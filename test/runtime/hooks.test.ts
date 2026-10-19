@@ -1,7 +1,7 @@
 import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
-import { hookLog, MAX_LOG_BYTES, preAgentHook, runHook, stopHook } from '../../src/runtime/hooks.js';
+import { hookLog, MAX_LOG_BYTES, preAgentHook, preTelegramHook, runHook, stopHook } from '../../src/runtime/hooks.js';
 import { makeEnv, tmp, type Env } from './fixtures.js';
 
 let stateDir: string;
@@ -137,5 +137,35 @@ describe('runHook', () => {
     hookLog('after rotation', path);
     expect(existsSync(`${path}.1`)).toBe(true);
     expect(statSync(path).size).toBeLessThan(1000);
+  });
+});
+
+describe('pre-telegram hook', () => {
+  const call = (extra: Record<string, unknown>) => ({ hook_event_name: 'PreToolUse', tool_name: 'mcp__plugin_telegram_telegram__reply', tool_input: { chat_id: '1', text: 'hi' }, ...extra });
+  const permission = (o: { stdout?: string }) => decision(o)?.hookSpecificOutput?.permissionDecision;
+
+  it('allows the coordinator main thread', () => {
+    const r = preTelegramHook(call({}));
+    expect(r.stdout).toBeUndefined();
+    expect(r.reason).toMatch(/^allow: mcp__plugin_telegram_telegram__reply from the coordinator/);
+  });
+
+  it('denies the built-in general-purpose subagent and every other subagent type', () => {
+    for (const agent_type of ['general-purpose', 'Explore', 'Plan', 'some-plugin:helper', 'minions:engineer']) {
+      const r = preTelegramHook(call({ agent_id: 'a1b2', agent_type }));
+      expect(permission(r), agent_type).toBe('deny');
+      expect(decision(r).hookSpecificOutput.permissionDecisionReason).toMatch(new RegExp(`coordinator-only; subagents \\(${agent_type}\\)`));
+    }
+    // Either field alone marks a subagent call.
+    expect(permission(preTelegramHook(call({ agent_id: 'x' })))).toBe('deny');
+    expect(permission(preTelegramHook(call({ agent_type: 'general-purpose' })))).toBe('deny');
+  });
+
+  it('runHook fails closed on unreadable input', async () => {
+    const env = makeEnv();
+    vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+    expect(permission(await runHook('pre-telegram', loader(env), 'not json'))).toBe('deny');
+    expect(permission(await runHook('pre-telegram', loader(env), JSON.stringify(call({ agent_id: 'z', agent_type: 'general-purpose' }))))).toBe('deny');
+    expect((await runHook('pre-telegram', loader(env), JSON.stringify(call({})))).stdout).toBeUndefined();
   });
 });

@@ -30,6 +30,8 @@ export function runtimePaths(env: NodeJS.ProcessEnv = process.env) {
     telegramStateDir: env.TELEGRAM_STATE_DIR || join(env.CLAUDE_CONFIG_DIR || c.claudeHome, 'channels', 'telegram'),
     /** Written by `minions coordinator run`: what the running coordinator was launched with (no secrets). */
     coordinatorLaunch: join(state, 'coordinator-launch.json'),
+    /** Written by `minions coordinator run` when it exits (code, signal, error; no secrets). Read by a detached start. */
+    coordinatorExit: join(state, 'coordinator-exit.json'),
     coordinatorPrompt: c.coordinatorPrompt,
   };
 }
