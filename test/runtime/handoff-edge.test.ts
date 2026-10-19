@@ -50,7 +50,7 @@ describe('record --submitted matches the stdin path', () => {
     expect(viaFile.backlog.status('task-1')).toBe(viaStdin.backlog.status('task-1'));
     // no third attempt: the lease has ended
     expect((await fail(submitResult(viaFile.db, p, f.brief.leaseId, '{}', f.owner))).code).toBe('CONFLICT');
-    expect((await fail(recordSubmitted(viaFile.sched, p, f.brief.leaseId, { correction: true }))).code).toBe('NOT_FOUND');
+    expect((await fail(recordSubmitted(viaFile.sched, p, f.brief.leaseId, { correction: true }))).code).toBe('CONFLICT');
   });
 
   it('--correction before any invalid result is refused exactly as on stdin and keeps the submission', async () => {
@@ -172,13 +172,15 @@ describe('concurrency and lifecycle', () => {
     expect(env.db.events('task-1', 'submit')).toHaveLength(3);
   });
 
-  it('recording twice: the second record finds nothing and the transition is applied once', async () => {
+  it('recording twice: the second record reports the ended lease and the transition is applied once', async () => {
     const env = makeEnv();
     const { brief, head, owner } = await engineer(env);
     const p = paths(env);
     await submitResult(env.db, p, brief.leaseId, json(result({ branch: brief.branch, headSha: head })), owner);
     expect((await recordSubmitted(env.sched, p, brief.leaseId)).to).toBe('testing');
-    expect((await fail(recordSubmitted(env.sched, p, brief.leaseId))).code).toBe('NOT_FOUND');
+    const again = await fail(recordSubmitted(env.sched, p, brief.leaseId));
+    expect(again.code).toBe('CONFLICT');
+    expect(again.message).toMatch(/already ended \(completed\)/);
     expect(env.backlog.status('task-1')).toBe('testing');
   });
 

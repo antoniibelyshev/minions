@@ -33,6 +33,20 @@ export const briefPath = (p: HandoffPaths, leaseId: string) => { checkId(leaseId
 export const submissionPath = (p: HandoffPaths, leaseId: string) => { checkId(leaseId); return join(p.results, `${leaseId}.json`); };
 export const rejectedPath = (p: HandoffPaths, leaseId: string) => { checkId(leaseId); return join(p.results, `${leaseId}.rejected.json`); };
 
+/**
+ * Removes a lease's hand-off files (brief, pending and rejected submission). Called whenever a lease ends;
+ * best-effort: returns the failures instead of throwing so the caller can log them without failing the transition.
+ * The DB keeps the recorded `result_json`.
+ */
+export async function removeLeaseFiles(p: HandoffPaths, leaseId: string): Promise<string[]> {
+  if (!LEASE_ID.test(leaseId)) return [];
+  const errors: string[] = [];
+  for (const path of [briefPath(p, leaseId), submissionPath(p, leaseId), rejectedPath(p, leaseId)]) {
+    try { await rm(path, { force: true }); } catch (e) { errors.push(`${path}: ${(e as Error).message}`); }
+  }
+  return errors;
+}
+
 const real = (p: string): string => { try { return realpathSync(p); } catch { return p; } };
 
 function inside(dir: string, cwd: string): boolean {
@@ -134,9 +148,12 @@ export async function readSubmission(p: HandoffPaths, leaseId: string, opts: { c
 /**
  * `minions work record <leaseId> --submitted`: records the submitted file with the same validation and
  * correction semantics as stdin. A rejected submission is moved aside so a correction must be a new submit;
- * once the result is final (valid, or unvalidated after the correction) the file is removed (the DB keeps it).
+ * once the result is final (valid, or unvalidated after the correction) the lease's files are removed (the DB keeps it).
+ * The lease is checked first, so an ended lease reports CONFLICT rather than a missing file.
  */
 export async function recordSubmitted(sched: Scheduler, p: HandoffPaths, leaseId: string, opts: { correction?: boolean } = {}): Promise<RecordResponse> {
+  checkId(leaseId);
+  await sched.requireActive(leaseId);
   const raw = await readSubmission(p, leaseId, opts);
   const r = await sched.record(leaseId, raw, opts);
   const path = submissionPath(p, leaseId);
@@ -144,8 +161,8 @@ export async function recordSubmitted(sched: Scheduler, p: HandoffPaths, leaseId
     await rename(path, rejectedPath(p, leaseId));
     return { ...r, message: `Result rejected; one bounded correction is allowed: relay the listed errors to the worker, have it fix them and run \`minions work submit ${leaseId}\` again, then \`minions work record ${leaseId} --submitted --correction\`.` };
   } else {
-    await rm(path, { force: true });
-    await rm(rejectedPath(p, leaseId), { force: true });
+    // The scheduler already cleaned up its configured paths; this covers a caller passing other paths.
+    await removeLeaseFiles(p, leaseId);
   }
   return r;
 }

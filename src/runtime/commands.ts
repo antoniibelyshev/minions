@@ -59,7 +59,7 @@ export const coordinatorRestartRecorder = (d: RuntimeDb) => (info: { at: string;
   d.addEvent('coordinator-restart', null, info);
 };
 
-const scheduler = async () => new Scheduler({ ...(await context()), layout: workspaceLayout() });
+const scheduler = async () => new Scheduler({ ...(await context()), layout: workspaceLayout(), handoff: runtimePaths() });
 
 async function readInput(file?: string): Promise<string> {
   if (file && file !== '-') return readFile(file, 'utf8');
