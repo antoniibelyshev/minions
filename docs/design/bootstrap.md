@@ -291,3 +291,26 @@ fields: `name, description, tools, disallowedTools, model, maxTurns, effort`. Wo
   exec -it app minions coordinator` which runs `tmux new-session -A -s coordinator claude
   --plugin-dir /opt/minions/plugin --append-system-prompt <coordinator.md> --permission-mode <mode>
   --settings <allowlist json>` with cwd `/workspace/repo`.
+
+## Cross-module seams (phase 2)
+
+Stub files pin these signatures; the owning worker implements them, others import them:
+- `src/backlog/factory.ts` (backlog worker): `openBacklog(cfg, { idempotency: IdempotencyStore, root? }): BacklogAdapter`.
+- `src/plugin/generate.ts` (plugin worker): `generatePlugin(cfg, outDir): Promise<{path, sha256}[]>`.
+- `src/host/delegate.ts` (host worker): `delegateToContainer(args, {json, cwd?}): Promise<number>`.
+
+Runtime-side workspace commands (runtime worker owns; host transfer calls them through `docker compose exec`):
+- `minions workspace setup --json`: idempotent; creates `/state/{backlog,notes,import,exports}`, the DB,
+  and `/state/backlog/backlog/config.yml` (statuses, `done` last, `filesystem_only: true`).
+- `minions workspace import <bundlePath> --base <branch> [--remote-url <url>] --json`: clones
+  `/workspace/repo` from the bundle if absent, else fetches into `refs/remotes/host/*` (never
+  rewrites local branches); sets `user.name`/`user.email` from `config.git.identity`; records origin URL
+  as remote `origin` without fetching. Returns `{ head, base, imported: boolean }`.
+- `minions workspace export <outPath> --json`: writes a bundle with `agent/*` branches and the base
+  branch; returns `{ path, refs: string[] }`. Host fetches it into `refs/remotes/minions/*` only.
+
+Command ownership: `status`, `pause`, `resume` are registered once in `runtime/commands.ts`; in host mode
+they call `delegateToContainer`. Host-only commands live in `host/commands.ts`, `backlog ...` in
+`backlog/commands.ts`, everything else runtime-side in `runtime/commands.ts`.
+Workers must not edit `package.json`, `src/core/**`, `src/config/**`, or each other's files; report
+needed changes instead. Tests go in `test/<area>/`.

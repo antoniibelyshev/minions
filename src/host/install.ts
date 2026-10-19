@@ -1,0 +1,518 @@
+// init: inspect → propose (plan) → apply (journal, atomic writes, manifest, rollback) → verify.
+import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join, relative, sep } from 'node:path';
+import { z } from 'zod';
+import { can } from '../config/capabilities.js';
+import { DEFERRED_FEATURES, listUnavailable, validateConfig, type Unavailable } from '../config/resolve.js';
+import { CAPABILITIES, type Effect, type MinionsConfig, type Profile } from '../config/schema.js';
+import { MinionsError } from '../core/errors.js';
+import { atomicWrite, exists, readJsonIfExists, sha256, writeJson } from '../core/fsutil.js';
+import { imageTag, projectPaths, registryPath, repoPaths, volumeNames } from '../core/paths.js';
+import { VERSION } from '../core/version.js';
+import { generatePlugin } from '../plugin/generate.js';
+import { discover, dockerProbe, type Discovery, type DockerProbe, type DockerStatus } from './discovery.js';
+import { composeYaml, type Runner } from './docker.js';
+import { ProjectJsonSchema, resolveEffective, runtimeProjectInfo, sharedConfigView, type ProjectJson } from './project.js';
+import { bindProject, gitCommonDir, loadRegistry, repoRoot, resolveIdentity, saveRegistry, sharedProjectId, type Identity, type Registry } from './registry.js';
+import { runWizard, type WizardIO } from './wizard.js';
+
+// ---------------------------------------------------------------- manifest + journal
+
+export const ManifestSchema = z.object({
+  version: z.literal(1),
+  packageVersion: z.string(),
+  files: z.array(z.object({ path: z.string(), sha256: z.string(), owner: z.literal('minions') }).strict()),
+}).strict();
+export type Manifest = z.infer<typeof ManifestSchema>;
+
+const JournalSchema = z.object({
+  version: z.literal(1),
+  projectId: z.string(),
+  startedAt: z.string(),
+  steps: z.array(z.object({
+    kind: z.enum(['create', 'update', 'remove', 'registry']),
+    path: z.string(),
+    sha256: z.string().optional(),
+    backup: z.string().optional(), // base64 of previous content (update/remove/registry)
+  }).strict()),
+}).strict();
+type Journal = z.infer<typeof JournalSchema>;
+
+export const loadManifest = async (projectId: string): Promise<Manifest | undefined> =>
+  readJsonIfExists(projectPaths(projectId).manifestJson, ManifestSchema);
+
+async function fileHash(path: string): Promise<string | undefined> {
+  try { return sha256(await readFile(path)); } catch { return undefined; }
+}
+
+/** Undo journal steps in reverse; only touches files whose content is still what we wrote. */
+async function rollback(journal: Journal): Promise<string[]> {
+  const undone: string[] = [];
+  for (const step of [...journal.steps].reverse()) {
+    try {
+      if (step.kind === 'create') {
+        if ((await fileHash(step.path)) === step.sha256) { await rm(step.path, { force: true }); undone.push(step.path); }
+      } else if (step.backup !== undefined) {
+        const cur = await fileHash(step.path);
+        if (step.kind === 'registry' || cur === step.sha256 || cur === undefined) {
+          await atomicWrite(step.path, Buffer.from(step.backup, 'base64'));
+          undone.push(step.path);
+        }
+      } else if (step.kind === 'registry') {
+        await rm(step.path, { force: true });
+      }
+    } catch { /* best effort; journal stays for inspection only if we can't remove it */ }
+  }
+  return undone;
+}
+
+/** Rolls back an interrupted install recorded in journal.json. Returns restored paths. */
+export async function recoverJournal(projectId: string): Promise<string[] | undefined> {
+  const path = projectPaths(projectId).journalJson;
+  const j = await readJsonIfExists(path, JournalSchema).catch(() => undefined);
+  if (!j) return undefined;
+  const undone = await rollback(j);
+  await rm(path, { force: true });
+  return undone;
+}
+
+// ---------------------------------------------------------------- plan
+
+export type WriteAction = 'create' | 'update' | 'unchanged' | 'adopt' | 'drift' | 'conflict' | 'remove' | 'keep';
+export interface PlannedWrite {
+  path: string;
+  action: WriteAction;
+  inRepo: boolean;
+  sha256?: string;
+  note?: string;
+}
+
+export interface InstallPlan {
+  projectId: string;
+  identitySource: Identity['source'];
+  repoPath: string;
+  gitCommonDir: string;
+  visibility: 'shared' | 'private';
+  profile: Profile;
+  writes: PlannedWrite[];
+  permissions: Record<Effect, string[]>;
+  verificationCommands: string[];
+  unavailable: { settings: Unavailable[]; features: string[] };
+  externalSetup: string[];
+  notes: string[];
+  warnings: string[];
+  container: ProjectJson['container'] & { image: string; volumes: string[] };
+  gitIdentity: { name: string; email: string };
+  discovery: Discovery;
+}
+
+interface Desired { path: string; content: Buffer; inRepo: boolean; note?: string }
+
+export interface InitOptions {
+  path: string;
+  profile?: Profile;
+  visibility?: 'shared' | 'private';
+  yes?: boolean;
+  configFile?: string;
+  dryRun?: boolean;
+  attach?: boolean;
+  newIdentity?: boolean;
+  io?: WizardIO;
+  dockerProbe?: DockerProbe;
+  runner?: Runner;
+}
+
+interface Prepared { plan: InstallPlan; desired: Desired[]; manifest: Manifest | undefined; registry: Registry; cleanup: () => Promise<void> }
+
+const json = (v: unknown) => Buffer.from(JSON.stringify(v, null, 2) + '\n');
+
+function sharedReadme(): string {
+  return `# .minions
+
+This directory holds the shared [minions](https://github.com/) configuration for this repository.
+
+- \`config.json\` — project configuration (profile, policy, limits). Commit it to share the setup.
+- Runtime state, backlog, credentials, and Claude login live in per-project Docker volumes on
+  each developer's machine, never in this directory.
+
+Run \`minions init\` after cloning to attach to this configuration, then \`minions start\`.
+Personal values (git identity) are kept on the host, not here.
+`;
+}
+
+async function walkFiles(dir: string): Promise<string[]> {
+  const out: string[] = [];
+  for (const e of await readdir(dir, { withFileTypes: true })) {
+    const p = join(dir, e.name);
+    if (e.isDirectory()) out.push(...await walkFiles(p));
+    else if (e.isFile()) out.push(p);
+  }
+  return out.sort();
+}
+
+function permissionSummary(cfg: MinionsConfig): Record<Effect, string[]> {
+  const out: Record<Effect, string[]> = { allow: [], ask: [], deny: [] };
+  for (const cap of CAPABILITIES) {
+    const r = cfg.capabilities[cap];
+    const base = can(cfg, cap);
+    const extra = typeof r !== 'string' && r.rules?.length
+      ? ` (${r.rules.map((x) => `${x.effect} for ${[...(x.roles ?? []), ...(x.paths ?? [])].join(',')}`).join('; ')})` : '';
+    out[base].push(cap + extra);
+  }
+  return out;
+}
+
+const isInside = (child: string, parent: string) => {
+  const r = relative(parent, child);
+  return !!r && r !== '..' && !r.startsWith('..' + sep) && !r.startsWith(sep);
+};
+
+async function prepare(opts: InitOptions): Promise<Prepared> {
+  if (!(await exists(opts.path))) throw new MinionsError('NOT_FOUND', `Path not found: ${opts.path}`);
+  const repoPath = await repoRoot(opts.path);
+  const commonDir = await gitCommonDir(repoPath);
+  const discovery = await discover(repoPath, opts.runner);
+  const registry = await loadRegistry();
+  const notes: string[] = [];
+  const warnings: string[] = [];
+
+  const registered = Object.entries(registry.projects).find(([, e]) => e.gitCommonDir === commonDir);
+  const sharedPath = repoPaths(repoPath).configJson;
+  const sharedExists = await exists(sharedPath);
+  const visibility = opts.visibility ?? registered?.[1].visibility ?? (sharedExists ? 'shared' : undefined);
+  const sharedId = visibility !== 'private' ? await sharedProjectId(repoPath) : undefined;
+  if (sharedExists && visibility !== 'private' && !sharedId) {
+    throw new MinionsError('INVALID_CONFIG', `${sharedPath} has no valid projectId.`, 'Fix or remove the file, then rerun init.');
+  }
+  const identity = resolveIdentity(registry, { commonDir, sharedId, attach: opts.attach, newIdentity: opts.newIdentity });
+  const projectId = identity.projectId;
+  const paths = projectPaths(projectId);
+
+  const recovered = opts.dryRun ? undefined : await recoverJournal(projectId);
+  if (recovered) notes.push(`Rolled back an interrupted install (${recovered.length} file(s) restored/removed).`);
+  if (identity.source === 'attached') notes.push(`Attaching this repository to existing project ${projectId}.`);
+  if (identity.replacesSharedId) notes.push(`New project identity ${projectId} replaces ${identity.replacesSharedId} in .minions/config.json.`);
+
+  const prevProject = await readJsonIfExists(paths.projectJson, ProjectJsonSchema).catch(() => undefined);
+  if (prevProject && visibility && prevProject.visibility !== visibility) {
+    throw new MinionsError('PRECONDITION', `Project is installed as ${prevProject.visibility}; switching to ${visibility} is not supported in v0.1.`,
+      'Run `minions uninstall` first, then init with the new visibility.');
+  }
+
+  // Existing project configuration is reused (rerun = regenerate derived files); --config replaces it.
+  let existingRaw: Record<string, unknown> | undefined;
+  let existingFile: string | undefined;
+  if (visibility === 'shared' && sharedExists) { existingRaw = await readJsonIfExists(sharedPath); existingFile = sharedPath; }
+  else if (visibility !== 'shared' && await exists(paths.configJson)) { existingRaw = await readJsonIfExists(paths.configJson); existingFile = paths.configJson; }
+
+  let config: MinionsConfig;
+  if (existingRaw && !opts.configFile) {
+    const profile = (existingRaw.profile as Profile | undefined) ?? 'project-owner';
+    const ctx = {
+      projectId, profile,
+      baseBranch: prevProject?.baseBranch ?? discovery.git.baseBranch,
+      gitIdentity: prevProject?.gitIdentity ?? { name: discovery.git.userName ?? '', email: discovery.git.userEmail ?? '' },
+    };
+    if (!ctx.gitIdentity.name || !ctx.gitIdentity.email) {
+      throw new MinionsError('PRECONDITION', 'Git identity (user.name / user.email) is not configured for this repository.',
+        'Run `git config user.name "…"` and `git config user.email "…"`, then rerun init.');
+    }
+    config = resolveEffective(ctx, { ...existingRaw, projectId }, undefined, { project: existingFile! }).config;
+    if (opts.profile && opts.profile !== config.profile) {
+      warnings.push(`--profile ${opts.profile} ignored: existing configuration uses ${config.profile}; edit ${existingFile} to change it.`);
+    }
+    notes.push(`Reusing existing configuration ${existingFile}.`);
+  } else {
+    const r = await runWizard({
+      discovery, projectId, profile: opts.profile, visibility, configFile: opts.configFile,
+      yes: !!opts.yes, io: opts.io,
+    });
+    config = r.config;
+    notes.push(...r.notes);
+  }
+  config = validateConfig({ ...config, projectId }, 'install');
+  const vis = config.visibility;
+
+  const project: ProjectJson = {
+    version: 1, projectId,
+    repoPath: prevProject && await exists(prevProject.repoPath) && identity.source !== 'attached' ? prevProject.repoPath : repoPath,
+    gitCommonDir: commonDir, visibility: vis, profile: config.profile, imageTag: imageTag(VERSION),
+    baseBranch: config.git.baseBranch, remoteUrl: discovery.git.remoteUrl, gitIdentity: config.git.identity,
+    container: {
+      cpus: config.container.cpus, memoryMiB: config.container.memoryMiB, pidsLimit: config.container.pidsLimit,
+      publishPorts: config.container.publishPorts, network: config.container.network,
+    },
+  };
+
+  // Project config layer as written to disk, and the effective config for the runtime.
+  const projectLayer = vis === 'shared' ? sharedConfigView(config as unknown as Record<string, unknown>) : config as unknown as Record<string, unknown>;
+  const local = await readJsonIfExists(paths.configLocalJson);
+  const effective = resolveEffective(project, projectLayer, local, { project: 'project configuration', local: paths.configLocalJson }).config;
+
+  const desired: Desired[] = [];
+  const add = (path: string, content: Buffer | string, note?: string) =>
+    desired.push({ path, content: Buffer.isBuffer(content) ? content : Buffer.from(content), inRepo: isInside(path, repoPath), note });
+  add(paths.projectJson, json(project));
+  if (vis === 'private') add(paths.configJson, json(config));
+  add(paths.composeYaml, composeYaml(project));
+  add(join(paths.runtimeDir, 'config.json'), json(effective));
+  add(join(paths.runtimeDir, 'project.json'), json(runtimeProjectInfo(project)));
+
+  const staging = await mkdtemp(join(tmpdir(), 'minions-plugin-'));
+  const cleanup = () => rm(staging, { recursive: true, force: true });
+  try {
+    await generatePlugin(effective, staging);
+    for (const f of await walkFiles(staging)) add(join(paths.pluginDir, relative(staging, f)), await readFile(f));
+  } catch (e) { await cleanup(); throw e; }
+
+  let sharedConfigDesired = false;
+  if (vis === 'shared') {
+    const rp = repoPaths(repoPath);
+    if (!sharedExists || identity.replacesSharedId || opts.configFile) { add(rp.configJson, json(projectLayer)); sharedConfigDesired = true; }
+    add(rp.readme, sharedReadme());
+  }
+
+  const manifest = await loadManifest(projectId);
+  const inManifest = new Map((manifest?.files ?? []).map((f) => [f.path, f.sha256]));
+  const writes: PlannedWrite[] = [];
+  for (const d of desired) {
+    const want = sha256(d.content);
+    const cur = await fileHash(d.path);
+    const recorded = inManifest.get(d.path);
+    let action: WriteAction;
+    let note = d.note;
+    if (cur === undefined) action = 'create';
+    else if (cur === want) action = recorded === want ? 'unchanged' : 'adopt';
+    else if (recorded === undefined) {
+      const explicit = d.path === repoPaths(repoPath).configJson && sharedConfigDesired && (identity.replacesSharedId || opts.configFile);
+      action = explicit ? 'update' : 'conflict';
+      note = explicit ? 'explicitly requested (--new-identity/--config)' : 'exists and is not owned by minions; not overwritten';
+    } else if (recorded === cur) action = 'update';
+    else { action = 'drift'; note = 'edited since generation; left unchanged — reconcile manually (or delete it and rerun init)'; }
+    writes.push({ path: d.path, action, inRepo: d.inRepo, sha256: want, ...(note ? { note } : {}) });
+  }
+  if (vis === 'shared' && sharedExists && !sharedConfigDesired) {
+    writes.push({ path: sharedPath, action: 'keep', inRepo: true, note: 'existing shared configuration is the source of truth' });
+  }
+  const wanted = new Set(desired.map((d) => d.path));
+  for (const [p, h] of inManifest) {
+    if (wanted.has(p) || p === sharedPath) continue;
+    const cur = await fileHash(p);
+    if (cur === undefined) continue;
+    writes.push(cur === h ? { path: p, action: 'remove', inRepo: isInside(p, repoPath) }
+      : { path: p, action: 'drift', inRepo: isInside(p, repoPath), note: 'no longer generated but edited; left in place' });
+  }
+
+  if (vis === 'private' && writes.some((w) => w.inRepo && w.action !== 'unchanged' && w.action !== 'keep')) {
+    throw new MinionsError('INTERNAL', 'Private install planned a write inside the repository; refusing.', 'Check MINIONS_HOME is outside the repository.');
+  }
+  if (vis === 'private' && isInside(paths.dir, repoPath)) {
+    throw new MinionsError('PRECONDITION', `MINIONS_HOME (${paths.dir}) is inside the repository; private installs must not write into the repo.`);
+  }
+
+  if (discovery.git.dirty) notes.push('Working tree has uncommitted changes: they are left untouched and are not imported into the container.');
+  if (discovery.dockerfile) notes.push('A repository Dockerfile exists; it is not built. The minions runtime image is used.');
+  if (vis === 'shared') notes.push('Shared install never modifies CLAUDE.md, AGENTS.md, or .claude/.');
+
+  const unavailable = { settings: listUnavailable(config), features: [...DEFERRED_FEATURES] };
+  const plan: InstallPlan = {
+    projectId, identitySource: identity.source, repoPath, gitCommonDir: commonDir, visibility: vis, profile: config.profile,
+    writes, permissions: permissionSummary(effective), verificationCommands: effective.verification.commands,
+    unavailable,
+    externalSetup: [
+      'Docker Desktop running (compose v2+).',
+      `Runtime image ${project.imageTag} is built from the installed package on first \`minions start\`.`,
+      'Claude login inside the container on first start: run /login in the coordinator session (host login is not reused).',
+      'Repository is imported into the container from a Git bundle of committed history on first start.',
+    ],
+    notes, warnings,
+    container: { ...project.container, image: project.imageTag, volumes: Object.values(volumeNames(projectId)) },
+    gitIdentity: config.git.identity,
+    discovery,
+  };
+  return { plan, desired, manifest, registry, cleanup };
+}
+
+// ---------------------------------------------------------------- apply
+
+export interface ApplyResult { written: string[]; removed: string[]; unchanged: number; skipped: PlannedWrite[] }
+
+async function apply(prep: Prepared): Promise<ApplyResult> {
+  const { plan, desired } = prep;
+  const conflicts = plan.writes.filter((w) => w.action === 'conflict');
+  if (conflicts.length) {
+    throw new MinionsError('CONFLICT', `Refusing to overwrite files not owned by minions:\n${conflicts.map((c) => `  - ${c.path}`).join('\n')}`,
+      'Move or delete these files (minions never overwrites user files), then rerun init.', { paths: conflicts.map((c) => c.path) });
+  }
+  const paths = projectPaths(plan.projectId);
+  const content = new Map(desired.map((d) => [d.path, d.content]));
+  const journal: Journal = { version: 1, projectId: plan.projectId, startedAt: new Date().toISOString(), steps: [] };
+  const saveJournal = () => writeJson(paths.journalJson, journal);
+  const result: ApplyResult = { written: [], removed: [], unchanged: 0, skipped: [] };
+  const oldManifest = new Map((prep.manifest?.files ?? []).map((f) => [f.path, f.sha256]));
+  const newManifest = new Map<string, string>();
+
+  try {
+    await saveJournal();
+    for (const w of plan.writes) {
+      if (w.action === 'create' || w.action === 'update') {
+        const data = content.get(w.path)!;
+        const backup = w.action === 'update' ? (await readFile(w.path)).toString('base64') : undefined;
+        journal.steps.push({ kind: w.action, path: w.path, sha256: w.sha256, ...(backup !== undefined ? { backup } : {}) });
+        await saveJournal();
+        await atomicWrite(w.path, data);
+        result.written.push(w.path);
+        newManifest.set(w.path, w.sha256!);
+      } else if (w.action === 'remove') {
+        const prev = await readFile(w.path);
+        journal.steps.push({ kind: 'remove', path: w.path, sha256: sha256(prev), backup: prev.toString('base64') });
+        await saveJournal();
+        await rm(w.path, { force: true });
+        result.removed.push(w.path);
+      } else if (w.action === 'unchanged' || w.action === 'adopt') {
+        result.unchanged++;
+        newManifest.set(w.path, w.sha256!);
+      } else if (w.action === 'drift') {
+        result.skipped.push(w);
+        const h = oldManifest.get(w.path);
+        if (h) newManifest.set(w.path, h); // keep the generated hash so drift stays visible
+      } else if (w.action === 'keep') {
+        const h = oldManifest.get(w.path);
+        if (h) newManifest.set(w.path, h);
+      }
+    }
+    const reg = bindProject(prep.registry, plan.projectId, { gitCommonDir: plan.gitCommonDir, repoPath: plan.repoPath, visibility: plan.visibility });
+    if (JSON.stringify(reg) !== JSON.stringify(prep.registry)) {
+      const regPath = registryPath();
+      const prev = await readFile(regPath).catch(() => undefined);
+      journal.steps.push({ kind: 'registry', path: regPath, ...(prev ? { backup: prev.toString('base64') } : {}) });
+      await saveJournal();
+      await saveRegistry(reg);
+    }
+    const manifest: Manifest = {
+      version: 1, packageVersion: VERSION,
+      files: [...newManifest].sort(([a], [b]) => a.localeCompare(b)).map(([path, h]) => ({ path, sha256: h, owner: 'minions' as const })),
+    };
+    const prevText = JSON.stringify(prep.manifest ?? null);
+    if (JSON.stringify(manifest) !== prevText) await writeJson(paths.manifestJson, manifest);
+    await rm(paths.journalJson, { force: true });
+    return result;
+  } catch (e) {
+    await rollback(journal);
+    await rm(paths.journalJson, { force: true });
+    throw e;
+  }
+}
+
+// ---------------------------------------------------------------- derived files at start
+
+/**
+ * Regenerates compose.yaml and runtime/{config,project}.json from project.json + config (used by
+ * `minions start`). Files edited by the user (hash ≠ manifest) are not replaced; a warning is returned.
+ */
+export async function refreshDerived(project: ProjectJson, effective: MinionsConfig): Promise<string[]> {
+  const paths = projectPaths(project.projectId);
+  const manifest = (await loadManifest(project.projectId)) ?? { version: 1 as const, packageVersion: VERSION, files: [] };
+  const warnings: string[] = [];
+  const files: [string, Buffer][] = [
+    [paths.composeYaml, Buffer.from(composeYaml(project))],
+    [join(paths.runtimeDir, 'config.json'), json(effective)],
+    [join(paths.runtimeDir, 'project.json'), json(runtimeProjectInfo(project))],
+  ];
+  let changed = false;
+  for (const [path, data] of files) {
+    const want = sha256(data);
+    const cur = await fileHash(path);
+    const entry = manifest.files.find((f) => f.path === path);
+    if (cur === want) continue;
+    if (cur !== undefined && entry?.sha256 !== cur) { warnings.push(`${path} was edited since generation; using it as is.`); continue; }
+    await atomicWrite(path, data);
+    if (entry) entry.sha256 = want; else manifest.files.push({ path, sha256: want, owner: 'minions' });
+    changed = true;
+  }
+  if (changed) await writeJson(paths.manifestJson, manifest);
+  return warnings;
+}
+
+// ---------------------------------------------------------------- init
+
+export interface InitResult {
+  dryRun: boolean;
+  plan: Omit<InstallPlan, 'discovery'> & { discovery: Pick<Discovery, 'git' | 'instructions' | 'ciWorkflows' | 'dockerfile' | 'host'> };
+  applied?: ApplyResult;
+  docker: DockerStatus;
+  nextSteps: string[];
+}
+
+export function dockerUnavailable(s: DockerStatus): MinionsError {
+  const what = !s.daemon ? `Docker daemon is not reachable${s.error ? ` (${s.error})` : ''}` : `Docker Compose v2+ is required (found: ${s.composeVersion ?? 'none'})`;
+  return new MinionsError('DOCKER_UNAVAILABLE', `${what}. minions runs agents only inside Docker; there is no host fallback.`,
+    'Start Docker Desktop (or install Compose v2), then rerun `minions init`.', s);
+}
+
+export async function runInit(opts: InitOptions): Promise<InitResult> {
+  const probe = opts.dockerProbe ?? dockerProbe(opts.runner);
+  // Docker is mandatory: fail before writing anything (no host-execution fallback).
+  const docker = await probe();
+  if (!opts.dryRun && (!docker.daemon || !docker.compose)) throw dockerUnavailable(docker);
+  const prep = await prepare(opts);
+  try {
+    const { discovery, ...rest } = prep.plan;
+    const plan = { ...rest, discovery: { git: discovery.git, instructions: discovery.instructions, ciWorkflows: discovery.ciWorkflows, dockerfile: discovery.dockerfile, host: discovery.host } };
+    if (opts.dryRun) {
+      if (!docker.daemon || !docker.compose) plan.warnings.push(dockerUnavailable(docker).message);
+      return { dryRun: true, plan, docker, nextSteps: ['Rerun without --dry-run to apply this plan.'] };
+    }
+    if (!opts.yes && !opts.configFile && opts.io && plan.writes.some((w) => ['create', 'update', 'remove'].includes(w.action))) {
+      opts.io.info(formatPlan(plan));
+      const ok = await opts.io.ask('Apply this plan? (y/n)', 'y');
+      if (!/^y(es)?$/i.test(ok)) throw new MinionsError('PRECONDITION', 'Installation cancelled; nothing was written.');
+    }
+    const applied = await apply(prep);
+    // Verify: Docker still reachable after applying (never claim readiness otherwise).
+    const after = await probe();
+    if (!after.daemon || !after.compose) throw dockerUnavailable(after);
+    return {
+      dryRun: false, plan, applied, docker: after,
+      nextSteps: [
+        'Run `minions start` in this repository.',
+        'The first start builds the runtime image, imports committed history, and opens the coordinator; log in to Claude inside the container with /login.',
+        'Run `minions doctor` to check readiness at any time.',
+      ],
+    };
+  } finally {
+    await prep.cleanup();
+  }
+}
+
+export function formatPlan(plan: InitResult['plan']): string {
+  const L: string[] = [];
+  L.push(`Project ${plan.projectId} (${plan.visibility}, profile ${plan.profile}) — ${plan.repoPath}`);
+  L.push('', 'Planned writes:');
+  for (const w of plan.writes) L.push(`  ${w.action.padEnd(9)} ${w.path}${w.note ? `  — ${w.note}` : ''}`);
+  L.push('', 'Effective permissions:');
+  for (const e of ['allow', 'ask', 'deny'] as const) L.push(`  ${e.padEnd(5)}: ${plan.permissions[e].join(', ') || '—'}`);
+  L.push('', `Git identity for agent commits: ${plan.gitIdentity.name} <${plan.gitIdentity.email}>`);
+  L.push(`Container: ${plan.container.image}, ${plan.container.cpus} CPUs, ${plan.container.memoryMiB} MiB, ${plan.container.pidsLimit} pids, ports: ${plan.container.publishPorts.map((p) => `127.0.0.1:${p.host}->${p.container}`).join(', ') || 'none'}`);
+  L.push(`Verification commands (run inside the container): ${plan.verificationCommands.join('; ') || 'none inferred'}`);
+  L.push('', 'Unavailable in v0.1:');
+  for (const u of plan.unavailable.settings) L.push(`  - ${u.path}: ${u.reason}`);
+  L.push(`  - ${plan.unavailable.features.join(', ')}`);
+  L.push('', 'External setup required:');
+  for (const s of plan.externalSetup) L.push(`  - ${s}`);
+  if (plan.notes.length) { L.push('', 'Notes:'); for (const n of plan.notes) L.push(`  - ${n}`); }
+  if (plan.warnings.length) { L.push('', 'Warnings:'); for (const n of plan.warnings) L.push(`  ! ${n}`); }
+  return L.join('\n');
+}
+
+export function formatInit(r: InitResult): string {
+  const L = [formatPlan(r.plan)];
+  if (r.applied) {
+    L.push('', `Applied: ${r.applied.written.length} written, ${r.applied.removed.length} removed, ${r.applied.unchanged} unchanged.`);
+    for (const s of r.applied.skipped) L.push(`  ! drift: ${s.path} — ${s.note}`);
+  }
+  L.push('', 'Next steps:', ...r.nextSteps.map((s) => `  ${s}`));
+  return L.join('\n');
+}
+
