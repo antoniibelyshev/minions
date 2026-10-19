@@ -22,6 +22,7 @@ Everything the model controls runs inside one Docker container per project. Your
 - [Configuration](#configuration)
 - [Models and budgets](#models-and-budgets)
 - [Communication](#communication)
+- [Claude authorization](#claude-authorization)
 - [Security model](#security-model)
 - [CLI reference](#cli-reference)
 - [Recovery, upgrades, and uninstall](#recovery-upgrades-and-uninstall)
@@ -64,7 +65,7 @@ Everything the model controls runs inside one Docker container per project. Your
 - Docker Desktop with Docker Compose v2, installed by you. minions never falls back to running agents on the host.
 - Node.js 22.13 or later, for the host CLI
 - A Git repository. A remote is recommended; repositories without a usable remote are supported through explicit snapshot import.
-- A Claude account or API key. You authenticate Claude inside the container; your host login is not reused.
+- A Claude account or API key. By default you log in to Claude inside the container; your host login is not reused. You can instead let the host provision an API key (see [Claude authorization](#claude-authorization)).
 - Optional: the GitHub CLI and credentials for PR delivery, and a Telegram bot for remote control
 
 Native macOS or iOS builds that need Xcode can't run in the Linux container. minions reports them as an environment limitation.
@@ -85,6 +86,7 @@ minions doctor
 
 # Launch the coordinator in the project container and attach your terminal
 minions start                   # first run: log in with /login inside the coordinator session
+                                # (or set up host-provisioned keys first: minions auth set …)
 minions start --no-attach       # only start the container and import the repository
 ```
 
@@ -359,6 +361,68 @@ You won't get tool-call or test-log spam. Every question includes a recommended 
 
 The Telegram controls (pause intake, pause new starts, cancel workers, resume, status, sync) also exist as terminal commands that work without Claude.
 
+## Claude authorization
+
+How Claude Code inside the container gets credentials is a **host-side** setting (`claudeAuth` in
+the project's `project.json`, outside the repository). It is never read from `.minions/config.json`
+or any repository file, so a cloned repository can't make your Mac run a command.
+
+| Method | What happens |
+| - | - |
+| `login` (default) | Run `/login` in the coordinator session; the login is kept in the project's `claude` volume. |
+| `api-key` | The host reads a key from a file (`--file`), the macOS Keychain (`--keychain-service`/`--keychain-account`, via `security find-generic-password … -w`), or a host env var (`--env-var`). |
+| `helper` | The host runs a fixed argv command (no shell) that prints the key on its last output line. It runs on every `minions start`, on `minions auth refresh`, and every `--refresh-minutes` (default 30) while `minions start` stays attached. If a periodic refresh fails, the old key is kept and a one-line warning is shown. |
+
+For `api-key` and `helper`, the host writes the key to
+`projects/<id>/secrets/anthropic-api-key` (directory 0700, file 0600, replaced atomically) and
+mounts the `secrets` **directory** read-only at `/run/minions/secrets`, so refreshed keys show up
+without a restart. Claude Code in the container gets `apiKeyHelper: "cat /run/minions/secrets/anthropic-api-key"`
+and re-reads the file every 5 minutes. The key is never put in environment variables, process
+arguments, `compose.yaml`, logs, or command output. If the key can't be obtained on `minions start`,
+nothing is launched and the command exits with `AUTH_REQUIRED`.
+
+`--env NAME=VALUE` (repeatable) adds non-secret container environment such as `ANTHROPIC_BASE_URL`.
+Hosts `127.0.0.1`, `localhost`, and `[::1]` in those values are rewritten to `host.docker.internal`
+so the container reaches services on your Mac (`--no-rewrite-loopback` turns that off). `minions auth show`
+masks values after the scheme and host.
+
+**JetBrains Central:**
+
+```sh
+minions auth set jbcentral      # shows the plan; asks before applying (--yes to skip, --dry-run to preview)
+minions start
+```
+
+The `jbcentral` preset runs `central proxy start --ensure-updated --caller agent --return-key` on the
+host, and takes `ANTHROPIC_BASE_URL` from `env.ANTHROPIC_BASE_URL` in your host `~/.claude/settings.json`
+(only that key is read, only when you pick the preset). If it's missing, run `central add claude`
+first or pass `--base-url <url>`. The container reaches the local Central proxy through
+`host.docker.internal`.
+
+**Custom helper:**
+
+```sh
+minions auth set helper --refresh-minutes 15 -- /usr/local/bin/print-anthropic-key --profile work
+minions auth set api-key --keychain-service anthropic --keychain-account "$USER"
+minions auth refresh            # re-run the helper / re-read the source now
+minions auth show [--json]      # method, source, masked env, key file status and last refresh; never the key
+```
+
+**Global default:** `minions auth set <method> … --global` writes `<MINIONS_HOME>/defaults.json`
+(`{ "claudeAuth": … }`), which `minions init` uses for new projects. A project's own setting always
+wins. The `init` wizard asks the same question (JetBrains Central is offered only when `central` is
+on your `PATH`; it is looked up, not run).
+
+`minions doctor` checks the method: for `login`, `claude auth status` inside the container; for keys,
+that the key file is present and fresh, the helper resolves on `PATH`, the key is readable inside the
+container, and that `ANTHROPIC_BASE_URL` (when set) answers HTTP from inside the container. Doctor
+makes no API calls that use tokens.
+
+**Security notes:** a provisioned key is readable by any process in the container, including every
+worker. Helper commands run on your Mac with your user rights; they live only in host-side
+configuration (`project.json`, `defaults.json`), which the container can't modify. The container never
+gets the host `central` binary, your `~/.claude`, the Keychain, or a way to run host commands.
+
 ## Security model
 
 **What Docker protects:**
@@ -399,6 +463,7 @@ There is no default production credential injection and no deployment authority.
 | `minions import` | Refresh the container workspace from the committed base branch (Git bundle) |
 | `minions export` | Fetch `agent/*` branches into `refs/remotes/minions/*` in your repository; local branches are untouched |
 | `minions config show [--explain]` | Effective values and their provenance |
+| `minions auth show` / `set <login\|api-key\|helper\|jbcentral>` / `refresh` | Host-side Claude authorization (see [Claude authorization](#claude-authorization)) |
 | `minions backlog ready` / `list` / `show` / `create` / `update` / `note` / `export` | Backend-neutral task operations (inside the container) |
 | `minions work claim` / `record` / `release` / `list` | Leases and worker results (used by the coordinator, inside the container) |
 | `minions uninstall` | Remove owned files while keeping task data (`--delete-data` also deletes volumes) |

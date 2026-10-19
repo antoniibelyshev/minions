@@ -16,7 +16,13 @@ In:
 - Backlog.md backend only. Delivery mode `local` only (commits on `agent/<slug>` branches in the container clone, fetched to host with `minions export`).
 - Terminal communication only.
 - One Docker container per project, security baseline from spec §3A.
-- Claude auth inside the container (interactive `/login`, persisted in the claude volume).
+- Claude auth inside the container (interactive `/login`, persisted in the claude volume) by default, or
+  host-provisioned keys: host-only `claudeAuth` in project.json (`api-key` from file/Keychain/env, or a
+  `helper` argv such as the `jbcentral` preset), written to `projects/<id>/secrets/anthropic-api-key`
+  (0600), the `secrets` directory bind-mounted ro at `/run/minions/secrets`, and the coordinator
+  `--settings` gaining `apiKeyHelper: "cat /run/minions/secrets/anthropic-api-key"` when
+  `MINIONS_AUTH_METHOD` (compose env) is a key method. Commands: `auth show|set|refresh`.
+  Global default in `<MINIONS_HOME>/defaults.json`.
 
 Deferred (report as unavailable): GitHub Issues backend, branch/PR/auto-merge delivery,
 review publication, Telegram, config plan/apply transactions, backlog migration, upgrade,

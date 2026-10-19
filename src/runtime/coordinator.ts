@@ -3,14 +3,29 @@ import { readFile } from 'node:fs/promises';
 import type { MinionsConfig } from '../config/schema.js';
 import { MinionsError } from '../core/errors.js';
 import { run } from '../core/exec.js';
+import { CONTAINER } from '../core/paths.js';
 import { runtimePaths, type RuntimePaths } from './paths.js';
 
 export const TMUX_SESSION = 'coordinator';
 
 export interface CoordinatorCommand { cmd: string; args: string[]; cwd: string }
 
-/** Claude Code settings passed with --settings: an allowlist for deterministic CLIs; bypass mode disabled. */
-export function coordinatorSettings(cfg: MinionsConfig): Record<string, unknown> {
+export type RuntimeAuthMethod = 'login' | 'api-key' | 'helper';
+
+/** Claude auth method from the non-secret MINIONS_AUTH_METHOD set by the host in compose.yaml. */
+export function runtimeAuthMethod(env: NodeJS.ProcessEnv = process.env): RuntimeAuthMethod {
+  const m = env.MINIONS_AUTH_METHOD;
+  return m === 'api-key' || m === 'helper' ? m : 'login';
+}
+
+/** In-container apiKeyHelper: reads the host-provisioned key from the read-only secrets mount. */
+export const API_KEY_HELPER = `cat ${CONTAINER.apiKeyFile}`;
+
+/**
+ * Claude Code settings passed with --settings: an allowlist for deterministic CLIs; bypass mode disabled.
+ * Key methods (api-key/helper) add apiKeyHelper; the login method relies on /login state instead.
+ */
+export function coordinatorSettings(cfg: MinionsConfig, auth: RuntimeAuthMethod = runtimeAuthMethod()): Record<string, unknown> {
   const allow = ['Bash(minions *)', 'Bash(minions)', 'Bash(git *)', 'Bash(backlog *)'];
   for (const c of cfg.verification.commands) allow.push(`Bash(${c})`, `Bash(${c} *)`);
   return {
@@ -20,6 +35,7 @@ export function coordinatorSettings(cfg: MinionsConfig): Record<string, unknown>
       deny: ['Bash(git push *)', 'Bash(git push)', 'Bash(git * push *)', 'Bash(git * push)'],
       disableBypassPermissionsMode: 'disable',
     },
+    ...(auth === 'login' ? {} : { apiKeyHelper: API_KEY_HELPER }),
   };
 }
 

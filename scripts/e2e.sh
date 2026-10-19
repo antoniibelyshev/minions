@@ -14,6 +14,7 @@ export MINIONS_HOME="$WORK/home"
 PREFIX="$WORK/prefix"
 M="$PREFIX/node_modules/.bin/minions"
 PROJECT_IDS=()
+SERVER_PID=""
 
 step() { printf '\n==> %s\n' "$*" >&2; }
 ok() { printf '  ok: %s\n' "$*" >&2; }
@@ -24,6 +25,7 @@ expect_eq() { [ "$1" = "$2" ] || fail "$3: expected '$2', got '$1'"; ok "$3"; }
 
 cleanup() {
   local code=$?
+  [ -n "$SERVER_PID" ] && kill "$SERVER_PID" >/dev/null 2>&1 || true
   if [ "${E2E_KEEP:-}" = 1 ]; then printf '\nKept %s (MINIONS_HOME=%s)\n' "$WORK" "$MINIONS_HOME" >&2; exit "$code"; fi
   for id in "${PROJECT_IDS[@]+"${PROJECT_IDS[@]}"}"; do
     local f="$MINIONS_HOME/projects/$id/compose.yaml"
@@ -148,6 +150,60 @@ step "down / start persists state"
 expect_eq "$(cx minions backlog show "$T" --json | json 'd.data.status')" delivered "backlog persisted"
 expect_eq "$(cx git -C /workspace/repo rev-parse "refs/heads/$BRANCH")" "$H" "workspace persisted"
 expect_eq "$(cx minions status --json | json 'd.data.queue.ready')" 1 "runtime DB persisted"
+
+step "Claude authorization: helper mode with a fake key script (no real credentials)"
+cd "$A"
+mkdir -p "$WORK/bin"
+KEY1="fake-e2e-key-$(date +%s)-one"; KEY2="fake-e2e-key-rotated-two"
+printf '%s' "$KEY1" > "$WORK/key.txt"
+printf '#!/bin/sh\necho "pretend proxy started"\ncat "%s"\n' "$WORK/key.txt" > "$WORK/bin/fake-key"; chmod +x "$WORK/bin/fake-key"
+# Fake Anthropic endpoint on host loopback: records the x-api-key header, answers 401 (no tokens anywhere).
+cat > "$WORK/fake-api.mjs" <<'JS'
+import http from 'node:http'; import fs from 'node:fs';
+const [log, portFile] = process.argv.slice(2);
+const s = http.createServer((q, r) => { fs.appendFileSync(log, `${q.method} ${q.url} ${q.headers['x-api-key'] ?? '-'}\n`); r.writeHead(401, { 'content-type': 'application/json' }); r.end('{"type":"error","error":{"type":"authentication_error","message":"fake"}}'); });
+s.listen(0, '127.0.0.1', () => fs.writeFileSync(portFile, String(s.address().port)));
+JS
+: > "$WORK/fake-api.log"
+node "$WORK/fake-api.mjs" "$WORK/fake-api.log" "$WORK/fake-api.port" & SERVER_PID=$!; disown "$SERVER_PID"
+for _ in $(seq 50); do [ -s "$WORK/fake-api.port" ] && break; sleep 0.1; done
+PORT="$(cat "$WORK/fake-api.port")"
+set_out="$("$M" auth set helper --yes --json --refresh-minutes 5 --env "ANTHROPIC_BASE_URL=http://127.0.0.1:$PORT/fake/anthropic" -- "$WORK/bin/fake-key")"
+expect_eq "$(json 'd.data.provisioned!==null' <<<"$set_out")" true "auth set helper provisions the key"
+SECRET="$MINIONS_HOME/projects/$ID_A/secrets/anthropic-api-key"
+expect_eq "$(stat -f '%Lp' "$SECRET")" 600 "host key file is 0600"
+for f in "$COMPOSE" "$MINIONS_HOME/projects/$ID_A/project.json"; do grep -qF "$KEY1" "$f" && fail "key leaked into $f"; done
+grep -qF "$KEY1" <<<"$set_out$("$M" auth show --json)$("$M" auth show)" && fail "key leaked into auth output"
+ok "key absent from compose.yaml, project.json and auth output"
+grep -q 'target: "/run/minions/secrets"' "$COMPOSE" && ! grep -q 'anthropic-api-key' "$COMPOSE" || fail "compose must mount the secrets directory"
+ok "compose mounts the secrets directory"
+start_out="$("$M" start --no-attach --json 2>&1)"
+grep -qF "$KEY1" <<<"$start_out" && fail "key leaked into start output"
+expect_eq "$(cx printenv MINIONS_AUTH_METHOD)" helper "container recreated with the helper method"
+expect_eq "$(cx printenv ANTHROPIC_BASE_URL)" "http://host.docker.internal:$PORT/fake/anthropic" "loopback base URL rewritten"
+cx test -r /run/minions/secrets/anthropic-api-key || fail "key not readable in container"; ok "key readable in container"
+expect_eq "$(cx cat /run/minions/secrets/anthropic-api-key)" "$KEY1" "container sees the provisioned key"
+cx sh -c 'echo x > /run/minions/secrets/anthropic-api-key' 2>/dev/null && fail "key file is writable in container"
+cx sh -c 'touch /run/minions/secrets/new' 2>/dev/null && fail "secrets dir is writable in container"
+ok "secrets mount is read-only"
+expect_eq "$(cx minions coordinator --print-command --json | json 'JSON.parse(d.data.args[d.data.args.indexOf("--settings")+1]).apiKeyHelper')" "cat /run/minions/secrets/anthropic-api-key" "coordinator settings carry apiKeyHelper"
+printf '%s' "$KEY2" > "$WORK/key.txt"
+"$M" auth refresh --json >/dev/null
+expect_eq "$(cx cat /run/minions/secrets/anthropic-api-key)" "$KEY2" "refreshed key visible through the directory mount (no restart)"
+doc="$("$M" doctor --json)"
+expect_eq "$(json 'd.data.checks.find(c=>c.name==="claude.auth").status' <<<"$doc")" ok "doctor: key readable in container"
+expect_eq "$(json 'd.data.checks.find(c=>c.name==="claude.baseUrl").status' <<<"$doc")" ok "doctor: base URL reachable from container"
+grep -qF "$KEY2" <<<"$doc" && fail "key leaked into doctor output"
+cx timeout 60 claude -p hello --settings '{"apiKeyHelper":"cat /run/minions/secrets/anthropic-api-key"}' </dev/null >/dev/null 2>&1 || true
+grep -q "POST /fake/anthropic/v1/messages.* $KEY2\$" "$WORK/fake-api.log" || fail "Claude Code did not send the helper key to the configured base URL"
+ok "Claude Code in the container sends the helper key to ANTHROPIC_BASE_URL"
+"$M" auth set login --yes --json >/dev/null
+"$M" start --no-attach --json >/dev/null
+expect_eq "$(cx printenv MINIONS_AUTH_METHOD)" login "back to login: container recreated"
+cx test ! -e /run/minions/secrets/anthropic-api-key || fail "secrets mount still present for login"
+cx minions coordinator --print-command --json | grep -q apiKeyHelper && fail "login settings must not set apiKeyHelper"
+ok "login method: no secrets mount, no apiKeyHelper"
+[ ! -e "$SECRET" ] && ok "host key file removed for login" || fail "host key file still present"
 
 step "uninstall"
 cd "$B"

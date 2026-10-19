@@ -1,0 +1,134 @@
+{
+  "schemaVersion": 1,
+  "configRevision": 1,
+  "projectId": "82b0030a-1ec5-45a5-9ecb-88b0184ba76e",
+  "packageVersion": "0.1.0",
+  "profile": "project-owner",
+  "visibility": "shared",
+  "backlog": {
+    "backend": "backlogmd",
+    "ownership": "direct",
+    "repository": null
+  },
+  "intake": {
+    "sources": [
+      "user",
+      "milestone"
+    ],
+    "startReady": true,
+    "scope": {
+      "milestone": null,
+      "externalAssignee": null,
+      "requiredLabels": [],
+      "allowedPaths": [
+        "**"
+      ]
+    }
+  },
+  "container": {
+    "required": true,
+    "workspace": "named-volume",
+    "cpus": 4,
+    "memoryMiB": 6144,
+    "pidsLimit": 512,
+    "publishPorts": [],
+    "network": "outbound-internet",
+    "mountHostRepository": false,
+    "mountDockerSocket": false
+  },
+  "execution": {
+    "maxActiveTasks": 2,
+    "maxEngineers": 2,
+    "oneActiveStagePerTask": true,
+    "maxRepairCyclesBeforeReplan": 3,
+    "attemptMaxTurns": 80
+  },
+  "models": {
+    "default": "sonnet",
+    "allowed": [
+      "sonnet",
+      "opus",
+      "haiku"
+    ],
+    "selection": "coordinator"
+  },
+  "delivery": {
+    "provider": "none",
+    "mode": "local",
+    "merge": "disabled",
+    "method": "squash",
+    "deleteMergedBranches": true,
+    "identityMode": "git-identity",
+    "requireIndependentApproval": true,
+    "requiredChecksConfigured": false
+  },
+  "verification": {
+    "commands": [
+      "npm run typecheck",
+      "npm test"
+    ],
+    "testerRequired": true,
+    "reviewerRequired": true,
+    "ciAuthority": "none"
+  },
+  "communication": {
+    "channel": "terminal",
+    "progress": "milestones"
+  },
+  "budgets": {
+    "taskUsd": null,
+    "dailyUsd": null
+  },
+  "capabilities": {
+    "task.read": "allow",
+    "task.create": "allow",
+    "task.update": "allow",
+    "task.start": "allow",
+    "external.read": "allow",
+    "external.comment": "ask",
+    "external.changeStatus": "ask",
+    "external.create": "ask",
+    "code.edit": {
+      "effect": "allow",
+      "rules": [
+        {
+          "effect": "deny",
+          "roles": [
+            "reviewer"
+          ]
+        }
+      ]
+    },
+    "dependencies.edit": "allow",
+    "architecture.change": "allow",
+    "migrations.edit": "allow",
+    "git.commit": "allow",
+    "git.push": "allow",
+    "pr.create": "allow",
+    "pr.review": "allow",
+    "pr.merge": "ask",
+    "ci.edit": "ask",
+    "infrastructure.edit": "ask",
+    "network.use": "allow",
+    "deploy.execute": "deny"
+  },
+  "sensitivePaths": [
+    ".github/workflows/**",
+    ".github/CODEOWNERS",
+    ".minions/**",
+    ".claude/**",
+    "CLAUDE.md",
+    "AGENTS.md",
+    "automation/**",
+    "infra/**",
+    "infrastructure/**",
+    "deploy/**",
+    "terraform/**",
+    "**/migrations/**"
+  ],
+  "architecture": "decide",
+  "git": {
+    "baseBranch": "main"
+  },
+  "permissionMode": "acceptEdits"
+}

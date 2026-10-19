@@ -7,6 +7,7 @@ import { MinionsError } from '../core/errors.js';
 import { readJson, readJsonIfExists } from '../core/fsutil.js';
 import { projectPaths, repoPaths } from '../core/paths.js';
 import { VERSION } from '../core/version.js';
+import { ClaudeAuthSchema } from './auth.js';
 
 const port = z.number().int().min(1).max(65535);
 
@@ -28,6 +29,11 @@ export const ProjectJsonSchema = z.object({
     publishPorts: z.array(z.object({ host: port, container: port }).strict()),
     network: z.enum(['outbound-internet', 'none']),
   }).strict(),
+  /**
+   * Claude authorization (host-only; never in shared/repository config, which the strict
+   * MinionsConfig schema rejects). Absent = interactive login inside the container.
+   */
+  claudeAuth: ClaudeAuthSchema.optional(),
 }).strict();
 export type ProjectJson = z.infer<typeof ProjectJsonSchema>;
 

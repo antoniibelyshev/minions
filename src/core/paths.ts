@@ -9,6 +9,8 @@ export function hostRoot(): string {
 }
 
 export const registryPath = () => join(hostRoot(), 'registry.json');
+/** Host-wide defaults applied to new projects at init (e.g. { claudeAuth }). */
+export const defaultsPath = () => join(hostRoot(), 'defaults.json');
 export const projectDir = (projectId: string) => join(hostRoot(), 'projects', projectId);
 
 export function projectPaths(projectId: string) {
@@ -25,6 +27,12 @@ export function projectPaths(projectId: string) {
     runtimeConfigJson: join(dir, 'runtime', 'config.json'),
     pluginDir: join(dir, 'plugin'),
     exportsDir: join(dir, 'exports'),
+    /** Host-provisioned secrets (dir 0700), bind-mounted read-only as a directory at /run/minions/secrets. */
+    secretsDir: join(dir, 'secrets'),
+    apiKeyFile: join(dir, 'secrets', 'anthropic-api-key'),
+    /** Non-secret record of the last key refresh (time, redacted error). */
+    authStateJson: join(dir, 'auth-state.json'),
+    logsDir: join(dir, 'logs'),
   };
 }
 export type ProjectPaths = ReturnType<typeof projectPaths>;
@@ -56,6 +64,8 @@ export function containerPaths(root = process.env.MINIONS_CONTAINER_ROOT ?? '') 
     exports: p('/state/exports'),
     claudeHome: p('/home/node/.claude'),
     cache: p('/home/node/.cache'),
+    secretsDir: p('/run/minions/secrets'),
+    apiKeyFile: p('/run/minions/secrets/anthropic-api-key'),
   };
 }
 export const CONTAINER = containerPaths('');

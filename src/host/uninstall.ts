@@ -70,6 +70,10 @@ export async function runUninstall(opts: UninstallOptions): Promise<UninstallRes
     for (const p of toRemove) { await rm(p, { force: true }); removed.push(p); await pruneEmptyDirs(dirname(p), p.startsWith(paths.dir) ? paths.dir : entry.repoPath); }
     await rm(paths.manifestJson, { force: true });
     await rm(paths.journalJson, { force: true });
+    // Host-provisioned Claude key copy and its non-secret refresh state (the original source is untouched).
+    await rm(paths.secretsDir, { recursive: true, force: true });
+    await rm(paths.authStateJson, { force: true });
+    await rm(paths.logsDir, { recursive: true, force: true });
     await pruneEmptyDirs(paths.dir, dirname(paths.dir));
     const reg = await loadRegistry();
     if (reg.projects[projectId]) { delete reg.projects[projectId]; await saveRegistry(reg); }

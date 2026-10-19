@@ -12,6 +12,7 @@ import { imageTag, projectPaths, registryPath, repoPaths, volumeNames } from '..
 import { VERSION } from '../core/version.js';
 import { generatePlugin } from '../plugin/generate.js';
 import { discover, dockerProbe, type Discovery, type DockerProbe, type DockerStatus } from './discovery.js';
+import { authOf, isKeyAuth, loadDefaults, resolveOnPath, summarize, type AuthSummary, type ClaudeAuth } from './auth.js';
 import { composeYaml, type Runner } from './docker.js';
 import { ProjectJsonSchema, resolveEffective, runtimeProjectInfo, sharedConfigView, type ProjectJson } from './project.js';
 import { bindProject, gitCommonDir, loadRegistry, repoRoot, resolveIdentity, saveRegistry, sharedProjectId, type Identity, type Registry } from './registry.js';
@@ -104,6 +105,7 @@ export interface InstallPlan {
   warnings: string[];
   container: ProjectJson['container'] & { image: string; volumes: string[] };
   gitIdentity: { name: string; email: string };
+  claudeAuth: AuthSummary;
   discovery: Discovery;
 }
 
@@ -121,6 +123,8 @@ export interface InitOptions {
   io?: WizardIO;
   dockerProbe?: DockerProbe;
   runner?: Runner;
+  /** Wizard: whether `central` is on PATH (default: PATH lookup, never executed). */
+  centralOnPath?: boolean;
 }
 
 interface Prepared { plan: InstallPlan; desired: Desired[]; manifest: Manifest | undefined; registry: Registry; cleanup: () => Promise<void> }
@@ -206,6 +210,9 @@ async function prepare(opts: InitOptions): Promise<Prepared> {
   if (visibility === 'shared' && sharedExists) { existingRaw = await readJsonIfExists(sharedPath); existingFile = sharedPath; }
   else if (visibility !== 'shared' && await exists(paths.configJson)) { existingRaw = await readJsonIfExists(paths.configJson); existingFile = paths.configJson; }
 
+  // Claude authorization is host-only: previous project.json, else <MINIONS_HOME>/defaults.json, else login.
+  const defaults = await loadDefaults();
+  let claudeAuth: ClaudeAuth | undefined = prevProject?.claudeAuth ?? defaults.claudeAuth;
   let config: MinionsConfig;
   if (existingRaw && !opts.configFile) {
     const profile = (existingRaw.profile as Profile | undefined) ?? 'project-owner';
@@ -227,8 +234,10 @@ async function prepare(opts: InitOptions): Promise<Prepared> {
     const r = await runWizard({
       discovery, projectId, profile: opts.profile, visibility, configFile: opts.configFile,
       yes: !!opts.yes, io: opts.io,
+      auth: { default: claudeAuth, centralOnPath: opts.centralOnPath ?? !!(await resolveOnPath('central')) },
     });
     config = r.config;
+    claudeAuth = r.claudeAuth ?? claudeAuth;
     notes.push(...r.notes);
   }
   config = validateConfig({ ...config, projectId }, 'install');
@@ -243,6 +252,7 @@ async function prepare(opts: InitOptions): Promise<Prepared> {
       cpus: config.container.cpus, memoryMiB: config.container.memoryMiB, pidsLimit: config.container.pidsLimit,
       publishPorts: config.container.publishPorts, network: config.container.network,
     },
+    ...(claudeAuth ? { claudeAuth } : {}),
   };
 
   // Project config layer as written to disk, and the effective config for the runtime.
@@ -323,12 +333,15 @@ async function prepare(opts: InitOptions): Promise<Prepared> {
     externalSetup: [
       'Docker Desktop running (compose v2+).',
       `Runtime image ${project.imageTag} is built from the installed package on first \`minions start\`.`,
-      'Claude login inside the container on first start: run /login in the coordinator session (host login is not reused).',
+      isKeyAuth(authOf(project))
+        ? `Claude key from ${summarize(authOf(project)).source} is provisioned by the host on every \`minions start\` (mounted read-only; no /login needed).`
+        : 'Claude login inside the container on first start: run /login in the coordinator session (host login is not reused).',
       'Repository is imported into the container from a Git bundle of committed history on first start.',
     ],
     notes, warnings,
     container: { ...project.container, image: project.imageTag, volumes: Object.values(volumeNames(projectId)) },
     gitIdentity: config.git.identity,
+    claudeAuth: summarize(authOf(project), paths.secretsDir),
     discovery,
   };
   return { plan, desired, manifest, registry, cleanup };
@@ -435,6 +448,20 @@ export async function refreshDerived(project: ProjectJson, effective: MinionsCon
   return warnings;
 }
 
+/** Writes a manifest-tracked generated file (e.g. project.json after `minions auth set`) and records its hash. */
+export async function writeGenerated(projectId: string, path: string, data: Buffer): Promise<void> {
+  const paths = projectPaths(projectId);
+  const manifest = await loadManifest(projectId);
+  await atomicWrite(path, data);
+  if (!manifest) return;
+  const entry = manifest.files.find((f) => f.path === path);
+  const h = sha256(data);
+  if (entry) entry.sha256 = h; else manifest.files.push({ path, sha256: h, owner: 'minions' });
+  await writeJson(paths.manifestJson, manifest);
+}
+
+export const projectJsonBytes = (p: ProjectJson) => json(p);
+
 // ---------------------------------------------------------------- init
 
 export interface InitResult {
@@ -477,7 +504,9 @@ export async function runInit(opts: InitOptions): Promise<InitResult> {
       dryRun: false, plan, applied, docker: after,
       nextSteps: [
         'Run `minions start` in this repository.',
-        'The first start builds the runtime image, imports committed history, and opens the coordinator; log in to Claude inside the container with /login.',
+        prep.plan.claudeAuth.method === 'login'
+          ? 'The first start builds the runtime image, imports committed history, and opens the coordinator; log in to Claude inside the container with /login.'
+          : 'The first start builds the runtime image, provisions the Claude key, imports committed history, and opens the coordinator.',
         'Run `minions doctor` to check readiness at any time.',
       ],
     };
@@ -496,6 +525,7 @@ export function formatPlan(plan: InitResult['plan']): string {
   L.push('', `Git identity for agent commits: ${plan.gitIdentity.name} <${plan.gitIdentity.email}>`);
   L.push(`Container: ${plan.container.image}, ${plan.container.cpus} CPUs, ${plan.container.memoryMiB} MiB, ${plan.container.pidsLimit} pids, ports: ${plan.container.publishPorts.map((p) => `127.0.0.1:${p.host}->${p.container}`).join(', ') || 'none'}`);
   L.push(`Verification commands (run inside the container): ${plan.verificationCommands.join('; ') || 'none inferred'}`);
+  L.push(`Claude authorization: ${plan.claudeAuth.method}${plan.claudeAuth.preset ? ` (${plan.claudeAuth.preset})` : ''}: ${plan.claudeAuth.source}`);
   L.push('', 'Unavailable in v0.1:');
   for (const u of plan.unavailable.settings) L.push(`  - ${u.path}: ${u.reason}`);
   L.push(`  - ${plan.unavailable.features.join(', ')}`);

@@ -6,6 +6,8 @@ import { action, globalOpts, requireMode } from '../core/cli-helpers.js';
 import { MinionsError } from '../core/errors.js';
 import { emit } from '../core/output.js';
 import { CONTAINER } from '../core/paths.js';
+import { registerAuth } from './auth-cli.js';
+import { authOf, ensureSecretsDir, isKeyAuth, refreshKey, startRefreshTimer } from './auth.js';
 import { dockerProbe } from './discovery.js';
 import { Compose, ensureImage } from './docker.js';
 import { formatDoctor, runDoctor } from './doctor.js';
@@ -32,9 +34,22 @@ async function openProject(json: boolean) {
   return { project, config: eff.config, compose: new Compose(projectId) };
 }
 
-async function ensureUp(json: boolean) {
+/**
+ * Starts the container. For Claude key methods the secrets dir must exist (bind source); with
+ * `provision` the key is (re)obtained first and a failure stops here with AUTH_REQUIRED.
+ * `compose up -d` recreates the container whenever compose.yaml changed (method, env, mounts).
+ */
+async function ensureUp(json: boolean, opts: { provision?: boolean } = {}) {
   await requireDocker();
   const p = await openProject(json);
+  const auth = authOf(p.project);
+  if (isKeyAuth(auth)) {
+    await ensureSecretsDir(p.project.projectId);
+    if (opts.provision) {
+      say(json, `Refreshing the Claude key on the host (${auth.method === 'helper' ? `running \`${auth.command[0]}\`` : 'reading the configured source'})…`);
+      await refreshKey(p.project.projectId, auth);
+    }
+  }
   if (await ensureImage(p.project.imageTag, { onBuild: (m) => say(json, m) })) say(json, `Built ${p.project.imageTag}.`);
   await p.compose.up();
   await p.compose.exec(['minions', 'workspace', 'setup', '--json'], { timeoutMs: 120_000 });
@@ -52,6 +67,7 @@ async function confirm(question: string): Promise<boolean> {
 
 /** Registers host commands on the root program. */
 export function register(program: Command): void {
+  registerAuth(program, async (plan) => { process.stderr.write(plan + '\n'); return confirm('Apply? (y/n)'); });
   program.command('init [path]')
     .description('Inspect a Git repository, propose an install plan, apply it, and verify Docker')
     .addOption(new Option('--profile <profile>', 'starting profile').choices([...PROFILES]))
@@ -96,7 +112,7 @@ export function register(program: Command): void {
     .action(action(async (o: { attach: boolean }, cmd: Command) => {
       requireMode('host');
       const { json } = globalOpts(cmd);
-      const { project, compose } = await ensureUp(json);
+      const { project, compose } = await ensureUp(json, { provision: true });
       let imported: unknown = null;
       if (!(await repoPresent(compose))) {
         say(json, `Importing committed history of ${project.baseBranch} into the container…`);
@@ -110,8 +126,12 @@ export function register(program: Command): void {
           { json, human: () => `Container ${compose.name} is running. Run \`minions start\` in a terminal to attach the coordinator.` });
         return;
       }
-      say(json, 'Attaching the coordinator (tmux session "coordinator"). On first start, log in to Claude with /login.');
-      process.exitCode = await compose.execInherit(['minions', 'coordinator'], { tty: true });
+      const auth = authOf(project);
+      say(json, auth.method === 'login'
+        ? 'Attaching the coordinator (tmux session "coordinator"). On first start, log in to Claude with /login.'
+        : 'Attaching the coordinator (tmux session "coordinator"). Claude uses the host-provisioned key.');
+      const stopRefresh = startRefreshTimer(project.projectId, auth, { onWarn: (line) => process.stderr.write(`\r\n${line}\r\n`) });
+      try { process.exitCode = await compose.execInherit(['minions', 'coordinator'], { tty: true }); } finally { stopRefresh(); }
     }));
 
   program.command('down')

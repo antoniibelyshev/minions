@@ -21,7 +21,8 @@ ignored `.env` absent, volumes survive recreation. All test resources are remove
 
 `npm run e2e` (scripts/e2e.sh) drives the full terminal workflow without a Claude login: pack and
 install into a temp prefix, private and shared `init`, `doctor`, `start --no-attach`, the
-engineer → tester → reviewer lease flow, hooks, `export`, restart persistence, and `uninstall`.
+engineer → tester → reviewer lease flow, hooks, `export`, restart persistence, helper-mode Claude
+key provisioning (fake key script), and `uninstall`.
 It uses a temp `MINIONS_HOME` and disposable repos and removes its containers and volumes on exit.
 
 ## Known gaps
@@ -34,8 +35,17 @@ It uses a temp `MINIONS_HOME` and disposable repos and removes its containers an
   locally (needs network access to Docker Hub, Debian mirrors, and npm). The image carries a
   `minions.build` label (hash of `dist/cli.js`, the Dockerfile and `package.json`); `minions start`
   rebuilds it when the installed package differs, and `doctor` warns about a stale image.
-- **Claude login** happens interactively inside the container (`/login`) and is stored in the
-  project's `claude` volume. API-key provisioning and host login reuse are not supported.
+- **Claude authorization** defaults to an interactive `/login` inside the container (stored in the
+  project's `claude` volume). Host-provisioned keys (`minions auth set api-key|helper|jbcentral`) are
+  supported: the key file is mounted read-only as a directory at `/run/minions/secrets` and Claude
+  Code 2.1.292 reads it through `apiKeyHelper` (re-read every `CLAUDE_CODE_API_KEY_HELPER_TTL_MS` =
+  5 min). `npm run e2e` verifies this with a fake helper and a fake local endpoint: the key is
+  readable and read-only in the container, a refreshed key becomes visible without a restart, the
+  loopback base URL is rewritten to `host.docker.internal`, and Claude Code sends the key to it.
+  The real JetBrains Central flow (`central proxy start … --return-key` + the local proxy on
+  `127.0.0.1:19516`) is not exercised by the automated tests; reaching the host proxy at
+  `host.docker.internal` was verified manually on Docker Desktop. Other engines get an
+  `extra_hosts: host.docker.internal:host-gateway` entry (untested). Host login reuse is not supported.
 - **Outbound network is unrestricted** in the container (`network: outbound-internet`). There is no
   egress allowlist, and the container can reach the host/LAN like any Docker Desktop container.
 - **Single container, shared credentials**: engineer, tester, and reviewer run in one container and

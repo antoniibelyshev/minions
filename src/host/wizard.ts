@@ -1,13 +1,15 @@
 // Init wizard (spec §7). Questions are prefilled from the profile, an existing config, and discovery.
 // Questions whose answer cannot change v0.1 behaviour are shown as information only, with the
-// deferred options marked "(not available in v0.1)". Never asks for secrets.
+// deferred options marked "(not available in v0.1)". Never asks for secrets: the Claude
+// authorization question only asks where the host should read a key from, never the key itself.
 import { createInterface } from 'node:readline/promises';
 import { profileDefaults } from '../config/profiles.js';
 import { validateConfig } from '../config/resolve.js';
 import { PROFILES, type MinionsConfig, type Profile } from '../config/schema.js';
 import { MinionsError } from '../core/errors.js';
-import { readJson } from '../core/fsutil.js';
+import { parseWith, readJson } from '../core/fsutil.js';
 import { VERSION } from '../core/version.js';
+import { ClaudeAuthSchema, PRESETS, checkUrl, parseEnvPairs, type ClaudeAuth } from './auth.js';
 import type { Discovery } from './discovery.js';
 
 export interface WizardIO {
@@ -41,9 +43,11 @@ export interface WizardInput {
   /** --yes: accept defaults. */
   yes: boolean;
   io?: WizardIO;
+  /** Claude authorization: default (previous project / defaults.json) and preset detection. */
+  auth?: { default?: ClaudeAuth; centralOnPath?: boolean; home?: string };
 }
 
-export interface WizardResult { config: MinionsConfig; notes: string[]; asked: string[] }
+export interface WizardResult { config: MinionsConfig; notes: string[]; asked: string[]; claudeAuth?: ClaudeAuth }
 
 const NA = '(not available in v0.1)';
 
@@ -125,6 +129,7 @@ export async function runWizard(input: WizardInput): Promise<WizardResult> {
     profile = await ask('profile', 'Starting profile', profile, choice(PROFILES));
   }
   const { config: cfg, notes } = baseConfig(input, profile);
+  let claudeAuth = input.auth?.default;
 
   // 2. Visibility.
   if (input.visibility) cfg.visibility = input.visibility;
@@ -143,8 +148,8 @@ export async function runWizard(input: WizardInput): Promise<WizardResult> {
     io.info(`Delivery: local commits on agent/<slug> branches, fetched with \`minions export\`. Branch push, pull requests, auto-merge ${NA}.`);
     // 6. Communication.
     io.info(`Communication: terminal. Telegram ${NA}.`);
-    // 7. Credentials — none requested here.
-    io.info('Credentials: log in to Claude inside the container (/login) on first `minions start`; host login is not reused.');
+    // 7. Credentials — references only, never secret values.
+    claudeAuth = parseWith(ClaudeAuthSchema, await askClaudeAuth(input, ask, io), 'wizard answers (Claude authorization)');
     io.info(`GitHub credential provisioning ${NA}. minions never asks for secrets in this wizard.`);
   }
   if (!cfg.git.identity.name || !cfg.git.identity.email) {
@@ -170,5 +175,60 @@ export async function runWizard(input: WizardInput): Promise<WizardResult> {
   }
   if (cfg.container.cpus > d.host.cpus) notes.push(`container.cpus ${cfg.container.cpus} exceeds host CPUs (${d.host.cpus}).`);
   if (cfg.container.memoryMiB > d.host.memoryMiB) notes.push(`container.memoryMiB ${cfg.container.memoryMiB} exceeds host memory (${d.host.memoryMiB} MiB).`);
-  return { config: validateConfig(cfg, 'wizard answers'), notes, asked };
+  return { config: validateConfig(cfg, 'wizard answers'), notes, asked, ...(claudeAuth ? { claudeAuth } : {}) };
+}
+
+type Ask = <T>(id: string, q: string, def: string, parse: (s: string) => T) => Promise<T>;
+
+/** Splits a command line into argv (whitespace, with '…' / "…" quoting). Never passed to a shell. */
+export function splitArgv(s: string): string[] {
+  const out: string[] = [];
+  const re = /"([^"]*)"|'([^']*)'|(\S+)/g;
+  for (let m; (m = re.exec(s));) out.push(m[1] ?? m[2] ?? m[3]!);
+  if (!out.length) throw new Error('enter a command');
+  return out;
+}
+
+async function askClaudeAuth(input: WizardInput, ask: Ask, io: WizardIO): Promise<ClaudeAuth> {
+  const def = input.auth?.default;
+  const opts: { id: 'login' | 'api-key' | 'jbcentral' | 'helper'; label: string }[] = [
+    { id: 'login', label: 'Claude login inside container (default)' },
+    { id: 'api-key', label: 'API key from file/Keychain/env' },
+    ...(input.auth?.centralOnPath ? [{ id: 'jbcentral' as const, label: 'JetBrains Central (detected)' }] : []),
+    { id: 'helper', label: 'Custom host helper command' },
+  ];
+  const ids = opts.map((o) => o.id);
+  const defId = def?.preset === 'jbcentral' && ids.includes('jbcentral') ? 'jbcentral' : def?.method === 'api-key' ? 'api-key' : def?.method === 'helper' ? 'helper' : 'login';
+  io.info('Claude authorization (host-side setting; never stored in the repository):');
+  io.info('  ' + opts.map((o, i) => `${i + 1}) ${o.label}`).join('  '));
+  const pick = await ask('claudeAuth.method', 'Claude authorization', defId, choice(ids));
+  if (pick === defId && def && (pick !== 'login' || def.method === 'login')) {
+    const keep = await ask('claudeAuth.keep', 'Keep the current/default settings for it? (y/n)', 'y', yesNo);
+    if (keep) return def;
+  }
+  if (pick === 'login') {
+    io.info('  Log in with /login in the coordinator session on first `minions start`; host login is not reused.');
+    return { method: 'login' };
+  }
+  if (pick === 'jbcentral') {
+    try { return await PRESETS.jbcentral!.expand({ home: input.auth?.home }); } catch (e) {
+      io.info(`  ${(e as Error).message} (${(e as MinionsError).hint ?? ''})`);
+      const baseUrl = await ask('claudeAuth.baseUrl', 'Central proxy base URL (ANTHROPIC_BASE_URL)', '', (s) => checkUrl(nonEmpty(s), 'base URL'));
+      return PRESETS.jbcentral!.expand({ baseUrl });
+    }
+  }
+  const env = await ask('claudeAuth.env', 'Extra container env for Claude (NAME=VALUE separated by spaces, or none)', 'none',
+    (s) => (s.trim() === 'none' ? {} : parseEnvPairs(s.trim().split(/\s+/))));
+  const withEnv = Object.keys(env).length ? { env } : {};
+  if (pick === 'helper') {
+    io.info('  The command runs on the host (argv, no shell) on start and every 30 minutes while attached; it must print the key.');
+    const command = await ask('claudeAuth.command', 'Host helper command', def?.method === 'helper' ? def.command.join(' ') : '', splitArgv);
+    return { method: 'helper', command, ...withEnv };
+  }
+  const type = await ask('claudeAuth.source', 'Where does the host read the key? (file/keychain/env)', 'keychain', choice(['file', 'keychain', 'env'] as const));
+  if (type === 'file') return { method: 'api-key', source: { type, path: await ask('claudeAuth.file', 'Path of the key file on the host (0600, outside the repo)', '', nonEmpty) }, ...withEnv };
+  if (type === 'env') return { method: 'api-key', source: { type, name: await ask('claudeAuth.envVar', 'Host environment variable name', 'ANTHROPIC_API_KEY', nonEmpty) }, ...withEnv };
+  const service = await ask('claudeAuth.keychainService', 'Keychain item service', 'minions-anthropic', nonEmpty);
+  const account = await ask('claudeAuth.keychainAccount', 'Keychain item account', process.env.USER ?? 'minions', nonEmpty);
+  return { method: 'api-key', source: { type, service, account }, ...withEnv };
 }
