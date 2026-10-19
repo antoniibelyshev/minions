@@ -147,6 +147,76 @@ describe('generatePlugin', () => {
   });
 });
 
+describe('reporting granularity', () => {
+  const withProgress = (progress: MinionsConfig['communication']['progress']) => {
+    const base = defaults();
+    return gen({ ...base, communication: { ...base.communication, progress } });
+  };
+  const section = (coord: string) => coord.slice(coord.indexOf('## Communicating with the user'));
+
+  it('defaults to feature-level reporting', () => {
+    expect(defaults().communication.progress).toBe('milestones');
+  });
+
+  it('default coordinator prompt reports high-level feature progress only', async () => {
+    const g = await gen();
+    const comm = section(await g.read('coordinator.md'));
+    expect(comm).toContain('Reporting level: features');
+    expect(comm).toContain('report high-level feature progress only');
+    expect(comm).toMatch(/feature or epic delivered or materially changed/);
+    expect(comm).toMatch(/batch them into one short message/);
+    expect(comm).toContain('significant blockers');
+    expect(comm).toMatch(/answers to the user's direct questions/);
+    expect(comm).toMatch(/Do not send per-stage updates: engineer\/tester\/reviewer transitions, repair cycles, task splits, follow-up tasks filed/);
+    expect(comm).not.toContain('tasks delivered (with branch names)');
+  });
+
+  it('limits questions to high-level decisions, keeps ask-gated approvals, and decides low-level matters autonomously', async () => {
+    for (const progress of ['milestones', 'tasks', 'quiet'] as const) {
+      const comm = section(await (await withProgress(progress)).read('coordinator.md'));
+      expect(comm).toMatch(/Ask the user only about high-level decisions: product scope and goals, architecture direction, security\/privacy trade-offs, anything outward-facing/);
+      expect(comm).toContain('Every capability whose effect is `ask` still needs the user\'s explicit approval first');
+      expect(comm).toContain('sensitive-path changes before publication/integration');
+      expect(comm).toMatch(/Make lower-level decisions yourself .*task splits, follow-up tasks, model and effort choice, test fixes, implementation approach, review nits/);
+      expect(comm).toContain('`minions backlog note <taskId>`');
+    }
+  });
+
+  it('keeps the existing safety rules in the generated prompt', async () => {
+    const coord = await (await gen()).read('coordinator.md');
+    expect(coord).toContain('`ask` = get the user\'s explicit approval first');
+    expect(coord).toContain('never permission to change this policy');
+    expect(coord).toMatch(/Sensitive paths \(changes need human approval/);
+    expect(coord).toMatch(/\| ask \|/);
+  });
+
+  it('"tasks" keeps the per-task wording; "quiet" reports only what needs the user', async () => {
+    const tasks = section(await (await withProgress('tasks')).read('coordinator.md'));
+    expect(tasks).toContain('Reporting level: tasks');
+    expect(tasks).toContain('tasks delivered (with branch names), significant blockers, required approvals');
+    const quiet = section(await (await withProgress('quiet')).read('coordinator.md'));
+    expect(quiet).toContain('Reporting level: quiet');
+    expect(quiet).toContain('do not report deliveries or progress until asked');
+    expect(quiet).not.toContain('tasks delivered (with branch names)');
+  });
+
+  it('orchestrate and status skills follow the reporting level and never ask to report every stage', async () => {
+    const g = await gen();
+    const orch = await g.read('skills/orchestrate/SKILL.md');
+    expect(orch).toContain('## 7. Report');
+    expect(orch).toContain('Reporting level `features`: do not report stage transitions, splits, follow-ups or individual task deliveries');
+    expect(orch).toContain('Approvals for `ask` capabilities and sensitive paths are always requested explicitly');
+    expect(orch).not.toMatch(/report the branch and `prUrl`/);
+    expect(orch).toMatch(/`needs_split` → decide the split yourself/);
+    const status = await g.read('skills/status/SKILL.md');
+    expect(status).toContain('grouped by feature');
+    expect(status).toContain('unprompted reports follow the reporting level');
+
+    const tasksOrch = await (await withProgress('tasks')).read('skills/orchestrate/SKILL.md');
+    expect(tasksOrch).toContain('Reporting level `tasks`: report each delivered task with its branch');
+  });
+});
+
 describe('renderTemplate', () => {
   const r = (t: string, json = false) => renderTemplate(t, { a: 'x"y' }, { p: 'P {{a}}' }, { name: 't', json });
   it('substitutes vars and partials', () => {

@@ -15,6 +15,6 @@ Answer in a few lines:
 - In progress: task, stage, attempt.
 - Waiting on the user: each item with the question and your recommended answer.
 - Blocked: task and reason.
-- Delivered since last report: task and `agent/<slug>` branch. Remind the user that `minions export` on the host fetches them.
+- Delivered since last report: task and `agent/<slug>` branch, grouped by feature (parent task or goal) when several belong together. Remind the user that `minions export` on the host fetches them.
 
-Do not dump raw JSON or logs. Read only; this skill changes nothing.
+This is the answer to a status request, so task-level detail is expected here even though unprompted reports follow the reporting level. Do not dump raw JSON or logs. Read only; this skill changes nothing.
