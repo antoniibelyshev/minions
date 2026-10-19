@@ -1,8 +1,10 @@
 import { randomBytes } from 'node:crypto';
 import type { BacklogAdapter, ScopeFilter, Task, TaskStatus } from '../backlog/types.js';
 import { can } from '../config/capabilities.js';
+import { isGithubDelivery } from '../config/delivery.js';
 import type { MinionsConfig } from '../config/schema.js';
 import { MinionsError } from '../core/errors.js';
+import { syncBaseFromOrigin, type BaseSyncResult } from './base-sync.js';
 import type { Lease, LeaseRole, PublicationState, RuntimeDb } from './db.js';
 import { removeLeaseFiles, type HandoffPaths } from './handoff.js';
 import { publishTask, type PublishInput, type PublishOutcome } from './publish.js';
@@ -30,6 +32,8 @@ export interface SchedulerDeps {
   publisher?: (input: PublishInput) => Promise<PublishOutcome>;
   /** Where briefs and submitted results live; their files are removed whenever a lease ends. Omitted: no file cleanup. */
   handoff?: HandoffPaths;
+  /** GitHub delivery: pre-claim fetch + fast-forward of the base from origin (tests may inject one). */
+  baseSync?: (repo: string, base: string) => Promise<BaseSyncResult>;
 }
 
 /** Result of a publication attempt (`minions work publish`, or embedded in a record response). */
@@ -123,12 +127,14 @@ export class Scheduler {
   readonly layout: WorkspaceLayout;
   private readonly publisher: (input: PublishInput) => Promise<PublishOutcome>;
   private readonly handoff: HandoffPaths | null;
+  private readonly baseSync: (repo: string, base: string) => Promise<BaseSyncResult>;
 
   constructor(deps: SchedulerDeps) {
     this.db = deps.db; this.backlog = deps.backlog; this.config = deps.config;
     this.layout = deps.layout ?? workspaceLayout();
     this.handoff = deps.handoff ?? null;
     this.publisher = deps.publisher ?? publishTask;
+    this.baseSync = deps.baseSync ?? ((repo, base) => syncBaseFromOrigin(repo, base));
   }
 
   list(opts: { all?: boolean; taskId?: string } = {}): Lease[] { return this.db.leases(opts); }
@@ -174,6 +180,7 @@ export class Scheduler {
         if (d.status !== 'done' && d.status !== 'delivered') throw new MinionsError('PRECONDITION', `Task ${task.id} depends on ${dep}, which is "${d.status}".`);
       }
     }
+    if (isGithubDelivery(cfg)) await this.syncBase(task.id, role);
     const allTasks = await this.backlog.listTasks();
     const { branch, slug } = this.branchForTask(task);
     const leaseId = newLeaseId();
@@ -229,6 +236,23 @@ export class Scheduler {
     }
 
     return this.buildBrief(this.db.lease(leaseId)!, task, { attempt, branch, worktree, baseBranch, baseSha, head, startEffect });
+  }
+
+  /**
+   * GitHub delivery: origin/<base> is the single source of truth. Fetch it and fast-forward the local
+   * base before any lease exists; a fetch failure or a local base that origin does not contain blocks
+   * the claim (the error propagates unchanged and is recorded as a `base-sync-blocked` event).
+   */
+  private async syncBase(taskId: string, role: LeaseRole): Promise<void> {
+    const base = this.config.git.baseBranch;
+    try {
+      const r = await this.baseSync(this.layout.repo, base);
+      if (r.action !== 'up-to-date') this.db.addEvent('base-sync', taskId, { role, ...r });
+    } catch (e) {
+      const err = e as Partial<MinionsError>;
+      this.db.addEvent('base-sync-blocked', taskId, { role, base, code: err.code ?? 'INTERNAL', message: err.message ?? String(e), details: err.details ?? null });
+      throw e;
+    }
   }
 
   private buildBrief(lease: Lease, task: Task, x: { attempt: number; branch: string; worktree: string; baseBranch: string; baseSha: string; head: string; startEffect: string }): TaskBrief {

@@ -1,9 +1,15 @@
 // Source phase of `minions upgrade` (host), run before any container step:
 //   sync: `--from-container` exports the container's branches (exportRepo) and fast-forwards one host
 //         branch to refs/remotes/minions/<base>, only on a strict fast-forward with clean trees.
+//         Local delivery only.
+//   origin: GitHub delivery (branch / pull-request): origin/<base> is the single source of truth. In a
+//         minions checkout the host base is fetched from origin and strictly fast-forwarded, and the
+//         CLI is built only when the checkout is exactly the reviewed origin/<base> commit (clean tree);
+//         --from-container is refused.
 //   cli:  when the project repo is a minions checkout, compares the installed global CLI with it and
 //         rebuilds/reinstalls, or prints the exact command and stops before the container steps.
-// Decision record: docs/design/bootstrap.md, "Upgrade from the container".
+// Decision records: docs/design/bootstrap.md, "Upgrade from the container" and "origin/<base> as the
+// single source of truth".
 //
 // - The host branch only ever moves forward: `merge --ff-only` where it is checked out, else
 //   `update-ref <ref> <new> <old>`. Never a force, reset, checkout or stash; a dirty tree or a
@@ -31,12 +37,16 @@ const BUILD_DEPS = ['esbuild', 'zod', 'commander'];
 
 export interface SourceStep { id: 'sync' | 'cli'; status: 'done' | 'skipped' | 'failed' | 'planned'; detail: string }
 
-// ---------------------------------------------------------------- sync (--from-container)
+// ---------------------------------------------------------------- sync (--from-container / origin)
 
 export interface SyncResult {
+  /** container: `--from-container` (local delivery); origin: GitHub delivery, the reviewed origin/<base>. */
+  source: 'container' | 'origin';
   branch: string;
   /** Remote-tracking ref the branch is fast-forwarded to. */
   target: string;
+  /** Commit of `target` (for `ahead`, `to` stays the branch head). */
+  targetSha: string;
   from: string | null;
   to: string | null;
   action: 'fast-forward' | 'up-to-date' | 'ahead';
@@ -62,27 +72,25 @@ export interface SyncOptions {
 
 const short = (sha: string | null) => sha?.slice(0, 12) ?? '(none)';
 
-export async function syncFromContainer(opts: SyncOptions): Promise<SyncResult> {
-  const runner = opts.runner ?? run;
-  const git = (args: string[], cwd = opts.repo) => runner('git', [...HOST_GIT, ...args], { cwd, allowFailure: true, timeoutMs: 120_000 });
-  const branch = opts.branch;
-  const fmt = await git(['check-ref-format', `refs/heads/${branch}`]);
-  if (fmt.code !== 0 || branch.startsWith('-')) throw new MinionsError('PRECONDITION', `--from-container: "${branch}" is not a valid branch name.`);
-  const target = `refs/remotes/minions/${opts.baseBranch}`;
+type HostGit = (args: string[], cwd?: string) => Promise<RunResult>;
+const hostGit = (repo: string, runner: Runner): HostGit => (args, cwd = repo) => runner('git', [...HOST_GIT, ...args], { cwd, allowFailure: true, timeoutMs: 120_000 });
 
-  const exported = opts.dryRun ? null : (await opts.exportRepo()).changes;
+/**
+ * Strict fast-forward of host branch `branch` to `target` (merge --ff-only where it is checked out, else
+ * update-ref with the old value). `label` prefixes every message; `rerun` is the command to retry.
+ */
+async function fastForwardHost(git: HostGit, o: { repo: string; branch: string; target: string; label: string; reflog: string; rerun: string; dryRun: boolean; missingHint: string }):
+  Promise<Omit<SyncResult, 'source' | 'exported'>> {
+  const { branch, target, label } = o;
   const sha = async (ref: string) => {
     const r = await git(['rev-parse', '--verify', '--quiet', `${ref}^{commit}`]);
     return r.code === 0 ? r.stdout.trim() : null;
   };
   const to = await sha(target);
-  if (!to) {
-    throw new MinionsError('PRECONDITION', `--from-container: ${target} does not exist${opts.dryRun ? ' (no export yet; the dry run does not export)' : ' after the export'}.`,
-      opts.dryRun ? 'Run `minions export` first to preview against the container state.' : `The container has no ${opts.baseBranch} branch to take.`);
-  }
+  if (!to) throw new MinionsError('PRECONDITION', `${label}: ${target} does not exist${o.dryRun ? ' (the dry run does not fetch)' : ''}.`, o.missingHint);
   const from = await sha(`refs/heads/${branch}`);
-  if (!from) throw new MinionsError('PRECONDITION', `--from-container: the host has no branch ${branch}.`, `Create it first (git branch ${shellQuote(branch)} ${target}) or choose another branch.`);
-  const base: Omit<SyncResult, 'action' | 'method' | 'applied'> = { branch, target, from, to, worktree: null, exported };
+  if (!from) throw new MinionsError('PRECONDITION', `${label}: the host has no branch ${branch}.`, `Create it first (git branch ${shellQuote(branch)} ${target}) or choose another branch.`);
+  const base = { branch, target, targetSha: to, from, to, worktree: null };
   if (from === to) return { ...base, action: 'up-to-date', method: null, applied: false };
 
   const isAncestor = async (a: string, b: string) => {
@@ -93,8 +101,8 @@ export async function syncFromContainer(opts: SyncOptions): Promise<SyncResult> 
   if (!(await isAncestor(from, to))) {
     if (await isAncestor(to, from)) return { ...base, to: from, action: 'ahead', method: null, applied: false };
     throw new MinionsError('CONFLICT',
-      `--from-container: ${branch} (${short(from)}) and ${target} (${short(to)}) have diverged; refusing to move ${branch} (only strict fast-forwards are applied).`,
-      `Nothing was changed. Merge or rebase yourself, e.g. \`git merge ${target}\` on ${branch}, then rerun \`minions upgrade\`.`);
+      `${label}: ${branch} (${short(from)}) and ${target} (${short(to)}) have diverged; refusing to move ${branch} (only strict fast-forwards are applied).`,
+      `Nothing was changed. Merge or rebase yourself, e.g. \`git merge ${target}\` on ${branch}, then rerun \`${o.rerun}\`.`);
   }
 
   // Where is the branch checked out? Every worktree of the repository counts, not only the main one.
@@ -105,37 +113,114 @@ export async function syncFromContainer(opts: SyncOptions): Promise<SyncResult> 
     else if (line === `branch refs/heads/${branch}` && current) { worktree = current; break; }
   }
   // Clean trees only: the repository's own worktree always, and the one that has the branch.
-  for (const dir of [...new Set([opts.repo, ...(worktree ? [worktree] : [])])]) {
-    const st = await git(['status', '--porcelain'], dir);
-    if (st.code !== 0) throw new MinionsError('PRECONDITION', `--from-container: git status failed in ${dir}: ${(st.stderr || st.stdout).trim().slice(0, 300)}`);
-    const dirty = st.stdout.split('\n').filter(Boolean);
+  for (const dir of [...new Set([o.repo, ...(worktree ? [worktree] : [])])]) {
+    const dirty = await dirtyEntries(git, dir, label);
     if (dirty.length) {
       throw new MinionsError('PRECONDITION',
-        `--from-container: the working tree at ${dir} has uncommitted or untracked changes (${dirty.length}: ${dirty.slice(0, 5).map((l) => l.trim()).join(', ')}${dirty.length > 5 ? ', ...' : ''}); refusing to move ${branch}.`,
-        'Nothing was changed. Commit or stash the changes yourself, then rerun `minions upgrade --from-container`.');
+        `${label}: the working tree at ${dir} has uncommitted or untracked changes (${dirty.length}: ${dirty.slice(0, 5).map((l) => l.trim()).join(', ')}${dirty.length > 5 ? ', ...' : ''}); refusing to move ${branch}.`,
+        `Nothing was changed. Commit or stash the changes yourself, then rerun \`${o.rerun}\`.`);
     }
   }
   const method = worktree ? 'merge --ff-only' as const : 'update-ref' as const;
-  if (opts.dryRun) return { ...base, worktree, action: 'fast-forward', method, applied: false };
+  if (o.dryRun) return { ...base, worktree, action: 'fast-forward', method, applied: false };
 
   const r = worktree
     ? await git(['merge', '--ff-only', '--no-edit', to], worktree)
-    : await git(['update-ref', '-m', 'minions upgrade --from-container: fast-forward', `refs/heads/${branch}`, to, from]);
+    : await git(['update-ref', '-m', o.reflog, `refs/heads/${branch}`, to, from]);
   if (r.code !== 0) {
-    throw new MinionsError('CONFLICT', `--from-container: git ${method} on ${branch} failed: ${(r.stderr || r.stdout).trim().slice(0, 300)}`,
+    throw new MinionsError('CONFLICT', `${label}: git ${method} on ${branch} failed: ${(r.stderr || r.stdout).trim().slice(0, 300)}`,
       'The branch was not moved; check the repository and rerun.');
   }
   const now = await sha(`refs/heads/${branch}`);
-  if (now !== to) throw new MinionsError('INTERNAL', `--from-container: ${branch} is at ${short(now)} after ${method}, expected ${short(to)}.`);
+  if (now !== to) throw new MinionsError('INTERNAL', `${label}: ${branch} is at ${short(now)} after ${method}, expected ${short(to)}.`);
   return { ...base, worktree, action: 'fast-forward', method, applied: true };
+}
+
+async function dirtyEntries(git: HostGit, dir: string, label: string): Promise<string[]> {
+  const st = await git(['status', '--porcelain'], dir);
+  if (st.code !== 0) throw new MinionsError('PRECONDITION', `${label}: git status failed in ${dir}: ${(st.stderr || st.stdout).trim().slice(0, 300)}`);
+  return st.stdout.split('\n').filter(Boolean);
+}
+
+export async function syncFromContainer(opts: SyncOptions): Promise<SyncResult> {
+  const git = hostGit(opts.repo, opts.runner ?? run);
+  const branch = opts.branch;
+  const fmt = await git(['check-ref-format', `refs/heads/${branch}`]);
+  if (fmt.code !== 0 || branch.startsWith('-')) throw new MinionsError('PRECONDITION', `--from-container: "${branch}" is not a valid branch name.`);
+  const target = `refs/remotes/minions/${opts.baseBranch}`;
+  const exported = opts.dryRun ? null : (await opts.exportRepo()).changes;
+  const r = await fastForwardHost(git, {
+    repo: opts.repo, branch, target, label: '--from-container', reflog: 'minions upgrade --from-container: fast-forward', rerun: 'minions upgrade --from-container', dryRun: !!opts.dryRun,
+    missingHint: opts.dryRun ? 'Run `minions export` first to preview against the container state.' : `The container has no ${opts.baseBranch} branch to take.`,
+  });
+  return { source: 'container', ...r, exported };
+}
+
+// ---------------------------------------------------------------- origin (GitHub delivery)
+
+export interface OriginSyncOptions {
+  /** The project checkout (a minions checkout). */
+  repo: string;
+  /** Base branch: fetched from origin and fast-forwarded on the host. */
+  baseBranch: string;
+  /** Remote to fetch from: the project's recorded remote URL, else `origin`. */
+  remote: string;
+  dryRun?: boolean;
+  runner?: Runner;
+}
+
+export const ORIGIN_LABEL = 'origin';
+
+/**
+ * GitHub delivery: origin/<base> is the single source of truth, so the CLI is built only from it. Fetches
+ * <base> into refs/remotes/origin/<base> (not on --dry-run), then fast-forwards the host <base> to it
+ * with the same strict rules as --from-container. Never takes anything from the container.
+ */
+export async function syncFromOrigin(opts: OriginSyncOptions): Promise<SyncResult> {
+  const git = hostGit(opts.repo, opts.runner ?? run);
+  const base = opts.baseBranch;
+  const fmt = await git(['check-ref-format', `refs/heads/${base}`]);
+  if (fmt.code !== 0 || base.startsWith('-')) throw new MinionsError('PRECONDITION', `upgrade: "${base}" is not a valid base branch name.`);
+  const target = `refs/remotes/origin/${base}`;
+  if (!opts.dryRun) {
+    const f = await git(['fetch', '--no-tags', '--', opts.remote, `+refs/heads/${base}:${target}`]);
+    if (f.code !== 0) {
+      throw new MinionsError('NETWORK_RETRYABLE', `upgrade: fetching ${base} from origin failed: ${(f.stderr || f.stdout).trim().split('\n').slice(-2).join(' ').slice(0, 300) || `git exit ${f.code}`}.`,
+        'Nothing was changed. With GitHub delivery the CLI is built only from origin; fix the network or your git credentials, then rerun `minions upgrade`.');
+    }
+  }
+  const r = await fastForwardHost(git, {
+    repo: opts.repo, branch: base, target, label: `upgrade (origin/${base})`, reflog: 'minions upgrade: fast-forward from origin', rerun: 'minions upgrade', dryRun: !!opts.dryRun,
+    missingHint: opts.dryRun ? `Run \`git fetch origin ${base}\` first to preview against origin.` : `origin has no ${base} branch.`,
+  });
+  return { source: 'origin', ...r, exported: null };
+}
+
+/**
+ * The checkout the CLI is built from must be exactly the reviewed origin commit: HEAD at `sha` and no
+ * uncommitted or untracked changes. Returns the reason it is not, or null.
+ */
+export async function checkoutAtReviewed(repo: string, sha: string, base: string, runner: Runner = run): Promise<string | null> {
+  const git = hostGit(repo, runner);
+  const h = await git(['rev-parse', '--verify', '--quiet', 'HEAD^{commit}']);
+  const headSha = h.code === 0 ? h.stdout.trim() : null;
+  if (headSha !== sha) return `the checkout at ${repo} is at ${short(headSha)}, not the reviewed origin/${base} commit ${short(sha)}`;
+  const dirty = await dirtyEntries(git, repo, 'upgrade');
+  if (dirty.length) return `the checkout at ${repo} has uncommitted or untracked changes (${dirty.length}: ${dirty.slice(0, 5).map((l) => l.trim()).join(', ')}${dirty.length > 5 ? ', ...' : ''}), so it is not the reviewed origin/${base} commit`;
+  return null;
 }
 
 export function syncStep(s: SyncResult, dryRun: boolean): SourceStep {
   const where = s.worktree ? `checked out at ${s.worktree}` : 'not checked out';
+  const how = s.source === 'origin' ? 'fetch origin' : 'export';
   if (s.action === 'up-to-date') return { id: 'sync', status: 'skipped', detail: `${s.branch} already at ${s.target} (${short(s.to)})` };
-  if (s.action === 'ahead') return { id: 'sync', status: 'skipped', detail: `${s.branch} (${short(s.from)}) already contains ${s.target}; not moved` };
+  if (s.action === 'ahead') {
+    return { id: 'sync', status: 'skipped', detail: s.source === 'origin'
+      ? `${s.branch} (${short(s.from)}) has commits origin does not have (${s.target} at ${short(s.targetSha)}); not moved`
+      : `${s.branch} (${short(s.from)}) already contains ${s.target}; not moved` };
+  }
   return dryRun
-    ? { id: 'sync', status: 'planned', detail: `export, then fast-forward ${s.branch} ${short(s.from)} -> ${short(s.to)} (${s.target}, as of the last export) with ${s.method} (${where})` }
+    ? { id: 'sync', status: 'planned', detail: `${how}, then fast-forward ${s.branch} ${short(s.from)} -> ${short(s.to)} (${s.target}, as of the last ${s.source === 'origin' ? 'fetch' : 'export'}) with ${s.method} (${where})` }
     : { id: 'sync', status: 'done', detail: `fast-forwarded ${s.branch} ${short(s.from)} -> ${short(s.to)} with ${s.method} (${where})` };
 }
 
@@ -295,8 +380,14 @@ export interface SourcePhase<C = unknown> {
 }
 
 export interface SourcePhaseOptions {
-  /** --from-container sync; null when not requested. */
+  /** --from-container sync (local delivery only); null when not requested. */
   sync: SyncOptions | null;
+  /**
+   * GitHub delivery: build the CLI only from the reviewed origin/<base> commit (fetch, strict fast-forward
+   * of the host base, then require the checkout to be exactly that commit). Used only with a checkout;
+   * never combined with `sync`.
+   */
+  origin?: OriginSyncOptions | null;
   /** The project checkout when it is a minions source checkout (else the CLI check is skipped). */
   checkout: string | null;
   dryRun?: boolean;
@@ -324,6 +415,7 @@ export async function runSourcePhase<C>(opts: SourcePhaseOptions): Promise<Sourc
   const out: SourcePhase<C> = { steps: [], ok: true, sync: null, cli: null, stop: null, continued: null };
   const push = (s: SourceStep) => { out.steps.push(s); if (!dryRun) log(`${s.id}: ${s.detail}`); };
 
+  if (opts.sync && opts.origin) throw new MinionsError('PRECONDITION', '--from-container cannot be combined with GitHub delivery (origin/<base> is the source).');
   if (opts.sync) {
     try {
       out.sync = await syncFromContainer({ ...opts.sync, dryRun, runner: opts.sync.runner ?? opts.runner });
@@ -338,6 +430,32 @@ export async function runSourcePhase<C>(opts: SourcePhaseOptions): Promise<Sourc
     push({ id: 'cli', status: 'skipped', detail: 'the project repository is not a minions checkout; installed CLI not compared' });
     return out;
   }
+  if (opts.origin) {
+    const base = opts.origin.baseBranch;
+    try {
+      out.sync = await syncFromOrigin({ ...opts.origin, dryRun, runner: opts.origin.runner ?? opts.runner });
+      push(syncStep(out.sync, dryRun));
+    } catch (e) {
+      if (!dryRun || !(e instanceof MinionsError)) throw e;
+      push({ id: 'sync', status: 'failed', detail: `would refuse: ${e.message}` });
+      push({ id: 'cli', status: 'failed', detail: `would stop: the CLI is built only from the reviewed origin/${base} commit` });
+      out.ok = false;
+      return out;
+    }
+    // A dry run that plans the fast-forward checks the checkout as it will be after it.
+    const planned = dryRun && out.sync.action === 'fast-forward';
+    const notReviewed = planned ? null : await checkoutAtReviewed(opts.checkout, out.sync.targetSha, base, opts.origin.runner ?? opts.runner);
+    if (notReviewed) {
+      const reason = `${notReviewed}; with GitHub delivery the CLI is built only from origin/${base}`;
+      push({ id: 'cli', status: 'failed', detail: dryRun ? `would stop: ${reason}` : reason });
+      out.ok = false;
+      if (!dryRun) {
+        out.stop = { reason, rerun: opts.rerun,
+          command: `cd ${shellQuote(opts.checkout)} && git status && git switch ${shellQuote(base)} && git merge --ff-only origin/${shellQuote(base)}` };
+      }
+      return out;
+    }
+  }
   const check = () => checkCli({ checkout: opts.checkout!, runner: opts.runner, runningRoot: opts.runningRoot, handoff: opts.handoff });
   const c = out.cli = await check();
   push(cliStep(c, dryRun));
@@ -349,7 +467,8 @@ export async function runSourcePhase<C>(opts: SourcePhaseOptions): Promise<Sourc
   // Building runs the checkout's npm lifecycle scripts, esbuild config and lockfile dependencies on the
   // host and installs the result as the global CLI. Commits just taken from the container are never
   // built in the same run, and building at all needs the explicit --rebuild-cli opt-in.
-  const moved = !!out.sync && out.sync.action === 'fast-forward' && out.sync.applied;
+  // origin/<base> commits were reviewed and merged on GitHub, so only container commits wait a run.
+  const moved = !!out.sync && out.sync.source === 'container' && out.sync.action === 'fast-forward' && out.sync.applied;
   if (moved || !opts.rebuildCli) {
     const why = moved
       ? `${c.reason}; the checkout was just fast-forwarded to commits from the container (${out.sync!.from?.slice(0, 12) ?? '?'}..${out.sync!.to?.slice(0, 12) ?? '?'}), which are not built in the same run: review them (git diff --stat ${out.sync!.from ?? ''} ${out.sync!.to ?? ''}), then rerun with --rebuild-cli or run the command yourself`
@@ -388,4 +507,24 @@ export async function runSourcePhase<C>(opts: SourcePhaseOptions): Promise<Sourc
   }
   out.continued = env.data ?? null;
   return out;
+}
+
+// ---------------------------------------------------------------- which source
+
+/**
+ * Where `minions upgrade` takes its source from. Local delivery: the checkout as it is, plus the
+ * container's base on --from-container. GitHub delivery: origin/<base> only (in a minions checkout), and
+ * --from-container is refused, because nothing may reach the host base except through pull requests.
+ */
+export function upgradeSourceMode(o: { githubDelivery: boolean; fromContainer: boolean; checkout: string | null; baseBranch: string }): 'origin' | 'container' | 'checkout' | 'none' {
+  if (o.githubDelivery) {
+    if (o.fromContainer) {
+      throw new MinionsError('PRECONDITION',
+        `--from-container is available with local delivery only: with GitHub delivery origin/${o.baseBranch} is the single source of truth and container work reaches it only through pull requests.`,
+        `Merge the pull requests on GitHub, then run \`minions upgrade\` (it fetches origin/${o.baseBranch} and builds the CLI from that reviewed commit).`);
+    }
+    return o.checkout ? 'origin' : 'none';
+  }
+  if (o.fromContainer) return 'container';
+  return o.checkout ? 'checkout' : 'none';
 }

@@ -504,6 +504,41 @@ The source phase (`src/host/upgrade-source.ts`) adds two steps, `sync` and `cli`
   rerun that opts in. Commits fast-forwarded by `--from-container` are never built in the same run,
   even with `--rebuild-cli`: the upgrade stops and names the range to review.
 
+### origin/<base> as the single source of truth
+
+Owner policy (task-28): with GitHub delivery (`delivery.mode` `branch` or `pull-request`,
+`isGithubDelivery` in `src/config/delivery.ts`), `origin/<base>` is the only source of the base branch.
+`local` delivery keeps every behaviour described above.
+
+- **No local base merges.** Nothing in minions merges into a local base: publication pushes
+  `agent/<slug>` and opens a PR, and merging happens only on GitHub when policy allows (`pr.merge`
+  stays `ask`; CI-gated auto-merge is task-1.9). The local auto-merge of approved branches (task-15) is
+  a `local` delivery practice; the coordinator prompt for GitHub delivery forbids merging, rebasing,
+  cherry-picking or committing into the local base. Enforcement is deterministic at the next claim
+  (below) rather than a permission rule: a `git merge` deny would also stop workers that update their
+  own task branch.
+- **Pre-claim sync** (`src/runtime/base-sync.ts`, called from `Scheduler.claim` for every role before
+  the lease exists). Fetch `+refs/heads/<base>:refs/remotes/origin/<base>` (container: the `origin`
+  remote; host runtime: the normalized https URL, as `configureOrigin` and `publishTask` do), then
+  fast-forward only: `merge --ff-only` in the worktree that has the base checked out, else
+  `update-ref <ref> <new> <old>`; a missing local base is created at origin. Blocks the claim, with no
+  lease and the task status unchanged, when origin is not github.com (`PRECONDITION`), the fetch fails
+  (the classified error, `NETWORK_RETRYABLE` by default), the local base is ahead of or diverged from
+  origin (`CONFLICT`), or the fast-forward itself fails (`CONFLICT`). Each block is recorded as a
+  `base-sync-blocked` event (role, base, code, message, details); a moved base as `base-sync`. The
+  coordinator reports the error; nothing merges or resets automatically.
+- **Import.** `minions workspace import` still fetches the host refs into `refs/remotes/host/*`, but
+  under GitHub delivery (`baseFrom: 'origin'`) it no longer fast-forwards the workspace base to the
+  host's base, because the host's local base may hold commits that never went through a PR.
+- **Upgrade source** (`src/host/upgrade-source.ts`, `upgradeSourceMode`). `--from-container` stays,
+  for `local` delivery only; with GitHub delivery it is refused with `PRECONDITION` (no new flag or
+  command). In a minions checkout the source phase instead fetches `<base>` from the project's recorded
+  remote URL (else `origin`) into `refs/remotes/origin/<base>`, moves the host base with the same strict
+  fast-forward rules, and requires the checkout to be exactly that commit with a clean tree before the
+  CLI check; otherwise the `cli` step fails and the upgrade stops with the command to get there.
+  Because `origin/<base>` commits were reviewed and merged on GitHub, a fresh fast-forward from origin
+  may be built in the same run (still only with `--rebuild-cli`); commits from the container never are.
+
 ## Telegram bot token
 
 A second credential kind on the same mechanism (`CredentialKind` in `src/host/credentials.ts`;
