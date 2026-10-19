@@ -169,3 +169,27 @@ describe('pre-telegram hook', () => {
     expect((await runHook('pre-telegram', loader(env), JSON.stringify(call({})))).stdout).toBeUndefined();
   });
 });
+
+describe('tester: pre-telegram edge cases', () => {
+  const permission = (o: { stdout?: string }) => decision(o)?.hookSpecificOutput?.permissionDecision;
+
+  it('never emits an explicit allow on the main thread, so download_attachment still prompts', () => {
+    for (const tool of ['reply', 'react', 'edit_message', 'download_attachment'].map((t) => `mcp__plugin_telegram_telegram__${t}`)) {
+      const r = preTelegramHook({ hook_event_name: 'PreToolUse', tool_name: tool, tool_input: {} });
+      expect(r.stdout, tool).toBeUndefined();
+    }
+  });
+
+  it('denies a subagent download_attachment call and names the tool', () => {
+    const r = preTelegramHook({ hook_event_name: 'PreToolUse', tool_name: 'mcp__plugin_telegram_telegram__download_attachment', agent_id: 'a', agent_type: 'general-purpose' });
+    expect(permission(r)).toBe('deny');
+    expect(decision(r).hookSpecificOutput.permissionDecisionReason).toMatch(/^mcp__plugin_telegram_telegram__download_attachment is coordinator-only/);
+  });
+
+  it('logs the deny to hooks.log so the first live run can confirm the gate', async () => {
+    const env = makeEnv();
+    vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+    await runHook('pre-telegram', loader(env), JSON.stringify({ tool_name: 'mcp__plugin_telegram_telegram__reply', agent_id: 'a', agent_type: 'general-purpose' }));
+    expect(readFileSync(join(stateDir, 'logs', 'hooks.log'), 'utf8')).toMatch(/pre-telegram deny/);
+  });
+});
