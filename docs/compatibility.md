@@ -12,6 +12,7 @@
 | Claude Code (in image) | `@anthropic-ai/claude-code@2.1.292` | Pinned in `docker/Dockerfile`; auto-updater disabled. |
 | Backlog.md (in image) | `backlog.md@1.54.0` | Pinned in `docker/Dockerfile`. |
 | GitHub CLI (in image) | `gh` 2.102.0 (official release tarball `gh_2.102.0_linux_{amd64,arm64}.tar.gz`) | Pinned in `docker/Dockerfile` with SHA-256 per architecture (`ADD --checksum`, BuildKit). Real binary at `/opt/gh/bin/gh`; `/usr/local/bin/gh` is the token wrapper (`docker/gh-wrapper.sh`). Image with gh not yet built/tested. |
+| Telegram channel plugin | `telegram@claude-plugins-official` 0.0.7 (marketplace commit `1e96c6b`) | Interface read and install verified on Claude Code 2.1.292 without credentials; not shipped in v0.1. Needs Bun, which the image does not include yet. `minions telegram probe` and doctor check `telegram.plugin` report availability. See [design/telegram.md](design/telegram.md). |
 | System packages (in image) | git, tmux, ca-certificates, ripgrep, less, procps (Debian bookworm) | Installed at build time only. |
 
 `MINIONS_DOCKER_TESTS=1 npx vitest run test/docker` builds the image (tag `minions-test-runtime:latest`),

@@ -10,6 +10,7 @@ import { MinionsError } from '../core/errors.js';
 import { readJson } from '../core/fsutil.js';
 import { emit } from '../core/output.js';
 import { delegateToContainer } from '../host/delegate.js';
+import { formatTelegramProbe, probeTelegram } from '../telegram/probe.js';
 import { buildCoordinatorCommand, launchCoordinator, probeRuntime } from './coordinator.js';
 import { openDb, type Lease, type LeaseRole, type RuntimeDb } from './db.js';
 import { runHook } from './hooks.js';
@@ -188,6 +189,14 @@ export function register(program: Command): void {
       }
       requireMode('container');
       process.exitCode = await launchCoordinator(cfg);
+    }));
+
+  // telegram: credential-free capability probe. Host mode delegates to the container, where Claude Code runs.
+  const tg = program.command('telegram').description('Telegram channel plugin support (docs/design/telegram.md)');
+  tg.command('probe').description('Report whether the official Telegram channel plugin is usable (needs no credentials)')
+    .action(action(async (_o: unknown, cmd: Command) => {
+      if (runtimeMode() === 'host') return delegate(cmd);
+      emit(await probeTelegram(), { json: globalOpts(cmd).json, human: formatTelegramProbe });
     }));
 
   // workspace
