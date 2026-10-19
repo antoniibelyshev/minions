@@ -14,6 +14,7 @@ const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')) as {
   bin: Record<string, string>;
   files: string[];
   scripts: Record<string, string>;
+  license?: string;
   repository?: { type: string; url: string };
   dependencies?: Record<string, string>;
   devDependencies?: Record<string, string>;
@@ -64,6 +65,15 @@ describe('package.json for git-URL installs', () => {
     expect(files).toContain('templates/plugin/.claude-plugin/plugin.json');
     if (existsSync(join(root, 'dist', 'cli.js'))) expect(files).toContain('dist/cli.js');
     expect(files.some((p) => p.startsWith('src/') || p.startsWith('test/') || p.startsWith('node_modules/'))).toBe(false);
+  });
+
+  it('declares MIT license and includes LICENSE in npm pack', () => {
+    expect(pkg.license).toBe('MIT');
+    expect(existsSync(join(root, 'LICENSE')), 'LICENSE file exists').toBe(true);
+    const r = spawnSync('npm', ['pack', '--dry-run', '--json', '--ignore-scripts'], { cwd: root, encoding: 'utf8', env: cleanEnv() });
+    expect(r.status, r.stderr).toBe(0);
+    const files = (JSON.parse(r.stdout) as Array<{ files: Array<{ path: string }> }>)[0]!.files.map((f) => f.path);
+    expect(files).toContain('LICENSE');
   });
 });
 

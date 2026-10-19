@@ -498,4 +498,4 @@ Every command supports `--json`, and mutating commands support `--dry-run`. Exit
 
 ## License
 
-To be decided.
+MIT — see LICENSE. Note that Claude Code, which the Docker image installs at build time, is distributed under Anthropic's own terms and is not covered by this license.

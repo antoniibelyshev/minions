@@ -7,6 +7,7 @@
     "url": "git+https://github.com/antoniibelyshev/minions.git"
   },
   "homepage": "https://github.com/antoniibelyshev/minions#readme",
+  "license": "MIT",
   "type": "module",
   "bin": {
     "minions": "dist/cli.js"
@@ -21,7 +22,8 @@
     "schema",
     "install.sh",
     "README.md",
-    "docs"
+    "docs",
+    "LICENSE"
   ],
   "scripts": {
     "build": "node esbuild.config.mjs",
