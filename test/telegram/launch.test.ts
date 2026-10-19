@@ -230,3 +230,131 @@ describe('controlled coordinator restart', () => {
     expect(launchFingerprint(telegramCfg(), tok(TOKEN))).not.toContain(TOKEN.slice(0, 12));
   });
 });
+
+describe('tester edge cases: terminal mode through the wrapper', () => {
+  it('terminal argv is the plain claude argv (no channels, no Telegram tools) and other env is preserved', async () => {
+    const { paths } = layout(null);
+    const { calls, spawn } = fakeSpawn();
+    const parentEnv = { PATH: '/usr/bin', HOME: '/home/node', TELEGRAM_BOT_TOKEN: TOKEN, CLAUDE_CONFIG_DIR: '/home/node/.claude' };
+    await runCoordinator(defaults(), { paths, spawn, env: parentEnv, log: () => {} });
+    const expected = await buildClaudeCommand(defaults(), paths);
+    expect(calls[0]!.cmd).toBe('claude');
+    expect(calls[0]!.args).toEqual(expected.args);
+    expect(calls[0]!.args).not.toContain('--channels');
+    expect(calls[0]!.args.join('\n')).not.toContain('mcp__plugin_telegram');
+    expect(calls[0]!.env).toEqual({ PATH: '/usr/bin', HOME: '/home/node', CLAUDE_CONFIG_DIR: '/home/node/.claude' });
+    expect(parentEnv.TELEGRAM_BOT_TOKEN).toBe(TOKEN); // caller's object is not mutated
+  });
+
+  it('a corrupt or hostile mounted token never reaches env or argv and keeps terminal mode', async () => {
+    for (const bad of ['garbage', `${TOKEN}\nFOO=bar`, `${TOKEN} --dangerously-skip-permissions`, '$(touch /tmp/x):' + 'a'.repeat(35)]) {
+      const { paths } = layout(bad);
+      const { calls, spawn } = fakeSpawn();
+      const logs: string[] = [];
+      await runCoordinator(telegramCfg(), { paths, spawn, env: {}, probe: async () => available(), log: (l) => logs.push(l) });
+      expect(calls[0]!.args, bad).not.toContain('--channels');
+      expect(calls[0]!.env, bad).not.toHaveProperty(TELEGRAM_TOKEN_ENV);
+      expect(logs.join('\n'), bad).toMatch(/Telegram disabled.*not a Telegram bot token/);
+      expect(logs.join('\n')).not.toContain('touch');
+    }
+  });
+
+  it('missing coordinator prompt fails with a precise error before spawning claude', async () => {
+    const { paths } = layout();
+    const { calls, spawn } = fakeSpawn();
+    await expect(runCoordinator(defaults(), { paths: { ...paths, coordinatorPrompt: join(paths.pluginDir, 'nope.md') }, spawn, env: {}, log: () => {} }))
+      .rejects.toMatchObject({ code: 'NOT_FOUND', message: expect.stringMatching(/Coordinator prompt not found/) });
+    expect(calls).toHaveLength(0);
+  });
+
+  it('a spawn error is reported precisely; a non-zero claude exit code is propagated', async () => {
+    const { paths } = layout(null);
+    const failing: SpawnLike = () => ({
+      on(event: string, cb: (...a: unknown[]) => void) { if (event === 'error') setImmediate(() => cb(new Error('spawn claude ENOENT'))); return this; },
+    } as ReturnType<SpawnLike>);
+    await expect(runCoordinator(defaults(), { paths, spawn: failing, env: {}, log: () => {} }))
+      .rejects.toMatchObject({ code: 'INCOMPATIBLE_RUNTIME', message: expect.stringMatching(/Failed to start claude: spawn claude ENOENT/) });
+    const exits: SpawnLike = () => ({
+      on(event: string, cb: (...a: unknown[]) => void) { if (event === 'exit') setImmediate(() => cb(null, 'SIGTERM')); return this; },
+    } as ReturnType<SpawnLike>);
+    expect(await runCoordinator(defaults(), { paths, spawn: exits, env: {}, log: () => {} })).toBe(128);
+  });
+
+  it('an unwritable state dir does not stop the session from launching', async () => {
+    const { paths } = layout(null);
+    const { calls, spawn } = fakeSpawn();
+    await runCoordinator(defaults(), { paths: { ...paths, coordinatorLaunch: join(paths.coordinatorPrompt, 'x', 'launch.json') }, spawn, env: {}, log: () => {} });
+    expect(calls).toHaveLength(1);
+  });
+
+  it('tmux argv is only the wrapper: no env, no token, no claude flags', async () => {
+    const { paths } = layout();
+    const { buildCoordinatorCommand } = await import('../../src/runtime/coordinator.js');
+    const c = await buildCoordinatorCommand(telegramCfg(), paths);
+    expect(c.cmd).toBe('tmux');
+    expect(c.args.slice(-3)).toEqual(['minions', 'coordinator', 'run']);
+    expect(JSON.stringify(c)).not.toMatch(/TELEGRAM|channels|123456789/);
+  });
+});
+
+describe('tester edge cases: restart with leases', () => {
+  const stub = (running: boolean) => {
+    const calls: string[][] = [];
+    let alive = running;
+    const runner = async (_c: string, args: string[]): Promise<RunResult> => {
+      calls.push(args);
+      if (args[0] === 'has-session') return { code: alive ? 0 : 1, stdout: '', stderr: '' };
+      if (args[0] === 'kill-session') { alive = false; return ok(''); }
+      alive = true; return ok('');
+    };
+    return { calls, runner };
+  };
+  const launched = async (paths: ReturnType<typeof layout>['paths'], cfg: MinionsConfig) => {
+    const { spawn } = fakeSpawn();
+    await runCoordinator(cfg, { paths, spawn, env: {}, probe: async () => available(), log: () => {} });
+  };
+
+  it('--force restarts but never touches the lease source; the leases are reported for recovery', async () => {
+    const { paths } = layout();
+    await launched(paths, telegramCfg());
+    writeFileSync(paths.telegramTokenFile, TOKEN2 + '\n');
+    const leases = [{ id: 'lease-a' }, { id: 'lease-b' }];
+    const snapshot = JSON.stringify(leases);
+    const rec: { leases: string[] }[] = [];
+    const t = stub(true);
+    const r = await syncCoordinator(telegramCfg(), { paths, runner: t.runner, activeLeases: () => leases, recordRestart: (i) => rec.push(i) }, { force: true });
+    expect(r.action).toBe('restarted');
+    expect(rec[0]!.leases).toEqual(['lease-a', 'lease-b']);
+    expect(JSON.stringify(leases)).toBe(snapshot);
+    expect(t.calls.filter((a) => a[0] === 'kill-session')).toHaveLength(1);
+  });
+
+  it('pending restart without force does not record a restart and leaves the session alone', async () => {
+    const { paths } = layout();
+    await launched(paths, telegramCfg());
+    writeFileSync(paths.telegramTokenFile, TOKEN2 + '\n');
+    const t = stub(true);
+    let recorded = 0;
+    const r = await syncCoordinator(telegramCfg(), { paths, runner: t.runner, activeLeases: () => [{ id: 'l1' }], recordRestart: () => { recorded++; } }, { startDetached: true });
+    expect(r).toMatchObject({ action: 'restart-pending', running: true });
+    expect(recorded).toBe(0);
+    expect(t.calls).toEqual([['has-session', '-t', 'coordinator']]);
+  });
+
+  it('no active leases: restart is immediate; a coordinator with no launch record is not killed', async () => {
+    const { paths } = layout();
+    const t = stub(true);
+    const r = await syncCoordinator(telegramCfg(), { paths, runner: t.runner, activeLeases: () => [{ id: 'x' }] });
+    expect(r.action).toBe('unchanged');
+    expect(r.reason).toMatch(/without a launch record/);
+    expect(t.calls.some((a) => a[0] === 'kill-session')).toBe(false);
+  });
+
+  it('a failing detached start surfaces the tmux error without the token', async () => {
+    const { paths } = layout();
+    const runner = async (_c: string, args: string[]): Promise<RunResult> =>
+      args[0] === 'has-session' ? { code: 1, stdout: '', stderr: '' } : { code: 1, stdout: '', stderr: 'tmux: boom' };
+    await expect(syncCoordinator(telegramCfg(), { paths, runner, activeLeases: () => [] }, { startDetached: true }))
+      .rejects.toMatchObject({ code: 'INCOMPATIBLE_RUNTIME', message: expect.stringMatching(/tmux: boom/) });
+  });
+});

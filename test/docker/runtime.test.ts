@@ -79,11 +79,11 @@ describe('runtime container (docker)', () => {
     expect(inspect.Config.Env).toEqual(expect.arrayContaining(['MINIONS_RUNTIME=container', 'CLAUDE_CONFIG_DIR=/home/node/.claude']));
   });
 
-  it('mounts no docker socket and only ro binds for plugin/config', () => {
+  it('mounts no docker socket and only ro binds for plugin/config/secrets', () => {
     const mounts = inspect.Mounts as { Type: string; Source: string; Destination: string; RW: boolean; Name?: string }[];
     expect(mounts.some((m) => /docker\.sock/.test(m.Source) || /docker\.sock/.test(m.Destination))).toBe(false);
     const binds = mounts.filter((m) => m.Type === 'bind');
-    expect(binds.map((m) => [m.Destination, m.RW]).sort()).toEqual([['/opt/minions/config', false], ['/opt/minions/plugin', false]]);
+    expect(binds.map((m) => [m.Destination, m.RW]).sort()).toEqual([['/opt/minions/config', false], ['/opt/minions/plugin', false], ['/opt/minions/secrets', false]]);
     const vols = mounts.filter((m) => m.Type === 'volume').map((m) => m.Name).sort();
     expect(vols.every((n) => n!.startsWith('minions-test-'))).toBe(true);
     expect(vols).toHaveLength(4);
