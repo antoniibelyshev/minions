@@ -4,10 +4,12 @@
 // instructions (templates/assistant). It closes the remaining gaps through documented commands only.
 //
 // Safety: permission mode `default` (every non-allowlisted tool prompts; never bypass/acceptEdits/auto,
-// and bypass is disabled through --settings). Only read-only commands are pre-allowed. Credential,
+// and bypass is disabled through --settings). Only read-only commands and reads inside the repository
+// root (`Read(//<repo>/**)`; Claude Code applies Read rules to Glob/Grep too) are pre-allowed. Credential,
 // runtime-switch and publishing commands are denied: the user runs them (`! minions auth ...`) so
 // secrets are typed only at minions' hidden prompts, never into the chat. Host-side minions files
-// (project.json, defaults.json, secrets, credentials) are denied for Edit, the secret stores for Read.
+// (project.json, defaults.json, secrets, credentials) are denied for Edit; the secret stores (this and every
+// other project's secrets/credentials, the credential store, the host secret dirs) for Read.
 // Never launched with --yes, --json, --config, --dry-run or without a terminal.
 import { spawn as nodeSpawn } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
@@ -20,6 +22,7 @@ import { atomicWrite, sha256 } from '../core/fsutil.js';
 import { emit } from '../core/output.js';
 import { credentialStoreDir, defaultsPath, hostRoot, projectPaths, registryPath } from '../core/paths.js';
 import { VERSION } from '../core/version.js';
+import { HOST_SECRET_DIRS } from '../runtime/coordinator.js';
 import { renderTemplate, templatesDir } from '../plugin/generate.js';
 import { resolveOnPath } from './auth.js';
 import { loadEffectiveConfig, loadProjectJson, projectConfigPath, type ProjectJson } from './project.js';
@@ -33,12 +36,23 @@ export const ASSISTANT_SKILL = `${ASSISTANT_PLUGIN}:setup`;
 export const ASSISTANT_PERMISSION_MODE = 'default';
 export const ASSISTANT_PROMPT = `Use the ${ASSISTANT_SKILL} skill to help me finish setting up minions in this repository. Start by gathering context (read-only), then show me the gaps you found.`;
 
-/** Read-only commands and tools the assistant may use without a prompt. Everything else asks. */
-export const ASSISTANT_ALLOWED_TOOLS = [
+/** Read-only commands the assistant may run without a prompt. */
+export const ASSISTANT_ALLOWED_COMMANDS = [
   'Bash(minions doctor*)', 'Bash(minions status*)', 'Bash(minions auth show*)', 'Bash(minions config show*)', 'Bash(minions runtime show*)',
   'Bash(git remote -v)', 'Bash(git status*)', 'Bash(git log*)',
-  'Read', 'Glob', 'Grep',
 ] as const;
+
+/**
+ * Everything the assistant may use without a prompt: the read-only commands plus file reads scoped to
+ * the repository root. Never a bare `Read`/`Glob`/`Grep` (that would read any file on the host); reads
+ * elsewhere prompt. Everything else asks.
+ */
+export function assistantAllowedTools(repoRoot: string): string[] {
+  return [...ASSISTANT_ALLOWED_COMMANDS, `Read(${abs(repoRoot.replace(/\/+$/, ''))}/**)`];
+}
+
+/** Claude Code permission path for an absolute host path (`//abs/path`). */
+const abs = (p: string) => `/${p.startsWith('/') ? p : `/${p}`}`;
 
 /** Commands the assistant must never run itself (the user runs them with `! ...`). */
 export const ASSISTANT_DENIED_COMMANDS = [
@@ -48,14 +62,15 @@ export const ASSISTANT_DENIED_COMMANDS = [
   'Bash(git push*)', 'Bash(open *)',
 ] as const;
 
-/** Claude Code permission path for an absolute host path (`//abs/path`). */
-const abs = (p: string) => `/${p}`;
 
 /** Read/Edit deny rules for host-side minions data and common secret stores. */
 export function assistantDeniedPaths(projectId: string): string[] {
   const pp = projectPaths(projectId);
-  const read = [credentialStoreDir() + '/**', pp.secretsDir + '/**'].map((p) => `Read(${abs(p)})`)
-    .concat(['Read(~/.ssh/**)', 'Read(~/.aws/**)', 'Read(~/.config/gh/**)', 'Read(~/.netrc)', 'Read(**/.env)', 'Read(**/.env.*)']);
+  const projects = join(hostRoot(), 'projects');
+  const read = [credentialStoreDir() + '/**', pp.secretsDir + '/**', pp.credentialsJson,
+    // Every other project's secret copies and credential references too.
+    join(projects, '*', 'secrets') + '/**', join(projects, '*', 'credentials.json')].map((p) => `Read(${abs(p)})`)
+    .concat(HOST_SECRET_DIRS.flatMap((d) => [`Read(~/${d})`, `Read(~/${d}/**)`]), ['Read(**/.env)', 'Read(**/.env.*)']);
   const edit = [defaultsPath(), registryPath(), credentialStoreDir() + '/**', pp.projectJson, pp.credentialsJson, pp.secretsDir + '/**',
     pp.manifestJson, pp.journalJson, pp.composeYaml, pp.pluginDir + '/**', pp.runtimeDir + '/**', pp.hostDir + '/**', assistantPluginDir(projectId) + '/**']
     .map((p) => `Edit(${abs(p)})`);
@@ -105,11 +120,11 @@ export function assistantVars(ctx: AssistantContext): Record<string, string> {
 }
 
 /** argv of the assistant's claude process. Never contains a secret; never a bypass/accept-edits mode. */
-export function assistantArgs(o: { pluginDir: string; systemPrompt: string; deniedPaths: string[]; prompt?: string }): string[] {
+export function assistantArgs(o: { repoRoot: string; pluginDir: string; systemPrompt: string; deniedPaths: string[]; prompt?: string }): string[] {
   // Variadic tool lists come first and end at the next option, so the trailing positional prompt is
   // never swallowed by them.
   return [
-    '--allowedTools', ...ASSISTANT_ALLOWED_TOOLS,
+    '--allowedTools', ...assistantAllowedTools(o.repoRoot),
     '--disallowedTools', ...ASSISTANT_DENIED_COMMANDS, ...o.deniedPaths,
     '--plugin-dir', o.pluginDir,
     '--append-system-prompt', o.systemPrompt,
@@ -138,7 +153,7 @@ export async function planAssistant(ctx: AssistantContext): Promise<AssistantPla
       { path: join(pluginDir, '.claude-plugin', 'plugin.json'), content: manifest },
       { path: join(pluginDir, 'skills', 'setup', 'SKILL.md'), content: skill },
     ],
-    args: assistantArgs({ pluginDir, systemPrompt, deniedPaths: assistantDeniedPaths(ctx.project.projectId) }),
+    args: assistantArgs({ repoRoot: ctx.repoPath, pluginDir, systemPrompt, deniedPaths: assistantDeniedPaths(ctx.project.projectId) }),
   };
 }
 

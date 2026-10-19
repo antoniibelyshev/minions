@@ -407,9 +407,9 @@ It is never offered with `--yes`, `--config`, `--json`, `--dry-run`, or without 
 
 Guard rails:
 
-- Claude Code runs in permission mode `default`, with bypass mode disabled for the session. Only read-only commands run without asking: `minions doctor|status|auth show|config show|runtime show`, `git remote -v`, `git status`, `git log`, and Read/Glob/Grep.
+- Claude Code runs in permission mode `default`, with bypass mode disabled for the session. Only read-only commands run without asking: `minions doctor|status|auth show|config show|runtime show`, `git remote -v`, `git status`, `git log`, and file reads inside the repository (`Read(//<repo>/**)`, which also covers Glob/Grep there). Reads anywhere else prompt.
 - It never asks for a token or key. Credential, runtime and publishing commands (`minions auth ...`, `minions setup github`, `minions runtime set`, `minions start`, `git push`, `open`, `security`, `gh auth token`) are denied to the assistant. You run them yourself with `!` (or in another terminal), so secrets are typed only at minions' hidden prompts.
-- It can't read the minions secret and credential stores, `~/.ssh`, `~/.aws`, `~/.config/gh` or `.env` files, and can't edit host-side minions files (`project.json`, `defaults.json`, secrets). Changes to the project configuration are shown as a diff first, need your yes, bump `configRevision`, and are validated with `minions config show --explain`.
+- It can't read the minions secret and credential stores (of any project), `~/.ssh`, `~/.aws`, `~/.config/gh`, the Keychains and other host secret dirs, or `.env` files, and can't edit host-side minions files (`project.json`, `defaults.json`, secrets). Changes to the project configuration are shown as a diff first, need your yes, bump `configRevision`, and are validated with `minions config show --explain`.
 
 `minions doctor` shows a `setup` check that suggests `minions setup assist` when there are obvious gaps, such as no verification commands.
 

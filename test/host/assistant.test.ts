@@ -73,8 +73,11 @@ describe('assistant argv', () => {
 
     expect(variadic(args, '--allowedTools')).toEqual([
       'Bash(minions doctor*)', 'Bash(minions status*)', 'Bash(minions auth show*)', 'Bash(minions config show*)', 'Bash(minions runtime show*)',
-      'Bash(git remote -v)', 'Bash(git status*)', 'Bash(git log*)', 'Read', 'Glob', 'Grep',
+      'Bash(git remote -v)', 'Bash(git status*)', 'Bash(git log*)', `Read(/${ctx.repoPath}/**)`,
     ]);
+    // Reads are pre-allowed only inside the repository root: never a bare Read/Glob/Grep.
+    expect(variadic(args, '--allowedTools').filter((a) => /^(Read|Glob|Grep)$/.test(a))).toEqual([]);
+    expect(`Read(/${ctx.repoPath}/**)`.startsWith('Read(//')).toBe(true);
     const denied = variadic(args, '--disallowedTools');
     for (const d of ['Bash(minions runtime set*)', 'Bash(security *)', 'Bash(gh auth token*)', 'Bash(cat *secrets*)', 'Bash(git push*)', 'Bash(open *)',
       'Bash(minions auth set*)', 'Bash(minions auth github*)', 'Bash(minions auth telegram*)']) expect(denied).toContain(d);
@@ -82,6 +85,9 @@ describe('assistant argv', () => {
     const p = projectPaths(id);
     expect(denied).toContain(`Read(/${credentialStoreDir()}/**)`);
     expect(denied).toContain(`Read(/${p.secretsDir}/**)`);
+    expect(denied).toContain(`Read(/${join(env.home, 'projects', '*', 'secrets')}/**)`);
+    expect(denied).toContain(`Read(/${join(env.home, 'projects', '*', 'credentials.json')})`);
+    for (const d of ['Read(~/.ssh/**)', 'Read(~/.aws/**)', 'Read(~/.config/gh/**)', 'Read(~/.netrc)', 'Read(~/Library/Keychains/**)']) expect(denied).toContain(d);
     for (const f of [p.projectJson, join(env.home, 'defaults.json'), p.credentialsJson]) expect(denied).toContain(`Edit(/${f})`);
     expect(denied).toContain(`Edit(/${p.secretsDir}/**)`);
     expect(denied.every((d) => !d.startsWith('Read(//') || d.startsWith(`Read(//${env.home.slice(1)}`))).toBe(true);

@@ -141,7 +141,7 @@ async function startHost(json: boolean, o: { attach: boolean }): Promise<void> {
   const hint = await githubStartHint(project, config);
   if (hint) say(json, hint);
   if (config.communication.channel === 'telegram') {
-    say(json, 'warning: host runtime: the Telegram channel plugin is not installed automatically (it would change your own Claude Code setup). Install it yourself with `claude plugin install telegram@claude-plugins-official`, or the coordinator runs terminal-only.');
+    say(json, 'warning: Telegram is unavailable in the host runtime (the coordinator starts without user plugins or MCP servers), so it runs terminal-only. Use the Docker runtime for Telegram (`minions runtime set docker`).');
   }
   const attach = o.attach && !json && !!process.stdin.isTTY && !!process.stdout.isTTY;
   const sync = await host.exec(['minions', 'coordinator', 'sync', '--json', ...(!attach && config.communication.channel === 'telegram' ? ['--start-detached'] : [])], { allowFailure: true, timeoutMs: 60_000 });

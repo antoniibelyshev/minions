@@ -129,7 +129,10 @@ deterministic init. `minions init` stays complete without it.
   as `manual`); never `bypassPermissions`, `acceptEdits`, `auto` or `dontAsk`.
 - **Allowed without a prompt:** `Bash(minions doctor*)`, `Bash(minions status*)`, `Bash(minions auth show*)`,
   `Bash(minions config show*)`, `Bash(minions runtime show*)`, `Bash(git remote -v)`, `Bash(git status*)`,
-  `Bash(git log*)`, `Read`, `Glob`, `Grep`. Everything else (including every `Edit`) prompts.
+  `Bash(git log*)`, and `Read(//<repo root>/**)` (Claude Code applies Read rules to Glob/Grep as well). Never a
+  bare `Read`/`Glob`/`Grep`, which would read any file on the host. Everything else (reads outside the repository,
+  every `Edit`) prompts. Read denies also cover every project's `secrets/` and `credentials.json`, the credential
+  store and the host secret dirs shared with the host-runtime hardening (`HOST_SECRET_DIRS`).
 - **Denied** (the user runs them as `! <command>`, so secrets are typed only at minions' hidden prompts):
   `minions runtime set`, `minions auth set|github|telegram|refresh`, `minions setup github`, `minions start`,
   `minions uninstall`, `security *`, `gh auth token*`, `cat *secrets*`, `cat *credentials*`, `git push*`,
