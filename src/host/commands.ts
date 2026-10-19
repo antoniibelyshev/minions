@@ -19,6 +19,7 @@ import { loadEffectiveConfig, loadProjectJson } from './project.js';
 import { projectForPath } from './registry.js';
 import { exportRepo, importRepo } from './transfer.js';
 import { formatUninstall, runUninstall } from './uninstall.js';
+import { DELIVERY_MODES, formatSetup, runSetup, type DeliveryMode, type SetupRuntime } from './setup.js';
 import { readSecret, readlineIO } from './wizard.js';
 
 const say = (json: boolean, msg: string) => { if (!json) process.stderr.write(msg + '\n'); };
@@ -29,8 +30,8 @@ async function requireDocker(): Promise<void> {
 }
 
 /** Loads the project for cwd, refreshes derived files, and returns a compose handle. */
-async function openProject(json: boolean) {
-  const { projectId } = await projectForPath(process.cwd());
+async function openProject(json: boolean, cwd: string = process.cwd()) {
+  const { projectId } = await projectForPath(cwd);
   const project = await loadProjectJson(projectId);
   const eff = await loadEffectiveConfig(project);
   for (const w of await refreshDerived(project, eff.config)) say(json, `warning: ${w}`);
@@ -73,15 +74,38 @@ const lastLine = (...parts: string[]) => {
 };
 
 async function readStdinSecret(): Promise<string> {
-  if (process.stdin.isTTY) throw new MinionsError('PRECONDITION', '--stdin expects the token on a pipe, not a terminal.', 'Omit --stdin to be prompted without echo.');
-  let data = '';
-  for await (const chunk of process.stdin) { data += String(chunk); if (data.length > 4096) break; }
-  return data.split(/\r?\n/)[0] ?? '';
+  return (await readStdinLines(1))[0] ?? '';
 }
 
-async function ensureUp(json: boolean) {
+/** First `n` lines of piped stdin (tokens are never accepted from argv). */
+async function readStdinLines(n: number): Promise<string[]> {
+  if (process.stdin.isTTY) throw new MinionsError('PRECONDITION', 'Token input on stdin expects a pipe, not a terminal.', 'Omit the stdin option to be prompted without echo.');
+  let data = '';
+  for await (const chunk of process.stdin) { data += String(chunk); if (data.length > 8192) break; }
+  return data.split(/\r?\n/).slice(0, n);
+}
+
+/** `minions setup` container steps, using the same code as `minions start` and `minions import`. */
+function setupRuntime(json: boolean, cwd: string): SetupRuntime {
+  let opened: Awaited<ReturnType<typeof ensureUp>> | undefined;
+  const up = () => { if (!opened) throw new MinionsError('INTERNAL', 'container not started'); return opened; };
+  return {
+    containerRunning: (projectId) => new Compose(projectId).isRunning().catch(() => false),
+    async start() { opened = await ensureUp(json, cwd); },
+    repoPresent: async () => repoPresent(up().compose),
+    importRepo: async () => importRepo(up().project, { repoPath: (await projectForPath(cwd)).repoPath }),
+    async launchCoordinator() {
+      const p = up();
+      // Started detached so it runs (and Telegram works) with nobody attached; attaching comes after.
+      return (await telegramStartup(json, p.compose, p.config, { startDetached: true })) as { action?: string; reason?: string } | null;
+    },
+    attachCommand: (projectId) => { const c = new Compose(projectId); return `docker compose -p ${c.name} -f ${c.file} exec app minions coordinator`; },
+  };
+}
+
+async function ensureUp(json: boolean, cwd: string = process.cwd()) {
   await requireDocker();
-  const p = await openProject(json);
+  const p = await openProject(json, cwd);
   if (await ensureImage(p.project.imageTag, { onBuild: (m) => say(json, m) })) say(json, `Built ${p.project.imageTag}.`);
   await materialize(json, p.project.projectId);
   await upClearingSecretsOnFailure(p.compose, p.project.projectId);
@@ -126,6 +150,49 @@ export function register(program: Command): void {
           attach: o.attach, newIdentity: o.newIdentity, io,
         });
         emit(r, { json, human: formatInit });
+      } finally { io?.close?.(); }
+    }));
+
+  program.command('setup [path]')
+    .description('Guided end-to-end setup: init wizard, GitHub, CI guidance, Telegram, container start, import, coordinator')
+    .addOption(new Option('--profile <profile>', 'starting profile').choices([...PROFILES]))
+    .option('--private', 'private install: nothing is written into the repository')
+    .option('--shared', 'shared install: writes .minions/config.json and .minions/README.md')
+    .option('-y, --yes', 'non-interactive: accept defaults (optional integrations off unless a token is piped)')
+    .option('--dry-run', 'show what setup would do without writing, prompting for secrets, or starting anything')
+    .addOption(new Option('--delivery <mode>', 'delivery mode (branch/pull-request need a stored GitHub token)').choices([...DELIVERY_MODES]))
+    .option('--github-token-stdin', 'read the GitHub token from the first line of piped stdin')
+    .option('--telegram-token-stdin', 'read the Telegram bot token from piped stdin (second line when combined with --github-token-stdin)')
+    .option('--no-attach', 'do not offer to attach the coordinator at the end')
+    .action(action(async (path: string | undefined, o: { profile?: Profile; private?: boolean; shared?: boolean; yes?: boolean; dryRun?: boolean; delivery?: DeliveryMode; githubTokenStdin?: boolean; telegramTokenStdin?: boolean; attach: boolean }, cmd: Command) => {
+      requireMode('host');
+      const { json } = globalOpts(cmd);
+      if (o.private && o.shared) throw new MinionsError('INVALID_CONFIG', '--private and --shared are mutually exclusive.');
+      const piped = !!(o.githubTokenStdin || o.telegramTokenStdin);
+      const interactive = !o.yes && !o.dryRun && !json && !piped && !!process.stdin.isTTY;
+      if (!o.yes && !o.dryRun && !interactive) {
+        throw new MinionsError('PRECONDITION', 'setup needs a terminal for its questions.', 'Pass --yes to accept the defaults (tokens can be piped with --github-token-stdin / --telegram-token-stdin), or --dry-run.');
+      }
+      const target = resolvePath(path ?? '.');
+      let tokens: { github?: string; telegram?: string } | undefined;
+      if (piped && !o.dryRun) {
+        const lines = await readStdinLines(o.githubTokenStdin && o.telegramTokenStdin ? 2 : 1);
+        tokens = o.githubTokenStdin ? { github: lines[0], ...(o.telegramTokenStdin ? { telegram: lines[1] } : {}) } : { telegram: lines[0] };
+      }
+      const io = interactive ? readlineIO() : undefined;
+      try {
+        const r = await runSetup({
+          path: target, profile: o.profile, visibility: o.private ? 'private' : o.shared ? 'shared' : undefined,
+          yes: !interactive, dryRun: o.dryRun, io, delivery: o.delivery, tokens, runtime: setupRuntime(json, target),
+        });
+        emit(r, { json, human: formatSetup });
+        if (r.steps.some((s) => s.status === 'failed')) process.exitCode = 1;
+        // The coordinator is a TUI in tmux: attaching needs a terminal (compose exec allocates a TTY).
+        if (r.ready && interactive && o.attach && process.stdout.isTTY && io && /^y(es)?$/i.test(await io.ask('Attach to the coordinator now? (y/n)', 'y'))) {
+          io.close?.();
+          say(json, 'Attaching the coordinator (tmux session "coordinator"; detach with Ctrl-b d). On first start, log in to Claude with /login.');
+          process.exitCode = await new Compose(r.projectId).execInherit(['minions', 'coordinator'], { tty: true });
+        }
       } finally { io?.close?.(); }
     }));
 
