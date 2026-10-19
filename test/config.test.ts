@@ -171,3 +171,29 @@ describe('layering and provenance', () => {
     expect(e.code).toBe('POLICY_DENIED');
   });
 });
+
+describe('models.effort and models.coordinator', async () => {
+  const { validateConfig } = await import('../src/config/resolve.js');
+  const { defaults: d } = await import('./helpers.js');
+  const base = () => { const c = d(); c.models = { ...c.models, default: 'claude-opus-5-5', allowed: ['claude-opus-5-5', 'sonnet', 'opus', 'haiku'] }; return c; };
+
+  it('accepts a full model id, effort levels and an allowed coordinator model', () => {
+    for (const effort of ['low', 'medium', 'high', 'xhigh', 'max'] as const) {
+      expect(validateConfig({ ...base(), models: { ...base().models, effort, coordinator: 'claude-opus-5-5' } }, 'x').models).toMatchObject({ effort, coordinator: 'claude-opus-5-5' });
+    }
+    expect(validateConfig(base(), 'x').models.effort).toBeUndefined();
+  });
+
+  it('rejects unknown effort levels and a coordinator model outside models.allowed', () => {
+    expect(() => validateConfig({ ...base(), models: { ...base().models, effort: 'extreme' } }, 'x')).toThrow(expect.objectContaining({ code: 'INVALID_CONFIG' }));
+    expect(() => validateConfig({ ...base(), models: { ...base().models, coordinator: 'gpt-x' } }, 'x')).toThrow(expect.objectContaining({ code: 'INVALID_CONFIG' }));
+  });
+
+  it("this repository's .minions/config.json validates (Opus 5.5 workers at medium effort)", async () => {
+    const { readFileSync } = await import('node:fs');
+    const raw = JSON.parse(readFileSync(new URL('../.minions/config.json', import.meta.url), 'utf8'));
+    const cfg = validateConfig({ ...raw, git: { ...raw.git, identity: { name: 'x', email: 'x@example.com' } } }, '.minions/config.json');
+    expect(cfg.models).toMatchObject({ default: 'claude-opus-5-5', effort: 'medium', selection: 'coordinator' });
+    expect(cfg.models.allowed).toEqual(['claude-opus-5-5', 'sonnet', 'opus', 'haiku']);
+  });
+});

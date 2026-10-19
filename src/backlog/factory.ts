@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import type { MinionsConfig } from '../config/schema.js';
 import { MinionsError } from '../core/errors.js';
 import { atomicWrite } from '../core/fsutil.js';
-import { containerPaths } from '../core/paths.js';
+import { runtimePaths } from '../runtime/paths.js';
 import { BacklogMdAdapter } from './backlogmd.js';
 import type { BacklogAdapter, IdempotencyStore } from './types.js';
 
@@ -16,14 +16,14 @@ export class MemoryIdempotencyStore implements IdempotencyStore {
   put(key: string, taskId: string) { this.map.set(key, taskId); }
 }
 
-/** Opens the configured backend (v0.1: Backlog.md at /state/backlog). */
+/** Opens the configured backend (v0.1: Backlog.md at <state>/backlog). */
 export function openBacklog(cfg: MinionsConfig, deps: { idempotency: IdempotencyStore; root?: string }): BacklogAdapter {
   if (cfg.backlog.backend !== 'backlogmd') {
     throw new MinionsError('INCOMPATIBLE_RUNTIME', `Backlog backend "${cfg.backlog.backend}" is deferred in v0.1`,
       'Use backlog.backend "backlogmd".');
   }
   return new BacklogMdAdapter({
-    root: deps.root ?? containerPaths().backlog,
+    root: deps.root ?? runtimePaths().backlog,
     idempotency: deps.idempotency,
     startReady: cfg.intake.startReady,
   });

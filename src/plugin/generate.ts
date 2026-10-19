@@ -82,7 +82,7 @@ function architectureGuidance(cfg: MinionsConfig): string {
 }
 
 function modelGuidance(cfg: MinionsConfig): string {
-  if (cfg.models.selection === 'fixed') return `Selection is fixed: always pass \`model: "${cfg.models.default}"\`.`;
+  if (cfg.models.selection === 'fixed') return `Selection is fixed: always pass \`model: "${cfg.models.default}"\`.${effortGuidance(cfg)}`;
   const allowed = new Set(cfg.models.allowed);
   const opt = (m: string, why: string) => (allowed.has(m) ? `\`${m}\` for ${why}` : null);
   const parts = [
@@ -90,7 +90,14 @@ function modelGuidance(cfg: MinionsConfig): string {
     cfg.models.default !== 'haiku' ? opt('haiku', 'narrow inspection or mechanical analysis') : null,
     cfg.models.default !== 'opus' ? opt('opus', 'hard debugging, architecture, or repeated failures') : null,
   ].filter(Boolean);
-  return `Choose per attempt, only from the allowed list: ${parts.join('; ')}. Prefer a fresh worker for independent work.`;
+  return `Choose per attempt, only from the allowed list: ${parts.join('; ')}. Prefer a fresh worker for independent work.${effortGuidance(cfg)}`;
+}
+
+/** Workers' reasoning effort comes from their definition (frontmatter `effort`); the Agent call cannot change it. */
+function effortGuidance(cfg: MinionsConfig): string {
+  return cfg.models.effort
+    ? ` Workers run at reasoning effort \`${cfg.models.effort}\` (set in their definitions; a call cannot change it): for work that needs deeper reasoning, pick a stronger allowed model rather than retrying at the same one.`
+    : '';
 }
 
 function deliveryGuidance(cfg: MinionsConfig): string {
@@ -134,6 +141,8 @@ function baseVars(cfg: MinionsConfig): Record<string, string> {
     profile: cfg.profile,
     configRevision: String(cfg.configRevision),
     workerModel: cfg.models.default,
+    // Frontmatter line appended after `model:` only when models.effort is set (enum value, YAML-safe).
+    workerEffortLine: cfg.models.effort ? `\neffort: ${cfg.models.effort}` : '',
     defaultModel: cfg.models.default,
     allowedModels: inlineList(cfg.models.allowed, 'none'),
     modelGuidance: modelGuidance(cfg),

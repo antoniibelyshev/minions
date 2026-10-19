@@ -17,6 +17,7 @@ import type { ErrorCode } from '../core/errors.js';
 import { run, type RunResult } from '../core/exec.js';
 import { redact } from '../core/output.js';
 import { normalizeGithubRemote, readGithubToken, type GitFn } from './github.js';
+import { isHostRuntime } from './git-hardening.js';
 import { git as realGit } from './worktree.js';
 
 export type GhFn = (args: string[], opts?: { input?: string; cwd?: string }) => Promise<RunResult>;
@@ -141,8 +142,11 @@ export async function publishTask(input: PublishInput): Promise<PublishOutcome> 
   }
   if (reasons.length && !input.humanApproved) return { state: 'awaiting-approval', reasons, changedPaths, sensitivePaths };
 
-  // 4. Remote branch: reconcile, fast-forward only, never force.
-  const ls = await git(repo, ['ls-remote', '--heads', 'origin', `refs/heads/${branch}`], true);
+  // 4. Remote branch: reconcile, fast-forward only, never force. The host runtime names the normalized
+  // https URL instead of the agent-writable `origin` remote (no pushurl / receivepack from the workspace).
+  const remote = isHostRuntime() ? https : 'origin';
+  const ghCwd = isHostRuntime() ? '/' : repo; // gh gets --repo; outside the workspace it never runs git there
+  const ls = await git(repo, ['ls-remote', '--heads', remote, `refs/heads/${branch}`], true);
   if (ls.code !== 0) return fail(classifyFailure(ls.stderr), `Cannot read origin: ${lastLines(ls.stderr) || `git exit ${ls.code}`}`);
   const remoteSha = ls.stdout.trim().split(/\s+/)[0] || null;
   let push: 'pushed' | 'already-current' = 'already-current';
@@ -150,27 +154,27 @@ export async function publishTask(input: PublishInput): Promise<PublishOutcome> 
     if (remoteSha && (await git(repo, ['merge-base', '--is-ancestor', remoteSha, head], true)).code !== 0) {
       return fail('CONFLICT', `origin/${branch} is at ${remoteSha}, which is not an ancestor of the approved head ${head}; refusing to overwrite it (no force push).`);
     }
-    const p = await git(repo, ['push', '--porcelain', 'origin', `${head}:refs/heads/${branch}`], true);
+    const p = await git(repo, ['push', '--porcelain', remote, `${head}:refs/heads/${branch}`], true);
     if (p.code !== 0) return fail(classifyFailure(p.stderr), `git push to origin failed: ${lastLines(p.stderr) || `git exit ${p.code}`}`);
     push = 'pushed';
   }
   if (mode === 'branch') return { state: 'published', mode, push, pr: null, prUrl: null, repository, changedPaths, sensitivePaths };
 
   // 5. Pull request: reuse an existing one for this head branch, else open exactly one.
-  const found = await findPr(gh, repo, repository, branch, head);
+  const found = await findPr(gh, ghCwd, repository, branch, head);
   if (found.error) return found.error;
   if (found.pr) return { state: 'published', mode, push, pr: 'existing', prUrl: found.pr.url, repository, changedPaths, sensitivePaths };
   const text = pullRequestText(input.task, cfg, head);
-  const c = await gh(['pr', 'create', '--repo', repository, '--base', base, '--head', branch, '--title', text.title, '--body-file', '-'], { cwd: repo, input: text.body });
+  const c = await gh(['pr', 'create', '--repo', repository, '--base', base, '--head', branch, '--title', text.title, '--body-file', '-'], { cwd: ghCwd, input: text.body });
   if (c.code !== 0) {
     // A concurrent or interrupted earlier run may have opened it; reconcile once.
-    const again = await findPr(gh, repo, repository, branch, head);
+    const again = await findPr(gh, ghCwd, repository, branch, head);
     if (again.pr) return { state: 'published', mode, push, pr: 'existing', prUrl: again.pr.url, repository, changedPaths, sensitivePaths };
     return fail(classifyFailure(c.stderr), `gh pr create failed: ${lastLines(c.stderr || c.stdout) || `exit ${c.code}`}`);
   }
   const url = PR_URL_RE.exec(c.stdout)?.[0];
   if (!url) {
-    const again = await findPr(gh, repo, repository, branch, head);
+    const again = await findPr(gh, ghCwd, repository, branch, head);
     if (again.pr) return { state: 'published', mode, push, pr: 'created', prUrl: again.pr.url, repository, changedPaths, sensitivePaths };
     return fail('INTERNAL', 'gh pr create did not report a pull request URL.');
   }

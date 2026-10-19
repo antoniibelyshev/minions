@@ -9,7 +9,7 @@ import { action, globalOpts, requireMode, runtimeMode } from '../core/cli-helper
 import { MinionsError } from '../core/errors.js';
 import { readJson } from '../core/fsutil.js';
 import { emit } from '../core/output.js';
-import { delegateToContainer } from '../host/delegate.js';
+import { delegateToRuntime } from '../host/delegate.js';
 import { readTelegramAccess } from '../telegram/access.js';
 import { installTelegramPlugin } from '../telegram/install.js';
 import { formatTelegramProbe, probeTelegram } from '../telegram/probe.js';
@@ -112,9 +112,9 @@ function humanStatus(s: StatusReport): string {
   return out.join('\n');
 }
 
-/** Host mode: run the same command inside the container and exit with its code. */
+/** Host CLI: run the same command in the project runtime (container or host runtime) and exit with its code. */
 async function delegate(cmd: Command): Promise<void> {
-  const code = await delegateToContainer(process.argv.slice(2), { json: globalOpts(cmd).json });
+  const code = await delegateToRuntime(process.argv.slice(2), { json: globalOpts(cmd).json });
   process.exit(code);
 }
 
@@ -122,7 +122,7 @@ async function delegate(cmd: Command): Promise<void> {
 
 /** Registers runtime commands on the root program. */
 export function register(program: Command): void {
-  if (runtimeMode() === 'container') {
+  if (runtimeMode() !== 'host') {
     // Give `backlog ...` the lease/pause view and DB-backed idempotency (lazy: no DB opened until used).
     setIdempotencyStore(lazyIdempotency);
     setReadyContext(() => {
@@ -137,7 +137,7 @@ export function register(program: Command): void {
     .requiredOption('--role <role>', 'engineer | tester | reviewer')
     .option('--holder <holder>', 'who holds the lease (default: this process)')
     .action(action(async (taskId: string, o: { role: string; holder?: string }, cmd: Command) => {
-      requireMode('container');
+      requireMode('runtime');
       if (!(LEASE_ROLES as readonly string[]).includes(o.role)) throw new MinionsError('PRECONDITION', `--role must be engineer, tester or reviewer (got ${o.role}).`);
       const brief = await (await scheduler()).claim(taskId, o.role as LeaseRole, { holder: o.holder });
       emit(brief, { json: globalOpts(cmd).json, human: (b) => `${b.briefMarker}\n${JSON.stringify(b, null, 2)}` });
@@ -146,7 +146,7 @@ export function register(program: Command): void {
     .option('--result-file <path>', 'read the WorkerResult from a file ("-" = stdin)')
     .option('--correction', 'the single allowed correction after an invalid result')
     .action(action(async (leaseId: string, o: { resultFile?: string; correction?: boolean }, cmd: Command) => {
-      requireMode('container');
+      requireMode('runtime');
       const raw = await readInput(o.resultFile);
       const r = await (await scheduler()).record(leaseId, raw, { correction: !!o.correction });
       emit(r, { json: globalOpts(cmd).json, human: (d) => [d.message, ...(d.errors ?? []).map((e: string) => `  - ${e}`)].join('\n') });
@@ -154,7 +154,7 @@ export function register(program: Command): void {
   work.command('release <leaseId>').description('Release a lease without a result (worktree is kept)')
     .requiredOption('--reason <text>', 'why the lease is released')
     .action(action(async (leaseId: string, o: { reason: string }, cmd: Command) => {
-      requireMode('container');
+      requireMode('runtime');
       const r = await (await scheduler()).release(leaseId, o.reason);
       emit(r, { json: globalOpts(cmd).json, human: (d) => `Released ${d.leaseId} (${d.taskId}); worktree kept at ${d.worktree ?? '-'}` });
     }));
@@ -177,7 +177,7 @@ export function register(program: Command): void {
   work.command('list').description('List active leases')
     .option('--all', 'include ended leases')
     .action(action(async (o: { all?: boolean }, cmd: Command) => {
-      requireMode('container');
+      requireMode('runtime');
       const leases = getDb().leases({ all: !!o.all });
       emit({ leases }, { json: globalOpts(cmd).json, human: (d) => (d.leases.length ? d.leases.map(leaseLine).join('\n') : '(no leases)') });
     }));
@@ -197,7 +197,7 @@ export function register(program: Command): void {
     .action(action(async (o: { printCommand?: boolean; probe?: boolean }, cmd: Command) => {
       const cfg = await getConfig();
       if (o.probe) {
-        const r = { ...(await probeRuntime()), command: await buildCoordinatorCommand(cfg) };
+        const r = { ...(await probeRuntime(cfg)), command: await buildCoordinatorCommand(cfg) };
         emit(r, { json: globalOpts(cmd).json, human: (d: typeof r) => `Claude Code ${d.claudeVersion}, ${d.tmuxVersion}: launch flags supported` });
         return;
       }
@@ -206,19 +206,19 @@ export function register(program: Command): void {
         emit(r, { json: globalOpts(cmd).json, human: (d: typeof r) => [JSON.stringify([d.tmux.cmd, ...d.tmux.args]), JSON.stringify([d.claude.cmd, ...d.claude.args])].join('\n') });
         return;
       }
-      requireMode('container');
+      requireMode('runtime');
       process.exitCode = await launchCoordinator(cfg);
     }));
   coord.command('run').description('Exec wrapper started by tmux: decides Telegram, then runs claude (container only)')
     .action(action(async () => {
-      requireMode('container');
+      requireMode('runtime');
       process.exitCode = await runCoordinator(await getConfig());
     }));
   coord.command('sync').description('Apply restart-required Telegram changes with a controlled coordinator restart (container only)')
     .option('--force', 'restart even while worker leases are active (they stay recorded for recovery)')
     .option('--start-detached', 'start the coordinator session without attaching when it is not running')
     .action(action(async (o: { force?: boolean; startDetached?: boolean }, cmd: Command) => {
-      requireMode('container');
+      requireMode('runtime');
       const d = getDb();
       const r = await syncCoordinator(await getConfig(), {
         activeLeases: () => d.activeLeases(),
@@ -237,6 +237,10 @@ export function register(program: Command): void {
   tg.command('install').description('Install the official Telegram channel plugin at user scope in the claude volume (needs network, no login)')
     .action(action(async (_o: unknown, cmd: Command) => {
       if (runtimeMode() === 'host') return delegate(cmd);
+      if (runtimeMode() === 'host-runtime') {
+        throw new MinionsError('PRECONDITION', 'The Telegram channel is not available in the host runtime: it would install a plugin into your own Claude Code setup, and the host runtime starts Claude Code without user settings, plugins or MCP servers.',
+          'Use the Docker runtime for Telegram (`minions runtime set docker`), or keep the terminal channel.');
+      }
       const r = await installTelegramPlugin();
       emit(r, { json: globalOpts(cmd).json, human: (d: typeof r) => [`marketplace ${d.marketplace}; plugin ${d.plugin} (version ${d.version ?? 'unknown'})`, ...d.warnings.map((w) => `warning: ${w}`)].join('\n') });
     }));
@@ -255,7 +259,7 @@ export function register(program: Command): void {
   const ws = program.command('workspace').description('Container workspace and state setup (container only)');
   ws.command('setup').description('Create /state layout, runtime DB and Backlog.md config (idempotent)')
     .action(action(async (_o: unknown, cmd: Command) => {
-      requireMode('container');
+      requireMode('runtime');
       const r = await setupState(runtimePaths(), writeBacklogConfig);
       emit(r, { json: globalOpts(cmd).json, human: (d) => `State ready at ${d.state} (schema ${d.schemaVersion}); backlog config ${d.backlogConfig.changed ? 'written' : 'unchanged'}` });
     }));
@@ -263,7 +267,7 @@ export function register(program: Command): void {
     .requiredOption('--base <branch>', 'base branch')
     .option('--remote-url <url>', 'origin URL to record (fetched over https only when a GitHub token is mounted)')
     .action(action(async (bundle: string, o: { base: string; remoteUrl?: string }, cmd: Command) => {
-      requireMode('container');
+      requireMode('runtime');
       const r = await importWorkspace(bundle, { base: o.base, remoteUrl: o.remoteUrl, config: await getConfig() });
       emit(r, { json: globalOpts(cmd).json, human: (d: typeof r) => [`${d.imported ? 'Cloned' : 'Refreshed'} ${d.repo} at ${d.head} (base ${d.base})`,
         ...(d.origin ? [`origin ${d.origin.url}: ${d.origin.authenticated ? 'authenticated' : 'not authenticated'}, ${d.origin.fetched ? `fetched ${d.base}` : 'not fetched'}`] : []),
@@ -284,7 +288,7 @@ export function register(program: Command): void {
     });
   ws.command('export <outPath>').description('Write a bundle with the base branch and agent/* branches')
     .action(action(async (out: string, _o: unknown, cmd: Command) => {
-      requireMode('container');
+      requireMode('runtime');
       const r = await exportWorkspace(out, { base: (await getConfig()).git.baseBranch });
       emit(r, { json: globalOpts(cmd).json, human: (d) => `Wrote ${d.path}\n${d.refs.join('\n')}` });
     }));

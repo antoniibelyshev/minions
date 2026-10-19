@@ -16,6 +16,7 @@ import { run, type RunOptions, type RunResult } from '../core/exec.js';
 import { atomicWrite, ensureDir, readJsonIfExists, writeJson } from '../core/fsutil.js';
 import { redact } from '../core/output.js';
 import { CONTAINER, defaultsPath, projectPaths } from '../core/paths.js';
+import { RuntimeKindSchema } from './runtime-kind.js';
 
 export type Runner = (cmd: string, args: string[], opts?: RunOptions) => Promise<RunResult>;
 
@@ -26,6 +27,8 @@ const RESERVED_ENV = new Set([
   'HOME', 'PATH', 'LANG', 'LC_ALL', 'TERM', 'USER', 'SHELL', 'npm_config_cache', 'XDG_CACHE_HOME',
   'NODE_OPTIONS', 'LD_PRELOAD', 'LD_LIBRARY_PATH',
 ]);
+/** Prefixes claudeAuth.env may not set either (runtime variables, git config/programs, dynamic linker). */
+const RESERVED_ENV_PREFIXES = ['MINIONS_', 'GIT_', 'DYLD_', 'SSH_'];
 const envName = z.string().regex(ENV_NAME, 'must be an environment variable name');
 const EnvSchema = z.record(envName, z.string().max(4096));
 
@@ -58,7 +61,7 @@ export const ClaudeAuthSchema = z.discriminatedUnion('method', [
   }).strict(),
 ]).superRefine((a, ctx) => {
   for (const k of Object.keys(a.env ?? {})) {
-    if (RESERVED_ENV.has(k) || k.startsWith('MINIONS_')) ctx.addIssue({ code: 'custom', path: ['env', k], message: 'reserved: cannot be set through claudeAuth.env (secrets never go in env)' });
+    if (RESERVED_ENV.has(k) || RESERVED_ENV_PREFIXES.some((p) => k.startsWith(p))) ctx.addIssue({ code: 'custom', path: ['env', k], message: 'reserved: cannot be set through claudeAuth.env (secrets never go in env)' });
   }
 });
 export type ClaudeAuth = z.infer<typeof ClaudeAuthSchema>;
@@ -167,7 +170,8 @@ export async function resolveOnPath(cmd: string, pathEnv: string | undefined = p
 
 // ---------------------------------------------------------------- defaults.json
 
-export const DefaultsSchema = z.object({ claudeAuth: ClaudeAuthSchema.optional() }).strict();
+/** Host-wide defaults for new projects. `runtime` (docker|host) is host-only, like claudeAuth. */
+export const DefaultsSchema = z.object({ claudeAuth: ClaudeAuthSchema.optional(), runtime: RuntimeKindSchema.optional() }).strict();
 export type Defaults = z.infer<typeof DefaultsSchema>;
 export const loadDefaults = async (): Promise<Defaults> => (await readJsonIfExists(defaultsPath(), DefaultsSchema)) ?? {};
 export async function saveDefaults(d: Defaults): Promise<void> { await writeJson(defaultsPath(), d, { mode: 0o600 }); }

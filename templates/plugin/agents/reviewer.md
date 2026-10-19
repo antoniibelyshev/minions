@@ -3,7 +3,7 @@ name: reviewer
 description: Minions reviewer. Inspects the exact branch head of a task in its read-only review worktree and returns a verdict in a WorkerResult JSON. Never edits or commits. Launched only by the minions coordinator with a minions-lease brief.
 tools: Read, Grep, Glob, Bash
 disallowedTools: Agent, Edit, Write, NotebookEdit
-model: {{workerModel}}
+model: {{workerModel}}{{workerEffortLine}}
 maxTurns: {{attemptMaxTurns}}
 ---
 

@@ -29,6 +29,8 @@ export function projectPaths(projectId: string) {
     runtimeDir: join(dir, 'runtime'),
     runtimeConfigJson: join(dir, 'runtime', 'config.json'),
     pluginDir: join(dir, 'plugin'),
+    /** Host-side plugin of the setup assistant (`minions setup assist`), regenerated on every launch. */
+    assistantPluginDir: join(dir, 'assistant-plugin'),
     exportsDir: join(dir, 'exports'),
     /** Host-only credential references (never mounted). */
     credentialsJson: join(dir, 'credentials.json'),
@@ -43,9 +45,49 @@ export function projectPaths(projectId: string) {
     /** Non-secret record of the last key refresh (time, redacted error). */
     authStateJson: join(dir, 'auth-state.json'),
     logsDir: join(dir, 'logs'),
+    /** Host runtime (no Docker) only: the agents' own clone, state, and PATH shims. */
+    hostDir: join(dir, 'host'),
   };
 }
 export type ProjectPaths = ReturnType<typeof projectPaths>;
+
+/**
+ * Host runtime layout (`runtime: "host"` in project.json). The agents never work in the user's
+ * checkout: they get a separate clone under <project>/host/workspace, seeded from a Git bundle of the
+ * base branch exactly like the container workspace.
+ */
+export function hostRuntimePaths(projectId: string) {
+  const root = join(projectDir(projectId), 'host');
+  return {
+    root,
+    workspace: join(root, 'workspace'),
+    repo: join(root, 'workspace', 'repo'),
+    state: join(root, 'state'),
+    /** Tool caches (npm, XDG, corepack, pip, ...) of the agents: inside the state dir, never ~/.npm or ~/.cache. */
+    cache: join(root, 'state', 'cache'),
+    /**
+     * Bundle transfer dirs owned by the host CLI (not agent-writable: the sandbox may write only the
+     * workspace and state): bundles are never copied through a path an agent could swap for a symlink.
+     */
+    transfer: join(root, 'transfer'),
+    import: join(root, 'transfer', 'import'),
+    exports: join(root, 'transfer', 'exports'),
+    /** Logs written by unsandboxed hook processes (MINIONS_LOG_DIR); outside the agent-writable dirs. */
+    logs: join(root, 'logs'),
+    /** PATH shims: `minions` (pins the runtime environment) and the `gh` token wrapper. */
+    bin: join(root, 'bin'),
+    minionsShim: join(root, 'bin', 'minions'),
+    ghShim: join(root, 'bin', 'gh'),
+    /**
+     * Dedicated tmux server socket name (`tmux -L`), so the user's own tmux server is never touched.
+     * tmux keeps it in its private per-user directory (/tmp/tmux-<uid>, 0700, ownership-checked);
+     * sandboxed commands get no Unix sockets and no access to that directory (see hostSettings). A
+     * `-S <project>/host/...` socket is not used: that path exceeds the 104-byte macOS socket path limit.
+     */
+    tmuxSocket: `minions-${shortId(projectId)}`,
+  };
+}
+export type HostRuntimePaths = ReturnType<typeof hostRuntimePaths>;
 
 /** Shared-install files inside the repository. */
 export function repoPaths(repoPath: string) {

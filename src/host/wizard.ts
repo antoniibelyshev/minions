@@ -99,6 +99,8 @@ export interface WizardInput {
   io?: WizardIO;
   /** Claude authorization: default (previous project / defaults.json) and preset detection. */
   auth?: { default?: ClaudeAuth; centralOnPath?: boolean; home?: string };
+  /** Agent runtime chosen before the wizard (host-only setting). Default docker. */
+  runtime?: 'docker' | 'host';
 }
 
 export interface WizardResult { config: MinionsConfig; notes: string[]; asked: string[]; claudeAuth?: ClaudeAuth }
@@ -264,18 +266,21 @@ export async function runWizard(input: WizardInput): Promise<WizardResult> {
 
   if (interactive) {
     // Verification commands (inferred from package.json scripts, never executed on the host).
-    const v = await ask('verification.commands', "Verification commands run inside the container (separate with ';', 'none' for none)",
+    const v = await ask('verification.commands', `Verification commands run by the agents ${input.runtime === 'host' ? 'in their workspace clone' : 'inside the container'} (separate with ';', 'none' for none)`,
       cfg.verification.commands.join('; ') || 'none', (s) => (s.trim() === 'none' ? [] : s.split(';').map((x) => x.trim()).filter(Boolean)));
     cfg.verification.commands = v;
-    // 8. Container resources and preview ports.
-    io.info(`Container: image minions-runtime:${VERSION}${d.dockerfile ? ' (the repository Dockerfile is not built)' : ''}; host has ${d.host.cpus} CPUs, ${d.host.memoryMiB} MiB RAM.`);
-    cfg.container.cpus = await ask('container.cpus', 'Container CPUs', String(cfg.container.cpus), posNum(false, 0.5));
-    cfg.container.memoryMiB = await ask('container.memoryMiB', 'Container memory (MiB)', String(cfg.container.memoryMiB), posNum(true, 512));
-    cfg.container.publishPorts = await ask('container.publishPorts', 'Preview ports to publish on 127.0.0.1 (host:container, comma separated)',
-      fmtPorts(cfg.container.publishPorts), parsePorts);
+    // 8. Container resources and preview ports (docker runtime only).
+    if (input.runtime === 'host') io.info('Container resources and preview ports: not applicable (host runtime has no container limits).');
+    else {
+      io.info(`Container: image minions-runtime:${VERSION}${d.dockerfile ? ' (the repository Dockerfile is not built)' : ''}; host has ${d.host.cpus} CPUs, ${d.host.memoryMiB} MiB RAM.`);
+      cfg.container.cpus = await ask('container.cpus', 'Container CPUs', String(cfg.container.cpus), posNum(false, 0.5));
+      cfg.container.memoryMiB = await ask('container.memoryMiB', 'Container memory (MiB)', String(cfg.container.memoryMiB), posNum(true, 512));
+      cfg.container.publishPorts = await ask('container.publishPorts', 'Preview ports to publish on 127.0.0.1 (host:container, comma separated)',
+        fmtPorts(cfg.container.publishPorts), parsePorts);
+    }
   }
-  if (cfg.container.cpus > d.host.cpus) notes.push(`container.cpus ${cfg.container.cpus} exceeds host CPUs (${d.host.cpus}).`);
-  if (cfg.container.memoryMiB > d.host.memoryMiB) notes.push(`container.memoryMiB ${cfg.container.memoryMiB} exceeds host memory (${d.host.memoryMiB} MiB).`);
+  if (input.runtime !== 'host' && cfg.container.cpus > d.host.cpus) notes.push(`container.cpus ${cfg.container.cpus} exceeds host CPUs (${d.host.cpus}).`);
+  if (input.runtime !== 'host' && cfg.container.memoryMiB > d.host.memoryMiB) notes.push(`container.memoryMiB ${cfg.container.memoryMiB} exceeds host memory (${d.host.memoryMiB} MiB).`);
   return { config: validateConfig(cfg, 'wizard answers'), notes, asked, ...(claudeAuth ? { claudeAuth } : {}) };
 }
 
@@ -293,7 +298,7 @@ export function splitArgv(s: string): string[] {
 async function askClaudeAuth(input: WizardInput, ask: Ask, io: WizardIO): Promise<ClaudeAuth> {
   const def = input.auth?.default;
   const opts: { id: 'login' | 'api-key' | 'jbcentral' | 'helper'; label: string }[] = [
-    { id: 'login', label: 'Claude login inside container (default)' },
+    { id: 'login', label: input.runtime === 'host' ? 'Your existing host Claude Code login (default)' : 'Claude login inside container (default)' },
     { id: 'api-key', label: 'API key from file/Keychain/env' },
     ...(input.auth?.centralOnPath ? [{ id: 'jbcentral' as const, label: 'JetBrains Central (detected)' }] : []),
     { id: 'helper', label: 'Custom host helper command' },
@@ -308,7 +313,9 @@ async function askClaudeAuth(input: WizardInput, ask: Ask, io: WizardIO): Promis
     if (keep) return def;
   }
   if (pick === 'login') {
-    io.info('  Log in with /login in the coordinator session on first `minions start`; host login is not reused.');
+    io.info(input.runtime === 'host'
+      ? '  The host runtime uses your existing Claude Code login on this Mac (no key is handed over).'
+      : '  Log in with /login in the coordinator session on first `minions start`; host login is not reused.');
     return { method: 'login' };
   }
   if (pick === 'jbcentral') {

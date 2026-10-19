@@ -108,3 +108,26 @@ describe('coordinator command', () => {
     await expect(buildCoordinatorCommand(defaults(), paths)).rejects.toMatchObject({ code: 'NOT_FOUND' });
   });
 });
+
+describe('coordinator --model / --effort', () => {
+  it('passes models.coordinator and models.effort to claude only when set', async () => {
+    const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const { runtimePaths } = await import('../../src/runtime/paths.js');
+    const dir = mkdtempSync(join(tmpdir(), 'minions-coord-'));
+    try {
+      mkdirSync(join(dir, 'plugin'));
+      writeFileSync(join(dir, 'plugin', 'coordinator.md'), 'prompt\n');
+      const paths = runtimePaths({ MINIONS_PLUGIN_DIR: join(dir, 'plugin'), MINIONS_STATE_DIR: join(dir, 's'), MINIONS_WORKSPACE: join(dir, 'w') });
+      const cfg = defaults();
+      cfg.models = { ...cfg.models, allowed: [...cfg.models.allowed, 'claude-opus-5-5'], coordinator: 'claude-opus-5-5', effort: 'medium' };
+      const args = (await buildClaudeCommand(cfg, paths)).args;
+      expect(args.slice(args.indexOf('--model'), args.indexOf('--model') + 2)).toEqual(['--model', 'claude-opus-5-5']);
+      expect(args.slice(args.indexOf('--effort'), args.indexOf('--effort') + 2)).toEqual(['--effort', 'medium']);
+      const plain = (await buildClaudeCommand(defaults(), paths)).args;
+      expect(plain).not.toContain('--model');
+      expect(plain).not.toContain('--effort');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+});

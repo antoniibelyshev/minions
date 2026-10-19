@@ -14,13 +14,16 @@ import { generatePlugin } from '../plugin/generate.js';
 import { discover, dockerProbe, type Discovery, type DockerProbe, type DockerStatus } from './discovery.js';
 import { authOf, isKeyAuth, loadDefaults, resolveOnPath, summarize, type AuthSummary, type ClaudeAuth } from './auth.js';
 import {
-  githubTokenGuidance, loadCredentialRefs, provisionGithubToken, provisionTelegramToken,
+  githubTokenGuidance, loadCredentialRefs, provisionTelegramToken,
   type CredentialsJson, type Fetch, type ProvisionResult, type TelegramProvisionResult,
 } from './credentials.js';
 import { composeYaml, type Runner } from './docker.js';
 import { ProjectJsonSchema, resolveEffective, runtimeProjectInfo, sharedConfigView, type ProjectJson } from './project.js';
 import { bindProject, gitCommonDir, loadRegistry, repoRoot, resolveIdentity, saveRegistry, sharedProjectId, type Identity, type Registry } from './registry.js';
 import { runWizard, type WizardIO } from './wizard.js';
+import { runGithubSetup, type GithubSetupResult } from './github-setup.js';
+import { HOST_CONFIRM_WORD, HOST_RUNTIME_SHORT, HOST_RUNTIME_WARNING, RUNTIMES, type RuntimeKind } from './runtime.js';
+import { hostRuntimePaths } from '../core/paths.js';
 
 // ---------------------------------------------------------------- manifest + journal
 
@@ -111,6 +114,8 @@ export interface InstallPlan {
   container: ProjectJson['container'] & { image: string; volumes: string[] };
   gitIdentity: { name: string; email: string };
   claudeAuth: AuthSummary;
+  /** Agent runtime (host-only setting): docker (default) or host (less safe). */
+  runtime: RuntimeKind;
   discovery: Discovery;
 }
 
@@ -132,9 +137,40 @@ export interface InitOptions {
   centralOnPath?: boolean;
   /** GitHub API client for token verification (tests). */
   fetch?: Fetch;
+  /** --runtime docker|host (host-only setting; repository config can never select it). */
+  runtime?: RuntimeKind;
+  /** Opens the token page after an explicit yes (tests; default `open` on macOS). */
+  openUrl?: (url: string) => Promise<void>;
 }
 
 interface Prepared { plan: InstallPlan; desired: Desired[]; manifest: Manifest | undefined; registry: Registry; cleanup: () => Promise<void> }
+
+/**
+ * Wizard step 0: agent runtime. Docker is the default; choosing host shows the warning and needs the
+ * typed confirmation word, otherwise Docker is kept.
+ */
+async function askRuntime(io: WizardIO, def: RuntimeKind, docker: DockerStatus | undefined, notes: string[]): Promise<RuntimeKind> {
+  const dockerOk = !docker || (docker.daemon && docker.compose);
+  io.info(`Agent runtime: docker (hardened container, recommended${dockerOk ? '' : '; Docker is not reachable right now'}) or host (no Docker; less safe).`);
+  let pick: RuntimeKind = def;
+  for (let i = 0; ; i++) {
+    const a = (await io.ask('Agent runtime (docker/host)', def)).trim();
+    if ((RUNTIMES as readonly string[]).includes(a)) { pick = a as RuntimeKind; break; }
+    if (i >= 2) throw new MinionsError('INVALID_CONFIG', 'Agent runtime: choose docker or host.');
+    io.info('  choose one of: docker, host');
+  }
+  if (pick !== 'host') return pick;
+  return confirmHostRuntime(io, notes);
+}
+
+/** Shows the warning and asks for the typed confirmation word; anything else keeps Docker. */
+async function confirmHostRuntime(io: WizardIO, notes: string[]): Promise<RuntimeKind> {
+  for (const l of HOST_RUNTIME_WARNING) io.info(l);
+  const typed = (await io.ask(`Type "${HOST_CONFIRM_WORD}" to run agents without Docker (anything else keeps Docker)`, '')).trim();
+  if (typed === HOST_CONFIRM_WORD) return 'host';
+  notes.push('Host runtime not confirmed; using the Docker runtime.');
+  return 'docker';
+}
 
 const json = (v: unknown) => Buffer.from(JSON.stringify(v, null, 2) + '\n');
 
@@ -179,7 +215,7 @@ const isInside = (child: string, parent: string) => {
   return !!r && r !== '..' && !r.startsWith('..' + sep) && !r.startsWith(sep);
 };
 
-async function prepare(opts: InitOptions): Promise<Prepared> {
+async function prepare(opts: InitOptions, docker?: DockerStatus): Promise<Prepared> {
   if (!(await exists(opts.path))) throw new MinionsError('NOT_FOUND', `Path not found: ${opts.path}`);
   const repoPath = await repoRoot(opts.path);
   const commonDir = await gitCommonDir(repoPath);
@@ -217,8 +253,26 @@ async function prepare(opts: InitOptions): Promise<Prepared> {
   if (visibility === 'shared' && sharedExists) { existingRaw = await readJsonIfExists(sharedPath); existingFile = sharedPath; }
   else if (visibility !== 'shared' && await exists(paths.configJson)) { existingRaw = await readJsonIfExists(paths.configJson); existingFile = paths.configJson; }
 
-  // Claude authorization is host-only: previous project.json, else <MINIONS_HOME>/defaults.json, else login.
+  // Claude authorization and the runtime are host-only: previous project.json, else
+  // <MINIONS_HOME>/defaults.json, else login / docker.
   const defaults = await loadDefaults();
+  const interactive = !!opts.io && !opts.yes && !opts.configFile;
+  // The host runtime is never inherited silently: a non-interactive init uses it only for an existing
+  // host project or an explicit `--runtime host --yes`; a host-wide default of host applies interactively
+  // (the wizard asks, with the typed confirmation).
+  const inheritedHost = !opts.runtime && !prevProject?.runtime && defaults.runtime === 'host';
+  let runtime: RuntimeKind = opts.runtime ?? prevProject?.runtime ?? (inheritedHost && !interactive ? 'docker' : defaults.runtime) ?? 'docker';
+  if (inheritedHost && !interactive) notes.push('defaults.json selects the host runtime, but a non-interactive init never inherits it; using Docker. Pass `--runtime host --yes` to choose it explicitly.');
+  if (!opts.runtime && interactive) runtime = await askRuntime(opts.io!, runtime, docker, notes);
+  else if (opts.runtime === 'host' && prevProject?.runtime !== 'host') {
+    if (interactive) runtime = await confirmHostRuntime(opts.io!, notes);
+    else if (!opts.yes && !opts.dryRun) {
+      throw new MinionsError('PRECONDITION', '--runtime host needs confirmation: agents would run as your macOS user without Docker.',
+        'Rerun interactively and type the confirmation word, or pass `--runtime host --yes`.');
+    }
+  }
+  if (runtime === 'docker' && docker && !opts.dryRun && (!docker.daemon || !docker.compose)) throw dockerUnavailable(docker);
+  if (runtime === 'host') warnings.push(`${HOST_RUNTIME_SHORT}`);
   let claudeAuth: ClaudeAuth | undefined = prevProject?.claudeAuth ?? defaults.claudeAuth;
   let config: MinionsConfig;
   if (existingRaw && !opts.configFile) {
@@ -243,7 +297,7 @@ async function prepare(opts: InitOptions): Promise<Prepared> {
       !!(await loadCredentialRefs(projectId).catch((): CredentialsJson => ({ version: 1 }))).github;
     const r = await runWizard({
       discovery, projectId, profile: opts.profile, visibility, configFile: opts.configFile,
-      yes: !!opts.yes, io: opts.io, githubCredential,
+      yes: !!opts.yes, io: opts.io, githubCredential, runtime,
       auth: { default: claudeAuth, centralOnPath: opts.centralOnPath ?? !!(await resolveOnPath('central')) },
     });
     config = r.config;
@@ -263,6 +317,7 @@ async function prepare(opts: InitOptions): Promise<Prepared> {
       publishPorts: config.container.publishPorts, network: config.container.network,
     },
     ...(claudeAuth ? { claudeAuth } : {}),
+    ...(runtime === 'host' || prevProject?.runtime || opts.runtime ? { runtime } : {}),
   };
 
   // Project config layer as written to disk, and the effective config for the runtime.
@@ -342,12 +397,21 @@ async function prepare(opts: InitOptions): Promise<Prepared> {
     communication: effective.communication,
     unavailable,
     externalSetup: [
-      'Docker Desktop running (compose v2+).',
-      `Runtime image ${project.imageTag} is built from the installed package on first \`minions start\`.`,
-      isKeyAuth(authOf(project))
-        ? `Claude key from ${summarize(authOf(project)).source} is provisioned by the host on every \`minions start\` (mounted read-only; no /login needed).`
-        : 'Claude login inside the container on first start: run /login in the coordinator session (host login is not reused).',
-      'Repository is imported into the container from a Git bundle of committed history on first start.',
+      ...(runtime === 'host' ? [
+        'Host runtime (no Docker): tmux, claude (Claude Code) and backlog (backlog.md) on PATH; `minions doctor` checks them.',
+        `Agents work in a separate clone at ${hostRuntimePaths(projectId).repo}, seeded from committed history on first start; your checkout is never used.`,
+        isKeyAuth(authOf(project))
+          ? `Claude key from ${summarize(authOf(project)).source} is provisioned by the host on every \`minions start\` (0600 file read by apiKeyHelper).`
+          : 'Claude Code uses your existing host login (run `claude` once and /login if you are not logged in).',
+        'The coordinator gets the Claude Code sandbox (Bash writes limited to the workspace/state, credential directories unreadable) and never bypassPermissions.',
+      ] : [
+        'Docker Desktop running (compose v2+).',
+        `Runtime image ${project.imageTag} is built from the installed package on first \`minions start\`.`,
+        isKeyAuth(authOf(project))
+          ? `Claude key from ${summarize(authOf(project)).source} is provisioned by the host on every \`minions start\` (mounted read-only; no /login needed).`
+          : 'Claude login inside the container on first start: run /login in the coordinator session (host login is not reused).',
+        'Repository is imported into the container from a Git bundle of committed history on first start.',
+      ]),
       ...(discovery.git.hasGitHub ? [
         `Optional GitHub token (mounted read-only at ${GITHUB_TOKEN_CONTAINER_PATH}; needed for upcoming push/PR delivery):`,
         ...githubTokenGuidance(discovery.git.remoteUrl).map((l) => `  ${l}`),
@@ -364,6 +428,7 @@ async function prepare(opts: InitOptions): Promise<Prepared> {
     container: { ...project.container, image: project.imageTag, volumes: Object.values(volumeNames(projectId)) },
     gitIdentity: config.git.identity,
     claudeAuth: summarize(authOf(project), paths.secretsDir),
+    runtime,
     discovery,
   };
   return { plan, desired, manifest, registry, cleanup };
@@ -494,6 +559,8 @@ export interface InitResult {
   nextSteps: string[];
   /** GitHub token step of an interactive init (repo has a GitHub remote). Never contains the token. */
   github?: { status: 'present' | 'stored' | 'skipped' | 'failed'; detail: string; provisioned?: Omit<ProvisionResult, 'projectId'> };
+  /** Guided GitHub setup (interactive) or its next-step hints (--yes). Never contains the token. */
+  githubSetup?: GithubSetupResult;
   /** Telegram bot token step (communication.channel is telegram). Never contains the token. */
   telegram?: { status: 'present' | 'stored' | 'skipped' | 'failed'; detail: string; provisioned?: Omit<TelegramProvisionResult, 'projectId'> };
 }
@@ -527,47 +594,36 @@ async function offerTelegramToken(opts: InitOptions, plan: InitResult['plan']): 
 }
 
 /**
- * Interactive init only, GitHub remote only: offers to store a token through the host terminal's
- * non-echoing prompt. Failures never fail init (the install is already applied).
+ * GitHub step of init (after the plan is applied, so failures never fail init). Interactive: the
+ * guided flow (remote, base branch on the remote, token, delivery mode; src/host/github-setup.ts).
+ * --yes / --config / no terminal: next-step hints only (no prompt, push, browser or network).
  */
-async function offerGithubToken(opts: InitOptions, plan: InitResult['plan']): Promise<InitResult['github']> {
-  const io = opts.io;
-  if (!io || opts.yes || opts.configFile || !plan.discovery.git.hasGitHub) return undefined;
-  const existing = (await loadCredentialRefs(plan.projectId).catch((): CredentialsJson => ({ version: 1 }))).github;
-  if (existing) return { status: 'present', detail: `GitHub token already provisioned (${existing.backend}); replace it with \`minions auth github\`.` };
-  if (!io.secret) return { status: 'skipped', detail: 'no terminal for a non-echoing prompt; run `minions auth github` later.' };
-  io.info(['', 'GitHub token (optional now; needed later for push/PR delivery):', ...githubTokenGuidance(plan.discovery.git.remoteUrl).map((l) => `  ${l}`)].join('\n'));
-  const want = await io.ask('Store a GitHub token for this project now? (y/n)', 'n');
-  if (!/^y(es)?$/i.test(want)) return { status: 'skipped', detail: 'skipped; run `minions auth github` later.' };
-  try {
-    const token = await io.secret('GitHub token (input hidden): ');
-    const { projectId: _id, ...provisioned } = await provisionGithubToken({
-      projectId: plan.projectId, token, repoPath: plan.repoPath, remoteUrl: plan.discovery.git.remoteUrl,
-      runner: opts.runner, fetch: opts.fetch,
-    });
-    return { status: 'stored', detail: `stored in ${provisioned.backend === 'keychain' ? 'the macOS Keychain' : 'a 0600 host file'}`, provisioned };
-  } catch (e) {
-    return { status: 'failed', detail: `${e instanceof MinionsError ? e.message : 'could not store the token'}; run \`minions auth github\` to retry.` };
-  }
+async function githubStep(opts: InitOptions, plan: InitResult['plan']): Promise<GithubSetupResult> {
+  const interactive = !!opts.io && !opts.yes && !opts.configFile;
+  return runGithubSetup({
+    projectId: plan.projectId, repoPath: plan.repoPath, io: interactive ? opts.io : undefined, yes: !interactive,
+    runner: opts.runner, fetch: opts.fetch, openUrl: opts.openUrl,
+  });
 }
 
 export function dockerUnavailable(s: DockerStatus): MinionsError {
   const what = !s.daemon ? `Docker daemon is not reachable${s.error ? ` (${s.error})` : ''}` : `Docker Compose v2+ is required (found: ${s.composeVersion ?? 'none'})`;
-  return new MinionsError('DOCKER_UNAVAILABLE', `${what}. minions runs agents only inside Docker; there is no host fallback.`,
-    'Start Docker Desktop (or install Compose v2), then rerun `minions init`.', s);
+  return new MinionsError('DOCKER_UNAVAILABLE', `${what}. The docker runtime needs Docker; minions never falls back to the host on its own.`,
+    'Start Docker Desktop (or install Compose v2), then rerun. Running without Docker is an explicit, less safe choice: `minions runtime set host` (see README "Running without Docker").', s);
 }
 
 export async function runInit(opts: InitOptions): Promise<InitResult> {
   const probe = opts.dockerProbe ?? dockerProbe(opts.runner);
-  // Docker is mandatory: fail before writing anything (no host-execution fallback).
+  // The Docker runtime needs Docker: prepare() fails before writing anything (no silent host fallback;
+  // the host runtime is only ever an explicit, host-side choice).
   const docker = await probe();
-  if (!opts.dryRun && (!docker.daemon || !docker.compose)) throw dockerUnavailable(docker);
-  const prep = await prepare(opts);
+  const prep = await prepare(opts, docker);
+  const hostRuntime = prep.plan.runtime === 'host';
   try {
     const { discovery, ...rest } = prep.plan;
     const plan = { ...rest, discovery: { git: discovery.git, instructions: discovery.instructions, ciWorkflows: discovery.ciWorkflows, dockerfile: discovery.dockerfile, host: discovery.host } };
     if (opts.dryRun) {
-      if (!docker.daemon || !docker.compose) plan.warnings.push(dockerUnavailable(docker).message);
+      if (!hostRuntime && (!docker.daemon || !docker.compose)) plan.warnings.push(dockerUnavailable(docker).message);
       return { dryRun: true, plan, docker, nextSteps: ['Rerun without --dry-run to apply this plan.'] };
     }
     if (!opts.yes && !opts.configFile && opts.io && plan.writes.some((w) => ['create', 'update', 'remove'].includes(w.action))) {
@@ -577,22 +633,27 @@ export async function runInit(opts: InitOptions): Promise<InitResult> {
     }
     const applied = await apply(prep);
     // Verify: Docker still reachable after applying (never claim readiness otherwise).
-    const after = await probe();
-    if (!after.daemon || !after.compose) throw dockerUnavailable(after);
+    const after = hostRuntime ? docker : await probe();
+    if (!hostRuntime && (!after.daemon || !after.compose)) throw dockerUnavailable(after);
     // The secrets directory must exist: compose bind-mounts it with create_host_path: false.
     await ensureDir(projectPaths(plan.projectId).secretsDir, 0o700);
-    const github = await offerGithubToken(opts, plan);
+    const setup = await githubStep(opts, plan);
+    const github = setup.interactive && setup.state.repository ? setup.token : undefined;
     const telegram = await offerTelegramToken(opts, plan);
     const tgReady = telegram?.status === 'stored' || telegram?.status === 'present';
     return {
-      dryRun: false, plan, applied, docker: after, ...(github ? { github } : {}), ...(telegram ? { telegram } : {}),
+      dryRun: false, plan, applied, docker: after, ...(github ? { github } : {}), githubSetup: setup, ...(telegram ? { telegram } : {}),
       nextSteps: [
         'Run `minions start` in this repository.',
-        prep.plan.claudeAuth.method === 'login'
+        ...(hostRuntime ? [
+          'Host runtime: agents run as your macOS user without Docker (see the warning above); switch back any time with `minions runtime set docker`.',
+          prep.plan.claudeAuth.method === 'login'
+            ? 'The first start clones committed history into the host runtime workspace and opens the coordinator with your existing Claude Code login.'
+            : 'The first start provisions the Claude key, clones committed history into the host runtime workspace, and opens the coordinator.',
+        ] : [prep.plan.claudeAuth.method === 'login'
           ? 'The first start builds the runtime image, imports committed history, and opens the coordinator; log in to Claude inside the container with /login.'
-          : 'The first start builds the runtime image, provisions the Claude key, imports committed history, and opens the coordinator.',
-        ...(plan.discovery.git.hasGitHub && github?.status !== 'stored' && github?.status !== 'present'
-          ? ['Run `minions auth github` to store a GitHub token for this project (entered without echo).'] : []),
+          : 'The first start builds the runtime image, provisions the Claude key, imports committed history, and opens the coordinator.']),
+        ...setup.nextSteps,
         ...(plan.communication.channel === 'telegram' ? [
           ...(tgReady ? [] : ['Run `minions auth telegram` to store the Telegram bot token (entered without echo); until then the coordinator is terminal-only.']),
           'After the first start, pair in the coordinator terminal: DM your bot, type /telegram:access pair <code>, then /telegram:access policy allowlist.',
@@ -613,8 +674,10 @@ export function formatPlan(plan: InitResult['plan']): string {
   L.push('', 'Effective permissions:');
   for (const e of ['allow', 'ask', 'deny'] as const) L.push(`  ${e.padEnd(5)}: ${plan.permissions[e].join(', ') || '—'}`);
   L.push('', `Git identity for agent commits: ${plan.gitIdentity.name} <${plan.gitIdentity.email}>`);
-  L.push(`Container: ${plan.container.image}, ${plan.container.cpus} CPUs, ${plan.container.memoryMiB} MiB, ${plan.container.pidsLimit} pids, ports: ${plan.container.publishPorts.map((p) => `127.0.0.1:${p.host}->${p.container}`).join(', ') || 'none'}`);
-  L.push(`Verification commands (run inside the container): ${plan.verificationCommands.join('; ') || 'none inferred'}`);
+  L.push(`Agent runtime: ${plan.runtime === 'host' ? 'host (no Docker; LESS SAFE, see warning)' : 'docker (hardened container)'}`);
+  if (plan.runtime === 'host') L.push(...HOST_RUNTIME_WARNING.map((l) => `  ${l}`));
+  if (plan.runtime === 'docker') L.push(`Container: ${plan.container.image}, ${plan.container.cpus} CPUs, ${plan.container.memoryMiB} MiB, ${plan.container.pidsLimit} pids, ports: ${plan.container.publishPorts.map((p) => `127.0.0.1:${p.host}->${p.container}`).join(', ') || 'none'}`);
+  L.push(`Verification commands (run by the agents in the ${plan.runtime === 'host' ? 'host runtime workspace' : 'container'}): ${plan.verificationCommands.join('; ') || 'none inferred'}`);
   L.push(`Claude authorization: ${plan.claudeAuth.method}${plan.claudeAuth.preset ? ` (${plan.claudeAuth.preset})` : ''}: ${plan.claudeAuth.source}`);
   L.push(`Communication: ${plan.communication.channel}${plan.communication.channel === 'telegram' ? ' (terminal stays available; restart-required changes)' : ''}`);
   L.push('', 'Unavailable in v0.1:');
@@ -637,6 +700,8 @@ export function formatInit(r: InitResult): string {
     L.push(`GitHub token: ${r.github.status} — ${r.github.detail}`);
     for (const w of r.github.provisioned?.warnings ?? []) L.push(`  ! ${w}`);
   }
+  if (r.githubSetup?.interactive && r.githubSetup.remote.status === 'added') L.push(`GitHub remote added: ${r.githubSetup.remote.url}`);
+  if (r.githubSetup?.delivery.changed) L.push(`Delivery: ${r.githubSetup.delivery.note}`);
   if (r.telegram) {
     L.push(`Telegram bot token: ${r.telegram.status} — ${r.telegram.detail}`);
     for (const w of r.telegram.provisioned?.warnings ?? []) L.push(`  ! ${w}`);

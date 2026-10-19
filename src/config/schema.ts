@@ -44,6 +44,9 @@ const modelId = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:@\[\]-]*$/, 'must be 
 /** Git branch name; also passed to git argv, so it may not start with '-' or contain '..'. */
 const branchName = z.string().regex(/^(?!-)(?!.*\.\.)[A-Za-z0-9._/-]+$/, 'must be a plain git branch name');
 const port = z.number().int().min(1).max(65535);
+/** Claude Code reasoning effort levels (`--effort`, agent frontmatter `effort`; Claude Code 2.1.292). */
+export const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'] as const;
+export type Effort = (typeof EFFORTS)[number];
 
 export const MinionsConfigSchema = z.object({
   schemaVersion: z.literal(1),
@@ -89,6 +92,10 @@ export const MinionsConfigSchema = z.object({
     default: modelId,
     allowed: z.array(modelId).min(1),
     selection: z.enum(['coordinator', 'fixed']),
+    /** Reasoning effort for workers (agent frontmatter) and the coordinator (`--effort`); unset = Claude Code default. */
+    effort: z.enum(EFFORTS).optional(),
+    /** Model of the coordinator session (`--model`); unset = Claude Code default. Must be in `allowed`. */
+    coordinator: modelId.optional(),
   }).strict(),
   delivery: z.object({
     provider: z.enum(['none', 'github']),

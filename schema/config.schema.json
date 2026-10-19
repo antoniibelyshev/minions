@@ -252,6 +252,19 @@
             "coordinator",
             "fixed"
           ]
+        },
+        "effort": {
+          "type": "string",
+          "enum": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        },
+        "coordinator": {
+          "$ref": "#/$defs/__schema3"
         }
       },
       "required": [

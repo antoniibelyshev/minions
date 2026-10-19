@@ -8,15 +8,23 @@
 // - gh: /usr/local/bin/gh is a wrapper (docker/gh-wrapper.sh) that reads the same file and sets
 //   GH_TOKEN only in the environment of the exec'd gh process.
 import { readFile, stat } from 'node:fs/promises';
-import { GITHUB_TOKEN_CONTAINER_PATH } from '../core/paths.js';
 import { redact } from '../core/output.js';
 import type { RunResult } from '../core/exec.js';
+import { runtimePaths } from './paths.js';
+import { isHostRuntime } from './git-hardening.js';
 import { git as realGit } from './worktree.js';
 
 export type GitFn = (cwd: string, args: string[], allowFailure?: boolean) => Promise<RunResult>;
 
 /** Credential helper command as configured in git (absolute path, fixed arguments, no user input). */
 export const GIT_CREDENTIAL_HELPER = '/usr/local/bin/minions git-credential';
+/**
+ * Helper for this runtime. The host runtime sets MINIONS_GIT_CREDENTIAL_HELPER to its `minions` shim
+ * (a `!`-prefixed, shell-quoted command, because the host path may contain spaces).
+ */
+export const gitCredentialHelper = (env: NodeJS.ProcessEnv = process.env) => env.MINIONS_GIT_CREDENTIAL_HELPER || GIT_CREDENTIAL_HELPER;
+/** Token file of this runtime: /opt/minions/secrets/github-token, or <MINIONS_SECRETS_DIR>/github-token. */
+const defaultTokenFile = () => runtimePaths().githubTokenFile;
 export const GITHUB_CREDENTIAL_KEY = 'credential.https://github.com.helper';
 export const GITHUB_TOKEN_USERNAME = 'x-access-token';
 
@@ -33,7 +41,7 @@ export type TokenState =
 const uid = () => (typeof process.getuid === 'function' ? process.getuid() : -1);
 
 /** Reads the mounted token now. Never throws; never includes the token in a message. */
-export async function readGithubToken(file: string = GITHUB_TOKEN_CONTAINER_PATH): Promise<TokenState> {
+export async function readGithubToken(file: string = defaultTokenFile()): Promise<TokenState> {
   let raw: string;
   try {
     raw = await readFile(file, 'utf8');
@@ -100,7 +108,7 @@ export async function gitCredential(operation: string, input: string, opts: { to
   if (req.protocol !== 'https' || req.host?.toLowerCase() !== 'github.com') return { stdout: '' };
   const t = await readGithubToken(opts.tokenFile);
   if (t.state === 'ok') return { stdout: `username=${GITHUB_TOKEN_USERNAME}\npassword=${t.token}\n` };
-  if (t.state === 'absent') return { stdout: '', stderr: `minions: no GitHub token is provisioned (${opts.tokenFile ?? GITHUB_TOKEN_CONTAINER_PATH} is absent); run \`minions auth github\` on the host.` };
+  if (t.state === 'absent') return { stdout: '', stderr: `minions: no GitHub token is provisioned (${opts.tokenFile ?? defaultTokenFile()} is absent); run \`minions auth github\` on the host.` };
   return { stdout: '', stderr: `minions: ${t.message}` };
 }
 
@@ -140,9 +148,10 @@ export async function configureOrigin(repo: string, opts: { remoteUrl?: string; 
   // An empty helper entry first resets any inherited helpers for github.com; ours is the only one.
   await git(repo, ['config', '--unset-all', GITHUB_CREDENTIAL_KEY], true);
   await git(repo, ['config', '--add', GITHUB_CREDENTIAL_KEY, '']);
-  await git(repo, ['config', '--add', GITHUB_CREDENTIAL_KEY, opts.helper ?? GIT_CREDENTIAL_HELPER]);
+  await git(repo, ['config', '--add', GITHUB_CREDENTIAL_KEY, opts.helper ?? gitCredentialHelper()]);
   const warnings: string[] = [];
-  const f = await git(repo, ['fetch', '--no-tags', 'origin', `+refs/heads/${opts.base}:refs/remotes/origin/${opts.base}`], true);
+  // The host runtime fetches from the normalized URL (never through agent-writable remote settings).
+  const f = await git(repo, ['fetch', '--no-tags', isHostRuntime() ? https : 'origin', `+refs/heads/${opts.base}:refs/remotes/origin/${opts.base}`], true);
   if (f.code !== 0) warnings.push(`Fetching ${opts.base} from origin failed: ${redact(f.stderr.trim()).slice(-500) || `git exit ${f.code}`}`);
   return { url: https, authenticated: true, fetched: f.code === 0, warnings };
 }

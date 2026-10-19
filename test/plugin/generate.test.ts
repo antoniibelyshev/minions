@@ -207,3 +207,24 @@ describe('Telegram tools are coordinator-only', () => {
     expect(await term.read('coordinator.md')).toContain('Telegram is not configured for this project.');
   });
 });
+
+describe('models.effort / models.coordinator', () => {
+  const withModels = (m: Partial<MinionsConfig['models']>): MinionsConfig => {
+    const c = defaults();
+    c.models = { ...c.models, default: 'claude-opus-5-5', allowed: ['claude-opus-5-5', 'sonnet', 'opus', 'haiku'], ...m };
+    return c;
+  };
+
+  it('worker frontmatter gets `effort` only when set; the coordinator guidance mentions it', async () => {
+    const g = await gen(withModels({ effort: 'medium' }));
+    for (const a of ['engineer', 'tester', 'reviewer']) {
+      const fm = frontmatter(await g.read(`agents/${a}.md`));
+      expect(fm.model).toBe('claude-opus-5-5');
+      expect(fm.effort).toBe('medium');
+    }
+    expect(await g.read('coordinator.md')).toMatch(/reasoning effort `medium`/);
+    const plain = await gen();
+    expect(frontmatter(await plain.read('agents/engineer.md'))).not.toHaveProperty('effort');
+    expect(await plain.read('coordinator.md')).not.toMatch(/reasoning effort/);
+  });
+});

@@ -10,6 +10,7 @@
 | Host Node.js | 22.13+ required; tested 25.6 (dev), 22.x (CI target) | Host runs only the minions CLI. |
 | Runtime base image | `node:22-bookworm-slim@sha256:c3de60bf2f9dd0ac6370e6117950ff62d6e339527e7472301c9c78a017978392` (Node 22.23.3) | Multi-arch index digest, resolved 2026-10-19. |
 | Claude Code (in image) | `@anthropic-ai/claude-code@2.1.292` | Pinned in `docker/Dockerfile`; auto-updater disabled. |
+| Claude Code flags/fields used optionally | `--model`, `--effort <low\|medium\|high\|xhigh\|max>`, agent frontmatter `effort` | Verified in 2.1.292 (`claude --help`, agent definition schema). Sent only when `models.coordinator` / `models.effort` are set. |
 | Backlog.md (in image) | `backlog.md@1.54.0` | Pinned in `docker/Dockerfile`. |
 | GitHub CLI (in image) | `gh` 2.102.0 (official release tarball `gh_2.102.0_linux_{amd64,arm64}.tar.gz`) | Pinned in `docker/Dockerfile` with SHA-256 per architecture (`ADD --checksum`, BuildKit). Real binary at `/opt/gh/bin/gh`; `/usr/local/bin/gh` is the token wrapper (`docker/gh-wrapper.sh`). Image with gh not yet built/tested. |
 | Telegram channel plugin | `telegram@claude-plugins-official` 0.0.7 (marketplace commit `1e96c6b`) | Interface read and install verified on Claude Code 2.1.292 without credentials. Not bundled: `minions start` runs `minions telegram install` (user scope, claude volume) when `communication.channel` is `telegram`; other versions get a warning. `minions telegram probe` and doctor checks `telegram.*` report readiness. No live bot/pairing run recorded yet. See [design/telegram.md](design/telegram.md). |
@@ -27,6 +28,26 @@ install into a temp prefix, private and shared `init`, `doctor`, `start --no-att
 engineer → tester → reviewer lease flow, hooks, `export`, restart persistence, helper-mode Claude
 key provisioning (fake key script), and `uninstall`.
 It uses a temp `MINIONS_HOME` and disposable repos and removes its containers and volumes on exit.
+
+`npm run e2e:host` (scripts/e2e-host.sh) drives the host runtime with no Docker on `PATH`: init
+`--runtime host`, doctor host checks, `start --no-attach` (warning, separate clone, 0700 dirs), the lease
+flow through the shim, host-delegated status/pause/resume, a coordinator launch through a fake tmux and
+fake claude (dedicated `-L` server, sandbox settings, user `GH_TOKEN` dropped), the git credential helper
+through a shim path with a space, `export`, helper-mode Claude key (`apiKeyHelper` quoting), `runtime
+set`, and `uninstall --delete-data`. It installs the real `backlog.md@1.54.0` into its temp dir.
+
+The guided GitHub setup (`minions setup github`, init) is covered by unit tests with temp repos and a
+fake GitHub API; the pre-filled token URL follows GitHub's documented template URL parameters
+(verified against docs.github.com on 2026-10-19), but opening it in a real browser is not automated.
+
+### Host runtime (no Docker)
+
+| Component | Tested | Notes |
+| - | - | - |
+| Claude Code (host) | 2.1.292 | Sandbox keys checked against this version's settings schema; doctor warns on other versions. No real session in automated tests. |
+| Backlog.md (host) | 1.54.0 | Installed by you (`npm install -g backlog.md@1.54.0`). |
+| tmux (host) | fake only in e2e | `brew install tmux`; any 3.x expected to work (`-L`, `new-session -A/-d`, `has-session`, `kill-server`). |
+| gh (host) | not exercised | Optional, for pull-request delivery; wrapped by `host/bin/gh`. |
 
 ## Known gaps
 
@@ -71,6 +92,12 @@ It uses a temp `MINIONS_HOME` and disposable repos and removes its containers an
   channel registered is visible only in the coordinator's startup notice. The plugin runs `bun install`
   at each start, so it needs npm registry access.
 - Native macOS/iOS builds (Xcode) cannot run inside the Linux runtime.
+- **Host runtime** is less safe by design: agents run as your macOS user. The Claude Code sandbox
+  (Seatbelt) confines Bash writes and denies credential reads, but the Read/Edit tools rely on
+  permission rules only, your user-level Claude Code settings/hooks/plugins also apply, network
+  outside the allowlist prompts rather than being blocked, and there are no CPU/memory/process limits.
+  The sandbox configuration has not been exercised against a live Claude session in automated tests.
+  Telegram is not set up automatically in host mode.
 - **Keychain access list**: the GitHub and Telegram Keychain items are created without a `-T` access list, so any
   process running as your macOS user can read them (normal macOS behaviour). The plaintext copy mounted into the
   container is cleared when `minions start` fails to bring the container up and by `minions doctor` when the container is

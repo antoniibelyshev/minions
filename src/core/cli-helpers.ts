@@ -2,17 +2,33 @@ import type { Command } from 'commander';
 import { MinionsError } from './errors.js';
 import { handleError } from './output.js';
 
-export type RuntimeMode = 'host' | 'container';
+/**
+ * - `host`: the trusted host CLI (MINIONS_RUNTIME unset).
+ * - `container`: the agent runtime inside the project container (MINIONS_RUNTIME=container, set in the image).
+ * - `host-runtime`: the agent runtime running directly on the host without Docker (MINIONS_RUNTIME=host,
+ *   set only by the host CLI for the processes it launches: coordinator, hooks, helpers).
+ */
+export type RuntimeMode = 'host' | 'container' | 'host-runtime';
+/** `runtime` = either agent runtime (container or host-runtime). */
+export type RequiredMode = 'host' | 'container' | 'runtime';
 
-export const runtimeMode = (): RuntimeMode => (process.env.MINIONS_RUNTIME === 'container' ? 'container' : 'host');
+export const runtimeMode = (env: NodeJS.ProcessEnv = process.env): RuntimeMode =>
+  env.MINIONS_RUNTIME === 'container' ? 'container' : env.MINIONS_RUNTIME === 'host' ? 'host-runtime' : 'host';
 
-export function requireMode(mode: RuntimeMode): void {
+/** True inside an agent runtime (container or host runtime). */
+export const isAgentRuntime = (env: NodeJS.ProcessEnv = process.env) => runtimeMode(env) !== 'host';
+
+export function requireMode(mode: RequiredMode): void {
   const actual = runtimeMode();
-  if (actual !== mode) {
-    throw new MinionsError('INCOMPATIBLE_RUNTIME', `This command runs only on the ${mode} (current: ${actual}).`,
-      mode === 'container' ? 'Run it inside the container: docker compose exec app minions …, or via the coordinator.'
-        : 'Run it on the host, not inside the minions container.');
+  const ok = mode === 'runtime' ? actual !== 'host' : actual === mode;
+  if (ok) return;
+  if (mode === 'host') {
+    throw new MinionsError('INCOMPATIBLE_RUNTIME', `This command runs only in the host CLI (current: ${actual}).`,
+      actual === 'container' ? 'Run it on the host, not inside the minions container.'
+        : 'Run it from your own terminal; agent processes of the host runtime cannot run host-control commands.');
   }
+  throw new MinionsError('INCOMPATIBLE_RUNTIME', `This command runs only in the agent runtime (current: ${actual}).`,
+    'It is used by the coordinator inside the runtime (container, or the host runtime launched by `minions start`).');
 }
 
 /** Global flags of the command (incl. root --json). */

@@ -9,13 +9,14 @@ reported as unavailable by `doctor` and the wizard, never faked.
 
 In:
 - Host CLI: `init [path]`, `doctor`, `start`, `down`, `status`, `pause`, `resume`,
-  `import`, `export`, `config show`, `auth show|set|refresh`, `auth github`, `auth telegram`, `uninstall`. All support `--json`; mutating ones `--dry-run`.
+  `import`, `export`, `config show`, `auth show|set|refresh`, `auth github`, `auth telegram`, `runtime show|set`, `setup github`, `uninstall`. All support `--json`; mutating ones `--dry-run`.
 - Runtime CLI (inside container): `backlog ready|list|show|create|update|note`,
   `work claim|record|release|list`, `hook stop|pre-agent`, `coordinator`, `status`, `pause`, `resume`.
 - Profiles `project-owner`, `personal-work`, `supervised`; shared + private visibility.
 - Backlog.md backend only. Delivery modes `local` (default; commits on `agent/<slug>` branches in the container clone, fetched to host with `minions export`), and, for the github provider, `branch` and `pull-request` (see "Branch and pull-request delivery"). minions never merges.
 - Terminal communication, plus optional Telegram through the official channel plugin (see [telegram.md](telegram.md)).
-- One Docker container per project, security baseline from spec §3A.
+- One Docker container per project, security baseline from spec §3A. Opt-in, less safe host runtime
+  without Docker (see "Host runtime").
 - Claude auth inside the container (interactive `/login`, persisted in the claude volume) by default, or
   host-provisioned keys: host-only `claudeAuth` in project.json (`api-key` from file/Keychain/env, or a
   `helper` argv such as the `jbcentral` preset), written to `projects/<id>/secrets/anthropic-api-key`
@@ -48,13 +49,13 @@ A per-project fine-grained personal access token, provisioned only by the host C
 (`src/host/credentials.ts`). Inside the container git and gh use it (see "GitHub in the
 container"), and branch/pull-request delivery publishes with it; CI observation is a later task.
 
-- **Entry.** `minions auth github` (and, for repositories with a GitHub remote, an optional offer at
-  the end of an interactive `minions init`) reads the token from the host terminal in raw mode with
+- **Entry.** `minions auth github`, or the guided GitHub setup (see "GitHub setup"), reads the token from the host terminal in raw mode with
   no echo, or from a pipe with `--stdin`. There is no `--token` flag; the token is never in argv,
   config, the plan, logs, or `--json` output. The wizard questions themselves never ask for secrets.
-- **Guidance.** Setup prints the creation link (`https://github.com/settings/personal-access-tokens/new`)
-  and the repository permissions: Contents read/write, Pull requests read/write, Checks read,
-  Actions read, Commit statuses read, Metadata read. Nothing else.
+- **Guidance.** Setup prints the creation link (`https://github.com/settings/personal-access-tokens/new`,
+  pre-filled as a GitHub template URL by the guided setup) and the repository permissions: Contents
+  read/write, Pull requests read/write, Checks read, Actions read, Commit statuses read, Metadata read.
+  Nothing else.
 - **Verification.** Before storing, `GET /repos/<owner>/<repo>` (or `/user` without a GitHub
   remote) with the token in the `Authorization` header only. 401/403/404 → not stored. A network
   failure stores it with a warning. `doctor` repeats the call and reports
@@ -76,6 +77,82 @@ container"), and branch/pull-request delivery publishes with it; CI observation 
   visible without recreating the container. The Keychain and the credentials directory are never mounted.
 - **Uninstall** keeps the stored token, as it keeps other credentials. `minions auth github --remove`
   deletes it.
+
+## GitHub setup
+
+Decision record for the guided flow (`src/host/github-setup.ts`): run after the plan is applied by an
+interactive `minions init` (intro question, default yes; failures never fail init) and standalone by
+`minions setup github`.
+
+- **Non-interactive** (`--yes`, `--config`, `--json`, no TTY, `--dry-run`): inspection plus next-step
+  hints only. No prompt, no push, no browser, no network.
+- **Inspection** uses local data only: `remote.origin.url`, `refs/remotes/origin/<base>`, the stored
+  credential reference, the effective config. Nothing is fetched or `ls-remote`d.
+- **Remote.** Missing: offer `git remote add origin <https url>` for a validated `owner/repo` / github.com
+  URL (command shown; `project.json` `remoteUrl` updated). A non-GitHub `origin` is never changed.
+- **Base branch.** Missing tracking ref: show `git push -u origin <base>`; run it (exactly
+  `refs/heads/<base>:refs/heads/<base>`) only after an explicit yes (default no), with the user's own git
+  credentials.
+- **Token link.** GitHub template URL (docs.github.com "Managing your personal access tokens" →
+  "Pre-filling fine-grained personal access token details using URL parameters"; changelog 2025-08-26):
+  `name` (≤ 40 chars), `description`, `target_name` (= remote owner), `expires_in=90`, `contents=write`,
+  `pull_requests=write`, `actions=read`, `statuses=read`. Repository selection and Checks are picked by hand.
+  `open <url>` (macOS) only after a yes (default no).
+- **Token entry** reuses the non-echoing prompt and `provisionGithubToken` (verification first; up to two
+  attempts). A stored token is re-checked with `githubCredentialStatus`.
+- **Delivery.** With a working token and `git.push` not denied: `local/branch/pull-request` (default
+  pull-request). Written to the project config file (private `config.json` or shared
+  `.minions/config.json`) with `configRevision + 1`, validated by `resolveEffective`, only if the file
+  still has the manifest hash; otherwise the exact edit is printed.
+- **Doctor/start.** `doctor` adds `github.setup` (remote, base on origin, token, delivery, next step).
+  `start` prints one hint line when a GitHub remote exists and no token is stored.
+- **Not offered:** reusing the user's `gh` CLI login (broader than one repository).
+
+## Setup assistant
+
+Decision record for `src/host/assistant.ts` (templates in `templates/assistant/`): an AI pass after the
+deterministic init. `minions init` stays complete without it.
+
+- **When.** End of an interactive `minions init` (after the plan is applied and verified and the GitHub
+  and Telegram steps ran): `Open the setup assistant to finish remaining setup? [Y/n]`. Never with
+  `--yes`, `--config`, `--json`, `--dry-run`, or without a TTY on stdin and stdout. No question (one hint
+  line instead) when `claude` is not on PATH; a failed launch never fails init. Standalone:
+  `minions setup assist` (needs a terminal; `--dry-run [--json]` prints the argv and writes nothing).
+- **Launch.** The user's own host `claude` (foreground, inherited stdio, `shell: false`) in the repository
+  root. A host plugin is regenerated on every launch at `projects/<id>/assistant-plugin`
+  (`.claude-plugin/plugin.json` name `minions-setup`, skill `skills/setup/SKILL.md` -> `minions-setup:setup`;
+  passes `claude plugin validate --strict`). argv (flags checked against `claude --help` 2.1.292):
+  `--allowedTools <read-only...> --disallowedTools <denied...> --plugin-dir <dir> --append-system-prompt
+  <system-prompt.md> --settings '{"permissions":{"disableBypassPermissionsMode":"disable"}}' --name
+  "minions setup" --permission-mode default "<kick-off prompt>"`. The variadic tool lists come first so
+  they never swallow the positional prompt. `default` is accepted by 2.1.292 (its help lists the same mode
+  as `manual`); never `bypassPermissions`, `acceptEdits`, `auto` or `dontAsk`.
+- **Allowed without a prompt:** `Bash(minions doctor*)`, `Bash(minions status*)`, `Bash(minions auth show*)`,
+  `Bash(minions config show*)`, `Bash(minions runtime show*)`, `Bash(git remote -v)`, `Bash(git status*)`,
+  `Bash(git log*)`, and `Read(//<repo root>/**)` (Claude Code applies Read rules to Glob/Grep as well). Never a
+  bare `Read`/`Glob`/`Grep`, which would read any file on the host. Everything else (reads outside the repository,
+  every `Edit`) prompts. Read denies also cover every project's `secrets/` and `credentials.json`, the credential
+  store and the host secret dirs shared with the host-runtime hardening (`HOST_SECRET_DIRS`).
+- **Denied** (the user runs them as `! <command>`, so secrets are typed only at minions' hidden prompts):
+  `minions runtime set`, `minions auth set|github|telegram|refresh`, `minions setup github`, `minions start`,
+  `minions uninstall`, `security *`, `gh auth token*`, `cat *secrets*`, `cat *credentials*`, `git push*`,
+  `open *`. `Read` of the credential store, the project `secrets/`, `~/.ssh`, `~/.aws`, `~/.config/gh`,
+  `~/.netrc`, `.env*`. `Edit` of `defaults.json`, `registry.json`, the credential store, and the project's
+  `project.json`, `credentials.json`, `secrets/`, `manifest.json`, `journal.json`, `compose.yaml`,
+  `plugin/`, `runtime/`, `host/`, `assistant-plugin/` (absolute `//path` rules). The project configuration
+  (`.minions/config.json`, or the private `config.json`) stays editable with a prompt.
+- **Instructions.** Context first (`minions doctor --json`, `minions status --json`, `minions auth show
+  --json`, `minions config show --explain`, `git remote -v`, build and CI files), then only the gaps:
+  GitHub (`! minions setup github`), Claude authorization options (`! minions auth set ...`), Telegram
+  (optional; `! minions auth telegram`), verification commands from the repository's real scripts/CI
+  (diff first, `configRevision + 1`, validated with `minions config show --explain`), models/effort
+  (budgets are not enforced in v0.1), doctor warnings, and first tasks. `minions backlog ...` is
+  runtime-only (no host delegation), so first tasks are handed to the user as a message for the
+  coordinator. Hard rules: no secrets in chat, no host-side file edits, no runtime switch, no push, no
+  URLs opened; ends with `minions doctor` and a done/remaining summary.
+- **Doctor.** A `setup` check warns on obvious gaps (empty `verification.commands`, GitHub remote without a
+  token, Telegram selected without a valid bot token) and hints `minions setup assist`.
+- **Uninstall** removes `assistant-plugin/`.
 
 ## GitHub in the container
 
@@ -149,6 +226,118 @@ Decision record for `delivery.mode` `branch` / `pull-request` (`src/runtime/publ
   Shared installations append the task id and head SHA; private installations add nothing else. Notes,
   handoffs, worker results and decision records are never read for PR text.
 
+## Host runtime
+
+Decision record for running agents without Docker (`src/host/runtime.ts`, `src/host/runtime-cli.ts`,
+`hostSettings` in `src/runtime/coordinator.ts`).
+
+- **Selection is host-controlled.** `runtime: "docker" | "host"` in `project.json` (absent = docker) and
+  optionally in `<MINIONS_HOME>/defaults.json` for new projects. Set by `minions init --runtime`, the
+  wizard's first question (default docker; host needs the typed word `host`), or `minions runtime set`
+  (host: warning plus typed confirmation, or `--yes`; refused while the old runtime runs). The strict
+  MinionsConfig schema has no such field, so repository config cannot downgrade isolation. The
+  warning is printed by the wizard, `runtime set host`, every host `minions start` (stderr, also with
+  `--json`), init plans, and doctor (`runtime: warn`).
+- **Modes.** `MINIONS_RUNTIME` unset = host CLI, `container` = container runtime, `host` = host runtime
+  (`runtimeMode()` → `host-runtime`). Runtime commands accept both runtimes (`requireMode('runtime')`);
+  host-control commands (`init`, `auth`, `runtime`, `uninstall`, …) refuse to run inside either.
+- **Paths from the environment.** `runtimePaths()` defaults to the container paths and reads
+  `MINIONS_STATE_DIR`, `MINIONS_WORKSPACE`, `MINIONS_CONFIG`, `MINIONS_SECRETS_DIR`, `MINIONS_PLUGIN_DIR`,
+  `MINIONS_TMUX_SOCKET`; DB, backlog root, worktrees, hooks log, plugin dir, coordinator prompt, GitHub
+  token file and Claude key file derive from them. The host runtime sets them to
+  `projects/<id>/host/{workspace,state}`, `projects/<id>/{runtime/config.json,secrets,plugin}` and
+  `minions-<id8>`.
+- **Shim.** `projects/<id>/host/bin/minions` (regenerated on every start; 0755 in 0700 dirs) exports
+  those variables, `MINIONS_GIT_CREDENTIAL_HELPER` (`!'<shim>' git-credential`), `GIT_TERMINAL_PROMPT=0`,
+  the auth env (first, so runtime values win; the schema rejects `MINIONS_*`, `PATH`, `GIT_*`, `DYLD_*`,
+  `SSH_*` names), tool cache variables pointing into `host/state/cache`, `MINIONS_LOG_DIR`
+  (`host/logs`), unsets token, ssh-agent, git-injection and cloud-credential variables, puts `host/bin`
+  first on `PATH`, and execs the installed CLI with the current Node. Processes the host CLI starts
+  (`HostRuntime.exec`, delegation, tmux) get `hostRuntimeEnv`: an allowlist (`PASS_ENV`: HOME, USER,
+  LOGNAME, LANG, LC_*, TERM*, TMPDIR, SHELL, COLORTERM, proxy and CA variables, CLAUDE_CONFIG_DIR) plus
+  those variables, with only absolute PATH entries. tmux, the plugin hooks
+  (`minions hook …`), the coordinator's `Bash(minions …)` calls and git's credential helper all go
+  through it. `host/bin/gh` is `docker/gh-wrapper.sh` with the host's real gh and token path.
+- **Delegation.** `status`, `pause`, `resume`, `work publish|approve`, `telegram probe|install|status`
+  run the shim with inherited stdio instead of `docker compose exec`. `start` = warning → host tools
+  (`tmux`, `claude`, `backlog`, `git` required; `gh` optional) → Claude key refresh (key methods) →
+  token copies → shims → `workspace setup` → bundle import if the clone is missing → `coordinator sync`
+  → `minions coordinator` (tmux `-L minions-<id8>` `new-session -A`). `down` = `tmux -L … kill-server`
+  plus token-copy removal. `import`/`export` use the same bundle flow through
+  `host/transfer/{import,exports}` (`TransferTarget`; host-owned, not agent-writable; copies open the
+  source `O_NOFOLLOW` + fstat and create the target `O_EXCL`, and the dirs must be real 0700 dirs). `uninstall` kills the tmux server; `--delete-data`
+  deletes `host/`.
+- **Claude auth.** `login` reuses the user's own Claude Code login (no `CLAUDE_CONFIG_DIR` override).
+  Key methods use `apiKeyHelper: "cat '<secrets>/anthropic-api-key'"` (shell-quoted); env values are
+  not loopback-rewritten.
+- **Claude Code launch.** `claude --setting-sources= --strict-mcp-config --add-dir <workspace> <state>`
+  plus `--settings`. `--setting-sources` takes `user,project,local` (`claude --help`); the empty list is
+  what the Agent SDK passes for `settingSources: []` (verified in its source), and `--strict-mcp-config`
+  without `--mcp-config` is the SDK's form for "no MCP servers". Excluded: user/project/local hooks, MCP
+  servers, plugins, statusLine, permission rules, `sandbox.excludedCommands`, repo `CLAUDE.md`
+  auto-loading. Still applied: managed settings, user `sandbox.credentials` deny entries (documented),
+  the minions plugin and its hooks. Login credentials are not settings, so `login` keeps working.
+  `--permission-mode` is forced to `default` (the config value may come from the repository). The
+  doctor/coordinator probe also requires these flags in `claude --help`.
+- **Hardening (coordinator `--settings`).** Keys verified in the Claude Code 2.1.292 docs
+  (code.claude.com/docs/en/sandboxing, settings-reference, cli-reference): `sandbox.enabled`,
+  `autoAllowBashIfSandboxed: false`, `allowUnsandboxedCommands: false` (also makes the sandbox
+  admin-required, so repository sandbox loosening is ignored), `failIfUnavailable: true`;
+  `filesystem.allowWrite` = workspace, state (no home paths; caches redirected); `denyWrite` = the
+  clone's `.git/config` and `.git/hooks`, tmux's socket dir; `denyRead` = `HOST_SECRET_DIRS` (keys,
+  cloud CLIs, gh/hub, `.git-credentials`, `.claude.json`, `.claude/.credentials.json`, browser
+  profiles, cookies, Safari, Mail, Messages, shell histories, 1Password/Vault/Terraform/Cargo/Gem/
+  Maven/Gradle/OCI/Azure/gcloud), the whole minions data root, the credential store, the Claude key
+  and bot-token copies, tmux's dir; `allowRead` (narrower paths re-open part of a denied region,
+  documented overlap rule) = workspace, state, `host/bin`, `runtime/`, `plugin/`, `secrets/github-token`,
+  toolchain dirs under `~` (`readableToolDirs`: absolute PATH entries and real paths, install prefixes
+  of node/minions/claude/backlog/git/gh/tmux, known toolchain dirs; never `~` itself or a secret dir);
+  `network.allowedDomains` = GitHub + npm, `allowUnixSockets: []`, `allowAllUnixSockets: false`,
+  `allowLocalBinding: false`; `permissions.blockReadsOutsideWorkingDirectories: true` (Read tool
+  refuses reads outside the working dirs; sandboxed commands lose `~` except working dirs, needed
+  `~/.claude` parts and the global git config). Permission denies: `Read`/`Edit` of the secret dirs,
+  credential store, other projects (exact paths), the key/bot-token copies, data-root `*.json`,
+  `credentials.json`; `Edit` of shell rc files, `~/.gitconfig`, `~/.config/git`, `~/Library/LaunchAgents`,
+  `~/.claude`, the project's host-control files (`*.json`, `runtime/`, `plugin/`, `secrets/`, `host/bin`,
+  `host/logs`, `host/transfer`), the clone's `.git/config|config.worktree|hooks`, and `.claude/**` /
+  `.mcp.json` in the workspace (not all of `.git`: Edit denies become sandbox write denies and would
+  break commits); `Bash(security …)`, `Bash(gh auth …)`, `git -c`, `git config`, `--exec-path`,
+  `--git-dir`, `--work-tree`. Allow rules: `minions`, `backlog`, `HOST_GIT_SUBCOMMANDS` (no config,
+  remote, fetch or push), and verification commands that pass `safeVerificationCommand` (no globs,
+  operators, quotes, substitutions; not a shell, wrapper, interpreter `-e`, or credential/network CLI).
+  The Seatbelt profile in the 2.1.292 binary allows `mach-lookup` of `com.apple.SecurityServer`, so
+  Keychain access is not blocked by the sandbox (see "Keychain" below). Not exercised against a real
+  Claude session in tests (fakes only).
+- **Git run outside the sandbox** (`src/runtime/git-hardening.ts`, used by `git()` in host mode and by
+  `HostRuntime.exec('git', …)`): `-c core.hooksPath=/dev/null core.fsmonitor=false
+  core.sshCommand=/usr/bin/false core.askPass=/usr/bin/false core.pager=cat core.attributesFile=/dev/null
+  credential.helper=` (empties the list) + the minions helper for `https://github.com`, `gc.auto=0`,
+  `maintenance.auto=false`, no submodule recursion, `protocol.allow=never`, `https` always, `file`
+  always except for network ops (push, ls-remote, fetch from a URL), and ssh/git/http/ext/fd/ftp(s)/rsync
+  explicitly never (a repository `protocol.<x>.allow` would beat the generic key); env without
+  inherited `GIT_*`, with `GIT_CONFIG_NOSYSTEM`, `GIT_ATTR_NOSYSTEM`, askpass `/usr/bin/false`. Work-tree
+  commands also get `GIT_WORK_TREE=<cwd>` (a repository `core.worktree` is not overridden by `-c`,
+  tested) and empty `filter.<name>.{clean,smudge,process}` for every driver not defined only in the
+  global config (read right before the call; an unsafe name fails closed). Publication and origin fetch
+  name the normalized https URL instead of `origin`; gh runs with cwd `/` (it gets `--repo`).
+- **Keychain.** `selectStore` returns the file store while any project (or the host-wide default) uses
+  the host runtime, and `prepareHostRuntime` moves every registered project's minions Keychain items to
+  the file store (`moveKeychainTokensToFileStore`). Rejected alternative: `security add-generic-password
+  -T ''` (no trusted apps) prompts on every read by minions itself, and "Always Allow" re-adds
+  `/usr/bin/security`. Residual: Claude Code's own login item.
+- **Hooks log.** Hooks run unsandboxed, so `hookLog` opens `O_NOFOLLOW|O_APPEND`, requires a regular
+  file, escapes control characters and caps lines at 2000 characters; in host mode it writes to
+  `host/logs` (`MINIONS_LOG_DIR`), outside the agent-writable state.
+- **tmux.** Kept on `-L minions-<id8>` (tmux's private `/tmp/tmux-<uid>`, 0700, ownership-checked):
+  a `-S` socket under `<project>/host/` would exceed the 104-byte macOS socket path limit with the
+  default data root. Sandboxed commands get no Unix sockets and no access to that directory.
+- **Not supported in host mode:** container resources/ports, Telegram (`decideTelegram` disables it
+  with a reason, `telegram install` refuses: the plugin would live in the user's Claude Code settings,
+  which the host runtime doesn't load). `init --runtime host` needs the typed confirmation
+  interactively or `--yes`; a `defaults.json` runtime of host is never inherited non-interactively.
+- **`requireMode` is UX, not a boundary.** It reads `MINIONS_RUNTIME`, which an agent can unset inside
+  its sandboxed shell; host-control files are protected by the sandbox write policy and Edit denies.
+
 ## Telegram bot token
 
 A second credential kind on the same mechanism (`CredentialKind` in `src/host/credentials.ts`;
@@ -192,6 +381,7 @@ src/
   runtime/coordinator.ts     tmux + claude launch inside container
   runtime/commands.ts        register(program) for runtime commands
   plugin/generate.ts         render templates/plugin -> plugin dir, returns file hashes
+  host/assistant.ts          setup assistant: host plugin + claude argv, init offer, `setup assist`
   host/registry.ts           gitCommonDir -> projectId registry, copied-id detection
   host/discovery.ts          read-only repo inspection
   host/wizard.ts             questions with prefilled defaults
@@ -202,14 +392,16 @@ src/
   host/uninstall.ts
   host/commands.ts           register(program) for host commands
 templates/plugin/            plugin sources (see "Plugin")
+templates/assistant/         setup assistant instructions and skill (see "Setup assistant")
 docker/Dockerfile  docker/entrypoint.sh
 test/                        vitest unit tests; test/docker/ opt-in (MINIONS_DOCKER_TESTS=1)
 ```
 
-`minions` decides host vs container mode by `MINIONS_RUNTIME=container` (set in the image).
-Host-only commands error with `INCOMPATIBLE_RUNTIME` inside the container and vice versa,
-except `status`/`pause`/`resume`, which on the host delegate to the container with
-`docker compose exec -T app minions <cmd> --json`.
+`minions` decides its mode by `MINIONS_RUNTIME`: unset = host CLI, `container` (set in the image),
+`host` (host runtime, set by the shim; see "Host runtime"). Host-only commands error with
+`INCOMPATIBLE_RUNTIME` inside a runtime and vice versa, except `status`/`pause`/`resume`, which on the
+host delegate to the project's runtime: `docker compose exec -T app minions <cmd> --json`, or the
+host runtime shim.
 
 ## Core contracts
 
@@ -253,6 +445,7 @@ Host (`MINIONS_HOME` overrides the root, used by tests):
     runtime/config.json              effective config written at start, mounted ro
     runtime/coordinator.md           (inside plugin dir actually — see Plugin)
     plugin/                          generated plugin, mounted ro
+    assistant-plugin/                host-only plugin of the setup assistant (`minions setup assist`), regenerated per launch
     exports/                         bundles exported from the container
 ```
 Shared installs additionally write `<repo>/.minions/config.json` (+ `<repo>/.minions/README.md`)
@@ -402,6 +595,10 @@ skills/{orchestrate,status,intake,recover,maintain-context}/SKILL.md
 hooks/hooks.json             Stop -> minions hook stop ; PreToolUse(Agent) -> minions hook pre-agent (exec form)
 coordinator.md               appended to the coordinator system prompt
 ```
+`models.effort` (optional; `low|medium|high|xhigh|max`) adds `effort:` to the worker frontmatter and
+`--effort` to the coordinator launch; `models.coordinator` (optional, must be in `models.allowed`) adds
+`--model`. Both verified against Claude Code 2.1.292 (`claude --help`; agent definition schema field
+`effort`). The probe requires the flags only when they are configured.
 Templates use `{{var}}` placeholders rendered from EffectiveConfig (profile, policy summary, limits,
 models, delivery mode, capability table, sensitive paths). Agent frontmatter uses only documented
 fields: `name, description, tools, disallowedTools, model, maxTurns, effort`. Workers get no
