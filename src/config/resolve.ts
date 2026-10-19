@@ -5,12 +5,12 @@ import { MinionsConfigSchema, CapabilityRuleSchema, type Capability, type Capabi
 export const SUPPORTED = {
   backlog: ['backlogmd'],
   delivery: ['local', 'branch', 'pull-request'],
-  communication: ['terminal'],
+  communication: ['terminal', 'telegram'],
 } as const;
 
 /** Features deferred in v0.1; doctor and the wizard report them as unavailable. */
 export const DEFERRED_FEATURES = [
-  'GitHub Issues backend', 'auto-merge and merge requests', 'review publication', 'Telegram',
+  'GitHub Issues backend', 'auto-merge and merge requests', 'review publication',
   'config plan/apply transactions', 'backlog migration', 'upgrade', 'budgets',
   'companion containers',
 ] as const;
@@ -23,7 +23,10 @@ export function listUnavailable(config: MinionsConfig): Unavailable[] {
   const has = (list: readonly string[], v: string) => list.includes(v);
   if (!has(SUPPORTED.backlog, config.backlog.backend)) out.push({ path: 'backlog.backend', value: config.backlog.backend, reason: 'only Backlog.md is supported in v0.1' });
   if (!has(SUPPORTED.delivery, config.delivery.mode)) out.push({ path: 'delivery.mode', value: config.delivery.mode, reason: `delivery mode is not supported (supported: ${SUPPORTED.delivery.join(', ')})` });
-  if (!has(SUPPORTED.communication, config.communication.channel)) out.push({ path: 'communication.channel', value: config.communication.channel, reason: 'only terminal communication is supported in v0.1' });
+  if (!has(SUPPORTED.communication, config.communication.channel)) out.push({ path: 'communication.channel', value: config.communication.channel, reason: 'this communication channel is not supported in v0.1' });
+  if (config.communication.channel === 'telegram' && config.container.network === 'none') {
+    out.push({ path: 'communication.channel', value: 'telegram', reason: 'Telegram needs outbound network (api.telegram.org, and the npm registry for the plugin\'s dependencies) but container.network is none; the coordinator runs terminal-only' });
+  }
   if (config.delivery.merge === 'auto-when-eligible') {
     out.push({ path: 'delivery.merge', value: config.delivery.merge, reason: config.delivery.requiredChecksConfigured
       ? 'automatic merge is deferred in v0.1'

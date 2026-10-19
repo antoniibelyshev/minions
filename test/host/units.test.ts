@@ -203,7 +203,8 @@ describe('wizard', () => {
     expect(r.config.container.publishPorts).toEqual([{ host: 3000, container: 3000 }]);
     expect(r.config.verification.commands).toEqual(['npm run lint', 'npm test']);
     expect(info.join('\n')).toMatch(/GitHub Issues \(not available in v0\.1\)/);
-    expect(info.join('\n')).toMatch(/Telegram \(not available in v0\.1\)/);
+    expect(info.join('\n')).toMatch(/Telegram through the official Claude Code channel plugin/);
+    expect(r.config.communication.channel).toBe('terminal');
     expect(info.join('\n')).toMatch(/Branch push and pull requests are not selectable: the repository has no GitHub remote/);
     expect(info.join('\n')).toMatch(/Auto-merge \(not available in v0\.1\)/);
     expect(questions.some((q) => q.startsWith('Delivery mode'))).toBe(false);
@@ -242,6 +243,19 @@ describe('wizard', () => {
     const fallback = await runWizard({ discovery, projectId: ID, yes: true });
     expect(fallback.config.delivery.mode).toBe('local');
     expect(fallback.notes.join('\n')).toMatch(/pull-request delivery .* no GitHub token/);
+  });
+
+  it('does not offer branch/pull-request under a profile that denies git.push (supervised)', async () => {
+    const repo = makeRepo(env.root);
+    const { execFileSync } = await import('node:child_process');
+    execFileSync('git', ['-C', repo, 'remote', 'add', 'origin', 'git@github.com:acme/demo.git']);
+    const discovery = await discover(repo);
+    const questions: string[] = [], info: string[] = [];
+    const io: WizardIO = { ask: async (q, def) => { questions.push(q); return def; }, info: (l) => info.push(l) };
+    const r = await runWizard({ discovery, projectId: ID, yes: false, io, githubCredential: true, profile: 'supervised' });
+    expect(questions.some((q) => q.startsWith('Delivery mode'))).toBe(false);
+    expect(r.config.delivery.mode).toBe('local');
+    expect(info.join('\n')).toMatch(/not selectable: the profile denies git\.push/);
   });
 
   it('--config with pull-request delivery falls back to local without a GitHub remote, with a reason', async () => {

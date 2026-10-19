@@ -1,15 +1,17 @@
 // Init wizard (spec §7). Questions are prefilled from the profile, an existing config, and discovery.
 // Questions whose answer cannot change v0.1 behaviour are shown as information only, with the
 // deferred options marked "(not available in v0.1)". The wizard questions never ask for secrets;
-// the only secret prompt (GitHub token, after the plan is applied) goes through `secret()`, which
-// reads from the host terminal without echo.
+// the only secret prompts (GitHub token, Telegram bot token, after the plan is applied) go through
+// `secret()`, which reads from the host terminal without echo.
 import { createInterface, type Interface } from 'node:readline/promises';
+import { can } from '../config/capabilities.js';
 import { githubDeliveryUnavailableReason, profileDefaults } from '../config/profiles.js';
 import { validateConfig } from '../config/resolve.js';
 import { PROFILES, type MinionsConfig, type Profile } from '../config/schema.js';
 import { MinionsError } from '../core/errors.js';
 import { readJson } from '../core/fsutil.js';
 import { VERSION } from '../core/version.js';
+import { telegramBotGuidance } from './credentials.js';
 import type { Discovery } from './discovery.js';
 
 export interface WizardIO {
@@ -155,8 +157,17 @@ function baseConfig(input: WizardInput, profile: Profile): { config: MinionsConf
 const DELIVERY_MODES = ['local', 'branch', 'pull-request'] as const;
 
 /** Branch/PR delivery without a GitHub remote and stored token falls back to local, with the reason. */
+const PUSH_DENIED = 'the profile denies git.push (e.g. supervised), so nothing could be published';
+
+/** Why branch/pull-request delivery cannot be selected, or null: GitHub remote + token, and git.push not denied. */
+function deliveryBlockedReason(cfg: MinionsConfig, input: WizardInput): string | null {
+  return githubDeliveryUnavailableReason({ hasGitHub: input.discovery.git.hasGitHub, hasGitHubCredential: !!input.githubCredential })
+    ?? (can(cfg, 'git.push') === 'deny' ? PUSH_DENIED : null);
+}
+
+/** Branch/PR delivery without a GitHub remote and stored token (or with git.push denied) falls back to local, with the reason. */
 function deliveryFallback(cfg: MinionsConfig, input: WizardInput, notes: string[]): void {
-  const why = githubDeliveryUnavailableReason({ hasGitHub: input.discovery.git.hasGitHub, hasGitHubCredential: !!input.githubCredential });
+  const why = deliveryBlockedReason(cfg, input);
   if (cfg.delivery.mode !== 'local' && why) {
     notes.push(`delivery.mode "${cfg.delivery.mode}" is not selectable: ${why}; using local delivery.`);
     cfg.delivery.mode = 'local';
@@ -207,7 +218,7 @@ export async function runWizard(input: WizardInput): Promise<WizardResult> {
     cfg.intake.startReady = await ask('intake.startReady',
       'Start ready tasks automatically? (n = only tasks labelled minions:authorized)', cfg.intake.startReady ? 'y' : 'n', yesNo);
     // 5. Publication and merge authority.
-    const blocked = githubDeliveryUnavailableReason({ hasGitHub: d.git.hasGitHub, hasGitHubCredential: !!input.githubCredential });
+    const blocked = deliveryBlockedReason(cfg, input);
     if (blocked) {
       io.info(`Delivery: local commits on agent/<slug> branches, fetched with \`minions export\`. Branch push and pull requests are not selectable: ${blocked}. Auto-merge ${NA}.`);
     } else {
@@ -215,8 +226,22 @@ export async function runWizard(input: WizardInput): Promise<WizardResult> {
       cfg.delivery.mode = await ask('delivery.mode', 'Delivery mode (local/branch/pull-request)', cfg.delivery.mode, choice(DELIVERY_MODES));
       cfg.delivery.provider = cfg.delivery.mode === 'local' ? cfg.delivery.provider : 'github';
     }
-    // 6. Communication.
-    io.info(`Communication: terminal. Telegram ${NA}.`);
+    // 6. Communication. Terminal is always available; Telegram is optional and degrades to terminal.
+    io.info('Communication: terminal (always available), or Telegram through the official Claude Code channel plugin (research preview).');
+    let channel = await ask('communication.channel', 'Communication channel (terminal/telegram)', cfg.communication.channel, choice(['terminal', 'telegram'] as const));
+    if (channel === 'telegram') {
+      for (const l of telegramBotGuidance()) io.info(`  ${l}`);
+      if (cfg.container.network === 'none') {
+        const why = 'Telegram is unavailable: container.network is none, and the plugin needs api.telegram.org and the npm registry. Using terminal.';
+        io.info(`  ${why}`);
+        notes.push(why);
+        channel = 'terminal';
+      } else {
+        io.info('  After the plan is applied you can store the bot token (input hidden). Until a token is stored and the plugin');
+        io.info('  is available in the container, the coordinator starts terminal-only and says why.');
+      }
+    }
+    cfg.communication.channel = channel;
     // 7. Credentials — no secret is requested by these questions.
     io.info('Credentials: log in to Claude inside the container (/login) on first `minions start`; host login is not reused.');
     io.info(d.git.hasGitHub

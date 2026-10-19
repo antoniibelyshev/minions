@@ -46,7 +46,7 @@ describe('telegram capability probe: evaluation', () => {
     const r = evaluateTelegram(facts({ bun: err(127, 'Command not found: bun') }));
     expect(r.availability).toBe('unavailable');
     expect(r.summary).toMatch(/Bun is not installed/);
-    expect(item(r, 'bun').hint).toMatch(/image does not ship Bun/);
+    expect(item(r, 'bun').hint).toMatch(/ships a pinned Bun/);
   });
 
   it('is unavailable when claude itself fails', () => {

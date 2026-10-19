@@ -84,10 +84,13 @@ COMPOSE="$MINIONS_HOME/projects/$ID_A/compose.yaml"
 cx() { docker compose -f "$COMPOSE" exec -T app "$@"; }
 expect_eq "$(cx claude --version | awk '{print $1}')" "2.1.292" "claude --version"
 expect_eq "$(cx backlog --version)" "1.54.0" "backlog --version"
+expect_eq "$(cx bun --version)" "1.4.3" "bun --version"
 cx test ! -e /workspace/repo/.env || fail ".env was imported"; ok "ignored .env not imported"
 cx claude plugin validate /opt/minions/plugin >/dev/null || fail "plugin validate"; ok "plugin validates"
 expect_eq "$(cx minions coordinator --probe --json | json 'd.data.claudeVersion' | awk '{print $1}')" 2.1.292 "capability probe"
-argv="$(cx minions coordinator --print-command --json | json 'd.data.args.join("\n")')"
+argv="$(cx minions coordinator --print-command --json | json 'd.data.claude.args.join("\n")')"
+tmuxargv="$(cx minions coordinator --print-command --json | json 'd.data.tmux.args.join(" ")')"
+grep -q -- '-- minions coordinator run$' <<<"$tmuxargv" || fail "tmux does not run the exec wrapper"
 for want in --plugin-dir /opt/minions/plugin --append-system-prompt --permission-mode; do
   grep -qxF -- "$want" <<<"$argv" || fail "coordinator argv lacks $want"
 done

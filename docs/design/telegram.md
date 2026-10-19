@@ -1,8 +1,8 @@
 # Telegram channel integration: design
 
-Status: design plus a capability probe (`minions telegram probe`, doctor check `telegram.plugin`).
-Telegram stays **deferred in v0.1**. The wizard, launch flag, outbox, and controls described here are
-the plan for implementation step 7 of the spec ("Telegram configuration and startup integration").
+Status: **implemented** except the notification outbox (task-2.3): bot token provisioning, the
+wizard step, plugin install, the coordinator exec wrapper with `--channels`, controlled restarts, and
+doctor readiness (see [Implementation](#implementation-step-7)). The outbox section is still a plan.
 Everything marked **verified** was observed on Claude Code 2.1.292 in a Linux container on
 2026-10-19 or read from the sources below. Everything marked **unknown** is listed in
 [Unknowns and fallbacks](#unknowns-and-fallbacks) and is not assumed.
@@ -63,7 +63,7 @@ host (macOS)                                  project container
 ───────────────                               ────────────────────────────────────────────────
 minions CLI                                   tmux "coordinator"
   credential store (task-1.1 mechanism)  ──►    minions coordinator run   (exec wrapper)
-  writes 0600 file, ro bind-mount               │ reads /run/minions-secrets/telegram-bot-token
+  writes 0600 file, ro bind-mount               │ reads /opt/minions/secrets/telegram-bot-token
   doctor ── compose exec ──────────────────►    │ env TELEGRAM_BOT_TOKEN=… (this process tree only)
             minions telegram probe --json       └─ claude --plugin-dir /opt/minions/plugin
                                                          --channels plugin:telegram@claude-plugins-official …
@@ -109,15 +109,33 @@ The probe runs **inside the container**, where Claude Code, the plugin cache, Bu
 the existing delegate mechanism. The probe needs no credentials and no login. It never reads the token, `.env`, or
 `access.json`, and it never starts a Claude session. Implementation: `src/telegram/probe.ts`.
 
+## Access boundary (who can control the coordinator)
+
+**Only paired, allowlisted senders can control the coordinator. Messages from unpaired senders are
+dropped by the plugin before they reach the session** (spec §811). Under the default `pairing` DM
+policy an unknown sender only receives a pairing code from the plugin itself; the code grants nothing
+until the owner approves it **in the coordinator terminal** (`/telegram:access pair <code>`), and the
+plugin's access skill refuses pairing or policy requests that arrive over the channel. Allowlisted
+senders can also approve tool-permission prompts (permission relay), so minions requires exactly one
+allowlisted sender: the owner.
+
+What minions enforces (tested with fakes): the token and `--channels` reach only the coordinator's
+`claude` process; worker agent definitions have explicit `tools:` allowlists without MCP tools, so
+workers never receive Telegram tools; minions never writes `access.json`; doctor (`telegram.access`)
+reports `ok` only for DM policy `allowlist` with exactly one allowlisted sender and no groups, and warns
+otherwise. What the plugin enforces (not re-implemented): the inbound gate, pairing codes, and
+outbound gating to allowlisted chats. `src/telegram/access.ts` (`senderCanControl`) mirrors the
+documented gate for tests and status only.
+
 ## Bot token provisioning
 
 Reuse the shared host credential mechanism (task-1.1) for a new credential kind `telegram-bot-token`:
 
 - Storage: macOS Keychain item (preferred) or a 0600 file under the minions data root. The token never goes in config,
   `project.json`, the plan output, logs, or Git. `redact()` already masks bot-token-shaped strings.
-- Delivery: `minions start` materializes the secret as a 0600 file in the project's private runtime directory and bind-mounts
-  it read-only at `/run/minions-secrets/telegram-bot-token`. The exact host path and mount mechanics follow task-1.1. If
-  task-1.1 picks Compose secrets, the in-container path changes, but the exec-wrapper contract stays the same.
+- Delivery: `minions start` materializes the secret as a 0600 file in `projects/<id>/secrets/`, whose directory is
+  bind-mounted read-only at `/opt/minions/secrets` (task-1.1 mechanism), so the token is at
+  `/opt/minions/secrets/telegram-bot-token`.
 - Residual risk (spec §120): the coordinator's tools, and their child processes, can read the token from the mount or the
   environment. The design doc and wizard say so plainly.
 - Rotation: re-run the wizard step, then do a controlled coordinator restart (spec §653: Telegram changes are restart-required).
@@ -129,7 +147,7 @@ Reuse the shared host credential mechanism (task-1.1) for a new credential kind 
    orgs need an Owner to enable channels. Offer terminal-only as the recommended default.
 2. Bot creation: open https://t.me/BotFather, send `/newbot`, choose a display name and a unique username ending in `bot`,
    and copy the token. Recommend one bot per project, and optionally `/setjoingroups` → Disable (DM-only use).
-3. Token entry: hidden input. Validate the format `^\d{6,12}:[A-Za-z0-9_-]{30,}$` locally. Optionally, with explicit consent,
+3. Token entry: hidden input. Validate the format `^\d{6,12}:[A-Za-z0-9_-]{30,64}$` locally. Optionally, with explicit consent,
    check it with the read-only Bot API `getMe` from the host to show the bot username. Store it with the shared credential
    mechanism. Warn if the bot ID is already registered to another project.
 4. Plan output (reviewable, no secrets): config change `communication.channel: telegram`, the secret mount, the image rebuild
@@ -146,7 +164,7 @@ Reuse the shared host credential mechanism (task-1.1) for a new credential kind 
 
 ## Launch integration
 
-- `buildCoordinatorCommand` adds `--channels plugin:telegram@claude-plugins-official` only when `communication.channel`
+- `buildClaudeCommand` (called by the exec wrapper) adds `--channels plugin:telegram@claude-plugins-official` only when `communication.channel`
   is `telegram`, the probe reports `available`, and the token mount exists. Otherwise it launches terminal-only and prints
   the reason. Example: `Telegram disabled for this session: Bun is not installed …`.
 - tmux runs `minions coordinator run` (the exec wrapper) instead of `claude` directly, so the token stays out of tmux's environment.
@@ -156,6 +174,24 @@ Reuse the shared host credential mechanism (task-1.1) for a new credential kind 
 - `bypassPermissions` stays forbidden. Permission prompts either relay to the paired owner (plugin capability) or wait
   for the terminal.
 - Telegram config changes trigger a controlled coordinator restart: drain or record in-flight state, kill the tmux session, relaunch.
+
+## Implementation (step 7)
+
+| Piece | Where | Behavior |
+| - | - | - |
+| Credential kind | `src/host/credentials.ts` (`TELEGRAM_CREDENTIAL`) | Same stores, reference file and secrets dir as the GitHub token. Keychain service `minions.telegram`; file `credentials/<id>/telegram-bot-token`. `credentials.json` keeps `botId` (not secret) for the one-bot-per-project warning; it lives there rather than in the registry so the registry schema is unchanged. |
+| Standalone command | `minions auth telegram [--stdin] [--verify] [--remove] [--dry-run]` | Prints the bot/pairing guidance, reads the token without echo, stores it, and on a running container re-materializes it and runs `minions coordinator sync` (controlled restart). `--verify` (getMe) is opt-in. |
+| Wizard | `src/host/wizard.ts`, `src/host/install.ts` | "Communication channel (terminal/telegram)". Telegram prints the guidance (preview status, BotFather, one coordinator per bot, pairing, owner-only allowlist, residual risk). `container.network: none` falls back to terminal with the reason. After the plan is applied: the token offer (hidden prompt, optional consented getMe). Declined or failed: init says the coordinator stays terminal-only until `minions auth telegram`. |
+| Image | `docker/Dockerfile` | Bun 1.4.3 from a throwaway stage, SHA-256 pinned per architecture; `BUN_INSTALL_CACHE_DIR=/home/node/.cache/bun` (cache volume). |
+| Plugin install | `minions telegram install` (`src/telegram/install.ts`) | Adds the official marketplace if missing, installs `telegram@claude-plugins-official` at user scope, enables a disabled install, never updates. Refuses a marketplace named `claude-plugins-official` that points at another repo. Run by `minions start` when Telegram is selected; failure only warns. |
+| Exec wrapper | `minions coordinator run` (`runCoordinator`) | tmux runs it instead of `claude`. It reads and validates the mounted token, runs the probe, and decides (`decideTelegram`). Enabled: `--channels plugin:telegram@claude-plugins-official`, `TELEGRAM_BOT_TOKEN` in the child env only, and the plugin's `reply`/`react`/`edit_message` tools allowed in `--settings`. Otherwise an inherited `TELEGRAM_BOT_TOKEN` is removed and it prints `Telegram disabled for this session: <reason>. Terminal mode is active.` It writes `/state/coordinator-launch.json` (channel, decision, fingerprint; no token). |
+| Controlled restart | `minions coordinator sync [--force] [--start-detached]` | Compares the running launch's fingerprint (channel, network, truncated token hash) with the current state. On a difference it kills the tmux session, records `coordinator_restart` in the runtime DB, and relaunches detached if asked. While worker leases are active it defers (`restart-pending`) unless `--force`; leases stay in the DB for `recover`. `minions start` runs it (detached start when Telegram is selected and nobody attaches). |
+| Doctor | `src/host/doctor.ts` | `telegram` (ok / missing / unavailable; never fail), `telegram.credential`, `telegram.bot` (shared bot), `telegram.plugin` (probe), `telegram.access` (`minions telegram status`: policy and counts only, never codes or ids). |
+| Coordinator prompt | `templates/plugin/coordinator.md` (`telegramGuidance`) | Replies with `reply`; Telegram tools are coordinator-only; access changes are terminal-only; plain-language controls. |
+
+Assumption: plugin MCP tools are named `mcp__plugin_telegram_telegram__<tool>` (Claude Code's
+`mcp__plugin_<plugin>_<server>__<tool>` scheme). If that is wrong, replies fall back to normal
+permission prompts; nothing else depends on it.
 
 ## Notification outbox
 
@@ -231,9 +267,12 @@ use a separate bot per project". Startup notice "not on the approved allowlist" 
 - Unit (default `npm test`, deterministic, no network): `test/telegram/probe.test.ts` covers probe evaluation, fact
   gathering with a fake runner and file reader (it asserts that only the documented commands run and only the managed-settings
   file is read), and the doctor mapping, including redaction.
-- Planned with step 7, using fake adapters: launch argv with and without `--channels` (no token in argv), the exec wrapper's env
-  scoping (a fake spawn records env), outbox enqueue/dedup/ack/fail/backoff on a temp SQLite DB, control mapping, the wizard
-  with fake IO and a fake credential store, and bot-ID collision detection in the registry.
+- Step 7, with fakes: `test/telegram/launch.test.ts` (launch argv with and without `--channels`, no token in argv/logs/launch
+  record, env scoping with a fake spawn, terminal fallback reasons, controlled restart and deferral), `test/telegram/access.test.ts`
+  (owner-only policy, unpaired senders cannot control, no codes or ids in status), `test/telegram/install.test.ts` (fake
+  `claude plugin` CLI), `test/host/telegram.test.ts` (format, stores, Keychain stdin-only, getMe, bot-ID collisions, wizard
+  and init with fake IO, doctor ok/missing/unavailable), and `test/plugin/generate.test.ts` (workers get no Telegram tools).
+- Planned with task-2.3: outbox enqueue/dedup/ack/fail/backoff on a temp SQLite DB, and control mapping.
 - Container boundary (`MINIONS_DOCKER_TESTS=1`): the image has Bun at the pinned version, the token mount is read-only and absent
   from `docker inspect` env, and `minions telegram probe --json` reports `available` after `minions telegram install` (needs network, no token).
 - Live (opt-in only, never in CI): `MINIONS_LIVE_TELEGRAM=1` plus a disposable bot token and a logged-in container. A manual

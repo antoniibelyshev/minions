@@ -1,11 +1,11 @@
 // `minions doctor`: host, Docker, container, and configuration readiness. Never prints secrets.
 import { DEFERRED_FEATURES, listUnavailable } from '../config/resolve.js';
-import type { MinionsConfig } from '../config/schema.js';
 import { isMinionsError } from '../core/errors.js';
 import { run } from '../core/exec.js';
 import { redact } from '../core/output.js';
 import { VERSION } from '../core/version.js';
-import { githubCredentialStatus, githubRepoFromRemote, type CredentialStatus, type Fetch } from './credentials.js';
+import type { MinionsConfig } from '../config/schema.js';
+import { githubCredentialStatus, githubRepoFromRemote, telegramCredentialStatus, type CredentialStatus, type Fetch, type TelegramCredentialStatus } from './credentials.js';
 import { dockerProbe, type DockerProbe } from './discovery.js';
 import { Compose, buildFingerprint, imageBuildLabel, type Runner } from './docker.js';
 import { telegramDoctorCheck } from '../telegram/probe.js';
@@ -61,6 +61,30 @@ export function mergeReadiness(config: Pick<MinionsConfig, 'delivery'> | null, g
   return ['warn', `delivery.mode "${mode}" cannot publish: GitHub credential ${github.credential ?? 'unknown'}; ${deferred}`, 'Run `minions auth github`; approved tasks wait (blocked) until `minions work publish` succeeds.'];
 }
 
+/** telegram.credential: ok / missing / invalid. Never 'fail': terminal mode must stay usable without Telegram. */
+function telegramCredentialCheck(s: TelegramCredentialStatus, channel: MinionsConfig['communication']['channel'] | undefined): Check {
+  const name = 'telegram.credential';
+  const wanted = channel === 'telegram';
+  switch (s.state) {
+    case 'ok': return { name, status: 'ok', detail: `ok: ${s.detail}${wanted ? '' : ' (unused: communication.channel is terminal)'}` };
+    case 'missing': return wanted
+      ? { name, status: 'warn', detail: `missing: ${s.detail}`, hint: 'Run `minions auth telegram`; until then the coordinator runs terminal-only.' }
+      : { name, status: 'ok', detail: 'missing: not needed (communication.channel is terminal)' };
+    default: return { name, status: 'warn', detail: `invalid: ${s.detail}`, hint: 'Store the token again with `minions auth telegram`.' };
+  }
+}
+
+function telegramAccessCheck(r: { code: number; stdout: string; stderr: string }): Check {
+  const name = 'telegram.access';
+  let data: { access?: { state?: string; detail?: string; hint?: string }; coordinator?: { telegram?: { enabled?: boolean; reason?: string } } | null } | undefined;
+  try { const env = JSON.parse(r.stdout) as { ok?: boolean; data?: typeof data }; if (env.ok) data = env.data; } catch { /* below */ }
+  if (r.code !== 0 || !data?.access?.state) return { name, status: 'warn', detail: `telegram status unavailable: ${short(r.stderr || r.stdout) || 'no output'}`, hint: '`minions start` rebuilds an outdated image.' };
+  const launched = data.coordinator?.telegram;
+  const suffix = launched ? (launched.enabled ? '; running coordinator has Telegram' : `; running coordinator is terminal-only (${launched.reason ?? 'unknown reason'})`) : '';
+  const detail = redact(`${data.access.state}: ${data.access.detail ?? ''}${suffix}`);
+  return { name, status: data.access.state === 'ok' ? 'ok' : 'warn', detail, ...(data.access.hint ? { hint: redact(data.access.hint) } : {}) };
+}
+
 export async function runDoctor(opts: { cwd: string; runner?: Runner; probe?: DockerProbe; fetch?: Fetch }): Promise<DoctorReport> {
   const runner = opts.runner ?? run;
   const checks: Check[] = [];
@@ -83,9 +107,10 @@ export async function runDoctor(opts: { cwd: string; runner?: Runner; probe?: Do
     projectId = ref.projectId;
     const project = await loadProjectJson(ref.projectId);
     add('project', 'ok', `${project.projectId} (${project.visibility}, ${project.profile}) at ${project.repoPath}`);
+    let config: MinionsConfig | undefined;
     try {
       const eff = await loadEffectiveConfig(project);
-      effective = eff.config;
+      effective = config = eff.config;
       add('config', 'ok', `valid (revision ${eff.config.configRevision}, package ${eff.config.packageVersion})`);
       for (const u of listUnavailable(eff.config)) add(`config.${u.path}`, 'unavailable', u.reason);
     } catch (e) {
@@ -95,6 +120,15 @@ export async function runDoctor(opts: { cwd: string; runner?: Runner; probe?: Do
     add(...gc);
     github.onGitHub = githubRepoFromRemote(project.remoteUrl) !== null;
     github.credential = (['ok', 'missing', 'invalid', 'unverified'] as const).find((s) => gc[2].startsWith(`${s}:`)) ?? null;
+    const channel = config?.communication.channel;
+    const tgCred = await telegramCredentialStatus(project.projectId, { runner })
+      .catch((e): TelegramCredentialStatus => ({ state: 'invalid', detail: `could not check (${short(String((e as Error).message ?? e))})` }));
+    checks.push(telegramCredentialCheck(tgCred, channel));
+    if (tgCred.sharedWith?.length) {
+      add('telegram.bot', 'warn', `bot ${tgCred.botId} is also provisioned for project(s) ${tgCred.sharedWith.join(', ')}; only one coordinator can poll a bot at a time`,
+        'Create a separate bot per project (BotFather /newbot) and run `minions auth telegram` in one of them.');
+    }
+    let tgPlugin: Check | undefined;
 
     if (docker.daemon && docker.compose) {
       const label = await imageBuildLabel(project.imageTag, runner);
@@ -117,12 +151,21 @@ export async function runDoctor(opts: { cwd: string; runner?: Runner; probe?: Do
         // Credential-free; never 'fail' because terminal mode must stay usable without Telegram.
         const tg = telegramDoctorCheck(await ex(['minions', 'telegram', 'probe', '--json']));
         add('telegram.plugin', tg.status, tg.detail, tg.hint);
+        tgPlugin = checks[checks.length - 1];
+        if (channel === 'telegram') checks.push(telegramAccessCheck(await ex(['minions', 'telegram', 'status', '--json'])));
       } else {
         for (const n of ['claude.auth', 'backlog.cli', 'claude.capabilities', 'telegram.plugin']) add(n, 'warn', 'skipped: container not running');
       }
     } else {
       add('container', 'fail', 'skipped: Docker unavailable');
     }
+    // Overall Telegram readiness: ok / missing / unavailable (never fail; terminal is the baseline).
+    if (channel !== 'telegram') add('telegram', 'ok', 'terminal mode (Telegram not selected)');
+    else if (config?.container.network === 'none') add('telegram', 'unavailable', 'unavailable: container.network is none; the coordinator runs terminal-only');
+    else if (tgCred.state !== 'ok') add('telegram', 'warn', `${tgCred.state === 'missing' ? 'missing' : 'invalid'}: bot token ${tgCred.state}; the coordinator runs terminal-only`, 'Run `minions auth telegram`.');
+    else if (!tgPlugin) add('telegram', 'warn', 'unknown: bot token stored; plugin availability not checked (container not running)', 'Run `minions start`, then rerun doctor.');
+    else if (tgPlugin.status !== 'ok') add('telegram', 'unavailable', `unavailable: ${tgPlugin.detail}; the coordinator runs terminal-only`, tgPlugin.hint);
+    else add('telegram', 'ok', 'ok: bot token stored and the official plugin is available (see telegram.access for pairing)');
   } catch (e) {
     add('project', 'warn', isMinionsError(e) ? e.message : String(e), 'Run `minions init` in this repository.');
   }

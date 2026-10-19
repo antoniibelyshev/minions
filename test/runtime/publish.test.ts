@@ -261,6 +261,26 @@ describe('sensitive-path gate', () => {
     expect(s.permissions.deny).toEqual(expect.arrayContaining(['Bash(git push *)', 'Bash(gh pr merge *)']));
     expect(s.permissions.ask).toEqual(expect.arrayContaining(['Bash(minions work approve *)']));
   });
+
+  it('approve asks (not allow) even with program-level options before the subcommand', () => {
+    const s = coordinatorSettings(defaults()) as { permissions: { allow: string[]; deny: string[]; ask: string[] } };
+    // Claude Code wildcard semantics: `*` matches any run of characters, including spaces. Precedence deny > ask > allow.
+    const glob = (rule: string, cmd: string) => {
+      const m = /^Bash\((.*)\)$/.exec(rule)![1]!;
+      return new RegExp('^' + m.split('*').map((x) => x.replace(/[.+?^${}()|[\]\\]/g, (ch) => `\\${ch}`)).join('.*') + '$').test(cmd);
+    };
+    const decide = (cmd: string) => s.permissions.deny.some((r) => glob(r, cmd)) ? 'deny'
+      : s.permissions.ask.some((r) => glob(r, cmd)) ? 'ask' : s.permissions.allow.some((r) => glob(r, cmd)) ? 'allow' : 'none';
+    for (const cmd of [
+      'minions work approve task-1 --head abc', 'minions --json work approve task-1 --head abc', 'minions --json --project x work approve task-1',
+      'minions --json work approve', 'minions approve task-1', 'minions --json approve task-1 --head abc',
+    ]) expect(decide(cmd), cmd).toBe('ask');
+    expect(decide('minions work list')).toBe('allow');
+    expect(decide('minions --json status')).toBe('allow');
+    expect(decide('git -C x push origin HEAD')).toBe('deny');
+    expect(decide('gh pr merge 3')).toBe('deny');
+    expect(decide('gh -R o/r pr merge 3')).toBe('deny');
+  });
 });
 
 describe('branch delivery', () => {
