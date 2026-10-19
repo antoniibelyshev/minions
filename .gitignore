@@ -1,0 +1,32 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+*.tsbuildinfo
+*.tgz
+
+# Test / coverage
+coverage/
+.vitest-cache/
+
+# Logs
+*.log
+npm-debug.log*
+
+# Env and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Local runtime state
+*.sqlite
+*.sqlite-journal
+*.db
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
