@@ -188,3 +188,58 @@ describe('telegram doctor check (host side)', () => {
     expect(c.detail).not.toMatch(/AAHfiqks/);
   });
 });
+
+describe('telegram capability probe: robustness', () => {
+  it('bounds every external command with a timeout and tolerates failure', async () => {
+    const seen: Array<{ cmd: string; timeoutMs?: number; allowFailure?: boolean }> = [];
+    const runner = async (cmd: string, _a: string[], o?: { timeoutMs?: number; allowFailure?: boolean }) => {
+      seen.push({ cmd, ...(o ?? {}) });
+      return ok('[]');
+    };
+    await gatherTelegramFacts({ runner, readText: async () => '{}' });
+    expect(seen).toHaveLength(4);
+    for (const s of seen) {
+      expect(s.allowFailure).toBe(true);
+      expect(s.timeoutMs).toBeGreaterThan(0);
+      expect(s.timeoutMs).toBeLessThanOrEqual(60_000);
+    }
+  });
+
+  it('treats timed-out commands (code 124) as failures without throwing', () => {
+    const timedOut: RunResult = { code: 124, stdout: '', stderr: '', timedOut: true };
+    const r = evaluateTelegram(facts({ claude: timedOut, bun: timedOut, plugins: timedOut, marketplaces: timedOut }));
+    expect(r.availability).toBe('unavailable');
+    expect(item(r, 'plugin').status).toBe('unknown');
+  });
+
+  it('handles empty, null and non-object JSON from the plugin CLI and managed settings', () => {
+    for (const out of ['', 'null', '"x"', '42']) {
+      const r = evaluateTelegram(facts({ plugins: ok(out), marketplaces: ok(out) }));
+      expect(r.availability).toBe('not-installed');
+    }
+    for (const json of [null, [], 'str', 7]) {
+      const r = evaluateTelegram(facts({ managed: { present: true, json } }));
+      expect(r.availability).toBe('blocked');
+    }
+    expect(evaluateTelegram(facts({ claude: ok('') })).claudeVersion).toBeNull();
+  });
+
+  it('runs against genuinely missing binaries without throwing (real runner)', async () => {
+    const oldPath = process.env.PATH;
+    process.env.PATH = '/nonexistent-minions-test';
+    try {
+      const r = await probeTelegram({ readText: async () => { throw Object.assign(new Error('x'), { code: 'ENOENT' }); } });
+      expect(r.availability).toBe('unavailable');
+      expect(r.available).toBe(false);
+    } finally {
+      process.env.PATH = oldPath;
+    }
+  });
+
+  it('doctor check warns, never fails, for timeout or non-JSON from the container', () => {
+    expect(telegramDoctorCheck({ code: 124, stdout: '', stderr: '', timedOut: true }).status).toBe('warn');
+    expect(telegramDoctorCheck(ok('')).status).toBe('warn');
+    expect(telegramDoctorCheck(ok('{')).status).toBe('warn');
+    expect(telegramDoctorCheck(ok(JSON.stringify({ ok: true, data: { availability: 1 } }))).status).toBe('warn');
+  });
+});
