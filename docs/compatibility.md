@@ -62,5 +62,5 @@ It uses a temp `MINIONS_HOME` and disposable repos and removes its containers an
 - Native macOS/iOS builds (Xcode) cannot run inside the Linux runtime.
 - **Keychain access list**: the GitHub and Telegram Keychain items are created without a `-T` access list, so any
   process running as your macOS user can read them (normal macOS behaviour). The plaintext copy mounted into the
-  container is cleared when `minions start` fails to bring the container up and by `minions doctor` when no
-  container is running; the Keychain/file-store originals are never removed by that cleanup.
+  container is cleared when `minions start` fails to bring the container up and by `minions doctor` when the container is
+  confirmed gone (exited, dead or absent; an uncertain state only produces a warning); the Keychain/file-store originals are never removed by that cleanup.

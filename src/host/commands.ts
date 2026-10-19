@@ -243,10 +243,9 @@ export function register(program: Command): void {
       const compose = new Compose(project.projectId);
       let mounted = false;
       let needsRestart = false;
-      if (await compose.isRunning().catch(() => false)) {
-        if (await compose.hasSecretsMount().catch(() => false)) { await materialize(json, project.projectId); mounted = true; }
-        else needsRestart = true; // container predates the secrets mount: a copy would not reach it
-      }
+      const vis = await compose.secretsVisibility();
+      if (vis === 'mounted') { await materialize(json, project.projectId); mounted = true; }
+      else if (vis === 'restart-required') needsRestart = true; // container predates the secrets mount: a copy would not reach it
       emit({ ...r, mountedPath: CONTAINER.githubTokenFile, visibleInRunningContainer: mounted, ...(needsRestart ? { restartRequired: true } : {}) }, { json, human: () => [
         `Stored the GitHub token in ${r.backend === 'keychain' ? 'the macOS Keychain' : 'a 0600 host file'} (${r.ref}).`,
         r.verification ? `Verification: ${r.verification.status} — ${r.verification.detail}` : 'Verification skipped (--no-verify).',
@@ -270,8 +269,11 @@ export function register(program: Command): void {
       const project = await loadProjectJson(ref.projectId);
       const compose = new Compose(project.projectId);
       // A token change is restart-required: apply it to a running container with a controlled restart.
+      let needsRestart = false;
       const apply = async () => {
-        if (!(await compose.isRunning().catch(() => false))) return false;
+        const vis = await compose.secretsVisibility();
+        if (vis === 'not-running') return false;
+        if (vis === 'restart-required') { needsRestart = true; return false; } // a copy would not reach it
         await materialize(json, project.projectId);
         const eff = await loadEffectiveConfig(project).catch(() => undefined);
         await coordinatorSync(json, compose, { startDetached: eff?.config.communication.channel === 'telegram' });
@@ -280,7 +282,7 @@ export function register(program: Command): void {
       if (o.remove) {
         const r = dryRun ? { removed: false, backend: null } : await removeTelegramToken(project.projectId);
         const applied = !dryRun && r.removed ? await apply() : false;
-        emit({ projectId: project.projectId, dryRun, ...r, appliedToRunningContainer: applied }, { json, human: () => dryRun ? 'Would remove the stored Telegram bot token.'
+        emit({ projectId: project.projectId, dryRun, ...r, appliedToRunningContainer: applied, ...(needsRestart ? { restartRequired: true } : {}) }, { json, human: () => dryRun ? 'Would remove the stored Telegram bot token.'
           : r.removed ? `Removed the Telegram bot token (${r.backend}).${applied ? ' The coordinator now runs terminal-only.' : ''}` : 'No Telegram bot token was stored.' });
         return;
       }
@@ -293,12 +295,13 @@ export function register(program: Command): void {
           : (() => { throw new MinionsError('PRECONDITION', 'No terminal to prompt for the token.', 'Run in a terminal, or pipe it: `minions auth telegram --stdin < token-file`.'); })();
       const r = await provisionTelegramToken({ projectId: project.projectId, token, repoPath: ref.repoPath, verify: !!o.verify });
       const applied = await apply();
-      emit({ ...r, mountedPath: CONTAINER.telegramTokenFile, appliedToRunningContainer: applied }, { json, human: () => [
+      emit({ ...r, mountedPath: CONTAINER.telegramTokenFile, appliedToRunningContainer: applied, ...(needsRestart ? { restartRequired: true } : {}) }, { json, human: () => [
         `Stored the Telegram bot token for bot ${r.botId} in ${r.backend === 'keychain' ? 'the macOS Keychain' : 'a 0600 host file'} (${r.ref}).`,
         r.verification ? `Verification: ${r.verification.status} — ${r.verification.detail}` : 'Not checked with Telegram (pass --verify to call getMe).',
         ...r.warnings.map((w) => `warning: ${w}`),
         applied ? 'Applied to the running container (controlled coordinator restart when needed).'
-          : `It is mounted read-only at ${CONTAINER.telegramTokenFile} on the next \`minions start\`.`,
+          : needsRestart ? 'The running container has no secrets mount (created before this feature); run `minions start` to recreate it so the token becomes visible.'
+            : `It is mounted read-only at ${CONTAINER.telegramTokenFile} on the next \`minions start\`.`,
         'Telegram is used only when communication.channel is "telegram" (check with `minions config show --explain`).',
       ].join('\n') });
     }));

@@ -110,3 +110,70 @@ describe('upClearingSecretsOnFailure resilience', () => {
     await expect(C.upClearingSecretsOnFailure({ up: async () => { throw err; } }, '../does-not-exist/../' + ID)).rejects.toBe(err);
   });
 });
+
+describe('Compose.containerState', () => {
+  const st = (stdout: string, code = 0) => new Compose(ID, async () => ({ code, stdout, stderr: '' })).containerState();
+  const one = (State: string) => JSON.stringify({ Name: 'x', State });
+  it('is absent only for empty output, exited or dead', async () => {
+    expect((await st('')).state).toBe('absent');
+    expect((await st(one('exited'))).state).toBe('absent');
+    expect((await st(one('dead'))).state).toBe('absent');
+    expect((await st('[]')).state).toBe('absent');
+  });
+  it('is running for a running container (NDJSON or array)', async () => {
+    expect((await st(one('running'))).state).toBe('running');
+    expect((await st(`[${one('running')}]`)).state).toBe('running');
+  });
+  it('is unknown for restarting, paused, created, errors, timeouts, multiples and malformed output', async () => {
+    for (const s of ['restarting', 'paused', 'created']) expect((await st(one(s))).state).toBe('unknown');
+    expect((await st('', 1)).state).toBe('unknown');
+    expect((await st(one('exited'), 1)).state).toBe('unknown');
+    expect((await new Compose(ID, async () => { throw new Error('timed out'); }).containerState()).state).toBe('unknown');
+    expect((await st(`${one('exited')}\n${one('exited')}`)).state).toBe('unknown');
+    expect((await st('not json')).state).toBe('unknown');
+    expect((await st('{"Name":"x"}')).state).toBe('unknown');
+    expect((await st('null')).state).toBe('unknown');
+  });
+});
+
+describe('doctor keeps copies unless the container is confirmed gone', () => {
+  for (const [label, res] of [
+    ['ps error', { code: 1, stdout: '', stderr: 'boom' }],
+    ['restarting', { code: 0, stdout: JSON.stringify({ State: 'restarting' }), stderr: '' }],
+    ['paused', { code: 0, stdout: JSON.stringify({ State: 'paused' }), stderr: '' }],
+    ['created', { code: 0, stdout: JSON.stringify({ State: 'created' }), stderr: '' }],
+  ] as const) {
+    it(`does not delete on ${label}, and warns`, async () => {
+      const repo = makeRepo(env.root);
+      const r = await runInit({ path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
+      const id = r.plan.projectId;
+      await plant(id);
+      const runner = async (_c: string, args: string[]): Promise<RunResult> => {
+        if (!args.includes('ps')) return ok('{}');
+        return args.includes('-a') ? res : ok(''); // `--status running` lookup finds nothing
+      };
+      const doc = await runDoctor({ cwd: repo, probe: dockerUp, runner });
+      expect(copies(id)).toEqual([true, true]);
+      expect(doc.checks.find((c) => c.name === 'secrets.copy')).toMatchObject({ status: 'warn', detail: expect.stringContaining('not removed') });
+    });
+  }
+  it('deletes on exited', async () => {
+    const repo = makeRepo(env.root);
+    const r = await runInit({ path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
+    await plant(r.plan.projectId);
+    const runner = async (_c: string, args: string[]): Promise<RunResult> =>
+      args.includes('ps') && args.includes('-a') ? ok(JSON.stringify({ State: 'exited' })) : ok('');
+    await runDoctor({ cwd: repo, probe: dockerUp, runner });
+    expect(copies(r.plan.projectId)).toEqual([false, false]);
+  });
+});
+
+describe('Compose.secretsVisibility (auth github / auth telegram)', () => {
+  const mk = (running: boolean, mounts: unknown) => new Compose(ID, async (_c, args) =>
+    args[0] === 'inspect' ? ok(JSON.stringify(mounts)) : ok(running ? 'abc\n' : ''));
+  it('claims visibility only when running with the secrets mount', async () => {
+    expect(await mk(true, [{ Destination: CONTAINER.secretsDir }]).secretsVisibility()).toBe('mounted');
+    expect(await mk(true, [{ Destination: '/workspace' }]).secretsVisibility()).toBe('restart-required');
+    expect(await mk(false, []).secretsVisibility()).toBe('not-running');
+  });
+});
