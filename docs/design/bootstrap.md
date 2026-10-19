@@ -201,7 +201,15 @@ Decision record for `minions setup` (`src/host/setup.ts`).
 - **Defaults.** Optional integrations (GitHub, CI, auto-merge, Telegram) default to no. Core steps
   (apply the plan, start the container, import, launch, attach) default to yes. `--yes` takes the
   defaults. A token piped with `--github-token-stdin` / `--telegram-token-stdin` enables that
-  integration. `--delivery` is honoured only when it is selectable.
+  integration; an empty piped token is an error (non-zero exit, nothing changed). `--delivery` is
+  honoured only when it is selectable.
+- **Init options.** `--config <file>`, `--attach` and `--new-identity` are forwarded to `runInit` with
+  the same semantics as `minions init`, so `./install.sh path --config cfg.json` keeps working. With
+  `--config` the init wizard, the keep/change question, the delivery-mode question and the
+  "Set up Telegram?" question are skipped (the file sets `delivery.mode` and
+  `communication.channel`); token questions are still asked in a terminal, and like init, `--config`
+  works without a terminal. The coordinator-attach opt-out is `--no-attach-coordinator` because
+  `--attach` has init's meaning.
 - **Idempotent rerun.** Setup detects the registered project and offers keep or change (change reruns
   the wizard with the existing values as defaults; visibility stays as installed). For a stored GitHub
   token it offers keep, change, or remove. For Telegram it offers keep, change, or disable. A running

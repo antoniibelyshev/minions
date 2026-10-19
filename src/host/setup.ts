@@ -52,6 +52,15 @@ export interface SetupOptions {
   path: string;
   profile?: Profile;
   visibility?: 'shared' | 'private';
+  /**
+   * --config <file>: validated project configuration (same semantics as `minions init --config`). The
+   * init wizard and the questions the file covers (keep/change, delivery mode, communication channel)
+   * are skipped; token questions are still asked when interactive.
+   */
+  configFile?: string;
+  /** --attach / --new-identity: forwarded to runInit (same semantics as `minions init`). */
+  attach?: boolean;
+  newIdentity?: boolean;
   /** --yes: non-interactive defaults (optional integrations off unless a token arrives on stdin). */
   yes: boolean;
   dryRun?: boolean;
@@ -139,6 +148,16 @@ export async function runSetup(opts: SetupOptions): Promise<SetupResult> {
   if (!opts.yes && !opts.dryRun && !opts.io) {
     throw new MinionsError('PRECONDITION', 'setup needs a terminal for its questions.', 'Pass --yes to accept the defaults (optional integrations off), or --dry-run.');
   }
+  // A piped token that is empty is an error, not "no integration": fail before anything is written.
+  // The message never includes the input.
+  for (const [name, label] of [['github', 'GitHub'], ['telegram', 'Telegram']] as const) {
+    const t = opts.tokens?.[name];
+    if (t !== undefined && t.trim() === '') {
+      const line = name === 'telegram' && opts.tokens?.github !== undefined ? 'second' : 'first';
+      throw new MinionsError('PRECONDITION', `--${name}-token-stdin: no ${label} token was read from stdin (empty input); nothing was changed.`,
+        `Pipe the token as the ${line} line of stdin, or omit --${name}-token-stdin.`);
+    }
+  }
   const io = opts.io;
   const say = (l: string) => io?.info(l);
   const steps: SetupStep[] = [];
@@ -147,19 +166,20 @@ export async function runSetup(opts: SetupOptions): Promise<SetupResult> {
   // ---------------------------------------------------------------- 1. project (init wizard)
   const priorId = await registeredProject(opts.path);
   let reconfigure = false;
-  if (priorId && interactive) {
+  if (priorId && interactive && !opts.configFile) {
     say(`minions is already set up for this repository (project ${priorId}).`);
     reconfigure = (await choose(io!, 'Project configuration: keep it or change it?', 'keep', ['keep', 'change'] as const)) === 'change';
   }
   if (interactive) say('\n== Project ==');
   const init = await runInit({
     path: opts.path, profile: opts.profile, visibility: opts.visibility, yes: !interactive, dryRun: opts.dryRun,
+    configFile: opts.configFile, attach: opts.attach, newIdentity: opts.newIdentity,
     io: interactive ? io : undefined, skipIntegrations: true, reconfigure,
     dockerProbe: opts.dockerProbe, runner: opts.runner, fetch: opts.fetch,
   });
   const projectId = init.plan.projectId;
   const written = init.applied ? init.applied.written.length + init.applied.removed.length : 0;
-  step({ id: 'init', status: opts.dryRun ? 'planned' : priorId ? (reconfigure ? 'changed' : 'kept') : 'done',
+  step({ id: 'init', status: opts.dryRun ? 'planned' : priorId ? (reconfigure || opts.configFile ? 'changed' : 'kept') : 'done',
     detail: opts.dryRun ? `would install project ${projectId} (${init.plan.visibility}, profile ${init.plan.profile})`
       : `project ${projectId} (${init.plan.visibility}, profile ${init.plan.profile}); ${written} file(s) written, ${init.applied?.unchanged ?? 0} unchanged` });
 
@@ -231,7 +251,7 @@ export async function runSetup(opts: SetupOptions): Promise<SetupResult> {
     if (opts.delivery !== 'local' && blocked) {
       step({ id: 'delivery', status: 'failed', detail: `--delivery ${opts.delivery} is not selectable (${blocked}); keeping ${current}`, later: LATER.github });
     } else mode = opts.delivery;
-  } else if (interactive && !blocked && steps.find((s) => s.id === 'github')?.status !== 'skipped') {
+  } else if (interactive && !opts.configFile && !blocked && steps.find((s) => s.id === 'github')?.status !== 'skipped') {
     say('  Delivery: local (commits stay in the container; `minions export`), branch (push agent/<slug>), or pull-request (push and open a PR). minions never merges.');
     mode = await choose(io!, 'Delivery mode', current, DELIVERY_MODES);
   } else if (blocked && current !== 'local' && !hasToken && refs.github) {
@@ -281,7 +301,8 @@ export async function runSetup(opts: SetupOptions): Promise<SetupResult> {
     } else if (!interactive) action = 'skip';
     else if (channel === 'telegram') {
       action = await yesNo(io!, 'Telegram is selected but no bot token is stored. Set up Telegram now?', false) ? 'setup' : 'skip';
-    } else if (await yesNo(io!, 'Set up Telegram (talk to the coordinator through your own bot)?', false)) {
+    } else if (opts.configFile) action = 'skip'; // the config file selects the channel (terminal)
+    else if (await yesNo(io!, 'Set up Telegram (talk to the coordinator through your own bot)?', false)) {
       action = tg && await yesNo(io!, `A bot token is already stored (bot ${tg.botId}). Use it?`, true) ? 'reuse' : 'setup';
     } else action = 'skip';
 

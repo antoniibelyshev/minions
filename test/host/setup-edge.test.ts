@@ -25,6 +25,7 @@ const { loadCredentialRefs } = await import('../../src/host/credentials.js');
 const { loadRegistry } = await import('../../src/host/registry.js');
 const { projectPaths, repoPaths } = await import('../../src/core/paths.js');
 const { register } = await import('../../src/host/commands.js');
+const { profileDefaults } = await import('../../src/config/profiles.js');
 const { dockerUp, git, makeRepo, withHome } = await import('./fixtures.js');
 type SetupRuntime = import('../../src/host/setup.js').SetupRuntime;
 type SetupResult = import('../../src/host/setup.js').SetupResult;
@@ -248,7 +249,7 @@ describe('CLI wiring', () => {
   it('registers setup with stdin-only token flags (no option takes a token value)', () => {
     const cmd = setupCmd();
     const longs = cmd.options.map((o) => o.long).sort();
-    expect(longs).toEqual(['--delivery', '--dry-run', '--github-token-stdin', '--no-attach', '--private', '--profile', '--shared', '--telegram-token-stdin', '--yes'].sort());
+    expect(longs).toEqual(['--attach', '--config', '--delivery', '--dry-run', '--github-token-stdin', '--new-identity', '--no-attach-coordinator', '--private', '--profile', '--shared', '--telegram-token-stdin', '--yes'].sort());
     for (const o of cmd.options.filter((x) => /token/.test(x.long ?? ''))) expect(o.required || o.optional).toBe(false);
   });
 
@@ -292,5 +293,110 @@ describe('install.sh', () => {
     const sh = readFileSync(join(import.meta.dirname, '..', '..', 'install.sh'), 'utf8');
     expect(sh).toMatch(/^exec minions setup "\$target" "\$@"$/m);
     expect(sh).not.toMatch(/exec minions init/);
+  });
+});
+
+describe('minions setup: init options (--config, --attach, --new-identity)', () => {
+  const writeCfg = async (name: string, mutate: (c: Record<string, any>) => void = () => {}) => {
+    const { writeFileSync } = await import('node:fs');
+    const cfg = profileDefaults('supervised', { hasGitHub: true, baseBranch: 'main', identity: { name: 'A', email: 'a@b' }, projectId: '00000000-0000-4000-8000-000000000000', packageVersion: '0.1.0' }).config as unknown as Record<string, any>;
+    mutate(cfg);
+    const file = join(env.root, name);
+    writeFileSync(file, JSON.stringify(cfg));
+    return file;
+  };
+
+  it('--config skips the init wizard and the questions the file covers; token questions are still asked', async () => {
+    const repo = githubRepo();
+    const cfg = await writeCfg('cfg.json');
+    const a = scripted({ 'Set up GitHub integration': 'n', 'Use CI?': 'n' });
+    const r = await runSetup({ path: repo, yes: false, io: a.io, visibility: 'private', configFile: cfg, runtime: fakeRuntime().runtime, dockerProbe: dockerUp });
+    expect(r.init.plan.profile).toBe('supervised');
+    expect(step(r, 'init').status).toBe('done');
+    for (const q of ['Installation visibility', 'Starting profile', 'Project configuration', 'Delivery mode', 'Set up Telegram', 'Communication channel']) {
+      expect(a.asked.some((x) => x.startsWith(q)), q).toBe(false);
+    }
+    expect(a.asked.some((x) => x.startsWith('Set up GitHub integration'))).toBe(true);
+    expect(step(r, 'telegram').status).toBe('skipped');
+
+    // Rerun with a changed file: applied without the keep/change question.
+    const cfg2 = await writeCfg('cfg2.json', (c) => { c.execution.maxEngineers = 1; });
+    const b = scripted({ 'Set up GitHub integration': 'n' });
+    const again = await runSetup({ path: repo, yes: false, io: b.io, configFile: cfg2, runtime: fakeRuntime().runtime, dockerProbe: dockerUp });
+    expect(again.rerun).toBe(true);
+    expect(again.projectId).toBe(r.projectId);
+    expect(step(again, 'init').status).toBe('changed');
+    expect(b.asked.some((x) => x.startsWith('Project configuration'))).toBe(false);
+    expect(JSON.parse(readFileSync(projectPaths(r.projectId).configJson, 'utf8')).execution.maxEngineers).toBe(1);
+  });
+
+  it('--yes --config applies the file non-interactively', async () => {
+    const repo = githubRepo();
+    const r = await runSetup({ path: repo, yes: true, visibility: 'private', configFile: await writeCfg('cfg.json'), runtime: fakeRuntime().runtime, dockerProbe: dockerUp });
+    expect(r.init.plan.profile).toBe('supervised');
+  });
+
+  it('--new-identity and --attach are forwarded to init for a copied shared identity', async () => {
+    const { cpSync } = await import('node:fs');
+    const a = githubRepo('a');
+    const ra = await runSetup({ path: a, yes: true, visibility: 'shared', runtime: fakeRuntime().runtime, dockerProbe: dockerUp });
+    git(a, 'add', '.minions'); git(a, 'commit', '-q', '-m', 'minions');
+    const b = join(env.root, 'b');
+    cpSync(a, b, { recursive: true });
+    await expect(runSetup({ path: b, yes: true, runtime: fakeRuntime().runtime, dockerProbe: dockerUp })).rejects.toMatchObject({ code: 'CONFLICT' });
+    const rb = await runSetup({ path: b, yes: true, newIdentity: true, runtime: fakeRuntime().runtime, dockerProbe: dockerUp });
+    expect(rb.projectId).not.toBe(ra.projectId);
+    const c = join(env.root, 'c');
+    cpSync(a, c, { recursive: true });
+    const rc = await runSetup({ path: c, yes: true, attach: true, runtime: fakeRuntime().runtime, dockerProbe: dockerUp });
+    expect(rc.projectId).toBe(ra.projectId);
+    expect((await loadRegistry()).projects[ra.projectId]!.repoPath).toBe(c);
+  });
+
+  it('the CLI accepts the install.sh passthrough `path --config cfg.json --attach --new-identity`', () => {
+    const program = new Command();
+    register(program);
+    const cmd = program.commands.find((x) => x.name() === 'setup')!;
+    cmd.exitOverride();
+    cmd.action(() => {});
+    cmd.parse(['/tmp/x', '--config', 'cfg.json', '--attach', '--new-identity', '--no-attach-coordinator'], { from: 'user' });
+    expect(cmd.opts()).toMatchObject({ config: 'cfg.json', attach: true, newIdentity: true, attachCoordinator: false });
+  });
+});
+
+describe('minions setup: empty piped tokens', () => {
+  it.each([
+    [{ github: '' }, /--github-token-stdin: no GitHub token .*empty/, /first line/],
+    [{ github: '   ' }, /--github-token-stdin/, /first line/],
+    [{ telegram: '' }, /--telegram-token-stdin: no Telegram token .*empty/, /first line/],
+    [{ github: GH_TOKEN, telegram: '' }, /--telegram-token-stdin/, /second line/],
+  ])('%j fails before anything is written and does not echo the input', async (tokens, message, hint) => {
+    const repo = githubRepo();
+    const rt = fakeRuntime();
+    const e = await runSetup({ path: repo, yes: true, visibility: 'private', tokens, runtime: rt.runtime, dockerProbe: dockerUp }).then(() => null, (x: unknown) => x as { code: string; message: string; hint?: string });
+    expect(e).toMatchObject({ code: 'PRECONDITION', message: expect.stringMatching(message), hint: expect.stringMatching(hint) });
+    expect(JSON.stringify(e)).not.toContain(GH_TOKEN);
+    expect(rt.calls).toEqual([]);
+    expect(allFiles(env.home)).toEqual([]);
+  });
+
+  it('the CLI exits non-zero on empty stdin with --yes --github-token-stdin', async () => {
+    const { Readable } = await import('node:stream');
+    const exit = vi.spyOn(process, 'exit').mockImplementation(((code?: number) => { throw new Error(`exit ${code}`); }) as never);
+    const err = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const repo = githubRepo();
+    vi.stubEnv('MINIONS_RUNTIME', 'host');
+    const stdin = Object.assign(Readable.from(['']), { isTTY: false });
+    vi.spyOn(process, 'stdin', 'get').mockReturnValue(stdin as unknown as typeof process.stdin);
+    try {
+      const program = new Command();
+      register(program);
+      await expect(program.parseAsync(['setup', repo, '--yes', '--private', '--github-token-stdin'], { from: 'user' })).rejects.toThrow(/^exit [1-9]/);
+      expect(exit).toHaveBeenCalledTimes(1);
+      expect(err.mock.calls.map((c) => String(c[0])).join('')).toContain('no GitHub token was read from stdin');
+      expect(allFiles(env.home)).toEqual([]);
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 });

@@ -163,32 +163,39 @@ export function register(program: Command): void {
     .addOption(new Option('--delivery <mode>', 'delivery mode (branch/pull-request need a stored GitHub token)').choices([...DELIVERY_MODES]))
     .option('--github-token-stdin', 'read the GitHub token from the first line of piped stdin')
     .option('--telegram-token-stdin', 'read the Telegram bot token from piped stdin (second line when combined with --github-token-stdin)')
-    .option('--no-attach', 'do not offer to attach the coordinator at the end')
-    .action(action(async (path: string | undefined, o: { profile?: Profile; private?: boolean; shared?: boolean; yes?: boolean; dryRun?: boolean; delivery?: DeliveryMode; githubTokenStdin?: boolean; telegramTokenStdin?: boolean; attach: boolean }, cmd: Command) => {
+    // Same semantics as `minions init` (install.sh passes init options through to setup).
+    .option('--config <file>', 'use a validated config file instead of the init wizard (skips the questions it covers)')
+    .option('--attach', 'attach this repository to the project id in .minions/config.json')
+    .option('--new-identity', 'create a new project identity for this repository')
+    .option('--no-attach-coordinator', 'do not offer to attach the coordinator at the end')
+    .action(action(async (path: string | undefined, o: { profile?: Profile; private?: boolean; shared?: boolean; yes?: boolean; dryRun?: boolean; delivery?: DeliveryMode; githubTokenStdin?: boolean; telegramTokenStdin?: boolean; config?: string; attach?: boolean; newIdentity?: boolean; attachCoordinator: boolean }, cmd: Command) => {
       requireMode('host');
       const { json } = globalOpts(cmd);
       if (o.private && o.shared) throw new MinionsError('INVALID_CONFIG', '--private and --shared are mutually exclusive.');
       const piped = !!(o.githubTokenStdin || o.telegramTokenStdin);
       const interactive = !o.yes && !o.dryRun && !json && !piped && !!process.stdin.isTTY;
-      if (!o.yes && !o.dryRun && !interactive) {
-        throw new MinionsError('PRECONDITION', 'setup needs a terminal for its questions.', 'Pass --yes to accept the defaults (tokens can be piped with --github-token-stdin / --telegram-token-stdin), or --dry-run.');
+      // Like init, --config is a non-interactive alternative to --yes (token questions then need stdin).
+      if (!o.yes && !o.config && !o.dryRun && !interactive) {
+        throw new MinionsError('PRECONDITION', 'setup needs a terminal for its questions.', 'Pass --yes to accept the defaults or --config <file> (tokens can be piped with --github-token-stdin / --telegram-token-stdin), or --dry-run.');
       }
       const target = resolvePath(path ?? '.');
       let tokens: { github?: string; telegram?: string } | undefined;
       if (piped && !o.dryRun) {
         const lines = await readStdinLines(o.githubTokenStdin && o.telegramTokenStdin ? 2 : 1);
-        tokens = o.githubTokenStdin ? { github: lines[0], ...(o.telegramTokenStdin ? { telegram: lines[1] } : {}) } : { telegram: lines[0] };
+        // A missing line is an empty token: runSetup rejects it instead of silently skipping the step.
+        tokens = o.githubTokenStdin ? { github: lines[0] ?? '', ...(o.telegramTokenStdin ? { telegram: lines[1] ?? '' } : {}) } : { telegram: lines[0] ?? '' };
       }
       const io = interactive ? readlineIO() : undefined;
       try {
         const r = await runSetup({
           path: target, profile: o.profile, visibility: o.private ? 'private' : o.shared ? 'shared' : undefined,
           yes: !interactive, dryRun: o.dryRun, io, delivery: o.delivery, tokens, runtime: setupRuntime(json, target),
+          configFile: o.config ? resolvePath(o.config) : undefined, attach: o.attach, newIdentity: o.newIdentity,
         });
         emit(r, { json, human: formatSetup });
         if (r.steps.some((s) => s.status === 'failed')) process.exitCode = 1;
         // The coordinator is a TUI in tmux: attaching needs a terminal (compose exec allocates a TTY).
-        if (r.ready && interactive && o.attach && process.stdout.isTTY && io && /^y(es)?$/i.test(await io.ask('Attach to the coordinator now? (y/n)', 'y'))) {
+        if (r.ready && interactive && o.attachCoordinator && process.stdout.isTTY && io && /^y(es)?$/i.test(await io.ask('Attach to the coordinator now? (y/n)', 'y'))) {
           io.close?.();
           say(json, 'Attaching the coordinator (tmux session "coordinator"; detach with Ctrl-b d). On first start, log in to Claude with /login.');
           process.exitCode = await new Compose(r.projectId).execInherit(['minions', 'coordinator'], { tty: true });

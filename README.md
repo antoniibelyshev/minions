@@ -404,7 +404,7 @@ There is no default production credential injection and no deployment authority.
 
 | Command | Purpose |
 | - | - |
-| `minions setup [path]` | Guided end-to-end setup: init wizard, GitHub token and delivery mode, CI guidance, auto-merge (not available yet), Telegram, container start, import, coordinator launch, attach and pairing instructions (`--yes`, `--dry-run`, `--delivery`, `--github-token-stdin`, `--telegram-token-stdin`, `--no-attach`) |
+| `minions setup [path]` | Guided end-to-end setup: init wizard, GitHub token and delivery mode, CI guidance, auto-merge (not available yet), Telegram, container start, import, coordinator launch, attach and pairing instructions (`--yes`, `--dry-run`, `--delivery`, `--github-token-stdin`, `--telegram-token-stdin`, `--no-attach-coordinator`; `--config`, `--attach`, `--new-identity` as for `init`) |
 | `minions init [path]` | Inspect and initialize a project (`--private` / `--shared`, `--yes`, `--dry-run`) |
 | `minions doctor` | Check tools, Docker, image, container, Claude auth, backlog CLI, and deferred features |
 | `minions start` | Build the image if needed, start the container, import the repo, attach the coordinator (`--no-attach`) |
