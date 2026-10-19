@@ -218,6 +218,8 @@ v0.1 supports `local`, `branch`, and `pull-request` delivery. `auto-when-eligibl
 
 **Branch and pull-request delivery (v0.1).** Set `delivery.provider` to `"github"` and `delivery.mode` to `"branch"` or `"pull-request"`. The init wizard offers these only when the repository has a GitHub remote and a token is stored (`minions auth github`); otherwise it keeps `local` and says why. When the reviewer approves, `minions work record` pushes exactly the approved commit to `agent/<slug>` on origin and, in `pull-request` mode, opens one PR against the base branch. The task becomes `delivered` with the PR URL recorded. If publication fails (network, credential, permission), the task is `blocked`, the local branch is kept, and `minions work publish <taskId>` retries; reruns reuse an existing remote branch or PR instead of duplicating it. If the change touches a sensitive path (or `git.push` / `pr.create` is `ask`), nothing is pushed until you approve that exact commit with `minions work approve <taskId> --head <sha>`. PR text comes only from the task title, objective, and acceptance criteria; private installations add nothing else.
 
+**CI awareness (v0.1, read-only).** `minions sync` refreshes the state and check results of every task's PR in one pass (no polling loop): it records the CI observation (`awaiting-ci`, `passing`, `failing`, or `no-checks`) against the PR head, adds a task note when it changes, marks merged PRs `done`, and marks PRs closed without merging `blocked`. `minions doctor` reports whether the base branch requires status checks (branch protection or rulesets) as `ci.requiredChecks`, compared with `delivery.requiredChecksConfigured`. A project without CI can still use local work and pull-request delivery, but not automatic merge. When CI or required checks are missing, `minions init`, `minions doctor`, and `minions ci status` print the manual setup steps. minions never creates workflows or changes branch protection.
+
 **Evidence is tied to commits.** Test results, the review verdict, local checks, and CI observations are recorded against a head SHA and a config revision. A new commit invalidates stale evidence.
 
 **Approvals need a real second identity.** A native approving GitHub review requires an author and a reviewer with different identities. Two Claude sessions or two tokens for the same user don't count. The `project-owner` profile supports two GitHub Apps, one for development and one for review, and you remain a third identity for sensitive approvals. The `personal-work` profile adopts your existing approved credentials and review process.
@@ -398,6 +400,8 @@ There is no default production credential injection and no deployment authority.
 | `minions start` | Build the image if needed, start the container, import the repo, attach the coordinator (`--no-attach`) |
 | `minions down` | Stop and remove the project container; volumes are kept |
 | `minions status` | Queue, workers, pause state, config revision, delivery mode |
+| `minions sync [taskIds...]` | Refresh PR state and CI check results for tasks with a PR; reconcile merged/closed PRs (read-only on GitHub) |
+| `minions ci status` | Required status checks on the base branch and the external CI setup plan (read-only) |
 | `minions pause` / `resume` | Persist scheduling controls |
 | `minions import` | Refresh the container workspace from the committed base branch (Git bundle) |
 | `minions export` | Fetch `agent/*` branches into `refs/remotes/minions/*` in your repository; local branches are untouched |
