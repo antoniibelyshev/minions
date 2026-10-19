@@ -312,3 +312,54 @@ describe('gh wrapper (docker/gh-wrapper.sh)', () => {
     expect(execFileSync('sh', ['-n', script], { encoding: 'utf8' })).toBe('');
   });
 });
+
+describe('tester edge cases', () => {
+  it('credential helper answers a request without the trailing blank line, with CRLF, and a path-scoped request', async () => {
+    const file = tokenFile(`${TOKEN}\n\n`);
+    const want = { stdout: `username=x-access-token\npassword=${TOKEN}\n` };
+    expect(await gitCredential('get', 'protocol=https\nhost=github.com', { tokenFile: file })).toEqual(want);
+    expect(await gitCredential('get', 'protocol=https\r\nhost=github.com\r\n\r\n', { tokenFile: file })).toEqual(want);
+    expect(await gitCredential('get', 'protocol=https\nhost=github.com\npath=acme/app.git\nusername=bob\n\n', { tokenFile: file })).toEqual(want);
+    expect(await gitCredential('get', '', { tokenFile: file })).toEqual({ stdout: '' });
+  });
+
+  it('helper stderr never contains the token for any token state', async () => {
+    for (const content of [undefined, '', `${TOKEN} x`, 'junk']) {
+      const r = await gitCredential('get', 'protocol=https\nhost=github.com\n\n', { tokenFile: tokenFile(content) });
+      expect(r.stdout).toBe('');
+      expect(`${r.stderr ?? ''}`).not.toContain(TOKEN);
+    }
+  });
+
+  it('hostile recorded origins are never normalized, fetched or given the helper, even with a credential', async () => {
+    const file = tokenFile(TOKEN);
+    for (const url of [
+      'ext::sh -c touch% /tmp/pwn', 'file:///etc', '--upload-pack=touch /tmp/pwn', '-f',
+      'https://github.com.evil.io/o/r.git', 'https://evil.io/github.com/o/r.git', 'https://github.com@evil.io/o/r.git',
+      'https://u:p@evil.io/o/r.git', 'https://github.com/../r', 'https://github.com/o/r.git --upload-pack=x',
+    ]) {
+      const g = mockGit();
+      const r = await configureOrigin('/repo', { remoteUrl: url, base: 'main', tokenFile: file, git: g.fn });
+      expect(r, url).toBeNull();
+      expect(g.calls.some((c) => c[0] === 'fetch' || c[0] === 'config'), url).toBe(false);
+      expect(JSON.stringify(g.calls)).not.toContain(TOKEN);
+    }
+  });
+
+  it('embedded credentials in a github URL never survive normalization', () => {
+    expect(normalizeGithubRemote('https://user:pw@github.com/o/r.git')).toBe('https://github.com/o/r.git');
+    expect(normalizeGithubRemote('https://x-access-token:ghp_secret@github.com/o/r')).toBe('https://github.com/o/r.git');
+  });
+
+  it('the CLI helper reads stdin, writes the token only to stdout, ignores store, and exits 0', () => {
+    const cli = resolve(fileURLToPath(new URL('../../dist/cli.js', import.meta.url)));
+    if (!existsSync(cli)) return;
+    const run = (op: string) => spawnSync(process.execPath, [cli, 'git-credential', op], { input: 'protocol=https\nhost=github.com\n\n', encoding: 'utf8', env: { ...process.env, MINIONS_MODE: 'container' } });
+    const store = run('store');
+    expect(store.status).toBe(0);
+    expect(store.stdout).toBe('');
+    const get = run('get');
+    expect(get.status).toBe(0);
+    expect(get.stdout).not.toContain('password=');
+  });
+});
