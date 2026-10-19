@@ -125,6 +125,16 @@ export interface InitOptions {
   attach?: boolean;
   newIdentity?: boolean;
   io?: WizardIO;
+  /**
+   * `minions setup`: the wizard skips the delivery/channel questions and init does not offer the
+   * GitHub/Telegram token prompts; setup asks for them itself after the plan is applied.
+   */
+  skipIntegrations?: boolean;
+  /**
+   * Rerun with an existing configuration: run the wizard again with the existing values as defaults
+   * (visibility stays as installed) instead of reusing the configuration unchanged.
+   */
+  reconfigure?: boolean;
   dockerProbe?: DockerProbe;
   runner?: Runner;
   /** GitHub API client for token verification (tests). */
@@ -214,7 +224,8 @@ async function prepare(opts: InitOptions): Promise<Prepared> {
   if (visibility === 'shared' && sharedExists) { existingRaw = await readJsonIfExists(sharedPath); existingFile = sharedPath; }
   else if (visibility !== 'shared' && await exists(paths.configJson)) { existingRaw = await readJsonIfExists(paths.configJson); existingFile = paths.configJson; }
 
-  let config: MinionsConfig;
+  let config!: MinionsConfig;
+  const reconfigure = !!opts.reconfigure && !!existingRaw && !opts.configFile && !opts.yes;
   if (existingRaw && !opts.configFile) {
     const profile = (existingRaw.profile as Profile | undefined) ?? 'project-owner';
     const ctx = {
@@ -227,18 +238,21 @@ async function prepare(opts: InitOptions): Promise<Prepared> {
         'Run `git config user.name "…"` and `git config user.email "…"`, then rerun init.');
     }
     config = resolveEffective(ctx, { ...existingRaw, projectId }, undefined, { project: existingFile! }).config;
-    if (opts.profile && opts.profile !== config.profile) {
+    if (opts.profile && opts.profile !== config.profile && !reconfigure) {
       warnings.push(`--profile ${opts.profile} ignored: existing configuration uses ${config.profile}; edit ${existingFile} to change it.`);
     }
     notes.push(`Reusing existing configuration ${existingFile}.`);
-  } else {
+  }
+  if (!existingRaw || opts.configFile || reconfigure) {
     // Branch/PR delivery is selectable only when a GitHub token is already stored for this project.
     const githubCredential = discovery.git.hasGitHub &&
       !!(await loadCredentialRefs(projectId).catch((): CredentialsJson => ({ version: 1 }))).github;
     const r = await runWizard({
-      discovery, projectId, profile: opts.profile, visibility, configFile: opts.configFile,
-      yes: !!opts.yes, io: opts.io, githubCredential,
+      discovery, projectId, profile: opts.profile, visibility: reconfigure ? visibility ?? config.visibility : visibility, configFile: opts.configFile,
+      yes: !!opts.yes, io: opts.io, githubCredential, skipIntegrations: opts.skipIntegrations,
+      ...(reconfigure ? { existing: config } : {}),
     });
+    if (reconfigure) notes.splice(notes.indexOf(`Reusing existing configuration ${existingFile}.`), 1, `Reconfigured ${existingFile} (previous values were the defaults).`);
     config = r.config;
     notes.push(...r.notes);
   }
@@ -280,7 +294,7 @@ async function prepare(opts: InitOptions): Promise<Prepared> {
   let sharedConfigDesired = false;
   if (vis === 'shared') {
     const rp = repoPaths(repoPath);
-    if (!sharedExists || identity.replacesSharedId || opts.configFile) { add(rp.configJson, json(projectLayer)); sharedConfigDesired = true; }
+    if (!sharedExists || identity.replacesSharedId || opts.configFile || reconfigure) { add(rp.configJson, json(projectLayer)); sharedConfigDesired = true; }
     add(rp.readme, sharedReadme());
   }
 
@@ -296,9 +310,9 @@ async function prepare(opts: InitOptions): Promise<Prepared> {
     if (cur === undefined) action = 'create';
     else if (cur === want) action = recorded === want ? 'unchanged' : 'adopt';
     else if (recorded === undefined) {
-      const explicit = d.path === repoPaths(repoPath).configJson && sharedConfigDesired && (identity.replacesSharedId || opts.configFile);
+      const explicit = d.path === repoPaths(repoPath).configJson && sharedConfigDesired && (identity.replacesSharedId || opts.configFile || reconfigure);
       action = explicit ? 'update' : 'conflict';
-      note = explicit ? 'explicitly requested (--new-identity/--config)' : 'exists and is not owned by minions; not overwritten';
+      note = explicit ? 'explicitly requested (--new-identity/--config/reconfigure)' : 'exists and is not owned by minions; not overwritten';
     } else if (recorded === cur) action = 'update';
     else { action = 'drift'; note = 'edited since generation; left unchanged — reconcile manually (or delete it and rerun init)'; }
     writes.push({ path: d.path, action, inRepo: d.inRepo, sha256: want, ...(note ? { note } : {}) });
@@ -563,8 +577,8 @@ export async function runInit(opts: InitOptions): Promise<InitResult> {
     if (!after.daemon || !after.compose) throw dockerUnavailable(after);
     // The secrets directory must exist: compose bind-mounts it with create_host_path: false.
     await ensureDir(projectPaths(plan.projectId).secretsDir, 0o700);
-    const github = await offerGithubToken(opts, plan);
-    const telegram = await offerTelegramToken(opts, plan);
+    const github = opts.skipIntegrations ? undefined : await offerGithubToken(opts, plan);
+    const telegram = opts.skipIntegrations ? undefined : await offerTelegramToken(opts, plan);
     const tgReady = telegram?.status === 'stored' || telegram?.status === 'present';
     return {
       dryRun: false, plan, applied, docker: after, ...(github ? { github } : {}), ...(telegram ? { telegram } : {}),

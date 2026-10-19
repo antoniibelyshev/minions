@@ -94,6 +94,11 @@ export interface WizardInput {
   githubCredential?: boolean;
   /** --yes: accept defaults. */
   yes: boolean;
+  /**
+   * `minions setup`: the delivery-mode, channel and token questions are asked by setup after the
+   * plan is applied (it needs the project id to store tokens), so the wizard skips them here.
+   */
+  skipIntegrations?: boolean;
   io?: WizardIO;
 }
 
@@ -219,7 +224,9 @@ export async function runWizard(input: WizardInput): Promise<WizardResult> {
       'Start ready tasks automatically? (n = only tasks labelled minions:authorized)', cfg.intake.startReady ? 'y' : 'n', yesNo);
     // 5. Publication and merge authority.
     const blocked = deliveryBlockedReason(cfg, input);
-    if (blocked) {
+    if (input.skipIntegrations) {
+      io.info('Delivery, GitHub and Telegram: asked by `minions setup` after this plan is applied.');
+    } else if (blocked) {
       io.info(`Delivery: local commits on agent/<slug> branches, fetched with \`minions export\`. Branch push and pull requests are not selectable: ${blocked}. Auto-merge ${NA}.`);
     } else {
       io.info(`Delivery: local (commits stay in the container; \`minions export\`), branch (push agent/<slug> to origin), or pull-request (push and open a PR against ${cfg.git.baseBranch}). minions never merges; auto-merge ${NA}.`);
@@ -227,9 +234,12 @@ export async function runWizard(input: WizardInput): Promise<WizardResult> {
       cfg.delivery.provider = cfg.delivery.mode === 'local' ? cfg.delivery.provider : 'github';
     }
     // 6. Communication. Terminal is always available; Telegram is optional and degrades to terminal.
-    io.info('Communication: terminal (always available), or Telegram through the official Claude Code channel plugin (research preview).');
-    let channel = await ask('communication.channel', 'Communication channel (terminal/telegram)', cfg.communication.channel, choice(['terminal', 'telegram'] as const));
-    if (channel === 'telegram') {
+    let channel = cfg.communication.channel;
+    if (!input.skipIntegrations) {
+      io.info('Communication: terminal (always available), or Telegram through the official Claude Code channel plugin (research preview).');
+      channel = await ask('communication.channel', 'Communication channel (terminal/telegram)', cfg.communication.channel, choice(['terminal', 'telegram'] as const));
+    }
+    if (channel === 'telegram' && !input.skipIntegrations) {
       for (const l of telegramBotGuidance()) io.info(`  ${l}`);
       if (cfg.container.network === 'none') {
         const why = 'Telegram is unavailable: container.network is none, and the plugin needs api.telegram.org and the npm registry. Using terminal.';
@@ -244,7 +254,7 @@ export async function runWizard(input: WizardInput): Promise<WizardResult> {
     cfg.communication.channel = channel;
     // 7. Credentials — no secret is requested by these questions.
     io.info('Credentials: log in to Claude inside the container (/login) on first `minions start`; host login is not reused.');
-    io.info(d.git.hasGitHub
+    if (!input.skipIntegrations) io.info(d.git.hasGitHub
       ? 'GitHub token: after the plan is applied you can store a fine-grained token (entered without echo, kept in the Keychain or a 0600 host file), or later with `minions auth github`.'
       : 'GitHub token: not needed (no GitHub remote); `minions auth github` can store one later.');
   }

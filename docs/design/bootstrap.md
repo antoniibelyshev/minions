@@ -181,6 +181,50 @@ Decision record for required-checks readiness, `minions sync` and CI setup guida
   moved. A PR head differing from the approved publication head is reported as a warning. Per-task gh
   failures are reported and the command exits 1; nothing is thrown away.
 
+## Guided setup
+
+Decision record for `minions setup` (`src/host/setup.ts`).
+
+- **One command, existing code.** `setup` runs `runInit` (wizard, plan, apply) with `skipIntegrations`:
+  the wizard skips its delivery, channel, and token questions, and init does not offer the token prompts.
+  Setup then asks them in order: GitHub (token via `provisionGithubToken`, then delivery mode), CI
+  (read-only `requiredChecksStatus` with the stored token, plus `ciSetupPlan`), auto-merge (shown as
+  not available yet, default no, nothing written), and Telegram (`provisionTelegramToken`, pairing
+  instructions). Container start, import, and coordinator launch reuse the `minions start` code
+  (`ensureUp`, `importRepo`, Telegram plugin install, and `coordinator sync --start-detached`) through
+  the `SetupRuntime` seam, which tests replace with a fake.
+- **Where choices go.** Integration choices that differ from the project configuration
+  (`delivery.mode`/`delivery.provider`, `communication.channel`) are written to the host-only
+  `config.local.json`. They are never written into the shared `.minions/config.json`, because a token is
+  personal and another clone may not have one. After a change, setup reruns `runInit --yes`, the same
+  path as a rerun of init, so the plugin and runtime config are regenerated with the new layer.
+- **Defaults.** Optional integrations (GitHub, CI, auto-merge, Telegram) default to no. Core steps
+  (apply the plan, start the container, import, launch, attach) default to yes. `--yes` takes the
+  defaults. A token piped with `--github-token-stdin` / `--telegram-token-stdin` enables that
+  integration; an empty piped token is an error (non-zero exit, nothing changed). `--delivery` is
+  honoured only when it is selectable.
+- **Init options.** `--config <file>`, `--attach` and `--new-identity` are forwarded to `runInit` with
+  the same semantics as `minions init`, so `./install.sh path --config cfg.json` keeps working. With
+  `--config` the init wizard, the keep/change question, the delivery-mode question and the
+  "Set up Telegram?" question are skipped (the file sets `delivery.mode` and
+  `communication.channel`); token questions are still asked in a terminal, and like init, `--config`
+  works without a terminal. The coordinator-attach opt-out is `--no-attach-coordinator` because
+  `--attach` has init's meaning.
+- **Idempotent rerun.** Setup detects the registered project and offers keep or change (change reruns
+  the wizard with the existing values as defaults; visibility stays as installed). For a stored GitHub
+  token it offers keep, change, or remove. For Telegram it offers keep, change, or disable. A running
+  container is reused, and an imported repository is kept unless you ask to import again. Keeping
+  every answer writes nothing.
+- **Unknown required checks.** `ciSetupPlan` treats `hasWorkflows: null` as missing, so setup always
+  passes a boolean: local `.github/workflows` files, or GitHub's workflow count when that is readable.
+  Required checks that cannot be read (no token, API error) are reported as `unknown`, never as `none`,
+  and the plan is labelled conditional.
+- **Never.** Setup never writes workflow files, never changes branch protection, never sets
+  `delivery.requiredChecksConfigured`, and never enables auto-merge. Secrets are read only through the
+  non-echoing prompt or stdin. They never come from argv and never appear in output, notes, or prompts.
+  Setup cannot approve Telegram pairing; it prints the `/telegram:access` steps for the coordinator
+  terminal.
+
 ## Telegram bot token
 
 A second credential kind on the same mechanism (`CredentialKind` in `src/host/credentials.ts`;
