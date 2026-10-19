@@ -1,7 +1,9 @@
 // Init wizard (spec §7). Questions are prefilled from the profile, an existing config, and discovery.
 // Questions whose answer cannot change v0.1 behaviour are shown as information only, with the
-// deferred options marked "(not available in v0.1)". Never asks for secrets.
-import { createInterface } from 'node:readline/promises';
+// deferred options marked "(not available in v0.1)". The wizard questions never ask for secrets;
+// the only secret prompt (GitHub token, after the plan is applied) goes through `secret()`, which
+// reads from the host terminal without echo.
+import { createInterface, type Interface } from 'node:readline/promises';
 import { profileDefaults } from '../config/profiles.js';
 import { validateConfig } from '../config/resolve.js';
 import { PROFILES, type MinionsConfig, type Profile } from '../config/schema.js';
@@ -13,20 +15,68 @@ import type { Discovery } from './discovery.js';
 export interface WizardIO {
   ask(question: string, defaultValue: string): Promise<string>;
   info(line: string): void;
+  /** Non-echoing secret prompt on the host terminal. Absent when no TTY is available. */
+  secret?(prompt: string): Promise<string>;
   close?(): void;
 }
 
 /** Interactive prompts on stderr (stdout stays clean for --json). */
 export function readlineIO(): WizardIO {
-  const rl = createInterface({ input: process.stdin, output: process.stderr });
+  let rl: Interface | null = createInterface({ input: process.stdin, output: process.stderr });
+  const get = () => (rl ??= createInterface({ input: process.stdin, output: process.stderr }));
   return {
     async ask(question, def) {
-      const a = (await rl.question(`${question}${def ? ` [${def}]` : ''}: `)).trim();
+      const a = (await get().question(`${question}${def ? ` [${def}]` : ''}: `)).trim();
       return a || def;
     },
     info: (line) => process.stderr.write(line + '\n'),
-    close: () => rl.close(),
+    ...(process.stdin.isTTY ? {
+      async secret(prompt: string) {
+        // readline would echo; close it while reading raw keystrokes, reopen lazily afterwards.
+        rl?.close(); rl = null;
+        return readSecret(prompt);
+      },
+    } : {}),
+    close: () => { rl?.close(); rl = null; },
   };
+}
+
+type SecretInput = Pick<NodeJS.ReadStream, 'isTTY' | 'isRaw' | 'setRawMode' | 'on' | 'removeListener' | 'resume' | 'pause' | 'setEncoding'>;
+
+/**
+ * Reads one line from a TTY in raw mode without echoing it (nothing, not even '*', is written).
+ * Enter finishes, Backspace edits, Ctrl-C / Ctrl-D-on-empty cancel. Escape sequences (arrows,
+ * bracketed paste markers) are dropped.
+ */
+export function readSecret(prompt: string, input: SecretInput = process.stdin, output: Pick<NodeJS.WritableStream, 'write'> = process.stderr): Promise<string> {
+  if (!input.isTTY || typeof input.setRawMode !== 'function') {
+    return Promise.reject(new MinionsError('PRECONDITION', 'A terminal is required to enter a secret without echo.', 'Run in a terminal, or pipe the token with --stdin.'));
+  }
+  output.write(prompt);
+  return new Promise((resolve, reject) => {
+    let buf = '';
+    const wasRaw = !!input.isRaw;
+    const finish = (err?: Error) => {
+      input.removeListener('data', onData);
+      input.setRawMode(wasRaw);
+      input.pause();
+      output.write('\n');
+      if (err) reject(err); else resolve(buf);
+    };
+    const onData = (chunk: Buffer | string) => {
+      const s = String(chunk).replace(/\x1b\[[0-9;]*[A-Za-z~]/g, '').replace(/\x1b./g, '');
+      for (const ch of s) {
+        if (ch === '\r' || ch === '\n') return finish();
+        if (ch === '\u0003' || (ch === '\u0004' && !buf)) return finish(new MinionsError('PRECONDITION', 'Secret entry cancelled; nothing was stored.'));
+        if (ch === '\u007f' || ch === '\b') { buf = buf.slice(0, -1); continue; }
+        if (ch >= ' ') buf += ch;
+      }
+    };
+    input.setEncoding('utf8');
+    input.setRawMode(true);
+    input.on('data', onData);
+    input.resume();
+  });
 }
 
 export interface WizardInput {
@@ -143,9 +193,11 @@ export async function runWizard(input: WizardInput): Promise<WizardResult> {
     io.info(`Delivery: local commits on agent/<slug> branches, fetched with \`minions export\`. Branch push, pull requests, auto-merge ${NA}.`);
     // 6. Communication.
     io.info(`Communication: terminal. Telegram ${NA}.`);
-    // 7. Credentials — none requested here.
+    // 7. Credentials — no secret is requested by these questions.
     io.info('Credentials: log in to Claude inside the container (/login) on first `minions start`; host login is not reused.');
-    io.info(`GitHub credential provisioning ${NA}. minions never asks for secrets in this wizard.`);
+    io.info(d.git.hasGitHub
+      ? 'GitHub token: after the plan is applied you can store a fine-grained token (entered without echo, kept in the Keychain or a 0600 host file), or later with `minions auth github`.'
+      : 'GitHub token: not needed (no GitHub remote); `minions auth github` can store one later.');
   }
   if (!cfg.git.identity.name || !cfg.git.identity.email) {
     if (!interactive) {

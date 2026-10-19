@@ -6,6 +6,7 @@ import { action, globalOpts, requireMode } from '../core/cli-helpers.js';
 import { MinionsError } from '../core/errors.js';
 import { emit } from '../core/output.js';
 import { CONTAINER } from '../core/paths.js';
+import { clearSecrets, githubTokenGuidance, materializeSecrets, provisionGithubToken, removeGithubToken } from './credentials.js';
 import { dockerProbe } from './discovery.js';
 import { Compose, ensureImage } from './docker.js';
 import { formatDoctor, runDoctor } from './doctor.js';
@@ -14,7 +15,7 @@ import { loadEffectiveConfig, loadProjectJson } from './project.js';
 import { projectForPath } from './registry.js';
 import { exportRepo, importRepo } from './transfer.js';
 import { formatUninstall, runUninstall } from './uninstall.js';
-import { readlineIO } from './wizard.js';
+import { readSecret, readlineIO } from './wizard.js';
 
 const say = (json: boolean, msg: string) => { if (!json) process.stderr.write(msg + '\n'); };
 
@@ -32,10 +33,26 @@ async function openProject(json: boolean) {
   return { project, config: eff.config, compose: new Compose(projectId) };
 }
 
+/** Writes the provisioned token into the mounted secrets dir; a store read failure only warns. */
+async function materialize(json: boolean, projectId: string): Promise<void> {
+  try { await materializeSecrets(projectId); } catch (e) {
+    await clearSecrets(projectId).catch(() => {});
+    say(json, `warning: GitHub token not available to the container: ${e instanceof MinionsError ? e.message : 'credential store unreadable'}`);
+  }
+}
+
+async function readStdinSecret(): Promise<string> {
+  if (process.stdin.isTTY) throw new MinionsError('PRECONDITION', '--stdin expects the token on a pipe, not a terminal.', 'Omit --stdin to be prompted without echo.');
+  let data = '';
+  for await (const chunk of process.stdin) { data += String(chunk); if (data.length > 4096) break; }
+  return data.split(/\r?\n/)[0] ?? '';
+}
+
 async function ensureUp(json: boolean) {
   await requireDocker();
   const p = await openProject(json);
   if (await ensureImage(p.project.imageTag, { onBuild: (m) => say(json, m) })) say(json, `Built ${p.project.imageTag}.`);
+  await materialize(json, p.project.projectId);
   await p.compose.up();
   await p.compose.exec(['minions', 'workspace', 'setup', '--json'], { timeoutMs: 120_000 });
   return p;
@@ -122,7 +139,7 @@ export function register(program: Command): void {
       const { json, dryRun } = globalOpts(cmd);
       const { projectId } = await projectForPath(process.cwd());
       const compose = new Compose(projectId);
-      if (!dryRun) { await requireDocker(); await compose.down(); }
+      if (!dryRun) { await requireDocker(); await compose.down(); await clearSecrets(projectId); }
       emit({ projectId, stopped: !dryRun, dryRun }, { json, human: () => dryRun ? `Would stop ${compose.name}.` : `Stopped ${compose.name}; volumes kept.` });
     }));
 
@@ -159,6 +176,43 @@ export function register(program: Command): void {
       emit(r, { json, human: (d: typeof r) => [`Bundle: ${d.bundle}`,
         ...(d.changes.length ? d.changes.map((c) => `  ${c.ref}: ${c.from?.slice(0, 12) ?? '(new)'} -> ${c.to?.slice(0, 12) ?? '(deleted)'}`) : ['  no ref changes']),
         'Local branches and the working tree were not modified.'].join('\n') });
+    }));
+
+  const auth = program.command('auth').description('Provision host-held credentials for this project');
+  auth.command('github')
+    .description('Store a fine-grained GitHub token (prompted without echo; Keychain or a 0600 host file)')
+    .option('--stdin', 'read the token from piped stdin instead of the terminal prompt')
+    .option('--no-verify', 'store without checking the token against the GitHub API')
+    .option('--remove', 'delete the stored token and its reference')
+    .option('--dry-run', 'show the guidance and storage location without prompting')
+    .action(action(async (o: { stdin?: boolean; verify: boolean; remove?: boolean }, cmd: Command) => {
+      requireMode('host');
+      const { json, dryRun } = globalOpts(cmd);
+      const ref = await projectForPath(process.cwd());
+      const project = await loadProjectJson(ref.projectId);
+      if (o.remove) {
+        const r = dryRun ? { removed: false, backend: null } : await removeGithubToken(project.projectId);
+        emit({ projectId: project.projectId, dryRun, ...r }, { json, human: () => dryRun ? 'Would remove the stored GitHub token.'
+          : r.removed ? `Removed the GitHub token (${r.backend}).` : 'No GitHub token was stored.' });
+        return;
+      }
+      const guidance = githubTokenGuidance(project.remoteUrl);
+      if (dryRun) { emit({ projectId: project.projectId, dryRun: true, guidance }, { json, human: () => guidance.join('\n') }); return; }
+      say(json, guidance.join('\n'));
+      // The token is read only here, from the host terminal (no echo) or a pipe; never from argv.
+      const token = o.stdin ? await readStdinSecret()
+        : process.stdin.isTTY ? await readSecret('GitHub token (input hidden): ')
+          : (() => { throw new MinionsError('PRECONDITION', 'No terminal to prompt for the token.', 'Run in a terminal, or pipe it: `minions auth github --stdin < token-file`.'); })();
+      const r = await provisionGithubToken({ projectId: project.projectId, token, repoPath: ref.repoPath, remoteUrl: project.remoteUrl, verify: o.verify });
+      const compose = new Compose(project.projectId);
+      let mounted = false;
+      if (await compose.isRunning().catch(() => false)) { await materialize(json, project.projectId); mounted = true; }
+      emit({ ...r, mountedPath: CONTAINER.githubTokenFile, visibleInRunningContainer: mounted }, { json, human: () => [
+        `Stored the GitHub token in ${r.backend === 'keychain' ? 'the macOS Keychain' : 'a 0600 host file'} (${r.ref}).`,
+        r.verification ? `Verification: ${r.verification.status} — ${r.verification.detail}` : 'Verification skipped (--no-verify).',
+        ...r.warnings.map((w) => `warning: ${w}`),
+        mounted ? `Updated ${CONTAINER.githubTokenFile} in the running container.` : `It is mounted read-only at ${CONTAINER.githubTokenFile} on the next \`minions start\`.`,
+      ].join('\n') });
     }));
 
   const config = program.command('config').description('Inspect configuration');

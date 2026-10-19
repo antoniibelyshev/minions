@@ -4,6 +4,7 @@ import { isMinionsError } from '../core/errors.js';
 import { run } from '../core/exec.js';
 import { redact } from '../core/output.js';
 import { VERSION } from '../core/version.js';
+import { githubCredentialStatus, githubRepoFromRemote, type CredentialStatus, type Fetch } from './credentials.js';
 import { dockerProbe, type DockerProbe } from './discovery.js';
 import { Compose, buildFingerprint, imageBuildLabel, type Runner } from './docker.js';
 import { loadEffectiveConfig, loadProjectJson } from './project.js';
@@ -20,7 +21,25 @@ export function nodeVersionOk(v: string): boolean {
   return maj > 22 || (maj === 22 && min >= 13);
 }
 
-export async function runDoctor(opts: { cwd: string; runner?: Runner; probe?: DockerProbe }): Promise<DoctorReport> {
+/** github.credential: ok / missing / invalid (/ unverified when the API is unreachable). Never includes the token. */
+async function githubCheck(project: { projectId: string; remoteUrl: string | null }, runner: Runner, f?: Fetch): Promise<[string, CheckStatus, string, string?]> {
+  const name = 'github.credential';
+  const onGitHub = githubRepoFromRemote(project.remoteUrl) !== null;
+  let s: CredentialStatus;
+  try { s = await githubCredentialStatus(project, { runner, fetch: f }); } catch (e) {
+    return [name, 'warn', `invalid: could not check (${short(String((e as Error).message ?? e))})`, 'Run `minions auth github` to store the token again.'];
+  }
+  switch (s.state) {
+    case 'ok': return [name, 'ok', `ok: ${s.detail}`];
+    case 'missing': return onGitHub
+      ? [name, 'warn', `missing: ${s.detail}`, 'Run `minions auth github` (needed for upcoming push/PR delivery).']
+      : [name, 'ok', 'missing: not needed (no GitHub remote)'];
+    case 'invalid': return [name, 'fail', `invalid: ${s.detail}`, 'Create a new fine-grained token and run `minions auth github`.'];
+    case 'unverified': return [name, 'warn', `unverified: ${s.detail}`, 'Check network access to api.github.com and rerun doctor.'];
+  }
+}
+
+export async function runDoctor(opts: { cwd: string; runner?: Runner; probe?: DockerProbe; fetch?: Fetch }): Promise<DoctorReport> {
   const runner = opts.runner ?? run;
   const checks: Check[] = [];
   const add = (name: string, status: CheckStatus, detail: string, hint?: string) => checks.push({ name, status, detail, ...(hint ? { hint } : {}) });
@@ -47,6 +66,7 @@ export async function runDoctor(opts: { cwd: string; runner?: Runner; probe?: Do
     } catch (e) {
       add('config', 'fail', isMinionsError(e) ? e.message : String(e), 'Fix the configuration file, then rerun doctor.');
     }
+    add(...await githubCheck(project, runner, opts.fetch));
 
     if (docker.daemon && docker.compose) {
       const label = await imageBuildLabel(project.imageTag, runner);

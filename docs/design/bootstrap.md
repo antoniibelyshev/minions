@@ -9,7 +9,7 @@ reported as unavailable by `doctor` and the wizard, never faked.
 
 In:
 - Host CLI: `init [path]`, `doctor`, `start`, `down`, `status`, `pause`, `resume`,
-  `import`, `export`, `config show`, `uninstall`. All support `--json`; mutating ones `--dry-run`.
+  `import`, `export`, `config show`, `auth github`, `uninstall`. All support `--json`; mutating ones `--dry-run`.
 - Runtime CLI (inside container): `backlog ready|list|show|create|update|note`,
   `work claim|record|release|list`, `hook stop|pre-agent`, `coordinator`, `status`, `pause`, `resume`.
 - Profiles `project-owner`, `personal-work`, `supervised`; shared + private visibility.
@@ -20,7 +20,7 @@ In:
 
 Deferred (report as unavailable): GitHub Issues backend, branch/PR/auto-merge delivery,
 review publication, Telegram, config plan/apply transactions, backlog migration, upgrade,
-budgets, companion containers, GitHub credential provisioning.
+budgets, companion containers.
 
 ## Recorded low-impact decisions
 
@@ -35,6 +35,41 @@ budgets, companion containers, GitHub credential provisioning.
 - Coordinator permission mode defaults to `acceptEdits` with an allowlist for `minions`, `git`, and `backlog` commands. Never `bypassPermissions`.
 - Pinned in image: base `node:22-bookworm-slim` (digest pinned in Dockerfile), `@anthropic-ai/claude-code@2.1.292`, `backlog.md@1.54.0`. Tested range documented in `docs/compatibility.md`.
 - No `--append-system-prompt-file` exists in Claude Code 2.1.292; the launcher reads the coordinator prompt file and passes it with `--append-system-prompt` as an argv element (no shell).
+
+## GitHub credential
+
+A per-project fine-grained personal access token, provisioned only by the host CLI
+(`src/host/credentials.ts`). Nothing inside the container uses it yet; later tasks wire it into
+git/gh, branch/PR delivery, and CI observation.
+
+- **Entry.** `minions auth github` (and, for repositories with a GitHub remote, an optional offer at
+  the end of an interactive `minions init`) reads the token from the host terminal in raw mode with
+  no echo, or from a pipe with `--stdin`. There is no `--token` flag; the token is never in argv,
+  config, the plan, logs, or `--json` output. The wizard questions themselves never ask for secrets.
+- **Guidance.** Setup prints the creation link (`https://github.com/settings/personal-access-tokens/new`)
+  and the repository permissions: Contents read/write, Pull requests read/write, Checks read,
+  Actions read, Commit statuses read, Metadata read. Nothing else.
+- **Verification.** Before storing, `GET /repos/<owner>/<repo>` (or `/user` without a GitHub
+  remote) with the token in the `Authorization` header only. 401/403/404 → not stored. A network
+  failure stores it with a warning. `doctor` repeats the call and reports
+  `github.credential: ok | missing | invalid | unverified`.
+- **Storage.** macOS Keychain (generic password, service `minions.github`, account = project id)
+  when `security` works; otherwise `<host data root>/credentials/<projectId>/github-token`
+  (0600 file, 0700 dirs). `MINIONS_CREDENTIAL_STORE=file|keychain` overrides. Storage is refused
+  if the host data root is inside the repository. `security add-generic-password -w <secret>`
+  would expose the token in argv, so the Keychain write goes through `security -i` with the
+  command on stdin and is verified by reading it back.
+- **Reference.** `projects/<id>/credentials.json` (0600, host only, not in the manifest) holds
+  `{backend, ref, kind, updatedAt}`, never the token. `config show`, the shared config, and
+  `project.json` contain no credential data.
+- **Mount.** The token is materialized into `projects/<id>/secrets/github-token` (0600, atomic
+  rename) on `minions start` and on `auth github` while the container runs, and removed on
+  `minions down` and `uninstall`. Compose bind-mounts the **directory** read-only at
+  `/opt/minions/secrets` (`GITHUB_TOKEN_CONTAINER_PATH` = `/opt/minions/secrets/github-token` in
+  `src/core/paths.ts`). Mounting the directory rather than the file keeps replaced tokens (new inode)
+  visible without recreating the container. The Keychain and the credentials directory are never mounted.
+- **Uninstall** keeps the stored token, as it keeps other credentials. `minions auth github --remove`
+  deletes it.
 
 ## Repository layout
 

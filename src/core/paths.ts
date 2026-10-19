@@ -9,6 +9,9 @@ export function hostRoot(): string {
 }
 
 export const registryPath = () => join(hostRoot(), 'registry.json');
+/** Host credential store for the file backend (0700 dirs, 0600 files). Never mounted into a container. */
+export const credentialStoreDir = () => join(hostRoot(), 'credentials');
+export const credentialStoreFile = (projectId: string, name: string) => join(credentialStoreDir(), projectId, name);
 export const projectDir = (projectId: string) => join(hostRoot(), 'projects', projectId);
 
 export function projectPaths(projectId: string) {
@@ -25,6 +28,11 @@ export function projectPaths(projectId: string) {
     runtimeConfigJson: join(dir, 'runtime', 'config.json'),
     pluginDir: join(dir, 'plugin'),
     exportsDir: join(dir, 'exports'),
+    /** Host-only credential references (never mounted). */
+    credentialsJson: join(dir, 'credentials.json'),
+    /** Materialized secret files, bind-mounted read-only into the container as a directory. */
+    secretsDir: join(dir, 'secrets'),
+    githubTokenFile: join(dir, 'secrets', 'github-token'),
   };
 }
 export type ProjectPaths = ReturnType<typeof projectPaths>;
@@ -42,6 +50,8 @@ export function containerPaths(root = process.env.MINIONS_CONTAINER_ROOT ?? '') 
     pluginDir: p('/opt/minions/plugin'),
     coordinatorPrompt: p('/opt/minions/plugin/coordinator.md'),
     configDir: p('/opt/minions/config'),
+    secretsDir: p('/opt/minions/secrets'),
+    githubTokenFile: p('/opt/minions/secrets/github-token'),
     configJson: p('/opt/minions/config/config.json'),
     projectJson: p('/opt/minions/config/project.json'),
     workspace: p('/workspace'),
@@ -59,6 +69,12 @@ export function containerPaths(root = process.env.MINIONS_CONTAINER_ROOT ?? '') 
   };
 }
 export const CONTAINER = containerPaths('');
+
+/**
+ * In-container path of the GitHub token (read-only). The directory is bind-mounted, not the file,
+ * so atomic host-side replacements (new inode) stay visible to a running container.
+ */
+export const GITHUB_TOKEN_CONTAINER_PATH = CONTAINER.githubTokenFile;
 
 export const SERVICE_NAME = 'app';
 export const shortId = (projectId: string) => projectId.slice(0, 8).toLowerCase();

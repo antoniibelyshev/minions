@@ -12,7 +12,7 @@ export const SUPPORTED = {
 export const DEFERRED_FEATURES = [
   'GitHub Issues backend', 'branch/PR/auto-merge delivery', 'review publication', 'Telegram',
   'config plan/apply transactions', 'backlog migration', 'upgrade', 'budgets',
-  'companion containers', 'GitHub credential provisioning',
+  'companion containers',
 ] as const;
 
 export interface Unavailable { path: string; value: unknown; reason: string }
