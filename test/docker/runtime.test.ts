@@ -79,11 +79,11 @@ describe('runtime container (docker)', () => {
     expect(inspect.Config.Env).toEqual(expect.arrayContaining(['MINIONS_RUNTIME=container', 'CLAUDE_CONFIG_DIR=/home/node/.claude']));
   });
 
-  it('mounts no docker socket and only ro binds for plugin/config', () => {
+  it('mounts no docker socket and only ro binds for plugin/config/secrets', () => {
     const mounts = inspect.Mounts as { Type: string; Source: string; Destination: string; RW: boolean; Name?: string }[];
     expect(mounts.some((m) => /docker\.sock/.test(m.Source) || /docker\.sock/.test(m.Destination))).toBe(false);
     const binds = mounts.filter((m) => m.Type === 'bind');
-    expect(binds.map((m) => [m.Destination, m.RW]).sort()).toEqual([['/opt/minions/config', false], ['/opt/minions/plugin', false]]);
+    expect(binds.map((m) => [m.Destination, m.RW]).sort()).toEqual([['/opt/minions/config', false], ['/opt/minions/plugin', false], ['/opt/minions/secrets', false]]);
     const vols = mounts.filter((m) => m.Type === 'volume').map((m) => m.Name).sort();
     expect(vols.every((n) => n!.startsWith('minions-test-'))).toBe(true);
     expect(vols).toHaveLength(4);
@@ -105,6 +105,8 @@ describe('runtime container (docker)', () => {
   it('pinned tools are present', async () => {
     expect((await sh(['claude', '--version'])).stdout).toContain('2.1.292');
     expect((await sh(['backlog', '--version'])).stdout).toContain('1.54.0');
+    expect((await sh(['bun', '--version'])).stdout.trim()).toBe('1.4.3'); // Telegram channel plugin runtime
+    expect(JSON.stringify(inspect.Config.Env)).not.toContain('TELEGRAM_BOT_TOKEN'); // token reaches only the coordinator process
     for (const t of ['git', 'tmux', 'rg', 'minions']) expect((await sh(['sh', '-c', `command -v ${t}`])).code, t).toBe(0);
   });
 

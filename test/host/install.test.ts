@@ -204,7 +204,7 @@ describe('init', () => {
     const r = await init(repo, { visibility: 'private', profile: 'personal-work', dryRun: true });
     expect(r.plan.verificationCommands).toEqual(['npm run lint', 'npm test']);
     expect(r.plan.permissions.deny).toContain('deploy.execute');
-    expect(r.plan.unavailable.features).toContain('Telegram');
+    expect(r.plan.unavailable.features).not.toContain('Telegram');
     expect(r.plan.externalSetup.join('\n')).toMatch(/\/login/);
     expect(r.plan.writes.every((w) => w.action === 'create')).toBe(true);
   });

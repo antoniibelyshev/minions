@@ -101,7 +101,7 @@ function claudeItem(f: TelegramFacts): { item: ProbeItem; version: string | null
 function bunItem(f: TelegramFacts): ProbeItem {
   if (f.bun.code === 0) return { name: 'bun', status: 'ok', detail: `Bun ${short(f.bun.stdout)}` };
   return { name: 'bun', status: 'missing', detail: 'Bun is not installed: the official Telegram channel plugin runs its MCP server with `bun` (and installs its npm dependencies with `bun install` at start)',
-    hint: 'The minions image does not ship Bun yet; it is added with Telegram startup integration (docs/design/telegram.md).' };
+    hint: 'The minions image ships a pinned Bun (docker/Dockerfile); run `minions start` to rebuild an outdated image.' };
 }
 
 function marketplaceItem(f: TelegramFacts): ProbeItem {

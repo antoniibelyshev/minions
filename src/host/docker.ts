@@ -53,6 +53,8 @@ export function composeYaml(p: ProjectJson): string {
     '      TERM: "xterm-256color"',
     '      npm_config_cache: "/home/node/.cache/npm"',
     '      XDG_CACHE_HOME: "/home/node/.cache"',
+    // Bun (Telegram plugin dependencies) caches in the cache volume; /home/node itself is tmpfs.
+    '      BUN_INSTALL_CACHE_DIR: "/home/node/.cache/bun"',
     '    tmpfs:',
     '      - "/tmp:rw,nosuid,nodev,uid=1000,gid=1000,mode=1777"',
     '      - "/home/node:rw,nosuid,nodev,uid=1000,gid=1000,mode=0755"',

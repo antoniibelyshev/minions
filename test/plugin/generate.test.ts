@@ -179,3 +179,31 @@ describe.runIf(process.env.MINIONS_LIVE_CLAUDE === '1' && hasClaude)('claude plu
     expect(res.status, res.stdout + res.stderr).toBe(0);
   }, 70_000);
 });
+
+describe('Telegram tools are coordinator-only', () => {
+  const telegram = () => { const c = defaults(); c.communication.channel = 'telegram'; return c; };
+
+  it('worker agents have explicit tool allowlists with no MCP (Telegram) tools when Telegram is configured', async () => {
+    const { read } = await gen(telegram());
+    for (const role of ['engineer', 'tester', 'reviewer']) {
+      const md = await read(`agents/${role}.md`);
+      const fm = frontmatter(md);
+      const tools = toolList(fm.tools);
+      expect(tools.length, role).toBeGreaterThan(0); // an explicit allowlist: omitted `tools` would inherit every tool
+      for (const t of tools) expect(t, role).toMatch(/^(Read|Edit|Write|Grep|Glob|Bash)$/);
+      expect(md, role).not.toMatch(/mcp__|telegram/i);
+      expect(toolList(fm.disallowedTools)).toContain('Agent');
+    }
+  });
+
+  it('only the coordinator prompt describes the Telegram channel and its access rules', async () => {
+    const { read } = await gen(telegram());
+    const coord = await read('coordinator.md');
+    expect(coord).toContain('Communication channel: Telegram');
+    expect(coord).toContain('the plugin drops unpaired senders');
+    expect(coord).toMatch(/Never give them to workers/);
+    expect(coord).toMatch(/Pairing and access changes .* happen only in the terminal/);
+    const term = await gen();
+    expect(await term.read('coordinator.md')).toContain('Telegram is not configured for this project.');
+  });
+});

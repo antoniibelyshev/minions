@@ -33,6 +33,7 @@ export function projectPaths(projectId: string) {
     /** Materialized secret files, bind-mounted read-only into the container as a directory. */
     secretsDir: join(dir, 'secrets'),
     githubTokenFile: join(dir, 'secrets', 'github-token'),
+    telegramTokenFile: join(dir, 'secrets', 'telegram-bot-token'),
   };
 }
 export type ProjectPaths = ReturnType<typeof projectPaths>;
@@ -52,6 +53,7 @@ export function containerPaths(root = process.env.MINIONS_CONTAINER_ROOT ?? '') 
     configDir: p('/opt/minions/config'),
     secretsDir: p('/opt/minions/secrets'),
     githubTokenFile: p('/opt/minions/secrets/github-token'),
+    telegramTokenFile: p('/opt/minions/secrets/telegram-bot-token'),
     configJson: p('/opt/minions/config/config.json'),
     projectJson: p('/opt/minions/config/project.json'),
     workspace: p('/workspace'),
@@ -66,6 +68,8 @@ export function containerPaths(root = process.env.MINIONS_CONTAINER_ROOT ?? '') 
     exports: p('/state/exports'),
     claudeHome: p('/home/node/.claude'),
     cache: p('/home/node/.cache'),
+    /** Official Telegram plugin state (access.json, .env, pairing codes); owned by the plugin. */
+    telegramStateDir: p('/home/node/.claude/channels/telegram'),
   };
 }
 export const CONTAINER = containerPaths('');
@@ -75,6 +79,8 @@ export const CONTAINER = containerPaths('');
  * so atomic host-side replacements (new inode) stay visible to a running container.
  */
 export const GITHUB_TOKEN_CONTAINER_PATH = CONTAINER.githubTokenFile;
+/** In-container path of the Telegram bot token (read-only; read only by `minions coordinator run`). */
+export const TELEGRAM_TOKEN_CONTAINER_PATH = CONTAINER.telegramTokenFile;
 
 export const SERVICE_NAME = 'app';
 export const shortId = (projectId: string) => projectId.slice(0, 8).toLowerCase();

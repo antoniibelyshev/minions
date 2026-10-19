@@ -203,7 +203,8 @@ describe('wizard', () => {
     expect(r.config.container.publishPorts).toEqual([{ host: 3000, container: 3000 }]);
     expect(r.config.verification.commands).toEqual(['npm run lint', 'npm test']);
     expect(info.join('\n')).toMatch(/GitHub Issues \(not available in v0\.1\)/);
-    expect(info.join('\n')).toMatch(/Telegram \(not available in v0\.1\)/);
+    expect(info.join('\n')).toMatch(/Telegram through the official Claude Code channel plugin/);
+    expect(r.config.communication.channel).toBe('terminal');
     expect(info.join('\n')).toMatch(/pull requests, auto-merge \(not available in v0\.1\)/);
     for (const q of questions) expect(q).not.toMatch(/token|password|secret|api key/i);
   });

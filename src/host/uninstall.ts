@@ -58,8 +58,9 @@ export async function runUninstall(opts: UninstallOptions): Promise<UninstallRes
   }
 
   // Credentials are preserved by default (spec: uninstall keeps credentials).
-  const gh = (await loadCredentialRefs(projectId).catch(() => undefined))?.github;
-  if (gh) kept.push({ path: gh.ref, reason: 'GitHub token kept; run `minions auth github --remove` before uninstalling to delete it' });
+  const refs = await loadCredentialRefs(projectId).catch(() => undefined);
+  if (refs?.github) kept.push({ path: refs.github.ref, reason: 'GitHub token kept; run `minions auth github --remove` before uninstalling to delete it' });
+  if (refs?.telegram) kept.push({ path: refs.telegram.ref, reason: 'Telegram bot token kept; run `minions auth telegram --remove` before uninstalling to delete it (or revoke it in BotFather)' });
 
   let container: UninstallResult['container'] = 'skipped';
   if (!opts.dryRun) {
