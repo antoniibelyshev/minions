@@ -1,5 +1,6 @@
 // `minions doctor`: host, Docker, container, and configuration readiness. Never prints secrets.
 import { DEFERRED_FEATURES, listUnavailable } from '../config/resolve.js';
+import type { MinionsConfig } from '../config/schema.js';
 import { isMinionsError } from '../core/errors.js';
 import { run } from '../core/exec.js';
 import { redact } from '../core/output.js';
@@ -33,11 +34,31 @@ async function githubCheck(project: { projectId: string; remoteUrl: string | nul
   switch (s.state) {
     case 'ok': return [name, 'ok', `ok: ${s.detail}`];
     case 'missing': return onGitHub
-      ? [name, 'warn', `missing: ${s.detail}`, 'Run `minions auth github` (needed for upcoming push/PR delivery).']
+      ? [name, 'warn', `missing: ${s.detail}`, 'Run `minions auth github` (needed for branch/pull-request delivery).']
       : [name, 'ok', 'missing: not needed (no GitHub remote)'];
     case 'invalid': return [name, 'fail', `invalid: ${s.detail}`, 'Create a new fine-grained token and run `minions auth github`.'];
     case 'unverified': return [name, 'warn', `unverified: ${s.detail}`, 'Check network access to api.github.com and rerun doctor.'];
   }
+}
+
+/**
+ * merge.readiness: what delivery can do now. PR/branch delivery is available with a GitHub remote and
+ * credential; minions never merges and auto-merge is always reported as deferred.
+ */
+export function mergeReadiness(config: Pick<MinionsConfig, 'delivery'> | null, github: { onGitHub: boolean; credential: CredentialStatus['state'] | null }): [CheckStatus, string, string?] {
+  const deferred = 'auto-merge is deferred (minions never merges)';
+  const ready = github.onGitHub && github.credential === 'ok';
+  if (!config) return ['unavailable', `configuration not loaded; ${deferred}`];
+  const mode = config.delivery.mode;
+  if (mode === 'local') {
+    return ['unavailable', ready
+      ? `local delivery (nothing is pushed); pull-request delivery is available: set delivery.mode "pull-request"; ${deferred}`
+      : `local delivery only: branch/pull-request delivery needs ${github.onGitHub ? 'a valid GitHub token' : 'a GitHub remote and token'}; ${deferred}`];
+  }
+  const what = mode === 'pull-request' ? 'pull-request delivery available (push agent/<slug> and open a PR, never merged)' : 'branch delivery available (push agent/<slug>)';
+  if (!github.onGitHub) return ['fail', `delivery.mode "${mode}" but the repository has no GitHub remote; ${deferred}`, 'Add a github.com origin or set delivery.mode "local".'];
+  if (ready) return ['ok', `${what}; ${deferred}`];
+  return ['warn', `delivery.mode "${mode}" cannot publish: GitHub credential ${github.credential ?? 'unknown'}; ${deferred}`, 'Run `minions auth github`; approved tasks wait (blocked) until `minions work publish` succeeds.'];
 }
 
 export async function runDoctor(opts: { cwd: string; runner?: Runner; probe?: DockerProbe; fetch?: Fetch }): Promise<DoctorReport> {
@@ -55,6 +76,8 @@ export async function runDoctor(opts: { cwd: string; runner?: Runner; probe?: Do
     docker.compose ? undefined : 'Install Docker Compose v2 or newer (bundled with Docker Desktop).');
 
   let projectId: string | null = null;
+  let effective: MinionsConfig | null = null;
+  const github: { onGitHub: boolean; credential: CredentialStatus['state'] | null } = { onGitHub: false, credential: null };
   try {
     const ref = await projectForPath(opts.cwd);
     projectId = ref.projectId;
@@ -62,12 +85,16 @@ export async function runDoctor(opts: { cwd: string; runner?: Runner; probe?: Do
     add('project', 'ok', `${project.projectId} (${project.visibility}, ${project.profile}) at ${project.repoPath}`);
     try {
       const eff = await loadEffectiveConfig(project);
+      effective = eff.config;
       add('config', 'ok', `valid (revision ${eff.config.configRevision}, package ${eff.config.packageVersion})`);
       for (const u of listUnavailable(eff.config)) add(`config.${u.path}`, 'unavailable', u.reason);
     } catch (e) {
       add('config', 'fail', isMinionsError(e) ? e.message : String(e), 'Fix the configuration file, then rerun doctor.');
     }
-    add(...await githubCheck(project, runner, opts.fetch));
+    const gc = await githubCheck(project, runner, opts.fetch);
+    add(...gc);
+    github.onGitHub = githubRepoFromRemote(project.remoteUrl) !== null;
+    github.credential = (['ok', 'missing', 'invalid', 'unverified'] as const).find((s) => gc[2].startsWith(`${s}:`)) ?? null;
 
     if (docker.daemon && docker.compose) {
       const label = await imageBuildLabel(project.imageTag, runner);
@@ -100,7 +127,7 @@ export async function runDoctor(opts: { cwd: string; runner?: Runner; probe?: Do
     add('project', 'warn', isMinionsError(e) ? e.message : String(e), 'Run `minions init` in this repository.');
   }
 
-  add('merge.readiness', 'unavailable', 'automatic merge and PR delivery are deferred in v0.1 (local delivery only)');
+  add('merge.readiness', ...mergeReadiness(effective, github));
   add('features', 'unavailable', DEFERRED_FEATURES.join(', '));
   add('package', 'ok', `minions ${VERSION}`);
   return { healthy: !checks.some((c) => c.status === 'fail'), projectId, checks };

@@ -156,6 +156,22 @@ export function register(program: Command): void {
       const r = await (await scheduler()).release(leaseId, o.reason);
       emit(r, { json: globalOpts(cmd).json, human: (d) => `Released ${d.leaseId} (${d.taskId}); worktree kept at ${d.worktree ?? '-'}` });
     }));
+  work.command('publish <taskId>').description('Publish an approved task (branch / pull-request delivery); idempotent, retryable')
+    .action(action(async (taskId: string, _o: unknown, cmd: Command) => {
+      if (runtimeMode() === 'host') return delegate(cmd);
+      const r = await (await scheduler()).publish(taskId);
+      emit(r, { json: globalOpts(cmd).json, human: (d) => d.message });
+      if (r.state === 'failed') process.exitCode = 1;
+    }));
+  work.command('approve <taskId>').description('Record a human approval to publish the approved head (sensitive paths / "ask" publication)')
+    .requiredOption('--head <sha>', 'the approved head SHA being authorized (binds the approval to that commit)')
+    .option('--by <name>', 'who approved')
+    .option('--note <text>', 'why')
+    .action(action(async (taskId: string, o: { head: string; by?: string; note?: string }, cmd: Command) => {
+      if (runtimeMode() === 'host') return delegate(cmd);
+      const r = (await scheduler()).approvePublication(taskId, { head: o.head, by: o.by, note: o.note });
+      emit(r, { json: globalOpts(cmd).json, human: (d) => d.message });
+    }));
   work.command('list').description('List active leases')
     .option('--all', 'include ended leases')
     .action(action(async (o: { all?: boolean }, cmd: Command) => {

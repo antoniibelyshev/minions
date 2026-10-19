@@ -50,6 +50,6 @@ It uses a temp `MINIONS_HOME` and disposable repos and removes its containers an
   untracked, and ignored files are never imported; tracked secret-looking files trigger a warning
   but detection is best effort.
 - **Deferred features** (reported as unavailable by `minions doctor`): GitHub Issues backend,
-  branch/PR/auto-merge delivery, review publication, Telegram, config plan/apply transactions,
+  auto-merge and merge requests, review publication, Telegram, config plan/apply transactions,
   backlog migration, upgrade, budgets, companion containers.
 - Native macOS/iOS builds (Xcode) cannot run inside the Linux runtime.

@@ -13,12 +13,12 @@ In:
 - Runtime CLI (inside container): `backlog ready|list|show|create|update|note`,
   `work claim|record|release|list`, `hook stop|pre-agent`, `coordinator`, `status`, `pause`, `resume`.
 - Profiles `project-owner`, `personal-work`, `supervised`; shared + private visibility.
-- Backlog.md backend only. Delivery mode `local` only (commits on `agent/<slug>` branches in the container clone, fetched to host with `minions export`).
+- Backlog.md backend only. Delivery modes `local` (default; commits on `agent/<slug>` branches in the container clone, fetched to host with `minions export`), and, for the github provider, `branch` and `pull-request` (see "Branch and pull-request delivery"). minions never merges.
 - Terminal communication only.
 - One Docker container per project, security baseline from spec §3A.
 - Claude auth inside the container (interactive `/login`, persisted in the claude volume).
 
-Deferred (report as unavailable): GitHub Issues backend, branch/PR/auto-merge delivery,
+Deferred (report as unavailable): GitHub Issues backend, auto-merge and merge requests,
 review publication, Telegram, config plan/apply transactions, backlog migration, upgrade,
 budgets, companion containers.
 
@@ -40,7 +40,7 @@ budgets, companion containers.
 
 A per-project fine-grained personal access token, provisioned only by the host CLI
 (`src/host/credentials.ts`). Inside the container git and gh use it (see "GitHub in the
-container"); later tasks wire it into branch/PR delivery and CI observation.
+container"), and branch/pull-request delivery publishes with it; CI observation is a later task.
 
 - **Entry.** `minions auth github` (and, for repositories with a GitHub remote, an optional offer at
   the end of an interactive `minions init`) reads the token from the host terminal in raw mode with
@@ -99,6 +99,49 @@ argv, environment files, tmux, or Claude Code settings.
   (path, container uid, file owner and mode). The helper and the gh wrapper print the same diagnosis.
 - **No token file**: identical to the previous behaviour — the recorded URL is stored verbatim,
   never fetched, no helper is configured, and the import result has no `origin` field.
+
+## Branch and pull-request delivery
+
+Decision record for `delivery.mode` `branch` / `pull-request` (`src/runtime/publish.ts`,
+`Scheduler.publish` / `approvePublication` in `src/runtime/scheduler.ts`).
+
+- **Config.** Both modes need `delivery.provider: "github"` (cross-field validation). `merge` stays
+  `disabled`; `manual` / `auto-when-eligible` validate but are reported unavailable (deferred).
+  `project-owner` defaults to `pull-request` only when the repository has a github.com remote **and** a
+  token is already stored for the project; otherwise `local` with a note. The init wizard offers
+  `local/branch/pull-request` under the same condition and otherwise shows the reason and keeps
+  `local` (also for `--config` files that ask for branch/PR delivery). `doctor` `merge.readiness`
+  reports whether PR delivery is available and that auto-merge is deferred.
+- **Where publication runs.** Synchronously inside `minions work record` when a reviewer approval is
+  accepted (tester evidence for the same head and config revision as before), plus
+  `minions work publish <taskId>` to retry. One `publications` row per task (DB schema 2) is
+  written in the same transaction that ends the reviewer lease (`pending`, bound to the approved
+  head and config revision), so a crash between approval and publication is resumable. The response
+  carries `publication` (`state`, `status`, `prUrl`, `merged: false`).
+- **Outcomes.** `published` → backlog `delivered` with `prUrl` (pull-request mode) and `branch` in the
+  task meta; an open PR is reported as delivered, never merged. `awaiting-approval` → `awaiting-human`.
+  `failed` (network, auth, permission, diverged remote, moved branch, stale evidence) → `blocked`
+  with a note; the local branch and worktree are never touched. Nothing is reported delivered until
+  publication succeeded.
+- **Gates (deterministic).** `git.push` (and `pr.create` in pull-request mode) are evaluated with
+  `can()` against the paths changed by `git diff --name-only --no-renames <base>...<head>` (renames split
+  so moving a file out of a sensitive path counts). `deny` fails. `ask` — including the
+  sensitive-path upgrade allow→ask — requires a human approval recorded with
+  `minions work approve <taskId> --head <sha>` (`approvals` table, scope `publish`, bound to the head;
+  a new commit needs a new approval). The coordinator's Claude Code settings put that command under
+  `ask` (Claude Code prompts the user every time; ask beats the `minions *` allow) and deny
+  `git push` / `gh pr merge`; the user can also run it on the host (delegated into the container).
+  Within one container this is policy plus the permission prompt, not a cryptographic separation.
+- **Idempotency.** `git ls-remote` first: a remote branch already at the approved head is not pushed
+  again; a remote branch that is not an ancestor of the head is a `CONFLICT` (never force-pushed);
+  otherwise `git push origin <head>:refs/heads/agent/<slug>` (exactly the approved commit, authenticated
+  by the repository credential helper). Then `gh pr list --repo <owner/repo> --head agent/<slug> --state
+  all`: an open same-repository PR is reused (as is a merged one for the same head); otherwise exactly
+  one `gh pr create --base <base> --head agent/<slug> --title … --body-file -` (body on stdin). If create
+  fails (e.g. a concurrent run opened it) the list is re-read once before failing.
+- **PR text.** Title, objective (description, minions meta stripped) and acceptance criteria only.
+  Shared installations append the task id and head SHA; private installations add nothing else. Notes,
+  handoffs, worker results and decision records are never read for PR text.
 
 ## Repository layout
 
@@ -304,7 +347,8 @@ Scheduler rules:
   Valid: checks `headSha` equals actual branch head (else invalid "stale head").
   Transitions: engineer complete→testing; tester complete→reviewing, needs_changes→changes-requested;
   reviewer complete(approve)→delivered (local mode) — requires tester evidence for the same head
-  when `testerRequired`; needs_changes→changes-requested (repairs++); blocked→blocked;
+  when `testerRequired`; in branch/pull-request mode the approval starts publication instead and the
+  final status comes from it (see "Branch and pull-request delivery"); needs_changes→changes-requested (repairs++); blocked→blocked;
   needs_split→awaiting-human with `needsSplit` flag for the coordinator; partial→ unchanged with note.
   When repairs ≥ `maxRepairCyclesBeforeReplan`, response includes `replan: true` and status →
   awaiting-human. Records evidence keyed by head SHA + config revision. Releases the lease.

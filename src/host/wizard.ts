@@ -4,7 +4,7 @@
 // the only secret prompt (GitHub token, after the plan is applied) goes through `secret()`, which
 // reads from the host terminal without echo.
 import { createInterface, type Interface } from 'node:readline/promises';
-import { profileDefaults } from '../config/profiles.js';
+import { githubDeliveryUnavailableReason, profileDefaults } from '../config/profiles.js';
 import { validateConfig } from '../config/resolve.js';
 import { PROFILES, type MinionsConfig, type Profile } from '../config/schema.js';
 import { MinionsError } from '../core/errors.js';
@@ -88,6 +88,8 @@ export interface WizardInput {
   existing?: MinionsConfig;
   /** --config <file>: validated config, no questions. */
   configFile?: string;
+  /** A GitHub token is already stored for this project (branch/PR delivery needs it). */
+  githubCredential?: boolean;
   /** --yes: accept defaults. */
   yes: boolean;
   io?: WizardIO;
@@ -142,12 +144,24 @@ function baseConfig(input: WizardInput, profile: Profile): { config: MinionsConf
     return { config: { ...structuredClone(input.existing), projectId: input.projectId, packageVersion: VERSION }, notes: [] };
   }
   const r = profileDefaults(profile, {
-    hasGitHub: d.git.hasGitHub, baseBranch: d.git.baseBranch,
+    hasGitHub: d.git.hasGitHub, hasGitHubCredential: !!input.githubCredential, baseBranch: d.git.baseBranch,
     identity: { name: d.git.userName ?? '', email: d.git.userEmail ?? '' },
     projectId: input.projectId, packageVersion: VERSION,
   });
   r.config.verification.commands = [...d.verificationCommands];
   return r;
+}
+
+const DELIVERY_MODES = ['local', 'branch', 'pull-request'] as const;
+
+/** Branch/PR delivery without a GitHub remote and stored token falls back to local, with the reason. */
+function deliveryFallback(cfg: MinionsConfig, input: WizardInput, notes: string[]): void {
+  const why = githubDeliveryUnavailableReason({ hasGitHub: input.discovery.git.hasGitHub, hasGitHubCredential: !!input.githubCredential });
+  if (cfg.delivery.mode !== 'local' && why) {
+    notes.push(`delivery.mode "${cfg.delivery.mode}" is not selectable: ${why}; using local delivery.`);
+    cfg.delivery.mode = 'local';
+    cfg.delivery.provider = 'none';
+  }
 }
 
 export async function runWizard(input: WizardInput): Promise<WizardResult> {
@@ -157,7 +171,9 @@ export async function runWizard(input: WizardInput): Promise<WizardResult> {
     const raw = await readJson<Record<string, unknown>>(input.configFile);
     const cfg = validateConfig({ ...raw, projectId: input.projectId, packageVersion: VERSION }, input.configFile);
     if (input.visibility) cfg.visibility = input.visibility;
-    return { config: validateConfig(cfg, input.configFile), notes: [`configuration from ${input.configFile}`], asked };
+    const notes = [`configuration from ${input.configFile}`];
+    deliveryFallback(cfg, input, notes);
+    return { config: validateConfig(cfg, input.configFile), notes, asked };
   }
 
   const interactive = !input.yes;
@@ -175,6 +191,7 @@ export async function runWizard(input: WizardInput): Promise<WizardResult> {
     profile = await ask('profile', 'Starting profile', profile, choice(PROFILES));
   }
   const { config: cfg, notes } = baseConfig(input, profile);
+  deliveryFallback(cfg, input, notes);
 
   // 2. Visibility.
   if (input.visibility) cfg.visibility = input.visibility;
@@ -190,7 +207,14 @@ export async function runWizard(input: WizardInput): Promise<WizardResult> {
     cfg.intake.startReady = await ask('intake.startReady',
       'Start ready tasks automatically? (n = only tasks labelled minions:authorized)', cfg.intake.startReady ? 'y' : 'n', yesNo);
     // 5. Publication and merge authority.
-    io.info(`Delivery: local commits on agent/<slug> branches, fetched with \`minions export\`. Branch push, pull requests, auto-merge ${NA}.`);
+    const blocked = githubDeliveryUnavailableReason({ hasGitHub: d.git.hasGitHub, hasGitHubCredential: !!input.githubCredential });
+    if (blocked) {
+      io.info(`Delivery: local commits on agent/<slug> branches, fetched with \`minions export\`. Branch push and pull requests are not selectable: ${blocked}. Auto-merge ${NA}.`);
+    } else {
+      io.info(`Delivery: local (commits stay in the container; \`minions export\`), branch (push agent/<slug> to origin), or pull-request (push and open a PR against ${cfg.git.baseBranch}). minions never merges; auto-merge ${NA}.`);
+      cfg.delivery.mode = await ask('delivery.mode', 'Delivery mode (local/branch/pull-request)', cfg.delivery.mode, choice(DELIVERY_MODES));
+      cfg.delivery.provider = cfg.delivery.mode === 'local' ? cfg.delivery.provider : 'github';
+    }
     // 6. Communication.
     io.info(`Communication: terminal. Telegram ${NA}.`);
     // 7. Credentials — no secret is requested by these questions.

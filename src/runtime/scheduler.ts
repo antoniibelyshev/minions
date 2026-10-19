@@ -3,7 +3,8 @@ import type { BacklogAdapter, ScopeFilter, Task, TaskStatus } from '../backlog/t
 import { can } from '../config/capabilities.js';
 import type { MinionsConfig } from '../config/schema.js';
 import { MinionsError } from '../core/errors.js';
-import type { Lease, LeaseRole, RuntimeDb } from './db.js';
+import type { Lease, LeaseRole, PublicationState, RuntimeDb } from './db.js';
+import { publishTask, type PublishInput, type PublishOutcome } from './publish.js';
 import { validateResult, type WorkerResult } from './results.js';
 import { BRANCH_PREFIX, branchFor, ensureBranchWorktree, ensureReviewWorktree, git, headOf, resolveBaseBranch, taskSlug, workspaceLayout, type WorkspaceLayout } from './worktree.js';
 
@@ -24,6 +25,20 @@ export interface SchedulerDeps {
   backlog: BacklogAdapter;
   config: MinionsConfig;
   layout?: WorkspaceLayout;
+  /** Branch/PR publisher (tests inject one with mocked git/gh). */
+  publisher?: (input: PublishInput) => Promise<PublishOutcome>;
+}
+
+/** Result of a publication attempt (`minions work publish`, or embedded in a record response). */
+export interface PublishResponse {
+  taskId: string; branch: string; headSha: string; mode: string;
+  state: PublicationState; status: TaskStatus; prUrl: string | null;
+  /** Always false: minions never merges in this phase. */
+  merged: false;
+  push?: 'pushed' | 'already-current'; pr?: 'created' | 'existing' | null;
+  reasons?: string[]; sensitivePaths?: string[];
+  errorCode?: string; retryable?: boolean;
+  message: string;
 }
 
 export interface Capacity {
@@ -89,6 +104,8 @@ export interface RecordResponse {
   errors?: string[]; correctionAllowed?: boolean; unvalidated?: boolean;
   from?: TaskStatus; to?: TaskStatus; approved: boolean; replan: boolean; needsSplit: boolean;
   repairCycles?: number; headSha?: string; message: string;
+  /** Present when the approval started branch/PR publication. */
+  publication?: PublishResponse;
 }
 
 const RESULT_CONTRACT = 'Return exactly one JSON object: {status: complete|needs_changes|blocked|needs_split|partial, summary, branch, headSha (full SHA of the branch head you leave), modifiedPaths[], checks[{command, outcome: pass|fail|skipped, details?}], acceptanceEvidence[{criterion, evidence}], findings[], nextAction, verdict?: approve|request-changes (reviewer only), usage? (only when actually available)}.';
@@ -101,10 +118,12 @@ export class Scheduler {
   readonly backlog: BacklogAdapter;
   readonly config: MinionsConfig;
   readonly layout: WorkspaceLayout;
+  private readonly publisher: (input: PublishInput) => Promise<PublishOutcome>;
 
   constructor(deps: SchedulerDeps) {
     this.db = deps.db; this.backlog = deps.backlog; this.config = deps.config;
     this.layout = deps.layout ?? workspaceLayout();
+    this.publisher = deps.publisher ?? publishTask;
   }
 
   list(opts: { all?: boolean; taskId?: string } = {}): Lease[] { return this.db.leases(opts); }
@@ -357,6 +376,7 @@ export class Scheduler {
     const from = task.status;
     let to: TaskStatus = from;
     let approved = false, replan = false, needsSplit = false, repairCycles: number | undefined;
+    let publish = false;
     let message = '';
     const afterTesting: TaskStatus = cfg.verification.reviewerRequired ? 'reviewing' : 'delivered';
 
@@ -367,7 +387,10 @@ export class Scheduler {
         else {
           const testerOk = !cfg.verification.testerRequired ||
             this.db.evidenceFor(task.id, head, 'tester', cfg.configRevision).some((e) => e.outcome === 'complete');
-          if (testerOk) { to = 'delivered'; approved = true; message = `Approved at ${head}; delivered locally (export with minions export).`; }
+          if (testerOk && cfg.delivery.mode !== 'local') {
+            // Publication (below) decides the final status; the task is never delivered before it succeeds.
+            approved = true; publish = true;
+          } else if (testerOk) { to = 'delivered'; approved = true; message = `Approved at ${head}; delivered locally (export with minions export).`; }
           else { to = 'testing'; message = `Approval not applied: no passing tester evidence for head ${head} at config revision ${cfg.configRevision}. Run the tester again.`; }
         }
         break;
@@ -400,14 +423,129 @@ export class Scheduler {
           outcome: c.outcome, details_json: JSON.stringify({ leaseId, command: c.command, details: c.details ?? null }) });
       }
       this.db.exec('UPDATE leases SET head_sha = ? WHERE id = ?', head, leaseId);
-      this.endLease(leaseId, 'completed', { from, to, approved, replan, needsSplit }, { json: JSON.stringify(r), valid: 1 });
+      if (publish) this.db.upsertPublication({ task_id: task.id, branch: lease.branch!, head_sha: head, mode: cfg.delivery.mode, config_revision: cfg.configRevision });
+      this.endLease(leaseId, 'completed', { from, to, approved, replan, needsSplit, publish }, { json: JSON.stringify(r), valid: 1 });
     });
     try {
       await this.backlog.addNote(task.id, `minions: ${lease.role} ${r.status}${r.verdict ? ` (${r.verdict})` : ''} at ${head.slice(0, 12)}: ${r.summary}`);
     } catch (e) {
       this.db.addEvent('record-backlog-error', task.id, { leaseId, error: (e as Error).message });
     }
+    if (publish) {
+      let publication: PublishResponse;
+      try { publication = await this.publish(task.id); } catch (e) {
+        // The approval and the pending publication are recorded; `minions work publish` retries.
+        this.db.addEvent('publish-error', task.id, { error: (e as Error).message });
+        publication = {
+          taskId: task.id, branch: lease.branch!, headSha: head, mode: cfg.delivery.mode, state: 'pending', status: from, prUrl: null, merged: false,
+          errorCode: (e as MinionsError).code ?? 'INTERNAL', retryable: true,
+          message: `Approved at ${head}, but publication did not complete (${(e as Error).message}). Retry with \`minions work publish ${task.id}\`.`,
+        };
+      }
+      return { ...base, valid: true, from, to: publication.status, approved, replan, needsSplit, repairCycles, headSha: head, publication, message: publication.message };
+    }
     return { ...base, valid: true, from, to, approved, replan, needsSplit, repairCycles, headSha: head,
       message: message || `Recorded ${lease.role} ${r.status}; task ${from} → ${to}.` };
+  }
+
+  private async setStatus(taskId: string, status: TaskStatus): Promise<Task> {
+    const t = await this.backlog.getTask(taskId);
+    return t.status === status ? t : this.backlog.updateTask(t.id, t.version, { status });
+  }
+
+  private async note(taskId: string, text: string): Promise<void> {
+    try { await this.backlog.addNote(taskId, text); } catch (e) {
+      this.db.addEvent('publish-backlog-error', taskId, { error: (e as Error).message });
+    }
+  }
+
+  /**
+   * Publishes an approved task (branch / pull-request delivery). Idempotent: reruns after a crash
+   * or failure reconcile with the remote branch and an existing PR. The task becomes `delivered`
+   * (with prUrl in pull-request mode) only after publication succeeded; it is never merged.
+   */
+  async publish(taskId: string): Promise<PublishResponse> {
+    const cfg = this.config;
+    const pub = this.db.publication(taskId);
+    if (!pub) {
+      throw new MinionsError('PRECONDITION', `Task ${taskId} has no approved publication.`,
+        'Publication starts when a reviewer approval is recorded with delivery.mode branch or pull-request.');
+    }
+    if (cfg.delivery.mode === 'local') {
+      throw new MinionsError('PRECONDITION', 'delivery.mode is "local": nothing is published.', 'Export branches with `minions export` on the host.');
+    }
+    const held = this.db.activeLeases().find((l) => l.task_id === taskId);
+    if (held) throw new MinionsError('CONFLICT', `Task ${taskId} has an active ${held.role} lease (${held.id}); publish after it ends.`);
+    let task = await this.backlog.getTask(taskId);
+    const resp = (state: PublicationState, status: TaskStatus, message: string, extra: Partial<PublishResponse> = {}): PublishResponse =>
+      ({ taskId, branch: pub.branch, headSha: pub.head_sha, mode: cfg.delivery.mode, state, status, prUrl: extra.prUrl ?? pub.pr_url, merged: false, ...extra, message });
+
+    if (pub.state === 'published' && task.status === 'delivered' && (cfg.delivery.mode === 'branch' || task.prUrl)) {
+      return resp('published', 'delivered', `Already delivered: ${pub.branch} at ${pub.head_sha}${task.prUrl ? ` (${task.prUrl}, not merged)` : ''}.`, { prUrl: task.prUrl });
+    }
+
+    const failWith = async (code: string, message: string, retryable: boolean): Promise<PublishResponse> => {
+      this.db.setPublicationState(taskId, 'failed', { errorCode: code, error: message });
+      this.db.addEvent('publish', taskId, { state: 'failed', code, message });
+      await this.setStatus(taskId, 'blocked');
+      await this.note(taskId, `minions: publication of ${pub.branch} at ${pub.head_sha.slice(0, 12)} failed (${code}): ${message} Local branch kept; retry with \`minions work publish ${taskId}\`.`);
+      return resp('failed', 'blocked', `Publication failed (${code}): ${message} The local branch is kept; the task is blocked until \`minions work publish ${taskId}\` succeeds.`, { errorCode: code, retryable });
+    };
+
+    const head = await headOf(this.layout.repo, pub.branch);
+    if (head !== pub.head_sha) {
+      return failWith('PRECONDITION', `${pub.branch} is at ${head ?? '(missing)'}, not the approved head ${pub.head_sha}; test and review the new head before publishing.`, false);
+    }
+    const reviewed = this.db.evidenceFor(taskId, head, 'reviewer', cfg.configRevision).some((e) => e.outcome === 'complete');
+    const tested = !cfg.verification.testerRequired || this.db.evidenceFor(taskId, head, 'tester', cfg.configRevision).some((e) => e.outcome === 'complete');
+    if (!reviewed || !tested) {
+      return failWith('PRECONDITION', `no ${!reviewed ? 'reviewer approval' : 'passing tester evidence'} for ${head} at config revision ${cfg.configRevision}; run the stage again.`, false);
+    }
+
+    const outcome = await this.publisher({
+      config: cfg, task, repo: this.layout.repo, branch: pub.branch, head,
+      humanApproved: !!this.db.approval(taskId, 'publish', head),
+    });
+
+    if (outcome.state === 'failed') return failWith(outcome.code, outcome.message, outcome.retryable);
+    if (outcome.state === 'awaiting-approval') {
+      this.db.setPublicationState(taskId, 'awaiting-approval');
+      this.db.addEvent('publish', taskId, { state: 'awaiting-approval', reasons: outcome.reasons, sensitivePaths: outcome.sensitivePaths });
+      await this.setStatus(taskId, 'awaiting-human');
+      const how = `the user approves with \`minions work approve ${taskId} --head ${head}\`, then run \`minions work publish ${taskId}\``;
+      await this.note(taskId, `minions: publication of ${pub.branch} at ${head.slice(0, 12)} waits for human approval: ${outcome.reasons.join('; ')}.`);
+      return resp('awaiting-approval', 'awaiting-human', `Not published: ${outcome.reasons.join('; ')}. Nothing was pushed; ask the user — ${how}.`,
+        { reasons: outcome.reasons, sensitivePaths: outcome.sensitivePaths });
+    }
+
+    this.db.setPublicationState(taskId, 'published', { prUrl: outcome.prUrl });
+    this.db.addEvent('publish', taskId, { state: 'published', push: outcome.push, pr: outcome.pr, prUrl: outcome.prUrl, head });
+    task = await this.backlog.getTask(taskId);
+    if ((outcome.prUrl && task.prUrl !== outcome.prUrl) || task.branch !== pub.branch) {
+      task = await this.backlog.updateTask(taskId, task.version, { ...(outcome.prUrl ? { prUrl: outcome.prUrl } : {}), branch: pub.branch });
+    }
+    if (task.status !== 'delivered') await this.backlog.closeTask(taskId, 'delivered');
+    const what = outcome.prUrl ? `pull request ${outcome.prUrl} (${outcome.pr === 'created' ? 'opened' : 'existing'}, open, not merged)` : `branch ${pub.branch} on origin`;
+    await this.note(taskId, `minions: delivered ${pub.branch} at ${head.slice(0, 12)} as ${what}.`);
+    return resp('published', 'delivered', `Delivered ${pub.branch} at ${head} as ${what}. minions does not merge.`,
+      { prUrl: outcome.prUrl, push: outcome.push, pr: outcome.pr, sensitivePaths: outcome.sensitivePaths });
+  }
+
+  /**
+   * Records a human approval to publish the task's approved head (needed when publication touches
+   * sensitive paths or git.push / pr.create are "ask"). Bound to the head SHA: new commits need a
+   * new approval. Meant to be run by the user (host CLI) or by the coordinator only on the user's
+   * explicit instruction — the coordinator's Claude Code settings make this command always ask.
+   */
+  approvePublication(taskId: string, opts: { head?: string; by?: string; note?: string } = {}): { taskId: string; headSha: string; approvalId: number; message: string } {
+    const pub = this.db.publication(taskId);
+    if (!pub) throw new MinionsError('PRECONDITION', `Task ${taskId} has no approved publication to authorize.`, 'Approval applies after the reviewer approved the task.');
+    if (pub.state === 'published') throw new MinionsError('PRECONDITION', `Task ${taskId} is already published at ${pub.head_sha}.`);
+    if (opts.head && opts.head !== pub.head_sha) {
+      throw new MinionsError('CONFLICT', `--head ${opts.head} is not the head awaiting publication (${pub.head_sha}).`, 'Approve the exact head that was reviewed.');
+    }
+    const a = this.db.addApproval({ task_id: taskId, scope: 'publish', head_sha: pub.head_sha, approved_by: opts.by ?? null, note: opts.note ?? null });
+    this.db.addEvent('approval', taskId, { scope: 'publish', head: pub.head_sha, by: opts.by ?? null, approvalId: a.id });
+    return { taskId, headSha: pub.head_sha, approvalId: a.id, message: `Recorded human approval to publish ${pub.branch} at ${pub.head_sha}. Run \`minions work publish ${taskId}\`.` };
   }
 }

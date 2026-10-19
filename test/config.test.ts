@@ -32,6 +32,15 @@ describe('profiles', () => {
     expect(c.sensitivePaths).toContain('.github/workflows/**');
     expect(notes.some((n) => n.includes('GitHub Issues'))).toBe(true);
     expect(profileDefaults('project-owner', { ...ctx, hasGitHub: false }).notes).toEqual([]);
+    expect(notes.some((n) => /pull-request delivery .*no GitHub token/.test(n))).toBe(true);
+  });
+
+  it('project-owner defaults to pull-request delivery only with a GitHub remote and token', () => {
+    const withToken = profileDefaults('project-owner', { ...ctx, hasGitHubCredential: true }).config;
+    expect(validateConfig(withToken).delivery).toMatchObject({ provider: 'github', mode: 'pull-request', merge: 'disabled' });
+    expect(profileDefaults('project-owner', { ...ctx, hasGitHub: false, hasGitHubCredential: true }).config.delivery.mode).toBe('local');
+    expect(profileDefaults('personal-work', { ...ctx, hasGitHubCredential: true }).config.delivery.mode).toBe('local');
+    expect(profileDefaults('supervised', { ...ctx, hasGitHubCredential: true }).config.delivery.mode).toBe('local');
   });
 
   it('personal-work yields documented explicit defaults', () => {
@@ -87,7 +96,8 @@ describe('validation', () => {
     [{ models: { default: 'gpt' } }, 'models.default'],
     [{ container: { mountDockerSocket: true } }, 'container.mountDockerSocket'],
     [{ container: { mountHostRepository: true } }, 'container.mountHostRepository'],
-    [{ delivery: { mode: 'pull-request' } }, 'delivery.mode'],
+    [{ delivery: { mode: 'pull-request' } }, 'delivery.provider'],
+    [{ delivery: { mode: 'branch', provider: 'none' } }, 'delivery.provider'],
     [{ backlog: { backend: 'github' } }, 'backlog.backend'],
   ])('rejects conflicting settings %j', (project, path) => {
     const e = fail(() => resolve({ defaults: defaults(), project }));
@@ -100,7 +110,20 @@ describe('validation', () => {
     validateConfig(c);
     const u = listUnavailable(c).find((x) => x.path === 'delivery.merge');
     expect(u?.reason).toContain('requiredChecksConfigured is false');
-    expect(SUPPORTED.delivery).toEqual(['local']);
+    expect(SUPPORTED.delivery).toEqual(['local', 'branch', 'pull-request']);
+  });
+
+  it('accepts branch and pull-request delivery with the github provider; merge stays deferred', () => {
+    for (const mode of ['branch', 'pull-request'] as const) {
+      const c = validateConfig({ ...defaults(), delivery: { ...defaults().delivery, provider: 'github', mode } });
+      expect(c.delivery.mode).toBe(mode);
+      expect(listUnavailable(c).map((u) => u.path)).not.toContain('delivery.mode');
+    }
+    const pr = { ...defaults(), delivery: { ...defaults().delivery, provider: 'github' as const, mode: 'pull-request' as const, merge: 'manual' as const } };
+    expect(listUnavailable(validateConfig(pr)).find((u) => u.path === 'delivery.merge')?.reason).toMatch(/never merges/);
+    const auto = { ...pr, delivery: { ...pr.delivery, merge: 'auto-when-eligible' as const, requiredChecksConfigured: true } };
+    expect(listUnavailable(validateConfig(auto)).find((u) => u.path === 'delivery.merge')?.reason).toMatch(/deferred/);
+    expect(resolve({ defaults: defaults(), project: { delivery: { provider: 'github', mode: 'branch' } } }).config.delivery.mode).toBe('branch');
   });
 });
 

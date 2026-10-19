@@ -227,9 +227,12 @@ async function prepare(opts: InitOptions): Promise<Prepared> {
     }
     notes.push(`Reusing existing configuration ${existingFile}.`);
   } else {
+    // Branch/PR delivery is selectable only when a GitHub token is already stored for this project.
+    const githubCredential = discovery.git.hasGitHub &&
+      !!(await loadCredentialRefs(projectId).catch((): CredentialsJson => ({ version: 1 }))).github;
     const r = await runWizard({
       discovery, projectId, profile: opts.profile, visibility, configFile: opts.configFile,
-      yes: !!opts.yes, io: opts.io,
+      yes: !!opts.yes, io: opts.io, githubCredential,
     });
     config = r.config;
     notes.push(...r.notes);

@@ -5,7 +5,7 @@ import type { IdempotencyStore } from '../backlog/types.js';
 import { MinionsError } from '../core/errors.js';
 import { runtimePaths } from './paths.js';
 
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
 
 export type LeaseRole = 'engineer' | 'tester' | 'reviewer';
 /** active: worker running (or awaiting a correction); completed: valid result; released: no result; unvalidated: invalid after correction. */
@@ -22,6 +22,20 @@ export interface EvidenceRow {
   task_id: string; head_sha: string; kind: string; config_revision: number;
   outcome: string; details_json: string | null; recorded_at: string;
 }
+
+/**
+ * Publication of an approved task (branch / pull-request delivery). One row per task, bound to the
+ * approved head. pending: approved, not yet published (or interrupted); awaiting-approval: needs a
+ * recorded human approval (sensitive paths or an "ask" capability); failed: retryable with
+ * `minions work publish`; published: pushed (and PR opened in pull-request mode).
+ */
+export type PublicationState = 'pending' | 'awaiting-approval' | 'failed' | 'published';
+export interface PublicationRow {
+  task_id: string; branch: string; head_sha: string; mode: string; state: PublicationState;
+  pr_url: string | null; error_code: string | null; error: string | null;
+  config_revision: number; updated_at: string;
+}
+export interface ApprovalRow { id: number; task_id: string; scope: string; head_sha: string; approved_by: string | null; note: string | null; recorded_at: string }
 
 export interface GuardRow { fingerprint: string | null; count: number; last_reason: string | null; updated_at: string | null }
 
@@ -46,6 +60,16 @@ const MIGRATIONS: Record<number, string> = {
     CREATE TABLE IF NOT EXISTS events (
       id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, kind TEXT NOT NULL, task_id TEXT, data_json TEXT);
     CREATE TABLE IF NOT EXISTS repairs (task_id TEXT PRIMARY KEY, cycles INTEGER NOT NULL DEFAULT 0);
+  `,
+  2: `
+    CREATE TABLE IF NOT EXISTS publications (
+      task_id TEXT PRIMARY KEY, branch TEXT NOT NULL, head_sha TEXT NOT NULL, mode TEXT NOT NULL,
+      state TEXT NOT NULL, pr_url TEXT, error_code TEXT, error TEXT,
+      config_revision INTEGER NOT NULL, updated_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS approvals (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, scope TEXT NOT NULL, head_sha TEXT NOT NULL,
+      approved_by TEXT, note TEXT, recorded_at TEXT NOT NULL);
+    CREATE INDEX IF NOT EXISTS approvals_task_head ON approvals(task_id, scope, head_sha);
   `,
 };
 
@@ -202,6 +226,33 @@ export class RuntimeDb {
   incrementRepairs(taskId: string): number {
     this.exec('INSERT INTO repairs (task_id, cycles) VALUES (?, 1) ON CONFLICT(task_id) DO UPDATE SET cycles = cycles + 1', taskId);
     return this.repairCycles(taskId);
+  }
+
+  // Publications (branch / pull-request delivery)
+  publication(taskId: string): PublicationRow | undefined { return this.get<PublicationRow>('SELECT * FROM publications WHERE task_id = ?', taskId); }
+  /** Starts (or restarts) the publication of an approved head; a new head resets any earlier state. */
+  upsertPublication(p: { task_id: string; branch: string; head_sha: string; mode: string; config_revision: number }): PublicationRow {
+    this.exec(`INSERT INTO publications (task_id, branch, head_sha, mode, state, pr_url, error_code, error, config_revision, updated_at)
+      VALUES (?, ?, ?, ?, 'pending', NULL, NULL, NULL, ?, ?)
+      ON CONFLICT(task_id) DO UPDATE SET branch = excluded.branch, head_sha = excluded.head_sha, mode = excluded.mode,
+        state = 'pending', pr_url = NULL, error_code = NULL, error = NULL, config_revision = excluded.config_revision, updated_at = excluded.updated_at`,
+      p.task_id, p.branch, p.head_sha, p.mode, p.config_revision, nowIso());
+    return this.publication(p.task_id)!;
+  }
+  setPublicationState(taskId: string, state: PublicationState, x: { prUrl?: string | null; errorCode?: string | null; error?: string | null } = {}): PublicationRow {
+    this.exec('UPDATE publications SET state = ?, pr_url = COALESCE(?, pr_url), error_code = ?, error = ?, updated_at = ? WHERE task_id = ?',
+      state, x.prUrl ?? null, x.errorCode ?? null, x.error ?? null, nowIso(), taskId);
+    return this.publication(taskId)!;
+  }
+
+  // Human approvals, bound to a head SHA (a new commit needs a new approval).
+  addApproval(a: { task_id: string; scope: string; head_sha: string; approved_by: string | null; note: string | null }): ApprovalRow {
+    const id = this.exec('INSERT INTO approvals (task_id, scope, head_sha, approved_by, note, recorded_at) VALUES (?, ?, ?, ?, ?, ?)',
+      a.task_id, a.scope, a.head_sha, a.approved_by, a.note, nowIso()).lastInsertRowid;
+    return this.get<ApprovalRow>('SELECT * FROM approvals WHERE id = ?', id)!;
+  }
+  approval(taskId: string, scope: string, headSha: string): ApprovalRow | undefined {
+    return this.get<ApprovalRow>('SELECT * FROM approvals WHERE task_id = ? AND scope = ? AND head_sha = ? ORDER BY id DESC LIMIT 1', taskId, scope, headSha);
   }
 
   // Stop guard
