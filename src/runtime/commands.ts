@@ -10,11 +10,15 @@ import { MinionsError } from '../core/errors.js';
 import { readJson } from '../core/fsutil.js';
 import { emit } from '../core/output.js';
 import { delegateToContainer } from '../host/delegate.js';
-import { buildCoordinatorCommand, launchCoordinator, probeRuntime } from './coordinator.js';
+import { readTelegramAccess } from '../telegram/access.js';
+import { installTelegramPlugin } from '../telegram/install.js';
+import { formatTelegramProbe, probeTelegram } from '../telegram/probe.js';
+import { buildClaudeCommand, buildCoordinatorCommand, launchCoordinator, probeRuntime, readLaunchRecord, runCoordinator, syncCoordinator } from './coordinator.js';
 import { openDb, type Lease, type LeaseRole, type RuntimeDb } from './db.js';
 import { runHook } from './hooks.js';
 import { runtimePaths } from './paths.js';
 import { capacityOf, LEASE_ROLES, Scheduler } from './scheduler.js';
+import { gitCredential } from './github.js';
 import { exportWorkspace, importWorkspace, setupState } from './workspace.js';
 import { workspaceLayout } from './worktree.js';
 
@@ -154,6 +158,22 @@ export function register(program: Command): void {
       const r = await (await scheduler()).release(leaseId, o.reason);
       emit(r, { json: globalOpts(cmd).json, human: (d) => `Released ${d.leaseId} (${d.taskId}); worktree kept at ${d.worktree ?? '-'}` });
     }));
+  work.command('publish <taskId>').description('Publish an approved task (branch / pull-request delivery); idempotent, retryable')
+    .action(action(async (taskId: string, _o: unknown, cmd: Command) => {
+      if (runtimeMode() === 'host') return delegate(cmd);
+      const r = await (await scheduler()).publish(taskId);
+      emit(r, { json: globalOpts(cmd).json, human: (d) => d.message });
+      if (r.state === 'failed') process.exitCode = 1;
+    }));
+  work.command('approve <taskId>').description('Record a human approval to publish the approved head (sensitive paths / "ask" publication)')
+    .requiredOption('--head <sha>', 'the approved head SHA being authorized (binds the approval to that commit)')
+    .option('--by <name>', 'who approved')
+    .option('--note <text>', 'why')
+    .action(action(async (taskId: string, o: { head: string; by?: string; note?: string }, cmd: Command) => {
+      if (runtimeMode() === 'host') return delegate(cmd);
+      const r = (await scheduler()).approvePublication(taskId, { head: o.head, by: o.by, note: o.note });
+      emit(r, { json: globalOpts(cmd).json, human: (d) => d.message });
+    }));
   work.command('list').description('List active leases')
     .option('--all', 'include ended leases')
     .action(action(async (o: { all?: boolean }, cmd: Command) => {
@@ -171,8 +191,8 @@ export function register(program: Command): void {
     .action(async () => { await runHook('pre-agent', hookLoader); process.exitCode = 0; });
 
   // coordinator
-  program.command('coordinator').description('Launch or attach the coordinator Claude Code session (tmux)')
-    .option('--print-command', 'print the launch argv without running it')
+  const coord = program.command('coordinator').description('Launch or attach the coordinator Claude Code session (tmux)')
+    .option('--print-command', 'print the launch argv without running it (no secrets)')
     .option('--probe', 'check that Claude Code and tmux support the launch flags, then exit')
     .action(action(async (o: { printCommand?: boolean; probe?: boolean }, cmd: Command) => {
       const cfg = await getConfig();
@@ -182,11 +202,53 @@ export function register(program: Command): void {
         return;
       }
       if (o.printCommand) {
-        emit(await buildCoordinatorCommand(cfg), { json: globalOpts(cmd).json, human: (c) => JSON.stringify([c.cmd, ...c.args]) });
+        const r = { tmux: await buildCoordinatorCommand(cfg), claude: await buildClaudeCommand(cfg, runtimePaths(), { telegram: cfg.communication.channel === 'telegram' }) };
+        emit(r, { json: globalOpts(cmd).json, human: (d: typeof r) => [JSON.stringify([d.tmux.cmd, ...d.tmux.args]), JSON.stringify([d.claude.cmd, ...d.claude.args])].join('\n') });
         return;
       }
       requireMode('container');
       process.exitCode = await launchCoordinator(cfg);
+    }));
+  coord.command('run').description('Exec wrapper started by tmux: decides Telegram, then runs claude (container only)')
+    .action(action(async () => {
+      requireMode('container');
+      process.exitCode = await runCoordinator(await getConfig());
+    }));
+  coord.command('sync').description('Apply restart-required Telegram changes with a controlled coordinator restart (container only)')
+    .option('--force', 'restart even while worker leases are active (they stay recorded for recovery)')
+    .option('--start-detached', 'start the coordinator session without attaching when it is not running')
+    .action(action(async (o: { force?: boolean; startDetached?: boolean }, cmd: Command) => {
+      requireMode('container');
+      const d = getDb();
+      const r = await syncCoordinator(await getConfig(), {
+        activeLeases: () => d.activeLeases(),
+        recordRestart: (info) => d.setMeta('coordinator_restart', JSON.stringify(info)),
+      }, o);
+      emit(r, { json: globalOpts(cmd).json, human: (x: typeof r) => `coordinator: ${x.action} (${x.reason})` });
+    }));
+
+  // telegram: credential-free capability probe. Host mode delegates to the container, where Claude Code runs.
+  const tg = program.command('telegram').description('Telegram channel plugin support (docs/design/telegram.md)');
+  tg.command('probe').description('Report whether the official Telegram channel plugin is usable (needs no credentials)')
+    .action(action(async (_o: unknown, cmd: Command) => {
+      if (runtimeMode() === 'host') return delegate(cmd);
+      emit(await probeTelegram(), { json: globalOpts(cmd).json, human: formatTelegramProbe });
+    }));
+  tg.command('install').description('Install the official Telegram channel plugin at user scope in the claude volume (needs network, no login)')
+    .action(action(async (_o: unknown, cmd: Command) => {
+      if (runtimeMode() === 'host') return delegate(cmd);
+      const r = await installTelegramPlugin();
+      emit(r, { json: globalOpts(cmd).json, human: (d: typeof r) => [`marketplace ${d.marketplace}; plugin ${d.plugin} (version ${d.version ?? 'unknown'})`, ...d.warnings.map((w) => `warning: ${w}`)].join('\n') });
+    }));
+  tg.command('status').description('Pairing/allowlist policy and whether the running coordinator has Telegram (no codes, ids or tokens)')
+    .action(action(async (_o: unknown, cmd: Command) => {
+      if (runtimeMode() === 'host') return delegate(cmd);
+      const paths = runtimePaths();
+      const r = { access: await readTelegramAccess(paths.telegramStateDir), coordinator: await readLaunchRecord(paths) };
+      emit(r, { json: globalOpts(cmd).json, human: (d: typeof r) => [
+        `access: ${d.access.state} - ${d.access.detail}${d.access.hint ? `\n  hint: ${d.access.hint}` : ''}`,
+        `coordinator: ${d.coordinator ? (d.coordinator.telegram.enabled ? 'Telegram enabled' : `terminal only (${d.coordinator.telegram.reason})`) : 'no launch recorded'}`,
+      ].join('\n') });
     }));
 
   // workspace
@@ -199,12 +261,27 @@ export function register(program: Command): void {
     }));
   ws.command('import <bundlePath>').description('Clone or refresh /workspace/repo from a git bundle')
     .requiredOption('--base <branch>', 'base branch')
-    .option('--remote-url <url>', 'origin URL to record (not fetched)')
+    .option('--remote-url <url>', 'origin URL to record (fetched over https only when a GitHub token is mounted)')
     .action(action(async (bundle: string, o: { base: string; remoteUrl?: string }, cmd: Command) => {
       requireMode('container');
       const r = await importWorkspace(bundle, { base: o.base, remoteUrl: o.remoteUrl, config: await getConfig() });
-      emit(r, { json: globalOpts(cmd).json, human: (d) => `${d.imported ? 'Cloned' : 'Refreshed'} ${d.repo} at ${d.head} (base ${d.base})` });
+      emit(r, { json: globalOpts(cmd).json, human: (d: typeof r) => [`${d.imported ? 'Cloned' : 'Refreshed'} ${d.repo} at ${d.head} (base ${d.base})`,
+        ...(d.origin ? [`origin ${d.origin.url}: ${d.origin.authenticated ? 'authenticated' : 'not authenticated'}, ${d.origin.fetched ? `fetched ${d.base}` : 'not fetched'}`] : []),
+        ...(d.origin?.warnings ?? []).map((w) => `warning: ${w}`)].join('\n') });
     }));
+
+  // git credential helper (configured per repository by `workspace import` when a token is mounted).
+  // Reads the mounted token at use time; answers only `get` for https://github.com; no JSON envelope.
+  program.command('git-credential <operation>', { hidden: true })
+    .description('git credential helper for https://github.com backed by the mounted GitHub token')
+    .action(async (operation: string) => {
+      const chunks: Buffer[] = [];
+      if (!process.stdin.isTTY) for await (const c of process.stdin) chunks.push(c as Buffer);
+      const r = await gitCredential(operation, Buffer.concat(chunks).toString('utf8'));
+      if (r.stderr) process.stderr.write(r.stderr + '\n');
+      if (r.stdout) process.stdout.write(r.stdout);
+      process.exitCode = 0;
+    });
   ws.command('export <outPath>').description('Write a bundle with the base branch and agent/* branches')
     .action(action(async (out: string, _o: unknown, cmd: Command) => {
       requireMode('container');

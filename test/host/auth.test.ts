@@ -200,11 +200,13 @@ describe('provisioning', () => {
     expect(compose).toContain('MINIONS_AUTH_METHOD: "helper"');
     expect(compose).toContain('CLAUDE_CODE_API_KEY_HELPER_TTL_MS:');
 
-    // Switching back to login removes the key file and the mount.
+    // Switching back to login removes the key file and the key-method env (the secrets directory
+    // stays mounted: it also carries the GitHub/Telegram tokens).
     const back = await runAuthSet('login', [], { yes: true }, { cwd: repo });
     expect(back.removedKeyFile).toBe(true);
     expect(() => statSync(p.apiKeyFile)).toThrow();
-    expect(readFileSync(p.composeYaml, 'utf8')).not.toContain('/run/minions/secrets');
+    expect(readFileSync(p.composeYaml, 'utf8')).toContain('MINIONS_AUTH_METHOD: "login"');
+    expect(readFileSync(p.composeYaml, 'utf8')).not.toContain('CLAUDE_CODE_API_KEY_HELPER_TTL_MS');
   });
 
   it('refresh failure keeps the old key and records a redacted error', async () => {
@@ -249,15 +251,16 @@ describe('provisioning', () => {
 });
 
 describe('compose + coordinator', () => {
-  it('mounts the secrets DIRECTORY read-only only for key methods (never the file, never the key)', () => {
+  it('mounts the secrets DIRECTORY read-only (never the file, never the key); key env only for key methods', () => {
     const login = composeYaml(baseProject);
-    expect(login).not.toContain('/run/minions/secrets');
+    expect(login).toContain('target: "/opt/minions/secrets"');
+    expect(login).not.toContain('anthropic-api-key');
     expect(login).toContain('MINIONS_AUTH_METHOD: "login"');
     expect(login).not.toContain('CLAUDE_CODE_API_KEY_HELPER_TTL_MS');
     const y = composeYaml({ ...baseProject, claudeAuth: { method: 'api-key', source: { type: 'env', name: 'K' } } });
     const secrets = projectPaths(baseProject.projectId).secretsDir;
     expect(y).toContain([
-      '      - type: bind', `        source: ${JSON.stringify(secrets)}`, '        target: "/run/minions/secrets"', '        read_only: true',
+      '      - type: bind', `        source: ${JSON.stringify(secrets)}`, '        target: "/opt/minions/secrets"', '        read_only: true',
     ].join('\n'));
     expect(y).not.toContain('anthropic-api-key'); // a directory mount, so atomic replacements stay visible
     expect(y).not.toMatch(/ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN/);
@@ -267,9 +270,9 @@ describe('compose + coordinator', () => {
     expect(runtimeAuthMethod({})).toBe('login');
     expect(runtimeAuthMethod({ MINIONS_AUTH_METHOD: 'helper' })).toBe('helper');
     expect(runtimeAuthMethod({ MINIONS_AUTH_METHOD: 'cat /etc/passwd' })).toBe('login');
-    expect(coordinatorSettings(defaults(), 'login')).not.toHaveProperty('apiKeyHelper');
+    expect(coordinatorSettings(defaults(), { auth: 'login' })).not.toHaveProperty('apiKeyHelper');
     for (const m of ['api-key', 'helper'] as const) {
-      expect(coordinatorSettings(defaults(), m).apiKeyHelper).toBe('cat /run/minions/secrets/anthropic-api-key');
+      expect(coordinatorSettings(defaults(), { auth: m }).apiKeyHelper).toBe('cat /opt/minions/secrets/anthropic-api-key');
     }
   });
 });
@@ -285,7 +288,7 @@ describe('defaults.json and init', () => {
     expect(r.plan.claudeAuth.method).toBe('helper');
     const pj = JSON.parse(readFileSync(projectPaths(r.plan.projectId).projectJson, 'utf8'));
     expect(pj.claudeAuth).toEqual({ method: 'helper', command: [helper] });
-    expect(readFileSync(projectPaths(r.plan.projectId).composeYaml, 'utf8')).toContain('/run/minions/secrets');
+    expect(readFileSync(projectPaths(r.plan.projectId).composeYaml, 'utf8')).toContain('/opt/minions/secrets');
     // Changing the default later does not change the existing project (rerun keeps project.json's setting).
     await runAuthSet('login', [], { yes: true, global: true }, { cwd: env.root });
     const again = await init(repo);

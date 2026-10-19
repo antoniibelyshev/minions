@@ -2,7 +2,7 @@ import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import type { MinionsError } from '../../src/core/errors.js';
-import { buildCoordinatorCommand, coordinatorSettings } from '../../src/runtime/coordinator.js';
+import { buildClaudeCommand, buildCoordinatorCommand, coordinatorSettings } from '../../src/runtime/coordinator.js';
 import { RuntimeDb, SCHEMA_VERSION } from '../../src/runtime/db.js';
 import { runtimePaths } from '../../src/runtime/paths.js';
 import { validateResult } from '../../src/runtime/results.js';
@@ -79,7 +79,7 @@ describe('worker results', () => {
 });
 
 describe('coordinator command', () => {
-  it('builds tmux + claude argv without a shell or bypass mode', async () => {
+  it('builds tmux (exec wrapper) + claude argv without a shell or bypass mode', async () => {
     const root = tmp();
     mkdirSync(join(root, 'plugin'), { recursive: true });
     const prompt = 'You are the coordinator.\nUse $(minions status) literally; no shell.';
@@ -88,16 +88,19 @@ describe('coordinator command', () => {
     const cfg = defaults();
     const c = await buildCoordinatorCommand(cfg, paths);
     expect(c.cmd).toBe('tmux');
-    expect(c.args.slice(0, 8)).toEqual(['-u', 'new-session', '-A', '-s', 'coordinator', '-c', join(root, 'ws', 'repo'), '--']);
-    const claude = c.args.slice(8);
-    expect(claude[0]).toBe('claude');
+    expect(c.args).toEqual(['-u', 'new-session', '-A', '-s', 'coordinator', '-c', join(root, 'ws', 'repo'), '--', 'minions', 'coordinator', 'run']);
+    expect((await buildCoordinatorCommand(cfg, paths, { detached: true })).args.slice(0, 3)).toEqual(['-u', 'new-session', '-d']);
+    const cc = await buildClaudeCommand(cfg, paths);
+    expect(cc.cmd).toBe('claude');
+    const claude = cc.args;
+    expect(claude).not.toContain('--channels');
     expect(claude[claude.indexOf('--plugin-dir') + 1]).toBe(join(root, 'plugin'));
     expect(claude[claude.indexOf('--append-system-prompt') + 1]).toBe(prompt);
     expect(claude[claude.indexOf('--permission-mode') + 1]).toBe('acceptEdits');
     const settings = JSON.parse(claude[claude.indexOf('--settings') + 1]!);
     expect(settings.permissions.allow).toEqual(expect.arrayContaining(['Bash(minions *)', 'Bash(git *)', 'Bash(backlog *)']));
     expect(settings.permissions.deny).toEqual(expect.arrayContaining(['Bash(git push *)', 'Bash(git * push *)']));
-    expect(JSON.stringify(c.args)).not.toMatch(/bypassPermissions/);
+    expect(JSON.stringify([c.args, cc.args])).not.toMatch(/bypassPermissions/);
     expect(coordinatorSettings(cfg).permissions).toMatchObject({ disableBypassPermissionsMode: 'disable' });
   });
   it('reports a missing coordinator prompt', async () => {

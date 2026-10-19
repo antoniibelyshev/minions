@@ -226,9 +226,12 @@ export async function runAuthRefresh(deps: AuthDeps): Promise<{ projectId: strin
 
 const collect = (v: string, prev: string[] = []) => [...prev, v];
 
-/** Registers `minions auth …`. `confirm` prints the plan and asks (TTY only). */
-export function registerAuth(program: Command, confirm: (plan: string) => Promise<boolean>): void {
-  const auth = program.command('auth').description('Show or change how Claude is authorized inside the project container (host-side setting)');
+/**
+ * Registers the `minions auth …` group with the Claude subcommands (show/set/refresh) and returns it,
+ * so host credential subcommands (github, telegram) join the same group. `confirm` prints the plan and asks (TTY only).
+ */
+export function registerAuth(program: Command, confirm: (plan: string) => Promise<boolean>): Command {
+  const auth = program.command('auth').description('Claude authorization (show/set/refresh) and host-held GitHub/Telegram credentials for this project');
 
   auth.command('show')
     .description('Show the method, source, container env (masked) and secret file status; never the key')
@@ -274,4 +277,5 @@ export function registerAuth(program: Command, confirm: (plan: string) => Promis
       const r = await runAuthRefresh({ cwd: process.cwd() });
       emit(r, { json: globalOpts(cmd).json, human: (d: typeof r) => d.refreshed ? `Claude key refreshed at ${d.refreshedAt} (value not shown); mounted at ${CONTAINER.apiKeyFile}.` : d.note! });
     }));
+  return auth;
 }

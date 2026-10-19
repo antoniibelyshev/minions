@@ -71,7 +71,7 @@ export class FakeBacklog implements BacklogAdapter {
     const t = this.add({ id: `task-${this.tasks.size + 1}`, title: input.title, status: input.status ?? 'idea' });
     return { task: t, created: true };
   }
-  async updateTask(id: string, expectedVersion: string, patch: Partial<Pick<Task, 'status' | 'title' | 'description' | 'priority' | 'labels' | 'branch'>>) {
+  async updateTask(id: string, expectedVersion: string, patch: Partial<Pick<Task, 'status' | 'title' | 'description' | 'priority' | 'labels' | 'branch' | 'prUrl'>>) {
     const t = this.must(id);
     if (t.version !== expectedVersion) throw new MinionsError('CONFLICT', `version mismatch for ${id}`);
     Object.assign(t, patch);

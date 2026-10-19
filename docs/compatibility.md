@@ -11,6 +11,9 @@
 | Runtime base image | `node:22-bookworm-slim@sha256:c3de60bf2f9dd0ac6370e6117950ff62d6e339527e7472301c9c78a017978392` (Node 22.23.3) | Multi-arch index digest, resolved 2026-10-19. |
 | Claude Code (in image) | `@anthropic-ai/claude-code@2.1.292` | Pinned in `docker/Dockerfile`; auto-updater disabled. |
 | Backlog.md (in image) | `backlog.md@1.54.0` | Pinned in `docker/Dockerfile`. |
+| GitHub CLI (in image) | `gh` 2.102.0 (official release tarball `gh_2.102.0_linux_{amd64,arm64}.tar.gz`) | Pinned in `docker/Dockerfile` with SHA-256 per architecture (`ADD --checksum`, BuildKit). Real binary at `/opt/gh/bin/gh`; `/usr/local/bin/gh` is the token wrapper (`docker/gh-wrapper.sh`). Image with gh not yet built/tested. |
+| Telegram channel plugin | `telegram@claude-plugins-official` 0.0.7 (marketplace commit `1e96c6b`) | Interface read and install verified on Claude Code 2.1.292 without credentials. Not bundled: `minions start` runs `minions telegram install` (user scope, claude volume) when `communication.channel` is `telegram`; other versions get a warning. `minions telegram probe` and doctor checks `telegram.*` report readiness. No live bot/pairing run recorded yet. See [design/telegram.md](design/telegram.md). |
+| Bun (in image) | `1.4.3` (`bun-linux-aarch64`, `bun-linux-x64-baseline`) | Pinned with SHA-256 checksums from the release `SHASUMS256.txt` in `docker/Dockerfile`, fetched in a throwaway build stage; runs the Telegram plugin's MCP server. The aarch64 checksum was re-verified against the downloaded archive on 2026-10-19. The updated image has not been built in the development sandbox (no Docker there). |
 | System packages (in image) | git, tmux, ca-certificates, ripgrep, less, procps (Debian bookworm) | Installed at build time only. |
 
 `MINIONS_DOCKER_TESTS=1 npx vitest run test/docker` builds the image (tag `minions-test-runtime:latest`),
@@ -37,7 +40,8 @@ It uses a temp `MINIONS_HOME` and disposable repos and removes its containers an
   rebuilds it when the installed package differs, and `doctor` warns about a stale image.
 - **Claude authorization** defaults to an interactive `/login` inside the container (stored in the
   project's `claude` volume). Host-provisioned keys (`minions auth set api-key|helper|jbcentral`) are
-  supported: the key file is mounted read-only as a directory at `/run/minions/secrets` and Claude
+  supported: the key file (`anthropic-api-key`) lives in the secrets directory mounted read-only at
+  `/opt/minions/secrets` (shared with the GitHub/Telegram tokens) and Claude
   Code 2.1.292 reads it through `apiKeyHelper` (re-read every `CLAUDE_CODE_API_KEY_HELPER_TTL_MS` =
   5 min). `npm run e2e` verifies this with a fake helper and a fake local endpoint: the key is
   readable and read-only in the container, a refreshed key becomes visible without a restart, the
@@ -46,6 +50,10 @@ It uses a temp `MINIONS_HOME` and disposable repos and removes its containers an
   `127.0.0.1:19516`) is not exercised by the automated tests; reaching the host proxy at
   `host.docker.internal` was verified manually on Docker Desktop. Other engines get an
   `extra_hosts: host.docker.internal:host-gateway` entry (untested). Host login reuse is not supported.
+- **Secret file ownership**: the materialized files in `/opt/minions/secrets` (GitHub token, Telegram
+  bot token, Claude key) are 0600 files owned by the host user. Docker Desktop on macOS maps bind-mount ownership so the
+  container user (uid 1000) can read it. On a Linux Docker Engine whose host user is not uid 1000,
+  the container cannot read it (untested).
 - **Outbound network is unrestricted** in the container (`network: outbound-internet`). There is no
   egress allowlist, and the container can reach the host/LAN like any Docker Desktop container.
 - **Single container, shared credentials**: engineer, tester, and reviewer run in one container and
@@ -54,6 +62,16 @@ It uses a temp `MINIONS_HOME` and disposable repos and removes its containers an
   untracked, and ignored files are never imported; tracked secret-looking files trigger a warning
   but detection is best effort.
 - **Deferred features** (reported as unavailable by `minions doctor`): GitHub Issues backend,
-  branch/PR/auto-merge delivery, review publication, Telegram, config plan/apply transactions,
-  backlog migration, upgrade, budgets, companion containers, GitHub credential provisioning.
+  auto-merge and merge requests, review publication, the Telegram notification outbox, config plan/apply transactions,
+  backlog migration, upgrade, budgets, companion containers.
+- **Telegram bot token exposure inside the container**: the token is mounted read-only and given only to
+  the coordinator's `claude` process environment, but the coordinator's tools (and workers' Bash, which
+  run in the same process tree) can read it. Revoke it in BotFather (`/revoke`) if the container is compromised.
+- **Telegram preview**: `--channels` is a research-preview flag hidden from `claude --help`; whether the
+  channel registered is visible only in the coordinator's startup notice. The plugin runs `bun install`
+  at each start, so it needs npm registry access.
 - Native macOS/iOS builds (Xcode) cannot run inside the Linux runtime.
+- **Keychain access list**: the GitHub and Telegram Keychain items are created without a `-T` access list, so any
+  process running as your macOS user can read them (normal macOS behaviour). The plaintext copy mounted into the
+  container is cleared when `minions start` fails to bring the container up and by `minions doctor` when the container is
+  confirmed gone (exited, dead or absent; an uncertain state only produces a warning); the Keychain/file-store originals are never removed by that cleanup.

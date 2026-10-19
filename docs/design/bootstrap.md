@@ -9,24 +9,24 @@ reported as unavailable by `doctor` and the wizard, never faked.
 
 In:
 - Host CLI: `init [path]`, `doctor`, `start`, `down`, `status`, `pause`, `resume`,
-  `import`, `export`, `config show`, `uninstall`. All support `--json`; mutating ones `--dry-run`.
+  `import`, `export`, `config show`, `auth show|set|refresh`, `auth github`, `auth telegram`, `uninstall`. All support `--json`; mutating ones `--dry-run`.
 - Runtime CLI (inside container): `backlog ready|list|show|create|update|note`,
   `work claim|record|release|list`, `hook stop|pre-agent`, `coordinator`, `status`, `pause`, `resume`.
 - Profiles `project-owner`, `personal-work`, `supervised`; shared + private visibility.
-- Backlog.md backend only. Delivery mode `local` only (commits on `agent/<slug>` branches in the container clone, fetched to host with `minions export`).
-- Terminal communication only.
+- Backlog.md backend only. Delivery modes `local` (default; commits on `agent/<slug>` branches in the container clone, fetched to host with `minions export`), and, for the github provider, `branch` and `pull-request` (see "Branch and pull-request delivery"). minions never merges.
+- Terminal communication, plus optional Telegram through the official channel plugin (see [telegram.md](telegram.md)).
 - One Docker container per project, security baseline from spec §3A.
 - Claude auth inside the container (interactive `/login`, persisted in the claude volume) by default, or
   host-provisioned keys: host-only `claudeAuth` in project.json (`api-key` from file/Keychain/env, or a
   `helper` argv such as the `jbcentral` preset), written to `projects/<id>/secrets/anthropic-api-key`
-  (0600), the `secrets` directory bind-mounted ro at `/run/minions/secrets`, and the coordinator
-  `--settings` gaining `apiKeyHelper: "cat /run/minions/secrets/anthropic-api-key"` when
+  (0600), the `secrets` directory bind-mounted ro at `/opt/minions/secrets`, and the coordinator
+  `--settings` gaining `apiKeyHelper: "cat /opt/minions/secrets/anthropic-api-key"` when
   `MINIONS_AUTH_METHOD` (compose env) is a key method. Commands: `auth show|set|refresh`.
   Global default in `<MINIONS_HOME>/defaults.json`.
 
-Deferred (report as unavailable): GitHub Issues backend, branch/PR/auto-merge delivery,
-review publication, Telegram, config plan/apply transactions, backlog migration, upgrade,
-budgets, companion containers, GitHub credential provisioning.
+Deferred (report as unavailable): GitHub Issues backend, auto-merge and merge requests,
+review publication, config plan/apply transactions, backlog migration, upgrade,
+budgets, companion containers.
 
 ## Recorded low-impact decisions
 
@@ -36,11 +36,134 @@ budgets, companion containers, GitHub credential provisioning.
 - Plugin name `minions`; agents `engineer`, `tester`, `reviewer` resolve as `minions:engineer` etc. Skills `orchestrate`, `status`, `intake`, `recover`, `maintain-context` resolve as `/minions:<name>`.
 - Backlog.md project lives in `/state/backlog` for **both** visibilities in v0.1 (single writer, never on implementation branches). Versioning a shared backlog in Git is deferred.
 - Container reads effective config from a read-only mount; it cannot change config in v0.1.
-- Workspace is seeded from a Git bundle of the host repo's committed HEAD branch (`minions import`), so no GitHub credentials are needed. The real `origin` URL is recorded but unused until PR delivery exists.
+- Workspace is seeded from a Git bundle of the host repo's committed HEAD branch (`minions import`), so no GitHub credentials are needed. The real `origin` URL is recorded; it is fetched (over https, via the credential helper) only when a GitHub token is mounted.
 - Commits inside the container use the host's `git config user.name/email` (copied as plain values at init, shown in the plan).
 - Coordinator permission mode defaults to `acceptEdits` with an allowlist for `minions`, `git`, and `backlog` commands. Never `bypassPermissions`.
 - Pinned in image: base `node:22-bookworm-slim` (digest pinned in Dockerfile), `@anthropic-ai/claude-code@2.1.292`, `backlog.md@1.54.0`. Tested range documented in `docs/compatibility.md`.
 - No `--append-system-prompt-file` exists in Claude Code 2.1.292; the launcher reads the coordinator prompt file and passes it with `--append-system-prompt` as an argv element (no shell).
+
+## GitHub credential
+
+A per-project fine-grained personal access token, provisioned only by the host CLI
+(`src/host/credentials.ts`). Inside the container git and gh use it (see "GitHub in the
+container"), and branch/pull-request delivery publishes with it; CI observation is a later task.
+
+- **Entry.** `minions auth github` (and, for repositories with a GitHub remote, an optional offer at
+  the end of an interactive `minions init`) reads the token from the host terminal in raw mode with
+  no echo, or from a pipe with `--stdin`. There is no `--token` flag; the token is never in argv,
+  config, the plan, logs, or `--json` output. The wizard questions themselves never ask for secrets.
+- **Guidance.** Setup prints the creation link (`https://github.com/settings/personal-access-tokens/new`)
+  and the repository permissions: Contents read/write, Pull requests read/write, Checks read,
+  Actions read, Commit statuses read, Metadata read. Nothing else.
+- **Verification.** Before storing, `GET /repos/<owner>/<repo>` (or `/user` without a GitHub
+  remote) with the token in the `Authorization` header only. 401/403/404 → not stored. A network
+  failure stores it with a warning. `doctor` repeats the call and reports
+  `github.credential: ok | missing | invalid | unverified`.
+- **Storage.** macOS Keychain (generic password, service `minions.github`, account = project id)
+  when `security` works; otherwise `<host data root>/credentials/<projectId>/github-token`
+  (0600 file, 0700 dirs). `MINIONS_CREDENTIAL_STORE=file|keychain` overrides. Storage is refused
+  if the host data root is inside the repository. `security add-generic-password -w <secret>`
+  would expose the token in argv, so the Keychain write goes through `security -i` with the
+  command on stdin and is verified by reading it back.
+- **Reference.** `projects/<id>/credentials.json` (0600, host only, not in the manifest) holds
+  `{backend, ref, kind, updatedAt}`, never the token. `config show`, the shared config, and
+  `project.json` contain no credential data.
+- **Mount.** The token is materialized into `projects/<id>/secrets/github-token` (0600, atomic
+  rename) on `minions start` and on `auth github` while the container runs, and removed on
+  `minions down` and `uninstall`. Compose bind-mounts the **directory** read-only at
+  `/opt/minions/secrets` (`GITHUB_TOKEN_CONTAINER_PATH` = `/opt/minions/secrets/github-token` in
+  `src/core/paths.ts`). Mounting the directory rather than the file keeps replaced tokens (new inode)
+  visible without recreating the container. The Keychain and the credentials directory are never mounted.
+- **Uninstall** keeps the stored token, as it keeps other credentials. `minions auth github --remove`
+  deletes it.
+
+## GitHub in the container
+
+Decision record for git/gh authentication inside the runtime (`src/runtime/github.ts`,
+`docker/gh-wrapper.sh`). The token is read from `GITHUB_TOKEN_CONTAINER_PATH` **at use time**
+(absent, replaced, or removed at any moment); it is never copied into git config, remote URLs,
+argv, environment files, tmux, or Claude Code settings.
+
+- **git.** `minions workspace import` with a readable token and a github.com remote sets `origin` to
+  the normalized `https://github.com/<owner>/<repo>.git` (scp/ssh forms and any URL userinfo are
+  dropped), configures the repository-level `credential.https://github.com.helper` as an empty
+  entry (resets inherited helpers) followed by `/usr/local/bin/minions git-credential`, and fetches
+  the base branch into `refs/remotes/origin/<base>` (a failed fetch only warns). Worktrees share the
+  repository config, so push/fetch from any worktree authenticates the same way.
+- **Helper.** `minions git-credential <op>` (hidden) answers only `get` for `protocol=https`,
+  `host=github.com`, emitting `username=x-access-token` and `password=<token>` on stdout to git.
+  `store`/`erase`/other hosts produce nothing. Absent or malformed token: no output plus a stderr
+  diagnostic; git then fails non-interactively (`GIT_TERMINAL_PROMPT=0`).
+- **gh.** `/usr/local/bin/gh` is a POSIX sh wrapper; the pinned real binary lives at
+  `/opt/gh/bin/gh` (off `PATH`). The wrapper reads the token file and sets `GH_TOKEN` only in the
+  environment of the `exec`'d gh process. Chosen over `gh auth login` (which would persist the
+  token in `~/.config/gh/hosts.yml`) and over a global `GH_TOKEN` (which would leak into tmux and
+  every child process). No token file: gh runs unauthenticated.
+- **Unreadable token** (e.g. a Linux Docker Engine host whose user is not uid 1000, so the 0600
+  file is not readable by container uid 1000): import does not fail; origin is recorded verbatim as
+  without a credential and the result carries `origin.authenticated: false` with a precise warning
+  (path, container uid, file owner and mode). The helper and the gh wrapper print the same diagnosis.
+- **No token file**: identical to the previous behaviour — the recorded URL is stored verbatim,
+  never fetched, no helper is configured, and the import result has no `origin` field.
+
+## Branch and pull-request delivery
+
+Decision record for `delivery.mode` `branch` / `pull-request` (`src/runtime/publish.ts`,
+`Scheduler.publish` / `approvePublication` in `src/runtime/scheduler.ts`).
+
+- **Config.** Both modes need `delivery.provider: "github"` (cross-field validation). `merge` stays
+  `disabled`; `manual` / `auto-when-eligible` validate but are reported unavailable (deferred).
+  `project-owner` defaults to `pull-request` only when the repository has a github.com remote **and** a
+  token is already stored for the project; otherwise `local` with a note. The init wizard offers
+  `local/branch/pull-request` under the same condition and otherwise shows the reason and keeps
+  `local` (also for `--config` files that ask for branch/PR delivery). `doctor` `merge.readiness`
+  reports whether PR delivery is available and that auto-merge is deferred.
+- **Where publication runs.** Synchronously inside `minions work record` when a reviewer approval is
+  accepted (tester evidence for the same head and config revision as before), plus
+  `minions work publish <taskId>` to retry. One `publications` row per task (DB schema 2) is
+  written in the same transaction that ends the reviewer lease (`pending`, bound to the approved
+  head and config revision), so a crash between approval and publication is resumable. The response
+  carries `publication` (`state`, `status`, `prUrl`, `merged: false`).
+- **Outcomes.** `published` → backlog `delivered` with `prUrl` (pull-request mode) and `branch` in the
+  task meta; an open PR is reported as delivered, never merged. `awaiting-approval` → `awaiting-human`.
+  `failed` (network, auth, permission, diverged remote, moved branch, stale evidence) → `blocked`
+  with a note; the local branch and worktree are never touched. Nothing is reported delivered until
+  publication succeeded.
+- **Gates (deterministic).** `git.push` (and `pr.create` in pull-request mode) are evaluated with
+  `can()` against the paths changed by `git diff --name-only --no-renames <base>...<head>` (renames split
+  so moving a file out of a sensitive path counts). `deny` fails. `ask` — including the
+  sensitive-path upgrade allow→ask — requires a human approval recorded with
+  `minions work approve <taskId> --head <sha>` (`approvals` table, scope `publish`, bound to the head;
+  a new commit needs a new approval). The coordinator's Claude Code settings put that command under
+  `ask` (Claude Code prompts the user every time; ask beats the `minions *` allow) and deny
+  `git push` / `gh pr merge`; the user can also run it on the host (delegated into the container).
+  Within one container this is policy plus the permission prompt, not a cryptographic separation.
+- **Idempotency.** `git ls-remote` first: a remote branch already at the approved head is not pushed
+  again; a remote branch that is not an ancestor of the head is a `CONFLICT` (never force-pushed);
+  otherwise `git push origin <head>:refs/heads/agent/<slug>` (exactly the approved commit, authenticated
+  by the repository credential helper). Then `gh pr list --repo <owner/repo> --head agent/<slug> --state
+  all`: an open same-repository PR is reused (as is a merged one for the same head); otherwise exactly
+  one `gh pr create --base <base> --head agent/<slug> --title … --body-file -` (body on stdin). If create
+  fails (e.g. a concurrent run opened it) the list is re-read once before failing.
+- **PR text.** Title, objective (description, minions meta stripped) and acceptance criteria only.
+  Shared installations append the task id and head SHA; private installations add nothing else. Notes,
+  handoffs, worker results and decision records are never read for PR text.
+
+## Telegram bot token
+
+A second credential kind on the same mechanism (`CredentialKind` in `src/host/credentials.ts`;
+stores, reference file, and secrets mount are shared, not duplicated). Full design: [telegram.md](telegram.md).
+
+- **Entry.** `minions auth telegram` (and, when `communication.channel` is `telegram`, an offer at the
+  end of an interactive `minions init`), hidden prompt or `--stdin`. Format `^\d{6,12}:[A-Za-z0-9_-]{30,64}$`
+  is checked before the value reaches any store, environment, or `security -i` line.
+  `--verify` (wizard: explicit consent) calls the Bot API `getMe`.
+- **Storage.** Keychain service `minions.telegram`, or `<host data root>/credentials/<projectId>/telegram-bot-token`.
+  `credentials.json` records `{backend, ref, botId, updatedAt}`; the numeric bot id is not secret and
+  detects one bot provisioned for two projects (warning at provisioning and in doctor).
+- **Mount.** `projects/<id>/secrets/telegram-bot-token` → `/opt/minions/secrets/telegram-bot-token` (ro).
+  Only `minions coordinator run` reads it, and passes it to the coordinator's `claude` process as
+  `TELEGRAM_BOT_TOKEN`. A token change applied to a running container triggers a controlled restart.
 
 ## Repository layout
 
@@ -246,7 +369,8 @@ Scheduler rules:
   Valid: checks `headSha` equals actual branch head (else invalid "stale head").
   Transitions: engineer complete→testing; tester complete→reviewing, needs_changes→changes-requested;
   reviewer complete(approve)→delivered (local mode) — requires tester evidence for the same head
-  when `testerRequired`; needs_changes→changes-requested (repairs++); blocked→blocked;
+  when `testerRequired`; in branch/pull-request mode the approval starts publication instead and the
+  final status comes from it (see "Branch and pull-request delivery"); needs_changes→changes-requested (repairs++); blocked→blocked;
   needs_split→awaiting-human with `needsSplit` flag for the coordinator; partial→ unchanged with note.
   When repairs ≥ `maxRepairCyclesBeforeReplan`, response includes `replan: true` and status →
   awaiting-human. Records evidence keyed by head SHA + config revision. Releases the lease.

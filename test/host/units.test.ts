@@ -43,12 +43,12 @@ describe('compose generation', () => {
     expect(y).toContain('name: "minions-3f2b8c1e"');
   });
 
-  it('bind mounts only the plugin and runtime config dirs, read-only', () => {
+  it('bind mounts only the plugin, runtime config and secrets dirs, read-only', () => {
     const y = composeYaml(project());
     const p = projectPaths(ID);
     const binds = [...y.matchAll(/- type: bind\n\s+source: "([^"]+)"\n\s+target: "([^"]+)"\n\s+read_only: (\w+)/g)].map((m) => [m[1], m[2], m[3]]);
-    expect(binds).toEqual([[p.pluginDir, '/opt/minions/plugin', 'true'], [p.runtimeDir, '/opt/minions/config', 'true']]);
-    expect(y.match(/type: bind/g)).toHaveLength(2);
+    expect(binds).toEqual([[p.pluginDir, '/opt/minions/plugin', 'true'], [p.runtimeDir, '/opt/minions/config', 'true'], [p.secretsDir, '/opt/minions/secrets', 'true']]);
+    expect(y.match(/type: bind/g)).toHaveLength(3);
     const vols = [...y.matchAll(/- type: volume\n\s+source: (\w+)\n\s+target: "([^"]+)"/g)].map((m) => [m[1], m[2]]);
     expect(vols).toEqual([['workspace', '/workspace'], ['state', '/state'], ['claude', '/home/node/.claude'], ['cache', '/home/node/.cache']]);
   });
@@ -203,9 +203,71 @@ describe('wizard', () => {
     expect(r.config.container.publishPorts).toEqual([{ host: 3000, container: 3000 }]);
     expect(r.config.verification.commands).toEqual(['npm run lint', 'npm test']);
     expect(info.join('\n')).toMatch(/GitHub Issues \(not available in v0\.1\)/);
-    expect(info.join('\n')).toMatch(/Telegram \(not available in v0\.1\)/);
-    expect(info.join('\n')).toMatch(/pull requests, auto-merge \(not available in v0\.1\)/);
+    expect(info.join('\n')).toMatch(/Telegram through the official Claude Code channel plugin/);
+    expect(r.config.communication.channel).toBe('terminal');
+    expect(info.join('\n')).toMatch(/Branch push and pull requests are not selectable: the repository has no GitHub remote/);
+    expect(info.join('\n')).toMatch(/Auto-merge \(not available in v0\.1\)/);
+    expect(questions.some((q) => q.startsWith('Delivery mode'))).toBe(false);
+    expect(r.config.delivery.mode).toBe('local');
     for (const q of questions) expect(q).not.toMatch(/token|password|secret|api key/i);
+  });
+
+  it('offers branch/pull-request delivery only with a GitHub remote and a stored token', async () => {
+    const repo = makeRepo(env.root);
+    const { execFileSync } = await import('node:child_process');
+    execFileSync('git', ['-C', repo, 'remote', 'add', 'origin', 'git@github.com:acme/demo.git']);
+    const discovery = await discover(repo);
+    const run = async (githubCredential: boolean, mode = 'pull-request') => {
+      const questions: string[] = [], info: string[] = [];
+      const io: WizardIO = {
+        ask: async (q, def) => { questions.push(q); return q.startsWith('Starting profile') ? '1' : q.startsWith('Delivery mode') ? mode : def; },
+        info: (l) => info.push(l),
+      };
+      const r = await runWizard({ discovery, projectId: ID, yes: false, io, githubCredential });
+      return { r, questions, info: info.join('\n') };
+    };
+    const ok = await run(true);
+    expect(ok.questions.some((q) => q.startsWith('Delivery mode (local/branch/pull-request)'))).toBe(true);
+    expect(ok.r.config.delivery).toMatchObject({ mode: 'pull-request', provider: 'github', merge: 'disabled' });
+    expect(ok.info).toMatch(/minions never merges/);
+    expect((await run(true, 'branch')).r.config.delivery.mode).toBe('branch');
+    expect((await run(true, 'local')).r.config.delivery.mode).toBe('local');
+
+    const noToken = await run(false);
+    expect(noToken.questions.some((q) => q.startsWith('Delivery mode'))).toBe(false);
+    expect(noToken.r.config.delivery.mode).toBe('local');
+    expect(noToken.info).toMatch(/not selectable: no GitHub token is stored for this project \(run `minions auth github`/);
+
+    // --yes: project-owner defaults to pull-request only when the token exists.
+    expect((await runWizard({ discovery, projectId: ID, yes: true, githubCredential: true })).config.delivery.mode).toBe('pull-request');
+    const fallback = await runWizard({ discovery, projectId: ID, yes: true });
+    expect(fallback.config.delivery.mode).toBe('local');
+    expect(fallback.notes.join('\n')).toMatch(/pull-request delivery .* no GitHub token/);
+  });
+
+  it('does not offer branch/pull-request under a profile that denies git.push (supervised)', async () => {
+    const repo = makeRepo(env.root);
+    const { execFileSync } = await import('node:child_process');
+    execFileSync('git', ['-C', repo, 'remote', 'add', 'origin', 'git@github.com:acme/demo.git']);
+    const discovery = await discover(repo);
+    const questions: string[] = [], info: string[] = [];
+    const io: WizardIO = { ask: async (q, def) => { questions.push(q); return def; }, info: (l) => info.push(l) };
+    const r = await runWizard({ discovery, projectId: ID, yes: false, io, githubCredential: true, profile: 'supervised' });
+    expect(questions.some((q) => q.startsWith('Delivery mode'))).toBe(false);
+    expect(r.config.delivery.mode).toBe('local');
+    expect(info.join('\n')).toMatch(/not selectable: the profile denies git\.push/);
+  });
+
+  it('--config with pull-request delivery falls back to local without a GitHub remote, with a reason', async () => {
+    const repo = makeRepo(env.root);
+    const { writeFileSync } = await import('node:fs');
+    const cfg = profileDefaults('project-owner', { hasGitHub: true, hasGitHubCredential: true, baseBranch: 'main', identity: { name: 'A', email: 'a@b' }, projectId: ID, packageVersion: '0.1.0' }).config;
+    expect(cfg.delivery.mode).toBe('pull-request');
+    const file = join(env.root, 'pr.json');
+    writeFileSync(file, JSON.stringify(cfg));
+    const r = await runWizard({ discovery: await discover(repo), projectId: ID, yes: false, configFile: file, githubCredential: true });
+    expect(r.config.delivery).toMatchObject({ mode: 'local', provider: 'none' });
+    expect(r.notes.join('\n')).toMatch(/delivery.mode "pull-request" is not selectable: the repository has no GitHub remote/);
   });
 
   it('--yes accepts profile defaults without asking', async () => {

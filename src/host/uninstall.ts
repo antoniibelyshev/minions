@@ -5,6 +5,7 @@ import { dirname } from 'node:path';
 import { MinionsError } from '../core/errors.js';
 import { sha256 } from '../core/fsutil.js';
 import { projectPaths, volumeNames } from '../core/paths.js';
+import { clearSecrets, loadCredentialRefs } from './credentials.js';
 import { Compose, type Runner } from './docker.js';
 import { loadManifest } from './install.js';
 import { loadRegistry, projectForPath, saveRegistry } from './registry.js';
@@ -56,6 +57,11 @@ export async function runUninstall(opts: UninstallOptions): Promise<UninstallRes
     else kept.push({ path: f.path, reason: 'modified since generation' });
   }
 
+  // Credentials are preserved by default (spec: uninstall keeps credentials).
+  const refs = await loadCredentialRefs(projectId).catch(() => undefined);
+  if (refs?.github) kept.push({ path: refs.github.ref, reason: 'GitHub token kept; run `minions auth github --remove` before uninstalling to delete it' });
+  if (refs?.telegram) kept.push({ path: refs.telegram.ref, reason: 'Telegram bot token kept; run `minions auth telegram --remove` before uninstalling to delete it (or revoke it in BotFather)' });
+
   let container: UninstallResult['container'] = 'skipped';
   if (!opts.dryRun) {
     // Stop the container before its compose file goes away.
@@ -70,7 +76,9 @@ export async function runUninstall(opts: UninstallOptions): Promise<UninstallRes
     for (const p of toRemove) { await rm(p, { force: true }); removed.push(p); await pruneEmptyDirs(dirname(p), p.startsWith(paths.dir) ? paths.dir : entry.repoPath); }
     await rm(paths.manifestJson, { force: true });
     await rm(paths.journalJson, { force: true });
-    // Host-provisioned Claude key copy and its non-secret refresh state (the original source is untouched).
+    // The container is gone: drop the materialized GitHub/Telegram token copies, the host-provisioned
+    // Claude key copy (its original source is untouched), the mount dir, and the non-secret refresh state.
+    await clearSecrets(projectId);
     await rm(paths.secretsDir, { recursive: true, force: true });
     await rm(paths.authStateJson, { force: true });
     await rm(paths.logsDir, { recursive: true, force: true });

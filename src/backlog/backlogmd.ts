@@ -298,10 +298,12 @@ export class BacklogMdAdapter implements BacklogAdapter {
     }
     const descChanged = patch.description !== undefined && patch.description.trim() !== cur.description;
     const branchChanged = 'branch' in patch && patch.branch !== undefined && patch.branch !== cur.branch;
-    if (descChanged || branchChanged) {
+    const prUrlChanged = 'prUrl' in patch && patch.prUrl !== undefined && patch.prUrl !== cur.prUrl;
+    if (descChanged || branchChanged || prUrlChanged) {
       const parsed = parseDescription(raw.description);
       const meta: MinionsMeta = { provenance: cur.provenance, ...parsed.meta };
       if (branchChanged) meta.branch = patch.branch ?? null;
+      if (prUrlChanged) meta.prUrl = patch.prUrl ?? null;
       const desc = descChanged ? composeDescription(patch.description!, meta) : replaceMeta(raw.description ?? '', meta);
       args.push(`--description=${desc}`);
     }

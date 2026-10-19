@@ -17,10 +17,10 @@ const q = (s: string | number) => JSON.stringify(String(s)); // JSON strings are
 /**
  * Generates compose.yaml for one project. Security baseline (spec §3A, bootstrap "Container"):
  * non-root, read-only rootfs, all caps dropped, no-new-privileges, resource limits, tmpfs for /tmp
- * and /home/node, named volumes for state, ro binds only for the plugin and runtime config,
+ * and /home/node, named volumes for state, ro binds only for the plugin, runtime config and secrets dir,
  * loopback-only published ports, no Docker socket, no privileged mode, no host network/PID.
- * Claude key methods (api-key/helper) add the secrets DIRECTORY as a read-only bind (a directory, so
- * atomically replaced key files are visible) and MINIONS_AUTH_METHOD; the key itself is never here.
+ * The secrets DIRECTORY is always a read-only bind (a directory, so atomically replaced files are
+ * visible); Claude key methods (api-key/helper) add MINIONS_AUTH_METHOD/TTL env; secrets are never here.
  */
 export function composeYaml(p: ProjectJson): string {
   const paths = projectPaths(p.projectId);
@@ -60,6 +60,8 @@ export function composeYaml(p: ProjectJson): string {
     '      XDG_CACHE_HOME: "/home/node/.cache"',
     `      MINIONS_AUTH_METHOD: ${q(auth.method)}`,
     ...(isKeyAuth(auth) ? [`      CLAUDE_CODE_API_KEY_HELPER_TTL_MS: ${q(KEY_HELPER_TTL_MS)}`] : []),
+    // Bun (Telegram plugin dependencies) caches in the cache volume; /home/node itself is tmpfs.
+    '      BUN_INSTALL_CACHE_DIR: "/home/node/.cache/bun"',
     ...Object.entries(extraEnv).map(([k, v]) => `      ${k}: ${q(v)}`),
     // host.docker.internal is built into Docker Desktop; other engines need the host-gateway alias.
     ...(process.platform !== 'darwin' && c.network !== 'none' && Object.values(extraEnv).some((v) => v.includes('host.docker.internal'))
@@ -80,7 +82,11 @@ export function composeYaml(p: ProjectJson): string {
     '        bind:', '          create_host_path: false');
   bind(paths.pluginDir, CONTAINER.pluginDir);
   bind(paths.runtimeDir, CONTAINER.configDir);
-  if (isKeyAuth(auth)) bind(paths.secretsDir, CONTAINER.secretsDir);
+  // Secrets: a directory mount (never a single-file mount) so a key/token replaced on the host via
+  // rename (new inode) is visible without recreating the container. Only the Claude key copy and
+  // materialized GitHub/Telegram tokens live here; the host credential store (Keychain / credentials
+  // dir) and the Claude key source are never mounted.
+  bind(paths.secretsDir, CONTAINER.secretsDir);
   if (c.publishPorts.length && c.network !== 'none') {
     L.push('    ports:');
     for (const { host, container } of c.publishPorts) L.push(`      - ${q(`127.0.0.1:${host}:${container}`)}`);
@@ -123,6 +129,48 @@ export class Compose {
     return r.code === 0 && r.stdout.trim().length > 0;
   }
 
+  /**
+   * Tri-state container status for destructive decisions. `absent` only when `ps -a` succeeded and shows
+   * no container, or the single container is exited/dead. Errors, timeouts, malformed output, several
+   * containers, or restarting/paused/created states are `unknown` (never deleted).
+   */
+  async containerState(): Promise<{ state: 'running' | 'absent' | 'unknown'; reason: string }> {
+    let r: RunResult;
+    try { r = await this.compose(['ps', '-a', '--format', 'json', SERVICE_NAME], { allowFailure: true, timeoutMs: 30_000 }); }
+    catch (e) { return { state: 'unknown', reason: `docker compose ps failed (${String((e as Error).message ?? e).slice(0, 120)})` }; }
+    if (r.code !== 0) return { state: 'unknown', reason: `docker compose ps exited with code ${r.code}` };
+    const out = r.stdout.trim();
+    if (!out) return { state: 'absent', reason: 'no container exists' };
+    let items: unknown[];
+    try {
+      const parsed: unknown = out.startsWith('[') ? JSON.parse(out) : out.split('\n').filter((l) => l.trim()).map((l) => JSON.parse(l));
+      items = Array.isArray(parsed) ? parsed : [parsed];
+    } catch { return { state: 'unknown', reason: 'could not parse docker compose ps output' }; }
+    if (items.length === 0) return { state: 'absent', reason: 'no container exists' };
+    if (items.length > 1) return { state: 'unknown', reason: 'more than one container reported' };
+    const st = (items[0] as { State?: unknown } | null)?.State;
+    if (typeof st !== 'string') return { state: 'unknown', reason: 'container state missing from docker compose ps output' };
+    if (st === 'exited' || st === 'dead') return { state: 'absent', reason: `container is ${st}` };
+    if (st === 'running') return { state: 'running', reason: 'container is running' };
+    return { state: 'unknown', reason: `container is ${st}` };
+  }
+
+  /** True when the running container has the secrets dir bind-mounted (false for one created from a pre-upgrade compose.yaml). */
+  async hasSecretsMount(): Promise<boolean> {
+    const ps = await this.compose(['ps', '--status', 'running', '-q', SERVICE_NAME], { allowFailure: true, timeoutMs: 30_000 });
+    const id = ps.stdout.trim().split('\n')[0]?.trim();
+    if (ps.code !== 0 || !id) return false;
+    const r = await this.runner('docker', ['inspect', '--format', '{{json .Mounts}}', id], { allowFailure: true, timeoutMs: 30_000 });
+    if (r.code !== 0) return false;
+    try { return (JSON.parse(r.stdout) as { Destination?: string }[]).some((m) => m.Destination === CONTAINER.secretsDir); } catch { return false; }
+  }
+
+  /** Whether a freshly written secret copy would reach the container: running with the mount, running without it, or not running. */
+  async secretsVisibility(): Promise<'mounted' | 'restart-required' | 'not-running'> {
+    if (!(await this.isRunning().catch(() => false))) return 'not-running';
+    return (await this.hasSecretsMount().catch(() => false)) ? 'mounted' : 'restart-required';
+  }
+
   /** Non-interactive exec (no TTY); output captured. */
   exec(args: string[], opts: RunOptions = {}): Promise<RunResult> {
     return this.compose(['exec', '-T', SERVICE_NAME, ...args], opts);
@@ -158,7 +206,7 @@ export async function imageBuildLabel(tag: string, runner: Runner = run): Promis
 
 /** Fingerprint of what goes into the image from the package (null when dist/ is not built). */
 export function buildFingerprint(root: string = packageRoot()): string | null {
-  const files = [join('dist', 'cli.js'), join('docker', 'Dockerfile'), 'package.json'];
+  const files = [join('dist', 'cli.js'), join('docker', 'Dockerfile'), join('docker', 'gh-wrapper.sh'), 'package.json'];
   if (!existsSync(join(root, files[0]!))) return null;
   const h = createHash('sha256');
   for (const f of files) h.update(f).update('\0').update(existsSync(join(root, f)) ? readFileSync(join(root, f)) : '').update('\0');

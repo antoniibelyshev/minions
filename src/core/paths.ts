@@ -11,6 +11,9 @@ export function hostRoot(): string {
 export const registryPath = () => join(hostRoot(), 'registry.json');
 /** Host-wide defaults applied to new projects at init (e.g. { claudeAuth }). */
 export const defaultsPath = () => join(hostRoot(), 'defaults.json');
+/** Host credential store for the file backend (0700 dirs, 0600 files). Never mounted into a container. */
+export const credentialStoreDir = () => join(hostRoot(), 'credentials');
+export const credentialStoreFile = (projectId: string, name: string) => join(credentialStoreDir(), projectId, name);
 export const projectDir = (projectId: string) => join(hostRoot(), 'projects', projectId);
 
 export function projectPaths(projectId: string) {
@@ -27,9 +30,16 @@ export function projectPaths(projectId: string) {
     runtimeConfigJson: join(dir, 'runtime', 'config.json'),
     pluginDir: join(dir, 'plugin'),
     exportsDir: join(dir, 'exports'),
-    /** Host-provisioned secrets (dir 0700), bind-mounted read-only as a directory at /run/minions/secrets. */
+    /** Host-only credential references (never mounted). */
+    credentialsJson: join(dir, 'credentials.json'),
+    /**
+     * Host-provisioned secret files (dir 0700, files 0600), bind-mounted read-only as a directory at
+     * /opt/minions/secrets: the Claude key copy plus materialized GitHub/Telegram tokens.
+     */
     secretsDir: join(dir, 'secrets'),
     apiKeyFile: join(dir, 'secrets', 'anthropic-api-key'),
+    githubTokenFile: join(dir, 'secrets', 'github-token'),
+    telegramTokenFile: join(dir, 'secrets', 'telegram-bot-token'),
     /** Non-secret record of the last key refresh (time, redacted error). */
     authStateJson: join(dir, 'auth-state.json'),
     logsDir: join(dir, 'logs'),
@@ -50,6 +60,11 @@ export function containerPaths(root = process.env.MINIONS_CONTAINER_ROOT ?? '') 
     pluginDir: p('/opt/minions/plugin'),
     coordinatorPrompt: p('/opt/minions/plugin/coordinator.md'),
     configDir: p('/opt/minions/config'),
+    secretsDir: p('/opt/minions/secrets'),
+    githubTokenFile: p('/opt/minions/secrets/github-token'),
+    telegramTokenFile: p('/opt/minions/secrets/telegram-bot-token'),
+    /** Host-provisioned Claude key (api-key/helper methods), read by the in-container apiKeyHelper. */
+    apiKeyFile: p('/opt/minions/secrets/anthropic-api-key'),
     configJson: p('/opt/minions/config/config.json'),
     projectJson: p('/opt/minions/config/project.json'),
     workspace: p('/workspace'),
@@ -64,11 +79,19 @@ export function containerPaths(root = process.env.MINIONS_CONTAINER_ROOT ?? '') 
     exports: p('/state/exports'),
     claudeHome: p('/home/node/.claude'),
     cache: p('/home/node/.cache'),
-    secretsDir: p('/run/minions/secrets'),
-    apiKeyFile: p('/run/minions/secrets/anthropic-api-key'),
+    /** Official Telegram plugin state (access.json, .env, pairing codes); owned by the plugin. */
+    telegramStateDir: p('/home/node/.claude/channels/telegram'),
   };
 }
 export const CONTAINER = containerPaths('');
+
+/**
+ * In-container path of the GitHub token (read-only). The directory is bind-mounted, not the file,
+ * so atomic host-side replacements (new inode) stay visible to a running container.
+ */
+export const GITHUB_TOKEN_CONTAINER_PATH = CONTAINER.githubTokenFile;
+/** In-container path of the Telegram bot token (read-only; read only by `minions coordinator run`). */
+export const TELEGRAM_TOKEN_CONTAINER_PATH = CONTAINER.telegramTokenFile;
 
 export const SERVICE_NAME = 'app';
 export const shortId = (projectId: string) => projectId.slice(0, 8).toLowerCase();
