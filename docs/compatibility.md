@@ -35,6 +35,10 @@ fake claude (dedicated `-L` server, sandbox settings, user `GH_TOKEN` dropped), 
 through a shim path with a space, `export`, helper-mode Claude key (`apiKeyHelper` quoting), `runtime
 set`, and `uninstall --delete-data`. It installs the real `backlog.md@1.54.0` into its temp dir.
 
+The guided GitHub setup (`minions setup github`, init) is covered by unit tests with temp repos and a
+fake GitHub API; the pre-filled token URL follows GitHub's documented template URL parameters
+(verified against docs.github.com on 2026-10-19), but opening it in a real browser is not automated.
+
 ### Host runtime (no Docker)
 
 | Component | Tested | Notes |

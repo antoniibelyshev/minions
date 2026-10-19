@@ -9,7 +9,7 @@ reported as unavailable by `doctor` and the wizard, never faked.
 
 In:
 - Host CLI: `init [path]`, `doctor`, `start`, `down`, `status`, `pause`, `resume`,
-  `import`, `export`, `config show`, `auth show|set|refresh`, `auth github`, `auth telegram`, `runtime show|set`, `uninstall`. All support `--json`; mutating ones `--dry-run`.
+  `import`, `export`, `config show`, `auth show|set|refresh`, `auth github`, `auth telegram`, `runtime show|set`, `setup github`, `uninstall`. All support `--json`; mutating ones `--dry-run`.
 - Runtime CLI (inside container): `backlog ready|list|show|create|update|note`,
   `work claim|record|release|list`, `hook stop|pre-agent`, `coordinator`, `status`, `pause`, `resume`.
 - Profiles `project-owner`, `personal-work`, `supervised`; shared + private visibility.
@@ -49,13 +49,13 @@ A per-project fine-grained personal access token, provisioned only by the host C
 (`src/host/credentials.ts`). Inside the container git and gh use it (see "GitHub in the
 container"), and branch/pull-request delivery publishes with it; CI observation is a later task.
 
-- **Entry.** `minions auth github` (and, for repositories with a GitHub remote, an optional offer at
-  the end of an interactive `minions init`) reads the token from the host terminal in raw mode with
+- **Entry.** `minions auth github`, or the guided GitHub setup (see "GitHub setup"), reads the token from the host terminal in raw mode with
   no echo, or from a pipe with `--stdin`. There is no `--token` flag; the token is never in argv,
   config, the plan, logs, or `--json` output. The wizard questions themselves never ask for secrets.
-- **Guidance.** Setup prints the creation link (`https://github.com/settings/personal-access-tokens/new`)
-  and the repository permissions: Contents read/write, Pull requests read/write, Checks read,
-  Actions read, Commit statuses read, Metadata read. Nothing else.
+- **Guidance.** Setup prints the creation link (`https://github.com/settings/personal-access-tokens/new`,
+  pre-filled as a GitHub template URL by the guided setup) and the repository permissions: Contents
+  read/write, Pull requests read/write, Checks read, Actions read, Commit statuses read, Metadata read.
+  Nothing else.
 - **Verification.** Before storing, `GET /repos/<owner>/<repo>` (or `/user` without a GitHub
   remote) with the token in the `Authorization` header only. 401/403/404 → not stored. A network
   failure stores it with a warning. `doctor` repeats the call and reports
@@ -77,6 +77,36 @@ container"), and branch/pull-request delivery publishes with it; CI observation 
   visible without recreating the container. The Keychain and the credentials directory are never mounted.
 - **Uninstall** keeps the stored token, as it keeps other credentials. `minions auth github --remove`
   deletes it.
+
+## GitHub setup
+
+Decision record for the guided flow (`src/host/github-setup.ts`): run after the plan is applied by an
+interactive `minions init` (intro question, default yes; failures never fail init) and standalone by
+`minions setup github`.
+
+- **Non-interactive** (`--yes`, `--config`, `--json`, no TTY, `--dry-run`): inspection plus next-step
+  hints only. No prompt, no push, no browser, no network.
+- **Inspection** uses local data only: `remote.origin.url`, `refs/remotes/origin/<base>`, the stored
+  credential reference, the effective config. Nothing is fetched or `ls-remote`d.
+- **Remote.** Missing: offer `git remote add origin <https url>` for a validated `owner/repo` / github.com
+  URL (command shown; `project.json` `remoteUrl` updated). A non-GitHub `origin` is never changed.
+- **Base branch.** Missing tracking ref: show `git push -u origin <base>`; run it (exactly
+  `refs/heads/<base>:refs/heads/<base>`) only after an explicit yes (default no), with the user's own git
+  credentials.
+- **Token link.** GitHub template URL (docs.github.com "Managing your personal access tokens" →
+  "Pre-filling fine-grained personal access token details using URL parameters"; changelog 2025-08-26):
+  `name` (≤ 40 chars), `description`, `target_name` (= remote owner), `expires_in=90`, `contents=write`,
+  `pull_requests=write`, `actions=read`, `statuses=read`. Repository selection and Checks are picked by hand.
+  `open <url>` (macOS) only after a yes (default no).
+- **Token entry** reuses the non-echoing prompt and `provisionGithubToken` (verification first; up to two
+  attempts). A stored token is re-checked with `githubCredentialStatus`.
+- **Delivery.** With a working token and `git.push` not denied: `local/branch/pull-request` (default
+  pull-request). Written to the project config file (private `config.json` or shared
+  `.minions/config.json`) with `configRevision + 1`, validated by `resolveEffective`, only if the file
+  still has the manifest hash; otherwise the exact edit is printed.
+- **Doctor/start.** `doctor` adds `github.setup` (remote, base on origin, token, delivery, next step).
+  `start` prints one hint line when a GitHub remote exists and no token is stored.
+- **Not offered:** reusing the user's `gh` CLI login (broader than one repository).
 
 ## GitHub in the container
 

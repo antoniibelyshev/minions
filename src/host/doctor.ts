@@ -14,6 +14,7 @@ import { Compose, buildFingerprint, imageBuildLabel, type Runner } from './docke
 import { telegramDoctorCheck } from '../telegram/probe.js';
 import { loadEffectiveConfig, loadProjectJson } from './project.js';
 import { projectForPath } from './registry.js';
+import { githubHints, inspectGithub } from './github-setup.js';
 import { HOST_RUNTIME_SHORT, HostRuntime, hostTools, prepareHostRuntime, runtimeOf } from './runtime.js';
 import type { ProjectJson } from './project.js';
 import { projectPaths } from '../core/paths.js';
@@ -78,6 +79,24 @@ async function githubCheck(project: { projectId: string; remoteUrl: string | nul
     case 'invalid': return [name, 'fail', `invalid: ${s.detail}`, 'Create a new fine-grained token and run `minions auth github`.'];
     case 'unverified': return [name, 'warn', `unverified: ${s.detail}`, 'Check network access to api.github.com and rerun doctor.'];
   }
+}
+
+/**
+ * github.setup: the GitHub section with one actionable next step (remote, base branch on the remote,
+ * token, delivery). Local git data and stored references only; the token check is github.credential.
+ */
+async function githubSetupCheck(project: ProjectJson, repoPath: string, credential: CredentialStatus['state'] | null, runner: Runner): Promise<Check> {
+  const name = 'github.setup';
+  const s = await inspectGithub(project, repoPath, { runner }).catch(() => null);
+  if (!s) return { name, status: 'warn', detail: 'could not inspect the repository remote', hint: 'Run `minions setup github`.' };
+  if (!s.repository) {
+    return { name, status: 'ok', detail: s.nonGithubOrigin ? `not set up: origin is not on github.com; delivery stays local` : 'not set up: no GitHub remote; delivery stays local',
+      hint: githubHints(s)[0] ?? 'Run `minions setup github`.' };
+  }
+  const parts = [`origin ${s.repository}`, `base ${s.baseBranch} ${s.baseOnRemote ? 'on origin' : 'not known on origin'}`, `token ${credential ?? s.token}`, `delivery ${s.deliveryMode ?? 'unknown'}`];
+  const hints = githubHints(s);
+  const ready = s.token === 'stored' && credential === 'ok' && s.baseOnRemote !== false;
+  return { name, status: ready ? 'ok' : 'warn', detail: `${ready ? 'ready' : 'incomplete'}: ${parts.join(', ')}`, ...(hints.length ? { hint: hints.join(' ') } : credential && credential !== 'ok' ? { hint: 'Run `minions setup github` to replace the token.' } : {}) };
 }
 
 /**
@@ -213,6 +232,7 @@ export async function runDoctor(opts: { cwd: string; runner?: Runner; probe?: Do
     add(...gc);
     github.onGitHub = githubRepoFromRemote(project.remoteUrl) !== null;
     github.credential = (['ok', 'missing', 'invalid', 'unverified'] as const).find((s) => gc[2].startsWith(`${s}:`)) ?? null;
+    checks.push(await githubSetupCheck(project, ref.repoPath, github.credential, runner));
     const channel = config?.communication.channel;
     const tgCred = await telegramCredentialStatus(project.projectId, { runner })
       .catch((e): TelegramCredentialStatus => ({ state: 'invalid', detail: `could not check (${short(String((e as Error).message ?? e))})` }));

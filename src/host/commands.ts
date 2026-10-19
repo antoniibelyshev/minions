@@ -22,6 +22,7 @@ import { projectForPath } from './registry.js';
 import { exportRepo, importRepo } from './transfer.js';
 import { HOST_RUNTIME_WARNING, HostRuntime, RUNTIMES, prepareHostRuntime, requireHostTools, runtimeOf, type RuntimeKind } from './runtime.js';
 import { registerRuntime } from './runtime-cli.js';
+import { githubStartHint, registerGithubSetup } from './github-setup.js';
 import { formatUninstall, runUninstall } from './uninstall.js';
 import { readSecret, readlineIO } from './wizard.js';
 
@@ -136,6 +137,8 @@ async function startHost(json: boolean, o: { attach: boolean }): Promise<void> {
     for (const w of r.warnings) say(json, `warning: ${w}`);
     imported = r;
   }
+  const hint = await githubStartHint(project, config);
+  if (hint) say(json, hint);
   if (config.communication.channel === 'telegram') {
     say(json, 'warning: host runtime: the Telegram channel plugin is not installed automatically (it would change your own Claude Code setup). Install it yourself with `claude plugin install telegram@claude-plugins-official`, or the coordinator runs terminal-only.');
   }
@@ -229,6 +232,8 @@ export function register(program: Command): void {
         for (const w of r.warnings) say(json, `warning: ${w}`);
         imported = r;
       }
+      const hint = await githubStartHint(project, config);
+      if (hint) say(json, hint);
       // The coordinator is a TUI in tmux: attaching needs a terminal (compose exec allocates a TTY).
       const attach = o.attach && !json && !!process.stdin.isTTY && !!process.stdout.isTTY;
       // Telegram must work with nobody attached: start the session detached in that case.
@@ -410,6 +415,7 @@ export function register(program: Command): void {
     }));
 
   registerRuntime(program, { confirm, ask: askLine });
+  registerGithubSetup(program);
 
   const config = program.command('config').description('Inspect configuration');
   config.command('show')

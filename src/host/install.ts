@@ -14,13 +14,14 @@ import { generatePlugin } from '../plugin/generate.js';
 import { discover, dockerProbe, type Discovery, type DockerProbe, type DockerStatus } from './discovery.js';
 import { authOf, isKeyAuth, loadDefaults, resolveOnPath, summarize, type AuthSummary, type ClaudeAuth } from './auth.js';
 import {
-  githubTokenGuidance, loadCredentialRefs, provisionGithubToken, provisionTelegramToken,
+  githubTokenGuidance, loadCredentialRefs, provisionTelegramToken,
   type CredentialsJson, type Fetch, type ProvisionResult, type TelegramProvisionResult,
 } from './credentials.js';
 import { composeYaml, type Runner } from './docker.js';
 import { ProjectJsonSchema, resolveEffective, runtimeProjectInfo, sharedConfigView, type ProjectJson } from './project.js';
 import { bindProject, gitCommonDir, loadRegistry, repoRoot, resolveIdentity, saveRegistry, sharedProjectId, type Identity, type Registry } from './registry.js';
 import { runWizard, type WizardIO } from './wizard.js';
+import { runGithubSetup, type GithubSetupResult } from './github-setup.js';
 import { HOST_CONFIRM_WORD, HOST_RUNTIME_SHORT, HOST_RUNTIME_WARNING, RUNTIMES, type RuntimeKind } from './runtime.js';
 import { hostRuntimePaths } from '../core/paths.js';
 
@@ -138,6 +139,8 @@ export interface InitOptions {
   fetch?: Fetch;
   /** --runtime docker|host (host-only setting; repository config can never select it). */
   runtime?: RuntimeKind;
+  /** Opens the token page after an explicit yes (tests; default `open` on macOS). */
+  openUrl?: (url: string) => Promise<void>;
 }
 
 interface Prepared { plan: InstallPlan; desired: Desired[]; manifest: Manifest | undefined; registry: Registry; cleanup: () => Promise<void> }
@@ -539,6 +542,8 @@ export interface InitResult {
   nextSteps: string[];
   /** GitHub token step of an interactive init (repo has a GitHub remote). Never contains the token. */
   github?: { status: 'present' | 'stored' | 'skipped' | 'failed'; detail: string; provisioned?: Omit<ProvisionResult, 'projectId'> };
+  /** Guided GitHub setup (interactive) or its next-step hints (--yes). Never contains the token. */
+  githubSetup?: GithubSetupResult;
   /** Telegram bot token step (communication.channel is telegram). Never contains the token. */
   telegram?: { status: 'present' | 'stored' | 'skipped' | 'failed'; detail: string; provisioned?: Omit<TelegramProvisionResult, 'projectId'> };
 }
@@ -572,28 +577,16 @@ async function offerTelegramToken(opts: InitOptions, plan: InitResult['plan']): 
 }
 
 /**
- * Interactive init only, GitHub remote only: offers to store a token through the host terminal's
- * non-echoing prompt. Failures never fail init (the install is already applied).
+ * GitHub step of init (after the plan is applied, so failures never fail init). Interactive: the
+ * guided flow (remote, base branch on the remote, token, delivery mode; src/host/github-setup.ts).
+ * --yes / --config / no terminal: next-step hints only (no prompt, push, browser or network).
  */
-async function offerGithubToken(opts: InitOptions, plan: InitResult['plan']): Promise<InitResult['github']> {
-  const io = opts.io;
-  if (!io || opts.yes || opts.configFile || !plan.discovery.git.hasGitHub) return undefined;
-  const existing = (await loadCredentialRefs(plan.projectId).catch((): CredentialsJson => ({ version: 1 }))).github;
-  if (existing) return { status: 'present', detail: `GitHub token already provisioned (${existing.backend}); replace it with \`minions auth github\`.` };
-  if (!io.secret) return { status: 'skipped', detail: 'no terminal for a non-echoing prompt; run `minions auth github` later.' };
-  io.info(['', 'GitHub token (optional now; needed later for push/PR delivery):', ...githubTokenGuidance(plan.discovery.git.remoteUrl).map((l) => `  ${l}`)].join('\n'));
-  const want = await io.ask('Store a GitHub token for this project now? (y/n)', 'n');
-  if (!/^y(es)?$/i.test(want)) return { status: 'skipped', detail: 'skipped; run `minions auth github` later.' };
-  try {
-    const token = await io.secret('GitHub token (input hidden): ');
-    const { projectId: _id, ...provisioned } = await provisionGithubToken({
-      projectId: plan.projectId, token, repoPath: plan.repoPath, remoteUrl: plan.discovery.git.remoteUrl,
-      runner: opts.runner, fetch: opts.fetch,
-    });
-    return { status: 'stored', detail: `stored in ${provisioned.backend === 'keychain' ? 'the macOS Keychain' : 'a 0600 host file'}`, provisioned };
-  } catch (e) {
-    return { status: 'failed', detail: `${e instanceof MinionsError ? e.message : 'could not store the token'}; run \`minions auth github\` to retry.` };
-  }
+async function githubStep(opts: InitOptions, plan: InitResult['plan']): Promise<GithubSetupResult> {
+  const interactive = !!opts.io && !opts.yes && !opts.configFile;
+  return runGithubSetup({
+    projectId: plan.projectId, repoPath: plan.repoPath, io: interactive ? opts.io : undefined, yes: !interactive,
+    runner: opts.runner, fetch: opts.fetch, openUrl: opts.openUrl,
+  });
 }
 
 export function dockerUnavailable(s: DockerStatus): MinionsError {
@@ -627,11 +620,12 @@ export async function runInit(opts: InitOptions): Promise<InitResult> {
     if (!hostRuntime && (!after.daemon || !after.compose)) throw dockerUnavailable(after);
     // The secrets directory must exist: compose bind-mounts it with create_host_path: false.
     await ensureDir(projectPaths(plan.projectId).secretsDir, 0o700);
-    const github = await offerGithubToken(opts, plan);
+    const setup = await githubStep(opts, plan);
+    const github = setup.interactive && setup.state.repository ? setup.token : undefined;
     const telegram = await offerTelegramToken(opts, plan);
     const tgReady = telegram?.status === 'stored' || telegram?.status === 'present';
     return {
-      dryRun: false, plan, applied, docker: after, ...(github ? { github } : {}), ...(telegram ? { telegram } : {}),
+      dryRun: false, plan, applied, docker: after, ...(github ? { github } : {}), githubSetup: setup, ...(telegram ? { telegram } : {}),
       nextSteps: [
         'Run `minions start` in this repository.',
         ...(hostRuntime ? [
@@ -642,8 +636,7 @@ export async function runInit(opts: InitOptions): Promise<InitResult> {
         ] : [prep.plan.claudeAuth.method === 'login'
           ? 'The first start builds the runtime image, imports committed history, and opens the coordinator; log in to Claude inside the container with /login.'
           : 'The first start builds the runtime image, provisions the Claude key, imports committed history, and opens the coordinator.']),
-        ...(plan.discovery.git.hasGitHub && github?.status !== 'stored' && github?.status !== 'present'
-          ? ['Run `minions auth github` to store a GitHub token for this project (entered without echo).'] : []),
+        ...setup.nextSteps,
         ...(plan.communication.channel === 'telegram' ? [
           ...(tgReady ? [] : ['Run `minions auth telegram` to store the Telegram bot token (entered without echo); until then the coordinator is terminal-only.']),
           'After the first start, pair in the coordinator terminal: DM your bot, type /telegram:access pair <code>, then /telegram:access policy allowlist.',
@@ -690,6 +683,8 @@ export function formatInit(r: InitResult): string {
     L.push(`GitHub token: ${r.github.status} — ${r.github.detail}`);
     for (const w of r.github.provisioned?.warnings ?? []) L.push(`  ! ${w}`);
   }
+  if (r.githubSetup?.interactive && r.githubSetup.remote.status === 'added') L.push(`GitHub remote added: ${r.githubSetup.remote.url}`);
+  if (r.githubSetup?.delivery.changed) L.push(`Delivery: ${r.githubSetup.delivery.note}`);
   if (r.telegram) {
     L.push(`Telegram bot token: ${r.telegram.status} — ${r.telegram.detail}`);
     for (const w of r.telegram.provisioned?.warnings ?? []) L.push(`  ! ${w}`);

@@ -108,6 +108,13 @@ expect_eq "$(json 'd.data.checks.find(c=>c.name==="runtime").status' <<<"$doc")"
 for t in tmux claude backlog git; do expect_eq "$(json "d.data.checks.find(c=>c.name===\"host.$t\").status" <<<"$doc")" ok "doctor: host.$t"; done
 expect_eq "$(json 'd.data.checks.some(c=>c.name.startsWith("docker."))' <<<"$doc")" false "doctor does not check Docker"
 
+step "GitHub setup hints (--yes: no prompt, push or browser)"
+gs="$("$M" setup github --yes --json)"
+expect_eq "$(json 'd.data.remote.status' <<<"$gs")" missing "setup github sees no remote"
+json 'd.data.nextSteps.join(" ")' <<<"$gs" | grep -q 'minions setup github' || fail "setup github hints"
+expect_eq "$(json 'd.data.checks.find(c=>c.name==="github.setup").status' <<<"$doc")" ok "doctor has a github.setup check"
+expect_eq "$(git remote)" "" "no remote added"
+
 step "start --no-attach: warning, separate workspace clone, state"
 start_err="$WORK/start.err"
 st="$("$M" start --no-attach --json 2>"$start_err")"
