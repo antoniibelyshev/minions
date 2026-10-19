@@ -115,6 +115,19 @@ json 'd.data.nextSteps.join(" ")' <<<"$gs" | grep -q 'minions setup github' || f
 expect_eq "$(json 'd.data.checks.find(c=>c.name==="github.setup").status' <<<"$doc")" ok "doctor has a github.setup check"
 expect_eq "$(git remote)" "" "no remote added"
 
+step "Setup assistant (never launched by init --yes; dry-run plan; needs a terminal)"
+[ ! -e "$WORK/fake/claude.json" ] && ok "init --yes did not launch claude" || fail "init --yes launched claude"
+expect_eq "$(json 'd.data.checks.find(c=>c.name==="setup").status' <<<"$doc")" ok "doctor: setup check (verification commands inferred)"
+sa="$("$M" setup assist --dry-run --json)"
+expect_eq "$(json 'd.data.args[d.data.args.indexOf("--permission-mode")+1]' <<<"$sa")" default "assistant permission mode default"
+expect_eq "$(json 'd.data.args.some(a=>/^(bypassPermissions|acceptEdits|auto|--dangerously-skip-permissions|--allow-dangerously-skip-permissions)$/.test(a))' <<<"$sa")" false "assistant never bypasses permissions"
+expect_eq "$(json 'd.data.args.includes("Bash(git push*)") && d.data.args.includes("Bash(minions runtime set*)")' <<<"$sa")" true "assistant denies push and runtime set"
+expect_eq "$(json 'd.data.cwd' <<<"$sa")" "$A" "assistant runs in the repository root"
+[ ! -e "$P/assistant-plugin" ] && ok "dry-run wrote nothing" || fail "dry-run wrote the assistant plugin"
+set +e; "$M" setup assist --json </dev/null >/dev/null 2>&1; rc=$?; set -e
+expect_eq "$rc" 11 "setup assist without a terminal fails (PRECONDITION)"
+[ ! -e "$WORK/fake/claude.json" ] && ok "claude not launched without a terminal" || fail "claude launched without a terminal"
+
 step "start --no-attach: warning, separate workspace clone, state"
 start_err="$WORK/start.err"
 st="$("$M" start --no-attach --json 2>"$start_err")"

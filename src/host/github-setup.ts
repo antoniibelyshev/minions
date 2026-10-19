@@ -343,7 +343,7 @@ export function formatGithubSetup(r: GithubSetupResult): string {
 }
 
 /** `minions setup github`: the same guided flow, standalone. */
-export function registerGithubSetup(program: Command): void {
+export function registerGithubSetup(program: Command): Command {
   const setup = program.command('setup').description('Guided setup steps for an initialized project');
   setup.command('github')
     .description('Guided GitHub setup: remote, base branch on the remote, fine-grained token, delivery mode')
@@ -360,4 +360,5 @@ export function registerGithubSetup(program: Command): void {
         emit(r, { json, human: formatGithubSetup });
       } finally { io?.close?.(); }
     }));
+  return setup;
 }

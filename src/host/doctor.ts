@@ -143,6 +143,21 @@ function telegramAccessCheck(r: { code: number; stdout: string; stderr: string }
   return { name, status: data.access.state === 'ok' ? 'ok' : 'warn', detail, ...(data.access.hint ? { hint: redact(data.access.hint) } : {}) };
 }
 
+/**
+ * setup: obvious configuration gaps left after init (no verification commands, GitHub remote without a
+ * working token, Telegram selected without a bot token), with a pointer to the setup assistant.
+ */
+export function setupGapsCheck(config: Pick<MinionsConfig, 'verification' | 'communication'>,
+  s: { onGitHub: boolean; githubCredential: CredentialStatus['state'] | null; telegramToken: TelegramCredentialStatus['state'] }): Check {
+  const gaps: string[] = [];
+  if (!config.verification.commands.length) gaps.push('no verification commands (verification.commands is empty)');
+  if (s.onGitHub && s.githubCredential === 'missing') gaps.push('GitHub remote without a stored token');
+  if (config.communication.channel === 'telegram' && s.telegramToken !== 'ok') gaps.push('Telegram selected without a valid bot token');
+  return gaps.length
+    ? { name: 'setup', status: 'warn', detail: `incomplete: ${gaps.join('; ')}`, hint: 'Run `minions setup assist` (AI setup assistant in Claude Code) to finish the remaining setup, or follow the hints above.' }
+    : { name: 'setup', status: 'ok', detail: 'no obvious gaps (verification commands set; credentials match the configured delivery and channel)' };
+}
+
 /** Host runtime: coordinator session, Claude auth on the host, launch probe, Telegram plugin (via the runtime shim). */
 async function hostRuntimeChecks(project: ProjectJson, auth: ClaudeAuth, baseUrl: string | undefined, channel: MinionsConfig['communication']['channel'] | undefined,
   runner: Runner, add: Add, checks: Check[]): Promise<Check | undefined> {
@@ -305,6 +320,7 @@ export async function runDoctor(opts: { cwd: string; runner?: Runner; probe?: Do
     else if (!tgPlugin) add('telegram', 'warn', 'unknown: bot token stored; plugin availability not checked (container not running)', 'Run `minions start`, then rerun doctor.');
     else if (tgPlugin.status !== 'ok') add('telegram', 'unavailable', `unavailable: ${tgPlugin.detail}; the coordinator runs terminal-only`, tgPlugin.hint);
     else add('telegram', 'ok', 'ok: bot token stored and the official plugin is available (see telegram.access for pairing)');
+    if (config) checks.push(setupGapsCheck(config, { onGitHub: github.onGitHub, githubCredential: github.credential, telegramToken: tgCred.state }));
   } catch (e) {
     add('project', 'warn', isMinionsError(e) ? e.message : String(e), 'Run `minions init` in this repository.');
   }
