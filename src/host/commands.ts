@@ -191,7 +191,9 @@ export function register(program: Command): void {
       }
       const { project } = await ensureUp(json);
       const r = await importRepo(project, { repoPath: (await projectForPath(process.cwd())).repoPath });
-      emit(r, { json, human: (d: typeof r) => [`Imported ${d.baseBranch} @ ${d.commit.slice(0, 12)} into the container.`, ...d.warnings.map((w) => `warning: ${w}`)].join('\n') });
+      emit(r, { json, human: (d: typeof r) => [`Imported ${d.baseBranch} @ ${d.commit.slice(0, 12)} into the container.`,
+        ...(d.container.origin ? [`origin ${d.container.origin.url}: ${d.container.origin.authenticated ? 'authenticated' : 'not authenticated'}, ${d.container.origin.fetched ? 'base fetched' : 'not fetched'}`] : []),
+        ...[...d.warnings, ...(d.container.origin?.warnings ?? [])].map((w) => `warning: ${w}`)].join('\n') });
     }));
 
   program.command('export')

@@ -36,7 +36,7 @@ function parseEnvelope<T>(stdout: string, what: string): T {
   return env.data as T;
 }
 
-export interface ImportResult { bundle: string; commit: string; baseBranch: string; warnings: string[]; container: { head?: string; base?: string; imported?: boolean } }
+export interface ImportResult { bundle: string; commit: string; baseBranch: string; warnings: string[]; container: { head?: string; base?: string; imported?: boolean; origin?: { url: string; authenticated: boolean; fetched: boolean; warnings: string[] } } }
 
 export async function importRepo(project: ProjectJson, opts: { runner?: Runner; repoPath?: string; compose?: Compose } = {}): Promise<ImportResult> {
   const runner = opts.runner ?? run;

@@ -30,7 +30,7 @@ budgets, companion containers.
 - Plugin name `minions`; agents `engineer`, `tester`, `reviewer` resolve as `minions:engineer` etc. Skills `orchestrate`, `status`, `intake`, `recover`, `maintain-context` resolve as `/minions:<name>`.
 - Backlog.md project lives in `/state/backlog` for **both** visibilities in v0.1 (single writer, never on implementation branches). Versioning a shared backlog in Git is deferred.
 - Container reads effective config from a read-only mount; it cannot change config in v0.1.
-- Workspace is seeded from a Git bundle of the host repo's committed HEAD branch (`minions import`), so no GitHub credentials are needed. The real `origin` URL is recorded but unused until PR delivery exists.
+- Workspace is seeded from a Git bundle of the host repo's committed HEAD branch (`minions import`), so no GitHub credentials are needed. The real `origin` URL is recorded; it is fetched (over https, via the credential helper) only when a GitHub token is mounted.
 - Commits inside the container use the host's `git config user.name/email` (copied as plain values at init, shown in the plan).
 - Coordinator permission mode defaults to `acceptEdits` with an allowlist for `minions`, `git`, and `backlog` commands. Never `bypassPermissions`.
 - Pinned in image: base `node:22-bookworm-slim` (digest pinned in Dockerfile), `@anthropic-ai/claude-code@2.1.292`, `backlog.md@1.54.0`. Tested range documented in `docs/compatibility.md`.
@@ -39,8 +39,8 @@ budgets, companion containers.
 ## GitHub credential
 
 A per-project fine-grained personal access token, provisioned only by the host CLI
-(`src/host/credentials.ts`). Nothing inside the container uses it yet; later tasks wire it into
-git/gh, branch/PR delivery, and CI observation.
+(`src/host/credentials.ts`). Inside the container git and gh use it (see "GitHub in the
+container"); later tasks wire it into branch/PR delivery and CI observation.
 
 - **Entry.** `minions auth github` (and, for repositories with a GitHub remote, an optional offer at
   the end of an interactive `minions init`) reads the token from the host terminal in raw mode with
@@ -70,6 +70,35 @@ git/gh, branch/PR delivery, and CI observation.
   visible without recreating the container. The Keychain and the credentials directory are never mounted.
 - **Uninstall** keeps the stored token, as it keeps other credentials. `minions auth github --remove`
   deletes it.
+
+## GitHub in the container
+
+Decision record for git/gh authentication inside the runtime (`src/runtime/github.ts`,
+`docker/gh-wrapper.sh`). The token is read from `GITHUB_TOKEN_CONTAINER_PATH` **at use time**
+(absent, replaced, or removed at any moment); it is never copied into git config, remote URLs,
+argv, environment files, tmux, or Claude Code settings.
+
+- **git.** `minions workspace import` with a readable token and a github.com remote sets `origin` to
+  the normalized `https://github.com/<owner>/<repo>.git` (scp/ssh forms and any URL userinfo are
+  dropped), configures the repository-level `credential.https://github.com.helper` as an empty
+  entry (resets inherited helpers) followed by `/usr/local/bin/minions git-credential`, and fetches
+  the base branch into `refs/remotes/origin/<base>` (a failed fetch only warns). Worktrees share the
+  repository config, so push/fetch from any worktree authenticates the same way.
+- **Helper.** `minions git-credential <op>` (hidden) answers only `get` for `protocol=https`,
+  `host=github.com`, emitting `username=x-access-token` and `password=<token>` on stdout to git.
+  `store`/`erase`/other hosts produce nothing. Absent or malformed token: no output plus a stderr
+  diagnostic; git then fails non-interactively (`GIT_TERMINAL_PROMPT=0`).
+- **gh.** `/usr/local/bin/gh` is a POSIX sh wrapper; the pinned real binary lives at
+  `/opt/gh/bin/gh` (off `PATH`). The wrapper reads the token file and sets `GH_TOKEN` only in the
+  environment of the `exec`'d gh process. Chosen over `gh auth login` (which would persist the
+  token in `~/.config/gh/hosts.yml`) and over a global `GH_TOKEN` (which would leak into tmux and
+  every child process). No token file: gh runs unauthenticated.
+- **Unreadable token** (e.g. a Linux Docker Engine host whose user is not uid 1000, so the 0600
+  file is not readable by container uid 1000): import does not fail; origin is recorded verbatim as
+  without a credential and the result carries `origin.authenticated: false` with a precise warning
+  (path, container uid, file owner and mode). The helper and the gh wrapper print the same diagnosis.
+- **No token file**: identical to the previous behaviour — the recorded URL is stored verbatim,
+  never fetched, no helper is configured, and the import result has no `origin` field.
 
 ## Telegram bot token
 
