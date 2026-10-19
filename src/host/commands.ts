@@ -20,6 +20,7 @@ import { projectForPath } from './registry.js';
 import { exportRepo, importRepo } from './transfer.js';
 import { formatUninstall, runUninstall } from './uninstall.js';
 import { DELIVERY_MODES, formatSetup, runSetup, shellQuote, type DeliveryMode, type SetupRuntime } from './setup.js';
+import { DEFAULT_UPGRADE_TIMEOUT_SEC, formatUpgrade, runUpgrade } from './upgrade.js';
 import { readSecret, readlineIO } from './wizard.js';
 
 const say = (json: boolean, msg: string) => { if (!json) process.stderr.write(msg + '\n'); };
@@ -237,6 +238,30 @@ export function register(program: Command): void {
       }
       say(json, 'Attaching the coordinator (tmux session "coordinator"). On first start, log in to Claude with /login.');
       process.exitCode = await compose.execInherit(['minions', 'coordinator'], { tty: true });
+    }));
+
+  program.command('upgrade')
+    .description('Upgrade the project container to the installed minions (drains workers, keeps volumes)')
+    .option('--timeout <seconds>', `wait this long for active workers (default ${DEFAULT_UPGRADE_TIMEOUT_SEC}; 0 with --now)`)
+    .option('--now', 'release workers still active when the wait ends (reported as interrupted, re-dispatched after)')
+    .option('--dry-run', 'list the steps without changing anything')
+    .action(action(async (o: { timeout?: string; now?: boolean }, cmd: Command) => {
+      requireMode('host');
+      const { json, dryRun } = globalOpts(cmd);
+      const timeoutSec = o.timeout === undefined ? (o.now ? 0 : DEFAULT_UPGRADE_TIMEOUT_SEC) : Number(o.timeout);
+      if (!Number.isInteger(timeoutSec) || timeoutSec < 0) throw new MinionsError('PRECONDITION', `--timeout must be a whole number of seconds (got ${o.timeout}).`);
+      const ref = await projectForPath(process.cwd());
+      const project = await loadProjectJson(ref.projectId);
+      if (!dryRun) await requireDocker();
+      const r = await runUpgrade({
+        projectId: project.projectId, imageTag: project.imageTag, compose: new Compose(project.projectId), timeoutSec, now: o.now, dryRun,
+        refresh: async () => refreshDerived(project, (await loadEffectiveConfig(project)).config),
+        importRepo: () => importRepo(project, { repoPath: ref.repoPath }),
+        materialize: () => materializeSecrets(project.projectId),
+        log: (m) => say(json, m),
+      });
+      emit(r, { json, human: formatUpgrade });
+      if (!r.ok) process.exitCode = 1;
     }));
 
   program.command('down')

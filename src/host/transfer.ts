@@ -26,7 +26,8 @@ export function secretLikePaths(tracked: string[]): string[] {
 }
 
 interface Envelope<T> { ok: boolean; data?: T; error?: { code: string; message: string; hint?: string } }
-function parseEnvelope<T>(stdout: string, what: string): T {
+/** Data of the last `{ok,data}` JSON line printed by a container-side `minions … --json` command. */
+export function parseEnvelope<T>(stdout: string, what: string): T {
   const line = stdout.trim().split('\n').filter(Boolean).at(-1) ?? '';
   let env: Envelope<T>;
   try { env = JSON.parse(line) as Envelope<T>; } catch {
