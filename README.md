@@ -205,6 +205,19 @@ Local and PR-only workflows can end a task at **delivered**. Reports keep that d
 
 Under the default settings, at most **2 tasks** are active and at most **2 engineers** run at once. A blocked task or one waiting on a human frees its capacity unless a worker is still running on it.
 
+### Worker hand-offs (briefs and results through files)
+
+Briefs and worker results go through files under `/state`, not through the coordinator's context:
+
+1. `minions work claim <taskId> --role <role> --compact --json` claims the lease, stores the full brief in `/state/briefs/<leaseId>.json`, and prints a short summary: `leaseId`, `briefMarker`, `branch`, `worktree`, `expectedHead`, and the task id, title, role and attempt.
+2. The worker prompt holds only the `minions-lease: <leaseId>` line, a `worktree:` line and the coordinator's notes. The worker runs `minions work brief <leaseId> --role <role> --json` itself. The command works only while the lease is active, only for the lease's role, and only from inside the lease's worktree, so a worker cannot read another lease's brief. The PreToolUse hook still refuses a worker launch whose prompt has no active lease marker for that role.
+3. The worker writes its WorkerResult with `minions work submit <leaseId> --role <role> --json`, with the JSON on stdin, to `/state/results/<leaseId>.json`, then ends with a one-line summary. Reviewers can submit too, because the file goes under `/state` and not into their read-only worktree.
+4. The coordinator runs `minions work record <leaseId> --submitted --json`. Validation and the single correction work as before. An invalid result returns its `errors`, and the rejected file is set aside so the correction has to be a new submission (`--submitted --correction`). A missing submission fails with `NOT_FOUND` and a hint. Piping the JSON to `minions work record` on stdin still works.
+
+`minions backlog list|ready --compact --json` (or `--fields id,title,status,...`) leaves out descriptions and other bulky fields.
+
+**Idle context reset (opt-in).** If you ask for it, the coordinator can restart itself once the queue is idle (nothing runnable, no active leases) after many hand-offs. It runs `minions coordinator restart --recover` detached and starts again with a fresh context. All state is durable, so nothing is lost. This is guidance in the coordinator prompt, and nothing restarts on its own.
+
 ## Delivery, review, and merging
 
 v0.1 supports `local`, `branch`, and `pull-request` delivery. `auto-when-eligible`, review publication, and merging are **deferred in v0.1**: minions never merges, and an open PR is reported as **delivered**, not merged.

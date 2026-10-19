@@ -14,6 +14,10 @@ export function runtimePaths(env: NodeJS.ProcessEnv = process.env) {
     db: join(state, 'minions.db'),
     backlog: join(state, 'backlog'),
     notes: join(state, 'notes'),
+    /** Stored worker briefs (`work claim` writes, `work brief` reads). */
+    briefs: join(state, 'briefs'),
+    /** Submitted worker results (`work submit` writes, `work record --submitted` reads). */
+    results: join(state, 'results'),
     import: join(state, 'import'),
     exports: join(state, 'exports'),
     logs: join(state, 'logs'),

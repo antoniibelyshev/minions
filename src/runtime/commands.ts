@@ -15,6 +15,7 @@ import { installTelegramPlugin } from '../telegram/install.js';
 import { formatTelegramProbe, probeTelegram } from '../telegram/probe.js';
 import { buildClaudeCommand, buildCoordinatorCommand, launchCoordinator, probeRuntime, coordinatorWrapper, readLaunchRecord, restartCoordinator, RECOVERY_PROMPT, syncCoordinator } from './coordinator.js';
 import { openDb, type Lease, type LeaseRole, type RuntimeDb } from './db.js';
+import { claimWithBrief, compactClaim, fetchBrief, recordSubmitted, submitResult, type CompactClaim } from './handoff.js';
 import { runHook } from './hooks.js';
 import { runtimePaths } from './paths.js';
 import { capacityOf, LEASE_ROLES, Scheduler } from './scheduler.js';
@@ -62,7 +63,7 @@ const scheduler = async () => new Scheduler({ ...(await context()), layout: work
 
 async function readInput(file?: string): Promise<string> {
   if (file && file !== '-') return readFile(file, 'utf8');
-  if (process.stdin.isTTY) throw new MinionsError('PRECONDITION', 'Expected the worker result on stdin.', 'Pipe the JSON in or pass --result-file <path>.');
+  if (process.stdin.isTTY) throw new MinionsError('PRECONDITION', 'Expected the worker result on stdin.', 'Pipe the JSON in, pass --result-file <path>, or (record) use --submitted.');
   const chunks: Buffer[] = [];
   for await (const c of process.stdin) chunks.push(c as Buffer);
   return Buffer.concat(chunks).toString('utf8');
@@ -140,22 +141,43 @@ export function register(program: Command): void {
 
   // work
   const work = program.command('work').description('Claim, record and release worker leases (container only)');
-  work.command('claim <taskId>').description('Claim a task for a worker role; returns the task brief')
+  work.command('claim <taskId>').description('Claim a task for a worker role; returns the task brief (stored for `work brief`)')
     .requiredOption('--role <role>', 'engineer | tester | reviewer')
     .option('--holder <holder>', 'who holds the lease (default: this process)')
-    .action(action(async (taskId: string, o: { role: string; holder?: string }, cmd: Command) => {
+    .option('--compact', 'print only leaseId, briefMarker, task, role, attempt, branch, worktree, expectedHead (the worker fetches the full brief)')
+    .action(action(async (taskId: string, o: { role: string; holder?: string; compact?: boolean }, cmd: Command) => {
       requireMode('container');
       if (!(LEASE_ROLES as readonly string[]).includes(o.role)) throw new MinionsError('PRECONDITION', `--role must be engineer, tester or reviewer (got ${o.role}).`);
-      const brief = await (await scheduler()).claim(taskId, o.role as LeaseRole, { holder: o.holder });
-      emit(brief, { json: globalOpts(cmd).json, human: (b) => `${b.briefMarker}\n${JSON.stringify(b, null, 2)}` });
+      const brief = await claimWithBrief(await scheduler(), runtimePaths(), taskId, o.role as LeaseRole, { holder: o.holder });
+      if (o.compact) emit(compactClaim(brief), { json: globalOpts(cmd).json, human: (c: CompactClaim) => `${c.briefMarker}\nworktree: ${c.worktree}\nbranch: ${c.branch} @ ${c.expectedHead}` });
+      else emit(brief, { json: globalOpts(cmd).json, human: (b) => `${b.briefMarker}\n${JSON.stringify(b, null, 2)}` });
     }));
-  work.command('record <leaseId>').description('Record a worker result (JSON on stdin or --result-file)')
+  work.command('brief <leaseId>').description('Worker: fetch the full brief of your own lease (run from inside its worktree)')
+    .requiredOption('--role <role>', 'your role: engineer | tester | reviewer')
+    .action(action(async (leaseId: string, o: { role: string }, cmd: Command) => {
+      requireMode('container');
+      const b = await fetchBrief(getDb(), runtimePaths(), leaseId, { role: o.role, cwd: process.cwd() });
+      emit(b, { json: globalOpts(cmd).json, human: (x) => JSON.stringify(x, null, 2) });
+    }));
+  work.command('submit <leaseId>').description('Worker: submit your WorkerResult JSON (stdin or --result-file) for the coordinator to record')
+    .requiredOption('--role <role>', 'your role: engineer | tester | reviewer')
     .option('--result-file <path>', 'read the WorkerResult from a file ("-" = stdin)')
-    .option('--correction', 'the single allowed correction after an invalid result')
-    .action(action(async (leaseId: string, o: { resultFile?: string; correction?: boolean }, cmd: Command) => {
+    .action(action(async (leaseId: string, o: { role: string; resultFile?: string }, cmd: Command) => {
       requireMode('container');
       const raw = await readInput(o.resultFile);
-      const r = await (await scheduler()).record(leaseId, raw, { correction: !!o.correction });
+      const r = await submitResult(getDb(), runtimePaths(), leaseId, raw, { role: o.role, cwd: process.cwd() });
+      emit(r, { json: globalOpts(cmd).json, human: (d) => d.message });
+    }));
+  work.command('record <leaseId>').description('Record a worker result (submitted file, JSON on stdin, or --result-file)')
+    .option('--submitted', 'record the result the worker stored with `minions work submit` (no JSON passes through the coordinator)')
+    .option('--result-file <path>', 'read the WorkerResult from a file ("-" = stdin)')
+    .option('--correction', 'the single allowed correction after an invalid result')
+    .action(action(async (leaseId: string, o: { submitted?: boolean; resultFile?: string; correction?: boolean }, cmd: Command) => {
+      requireMode('container');
+      if (o.submitted && o.resultFile) throw new MinionsError('PRECONDITION', 'Use --submitted or --result-file, not both.');
+      const r = o.submitted
+        ? await recordSubmitted(await scheduler(), runtimePaths(), leaseId, { correction: !!o.correction })
+        : await (await scheduler()).record(leaseId, await readInput(o.resultFile), { correction: !!o.correction });
       emit(r, { json: globalOpts(cmd).json, human: (d) => [d.message, ...(d.errors ?? []).map((e: string) => `  - ${e}`)].join('\n') });
     }));
   work.command('release <leaseId>').description('Release a lease without a result (worktree is kept)')

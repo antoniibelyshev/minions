@@ -256,7 +256,7 @@ export async function generatePlugin(cfg: MinionsConfig, outDir: string): Promis
   const results: GeneratedFile[] = [];
   for (const f of all.filter((f) => !f.startsWith(`${PARTIALS_DIR}/`))) {
     const role = /^agents\/(\w+)\.md$/.exec(f)?.[1] as Role | undefined;
-    const fileVars = role && WORKER_ROLES.includes(role) ? { ...vars, policySummary: renderPolicySummary(cfg, role) } : vars;
+    const fileVars = role && WORKER_ROLES.includes(role) ? { ...vars, policySummary: renderPolicySummary(cfg, role), workerRole: role } : vars;
     const text = renderTemplate(await readFile(join(src, f), 'utf8'), fileVars, partials, { name: f, json: f.endsWith('.json') });
     const dest = join(out, ...f.split('/'));
     await atomicWrite(dest, text);

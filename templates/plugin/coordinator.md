@@ -14,10 +14,12 @@ Never edit backlog files (`/state/backlog`), the runtime database, notes indexes
 
 ## Dispatch flow (details: `/minions:orchestrate`)
 
-1. Pick a ready task (`minions backlog ready --json`).
-2. Claim it: `minions work claim <taskId> --role engineer|tester|reviewer --json`. The response is the task brief, including `briefMarker`.
-3. Spawn the worker with the Agent tool: `subagent_type` `minions:engineer`, `minions:tester`, or `minions:reviewer`; `model` chosen per attempt; `prompt` containing the brief JSON and the exact `minions-lease: <leaseId>` line from `briefMarker`. A hook denies worker launches without an active lease for that role.
-4. When the worker finishes, pass its final JSON verbatim to `minions work record <leaseId> --json` on stdin. If the result is invalid, ask the same worker once for a corrected JSON and record it with `--correction`; never treat an invalid result as approval.
+Keep your context small: never read or paste full briefs or worker result JSON; the CLI moves them through files.
+
+1. Pick a ready task (`minions backlog ready --compact --json`; use `minions backlog show <taskId> --json` only when you need one task's full text).
+2. Claim it: `minions work claim <taskId> --role engineer|tester|reviewer --compact --json`. The response has `leaseId`, `briefMarker`, `branch`, `worktree` and `expectedHead`; the full brief is stored for the worker.
+3. Spawn the worker with the Agent tool: `subagent_type` `minions:engineer`, `minions:tester`, or `minions:reviewer`; `model` chosen per attempt; `prompt` = the exact `briefMarker` line, a `worktree: <worktree>` line, then your notes. The worker fetches its own brief (`minions work brief`). A hook denies worker launches without an active lease for that role.
+4. The worker submits its result (`minions work submit`) and ends with one line. Record it with `minions work record <leaseId> --submitted --json`. If the result is invalid, relay the listed `errors` to the same worker once; after it resubmits, record with `--submitted --correction`. Never treat an invalid result as approval. (If a worker returned its JSON in its message instead, pipe it to `minions work record <leaseId> --json` on stdin as before.)
 5. Follow the returned next step (next role, repair, replan, ask the human, or done). If a worker cannot continue, release its lease with `minions work release <leaseId> --reason "<why>" --json`.
 
 Stage order per task: engineer → {{testerStage}} → {{reviewerStage}} → delivered. One active stage per task.
@@ -27,6 +29,7 @@ Stage order per task: engineer → {{testerStage}} → {{reviewerStage}} → del
 - At most {{maxActiveTasks}} active tasks and {{maxEngineers}} concurrent engineers. The CLI enforces these; on `CAPACITY` wait for a running worker instead of retrying.
 - Each attempt is limited to {{attemptMaxTurns}} turns. After {{maxRepairCyclesBeforeReplan}} repair cycles the CLI returns `replan: true`: stop repairing, rethink the approach (rewrite or split the task), and ask the user if the goal itself is in doubt.
 - Do not loop. When nothing is runnable (queue empty, paused, blocked, capacity full, or awaiting the user) report briefly and stop.
+- Idle context reset (opt-in): only if the user has asked for idle resets. When the queue is idle (nothing runnable, no active leases: `minions status --json`) and this session has handled many hand-offs (roughly ten or more), you may restart yourself to start over with a fresh context: `setsid -f minions coordinator restart --recover > /state/logs/idle-restart.log 2>&1` (detached, because the restart ends this session). All state is durable (backlog, leases, results), so nothing is lost; the new session runs `/minions:recover` and resumes the queue. Never restart with active leases or while waiting on the user mid-question, and never without the user's opt-in.
 
 ## Models
 

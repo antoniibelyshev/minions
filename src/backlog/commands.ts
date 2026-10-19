@@ -76,29 +76,64 @@ function detail(t: Task): string {
   return out.join('\n');
 }
 
+// ---------------------------------------------------------------- compact listing
+
+/** Fields `--compact` keeps for `backlog list|ready` (coordinator reads without full descriptions). */
+export const COMPACT_FIELDS = ['id', 'title', 'status', 'priority', 'dependencies'] as const;
+export const TASK_FIELDS: readonly (keyof Task)[] = ['id', 'locator', 'title', 'description', 'acceptanceCriteria', 'status', 'priority',
+  'dependencies', 'parent', 'externalLinks', 'labels', 'authorized', 'branch', 'commits', 'prUrl', 'provenance', 'version', 'milestone'];
+
+/** Resolves `--fields a,b` / `--compact` into a field list (undefined = full tasks). Unknown fields are an error. */
+export function selectFields(o: { fields?: string; compact?: boolean }): (keyof Task)[] | undefined {
+  if (o.fields === undefined) return o.compact ? [...COMPACT_FIELDS] : undefined;
+  const fields = o.fields.split(',').map((f) => f.trim()).filter(Boolean);
+  const unknown = fields.filter((f) => !(TASK_FIELDS as readonly string[]).includes(f));
+  if (unknown.length || !fields.length) {
+    throw new MinionsError('PRECONDITION', `Unknown task field(s) in --fields: ${unknown.join(', ') || '(none given)'}.`, `Allowed: ${TASK_FIELDS.join(', ')}.`);
+  }
+  return [...new Set(fields)] as (keyof Task)[];
+}
+
+/** Keeps only the selected fields of each task (all fields when `fields` is undefined). */
+export function projectTasks(tasks: Task[], fields?: readonly (keyof Task)[]): Partial<Task>[] {
+  if (!fields) return tasks;
+  return tasks.map((t) => Object.fromEntries(fields.filter((f) => f in t).map((f) => [f, t[f]])) as Partial<Task>);
+}
+
+
 // ---------------------------------------------------------------- commands
 
 /** Registers backlog commands on the root program. */
 export function register(program: Command): void {
   const bl = program.command('backlog').description('Query and edit the task backlog (container only)');
 
+  const FIELDS_HELP = `JSON output keeps only these task fields (comma-separated; e.g. ${COMPACT_FIELDS.join(',')})`;
+  const COMPACT_HELP = `same as --fields ${COMPACT_FIELDS.join(',')}`;
+
   bl.command('ready').description('List tasks ready to start (priority order)')
     .option('--limit <n>', 'maximum number of tasks', '10')
-    .action(action(async (opts: { limit: string }, cmd: Command) => {
+    .option('--fields <list>', FIELDS_HELP)
+    .option('--compact', COMPACT_HELP)
+    .action(action(async (opts: { limit: string; fields?: string; compact?: boolean }, cmd: Command) => {
       requireMode('container');
       const limit = Number(opts.limit);
       if (!Number.isInteger(limit) || limit < 0) throw new MinionsError('PRECONDITION', `--limit must be a non-negative integer (got ${opts.limit})`);
+      const fields = selectFields(opts);
       const { cfg, backlog } = await open();
       const ctx = await readyContext();
       const tasks = ctx.paused ? [] : await backlog.listReady(limit, ctx.leased, scopeOf(cfg));
-      emit({ paused: ctx.paused, tasks }, { json: globalOpts(cmd).json, human: (d) => (d.paused ? 'Starts are paused.\n' : '') + lines(d.tasks) });
+      emit({ paused: ctx.paused, tasks: projectTasks(tasks, fields) }, { json: globalOpts(cmd).json, human: (d) => (d.paused ? 'Starts are paused.\n' : '') + lines(tasks) });
     }));
 
   bl.command('list').description('List all tasks')
-    .action(action(async (_opts: unknown, cmd: Command) => {
+    .option('--fields <list>', FIELDS_HELP)
+    .option('--compact', COMPACT_HELP)
+    .action(action(async (opts: { fields?: string; compact?: boolean }, cmd: Command) => {
       requireMode('container');
+      const fields = selectFields(opts);
       const { backlog } = await open();
-      emit({ tasks: await backlog.listTasks() }, { json: globalOpts(cmd).json, human: (d) => lines(d.tasks) });
+      const tasks = await backlog.listTasks();
+      emit({ tasks: projectTasks(tasks, fields) }, { json: globalOpts(cmd).json, human: () => lines(tasks) });
     }));
 
   bl.command('show <id>').description('Show one task')

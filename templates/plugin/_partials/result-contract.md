@@ -1,6 +1,16 @@
 ## Result (output)
 
-Your final message must be exactly one fenced `json` block containing a single WorkerResult object, with nothing after it:
+Submit your WorkerResult as a single JSON object on stdin, from inside your worktree:
+
+```bash
+minions work submit <leaseId> --role {{workerRole}} --json <<'RESULT'
+{ ...WorkerResult JSON... }
+RESULT
+```
+
+Then end with **one short line** (no JSON), e.g. `submitted <leaseId>: complete - <summary>`. The coordinator records the submitted file without reading it. If the coordinator relays validation errors, fix exactly those fields, submit again, and end with one line again. Only if `minions work submit` itself fails, make your final message exactly one fenced `json` block with the WorkerResult instead.
+
+The WorkerResult:
 
 ```json
 {

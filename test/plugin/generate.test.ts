@@ -277,3 +277,39 @@ describe('Telegram tools are coordinator-only', () => {
     expect(await term.read('coordinator.md')).toContain('Telegram is not configured for this project.');
   });
 });
+
+describe('file hand-offs and compact reads', () => {
+  it('workers fetch their own brief and submit their result with their role', async () => {
+    const { read } = await gen();
+    for (const role of ['engineer', 'tester', 'reviewer']) {
+      const md = await read(`agents/${role}.md`);
+      expect(md, role).toContain(`minions work brief <leaseId> --role ${role} --json`);
+      expect(md, role).toContain(`minions work submit <leaseId> --role ${role} --json`);
+      expect(md, role).toMatch(/end with \*\*one short line\*\*/);
+      expect(md, role).toContain('Only if `minions work submit` itself fails');
+    }
+    // the read-only reviewer may still submit (state under /state, not its worktree)
+    expect(await read('agents/reviewer.md')).toMatch(/`minions work submit` commands are allowed: they read and write minions state under `\/state`, not your worktree/);
+  });
+
+  it('the coordinator and orchestrate skill use compact claims, marker-only prompts and record --submitted', async () => {
+    const { read } = await gen();
+    const coord = await read('coordinator.md');
+    const orch = await read('skills/orchestrate/SKILL.md');
+    for (const md of [coord, orch]) {
+      expect(md).toContain('--compact --json');
+      expect(md).toContain('minions work record <leaseId> --submitted');
+      expect(md).toContain('--submitted --correction');
+      expect(md).not.toMatch(/pipe it verbatim|brief JSON in a ```json fence/);
+    }
+    expect(orch).toMatch(/minions-lease: <leaseId>\n\s*worktree: <worktree>/);
+    expect(await read('skills/recover/SKILL.md')).toContain('minions work record <leaseId> --submitted --json');
+  });
+
+  it('documents the opt-in idle context reset without making it automatic', async () => {
+    const coord = await (await gen()).read('coordinator.md');
+    expect(coord).toMatch(/Idle context reset \(opt-in\): only if the user has asked for idle resets/);
+    expect(coord).toContain('minions coordinator restart --recover');
+    expect(coord).toMatch(/no active leases/);
+  });
+});
