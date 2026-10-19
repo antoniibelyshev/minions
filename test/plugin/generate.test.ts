@@ -287,6 +287,8 @@ describe('file hand-offs and compact reads', () => {
       expect(md, role).toContain(`minions work submit <leaseId> --role ${role} --json`);
       expect(md, role).toMatch(/end with \*\*one short line\*\*/);
       expect(md, role).toContain('Only if `minions work submit` itself fails');
+      expect(md, role).toContain('end with exactly one line, `brief unavailable: <error>`, and no WorkerResult');
+      expect(md, role).not.toMatch(/fetch fails, report `blocked`/);
     }
     // the read-only reviewer may still submit (state under /state, not its worktree)
     expect(await read('agents/reviewer.md')).toMatch(/`minions work submit` commands are allowed: they read and write minions state under `\/state`, not your worktree/);
@@ -301,9 +303,15 @@ describe('file hand-offs and compact reads', () => {
       expect(md).toContain('minions work record <leaseId> --submitted');
       expect(md).toContain('--submitted --correction');
       expect(md).not.toMatch(/pipe it verbatim|brief JSON in a ```json fence/);
+      // older-CLI fallback: plain claim with pasted brief, record via stdin
+      expect(md).toContain('Older CLI fallback: if `--compact`, `work brief` or `--submitted` is rejected as an unknown option or command, claim without `--compact` and paste the brief in a ```json fence after the marker and worktree lines');
+      expect(md).toContain("piping the worker's final JSON to `minions work record <leaseId> --json` on stdin");
+      expect(md).toMatch(/`brief unavailable: <error>`.*do not record it.*[Rr]elease/s);
     }
     expect(orch).toMatch(/minions-lease: <leaseId>\n\s*worktree: <worktree>/);
-    expect(await read('skills/recover/SKILL.md')).toContain('minions work record <leaseId> --submitted --json');
+    const recover = await read('skills/recover/SKILL.md');
+    expect(recover).toContain('minions work record <leaseId> --submitted --json');
+    expect(recover).toMatch(/On `PRECONDITION` about a pending correction.*--submitted --correction --json/);
   });
 
   it('documents the opt-in idle context reset without making it automatic', async () => {

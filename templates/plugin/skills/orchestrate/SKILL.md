@@ -50,6 +50,8 @@ Call the Agent tool:
 
   Copy `briefMarker` exactly as the first line. The worker runs `minions work brief <leaseId> --role <role> --json` from its worktree (only the lease's own worker can). Keep notes focused: no full backlog, transcripts, or unrelated notes.
 
+Older CLI fallback: if `--compact`, `work brief` or `--submitted` is rejected as an unknown option or command, claim without `--compact` and paste the brief in a ```json fence after the marker and worktree lines; in step 5, record by piping the worker's final JSON to `minions work record <leaseId> --json` on stdin.
+
 Independent tasks may run in parallel up to the limits. A task never has two workers at once.
 
 ## 5. Record
@@ -60,6 +62,7 @@ When a worker returns, it has submitted its result with `minions work submit` an
 
 - No submission (`NOT_FOUND`, hint names `minions work submit`): if the worker's final message contains the JSON instead, pipe that to `minions work record <leaseId> --json` on stdin; otherwise ask the worker to submit (once), or release the lease.
 - Invalid result (`valid: false`, `correctionAllowed: true`): send the worker only the listed `errors`, ask it to fix them and submit again, then `minions work record <leaseId> --submitted --correction --json`. If it is still invalid, it is stored unvalidated; decide yourself (usually re-dispatch or ask the user). Never treat it as approval.
+- Worker ended with `brief unavailable: <error>` (no result): do not record it. Release the lease (`minions work release <leaseId> --reason "brief unavailable" --json`), claim again without `--compact`, and re-dispatch with the brief pasted in a ```json fence.
 - Stale head: the worker reported a SHA that is not the branch head; re-dispatch the same role.
 - If a worker died or will not finish, `minions work release <leaseId> --reason "<why>" --json`.
 

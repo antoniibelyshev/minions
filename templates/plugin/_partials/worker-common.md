@@ -20,6 +20,6 @@ Your prompt starts with a `minions-lease: <leaseId>` line and a `worktree: <path
 cd <worktree> && minions work brief <leaseId> --role {{workerRole}} --json
 ```
 
-It only works for your own active lease, from inside its worktree. The brief is in `data`. If the prompt instead contains the brief JSON itself, use that. If the fetch fails, report `blocked` with the error (do not guess the brief).
+It only works for your own active lease, from inside its worktree. The brief is in `data`. If the prompt instead contains the brief JSON itself, use that. If the fetch fails, do not guess the brief and do not report `blocked`: end with exactly one line, `brief unavailable: <error>`, and no WorkerResult. The coordinator will re-dispatch with the brief pasted.
 
 Fields you rely on: `leaseId`, `role`, `attempt`, `task` (`id`, `locator`, `title`, `description`, `acceptanceCriteria`, non-goals if any), `branch`, `worktree`, `baseBranch`, `baseSha`, `expectedHead`, `verificationCommands`, `relevantFiles`/`decisions` when given, `priorFindings` from earlier attempts, `model`, `maxTurns`, and `configRevision`. Coordinator notes in the prompt take precedence over the brief for focus. Missing optional fields mean "none". If `worktree` or `branch` is missing, report `blocked`; do not guess.
