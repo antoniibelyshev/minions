@@ -13,7 +13,7 @@ import { delegateToContainer } from '../host/delegate.js';
 import { readTelegramAccess } from '../telegram/access.js';
 import { installTelegramPlugin } from '../telegram/install.js';
 import { formatTelegramProbe, probeTelegram } from '../telegram/probe.js';
-import { buildClaudeCommand, buildCoordinatorCommand, launchCoordinator, probeRuntime, coordinatorWrapper, readLaunchRecord, syncCoordinator } from './coordinator.js';
+import { buildClaudeCommand, buildCoordinatorCommand, launchCoordinator, probeRuntime, coordinatorWrapper, readLaunchRecord, restartCoordinator, RECOVERY_PROMPT, syncCoordinator } from './coordinator.js';
 import { openDb, type Lease, type LeaseRole, type RuntimeDb } from './db.js';
 import { runHook } from './hooks.js';
 import { runtimePaths } from './paths.js';
@@ -50,6 +50,12 @@ async function context() {
   const cfg = await getConfig();
   return { config: cfg, db: getDb(), backlog: await getBacklog() };
 }
+
+/** Records a requested coordinator restart: last one in meta (as `sync` does) and a `coordinator-restart` event. */
+export const coordinatorRestartRecorder = (d: RuntimeDb) => (info: { at: string; reason: string; leases: string[]; recover?: boolean }): void => {
+  d.setMeta('coordinator_restart', JSON.stringify(info));
+  d.addEvent('coordinator-restart', null, info);
+};
 
 const scheduler = async () => new Scheduler({ ...(await context()), layout: workspaceLayout() });
 
@@ -212,9 +218,10 @@ export function register(program: Command): void {
       process.exitCode = await launchCoordinator(cfg);
     }));
   coord.command('run').description('Exec wrapper started by tmux: decides Telegram, then runs claude (container only)')
-    .action(action(async () => {
+    .option('--recover', 'start claude with the recovery prompt (recover skill, then resume the queue)')
+    .action(action(async (o: { recover?: boolean }) => {
       requireMode('container');
-      process.exitCode = await coordinatorWrapper(getConfig);
+      process.exitCode = await coordinatorWrapper(getConfig, o.recover ? { startupPrompt: RECOVERY_PROMPT } : {});
     }));
   coord.command('sync').description('Apply restart-required Telegram changes with a controlled coordinator restart (container only)')
     .option('--force', 'restart even while worker leases are active (they stay recorded for recovery)')
@@ -225,6 +232,18 @@ export function register(program: Command): void {
       const r = await syncCoordinator(await getConfig(), {
         activeLeases: () => d.activeLeases(),
         recordRestart: (info) => d.setMeta('coordinator_restart', JSON.stringify(info)),
+      }, o);
+      emit(r, { json: globalOpts(cmd).json, human: (x: typeof r) => `coordinator: ${x.action} (${x.reason})` });
+    }));
+  coord.command('restart').description('Kill the coordinator session and relaunch it detached (container only; used by the host upgrade)')
+    .option('--recover', 'start with the recovery prompt: reconcile leases, re-dispatch, resume the queue')
+    .option('--force', 'restart even while worker leases are active (they stay recorded for recovery)')
+    .action(action(async (o: { force?: boolean; recover?: boolean }, cmd: Command) => {
+      requireMode('container');
+      const d = getDb();
+      const r = await restartCoordinator(await getConfig(), {
+        activeLeases: () => d.activeLeases(),
+        recordRestart: coordinatorRestartRecorder(d),
       }, o);
       emit(r, { json: globalOpts(cmd).json, human: (x: typeof r) => `coordinator: ${x.action} (${x.reason})` });
     }));
