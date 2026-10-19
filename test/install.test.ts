@@ -6,7 +6,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync }
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { BUILD_DEPS, localNpmEnv, missingBuildDeps, strayGlobalLink } from '../scripts/prepare.mjs';
+import { BUILD_DEPS, inGitDepPrepare, localNpmEnv, missingBuildDeps, strayGlobalLink } from '../scripts/prepare.mjs';
 
 const root = join(import.meta.dirname, '..');
 const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')) as {
@@ -83,18 +83,46 @@ describe('prepare hook helpers', () => {
     expect(env).toEqual({ PATH: '/bin', npm_config_cache: '/c' });
   });
 
-  it('detects the stray global link to the clone only during a global install', () => {
+  /** A temp dir shaped like pacote's git clone: `<cache>/_cacache/tmp/git-clone<random>`. */
+  const gitClone = () => {
+    const dir = join(tmp(), '_cacache', 'tmp', 'git-cloneAbC123');
+    mkdirSync(dir, { recursive: true });
+    return dir;
+  };
+  const pacoteEnv = { _PACOTE_NO_PREPARE_: 'git+ssh://git@github.com/antoniibelyshev/minions.git#0123abc' };
+
+  it('recognises npm git-dependency preparation only with both pacote signals', () => {
+    const clone = gitClone();
+    expect(inGitDepPrepare(pacoteEnv, clone)).toBe(true);
+    expect(inGitDepPrepare({}, clone)).toBe(false); // no _PACOTE_NO_PREPARE_
+    expect(inGitDepPrepare(pacoteEnv, tmp())).toBe(false); // not a git-clone temp dir
+    expect(inGitDepPrepare(pacoteEnv, root)).toBe(false); // a checkout
+  });
+
+  it('detects the stray global link to the clone only during a global git-dep install', () => {
     const prefix = tmp();
-    const clone = tmp();
+    const clone = gitClone();
     mkdirSync(join(prefix, 'lib', 'node_modules'), { recursive: true });
     const link = join(prefix, 'lib', 'node_modules', 'minions');
     symlinkSync(clone, link);
-    const env = { npm_config_global: 'true', npm_config_prefix: prefix };
+    const env = { ...pacoteEnv, npm_config_global: 'true', npm_config_prefix: prefix };
     expect(strayGlobalLink(env, clone, 'linux')).toBe(link);
-    expect(strayGlobalLink({ npm_config_prefix: prefix }, clone, 'linux')).toBeNull();
-    expect(strayGlobalLink(env, tmp(), 'linux')).toBeNull(); // link points elsewhere
+    expect(strayGlobalLink({ ...pacoteEnv, npm_config_prefix: prefix }, clone, 'linux')).toBeNull();
+    expect(strayGlobalLink(env, gitClone(), 'linux')).toBeNull(); // link points elsewhere
     rmSync(link);
     mkdirSync(link);
     expect(strayGlobalLink(env, clone, 'linux')).toBeNull(); // a real directory is left alone
+  });
+
+  it('leaves the link alone for a plain `npm install -g .` from a checkout', () => {
+    const prefix = tmp();
+    const checkout = tmp();
+    mkdirSync(join(prefix, 'lib', 'node_modules'), { recursive: true });
+    const link = join(prefix, 'lib', 'node_modules', 'minions');
+    symlinkSync(checkout, link);
+    const env = { npm_config_global: 'true', npm_config_prefix: prefix };
+    expect(strayGlobalLink(env, checkout, 'linux')).toBeNull();
+    // Even a stray _PACOTE_NO_PREPARE_ (a parent git-dep install) is not enough outside a git-clone dir.
+    expect(strayGlobalLink({ ...env, ...pacoteEnv }, checkout, 'linux')).toBeNull();
   });
 });
