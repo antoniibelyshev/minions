@@ -14,7 +14,10 @@
 //   (or the remaining steps) still resumes it.
 // - Never `compose down -v`, never removes volumes, never re-clones the workspace: the repository clone,
 //   worktrees, Backlog.md tasks, runtime DB and Claude login all live in named volumes.
-// - Reinstalling the CLI package is not done here (the running CLI is the installed package).
+// - Before all of that, the optional source phase (src/host/upgrade-source.ts) runs: --from-container
+//   fast-forwards a host branch to the container's base branch, and an installed CLI that differs from
+//   the project's minions checkout is rebuilt/reinstalled (the rest then runs on the new CLI) or the
+//   exact command is printed and the upgrade stops before any container step.
 import { rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { MinionsError } from '../core/errors.js';
@@ -23,12 +26,13 @@ import { projectPaths } from '../core/paths.js';
 import { materializeSecrets, upClearingSecretsOnFailure } from './credentials.js';
 import { buildFingerprint, ensureImage, imageBuildLabel, packageRoot, type Compose, type Runner } from './docker.js';
 import { parseEnvelope, type ImportResult } from './transfer.js';
+import type { CliCheck, SourcePhase, SourceStop, SyncResult } from './upgrade-source.js';
 
 export const DEFAULT_UPGRADE_TIMEOUT_SEC = 1800;
 export const UPGRADE_RELEASE_REASON = 'interrupted by minions upgrade --now (container recreated); re-dispatch on recovery';
 
-export type UpgradeStepId = 'preflight' | 'pause' | 'drain' | 'files' | 'image' | 'secrets' | 'recreate' | 'workspace' | 'origin' | 'resume' | 'coordinator';
-export const UPGRADE_STEPS: readonly UpgradeStepId[] = ['preflight', 'pause', 'drain', 'files', 'image', 'secrets', 'recreate', 'workspace', 'origin', 'resume', 'coordinator'];
+export type UpgradeStepId = 'sync' | 'cli' | 'preflight' | 'pause' | 'drain' | 'files' | 'image' | 'secrets' | 'recreate' | 'workspace' | 'origin' | 'resume' | 'coordinator';
+export const UPGRADE_STEPS: readonly UpgradeStepId[] = ['sync', 'cli', 'preflight', 'pause', 'drain', 'files', 'image', 'secrets', 'recreate', 'workspace', 'origin', 'resume', 'coordinator'];
 export type UpgradeStepStatus = 'done' | 'skipped' | 'failed' | 'planned';
 export interface UpgradeStep { id: UpgradeStepId; status: UpgradeStepStatus; detail: string }
 
@@ -44,6 +48,13 @@ export interface UpgradeResult {
   interrupted: LeaseInfo[];
   image: { tag: string; rebuild: boolean; fingerprint: string | null; previous: string | null };
   coordinator: { action?: string; running?: boolean; reason?: string } | null;
+  /** Source phase (present when it ran): the --from-container fast-forward and the installed-CLI check. */
+  sync?: SyncResult | null;
+  cli?: CliCheck | null;
+  /** The upgrade stopped before the container steps: run `command`, then `rerun`. */
+  stopped?: SourceStop | null;
+  /** The container steps ran on the newly installed CLI (after a rebuild/reinstall). */
+  continued?: boolean;
 }
 
 export interface UpgradeOptions {
@@ -68,6 +79,8 @@ export interface UpgradeOptions {
   sleep?: (ms: number) => Promise<void>;
   clock?: () => number;
   pollMs?: number;
+  /** Source phase run first (--from-container sync and the CLI check); see src/host/upgrade-source.ts. */
+  source?: () => Promise<SourcePhase<UpgradeResult>>;
 }
 
 interface Marker { pausedStarts: boolean; at: string }
@@ -91,6 +104,16 @@ export async function runUpgrade(opts: UpgradeOptions): Promise<UpgradeResult> {
     projectId, dryRun: !!opts.dryRun, ok: true, steps, interrupted: [],
     image: { tag: opts.imageTag, rebuild: false, fingerprint: null, previous: null }, coordinator: null,
   };
+
+  // ---- source phase (host only; before any container step) ----
+  if (opts.source) {
+    const s = await opts.source();
+    steps.push(...s.steps);
+    result.sync = s.sync; result.cli = s.cli; result.stopped = s.stop;
+    if (!s.ok) result.ok = false;
+    if (s.stop) { result.ok = false; return result; }
+    if (s.continued) return { ...s.continued, steps: [...steps, ...s.continued.steps], sync: s.sync, cli: s.cli, stopped: null, continued: true };
+  }
 
   // Container-side status: pause state and active leases (runtime DB in the state volume).
   const status = async (): Promise<{ paused: { intake: boolean; starts: boolean }; activeLeases: LeaseInfo[] }> => {
@@ -265,8 +288,10 @@ export async function runUpgrade(opts: UpgradeOptions): Promise<UpgradeResult> {
 export function formatUpgrade(r: UpgradeResult): string {
   const mark: Record<UpgradeStepStatus, string> = { done: 'ok  ', skipped: 'skip', failed: 'FAIL', planned: 'plan' };
   return [
-    r.dryRun ? `Upgrade plan for ${r.projectId} (dry run; nothing changed):` : `Upgrade of ${r.projectId}: ${r.ok ? 'complete' : 'finished with failures'}.`,
+    r.dryRun ? `Upgrade plan for ${r.projectId} (dry run; nothing changed):` : `Upgrade of ${r.projectId}: ${r.stopped ? 'stopped' : r.ok ? 'complete' : 'finished with failures'}.`,
     ...r.steps.map((s) => `  [${mark[s.status]}] ${s.id}: ${s.detail}`),
+    ...(r.stopped ? [`Stopped before the container steps (nothing in the container changed): ${r.stopped.reason}.`, 'Run:', `  ${r.stopped.command}`, 'then:', `  ${r.stopped.rerun}`] : []),
+    ...(r.continued ? ['The container steps ran on the newly installed CLI.'] : []),
     ...(r.interrupted.length ? [`Interrupted leases (re-dispatched by the coordinator's recovery): ${r.interrupted.map(leaseLabel).join(', ')}`] : []),
   ].join('\n');
 }

@@ -12,7 +12,7 @@ import {
   removeTelegramToken, telegramBotGuidance,
 } from './credentials.js';
 import { dockerProbe } from './discovery.js';
-import { Compose, ensureImage } from './docker.js';
+import { Compose, ensureImage, packageRoot } from './docker.js';
 import { formatDoctor, runDoctor } from './doctor.js';
 import { dockerUnavailable, formatInit, refreshDerived, runInit } from './install.js';
 import { loadEffectiveConfig, loadProjectJson } from './project.js';
@@ -21,6 +21,7 @@ import { exportRepo, importRepo } from './transfer.js';
 import { formatUninstall, runUninstall } from './uninstall.js';
 import { DELIVERY_MODES, formatSetup, runSetup, shellQuote, type DeliveryMode, type SetupRuntime } from './setup.js';
 import { DEFAULT_UPGRADE_TIMEOUT_SEC, formatUpgrade, runUpgrade } from './upgrade.js';
+import { HANDOFF_ENV, isMinionsCheckout, runSourcePhase } from './upgrade-source.js';
 import { readSecret, readlineIO } from './wizard.js';
 
 const say = (json: boolean, msg: string) => { if (!json) process.stderr.write(msg + '\n'); };
@@ -244,8 +245,9 @@ export function register(program: Command): void {
     .description('Upgrade the project container to the installed minions (drains workers, keeps volumes)')
     .option('--timeout <seconds>', `wait this long for active workers (default ${DEFAULT_UPGRADE_TIMEOUT_SEC}; 0 with --now)`)
     .option('--now', 'release workers still active when the wait ends (reported as interrupted, re-dispatched after)')
+    .option('--from-container [branch]', 'first export the container branches and fast-forward <branch> (default: the base branch) to minions/<base>; strict fast-forward on a clean tree only')
     .option('--dry-run', 'list the steps without changing anything')
-    .action(action(async (o: { timeout?: string; now?: boolean }, cmd: Command) => {
+    .action(action(async (o: { timeout?: string; now?: boolean; fromContainer?: string | boolean }, cmd: Command) => {
       requireMode('host');
       const { json, dryRun } = globalOpts(cmd);
       const timeoutSec = o.timeout === undefined ? (o.now ? 0 : DEFAULT_UPGRADE_TIMEOUT_SEC) : Number(o.timeout);
@@ -253,8 +255,25 @@ export function register(program: Command): void {
       const ref = await projectForPath(process.cwd());
       const project = await loadProjectJson(ref.projectId);
       if (!dryRun) await requireDocker();
+      const compose = new Compose(project.projectId);
+      // The rest of the upgrade, as run again by the new CLI after a reinstall (or by the user after a stop).
+      const flags = [...(o.timeout !== undefined ? ['--timeout', String(timeoutSec)] : []), ...(o.now ? ['--now'] : [])];
       const r = await runUpgrade({
-        projectId: project.projectId, imageTag: project.imageTag, compose: new Compose(project.projectId), timeoutSec, now: o.now, dryRun,
+        source: () => runSourcePhase({
+          dryRun, handoff: process.env[HANDOFF_ENV] === '1', runningRoot: packageRoot(), log: (m) => say(json, m),
+          checkout: isMinionsCheckout(ref.repoPath) ? ref.repoPath : null,
+          sync: o.fromContainer === undefined ? null : {
+            repo: ref.repoPath, baseBranch: project.baseBranch,
+            branch: typeof o.fromContainer === 'string' ? o.fromContainer : project.baseBranch,
+            exportRepo: async () => {
+              if (!(await compose.isRunning())) throw new MinionsError('PRECONDITION', '--from-container needs the project container running (it exports from it).', 'Run `minions start --no-attach`, or upgrade without --from-container.');
+              return exportRepo(project, { repoPath: ref.repoPath, compose });
+            },
+          },
+          continueArgs: ['--json', 'upgrade', ...flags],
+          rerun: ['minions', 'upgrade', ...flags].join(' '),
+        }),
+        projectId: project.projectId, imageTag: project.imageTag, compose, timeoutSec, now: o.now, dryRun,
         refresh: async () => refreshDerived(project, (await loadEffectiveConfig(project)).config),
         importRepo: () => importRepo(project, { repoPath: ref.repoPath }),
         materialize: () => materializeSecrets(project.projectId),

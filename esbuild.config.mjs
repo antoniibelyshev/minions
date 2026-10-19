@@ -1,7 +1,8 @@
 // Bundles src/cli.ts into a single dependency-free dist/cli.js and regenerates schema/config.schema.json.
 import { build } from 'esbuild';
-import { readFileSync, rmSync, chmodSync } from 'node:fs';
-import { pathToFileURL } from 'node:url';
+import { readFileSync, rmSync, chmodSync, writeFileSync } from 'node:fs';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { sourceFingerprint } from './scripts/source-fingerprint.mjs';
 
 const pkg = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8'));
 const common = {
@@ -36,5 +37,13 @@ if (!process.argv.includes('--schema-only')) {
     },
   });
   chmodSync('dist/cli.js', 0o755);
+  // Build stamp read by `minions upgrade` to tell whether the installed CLI matches a checkout.
+  // MINIONS_BUILD_KIND=packed is set by install.sh (and by the upgrade's own reinstall) for a packed
+  // tarball install; any other build (git-URL prepare, plain `npm run build`) records 'source'.
+  writeFileSync('dist/build.json', JSON.stringify({
+    version: pkg.version,
+    source: sourceFingerprint(fileURLToPath(new URL('.', import.meta.url))),
+    kind: process.env.MINIONS_BUILD_KIND === 'packed' ? 'packed' : 'source',
+  }) + '\n');
 }
 await generateSchema();

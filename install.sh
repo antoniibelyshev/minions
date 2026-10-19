@@ -28,6 +28,8 @@ fi
 docker compose version >/dev/null 2>&1 || die "Docker Compose v2 is required (bundled with Docker Desktop)."
 
 cd "$here"
+# Stamps dist/build.json as a packed install, so `minions upgrade` may later reinstall it in place.
+export MINIONS_BUILD_KIND=packed
 info "Installing build dependencies (npm ci)"
 npm ci --no-fund --no-audit
 info "Building"

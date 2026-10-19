@@ -229,7 +229,8 @@ Decision record for `minions setup` (`src/host/setup.ts`).
 
 `minions upgrade` (host, `src/host/upgrade.ts`) moves a project onto the installed minions package
 without losing progress. The host drives the container through `docker compose exec`; lease and pause
-state stay in the runtime DB in the state volume. Reinstalling the CLI package is a separate step.
+state stay in the runtime DB in the state volume. Bringing the host checkout and the installed CLI up to
+date is the source phase. It runs before everything else (see "Upgrade from the container" below).
 
 - **Order.** Preflight (read-only) → `pause --starts` → drain → regenerate derived files → image →
   materialize secrets → `compose up --force-recreate` → `workspace setup` → `importRepo` (refreshes
@@ -251,6 +252,43 @@ state stay in the runtime DB in the state volume. Reinstalling the CLI package i
   attempted and failures are reported (`ok: false`, exit code 1).
 - **Volumes.** The upgrade never runs `down -v` or volume commands. `--dry-run` only reads (compose
   ps, image inspect, `minions status`) and lists every step.
+
+### Upgrade from the container
+
+The source phase (`src/host/upgrade-source.ts`) adds two steps, `sync` and `cli`, ahead of
+`preflight`. Both finish before any pause, drain or recreate.
+
+- **`--from-container [branch]`** runs `exportRepo`, then moves `branch` (default: the base branch) to
+  `refs/remotes/minions/<base>`. The move happens only when `git merge-base --is-ancestor` holds and
+  `git status --porcelain` is empty. That check covers the repository's worktree and the worktree that
+  has the branch checked out; untracked files count as dirty. If the branch is checked out, the move is
+  `merge --ff-only`. Otherwise it is `update-ref <ref> <new> <old>`, a compare-and-swap with a reflog
+  entry. A dirty tree refuses with `PRECONDITION` and a divergence refuses with `CONFLICT`. Neither
+  changes anything. A branch that is already up to date or ahead is left alone. Nothing here forces,
+  resets, stashes or checks out. `--dry-run` does not export; it checks against the refs from the last
+  export and reports a refusal as a failed step.
+- **Installed CLI vs checkout.** This check runs only when the project repository is a minions
+  checkout. `esbuild.config.mjs` writes `dist/build.json` = `{version, source, kind}`. `source` is
+  `scripts/source-fingerprint.mjs`, a hash of `src/ templates/ docker/ scripts/` plus the package,
+  lock and esbuild files, regular files only. The upgrade recomputes that hash on the checkout and
+  compares it, together with the version, against the global install at `<npm root -g>/minions`.
+- **Install kinds and what happens.** A symlink is a `link` (`npm install -g <dir>`). If it points at the
+  checkout, the upgrade rebuilds it (`npm run build`, or `npm ci` when build deps are missing). A real
+  directory stamped `kind: packed` comes from `install.sh`, which exports `MINIONS_BUILD_KIND=packed`.
+  The upgrade reinstalls it in place: `npm pack` of the checkout into a temp dir, then
+  `npm install -g <tgz>`. A real directory whose `npm ls -g --long` `resolved` or package.json
+  `_resolved`/`_from` is a git spec is a `git` install. Any other real directory is `unknown`; npm 10
+  records nothing that tells a git-URL install from a tarball install. For `git`, `unknown`, a link
+  elsewhere, or a missing install, the upgrade does not touch npm. It prints
+  `cd <checkout> && npm ci && MINIONS_BUILD_KIND=packed npm pack && npm uninstall -g minions && npm install -g ./minions-<v>.tgz`
+  plus the rerun command and stops (`stopped`, `ok: false`, exit 1).
+- **No self-continuation (task-3 decision).** The running CLI never runs container steps from a
+  package it just replaced. After a rebuild or reinstall it re-checks the install, then runs
+  `node <installed>/dist/cli.js --json upgrade [--timeout N] [--now]` with `MINIONS_UPGRADE_HANDOFF=1`
+  and returns that result, source steps first, with `continued: true`. Under the hand-off variable a
+  CLI that still differs stops with the command instead of reinstalling again.
+- **Trust.** Rebuilding runs the checkout's build scripts on the host. With `--from-container`, that
+  code comes from agent branches the user chose to take.
 
 ## Telegram bot token
 
