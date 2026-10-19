@@ -294,3 +294,129 @@ describe('runUpgrade', () => {
     expect(h.events).toEqual([]);
   });
 });
+
+// Graceful-upgrade probes: a live coordinator session during the drain, an upgrade killed mid-drain,
+// a stale upgrade.json, the --now release race, and --timeout N --now.
+describe('runUpgrade: interruption and recovery', () => {
+  const markerFile = () => join(projectPaths(ID).dir, 'upgrade.json');
+  const writeMarker = () => { mkdirSync(projectPaths(ID).dir, { recursive: true }); writeFileSync(markerFile(), JSON.stringify({ pausedStarts: true, at: '2026-01-01T00:00:00.000Z' })); };
+
+  it('the drain only polls status while the coordinator session runs: nothing is released, killed or recreated early', async () => {
+    const a = lease('l1', 'task-1');
+    const w = world({ leases: [a], leaseTimeline: [[a], [a], [a], []] });
+    const h = harness(w);
+    let checked = 0;
+    const r = await runUpgrade(h.opts({
+      timeoutSec: 600,
+      sleep: async (ms) => {
+        // Every wait happens with the session alive and the container untouched.
+        expect(w.coordinatorRunning).toBe(true);
+        expect(h.events).not.toContain('recreate');
+        expect(h.mutating().map((c) => c.slice(1)).filter((a) => !(a[5] === 'exec' && a.includes('pause')))).toEqual([]);
+        checked++;
+        await h.opts().sleep!(ms);
+      },
+    }));
+    expect(r.ok).toBe(true);
+    expect(checked).toBe(4); // initial read, then three polls still showing l1, then the empty set
+    expect(r.interrupted).toEqual([]);
+    expect(h.events.filter((e) => e.startsWith('release'))).toEqual([]);
+    expect(h.events.indexOf('recreate')).toBeGreaterThan(h.events.lastIndexOf('status'));
+  });
+
+  it('a run killed mid-drain leaves its pause and marker; the rerun finishes the drain and resumes starts', async () => {
+    // State left by a SIGINT/SIGTERM during the wait: starts paused by the upgrade, marker on disk, lease active.
+    const a = lease('l1', 'task-1');
+    writeMarker();
+    const w = world({ paused: { intake: false, starts: true }, leases: [a], leaseTimeline: [[a], []] });
+    const h = harness(w);
+    const r = await runUpgrade(h.opts());
+    expect(r.ok).toBe(true);
+    expect(r.steps.find((s) => s.id === 'pause')).toMatchObject({ status: 'skipped', detail: expect.stringMatching(/unfinished upgrade/) });
+    expect(h.events).not.toContain('pause');
+    expect(h.events.slice(-2)).toEqual(['resume', 'coordinator']);
+    expect(w.paused.starts).toBe(false);
+    expect(existsSync(markerFile())).toBe(false);
+  });
+
+  it('a rerun after a killed run that times out again still resumes the inherited pause', async () => {
+    const a = lease('l1', 'task-1');
+    writeMarker();
+    const w = world({ paused: { intake: false, starts: true }, leases: [a], leaseTimeline: [[a]] });
+    const h = harness(w);
+    const err = await runUpgrade(h.opts({ timeoutSec: 10 })).catch((e) => e);
+    expect(err).toMatchObject({ code: 'PRECONDITION' });
+    expect(h.events.filter((e) => e !== 'status')).toEqual(['resume']);
+    expect(w.paused.starts).toBe(false);
+    expect(existsSync(markerFile())).toBe(false);
+  });
+
+  it('a stale marker after the user resumed manually: pauses and resumes normally and clears the marker', async () => {
+    writeMarker();
+    const w = world();
+    const h = harness(w);
+    const r = await runUpgrade(h.opts());
+    expect(r.ok).toBe(true);
+    expect(h.events).toEqual(['status', 'pause', 'files', 'secrets', 'recreate', 'workspace', 'origin', 'resume', 'coordinator']);
+    expect(w.paused.starts).toBe(false);
+    expect(existsSync(markerFile())).toBe(false);
+  });
+
+  it('--dry-run with a stale marker reads it but does not remove it or touch the container', async () => {
+    writeMarker();
+    const w = world({ paused: { intake: false, starts: true } });
+    const h = harness(w);
+    const r = await runUpgrade(h.opts({ dryRun: true }));
+    expect(r.steps.find((s) => s.id === 'resume')?.status).toBe('planned');
+    expect(h.mutating()).toEqual([]);
+    expect(existsSync(markerFile())).toBe(true);
+  });
+
+  it('--timeout N --now waits N seconds, lets finished leases end normally, then releases only the rest', async () => {
+    const a = lease('l1', 'task-1'), b = lease('l2', 'task-2', 'reviewer');
+    const w = world({ leases: [a, b], leaseTimeline: [[a, b], [b]] });
+    const h = harness(w);
+    const r = await runUpgrade(h.opts({ timeoutSec: 30, now: true }));
+    expect(r.ok).toBe(true);
+    expect(h.elapsed()).toBe(30_000);
+    expect(r.interrupted).toEqual([b]);
+    expect(h.events.filter((e) => e.startsWith('release'))).toEqual(['release:l2']);
+    expect(h.events.indexOf('release:l2')).toBeLessThan(h.events.indexOf('recreate'));
+  });
+
+  it('a lease that ends between the last poll and its --now release aborts safely: starts resumed, container untouched', async () => {
+    const a = lease('l1', 'task-1');
+    const w = world({ leases: [a], leaseTimeline: [[a]] });
+    const base = harness(w);
+    const runner = async (c: string, args: string[], o?: RunOptions): Promise<RunResult> =>
+      args.includes('release') ? { code: 1, stdout: '', stderr: 'Lease l1 already ended (completed).' } : base.runner(c, args, o);
+    const err = await runUpgrade(base.opts({ timeoutSec: 0, now: true, compose: new Compose(ID, runner), runner })).catch((e) => e);
+    expect(err.message).toMatch(/aborted at drain: work release l1 failed/);
+    expect(base.events).not.toContain('recreate');
+    expect(base.events.at(-1)).toBe('resume');
+    expect(w.paused.starts).toBe(false);
+    expect(w.coordinatorRunning).toBe(true);
+  });
+
+  it('no path issues compose down, -v or volume commands (success, timeout, --now, failed recreate, post-recreate failure)', async () => {
+    const a = lease('l1', 'task-1');
+    const scenarios: [Partial<World>, Partial<UpgradeOptions>][] = [
+      [{}, {}],
+      [{ leases: [a], leaseTimeline: [[a]] }, { timeoutSec: 5 }],
+      [{ leases: [a], leaseTimeline: [[a]] }, { timeoutSec: 0, now: true }],
+      [{ fail: { recreate: true } }, {}],
+      [{ fail: { workspace: true, resume: true } }, {}],
+      [{ label: 'stale0000000000', fail: { build: true } }, {}],
+      [{ container: 'absent', coordinatorRunning: false }, {}],
+    ];
+    for (const [over, o] of scenarios) {
+      const w = world(over);
+      const before = structuredClone(w.volumes);
+      const h = harness(w);
+      await runUpgrade(h.opts(o)).catch(() => undefined);
+      const docker = h.calls.map((c) => c.slice(1));
+      expect(docker.filter((x) => x.includes('down') || x.includes('-v') || x.includes('--volumes') || x[0] === 'volume' || x.includes('rm'))).toEqual([]);
+      expect(w.volumes).toEqual(before);
+    }
+  });
+});
