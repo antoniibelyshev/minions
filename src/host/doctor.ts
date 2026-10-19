@@ -6,6 +6,7 @@ import { redact } from '../core/output.js';
 import { VERSION } from '../core/version.js';
 import { dockerProbe, type DockerProbe } from './discovery.js';
 import { Compose, buildFingerprint, imageBuildLabel, type Runner } from './docker.js';
+import { telegramDoctorCheck } from '../telegram/probe.js';
 import { loadEffectiveConfig, loadProjectJson } from './project.js';
 import { projectForPath } from './registry.js';
 
@@ -66,8 +67,11 @@ export async function runDoctor(opts: { cwd: string; runner?: Runner; probe?: Do
         add('backlog.cli', bl.code === 0 ? 'ok' : 'fail', bl.code === 0 ? `backlog.md ${short(bl.stdout)}` : `backlog CLI not usable: ${short(bl.stderr || bl.stdout)}`);
         const probe = await ex(['minions', 'coordinator', '--probe', '--json']);
         add('claude.capabilities', probe.code === 0 ? 'ok' : 'fail', probe.code === 0 ? 'Claude Code supports the coordinator launch flags; launch command resolves' : `coordinator probe failed (exit ${probe.code}): ${short(probe.stderr || probe.stdout)}`);
+        // Credential-free; never 'fail' because terminal mode must stay usable without Telegram.
+        const tg = telegramDoctorCheck(await ex(['minions', 'telegram', 'probe', '--json']));
+        add('telegram.plugin', tg.status, tg.detail, tg.hint);
       } else {
-        for (const n of ['claude.auth', 'backlog.cli', 'claude.capabilities']) add(n, 'warn', 'skipped: container not running');
+        for (const n of ['claude.auth', 'backlog.cli', 'claude.capabilities', 'telegram.plugin']) add(n, 'warn', 'skipped: container not running');
       }
     } else {
       add('container', 'fail', 'skipped: Docker unavailable');

@@ -11,6 +11,7 @@
 | Runtime base image | `node:22-bookworm-slim@sha256:c3de60bf2f9dd0ac6370e6117950ff62d6e339527e7472301c9c78a017978392` (Node 22.23.3) | Multi-arch index digest, resolved 2026-10-19. |
 | Claude Code (in image) | `@anthropic-ai/claude-code@2.1.292` | Pinned in `docker/Dockerfile`; auto-updater disabled. |
 | Backlog.md (in image) | `backlog.md@1.54.0` | Pinned in `docker/Dockerfile`. |
+| Telegram channel plugin | `telegram@claude-plugins-official` 0.0.7 (marketplace commit `1e96c6b`) | Interface read and install verified on Claude Code 2.1.292 without credentials; not shipped in v0.1. Needs Bun, which the image does not include yet. `minions telegram probe` and doctor check `telegram.plugin` report availability. See [design/telegram.md](design/telegram.md). |
 | System packages (in image) | git, tmux, ca-certificates, ripgrep, less, procps (Debian bookworm) | Installed at build time only. |
 
 `MINIONS_DOCKER_TESTS=1 npx vitest run test/docker` builds the image (tag `minions-test-runtime:latest`),
