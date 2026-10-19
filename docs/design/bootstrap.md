@@ -203,8 +203,13 @@ Decision record for running agents without Docker (`src/host/runtime.ts`, `src/h
   `minions-<id8>`.
 - **Shim.** `projects/<id>/host/bin/minions` (regenerated on every start; 0755 in 0700 dirs) exports
   those variables, `MINIONS_GIT_CREDENTIAL_HELPER` (`!'<shim>' git-credential`), `GIT_TERMINAL_PROMPT=0`,
-  the auth env, drops `GH_TOKEN`/`GITHUB_TOKEN`/`TMUX`/`TELEGRAM_BOT_TOKEN`, puts `host/bin` first on
-  `PATH`, and execs the installed CLI with the current Node. tmux, the plugin hooks
+  the auth env (first, so runtime values win; the schema rejects `MINIONS_*`, `PATH`, `GIT_*`, `DYLD_*`,
+  `SSH_*` names), tool cache variables pointing into `host/state/cache`, `MINIONS_LOG_DIR`
+  (`host/logs`), unsets token, ssh-agent, git-injection and cloud-credential variables, puts `host/bin`
+  first on `PATH`, and execs the installed CLI with the current Node. Processes the host CLI starts
+  (`HostRuntime.exec`, delegation, tmux) get `hostRuntimeEnv`: an allowlist (`PASS_ENV`: HOME, USER,
+  LOGNAME, LANG, LC_*, TERM*, TMPDIR, SHELL, COLORTERM, proxy and CA variables, CLAUDE_CONFIG_DIR) plus
+  those variables, with only absolute PATH entries. tmux, the plugin hooks
   (`minions hook …`), the coordinator's `Bash(minions …)` calls and git's credential helper all go
   through it. `host/bin/gh` is `docker/gh-wrapper.sh` with the host's real gh and token path.
 - **Delegation.** `status`, `pause`, `resume`, `work publish|approve`, `telegram probe|install|status`
@@ -213,25 +218,79 @@ Decision record for running agents without Docker (`src/host/runtime.ts`, `src/h
   token copies → shims → `workspace setup` → bundle import if the clone is missing → `coordinator sync`
   → `minions coordinator` (tmux `-L minions-<id8>` `new-session -A`). `down` = `tmux -L … kill-server`
   plus token-copy removal. `import`/`export` use the same bundle flow through
-  `host/state/{import,exports}` (`TransferTarget`). `uninstall` kills the tmux server; `--delete-data`
+  `host/transfer/{import,exports}` (`TransferTarget`; host-owned, not agent-writable; copies open the
+  source `O_NOFOLLOW` + fstat and create the target `O_EXCL`, and the dirs must be real 0700 dirs). `uninstall` kills the tmux server; `--delete-data`
   deletes `host/`.
 - **Claude auth.** `login` reuses the user's own Claude Code login (no `CLAUDE_CONFIG_DIR` override).
   Key methods use `apiKeyHelper: "cat '<secrets>/anthropic-api-key'"` (shell-quoted); env values are
   not loopback-rewritten.
-- **Hardening (coordinator `--settings`).** Verified against the Claude Code 2.1.292 binary and docs
-  (code.claude.com/docs/en/sandboxing, /settings, /permissions): `sandbox.enabled: true`,
-  `autoAllowBashIfSandboxed: false` (the allowlist still governs prompts), `allowUnsandboxedCommands: false`,
-  `failIfUnavailable: true`, `filesystem.allowWrite` = workspace, state, `~/.npm`, `~/.cache`,
-  `filesystem.denyRead` = `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.config/gh`, `~/.docker`, `~/.kube`,
-  `~/.azure`, `~/.config/gcloud`, `~/Library/Keychains`, `~/.netrc`, `~/.npmrc`, `~/.pypirc` and the
-  credential store; `network.allowedDomains` = GitHub and the npm registry. Permission denies add
-  `Read`/`Edit` of the same paths, the secrets dir and credential store (`//abs` form), `Edit` of the
-  project's host-control files, and `Bash(security …)`, `Bash(gh auth …)`. The secrets dir is not in
-  `denyRead` because the git credential helper and gh wrapper run inside sandboxed `minions work`
-  commands. Not exercised against a real Claude session in tests (fakes only); the coordinator prompt
-  gets a host-runtime note with the real paths.
-- **Not supported in host mode:** container resources/ports, automatic Telegram plugin install (it
-  would modify the user's Claude Code setup).
+- **Claude Code launch.** `claude --setting-sources= --strict-mcp-config --add-dir <workspace> <state>`
+  plus `--settings`. `--setting-sources` takes `user,project,local` (`claude --help`); the empty list is
+  what the Agent SDK passes for `settingSources: []` (verified in its source), and `--strict-mcp-config`
+  without `--mcp-config` is the SDK's form for "no MCP servers". Excluded: user/project/local hooks, MCP
+  servers, plugins, statusLine, permission rules, `sandbox.excludedCommands`, repo `CLAUDE.md`
+  auto-loading. Still applied: managed settings, user `sandbox.credentials` deny entries (documented),
+  the minions plugin and its hooks. Login credentials are not settings, so `login` keeps working.
+  `--permission-mode` is forced to `default` (the config value may come from the repository). The
+  doctor/coordinator probe also requires these flags in `claude --help`.
+- **Hardening (coordinator `--settings`).** Keys verified in the Claude Code 2.1.292 docs
+  (code.claude.com/docs/en/sandboxing, settings-reference, cli-reference): `sandbox.enabled`,
+  `autoAllowBashIfSandboxed: false`, `allowUnsandboxedCommands: false` (also makes the sandbox
+  admin-required, so repository sandbox loosening is ignored), `failIfUnavailable: true`;
+  `filesystem.allowWrite` = workspace, state (no home paths; caches redirected); `denyWrite` = the
+  clone's `.git/config` and `.git/hooks`, tmux's socket dir; `denyRead` = `HOST_SECRET_DIRS` (keys,
+  cloud CLIs, gh/hub, `.git-credentials`, `.claude.json`, `.claude/.credentials.json`, browser
+  profiles, cookies, Safari, Mail, Messages, shell histories, 1Password/Vault/Terraform/Cargo/Gem/
+  Maven/Gradle/OCI/Azure/gcloud), the whole minions data root, the credential store, the Claude key
+  and bot-token copies, tmux's dir; `allowRead` (narrower paths re-open part of a denied region,
+  documented overlap rule) = workspace, state, `host/bin`, `runtime/`, `plugin/`, `secrets/github-token`,
+  toolchain dirs under `~` (`readableToolDirs`: absolute PATH entries and real paths, install prefixes
+  of node/minions/claude/backlog/git/gh/tmux, known toolchain dirs; never `~` itself or a secret dir);
+  `network.allowedDomains` = GitHub + npm, `allowUnixSockets: []`, `allowAllUnixSockets: false`,
+  `allowLocalBinding: false`; `permissions.blockReadsOutsideWorkingDirectories: true` (Read tool
+  refuses reads outside the working dirs; sandboxed commands lose `~` except working dirs, needed
+  `~/.claude` parts and the global git config). Permission denies: `Read`/`Edit` of the secret dirs,
+  credential store, other projects (exact paths), the key/bot-token copies, data-root `*.json`,
+  `credentials.json`; `Edit` of shell rc files, `~/.gitconfig`, `~/.config/git`, `~/Library/LaunchAgents`,
+  `~/.claude`, the project's host-control files (`*.json`, `runtime/`, `plugin/`, `secrets/`, `host/bin`,
+  `host/logs`, `host/transfer`), the clone's `.git/config|config.worktree|hooks`, and `.claude/**` /
+  `.mcp.json` in the workspace (not all of `.git`: Edit denies become sandbox write denies and would
+  break commits); `Bash(security …)`, `Bash(gh auth …)`, `git -c`, `git config`, `--exec-path`,
+  `--git-dir`, `--work-tree`. Allow rules: `minions`, `backlog`, `HOST_GIT_SUBCOMMANDS` (no config,
+  remote, fetch or push), and verification commands that pass `safeVerificationCommand` (no globs,
+  operators, quotes, substitutions; not a shell, wrapper, interpreter `-e`, or credential/network CLI).
+  The Seatbelt profile in the 2.1.292 binary allows `mach-lookup` of `com.apple.SecurityServer`, so
+  Keychain access is not blocked by the sandbox (see "Keychain" below). Not exercised against a real
+  Claude session in tests (fakes only).
+- **Git run outside the sandbox** (`src/runtime/git-hardening.ts`, used by `git()` in host mode and by
+  `HostRuntime.exec('git', …)`): `-c core.hooksPath=/dev/null core.fsmonitor=false
+  core.sshCommand=/usr/bin/false core.askPass=/usr/bin/false core.pager=cat core.attributesFile=/dev/null
+  credential.helper=` (empties the list) + the minions helper for `https://github.com`, `gc.auto=0`,
+  `maintenance.auto=false`, no submodule recursion, `protocol.allow=never`, `https` always, `file`
+  always except for network ops (push, ls-remote, fetch from a URL), and ssh/git/http/ext/fd/ftp(s)/rsync
+  explicitly never (a repository `protocol.<x>.allow` would beat the generic key); env without
+  inherited `GIT_*`, with `GIT_CONFIG_NOSYSTEM`, `GIT_ATTR_NOSYSTEM`, askpass `/usr/bin/false`. Work-tree
+  commands also get `GIT_WORK_TREE=<cwd>` (a repository `core.worktree` is not overridden by `-c`,
+  tested) and empty `filter.<name>.{clean,smudge,process}` for every driver not defined only in the
+  global config (read right before the call; an unsafe name fails closed). Publication and origin fetch
+  name the normalized https URL instead of `origin`; gh runs with cwd `/` (it gets `--repo`).
+- **Keychain.** `selectStore` returns the file store while any project (or the host-wide default) uses
+  the host runtime, and `prepareHostRuntime` moves every registered project's minions Keychain items to
+  the file store (`moveKeychainTokensToFileStore`). Rejected alternative: `security add-generic-password
+  -T ''` (no trusted apps) prompts on every read by minions itself, and "Always Allow" re-adds
+  `/usr/bin/security`. Residual: Claude Code's own login item.
+- **Hooks log.** Hooks run unsandboxed, so `hookLog` opens `O_NOFOLLOW|O_APPEND`, requires a regular
+  file, escapes control characters and caps lines at 2000 characters; in host mode it writes to
+  `host/logs` (`MINIONS_LOG_DIR`), outside the agent-writable state.
+- **tmux.** Kept on `-L minions-<id8>` (tmux's private `/tmp/tmux-<uid>`, 0700, ownership-checked):
+  a `-S` socket under `<project>/host/` would exceed the 104-byte macOS socket path limit with the
+  default data root. Sandboxed commands get no Unix sockets and no access to that directory.
+- **Not supported in host mode:** container resources/ports, Telegram (`decideTelegram` disables it
+  with a reason, `telegram install` refuses: the plugin would live in the user's Claude Code settings,
+  which the host runtime doesn't load). `init --runtime host` needs the typed confirmation
+  interactively or `--yes`; a `defaults.json` runtime of host is never inherited non-interactively.
+- **`requireMode` is UX, not a boundary.** It reads `MINIONS_RUNTIME`, which an agent can unset inside
+  its sandboxed shell; host-control files are protected by the sandbox write policy and Edit denies.
 
 ## Telegram bot token
 

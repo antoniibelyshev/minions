@@ -23,7 +23,8 @@ export function runtimePaths(env: NodeJS.ProcessEnv = process.env) {
     import: join(state, 'import'),
     exports: join(state, 'exports'),
     logs: join(state, 'logs'),
-    hooksLog: join(state, 'logs', 'hooks.log'),
+    /** Host runtime: MINIONS_LOG_DIR (<project>/host/logs) keeps the unsandboxed hooks' log out of agent-writable dirs. */
+    hooksLog: join(env.MINIONS_LOG_DIR || join(state, 'logs'), 'hooks.log'),
     workspace,
     repo: join(workspace, 'repo'),
     worktrees: join(workspace, 'worktrees'),

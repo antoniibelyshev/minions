@@ -69,7 +69,7 @@ cat > "$WORK/bin/claude" <<SH
 #!/bin/sh
 case "\$1" in
   --version) echo "2.1.292 (Claude Code)"; exit 0 ;;
-  --help) echo "--plugin-dir --append-system-prompt --permission-mode --settings"; exit 0 ;;
+  --help) echo "--plugin-dir --append-system-prompt --permission-mode --settings --setting-sources --strict-mcp-config --add-dir"; exit 0 ;;
   auth) exit 0 ;;
 esac
 node -e 'require("fs").writeFileSync(process.argv[1], JSON.stringify({ argv: process.argv.slice(2), env: { MINIONS_RUNTIME: process.env.MINIONS_RUNTIME, PATH: process.env.PATH, GH_TOKEN: process.env.GH_TOKEN ?? null } }))' "$WORK/fake/claude.json" "\$@"
@@ -137,12 +137,20 @@ expect_eq "$(json 'd.sandbox.enabled' <<<"$settings")" true "coordinator setting
 expect_eq "$(json 'd.permissions.deny.includes("Read(~/.ssh/**)")' <<<"$settings")" true "settings deny ~/.ssh"
 expect_eq "$(json 'd.permissions.disableBypassPermissionsMode' <<<"$settings")" disable "bypass disabled"
 json 'd.data.claude.args' <<<"$argv" | grep -q bypassPermissions && fail "argv uses bypassPermissions"
+expect_eq "$(json 'd.data.claude.args.includes("--setting-sources=") && d.data.claude.args.includes("--strict-mcp-config")' <<<"$argv")" true "no user/project settings or MCP servers"
+expect_eq "$(json 'd.sandbox.filesystem.allowWrite.some(p=>p.startsWith("~"))' <<<"$settings")" false "no home paths writable"
+expect_eq "$(json 'd.sandbox.filesystem.denyRead.includes(process.env.MINIONS_HOME)' <<<"$settings")" true "data root unreadable to sandboxed commands"
+expect_eq "$(json 'd.sandbox.network.allowUnixSockets.length' <<<"$settings")" 0 "no Unix sockets"
+expect_eq "$(json 'd.permissions.allow.includes("Bash(git *)")' <<<"$settings")" false "no blanket git allow"
+set +e; "$SHIM" telegram install --json >/dev/null 2>&1; rc=$?; set -e
+expect_eq "$rc" 11 "telegram install refused in the host runtime"
 t1="$("$SHIM" backlog create --title "Add greeting" --ac "prints hello" --key k1 --status ready --json)"
 T="$(json 'd.data.task.id' <<<"$t1")"
 brief="$("$SHIM" work claim "$T" --role engineer --json)"
 LEASE="$(json 'd.data.leaseId' <<<"$brief")"; BRANCH="$(json 'd.data.branch' <<<"$brief")"; WT="$(json 'd.data.worktree' <<<"$brief")"
 case "$WT" in "$P/host/workspace/worktrees/"*) ok "worktree under the host workspace";; *) fail "worktree at $WT";; esac
 deny="$(printf '{"tool_name":"Agent","tool_input":{"subagent_type":"minions:engineer","prompt":"go"}}' | "$SHIM" hook pre-agent)"
+[ -s "$P/host/logs/hooks.log" ] && ok "hooks log outside the agent-writable state" || fail "hooks.log not in host/logs"
 expect_eq "$(json 'd.hookSpecificOutput.permissionDecision' <<<"$deny")" deny "pre-agent hook denies an unclaimed worker"
 H="$(cd "$WT" && echo 'console.log("hello")' > hello.js && git add hello.js && git -c commit.gpgsign=false commit -qm 'Add greeting' && git rev-parse HEAD)"
 result() { printf '{"status":"complete","summary":"done","branch":"%s","headSha":"%s","modifiedPaths":["hello.js"],"checks":[{"command":"npm test","outcome":"pass"}],"acceptanceEvidence":[{"criterion":"prints hello","evidence":"hello.js"}],"findings":[],"nextAction":"next"%s}' "$BRANCH" "$H" "${1:-}"; }

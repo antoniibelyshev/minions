@@ -12,13 +12,15 @@
 // - Claude Code's sandbox and credential deny rules are added to the coordinator settings
 //   (src/runtime/coordinator.ts `hostSettings`); bypassPermissions stays disabled.
 import { spawn } from 'node:child_process';
-import { chmod, copyFile, readFile, rm } from 'node:fs/promises';
-import { join } from 'node:path';
+import { chmod, readFile, rm } from 'node:fs/promises';
+import { isAbsolute, join } from 'node:path';
 import { MinionsError } from '../core/errors.js';
 import { run, type RunOptions, type RunResult } from '../core/exec.js';
-import { atomicWrite, ensureDir, exists } from '../core/fsutil.js';
+import { atomicWrite, copyRegularFileNoFollow, ensureDir, ensureRealDir, exists } from '../core/fsutil.js';
 import { hostRoot, hostRuntimePaths, projectPaths } from '../core/paths.js';
 import { shQuote } from '../runtime/coordinator.js';
+import { hardenedGitArgs, hardenedGitEnv } from '../runtime/git-hardening.js';
+import { moveKeychainTokensToFileStore, type MovedToken } from './credentials.js';
 import { KEY_HELPER_TTL_MS, authOf, isKeyAuth, resolveOnPath } from './auth.js';
 import { packageRoot, type Runner } from './docker.js';
 import type { ProjectJson } from './project.js';
@@ -41,8 +43,29 @@ export const HOST_CONFIRM_WORD = 'host';
 
 // ---------------------------------------------------------------- environment + shims
 
-/** Variables that must never leak from the user's shell into agent processes. */
-const DROP_ENV = ['TMUX', 'TMUX_PANE', 'GH_TOKEN', 'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN', 'TELEGRAM_BOT_TOKEN'];
+/**
+ * Variables of the user's shell that reach host-runtime processes (allowlist). Everything else (cloud
+ * and registry tokens, ANTHROPIC_API_KEY, SSH_AUTH_SOCK, GIT_SSH_COMMAND, NODE_OPTIONS, DYLD_*, ...)
+ * is dropped. Proxy and CA variables stay so Claude Code and git work behind a corporate proxy;
+ * CLAUDE_CONFIG_DIR stays so the `login` method finds the user's own Claude Code login.
+ */
+export const PASS_ENV = new Set([
+  'HOME', 'USER', 'LOGNAME', 'LANG', 'TERM', 'TERMINFO', 'TMPDIR', 'SHELL', 'COLORTERM', 'TERM_PROGRAM', 'TERM_PROGRAM_VERSION',
+  '__CF_USER_TEXT_ENCODING', 'HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'no_proxy', 'all_proxy',
+  'NODE_EXTRA_CA_CERTS', 'SSL_CERT_FILE', 'SSL_CERT_DIR', 'CLAUDE_CONFIG_DIR',
+]);
+const passEnv = (k: string) => PASS_ENV.has(k) || k.startsWith('LC_');
+
+/**
+ * Unset by the shim, which also runs from environments minions did not build (a user's shell). The
+ * shim keeps the rest so the Claude Code sandbox's own variables (proxy, TMPDIR) survive.
+ */
+const DROP_ENV = ['TMUX', 'TMUX_PANE', 'TMUX_TMPDIR', 'GH_TOKEN', 'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN', 'GH_HOST', 'TELEGRAM_BOT_TOKEN',
+  'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN', 'NPM_TOKEN', 'NODE_AUTH_TOKEN', 'SSH_AUTH_SOCK', 'NODE_OPTIONS',
+  'GIT_SSH', 'GIT_SSH_COMMAND', 'GIT_ASKPASS', 'SSH_ASKPASS', 'GIT_DIR', 'GIT_WORK_TREE', 'GIT_CONFIG', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM',
+  'GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_COUNT', 'GIT_EXEC_PATH', 'GIT_TEMPLATE_DIR', 'LD_PRELOAD', 'DYLD_INSERT_LIBRARIES', 'DYLD_LIBRARY_PATH'];
+/** Prefixes the shim also unsets (cloud credentials, injected git config). */
+const DROP_PREFIXES = ['AWS_', 'AZURE_', 'GOOGLE_', 'GCLOUD_', 'CLOUDSDK_', 'GIT_CONFIG_KEY_', 'GIT_CONFIG_VALUE_', 'DYLD_'];
 
 export interface ShimTarget { node: string; cli: string }
 export const defaultShimTarget = (): ShimTarget => ({ node: process.execPath, cli: join(packageRoot(), 'dist', 'cli.js') });
@@ -58,12 +81,15 @@ export function hostRuntimeVars(project: ProjectJson): Record<string, string> {
   const hp = hostRuntimePaths(project.projectId);
   const auth = authOf(project);
   return {
+    // claudeAuth.env first: the schema rejects MINIONS_*/PATH/GIT_* names, and the runtime values below win anyway.
+    ...(auth.env ?? {}),
     MINIONS_RUNTIME: 'host',
     MINIONS_HOME: hostRoot(),
     MINIONS_PROJECT_ID: project.projectId,
     MINIONS_PROJECT_DIR: pp.dir,
     MINIONS_WORKSPACE: hp.workspace,
     MINIONS_STATE_DIR: hp.state,
+    MINIONS_LOG_DIR: hp.logs,
     MINIONS_CONFIG: pp.runtimeConfigJson,
     MINIONS_SECRETS_DIR: pp.secretsDir,
     MINIONS_PLUGIN_DIR: pp.pluginDir,
@@ -72,25 +98,46 @@ export function hostRuntimeVars(project: ProjectJson): Record<string, string> {
     MINIONS_GIT_CREDENTIAL_HELPER: `!${shQuote(hp.minionsShim)} git-credential`,
     GIT_TERMINAL_PROMPT: '0',
     GH_PROMPT_DISABLED: '1',
+    // Tool caches live in the agent state, so sandboxed commands never write ~/.npm or ~/.cache (cache poisoning).
+    ...cacheVars(hp.cache),
     ...(isKeyAuth(auth) ? { CLAUDE_CODE_API_KEY_HELPER_TTL_MS: String(KEY_HELPER_TTL_MS) } : {}),
-    ...(auth.env ?? {}),
   };
 }
 
-/** Full environment of host-runtime processes: the user's environment minus tokens/tmux, plus the runtime variables. */
+/** Cache locations of common toolchains, all under <state>/cache. */
+export const cacheVars = (cache: string): Record<string, string> => ({
+  XDG_CACHE_HOME: cache,
+  npm_config_cache: join(cache, 'npm'),
+  COREPACK_HOME: join(cache, 'corepack'),
+  YARN_CACHE_FOLDER: join(cache, 'yarn'),
+  PIP_CACHE_DIR: join(cache, 'pip'),
+  UV_CACHE_DIR: join(cache, 'uv'),
+  GOCACHE: join(cache, 'go-build'),
+  GOMODCACHE: join(cache, 'go-mod'),
+  BUN_INSTALL_CACHE_DIR: join(cache, 'bun'),
+});
+
+/**
+ * Full environment of host-runtime processes: an allowlist of the user's environment (PASS_ENV, LC_*),
+ * the runtime variables, and PATH with the shim dir first and only absolute entries (a relative entry
+ * would resolve inside the agent-writable workspace).
+ */
 export function hostRuntimeEnv(project: ProjectJson, base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
-  for (const [k, v] of Object.entries(base)) if (!DROP_ENV.includes(k) && !k.startsWith('MINIONS_')) env[k] = v;
+  for (const [k, v] of Object.entries(base)) if (passEnv(k) && v !== undefined) env[k] = v;
+  if (env.CLAUDE_CONFIG_DIR && !isAbsolute(env.CLAUDE_CONFIG_DIR)) delete env.CLAUDE_CONFIG_DIR;
   Object.assign(env, hostRuntimeVars(project));
   const bin = hostRuntimePaths(project.projectId).bin;
-  env.PATH = [bin, ...(base.PATH ?? '').split(':').filter((d) => d && d !== bin)].join(':');
+  env.PATH = [bin, ...(base.PATH ?? '').split(':').filter((d) => d && d !== bin && isAbsolute(d))].join(':');
   return env;
 }
 
 export function minionsShim(project: ProjectJson, target: ShimTarget): string {
   const bin = hostRuntimePaths(project.projectId).bin;
   const L = ['#!/bin/sh', `# Generated by minions: host runtime of project ${project.projectId}. Regenerated on every \`minions start\`; do not edit.`];
-  for (const k of DROP_ENV) L.push(`unset ${k}`);
+  L.push(`unset ${DROP_ENV.join(' ')}`);
+  const prefixes = DROP_PREFIXES.map((p) => p.replace(/_$/, '')).join('|');
+  L.push(`for v in $(env | sed -n -E 's/^((${prefixes})_[A-Za-z0-9_]*)=.*/\\1/p'); do unset "$v"; done`);
   for (const [k, v] of Object.entries(hostRuntimeVars(project))) L.push(`${k}=${shQuote(v)}; export ${k}`);
   L.push(`case ":$PATH:" in *:${shQuote(bin)}:*) ;; *) PATH=${shQuote(bin)}:"$PATH"; export PATH ;; esac`);
   L.push(`exec ${shQuote(target.node)} ${shQuote(target.cli)} "$@"`);
@@ -111,18 +158,21 @@ export async function ghShim(realGh: string, tokenFile: string, root: string = p
 
 /**
  * Writes the shims (0755 in a 0700 dir) and creates the 0700 host runtime dirs. The gh shim exists
- * only when gh is installed on the host (needed for pull-request delivery).
+ * only when gh is installed on the host (needed for pull-request delivery). Tokens still in the macOS
+ * Keychain are moved to the 0600 file store first (see moveKeychainTokensToFileStore: sandboxed agent
+ * commands can run /usr/bin/security, which every minions Keychain item trusts).
  */
-export async function prepareHostRuntime(project: ProjectJson, opts: { target?: ShimTarget; pathEnv?: string } = {}): Promise<{ gh: string | null }> {
+export async function prepareHostRuntime(project: ProjectJson, opts: { target?: ShimTarget; pathEnv?: string; runner?: Runner } = {}): Promise<{ gh: string | null; movedToFileStore: MovedToken[]; keychainWarnings: string[] }> {
   const hp = hostRuntimePaths(project.projectId);
-  for (const d of [hp.root, hp.bin, hp.workspace, hp.state]) { await ensureDir(d, 0o700); await chmod(d, 0o700); }
+  for (const d of [hp.root, hp.bin, hp.workspace, hp.state, hp.cache, hp.logs, hp.transfer, hp.import, hp.exports]) { await ensureRealDir(d, 0o700); await chmod(d, 0o700); }
   await ensureDir(projectPaths(project.projectId).secretsDir, 0o700);
+  const moved = await moveKeychainTokensToFileStore(opts.runner ?? run);
   await atomicWrite(hp.minionsShim, minionsShim(project, opts.target ?? defaultShimTarget()), { mode: 0o755 });
-  const pathEnv = (opts.pathEnv ?? process.env.PATH ?? '').split(':').filter((d) => d && d !== hp.bin).join(':');
+  const pathEnv = (opts.pathEnv ?? process.env.PATH ?? '').split(':').filter((d) => d && d !== hp.bin && isAbsolute(d)).join(':');
   const gh = await resolveOnPath('gh', pathEnv);
   if (gh) await atomicWrite(hp.ghShim, await ghShim(gh, projectPaths(project.projectId).githubTokenFile), { mode: 0o755 });
   else await rm(hp.ghShim, { force: true });
-  return { gh };
+  return { gh, movedToFileStore: moved.moved, keychainWarnings: moved.warnings };
 }
 
 // ---------------------------------------------------------------- lifecycle
@@ -136,9 +186,17 @@ export class HostRuntime {
   /** Human hint for attaching to the coordinator's dedicated tmux server. */
   get attachCommand() { return `tmux -L ${this.paths.tmuxSocket} attach -t coordinator`; }
 
-  /** Runs `minions …` through the shim (or another command with the runtime environment); output captured. */
+  /**
+   * Runs `minions …` through the shim (or another command with the runtime environment); output
+   * captured. These processes run OUTSIDE the Claude Code sandbox with a fresh allowlisted environment;
+   * `git` gets the host-runtime hardening (src/runtime/git-hardening.ts), because the workspace is agent-writable.
+   */
   exec(args: string[], opts: RunOptions = {}): Promise<RunResult> {
     const [cmd, ...rest] = args;
+    if (cmd === 'git') {
+      const env = this.env();
+      return this.runner('git', [...hardenedGitArgs({ credentialHelper: env.MINIONS_GIT_CREDENTIAL_HELPER }), ...rest], { cwd: this.paths.workspace, timeoutMs: 300_000, ...opts, env: hardenedGitEnv(env) });
+    }
     const bin = cmd === 'minions' ? this.paths.minionsShim : cmd!;
     return this.runner(bin, rest, { cwd: this.paths.workspace, timeoutMs: 300_000, ...opts, env: this.env() });
   }
@@ -157,27 +215,32 @@ export class HostRuntime {
 
   /** True when the coordinator's tmux session exists on the dedicated server. */
   async isRunning(): Promise<boolean> {
-    const r = await this.runner('tmux', ['-L', this.paths.tmuxSocket, 'has-session', '-t', 'coordinator'], { allowFailure: true, timeoutMs: 10_000 });
+    const r = await this.runner('tmux', ['-L', this.paths.tmuxSocket, 'has-session', '-t', 'coordinator'], { allowFailure: true, timeoutMs: 10_000, env: this.env() });
     return r.code === 0;
   }
 
   /** Stops the coordinator: kills the dedicated tmux server (only minions sessions live there). */
   async down(): Promise<boolean> {
     const was = await this.isRunning();
-    await this.runner('tmux', ['-L', this.paths.tmuxSocket, 'kill-server'], { allowFailure: true, timeoutMs: 10_000 });
+    await this.runner('tmux', ['-L', this.paths.tmuxSocket, 'kill-server'], { allowFailure: true, timeoutMs: 10_000, env: this.env() });
     return was;
   }
 
   async prepared(): Promise<boolean> { return exists(this.paths.minionsShim); }
 
-  /** Transfer target: bundles go through <project>/host/state/{import,exports}. */
+  /**
+   * Transfer target: bundles go through <project>/host/transfer/{import,exports}, which only the host
+   * CLI writes (the sandbox may write the workspace and state only). Copies never follow symlinks: the
+   * dirs must be real 0700 dirs, sources are opened O_NOFOLLOW and fstat-checked, targets created O_EXCL.
+   */
   transferTarget() {
     const hp = this.paths;
+    const dirs = async (d: string) => { await ensureRealDir(hp.root); await ensureRealDir(hp.transfer); await ensureRealDir(d); };
     return {
       dirs: { import: hp.import, exports: hp.exports },
-      exec: (args: string[], opts?: RunOptions) => this.exec(args, opts),
-      putFile: async (local: string, remote: string) => { await ensureDir(hp.import, 0o700); await copyFile(local, remote); },
-      getFile: async (remote: string, local: string) => { await copyFile(remote, local); },
+      exec: async (args: string[], opts?: RunOptions) => { await dirs(hp.exports); return this.exec(args, opts); },
+      putFile: async (local: string, remote: string) => { await dirs(hp.import); await rm(remote, { force: true }); await copyRegularFileNoFollow(local, remote); },
+      getFile: async (remote: string, local: string) => { await copyRegularFileNoFollow(remote, local); },
     };
   }
 }

@@ -85,9 +85,9 @@ describe('sensitive path detection and publication argv safety (fake git/gh)', (
       if (args[0] === 'push') return { code: 0, stdout: '', stderr: '' };
       return realGit(cwd, args, allow);
     };
-    const ghCalls: { args: string[]; input?: string }[] = [];
+    const ghCalls: { args: string[]; input?: string; cwd?: string }[] = [];
     const gh: GhFn = async (args, opts) => {
-      ghCalls.push({ args, input: opts?.input });
+      ghCalls.push({ args, input: opts?.input, cwd: opts?.cwd });
       if (args[1] === 'list') return { code: 0, stdout: '[]', stderr: '' };
       return { code: 0, stdout: 'https://github.com/acme/demo/pull/9\n', stderr: '' };
     };
@@ -149,6 +149,21 @@ describe('sensitive path detection and publication argv safety (fake git/gh)', (
     expect(create.args).toContain('--body-file');
     expect(create.input).toMatch(/^d\n/);
     expect(t.ghCalls.some((c) => c.args.includes('merge'))).toBe(false);
+  });
+
+  it('host runtime: ls-remote/push name the normalized https URL (never the agent-writable origin remote); gh runs outside the workspace', async () => {
+    const prev = process.env.MINIONS_RUNTIME;
+    process.env.MINIONS_RUNTIME = 'host';
+    try {
+      const t = setup(['a.ts']);
+      expect((await t.run(false)).state).toBe('published');
+      for (const op of ['ls-remote', 'push']) {
+        const c = t.calls.find((a) => a[0] === op)!;
+        expect(c).toContain('https://github.com/acme/demo.git');
+        expect(c).not.toContain('origin');
+      }
+      expect(t.ghCalls.every((g) => g.cwd === '/')).toBe(true);
+    } finally { if (prev === undefined) delete process.env.MINIONS_RUNTIME; else process.env.MINIONS_RUNTIME = prev; }
   });
 
   it('hostile task id/title produce a safe branch slug', () => {

@@ -61,13 +61,27 @@ export function hostRuntimePaths(projectId: string) {
     workspace: join(root, 'workspace'),
     repo: join(root, 'workspace', 'repo'),
     state: join(root, 'state'),
-    import: join(root, 'state', 'import'),
-    exports: join(root, 'state', 'exports'),
+    /** Tool caches (npm, XDG, corepack, pip, ...) of the agents: inside the state dir, never ~/.npm or ~/.cache. */
+    cache: join(root, 'state', 'cache'),
+    /**
+     * Bundle transfer dirs owned by the host CLI (not agent-writable: the sandbox may write only the
+     * workspace and state): bundles are never copied through a path an agent could swap for a symlink.
+     */
+    transfer: join(root, 'transfer'),
+    import: join(root, 'transfer', 'import'),
+    exports: join(root, 'transfer', 'exports'),
+    /** Logs written by unsandboxed hook processes (MINIONS_LOG_DIR); outside the agent-writable dirs. */
+    logs: join(root, 'logs'),
     /** PATH shims: `minions` (pins the runtime environment) and the `gh` token wrapper. */
     bin: join(root, 'bin'),
     minionsShim: join(root, 'bin', 'minions'),
     ghShim: join(root, 'bin', 'gh'),
-    /** Dedicated tmux server socket name (`tmux -L`), so the user's own tmux server is never touched. */
+    /**
+     * Dedicated tmux server socket name (`tmux -L`), so the user's own tmux server is never touched.
+     * tmux keeps it in its private per-user directory (/tmp/tmux-<uid>, 0700, ownership-checked);
+     * sandboxed commands get no Unix sockets and no access to that directory (see hostSettings). A
+     * `-S <project>/host/...` socket is not used: that path exceeds the 104-byte macOS socket path limit.
+     */
     tmuxSocket: `minions-${shortId(projectId)}`,
   };
 }

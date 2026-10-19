@@ -11,6 +11,7 @@ import { readFile, stat } from 'node:fs/promises';
 import { redact } from '../core/output.js';
 import type { RunResult } from '../core/exec.js';
 import { runtimePaths } from './paths.js';
+import { isHostRuntime } from './git-hardening.js';
 import { git as realGit } from './worktree.js';
 
 export type GitFn = (cwd: string, args: string[], allowFailure?: boolean) => Promise<RunResult>;
@@ -149,7 +150,8 @@ export async function configureOrigin(repo: string, opts: { remoteUrl?: string; 
   await git(repo, ['config', '--add', GITHUB_CREDENTIAL_KEY, '']);
   await git(repo, ['config', '--add', GITHUB_CREDENTIAL_KEY, opts.helper ?? gitCredentialHelper()]);
   const warnings: string[] = [];
-  const f = await git(repo, ['fetch', '--no-tags', 'origin', `+refs/heads/${opts.base}:refs/remotes/origin/${opts.base}`], true);
+  // The host runtime fetches from the normalized URL (never through agent-writable remote settings).
+  const f = await git(repo, ['fetch', '--no-tags', isHostRuntime() ? https : 'origin', `+refs/heads/${opts.base}:refs/remotes/origin/${opts.base}`], true);
   if (f.code !== 0) warnings.push(`Fetching ${opts.base} from origin failed: ${redact(f.stderr.trim()).slice(-500) || `git exit ${f.code}`}`);
   return { url: https, authenticated: true, fetched: f.code === 0, warnings };
 }

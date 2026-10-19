@@ -138,6 +138,8 @@ describe('interactive guided flow', () => {
     const s = await S.runGithubSetup({ projectId: init.plan.projectId, repoPath: repo, io: a.io, runner: g.runner, openUrl: async (u) => { opened.push(u); }, skipIntro: true });
     expect(g.calls.filter((c) => c.includes('push'))).toEqual([['git', '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null', '--no-pager', 'push', '-u', 'origin', 'refs/heads/main:refs/heads/main']]);
     expect(s.base.pushed).toBe(true);
+    expect(a.info.join('\n')).toContain(`Push URL: ${REMOTE}`); // the real push destination is shown before the question
+    expect(a.info.findIndex((l) => l.includes('Push URL:'))).toBeGreaterThan(-1);
     expect(opened).toEqual([S.githubTokenUrl(REMOTE)]);
     expect(s.token.status).toBe('skipped');
     expect(a.asked.some((q) => q.startsWith('secret:'))).toBe(false);

@@ -118,12 +118,30 @@ describe('runtime selection is host-controlled', () => {
       .rejects.toMatchObject({ code: 'DOCKER_UNAVAILABLE' });
   });
 
-  it('a global default of host applies to new projects and still warns', async () => {
+  it('a global default of host is never inherited by a non-interactive init; the wizard asks with the typed word', async () => {
     await saveDefaults({ runtime: 'host' });
     const repo = makeRepo(env.root);
-    const r = await runInit({ path: repo, yes: true, visibility: 'private', dockerProbe: dockerDown });
-    expect(r.plan.runtime).toBe('host');
-    expect(r.plan.warnings.join('\n')).toMatch(/Use Docker for untrusted repositories/);
+    const r = await runInit({ path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
+    expect(r.plan.runtime).toBe('docker');
+    expect(r.plan.notes.join(' ')).toMatch(/never inherits it/);
+    await runUninstall({ cwd: repo, yes: true, runner: async () => no });
+    const asked: string[] = [];
+    const io = { info: () => undefined, ask: async (q: string, def: string) => { asked.push(`${q}=${def}`); return q.startsWith('Type "host"') ? 'host' : q.startsWith('Apply this plan') ? 'y' : def; } };
+    const r2 = await runInit({ path: repo, io, dockerProbe: dockerDown, visibility: 'private' });
+    expect(r2.plan.runtime).toBe('host');
+    expect(asked.some((a) => a.startsWith('Agent runtime (docker/host)=host'))).toBe(true);
+    expect(r2.plan.warnings.join('\n')).toMatch(/Use Docker for untrusted repositories/);
+  });
+
+  it('--runtime host: non-interactive needs --yes; interactive needs the typed word', async () => {
+    const repo = makeRepo(env.root);
+    await expect(runInit({ path: repo, visibility: 'private', runtime: 'host', dockerProbe: dockerDown })).rejects.toMatchObject({ code: 'PRECONDITION', message: expect.stringMatching(/needs confirmation/) });
+    const io = (typed: string) => ({ info: () => undefined, ask: async (q: string, def: string) => (q.startsWith('Type "host"') ? typed : q.startsWith('Apply this plan') ? 'y' : def) });
+    const r1 = await runInit({ path: repo, io: io('no'), visibility: 'private', runtime: 'host', dockerProbe: dockerUp });
+    expect(r1.plan.runtime).toBe('docker');
+    await runUninstall({ cwd: repo, yes: true, runner: async () => no });
+    const r2 = await runInit({ path: repo, io: io('host'), visibility: 'private', runtime: 'host', dockerProbe: dockerDown });
+    expect(r2.plan.runtime).toBe('host');
   });
 
   it('wizard: host needs the typed word, anything else keeps docker', async () => {
@@ -176,10 +194,14 @@ describe('host runtime coordinator settings', () => {
       permissions: { deny: string[]; disableBypassPermissionsMode: string }; sandbox: Record<string, unknown>; apiKeyHelper: string };
     expect(s.permissions.disableBypassPermissionsMode).toBe('disable');
     expect(s.sandbox).toMatchObject({ enabled: true, autoAllowBashIfSandboxed: false, allowUnsandboxedCommands: false, failIfUnavailable: true });
-    expect((s.sandbox.filesystem as { allowWrite: string[] }).allowWrite).toEqual(expect.arrayContaining([h.workspace, h.state]));
+    expect((s.sandbox.filesystem as { allowWrite: string[] }).allowWrite).toEqual([h.workspace, h.state]);
     expect((s.sandbox.filesystem as { denyRead: string[] }).denyRead).toEqual(expect.arrayContaining(['~/.ssh', '~/.aws', '~/Library/Keychains', h.credentialsDir]));
     expect((s.sandbox.network as { allowedDomains: string[] }).allowedDomains).toContain('github.com');
-    expect(s.permissions.deny).toEqual(expect.arrayContaining(['Read(~/.ssh/**)', 'Read(~/.aws/**)', 'Bash(security *)', 'Read(//m/credentials/**)', 'Read(//m/My Proj/secrets/**)', 'Edit(//m/proj/*.json)']));
+    expect(s.permissions.deny).toEqual(expect.arrayContaining(['Read(~/.ssh/**)', 'Read(~/.aws/**)', 'Bash(security *)', 'Read(//m/credentials/**)',
+      'Read(//m/My Proj/secrets/anthropic-api-key)', 'Read(//m/My Proj/secrets/telegram-bot-token)', 'Edit(//m/proj/*.json)']));
+    // no data root derivable from /m/proj: never deny `/` or the home directory
+    expect(s.permissions.deny.some((d) => d.startsWith('Read(///'))).toBe(false);
+    expect((s.sandbox.filesystem as { denyRead: string[] }).denyRead).not.toContain('/');
     expect(s.apiKeyHelper).toBe("cat '/m/My Proj/secrets/anthropic-api-key'");
     const c = coordinatorSettings(defaults(), { auth: 'api-key', host: null });
     expect(c).not.toHaveProperty('sandbox');

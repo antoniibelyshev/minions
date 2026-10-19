@@ -160,6 +160,11 @@ async function askRuntime(io: WizardIO, def: RuntimeKind, docker: DockerStatus |
     io.info('  choose one of: docker, host');
   }
   if (pick !== 'host') return pick;
+  return confirmHostRuntime(io, notes);
+}
+
+/** Shows the warning and asks for the typed confirmation word; anything else keeps Docker. */
+async function confirmHostRuntime(io: WizardIO, notes: string[]): Promise<RuntimeKind> {
   for (const l of HOST_RUNTIME_WARNING) io.info(l);
   const typed = (await io.ask(`Type "${HOST_CONFIRM_WORD}" to run agents without Docker (anything else keeps Docker)`, '')).trim();
   if (typed === HOST_CONFIRM_WORD) return 'host';
@@ -252,8 +257,20 @@ async function prepare(opts: InitOptions, docker?: DockerStatus): Promise<Prepar
   // <MINIONS_HOME>/defaults.json, else login / docker.
   const defaults = await loadDefaults();
   const interactive = !!opts.io && !opts.yes && !opts.configFile;
-  let runtime: RuntimeKind = opts.runtime ?? prevProject?.runtime ?? defaults.runtime ?? 'docker';
+  // The host runtime is never inherited silently: a non-interactive init uses it only for an existing
+  // host project or an explicit `--runtime host --yes`; a host-wide default of host applies interactively
+  // (the wizard asks, with the typed confirmation).
+  const inheritedHost = !opts.runtime && !prevProject?.runtime && defaults.runtime === 'host';
+  let runtime: RuntimeKind = opts.runtime ?? prevProject?.runtime ?? (inheritedHost && !interactive ? 'docker' : defaults.runtime) ?? 'docker';
+  if (inheritedHost && !interactive) notes.push('defaults.json selects the host runtime, but a non-interactive init never inherits it; using Docker. Pass `--runtime host --yes` to choose it explicitly.');
   if (!opts.runtime && interactive) runtime = await askRuntime(opts.io!, runtime, docker, notes);
+  else if (opts.runtime === 'host' && prevProject?.runtime !== 'host') {
+    if (interactive) runtime = await confirmHostRuntime(opts.io!, notes);
+    else if (!opts.yes && !opts.dryRun) {
+      throw new MinionsError('PRECONDITION', '--runtime host needs confirmation: agents would run as your macOS user without Docker.',
+        'Rerun interactively and type the confirmation word, or pass `--runtime host --yes`.');
+    }
+  }
   if (runtime === 'docker' && docker && !opts.dryRun && (!docker.daemon || !docker.compose)) throw dockerUnavailable(docker);
   if (runtime === 'host') warnings.push(`${HOST_RUNTIME_SHORT}`);
   let claudeAuth: ClaudeAuth | undefined = prevProject?.claudeAuth ?? defaults.claudeAuth;

@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import { MinionsError } from '../core/errors.js';
 import { run } from '../core/exec.js';
 import { ensureDir, exists } from '../core/fsutil.js';
+import { hardenedGit, isHostRuntime } from './git-hardening.js';
 import { runtimePaths } from './paths.js';
 
 export interface WorkspaceLayout { root: string; repo: string; worktrees: string; review: string }
@@ -26,8 +27,11 @@ export function taskSlug(id: string, title: string): string {
 }
 export const branchFor = (slug: string) => `${BRANCH_PREFIX}${slug}`;
 
+/** git in the workspace. The host runtime adds the hardening of ./git-hardening.ts (the container is unchanged). */
 export const git = (cwd: string, args: string[], allowFailure = false) =>
-  run('git', args, { cwd, allowFailure, timeoutMs: 120_000, env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } });
+  isHostRuntime()
+    ? hardenedGit(cwd, args, allowFailure)
+    : run('git', args, { cwd, allowFailure, timeoutMs: 120_000, env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } });
 
 async function revParse(repo: string, ref: string): Promise<string | null> {
   const r = await git(repo, ['rev-parse', '--verify', '--quiet', `${ref}^{commit}`], true);

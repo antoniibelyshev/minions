@@ -259,6 +259,9 @@ export async function runGithubSetup(opts: GithubSetupOptions): Promise<GithubSe
     result.base.command = command;
     io.info(`origin has no known ${state.baseBranch} branch. Pull requests target it, so it must exist on GitHub.`);
     io.info(`  Command: ${command}   (uses your own git credentials; nothing else is pushed)`);
+    // Show where the push really goes (pushurl / insteadOf can differ from the fetch URL).
+    const pushUrl = await runner('git', [...HOST_GIT, 'remote', 'get-url', '--push', 'origin'], { cwd: opts.repoPath, allowFailure: true, timeoutMs: 15_000 });
+    if (pushUrl.code === 0 && pushUrl.stdout.trim()) io.info(`  Push URL: ${sanitizeRemoteUrl(pushUrl.stdout.trim().split('\n')[0]!)}`);
     if (yes(await io.ask(`Push ${state.baseBranch} to origin now? (y/n)`, 'n'))) {
       const r = await runner('git', [...HOST_GIT, 'push', '-u', 'origin', `refs/heads/${state.baseBranch}:refs/heads/${state.baseBranch}`], { cwd: opts.repoPath, allowFailure: true, timeoutMs: 300_000 });
       result.base.pushed = r.code === 0;

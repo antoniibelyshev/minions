@@ -237,6 +237,10 @@ export function register(program: Command): void {
   tg.command('install').description('Install the official Telegram channel plugin at user scope in the claude volume (needs network, no login)')
     .action(action(async (_o: unknown, cmd: Command) => {
       if (runtimeMode() === 'host') return delegate(cmd);
+      if (runtimeMode() === 'host-runtime') {
+        throw new MinionsError('PRECONDITION', 'The Telegram channel is not available in the host runtime: it would install a plugin into your own Claude Code setup, and the host runtime starts Claude Code without user settings, plugins or MCP servers.',
+          'Use the Docker runtime for Telegram (`minions runtime set docker`), or keep the terminal channel.');
+      }
       const r = await installTelegramPlugin();
       emit(r, { json: globalOpts(cmd).json, human: (d: typeof r) => [`marketplace ${d.marketplace}; plugin ${d.plugin} (version ${d.version ?? 'unknown'})`, ...d.warnings.map((w) => `warning: ${w}`)].join('\n') });
     }));

@@ -1,12 +1,58 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { createReadStream } from 'node:fs';
-import { access, chmod, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { constants, createReadStream } from 'node:fs';
+import { access, chmod, lstat, mkdir, open, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { basename, dirname, join } from 'node:path';
 import type { z } from 'zod';
 import { MinionsError, invalidConfig, zodIssues } from './errors.js';
 
 export async function ensureDir(dir: string, mode?: number): Promise<void> {
   await mkdir(dir, { recursive: true, mode });
+}
+
+/**
+ * Ensures `dir` is a real directory (not a symlink) owned by this user, creating it 0700. A symlink or
+ * non-directory at that path is refused (PRECONDITION), never followed.
+ */
+export async function ensureRealDir(dir: string, mode = 0o700): Promise<void> {
+  await mkdir(dir, { recursive: true, mode });
+  const st = await lstat(dir);
+  const uid = typeof process.getuid === 'function' ? process.getuid() : st.uid;
+  if (!st.isDirectory() || st.isSymbolicLink() || st.uid !== uid) {
+    throw new MinionsError('PRECONDITION', `${dir} is not a directory owned by you (symlink or foreign file); refusing to use it.`, 'Remove it and rerun.');
+  }
+}
+
+/**
+ * Copies a regular file without following symlinks at either end: the source is opened with
+ * O_NOFOLLOW and checked with fstat on the open descriptor (no lstat/copy race), the destination is
+ * created exclusively (O_EXCL | O_NOFOLLOW, 0600 by default). PRECONDITION for anything but a regular file.
+ */
+export async function copyRegularFileNoFollow(src: string, dst: string, mode = 0o600): Promise<void> {
+  const notRegular = () => new MinionsError('PRECONDITION', `${src} is not a regular file; refusing to copy it.`);
+  let input;
+  try { input = await open(src, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK); } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === 'ELOOP') throw notRegular();
+    throw e;
+  }
+  try {
+    if (!(await input.stat()).isFile()) throw notRegular();
+    const output = await open(dst, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, mode);
+    try {
+      const buf = Buffer.allocUnsafe(1 << 20);
+      for (;;) {
+        const { bytesRead } = await input.read(buf, 0, buf.length, null);
+        if (!bytesRead) break;
+        let off = 0;
+        while (off < bytesRead) off += (await output.write(buf, off, bytesRead - off)).bytesWritten;
+      }
+      await output.sync();
+    } catch (e) {
+      await output.close().catch(() => undefined);
+      await rm(dst, { force: true });
+      throw e;
+    }
+    await output.close();
+  } finally { await input.close(); }
 }
 
 /** Writes via a temp file in the same directory, then renames over the target. */

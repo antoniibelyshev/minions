@@ -17,7 +17,7 @@ import { MinionsError } from '../core/errors.js';
 import { run } from '../core/exec.js';
 import { atomicWrite, ensureDir, readJsonIfExists, writeJson } from '../core/fsutil.js';
 import { redact } from '../core/output.js';
-import { credentialStoreDir, credentialStoreFile, projectPaths } from '../core/paths.js';
+import { credentialStoreDir, credentialStoreFile, defaultsPath, projectPaths } from '../core/paths.js';
 import { BOTFATHER_URL, checkTelegramTokenFormat } from '../telegram/token.js';
 import { loadRegistry } from './registry.js';
 
@@ -222,14 +222,35 @@ const assertProjectId = (id: string) => {
   if (!z.uuid().safeParse(id).success) throw new MinionsError('INTERNAL', 'invalid project id');
 };
 
-export interface StoreOptions { runner?: Runner; platform?: NodeJS.Platform; env?: NodeJS.ProcessEnv; kind?: CredentialKind }
+export interface StoreOptions { runner?: Runner; platform?: NodeJS.Platform; env?: NodeJS.ProcessEnv; kind?: CredentialKind; hostRuntime?: boolean }
 
-/** Keychain on macOS when `security` works; else the file store. MINIONS_CREDENTIAL_STORE=file|keychain overrides. */
+/**
+ * True when any registered project (or the host-wide default) uses the host runtime. Its agents run
+ * sandboxed commands as the user, and the Seatbelt sandbox lets them reach the Keychain service
+ * (com.apple.SecurityServer): /usr/bin/security can then read every minions Keychain item, because
+ * items created through `security` trust that binary. The file store sits under a sandbox read deny.
+ */
+export async function hostRuntimeInUse(): Promise<boolean> {
+  const defaults = await readJsonIfExists<{ runtime?: string }>(defaultsPath()).catch(() => undefined);
+  if (defaults?.runtime === 'host') return true;
+  const reg = await loadRegistry().catch(() => ({ version: 1 as const, projects: {} }));
+  for (const id of Object.keys(reg.projects)) {
+    const pj = await readJsonIfExists<{ runtime?: string }>(projectPaths(id).projectJson).catch(() => undefined);
+    if (pj?.runtime === 'host') return true;
+  }
+  return false;
+}
+
+/**
+ * Keychain on macOS when `security` works; else the file store. MINIONS_CREDENTIAL_STORE=file|keychain
+ * overrides, except that the file store is always used while the host runtime is in use (see hostRuntimeInUse).
+ */
 export async function selectStore(opts: StoreOptions = {}): Promise<SecretStore> {
   const runner = opts.runner ?? run;
   const kind = opts.kind ?? GITHUB_CREDENTIAL;
   const pref = (opts.env ?? process.env).MINIONS_CREDENTIAL_STORE;
   if (pref === 'file') return new FileStore(kind);
+  if (opts.hostRuntime ?? await hostRuntimeInUse()) return new FileStore(kind);
   if (pref === 'keychain') return new KeychainStore(runner, kind);
   if ((opts.platform ?? process.platform) !== 'darwin') return new FileStore(kind);
   const probe = await runner('security', ['list-keychains', '-d', 'user'], { allowFailure: true, timeoutMs: 15_000 });
@@ -238,6 +259,41 @@ export async function selectStore(opts: StoreOptions = {}): Promise<SecretStore>
 
 const storeFor = (backend: Backend, runner: Runner, kind: CredentialKind = GITHUB_CREDENTIAL): SecretStore =>
   (backend === 'keychain' ? new KeychainStore(runner, kind) : new FileStore(kind));
+
+export interface MovedToken { projectId: string; kind: CredentialKind['name'] }
+
+/**
+ * Host runtime: moves every registered project's tokens from the macOS Keychain to the 0600 file store
+ * (read from Keychain, written to the file store, reference updated, Keychain item deleted). A token
+ * that cannot be read (locked keychain, denied prompt) stays where it is and yields a warning.
+ */
+export async function moveKeychainTokensToFileStore(runner: Runner = run): Promise<{ moved: MovedToken[]; warnings: string[] }> {
+  const moved: MovedToken[] = [];
+  const warnings: string[] = [];
+  const reg = await loadRegistry().catch(() => ({ version: 1 as const, projects: {} }));
+  for (const projectId of Object.keys(reg.projects)) {
+    const refs = await loadCredentialRefs(projectId).catch((): CredentialsJson => ({ version: 1 }));
+    for (const kind of CREDENTIAL_KINDS) {
+      const ref = refs[kind.name];
+      if (ref?.backend !== 'keychain') continue;
+      try {
+        const keychain = new KeychainStore(runner, kind);
+        const token = await keychain.get(projectId);
+        if (!token) continue;
+        const file = new FileStore(kind);
+        await file.set(projectId, token);
+        const now = await loadCredentialRefs(projectId);
+        const cur = now[kind.name];
+        if (cur) await saveCredentialRefs(projectId, { ...now, [kind.name]: { ...cur, backend: 'file', ref: file.ref(projectId), updatedAt: new Date().toISOString() } });
+        await keychain.delete(projectId);
+        moved.push({ projectId, kind: kind.name });
+      } catch (e) {
+        warnings.push(`The ${kind.label} of project ${projectId} is still in the macOS Keychain (${redact((e as Error).message).split('\n')[0]}); agents of a host-runtime project could read it with /usr/bin/security. Re-provision it with \`${kind.command}\`.`);
+      }
+    }
+  }
+  return { moved, warnings };
+}
 
 // ---------------------------------------------------------------- reference file
 

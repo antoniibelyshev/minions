@@ -1,4 +1,4 @@
-import { appendFileSync, mkdirSync, renameSync, statSync } from 'node:fs';
+import { closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, renameSync, writeSync } from 'node:fs';
 import { dirname } from 'node:path';
 import type { BacklogAdapter } from '../backlog/types.js';
 import type { MinionsConfig } from '../config/schema.js';
@@ -16,12 +16,27 @@ export interface HookOutput { stdout?: string; reason: string }
 export const MAX_LOG_BYTES = 1024 * 1024;
 export const NO_PROGRESS_LIMIT = 2;
 
-/** Appends a redacted line to /state/logs/hooks.log, rotating to hooks.log.1 at ~1MB. Never throws. */
+/** Control characters (incl. ESC, CR, LF) are escaped so a logged string cannot forge lines or terminal sequences. */
+const sanitizeLogLine = (s: string) => redact(s).slice(0, 2000).replace(/[\u0000-\u001f\u007f\u0080-\u009f]/g, (c) => (c === '\n' ? '\\n' : `\\x${c.charCodeAt(0).toString(16).padStart(2, '0')}`));
+
+/**
+ * Appends a redacted, sanitized line to hooks.log (/state/logs; the host runtime uses <project>/host/logs,
+ * outside the agent-writable dirs, via MINIONS_LOG_DIR), rotating to hooks.log.1 at ~1MB. Hooks run
+ * outside the Claude Code sandbox, so the file is opened with O_NOFOLLOW and must be a regular file:
+ * a symlink planted at the log path is never followed. Never throws.
+ */
 export function hookLog(line: string, path = runtimePaths().hooksLog): void {
   try {
-    mkdirSync(dirname(path), { recursive: true });
-    try { if (statSync(path).size >= MAX_LOG_BYTES) renameSync(path, `${path}.1`); } catch { /* no log yet */ }
-    appendFileSync(path, `${new Date().toISOString()} ${redact(line).replace(/\n/g, '\\n').slice(0, 4000)}\n`);
+    mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+    try {
+      const st = lstatSync(path);
+      if (st.isFile() && st.size >= MAX_LOG_BYTES) renameSync(path, `${path}.1`);
+    } catch { /* no log yet */ }
+    const fd = openSync(path, constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT | constants.O_NOFOLLOW, 0o600);
+    try {
+      if (!fstatSync(fd).isFile()) return;
+      writeSync(fd, `${new Date().toISOString()} ${sanitizeLogLine(line)}\n`);
+    } finally { closeSync(fd); }
   } catch { /* logging must never break a hook */ }
 }
 
