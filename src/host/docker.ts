@@ -117,6 +117,48 @@ export class Compose {
     return r.code === 0 && r.stdout.trim().length > 0;
   }
 
+  /**
+   * Tri-state container status for destructive decisions. `absent` only when `ps -a` succeeded and shows
+   * no container, or the single container is exited/dead. Errors, timeouts, malformed output, several
+   * containers, or restarting/paused/created states are `unknown` (never deleted).
+   */
+  async containerState(): Promise<{ state: 'running' | 'absent' | 'unknown'; reason: string }> {
+    let r: RunResult;
+    try { r = await this.compose(['ps', '-a', '--format', 'json', SERVICE_NAME], { allowFailure: true, timeoutMs: 30_000 }); }
+    catch (e) { return { state: 'unknown', reason: `docker compose ps failed (${String((e as Error).message ?? e).slice(0, 120)})` }; }
+    if (r.code !== 0) return { state: 'unknown', reason: `docker compose ps exited with code ${r.code}` };
+    const out = r.stdout.trim();
+    if (!out) return { state: 'absent', reason: 'no container exists' };
+    let items: unknown[];
+    try {
+      const parsed: unknown = out.startsWith('[') ? JSON.parse(out) : out.split('\n').filter((l) => l.trim()).map((l) => JSON.parse(l));
+      items = Array.isArray(parsed) ? parsed : [parsed];
+    } catch { return { state: 'unknown', reason: 'could not parse docker compose ps output' }; }
+    if (items.length === 0) return { state: 'absent', reason: 'no container exists' };
+    if (items.length > 1) return { state: 'unknown', reason: 'more than one container reported' };
+    const st = (items[0] as { State?: unknown } | null)?.State;
+    if (typeof st !== 'string') return { state: 'unknown', reason: 'container state missing from docker compose ps output' };
+    if (st === 'exited' || st === 'dead') return { state: 'absent', reason: `container is ${st}` };
+    if (st === 'running') return { state: 'running', reason: 'container is running' };
+    return { state: 'unknown', reason: `container is ${st}` };
+  }
+
+  /** True when the running container has the secrets dir bind-mounted (false for one created from a pre-upgrade compose.yaml). */
+  async hasSecretsMount(): Promise<boolean> {
+    const ps = await this.compose(['ps', '--status', 'running', '-q', SERVICE_NAME], { allowFailure: true, timeoutMs: 30_000 });
+    const id = ps.stdout.trim().split('\n')[0]?.trim();
+    if (ps.code !== 0 || !id) return false;
+    const r = await this.runner('docker', ['inspect', '--format', '{{json .Mounts}}', id], { allowFailure: true, timeoutMs: 30_000 });
+    if (r.code !== 0) return false;
+    try { return (JSON.parse(r.stdout) as { Destination?: string }[]).some((m) => m.Destination === CONTAINER.secretsDir); } catch { return false; }
+  }
+
+  /** Whether a freshly written secret copy would reach the container: running with the mount, running without it, or not running. */
+  async secretsVisibility(): Promise<'mounted' | 'restart-required' | 'not-running'> {
+    if (!(await this.isRunning().catch(() => false))) return 'not-running';
+    return (await this.hasSecretsMount().catch(() => false)) ? 'mounted' : 'restart-required';
+  }
+
   /** Non-interactive exec (no TTY); output captured. */
   exec(args: string[], opts: RunOptions = {}): Promise<RunResult> {
     return this.compose(['exec', '-T', SERVICE_NAME, ...args], opts);
