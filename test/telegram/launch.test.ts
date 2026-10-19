@@ -7,7 +7,8 @@ import type { MinionsConfig } from '../../src/config/schema.js';
 import type { RunOptions, RunResult } from '../../src/core/exec.js';
 import {
   buildClaudeCommand, decideTelegram, launchFingerprint, readMountedToken, runCoordinator, syncCoordinator,
-  TELEGRAM_TOKEN_ENV, TELEGRAM_TOOLS, type SpawnLike,
+  coordinatorSettings, coordinatorWrapper, exitCodeOf, readExitRecord, TELEGRAM_ALL_TOOLS, TELEGRAM_HOOK_COMMAND,
+  TELEGRAM_TOKEN_ENV, TELEGRAM_TOOLS, type SignalTarget, type SpawnLike,
 } from '../../src/runtime/coordinator.js';
 import { runtimePaths } from '../../src/runtime/paths.js';
 import { evaluateTelegram, TELEGRAM_CHANNEL_SPEC, TELEGRAM_PLUGIN_ID, type TelegramProbeReport } from '../../src/telegram/probe.js';
@@ -51,6 +52,20 @@ function layout(token: string | null = TOKEN) {
     pluginDir: join(root, 'plugin'), coordinatorPrompt: join(root, 'plugin', 'coordinator.md'),
   };
   return { root, paths };
+}
+
+const noSleep = async () => {};
+
+/** Fake process signal target: records listeners so a test can deliver a signal. */
+function fakeSignals() {
+  const listeners = new Map<string, Set<() => void>>();
+  const target: SignalTarget = {
+    on(s, l) { if (!listeners.has(s)) listeners.set(s, new Set()); listeners.get(s)!.add(l); return target; },
+    removeListener(s, l) { listeners.get(s)?.delete(l); return target; },
+  };
+  const emit = (s: NodeJS.Signals) => { for (const l of [...(listeners.get(s) ?? [])]) l(); };
+  const count = () => [...listeners.values()].reduce((n, set) => n + set.size, 0);
+  return { target, emit, count, listeners };
 }
 
 /** Fake spawn: records argv and env, exits 0. */
@@ -189,10 +204,10 @@ describe('controlled coordinator restart', () => {
     writeFileSync(paths.telegramTokenFile, TOKEN2 + '\n');
     const t = tmux(true);
     const restarts: unknown[] = [];
-    const r = await syncCoordinator(telegramCfg(), { paths, runner: t.runner, activeLeases: () => [], recordRestart: (i) => restarts.push(i) }, { startDetached: true });
+    const r = await syncCoordinator(telegramCfg(), { paths, runner: t.runner, activeLeases: () => [], recordRestart: (i) => restarts.push(i), sleep: noSleep }, { startDetached: true });
     expect(r.action).toBe('restarted');
     expect(r.reason).toMatch(/Telegram configuration changed/);
-    expect(t.calls.map((c) => c.args.slice(0, 3))).toEqual([['has-session', '-t', 'coordinator'], ['kill-session', '-t', 'coordinator'], ['-u', 'new-session', '-d']]);
+    expect(t.calls.map((c) => c.args.slice(0, 3))).toEqual([['has-session', '-t', 'coordinator'], ['kill-session', '-t', 'coordinator'], ['-u', 'new-session', '-d'], ['has-session', '-t', 'coordinator']]);
     expect(t.calls[2]!.args.slice(-3)).toEqual(['minions', 'coordinator', 'run']);
     expect(JSON.stringify(t.calls)).not.toContain(TOKEN2);
     expect(restarts).toHaveLength(1);
@@ -219,7 +234,7 @@ describe('controlled coordinator restart', () => {
     const { paths } = layout();
     const t = tmux(false);
     expect((await syncCoordinator(telegramCfg(), { paths, runner: t.runner, activeLeases: () => [] })).action).toBe('none');
-    const r = await syncCoordinator(telegramCfg(), { paths, runner: t.runner, activeLeases: () => [] }, { startDetached: true });
+    const r = await syncCoordinator(telegramCfg(), { paths, runner: t.runner, activeLeases: () => [], sleep: noSleep }, { startDetached: true });
     expect(r).toMatchObject({ action: 'started', running: true });
   });
 
@@ -277,7 +292,7 @@ describe('tester edge cases: terminal mode through the wrapper', () => {
     const exits: SpawnLike = () => ({
       on(event: string, cb: (...a: unknown[]) => void) { if (event === 'exit') setImmediate(() => cb(null, 'SIGTERM')); return this; },
     } as ReturnType<SpawnLike>);
-    expect(await runCoordinator(defaults(), { paths, spawn: exits, env: {}, log: () => {} })).toBe(128);
+    expect(await runCoordinator(defaults(), { paths, spawn: exits, env: {}, log: () => {}, signals: fakeSignals().target })).toBe(143); // 128 + SIGTERM(15)
   });
 
   it('an unwritable state dir does not stop the session from launching', async () => {
@@ -335,7 +350,7 @@ describe('tester edge cases: restart with leases', () => {
     writeFileSync(paths.telegramTokenFile, TOKEN2 + '\n');
     const t = stub(true);
     let recorded = 0;
-    const r = await syncCoordinator(telegramCfg(), { paths, runner: t.runner, activeLeases: () => [{ id: 'l1' }], recordRestart: () => { recorded++; } }, { startDetached: true });
+    const r = await syncCoordinator(telegramCfg(), { paths, runner: t.runner, activeLeases: () => [{ id: 'l1' }], recordRestart: () => { recorded++; }, sleep: noSleep }, { startDetached: true });
     expect(r).toMatchObject({ action: 'restart-pending', running: true });
     expect(recorded).toBe(0);
     expect(t.calls).toEqual([['has-session', '-t', 'coordinator']]);
@@ -356,5 +371,127 @@ describe('tester edge cases: restart with leases', () => {
       args[0] === 'has-session' ? { code: 1, stdout: '', stderr: '' } : { code: 1, stdout: '', stderr: 'tmux: boom' };
     await expect(syncCoordinator(telegramCfg(), { paths, runner, activeLeases: () => [] }, { startDetached: true }))
       .rejects.toMatchObject({ code: 'INCOMPATIBLE_RUNTIME', message: expect.stringMatching(/tmux: boom/) });
+  });
+});
+
+describe('wrapper signal handling', () => {
+  /** A claude child that stays running until the test ends it; records the signals it was sent. */
+  function controllableSpawn() {
+    const killed: NodeJS.Signals[] = [];
+    let exit: ((code: number | null, signal: NodeJS.Signals | null) => void) | undefined;
+    const spawn: SpawnLike = () => ({
+      on(event: string, cb: (...a: unknown[]) => void) { if (event === 'exit') exit = cb as typeof exit; return this; },
+      kill(s: NodeJS.Signals) { killed.push(s); return true; },
+    } as ReturnType<SpawnLike>);
+    return { spawn, killed, finish: (code: number | null, signal: NodeJS.Signals | null) => exit!(code, signal) };
+  }
+  const settle = () => new Promise((r) => setImmediate(r));
+
+  it('ignores SIGINT/SIGQUIT while claude runs and forwards SIGTERM/SIGHUP; 128+n on signal exit', async () => {
+    const { paths } = layout(null);
+    const sig = fakeSignals();
+    const child = controllableSpawn();
+    let done: number | undefined;
+    const p = runCoordinator(defaults(), { paths, spawn: child.spawn, env: {}, log: () => {}, signals: sig.target }).then((c) => (done = c));
+    for (let i = 0; i < 200 && sig.count() < 4; i++) await new Promise((r) => setTimeout(r, 5)); // until claude is spawned
+    for (const s of ['SIGINT', 'SIGQUIT', 'SIGTERM', 'SIGHUP'] as const) expect(sig.listeners.get(s)?.size, s).toBe(1);
+    sig.emit('SIGINT');
+    sig.emit('SIGQUIT');
+    await settle();
+    expect(done).toBeUndefined(); // the wrapper is still waiting on claude
+    expect(child.killed).toEqual([]); // claude gets Ctrl-C from the terminal itself, not from us
+    sig.emit('SIGTERM');
+    sig.emit('SIGHUP');
+    expect(child.killed).toEqual(['SIGTERM', 'SIGHUP']);
+    child.finish(null, 'SIGHUP');
+    expect(await p).toBe(129);
+    expect(sig.count()).toBe(0); // listeners removed after claude exits
+  });
+
+  it('removes its listeners when claude fails to start', async () => {
+    const { paths } = layout(null);
+    const sig = fakeSignals();
+    const failing: SpawnLike = () => ({
+      on(event: string, cb: (...a: unknown[]) => void) { if (event === 'error') setImmediate(() => cb(new Error('ENOENT'))); return this; },
+    } as ReturnType<SpawnLike>);
+    await expect(runCoordinator(defaults(), { paths, spawn: failing, env: {}, log: () => {}, signals: sig.target })).rejects.toThrow(/ENOENT/);
+    expect(sig.count()).toBe(0);
+  });
+
+  it('exit codes follow the 128+n convention', () => {
+    expect(exitCodeOf(0, null)).toBe(0);
+    expect(exitCodeOf(3, null)).toBe(3);
+    expect(exitCodeOf(null, 'SIGINT')).toBe(130);
+    expect(exitCodeOf(null, 'SIGKILL')).toBe(137);
+    expect(exitCodeOf(null, 'SIGTERM')).toBe(143);
+    expect(exitCodeOf(null, null)).toBe(1);
+  });
+});
+
+describe('Telegram tools are coordinator-only', () => {
+  it('the generated settings gate every Telegram tool behind the pre-telegram hook', async () => {
+    const { paths } = layout();
+    const on = await buildClaudeCommand(telegramCfg(), paths, { telegram: true });
+    const settings = JSON.parse(on.args[on.args.indexOf('--settings') + 1]!);
+    const entries = settings.hooks.PreToolUse as { matcher: string; hooks: { type: string; command: string }[] }[];
+    expect(entries).toHaveLength(1);
+    expect(entries[0]!.hooks).toEqual([{ type: 'command', command: TELEGRAM_HOOK_COMMAND }]);
+    const matcher = new RegExp(`^(?:${entries[0]!.matcher})$`);
+    for (const t of TELEGRAM_ALL_TOOLS) expect(matcher.test(t), t).toBe(true);
+    expect(TELEGRAM_ALL_TOOLS).toEqual(['reply', 'react', 'edit_message', 'download_attachment'].map((t) => `mcp__plugin_telegram_telegram__${t}`));
+    for (const t of ['Bash', 'Agent', 'mcp__other__reply', 'mcp__plugin_telegram_telegramx']) expect(matcher.test(t), t).toBe(false);
+    // Terminal launches carry no Telegram hook (and no Telegram allow).
+    expect(coordinatorSettings(telegramCfg())).not.toHaveProperty('hooks');
+  });
+});
+
+describe('detached start detects a wrapper that dies immediately', () => {
+  /** tmux fake whose session disappears right after new-session, like a wrapper that exits on startup. */
+  function dyingTmux(onStart: () => void = () => {}) {
+    const calls: string[][] = [];
+    const runner = async (_c: string, args: string[]): Promise<RunResult> => {
+      calls.push(args);
+      if (args[0] === 'has-session') return { code: 1, stdout: '', stderr: "can't find session: coordinator" };
+      if (args.includes('new-session')) { onStart(); return ok(''); }
+      return { code: 1, stdout: '', stderr: 'unexpected' };
+    };
+    return { calls, runner };
+  }
+
+  it('reports the wrapper error recorded in the exit record instead of "started"', async () => {
+    const { paths } = layout();
+    // The real wrapper entry point fails (e.g. invalid config) and records why.
+    const t = dyingTmux();
+    const sleeps: number[] = [];
+    const sleep = async (ms: number) => {
+      sleeps.push(ms);
+      await coordinatorWrapper(async () => { throw new Error(`invalid config: verification.commands[0] (token ${TOKEN})`); }, { paths }).catch(() => {});
+    };
+    const err = await syncCoordinator(telegramCfg(), { paths, runner: t.runner, activeLeases: () => [], sleep }, { startDetached: true }).catch((e) => e);
+    expect(err).toMatchObject({ code: 'INCOMPATIBLE_RUNTIME', message: expect.stringMatching(/exited right after starting: invalid config: verification\.commands\[0\]/) });
+    expect(err.message).not.toContain(TOKEN);
+    expect(sleeps).toEqual([2000]);
+    expect(t.calls.map((a) => a[0] === 'has-session' ? 'has' : 'new')).toEqual(['has', 'new', 'has']);
+  });
+
+  it('reports a non-zero exit code when the wrapper exited without an error message', async () => {
+    const { paths } = layout(null);
+    const t = dyingTmux();
+    const exits: SpawnLike = () => ({
+      on(event: string, cb: (...a: unknown[]) => void) { if (event === 'exit') setImmediate(() => cb(2, null)); return this; },
+    } as ReturnType<SpawnLike>);
+    const sleep = async () => { await coordinatorWrapper(async () => defaults(), { paths, spawn: exits, env: {}, log: () => {}, signals: fakeSignals().target }); };
+    await expect(syncCoordinator(defaults(), { paths, runner: t.runner, activeLeases: () => [], sleep }, { startDetached: true }))
+      .rejects.toMatchObject({ message: expect.stringMatching(/exited with code 2/) });
+    expect(await readExitRecord(paths)).toMatchObject({ version: 1, code: 2 });
+  });
+
+  it('a stale exit record from an earlier run is not reported as this failure', async () => {
+    const { paths } = layout();
+    writeFileSync(paths.coordinatorExit, JSON.stringify({ version: 1, pid: 1, at: '2020-01-01T00:00:00Z', code: 1, error: 'old failure' }));
+    const t = dyingTmux();
+    const err = await syncCoordinator(telegramCfg(), { paths, runner: t.runner, activeLeases: () => [], sleep: noSleep }, { startDetached: true }).catch((e) => e);
+    expect(err.message).toMatch(/exited right after starting: no exit record was written/);
+    expect(err.message).not.toMatch(/old failure/);
   });
 });

@@ -13,7 +13,7 @@ import { delegateToContainer } from '../host/delegate.js';
 import { readTelegramAccess } from '../telegram/access.js';
 import { installTelegramPlugin } from '../telegram/install.js';
 import { formatTelegramProbe, probeTelegram } from '../telegram/probe.js';
-import { buildClaudeCommand, buildCoordinatorCommand, launchCoordinator, probeRuntime, readLaunchRecord, runCoordinator, syncCoordinator } from './coordinator.js';
+import { buildClaudeCommand, buildCoordinatorCommand, launchCoordinator, probeRuntime, coordinatorWrapper, readLaunchRecord, syncCoordinator } from './coordinator.js';
 import { openDb, type Lease, type LeaseRole, type RuntimeDb } from './db.js';
 import { runHook } from './hooks.js';
 import { runtimePaths } from './paths.js';
@@ -189,6 +189,8 @@ export function register(program: Command): void {
     .action(async () => { await runHook('stop', hookLoader); process.exitCode = 0; });
   hook.command('pre-agent').description('PreToolUse(Agent) hook: minions workers need an active lease')
     .action(async () => { await runHook('pre-agent', hookLoader); process.exitCode = 0; });
+  hook.command('pre-telegram').description('PreToolUse(Telegram tools) hook: only the coordinator itself may use them, never a subagent')
+    .action(async () => { await runHook('pre-telegram', hookLoader); process.exitCode = 0; });
 
   // coordinator
   const coord = program.command('coordinator').description('Launch or attach the coordinator Claude Code session (tmux)')
@@ -212,7 +214,7 @@ export function register(program: Command): void {
   coord.command('run').description('Exec wrapper started by tmux: decides Telegram, then runs claude (container only)')
     .action(action(async () => {
       requireMode('container');
-      process.exitCode = await runCoordinator(await getConfig());
+      process.exitCode = await coordinatorWrapper(getConfig);
     }));
   coord.command('sync').description('Apply restart-required Telegram changes with a controlled coordinator restart (container only)')
     .option('--force', 'restart even while worker leases are active (they stay recorded for recovery)')
