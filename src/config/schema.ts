@@ -39,6 +39,10 @@ export const PROFILES = ['project-owner', 'personal-work', 'supervised'] as cons
 export type Profile = (typeof PROFILES)[number];
 
 const nonEmpty = z.string().min(1);
+/** Model ids/aliases (e.g. `sonnet`, `claude-opus-4-1`, `opus[1m]`); rendered into agent frontmatter, so no whitespace or YAML syntax. */
+const modelId = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:@\[\]-]*$/, 'must be a model id or alias (letters, digits, . _ : @ [ ] -)');
+/** Git branch name; also passed to git argv, so it may not start with '-' or contain '..'. */
+const branchName = z.string().regex(/^(?!-)(?!.*\.\.)[A-Za-z0-9._/-]+$/, 'must be a plain git branch name');
 const port = z.number().int().min(1).max(65535);
 
 export const MinionsConfigSchema = z.object({
@@ -82,8 +86,8 @@ export const MinionsConfigSchema = z.object({
     attemptMaxTurns: z.number().int().min(1),
   }).strict(),
   models: z.object({
-    default: nonEmpty,
-    allowed: z.array(nonEmpty).min(1),
+    default: modelId,
+    allowed: z.array(modelId).min(1),
     selection: z.enum(['coordinator', 'fixed']),
   }).strict(),
   delivery: z.object({
@@ -114,7 +118,7 @@ export const MinionsConfigSchema = z.object({
   sensitivePaths: z.array(nonEmpty),
   architecture: z.enum(['decide', 'propose']),
   git: z.object({
-    baseBranch: nonEmpty,
+    baseBranch: branchName,
     identity: z.object({ name: nonEmpty, email: nonEmpty }).strict(),
   }).strict(),
   permissionMode: z.enum(['default', 'acceptEdits', 'auto']),

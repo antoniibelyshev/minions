@@ -51,10 +51,16 @@ export function findByCommonDir(reg: Registry, commonDir: string): [string, Regi
   return Object.entries(reg.projects).find(([, e]) => e.gitCommonDir === commonDir);
 }
 
-/** projectId stored in a shared `<repo>/.minions/config.json`, if any (read as raw data). */
+const ProjectIdSchema = z.uuid();
+
+/**
+ * projectId stored in a shared `<repo>/.minions/config.json`, if any (read as raw data). The file is
+ * repository-controlled and the id becomes a host path segment, so anything but a UUID is ignored.
+ */
 export async function sharedProjectId(repoPath: string): Promise<string | undefined> {
   const raw = await readJsonIfExists<{ projectId?: unknown }>(repoPaths(repoPath).configJson).catch(() => undefined);
-  return raw && typeof raw.projectId === 'string' ? raw.projectId : undefined;
+  const id = ProjectIdSchema.safeParse(raw?.projectId);
+  return id.success ? id.data : undefined;
 }
 
 export interface IdentityInput { commonDir: string; sharedId?: string; attach?: boolean; newIdentity?: boolean }

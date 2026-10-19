@@ -1,14 +1,15 @@
 // Explicit repository transfer between host and container via Git bundles (spec §3A "Repository access").
 // Import copies committed history of the base branch only; export fetches agent branches into
 // refs/remotes/minions/* on the host (never touches local branches or the working tree).
-import { mkdtemp, rm } from 'node:fs/promises';
+import { lstat, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { basename, join } from 'node:path';
+import { join } from 'node:path';
 import { matchesAny } from '../config/capabilities.js';
 import { MinionsError } from '../core/errors.js';
 import { run } from '../core/exec.js';
 import { ensureDir } from '../core/fsutil.js';
 import { CONTAINER, SERVICE_NAME, projectPaths } from '../core/paths.js';
+import { HOST_GIT } from './discovery.js';
 import { Compose, type Runner } from './docker.js';
 import type { ProjectJson } from './project.js';
 
@@ -41,7 +42,7 @@ export async function importRepo(project: ProjectJson, opts: { runner?: Runner; 
   const runner = opts.runner ?? run;
   const repo = opts.repoPath ?? project.repoPath;
   const compose = opts.compose ?? new Compose(project.projectId, runner);
-  const git = (args: string[], allowFailure = false) => runner('git', args, { cwd: repo, allowFailure, timeoutMs: 300_000 });
+  const git = (args: string[], allowFailure = false) => runner('git', [...HOST_GIT, ...args], { cwd: repo, allowFailure, timeoutMs: 300_000 });
   const base = project.baseBranch;
 
   const ref = await git(['rev-parse', '--verify', '--quiet', `refs/heads/${base}^{commit}`], true);
@@ -67,7 +68,7 @@ export async function importRepo(project: ProjectJson, opts: { runner?: Runner; 
   const file = `import-${commit.slice(0, 12)}.bundle`;
   const bundle = join(tmp, file);
   try {
-    await git(['bundle', 'create', bundle, base]);
+    await git(['bundle', 'create', bundle, `refs/heads/${base}`]);
     await compose.cp(bundle, `${SERVICE_NAME}:${CONTAINER.import}/${file}`);
   } finally {
     await rm(tmp, { recursive: true, force: true });
@@ -83,7 +84,7 @@ export async function importRepo(project: ProjectJson, opts: { runner?: Runner; 
 export interface ExportResult { bundle: string; refs: string[]; changes: { ref: string; from: string | null; to: string | null }[] }
 
 async function minionsRefs(runner: Runner, repo: string): Promise<Map<string, string>> {
-  const r = await runner('git', ['for-each-ref', '--format=%(refname) %(objectname)', 'refs/remotes/minions/'], { cwd: repo, allowFailure: true });
+  const r = await runner('git', [...HOST_GIT, 'for-each-ref', '--format=%(refname) %(objectname)', 'refs/remotes/minions/'], { cwd: repo, allowFailure: true });
   return new Map(r.stdout.split('\n').filter(Boolean).map((l) => l.split(' ') as [string, string]));
 }
 
@@ -96,11 +97,18 @@ export async function exportRepo(project: ProjectJson, opts: { runner?: Runner; 
   const data = parseEnvelope<{ path: string; refs: string[] }>(r.stdout, 'workspace export');
   const exportsDir = projectPaths(project.projectId).exportsDir;
   await ensureDir(exportsDir);
-  const local = join(exportsDir, basename(data.path || file));
-  await compose.cp(`${SERVICE_NAME}:${data.path || `${CONTAINER.exports}/${file}`}`, local);
+  // The bundle name is chosen here, never taken from container output; the copied file must be a
+  // regular file (an agent could swap it for a symlink or directory inside the container).
+  const local = join(exportsDir, file);
+  await compose.cp(`${SERVICE_NAME}:${CONTAINER.exports}/${file}`, local);
+  const st = await lstat(local).catch(() => null);
+  if (!st?.isFile()) {
+    await rm(local, { recursive: true, force: true });
+    throw new MinionsError('PRECONDITION', 'The exported bundle is not a regular file; refusing to fetch it.', 'Inspect /state/exports in the container.');
+  }
   const before = await minionsRefs(runner, repo);
   // Remote-tracking refs under refs/remotes/minions/ are minions-owned; forced updates there never touch local branches.
-  await runner('git', ['fetch', '--no-tags', '--prune', local, '+refs/heads/*:refs/remotes/minions/*'], { cwd: repo, timeoutMs: 300_000 });
+  await runner('git', [...HOST_GIT, 'fetch', '--no-tags', '--no-recurse-submodules', '--prune', local, '+refs/heads/*:refs/remotes/minions/*'], { cwd: repo, timeoutMs: 300_000 });
   const after = await minionsRefs(runner, repo);
   const changes: ExportResult['changes'] = [];
   for (const ref of new Set([...before.keys(), ...after.keys()])) {

@@ -216,6 +216,26 @@ describe('scheduler record', () => {
     expect(r2.errors!.join()).toMatch(/review started at/);
   });
 
+  it('a tester may add commits but not rewrite the head it was given; complete with failing checks is invalid', async () => {
+    const env = makeEnv();
+    env.backlog.add({ id: 'task-1' });
+    await engineerPass(env, 'task-1');
+    const t = await env.sched.claim('task-1', 'tester');
+    const failing = await env.sched.record(t.leaseId, result({ branch: t.branch, headSha: t.expectedHead, checks: [{ command: 'npm test', outcome: 'fail' }] }));
+    expect(failing.valid).toBe(false);
+    expect(failing.errors!.join()).toMatch(/failing checks/);
+    gitSync(t.worktree, 'reset', '-q', '--hard', 'HEAD~1');
+    const rewritten = commitFile(t.worktree, 'other.txt', 'rewritten');
+    const r = await env.sched.record(t.leaseId, result({ branch: t.branch, headSha: rewritten }), { correction: true });
+    expect(r).toMatchObject({ valid: false, unvalidated: true });
+    expect(r.errors!.join()).toMatch(/testing started at/);
+    expect(env.backlog.status('task-1')).toBe('testing');
+
+    const t2 = await env.sched.claim('task-1', 'tester');
+    const added = commitFile(t2.worktree, 'extra.test.txt', 'more tests');
+    expect(await env.sched.record(t2.leaseId, result({ branch: t2.branch, headSha: added }))).toMatchObject({ valid: true, to: 'reviewing' });
+  });
+
   it('repeated repair cycles trigger replan', async () => {
     const env = makeEnv();
     env.backlog.add({ id: 'task-1' });

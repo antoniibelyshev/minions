@@ -88,14 +88,15 @@ describe('coordinator command', () => {
     const cfg = defaults();
     const c = await buildCoordinatorCommand(cfg, paths);
     expect(c.cmd).toBe('tmux');
-    expect(c.args.slice(0, 7)).toEqual(['new-session', '-A', '-s', 'coordinator', '-c', join(root, 'ws', 'repo'), '--']);
-    const claude = c.args.slice(7);
+    expect(c.args.slice(0, 8)).toEqual(['-u', 'new-session', '-A', '-s', 'coordinator', '-c', join(root, 'ws', 'repo'), '--']);
+    const claude = c.args.slice(8);
     expect(claude[0]).toBe('claude');
     expect(claude[claude.indexOf('--plugin-dir') + 1]).toBe(join(root, 'plugin'));
     expect(claude[claude.indexOf('--append-system-prompt') + 1]).toBe(prompt);
     expect(claude[claude.indexOf('--permission-mode') + 1]).toBe('acceptEdits');
     const settings = JSON.parse(claude[claude.indexOf('--settings') + 1]!);
     expect(settings.permissions.allow).toEqual(expect.arrayContaining(['Bash(minions *)', 'Bash(git *)', 'Bash(backlog *)']));
+    expect(settings.permissions.deny).toEqual(expect.arrayContaining(['Bash(git push *)', 'Bash(git * push *)']));
     expect(JSON.stringify(c.args)).not.toMatch(/bypassPermissions/);
     expect(coordinatorSettings(cfg).permissions).toMatchObject({ disableBypassPermissionsMode: 'disable' });
   });

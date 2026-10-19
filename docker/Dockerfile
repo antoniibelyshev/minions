@@ -29,7 +29,9 @@ RUN chmod 0755 /opt/minions/pkg/dist/cli.js \
 ENV MINIONS_RUNTIME=container \
     CLAUDE_CONFIG_DIR=/home/node/.claude \
     MINIONS_CONFIG=/opt/minions/config/config.json \
-    DISABLE_AUTOUPDATER=1
+    DISABLE_AUTOUPDATER=1 \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8
 
 USER node
 WORKDIR /workspace

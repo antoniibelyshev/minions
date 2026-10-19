@@ -104,9 +104,10 @@ export function register(program: Command): void {
         for (const w of r.warnings) say(json, `warning: ${w}`);
         imported = r;
       }
-      if (!o.attach || json) {
+      // The coordinator is a TUI in tmux: attaching needs a terminal (compose exec allocates a TTY).
+      if (!o.attach || json || !process.stdin.isTTY || !process.stdout.isTTY) {
         emit({ projectId: project.projectId, running: true, imported, attach: `docker compose -p ${compose.name} -f ${compose.file} exec ${'app'} minions coordinator` },
-          { json, human: () => `Container ${compose.name} is running. Run \`minions start\` to attach the coordinator.` });
+          { json, human: () => `Container ${compose.name} is running. Run \`minions start\` in a terminal to attach the coordinator.` });
         return;
       }
       say(json, 'Attaching the coordinator (tmux session "coordinator"). On first start, log in to Claude with /login.');

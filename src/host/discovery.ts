@@ -38,8 +38,26 @@ export interface Discovery {
 const isFile = async (p: string) => (await stat(p).catch(() => null))?.isFile() ?? false;
 const isDir = async (p: string) => (await stat(p).catch(() => null))?.isDirectory() ?? false;
 
+/**
+ * Leading `git` options for host-side git calls: never run an fsmonitor daemon, hooks, or a pager
+ * from repository configuration while minions inspects or transfers the repo.
+ */
+export const HOST_GIT = ['-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null', '--no-pager'];
+
+/** Drops embedded credentials (`https://user:token@host/…`) from a remote URL; scp-style URLs are kept. */
+export function sanitizeRemoteUrl(url: string | null): string | null {
+  if (!url) return url;
+  try {
+    const u = new URL(url);
+    if (!u.username && !u.password) return url;
+    if (u.protocol === 'ssh:') { u.password = ''; return u.toString(); } // ssh user name is not a secret
+    u.username = ''; u.password = '';
+    return u.toString();
+  } catch { return url; }
+}
+
 async function gitOut(runner: Runner, cwd: string, args: string[]): Promise<string | null> {
-  const r = await runner('git', args, { cwd, allowFailure: true, timeoutMs: 15_000 });
+  const r = await runner('git', [...HOST_GIT, ...args], { cwd, allowFailure: true, timeoutMs: 15_000 });
   return r.code === 0 ? r.stdout.trim() || null : null;
 }
 
@@ -86,7 +104,7 @@ export async function discover(repoPath: string, runner: Runner = run): Promise<
   const currentBranch = await g(['symbolic-ref', '--quiet', '--short', 'HEAD']);
   const originHead = await g(['symbolic-ref', '--quiet', '--short', 'refs/remotes/origin/HEAD']);
   const baseBranch = originHead?.replace(/^origin\//, '') || currentBranch || 'main';
-  const remoteUrl = await g(['config', '--get', 'remote.origin.url']);
+  const remoteUrl = sanitizeRemoteUrl(await g(['config', '--get', 'remote.origin.url']));
   const status = await g(['status', '--porcelain', '--untracked-files=no']);
   const top = new Set(await readdir(repoPath).catch(() => [] as string[]));
 

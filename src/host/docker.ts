@@ -47,6 +47,10 @@ export function composeYaml(p: ProjectJson): string {
     `      CLAUDE_CONFIG_DIR: ${q(CONTAINER.claudeHome)}`,
     `      MINIONS_CONFIG: ${q(CONTAINER.configJson)}`,
     '      HOME: "/home/node"',
+    // Claude Code's TUI runs inside tmux: it needs a UTF-8 locale (C.UTF-8 ships with Debian) and a color TERM.
+    '      LANG: "C.UTF-8"',
+    '      LC_ALL: "C.UTF-8"',
+    '      TERM: "xterm-256color"',
     '      npm_config_cache: "/home/node/.cache/npm"',
     '      XDG_CACHE_HOME: "/home/node/.cache"',
     '    tmpfs:',

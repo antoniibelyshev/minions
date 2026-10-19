@@ -16,13 +16,14 @@ export function coordinatorSettings(cfg: MinionsConfig): Record<string, unknown>
   return {
     permissions: {
       allow: [...new Set(allow)],
-      deny: ['Bash(git push *)', 'Bash(git push)'], // v0.1 delivers locally only
+      // v0.1 delivers locally only; also cover global options before the subcommand (git -C x push).
+      deny: ['Bash(git push *)', 'Bash(git push)', 'Bash(git * push *)', 'Bash(git * push)'],
       disableBypassPermissionsMode: 'disable',
     },
   };
 }
 
-/** argv for `tmux new-session -A -s coordinator -c <repo> -- claude …` (no shell anywhere). */
+/** argv for `tmux -u new-session -A -s coordinator -c <repo> -- claude …` (no shell anywhere; -u forces UTF-8 for the TUI). */
 export async function buildCoordinatorCommand(cfg: MinionsConfig, paths: RuntimePaths = runtimePaths()): Promise<CoordinatorCommand> {
   if ((cfg.permissionMode as string) === 'bypassPermissions') {
     throw new MinionsError('POLICY_DENIED', 'permissionMode bypassPermissions is never allowed for the coordinator.');
@@ -36,7 +37,7 @@ export async function buildCoordinatorCommand(cfg: MinionsConfig, paths: Runtime
     cmd: 'tmux',
     cwd: paths.repo,
     args: [
-      'new-session', '-A', '-s', TMUX_SESSION, '-c', paths.repo, '--',
+      '-u', 'new-session', '-A', '-s', TMUX_SESSION, '-c', paths.repo, '--',
       'claude',
       '--plugin-dir', paths.pluginDir,
       '--append-system-prompt', prompt,

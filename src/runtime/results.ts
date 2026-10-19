@@ -61,7 +61,8 @@ function parseText(raw: string): { value?: unknown; error?: string } {
 
 /**
  * Validates a worker result (object or JSON text). With a role, also checks role rules:
- * only reviewers give a verdict; reviewer `complete` means `approve`, `needs_changes` means `request-changes`.
+ * only reviewers give a verdict; reviewer `complete` means `approve`, `needs_changes` means `request-changes`;
+ * a tester/reviewer `complete` may not report failing checks.
  */
 export function validateResult(raw: unknown, role?: LeaseRole): ValidationOutcome {
   let value = raw;
@@ -77,6 +78,10 @@ export function validateResult(raw: unknown, role?: LeaseRole): ValidationOutcom
   const res = r.data;
   const errors: string[] = [];
   if (role && role !== 'reviewer' && res.verdict !== undefined) errors.push(`verdict: only reviewer results carry a verdict (role ${role})`);
+  if ((role === 'tester' || role === 'reviewer') && res.status === 'complete') {
+    const failed = res.checks.filter((c) => c.outcome === 'fail').map((c) => c.command);
+    if (failed.length) errors.push(`checks: a complete ${role} result cannot report failing checks (${failed.join(', ')}); use needs_changes or blocked`);
+  }
   if (role === 'reviewer') {
     if (res.status === 'complete' && res.verdict !== 'approve') errors.push('verdict: a complete reviewer result must have verdict "approve"');
     if (res.status === 'needs_changes' && res.verdict === 'approve') errors.push('verdict: needs_changes cannot carry verdict "approve"');

@@ -5,7 +5,7 @@ import type { MinionsConfig } from '../config/schema.js';
 import { MinionsError } from '../core/errors.js';
 import type { Lease, LeaseRole, RuntimeDb } from './db.js';
 import { validateResult, type WorkerResult } from './results.js';
-import { BRANCH_PREFIX, branchFor, ensureBranchWorktree, ensureReviewWorktree, headOf, resolveBaseBranch, taskSlug, workspaceLayout, type WorkspaceLayout } from './worktree.js';
+import { BRANCH_PREFIX, branchFor, ensureBranchWorktree, ensureReviewWorktree, git, headOf, resolveBaseBranch, taskSlug, workspaceLayout, type WorkspaceLayout } from './worktree.js';
 
 export const LEASE_ROLES: readonly LeaseRole[] = ['engineer', 'tester', 'reviewer'];
 
@@ -264,6 +264,10 @@ export class Scheduler {
     });
   }
 
+  private async isAncestor(from: string, to: string): Promise<boolean> {
+    return (await git(this.layout.repo, ['merge-base', '--is-ancestor', from, to], true)).code === 0;
+  }
+
   private preClaimStatus(lease: Lease): TaskStatus | undefined {
     const ev = this.db.events(lease.task_id, 'claim').find((e) => (e.data as { leaseId?: string })?.leaseId === lease.id);
     return (ev?.data as { fromStatus?: TaskStatus } | undefined)?.fromStatus;
@@ -322,6 +326,10 @@ export class Scheduler {
       else if (result.headSha !== actualHead) errors.push(`stale head: result headSha ${result.headSha} but ${lease.branch} is at ${actualHead}`);
       else if (lease.role === 'reviewer' && lease.head_sha && lease.head_sha !== actualHead) {
         errors.push(`stale head: review started at ${lease.head_sha} but ${lease.branch} moved to ${actualHead}`);
+      } else if (lease.role === 'tester' && lease.head_sha && actualHead !== lease.head_sha &&
+        !(await this.isAncestor(lease.head_sha, actualHead))) {
+        // Testers may add commits on top of the head they were given, but must not rewrite it.
+        errors.push(`stale head: testing started at ${lease.head_sha} but ${lease.branch} at ${actualHead} no longer contains it`);
       }
     }
 

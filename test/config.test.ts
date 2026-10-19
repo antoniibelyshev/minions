@@ -65,6 +65,17 @@ describe('validation', () => {
     expect(e.message).toContain('execution.maxWorkers: unknown field');
   });
 
+  it('rejects model ids and base branches that could inject into frontmatter or git argv', () => {
+    const d = defaults();
+    for (const m of ['sonnet\ntools: Agent', 'opus # x']) {
+      expect(fail(() => validateConfig({ ...d, models: { ...d.models, default: m, allowed: [m] } })).message).toContain('models.');
+    }
+    for (const b of ['--upload-pack=x', 'a..b', 'main branch']) {
+      expect(fail(() => validateConfig({ ...d, git: { ...d.git, baseBranch: b } })).message).toContain('git.baseBranch');
+    }
+    expect(validateConfig({ ...d, models: { ...d.models, default: 'opus[1m]', allowed: ['opus[1m]'] } }).models.default).toBe('opus[1m]');
+  });
+
   it('rejects wrong types with dotted path', () => {
     const e = fail(() => resolve({ defaults: defaults(), local: { container: { cpus: 'four' } } }));
     expect(e.message).toContain('container.cpus');

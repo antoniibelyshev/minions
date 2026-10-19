@@ -1,14 +1,15 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { existsSync, mkdirSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { profileDefaults } from '../../src/config/profiles.js';
 import { MinionsError } from '../../src/core/errors.js';
 import { projectPaths, volumeNames } from '../../src/core/paths.js';
-import { composeMajor, discover, proposeVerification } from '../../src/host/discovery.js';
+import { composeMajor, discover, proposeVerification, sanitizeRemoteUrl } from '../../src/host/discovery.js';
 import { Compose, buildFingerprint, composeYaml, ensureImage, packageRoot } from '../../src/host/docker.js';
 import { nodeVersionOk } from '../../src/host/doctor.js';
 import type { ProjectJson } from '../../src/host/project.js';
-import { bindProject, resolveIdentity, type Registry } from '../../src/host/registry.js';
-import { secretLikePaths } from '../../src/host/transfer.js';
+import { bindProject, resolveIdentity, sharedProjectId, type Registry } from '../../src/host/registry.js';
+import { exportRepo, secretLikePaths } from '../../src/host/transfer.js';
 import { parsePorts, runWizard, type WizardIO } from '../../src/host/wizard.js';
 import { makeRepo, withHome } from './fixtures.js';
 
@@ -31,7 +32,7 @@ describe('compose generation', () => {
       'user: "1000:1000"', 'read_only: true', 'cap_drop: ["ALL"]', 'security_opt: ["no-new-privileges:true"]',
       'init: true', 'privileged: false', 'cpus: 4', 'mem_limit: "6144m"', 'pids_limit: 512',
       'command: ["sleep", "infinity"]', 'MINIONS_RUNTIME: "container"', 'CLAUDE_CONFIG_DIR: "/home/node/.claude"',
-      'MINIONS_CONFIG: "/opt/minions/config/config.json"', 'pull_policy: never',
+      'MINIONS_CONFIG: "/opt/minions/config/config.json"', 'pull_policy: never', 'LANG: "C.UTF-8"', 'TERM: "xterm-256color"',
       '- "/tmp:rw,nosuid,nodev,uid=1000,gid=1000,mode=1777"', '- "/home/node:rw,nosuid,nodev,uid=1000,gid=1000,mode=0755"',
     ]) expect(y, line).toContain(line);
     for (const bad of ['docker.sock', 'privileged: true', 'network_mode: host', 'network_mode: "host"', 'pid:', 'devices:', 'cap_add', 'ports:']) {
@@ -122,6 +123,20 @@ describe('registry identity', () => {
     expect(n.replacesSharedId).toBe(ID);
   });
 
+  it('ignores a shared projectId that is not a UUID (it becomes a host path segment)', async () => {
+    const env = withHome();
+    try {
+      const repo = makeRepo(env.root);
+      mkdirSync(join(repo, '.minions'));
+      for (const bad of ['../../../../tmp/evil', `${ID}/../x`, 42]) {
+        writeFileSync(join(repo, '.minions', 'config.json'), JSON.stringify({ projectId: bad }));
+        expect(await sharedProjectId(repo)).toBeUndefined();
+      }
+      writeFileSync(join(repo, '.minions', 'config.json'), JSON.stringify({ projectId: ID }));
+      expect(await sharedProjectId(repo)).toBe(ID);
+    } finally { env.cleanup(); }
+  });
+
   it('bindProject replaces older bindings of the same common dir', () => {
     const r = bindProject(reg({ old: entry('/r/.git'), [ID]: entry('/x/.git') }), 'new', entry('/r/.git'));
     expect(Object.keys(r.projects).sort()).toEqual([ID, 'new'].sort());
@@ -146,6 +161,15 @@ describe('discovery', () => {
   it('proposes commands per package manager and skips placeholder test scripts', () => {
     expect(proposeVerification({ test: 'echo "Error: no test specified" && exit 1' }, 'npm')).toEqual([]);
     expect(proposeVerification({ test: 'jest', typecheck: 'tsc' }, 'pnpm')).toEqual(['pnpm run typecheck', 'pnpm test']);
+  });
+
+  it('strips credentials embedded in the remote URL', () => {
+    expect(sanitizeRemoteUrl('https://x-access-token:ghp_secret@github.com/o/r.git')).toBe('https://github.com/o/r.git');
+    expect(sanitizeRemoteUrl('https://ghp_secret@github.com/o/r.git')).toBe('https://github.com/o/r.git');
+    expect(sanitizeRemoteUrl('ssh://git:pw@github.com/o/r.git')).toBe('ssh://git@github.com/o/r.git');
+    expect(sanitizeRemoteUrl('git@github.com:o/r.git')).toBe('git@github.com:o/r.git');
+    expect(sanitizeRemoteUrl('https://github.com/o/r.git')).toBe('https://github.com/o/r.git');
+    expect(sanitizeRemoteUrl(null)).toBeNull();
   });
 
   it('requires compose v2+', () => {
@@ -216,6 +240,24 @@ describe('transfer + doctor helpers', () => {
   it('flags tracked secret-looking files but not examples', () => {
     expect(secretLikePaths(['.env', 'app/.env.production', '.env.example', 'certs/server.pem', 'keys/id_rsa', 'keys/id_rsa.pub', 'src/index.ts', '.npmrc']))
       .toEqual(['.env', 'app/.env.production', 'certs/server.pem', 'keys/id_rsa', '.npmrc']);
+  });
+
+  it('export uses its own bundle name and refuses a copied file that is not a regular file', async () => {
+    const env = withHome();
+    try {
+      const repo = makeRepo(env.root);
+      const copies: string[][] = [];
+      const fake = {
+        // container output names a traversal path: it must be ignored
+        exec: async () => ({ code: 0, stderr: '', stdout: JSON.stringify({ ok: true, data: { path: '/state/exports/..', refs: ['refs/heads/main'] } }) }),
+        cp: async (src: string, dst: string) => { copies.push([src, dst]); symlinkSync(join(repo, '.git', 'config'), dst); },
+      } as unknown as Compose;
+      await expect(exportRepo({ ...project(), repoPath: repo }, { compose: fake, repoPath: repo })).rejects.toMatchObject({ code: 'PRECONDITION' });
+      expect(copies).toHaveLength(1);
+      expect(copies[0]![0]).toMatch(/^app:\/state\/exports\/export-[\w-]+\.bundle$/);
+      expect(copies[0]![1]).toBe(join(projectPaths(ID).exportsDir, copies[0]![0]!.split('/').pop()!));
+      expect(existsSync(copies[0]![1]!)).toBe(false);
+    } finally { env.cleanup(); }
   });
 
   it('node version check', () => {
