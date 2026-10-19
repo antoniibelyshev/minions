@@ -4,7 +4,7 @@ minions installs a small Claude Code development team into a Git project on your
 
 Everything the model controls runs inside one Docker container per project. Your Mac runs only a small, trusted `minions` CLI. That CLI installs the team, starts and stops the container, provisions the credentials you grant, and handles explicit import and export.
 
-> **Status:** version 0.1 (bootstrap) is installable from source. It implements the terminal workflow: `init`, `doctor`, `start`, `down`, `status`, `pause`, `resume`, `import`, `export`, `config show [--explain]`, `auth github`, `auth telegram`, and `uninstall` on the host; optional Telegram communication through the official Claude Code channel plugin (see [docs/design/telegram.md](docs/design/telegram.md); the notification outbox is not implemented yet); the Backlog.md backend; `local` delivery (commits on `agent/<slug>` branches, fetched to the host with `minions export`); and `branch` / `pull-request` delivery to GitHub (push `agent/<slug>`, open one PR; never merged). The rest of this README describes the intended version 1 behavior. Sections marked **(deferred in v0.1)** are not implemented yet, and `minions doctor` reports them as unavailable: GitHub Issues backend, auto-merge and merge requests, review publication, config plan/apply, backlog migration, upgrade, budgets, and companion containers. `minions auth github` stores a per-project fine-grained GitHub token on the host (see [docs/design/bootstrap.md](docs/design/bootstrap.md#github-credential)); the container uses it for branch/pull-request delivery. The v0.1 contract is [docs/design/bootstrap.md](docs/design/bootstrap.md); the full requirements are in [docs/spec.md](docs/spec.md).
+> **Status:** version 0.1 (bootstrap) is installable from source. It implements the terminal workflow: `setup` (guided, end to end), `init`, `doctor`, `start`, `down`, `status`, `pause`, `resume`, `import`, `export`, `config show [--explain]`, `auth github`, `auth telegram`, and `uninstall` on the host; optional Telegram communication through the official Claude Code channel plugin (see [docs/design/telegram.md](docs/design/telegram.md); the notification outbox is not implemented yet); the Backlog.md backend; `local` delivery (commits on `agent/<slug>` branches, fetched to the host with `minions export`); and `branch` / `pull-request` delivery to GitHub (push `agent/<slug>`, open one PR; never merged). The rest of this README describes the intended version 1 behavior. Sections marked **(deferred in v0.1)** are not implemented yet, and `minions doctor` reports them as unavailable: GitHub Issues backend, auto-merge and merge requests, review publication, config plan/apply, backlog migration, upgrade, budgets, and companion containers. `minions auth github` stores a per-project fine-grained GitHub token on the host (see [docs/design/bootstrap.md](docs/design/bootstrap.md#github-credential)); the container uses it for branch/pull-request delivery. The v0.1 contract is [docs/design/bootstrap.md](docs/design/bootstrap.md); the full requirements are in [docs/spec.md](docs/spec.md).
 
 ## Contents
 
@@ -72,21 +72,30 @@ Native macOS or iOS builds that need Xcode can't run in the Linux container. min
 ## Quickstart
 
 ```sh
-# Install the CLI from a source checkout (builds, packs, installs globally with npm, runs init)
-./install.sh path/to/repo
-# or manually: npm ci && npm run build && npm pack && npm install -g ./minions-<version>.tgz
-
-# Initialize a project: inspect, propose, apply, verify
-minions init path/to/repo
-minions init path/to/repo --dry-run --json   # preview without writing
-
-# Check tools, credentials, runtime features, policy, backend, and merge readiness
-minions doctor
-
-# Launch the coordinator in the project container and attach your terminal
-minions start                   # first run: log in with /login inside the coordinator session
-minions start --no-attach       # only start the container and import the repository
+minions setup path/to/repo
 ```
+
+That one command asks everything it needs and runs the whole setup. You don't need to know the individual commands. (From a source checkout, `./install.sh path/to/repo` builds and installs the CLI globally with npm, then runs `minions setup`.)
+
+`minions setup` walks through these steps in order. Optional integrations default to **no**, and core steps default to **yes**:
+
+1. **Project.** The `init` wizard covers the profile, shared or private installation, intake, verification commands, and container resources. It shows the plan and applies it after you confirm.
+2. **GitHub (optional).** *Set up GitHub integration?* If you say yes, it shows the fine-grained token permissions, reads the token without echo, and asks for the delivery mode (`local`, `branch`, or `pull-request`).
+3. **CI (optional).** *Use CI?* It detects workflows and the base branch's required status checks with read-only calls, then prints the external CI setup plan. It never writes workflow files or changes branch protection.
+4. **Auto-merge.** The question is shown but marked *not available yet*, and the default is no. Nothing is written.
+5. **Telegram (optional).** *Set up Telegram?* It gives BotFather guidance, reads the bot token without echo, and prints the pairing instructions.
+6. **Container.** It builds the image if needed, starts the container, imports the committed history of the base branch, configures `origin`, and launches the coordinator. Then it prints exactly how to attach (`minions start`), how to log in to Claude (`/login`), and how to pair Telegram (`/telegram:access pair <code>` in the coordinator terminal). Finally it offers to attach.
+
+If you decline a step, setup skips it and prints how to enable it later. Rerunning `minions setup` is safe. It detects the existing configuration, stored tokens, container, and imported repository, and offers to keep or change each one without duplicating anything. Integration choices that differ from the project configuration (`delivery.mode`, `communication.channel`) are recorded in the host-only `config.local.json`.
+
+```sh
+minions setup --dry-run                        # show what would happen; writes nothing, asks for no secrets
+minions setup --yes                            # non-interactive defaults: optional integrations off
+minions setup --yes --github-token-stdin --delivery pull-request < token-file   # tokens only via stdin, never argv
+minions doctor                                 # check readiness at any time
+```
+
+The individual commands (`init`, `auth github`, `auth telegram`, `start`, `import`) still work on their own. See the [CLI reference](#cli-reference).
 
 ### What `init` does
 
@@ -218,7 +227,7 @@ v0.1 supports `local`, `branch`, and `pull-request` delivery. `auto-when-eligibl
 
 **Branch and pull-request delivery (v0.1).** Set `delivery.provider` to `"github"` and `delivery.mode` to `"branch"` or `"pull-request"`. The init wizard offers these only when the repository has a GitHub remote and a token is stored (`minions auth github`); otherwise it keeps `local` and says why. When the reviewer approves, `minions work record` pushes exactly the approved commit to `agent/<slug>` on origin and, in `pull-request` mode, opens one PR against the base branch. The task becomes `delivered` with the PR URL recorded. If publication fails (network, credential, permission), the task is `blocked`, the local branch is kept, and `minions work publish <taskId>` retries; reruns reuse an existing remote branch or PR instead of duplicating it. If the change touches a sensitive path (or `git.push` / `pr.create` is `ask`), nothing is pushed until you approve that exact commit with `minions work approve <taskId> --head <sha>`. PR text comes only from the task title, objective, and acceptance criteria; private installations add nothing else.
 
-**CI awareness (v0.1, read-only).** `minions sync` refreshes the state and check results of every task's PR in one pass (no polling loop): it records the CI observation (`awaiting-ci`, `passing`, `failing`, or `no-checks`) against the PR head, adds a task note when it changes, marks merged PRs `done`, and marks PRs closed without merging `blocked`. `minions doctor` reports whether the base branch requires status checks (branch protection or rulesets) as `ci.requiredChecks`, compared with `delivery.requiredChecksConfigured`. A project without CI can still use local work and pull-request delivery, but not automatic merge. When CI or required checks are missing, `minions init`, `minions doctor`, and `minions ci status` print the manual setup steps. minions never creates workflows or changes branch protection.
+**CI awareness (v0.1, read-only).** `minions sync` refreshes the state and check results of every task's PR in one pass (no polling loop): it records the CI observation (`awaiting-ci`, `passing`, `failing`, or `no-checks`) against the PR head, adds a task note when it changes, marks merged PRs `done`, and marks PRs closed without merging `blocked`. `minions doctor` reports whether the base branch requires status checks (branch protection or rulesets) as `ci.requiredChecks`, compared with `delivery.requiredChecksConfigured`. A project without CI can still use local work and pull-request delivery, but not automatic merge. When CI or required checks are missing, `minions setup` (when you answer yes to *Use CI?*), `minions init`, `minions doctor`, and `minions ci status` print the manual setup steps. minions never creates workflows or changes branch protection.
 
 **Evidence is tied to commits.** Test results, the review verdict, local checks, and CI observations are recorded against a head SHA and a config revision. A new commit invalidates stale evidence.
 
@@ -409,6 +418,7 @@ There is no default production credential injection and no deployment authority.
 
 | Command | Purpose |
 | - | - |
+| `minions setup [path]` | Guided end-to-end setup: init wizard, GitHub token and delivery mode, CI guidance, auto-merge (not available yet), Telegram, container start, import, coordinator launch, attach and pairing instructions (`--yes`, `--dry-run`, `--delivery`, `--github-token-stdin`, `--telegram-token-stdin`, `--no-attach-coordinator`; `--config`, `--attach`, `--new-identity` as for `init`) |
 | `minions init [path]` | Inspect and initialize a project (`--private` / `--shared`, `--yes`, `--dry-run`) |
 | `minions doctor` | Check tools, Docker, image, container, Claude auth, backlog CLI, and deferred features |
 | `minions start` | Build the image if needed, start the container, import the repo, attach the coordinator (`--no-attach`) |

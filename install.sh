@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # One-command bootstrap for minions from a source checkout:
-#   ./install.sh [path-to-your-repo] [minions init options, e.g. --private --yes]
-# Builds the package, installs it GLOBALLY with npm (npm install -g), then runs `minions init`.
+#   ./install.sh [path-to-your-repo] [minions setup options, e.g. --private --yes]
+# Builds the package, installs it GLOBALLY with npm (npm install -g), then runs `minions setup`.
 # It does not edit shell rc files and does not download and execute remote scripts.
 set -euo pipefail
 
@@ -38,8 +38,8 @@ tgz="$(npm pack --silent | tail -n 1)"
 
 info "Installing $tgz globally with npm (npm install -g). Remove later with: npm uninstall -g minions"
 npm install -g --no-fund --no-audit "./$tgz"
-command -v minions >/dev/null 2>&1 || die "minions is not on PATH; add \"$(npm prefix -g)/bin\" to your PATH, then run: minions init \"$target\""
+command -v minions >/dev/null 2>&1 || die "minions is not on PATH; add \"$(npm prefix -g)/bin\" to your PATH, then run: minions setup \"$target\""
 
 cd - >/dev/null
-info "Running: minions init $target $*"
-exec minions init "$target" "$@"
+info "Running: minions setup $target $*"
+exec minions setup "$target" "$@"
