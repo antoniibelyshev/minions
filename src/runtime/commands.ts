@@ -1,5 +1,5 @@
 import { readFile } from 'node:fs/promises';
-import type { Command } from 'commander';
+import { Option, type Command } from 'commander';
 import { setIdempotencyStore, setReadyContext } from '../backlog/commands.js';
 import { openBacklog, writeBacklogConfig } from '../backlog/factory.js';
 import type { BacklogAdapter, IdempotencyStore } from '../backlog/types.js';
@@ -274,12 +274,15 @@ export function register(program: Command): void {
 
   // git credential helper (configured per repository by `workspace import` when a token is mounted).
   // Reads the mounted token at use time; answers only `get` for https://github.com; no JSON envelope.
+  // The hidden --token-file takes a file path only (tests point it away from the real mount); the
+  // token value itself is never accepted on argv or via the environment.
   program.command('git-credential <operation>', { hidden: true })
     .description('git credential helper for https://github.com backed by the mounted GitHub token')
-    .action(async (operation: string) => {
+    .addOption(new Option('--token-file <path>', 'read the token from this file instead of the mounted secret').hideHelp())
+    .action(async (operation: string, o: { tokenFile?: string }) => {
       const chunks: Buffer[] = [];
       if (!process.stdin.isTTY) for await (const c of process.stdin) chunks.push(c as Buffer);
-      const r = await gitCredential(operation, Buffer.concat(chunks).toString('utf8'));
+      const r = await gitCredential(operation, Buffer.concat(chunks).toString('utf8'), { tokenFile: o.tokenFile });
       if (r.stderr) process.stderr.write(r.stderr + '\n');
       if (r.stdout) process.stdout.write(r.stdout);
       process.exitCode = 0;

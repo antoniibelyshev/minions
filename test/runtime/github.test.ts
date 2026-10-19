@@ -351,15 +351,20 @@ describe('tester edge cases', () => {
     expect(normalizeGithubRemote('https://x-access-token:ghp_secret@github.com/o/r')).toBe('https://github.com/o/r.git');
   });
 
-  it('the CLI helper reads stdin, writes the token only to stdout, ignores store, and exits 0', () => {
-    const cli = resolve(fileURLToPath(new URL('../../dist/cli.js', import.meta.url)));
-    if (!existsSync(cli)) return;
-    const run = (op: string) => spawnSync(process.execPath, [cli, 'git-credential', op], { input: 'protocol=https\nhost=github.com\n\n', encoding: 'utf8', env: { ...process.env, MINIONS_MODE: 'container' } });
-    const store = run('store');
+  // Spawns the built CLI with an explicit --token-file so the real mounted token is never read.
+  const cli = resolve(fileURLToPath(new URL('../../dist/cli.js', import.meta.url)));
+  it.skipIf(!existsSync(cli))('the CLI helper reads stdin, writes the token only to stdout, ignores store, and exits 0 (needs dist/cli.js: npm run build)', () => {
+    const run = (op: string, file: string) => spawnSync(process.execPath, [cli, 'git-credential', op, '--token-file', file], { input: 'protocol=https\nhost=github.com\n\n', encoding: 'utf8', env: { ...process.env, MINIONS_MODE: 'container' } });
+    const file = tokenFile(TOKEN);
+    const store = run('store', file);
     expect(store.status).toBe(0);
     expect(store.stdout).toBe('');
-    const get = run('get');
+    const get = run('get', file);
     expect(get.status).toBe(0);
-    expect(get.stdout).not.toContain('password=');
+    expect(get.stdout).toBe(`username=x-access-token\npassword=${TOKEN}\n`);
+    expect(get.stderr).not.toContain(TOKEN);
+    const absent = run('get', join(tmp(), 'missing-token'));
+    expect(absent.status).toBe(0);
+    expect(absent.stdout).not.toContain('password=');
   });
 });
