@@ -9,7 +9,7 @@ reported as unavailable by `doctor` and the wizard, never faked.
 
 In:
 - Host CLI: `init [path]`, `doctor`, `start`, `down`, `status`, `pause`, `resume`,
-  `import`, `export`, `config show`, `auth github`, `uninstall`. All support `--json`; mutating ones `--dry-run`.
+  `import`, `export`, `config show`, `auth github`, `upgrade`, `uninstall`. All support `--json`; mutating ones `--dry-run`.
 - Runtime CLI (inside container): `backlog ready|list|show|create|update|note`,
   `work claim|record|release|list`, `hook stop|pre-agent`, `coordinator`, `status`, `pause`, `resume`.
 - Profiles `project-owner`, `personal-work`, `supervised`; shared + private visibility.
@@ -19,7 +19,7 @@ In:
 - Claude auth inside the container (interactive `/login`, persisted in the claude volume).
 
 Deferred (report as unavailable): GitHub Issues backend, auto-merge and merge requests,
-review publication, config plan/apply transactions, backlog migration, upgrade,
+review publication, config plan/apply transactions, backlog migration, upgrade plan and schema migration,
 budgets, companion containers.
 
 ## Recorded low-impact decisions
@@ -224,6 +224,33 @@ Decision record for `minions setup` (`src/host/setup.ts`).
   non-echoing prompt or stdin. They never come from argv and never appear in output, notes, or prompts.
   Setup cannot approve Telegram pairing; it prints the `/telegram:access` steps for the coordinator
   terminal.
+
+## Upgrade
+
+`minions upgrade` (host, `src/host/upgrade.ts`) moves a project onto the installed minions package
+without losing progress. The host drives the container through `docker compose exec`; lease and pause
+state stay in the runtime DB in the state volume. Reinstalling the CLI package is a separate step.
+
+- **Order.** Preflight (read-only) → `pause --starts` → drain → regenerate derived files → image →
+  materialize secrets → `compose up --force-recreate` → `workspace setup` → `importRepo` (refreshes
+  the clone, which is never re-cloned, and configures origin) → `resume --starts` → `coordinator restart --recover`.
+- **Drain.** Workers are Agent subagents of the coordinator's claude process, so draining means
+  waiting until their leases end (recorded or released by the coordinator) while no new stage can
+  start. The wait is up to `--timeout` seconds (default 1800). When it runs out, the default aborts:
+  starts are resumed and the container is left alone. With `--now` the remaining leases are released
+  and reported as `interrupted`, and the recovery prompt re-dispatches them. `--now` on its own means
+  no wait at all.
+- **Image.** The image is rebuilt only when its `minions.build` label differs from the package
+  fingerprint (`ensureImage`).
+- **Pause ownership.** Starts that the user paused before the upgrade stay paused. A pause made by an
+  upgrade is recorded in `projects/<id>/upgrade.json` until it is resumed, so a rerun after a failure
+  still resumes it.
+- **Resume before restart.** The recovery prompt dispatches only when starts are not paused.
+- **Failures.** A failure before the recreate resumes starts and changes nothing else. A failed
+  recreate keeps the volumes and points to a rerun. After the recreate, each remaining step is still
+  attempted and failures are reported (`ok: false`, exit code 1).
+- **Volumes.** The upgrade never runs `down -v` or volume commands. `--dry-run` only reads (compose
+  ps, image inspect, `minions status`) and lists every step.
 
 ## Telegram bot token
 

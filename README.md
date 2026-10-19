@@ -462,6 +462,7 @@ There is no default production credential injection and no deployment authority.
 | `minions doctor` | Check tools, Docker, image, container, Claude auth, backlog CLI, and deferred features |
 | `minions start` | Build the image if needed, start the container, import the repo, attach the coordinator (`--no-attach`) |
 | `minions down` | Stop and remove the project container; volumes are kept |
+| `minions upgrade [--timeout <s>] [--now] [--dry-run]` | Move the running container onto the installed minions: pause starts, wait for active workers (or release them with `--now`, reported as interrupted), rebuild the image only if the package changed, recreate the container with volumes kept, restart the coordinator with recovery, resume starts |
 | `minions status` | Queue, workers, pause state, config revision, delivery mode |
 | `minions sync [taskIds...]` | Refresh PR state and CI check results for tasks with a PR; reconcile merged/closed PRs (read-only on GitHub) |
 | `minions ci status` | Required status checks on the base branch and the external CI setup plan (read-only) |
@@ -475,14 +476,14 @@ There is no default production credential injection and no deployment authority.
 | `minions work approve <taskId> --head <sha>` | Record your approval to publish that exact commit (sensitive paths, or `ask` publication) |
 | `minions uninstall` | Remove owned files while keeping task data (`--delete-data` also deletes volumes) |
 
-Planned, **deferred in v0.1**: `minions stop`, `minions sync`, `minions config plan` / `apply`, `minions review publish`, `minions merge request`, `minions migrate backlog`, `minions upgrade`.
+Planned, **deferred in v0.1**: `minions stop`, `minions sync`, `minions config plan` / `apply`, `minions review publish`, `minions merge request`, `minions migrate backlog`, and the plan/migration parts of `minions upgrade`.
 
 Every command supports `--json`, and mutating commands support `--dry-run`. Exit code 0 means the requested operation completed; it does not mean a whole task passed. Errors use stable codes for auth required, conflict, policy denied, invalid configuration, incompatible runtime, and retryable network failure. Secrets and large task text go through stdin or restricted temporary files, never through process arguments.
 
 ## Recovery, upgrades, and uninstall
 
 - **Restart and recovery.** `minions start` reconciles sessions, branches, leases, and completed external actions before it retries anything, then attaches to or relaunches the coordinator. If a worker fails, its worktree and a recovery record are kept. minions never cleans up worktrees it doesn't own.
-- **Upgrades (deferred in v0.1).** `minions upgrade` produces a plan, backs up the config, migrates schemas deterministically, preserves your overrides, detects edits to managed files, marks running workers stale when behavior changes, and never turns on new authority.
+- **Upgrades.** In v0.1 `minions upgrade` moves the container onto the installed package without losing progress (see the command table; reinstalling the CLI itself is a separate step). Deferred in v0.1: it produces a plan, backs up the config, migrates schemas deterministically, preserves your overrides, detects edits to managed files, marks running workers stale when behavior changes, and never turns on new authority.
 - **Uninstall.** Removes only the files and owned blocks recorded in the manifest that are unchanged since minions generated them. Backlogs, decision records, worktrees with work, credentials, and Docker volumes are kept. Deleting data is a separate, explicit step. A private uninstall leaves the repository unchanged.
 - **Interrupted operations.** An interrupted install or upgrade can be recovered from its journal.
 
