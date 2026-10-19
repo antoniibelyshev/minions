@@ -204,6 +204,19 @@ describe('keychain store', () => {
     expect(readFileSync(projectPaths(ID).githubTokenFile, 'utf8')).toBe(TOKEN + '\n');
     for (const c of calls) expect(c.args.join(' ')).not.toContain(TOKEN);
   });
+
+  it('a store read failure keeps the last materialized copy (the running container keeps the token) and rethrows', async () => {
+    const repo = makeRepo(env.root);
+    const { runner } = fakeKeychain();
+    await C.provisionGithubToken({ projectId: ID, token: TOKEN, repoPath: repo, verify: false, runner, env: {}, platform: 'darwin' });
+    await C.materializeSecrets(ID, runner);
+    const locked = recorder(({ cmd }) => (cmd === 'security' ? { code: 51, stdout: '', stderr: 'locked' } : undefined)).runner;
+    await expect(C.materializeSecrets(ID, locked)).rejects.toMatchObject({ code: 'AUTH_REQUIRED' });
+    expect(readFileSync(projectPaths(ID).githubTokenFile, 'utf8')).toBe(TOKEN + '\n');
+    // A token that is really gone (removed from the store) still drops the copy.
+    await C.materializeSecrets(ID, fakeKeychain().runner);
+    expect(existsSync(projectPaths(ID).githubTokenFile)).toBe(false);
+  });
 });
 
 describe('container mount', () => {

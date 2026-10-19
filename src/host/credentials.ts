@@ -474,7 +474,8 @@ export type Materialized = Record<CredentialKind['name'], boolean>;
 /**
  * Ensures the mounted secrets directory exists (0700) and writes every provisioned token into it
  * (0600) via an atomic rename, removing stale copies of kinds that are not provisioned. A store read
- * failure for one kind removes its copy and is rethrown after the other kinds are handled.
+ * failure for one kind keeps its last materialized copy (the directory is bind-mounted into a possibly
+ * running container, which must not lose the token) and is rethrown after the other kinds are handled.
  */
 export async function materializeSecrets(projectId: string, runner: Runner = run): Promise<Materialized> {
   await privateDir(projectPaths(projectId).secretsDir);
@@ -482,8 +483,8 @@ export async function materializeSecrets(projectId: string, runner: Runner = run
   let failure: unknown;
   for (const kind of CREDENTIAL_KINDS) {
     const file = secretFile(projectId, kind);
-    let token: string | null = null;
-    try { token = await readToken(projectId, kind, runner); } catch (e) { failure ??= e; }
+    let token: string | null;
+    try { token = await readToken(projectId, kind, runner); } catch (e) { failure ??= e; continue; }
     if (!token) { await rm(file, { force: true }); continue; }
     await atomicWrite(file, token + '\n', { mode: 0o600 });
     out[kind.name] = true;
