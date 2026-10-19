@@ -280,6 +280,17 @@ export function spawnCli(cliPath: string, args: string[]): Promise<RunResult> {
 
 // ---------------------------------------------------------------- the phase
 
+/** Shows the commits the fast-forward brought in, which the CLI step is about to build and run on the host. */
+async function logRange(s: SyncResult, repo: string, runner: Runner, log: (m: string) => void): Promise<void> {
+  if (!s.from || !s.to) return;
+  log(`cli: the build includes the commits fetched from the container (${short(s.from)}..${short(s.to)}):`);
+  const r = await runner('git', [...HOST_GIT, 'log', '--oneline', '--no-decorate', '-n', '20', `${s.from}..${s.to}`], { cwd: repo, allowFailure: true, timeoutMs: 60_000 })
+    .catch(() => null);
+  const lines = r && r.code === 0 ? r.stdout.split('\n').filter(Boolean) : [];
+  for (const l of lines) log(`  ${l}`);
+  if (!lines.length) log(`  (see git log ${short(s.from)}..${short(s.to)})`);
+}
+
 export interface SourceStop { reason: string; command: string; rerun: string }
 
 export interface SourcePhase<C = unknown> {
@@ -335,26 +346,35 @@ export async function runSourcePhase<C>(opts: SourcePhaseOptions): Promise<Sourc
   }
   const check = () => checkCli({ checkout: opts.checkout!, runner: opts.runner, runningRoot: opts.runningRoot, handoff: opts.handoff });
   const c = out.cli = await check();
-  push(cliStep(c, dryRun));
-  if (!c.differs || dryRun) return out;
-  if (c.action === 'manual') {
-    out.stop = { reason: c.reason, command: c.command!, rerun: opts.rerun };
+  if (!c.differs || dryRun || c.action === 'manual') {
+    push(cliStep(c, dryRun));
+    if (c.differs && c.action === 'manual') {
+      if (dryRun) out.ok = false; // the real run would stop here
+      else out.stop = { reason: c.reason, command: c.command!, rerun: opts.rerun };
+    }
     return out;
   }
+  // Log in the order things happen: what is about to be built, the npm commands, then the result.
+  out.steps.push(cliStep(c, dryRun));
+  log(`cli: ${c.reason}; ${c.action === 'rebuild' ? 'rebuilding the linked checkout' : 'reinstalling from the checkout'} (${c.command})`);
+  if (out.sync?.applied && opts.sync && real(opts.sync.repo) === c.checkout) await logRange(out.sync, opts.sync.repo, opts.sync.runner ?? opts.runner ?? run, log);
   try {
     await applyCli(c, { runner: opts.runner, log });
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     out.steps[out.steps.length - 1] = { id: 'cli', status: 'failed', detail: `${c.reason}; ${c.action} failed: ${msg}` };
+    log(`cli: ${c.action} failed: ${msg}`);
     out.stop = { reason: `${c.action} failed: ${msg}`, command: c.command!, rerun: opts.rerun };
     return out;
   }
   const after = await check();
   if (after.differs || !after.installed.realPath) {
     out.steps[out.steps.length - 1] = { id: 'cli', status: 'failed', detail: `${c.action} finished but ${after.reason}` };
+    log(`cli: ${c.action} finished but ${after.reason}`);
     out.stop = { reason: `after the ${c.action}: ${after.reason}`, command: manualReinstallCommand(after.checkout, after.checkoutVersion), rerun: opts.rerun };
     return out;
   }
+  log(`cli: ${out.steps[out.steps.length - 1]!.detail}`);
   out.cli = { ...c, installed: after.installed };
   const cliPath = join(after.installed.realPath, 'dist', 'cli.js');
   log(`cli: continuing the upgrade on the new CLI (${cliPath})`);

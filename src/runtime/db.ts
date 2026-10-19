@@ -38,6 +38,8 @@ export interface PublicationRow {
 export interface ApprovalRow { id: number; task_id: string; scope: string; head_sha: string; approved_by: string | null; note: string | null; recorded_at: string }
 
 export interface GuardRow { fingerprint: string | null; count: number; last_reason: string | null; updated_at: string | null }
+/** The last `controls` event that set one pause flag: its event id, time and the value it set. */
+export interface PauseChange { id: number; at: string; value: boolean }
 
 const MIGRATIONS: Record<number, string> = {
   1: `
@@ -183,6 +185,19 @@ export class RuntimeDb {
       this.addEvent('controls', null, which);
     });
     return this.paused();
+  }
+
+  /** The last `controls` event that set intake or starts (lets `minions upgrade` tell its own pause from the user's). */
+  lastPauseChange(which: 'intake' | 'starts'): PauseChange | null {
+    for (const r of this.all<{ id: number; at: string; data_json: string | null }>("SELECT id, at, data_json FROM events WHERE kind = 'controls' ORDER BY id DESC")) {
+      let d: Record<string, unknown> | null = null;
+      try { d = r.data_json ? JSON.parse(r.data_json) as Record<string, unknown> : null; } catch { /* not a controls payload */ }
+      if (d && typeof d[which] === 'boolean') return { id: r.id, at: r.at, value: d[which] as boolean };
+    }
+    return null;
+  }
+  pauseChanges(): { intake: PauseChange | null; starts: PauseChange | null } {
+    return { intake: this.lastPauseChange('intake'), starts: this.lastPauseChange('starts') };
   }
 
   addEvent(kind: string, taskId: string | null, data?: unknown): number {

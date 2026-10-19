@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from 
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { sourceFingerprint } from '../../scripts/source-fingerprint.mjs';
-import type { RunOptions, RunResult } from '../../src/core/exec.js';
+import { run, type RunOptions, type RunResult } from '../../src/core/exec.js';
 import { MinionsError } from '../../src/core/errors.js';
 import { Compose } from '../../src/host/docker.js';
 import type { ExportResult } from '../../src/host/transfer.js';
@@ -405,6 +405,56 @@ describe('installed CLI check', () => {
     expect(mutatingNpm(w.calls)).toEqual([]);
   });
 
+  it('logs in order: what is built with the commits the fast-forward brought in, the npm commands, then the result', async () => {
+    // The project repo is a minions checkout with a linked global install; the container is one commit ahead.
+    const repo = makeRepo(home.root, 'minions-co');
+    mkdirSync(join(repo, 'src'), { recursive: true });
+    writeFileSync(join(repo, 'package.json'), JSON.stringify({ name: 'minions', version: '0.2.0' }));
+    writeFileSync(join(repo, 'src', 'cli.ts'), 'export {};\n');
+    writeFileSync(join(repo, '.git', 'info', 'exclude'), 'node_modules/\ndist/\n');
+    git(repo, 'add', '.');
+    git(repo, 'commit', '-q', '-m', 'checkout');
+    const base = git(repo, 'rev-parse', 'HEAD');
+    git(repo, 'checkout', '-q', '-b', 'tmp');
+    writeFileSync(join(repo, 'src', 'feature.ts'), 'export const f = 1;\n');
+    git(repo, 'add', '.');
+    git(repo, 'commit', '-q', '-m', 'agent work: add feature');
+    const ahead = git(repo, 'rev-parse', 'HEAD');
+    git(repo, 'checkout', '-q', 'main');
+    git(repo, 'update-ref', 'refs/remotes/minions/main', ahead);
+    git(repo, 'branch', '-q', '-D', 'tmp');
+    for (const d of ['esbuild', 'zod', 'commander']) { mkdirSync(join(repo, 'node_modules', d), { recursive: true }); writeFileSync(join(repo, 'node_modules', d, 'package.json'), '{}'); }
+    stampDist(repo, '0.2.0', 'old0000000000000', 'source');
+    symlinkSync(repo, join(g, 'minions'));
+    const w: NpmWorld = { globalRoot: g, checkout: repo, calls: [], lsResolved: `file:${repo}` };
+    const logs: string[] = [];
+    const exportRepo = async (): Promise<ExportResult> => ({ bundle: 'b', refs: ['refs/heads/main'], changes: [{ ref: 'refs/remotes/minions/main', from: base, to: ahead }] });
+    const p = await runSourcePhase<UpgradeResult>(phaseBase({
+      checkout: repo, runner: fakeNpm(w), log: (m) => logs.push(m),
+      sync: { repo, branch: 'main', baseBranch: 'main', exportRepo, runner: run },
+      spawnCli: async () => ({ code: 0, stdout: JSON.stringify({ ok: true, data: childResult() }), stderr: '' }),
+    }));
+    expect(p.cli?.action).toBe('rebuild');
+    const at = (re: RegExp) => logs.findIndex((l) => re.test(l));
+    expect(at(/^sync: fast-forwarded main/)).toBe(0);
+    expect(at(/^cli: .*; rebuilding the linked checkout/)).toBe(1);
+    expect(logs[2]).toMatch(new RegExp(`^cli: the build includes the commits fetched from the container \\(${base.slice(0, 12)}\\.\\.${ahead.slice(0, 12)}\\)`));
+    expect(logs[3]).toMatch(/^ {2}[0-9a-f]+ agent work: add feature$/);
+    expect(logs[4]).toMatch(/^cli: npm run build/);
+    expect(logs[5]).toMatch(/^cli: .*; rebuilt \(/);
+    expect(logs[6]).toMatch(/^cli: continuing the upgrade on the new CLI/);
+    expect(logs.filter((l) => l.startsWith('cli: ') && /rebuilt/.test(l))).toHaveLength(1);
+  });
+
+  it('dry run: a stop at the cli step makes the plan not ok', async () => {
+    const c = checkout();
+    realInstall(g, '0.1.0', null, 'source', { _resolved: 'git+ssh://git@github.com/antoniibelyshev/minions.git#abc' });
+    const p = await runSourcePhase(phaseBase({ dryRun: true, checkout: c, runner: fakeNpm({ globalRoot: g, checkout: c, calls: [] }) }));
+    expect(p.ok).toBe(false);
+    expect(p.stop).toBeNull();
+    expect(p.steps[0]).toMatchObject({ id: 'cli', status: 'planned', detail: expect.stringContaining('stop and print') });
+  });
+
   it('skips the check outside a minions checkout', async () => {
     expect(isMinionsCheckout(makeRepo(home.root, 'demo'))).toBe(false);
     expect(isMinionsCheckout(checkout())).toBe(true);
@@ -437,7 +487,8 @@ describe('runUpgrade with the source phase', () => {
     const r = await runUpgrade({ ...base, source: async () => ({ ok: true, steps: [{ id: 'sync', status: 'done', detail: 'ff' }, { id: 'cli', status: 'done', detail: 'reinstalled' }], sync: null, cli: null, stop: null, continued: childResult() }) });
     expect(docker).toEqual([]);
     expect(r.continued).toBe(true);
-    expect(r.steps.map((s) => `${s.id}:${s.status}`)).toEqual(['sync:done', 'cli:done', 'cli:skipped', 'preflight:done']);
+    // The continued CLI's own "matches" cli step is not repeated.
+    expect(r.steps.map((s) => `${s.id}:${s.status}`)).toEqual(['sync:done', 'cli:done', 'preflight:done']);
     expect(formatUpgrade(r)).toContain('newly installed CLI');
   });
 

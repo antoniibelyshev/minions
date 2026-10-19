@@ -14,7 +14,7 @@ import { readTelegramAccess } from '../telegram/access.js';
 import { installTelegramPlugin } from '../telegram/install.js';
 import { formatTelegramProbe, probeTelegram } from '../telegram/probe.js';
 import { buildClaudeCommand, buildCoordinatorCommand, launchCoordinator, probeRuntime, coordinatorWrapper, readLaunchRecord, restartCoordinator, RECOVERY_PROMPT, syncCoordinator } from './coordinator.js';
-import { openDb, type Lease, type LeaseRole, type RuntimeDb } from './db.js';
+import { openDb, type Lease, type PauseChange, type LeaseRole, type RuntimeDb } from './db.js';
 import { claimWithBrief, compactClaim, fetchBrief, recordSubmitted, submitResult, type CompactClaim } from './handoff.js';
 import { runHook } from './hooks.js';
 import { runtimePaths } from './paths.js';
@@ -75,6 +75,8 @@ const leaseLine = (l: Lease) => `${l.id}  ${l.task_id.padEnd(10)} ${l.role.padEn
 
 export interface StatusReport {
   paused: { intake: boolean; starts: boolean };
+  /** Last event that set each pause flag (event id + time); `minions upgrade` uses it to recognize its own pause. */
+  pauseChanges: { intake: PauseChange | null; starts: PauseChange | null };
   configRevision: number;
   profile: string;
   deliveryMode: string;
@@ -90,7 +92,7 @@ export async function collectStatus(deps: { db: RuntimeDb; config: MinionsConfig
   const { db: d, config: cfg } = deps;
   const leases = d.activeLeases();
   const report: StatusReport = {
-    paused: d.paused(), configRevision: cfg.configRevision, profile: cfg.profile, deliveryMode: cfg.delivery.mode,
+    paused: d.paused(), pauseChanges: d.pauseChanges(), configRevision: cfg.configRevision, profile: cfg.profile, deliveryMode: cfg.delivery.mode,
     queue: {}, capacity: null,
     activeLeases: leases.map((l) => ({ id: l.id, task_id: l.task_id, role: l.role, attempt: l.attempt, branch: l.branch, worktree: l.worktree, head_sha: l.head_sha, started_at: l.started_at })),
     guard: { lastReason: d.guard().last_reason, updatedAt: d.guard().updated_at },
@@ -371,7 +373,7 @@ export function register(program: Command): void {
       const both = !o.intake && !o.starts;
       const value = name === 'pause';
       const paused = getDb().setPaused({ intake: both || o.intake ? value : undefined, starts: both || o.starts ? value : undefined });
-      emit({ paused }, { json: globalOpts(cmd).json, human: (d) => `paused: intake=${d.paused.intake} starts=${d.paused.starts}` });
+      emit({ paused, pauseChanges: getDb().pauseChanges() }, { json: globalOpts(cmd).json, human: (d) => `paused: intake=${d.paused.intake} starts=${d.paused.starts}` });
     }));
   pauseLike('pause');
   pauseLike('resume');

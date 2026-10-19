@@ -20,7 +20,7 @@ import { projectForPath } from './registry.js';
 import { exportRepo, importRepo } from './transfer.js';
 import { formatUninstall, runUninstall } from './uninstall.js';
 import { DELIVERY_MODES, formatSetup, runSetup, shellQuote, type DeliveryMode, type SetupRuntime } from './setup.js';
-import { DEFAULT_UPGRADE_TIMEOUT_SEC, formatUpgrade, runUpgrade } from './upgrade.js';
+import { DEFAULT_UPGRADE_TIMEOUT_SEC, formatUpgrade, runUpgrade, upgradeTimeout } from './upgrade.js';
 import { HANDOFF_ENV, isMinionsCheckout, runSourcePhase } from './upgrade-source.js';
 import { readSecret, readlineIO } from './wizard.js';
 
@@ -245,13 +245,12 @@ export function register(program: Command): void {
     .description('Upgrade the project container to the installed minions (drains workers, keeps volumes)')
     .option('--timeout <seconds>', `wait this long for active workers (default ${DEFAULT_UPGRADE_TIMEOUT_SEC}; 0 with --now)`)
     .option('--now', 'release workers still active when the wait ends (reported as interrupted, re-dispatched after)')
-    .option('--from-container [branch]', 'first export the container branches and fast-forward <branch> (default: the base branch) to minions/<base>; strict fast-forward on a clean tree only')
+    .option('--from-container [branch]', 'first export the container branches and fast-forward <branch> (default: the base branch) to minions/<base>; strict fast-forward on a clean tree only. In a minions checkout the fetched code is then built and installed on the host')
     .option('--dry-run', 'list the steps without changing anything')
     .action(action(async (o: { timeout?: string; now?: boolean; fromContainer?: string | boolean }, cmd: Command) => {
       requireMode('host');
       const { json, dryRun } = globalOpts(cmd);
-      const timeoutSec = o.timeout === undefined ? (o.now ? 0 : DEFAULT_UPGRADE_TIMEOUT_SEC) : Number(o.timeout);
-      if (!Number.isInteger(timeoutSec) || timeoutSec < 0) throw new MinionsError('PRECONDITION', `--timeout must be a whole number of seconds (got ${o.timeout}).`);
+      const timeoutSec = upgradeTimeout(o.timeout, !!o.now);
       const ref = await projectForPath(process.cwd());
       const project = await loadProjectJson(ref.projectId);
       if (!dryRun) await requireDocker();
