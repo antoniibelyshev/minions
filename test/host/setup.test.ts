@@ -190,10 +190,41 @@ describe('minions setup', () => {
     expect(step(r, 'autoMerge').status).toBe('deferred');
     expect(r.localConfig.changed).toEqual([]);
     expect(existsSync(projectPaths(r.projectId).configLocalJson)).toBe(false);
-    expect(formatSetup(r)).toContain('later: Run `minions setup` again (or `minions auth github`)');
+    const rp = r.init.plan.repoPath;
+    expect(formatSetup(r)).toContain(`later: Run \`minions setup ${rp}\` again (or \`cd ${rp} && minions auth github\`)`);
     // Core steps default to yes.
     expect(rt.calls).toContain('start');
     expect(step(r, 'coordinator').status).toBe('done');
+  });
+
+  it('every printed command names the repository (shell-quoted), so it works from any directory', async () => {
+    const repo = makeRepo(env.root, "my repo's dir");
+    const r = await runSetup({ path: repo, yes: true, runtime: fakeRuntime().runtime, dockerProbe: dockerUp, tokens: { github: GH_TOKEN } });
+    const q = `'${r.init.plan.repoPath.replace(/'/g, `'\\''`)}'`;
+    expect(r.init.plan.repoPath).toContain("my repo's dir");
+    expect(r.ready).toBe(true);
+    expect(r.nextSteps[0]).toContain(`\`cd ${q} && minions start\``);
+    expect(r.nextSteps.at(-1)).toContain(`\`cd ${q} && minions doctor\``);
+    expect(r.nextSteps.at(-1)).toContain(`\`minions setup ${q}\``);
+    const out = formatSetup(r);
+    expect(out).toContain(`Attach: cd ${q} && minions start   (or: `);
+    // Every \`minions ...\` instruction is either \`minions setup <path>\` or prefixed with \`cd <path> &&\`.
+    for (const m of out.matchAll(/\`([^\`]*minions [^\`]*)\`/g)) {
+      expect(m[1]!.startsWith(`cd ${q} && `) || m[1] === `minions setup ${q}`, m[1]).toBe(true);
+    }
+    expect(step(r, 'telegram').later).toContain(`\`cd ${q} && minions auth telegram\``);
+    // The piped GitHub token cannot be used without a github.com origin; the summary says so.
+    expect(step(r, 'github').detail).toContain('the token piped with --github-token-stdin was not used');
+    expect(step(r, 'github').later).toContain(`\`minions setup ${q}\``);
+    expect(JSON.stringify(r) + out).not.toContain(GH_TOKEN);
+  });
+
+  it('declining the container step says how to start later from any directory', async () => {
+    const repo = makeRepo(env.root);
+    const r = await runSetup({ path: repo, yes: false, io: scripted({ 'Installation visibility': 'private', 'Build and start the container': 'n' }).io, runtime: fakeRuntime().runtime, dockerProbe: dockerUp });
+    const rp = r.init.plan.repoPath;
+    expect(step(r, 'container').later).toBe(`Run \`minions setup ${rp}\` again or \`cd ${rp} && minions start\` to start the container and attach the coordinator.`);
+    expect(r.nextSteps[0]).toBe(`Run \`cd ${rp} && minions start\` to start the container and attach the coordinator.`);
   });
 
   it('declining the container step leaves Docker untouched and says how to start later', async () => {

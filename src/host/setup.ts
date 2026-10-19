@@ -92,6 +92,8 @@ export interface SetupResult {
   /** The container is running and the coordinator was launched. */
   ready: boolean;
   attach: string | null;
+  /** `cd <repo> && minions start`: the attach command that works from any directory. */
+  attachStart?: string;
   pairing: string[];
   nextSteps: string[];
 }
@@ -127,13 +129,30 @@ export const PAIRING_STEPS = [
   '  3. Then lock access to the allowlist: /telegram:access policy allowlist (pair only yourself).',
 ];
 
-const LATER = {
-  github: 'Run `minions setup` again (or `minions auth github`) to store a GitHub token and choose branch or pull-request delivery.',
-  ci: 'Run `minions setup` again, `minions doctor` (ci.requiredChecks), or `minions ci status` to see the CI setup plan.',
-  autoMerge: 'Auto-merge is not available yet; minions never merges.',
-  telegram: 'Run `minions setup` again (or `minions auth telegram`) to connect a Telegram bot.',
-  container: 'Run `minions setup` again or `minions start` to start the container and attach the coordinator.',
-};
+/** POSIX shell quoting: plain paths stay as they are, anything else is single-quoted. */
+export function shellQuote(s: string): string {
+  return /^[\w@%+=:,./-]+$/.test(s) ? s : `'${s.replace(/'/g, `'\\''`)}'`;
+}
+
+/**
+ * Commands printed by setup that work from any directory: `minions setup <repo>` takes the path; the
+ * other commands resolve the project from the working directory, so they get a `cd <repo> &&` prefix.
+ */
+export function setupCommands(repoPath: string) {
+  const q = shellQuote(repoPath);
+  const setup = `\`minions setup ${q}\``;
+  const inRepo = (c: string) => `\`cd ${q} && ${c}\``;
+  return {
+    setup, inRepo,
+    later: {
+      github: `Run ${setup} again (or ${inRepo('minions auth github')}) to store a GitHub token and choose branch or pull-request delivery.`,
+      ci: `Run ${setup} again, ${inRepo('minions doctor')} (ci.requiredChecks), or ${inRepo('minions ci status')} to see the CI setup plan.`,
+      autoMerge: 'Auto-merge is not available yet; minions never merges.',
+      telegram: `Run ${setup} again (or ${inRepo('minions auth telegram')}) to connect a Telegram bot.`,
+      container: `Run ${setup} again or ${inRepo('minions start')} to start the container and attach the coordinator.`,
+    },
+  };
+}
 
 /** Registered project id for the repository containing `path`, or null. */
 async function registeredProject(path: string): Promise<string | null> {
@@ -184,10 +203,13 @@ export async function runSetup(opts: SetupOptions): Promise<SetupResult> {
       : `project ${projectId} (${init.plan.visibility}, profile ${init.plan.profile}); ${written} file(s) written, ${init.applied?.unchanged ?? 0} unchanged` });
 
   const git = init.plan.discovery.git;
+  const cmds = setupCommands(init.plan.repoPath);
+  const LATER = cmds.later;
   const refs = await loadCredentialRefs(projectId).catch((): CredentialsJson => ({ version: 1 }));
   const localPath = projectPaths(projectId).configLocalJson;
 
   if (opts.dryRun) return dryRunResult(opts, init, steps, refs, priorId !== null, localPath);
+  const unused = (name: string) => `; the token piped with --${name}-token-stdin was not used (nothing was stored)`;
 
   const project = await loadProjectJson(projectId);
   let config: MinionsConfig = (await loadEffectiveConfig(project)).config;
@@ -208,7 +230,7 @@ export async function runSetup(opts: SetupOptions): Promise<SetupResult> {
   let hasToken = !!refs.github;
   if (interactive) say('\n== GitHub ==');
   if (!git.hasGitHub) {
-    step({ id: 'github', status: 'skipped', detail: 'the repository has no github.com origin; local delivery only', later: 'Add a github.com origin, then run `minions setup` again.' });
+    step({ id: 'github', status: 'skipped', detail: `the repository has no github.com origin; local delivery only${opts.tokens?.github ? unused('github') : ''}`, later: `Add a github.com origin, then run ${cmds.setup} again.` });
   } else {
     type GhAction = 'keep' | 'change' | 'remove' | 'setup' | 'skip';
     let action: GhAction;
@@ -291,7 +313,7 @@ export async function runSetup(opts: SetupOptions): Promise<SetupResult> {
   let channel = config.communication.channel;
   const tg = refs.telegram;
   if (config.container.network === 'none') {
-    step({ id: 'telegram', status: 'skipped', detail: 'container.network is none; the Telegram plugin needs api.telegram.org and the npm registry', later: LATER.telegram });
+    step({ id: 'telegram', status: 'skipped', detail: `container.network is none; the Telegram plugin needs api.telegram.org and the npm registry${opts.tokens?.telegram ? unused('telegram') : ''}`, later: LATER.telegram });
   } else {
     type TgAction = 'keep' | 'change' | 'disable' | 'setup' | 'reuse' | 'skip';
     let action: TgAction;
@@ -371,7 +393,7 @@ export async function runSetup(opts: SetupOptions): Promise<SetupResult> {
 
       const c = await opts.runtime.launchCoordinator(projectId);
       step(c ? { id: 'coordinator', status: c.action === 'started' ? 'done' : 'kept', detail: `coordinator ${c.action ?? 'running'}${c.reason ? ` (${c.reason})` : ''}` }
-        : { id: 'coordinator', status: 'failed', detail: 'coordinator sync failed (see the warning above)', later: 'Run `minions start` to launch and attach it.' });
+        : { id: 'coordinator', status: 'failed', detail: 'coordinator sync failed (see the warning above)', later: `Run ${cmds.inRepo('minions start')} to launch and attach it.` });
       ready = !!c;
     } catch (e) {
       const at: StepId = !steps.some((s) => s.id === 'container') ? 'container' : !steps.some((s) => s.id === 'import') ? 'import' : 'coordinator';
@@ -383,13 +405,13 @@ export async function runSetup(opts: SetupOptions): Promise<SetupResult> {
   const attach = start ? opts.runtime.attachCommand(projectId) : null;
   return {
     dryRun: false, projectId, rerun: priorId !== null, init, steps, localConfig: { path: localPath, changed }, ready,
-    attach, pairing: telegramOn ? PAIRING_STEPS : [],
+    attach, attachStart: `cd ${shellQuote(init.plan.repoPath)} && minions start`, pairing: telegramOn ? PAIRING_STEPS : [],
     nextSteps: [
-      ready ? 'Attach to the coordinator: `minions start` (or the command below); detach with Ctrl-b d, it keeps running.'
-        : 'Run `minions start` to start the container and attach the coordinator.',
+      ready ? `Attach to the coordinator: ${cmds.inRepo('minions start')} (or the command below); detach with Ctrl-b d, it keeps running.`
+        : `Run ${cmds.inRepo('minions start')} to start the container and attach the coordinator.`,
       'First time only: log in to Claude inside the coordinator session with /login (your host login is not reused).',
       ...(telegramOn ? PAIRING_STEPS : []),
-      'Run `minions doctor` to check readiness at any time; rerun `minions setup` to keep or change any of these choices.',
+      `Run ${cmds.inRepo('minions doctor')} to check readiness at any time; rerun ${cmds.setup} to keep or change any of these choices.`,
     ],
   };
 }
@@ -460,7 +482,7 @@ export function formatSetup(r: SetupResult): string {
     if (s.later && (s.status === 'skipped' || s.status === 'failed')) L.push(`              later: ${s.later}`);
   }
   if (r.localConfig.changed.length) L.push('', `Recorded in ${r.localConfig.path}: ${r.localConfig.changed.join(', ')}`);
-  if (r.attach) L.push('', `Attach: minions start   (or: ${r.attach})`);
+  if (r.attach) L.push('', `Attach: ${r.attachStart ?? 'minions start'}   (or: ${r.attach})`);
   L.push('', 'Next steps:', ...r.nextSteps.map((s) => `  ${s}`));
   return L.join('\n');
 }

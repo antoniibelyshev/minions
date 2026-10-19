@@ -19,7 +19,7 @@ import { loadEffectiveConfig, loadProjectJson } from './project.js';
 import { projectForPath } from './registry.js';
 import { exportRepo, importRepo } from './transfer.js';
 import { formatUninstall, runUninstall } from './uninstall.js';
-import { DELIVERY_MODES, formatSetup, runSetup, type DeliveryMode, type SetupRuntime } from './setup.js';
+import { DELIVERY_MODES, formatSetup, runSetup, shellQuote, type DeliveryMode, type SetupRuntime } from './setup.js';
 import { readSecret, readlineIO } from './wizard.js';
 
 const say = (json: boolean, msg: string) => { if (!json) process.stderr.write(msg + '\n'); };
@@ -99,7 +99,7 @@ function setupRuntime(json: boolean, cwd: string): SetupRuntime {
       // Started detached so it runs (and Telegram works) with nobody attached; attaching comes after.
       return (await telegramStartup(json, p.compose, p.config, { startDetached: true })) as { action?: string; reason?: string } | null;
     },
-    attachCommand: (projectId) => { const c = new Compose(projectId); return `docker compose -p ${c.name} -f ${c.file} exec app minions coordinator`; },
+    attachCommand: (projectId) => { const c = new Compose(projectId); return `docker compose -p ${c.name} -f ${shellQuote(c.file)} exec app minions coordinator`; },
   };
 }
 
