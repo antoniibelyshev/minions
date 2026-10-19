@@ -234,9 +234,15 @@ export async function runWizard(input: WizardInput): Promise<WizardResult> {
       cfg.delivery.provider = cfg.delivery.mode === 'local' ? cfg.delivery.provider : 'github';
     }
     // 6. Communication. Terminal is always available; Telegram is optional and degrades to terminal.
-    io.info('Communication: terminal (always available), or Telegram through the official Claude Code channel plugin (research preview).');
-    let channel = await ask('communication.channel', 'Communication channel (terminal/telegram)', cfg.communication.channel, choice(['terminal', 'telegram'] as const));
-    if (channel === 'telegram') {
+    io.info('Communication: auto (default: Telegram when a bot token is stored for this project with `minions auth telegram`, otherwise terminal),');
+    io.info('  terminal (always available), or telegram (explicit; warns when it cannot start). Telegram uses the official Claude Code channel plugin (research preview).');
+    if (input.runtime === 'host') io.info('  The host runtime has no Telegram (no user plugins or MCP servers): auto means terminal there.');
+    let channel = await ask('communication.channel', 'Communication channel (auto/terminal/telegram)', cfg.communication.channel, choice(['auto', 'terminal', 'telegram'] as const));
+    if (channel === 'auto') {
+      io.info(cfg.container.network === 'none'
+        ? '  container.network is none, so auto means terminal (the Telegram plugin needs api.telegram.org and the npm registry).'
+        : '  To use Telegram later: create a bot with BotFather, run `minions auth telegram`, then `minions down && minions start`.');
+    } else if (channel === 'telegram') {
       for (const l of telegramBotGuidance()) io.info(`  ${l}`);
       if (cfg.container.network === 'none') {
         const why = 'Telegram is unavailable: container.network is none, and the plugin needs api.telegram.org and the npm registry. Using terminal.';

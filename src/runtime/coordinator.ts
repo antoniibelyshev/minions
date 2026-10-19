@@ -12,6 +12,7 @@ import { runtimeMode } from '../core/cli-helpers.js';
 import { CONTAINER, credentialStoreDir } from '../core/paths.js';
 import { probeTelegram, TELEGRAM_CHANNEL_SPEC, type TelegramProbeReport } from '../telegram/probe.js';
 import { checkTelegramTokenFormat } from '../telegram/token.js';
+import { HOST_TELEGRAM_REASON, resolveChannel, type ChannelFacts } from '../telegram/channel.js';
 import { runtimePaths, type RuntimePaths } from './paths.js';
 
 export const TMUX_SESSION = 'coordinator';
@@ -366,21 +367,24 @@ export async function readMountedToken(file: string, readText: (p: string) => Pr
 
 export interface TelegramDecision { enabled: boolean; reason: string }
 
-/** Whether this coordinator launch gets --channels and the token. Every "no" carries a precise reason. */
-export const HOST_TELEGRAM_REASON = 'the host runtime starts Claude Code without user settings, plugins installed there, or MCP servers (--setting-sources=, --strict-mcp-config), so the Telegram channel plugin is unavailable; use the Docker runtime for Telegram';
+export { HOST_TELEGRAM_REASON };
 
+/** Channel facts inside the runtime: the mounted token, the runtime kind, the network, and the probe (when run). */
+export function runtimeChannelFacts(cfg: MinionsConfig, token: MountedToken, probe: TelegramProbeReport | null | undefined, hostRuntime = runtimeMode() === 'host-runtime'): ChannelFacts {
+  return {
+    token: token.state, ...(token.state === 'invalid' ? { tokenDetail: `mounted but ${token.detail}` } : {}),
+    runtime: hostRuntime ? 'host' : 'docker', network: cfg.container.network, probe,
+  };
+}
+
+/**
+ * Whether this coordinator launch gets --channels and the token (communication.channel resolved by
+ * resolveChannel, src/telegram/channel.ts). Every "no" carries a precise reason.
+ */
 export function decideTelegram(cfg: MinionsConfig, token: MountedToken, probe: TelegramProbeReport | null, hostRuntime = runtimeMode() === 'host-runtime'): TelegramDecision {
-  if (cfg.communication.channel !== 'telegram') return { enabled: false, reason: 'communication.channel is terminal' };
-  if (hostRuntime) return { enabled: false, reason: HOST_TELEGRAM_REASON };
-  if (cfg.container.network === 'none') return { enabled: false, reason: 'container.network is none; the Telegram plugin needs api.telegram.org and the npm registry' };
-  if (token.state === 'missing') return { enabled: false, reason: 'Telegram bot token is not provisioned; run `minions auth telegram` on the host' };
-  if (token.state === 'invalid') return { enabled: false, reason: `the mounted Telegram bot token is ${token.detail}; run \`minions auth telegram\` on the host` };
-  if (!probe) return { enabled: false, reason: 'the Telegram capability probe did not run' };
-  if (!probe.available) {
-    const hint = probe.items.find((i) => i.status !== 'ok' && i.status !== 'unknown' && i.hint)?.hint;
-    return { enabled: false, reason: `${probe.summary}${hint ? ` (${hint})` : ''}` };
-  }
-  return { enabled: true, reason: `Telegram enabled: ${TELEGRAM_CHANNEL_SPEC}` };
+  const r = resolveChannel(cfg.communication.channel, runtimeChannelFacts(cfg, token, probe, hostRuntime));
+  if (r.effective === 'telegram') return { enabled: true, reason: `Telegram enabled${r.configured === 'auto' ? ' (communication.channel auto: bot token stored)' : ''}: ${TELEGRAM_CHANNEL_SPEC}` };
+  return { enabled: false, reason: r.reason };
 }
 
 /**
@@ -433,14 +437,17 @@ export interface RunCoordinatorDeps {
 export async function runCoordinator(cfg: MinionsConfig, deps: RunCoordinatorDeps = {}): Promise<number> {
   const paths = deps.paths ?? runtimePaths();
   const log = deps.log ?? ((l: string) => process.stderr.write(l + '\n'));
-  const wantsTelegram = cfg.communication.channel === 'telegram';
   const token = await readMountedToken(paths.telegramTokenFile, deps.readText);
   let probe: TelegramProbeReport | null = null;
-  if (wantsTelegram && cfg.container.network !== 'none' && token.state === 'ok' && runtimeMode() !== 'host-runtime') {
+  if (cfg.communication.channel !== 'terminal' && cfg.container.network !== 'none' && token.state === 'ok' && runtimeMode() !== 'host-runtime') {
     try { probe = await (deps.probe ?? (() => probeTelegram()))(); } catch { probe = null; }
   }
   const decision = decideTelegram(cfg, token, probe);
-  if (wantsTelegram) log(decision.enabled ? `minions: ${decision.reason}` : `minions: Telegram disabled for this session: ${decision.reason}. Terminal mode is active.`);
+  // Intended Telegram (telegram, or auto with a token) says why it is off; auto without a token is plain terminal mode.
+  const intended = resolveChannel(cfg.communication.channel, runtimeChannelFacts(cfg, token, probe)).wantsTelegram;
+  if (decision.enabled) log(`minions: ${decision.reason}`);
+  else if (intended) log(`minions: Telegram disabled for this session: ${decision.reason}. Terminal mode is active.`);
+  else if (cfg.communication.channel === 'auto') log(`minions: terminal mode (${decision.reason}).`);
   const c = await buildClaudeCommand(cfg, paths, { telegram: decision.enabled });
   const env: NodeJS.ProcessEnv = { ...(deps.env ?? process.env) };
   delete env[TELEGRAM_TOKEN_ENV];

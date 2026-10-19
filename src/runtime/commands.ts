@@ -13,7 +13,10 @@ import { delegateToRuntime } from '../host/delegate.js';
 import { readTelegramAccess } from '../telegram/access.js';
 import { installTelegramPlugin } from '../telegram/install.js';
 import { formatTelegramProbe, probeTelegram } from '../telegram/probe.js';
-import { buildClaudeCommand, buildCoordinatorCommand, launchCoordinator, probeRuntime, readLaunchRecord, runCoordinator, syncCoordinator } from './coordinator.js';
+import { resolveChannel } from '../telegram/channel.js';
+import {
+  buildClaudeCommand, buildCoordinatorCommand, launchCoordinator, probeRuntime, readLaunchRecord, readMountedToken, runCoordinator, runtimeChannelFacts, syncCoordinator,
+} from './coordinator.js';
 import { openDb, type Lease, type LeaseRole, type RuntimeDb } from './db.js';
 import { runHook } from './hooks.js';
 import { runtimePaths } from './paths.js';
@@ -75,10 +78,35 @@ export interface StatusReport {
   capacity: { activeTasks: number; maxActiveTasks: number; activeEngineers: number; maxEngineers: number } | null;
   guard: { lastReason: string | null; updatedAt: string | null };
   coordinatorLock: unknown;
+  /** communication.channel: configured vs effective (running coordinator's launch decision, else predicted). */
+  channel?: ChannelStatus;
   backlogError?: string;
 }
 
-export async function collectStatus(deps: { db: RuntimeDb; config: MinionsConfig; backlog: () => Promise<BacklogAdapter> }): Promise<StatusReport> {
+export interface ChannelStatus {
+  configured: MinionsConfig['communication']['channel'];
+  effective: 'terminal' | 'telegram';
+  reason: string;
+  /** launch: decided by the running coordinator; predicted: no launch recorded (the probe runs at launch). */
+  source: 'launch' | 'predicted';
+  /** The running coordinator was launched with another channel setting: `minions down && minions start`. */
+  restartRequired?: boolean;
+}
+
+/** Channel status inside the runtime: the launch record when the coordinator ran, else a prediction from the mounted token. */
+export async function runtimeChannelStatus(cfg: MinionsConfig, paths = runtimePaths()): Promise<ChannelStatus> {
+  const rec = await readLaunchRecord(paths);
+  if (rec) {
+    return {
+      configured: cfg.communication.channel, effective: rec.telegram.enabled ? 'telegram' : 'terminal', reason: rec.telegram.reason, source: 'launch',
+      ...(rec.channel !== cfg.communication.channel ? { restartRequired: true } : {}),
+    };
+  }
+  const r = resolveChannel(cfg.communication.channel, runtimeChannelFacts(cfg, await readMountedToken(paths.telegramTokenFile), undefined));
+  return { configured: r.configured, effective: r.effective, reason: r.reason, source: 'predicted' };
+}
+
+export async function collectStatus(deps: { db: RuntimeDb; config: MinionsConfig; backlog: () => Promise<BacklogAdapter>; channel?: () => Promise<ChannelStatus> }): Promise<StatusReport> {
   const { db: d, config: cfg } = deps;
   const leases = d.activeLeases();
   const report: StatusReport = {
@@ -88,6 +116,7 @@ export async function collectStatus(deps: { db: RuntimeDb; config: MinionsConfig
     guard: { lastReason: d.guard().last_reason, updatedAt: d.guard().updated_at },
     coordinatorLock: d.coordinatorLock() ?? null,
   };
+  if (deps.channel) report.channel = await deps.channel().catch(() => undefined);
   try {
     const tasks = await (await deps.backlog()).listTasks();
     for (const t of tasks) report.queue[t.status] = (report.queue[t.status] ?? 0) + 1;
@@ -103,6 +132,7 @@ function humanStatus(s: StatusReport): string {
   const out = [
     `config revision ${s.configRevision}  profile ${s.profile}  delivery ${s.deliveryMode}`,
     `paused: intake=${s.paused.intake} starts=${s.paused.starts}`,
+    ...(s.channel ? [`channel: configured ${s.channel.configured}, effective ${s.channel.effective} (${s.channel.source === 'launch' ? 'running coordinator' : 'predicted'}: ${s.channel.reason})${s.channel.restartRequired ? '; restart required: `minions down && minions start`' : ''}`] : []),
     s.capacity ? `capacity: ${s.capacity.activeTasks}/${s.capacity.maxActiveTasks} tasks, ${s.capacity.activeEngineers}/${s.capacity.maxEngineers} engineers` : 'capacity: unknown',
     `queue: ${Object.entries(s.queue).map(([k, v]) => `${k}=${v}`).join(' ') || '(empty)'}`,
     `stop guard: ${s.guard.lastReason ?? '-'}`,
@@ -202,7 +232,7 @@ export function register(program: Command): void {
         return;
       }
       if (o.printCommand) {
-        const r = { tmux: await buildCoordinatorCommand(cfg), claude: await buildClaudeCommand(cfg, runtimePaths(), { telegram: cfg.communication.channel === 'telegram' }) };
+        const r = { tmux: await buildCoordinatorCommand(cfg), claude: await buildClaudeCommand(cfg, runtimePaths(), { telegram: cfg.communication.channel !== 'terminal' }) };
         emit(r, { json: globalOpts(cmd).json, human: (d: typeof r) => [JSON.stringify([d.tmux.cmd, ...d.tmux.args]), JSON.stringify([d.claude.cmd, ...d.claude.args])].join('\n') });
         return;
       }
@@ -294,10 +324,11 @@ export function register(program: Command): void {
     }));
 
   // status / pause / resume (host mode delegates to the container)
-  program.command('status').description('Show queue, workers, pause state, config revision and delivery mode')
+  program.command('status').description('Show queue, workers, pause state, config revision, delivery mode and channel (configured vs effective)')
     .action(action(async (_o: unknown, cmd: Command) => {
       if (runtimeMode() === 'host') return delegate(cmd);
-      const r = await collectStatus({ db: getDb(), config: await getConfig(), backlog: getBacklog });
+      const cfg = await getConfig();
+      const r = await collectStatus({ db: getDb(), config: cfg, backlog: getBacklog, channel: () => runtimeChannelStatus(cfg) });
       emit(r, { json: globalOpts(cmd).json, human: humanStatus });
     }));
   const pauseLike = (name: 'pause' | 'resume') => program.command(name)

@@ -57,7 +57,7 @@ const abs = (p: string) => `/${p.startsWith('/') ? p : `/${p}`}`;
 /** Commands the assistant must never run itself (the user runs them with `! ...`). */
 export const ASSISTANT_DENIED_COMMANDS = [
   'Bash(minions runtime set*)', 'Bash(minions auth set*)', 'Bash(minions auth github*)', 'Bash(minions auth telegram*)', 'Bash(minions auth refresh*)',
-  'Bash(minions setup github*)', 'Bash(minions start*)', 'Bash(minions uninstall*)',
+  'Bash(minions setup github*)', 'Bash(minions channel set*)', 'Bash(minions start*)', 'Bash(minions uninstall*)',
   'Bash(security *)', 'Bash(gh auth token*)', 'Bash(cat *secrets*)', 'Bash(cat *credentials*)',
   'Bash(git push*)', 'Bash(open *)',
 ] as const;

@@ -9,12 +9,15 @@ reported as unavailable by `doctor` and the wizard, never faked.
 
 In:
 - Host CLI: `init [path]`, `doctor`, `start`, `down`, `status`, `pause`, `resume`,
-  `import`, `export`, `config show`, `auth show|set|refresh`, `auth github`, `auth telegram`, `runtime show|set`, `setup github`, `uninstall`. All support `--json`; mutating ones `--dry-run`.
+  `import`, `export`, `config show`, `auth show|set|refresh`, `auth github`, `auth telegram`, `channel show|set`, `runtime show|set`, `setup github`, `uninstall`. All support `--json`; mutating ones `--dry-run`.
 - Runtime CLI (inside container): `backlog ready|list|show|create|update|note`,
   `work claim|record|release|list`, `hook stop|pre-agent`, `coordinator`, `status`, `pause`, `resume`.
 - Profiles `project-owner`, `personal-work`, `supervised`; shared + private visibility.
 - Backlog.md backend only. Delivery modes `local` (default; commits on `agent/<slug>` branches in the container clone, fetched to host with `minions export`), and, for the github provider, `branch` and `pull-request` (see "Branch and pull-request delivery"). minions never merges.
 - Terminal communication, plus optional Telegram through the official channel plugin (see [telegram.md](telegram.md)).
+  `communication.channel` is `terminal`, `telegram`, or `auto` (profile default: Telegram when a bot token is stored
+  and the runtime is docker, else terminal); resolved by `resolveChannel` (`src/telegram/channel.ts`), switched with
+  `minions channel set` (see "Communication channel").
 - One Docker container per project, security baseline from spec §3A. Opt-in, less safe host runtime
   without Docker (see "Host runtime").
 - Claude auth inside the container (interactive `/login`, persisted in the claude volume) by default, or
@@ -343,6 +346,8 @@ Decision record for running agents without Docker (`src/host/runtime.ts`, `src/h
 A second credential kind on the same mechanism (`CredentialKind` in `src/host/credentials.ts`;
 stores, reference file, and secrets mount are shared, not duplicated). Full design: [telegram.md](telegram.md).
 
+- **Channel.** After storing, `auth telegram` offers (interactive, default yes) to switch an explicit `terminal`
+  channel to `auto`; non-interactive runs print `minions channel set auto` instead.
 - **Entry.** `minions auth telegram` (and, when `communication.channel` is `telegram`, an offer at the
   end of an interactive `minions init`), hidden prompt or `--stdin`. Format `^\d{6,12}:[A-Za-z0-9_-]{30,64}$`
   is checked before the value reaches any store, environment, or `security -i` line.
@@ -353,6 +358,19 @@ stores, reference file, and secrets mount are shared, not duplicated). Full desi
 - **Mount.** `projects/<id>/secrets/telegram-bot-token` → `/opt/minions/secrets/telegram-bot-token` (ro).
   Only `minions coordinator run` reads it, and passes it to the coordinator's `claude` process as
   `TELEGRAM_BOT_TOKEN`. A token change applied to a running container triggers a controlled restart.
+
+## Communication channel
+
+- `minions channel show`: configured `communication.channel` (and its layer), effective channel, reason.
+- `minions channel set terminal|telegram|auto [--dry-run] [--yes]`: edits the project config file the install
+  uses (shared `.minions/config.json` or `<host data root>/projects/<id>/config.json`) via `editProjectConfig`
+  (`src/host/config-write.ts`): strict parse (a file that fails to parse is never overwritten), `configRevision`
+  bump, validation with `config.local.json`, atomic write, derived files refreshed. Needs `--yes` or a
+  confirmation. Never commits (shared: prints a commit reminder) and never restarts: restart-required, so it prints
+  `minions down && minions start` when the runtime is running, `minions auth telegram` when no token is stored, and a
+  host-runtime warning (no Telegram there). `config.local.json` overriding the value is reported.
+- Resolution matrix and fallbacks: [telegram.md](telegram.md#channel-selection-terminal--telegram--auto).
+  `minions status` shows `channel: {configured, effective, reason, source}`; doctor adds `communication.channel`.
 
 ## Repository layout
 

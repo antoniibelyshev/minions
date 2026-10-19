@@ -22,6 +22,8 @@ import { projectForPath } from './registry.js';
 import { exportRepo, importRepo } from './transfer.js';
 import { HOST_RUNTIME_WARNING, HostRuntime, RUNTIMES, prepareHostRuntime, requireHostTools, runtimeOf, type RuntimeKind } from './runtime.js';
 import { registerRuntime } from './runtime-cli.js';
+import { HOST_CHANNEL_WARNING, formatChannelSet, hostChannel, offerAutoChannel, registerChannel } from './channel-cli.js';
+import { formatChannel } from '../telegram/channel.js';
 import { githubStartHint, registerGithubSetup } from './github-setup.js';
 import { formatUninstall, runUninstall } from './uninstall.js';
 import { readSecret, readlineIO } from './wizard.js';
@@ -55,8 +57,8 @@ async function materialize(json: boolean, projectId: string): Promise<void> {
  * then apply restart-required Telegram changes with a controlled coordinator restart. Never fails
  * the start: terminal mode must keep working.
  */
-async function telegramStartup(json: boolean, compose: Compose, config: MinionsConfig, opts: { startDetached: boolean }): Promise<unknown> {
-  if (config.communication.channel === 'telegram' && config.container.network !== 'none') {
+async function telegramStartup(json: boolean, compose: Compose, config: MinionsConfig, opts: { startDetached: boolean; wantsTelegram: boolean }): Promise<unknown> {
+  if (opts.wantsTelegram && config.container.network !== 'none') {
     const r = await compose.exec(['minions', 'telegram', 'install', '--json'], { allowFailure: true, timeoutMs: 600_000 });
     if (r.code !== 0) say(json, `warning: Telegram plugin not installed (${lastLine(r.stdout, r.stderr)}); the coordinator starts terminal-only.`);
   }
@@ -140,11 +142,11 @@ async function startHost(json: boolean, o: { attach: boolean }): Promise<void> {
   }
   const hint = await githubStartHint(project, config);
   if (hint) say(json, hint);
-  if (config.communication.channel === 'telegram') {
-    say(json, 'warning: Telegram is unavailable in the host runtime (the coordinator starts without user plugins or MCP servers), so it runs terminal-only. Use the Docker runtime for Telegram (`minions runtime set docker`).');
-  }
+  // Telegram intended (telegram, or auto with a stored token) but the host runtime cannot run it.
+  const channel = await hostChannel(project, config);
+  if (channel.wantsTelegram) say(json, `warning: ${HOST_CHANNEL_WARNING}`);
   const attach = o.attach && !json && !!process.stdin.isTTY && !!process.stdout.isTTY;
-  const sync = await host.exec(['minions', 'coordinator', 'sync', '--json', ...(!attach && config.communication.channel === 'telegram' ? ['--start-detached'] : [])], { allowFailure: true, timeoutMs: 60_000 });
+  const sync = await host.exec(['minions', 'coordinator', 'sync', '--json', ...(!attach && channel.wantsTelegram ? ['--start-detached'] : [])], { allowFailure: true, timeoutMs: 60_000 });
   let coordinator: unknown = null;
   try { coordinator = (JSON.parse(sync.stdout) as { data?: unknown }).data ?? null; } catch { say(json, `warning: coordinator sync failed: ${lastLine(sync.stdout, sync.stderr)}`); }
   if (!attach) {
@@ -167,6 +169,16 @@ async function askLine(question: string): Promise<string | null> {
   if (!process.stdin.isTTY) return null;
   const rl = createInterface({ input: process.stdin, output: process.stderr });
   try { return (await rl.question(`${question} `)).trim(); } finally { rl.close(); }
+}
+
+/** Yes/no with yes as the default; null without a terminal. */
+async function confirmDefaultYes(question: string): Promise<boolean> {
+  return (await confirmOrNull(question)) ?? false;
+}
+async function confirmOrNull(question: string): Promise<boolean | null> {
+  if (!process.stdin.isTTY) return null;
+  const rl = createInterface({ input: process.stdin, output: process.stderr });
+  try { return !/^n(o)?$/i.test((await rl.question(`${question} `)).trim()); } finally { rl.close(); }
 }
 
 async function confirm(question: string): Promise<boolean> {
@@ -246,7 +258,9 @@ export function register(program: Command): void {
       // The coordinator is a TUI in tmux: attaching needs a terminal (compose exec allocates a TTY).
       const attach = o.attach && !json && !!process.stdin.isTTY && !!process.stdout.isTTY;
       // Telegram must work with nobody attached: start the session detached in that case.
-      const coordinator = await telegramStartup(json, compose, config, { startDetached: !attach && config.communication.channel === 'telegram' });
+      const channel = await hostChannel(project, config);
+      if (channel.degraded) say(json, `warning: Telegram is off: ${channel.reason}; the coordinator starts terminal-only.`);
+      const coordinator = await telegramStartup(json, compose, config, { startDetached: !attach && channel.wantsTelegram, wantsTelegram: channel.wantsTelegram });
       if (!attach) {
         emit({ projectId: project.projectId, runtime: 'docker', running: true, imported, coordinator, attach: `docker compose -p ${compose.name} -f ${compose.file} exec ${'app'} minions coordinator` },
           { json, human: () => `Container ${compose.name} is running. Run \`minions start\` in a terminal to attach the coordinator.` });
@@ -393,7 +407,7 @@ export function register(program: Command): void {
         if (vis === 'restart-required') { needsRestart = true; return false; } // a copy would not reach it
         await materialize(json, project.projectId);
         const eff = await loadEffectiveConfig(project).catch(() => undefined);
-        await coordinatorSync(json, compose, { startDetached: eff?.config.communication.channel === 'telegram' });
+        await coordinatorSync(json, compose, { startDetached: eff ? (await hostChannel(project, eff.config)).wantsTelegram : false });
         return true;
       };
       if (o.remove) {
@@ -411,19 +425,32 @@ export function register(program: Command): void {
         : process.stdin.isTTY ? await readSecret('Telegram bot token (input hidden): ')
           : (() => { throw new MinionsError('PRECONDITION', 'No terminal to prompt for the token.', 'Run in a terminal, or pipe it: `minions auth telegram --stdin < token-file`.'); })();
       const r = await provisionTelegramToken({ projectId: project.projectId, token, repoPath: ref.repoPath, verify: !!o.verify });
+      // Explicit "terminal" would leave the token unused: offer auto (same path as `minions channel set auto`).
+      const interactive = !o.stdin && !json && !!process.stdin.isTTY;
+      const channel = await offerAutoChannel(project, { interactive, confirm: confirmDefaultYes });
       const applied = await apply();
-      emit({ ...r, mountedPath: CONTAINER.telegramTokenFile, appliedToRunningContainer: applied, ...(needsRestart ? { restartRequired: true } : {}) }, { json, human: () => [
+      const eff = await loadEffectiveConfig(project).catch(() => undefined);
+      const resolved = eff ? await hostChannel(project, eff.config) : null;
+      emit({ ...r, mountedPath: CONTAINER.telegramTokenFile, appliedToRunningContainer: applied, ...(needsRestart ? { restartRequired: true } : {}),
+        channel: { configured: resolved?.configured ?? channel.configured, effective: resolved?.effective ?? 'terminal', reason: resolved?.reason ?? null, switchedToAuto: channel.switched, hint: channel.hint } }, { json, human: () => [
         `Stored the Telegram bot token for bot ${r.botId} in ${r.backend === 'keychain' ? 'the macOS Keychain' : 'a 0600 host file'} (${r.ref}).`,
         r.verification ? `Verification: ${r.verification.status} — ${r.verification.detail}` : 'Not checked with Telegram (pass --verify to call getMe).',
         ...r.warnings.map((w) => `warning: ${w}`),
         applied ? 'Applied to the running container (controlled coordinator restart when needed).'
           : needsRestart ? 'The running container has no secrets mount (created before this feature); run `minions start` to recreate it so the token becomes visible.'
             : `It is mounted read-only at ${CONTAINER.telegramTokenFile} on the next \`minions start\`.`,
-        'Telegram is used only when communication.channel is "telegram" (check with `minions config show --explain`).',
-      ].join('\n') });
+        ...(channel.result ? [formatChannelSet(channel.result)] : []),
+        resolved ? `communication.channel: ${formatChannel(resolved)}` : '',
+        ...(channel.hint ? [`hint: ${channel.hint}`] : []),
+        ...(resolved?.effective === 'telegram' ? [
+          ...(channel.result ? [] : ['Start (or restart) with Telegram: `minions down && minions start` (installs the plugin and relaunches the coordinator).']),
+          'Then pair in the coordinator terminal: DM your bot, type /telegram:access pair <code>, then /telegram:access policy allowlist.',
+        ] : []),
+      ].filter(Boolean).join('\n') });
     }));
 
   registerRuntime(program, { confirm, ask: askLine });
+  registerChannel(program, { confirm: confirmOrNull });
   registerAssistant(registerGithubSetup(program));
 
   const config = program.command('config').description('Inspect configuration');

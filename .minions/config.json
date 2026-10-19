@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "configRevision": 2,
+  "configRevision": 3,
   "projectId": "82b0030a-1ec5-45a5-9ecb-88b0184ba76e",
   "packageVersion": "0.1.0",
   "profile": "project-owner",
@@ -74,7 +74,7 @@
     "ciAuthority": "none"
   },
   "communication": {
-    "channel": "terminal",
+    "channel": "auto",
     "progress": "milestones"
   },
   "budgets": {

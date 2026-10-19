@@ -70,7 +70,7 @@ export function profileDefaults(profile: Profile, ctx: ProfileContext): { config
       identityMode: 'git-identity', requireIndependentApproval: true, requiredChecksConfigured: false,
     },
     verification: { commands: [], testerRequired: true, reviewerRequired: true, ciAuthority: 'none' },
-    communication: { channel: 'terminal', progress: 'milestones' },
+    communication: { channel: 'auto', progress: 'milestones' },
     budgets: { taskUsd: null, dailyUsd: null },
     capabilities: defaultCapabilities(profile),
     sensitivePaths: [...DEFAULT_SENSITIVE_PATHS],

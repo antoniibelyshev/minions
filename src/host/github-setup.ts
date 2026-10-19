@@ -10,14 +10,14 @@
 // - The token creation link is a GitHub "template URL" (docs.github.com, "Pre-filling fine-grained
 //   personal access token details using URL parameters"): name, description, target_name,
 //   expires_in and <permission>=<level>. Repository selection cannot be pre-filled.
-import { readFile } from 'node:fs/promises';
 import type { Command } from 'commander';
 import { can } from '../config/capabilities.js';
 import type { MinionsConfig } from '../config/schema.js';
 import { action, globalOpts, requireMode } from '../core/cli-helpers.js';
 import { MinionsError } from '../core/errors.js';
 import { run } from '../core/exec.js';
-import { readJsonIfExists, sha256 } from '../core/fsutil.js';
+import { readJsonIfExists } from '../core/fsutil.js';
+import { editProjectConfig } from './config-write.js';
 import { emit } from '../core/output.js';
 import { projectPaths } from '../core/paths.js';
 import { normalizeGithubRemote } from '../runtime/github.js';
@@ -27,8 +27,8 @@ import {
 } from './credentials.js';
 import { HOST_GIT, sanitizeRemoteUrl } from './discovery.js';
 import type { Runner } from './docker.js';
-import { loadManifest, projectJsonBytes, refreshDerived, writeGenerated } from './install.js';
-import { loadEffectiveConfig, loadProjectJson, projectConfigPath, resolveEffective, type ProjectJson } from './project.js';
+import { projectJsonBytes, writeGenerated } from './install.js';
+import { loadEffectiveConfig, loadProjectJson, projectConfigPath, type ProjectJson } from './project.js';
 import { projectForPath } from './registry.js';
 import { readlineIO, type WizardIO } from './wizard.js';
 
@@ -132,20 +132,16 @@ export async function githubStartHint(project: ProjectJson, _config?: MinionsCon
  */
 export async function setDeliveryMode(project: ProjectJson, mode: MinionsConfig['delivery']['mode']): Promise<{ changed: boolean; path: string; note: string }> {
   const file = projectConfigPath(project);
-  const raw = await readJsonIfExists<Record<string, unknown>>(file);
   const manual = `set "delivery": { "mode": "${mode}"${mode === 'local' ? '' : ', "provider": "github"'} } in ${file}`;
-  if (!raw) return { changed: false, path: file, note: `configuration not found; ${manual}` };
-  const entry = (await loadManifest(project.projectId))?.files.find((f) => f.path === file);
-  const current = sha256(await readFile(file));
-  if (!entry || entry.sha256 !== current) return { changed: false, path: file, note: `${file} was edited since minions generated it; ${manual}` };
-  const delivery = (raw.delivery ?? {}) as Record<string, unknown>;
-  if (delivery.mode === mode) return { changed: false, path: file, note: `delivery.mode is already ${mode}` };
-  const next = { ...raw, configRevision: Number(raw.configRevision ?? 1) + 1, delivery: { ...delivery, mode, ...(mode === 'local' ? {} : { provider: 'github' }) } };
-  const local = await readJsonIfExists(projectPaths(project.projectId).configLocalJson);
-  const eff = resolveEffective(project, next, local, { project: file }); // throws INVALID_CONFIG
-  await writeGenerated(project.projectId, file, Buffer.from(JSON.stringify(next, null, 2) + '\n'));
-  await refreshDerived(project, eff.config);
-  return { changed: true, path: file, note: `delivery.mode = ${mode} (configRevision ${next.configRevision})${project.visibility === 'shared' ? '; commit .minions/config.json to share it' : ''}; applies on the next \`minions start\`` };
+  if (!(await readJsonIfExists(file))) return { changed: false, path: file, note: `configuration not found; ${manual}` };
+  const r = await editProjectConfig(project, (raw) => {
+    const delivery = (raw.delivery ?? {}) as Record<string, unknown>;
+    if (delivery.mode === mode) return null;
+    return { ...raw, delivery: { ...delivery, mode, ...(mode === 'local' ? {} : { provider: 'github' }) } };
+  }, { requireUnedited: true });
+  if (r.edited && r.changed) return { changed: false, path: file, note: `${file} was edited since minions generated it; ${manual}` };
+  if (!r.changed) return { changed: false, path: file, note: `delivery.mode is already ${mode}` };
+  return { changed: true, path: file, note: `delivery.mode = ${mode} (configRevision ${r.revision})${project.visibility === 'shared' ? '; commit .minions/config.json to share it' : ''}; applies on the next \`minions start\`` };
 }
 
 // ---------------------------------------------------------------- guided flow

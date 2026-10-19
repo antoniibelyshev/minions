@@ -176,6 +176,8 @@ expect_eq "$(result ',"verdict":"approve"' | "$SHIM" work record "$L3" --json | 
 step "host CLI runs status / pause / resume directly (no docker exec)"
 expect_eq "$("$M" pause --json | json 'd.data.paused.starts')" true "pause"
 expect_eq "$("$M" status --json | json 'd.data.paused.starts')" true "status"
+expect_eq "$("$M" status --json | json 'd.data.channel.configured+" "+d.data.channel.effective')" "auto terminal" "status: channel auto is terminal in the host runtime"
+expect_eq "$("$M" channel show --json | json 'd.data.cause')" "no-token" "channel show in the host runtime"
 expect_eq "$("$M" resume --json | json 'd.data.paused.starts')" false "resume"
 
 step "git credential helper through the shim (quoted path with a space; fake token file)"

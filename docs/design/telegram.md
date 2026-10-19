@@ -162,10 +162,46 @@ Reuse the shared host credential mechanism (task-1.1) for a new credential kind 
    `allowFrom` non-empty) read from the documented `access.json` schema. The status read never includes pending codes,
    and minions never writes the file.
 
+## Channel selection: `terminal` | `telegram` | `auto`
+
+`communication.channel` is resolved in one place, `resolveChannel` in `src/telegram/channel.ts`, used by the
+launch (`decideTelegram`), `minions status`, `minions channel show|set`, `minions start`, doctor and `auth telegram`:
+
+| Configured | Token stored | Runtime | Effective | Notes |
+| - | - | - | - | - |
+| `terminal` | any | any | terminal | a stored token is unused (doctor and `auth telegram` say so) |
+| `auto` (profile default) | no | any | terminal | quiet: plain terminal mode, no warning, no plugin install |
+| `auto` | yes | docker | telegram | same fallbacks as `telegram`: network `none`, invalid token, probe not run or not `available` → terminal with the reason |
+| `auto` | yes | host | terminal | warned: the host runtime has no Telegram |
+| `telegram` | no | docker | terminal | warned: "Telegram bot token is not provisioned; run `minions auth telegram`" |
+| `telegram` | yes | docker | telegram | unless the network/probe fallbacks apply |
+| `telegram` | any | host | terminal | warned (`HOST_TELEGRAM_REASON`) |
+
+"Token stored" is the host credential reference on the host (no secret store read, no network) and the
+read-only token mount inside the runtime. The plugin probe runs only at launch, so host-side views
+(`channel show`, doctor without a running container) report Telegram as *predicted* (`cause: unchecked`).
+Telegram is *intended* (`wantsTelegram`) for `telegram`, and for `auto` with a stored token: only then does
+`minions start` install the plugin and start the coordinator detached, and does doctor check `telegram.access`.
+
+- `minions channel show`: configured value and its layer (project file / `config.local.json` / default), the
+  effective channel and reason, token stored, runtime.
+- `minions channel set <value> [--dry-run] [--yes]`: edits `communication.channel` in the config file the install
+  uses (shared `.minions/config.json` or private config) through `editProjectConfig` (`src/host/config-write.ts`,
+  also used by `setDeliveryMode`): strict parse first (a file that does not parse is never overwritten),
+  `configRevision` bump, full validation with `config.local.json`, atomic write, derived files refreshed. A
+  hand-edited file is written but stays "edited" in the manifest. Never commits. Next steps: `minions auth telegram`
+  when no token is stored, commit reminder for shared configs, `minions down && minions start` when the runtime is
+  running (restart-required); host runtime: a warning that Telegram is unavailable there.
+- `minions auth telegram`: after storing the token, an explicit `terminal` channel gets an offer (interactive,
+  default yes) to switch to `auto` through the same `setChannel` path; with `--stdin`, `--json` or no terminal it
+  only prints the hint `minions channel set auto`.
+- `minions status` (runtime): `channel: { configured, effective, reason, source: launch|predicted, restartRequired? }`,
+  from the running coordinator's launch record when there is one.
+
 ## Launch integration
 
 - `buildClaudeCommand` (called by the exec wrapper) adds `--channels plugin:telegram@claude-plugins-official` only when `communication.channel`
-  is `telegram`, the probe reports `available`, and the token mount exists. Otherwise it launches terminal-only and prints
+  resolves to Telegram (`telegram`, or `auto` with a token), the probe reports `available`, and the token mount exists. Otherwise it launches terminal-only and prints
   the reason. Example: `Telegram disabled for this session: Bun is not installed …`.
 - tmux runs `minions coordinator run` (the exec wrapper) instead of `claude` directly, so the token stays out of tmux's environment.
 - Telegram mode must work with nobody attached: `minions start --no-attach` starts the tmux session detached. tmux gives the
@@ -181,10 +217,10 @@ Reuse the shared host credential mechanism (task-1.1) for a new credential kind 
 | - | - | - |
 | Credential kind | `src/host/credentials.ts` (`TELEGRAM_CREDENTIAL`) | Same stores, reference file and secrets dir as the GitHub token. Keychain service `minions.telegram`; file `credentials/<id>/telegram-bot-token`. `credentials.json` keeps `botId` (not secret) for the one-bot-per-project warning; it lives there rather than in the registry so the registry schema is unchanged. |
 | Standalone command | `minions auth telegram [--stdin] [--verify] [--remove] [--dry-run]` | Prints the bot/pairing guidance, reads the token without echo, stores it, and on a running container re-materializes it and runs `minions coordinator sync` (controlled restart). `--verify` (getMe) is opt-in. |
-| Wizard | `src/host/wizard.ts`, `src/host/install.ts` | "Communication channel (terminal/telegram)". Telegram prints the guidance (preview status, BotFather, one coordinator per bot, pairing, owner-only allowlist, residual risk). `container.network: none` falls back to terminal with the reason. After the plan is applied: the token offer (hidden prompt, optional consented getMe). Declined or failed: init says the coordinator stays terminal-only until `minions auth telegram`. |
+| Wizard | `src/host/wizard.ts`, `src/host/install.ts` | "Communication channel (auto/terminal/telegram)", default `auto` (Telegram when a bot token is stored, otherwise terminal; a next step names `minions auth telegram`). Explicit `telegram` prints the guidance (preview status, BotFather, one coordinator per bot, pairing, owner-only allowlist, residual risk). `container.network: none` falls back to terminal with the reason. After the plan is applied: the token offer (hidden prompt, optional consented getMe). Declined or failed: init says the coordinator stays terminal-only until `minions auth telegram`. |
 | Image | `docker/Dockerfile` | Bun 1.4.3 from a throwaway stage, SHA-256 pinned per architecture; `BUN_INSTALL_CACHE_DIR=/home/node/.cache/bun` (cache volume). |
 | Plugin install | `minions telegram install` (`src/telegram/install.ts`) | Adds the official marketplace if missing, installs `telegram@claude-plugins-official` at user scope, enables a disabled install, never updates. Refuses a marketplace named `claude-plugins-official` that points at another repo. Run by `minions start` when Telegram is selected; failure only warns. |
-| Exec wrapper | `minions coordinator run` (`runCoordinator`) | tmux runs it instead of `claude`. It reads and validates the mounted token, runs the probe, and decides (`decideTelegram`). Enabled: `--channels plugin:telegram@claude-plugins-official`, `TELEGRAM_BOT_TOKEN` in the child env only, and the plugin's `reply`/`react`/`edit_message` tools allowed in `--settings`. Otherwise an inherited `TELEGRAM_BOT_TOKEN` is removed and it prints `Telegram disabled for this session: <reason>. Terminal mode is active.` It writes `/state/coordinator-launch.json` (channel, decision, fingerprint; no token). |
+| Exec wrapper | `minions coordinator run` (`runCoordinator`) | tmux runs it instead of `claude`. It reads and validates the mounted token, runs the probe, and decides (`decideTelegram`). Enabled: `--channels plugin:telegram@claude-plugins-official`, `TELEGRAM_BOT_TOKEN` in the child env only, and the plugin's `reply`/`react`/`edit_message` tools allowed in `--settings`. Otherwise an inherited `TELEGRAM_BOT_TOKEN` is removed and it prints `Telegram disabled for this session: <reason>. Terminal mode is active.` (`auto` without a token: `terminal mode (<reason>)`). It writes `/state/coordinator-launch.json` (channel, decision, fingerprint; no token). |
 | Controlled restart | `minions coordinator sync [--force] [--start-detached]` | Compares the running launch's fingerprint (channel, network, truncated token hash) with the current state. On a difference it kills the tmux session, records `coordinator_restart` in the runtime DB, and relaunches detached if asked. While worker leases are active it defers (`restart-pending`) unless `--force`; leases stay in the DB for `recover`. `minions start` runs it (detached start when Telegram is selected and nobody attaches). |
 | Doctor | `src/host/doctor.ts` | `telegram` (ok / missing / unavailable; never fail), `telegram.credential`, `telegram.bot` (shared bot), `telegram.plugin` (probe), `telegram.access` (`minions telegram status`: policy and counts only, never codes or ids). |
 | Coordinator prompt | `templates/plugin/coordinator.md` (`telegramGuidance`) | Replies with `reply`; Telegram tools are coordinator-only; access changes are terminal-only; plain-language controls. |

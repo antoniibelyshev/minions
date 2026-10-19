@@ -312,9 +312,22 @@ describe('init and doctor', () => {
     expect(doc.checks.find((c) => c.name === 'telegram')).toMatchObject({ status: 'warn', detail: expect.stringMatching(/^missing:.*terminal-only/) });
   });
 
-  it('terminal projects: Telegram reported as not selected, no prompt', async () => {
+  it('auto projects (default) without a token: terminal mode, no prompt, optional hint', async () => {
     const repo = makeRepo(env.root);
     const r = await runInit({ path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
+    expect(r.plan.communication.channel).toBe('auto');
+    expect(r.telegram).toBeUndefined();
+    expect(r.nextSteps.join('\n')).toMatch(/Optional Telegram \(channel auto\): `minions auth telegram`/);
+    const doc = await runDoctor({ cwd: repo, probe: dockerDown, runner: recorder().runner });
+    expect(doc.checks.find((c) => c.name === 'telegram')).toMatchObject({ status: 'ok', detail: expect.stringMatching(/^auto: terminal mode \(auto: no Telegram bot token is stored/) });
+    expect(doc.checks.find((c) => c.name === 'telegram.credential')).toMatchObject({ status: 'ok', detail: expect.stringMatching(/^missing: optional/) });
+    expect(doc.checks.find((c) => c.name === 'communication.channel')).toMatchObject({ status: 'ok', detail: expect.stringMatching(/^configured auto, effective terminal/) });
+  });
+
+  it('terminal projects: Telegram reported as not selected, no prompt', async () => {
+    const repo = makeRepo(env.root);
+    const a = answering({ 'Communication channel': 'terminal' });
+    const r = await runInit({ path: repo, yes: false, visibility: 'private', io: a.io, dockerProbe: dockerUp });
     expect(r.telegram).toBeUndefined();
     const doc = await runDoctor({ cwd: repo, probe: dockerDown, runner: recorder().runner });
     expect(doc.checks.find((c) => c.name === 'telegram')).toMatchObject({ status: 'ok', detail: 'terminal mode (Telegram not selected)' });

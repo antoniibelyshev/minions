@@ -203,8 +203,11 @@ describe('Telegram tools are coordinator-only', () => {
     expect(coord).toContain('the plugin drops unpaired senders');
     expect(coord).toMatch(/Never give them to workers/);
     expect(coord).toMatch(/Pairing and access changes .* happen only in the terminal/);
-    const term = await gen();
+    const terminal = defaults(); terminal.communication.channel = 'terminal';
+    const term = await gen(terminal);
     expect(await term.read('coordinator.md')).toContain('Telegram is not configured for this project.');
+    const auto = await gen();
+    expect(await auto.read('coordinator.md')).toContain('Communication channel: auto (Telegram when a bot token is provisioned for this project, otherwise terminal)');
   });
 });
 

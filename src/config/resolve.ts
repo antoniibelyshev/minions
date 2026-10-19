@@ -5,7 +5,7 @@ import { MinionsConfigSchema, CapabilityRuleSchema, type Capability, type Capabi
 export const SUPPORTED = {
   backlog: ['backlogmd'],
   delivery: ['local', 'branch', 'pull-request'],
-  communication: ['terminal', 'telegram'],
+  communication: ['terminal', 'telegram', 'auto'],
 } as const;
 
 /** Features deferred in v0.1; doctor and the wizard report them as unavailable. */

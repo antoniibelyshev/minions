@@ -203,8 +203,10 @@ describe('wizard', () => {
     expect(r.config.container.publishPorts).toEqual([{ host: 3000, container: 3000 }]);
     expect(r.config.verification.commands).toEqual(['npm run lint', 'npm test']);
     expect(info.join('\n')).toMatch(/GitHub Issues \(not available in v0\.1\)/);
-    expect(info.join('\n')).toMatch(/Telegram through the official Claude Code channel plugin/);
-    expect(r.config.communication.channel).toBe('terminal');
+    expect(info.join('\n')).toMatch(/Telegram uses the official Claude Code channel plugin/);
+    expect(info.join('\n')).toMatch(/auto \(default: Telegram when a bot token is stored for this project with `minions auth telegram`, otherwise terminal\)/);
+    expect(questions).toContain('Communication channel (auto/terminal/telegram)');
+    expect(r.config.communication.channel).toBe('auto');
     expect(info.join('\n')).toMatch(/Branch push and pull requests are not selectable: the repository has no GitHub remote/);
     expect(info.join('\n')).toMatch(/Auto-merge \(not available in v0\.1\)/);
     expect(questions.some((q) => q.startsWith('Delivery mode'))).toBe(false);

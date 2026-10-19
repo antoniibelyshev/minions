@@ -38,6 +38,10 @@ export const CapabilitiesSchema = z.object(
 export const PROFILES = ['project-owner', 'personal-work', 'supervised'] as const;
 export type Profile = (typeof PROFILES)[number];
 
+/** communication.channel values. */
+export const CHANNELS = ['terminal', 'telegram', 'auto'] as const;
+export type ChannelSetting = (typeof CHANNELS)[number];
+
 const nonEmpty = z.string().min(1);
 /** Model ids/aliases (e.g. `sonnet`, `claude-opus-4-1`, `opus[1m]`); rendered into agent frontmatter, so no whitespace or YAML syntax. */
 const modelId = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:@\[\]-]*$/, 'must be a model id or alias (letters, digits, . _ : @ [ ] -)');
@@ -114,7 +118,8 @@ export const MinionsConfigSchema = z.object({
     ciAuthority: z.enum(['none', 'github']),
   }).strict(),
   communication: z.object({
-    channel: z.enum(['terminal', 'telegram']),
+    /** "auto": Telegram when a bot token is stored and the runtime supports it, else terminal (src/telegram/channel.ts). */
+    channel: z.enum(CHANNELS),
     progress: z.enum(['milestones', 'tasks', 'quiet']),
   }).strict(),
   budgets: z.object({

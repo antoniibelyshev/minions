@@ -36,7 +36,7 @@ The user runs the chosen `! minions auth set ...` themselves (it shows the plan 
 
 ## 4. Telegram (optional)
 
-Only if the user wants remote control: explain that it uses the official Claude Code channel plugin with their own bot (BotFather `/newbot`), one bot per project. Switching `communication.channel` to `telegram` is a configuration edit (step 5 procedure). The bot token goes in with `! minions auth telegram`. Pairing happens later in the coordinator terminal (`/telegram:access pair <code>`, then `/telegram:access policy allowlist`).
+Only if the user wants remote control: explain that it uses the official Claude Code channel plugin with their own bot (BotFather `/newbot`), one bot per project. `communication.channel` `auto` (the default) already uses Telegram once a bot token is stored; for an explicit `terminal` channel, switch with `! minions channel set auto` (or `telegram`). The bot token goes in with `! minions auth telegram`, then `! minions down && minions start`. Pairing happens later in the coordinator terminal (`/telegram:access pair <code>`, then `/telegram:access policy allowlist`).
 
 ## 5. Verification commands
 

@@ -32,6 +32,9 @@ const factsOf = () => ({
   managed: { present: false } as const,
 });
 
+/** Explicit terminal (the profile default is auto). */
+const terminalCfg = (): MinionsConfig => { const c = defaults(); c.communication.channel = 'terminal'; return c; };
+
 const telegramCfg = (over: Partial<MinionsConfig['container']> = {}): MinionsConfig => {
   const c = defaults();
   c.communication.channel = 'telegram';
@@ -69,7 +72,7 @@ describe('Telegram launch decision', () => {
   const tok = { state: 'ok' as const, token: TOKEN, botId: '123456789' };
   it('enables Telegram only when selected, networked, provisioned and the probe is available', () => {
     expect(decideTelegram(telegramCfg(), tok, available())).toMatchObject({ enabled: true });
-    expect(decideTelegram(defaults(), tok, available())).toEqual({ enabled: false, reason: 'communication.channel is terminal' });
+    expect(decideTelegram(terminalCfg(), tok, available())).toEqual({ enabled: false, reason: 'communication.channel is terminal' });
     expect(decideTelegram(telegramCfg({ network: 'none' }), tok, available()).reason).toMatch(/network is none/);
     expect(decideTelegram(telegramCfg(), { state: 'missing' }, available()).reason).toMatch(/not provisioned; run `minions auth telegram`/);
     expect(decideTelegram(telegramCfg(), { state: 'invalid', detail: 'not a Telegram bot token' }, available()).reason).toMatch(/not a Telegram bot token/);
@@ -134,11 +137,32 @@ describe('coordinator exec wrapper', () => {
     expect(probed).toBe(false);
   });
 
+  it('auto channel: Telegram with a mounted token; quiet terminal mode without one (no probe)', async () => {
+    const auto = defaults();
+    expect(auto.communication.channel).toBe('auto');
+    const withTok = layout();
+    const a = fakeSpawn();
+    const logs: string[] = [];
+    await runCoordinator(auto, { paths: withTok.paths, spawn: a.spawn, env: {}, probe: async () => available(), log: (l) => logs.push(l) });
+    expect(a.calls[0]!.args).toContain('--channels');
+    expect(a.calls[0]!.env[TELEGRAM_TOKEN_ENV]).toBe(TOKEN);
+    expect(logs.join('\n')).toMatch(/Telegram enabled \(communication.channel auto: bot token stored\)/);
+
+    const noTok = layout(null);
+    const b = fakeSpawn();
+    const logs2: string[] = [];
+    await runCoordinator(auto, { paths: noTok.paths, spawn: b.spawn, env: { [TELEGRAM_TOKEN_ENV]: TOKEN }, probe: async () => { throw new Error('must not probe'); }, log: (l) => logs2.push(l) });
+    expect(b.calls[0]!.args).not.toContain('--channels');
+    expect(b.calls[0]!.env).not.toHaveProperty(TELEGRAM_TOKEN_ENV);
+    expect(logs2.join('\n')).toMatch(/^minions: terminal mode \(auto: no Telegram bot token is stored/);
+    expect(logs2.join('\n')).not.toMatch(/disabled/);
+  });
+
   it('terminal channel: no probe, no token, no Telegram message', async () => {
     const { paths } = layout();
     const { calls, spawn } = fakeSpawn();
     const logs: string[] = [];
-    await runCoordinator(defaults(), { paths, spawn, env: {}, probe: async () => { throw new Error('must not probe'); }, log: (l) => logs.push(l) });
+    await runCoordinator(terminalCfg(), { paths, spawn, env: {}, probe: async () => { throw new Error('must not probe'); }, log: (l) => logs.push(l) });
     expect(calls[0]!.args).not.toContain('--channels');
     expect(calls[0]!.env).not.toHaveProperty(TELEGRAM_TOKEN_ENV);
     expect(logs).toEqual([]);
@@ -199,7 +223,7 @@ describe('controlled coordinator restart', () => {
 
     await launchWith(paths, telegramCfg());
     const t2 = tmux(true);
-    const r2 = await syncCoordinator(defaults(), { paths, runner: t2.runner, activeLeases: () => [] });
+    const r2 = await syncCoordinator(terminalCfg(), { paths, runner: t2.runner, activeLeases: () => [] });
     expect(r2).toMatchObject({ action: 'restarted', running: false, reason: 'communication.channel changed (telegram -> terminal)' });
   });
 
@@ -207,11 +231,11 @@ describe('controlled coordinator restart', () => {
     const { paths } = layout();
     await launchWith(paths, telegramCfg());
     const t = tmux(true);
-    const r = await syncCoordinator(defaults(), { paths, runner: t.runner, activeLeases: () => [{ id: 'lease-1' }] });
+    const r = await syncCoordinator(terminalCfg(), { paths, runner: t.runner, activeLeases: () => [{ id: 'lease-1' }] });
     expect(r.action).toBe('restart-pending');
     expect(r.reason).toMatch(/1 active worker lease\(s\) \(lease-1\)/);
     expect(t.calls.some((c) => c.args[0] === 'kill-session')).toBe(false);
-    const forced = await syncCoordinator(defaults(), { paths, runner: t.runner, activeLeases: () => [{ id: 'lease-1' }] }, { force: true });
+    const forced = await syncCoordinator(terminalCfg(), { paths, runner: t.runner, activeLeases: () => [{ id: 'lease-1' }] }, { force: true });
     expect(forced.action).toBe('restarted');
   });
 
@@ -226,7 +250,7 @@ describe('controlled coordinator restart', () => {
   it('fingerprint depends on channel and token, not on the token text itself', () => {
     const tok = (t: string) => ({ state: 'ok' as const, token: t, botId: '123456789' });
     expect(launchFingerprint(telegramCfg(), tok(TOKEN))).not.toBe(launchFingerprint(telegramCfg(), tok(TOKEN2)));
-    expect(launchFingerprint(telegramCfg(), tok(TOKEN))).not.toBe(launchFingerprint(defaults(), tok(TOKEN)));
+    expect(launchFingerprint(telegramCfg(), tok(TOKEN))).not.toBe(launchFingerprint(terminalCfg(), tok(TOKEN)));
     expect(launchFingerprint(telegramCfg(), tok(TOKEN))).not.toContain(TOKEN.slice(0, 12));
   });
 });
@@ -236,8 +260,8 @@ describe('tester edge cases: terminal mode through the wrapper', () => {
     const { paths } = layout(null);
     const { calls, spawn } = fakeSpawn();
     const parentEnv = { PATH: '/usr/bin', HOME: '/home/node', TELEGRAM_BOT_TOKEN: TOKEN, CLAUDE_CONFIG_DIR: '/home/node/.claude' };
-    await runCoordinator(defaults(), { paths, spawn, env: parentEnv, log: () => {} });
-    const expected = await buildClaudeCommand(defaults(), paths);
+    await runCoordinator(terminalCfg(), { paths, spawn, env: parentEnv, log: () => {} });
+    const expected = await buildClaudeCommand(terminalCfg(), paths);
     expect(calls[0]!.cmd).toBe('claude');
     expect(calls[0]!.args).toEqual(expected.args);
     expect(calls[0]!.args).not.toContain('--channels');
@@ -262,7 +286,7 @@ describe('tester edge cases: terminal mode through the wrapper', () => {
   it('missing coordinator prompt fails with a precise error before spawning claude', async () => {
     const { paths } = layout();
     const { calls, spawn } = fakeSpawn();
-    await expect(runCoordinator(defaults(), { paths: { ...paths, coordinatorPrompt: join(paths.pluginDir, 'nope.md') }, spawn, env: {}, log: () => {} }))
+    await expect(runCoordinator(terminalCfg(), { paths: { ...paths, coordinatorPrompt: join(paths.pluginDir, 'nope.md') }, spawn, env: {}, log: () => {} }))
       .rejects.toMatchObject({ code: 'NOT_FOUND', message: expect.stringMatching(/Coordinator prompt not found/) });
     expect(calls).toHaveLength(0);
   });
@@ -272,18 +296,18 @@ describe('tester edge cases: terminal mode through the wrapper', () => {
     const failing: SpawnLike = () => ({
       on(event: string, cb: (...a: unknown[]) => void) { if (event === 'error') setImmediate(() => cb(new Error('spawn claude ENOENT'))); return this; },
     } as ReturnType<SpawnLike>);
-    await expect(runCoordinator(defaults(), { paths, spawn: failing, env: {}, log: () => {} }))
+    await expect(runCoordinator(terminalCfg(), { paths, spawn: failing, env: {}, log: () => {} }))
       .rejects.toMatchObject({ code: 'INCOMPATIBLE_RUNTIME', message: expect.stringMatching(/Failed to start claude: spawn claude ENOENT/) });
     const exits: SpawnLike = () => ({
       on(event: string, cb: (...a: unknown[]) => void) { if (event === 'exit') setImmediate(() => cb(null, 'SIGTERM')); return this; },
     } as ReturnType<SpawnLike>);
-    expect(await runCoordinator(defaults(), { paths, spawn: exits, env: {}, log: () => {} })).toBe(128);
+    expect(await runCoordinator(terminalCfg(), { paths, spawn: exits, env: {}, log: () => {} })).toBe(128);
   });
 
   it('an unwritable state dir does not stop the session from launching', async () => {
     const { paths } = layout(null);
     const { calls, spawn } = fakeSpawn();
-    await runCoordinator(defaults(), { paths: { ...paths, coordinatorLaunch: join(paths.coordinatorPrompt, 'x', 'launch.json') }, spawn, env: {}, log: () => {} });
+    await runCoordinator(terminalCfg(), { paths: { ...paths, coordinatorLaunch: join(paths.coordinatorPrompt, 'x', 'launch.json') }, spawn, env: {}, log: () => {} });
     expect(calls).toHaveLength(1);
   });
 

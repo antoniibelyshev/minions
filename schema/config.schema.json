@@ -376,7 +376,8 @@
           "type": "string",
           "enum": [
             "terminal",
-            "telegram"
+            "telegram",
+            "auto"
           ]
         },
         "progress": {

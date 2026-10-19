@@ -422,6 +422,8 @@ async function prepare(opts: InitOptions, docker?: DockerStatus): Promise<Prepar
         'On `minions start` the container installs telegram@claude-plugins-official at user scope (needs network; no login).',
         'Pairing happens in the coordinator terminal (/telegram:access pair <code>, then /telegram:access policy allowlist); pair only yourself.',
         'Telegram changes are restart-required: `minions start` restarts the coordinator in a controlled way.',
+      ] : effective.communication.channel === 'auto' && runtime !== 'host' && effective.container.network !== 'none' ? [
+        'Optional Telegram (communication.channel auto): create a bot with BotFather, store its token with `minions auth telegram`, then `minions down && minions start`; pair in the coordinator terminal (/telegram:access pair <code>, then /telegram:access policy allowlist). Without a token the coordinator uses the terminal.',
       ] : []),
     ],
     notes, warnings,
@@ -657,6 +659,8 @@ export async function runInit(opts: InitOptions): Promise<InitResult> {
         ...(plan.communication.channel === 'telegram' ? [
           ...(tgReady ? [] : ['Run `minions auth telegram` to store the Telegram bot token (entered without echo); until then the coordinator is terminal-only.']),
           'After the first start, pair in the coordinator terminal: DM your bot, type /telegram:access pair <code>, then /telegram:access policy allowlist.',
+        ] : plan.communication.channel === 'auto' && !hostRuntime ? [
+          'Optional Telegram (channel auto): `minions auth telegram` stores a bot token; the coordinator then uses Telegram after `minions down && minions start`.',
         ] : []),
         'Run `minions doctor` to check readiness at any time.',
       ],
@@ -679,7 +683,8 @@ export function formatPlan(plan: InitResult['plan']): string {
   if (plan.runtime === 'docker') L.push(`Container: ${plan.container.image}, ${plan.container.cpus} CPUs, ${plan.container.memoryMiB} MiB, ${plan.container.pidsLimit} pids, ports: ${plan.container.publishPorts.map((p) => `127.0.0.1:${p.host}->${p.container}`).join(', ') || 'none'}`);
   L.push(`Verification commands (run by the agents in the ${plan.runtime === 'host' ? 'host runtime workspace' : 'container'}): ${plan.verificationCommands.join('; ') || 'none inferred'}`);
   L.push(`Claude authorization: ${plan.claudeAuth.method}${plan.claudeAuth.preset ? ` (${plan.claudeAuth.preset})` : ''}: ${plan.claudeAuth.source}`);
-  L.push(`Communication: ${plan.communication.channel}${plan.communication.channel === 'telegram' ? ' (terminal stays available; restart-required changes)' : ''}`);
+  L.push(`Communication: ${plan.communication.channel}${plan.communication.channel === 'telegram' ? ' (terminal stays available; restart-required changes)'
+    : plan.communication.channel === 'auto' ? (plan.runtime === 'host' ? ' (terminal: the host runtime has no Telegram)' : ' (Telegram when a bot token is stored with `minions auth telegram`, otherwise terminal)') : ''}`);
   L.push('', 'Unavailable in v0.1:');
   for (const u of plan.unavailable.settings) L.push(`  - ${u.path}: ${u.reason}`);
   L.push(`  - ${plan.unavailable.features.join(', ')}`);

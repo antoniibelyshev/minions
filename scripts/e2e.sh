@@ -79,6 +79,23 @@ step "init (shared)"
 out="$("$M" init "$B" --yes --shared --json)"; PROJECT_IDS+=("$(json 'd.data.plan.projectId' <<<"$out")")
 [ -f "$B/.minions/config.json" ] && ok "shared init wrote .minions/config.json" || fail ".minions/config.json missing"
 
+step "channel show / set (shared config, never committed)"
+cd "$B"
+expect_eq "$("$M" channel show --json | json 'd.data.configured+" "+d.data.effective')" "auto terminal" "channel auto resolves to terminal without a bot token"
+rev="$(json 'd.configRevision' < "$B/.minions/config.json")"
+head_before="$(git -C "$B" rev-parse HEAD)"
+set +e; "$M" channel set terminal --json </dev/null >/dev/null 2>&1; rc=$?; set -e
+expect_eq "$rc" 11 "channel set without --yes and without a terminal is refused"
+expect_eq "$("$M" channel set terminal --dry-run --json | json 'd.data.applied')" false "channel set --dry-run writes nothing"
+expect_eq "$(json 'd.configRevision' < "$B/.minions/config.json")" "$rev" "dry run keeps configRevision"
+steps="$("$M" channel set telegram --yes --json | json 'd.data.nextSteps.join("\n")')"
+grep -q 'minions auth telegram' <<<"$steps" || fail "channel set telegram hints minions auth telegram"
+grep -q 'Commit .minions/config.json' <<<"$steps" || fail "channel set reminds to commit the shared config"
+expect_eq "$(json 'd.configRevision+" "+d.communication.channel' < "$B/.minions/config.json")" "$((rev + 1)) telegram" "channel set bumps configRevision"
+expect_eq "$(git -C "$B" rev-parse HEAD)" "$head_before" "channel set does not commit"
+"$M" channel set auto --yes --json >/dev/null
+cd - >/dev/null
+
 step "start --no-attach"
 cd "$A"
 expect_eq "$("$M" start --no-attach --json | json 'd.data.running')" true "container running"
@@ -137,6 +154,7 @@ expect_eq "$allowed" yes "repeated stop without progress is eventually allowed"
 step "host-delegated status / pause / resume"
 expect_eq "$("$M" pause --json | json 'd.data.paused.starts')" true "pause"
 expect_eq "$("$M" status --json | json 'd.data.paused.starts')" true "status sees pause"
+expect_eq "$("$M" status --json | json 'd.data.channel.configured+" "+d.data.channel.effective')" "auto terminal" "status shows configured vs effective channel"
 expect_eq "$(cx minions hook stop <<<"$S")" "" "paused allows stop"
 expect_eq "$("$M" resume --json | json 'd.data.paused.starts')" false "resume"
 

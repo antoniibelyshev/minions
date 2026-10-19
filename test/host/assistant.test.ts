@@ -80,7 +80,7 @@ describe('assistant argv', () => {
     expect(`Read(/${ctx.repoPath}/**)`.startsWith('Read(//')).toBe(true);
     const denied = variadic(args, '--disallowedTools');
     for (const d of ['Bash(minions runtime set*)', 'Bash(security *)', 'Bash(gh auth token*)', 'Bash(cat *secrets*)', 'Bash(git push*)', 'Bash(open *)',
-      'Bash(minions auth set*)', 'Bash(minions auth github*)', 'Bash(minions auth telegram*)']) expect(denied).toContain(d);
+      'Bash(minions auth set*)', 'Bash(minions auth github*)', 'Bash(minions auth telegram*)', 'Bash(minions channel set*)']) expect(denied).toContain(d);
     // Host-side secret stores are unreadable; host-side minions files are not editable.
     const p = projectPaths(id);
     expect(denied).toContain(`Read(/${credentialStoreDir()}/**)`);

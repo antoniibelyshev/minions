@@ -4,7 +4,7 @@ minions installs a small Claude Code development team into a Git project on your
 
 Everything the model controls runs inside one Docker container per project. Your Mac runs only a small, trusted `minions` CLI. (You can explicitly opt into a less safe **host runtime** without Docker; see [Running without Docker](#running-without-docker).) That CLI installs the team, starts and stops the container, provisions the credentials you grant, and handles explicit import and export.
 
-> **Status:** version 0.1 (bootstrap) is installable from source. It implements the terminal workflow: `init`, `doctor`, `start`, `down`, `status`, `pause`, `resume`, `import`, `export`, `config show [--explain]`, `auth show|set|refresh` (Claude authorization), `auth github`, `auth telegram`, `runtime show|set`, `setup github`, `setup assist` (AI setup assistant), and `uninstall` on the host; an opt-in host runtime without Docker ([Running without Docker](#running-without-docker)); optional Telegram communication through the official Claude Code channel plugin (see [docs/design/telegram.md](docs/design/telegram.md); the notification outbox is not implemented yet); the Backlog.md backend; `local` delivery (commits on `agent/<slug>` branches, fetched to the host with `minions export`); and `branch` / `pull-request` delivery to GitHub (push `agent/<slug>`, open one PR; never merged). The rest of this README describes the intended version 1 behavior. Sections marked **(deferred in v0.1)** are not implemented yet, and `minions doctor` reports them as unavailable: GitHub Issues backend, auto-merge and merge requests, review publication, config plan/apply, backlog migration, upgrade, budgets, and companion containers. `minions auth github` stores a per-project fine-grained GitHub token on the host (see [docs/design/bootstrap.md](docs/design/bootstrap.md#github-credential)); the container uses it for branch/pull-request delivery. The v0.1 contract is [docs/design/bootstrap.md](docs/design/bootstrap.md); the full requirements are in [docs/spec.md](docs/spec.md).
+> **Status:** version 0.1 (bootstrap) is installable from source. It implements the terminal workflow: `init`, `doctor`, `start`, `down`, `status`, `pause`, `resume`, `import`, `export`, `config show [--explain]`, `auth show|set|refresh` (Claude authorization), `auth github`, `auth telegram`, `channel show|set`, `runtime show|set`, `setup github`, `setup assist` (AI setup assistant), and `uninstall` on the host; an opt-in host runtime without Docker ([Running without Docker](#running-without-docker)); optional Telegram communication through the official Claude Code channel plugin (see [docs/design/telegram.md](docs/design/telegram.md); the notification outbox is not implemented yet); the Backlog.md backend; `local` delivery (commits on `agent/<slug>` branches, fetched to the host with `minions export`); and `branch` / `pull-request` delivery to GitHub (push `agent/<slug>`, open one PR; never merged). The rest of this README describes the intended version 1 behavior. Sections marked **(deferred in v0.1)** are not implemented yet, and `minions doctor` reports them as unavailable: GitHub Issues backend, auto-merge and merge requests, review publication, config plan/apply, backlog migration, upgrade, budgets, and companion containers. `minions auth github` stores a per-project fine-grained GitHub token on the host (see [docs/design/bootstrap.md](docs/design/bootstrap.md#github-credential)); the container uses it for branch/pull-request delivery. The v0.1 contract is [docs/design/bootstrap.md](docs/design/bootstrap.md); the full requirements are in [docs/spec.md](docs/spec.md).
 
 ## Contents
 
@@ -102,7 +102,7 @@ minions start --no-attach       # only start the container and import the reposi
    3. Backlog backend and ownership
    4. Task intake and authorized scope
    5. Publication and merge authority
-   6. Terminal or Telegram
+   6. Communication channel: `auto` (default: Telegram once a bot token is stored, otherwise terminal), `terminal`, or `telegram`
    7. Credential references and authentication readiness
    8. Container image, toolchain, and any application preview ports
 3. **Plan review.** Shows the planned writes, effective permissions, inferred verification commands, unavailable capabilities, and any external setup you still need to do. Approving the plan authorizes exactly those changes and nothing else.
@@ -308,7 +308,7 @@ Each change is classified by when it takes effect:
 | - | - |
 | immediate | Lowering concurrency stops new starts; running work continues |
 | next-dispatch | Changing the default model |
-| restart-required | Updated prompts or tool permissions, Telegram changes |
+| restart-required | Updated prompts or tool permissions, Telegram changes (`minions channel set`, `minions auth telegram`) |
 | migration | Switching backlog backend, switching private and shared visibility |
 
 Tightening permissions suspends the affected external actions immediately. A worker still running on an older config revision is blocked from sensitive external operations. Broadening permissions always needs an explicit request from you; the agent can't grant itself authority. Container mounts, image, resources, published ports, and credential grants are host-controlled. Claude can only propose a change plan for them, which you apply through the host CLI.
@@ -333,7 +333,7 @@ Tightening permissions suspends the affected external actions immediately. A wor
   "models": { "default": "sonnet", "allowed": ["sonnet", "opus", "haiku"], "selection": "coordinator" },
   "delivery": { "mode": "pull-request", "merge": "auto-when-eligible", "method": "squash", "requiredChecksConfigured": false },
   "verification": { "commands": [], "testerRequired": true, "reviewerRequired": true },
-  "communication": { "channel": "terminal", "progress": "milestones" },
+  "communication": { "channel": "auto", "progress": "milestones" },
   "budgets": { "taskUsd": null, "dailyUsd": null }
 }
 ```
@@ -351,9 +351,31 @@ The full shape is defined by the JSON Schema shipped with the package. Unknown f
 
 ## Communication
 
-**Terminal** is the only channel in v0.1 and the baseline for setup and recovery, and it always works.
+**Terminal** is the baseline for setup and recovery, and it always works.
 
-**Telegram** uses the official Claude Code channel plugin (a research preview) with your own bot. The wizard walks you through creating the bot, pairing it, and allowlisting senders; `minions auth telegram` stores the bot token on the host without echo. Only paired senders can control the coordinator; unpaired senders are dropped. Pair only yourself, because allowlisted senders can also approve tool-permission prompts. If Telegram is unavailable, the coordinator starts in terminal mode and says why. Each bot can be polled by only one coordinator at a time, so use a separate bot for each project you run at the same time.
+**Telegram** uses the official Claude Code channel plugin (a research preview) with your own bot. Only paired senders can control the coordinator; unpaired senders are dropped. Pair only yourself, because allowlisted senders can also approve tool-permission prompts. If Telegram is unavailable, the coordinator starts in terminal mode and says why. Each bot can be polled by only one coordinator at a time, so use a separate bot for each project you run at the same time.
+
+`communication.channel` takes three values:
+
+| Value | Effective channel |
+| - | - |
+| `auto` (default for new installs) | Telegram when a bot token is stored for the project (`minions auth telegram`) and the runtime is Docker; otherwise terminal. Like `telegram`, it falls back to terminal with a reason when the plugin probe fails or the network is `none`. |
+| `telegram` | Telegram; when it can't start (no token, host runtime, plugin unavailable) the coordinator warns and runs terminal-only |
+| `terminal` | Terminal only; a stored token is ignored |
+
+```sh
+minions channel show                      # configured vs effective channel, and why
+minions channel set auto|terminal|telegram [--dry-run] [--yes]
+```
+
+`channel set` edits the project configuration the install uses (shared `.minions/config.json` or the private config), bumps `configRevision`, validates the result, and never overwrites a file that fails to parse. It doesn't commit: for a shared install, commit `.minions/config.json` yourself. The change is restart-required (`minions down && minions start`). `minions status` also shows the configured and the effective channel. The host runtime has no Telegram, so `auto` means terminal there.
+
+Turning Telegram on:
+
+1. Create a bot with [BotFather](https://t.me/BotFather) (`/newbot`) and copy its token. Use one bot per project.
+2. Store the token: `minions auth telegram` (prompted without echo, or `--stdin`). If the channel is `terminal`, it offers to switch to `auto`.
+3. Restart: `minions down && minions start` (installs the plugin and starts the coordinator with Telegram).
+4. Pair in the coordinator terminal: DM your bot, then type `/telegram:access pair <code>`, then `/telegram:access policy allowlist`.
 
 What you receive:
 
@@ -530,7 +552,7 @@ Switching needs the old runtime stopped (`minions down`). Agent branches, backlo
 - **Claude authorization.** `login` uses your existing Claude Code login on this Mac (no key handoff). `api-key` / `helper` / `jbcentral` write the key to `projects/<id>/secrets/anthropic-api-key` (0600) and the coordinator gets `apiKeyHelper: "cat '<that file>'"`; no loopback rewrite is needed.
 - **GitHub.** The stored per-project token (`minions auth github`) is copied to `projects/<id>/secrets/github-token` (0600) on `minions start` and removed on `minions down`. The workspace clone's own git config points its github.com credential helper at the shim; a generated `gh` wrapper (`host/bin/gh`, only when `gh` is installed) passes the token to gh's process only. Your global git and gh configuration and your own gh login are never changed or used. `GH_TOKEN` / `GITHUB_TOKEN` from your shell are removed from agent processes.
 - **Tools.** You install `tmux` (`brew install tmux`), Claude Code (`npm install -g @anthropic-ai/claude-code` or `brew install --cask claude-code`), Backlog.md (`npm install -g backlog.md@1.54.0`), `git`, and, for pull-request delivery, `gh` (`brew install gh`). `minions doctor` checks their versions and shows a warn-level `runtime` check.
-- **Not in host mode.** Container resources and preview ports don't apply. Telegram is unavailable: the plugin would live in your own Claude Code setup, which the host runtime doesn't load (`minions telegram install` refuses); the coordinator stays terminal-only. `init --runtime host` asks for the typed confirmation (non-interactive: `--runtime host --yes`); a host-wide default of `host` is never inherited by a non-interactive init.
+- **Not in host mode.** Container resources and preview ports don't apply. Telegram is unavailable: the plugin would live in your own Claude Code setup, which the host runtime doesn't load (`minions telegram install` refuses); the coordinator stays terminal-only (`communication.channel` `auto` simply means terminal there; explicit `telegram` warns). `init --runtime host` asks for the typed confirmation (non-interactive: `--runtime host --yes`); a host-wide default of `host` is never inherited by a non-interactive init.
 
 **Residual risks (read before choosing host mode)**
 
@@ -551,7 +573,7 @@ Switching needs the old runtime stopped (`minions down`). Agent branches, backlo
 | `minions doctor` | Check tools, Docker (or the host runtime's tmux/claude/backlog/git), image, container, Claude auth, backlog CLI, and deferred features |
 | `minions start` | Build the image if needed, start the container, import the repo, attach the coordinator (`--no-attach`) |
 | `minions down` | Stop and remove the project container (volumes kept), or stop the host runtime's tmux server |
-| `minions status` | Queue, workers, pause state, config revision, delivery mode |
+| `minions status` | Queue, workers, pause state, config revision, delivery mode, channel (configured vs effective) |
 | `minions pause` / `resume` | Persist scheduling controls |
 | `minions import` | Refresh the container workspace from the committed base branch (Git bundle) |
 | `minions export` | Fetch `agent/*` branches into `refs/remotes/minions/*` in your repository; local branches are untouched |
@@ -559,7 +581,8 @@ Switching needs the old runtime stopped (`minions down`). Agent branches, backlo
 | `minions auth show` / `set <login\|api-key\|helper\|jbcentral>` / `refresh` | Host-side Claude authorization (see [Claude authorization](#claude-authorization)) |
 | `minions setup github` | Guided GitHub setup: remote, base branch on the remote, pre-filled fine-grained token, delivery mode (`--yes` prints the next steps only; see [GitHub setup](#github-setup)) |
 | `minions setup assist` | AI setup assistant: opens your host Claude Code with a minions setup skill to finish the remaining setup (interactive; `--dry-run` prints the command; see [Setup assistant](#setup-assistant)) |
-| `minions auth github` / `telegram` | Store (or `--remove`) the project's GitHub token / Telegram bot token on the host; prompted without echo or `--stdin` |
+| `minions auth github` / `telegram` | Store (or `--remove`) the project's GitHub token / Telegram bot token on the host; prompted without echo or `--stdin` (`telegram` offers to switch a `terminal` channel to `auto`) |
+| `minions channel show` / `set <auto\|terminal\|telegram>` | Configured vs effective communication channel; set it in the project config (`configRevision` bump, `--yes`, `--dry-run`; restart-required; see [Communication](#communication)) |
 | `minions backlog ready` / `list` / `show` / `create` / `update` / `note` / `export` | Backend-neutral task operations (inside the container) |
 | `minions work claim` / `record` / `release` / `list` | Leases and worker results (used by the coordinator, inside the container) |
 | `minions work publish <taskId>` | Publish (or retry publishing) an approved task in branch / pull-request delivery; idempotent |
