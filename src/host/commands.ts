@@ -406,8 +406,9 @@ export function register(program: Command): void {
     .option('--timeout <seconds>', `wait this long for active workers (default ${DEFAULT_UPGRADE_TIMEOUT_SEC}; 0 with --now)`)
     .option('--now', 'release workers still active when the wait ends (reported as interrupted, re-dispatched after)')
     .option('--from-container [branch]', 'first export the container branches and fast-forward <branch> (default: the base branch) to minions/<base>; strict fast-forward on a clean tree only')
+    .option('--rebuild-cli', 'in a minions checkout: allow rebuilding/reinstalling the global CLI from it (runs its npm scripts and build on the host; review it first)')
     .option('--dry-run', 'list the steps without changing anything')
-    .action(action(async (o: { timeout?: string; now?: boolean; fromContainer?: string | boolean }, cmd: Command) => {
+    .action(action(async (o: { timeout?: string; now?: boolean; fromContainer?: string | boolean; rebuildCli?: boolean }, cmd: Command) => {
       requireMode('host');
       const { json, dryRun } = globalOpts(cmd);
       const timeoutSec = o.timeout === undefined ? (o.now ? 0 : DEFAULT_UPGRADE_TIMEOUT_SEC) : Number(o.timeout);
@@ -426,7 +427,7 @@ export function register(program: Command): void {
       const flags = [...(o.timeout !== undefined ? ['--timeout', String(timeoutSec)] : []), ...(o.now ? ['--now'] : [])];
       const r = await runUpgrade({
         source: () => runSourcePhase({
-          dryRun, handoff: process.env[HANDOFF_ENV] === '1', runningRoot: packageRoot(), log: (m) => say(json, m),
+          dryRun, handoff: process.env[HANDOFF_ENV] === '1', rebuildCli: !!o.rebuildCli, runningRoot: packageRoot(), log: (m) => say(json, m),
           checkout: isMinionsCheckout(ref.repoPath) ? ref.repoPath : null,
           sync: o.fromContainer === undefined ? null : {
             repo: ref.repoPath, baseBranch: project.baseBranch,

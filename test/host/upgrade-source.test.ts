@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { sourceFingerprint } from '../../scripts/source-fingerprint.mjs';
 import type { RunOptions, RunResult } from '../../src/core/exec.js';
 import { MinionsError } from '../../src/core/errors.js';
+import { run } from '../../src/core/exec.js';
 import { Compose } from '../../src/host/docker.js';
 import type { ExportResult } from '../../src/host/transfer.js';
 import { formatUpgrade, runUpgrade, type UpgradeResult } from '../../src/host/upgrade.js';
@@ -280,7 +281,7 @@ describe('installed CLI check', () => {
     const w: NpmWorld = { globalRoot: g, checkout: c, calls: [], lsResolved: `file:${c}` };
     const spawned: [string, string[]][] = [];
     const p = await runSourcePhase<UpgradeResult>(phaseBase({
-      checkout: c, runner: fakeNpm(w), continueArgs: ['--json', 'upgrade', '--now'],
+      checkout: c, runner: fakeNpm(w), continueArgs: ['--json', 'upgrade', '--now'], rebuildCli: true,
       spawnCli: async (cli, args) => { spawned.push([cli, args]); return { code: 0, stdout: JSON.stringify({ ok: true, data: childResult() }) + '\n', stderr: '' }; },
     }));
     expect(p.cli).toMatchObject({ action: 'rebuild', differs: true });
@@ -296,7 +297,7 @@ describe('installed CLI check', () => {
     realInstall(g, '0.1.0', 'old0000000000000', 'packed');
     const w: NpmWorld = { globalRoot: g, checkout: c, calls: [] };
     const p = await runSourcePhase<UpgradeResult>(phaseBase({
-      checkout: c, runner: fakeNpm(w),
+      checkout: c, runner: fakeNpm(w), rebuildCli: true,
       spawnCli: async () => ({ code: 0, stdout: JSON.stringify({ ok: true, data: childResult() }), stderr: '' }),
     }));
     expect(p.cli).toMatchObject({ action: 'reinstall', reason: 'installed 0.1.0 != checkout 0.2.0' });
@@ -385,11 +386,40 @@ describe('installed CLI check', () => {
     expect(r.reason).toMatch(/still different after the reinstall/);
   });
 
+  it('without --rebuild-cli never runs npm on the host: stops with the command and a rerun that opts in', async () => {
+    for (const kind of ['packed', 'link'] as const) {
+      const gg = tempDir('minions-global-');
+      const c = checkout();
+      if (kind === 'packed') realInstall(gg, '0.1.0', 'old0000000000000', 'packed');
+      else { stampDist(c, '0.2.0', 'old0000000000000', 'source'); symlinkSync(c, join(gg, 'minions')); }
+      const w: NpmWorld = { globalRoot: gg, checkout: c, calls: [], ...(kind === 'link' ? { lsResolved: `file:${c}` } : {}) };
+      const p = await runSourcePhase(phaseBase({ checkout: c, runner: fakeNpm(w), spawnCli: async () => { throw new Error('must not spawn'); } }));
+      expect(mutatingNpm(w.calls)).toEqual([]);
+      expect(p.ok).toBe(false);
+      expect(p.stop?.reason).toMatch(/runs the checkout's npm scripts and build on this host/);
+      expect(p.stop?.rerun).toMatch(/--rebuild-cli$/);
+    }
+  });
+
+  it('never builds commits just fast-forwarded from the container in the same run, even with --rebuild-cli', async () => {
+    const s = syncRepo();
+    const c = checkout();
+    realInstall(g, '0.1.0', 'old0000000000000', 'packed');
+    const w: NpmWorld = { globalRoot: g, checkout: c, calls: [] };
+    const p = await runSourcePhase(phaseBase({
+      checkout: c, runner: fakeNpm(w), rebuildCli: true, spawnCli: async () => { throw new Error('must not spawn'); },
+      sync: { repo: s.repo, branch: 'main', baseBranch: 'main', exportRepo: s.exportRepo, runner: run },
+    }));
+    expect(p.sync).toMatchObject({ action: 'fast-forward', applied: true });
+    expect(mutatingNpm(w.calls)).toEqual([]);
+    expect(p.stop?.reason).toMatch(/just fast-forwarded to commits from the container .*review them/);
+  });
+
   it('stops with the command when the reinstall fails, before any container step', async () => {
     const c = checkout();
     realInstall(g, '0.1.0', 'old0000000000000', 'packed');
     const w: NpmWorld = { globalRoot: g, checkout: c, calls: [], fail: 'install' };
-    const p = await runSourcePhase(phaseBase({ checkout: c, runner: fakeNpm(w), spawnCli: async () => { throw new Error('must not spawn'); } }));
+    const p = await runSourcePhase(phaseBase({ checkout: c, runner: fakeNpm(w), rebuildCli: true, spawnCli: async () => { throw new Error('must not spawn'); } }));
     expect(p.stop?.reason).toMatch(/reinstall failed: npm install failed: EACCES/);
     expect(p.steps[0]).toMatchObject({ id: 'cli', status: 'failed' });
   });

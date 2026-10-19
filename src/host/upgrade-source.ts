@@ -305,6 +305,11 @@ export interface SourcePhaseOptions {
   runningRoot?: string;
   /** This process already continues an upgrade after a reinstall: never reinstall again. */
   handoff?: boolean;
+  /**
+   * --rebuild-cli: the user reviewed the checkout and allows the upgrade to run its npm scripts/build
+   * on the host and install the result globally. Without it the command is printed and the upgrade stops.
+   */
+  rebuildCli?: boolean;
   /** Arguments that continue the upgrade on the new CLI, e.g. ['--json', 'upgrade', '--timeout', '60']. */
   continueArgs: string[];
   /** The human rerun command printed when the upgrade stops. */
@@ -339,6 +344,19 @@ export async function runSourcePhase<C>(opts: SourcePhaseOptions): Promise<Sourc
   if (!c.differs || dryRun) return out;
   if (c.action === 'manual') {
     out.stop = { reason: c.reason, command: c.command!, rerun: opts.rerun };
+    return out;
+  }
+  // Building runs the checkout's npm lifecycle scripts, esbuild config and lockfile dependencies on the
+  // host and installs the result as the global CLI. Commits just taken from the container are never
+  // built in the same run, and building at all needs the explicit --rebuild-cli opt-in.
+  const moved = !!out.sync && out.sync.action === 'fast-forward' && out.sync.applied;
+  if (moved || !opts.rebuildCli) {
+    const why = moved
+      ? `${c.reason}; the checkout was just fast-forwarded to commits from the container (${out.sync!.from?.slice(0, 12) ?? '?'}..${out.sync!.to?.slice(0, 12) ?? '?'}), which are not built in the same run: review them (git diff --stat ${out.sync!.from ?? ''} ${out.sync!.to ?? ''}), then rerun with --rebuild-cli or run the command yourself`
+      : `${c.reason}; rebuilding runs the checkout's npm scripts and build on this host and installs the result globally: review the checkout, then rerun with --rebuild-cli or run the command yourself`;
+    out.steps[out.steps.length - 1] = { id: 'cli', status: 'failed', detail: why };
+    out.ok = false;
+    out.stop = { reason: why, command: c.command!, rerun: `${opts.rerun} --rebuild-cli` };
     return out;
   }
   try {

@@ -497,8 +497,12 @@ The source phase (`src/host/upgrade-source.ts`) adds two steps, `sync` and `cli`
   `node <installed>/dist/cli.js --json upgrade [--timeout N] [--now]` with `MINIONS_UPGRADE_HANDOFF=1`
   and returns that result, source steps first, with `continued: true`. Under the hand-off variable a
   CLI that still differs stops with the command instead of reinstalling again.
-- **Trust.** Rebuilding runs the checkout's build scripts on the host. With `--from-container`, that
-  code comes from agent branches the user chose to take.
+- **Trust.** Rebuilding runs the checkout's npm lifecycle scripts, `esbuild.config.mjs` and lockfile
+  dependencies on the host and installs the result as the global CLI, and anything in a project repo
+  can claim to be a minions checkout (`package.json` name plus `src/cli.ts`). So the rebuild/reinstall
+  runs only with `--rebuild-cli`; without it the upgrade stops with the command (`ok: false`) and a
+  rerun that opts in. Commits fast-forwarded by `--from-container` are never built in the same run,
+  even with `--rebuild-cli`: the upgrade stops and names the range to review.
 
 ## Telegram bot token
 
