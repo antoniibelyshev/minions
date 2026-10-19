@@ -1,0 +1,398 @@
+import { randomBytes } from 'node:crypto';
+import type { BacklogAdapter, ScopeFilter, Task, TaskStatus } from '../backlog/types.js';
+import { can } from '../config/capabilities.js';
+import type { MinionsConfig } from '../config/schema.js';
+import { MinionsError } from '../core/errors.js';
+import type { Lease, LeaseRole, RuntimeDb } from './db.js';
+import { validateResult, type WorkerResult } from './results.js';
+import { BRANCH_PREFIX, branchFor, ensureBranchWorktree, ensureReviewWorktree, headOf, resolveBaseBranch, taskSlug, workspaceLayout, type WorkspaceLayout } from './worktree.js';
+
+export const LEASE_ROLES: readonly LeaseRole[] = ['engineer', 'tester', 'reviewer'];
+
+/** Backlog statuses a role may be claimed from. */
+export const ROLE_STATUSES: Record<LeaseRole, TaskStatus[]> = {
+  engineer: ['ready', 'changes-requested'],
+  tester: ['testing'],
+  reviewer: ['reviewing'],
+};
+
+/** Statuses that occupy active-task capacity even between worker stages. Blocked/human-waiting tasks do not. */
+export const IN_FLIGHT: TaskStatus[] = ['implementing', 'testing', 'reviewing', 'changes-requested', 'awaiting-ci', 'merging'];
+
+export interface SchedulerDeps {
+  db: RuntimeDb;
+  backlog: BacklogAdapter;
+  config: MinionsConfig;
+  layout?: WorkspaceLayout;
+}
+
+export interface Capacity {
+  activeTaskIds: string[];
+  activeEngineers: number;
+  maxActiveTasks: number;
+  maxEngineers: number;
+  freeTaskSlots: number;
+  freeEngineerSlots: number;
+}
+
+/** Readiness scope from config (mirrors backlog/commands scopeOf, kept local so hooks don't load the CLI module). */
+export const scopeOf = (cfg: MinionsConfig): ScopeFilter => ({
+  milestone: cfg.intake.scope.milestone, requiredLabels: [...cfg.intake.scope.requiredLabels], allowedPaths: [...cfg.intake.scope.allowedPaths],
+});
+
+/** Active tasks = tasks with an active lease ∪ tasks in an in-flight status. */
+export function capacityOf(config: MinionsConfig, leases: Lease[], tasks: Task[]): Capacity {
+  const ids = new Set(leases.map((l) => l.task_id));
+  for (const t of tasks) if (IN_FLIGHT.includes(t.status)) ids.add(t.id);
+  const activeEngineers = leases.filter((l) => l.role === 'engineer').length;
+  const { maxActiveTasks, maxEngineers } = config.execution;
+  return {
+    activeTaskIds: [...ids].sort(), activeEngineers, maxActiveTasks, maxEngineers,
+    freeTaskSlots: Math.max(0, maxActiveTasks - ids.size),
+    freeEngineerSlots: Math.max(0, maxEngineers - activeEngineers),
+  };
+}
+
+export interface TaskBrief {
+  briefMarker: string;
+  leaseId: string;
+  role: LeaseRole;
+  attempt: number;
+  task: {
+    id: string; locator: string; title: string; description: string; objective: string;
+    acceptanceCriteria: { text: string; done: boolean }[];
+    nonGoals: string[]; dependencies: string[]; labels: string[]; parent: string | null; externalLinks: string[];
+  };
+  relevantDecisions: string[];
+  relevantFiles: string[];
+  branch: string;
+  worktree: string;
+  baseBranch: string;
+  baseSha: string;
+  expectedHead: string;
+  verificationCommands: string[];
+  authorizedCommands: string[];
+  publication: Record<string, string>;
+  policy: { taskStart: string; codeEdit: string; gitCommit: string; sensitivePaths: string[]; architecture: string };
+  model: string;
+  allowedModels: string[];
+  effort: string | null;
+  maxTurns: number;
+  configRevision: number;
+  deliveryMode: string;
+  priorFindings: { leaseId: string; role: string; status: string; findings: unknown[]; nextAction: string }[];
+  resultContract: string;
+}
+
+export interface RecordResponse {
+  leaseId: string; taskId: string; role: LeaseRole; valid: boolean;
+  errors?: string[]; correctionAllowed?: boolean; unvalidated?: boolean;
+  from?: TaskStatus; to?: TaskStatus; approved: boolean; replan: boolean; needsSplit: boolean;
+  repairCycles?: number; headSha?: string; message: string;
+}
+
+const RESULT_CONTRACT = 'Return exactly one JSON object: {status: complete|needs_changes|blocked|needs_split|partial, summary, branch, headSha (full SHA of the branch head you leave), modifiedPaths[], checks[{command, outcome: pass|fail|skipped, details?}], acceptanceEvidence[{criterion, evidence}], findings[], nextAction, verdict?: approve|request-changes (reviewer only), usage? (only when actually available)}.';
+
+const newLeaseId = () => `lease-${randomBytes(6).toString('hex')}`;
+const nowIso = () => new Date().toISOString();
+
+export class Scheduler {
+  readonly db: RuntimeDb;
+  readonly backlog: BacklogAdapter;
+  readonly config: MinionsConfig;
+  readonly layout: WorkspaceLayout;
+
+  constructor(deps: SchedulerDeps) {
+    this.db = deps.db; this.backlog = deps.backlog; this.config = deps.config;
+    this.layout = deps.layout ?? workspaceLayout();
+  }
+
+  list(opts: { all?: boolean; taskId?: string } = {}): Lease[] { return this.db.leases(opts); }
+
+  async capacity(): Promise<Capacity> {
+    return capacityOf(this.config, this.db.activeLeases(), await this.backlog.listTasks());
+  }
+
+  /** Branch for a task: recorded branch, else an earlier lease's branch, else agent/<slug>. */
+  private branchForTask(task: Task): { slug: string; branch: string } {
+    const prior = this.db.leases({ taskId: task.id, all: true }).find((l) => l.branch)?.branch;
+    const branch = (task.branch && task.branch.startsWith(BRANCH_PREFIX) ? task.branch : null) ?? prior ?? branchFor(taskSlug(task.id, task.title));
+    return { branch, slug: branch.slice(BRANCH_PREFIX.length) };
+  }
+
+  async claim(taskId: string, role: LeaseRole, opts: { holder?: string } = {}): Promise<TaskBrief> {
+    if (!LEASE_ROLES.includes(role)) throw new MinionsError('INVALID_CONFIG', `Unknown role "${role}" (engineer|tester|reviewer).`);
+    const cfg = this.config;
+    if (this.db.paused().starts) {
+      throw new MinionsError('POLICY_DENIED', 'Starts are paused (paused_starts).', 'Run `minions resume` to allow new work.');
+    }
+    const startEffect = can(cfg, 'task.start', { role });
+    if (startEffect === 'deny') throw new MinionsError('POLICY_DENIED', `task.start is denied for role ${role} by configuration.`);
+
+    const task = await this.backlog.getTask(taskId);
+    if (!ROLE_STATUSES[role].includes(task.status)) {
+      throw new MinionsError('PRECONDITION', `Task ${task.id} is "${task.status}"; a ${role} can only be claimed from ${ROLE_STATUSES[role].join('|')}.`);
+    }
+    if (role === 'engineer' && task.status === 'ready') {
+      if (!task.authorized) throw new MinionsError('POLICY_DENIED', `Task ${task.id} is not authorized to start.`, 'Label it minions:authorized or enable intake.startReady.');
+      for (const dep of task.dependencies) {
+        let d: Task;
+        try { d = await this.backlog.getTask(dep); } catch (e) {
+          throw new MinionsError('PRECONDITION', `Task ${task.id}: dependency ${dep} cannot be read (${(e as Error).message}).`);
+        }
+        if (d.status !== 'done' && d.status !== 'delivered') throw new MinionsError('PRECONDITION', `Task ${task.id} depends on ${dep}, which is "${d.status}".`);
+      }
+    }
+    const allTasks = await this.backlog.listTasks();
+    const { branch, slug } = this.branchForTask(task);
+    const leaseId = newLeaseId();
+    const holder = opts.holder ?? `pid:${process.pid}`;
+
+    const attempt = this.db.transaction(() => {
+      const active = this.db.activeLeases();
+      const mine = active.find((l) => l.task_id === task.id);
+      if (mine) {
+        throw new MinionsError('CONFLICT', `Task ${task.id} already has an active ${mine.role} lease (${mine.id}).`,
+          'One active stage per task: wait for it, record its result, or release it.', { leaseId: mine.id, role: mine.role });
+      }
+      const cap = capacityOf(cfg, active, allTasks);
+      if (!cap.activeTaskIds.includes(task.id) && cap.activeTaskIds.length >= cfg.execution.maxActiveTasks) {
+        throw new MinionsError('CAPACITY', `Active task limit reached (${cap.activeTaskIds.length}/${cfg.execution.maxActiveTasks}: ${cap.activeTaskIds.join(', ')}).`,
+          'Finish, block, or release an active task first.', cap);
+      }
+      if (role === 'engineer' && cap.activeEngineers >= cfg.execution.maxEngineers) {
+        throw new MinionsError('CAPACITY', `Engineer limit reached (${cap.activeEngineers}/${cfg.execution.maxEngineers}).`, 'Wait for an engineer to finish.', cap);
+      }
+      const n = this.db.get<{ n: number }>('SELECT COUNT(*) AS n FROM leases WHERE task_id = ? AND role = ?', task.id, role)!.n + 1;
+      this.db.exec(`INSERT INTO leases (id, task_id, role, attempt, holder, branch, config_revision, started_at, status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active')`, leaseId, task.id, role, n, holder, branch, cfg.configRevision, nowIso());
+      this.db.addEvent('claim', task.id, { leaseId, role, attempt: n, fromStatus: task.status, holder });
+      return n;
+    });
+
+    let worktree: string, baseBranch: string, baseSha: string, head: string;
+    try {
+      if (role !== 'engineer' && !(await headOf(this.layout.repo, branch))) {
+        throw new MinionsError('PRECONDITION', `Task ${task.id} has no branch ${branch} to ${role === 'tester' ? 'test' : 'review'}.`, 'Run the engineer stage first.');
+      }
+      if (role === 'reviewer') {
+        const b = await resolveBaseBranch(this.layout.repo, cfg.git.baseBranch);
+        baseBranch = b.branch; baseSha = b.sha; head = (await headOf(this.layout.repo, branch))!;
+        worktree = (await ensureReviewWorktree(this.layout, slug, head)).worktree;
+      } else {
+        const wt = await ensureBranchWorktree(this.layout, slug, cfg.git.baseBranch);
+        baseBranch = wt.baseBranch; baseSha = wt.baseSha; head = wt.head; worktree = wt.worktree;
+      }
+      this.db.exec('UPDATE leases SET worktree = ?, base_sha = ?, head_sha = ? WHERE id = ?', worktree, baseSha, head, leaseId);
+      if (role === 'engineer') {
+        const fresh = await this.backlog.getTask(task.id);
+        await this.backlog.updateTask(task.id, fresh.version, { status: 'implementing', branch });
+      } else if (task.branch !== branch) {
+        const fresh = await this.backlog.getTask(task.id);
+        await this.backlog.updateTask(task.id, fresh.version, { branch });
+      }
+    } catch (e) {
+      this.endLease(leaseId, 'released', { reason: `claim failed: ${(e as Error).message}` });
+      throw e;
+    }
+
+    return this.buildBrief(this.db.lease(leaseId)!, task, { attempt, branch, worktree, baseBranch, baseSha, head, startEffect });
+  }
+
+  private buildBrief(lease: Lease, task: Task, x: { attempt: number; branch: string; worktree: string; baseBranch: string; baseSha: string; head: string; startEffect: string }): TaskBrief {
+    const cfg = this.config;
+    const role = lease.role;
+    const priorFindings = this.db.leases({ taskId: task.id, all: true })
+      .filter((l) => l.id !== lease.id && l.result_valid === 1 && l.result_json)
+      .slice(-3)
+      .map((l) => {
+        const r = JSON.parse(l.result_json!) as WorkerResult;
+        return { leaseId: l.id, role: l.role, status: r.status, findings: r.findings, nextAction: r.nextAction };
+      });
+    return {
+      briefMarker: `minions-lease: ${lease.id}`,
+      leaseId: lease.id,
+      role,
+      attempt: x.attempt,
+      task: {
+        id: task.id, locator: task.locator, title: task.title, description: task.description, objective: task.description,
+        acceptanceCriteria: task.acceptanceCriteria, nonGoals: [], dependencies: task.dependencies,
+        labels: task.labels, parent: task.parent, externalLinks: task.externalLinks,
+      },
+      relevantDecisions: [],
+      relevantFiles: [],
+      branch: x.branch,
+      worktree: x.worktree,
+      baseBranch: x.baseBranch,
+      baseSha: x.baseSha,
+      expectedHead: x.head,
+      verificationCommands: [...cfg.verification.commands],
+      authorizedCommands: ['git', ...cfg.verification.commands],
+      publication: {
+        'git.commit': role === 'reviewer' ? 'deny' : can(cfg, 'git.commit', { role }),
+        'git.push': can(cfg, 'git.push', { role }),
+        'pr.create': can(cfg, 'pr.create', { role }),
+      },
+      policy: {
+        taskStart: x.startEffect, codeEdit: can(cfg, 'code.edit', { role }), gitCommit: can(cfg, 'git.commit', { role }),
+        sensitivePaths: [...cfg.sensitivePaths], architecture: cfg.architecture,
+      },
+      model: cfg.models.default,
+      allowedModels: [...cfg.models.allowed],
+      effort: null,
+      maxTurns: cfg.execution.attemptMaxTurns,
+      configRevision: cfg.configRevision,
+      deliveryMode: cfg.delivery.mode,
+      priorFindings,
+      resultContract: RESULT_CONTRACT,
+    };
+  }
+
+  private endLease(id: string, status: Lease['status'], data: Record<string, unknown>, result?: { json: string; valid: number }): void {
+    this.db.transaction(() => {
+      const l = this.db.lease(id);
+      if (result) this.db.exec('UPDATE leases SET status = ?, ended_at = ?, result_json = ?, result_valid = ? WHERE id = ?', status, nowIso(), result.json, result.valid, id);
+      else this.db.exec('UPDATE leases SET status = ?, ended_at = ? WHERE id = ?', status, nowIso(), id);
+      this.db.addEvent(status === 'released' ? 'release' : 'record', l?.task_id ?? null, { leaseId: id, status, ...data });
+    });
+  }
+
+  private preClaimStatus(lease: Lease): TaskStatus | undefined {
+    const ev = this.db.events(lease.task_id, 'claim').find((e) => (e.data as { leaseId?: string })?.leaseId === lease.id);
+    return (ev?.data as { fromStatus?: TaskStatus } | undefined)?.fromStatus;
+  }
+
+  /** Puts an engineer's task back to its pre-claim status so it can be claimed again (worktree kept). */
+  private async restoreAfterEngineer(lease: Lease): Promise<TaskStatus | undefined> {
+    if (lease.role !== 'engineer') return undefined;
+    const from = this.preClaimStatus(lease) ?? 'ready';
+    const t = await this.backlog.getTask(lease.task_id);
+    if (t.status !== 'implementing') return t.status;
+    await this.backlog.updateTask(t.id, t.version, { status: from });
+    return from;
+  }
+
+  private activeLease(leaseId: string): Lease {
+    const lease = this.db.lease(leaseId);
+    if (!lease) throw new MinionsError('NOT_FOUND', `Lease ${leaseId} does not exist.`);
+    if (lease.status !== 'active') throw new MinionsError('CONFLICT', `Lease ${leaseId} already ended (${lease.status}).`);
+    return lease;
+  }
+
+  /** Releases a lease without a result. The worktree and branch are always preserved. */
+  async release(leaseId: string, reason: string): Promise<{ leaseId: string; taskId: string; worktree: string | null; branch: string | null; status: TaskStatus | null }> {
+    const lease = this.activeLease(leaseId);
+    this.endLease(leaseId, 'released', { reason });
+    let status: TaskStatus | null = null;
+    try {
+      status = (await this.restoreAfterEngineer(lease)) ?? (await this.backlog.getTask(lease.task_id)).status;
+      await this.backlog.addNote(lease.task_id, `minions: ${lease.role} lease ${leaseId} released: ${reason}. Worktree kept at ${lease.worktree ?? '(none)'}.`);
+    } catch (e) {
+      this.db.addEvent('release-backlog-error', lease.task_id, { leaseId, error: (e as Error).message });
+    }
+    return { leaseId, taskId: lease.task_id, worktree: lease.worktree, branch: lease.branch, status };
+  }
+
+  /** Validates and records a worker result, applies the transition and releases the lease. */
+  async record(leaseId: string, raw: unknown, opts: { correction?: boolean } = {}): Promise<RecordResponse> {
+    const lease = this.activeLease(leaseId);
+    const base = { leaseId, taskId: lease.task_id, role: lease.role, approved: false, replan: false, needsSplit: false };
+    if (lease.result_valid === 0 && !opts.correction) {
+      throw new MinionsError('PRECONDITION', `Lease ${leaseId} has an invalid result awaiting correction.`, 'Re-record with --correction (one correction is allowed).');
+    }
+    if (opts.correction && lease.result_valid !== 0) {
+      throw new MinionsError('PRECONDITION', `Lease ${leaseId} has no invalid result to correct.`, 'Record without --correction.');
+    }
+    const rawText = typeof raw === 'string' ? raw : JSON.stringify(raw);
+    const v = validateResult(raw, lease.role);
+    let errors: string[] = v.ok ? [] : v.errors;
+    const result = v.ok ? v.result : undefined;
+    let actualHead: string | null = null;
+    if (result) {
+      actualHead = lease.branch ? await headOf(this.layout.repo, lease.branch) : null;
+      if (result.branch !== lease.branch) errors.push(`branch: result names ${result.branch} but the lease is for ${lease.branch}`);
+      if (!actualHead) errors.push(`stale head: branch ${lease.branch} no longer exists`);
+      else if (result.headSha !== actualHead) errors.push(`stale head: result headSha ${result.headSha} but ${lease.branch} is at ${actualHead}`);
+      else if (lease.role === 'reviewer' && lease.head_sha && lease.head_sha !== actualHead) {
+        errors.push(`stale head: review started at ${lease.head_sha} but ${lease.branch} moved to ${actualHead}`);
+      }
+    }
+
+    if (errors.length) {
+      if (!opts.correction) {
+        this.db.transaction(() => {
+          this.db.exec('UPDATE leases SET result_json = ?, result_valid = 0 WHERE id = ?', rawText, leaseId);
+          this.db.addEvent('invalid-result', lease.task_id, { leaseId, errors });
+        });
+        return { ...base, valid: false, errors, correctionAllowed: true,
+          message: 'Result rejected; one bounded correction is allowed: fix the listed fields and re-record with --correction.' };
+      }
+      this.endLease(leaseId, 'unvalidated', { errors }, { json: rawText, valid: 0 });
+      try { await this.restoreAfterEngineer(lease); } catch (e) {
+        this.db.addEvent('record-backlog-error', lease.task_id, { leaseId, error: (e as Error).message });
+      }
+      return { ...base, valid: false, errors, correctionAllowed: false, unvalidated: true,
+        message: 'Correction also invalid: the raw result is stored unvalidated and nothing was approved. Interpret it and decide (reclaim, block, or ask the user).' };
+    }
+
+    const r = result!;
+    const head = actualHead!;
+    const cfg = this.config;
+    const task = await this.backlog.getTask(lease.task_id);
+    const from = task.status;
+    let to: TaskStatus = from;
+    let approved = false, replan = false, needsSplit = false, repairCycles: number | undefined;
+    let message = '';
+    const afterTesting: TaskStatus = cfg.verification.reviewerRequired ? 'reviewing' : 'delivered';
+
+    switch (r.status) {
+      case 'complete':
+        if (lease.role === 'engineer') to = cfg.verification.testerRequired ? 'testing' : afterTesting;
+        else if (lease.role === 'tester') to = afterTesting;
+        else {
+          const testerOk = !cfg.verification.testerRequired ||
+            this.db.evidenceFor(task.id, head, 'tester', cfg.configRevision).some((e) => e.outcome === 'complete');
+          if (testerOk) { to = 'delivered'; approved = true; message = `Approved at ${head}; delivered locally (export with minions export).`; }
+          else { to = 'testing'; message = `Approval not applied: no passing tester evidence for head ${head} at config revision ${cfg.configRevision}. Run the tester again.`; }
+        }
+        break;
+      case 'needs_changes':
+        if (lease.role === 'engineer') { to = this.preClaimStatus(lease) ?? 'ready'; message = 'Engineer reported needs_changes; task returned for re-planning.'; break; }
+        to = 'changes-requested';
+        if (lease.role === 'reviewer') {
+          repairCycles = this.db.incrementRepairs(task.id);
+          if (repairCycles >= cfg.execution.maxRepairCyclesBeforeReplan) {
+            replan = true; to = 'awaiting-human';
+            message = `Repair cycle ${repairCycles} reached the limit (${cfg.execution.maxRepairCyclesBeforeReplan}); replan the task before more repairs.`;
+          }
+        }
+        break;
+      case 'blocked': to = 'blocked'; break;
+      case 'needs_split': to = 'awaiting-human'; needsSplit = true; message = 'Worker reported needs_split: create child tasks idempotently and link dependencies.'; break;
+      case 'partial': to = lease.role === 'engineer' ? (this.preClaimStatus(lease) ?? 'ready') : from; message = 'Partial result recorded; status unchanged.'; break;
+    }
+
+    if (to !== from) {
+      if (to === 'delivered') await this.backlog.closeTask(task.id, 'delivered');
+      else await this.backlog.updateTask(task.id, task.version, { status: to });
+    }
+
+    this.db.transaction(() => {
+      this.db.addEvidence({ task_id: task.id, head_sha: head, kind: lease.role, config_revision: cfg.configRevision,
+        outcome: r.status, details_json: JSON.stringify({ leaseId, verdict: r.verdict ?? null, summary: r.summary }) });
+      for (const c of r.checks) {
+        this.db.addEvidence({ task_id: task.id, head_sha: head, kind: 'check', config_revision: cfg.configRevision,
+          outcome: c.outcome, details_json: JSON.stringify({ leaseId, command: c.command, details: c.details ?? null }) });
+      }
+      this.db.exec('UPDATE leases SET head_sha = ? WHERE id = ?', head, leaseId);
+      this.endLease(leaseId, 'completed', { from, to, approved, replan, needsSplit }, { json: JSON.stringify(r), valid: 1 });
+    });
+    try {
+      await this.backlog.addNote(task.id, `minions: ${lease.role} ${r.status}${r.verdict ? ` (${r.verdict})` : ''} at ${head.slice(0, 12)}: ${r.summary}`);
+    } catch (e) {
+      this.db.addEvent('record-backlog-error', task.id, { leaseId, error: (e as Error).message });
+    }
+    return { ...base, valid: true, from, to, approved, replan, needsSplit, repairCycles, headSha: head,
+      message: message || `Recorded ${lease.role} ${r.status}; task ${from} → ${to}.` };
+  }
+}

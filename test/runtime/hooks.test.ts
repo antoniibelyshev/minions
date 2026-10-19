@@ -1,0 +1,141 @@
+import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
+import { hookLog, MAX_LOG_BYTES, preAgentHook, runHook, stopHook } from '../../src/runtime/hooks.js';
+import { makeEnv, tmp, type Env } from './fixtures.js';
+
+let stateDir: string;
+beforeAll(() => { stateDir = tmp('minions-hooks-'); process.env.MINIONS_STATE_DIR = stateDir; });
+afterEach(() => vi.restoreAllMocks());
+
+const loader = (env: Env) => () => ({ db: env.db, backlog: env.backlog, config: env.config });
+const decision = (o: { stdout?: string }) => (o.stdout ? JSON.parse(o.stdout) : null);
+
+describe('stop hook', () => {
+  it('blocks with a bounded instruction, then allows stop after repeated no-progress', async () => {
+    const env = makeEnv();
+    env.backlog.add({ id: 'task-1' });
+    const a = await stopHook({ hook_event_name: 'Stop' }, loader(env));
+    expect(decision(a)).toMatchObject({ decision: 'block' });
+    expect(decision(a).reason).toMatch(/1 ready task\(s\) \(task-1\), capacity 2; run \/minions:orchestrate/);
+    const b = await stopHook({ stop_hook_active: true }, loader(env));
+    expect(decision(b)?.decision).toBe('block');
+    const c = await stopHook({ stop_hook_active: true }, loader(env));
+    expect(c.stdout).toBeUndefined();
+    expect(env.db.guard().last_reason).toBe('no-progress');
+    // stays quiet while nothing changes
+    expect((await stopHook({}, loader(env))).stdout).toBeUndefined();
+    // progress (a claim) resets the guard
+    env.backlog.add({ id: 'task-2' });
+    await env.sched.claim('task-1', 'engineer');
+    expect(decision(await stopHook({}, loader(env)))?.decision).toBe('block');
+  });
+
+  it('allows stop when paused', async () => {
+    const env = makeEnv();
+    env.backlog.add({ id: 'task-1' });
+    env.db.setPaused({ starts: true });
+    expect((await stopHook({}, loader(env))).stdout).toBeUndefined();
+    expect(env.db.guard().last_reason).toBe('paused');
+  });
+
+  it('allows stop when the only tasks are blocked', async () => {
+    const env = makeEnv();
+    env.backlog.add({ id: 'task-1', status: 'blocked' });
+    env.backlog.add({ id: 'task-2', dependencies: ['task-1'] });
+    expect((await stopHook({}, loader(env))).stdout).toBeUndefined();
+    expect(env.db.guard().last_reason).toBe('no-ready');
+  });
+
+  it('allows stop when there is no capacity', async () => {
+    const env = makeEnv();
+    for (const id of ['task-1', 'task-2', 'task-3']) env.backlog.add({ id });
+    await env.sched.claim('task-1', 'engineer');
+    await env.sched.claim('task-2', 'engineer');
+    expect((await stopHook({}, loader(env))).stdout).toBeUndefined();
+    expect(env.db.guard().last_reason).toBe('no-capacity');
+  });
+
+  it('allows stop on backlog error or unavailable state', async () => {
+    const env = makeEnv();
+    env.backlog.add({ id: 'task-1' });
+    env.backlog.failReady = true;
+    expect((await stopHook({}, loader(env))).stdout).toBeUndefined();
+    expect(env.db.guard().last_reason).toBe('backlog-error');
+    const r = await stopHook({}, () => { throw new Error('db locked'); });
+    expect(r.stdout).toBeUndefined();
+    expect(r.reason).toMatch(/db locked/);
+  });
+
+  it('allows stop while a background subagent is running', async () => {
+    const env = makeEnv();
+    env.backlog.add({ id: 'task-1' });
+    const r = await stopHook({ background_tasks: [{ id: 'x', type: 'subagent', status: 'running' }] }, loader(env));
+    expect(r.stdout).toBeUndefined();
+    expect(env.db.guard().last_reason).toBe('background-running');
+  });
+
+  it('continues for tasks awaiting the next stage', async () => {
+    const env = makeEnv();
+    env.backlog.add({ id: 'task-1', status: 'testing' });
+    expect(decision(await stopHook({}, loader(env))).reason).toMatch(/task-1:testing/);
+  });
+});
+
+describe('pre-agent hook', () => {
+  const agent = (subagent_type: string, prompt: string) => ({ hook_event_name: 'PreToolUse', tool_name: 'Agent', tool_input: { subagent_type, prompt, description: 'x' } });
+
+  it('denies an unclaimed minions:engineer and allows a claimed one', async () => {
+    const env = makeEnv();
+    env.backlog.add({ id: 'task-1' });
+    const none = await preAgentHook(agent('minions:engineer', 'implement task-1'), loader(env));
+    expect(decision(none)).toMatchObject({ hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny' } });
+    expect(decision(none).hookSpecificOutput.permissionDecisionReason).toMatch(/work claim/);
+    expect(decision(await preAgentHook(agent('minions:engineer', 'minions-lease: lease-deadbeef0000'), loader(env))).hookSpecificOutput.permissionDecision).toBe('deny');
+
+    const brief = await env.sched.claim('task-1', 'engineer');
+    const ok = await preAgentHook(agent('minions:engineer', `Brief...\n${brief.briefMarker}\n`), loader(env));
+    expect(ok.stdout).toBeUndefined();
+    // wrong role for the lease
+    expect(decision(await preAgentHook(agent('minions:tester', brief.briefMarker), loader(env))).hookSpecificOutput.permissionDecision).toBe('deny');
+    // released lease no longer authorizes
+    await env.sched.release(brief.leaseId, 'done');
+    expect(decision(await preAgentHook(agent('minions:engineer', brief.briefMarker), loader(env))).hookSpecificOutput.permissionDecision).toBe('deny');
+  });
+
+  it('passes other agent types through and fails closed for minions workers', async () => {
+    expect((await preAgentHook(agent('general-purpose', 'anything'), () => { throw new Error('x'); })).stdout).toBeUndefined();
+    const r = await preAgentHook(agent('minions:reviewer', 'minions-lease: lease-abc'), () => { throw new Error('db broken'); });
+    expect(decision(r).hookSpecificOutput.permissionDecision).toBe('deny');
+    expect(decision(r).hookSpecificOutput.permissionDecisionReason).toMatch(/db broken/);
+  });
+});
+
+describe('runHook', () => {
+  it('prints the exact Claude Code formats and logs redacted lines', async () => {
+    const env = makeEnv();
+    env.backlog.add({ id: 'task-1' });
+    const writes: string[] = [];
+    vi.spyOn(process.stdout, 'write').mockImplementation((s: string | Uint8Array) => { writes.push(String(s)); return true; });
+    await runHook('stop', loader(env), '{"hook_event_name":"Stop"}');
+    expect(JSON.parse(writes.join(''))).toEqual({ decision: 'block', reason: expect.any(String) });
+    writes.length = 0;
+    await runHook('pre-agent', loader(env), 'not json sk-ant-api03-abcdefghijklmnop');
+    expect(JSON.parse(writes.join('')).hookSpecificOutput.permissionDecision).toBe('deny');
+    writes.length = 0;
+    await runHook('stop', loader(env), 'garbage');
+    expect(writes).toEqual([]);
+    const log = readFileSync(join(stateDir, 'logs', 'hooks.log'), 'utf8');
+    expect(log).toMatch(/stop allow: unreadable/);
+    expect(log).not.toMatch(/sk-ant-api03-abcdefghijklmnop/);
+  });
+
+  it('rotates the hook log at ~1MB', () => {
+    const path = join(tmp(), 'logs', 'hooks.log');
+    hookLog('first', path);
+    writeFileSync(path, 'x'.repeat(MAX_LOG_BYTES + 10));
+    hookLog('after rotation', path);
+    expect(existsSync(`${path}.1`)).toBe(true);
+    expect(statSync(path).size).toBeLessThan(1000);
+  });
+});
