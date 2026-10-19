@@ -223,3 +223,100 @@ describe('minions sync', () => {
     expect(only.tasks.map((t) => t.taskId)).toEqual(['task-2']);
   });
 });
+
+describe('CI awareness edge cases (tester)', () => {
+  const HEAD = 'c'.repeat(40);
+  const url = (n: number) => `https://github.com/acme/demo/pull/${n}`;
+  const pr = (state: string, rollup: unknown[] = [], head = HEAD) =>
+    ({ state, isDraft: false, headRefOid: head, mergedAt: null, mergeStateStatus: 'CLEAN', statusCheckRollup: rollup });
+  const passRun = { __typename: 'CheckRun', name: 'build', status: 'COMPLETED', conclusion: 'SUCCESS' };
+
+  it('rules 404 with an unprotected branch is "none"; rules 403 makes it "unknown" unless protection already lists checks', async () => {
+    const r404 = fakeGh({ [`${R}/branches/main`]: branch(undefined, false) });
+    const a = await requiredChecksStatus(ghApi(r404.fn), 'acme/demo', 'main');
+    expect(a).toMatchObject({ state: 'none', rulesets: null, errors: [] });
+
+    const r403 = fakeGh({ [`${R}/branches/main`]: branch(undefined, false), [`${R}/rules/branches/main`]: httpErr(403, 'Forbidden') });
+    const b = await requiredChecksStatus(ghApi(r403.fn), 'acme/demo', 'main');
+    expect(b.state).toBe('unknown');
+    expect(b.errors.join()).toMatch(/rulesets unreadable/);
+
+    const prot = fakeGh({ [`${R}/branches/main`]: branch({ required_status_checks: { contexts: ['build'] } }), [`${R}/rules/branches/main`]: httpErr(403, 'Forbidden') });
+    expect(await requiredChecksStatus(ghApi(prot.fn), 'acme/demo', 'main')).toMatchObject({ state: 'configured', requiredChecks: ['build'] });
+    expectReadOnly([...r404.calls, ...r403.calls, ...prot.calls]);
+  });
+
+  it('transport failure (status 0) on every endpoint is "unknown", never "none"', async () => {
+    const down: GhFn = async () => ({ code: 1, stdout: '', stderr: 'error connecting to api.github.com' });
+    const rc = await requiredChecksStatus(ghApi(down), 'acme/demo', 'main');
+    expect(rc).toMatchObject({ state: 'unknown', workflows: null, protection: null, rulesets: null });
+    expect(rc.errors).toHaveLength(2);
+  });
+
+  it('redacts tokens that appear in gh/fetch error output', async () => {
+    const tok = 'ghp_' + 'A'.repeat(36);
+    const leaky: GhFn = async () => ({ code: 1, stdout: '', stderr: `auth with ${tok} failed (HTTP 401)` });
+    const rc = await requiredChecksStatus(ghApi(leaky), 'acme/demo', 'main');
+    expect(JSON.stringify(rc)).not.toContain(tok);
+    const f = (async () => new Response(JSON.stringify({ message: `Bad credentials for ${tok}` }), { status: 401 })) as unknown as typeof fetch;
+    const res = await fetchApi(tok, f)('/repos/acme/demo');
+    expect(res.status).toBe(401);
+    expect(res.error).toBe('HTTP 401: Bad credentials for gh*_[REDACTED]');
+    const report = await requiredChecksStatus(fetchApi(tok, f), 'acme/demo', 'main');
+    expect(JSON.stringify(report)).not.toContain(tok); // the raw body is never copied into the report
+  });
+
+  it('readiness for unknown state never fails and points at the token', () => {
+    const c = requiredChecksReadiness(defaults(), { repository: 'acme/demo', baseBranch: 'main', state: 'unknown', requiredChecks: [], protection: null, rulesets: null, workflows: null, errors: ['branch protection unreadable: HTTP 403'] }, { onGitHub: true });
+    expect(c.status).toBe('warn');
+    expect(c.detail).toMatch(/^unknown: .*HTTP 403.*requiredChecksConfigured false/);
+    expect(c.hint).toMatch(/minions auth github/);
+  });
+
+  it('sync is idempotent: unchanged outcome adds no notes and no duplicate evidence; new head is a new observation', async () => {
+    const env = makeEnv();
+    env.backlog.add({ id: 'task-1', status: 'delivered', prUrl: url(1) });
+    const prs: Record<string, unknown> = { [url(1)]: pr('OPEN', [passRun]) };
+    const gh = fakeGh({}, prs);
+    const deps = { db: env.db, backlog: env.backlog, config: env.config, gh: gh.fn };
+    await syncTasks(deps);
+    const r2 = await syncTasks(deps);
+    await syncTasks(deps);
+    expect(r2.tasks[0]!.changed).toBe(false);
+    expect(formatSync(r2)).toMatch(/\(unchanged\)/);
+    expect(env.backlog.notes).toHaveLength(1);
+    expect(env.db.evidenceFor('task-1', HEAD, 'ci')).toHaveLength(1);
+    expect(env.backlog.status('task-1')).toBe('delivered'); // open PR stays delivered, not awaiting-ci
+
+    const NEW = 'd'.repeat(40);
+    prs[url(1)] = pr('OPEN', [passRun], NEW);
+    const r4 = await syncTasks(deps);
+    expect(r4.tasks[0]).toMatchObject({ changed: true, headSha: NEW });
+    expect(env.backlog.notes).toHaveLength(2);
+    expect(env.db.evidenceFor('task-1', NEW, 'ci')).toHaveLength(1);
+    expectReadOnly(gh.calls);
+  });
+
+  it('ignores tasks without a prUrl even when named explicitly, and reports nothing to sync', async () => {
+    const env = makeEnv();
+    env.backlog.add({ id: 'task-1', status: 'delivered' });
+    const gh = fakeGh({}, {});
+    const r = await syncTasks({ db: env.db, backlog: env.backlog, config: env.config, gh: gh.fn }, { taskIds: ['task-1'] });
+    expect(r).toEqual({ tasks: [], synced: 0, failed: 0 });
+    expect(gh.calls).toHaveLength(0);
+    expect(formatSync(r)).toBe('No tasks with a pull request to sync.');
+  });
+
+  it('a closed PR does not block tasks outside delivery statuses; invalid gh output is a per-task error', async () => {
+    const env = makeEnv();
+    env.backlog.add({ id: 'task-1', status: 'reviewing', prUrl: url(1) });
+    env.backlog.add({ id: 'task-2', status: 'delivered', prUrl: url(2) });
+    const gh: GhFn = async (args) => args[2] === url(1) ? ok(JSON.stringify(pr('CLOSED'))) : ok('not json');
+    const r = await syncTasks({ db: env.db, backlog: env.backlog, config: env.config, gh });
+    expect(r.tasks[0]!.statusChange).toBeUndefined();
+    expect(env.backlog.status('task-1')).toBe('reviewing');
+    expect(r.tasks[1]!.error).toMatch(/invalid JSON/);
+    expect(env.backlog.status('task-2')).toBe('delivered');
+    expect(r).toMatchObject({ synced: 1, failed: 1 });
+  });
+});
