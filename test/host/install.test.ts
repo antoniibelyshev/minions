@@ -191,7 +191,7 @@ describe('init', () => {
     const repo = makeRepo(env.root);
     const e = await failure(runInit({ path: repo, yes: true, visibility: 'private', dockerProbe: dockerDown }));
     expect(e.code).toBe('DOCKER_UNAVAILABLE');
-    expect(e.message).toMatch(/no host fallback/);
+    expect(e.message).toMatch(/never falls back to the host/);
     expect(existsSync(env.home)).toBe(false);
     // dry-run still works and reports it
     const dry = await runInit({ path: repo, yes: true, visibility: 'private', dockerProbe: dockerDown, dryRun: true });

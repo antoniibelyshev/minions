@@ -1,7 +1,7 @@
 // `minions uninstall`: removes only manifest files unchanged since generation; keeps Docker volumes
 // (repository clone, backlog, runtime DB, Claude login) unless --delete-data is confirmed.
-import { readdir, readFile, rm, rmdir } from 'node:fs/promises';
-import { dirname } from 'node:path';
+import { readdir, readFile, rm, rmdir, stat } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
 import { MinionsError } from '../core/errors.js';
 import { sha256 } from '../core/fsutil.js';
 import { projectPaths, volumeNames } from '../core/paths.js';
@@ -9,6 +9,9 @@ import { clearSecrets, loadCredentialRefs } from './credentials.js';
 import { Compose, type Runner } from './docker.js';
 import { loadManifest } from './install.js';
 import { loadRegistry, projectForPath, saveRegistry } from './registry.js';
+import { readJsonIfExists } from '../core/fsutil.js';
+import { ProjectJsonSchema } from './project.js';
+import { HostRuntime, runtimeOf } from './runtime.js';
 
 export interface UninstallOptions {
   cwd: string;
@@ -25,6 +28,9 @@ export interface UninstallResult {
   kept: { path: string; reason: string }[];
   container: 'stopped' | 'stopped-and-volumes-deleted' | 'not-running-or-unavailable' | 'skipped';
   volumesKept: string[];
+  runtime: 'docker' | 'host';
+  /** Host runtime workspace/state (<project>/host): kept unless --delete-data. */
+  hostData: { path: string; deleted: boolean } | null;
 }
 
 async function pruneEmptyDirs(start: string, stop: string): Promise<void> {
@@ -42,9 +48,16 @@ export async function runUninstall(opts: UninstallOptions): Promise<UninstallRes
   const removed: string[] = [];
   const kept: UninstallResult['kept'] = [];
   const vols = Object.values(volumeNames(projectId));
+  const project = await readJsonIfExists(paths.projectJson, ProjectJsonSchema).catch(() => undefined);
+  const runtime = project ? runtimeOf(project) : 'docker';
+  const hostDir = paths.hostDir;
+  const hasHostData = await stat(hostDir).then(() => true, () => false);
 
   if (opts.deleteData && !opts.yes && !opts.dryRun) {
-    const ok = opts.confirm ? await opts.confirm(`Delete ALL data volumes (${vols.join(', ')}): repository clone, backlog, runtime DB, Claude login? (y/n)`) : false;
+    const what = runtime === 'host'
+      ? `Delete ALL host runtime data (${hostDir}: workspace clone with agent branches, backlog, runtime DB) and any Docker volumes of this project? (y/n)`
+      : `Delete ALL data volumes (${vols.join(', ')}): repository clone, backlog, runtime DB, Claude login? (y/n)`;
+    const ok = opts.confirm ? await opts.confirm(what) : false;
     if (!ok) throw new MinionsError('PRECONDITION', 'Data deletion not confirmed; nothing was changed.', 'Pass --yes to confirm non-interactively.');
   }
 
@@ -63,16 +76,21 @@ export async function runUninstall(opts: UninstallOptions): Promise<UninstallRes
   if (refs?.telegram) kept.push({ path: refs.telegram.ref, reason: 'Telegram bot token kept; run `minions auth telegram --remove` before uninstalling to delete it (or revoke it in BotFather)' });
 
   let container: UninstallResult['container'] = 'skipped';
+  let hostDeleted = false;
   if (!opts.dryRun) {
+    if (project && runtime === 'host') await new HostRuntime(project, opts.runner).down().catch(() => false);
     // Stop the container before its compose file goes away.
     const compose = new Compose(projectId, opts.runner);
     try {
       await compose.down({ volumes: !!opts.deleteData });
       container = opts.deleteData ? 'stopped-and-volumes-deleted' : 'stopped';
     } catch (e) {
-      if (opts.deleteData) throw new MinionsError('DOCKER_UNAVAILABLE', `Could not delete data volumes: ${(e as Error).message}`, 'Start Docker and rerun `minions uninstall --delete-data`.');
+      // A host-runtime project may never have had a container (or Docker): that is not an error.
+      if (opts.deleteData && runtime !== 'host') throw new MinionsError('DOCKER_UNAVAILABLE', `Could not delete data volumes: ${(e as Error).message}`, 'Start Docker and rerun `minions uninstall --delete-data`.');
       container = 'not-running-or-unavailable';
     }
+    if (opts.deleteData && hasHostData) { await rm(hostDir, { recursive: true, force: true }); hostDeleted = true; }
+    else if (hasHostData) await rm(join(hostDir, 'bin'), { recursive: true, force: true }); // shims are generated; data stays
     for (const p of toRemove) { await rm(p, { force: true }); removed.push(p); await pruneEmptyDirs(dirname(p), p.startsWith(paths.dir) ? paths.dir : entry.repoPath); }
     await rm(paths.manifestJson, { force: true });
     await rm(paths.journalJson, { force: true });
@@ -88,13 +106,19 @@ export async function runUninstall(opts: UninstallOptions): Promise<UninstallRes
   } else {
     removed.push(...toRemove);
   }
-  return { projectId, dryRun: !!opts.dryRun, removed, kept, container, volumesKept: opts.deleteData ? [] : vols };
+  if (hasHostData && !opts.deleteData) kept.push({ path: hostDir, reason: 'host runtime workspace and state kept; `minions uninstall --delete-data` deletes them' });
+  return {
+    projectId, dryRun: !!opts.dryRun, removed, kept, container,
+    volumesKept: opts.deleteData || (runtime === 'host' && container !== 'stopped') ? [] : vols,
+    runtime, hostData: hasHostData ? { path: hostDir, deleted: hostDeleted } : null,
+  };
 }
 
 export function formatUninstall(r: UninstallResult): string {
   const L = [`${r.dryRun ? 'Would remove' : 'Removed'} ${r.removed.length} generated file(s) for project ${r.projectId}.`];
   for (const k of r.kept) L.push(`  kept ${k.path} (${k.reason})`);
   L.push(`Container: ${r.container}.`);
+  if (r.hostData) L.push(r.hostData.deleted ? `Deleted host runtime data ${r.hostData.path}.` : `Host runtime data kept: ${r.hostData.path}.`);
   if (r.volumesKept.length) L.push(`Data volumes kept: ${r.volumesKept.join(', ')}.`, `  To delete them later: docker volume rm ${r.volumesKept.join(' ')}`);
   return L.join('\n');
 }

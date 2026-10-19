@@ -16,6 +16,7 @@ import { run, type RunOptions, type RunResult } from '../core/exec.js';
 import { atomicWrite, ensureDir, readJsonIfExists, writeJson } from '../core/fsutil.js';
 import { redact } from '../core/output.js';
 import { CONTAINER, defaultsPath, projectPaths } from '../core/paths.js';
+import { RuntimeKindSchema } from './runtime-kind.js';
 
 export type Runner = (cmd: string, args: string[], opts?: RunOptions) => Promise<RunResult>;
 
@@ -167,7 +168,8 @@ export async function resolveOnPath(cmd: string, pathEnv: string | undefined = p
 
 // ---------------------------------------------------------------- defaults.json
 
-export const DefaultsSchema = z.object({ claudeAuth: ClaudeAuthSchema.optional() }).strict();
+/** Host-wide defaults for new projects. `runtime` (docker|host) is host-only, like claudeAuth. */
+export const DefaultsSchema = z.object({ claudeAuth: ClaudeAuthSchema.optional(), runtime: RuntimeKindSchema.optional() }).strict();
 export type Defaults = z.infer<typeof DefaultsSchema>;
 export const loadDefaults = async (): Promise<Defaults> => (await readJsonIfExists(defaultsPath(), DefaultsSchema)) ?? {};
 export async function saveDefaults(d: Defaults): Promise<void> { await writeJson(defaultsPath(), d, { mode: 0o600 }); }

@@ -28,6 +28,22 @@ engineer → tester → reviewer lease flow, hooks, `export`, restart persistenc
 key provisioning (fake key script), and `uninstall`.
 It uses a temp `MINIONS_HOME` and disposable repos and removes its containers and volumes on exit.
 
+`npm run e2e:host` (scripts/e2e-host.sh) drives the host runtime with no Docker on `PATH`: init
+`--runtime host`, doctor host checks, `start --no-attach` (warning, separate clone, 0700 dirs), the lease
+flow through the shim, host-delegated status/pause/resume, a coordinator launch through a fake tmux and
+fake claude (dedicated `-L` server, sandbox settings, user `GH_TOKEN` dropped), the git credential helper
+through a shim path with a space, `export`, helper-mode Claude key (`apiKeyHelper` quoting), `runtime
+set`, and `uninstall --delete-data`. It installs the real `backlog.md@1.54.0` into its temp dir.
+
+### Host runtime (no Docker)
+
+| Component | Tested | Notes |
+| - | - | - |
+| Claude Code (host) | 2.1.292 | Sandbox keys checked against this version's settings schema; doctor warns on other versions. No real session in automated tests. |
+| Backlog.md (host) | 1.54.0 | Installed by you (`npm install -g backlog.md@1.54.0`). |
+| tmux (host) | fake only in e2e | `brew install tmux`; any 3.x expected to work (`-L`, `new-session -A/-d`, `has-session`, `kill-server`). |
+| gh (host) | not exercised | Optional, for pull-request delivery; wrapped by `host/bin/gh`. |
+
 ## Known gaps
 
 - **Intel (amd64) hosts** are not tested. The image is built natively on the host from a multi-arch
@@ -71,6 +87,12 @@ It uses a temp `MINIONS_HOME` and disposable repos and removes its containers an
   channel registered is visible only in the coordinator's startup notice. The plugin runs `bun install`
   at each start, so it needs npm registry access.
 - Native macOS/iOS builds (Xcode) cannot run inside the Linux runtime.
+- **Host runtime** is less safe by design: agents run as your macOS user. The Claude Code sandbox
+  (Seatbelt) confines Bash writes and denies credential reads, but the Read/Edit tools rely on
+  permission rules only, your user-level Claude Code settings/hooks/plugins also apply, network
+  outside the allowlist prompts rather than being blocked, and there are no CPU/memory/process limits.
+  The sandbox configuration has not been exercised against a live Claude session in automated tests.
+  Telegram is not set up automatically in host mode.
 - **Keychain access list**: the GitHub and Telegram Keychain items are created without a `-T` access list, so any
   process running as your macOS user can read them (normal macOS behaviour). The plaintext copy mounted into the
   container is cleared when `minions start` fails to bring the container up and by `minions doctor` when the container is

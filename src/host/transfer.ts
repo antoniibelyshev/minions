@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { matchesAny } from '../config/capabilities.js';
 import { MinionsError } from '../core/errors.js';
-import { run } from '../core/exec.js';
+import { run, type RunOptions, type RunResult } from '../core/exec.js';
 import { ensureDir } from '../core/fsutil.js';
 import { CONTAINER, SERVICE_NAME, projectPaths } from '../core/paths.js';
 import { HOST_GIT } from './discovery.js';
@@ -25,6 +25,26 @@ export function secretLikePaths(tracked: string[]): string[] {
   return tracked.filter((p) => matchesAny(p, SECRET_FILE_PATTERNS) && !SAFE_SUFFIXES.some((s) => p.endsWith(s)));
 }
 
+/**
+ * Where bundles go and how runtime commands run: the container (docker compose cp/exec) or the host
+ * runtime (<project>/host/state/{import,exports}, the `minions` shim). Remote paths are runtime paths.
+ */
+export interface TransferTarget {
+  dirs: { import: string; exports: string };
+  exec(args: string[], opts?: RunOptions): Promise<RunResult>;
+  putFile(local: string, remote: string): Promise<void>;
+  getFile(remote: string, local: string): Promise<void>;
+}
+
+export function composeTarget(compose: Compose): TransferTarget {
+  return {
+    dirs: { import: CONTAINER.import, exports: CONTAINER.exports },
+    exec: (args, opts) => compose.exec(args, opts),
+    putFile: (local, remote) => compose.cp(local, `${SERVICE_NAME}:${remote}`),
+    getFile: (remote, local) => compose.cp(`${SERVICE_NAME}:${remote}`, local),
+  };
+}
+
 interface Envelope<T> { ok: boolean; data?: T; error?: { code: string; message: string; hint?: string } }
 function parseEnvelope<T>(stdout: string, what: string): T {
   const line = stdout.trim().split('\n').filter(Boolean).at(-1) ?? '';
@@ -38,10 +58,10 @@ function parseEnvelope<T>(stdout: string, what: string): T {
 
 export interface ImportResult { bundle: string; commit: string; baseBranch: string; warnings: string[]; container: { head?: string; base?: string; imported?: boolean; origin?: { url: string; authenticated: boolean; fetched: boolean; warnings: string[] } } }
 
-export async function importRepo(project: ProjectJson, opts: { runner?: Runner; repoPath?: string; compose?: Compose } = {}): Promise<ImportResult> {
+export async function importRepo(project: ProjectJson, opts: { runner?: Runner; repoPath?: string; compose?: Compose; target?: TransferTarget } = {}): Promise<ImportResult> {
   const runner = opts.runner ?? run;
   const repo = opts.repoPath ?? project.repoPath;
-  const compose = opts.compose ?? new Compose(project.projectId, runner);
+  const target = opts.target ?? composeTarget(opts.compose ?? new Compose(project.projectId, runner));
   const git = (args: string[], allowFailure = false) => runner('git', [...HOST_GIT, ...args], { cwd: repo, allowFailure, timeoutMs: 300_000 });
   const base = project.baseBranch;
 
@@ -69,14 +89,14 @@ export async function importRepo(project: ProjectJson, opts: { runner?: Runner; 
   const bundle = join(tmp, file);
   try {
     await git(['bundle', 'create', bundle, `refs/heads/${base}`]);
-    await compose.cp(bundle, `${SERVICE_NAME}:${CONTAINER.import}/${file}`);
+    await target.putFile(bundle, `${target.dirs.import}/${file}`);
   } finally {
     await rm(tmp, { recursive: true, force: true });
   }
-  const args = ['minions', 'workspace', 'import', `${CONTAINER.import}/${file}`, '--base', base];
+  const args = ['minions', 'workspace', 'import', `${target.dirs.import}/${file}`, '--base', base];
   if (project.remoteUrl) args.push('--remote-url', project.remoteUrl);
   args.push('--json');
-  const r = await compose.exec(args, { allowFailure: true, timeoutMs: 600_000 });
+  const r = await target.exec(args, { allowFailure: true, timeoutMs: 600_000 });
   const data = parseEnvelope<ImportResult['container']>(r.stdout, 'workspace import');
   return { bundle: file, commit, baseBranch: base, warnings, container: data ?? {} };
 }
@@ -88,23 +108,28 @@ async function minionsRefs(runner: Runner, repo: string): Promise<Map<string, st
   return new Map(r.stdout.split('\n').filter(Boolean).map((l) => l.split(' ') as [string, string]));
 }
 
-export async function exportRepo(project: ProjectJson, opts: { runner?: Runner; repoPath?: string; compose?: Compose } = {}): Promise<ExportResult> {
+export async function exportRepo(project: ProjectJson, opts: { runner?: Runner; repoPath?: string; compose?: Compose; target?: TransferTarget } = {}): Promise<ExportResult> {
   const runner = opts.runner ?? run;
   const repo = opts.repoPath ?? project.repoPath;
-  const compose = opts.compose ?? new Compose(project.projectId, runner);
+  const target = opts.target ?? composeTarget(opts.compose ?? new Compose(project.projectId, runner));
   const file = `export-${new Date().toISOString().replace(/[:.]/g, '-')}.bundle`;
-  const r = await compose.exec(['minions', 'workspace', 'export', `${CONTAINER.exports}/${file}`, '--json'], { allowFailure: true, timeoutMs: 600_000 });
+  const r = await target.exec(['minions', 'workspace', 'export', `${target.dirs.exports}/${file}`, '--json'], { allowFailure: true, timeoutMs: 600_000 });
   const data = parseEnvelope<{ path: string; refs: string[] }>(r.stdout, 'workspace export');
   const exportsDir = projectPaths(project.projectId).exportsDir;
   await ensureDir(exportsDir);
   // The bundle name is chosen here, never taken from container output; the copied file must be a
   // regular file (an agent could swap it for a symlink or directory inside the container).
   const local = join(exportsDir, file);
-  await compose.cp(`${SERVICE_NAME}:${CONTAINER.exports}/${file}`, local);
+  // Host runtime: refuse a non-regular bundle before copying it (copyFile follows symlinks).
+  if (!opts.compose && opts.target) {
+    const src = await lstat(`${target.dirs.exports}/${file}`).catch(() => null);
+    if (!src?.isFile()) throw new MinionsError('PRECONDITION', 'The exported bundle is not a regular file; refusing to fetch it.', `Inspect ${target.dirs.exports}.`);
+  }
+  await target.getFile(`${target.dirs.exports}/${file}`, local);
   const st = await lstat(local).catch(() => null);
   if (!st?.isFile()) {
     await rm(local, { recursive: true, force: true });
-    throw new MinionsError('PRECONDITION', 'The exported bundle is not a regular file; refusing to fetch it.', 'Inspect /state/exports in the container.');
+    throw new MinionsError('PRECONDITION', 'The exported bundle is not a regular file; refusing to fetch it.', `Inspect ${target.dirs.exports} in the runtime.`);
   }
   const before = await minionsRefs(runner, repo);
   // Remote-tracking refs under refs/remotes/minions/ are minions-owned; forced updates there never touch local branches.

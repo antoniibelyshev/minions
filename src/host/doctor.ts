@@ -14,6 +14,11 @@ import { Compose, buildFingerprint, imageBuildLabel, type Runner } from './docke
 import { telegramDoctorCheck } from '../telegram/probe.js';
 import { loadEffectiveConfig, loadProjectJson } from './project.js';
 import { projectForPath } from './registry.js';
+import { HOST_RUNTIME_SHORT, HostRuntime, hostTools, prepareHostRuntime, runtimeOf } from './runtime.js';
+import type { ProjectJson } from './project.js';
+import { projectPaths } from '../core/paths.js';
+import { access } from 'node:fs/promises';
+import { constants } from 'node:fs';
 
 export type CheckStatus = 'ok' | 'warn' | 'fail' | 'unavailable';
 export interface Check { name: string; status: CheckStatus; detail: string; hint?: string }
@@ -119,6 +124,44 @@ function telegramAccessCheck(r: { code: number; stdout: string; stderr: string }
   return { name, status: data.access.state === 'ok' ? 'ok' : 'warn', detail, ...(data.access.hint ? { hint: redact(data.access.hint) } : {}) };
 }
 
+/** Host runtime: coordinator session, Claude auth on the host, launch probe, Telegram plugin (via the runtime shim). */
+async function hostRuntimeChecks(project: ProjectJson, auth: ClaudeAuth, baseUrl: string | undefined, channel: MinionsConfig['communication']['channel'] | undefined,
+  runner: Runner, add: Add, checks: Check[]): Promise<Check | undefined> {
+  const host = new HostRuntime(project, runner);
+  const running = await host.isRunning();
+  add('coordinator', running ? 'ok' : 'warn', running ? `tmux server ${host.paths.tmuxSocket} has the coordinator session` : `not running (tmux server ${host.paths.tmuxSocket})`,
+    running ? undefined : 'Run `minions start`.');
+  if (!running && await clearStaleSecrets(project.projectId, false).catch(() => false)) {
+    add('secrets.copy', 'warn', 'removed stale token copies from the secrets directory (host runtime not running)', '`minions start` writes them again.');
+  }
+  if (isKeyAuth(auth)) {
+    const readable = await access(projectPaths(project.projectId).apiKeyFile, constants.R_OK).then(() => true, () => false);
+    add('claude.auth', readable ? 'ok' : 'fail', readable ? 'key file readable; Claude Code uses apiKeyHelper' : 'key file not provisioned', readable ? undefined : 'Run `minions auth refresh`.');
+  } else {
+    const r = await runner('claude', ['auth', 'status'], { allowFailure: true, timeoutMs: 60_000 });
+    add('claude.auth', r.code === 0 ? 'ok' : 'warn', r.code === 0 ? 'Claude Code on the host is logged in (your own login is used)' : 'Claude Code on the host is not logged in',
+      r.code === 0 ? undefined : 'Run `claude` and /login once, or choose a key method with `minions auth set`.');
+  }
+  if (baseUrl) {
+    const ok = await fetch(baseUrl, { method: 'HEAD', redirect: 'manual', signal: AbortSignal.timeout(8000) }).then((res) => `HTTP ${res.status}`, () => null);
+    add('claude.baseUrl', ok ? 'ok' : 'fail', ok ? `${maskValue(baseUrl)} reachable from the host (${ok})` : `${maskValue(baseUrl)} not reachable from the host`,
+      ok ? undefined : 'Check the URL and that the service is running.');
+  }
+  if (!(await host.prepared())) {
+    for (const n of ['claude.capabilities', 'telegram.plugin']) add(n, 'warn', 'skipped: host runtime not prepared yet', 'Run `minions start --no-attach`.');
+    return undefined;
+  }
+  await prepareHostRuntime(project).catch(() => undefined);
+  const ex = (args: string[]) => host.exec(args, { allowFailure: true, timeoutMs: 60_000 });
+  const probe = await ex(['minions', 'coordinator', '--probe', '--json']);
+  add('claude.capabilities', probe.code === 0 ? 'ok' : 'fail', probe.code === 0 ? 'Claude Code supports the coordinator launch flags; launch command resolves; sandbox settings applied' : `coordinator probe failed (exit ${probe.code}): ${short(probe.stderr || probe.stdout)}`);
+  const tg = telegramDoctorCheck(await ex(['minions', 'telegram', 'probe', '--json']));
+  add('telegram.plugin', tg.status, tg.detail, tg.hint);
+  const tgPlugin = checks[checks.length - 1];
+  if (channel === 'telegram') checks.push(telegramAccessCheck(await ex(['minions', 'telegram', 'status', '--json'])));
+  return tgPlugin;
+}
+
 export async function runDoctor(opts: { cwd: string; runner?: Runner; probe?: DockerProbe; fetch?: Fetch }): Promise<DoctorReport> {
   const runner = opts.runner ?? run;
   const checks: Check[] = [];
@@ -127,11 +170,24 @@ export async function runDoctor(opts: { cwd: string; runner?: Runner; probe?: Do
   add('node', nodeVersionOk(process.version) ? 'ok' : 'fail', `host Node ${process.version} (requires >= 22.13)`,
     nodeVersionOk(process.version) ? undefined : 'Install Node 22.13 or newer.');
 
-  const docker = await (opts.probe ?? dockerProbe(runner))();
-  add('docker.daemon', docker.daemon ? 'ok' : 'fail', docker.daemon ? `Docker ${docker.serverVersion}` : `not reachable${docker.error ? `: ${short(docker.error)}` : ''}`,
-    docker.daemon ? undefined : 'Start Docker Desktop.');
-  add('docker.compose', docker.compose ? 'ok' : 'fail', docker.composeVersion ? `Compose ${docker.composeVersion}` : 'docker compose not found',
-    docker.compose ? undefined : 'Install Docker Compose v2 or newer (bundled with Docker Desktop).');
+  // The runtime decides which checks apply (host runtime: no Docker; host tools instead).
+  const pre = await projectForPath(opts.cwd).then((r) => loadProjectJson(r.projectId)).catch(() => null);
+  const hostMode = !!pre && runtimeOf(pre) === 'host';
+  const docker = hostMode
+    ? { daemon: false, compose: false, serverVersion: null, composeVersion: null }
+    : await (opts.probe ?? dockerProbe(runner))();
+  if (hostMode) {
+    add('runtime', 'warn', HOST_RUNTIME_SHORT, 'Switch back with `minions runtime set docker` (recommended for untrusted repositories).');
+    for (const t of await hostTools(runner)) {
+      add(`host.${t.name}`, t.ok ? 'ok' : t.required ? 'fail' : 'warn', t.detail, t.ok ? undefined : `Install: ${t.hint}`);
+    }
+  } else {
+    if (pre) add('runtime', 'ok', 'docker (hardened container)');
+    add('docker.daemon', docker.daemon ? 'ok' : 'fail', docker.daemon ? `Docker ${docker.serverVersion}` : `not reachable${docker.error ? `: ${short(docker.error)}` : ''}`,
+      docker.daemon ? undefined : 'Start Docker Desktop.');
+    add('docker.compose', docker.compose ? 'ok' : 'fail', docker.composeVersion ? `Compose ${docker.composeVersion}` : 'docker compose not found',
+      docker.compose ? undefined : 'Install Docker Compose v2 or newer (bundled with Docker Desktop).');
+  }
 
   let projectId: string | null = null;
   let effective: MinionsConfig | null = null;
@@ -139,7 +195,7 @@ export async function runDoctor(opts: { cwd: string; runner?: Runner; probe?: Do
   try {
     const ref = await projectForPath(opts.cwd);
     projectId = ref.projectId;
-    const project = await loadProjectJson(ref.projectId);
+    const project = pre ?? await loadProjectJson(ref.projectId);
     add('project', 'ok', `${project.projectId} (${project.visibility}, ${project.profile}) at ${project.repoPath}`);
     const auth = authOf(project);
     await hostAuthChecks(project.projectId, auth, add);
@@ -167,7 +223,9 @@ export async function runDoctor(opts: { cwd: string; runner?: Runner; probe?: Do
     }
     let tgPlugin: Check | undefined;
 
-    if (docker.daemon && docker.compose) {
+    if (hostMode) {
+      tgPlugin = await hostRuntimeChecks(project, auth, baseUrl, channel, runner, add, checks);
+    } else if (docker.daemon && docker.compose) {
       const label = await imageBuildLabel(project.imageTag, runner);
       const fp = buildFingerprint();
       if (label === null) add('image', 'warn', `${project.imageTag} not built yet`, '`minions start` builds it.');

@@ -43,9 +43,35 @@ export function projectPaths(projectId: string) {
     /** Non-secret record of the last key refresh (time, redacted error). */
     authStateJson: join(dir, 'auth-state.json'),
     logsDir: join(dir, 'logs'),
+    /** Host runtime (no Docker) only: the agents' own clone, state, and PATH shims. */
+    hostDir: join(dir, 'host'),
   };
 }
 export type ProjectPaths = ReturnType<typeof projectPaths>;
+
+/**
+ * Host runtime layout (`runtime: "host"` in project.json). The agents never work in the user's
+ * checkout: they get a separate clone under <project>/host/workspace, seeded from a Git bundle of the
+ * base branch exactly like the container workspace.
+ */
+export function hostRuntimePaths(projectId: string) {
+  const root = join(projectDir(projectId), 'host');
+  return {
+    root,
+    workspace: join(root, 'workspace'),
+    repo: join(root, 'workspace', 'repo'),
+    state: join(root, 'state'),
+    import: join(root, 'state', 'import'),
+    exports: join(root, 'state', 'exports'),
+    /** PATH shims: `minions` (pins the runtime environment) and the `gh` token wrapper. */
+    bin: join(root, 'bin'),
+    minionsShim: join(root, 'bin', 'minions'),
+    ghShim: join(root, 'bin', 'gh'),
+    /** Dedicated tmux server socket name (`tmux -L`), so the user's own tmux server is never touched. */
+    tmuxSocket: `minions-${shortId(projectId)}`,
+  };
+}
+export type HostRuntimePaths = ReturnType<typeof hostRuntimePaths>;
 
 /** Shared-install files inside the repository. */
 export function repoPaths(repoPath: string) {

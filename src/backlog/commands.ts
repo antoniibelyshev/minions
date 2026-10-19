@@ -85,7 +85,7 @@ export function register(program: Command): void {
   bl.command('ready').description('List tasks ready to start (priority order)')
     .option('--limit <n>', 'maximum number of tasks', '10')
     .action(action(async (opts: { limit: string }, cmd: Command) => {
-      requireMode('container');
+      requireMode('runtime');
       const limit = Number(opts.limit);
       if (!Number.isInteger(limit) || limit < 0) throw new MinionsError('PRECONDITION', `--limit must be a non-negative integer (got ${opts.limit})`);
       const { cfg, backlog } = await open();
@@ -96,14 +96,14 @@ export function register(program: Command): void {
 
   bl.command('list').description('List all tasks')
     .action(action(async (_opts: unknown, cmd: Command) => {
-      requireMode('container');
+      requireMode('runtime');
       const { backlog } = await open();
       emit({ tasks: await backlog.listTasks() }, { json: globalOpts(cmd).json, human: (d) => lines(d.tasks) });
     }));
 
   bl.command('show <id>').description('Show one task')
     .action(action(async (id: string, _opts: unknown, cmd: Command) => {
-      requireMode('container');
+      requireMode('runtime');
       const { backlog } = await open();
       emit(await backlog.getTask(id), { json: globalOpts(cmd).json, human: detail });
     }));
@@ -122,7 +122,7 @@ export function register(program: Command): void {
     .requiredOption('--key <idempotencyKey>', 'idempotency key; repeating it returns the existing task')
     .action(action(async (o: { title: string; description?: string; descriptionFile?: string; ac?: string[]; priority?: string;
       dep?: string[]; parent?: string; label?: string[]; status?: string; provenance?: string; key: string }, cmd: Command) => {
-      requireMode('container');
+      requireMode('runtime');
       if (o.description !== undefined && o.descriptionFile !== undefined) throw new MinionsError('PRECONDITION', 'Use --description or --description-file, not both');
       const description = o.descriptionFile !== undefined ? await readTextFile(o.descriptionFile) : o.description;
       const input = {
@@ -145,7 +145,7 @@ export function register(program: Command): void {
     .option('--branch <branch>', 'record the task branch')
     .action(action(async (id: string, o: { expectedVersion: string; status?: string; title?: string; priority?: string;
       label?: string[]; descriptionFile?: string; branch?: string }, cmd: Command) => {
-      requireMode('container');
+      requireMode('runtime');
       const patch: Parameters<BacklogAdapter['updateTask']>[2] = {};
       const status = oneOf<TaskStatus>('status', o.status, TASK_STATUSES);
       const priority = oneOf('priority', o.priority, PRIORITIES);
@@ -163,7 +163,7 @@ export function register(program: Command): void {
   bl.command('note <id>').description('Append an implementation note (text from --text or stdin)')
     .option('--text <text>', 'note text')
     .action(action(async (id: string, o: { text?: string }, cmd: Command) => {
-      requireMode('container');
+      requireMode('runtime');
       const text = o.text ?? (await readStdin());
       const { backlog } = await open();
       await backlog.addNote(id, text);
@@ -172,7 +172,7 @@ export function register(program: Command): void {
 
   bl.command('export').description('Export all tasks as JSON')
     .action(action(async (_opts: unknown, cmd: Command) => {
-      requireMode('container');
+      requireMode('runtime');
       const { backlog } = await open();
       const tasks = await backlog.exportTasks();
       emit({ tasks }, { json: globalOpts(cmd).json, human: (d) => JSON.stringify(d.tasks, null, 2) });

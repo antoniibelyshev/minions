@@ -9,13 +9,14 @@ reported as unavailable by `doctor` and the wizard, never faked.
 
 In:
 - Host CLI: `init [path]`, `doctor`, `start`, `down`, `status`, `pause`, `resume`,
-  `import`, `export`, `config show`, `auth show|set|refresh`, `auth github`, `auth telegram`, `uninstall`. All support `--json`; mutating ones `--dry-run`.
+  `import`, `export`, `config show`, `auth show|set|refresh`, `auth github`, `auth telegram`, `runtime show|set`, `uninstall`. All support `--json`; mutating ones `--dry-run`.
 - Runtime CLI (inside container): `backlog ready|list|show|create|update|note`,
   `work claim|record|release|list`, `hook stop|pre-agent`, `coordinator`, `status`, `pause`, `resume`.
 - Profiles `project-owner`, `personal-work`, `supervised`; shared + private visibility.
 - Backlog.md backend only. Delivery modes `local` (default; commits on `agent/<slug>` branches in the container clone, fetched to host with `minions export`), and, for the github provider, `branch` and `pull-request` (see "Branch and pull-request delivery"). minions never merges.
 - Terminal communication, plus optional Telegram through the official channel plugin (see [telegram.md](telegram.md)).
-- One Docker container per project, security baseline from spec §3A.
+- One Docker container per project, security baseline from spec §3A. Opt-in, less safe host runtime
+  without Docker (see "Host runtime").
 - Claude auth inside the container (interactive `/login`, persisted in the claude volume) by default, or
   host-provisioned keys: host-only `claudeAuth` in project.json (`api-key` from file/Keychain/env, or a
   `helper` argv such as the `jbcentral` preset), written to `projects/<id>/secrets/anthropic-api-key`
@@ -149,6 +150,59 @@ Decision record for `delivery.mode` `branch` / `pull-request` (`src/runtime/publ
   Shared installations append the task id and head SHA; private installations add nothing else. Notes,
   handoffs, worker results and decision records are never read for PR text.
 
+## Host runtime
+
+Decision record for running agents without Docker (`src/host/runtime.ts`, `src/host/runtime-cli.ts`,
+`hostSettings` in `src/runtime/coordinator.ts`).
+
+- **Selection is host-controlled.** `runtime: "docker" | "host"` in `project.json` (absent = docker) and
+  optionally in `<MINIONS_HOME>/defaults.json` for new projects. Set by `minions init --runtime`, the
+  wizard's first question (default docker; host needs the typed word `host`), or `minions runtime set`
+  (host: warning plus typed confirmation, or `--yes`; refused while the old runtime runs). The strict
+  MinionsConfig schema has no such field, so repository config cannot downgrade isolation. The
+  warning is printed by the wizard, `runtime set host`, every host `minions start` (stderr, also with
+  `--json`), init plans, and doctor (`runtime: warn`).
+- **Modes.** `MINIONS_RUNTIME` unset = host CLI, `container` = container runtime, `host` = host runtime
+  (`runtimeMode()` → `host-runtime`). Runtime commands accept both runtimes (`requireMode('runtime')`);
+  host-control commands (`init`, `auth`, `runtime`, `uninstall`, …) refuse to run inside either.
+- **Paths from the environment.** `runtimePaths()` defaults to the container paths and reads
+  `MINIONS_STATE_DIR`, `MINIONS_WORKSPACE`, `MINIONS_CONFIG`, `MINIONS_SECRETS_DIR`, `MINIONS_PLUGIN_DIR`,
+  `MINIONS_TMUX_SOCKET`; DB, backlog root, worktrees, hooks log, plugin dir, coordinator prompt, GitHub
+  token file and Claude key file derive from them. The host runtime sets them to
+  `projects/<id>/host/{workspace,state}`, `projects/<id>/{runtime/config.json,secrets,plugin}` and
+  `minions-<id8>`.
+- **Shim.** `projects/<id>/host/bin/minions` (regenerated on every start; 0755 in 0700 dirs) exports
+  those variables, `MINIONS_GIT_CREDENTIAL_HELPER` (`!'<shim>' git-credential`), `GIT_TERMINAL_PROMPT=0`,
+  the auth env, drops `GH_TOKEN`/`GITHUB_TOKEN`/`TMUX`/`TELEGRAM_BOT_TOKEN`, puts `host/bin` first on
+  `PATH`, and execs the installed CLI with the current Node. tmux, the plugin hooks
+  (`minions hook …`), the coordinator's `Bash(minions …)` calls and git's credential helper all go
+  through it. `host/bin/gh` is `docker/gh-wrapper.sh` with the host's real gh and token path.
+- **Delegation.** `status`, `pause`, `resume`, `work publish|approve`, `telegram probe|install|status`
+  run the shim with inherited stdio instead of `docker compose exec`. `start` = warning → host tools
+  (`tmux`, `claude`, `backlog`, `git` required; `gh` optional) → Claude key refresh (key methods) →
+  token copies → shims → `workspace setup` → bundle import if the clone is missing → `coordinator sync`
+  → `minions coordinator` (tmux `-L minions-<id8>` `new-session -A`). `down` = `tmux -L … kill-server`
+  plus token-copy removal. `import`/`export` use the same bundle flow through
+  `host/state/{import,exports}` (`TransferTarget`). `uninstall` kills the tmux server; `--delete-data`
+  deletes `host/`.
+- **Claude auth.** `login` reuses the user's own Claude Code login (no `CLAUDE_CONFIG_DIR` override).
+  Key methods use `apiKeyHelper: "cat '<secrets>/anthropic-api-key'"` (shell-quoted); env values are
+  not loopback-rewritten.
+- **Hardening (coordinator `--settings`).** Verified against the Claude Code 2.1.292 binary and docs
+  (code.claude.com/docs/en/sandboxing, /settings, /permissions): `sandbox.enabled: true`,
+  `autoAllowBashIfSandboxed: false` (the allowlist still governs prompts), `allowUnsandboxedCommands: false`,
+  `failIfUnavailable: true`, `filesystem.allowWrite` = workspace, state, `~/.npm`, `~/.cache`,
+  `filesystem.denyRead` = `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.config/gh`, `~/.docker`, `~/.kube`,
+  `~/.azure`, `~/.config/gcloud`, `~/Library/Keychains`, `~/.netrc`, `~/.npmrc`, `~/.pypirc` and the
+  credential store; `network.allowedDomains` = GitHub and the npm registry. Permission denies add
+  `Read`/`Edit` of the same paths, the secrets dir and credential store (`//abs` form), `Edit` of the
+  project's host-control files, and `Bash(security …)`, `Bash(gh auth …)`. The secrets dir is not in
+  `denyRead` because the git credential helper and gh wrapper run inside sandboxed `minions work`
+  commands. Not exercised against a real Claude session in tests (fakes only); the coordinator prompt
+  gets a host-runtime note with the real paths.
+- **Not supported in host mode:** container resources/ports, automatic Telegram plugin install (it
+  would modify the user's Claude Code setup).
+
 ## Telegram bot token
 
 A second credential kind on the same mechanism (`CredentialKind` in `src/host/credentials.ts`;
@@ -206,10 +260,11 @@ docker/Dockerfile  docker/entrypoint.sh
 test/                        vitest unit tests; test/docker/ opt-in (MINIONS_DOCKER_TESTS=1)
 ```
 
-`minions` decides host vs container mode by `MINIONS_RUNTIME=container` (set in the image).
-Host-only commands error with `INCOMPATIBLE_RUNTIME` inside the container and vice versa,
-except `status`/`pause`/`resume`, which on the host delegate to the container with
-`docker compose exec -T app minions <cmd> --json`.
+`minions` decides its mode by `MINIONS_RUNTIME`: unset = host CLI, `container` (set in the image),
+`host` (host runtime, set by the shim; see "Host runtime"). Host-only commands error with
+`INCOMPATIBLE_RUNTIME` inside a runtime and vice versa, except `status`/`pause`/`resume`, which on the
+host delegate to the project's runtime: `docker compose exec -T app minions <cmd> --json`, or the
+host runtime shim.
 
 ## Core contracts
 

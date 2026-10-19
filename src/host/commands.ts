@@ -20,6 +20,8 @@ import { dockerUnavailable, formatInit, refreshDerived, runInit } from './instal
 import { loadEffectiveConfig, loadProjectJson } from './project.js';
 import { projectForPath } from './registry.js';
 import { exportRepo, importRepo } from './transfer.js';
+import { HOST_RUNTIME_WARNING, HostRuntime, RUNTIMES, prepareHostRuntime, requireHostTools, runtimeOf, type RuntimeKind } from './runtime.js';
+import { registerRuntime } from './runtime-cli.js';
 import { formatUninstall, runUninstall } from './uninstall.js';
 import { readSecret, readlineIO } from './wizard.js';
 
@@ -102,8 +104,66 @@ async function ensureUp(json: boolean, opts: { provision?: boolean } = {}) {
   return p;
 }
 
+/**
+ * Host runtime counterpart of ensureUp: warning, host tools, Claude key (key methods), token copies,
+ * shims, and the state layout. Nothing Docker-related runs.
+ */
+async function ensureHost(json: boolean, opts: { provision?: boolean } = {}) {
+  const p = await openProject(json);
+  process.stderr.write(HOST_RUNTIME_WARNING.join('\n') + '\n'); // always (stderr): also in --json mode
+  await requireHostTools();
+  const auth = authOf(p.project);
+  if (isKeyAuth(auth) && opts.provision) {
+    say(json, `Refreshing the Claude key on the host (${auth.method === 'helper' ? `running \`${auth.command[0]}\`` : 'reading the configured source'})…`);
+    await refreshKey(p.project.projectId, auth);
+  }
+  const host = new HostRuntime(p.project);
+  const prepared = await prepareHostRuntime(p.project);
+  if (!prepared.gh && p.config.delivery.mode === 'pull-request') say(json, 'warning: gh is not installed on the host; pull-request delivery cannot open PRs (brew install gh).');
+  await materialize(json, p.project.projectId);
+  const setup = await host.exec(['minions', 'workspace', 'setup', '--json'], { allowFailure: true, timeoutMs: 120_000 });
+  if (setup.code !== 0) throw new MinionsError('INTERNAL', `Host runtime state setup failed: ${lastLine(setup.stdout, setup.stderr)}`);
+  return { ...p, host };
+}
+
+async function startHost(json: boolean, o: { attach: boolean }): Promise<void> {
+  const { project, config, host } = await ensureHost(json, { provision: true });
+  let imported: unknown = null;
+  const present = (await host.exec(['git', '-C', host.paths.repo, 'rev-parse', '--git-dir'], { allowFailure: true, timeoutMs: 30_000 })).code === 0;
+  if (!present) {
+    say(json, `Cloning committed history of ${project.baseBranch} into the host runtime workspace (${host.paths.workspace})…`);
+    const r = await importRepo(project, { repoPath: (await projectForPath(process.cwd())).repoPath, target: host.transferTarget() });
+    for (const w of r.warnings) say(json, `warning: ${w}`);
+    imported = r;
+  }
+  if (config.communication.channel === 'telegram') {
+    say(json, 'warning: host runtime: the Telegram channel plugin is not installed automatically (it would change your own Claude Code setup). Install it yourself with `claude plugin install telegram@claude-plugins-official`, or the coordinator runs terminal-only.');
+  }
+  const attach = o.attach && !json && !!process.stdin.isTTY && !!process.stdout.isTTY;
+  const sync = await host.exec(['minions', 'coordinator', 'sync', '--json', ...(!attach && config.communication.channel === 'telegram' ? ['--start-detached'] : [])], { allowFailure: true, timeoutMs: 60_000 });
+  let coordinator: unknown = null;
+  try { coordinator = (JSON.parse(sync.stdout) as { data?: unknown }).data ?? null; } catch { say(json, `warning: coordinator sync failed: ${lastLine(sync.stdout, sync.stderr)}`); }
+  if (!attach) {
+    emit({ projectId: project.projectId, runtime: 'host', running: await host.isRunning(), imported, coordinator, workspace: host.paths.workspace, attach: host.attachCommand },
+      { json, human: () => `Host runtime prepared (workspace ${host.paths.repo}). Run \`minions start\` in a terminal to attach the coordinator.` });
+    return;
+  }
+  const auth = authOf(project);
+  say(json, auth.method === 'login'
+    ? `Attaching the coordinator (tmux server ${host.paths.tmuxSocket}, session "coordinator"). Claude Code uses your existing host login.`
+    : `Attaching the coordinator (tmux server ${host.paths.tmuxSocket}, session "coordinator"). Claude uses the host-provisioned key.`);
+  const stopRefresh = startRefreshTimer(project.projectId, auth, { onWarn: (line) => process.stderr.write(`\r\n${line}\r\n`) });
+  try { process.exitCode = await host.execInherit(['minions', 'coordinator']); } finally { stopRefresh(); }
+}
+
 const repoPresent = async (compose: Compose) =>
   (await compose.exec(['git', '-C', CONTAINER.repo, 'rev-parse', '--git-dir'], { allowFailure: true, timeoutMs: 30_000 })).code === 0;
+
+async function askLine(question: string): Promise<string | null> {
+  if (!process.stdin.isTTY) return null;
+  const rl = createInterface({ input: process.stdin, output: process.stderr });
+  try { return (await rl.question(`${question} `)).trim(); } finally { rl.close(); }
+}
 
 async function confirm(question: string): Promise<boolean> {
   if (!process.stdin.isTTY) return false;
@@ -115,7 +175,7 @@ async function confirm(question: string): Promise<boolean> {
 export function register(program: Command): void {
   const auth = registerAuth(program, async (plan) => { process.stderr.write(plan + '\n'); return confirm('Apply? (y/n)'); });
   program.command('init [path]')
-    .description('Inspect a Git repository, propose an install plan, apply it, and verify Docker')
+    .description('Inspect a Git repository, propose an install plan, apply it, and verify the runtime')
     .addOption(new Option('--profile <profile>', 'starting profile').choices([...PROFILES]))
     .option('--private', 'private install: nothing is written into the repository')
     .option('--shared', 'shared install: writes .minions/config.json and .minions/README.md')
@@ -124,7 +184,8 @@ export function register(program: Command): void {
     .option('--dry-run', 'show the plan without writing anything')
     .option('--attach', 'attach this repository to the project id in .minions/config.json')
     .option('--new-identity', 'create a new project identity for this repository')
-    .action(action(async (path: string | undefined, o: { profile?: Profile; private?: boolean; shared?: boolean; yes?: boolean; config?: string; dryRun?: boolean; attach?: boolean; newIdentity?: boolean }, cmd: Command) => {
+    .addOption(new Option('--runtime <runtime>', 'agent runtime: docker (default) or host (no Docker, less safe; prints a warning)').choices([...RUNTIMES]))
+    .action(action(async (path: string | undefined, o: { profile?: Profile; private?: boolean; shared?: boolean; yes?: boolean; config?: string; dryRun?: boolean; attach?: boolean; newIdentity?: boolean; runtime?: RuntimeKind }, cmd: Command) => {
       requireMode('host');
       const { json } = globalOpts(cmd);
       if (o.private && o.shared) throw new MinionsError('INVALID_CONFIG', '--private and --shared are mutually exclusive.');
@@ -137,7 +198,7 @@ export function register(program: Command): void {
         const r = await runInit({
           path: resolvePath(path ?? '.'), profile: o.profile, visibility: o.private ? 'private' : o.shared ? 'shared' : undefined,
           yes: !interactive, configFile: o.config ? resolvePath(o.config) : undefined, dryRun: o.dryRun,
-          attach: o.attach, newIdentity: o.newIdentity, io,
+          attach: o.attach, newIdentity: o.newIdentity, io, runtime: o.runtime,
         });
         emit(r, { json, human: formatInit });
       } finally { io?.close?.(); }
@@ -153,11 +214,13 @@ export function register(program: Command): void {
     }));
 
   program.command('start')
-    .description('Build the image if needed, start the container, import the repo, and attach the coordinator')
-    .option('--no-attach', 'start the container without attaching to the coordinator')
+    .description('Start the agent runtime (container, or the host runtime), import the repo, and attach the coordinator')
+    .option('--no-attach', 'start the runtime without attaching to the coordinator')
     .action(action(async (o: { attach: boolean }, cmd: Command) => {
       requireMode('host');
       const { json } = globalOpts(cmd);
+      const { projectId } = await projectForPath(process.cwd());
+      if (runtimeOf(await loadProjectJson(projectId)) === 'host') return startHost(json, o);
       const { project, compose, config } = await ensureUp(json, { provision: true });
       let imported: unknown = null;
       if (!(await repoPresent(compose))) {
@@ -171,7 +234,7 @@ export function register(program: Command): void {
       // Telegram must work with nobody attached: start the session detached in that case.
       const coordinator = await telegramStartup(json, compose, config, { startDetached: !attach && config.communication.channel === 'telegram' });
       if (!attach) {
-        emit({ projectId: project.projectId, running: true, imported, coordinator, attach: `docker compose -p ${compose.name} -f ${compose.file} exec ${'app'} minions coordinator` },
+        emit({ projectId: project.projectId, runtime: 'docker', running: true, imported, coordinator, attach: `docker compose -p ${compose.name} -f ${compose.file} exec ${'app'} minions coordinator` },
           { json, human: () => `Container ${compose.name} is running. Run \`minions start\` in a terminal to attach the coordinator.` });
         return;
       }
@@ -184,19 +247,29 @@ export function register(program: Command): void {
     }));
 
   program.command('down')
-    .description('Stop and remove the project container (volumes are kept)')
+    .description('Stop the agent runtime: remove the container (volumes kept) or stop the host runtime tmux server')
     .option('--dry-run', 'show what would be stopped')
     .action(action(async (_o: unknown, cmd: Command) => {
       requireMode('host');
       const { json, dryRun } = globalOpts(cmd);
       const { projectId } = await projectForPath(process.cwd());
+      const project = await loadProjectJson(projectId);
+      if (runtimeOf(project) === 'host') {
+        const host = new HostRuntime(project);
+        const was = dryRun ? false : await host.down();
+        if (!dryRun) await clearSecrets(projectId);
+        emit({ projectId, runtime: 'host', stopped: !dryRun, wasRunning: was, dryRun }, { json, human: () => dryRun
+          ? `Would stop the host runtime (tmux server ${host.paths.tmuxSocket}) and remove the materialized token copies.`
+          : `Stopped the host runtime (tmux server ${host.paths.tmuxSocket}${was ? '' : ', was not running'}); workspace and state kept in ${host.paths.root}.` });
+        return;
+      }
       const compose = new Compose(projectId);
       if (!dryRun) { await requireDocker(); await compose.down(); await clearSecrets(projectId); }
-      emit({ projectId, stopped: !dryRun, dryRun }, { json, human: () => dryRun ? `Would stop ${compose.name}.` : `Stopped ${compose.name}; volumes kept.` });
+      emit({ projectId, runtime: 'docker', stopped: !dryRun, dryRun }, { json, human: () => dryRun ? `Would stop ${compose.name}.` : `Stopped ${compose.name}; volumes kept.` });
     }));
 
   program.command('import')
-    .description('Import committed history of the base branch into the container workspace (git bundle)')
+    .description('Import committed history of the base branch into the runtime workspace (git bundle)')
     .option('--dry-run', 'show what would be imported')
     .action(action(async (_o: unknown, cmd: Command) => {
       requireMode('host');
@@ -207,26 +280,37 @@ export function register(program: Command): void {
         emit({ dryRun: true, baseBranch: p.baseBranch, note: 'committed history only; dirty, untracked and ignored files are not imported' }, { json });
         return;
       }
-      const { project } = await ensureUp(json);
-      const r = await importRepo(project, { repoPath: (await projectForPath(process.cwd())).repoPath });
-      emit(r, { json, human: (d: typeof r) => [`Imported ${d.baseBranch} @ ${d.commit.slice(0, 12)} into the container.`,
+      const { projectId } = await projectForPath(process.cwd());
+      const isHost = runtimeOf(await loadProjectJson(projectId)) === 'host';
+      const r = isHost
+        ? await (async () => { const h = await ensureHost(json); return importRepo(h.project, { repoPath: (await projectForPath(process.cwd())).repoPath, target: h.host.transferTarget() }); })()
+        : await (async () => { const { project } = await ensureUp(json); return importRepo(project, { repoPath: (await projectForPath(process.cwd())).repoPath }); })();
+      emit(r, { json, human: (d: typeof r) => [`Imported ${d.baseBranch} @ ${d.commit.slice(0, 12)} into the ${isHost ? 'host runtime workspace' : 'container'}.`,
         ...(d.container.origin ? [`origin ${d.container.origin.url}: ${d.container.origin.authenticated ? 'authenticated' : 'not authenticated'}, ${d.container.origin.fetched ? 'base fetched' : 'not fetched'}`] : []),
         ...[...d.warnings, ...(d.container.origin?.warnings ?? [])].map((w) => `warning: ${w}`)].join('\n') });
     }));
 
   program.command('export')
-    .description('Fetch agent branches from the container into refs/remotes/minions/* (non-destructive)')
+    .description('Fetch agent branches from the runtime workspace into refs/remotes/minions/* (non-destructive)')
     .option('--dry-run', 'show what would be exported')
     .action(action(async (_o: unknown, cmd: Command) => {
       requireMode('host');
       const { json, dryRun } = globalOpts(cmd);
       const ref = await projectForPath(process.cwd());
       if (dryRun) { emit({ dryRun: true, target: 'refs/remotes/minions/*' }, { json }); return; }
-      await requireDocker();
       const project = await loadProjectJson(ref.projectId);
-      const compose = new Compose(ref.projectId);
-      if (!(await compose.isRunning())) throw new MinionsError('PRECONDITION', 'The project container is not running.', 'Run `minions start --no-attach` first.');
-      const r = await exportRepo(project, { repoPath: ref.repoPath, compose });
+      let r;
+      if (runtimeOf(project) === 'host') {
+        const host = new HostRuntime(project);
+        if (!(await host.prepared())) throw new MinionsError('PRECONDITION', 'The host runtime has not been started for this project.', 'Run `minions start --no-attach` first.');
+        await prepareHostRuntime(project);
+        r = await exportRepo(project, { repoPath: ref.repoPath, target: host.transferTarget() });
+      } else {
+        await requireDocker();
+        const compose = new Compose(ref.projectId);
+        if (!(await compose.isRunning())) throw new MinionsError('PRECONDITION', 'The project container is not running.', 'Run `minions start --no-attach` first.');
+        r = await exportRepo(project, { repoPath: ref.repoPath, compose });
+      }
       emit(r, { json, human: (d: typeof r) => [`Bundle: ${d.bundle}`,
         ...(d.changes.length ? d.changes.map((c) => `  ${c.ref}: ${c.from?.slice(0, 12) ?? '(new)'} -> ${c.to?.slice(0, 12) ?? '(deleted)'}`) : ['  no ref changes']),
         'Local branches and the working tree were not modified.'].join('\n') });
@@ -260,7 +344,9 @@ export function register(program: Command): void {
       const compose = new Compose(project.projectId);
       let mounted = false;
       let needsRestart = false;
-      const vis = await compose.secretsVisibility();
+      const vis = runtimeOf(project) === 'host'
+        ? (await new HostRuntime(project).prepared() ? 'mounted' : 'not-running')
+        : await compose.secretsVisibility();
       if (vis === 'mounted') { await materialize(json, project.projectId); mounted = true; }
       else if (vis === 'restart-required') needsRestart = true; // container predates the secrets mount: a copy would not reach it
       emit({ ...r, mountedPath: CONTAINER.githubTokenFile, visibleInRunningContainer: mounted, ...(needsRestart ? { restartRequired: true } : {}) }, { json, human: () => [
@@ -322,6 +408,8 @@ export function register(program: Command): void {
         'Telegram is used only when communication.channel is "telegram" (check with `minions config show --explain`).',
       ].join('\n') });
     }));
+
+  registerRuntime(program, { confirm, ask: askLine });
 
   const config = program.command('config').description('Inspect configuration');
   config.command('show')

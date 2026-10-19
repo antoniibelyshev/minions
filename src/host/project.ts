@@ -8,6 +8,7 @@ import { readJson, readJsonIfExists } from '../core/fsutil.js';
 import { projectPaths, repoPaths } from '../core/paths.js';
 import { VERSION } from '../core/version.js';
 import { ClaudeAuthSchema } from './auth.js';
+import { RuntimeKindSchema } from './runtime-kind.js';
 
 const port = z.number().int().min(1).max(65535);
 
@@ -34,6 +35,11 @@ export const ProjectJsonSchema = z.object({
    * MinionsConfig schema rejects). Absent = interactive login inside the container.
    */
   claudeAuth: ClaudeAuthSchema.optional(),
+  /**
+   * Agent runtime (host-only, like claudeAuth): absent/"docker" = hardened container; "host" = agents run
+   * directly on the Mac (less safe; `minions runtime set host`). Never read from repository config.
+   */
+  runtime: RuntimeKindSchema.optional(),
 }).strict();
 export type ProjectJson = z.infer<typeof ProjectJsonSchema>;
 
