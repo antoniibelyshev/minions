@@ -116,6 +116,8 @@ describe.skipIf(!hasCli)('Backlog.md adapter (real CLI)', () => {
     expect(u).toMatchObject({ branch: 'agent/first-task', description: 'Do the thing\n\nwith detail', provenance: 'agent-hypothesis' });
     const u2 = await a.updateTask('task-1', u.version, { description: 'New text' });
     expect(u2).toMatchObject({ branch: 'agent/first-task', description: 'New text', provenance: 'agent-hypothesis' });
+    const u3 = await a.updateTask('task-1', u2.version, { prUrl: 'https://github.com/o/r/pull/7' });
+    expect(u3).toMatchObject({ branch: 'agent/first-task', prUrl: 'https://github.com/o/r/pull/7', description: 'New text' });
   });
 
   it('adds dependencies (merging) and rejects cycles with the path', async () => {

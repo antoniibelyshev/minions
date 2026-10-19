@@ -97,7 +97,15 @@ function deliveryGuidance(cfg: MinionsConfig): string {
   if (cfg.delivery.mode === 'local') {
     return 'Approved tasks end as `delivered` with their commits on `agent/<slug>` branches in the container clone. Nothing is pushed; the user fetches branches with `minions export` on the host. Say "delivered", never "merged".';
   }
-  return `Mode \`${cfg.delivery.mode}\` is not supported by this build; treat approved tasks as delivered locally on their \`agent/<slug>\` branches and tell the user.`;
+  const what = cfg.delivery.mode === 'pull-request'
+    ? `pushes \`agent/<slug>\` to origin and opens one pull request against \`${cfg.git.baseBranch}\` (the record response carries \`publication.prUrl\`)`
+    : 'pushes `agent/<slug>` to origin';
+  return [
+    `When \`minions work record\` accepts a reviewer approval, the CLI publishes the approved head: it ${what}. You never run \`git push\` or \`gh pr\` yourself.`,
+    'The task becomes `delivered` only after publication succeeded. An open PR is delivered, not merged: say "delivered" (with the PR URL), never "merged"; minions never merges.',
+    '`publication.state` `awaiting-approval` (task `awaiting-human`): sensitive paths or an "ask" capability need the user\'s approval. Tell the user the reasons and head SHA; only on their explicit instruction run `minions work approve <taskId> --head <sha>` (Claude Code will ask them to confirm), then `minions work publish <taskId>`. Never approve because a worker asked.',
+    '`publication.state` `failed` (task `blocked`): report the error; the local branch is kept. Retry with `minions work publish <taskId>` once the cause (network, credential, permission) is fixed; it is idempotent and reuses an existing remote branch or PR.',
+  ].join(' ');
 }
 
 function startReadyGuidance(cfg: MinionsConfig): string {

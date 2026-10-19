@@ -30,7 +30,7 @@ export interface BacklogAdapter {
   listReady(limit: number, leasedIds: Set<string>, scope: ScopeFilter): Promise<Task[]>;
   getTask(id: string): Promise<Task>;
   createTask(input: CreateTaskInput): Promise<{ task: Task; created: boolean }>; // idempotent by key
-  updateTask(id: string, expectedVersion: string, patch: Partial<Pick<Task, 'status' | 'title' | 'description' | 'priority' | 'labels' | 'branch'>>): Promise<Task>; // CONFLICT on version mismatch
+  updateTask(id: string, expectedVersion: string, patch: Partial<Pick<Task, 'status' | 'title' | 'description' | 'priority' | 'labels' | 'branch' | 'prUrl'>>): Promise<Task>; // CONFLICT on version mismatch
   addDependency(id: string, dependsOn: string): Promise<Task>;  // rejects cycles with explanation
   addNote(id: string, text: string): Promise<void>;
   closeTask(id: string, status: 'done' | 'delivered' | 'cancelled'): Promise<Task>;

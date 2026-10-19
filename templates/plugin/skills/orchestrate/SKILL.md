@@ -59,7 +59,7 @@ The record response says what happened. Typical transitions:
 
 - engineer `complete` → tester (status `testing`).
 - tester `complete` → reviewer (`reviewing`); tester `needs_changes` → engineer repair (`changes-requested`), passing the tester's findings as prior findings.
-- reviewer `approve` → `delivered`. Report the branch to the user.
+- reviewer `approve` → `delivered` (local delivery). In branch / pull-request delivery the record response has `publication`: `published` → `delivered`, report the branch and `prUrl` (open, not merged); `awaiting-approval` → `awaiting-human`, ask the user (reasons + head SHA), and only on their explicit instruction run `minions work approve <taskId> --head <sha>` then `minions work publish <taskId>`; `failed` → `blocked`, report the error and retry `minions work publish <taskId>` after the cause is fixed.
 - reviewer `request-changes` → engineer repair with the reviewer's findings. Prefer a fresh engineer; use a stronger model after repeated failure.
 - `replan: true` → stop repairing. Rethink: rewrite the task, split it, or ask the user. Do not dispatch another repair of the same approach.
 - `blocked` → record the reason (`minions backlog note`), tell the user what would unblock it if it needs them, move on.

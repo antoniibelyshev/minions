@@ -4,13 +4,13 @@ import { MinionsConfigSchema, CapabilityRuleSchema, type Capability, type Capabi
 
 export const SUPPORTED = {
   backlog: ['backlogmd'],
-  delivery: ['local'],
+  delivery: ['local', 'branch', 'pull-request'],
   communication: ['terminal', 'telegram'],
 } as const;
 
 /** Features deferred in v0.1; doctor and the wizard report them as unavailable. */
 export const DEFERRED_FEATURES = [
-  'GitHub Issues backend', 'branch/PR/auto-merge delivery', 'review publication',
+  'GitHub Issues backend', 'auto-merge and merge requests', 'review publication',
   'config plan/apply transactions', 'backlog migration', 'upgrade', 'budgets',
   'companion containers',
 ] as const;
@@ -22,7 +22,7 @@ export function listUnavailable(config: MinionsConfig): Unavailable[] {
   const out: Unavailable[] = [];
   const has = (list: readonly string[], v: string) => list.includes(v);
   if (!has(SUPPORTED.backlog, config.backlog.backend)) out.push({ path: 'backlog.backend', value: config.backlog.backend, reason: 'only Backlog.md is supported in v0.1' });
-  if (!has(SUPPORTED.delivery, config.delivery.mode)) out.push({ path: 'delivery.mode', value: config.delivery.mode, reason: 'only local delivery is supported in v0.1' });
+  if (!has(SUPPORTED.delivery, config.delivery.mode)) out.push({ path: 'delivery.mode', value: config.delivery.mode, reason: `delivery mode is not supported (supported: ${SUPPORTED.delivery.join(', ')})` });
   if (!has(SUPPORTED.communication, config.communication.channel)) out.push({ path: 'communication.channel', value: config.communication.channel, reason: 'this communication channel is not supported in v0.1' });
   if (config.communication.channel === 'telegram' && config.container.network === 'none') {
     out.push({ path: 'communication.channel', value: 'telegram', reason: 'Telegram needs outbound network (api.telegram.org, and the npm registry for the plugin\'s dependencies) but container.network is none; the coordinator runs terminal-only' });
@@ -31,11 +31,13 @@ export function listUnavailable(config: MinionsConfig): Unavailable[] {
     out.push({ path: 'delivery.merge', value: config.delivery.merge, reason: config.delivery.requiredChecksConfigured
       ? 'automatic merge is deferred in v0.1'
       : 'automatic merge is unavailable: requiredChecksConfigured is false (never treated as zero required checks)' });
-  } else if (config.delivery.merge === 'manual' && config.delivery.mode === 'local') {
-    out.push({ path: 'delivery.merge', value: 'manual', reason: 'merge requests need PR delivery (deferred); use `minions export`' });
+  } else if (config.delivery.merge === 'manual') {
+    out.push({ path: 'delivery.merge', value: 'manual', reason: config.delivery.mode === 'pull-request'
+      ? 'merge requests through minions are deferred; minions never merges: merge the pull request through your normal process'
+      : 'merge requests need pull-request delivery and are deferred in v0.1' });
   }
   if (config.budgets.taskUsd !== null || config.budgets.dailyUsd !== null) out.push({ path: 'budgets', value: config.budgets, reason: 'budgets are not enforced in v0.1' });
-  if (config.verification.ciAuthority !== 'none') out.push({ path: 'verification.ciAuthority', value: config.verification.ciAuthority, reason: 'CI observation needs PR delivery (deferred)' });
+  if (config.verification.ciAuthority !== 'none') out.push({ path: 'verification.ciAuthority', value: config.verification.ciAuthority, reason: 'CI observation is deferred in v0.1' });
   return out;
 }
 
@@ -44,6 +46,7 @@ function crossFieldIssues(c: MinionsConfig): ConfigIssue[] {
   if (!(SUPPORTED.delivery as readonly string[]).includes(c.delivery.mode)) issues.push({ path: 'delivery.mode', message: `"${c.delivery.mode}" is not supported by this build (supported: ${SUPPORTED.delivery.join(', ')})` });
   if (!(SUPPORTED.backlog as readonly string[]).includes(c.backlog.backend)) issues.push({ path: 'backlog.backend', message: `"${c.backlog.backend}" is not supported by this build (supported: ${SUPPORTED.backlog.join(', ')})` });
   if (!(SUPPORTED.communication as readonly string[]).includes(c.communication.channel)) issues.push({ path: 'communication.channel', message: `"${c.communication.channel}" is not supported by this build (supported: ${SUPPORTED.communication.join(', ')})` });
+  if (c.delivery.mode !== 'local' && c.delivery.provider !== 'github') issues.push({ path: 'delivery.provider', message: `delivery.mode "${c.delivery.mode}" publishes to GitHub and needs delivery.provider "github" (got "${c.delivery.provider}")` });
   if (c.execution.maxEngineers > c.execution.maxActiveTasks) issues.push({ path: 'execution.maxEngineers', message: `must be <= execution.maxActiveTasks (${c.execution.maxEngineers} > ${c.execution.maxActiveTasks})` });
   if (!c.models.allowed.includes(c.models.default)) issues.push({ path: 'models.default', message: `"${c.models.default}" is not in models.allowed [${c.models.allowed.join(', ')}]` });
   if (c.container.mountDockerSocket) issues.push({ path: 'container.mountDockerSocket', message: 'must be false: the Docker socket grants host control' });

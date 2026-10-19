@@ -27,8 +27,14 @@ export function coordinatorSettings(cfg: MinionsConfig, opts: { telegram?: boole
   return {
     permissions: {
       allow: [...new Set(allow)],
-      // v0.1 delivers locally only; also cover global options before the subcommand (git -C x push).
-      deny: ['Bash(git push *)', 'Bash(git push)', 'Bash(git * push *)', 'Bash(git * push)'],
+      // Publication runs only through `minions work publish` (gated, deterministic); the coordinator never
+      // pushes or merges itself. Also cover global options before the subcommand (git -C x push).
+      deny: ['Bash(git push *)', 'Bash(git push)', 'Bash(git * push *)', 'Bash(git * push)', 'Bash(gh pr merge *)', 'Bash(gh pr merge)', 'Bash(gh * pr merge *)', 'Bash(gh * pr merge)'],
+      // A publication approval must come from the user: Claude Code asks every time (ask beats allow).
+      // Also cover program-level options before the subcommand (`minions --json work approve ...`), which would
+      // otherwise fall to the `Bash(minions *)` allow.
+      ask: ['Bash(minions work approve *)', 'Bash(minions work approve)', 'Bash(minions * work approve *)', 'Bash(minions * work approve)',
+        'Bash(minions approve *)', 'Bash(minions approve)', 'Bash(minions * approve *)', 'Bash(minions * approve)'],
       disableBypassPermissionsMode: 'disable',
     },
   };

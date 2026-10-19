@@ -3,28 +3,44 @@ import type { MinionsConfig, Profile } from './schema.js';
 
 export interface ProfileContext {
   hasGitHub: boolean;
+  /** A GitHub token is stored for this project (`minions auth github`). Branch/PR delivery needs both. */
+  hasGitHubCredential?: boolean;
   baseBranch: string;
   identity: { name: string; email: string };
   projectId: string;
   packageVersion: string;
 }
 
+/** Why branch/PR delivery cannot be selected, or null when a GitHub remote and a stored token exist. */
+export function githubDeliveryUnavailableReason(ctx: Pick<ProfileContext, 'hasGitHub' | 'hasGitHubCredential'>): string | null {
+  if (!ctx.hasGitHub) return 'the repository has no GitHub remote (origin is not on github.com)';
+  if (!ctx.hasGitHubCredential) return 'no GitHub token is stored for this project (run `minions auth github`, then set delivery.mode)';
+  return null;
+}
+
 /**
  * Explicit config values for a profile (spec §4). Where the profile's intent needs a feature this
- * build lacks (GitHub Issues, PR delivery, auto-merge, GitHub CI authority) the supported fallback is
- * used and a note explains it.
+ * build lacks (GitHub Issues, auto-merge, GitHub CI authority) or a prerequisite is missing (PR
+ * delivery without a GitHub remote and token) the supported fallback is used and a note explains it.
  */
 export function profileDefaults(profile: Profile, ctx: ProfileContext): { config: MinionsConfig; notes: string[] } {
   const notes: string[] = [];
   const owner = profile === 'project-owner';
   const supervised = profile === 'supervised';
 
+  const githubBlocked = githubDeliveryUnavailableReason(ctx);
+  // project-owner publishes through pull requests when it can; the others start local (personal-work
+  // may opt in; each push then needs recorded human approval because git.push is "ask").
+  const prDelivery = owner && githubBlocked === null;
   if (owner && ctx.hasGitHub) {
     notes.push('unavailable: GitHub Issues backlog (project-owner default) is deferred in v0.1; using Backlog.md.');
-    notes.push('unavailable: branch/PR delivery and auto-merge-when-eligible are deferred in v0.1; using local delivery with merge disabled.');
-    notes.push('unavailable: GitHub CI authority requires PR delivery; verification.ciAuthority is "none".');
+    if (githubBlocked) notes.push(`unavailable: pull-request delivery (project-owner default) needs a GitHub remote and token: ${githubBlocked}; using local delivery.`);
+    notes.push('unavailable: auto-merge-when-eligible is deferred in v0.1; merge stays disabled (minions never merges).');
+    notes.push('unavailable: GitHub CI authority is deferred in v0.1; verification.ciAuthority is "none".');
   } else if (profile === 'personal-work') {
-    notes.push('unavailable: PR publication via the existing contribution process is deferred in v0.1; using local delivery.');
+    notes.push(githubBlocked
+      ? `unavailable: pull-request delivery needs a GitHub remote and token: ${githubBlocked}; using local delivery.`
+      : 'pull-request delivery is available (set delivery.mode "pull-request"); every push then needs recorded human approval (git.push is "ask").');
   }
 
   const config: MinionsConfig = {
@@ -50,7 +66,7 @@ export function profileDefaults(profile: Profile, ctx: ProfileContext): { config
     },
     models: { default: 'sonnet', allowed: ['sonnet', 'opus', 'haiku'], selection: 'coordinator' },
     delivery: {
-      provider: 'none', mode: 'local', merge: 'disabled', method: 'squash', deleteMergedBranches: true,
+      provider: prDelivery ? 'github' : 'none', mode: prDelivery ? 'pull-request' : 'local', merge: 'disabled', method: 'squash', deleteMergedBranches: true,
       identityMode: 'git-identity', requireIndependentApproval: true, requiredChecksConfigured: false,
     },
     verification: { commands: [], testerRequired: true, reviewerRequired: true, ciAuthority: 'none' },
