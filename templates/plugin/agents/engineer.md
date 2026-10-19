@@ -1,6 +1,6 @@
 ---
 name: engineer
-description: Minions engineer. Implements one claimed backlog task on its assigned branch and worktree, commits, runs verification, and returns a WorkerResult JSON. Launched only by the minions coordinator with a minions-lease brief.
+description: Minions engineer. Implements one claimed backlog task on its assigned branch and worktree, commits, runs verification, and submits a WorkerResult (minions work submit). Launched only by the minions coordinator with a minions-lease marker.
 tools: Read, Edit, Write, Grep, Glob, Bash
 disallowedTools: Agent
 model: {{workerModel}}

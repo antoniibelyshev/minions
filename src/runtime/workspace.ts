@@ -86,7 +86,7 @@ export async function exportWorkspace(outPath: string, opts: { base: string; lay
 
 /** Idempotent: creates the /state layout, the runtime DB and the Backlog.md config. */
 export async function setupState(paths: RuntimePaths, writeBacklogConfig: (root: string) => Promise<{ path: string; changed: boolean }>): Promise<{ state: string; dirs: string[]; db: string; schemaVersion: number; backlogConfig: { path: string; changed: boolean } }> {
-  const dirs = [paths.state, paths.backlog, paths.notes, paths.import, paths.exports, paths.logs];
+  const dirs = [paths.state, paths.backlog, paths.notes, paths.briefs, paths.results, paths.import, paths.exports, paths.logs];
   for (const d of dirs) await ensureDir(d);
   const db = openDb(paths.db);
   let schemaVersion: number;

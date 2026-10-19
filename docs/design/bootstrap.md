@@ -451,6 +451,23 @@ Scheduler rules:
   When repairs ≥ `maxRepairCyclesBeforeReplan`, response includes `replan: true` and status →
   awaiting-human. Records evidence keyed by head SHA + config revision. Releases the lease.
 - `work release <leaseId> --reason` releases without a result (worktree kept).
+- File hand-offs (coordinator context diet). `work claim` also stores the brief at
+  `/state/briefs/<leaseId>.json`; `--compact` prints only leaseId, briefMarker, taskId, title, role,
+  attempt, branch, worktree, expectedHead and the brief command. `work brief <leaseId> --role <role>`
+  returns the stored brief and `work submit <leaseId> --role <role>` (stdin/--result-file) writes the raw
+  result to `/state/results/<leaseId>.json`; `work record <leaseId> --submitted [--correction]` records
+  that file through the same `record` path (same validation, stale-head checks, one correction). An
+  invalid submission is renamed to `<leaseId>.rejected.json`, so a correction needs a fresh submit; a
+  final record (valid or unvalidated) deletes the file (the DB keeps `result_json`). A missing file is
+  `NOT_FOUND` with a hint. Stdin/--result-file recording is unchanged.
+  Decision (ownership): `brief` and `submit` require an active lease, the lease's role, and a cwd
+  (realpath) inside the lease's worktree. One active stage per task plus per-task worktrees mean a
+  worker in its own worktree can reach only its own lease; this is a misuse guard, not a security
+  boundary against a worker that deliberately `cd`s elsewhere (workers share one OS user). Lease ids are
+  shape-checked so they cannot escape the directories. No DB schema change: briefs and submissions are
+  files. The PreToolUse(Agent) hook is unchanged; prompts carry the marker, a `worktree:` line and notes.
+- `backlog list|ready --compact` (= `--fields id,title,status,priority,dependencies`) or
+  `--fields a,b` projects JSON task objects; unknown fields are `PRECONDITION`. Human output is unchanged.
 - New commits invalidate evidence: evidence lookups always filter by current head SHA.
 
 WorkerResult schema (spec §11): `{ status, summary, branch, headSha, modifiedPaths[], checks[{command,

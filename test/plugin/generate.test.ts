@@ -277,3 +277,77 @@ describe('Telegram tools are coordinator-only', () => {
     expect(await term.read('coordinator.md')).toContain('Telegram is not configured for this project.');
   });
 });
+
+describe('file hand-offs and compact reads', () => {
+  it('workers fetch their own brief and submit their result with their role', async () => {
+    const { read } = await gen();
+    for (const role of ['engineer', 'tester', 'reviewer']) {
+      const md = await read(`agents/${role}.md`);
+      expect(md, role).toContain(`minions work brief <leaseId> --role ${role} --json`);
+      expect(md, role).toContain(`minions work submit <leaseId> --role ${role} --json`);
+      expect(md, role).toMatch(/end with \*\*one short line\*\*/);
+      expect(md, role).toContain('Only if `minions work submit` itself fails');
+      expect(md, role).toContain('end with exactly one line, `brief unavailable: <error>`, and no WorkerResult');
+      expect(md, role).not.toMatch(/fetch fails, report `blocked`/);
+    }
+    // the read-only reviewer may still submit (state under /state, not its worktree)
+    expect(await read('agents/reviewer.md')).toMatch(/`minions work submit` commands are allowed: they read and write minions state under `\/state`, not your worktree/);
+  });
+
+  it('the coordinator and orchestrate skill use compact claims, marker-only prompts and record --submitted', async () => {
+    const { read } = await gen();
+    const coord = await read('coordinator.md');
+    const orch = await read('skills/orchestrate/SKILL.md');
+    for (const md of [coord, orch]) {
+      expect(md).toContain('--compact --json');
+      expect(md).toContain('minions work record <leaseId> --submitted');
+      expect(md).toContain('--submitted --correction');
+      expect(md).not.toMatch(/pipe it verbatim|brief JSON in a ```json fence/);
+      // older-CLI fallback: plain claim with pasted brief, record via stdin
+      expect(md).toContain('Older CLI fallback: if `--compact`, `work brief` or `--submitted` is rejected as an unknown option or command, claim without `--compact` and paste the brief in a ```json fence after the marker and worktree lines');
+      expect(md).toContain("piping the worker's final JSON to `minions work record <leaseId> --json` on stdin");
+      expect(md).toMatch(/`brief unavailable: <error>`.*do not record it.*[Rr]elease/s);
+    }
+    expect(orch).toMatch(/minions-lease: <leaseId>\n\s*worktree: <worktree>/);
+    const recover = await read('skills/recover/SKILL.md');
+    expect(recover).toContain('minions work record <leaseId> --submitted --json');
+    expect(recover).toMatch(/On `PRECONDITION` about a pending correction.*--submitted --correction --json/);
+  });
+
+  it('documents the opt-in idle context reset without making it automatic', async () => {
+    const coord = await (await gen()).read('coordinator.md');
+    expect(coord).toMatch(/Idle context reset \(opt-in\): only if the user has asked for idle resets/);
+    expect(coord).toContain('minions coordinator restart --recover');
+    expect(coord).toMatch(/no active leases/);
+  });
+});
+
+describe('file hand-off templates render completely (task-9 edge cases)', () => {
+  it('no generated file keeps an unrendered placeholder, and each worker gets its own role in the commands', async () => {
+    const { read, rel } = await gen();
+    for (const f of rel) {
+      const text = await read(f);
+      expect(text, f).not.toMatch(/\{\{|\}\}/);
+      expect(text, f).not.toContain('--role {{');
+    }
+    for (const role of ['engineer', 'tester', 'reviewer']) {
+      const md = await read(`agents/${role}.md`);
+      const roles = [...md.matchAll(/minions work (?:brief|submit) <leaseId> --role (\w+)/g)].map((m) => m[1]);
+      expect(roles.length, role).toBeGreaterThanOrEqual(2);
+      expect(new Set(roles), role).toEqual(new Set([role]));
+      expect(md, role).toContain('minions-lease: <leaseId>');
+    }
+  });
+
+  it('the reviewer stays read-only on its worktree while being allowed to submit', async () => {
+    const { read } = await gen();
+    const md = await read('agents/reviewer.md');
+    const fm = frontmatter(md);
+    for (const t of ['Edit', 'Write', 'NotebookEdit', 'Agent']) expect(toolList(fm.disallowedTools)).toContain(t);
+    expect(toolList(fm.tools)).not.toContain('Edit');
+    expect(toolList(fm.tools)).not.toContain('Write');
+    expect(md).toMatch(/Never edit, create or delete files in the repository or worktree/);
+    expect(md).toMatch(/never `git commit`/);
+    expect(md).toContain('minions work submit <leaseId> --role reviewer --json');
+  });
+});
