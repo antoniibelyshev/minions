@@ -307,6 +307,8 @@ src/
 templates/plugin/            plugin sources (see "Plugin")
 docker/Dockerfile  docker/entrypoint.sh
 test/                        vitest unit tests; test/docker/ opt-in (MINIONS_DOCKER_TESTS=1)
+scripts/prepare.mjs          npm prepare hook: builds dist/ on git-URL installs (`npm install -g github:…`)
+scripts/verify-git-install.sh  offline check of the git-URL install into a temp prefix (`npm run verify:git-install`)
 ```
 
 `minions` decides host vs container mode by `MINIONS_RUNTIME=container` (set in the image).
