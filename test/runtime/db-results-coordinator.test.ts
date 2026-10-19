@@ -27,6 +27,23 @@ describe('runtime db', () => {
     expect(() => new RuntimeDb(path)).toThrow(/newer/);
   });
 
+  it('reports the last controls event that set each pause flag (upgrade pause ownership)', () => {
+    const db = new RuntimeDb(join(tmp(), 'state', 'minions.db'));
+    expect(db.pauseChanges()).toEqual({ intake: null, starts: null });
+    db.setPaused({ starts: true });
+    const paused = db.lastPauseChange('starts')!;
+    expect(paused).toMatchObject({ value: true, at: expect.any(String) });
+    db.setPaused({ intake: true }); // an intake-only change leaves the starts change alone
+    expect(db.lastPauseChange('starts')).toEqual(paused);
+    expect(db.lastPauseChange('intake')).toMatchObject({ value: true });
+    db.setPaused({ starts: false });
+    db.setPaused({ starts: true });
+    const again = db.lastPauseChange('starts')!;
+    expect(again.id).toBeGreaterThan(paused.id);
+    expect(again.value).toBe(true);
+    db.close();
+  });
+
   it('idempotency store maps keys to task ids', () => {
     const db = new RuntimeDb(':memory:');
     expect(db.idempotency.get('k')).toBeUndefined();
