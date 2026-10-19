@@ -11,9 +11,10 @@ import { atomicWrite, ensureDir, exists, readJsonIfExists, sha256, writeJson } f
 import { GITHUB_TOKEN_CONTAINER_PATH, TELEGRAM_TOKEN_CONTAINER_PATH, imageTag, projectPaths, registryPath, repoPaths, volumeNames } from '../core/paths.js';
 import { VERSION } from '../core/version.js';
 import { generatePlugin } from '../plugin/generate.js';
+import { ciSetupPlan } from '../runtime/ci.js';
 import { discover, dockerProbe, type Discovery, type DockerProbe, type DockerStatus } from './discovery.js';
 import {
-  githubTokenGuidance, loadCredentialRefs, provisionGithubToken, provisionTelegramToken,
+  githubRepoFromRemote, githubTokenGuidance, loadCredentialRefs, provisionGithubToken, provisionTelegramToken,
   type CredentialsJson, type Fetch, type ProvisionResult, type TelegramProvisionResult,
 } from './credentials.js';
 import { composeYaml, type Runner } from './docker.js';
@@ -326,6 +327,7 @@ async function prepare(opts: InitOptions): Promise<Prepared> {
   if (vis === 'shared') notes.push('Shared install never modifies CLAUDE.md, AGENTS.md, or .claude/.');
 
   const unavailable = { settings: listUnavailable(config), features: [...DEFERRED_FEATURES] };
+  const ghRepo = githubRepoFromRemote(discovery.git.remoteUrl);
   const plan: InstallPlan = {
     projectId, identitySource: identity.source, repoPath, gitCommonDir: commonDir, visibility: vis, profile: config.profile,
     writes, permissions: permissionSummary(effective), verificationCommands: effective.verification.commands,
@@ -340,6 +342,13 @@ async function prepare(opts: InitOptions): Promise<Prepared> {
         `Optional GitHub token (mounted read-only at ${GITHUB_TOKEN_CONTAINER_PATH}; needed for upcoming push/PR delivery):`,
         ...githubTokenGuidance(discovery.git.remoteUrl).map((l) => `  ${l}`),
       ] : []),
+      // Printed only: the installer never writes workflow files or changes branch protection.
+      ...(discovery.git.hasGitHub ? ciSetupPlan({
+        hasWorkflows: discovery.ciWorkflows.some((f) => f.startsWith('.github/workflows/')),
+        requiredChecks: effective.delivery.requiredChecksConfigured ? 'configured' : 'unknown',
+        verificationCommands: effective.verification.commands, baseBranch: effective.git.baseBranch,
+        repository: ghRepo ? `${ghRepo.owner}/${ghRepo.repo}` : null,
+      }) : []),
       ...(effective.communication.channel === 'telegram' ? [
         `Telegram bot token from BotFather, stored on the host (Keychain or 0600 file) and mounted read-only at ${TELEGRAM_TOKEN_CONTAINER_PATH}; only the coordinator process receives it.`,
         'The runtime image includes a pinned Bun (the Telegram plugin runs on it); an existing image is rebuilt on the next `minions start`.',

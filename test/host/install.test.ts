@@ -258,3 +258,35 @@ describe('init', () => {
   });
 });
 
+
+describe('CI setup guidance', () => {
+  it('prints an external CI setup plan for a GitHub repo without CI and writes no workflow files', async () => {
+    const repo = makeRepo(env.root);
+    git(repo, 'remote', 'add', 'origin', 'https://github.com/acme/demo.git');
+    const r = await init(repo, { visibility: 'shared' });
+    const setup = r.plan.externalSetup.join('\n');
+    expect(setup).toMatch(/never creates workflows or changes branch protection/);
+    expect(setup).toMatch(/Add a CI workflow yourself/);
+    expect(setup).toContain('https://github.com/acme/demo/settings/branches');
+    expect(setup).toMatch(/Require status checks to pass/);
+    expect(existsSync(join(repo, '.github'))).toBe(false);
+    expect(listFiles(repo).some((f) => f.includes('.github'))).toBe(false);
+  });
+
+  it('with existing workflows only explains how to require the checks; no plan without a GitHub remote', async () => {
+    const repo = makeRepo(env.root);
+    git(repo, 'remote', 'add', 'origin', 'git@github.com:acme/demo.git');
+    mkdirSync(join(repo, '.github', 'workflows'), { recursive: true });
+    const wf = join(repo, '.github', 'workflows', 'ci.yml');
+    writeFileSync(wf, 'name: ci\n');
+    const r = await init(repo, { visibility: 'private' });
+    const setup = r.plan.externalSetup.join('\n');
+    expect(setup).not.toMatch(/Add a CI workflow yourself/);
+    expect(setup).toMatch(/Mark the check required for/);
+    expect(readFileSync(wf, 'utf8')).toBe('name: ci\n');
+    expect(readdirSync(join(repo, '.github', 'workflows'))).toEqual(['ci.yml']);
+
+    const plain = makeRepo(env.root, 'plain');
+    expect((await init(plain, { visibility: 'private' })).plan.externalSetup.join('\n')).not.toMatch(/CI setup/);
+  });
+});

@@ -19,8 +19,9 @@ import { runHook } from './hooks.js';
 import { runtimePaths } from './paths.js';
 import { capacityOf, LEASE_ROLES, Scheduler } from './scheduler.js';
 import { gitCredential } from './github.js';
+import { ciStatus, formatCiStatus, formatSync, syncTasks } from './ci.js';
 import { exportWorkspace, importWorkspace, setupState } from './workspace.js';
-import { workspaceLayout } from './worktree.js';
+import { git, workspaceLayout } from './worktree.js';
 
 // ---------------------------------------------------------------- lazy runtime context
 
@@ -287,6 +288,25 @@ export function register(program: Command): void {
       requireMode('container');
       const r = await exportWorkspace(out, { base: (await getConfig()).git.baseBranch });
       emit(r, { json: globalOpts(cmd).json, human: (d) => `Wrote ${d.path}\n${d.refs.join('\n')}` });
+    }));
+
+  // sync: one-shot refresh of PR state and CI check results (no polling loop); host delegates.
+  program.command('sync [taskIds...]').description('Refresh pull-request state and CI check results for tasks with a PR; reconcile merged/closed PRs (read-only on GitHub)')
+    .action(action(async (taskIds: string[], _o: unknown, cmd: Command) => {
+      if (runtimeMode() === 'host') return delegate(cmd);
+      const { db: d, backlog: b, config: cfg } = await context();
+      const r = await syncTasks({ db: d, backlog: b, config: cfg }, { taskIds });
+      emit(r, { json: globalOpts(cmd).json, human: formatSync });
+      if (r.failed) process.exitCode = 1;
+    }));
+
+  // ci: read-only required-checks status for the base branch (used by `minions doctor`).
+  const ci = program.command('ci').description('CI awareness (read-only; minions never creates workflows or changes branch protection)');
+  ci.command('status').description('Report required status checks on the base branch and the external CI setup plan')
+    .action(action(async (_o: unknown, cmd: Command) => {
+      if (runtimeMode() === 'host') return delegate(cmd);
+      const r = await ciStatus(workspaceLayout().repo, await getConfig(), { git });
+      emit(r, { json: globalOpts(cmd).json, human: formatCiStatus });
     }));
 
   // status / pause / resume (host mode delegates to the container)

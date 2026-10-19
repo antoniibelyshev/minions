@@ -40,7 +40,7 @@ budgets, companion containers.
 
 A per-project fine-grained personal access token, provisioned only by the host CLI
 (`src/host/credentials.ts`). Inside the container git and gh use it (see "GitHub in the
-container"), and branch/pull-request delivery publishes with it; CI observation is a later task.
+container"), and branch/pull-request delivery publishes with it; `minions sync` and doctor read PR and CI state with it (read-only, see "CI awareness").
 
 - **Entry.** `minions auth github` (and, for repositories with a GitHub remote, an optional offer at
   the end of an interactive `minions init`) reads the token from the host terminal in raw mode with
@@ -142,6 +142,44 @@ Decision record for `delivery.mode` `branch` / `pull-request` (`src/runtime/publ
 - **PR text.** Title, objective (description, minions meta stripped) and acceptance criteria only.
   Shared installations append the task id and head SHA; private installations add nothing else. Notes,
   handoffs, worker results and decision records are never read for PR text.
+
+## CI awareness
+
+Decision record for required-checks readiness, `minions sync` and CI setup guidance
+(`src/runtime/ci.ts`, `ci.requiredChecks` in `src/host/doctor.ts`).
+
+- **Read-only.** Every GitHub call is a GET: `gh api --method GET` in the container (the gh wrapper
+  injects the token), or a plain `fetch` GET with the stored token on the host. minions never creates
+  workflows, never edits branch protection or rulesets, and never merges.
+- **Required checks.** Union of classic branch protection (`GET /repos/{repo}/branches/{base}`,
+  `protection.required_status_checks` unless `enforcement_level` is `off`; readable with repository
+  read access, so no Administration permission is needed) and rulesets (`GET
+  /repos/{repo}/rules/branches/{base}`, rules of type `required_status_checks`; 404 = no rulesets).
+  `GET /repos/{repo}/actions/workflows` counts workflows. `configured` = at least one required check;
+  `none` only when both sources were read; otherwise `unknown` (never treated as "none").
+- **doctor.** `ci.requiredChecks` runs `minions ci status --json` in a running container; when that is
+  unavailable (container stopped, older image) it falls back to host GETs if the GitHub credential is
+  `ok`. Mapping to `delivery.requiredChecksConfigured`: checks present → `ok` (hint to set the flag
+  when it is false); none and flag false → `unavailable` ("usable for local work and pull-request
+  delivery; automatic merge unavailable") with the setup plan as hint; none but flag true → `warn`
+  (never treated as zero required checks); unknown → `warn`. Never `fail`: no CI does not make doctor
+  unhealthy.
+- **Setup plan.** `ciSetupPlan` prints step-by-step external setup (add a workflow running the
+  configured verification commands, let it report once, mark it required in branch protection or a
+  ruleset, then set `delivery.requiredChecksConfigured`). Shown by `minions init` (external setup,
+  GitHub remotes only; no workflow step when `.github/workflows` exists), by doctor, and by
+  `minions ci status`. The installer never writes workflow files.
+- **`minions sync [taskIds...]`.** One explicit pass (no LLM polling loop), host delegates into the
+  container. For tasks with a `prUrl` (default: all except `done`/`cancelled`) it runs `gh pr view
+  <url> --json …statusCheckRollup` and summarizes checks: `no-checks`, `awaiting-ci` (any check pending),
+  `failing` (failure/timed-out/cancelled/action-required/startup-failure/stale, or status
+  failure/error), `passing`. The observation is recorded as `ci` evidence bound to the PR head SHA
+  (outcome `<prState>:<ciState>`, details JSON), plus a `ci-observation` event; a task note is added
+  only when the outcome changes. Open PRs keep their status (`delivered`; a failing PR is reported,
+  not reworked automatically). Reconciliation: `MERGED` → `done`; `CLOSED` without merge → `blocked`
+  with a note (only from `delivered`/`awaiting-ci`/`merging`); tasks with an active lease are never
+  moved. A PR head differing from the approved publication head is reported as a warning. Per-task gh
+  failures are reported and the command exits 1; nothing is thrown away.
 
 ## Telegram bot token
 
