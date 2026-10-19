@@ -437,6 +437,28 @@ describe('runUpgrade: interruption and recovery', () => {
     expect(w.coordinatorRunning).toBe(true);
   });
 
+  it('--now: a CONFLICT for another reason (not "already ended") is not taken as ended: the upgrade aborts', async () => {
+    const a = lease('l1', 'task-1');
+    const w = world({ leases: [a], leaseTimeline: [[a]] });
+    const h = harness(w);
+    const conflict = { code: 4, stdout: JSON.stringify({ ok: false, error: { code: 'CONFLICT', message: 'Lease l1 is held by another coordinator.' } }) + '\n', stderr: 'already ended' };
+    const runner = async (c: string, args: string[], o?: RunOptions): Promise<RunResult> =>
+      args.includes('release') ? conflict : h.runner(c, args, o);
+    const err = await runUpgrade(h.opts({ timeoutSec: 0, now: true, compose: new Compose(ID, runner), runner })).catch((e) => e);
+    expect(err.message).toMatch(/aborted at drain: work release l1 failed/);
+    expect(h.events).not.toContain('recreate');
+    expect(w.paused.starts).toBe(false);
+    // Another error code with an "already ended" message is not a race either.
+    const w2 = world({ leases: [a], leaseTimeline: [[a]] });
+    const h2 = harness(w2);
+    const notFound = { code: 3, stdout: JSON.stringify({ ok: false, error: { code: 'NOT_FOUND', message: 'Lease l1 already ended (completed).' } }) + '\n', stderr: '' };
+    const runner2 = async (c: string, args: string[], o?: RunOptions): Promise<RunResult> =>
+      args.includes('release') ? notFound : h2.runner(c, args, o);
+    const err2 = await runUpgrade(h2.opts({ timeoutSec: 0, now: true, compose: new Compose(ID, runner2), runner: runner2 })).catch((e) => e);
+    expect(err2.message).toMatch(/aborted at drain/);
+    expect(h2.events).not.toContain('recreate');
+  });
+
   it('a failed drain poll is retried with backoff; the drain goes on when status answers again', async () => {
     const a = lease('l1', 'task-1');
     const w = world({ leases: [a], leaseTimeline: [[]], statusFailures: 2 });
@@ -557,6 +579,69 @@ describe('runUpgrade: SIGINT/SIGTERM', () => {
     expect(sig.notices).toHaveLength(1);
     expect(sig.notices[0]).toMatch(/interrupted \(SIGTERM\) after the container recreate started; volumes are kept\. Rerun `minions upgrade` to finish/);
     expect(markerAtSignal).toBe(true);
+  });
+
+  it('during a status-retry backoff: resumes, prints the hint, stops polling, never recreates', async () => {
+    const a = lease('l1', 'task-1');
+    const w = world({ leases: [a], leaseTimeline: [[a]], statusFailures: 99 });
+    const h = harness(w);
+    const sig = signals();
+    const slept: number[] = [];
+    const err = await runUpgrade(h.opts({ interrupt: sig.hooks, sleep: async (ms) => { slept.push(ms); if (ms === STATUS_RETRY_MS[0]) await sig.fire('SIGINT'); } })).catch((e) => e);
+    expect(slept).toEqual([10_000, STATUS_RETRY_MS[0]]);
+    expect(h.events.filter((e) => e === 'status:failed')).toHaveLength(1);
+    expect(h.events.filter((e) => !e.startsWith('status'))).toEqual(['pause', 'resume']);
+    expect(w.paused.starts).toBe(false);
+    expect(sig.exits).toEqual([130]);
+    expect(sig.notices[0]).toMatch(/starts were resumed\. Rerun `minions upgrade`/);
+    expect(err.message).toMatch(/interrupted \(SIGINT\)/);
+  });
+
+  it('during --now releases: the remaining leases are not released, starts resumed, never recreates', async () => {
+    const a = lease('l1', 'task-1'), b = lease('l2', 'task-2', 'tester');
+    const w = world({ leases: [a, b], leaseTimeline: [[a, b]] });
+    const base = harness(w);
+    const sig = signals();
+    const runner = async (c: string, args: string[], o?: RunOptions): Promise<RunResult> => {
+      if (args.includes('release') && args.includes('l1')) await sig.fire('SIGTERM');
+      return base.runner(c, args, o);
+    };
+    const err = await runUpgrade(base.opts({ timeoutSec: 0, now: true, interrupt: sig.hooks, compose: new Compose(ID, runner), runner })).catch((e) => e);
+    expect(base.events.filter((e) => e !== 'status')).toEqual(['pause', 'resume', 'release:l1']);
+    expect(base.events).not.toContain('release:l2');
+    expect(base.events).not.toContain('recreate');
+    expect(sig.exits).toEqual([143]);
+    expect(err.message).toMatch(/interrupted \(SIGTERM\)/);
+  });
+
+  it('a second signal exits at once, without waiting for the first one to finish', async () => {
+    const a = lease('l1', 'task-1');
+    const w = world({ leases: [a], leaseTimeline: [[a]] });
+    const base = harness(w);
+    let handler: ((s: NodeJS.Signals) => void) | null = null;
+    const exits: number[] = [];
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((r) => { release = r; });
+    const runner = async (c: string, args: string[], o?: RunOptions): Promise<RunResult> => {
+      if (args.includes('resume')) await gate; // the first handler's resume hangs
+      return base.runner(c, args, o);
+    };
+    const hooks: InterruptHooks = { subscribe: (h) => { handler = h; return () => { handler = null; }; }, exit: (c) => { exits.push(c); }, notice: () => undefined };
+    let fired = false;
+    const err = await runUpgrade(base.opts({ interrupt: hooks, compose: new Compose(ID, runner), runner, sleep: async () => {
+      if (fired) return;
+      fired = true;
+      handler!('SIGINT');
+      await new Promise((r) => setTimeout(r, 5));
+      expect(exits).toEqual([]); // the first signal is still resuming
+      handler!('SIGTERM');
+      expect(exits).toEqual([143]); // the second exits synchronously
+      release();
+    } })).catch((e) => e);
+    expect(err.message).toMatch(/interrupted \(SIGINT\)/);
+    await new Promise((r) => setTimeout(r, 0));
+    expect(exits).toEqual([143, 130]);
+    expect(base.events).not.toContain('recreate');
   });
 
   it('subscribes only for the container steps (not in a dry run) and unsubscribes when done', async () => {
