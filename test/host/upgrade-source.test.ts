@@ -515,6 +515,23 @@ describe('GitHub delivery: the CLI comes from the reviewed origin/<base> commit'
     }
   });
 
+  it('base not checked out (checkout on another branch): the base moves by update-ref, but the CLI is not built from the other branch', async () => {
+    const o = originCheckout();
+    git(o.c, 'checkout', '-q', '-b', 'feature');
+    const merged = o.merge('feature.ts');
+    realInstall(g, '0.1.0', 'old0000000000000', 'packed');
+    const w: NpmWorld = { globalRoot: g, checkout: o.c, calls: [] };
+    const p = await runSourcePhase(phaseBase({ checkout: o.c, origin: origin(o), runner: fakeNpm(w), rebuildCli: true, spawnCli: async () => { throw new Error('must not spawn'); } }));
+    expect(p.sync).toMatchObject({ source: 'origin', action: 'fast-forward', method: 'update-ref', applied: true, from: o.base, to: merged, worktree: null });
+    expect(git(o.c, 'rev-parse', 'refs/heads/main')).toBe(merged);
+    expect(head(o.c, 'HEAD')).toBe(o.base);
+    expect(git(o.c, 'rev-parse', '--abbrev-ref', 'HEAD')).toBe('feature');
+    expect(mutatingNpm(w.calls)).toEqual([]);
+    expect(p.ok).toBe(false);
+    expect(p.stop?.reason).toMatch(/not the reviewed origin\/main commit/);
+    expect(p.stop?.command).toMatch(/git switch main/);
+  });
+
   it('a diverged base refuses the whole upgrade; nothing is merged', async () => {
     const o = originCheckout();
     writeFileSync(join(o.c, 'src', 'local.ts'), 'export {};\n');

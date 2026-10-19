@@ -2,14 +2,16 @@
 // fast-forwards the workspace base; anything else blocks the claim (never a local merge). Local delivery
 // is unchanged. Real temp repos; origin is a local bare repo behind a github.com URL (insteadOf).
 import { execFileSync } from 'node:child_process';
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { MinionsConfig } from '../../src/config/schema.js';
 import { MinionsError } from '../../src/core/errors.js';
 import { syncBaseFromOrigin } from '../../src/runtime/base-sync.js';
 import { importWorkspace } from '../../src/runtime/workspace.js';
-import { workspaceLayout } from '../../src/runtime/worktree.js';
+import type { GitFn } from '../../src/runtime/github.js';
+import { Scheduler } from '../../src/runtime/scheduler.js';
+import { git as realGit, workspaceLayout } from '../../src/runtime/worktree.js';
 import { defaults } from '../helpers.js';
 import { commitFile, gitSync, initRepo, makeEnv, tmp, type Env } from './fixtures.js';
 
@@ -177,5 +179,132 @@ describe('workspace import under GitHub delivery', () => {
     expect(second).toMatchObject({ imported: false, baseFastForwarded: false });
     expect(gitSync(layout.repo, 'rev-parse', 'refs/heads/trunk')).toBe(before);
     expect(gitSync(layout.repo, 'rev-parse', 'refs/remotes/host/trunk')).toBe(hostHead2);
+  });
+});
+
+describe('pre-claim base sync: edge cases', () => {
+  afterEach(() => { vi.unstubAllEnvs(); });
+
+  /** Delegates to the real git, running `before` ahead of each call. */
+  const hookedGit = (before: (args: string[]) => void): GitFn => async (cwd, args, allowFailure) => {
+    before(args);
+    return realGit(cwd, args, allowFailure);
+  };
+
+  it('fast-forwards the base where it is checked out in a linked worktree, not the main repository', async () => {
+    const e = originEnv();
+    gitSync(e.layout.repo, 'checkout', '-q', '--detach');
+    const baseWt = join(e.root, 'base-wt');
+    gitSync(e.layout.repo, 'worktree', 'add', '-q', baseWt, 'main');
+    const merged = mergeOnGithub(e, 'merged.txt');
+    const r = await syncBaseFromOrigin(e.layout.repo, 'main');
+    expect(r).toMatchObject({ action: 'fast-forward', method: 'merge --ff-only', from: e.baseSha, to: merged });
+    expect(main(e)).toBe(merged);
+    expect(gitSync(baseWt, 'rev-parse', 'HEAD')).toBe(merged);
+    expect(gitSync(baseWt, 'status', '--porcelain')).toBe('');
+    expect(gitSync(e.layout.repo, 'rev-parse', 'HEAD')).toBe(e.baseSha); // the detached main checkout is untouched
+  });
+
+  it('a base checkout whose local changes clash with origin blocks the claim; the base and the changes stay', async () => {
+    const e = originEnv();
+    mergeOnGithub(e, 'clash.txt');
+    writeFileSync(join(e.layout.repo, 'clash.txt'), 'uncommitted local\n');
+    e.backlog.add({ id: 'task-1', title: 'Dirty base' });
+    const err = await failure(e.sched.claim('task-1', 'engineer'));
+    expect(err.code).toBe('CONFLICT');
+    expect(err.message).toMatch(/Cannot fast-forward main .* in .*claim was blocked; nothing was merged/);
+    expect(main(e)).toBe(e.baseSha);
+    expect(gitSync(e.layout.repo, 'status', '--porcelain')).toBe('?? clash.txt');
+    expect(e.db.leases({ all: true })).toHaveLength(0);
+    expect(e.backlog.status('task-1')).toBe('ready');
+    expect(e.db.events('task-1', 'base-sync-blocked')[0]?.data).toMatchObject({ code: 'CONFLICT', details: { reason: 'fast-forward-failed' } });
+  });
+
+  it('race: a local commit lands after the ancestry check, so update-ref with the old value fails and nothing is overwritten', async () => {
+    const e = originEnv();
+    gitSync(e.layout.repo, 'checkout', '-q', '--detach');
+    const merged = mergeOnGithub(e, 'merged.txt');
+    let raced: string | null = null;
+    const git = hookedGit((args) => {
+      if (args[0] === 'update-ref' && !raced) {
+        gitSync(e.layout.repo, 'checkout', '-q', 'main');
+        raced = commitFile(e.layout.repo, 'race.txt', 'race', 'concurrent local commit');
+        gitSync(e.layout.repo, 'checkout', '-q', '--detach');
+      }
+    });
+    const err = await failure(syncBaseFromOrigin(e.layout.repo, 'main', { git }));
+    expect(err.code).toBe('CONFLICT');
+    expect(err.details).toMatchObject({ reason: 'fast-forward-failed', origin: merged });
+    expect(raced).not.toBeNull();
+    expect(main(e)).toBe(raced);
+  });
+
+  it('race: origin moving again after the fetch is harmless; the base goes exactly to the fetched commit and the next claim takes the rest', async () => {
+    const e = originEnv();
+    const first = mergeOnGithub(e, 'one.txt');
+    let later: string | null = null;
+    const git = hookedGit((args) => { if (args[0] === 'merge-base' && !later) later = mergeOnGithub(e, 'two.txt'); });
+    expect(await syncBaseFromOrigin(e.layout.repo, 'main', { git })).toMatchObject({ action: 'fast-forward', to: first });
+    expect(main(e)).toBe(first);
+    expect(await syncBaseFromOrigin(e.layout.repo, 'main')).toMatchObject({ action: 'fast-forward', from: first, to: later });
+  });
+
+  it('up to date: the claim proceeds without a base-sync event or a ref change', async () => {
+    const e = originEnv();
+    e.backlog.add({ id: 'task-1', title: 'Up to date' });
+    await e.sched.claim('task-1', 'engineer');
+    expect(main(e)).toBe(e.baseSha);
+    expect(e.db.events('task-1', 'base-sync')).toHaveLength(0);
+    expect(e.db.events('task-1', 'base-sync-blocked')).toHaveLength(0);
+  });
+
+  it('the container fetches the origin remote; the host runtime fetches the normalized https URL', async () => {
+    const cases: Array<[string | undefined, string, string]> = [
+      [undefined, REMOTE, 'origin'],
+      ['host', 'git@github.com:acme/demo.git', REMOTE],
+    ];
+    for (const [runtime, remote, expected] of cases) {
+      const e = originEnv();
+      gitSync(e.layout.repo, 'remote', 'set-url', 'origin', remote);
+      const merged = mergeOnGithub(e, 'merged.txt');
+      if (runtime) vi.stubEnv('MINIONS_RUNTIME', runtime);
+      const fetches: string[][] = [];
+      // Record the fetch, then fetch from the bare repo (hardened host git ignores the test's insteadOf).
+      const git: GitFn = async (cwd, args, allowFailure) => {
+        if (args[0] !== 'fetch') return realGit(cwd, args, allowFailure);
+        fetches.push(args);
+        return realGit(cwd, ['fetch', '--no-tags', e.bare, args[args.length - 1]!], allowFailure);
+      };
+      await syncBaseFromOrigin(e.layout.repo, 'main', { git });
+      expect(fetches).toEqual([['fetch', '--no-tags', expected, '+refs/heads/main:refs/remotes/origin/main']]);
+      expect(main(e)).toBe(merged);
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it('local delivery never calls the base sync, so nothing is fetched', async () => {
+    const e = originEnv('local');
+    const baseSync = vi.fn(async () => { throw new Error('must not run under local delivery'); });
+    const sched = new Scheduler({ db: e.db, backlog: e.backlog, config: e.config, layout: e.layout, baseSync });
+    mergeOnGithub(e, 'merged.txt');
+    e.backlog.add({ id: 'task-1', title: 'Local' });
+    const brief = await sched.claim('task-1', 'engineer');
+    expect(baseSync).not.toHaveBeenCalled();
+    expect(brief.baseSha).toBe(e.baseSha);
+    // The fixture's initial push set origin/main; it was never fetched again.
+    expect(gitSync(e.layout.repo, 'rev-parse', 'refs/remotes/origin/main')).toBe(e.baseSha);
+  });
+
+  it('GitHub delivery: a sync failure leaves no lease and no status change, and is recorded as base-sync-blocked', async () => {
+    const e = originEnv('branch');
+    const baseSync = vi.fn(async () => { throw new MinionsError('NETWORK_RETRYABLE', 'offline. The claim was blocked; nothing was merged.', undefined, { reason: 'fetch-failed' }); });
+    const sched = new Scheduler({ db: e.db, backlog: e.backlog, config: e.config, layout: e.layout, baseSync });
+    e.backlog.add({ id: 'task-1', title: 'Offline' });
+    const err = await failure(sched.claim('task-1', 'engineer'));
+    expect(err.code).toBe('NETWORK_RETRYABLE');
+    expect(baseSync).toHaveBeenCalledWith(e.layout.repo, 'main');
+    expect(e.db.leases({ all: true })).toHaveLength(0);
+    expect(e.backlog.status('task-1')).toBe('ready');
+    expect(e.db.events('task-1', 'base-sync-blocked')[0]?.data).toMatchObject({ role: 'engineer', base: 'main', code: 'NETWORK_RETRYABLE', details: { reason: 'fetch-failed' } });
   });
 });
