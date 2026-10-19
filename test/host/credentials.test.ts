@@ -394,3 +394,100 @@ describe('init and doctor integration', () => {
     expect(doc.checks.find((c) => c.name === 'github.credential')).toMatchObject({ status: 'ok', detail: expect.stringMatching(/^missing: not needed/) });
   });
 });
+
+describe('security edge cases (tester)', () => {
+  const PREFIX = 'github_pat_11ABCDEFG0123456789_abcdefghij';
+  const hostile = [
+    `${PREFIX}\nadd-generic-password -s evil -w x`,
+    `${PREFIX} -w other`,
+    `${PREFIX}"; rm -rf /`,
+    `${PREFIX}'`,
+    `${PREFIX}\\`,
+    `${PREFIX};x`,
+    `${PREFIX}$(id)`,
+    `${PREFIX}\`id\``,
+    `${PREFIX}\r\nfoo`,
+    `${PREFIX}\u0000`,
+  ];
+
+  it('security -i is never invoked for tokens with whitespace, quotes or metacharacters', async () => {
+    const { calls, runner } = recorder();
+    const ks = new C.KeychainStore(runner);
+    for (const t of hostile) {
+      expect(() => C.checkTokenFormat(t)).toThrow();
+      await expect(ks.set(ID, t)).rejects.toBeInstanceOf(MinionsError);
+    }
+    expect(calls).toEqual([]);
+  });
+
+  it('security -i is never invoked with a non-UUID project id', async () => {
+    const { calls, runner } = recorder();
+    for (const id of ['x -w y', `${ID}\nfoo`, '../../etc', `${ID} `]) {
+      await expect(new C.KeychainStore(runner).set(id, TOKEN)).rejects.toBeInstanceOf(MinionsError);
+      await expect(new C.FileStore().set(id, TOKEN)).rejects.toBeInstanceOf(MinionsError);
+    }
+    expect(calls).toEqual([]);
+  });
+
+  it('surrounding whitespace/newlines are trimmed (stdin-style input)', () => {
+    expect(C.checkTokenFormat(`  ${TOKEN}\r\n`).token).toBe(TOKEN);
+    expect(C.checkTokenFormat(`${TOKEN}\n\n`).token).toBe(TOKEN);
+  });
+
+  it('format errors do not echo the rejected input', () => {
+    try { C.checkTokenFormat('hunter2-secret-value'); expect.unreachable(); } catch (e) {
+      expect(JSON.stringify(e) + (e as Error).message + ((e as { hint?: string }).hint ?? '')).not.toContain('hunter2');
+    }
+  });
+
+  it('file permissions hold under a permissive umask and leave no temp files', async () => {
+    const repo = makeRepo(env.root);
+    const old = process.umask(0o000);
+    try {
+      await C.provisionGithubToken({ projectId: ID, token: TOKEN, repoPath: repo, verify: false });
+      await C.provisionGithubToken({ projectId: ID, token: TOKEN2, repoPath: repo, verify: false });
+      await C.materializeSecrets(ID);
+    } finally { process.umask(old); }
+    expect(mode(new C.FileStore().path(ID))).toBe(0o600);
+    expect(mode(join(credentialStoreDir(), ID))).toBe(0o700);
+    expect(mode(projectPaths(ID).githubTokenFile)).toBe(0o600);
+    expect(mode(projectPaths(ID).secretsDir)).toBe(0o700);
+    expect(mode(projectPaths(ID).credentialsJson)).toBe(0o600);
+    for (const dir of [join(credentialStoreDir(), ID), projectPaths(ID).secretsDir]) {
+      expect(readdirSync(dir).filter((n) => n.endsWith('.tmp'))).toEqual([]);
+    }
+    expect(readFileSync(projectPaths(ID).githubTokenFile, 'utf8')).toBe(TOKEN2 + '\n');
+  });
+
+  it('a network error that echoes the token is redacted; Authorization header is not in results', async () => {
+    const f = (async (_u: unknown, init?: RequestInit) => {
+      throw new Error(`connect failed, headers: Authorization: Bearer ${new Headers(init?.headers).get('authorization')?.slice(7)}`);
+    }) as unknown as typeof fetch;
+    const v = await C.verifyGithubToken(TOKEN, { remoteUrl: REMOTE, fetch: f });
+    expect(v.status).toBe('unverified');
+    expect(JSON.stringify(v)).not.toContain(TOKEN);
+    expect(JSON.stringify(v)).not.toContain('11ABCDEFG0123456789_abcdefghij');
+  });
+
+  it('HTTP error bodies echoing the token never reach the result', async () => {
+    for (const status of [401, 403, 404, 500]) {
+      const v = await C.verifyGithubToken(TOKEN, { remoteUrl: REMOTE, fetch: github(status, { message: `bad ${TOKEN}` }).f });
+      expect(JSON.stringify(v)).not.toContain(TOKEN);
+    }
+  });
+
+  it('unverified status is reported for network failure and 5xx; token never in status', async () => {
+    const repo = makeRepo(env.root);
+    await C.provisionGithubToken({ projectId: ID, token: TOKEN, repoPath: repo, verify: false });
+    const proj = { projectId: ID, remoteUrl: REMOTE };
+    const s5 = await C.githubCredentialStatus(proj, { fetch: github(503).f });
+    expect(s5.state).toBe('unverified');
+    const net = await C.githubCredentialStatus(proj, { fetch: (async () => { throw new Error(`boom ${TOKEN}`); }) as unknown as typeof fetch });
+    expect(net.state).toBe('unverified');
+    expect(JSON.stringify([s5, net])).not.toContain(TOKEN);
+  });
+
+  it('removing when nothing is provisioned is a no-op', async () => {
+    expect(await C.removeGithubToken(ID)).toEqual({ removed: false, backend: null });
+  });
+});
