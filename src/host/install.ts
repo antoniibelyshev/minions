@@ -7,11 +7,12 @@ import { can } from '../config/capabilities.js';
 import { DEFERRED_FEATURES, listUnavailable, validateConfig, type Unavailable } from '../config/resolve.js';
 import { CAPABILITIES, type Effect, type MinionsConfig, type Profile } from '../config/schema.js';
 import { MinionsError } from '../core/errors.js';
-import { atomicWrite, exists, readJsonIfExists, sha256, writeJson } from '../core/fsutil.js';
-import { imageTag, projectPaths, registryPath, repoPaths, volumeNames } from '../core/paths.js';
+import { atomicWrite, ensureDir, exists, readJsonIfExists, sha256, writeJson } from '../core/fsutil.js';
+import { GITHUB_TOKEN_CONTAINER_PATH, imageTag, projectPaths, registryPath, repoPaths, volumeNames } from '../core/paths.js';
 import { VERSION } from '../core/version.js';
 import { generatePlugin } from '../plugin/generate.js';
 import { discover, dockerProbe, type Discovery, type DockerProbe, type DockerStatus } from './discovery.js';
+import { githubTokenGuidance, loadCredentialRefs, provisionGithubToken, type CredentialsJson, type Fetch, type ProvisionResult } from './credentials.js';
 import { composeYaml, type Runner } from './docker.js';
 import { ProjectJsonSchema, resolveEffective, runtimeProjectInfo, sharedConfigView, type ProjectJson } from './project.js';
 import { bindProject, gitCommonDir, loadRegistry, repoRoot, resolveIdentity, saveRegistry, sharedProjectId, type Identity, type Registry } from './registry.js';
@@ -121,6 +122,8 @@ export interface InitOptions {
   io?: WizardIO;
   dockerProbe?: DockerProbe;
   runner?: Runner;
+  /** GitHub API client for token verification (tests). */
+  fetch?: Fetch;
 }
 
 interface Prepared { plan: InstallPlan; desired: Desired[]; manifest: Manifest | undefined; registry: Registry; cleanup: () => Promise<void> }
@@ -325,6 +328,10 @@ async function prepare(opts: InitOptions): Promise<Prepared> {
       `Runtime image ${project.imageTag} is built from the installed package on first \`minions start\`.`,
       'Claude login inside the container on first start: run /login in the coordinator session (host login is not reused).',
       'Repository is imported into the container from a Git bundle of committed history on first start.',
+      ...(discovery.git.hasGitHub ? [
+        `Optional GitHub token (mounted read-only at ${GITHUB_TOKEN_CONTAINER_PATH}; needed for upcoming push/PR delivery):`,
+        ...githubTokenGuidance(discovery.git.remoteUrl).map((l) => `  ${l}`),
+      ] : []),
     ],
     notes, warnings,
     container: { ...project.container, image: project.imageTag, volumes: Object.values(volumeNames(projectId)) },
@@ -443,6 +450,33 @@ export interface InitResult {
   applied?: ApplyResult;
   docker: DockerStatus;
   nextSteps: string[];
+  /** GitHub token step of an interactive init (repo has a GitHub remote). Never contains the token. */
+  github?: { status: 'present' | 'stored' | 'skipped' | 'failed'; detail: string; provisioned?: Omit<ProvisionResult, 'projectId'> };
+}
+
+/**
+ * Interactive init only, GitHub remote only: offers to store a token through the host terminal's
+ * non-echoing prompt. Failures never fail init (the install is already applied).
+ */
+async function offerGithubToken(opts: InitOptions, plan: InitResult['plan']): Promise<InitResult['github']> {
+  const io = opts.io;
+  if (!io || opts.yes || opts.configFile || !plan.discovery.git.hasGitHub) return undefined;
+  const existing = (await loadCredentialRefs(plan.projectId).catch((): CredentialsJson => ({ version: 1 }))).github;
+  if (existing) return { status: 'present', detail: `GitHub token already provisioned (${existing.backend}); replace it with \`minions auth github\`.` };
+  if (!io.secret) return { status: 'skipped', detail: 'no terminal for a non-echoing prompt; run `minions auth github` later.' };
+  io.info(['', 'GitHub token (optional now; needed later for push/PR delivery):', ...githubTokenGuidance(plan.discovery.git.remoteUrl).map((l) => `  ${l}`)].join('\n'));
+  const want = await io.ask('Store a GitHub token for this project now? (y/n)', 'n');
+  if (!/^y(es)?$/i.test(want)) return { status: 'skipped', detail: 'skipped; run `minions auth github` later.' };
+  try {
+    const token = await io.secret('GitHub token (input hidden): ');
+    const { projectId: _id, ...provisioned } = await provisionGithubToken({
+      projectId: plan.projectId, token, repoPath: plan.repoPath, remoteUrl: plan.discovery.git.remoteUrl,
+      runner: opts.runner, fetch: opts.fetch,
+    });
+    return { status: 'stored', detail: `stored in ${provisioned.backend === 'keychain' ? 'the macOS Keychain' : 'a 0600 host file'}`, provisioned };
+  } catch (e) {
+    return { status: 'failed', detail: `${e instanceof MinionsError ? e.message : 'could not store the token'}; run \`minions auth github\` to retry.` };
+  }
 }
 
 export function dockerUnavailable(s: DockerStatus): MinionsError {
@@ -473,11 +507,16 @@ export async function runInit(opts: InitOptions): Promise<InitResult> {
     // Verify: Docker still reachable after applying (never claim readiness otherwise).
     const after = await probe();
     if (!after.daemon || !after.compose) throw dockerUnavailable(after);
+    // The secrets directory must exist: compose bind-mounts it with create_host_path: false.
+    await ensureDir(projectPaths(plan.projectId).secretsDir, 0o700);
+    const github = await offerGithubToken(opts, plan);
     return {
-      dryRun: false, plan, applied, docker: after,
+      dryRun: false, plan, applied, docker: after, ...(github ? { github } : {}),
       nextSteps: [
         'Run `minions start` in this repository.',
         'The first start builds the runtime image, imports committed history, and opens the coordinator; log in to Claude inside the container with /login.',
+        ...(plan.discovery.git.hasGitHub && github?.status !== 'stored' && github?.status !== 'present'
+          ? ['Run `minions auth github` to store a GitHub token for this project (entered without echo).'] : []),
         'Run `minions doctor` to check readiness at any time.',
       ],
     };
@@ -511,6 +550,10 @@ export function formatInit(r: InitResult): string {
   if (r.applied) {
     L.push('', `Applied: ${r.applied.written.length} written, ${r.applied.removed.length} removed, ${r.applied.unchanged} unchanged.`);
     for (const s of r.applied.skipped) L.push(`  ! drift: ${s.path} — ${s.note}`);
+  }
+  if (r.github) {
+    L.push(`GitHub token: ${r.github.status} — ${r.github.detail}`);
+    for (const w of r.github.provisioned?.warnings ?? []) L.push(`  ! ${w}`);
   }
   L.push('', 'Next steps:', ...r.nextSteps.map((s) => `  ${s}`));
   return L.join('\n');

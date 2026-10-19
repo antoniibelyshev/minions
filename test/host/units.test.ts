@@ -43,12 +43,12 @@ describe('compose generation', () => {
     expect(y).toContain('name: "minions-3f2b8c1e"');
   });
 
-  it('bind mounts only the plugin and runtime config dirs, read-only', () => {
+  it('bind mounts only the plugin, runtime config and secrets dirs, read-only', () => {
     const y = composeYaml(project());
     const p = projectPaths(ID);
     const binds = [...y.matchAll(/- type: bind\n\s+source: "([^"]+)"\n\s+target: "([^"]+)"\n\s+read_only: (\w+)/g)].map((m) => [m[1], m[2], m[3]]);
-    expect(binds).toEqual([[p.pluginDir, '/opt/minions/plugin', 'true'], [p.runtimeDir, '/opt/minions/config', 'true']]);
-    expect(y.match(/type: bind/g)).toHaveLength(2);
+    expect(binds).toEqual([[p.pluginDir, '/opt/minions/plugin', 'true'], [p.runtimeDir, '/opt/minions/config', 'true'], [p.secretsDir, '/opt/minions/secrets', 'true']]);
+    expect(y.match(/type: bind/g)).toHaveLength(3);
     const vols = [...y.matchAll(/- type: volume\n\s+source: (\w+)\n\s+target: "([^"]+)"/g)].map((m) => [m[1], m[2]]);
     expect(vols).toEqual([['workspace', '/workspace'], ['state', '/state'], ['claude', '/home/node/.claude'], ['cache', '/home/node/.cache']]);
   });

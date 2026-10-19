@@ -16,7 +16,7 @@ const q = (s: string | number) => JSON.stringify(String(s)); // JSON strings are
 /**
  * Generates compose.yaml for one project. Security baseline (spec §3A, bootstrap "Container"):
  * non-root, read-only rootfs, all caps dropped, no-new-privileges, resource limits, tmpfs for /tmp
- * and /home/node, named volumes for state, ro binds only for the plugin and runtime config,
+ * and /home/node, named volumes for state, ro binds only for the plugin, runtime config and secrets dir,
  * loopback-only published ports, no Docker socket, no privileged mode, no host network/PID.
  */
 export function composeYaml(p: ProjectJson): string {
@@ -69,6 +69,10 @@ export function composeYaml(p: ProjectJson): string {
     '        bind:', '          create_host_path: false');
   bind(paths.pluginDir, CONTAINER.pluginDir);
   bind(paths.runtimeDir, CONTAINER.configDir);
+  // Secrets: a directory mount (never a single-file mount) so a token replaced on the host via
+  // rename (new inode) is visible without recreating the container. Only materialized secret files
+  // live here; the host credential store (Keychain / credentials dir) is never mounted.
+  bind(paths.secretsDir, CONTAINER.secretsDir);
   if (c.publishPorts.length && c.network !== 'none') {
     L.push('    ports:');
     for (const { host, container } of c.publishPorts) L.push(`      - ${q(`127.0.0.1:${host}:${container}`)}`);

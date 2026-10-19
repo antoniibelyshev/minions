@@ -36,6 +36,10 @@ It uses a temp `MINIONS_HOME` and disposable repos and removes its containers an
   rebuilds it when the installed package differs, and `doctor` warns about a stale image.
 - **Claude login** happens interactively inside the container (`/login`) and is stored in the
   project's `claude` volume. API-key provisioning and host login reuse are not supported.
+- **GitHub token file ownership**: the materialized token (`/opt/minions/secrets/github-token`) is a
+  0600 file owned by the host user. Docker Desktop on macOS maps bind-mount ownership so the
+  container user (uid 1000) can read it. On a Linux Docker Engine whose host user is not uid 1000,
+  the container cannot read it (untested).
 - **Outbound network is unrestricted** in the container (`network: outbound-internet`). There is no
   egress allowlist, and the container can reach the host/LAN like any Docker Desktop container.
 - **Single container, shared credentials**: engineer, tester, and reviewer run in one container and
@@ -45,5 +49,5 @@ It uses a temp `MINIONS_HOME` and disposable repos and removes its containers an
   but detection is best effort.
 - **Deferred features** (reported as unavailable by `minions doctor`): GitHub Issues backend,
   branch/PR/auto-merge delivery, review publication, Telegram, config plan/apply transactions,
-  backlog migration, upgrade, budgets, companion containers, GitHub credential provisioning.
+  backlog migration, upgrade, budgets, companion containers.
 - Native macOS/iOS builds (Xcode) cannot run inside the Linux runtime.
