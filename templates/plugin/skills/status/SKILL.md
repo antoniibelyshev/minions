@@ -1,0 +1,20 @@
+---
+name: status
+description: Concise minions project status - queue, active workers, blockers, delivered branches.
+---
+
+# Minions status
+
+1. `minions status --json` (controls, counts, config revision).
+2. `minions work list --json` (active leases: task, role, attempt, started).
+3. If needed, `minions backlog list --json` for tasks in `blocked`, `awaiting-human` or `changes-requested`.
+
+Answer in a few lines:
+
+- Paused or running; active tasks/limits ({{maxActiveTasks}} tasks, {{maxEngineers}} engineers).
+- In progress: task, stage, attempt.
+- Waiting on the user: each item with the question and your recommended answer.
+- Blocked: task and reason.
+- Delivered since last report: task and `agent/<slug>` branch. Remind the user that `minions export` on the host fetches them.
+
+Do not dump raw JSON or logs. Read only; this skill changes nothing.

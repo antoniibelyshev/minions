@@ -1,0 +1,6 @@
+{
+  "name": "minions",
+  "version": "{{packageVersion}}",
+  "author": { "name": "minions" },
+  "description": "Minions agent team for this project: coordinator procedures plus engineer, tester and reviewer workers (profile {{profile}}, config revision {{configRevision}})."
+}

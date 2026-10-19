@@ -13,6 +13,7 @@ export interface Task {
   labels: string[]; authorized: boolean;   // label 'minions:authorized' or profile allows startReady
   branch: string | null; commits: string[]; prUrl: string | null;
   provenance: Provenance; version: string; // content hash for conflict checks
+  milestone?: string | null; // backend milestone, used by intake.scope.milestone
 }
 
 export interface CreateTaskInput {
@@ -34,4 +35,10 @@ export interface BacklogAdapter {
   addNote(id: string, text: string): Promise<void>;
   closeTask(id: string, status: 'done' | 'delivered' | 'cancelled'): Promise<Task>;
   exportTasks(): Promise<Task[]>;
+}
+
+/** Idempotency key -> task id (runtime DB table `idempotency` in production). */
+export interface IdempotencyStore {
+  get(key: string): string | undefined;
+  put(key: string, taskId: string): void;
 }
