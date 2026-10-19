@@ -1,0 +1,670 @@
+{
+  "title": "Minions configuration",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "schemaVersion": {
+      "type": "number",
+      "const": 1
+    },
+    "configRevision": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991
+    },
+    "projectId": {
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+    },
+    "packageVersion": {
+      "$ref": "#/$defs/__schema0"
+    },
+    "profile": {
+      "type": "string",
+      "enum": [
+        "project-owner",
+        "personal-work",
+        "supervised"
+      ]
+    },
+    "visibility": {
+      "type": "string",
+      "enum": [
+        "shared",
+        "private"
+      ]
+    },
+    "backlog": {
+      "type": "object",
+      "properties": {
+        "backend": {
+          "type": "string",
+          "enum": [
+            "backlogmd",
+            "github"
+          ]
+        },
+        "ownership": {
+          "type": "string",
+          "enum": [
+            "direct",
+            "personal",
+            "assigned"
+          ]
+        },
+        "repository": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "backend",
+        "ownership",
+        "repository"
+      ],
+      "additionalProperties": false
+    },
+    "intake": {
+      "type": "object",
+      "properties": {
+        "sources": {
+          "minItems": 1,
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/__schema1"
+          }
+        },
+        "startReady": {
+          "type": "boolean"
+        },
+        "scope": {
+          "type": "object",
+          "properties": {
+            "milestone": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "externalAssignee": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "requiredLabels": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/__schema0"
+              }
+            },
+            "allowedPaths": {
+              "minItems": 1,
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/__schema0"
+              }
+            }
+          },
+          "required": [
+            "milestone",
+            "externalAssignee",
+            "requiredLabels",
+            "allowedPaths"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "sources",
+        "startReady",
+        "scope"
+      ],
+      "additionalProperties": false
+    },
+    "container": {
+      "type": "object",
+      "properties": {
+        "required": {
+          "type": "boolean",
+          "const": true
+        },
+        "workspace": {
+          "type": "string",
+          "const": "named-volume"
+        },
+        "cpus": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "memoryMiB": {
+          "type": "integer",
+          "minimum": 512,
+          "maximum": 9007199254740991
+        },
+        "pidsLimit": {
+          "type": "integer",
+          "minimum": 64,
+          "maximum": 9007199254740991
+        },
+        "publishPorts": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "host": {
+                "$ref": "#/$defs/__schema2"
+              },
+              "container": {
+                "$ref": "#/$defs/__schema2"
+              }
+            },
+            "required": [
+              "host",
+              "container"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "network": {
+          "type": "string",
+          "enum": [
+            "outbound-internet",
+            "none"
+          ]
+        },
+        "mountHostRepository": {
+          "type": "boolean"
+        },
+        "mountDockerSocket": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "required",
+        "workspace",
+        "cpus",
+        "memoryMiB",
+        "pidsLimit",
+        "publishPorts",
+        "network",
+        "mountHostRepository",
+        "mountDockerSocket"
+      ],
+      "additionalProperties": false
+    },
+    "execution": {
+      "type": "object",
+      "properties": {
+        "maxActiveTasks": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "maxEngineers": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "oneActiveStagePerTask": {
+          "type": "boolean",
+          "const": true
+        },
+        "maxRepairCyclesBeforeReplan": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "attemptMaxTurns": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        }
+      },
+      "required": [
+        "maxActiveTasks",
+        "maxEngineers",
+        "oneActiveStagePerTask",
+        "maxRepairCyclesBeforeReplan",
+        "attemptMaxTurns"
+      ],
+      "additionalProperties": false
+    },
+    "models": {
+      "type": "object",
+      "properties": {
+        "default": {
+          "$ref": "#/$defs/__schema0"
+        },
+        "allowed": {
+          "minItems": 1,
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/__schema0"
+          }
+        },
+        "selection": {
+          "type": "string",
+          "enum": [
+            "coordinator",
+            "fixed"
+          ]
+        }
+      },
+      "required": [
+        "default",
+        "allowed",
+        "selection"
+      ],
+      "additionalProperties": false
+    },
+    "delivery": {
+      "type": "object",
+      "properties": {
+        "provider": {
+          "type": "string",
+          "enum": [
+            "none",
+            "github"
+          ]
+        },
+        "mode": {
+          "type": "string",
+          "enum": [
+            "local",
+            "branch",
+            "pull-request"
+          ]
+        },
+        "merge": {
+          "type": "string",
+          "enum": [
+            "disabled",
+            "manual",
+            "auto-when-eligible"
+          ]
+        },
+        "method": {
+          "type": "string",
+          "enum": [
+            "squash",
+            "merge",
+            "rebase"
+          ]
+        },
+        "deleteMergedBranches": {
+          "type": "boolean"
+        },
+        "identityMode": {
+          "type": "string",
+          "enum": [
+            "git-identity",
+            "user-token",
+            "github-apps"
+          ]
+        },
+        "requireIndependentApproval": {
+          "type": "boolean"
+        },
+        "requiredChecksConfigured": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "provider",
+        "mode",
+        "merge",
+        "method",
+        "deleteMergedBranches",
+        "identityMode",
+        "requireIndependentApproval",
+        "requiredChecksConfigured"
+      ],
+      "additionalProperties": false
+    },
+    "verification": {
+      "type": "object",
+      "properties": {
+        "commands": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/__schema0"
+          }
+        },
+        "testerRequired": {
+          "type": "boolean"
+        },
+        "reviewerRequired": {
+          "type": "boolean"
+        },
+        "ciAuthority": {
+          "type": "string",
+          "enum": [
+            "none",
+            "github"
+          ]
+        }
+      },
+      "required": [
+        "commands",
+        "testerRequired",
+        "reviewerRequired",
+        "ciAuthority"
+      ],
+      "additionalProperties": false
+    },
+    "communication": {
+      "type": "object",
+      "properties": {
+        "channel": {
+          "type": "string",
+          "enum": [
+            "terminal",
+            "telegram"
+          ]
+        },
+        "progress": {
+          "type": "string",
+          "enum": [
+            "milestones",
+            "tasks",
+            "quiet"
+          ]
+        }
+      },
+      "required": [
+        "channel",
+        "progress"
+      ],
+      "additionalProperties": false
+    },
+    "budgets": {
+      "type": "object",
+      "properties": {
+        "taskUsd": {
+          "anyOf": [
+            {
+              "type": "number",
+              "exclusiveMinimum": 0
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "dailyUsd": {
+          "anyOf": [
+            {
+              "type": "number",
+              "exclusiveMinimum": 0
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "taskUsd",
+        "dailyUsd"
+      ],
+      "additionalProperties": false
+    },
+    "capabilities": {
+      "type": "object",
+      "properties": {
+        "task.read": {
+          "$ref": "#/$defs/__schema3"
+        },
+        "task.create": {
+          "$ref": "#/$defs/__schema3"
+        },
+        "task.update": {
+          "$ref": "#/$defs/__schema3"
+        },
+        "task.start": {
+          "$ref": "#/$defs/__schema3"
+        },
+        "external.read": {
+          "$ref": "#/$defs/__schema3"
+        },
+        "external.comment": {
+          "$ref": "#/$defs/__schema3"
+        },
+        "external.changeStatus": {
+          "$ref": "#/$defs/__schema3"
+        },
+        "external.create": {
+          "$ref": "#/$defs/__schema3"
+        },
+        "code.edit": {
+          "$ref": "#/$defs/__schema3"
+        },
+        "dependencies.edit": {
+          "$ref": "#/$defs/__schema3"
+        },
+        "architecture.change": {
+          "$ref": "#/$defs/__schema3"
+        },
+        "migrations.edit": {
+          "$ref": "#/$defs/__schema3"
+        },
+        "git.commit": {
+          "$ref": "#/$defs/__schema3"
+        },
+        "git.push": {
+          "$ref": "#/$defs/__schema3"
+        },
+        "pr.create": {
+          "$ref": "#/$defs/__schema3"
+        },
+        "pr.review": {
+          "$ref": "#/$defs/__schema3"
+        },
+        "pr.merge": {
+          "$ref": "#/$defs/__schema3"
+        },
+        "ci.edit": {
+          "$ref": "#/$defs/__schema3"
+        },
+        "infrastructure.edit": {
+          "$ref": "#/$defs/__schema3"
+        },
+        "network.use": {
+          "$ref": "#/$defs/__schema3"
+        },
+        "deploy.execute": {
+          "$ref": "#/$defs/__schema3"
+        }
+      },
+      "required": [
+        "task.read",
+        "task.create",
+        "task.update",
+        "task.start",
+        "external.read",
+        "external.comment",
+        "external.changeStatus",
+        "external.create",
+        "code.edit",
+        "dependencies.edit",
+        "architecture.change",
+        "migrations.edit",
+        "git.commit",
+        "git.push",
+        "pr.create",
+        "pr.review",
+        "pr.merge",
+        "ci.edit",
+        "infrastructure.edit",
+        "network.use",
+        "deploy.execute"
+      ],
+      "additionalProperties": false
+    },
+    "sensitivePaths": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/__schema0"
+      }
+    },
+    "architecture": {
+      "type": "string",
+      "enum": [
+        "decide",
+        "propose"
+      ]
+    },
+    "git": {
+      "type": "object",
+      "properties": {
+        "baseBranch": {
+          "$ref": "#/$defs/__schema0"
+        },
+        "identity": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "$ref": "#/$defs/__schema0"
+            },
+            "email": {
+              "$ref": "#/$defs/__schema0"
+            }
+          },
+          "required": [
+            "name",
+            "email"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "baseBranch",
+        "identity"
+      ],
+      "additionalProperties": false
+    },
+    "permissionMode": {
+      "type": "string",
+      "enum": [
+        "default",
+        "acceptEdits",
+        "auto"
+      ]
+    }
+  },
+  "required": [
+    "schemaVersion",
+    "configRevision",
+    "projectId",
+    "packageVersion",
+    "profile",
+    "visibility",
+    "backlog",
+    "intake",
+    "container",
+    "execution",
+    "models",
+    "delivery",
+    "verification",
+    "communication",
+    "budgets",
+    "capabilities",
+    "sensitivePaths",
+    "architecture",
+    "git",
+    "permissionMode"
+  ],
+  "additionalProperties": false,
+  "$defs": {
+    "__schema0": {
+      "type": "string",
+      "minLength": 1
+    },
+    "__schema1": {
+      "type": "string",
+      "enum": [
+        "user",
+        "milestone",
+        "external"
+      ]
+    },
+    "__schema2": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 65535
+    },
+    "__schema3": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/__schema4"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "effect": {
+              "$ref": "#/$defs/__schema4"
+            },
+            "rules": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "effect": {
+                    "$ref": "#/$defs/__schema4"
+                  },
+                  "roles": {
+                    "minItems": 1,
+                    "type": "array",
+                    "items": {
+                      "$ref": "#/$defs/__schema5"
+                    }
+                  },
+                  "paths": {
+                    "minItems": 1,
+                    "type": "array",
+                    "items": {
+                      "$ref": "#/$defs/__schema6"
+                    }
+                  }
+                },
+                "required": [
+                  "effect"
+                ],
+                "additionalProperties": false
+              }
+            }
+          },
+          "required": [
+            "effect"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "__schema4": {
+      "type": "string",
+      "enum": [
+        "allow",
+        "ask",
+        "deny"
+      ]
+    },
+    "__schema5": {
+      "type": "string",
+      "enum": [
+        "coordinator",
+        "engineer",
+        "tester",
+        "reviewer"
+      ]
+    },
+    "__schema6": {
+      "type": "string",
+      "minLength": 1
+    }
+  }
+}
