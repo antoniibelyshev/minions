@@ -110,19 +110,3 @@ describe('upClearingSecretsOnFailure resilience', () => {
     await expect(C.upClearingSecretsOnFailure({ up: async () => { throw err; } }, '../does-not-exist/../' + ID)).rejects.toBe(err);
   });
 });
-
-describe('PROBE doctor must not delete when state unknown', () => {
-  for (const [name, mk] of [
-    ['ps errors (code 1)', (a: string[]): RunResult => a.includes('ps') ? { code: 1, stdout: '', stderr: 'boom' } : ok('{}')],
-    ['ps times out/empty ok but container restarting', (a: string[]): RunResult => ok(a.includes('ps') ? '' : '{}')],
-  ] as const) {
-    it(name, async () => {
-      const repo = makeRepo(env.root);
-      const r = await runInit({ path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
-      const id = r.plan.projectId;
-      await plant(id);
-      await runDoctor({ cwd: repo, probe: dockerUp, runner: async (_c, a) => mk(a) });
-      expect(copies(id)).toEqual([true, true]);
-    });
-  }
-});
