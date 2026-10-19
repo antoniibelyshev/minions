@@ -200,7 +200,7 @@ describe('keychain store', () => {
     const r = await C.provisionGithubToken({ projectId: ID, token: TOKEN, repoPath: repo, verify: false, runner, env: {}, platform: 'darwin' });
     expect(r.backend).toBe('keychain');
     expect(existsSync(new C.FileStore().path(ID))).toBe(false);
-    expect(await C.materializeSecrets(ID, runner)).toEqual({ github: true });
+    expect(await C.materializeSecrets(ID, runner)).toEqual({ github: true, telegram: false });
     expect(readFileSync(projectPaths(ID).githubTokenFile, 'utf8')).toBe(TOKEN + '\n');
     for (const c of calls) expect(c.args.join(' ')).not.toContain(TOKEN);
   });
@@ -229,7 +229,7 @@ describe('container mount', () => {
     const repo = makeRepo(env.root);
     await C.provisionGithubToken({ projectId: ID, token: TOKEN, repoPath: repo, verify: false });
     const p = projectPaths(ID);
-    expect(await C.materializeSecrets(ID)).toEqual({ github: true });
+    expect(await C.materializeSecrets(ID)).toEqual({ github: true, telegram: false });
     expect(mode(p.secretsDir)).toBe(0o700);
     expect(mode(p.githubTokenFile)).toBe(0o600);
     const ino = statSync(p.githubTokenFile).ino;
@@ -244,7 +244,7 @@ describe('container mount', () => {
   });
 
   it('materialize without a provisioned token leaves an empty secrets dir', async () => {
-    expect(await C.materializeSecrets(ID)).toEqual({ github: false });
+    expect(await C.materializeSecrets(ID)).toEqual({ github: false, telegram: false });
     expect(readdirSync(projectPaths(ID).secretsDir)).toEqual([]);
   });
 });

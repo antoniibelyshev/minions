@@ -6,7 +6,11 @@ import { action, globalOpts, requireMode } from '../core/cli-helpers.js';
 import { MinionsError } from '../core/errors.js';
 import { emit } from '../core/output.js';
 import { CONTAINER } from '../core/paths.js';
-import { clearSecrets, githubTokenGuidance, materializeSecrets, provisionGithubToken, removeGithubToken } from './credentials.js';
+import type { MinionsConfig } from '../config/schema.js';
+import {
+  clearSecrets, githubTokenGuidance, materializeSecrets, provisionGithubToken, provisionTelegramToken, removeGithubToken,
+  removeTelegramToken, telegramBotGuidance,
+} from './credentials.js';
 import { dockerProbe } from './discovery.js';
 import { Compose, ensureImage } from './docker.js';
 import { formatDoctor, runDoctor } from './doctor.js';
@@ -33,13 +37,40 @@ async function openProject(json: boolean) {
   return { project, config: eff.config, compose: new Compose(projectId) };
 }
 
-/** Writes the provisioned token into the mounted secrets dir; a store read failure only warns. */
+/** Writes the provisioned tokens into the mounted secrets dir; a store read failure only warns. */
 async function materialize(json: boolean, projectId: string): Promise<void> {
   try { await materializeSecrets(projectId); } catch (e) {
-    await clearSecrets(projectId).catch(() => {});
-    say(json, `warning: GitHub token not available to the container: ${e instanceof MinionsError ? e.message : 'credential store unreadable'}`);
+    say(json, `warning: a stored token is not available to the container: ${e instanceof MinionsError ? e.message : 'credential store unreadable'}`);
   }
 }
+
+/**
+ * Telegram startup integration (container): install the official plugin when Telegram is selected,
+ * then apply restart-required Telegram changes with a controlled coordinator restart. Never fails
+ * the start: terminal mode must keep working.
+ */
+async function telegramStartup(json: boolean, compose: Compose, config: MinionsConfig, opts: { startDetached: boolean }): Promise<unknown> {
+  if (config.communication.channel === 'telegram' && config.container.network !== 'none') {
+    const r = await compose.exec(['minions', 'telegram', 'install', '--json'], { allowFailure: true, timeoutMs: 600_000 });
+    if (r.code !== 0) say(json, `warning: Telegram plugin not installed (${lastLine(r.stdout, r.stderr)}); the coordinator starts terminal-only.`);
+  }
+  return coordinatorSync(json, compose, opts);
+}
+
+async function coordinatorSync(json: boolean, compose: Compose, opts: { startDetached: boolean }): Promise<unknown> {
+  const r = await compose.exec(['minions', 'coordinator', 'sync', '--json', ...(opts.startDetached ? ['--start-detached'] : [])], { allowFailure: true, timeoutMs: 60_000 });
+  let data: { action?: string; reason?: string } | undefined;
+  try { data = (JSON.parse(r.stdout) as { ok: boolean; data?: typeof data }).data; } catch { /* below */ }
+  if (r.code !== 0 || !data) { say(json, `warning: coordinator sync failed: ${lastLine(r.stdout, r.stderr)}`); return null; }
+  if (data.action === 'restarted' || data.action === 'restart-pending' || data.action === 'started') say(json, `coordinator: ${data.action} (${data.reason})`);
+  return data;
+}
+
+const lastLine = (...parts: string[]) => {
+  const text = parts.filter(Boolean).join('\n');
+  try { const e = JSON.parse(text.split('\n')[0] ?? '') as { error?: { message?: string } }; if (e.error?.message) return e.error.message; } catch { /* plain text */ }
+  return text.trim().split('\n').filter(Boolean).slice(-1)[0]?.slice(0, 300) ?? 'no output';
+};
 
 async function readStdinSecret(): Promise<string> {
   if (process.stdin.isTTY) throw new MinionsError('PRECONDITION', '--stdin expects the token on a pipe, not a terminal.', 'Omit --stdin to be prompted without echo.');
@@ -113,7 +144,7 @@ export function register(program: Command): void {
     .action(action(async (o: { attach: boolean }, cmd: Command) => {
       requireMode('host');
       const { json } = globalOpts(cmd);
-      const { project, compose } = await ensureUp(json);
+      const { project, compose, config } = await ensureUp(json);
       let imported: unknown = null;
       if (!(await repoPresent(compose))) {
         say(json, `Importing committed history of ${project.baseBranch} into the container…`);
@@ -122,8 +153,11 @@ export function register(program: Command): void {
         imported = r;
       }
       // The coordinator is a TUI in tmux: attaching needs a terminal (compose exec allocates a TTY).
-      if (!o.attach || json || !process.stdin.isTTY || !process.stdout.isTTY) {
-        emit({ projectId: project.projectId, running: true, imported, attach: `docker compose -p ${compose.name} -f ${compose.file} exec ${'app'} minions coordinator` },
+      const attach = o.attach && !json && !!process.stdin.isTTY && !!process.stdout.isTTY;
+      // Telegram must work with nobody attached: start the session detached in that case.
+      const coordinator = await telegramStartup(json, compose, config, { startDetached: !attach && config.communication.channel === 'telegram' });
+      if (!attach) {
+        emit({ projectId: project.projectId, running: true, imported, coordinator, attach: `docker compose -p ${compose.name} -f ${compose.file} exec ${'app'} minions coordinator` },
           { json, human: () => `Container ${compose.name} is running. Run \`minions start\` in a terminal to attach the coordinator.` });
         return;
       }
@@ -212,6 +246,52 @@ export function register(program: Command): void {
         r.verification ? `Verification: ${r.verification.status} — ${r.verification.detail}` : 'Verification skipped (--no-verify).',
         ...r.warnings.map((w) => `warning: ${w}`),
         mounted ? `Updated ${CONTAINER.githubTokenFile} in the running container.` : `It is mounted read-only at ${CONTAINER.githubTokenFile} on the next \`minions start\`.`,
+      ].join('\n') });
+    }));
+
+  auth.command('telegram')
+    .description('Store the Telegram bot token (prompted without echo; Keychain or a 0600 host file)')
+    .option('--stdin', 'read the token from piped stdin instead of the terminal prompt')
+    .option('--verify', 'check the token with the Telegram Bot API (getMe) before storing it')
+    .option('--remove', 'delete the stored token and its reference')
+    .option('--dry-run', 'show the guidance and storage location without prompting')
+    .action(action(async (o: { stdin?: boolean; verify?: boolean; remove?: boolean }, cmd: Command) => {
+      requireMode('host');
+      const { json, dryRun } = globalOpts(cmd);
+      const ref = await projectForPath(process.cwd());
+      const project = await loadProjectJson(ref.projectId);
+      const compose = new Compose(project.projectId);
+      // A token change is restart-required: apply it to a running container with a controlled restart.
+      const apply = async () => {
+        if (!(await compose.isRunning().catch(() => false))) return false;
+        await materialize(json, project.projectId);
+        const eff = await loadEffectiveConfig(project).catch(() => undefined);
+        await coordinatorSync(json, compose, { startDetached: eff?.config.communication.channel === 'telegram' });
+        return true;
+      };
+      if (o.remove) {
+        const r = dryRun ? { removed: false, backend: null } : await removeTelegramToken(project.projectId);
+        const applied = !dryRun && r.removed ? await apply() : false;
+        emit({ projectId: project.projectId, dryRun, ...r, appliedToRunningContainer: applied }, { json, human: () => dryRun ? 'Would remove the stored Telegram bot token.'
+          : r.removed ? `Removed the Telegram bot token (${r.backend}).${applied ? ' The coordinator now runs terminal-only.' : ''}` : 'No Telegram bot token was stored.' });
+        return;
+      }
+      const guidance = telegramBotGuidance();
+      if (dryRun) { emit({ projectId: project.projectId, dryRun: true, guidance, mountedPath: CONTAINER.telegramTokenFile }, { json, human: () => guidance.join('\n') }); return; }
+      say(json, guidance.join('\n'));
+      // The token is read only here, from the host terminal (no echo) or a pipe; never from argv.
+      const token = o.stdin ? await readStdinSecret()
+        : process.stdin.isTTY ? await readSecret('Telegram bot token (input hidden): ')
+          : (() => { throw new MinionsError('PRECONDITION', 'No terminal to prompt for the token.', 'Run in a terminal, or pipe it: `minions auth telegram --stdin < token-file`.'); })();
+      const r = await provisionTelegramToken({ projectId: project.projectId, token, repoPath: ref.repoPath, verify: !!o.verify });
+      const applied = await apply();
+      emit({ ...r, mountedPath: CONTAINER.telegramTokenFile, appliedToRunningContainer: applied }, { json, human: () => [
+        `Stored the Telegram bot token for bot ${r.botId} in ${r.backend === 'keychain' ? 'the macOS Keychain' : 'a 0600 host file'} (${r.ref}).`,
+        r.verification ? `Verification: ${r.verification.status} — ${r.verification.detail}` : 'Not checked with Telegram (pass --verify to call getMe).',
+        ...r.warnings.map((w) => `warning: ${w}`),
+        applied ? 'Applied to the running container (controlled coordinator restart when needed).'
+          : `It is mounted read-only at ${CONTAINER.telegramTokenFile} on the next \`minions start\`.`,
+        'Telegram is used only when communication.channel is "telegram" (check with `minions config show --explain`).',
       ].join('\n') });
     }));
 

@@ -14,12 +14,12 @@ In:
   `work claim|record|release|list`, `hook stop|pre-agent`, `coordinator`, `status`, `pause`, `resume`.
 - Profiles `project-owner`, `personal-work`, `supervised`; shared + private visibility.
 - Backlog.md backend only. Delivery mode `local` only (commits on `agent/<slug>` branches in the container clone, fetched to host with `minions export`).
-- Terminal communication only.
+- Terminal communication, plus optional Telegram through the official channel plugin (see [telegram.md](telegram.md)).
 - One Docker container per project, security baseline from spec §3A.
 - Claude auth inside the container (interactive `/login`, persisted in the claude volume).
 
 Deferred (report as unavailable): GitHub Issues backend, branch/PR/auto-merge delivery,
-review publication, Telegram, config plan/apply transactions, backlog migration, upgrade,
+review publication, config plan/apply transactions, backlog migration, upgrade,
 budgets, companion containers.
 
 ## Recorded low-impact decisions
@@ -70,6 +70,22 @@ git/gh, branch/PR delivery, and CI observation.
   visible without recreating the container. The Keychain and the credentials directory are never mounted.
 - **Uninstall** keeps the stored token, as it keeps other credentials. `minions auth github --remove`
   deletes it.
+
+## Telegram bot token
+
+A second credential kind on the same mechanism (`CredentialKind` in `src/host/credentials.ts`;
+stores, reference file, and secrets mount are shared, not duplicated). Full design: [telegram.md](telegram.md).
+
+- **Entry.** `minions auth telegram` (and, when `communication.channel` is `telegram`, an offer at the
+  end of an interactive `minions init`), hidden prompt or `--stdin`. Format `^\d{6,12}:[A-Za-z0-9_-]{30,64}$`
+  is checked before the value reaches any store, environment, or `security -i` line.
+  `--verify` (wizard: explicit consent) calls the Bot API `getMe`.
+- **Storage.** Keychain service `minions.telegram`, or `<host data root>/credentials/<projectId>/telegram-bot-token`.
+  `credentials.json` records `{backend, ref, botId, updatedAt}`; the numeric bot id is not secret and
+  detects one bot provisioned for two projects (warning at provisioning and in doctor).
+- **Mount.** `projects/<id>/secrets/telegram-bot-token` → `/opt/minions/secrets/telegram-bot-token` (ro).
+  Only `minions coordinator run` reads it, and passes it to the coordinator's `claude` process as
+  `TELEGRAM_BOT_TOKEN`. A token change applied to a running container triggers a controlled restart.
 
 ## Repository layout
 

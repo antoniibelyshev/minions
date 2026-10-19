@@ -11,7 +11,8 @@
 | Runtime base image | `node:22-bookworm-slim@sha256:c3de60bf2f9dd0ac6370e6117950ff62d6e339527e7472301c9c78a017978392` (Node 22.23.3) | Multi-arch index digest, resolved 2026-10-19. |
 | Claude Code (in image) | `@anthropic-ai/claude-code@2.1.292` | Pinned in `docker/Dockerfile`; auto-updater disabled. |
 | Backlog.md (in image) | `backlog.md@1.54.0` | Pinned in `docker/Dockerfile`. |
-| Telegram channel plugin | `telegram@claude-plugins-official` 0.0.7 (marketplace commit `1e96c6b`) | Interface read and install verified on Claude Code 2.1.292 without credentials; not shipped in v0.1. Needs Bun, which the image does not include yet. `minions telegram probe` and doctor check `telegram.plugin` report availability. See [design/telegram.md](design/telegram.md). |
+| Telegram channel plugin | `telegram@claude-plugins-official` 0.0.7 (marketplace commit `1e96c6b`) | Interface read and install verified on Claude Code 2.1.292 without credentials. Not bundled: `minions start` runs `minions telegram install` (user scope, claude volume) when `communication.channel` is `telegram`; other versions get a warning. `minions telegram probe` and doctor checks `telegram.*` report readiness. No live bot/pairing run recorded yet. See [design/telegram.md](design/telegram.md). |
+| Bun (in image) | `1.4.3` (`bun-linux-aarch64`, `bun-linux-x64-baseline`) | Pinned with SHA-256 checksums from the release `SHASUMS256.txt` in `docker/Dockerfile`, fetched in a throwaway build stage; runs the Telegram plugin's MCP server. The aarch64 checksum was re-verified against the downloaded archive on 2026-10-19. The updated image has not been built in the development sandbox (no Docker there). |
 | System packages (in image) | git, tmux, ca-certificates, ripgrep, less, procps (Debian bookworm) | Installed at build time only. |
 
 `MINIONS_DOCKER_TESTS=1 npx vitest run test/docker` builds the image (tag `minions-test-runtime:latest`),
@@ -49,6 +50,12 @@ It uses a temp `MINIONS_HOME` and disposable repos and removes its containers an
   untracked, and ignored files are never imported; tracked secret-looking files trigger a warning
   but detection is best effort.
 - **Deferred features** (reported as unavailable by `minions doctor`): GitHub Issues backend,
-  branch/PR/auto-merge delivery, review publication, Telegram, config plan/apply transactions,
+  branch/PR/auto-merge delivery, review publication, the Telegram notification outbox, config plan/apply transactions,
   backlog migration, upgrade, budgets, companion containers.
+- **Telegram bot token exposure inside the container**: the token is mounted read-only and given only to
+  the coordinator's `claude` process environment, but the coordinator's tools (and workers' Bash, which
+  run in the same process tree) can read it. Revoke it in BotFather (`/revoke`) if the container is compromised.
+- **Telegram preview**: `--channels` is a research-preview flag hidden from `claude --help`; whether the
+  channel registered is visible only in the coordinator's startup notice. The plugin runs `bun install`
+  at each start, so it needs npm registry access.
 - Native macOS/iOS builds (Xcode) cannot run inside the Linux runtime.

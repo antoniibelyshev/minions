@@ -105,6 +105,8 @@ describe('runtime container (docker)', () => {
   it('pinned tools are present', async () => {
     expect((await sh(['claude', '--version'])).stdout).toContain('2.1.292');
     expect((await sh(['backlog', '--version'])).stdout).toContain('1.54.0');
+    expect((await sh(['bun', '--version'])).stdout.trim()).toBe('1.4.3'); // Telegram channel plugin runtime
+    expect(JSON.stringify(inspect.Config.Env)).not.toContain('TELEGRAM_BOT_TOKEN'); // token reaches only the coordinator process
     for (const t of ['git', 'tmux', 'rg', 'minions']) expect((await sh(['sh', '-c', `command -v ${t}`])).code, t).toBe(0);
   });
 
