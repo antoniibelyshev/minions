@@ -343,6 +343,7 @@ The full shape is defined by the JSON Schema shipped with the package. Unknown f
 
 - Workers default to `sonnet`. `opus` and `haiku` are also allowed, limited to whatever your account can actually use.
 - The coordinator picks the model and effort for each attempt: smaller models for narrow inspection, stronger reasoning for hard debugging, architecture work, or repeated failures.
+- `models.effort` (`low` | `medium` | `high` | `xhigh` | `max`, unset = Claude Code's default) sets the workers' reasoning effort (agent frontmatter `effort`) and the coordinator's (`--effort`). `models.coordinator` picks the coordinator session's model (`--model`; must be in `models.allowed`). Example: `"models": { "default": "claude-opus-5-5", "allowed": ["claude-opus-5-5", "sonnet", "opus", "haiku"], "selection": "coordinator", "effort": "medium" }`.
 - Each attempt is capped at 80 turns, and a task replans after 3 repair cycles. These are attempt limits; they don't cancel the task.
 - Per-task and per-day USD caps are optional and off by default. When set, minions checks known usage before starting each attempt and stops new starts once a cap is reached. Usage figures may be estimates, and minions records how reliable they are. It doesn't promise hard billing enforcement.
 - minions tracks completion time, attempts, repairs, human interventions, and available usage per task.

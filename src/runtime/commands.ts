@@ -197,7 +197,7 @@ export function register(program: Command): void {
     .action(action(async (o: { printCommand?: boolean; probe?: boolean }, cmd: Command) => {
       const cfg = await getConfig();
       if (o.probe) {
-        const r = { ...(await probeRuntime()), command: await buildCoordinatorCommand(cfg) };
+        const r = { ...(await probeRuntime(cfg)), command: await buildCoordinatorCommand(cfg) };
         emit(r, { json: globalOpts(cmd).json, human: (d: typeof r) => `Claude Code ${d.claudeVersion}, ${d.tmuxVersion}: launch flags supported` });
         return;
       }

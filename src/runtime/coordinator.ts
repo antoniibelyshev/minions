@@ -183,6 +183,8 @@ export async function buildClaudeCommand(cfg: MinionsConfig, paths: RuntimePaths
       '--plugin-dir', paths.pluginDir,
       '--append-system-prompt', prompt,
       '--permission-mode', cfg.permissionMode,
+      ...(cfg.models.coordinator ? ['--model', cfg.models.coordinator] : []),
+      ...(cfg.models.effort ? ['--effort', cfg.models.effort] : []),
       '--settings', JSON.stringify(coordinatorSettings(cfg, { ...opts, paths })),
       ...(opts.telegram ? ['--channels', TELEGRAM_CHANNEL_SPEC] : []),
     ],
@@ -353,7 +355,7 @@ export async function syncCoordinator(cfg: MinionsConfig, deps: SyncDeps, opts: 
 }
 
 /** Verifies the installed Claude Code and tmux support what the launcher needs. */
-export async function probeRuntime(): Promise<{ claudeVersion: string; tmuxVersion: string }> {
+export async function probeRuntime(cfg?: Pick<MinionsConfig, 'models'>): Promise<{ claudeVersion: string; tmuxVersion: string }> {
   const onHost = runtimeMode() === 'host-runtime';
   const ver = await run('claude', ['--version'], { allowFailure: true, timeoutMs: 30_000 });
   if (ver.code !== 0) {
@@ -363,7 +365,9 @@ export async function probeRuntime(): Promise<{ claudeVersion: string; tmuxVersi
   }
   const help = await run('claude', ['--help'], { allowFailure: true, timeoutMs: 30_000 });
   const text = help.stdout + help.stderr;
-  const missing = ['--plugin-dir', '--append-system-prompt', '--permission-mode', '--settings'].filter((f) => !text.includes(f));
+  const flags = ['--plugin-dir', '--append-system-prompt', '--permission-mode', '--settings',
+    ...(cfg?.models.coordinator ? ['--model'] : []), ...(cfg?.models.effort ? ['--effort'] : [])];
+  const missing = flags.filter((f) => !text.includes(f));
   if (help.code !== 0 || missing.length) {
     throw new MinionsError('INCOMPATIBLE_RUNTIME',
       `Claude Code ${ver.stdout.trim()} does not support required flags: ${missing.join(', ') || '(claude --help failed)'}.`,
@@ -378,7 +382,7 @@ export async function probeRuntime(): Promise<{ claudeVersion: string; tmuxVersi
 
 /** Launches (or attaches to) the coordinator tmux session with inherited stdio. Resolves with the exit code. */
 export async function launchCoordinator(cfg: MinionsConfig, paths: RuntimePaths = runtimePaths()): Promise<number> {
-  await probeRuntime();
+  await probeRuntime(cfg);
   const c = await buildCoordinatorCommand(cfg, paths);
   return new Promise((resolve, reject) => {
     const child = nodeSpawn(c.cmd, c.args, { cwd: c.cwd, stdio: 'inherit', shell: false });

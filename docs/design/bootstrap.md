@@ -487,6 +487,10 @@ skills/{orchestrate,status,intake,recover,maintain-context}/SKILL.md
 hooks/hooks.json             Stop -> minions hook stop ; PreToolUse(Agent) -> minions hook pre-agent (exec form)
 coordinator.md               appended to the coordinator system prompt
 ```
+`models.effort` (optional; `low|medium|high|xhigh|max`) adds `effort:` to the worker frontmatter and
+`--effort` to the coordinator launch; `models.coordinator` (optional, must be in `models.allowed`) adds
+`--model`. Both verified against Claude Code 2.1.292 (`claude --help`; agent definition schema field
+`effort`). The probe requires the flags only when they are configured.
 Templates use `{{var}}` placeholders rendered from EffectiveConfig (profile, policy summary, limits,
 models, delivery mode, capability table, sensitive paths). Agent frontmatter uses only documented
 fields: `name, description, tools, disallowedTools, model, maxTurns, effort`. Workers get no
