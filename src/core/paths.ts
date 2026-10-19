@@ -29,6 +29,8 @@ export function projectPaths(projectId: string) {
     runtimeDir: join(dir, 'runtime'),
     runtimeConfigJson: join(dir, 'runtime', 'config.json'),
     pluginDir: join(dir, 'plugin'),
+    /** Host-side plugin of the setup assistant (`minions setup assist`), regenerated on every launch. */
+    assistantPluginDir: join(dir, 'assistant-plugin'),
     exportsDir: join(dir, 'exports'),
     /** Host-only credential references (never mounted). */
     credentialsJson: join(dir, 'credentials.json'),

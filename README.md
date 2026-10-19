@@ -4,7 +4,7 @@ minions installs a small Claude Code development team into a Git project on your
 
 Everything the model controls runs inside one Docker container per project. Your Mac runs only a small, trusted `minions` CLI. (You can explicitly opt into a less safe **host runtime** without Docker; see [Running without Docker](#running-without-docker).) That CLI installs the team, starts and stops the container, provisions the credentials you grant, and handles explicit import and export.
 
-> **Status:** version 0.1 (bootstrap) is installable from source. It implements the terminal workflow: `init`, `doctor`, `start`, `down`, `status`, `pause`, `resume`, `import`, `export`, `config show [--explain]`, `auth show|set|refresh` (Claude authorization), `auth github`, `auth telegram`, `runtime show|set`, `setup github`, and `uninstall` on the host; an opt-in host runtime without Docker ([Running without Docker](#running-without-docker)); optional Telegram communication through the official Claude Code channel plugin (see [docs/design/telegram.md](docs/design/telegram.md); the notification outbox is not implemented yet); the Backlog.md backend; `local` delivery (commits on `agent/<slug>` branches, fetched to the host with `minions export`); and `branch` / `pull-request` delivery to GitHub (push `agent/<slug>`, open one PR; never merged). The rest of this README describes the intended version 1 behavior. Sections marked **(deferred in v0.1)** are not implemented yet, and `minions doctor` reports them as unavailable: GitHub Issues backend, auto-merge and merge requests, review publication, config plan/apply, backlog migration, upgrade, budgets, and companion containers. `minions auth github` stores a per-project fine-grained GitHub token on the host (see [docs/design/bootstrap.md](docs/design/bootstrap.md#github-credential)); the container uses it for branch/pull-request delivery. The v0.1 contract is [docs/design/bootstrap.md](docs/design/bootstrap.md); the full requirements are in [docs/spec.md](docs/spec.md).
+> **Status:** version 0.1 (bootstrap) is installable from source. It implements the terminal workflow: `init`, `doctor`, `start`, `down`, `status`, `pause`, `resume`, `import`, `export`, `config show [--explain]`, `auth show|set|refresh` (Claude authorization), `auth github`, `auth telegram`, `runtime show|set`, `setup github`, `setup assist` (AI setup assistant), and `uninstall` on the host; an opt-in host runtime without Docker ([Running without Docker](#running-without-docker)); optional Telegram communication through the official Claude Code channel plugin (see [docs/design/telegram.md](docs/design/telegram.md); the notification outbox is not implemented yet); the Backlog.md backend; `local` delivery (commits on `agent/<slug>` branches, fetched to the host with `minions export`); and `branch` / `pull-request` delivery to GitHub (push `agent/<slug>`, open one PR; never merged). The rest of this README describes the intended version 1 behavior. Sections marked **(deferred in v0.1)** are not implemented yet, and `minions doctor` reports them as unavailable: GitHub Issues backend, auto-merge and merge requests, review publication, config plan/apply, backlog migration, upgrade, budgets, and companion containers. `minions auth github` stores a per-project fine-grained GitHub token on the host (see [docs/design/bootstrap.md](docs/design/bootstrap.md#github-credential)); the container uses it for branch/pull-request delivery. The v0.1 contract is [docs/design/bootstrap.md](docs/design/bootstrap.md); the full requirements are in [docs/spec.md](docs/spec.md).
 
 ## Contents
 
@@ -23,6 +23,7 @@ Everything the model controls runs inside one Docker container per project. Your
 - [Models and budgets](#models-and-budgets)
 - [Communication](#communication)
 - [GitHub setup](#github-setup)
+- [Setup assistant](#setup-assistant)
 - [Claude authorization](#claude-authorization)
 - [Security model](#security-model)
 - [Running without Docker](#running-without-docker)
@@ -382,6 +383,36 @@ minions setup github --yes    # never prompts, pushes or opens a browser: prints
 
 `minions doctor` shows a `github.setup` check with the next step when something is missing, and `minions start` prints a one-line hint when the repository has a GitHub remote but no token is stored. Using your existing `gh` CLI login instead of a per-project token is not offered: the per-project fine-grained token keeps the agents' scope to one repository.
 
+## Setup assistant
+
+`minions init` is deterministic and complete on its own. At the end of an interactive init it asks:
+
+```
+Open the setup assistant to finish remaining setup? [Y/n]
+```
+
+Yes opens **your own** Claude Code (`claude` on the host, in the repository root, in the foreground) with a small generated skill, `minions-setup:setup`, that helps you close what is left. You can open it any time:
+
+```sh
+minions setup assist             # interactive; needs a terminal and `claude` on PATH
+minions setup assist --dry-run   # print the claude command; writes and launches nothing
+```
+
+It is never offered with `--yes`, `--config`, `--json`, `--dry-run`, or without a terminal. The assistant:
+
+1. Gathers context first, read-only: `minions doctor --json`, `minions status --json`, `minions auth show --json`, `minions config show --explain`, `git remote -v`, and your build and CI files.
+2. Works only on the gaps: GitHub (you run `! minions setup github`), the Claude authorization choice (you run `! minions auth set ...`), Telegram if you want it (`! minions auth telegram`), verification commands taken from your real scripts and CI, models and effort, and doctor warnings.
+3. Turns your goals into a few first tasks. The backlog lives in the agent runtime, so it gives you a message to paste into the coordinator after `minions start`.
+4. Ends with `minions doctor` and a summary of what was done and what remains.
+
+Guard rails:
+
+- Claude Code runs in permission mode `default`, with bypass mode disabled for the session. Only read-only commands run without asking: `minions doctor|status|auth show|config show|runtime show`, `git remote -v`, `git status`, `git log`, and Read/Glob/Grep.
+- It never asks for a token or key. Credential, runtime and publishing commands (`minions auth ...`, `minions setup github`, `minions runtime set`, `minions start`, `git push`, `open`, `security`, `gh auth token`) are denied to the assistant. You run them yourself with `!` (or in another terminal), so secrets are typed only at minions' hidden prompts.
+- It can't read the minions secret and credential stores, `~/.ssh`, `~/.aws`, `~/.config/gh` or `.env` files, and can't edit host-side minions files (`project.json`, `defaults.json`, secrets). Changes to the project configuration are shown as a diff first, need your yes, bump `configRevision`, and are validated with `minions config show --explain`.
+
+`minions doctor` shows a `setup` check that suggests `minions setup assist` when there are obvious gaps, such as no verification commands.
+
 ## Claude authorization
 
 How Claude Code inside the container gets credentials is a **host-side** setting (`claudeAuth` in
@@ -527,6 +558,7 @@ Switching needs the old runtime stopped (`minions down`). Agent branches, backlo
 | `minions config show [--explain]` | Effective values and their provenance |
 | `minions auth show` / `set <login\|api-key\|helper\|jbcentral>` / `refresh` | Host-side Claude authorization (see [Claude authorization](#claude-authorization)) |
 | `minions setup github` | Guided GitHub setup: remote, base branch on the remote, pre-filled fine-grained token, delivery mode (`--yes` prints the next steps only; see [GitHub setup](#github-setup)) |
+| `minions setup assist` | AI setup assistant: opens your host Claude Code with a minions setup skill to finish the remaining setup (interactive; `--dry-run` prints the command; see [Setup assistant](#setup-assistant)) |
 | `minions auth github` / `telegram` | Store (or `--remove`) the project's GitHub token / Telegram bot token on the host; prompted without echo or `--stdin` |
 | `minions backlog ready` / `list` / `show` / `create` / `update` / `note` / `export` | Backend-neutral task operations (inside the container) |
 | `minions work claim` / `record` / `release` / `list` | Leases and worker results (used by the coordinator, inside the container) |

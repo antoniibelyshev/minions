@@ -25,6 +25,7 @@ import { registerRuntime } from './runtime-cli.js';
 import { githubStartHint, registerGithubSetup } from './github-setup.js';
 import { formatUninstall, runUninstall } from './uninstall.js';
 import { readSecret, readlineIO } from './wizard.js';
+import { initMayOfferAssistant, launchAssistant, loadAssistantContext, offerSetupAssistant, registerAssistant } from './assistant.js';
 
 const say = (json: boolean, msg: string) => { if (!json) process.stderr.write(msg + '\n'); };
 
@@ -204,6 +205,14 @@ export function register(program: Command): void {
           attach: o.attach, newIdentity: o.newIdentity, io, runtime: o.runtime,
         });
         emit(r, { json, human: formatInit });
+        // Interactive init only (never --yes / --config / --json / --dry-run / no terminal): offer the AI setup assistant.
+        const offer = initMayOfferAssistant({ ...o, json, stdinTTY: !!process.stdin.isTTY, stdoutTTY: !!process.stdout.isTTY }) && !r.dryRun;
+        if (offer && io) {
+          await offerSetupAssistant({ interactive: true, io, launch: async () => {
+            io.close?.(); // the assistant owns the terminal from here
+            return launchAssistant(await loadAssistantContext(r.plan.repoPath), { onInfo: (l) => process.stderr.write(l + '\n') });
+          } });
+        }
       } finally { io?.close?.(); }
     }));
 
@@ -415,7 +424,7 @@ export function register(program: Command): void {
     }));
 
   registerRuntime(program, { confirm, ask: askLine });
-  registerGithubSetup(program);
+  registerAssistant(registerGithubSetup(program));
 
   const config = program.command('config').description('Inspect configuration');
   config.command('show')

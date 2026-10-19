@@ -108,6 +108,49 @@ interactive `minions init` (intro question, default yes; failures never fail ini
   `start` prints one hint line when a GitHub remote exists and no token is stored.
 - **Not offered:** reusing the user's `gh` CLI login (broader than one repository).
 
+## Setup assistant
+
+Decision record for `src/host/assistant.ts` (templates in `templates/assistant/`): an AI pass after the
+deterministic init. `minions init` stays complete without it.
+
+- **When.** End of an interactive `minions init` (after the plan is applied and verified and the GitHub
+  and Telegram steps ran): `Open the setup assistant to finish remaining setup? [Y/n]`. Never with
+  `--yes`, `--config`, `--json`, `--dry-run`, or without a TTY on stdin and stdout. No question (one hint
+  line instead) when `claude` is not on PATH; a failed launch never fails init. Standalone:
+  `minions setup assist` (needs a terminal; `--dry-run [--json]` prints the argv and writes nothing).
+- **Launch.** The user's own host `claude` (foreground, inherited stdio, `shell: false`) in the repository
+  root. A host plugin is regenerated on every launch at `projects/<id>/assistant-plugin`
+  (`.claude-plugin/plugin.json` name `minions-setup`, skill `skills/setup/SKILL.md` -> `minions-setup:setup`;
+  passes `claude plugin validate --strict`). argv (flags checked against `claude --help` 2.1.292):
+  `--allowedTools <read-only...> --disallowedTools <denied...> --plugin-dir <dir> --append-system-prompt
+  <system-prompt.md> --settings '{"permissions":{"disableBypassPermissionsMode":"disable"}}' --name
+  "minions setup" --permission-mode default "<kick-off prompt>"`. The variadic tool lists come first so
+  they never swallow the positional prompt. `default` is accepted by 2.1.292 (its help lists the same mode
+  as `manual`); never `bypassPermissions`, `acceptEdits`, `auto` or `dontAsk`.
+- **Allowed without a prompt:** `Bash(minions doctor*)`, `Bash(minions status*)`, `Bash(minions auth show*)`,
+  `Bash(minions config show*)`, `Bash(minions runtime show*)`, `Bash(git remote -v)`, `Bash(git status*)`,
+  `Bash(git log*)`, `Read`, `Glob`, `Grep`. Everything else (including every `Edit`) prompts.
+- **Denied** (the user runs them as `! <command>`, so secrets are typed only at minions' hidden prompts):
+  `minions runtime set`, `minions auth set|github|telegram|refresh`, `minions setup github`, `minions start`,
+  `minions uninstall`, `security *`, `gh auth token*`, `cat *secrets*`, `cat *credentials*`, `git push*`,
+  `open *`. `Read` of the credential store, the project `secrets/`, `~/.ssh`, `~/.aws`, `~/.config/gh`,
+  `~/.netrc`, `.env*`. `Edit` of `defaults.json`, `registry.json`, the credential store, and the project's
+  `project.json`, `credentials.json`, `secrets/`, `manifest.json`, `journal.json`, `compose.yaml`,
+  `plugin/`, `runtime/`, `host/`, `assistant-plugin/` (absolute `//path` rules). The project configuration
+  (`.minions/config.json`, or the private `config.json`) stays editable with a prompt.
+- **Instructions.** Context first (`minions doctor --json`, `minions status --json`, `minions auth show
+  --json`, `minions config show --explain`, `git remote -v`, build and CI files), then only the gaps:
+  GitHub (`! minions setup github`), Claude authorization options (`! minions auth set ...`), Telegram
+  (optional; `! minions auth telegram`), verification commands from the repository's real scripts/CI
+  (diff first, `configRevision + 1`, validated with `minions config show --explain`), models/effort
+  (budgets are not enforced in v0.1), doctor warnings, and first tasks. `minions backlog ...` is
+  runtime-only (no host delegation), so first tasks are handed to the user as a message for the
+  coordinator. Hard rules: no secrets in chat, no host-side file edits, no runtime switch, no push, no
+  URLs opened; ends with `minions doctor` and a done/remaining summary.
+- **Doctor.** A `setup` check warns on obvious gaps (empty `verification.commands`, GitHub remote without a
+  token, Telegram selected without a valid bot token) and hints `minions setup assist`.
+- **Uninstall** removes `assistant-plugin/`.
+
 ## GitHub in the container
 
 Decision record for git/gh authentication inside the runtime (`src/runtime/github.ts`,
@@ -335,6 +378,7 @@ src/
   runtime/coordinator.ts     tmux + claude launch inside container
   runtime/commands.ts        register(program) for runtime commands
   plugin/generate.ts         render templates/plugin -> plugin dir, returns file hashes
+  host/assistant.ts          setup assistant: host plugin + claude argv, init offer, `setup assist`
   host/registry.ts           gitCommonDir -> projectId registry, copied-id detection
   host/discovery.ts          read-only repo inspection
   host/wizard.ts             questions with prefilled defaults
@@ -345,6 +389,7 @@ src/
   host/uninstall.ts
   host/commands.ts           register(program) for host commands
 templates/plugin/            plugin sources (see "Plugin")
+templates/assistant/         setup assistant instructions and skill (see "Setup assistant")
 docker/Dockerfile  docker/entrypoint.sh
 test/                        vitest unit tests; test/docker/ opt-in (MINIONS_DOCKER_TESTS=1)
 ```
@@ -397,6 +442,7 @@ Host (`MINIONS_HOME` overrides the root, used by tests):
     runtime/config.json              effective config written at start, mounted ro
     runtime/coordinator.md           (inside plugin dir actually — see Plugin)
     plugin/                          generated plugin, mounted ro
+    assistant-plugin/                host-only plugin of the setup assistant (`minions setup assist`), regenerated per launch
     exports/                         bundles exported from the container
 ```
 Shared installs additionally write `<repo>/.minions/config.json` (+ `<repo>/.minions/README.md`)
