@@ -212,6 +212,12 @@ Goal (spec §611): Telegram outages never discard notifications, retries use ded
 - Producers: deterministic CLI events enqueue with stable keys, for example `question:<taskId>:<questionId>`,
   `delivered:<taskId>:<headSha>`, `blocked:<taskId>:<attempt>`, `milestone:<taskId>:<status>`. Enqueueing an existing key is
   a no-op.
+- Reporting level: producers follow `communication.progress` (see the README Communication section). At the default
+  `milestones` (feature-level) only feature-level items are enqueued: a feature or epic (parent task or goal) delivered
+  or materially changed, batched when several land together, plus questions and blockers that need the user. Per-task
+  `delivered:` items are enqueued only at `tasks`; at `quiet` only questions, approvals and blockers are. Per-stage
+  transitions (engineer/tester/reviewer, splits, follow-ups) are never enqueued. Approval requests are enqueued at
+  every level.
 - Delivery: only the coordinator model can call the plugin's `reply` tool, because minions does not duplicate the transport.
   When the coordinator is already awake (an inbound Telegram message, a worker result, a sync, or a user turn), the
   orchestrate skill runs `minions notify pending --json`, sends each item with `reply`, and then calls

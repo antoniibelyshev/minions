@@ -360,13 +360,27 @@ The full shape is defined by the JSON Schema shipped with the package. Unknown f
 
 **Telegram** uses the official Claude Code channel plugin (a research preview) with your own bot. The wizard walks you through creating the bot, pairing it, and allowlisting senders; `minions auth telegram` stores the bot token on the host without echo. Only paired senders can control the coordinator; unpaired senders are dropped. Pair only yourself, because allowlisted senders can also approve tool-permission prompts. If Telegram is unavailable, the coordinator starts in terminal mode and says why. Each bot can be polled by only one coordinator at a time, so use a separate bot for each project you run at the same time.
 
-What you receive:
+What you receive (the same on every channel). By default the coordinator reports at the feature level:
 
 - acknowledgements of new goals
-- summaries of completed tasks and milestones, with links
+- a short summary when a user-visible feature or epic is delivered or materially changes, with branch names or links; features that land close together come in one message
 - significant blockers and changed plans
-- approval requests
-- status, when you ask for it
+- approval requests and high-level questions
+- status, when you ask for it (with task-level detail if you want it)
+
+You don't get per-stage updates: engineer, tester, and reviewer hand-offs, repair cycles, task splits, follow-up tasks, and individual merges stay in the backlog, and `/minions:status` (or `minions status`) shows them on request.
+
+The coordinator asks you only about high-level decisions: product scope and goals, architecture direction, security and privacy trade-offs, anything outward-facing, and every capability whose policy effect is `ask` (those still need your explicit approval, as do sensitive-path changes). It makes lower-level decisions on its own, within the task's scope and policy, and records them as backlog notes or decision files. That covers task splits, follow-up tasks, model choice, test fixes, implementation approach, and review nits.
+
+`communication.progress` sets how much it reports unprompted. The value is validated by the config schema.
+
+| Value | Unprompted reports |
+| --- | --- |
+| `milestones` (default) | Feature-level progress, as described above. |
+| `tasks` | Each delivered task with its branch, plus blockers and approvals. |
+| `quiet` | Only blockers that need you, approval requests, and high-level questions. Deliveries show up when you ask for status. |
+
+The reporting level never changes what needs approval. The coordinator prompt and skills are generated from the config, so a change takes effect once the plugin is regenerated on the host (`minions init`) and the coordinator restarts.
 
 You won't get tool-call or test-log spam. Every question includes a recommended answer and says what is blocked until you reply. Notifications that fail during a Telegram outage are queued with deduplication keys and resent later; the model is not woken up just to resend them.
 
