@@ -15,6 +15,7 @@ import { openDb, type Lease, type LeaseRole, type RuntimeDb } from './db.js';
 import { runHook } from './hooks.js';
 import { runtimePaths } from './paths.js';
 import { capacityOf, LEASE_ROLES, Scheduler } from './scheduler.js';
+import { gitCredential } from './github.js';
 import { exportWorkspace, importWorkspace, setupState } from './workspace.js';
 import { workspaceLayout } from './worktree.js';
 
@@ -199,12 +200,27 @@ export function register(program: Command): void {
     }));
   ws.command('import <bundlePath>').description('Clone or refresh /workspace/repo from a git bundle')
     .requiredOption('--base <branch>', 'base branch')
-    .option('--remote-url <url>', 'origin URL to record (not fetched)')
+    .option('--remote-url <url>', 'origin URL to record (fetched over https only when a GitHub token is mounted)')
     .action(action(async (bundle: string, o: { base: string; remoteUrl?: string }, cmd: Command) => {
       requireMode('container');
       const r = await importWorkspace(bundle, { base: o.base, remoteUrl: o.remoteUrl, config: await getConfig() });
-      emit(r, { json: globalOpts(cmd).json, human: (d) => `${d.imported ? 'Cloned' : 'Refreshed'} ${d.repo} at ${d.head} (base ${d.base})` });
+      emit(r, { json: globalOpts(cmd).json, human: (d: typeof r) => [`${d.imported ? 'Cloned' : 'Refreshed'} ${d.repo} at ${d.head} (base ${d.base})`,
+        ...(d.origin ? [`origin ${d.origin.url}: ${d.origin.authenticated ? 'authenticated' : 'not authenticated'}, ${d.origin.fetched ? `fetched ${d.base}` : 'not fetched'}`] : []),
+        ...(d.origin?.warnings ?? []).map((w) => `warning: ${w}`)].join('\n') });
     }));
+
+  // git credential helper (configured per repository by `workspace import` when a token is mounted).
+  // Reads the mounted token at use time; answers only `get` for https://github.com; no JSON envelope.
+  program.command('git-credential <operation>', { hidden: true })
+    .description('git credential helper for https://github.com backed by the mounted GitHub token')
+    .action(async (operation: string) => {
+      const chunks: Buffer[] = [];
+      if (!process.stdin.isTTY) for await (const c of process.stdin) chunks.push(c as Buffer);
+      const r = await gitCredential(operation, Buffer.concat(chunks).toString('utf8'));
+      if (r.stderr) process.stderr.write(r.stderr + '\n');
+      if (r.stdout) process.stdout.write(r.stdout);
+      process.exitCode = 0;
+    });
   ws.command('export <outPath>').description('Write a bundle with the base branch and agent/* branches')
     .action(action(async (out: string, _o: unknown, cmd: Command) => {
       requireMode('container');

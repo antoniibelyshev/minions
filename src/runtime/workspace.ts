@@ -3,12 +3,17 @@ import type { MinionsConfig } from '../config/schema.js';
 import { MinionsError } from '../core/errors.js';
 import { ensureDir, exists } from '../core/fsutil.js';
 import { openDb } from './db.js';
+import { configureOrigin, type OriginResult } from './github.js';
 import type { RuntimePaths } from './paths.js';
 import { BRANCH_PREFIX, git, workspaceLayout, type WorkspaceLayout } from './worktree.js';
 
 const validBranch = (b: string) => /^[A-Za-z0-9._/-]+$/.test(b) && !b.startsWith('-') && !b.includes('..');
 
-export interface ImportResult { head: string; base: string; imported: boolean; baseFastForwarded: boolean; repo: string; hostRefs: string[] }
+export interface ImportResult {
+  head: string; base: string; imported: boolean; baseFastForwarded: boolean; repo: string; hostRefs: string[];
+  /** Present only when a GitHub token file is mounted (readable or not); absent = unchanged v0.1 behaviour. */
+  origin?: OriginResult;
+}
 
 /**
  * Seeds /workspace/repo from a Git bundle. Absent repo: clone (remote `host`, base checked out).
@@ -16,7 +21,7 @@ export interface ImportResult { head: string; base: string; imported: boolean; b
  * agent branches start from the refreshed base) and never rewritten — a diverged base is left alone.
  * `imported` is true when the repo was cloned, false when an existing clone was refreshed.
  */
-export async function importWorkspace(bundlePath: string, opts: { base: string; remoteUrl?: string; config: Pick<MinionsConfig, 'git'>; layout?: WorkspaceLayout }): Promise<ImportResult> {
+export async function importWorkspace(bundlePath: string, opts: { base: string; remoteUrl?: string; config: Pick<MinionsConfig, 'git'>; layout?: WorkspaceLayout; tokenFile?: string }): Promise<ImportResult> {
   const layout = opts.layout ?? workspaceLayout();
   const bundle = resolvePath(bundlePath);
   if (!validBranch(opts.base)) throw new MinionsError('PRECONDITION', `Invalid base branch name "${opts.base}".`);
@@ -42,14 +47,12 @@ export async function importWorkspace(bundlePath: string, opts: { base: string; 
   const id = opts.config.git.identity;
   await git(repo, ['config', 'user.name', id.name]);
   await git(repo, ['config', 'user.email', id.email]);
-  if (opts.remoteUrl) {
-    const has = await git(repo, ['remote', 'get-url', 'origin'], true);
-    await git(repo, has.code === 0 ? ['remote', 'set-url', 'origin', opts.remoteUrl] : ['remote', 'add', 'origin', opts.remoteUrl]);
-    // Recorded only; never fetched in v0.1 (no credentials in the container).
-  }
+  // Without a mounted GitHub token the URL is recorded verbatim and never fetched (unchanged v0.1
+  // behaviour); with one, origin becomes the https URL backed by the credential helper.
+  const origin = await configureOrigin(repo, { remoteUrl: opts.remoteUrl, base: opts.base, tokenFile: opts.tokenFile });
   const head = (await git(repo, ['rev-parse', 'HEAD'])).stdout.trim();
   const hostRefs = (await git(repo, ['for-each-ref', '--format=%(refname)', 'refs/remotes/host/'])).stdout.split('\n').filter(Boolean);
-  return { head, base: opts.base, imported, baseFastForwarded, repo, hostRefs };
+  return { head, base: opts.base, imported, baseFastForwarded, repo, hostRefs, ...(origin ? { origin } : {}) };
 }
 
 /** Fast-forwards the local base branch to refs/remotes/host/<base> when that is a pure fast-forward. */
