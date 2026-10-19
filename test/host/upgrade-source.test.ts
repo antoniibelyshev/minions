@@ -70,6 +70,45 @@ describe('--from-container sync', () => {
     expect(existsSync(join(s.repo, 'notes.txt'))).toBe(true);
   });
 
+  it('does not count gitignored build output (dist/, node_modules/, *.tgz, .env) as dirty', async () => {
+    const s = syncRepo();
+    // .env is in the committed .gitignore; the build-output patterns go to info/exclude so history is unchanged.
+    writeFileSync(join(s.repo, '.git', 'info', 'exclude'), 'node_modules/\ndist/\n*.tgz\n');
+    for (const d of ['node_modules/esbuild', 'dist']) mkdirSync(join(s.repo, d), { recursive: true });
+    writeFileSync(join(s.repo, 'node_modules', 'esbuild', 'package.json'), '{}\n');
+    writeFileSync(join(s.repo, 'dist', 'cli.js'), '// built\n');
+    writeFileSync(join(s.repo, 'minions-0.1.0.tgz'), 'tarball');
+    writeFileSync(join(s.repo, '.env'), 'SECRET=1\n');
+    const r = await syncFromContainer({ repo: s.repo, branch: 'main', baseBranch: 'main', exportRepo: s.exportRepo });
+    expect(r).toMatchObject({ action: 'fast-forward', method: 'merge --ff-only', applied: true });
+    expect(head(s.repo)).toBe(s.ahead);
+    for (const f of ['node_modules/esbuild/package.json', 'dist/cli.js', 'minions-0.1.0.tgz', '.env']) expect(existsSync(join(s.repo, f))).toBe(true);
+  });
+
+  it('ignores a dirty worktree that does not have the branch checked out', async () => {
+    const s = syncRepo();
+    const other = join(home.root, 'other-wt');
+    git(s.repo, 'worktree', 'add', '-q', '-b', 'side', other, s.base);
+    writeFileSync(join(other, 'README.md'), 'unrelated edit\n');
+    const r = await syncFromContainer({ repo: s.repo, branch: 'main', baseBranch: 'main', exportRepo: s.exportRepo });
+    expect(r).toMatchObject({ applied: true, worktree: s.repo });
+    expect(readFileSync(join(other, 'README.md'), 'utf8')).toBe('unrelated edit\n');
+    expect(head(s.repo, 'refs/heads/side')).toBe(s.base);
+  });
+
+  it('a staged-only change counts as dirty, also when the branch is not checked out', async () => {
+    const s = syncRepo();
+    writeFileSync(join(s.repo, 'staged.txt'), 'staged\n');
+    git(s.repo, 'add', 'staged.txt');
+    expect((await reason(syncFromContainer({ repo: s.repo, branch: 'main', baseBranch: 'main', exportRepo: s.exportRepo }))).message).toContain('staged.txt');
+    expect(head(s.repo)).toBe(s.base);
+    git(s.repo, 'checkout', '-q', '-b', 'work');
+    const e = await reason(syncFromContainer({ repo: s.repo, branch: 'main', baseBranch: 'main', exportRepo: s.exportRepo }));
+    expect(e.code).toBe('PRECONDITION');
+    expect(head(s.repo)).toBe(s.base);
+    expect(git(s.repo, 'diff', '--cached', '--name-only')).toBe('staged.txt');
+  });
+
   it('refuses a divergence (no merge, no reset, no force)', async () => {
     const s = syncRepo();
     writeFileSync(join(s.repo, 'host.txt'), 'host work\n');
@@ -292,6 +331,50 @@ describe('installed CLI check', () => {
     expect(r).toMatchObject({ differs: true, action: 'manual' });
     expect(r.installed.kind).toBe('unknown');
     expect(r.reason).toMatch(/installed source old0000000000000 != checkout/);
+  });
+
+  it('a git install as npm 10 leaves it (no resolved in npm ls, stamp kind source) is unknown and still stops with the command', async () => {
+    const c = checkout();
+    realInstall(g, '0.1.0', 'old0000000000000', 'source');
+    const w: NpmWorld = { globalRoot: g, checkout: c, calls: [] };
+    const p = await runSourcePhase(phaseBase({ checkout: c, runner: fakeNpm(w), spawnCli: async () => { throw new Error('must not spawn'); } }));
+    expect(p.cli!.installed.kind).toBe('unknown');
+    expect(p.stop?.command).toBe(`cd ${c} && npm ci && MINIONS_BUILD_KIND=packed npm pack && npm uninstall -g minions && npm install -g ./minions-0.2.0.tgz`);
+    expect(mutatingNpm(w.calls)).toEqual([]);
+  });
+
+  it('an old install.sh install without dist/build.json is unknown: stops with the command, never reinstalls', async () => {
+    const c = checkout();
+    const dir = join(g, 'minions');
+    mkdirSync(join(dir, 'dist'), { recursive: true });
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({ name: 'minions', version: '0.2.0' }));
+    writeFileSync(join(dir, 'dist', 'cli.js'), '// old cli\n');
+    const w: NpmWorld = { globalRoot: g, checkout: c, calls: [] };
+    const p = await runSourcePhase(phaseBase({ checkout: c, runner: fakeNpm(w), spawnCli: async () => { throw new Error('must not spawn'); } }));
+    expect(p.cli).toMatchObject({ differs: true, action: 'manual', reason: 'the installed CLI has no build stamp (dist/build.json)' });
+    expect(p.cli!.installed).toMatchObject({ kind: 'unknown', stamp: null });
+    expect(p.stop).toMatchObject({ command: expect.stringContaining('npm uninstall -g minions && npm install -g ./minions-0.2.0.tgz') });
+    expect(mutatingNpm(w.calls)).toEqual([]);
+    // The dry run plans the stop and runs nothing either.
+    const w2: NpmWorld = { globalRoot: g, checkout: c, calls: [] };
+    const d = await runSourcePhase(phaseBase({ dryRun: true, checkout: c, runner: fakeNpm(w2) }));
+    expect(d.steps[0]).toMatchObject({ id: 'cli', status: 'planned' });
+    expect(d.steps[0]!.detail).toContain('stop and print');
+    expect(mutatingNpm(w2.calls)).toEqual([]);
+  });
+
+  it('a link to a different checkout is not rebuilt (manual command for this checkout)', async () => {
+    const c = checkout();
+    const elsewhere = join(home.root, 'other-minions');
+    mkdirSync(elsewhere, { recursive: true });
+    writeFileSync(join(elsewhere, 'package.json'), JSON.stringify({ name: 'minions', version: '0.2.0' }));
+    stampDist(elsewhere, '0.2.0', 'old0000000000000', 'source');
+    symlinkSync(elsewhere, join(g, 'minions'));
+    const w: NpmWorld = { globalRoot: g, checkout: c, calls: [] };
+    const r = await checkCli({ checkout: c, runner: fakeNpm(w) });
+    expect(r).toMatchObject({ differs: true, action: 'manual' });
+    expect(r.installed.kind).toBe('link');
+    expect(mutatingNpm(w.calls)).toEqual([]);
   });
 
   it('never reinstalls twice: the continued CLI stops with the command when it still differs', async () => {
