@@ -1,5 +1,6 @@
 // Compose file generation and container lifecycle. Every Docker call is argv-only (no shell).
 import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -125,19 +126,45 @@ export class Compose {
   async cp(src: string, dst: string): Promise<void> { await this.compose(['cp', src, dst]); }
 }
 
+export const BUILD_LABEL = 'minions.build';
+
 export async function imageExists(tag: string, runner: Runner = run): Promise<boolean> {
-  return (await runner('docker', ['image', 'inspect', '--format', '{{.Id}}', tag], { allowFailure: true, timeoutMs: 30_000 })).code === 0;
+  return (await imageBuildLabel(tag, runner)) !== null;
 }
 
-/** Builds `tag` from the package root with docker/Dockerfile when missing. Returns true if built. */
+/** The image's `minions.build` label ('' when unlabeled), or null when the image is missing. */
+export async function imageBuildLabel(tag: string, runner: Runner = run): Promise<string | null> {
+  const r = await runner('docker', ['image', 'inspect', '--format', `{{index .Config.Labels "${BUILD_LABEL}"}}`, tag], { allowFailure: true, timeoutMs: 30_000 });
+  if (r.code !== 0) return null;
+  const v = r.stdout.trim();
+  return v === '<no value>' ? '' : v;
+}
+
+/** Fingerprint of what goes into the image from the package (null when dist/ is not built). */
+export function buildFingerprint(root: string = packageRoot()): string | null {
+  const files = [join('dist', 'cli.js'), join('docker', 'Dockerfile'), 'package.json'];
+  if (!existsSync(join(root, files[0]!))) return null;
+  const h = createHash('sha256');
+  for (const f of files) h.update(f).update('\0').update(existsSync(join(root, f)) ? readFileSync(join(root, f)) : '').update('\0');
+  return h.digest('hex').slice(0, 16);
+}
+
+/**
+ * Builds `tag` from the package root with docker/Dockerfile when missing, or when its build label
+ * does not match the installed package (same version reinstalled with different code). Returns true if built.
+ */
 export async function ensureImage(tag: string, opts: { runner?: Runner; root?: string; onBuild?: (msg: string) => void } = {}): Promise<boolean> {
   const runner = opts.runner ?? run;
-  if (await imageExists(tag, runner)) return false;
   const root = opts.root ?? packageRoot();
-  if (!existsSync(join(root, 'dist', 'cli.js'))) {
+  const label = await imageBuildLabel(tag, runner);
+  const fp = buildFingerprint(root);
+  if (label !== null && (fp === null || label === fp)) return false;
+  if (fp === null) {
     throw new MinionsError('PRECONDITION', `Package at ${root} has no dist/cli.js; cannot build the runtime image.`, 'Run `npm run build` in the minions package.');
   }
-  opts.onBuild?.(`Building image ${tag} from ${root} (first run may take a few minutes)…`);
-  await runner('docker', ['build', '-t', tag, '-f', join(root, 'docker', 'Dockerfile'), root], { timeoutMs: 1_800_000 });
+  opts.onBuild?.(label === null
+    ? `Building image ${tag} from ${root} (first run may take a few minutes)…`
+    : `Rebuilding image ${tag}: the installed package changed since it was built…`);
+  await runner('docker', ['build', '-t', tag, '--label', `${BUILD_LABEL}=${fp}`, '-f', join(root, 'docker', 'Dockerfile'), root], { timeoutMs: 1_800_000 });
   return true;
 }

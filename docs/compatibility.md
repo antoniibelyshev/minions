@@ -19,6 +19,11 @@ no-new-privileges, CPU/memory/pids limits, no Docker socket, only read-only bind
 runtime config, loopback-only published ports, no host network/PID namespace, host paths and
 ignored `.env` absent, volumes survive recreation. All test resources are removed afterwards.
 
+`npm run e2e` (scripts/e2e.sh) drives the full terminal workflow without a Claude login: pack and
+install into a temp prefix, private and shared `init`, `doctor`, `start --no-attach`, the
+engineer → tester → reviewer lease flow, hooks, `export`, restart persistence, and `uninstall`.
+It uses a temp `MINIONS_HOME` and disposable repos and removes its containers and volumes on exit.
+
 ## Known gaps
 
 - **Intel (amd64) hosts** are not tested. The image is built natively on the host from a multi-arch
@@ -26,7 +31,9 @@ ignored `.env` absent, volumes survive recreation. All test resources are remove
 - **Linux / Windows hosts** are untested; the host data root falls back to `$XDG_DATA_HOME/minions`
   on non-macOS hosts.
 - **No prebuilt image** is published; the first `minions start` builds `minions-runtime:<version>`
-  locally (needs network access to Docker Hub, Debian mirrors, and npm).
+  locally (needs network access to Docker Hub, Debian mirrors, and npm). The image carries a
+  `minions.build` label (hash of `dist/cli.js`, the Dockerfile and `package.json`); `minions start`
+  rebuilds it when the installed package differs, and `doctor` warns about a stale image.
 - **Claude login** happens interactively inside the container (`/login`) and is stored in the
   project's `claude` volume. API-key provisioning and host login reuse are not supported.
 - **Outbound network is unrestricted** in the container (`network: outbound-internet`). There is no

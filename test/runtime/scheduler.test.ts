@@ -47,7 +47,7 @@ describe('scheduler claim', () => {
     expect(results.filter((r) => r.status === 'fulfilled')).toHaveLength(1);
     const rej = results.find((r) => r.status === 'rejected') as PromiseRejectedResult;
     expect(['CONFLICT', 'PRECONDITION']).toContain((rej.reason as MinionsError).code);
-    expect(await code(env.sched.claim('task-1', 'engineer'))).toBe('PRECONDITION'); // now implementing
+    expect(await code(env.sched.claim('task-1', 'engineer'))).toBe('CONFLICT'); // active lease wins over status
     expect(env.db.activeLeases()).toHaveLength(1);
   });
 
@@ -83,7 +83,7 @@ describe('scheduler claim', () => {
     const env = makeEnv();
     env.backlog.add({ id: 'task-1' });
     const eng = await env.sched.claim('task-1', 'engineer');
-    expect(await code(env.sched.claim('task-1', 'tester'))).toBe('PRECONDITION');
+    expect(await code(env.sched.claim('task-1', 'tester'))).toBe('CONFLICT');
     env.backlog.tasks.get('task-1')!.status = 'testing'; // even if the status were forced
     expect(await code(env.sched.claim('task-1', 'tester'))).toBe('CONFLICT');
     env.backlog.tasks.get('task-1')!.status = 'implementing';

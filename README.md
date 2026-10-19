@@ -4,7 +4,7 @@ minions installs a small Claude Code development team into a Git project on your
 
 Everything the model controls runs inside one Docker container per project. Your Mac runs only a small, trusted `minions` CLI. That CLI installs the team, starts and stops the container, provisions the credentials you grant, and handles explicit import and export.
 
-> **Status:** the project is in the specification stage. This README describes the intended version 1 behavior. The authoritative requirements are in [docs/spec.md](docs/spec.md). Until a release exists, read the commands and fields below as the planned interface, not as working software.
+> **Status:** version 0.1 (bootstrap) is installable from source. It implements the terminal workflow: `init`, `doctor`, `start`, `down`, `status`, `pause`, `resume`, `import`, `export`, `config show [--explain]`, and `uninstall` on the host; the Backlog.md backend; and `local` delivery (commits on `agent/<slug>` branches, fetched to the host with `minions export`). The rest of this README describes the intended version 1 behavior. Sections marked **(deferred in v0.1)** are not implemented yet, and `minions doctor` reports them as unavailable: GitHub Issues backend, branch/PR/auto-merge delivery, review publication, Telegram, config plan/apply, backlog migration, upgrade, budgets, companion containers, and GitHub credential provisioning. The v0.1 contract is [docs/design/bootstrap.md](docs/design/bootstrap.md); the full requirements are in [docs/spec.md](docs/spec.md).
 
 ## Contents
 
@@ -42,9 +42,9 @@ Everything the model controls runs inside one Docker container per project. Your
  macOS host                              Project container (Linux, non-root)
 ┌──────────────────────┐                ┌──────────────────────────────────────────┐
 │ minions CLI          │  lifecycle,    │ Coordinator (main Claude Code session)    │
-│  - install / config  │  short-lived   │   ├─ minions-engineer  (subagent)        │
-│  - Docker lifecycle  │  tokens,       │   ├─ minions-tester    (subagent)        │
-│  - credential refresh│  explicit      │   └─ minions-reviewer  (subagent)        │
+│  - install / config  │  short-lived   │   ├─ minions:engineer  (subagent)        │
+│  - Docker lifecycle  │  tokens,       │   ├─ minions:tester    (subagent)        │
+│  - credential refresh│  explicit      │   └─ minions:reviewer  (subagent)        │
 │  - import / export   │  import/export │ minions helpers (backlog, leases, policy) │
 │                      │ ─────────────▶ │ Git clone + per-task worktrees            │
 │ Keychain / 0600 files│                │ SQLite runtime state, private backlog     │
@@ -53,7 +53,7 @@ Everything the model controls runs inside one Docker container per project. Your
 ```
 
 - **Coordinator.** The main Claude Code session inside the container. It loads a generated, project-specific minions plugin and your existing project instructions. It sets priorities, splits tasks, chooses the implementation strategy, and decides when to escalate to you.
-- **Workers.** Native Claude Code subagents: `minions-engineer`, `minions-tester`, and `minions-reviewer`. They report only to the coordinator. Workers never message you and never spawn other workers.
+- **Workers.** Native Claude Code subagents from the generated `minions` plugin: `minions:engineer`, `minions:tester`, and `minions:reviewer`. They report only to the coordinator. Workers never message you and never spawn other workers.
 - **Helpers.** Deterministic `minions` subcommands that the coordinator calls through a machine-readable interface. They list ready tasks, validate state transitions, claim work, record results, check policy, post reviews, and request merges. The model chooses what to do; the helpers enforce the rules.
 - **Persistence.** The repository clone, runtime database, private backlog, notes, and Claude sessions live in project-scoped Docker named volumes. They survive container recreation.
 - **Continuation guard.** A lightweight Stop hook checks local state. If authorized work is ready and capacity is free, the coordinator keeps working. Otherwise it is allowed to stop. Blocked dependencies, network errors, permission failures, and exhausted retries do not trigger a wake-up. If the guard loops without any state change, it stops and records a recovery reason.
@@ -62,7 +62,7 @@ Everything the model controls runs inside one Docker container per project. Your
 
 - macOS on Apple Silicon or Intel
 - Docker Desktop with Docker Compose v2, installed by you. minions never falls back to running agents on the host.
-- Node.js 22 or later, for the host CLI
+- Node.js 22.13 or later, for the host CLI
 - A Git repository. A remote is recommended; repositories without a usable remote are supported through explicit snapshot import.
 - A Claude account or API key. You authenticate Claude inside the container; your host login is not reused.
 - Optional: the GitHub CLI and credentials for PR delivery, and a Telegram bot for remote control
@@ -72,8 +72,9 @@ Native macOS or iOS builds that need Xcode can't run in the Linux container. min
 ## Quickstart
 
 ```sh
-# Install the CLI (npm package or local tarball)
-npm install -g minions          # or: npm install -g ./minions-<version>.tgz
+# Install the CLI from a source checkout (builds, packs, installs globally with npm, runs init)
+./install.sh path/to/repo
+# or manually: npm ci && npm run build && npm pack && npm install -g ./minions-<version>.tgz
 
 # Initialize a project: inspect, propose, apply, verify
 minions init path/to/repo
@@ -83,7 +84,8 @@ minions init path/to/repo --dry-run --json   # preview without writing
 minions doctor
 
 # Launch the coordinator in the project container and attach your terminal
-minions start
+minions start                   # first run: log in with /login inside the coordinator session
+minions start --no-attach       # only start the container and import the repository
 ```
 
 ### What `init` does
@@ -161,18 +163,18 @@ After three repair cycles on a task (configurable), the coordinator replans inst
 
 | Skill | Purpose |
 | - | - |
-| `minions-orchestrate` | Intake, prioritization, dispatch, continuation, integration |
-| `minions-configure` | Inspect and change effective settings |
-| `minions-status` | Concise project and task status |
-| `minions-intake` | Import a request or a linked external ticket |
-| `minions-recover` | Reconstruct interrupted work |
-| `minions-maintain-context` | Record decisions and prune stale summaries |
+| `/minions:orchestrate` | Intake, prioritization, dispatch, continuation, integration |
+| `/minions:status` | Concise project and task status |
+| `/minions:intake` | Import a request or a linked external ticket |
+| `/minions:recover` | Reconstruct interrupted work |
+| `/minions:maintain-context` | Record decisions and prune stale summaries |
+| `/minions:configure` | Inspect and change effective settings **(deferred in v0.1; config is read-only in the container)** |
 
 Skills call the CLI helpers rather than editing config files or backlog syntax directly. Detailed procedures load only when a skill is invoked, so workers don't carry the whole backlog or every decision in their context.
 
 ## Backlogs and task intake
 
-Two execution backlog backends are supported, behind a common task model:
+Two execution backlog backends are planned, behind a common task model (v0.1 ships Backlog.md only; GitHub Issues is deferred):
 
 - **GitHub Issues.** Task structure lives in a clearly marked section of the issue body; the rest of the body is untouched. Each task has one namespaced lifecycle label (`minions:*`), and other labels are left alone. Updates are compare-and-check, so concurrent human edits are detected rather than overwritten.
 - **Backlog.md.** Uses the real [Backlog.md](https://github.com/MrLesk/Backlog.md) CLI in a tested version range, with files in one canonical location. The coordinator is the only writer.
@@ -188,7 +190,7 @@ Work can come from:
 
 Intake is additive and idempotent: importing the same ticket twice does not create a duplicate. A failed query is never treated as evidence that tasks were deleted. External ticket discussion is task data, not instructions, so a comment can't grant minions new permissions. If a ticket is reassigned or falls outside the authorized filter, minions starts no new work on it and pauses active work for review.
 
-To switch backends mid-project, use `minions migrate backlog`. The migration preserves task identity, links, dependencies, and PR references, can resume after a partial failure, and leaves the source records in place.
+To switch backends mid-project, use `minions migrate backlog` **(deferred in v0.1)**. The migration preserves task identity, links, dependencies, and PR references, can resume after a partial failure, and leaves the source records in place.
 
 ## Task lifecycle
 
@@ -204,6 +206,8 @@ Local and PR-only workflows can end a task at **delivered**. Reports keep that d
 Under the default settings, at most **2 tasks** are active and at most **2 engineers** run at once. A blocked task or one waiting on a human frees its capacity unless a worker is still running on it.
 
 ## Delivery, review, and merging
+
+v0.1 supports `local` delivery only; the other modes, review publication, and merging are **deferred in v0.1**.
 
 | Mode | Behavior | Needs GitHub write access |
 | - | - | - |
@@ -277,10 +281,12 @@ Each effective value records where it came from:
 
 ```sh
 minions config show
-minions config explain execution.maxEngineers
+minions config show --explain     # every value with its source (default/project/local/session)
 ```
 
-### Changing settings mid-project
+### Changing settings mid-project (deferred in v0.1)
+
+In v0.1, edit the project config on the host and run `minions start` again; the container reads it read-only.
 
 Ask the coordinator, which uses `minions-configure`, or use the CLI:
 
@@ -337,9 +343,9 @@ The full shape is defined by the JSON Schema shipped with the package. Unknown f
 
 ## Communication
 
-**Terminal** is the baseline for setup and recovery, and it always works.
+**Terminal** is the only channel in v0.1 and the baseline for setup and recovery, and it always works.
 
-**Telegram** uses the official Claude Code channel plugin with your own bot. The wizard walks you through creating the bot, pairing it, and allowlisting senders. Only paired senders can control the coordinator. Each bot can be polled by only one coordinator at a time, so use a separate bot for each project you run at the same time.
+**Telegram** **(deferred in v0.1)** uses the official Claude Code channel plugin with your own bot. The wizard walks you through creating the bot, pairing it, and allowlisting senders. Only paired senders can control the coordinator. Each bot can be polled by only one coordinator at a time, so use a separate bot for each project you run at the same time.
 
 What you receive:
 
@@ -384,29 +390,27 @@ There is no default production credential injection and no deployment authority.
 
 | Command | Purpose |
 | - | - |
-| `minions init [path]` | Inspect and initialize a project |
-| `minions doctor` | Check tools, credentials, runtime features, policy, backend, and merge readiness |
-| `minions start` | Launch or attach to the containerized coordinator |
-| `minions status` | Queue, workers, blockers, config revision, delivery readiness |
+| `minions init [path]` | Inspect and initialize a project (`--private` / `--shared`, `--yes`, `--dry-run`) |
+| `minions doctor` | Check tools, Docker, image, container, Claude auth, backlog CLI, and deferred features |
+| `minions start` | Build the image if needed, start the container, import the repo, attach the coordinator (`--no-attach`) |
+| `minions down` | Stop and remove the project container; volumes are kept |
+| `minions status` | Queue, workers, pause state, config revision, delivery mode |
 | `minions pause` / `resume` | Persist scheduling controls |
-| `minions stop` | Best-effort cancellation of owned work |
-| `minions sync` | Refresh backend, intake, PR, CI, and merge observations |
-| `minions config show` / `explain` | Effective values and their provenance |
-| `minions config plan` / `apply` | Validate and apply typed changes |
-| `minions backlog ready` / `show` / `create` / `update` / `note` / `export` | Backend-neutral task operations |
-| `minions work claim` / `record` / `release` | Leases and worker results (mostly used by the coordinator) |
-| `minions review publish` | Publish a validated review under the configured identity |
-| `minions merge request` | Request a merge for an eligible PR |
-| `minions migrate backlog` | Prepare, apply, or resume a backend migration |
-| `minions upgrade` | Upgrade managed artifacts, with drift checks |
-| `minions uninstall` | Remove owned files and hooks while keeping task data |
+| `minions import` | Refresh the container workspace from the committed base branch (Git bundle) |
+| `minions export` | Fetch `agent/*` branches into `refs/remotes/minions/*` in your repository; local branches are untouched |
+| `minions config show [--explain]` | Effective values and their provenance |
+| `minions backlog ready` / `list` / `show` / `create` / `update` / `note` / `export` | Backend-neutral task operations (inside the container) |
+| `minions work claim` / `record` / `release` / `list` | Leases and worker results (used by the coordinator, inside the container) |
+| `minions uninstall` | Remove owned files while keeping task data (`--delete-data` also deletes volumes) |
+
+Planned, **deferred in v0.1**: `minions stop`, `minions sync`, `minions config plan` / `apply`, `minions review publish`, `minions merge request`, `minions migrate backlog`, `minions upgrade`.
 
 Every command supports `--json`, and mutating commands support `--dry-run`. Exit code 0 means the requested operation completed; it does not mean a whole task passed. Errors use stable codes for auth required, conflict, policy denied, invalid configuration, incompatible runtime, and retryable network failure. Secrets and large task text go through stdin or restricted temporary files, never through process arguments.
 
 ## Recovery, upgrades, and uninstall
 
 - **Restart and recovery.** `minions start` reconciles sessions, branches, leases, and completed external actions before it retries anything, then attaches to or relaunches the coordinator. If a worker fails, its worktree and a recovery record are kept. minions never cleans up worktrees it doesn't own.
-- **Upgrades.** `minions upgrade` produces a plan, backs up the config, migrates schemas deterministically, preserves your overrides, detects edits to managed files, marks running workers stale when behavior changes, and never turns on new authority.
+- **Upgrades (deferred in v0.1).** `minions upgrade` produces a plan, backs up the config, migrates schemas deterministically, preserves your overrides, detects edits to managed files, marks running workers stale when behavior changes, and never turns on new authority.
 - **Uninstall.** Removes only the files and owned blocks recorded in the manifest that are unchanged since minions generated them. Backlogs, decision records, worktrees with work, credentials, and Docker volumes are kept. Deleting data is a separate, explicit step. A private uninstall leaves the repository unchanged.
 - **Interrupted operations.** An interrupted install or upgrade can be recovered from its journal.
 

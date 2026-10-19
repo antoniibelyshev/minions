@@ -83,6 +83,6 @@ export function formatUninstall(r: UninstallResult): string {
   const L = [`${r.dryRun ? 'Would remove' : 'Removed'} ${r.removed.length} generated file(s) for project ${r.projectId}.`];
   for (const k of r.kept) L.push(`  kept ${k.path} (${k.reason})`);
   L.push(`Container: ${r.container}.`);
-  if (r.volumesKept.length) L.push(`Data volumes kept: ${r.volumesKept.join(', ')} (use --delete-data to remove).`);
+  if (r.volumesKept.length) L.push(`Data volumes kept: ${r.volumesKept.join(', ')}.`, `  To delete them later: docker volume rm ${r.volumesKept.join(' ')}`);
   return L.join('\n');
 }

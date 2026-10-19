@@ -49,6 +49,25 @@ describe('workspace import/export', () => {
     expect(readFileSync(join(layout.repo, 'local.txt'), 'utf8')).toBe('local only');
   });
 
+  it('re-import fast-forwards an undiverged local base so new agent branches start from it', async () => {
+    const root = tmp();
+    const host = join(root, 'host');
+    mkdirSync(host);
+    initRepo(host, 'trunk');
+    const bundle1 = join(root, 'in1.bundle');
+    gitSync(host, 'bundle', 'create', bundle1, 'trunk');
+    const layout = workspaceLayout(join(root, 'workspace'));
+    const config = defaults();
+    await importWorkspace(bundle1, { base: 'trunk', config, layout });
+
+    const hostHead2 = commitFile(host, 'host.txt', 'host change');
+    const bundle2 = join(root, 'in2.bundle');
+    gitSync(host, 'bundle', 'create', bundle2, 'trunk');
+    const second = await importWorkspace(bundle2, { base: 'trunk', config, layout });
+    expect(second).toMatchObject({ imported: false, baseFastForwarded: true, head: hostHead2 });
+    expect(gitSync(layout.repo, 'rev-parse', 'refs/heads/trunk')).toBe(hostHead2);
+  });
+
   it('rejects bundles without the base branch', async () => {
     const root = tmp();
     const host = join(root, 'host');

@@ -23,7 +23,8 @@
     "schema": "node esbuild.config.mjs --schema-only",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "pack": "npm run build && npm pack"
+    "pack": "npm run build && npm pack",
+    "e2e": "bash scripts/e2e.sh"
   },
   "dependencies": {},
   "devDependencies": {

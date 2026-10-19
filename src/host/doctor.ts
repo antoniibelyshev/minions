@@ -5,7 +5,7 @@ import { run } from '../core/exec.js';
 import { redact } from '../core/output.js';
 import { VERSION } from '../core/version.js';
 import { dockerProbe, type DockerProbe } from './discovery.js';
-import { Compose, imageExists, type Runner } from './docker.js';
+import { Compose, buildFingerprint, imageBuildLabel, type Runner } from './docker.js';
 import { loadEffectiveConfig, loadProjectJson } from './project.js';
 import { projectForPath } from './registry.js';
 
@@ -49,8 +49,11 @@ export async function runDoctor(opts: { cwd: string; runner?: Runner; probe?: Do
     }
 
     if (docker.daemon && docker.compose) {
-      const image = await imageExists(project.imageTag, runner);
-      add('image', image ? 'ok' : 'warn', image ? project.imageTag : `${project.imageTag} not built yet`, image ? undefined : '`minions start` builds it.');
+      const label = await imageBuildLabel(project.imageTag, runner);
+      const fp = buildFingerprint();
+      if (label === null) add('image', 'warn', `${project.imageTag} not built yet`, '`minions start` builds it.');
+      else if (fp !== null && label !== fp) add('image', 'warn', `${project.imageTag} was built from a different minions package`, '`minions start` rebuilds it and recreates the container.');
+      else add('image', 'ok', project.imageTag);
       const compose = new Compose(project.projectId, runner);
       const running = await compose.isRunning();
       add('container', running ? 'ok' : 'warn', running ? `${compose.name} running` : `${compose.name} not running`, running ? undefined : 'Run `minions start`.');
@@ -61,8 +64,8 @@ export async function runDoctor(opts: { cwd: string; runner?: Runner; probe?: Do
           auth.code === 0 ? undefined : 'Run `minions start` and use /login in the coordinator session.');
         const bl = await ex(['backlog', '--version']);
         add('backlog.cli', bl.code === 0 ? 'ok' : 'fail', bl.code === 0 ? `backlog.md ${short(bl.stdout)}` : `backlog CLI not usable: ${short(bl.stderr || bl.stdout)}`);
-        const probe = await ex(['minions', 'coordinator', '--print-command', '--json']);
-        add('claude.capabilities', probe.code === 0 ? 'ok' : 'fail', probe.code === 0 ? 'coordinator launch command resolves' : `coordinator probe failed (exit ${probe.code}): ${short(probe.stderr || probe.stdout)}`);
+        const probe = await ex(['minions', 'coordinator', '--probe', '--json']);
+        add('claude.capabilities', probe.code === 0 ? 'ok' : 'fail', probe.code === 0 ? 'Claude Code supports the coordinator launch flags; launch command resolves' : `coordinator probe failed (exit ${probe.code}): ${short(probe.stderr || probe.stdout)}`);
       } else {
         for (const n of ['claude.auth', 'backlog.cli', 'claude.capabilities']) add(n, 'warn', 'skipped: container not running');
       }

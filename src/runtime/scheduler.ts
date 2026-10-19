@@ -130,6 +130,13 @@ export class Scheduler {
     if (startEffect === 'deny') throw new MinionsError('POLICY_DENIED', `task.start is denied for role ${role} by configuration.`);
 
     const task = await this.backlog.getTask(taskId);
+    // An active lease is a CONFLICT regardless of status (the claim itself moved the status on);
+    // re-checked inside the transaction below.
+    const held = this.db.activeLeases().find((l) => l.task_id === task.id);
+    if (held) {
+      throw new MinionsError('CONFLICT', `Task ${task.id} already has an active ${held.role} lease (${held.id}).`,
+        'One active stage per task: wait for it, record its result, or release it.', { leaseId: held.id, role: held.role });
+    }
     if (!ROLE_STATUSES[role].includes(task.status)) {
       throw new MinionsError('PRECONDITION', `Task ${task.id} is "${task.status}"; a ${role} can only be claimed from ${ROLE_STATUSES[role].join('|')}.`);
     }

@@ -304,7 +304,7 @@ Runtime-side workspace commands (runtime worker owns; host transfer calls them t
   and `/state/backlog/backlog/config.yml` (statuses, `done` last, `filesystem_only: true`).
 - `minions workspace import <bundlePath> --base <branch> [--remote-url <url>] --json`: clones
   `/workspace/repo` from the bundle if absent, else fetches into `refs/remotes/host/*` (never
-  rewrites local branches); sets `user.name`/`user.email` from `config.git.identity`; records origin URL
+  rewrites local branches; the base branch is fast-forwarded only when it has not diverged); sets `user.name`/`user.email` from `config.git.identity`; records origin URL
   as remote `origin` without fetching. Returns `{ head, base, imported: boolean }`.
 - `minions workspace export <outPath> --json`: writes a bundle with `agent/*` branches and the base
   branch; returns `{ path, refs: string[] }`. Host fetches it into `refs/remotes/minions/*` only.

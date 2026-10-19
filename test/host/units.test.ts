@@ -4,7 +4,7 @@ import { profileDefaults } from '../../src/config/profiles.js';
 import { MinionsError } from '../../src/core/errors.js';
 import { projectPaths, volumeNames } from '../../src/core/paths.js';
 import { composeMajor, discover, proposeVerification } from '../../src/host/discovery.js';
-import { Compose, composeYaml, ensureImage, packageRoot } from '../../src/host/docker.js';
+import { Compose, buildFingerprint, composeYaml, ensureImage, packageRoot } from '../../src/host/docker.js';
 import { nodeVersionOk } from '../../src/host/doctor.js';
 import type { ProjectJson } from '../../src/host/project.js';
 import { bindProject, resolveIdentity, type Registry } from '../../src/host/registry.js';
@@ -82,7 +82,19 @@ describe('compose generation', () => {
     const built = await ensureImage('minions-runtime:9.9.9', { runner, root: join(root) }).catch((e: MinionsError) => e);
     if (built instanceof MinionsError) { expect(built.code).toBe('PRECONDITION'); return; } // dist/ not built in this checkout
     expect(built).toBe(true);
-    expect(calls[1]).toEqual(['docker', 'build', '-t', 'minions-runtime:9.9.9', '-f', join(root, 'docker', 'Dockerfile'), root]);
+    expect(calls[1]).toEqual(['docker', 'build', '-t', 'minions-runtime:9.9.9', '--label', `minions.build=${buildFingerprint(root)}`, '-f', join(root, 'docker', 'Dockerfile'), root]);
+  });
+
+  it('ensureImage rebuilds only when the build label differs from the installed package', async () => {
+    const root = packageRoot();
+    const fp = buildFingerprint(root);
+    if (fp === null) return; // dist/ not built in this checkout
+    for (const [label, rebuild] of [[fp, false], ['stale', true], ['<no value>', true]] as const) {
+      const calls: string[][] = [];
+      const runner = async (cmd: string, args: string[]) => { calls.push([cmd, ...args]); return { code: 0, stdout: `${label}\n`, stderr: '' }; };
+      expect(await ensureImage('minions-runtime:9.9.9', { runner, root })).toBe(rebuild);
+      expect(calls.some((c) => c[1] === 'build')).toBe(rebuild);
+    }
   });
 });
 

@@ -188,8 +188,15 @@ export function register(program: Command): void {
     }));
 }
 
+/** Resolve a dotted provenance path; keys may themselves contain dots (e.g. `capabilities.code.edit`). */
 function get(obj: unknown, dotted: string): unknown {
-  let cur: unknown = obj;
-  for (const k of dotted.split('.')) cur = cur && typeof cur === 'object' ? (cur as Record<string, unknown>)[k] : undefined;
-  return cur;
+  if (dotted === '') return obj;
+  if (!obj || typeof obj !== 'object') return undefined;
+  const rec = obj as Record<string, unknown>;
+  const parts = dotted.split('.');
+  for (let i = parts.length; i > 0; i--) {
+    const key = parts.slice(0, i).join('.');
+    if (key in rec) return get(rec[key], parts.slice(i).join('.'));
+  }
+  return undefined;
 }

@@ -10,7 +10,7 @@ import { MinionsError } from '../core/errors.js';
 import { readJson } from '../core/fsutil.js';
 import { emit } from '../core/output.js';
 import { delegateToContainer } from '../host/delegate.js';
-import { buildCoordinatorCommand, launchCoordinator } from './coordinator.js';
+import { buildCoordinatorCommand, launchCoordinator, probeRuntime } from './coordinator.js';
 import { openDb, type Lease, type LeaseRole, type RuntimeDb } from './db.js';
 import { runHook } from './hooks.js';
 import { runtimePaths } from './paths.js';
@@ -173,8 +173,14 @@ export function register(program: Command): void {
   // coordinator
   program.command('coordinator').description('Launch or attach the coordinator Claude Code session (tmux)')
     .option('--print-command', 'print the launch argv without running it')
-    .action(action(async (o: { printCommand?: boolean }, cmd: Command) => {
+    .option('--probe', 'check that Claude Code and tmux support the launch flags, then exit')
+    .action(action(async (o: { printCommand?: boolean; probe?: boolean }, cmd: Command) => {
       const cfg = await getConfig();
+      if (o.probe) {
+        const r = { ...(await probeRuntime()), command: await buildCoordinatorCommand(cfg) };
+        emit(r, { json: globalOpts(cmd).json, human: (d: typeof r) => `Claude Code ${d.claudeVersion}, ${d.tmuxVersion}: launch flags supported` });
+        return;
+      }
       if (o.printCommand) {
         emit(await buildCoordinatorCommand(cfg), { json: globalOpts(cmd).json, human: (c) => JSON.stringify([c.cmd, ...c.args]) });
         return;
