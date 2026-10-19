@@ -18,7 +18,9 @@ describe('workspace import/export', () => {
     const layout = workspaceLayout(join(root, 'workspace'));
     const config = defaults();
 
-    const first = await importWorkspace(bundle1, { base: 'trunk', remoteUrl: 'git@github.com:acme/app.git', config, layout });
+    // Explicit absent token file: the default container path may hold a real token, which would
+    // normalize origin to https (configureOrigin) and make this test environment-dependent.
+    const first = await importWorkspace(bundle1, { base: 'trunk', remoteUrl: 'git@github.com:acme/app.git', config, layout, tokenFile: join(root, 'no-github-token') });
     expect(first).toMatchObject({ head: hostHead, base: 'trunk', imported: true });
     expect(gitSync(layout.repo, 'config', 'user.email')).toBe(config.git.identity.email);
     expect(gitSync(layout.repo, 'remote', 'get-url', 'origin')).toBe('git@github.com:acme/app.git');
