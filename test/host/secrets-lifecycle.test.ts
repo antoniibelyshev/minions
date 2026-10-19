@@ -87,3 +87,42 @@ describe('Compose.hasSecretsMount', () => {
     expect(await new Compose(ID, runnerWith([], false)).hasSecretsMount()).toBe(false);
   });
 });
+
+describe('Compose.hasSecretsMount parsing edge cases', () => {
+  const withOut = (out: string, code = 0) => async (_c: string, args: string[]): Promise<RunResult> =>
+    args[0] === 'inspect' ? { code, stdout: out, stderr: '' } : ok('abc123\n');
+  it('is false for malformed, empty or failing inspect output', async () => {
+    for (const out of ['', 'not json', 'null', '{}', '[1,null]']) {
+      expect(await new Compose(ID, withOut(out)).hasSecretsMount().catch(() => 'threw')).toBe(false);
+    }
+    expect(await new Compose(ID, withOut(JSON.stringify([{ Destination: CONTAINER.secretsDir }]), 1)).hasSecretsMount()).toBe(false);
+  });
+  it('does not match lookalike destinations or the Source field', async () => {
+    const m = [{ Destination: `${CONTAINER.secretsDir}-old` }, { Destination: `${CONTAINER.secretsDir}X` }, { Destination: '/opt/minions' }, { Source: CONTAINER.secretsDir, Destination: '/elsewhere' }];
+    expect(await new Compose(ID, withOut(JSON.stringify(m))).hasSecretsMount()).toBe(false);
+  });
+});
+
+describe('upClearingSecretsOnFailure resilience', () => {
+  it('still rethrows the original error and clears when one kind cannot be removed', async () => {
+    await plant(ID);
+    const err = new Error('boom');
+    await expect(C.upClearingSecretsOnFailure({ up: async () => { throw err; } }, '../does-not-exist/../' + ID)).rejects.toBe(err);
+  });
+});
+
+describe('PROBE doctor must not delete when state unknown', () => {
+  for (const [name, mk] of [
+    ['ps errors (code 1)', (a: string[]): RunResult => a.includes('ps') ? { code: 1, stdout: '', stderr: 'boom' } : ok('{}')],
+    ['ps times out/empty ok but container restarting', (a: string[]): RunResult => ok(a.includes('ps') ? '' : '{}')],
+  ] as const) {
+    it(name, async () => {
+      const repo = makeRepo(env.root);
+      const r = await runInit({ path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
+      const id = r.plan.projectId;
+      await plant(id);
+      await runDoctor({ cwd: repo, probe: dockerUp, runner: async (_c, a) => mk(a) });
+      expect(copies(id)).toEqual([true, true]);
+    });
+  }
+});
