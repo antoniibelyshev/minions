@@ -4,13 +4,14 @@ minions installs a small Claude Code development team into a Git project on your
 
 Everything the model controls runs inside one Docker container per project. Your Mac runs only a small, trusted `minions` CLI. That CLI installs the team, starts and stops the container, provisions the credentials you grant, and handles explicit import and export.
 
-> **Status:** version 0.1 (bootstrap) is installable from source. It implements the terminal workflow: `setup` (guided, end to end), `init`, `doctor`, `start`, `down`, `status`, `pause`, `resume`, `import`, `export`, `config show [--explain]`, `auth github`, `auth telegram`, and `uninstall` on the host; optional Telegram communication through the official Claude Code channel plugin (see [docs/design/telegram.md](docs/design/telegram.md); the notification outbox is not implemented yet); the Backlog.md backend; `local` delivery (commits on `agent/<slug>` branches, fetched to the host with `minions export`); and `branch` / `pull-request` delivery to GitHub (push `agent/<slug>`, open one PR; never merged). The rest of this README describes the intended version 1 behavior. Sections marked **(deferred in v0.1)** are not implemented yet, and `minions doctor` reports them as unavailable: GitHub Issues backend, auto-merge and merge requests, review publication, config plan/apply, backlog migration, upgrade, budgets, and companion containers. `minions auth github` stores a per-project fine-grained GitHub token on the host (see [docs/design/bootstrap.md](docs/design/bootstrap.md#github-credential)); the container uses it for branch/pull-request delivery. The v0.1 contract is [docs/design/bootstrap.md](docs/design/bootstrap.md); the full requirements are in [docs/spec.md](docs/spec.md).
+> **Status:** version 0.1 (bootstrap) is installable from GitHub or from source (see [Install in another project](#install-in-another-project)). It implements the terminal workflow: `setup` (guided, end to end), `init`, `doctor`, `start`, `down`, `status`, `pause`, `resume`, `import`, `export`, `config show [--explain]`, `auth github`, `auth telegram`, and `uninstall` on the host; optional Telegram communication through the official Claude Code channel plugin (see [docs/design/telegram.md](docs/design/telegram.md); the notification outbox is not implemented yet); the Backlog.md backend; `local` delivery (commits on `agent/<slug>` branches, fetched to the host with `minions export`); and `branch` / `pull-request` delivery to GitHub (push `agent/<slug>`, open one PR; never merged). The rest of this README describes the intended version 1 behavior. Sections marked **(deferred in v0.1)** are not implemented yet, and `minions doctor` reports them as unavailable: GitHub Issues backend, auto-merge and merge requests, review publication, config plan/apply, backlog migration, upgrade, budgets, and companion containers. `minions auth github` stores a per-project fine-grained GitHub token on the host (see [docs/design/bootstrap.md](docs/design/bootstrap.md#github-credential)); the container uses it for branch/pull-request delivery. The v0.1 contract is [docs/design/bootstrap.md](docs/design/bootstrap.md); the full requirements are in [docs/spec.md](docs/spec.md).
 
 ## Contents
 
 - [What it does](#what-it-does)
 - [How it works](#how-it-works)
 - [Requirements](#requirements)
+- [Install in another project](#install-in-another-project)
 - [Quickstart](#quickstart)
 - [Profiles](#profiles)
 - [Working with the team](#working-with-the-team)
@@ -68,6 +69,31 @@ Everything the model controls runs inside one Docker container per project. Your
 - Optional: the GitHub CLI and credentials for PR delivery, and a Telegram bot for remote control
 
 Native macOS or iOS builds that need Xcode can't run in the Linux container. minions reports them as an environment limitation.
+
+## Install in another project
+
+Install the CLI from GitHub, then point it at the repository you want the team to work in:
+
+```sh
+npm install -g github:antoniibelyshev/minions
+minions setup path/to/your/repo
+```
+
+npm clones the repository, installs the build tools, and builds `dist/` during the install (the `prepare` script). The installed package includes the templates, the Docker build files, and the config schema that the CLI needs at run time. To run setup once without a global install:
+
+```sh
+npx github:antoniibelyshev/minions setup .
+```
+
+To upgrade, uninstall first and then install again. npm cannot replace an existing global install from a git URL in place, and it removes the old copy when it tries:
+
+```sh
+npm uninstall -g minions && npm install -g github:antoniibelyshev/minions
+```
+
+From a clone of this repository, `./install.sh path/to/your/repo` does the same thing: it builds and packs the CLI, installs it globally with npm, and runs `minions setup`. To check the git-URL install path locally without touching your global npm, run `npm run verify:git-install`. It installs a temporary clone into a temporary prefix.
+
+minions is not published to the npm registry. Installing with `npm install -g minions` may be offered later. Until then, use the GitHub URL.
 
 ## Quickstart
 
