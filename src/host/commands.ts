@@ -8,7 +8,7 @@ import { emit } from '../core/output.js';
 import { CONTAINER } from '../core/paths.js';
 import type { MinionsConfig } from '../config/schema.js';
 import {
-  clearSecrets, githubTokenGuidance, materializeSecrets, provisionGithubToken, provisionTelegramToken, removeGithubToken,
+  clearSecrets, upClearingSecretsOnFailure, githubTokenGuidance, materializeSecrets, provisionGithubToken, provisionTelegramToken, removeGithubToken,
   removeTelegramToken, telegramBotGuidance,
 } from './credentials.js';
 import { dockerProbe } from './discovery.js';
@@ -84,7 +84,7 @@ async function ensureUp(json: boolean) {
   const p = await openProject(json);
   if (await ensureImage(p.project.imageTag, { onBuild: (m) => say(json, m) })) say(json, `Built ${p.project.imageTag}.`);
   await materialize(json, p.project.projectId);
-  await p.compose.up();
+  await upClearingSecretsOnFailure(p.compose, p.project.projectId);
   await p.compose.exec(['minions', 'workspace', 'setup', '--json'], { timeoutMs: 120_000 });
   return p;
 }
@@ -242,12 +242,18 @@ export function register(program: Command): void {
       const r = await provisionGithubToken({ projectId: project.projectId, token, repoPath: ref.repoPath, remoteUrl: project.remoteUrl, verify: o.verify });
       const compose = new Compose(project.projectId);
       let mounted = false;
-      if (await compose.isRunning().catch(() => false)) { await materialize(json, project.projectId); mounted = true; }
-      emit({ ...r, mountedPath: CONTAINER.githubTokenFile, visibleInRunningContainer: mounted }, { json, human: () => [
+      let needsRestart = false;
+      if (await compose.isRunning().catch(() => false)) {
+        if (await compose.hasSecretsMount().catch(() => false)) { await materialize(json, project.projectId); mounted = true; }
+        else needsRestart = true; // container predates the secrets mount: a copy would not reach it
+      }
+      emit({ ...r, mountedPath: CONTAINER.githubTokenFile, visibleInRunningContainer: mounted, ...(needsRestart ? { restartRequired: true } : {}) }, { json, human: () => [
         `Stored the GitHub token in ${r.backend === 'keychain' ? 'the macOS Keychain' : 'a 0600 host file'} (${r.ref}).`,
         r.verification ? `Verification: ${r.verification.status} — ${r.verification.detail}` : 'Verification skipped (--no-verify).',
         ...r.warnings.map((w) => `warning: ${w}`),
-        mounted ? `Updated ${CONTAINER.githubTokenFile} in the running container.` : `It is mounted read-only at ${CONTAINER.githubTokenFile} on the next \`minions start\`.`,
+        mounted ? `Updated ${CONTAINER.githubTokenFile} in the running container.`
+          : needsRestart ? 'The running container has no secrets mount (created before this feature); run `minions start` to recreate it so the token becomes visible.'
+            : `It is mounted read-only at ${CONTAINER.githubTokenFile} on the next \`minions start\`.`,
       ].join('\n') });
     }));
 

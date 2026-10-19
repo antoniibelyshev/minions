@@ -117,6 +117,16 @@ export class Compose {
     return r.code === 0 && r.stdout.trim().length > 0;
   }
 
+  /** True when the running container has the secrets dir bind-mounted (false for one created from a pre-upgrade compose.yaml). */
+  async hasSecretsMount(): Promise<boolean> {
+    const ps = await this.compose(['ps', '--status', 'running', '-q', SERVICE_NAME], { allowFailure: true, timeoutMs: 30_000 });
+    const id = ps.stdout.trim().split('\n')[0]?.trim();
+    if (ps.code !== 0 || !id) return false;
+    const r = await this.runner('docker', ['inspect', '--format', '{{json .Mounts}}', id], { allowFailure: true, timeoutMs: 30_000 });
+    if (r.code !== 0) return false;
+    try { return (JSON.parse(r.stdout) as { Destination?: string }[]).some((m) => m.Destination === CONTAINER.secretsDir); } catch { return false; }
+  }
+
   /** Non-interactive exec (no TTY); output captured. */
   exec(args: string[], opts: RunOptions = {}): Promise<RunResult> {
     return this.compose(['exec', '-T', SERVICE_NAME, ...args], opts);

@@ -5,7 +5,7 @@ import { run } from '../core/exec.js';
 import { redact } from '../core/output.js';
 import { VERSION } from '../core/version.js';
 import type { MinionsConfig } from '../config/schema.js';
-import { githubCredentialStatus, githubRepoFromRemote, telegramCredentialStatus, type CredentialStatus, type Fetch, type TelegramCredentialStatus } from './credentials.js';
+import { clearStaleSecrets, githubCredentialStatus, githubRepoFromRemote, telegramCredentialStatus, type CredentialStatus, type Fetch, type TelegramCredentialStatus } from './credentials.js';
 import { dockerProbe, type DockerProbe } from './discovery.js';
 import { Compose, buildFingerprint, imageBuildLabel, type Runner } from './docker.js';
 import { telegramDoctorCheck } from '../telegram/probe.js';
@@ -114,6 +114,11 @@ export async function runDoctor(opts: { cwd: string; runner?: Runner; probe?: Do
       const compose = new Compose(project.projectId, runner);
       const running = await compose.isRunning();
       add('container', running ? 'ok' : 'warn', running ? `${compose.name} running` : `${compose.name} not running`, running ? undefined : 'Run `minions start`.');
+      if (!running) {
+        // Crash/reboot/Docker quit can leave plaintext token copies; the originals stay in the credential store.
+        const removed = await clearStaleSecrets(project.projectId, false).catch(() => false);
+        if (removed) add('secrets.copy', 'warn', 'removed stale token copies from the secrets directory (container not running)', '`minions start` writes them again.');
+      }
       if (running) {
         const ex = (args: string[]) => compose.exec(args, { allowFailure: true, timeoutMs: 60_000 });
         const auth = await ex(['claude', 'auth', 'status']);

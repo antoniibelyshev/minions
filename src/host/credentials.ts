@@ -561,3 +561,24 @@ export async function telegramCredentialStatus(projectId: string, opts: { runner
   if (problems.length) return { state: 'invalid', backend: ref.backend, botId: ref.botId, sharedWith, detail: `bot ${ref.botId}; stored in ${where}; ${problems.join('; ')}` };
   return { state: 'ok', backend: ref.backend, botId: ref.botId, sharedWith, detail: `bot ${ref.botId}; stored in ${where}` };
 }
+
+/** True when any materialized secret copy exists on the host. */
+export async function secretCopiesExist(projectId: string): Promise<boolean> {
+  for (const kind of CREDENTIAL_KINDS) if (await stat(secretFile(projectId, kind)).then(() => true, () => false)) return true;
+  return false;
+}
+
+/**
+ * Removes materialized copies left behind when no container is running (host crash, reboot, Docker
+ * quit). Never touches the Keychain / file-store originals. Returns true when something was removed.
+ */
+export async function clearStaleSecrets(projectId: string, containerRunning: boolean): Promise<boolean> {
+  if (containerRunning || !(await secretCopiesExist(projectId))) return false;
+  await clearSecrets(projectId);
+  return true;
+}
+
+/** Runs `compose.up()`; if it fails, the freshly materialized plaintext copies are removed before rethrowing. */
+export async function upClearingSecretsOnFailure(compose: { up(): Promise<void> }, projectId: string): Promise<void> {
+  try { await compose.up(); } catch (e) { await clearSecrets(projectId).catch(() => undefined); throw e; }
+}

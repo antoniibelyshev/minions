@@ -379,6 +379,7 @@ The Telegram controls (pause intake, pause new starts, cancel workers, resume, s
 **Credential handling:**
 
 - Long-lived secrets stay on the host, in macOS Keychain or in 0600 files outside the repository.
+- The Keychain items are created without a `-T` access list, so any process running as your user can read them (normal macOS behaviour; the Keychain protects against other users and offline access, not against your own processes). The plaintext copy mounted into the container (`secrets/` in the project directory) is removed by `minions down`/uninstall, `minions start` fails, or `minions doctor` finds it with no running container.
 - Configuration holds references only.
 - GitHub App private keys never enter the container. The host refreshes short-lived installation tokens into read-only secret files, and if a refresh fails, external writes pause.
 - Tokens, environment dumps, and private task payloads are never logged, and logs are kept bounded with predictable secret values redacted.
