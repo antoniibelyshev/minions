@@ -7,7 +7,7 @@ import { Compose } from '../../src/host/docker.js';
 import * as C from '../../src/host/credentials.js';
 import { runDoctor } from '../../src/host/doctor.js';
 import { runInit } from '../../src/host/install.js';
-import { dockerUp, makeRepo, withHome } from './fixtures.js';
+import { dockerDown, dockerUp, makeRepo, withHome } from './fixtures.js';
 
 type RunResult = import('../../src/core/exec.js').RunResult;
 const ID = '3f2b8c1e-7d4a-4e9b-9c2f-1a2b3c4d5e6f';
@@ -175,5 +175,55 @@ describe('Compose.secretsVisibility (auth github / auth telegram)', () => {
     expect(await mk(true, [{ Destination: CONTAINER.secretsDir }]).secretsVisibility()).toBe('mounted');
     expect(await mk(true, [{ Destination: '/workspace' }]).secretsVisibility()).toBe('restart-required');
     expect(await mk(false, []).secretsVisibility()).toBe('not-running');
+  });
+});
+
+describe('containerState edge cases (tester)', () => {
+  const st = (stdout: string) => new Compose(ID, async () => ({ code: 0, stdout, stderr: '' })).containerState();
+  it('treats extra fields as harmless and unexpected State casing as unknown (never deletes)', async () => {
+    expect((await st(JSON.stringify({ Name: 'x', State: 'exited', ExitCode: 137, Publishers: [], Health: '' }))).state).toBe('absent');
+    expect((await st(JSON.stringify({ State: 'Exited' }))).state).toBe('unknown');
+    expect((await st(JSON.stringify({ State: 'RUNNING' }))).state).toBe('unknown');
+    expect((await st(JSON.stringify({ State: 5 }))).state).toBe('unknown');
+  });
+  it('scopes the query to our service so other compose services are not counted', async () => {
+    let seen: string[] = [];
+    await new Compose(ID, async (_c, args) => { seen = args; return ok(''); }).containerState();
+    expect(seen.slice(-1)[0]).toBe('app');
+    expect(seen).toContain('-a');
+  });
+  it('tolerates blank lines and trailing newline in NDJSON', async () => {
+    expect((await st(`\n${JSON.stringify({ State: 'exited' })}\n\n`)).state).toBe('absent');
+  });
+});
+
+describe('doctor never deletes when Docker or ps is unreachable (tester)', () => {
+  it('keeps copies when the daemon is down', async () => {
+    const repo = makeRepo(env.root);
+    const r = await runInit({ path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
+    await plant(r.plan.projectId);
+    await runDoctor({ cwd: repo, probe: dockerDown, runner: async () => ok('') });
+    expect(copies(r.plan.projectId)).toEqual([true, true]);
+  });
+  it('keeps copies when ps -a throws (timeout) at doctor level', async () => {
+    const repo = makeRepo(env.root);
+    const r = await runInit({ path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
+    await plant(r.plan.projectId);
+    const runner = async (_c: string, args: string[]): Promise<RunResult> => {
+      if (args.includes('ps') && args.includes('-a')) throw new Error('timed out');
+      return ok('');
+    };
+    const doc = await runDoctor({ cwd: repo, probe: dockerUp, runner });
+    expect(copies(r.plan.projectId)).toEqual([true, true]);
+    expect(doc.checks.find((c) => c.name === 'secrets.copy')?.status).toBe('warn');
+  });
+  it('keeps copies when another service is running but ours is restarting (filtered ps -a returns ours only)', async () => {
+    const repo = makeRepo(env.root);
+    const r = await runInit({ path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
+    await plant(r.plan.projectId);
+    const runner = async (_c: string, args: string[]): Promise<RunResult> =>
+      args.includes('ps') && args.includes('-a') ? ok(JSON.stringify({ Service: 'app', State: 'restarting' })) : ok('');
+    await runDoctor({ cwd: repo, probe: dockerUp, runner });
+    expect(copies(r.plan.projectId)).toEqual([true, true]);
   });
 });
