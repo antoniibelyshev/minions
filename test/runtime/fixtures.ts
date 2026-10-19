@@ -94,7 +94,7 @@ export function makeEnv(mutate?: (c: MinionsConfig) => void): Env {
   const backlog = new FakeBacklog();
   const config = defaults('project-owner');
   mutate?.(config);
-  const sched = new Scheduler({ db, backlog, config, layout });
+  const sched = new Scheduler({ db, backlog, config, layout, handoff: { briefs: join(root, 'state', 'briefs'), results: join(root, 'state', 'results') } });
   return { root, layout, db, backlog, config, sched, baseSha };
 }
 

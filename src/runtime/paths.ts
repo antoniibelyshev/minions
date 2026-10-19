@@ -20,6 +20,10 @@ export function runtimePaths(env: NodeJS.ProcessEnv = process.env) {
     db: join(state, 'minions.db'),
     backlog: join(state, 'backlog'),
     notes: join(state, 'notes'),
+    /** Stored worker briefs (`work claim` writes, `work brief` reads). */
+    briefs: join(state, 'briefs'),
+    /** Submitted worker results (`work submit` writes, `work record --submitted` reads). */
+    results: join(state, 'results'),
     import: join(state, 'import'),
     exports: join(state, 'exports'),
     logs: join(state, 'logs'),
@@ -40,6 +44,8 @@ export function runtimePaths(env: NodeJS.ProcessEnv = process.env) {
     telegramStateDir: env.TELEGRAM_STATE_DIR || join(env.CLAUDE_CONFIG_DIR || (env.MINIONS_RUNTIME === 'host' ? join(homedir(), '.claude') : c.claudeHome), 'channels', 'telegram'),
     /** Written by `minions coordinator run`: what the running coordinator was launched with (no secrets). */
     coordinatorLaunch: join(state, 'coordinator-launch.json'),
+    /** Written by `minions coordinator run` when it exits (code, signal, error; no secrets). Read by a detached start. */
+    coordinatorExit: join(state, 'coordinator-exit.json'),
     coordinatorPrompt: join(pluginDir, 'coordinator.md'),
   };
 }

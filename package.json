@@ -2,6 +2,12 @@
   "name": "minions",
   "version": "0.1.0",
   "description": "Containerized Claude Code agent team for software projects",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/antoniibelyshev/minions.git"
+  },
+  "homepage": "https://github.com/antoniibelyshev/minions#readme",
+  "license": "MIT",
   "type": "module",
   "bin": {
     "minions": "dist/cli.js"
@@ -16,16 +22,19 @@
     "schema",
     "install.sh",
     "README.md",
-    "docs"
+    "docs",
+    "LICENSE"
   ],
   "scripts": {
     "build": "node esbuild.config.mjs",
+    "prepare": "node scripts/prepare.mjs",
     "schema": "node esbuild.config.mjs --schema-only",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "pack": "npm run build && npm pack",
     "e2e": "bash scripts/e2e.sh",
-    "e2e:host": "bash scripts/e2e-host.sh"
+    "e2e:host": "bash scripts/e2e-host.sh",
+    "verify:git-install": "bash scripts/verify-git-install.sh"
   },
   "dependencies": {},
   "devDependencies": {

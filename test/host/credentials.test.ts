@@ -491,3 +491,62 @@ describe('security edge cases (tester)', () => {
     expect(await C.removeGithubToken(ID)).toEqual({ removed: false, backend: null });
   });
 });
+
+describe('doctor ci.requiredChecks (read-only, mocked GitHub API)', () => {
+  const io = { ask: async (q: string, def: string) => (q.startsWith('Store a GitHub token') ? 'y' : def), info: () => {}, secret: async () => TOKEN };
+  /** Route-aware fake api.github.com; records method and path of every request. */
+  function api(routes: Record<string, [number, unknown]>) {
+    const seen: { method: string; path: string }[] = [];
+    const f = (async (url: string | URL | Request, init?: RequestInit) => {
+      const u = new URL(String(url));
+      seen.push({ method: init?.method ?? 'GET', path: u.pathname + u.search });
+      const [status, body] = routes[u.pathname + u.search] ?? (u.pathname === '/repos/acme/demo' || u.pathname === '/user' ? [200, { full_name: 'acme/demo', login: 'ada', permissions: { push: true } }] : [404, { message: 'Not Found' }]);
+      return new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
+    }) as typeof fetch;
+    return { f, seen };
+  }
+
+  it('host fallback reports required checks, only issues GETs, and never prints the token', async () => {
+    const repo = makeRepo(env.root);
+    git(repo, 'remote', 'add', 'origin', REMOTE);
+    await runInit({ path: repo, yes: false, visibility: 'private', io, dockerProbe: dockerUp, fetch: okRepo().f });
+    const ok = api({
+      '/repos/acme/demo/branches/main': [200, { protected: true, protection: { required_status_checks: { enforcement_level: 'everyone', contexts: ['build'] } } }],
+      '/repos/acme/demo/rules/branches/main': [200, []],
+      '/repos/acme/demo/actions/workflows?per_page=1': [200, { total_count: 1 }],
+    });
+    const doc = await runDoctor({ cwd: repo, probe: dockerDown, runner: recorder().runner, fetch: ok.f });
+    expect(doc.checks.find((c) => c.name === 'ci.requiredChecks')).toMatchObject({ status: 'ok', detail: expect.stringMatching(/required checks on main: build; delivery.requiredChecksConfigured false/) });
+    expect(ok.seen.every((s) => s.method === 'GET')).toBe(true);
+    expect(ok.seen.map((s) => s.path)).toContain('/repos/acme/demo/branches/main');
+    expect(JSON.stringify(doc) + formatDoctor(doc)).not.toContain(TOKEN);
+
+    const none = api({ '/repos/acme/demo/branches/main': [200, { protected: false }], '/repos/acme/demo/rules/branches/main': [200, []], '/repos/acme/demo/actions/workflows?per_page=1': [200, { total_count: 0 }] });
+    const d2 = await runDoctor({ cwd: repo, probe: dockerDown, runner: recorder().runner, fetch: none.f });
+    const c2 = d2.checks.find((c) => c.name === 'ci.requiredChecks')!;
+    expect(c2).toMatchObject({ status: 'unavailable', detail: expect.stringMatching(/no required status checks on main and no CI workflows: usable for local work and pull-request delivery; automatic merge unavailable/) });
+    expect(formatDoctor(d2)).toMatch(/Add a CI workflow yourself/);
+    expect(d2.healthy === doc.healthy).toBe(true); // no CI never makes doctor unhealthy
+    expect(none.seen.every((s) => s.method === 'GET')).toBe(true);
+  });
+
+  it('uses `minions ci status --json` in a running container', async () => {
+    const repo = makeRepo(env.root);
+    git(repo, 'remote', 'add', 'origin', REMOTE);
+    await runInit({ path: repo, yes: false, visibility: 'private', io, dockerProbe: dockerUp, fetch: okRepo().f });
+    const rc = { repository: 'acme/demo', baseBranch: 'main', state: 'configured', requiredChecks: ['ci/test'], protection: null, rulesets: { contexts: ['ci/test'] }, workflows: 3, errors: [] };
+    const rec = recorder((c) => {
+      const a = c.args.join(' ');
+      if (c.cmd !== 'docker') return undefined;
+      if (a.startsWith('image inspect')) return { code: 0, stdout: 'x\n', stderr: '' };
+      if (a.includes(' ps --status running')) return { code: 0, stdout: 'abc\n', stderr: '' };
+      if (a.endsWith('ci status --json')) return { code: 0, stdout: JSON.stringify({ ok: true, data: { repository: 'acme/demo', requiredChecks: rc, requiredChecksConfigured: false, setupPlan: [] } }), stderr: '' };
+      return undefined;
+    });
+    const ok = api({});
+    const doc = await runDoctor({ cwd: repo, probe: dockerUp, runner: rec.runner, fetch: ok.f });
+    expect(doc.checks.find((c) => c.name === 'ci.requiredChecks')).toMatchObject({ status: 'ok', detail: expect.stringContaining('ci/test') });
+    expect(rec.calls.some((c) => c.args.join(' ').endsWith('minions ci status --json'))).toBe(true);
+    expect(ok.seen.some((s) => s.path.includes('/branches/'))).toBe(false); // no host fallback needed
+  });
+});

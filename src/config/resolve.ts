@@ -11,7 +11,7 @@ export const SUPPORTED = {
 /** Features deferred in v0.1; doctor and the wizard report them as unavailable. */
 export const DEFERRED_FEATURES = [
   'GitHub Issues backend', 'auto-merge and merge requests', 'review publication',
-  'config plan/apply transactions', 'backlog migration', 'upgrade', 'budgets',
+  'config plan/apply transactions', 'backlog migration', 'upgrade plan and schema migration', 'budgets',
   'companion containers',
 ] as const;
 

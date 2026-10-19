@@ -140,6 +140,22 @@ export async function preAgentHook(input: unknown, load: HookLoader): Promise<Ho
   }
 }
 
+/**
+ * PreToolUse(Telegram MCP tools) guard, registered by the coordinator's --settings when Telegram is on.
+ * Telegram tools are coordinator-only: a call from any subagent (Claude Code sets agent_id/agent_type in
+ * hook input inside a subagent) is denied, whatever its type. The main coordinator thread is allowed.
+ */
+export function preTelegramHook(input: unknown): HookOutput {
+  const inp = isObj(input) ? input : {};
+  const tool = typeof inp.tool_name === 'string' ? inp.tool_name : 'a Telegram tool';
+  const agentId = typeof inp.agent_id === 'string' ? inp.agent_id : '';
+  const agentType = typeof inp.agent_type === 'string' ? inp.agent_type : '';
+  if (agentId || agentType) {
+    return deny(`${tool} is coordinator-only; subagents (${agentType || 'unknown type'}) cannot use Telegram tools. Return what you want sent to the coordinator instead.`);
+  }
+  return { reason: `allow: ${tool} from the coordinator` };
+}
+
 async function readStdin(timeoutMs = 5000): Promise<string> {
   if (process.stdin.isTTY) return '';
   return new Promise((resolve) => {
@@ -152,8 +168,10 @@ async function readStdin(timeoutMs = 5000): Promise<string> {
   });
 }
 
-/** Entry point for `minions hook stop|pre-agent`: reads stdin, prints the decision, never throws, exits 0. */
-export async function runHook(kind: 'stop' | 'pre-agent', load: HookLoader, stdinText?: string): Promise<HookOutput> {
+export type HookKind = 'stop' | 'pre-agent' | 'pre-telegram';
+
+/** Entry point for `minions hook stop|pre-agent|pre-telegram`: reads stdin, prints the decision, never throws, exits 0. */
+export async function runHook(kind: HookKind, load: HookLoader, stdinText?: string): Promise<HookOutput> {
   let out: HookOutput;
   try {
     const text = stdinText ?? (await readStdin());
@@ -163,7 +181,7 @@ export async function runHook(kind: 'stop' | 'pre-agent', load: HookLoader, stdi
     if (parseError) {
       out = kind === 'stop' ? { reason: `allow: unreadable hook input (${parseError})` } : deny(`minions could not parse the hook input (${parseError}).`);
     } else {
-      out = kind === 'stop' ? await stopHook(input, load) : await preAgentHook(input, load);
+      out = kind === 'stop' ? await stopHook(input, load) : kind === 'pre-telegram' ? preTelegramHook(input) : await preAgentHook(input, load);
     }
   } catch (e) {
     out = kind === 'stop' ? { reason: `allow: internal error (${(e as Error).message})` } : deny(`minions hook failed (${(e as Error).message}).`);

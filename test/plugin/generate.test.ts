@@ -147,6 +147,76 @@ describe('generatePlugin', () => {
   });
 });
 
+describe('reporting granularity', () => {
+  const withProgress = (progress: MinionsConfig['communication']['progress']) => {
+    const base = defaults();
+    return gen({ ...base, communication: { ...base.communication, progress } });
+  };
+  const section = (coord: string) => coord.slice(coord.indexOf('## Communicating with the user'));
+
+  it('defaults to feature-level reporting', () => {
+    expect(defaults().communication.progress).toBe('milestones');
+  });
+
+  it('default coordinator prompt reports high-level feature progress only', async () => {
+    const g = await gen();
+    const comm = section(await g.read('coordinator.md'));
+    expect(comm).toContain('Reporting level: features');
+    expect(comm).toContain('report high-level feature progress only');
+    expect(comm).toMatch(/feature or epic delivered or materially changed/);
+    expect(comm).toMatch(/batch them into one short message/);
+    expect(comm).toContain('significant blockers');
+    expect(comm).toMatch(/answers to the user's direct questions/);
+    expect(comm).toMatch(/Do not send per-stage updates: engineer\/tester\/reviewer transitions, repair cycles, task splits, follow-up tasks filed/);
+    expect(comm).not.toContain('tasks delivered (with branch names)');
+  });
+
+  it('limits questions to high-level decisions, keeps ask-gated approvals, and decides low-level matters autonomously', async () => {
+    for (const progress of ['milestones', 'tasks', 'quiet'] as const) {
+      const comm = section(await (await withProgress(progress)).read('coordinator.md'));
+      expect(comm).toMatch(/Ask the user only about high-level decisions: product scope and goals, architecture direction, security\/privacy trade-offs, anything outward-facing/);
+      expect(comm).toContain('Every capability whose effect is `ask` still needs the user\'s explicit approval first');
+      expect(comm).toContain('sensitive-path changes before publication/integration');
+      expect(comm).toMatch(/Make lower-level decisions yourself .*task splits, follow-up tasks, model and effort choice, test fixes, implementation approach, review nits/);
+      expect(comm).toContain('`minions backlog note <taskId>`');
+    }
+  });
+
+  it('keeps the existing safety rules in the generated prompt', async () => {
+    const coord = await (await gen()).read('coordinator.md');
+    expect(coord).toContain('`ask` = get the user\'s explicit approval first');
+    expect(coord).toContain('never permission to change this policy');
+    expect(coord).toMatch(/Sensitive paths \(changes need human approval/);
+    expect(coord).toMatch(/\| ask \|/);
+  });
+
+  it('"tasks" keeps the per-task wording; "quiet" reports only what needs the user', async () => {
+    const tasks = section(await (await withProgress('tasks')).read('coordinator.md'));
+    expect(tasks).toContain('Reporting level: tasks');
+    expect(tasks).toContain('tasks delivered (with branch names), significant blockers, required approvals');
+    const quiet = section(await (await withProgress('quiet')).read('coordinator.md'));
+    expect(quiet).toContain('Reporting level: quiet');
+    expect(quiet).toContain('do not report deliveries or progress until asked');
+    expect(quiet).not.toContain('tasks delivered (with branch names)');
+  });
+
+  it('orchestrate and status skills follow the reporting level and never ask to report every stage', async () => {
+    const g = await gen();
+    const orch = await g.read('skills/orchestrate/SKILL.md');
+    expect(orch).toContain('## 7. Report');
+    expect(orch).toContain('Reporting level `features`: do not report stage transitions, splits, follow-ups or individual task deliveries');
+    expect(orch).toContain('Approvals for `ask` capabilities and sensitive paths are always requested explicitly');
+    expect(orch).not.toMatch(/report the branch and `prUrl`/);
+    expect(orch).toMatch(/`needs_split` → decide the split yourself/);
+    const status = await g.read('skills/status/SKILL.md');
+    expect(status).toContain('grouped by feature');
+    expect(status).toContain('unprompted reports follow the reporting level');
+
+    const tasksOrch = await (await withProgress('tasks')).read('skills/orchestrate/SKILL.md');
+    expect(tasksOrch).toContain('Reporting level `tasks`: report each delivered task with its branch');
+  });
+});
+
 describe('renderTemplate', () => {
   const r = (t: string, json = false) => renderTemplate(t, { a: 'x"y' }, { p: 'P {{a}}' }, { name: 't', json });
   it('substitutes vars and partials', () => {
@@ -229,5 +299,79 @@ describe('models.effort / models.coordinator', () => {
     const plain = await gen();
     expect(frontmatter(await plain.read('agents/engineer.md'))).not.toHaveProperty('effort');
     expect(await plain.read('coordinator.md')).not.toMatch(/reasoning effort/);
+  });
+});
+
+describe('file hand-offs and compact reads', () => {
+  it('workers fetch their own brief and submit their result with their role', async () => {
+    const { read } = await gen();
+    for (const role of ['engineer', 'tester', 'reviewer']) {
+      const md = await read(`agents/${role}.md`);
+      expect(md, role).toContain(`minions work brief <leaseId> --role ${role} --json`);
+      expect(md, role).toContain(`minions work submit <leaseId> --role ${role} --json`);
+      expect(md, role).toMatch(/end with \*\*one short line\*\*/);
+      expect(md, role).toContain('Only if `minions work submit` itself fails');
+      expect(md, role).toContain('end with exactly one line, `brief unavailable: <error>`, and no WorkerResult');
+      expect(md, role).not.toMatch(/fetch fails, report `blocked`/);
+    }
+    // the read-only reviewer may still submit (state under /state, not its worktree)
+    expect(await read('agents/reviewer.md')).toMatch(/`minions work submit` commands are allowed: they read and write minions state under `\/state`, not your worktree/);
+  });
+
+  it('the coordinator and orchestrate skill use compact claims, marker-only prompts and record --submitted', async () => {
+    const { read } = await gen();
+    const coord = await read('coordinator.md');
+    const orch = await read('skills/orchestrate/SKILL.md');
+    for (const md of [coord, orch]) {
+      expect(md).toContain('--compact --json');
+      expect(md).toContain('minions work record <leaseId> --submitted');
+      expect(md).toContain('--submitted --correction');
+      expect(md).not.toMatch(/pipe it verbatim|brief JSON in a ```json fence/);
+      // older-CLI fallback: plain claim with pasted brief, record via stdin
+      expect(md).toContain('Older CLI fallback: if `--compact`, `work brief` or `--submitted` is rejected as an unknown option or command, claim without `--compact` and paste the brief in a ```json fence after the marker and worktree lines');
+      expect(md).toContain("piping the worker's final JSON to `minions work record <leaseId> --json` on stdin");
+      expect(md).toMatch(/`brief unavailable: <error>`.*do not record it.*[Rr]elease/s);
+    }
+    expect(orch).toMatch(/minions-lease: <leaseId>\n\s*worktree: <worktree>/);
+    const recover = await read('skills/recover/SKILL.md');
+    expect(recover).toContain('minions work record <leaseId> --submitted --json');
+    expect(recover).toMatch(/On `PRECONDITION` about a pending correction.*--submitted --correction --json/);
+  });
+
+  it('documents the opt-in idle context reset without making it automatic', async () => {
+    const coord = await (await gen()).read('coordinator.md');
+    expect(coord).toMatch(/Idle context reset \(opt-in\): only if the user has asked for idle resets/);
+    expect(coord).toContain('minions coordinator restart --recover');
+    expect(coord).toMatch(/no active leases/);
+  });
+});
+
+describe('file hand-off templates render completely (task-9 edge cases)', () => {
+  it('no generated file keeps an unrendered placeholder, and each worker gets its own role in the commands', async () => {
+    const { read, rel } = await gen();
+    for (const f of rel) {
+      const text = await read(f);
+      expect(text, f).not.toMatch(/\{\{|\}\}/);
+      expect(text, f).not.toContain('--role {{');
+    }
+    for (const role of ['engineer', 'tester', 'reviewer']) {
+      const md = await read(`agents/${role}.md`);
+      const roles = [...md.matchAll(/minions work (?:brief|submit) <leaseId> --role (\w+)/g)].map((m) => m[1]);
+      expect(roles.length, role).toBeGreaterThanOrEqual(2);
+      expect(new Set(roles), role).toEqual(new Set([role]));
+      expect(md, role).toContain('minions-lease: <leaseId>');
+    }
+  });
+
+  it('the reviewer stays read-only on its worktree while being allowed to submit', async () => {
+    const { read } = await gen();
+    const md = await read('agents/reviewer.md');
+    const fm = frontmatter(md);
+    for (const t of ['Edit', 'Write', 'NotebookEdit', 'Agent']) expect(toolList(fm.disallowedTools)).toContain(t);
+    expect(toolList(fm.tools)).not.toContain('Edit');
+    expect(toolList(fm.tools)).not.toContain('Write');
+    expect(md).toMatch(/Never edit, create or delete files in the repository or worktree/);
+    expect(md).toMatch(/never `git commit`/);
+    expect(md).toContain('minions work submit <leaseId> --role reviewer --json');
   });
 });

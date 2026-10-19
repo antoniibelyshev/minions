@@ -159,6 +159,14 @@ export interface GithubSetupOptions {
   platform?: NodeJS.Platform;
   /** init already asked "Set up GitHub now?" style questions elsewhere: skip the opening question. */
   skipIntro?: boolean;
+  /**
+   * `minions setup`: the user already chose to set up a token (skip "Store a GitHub token now?"), and
+   * setup asks the delivery mode itself (recorded in config.local.json), so step 4 is skipped.
+   */
+  tokenConfirmed?: boolean;
+  skipDelivery?: boolean;
+  /** Replace a stored token even when it still works (`minions setup` "change"). */
+  replaceToken?: boolean;
 }
 
 export type TokenStepStatus = 'present' | 'stored' | 'skipped' | 'failed';
@@ -267,7 +275,7 @@ export async function runGithubSetup(opts: GithubSetupOptions): Promise<GithubSe
 
   // 3. Token.
   let tokenOk = false;
-  if (state.token === 'stored') {
+  if (state.token === 'stored' && !opts.replaceToken) {
     const st = await githubCredentialStatus(project, { runner, fetch: opts.fetch }).catch(() => null);
     if (st?.state === 'ok' || st?.state === 'unverified') {
       tokenOk = true;
@@ -288,7 +296,7 @@ export async function runGithubSetup(opts: GithubSetupOptions): Promise<GithubSe
     }
     if (!io.secret) {
       result.token = { status: 'skipped', detail: 'no terminal for a non-echoing prompt; run `minions auth github` later.' };
-    } else if (!yes(await io.ask('Store a GitHub token for this project now? (y/n)', 'y'))) {
+    } else if (!opts.tokenConfirmed && !yes(await io.ask('Store a GitHub token for this project now? (y/n)', 'y'))) {
       result.token = { status: 'skipped', detail: 'skipped; run `minions setup github` or `minions auth github` later.' };
     } else {
       for (let attempt = 1; attempt <= 2 && !tokenOk; attempt++) {
@@ -309,7 +317,9 @@ export async function runGithubSetup(opts: GithubSetupOptions): Promise<GithubSe
   }
 
   // 4. Delivery mode (needs a working token; never offered when the profile denies git.push).
-  if (tokenOk && !state.pushDenied && state.deliveryMode) {
+  if (opts.skipDelivery) {
+    // The caller asks the delivery mode.
+  } else if (tokenOk && !state.pushDenied && state.deliveryMode) {
     io.info('Delivery: pull-request (recommended: push agent/<slug> and open one PR, never merged), branch (push only), or local.');
     const def = state.deliveryMode === 'local' ? 'pull-request' : state.deliveryMode;
     let mode: MinionsConfig['delivery']['mode'] | null = null;
@@ -341,9 +351,8 @@ export function formatGithubSetup(r: GithubSetupResult): string {
   return L.join('\n');
 }
 
-/** `minions setup github`: the same guided flow, standalone. */
-export function registerGithubSetup(program: Command): Command {
-  const setup = program.command('setup').description('Guided setup steps for an initialized project');
+/** `minions setup github`: the same guided flow, standalone (a subcommand of `minions setup`). */
+export function registerGithubSetup(setup: Command): Command {
   setup.command('github')
     .description('Guided GitHub setup: remote, base branch on the remote, fine-grained token, delivery mode')
     .option('-y, --yes', 'never prompt, push or open a browser; print the next steps only')
@@ -352,7 +361,9 @@ export function registerGithubSetup(program: Command): Command {
       requireMode('host');
       const { json, dryRun } = globalOpts(cmd);
       const ref = await projectForPath(process.cwd());
-      const interactive = !o.yes && !dryRun && !json && !!process.stdin.isTTY;
+      // `setup github --yes`: the parent `setup` command also defines --yes and parses it first.
+      const yesFlag = !!(o.yes || (cmd.optsWithGlobals() as { yes?: boolean }).yes);
+      const interactive = !yesFlag && !dryRun && !json && !!process.stdin.isTTY;
       const io = interactive ? readlineIO() : undefined;
       try {
         const r = await runGithubSetup({ projectId: ref.projectId, repoPath: ref.repoPath, io, yes: !interactive, skipIntro: true });

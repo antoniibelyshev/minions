@@ -1,5 +1,5 @@
 import { readFile } from 'node:fs/promises';
-import type { Command } from 'commander';
+import { Option, type Command } from 'commander';
 import { setIdempotencyStore, setReadyContext } from '../backlog/commands.js';
 import { openBacklog, writeBacklogConfig } from '../backlog/factory.js';
 import type { BacklogAdapter, IdempotencyStore } from '../backlog/types.js';
@@ -15,15 +15,18 @@ import { installTelegramPlugin } from '../telegram/install.js';
 import { formatTelegramProbe, probeTelegram } from '../telegram/probe.js';
 import { resolveChannel } from '../telegram/channel.js';
 import {
-  buildClaudeCommand, buildCoordinatorCommand, launchCoordinator, probeRuntime, readLaunchRecord, readMountedToken, runCoordinator, runtimeChannelFacts, syncCoordinator,
+  buildClaudeCommand, buildCoordinatorCommand, coordinatorWrapper, launchCoordinator, probeRuntime, readLaunchRecord, readMountedToken, RECOVERY_PROMPT,
+  restartCoordinator, runtimeChannelFacts, syncCoordinator,
 } from './coordinator.js';
 import { openDb, type Lease, type LeaseRole, type RuntimeDb } from './db.js';
+import { claimWithBrief, compactClaim, fetchBrief, recordSubmitted, submitResult, type CompactClaim } from './handoff.js';
 import { runHook } from './hooks.js';
 import { runtimePaths } from './paths.js';
 import { capacityOf, LEASE_ROLES, Scheduler } from './scheduler.js';
 import { gitCredential } from './github.js';
+import { ciStatus, formatCiStatus, formatSync, syncTasks } from './ci.js';
 import { exportWorkspace, importWorkspace, setupState } from './workspace.js';
-import { workspaceLayout } from './worktree.js';
+import { git, workspaceLayout } from './worktree.js';
 
 // ---------------------------------------------------------------- lazy runtime context
 
@@ -54,11 +57,17 @@ async function context() {
   return { config: cfg, db: getDb(), backlog: await getBacklog() };
 }
 
-const scheduler = async () => new Scheduler({ ...(await context()), layout: workspaceLayout() });
+/** Records a requested coordinator restart: last one in meta (as `sync` does) and a `coordinator-restart` event. */
+export const coordinatorRestartRecorder = (d: RuntimeDb) => (info: { at: string; reason: string; leases: string[]; recover?: boolean }): void => {
+  d.setMeta('coordinator_restart', JSON.stringify(info));
+  d.addEvent('coordinator-restart', null, info);
+};
+
+const scheduler = async () => new Scheduler({ ...(await context()), layout: workspaceLayout(), handoff: runtimePaths() });
 
 async function readInput(file?: string): Promise<string> {
   if (file && file !== '-') return readFile(file, 'utf8');
-  if (process.stdin.isTTY) throw new MinionsError('PRECONDITION', 'Expected the worker result on stdin.', 'Pipe the JSON in or pass --result-file <path>.');
+  if (process.stdin.isTTY) throw new MinionsError('PRECONDITION', 'Expected the worker result on stdin.', 'Pipe the JSON in, pass --result-file <path>, or (record) use --submitted.');
   const chunks: Buffer[] = [];
   for await (const c of process.stdin) chunks.push(c as Buffer);
   return Buffer.concat(chunks).toString('utf8');
@@ -163,22 +172,43 @@ export function register(program: Command): void {
 
   // work
   const work = program.command('work').description('Claim, record and release worker leases (container only)');
-  work.command('claim <taskId>').description('Claim a task for a worker role; returns the task brief')
+  work.command('claim <taskId>').description('Claim a task for a worker role; returns the task brief (stored for `work brief`)')
     .requiredOption('--role <role>', 'engineer | tester | reviewer')
     .option('--holder <holder>', 'who holds the lease (default: this process)')
-    .action(action(async (taskId: string, o: { role: string; holder?: string }, cmd: Command) => {
+    .option('--compact', 'print only leaseId, briefMarker, task, role, attempt, branch, worktree, expectedHead (the worker fetches the full brief)')
+    .action(action(async (taskId: string, o: { role: string; holder?: string; compact?: boolean }, cmd: Command) => {
       requireMode('runtime');
       if (!(LEASE_ROLES as readonly string[]).includes(o.role)) throw new MinionsError('PRECONDITION', `--role must be engineer, tester or reviewer (got ${o.role}).`);
-      const brief = await (await scheduler()).claim(taskId, o.role as LeaseRole, { holder: o.holder });
-      emit(brief, { json: globalOpts(cmd).json, human: (b) => `${b.briefMarker}\n${JSON.stringify(b, null, 2)}` });
+      const brief = await claimWithBrief(await scheduler(), runtimePaths(), taskId, o.role as LeaseRole, { holder: o.holder });
+      if (o.compact) emit(compactClaim(brief), { json: globalOpts(cmd).json, human: (c: CompactClaim) => `${c.briefMarker}\nworktree: ${c.worktree}\nbranch: ${c.branch} @ ${c.expectedHead}` });
+      else emit(brief, { json: globalOpts(cmd).json, human: (b) => `${b.briefMarker}\n${JSON.stringify(b, null, 2)}` });
     }));
-  work.command('record <leaseId>').description('Record a worker result (JSON on stdin or --result-file)')
+  work.command('brief <leaseId>').description('Worker: fetch the full brief of your own lease (run from inside its worktree)')
+    .requiredOption('--role <role>', 'your role: engineer | tester | reviewer')
+    .action(action(async (leaseId: string, o: { role: string }, cmd: Command) => {
+      requireMode('runtime');
+      const b = await fetchBrief(getDb(), runtimePaths(), leaseId, { role: o.role, cwd: process.cwd() });
+      emit(b, { json: globalOpts(cmd).json, human: (x) => JSON.stringify(x, null, 2) });
+    }));
+  work.command('submit <leaseId>').description('Worker: submit your WorkerResult JSON (stdin or --result-file) for the coordinator to record')
+    .requiredOption('--role <role>', 'your role: engineer | tester | reviewer')
     .option('--result-file <path>', 'read the WorkerResult from a file ("-" = stdin)')
-    .option('--correction', 'the single allowed correction after an invalid result')
-    .action(action(async (leaseId: string, o: { resultFile?: string; correction?: boolean }, cmd: Command) => {
+    .action(action(async (leaseId: string, o: { role: string; resultFile?: string }, cmd: Command) => {
       requireMode('runtime');
       const raw = await readInput(o.resultFile);
-      const r = await (await scheduler()).record(leaseId, raw, { correction: !!o.correction });
+      const r = await submitResult(getDb(), runtimePaths(), leaseId, raw, { role: o.role, cwd: process.cwd() });
+      emit(r, { json: globalOpts(cmd).json, human: (d) => d.message });
+    }));
+  work.command('record <leaseId>').description('Record a worker result (submitted file, JSON on stdin, or --result-file)')
+    .option('--submitted', 'record the result the worker stored with `minions work submit` (no JSON passes through the coordinator)')
+    .option('--result-file <path>', 'read the WorkerResult from a file ("-" = stdin)')
+    .option('--correction', 'the single allowed correction after an invalid result')
+    .action(action(async (leaseId: string, o: { submitted?: boolean; resultFile?: string; correction?: boolean }, cmd: Command) => {
+      requireMode('runtime');
+      if (o.submitted && o.resultFile) throw new MinionsError('PRECONDITION', 'Use --submitted or --result-file, not both.');
+      const r = o.submitted
+        ? await recordSubmitted(await scheduler(), runtimePaths(), leaseId, { correction: !!o.correction })
+        : await (await scheduler()).record(leaseId, await readInput(o.resultFile), { correction: !!o.correction });
       emit(r, { json: globalOpts(cmd).json, human: (d) => [d.message, ...(d.errors ?? []).map((e: string) => `  - ${e}`)].join('\n') });
     }));
   work.command('release <leaseId>').description('Release a lease without a result (worktree is kept)')
@@ -219,6 +249,8 @@ export function register(program: Command): void {
     .action(async () => { await runHook('stop', hookLoader); process.exitCode = 0; });
   hook.command('pre-agent').description('PreToolUse(Agent) hook: minions workers need an active lease')
     .action(async () => { await runHook('pre-agent', hookLoader); process.exitCode = 0; });
+  hook.command('pre-telegram').description('PreToolUse(Telegram tools) hook: only the coordinator itself may use them, never a subagent')
+    .action(async () => { await runHook('pre-telegram', hookLoader); process.exitCode = 0; });
 
   // coordinator
   const coord = program.command('coordinator').description('Launch or attach the coordinator Claude Code session (tmux)')
@@ -240,9 +272,10 @@ export function register(program: Command): void {
       process.exitCode = await launchCoordinator(cfg);
     }));
   coord.command('run').description('Exec wrapper started by tmux: decides Telegram, then runs claude (container only)')
-    .action(action(async () => {
+    .option('--recover', 'start claude with the recovery prompt (recover skill, then resume the queue)')
+    .action(action(async (o: { recover?: boolean }) => {
       requireMode('runtime');
-      process.exitCode = await runCoordinator(await getConfig());
+      process.exitCode = await coordinatorWrapper(getConfig, o.recover ? { startupPrompt: RECOVERY_PROMPT } : {});
     }));
   coord.command('sync').description('Apply restart-required Telegram changes with a controlled coordinator restart (container only)')
     .option('--force', 'restart even while worker leases are active (they stay recorded for recovery)')
@@ -253,6 +286,18 @@ export function register(program: Command): void {
       const r = await syncCoordinator(await getConfig(), {
         activeLeases: () => d.activeLeases(),
         recordRestart: (info) => d.setMeta('coordinator_restart', JSON.stringify(info)),
+      }, o);
+      emit(r, { json: globalOpts(cmd).json, human: (x: typeof r) => `coordinator: ${x.action} (${x.reason})` });
+    }));
+  coord.command('restart').description('Kill the coordinator session and relaunch it detached (container only; used by the host upgrade)')
+    .option('--recover', 'start with the recovery prompt: reconcile leases, re-dispatch, resume the queue')
+    .option('--force', 'restart even while worker leases are active (they stay recorded for recovery)')
+    .action(action(async (o: { force?: boolean; recover?: boolean }, cmd: Command) => {
+      requireMode('runtime');
+      const d = getDb();
+      const r = await restartCoordinator(await getConfig(), {
+        activeLeases: () => d.activeLeases(),
+        recordRestart: coordinatorRestartRecorder(d),
       }, o);
       emit(r, { json: globalOpts(cmd).json, human: (x: typeof r) => `coordinator: ${x.action} (${x.reason})` });
     }));
@@ -306,12 +351,15 @@ export function register(program: Command): void {
 
   // git credential helper (configured per repository by `workspace import` when a token is mounted).
   // Reads the mounted token at use time; answers only `get` for https://github.com; no JSON envelope.
+  // The hidden --token-file takes a file path only (tests point it away from the real mount); the
+  // token value itself is never accepted on argv or via the environment.
   program.command('git-credential <operation>', { hidden: true })
     .description('git credential helper for https://github.com backed by the mounted GitHub token')
-    .action(async (operation: string) => {
+    .addOption(new Option('--token-file <path>', 'read the token from this file instead of the mounted secret').hideHelp())
+    .action(async (operation: string, o: { tokenFile?: string }) => {
       const chunks: Buffer[] = [];
       if (!process.stdin.isTTY) for await (const c of process.stdin) chunks.push(c as Buffer);
-      const r = await gitCredential(operation, Buffer.concat(chunks).toString('utf8'));
+      const r = await gitCredential(operation, Buffer.concat(chunks).toString('utf8'), { tokenFile: o.tokenFile });
       if (r.stderr) process.stderr.write(r.stderr + '\n');
       if (r.stdout) process.stdout.write(r.stdout);
       process.exitCode = 0;
@@ -321,6 +369,25 @@ export function register(program: Command): void {
       requireMode('runtime');
       const r = await exportWorkspace(out, { base: (await getConfig()).git.baseBranch });
       emit(r, { json: globalOpts(cmd).json, human: (d) => `Wrote ${d.path}\n${d.refs.join('\n')}` });
+    }));
+
+  // sync: one-shot refresh of PR state and CI check results (no polling loop); host delegates.
+  program.command('sync [taskIds...]').description('Refresh pull-request state and CI check results for tasks with a PR; reconcile merged/closed PRs (read-only on GitHub)')
+    .action(action(async (taskIds: string[], _o: unknown, cmd: Command) => {
+      if (runtimeMode() === 'host') return delegate(cmd);
+      const { db: d, backlog: b, config: cfg } = await context();
+      const r = await syncTasks({ db: d, backlog: b, config: cfg }, { taskIds });
+      emit(r, { json: globalOpts(cmd).json, human: formatSync });
+      if (r.failed) process.exitCode = 1;
+    }));
+
+  // ci: read-only required-checks status for the base branch (used by `minions doctor`).
+  const ci = program.command('ci').description('CI awareness (read-only; minions never creates workflows or changes branch protection)');
+  ci.command('status').description('Report required status checks on the base branch and the external CI setup plan')
+    .action(action(async (_o: unknown, cmd: Command) => {
+      if (runtimeMode() === 'host') return delegate(cmd);
+      const r = await ciStatus(workspaceLayout().repo, await getConfig(), { git });
+      emit(r, { json: globalOpts(cmd).json, human: formatCiStatus });
     }));
 
   // status / pause / resume (host mode delegates to the container)

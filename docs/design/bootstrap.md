@@ -9,7 +9,7 @@ reported as unavailable by `doctor` and the wizard, never faked.
 
 In:
 - Host CLI: `init [path]`, `doctor`, `start`, `down`, `status`, `pause`, `resume`,
-  `import`, `export`, `config show`, `auth show|set|refresh`, `auth github`, `auth telegram`, `channel show|set`, `runtime show|set`, `setup github`, `uninstall`. All support `--json`; mutating ones `--dry-run`.
+  `import`, `export`, `config show`, `auth show|set|refresh`, `auth github`, `auth telegram`, `channel show|set`, `runtime show|set`, `setup [path]` (guided; subcommands `setup github`, `setup assist`), `upgrade`, `uninstall`. All support `--json`; mutating ones `--dry-run`.
 - Runtime CLI (inside container): `backlog ready|list|show|create|update|note`,
   `work claim|record|release|list`, `hook stop|pre-agent`, `coordinator`, `status`, `pause`, `resume`.
 - Profiles `project-owner`, `personal-work`, `supervised`; shared + private visibility.
@@ -29,7 +29,7 @@ In:
   Global default in `<MINIONS_HOME>/defaults.json`.
 
 Deferred (report as unavailable): GitHub Issues backend, auto-merge and merge requests,
-review publication, config plan/apply transactions, backlog migration, upgrade,
+review publication, config plan/apply transactions, backlog migration, upgrade plan and schema migration,
 budgets, companion containers.
 
 ## Recorded low-impact decisions
@@ -50,7 +50,7 @@ budgets, companion containers.
 
 A per-project fine-grained personal access token, provisioned only by the host CLI
 (`src/host/credentials.ts`). Inside the container git and gh use it (see "GitHub in the
-container"), and branch/pull-request delivery publishes with it; CI observation is a later task.
+container"), and branch/pull-request delivery publishes with it; `minions sync` and doctor read PR and CI state with it (read-only, see "CI awareness").
 
 - **Entry.** `minions auth github`, or the guided GitHub setup (see "GitHub setup"), reads the token from the host terminal in raw mode with
   no echo, or from a pipe with `--stdin`. There is no `--token` flag; the token is never in argv,
@@ -340,6 +340,165 @@ Decision record for running agents without Docker (`src/host/runtime.ts`, `src/h
   interactively or `--yes`; a `defaults.json` runtime of host is never inherited non-interactively.
 - **`requireMode` is UX, not a boundary.** It reads `MINIONS_RUNTIME`, which an agent can unset inside
   its sandboxed shell; host-control files are protected by the sandbox write policy and Edit denies.
+## CI awareness
+
+Decision record for required-checks readiness, `minions sync` and CI setup guidance
+(`src/runtime/ci.ts`, `ci.requiredChecks` in `src/host/doctor.ts`).
+
+- **Read-only.** Every GitHub call is a GET: `gh api --method GET` in the container (the gh wrapper
+  injects the token), or a plain `fetch` GET with the stored token on the host. minions never creates
+  workflows, never edits branch protection or rulesets, and never merges.
+- **Required checks.** Union of classic branch protection (`GET /repos/{repo}/branches/{base}`,
+  `protection.required_status_checks` unless `enforcement_level` is `off`; readable with repository
+  read access, so no Administration permission is needed) and rulesets (`GET
+  /repos/{repo}/rules/branches/{base}`, rules of type `required_status_checks`; 404 = no rulesets).
+  `GET /repos/{repo}/actions/workflows` counts workflows. `configured` = at least one required check;
+  `none` only when both sources were read; otherwise `unknown` (never treated as "none").
+- **doctor.** `ci.requiredChecks` runs `minions ci status --json` in a running container; when that is
+  unavailable (container stopped, older image) it falls back to host GETs if the GitHub credential is
+  `ok`. Mapping to `delivery.requiredChecksConfigured`: checks present → `ok` (hint to set the flag
+  when it is false); none and flag false → `unavailable` ("usable for local work and pull-request
+  delivery; automatic merge unavailable") with the setup plan as hint; none but flag true → `warn`
+  (never treated as zero required checks); unknown → `warn`. Never `fail`: no CI does not make doctor
+  unhealthy.
+- **Setup plan.** `ciSetupPlan` prints step-by-step external setup (add a workflow running the
+  configured verification commands, let it report once, mark it required in branch protection or a
+  ruleset, then set `delivery.requiredChecksConfigured`). Shown by `minions init` (external setup,
+  GitHub remotes only; no workflow step when `.github/workflows` exists), by doctor, and by
+  `minions ci status`. The installer never writes workflow files.
+- **`minions sync [taskIds...]`.** One explicit pass (no LLM polling loop), host delegates into the
+  container. For tasks with a `prUrl` (default: all except `done`/`cancelled`) it runs `gh pr view
+  <url> --json …statusCheckRollup` and summarizes checks: `no-checks`, `awaiting-ci` (any check pending),
+  `failing` (failure/timed-out/cancelled/action-required/startup-failure/stale, or status
+  failure/error), `passing`. The observation is recorded as `ci` evidence bound to the PR head SHA
+  (outcome `<prState>:<ciState>`, details JSON), plus a `ci-observation` event; a task note is added
+  only when the outcome changes. Open PRs keep their status (`delivered`; a failing PR is reported,
+  not reworked automatically). Reconciliation: `MERGED` → `done`; `CLOSED` without merge → `blocked`
+  with a note (only from `delivered`/`awaiting-ci`/`merging`); tasks with an active lease are never
+  moved. A PR head differing from the approved publication head is reported as a warning. Per-task gh
+  failures are reported and the command exits 1; nothing is thrown away.
+
+## Guided setup
+
+Decision record for `minions setup` (`src/host/setup.ts`).
+
+- **One command, existing code.** `setup` runs `runInit` (wizard, plan, apply) with `skipIntegrations`:
+  the wizard skips its delivery, channel, and token questions, and init does not offer the token prompts.
+  Setup then asks them in order: GitHub (in a terminal, the guided flow of `minions setup github`,
+  `runGithubSetup` with `skipDelivery`: remote, base branch, pre-filled token link, hidden token prompt;
+  a piped token goes straight to `provisionGithubToken`; then setup's own delivery-mode question), CI
+  (read-only `requiredChecksStatus` with the stored token, plus `ciSetupPlan`), auto-merge (shown as
+  not available yet, default no, nothing written), and Telegram (`provisionTelegramToken`, pairing
+  instructions; skipped in the host runtime, which has no Telegram; with channel `auto` a stored token
+  keeps `auto`). Runtime start, import, and coordinator launch reuse the `minions start` code
+  (`ensureUp` / `ensureHost`, `importRepo`, Telegram plugin install, and `coordinator sync
+  --start-detached`) through the `SetupRuntime` seam, which tests replace with a fake. The runtime
+  (`--runtime`, or the wizard's question with its typed confirmation for `host`) and the Claude
+  authorization method are init wizard questions.
+- **One `setup` command.** Bare `minions setup [path]` is the guided flow; `minions setup github` and
+  `minions setup assist` are its subcommands (`--yes` / `--dry-run` after the subcommand name are
+  parsed by `setup` and read by the subcommand through `optsWithGlobals`). In a terminal the guided flow ends by offering the setup assistant (`offerSetupAssistant`,
+  opt out with `--no-assistant`); when the assistant is not launched it then offers to attach.
+- **Where choices go.** Integration choices that differ from the project configuration
+  (`delivery.mode`/`delivery.provider`, `communication.channel`) are written to the host-only
+  `config.local.json`. They are never written into the shared `.minions/config.json`, because a token is
+  personal and another clone may not have one. After a change, setup reruns `runInit --yes`, the same
+  path as a rerun of init, so the plugin and runtime config are regenerated with the new layer.
+- **Defaults.** Optional integrations (GitHub, CI, auto-merge, Telegram) default to no. Core steps
+  (apply the plan, start the container, import, launch, attach) default to yes. `--yes` takes the
+  defaults. A token piped with `--github-token-stdin` / `--telegram-token-stdin` enables that
+  integration; an empty piped token is an error (non-zero exit, nothing changed). `--delivery` is
+  honoured only when it is selectable.
+- **Init options.** `--config <file>`, `--attach` and `--new-identity` are forwarded to `runInit` with
+  the same semantics as `minions init`, so `./install.sh path --config cfg.json` keeps working. With
+  `--config` the init wizard, the keep/change question, the delivery-mode question and the
+  "Set up Telegram?" question are skipped (the file sets `delivery.mode` and
+  `communication.channel`); token questions are still asked in a terminal, and like init, `--config`
+  works without a terminal. The coordinator-attach opt-out is `--no-attach-coordinator` because
+  `--attach` has init's meaning.
+- **Idempotent rerun.** Setup detects the registered project and offers keep or change (change reruns
+  the wizard with the existing values as defaults; visibility stays as installed). For a stored GitHub
+  token it offers keep, change, or remove. For Telegram it offers keep, change, or disable. A running
+  container is reused, and an imported repository is kept unless you ask to import again. Keeping
+  every answer writes nothing.
+- **Unknown required checks.** `ciSetupPlan` treats `hasWorkflows: null` as missing, so setup always
+  passes a boolean: local `.github/workflows` files, or GitHub's workflow count when that is readable.
+  Required checks that cannot be read (no token, API error) are reported as `unknown`, never as `none`,
+  and the plan is labelled conditional.
+- **Never.** Setup never writes workflow files, never changes branch protection, never sets
+  `delivery.requiredChecksConfigured`, and never enables auto-merge. Secrets are read only through the
+  non-echoing prompt or stdin. They never come from argv and never appear in output, notes, or prompts.
+  Setup cannot approve Telegram pairing; it prints the `/telegram:access` steps for the coordinator
+  terminal.
+
+## Upgrade
+
+`minions upgrade` (host, `src/host/upgrade.ts`) moves a project onto the installed minions package
+without losing progress. The host drives the container through `docker compose exec`; lease and pause
+state stay in the runtime DB in the state volume. Bringing the host checkout and the installed CLI up to
+date is the source phase. It runs before everything else (see "Upgrade from the container" below).
+
+- **Order.** Preflight (read-only) → `pause --starts` → drain → regenerate derived files → image →
+  materialize secrets → `compose up --force-recreate` → `workspace setup` → `importRepo` (refreshes
+  the clone, which is never re-cloned, and configures origin) → `resume --starts` → `coordinator restart --recover`.
+- **Drain.** Workers are Agent subagents of the coordinator's claude process, so draining means
+  waiting until their leases end (recorded or released by the coordinator) while no new stage can
+  start. The wait is up to `--timeout` seconds (default 1800). When it runs out, the default aborts:
+  starts are resumed and the container is left alone. With `--now` the remaining leases are released
+  and reported as `interrupted`, and the recovery prompt re-dispatches them. `--now` on its own means
+  no wait at all.
+- **Image.** The image is rebuilt only when its `minions.build` label differs from the package
+  fingerprint (`ensureImage`).
+- **Pause ownership.** Starts that the user paused before the upgrade stay paused. A pause made by an
+  upgrade is recorded in `projects/<id>/upgrade.json` until it is resumed, so a rerun after a failure
+  still resumes it.
+- **Resume before restart.** The recovery prompt dispatches only when starts are not paused.
+- **Failures.** A failure before the recreate resumes starts and changes nothing else. A failed
+  recreate keeps the volumes and points to a rerun. After the recreate, each remaining step is still
+  attempted and failures are reported (`ok: false`, exit code 1).
+- **Volumes.** The upgrade never runs `down -v` or volume commands. `--dry-run` only reads (compose
+  ps, image inspect, `minions status`) and lists every step.
+- **Host runtime.** Not supported: `minions upgrade` refuses with `PRECONDITION` for a project on the
+  host runtime (there is no image or container to move). Install the new CLI, let workers finish
+  (`minions status`, or `minions pause --starts`), then `minions down && minions start`, which
+  regenerates the plugin, shim and sandbox settings and restarts the coordinator.
+
+### Upgrade from the container
+
+The source phase (`src/host/upgrade-source.ts`) adds two steps, `sync` and `cli`, ahead of
+`preflight`. Both finish before any pause, drain or recreate.
+
+- **`--from-container [branch]`** runs `exportRepo`, then moves `branch` (default: the base branch) to
+  `refs/remotes/minions/<base>`. The move happens only when `git merge-base --is-ancestor` holds and
+  `git status --porcelain` is empty. That check covers the repository's worktree and the worktree that
+  has the branch checked out; untracked files count as dirty. If the branch is checked out, the move is
+  `merge --ff-only`. Otherwise it is `update-ref <ref> <new> <old>`, a compare-and-swap with a reflog
+  entry. A dirty tree refuses with `PRECONDITION` and a divergence refuses with `CONFLICT`. Neither
+  changes anything. A branch that is already up to date or ahead is left alone. Nothing here forces,
+  resets, stashes or checks out. `--dry-run` does not export; it checks against the refs from the last
+  export and reports a refusal as a failed step.
+- **Installed CLI vs checkout.** This check runs only when the project repository is a minions
+  checkout. `esbuild.config.mjs` writes `dist/build.json` = `{version, source, kind}`. `source` is
+  `scripts/source-fingerprint.mjs`, a hash of `src/ templates/ docker/ scripts/` plus the package,
+  lock and esbuild files, regular files only. The upgrade recomputes that hash on the checkout and
+  compares it, together with the version, against the global install at `<npm root -g>/minions`.
+- **Install kinds and what happens.** A symlink is a `link` (`npm install -g <dir>`). If it points at the
+  checkout, the upgrade rebuilds it (`npm run build`, or `npm ci` when build deps are missing). A real
+  directory stamped `kind: packed` comes from `install.sh`, which exports `MINIONS_BUILD_KIND=packed`.
+  The upgrade reinstalls it in place: `npm pack` of the checkout into a temp dir, then
+  `npm install -g <tgz>`. A real directory whose `npm ls -g --long` `resolved` or package.json
+  `_resolved`/`_from` is a git spec is a `git` install. Any other real directory is `unknown`; npm 10
+  records nothing that tells a git-URL install from a tarball install. For `git`, `unknown`, a link
+  elsewhere, or a missing install, the upgrade does not touch npm. It prints
+  `cd <checkout> && npm ci && MINIONS_BUILD_KIND=packed npm pack && npm uninstall -g minions && npm install -g ./minions-<v>.tgz`
+  plus the rerun command and stops (`stopped`, `ok: false`, exit 1).
+- **No self-continuation (task-3 decision).** The running CLI never runs container steps from a
+  package it just replaced. After a rebuild or reinstall it re-checks the install, then runs
+  `node <installed>/dist/cli.js --json upgrade [--timeout N] [--now]` with `MINIONS_UPGRADE_HANDOFF=1`
+  and returns that result, source steps first, with `continued: true`. Under the hand-off variable a
+  CLI that still differs stops with the command instead of reinstalling again.
+- **Trust.** Rebuilding runs the checkout's build scripts on the host. With `--from-container`, that
+  code comes from agent branches the user chose to take.
 
 ## Telegram bot token
 
@@ -413,6 +572,8 @@ templates/plugin/            plugin sources (see "Plugin")
 templates/assistant/         setup assistant instructions and skill (see "Setup assistant")
 docker/Dockerfile  docker/entrypoint.sh
 test/                        vitest unit tests; test/docker/ opt-in (MINIONS_DOCKER_TESTS=1)
+scripts/prepare.mjs          npm prepare hook: builds dist/ on git-URL installs (`npm install -g github:…`)
+scripts/verify-git-install.sh  offline check of the git-URL install into a temp prefix (`npm run verify:git-install`)
 ```
 
 `minions` decides its mode by `MINIONS_RUNTIME`: unset = host CLI, `container` (set in the image),
@@ -586,6 +747,23 @@ Scheduler rules:
   When repairs ≥ `maxRepairCyclesBeforeReplan`, response includes `replan: true` and status →
   awaiting-human. Records evidence keyed by head SHA + config revision. Releases the lease.
 - `work release <leaseId> --reason` releases without a result (worktree kept).
+- File hand-offs (coordinator context diet). `work claim` also stores the brief at
+  `/state/briefs/<leaseId>.json`; `--compact` prints only leaseId, briefMarker, taskId, title, role,
+  attempt, branch, worktree, expectedHead and the brief command. `work brief <leaseId> --role <role>`
+  returns the stored brief and `work submit <leaseId> --role <role>` (stdin/--result-file) writes the raw
+  result to `/state/results/<leaseId>.json`; `work record <leaseId> --submitted [--correction]` records
+  that file through the same `record` path (same validation, stale-head checks, one correction). An
+  invalid submission is renamed to `<leaseId>.rejected.json`, so a correction needs a fresh submit; a
+  final record (valid or unvalidated) deletes the file (the DB keeps `result_json`). A missing file is
+  `NOT_FOUND` with a hint. Stdin/--result-file recording is unchanged.
+  Decision (ownership): `brief` and `submit` require an active lease, the lease's role, and a cwd
+  (realpath) inside the lease's worktree. One active stage per task plus per-task worktrees mean a
+  worker in its own worktree can reach only its own lease; this is a misuse guard, not a security
+  boundary against a worker that deliberately `cd`s elsewhere (workers share one OS user). Lease ids are
+  shape-checked so they cannot escape the directories. No DB schema change: briefs and submissions are
+  files. The PreToolUse(Agent) hook is unchanged; prompts carry the marker, a `worktree:` line and notes.
+- `backlog list|ready --compact` (= `--fields id,title,status,priority,dependencies`) or
+  `--fields a,b` projects JSON task objects; unknown fields are `PRECONDITION`. Human output is unchanged.
 - New commits invalidate evidence: evidence lookups always filter by current head SHA.
 
 WorkerResult schema (spec §11): `{ status, summary, branch, headSha, modifiedPaths[], checks[{command,

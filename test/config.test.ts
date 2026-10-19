@@ -85,6 +85,17 @@ describe('validation', () => {
     expect(validateConfig({ ...d, models: { ...d.models, default: 'opus[1m]', allowed: ['opus[1m]'] } }).models.default).toBe('opus[1m]');
   });
 
+  it('validates communication.progress (reporting level) and defaults it to feature-level milestones', () => {
+    for (const p of ['project-owner', 'personal-work', 'supervised'] as const) {
+      expect(profileDefaults(p, ctx).config.communication.progress).toBe('milestones');
+    }
+    const d = defaults();
+    for (const progress of ['milestones', 'tasks', 'quiet']) {
+      expect(resolve({ defaults: d, project: { communication: { progress } } }).config.communication.progress).toBe(progress);
+    }
+    expect(fail(() => resolve({ defaults: d, project: { communication: { progress: 'stages' } } })).message).toContain('communication.progress');
+  });
+
   it('rejects wrong types with dotted path', () => {
     const e = fail(() => resolve({ defaults: defaults(), local: { container: { cpus: 'four' } } }));
     expect(e.message).toContain('container.cpus');

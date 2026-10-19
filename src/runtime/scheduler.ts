@@ -4,6 +4,7 @@ import { can } from '../config/capabilities.js';
 import type { MinionsConfig } from '../config/schema.js';
 import { MinionsError } from '../core/errors.js';
 import type { Lease, LeaseRole, PublicationState, RuntimeDb } from './db.js';
+import { removeLeaseFiles, type HandoffPaths } from './handoff.js';
 import { publishTask, type PublishInput, type PublishOutcome } from './publish.js';
 import { validateResult, type WorkerResult } from './results.js';
 import { BRANCH_PREFIX, branchFor, ensureBranchWorktree, ensureReviewWorktree, git, headOf, resolveBaseBranch, taskSlug, workspaceLayout, type WorkspaceLayout } from './worktree.js';
@@ -27,6 +28,8 @@ export interface SchedulerDeps {
   layout?: WorkspaceLayout;
   /** Branch/PR publisher (tests inject one with mocked git/gh). */
   publisher?: (input: PublishInput) => Promise<PublishOutcome>;
+  /** Where briefs and submitted results live; their files are removed whenever a lease ends. Omitted: no file cleanup. */
+  handoff?: HandoffPaths;
 }
 
 /** Result of a publication attempt (`minions work publish`, or embedded in a record response). */
@@ -119,10 +122,12 @@ export class Scheduler {
   readonly config: MinionsConfig;
   readonly layout: WorkspaceLayout;
   private readonly publisher: (input: PublishInput) => Promise<PublishOutcome>;
+  private readonly handoff: HandoffPaths | null;
 
   constructor(deps: SchedulerDeps) {
     this.db = deps.db; this.backlog = deps.backlog; this.config = deps.config;
     this.layout = deps.layout ?? workspaceLayout();
+    this.handoff = deps.handoff ?? null;
     this.publisher = deps.publisher ?? publishTask;
   }
 
@@ -219,6 +224,7 @@ export class Scheduler {
       }
     } catch (e) {
       this.endLease(leaseId, 'released', { reason: `claim failed: ${(e as Error).message}` });
+      await this.cleanupLeaseFiles(leaseId);
       throw e;
     }
 
@@ -302,17 +308,35 @@ export class Scheduler {
     return from;
   }
 
-  private activeLease(leaseId: string): Lease {
+  /**
+   * Removes the hand-off files (brief, submitted and rejected result) of an ended lease. Best-effort: a failed
+   * delete is logged as a `handoff-cleanup-error` event and never fails the transition.
+   */
+  private async cleanupLeaseFiles(leaseId: string): Promise<void> {
+    if (!this.handoff) return;
+    let errors: string[];
+    try { errors = await removeLeaseFiles(this.handoff, leaseId); } catch (e) { errors = [(e as Error).message]; }
+    if (errors.length) {
+      try { this.db.addEvent('handoff-cleanup-error', this.db.lease(leaseId)?.task_id ?? null, { leaseId, errors }); } catch { /* logging only */ }
+    }
+  }
+
+  /** Returns the active lease; for an ended lease, removes any leftover hand-off files and throws CONFLICT. */
+  async requireActive(leaseId: string): Promise<Lease> {
     const lease = this.db.lease(leaseId);
     if (!lease) throw new MinionsError('NOT_FOUND', `Lease ${leaseId} does not exist.`);
-    if (lease.status !== 'active') throw new MinionsError('CONFLICT', `Lease ${leaseId} already ended (${lease.status}).`);
+    if (lease.status !== 'active') {
+      await this.cleanupLeaseFiles(leaseId);
+      throw new MinionsError('CONFLICT', `Lease ${leaseId} already ended (${lease.status}).`);
+    }
     return lease;
   }
 
   /** Releases a lease without a result. The worktree and branch are always preserved. */
   async release(leaseId: string, reason: string): Promise<{ leaseId: string; taskId: string; worktree: string | null; branch: string | null; status: TaskStatus | null }> {
-    const lease = this.activeLease(leaseId);
+    const lease = await this.requireActive(leaseId);
     this.endLease(leaseId, 'released', { reason });
+    await this.cleanupLeaseFiles(leaseId);
     let status: TaskStatus | null = null;
     try {
       status = (await this.restoreAfterEngineer(lease)) ?? (await this.backlog.getTask(lease.task_id)).status;
@@ -325,7 +349,7 @@ export class Scheduler {
 
   /** Validates and records a worker result, applies the transition and releases the lease. */
   async record(leaseId: string, raw: unknown, opts: { correction?: boolean } = {}): Promise<RecordResponse> {
-    const lease = this.activeLease(leaseId);
+    const lease = await this.requireActive(leaseId);
     const base = { leaseId, taskId: lease.task_id, role: lease.role, approved: false, replan: false, needsSplit: false };
     if (lease.result_valid === 0 && !opts.correction) {
       throw new MinionsError('PRECONDITION', `Lease ${leaseId} has an invalid result awaiting correction.`, 'Re-record with --correction (one correction is allowed).');
@@ -362,6 +386,7 @@ export class Scheduler {
           message: 'Result rejected; one bounded correction is allowed: fix the listed fields and re-record with --correction.' };
       }
       this.endLease(leaseId, 'unvalidated', { errors }, { json: rawText, valid: 0 });
+      await this.cleanupLeaseFiles(leaseId);
       try { await this.restoreAfterEngineer(lease); } catch (e) {
         this.db.addEvent('record-backlog-error', lease.task_id, { leaseId, error: (e as Error).message });
       }
@@ -426,6 +451,7 @@ export class Scheduler {
       if (publish) this.db.upsertPublication({ task_id: task.id, branch: lease.branch!, head_sha: head, mode: cfg.delivery.mode, config_revision: cfg.configRevision });
       this.endLease(leaseId, 'completed', { from, to, approved, replan, needsSplit, publish }, { json: JSON.stringify(r), valid: 1 });
     });
+    await this.cleanupLeaseFiles(leaseId);
     try {
       await this.backlog.addNote(task.id, `minions: ${lease.role} ${r.status}${r.verdict ? ` (${r.verdict})` : ''} at ${head.slice(0, 12)}: ${r.summary}`);
     } catch (e) {

@@ -1,6 +1,6 @@
 ---
 name: tester
-description: Minions tester. Verifies an implemented task on its branch after the engineer, may add in-scope tests, commits them, and returns a WorkerResult JSON. Launched only by the minions coordinator with a minions-lease brief.
+description: Minions tester. Verifies an implemented task on its branch after the engineer, may add in-scope tests, commits them, and submits a WorkerResult (minions work submit). Launched only by the minions coordinator with a minions-lease marker.
 tools: Read, Edit, Write, Grep, Glob, Bash
 disallowedTools: Agent
 model: {{workerModel}}{{workerEffortLine}}

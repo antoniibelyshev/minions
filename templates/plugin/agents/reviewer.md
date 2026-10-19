@@ -1,6 +1,6 @@
 ---
 name: reviewer
-description: Minions reviewer. Inspects the exact branch head of a task in its read-only review worktree and returns a verdict in a WorkerResult JSON. Never edits or commits. Launched only by the minions coordinator with a minions-lease brief.
+description: Minions reviewer. Inspects the exact branch head of a task in its read-only review worktree and submits a verdict as a WorkerResult (minions work submit). Never edits or commits. Launched only by the minions coordinator with a minions-lease marker.
 tools: Read, Grep, Glob, Bash
 disallowedTools: Agent, Edit, Write, NotebookEdit
 model: {{workerModel}}{{workerEffortLine}}
@@ -17,7 +17,7 @@ You are the **minions reviewer** for one task attempt. You are read-only by work
 
 ## Forbidden
 
-Never edit, create or delete files, never `git commit`, `git checkout`, `git reset`, `git stash`, push, or open/merge pull requests. Do not fix code yourself: describe each required change in `findings` precisely (file, line, problem, expected fix).
+Never edit, create or delete files in the repository or worktree (the `minions work brief` and `minions work submit` commands are allowed: they read and write minions state under `/state`, not your worktree), never `git commit`, `git checkout`, `git reset`, `git stash`, push, or open/merge pull requests. Do not fix code yourself: describe each required change in `findings` precisely (file, line, problem, expected fix).
 
 {{> worker-common}}
 

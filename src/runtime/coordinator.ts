@@ -1,6 +1,7 @@
 import { spawn as nodeSpawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
+import { readFile, rm } from 'node:fs/promises';
+import { constants as osConstants } from 'node:os';
 import type { MinionsConfig } from '../config/schema.js';
 import { MinionsError } from '../core/errors.js';
 import { run, type RunOptions, type RunResult } from '../core/exec.js';
@@ -9,6 +10,7 @@ import { existsSync, readdirSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, sep } from 'node:path';
 import { runtimeMode } from '../core/cli-helpers.js';
+import { redact } from '../core/output.js';
 import { CONTAINER, credentialStoreDir } from '../core/paths.js';
 import { probeTelegram, TELEGRAM_CHANNEL_SPEC, type TelegramProbeReport } from '../telegram/probe.js';
 import { checkTelegramTokenFormat } from '../telegram/token.js';
@@ -18,8 +20,31 @@ import { runtimePaths, type RuntimePaths } from './paths.js';
 export const TMUX_SESSION = 'coordinator';
 /** Environment variable the official Telegram plugin reads its bot token from. */
 export const TELEGRAM_TOKEN_ENV = 'TELEGRAM_BOT_TOKEN';
-/** Tools of the official plugin's MCP server (plugin MCP tools are named mcp__plugin_<plugin>_<server>__<tool>). */
-export const TELEGRAM_TOOLS = ['reply', 'react', 'edit_message'].map((t) => `mcp__plugin_telegram_telegram__${t}`);
+/**
+ * Prefix of the official plugin's MCP tools (mcp__plugin_<plugin>_<server>__<tool>). Confirmed in a live
+ * run with telegram@claude-plugins-official 0.0.7: reply, react, edit_message, download_attachment.
+ */
+export const TELEGRAM_TOOL_PREFIX = 'mcp__plugin_telegram_telegram__';
+/** Telegram tools the coordinator may use without a prompt. download_attachment still asks. */
+export const TELEGRAM_TOOLS = ['reply', 'react', 'edit_message'].map((t) => `${TELEGRAM_TOOL_PREFIX}${t}`);
+/** Every tool the plugin's MCP server exposes; all are coordinator-only. */
+export const TELEGRAM_ALL_TOOLS = [...TELEGRAM_TOOLS, `${TELEGRAM_TOOL_PREFIX}download_attachment`];
+/**
+ * PreToolUse hook (in --settings) for every Telegram tool: `minions hook pre-telegram` denies the call
+ * when it comes from any subagent (general-purpose, Explore, Plan, plugin or user agents). Permission
+ * rules cannot be scoped per agent, so the allow above would otherwise extend to subagents.
+ */
+export const TELEGRAM_HOOK_MATCHER = `${TELEGRAM_TOOL_PREFIX}.*`;
+export const TELEGRAM_HOOK_COMMAND = 'minions hook pre-telegram';
+
+/**
+ * First user message of a coordinator started by `minions coordinator restart --recover`: run the recover
+ * skill (reconcile leases left by the previous session, re-dispatch), then resume the queue. Fixed text, no
+ * secrets; the pause state still applies (orchestrate stops when starts are paused).
+ */
+export const RECOVERY_PROMPT = '/minions:recover The coordinator was just restarted (minions coordinator restart --recover). '
+  + 'Reconcile the leases left by the previous session, release those without a live worker, re-dispatch interrupted tasks, '
+  + 'then resume the queue with /minions:orchestrate. If starts are paused, report that instead of dispatching.';
 
 export interface CoordinatorCommand { cmd: string; args: string[]; cwd: string }
 export type Runner = (cmd: string, args: string[], opts?: RunOptions) => Promise<RunResult>;
@@ -270,6 +295,9 @@ export function coordinatorSettings(cfg: MinionsConfig, opts: { telegram?: boole
     },
     ...(auth === 'login' ? {} : { apiKeyHelper: opts.paths ? apiKeyHelperFor(opts.paths) : host ? apiKeyHelperFor(runtimePaths()) : API_KEY_HELPER }),
     ...(hs ? { sandbox: hs.sandbox } : {}),
+    ...(opts.telegram ? {
+      hooks: { PreToolUse: [{ matcher: TELEGRAM_HOOK_MATCHER, hooks: [{ type: 'command', command: TELEGRAM_HOOK_COMMAND }] }] },
+    } : {}),
   };
 }
 
@@ -297,13 +325,13 @@ async function readPrompt(paths: RuntimePaths): Promise<string> {
 /** `-L <socket>` for the host runtime's dedicated tmux server (never the user's default server). */
 export const tmuxBase = (paths: Pick<RuntimePaths, 'tmuxSocket'>) => (paths.tmuxSocket ? ['-L', paths.tmuxSocket] : []);
 
-export async function buildCoordinatorCommand(cfg: MinionsConfig, paths: RuntimePaths = runtimePaths(), opts: { detached?: boolean } = {}): Promise<CoordinatorCommand> {
+export async function buildCoordinatorCommand(cfg: MinionsConfig, paths: RuntimePaths = runtimePaths(), opts: { detached?: boolean; recover?: boolean } = {}): Promise<CoordinatorCommand> {
   assertNoBypass(cfg);
   await readPrompt(paths); // fail here (doctor --probe), not inside the tmux pane
   return {
     cmd: 'tmux',
     cwd: paths.repo,
-    args: [...tmuxBase(paths), '-u', 'new-session', opts.detached ? '-d' : '-A', '-s', TMUX_SESSION, '-c', paths.repo, '--', 'minions', 'coordinator', 'run'],
+    args: [...tmuxBase(paths), '-u', 'new-session', opts.detached ? '-d' : '-A', '-s', TMUX_SESSION, '-c', paths.repo, '--', 'minions', 'coordinator', 'run', ...(opts.recover ? ['--recover'] : [])],
   };
 }
 
@@ -324,8 +352,8 @@ Repository and user Claude Code settings, hooks and MCP servers are not loaded i
  */
 export const HOST_CLAUDE_FLAGS = ['--setting-sources=', '--strict-mcp-config'];
 
-/** argv of the coordinator's claude process. Never contains a secret. */
-export async function buildClaudeCommand(cfg: MinionsConfig, paths: RuntimePaths = runtimePaths(), opts: { telegram?: boolean } = {}): Promise<CoordinatorCommand> {
+/** argv of the coordinator's claude process. Never contains a secret. `startupPrompt` becomes the first user message. */
+export async function buildClaudeCommand(cfg: MinionsConfig, paths: RuntimePaths = runtimePaths(), opts: { telegram?: boolean; startupPrompt?: string } = {}): Promise<CoordinatorCommand> {
   assertNoBypass(cfg);
   const onHost = runtimeMode() === 'host-runtime';
   const prompt = await readPrompt(paths) + (onHost ? hostPromptNote(paths) : '');
@@ -346,6 +374,8 @@ export async function buildClaudeCommand(cfg: MinionsConfig, paths: RuntimePaths
       ...(cfg.models.effort ? ['--effort', cfg.models.effort] : []),
       '--settings', JSON.stringify(coordinatorSettings(cfg, { ...opts, paths })),
       ...(opts.telegram ? ['--channels', TELEGRAM_CHANNEL_SPEC] : []),
+      // After `--` so a variadic option (--channels) cannot swallow the prompt.
+      ...(opts.startupPrompt ? ['--', opts.startupPrompt] : []),
     ],
   };
 }
@@ -417,7 +447,29 @@ export interface SpawnLike {
   (cmd: string, args: string[], opts: { cwd: string; env: NodeJS.ProcessEnv; stdio: 'inherit'; shell: false }): {
     on(event: 'error', cb: (e: Error) => void): unknown;
     on(event: 'exit', cb: (code: number | null, signal: NodeJS.Signals | null) => void): unknown;
+    kill?(signal: NodeJS.Signals): unknown;
   };
+}
+
+/** The part of `process` the wrapper uses to manage signals (injectable for tests). */
+export interface SignalTarget {
+  on(signal: NodeJS.Signals, listener: () => void): unknown;
+  removeListener(signal: NodeJS.Signals, listener: () => void): unknown;
+}
+
+/**
+ * While claude runs, the wrapper ignores these: claude shares the pane's foreground process group and
+ * gets Ctrl-C / Ctrl-\ itself, so the wrapper must not die and end the tmux session.
+ */
+export const IGNORED_SIGNALS: NodeJS.Signals[] = ['SIGINT', 'SIGQUIT'];
+/** Forwarded to claude (tmux kill-session sends SIGHUP; docker stop / kill send SIGTERM). */
+export const FORWARDED_SIGNALS: NodeJS.Signals[] = ['SIGTERM', 'SIGHUP'];
+
+/** Shell convention: a child killed by signal n exits with 128+n. */
+export function exitCodeOf(code: number | null, signal: NodeJS.Signals | null): number {
+  if (code !== null) return code;
+  if (signal) return 128 + (osConstants.signals[signal] ?? 0);
+  return 1;
 }
 
 export interface RunCoordinatorDeps {
@@ -427,6 +479,9 @@ export interface RunCoordinatorDeps {
   probe?: () => Promise<TelegramProbeReport>;
   readText?: (p: string) => Promise<string>;
   log?: (line: string) => void;
+  signals?: SignalTarget;
+  /** First user message for claude (`coordinator run --recover` passes RECOVERY_PROMPT). */
+  startupPrompt?: string;
 }
 
 /**
@@ -448,18 +503,66 @@ export async function runCoordinator(cfg: MinionsConfig, deps: RunCoordinatorDep
   if (decision.enabled) log(`minions: ${decision.reason}`);
   else if (intended) log(`minions: Telegram disabled for this session: ${decision.reason}. Terminal mode is active.`);
   else if (cfg.communication.channel === 'auto') log(`minions: terminal mode (${decision.reason}).`);
-  const c = await buildClaudeCommand(cfg, paths, { telegram: decision.enabled });
+  const c = await buildClaudeCommand(cfg, paths, { telegram: decision.enabled, startupPrompt: deps.startupPrompt });
   const env: NodeJS.ProcessEnv = { ...(deps.env ?? process.env) };
   delete env[TELEGRAM_TOKEN_ENV];
   if (decision.enabled && token.state === 'ok') env[TELEGRAM_TOKEN_ENV] = token.token;
   const record: LaunchRecord = { version: 1, pid: process.pid, startedAt: new Date().toISOString(), fingerprint: launchFingerprint(cfg, token), channel: cfg.communication.channel, telegram: decision };
   await atomicWrite(paths.coordinatorLaunch, JSON.stringify(record, null, 2) + '\n').catch(() => { /* state not writable: restart detection degrades */ });
   const spawn = deps.spawn ?? (nodeSpawn as unknown as SpawnLike);
+  const signals = deps.signals ?? process;
   return new Promise((resolve, reject) => {
-    const child = spawn(c.cmd, c.args, { cwd: c.cwd, env, stdio: 'inherit', shell: false });
-    child.on('error', (e) => reject(new MinionsError('INCOMPATIBLE_RUNTIME', `Failed to start claude: ${e.message}`)));
-    child.on('exit', (code, signal) => resolve(code ?? (signal ? 128 : 1)));
+    const installed: [NodeJS.Signals, () => void][] = [];
+    const cleanup = () => { for (const [s, h] of installed.splice(0)) signals.removeListener(s, h); };
+    // Install before spawning so no window exists where Ctrl-C kills the wrapper but not claude.
+    for (const s of IGNORED_SIGNALS) installed.push([s, () => { /* claude handles it */ }]);
+    let child: ReturnType<SpawnLike> | undefined;
+    for (const s of FORWARDED_SIGNALS) installed.push([s, () => { try { child?.kill?.(s); } catch { /* already gone */ } }]);
+    for (const [s, h] of installed) signals.on(s, h);
+    try {
+      child = spawn(c.cmd, c.args, { cwd: c.cwd, env, stdio: 'inherit', shell: false });
+    } catch (e) {
+      cleanup();
+      reject(new MinionsError('INCOMPATIBLE_RUNTIME', `Failed to start claude: ${(e as Error).message}`));
+      return;
+    }
+    child.on('error', (e) => { cleanup(); reject(new MinionsError('INCOMPATIBLE_RUNTIME', `Failed to start claude: ${e.message}`)); });
+    child.on('exit', (code, signal) => { cleanup(); resolve(exitCodeOf(code, signal)); });
   });
+}
+
+export interface ExitRecord {
+  version: 1;
+  pid: number;
+  at: string;
+  code: number;
+  error?: string;
+}
+
+/**
+ * Entry point of `minions coordinator run`: loads the config, runs the wrapper, and records how it
+ * ended in /state/coordinator-exit.json (exit code or error message; never a secret) so a detached
+ * start can report a wrapper that died before anyone attached. Errors are rethrown for the pane.
+ */
+export async function coordinatorWrapper(loadConfig: () => Promise<MinionsConfig>, deps: RunCoordinatorDeps = {}): Promise<number> {
+  const paths = deps.paths ?? runtimePaths();
+  const write = (r: Omit<ExitRecord, 'version' | 'pid' | 'at'>) =>
+    atomicWrite(paths.coordinatorExit, JSON.stringify({ version: 1, pid: process.pid, at: new Date().toISOString(), ...r }, null, 2) + '\n').catch(() => { /* best effort */ });
+  try {
+    const code = await runCoordinator(await loadConfig(), deps);
+    await write({ code });
+    return code;
+  } catch (e) {
+    await write({ code: 1, error: redact((e as Error).message).slice(0, 1000) });
+    throw e;
+  }
+}
+
+export async function readExitRecord(paths: RuntimePaths = runtimePaths()): Promise<ExitRecord | null> {
+  try {
+    const v = JSON.parse(await readFile(paths.coordinatorExit, 'utf8')) as ExitRecord;
+    return v && v.version === 1 && typeof v.code === 'number' ? v : null;
+  } catch { return null; }
 }
 
 // ---------------------------------------------------------------- controlled restart
@@ -475,9 +578,15 @@ export interface SyncDeps {
   paths?: RuntimePaths;
   runner?: Runner;
   activeLeases: () => { id: string }[];
-  recordRestart?: (info: { at: string; reason: string; leases: string[] }) => void;
+  recordRestart?: (info: { at: string; reason: string; leases: string[]; recover?: boolean }) => void;
   readText?: (p: string) => Promise<string>;
+  /** How long a detached start waits before re-checking that the wrapper is still alive (default 2000ms). */
+  settleMs?: number;
+  sleep?: (ms: number) => Promise<void>;
 }
+
+/** Default wait before re-checking a detached start: covers config load, probe, and claude startup errors. */
+export const DETACHED_SETTLE_MS = 2000;
 
 const tmuxHas = async (runner: Runner, paths: RuntimePaths) => (await runner('tmux', [...tmuxBase(paths), 'has-session', '-t', TMUX_SESSION], { allowFailure: true, timeoutMs: 10_000 })).code === 0;
 
@@ -488,7 +597,7 @@ const tmuxHas = async (runner: Runner, paths: RuntimePaths) => (await runner('tm
  * the runtime DB for `recover`. `startDetached` then (re)starts the session without a terminal, so
  * Telegram works with nobody attached.
  */
-export async function syncCoordinator(cfg: MinionsConfig, deps: SyncDeps, opts: { force?: boolean; startDetached?: boolean } = {}): Promise<SyncResult> {
+export async function syncCoordinator(cfg: MinionsConfig, deps: SyncDeps, opts: { force?: boolean; startDetached?: boolean; restart?: boolean; recover?: boolean } = {}): Promise<SyncResult> {
   const paths = deps.paths ?? runtimePaths();
   const runner = deps.runner ?? run;
   let running = await tmuxHas(runner, paths);
@@ -497,15 +606,15 @@ export async function syncCoordinator(cfg: MinionsConfig, deps: SyncDeps, opts: 
   const rec = await readLaunchRecord(paths);
   let action: SyncResult['action'] = running ? 'unchanged' : 'none';
   let reason = running ? 'coordinator is running with the current Telegram configuration' : 'coordinator is not running';
-  if (running && rec && rec.fingerprint !== want) {
+  if (running && (opts.restart || (rec && rec.fingerprint !== want))) {
     const leases = deps.activeLeases().map((l) => l.id);
-    reason = rec.channel !== cfg.communication.channel
+    reason = !rec || rec.fingerprint === want ? 'restart requested' : rec.channel !== cfg.communication.channel
       ? `communication.channel changed (${rec.channel} -> ${cfg.communication.channel})`
       : 'Telegram configuration changed (bot token or network)';
     if (leases.length && !opts.force) {
-      return { action: 'restart-pending', running, reason: `${reason}; restart deferred: ${leases.length} active worker lease(s) (${leases.join(', ')}). Rerun with --force, or after they finish.`, telegram: rec.telegram };
+      return { action: 'restart-pending', running, reason: `${reason}; restart deferred: ${leases.length} active worker lease(s) (${leases.join(', ')}). Rerun with --force, or after they finish.`, telegram: rec?.telegram ?? null };
     }
-    deps.recordRestart?.({ at: new Date().toISOString(), reason, leases });
+    deps.recordRestart?.({ at: new Date().toISOString(), reason, leases, ...(opts.recover ? { recover: true } : {}) });
     await runner('tmux', [...tmuxBase(paths), 'kill-session', '-t', TMUX_SESSION], { allowFailure: true, timeoutMs: 10_000 });
     running = false;
     action = 'restarted';
@@ -513,13 +622,39 @@ export async function syncCoordinator(cfg: MinionsConfig, deps: SyncDeps, opts: 
     reason = 'coordinator is running without a launch record (started by an older minions); restart it to apply Telegram settings';
   }
   if (!running && opts.startDetached) {
-    const c = await buildCoordinatorCommand(cfg, paths, { detached: true });
+    if (opts.restart && action === 'none') deps.recordRestart?.({ at: new Date().toISOString(), reason: 'restart requested; coordinator was not running', leases: deps.activeLeases().map((l) => l.id), ...(opts.recover ? { recover: true } : {}) });
+    const c = await buildCoordinatorCommand(cfg, paths, { detached: true, recover: opts.recover });
+    await rm(paths.coordinatorExit, { force: true }).catch(() => { /* a stale record only weakens the message */ });
     const r = await runner(c.cmd, c.args, { cwd: c.cwd, allowFailure: true, timeoutMs: 30_000 });
     if (r.code !== 0) throw new MinionsError('INCOMPATIBLE_RUNTIME', `Failed to start the coordinator session: ${(r.stderr || r.stdout).trim().slice(0, 300)}`);
+    // tmux returns as soon as the session exists; a wrapper that fails right away takes the session with it.
+    await (deps.sleep ?? ((ms: number) => new Promise<void>((res) => setTimeout(res, ms))))(deps.settleMs ?? DETACHED_SETTLE_MS);
+    if (!(await tmuxHas(runner, paths))) {
+      const exit = await readExitRecord(paths);
+      const why = exit?.error ? exit.error : exit ? `minions coordinator run exited with code ${exit.code}` : 'no exit record was written';
+      throw new MinionsError('INCOMPATIBLE_RUNTIME', `The coordinator session exited right after starting: ${why}`,
+        'Run `minions coordinator` attached to see the full output.');
+    }
     running = true;
     if (action === 'none') { action = 'started'; reason = 'coordinator started detached'; } else reason += '; coordinator relaunched detached';
+    if (opts.recover) reason += ' with the recovery prompt';
   }
   return { action, running, reason, telegram: rec?.telegram ?? null };
+}
+
+/**
+ * `minions coordinator restart [--recover]` (the container-side entry point the host upgrade drives):
+ * kills the running coordinator session and relaunches it detached; with `recover` its first message
+ * runs the recover skill and resumes the queue. Refuses while worker leases are active in a running
+ * session (their workers would die) unless `force`; the leases stay recorded for recovery either way.
+ */
+export async function restartCoordinator(cfg: MinionsConfig, deps: SyncDeps, opts: { force?: boolean; recover?: boolean } = {}): Promise<SyncResult> {
+  const r = await syncCoordinator(cfg, deps, { ...opts, restart: true, startDetached: true });
+  if (r.action === 'restart-pending') {
+    throw new MinionsError('PRECONDITION', `Coordinator restart refused: ${r.reason}`,
+      'Wait for the workers to finish, or rerun with --force (their leases stay recorded for recovery).');
+  }
+  return r;
 }
 
 /** Verifies the installed Claude Code and tmux support what the launcher needs. */
@@ -556,6 +691,6 @@ export async function launchCoordinator(cfg: MinionsConfig, paths: RuntimePaths 
   return new Promise((resolve, reject) => {
     const child = nodeSpawn(c.cmd, c.args, { cwd: c.cwd, stdio: 'inherit', shell: false });
     child.on('error', (e) => reject(new MinionsError('INCOMPATIBLE_RUNTIME', `Failed to start tmux: ${e.message}`)));
-    child.on('exit', (code, signal) => resolve(code ?? (signal ? 128 : 1)));
+    child.on('exit', (code, signal) => resolve(exitCodeOf(code, signal)));
   });
 }

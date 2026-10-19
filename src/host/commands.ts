@@ -14,7 +14,7 @@ import {
   removeTelegramToken, telegramBotGuidance,
 } from './credentials.js';
 import { dockerProbe } from './discovery.js';
-import { Compose, ensureImage } from './docker.js';
+import { Compose, ensureImage, packageRoot } from './docker.js';
 import { formatDoctor, runDoctor } from './doctor.js';
 import { dockerUnavailable, formatInit, refreshDerived, runInit } from './install.js';
 import { loadEffectiveConfig, loadProjectJson } from './project.js';
@@ -26,6 +26,9 @@ import { HOST_CHANNEL_WARNING, formatChannelSet, hostChannel, offerAutoChannel, 
 import { formatChannel } from '../telegram/channel.js';
 import { githubStartHint, registerGithubSetup } from './github-setup.js';
 import { formatUninstall, runUninstall } from './uninstall.js';
+import { DELIVERY_MODES, formatSetup, runSetup, shellQuote, type DeliveryMode, type SetupRuntime } from './setup.js';
+import { DEFAULT_UPGRADE_TIMEOUT_SEC, formatUpgrade, runUpgrade } from './upgrade.js';
+import { HANDOFF_ENV, isMinionsCheckout, runSourcePhase } from './upgrade-source.js';
 import { readSecret, readlineIO } from './wizard.js';
 import { initMayOfferAssistant, launchAssistant, loadAssistantContext, offerSetupAssistant, registerAssistant } from './assistant.js';
 
@@ -37,8 +40,8 @@ async function requireDocker(): Promise<void> {
 }
 
 /** Loads the project for cwd, refreshes derived files, and returns a compose handle. */
-async function openProject(json: boolean) {
-  const { projectId } = await projectForPath(process.cwd());
+async function openProject(json: boolean, cwd: string = process.cwd()) {
+  const { projectId } = await projectForPath(cwd);
   const project = await loadProjectJson(projectId);
   const eff = await loadEffectiveConfig(project);
   for (const w of await refreshDerived(project, eff.config)) say(json, `warning: ${w}`);
@@ -81,10 +84,60 @@ const lastLine = (...parts: string[]) => {
 };
 
 async function readStdinSecret(): Promise<string> {
-  if (process.stdin.isTTY) throw new MinionsError('PRECONDITION', '--stdin expects the token on a pipe, not a terminal.', 'Omit --stdin to be prompted without echo.');
+  return (await readStdinLines(1))[0] ?? '';
+}
+
+/** First `n` lines of piped stdin (tokens are never accepted from argv). */
+async function readStdinLines(n: number): Promise<string[]> {
+  if (process.stdin.isTTY) throw new MinionsError('PRECONDITION', 'Token input on stdin expects a pipe, not a terminal.', 'Omit the stdin option to be prompted without echo.');
   let data = '';
-  for await (const chunk of process.stdin) { data += String(chunk); if (data.length > 4096) break; }
-  return data.split(/\r?\n/)[0] ?? '';
+  for await (const chunk of process.stdin) { data += String(chunk); if (data.length > 8192) break; }
+  return data.split(/\r?\n/).slice(0, n);
+}
+
+/**
+ * `minions setup` runtime steps, using the same code as `minions start` and `minions import`, for
+ * the project's runtime (Docker container, or the host runtime when the project uses it).
+ */
+function setupRuntime(json: boolean, cwd: string): SetupRuntime {
+  let opened: Awaited<ReturnType<typeof ensureUp>> | undefined;
+  let hostOpened: Awaited<ReturnType<typeof ensureHost>> | undefined;
+  const up = () => { if (!opened) throw new MinionsError('INTERNAL', 'container not started'); return opened; };
+  const isHost = async (projectId: string) => runtimeOf(await loadProjectJson(projectId)) === 'host';
+  return {
+    kind: async (projectId) => ((await isHost(projectId)) ? 'host' : 'docker'),
+    containerRunning: async (projectId) => ((await isHost(projectId))
+      ? new HostRuntime(await loadProjectJson(projectId)).isRunning().catch(() => false)
+      : new Compose(projectId).isRunning().catch(() => false)),
+    async start(projectId) {
+      if (await isHost(projectId)) hostOpened = await ensureHost(json, { provision: true, cwd });
+      else opened = await ensureUp(json, { provision: true, cwd });
+    },
+    repoPresent: async () => (hostOpened ? hostRepoPresent(hostOpened.host) : repoPresent(up().compose)),
+    importRepo: async () => {
+      const repoPath = (await projectForPath(cwd)).repoPath;
+      return hostOpened ? importRepo(hostOpened.project, { repoPath, target: hostOpened.host.transferTarget() }) : importRepo(up().project, { repoPath });
+    },
+    async launchCoordinator() {
+      if (hostOpened) {
+        // The host runtime has no Telegram: the session starts when the user attaches (`minions start`).
+        const r = await hostOpened.host.exec(['minions', 'coordinator', 'sync', '--json'], { allowFailure: true, timeoutMs: 60_000 });
+        try { return ((JSON.parse(r.stdout) as { data?: { action?: string; reason?: string } }).data ?? null); } catch {
+          say(json, `warning: coordinator sync failed: ${lastLine(r.stdout, r.stderr)}`);
+          return null;
+        }
+      }
+      const p = up();
+      const channel = await hostChannel(p.project, p.config);
+      // Started detached so it runs (and Telegram works) with nobody attached; attaching comes after.
+      return (await telegramStartup(json, p.compose, p.config, { startDetached: true, wantsTelegram: channel.wantsTelegram })) as { action?: string; reason?: string } | null;
+    },
+    attachCommand: (projectId) => {
+      if (hostOpened) return hostOpened.host.attachCommand;
+      const c = new Compose(projectId);
+      return `docker compose -p ${c.name} -f ${shellQuote(c.file)} exec app minions coordinator`;
+    },
+  };
 }
 
 /**
@@ -93,9 +146,9 @@ async function readStdinSecret(): Promise<string> {
  * secrets dir (which must exist: it is the bind source), and cleared again if `up` fails.
  * `compose up -d` recreates the container whenever compose.yaml changed (method, env, mounts).
  */
-async function ensureUp(json: boolean, opts: { provision?: boolean } = {}) {
+async function ensureUp(json: boolean, opts: { provision?: boolean; cwd?: string } = {}) {
   await requireDocker();
-  const p = await openProject(json);
+  const p = await openProject(json, opts.cwd);
   const auth = authOf(p.project);
   if (isKeyAuth(auth) && opts.provision) {
     say(json, `Refreshing the Claude key on the host (${auth.method === 'helper' ? `running \`${auth.command[0]}\`` : 'reading the configured source'})…`);
@@ -112,8 +165,8 @@ async function ensureUp(json: boolean, opts: { provision?: boolean } = {}) {
  * Host runtime counterpart of ensureUp: warning, host tools, Claude key (key methods), token copies,
  * shims, and the state layout. Nothing Docker-related runs.
  */
-async function ensureHost(json: boolean, opts: { provision?: boolean } = {}) {
-  const p = await openProject(json);
+async function ensureHost(json: boolean, opts: { provision?: boolean; cwd?: string } = {}) {
+  const p = await openProject(json, opts.cwd);
   process.stderr.write(HOST_RUNTIME_WARNING.join('\n') + '\n'); // always (stderr): also in --json mode
   await requireHostTools();
   const auth = authOf(p.project);
@@ -133,8 +186,7 @@ async function ensureHost(json: boolean, opts: { provision?: boolean } = {}) {
 async function startHost(json: boolean, o: { attach: boolean }): Promise<void> {
   const { project, config, host } = await ensureHost(json, { provision: true });
   let imported: unknown = null;
-  const present = (await host.exec(['git', '-C', host.paths.repo, 'rev-parse', '--git-dir'], { allowFailure: true, timeoutMs: 30_000 })).code === 0;
-  if (!present) {
+  if (!(await hostRepoPresent(host))) {
     say(json, `Cloning committed history of ${project.baseBranch} into the host runtime workspace (${host.paths.workspace})…`);
     const r = await importRepo(project, { repoPath: (await projectForPath(process.cwd())).repoPath, target: host.transferTarget() });
     for (const w of r.warnings) say(json, `warning: ${w}`);
@@ -161,6 +213,9 @@ async function startHost(json: boolean, o: { attach: boolean }): Promise<void> {
   const stopRefresh = startRefreshTimer(project.projectId, auth, { onWarn: (line) => process.stderr.write(`\r\n${line}\r\n`) });
   try { process.exitCode = await host.execInherit(['minions', 'coordinator']); } finally { stopRefresh(); }
 }
+
+const hostRepoPresent = async (host: HostRuntime) =>
+  (await host.exec(['git', '-C', host.paths.repo, 'rev-parse', '--git-dir'], { allowFailure: true, timeoutMs: 30_000 })).code === 0;
 
 const repoPresent = async (compose: Compose) =>
   (await compose.exec(['git', '-C', CONTAINER.repo, 'rev-parse', '--git-dir'], { allowFailure: true, timeoutMs: 30_000 })).code === 0;
@@ -228,6 +283,78 @@ export function register(program: Command): void {
       } finally { io?.close?.(); }
     }));
 
+  const setupCmd = program.command('setup [path]')
+    .description('Guided end-to-end setup: init wizard, GitHub, CI guidance, Telegram, runtime start, import, coordinator, then the setup assistant (subcommands: github, assist)')
+    .addOption(new Option('--profile <profile>', 'starting profile').choices([...PROFILES]))
+    .option('--private', 'private install: nothing is written into the repository')
+    .option('--shared', 'shared install: writes .minions/config.json and .minions/README.md')
+    .option('-y, --yes', 'non-interactive: accept defaults (optional integrations off unless a token is piped)')
+    .option('--dry-run', 'show what setup would do without writing, prompting for secrets, or starting anything')
+    .addOption(new Option('--delivery <mode>', 'delivery mode (branch/pull-request need a stored GitHub token)').choices([...DELIVERY_MODES]))
+    .option('--github-token-stdin', 'read the GitHub token from the first line of piped stdin')
+    .option('--telegram-token-stdin', 'read the Telegram bot token from piped stdin (second line when combined with --github-token-stdin)')
+    // Same semantics as `minions init` (install.sh passes init options through to setup).
+    .option('--config <file>', 'use a validated config file instead of the init wizard (skips the questions it covers)')
+    .option('--attach', 'attach this repository to the project id in .minions/config.json')
+    .option('--new-identity', 'create a new project identity for this repository')
+    .addOption(new Option('--runtime <runtime>', 'agent runtime: docker (default) or host (no Docker, less safe; prints a warning)').choices([...RUNTIMES]))
+    .option('--no-attach-coordinator', 'do not offer to attach the coordinator at the end')
+    .option('--no-assistant', 'do not offer the AI setup assistant at the end')
+    .action(action(async (path: string | undefined, o: { profile?: Profile; private?: boolean; shared?: boolean; yes?: boolean; dryRun?: boolean; delivery?: DeliveryMode; githubTokenStdin?: boolean; telegramTokenStdin?: boolean; config?: string; attach?: boolean; newIdentity?: boolean; runtime?: RuntimeKind; attachCoordinator: boolean; assistant: boolean }, cmd: Command) => {
+      requireMode('host');
+      const { json } = globalOpts(cmd);
+      if (o.private && o.shared) throw new MinionsError('INVALID_CONFIG', '--private and --shared are mutually exclusive.');
+      const piped = !!(o.githubTokenStdin || o.telegramTokenStdin);
+      const interactive = !o.yes && !o.dryRun && !json && !piped && !!process.stdin.isTTY;
+      // Like init, --config is a non-interactive alternative to --yes (token questions then need stdin).
+      if (!o.yes && !o.config && !o.dryRun && !interactive) {
+        throw new MinionsError('PRECONDITION', 'setup needs a terminal for its questions.', 'Pass --yes to accept the defaults or --config <file> (tokens can be piped with --github-token-stdin / --telegram-token-stdin), or --dry-run.');
+      }
+      const target = resolvePath(path ?? '.');
+      let tokens: { github?: string; telegram?: string } | undefined;
+      if (piped && !o.dryRun) {
+        const lines = await readStdinLines(o.githubTokenStdin && o.telegramTokenStdin ? 2 : 1);
+        // A missing line is an empty token: runSetup rejects it instead of silently skipping the step.
+        tokens = o.githubTokenStdin ? { github: lines[0] ?? '', ...(o.telegramTokenStdin ? { telegram: lines[1] ?? '' } : {}) } : { telegram: lines[0] ?? '' };
+      }
+      const io = interactive ? readlineIO() : undefined;
+      try {
+        const r = await runSetup({
+          path: target, profile: o.profile, visibility: o.private ? 'private' : o.shared ? 'shared' : undefined,
+          yes: !interactive, dryRun: o.dryRun, io, delivery: o.delivery, tokens, runtime: setupRuntime(json, target),
+          configFile: o.config ? resolvePath(o.config) : undefined, attach: o.attach, newIdentity: o.newIdentity, runtimeKind: o.runtime,
+        });
+        emit(r, { json, human: formatSetup });
+        if (r.steps.some((s) => s.status === 'failed')) process.exitCode = 1;
+        const tty = interactive && !!process.stdout.isTTY && !!io;
+        // Last question of the guided flow: the AI setup assistant finishes whatever is left (failures never fail setup).
+        let assisted = false;
+        if (tty && o.assistant && !r.dryRun) {
+          assisted = await offerSetupAssistant({ interactive: true, io: io!, launch: async () => {
+            io!.close?.(); // the assistant owns the terminal from here
+            return launchAssistant(await loadAssistantContext(r.init.plan.repoPath), { onInfo: (l) => process.stderr.write(l + '\n') });
+          } }) === 'launched';
+          if (assisted && r.ready) say(json, `Attach to the coordinator any time: ${r.attachStart ?? 'minions start'}`);
+        }
+        // The coordinator is a TUI in tmux: attaching needs a terminal (compose exec allocates a TTY).
+        if (r.ready && tty && !assisted && o.attachCoordinator && /^y(es)?$/i.test(await io!.ask('Attach to the coordinator now? (y/n)', 'y'))) {
+          io!.close?.();
+          const project = await loadProjectJson(r.projectId);
+          if (runtimeOf(project) === 'host') {
+            // Same path as `minions start` in the host runtime (dedicated tmux server, key refresh timer).
+            process.chdir(r.init.plan.repoPath);
+            await startHost(json, { attach: true });
+          } else {
+            say(json, authOf(project).method === 'login'
+              ? 'Attaching the coordinator (tmux session "coordinator"; detach with Ctrl-b d). On first start, log in to Claude with /login.'
+              : 'Attaching the coordinator (tmux session "coordinator"; detach with Ctrl-b d). Claude uses the host-provisioned key.');
+            const stopRefresh = startRefreshTimer(project.projectId, authOf(project), { onWarn: (line) => process.stderr.write(`\r\n${line}\r\n`) });
+            try { process.exitCode = await new Compose(r.projectId).execInherit(['minions', 'coordinator'], { tty: true }); } finally { stopRefresh(); }
+          }
+        }
+      } finally { io?.close?.(); }
+    }));
+
   program.command('doctor')
     .description('Check host tools, Docker, the container, Claude auth, and configuration')
     .action(action(async (_o: unknown, cmd: Command) => {
@@ -272,6 +399,54 @@ export function register(program: Command): void {
         : 'Attaching the coordinator (tmux session "coordinator"). Claude uses the host-provisioned key.');
       const stopRefresh = startRefreshTimer(project.projectId, auth, { onWarn: (line) => process.stderr.write(`\r\n${line}\r\n`) });
       try { process.exitCode = await compose.execInherit(['minions', 'coordinator'], { tty: true }); } finally { stopRefresh(); }
+    }));
+
+  program.command('upgrade')
+    .description('Upgrade the project container to the installed minions (drains workers, keeps volumes)')
+    .option('--timeout <seconds>', `wait this long for active workers (default ${DEFAULT_UPGRADE_TIMEOUT_SEC}; 0 with --now)`)
+    .option('--now', 'release workers still active when the wait ends (reported as interrupted, re-dispatched after)')
+    .option('--from-container [branch]', 'first export the container branches and fast-forward <branch> (default: the base branch) to minions/<base>; strict fast-forward on a clean tree only')
+    .option('--dry-run', 'list the steps without changing anything')
+    .action(action(async (o: { timeout?: string; now?: boolean; fromContainer?: string | boolean }, cmd: Command) => {
+      requireMode('host');
+      const { json, dryRun } = globalOpts(cmd);
+      const timeoutSec = o.timeout === undefined ? (o.now ? 0 : DEFAULT_UPGRADE_TIMEOUT_SEC) : Number(o.timeout);
+      if (!Number.isInteger(timeoutSec) || timeoutSec < 0) throw new MinionsError('PRECONDITION', `--timeout must be a whole number of seconds (got ${o.timeout}).`);
+      const ref = await projectForPath(process.cwd());
+      const project = await loadProjectJson(ref.projectId);
+      if (runtimeOf(project) === 'host') {
+        // The host runtime has no image or container to move: agents run the installed CLI through the
+        // shim, and the plugin, shim and sandbox settings are regenerated by `minions start`.
+        throw new MinionsError('PRECONDITION', '`minions upgrade` supports the Docker runtime only; this project uses the host runtime.',
+          'Install the new CLI, wait until `minions status` shows no active workers (or `minions pause --starts` first), then run `minions down && minions start` (regenerates the plugin and shim and restarts the coordinator; run /minions:recover in it if a task was interrupted).');
+      }
+      if (!dryRun) await requireDocker();
+      const compose = new Compose(project.projectId);
+      // The rest of the upgrade, as run again by the new CLI after a reinstall (or by the user after a stop).
+      const flags = [...(o.timeout !== undefined ? ['--timeout', String(timeoutSec)] : []), ...(o.now ? ['--now'] : [])];
+      const r = await runUpgrade({
+        source: () => runSourcePhase({
+          dryRun, handoff: process.env[HANDOFF_ENV] === '1', runningRoot: packageRoot(), log: (m) => say(json, m),
+          checkout: isMinionsCheckout(ref.repoPath) ? ref.repoPath : null,
+          sync: o.fromContainer === undefined ? null : {
+            repo: ref.repoPath, baseBranch: project.baseBranch,
+            branch: typeof o.fromContainer === 'string' ? o.fromContainer : project.baseBranch,
+            exportRepo: async () => {
+              if (!(await compose.isRunning())) throw new MinionsError('PRECONDITION', '--from-container needs the project container running (it exports from it).', 'Run `minions start --no-attach`, or upgrade without --from-container.');
+              return exportRepo(project, { repoPath: ref.repoPath, compose });
+            },
+          },
+          continueArgs: ['--json', 'upgrade', ...flags],
+          rerun: ['minions', 'upgrade', ...flags].join(' '),
+        }),
+        projectId: project.projectId, imageTag: project.imageTag, compose, timeoutSec, now: o.now, dryRun,
+        refresh: async () => refreshDerived(project, (await loadEffectiveConfig(project)).config),
+        importRepo: () => importRepo(project, { repoPath: ref.repoPath }),
+        materialize: () => materializeSecrets(project.projectId),
+        log: (m) => say(json, m),
+      });
+      emit(r, { json, human: formatUpgrade });
+      if (!r.ok) process.exitCode = 1;
     }));
 
   program.command('down')
@@ -451,7 +626,7 @@ export function register(program: Command): void {
 
   registerRuntime(program, { confirm, ask: askLine });
   registerChannel(program, { confirm: confirmOrNull });
-  registerAssistant(registerGithubSetup(program));
+  registerAssistant(registerGithubSetup(setupCmd));
 
   const config = program.command('config').description('Inspect configuration');
   config.command('show')

@@ -122,6 +122,8 @@ export class Compose {
   }
 
   async up(): Promise<void> { await this.compose(['up', '-d', '--no-build', '--remove-orphans']); }
+  /** Recreates the container from the current compose.yaml and image; named volumes are kept. */
+  async recreate(): Promise<void> { await this.compose(['up', '-d', '--no-build', '--force-recreate', '--remove-orphans']); }
   async down(opts: { volumes?: boolean } = {}): Promise<void> { await this.compose(['down', ...(opts.volumes ? ['-v'] : [])]); }
 
   async isRunning(): Promise<boolean> {
