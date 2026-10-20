@@ -509,12 +509,27 @@ without losing progress. The host drives the container through `docker compose e
 state stay in the runtime DB in the state volume. Bringing the host checkout and the installed CLI up to
 date is the source phase. It runs before everything else (see "Upgrade from the container" below).
 
-- **Order.** Preflight (read-only) → `pause --starts` → drain → regenerate derived files → image →
+- **Order.** Preflight (read-only) → `pause --starts --drain --reason upgrade` → drain → regenerate derived files → image →
   materialize secrets → `compose up --force-recreate` → `workspace setup` → `importRepo` (refreshes
   the clone, which is never re-cloned, and configures origin) → `resume --starts` → `coordinator restart --recover`.
 - **Drain.** Workers are Agent subagents of the coordinator's claude process, so draining means
   waiting until their leases end (recorded or released by the coordinator) while no new stage can
-  start. The wait is up to `--timeout` seconds (default 1800). When it runs out, the default aborts:
+  start. The pause also records a drain request (runtime DB `controls` row `drain` with reason,
+  time and event id, mirrored by the flag file `/state/run/drain`; `status --json` shows `draining`).
+  Workers learn about it from a plugin PreToolUse hook on every tool, gated by a shell test
+  (`[ ! -e $MINIONS_STATE_DIR/run/drain ] || minions hook drain`) so node never starts otherwise. It
+  acts only on subagents (hook input `agent_id`) of a `minions:<role>` type while an active lease of
+  that role exists; the coordinator, other subagents and unleased sessions are never affected. The first
+  call adds the checkpoint notice (commit `wip:`, return a partial result listing the remaining work;
+  reviewers return partial at once); after 10 more calls only read-only tools, non-destructive git and
+  `minions work submit` are allowed. A hook error allows the call, except for a leased worker during
+  a drain, which is restricted the same way. The coordinator needs no new wake-up: worker completions
+  wake it, claims are refused while starts are paused, and a partial from a lease that was active when
+  a drain was requested is recorded with `drain: true` (not a failed attempt or a repair cycle). The
+  next claim of that task for the same role gets a `resume` block in its brief (remaining work,
+  checkpoint head); `/minions:recover` re-dispatches. `resume --starts` clears the request; when
+  the starts stay paused (the user's pause) the finish or abort runs `resume --drain`. A runtime that
+  rejects `--drain` (an older image) is paused the old way and only waited for. The wait is up to `--timeout` seconds (default 1800). When it runs out, the default aborts:
   starts are resumed and the container is left alone. With `--now` the remaining leases are released
   and reported as `interrupted`, and the recovery prompt re-dispatches them. `--now` on its own means
   no wait at all. A release answered with `CONFLICT` "already ended" means the lease ended on its own

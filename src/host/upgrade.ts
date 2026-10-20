@@ -2,7 +2,7 @@
 // progress. The host drives the container through `docker compose exec`; lease and pause state stay in
 // the runtime DB (state volume). Decision record: docs/design/bootstrap.md, "Upgrade".
 //
-// Order: preflight -> pause starts -> drain leases -> refresh derived files -> image (rebuilt only when
+// Order: preflight -> pause starts + request a drain -> wait for the leases to wind down -> refresh derived files -> image (rebuilt only when
 // the build fingerprint changed) -> secrets -> recreate the container (named volumes kept) -> workspace
 // setup -> origin configuration (importRepo) -> resume starts -> coordinator restart --recover.
 //
@@ -15,6 +15,11 @@
 //   runtime `controls` event id, so a rerun resumes exactly that pause and never a later one by the user.
 // - SIGINT/SIGTERM before the recreate resumes the starts this upgrade paused and prints a rerun hint;
 //   after the recreate has started it only prints the hint (the marker makes the rerun finish the job).
+// - The drain request (`minions pause --starts --drain --reason upgrade`, durable in the runtime DB) makes
+//   running workers commit work in progress (`wip:`) and return partial results (a PreToolUse hook in the
+//   plugin); recovery re-dispatches their tasks. Resuming starts clears it; when the starts stay paused
+//   (the user's pause) the finish or abort clears it with `minions resume --drain`. A runtime without
+//   drain support (an older image) is only waited for. --timeout/--now stay the hard fallback.
 // - The drain tolerates a few failed status polls (backoff), and a --now release answered with CONFLICT
 //   "already ended" means the lease finished on its own.
 // - Never `compose down -v`, never removes volumes, never re-clones the workspace: the repository clone,
@@ -127,7 +132,13 @@ interface RuntimeStatus {
   activeLeases: LeaseInfo[];
   /** Last event that set each pause flag; absent from runtimes older than task-3.6. */
   pauseChanges?: { starts: PauseChange | null };
+  /** Active drain request; absent from runtimes older than task-3.7. */
+  draining?: { reason: string; requestedAt: string; eventId: number } | null;
 }
+export const UPGRADE_DRAIN_REASON = 'upgrade';
+const DRAIN_PAUSE = ['minions', 'pause', '--starts', '--drain', '--reason', UPGRADE_DRAIN_REASON, '--json'];
+/** The runtime rejected --drain (an image from before task-3.7). */
+const noDrainSupport = (e: unknown) => /unknown option/i.test(errMsg(e));
 /** <project dir>/upgrade.json: the pause this upgrade made (the runtime `controls` event id when known). */
 export interface UpgradeMarker { pausedStarts: boolean; at: string; eventId?: number }
 const markerPath = (projectId: string) => join(projectPaths(projectId).dir, 'upgrade.json');
@@ -196,7 +207,7 @@ export async function runUpgrade(opts: UpgradeOptions): Promise<UpgradeResult> {
     const r = await compose.exec(['minions', 'status', '--json'], { allowFailure: true, timeoutMs: 60_000 });
     if (r.code !== 0 && !r.stdout.trim()) throw new MinionsError('INTERNAL', `status failed in the container: ${lastLine(r)}`);
     const d = parseEnvelope<RuntimeStatus>(r.stdout, 'status');
-    return { paused: d.paused, activeLeases: d.activeLeases ?? [], ...(d.pauseChanges ? { pauseChanges: d.pauseChanges } : {}) };
+    return { paused: d.paused, activeLeases: d.activeLeases ?? [], ...(d.pauseChanges ? { pauseChanges: d.pauseChanges } : {}), ...(d.draining !== undefined ? { draining: d.draining } : {}) };
   };
   const execOk = async (args: string[], what: string, timeoutMs = 120_000) => {
     const r = await compose.exec(args, { allowFailure: true, timeoutMs });
@@ -232,11 +243,11 @@ export async function runUpgrade(opts: UpgradeOptions): Promise<UpgradeResult> {
     else {
       if (userPaused) step('pause', 'skipped', 'starts already paused (left paused)');
       else if (inherited) step('pause', 'skipped', 'starts still paused by an unfinished upgrade (resumed at the end)');
-      else p('pause', 'pause new starts (minions pause --starts)');
+      else p('pause', 'pause new starts and request a drain (minions pause --starts --drain)');
       const n = before?.activeLeases.length ?? 0;
       p('drain', n === 0 ? 'no active leases' : opts.now && opts.timeoutSec === 0
         ? `release ${n} active lease(s) now and report them interrupted: ${before!.activeLeases.map(leaseLabel).join(', ')}`
-        : `wait up to ${opts.timeoutSec}s for ${n} active lease(s), then ${opts.now ? 'release the rest (reported interrupted)' : 'abort and resume starts'}`);
+        : `ask ${n} worker(s) to commit work in progress and return partial results, wait up to ${opts.timeoutSec}s, then ${opts.now ? 'release the rest (reported interrupted)' : 'abort and resume starts'}`);
     }
     p('files', 'regenerate compose.yaml, runtime config and plugin from the installed package');
     if (rebuild) p('image', `build ${opts.imageTag} (${previous === null ? 'missing' : 'fingerprint changed'})`); else step('image', 'skipped', 'fingerprint unchanged; no rebuild');
@@ -263,10 +274,24 @@ export async function runUpgrade(opts: UpgradeOptions): Promise<UpgradeResult> {
   // From here until the recreate, a failure (or SIGINT/SIGTERM) resumes what we paused and leaves the
   // container running.
   let ownPause = inherited;
+  // A drain this upgrade asked for, or one left by an earlier run: the finish or abort clears it.
+  let drainRequested = !!before?.draining;
   const resume = async () => {
     await execOk(['minions', 'resume', '--starts', '--json'], 'resume');
     ownPause = false;
+    drainRequested = false; // resuming starts clears the drain
     await rm(markerPath(projectId), { force: true });
+  };
+  /** Clears only the drain (the starts stay paused: the user's pause). */
+  const clearDrain = async () => {
+    await execOk(['minions', 'resume', '--drain', '--json'], 'drain clear');
+    drainRequested = false;
+  };
+  /** Abort/interrupt clean-up: resume our pause (which clears the drain), else clear only the drain. */
+  const undo = async (): Promise<string> => {
+    if (ownPause) { await resume(); return 'starts resumed'; }
+    if (drainRequested) { await clearDrain(); return 'drain request cleared (starts left paused)'; }
+    return '';
   };
 
   // ---- interrupt handling ----
@@ -285,9 +310,10 @@ export async function runUpgrade(opts: UpgradeOptions): Promise<UpgradeResult> {
       }
       await pausing?.catch(() => undefined); // an in-flight pause must not land after the resume
       let state = 'the container was not recreated';
-      if (ownPause && running) {
-        try { await resume(); state += ' and starts were resumed'; }
-        catch (e) { state += `; starts are still paused (${errMsg(e)}): run \`minions resume --starts\`,`; }
+      if ((ownPause || drainRequested) && running) {
+        const which = ownPause ? '--starts' : '--drain';
+        try { const done = await undo(); if (done) state += done === 'starts resumed' ? ' and starts were resumed' : ` and the ${done}`; }
+        catch (e) { state += `; starts are still paused (${errMsg(e)}): run \`minions resume ${which}\`,`; }
       }
       hooks.notice(`minions upgrade interrupted (${sig}): ${state}. Rerun \`minions upgrade\` to upgrade.`);
     })();
@@ -307,9 +333,10 @@ export async function runUpgrade(opts: UpgradeOptions): Promise<UpgradeResult> {
     if (e && typeof e === 'object' && aborted.has(e)) throw e; // already reported by an inner abort
     await checkpoint();
     if (!steps.some((s) => s.id === id)) step(id, 'failed', errMsg(e));
-    if (ownPause && running) {
-      try { await resume(); step('resume', 'done', 'starts resumed after the aborted upgrade'); }
-      catch (re) { step('resume', 'failed', `${errMsg(re)}; run \`minions resume --starts\``); }
+    if ((ownPause || drainRequested) && running) {
+      const which = ownPause ? '--starts' : '--drain';
+      try { step('resume', 'done', `${await undo()} after the aborted upgrade`); }
+      catch (re) { step('resume', 'failed', `${errMsg(re)}; run \`minions resume ${which}\``); }
     }
     const err = e instanceof MinionsError ? e : new MinionsError('INTERNAL', errMsg(e));
     const out = new MinionsError(err.code, `Upgrade aborted at ${id}: ${err.message}`, err.hint ?? 'The container was not recreated; fix the cause and rerun `minions upgrade`.', { steps });
@@ -342,14 +369,30 @@ export async function runUpgrade(opts: UpgradeOptions): Promise<UpgradeResult> {
           const at = new Date().toISOString();
           await writeJson(markerPath(projectId), { pausedStarts: true, at } satisfies UpgradeMarker);
           ownPause = true;
-          const r = await (pausing = execOk(['minions', 'pause', '--starts', '--json'], 'pause'));
+          // One call pauses starts and records the drain request; an older runtime only pauses.
+          const r = await (pausing = execOk(DRAIN_PAUSE, 'pause').then((x) => { drainRequested = true; return x; }, (e: unknown) => {
+            if (!noDrainSupport(e)) throw e;
+            log('pause: the running runtime does not support drain requests; its workers are only waited for');
+            return execOk(['minions', 'pause', '--starts', '--json'], 'pause');
+          }));
           // Remember which pause event is ours, so a stale marker can never claim a later user pause.
           let eventId: number | undefined;
           try { eventId = parseEnvelope<{ pauseChanges?: { starts?: PauseChange | null } }>(r.stdout, 'pause').pauseChanges?.starts?.id; } catch { /* older runtime */ }
           if (typeof eventId === 'number') await writeJson(markerPath(projectId), { pausedStarts: true, at, eventId } satisfies UpgradeMarker);
-          step('pause', 'done', 'new starts paused');
+          step('pause', 'done', drainRequested ? 'new starts paused; drain requested' : 'new starts paused');
           await checkpoint();
         } catch (e) { await abort('pause', e); }
+      }
+      // Starts were already paused: still ask running workers to wind down (the pause itself is kept).
+      if ((userPaused || inherited) && before!.activeLeases.length && !before!.draining) {
+        try {
+          await (pausing = execOk(DRAIN_PAUSE, 'drain request'));
+          drainRequested = true;
+          log('pause: drain requested (starts were already paused)');
+        } catch (e) {
+          log(`pause: could not request a drain (${errMsg(e)}); the workers are only waited for`);
+        }
+        await checkpoint();
       }
       try {
         const deadline = clock() + opts.timeoutSec * 1000;
@@ -358,13 +401,14 @@ export async function runUpgrade(opts: UpgradeOptions): Promise<UpgradeResult> {
         for (;;) {
           if (leases.length === 0) break;
           const ids = leases.map((l) => l.id).join(',');
-          if (ids !== shown) { log(`waiting for ${leases.length} active lease(s): ${leases.map(leaseLabel).join(', ')}`); shown = ids; }
+          if (ids !== shown) { log(`${drainRequested ? 'winding down' : 'waiting for'} ${leases.length} active lease(s): ${leases.map(leaseLabel).join(', ')}`); shown = ids; }
           if (clock() >= deadline) break;
           await sleep(Math.min(pollMs, Math.max(0, deadline - clock())));
           await checkpoint();
           leases = (await pollStatus()).activeLeases;
         }
-        if (leases.length === 0) step('drain', 'done', 'no active leases');
+        const started = before!.activeLeases.length;
+        if (leases.length === 0) step('drain', 'done', started && drainRequested ? `${started} lease(s) wound down; their tasks are re-dispatched after the upgrade` : 'no active leases');
         else if (!opts.now) {
           step('drain', 'failed', `${leases.length} lease(s) still active after ${opts.timeoutSec}s: ${leases.map(leaseLabel).join(', ')}`);
           await abort('drain', new MinionsError('PRECONDITION', `${leases.length} worker lease(s) still active after ${opts.timeoutSec}s (${leases.map((l) => l.task_id).join(', ')})`,
@@ -446,6 +490,7 @@ export async function runUpgrade(opts: UpgradeOptions): Promise<UpgradeResult> {
       } catch { ownPause = true; /* unreadable: trust the marker, as before */ }
     }
     if (ownPause) await attempt('resume', async () => { await resume(); return 'new starts resumed'; });
+    else if (drainRequested) await attempt('resume', async () => { await clearDrain(); return `drain request cleared; ${notOurs}`; });
     else step('resume', 'skipped', notOurs);
     await attempt('coordinator', async () => {
       const r = await compose.exec(['minions', 'coordinator', 'restart', '--recover', '--json'], { allowFailure: true, timeoutMs: 120_000 });

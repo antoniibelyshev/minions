@@ -125,7 +125,15 @@ export interface TaskBrief {
   configRevision: number;
   deliveryMode: string;
   priorFindings: { leaseId: string; role: string; status: string; findings: unknown[]; nextAction: string }[];
+  /** Present when the previous stage of this task was wound down by a drain (upgrade): continue from its checkpoint. */
+  resume?: DrainResume;
   resultContract: string;
+}
+
+/** The checkpoint a drained worker left: its partial result and the head it committed (`wip:` commit). */
+export interface DrainResume {
+  fromLeaseId: string; role: LeaseRole; reason: 'drain'; headSha: string | null;
+  summary: string; remainingWork: unknown[]; nextAction: string; instruction: string;
 }
 
 export interface RecordResponse {
@@ -133,6 +141,8 @@ export interface RecordResponse {
   errors?: string[]; correctionAllowed?: boolean; unvalidated?: boolean;
   from?: TaskStatus; to?: TaskStatus; approved: boolean; replan: boolean; needsSplit: boolean;
   repairCycles?: number; headSha?: string; message: string;
+  /** A partial result returned because of a drain (upgrade): not a failed attempt or a repair cycle. */
+  drain?: boolean;
   /** Present when the approval started branch/PR publication. */
   publication?: PublishResponse;
 }
@@ -179,6 +189,11 @@ export class Scheduler {
     if (!LEASE_ROLES.includes(role)) throw new MinionsError('INVALID_CONFIG', `Unknown role "${role}" (engineer|tester|reviewer).`);
     const cfg = this.config;
     if (this.db.paused().starts) {
+      const drain = this.db.drain();
+      if (drain) {
+        throw new MinionsError('POLICY_DENIED', `Starts are paused for a drain (${drain.reason}, since ${drain.requestedAt}).`,
+          'Start nothing while draining: record the partial results of running workers; work resumes after the drain (the upgrade resumes starts and recovery re-dispatches).');
+      }
       throw new MinionsError('POLICY_DENIED', 'Starts are paused (paused_starts).', 'Run `minions resume` to allow new work.');
     }
     const startEffect = can(cfg, 'task.start', { role });
@@ -303,6 +318,7 @@ export class Scheduler {
         const r = JSON.parse(l.result_json!) as WorkerResult;
         return { leaseId: l.id, role: l.role, status: r.status, findings: r.findings, nextAction: r.nextAction };
       });
+    const resume = this.drainResume(task.id, lease, x.branch);
     return {
       briefMarker: `minions-lease: ${lease.id}`,
       leaseId: lease.id,
@@ -339,8 +355,23 @@ export class Scheduler {
       configRevision: cfg.configRevision,
       deliveryMode: cfg.delivery.mode,
       priorFindings,
+      ...(resume ? { resume } : {}),
       resultContract: RESULT_CONTRACT,
     };
+  }
+
+  /** The last ended lease of the task, when it was a drain partial of the same role: what to continue from. */
+  private drainResume(taskId: string, lease: Lease, branch: string): DrainResume | undefined {
+    const last = this.db.leases({ taskId, all: true }).filter((l) => l.id !== lease.id && l.status !== 'active').at(-1);
+    if (!last || last.role !== lease.role || last.result_valid !== 1 || !last.result_json) return undefined;
+    const drained = this.db.events(taskId, 'record').some((e) => (e.data as { leaseId?: string; drain?: boolean } | null)?.leaseId === last.id && (e.data as { drain?: boolean }).drain === true);
+    if (!drained) return undefined;
+    const r = JSON.parse(last.result_json) as WorkerResult;
+    const at = last.head_sha ? ` at ${last.head_sha}` : '';
+    const instruction = lease.role === 'reviewer'
+      ? `The previous review was interrupted by a drain (upgrade). Review ${branch}${at} again from the start; the remaining work lists what was not reviewed yet.`
+      : `The previous ${lease.role} was interrupted by a drain (upgrade) and checkpointed on ${branch}${at} (\`wip:\` commit). Continue from that commit: keep the committed work, do the remaining work, and commit normally (you may fold the wip: commit into a proper message with new commits; never rewrite or discard it).`;
+    return { fromLeaseId: last.id, role: last.role, reason: 'drain', headSha: last.head_sha, summary: r.summary, remainingWork: r.findings, nextAction: r.nextAction, instruction };
   }
 
   private endLease(id: string, status: Lease['status'], data: Record<string, unknown>, result?: { json: string; valid: number }): void {
@@ -517,6 +548,8 @@ export class Scheduler {
       ? await this.qaRequirement(task, head, { paths: r.modifiedPaths, flagged })
       : { reasons: [], record: false };
     const qaWhy = qa.reasons.join('; ');
+    // A partial from a worker that was running when a drain was requested (even one cleared since) is a drain partial.
+    const drained = r.status === 'partial' && !sweep && this.db.drainRequestedSince(lease.started_at);
 
     if (sweep) {
       if (r.status === 'complete' || r.status === 'needs_changes') {
@@ -554,7 +587,12 @@ export class Scheduler {
         break;
       case 'blocked': to = 'blocked'; break;
       case 'needs_split': to = 'awaiting-human'; needsSplit = true; message = 'Worker reported needs_split: create child tasks idempotently and link dependencies.'; break;
-      case 'partial': to = lease.role === 'engineer' ? (this.preClaimStatus(lease) ?? 'ready') : from; message = 'Partial result recorded; status unchanged.'; break;
+      case 'partial':
+        to = lease.role === 'engineer' ? (this.preClaimStatus(lease) ?? 'ready') : from;
+        message = drained
+          ? `Drain partial recorded (${lease.role}): not a failed attempt or repair cycle. Start nothing while draining; after the drain re-dispatch the same role (its brief carries the remaining work and the wip: checkpoint).`
+          : 'Partial result recorded; status unchanged.';
+        break;
     }
 
     // Record the QA requirement on the task (first QA label) so later stages and publication see it.
@@ -574,11 +612,11 @@ export class Scheduler {
       }
       this.db.exec('UPDATE leases SET head_sha = ? WHERE id = ?', head, leaseId);
       if (publish) this.db.upsertPublication({ task_id: task.id, branch: lease.branch!, head_sha: head, mode: cfg.delivery.mode, config_revision: cfg.configRevision });
-      this.endLease(leaseId, 'completed', { from, to, approved, replan, needsSplit, publish }, { json: JSON.stringify(r), valid: 1 });
+      this.endLease(leaseId, 'completed', { from, to, approved, replan, needsSplit, publish, ...(drained ? { drain: true, reason: 'drain' } : {}) }, { json: JSON.stringify(r), valid: 1 });
     });
     await this.cleanupLeaseFiles(leaseId);
     try {
-      await this.backlog.addNote(task.id, `minions: ${lease.role} ${r.status}${r.verdict ? ` (${r.verdict})` : ''} at ${head.slice(0, 12)}: ${r.summary}${to === 'testing' && qa.reasons.length ? ` (QA required: ${qaWhy})` : ''}`);
+      await this.backlog.addNote(task.id, `minions: ${lease.role} ${r.status}${drained ? ' (drain)' : ''}${r.verdict ? ` (${r.verdict})` : ''} at ${head.slice(0, 12)}: ${r.summary}${to === 'testing' && qa.reasons.length ? ` (QA required: ${qaWhy})` : ''}`);
     } catch (e) {
       this.db.addEvent('record-backlog-error', task.id, { leaseId, error: (e as Error).message });
     }
@@ -595,7 +633,7 @@ export class Scheduler {
       }
       return { ...base, valid: true, from, to: publication.status, approved, replan, needsSplit, repairCycles, headSha: head, publication, message: publication.message };
     }
-    return { ...base, valid: true, from, to, approved, replan, needsSplit, repairCycles, headSha: head,
+    return { ...base, valid: true, from, to, approved, replan, needsSplit, repairCycles, headSha: head, ...(drained ? { drain: true } : {}),
       message: message || `Recorded ${lease.role} ${r.status}; task ${from} → ${to}.` };
   }
 

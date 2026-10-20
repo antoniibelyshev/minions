@@ -13,6 +13,12 @@
         "hooks": [
           { "type": "command", "command": "minions hook pre-agent" }
         ]
+      },
+      {
+        "matcher": "*",
+        "hooks": [
+          { "type": "command", "command": "[ ! -e ${MINIONS_STATE_DIR:-/state}/run/drain ] || minions hook drain" }
+        ]
       }
     ]
   }

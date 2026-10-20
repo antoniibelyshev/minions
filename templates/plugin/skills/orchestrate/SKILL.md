@@ -9,7 +9,7 @@ Run this loop until nothing is runnable. Every durable step uses a `minions ... 
 
 ## 1. Check state
 
-1. `minions status --json`. If starts are paused, report that and stop.
+1. `minions status --json`. If starts are paused, report that and stop. If `draining` is set (an upgrade is winding workers down), start nothing: only record the workers that return (step 5), report briefly and stop.
 2. `minions work list --json` to see active leases. Count active tasks (limit {{maxActiveTasks}}) and engineers (limit {{maxEngineers}}).
 3. `minions backlog ready --compact --json` for runnable tasks (`minions backlog list --compact --json` for the whole queue). Also note tasks in `testing`, `reviewing` or `changes-requested` without an active lease: they need the next stage.
 
@@ -77,7 +77,7 @@ The record response says what happened. Typical transitions:
 - reviewer `request-changes` → engineer repair with the reviewer's findings. Prefer a fresh engineer; when the previous engineer attempt failed to address the findings, use `minions:engineer-deep`, and a stronger allowed model after repeated failure.
 - `replan: true` → stop repairing. Rethink: rewrite the task, split it, or ask the user. Do not dispatch another repair of the same approach.
 - `blocked` → record the reason (`minions backlog note`), tell the user what would unblock it if it needs them, move on.
-- `partial` → re-dispatch the same role with the remaining work in the prompt, or split.
+- `partial` → re-dispatch the same role with the remaining work in the prompt, or split. A `drain: true` partial (wound down for an upgrade) is not a failed attempt: while draining do nothing; afterwards re-dispatch the same role (no `engineer-deep` escalation). Its brief carries `resume` (remaining work and the `wip:` checkpoint), so the prompt only needs `Continue from the wip: commit.`
 - `needs_split` → decide the split yourself (no need to ask the user); create each proposed child with `minions backlog create --json` using an idempotency key `split:<parentId>:<n>`, the parent id, acceptance criteria and dependencies between children; note the split on the parent. The parent stays as the tracking task.
 
 Then go back to step 1. Stop when nothing is runnable. (When idle after many hand-offs, see the opt-in idle context reset in your coordinator instructions.)

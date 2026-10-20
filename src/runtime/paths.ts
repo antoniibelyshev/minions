@@ -54,6 +54,8 @@ export function runtimePaths(env: NodeJS.ProcessEnv = process.env, opts: { inCon
     import: join(state, 'import'),
     exports: join(state, 'exports'),
     logs: join(state, 'logs'),
+    /** Flag file present while a drain is requested (`minions pause --drain`); the worker drain hook tests only for it. */
+    drainFlag: join(state, 'run', 'drain'),
     /** Host runtime: MINIONS_LOG_DIR (<project>/host/logs) keeps the unsandboxed hooks' log out of agent-writable dirs. */
     hooksLog: join(env.MINIONS_LOG_DIR || join(state, 'logs'), 'hooks.log'),
     workspace,

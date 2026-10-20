@@ -11,6 +11,8 @@ import { capacityOf, scopeOf } from './scheduler.js';
 
 export interface HookDeps { db: RuntimeDb; backlog: BacklogAdapter; config: MinionsConfig }
 export type HookLoader = () => HookDeps | Promise<HookDeps>;
+/** The drain hook needs only the runtime DB (it runs on every worker tool call during a drain). */
+export type DrainLoader = () => Pick<HookDeps, 'db'> | Promise<Pick<HookDeps, 'db'>>;
 /** stdout: exact text Claude Code reads (absent = allow). Exit code is always 0. */
 export interface HookOutput { stdout?: string; reason: string }
 
@@ -162,6 +164,108 @@ export function preTelegramHook(input: unknown): HookOutput {
   return { reason: `allow: ${tool} from the coordinator` };
 }
 
+// ---------------------------------------------------------------- drain (PreToolUse, every tool)
+
+/** Tool calls a leased worker may make freely after the first drain notice, before it is restricted. */
+export const DRAIN_GRACE_CALLS = 10;
+const DRAIN_READ_ONLY_TOOLS = new Set(['Read', 'Glob', 'Grep', 'LS', 'NotebookRead', 'TodoWrite']);
+/** git subcommands that record or inspect work; anything that could discard uncommitted changes is absent. */
+const DRAIN_GIT = new Set(['add', 'commit', 'status', 'log', 'diff', 'show', 'rev-parse', 'branch', 'ls-files']);
+const DRAIN_SHELL = new Set(['cd', 'pwd', 'ls', 'cat', 'head', 'tail', 'wc', 'echo', 'grep', 'true']);
+
+/** Splits a shell line on unquoted `&&`, `||`, `;`, `|`; stops at an unquoted `<<` (the heredoc body is data). */
+function shellSegments(cmd: string): { segments: string[]; redirect: boolean } {
+  const segments: string[] = [];
+  let cur = '';
+  let quote: string | null = null;
+  let redirect = false;
+  for (let i = 0; i < cmd.length; i++) {
+    const c = cmd[i]!;
+    if (quote) { if (c === quote) quote = null; else if (c === '\\' && quote === '"') { cur += c + (cmd[++i] ?? ''); continue; } cur += c; continue; }
+    if (c === "'" || c === '"') { quote = c; cur += c; continue; }
+    if (c === '<' && cmd[i + 1] === '<') break;
+    if (c === '\n' || c === ';' || c === '|' || (c === '&' && cmd[i + 1] === '&')) {
+      segments.push(cur); cur = '';
+      if ((c === '|' && cmd[i + 1] === '|') || c === '&') i++;
+      continue;
+    }
+    // Output redirection writes files; only `>/dev/null` and `2>&1` are harmless.
+    if (c === '>' && !/^>\s*\/dev\/null\b/.test(cmd.slice(i)) && !(cmd[i - 1] === '2' && cmd.startsWith('>&1', i))) redirect = true;
+    cur += c;
+  }
+  segments.push(cur);
+  return { segments: segments.map((s) => s.trim()).filter(Boolean), redirect };
+}
+
+/** True for Bash lines that only commit, inspect, or submit the result (no edits, no discarding). */
+export function drainSafeBash(command: string): boolean {
+  if (/^\s*(?:cd\s+\S+\s*&&\s*)?minions\s+work\s+(?:submit|brief)\b/.test(command)) return true;
+  const { segments, redirect } = shellSegments(command);
+  if (redirect || !segments.length) return false;
+  return segments.every((s) => {
+    const words = s.split(/\s+/);
+    if (words[0] === 'git') {
+      let i = 1;
+      while (words[i] === '-C' || words[i] === '-c') i += 2;
+      while (words[i]?.startsWith('--no-pager') || words[i] === '--no-optional-locks') i++;
+      return DRAIN_GIT.has(words[i] ?? '') && !(words[i] === 'branch' && words.slice(i + 1).some((w) => /^-[dDmMfc]|^--(delete|move|force|copy)/.test(w)));
+    }
+    if (words[0] === 'minions') return words[1] === 'work' && (words[2] === 'submit' || words[2] === 'brief');
+    return DRAIN_SHELL.has(words[0]!);
+  });
+}
+
+const drainAllowed = (tool: string, ti: Record<string, unknown>): boolean =>
+  DRAIN_READ_ONLY_TOOLS.has(tool) || /Handback$/.test(tool) || (tool === 'Bash' && typeof ti.command === 'string' && drainSafeBash(ti.command));
+
+/** What the worker is told on its first tool call after a drain request, by role. */
+export function drainNotice(role: LeaseRole, reason: string): string {
+  const head = reason === 'upgrade' ? 'Upgrade pending' : `Drain requested (${reason})`;
+  const what = role === 'reviewer'
+    ? `${head}: stop the review now. You have nothing to commit: return a partial WorkerResult right away (findings so far; the remaining review work in findings and nextAction). The review reruns later at the same head.`
+    : role === 'tester'
+      ? `${head}: reach a safe checkpoint now. If you changed tests, commit them on your branch (message prefix \`wip:\`); if you have nothing to commit, return a partial WorkerResult right away. List the remaining testing in findings and nextAction.`
+      : `${head}: reach a safe checkpoint now. Commit work in progress on your branch (message prefix \`wip:\`), then return a partial WorkerResult that lists the remaining work.`;
+  return `${what} Never discard uncommitted changes (no reset, checkout, restore, clean or stash). After about ${DRAIN_GRACE_CALLS} more tool calls only read-only tools, git (add/commit/status/log/diff) and \`minions work submit\` are allowed.`;
+}
+
+const addContext = (text: string, reason: string): HookOutput => ({
+  stdout: JSON.stringify({ hookSpecificOutput: { hookEventName: 'PreToolUse', additionalContext: text } }), reason,
+});
+
+/**
+ * PreToolUse(every tool) drain hook; the plugin runs it only while the drain flag file exists. It acts
+ * only on minions worker subagents (hook input `agent_id` + a `minions:<role>` `agent_type`) while an
+ * active lease of that role exists: the first call gets the checkpoint notice as context, then after
+ * DRAIN_GRACE_CALLS everything but read-only tools, git and `minions work submit` is denied. The
+ * coordinator (no agent_id), other subagents and unleased sessions are always allowed. An error allows
+ * the call, except for a minions worker during a drain, which is restricted (fails closed).
+ */
+export async function drainHook(input: unknown, load: DrainLoader): Promise<HookOutput> {
+  const inp = isObj(input) ? input : {};
+  const agentId = typeof inp.agent_id === 'string' ? inp.agent_id : '';
+  const agentType = typeof inp.agent_type === 'string' ? inp.agent_type : '';
+  const tool = typeof inp.tool_name === 'string' ? inp.tool_name : '';
+  const ti = isObj(inp.tool_input) ? inp.tool_input : {};
+  const m = WORKER.exec(agentType);
+  if (!agentId || !m) return { reason: `allow: not a minions worker (${agentId ? agentType || 'unknown type' : 'main thread'})` };
+  const role = m[1] as LeaseRole;
+  try {
+    const { db } = await load();
+    const drain = db.drain();
+    if (!drain) return { reason: 'allow: no drain requested' };
+    if (!db.activeLeases().some((l) => l.role === role)) return { reason: `allow: no active ${role} lease` };
+    const hits = db.drainHit(drain.eventId, agentId);
+    if (hits === 1) return addContext(drainNotice(role, drain.reason), `context: drain notice to ${agentType} ${agentId}`);
+    if (hits <= DRAIN_GRACE_CALLS + 1 || drainAllowed(tool, ti)) return { reason: `allow: ${agentType} ${agentId} ${tool} during drain (call ${hits})` };
+    return deny(`Drain in progress (${drain.reason}): only read-only tools, git (add/commit/status/log/diff) and \`minions work submit\` are allowed now. ` +
+      'Commit work in progress on your branch (message prefix `wip:`), then return a partial WorkerResult that lists the remaining work. Uncommitted changes are never discarded.');
+  } catch (e) {
+    if (drainAllowed(tool, ti)) return { reason: `allow: ${tool} (drain state unreadable: ${(e as Error).message})` };
+    return deny(`minions could not read the drain state (${(e as Error).message}); while a drain is pending only read-only tools, git and \`minions work submit\` are allowed. Commit work in progress (\`wip:\`) and return a partial WorkerResult.`);
+  }
+}
+
 async function readStdin(timeoutMs = 5000): Promise<string> {
   if (process.stdin.isTTY) return '';
   return new Promise((resolve) => {
@@ -174,10 +278,13 @@ async function readStdin(timeoutMs = 5000): Promise<string> {
   });
 }
 
-export type HookKind = 'stop' | 'pre-agent' | 'pre-telegram';
+export type HookKind = 'stop' | 'pre-agent' | 'pre-telegram' | 'drain';
 
-/** Entry point for `minions hook stop|pre-agent|pre-telegram`: reads stdin, prints the decision, never throws, exits 0. */
-export async function runHook(kind: HookKind, load: HookLoader, stdinText?: string): Promise<HookOutput> {
+/** Hooks that allow on unreadable input or an internal error (the others fail closed). */
+const failsOpen = (kind: HookKind) => kind === 'stop' || kind === 'drain';
+
+/** Entry point for `minions hook stop|pre-agent|pre-telegram|drain`: reads stdin, prints the decision, never throws, exits 0. */
+export async function runHook(kind: HookKind, load: HookLoader | DrainLoader, stdinText?: string): Promise<HookOutput> {
   let out: HookOutput;
   try {
     const text = stdinText ?? (await readStdin());
@@ -185,12 +292,13 @@ export async function runHook(kind: HookKind, load: HookLoader, stdinText?: stri
     let parseError: string | undefined;
     try { input = text.trim() ? JSON.parse(text) : {}; } catch (e) { parseError = (e as Error).message; }
     if (parseError) {
-      out = kind === 'stop' ? { reason: `allow: unreadable hook input (${parseError})` } : deny(`minions could not parse the hook input (${parseError}).`);
+      out = failsOpen(kind) ? { reason: `allow: unreadable hook input (${parseError})` } : deny(`minions could not parse the hook input (${parseError}).`);
     } else {
-      out = kind === 'stop' ? await stopHook(input, load) : kind === 'pre-telegram' ? preTelegramHook(input) : await preAgentHook(input, load);
+      out = kind === 'drain' ? await drainHook(input, load) : kind === 'pre-telegram' ? preTelegramHook(input)
+        : kind === 'stop' ? await stopHook(input, load as HookLoader) : await preAgentHook(input, load as HookLoader);
     }
   } catch (e) {
-    out = kind === 'stop' ? { reason: `allow: internal error (${(e as Error).message})` } : deny(`minions hook failed (${(e as Error).message}).`);
+    out = failsOpen(kind) ? { reason: `allow: internal error (${(e as Error).message})` } : deny(`minions hook failed (${(e as Error).message}).`);
   }
   hookLog(`${kind} ${out.reason}`);
   if (out.stdout) process.stdout.write(out.stdout + '\n');
