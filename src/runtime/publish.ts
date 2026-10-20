@@ -4,7 +4,8 @@
 // - Publication is a deterministic helper run by the runtime, never by a model: `minions work record`
 //   calls it when a reviewer approval is accepted, `minions work publish <taskId>` retries it.
 // - Gates: git.push (and pr.create in pull-request mode) are evaluated against the paths the branch
-//   changes relative to the base. `deny` fails; `ask` (including the sensitive-path upgrade
+//   changes relative to the base: the union of diffs against the base SHAs recorded at claim time,
+//   origin's base (ls-remote) and the local base refs; a movable local ref alone never suffices. `deny` fails; `ask` (including the sensitive-path upgrade
 //   allow -> ask) requires a host-signed human approval for exactly the approved head SHA, verified
 //   here against the runtime's read-only public key right before anything is pushed (src/core/approval.ts).
 //   Approval rows in the runtime DB are only carriers of tokens: an unsigned or forged row fails closed.
@@ -22,7 +23,7 @@ import { redact } from '../core/output.js';
 import { verifyAnyApproval } from '../core/approval.js';
 import { normalizeGithubRemote, readGithubToken, type GitFn } from './github.js';
 import { isHostRuntime } from './git-hardening.js';
-import { runtimePaths } from './paths.js';
+import { missingApprovalKeyReason, runtimePaths } from './paths.js';
 import { git as realGit } from './worktree.js';
 
 export type GhFn = (args: string[], opts?: { input?: string; cwd?: string }) => Promise<RunResult>;
@@ -41,6 +42,12 @@ export interface PublishInput {
   head: string;
   /** Host-signed approval tokens recorded for this task and head (scope publish); verified, never trusted as is. */
   approvals: (string | null)[];
+  /**
+   * Base commits recorded in the runtime DB when this task's leases were claimed (leases.base_sha).
+   * The sensitive-path gate diffs against these (and the remote's base), never only against a local
+   * ref that in-runtime code can move. None usable (and no remote base available locally) fails closed.
+   */
+  baseShas?: (string | null)[];
   /** Public key verifying approvals (default: the runtime's read-only /opt/minions/config/approval-public-key.pem). */
   approvalPublicKeyFile?: string;
   /** Clock for approval expiry (tests). */
@@ -110,6 +117,30 @@ async function readPublicKey(file: string): Promise<string | null> {
   try { return await readFile(file, 'utf8'); } catch { return null; }
 }
 
+const FULL_SHA_RE = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+
+/**
+ * Bases for the sensitive-path diff. `trusted`: base SHAs recorded in the runtime DB at claim time
+ * and origin's current base (read with ls-remote, i.e. from the server), each only when the commit is
+ * present locally. `local`: the workspace's base refs, which in-runtime code can move; they are
+ * diffed too (they can only add paths) but never suffice on their own.
+ */
+async function gateBases(git: GitFn, repo: string, remote: string, base: string, recorded: (string | null)[]): Promise<{ trusted: string[]; local: string[] }> {
+  const hasCommit = async (rev: string) => (await git(repo, ['rev-parse', '--verify', '--quiet', `${rev}^{commit}`], true)).code === 0;
+  const trusted: string[] = [];
+  for (const sha of new Set(recorded.filter((s): s is string => !!s && FULL_SHA_RE.test(s)))) {
+    if (await hasCommit(sha)) trusted.push(sha);
+  }
+  const ls = await git(repo, ['ls-remote', '--heads', remote, `refs/heads/${base}`], true);
+  const remoteBase = ls.code === 0 ? ls.stdout.trim().split(/\s+/)[0] ?? '' : '';
+  if (FULL_SHA_RE.test(remoteBase) && await hasCommit(remoteBase)) trusted.push(remoteBase);
+  const local: string[] = [];
+  for (const ref of [`refs/heads/${base}`, `refs/remotes/origin/${base}`, `refs/remotes/host/${base}`]) {
+    if (await hasCommit(ref)) local.push(ref);
+  }
+  return { trusted, local };
+}
+
 const PR_URL_RE = /https:\/\/github\.com\/[^\s/]+\/[^\s/]+\/pull\/\d+/;
 
 /** Publishes an approved head according to delivery.mode. Never throws for expected failures. */
@@ -131,16 +162,26 @@ export async function publishTask(input: PublishInput): Promise<PublishOutcome> 
     return fail('AUTH_REQUIRED', token.state === 'absent' ? 'No GitHub token is provisioned; run `minions auth github` on the host, then `minions work publish`.' : token.message);
   }
 
-  // 2. Changed paths vs the base (renames split so moving a file out of a sensitive path still counts).
+  // The host runtime names the normalized https URL instead of the agent-writable `origin` remote
+  // (no pushurl / receivepack from the workspace).
+  const remote = isHostRuntime() ? https : 'origin';
+
+  // 2. Changed paths vs the base (renames split so moving a file out of a sensitive path still counts),
+  // as the union over every base the gate knows of. At least one must be trustworthy: a base SHA
+  // recorded at claim time, or the remote's current base. Local refs (refs/heads/<base>, the
+  // remote-tracking refs) are movable by in-runtime code, so they can only add paths, never hide any.
   const base = cfg.git.baseBranch;
-  let baseRef: string | null = null;
-  for (const ref of [`refs/heads/${base}`, `refs/remotes/origin/${base}`, `refs/remotes/host/${base}`]) {
-    if ((await git(repo, ['rev-parse', '--verify', '--quiet', `${ref}^{commit}`], true)).code === 0) { baseRef = ref; break; }
+  const bases = await gateBases(git, repo, remote, base, input.baseShas ?? []);
+  if (!bases.trusted.length) {
+    return fail('PRECONDITION', `No trustworthy base for ${branch}: no base SHA recorded at claim time is present in the workspace and origin's ${base} is not available locally; refusing to evaluate the sensitive-path gate against a movable local ref.`);
   }
-  if (!baseRef) return fail('PRECONDITION', `Base branch "${base}" does not exist in the workspace.`);
-  const d = await git(repo, ['diff', '--name-only', '--no-renames', '-z', `${baseRef}...${head}`], true);
-  if (d.code !== 0) return fail('INTERNAL', `Cannot diff ${branch} against ${base}: ${lastLines(d.stderr)}`);
-  const changedPaths = d.stdout.split('\0').filter(Boolean);
+  const changed = new Set<string>();
+  for (const b of new Set([...bases.trusted, ...bases.local])) {
+    const d = await git(repo, ['diff', '--name-only', '--no-renames', '-z', `${b}...${head}`], true);
+    if (d.code !== 0) return fail('INTERNAL', `Cannot diff ${branch} against ${base} (${b}): ${lastLines(d.stderr)}`);
+    for (const f of d.stdout.split('\0')) if (f) changed.add(f);
+  }
+  const changedPaths = [...changed];
   const sensitivePaths = changedPaths.filter((p) => matchesAny(p, cfg.sensitivePaths));
 
   // 3. Capability gates.
@@ -156,14 +197,15 @@ export async function publishTask(input: PublishInput): Promise<PublishOutcome> 
     }
   }
   if (reasons.length) {
-    const check = verifyAnyApproval(input.approvals, await readPublicKey(input.approvalPublicKeyFile ?? runtimePaths().approvalPublicKey),
-      { taskId: input.task.id, head, now: input.now });
+    const keyFile = input.approvalPublicKeyFile ?? runtimePaths().approvalPublicKey;
+    const pem = await readPublicKey(keyFile);
+    const check = pem
+      ? verifyAnyApproval(input.approvals, pem, { taskId: input.task.id, head, now: input.now })
+      : { ok: false as const, reason: missingApprovalKeyReason(keyFile) };
     if (!check.ok) return { state: 'awaiting-approval', reasons, changedPaths, sensitivePaths, approvalError: check.reason };
   }
 
-  // 4. Remote branch: reconcile, fast-forward only, never force. The host runtime names the normalized
-  // https URL instead of the agent-writable `origin` remote (no pushurl / receivepack from the workspace).
-  const remote = isHostRuntime() ? https : 'origin';
+  // 4. Remote branch: reconcile, fast-forward only, never force.
   const ghCwd = isHostRuntime() ? '/' : repo; // gh gets --repo; outside the workspace it never runs git there
   const ls = await git(repo, ['ls-remote', '--heads', remote, `refs/heads/${branch}`], true);
   if (ls.code !== 0) return fail(classifyFailure(ls.stderr), `Cannot read origin: ${lastLines(ls.stderr) || `git exit ${ls.code}`}`);

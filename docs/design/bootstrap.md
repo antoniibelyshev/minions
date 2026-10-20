@@ -213,7 +213,14 @@ Decision record for `delivery.mode` `branch` / `pull-request` (`src/runtime/publ
   publication succeeded.
 - **Gates (deterministic).** `git.push` (and `pr.create` in pull-request mode) are evaluated with
   `can()` against the paths changed by `git diff --name-only --no-renames <base>...<head>` (renames split
-  so moving a file out of a sensitive path counts). `deny` fails. `ask` — including the
+  so moving a file out of a sensitive path counts). The changed paths are the union over every base the
+  gate knows of: the base SHAs recorded in the runtime DB when the task's leases were claimed
+  (`leases.base_sha`), origin's current base as read from the server with `git ls-remote` (when that
+  commit is present locally), and the workspace's `refs/heads/<base>` / `refs/remotes/{origin,host}/<base>`.
+  The local refs are movable by in-runtime code (`git update-ref`), so they can only add paths; at least
+  one of the first two must resolve, otherwise publication fails closed (`PRECONDITION`, nothing
+  pushed). Moving the local base ref to the branch head therefore no longer empties the diff
+  (task-1.12). Local delivery never runs this gate. `deny` fails. `ask` — including the
   sensitive-path upgrade allow→ask — requires a **host-signed** human approval for exactly that head
   (see "Host-signed publication approvals" below; a new commit needs a new approval). The coordinator's
   Claude Code settings still put `minions work approve` under `ask` and deny `git push` /
@@ -264,13 +271,22 @@ the normal flow.
   The DB row is only a carrier and is not trusted. It fails closed (publication stays
   `awaiting-approval`, with `approvalError` naming the cause) when there is no public key, no token,
   a malformed or tampered token, a signature from another key, another task or head, or an expired
-  approval. Where the key is read from is decided without trusting the environment: whenever
+  approval. A missing key's reason names the path that was tried; in the host runtime with
+  `MINIONS_CONFIG` unset (a launch that bypassed the shim) it says so instead of suggesting a first
+  approval, because the verifier then looks at the container path, which never exists on the host.
+  Where the key is read from is decided without trusting the environment: whenever
   `/opt/minions/config` exists (the container's read-only bind) or `MINIONS_RUNTIME=container`, the
   verifier reads the literal `/opt/minions/config/approval-public-key.pem`; `MINIONS_CONTAINER_ROOT`,
   `MINIONS_CONFIG` and `MINIONS_RUNTIME` cannot redirect it (an agent can set or unset all three).
   Only the host runtime, which has no such directory, uses its runtime config dir (`MINIONS_CONFIG`,
   pinned by the shim). The same filesystem check refuses the host-side `work approve` (signing)
   inside the container, even with `MINIONS_RUNTIME` unset.
+- **Upgrade to DB schema 3.** Approval rows recorded before schema 3 have no signature and no longer
+  authorize anything. A task that was waiting for publication approval when the runtime was upgraded
+  stays `awaiting-human` (`approvalError`: no host-signed approval is recorded, or no public key exists yet) until the user
+  approves it again **on the host** with `minions work approve <taskId> --head <sha>`, then runs
+  `minions work publish <taskId>`. The first such approval also creates the project's signing key and
+  writes the public key the runtime verifies against.
 - **Scope.** Every human publication approval is signed: sensitive-path changes and "ask" capabilities
   alike. Publication that needs no approval (allow, no sensitive paths) is unchanged and needs no key.
 
@@ -284,8 +300,24 @@ token, which is the real exposure. It does not stop in-runtime code from using t
 directly: the token is readable inside the container (the git credential helper
 and the gh wrapper need it), so a compromised worker can push any branch, or open a PR, with whatever
 the token allows. In the host runtime the agents run as the user under the Claude Code sandbox, so
-the separation is only as strong as that sandbox (its `denyRead` on the credential store). The final
-protection must therefore be server-side:
+the separation is only as strong as that sandbox (its `denyRead` on the credential store). Two more
+cases in the same class, named explicitly:
+
+- **Host runtime: `MINIONS_CONFIG` override.** In the host runtime the verifier's key path is derived
+  from `MINIONS_CONFIG` (the shim pins it to `<project>/runtime/config.json`). Code that can start
+  `minions` with its own environment can point `MINIONS_CONFIG` at a directory it controls, put its
+  own public key there and sign its own approvals, so that process's publication gate accepts them.
+  This is the "own process, own environment" case above, not a new hole: such code could equally run
+  its own `node` without the check, and either way it gains nothing beyond the GitHub token it can
+  already read. The container is not affected (the key path there is the literal read-only bind,
+  whatever the environment says).
+- **Runtime DB rows.** The sensitive-path gate trusts the base SHAs recorded in `/state/minions.db`
+  at claim time. Code that can rewrite the DB (and move the local base refs) can make those bases
+  point at the head, leaving origin's base, read live from the server, as the remaining check; code
+  that also moves origin's base needs push rights on the base branch, i.e. the token. Rewriting the
+  DB is therefore the same trust class as using the token directly.
+
+The final protection must therefore be server-side:
 
 - **Minimal token scope.** Use a fine-grained personal access token limited to the one repository with
   `Contents: read and write`, `Pull requests: read and write` and `Metadata: read`. Do not grant

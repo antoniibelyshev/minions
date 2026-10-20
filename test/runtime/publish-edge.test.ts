@@ -96,7 +96,7 @@ describe('sensitive path detection and publication argv safety (fake git/gh)', (
     const repo = join(tmp(), 'repo');
     execFileSync('git', ['init', '-q', '-b', 'main', repo]);
     gitSync(repo, 'config', 'user.email', 't@e.st'); gitSync(repo, 'config', 'user.name', 't');
-    commitFile(repo, 'base.txt', 'base');
+    const baseSha = commitFile(repo, 'base.txt', 'base');
     gitSync(repo, 'checkout', '-q', '-b', 'agent/t');
     const head = commitFile(repo, 'x.txt', 'x');
     const cfg = defaults();
@@ -119,9 +119,9 @@ describe('sensitive path detection and publication argv safety (fake git/gh)', (
       return { code: 0, stdout: 'https://github.com/acme/demo/pull/9\n', stderr: '' };
     };
     const keys = approvalKeys();
-    const run = (humanApproved = false, title = 'T') => publishTask({
+    const run = (humanApproved = false, title = 'T', baseShas: (string | null)[] = [baseSha]) => publishTask({
       config: cfg, task: { id: 'task-1', title, description: 'd', acceptanceCriteria: [] } as never,
-      repo, branch: 'agent/t', head, git, gh, tokenFile,
+      repo, branch: 'agent/t', head, git, gh, tokenFile, baseShas,
       approvals: humanApproved ? [keys.sign('task-1', head)] : [], approvalPublicKeyFile: keys.publicKeyFile,
     });
     return { run, calls, ghCalls };
@@ -193,6 +193,16 @@ describe('sensitive path detection and publication argv safety (fake git/gh)', (
       }
       expect(t.ghCalls.every((g) => g.cwd === '/')).toBe(true);
     } finally { if (prev === undefined) delete process.env.MINIONS_RUNTIME; else process.env.MINIONS_RUNTIME = prev; }
+  });
+
+  it('fails closed without a trustworthy base: no usable recorded base SHA and no remote base (local refs alone never suffice)', async () => {
+    const t = setup(['a.ts']); // refs/heads/main exists, but ls-remote reports no base
+    for (const baseShas of [[], [null], ['f'.repeat(40)], ['main'], ['HEAD~1']]) {
+      const out = await t.run(false, 'T', baseShas);
+      expect(out, JSON.stringify(baseShas)).toMatchObject({ state: 'failed', code: 'PRECONDITION', message: expect.stringMatching(/No trustworthy base/) });
+    }
+    expect(t.calls.some((a) => a[0] === 'push')).toBe(false);
+    expect(t.ghCalls).toHaveLength(0);
   });
 
   it('hostile task id/title produce a safe branch slug', () => {
