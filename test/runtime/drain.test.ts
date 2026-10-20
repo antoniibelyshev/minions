@@ -180,7 +180,103 @@ describe('drain hook (PreToolUse, every tool)', () => {
   });
 });
 
+describe('drain hook gate and phases (tester additions)', () => {
+  const gateEnv = () => {
+    const dir = tmp('minions-drain-gate2-');
+    const state = join(dir, 'state');
+    mkdirSync(join(state, 'run'), { recursive: true });
+    return { dir, state };
+  };
+  const runGate = (env: Record<string, string>) => {
+    try {
+      execFileSync('sh', ['-c', DRAIN_HOOK_COMMAND], { env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+      return 0;
+    } catch (e) { return (e as { status: number }).status; }
+  };
+
+  it('the gate never exits 2 (the only blocking PreToolUse exit code), even with a missing or broken minions binary', () => {
+    const { dir, state } = gateEnv();
+    const empty = join(dir, 'empty-bin');
+    const broken = join(dir, 'broken-bin');
+    mkdirSync(empty); mkdirSync(broken);
+    writeFileSync(join(broken, 'minions'), '#!/bin/sh\necho boom >&2\nexit 1\n');
+    chmodSync(join(broken, 'minions'), 0o755);
+    // No flag: exit 0 without looking for minions at all.
+    expect(runGate({ PATH: `${empty}:/usr/bin:/bin`, MINIONS_STATE_DIR: state })).toBe(0);
+    writeFileSync(join(state, 'run', 'drain'), '{}');
+    // Flag present: a missing binary is 127 and a crashing one 1; both are non-blocking hook errors.
+    expect(runGate({ PATH: `${empty}:/usr/bin:/bin`, MINIONS_STATE_DIR: state })).toBe(127);
+    expect(runGate({ PATH: `${broken}:/usr/bin:/bin`, MINIONS_STATE_DIR: state })).toBe(1);
+  });
+
+  it('the hooks.json command string keeps the ${MINIONS_STATE_DIR:-/state} default for the shell (no JSON escaping)', () => {
+    const json = JSON.parse(readFileSync(new URL('../../templates/plugin/hooks/hooks.json', import.meta.url), 'utf8')) as
+      { hooks: { PreToolUse: { matcher: string; hooks: { command: string }[] }[] } };
+    const entry = json.hooks.PreToolUse.find((h) => h.matcher === '*');
+    expect(entry?.hooks[0]?.command).toBe(DRAIN_HOOK_COMMAND);
+    expect(DRAIN_HOOK_COMMAND).toContain('${MINIONS_STATE_DIR:-/state}/run/drain');
+    // Shell expansion of the default, without touching the real /state.
+    const expanded = execFileSync('sh', ['-c', 'echo ${MINIONS_STATE_DIR:-/state}/run/drain'], { env: { PATH: '/usr/bin:/bin' }, encoding: 'utf8' });
+    expect(expanded.trim()).toBe('/state/run/drain');
+  });
+
+  it('testers get their own notice; the Handback tool and TodoWrite stay allowed after the grace', async () => {
+    const env = makeEnv();
+    env.backlog.add({ id: 'task-1' });
+    const e = await env.sched.claim('task-1', 'engineer');
+    const head = commitFile(e.worktree, 'a.txt', 'x');
+    await env.sched.record(e.leaseId, result({ branch: e.branch, headSha: head }));
+    env.backlog.tasks.get('task-1')!.status = 'testing';
+    await env.sched.claim('task-1', 'tester');
+    requestDrain(env.db, flagOf(env), 'upgrade');
+    const load = () => ({ db: env.db });
+    const first = out(await drainHook(worker('minions:tester', 'Bash', { command: 'npm test' }), load));
+    expect(first.hookSpecificOutput.additionalContext).toMatch(/If you changed tests, commit them.*if you have nothing to commit, return a partial WorkerResult right away/);
+    for (let i = 0; i < DRAIN_GRACE_CALLS; i++) await drainHook(worker('minions:tester', 'Read'), load);
+    expect(out(await drainHook(worker('minions:tester', 'Write', { file_path: '/w/t.test.ts' }), load)).hookSpecificOutput.permissionDecision).toBe('deny');
+    for (const tool of ['SubagentHandback', 'TodoWrite', 'Glob']) expect((await drainHook(worker('minions:tester', tool), load)).stdout, tool).toBeUndefined();
+    // A new drain request (after a clear) restarts the count: notice first again.
+    clearDrain(env.db, flagOf(env), 'test');
+    requestDrain(env.db, flagOf(env), 'upgrade');
+    expect(out(await drainHook(worker('minions:tester', 'Edit'), load)).hookSpecificOutput.additionalContext).toMatch(/Upgrade pending/);
+  });
+
+  it('drainSafeBash: the usual Claude Code commit forms and the plain submit forms pass', () => {
+    for (const ok of [
+      "git commit -m \"$(cat <<'EOF'\nwip: half of it\n\nCo-Authored-By: X <x@y>\nEOF\n)\"",
+      'git -C /w add -A && git -C /w commit -m "wip: x"',
+      "minions work submit lease-1 --role tester --json <<'RESULT'\n{\"status\":\"partial\"}\nRESULT",
+      "cd \"/w with space\" && minions work submit lease-1 --role tester --json <<'RESULT'\n{}\nRESULT",
+    ]) expect(drainSafeBash(ok), ok).toBe(true);
+  });
+});
+
 describe('drain partials (record + re-dispatch)', () => {
+  it('a partial from a lease started after the drain was cleared is an ordinary partial', async () => {
+    const env = makeEnv();
+    env.backlog.add({ id: 'task-1' });
+    requestDrain(env.db, flagOf(env), 'upgrade');
+    pauseControl(env.db, flagOf(env), 'resume', { starts: true });
+    await new Promise((r) => setTimeout(r, 5)); // lease started_at strictly after the drain-request event
+    const b = await env.sched.claim('task-1', 'engineer');
+    const head = commitFile(b.worktree, 'a.txt', 'half');
+    const r = await env.sched.record(b.leaseId, result({ status: 'partial', branch: b.branch, headSha: head }));
+    expect(r.drain).toBeUndefined();
+    expect(env.db.events('task-1', 'record').at(-1)?.data).not.toMatchObject({ drain: true });
+    expect((await env.sched.claim('task-1', 'engineer')).resume).toBeUndefined();
+  });
+
+  it('only partials are drain partials: a blocked result during a drain is recorded as blocked', async () => {
+    const env = makeEnv();
+    env.backlog.add({ id: 'task-1' });
+    const b = await env.sched.claim('task-1', 'engineer');
+    requestDrain(env.db, flagOf(env), 'upgrade');
+    const head = commitFile(b.worktree, 'a.txt', 'x');
+    const r = await env.sched.record(b.leaseId, result({ status: 'blocked', branch: b.branch, headSha: head }));
+    expect(r.drain).toBeUndefined();
+    expect(r.to).toBe('blocked');
+  });
+
   it('an engineer drain partial is marked drain, costs no repair cycle, and the next brief continues from the wip: commit', async () => {
     const env = makeEnv();
     env.backlog.add({ id: 'task-1' });
