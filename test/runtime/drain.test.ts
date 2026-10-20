@@ -310,6 +310,63 @@ describe('drain hook gate and phases (tester additions)', () => {
     ]) expect(drainSafeBash(ok), ok).toBe(true);
   });
 
+  it('drainSafeBash: adversarial forms fail closed (task-3.9, tester additions)', () => {
+    for (const bad of [
+      // Line continuations do not hide a separator.
+      'git status \\\n; rm x',
+      'git status \\\n&& rm x',
+      // Builtins and nested shells are not on the allow list.
+      "eval 'rm x'",
+      'exec rm x',
+      "sh -c 'git status'",
+      'bash -c "rm x"',
+      // Aliases via -c, env and assignment prefixes, expanded command names.
+      "git -c alias.st='!rm x' st",
+      'env X=1 git status',
+      'X=1 git status',
+      'git${IFS}status',
+      'cat ${x:-$(rm x)}',
+      // CRLF: the carriage return sticks to the word, so nothing matches.
+      'git status\r\nrm x',
+      "git commit -m \"$(cat <<'EOF'\r\nwip\r\nEOF\r\n)\"",
+      // The commit form followed by another command.
+      "git commit -m \"$(cat <<'EOF'\nwip\nEOF\n)\"; rm x",
+      "git commit -m \"$(cat <<'EOF'\nwip\nEOF\n)\"\nrm x",
+      "git commit -m \"$(cat <<'EOF'\nwip\nEOF\n)\" | sh",
+      // An escaped substitution in an expanded body, arithmetic expansion, and redirection variants.
+      'cat <<EOF\n\\$(x)\nEOF',
+      'echo $((1<<2))',
+      'git status >|x',
+      'git status &>x',
+      'cat <>x',
+      'git status#; rm x',
+    ]) expect(drainSafeBash(bad), bad).toBe(false);
+    for (const ok of [
+      // A double-quoted delimiter is literal: the body is not expanded, the next line is still checked.
+      'cat <<"EOF"\n$(rm x)\nEOF\ngit status',
+      // A terminator with trailing spaces does not end the body (same as bash), so the real one does.
+      'cat <<EOF\nbody\nEOF \nrm x\nEOF',
+      'git status # ; rm x',
+      'echo $GIT_DIR ${IFS}',
+    ]) expect(drainSafeBash(ok), ok).toBe(true);
+    expect(drainSafeBash('cat <<"EOF"\nbody\nEOF\nrm x')).toBe(false);
+  });
+
+  it('drainSafeBash: real worker finish and commit forms with long multi-line bodies pass (task-3.9, tester additions)', () => {
+    const result = JSON.stringify({
+      status: 'partial',
+      summary: 'Drained mid-task: $(not run) `nor this` > nothing; "quotes" and \'apostrophes\'.',
+      checks: [{ command: 'npm test', outcome: 'pass', details: '1 | 2 && 3' }],
+      findings: Array.from({ length: 40 }, (_, k) => `finding ${k}: EOF RESULT ) ;`),
+    }, null, 2);
+    for (const ok of [
+      `cd /w && minions work submit lease-1 --role tester --json <<'RESULT'\n${result}\nRESULT`,
+      `minions work submit lease-1 --role engineer --json <<'RESULT'\n${result}\nRESULT\n`,
+      `git add -A && git commit -m "$(cat <<'EOF'\nwip: drain\n\n${result}\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\nEOF\n)"`,
+      `git -C "/w with space" commit -m "$(cat <<'EOF'\n${result}\nEOF\n)" && git status --short && git log --oneline -1`,
+    ]) expect(drainSafeBash(ok), ok).toBe(true);
+  });
+
   it('drainSafeBash: git -c and git commit --amend are rejected (task-3.9)', () => {
     for (const bad of [
       'git -c core.fsmonitor=x status',
