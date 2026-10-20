@@ -418,6 +418,38 @@ describe('drain hook gate and phases (tester additions)', () => {
     }
   });
 
+  it('drainSafeBash: other shell grammar fails closed (task-3.9, tester attempt 3)', () => {
+    for (const bad of [
+      '{touch,/tmp/p}',
+      '{ touch /tmp/p; }',
+      'case x in x) touch /tmp/p;; esac',
+      '! touch /tmp/p',
+      '((a[$(touch /tmp/p)]))',
+      '[[ -v a[$(touch /tmp/p)] ]]',
+      'echo $[$(touch /tmp/p)]',
+      'echo x 3>/tmp/p',
+      'echo x >>/tmp/p',
+      'cat <>/tmp/p',
+      'echo >|/tmp/p',
+      'echo &>/tmp/p',
+      'echo\tx;\ttouch\t/tmp/p',
+      'echo x;(touch /tmp/p)',
+      'echo x |& touch /tmp/p',
+      'coproc touch /tmp/p',
+      'GIT_DIR=x git status',
+      'echo $"$(touch /tmp/p)"',
+      'echo ${x:-$(touch /tmp/p)}',
+      'echo()(touch /tmp/p);echo',
+      'echo () { touch /tmp/p; }; echo',
+      'cat <<A <<B\na\nA\nb\nB\ntouch /tmp/p',
+      'cat <<EOF; touch /tmp/p\nx\nEOF\n',
+      "git commit -m \"$(cat <<'EOF'\nmsg\nEOF\n)$(touch /tmp/p)\"",
+      'echo x; touch /tmp/p',
+      'echo ' + 'a '.repeat(200_000) + '; touch /tmp/p',
+    ]) expect(drainSafeBash(bad), JSON.stringify(bad.slice(0, 80))).toBe(false);
+    expect(drainSafeBash('echo ' + 'a '.repeat(200_000))).toBe(true);
+  });
+
   it('drainSafeBash: git -c and git commit --amend are rejected (task-3.9)', () => {
     for (const bad of [
       'git -c core.fsmonitor=x status',
