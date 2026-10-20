@@ -506,7 +506,7 @@ describe('detached start detects a wrapper that dies immediately', () => {
     const exits: SpawnLike = () => ({
       on(event: string, cb: (...a: unknown[]) => void) { if (event === 'exit') setImmediate(() => cb(2, null)); return this; },
     } as ReturnType<SpawnLike>);
-    const sleep = async () => { await coordinatorWrapper(async () => defaults(), { paths, spawn: exits, env: {}, log: () => {}, signals: fakeSignals().target }); };
+    const sleep = async () => { await coordinatorWrapper(async () => defaults(), { paths, spawn: exits, permissionModes: autoModes, env: {}, log: () => {}, signals: fakeSignals().target }); };
     await expect(syncCoordinator(defaults(), { paths, runner: t.runner, activeLeases: () => [], sleep }, { startDetached: true }))
       .rejects.toMatchObject({ message: expect.stringMatching(/exited with code 2/) });
     expect(await readExitRecord(paths)).toMatchObject({ version: 1, code: 2 });

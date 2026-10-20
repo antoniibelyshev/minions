@@ -529,6 +529,8 @@ export interface SpawnLike {
     on(event: 'error', cb: (e: Error) => void): unknown;
     on(event: 'exit', cb: (code: number | null, signal: NodeJS.Signals | null) => void): unknown;
     kill?(signal: NodeJS.Signals): unknown;
+    /** claude's pid: its MCP children are found through it (see the escalation below). */
+    pid?: number;
   };
 }
 
@@ -567,6 +569,50 @@ export interface RunCoordinatorDeps {
   timer?: (fn: () => void, ms: number) => () => void;
   /** The installed Claude Code's --permission-mode choices (default: `claude --help`); asked only when auto is configured. */
   permissionModes?: () => Promise<string[] | null>;
+  /** Pre-spawn signal guard of coordinatorWrapper: a signal before claude starts cancels the launch. */
+  preSpawn?: PreSpawnGuard;
+  /** Process table for stopping claude's MCP children on SIGKILL (default: /proc). */
+  proc?: ProcessControl;
+}
+
+/** Signals that end the wrapper cleanly before claude starts (Ctrl-C there is meant for the wrapper). */
+export const PRE_SPAWN_SIGNALS: NodeJS.Signals[] = [...FORWARDED_SIGNALS, ...IGNORED_SIGNALS];
+
+/**
+ * Decision (task-38): the probe window. Between taking the lock and spawning claude the wrapper awaits
+ * the Telegram probe, `claude --help` (up to 30 s each) and any other start-up work. A signal there
+ * used to kill the wrapper with Node's default action and leave a dead-pid lock. coordinatorWrapper
+ * installs this guard in the same tick it takes the lock: the first PRE_SPAWN_SIGNALS signal is
+ * recorded, `aborted` resolves, and the wrapper releases the lock and exits 128+n. runCoordinator calls
+ * `handOff()` synchronously right before installing its own handlers and spawning, so there is no gap
+ * in which a signal hits neither; after a signal `handOff()` returns false and claude is never started
+ * (nor the launch record written).
+ */
+export interface PreSpawnGuard {
+  /** The first signal received before claude started, or null. */
+  readonly signal: NodeJS.Signals | null;
+  /** Resolves with that signal. */
+  readonly aborted: Promise<NodeJS.Signals>;
+  /** Removes the guard's handlers; false (handlers stay) when a signal already arrived. */
+  handOff(): boolean;
+  /** Removes the guard's handlers unconditionally. */
+  dispose(): void;
+}
+
+export function installPreSpawnGuard(signals: SignalTarget = process): PreSpawnGuard {
+  let got: NodeJS.Signals | null = null;
+  let fire: (s: NodeJS.Signals) => void = () => {};
+  const aborted = new Promise<NodeJS.Signals>((res) => { fire = res; });
+  const installed = PRE_SPAWN_SIGNALS.map((s) => [s, () => { if (!got) { got = s; fire(s); } }] as const);
+  for (const [s, h] of installed) signals.on(s, h);
+  let removed = false;
+  const dispose = () => { if (removed) return; removed = true; for (const [s, h] of installed) signals.removeListener(s, h); };
+  return {
+    get signal() { return got; },
+    aborted,
+    handOff: () => { if (got) return false; dispose(); return true; },
+    dispose,
+  };
 }
 
 /**
@@ -576,6 +622,13 @@ export interface RunCoordinatorDeps {
  * ESCALATE_KILL_MS (both from the first signal), well inside the restart's LOCK_RELEASE_WAIT_MS. It
  * only ever signals its own claude child through the spawn handle, and never after that child exited
  * (an unreaped child keeps its pid, so the handle cannot hit a reused pid).
+ *
+ * MCP children (task-38): claude stops its MCP servers (the Telegram poller) itself on SIGHUP/SIGTERM.
+ * SIGKILL gives it no chance, so right before the SIGKILL the wrapper SIGKILLs claude's descendants,
+ * deepest first, each re-verified through its /proc parent while claude has not exited (so none was
+ * reparented or reused). The pane's process group is not signalled: claude shares it with the pane's
+ * foreground job, and task-17 keeps Ctrl-C there. Without /proc no descendant is found; those servers
+ * then rely on the stdin EOF they get when claude dies.
  */
 export const ESCALATE_TERM_MS = 4000;
 export const ESCALATE_KILL_MS = 8000;
@@ -595,6 +648,9 @@ export async function runCoordinator(cfg: MinionsConfig, deps: RunCoordinatorDep
   if (cfg.communication.channel !== 'terminal' && cfg.container.network !== 'none' && token.state === 'ok' && runtimeMode() !== 'host-runtime') {
     try { probe = await (deps.probe ?? (() => probeTelegram()))(); } catch { probe = null; }
   }
+  // A signal during the probe window cancels the launch (see PreSpawnGuard); checked after every await.
+  const cancelled = () => (deps.preSpawn?.signal ? exitCodeOf(null, deps.preSpawn.signal) : null);
+  if (cancelled() !== null) return cancelled()!;
   const decision = decideTelegram(cfg, token, probe);
   // Intended Telegram (telegram, or auto with a token) says why it is off; auto without a token is plain terminal mode.
   const intended = resolveChannel(cfg.communication.channel, runtimeChannelFacts(cfg, token, probe)).wantsTelegram;
@@ -604,9 +660,12 @@ export async function runCoordinator(cfg: MinionsConfig, deps: RunCoordinatorDep
   // Auto mode only where this Claude Code offers it; otherwise acceptEdits with a clear message.
   const permissionModes = configuredPermissionMode(cfg) === 'auto' && runtimeMode() !== 'host-runtime'
     ? await (deps.permissionModes ?? (() => claudePermissionModes()))().catch(() => null) : undefined;
+  if (cancelled() !== null) return cancelled()!;
   const perm = decidePermissionMode(cfg, { modes: permissionModes });
   if (perm.fallback) log(`minions: ${perm.reason}`);
   const c = await buildClaudeCommand(cfg, paths, { telegram: decision.enabled, startupPrompt: deps.startupPrompt, permissionModes });
+  // Before the launch record: a cancelled wrapper must not overwrite its successor's record.
+  if (cancelled() !== null) return cancelled()!;
   const env: NodeJS.ProcessEnv = { ...(deps.env ?? process.env) };
   delete env[TELEGRAM_TOKEN_ENV];
   if (decision.enabled && token.state === 'ok') env[TELEGRAM_TOKEN_ENV] = token.token;
@@ -614,7 +673,10 @@ export async function runCoordinator(cfg: MinionsConfig, deps: RunCoordinatorDep
   await atomicWrite(paths.coordinatorLaunch, JSON.stringify(record, null, 2) + '\n').catch(() => { /* state not writable: restart detection degrades */ });
   const spawn = deps.spawn ?? (nodeSpawn as unknown as SpawnLike);
   const signals = deps.signals ?? process;
+  const proc = deps.proc ?? systemProcessControl;
   return new Promise((resolve, reject) => {
+    // Same tick as installing the handlers below and spawning: no signal can fall between the two.
+    if (deps.preSpawn && !deps.preSpawn.handOff()) { resolve(cancelled()!); return; }
     const installed: [NodeJS.Signals, () => void][] = [];
     const cleanup = () => { for (const [s, h] of installed.splice(0)) signals.removeListener(s, h); };
     // Install before spawning so no window exists where Ctrl-C kills the wrapper but not claude.
@@ -622,7 +684,12 @@ export async function runCoordinator(cfg: MinionsConfig, deps: RunCoordinatorDep
     let child: ReturnType<SpawnLike> | undefined;
     let exited = false;
     const timers: (() => void)[] = [];
-    const killChild = (s: NodeJS.Signals) => { if (exited) return; try { child?.kill?.(s); } catch { /* already gone */ } };
+    const killChild = (s: NodeJS.Signals) => {
+      if (exited) return;
+      // MCP servers first, while claude (alive or unreaped) is still their verified parent.
+      if (s === 'SIGKILL' && child?.pid) { try { signalDescendants(proc, child.pid, 'SIGKILL', () => !exited); } catch { /* best effort */ } }
+      try { child?.kill?.(s); } catch { /* already gone */ }
+    };
     const escalate = (first: NodeJS.Signals) => {
       if (timers.length) return; // already escalating
       const timer = deps.timer ?? defaultTimer;
@@ -671,7 +738,7 @@ export interface ExitRecord {
 /** Lock storage (RuntimeDb implements it). */
 export interface CoordinatorLockStore {
   coordinatorLock(): CoordinatorLock | undefined;
-  acquireCoordinatorLock(session: string, pid?: number, alive?: (pid: number) => boolean): CoordinatorLock;
+  acquireCoordinatorLock(session: string, pid?: number, alive?: LockAlive, start?: string | null): CoordinatorLock;
   releaseCoordinatorLock(session: string, pid?: number): boolean;
 }
 
@@ -684,32 +751,55 @@ const LOCK_POLL_MS = 250;
 /** Session label recorded in the lock: the tmux session name inside tmux, `direct` otherwise. */
 export const lockSession = (env: NodeJS.ProcessEnv = process.env) => (env.TMUX ? TMUX_SESSION : 'direct');
 
-/** Lock holder liveness: the pid exists and (where /proc exists) still runs a coordinator wrapper. */
-export function coordinatorPidAlive(pid: number, readCmdline: (pid: number) => string | null = procCmdline): boolean {
-  if (!pidAlive(pid)) return false;
-  const cmd = readCmdline(pid);
-  return cmd === null || /\bcoordinator\b/.test(cmd);
+/** Liveness check for a lock holder; gets the lock row so it can compare the recorded start time. */
+export type LockAlive = (pid: number, lock?: Pick<CoordinatorLock, 'start'>) => boolean;
+
+/**
+ * Lock holder liveness (task-38): the pid exists, its start time matches the one recorded in the lock
+ * (when both are known), and (where /proc exists) it still runs a coordinator wrapper. The start time
+ * is what tells a reused pid apart: a tmux client's argv also contains `coordinator run`. Without /proc
+ * (macOS host runtime) a live pid counts as the holder: a second coordinator is refused, never signalled.
+ */
+export function coordinatorPidAlive(pid: number, lock?: Pick<CoordinatorLock, 'start'>, pc: Pick<ProcessControl, 'alive' | 'cmdline' | 'startTime'> = systemProcessControl): boolean {
+  if (!pc.alive(pid)) return false;
+  const start = lock?.start ? pc.startTime(pid) : null;
+  if (start !== null && start !== lock?.start) return false;
+  const cmd = pc.cmdline(pid);
+  return cmd === null || isWrapperCmdline(cmd);
 }
 
+/** `minions coordinator run`, but not a tmux client whose argv carries that command, nor `coordinator sync/status`. */
+export const isWrapperCmdline = (cmd: string) => WRAPPER_CMDLINE.test(cmd) && !TMUX_CMDLINE.test(cmd);
+
 function procCmdline(pid: number): string | null {
-  try { return readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0').join(' '); } catch { return null; }
+  try { return readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0').join(' ').trim(); } catch { return null; }
+}
+
+/** /proc/<pid>/stat field 22 (starttime, clock ticks since boot); null without /proc. */
+export function procStartTime(pid: number): string | null {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+    const v = stat.slice(stat.lastIndexOf(')') + 2).split(' ')[19];
+    return v && /^\d+$/.test(v) ? v : null;
+  } catch { return null; }
 }
 
 const defaultSleep = (ms: number) => new Promise<void>((res) => setTimeout(res, ms));
 
-export interface LockWaitOptions { pid?: number; session?: string; alive?: (pid: number) => boolean; waitMs?: number; sleep?: (ms: number) => Promise<void>; log?: (line: string) => void }
+export interface LockWaitOptions { pid?: number; session?: string; alive?: LockAlive; /** The holder's process start time recorded in the lock (default: read from /proc). */ start?: string | null; waitMs?: number; sleep?: (ms: number) => Promise<void>; log?: (line: string) => void }
 
 /** Acquires the coordinator lock, waiting up to `waitMs` for a live holder to exit (restart); CONFLICT after that. */
 export async function acquireCoordinatorLockWaiting(store: CoordinatorLockStore, o: LockWaitOptions = {}): Promise<CoordinatorLock> {
   const pid = o.pid ?? process.pid;
   const session = o.session ?? lockSession();
-  const alive = o.alive ?? ((p: number) => coordinatorPidAlive(p));
+  const alive: LockAlive = o.alive ?? ((p, l) => coordinatorPidAlive(p, l));
+  const start = o.start === undefined ? procStartTime(pid) : o.start;
   const sleep = o.sleep ?? defaultSleep;
   const waitMs = o.waitMs ?? LOCK_WAIT_MS;
   let waited = 0;
   let announced = false;
   for (;;) {
-    try { return store.acquireCoordinatorLock(session, pid, alive); } catch (e) {
+    try { return store.acquireCoordinatorLock(session, pid, alive, start); } catch (e) {
       const conflict = e instanceof MinionsError && e.code === 'CONFLICT';
       if (!conflict) throw e;
       if (waited >= waitMs) {
@@ -724,13 +814,13 @@ export async function acquireCoordinatorLockWaiting(store: CoordinatorLockStore,
 }
 
 /** Waits until no live holder has the lock (true) or `waitMs` passes (false). */
-export async function waitForLockRelease(store: Pick<CoordinatorLockStore, 'coordinatorLock'>, o: { alive?: (pid: number) => boolean; waitMs?: number; sleep?: (ms: number) => Promise<void> } = {}): Promise<boolean> {
-  const alive = o.alive ?? ((p: number) => coordinatorPidAlive(p));
+export async function waitForLockRelease(store: Pick<CoordinatorLockStore, 'coordinatorLock'>, o: { alive?: LockAlive; waitMs?: number; sleep?: (ms: number) => Promise<void> } = {}): Promise<boolean> {
+  const alive: LockAlive = o.alive ?? ((p, l) => coordinatorPidAlive(p, l));
   const sleep = o.sleep ?? defaultSleep;
   const waitMs = o.waitMs ?? LOCK_RELEASE_WAIT_MS;
   for (let waited = 0; ; waited += LOCK_POLL_MS) {
     const cur = store.coordinatorLock();
-    if (!cur || !alive(cur.pid)) return true;
+    if (!cur || !alive(cur.pid, cur)) return true;
     if (waited >= waitMs) return false;
     await sleep(LOCK_POLL_MS);
   }
@@ -741,11 +831,12 @@ export async function waitForLockRelease(store: Pick<CoordinatorLockStore, 'coor
 // Decision (task-17): when a restart's kill-session did not make the old wrapper release the lock in
 // LOCK_RELEASE_WAIT_MS (claude ignores SIGHUP and the wrapper's own escalation did not help, or the
 // wrapper itself hangs), syncCoordinator stops the lock holder before relaunching: SIGTERM the wrapper,
-// wait, then SIGKILL its claude children and the wrapper, wait again. A pid is signalled only when,
-// re-checked right before that signal: it is still the pid this project's runtime DB lock names (or a
-// direct child of it), it is alive, and its /proc cmdline is a coordinator wrapper (`coordinator run`)
-// or claude. Without /proc (macOS host runtime) nothing can be verified, so nothing is signalled and
-// the restart fails with a clear error instead of relaunching onto a held lock.
+// wait, then SIGKILL its claude children (and their descendants, the MCP servers) and the wrapper, wait
+// again. A pid is signalled only when, re-checked right before that signal: it is still the pid this
+// project's runtime DB lock names with the recorded start time (or a descendant of it, verified through
+// the /proc parent chain), it is alive, and its /proc cmdline is a coordinator wrapper (`coordinator
+// run`) or claude. Without /proc (macOS host runtime) nothing can be verified, so nothing is signalled
+// and the restart fails with a clear error instead of relaunching onto a held lock.
 
 /** Process inspection and signalling (injectable for tests). */
 export interface ProcessControl {
@@ -753,6 +844,8 @@ export interface ProcessControl {
   /** argv joined by spaces; null when unreadable (no /proc). */
   cmdline: (pid: number) => string | null;
   parentOf: (pid: number) => number | null;
+  /** Process start time (see procStartTime); null when unreadable (no /proc). */
+  startTime: (pid: number) => string | null;
   pids: () => number[];
   kill: (pid: number, signal: NodeJS.Signals) => void;
 }
@@ -770,10 +863,45 @@ function procPids(): number[] {
 }
 
 export const systemProcessControl: ProcessControl = {
-  alive: pidAlive, cmdline: procCmdline, parentOf: procParent, pids: procPids, kill: (pid, s) => { process.kill(pid, s); },
+  alive: pidAlive, cmdline: procCmdline, parentOf: procParent, startTime: procStartTime, pids: procPids, kill: (pid, s) => { process.kill(pid, s); },
 };
 
+/**
+ * Descendants of `root` from one /proc snapshot, deepest first, each with the parent it was found under.
+ * Killing in this order keeps every parent alive (and unreaped) while its children are re-verified.
+ */
+export function descendantsOf(pc: Pick<ProcessControl, 'pids' | 'parentOf'>, root: number): { pid: number; parent: number }[] {
+  const children = new Map<number, number[]>();
+  for (const p of pc.pids()) {
+    const pp = pc.parentOf(p);
+    if (pp !== null && pp !== p) (children.get(pp) ?? children.set(pp, []).get(pp)!).push(p);
+  }
+  const out: { pid: number; parent: number }[] = [];
+  const seen = new Set([root]);
+  for (let level = [root]; level.length;) {
+    const next: number[] = [];
+    for (const parent of level) for (const pid of children.get(parent) ?? []) if (!seen.has(pid)) { seen.add(pid); out.push({ pid, parent }); next.push(pid); }
+    level = next;
+  }
+  return out.reverse();
+}
+
+/**
+ * Signals the descendants of `root` (deepest first), each only while it is alive, still a child of the
+ * parent it was found under, and `rootOk()` still holds. Returns the `signal pid` strings sent.
+ */
+export function signalDescendants(pc: ProcessControl, root: number, signal: NodeJS.Signals, rootOk: () => boolean): string[] {
+  const sent: string[] = [];
+  for (const d of descendantsOf(pc, root)) {
+    if (!(pc.alive(d.pid) && pc.parentOf(d.pid) === d.parent && rootOk())) continue;
+    try { pc.kill(d.pid, signal); sent.push(`${signal} ${d.pid}`); } catch { /* exited meanwhile */ }
+  }
+  return sent;
+}
+
 const WRAPPER_CMDLINE = /\bcoordinator run\b/;
+/** argv[0] is tmux: a tmux client (`tmux new-session ... minions coordinator run`), never the wrapper. */
+const TMUX_CMDLINE = /^(\S*\/)?tmux(\s|$)/;
 const CLAUDE_CMDLINE = /(^|[\s/])claude(\s|$)/;
 /** How long the escalation waits after SIGTERM, then after SIGKILL, for the lock to be released. */
 export const STUCK_TERM_WAIT_MS = 5000;
@@ -781,7 +909,7 @@ export const STUCK_KILL_WAIT_MS = 3000;
 
 export interface StopStuckOptions {
   proc?: ProcessControl;
-  alive?: (pid: number) => boolean;
+  alive?: LockAlive;
   sleep?: (ms: number) => Promise<void>;
   termWaitMs?: number;
   killWaitMs?: number;
@@ -793,9 +921,13 @@ export interface StopStuckOptions {
  */
 export async function stopStuckCoordinator(store: Pick<CoordinatorLockStore, 'coordinatorLock'>, pid: number, o: StopStuckOptions = {}): Promise<{ released: boolean; signalled: string[]; verified: boolean }> {
   const pc = o.proc ?? systemProcessControl;
-  const alive = o.alive ?? ((p: number) => pc.alive(p) && (pc.cmdline(p) ?? 'coordinator').includes('coordinator'));
+  const alive: LockAlive = o.alive ?? ((p, l) => coordinatorPidAlive(p, l, pc));
   const wait = (waitMs: number) => waitForLockRelease(store, { alive, waitMs, sleep: o.sleep });
-  const isWrapper = (p: number) => store.coordinatorLock()?.pid === p && pc.alive(p) && WRAPPER_CMDLINE.test(pc.cmdline(p) ?? '');
+  const isWrapper = (p: number) => {
+    const l = store.coordinatorLock();
+    // A lock with a start time is verified against it; one that cannot be read (no /proc) never matches.
+    return l?.pid === p && pc.alive(p) && (!l.start || pc.startTime(p) === l.start) && isWrapperCmdline(pc.cmdline(p) ?? '');
+  };
   const isClaudeChild = (c: number) => c !== pid && pc.alive(c) && pc.parentOf(c) === pid && CLAUDE_CMDLINE.test(pc.cmdline(c) ?? '') && isWrapper(pid);
   const signalled: string[] = [];
   const send = (p: number, s: NodeJS.Signals, check: (p: number) => boolean) => {
@@ -806,7 +938,11 @@ export async function stopStuckCoordinator(store: Pick<CoordinatorLockStore, 'co
   send(pid, 'SIGTERM', isWrapper);
   if (await wait(o.termWaitMs ?? STUCK_TERM_WAIT_MS)) return { released: true, signalled, verified: true };
   // Children first: once the wrapper is gone they are reparented and can no longer be verified as its own.
-  for (const c of pc.pids().filter(isClaudeChild)) send(c, 'SIGKILL', isClaudeChild);
+  // Each claude's MCP servers (e.g. the Telegram poller) go before claude, for the same reason.
+  for (const c of pc.pids().filter(isClaudeChild)) {
+    signalled.push(...signalDescendants(pc, c, 'SIGKILL', () => isClaudeChild(c)));
+    send(c, 'SIGKILL', isClaudeChild);
+  }
   send(pid, 'SIGKILL', isWrapper);
   return { released: await wait(o.killWaitMs ?? STUCK_KILL_WAIT_MS), signalled, verified: true };
 }
@@ -816,10 +952,16 @@ export interface CoordinatorWrapperDeps extends RunCoordinatorDeps {
   lock?: CoordinatorLockStore;
   lockWait?: Omit<LockWaitOptions, 'log'>;
   /**
-   * Startup work run once the lock is held, before claude starts (the CLI passes the GitHub intake
-   * sync). Failures are logged and never stop the coordinator.
+   * Called with the exit code after a signal in the probe window ended the wrapper (lock released,
+   * exit record written). The CLI passes process.exit: a probe still in flight must not keep it alive.
    */
-  onStart?: (cfg: MinionsConfig, log: (line: string) => void) => Promise<void>;
+  exitAfterSignal?: (code: number) => void;
+  /**
+   * Startup work run once the lock is held, before claude starts (the CLI passes the GitHub intake
+   * sync). Failures are logged and never stop the coordinator. It runs inside the pre-spawn guard:
+   * `stop` is aborted on a signal, and the wrapper does not wait for it after that.
+   */
+  onStart?: (cfg: MinionsConfig, log: (line: string) => void, stop: AbortSignal) => Promise<void>;
 }
 
 /**
@@ -834,7 +976,9 @@ export async function coordinatorWrapper(loadConfig: () => Promise<MinionsConfig
     atomicWrite(paths.coordinatorExit, JSON.stringify({ version: 1, pid: process.pid, at: new Date().toISOString(), ...r }, null, 2) + '\n').catch(() => { /* best effort */ });
   let db: RuntimeDb | undefined;
   let held: CoordinatorLock | undefined;
+  let guard: PreSpawnGuard | undefined;
   const store = (): CoordinatorLockStore => deps.lock ?? (db ??= openDb(paths.db));
+  let code: number;
   try {
     const cfg = await loadConfig();
     // Before runCoordinator: a refused duplicate must not overwrite the running coordinator's launch record.
@@ -842,19 +986,34 @@ export async function coordinatorWrapper(loadConfig: () => Promise<MinionsConfig
     held = await acquireCoordinatorLockWaiting(store(), {
       session: lockSession(deps.env ?? process.env), ...deps.lockWait, log,
     });
-    if (deps.onStart) {
-      try { await deps.onStart(cfg, log); } catch (e) { log(`minions: startup step failed (the coordinator starts anyway): ${redact((e as Error).message).slice(0, 500)}`); }
-    }
-    const code = await runCoordinator(cfg, deps);
-    await write({ code });
-    return code;
+    // Same tick as the lock: every await until claude is spawned is covered (see PreSpawnGuard),
+    // the startup step (GitHub intake) included.
+    guard = installPreSpawnGuard(deps.signals ?? process);
+    const g = guard;
+    const stop = new AbortController();
+    void g.aborted.then(() => stop.abort());
+    const run = (async () => {
+      if (deps.onStart) {
+        try { await deps.onStart(cfg, log, stop.signal); } catch (e) { log(`minions: startup step failed (the coordinator starts anyway): ${redact((e as Error).message).slice(0, 500)}`); }
+      }
+      // A signal during the startup step: the race below has already ended the wrapper; never spawn.
+      if (g.signal) return exitCodeOf(null, g.signal);
+      return runCoordinator(cfg, { ...deps, preSpawn: g });
+    })();
+    // Errors still reach us through the race; after a pre-spawn signal a late one no longer matters.
+    run.catch(() => { /* see above */ });
+    code = await Promise.race([run, g.aborted.then((s) => exitCodeOf(null, s))]);
+    await write(g.signal ? { code, error: `stopped by ${g.signal} before claude started` } : { code });
   } catch (e) {
     await write({ code: 1, error: redact((e as Error).message).slice(0, 1000) });
     throw e;
   } finally {
+    guard?.dispose();
     if (held) { try { store().releaseCoordinatorLock(held.session, held.pid); } catch { /* a dead holder is taken over next time */ } }
     db?.close();
   }
+  if (guard?.signal) deps.exitAfterSignal?.(code);
+  return code;
 }
 
 export async function readExitRecord(paths: RuntimePaths = runtimePaths()): Promise<ExitRecord | null> {
@@ -884,7 +1043,7 @@ export interface SyncDeps {
   sleep?: (ms: number) => Promise<void>;
   /** Project coordinator lock: after kill-session, the relaunch waits for the old wrapper to release it. */
   lock?: Pick<CoordinatorLockStore, 'coordinatorLock'>;
-  lockAlive?: (pid: number) => boolean;
+  lockAlive?: LockAlive;
   lockReleaseWaitMs?: number;
   /** Stopping an old wrapper that outlived lockReleaseWaitMs (see stopStuckCoordinator). */
   proc?: ProcessControl;
@@ -962,12 +1121,12 @@ export async function syncCoordinator(cfg: MinionsConfig, deps: SyncDeps, opts: 
     if (deps.lock) {
       // Running only counts once the new wrapper holds the project lock, or its session outlived the
       // wrapper's whole lock wait (a wrapper refused with CONFLICT ends its session before that).
-      const alive = deps.lockAlive ?? ((p: number) => coordinatorPidAlive(p));
+      const alive: LockAlive = deps.lockAlive ?? ((p, l) => coordinatorPidAlive(p, l));
       const window = deps.handoverWaitMs ?? LOCK_WAIT_MS + DETACHED_SETTLE_MS;
       let held = false;
       for (let waited = 0; ; waited += LOCK_POLL_MS) {
         const cur = deps.lock.coordinatorLock();
-        if (cur && cur.session === TMUX_SESSION && alive(cur.pid) && !(prior && prior.pid === cur.pid && prior.acquiredAt === cur.acquiredAt)) { held = true; break; }
+        if (cur && cur.session === TMUX_SESSION && alive(cur.pid, cur) && !(prior && prior.pid === cur.pid && prior.acquiredAt === cur.acquiredAt)) { held = true; break; }
         if (waited > 0 && !(await tmuxHas(runner, paths))) throw await exited();
         if (waited >= window) break;
         await sleep(LOCK_POLL_MS);

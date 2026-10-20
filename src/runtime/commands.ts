@@ -89,9 +89,13 @@ export const intakeOnStart = async (
   cfg: MinionsConfig, log: (line: string) => void,
   sync: (opts: { signal: AbortSignal; gh?: GhFn }) => Promise<IntakeSyncReport> = runIntakeSync,
   budgetMs = STARTUP_INTAKE_BUDGET_MS,
+  /** Aborted by the wrapper on a signal before claude starts (task-38): the pass is aborted with it. */
+  stop?: AbortSignal,
 ): Promise<void> => {
-  if (!cfg.intake.github?.enabled) return;
+  if (!cfg.intake.github?.enabled || stop?.aborted) return;
   const ctl = new AbortController();
+  const onStop = () => ctl.abort();
+  stop?.addEventListener('abort', onStop, { once: true });
   const timers: NodeJS.Timeout[] = [];
   const late = new Promise<null>((resolve) => {
     timers.push(setTimeout(() => ctl.abort(), budgetMs));
@@ -104,6 +108,7 @@ export const intakeOnStart = async (
     if (r) log(`minions: ${formatIntake(r).split('\n').join('\nminions: ')}`);
     else log(`minions: intake sync did not finish within ${Math.round(budgetMs / 1000)} s; starting the coordinator without it (run \`minions sync\` later)`);
   } finally {
+    stop?.removeEventListener('abort', onStop);
     ctl.abort();
     for (const t of timers) clearTimeout(t);
   }
@@ -361,7 +366,12 @@ export function register(program: Command): void {
     .option('--recover', 'start claude with the recovery prompt (recover skill, then resume the queue)')
     .action(action(async (o: { recover?: boolean }) => {
       requireMode('runtime');
-      process.exitCode = await coordinatorWrapper(getConfig, { ...(o.recover ? { startupPrompt: RECOVERY_PROMPT } : {}), onStart: intakeOnStart });
+      // A signal before claude starts (startup intake included): exit now rather than wait for work still in flight.
+      process.exitCode = await coordinatorWrapper(getConfig, {
+        ...(o.recover ? { startupPrompt: RECOVERY_PROMPT } : {}),
+        onStart: (c, l, stop) => intakeOnStart(c, l, undefined, undefined, stop),
+        exitAfterSignal: (c) => process.exit(c),
+      });
     }));
   coord.command('sync').description('Apply restart-required Telegram changes with a controlled coordinator restart (container only)')
     .option('--force', 'restart even while worker leases are active (they stay recorded for recovery)')
