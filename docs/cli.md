@@ -54,7 +54,7 @@ run these yourself. They are not listed by the default help.
 | `minions work publish <taskId>` | Publish (or retry publishing) an approved task in branch / pull-request delivery; idempotent |
 | `minions work approve <taskId> --head <sha>` | Record your approval to publish that exact commit (sensitive paths, or `ask` publication) |
 | `minions backlog ready` / `list` / `show` / `create` / `update` / `note` / `export` | Backend-neutral task operations (inside the container) |
-| `minions sync [taskIds...]` | Refresh PR state and CI check results for tasks with a PR; reconcile merged/closed PRs (read-only on GitHub) |
+| `minions sync [taskIds...]` | Import issues matching `intake.github` into the backlog when enabled (also at coordinator start; skipped with a count while intake is paused; issues that leave the filter or are reassigned pause their task), then refresh PR state and CI check results for tasks with a PR and reconcile merged/closed PRs (read-only on GitHub). With task ids, only those PRs are refreshed |
 | `minions ci status` | Required status checks on the base branch and the external CI setup plan (read-only) |
 | `minions hook stop` / `pre-agent` / `pre-telegram` | Claude Code hook handlers (container only) |
 | `minions coordinator` / `coordinator run` / `sync` / `restart` | Attach or launch the coordinator session; restart it (`minions start` attaches for you) |

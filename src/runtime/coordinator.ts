@@ -815,6 +815,11 @@ export interface CoordinatorWrapperDeps extends RunCoordinatorDeps {
   /** Lock store; default: the runtime DB at paths.db (opened and closed by the wrapper). */
   lock?: CoordinatorLockStore;
   lockWait?: Omit<LockWaitOptions, 'log'>;
+  /**
+   * Startup work run once the lock is held, before claude starts (the CLI passes the GitHub intake
+   * sync). Failures are logged and never stop the coordinator.
+   */
+  onStart?: (cfg: MinionsConfig, log: (line: string) => void) => Promise<void>;
 }
 
 /**
@@ -833,9 +838,13 @@ export async function coordinatorWrapper(loadConfig: () => Promise<MinionsConfig
   try {
     const cfg = await loadConfig();
     // Before runCoordinator: a refused duplicate must not overwrite the running coordinator's launch record.
+    const log = deps.log ?? ((l: string) => process.stderr.write(l + '\n'));
     held = await acquireCoordinatorLockWaiting(store(), {
-      session: lockSession(deps.env ?? process.env), ...deps.lockWait, log: deps.log ?? ((l) => process.stderr.write(l + '\n')),
+      session: lockSession(deps.env ?? process.env), ...deps.lockWait, log,
     });
+    if (deps.onStart) {
+      try { await deps.onStart(cfg, log); } catch (e) { log(`minions: startup step failed (the coordinator starts anyway): ${redact((e as Error).message).slice(0, 500)}`); }
+    }
     const code = await runCoordinator(cfg, deps);
     await write({ code });
     return code;

@@ -253,6 +253,7 @@ export class BacklogMdAdapter implements BacklogAdapter {
     const labels = input.labels ?? [];
     checkLabels(labels);
     const meta: MinionsMeta = { provenance: input.provenance ?? DEFAULT_PROVENANCE };
+    if (input.externalLinks?.length) meta.externalLinks = [...input.externalLinks];
     const args = ['task', 'create', `--description=${composeDescription(input.description ?? '', meta)}`];
     for (const ac of input.acceptanceCriteria ?? []) args.push(`--ac=${ac}`);
     if (input.priority) args.push(`--priority=${input.priority}`);

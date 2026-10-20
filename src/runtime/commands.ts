@@ -27,7 +27,8 @@ import { runHook } from './hooks.js';
 import { runtimePaths } from './paths.js';
 import { capacityOf, LEASE_ROLES, Scheduler } from './scheduler.js';
 import { gitCredential } from './github.js';
-import { ciStatus, formatCiStatus, formatSync, syncTasks } from './ci.js';
+import { ciStatus, formatCiStatus, formatSync, syncTasks, type SyncReport } from './ci.js';
+import { formatIntake, originRepository, syncIntake, type IntakeSyncReport } from './intake-sync.js';
 import { exportWorkspace, importWorkspace, setupState } from './workspace.js';
 import { git, workspaceLayout } from './worktree.js';
 
@@ -64,6 +65,18 @@ async function context() {
 export const coordinatorRestartRecorder = (d: RuntimeDb) => (info: { at: string; reason: string; leases: string[]; recover?: boolean }): void => {
   d.setMeta('coordinator_restart', JSON.stringify(info));
   d.addEvent('coordinator-restart', null, info);
+};
+
+/** One intake pass with the runtime context (`minions sync` and coordinator startup). */
+export async function runIntakeSync(): Promise<IntakeSyncReport> {
+  const { db: d, backlog: b, config: cfg } = await context();
+  return syncIntake({ db: d, backlog: b, config: cfg, originRepository: () => originRepository(workspaceLayout().repo, git) });
+}
+
+/** Coordinator startup: one intake pass when intake.github is enabled (never blocks the start). */
+export const intakeOnStart = async (cfg: MinionsConfig, log: (line: string) => void, sync: () => Promise<IntakeSyncReport> = runIntakeSync): Promise<void> => {
+  if (!cfg.intake.github?.enabled) return;
+  log(`minions: ${formatIntake(await sync()).split('\n').join('\nminions: ')}`);
 };
 
 const scheduler = async () => new Scheduler({ ...(await context()), layout: workspaceLayout(), handoff: runtimePaths() });
@@ -288,7 +301,7 @@ export function register(program: Command): void {
     .option('--recover', 'start claude with the recovery prompt (recover skill, then resume the queue)')
     .action(action(async (o: { recover?: boolean }) => {
       requireMode('runtime');
-      process.exitCode = await coordinatorWrapper(getConfig, o.recover ? { startupPrompt: RECOVERY_PROMPT } : {});
+      process.exitCode = await coordinatorWrapper(getConfig, { ...(o.recover ? { startupPrompt: RECOVERY_PROMPT } : {}), onStart: intakeOnStart });
     }));
   coord.command('sync').description('Apply restart-required Telegram changes with a controlled coordinator restart (container only)')
     .option('--force', 'restart even while worker leases are active (they stay recorded for recovery)')
@@ -387,14 +400,17 @@ export function register(program: Command): void {
       emit(r, { json: globalOpts(cmd).json, human: (d) => `Wrote ${d.path}\n${d.refs.join('\n')}` });
     }));
 
-  // sync: one-shot refresh of PR state and CI check results (no polling loop); host delegates.
-  program.command('sync [taskIds...]').description('Refresh pull-request state and CI check results for tasks with a PR; reconcile merged/closed PRs (read-only on GitHub)')
+  // sync: one-shot GitHub intake import (when intake.github is enabled) plus a refresh of PR state and
+  // CI check results (no polling loop); host delegates.
+  program.command('sync [taskIds...]').description('Import issues matching intake.github into the backlog (when enabled), refresh pull-request state and CI check results for tasks with a PR; reconcile merged/closed PRs (read-only on GitHub)')
     .action(action(async (taskIds: string[], _o: unknown, cmd: Command) => {
       if (runtimeMode() === 'host') return delegate(cmd);
       const { db: d, backlog: b, config: cfg } = await context();
-      const r = await syncTasks({ db: d, backlog: b, config: cfg }, { taskIds });
-      emit(r, { json: globalOpts(cmd).json, human: formatSync });
-      if (r.failed) process.exitCode = 1;
+      // Intake runs on a full sync only (`minions sync <taskIds>` refreshes just those PRs).
+      const intake = taskIds.length ? null : await runIntakeSync();
+      const r: SyncReport & { intake: IntakeSyncReport | null } = { ...(await syncTasks({ db: d, backlog: b, config: cfg }, { taskIds })), intake };
+      emit(r, { json: globalOpts(cmd).json, human: (x) => [...(x.intake?.enabled ? [formatIntake(x.intake)] : []), formatSync(x)].join('\n') });
+      if (r.failed || intake?.errors.length) process.exitCode = 1;
     }));
 
   // ci: read-only required-checks status for the base branch (used by `minions doctor`).

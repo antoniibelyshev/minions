@@ -18,4 +18,6 @@ Turn the request into one or more well-formed backlog tasks using `minions backl
 5. **Readiness.** {{startReadyGuidance}} If acceptance criteria are unclear, keep the task in `idea` and ask the user one concise question with a recommended answer.
 6. Confirm to the user in one or two lines: tasks created (ids), what is ready, what needs their input. Then, if work is runnable, continue with `/minions:orchestrate`.
 
+**GitHub-filtered intake.** When `intake.github` is enabled, `minions sync` (and every coordinator start) imports the matching GitHub issues itself, read-only, as `idea` tasks with keys `intake:gh:<owner>/<repo>#<n>`; do not import those issues again by hand. Triage imported tasks like any other (acceptance criteria, readiness). Tasks it paused (`blocked` with an "intake sync" note: the issue left the filter or was reassigned) wait for the user's decision; never comment on, label or close the GitHub issue.
+
 Keep private or personal data out of shared task text.

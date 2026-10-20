@@ -19,6 +19,8 @@ export interface Task {
 export interface CreateTaskInput {
   title: string; description?: string; acceptanceCriteria?: string[]; priority?: Task['priority'];
   dependencies?: string[]; parent?: string; labels?: string[]; status?: TaskStatus; provenance?: Provenance; idempotencyKey: string;
+  /** Recorded in the minions meta block (e.g. the GitHub issue an intake sync imported). */
+  externalLinks?: string[];
 }
 
 /** Mirrors config `intake.scope`; tasks outside it are not ready. */
