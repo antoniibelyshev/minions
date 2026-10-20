@@ -186,6 +186,18 @@ describe('QA sweeps against the base branch', () => {
     expect((await env.sched.release(b2.leaseId, 'stop')).status).toBe('ready');
   });
 
+  it('an engineer claim after the qa-sweep label is removed uses agent/<slug>, never the base branch', async () => {
+    const env = makeDefaultEnv();
+    env.backlog.add({ id: 'task-9', labels: ['qa-sweep'] });
+    const b = await env.sched.claim('task-9', 'tester');
+    expect(b.branch).toBe('main');
+    await env.sched.record(b.leaseId, result({ status: 'partial', branch: 'main', headSha: env.baseSha }));
+    env.backlog.tasks.get('task-9')!.labels = [];
+    const e = await env.sched.claim('task-9', 'engineer');
+    expect(e.branch).toMatch(/^agent\/task-9/);
+    expect(gitSync(e.worktree, 'rev-parse', '--abbrev-ref', 'HEAD')).toBe(e.branch);
+  });
+
   it('an unauthorized sweep is not started', async () => {
     const env = makeDefaultEnv();
     env.backlog.add({ id: 'task-9', labels: ['qa-sweep'], authorized: false });

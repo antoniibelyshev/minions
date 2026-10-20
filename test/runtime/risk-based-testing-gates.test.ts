@@ -188,3 +188,68 @@ describe('risk-based testing: publish gate (non-local delivery)', () => {
     expect(env.calls).toHaveLength(1);
   });
 });
+
+describe('risk-based testing: fails closed when the branch diff cannot be computed', () => {
+  /** Simulates an unresolvable base or failing git diff. */
+  function breakDiff(sched: Scheduler) {
+    (sched as unknown as { changedPaths: () => Promise<null> }).changedPaths = async () => null;
+  }
+  const reason = /branch diff unavailable \(QA required, fail closed\)/;
+
+  it('engineer complete goes to testing and the requirement is recorded on the task', async () => {
+    const env = makeDefaultEnv();
+    env.backlog.add({ id: 'task-1' });
+    const b = await env.sched.claim('task-1', 'engineer');
+    breakDiff(env.sched);
+    const r = await env.sched.record(b.leaseId, result({ branch: b.branch, headSha: commitFile(b.worktree, 'a.txt', 'a') }));
+    expect(r).toMatchObject({ valid: true, to: 'testing' });
+    expect(r.message).toMatch(reason);
+    expect(env.backlog.tasks.get('task-1')!.labels).toEqual(['qa']);
+  });
+
+  it('a configured base branch that does not resolve also requires QA', async () => {
+    const env = makeDefaultEnv();
+    env.backlog.add({ id: 'task-1' });
+    const b = await env.sched.claim('task-1', 'engineer');
+    const head = commitFile(b.worktree, 'a.txt', 'a');
+    env.config.git.baseBranch = 'no-such-base';
+    const req = await env.sched.qaRequirement(env.backlog.tasks.get('task-1')!, head);
+    expect(req.reasons.join()).toMatch(reason);
+    expect(req.record).toBe(true);
+  });
+
+  it('approve without tester evidence is refused and goes to testing', async () => {
+    const env = makeDefaultEnv();
+    env.backlog.add({ id: 'task-1' });
+    const b = await env.sched.claim('task-1', 'engineer');
+    expect(await env.sched.record(b.leaseId, result({ branch: b.branch, headSha: commitFile(b.worktree, 'a.txt', 'a') }))).toMatchObject({ to: 'reviewing' });
+    breakDiff(env.sched);
+    const rr = await review(env, 'task-1');
+    expect(rr).toMatchObject({ approved: false, to: 'testing' });
+    expect(rr.message).toMatch(reason);
+  });
+
+  it('publish without tester evidence is refused', async () => {
+    const env = makeDefaultEnv((c) => { c.delivery.mode = 'branch'; });
+    const calls: PublishInput[] = [];
+    const outcome: { v: PublishOutcome } = { v: { state: 'failed', code: 'NETWORK_RETRYABLE', message: 'network down', retryable: true } };
+    const sched = new Scheduler({
+      db: env.db, backlog: env.backlog, config: env.config, layout: env.layout,
+      baseSync: async (_repo: string, base: string): Promise<BaseSyncResult> =>
+        ({ base, originRef: `refs/remotes/origin/${base}`, from: null, to: env.baseSha, action: 'up-to-date' } as BaseSyncResult),
+      publisher: async (input) => { calls.push(input); return outcome.v; },
+    });
+    const e2: Env = { ...env, sched };
+    env.backlog.add({ id: 'task-1' });
+    const b = await sched.claim('task-1', 'engineer');
+    await sched.record(b.leaseId, result({ branch: b.branch, headSha: commitFile(b.worktree, 'a.txt', 'a') }));
+    expect(await review(e2, 'task-1')).toMatchObject({ approved: true, to: 'blocked' });
+    expect(calls).toHaveLength(1);
+    breakDiff(sched);
+    outcome.v = { state: 'published', mode: 'branch', push: 'pushed', pr: null, prUrl: null, repository: 'acme/demo', changedPaths: [], sensitivePaths: [] };
+    const p = await sched.publish('task-1');
+    expect(p).toMatchObject({ state: 'failed', status: 'blocked', errorCode: 'PRECONDITION' });
+    expect(p.message).toMatch(/passing tester evidence/);
+    expect(calls).toHaveLength(1);
+  });
+});

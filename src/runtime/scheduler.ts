@@ -160,7 +160,8 @@ export class Scheduler {
 
   /** Branch for a task: recorded branch, else an earlier lease's branch, else agent/<slug>. */
   private branchForTask(task: Task): { slug: string; branch: string } {
-    const prior = this.db.leases({ taskId: task.id, all: true }).find((l) => l.branch)?.branch;
+    // Only agent/ branches: a QA sweep's tester lease records the base branch, which must never be reused.
+    const prior = this.db.leases({ taskId: task.id, all: true }).find((l) => l.branch?.startsWith(BRANCH_PREFIX))?.branch;
     const branch = (task.branch && task.branch.startsWith(BRANCH_PREFIX) ? task.branch : null) ?? prior ?? branchFor(taskSlug(task.id, task.title));
     return { branch, slug: branch.slice(BRANCH_PREFIX.length) };
   }
@@ -369,7 +370,7 @@ export class Scheduler {
   /**
    * Risk-based testing: a task needs a tester stage when verification.testerRequired is set, it carries a
    * QA label (verification.qaLabels; the coordinator may add one), its diff (or the reported modifiedPaths)
-   * touches sensitive paths, or the reviewer flagged it (`needsQa`). Sensitive paths and reviewer flags are
+   * touches sensitive paths, the branch diff cannot be computed (fail closed), or the reviewer flagged it (`needsQa`). Sensitive paths and reviewer flags are
    * recorded on the task as the first QA label so later stages and publication see the same requirement.
    */
   async qaRequirement(task: Task, head: string, opts: { paths?: string[]; flagged?: boolean } = {}): Promise<QaRequirement> {
@@ -379,7 +380,10 @@ export class Scheduler {
     if (cfg.verification.testerRequired) reasons.push('verification.testerRequired');
     const label = task.labels.find((l) => qaLabelsOf(cfg).includes(l));
     if (label) reasons.push(`label ${label}`);
-    const paths = [...new Set([...(opts.paths ?? []), ...((await this.changedPaths(head)) ?? [])])];
+    const diff = await this.changedPaths(head);
+    // Fail closed: without the branch diff an unreported sensitive change could skip QA.
+    if (diff === null) { reasons.push('branch diff unavailable (QA required, fail closed)'); record = !label; }
+    const paths = [...new Set([...(opts.paths ?? []), ...(diff ?? [])])];
     const sensitive = paths.filter((p) => matchesAny(p, cfg.sensitivePaths));
     if (sensitive.length) { reasons.push(`sensitive paths (${sensitive.slice(0, 5).join(', ')}${sensitive.length > 5 ? ', …' : ''})`); record = !label; }
     if (opts.flagged) { reasons.push('reviewer flagged needsQa'); record = !label; }
