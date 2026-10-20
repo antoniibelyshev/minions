@@ -215,6 +215,24 @@ If a task turns out to be too large, the worker reports `needs_split`. The coord
 
 After three repair cycles on a task (configurable), the coordinator replans instead of retrying again.
 
+### Coordinator defaults
+
+Every project's coordinator follows these defaults unless you tell it otherwise. The generated coordinator prompt is the single source for them (its *Owner defaults* section, built in `src/plugin/generate.ts`); this is a summary.
+
+- **Intake:** turns your requests into backlog tasks without asking first. `ask` capabilities and sensitive paths still need your approval.
+- **Reporting:** reports high-level feature progress only, asks only high-level decisions, and records low-level decisions as notes (`communication.progress`).
+- **Polls:** asks decisions as numbered options, with the recommended one first and "Other" last. Replying with just a number answers the poll.
+- **Spend:** tallies coordinator and worker usage and reports it with deliveries and on request: USD with API-key billing, tokens on a subscription. With a budget (given in chat, or `budgets.*`), it warns at about 50% and 80% and pauses starts at 100%.
+- **Quota mode:** on "major things only, then stop", it finishes or parks in-flight work, pauses starts, and asks before spending more.
+- **Briefs and staffing:** investigates first, then briefs engineers with context, goal, pitfalls and how to verify. Routine engineers run at low effort and reviewers and testers at medium (`models.effortByRole`). It uses the deep engineer for hard work or after a failure, and a small model for mechanical checks.
+- **Testing:** the reviewer owns test adequacy. Testers are for risky tasks and QA sweeps (see [Testing](#testing)).
+- **Merging:** with `local` delivery, the coordinator merges approved branches into the local base itself after a clean `git merge-tree` check. On a conflict it sends the branch back for a merge from the base and a re-test. With GitHub delivery it never merges locally, and merging a PR stays `ask`.
+- **Design first** for big features, shown to you before the build.
+- **Graceful operations:** pauses or drains before restarts and upgrades, and keeps uncommitted work.
+- **Channel:** answers on the channel you used. After an outage, it says so and asks you to resend anything important.
+- **Small CLI surface:** folds new features into existing commands rather than adding new ones.
+- **Permission mode:** `auto` by default (see [Coordinator permission mode](#coordinator-permission-mode)).
+
 ### Testing
 
 Testing is risk-based. Per-ticket testers mostly re-ran the suite; the problems worth a tester were integration and system-level ones. So by default a task goes **engineer → reviewer → delivered**:
@@ -305,11 +323,11 @@ Briefs and worker results go through files under `/state`, not through the coord
 
 ## Delivery, review, and merging
 
-v0.1 supports `local`, `branch`, and `pull-request` delivery. `auto-when-eligible`, review publication, and merging are **deferred in v0.1**: minions never merges, and an open PR is reported as **delivered**, not merged.
+v0.1 supports `local`, `branch`, and `pull-request` delivery. `auto-when-eligible`, review publication, and merging are **deferred in v0.1**: minions never merges a pull request, and an open PR is reported as **delivered**, not merged. With `local` delivery, the coordinator merges approved branches into the local base branch itself (see [Coordinator defaults](#coordinator-defaults)).
 
 | Mode | Behavior | Needs GitHub write access |
 | - | - | - |
-| `local` | Commits locally and writes a handoff | No |
+| `local` | Commits locally, writes a handoff, and the coordinator merges approved branches into the local base | No |
 | `branch` | Pushes the branch | Yes |
 | `pull-request` | Opens a PR and waits for your established process | Yes |
 | `auto-when-eligible` | Requests a merge once every gate passes **(deferred in v0.1)** | Yes, plus a separate review identity |
