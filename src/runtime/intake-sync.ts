@@ -18,6 +18,7 @@
 //   paused on a later sync. A task whose issue comes back is not resumed automatically (event + note).
 //   Departures are only evaluated after a complete query; a failed or truncated query never pauses.
 import type { BacklogAdapter, Task, TaskStatus } from '../backlog/types.js';
+import { neutralizeComments } from '../backlog/backlogmd.js';
 import { isIntakeCreation } from '../backlog/intake.js';
 import type { MinionsConfig } from '../config/schema.js';
 import { redact } from '../core/output.js';
@@ -79,6 +80,23 @@ export interface IntakeSyncDeps {
   /** Resolves the repository when `intake.github.repository` is null (the workspace origin). */
   originRepository?: () => Promise<string | null>;
   now?: () => Date;
+  /**
+   * Overall budget (coordinator startup): once aborted, in-flight GitHub reads resolve as failed, no new
+   * ones start, the import stops and departures are not evaluated. What was imported so far is kept.
+   */
+  signal?: AbortSignal;
+}
+
+export const INTAKE_ABORTED = 'intake sync stopped: time budget exhausted';
+
+/** ApiGet that resolves as failed as soon as `signal` aborts (the caller never waits past the budget). */
+function abortable(api: ApiGet, signal: AbortSignal | undefined): ApiGet {
+  if (!signal) return api;
+  const failed = { status: 0, body: null, error: INTAKE_ABORTED };
+  const onAbort = new Promise<typeof failed>((resolve) => {
+    if (signal.aborted) resolve(failed); else signal.addEventListener('abort', () => resolve(failed), { once: true });
+  });
+  return (path) => (signal.aborted ? Promise.resolve(failed) : Promise.race([api(path).catch((e: Error) => ({ status: 0, body: null, error: e.message })), onAbort]));
 }
 
 const segs = (s: string) => s.split('/').map(encodeURIComponent).join('/');
@@ -157,10 +175,11 @@ function describeIssue(issue: GhIssue): string {
     issue.assignees.length ? `assignees: ${issue.assignees.join(', ')}` : null,
     issue.milestone ? `milestone: ${issue.milestone}` : null,
   ].filter(Boolean).join('; ');
-  return [capped, `Imported from GitHub issue ${issue.html_url} by minions intake sync${facts ? ` (${facts})` : ''}.`].filter(Boolean).join('\n\n');
+  // Untrusted text: comment openers are neutralised so the issue cannot forge a minions meta block.
+  return neutralizeComments([capped, `Imported from GitHub issue ${issue.html_url} by minions intake sync${facts ? ` (${facts})` : ''}.`].filter(Boolean).join('\n\n'));
 }
 
-const titleOf = (issue: GhIssue) => issue.title.replace(/\s+/g, ' ').trim() || `GitHub issue #${issue.number}`;
+const titleOf = (issue: GhIssue) => neutralizeComments(issue.title.replace(/\s+/g, ' ').trim()) || `GitHub issue #${issue.number}`;
 
 /**
  * One intake pass: imports issues matching `intake.github` into the backlog and reconciles imported
@@ -183,7 +202,8 @@ export async function syncIntake(deps: IntakeSyncDeps): Promise<IntakeSyncReport
   };
   if (!repo) { report.errors.push('intake.github.repository is null and the workspace origin is not a github.com repository'); return finish(); }
 
-  const api = deps.api ?? ghApi(deps.gh);
+  const api = abortable(deps.api ?? ghApi(deps.gh), deps.signal);
+  const aborted = () => deps.signal?.aborted === true;
   const q = await queryIssues(api, repo, f);
   report.matched = q.issues.length;
   report.complete = q.complete;
@@ -229,6 +249,7 @@ export async function syncIntake(deps: IntakeSyncDeps): Promise<IntakeSyncReport
 
   const seen = new Set<string>();
   for (const issue of q.issues) {
+    if (aborted()) break;
     const key = intakeKey(repo, issue.number);
     seen.add(key);
     let rec = state.issues[key];
@@ -270,12 +291,13 @@ export async function syncIntake(deps: IntakeSyncDeps): Promise<IntakeSyncReport
   }
 
   // Departures: only after a complete query, so a failed or truncated read never pauses anything.
-  if (q.complete) {
+  // An aborted pass may not have looked at every matching issue, so it never evaluates departures.
+  if (q.complete && !aborted()) {
     for (const [key, rec] of Object.entries(state.issues)) {
+      if (aborted()) break;
       if (seen.has(key)) continue;
       const departed = rec.inFilter;
       if (!departed && !rec.pending) continue;
-      rec.inFilter = false;
       let reason: ReconcileReason = rec.pending?.reason ?? 'left-filter';
       let detail = rec.pending?.detail ?? 'no longer matches the intake filter';
       if (departed) {
@@ -286,12 +308,15 @@ export async function syncIntake(deps: IntakeSyncDeps): Promise<IntakeSyncReport
         else if (issue && rec.assignees.length && !sameSet(rec.assignees, issue.assignees)) {
           reason = 'reassigned'; detail = `was reassigned (${rec.assignees.join(', ')} -> ${issue.assignees.join(', ') || 'nobody'}) and no longer matches the intake filter`;
         } else if (rec.repository.toLowerCase() !== repo.toLowerCase()) detail = `is in ${rec.repository}, outside the configured repository ${repo}`;
+        if (aborted()) break; // the read was cut short: decide on a later sync
         if (issue) rec.assignees = issue.assignees;
       }
+      rec.inFilter = false;
       await reconcile(key, rec, reason, detail);
     }
   }
 
+  if (aborted()) report.warnings.push(`${INTAKE_ABORTED}; the rest runs on the next \`minions sync\``);
   db.setMeta(INTAKE_STATE_META, JSON.stringify(state));
   return finish();
 }

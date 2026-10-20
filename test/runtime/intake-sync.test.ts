@@ -369,6 +369,47 @@ describe('intake sync: config and startup', () => {
     expect(calls).toBe(1);
     expect(logs.join('\n')).toContain('minions: Intake sync from acme/demo: 1 matching issue(s), 1 imported (task-1)');
   });
+
+  it('startup intake has an overall budget: a hung pass is aborted and never stalls the coordinator start', async () => {
+    const on = defaults(); on.intake.github = { ...FILTER };
+    const logs: string[] = [];
+    let signal: AbortSignal | undefined;
+    const hung = (o: { signal: AbortSignal }) => { signal = o.signal; return new Promise<never>(() => { /* never settles */ }); };
+    const t0 = Date.now();
+    await intakeOnStart(on, (l) => logs.push(l), hung, 50);
+    expect(Date.now() - t0).toBeLessThan(4_000); // budget + grace, not the 120 s gh timeout
+    expect(signal?.aborted).toBe(true);
+    expect(logs.join('\n')).toMatch(/intake sync did not finish within .*starting the coordinator without it/);
+  });
+
+  it('an aborted pass stops reading GitHub, keeps what it imported and never pauses tasks', async () => {
+    const x = env();
+    x.gh.set([{ number: 1 }, { number: 2 }]);
+    await x.run();
+    // Issue 2 leaves the filter, but the single-issue read hangs past the budget.
+    x.gh.s.list = [{ number: 1 }];
+    const ctl = new AbortController();
+    const api = async (path: string) => {
+      if (/\/issues\/\d+$/.test(path)) { setTimeout(() => ctl.abort(), 10); return new Promise<never>(() => { /* hangs */ }); }
+      return { status: 200, body: x.gh.s.list.map(raw) };
+    };
+    const r = await syncIntake({ db: x.db, backlog: x.backlog, config: x.config, api, signal: ctl.signal });
+    expect(r.reconciliations).toEqual([]);
+    expect(r.warnings.join('\n')).toContain('time budget exhausted');
+    expect(x.backlog.status('task-2')).not.toBe('blocked');
+    // The next unbounded pass completes the reconciliation.
+    expect((await x.run()).reconciliations).toMatchObject([{ taskId: 'task-2', reason: 'left-filter', action: 'paused' }]);
+  });
+
+  it('an already-aborted signal makes no GitHub call and imports nothing', async () => {
+    const x = env();
+    x.gh.set([{ number: 1 }]);
+    const ctl = new AbortController(); ctl.abort();
+    const r = await syncIntake({ db: x.db, backlog: x.backlog, config: x.config, gh: x.gh.fn, signal: ctl.signal });
+    expect(r.created).toEqual([]);
+    expect(r.errors.join('\n')).toContain('time budget exhausted');
+    expect(x.gh.s.calls).toEqual([]);
+  });
 });
 
 describe.skipIf(!process.env.MINIONS_BACKLOG_BIN && !(() => { try { execFileSync('backlog', ['--version'], { stdio: 'ignore' }); return true; } catch { return false; } })())('intake sync with the real Backlog.md adapter', () => {

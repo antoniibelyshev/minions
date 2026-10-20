@@ -461,6 +461,18 @@ Decision record for GitHub-filtered intake (`src/runtime/intake-sync.ts`, config
 - **When.** `minions sync` (no task ids) runs one intake pass before the PR/CI refresh; the
   coordinator wrapper runs one after taking the project lock and before claude starts (`onStart`,
   failures only logged). No polling loop and no new top-level command.
+- **Startup budget.** The startup pass has an overall budget of 25 s (`STARTUP_INTAKE_BUDGET_MS`):
+  gh calls are killed at the budget, an `AbortSignal` makes in-flight reads resolve as failed and
+  stops the import, and after a 2 s grace the coordinator starts whether or not the pass returned.
+  An aborted pass keeps what it imported, evaluates no departures (pauses nothing) and is completed
+  by the next `minions sync`, which keeps the 120 s per-call gh timeout.
+- **Untrusted text.** Issue titles and bodies are task data. Every `<!--` in them becomes
+  `&lt;!--` before import, so an issue cannot forge the minions meta block (provenance, links, PR URL)
+  or hide text. The Backlog.md adapter also only parses the LAST `<!-- minions:meta ... -->` block
+  (the one minions appends), `replaceMeta` updates that same block, and `composeDescription` /
+  `replaceMeta` neutralise meta markers in all user content they write, so no task text (pasted
+  tickets, worker-created tasks) can carry a second block. Notes are a separate section and are
+  never parsed for meta.
 - **Read-only.** `gh api --method GET /repos/{repo}/issues?state&labels&assignee&milestone` (100 per
   page, at most 10 pages), plus `GET /repos/{repo}/issues/{n}` to explain a departure.
 - **Additive, idempotent.** Key `intake:gh:<owner>/<repo>#<n>` in the idempotency table, issue URL in

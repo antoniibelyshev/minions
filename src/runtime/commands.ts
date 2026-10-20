@@ -29,6 +29,7 @@ import { capacityOf, LEASE_ROLES, Scheduler } from './scheduler.js';
 import { gitCredential } from './github.js';
 import { ciStatus, formatCiStatus, formatSync, syncTasks, type SyncReport } from './ci.js';
 import { formatIntake, originRepository, syncIntake, type IntakeSyncReport } from './intake-sync.js';
+import { ghWithTimeout, type GhFn } from './publish.js';
 import { exportWorkspace, importWorkspace, setupState } from './workspace.js';
 import { git, workspaceLayout } from './worktree.js';
 
@@ -68,15 +69,43 @@ export const coordinatorRestartRecorder = (d: RuntimeDb) => (info: { at: string;
 };
 
 /** One intake pass with the runtime context (`minions sync` and coordinator startup). */
-export async function runIntakeSync(): Promise<IntakeSyncReport> {
+export async function runIntakeSync(opts: { signal?: AbortSignal; gh?: GhFn } = {}): Promise<IntakeSyncReport> {
   const { db: d, backlog: b, config: cfg } = await context();
-  return syncIntake({ db: d, backlog: b, config: cfg, originRepository: () => originRepository(workspaceLayout().repo, git) });
+  return syncIntake({ db: d, backlog: b, config: cfg, originRepository: () => originRepository(workspaceLayout().repo, git), ...opts });
 }
 
-/** Coordinator startup: one intake pass when intake.github is enabled (never blocks the start). */
-export const intakeOnStart = async (cfg: MinionsConfig, log: (line: string) => void, sync: () => Promise<IntakeSyncReport> = runIntakeSync): Promise<void> => {
+/** Overall time budget of the startup intake pass (`minions sync` keeps the per-call gh timeout). */
+export const STARTUP_INTAKE_BUDGET_MS = 25_000;
+/** Extra wait after the abort for the pass to save its state before the coordinator starts anyway. */
+const STARTUP_INTAKE_GRACE_MS = 2_000;
+
+/**
+ * Coordinator startup: one intake pass when intake.github is enabled. Bounded by `budgetMs`: the pass
+ * is aborted (gh calls are killed at the budget too) and, should it still not return, the coordinator
+ * starts without waiting for it; the next `minions sync` completes the import.
+ */
+export const intakeOnStart = async (
+  cfg: MinionsConfig, log: (line: string) => void,
+  sync: (opts: { signal: AbortSignal; gh?: GhFn }) => Promise<IntakeSyncReport> = runIntakeSync,
+  budgetMs = STARTUP_INTAKE_BUDGET_MS,
+): Promise<void> => {
   if (!cfg.intake.github?.enabled) return;
-  log(`minions: ${formatIntake(await sync()).split('\n').join('\nminions: ')}`);
+  const ctl = new AbortController();
+  const timers: NodeJS.Timeout[] = [];
+  const late = new Promise<null>((resolve) => {
+    timers.push(setTimeout(() => ctl.abort(), budgetMs));
+    timers.push(setTimeout(() => resolve(null), budgetMs + STARTUP_INTAKE_GRACE_MS));
+  });
+  const pass = sync({ signal: ctl.signal, gh: ghWithTimeout(budgetMs) });
+  pass.catch(() => { /* reported below when it settles in time; ignored after the start */ });
+  try {
+    const r = await Promise.race([pass, late]);
+    if (r) log(`minions: ${formatIntake(r).split('\n').join('\nminions: ')}`);
+    else log(`minions: intake sync did not finish within ${Math.round(budgetMs / 1000)} s; starting the coordinator without it (run \`minions sync\` later)`);
+  } finally {
+    ctl.abort();
+    for (const t of timers) clearTimeout(t);
+  }
 };
 
 const scheduler = async () => new Scheduler({ ...(await context()), layout: workspaceLayout(), handoff: runtimePaths() });
