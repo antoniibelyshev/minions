@@ -327,3 +327,47 @@ describe('host runtime processes', () => {
     expect(git(repo, 'status', '--porcelain')).toBe('');
   });
 });
+
+describe('minions upgrade on the host runtime', () => {
+  it('refuses with PRECONDITION before any source or container step, also with --dry-run, --from-container and --rebuild-cli', async () => {
+    const { Command } = await import('commander');
+    const { register } = await import('../../src/host/commands.js');
+    const { repo } = await hostProject();
+    const exit = vi.spyOn(process, 'exit').mockImplementation(((code?: number) => { throw new Error(`exit ${code}`); }) as never);
+    const err = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const out = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+    vi.stubEnv('MINIONS_RUNTIME', ''); // the host CLI
+    const cwd = process.cwd();
+    process.chdir(repo);
+    try {
+      for (const args of [['upgrade'], ['upgrade', '--dry-run'], ['upgrade', '--from-container', '--rebuild-cli', '--now']]) {
+        err.mockClear();
+        const program = new Command();
+        register(program);
+        await expect(program.parseAsync(args, { from: 'user' })).rejects.toThrow(/^exit [1-9]/);
+        const text = err.mock.calls.map((c) => String(c[0])).join('');
+        expect(text).toContain('supports the Docker runtime only');
+        expect(text).toContain('minions down && minions start');
+      }
+      expect(git(repo, 'status', '--porcelain')).toBe('');
+    } finally {
+      process.chdir(cwd);
+      exit.mockRestore(); err.mockRestore(); out.mockRestore();
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it('help: --rebuild-cli is offered and --from-container does not promise a host build', async () => {
+    const { Command } = await import('commander');
+    const { register } = await import('../../src/host/commands.js');
+    const program = new Command();
+    register(program);
+    const up = program.commands.find((c) => c.name() === 'upgrade')!;
+    const opt = (flag: string) => up.options.find((o) => o.long === flag);
+    expect(opt('--rebuild-cli')?.description).toMatch(/rebuilding\/reinstalling the global CLI .*review it first/);
+    expect(opt('--from-container')?.description).toMatch(/strict fast-forward on a clean tree only$/);
+    expect(opt('--from-container')?.description).not.toMatch(/built|install/);
+    expect(opt('--timeout')).toBeDefined();
+    expect(opt('--now')).toBeDefined();
+  });
+});

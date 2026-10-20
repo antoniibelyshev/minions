@@ -522,6 +522,72 @@ describe('installed CLI check', () => {
     expect(p.steps[0]).toMatchObject({ id: 'cli', status: 'planned', detail: expect.stringContaining('stop and print') });
   });
 
+  it('without --rebuild-cli the stop is one failed cli step, logged once, with no range and no rebuild line', async () => {
+    const c = checkout();
+    realInstall(g, '0.1.0', 'old0000000000000', 'packed');
+    const w: NpmWorld = { globalRoot: g, checkout: c, calls: [] };
+    const logs: string[] = [];
+    const p = await runSourcePhase(phaseBase({ checkout: c, runner: fakeNpm(w), log: (m) => logs.push(m), spawnCli: async () => { throw new Error('must not spawn'); } }));
+    expect(p.steps.filter((s) => s.id === 'cli')).toHaveLength(1);
+    expect(p.steps[0]).toMatchObject({ id: 'cli', status: 'failed', detail: expect.stringMatching(/rerun with --rebuild-cli/) });
+    expect(p.stop?.rerun).toBe('minions upgrade --rebuild-cli');
+    expect(logs).toEqual([`cli: ${p.steps[0]!.detail}`]);
+    expect(logs[0]).toMatch(/rerun with --rebuild-cli/);
+    expect(logs.some((l) => /not built in this run|rebuilding the linked|reinstalling from|rebuilt|reinstalled/.test(l))).toBe(false);
+    expect(mutatingNpm(w.calls)).toEqual([]);
+  });
+
+  it('a fast-forward without --rebuild-cli also stops on the fast-forward reason and logs the range', async () => {
+    const s = syncRepo();
+    const c = checkout();
+    realInstall(g, '0.1.0', 'old0000000000000', 'packed');
+    const w: NpmWorld = { globalRoot: g, checkout: c, calls: [] };
+    const logs: string[] = [];
+    const p = await runSourcePhase(phaseBase({
+      checkout: c, runner: fakeNpm(w), log: (m) => logs.push(m), spawnCli: async () => { throw new Error('must not spawn'); },
+      sync: { repo: s.repo, branch: 'main', baseBranch: 'main', exportRepo: s.exportRepo, runner: run },
+    }));
+    expect(p.ok).toBe(false);
+    expect(p.stop?.reason).toMatch(/just fast-forwarded to commits from the container/);
+    expect(p.stop?.rerun).toBe('minions upgrade --rebuild-cli');
+    expect(logs.some((l) => l.startsWith(`cli: not built in this run; review the commits fetched from the container (${s.base.slice(0, 12)}..${s.ahead.slice(0, 12)})`))).toBe(true);
+    expect(logs.some((l) => /^ {2}[0-9a-f]+ agent work$/.test(l))).toBe(true);
+    expect(mutatingNpm(w.calls)).toEqual([]);
+  });
+
+  it('dry run with --rebuild-cli and nothing to fast-forward plans the rebuild and stays ok', async () => {
+    const s = syncRepo();
+    git(s.repo, 'merge', '-q', '--ff-only', s.ahead);
+    const c = checkout();
+    realInstall(g, '0.1.0', 'old0000000000000', 'packed');
+    const w: NpmWorld = { globalRoot: g, checkout: c, calls: [] };
+    const p = await runSourcePhase(phaseBase({
+      dryRun: true, checkout: c, runner: fakeNpm(w), rebuildCli: true,
+      sync: { repo: s.repo, branch: 'main', baseBranch: 'main', exportRepo: s.exportRepo, runner: run },
+    }));
+    expect(p.sync?.action).toBe('up-to-date');
+    expect(p.ok).toBe(true);
+    expect(p.steps.at(-1)).toMatchObject({ id: 'cli', status: 'planned' });
+    expect(p.steps.at(-1)!.detail).not.toMatch(/would stop/);
+    expect(mutatingNpm(w.calls)).toEqual([]);
+  });
+
+  it('a matching CLI is not gated: a planned fast-forward without --rebuild-cli stays ok', async () => {
+    const s = syncRepo();
+    const c = checkout();
+    realInstall(g, '0.2.0', sourceFingerprint(c), 'packed');
+    const w: NpmWorld = { globalRoot: g, checkout: c, calls: [] };
+    const p = await runSourcePhase(phaseBase({
+      dryRun: true, checkout: c, runner: fakeNpm(w),
+      sync: { repo: s.repo, branch: 'main', baseBranch: 'main', exportRepo: s.exportRepo, runner: run },
+    }));
+    expect(p.sync).toMatchObject({ action: 'fast-forward', applied: false });
+    expect(p.ok).toBe(true);
+    expect(p.stop).toBeNull();
+    expect(p.steps.at(-1)).toMatchObject({ id: 'cli' });
+    expect(p.steps.at(-1)!.detail).not.toMatch(/would stop/);
+  });
+
   it('skips the check outside a minions checkout', async () => {
     expect(isMinionsCheckout(makeRepo(home.root, 'demo'))).toBe(false);
     expect(isMinionsCheckout(checkout())).toBe(true);
