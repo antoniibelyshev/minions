@@ -13,6 +13,7 @@ import { generateApprovalKeyPair, publicKeyOf, signApproval, type ApprovalPayloa
 import { MinionsError } from '../core/errors.js';
 import { atomicWrite, ensureDir } from '../core/fsutil.js';
 import { credentialStoreDir, credentialStoreFile, projectPaths } from '../core/paths.js';
+import { inMinionsContainer } from '../runtime/paths.js';
 import { delegateToRuntime } from './delegate.js';
 import { projectForPath } from './registry.js';
 
@@ -80,9 +81,15 @@ export async function removeApprovalKeys(projectId: string): Promise<void> {
  * `minions work approve <taskId> --head <sha>` on the host: signs with the host-held key, then
  * records the token in the agent runtime (`work approve ... --signature <token>`, delegated). The
  * runtime verifies it now and again before every push. Returns the delegated exit code.
+ * Refused inside the minions container (detected from the filesystem, so unsetting MINIONS_RUNTIME
+ * does not help): a key minted there would be useless and would only litter the container.
  */
 export async function approveOnHost(taskId: string, o: { head: string; by?: string; note?: string; json: boolean; cwd?: string },
-  deps: { delegate?: (args: string[], opts: { json: boolean; cwd?: string }) => Promise<number>; projectId?: string } = {}): Promise<number> {
+  deps: { delegate?: (args: string[], opts: { json: boolean; cwd?: string }) => Promise<number>; projectId?: string; inContainer?: boolean } = {}): Promise<number> {
+  if (deps.inContainer ?? inMinionsContainer()) {
+    throw new MinionsError('INCOMPATIBLE_RUNTIME', 'Approvals can only be signed by the host CLI; this is the minions container.',
+      'Ask the user to run `minions work approve <taskId> --head <sha>` on the host, in the repository.');
+  }
   const projectId = deps.projectId ?? (await projectForPath(o.cwd ?? process.cwd())).projectId;
   const by = o.by ?? userInfo().username;
   const { token } = await issueApproval(projectId, { taskId, head: o.head, by });

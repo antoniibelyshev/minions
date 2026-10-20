@@ -262,14 +262,24 @@ the normal flow.
   The DB row is only a carrier and is not trusted. It fails closed (publication stays
   `awaiting-approval`, with `approvalError` naming the cause) when there is no public key, no token,
   a malformed or tampered token, a signature from another key, another task or head, or an expired
-  approval. In the container the key path is fixed (`MINIONS_CONFIG` is not consulted, because an
-  agent could set it); the host runtime uses its runtime config dir (pinned by the shim).
+  approval. Where the key is read from is decided without trusting the environment: whenever
+  `/opt/minions/config` exists (the container's read-only bind) or `MINIONS_RUNTIME=container`, the
+  verifier reads the literal `/opt/minions/config/approval-public-key.pem`; `MINIONS_CONTAINER_ROOT`,
+  `MINIONS_CONFIG` and `MINIONS_RUNTIME` cannot redirect it (an agent can set or unset all three).
+  Only the host runtime, which has no such directory, uses its runtime config dir (`MINIONS_CONFIG`,
+  pinned by the shim). The same filesystem check refuses the host-side `work approve` (signing)
+  inside the container, even with `MINIONS_RUNTIME` unset.
 - **Scope.** Every human publication approval is signed: sensitive-path changes and "ask" capabilities
   alike. Publication that needs no approval (allow, no sensitive paths) is unchanged and needs no key.
 
-**Remaining trust boundary (what this does not protect).** The signature stops in-runtime code from
-*laundering* a change through minions' own publication flow. It does not stop in-runtime code from
-using the GitHub token directly: the token is readable inside the container (the git credential helper
+**Remaining trust boundary (what this does not protect).** The signature protects the normal
+coordinator flow: in-runtime code cannot *launder* a change through minions' own publication by
+writing an approval row, a state file or a CLI argument. It is not a sandbox against code that
+already runs in the container. Such code can start its own `minions` or `node` process with its own
+environment and code, or edit the Claude Code settings the coordinator reads (the Claude volume is
+writable), and so skip the check entirely; that gains it nothing beyond direct use of the GitHub
+token, which is the real exposure. It does not stop in-runtime code from using the GitHub token
+directly: the token is readable inside the container (the git credential helper
 and the gh wrapper need it), so a compromised worker can push any branch, or open a PR, with whatever
 the token allows. In the host runtime the agents run as the user under the Claude Code sandbox, so
 the separation is only as strong as that sandbox (its `denyRead` on the credential store). The final

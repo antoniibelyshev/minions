@@ -7,7 +7,7 @@ import { CONTAINER, credentialStoreDir, projectPaths } from '../../src/core/path
 import { approvalPublicKeyFile, approvalSigningKeyFile, approveOnHost, ensureApprovalKey, issueApproval, removeApprovalKeys } from '../../src/host/approvals.js';
 import { composeYaml } from '../../src/host/docker.js';
 import { hostSettings } from '../../src/runtime/coordinator.js';
-import { runtimePaths } from '../../src/runtime/paths.js';
+import { approvalPublicKeyPath, CONTAINER_APPROVAL_PUBLIC_KEY, runtimePaths } from '../../src/runtime/paths.js';
 import { withHome } from './fixtures.js';
 
 const HEAD = 'a1'.repeat(20);
@@ -87,9 +87,47 @@ describe('host-held approval key', () => {
     // The public key reaches the container through the read-only runtime config bind.
     expect(binds).toContainEqual({ source: projectPaths(ID).runtimeDir, target: CONTAINER.configDir });
     expect(CONTAINER.approvalPublicKey.startsWith(CONTAINER.configDir + '/')).toBe(true);
-    // Inside the container the verifier ignores MINIONS_CONFIG (agent-settable) for the key path.
-    expect(runtimePaths({ MINIONS_RUNTIME: 'container', MINIONS_CONFIG: '/state/evil/config.json' }).approvalPublicKey).toBe(CONTAINER.approvalPublicKey);
-    expect(runtimePaths({ MINIONS_RUNTIME: 'host', MINIONS_CONFIG: projectPaths(ID).runtimeConfigJson }).approvalPublicKey).toBe(projectPaths(ID).approvalPublicKey);
+    // Host runtime (no container config dir): the shim-pinned runtime config dir.
+    expect(runtimePaths({ MINIONS_RUNTIME: 'host', MINIONS_CONFIG: projectPaths(ID).runtimeConfigJson }, { inContainer: false }).approvalPublicKey).toBe(projectPaths(ID).approvalPublicKey);
+  });
+
+  it('inside the container the verifier key path is the literal read-only bind, whatever the env says', () => {
+    const LITERAL = '/opt/minions/config/approval-public-key.pem';
+    expect(CONTAINER_APPROVAL_PUBLIC_KEY).toBe(LITERAL);
+    const evil = [
+      {},
+      { MINIONS_CONTAINER_ROOT: '/tmp/evil' },
+      { MINIONS_CONFIG: '/tmp/evil/config.json' },
+      { MINIONS_RUNTIME: 'host' },
+      { MINIONS_RUNTIME: 'container', MINIONS_CONFIG: '/state/evil/config.json' },
+      { MINIONS_RUNTIME: 'host', MINIONS_CONFIG: '/tmp/evil/config.json' },
+      { MINIONS_CONTAINER_ROOT: '/tmp/evil', MINIONS_CONFIG: '/tmp/evil/config.json', MINIONS_RUNTIME: 'host' },
+      { MINIONS_CONTAINER_ROOT: '/tmp/evil', MINIONS_CONFIG: '/tmp/evil/config.json', MINIONS_RUNTIME: 'container' },
+    ];
+    for (const env of evil) {
+      // Container detected from the filesystem: env never redirects the key.
+      expect(approvalPublicKeyPath(env, true), JSON.stringify(env)).toBe(LITERAL);
+      expect(runtimePaths(env, { inContainer: true }).approvalPublicKey, JSON.stringify(env)).toBe(LITERAL);
+    }
+    // MINIONS_RUNTIME=container alone also pins it, even without the directory, and so does a missing MINIONS_CONFIG.
+    expect(approvalPublicKeyPath({ MINIONS_RUNTIME: 'container', MINIONS_CONTAINER_ROOT: '/tmp/evil', MINIONS_CONFIG: '/tmp/evil/c.json' }, false)).toBe(LITERAL);
+    expect(approvalPublicKeyPath({ MINIONS_CONTAINER_ROOT: '/tmp/evil' }, false)).toBe(LITERAL);
+    // The process env is not consulted for the container root either (containerPaths() would honour it).
+    const prev = process.env.MINIONS_CONTAINER_ROOT;
+    process.env.MINIONS_CONTAINER_ROOT = '/tmp/evil';
+    try {
+      expect(runtimePaths({ ...process.env, MINIONS_RUNTIME: 'container' }).approvalPublicKey).toBe(LITERAL);
+    } finally {
+      if (prev === undefined) delete process.env.MINIONS_CONTAINER_ROOT; else process.env.MINIONS_CONTAINER_ROOT = prev;
+    }
+  });
+
+  it('host-mode `work approve` is refused inside the container before any key is written', async () => {
+    let delegated = false;
+    await expect(approveOnHost('task-7', { head: HEAD, json: true }, { projectId: ID, inContainer: true, delegate: async () => { delegated = true; return 0; } }))
+      .rejects.toMatchObject({ code: 'INCOMPATIBLE_RUNTIME' });
+    expect(delegated).toBe(false);
+    expect(existsSync(approvalSigningKeyFile(ID))).toBe(false);
   });
 
   it('host runtime: sandboxed commands cannot read the signing key, may read the public key, and cannot edit it', () => {
@@ -109,7 +147,7 @@ describe('host-held approval key', () => {
   it('`work approve` on the host signs and delegates a token the runtime verifies for exactly that head', async () => {
     const calls: string[][] = [];
     const code = await approveOnHost('task-7', { head: HEAD, note: 'ok', json: true }, {
-      projectId: ID, delegate: async (args) => { calls.push(args); return 0; },
+      projectId: ID, inContainer: false, delegate: async (args) => { calls.push(args); return 0; },
     });
     expect(code).toBe(0);
     expect(calls).toHaveLength(1);
@@ -122,7 +160,7 @@ describe('host-held approval key', () => {
     expect(verifyApproval(token, pub, { taskId: 'task-7', head: 'e5'.repeat(20) }).ok).toBe(false);
     expect(token).not.toContain('PRIVATE');
 
-    await expect(approveOnHost('task-7', { head: 'a1b2c3d', json: false }, { projectId: ID, delegate: async () => 0 }))
+    await expect(approveOnHost('task-7', { head: 'a1b2c3d', json: false }, { projectId: ID, inContainer: false, delegate: async () => 0 }))
       .rejects.toMatchObject({ code: 'PRECONDITION' });
     await expect(issueApproval(ID, { taskId: 'task-7', head: 'main' })).rejects.toThrow(/full commit SHA/);
   });
