@@ -31,18 +31,43 @@ export interface MinionsMeta {
   commits?: string[]; prUrl?: string | null; [k: string]: unknown;
 }
 
-const META_RE = /<!-- minions:meta (.*?) -->/;
+const META_OPEN = '<!-- minions:meta ';
+const META_AT_RE = /^<!-- minions:meta (.*?) -->/;
 
-/** Splits a Backlog.md description into user content and the minions meta block. */
+/**
+ * The minions meta block is the one minions appends: the LAST `<!-- minions:meta ... -->` comment (text
+ * a human adds after it in Backlog.md is kept as user content). Earlier look-alike blocks (pasted
+ * tickets, imported issue bodies) are user content and never parsed as meta; minions also neutralises
+ * markers in every user content it writes, so nothing it stores can place a block after the real one.
+ */
+function lastMeta(text: string): { index: number; length: number; json: string } | null {
+  const index = text.lastIndexOf(META_OPEN);
+  if (index < 0) return null;
+  const m = META_AT_RE.exec(text.slice(index));
+  return m ? { index, length: m[0].length, json: m[1]! } : null;
+}
+
+/** Neutralises meta markers in user content (`<!-- minions:meta` -> `&lt;!-- minions:meta`). */
+const neutralizeMetaMarkers = (text: string) => text.replace(/<!--(\s*)minions:meta/gi, '&lt;!--$1minions:meta');
+
+/**
+ * Neutralises every HTML comment opener in untrusted text (`<!--` -> `&lt;!--`; renders the same in
+ * Markdown), so imported content can never carry a minions meta block or hide text in a comment.
+ */
+export function neutralizeComments(text: string): string {
+  return text.replace(/<!--/g, '&lt;!--');
+}
+
+/** Splits a Backlog.md description into user content and the (last) minions meta block. */
 export function parseDescription(raw: string | null | undefined): { user: string; meta: MinionsMeta; hasMeta: boolean } {
   const text = raw ?? '';
-  const m = META_RE.exec(text);
+  const m = lastMeta(text);
   if (!m) return { user: text.trim(), meta: {}, hasMeta: false };
   let meta: unknown;
-  try { meta = JSON.parse(m[1]!); } catch { return { user: text.trim(), meta: {}, hasMeta: false }; }
+  try { meta = JSON.parse(m.json); } catch { return { user: text.trim(), meta: {}, hasMeta: false }; }
   if (typeof meta !== 'object' || meta === null || Array.isArray(meta)) return { user: text.trim(), meta: {}, hasMeta: false };
   const before = text.slice(0, m.index).trimEnd();
-  const after = text.slice(m.index + m[0].length).trimStart();
+  const after = text.slice(m.index + m.length).trimStart();
   return { user: [before, after].filter(Boolean).join('\n\n'), meta: meta as MinionsMeta, hasMeta: true };
 }
 
@@ -52,15 +77,23 @@ export function metaLine(meta: MinionsMeta): string {
   return `<!-- minions:meta ${json} -->`;
 }
 
-/** New description from user content + meta (meta appended at the end). */
+/**
+ * New description from user content + meta (meta appended at the end). Meta markers inside the user
+ * content are neutralised, so it can never carry a second, forged block.
+ */
 export function composeDescription(user: string, meta: MinionsMeta): string {
-  const u = user.trim();
+  const u = neutralizeMetaMarkers(user.trim());
   return u ? `${u}\n\n${metaLine(meta)}` : metaLine(meta);
 }
 
-/** Replaces the meta block in place, keeping surrounding user content verbatim. */
+/**
+ * Replaces the last meta block (the one parseDescription reads) in place, keeping the surrounding user
+ * content (meta markers in it neutralised); without one, appends a fresh block.
+ */
 export function replaceMeta(raw: string, meta: MinionsMeta): string {
-  return META_RE.test(raw) ? raw.replace(META_RE, () => metaLine(meta)).trim() : composeDescription(raw, meta);
+  const m = lastMeta(raw);
+  if (!m) return composeDescription(raw, meta);
+  return (neutralizeMetaMarkers(raw.slice(0, m.index)) + metaLine(meta) + neutralizeMetaMarkers(raw.slice(m.index + m.length))).trim();
 }
 
 // ---------------------------------------------------------------- mapping
@@ -253,6 +286,7 @@ export class BacklogMdAdapter implements BacklogAdapter {
     const labels = input.labels ?? [];
     checkLabels(labels);
     const meta: MinionsMeta = { provenance: input.provenance ?? DEFAULT_PROVENANCE };
+    if (input.externalLinks?.length) meta.externalLinks = [...input.externalLinks];
     const args = ['task', 'create', `--description=${composeDescription(input.description ?? '', meta)}`];
     for (const ac of input.acceptanceCriteria ?? []) args.push(`--ac=${ac}`);
     if (input.priority) args.push(`--priority=${input.priority}`);

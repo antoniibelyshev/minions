@@ -90,7 +90,7 @@ export interface SetupOptions {
   platform?: NodeJS.Platform;
 }
 
-export type StepId = 'init' | 'github' | 'delivery' | 'ci' | 'autoMerge' | 'telegram' | 'container' | 'import' | 'coordinator';
+export type StepId = 'init' | 'github' | 'delivery' | 'ci' | 'intake' | 'autoMerge' | 'telegram' | 'container' | 'import' | 'coordinator';
 export type StepStatus = 'done' | 'kept' | 'changed' | 'skipped' | 'failed' | 'deferred' | 'planned';
 export interface SetupStep { id: StepId; status: StepStatus; detail: string; later?: string; lines?: string[] }
 
@@ -160,6 +160,7 @@ export function setupCommands(repoPath: string) {
     setup, inRepo,
     later: {
       github: `Run ${setup} again (or ${inRepo('minions auth github')}) to store a GitHub token and choose branch or pull-request delivery.`,
+      intake: `Run ${setup} again to import GitHub issues into the backlog (intake.github; read-only).`,
       ci: `Run ${setup} again, ${inRepo('minions doctor')} (ci.requiredChecks), or ${inRepo('minions ci status')} to see the CI setup plan.`,
       autoMerge: 'Auto-merge is not available yet; minions never merges.',
       telegram: `Run ${setup} again (or ${inRepo('minions auth telegram')}) to connect a Telegram bot.`,
@@ -333,6 +334,10 @@ export async function runSetup(opts: SetupOptions): Promise<SetupResult> {
     step({ id: 'ci', status: 'skipped', detail: 'CI guidance not requested', later: LATER.ci });
   }
 
+  // ---------------------------------------------------------------- 3b. GitHub intake sync (read-only import)
+  if (interactive) say('\n== GitHub intake ==');
+  step(await intakeStep(interactive && !opts.configFile ? io! : null, config, onGitHub, setLocal, LATER.intake));
+
   // ---------------------------------------------------------------- 4. auto-merge (deferred)
   if (interactive) {
     say('\n== Auto-merge ==');
@@ -485,6 +490,59 @@ function importStep(r: ImportResult, status: StepStatus): SetupStep {
   };
 }
 
+type IntakeFilter = NonNullable<MinionsConfig['intake']['github']>;
+const describeFilter = (f: IntakeFilter) => [`repository ${f.repository ?? 'origin'}`, `state ${f.state}`,
+  `labels ${f.labels.join(',') || 'any'}`, `assignee ${f.assignee ?? 'any'}`, `milestone ${f.milestone ?? 'any'}`].join(', ');
+
+async function askText(io: WizardIO, q: string, def: string, ok: (v: string) => string | null): Promise<string> {
+  for (let i = 0; i < 3; i++) {
+    const a = (await io.ask(q, def)).trim();
+    const why = ok(a);
+    if (!why) return a;
+    io.info(`  ${why}`);
+  }
+  return def;
+}
+
+/**
+ * Intake step: asks whether `minions sync` and coordinator startup should import GitHub issues matching a
+ * filter (default no), then the filter. Recorded in config.local.json as intake.github. Read-only on GitHub.
+ */
+async function intakeStep(io: WizardIO | null, config: MinionsConfig, onGitHub: boolean, setLocal: (k: string, v: unknown) => void, later: string): Promise<SetupStep> {
+  const cur = config.intake.github;
+  if (!onGitHub && !cur?.repository) {
+    return cur?.enabled ? { id: 'intake', status: 'kept', detail: `intake.github on (${describeFilter(cur)}), but there is no github.com origin` }
+      : { id: 'intake', status: 'skipped', detail: 'no GitHub remote: GitHub intake not applicable', later };
+  }
+  if (!io) {
+    return cur?.enabled ? { id: 'intake', status: 'kept', detail: `intake.github on (${describeFilter(cur)})` }
+      : { id: 'intake', status: 'skipped', detail: 'GitHub intake not enabled', later };
+  }
+  io.info('  minions can import GitHub issues matching a filter into the backlog on `minions sync` and at coordinator start.');
+  io.info('  It only reads GitHub (no comments, labels or status changes) and never deletes tasks; issues that leave the filter pause their task.');
+  const enable = await yesNo(io, 'Import GitHub issues into the backlog?', cur?.enabled ?? false);
+  if (!enable) {
+    if (!cur?.enabled) return { id: 'intake', status: 'skipped', detail: 'GitHub intake not enabled', later };
+    setLocal('intake.github', { ...cur, enabled: false });
+    return { id: 'intake', status: 'changed', detail: 'intake.github disabled (already imported tasks stay in the backlog)' };
+  }
+  const list = (v: string) => (v === 'none' || v === '' ? [] : v.split(',').map((x) => x.trim()).filter(Boolean));
+  const labels = list(await askText(io, 'Issue labels to import (comma separated; all must match; "none" for any)', cur?.labels.join(',') || 'none',
+    (v) => (/[\r\n]/.test(v) ? 'labels must be on one line' : null)));
+  const assignee = await askText(io, 'Assignee filter (GitHub login, "none" = unassigned, "*" = anyone assigned, "any" = no filter)', cur?.assignee ?? 'any',
+    (v) => (v === 'any' || /^(?:\*|none|[A-Za-z0-9][A-Za-z0-9-]{0,38})$/.test(v) ? null : 'enter a GitHub login, none, * or any'));
+  const milestone = await askText(io, 'Milestone filter (title or number, "none" = without milestone, "*" = any milestone, "any" = no filter)', cur?.milestone ?? 'any',
+    (v) => (v ? null : 'enter a milestone or any'));
+  const state = await choose(io, 'Issue state', cur?.state ?? 'open', ['open', 'closed', 'all'] as const);
+  const next: IntakeFilter = {
+    enabled: true, repository: cur?.repository ?? null, labels,
+    assignee: assignee === 'any' ? null : assignee, milestone: milestone === 'any' ? null : milestone, state,
+  };
+  if (cur && JSON.stringify(cur) === JSON.stringify(next)) return { id: 'intake', status: 'kept', detail: `intake.github on (${describeFilter(next)})` };
+  setLocal('intake.github', next);
+  return { id: 'intake', status: cur?.enabled ? 'changed' : 'done', detail: `intake.github on (${describeFilter(next)}); imported on \`minions sync\` and coordinator start` };
+}
+
 /** CI step: local workflow files plus (with a token) required checks read with GET only; prints the plan. */
 async function ciStep(opts: SetupOptions, config: MinionsConfig, remoteUrl: string | null, hasToken: boolean, projectId: string, ciWorkflows: string[]): Promise<SetupStep> {
   const workflows = ciWorkflows.filter((f) => f.startsWith('.github/workflows/'));
@@ -522,6 +580,7 @@ function dryRunResult(opts: SetupOptions, init: InitResult, steps: SetupStep[], 
     : refs.github ? `token stored (${refs.github.backend}): would offer keep/change/remove` : opts.tokens?.github ? 'would store the token from stdin' : 'would ask "Set up GitHub integration?" (default no); token entered without echo');
   would('delivery', `delivery.mode ${opts.delivery ?? 'unchanged'}; branch/pull-request need a GitHub remote and a stored token`);
   would('ci', git.hasGitHub ? 'would ask "Use CI?" (default no): read-only check of workflows and required checks, setup plan printed only' : 'skipped: no GitHub remote');
+  would('intake', git.hasGitHub ? 'would ask "Import GitHub issues into the backlog?" (default no): read-only filtered import on `minions sync` and coordinator start' : 'skipped: no GitHub remote');
   would('autoMerge', 'shown as not available yet (default no); nothing written');
   would('telegram', refs.telegram ? `bot ${refs.telegram.botId} stored: would offer keep/change/disable` : 'would ask "Set up Telegram?" (default no); bot token entered without echo');
   would('container', 'would build the image if needed and start the container (idempotent)');

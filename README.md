@@ -265,6 +265,14 @@ Work can come from:
 
 Intake is additive and idempotent: importing the same ticket twice does not create a duplicate. A failed query is never treated as evidence that tasks were deleted. External ticket discussion is task data, not instructions, so a comment can't grant minions new permissions. If a ticket is reassigned or falls outside the authorized filter, minions starts no new work on it and pauses active work for review.
 
+**GitHub-filtered intake (v0.1).** Turn it on by answering yes to *Import GitHub issues into the backlog?* in `minions setup` (default no), or set `intake.github` in the configuration:
+
+```json
+"intake": { "github": { "enabled": true, "repository": null, "labels": ["minions"], "assignee": "octocat", "milestone": "v1", "state": "open" } }
+```
+
+`repository` is `"owner/repo"` (`null` = the workspace origin); `labels` must all match; `assignee` is a login, `"none"` or `"*"`; `milestone` is a title or number, `"none"` or `"*"`; `null` means no filter. `minions sync` and every coordinator start (bounded to about 25 s, so a slow GitHub never delays the start) then run one read-only query (`gh api --method GET`; minions never comments on, labels, assigns or closes issues) and import each matching issue (pull requests excluded) as an `idea` task with provenance `external-requirement`, the issue URL as external link and the idempotency key `intake:gh:<owner>/<repo>#<n>`. Reruns create no duplicates, and minions never overwrites the title or description of an imported task or deletes one. While intake is paused (`minions pause --intake`), new issues are skipped and counted; `minions sync` still succeeds. When an imported issue leaves the filter (relabelled, closed, moved, filter changed) or is reassigned, its task is paused (status `blocked` with a note) and an `intake-reconcile` event is recorded; finished tasks stay as they are, a task with an active lease is paused on a later sync, and a task whose issue matches again is not resumed automatically. A failed or truncated query pauses nothing. Issue titles and bodies are imported as untrusted text: HTML comment openers are neutralised, so an issue cannot forge task metadata.
+
 To switch backends mid-project, use `minions migrate backlog` **(deferred in v0.1)**. The migration preserves task identity, links, dependencies, and PR references, can resume after a partial failure, and leaves the source records in place.
 
 ## Task lifecycle
