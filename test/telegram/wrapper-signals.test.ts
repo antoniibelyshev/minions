@@ -23,7 +23,7 @@ import { runCoordinator } from ${JSON.stringify(join(repo, 'src/runtime/coordina
 import { defaults } from ${JSON.stringify(join(repo, 'test/helpers.ts'))};
 const paths = JSON.parse(process.env.WRAP_PATHS!);
 const code = await runCoordinator(defaults(), {
-  paths, env: {}, log: () => {},
+  paths, env: {}, log: () => {}, permissionModes: async () => ['acceptEdits', 'auto'],
   spawn: (() => { const c = spawn('sleep', ['30'], { stdio: 'ignore' }); c.on('spawn', () => process.stdout.write('ready\\n')); return c; }) as never,
 });
 process.stdout.write('code ' + code + '\\n');

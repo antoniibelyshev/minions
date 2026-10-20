@@ -4,7 +4,7 @@ minions installs a small Claude Code development team into a Git project on your
 
 Everything the model controls runs inside one Docker container per project. Your Mac runs only a small, trusted `minions` CLI. (You can explicitly opt into a less safe **host runtime** without Docker; see [Running without Docker](#running-without-docker).) That CLI installs the team, starts and stops the container, provisions the credentials you grant, and handles explicit import and export.
 
-> **Status:** version 0.1 (bootstrap) is installable from GitHub or from source (see [Install in another project](#install-in-another-project)). It implements the terminal workflow on the host through six everyday commands (`setup`, `start`, `status`, `upgrade`, `down`, `uninstall`; see [Everyday use](#everyday-use)) plus advanced commands for single steps (see [docs/cli.md](docs/cli.md)); an opt-in host runtime without Docker ([Running without Docker](#running-without-docker)); optional Telegram communication through the official Claude Code channel plugin (see [docs/design/telegram.md](docs/design/telegram.md); the notification outbox is not implemented yet); the Backlog.md backend; `local` delivery (commits on `agent/<slug>` branches, fetched to the host with `minions export`); and `branch` / `pull-request` delivery to GitHub (push `agent/<slug>`, open one PR; never merged). The rest of this README describes the intended version 1 behavior. Sections marked **(deferred in v0.1)** are not implemented yet, and `minions status --check` reports them as unavailable: GitHub Issues backend, auto-merge and merge requests, review publication, config plan/apply, backlog migration, the plan/migration parts of upgrade, budgets, and companion containers. `minions auth github` stores a per-project fine-grained GitHub token on the host (see [docs/design/bootstrap.md](docs/design/bootstrap.md#github-credential)); the container uses it for branch/pull-request delivery. The v0.1 contract is [docs/design/bootstrap.md](docs/design/bootstrap.md); the full requirements are in [docs/spec.md](docs/spec.md).
+> **Status:** version 0.1 (bootstrap) is installable from GitHub or from source (see [Install in another project](#install-in-another-project)). It implements the terminal workflow on the host through six everyday commands (`setup`, `start`, `status`, `upgrade`, `down`, `uninstall`; see [Everyday use](#everyday-use)) plus advanced commands for single steps (see [docs/cli.md](docs/cli.md)); an opt-in host runtime without Docker ([Running without Docker](#running-without-docker)); optional Telegram communication through the official Claude Code channel plugin (see [docs/design/telegram.md](docs/design/telegram.md); the notification outbox is not implemented yet); the Backlog.md backend; `local` delivery (commits on `agent/<slug>` branches, fetched to the host with `minions export`); and `branch` / `pull-request` delivery to GitHub (push `agent/<slug>`, open one PR; never merged). The rest of this README describes the intended version 1 behavior. Sections marked **(deferred in v0.1)** are not implemented yet, and `minions status --check` reports them as unavailable: GitHub Issues backend, auto-merge and merge requests, review publication, config plan/apply, backlog migration, the plan/migration parts of upgrade, budgets, companion containers, GitHub App short-lived tokens (a fine-grained PAT is used instead), CODEOWNERS mapping of sensitive paths, and versioning a shared backlog in Git. `minions auth github` stores a per-project fine-grained GitHub token on the host (see [docs/design/bootstrap.md](docs/design/bootstrap.md#github-credential)); the container uses it for branch/pull-request delivery. The v0.1 contract is [docs/design/bootstrap.md](docs/design/bootstrap.md); the full requirements are in [docs/spec.md](docs/spec.md).
 
 ## Contents
 
@@ -48,9 +48,9 @@ Everything the model controls runs inside one Docker container per project. Your
  macOS host                              Project container (Linux, non-root)
 ┌──────────────────────┐                ┌──────────────────────────────────────────┐
 │ minions CLI          │  lifecycle,    │ Coordinator (main Claude Code session)    │
-│  - install / config  │  short-lived   │   ├─ minions:engineer  (subagent)        │
-│  - Docker lifecycle  │  tokens,       │   ├─ minions:tester    (subagent)        │
-│  - credential refresh│  explicit      │   └─ minions:reviewer  (subagent)        │
+│  - install / config  │  read-only     │   ├─ minions:engineer  (subagent)        │
+│  - Docker lifecycle  │  token files,  │   ├─ minions:tester    (subagent)        │
+│  - credentials       │  explicit      │   └─ minions:reviewer  (subagent)        │
 │  - import / export   │  import/export │ minions helpers (backlog, leases, policy) │
 │                      │ ─────────────▶ │ Git clone + per-task worktrees            │
 │ Keychain / 0600 files│                │ SQLite runtime state, private backlog     │
@@ -142,9 +142,9 @@ To change a choice later, rerun `minions setup`. Each step is also available as 
    7. Credential references and authentication readiness
    8. Container image, toolchain, and any application preview ports
 3. **Plan review.** Shows the planned writes, effective permissions, inferred verification commands, unavailable capabilities, and any external setup you still need to do. Approving the plan authorizes exactly those changes and nothing else.
-4. **Apply and verify.** Writes files atomically and records their hashes in a manifest. A failed install rolls back. Incomplete external setup, such as GitHub Apps or branch protection, is recorded as pending, never reported as ready.
+4. **Apply and verify.** Writes files atomically and records their hashes in a manifest. A failed install rolls back. Incomplete external setup, such as the GitHub token or branch protection, is recorded as pending, never reported as ready.
 
-The project step is idempotent. It never overwrites files you own, preserves uncommitted changes, never enables `bypassPermissions`, and never creates GitHub Apps or changes branch protection by itself. For non-interactive setup, pass a validated config file.
+The project step is idempotent. It never overwrites files you own, preserves uncommitted changes, never enables `bypassPermissions`, and never creates GitHub tokens or Apps or changes branch protection by itself. For non-interactive setup, pass a validated config file.
 
 ### Shared and private installations
 
@@ -152,7 +152,7 @@ The project step is idempotent. It never overwrites files you own, preserves unc
 | - | - | - |
 | Config location | `.minions/` in the repo (you may commit it) | `~/Library/Application Support/Minions/projects/<projectId>/` on the host, plus named volumes |
 | Repository changes | Managed files, optionally an owned block in `CLAUDE.md` | None: `git status` stays unchanged |
-| Backlog | Can be versioned in Git | Kept outside the repository |
+| Backlog | Planned: versioned in Git (deferred in v0.1; kept in the state volume) | Kept outside the repository |
 | Typical use | Your own project | Your personal team inside an employer's repo |
 
 All worktrees of a repository map to the same project ID, and only one coordinator can run per installation. If a copied project ID turns up bound to a different repository, minions detects it and asks you to attach explicitly or initialize a new project.
@@ -321,7 +321,7 @@ v0.1 supports `local`, `branch`, and `pull-request` delivery. `auto-when-eligibl
 
 **Evidence is tied to commits.** Test results, the review verdict, local checks, and CI observations are recorded against a head SHA and a config revision. A new commit invalidates stale evidence.
 
-**Approvals need a real second identity.** A native approving GitHub review requires an author and a reviewer with different identities. Two Claude sessions or two tokens for the same user don't count. The `project-owner` profile supports two GitHub Apps, one for development and one for review, and you remain a third identity for sensitive approvals. The `personal-work` profile adopts your existing approved credentials and review process.
+**Approvals need a real second identity.** A native approving GitHub review requires an author and a reviewer with different identities. Two Claude sessions or two tokens for the same user don't count. In v0.1 minions publishes with one fine-grained personal access token and posts no reviews, so approvals come from you or your normal review process. Planned (deferred): the `project-owner` profile uses two GitHub Apps, one for development and one for review, with you as a third identity for sensitive approvals. The `personal-work` profile adopts your existing approved credentials and review process.
 
 **The merge helper refuses to merge unless all of these hold:**
 
@@ -357,6 +357,18 @@ Authority is a set of independent capabilities. Each rule is `allow`, `ask`, or 
 - A prompt, task, ticket, or PR comment can't grant a capability.
 - minions keeps three questions separate, and `doctor` reports each one: Is the action **permitted**? Is the needed **credential** available? Can minions **enforce** the restriction mechanically?
 
+### Coordinator permission mode
+
+In the container, the coordinator Claude Code session runs in permission mode **`auto`** by default. The fixed rules stay the same in every mode: `git push` and `gh pr merge` are always denied, `minions work approve` / `minions approve` always ask you, and bypass mode is disabled for the session (`disableBypassPermissionsMode`). minions never launches with `bypassPermissions`, `dontAsk` or `--dangerously-skip-permissions`.
+
+**Trade-off.** With `auto`, a Claude Code classifier decides on actions outside the allow list (for example a Bash command that isn't `minions`, `git` or `backlog`) instead of asking you. You get far fewer prompts, but you are trusting the classifier with calls you would otherwise have reviewed yourself. The deny and ask rules above still match first, so the classifier can't approve a literal `git push`, `gh pr merge` or `minions work approve` (and since publication approvals must be signed on the host, an approval recorded in the container is rejected anyway). Those rules are command patterns, though. Other commands with the same effect that the patterns don't match (for example `sh -c 'git push ...'`, `gh api` calls that merge a PR, or `curl` with the push token, which is readable in the container) are now judged by the classifier instead of by you; under `acceptEdits` they would ask. The real boundary is server-side: a minimal-scope token and branch protection on GitHub (see the remaining trust boundary under [Host-signed publication approvals](docs/design/bootstrap.md#host-signed-publication-approvals)). If you'd rather review every such call, opt back into `acceptEdits`:
+
+```json
+{ "coordinator": { "permissionMode": "acceptEdits" } }
+```
+
+`minions coordinator --probe` (and `doctor`) report which mode the launch will use. If the installed Claude Code doesn't offer `--permission-mode auto`, the coordinator falls back to `acceptEdits`, prints why when it starts, and `doctor` shows a warning. A mode change takes effect when the coordinator restarts. The legacy top-level `permissionMode` key now matters only when it is `"default"` (stricter, still honoured). Its old default value `"acceptEdits"` doesn't opt out; use `coordinator.permissionMode` for that. Worker agents are unaffected. The host runtime always uses `default` (see [Running without Docker](#running-without-docker)).
+
 ## Sensitive changes
 
 Changes to these paths need human approval before publication or merge. Local planning and proposed edits can still be allowed.
@@ -369,7 +381,7 @@ infra/**   infrastructure/**   deploy/**   terraform/**   **/migrations/**
 
 You can change the list through the configuration workflow. A worker PR that tries to change its own control policy is handled separately from a reconfiguration you authorized. The development identity can never self-approve changes to credentials, workflow trust, or merge gates.
 
-In shared installs, path rules can map to CODEOWNERS and required code-owner review. In private installs, minions enforces them locally and says plainly that the repository has no hard gate for them. CODEOWNERS can't express semantic rules such as "all dependency changes", and minions does not claim that it can.
+In v0.1 minions enforces path rules locally and says plainly that the repository has no hard gate for them. Mapping them to CODEOWNERS and required code-owner review in shared installs is planned (deferred); you can add a `CODEOWNERS` entry yourself (see the branch-protection guidance in [docs/design/bootstrap.md](docs/design/bootstrap.md)). CODEOWNERS can't express semantic rules such as "all dependency changes", and minions does not claim that it can.
 
 ## Configuration
 
@@ -632,7 +644,7 @@ gets the host `central` binary, your `~/.claude`, the Keychain, or a way to run 
 - Long-lived secrets stay on the host, in macOS Keychain or in 0600 files outside the repository.
 - The Keychain items are created without a `-T` access list, so any process running as your user can read them (normal macOS behaviour; the Keychain protects against other users and offline access, not against your own processes). The plaintext GitHub/Telegram token copies mounted into the container (`secrets/` in the project directory) are removed by `minions down`/uninstall, when `minions start` fails, or when `minions doctor` finds them with no running container. The host-provisioned Claude key copy in the same directory stays until you switch back to `login` or uninstall (each `minions start` re-provisions it).
 - Configuration holds references only.
-- GitHub App private keys never enter the container. The host refreshes short-lived installation tokens into read-only secret files, and if a refresh fails, external writes pause.
+- GitHub access in v0.1 is a per-project fine-grained personal access token that you create and store with `minions auth github`. The host materializes it into a read-only secret file for the container. It is long-lived and not refreshed, so keep its scope minimal and its expiry short (see [GitHub credential](docs/design/bootstrap.md#github-credential)). Host-refreshed GitHub App installation tokens are planned (deferred).
 - Tokens, environment dumps, and private task payloads are never logged, and logs are kept bounded with predictable secret values redacted.
 - Issue, PR, and repository content is treated as untrusted. External commands use argument arrays, never shell strings built from that content.
 

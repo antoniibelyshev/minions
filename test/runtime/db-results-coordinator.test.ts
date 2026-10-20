@@ -113,7 +113,7 @@ describe('coordinator command', () => {
     expect(claude).not.toContain('--channels');
     expect(claude[claude.indexOf('--plugin-dir') + 1]).toBe(join(root, 'plugin'));
     expect(claude[claude.indexOf('--append-system-prompt') + 1]).toBe(prompt);
-    expect(claude[claude.indexOf('--permission-mode') + 1]).toBe('acceptEdits');
+    expect(claude[claude.indexOf('--permission-mode') + 1]).toBe('auto');
     const settings = JSON.parse(claude[claude.indexOf('--settings') + 1]!);
     expect(settings.permissions.allow).toEqual(expect.arrayContaining(['Bash(minions *)', 'Bash(git *)', 'Bash(backlog *)']));
     expect(settings.permissions.deny).toEqual(expect.arrayContaining(['Bash(git push *)', 'Bash(git * push *)']));

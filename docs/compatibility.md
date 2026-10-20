@@ -82,9 +82,14 @@ fake GitHub API; the pre-filled token URL follows GitHub's documented template U
 - **Repository import** copies committed history of the base branch only (Git bundle). Uncommitted,
   untracked, and ignored files are never imported; tracked secret-looking files trigger a warning
   but detection is best effort.
+- **Downgrade after task-36 (coordinator permission mode)**: older builds' strict config schema
+  requires the top-level `permissionMode` and rejects the `coordinator` key. Before reinstalling an
+  older build, remove `coordinator` from the project config and set `permissionMode` (for example
+  `"acceptEdits"`), otherwise config validation fails.
 - **Deferred features** (reported as unavailable by `minions doctor`): GitHub Issues backend,
   auto-merge and merge requests, review publication, the Telegram notification outbox, config plan/apply transactions,
-  backlog migration, upgrade, budgets, companion containers.
+  backlog migration, upgrade, budgets, companion containers, GitHub App short-lived tokens (a long-lived
+  fine-grained PAT is used instead), CODEOWNERS mapping of sensitive paths, shared backlog versioned in Git.
 - **Telegram bot token exposure inside the container**: the token is mounted read-only and given only to
   the coordinator's `claude` process environment, but the coordinator's tools (and workers' Bash, which
   run in the same process tree) can read it. Revoke it in BotFather (`/revoke`) if the container is compromised.

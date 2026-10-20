@@ -410,7 +410,15 @@ describe('init and doctor integration', () => {
     const gh = doc.checks.find((c) => c.name === 'github.credential')!;
     expect(gh).toMatchObject({ status: 'ok', detail: expect.stringMatching(/^ok: access to acme\/demo/) });
     expect(JSON.stringify(doc) + formatDoctor(doc)).not.toContain(TOKEN);
-    expect(doc.checks.find((c) => c.name === 'features')!.detail).not.toMatch(/credential/);
+    const features = doc.checks.find((c) => c.name === 'features')!;
+    expect(features.detail).not.toMatch(/credential/);
+    // Shipped-vs-planned deviations are reported as unavailable.
+    expect(features.status).toBe('unavailable');
+    for (const f of ['GitHub App short-lived tokens (a fine-grained PAT is used instead)', 'CODEOWNERS mapping of sensitive paths', 'shared backlog versioned in Git']) {
+      expect(DEFERRED_FEATURES as readonly string[]).toContain(f);
+      expect(features.detail).toContain(f);
+      expect(formatDoctor(doc)).toContain(f);
+    }
 
     // doctor: invalid
     const inv = await runDoctor({ cwd: repo, probe: dockerDown, runner: recorder().runner, fetch: github(401).f });
