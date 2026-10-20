@@ -14,7 +14,7 @@ import {
   clearSecrets, upClearingSecretsOnFailure, githubTokenGuidance, materializeSecrets, provisionGithubToken, provisionTelegramToken, removeGithubToken,
   removeTelegramToken, telegramBotGuidance,
 } from './credentials.js';
-import { assertBotFree } from './bot-guard.js';
+import { assertBotFree, startBotCheck } from './bot-guard.js';
 import { dockerProbe } from './discovery.js';
 import { Compose, ensureImage, packageRoot } from './docker.js';
 import { formatDoctor, runDoctor } from './doctor.js';
@@ -376,8 +376,11 @@ export function register(program: Command): void {
       const { projectId } = await projectForPath(process.cwd());
       const registered = await loadProjectJson(projectId);
       if (runtimeOf(registered) === 'host') return startHost(json, o);
-      // One bot, one coordinator: refuse before anything starts (terminal mode is never refused).
-      await assertBotFree(registered, (await loadEffectiveConfig(registered)).config);
+      // One bot, one coordinator: refuse before anything starts (terminal mode is never refused). When
+      // this project's own coordinator already runs, attaching adds no poller: warn and attach only.
+      const bot = await startBotCheck(registered, (await loadEffectiveConfig(registered)).config);
+      if (bot.action === 'attach-existing') say(json, bot.warning);
+      const attachOnly = bot.action === 'attach-existing';
       const { project, compose, config } = await ensureUp(json, { provision: true });
       let imported: unknown = null;
       if (!(await repoPresent(compose))) {
@@ -393,7 +396,9 @@ export function register(program: Command): void {
       // Telegram must work with nobody attached: start the session detached in that case.
       const channel = await hostChannel(project, config);
       if (channel.degraded) say(json, `warning: Telegram is off: ${channel.reason}; the coordinator starts terminal-only.`);
-      const coordinator = await telegramStartup(json, compose, config, { startDetached: !attach && channel.wantsTelegram, wantsTelegram: channel.wantsTelegram });
+      // attachOnly: never sync/relaunch the running coordinator onto a bot another project polls.
+      const coordinator = attachOnly ? { action: 'unchanged', reason: 'bot conflict: the running coordinator was left unchanged' }
+        : await telegramStartup(json, compose, config, { startDetached: !attach && channel.wantsTelegram, wantsTelegram: channel.wantsTelegram });
       if (!attach) {
         emit({ projectId: project.projectId, runtime: 'docker', running: true, imported, coordinator, attach: `docker compose -p ${compose.name} -f ${compose.file} exec ${'app'} minions coordinator` },
           { json, human: () => `Container ${compose.name} is running. Run \`minions start\` in a terminal to attach the coordinator.` });
@@ -404,7 +409,9 @@ export function register(program: Command): void {
         ? 'Attaching the coordinator (tmux session "coordinator"). On first start, log in to Claude with /login.'
         : 'Attaching the coordinator (tmux session "coordinator"). Claude uses the host-provisioned key.');
       const stopRefresh = startRefreshTimer(project.projectId, auth, { onWarn: (line) => process.stderr.write(`\r\n${line}\r\n`) });
-      try { process.exitCode = await compose.execInherit(['minions', 'coordinator'], { tty: true }); } finally { stopRefresh(); }
+      // attachOnly: plain tmux attach (never `new-session -A`), so a session that ended meanwhile is not relaunched.
+      const attachArgv = attachOnly ? ['tmux', 'attach-session', '-t', 'coordinator'] : ['minions', 'coordinator'];
+      try { process.exitCode = await compose.execInherit(attachArgv, { tty: true }); } finally { stopRefresh(); }
     }));
 
   program.command('upgrade')

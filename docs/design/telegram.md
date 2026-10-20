@@ -103,7 +103,8 @@ Decisions:
    whose launch record says Telegram is enabled (`src/host/bot-guard.ts`; a running session with an unreadable record
    counts as polling). The message names the bot ID and the other project only, never the token, and offers terminal
    mode (`minions channel set terminal`), stopping the other coordinator, or a separate bot. Terminal launches are never
-   checked. At runtime, a `409 Conflict` in the plugin's stderr maps to the precise message "another process is polling
+   checked. When this project's own coordinator session is already running, `minions start` warns and attaches to it
+   (plain `tmux attach-session`, no sync or relaunch), since attaching adds no second poller. At runtime, a `409 Conflict` in the plugin's stderr maps to the precise message "another process is polling
    this bot".
 7. **Terminal stays the baseline** (spec §76, §813). Every Telegram failure degrades to a terminal-only launch with a
    precise reason. Doctor never reports Telegram as `fail`.

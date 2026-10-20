@@ -3,7 +3,7 @@
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { assertBotFree, dockerCoordinatorPollsBot, findBotConflict } from '../../src/host/bot-guard.js';
+import { assertBotFree, dockerCoordinatorPollsBot, findBotConflict, ownCoordinatorRunning, startBotCheck } from '../../src/host/bot-guard.js';
 import { provisionTelegramToken } from '../../src/host/credentials.js';
 import type { ProjectJson } from '../../src/host/project.js';
 import { saveRegistry } from '../../src/host/registry.js';
@@ -131,5 +131,45 @@ describe('dockerCoordinatorPollsBot (fake docker)', () => {
     expect(await dockerCoordinatorPollsBot(B, d.runner)).toBe(false);
     expect(await dockerCoordinatorPollsBot(C, d.runner)).toBe(false);
     expect(d.calls).toEqual([]);
+  });
+});
+
+describe('minions start during a bot conflict', () => {
+  it("attaches with a warning when this project's own coordinator is already running (no new launch)", async () => {
+    await threeProjectsSharingABot();
+    const asked: string[] = [];
+    const r = await startBotCheck(project(A), cfg('telegram'), { coordinatorPollsBot: async () => true, ownRunning: async (id) => { asked.push(id); return true; } });
+    expect(asked).toEqual([A]);
+    expect(r.action).toBe('attach-existing');
+    const w = (r as { warning: string }).warning;
+    expect(w).toMatch(new RegExp(`^warning: Telegram bot 123456789 is also polled by the running coordinator of project\\(s\\) ${B}`));
+    expect(w).toMatch(/attaches to it without relaunching/);
+    expect(w).not.toContain(SECRET);
+  });
+
+  it('still refuses a new launch when this project has no running coordinator', async () => {
+    await threeProjectsSharingABot();
+    await expect(startBotCheck(project(A), cfg('telegram'), { coordinatorPollsBot: async () => true, ownRunning: async () => false })).rejects.toMatchObject({ code: 'CONFLICT' });
+    await expect(startBotCheck(project(A), cfg('telegram'), { coordinatorPollsBot: async () => true, ownRunning: async () => { throw new Error('docker gone'); } })).rejects.toMatchObject({ code: 'CONFLICT' });
+  });
+
+  it('launches normally without a conflict, and in terminal mode without asking', async () => {
+    await threeProjectsSharingABot();
+    let asked = false;
+    const ownRunning = async () => { asked = true; return true; };
+    expect(await startBotCheck(project(A), cfg('telegram'), { coordinatorPollsBot: async () => false, ownRunning })).toEqual({ action: 'launch' });
+    expect(await startBotCheck(project(A), cfg('terminal'), { coordinatorPollsBot: async () => true, ownRunning })).toEqual({ action: 'launch' });
+    expect(asked).toBe(false);
+  });
+
+  it('ownCoordinatorRunning: container up and tmux session present (fake docker)', async () => {
+    const runner = (running: boolean, session: boolean) => async (_cmd: string, args: string[]): Promise<RunResult> => {
+      if (args.includes('ps')) return { code: 0, stdout: running ? 'abc123\n' : '', stderr: '' };
+      if (args.includes('has-session')) return { code: session ? 0 : 1, stdout: '', stderr: '' };
+      return { code: 1, stdout: '', stderr: 'unexpected' };
+    };
+    expect(await ownCoordinatorRunning(A, runner(true, true))).toBe(true);
+    expect(await ownCoordinatorRunning(A, runner(true, false))).toBe(false);
+    expect(await ownCoordinatorRunning(A, runner(false, true))).toBe(false);
   });
 });

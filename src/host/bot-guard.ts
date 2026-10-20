@@ -82,3 +82,34 @@ export async function assertBotFree(project: ProjectJson, config: Pick<MinionsCo
   const conflict = await findBotConflict(project.projectId, deps);
   if (conflict) throw botConflictError(conflict);
 }
+
+/** Whether `projectId`'s own coordinator session is running (Docker runtime: container up, tmux session present). */
+export async function ownCoordinatorRunning(projectId: string, runner?: Runner): Promise<boolean> {
+  const compose = new Compose(projectId, runner);
+  if (!(await compose.isRunning().catch(() => false))) return false;
+  const has = await compose.exec(['tmux', 'has-session', '-t', 'coordinator'], { allowFailure: true, timeoutMs: 15_000 }).catch(() => null);
+  return !!has && has.code === 0;
+}
+
+export type StartBotCheck = { action: 'launch' } | { action: 'attach-existing'; warning: string };
+
+/**
+ * `minions start`'s bot check. No conflict: launch as usual. Conflict while this project's own
+ * coordinator is already running: attaching to it adds no second poller, so start only warns and
+ * attaches (it must not relaunch or sync that coordinator). Conflict otherwise: refused (CONFLICT).
+ */
+export async function startBotCheck(project: ProjectJson, config: Pick<MinionsConfig, 'communication' | 'container'>,
+  deps: BotGuardDeps & { ownRunning?: (projectId: string) => Promise<boolean> } = {}): Promise<StartBotCheck> {
+  try {
+    await assertBotFree(project, config, deps);
+    return { action: 'launch' };
+  } catch (e) {
+    if (!(e instanceof MinionsError && e.code === 'CONFLICT')) throw e;
+    const own = await (deps.ownRunning ?? ((id: string) => ownCoordinatorRunning(id, deps.runner)))(project.projectId).catch(() => false);
+    if (!own) throw e;
+    const c = e.details as BotConflict;
+    return { action: 'attach-existing', warning: `warning: Telegram bot ${c.botId} is also polled by the running coordinator of project(s) ${c.projects.join(', ')}. `
+      + "This project's coordinator is already running, so start attaches to it without relaunching or changing it. "
+      + 'Stop one of them (`minions down` in that project) or give one its own bot to avoid Telegram conflicts.' };
+  }
+}
