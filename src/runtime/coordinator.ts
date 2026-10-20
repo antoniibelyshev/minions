@@ -363,15 +363,19 @@ export function decidePermissionMode(cfg: PermCfg, opts: { hostRuntime?: boolean
   if (opts.hostRuntime ?? runtimeMode() === 'host-runtime') {
     return { configured, mode: 'default', fallback: false, reason: 'host runtime: the coordinator always runs in permission mode default' };
   }
+  // Legacy top-level "acceptEdits" (the old default) no longer opts out; say so wherever the mode is reported.
+  const legacy = cfg.permissionMode === 'acceptEdits' && !cfg.coordinator?.permissionMode
+    ? '; legacy permissionMode "acceptEdits" is ignored; set coordinator.permissionMode "acceptEdits" to opt out'
+    : '';
   if (configured !== 'auto' || opts.modes === undefined || opts.modes?.includes('auto')) {
-    return { configured, mode: configured, fallback: false, reason: `coordinator permission mode ${configured}` };
+    return { configured, mode: configured, fallback: false, reason: `coordinator permission mode ${configured}${legacy}` };
   }
   const why = opts.modes === null
     ? 'could not read the --permission-mode choices from `claude --help`'
     : `the installed Claude Code does not offer --permission-mode auto (choices: ${opts.modes.join(', ')})`;
   return {
     configured, mode: 'acceptEdits', fallback: true,
-    reason: `${why}; falling back to permission mode acceptEdits (Bash outside the allow list asks). Update Claude Code to get auto, or set coordinator.permissionMode "acceptEdits".`,
+    reason: `${why}; falling back to permission mode acceptEdits (Bash outside the allow list asks). Update Claude Code to get auto, or set coordinator.permissionMode "acceptEdits".${legacy}`,
   };
 }
 

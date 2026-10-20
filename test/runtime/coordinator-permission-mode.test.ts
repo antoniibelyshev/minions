@@ -79,6 +79,16 @@ describe('coordinator permission mode: config', () => {
     expect(validateConfig(withCoord(undefined, 'acceptEdits')).permissionMode).toBe('acceptEdits'); // existing configs stay valid
   });
 
+  it('legacy top-level permissionMode "acceptEdits" is reported as ignored by --probe/doctor (decision reason)', () => {
+    const note = /legacy permissionMode "acceptEdits" is ignored; set coordinator\.permissionMode "acceptEdits" to opt out/;
+    const legacy = withCoord(undefined, 'acceptEdits');
+    expect(decidePermissionMode(legacy, { hostRuntime: false, modes: ['acceptEdits', 'auto'] })).toMatchObject({ mode: 'auto', reason: expect.stringMatching(note) });
+    expect(decidePermissionMode(legacy, { hostRuntime: false, modes: ['acceptEdits'] })).toMatchObject({ mode: 'acceptEdits', fallback: true, reason: expect.stringMatching(note) });
+    expect(decidePermissionMode(withCoord('acceptEdits', 'acceptEdits'), { hostRuntime: false }).reason).not.toMatch(note);
+    expect(decidePermissionMode(withCoord(undefined, 'default'), { hostRuntime: false }).reason).not.toMatch(note);
+    expect(decidePermissionMode(defaults(), { hostRuntime: false }).reason).not.toMatch(note);
+  });
+
   it('never allows bypassPermissions from either key', () => {
     expect(() => decidePermissionMode({ permissionMode: 'bypassPermissions' as never }, { hostRuntime: false })).toThrow(/never allowed/);
     expect(() => decidePermissionMode({ coordinator: { permissionMode: 'bypassPermissions' as never } }, { hostRuntime: false })).toThrow(/never allowed/);
