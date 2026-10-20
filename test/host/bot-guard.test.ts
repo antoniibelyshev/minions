@@ -75,6 +75,14 @@ describe('one bot, one coordinator', () => {
     expect(checked).toBe(false);
   });
 
+  it('auto without a stored token is terminal mode: never checked, never refused', async () => {
+    await threeProjectsSharingABot();
+    const D = '2c3d4e5f-6a7b-4c8d-9e0f-1a2b3c4d5e6f';
+    let checked = false;
+    await expect(assertBotFree(project(D), cfg('auto'), { coordinatorPollsBot: async () => { checked = true; return true; } })).resolves.toBeUndefined();
+    expect(checked).toBe(false);
+  });
+
   it('allows the launch when the other project is stopped or terminal-only, and when no token is stored', async () => {
     await threeProjectsSharingABot();
     await expect(assertBotFree(project(A), cfg('telegram'), { coordinatorPollsBot: async () => false })).resolves.toBeUndefined();

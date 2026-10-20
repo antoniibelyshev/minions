@@ -203,3 +203,122 @@ describe('controlled restart waits for the old coordinator to release the lock',
     db.close();
   });
 });
+
+// Tester (task-17): a restart where the old wrapper outlives both waits (claude ignores SIGHUP, or a
+// slow MCP shutdown longer than LOCK_RELEASE_WAIT_MS + LOCK_WAIT_MS). One virtual clock drives both
+// the real syncCoordinator and the real coordinatorWrapper that tmux would start.
+describe('restart when the old wrapper is slow to exit', () => {
+  function world(oldExitsAtMs: number) {
+    const { paths } = layout();
+    const db = new RuntimeDb(paths.db);
+    db.acquireCoordinatorLock(TMUX_SESSION, OTHER_PID, () => true);
+    let now = 0;
+    const sleep = async (ms: number) => { now += ms; };
+    const alive = (p: number) => p === OTHER_PID && now < oldExitsAtMs;
+    let session = true;
+    let launchedAt = -1;
+    const runner = async (_cmd: string, args: string[], _opts?: RunOptions): Promise<RunResult> => {
+      if (args[0] === 'has-session') return { code: session ? 0 : 1, stdout: '', stderr: '' };
+      if (args[0] === 'kill-session') { session = false; return { code: 0, stdout: '', stderr: '' }; }
+      if (args.includes('new-session')) { session = true; launchedAt = now; return { code: 0, stdout: '', stderr: '' }; }
+      return { code: 1, stdout: '', stderr: 'unexpected' };
+    };
+    /** Runs the wrapper tmux started, from the moment it was launched. */
+    const runNewWrapper = async () => {
+      now = launchedAt;
+      const { spawn, calls } = fakeSpawn();
+      const result = await coordinatorWrapper(async () => terminalCfg(), {
+        paths, spawn, env: { TMUX: 'x' }, log: () => {}, signals: noSignals, lockWait: { alive, sleep },
+      }).then((code) => ({ code }), (e: unknown) => ({ error: e }));
+      session = false; // the pane's only process exited: tmux ends the session
+      return { result, claudeStarted: calls.length };
+    };
+    return { db, paths, runner, sleep, alive, runNewWrapper, hasSession: () => session };
+  }
+
+  it('an old wrapper that exits after the sync wait but within the wrapper wait hands over cleanly', async () => {
+    const w = world(20_000); // 15 s sync wait + 10 s wrapper wait covers 20 s
+    const r = await syncCoordinator(terminalCfg(), { paths: w.paths, runner: w.runner, activeLeases: () => [], sleep: w.sleep, lock: w.db, lockAlive: w.alive }, { restart: true, startDetached: true });
+    expect(r).toMatchObject({ action: 'restarted', running: true });
+    const n = await w.runNewWrapper();
+    expect(n.result).toEqual({ code: 0 });
+    expect(n.claudeStarted).toBe(1);
+    w.db.close();
+  });
+
+  // KNOWN DEFECT (reported to the coordinator as needs_changes): when the old wrapper outlives
+  // 15 s + 10 s, sync reports the coordinator relaunched and running, but the new wrapper later fails
+  // with CONFLICT and its session ends, so the project is left with no tmux coordinator. This test
+  // pins the current behaviour; flip it once sync/wrapper escalate (SIGTERM/SIGKILL the old pid) or
+  // keep retrying.
+  it('CURRENT BEHAVIOUR: an old wrapper that never exits leaves no coordinator after a "successful" restart', async () => {
+    const w = world(Number.POSITIVE_INFINITY); // claude ignores SIGHUP; the wrapper waits on it forever
+    const r = await syncCoordinator(terminalCfg(), { paths: w.paths, runner: w.runner, activeLeases: () => [], sleep: w.sleep, lock: w.db, lockAlive: w.alive }, { restart: true, startDetached: true });
+    expect(r).toMatchObject({ action: 'restarted', running: true }); // the 2 s settle check passed
+    expect(r.reason).toMatch(/had not exited yet/);
+    const n = await w.runNewWrapper();
+    expect(n.result).toMatchObject({ error: { code: 'CONFLICT' } });
+    expect(n.claudeStarted).toBe(0);
+    expect(w.hasSession()).toBe(false); // nobody is watching the project
+    expect(w.db.coordinatorLock()).toMatchObject({ pid: OTHER_PID }); // the stuck old wrapper still holds it
+    w.db.close();
+  });
+});
+
+describe('wrapper signal handling releases the lock', () => {
+  function signalBus() {
+    const handlers = new Map<NodeJS.Signals, Set<() => void>>();
+    return {
+      on(s: NodeJS.Signals, h: () => void) { (handlers.get(s) ?? handlers.set(s, new Set()).get(s)!).add(h); return this; },
+      removeListener(s: NodeJS.Signals, h: () => void) { handlers.get(s)?.delete(h); return this; },
+      emit(s: NodeJS.Signals) { for (const h of [...(handlers.get(s) ?? [])]) h(); },
+      count: () => [...handlers.values()].reduce((a, b) => a + b.size, 0),
+    };
+  }
+
+  /** Fake claude that runs until it gets a signal it does not ignore. */
+  function signalledChild(ignore: NodeJS.Signals[] = []) {
+    const kills: string[] = [];
+    let exit: ((code: number | null, signal: NodeJS.Signals | null) => void) | undefined;
+    const spawn: SpawnLike = () => ({
+      on(event: string, cb: (...a: unknown[]) => void) { if (event === 'exit') exit = cb as typeof exit; return this; },
+      kill(s?: NodeJS.Signals | number) { kills.push(String(s)); if (!ignore.includes(s as NodeJS.Signals)) setImmediate(() => exit?.(null, s as NodeJS.Signals)); return true; },
+    }) as unknown as ReturnType<SpawnLike>;
+    return { spawn, kills };
+  }
+
+  it('tmux kill-session (SIGHUP) is forwarded to claude; the wrapper exits 129 and releases the lock', async () => {
+    const { paths } = layout();
+    const bus = signalBus();
+    const child = signalledChild();
+    const p = coordinatorWrapper(async () => terminalCfg(), { paths, spawn: child.spawn, env: { TMUX: 'x' }, log: () => {}, signals: bus });
+    await new Promise((r) => setTimeout(r, 50)); // config load, lock, spawn
+    const db = new RuntimeDb(paths.db);
+    expect(db.coordinatorLock()).toMatchObject({ pid: process.pid, session: TMUX_SESSION });
+    bus.emit('SIGHUP');
+    expect(await p).toBe(129);
+    expect(child.kills).toEqual(['SIGHUP']);
+    expect(db.coordinatorLock()).toBeUndefined();
+    expect(bus.count()).toBe(0); // handlers removed
+    db.close();
+  });
+
+  it('CURRENT BEHAVIOUR: a claude that ignores SIGHUP keeps the wrapper (and the lock) alive; there is no escalation', async () => {
+    const { paths } = layout();
+    const bus = signalBus();
+    const child = signalledChild(['SIGHUP']);
+    let settled = false;
+    const p = coordinatorWrapper(async () => terminalCfg(), { paths, spawn: child.spawn, env: { TMUX: 'x' }, log: () => {}, signals: bus }).finally(() => { settled = true; });
+    await new Promise((r) => setTimeout(r, 50));
+    bus.emit('SIGHUP');
+    await new Promise((r) => setTimeout(r, 100));
+    expect(settled).toBe(false);
+    expect(child.kills).toEqual(['SIGHUP']); // no SIGTERM/SIGKILL follow-up
+    const db = new RuntimeDb(paths.db);
+    expect(db.coordinatorLock()).toMatchObject({ pid: process.pid });
+    bus.emit('SIGTERM'); // docker stop still ends it
+    expect(await p).toBe(143);
+    expect(db.coordinatorLock()).toBeUndefined();
+    db.close();
+  });
+});
