@@ -1,6 +1,6 @@
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { delimiter, join } from 'node:path';
+import { delimiter, join, sep } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { Command } from 'commander';
 import { assertIntakeOpen, isIntakeCreation } from '../../src/backlog/intake.js';
@@ -8,6 +8,7 @@ import { writeBacklogConfig } from '../../src/backlog/factory.js';
 import type { MinionsError } from '../../src/core/errors.js';
 import { generatePlugin } from '../../src/plugin/generate.js';
 import { buildProgram } from '../../src/program.js';
+import { runtimePaths } from '../../src/runtime/paths.js';
 import { defaults } from '../helpers.js';
 
 const onPath = (process.env.PATH ?? '').split(delimiter).some((d) => d && existsSync(join(d, 'backlog')));
@@ -146,6 +147,63 @@ describe('`minions backlog create` with intake paused', () => {
       expect(r.code, r.out).toBe(0);
       expect((JSON.parse(r.out) as { data: { created: boolean } }).data.created).toBe(true);
     }
+  });
+});
+
+describe('intake pause: isolation, re-runs, pause/resume combinations and status', () => {
+  const ownerRequest = (key: string) => ['backlog', 'create', '--title', 'Add login', '--provenance', 'user-decision', '--key', key];
+
+  it('uses only the temp state dir: runtime DB, backlog and config resolve under it', () => {
+    const p = runtimePaths();
+    expect(p.state).toBe(state);
+    expect(p.db.startsWith(state + sep)).toBe(true);
+    expect(p.backlog.startsWith(state + sep)).toBe(true);
+    expect(existsSync(join(state, 'minions.db'))).toBe(true);
+    expect(process.env.MINIONS_CONFIG?.startsWith(state + sep)).toBe(true);
+  });
+
+  it.runIf(onPath)('the task created on resume landed in the temp backlog', () => {
+    const files = readdirSync(join(state, 'backlog', 'backlog', 'tasks'));
+    expect(files.some((f) => /add-login/i.test(f)), files.join(', ')).toBe(true);
+  });
+
+  it('re-running an existing intake key is refused while paused; after resume it returns the existing task', async () => {
+    expect((await cli(['pause', '--intake'])).code).toBe(0);
+    expect(errorCode((await cli(ownerRequest('intake:add-login'))).out)).toBe('POLICY_DENIED');
+    expect((await cli(['resume', '--intake'])).code).toBe(0);
+    const after = await cli(ownerRequest('intake:add-login'));
+    expect(errorCode(after.out)).not.toBe('POLICY_DENIED');
+    if (onPath) expect((JSON.parse(after.out) as { data: { created: boolean } }).data.created).toBe(false);
+  });
+
+  it('plain `pause` pauses intake; `resume --starts` keeps it paused; plain `resume` re-opens it', async () => {
+    expect((await cli(['pause'])).code).toBe(0);
+    expect(errorCode((await cli(ownerRequest('intake:both-paused'))).out)).toBe('POLICY_DENIED');
+    const startsOnly = await cli(['resume', '--starts']);
+    expect((JSON.parse(startsOnly.out) as { data: { paused: { intake: boolean; starts: boolean } } }).data.paused)
+      .toEqual({ intake: true, starts: false });
+    expect(errorCode((await cli(ownerRequest('intake:starts-resumed'))).out)).toBe('POLICY_DENIED');
+    expect((await cli(['resume'])).code).toBe(0);
+    expect(errorCode((await cli(ownerRequest('intake:all-resumed'))).out)).not.toBe('POLICY_DENIED');
+  });
+
+  it('`status --json` reports data.paused.intake, which the intake skill checks', async () => {
+    expect((await cli(['pause', '--intake'])).code).toBe(0);
+    const paused = await cli(['status']);
+    expect(paused.code, paused.out).toBe(0);
+    expect((JSON.parse(paused.out) as { data: { paused: { intake: boolean } } }).data.paused.intake).toBe(true);
+    expect((await cli(['resume', '--intake'])).code).toBe(0);
+    const open = await cli(['status']);
+    expect((JSON.parse(open.out) as { data: { paused: { intake: boolean } } }).data.paused.intake).toBe(false);
+  });
+
+  it('`--parent` exempts any non-`intake:` key while paused (documented); `intake:` keys stay refused', async () => {
+    expect((await cli(['pause', '--intake'])).code).toBe(0);
+    const child = await cli(['backlog', 'create', '--title', 'Child', '--parent', 'task-1', '--provenance', 'external-requirement', '--key', 'ticket-42']);
+    expect(errorCode(child.out)).not.toBe('POLICY_DENIED');
+    const tagged = await cli(['backlog', 'create', '--title', 'Child', '--parent', 'task-1', '--key', 'intake:ticket-42:1']);
+    expect(errorCode(tagged.out)).toBe('POLICY_DENIED');
+    expect((await cli(['resume', '--intake'])).code).toBe(0);
   });
 });
 
