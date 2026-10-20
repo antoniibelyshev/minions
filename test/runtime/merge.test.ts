@@ -322,6 +322,59 @@ describe('CI-gated auto-merge (mocked gh)', () => {
     expect(env.backlog.status('task-1')).toBe('done');
   });
 
+  it('a merged PR whose task holds an active lease is recorded merged but the status is left alone', async () => {
+    const env = mergeEnv((c) => { c.capabilities['pr.merge'] = 'allow'; });
+    await deliver(env, 'task-1');
+    env.gh.pr().rollup = passing;
+    expect((await sync(env)).tasks[0]!.merge!.state).toBe('armed');
+    env.db.activeLeases = () => [{ task_id: 'task-1' } as never];
+    Object.assign(env.gh.pr(), { state: 'MERGED', mergedAt: '2026-10-20T12:00:00Z', autoMergeRequest: null });
+    const m = await env.sched.autoMerge('task-1');
+    expect(m).toMatchObject({ state: 'merged', merged: true });
+    expect(m.message).toMatch(/active lease; status left unchanged/);
+    expect(mergeHistory(env, 'task-1').at(-1)).toBe('merged');
+    expect(env.backlog.status('task-1')).not.toBe('done');
+  });
+
+  it('a failed --disable-auto is reported as failed with auto-merge still armed', async () => {
+    const env = mergeEnv((c) => { c.capabilities['pr.merge'] = 'allow'; });
+    await deliver(env, 'task-1');
+    env.gh.pr().rollup = passing;
+    expect((await sync(env)).tasks[0]!.merge!.state).toBe('armed');
+    env.gh.pr().rollup = failing;
+    env.gh.disableError = 'gh: HTTP 502';
+    const m = (await sync(env)).tasks[0]!.merge!;
+    expect(m).toMatchObject({ state: 'failed', armed: true });
+    expect(m.message).toMatch(/could not be disabled/);
+    expect(env.gh.pr().autoMergeRequest).not.toBeNull();
+    expect(armedByMinions(env.db.evidenceOfKind('task-1', 'merge'))).toBe(true);
+    env.gh.disableError = null;
+    expect((await sync(env)).tasks[0]!.merge!.state).toBe('disarmed');
+  });
+
+  it('sync reconciles a PR merged on GitHub with auto-merge off: done, merge evidence recorded once', async () => {
+    const env = mergeEnv((c) => { c.delivery.merge = 'disabled'; });
+    await deliver(env, 'task-1');
+    Object.assign(env.gh.pr(), { state: 'MERGED', mergedAt: '2026-10-20T12:00:00Z' });
+    const s = await sync(env);
+    expect(s.tasks[0]!.statusChange).toEqual({ from: 'delivered', to: 'done' });
+    expect(env.backlog.status('task-1')).toBe('done');
+    expect(mergeHistory(env, 'task-1')).toEqual(['merged']);
+    expect(env.db.evidenceOfKind('task-1', 'merge')[0]!.details_json).toContain('"how":"github"');
+    await sync(env);
+    expect(mergeHistory(env, 'task-1')).toEqual(['merged']);
+    expect(env.gh.merges()).toEqual([]);
+  });
+
+  it('formatSync prints the merge line with state and message', () => {
+    const text = formatSync({ synced: 1, failed: 0, tasks: [{
+      taskId: 'task-1', prUrl: 'https://github.com/acme/demo/pull/1', prState: 'OPEN', headSha: 'a'.repeat(40), changed: false, warnings: [],
+      ci: { state: 'passing', total: 1, passed: 1, failed: [], pending: [], checks: [] },
+      merge: { taskId: 'task-1', state: 'failed', prUrl: null, head: null, armed: false, merged: false, reasons: [], action: 'none', message: 'gh exploded' },
+    }] });
+    expect(text).toContain('\n  merge failed: gh exploded');
+  });
+
   it('auto-merge off: delivery and sync make no merge calls and say minions does not merge', async () => {
     const env = mergeEnv((c) => { c.delivery.merge = 'disabled'; c.capabilities['pr.merge'] = 'allow'; });
     const { r } = await deliver(env, 'task-1');
