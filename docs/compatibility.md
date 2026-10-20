@@ -87,7 +87,7 @@ fake GitHub API; the pre-filled token URL follows GitHub's documented template U
   older build, remove `coordinator` from the project config and set `permissionMode` (for example
   `"acceptEdits"`), otherwise config validation fails.
 - **Deferred features** (reported as unavailable by `minions doctor`): GitHub Issues backend,
-  auto-merge and merge requests, review publication, the Telegram notification outbox, config plan/apply transactions,
+  auto-merge and merge requests, review publication, the notification outbox, config plan/apply transactions,
   backlog migration, upgrade, budgets, companion containers, GitHub App short-lived tokens (a long-lived
   fine-grained PAT is used instead), CODEOWNERS mapping of sensitive paths, shared backlog versioned in Git.
 - **Telegram bot token exposure inside the container**: the token is mounted read-only and given only to

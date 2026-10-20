@@ -71,7 +71,7 @@ expect_eq "$("$M" init "$A" --yes --private --json | json 'd.data.applied.writte
 cd "$A"
 "$M" config show --explain | grep -q '^capabilities.code.edit = {' || fail "config show --explain resolves dotted capability keys"
 ok "config show --explain"
-doc="$("$M" doctor --json)"
+doc="$("$M" doctor --json || true)"  # doctor exits 1 on blocking FAIL; the checks are asserted below
 expect_eq "$(json 'd.ok' <<<"$doc")" true "doctor --json returns ok"
 case "$(json 'd.data.checks.find(c=>c.name==="claude.auth").status' <<<"$doc")" in warn|fail) ok "doctor reports Claude auth as not ready";; *) fail "claude.auth should be warn/fail without login";; esac
 
@@ -211,7 +211,7 @@ expect_eq "$(cx minions coordinator --print-command --json | json 'JSON.parse(d.
 printf '%s' "$KEY2" > "$WORK/key.txt"
 "$M" auth refresh --json >/dev/null
 expect_eq "$(cx cat /opt/minions/secrets/anthropic-api-key)" "$KEY2" "refreshed key visible through the directory mount (no restart)"
-doc="$("$M" doctor --json)"
+doc="$("$M" doctor --json || true)"  # doctor exits 1 on blocking FAIL; the checks are asserted below
 expect_eq "$(json 'd.data.checks.find(c=>c.name==="claude.auth").status' <<<"$doc")" ok "doctor: key readable in container"
 expect_eq "$(json 'd.data.checks.find(c=>c.name==="claude.baseUrl").status' <<<"$doc")" ok "doctor: base URL reachable from container"
 grep -qF "$KEY2" <<<"$doc" && fail "key leaked into doctor output"

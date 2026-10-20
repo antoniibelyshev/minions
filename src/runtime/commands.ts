@@ -12,7 +12,7 @@ import { readJson } from '../core/fsutil.js';
 import { emit } from '../core/output.js';
 import { approveOnHost } from '../host/approvals.js';
 import { delegateToRuntime } from '../host/delegate.js';
-import { formatDoctor, runDoctor } from '../host/doctor.js';
+import { applyDoctorExit, formatDoctor, runDoctor } from '../host/doctor.js';
 import { readTelegramAccess } from '../telegram/access.js';
 import { installTelegramPlugin } from '../telegram/install.js';
 import { formatTelegramProbe, probeTelegram } from '../telegram/probe.js';
@@ -507,6 +507,7 @@ export function register(program: Command): void {
         requireMode('host');
         const r = await runDoctor({ cwd: process.cwd() });
         emit(r, { json: globalOpts(cmd).json, human: formatDoctor });
+        applyDoctorExit(r);
         return;
       }
       if (runtimeMode() === 'host') return delegate(cmd);

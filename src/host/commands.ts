@@ -17,7 +17,7 @@ import {
 import { assertBotFree, startBotCheck } from './bot-guard.js';
 import { dockerProbe } from './discovery.js';
 import { Compose, ensureImage, packageRoot } from './docker.js';
-import { formatDoctor, runDoctor } from './doctor.js';
+import { applyDoctorExit, formatDoctor, runDoctor } from './doctor.js';
 import { dockerUnavailable, formatInit, refreshDerived, runInit } from './install.js';
 import { loadEffectiveConfig, loadProjectJson } from './project.js';
 import { projectForPath } from './registry.js';
@@ -365,6 +365,7 @@ export function register(program: Command): void {
       const { json } = globalOpts(cmd);
       const r = await runDoctor({ cwd: process.cwd() });
       emit(r, { json, human: formatDoctor });
+      applyDoctorExit(r);
     }));
 
   program.command('start')

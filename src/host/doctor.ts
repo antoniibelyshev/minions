@@ -494,3 +494,8 @@ export function formatDoctor(r: DoctorReport): string {
   L.push('', r.healthy ? 'No blocking problems found.' : 'Blocking problems found (FAIL).');
   return L.join('\n');
 }
+
+/** Blocking problems (a FAIL check) make `doctor` / `status --check` exit non-zero; warnings keep exit 0. */
+export function applyDoctorExit(r: DoctorReport): void {
+  if (!r.healthy) process.exitCode = 1;
+}
