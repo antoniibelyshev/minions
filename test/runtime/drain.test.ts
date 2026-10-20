@@ -450,6 +450,41 @@ describe('drain hook gate and phases (tester additions)', () => {
     for (const bad of probes) expect(drainSafeBash(bad), JSON.stringify(bad.slice(0, 80))).toBe(false);
   });
 
+  it('drainSafeBash: allowlist surface probes (tester round 4)', () => {
+    for (const bad of [
+      // git spellings of --output (parsed anywhere, also after --), and quoted option words.
+      'git diff --stat=1 --output=x', 'git log --format=%H --output=x', 'git diff -pz --output', 'git log -1 -- --output=x',
+      "git diff -- '--output=x'", 'git show --ou', "git add '-f'", 'git add "-p"', "git branch '-D'", 'git branch --list x',
+      'git --no-pager --no-pager status', 'git commit -m --amend', "git commit -m 'x' -F - <<'EOF'\nx\nEOF",
+      // Quoted or split command names.
+      "'echo' x", "'cd' /w && git status", "e'cho' x", '""echo x', "''git status", "git'' status",
+      // A body line equal to the delimiter ends the heredoc; whatever follows would run.
+      "minions work submit L --json <<'RESULT'\nRESULT\nRESULT",
+      "minions work submit L --json <<'RESULT'\nx\nRESULT\ntouch /tmp/p\nRESULT",
+      "git commit -F - <<'EOF'\nEOF\ntouch /tmp/p\nEOF",
+      "git commit -m \"$(cat <<'EOF'\nEOF\n)\" \nEOF\n)\"",
+      // CR and whitespace around the fixed heredoc parts; look-alike and invisible characters outside quotes.
+      "minions work submit L --json <<'RESULT'\r\nx\nRESULT", "git commit -F - <<'EOF' \nx\nEOF",
+      'git status && rm x', 'git status rm', 'git stаtus', 'git status rm x', 'git status \u0000; rm',
+      "echo 'a\u0000'; touch /tmp/p'",
+      // Heads of the heredoc forms beyond cd and git add.
+      "git status && minions work submit L --json <<'RESULT'\n{}\nRESULT",
+      "cd /w && git add -A && minions work submit L --json <<'RESULT'\n{}\nRESULT",
+      "git add -f x && git commit -F - <<'EOF'\nx\nEOF", "cd /w && cd /x && git commit -F - <<'EOF'\nx\nEOF",
+      'git log | head -1000000', 'git log | head -05',
+    ]) expect(drainSafeBash(bad), JSON.stringify(bad)).toBe(false);
+    // Allowed, and checked with bash 5.2: the quoted delimiters keep these bodies literal (nothing runs), and
+    // `RESULT\r` or ` EOF` is not a terminator line.
+    for (const ok of [
+      "git commit -m \"$(cat <<'EOF'\n EOF\nEOF\n)\"",
+      "git commit -m \"$(cat <<'EOF'\nx)\"; touch /tmp/p; echo \"(\nEOF\n)\"",
+      "git commit -m \"$(cat <<'EOF'\nit's\nEOF\n)\"",
+      "git commit -m \"$(cat <<'EOF'\na\"b\nEOF\n)\"",
+      "minions work submit L --json <<'RESULT'\nRESULT\r\ntouch /tmp/p\nRESULT",
+      "git -C '$(touch /tmp/p)' status", "git commit -m '--amend'", ' git status', 'git status ',
+    ]) expect(drainSafeBash(ok), JSON.stringify(ok)).toBe(true);
+  });
+
   it('the gate handles a state dir with a space: exit 0 without the flag, runs minions with it', () => {
     const { dir } = gateEnv();
     const state = join(dir, 'state with space');
