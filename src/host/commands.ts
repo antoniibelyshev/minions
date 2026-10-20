@@ -28,7 +28,7 @@ import { formatChannel } from '../telegram/channel.js';
 import { githubStartHint, registerGithubSetup } from './github-setup.js';
 import { formatUninstall, runUninstall } from './uninstall.js';
 import { DELIVERY_MODES, formatSetup, runSetup, shellQuote, type DeliveryMode, type SetupRuntime } from './setup.js';
-import { DEFAULT_UPGRADE_TIMEOUT_SEC, formatUpgrade, runUpgrade } from './upgrade.js';
+import { DEFAULT_UPGRADE_TIMEOUT_SEC, formatUpgrade, runUpgrade, upgradeTimeout } from './upgrade.js';
 import { HANDOFF_ENV, isMinionsCheckout, runSourcePhase, upgradeSourceMode } from './upgrade-source.js';
 import { readSecret, readlineIO } from './wizard.js';
 import { initMayOfferAssistant, launchAssistant, loadAssistantContext, offerSetupAssistant, registerAssistant } from './assistant.js';
@@ -412,8 +412,7 @@ export function register(program: Command): void {
     .action(action(async (o: { timeout?: string; now?: boolean; fromContainer?: string | boolean; rebuildCli?: boolean }, cmd: Command) => {
       requireMode('host');
       const { json, dryRun } = globalOpts(cmd);
-      const timeoutSec = o.timeout === undefined ? (o.now ? 0 : DEFAULT_UPGRADE_TIMEOUT_SEC) : Number(o.timeout);
-      if (!Number.isInteger(timeoutSec) || timeoutSec < 0) throw new MinionsError('PRECONDITION', `--timeout must be a whole number of seconds (got ${o.timeout}).`);
+      const timeoutSec = upgradeTimeout(o.timeout, !!o.now);
       const ref = await projectForPath(process.cwd());
       const project = await loadProjectJson(ref.projectId);
       if (runtimeOf(project) === 'host') {

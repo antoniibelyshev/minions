@@ -446,14 +446,27 @@ date is the source phase. It runs before everything else (see "Upgrade from the 
   start. The wait is up to `--timeout` seconds (default 1800). When it runs out, the default aborts:
   starts are resumed and the container is left alone. With `--now` the remaining leases are released
   and reported as `interrupted`, and the recovery prompt re-dispatches them. `--now` on its own means
-  no wait at all.
+  no wait at all. A release answered with `CONFLICT` "already ended" means the lease ended on its own
+  after the last poll; it counts as drained, not interrupted. If a release fails for another reason,
+  the abort lists the leases already released. A failed `status` poll is retried after 2, 5 and 10
+  seconds before the drain gives up.
 - **Image.** The image is rebuilt only when its `minions.build` label differs from the package
   fingerprint (`ensureImage`).
 - **Pause ownership.** Starts that the user paused before the upgrade stay paused. A pause made by an
   upgrade is recorded in `projects/<id>/upgrade.json` until it is resumed, so a rerun after a failure
-  still resumes it.
+  still resumes it. The marker holds the id of the runtime `controls` event that paused starts
+  (`minions status --json` reports the last one as `pauseChanges`). A rerun counts the current pause as
+  its own only when that event is the marker's, so a pause the user made after resuming by hand stays
+  paused and the stale marker is dropped. A marker without an event id matches a pause recorded within
+  a few minutes of its timestamp. A runtime that predates `pauseChanges` leaves only the marker to go
+  by. With the container down, ownership is decided after the recreate.
+- **Interrupts.** SIGINT or SIGTERM before the recreate waits for an in-flight pause, resumes the starts
+  the upgrade paused, prints one line with a hint to rerun `minions upgrade`, and exits (130/143). Once
+  the recreate has started it prints only the hint; the marker lets the rerun resume starts. A second
+  signal exits at once.
 - **Resume before restart.** The recovery prompt dispatches only when starts are not paused.
-- **Failures.** A failure before the recreate resumes starts and changes nothing else. A failed
+- **Failures.** A failure before the recreate resumes starts and changes nothing else. That includes a
+  stored token that cannot be read (secrets step), since the new container would start without it. A failed
   recreate keeps the volumes and points to a rerun. After the recreate, each remaining step is still
   attempted and failures are reported (`ok: false`, exit code 1).
 - **Volumes.** The upgrade never runs `down -v` or volume commands. `--dry-run` only reads (compose
@@ -502,7 +515,8 @@ The source phase (`src/host/upgrade-source.ts`) adds two steps, `sync` and `cli`
   can claim to be a minions checkout (`package.json` name plus `src/cli.ts`). So the rebuild/reinstall
   runs only with `--rebuild-cli`; without it the upgrade stops with the command (`ok: false`) and a
   rerun that opts in. Commits fast-forwarded by `--from-container` are never built in the same run,
-  even with `--rebuild-cli`: the upgrade stops and names the range to review.
+  even with `--rebuild-cli`: the upgrade stops, names the range to review and logs it
+  (`git log --oneline <from>..<to>`, up to 20 commits). A dry run plans these stops (`ok: false`).
 
 ### origin/<base> as the single source of truth
 

@@ -365,6 +365,20 @@ export function spawnCli(cliPath: string, args: string[]): Promise<RunResult> {
 
 // ---------------------------------------------------------------- the phase
 
+/**
+ * Shows the commits the fast-forward brought in. They are never built in the same run (the upgrade
+ * stops before the CLI step), so this is the range to review before rerunning with --rebuild-cli.
+ */
+async function logRange(s: SyncResult, repo: string, runner: Runner, log: (m: string) => void): Promise<void> {
+  if (!s.from || !s.to) return;
+  log(`cli: not built in this run; review the commits fetched from the container (${short(s.from)}..${short(s.to)}):`);
+  const r = await runner('git', [...HOST_GIT, 'log', '--oneline', '--no-decorate', '-n', '20', `${s.from}..${s.to}`], { cwd: repo, allowFailure: true, timeoutMs: 60_000 })
+    .catch(() => null);
+  const lines = r && r.code === 0 ? r.stdout.split('\n').filter(Boolean) : [];
+  for (const l of lines) log(`  ${l}`);
+  if (!lines.length) log(`  (see git log ${short(s.from)}..${short(s.to)})`);
+}
+
 export interface SourceStop { reason: string; command: string; rerun: string }
 
 export interface SourcePhase<C = unknown> {
@@ -458,40 +472,53 @@ export async function runSourcePhase<C>(opts: SourcePhaseOptions): Promise<Sourc
   }
   const check = () => checkCli({ checkout: opts.checkout!, runner: opts.runner, runningRoot: opts.runningRoot, handoff: opts.handoff });
   const c = out.cli = await check();
-  push(cliStep(c, dryRun));
-  if (!c.differs || dryRun) return out;
-  if (c.action === 'manual') {
-    out.stop = { reason: c.reason, command: c.command!, rerun: opts.rerun };
+  if (!c.differs || c.action === 'manual') {
+    push(cliStep(c, dryRun));
+    if (c.differs) {
+      if (dryRun) out.ok = false; // the real run would stop here
+      else out.stop = { reason: c.reason, command: c.command!, rerun: opts.rerun };
+    }
     return out;
   }
   // Building runs the checkout's npm lifecycle scripts, esbuild config and lockfile dependencies on the
   // host and installs the result as the global CLI. Commits just taken from the container are never
-  // built in the same run, and building at all needs the explicit --rebuild-cli opt-in.
-  // origin/<base> commits were reviewed and merged on GitHub, so only container commits wait a run.
-  const moved = !!out.sync && out.sync.source === 'container' && out.sync.action === 'fast-forward' && out.sync.applied;
+  // built in the same run (a dry run plans that fast-forward), and building at all needs the explicit
+  // --rebuild-cli opt-in. origin/<base> commits were reviewed and merged on GitHub, so only container
+  // commits wait a run.
+  const moved = !!out.sync && out.sync.source === 'container' && out.sync.action === 'fast-forward' && (out.sync.applied || dryRun);
   if (moved || !opts.rebuildCli) {
+    const s = out.sync;
     const why = moved
-      ? `${c.reason}; the checkout was just fast-forwarded to commits from the container (${out.sync!.from?.slice(0, 12) ?? '?'}..${out.sync!.to?.slice(0, 12) ?? '?'}), which are not built in the same run: review them (git diff --stat ${out.sync!.from ?? ''} ${out.sync!.to ?? ''}), then rerun with --rebuild-cli or run the command yourself`
+      ? `${c.reason}; the checkout ${dryRun ? 'would be' : 'was just'} fast-forwarded to commits from the container (${s!.from?.slice(0, 12) ?? '?'}..${s!.to?.slice(0, 12) ?? '?'}), which are not built in the same run: review them (git diff --stat ${s!.from ?? ''} ${s!.to ?? ''}), then rerun with --rebuild-cli or run the command yourself`
       : `${c.reason}; rebuilding runs the checkout's npm scripts and build on this host and installs the result globally: review the checkout, then rerun with --rebuild-cli or run the command yourself`;
-    out.steps[out.steps.length - 1] = { id: 'cli', status: 'failed', detail: why };
     out.ok = false;
+    if (dryRun) { push({ id: 'cli', status: 'planned', detail: `would stop: ${why}` }); return out; } // the real run would stop here
+    push({ id: 'cli', status: 'failed', detail: why });
+    if (moved && opts.sync) await logRange(s!, opts.sync.repo, opts.sync.runner ?? opts.runner ?? run, log);
     out.stop = { reason: why, command: c.command!, rerun: `${opts.rerun} --rebuild-cli` };
     return out;
   }
+  if (dryRun) { push(cliStep(c, dryRun)); return out; }
+  // Log in the order things happen: what is about to be built, the npm commands, then the result.
+  out.steps.push(cliStep(c, dryRun));
+  log(`cli: ${c.reason}; ${c.action === 'rebuild' ? 'rebuilding the linked checkout' : 'reinstalling from the checkout'} (${c.command})`);
   try {
     await applyCli(c, { runner: opts.runner, log });
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     out.steps[out.steps.length - 1] = { id: 'cli', status: 'failed', detail: `${c.reason}; ${c.action} failed: ${msg}` };
+    log(`cli: ${c.action} failed: ${msg}`);
     out.stop = { reason: `${c.action} failed: ${msg}`, command: c.command!, rerun: opts.rerun };
     return out;
   }
   const after = await check();
   if (after.differs || !after.installed.realPath) {
     out.steps[out.steps.length - 1] = { id: 'cli', status: 'failed', detail: `${c.action} finished but ${after.reason}` };
+    log(`cli: ${c.action} finished but ${after.reason}`);
     out.stop = { reason: `after the ${c.action}: ${after.reason}`, command: manualReinstallCommand(after.checkout, after.checkoutVersion), rerun: opts.rerun };
     return out;
   }
+  log(`cli: ${out.steps[out.steps.length - 1]!.detail}`);
   out.cli = { ...c, installed: after.installed };
   const cliPath = join(after.installed.realPath, 'dist', 'cli.js');
   log(`cli: continuing the upgrade on the new CLI (${cliPath})`);

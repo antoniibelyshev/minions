@@ -204,6 +204,58 @@ describe('keychain store', () => {
     expect(readFileSync(projectPaths(ID).githubTokenFile, 'utf8')).toBe(TOKEN + '\n');
     for (const c of calls) expect(c.args.join(' ')).not.toContain(TOKEN);
   });
+
+  it('a store read failure keeps the last materialized copy (the running container keeps the token) and rethrows', async () => {
+    const repo = makeRepo(env.root);
+    const { runner } = fakeKeychain();
+    await C.provisionGithubToken({ projectId: ID, token: TOKEN, repoPath: repo, verify: false, runner, env: {}, platform: 'darwin' });
+    await C.materializeSecrets(ID, runner);
+    const locked = recorder(({ cmd }) => (cmd === 'security' ? { code: 51, stdout: '', stderr: 'locked' } : undefined)).runner;
+    await expect(C.materializeSecrets(ID, locked)).rejects.toMatchObject({ code: 'AUTH_REQUIRED' });
+    expect(readFileSync(projectPaths(ID).githubTokenFile, 'utf8')).toBe(TOKEN + '\n');
+    // A token that is really gone (removed from the store) still drops the copy.
+    await C.materializeSecrets(ID, fakeKeychain().runner);
+    expect(existsSync(projectPaths(ID).githubTokenFile)).toBe(false);
+  });
+
+  const TG = '123456789:AAHfakefakefakefakefakefakefake_-0123';
+  const TG2 = '123456789:AAHrotatedrotatedrotatedrotated_-9876';
+  const lockedKeychain = () => recorder(({ cmd }) => (cmd === 'security' ? { code: 51, stdout: '', stderr: 'locked' } : undefined)).runner;
+
+  it('one kind failing to read does not stop the other kind: it is still refreshed, the failing copy is kept, then the error is rethrown', async () => {
+    const repo = makeRepo(env.root);
+    const { runner } = fakeKeychain();
+    const p = projectPaths(ID);
+    await C.provisionGithubToken({ projectId: ID, token: TOKEN, repoPath: repo, verify: false, runner, env: {}, platform: 'darwin' });
+    await C.provisionTelegramToken({ projectId: ID, token: TG, repoPath: repo, runner, env: {}, platform: 'linux' });
+    expect(await C.materializeSecrets(ID, runner)).toEqual({ github: true, telegram: true });
+    // Rotate the file-stored telegram token, then lock the keychain that holds the github token.
+    await C.provisionTelegramToken({ projectId: ID, token: TG2, repoPath: repo, runner, env: {}, platform: 'linux' });
+    await expect(C.materializeSecrets(ID, lockedKeychain())).rejects.toMatchObject({ code: 'AUTH_REQUIRED' });
+    expect(readFileSync(p.githubTokenFile, 'utf8')).toBe(TOKEN + '\n');
+    expect(readFileSync(p.telegramTokenFile, 'utf8')).toBe(TG2 + '\n');
+    expect(mode(p.githubTokenFile)).toBe(0o600);
+    expect(mode(p.telegramTokenFile)).toBe(0o600);
+    // A kind that is really absent is still removed while the other kind fails to read.
+    await C.removeTelegramToken(ID, runner);
+    await expect(C.materializeSecrets(ID, lockedKeychain())).rejects.toMatchObject({ code: 'AUTH_REQUIRED' });
+    expect(existsSync(p.telegramTokenFile)).toBe(false);
+    expect(readFileSync(p.githubTokenFile, 'utf8')).toBe(TOKEN + '\n');
+    expect(readdirSync(p.secretsDir)).toEqual(['github-token']);
+  });
+
+  it('a read failure on the later kind (telegram) keeps its copy after the earlier kind (github) is written', async () => {
+    const repo = makeRepo(env.root);
+    const { runner } = fakeKeychain();
+    const p = projectPaths(ID);
+    await C.provisionGithubToken({ projectId: ID, token: TOKEN, repoPath: repo, verify: false, runner, env: {}, platform: 'linux' });
+    await C.provisionTelegramToken({ projectId: ID, token: TG, repoPath: repo, runner, env: {}, platform: 'darwin' });
+    await C.materializeSecrets(ID, runner);
+    await C.provisionGithubToken({ projectId: ID, token: TOKEN2, repoPath: repo, verify: false, runner, env: {}, platform: 'linux' });
+    await expect(C.materializeSecrets(ID, lockedKeychain())).rejects.toMatchObject({ code: 'AUTH_REQUIRED' });
+    expect(readFileSync(p.githubTokenFile, 'utf8')).toBe(TOKEN2 + '\n');
+    expect(readFileSync(p.telegramTokenFile, 'utf8')).toBe(TG + '\n');
+  });
 });
 
 describe('container mount', () => {

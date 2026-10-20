@@ -4,9 +4,8 @@ import { existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from 
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { sourceFingerprint } from '../../scripts/source-fingerprint.mjs';
-import type { RunOptions, RunResult } from '../../src/core/exec.js';
+import { run, type RunOptions, type RunResult } from '../../src/core/exec.js';
 import { MinionsError } from '../../src/core/errors.js';
-import { run } from '../../src/core/exec.js';
 import { Compose } from '../../src/host/docker.js';
 import type { ExportResult } from '../../src/host/transfer.js';
 import { formatUpgrade, runUpgrade, type UpgradeResult } from '../../src/host/upgrade.js';
@@ -428,11 +427,165 @@ describe('installed CLI check', () => {
     const c = checkout();
     realInstall(g, '0.1.0', 'old0000000000000', 'packed');
     const w: NpmWorld = { globalRoot: g, checkout: c, calls: [] };
-    const p = await runSourcePhase(phaseBase({ dryRun: true, checkout: c, runner: fakeNpm(w) }));
+    const p = await runSourcePhase(phaseBase({ dryRun: true, checkout: c, runner: fakeNpm(w), rebuildCli: true }));
     expect(p.steps[0]).toMatchObject({ id: 'cli', status: 'planned' });
     expect(p.steps[0]!.detail).toMatch(/reinstall from the checkout .*then continue on the new CLI/);
+    expect(p.ok).toBe(true);
     expect(p.stop).toBeNull();
     expect(mutatingNpm(w.calls)).toEqual([]);
+  });
+
+  it('dry run: without --rebuild-cli, or with a planned fast-forward, plans the stop and is not ok', async () => {
+    const c = checkout();
+    realInstall(g, '0.1.0', 'old0000000000000', 'packed');
+    const w: NpmWorld = { globalRoot: g, checkout: c, calls: [] };
+    const p = await runSourcePhase(phaseBase({ dryRun: true, checkout: c, runner: fakeNpm(w) }));
+    expect(p.ok).toBe(false);
+    expect(p.stop).toBeNull();
+    expect(p.steps[0]).toMatchObject({ id: 'cli', status: 'planned', detail: expect.stringMatching(/^would stop: .*rerun with --rebuild-cli/) });
+    const s = syncRepo();
+    const q = await runSourcePhase(phaseBase({
+      dryRun: true, checkout: c, runner: fakeNpm(w), rebuildCli: true,
+      sync: { repo: s.repo, branch: 'main', baseBranch: 'main', exportRepo: s.exportRepo, runner: run },
+    }));
+    expect(q.sync).toMatchObject({ action: 'fast-forward', applied: false });
+    expect(q.ok).toBe(false);
+    expect(q.steps.at(-1)).toMatchObject({ id: 'cli', status: 'planned', detail: expect.stringMatching(/^would stop: .*would be fast-forwarded to commits from the container/) });
+    expect(mutatingNpm(w.calls)).toEqual([]);
+  });
+
+  it('after a fast-forward, logs the stop and then the fetched range to review, and builds nothing (even with --rebuild-cli)', async () => {
+    // The project repo is a minions checkout with a linked global install; the container is one commit ahead.
+    const repo = makeRepo(home.root, 'minions-co');
+    mkdirSync(join(repo, 'src'), { recursive: true });
+    writeFileSync(join(repo, 'package.json'), JSON.stringify({ name: 'minions', version: '0.2.0' }));
+    writeFileSync(join(repo, 'src', 'cli.ts'), 'export {};\n');
+    writeFileSync(join(repo, '.git', 'info', 'exclude'), 'node_modules/\ndist/\n');
+    git(repo, 'add', '.');
+    git(repo, 'commit', '-q', '-m', 'checkout');
+    const base = git(repo, 'rev-parse', 'HEAD');
+    git(repo, 'checkout', '-q', '-b', 'tmp');
+    writeFileSync(join(repo, 'src', 'feature.ts'), 'export const f = 1;\n');
+    git(repo, 'add', '.');
+    git(repo, 'commit', '-q', '-m', 'agent work: add feature');
+    const ahead = git(repo, 'rev-parse', 'HEAD');
+    git(repo, 'checkout', '-q', 'main');
+    git(repo, 'update-ref', 'refs/remotes/minions/main', ahead);
+    git(repo, 'branch', '-q', '-D', 'tmp');
+    for (const d of ['esbuild', 'zod', 'commander']) { mkdirSync(join(repo, 'node_modules', d), { recursive: true }); writeFileSync(join(repo, 'node_modules', d, 'package.json'), '{}'); }
+    stampDist(repo, '0.2.0', 'old0000000000000', 'source');
+    symlinkSync(repo, join(g, 'minions'));
+    const w: NpmWorld = { globalRoot: g, checkout: repo, calls: [], lsResolved: `file:${repo}` };
+    const logs: string[] = [];
+    const exportRepo = async (): Promise<ExportResult> => ({ bundle: 'b', refs: ['refs/heads/main'], changes: [{ ref: 'refs/remotes/minions/main', from: base, to: ahead }] });
+    const p = await runSourcePhase<UpgradeResult>(phaseBase({
+      checkout: repo, runner: fakeNpm(w), log: (m) => logs.push(m), rebuildCli: true,
+      sync: { repo, branch: 'main', baseBranch: 'main', exportRepo, runner: run },
+      spawnCli: async () => { throw new Error('must not spawn'); },
+    }));
+    expect(p.cli?.action).toBe('rebuild');
+    expect(p.ok).toBe(false);
+    expect(p.stop?.rerun).toMatch(/--rebuild-cli$/);
+    expect(mutatingNpm(w.calls)).toEqual([]);
+    expect(logs[0]).toMatch(/^sync: fast-forwarded main/);
+    expect(logs[1]).toMatch(/^cli: .*just fast-forwarded to commits from the container .*review them/);
+    expect(logs[2]).toMatch(new RegExp(`^cli: not built in this run; review the commits fetched from the container \\(${base.slice(0, 12)}\\.\\.${ahead.slice(0, 12)}\\)`));
+    expect(logs[3]).toMatch(/^ {2}[0-9a-f]+ agent work: add feature$/);
+    expect(logs).toHaveLength(4);
+    expect(logs.some((l) => /rebuilt|rebuilding/.test(l))).toBe(false);
+  });
+
+  it('with --rebuild-cli logs in order: what is built, the npm commands, then the result', async () => {
+    const c = checkout();
+    stampDist(c, '0.2.0', 'old0000000000000', 'source');
+    symlinkSync(c, join(g, 'minions'));
+    const w: NpmWorld = { globalRoot: g, checkout: c, calls: [], lsResolved: `file:${c}` };
+    const logs: string[] = [];
+    const p = await runSourcePhase<UpgradeResult>(phaseBase({
+      checkout: c, runner: fakeNpm(w), log: (m) => logs.push(m), rebuildCli: true,
+      spawnCli: async () => ({ code: 0, stdout: JSON.stringify({ ok: true, data: childResult() }), stderr: '' }),
+    }));
+    expect(p.cli?.action).toBe('rebuild');
+    expect(logs[0]).toMatch(/^cli: .*; rebuilding the linked checkout/);
+    expect(logs[1]).toMatch(/^cli: npm /);
+    expect(logs.at(-2)).toMatch(/^cli: .*; rebuilt \(/);
+    expect(logs.at(-1)).toMatch(/^cli: continuing the upgrade on the new CLI/);
+    expect(logs.filter((l) => l.startsWith('cli: ') && /rebuilt/.test(l))).toHaveLength(1);
+  });
+
+  it('dry run: a stop at the cli step makes the plan not ok', async () => {
+    const c = checkout();
+    realInstall(g, '0.1.0', null, 'source', { _resolved: 'git+ssh://git@github.com/antoniibelyshev/minions.git#abc' });
+    const p = await runSourcePhase(phaseBase({ dryRun: true, checkout: c, runner: fakeNpm({ globalRoot: g, checkout: c, calls: [] }) }));
+    expect(p.ok).toBe(false);
+    expect(p.stop).toBeNull();
+    expect(p.steps[0]).toMatchObject({ id: 'cli', status: 'planned', detail: expect.stringContaining('stop and print') });
+  });
+
+  it('without --rebuild-cli the stop is one failed cli step, logged once, with no range and no rebuild line', async () => {
+    const c = checkout();
+    realInstall(g, '0.1.0', 'old0000000000000', 'packed');
+    const w: NpmWorld = { globalRoot: g, checkout: c, calls: [] };
+    const logs: string[] = [];
+    const p = await runSourcePhase(phaseBase({ checkout: c, runner: fakeNpm(w), log: (m) => logs.push(m), spawnCli: async () => { throw new Error('must not spawn'); } }));
+    expect(p.steps.filter((s) => s.id === 'cli')).toHaveLength(1);
+    expect(p.steps[0]).toMatchObject({ id: 'cli', status: 'failed', detail: expect.stringMatching(/rerun with --rebuild-cli/) });
+    expect(p.stop?.rerun).toBe('minions upgrade --rebuild-cli');
+    expect(logs).toEqual([`cli: ${p.steps[0]!.detail}`]);
+    expect(logs[0]).toMatch(/rerun with --rebuild-cli/);
+    expect(logs.some((l) => /not built in this run|rebuilding the linked|reinstalling from|rebuilt|reinstalled/.test(l))).toBe(false);
+    expect(mutatingNpm(w.calls)).toEqual([]);
+  });
+
+  it('a fast-forward without --rebuild-cli also stops on the fast-forward reason and logs the range', async () => {
+    const s = syncRepo();
+    const c = checkout();
+    realInstall(g, '0.1.0', 'old0000000000000', 'packed');
+    const w: NpmWorld = { globalRoot: g, checkout: c, calls: [] };
+    const logs: string[] = [];
+    const p = await runSourcePhase(phaseBase({
+      checkout: c, runner: fakeNpm(w), log: (m) => logs.push(m), spawnCli: async () => { throw new Error('must not spawn'); },
+      sync: { repo: s.repo, branch: 'main', baseBranch: 'main', exportRepo: s.exportRepo, runner: run },
+    }));
+    expect(p.ok).toBe(false);
+    expect(p.stop?.reason).toMatch(/just fast-forwarded to commits from the container/);
+    expect(p.stop?.rerun).toBe('minions upgrade --rebuild-cli');
+    expect(logs.some((l) => l.startsWith(`cli: not built in this run; review the commits fetched from the container (${s.base.slice(0, 12)}..${s.ahead.slice(0, 12)})`))).toBe(true);
+    expect(logs.some((l) => /^ {2}[0-9a-f]+ agent work$/.test(l))).toBe(true);
+    expect(mutatingNpm(w.calls)).toEqual([]);
+  });
+
+  it('dry run with --rebuild-cli and nothing to fast-forward plans the rebuild and stays ok', async () => {
+    const s = syncRepo();
+    git(s.repo, 'merge', '-q', '--ff-only', s.ahead);
+    const c = checkout();
+    realInstall(g, '0.1.0', 'old0000000000000', 'packed');
+    const w: NpmWorld = { globalRoot: g, checkout: c, calls: [] };
+    const p = await runSourcePhase(phaseBase({
+      dryRun: true, checkout: c, runner: fakeNpm(w), rebuildCli: true,
+      sync: { repo: s.repo, branch: 'main', baseBranch: 'main', exportRepo: s.exportRepo, runner: run },
+    }));
+    expect(p.sync?.action).toBe('up-to-date');
+    expect(p.ok).toBe(true);
+    expect(p.steps.at(-1)).toMatchObject({ id: 'cli', status: 'planned' });
+    expect(p.steps.at(-1)!.detail).not.toMatch(/would stop/);
+    expect(mutatingNpm(w.calls)).toEqual([]);
+  });
+
+  it('a matching CLI is not gated: a planned fast-forward without --rebuild-cli stays ok', async () => {
+    const s = syncRepo();
+    const c = checkout();
+    realInstall(g, '0.2.0', sourceFingerprint(c), 'packed');
+    const w: NpmWorld = { globalRoot: g, checkout: c, calls: [] };
+    const p = await runSourcePhase(phaseBase({
+      dryRun: true, checkout: c, runner: fakeNpm(w),
+      sync: { repo: s.repo, branch: 'main', baseBranch: 'main', exportRepo: s.exportRepo, runner: run },
+    }));
+    expect(p.sync).toMatchObject({ action: 'fast-forward', applied: false });
+    expect(p.ok).toBe(true);
+    expect(p.stop).toBeNull();
+    expect(p.steps.at(-1)).toMatchObject({ id: 'cli' });
+    expect(p.steps.at(-1)!.detail).not.toMatch(/would stop/);
   });
 
   it('skips the check outside a minions checkout', async () => {
@@ -564,6 +717,25 @@ describe('GitHub delivery: the CLI comes from the reviewed origin/<base> commit'
     expect(head(o.c)).toBe(o.base);
   });
 
+  it('dry run with a planned origin fast-forward and --rebuild-cli plans the build (only container commits wait a run)', async () => {
+    const o = originCheckout();
+    o.merge('reviewed.ts');
+    git(o.c, 'fetch', '-q', 'origin');
+    realInstall(g, '0.1.0', 'old0000000000000', 'packed');
+    const w: NpmWorld = { globalRoot: g, checkout: o.c, calls: [] };
+    const logs: string[] = [];
+    const p = await runSourcePhase(phaseBase({ dryRun: true, checkout: o.c, origin: origin(o), runner: fakeNpm(w), rebuildCli: true, log: (m) => logs.push(m) }));
+    expect(p.sync).toMatchObject({ source: 'origin', action: 'fast-forward', applied: false });
+    expect(p.ok).toBe(true);
+    expect(p.stop).toBeNull();
+    const cli = p.steps.find((s) => s.id === 'cli');
+    expect(cli?.status).toBe('planned');
+    expect(cli?.detail).not.toMatch(/would stop|from the container/);
+    expect(logs.join('\n')).not.toMatch(/fetched from the container/);
+    expect(mutatingNpm(w.calls)).toEqual([]);
+    expect(head(o.c)).toBe(o.base);
+  });
+
   it('upgradeSourceMode: --from-container is local-delivery only; GitHub delivery always takes origin', () => {
     expect(upgradeSourceMode({ githubDelivery: false, fromContainer: true, checkout: null, baseBranch: 'main' })).toBe('container');
     expect(upgradeSourceMode({ githubDelivery: false, fromContainer: false, checkout: '/c', baseBranch: 'main' })).toBe('checkout');
@@ -609,7 +781,8 @@ describe('runUpgrade with the source phase', () => {
     const r = await runUpgrade({ ...base, source: async () => ({ ok: true, steps: [{ id: 'sync', status: 'done', detail: 'ff' }, { id: 'cli', status: 'done', detail: 'reinstalled' }], sync: null, cli: null, stop: null, continued: childResult() }) });
     expect(docker).toEqual([]);
     expect(r.continued).toBe(true);
-    expect(r.steps.map((s) => `${s.id}:${s.status}`)).toEqual(['sync:done', 'cli:done', 'cli:skipped', 'preflight:done']);
+    // The continued CLI's own "matches" cli step is not repeated.
+    expect(r.steps.map((s) => `${s.id}:${s.status}`)).toEqual(['sync:done', 'cli:done', 'preflight:done']);
     expect(formatUpgrade(r)).toContain('newly installed CLI');
   });
 
