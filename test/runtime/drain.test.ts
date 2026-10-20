@@ -340,7 +340,16 @@ describe('drain hook gate and phases (tester additions)', () => {
       'git status &>x',
       'cat <>x',
       'git status#; rm x',
+      // ANSI-C quoting: `$'\''` is one apostrophe in bash, so the `;` below is unquoted.
+      "echo $'\\'' ; touch PWNED #'",
+      // An expanded body joins `\<newline>` lines before matching, so `E\` + `OF` is the terminator.
+      'cat <<EOF\nE\\\nOF\ntouch PWNED\nEOF',
+      // `>/dev/null-x` is a different file.
+      'git status >/dev/null-x',
     ]) expect(drainSafeBash(bad), bad).toBe(false);
+    // A `$'` inside double quotes is literal; `>/dev/null` before a separator is still harmless.
+    expect(drainSafeBash("echo \"$'x\"")).toBe(true);
+    expect(drainSafeBash('git status >/dev/null; git log >/dev/null 2>&1')).toBe(true);
     for (const ok of [
       // A double-quoted delimiter is literal: the body is not expanded, the next line is still checked.
       'cat <<"EOF"\n$(rm x)\nEOF\ngit status',
