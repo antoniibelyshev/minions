@@ -11,6 +11,7 @@ import { MinionsError } from '../core/errors.js';
 import { readJson } from '../core/fsutil.js';
 import { emit } from '../core/output.js';
 import { delegateToRuntime } from '../host/delegate.js';
+import { formatDoctor, runDoctor } from '../host/doctor.js';
 import { readTelegramAccess } from '../telegram/access.js';
 import { installTelegramPlugin } from '../telegram/install.js';
 import { formatTelegramProbe, probeTelegram } from '../telegram/probe.js';
@@ -395,8 +396,15 @@ export function register(program: Command): void {
     }));
 
   // status / pause / resume (host mode delegates to the container)
-  program.command('status').description('Show queue, workers, pause state, config revision, delivery mode and channel (configured vs effective)')
-    .action(action(async (_o: unknown, cmd: Command) => {
+  program.command('status').description('Show queue, workers, pause state, config revision, delivery mode and channel (configured vs effective); --check: host health checks (same as `doctor`)')
+    .option('--check', 'run the host health checks (tools, Docker, container, Claude auth, configuration) instead; same as `minions doctor`')
+    .action(action(async (o: { check?: boolean }, cmd: Command) => {
+      if (o.check) {
+        requireMode('host');
+        const r = await runDoctor({ cwd: process.cwd() });
+        emit(r, { json: globalOpts(cmd).json, human: formatDoctor });
+        return;
+      }
       if (runtimeMode() === 'host') return delegate(cmd);
       const cfg = await getConfig();
       const r = await collectStatus({ db: getDb(), config: cfg, backlog: getBacklog, channel: () => runtimeChannelStatus(cfg) });

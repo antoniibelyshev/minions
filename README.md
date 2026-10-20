@@ -4,7 +4,7 @@ minions installs a small Claude Code development team into a Git project on your
 
 Everything the model controls runs inside one Docker container per project. Your Mac runs only a small, trusted `minions` CLI. (You can explicitly opt into a less safe **host runtime** without Docker; see [Running without Docker](#running-without-docker).) That CLI installs the team, starts and stops the container, provisions the credentials you grant, and handles explicit import and export.
 
-> **Status:** version 0.1 (bootstrap) is installable from GitHub or from source (see [Install in another project](#install-in-another-project)). It implements the terminal workflow: `setup` (guided, end to end; `setup github` and `setup assist` (AI setup assistant) for single steps), `init`, `doctor`, `start`, `down`, `upgrade`, `status`, `pause`, `resume`, `import`, `export`, `config show [--explain]`, `auth show|set|refresh` (Claude authorization), `auth github`, `auth telegram`, `channel show|set`, `runtime show|set`, and `uninstall` on the host; an opt-in host runtime without Docker ([Running without Docker](#running-without-docker)); optional Telegram communication through the official Claude Code channel plugin (see [docs/design/telegram.md](docs/design/telegram.md); the notification outbox is not implemented yet); the Backlog.md backend; `local` delivery (commits on `agent/<slug>` branches, fetched to the host with `minions export`); and `branch` / `pull-request` delivery to GitHub (push `agent/<slug>`, open one PR; never merged). The rest of this README describes the intended version 1 behavior. Sections marked **(deferred in v0.1)** are not implemented yet, and `minions doctor` reports them as unavailable: GitHub Issues backend, auto-merge and merge requests, review publication, config plan/apply, backlog migration, the plan/migration parts of upgrade, budgets, and companion containers. `minions auth github` stores a per-project fine-grained GitHub token on the host (see [docs/design/bootstrap.md](docs/design/bootstrap.md#github-credential)); the container uses it for branch/pull-request delivery. The v0.1 contract is [docs/design/bootstrap.md](docs/design/bootstrap.md); the full requirements are in [docs/spec.md](docs/spec.md).
+> **Status:** version 0.1 (bootstrap) is installable from GitHub or from source (see [Install in another project](#install-in-another-project)). It implements the terminal workflow on the host through six everyday commands (`setup`, `start`, `status`, `upgrade`, `down`, `uninstall`; see [Everyday use](#everyday-use)) plus advanced commands for single steps (see [docs/cli.md](docs/cli.md)); an opt-in host runtime without Docker ([Running without Docker](#running-without-docker)); optional Telegram communication through the official Claude Code channel plugin (see [docs/design/telegram.md](docs/design/telegram.md); the notification outbox is not implemented yet); the Backlog.md backend; `local` delivery (commits on `agent/<slug>` branches, fetched to the host with `minions export`); and `branch` / `pull-request` delivery to GitHub (push `agent/<slug>`, open one PR; never merged). The rest of this README describes the intended version 1 behavior. Sections marked **(deferred in v0.1)** are not implemented yet, and `minions status --check` reports them as unavailable: GitHub Issues backend, auto-merge and merge requests, review publication, config plan/apply, backlog migration, the plan/migration parts of upgrade, budgets, and companion containers. `minions auth github` stores a per-project fine-grained GitHub token on the host (see [docs/design/bootstrap.md](docs/design/bootstrap.md#github-credential)); the container uses it for branch/pull-request delivery. The v0.1 contract is [docs/design/bootstrap.md](docs/design/bootstrap.md); the full requirements are in [docs/spec.md](docs/spec.md).
 
 ## Contents
 
@@ -13,6 +13,7 @@ Everything the model controls runs inside one Docker container per project. Your
 - [Requirements](#requirements)
 - [Install in another project](#install-in-another-project)
 - [Quickstart](#quickstart)
+- [Everyday use](#everyday-use)
 - [Profiles](#profiles)
 - [Working with the team](#working-with-the-team)
 - [Backlogs and task intake](#backlogs-and-task-intake)
@@ -109,7 +110,7 @@ That one command asks everything it needs and runs the whole setup. You don't ne
 
 `minions setup` walks through these steps in order. Optional integrations default to **no**, and core steps default to **yes**:
 
-1. **Project.** The `init` wizard covers the profile, shared or private installation, intake, verification commands, container resources, the agent runtime (Docker by default; the host runtime only after a typed confirmation, see [Running without Docker](#running-without-docker)) and the Claude authorization method. It shows the plan and applies it after you confirm.
+1. **Project.** The project wizard covers the profile, shared or private installation, intake, verification commands, container resources, the agent runtime (Docker by default; the host runtime only after a typed confirmation, see [Running without Docker](#running-without-docker)) and the Claude authorization method. It shows the plan and applies it after you confirm.
 2. **GitHub (optional).** *Set up GitHub integration?* If you say yes, it runs the guided flow of `minions setup github`: it offers to add a github.com `origin` when there is none and to push the base branch (each shown as the exact git command first), prints a pre-filled fine-grained token link (optionally opened in the browser), reads the token without echo, and then asks for the delivery mode (`local`, `branch`, or `pull-request`).
 3. **CI (optional).** *Use CI?* It detects workflows and the base branch's required status checks with read-only calls, then prints the external CI setup plan. It never writes workflow files or changes branch protection.
 4. **Auto-merge.** The question is shown but marked *not available yet*, and the default is no. Nothing is written.
@@ -123,12 +124,12 @@ If you decline a step, setup skips it and prints how to enable it later. Rerunni
 minions setup --dry-run                        # show what would happen; writes nothing, asks for no secrets
 minions setup --yes                            # non-interactive defaults: optional integrations off
 minions setup --yes --github-token-stdin --delivery pull-request < token-file   # tokens only via stdin, never argv
-minions doctor                                 # check readiness at any time
+minions status --check                         # check readiness at any time
 ```
 
-The individual commands (`init`, `auth github`, `auth telegram`, `start`, `import`) still work on their own. See the [CLI reference](#cli-reference).
+To change a choice later, rerun `minions setup`. Each step is also available as a separate advanced command; see [docs/cli.md](docs/cli.md).
 
-### What `init` does
+### What the project step does
 
 1. **Read-only discovery.** Reads Git metadata, Docker availability, instructions, contribution docs, build files, CI workflows, and issue references. Files are treated as data: discovery runs no repository scripts and never builds your Dockerfile.
 2. **Wizard.** Asks only questions whose answers change behavior, with answers prefilled from the profile and from discovery:
@@ -143,7 +144,7 @@ The individual commands (`init`, `auth github`, `auth telegram`, `start`, `impor
 3. **Plan review.** Shows the planned writes, effective permissions, inferred verification commands, unavailable capabilities, and any external setup you still need to do. Approving the plan authorizes exactly those changes and nothing else.
 4. **Apply and verify.** Writes files atomically and records their hashes in a manifest. A failed install rolls back. Incomplete external setup, such as GitHub Apps or branch protection, is recorded as pending, never reported as ready.
 
-`init` is idempotent. It never overwrites files you own, preserves uncommitted changes, never enables `bypassPermissions`, and never creates GitHub Apps or changes branch protection by itself. For non-interactive setup, pass a validated config file.
+The project step is idempotent. It never overwrites files you own, preserves uncommitted changes, never enables `bypassPermissions`, and never creates GitHub Apps or changes branch protection by itself. For non-interactive setup, pass a validated config file.
 
 ### Shared and private installations
 
@@ -155,6 +156,21 @@ The individual commands (`init`, `auth github`, `auth telegram`, `start`, `impor
 | Typical use | Your own project | Your personal team inside an employer's repo |
 
 All worktrees of a repository map to the same project ID, and only one coordinator can run per installation. If a copied project ID turns up bound to a different repository, minions detects it and asks you to attach explicitly or initialize a new project.
+
+## Everyday use
+
+These are the only commands you need day to day. `minions --help` lists exactly these.
+
+| Command | What it does |
+| - | - |
+| `minions setup [path]` | Install, configure or reconfigure minions for a repository. Safe to rerun. |
+| `minions start` | Start the team (if needed) and attach to the coordinator. Use it after a reboot or to resume work. |
+| `minions status` | Queue, workers, pause state and channel. `minions status --check` checks the host, Docker, the container and Claude authorization. |
+| `minions upgrade` | Move the running team onto the installed minions version without losing work. |
+| `minions down` (or `minions stop`) | Stop the team. Data and progress are kept; `minions start` resumes. |
+| `minions uninstall` | Remove minions from the project, keeping task data unless you ask otherwise. |
+
+Everything else (pausing intake, credentials, channels, the agent runtime, and the commands the coordinator and workers use internally) is listed by `minions help --all` and in [docs/cli.md](docs/cli.md). Most of it you can also do by asking the coordinator.
 
 ## Profiles
 
@@ -664,36 +680,7 @@ Switching needs the old runtime stopped (`minions down`). Agent branches, backlo
 
 ## CLI reference
 
-| Command | Purpose |
-| - | - |
-| `minions setup [path]` | Guided end-to-end setup: init wizard (including the runtime and Claude authorization), the guided GitHub flow (remote, base branch, token) and delivery mode, CI guidance, auto-merge (not available yet), Telegram, runtime start, import, coordinator launch, attach and pairing instructions, then an offer to open the setup assistant (`--yes`, `--dry-run`, `--delivery`, `--github-token-stdin`, `--telegram-token-stdin`, `--no-attach-coordinator`, `--no-assistant`; `--config`, `--attach`, `--new-identity`, `--runtime` as for `init`) |
-| `minions init [path]` | Inspect and initialize a project (`--private` / `--shared`, `--runtime docker\|host`, `--yes`, `--dry-run`) |
-| `minions doctor` | Check tools, Docker (or the host runtime's tmux/claude/backlog/git), image, container, Claude auth, backlog CLI, and deferred features |
-| `minions start` | Build the image if needed, start the container, import the repo, attach the coordinator (`--no-attach`) |
-| `minions down` | Stop and remove the project container (volumes kept), or stop the host runtime's tmux server |
-| `minions upgrade [--timeout <s>] [--now] [--from-container [branch]] [--rebuild-cli] [--dry-run]` | Move the running container onto the installed minions: pause starts, wait for active workers (or release them with `--now`, reported as interrupted), rebuild the image only if the package changed, recreate the container with volumes kept, restart the coordinator with recovery, resume starts. With `--from-container` (`local` delivery only), first export the container branches and fast-forward `branch` (default: the base branch) to `minions/<base>`; this happens only on a strict fast-forward with clean working trees, and the command never merges, resets or force-updates. When the project is a minions checkout and the installed CLI differs from it, the upgrade stops and prints the rebuild command; with `--rebuild-cli` (you reviewed the checkout: this runs its npm scripts and build on the host) the CLI is rebuilt (linked install) or reinstalled (`install.sh` install) and the rest runs on the new CLI. Commits just taken with `--from-container` are never built in the same run. With `branch` / `pull-request` delivery the CLI comes only from the reviewed `origin/<base>` commit: the upgrade fetches origin, fast-forwards the base, and refuses `--from-container` (see [Delivery, review, and merging](#delivery-review-and-merging)). For other installs, such as git-URL ones, it prints the exact command and stops before touching the container. Docker runtime only: in the host runtime it refuses and points to `minions down && minions start` |
-| `minions status` | Queue, workers, pause state, config revision, delivery mode, channel (configured vs effective) |
-| `minions sync [taskIds...]` | Refresh PR state and CI check results for tasks with a PR; reconcile merged/closed PRs (read-only on GitHub) |
-| `minions ci status` | Required status checks on the base branch and the external CI setup plan (read-only) |
-| `minions pause` / `resume` | Persist scheduling controls |
-| `minions import` | Refresh the container workspace from the committed base branch (Git bundle) |
-| `minions export` | Fetch `agent/*` branches into `refs/remotes/minions/*` in your repository; local branches are untouched |
-| `minions config show [--explain]` | Effective values and their provenance |
-| `minions auth show` / `set <login\|api-key\|helper\|jbcentral>` / `refresh` | Host-side Claude authorization (see [Claude authorization](#claude-authorization)) |
-| `minions setup github` | Guided GitHub setup: remote, base branch on the remote, pre-filled fine-grained token, delivery mode (`--yes` prints the next steps only; see [GitHub setup](#github-setup)) |
-| `minions setup assist` | AI setup assistant: opens your host Claude Code with a minions setup skill to finish the remaining setup (interactive; `--dry-run` prints the command; see [Setup assistant](#setup-assistant)) |
-| `minions auth github` / `telegram` | Store (or `--remove`) the project's GitHub token / Telegram bot token on the host; prompted without echo or `--stdin` (`telegram` offers to switch a `terminal` channel to `auto`) |
-| `minions channel show` / `set <auto\|terminal\|telegram>` | Configured vs effective communication channel; set it in the project config (`configRevision` bump, `--yes`, `--dry-run`; restart-required; see [Communication](#communication)) |
-| `minions backlog ready` / `list` / `show` / `create` / `update` / `note` / `export` | Backend-neutral task operations (inside the container) |
-| `minions work claim` / `record` / `release` / `list` | Leases and worker results (used by the coordinator, inside the container) |
-| `minions work publish <taskId>` | Publish (or retry publishing) an approved task in branch / pull-request delivery; idempotent |
-| `minions work approve <taskId> --head <sha>` | Record your approval to publish that exact commit (sensitive paths, or `ask` publication) |
-| `minions runtime show` / `set <docker\|host>` | Host-side agent runtime: Docker (default) or the less safe host runtime (`--global`, `--yes`, `--dry-run`; see [Running without Docker](#running-without-docker)) |
-| `minions uninstall` | Remove owned files while keeping task data (`--delete-data` also deletes volumes) |
-
-Planned, **deferred in v0.1**: `minions stop`, `minions sync`, `minions config plan` / `apply`, `minions review publish`, `minions merge request`, `minions migrate backlog`, and the plan/migration parts of `minions upgrade`.
-
-Every command supports `--json`, and mutating commands support `--dry-run`. Exit code 0 means the requested operation completed; it does not mean a whole task passed. Errors use stable codes for auth required, conflict, policy denied, invalid configuration, incompatible runtime, and retryable network failure. Secrets and large task text go through stdin or restricted temporary files, never through process arguments.
+The full command reference is in [docs/cli.md](docs/cli.md). `minions help --all` prints the same grouping: the primary commands from [Everyday use](#everyday-use), advanced commands for single steps and fine-grained control, and internal commands used by the coordinator, workers, hooks and the container. Every command supports `--json`, and mutating commands support `--dry-run`.
 
 ## Recovery, upgrades, and uninstall
 
