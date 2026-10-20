@@ -17,6 +17,7 @@
 //   observed read-only (GET) and the setup plan is printed only.
 import { rm } from 'node:fs/promises';
 import { can } from '../config/capabilities.js';
+import { defaultDeliveryMode } from '../config/profiles.js';
 import type { MinionsConfig, Profile } from '../config/schema.js';
 import { MinionsError } from '../core/errors.js';
 import { readJsonIfExists, writeJson } from '../core/fsutil.js';
@@ -308,8 +309,10 @@ export async function runSetup(opts: SetupOptions): Promise<SetupResult> {
       step({ id: 'delivery', status: 'failed', detail: `--delivery ${opts.delivery} is not selectable (${blocked}); keeping ${current}`, later: LATER.github });
     } else mode = opts.delivery;
   } else if (interactive && !opts.configFile && !blocked && steps.find((s) => s.id === 'github')?.status !== 'skipped') {
-    say('  Delivery: local (commits stay in the container; `minions export`), branch (push agent/<slug>), or pull-request (push and open a PR). minions never merges.');
-    mode = await choose(io!, 'Delivery mode', current, DELIVERY_MODES);
+    // PR-first: with a GitHub remote and a stored token pull-request delivery is the offered default
+    // (a project still on local is offered the switch); local and branch stay selectable.
+    say('  Delivery: pull-request (default: push agent/<slug> and open a PR, CI runs on it), branch (push agent/<slug> only), or local (commits stay in the container; `minions export`). minions never merges.');
+    mode = await choose(io!, 'Delivery mode', defaultDeliveryMode(current, false), DELIVERY_MODES);
   } else if (blocked && current !== 'local' && !hasToken && refs.github) {
     mode = 'local'; // the token was just removed: branch/PR delivery could no longer publish
   }
@@ -585,7 +588,7 @@ async function ciStep(opts: SetupOptions, config: MinionsConfig, remoteUrl: stri
   const plan = ciSetupPlan({ hasWorkflows, requiredChecks: state, verificationCommands: config.verification.commands, baseBranch: base, repository });
   if (plan.length && state === 'unknown') lines.push('Required checks could not be read; follow the steps below if they are missing (rerun `minions doctor` to check).');
   lines.push(...plan);
-  if (!plan.length) lines.push(`CI is in place. Set delivery.requiredChecksConfigured to true to record that these checks gate merging (setup does not change it).`);
+  if (!plan.length) lines.push(`CI is in place. Set delivery.requiredChecksConfigured to true to record that these checks gate merging, and verification.ciAuthority to "github" to let tester/reviewer stages rely on them (setup changes neither; \`minions doctor\` reports ci.authority).`);
   for (const l of lines) opts.io?.info(`  ${l}`);
   return { id: 'ci', status: 'done', detail: `${workflows.length} workflow file(s); required checks ${state}; nothing was changed`, lines };
 }
@@ -595,7 +598,7 @@ function dryRunResult(opts: SetupOptions, init: InitResult, steps: SetupStep[], 
   const would = (id: StepId, detail: string) => steps.push({ id, status: 'planned', detail });
   would('github', !git.hasGitHub ? 'skipped: no github.com origin'
     : refs.github ? `token stored (${refs.github.backend}): would offer keep/change/remove` : opts.tokens?.github ? 'would store the token from stdin' : 'would ask "Set up GitHub integration?" (default no); token entered without echo');
-  would('delivery', `delivery.mode ${opts.delivery ?? 'unchanged'}; branch/pull-request need a GitHub remote and a stored token`);
+  would('delivery', `delivery.mode ${opts.delivery ?? 'unchanged'}; branch/pull-request need a GitHub remote and a stored token (then pull-request is the offered default)`);
   would('ci', git.hasGitHub ? 'would ask "Use CI?" (default no): read-only check of workflows and required checks, setup plan printed only' : 'skipped: no GitHub remote');
   would('intake', git.hasGitHub ? 'would ask "Import GitHub issues into the backlog?" (default no): read-only filtered import on `minions sync` and coordinator start' : 'skipped: no GitHub remote');
   would('autoMerge', 'shown as not available yet (default no); nothing written');
