@@ -76,6 +76,8 @@ export function runtimePaths(env: NodeJS.ProcessEnv = process.env, opts: { inCon
     tmp,
     /** Per-lease scratch dirs `<scratch>/<leaseId>`: created at claim, removed when the lease ends and on coordinator start. */
     scratch: join(tmp, 'leases'),
+    /** The minions-owned TMPDIR root the start-time stale sweep may clean: only the default, never an overridden (possibly shared) MINIONS_SCRATCH_DIR. */
+    tmpRoot: env.MINIONS_SCRATCH_DIR ? undefined : tmp,
     /** Flag file present while a drain is requested (`minions pause --drain`); the worker drain hook tests only for it. */
     drainFlag: join(state, 'run', 'drain'),
     /** Host runtime: MINIONS_LOG_DIR (<project>/host/logs) keeps the unsandboxed hooks' log out of agent-writable dirs. */

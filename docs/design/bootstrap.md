@@ -885,7 +885,10 @@ Container:
 /state                vol  minions.db, backlog/ (Backlog.md project root), notes/, import/, exports/
 /home/node/.claude    vol  Claude state (CLAUDE_CONFIG_DIR)
 /home/node/.cache     vol  npm and tool caches; tmp/ = TMPDIR (disk-backed, exec-allowed scratch),
-                           tmp/leases/<leaseId>/ = per-lease scratch (removed at lease end and coordinator start)
+                           tmp/leases/<leaseId>/ = per-lease scratch (removed at lease end and coordinator start);
+                           coordinator start also removes other tmp/ entries whose newest mtime (entry + tree,
+                           lstat only) is over 24 h old, keeping leases/ (10 s budget, kept if unsure; only the
+                           default minions-owned root, never an overridden MINIONS_SCRATCH_DIR, never a symlink)
 /home/node, /tmp      tmpfs (noexec; /tmp capped at container.tmpSizeMiB, default 1024 MiB)
 ```
 Volume names: `minions-<first 8 chars of projectId>-{workspace,state,claude,cache}`.

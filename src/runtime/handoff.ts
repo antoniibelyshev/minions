@@ -1,6 +1,6 @@
 import { realpathSync } from 'node:fs';
 import { lstat, mkdir, readdir, readFile, rename, rm, stat } from 'node:fs/promises';
-import { basename, dirname, join, relative, isAbsolute } from 'node:path';
+import { basename, dirname, join, relative, isAbsolute, resolve } from 'node:path';
 import { MinionsError } from '../core/errors.js';
 import { atomicWrite, writeJson } from '../core/fsutil.js';
 import type { Lease, LeaseRole, RuntimeDb } from './db.js';
@@ -29,6 +29,13 @@ export interface HandoffPaths {
    * scratch dirs. Only a lease's own dir is ever removed: never a worktree, the TMPDIR root or other entries.
    */
   scratch?: string;
+  /**
+   * The minions-owned TMPDIR root (parent of `scratch`), set only when it is the default one (container
+   * `/home/node/.cache/tmp`, or `<state>/cache/tmp`), never when MINIONS_SCRATCH_DIR points somewhere that may be
+   * shared (e.g. a whole cache dir). Coordinator start removes entries here that are stale (24 h, newest mtime in
+   * the entry's tree; 10 s budget), except `leases/`. Omitted: no root sweep.
+   */
+  tmpRoot?: string | undefined;
 }
 
 const LEASE_ID = /^lease-[A-Za-z0-9_-]+$/;
@@ -105,8 +112,27 @@ export const TMP_ROOT_MAX_AGE_MS = 24 * 3600_000;
 export const TMP_ROOT_BUDGET_MS = 10_000;
 
 /**
- * Removes entries of the TMPDIR root older than `maxAgeMs` (by lstat mtime; symlinks are unlinked, never followed),
- * except `skip` (the leases dir). Stops when `budgetMs` is spent. Best-effort: errors are returned, never thrown.
+ * Newest mtime over `path` and its descendants, from lstat only (symlinks are never followed). Returns null when
+ * the deadline passes mid-walk: the age is then unknown, so the caller must keep the entry.
+ */
+async function newestMtime(path: string, deadline: number): Promise<number | null> {
+  if (Date.now() > deadline) return null;
+  const st = await lstat(path);
+  let newest = st.mtimeMs;
+  if (!st.isDirectory()) return newest;
+  for (const name of await readdir(path)) {
+    const m = await newestMtime(join(path, name), deadline);
+    if (m === null) return null;
+    if (m > newest) newest = m;
+  }
+  return newest;
+}
+
+/**
+ * Removes entries of the minions-owned TMPDIR `root` whose newest mtime (the entry and everything under it,
+ * lstat only, symlinks never followed) is older than `maxAgeMs`, except `skip` (the leases dir). An entry whose
+ * age could not be fully determined (budget spent, unreadable) is kept. A symlinked root is refused.
+ * Best-effort: errors are returned, never thrown.
  */
 export async function sweepTmpRoot(root: string, skip: string, o: { maxAgeMs?: number; budgetMs?: number; now?: number } = {}): Promise<{ removed: string[]; errors: string[] }> {
   const out = { removed: [] as string[], errors: [] as string[] };
@@ -114,17 +140,20 @@ export async function sweepTmpRoot(root: string, skip: string, o: { maxAgeMs?: n
   const deadline = Date.now() + (o.budgetMs ?? TMP_ROOT_BUDGET_MS);
   const now = o.now ?? Date.now();
   let names: string[];
-  try { names = await readdir(root); } catch (e) {
+  try {
+    if ((await lstat(root)).isSymbolicLink()) { out.errors.push(`${root}: refusing to sweep a symlinked TMPDIR root`); return out; }
+    names = await readdir(root);
+  } catch (e) {
     if ((e as NodeJS.ErrnoException).code !== 'ENOENT') out.errors.push(`${root}: ${(e as Error).message}`);
     return out;
   }
   for (const name of names.sort()) {
     if (name === skip) continue;
-    if (Date.now() > deadline) { out.errors.push(`${root}: time budget spent`); break; }
     const path = join(root, name);
     try {
-      const st = await lstat(path);
-      if (now - st.mtimeMs < maxAge) continue;
+      const newest = await newestMtime(path, deadline);
+      if (newest === null) { out.errors.push(`${root}: time budget spent`); break; }
+      if (now - newest < maxAge) continue;
       await rm(path, { recursive: true, force: true });
       out.removed.push(name);
     } catch (e) { out.errors.push(`${path}: ${(e as Error).message}`); }
@@ -138,9 +167,9 @@ export async function sweepScratchOnStart(db: Pick<RuntimeDb, 'activeLeases'>, p
     const r = await sweepScratch(p, db.activeLeases().map((l) => l.id));
     if (r.removed.length) log(`minions: removed ${r.removed.length} leftover lease scratch dir(s) under ${p.scratch}`);
     if (r.errors.length) log(`minions: could not remove some lease scratch dirs: ${r.errors.join('; ').slice(0, 500)}`);
-    if (p.scratch) {
-      const t = await sweepTmpRoot(dirname(p.scratch), basename(p.scratch));
-      if (t.removed.length) log(`minions: removed ${t.removed.length} stale TMPDIR entr(ies) under ${dirname(p.scratch)}`);
+    if (p.scratch && p.tmpRoot && resolve(dirname(p.scratch)) === resolve(p.tmpRoot)) {
+      const t = await sweepTmpRoot(p.tmpRoot, basename(p.scratch));
+      if (t.removed.length) log(`minions: removed ${t.removed.length} stale TMPDIR entr(ies) under ${p.tmpRoot}`);
       if (t.errors.length) log(`minions: could not remove some stale TMPDIR entries: ${t.errors.join('; ').slice(0, 500)}`);
     }
   } catch (e) { log(`minions: lease scratch sweep failed: ${(e as Error).message.slice(0, 300)}`); }

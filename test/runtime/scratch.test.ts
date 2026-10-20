@@ -247,9 +247,11 @@ describe('lease scratch deletion safety', () => {
     writeFileSync(join(outside, 'keep'), 'k');
     symlinkSync(outside, join(root, 'old-link'));
     const past = new Date(Date.now() - 48 * 3600_000);
+    utimesSync(join(old, 'x'), past, past);
     utimesSync(old, past, past);
     utimesSync(p.scratch!, past, past);
     const logs: string[] = [];
+    p.tmpRoot = root;
     await sweepScratchOnStart(env.db, p, (l) => logs.push(l));
     expect(existsSync(old)).toBe(false);
     expect(existsSync(fresh)).toBe(true);
@@ -275,5 +277,47 @@ describe('lease scratch deletion safety', () => {
     expect(r.errors.join()).toMatch(/symlink/);
     expect((await removeLeaseFiles(p, 'lease-abc123')).join()).toMatch(/symlink/);
     expect(existsSync(join(target, 'lease-abc123'))).toBe(true);
+  });
+
+  it('no root sweep without a minions-owned tmpRoot (overridden shared scratch dir): old siblings survive', async () => {
+    const env = makeEnv();
+    const p = paths(env);
+    const root = join(p.scratch!, '..');
+    mkdirSync(join(root, 'npm-cache'), { recursive: true });
+    const past = new Date(Date.now() - 48 * 3600_000);
+    utimesSync(join(root, 'npm-cache'), past, past);
+    await sweepScratchOnStart(env.db, p, () => undefined);
+    expect(existsSync(join(root, 'npm-cache'))).toBe(true);
+    expect(runtimePaths({ MINIONS_SCRATCH_DIR: '/x/shared' }).tmpRoot).toBeUndefined();
+    expect(runtimePaths({ MINIONS_STATE_DIR: '/x/state' }).tmpRoot).toBe('/x/state/cache/tmp');
+  });
+
+  it('root sweep ages an entry by its newest descendant, keeps it when the budget runs out, refuses a symlinked root', async () => {
+    const env = makeEnv();
+    const root = join(env.root, 'cache', 'tmp');
+    const past = new Date(Date.now() - 48 * 3600_000);
+    const mk = (name: string, nestedFresh: boolean) => {
+      const d = join(root, name);
+      mkdirSync(join(d, 'sub'), { recursive: true });
+      writeFileSync(join(d, 'sub', 'f'), 'x');
+      for (const x of [join(d, 'sub', 'f'), join(d, 'sub'), d]) if (!(nestedFresh && x.endsWith('f'))) utimesSync(x, past, past);
+      return d;
+    };
+    const kept = mk('fresh-nested', true);
+    const gone = mk('all-old', false);
+    const r = await sweepTmpRoot(root, 'leases');
+    expect(r.removed).toEqual(['all-old']);
+    expect(existsSync(kept)).toBe(true);
+    expect(existsSync(gone)).toBe(false);
+    const again = mk('all-old2', false);
+    const b = await sweepTmpRoot(root, 'leases', { budgetMs: -1 });
+    expect(b.removed).toEqual([]);
+    expect(existsSync(again)).toBe(true);
+    const link = join(env.root, 'rootlink');
+    symlinkSync(root, link);
+    const sl = await sweepTmpRoot(link, 'leases');
+    expect(sl.removed).toEqual([]);
+    expect(sl.errors.join()).toMatch(/symlink/);
+    expect(existsSync(again)).toBe(true);
   });
 });
