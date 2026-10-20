@@ -13,7 +13,7 @@ In:
 - Runtime CLI (inside container): `backlog ready|list|show|create|update|note`,
   `work claim|record|release|list`, `hook stop|pre-agent`, `coordinator`, `status`, `pause`, `resume`.
 - Profiles `project-owner`, `personal-work`, `supervised`; shared + private visibility.
-- Backlog.md backend only. Delivery modes `local` (default; commits on `agent/<slug>` branches in the container clone, fetched to host with `minions export`), and, for the github provider, `branch` and `pull-request` (see "Branch and pull-request delivery"). minions never merges.
+- Backlog.md backend only. Delivery modes `local` (default; commits on `agent/<slug>` branches in the container clone, fetched to host with `minions export`), and, for the github provider, `branch` and `pull-request` (see "Branch and pull-request delivery"). minions never merges pull requests; with `local` delivery the coordinator integrates approved branches into the container's local base (project-owner automatically, personal-work after asking, supervised never).
 - Terminal communication, plus optional Telegram through the official channel plugin (see [telegram.md](telegram.md)).
   `communication.channel` is `terminal`, `telegram`, or `auto` (profile default: Telegram when a bot token is stored
   and the runtime is docker, else terminal); resolved by `resolveChannel` (`src/telegram/channel.ts`), switched with
