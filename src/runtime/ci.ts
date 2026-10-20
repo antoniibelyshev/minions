@@ -226,10 +226,23 @@ export function summarizeChecks(rollup: unknown): CiSummary {
  * per name and app), as rollup items. null when unreadable. Read-only.
  */
 export async function checkRunsWithApps(api: ApiGet, repository: string, sha: string): Promise<RollupItem[] | null> {
-  const r = await api(`/repos/${segs(repository)}/commits/${encodeURIComponent(sha)}/check-runs?per_page=100`);
-  const runs = (r.body as { check_runs?: unknown } | null)?.check_runs;
-  if (r.status !== 200 || !Array.isArray(runs)) return null;
-  return (runs as { name?: unknown; status?: unknown; conclusion?: unknown; app?: { id?: unknown } | null }[]).map((c) => ({
+  type Run = { name?: unknown; status?: unknown; conclusion?: unknown; app?: { id?: unknown } | null };
+  const base = `/repos/${segs(repository)}/commits/${encodeURIComponent(sha)}/check-runs?per_page=100`;
+  const all: Run[] = [];
+  // Paginate until total_count is reached. Any incomplete read (error, cap hit, inconsistent counts) is
+  // unreadable: a truncated list could hide a failing run, so a partial list is never returned.
+  for (let page = 1; ; page++) {
+    const r = await api(page === 1 ? base : `${base}&page=${page}`);
+    const body = r.body as { check_runs?: unknown; total_count?: unknown } | null;
+    const runs = body?.check_runs;
+    const total = body?.total_count;
+    if (r.status !== 200 || !Array.isArray(runs) || typeof total !== 'number' || !Number.isInteger(total) || total < 0) return null;
+    all.push(...(runs as Run[]));
+    if (all.length > total) return null;
+    if (all.length === total) break;
+    if (!runs.length || page >= CHECK_RUNS_MAX_PAGES) return null;
+  }
+  return all.map((c) => ({
     __typename: 'CheckRun',
     name: typeof c?.name === 'string' ? c.name : 'check',
     status: String(c?.status ?? '').toUpperCase(),
@@ -237,6 +250,7 @@ export async function checkRunsWithApps(api: ApiGet, repository: string, sha: st
     appId: c?.app?.id,
   }));
 }
+const CHECK_RUNS_MAX_PAGES = 10;
 
 // ---------------------------------------------------------------- sync
 
@@ -312,7 +326,11 @@ async function syncOne(task: Task, x: { db: RuntimeDb; backlog: BacklogAdapter; 
     // A required check is pinned to a GitHub App: the rollup carries no app, so read check runs (with
     // app ids) for the head. On failure the rollup is kept without apps and pinned checks stay unverified.
     const runs = await checkRunsWithApps(ghApi(x.gh), required.repository, pr.headRefOid);
-    if (runs) rollup = [...(Array.isArray(rollup) ? (rollup as RollupItem[]) : []).filter((i) => i.__typename === 'StatusContext' || (i.state !== undefined && i.status === undefined)), ...runs];
+    // Merge, never replace: a failing rollup check run (no app) is kept next to the app-aware runs, so a
+    // failure seen in either source cannot disappear. Passing rollup runs are duplicates and are dropped.
+    const failedRollupRun = (i: RollupItem) => i.__typename !== 'StatusContext' && !(i.state !== undefined && i.status === undefined)
+      && String(i.status ?? '').toUpperCase() === 'COMPLETED' && FAILED_CONCLUSIONS.has(String(i.conclusion ?? '').toUpperCase());
+    if (runs) rollup = [...(Array.isArray(rollup) ? (rollup as RollupItem[]) : []).filter((i) => i.__typename === 'StatusContext' || (i.state !== undefined && i.status === undefined) || failedRollupRun(i)), ...runs];
     else res.warnings.push('check runs (with apps) unreadable; required checks pinned to an app cannot be verified');
   }
   const ci = summarizeChecks(rollup);

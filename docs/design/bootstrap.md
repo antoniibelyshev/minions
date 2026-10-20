@@ -525,6 +525,11 @@ re-run the full verification when CI already proved it for the same commit.
   records each check's `source` (`check-run`/`status`) and `appId`. A commit status or another app's
   run with the same name is ignored (the check stays `pending`, then `timeout`). If the check runs
   cannot be read, a pinned check is `unknown`. `app_id` null or -1 means "any source".
+- **Pagination is complete or unknown.** The app-aware check-run read follows `&page=N` until
+  `total_count` is reached (at most 10 pages of 100). A read error, a hit page cap or inconsistent
+  counts make the whole read unreadable (pinned checks `unknown`, never a partial list). The result is
+  merged with failing rollup check runs rather than replacing them (a failure is never dropped),
+  so a failing run seen in either source cannot disappear.
 - **Residual: name-only matching.** A required check that GitHub does not pin to an app (legacy
   `contexts`, `app_id` null/-1, a ruleset entry without `integration_id`) is matched by name only, as
   GitHub itself does: anyone who can post a commit status with that name (for example with the

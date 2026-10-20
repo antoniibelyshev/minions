@@ -393,17 +393,34 @@ describe('app pinning through sync (attempt-2 probes, mocked gh)', () => {
     expect((await review(env)).rec).toMatchObject({ approved: false });
   });
 
-  // DEFECT (fail-open): checkRunsWithApps reads only page 1 (per_page=100) and ignores total_count. When the
-  // pinned app has two runs named `test` (e.g. two workflows with the same job name) and the failing one
-  // falls on page 2, the gate sees only the passing run and approves. A truncated read (total_count >
-  // check_runs.length) should be treated as unreadable (unknown) or paginated.
-  it.fails('truncated check-runs read hides a failing pinned run on page 2: must not be approval', async () => {
+  it('failing pinned run on page 2 of check-runs is found by pagination: fail', async () => {
     const env = await pinnedEnv({
-      runs: { total_count: 101, check_runs: [cr('test', 'success', 15368), ...filler(99)] }, // page 2 would hold cr('test','failure',15368)
+      runs: { total_count: 101, check_runs: [cr('test', 'success', 15368), ...filler(99)] },
+      rollup: passing,
+    });
+    const orig = env.st.api;
+    env.st.api = (p) => p === `${RUNS(env.head)}&page=2` ? ok(JSON.stringify({ total_count: 101, check_runs: [cr('test', 'failure', 15368)] })) : orig(p);
+    const s = await sync(env);
+    expect(s.tasks[0]!.gate?.state).toBe('fail');
+  });
+
+  it('pagination cap hit (total_count never reached): unreadable, gate unknown, never approval', async () => {
+    const env = await pinnedEnv({ runs: { total_count: 5000, check_runs: [cr('test', 'success', 15368), ...filler(99)] } });
+    const orig = env.st.api;
+    env.st.api = (p) => p.includes('&page=') ? ok(JSON.stringify({ total_count: 5000, check_runs: filler(100) })) : orig(p);
+    const s = await sync(env);
+    expect(env.calls.filter((c) => c.at(-1)!.includes('/check-runs')).length).toBe(10);
+    expect(s.tasks[0]!.gate?.state).toBe('unknown');
+    expect(s.tasks[0]!.warnings.join(' ')).toContain('unreadable');
+    expect((await review(env)).rec).toMatchObject({ approved: false });
+  });
+
+  it('a failing rollup run is kept when the app-aware runs are merged in: fail', async () => {
+    const env = await pinnedEnv({
+      runs: { total_count: 1, check_runs: [cr('test', 'success', 15368)] },
       rollup: [...passing, { __typename: 'CheckRun', name: 'test', status: 'COMPLETED', conclusion: 'FAILURE' }],
     });
-    const s = await sync(env);
-    expect(s.tasks[0]!.gate?.state).not.toBe('pass');
+    expect((await sync(env)).tasks[0]!.gate?.state).toBe('fail');
   });
 
   it('same app, two runs of the same name, one failing: fail', async () => {

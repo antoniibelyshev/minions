@@ -95,7 +95,9 @@ export function evaluateCiGate(i: CiGateInput): CiGate {
       v = states.length ? states.reduce((a, b) => (rank[b] > rank[a] ? b : a)) : 'pending';
     } else {
       // Pinned: only check runs reported by that app count; statuses and other apps are ignored.
-      const states = named.filter((c) => c.source === 'check-run' && c.appId === q.appId).map((c) => c.state);
+      const states: CheckState[] = named.filter((c) => c.source === 'check-run' && c.appId === q.appId).map((c) => c.state);
+      // An app-less check run (rollup without apps) that failed cannot be ruled out as the pinned app's: it fails.
+      if (named.some((c) => c.source === 'check-run' && typeof c.appId !== 'number' && c.state === 'fail')) states.push('fail');
       if (states.length) v = states.reduce((a, b) => (rank[b] > rank[a] ? b : a));
       // A check run of that name whose app is unknown (rollup without apps) cannot be attributed.
       else v = named.some((c) => c.source !== 'status' && typeof c.appId !== 'number') ? 'unverified' : 'pending';
