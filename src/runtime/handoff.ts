@@ -1,5 +1,5 @@
 import { realpathSync } from 'node:fs';
-import { readFile, rename, rm, stat } from 'node:fs/promises';
+import { lstat, mkdir, readdir, readFile, rename, rm, stat } from 'node:fs/promises';
 import { join, relative, isAbsolute } from 'node:path';
 import { MinionsError } from '../core/errors.js';
 import { atomicWrite, writeJson } from '../core/fsutil.js';
@@ -21,7 +21,15 @@ import type { RecordResponse, Scheduler, TaskBrief } from './scheduler.js';
  * task and one worktree per task (review worktrees are separate) mean a worker in its own worktree can
  * only reach its own lease. Lease ids are checked for shape so they can never escape the directories.
  */
-export interface HandoffPaths { briefs: string; results: string }
+export interface HandoffPaths {
+  briefs: string;
+  results: string;
+  /**
+   * Parent of the per-lease scratch dirs (`<scratch>/<leaseId>`, under the disk-backed TMPDIR). Omitted: no
+   * scratch dirs. Only a lease's own dir is ever removed: never a worktree, the TMPDIR root or other entries.
+   */
+  scratch?: string;
+}
 
 const LEASE_ID = /^lease-[A-Za-z0-9_-]+$/;
 
@@ -32,6 +40,38 @@ function checkId(leaseId: string): void {
 export const briefPath = (p: HandoffPaths, leaseId: string) => { checkId(leaseId); return join(p.briefs, `${leaseId}.json`); };
 export const submissionPath = (p: HandoffPaths, leaseId: string) => { checkId(leaseId); return join(p.results, `${leaseId}.json`); };
 export const rejectedPath = (p: HandoffPaths, leaseId: string) => { checkId(leaseId); return join(p.results, `${leaseId}.rejected.json`); };
+/** The lease's scratch dir, or null when no scratch parent is configured. */
+export const scratchDirOf = (p: HandoffPaths, leaseId: string): string | null => { checkId(leaseId); return p.scratch ? join(p.scratch, leaseId) : null; };
+
+/** Removes one lease's scratch dir (recursive; a symlink in its place is removed, never followed). */
+async function removeScratch(p: HandoffPaths, leaseId: string): Promise<string[]> {
+  const dir = scratchDirOf(p, leaseId);
+  if (!dir) return [];
+  try { await rm(dir, { recursive: true, force: true }); return []; } catch (e) { return [`${dir}: ${(e as Error).message}`]; }
+}
+
+/**
+ * Coordinator start (restart, crash recovery): removes the scratch dirs of every lease that is not active.
+ * Workers are subagents of the coordinator session, so an ended lease's dir is leftover data. Active leases
+ * keep theirs (recovery may still resume or release them; release removes it). Entries that are not lease
+ * dirs are left alone. Best-effort: failures are returned, never thrown.
+ */
+export async function sweepScratch(p: HandoffPaths, activeLeaseIds: Iterable<string>): Promise<{ removed: string[]; errors: string[] }> {
+  const out = { removed: [] as string[], errors: [] as string[] };
+  if (!p.scratch) return out;
+  let names: string[];
+  try { names = await readdir(p.scratch); } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== 'ENOENT') out.errors.push(`${p.scratch}: ${(e as Error).message}`);
+    return out;
+  }
+  const keep = new Set(activeLeaseIds);
+  for (const name of names.sort()) {
+    if (!LEASE_ID.test(name) || keep.has(name)) continue;
+    const errs = await removeScratch(p, name);
+    if (errs.length) out.errors.push(...errs); else out.removed.push(name);
+  }
+  return out;
+}
 
 /**
  * Removes a lease's hand-off files (brief, pending and rejected submission). Called whenever a lease ends;
@@ -44,7 +84,27 @@ export async function removeLeaseFiles(p: HandoffPaths, leaseId: string): Promis
   for (const path of [briefPath(p, leaseId), submissionPath(p, leaseId), rejectedPath(p, leaseId)]) {
     try { await rm(path, { force: true }); } catch (e) { errors.push(`${path}: ${(e as Error).message}`); }
   }
+  errors.push(...await removeScratch(p, leaseId));
   return errors;
+}
+
+/** Coordinator startup step: sweeps leftover scratch dirs of ended leases and logs what it did. Never throws. */
+export async function sweepScratchOnStart(db: Pick<RuntimeDb, 'activeLeases'>, p: HandoffPaths, log: (line: string) => void): Promise<void> {
+  try {
+    const r = await sweepScratch(p, db.activeLeases().map((l) => l.id));
+    if (r.removed.length) log(`minions: removed ${r.removed.length} leftover lease scratch dir(s) under ${p.scratch}`);
+    if (r.errors.length) log(`minions: could not remove some lease scratch dirs: ${r.errors.join('; ').slice(0, 500)}`);
+  } catch (e) { log(`minions: lease scratch sweep failed: ${(e as Error).message.slice(0, 300)}`); }
+}
+
+/** Creates the lease's scratch dir (0700). Best-effort: null when unconfigured or not creatable (the worker then uses TMPDIR). */
+export async function ensureScratchDir(p: HandoffPaths, leaseId: string): Promise<string | null> {
+  const dir = scratchDirOf(p, leaseId);
+  if (!dir) return null;
+  try {
+    await mkdir(dir, { recursive: true, mode: 0o700 });
+    return (await lstat(dir)).isDirectory() ? dir : null;
+  } catch { return null; }
 }
 
 const real = (p: string): string => { try { return realpathSync(p); } catch { return p; } };
@@ -78,9 +138,11 @@ export async function saveBrief(p: HandoffPaths, brief: TaskBrief): Promise<stri
   return path;
 }
 
-/** Claims a task and stores its brief; releases the lease again if the brief cannot be stored. */
+/** Claims a task, creates its scratch dir and stores its brief; releases the lease again if the brief cannot be stored. */
 export async function claimWithBrief(sched: Scheduler, p: HandoffPaths, taskId: string, role: LeaseRole, opts: { holder?: string } = {}): Promise<TaskBrief> {
-  const brief = await sched.claim(taskId, role, opts);
+  const claimed = await sched.claim(taskId, role, opts);
+  const scratchDir = await ensureScratchDir(p, claimed.leaseId);
+  const brief: TaskBrief = scratchDir ? { ...claimed, scratchDir } : claimed;
   try {
     await saveBrief(p, brief);
   } catch (e) {
@@ -94,12 +156,15 @@ export async function claimWithBrief(sched: Scheduler, p: HandoffPaths, taskId: 
 export interface CompactClaim {
   leaseId: string; briefMarker: string; taskId: string; title: string; role: LeaseRole; attempt: number;
   branch: string; worktree: string; expectedHead: string; briefCommand: string;
+  /** The lease's disk-backed scratch dir (removed when the lease ends); absent when none was created. */
+  scratchDir?: string;
 }
 
 export const compactClaim = (b: TaskBrief): CompactClaim => ({
   leaseId: b.leaseId, briefMarker: b.briefMarker, taskId: b.task.id, title: b.task.title, role: b.role, attempt: b.attempt,
   branch: b.branch, worktree: b.worktree, expectedHead: b.expectedHead,
   briefCommand: `minions work brief ${b.leaseId} --role ${b.role} --json`,
+  ...(b.scratchDir ? { scratchDir: b.scratchDir } : {}),
 });
 
 /** Returns the stored brief, only to the lease's own worker. */

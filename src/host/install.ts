@@ -329,6 +329,7 @@ async function prepare(opts: InitOptions, docker?: DockerStatus): Promise<Prepar
     baseBranch: config.git.baseBranch, remoteUrl: discovery.git.remoteUrl, gitIdentity: config.git.identity,
     container: {
       cpus: config.container.cpus, memoryMiB: config.container.memoryMiB, pidsLimit: config.container.pidsLimit,
+      ...(config.container.tmpSizeMiB !== undefined ? { tmpSizeMiB: config.container.tmpSizeMiB } : {}),
       publishPorts: config.container.publishPorts, network: config.container.network,
     },
     ...(claudeAuth ? { claudeAuth } : {}),

@@ -857,8 +857,9 @@ Container:
 /workspace            vol  repo/ (main clone), worktrees/<slug>/, review/<slug>/
 /state                vol  minions.db, backlog/ (Backlog.md project root), notes/, import/, exports/
 /home/node/.claude    vol  Claude state (CLAUDE_CONFIG_DIR)
-/home/node/.cache     vol  npm and tool caches
-/home/node, /tmp      tmpfs
+/home/node/.cache     vol  npm and tool caches; tmp/ = TMPDIR (disk-backed, exec-allowed scratch),
+                           tmp/leases/<leaseId>/ = per-lease scratch (removed at lease end and coordinator start)
+/home/node, /tmp      tmpfs (noexec; /tmp capped at container.tmpSizeMiB, default 1024 MiB)
 ```
 Volume names: `minions-<first 8 chars of projectId>-{workspace,state,claude,cache}`.
 Compose project name: `minions-<first 8 chars of projectId>`. Service name: `app`.
@@ -1028,9 +1029,11 @@ fields: `name, description, tools, disallowedTools, model, maxTurns, effort`. Wo
   (context contains `dist/`, `templates/`, `docker/`, `package.json`). Built natively per arch.
 - Compose service `app`: `user: "1000:1000"`, `read_only: true`, `cap_drop: [ALL]`,
   `security_opt: [no-new-privileges:true]`, `cpus`, `mem_limit`, `pids_limit` from config, tmpfs for
-  `/tmp` and `/home/node`, named volumes above, ro bind mounts for plugin and config only, no `ports`
+  `/tmp` (size-capped: tmpfs is RAM counted against `mem_limit`) and `/home/node`, `TMPDIR` on the
+  cache volume (`/home/node/.cache/tmp`), named volumes above, ro bind mounts for plugin and config only, no `ports`
   unless configured (always `127.0.0.1:<host>:<container>`), `init: true`,
-  command `sleep infinity` (the coordinator is launched via `docker compose exec`).
+  command `sh -c "mkdir -p /home/node/.cache/tmp; exec sleep infinity"` (the coordinator is launched via
+  `docker compose exec`). `minions doctor` warns when `/tmp` is 80% full or the scratch volume 90% full.
 - `minions start`: compose up -d (build if image missing) → ensure workspace imported → `docker compose
   exec -it app minions coordinator` which runs `tmux new-session -A -s coordinator claude
   --plugin-dir /opt/minions/plugin --append-system-prompt <coordinator.md> --permission-mode <mode>

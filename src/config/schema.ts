@@ -96,6 +96,8 @@ export const MinionsConfigSchema = z.object({
     cpus: z.number().positive(),
     memoryMiB: z.number().int().min(512),
     pidsLimit: z.number().int().min(64),
+    /** Size cap (MiB) of the container's /tmp tmpfs, which is RAM counted against memoryMiB; unset = 1024. Large temp data goes to TMPDIR on disk. */
+    tmpSizeMiB: z.number().int().min(64).optional(),
     publishPorts: z.array(z.object({ host: port, container: port }).strict()),
     network: z.enum(['outbound-internet', 'none']),
     mountHostRepository: z.boolean(),

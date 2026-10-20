@@ -127,6 +127,11 @@ export interface TaskBrief {
   priorFindings: { leaseId: string; role: string; status: string; findings: unknown[]; nextAction: string }[];
   /** Present when the previous stage of this task was wound down by a drain (upgrade): continue from its checkpoint. */
   resume?: DrainResume;
+  /**
+   * The lease's own disk-backed, exec-allowed scratch dir (set by claimWithBrief): the worker uses it as TMPDIR
+   * for test runs and tools. Removed when the lease ends and on coordinator start; absent = use the inherited TMPDIR.
+   */
+  scratchDir?: string;
   resultContract: string;
 }
 

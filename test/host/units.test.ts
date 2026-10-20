@@ -5,7 +5,11 @@ import { profileDefaults } from '../../src/config/profiles.js';
 import { MinionsError } from '../../src/core/errors.js';
 import { projectPaths, volumeNames } from '../../src/core/paths.js';
 import { composeMajor, discover, proposeVerification, sanitizeRemoteUrl } from '../../src/host/discovery.js';
-import { Compose, buildFingerprint, composeYaml, ensureImage, packageRoot } from '../../src/host/docker.js';
+import { CONTAINER } from '../../src/core/paths.js';
+import { DEFAULT_TMP_SIZE_MIB, Compose, buildFingerprint, composeYaml, ensureImage, packageRoot } from '../../src/host/docker.js';
+import { ProjectJsonSchema } from '../../src/host/project.js';
+import { MinionsConfigSchema } from '../../src/config/schema.js';
+import { runtimePaths } from '../../src/runtime/paths.js';
 import { nodeVersionOk } from '../../src/host/doctor.js';
 import type { ProjectJson } from '../../src/host/project.js';
 import { bindProject, resolveIdentity, sharedProjectId, type Registry } from '../../src/host/registry.js';
@@ -31,9 +35,10 @@ describe('compose generation', () => {
     for (const line of [
       'user: "1000:1000"', 'read_only: true', 'cap_drop: ["ALL"]', 'security_opt: ["no-new-privileges:true"]',
       'init: true', 'privileged: false', 'cpus: 4', 'mem_limit: "6144m"', 'pids_limit: 512',
-      'command: ["sleep", "infinity"]', 'MINIONS_RUNTIME: "container"', 'CLAUDE_CONFIG_DIR: "/home/node/.claude"',
+      'command: ["sh", "-c", "mkdir -p /home/node/.cache/tmp; exec sleep infinity"]', 'MINIONS_RUNTIME: "container"', 'CLAUDE_CONFIG_DIR: "/home/node/.claude"',
       'MINIONS_CONFIG: "/opt/minions/config/config.json"', 'pull_policy: never', 'LANG: "C.UTF-8"', 'TERM: "xterm-256color"',
-      '- "/tmp:rw,nosuid,nodev,uid=1000,gid=1000,mode=1777"', '- "/home/node:rw,nosuid,nodev,uid=1000,gid=1000,mode=0755"',
+      '- "/tmp:rw,nosuid,nodev,size=1024m,uid=1000,gid=1000,mode=1777"', '- "/home/node:rw,nosuid,nodev,uid=1000,gid=1000,mode=0755"',
+      'TMPDIR: "/home/node/.cache/tmp"',
     ]) expect(y, line).toContain(line);
     for (const bad of ['docker.sock', 'privileged: true', 'network_mode: host', 'network_mode: "host"', 'pid:', 'devices:', 'cap_add', 'ports:']) {
       expect(y, bad).not.toContain(bad);
@@ -41,6 +46,50 @@ describe('compose generation', () => {
     const v = volumeNames(ID);
     for (const n of Object.values(v)) expect(y).toContain(`name: "${n}"`);
     expect(y).toContain('name: "minions-3f2b8c1e"');
+  });
+
+  it('caps the /tmp tmpfs (default and container.tmpSizeMiB) and points TMPDIR at a disk-backed, exec-allowed scratch dir', () => {
+    const y = composeYaml(project());
+    const tmpfs = [...y.matchAll(/^ {6}- "(\/[^:"]+):([^"]*)"$/gm)].map((m) => [m[1]!, m[2]!.split(',')] as const);
+    expect(tmpfs.map(([p]) => p)).toEqual(['/tmp', '/home/node']);
+    // The RAM-backed /tmp carries a size cap (it counts against mem_limit).
+    expect(tmpfs[0]![1]).toContain(`size=${DEFAULT_TMP_SIZE_MIB}m`);
+    expect(composeYaml(project({ tmpSizeMiB: 256 }))).toContain('- "/tmp:rw,nosuid,nodev,size=256m,uid=1000,gid=1000,mode=1777"');
+    // TMPDIR: exactly one, on the cache volume (ext4 named volume, no noexec), not on a tmpfs and not in /workspace (git checkouts).
+    const tmpdir = [...y.matchAll(/^ {6}TMPDIR: "([^"]+)"$/gm)].map((m) => m[1]);
+    expect(tmpdir).toEqual([CONTAINER.scratch]);
+    const vols = [...y.matchAll(/- type: volume\n\s+source: (\w+)\n\s+target: "([^"]+)"/g)].map((m) => [m[1]!, m[2]!] as const);
+    const longest = (dir: string, mounts: string[]) => mounts.filter((m) => dir === m || dir.startsWith(m + '/')).sort((a, b) => b.length - a.length)[0];
+    const mountOf = longest(CONTAINER.scratch, [...vols.map(([, t]) => t), ...tmpfs.map(([p]) => p)]);
+    expect(mountOf).toBe('/home/node/.cache');
+    expect(vols.find(([, t]) => t === mountOf)?.[0]).toBe('cache');
+    expect(CONTAINER.scratch.startsWith(CONTAINER.workspace + '/')).toBe(false);
+    // The start command creates it before any exec can use TMPDIR.
+    expect(y).toMatch(/command: \["sh", "-c", "mkdir -p \/home\/node\/\.cache\/tmp; exec sleep infinity"\]/);
+  });
+
+  it('runtime env: the agents\' scratch root is the compose TMPDIR, lease scratch dirs live under it', () => {
+    const y = composeYaml(project());
+    const tmpdir = /^ {6}TMPDIR: "([^"]+)"$/m.exec(y)?.[1];
+    const rp = runtimePaths({});
+    expect(rp.tmp).toBe(tmpdir);
+    expect(rp.scratch).toBe(`${tmpdir}/leases`);
+    // Host runtime / tests (redirected state dir): never the container path; MINIONS_SCRATCH_DIR overrides.
+    expect(runtimePaths({ MINIONS_STATE_DIR: '/x/state' }).scratch).toBe('/x/state/cache/tmp/leases');
+    expect(runtimePaths({ MINIONS_STATE_DIR: '/x/state', MINIONS_SCRATCH_DIR: '/y/tmp' }).tmp).toBe('/y/tmp');
+  });
+
+  it('container.tmpSizeMiB is optional in project.json and config, and bounded below', () => {
+    const base = project();
+    expect(ProjectJsonSchema.safeParse(base).success).toBe(true);
+    expect(ProjectJsonSchema.safeParse({ ...base, container: { ...base.container, tmpSizeMiB: 2048 } }).success).toBe(true);
+    expect(ProjectJsonSchema.safeParse({ ...base, container: { ...base.container, tmpSizeMiB: 8 } }).success).toBe(false);
+    const cfg = profileDefaults('project-owner', { hasGitHub: false, hasGitHubCredential: false, baseBranch: 'main', identity: { name: 'Ada', email: 'ada@example.com' }, projectId: ID, packageVersion: '0.1.0' }).config;
+    expect(cfg.container.memoryMiB).toBe(6144);
+    expect(cfg.container.cpus).toBe(4);
+    const shape = MinionsConfigSchema.shape.container;
+    expect(shape.safeParse({ ...cfg.container, tmpSizeMiB: 512 }).success).toBe(true);
+    expect(shape.safeParse({ ...cfg.container, tmpSizeMiB: 1.5 }).success).toBe(false);
   });
 
   it('bind mounts only the plugin, runtime config and secrets dirs, read-only', () => {

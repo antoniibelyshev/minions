@@ -215,6 +215,11 @@
           "minimum": 64,
           "maximum": 9007199254740991
         },
+        "tmpSizeMiB": {
+          "type": "integer",
+          "minimum": 64,
+          "maximum": 9007199254740991
+        },
         "publishPorts": {
           "type": "array",
           "items": {

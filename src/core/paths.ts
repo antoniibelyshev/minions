@@ -125,6 +125,11 @@ export function containerPaths(root = process.env.MINIONS_CONTAINER_ROOT ?? '') 
     exports: p('/state/exports'),
     claudeHome: p('/home/node/.claude'),
     cache: p('/home/node/.cache'),
+    /**
+     * Disk-backed scratch dir (TMPDIR) on the cache volume: exec-allowed (the /tmp and /home/node tmpfs
+     * mounts are noexec), outside every git checkout, and not counted against the container memory limit.
+     */
+    scratch: p('/home/node/.cache/tmp'),
     /** Official Telegram plugin state (access.json, .env, pairing codes); owned by the plugin. */
     telegramStateDir: p('/home/node/.claude/channels/telegram'),
   };
