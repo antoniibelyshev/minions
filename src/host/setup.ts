@@ -3,7 +3,7 @@
 //
 // Order: init wizard (repo/profile/visibility/runtime/Claude auth) -> GitHub (the guided flow of
 // `minions setup github`: remote, base branch, pre-filled token link, token; then the delivery mode) ->
-// CI guidance -> auto-merge (deferred) -> Telegram (token + pairing guidance) -> runtime start
+// CI guidance -> auto-merge (opt-in, default no) -> Telegram (token + pairing guidance) -> runtime start
 // (container, or the host runtime), repository import, coordinator launch -> attach/pair instructions.
 // The CLI then offers the AI setup assistant (`minions setup assist`) for whatever is left.
 //
@@ -13,11 +13,13 @@
 //   communication.channel) go into the host-only config.local.json, never into shared repo files.
 // - Secrets are read only through the non-echoing terminal prompt or from stdin (never argv), and never
 //   appear in the result, the notes, or any prompt text.
-// - Never writes workflow files, never changes branch protection, never enables auto-merge: CI is
-//   observed read-only (GET) and the setup plan is printed only.
+// - Never writes workflow files and never changes branch protection: CI is observed read-only (GET)
+//   and the setup plan is printed only. Auto-merge is only recorded as delivery.merge in
+//   config.local.json when the user answers yes (default no); nothing is enabled on GitHub here.
 import { rm } from 'node:fs/promises';
 import { can } from '../config/capabilities.js';
 import { defaultDeliveryMode } from '../config/profiles.js';
+import { autoMergeConfigReasons } from '../config/delivery.js';
 import type { MinionsConfig, Profile } from '../config/schema.js';
 import { MinionsError } from '../core/errors.js';
 import { readJsonIfExists, writeJson } from '../core/fsutil.js';
@@ -163,7 +165,7 @@ export function setupCommands(repoPath: string) {
       github: `Run ${setup} again (or ${inRepo('minions auth github')}) to store a GitHub token and choose branch or pull-request delivery.`,
       intake: `Run ${setup} again to import GitHub issues into the backlog (intake.github; read-only).`,
       ci: `Run ${setup} again, ${inRepo('minions doctor')} (ci.requiredChecks), or ${inRepo('minions ci status')} to see the CI setup plan.`,
-      autoMerge: 'Auto-merge is not available yet; minions never merges.',
+      autoMerge: `Run ${setup} again to enable CI-gated auto-merge (needs pull-request delivery; default no).`,
       telegram: `Run ${setup} again (or ${inRepo('minions auth telegram')}) to connect a Telegram bot.`,
       container: `Run ${setup} again or ${inRepo('minions start')} to start the container and attach the coordinator.`,
     },
@@ -311,7 +313,7 @@ export async function runSetup(opts: SetupOptions): Promise<SetupResult> {
   } else if (interactive && !opts.configFile && !blocked && steps.find((s) => s.id === 'github')?.status !== 'skipped') {
     // PR-first: with a GitHub remote and a stored token pull-request delivery is the offered default
     // (a project still on local is offered the switch); local and branch stay selectable.
-    say('  Delivery: pull-request (default: push agent/<slug> and open a PR, CI runs on it), branch (push agent/<slug> only), or local (commits stay in the container; `minions export`). minions never merges.');
+    say('  Delivery: pull-request (default: push agent/<slug> and open a PR, CI runs on it), branch (push agent/<slug> only), or local (commits stay in the container; `minions export`). minions merges only through opt-in CI-gated auto-merge (asked below).');
     mode = await choose(io!, 'Delivery mode', defaultDeliveryMode(current, false), DELIVERY_MODES);
   } else if (blocked && current !== 'local' && !hasToken && refs.github) {
     mode = 'local'; // the token was just removed: branch/PR delivery could no longer publish
@@ -341,13 +343,9 @@ export async function runSetup(opts: SetupOptions): Promise<SetupResult> {
   if (interactive) say('\n== GitHub intake ==');
   step(await intakeStep(interactive && !opts.configFile ? io! : null, config, onGitHub, setLocal, LATER.intake));
 
-  // ---------------------------------------------------------------- 4. auto-merge (deferred)
-  if (interactive) {
-    say('\n== Auto-merge ==');
-    say('  Auto-merge is not available yet (planned after CI-gated delivery); minions never merges.');
-    if (await yesNo(io!, 'Enable auto-merge? (not available yet)', false)) say('  Auto-merge is not available yet; nothing was changed.');
-  }
-  step({ id: 'autoMerge', status: 'deferred', detail: 'not available yet; nothing written (minions never merges)', later: LATER.autoMerge });
+  // ---------------------------------------------------------------- 4. auto-merge (opt-in, default no)
+  if (interactive) say('\n== Auto-merge ==');
+  step(await autoMergeStep(interactive && !opts.configFile ? io! : null, config, mode, setLocal, LATER.autoMerge));
 
   // ---------------------------------------------------------------- 5. Telegram
   if (interactive) say('\n== Telegram ==');
@@ -563,6 +561,39 @@ async function intakeStep(io: WizardIO | null, config: MinionsConfig, onGitHub: 
   return { id: 'intake', status: cur?.enabled ? 'changed' : 'done', detail: `intake.github on (${describeFilter(next)}); imported on \`minions sync\` and coordinator start`, ...filterLines(next) };
 }
 
+/**
+ * Auto-merge step: with pull-request delivery, asks "Enable auto-merge?" (default: the current setting,
+ * i.e. no on a new project). Yes records delivery.merge "auto-when-eligible" in config.local.json and
+ * lists what is still missing; nothing is changed on GitHub.
+ */
+async function autoMergeStep(io: WizardIO | null, config: MinionsConfig, mode: DeliveryMode, setLocal: (k: string, v: unknown) => void, later: string): Promise<SetupStep> {
+  const on = config.delivery.merge === 'auto-when-eligible';
+  const missing = () => autoMergeConfigReasons({ ...config, delivery: { ...config.delivery, mode, provider: mode === 'local' ? 'none' : 'github', merge: 'auto-when-eligible' } });
+  const lines = () => missing().map((r) => `still needed: ${r}`);
+  if (mode !== 'pull-request') {
+    io?.info(`  Auto-merge needs pull-request delivery (delivery is ${mode}); not asked.`);
+    return on ? { id: 'autoMerge', status: 'kept', detail: `delivery.merge auto-when-eligible, but delivery is ${mode}: not usable`, later }
+      : { id: 'autoMerge', status: 'skipped', detail: `auto-merge needs pull-request delivery (delivery is ${mode})`, later };
+  }
+  if (!io) {
+    return on ? { id: 'autoMerge', status: 'kept', detail: 'delivery.merge auto-when-eligible', ...(missing().length ? { lines: lines() } : {}) }
+      : { id: 'autoMerge', status: 'skipped', detail: 'auto-merge not enabled (default no)', later };
+  }
+  io.info('  minions can arm GitHub auto-merge for a delivered PR, only when the base branch has required status checks and they all pass');
+  io.info('  for the reviewed head, the PR head is that head, and pr.merge policy allows it ("ask": you approve each PR on the host with');
+  io.info('  `minions work approve <taskId> --head <sha> --merge`). GitHub branch protection still decides; minions never force-merges.');
+  const yes = await yesNo(io, 'Enable auto-merge?', on);
+  if (yes === on) {
+    return on ? { id: 'autoMerge', status: 'kept', detail: 'delivery.merge auto-when-eligible', ...(missing().length ? { lines: lines() } : {}) }
+      : { id: 'autoMerge', status: 'skipped', detail: 'auto-merge not enabled', later };
+  }
+  setLocal('delivery.merge', yes ? 'auto-when-eligible' : 'disabled');
+  if (!yes) return { id: 'autoMerge', status: 'changed', detail: 'delivery.merge disabled (minions no longer arms auto-merge; `minions sync` disarms what it armed)' };
+  const l = lines();
+  for (const x of l) io.info(`  ${x}`);
+  return { id: 'autoMerge', status: 'done', detail: `delivery.merge auto-when-eligible${l.length ? ' (not usable yet; see below and `minions doctor` merge.readiness)' : ''}`, ...(l.length ? { lines: l } : {}) };
+}
+
 /** CI step: local workflow files plus (with a token) required checks read with GET only; prints the plan. */
 async function ciStep(opts: SetupOptions, config: MinionsConfig, remoteUrl: string | null, hasToken: boolean, projectId: string, ciWorkflows: string[]): Promise<SetupStep> {
   const workflows = ciWorkflows.filter((f) => f.startsWith('.github/workflows/'));
@@ -601,7 +632,7 @@ function dryRunResult(opts: SetupOptions, init: InitResult, steps: SetupStep[], 
   would('delivery', `delivery.mode ${opts.delivery ?? 'unchanged'}; branch/pull-request need a GitHub remote and a stored token (then pull-request is the offered default)`);
   would('ci', git.hasGitHub ? 'would ask "Use CI?" (default no): read-only check of workflows and required checks, setup plan printed only' : 'skipped: no GitHub remote');
   would('intake', git.hasGitHub ? 'would ask "Import GitHub issues into the backlog?" (default no): read-only filtered import on `minions sync` and coordinator start' : 'skipped: no GitHub remote');
-  would('autoMerge', 'shown as not available yet (default no); nothing written');
+  would('autoMerge', 'with pull-request delivery, would ask "Enable auto-merge?" (default no); yes records delivery.merge "auto-when-eligible" in the local layer');
   would('telegram', refs.telegram ? `bot ${refs.telegram.botId} stored: would offer keep/change/disable` : 'would ask "Set up Telegram?" (default no); bot token entered without echo');
   would('container', 'would build the image if needed and start the container (idempotent)');
   would('import', 'would import committed history of the base branch unless already imported, and configure origin');

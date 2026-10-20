@@ -14,6 +14,7 @@ import { publishTask, realGh, type GhFn, type PublishInput, type PublishOutcome 
 import { isCiCheck, validateResult, type WorkerResult } from './results.js';
 import { readRequiredChecks, type RequiredChecksReport } from './ci.js';
 import { ciGateFromDb, formatCiGate, type CiGate } from './ci-gate.js';
+import { autoMergeTask, type MergeResult } from './merge.js';
 import { BRANCH_PREFIX, branchFor, ensureBranchWorktree, ensureReviewWorktree, git, headOf, resolveBaseBranch, taskSlug, workspaceLayout, type WorkspaceLayout } from './worktree.js';
 
 export const LEASE_ROLES: readonly LeaseRole[] = ['engineer', 'tester', 'reviewer'];
@@ -51,8 +52,10 @@ export interface SchedulerDeps {
 export interface PublishResponse {
   taskId: string; branch: string; headSha: string; mode: string;
   state: PublicationState; status: TaskStatus; prUrl: string | null;
-  /** Always false: minions never merges in this phase. */
-  merged: false;
+  /** True only when the pull request is merged (task `done`); an open PR is `delivered`, never merged. */
+  merged: boolean;
+  /** delivery.merge "auto-when-eligible": the auto-merge pass that followed delivery (src/runtime/merge.ts). */
+  merge?: MergeResult;
   push?: 'pushed' | 'already-current'; pr?: 'created' | 'existing' | null;
   reasons?: string[]; sensitivePaths?: string[];
   /** awaiting-approval: why no recorded approval was accepted (missing, invalid signature, other head, expired). */
@@ -755,7 +758,7 @@ export class Scheduler {
       ({ taskId, branch: pub.branch, headSha: pub.head_sha, mode: cfg.delivery.mode, state, status, prUrl: extra.prUrl ?? pub.pr_url, merged: false, ...extra, message });
 
     if (pub.state === 'published' && task.status === 'delivered' && (cfg.delivery.mode === 'branch' || task.prUrl)) {
-      return resp('published', 'delivered', `Already delivered: ${pub.branch} at ${pub.head_sha}${task.prUrl ? ` (${task.prUrl}, not merged)` : ''}.`, { prUrl: task.prUrl });
+      return this.withMerge(resp('published', 'delivered', `Already delivered: ${pub.branch} at ${pub.head_sha}${task.prUrl ? ` (${task.prUrl}, not merged)` : ''}.`, { prUrl: task.prUrl }));
     }
 
     const failWith = async (code: string, message: string, retryable: boolean): Promise<PublishResponse> => {
@@ -805,8 +808,66 @@ export class Scheduler {
     if (task.status !== 'delivered') await this.backlog.closeTask(taskId, 'delivered');
     const what = outcome.prUrl ? `pull request ${outcome.prUrl} (${outcome.pr === 'created' ? 'opened' : 'existing'}, open, not merged)` : `branch ${pub.branch} on origin`;
     await this.note(taskId, `minions: delivered ${pub.branch} at ${head.slice(0, 12)} as ${what}.`);
-    return resp('published', 'delivered', `Delivered ${pub.branch} at ${head} as ${what}. minions does not merge.`,
-      { prUrl: outcome.prUrl, push: outcome.push, pr: outcome.pr, sensitivePaths: outcome.sensitivePaths });
+    return this.withMerge(resp('published', 'delivered', `Delivered ${pub.branch} at ${head} as ${what}.${cfg.delivery.merge === 'auto-when-eligible' ? '' : ' minions does not merge.'}`,
+      { prUrl: outcome.prUrl, push: outcome.push, pr: outcome.pr, sensitivePaths: outcome.sensitivePaths }));
+  }
+
+  /** Appends the auto-merge pass to a delivered response (only with delivery.merge "auto-when-eligible"). */
+  private async withMerge(r: PublishResponse): Promise<PublishResponse> {
+    if (this.config.delivery.merge !== 'auto-when-eligible' || this.config.delivery.mode !== 'pull-request') return r;
+    let merge: MergeResult;
+    try { merge = await this.autoMerge(r.taskId); } catch (e) {
+      this.db.addEvent('merge-error', r.taskId, { error: (e as Error).message });
+      return { ...r, message: `${r.message} Auto-merge was not evaluated (${(e as Error).message}); \`minions sync ${r.taskId}\` retries.` };
+    }
+    if (merge.merged) return { ...r, status: 'done', merged: true, merge, message: `${r.message} ${merge.message}` };
+    return { ...r, merge, message: `${r.message} ${merge.message}` };
+  }
+
+  /**
+   * CI-gated auto-merge pass for a delivered task (delivery.merge "auto-when-eligible"; src/runtime/merge.ts):
+   * every gate is evaluated for the approved publication head (CI through `ciGate`, the sensitive-path
+   * gate, pr.merge policy with host-signed merge approvals); GitHub auto-merge is armed only then, and
+   * disarmed when a PR minions armed stops passing. Run by `minions sync` and `minions work publish`.
+   */
+  async autoMerge(taskId: string): Promise<MergeResult> {
+    return autoMergeTask({
+      db: this.db, backlog: this.backlog, config: this.config, repo: this.layout.repo, gh: this.gh, git,
+      ciGate: (id, head) => this.ciGate(id, head), approvalPublicKeyFile: this.approvalPublicKeyFile, now: this.now,
+    }, taskId);
+  }
+
+  /**
+   * Records a host-signed approval (scope "merge") to merge the delivered PR at its approved head, which
+   * pr.merge "ask" requires (the default, and any sensitive-path change). Verified now and again by
+   * every auto-merge pass; the DB row only carries the token. A new head needs a new approval.
+   */
+  approveMerge(taskId: string, opts: { head?: string; by?: string; note?: string; signature?: string; now?: Date } = {}): { taskId: string; headSha: string; approvalId: number; expiresAt: string; message: string } {
+    const pub = this.db.publication(taskId);
+    if (!pub || pub.state !== 'published' || !pub.pr_url) {
+      throw new MinionsError('PRECONDITION', `Task ${taskId} has no delivered pull request to approve for merging.`, 'Merge approval applies after pull-request delivery.');
+    }
+    if (opts.head && opts.head !== pub.head_sha) {
+      throw new MinionsError('CONFLICT', `--head ${opts.head} is not the approved, delivered head (${pub.head_sha}).`, 'Approve the exact head that was reviewed and delivered.');
+    }
+    if (!opts.signature) {
+      throw new MinionsError('PRECONDITION', 'Merge approvals must be signed on the host; an unsigned approval is not accepted.',
+        `The user runs \`minions work approve ${taskId} --head ${pub.head_sha} --merge\` on the host, in the repository (not inside the runtime).`);
+    }
+    let publicKey: string | null = null;
+    try { publicKey = readFileSync(this.approvalPublicKeyFile, 'utf8'); } catch { publicKey = null; }
+    const check = publicKey
+      ? verifyApproval(opts.signature, publicKey, { taskId, head: pub.head_sha, now: opts.now, scope: 'merge' })
+      : { ok: false as const, reason: missingApprovalKeyReason(this.approvalPublicKeyFile) };
+    if (!check.ok) {
+      throw new MinionsError('POLICY_DENIED', `Merge approval rejected: ${check.reason}.`,
+        `The user re-runs \`minions work approve ${taskId} --head ${pub.head_sha} --merge\` on the host.`);
+    }
+    const by = check.payload.by ?? opts.by ?? null;
+    const a = this.db.addApproval({ task_id: taskId, scope: 'merge', head_sha: pub.head_sha, approved_by: by, note: opts.note ?? null, signature: opts.signature });
+    this.db.addEvent('approval', taskId, { scope: 'merge', head: pub.head_sha, by, approvalId: a.id, kid: check.payload.kid, expiresAt: check.payload.expiresAt });
+    return { taskId, headSha: pub.head_sha, approvalId: a.id, expiresAt: check.payload.expiresAt,
+      message: `Recorded host-signed approval to merge ${pub.pr_url} at ${pub.head_sha} (valid until ${check.payload.expiresAt}). Run \`minions sync ${taskId}\`; auto-merge is armed once every other gate passes.` };
   }
 
   /**

@@ -1,6 +1,8 @@
 // `minions doctor`: host, Docker, container, and configuration readiness. Never prints secrets.
 import { stat } from 'node:fs/promises';
 import { DEFERRED_FEATURES, listUnavailable } from '../config/resolve.js';
+import { can } from '../config/capabilities.js';
+import { autoMergeConfigReasons } from '../config/delivery.js';
 import { isMinionsError } from '../core/errors.js';
 import { run } from '../core/exec.js';
 import { redact } from '../core/output.js';
@@ -163,13 +165,43 @@ async function githubSetupCheck(project: ProjectJson, repoPath: string, credenti
 }
 
 /**
- * merge.readiness: what delivery can do now. PR/branch delivery is available with a GitHub remote and
- * credential; minions never merges and auto-merge is always reported as deferred.
+ * Auto-merge part of merge.readiness: off (opt-in), ready, or enabled with the reasons it cannot be
+ * used (configuration, required checks on the base, GitHub credential). Per-PR gates (CI for the
+ * approved head, PR head == approved head, pr.merge approvals) are evaluated by `minions sync`.
  */
-export function mergeReadiness(config: Pick<MinionsConfig, 'delivery'> | null, github: { onGitHub: boolean; credential: CredentialStatus['state'] | null }): [CheckStatus, string, string?] {
-  const deferred = 'auto-merge is deferred (minions never merges)';
+export function autoMergeReadiness(
+  config: Pick<MinionsConfig, 'delivery'> & Partial<Pick<MinionsConfig, 'verification' | 'capabilities' | 'sensitivePaths'>>,
+  github: { onGitHub: boolean; credential: CredentialStatus['state'] | null },
+  rc?: RequiredChecksReport | null,
+): { ready: boolean; enabled: boolean; detail: string; reasons: string[] } {
+  const enabled = config.delivery.merge === 'auto-when-eligible';
+  if (!enabled) {
+    return { ready: false, enabled, reasons: [], detail: `auto-merge off (opt-in: delivery.merge "auto-when-eligible" or \`minions setup\`; currently "${config.delivery.merge}")` };
+  }
+  const reasons = autoMergeConfigReasons(config);
+  if (!github.onGitHub) reasons.push('no GitHub remote');
+  else if (github.credential !== 'ok') reasons.push(`GitHub credential ${github.credential ?? 'unknown'}`);
+  if (rc === undefined) reasons.push('required checks on the base branch were not checked');
+  else if (!rc || rc.state === 'unknown') reasons.push('required checks on the base branch could not be read');
+  else if (rc.state !== 'configured' || !rc.requiredChecks.length) reasons.push(`no required status checks on ${rc.baseBranch} (never treated as zero required checks)`);
+  if (reasons.length) return { ready: false, enabled, reasons, detail: `auto-merge enabled but not usable: ${reasons.join('; ')}` };
+  const ask = config.capabilities && config.sensitivePaths ? can({ capabilities: config.capabilities, sensitivePaths: config.sensitivePaths }, 'pr.merge') === 'ask' : true;
+  return { ready: true, enabled, reasons: [], detail: `auto-merge ready: \`minions sync\` arms GitHub auto-merge (${config.delivery.method}) once the required checks (${rc!.requiredChecks.join(', ')}) pass for the approved head${ask ? '; pr.merge "ask": each PR also needs `minions work approve <taskId> --head <sha> --merge` on the host' : ''}` };
+}
+
+/**
+ * merge.readiness: what delivery can do now. PR/branch delivery is available with a GitHub remote and
+ * credential; auto-merge is opt-in and reported as off, ready, or enabled-but-not-usable with reasons.
+ */
+export function mergeReadiness(
+  config: (Pick<MinionsConfig, 'delivery'> & Partial<Pick<MinionsConfig, 'verification' | 'capabilities' | 'sensitivePaths'>>) | null,
+  github: { onGitHub: boolean; credential: CredentialStatus['state'] | null },
+  rc?: RequiredChecksReport | null,
+): [CheckStatus, string, string?] {
+  if (!config) return ['unavailable', 'configuration not loaded; auto-merge not evaluated'];
+  const am = autoMergeReadiness(config, github, rc);
+  const deferred = am.detail;
   const ready = github.onGitHub && github.credential === 'ok';
-  if (!config) return ['unavailable', `configuration not loaded; ${deferred}`];
   const mode = config.delivery.mode;
   if (mode === 'local') {
     return ['unavailable', ready
@@ -178,7 +210,8 @@ export function mergeReadiness(config: Pick<MinionsConfig, 'delivery'> | null, g
   }
   const what = mode === 'pull-request' ? 'pull-request delivery available (push agent/<slug> and open a PR, never merged)' : 'branch delivery available (push agent/<slug>)';
   if (!github.onGitHub) return ['fail', `delivery.mode "${mode}" but the repository has no GitHub remote; ${deferred}`, 'Add a github.com origin or set delivery.mode "local".'];
-  if (ready) return ['ok', `${what}; ${deferred}`];
+  if (am.enabled && !am.ready) return ['warn', `${what.replace(/, never merged\)/, ')')}; ${deferred}`, 'Fix the reasons above (see ci.requiredChecks and ci.authority), or set delivery.merge "disabled".'];
+  if (ready) return ['ok', `${am.enabled ? what.replace(/, never merged\)/, ')') : what}; ${deferred}`];
   return ['warn', `delivery.mode "${mode}" cannot publish: GitHub credential ${github.credential ?? 'unknown'}; ${deferred}`, 'Run `minions auth github`; approved tasks wait (blocked) until `minions work publish` succeeds.'];
 }
 
@@ -207,7 +240,7 @@ export function requiredChecksReadiness(
   if (rc.state === 'configured') {
     const detail = `required checks on ${base}: ${rc.requiredChecks.join(', ')}; delivery.requiredChecksConfigured ${flag}`;
     return flag
-      ? { name, status: 'ok', detail: `${detail}; automatic merge is deferred (minions never merges)` }
+      ? { name, status: 'ok', detail: `${detail}; automatic merge can use them (delivery.merge "auto-when-eligible", see merge.readiness)` }
       : { name, status: 'ok', detail, hint: 'Set delivery.requiredChecksConfigured to true to record that these checks gate merging.' };
   }
   const plan = ciSetupPlan({ hasWorkflows: workflows === null ? null : workflows > 0, requiredChecks: rc.state, verificationCommands: config.verification.commands, baseBranch: base, repository: rc.repository });
@@ -519,7 +552,7 @@ export async function runDoctor(opts: { cwd: string; runner?: Runner; probe?: Do
     add('project', 'warn', isMinionsError(e) ? e.message : String(e), 'Run `minions init` in this repository.');
   }
 
-  add('merge.readiness', ...mergeReadiness(effective, github));
+  add('merge.readiness', ...mergeReadiness(effective, github, github.onGitHub ? ci.rc ?? null : undefined));
   checks.push(requiredChecksReadiness(effective, ci.rc, { onGitHub: github.onGitHub, unknownReason: ci.reason }));
   checks.push(ciAuthorityReadiness(effective, ci.rc, { onGitHub: github.onGitHub, unknownReason: ci.reason }));
   add('features', 'unavailable', DEFERRED_FEATURES.join(', '));

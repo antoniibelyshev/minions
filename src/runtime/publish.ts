@@ -11,7 +11,7 @@
 //   Approval rows in the runtime DB are only carriers of tokens: an unsigned or forged row fails closed.
 // - Idempotent: the remote branch and open PRs are inspected first; an up-to-date remote branch is
 //   not pushed again and an existing PR for the head branch is reused, never duplicated.
-// - Never merges, never force-pushes, never passes the token anywhere (git uses the repository
+// - Never merges (opt-in auto-merge is a separate pass: src/runtime/merge.ts), never force-pushes, never passes the token anywhere (git uses the repository
 //   credential helper, gh the wrapper; see src/runtime/github.ts).
 import { readFile } from 'node:fs/promises';
 import { can, matchesAny } from '../config/capabilities.js';
@@ -85,7 +85,7 @@ const META_RE = /<!-- minions:meta .*? -->/g;
  * criteria. Shared installations add the task id and head SHA; private installations add nothing
  * else (no ids, notes, handoffs, worker results, or decision records ever appear).
  */
-export function pullRequestText(task: Pick<Task, 'id' | 'title' | 'description' | 'acceptanceCriteria'>, cfg: Pick<MinionsConfig, 'visibility'>, head: string): { title: string; body: string } {
+export function pullRequestText(task: Pick<Task, 'id' | 'title' | 'description' | 'acceptanceCriteria'>, cfg: Pick<MinionsConfig, 'visibility'> & { delivery?: Pick<MinionsConfig['delivery'], 'merge'> }, head: string): { title: string; body: string } {
   const title = task.title.replace(/[\r\n]+/g, ' ').trim().slice(0, 256) || 'Agent change';
   const parts: string[] = [];
   const desc = task.description.replace(META_RE, '').trim();
@@ -94,7 +94,9 @@ export function pullRequestText(task: Pick<Task, 'id' | 'title' | 'description' 
     parts.push(['## Acceptance criteria', ...task.acceptanceCriteria.map((c) => `- [${c.done ? 'x' : ' '}] ${c.text.replace(/[\r\n]+/g, ' ').trim()}`)].join('\n'));
   }
   if (cfg.visibility === 'shared') {
-    parts.push(`---\nTask \`${task.id}\` at \`${head}\`, opened by minions. minions never merges: review and merge through your normal process.`);
+    parts.push(cfg.delivery?.merge === 'auto-when-eligible'
+      ? `---\nTask \`${task.id}\` at \`${head}\`, opened by minions. minions may enable GitHub auto-merge for this head once the required checks pass and policy allows it; GitHub branch protection still decides.`
+      : `---\nTask \`${task.id}\` at \`${head}\`, opened by minions. minions never merges: review and merge through your normal process.`);
   }
   return { title, body: parts.join('\n\n') || title };
 }
@@ -144,6 +146,37 @@ async function gateBases(git: GitFn, repo: string, remote: string, base: string,
 
 const PR_URL_RE = /https:\/\/github\.com\/[^\s/]+\/[^\s/]+\/pull\/\d+/;
 
+/** origin as a github.com repository: the normalized URL, `owner/repo`, and the remote name git should use. */
+export async function githubOrigin(git: GitFn, repo: string): Promise<{ https: string; repository: string; remote: string } | null> {
+  const o = await git(repo, ['config', '--get', 'remote.origin.url'], true);
+  const https = o.code === 0 ? normalizeGithubRemote(o.stdout.trim()) : null;
+  if (!https) return null;
+  // The host runtime names the normalized https URL instead of the agent-writable `origin` remote
+  // (no pushurl / receivepack from the workspace).
+  return { https, repository: https.replace(/^https:\/\/github\.com\//, '').replace(/\.git$/, ''), remote: isHostRuntime() ? https : 'origin' };
+}
+
+/**
+ * The sensitive-path gate's input: paths `head` changes relative to the base, as the union over every
+ * base the gate knows of (see gateBases). Fails closed without a trustworthy base. Shared by
+ * publication and the merge gate (src/runtime/merge.ts).
+ */
+export async function gateChangedPaths(o: { git: GitFn; repo: string; remote: string; base: string; head: string; branch: string; baseShas: (string | null)[]; sensitivePaths: string[] }):
+  Promise<{ ok: true; changedPaths: string[]; sensitivePaths: string[] } | { ok: false; code: ErrorCode; message: string }> {
+  const bases = await gateBases(o.git, o.repo, o.remote, o.base, o.baseShas);
+  if (!bases.trusted.length) {
+    return { ok: false, code: 'PRECONDITION', message: `No trustworthy base for ${o.branch}: no base SHA recorded at claim time is present in the workspace and origin's ${o.base} is not available locally; refusing to evaluate the sensitive-path gate against a movable local ref.` };
+  }
+  const changed = new Set<string>();
+  for (const b of new Set([...bases.trusted, ...bases.local])) {
+    const d = await o.git(o.repo, ['diff', '--name-only', '--no-renames', '-z', `${b}...${o.head}`], true);
+    if (d.code !== 0) return { ok: false, code: 'INTERNAL', message: `Cannot diff ${o.branch} against ${o.base} (${b}): ${lastLines(d.stderr)}` };
+    for (const f of d.stdout.split('\0')) if (f) changed.add(f);
+  }
+  const changedPaths = [...changed];
+  return { ok: true, changedPaths, sensitivePaths: changedPaths.filter((p) => matchesAny(p, o.sensitivePaths)) };
+}
+
 /** Publishes an approved head according to delivery.mode. Never throws for expected failures. */
 export async function publishTask(input: PublishInput): Promise<PublishOutcome> {
   const { config: cfg, repo, branch, head } = input;
@@ -154,36 +187,22 @@ export async function publishTask(input: PublishInput): Promise<PublishOutcome> 
   if (cfg.delivery.provider !== 'github') return fail('INVALID_CONFIG', `delivery.mode "${mode}" needs delivery.provider "github".`);
 
   // 1. Origin and credential.
-  const o = await git(repo, ['config', '--get', 'remote.origin.url'], true);
-  const https = o.code === 0 ? normalizeGithubRemote(o.stdout.trim()) : null;
-  if (!https) return fail('PRECONDITION', 'origin is not a github.com repository; branch/PR delivery needs a GitHub remote (minions start records it from the host repository).');
-  const repository = https.replace(/^https:\/\/github\.com\//, '').replace(/\.git$/, '');
+  const origin = await githubOrigin(git, repo);
+  if (!origin) return fail('PRECONDITION', 'origin is not a github.com repository; branch/PR delivery needs a GitHub remote (minions start records it from the host repository).');
+  const { repository, remote } = origin;
   const token = await readGithubToken(input.tokenFile);
   if (token.state !== 'ok') {
     return fail('AUTH_REQUIRED', token.state === 'absent' ? 'No GitHub token is provisioned; run `minions auth github` on the host, then `minions work publish`.' : token.message);
   }
-
-  // The host runtime names the normalized https URL instead of the agent-writable `origin` remote
-  // (no pushurl / receivepack from the workspace).
-  const remote = isHostRuntime() ? https : 'origin';
 
   // 2. Changed paths vs the base (renames split so moving a file out of a sensitive path still counts),
   // as the union over every base the gate knows of. At least one must be trustworthy: a base SHA
   // recorded at claim time, or the remote's current base. Local refs (refs/heads/<base>, the
   // remote-tracking refs) are movable by in-runtime code, so they can only add paths, never hide any.
   const base = cfg.git.baseBranch;
-  const bases = await gateBases(git, repo, remote, base, input.baseShas ?? []);
-  if (!bases.trusted.length) {
-    return fail('PRECONDITION', `No trustworthy base for ${branch}: no base SHA recorded at claim time is present in the workspace and origin's ${base} is not available locally; refusing to evaluate the sensitive-path gate against a movable local ref.`);
-  }
-  const changed = new Set<string>();
-  for (const b of new Set([...bases.trusted, ...bases.local])) {
-    const d = await git(repo, ['diff', '--name-only', '--no-renames', '-z', `${b}...${head}`], true);
-    if (d.code !== 0) return fail('INTERNAL', `Cannot diff ${branch} against ${base} (${b}): ${lastLines(d.stderr)}`);
-    for (const f of d.stdout.split('\0')) if (f) changed.add(f);
-  }
-  const changedPaths = [...changed];
-  const sensitivePaths = changedPaths.filter((p) => matchesAny(p, cfg.sensitivePaths));
+  const gated = await gateChangedPaths({ git, repo, remote, base, head, branch, baseShas: input.baseShas ?? [], sensitivePaths: cfg.sensitivePaths });
+  if (!gated.ok) return fail(gated.code, gated.message);
+  const { changedPaths, sensitivePaths } = gated;
 
   // 3. Capability gates.
   const caps: Capability[] = mode === 'pull-request' ? ['git.push', 'pr.create'] : ['git.push'];

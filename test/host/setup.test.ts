@@ -129,7 +129,7 @@ describe('minions setup', () => {
     expect(a.asked.some((q) => q.startsWith('Communication channel') || q.startsWith('Store a GitHub token') || q.startsWith('Store the Telegram'))).toBe(false);
 
     expect(r.steps.map((s) => [s.id, s.status])).toEqual([
-      ['init', 'done'], ['github', 'done'], ['delivery', 'changed'], ['ci', 'done'], ['intake', 'skipped'], ['autoMerge', 'deferred'],
+      ['init', 'done'], ['github', 'done'], ['delivery', 'changed'], ['ci', 'done'], ['intake', 'skipped'], ['autoMerge', 'done'],
       ['telegram', 'done'], ['container', 'done'], ['import', 'done'], ['coordinator', 'done'],
     ]);
     expect(rt.calls).toEqual(['running?', 'start', 'repo?', 'import', 'coordinator']);
@@ -140,18 +140,19 @@ describe('minions setup', () => {
     // Choices land in the host-only local layer and in the regenerated plugin/runtime config.
     const paths = projectPaths(r.projectId);
     // communication.channel stays auto (the default): a stored bot token is what turns Telegram on.
-    expect(JSON.parse(readFileSync(paths.configLocalJson, 'utf8'))).toEqual({ delivery: { mode: 'pull-request', provider: 'github' } });
+    expect(JSON.parse(readFileSync(paths.configLocalJson, 'utf8'))).toEqual({ delivery: { mode: 'pull-request', provider: 'github', merge: 'auto-when-eligible' } });
     const eff = (await loadEffectiveConfig(await loadProjectJson(r.projectId))).config;
     expect(eff.delivery.mode).toBe('pull-request');
     expect(eff.communication.channel).toBe('auto');
     expect(readFileSync(join(paths.pluginDir, 'coordinator.md'), 'utf8')).toBe('delivery pull-request channel auto\n');
     expect(JSON.parse(readFileSync(paths.runtimeConfigJson, 'utf8')).communication.channel).toBe('auto');
 
-    // CI: read-only, plan printed. Auto-merge: deferred, nothing written.
+    // CI: read-only, plan printed. Auto-merge: opted in (local layer only), with what is still missing; nothing on GitHub.
     expect(api.seen.every((s) => s.method === 'GET')).toBe(true);
     expect(step(r, 'ci').lines!.join('\n')).toContain('Add a CI workflow yourself');
-    expect(a.info.join('\n')).toContain('Auto-merge is not available yet; nothing was changed.');
-    expect(JSON.stringify(eff)).not.toMatch(/autoMerge"?:\s*true/);
+    expect(eff.delivery.merge).toBe('auto-when-eligible');
+    expect(step(r, 'autoMerge').lines).toEqual(expect.arrayContaining([expect.stringMatching(/still needed: delivery\.requiredChecksConfigured is false/), expect.stringMatching(/still needed: verification\.ciAuthority/)]));
+    expect(a.asked.find((x) => x.startsWith('Enable auto-merge?'))).toBe('Enable auto-merge? (y/n)');
     expect(existsSync(join(repo, '.github'))).toBe(false);
 
     // Attach and pairing instructions.
@@ -203,6 +204,16 @@ describe('minions setup', () => {
     expect((await loadEffectiveConfig(await loadProjectJson(r.projectId))).config.delivery.mode).toBe('local');
   });
 
+  it('asks "Enable auto-merge?" with pull-request delivery, default no: accepting the default writes nothing for merge', async () => {
+    const repo = githubRepo();
+    const a = scripted({ 'Installation visibility': 'private', 'Set up GitHub integration': 'y', 'Delivery mode': 'pull-request' }, [GH_TOKEN]);
+    const r = await runSetup({ path: repo, yes: false, io: a.io, runtime: fakeRuntime().runtime, dockerProbe: dockerUp, fetch: githubApi().f });
+    expect(a.asked).toContain('Enable auto-merge? (y/n)');
+    expect(step(r, 'autoMerge')).toMatchObject({ status: 'skipped', detail: 'auto-merge not enabled' });
+    expect(JSON.parse(readFileSync(projectPaths(r.projectId).configLocalJson, 'utf8')).delivery.merge).toBeUndefined();
+    expect((await loadEffectiveConfig(await loadProjectJson(r.projectId))).config.delivery.merge).toBe('disabled');
+  });
+
   it('asks each optional integration with default no; declining skips cleanly with a note on enabling later', async () => {
     const repo = githubRepo();
     const a = scripted({ 'Installation visibility': 'private' });
@@ -213,7 +224,8 @@ describe('minions setup', () => {
     expect(q('Use CI?')).toBeDefined();
     expect(q('Import GitHub issues into the backlog?')).toContain('(y/n)');
     expect(q('Issue labels to import')).toBeUndefined();
-    expect(q('Enable auto-merge?')).toContain('not available yet');
+    // Auto-merge needs pull-request delivery; with local delivery it is not asked.
+    expect(q('Enable auto-merge?')).toBeUndefined();
     expect(q('Set up Telegram')).toBeDefined();
     expect(q('Delivery mode')).toBeUndefined();
     expect(a.asked.some((x) => x.startsWith('secret:'))).toBe(false);
@@ -221,7 +233,7 @@ describe('minions setup', () => {
       expect(step(r, id).status).toBe('skipped');
       expect(step(r, id).later).toMatch(/minions setup/);
     }
-    expect(step(r, 'autoMerge').status).toBe('deferred');
+    expect(step(r, 'autoMerge')).toMatchObject({ status: 'skipped', later: expect.stringMatching(/minions setup/) });
     expect(r.localConfig.changed).toEqual([]);
     expect(existsSync(projectPaths(r.projectId).configLocalJson)).toBe(false);
     const rp = r.init.plan.repoPath;
@@ -389,7 +401,7 @@ describe('minions setup', () => {
     const rt = fakeRuntime();
     const r = await runSetup({ path: repo, yes: true, runtime: rt.runtime, dockerProbe: dockerUp });
     expect(r.steps.map((s) => [s.id, s.status])).toEqual([
-      ['init', 'done'], ['github', 'skipped'], ['delivery', 'kept'], ['ci', 'skipped'], ['intake', 'skipped'], ['autoMerge', 'deferred'],
+      ['init', 'done'], ['github', 'skipped'], ['delivery', 'kept'], ['ci', 'skipped'], ['intake', 'skipped'], ['autoMerge', 'skipped'],
       ['telegram', 'skipped'], ['container', 'done'], ['import', 'done'], ['coordinator', 'done'],
     ]);
     expect((await loadEffectiveConfig(await loadProjectJson(r.projectId))).config.delivery.mode).toBe('local');

@@ -285,7 +285,7 @@ describe('wizard', () => {
     expect(questions).toContain('Communication channel (auto/terminal/telegram)');
     expect(r.config.communication.channel).toBe('auto');
     expect(info.join('\n')).toMatch(/Branch push and pull requests are not selectable: the repository has no GitHub remote/);
-    expect(info.join('\n')).toMatch(/Auto-merge \(not available in v0\.1\)/);
+    expect(info.join('\n')).toMatch(/Auto-merge needs pull-request delivery/);
     expect(questions.some((q) => q.startsWith('Delivery mode'))).toBe(false);
     expect(r.config.delivery.mode).toBe('local');
     for (const q of questions) expect(q).not.toMatch(/token|password|secret|api key/i);
@@ -308,7 +308,7 @@ describe('wizard', () => {
     const ok = await run(true);
     expect(ok.questions.some((q) => q.startsWith('Delivery mode (local/branch/pull-request)'))).toBe(true);
     expect(ok.r.config.delivery).toMatchObject({ mode: 'pull-request', provider: 'github', merge: 'disabled' });
-    expect(ok.info).toMatch(/minions never merges/);
+    expect(ok.info).toMatch(/minions does not merge pull requests unless you opt into CI-gated auto-merge/);
     expect((await run(true, 'branch')).r.config.delivery.mode).toBe('branch');
     expect((await run(true, 'local')).r.config.delivery.mode).toBe('local');
 

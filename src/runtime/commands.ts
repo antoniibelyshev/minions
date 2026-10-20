@@ -309,17 +309,20 @@ export function register(program: Command): void {
       emit(r, { json: globalOpts(cmd).json, human: (d) => d.message });
       if (r.state === 'failed') process.exitCode = 1;
     }));
-  work.command('approve <taskId>').description('Approve publishing the approved head (sensitive paths / "ask" publication); run on the host, which signs the approval')
+  work.command('approve <taskId>').description('Approve publishing the approved head (sensitive paths / "ask" publication), or with --merge merging its delivered PR (pr.merge "ask"); run on the host, which signs the approval')
     .requiredOption('--head <sha>', 'the full approved head SHA being authorized (binds the approval to that commit)')
+    .option('--merge', 'approve merging the delivered pull request at that head (CI-gated auto-merge) instead of publishing it')
     .option('--by <name>', 'who approved (default: the host user)')
     .option('--note <text>', 'why')
     .addOption(new Option('--signature <token>', 'host-signed approval token (set by the host CLI when it delegates; never needed by hand)').hideHelp())
-    .action(action(async (taskId: string, o: { head: string; by?: string; note?: string; signature?: string }, cmd: Command) => {
+    .action(action(async (taskId: string, o: { head: string; merge?: boolean; by?: string; note?: string; signature?: string }, cmd: Command) => {
       if (runtimeMode() === 'host') {
         if (o.signature) throw new MinionsError('PRECONDITION', 'The host CLI signs approvals itself; --signature is only accepted inside the agent runtime.');
-        process.exit(await approveOnHost(taskId, { head: o.head, by: o.by, note: o.note, json: globalOpts(cmd).json }));
+        process.exit(await approveOnHost(taskId, { head: o.head, by: o.by, note: o.note, merge: !!o.merge, json: globalOpts(cmd).json }));
       }
-      const r = (await scheduler()).approvePublication(taskId, { head: o.head, by: o.by, note: o.note, signature: o.signature });
+      const s = await scheduler();
+      const opts = { head: o.head, by: o.by, note: o.note, signature: o.signature };
+      const r = o.merge ? s.approveMerge(taskId, opts) : s.approvePublication(taskId, opts);
       emit(r, { json: globalOpts(cmd).json, human: (d) => d.message });
     }));
   work.command('list').description('List active leases')
@@ -479,15 +482,17 @@ export function register(program: Command): void {
 
   // sync: one-shot GitHub intake import (when intake.github is enabled) plus a refresh of PR state and
   // CI check results (no polling loop); host delegates.
-  program.command('sync [taskIds...]').description('Import issues matching intake.github into the backlog (when enabled), refresh pull-request state and CI check results for tasks with a PR; reconcile merged/closed PRs (read-only on GitHub)')
+  program.command('sync [taskIds...]').description('Import issues matching intake.github into the backlog (when enabled), refresh pull-request state and CI check results for tasks with a PR; reconcile merged/closed PRs; with delivery.merge auto-when-eligible, arm/disarm GitHub auto-merge for PRs that pass every gate')
     .action(action(async (taskIds: string[], _o: unknown, cmd: Command) => {
       if (runtimeMode() === 'host') return delegate(cmd);
       const { db: d, backlog: b, config: cfg } = await context();
       // Intake runs on a full sync only (`minions sync <taskIds>` refreshes just those PRs).
       const intake = taskIds.length ? null : await runIntakeSync();
-      const r: SyncReport & { intake: IntakeSyncReport | null } = { ...(await syncTasks({ db: d, backlog: b, config: cfg }, { taskIds })), intake };
+      // Auto-merge (delivery.merge "auto-when-eligible") runs here, through the runtime's own gates.
+      const sched = await scheduler();
+      const r: SyncReport & { intake: IntakeSyncReport | null } = { ...(await syncTasks({ db: d, backlog: b, config: cfg, merge: (id) => sched.autoMerge(id) }, { taskIds })), intake };
       emit(r, { json: globalOpts(cmd).json, human: (x) => [...(x.intake?.enabled ? [formatIntake(x.intake)] : []), formatSync(x)].join('\n') });
-      if (r.failed || intake?.errors.length) process.exitCode = 1;
+      if (r.failed || intake?.errors.length || r.tasks.some((t) => t.merge?.state === 'failed')) process.exitCode = 1;
     }));
 
   // ci: read-only required-checks status for the base branch (used by `minions doctor`).

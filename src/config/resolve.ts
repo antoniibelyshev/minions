@@ -1,5 +1,6 @@
 import { MinionsError, invalidConfig, zodIssues, type ConfigIssue } from '../core/errors.js';
 import { CAPABILITIES, ruleEffects, stricter, strictness } from './capabilities.js';
+import { autoMergeConfigReasons } from './delivery.js';
 import { MinionsConfigSchema, CapabilityRuleSchema, type Capability, type CapabilityRule, type MinionsConfig } from './schema.js';
 
 export const SUPPORTED = {
@@ -10,7 +11,7 @@ export const SUPPORTED = {
 
 /** Features deferred in v0.1; doctor and the wizard report them as unavailable. */
 export const DEFERRED_FEATURES = [
-  'GitHub Issues backend', 'auto-merge and merge requests', 'review publication',
+  'GitHub Issues backend', 'merge requests (delivery.merge "manual")', 'review publication',
   'notification outbox',
   'config plan/apply transactions', 'backlog migration', 'upgrade plan and schema migration', 'budgets',
   'companion containers', 'GitHub App short-lived tokens (a fine-grained PAT is used instead)',
@@ -30,9 +31,8 @@ export function listUnavailable(config: MinionsConfig): Unavailable[] {
     out.push({ path: 'communication.channel', value: 'telegram', reason: 'Telegram needs outbound network (api.telegram.org, and the npm registry for the plugin\'s dependencies) but container.network is none; the coordinator runs terminal-only' });
   }
   if (config.delivery.merge === 'auto-when-eligible') {
-    out.push({ path: 'delivery.merge', value: config.delivery.merge, reason: config.delivery.requiredChecksConfigured
-      ? 'automatic merge is deferred in v0.1'
-      : 'automatic merge is unavailable: requiredChecksConfigured is false (never treated as zero required checks)' });
+    const why = autoMergeConfigReasons(config);
+    if (why.length) out.push({ path: 'delivery.merge', value: config.delivery.merge, reason: `automatic merge is unavailable: ${why.join('; ')}` });
   } else if (config.delivery.merge === 'manual') {
     out.push({ path: 'delivery.merge', value: 'manual', reason: config.delivery.mode === 'pull-request'
       ? 'merge requests through minions are deferred; minions never merges: merge the pull request through your normal process'

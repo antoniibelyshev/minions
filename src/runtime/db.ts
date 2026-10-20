@@ -292,6 +292,11 @@ export class RuntimeDb {
     return this.all<EvidenceRow>(q + ' ORDER BY recorded_at', ...p);
   }
 
+  /** Every row of one kind for a task, any head, oldest first (e.g. the merge arm/disarm history). */
+  evidenceOfKind(taskId: string, kind: string): EvidenceRow[] {
+    return this.all<EvidenceRow>('SELECT * FROM evidence WHERE task_id = ? AND kind = ? ORDER BY recorded_at, rowid', taskId, kind);
+  }
+
   // Repairs
   repairCycles(taskId: string): number { return this.get<{ cycles: number }>('SELECT cycles FROM repairs WHERE task_id = ?', taskId)?.cycles ?? 0; }
   incrementRepairs(taskId: string): number {

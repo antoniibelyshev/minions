@@ -22,9 +22,17 @@ const CLOCK_SKEW_MS = 5 * 60 * 1000;
 /** Full SHA-1 or SHA-256 object name: approvals bind an exact commit, never an abbreviation or ref. */
 export const FULL_SHA_RE = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 
+/**
+ * What a signed approval authorizes. `publish`: push / open the PR for the head (task-1.8). `merge`:
+ * arm GitHub auto-merge for the PR at that head when `pr.merge` is "ask" (task-1.9). A token of one
+ * scope never satisfies the other.
+ */
+export type ApprovalScope = 'publish' | 'merge';
+export const APPROVAL_SCOPES: readonly ApprovalScope[] = ['publish', 'merge'];
+
 export interface ApprovalPayload {
   v: 1;
-  scope: 'publish';
+  scope: ApprovalScope;
   taskId: string;
   head: string;
   by: string | null;
@@ -65,14 +73,16 @@ export function approvalKeyId(publicKeyPem: string): string {
   return createHash('sha256').update(der).digest('hex').slice(0, 16);
 }
 
-/** Signs a publication approval for exactly (taskId, head). Host only: needs the private key. */
-export function signApproval(privateKeyPem: string, f: { taskId: string; head: string; by?: string | null; now?: Date; ttlMs?: number }): { token: string; payload: ApprovalPayload } {
+/** Signs an approval (default scope publish) for exactly (taskId, head). Host only: needs the private key. */
+export function signApproval(privateKeyPem: string, f: { taskId: string; head: string; by?: string | null; now?: Date; ttlMs?: number; scope?: ApprovalScope }): { token: string; payload: ApprovalPayload } {
+  const scope = f.scope ?? 'publish';
+  if (!APPROVAL_SCOPES.includes(scope)) throw new Error(`unknown approval scope ${String(scope)}`);
   if (!FULL_SHA_RE.test(f.head)) throw new Error('--head must be the full commit SHA (40 or 64 lowercase hex characters)');
   if (!f.taskId.trim()) throw new Error('task id is empty');
   const now = f.now ?? new Date();
   const key = createPrivateKey(privateKeyPem);
   const payload: ApprovalPayload = {
-    v: 1, scope: 'publish', taskId: f.taskId, head: f.head, by: f.by ?? null,
+    v: 1, scope, taskId: f.taskId, head: f.head, by: f.by ?? null,
     issuedAt: now.toISOString(), expiresAt: new Date(now.getTime() + (f.ttlMs ?? APPROVAL_TTL_MS)).toISOString(),
     kid: approvalKeyId(publicKeyOf(privateKeyPem)),
   };
@@ -85,7 +95,8 @@ export function signApproval(privateKeyPem: string, f: { taskId: string; head: s
  * key, a malformed/tampered/foreign-key token, another task or head, or an expired approval.
  */
 export function verifyApproval(token: string | null | undefined, publicKeyPem: string | null | undefined,
-  expect: { taskId: string; head: string; now?: Date }): ApprovalCheck {
+  expect: { taskId: string; head: string; now?: Date; scope?: ApprovalScope }): ApprovalCheck {
+  const scope = expect.scope ?? 'publish';
   if (!publicKeyPem) return { ok: false, reason: 'no approval public key is provisioned in this runtime (the host creates it on the first `minions work approve`)' };
   if (!token) return { ok: false, reason: 'no host-signed approval is recorded' };
   let key: KeyObject;
@@ -98,7 +109,8 @@ export function verifyApproval(token: string | null | undefined, publicKeyPem: s
   if (!good) return { ok: false, reason: 'the approval signature is invalid (tampered, or signed by another key)' };
   let p: ApprovalPayload;
   try { p = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8')) as ApprovalPayload; } catch { return { ok: false, reason: 'the approval payload is not JSON' }; }
-  if (!p || typeof p !== 'object' || p.v !== 1 || p.scope !== 'publish') return { ok: false, reason: 'the approval has an unsupported version or scope' };
+  if (!p || typeof p !== 'object' || p.v !== 1 || !APPROVAL_SCOPES.includes(p.scope)) return { ok: false, reason: 'the approval has an unsupported version or scope' };
+  if (p.scope !== scope) return { ok: false, reason: `the approval is a ${p.scope} approval, not a ${scope} approval` };
   if (p.taskId !== expect.taskId) return { ok: false, reason: `the approval is for task ${String(p.taskId)}, not ${expect.taskId}` };
   if (p.head !== expect.head) return { ok: false, reason: `the approval is for head ${String(p.head)}, not ${expect.head}` };
   const now = (expect.now ?? new Date()).getTime();
@@ -111,7 +123,7 @@ export function verifyApproval(token: string | null | undefined, publicKeyPem: s
 
 /** First valid token of several (e.g. every approval row recorded for one head), else the last failure. */
 export function verifyAnyApproval(tokens: (string | null | undefined)[], publicKeyPem: string | null | undefined,
-  expect: { taskId: string; head: string; now?: Date }): ApprovalCheck {
+  expect: { taskId: string; head: string; now?: Date; scope?: ApprovalScope }): ApprovalCheck {
   let last: ApprovalCheck = verifyApproval(null, publicKeyPem, expect);
   for (const t of tokens) {
     if (!t) continue;
