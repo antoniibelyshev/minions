@@ -296,6 +296,7 @@ export function register(program: Command): void {
       const r = await syncCoordinator(await getConfig(), {
         activeLeases: () => d.activeLeases(),
         recordRestart: (info) => d.setMeta('coordinator_restart', JSON.stringify(info)),
+        lock: d,
       }, o);
       emit(r, { json: globalOpts(cmd).json, human: (x: typeof r) => `coordinator: ${x.action} (${x.reason})` });
     }));
@@ -308,6 +309,7 @@ export function register(program: Command): void {
       const r = await restartCoordinator(await getConfig(), {
         activeLeases: () => d.activeLeases(),
         recordRestart: coordinatorRestartRecorder(d),
+        lock: d,
       }, o);
       emit(r, { json: globalOpts(cmd).json, human: (x: typeof r) => `coordinator: ${x.action} (${x.reason})` });
     }));

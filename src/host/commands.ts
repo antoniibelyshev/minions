@@ -14,6 +14,7 @@ import {
   clearSecrets, upClearingSecretsOnFailure, githubTokenGuidance, materializeSecrets, provisionGithubToken, provisionTelegramToken, removeGithubToken,
   removeTelegramToken, telegramBotGuidance,
 } from './credentials.js';
+import { assertBotFree } from './bot-guard.js';
 import { dockerProbe } from './discovery.js';
 import { Compose, ensureImage, packageRoot } from './docker.js';
 import { formatDoctor, runDoctor } from './doctor.js';
@@ -129,6 +130,7 @@ function setupRuntime(json: boolean, cwd: string): SetupRuntime {
         }
       }
       const p = up();
+      await assertBotFree(p.project, p.config);
       const channel = await hostChannel(p.project, p.config);
       // Started detached so it runs (and Telegram works) with nobody attached; attaching comes after.
       return (await telegramStartup(json, p.compose, p.config, { startDetached: true, wantsTelegram: channel.wantsTelegram })) as { action?: string; reason?: string } | null;
@@ -372,7 +374,10 @@ export function register(program: Command): void {
       requireMode('host');
       const { json } = globalOpts(cmd);
       const { projectId } = await projectForPath(process.cwd());
-      if (runtimeOf(await loadProjectJson(projectId)) === 'host') return startHost(json, o);
+      const registered = await loadProjectJson(projectId);
+      if (runtimeOf(registered) === 'host') return startHost(json, o);
+      // One bot, one coordinator: refuse before anything starts (terminal mode is never refused).
+      await assertBotFree(registered, (await loadEffectiveConfig(registered)).config);
       const { project, compose, config } = await ensureUp(json, { provision: true });
       let imported: unknown = null;
       if (!(await repoPresent(compose))) {
@@ -588,6 +593,12 @@ export function register(program: Command): void {
         if (vis === 'restart-required') { needsRestart = true; return false; } // a copy would not reach it
         await materialize(json, project.projectId);
         const eff = await loadEffectiveConfig(project).catch(() => undefined);
+        // One bot, one coordinator: do not (re)launch onto a bot another project's coordinator polls.
+        const busy = eff ? await assertBotFree(project, eff.config).then(() => null, (e: unknown) => e) : null;
+        if (busy) {
+          say(json, `warning: ${busy instanceof MinionsError ? busy.message : 'bot check failed'} The running coordinator was left unchanged.`);
+          return true;
+        }
         await coordinatorSync(json, compose, { startDetached: eff ? (await hostChannel(project, eff.config)).wantsTelegram : false });
         return true;
       };

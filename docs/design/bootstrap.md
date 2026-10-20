@@ -45,6 +45,7 @@ budgets, companion containers.
 - Coordinator permission mode defaults to `acceptEdits` with an allowlist for `minions`, `git`, and `backlog` commands. Never `bypassPermissions`.
 - Pinned in image: base `node:22-bookworm-slim` (digest pinned in Dockerfile), `@anthropic-ai/claude-code@2.1.292`, `backlog.md@1.54.0`. Tested range documented in `docs/compatibility.md`.
 - No `--append-system-prompt-file` exists in Claude Code 2.1.292; the launcher reads the coordinator prompt file and passes it with `--append-system-prompt` as an argv element (no shell).
+- One coordinator per project (spec §447, task-17): the runtime DB lock (`meta.coordinator_lock`, `{pid, session, acquiredAt}`) is enforced by `minions coordinator run`, on top of `tmux new-session -A` (which only dedupes one session name on one tmux server). The holder is the wrapper, which spawns claude as a child (no exec) and releases the lock when claude exits; it is taken before the launch record is written, so a refused duplicate changes nothing. Takeover rule: a holder whose pid is gone (SIGKILL, container restart) is replaced; on Linux a live pid whose `/proc/<pid>/cmdline` is not a coordinator wrapper counts as gone (pid reuse). Restarts (`coordinator restart`/`sync`, upgrades, idle self-restart) cannot deadlock: after `kill-session` the sync waits up to 15 s for the old wrapper to release, and a starting wrapper waits up to 10 s for a live holder before refusing with CONFLICT ("attach with `minions start`").
 
 ## GitHub credential
 
