@@ -264,6 +264,66 @@ describe('drain hook gate and phases (tester additions)', () => {
     ]) expect(drainSafeBash(bad), bad).toBe(false);
   });
 
+  it('drainSafeBash: commands after a heredoc terminator are checked (task-3.9)', () => {
+    for (const bad of [
+      'cat <<EOF; git reset --hard\nbody\nEOF',
+      "cat <<'EOF'\nbody\nEOF\ngit reset --hard",
+      "minions work submit L --json <<'RESULT'\n{}\nRESULT\ngit reset --hard",
+      "minions work submit L --json <<'RESULT' && rm -rf src\n{}\nRESULT",
+      "git commit -F - <<-'EOF'\n\twip\n\tEOF\nrm -rf src",
+      "cat <<'A' <<'B'\na\nA\nb\nB\nrm x",
+      "cat <<'EOF'\nno terminator",
+      'git status #<<EOF\nrm -rf src\nEOF',
+      'cat <<<"x"',
+    ]) expect(drainSafeBash(bad), bad).toBe(false);
+    for (const ok of [
+      "cat <<'EOF'\n$(rm -rf src) `rm x` > b\nEOF\ngit status",
+      "cat <<'A' <<'B'\na\nA\nb\nB\ngit status",
+      'cat <<EOF\nplain body\nEOF',
+      "git commit -F - <<-'EOF'\n\twip\n\tEOF",
+    ]) expect(drainSafeBash(ok), ok).toBe(true);
+  });
+
+  it('drainSafeBash: substitutions outside single quotes are rejected, except the cat-heredoc commit message (task-3.9)', () => {
+    for (const bad of [
+      'git commit -m "$(rm -rf src)"',
+      'git commit -m $(rm -rf src)',
+      'git commit -m "`rm -rf src`"',
+      'echo `rm x`',
+      'cat <(rm -rf src)',
+      'git diff >(cat)',
+      'cat <<EOF\n$(rm -rf src)\nEOF',
+      'cat <<EOF\n`rm x`\nEOF',
+      "git commit -m \"$(cat <<'EOF'\nwip\nEOF\n)\" && rm -rf src",
+      "git commit -m $(cat <<'EOF'\nwip\nEOF\n); rm -rf src",
+      "git commit -m \"$(cat <<'EOF'\nwip\n)\"",
+      'git commit -m "$(cat <<EOF\nwip\nEOF\n)"',
+      'git status "unterminated',
+    ]) expect(drainSafeBash(bad), bad).toBe(false);
+    for (const ok of [
+      "echo '$(rm -rf src) `x`'",
+      'echo "\\$(not run) \\`x\\`"',
+      "git commit -m \"$(cat <<'EOF'\nwip: a ) b $(c) `d`\nEOF\n)\"",
+      "cd \"/w with space\" && git add -A && git commit -m \"$(cat <<'EOF'\nwip\nEOF\n)\" && git status",
+      'git diff 2>&1 | head -5',
+      'git -C "/w with space" status',
+    ]) expect(drainSafeBash(ok), ok).toBe(true);
+  });
+
+  it('drainSafeBash: git -c and git commit --amend are rejected (task-3.9)', () => {
+    for (const bad of [
+      'git -c core.fsmonitor=x status',
+      'git -c core.pager=x log',
+      'git -C /w -c core.pager=x log',
+      'git --no-pager -c core.pager=x diff',
+      'git commit --amend --no-edit',
+      'git commit --amend -m "wip"',
+      'git -C /w commit --ame --no-edit',
+      '"git" reset --hard',
+    ]) expect(drainSafeBash(bad), bad).toBe(false);
+    for (const ok of ['git --no-pager -C /w log -1', 'git commit -m "wip: amend later"']) expect(drainSafeBash(ok), ok).toBe(true);
+  });
+
   it('the gate handles a state dir with a space: exit 0 without the flag, runs minions with it', () => {
     const { dir } = gateEnv();
     const state = join(dir, 'state with space');
