@@ -5,6 +5,7 @@ import { execFileSync } from 'node:child_process';
 import type { BacklogAdapter, CreateTaskInput, ScopeFilter, Task, TaskStatus } from '../../src/backlog/types.js';
 import type { MinionsConfig } from '../../src/config/schema.js';
 import { MinionsError } from '../../src/core/errors.js';
+import { generateApprovalKeyPair, signApproval } from '../../src/core/approval.js';
 import { RuntimeDb } from '../../src/runtime/db.js';
 import { Scheduler } from '../../src/runtime/scheduler.js';
 import { workspaceLayout, type WorkspaceLayout } from '../../src/runtime/worktree.js';
@@ -112,5 +113,19 @@ export function result(over: Record<string, unknown> & { branch: string; headSha
     status: 'complete', summary: 'done', modifiedPaths: ['a.txt'],
     checks: [{ command: 'npm test', outcome: 'pass' }], acceptanceEvidence: [{ criterion: 'works', evidence: 'test passes' }],
     findings: [], nextAction: 'continue', ...over,
+  };
+}
+
+/**
+ * A throwaway host approval key pair: the public half in a temp file (the runtime's view), the
+ * private half only in memory (stands in for the host credential store the runtime cannot read).
+ */
+export function approvalKeys() {
+  const pair = generateApprovalKeyPair();
+  const publicKeyFile = join(tmp('minions-approval-'), 'approval-public-key.pem');
+  writeFileSync(publicKeyFile, pair.publicKeyPem);
+  return {
+    ...pair, publicKeyFile,
+    sign: (taskId: string, head: string, o: { by?: string; now?: Date; ttlMs?: number } = {}) => signApproval(pair.privateKeyPem, { taskId, head, ...o }).token,
   };
 }
