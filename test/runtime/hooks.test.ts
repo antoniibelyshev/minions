@@ -103,6 +103,36 @@ describe('pre-agent hook', () => {
     expect(decision(await preAgentHook(agent('minions:engineer', brief.briefMarker), loader(env))).hookSpecificOutput.permissionDecision).toBe('deny');
   });
 
+  it('accepts minions:engineer-deep under an engineer lease only', async () => {
+    const env = makeEnv();
+    env.backlog.add({ id: 'task-1' });
+    const eng = await env.sched.claim('task-1', 'engineer');
+    const ok = await preAgentHook(agent('minions:engineer-deep', eng.briefMarker), loader(env));
+    expect(ok.stdout).toBeUndefined();
+    expect(ok.reason).toMatch(/allow: minions:engineer-deep under lease/);
+    for (const t of ['minions:tester-deep', 'minions:reviewer-deep', 'minions:engineer-deeper']) {
+      expect(decision(await preAgentHook(agent(t, eng.briefMarker), loader(env))).hookSpecificOutput.permissionDecisionReason, t).toMatch(/Unknown minions agent type/);
+    }
+    // the engineer lease is the only thing that authorizes it
+    await env.sched.release(eng.leaseId, 'done');
+    const gone = decision(await preAgentHook(agent('minions:engineer-deep', eng.briefMarker), loader(env)));
+    expect(gone.hookSpecificOutput.permissionDecision).toBe('deny');
+    expect(gone.hookSpecificOutput.permissionDecisionReason).toMatch(/No active engineer lease/);
+    expect(decision(await preAgentHook(agent('minions:engineer-deep', 'go'), loader(env))).hookSpecificOutput.permissionDecisionReason).toMatch(/--role engineer/);
+  });
+
+  it('denies a full model id as the Agent model and allows aliases or an omitted model', async () => {
+    const env = makeEnv();
+    env.backlog.add({ id: 'task-1' });
+    const brief = await env.sched.claim('task-1', 'engineer');
+    const withModel = (model: string) => ({ ...agent('minions:engineer', brief.briefMarker), tool_input: { ...agent('minions:engineer', brief.briefMarker).tool_input, model } });
+    const full = decision(await preAgentHook(withModel('claude-opus-5-5'), loader(env)));
+    expect(full.hookSpecificOutput.permissionDecision).toBe('deny');
+    expect(full.hookSpecificOutput.permissionDecisionReason).toMatch(/not an Agent model alias \(sonnet\|opus\|haiku\|fable\)\. Omit `model`/);
+    for (const m of ['sonnet', 'opus', 'haiku', 'fable']) expect((await preAgentHook(withModel(m), loader(env))).stdout, m).toBeUndefined();
+    expect((await preAgentHook(agent('minions:engineer', brief.briefMarker), loader(env))).stdout).toBeUndefined();
+  });
+
   it('passes other agent types through and fails closed for minions workers', async () => {
     expect((await preAgentHook(agent('general-purpose', 'anything'), () => { throw new Error('x'); })).stdout).toBeUndefined();
     const r = await preAgentHook(agent('minions:reviewer', 'minions-lease: lease-abc'), () => { throw new Error('db broken'); });
