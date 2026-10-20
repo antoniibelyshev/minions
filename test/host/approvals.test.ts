@@ -7,7 +7,7 @@ import { CONTAINER, credentialStoreDir, projectPaths } from '../../src/core/path
 import { approvalPublicKeyFile, approvalSigningKeyFile, approveOnHost, ensureApprovalKey, issueApproval, removeApprovalKeys } from '../../src/host/approvals.js';
 import { composeYaml } from '../../src/host/docker.js';
 import { hostSettings } from '../../src/runtime/coordinator.js';
-import { approvalPublicKeyPath, CONTAINER_APPROVAL_PUBLIC_KEY, runtimePaths } from '../../src/runtime/paths.js';
+import { approvalPublicKeyPath, CONTAINER_APPROVAL_PUBLIC_KEY, inMinionsContainer, runtimePaths } from '../../src/runtime/paths.js';
 import { withHome } from './fixtures.js';
 
 const HEAD = 'a1'.repeat(20);
@@ -120,6 +120,54 @@ describe('host-held approval key', () => {
     } finally {
       if (prev === undefined) delete process.env.MINIONS_CONTAINER_ROOT; else process.env.MINIONS_CONTAINER_ROOT = prev;
     }
+  });
+
+  // The real default probe (no injected inContainer). Only meaningful where the read-only bind exists,
+  // i.e. when the suite itself runs inside a minions container; skipped on a plain host.
+  const realContainer = existsSync('/opt/minions/config');
+  it.runIf(realContainer)('default probe in a real container: no env combination redirects the key (runtimePaths() reads process.env)', () => {
+    const LITERAL = '/opt/minions/config/approval-public-key.pem';
+    expect(inMinionsContainer()).toBe(true);
+    const keys = ['MINIONS_CONTAINER_ROOT', 'MINIONS_CONFIG', 'MINIONS_RUNTIME'] as const;
+    const choices: Record<(typeof keys)[number], (string | undefined)[]> = {
+      MINIONS_CONTAINER_ROOT: [undefined, '', '/tmp/evil'],
+      MINIONS_CONFIG: [undefined, '', '/tmp/evil/runtime/config.json'],
+      MINIONS_RUNTIME: [undefined, '', 'host', 'container'],
+    };
+    const saved = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
+    try {
+      for (const a of choices.MINIONS_CONTAINER_ROOT) for (const b of choices.MINIONS_CONFIG) for (const c of choices.MINIONS_RUNTIME) {
+        const combo = { MINIONS_CONTAINER_ROOT: a, MINIONS_CONFIG: b, MINIONS_RUNTIME: c };
+        for (const k of keys) { if (combo[k] === undefined) delete process.env[k]; else process.env[k] = combo[k]; }
+        expect(runtimePaths().approvalPublicKey, JSON.stringify(combo)).toBe(LITERAL);
+        expect(approvalPublicKeyPath(), JSON.stringify(combo)).toBe(LITERAL);
+        expect(runtimePaths({ ...process.env }).approvalPublicKey, JSON.stringify(combo)).toBe(LITERAL);
+      }
+    } finally {
+      for (const k of keys) { if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k]; }
+    }
+  });
+
+  it.runIf(realContainer)('default probe in a real container: host-side `work approve` is refused even with MINIONS_RUNTIME unset', async () => {
+    const prev = process.env.MINIONS_RUNTIME;
+    delete process.env.MINIONS_RUNTIME;
+    let delegated = false;
+    try {
+      await expect(approveOnHost('task-7', { head: HEAD, json: true }, { projectId: ID, delegate: async () => { delegated = true; return 0; } }))
+        .rejects.toMatchObject({ code: 'INCOMPATIBLE_RUNTIME' });
+    } finally {
+      if (prev === undefined) delete process.env.MINIONS_RUNTIME; else process.env.MINIONS_RUNTIME = prev;
+    }
+    expect(delegated).toBe(false);
+    expect(existsSync(approvalSigningKeyFile(ID))).toBe(false);
+  });
+
+  it('host runtime with MINIONS_CONFIG unset fails closed: the absent container key, never an agent-chosen file', () => {
+    expect(approvalPublicKeyPath({ MINIONS_RUNTIME: 'host' }, false)).toBe(CONTAINER_APPROVAL_PUBLIC_KEY);
+    expect(approvalPublicKeyPath({ MINIONS_RUNTIME: 'host', MINIONS_CONFIG: '' }, false)).toBe(CONTAINER_APPROVAL_PUBLIC_KEY);
+    const pair = generateApprovalKeyPair();
+    const t = signApproval(pair.privateKeyPem, { taskId: 'task-1', head: HEAD }).token;
+    expect(verifyApproval(t, null, { taskId: 'task-1', head: HEAD })).toMatchObject({ ok: false, reason: expect.stringMatching(/no approval public key/) });
   });
 
   it('host-mode `work approve` is refused inside the container before any key is written', async () => {
