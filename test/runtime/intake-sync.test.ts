@@ -382,6 +382,24 @@ describe('intake sync: config and startup', () => {
     expect(logs.join('\n')).toMatch(/intake sync did not finish within .*starting the coordinator without it/);
   });
 
+  it('the wrapper stop signal (task-38) aborts the startup pass; an already stopped wrapper skips it', async () => {
+    const on = defaults(); on.intake.github = { ...FILTER };
+    let calls = 0;
+    let signal: AbortSignal | undefined;
+    const sync = (o: { signal: AbortSignal }) => { calls++; signal = o.signal; return new Promise<never>((_, rej) => o.signal.addEventListener('abort', () => rej(new Error('aborted')))); };
+    const pre = new AbortController(); pre.abort();
+    await intakeOnStart(on, () => {}, sync, 25_000, pre.signal);
+    expect(calls).toBe(0);
+    const stop = new AbortController();
+    const pass = intakeOnStart(on, () => {}, sync, 25_000, stop.signal);
+    await new Promise((r) => setImmediate(r));
+    expect(calls).toBe(1);
+    expect(signal?.aborted).toBe(false);
+    stop.abort();
+    await expect(pass).rejects.toThrow('aborted'); // the wrapper logs it as a failed startup step
+    expect(signal?.aborted).toBe(true);
+  });
+
   it('an aborted pass stops reading GitHub, keeps what it imported and never pauses tasks', async () => {
     const x = env();
     x.gh.set([{ number: 1 }, { number: 2 }]);

@@ -10,6 +10,7 @@ import {
   ESCALATE_KILL_MS, ESCALATE_TERM_MS, LOCK_RELEASE_WAIT_MS, LOCK_WAIT_MS, STUCK_TERM_WAIT_MS, stopStuckCoordinator,
   TMUX_SESSION, waitForLockRelease, type ProcessControl, type SpawnLike,
 } from '../../src/runtime/coordinator.js';
+import { intakeOnStart, STARTUP_INTAKE_BUDGET_MS } from '../../src/runtime/commands.js';
 import { pidAlive, RuntimeDb } from '../../src/runtime/db.js';
 import { runtimePaths } from '../../src/runtime/paths.js';
 import { defaults } from '../helpers.js';
@@ -586,6 +587,77 @@ describe('wrapper signal handling releases the lock', () => {
       expect(bus.count()).toBe(0);
       await flush();
       expect(child.count()).toBe(0);
+    });
+
+    // Merge of task-19: the GitHub startup intake runs between the lock and the spawn, inside the guard.
+    it('SIGHUP during the startup intake aborts the pass, releases the lock, exits 129, and never starts claude', async () => {
+      const { paths } = layout();
+      const cfg = terminalCfg();
+      cfg.intake.github = { enabled: true, repository: 'acme/demo', labels: [], assignee: null, milestone: null, state: 'open' };
+      const bus = signalBus();
+      const child = signalledChild();
+      const syncing = deferred<AbortSignal>();
+      const exits: number[] = [];
+      const logs: string[] = [];
+      // The real CLI wiring (intakeOnStart with the wrapper's stop signal) and the default 25 s budget.
+      const sync = (o: { signal: AbortSignal }) => { syncing.resolve(o.signal); return new Promise<never>((_, rej) => o.signal.addEventListener('abort', () => rej(new Error('aborted')))); };
+      const t0 = Date.now();
+      const p = coordinatorWrapper(async () => cfg, {
+        paths, spawn: child.spawn, permissionModes: autoModes, env: { TMUX: 'x' }, log: (l) => logs.push(l), signals: bus,
+        onStart: (c, l, stop) => intakeOnStart(c, l, sync, undefined, stop), exitAfterSignal: (c) => exits.push(c),
+      });
+      const passSignal = await syncing.promise;
+      expect(lockOf(paths)).toMatchObject({ pid: process.pid, session: TMUX_SESSION });
+      expect(bus.count()).toBe(4); // guarded during the intake
+      bus.emit('SIGHUP');
+      expect(await p).toBe(129);
+      expect(Date.now() - t0).toBeLessThan(STARTUP_INTAKE_BUDGET_MS); // promptly, not after the intake budget
+      expect(passSignal.aborted).toBe(true); // the intake pass is aborted with the wrapper
+      expect(lockOf(paths)).toBeUndefined();
+      expect(bus.count()).toBe(0);
+      expect(exits).toEqual([129]);
+      expect(await readExitRecord(paths)).toMatchObject({ code: 129, error: 'stopped by SIGHUP before claude started' });
+      await flush();
+      expect(child.count()).toBe(0);
+      expect(existsSync(paths.coordinatorLaunch)).toBe(false);
+    });
+
+    it('a startup step that ignores the stop signal neither delays the exit nor starts claude when it finishes late', async () => {
+      const { paths } = layout();
+      const bus = signalBus();
+      const child = signalledChild();
+      const started = deferred<AbortSignal>();
+      const finish = deferred<void>();
+      const p = coordinatorWrapper(async () => terminalCfg(), {
+        paths, spawn: child.spawn, permissionModes: autoModes, env: {}, log: () => {}, signals: bus,
+        onStart: async (_c, _l, stop) => { started.resolve(stop); await finish.promise; },
+      });
+      const stop = await started.promise;
+      expect(stop.aborted).toBe(false);
+      bus.emit('SIGTERM');
+      expect(await p).toBe(143);
+      expect(stop.aborted).toBe(true);
+      expect(lockOf(paths)).toBeUndefined();
+      finish.resolve(); // the step returns after the wrapper ended: runCoordinator must not run
+      await flush();
+      expect(child.count()).toBe(0);
+      expect(existsSync(paths.coordinatorLaunch)).toBe(false);
+    });
+
+    it('without a signal the startup step gets a live stop signal and claude starts after it', async () => {
+      const { paths } = layout();
+      const bus = signalBus();
+      const child = signalledChild();
+      let seen: AbortSignal | undefined;
+      const p = coordinatorWrapper(async () => terminalCfg(), {
+        paths, spawn: child.spawn, permissionModes: autoModes, env: {}, log: () => {}, signals: bus, timer: manualTimer().timer,
+        onStart: async (_c, _l, stop) => { seen = stop; },
+      });
+      await child.spawned;
+      expect(seen?.aborted).toBe(false);
+      bus.emit('SIGTERM'); // forwarded to claude now, not the guard
+      expect(await p).toBe(143);
+      expect(child.kills).toEqual(['SIGTERM']);
     });
 
     it('once claude is spawned the guard is gone: the same signal is forwarded to claude instead', async () => {
