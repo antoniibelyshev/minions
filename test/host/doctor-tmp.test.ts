@@ -109,4 +109,19 @@ describe('runDoctor: /tmp usage in the running container', () => {
     const high = await check(df([GiB, Math.floor(0.9 * GiB)], [100 * GiB, GiB]));
     expect(high.find((c) => c.name === 'container.tmp')).toMatchObject({ status: 'warn', detail: expect.stringMatching(/\/tmp 90% used/) });
   });
+
+  it('lists container.tmp and container.scratch as skipped when the container is not running', async () => {
+    const repo = makeRepo(env.root);
+    await runInit({ path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
+    const down = async (cmd: string, args: string[], _o?: RunOptions): Promise<RunResult> => {
+      const a = args.join(' ');
+      if (cmd === 'docker' && a.startsWith('image inspect')) return { code: 0, stdout: 'x\n', stderr: '' };
+      if (cmd === 'docker' && a.includes(' ps --status running')) return { code: 0, stdout: '', stderr: '' };
+      return { code: 1, stdout: '', stderr: 'unavailable' };
+    };
+    const checks = (await runDoctor({ cwd: repo, probe: dockerUp, runner: down })).checks;
+    for (const n of ['container.tmp', 'container.scratch']) {
+      expect(checks.find((c) => c.name === n)).toMatchObject({ status: 'warn', detail: 'skipped: container not running' });
+    }
+  });
 });

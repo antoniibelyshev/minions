@@ -13,7 +13,7 @@ In:
 - Runtime CLI (inside container): `backlog ready|list|show|create|update|note`,
   `work claim|record|release|list`, `hook stop|pre-agent`, `coordinator`, `status`, `pause`, `resume`.
 - Profiles `project-owner`, `personal-work`, `supervised`; shared + private visibility.
-- Backlog.md backend only. Delivery modes `local` (default; commits on `agent/<slug>` branches in the container clone, fetched to host with `minions export`), and, for the github provider, `branch` and `pull-request` (see "Branch and pull-request delivery"). minions never merges.
+- Backlog.md backend only. Delivery modes `local` (default; commits on `agent/<slug>` branches in the container clone, fetched to host with `minions export`), and, for the github provider, `branch` and `pull-request` (see "Branch and pull-request delivery"). minions never merges pull requests; with `local` delivery the coordinator integrates approved branches into the container's local base (project-owner automatically, personal-work after asking, supervised never).
 - Terminal communication, plus optional Telegram through the official channel plugin (see [telegram.md](telegram.md)).
   `communication.channel` is `terminal`, `telegram`, or `auto` (profile default: Telegram when a bot token is stored
   and the runtime is docker, else terminal); resolved by `resolveChannel` (`src/telegram/channel.ts`), switched with
@@ -930,7 +930,10 @@ Container:
 /state                vol  minions.db, backlog/ (Backlog.md project root), notes/, import/, exports/
 /home/node/.claude    vol  Claude state (CLAUDE_CONFIG_DIR)
 /home/node/.cache     vol  npm and tool caches; tmp/ = TMPDIR (disk-backed, exec-allowed scratch),
-                           tmp/leases/<leaseId>/ = per-lease scratch (removed at lease end and coordinator start)
+                           tmp/leases/<leaseId>/ = per-lease scratch (removed at lease end and coordinator start);
+                           coordinator start also removes other tmp/ entries whose newest mtime (entry + tree,
+                           lstat only) is over 24 h old, keeping leases/ (10 s budget, kept if unsure; only the
+                           default minions-owned root, never an overridden MINIONS_SCRATCH_DIR, never a symlink)
 /home/node, /tmp      tmpfs (noexec; /tmp capped at container.tmpSizeMiB, default 1024 MiB)
 ```
 Volume names: `minions-<first 8 chars of projectId>-{workspace,state,claude,cache}`.

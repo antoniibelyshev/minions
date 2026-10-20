@@ -1,8 +1,8 @@
-import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, lutimesSync, utimesSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
-  briefPath, claimWithBrief, compactClaim, ensureScratchDir, removeLeaseFiles, scratchDirOf, sweepScratch, sweepScratchOnStart, type HandoffPaths,
+  briefPath, claimWithBrief, compactClaim, ensureScratchDir, removeLeaseFiles, scratchDirOf, sweepScratch, sweepScratchOnStart, sweepTmpRoot, type HandoffPaths,
 } from '../../src/runtime/handoff.js';
 import { runtimePaths } from '../../src/runtime/paths.js';
 import { Scheduler } from '../../src/runtime/scheduler.js';
@@ -231,5 +231,119 @@ describe('lease scratch deletion safety', () => {
     expect(brief.scratchDir).toBeUndefined();
     expect(existsSync(briefPath(p, brief.leaseId))).toBe(true);
     expect(readFileSync(p.scratch!, 'utf8')).toBe('not a dir');
+  });
+
+  it('start sweeps stale TMPDIR-root entries, keeping fresh ones and leases/', async () => {
+    const env = makeEnv();
+    const p = paths(env);
+    const root = join(p.scratch!, '..');
+    mkdirSync(p.scratch!, { recursive: true });
+    const old = join(root, 'minions-rt-old');
+    const fresh = join(root, 'minions-rt-fresh');
+    mkdirSync(join(old, 'x'), { recursive: true });
+    mkdirSync(fresh);
+    const outside = join(env.root, 'outside');
+    mkdirSync(outside);
+    writeFileSync(join(outside, 'keep'), 'k');
+    symlinkSync(outside, join(root, 'old-link'));
+    const past = new Date(Date.now() - 48 * 3600_000);
+    utimesSync(join(old, 'x'), past, past);
+    utimesSync(old, past, past);
+    utimesSync(p.scratch!, past, past);
+    const logs: string[] = [];
+    p.tmpRoot = root;
+    await sweepScratchOnStart(env.db, p, (l) => logs.push(l));
+    expect(existsSync(old)).toBe(false);
+    expect(existsSync(fresh)).toBe(true);
+    expect(existsSync(p.scratch!)).toBe(true);
+    expect(existsSync(join(outside, 'keep'))).toBe(true);
+    // A spent budget stops the sweep without throwing.
+    mkdirSync(old);
+    utimesSync(old, past, past);
+    const r = await sweepTmpRoot(root, 'leases', { budgetMs: -1 });
+    expect(r.removed).toEqual([]);
+    expect(existsSync(old)).toBe(true);
+  });
+
+  it('sweep and remove refuse a symlinked leases parent', async () => {
+    const env = makeEnv();
+    const p = paths(env);
+    const target = join(env.root, 'elsewhere');
+    mkdirSync(join(target, 'lease-abc123'), { recursive: true });
+    mkdirSync(join(p.scratch!, '..'), { recursive: true });
+    symlinkSync(target, p.scratch!);
+    const r = await sweepScratch(p, []);
+    expect(r.removed).toEqual([]);
+    expect(r.errors.join()).toMatch(/symlink/);
+    expect((await removeLeaseFiles(p, 'lease-abc123')).join()).toMatch(/symlink/);
+    expect(existsSync(join(target, 'lease-abc123'))).toBe(true);
+  });
+
+  it('no root sweep without a minions-owned tmpRoot (overridden shared scratch dir): old siblings survive', async () => {
+    const env = makeEnv();
+    const p = paths(env);
+    const root = join(p.scratch!, '..');
+    mkdirSync(join(root, 'npm-cache'), { recursive: true });
+    const past = new Date(Date.now() - 48 * 3600_000);
+    utimesSync(join(root, 'npm-cache'), past, past);
+    await sweepScratchOnStart(env.db, p, () => undefined);
+    expect(existsSync(join(root, 'npm-cache'))).toBe(true);
+    expect(runtimePaths({ MINIONS_SCRATCH_DIR: '/x/shared' }).tmpRoot).toBeUndefined();
+    expect(runtimePaths({ MINIONS_STATE_DIR: '/x/state' }).tmpRoot).toBe('/x/state/cache/tmp');
+  });
+
+  it('root sweep ages an entry by its newest descendant, keeps it when the budget runs out, refuses a symlinked root', async () => {
+    const env = makeEnv();
+    const root = join(env.root, 'cache', 'tmp');
+    const past = new Date(Date.now() - 48 * 3600_000);
+    const mk = (name: string, nestedFresh: boolean) => {
+      const d = join(root, name);
+      mkdirSync(join(d, 'sub'), { recursive: true });
+      writeFileSync(join(d, 'sub', 'f'), 'x');
+      for (const x of [join(d, 'sub', 'f'), join(d, 'sub'), d]) if (!(nestedFresh && x.endsWith('f'))) utimesSync(x, past, past);
+      return d;
+    };
+    const kept = mk('fresh-nested', true);
+    const gone = mk('all-old', false);
+    const r = await sweepTmpRoot(root, 'leases');
+    expect(r.removed).toEqual(['all-old']);
+    expect(existsSync(kept)).toBe(true);
+    expect(existsSync(gone)).toBe(false);
+    const again = mk('all-old2', false);
+    const b = await sweepTmpRoot(root, 'leases', { budgetMs: -1 });
+    expect(b.removed).toEqual([]);
+    expect(existsSync(again)).toBe(true);
+    const link = join(env.root, 'rootlink');
+    symlinkSync(root, link);
+    const sl = await sweepTmpRoot(link, 'leases');
+    expect(sl.removed).toEqual([]);
+    expect(sl.errors.join()).toMatch(/symlink/);
+    expect(existsSync(again)).toBe(true);
+  });
+
+  it('root sweep never follows a symlink inside an old entry; empty tmpRoot means no sweep', async () => {
+    const env = makeEnv();
+    const root = join(env.root, 'cache', 'tmp');
+    const outside = join(env.root, 'outside-target');
+    mkdirSync(outside, { recursive: true });
+    writeFileSync(join(outside, 'precious'), 'p');
+    const old = join(root, 'old-entry');
+    mkdirSync(old, { recursive: true });
+    symlinkSync(outside, join(old, 'link'));
+    const past = new Date(Date.now() - 48 * 3600_000);
+    lutimesSync(join(old, 'link'), past, past);
+    utimesSync(old, past, past);
+    const r = await sweepTmpRoot(root, 'leases');
+    expect(r.removed).toEqual(['old-entry']);
+    expect(existsSync(old)).toBe(false);
+    expect(readFileSync(join(outside, 'precious'), 'utf8')).toBe('p');
+    const env2 = makeEnv();
+    const p = paths(env2);
+    const old2 = join(p.scratch!, '..', 'old2');
+    mkdirSync(old2, { recursive: true });
+    utimesSync(old2, past, past);
+    p.tmpRoot = '';
+    await sweepScratchOnStart(env2.db, p, () => undefined);
+    expect(existsSync(old2)).toBe(true);
   });
 });

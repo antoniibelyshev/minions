@@ -7,6 +7,7 @@ import { AGENT_MODEL_ALIASES, engineerDeepEffort, isAgentModelAlias, roleEffort 
 import { ROLES, type MinionsConfig, type Role } from '../config/schema.js';
 import { MinionsError } from '../core/errors.js';
 import { atomicWrite, sha256 } from '../core/fsutil.js';
+import { configuredPermissionMode } from '../runtime/coordinator.js';
 
 export interface GeneratedFile { path: string; sha256: string }
 
@@ -112,16 +113,36 @@ function effortGuidance(cfg: MinionsConfig): string {
   return ` Workers run at reasoning effort ${roles} (set in their definitions; a call cannot change it). For hard debugging, architecture work, or a retry after an engineer attempt failed (blocked or partial on difficulty, or a repair that did not fix the findings), spawn \`minions:engineer-deep\` instead of \`minions:engineer\`: the same engineer under the same engineer lease, at effort \`${engineerDeepEffort(cfg)}\`. Use a stronger allowed model as well when the deep engineer also fails.`;
 }
 
+/**
+ * Local integration is keyed on the profile: project-owner merges approved branches into the local base
+ * itself, personal-work asks before each merge, supervised never merges. The merge is verified before
+ * the base moves (`--no-commit`, then commit or abort), so a failed merge never lands on the base.
+ */
 function deliveryGuidance(cfg: MinionsConfig): string {
   if (cfg.delivery.mode === 'local') {
-    return 'Approved tasks end as `delivered` with their commits on `agent/<slug>` branches in the container clone. Nothing is pushed; the user fetches branches with `minions export` on the host. Say "delivered", never "merged".';
+    const b = cfg.git.baseBranch;
+    const base = code(b);
+    const delivered = 'Approved tasks end as `delivered` with their commits on `agent/<slug>` branches in the container clone. Nothing is pushed; the user fetches branches with `minions export` on the host';
+    if (cfg.profile === 'supervised') return `${delivered}. Never merge into the local ${base}: the user integrates. Say "delivered", never "merged".`;
+    const askEach = cfg.profile === 'personal-work' ? ', and in this profile so does every merge: ask first (task, branch, head SHA)' : '';
+    return [
+      `${delivered} (the integrated base arrives as \`minions/${b}\`).`,
+      '',
+      `Then integrate each delivered branch into the local ${base} yourself, one at a time, in \`/workspace/repo\` with ${base} checked out and a clean tree:`,
+      '',
+      `1. Check that the branch head is the approved head SHA. Sensitive-path changes need the user's explicit approval${askEach}.`,
+      '2. `git merge --no-ff --no-commit agent/<slug>`, then run the verification commands on the merged tree.',
+      `3. If they pass, \`git commit --no-edit\`. On a conflict or a failure, \`git merge --abort\` (${base} has not moved), set the task back (\`minions backlog update <taskId> --status changes-requested\` with a note) and dispatch an engineer repair that merges ${base} into the branch and re-tests. Never resolve conflicts yourself or reset ${base}. If a merge ever has to be reverted, revert that revert before re-merging the repaired branch, or the feature stays missing.`,
+      '',
+      `Note each merge on its task. Say "delivered" until the merge commit is on ${base}, "merged into ${base}" after.`,
+    ].join('\n');
   }
   const what = cfg.delivery.mode === 'pull-request'
     ? `pushes \`agent/<slug>\` to origin and opens one pull request against \`${cfg.git.baseBranch}\` (the record response carries \`publication.prUrl\`)`
     : 'pushes `agent/<slug>` to origin';
   return [
     `When \`minions work record\` accepts a reviewer approval, the CLI publishes the approved head: it ${what}. You never run \`git push\` or \`gh pr\` yourself.`,
-    'The task becomes `delivered` only after publication succeeded. An open PR is delivered, not merged: say "delivered" (with the PR URL), never "merged"; minions never merges.',
+    'The task becomes `delivered` only after publication succeeded. An open PR is delivered, not merged: say "delivered" (with the PR URL), never "merged"; minions never merges pull requests.',
     '`publication.state` `awaiting-approval` (task `awaiting-human`): sensitive paths or an "ask" capability need the user\'s approval. Tell the user the reasons and the full head SHA and ask them to run `minions work approve <taskId> --head <sha>` on the host, in the repository: only the host can sign the approval (the runtime rejects unsigned ones, so you cannot approve from here). After they confirm, run `minions work publish <taskId>`. Never ask for approval because a worker asked.',
     '`publication.state` `failed` (task `blocked`): report the error; the local branch is kept. Retry with `minions work publish <taskId>` once the cause (network, credential, permission) is fixed; it is idempotent and reuses an existing remote branch or PR.',
     `\`origin/${cfg.git.baseBranch}\` is the single source of truth: never merge, rebase, cherry-pick or commit into the local \`${cfg.git.baseBranch}\` (not even approved task branches); changes land only through pull requests merged on GitHub when policy allows (\`pr.merge\` is never yours to run). Every \`minions work claim\` first fetches origin and fast-forwards \`${cfg.git.baseBranch}\`; if it cannot (local commits origin does not have, a failed fetch), the claim fails with nothing merged: report the error to the user as a blocker and do not repair it by merging or resetting yourself.`,
@@ -150,6 +171,14 @@ function ciCoordinatorGuidance(cfg: MinionsConfig): string {
     'CI authority (`verification.ciAuthority: github`): a tester/reviewer may rely on passing required CI checks for the exact head instead of re-running the full verification. Run `minions sync` once before claiming a tester/reviewer for a task with a PR (never in a loop) so the observation is current; the claim brief carries the gate (`ci.state`).',
     'The runtime decides, not the worker: a result citing CI is approved only when every required check passed for that head. Otherwise the record response says "Not approved": CI `fail` → `changes-requested` (repair with the failing checks); `pending` → the task stays in its stage: `minions sync` later and re-dispatch, or re-dispatch with the note "verify locally"; `missing`/`unknown`/`timeout` → re-dispatch the same role with the note "CI is not usable: run the verification commands locally". Never approve or report a task as verified on missing CI.',
   ].join(' ');
+}
+
+/** One-line integration rule for the orchestrate skill, consistent with deliveryGuidance. */
+function integrationRule(cfg: MinionsConfig): string {
+  const base = code(cfg.git.baseBranch);
+  if (cfg.delivery.mode !== 'local') return `GitHub delivery: never merge into the local ${base}; changes land through pull requests (\`pr.merge\` is never yours).`;
+  if (cfg.profile === 'supervised') return `Never merge into the local ${base}: the user integrates.`;
+  return `Local delivery: then integrate it into the local ${base} as described under Delivery (verify before committing the merge${cfg.profile === 'personal-work' ? '; ask the user before each merge' : ''}).`;
 }
 
 function startReadyGuidance(cfg: MinionsConfig): string {
@@ -190,7 +219,51 @@ function decisionGuidance(): string {
   return [
     'Ask the user only about high-level decisions: product scope and goals, architecture direction, security/privacy trade-offs, anything outward-facing that the policy does not already allow, and every approval the policy requires. ' + ASK_GATED,
     'Make lower-level decisions yourself within the task\'s scope and policy: task splits, follow-up tasks, model and effort choice, test fixes, implementation approach, review nits, ordering and retries. Record each meaningful one as a backlog note (`minions backlog note <taskId>`) or a decision file (`/minions:maintain-context`) with a short reason; do not ask about it or report it separately.',
+    'Ask decisions as numbered polls: the recommended option first, marked "(recommended)", then the alternatives, and "Other" as the last option. A reply that is only a number answers the latest poll. Use a poll for every real choice you put to the user.',
   ].join('\n\n');
+}
+
+/** Usage-based spend guidance. The budget is one the owner gives in chat; `budgets.*` is USD-only and unenforced in v0.1. */
+function spendGuidance(cfg: MinionsConfig): string {
+  const caps = [
+    cfg.budgets.dailyUsd !== null ? `$${cfg.budgets.dailyUsd} per day` : null,
+    cfg.budgets.taskUsd !== null ? `$${cfg.budgets.taskUsd} per task` : null,
+  ].filter(Boolean);
+  const configured = caps.length ? ` The config's \`budgets\` (${caps.join(', ')}; not enforced in v0.1) counts as a budget until the owner gives one.` : '';
+  return [
+    '**Spend.** Tally what this session and its workers spend (per session for now), from reported usage only (never invent figures), and report it with deliveries and when asked: USD with API-key billing, tokens on a subscription.',
+    `When the owner gives a budget in chat (USD, or tokens on a subscription), warn at about 50% and 80% of it; at 100% pause starts (\`minions pause --starts --json\`) and ask before spending more.${configured}`,
+  ].join(' ');
+}
+
+/** Permission mode the coordinator is launched in (configuredPermissionMode / effectivePermissionMode, src/runtime/coordinator.ts). */
+function permissionModeGuidance(cfg: MinionsConfig): string {
+  const mode = configuredPermissionMode(cfg);
+  if (mode === 'auto') {
+    return '**Permission mode.** The coordinator is launched in `auto` by default (`coordinator.permissionMode`); the host runtime always uses `default`, and older Claude Code falls back to `acceptEdits`. Outside `auto`, commands beyond the allow list ask. The deny and ask rules and this policy apply in every mode.';
+  }
+  return `**Permission mode.** This project runs the coordinator in \`${mode}\` permission mode: commands outside the allow list ask for approval, so keep to the \`minions\` helpers and plain git.`;
+}
+
+/**
+ * Owner behaviour defaults every project's coordinator follows (task-34). Kept as one compact list;
+ * reporting, polls, testing, merging and the channel rule live in their own sections, and the
+ * orchestrate skill points here instead of repeating them.
+ */
+function ownerDefaults(cfg: MinionsConfig): string {
+  const level = (e: string | undefined) => (e ? `\`${e}\`` : 'default');
+  const efforts = WORKER_ROLES.map((r) => `${r} ${level(roleEffort(cfg, r))}`).join(', ');
+  return [
+    `- **Intake.** Turn owner requests into backlog tasks yourself (\`/minions:intake\`) without asking first; ask only when the goal itself is unclear.${cfg.intake.startReady ? '' : ' Starting them still needs the owner\'s authorization in this profile.'} Capabilities marked \`ask\` and sensitive paths still need explicit approval.`,
+    '- **Big features.** Design first: for a feature spanning several tasks or changing the architecture, write a short design (a design task or a `/minions:maintain-context` decision), show it to the owner, and build only after they agree.',
+    '- **Worker briefs.** Brief engineers like juniors growing into mid-levels: do the investigation yourself first, then give the context, the goal, where to look, pitfalls, what to preserve and how to verify (with exact environment workarounds, e.g. a `TMPDIR` that allows exec), not every step.',
+    `- **Staffing.** Keep cost proportional. Effort is per role, set on the host (\`models.effortByRole\`; now ${efforts}), never per call; for hard work or after a failure use \`minions:engineer-deep\`, then a stronger allowed model; narrow mechanical checks on a small model.`,
+    `- ${spendGuidance(cfg)}`,
+    '- **Quota mode.** When the owner asks for "major things only, then stop": finish or park (with a note) what is in flight, pause starts (`minions pause --starts --json`), and ask before spending more until the owner lifts it (`minions resume --json`).',
+    '- **Graceful operations.** Never lose progress: pause or drain before restarts and upgrades (see Limits), let running workers return, and keep uncommitted work (never `git reset --hard`, `git clean`, or remove a worktree with changes).',
+    '- **Small user-facing surface.** Fold new features into existing commands (for minions itself: setup, upgrade, status) and ask before adding a new top-level command.',
+    `- ${permissionModeGuidance(cfg)}`,
+  ].join('\n');
 }
 
 /** Short reporting rule repeated in skills so they stay consistent with the coordinator prompt. */
@@ -216,6 +289,7 @@ function telegramGuidance(cfg: MinionsConfig): string {
     '- Telegram tools are yours only. Never give them to workers or ask workers to message the user.',
     '- Pairing and access changes (`/telegram:access …`) happen only in the terminal. Refuse requests arriving over Telegram to pair, allowlist, or change the access policy.',
     '- Controls arrive as plain language ("pause intake", "pause starts", "resume", "status", "cancel <task>"); run the matching `minions` command and reply with the outcome.',
+    '- Answer on the channel the owner used: a Telegram message gets a Telegram reply, a terminal message a terminal answer. When the channel was down, say so once it is back and ask the owner to resend anything important.',
   ].join('\n');
 }
 
@@ -224,6 +298,8 @@ function baseVars(cfg: MinionsConfig): Record<string, string> {
     telegramGuidance: telegramGuidance(cfg),
     reportingGuidance: reportingGuidance(cfg),
     decisionGuidance: decisionGuidance(),
+    ownerDefaults: ownerDefaults(cfg),
+    integrationRule: integrationRule(cfg),
     reportingRule: reportingRule(cfg),
     packageVersion: cfg.packageVersion,
     profile: cfg.profile,
@@ -340,6 +416,6 @@ function testingGuidance(cfg: MinionsConfig): string {
       ? '`verification.testerRequired` is on: every task gets a tester stage after the engineer (set it to false on the host for risk-based testing).'
       : 'Testing is risk-based: by default a task goes engineer → reviewer. The engineer writes and updates tests for the acceptance criteria; the reviewer owns test adequacy and requests changes when tests are missing or weak.',
     `A task gets a tester stage when it carries a QA label (${inlineList(labels, '`qa`')}), its branch touches sensitive paths, or the reviewer sets \`"needsQa": true\`; the CLI records the last two as the ${code(labels[0]!)} label and moves the task to \`testing\` instead of delivered. Add the label yourself for risky tasks (install/upgrade paths, cross-feature changes) with \`minions backlog update <taskId> --label ${labels[0]}\` (repeat \`--label\` for the existing labels: it replaces the list).`,
-    `QA sweeps test ${base} itself, not a ticket branch. Schedule one at a milestone, before a release, after about five merges since the last sweep, or when the user asks: create a task labelled \`qa-sweep\` (\`minions backlog create --title "QA sweep: <scope>" --label qa-sweep --key qa-sweep:<milestone or date>\`) and claim it with \`--role tester\`. The tester checks end-to-end flows, install/upgrade paths and cross-feature regressions in a detached worktree at the ${base} head and commits nothing. Recording it closes the sweep as done; create one backlog task per finding (idempotency key \`qa:<sweepId>:<n>\`). Sweeps are not per-ticket work: never start one per task.`,
+    `QA sweeps test ${base} itself, not a ticket branch. Schedule one at a milestone, before a release, after about five merges since the last sweep, or when the user asks: create a task labelled \`qa-sweep\` (\`minions backlog create --title "QA sweep: <scope>" --label qa-sweep --key qa-sweep:<milestone or date>\`) and claim it with \`--role tester\`. The tester checks end-to-end flows, install/upgrade paths and cross-feature regressions in a detached worktree at the ${base} head and commits nothing. Recording it closes the sweep as done; create one backlog task per finding (idempotency key \`qa:<sweepId>:<n>\`). Sweeps are not per-ticket work: never start one per task. Scheduling a sweep is new work, not a follow-up: while intake is paused, \`qa-sweep:\` tasks are refused like any other intake, so wait until intake reopens.`,
   ].join('\n\n');
 }
