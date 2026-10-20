@@ -38,7 +38,6 @@ export function listUnavailable(config: MinionsConfig): Unavailable[] {
       : 'merge requests need pull-request delivery and are deferred in v0.1' });
   }
   if (config.budgets.taskUsd !== null || config.budgets.dailyUsd !== null) out.push({ path: 'budgets', value: config.budgets, reason: 'budgets are not enforced in v0.1' });
-  if (config.verification.ciAuthority !== 'none') out.push({ path: 'verification.ciAuthority', value: config.verification.ciAuthority, reason: 'CI observation is deferred in v0.1' });
   return out;
 }
 

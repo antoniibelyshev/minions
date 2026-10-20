@@ -25,6 +25,10 @@ The brief's `kind` says which job this is.
 - Add or improve tests within the task's scope (regressions, edge cases, integration). Do not change production code; if it is wrong, report it. Commit test changes on the branch and report `headSha` after your own commits.
 - Status: `complete` when all criteria have passing evidence; `needs_changes` when production code is wrong or criteria are not met (describe each defect in `findings` with how to reproduce); `blocked`/`partial` as below.
 
+## CI evidence
+
+{{ciWorkerGuidance}}
+
 ## Allowed actions
 
 Read and search the code; run builds, tests, linters and the project's install/upgrade flows in scratch locations; for task QA only, create or edit test files and fixtures and `git add`/`git commit` on your branch.

@@ -9,6 +9,7 @@ import { VERSION } from '../core/version.js';
 import { DEFAULT_REFRESH_MINUTES, authOf, containerEnv, describeSource, expandHome, isKeyAuth, maskValue, resolveOnPath, secretStatus, type ClaudeAuth } from './auth.js';
 import type { MinionsConfig } from '../config/schema.js';
 import { ciSetupPlan, fetchApi, requiredChecksStatus, type RequiredChecksReport } from '../runtime/ci.js';
+import { DEFAULT_CI_PENDING_TIMEOUT_MINUTES } from '../runtime/ci-gate.js';
 import { clearStaleSecrets, secretCopiesExist, githubCredentialStatus, readGithubToken, githubRepoFromRemote, telegramCredentialStatus, type CredentialStatus, type Fetch, type TelegramCredentialStatus } from './credentials.js';
 import { dockerProbe, type DockerProbe } from './discovery.js';
 import { Compose, buildFingerprint, imageBuildLabel, tmpSizeMiB, type Runner } from './docker.js';
@@ -214,6 +215,43 @@ export function requiredChecksReadiness(
   const what = `no required status checks on ${base}${workflows === 0 ? ' and no CI workflows' : workflows ? ` (${workflows} workflow(s), none required)` : ''}`;
   if (flag) return { name, status: 'warn', detail: `${what}, but delivery.requiredChecksConfigured is true (never treated as zero required checks); ${noMerge}`, hint: `Set delivery.requiredChecksConfigured to false, or configure required checks:\n       ${hint}` };
   return { name, status: 'unavailable', detail: `${what}: ${noMerge}`, hint };
+}
+
+/**
+ * ci.authority: whether verification.ciAuthority "github" can take effect. Ready only when the base has
+ * required status checks (read-only observation); otherwise every stage falls back to local
+ * verification (the gate never approves on missing or unknown CI). Never 'fail'.
+ */
+export function ciAuthorityReadiness(
+  config: Pick<MinionsConfig, 'delivery' | 'verification' | 'git'> | null,
+  rc: RequiredChecksReport | null,
+  ctx: { onGitHub: boolean; unknownReason?: string },
+): Check {
+  const name = 'ci.authority';
+  if (!config) return { name, status: 'unavailable', detail: 'configuration not loaded' };
+  const base = config.git.baseBranch;
+  const timeout = config.verification.ciPendingTimeoutMinutes ?? DEFAULT_CI_PENDING_TIMEOUT_MINUTES;
+  const required = rc?.state === 'configured' ? rc.requiredChecks : null;
+  if (config.verification.ciAuthority !== 'github') {
+    return required && ctx.onGitHub
+      ? { name, status: 'ok', detail: `verification.ciAuthority none: stages verify locally; required checks on ${base} (${required.join(', ')}) could serve as CI evidence`,
+          hint: 'Set verification.ciAuthority to "github" to let tester/reviewer stages rely on passing required checks for the reviewed head.' }
+      : { name, status: 'ok', detail: 'verification.ciAuthority none: stages verify locally' };
+  }
+  const fallback = 'stages fall back to local verification (CI never approves without readable, passing required checks)';
+  if (!ctx.onGitHub) return { name, status: 'warn', detail: `verification.ciAuthority github, but there is no GitHub remote: ${fallback}`, hint: 'Add a github.com origin and run `minions setup github`, or set verification.ciAuthority to "none".' };
+  if (config.delivery.mode !== 'pull-request') {
+    return { name, status: 'warn', detail: `verification.ciAuthority github, but delivery.mode is ${config.delivery.mode}: no pull request runs CI for task heads; ${fallback}`, hint: 'Run `minions setup` and choose pull-request delivery.' };
+  }
+  if (!rc || rc.state === 'unknown') {
+    return { name, status: 'warn', detail: `not ready: required checks on ${base} could not be read (${ctx.unknownReason ?? rc?.errors.join('; ') ?? 'not checked'}); ${fallback}`,
+      hint: 'Rerun doctor with the container running and a GitHub token that can read the repository (`minions auth github`).' };
+  }
+  if (!required) {
+    return { name, status: 'warn', detail: `not ready: no required status checks on ${base}; ${fallback}`,
+      hint: `Mark the CI check required for ${base} (branch protection or a ruleset: "Require status checks to pass"), then rerun doctor.` };
+  }
+  return { name, status: 'ok', detail: `ready: required checks on ${base} (${required.join(', ')}) count as CI evidence for the exact head observed by \`minions sync\`; pending timeout ${timeout} min` };
 }
 
 /** telegram.credential: ok / missing / invalid. Never 'fail': terminal mode must stay usable without Telegram. */
@@ -483,6 +521,7 @@ export async function runDoctor(opts: { cwd: string; runner?: Runner; probe?: Do
 
   add('merge.readiness', ...mergeReadiness(effective, github));
   checks.push(requiredChecksReadiness(effective, ci.rc, { onGitHub: github.onGitHub, unknownReason: ci.reason }));
+  checks.push(ciAuthorityReadiness(effective, ci.rc, { onGitHub: github.onGitHub, unknownReason: ci.reason }));
   add('features', 'unavailable', DEFERRED_FEATURES.join(', '));
   add('package', 'ok', `minions ${VERSION}`);
   return { healthy: !checks.some((c) => c.status === 'fail'), projectId, checks };

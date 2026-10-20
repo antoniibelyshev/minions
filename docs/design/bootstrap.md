@@ -482,6 +482,51 @@ Decision record for required-checks readiness, `minions sync` and CI setup guida
   moved. A PR head differing from the approved publication head is reported as a warning. Per-task gh
   failures are reported and the command exits 1; nothing is thrown away.
 
+## CI as verification authority
+
+Decision record for `verification.ciAuthority: "github"` (`src/runtime/ci-gate.ts`, the tester/reviewer
+gate in `src/runtime/scheduler.ts`, `ci.authority` in `src/host/doctor.ts`). Owner direction
+2026-10-19: pull requests are the primary path and CI is trusted, so tester/reviewer stages need not
+re-run the full verification when CI already proved it for the same commit.
+
+- **One gate, fail closed.** `evaluateCiGate` answers one question: did every *required* check of the
+  base branch pass for exactly this head? Inputs: required checks read now through read-only GETs
+  (branch protection + rulesets, as in "CI awareness"), and `minions sync` observations (`ci`
+  evidence) recorded for that head SHA. States: `pass`; `fail` (a required check failed); `pending`
+  (a required check is running or not reported yet, within `verification.ciPendingTimeoutMinutes`,
+  default 60, counted from the first observation of the head); `timeout`; `missing` (no observation
+  of this head); `unknown` (required checks unreadable or none configured, never treated as zero
+  required checks; an observation without per-check results; a skipped required check); `disabled`
+  (`ciAuthority: none`). Only `pass` is evidence. Observations of an earlier head never carry over.
+  Checks that are not required are ignored. The same gate (`Scheduler.ciGate(taskId, head)`) is what
+  the merge gate of task-1.9 is meant to reuse for the approved head.
+- **Stages.** The claim brief of a tester/reviewer carries the gate for `expectedHead` (`ci`). A
+  result may cite CI as `checks[]` entries with `"source": "ci"` (the check name as `command`,
+  outcome `pass`/`fail`). The runtime re-evaluates the gate when recording: `pass` → the stage is
+  satisfied (each `ci` entry must name a required check that passed, else a correctable validation
+  error); `fail` → no approval, task → `changes-requested` (a reviewer repair cycle); any other
+  state → falls back to the result's own passing local checks if it has any, otherwise no approval and
+  the task stays in its stage (`testing`/`reviewing`) for a re-run with local verification. A
+  blocked stage records its role evidence as `ci-<state>`, never `complete`, so publication cannot
+  treat it as approved; every evaluation is recorded as `ci-gate` evidence.
+- **Result contract.** `checks[].source` is optional (`local` default). `ci` entries are rejected
+  without `ciAuthority: github`, from engineers (they always run targeted local checks), and with
+  outcome `skipped`. A worker's claim about CI is never evidence by itself.
+- **Sync.** With `ciAuthority: github`, `minions sync` also reports the gate per PR head. Observations
+  now include per-check results (`ci.checks[]`: name and pass/fail/pending/skipped).
+- **Readiness.** `minions doctor` reports `ci.authority`: ready only with `ciAuthority: github`,
+  pull-request delivery, and readable required checks; otherwise `warn` with what is missing
+  (never `fail`). With `ciAuthority: none` it is `ok` and hints when required checks exist.
+- **When CI evidence exists.** CI runs on the pull request, which is opened when the reviewer approves.
+  CI evidence therefore applies to heads that are already on a PR (re-review or QA of a published
+  head, and the merge gate); a head that was never pushed has no observation (`missing`) and is
+  verified locally. Pushing heads for CI before review is not part of this decision.
+- **Setup default (PR-first).** With a GitHub remote, a stored token and `git.push` not denied,
+  `minions setup` (and `minions setup github`, the init wizard) offers `pull-request` as the default
+  delivery answer, also to a project still on `local`; `local` and `branch` stay selectable.
+  Without GitHub or a token nothing is offered and delivery stays `local`. Non-interactive runs keep
+  the configured mode (project-owner defaults to `pull-request` when the token exists).
+
 ## GitHub intake sync
 
 Decision record for GitHub-filtered intake (`src/runtime/intake-sync.ts`, config `intake.github`).

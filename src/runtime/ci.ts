@@ -16,6 +16,7 @@ import { redact } from '../core/output.js';
 import type { RuntimeDb } from './db.js';
 import { normalizeGithubRemote, type GitFn } from './github.js';
 import { realGh, type GhFn } from './publish.js';
+import { ciTimeoutOf, evaluateCiGate, formatCiGate, type CiGate } from './ci-gate.js';
 
 // ---------------------------------------------------------------- read-only API access
 
@@ -119,6 +120,15 @@ export async function requiredChecksStatus(api: ApiGet, repository: string, base
   return { repository, baseBranch, state, requiredChecks, protection, rulesets, workflows, errors };
 }
 
+/** Required checks of the base for the workspace origin via read-only `gh api` GETs; null when origin is not on GitHub. */
+export async function readRequiredChecks(repo: string, cfg: Pick<MinionsConfig, 'git'>, deps: { git: GitFn; gh: GhFn }): Promise<RequiredChecksReport | null> {
+  const o = await deps.git(repo, ['config', '--get', 'remote.origin.url'], true);
+  const https = o.code === 0 ? normalizeGithubRemote(o.stdout.trim()) : null;
+  if (!https) return null;
+  const repository = https.replace(/^https:\/\/github\.com\//, '').replace(/\.git$/, '');
+  return requiredChecksStatus(ghApi(deps.gh), repository, cfg.git.baseBranch);
+}
+
 // ---------------------------------------------------------------- setup guidance
 
 /**
@@ -144,7 +154,13 @@ export function ciSetupPlan(o: { hasWorkflows: boolean | null; requiredChecks: '
 // ---------------------------------------------------------------- check rollup
 
 export type CiState = 'no-checks' | 'awaiting-ci' | 'passing' | 'failing';
-export interface CiSummary { state: CiState; total: number; passed: number; failed: string[]; pending: string[] }
+/** Per-check result. pass = SUCCESS / NEUTRAL; skipped is kept apart because it is never CI evidence. */
+export type CheckState = 'pass' | 'fail' | 'pending' | 'skipped';
+export interface CiSummary {
+  state: CiState; total: number; passed: number; failed: string[]; pending: string[];
+  /** Every check run / status context by name (the CI evidence gate matches required checks against these). */
+  checks: { name: string; state: CheckState }[];
+}
 
 interface RollupItem { __typename?: string; name?: string; context?: string; status?: string; conclusion?: string | null; state?: string }
 
@@ -154,23 +170,26 @@ const FAILED_CONCLUSIONS = new Set(['FAILURE', 'TIMED_OUT', 'CANCELLED', 'ACTION
 export function summarizeChecks(rollup: unknown): CiSummary {
   const items = Array.isArray(rollup) ? (rollup as RollupItem[]) : [];
   const failed: string[] = [], pending: string[] = [];
+  const checks: CiSummary['checks'] = [];
   let passed = 0;
+  const add = (name: string, state: CheckState) => {
+    checks.push({ name, state });
+    if (state === 'fail') failed.push(name); else if (state === 'pending') pending.push(name); else passed++;
+  };
   for (const it of items) {
     const name = String(it.name ?? it.context ?? 'check');
     if (it.__typename === 'StatusContext' || (it.state !== undefined && it.status === undefined)) {
       const s = String(it.state ?? '').toUpperCase();
-      if (s === 'SUCCESS') passed++;
-      else if (s === 'FAILURE' || s === 'ERROR') failed.push(name);
-      else pending.push(name);
+      add(name, s === 'SUCCESS' ? 'pass' : s === 'FAILURE' || s === 'ERROR' ? 'fail' : 'pending');
       continue;
     }
-    if (String(it.status ?? '').toUpperCase() !== 'COMPLETED') { pending.push(name); continue; }
+    if (String(it.status ?? '').toUpperCase() !== 'COMPLETED') { add(name, 'pending'); continue; }
     const c = String(it.conclusion ?? '').toUpperCase();
-    if (FAILED_CONCLUSIONS.has(c)) failed.push(name);
-    else passed++; // SUCCESS, NEUTRAL, SKIPPED
+    // The rollup counts SUCCESS, NEUTRAL and SKIPPED as passed; per check, skipped stays apart (never CI evidence).
+    add(name, FAILED_CONCLUSIONS.has(c) ? 'fail' : c === 'SKIPPED' ? 'skipped' : 'pass');
   }
   const state: CiState = !items.length ? 'no-checks' : failed.length ? 'failing' : pending.length ? 'awaiting-ci' : 'passing';
-  return { state, total: items.length, passed, failed, pending };
+  return { state, total: items.length, passed, failed, pending, checks };
 }
 
 // ---------------------------------------------------------------- sync
@@ -186,6 +205,8 @@ export interface SyncTaskResult {
   /** Observation differs from the last one recorded for this head (a note was added). */
   changed: boolean;
   statusChange?: { from: TaskStatus; to: TaskStatus };
+  /** verification.ciAuthority github: the CI evidence gate for the PR head (src/runtime/ci-gate.ts). */
+  gate?: CiGate;
   warnings: string[];
   error?: string;
 }
@@ -216,12 +237,20 @@ export async function syncTasks(deps: SyncDeps, opts: { taskIds?: string[] } = {
   const tasks = all.filter((t) => t.prUrl && (want ? want.has(t.id) : !SKIP_STATUSES.includes(t.status)));
   const leased = new Set(db.activeLeases().map((l) => l.task_id));
   const out: SyncTaskResult[] = [];
-  for (const task of tasks) out.push(await syncOne(task, { db, backlog, config, gh, leased }));
+  // CI authority: required checks per repository, read once per sync (read-only GETs).
+  const required = new Map<string, Promise<RequiredChecksReport | null>>();
+  const requiredFor = (prUrl: string) => {
+    const repository = /^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/\d+/.exec(prUrl)?.[1];
+    if (!repository) return Promise.resolve(null);
+    if (!required.has(repository)) required.set(repository, requiredChecksStatus(ghApi(gh), repository, config.git.baseBranch).catch(() => null));
+    return required.get(repository)!;
+  };
+  for (const task of tasks) out.push(await syncOne(task, { db, backlog, config, gh, leased, requiredFor }));
   db.addEvent('sync', null, { tasks: out.length, failed: out.filter((t) => t.error).length });
   return { tasks: out, synced: out.filter((t) => !t.error).length, failed: out.filter((t) => t.error).length };
 }
 
-async function syncOne(task: Task, x: { db: RuntimeDb; backlog: BacklogAdapter; config: MinionsConfig; gh: GhFn; leased: Set<string> }): Promise<SyncTaskResult> {
+async function syncOne(task: Task, x: { db: RuntimeDb; backlog: BacklogAdapter; config: MinionsConfig; gh: GhFn; leased: Set<string>; requiredFor: (prUrl: string) => Promise<RequiredChecksReport | null> }): Promise<SyncTaskResult> {
   const prUrl = task.prUrl!;
   const res: SyncTaskResult = { taskId: task.id, prUrl, changed: false, warnings: [] };
   const r = await x.gh(['pr', 'view', prUrl, '--json', PR_FIELDS]);
@@ -244,6 +273,10 @@ async function syncOne(task: Task, x: { db: RuntimeDb; backlog: BacklogAdapter; 
     x.db.addEvidence({ task_id: task.id, head_sha: pr.headRefOid, kind: 'ci', config_revision: x.config.configRevision, outcome, details_json: JSON.stringify(details) });
   }
   res.changed = !prev || prev.outcome !== outcome;
+  if (x.config.verification.ciAuthority === 'github') {
+    res.gate = evaluateCiGate({ ciAuthority: 'github', head: pr.headRefOid, required: await x.requiredFor(prUrl), now: new Date(),
+      timeoutMinutes: ciTimeoutOf(x.config), observations: x.db.evidenceFor(task.id, pr.headRefOid, 'ci') });
+  }
   if (res.changed) {
     await x.backlog.addNote(task.id, `minions sync: ${describeObservation({ prState, ci, headSha: pr.headRefOid })}. ${prState === 'OPEN' ? 'Not merged; minions never merges.' : ''}`.trim());
   }
@@ -269,7 +302,7 @@ export function formatSync(r: SyncReport): string {
   const L = r.tasks.map((t) => t.error
     ? `${t.taskId}: error: ${t.error}`
     : `${t.taskId}: ${describeObservation({ prState: t.prState!, ci: t.ci!, headSha: t.headSha! })}${t.statusChange ? `; status ${t.statusChange.from} -> ${t.statusChange.to}` : ''}${t.changed ? '' : ' (unchanged)'}  ${t.prUrl}` +
-      t.warnings.map((w) => `\n  warning: ${w}`).join(''));
+      (t.gate ? `\n  ${formatCiGate(t.gate)}` : '') + t.warnings.map((w) => `\n  warning: ${w}`).join(''));
   L.push(`synced ${r.synced}, failed ${r.failed}`);
   return L.join('\n');
 }
