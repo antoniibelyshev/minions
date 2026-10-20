@@ -1,6 +1,6 @@
 import { readFile } from 'node:fs/promises';
 import { Option, type Command } from 'commander';
-import { setIdempotencyStore, setReadyContext } from '../backlog/commands.js';
+import { setIdempotencyStore, setIntakePausedContext, setReadyContext } from '../backlog/commands.js';
 import { openBacklog, writeBacklogConfig } from '../backlog/factory.js';
 import type { BacklogAdapter, IdempotencyStore } from '../backlog/types.js';
 import { validateConfig } from '../config/resolve.js';
@@ -173,6 +173,7 @@ export function register(program: Command): void {
       const d = getDb();
       return { leased: new Set(d.activeLeases().map((l) => l.task_id)), paused: d.paused().starts };
     });
+    setIntakePausedContext(() => getDb().paused().intake);
   }
 
   // work

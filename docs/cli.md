@@ -41,7 +41,7 @@ those choices. `minions doctor` is the same check as `minions status --check`.
 | `minions runtime show` / `set <docker\|host>` | Host-side agent runtime: Docker (default) or the less safe host runtime (`--global`, `--yes`, `--dry-run`; see [Running without Docker](../README.md#running-without-docker)) |
 | `minions import` | Refresh the container workspace from the committed base branch (Git bundle) |
 | `minions export` | Fetch `agent/*` branches into `refs/remotes/minions/*` in your repository; local branches are untouched |
-| `minions pause` / `resume` | Persist scheduling controls |
+| `minions pause` / `resume` | Persist scheduling controls. `--intake` / `--starts` select one (default: both). Paused starts stop new task starts; paused intake makes `minions backlog create` refuse new work from requests or tickets (`POLICY_DENIED`), while creation from existing work stays allowed: a `--parent`, a `split:` / `followup:` / `qa:` idempotency key, or provenance `observed-result` (keys starting with `intake:` are always refused) |
 
 ## Internal commands
 
