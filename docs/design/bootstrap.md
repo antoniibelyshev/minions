@@ -30,7 +30,8 @@ In:
 
 Deferred (report as unavailable): GitHub Issues backend, auto-merge and merge requests,
 review publication, config plan/apply transactions, backlog migration, upgrade plan and schema migration,
-budgets, companion containers.
+budgets, companion containers, GitHub App short-lived tokens (the fine-grained PAT in "GitHub credential"
+is used instead), CODEOWNERS mapping of sensitive paths, shared backlog versioned in Git.
 
 ## Recorded low-impact decisions
 
