@@ -1,9 +1,10 @@
-import { existsSync, mkdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { isAbsolute, join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
-  briefPath, claimWithBrief, compactClaim, scratchDirOf, sweepScratch, sweepScratchOnStart, type HandoffPaths,
+  briefPath, claimWithBrief, compactClaim, ensureScratchDir, removeLeaseFiles, scratchDirOf, sweepScratch, sweepScratchOnStart, type HandoffPaths,
 } from '../../src/runtime/handoff.js';
+import { runtimePaths } from '../../src/runtime/paths.js';
 import { Scheduler } from '../../src/runtime/scheduler.js';
 import { commitFile, makeEnv, result, type Env } from './fixtures.js';
 
@@ -128,5 +129,107 @@ describe('lease scratch dirs', () => {
     const broken = { activeLeases: () => { throw new Error('db locked'); } };
     await sweepScratchOnStart(broken as never, paths(env), (l) => logs.push(l));
     expect(logs.join('\n')).toMatch(/scratch sweep failed: db locked/);
+  });
+});
+
+// Deletion safety (tester, task-27): nothing outside <scratch>/<leaseId> is ever removed, whatever the
+// lease id, the entries found by the sweep or the configured roots look like.
+describe('lease scratch deletion safety', () => {
+  it('lease ids that could escape the scratch parent are rejected before any path is built', async () => {
+    const env = makeEnv();
+    const p = paths(env);
+    // Bait: dirs a traversal would reach (the scratch parent's parent and the parent itself).
+    mkdirSync(join(p.scratch!, 'lease-a', 'b'), { recursive: true });
+    mkdirSync(join(p.scratch!, '..', 'x'), { recursive: true });
+    for (const bad of ['..', '.', '', '../x', 'lease-a/../../x', 'lease-a/b', '/etc', 'lease-..', 'lease-a\0b', 'lease-a.json']) {
+      expect(() => scratchDirOf(p, bad), JSON.stringify(bad)).toThrow();
+      // removeLeaseFiles is a no-op for malformed ids (pre-existing contract): nothing is removed.
+      expect(await removeLeaseFiles(p, bad), JSON.stringify(bad)).toEqual([]);
+      expect(await ensureScratchDir(p, bad).catch(() => 'threw')).toBe('threw');
+    }
+    expect(existsSync(join(p.scratch!, 'lease-a', 'b'))).toBe(true);
+    expect(existsSync(join(p.scratch!, '..', 'x'))).toBe(true);
+    expect(existsSync(p.scratch!)).toBe(true);
+  });
+
+  it('an empty scratch root means no scratch at all, never the cwd or /leases', async () => {
+    const env = makeEnv();
+    const p = { ...paths(env), scratch: '' };
+    expect(scratchDirOf(p, 'lease-abc')).toBeNull();
+    expect(await ensureScratchDir(p, 'lease-abc')).toBeNull();
+    expect(await sweepScratch(p, [])).toEqual({ removed: [], errors: [] });
+    expect(await removeLeaseFiles(p, 'lease-abc')).toEqual([]);
+    // Empty env values fall back to the absolute container default, never a relative path or "/leases".
+    for (const e of [{}, { TMPDIR: '' }, { MINIONS_SCRATCH_DIR: '' }, { MINIONS_SCRATCH_DIR: '', MINIONS_STATE_DIR: '' }, { TMPDIR: '/elsewhere' }]) {
+      const rp = runtimePaths(e);
+      expect(rp.scratch, JSON.stringify(e)).toBe('/home/node/.cache/tmp/leases');
+      expect(isAbsolute(rp.tmp)).toBe(true);
+    }
+  });
+
+  it('the sweep removes lease-named symlinks and files without following them and skips names that are not lease ids', async () => {
+    const env = makeEnv();
+    const p = paths(env);
+    mkdirSync(p.scratch!, { recursive: true });
+    const victim = join(env.root, 'victim');
+    mkdirSync(join(victim, 'lease-inner'), { recursive: true });
+    writeFileSync(join(victim, 'precious'), 'x');
+    symlinkSync(victim, join(p.scratch!, 'lease-link'));
+    writeFileSync(join(p.scratch!, 'lease-file'), 'x');
+    const kept = ['lease-x.json', '.lease-hidden', 'lease-', 'xlease-a', 'lease-a b'];
+    for (const n of kept) mkdirSync(join(p.scratch!, n));
+    // A lease dir nested inside a foreign entry is not a sweep target either.
+    mkdirSync(join(p.scratch!, 'lease-x.json', 'lease-nested'));
+
+    const r = await sweepScratch(p, []);
+    expect(r).toEqual({ removed: ['lease-file', 'lease-link'], errors: [] });
+    expect(existsSync(join(victim, 'precious'))).toBe(true);
+    expect(existsSync(join(victim, 'lease-inner'))).toBe(true);
+    expect(readdirSync(p.scratch!).sort()).toEqual([...kept].sort());
+    expect(existsSync(join(p.scratch!, 'lease-x.json', 'lease-nested'))).toBe(true);
+    // The parent dir and its siblings (the TMPDIR root) stay.
+    expect(existsSync(join(p.scratch!, '..'))).toBe(true);
+  });
+
+  it('unreadable or unremovable scratch dirs are reported, never thrown, and leave the coordinator start going', async () => {
+    const env = makeEnv();
+    const p = paths(env);
+    mkdirSync(join(p.scratch!, 'lease-stuck', 'sub'), { recursive: true });
+    const logs: string[] = [];
+    try {
+      // Removal fails: the parent is read-only.
+      chmodSync(p.scratch!, 0o500);
+      const r = await sweepScratch(p, []);
+      if (process.getuid?.() !== 0) {
+        expect(r.removed).toEqual([]);
+        expect(r.errors.join('\n')).toContain('lease-stuck');
+      }
+      await sweepScratchOnStart(env.db, p, (l) => logs.push(l));
+      // Listing fails: the parent is unreadable.
+      chmodSync(p.scratch!, 0o000);
+      const r2 = await sweepScratch(p, []);
+      if (process.getuid?.() !== 0) expect(r2.errors.join('\n')).toContain(p.scratch!);
+      await sweepScratchOnStart(env.db, p, (l) => logs.push(l));
+    } finally {
+      chmodSync(p.scratch!, 0o700);
+    }
+    if (process.getuid?.() !== 0) expect(logs.join('\n')).toMatch(/could not remove some lease scratch dirs/);
+    // A scratch root that is a file (not a dir) is an error, not a crash.
+    const fileRoot = join(env.root, 'scratch-file');
+    writeFileSync(fileRoot, 'x');
+    expect((await sweepScratch({ ...p, scratch: fileRoot }, [])).errors).toHaveLength(1);
+    expect(existsSync(fileRoot)).toBe(true);
+  });
+
+  it('a scratch dir that cannot be created does not block the claim: the brief just has no scratchDir', async () => {
+    const env = makeEnv();
+    const p = paths(env);
+    mkdirSync(join(p.scratch!, '..'), { recursive: true });
+    writeFileSync(p.scratch!, 'not a dir');
+    env.backlog.add({ id: 'task-1' });
+    const brief = await claimWithBrief(sched(env, p), p, 'task-1', 'engineer');
+    expect(brief.scratchDir).toBeUndefined();
+    expect(existsSync(briefPath(p, brief.leaseId))).toBe(true);
+    expect(readFileSync(p.scratch!, 'utf8')).toBe('not a dir');
   });
 });

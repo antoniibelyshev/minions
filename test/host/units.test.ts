@@ -68,6 +68,34 @@ describe('compose generation', () => {
     expect(y).toMatch(/command: \["sh", "-c", "mkdir -p \/home\/node\/\.cache\/tmp; exec sleep infinity"\]/);
   });
 
+  it('tmpfs/TMPDIR/command lines are well-formed YAML scalars for any valid tmpSizeMiB (tester, task-27)', () => {
+    for (const size of [64, 256, 1024, 8192]) {
+      const y = composeYaml(project({ tmpSizeMiB: size }));
+      const lines = y.split('\n');
+      // Exactly one /tmp tmpfs entry with exactly one size option, as an integer MiB count.
+      const tmp = lines.filter((l) => /^ {6}- "\/tmp:/.test(l));
+      expect(tmp).toHaveLength(1);
+      const opts = (JSON.parse(tmp[0]!.trim().slice(2)) as string).split(':')[1]!.split(',');
+      expect(opts.filter((o) => o.startsWith('size='))).toEqual([`size=${size}m`]);
+      expect(opts).toEqual(expect.arrayContaining(['rw', 'nosuid', 'nodev', 'mode=1777']));
+      // /home/node has no size cap (unchanged).
+      expect(lines.find((l) => l.includes('"/home/node:'))).not.toContain('size=');
+      // The command is a JSON flow sequence (valid YAML) running mkdir then exec sleep.
+      const cmd = lines.find((l) => l.startsWith('    command: '))!;
+      expect(JSON.parse(cmd.slice('    command: '.length))).toEqual(['sh', '-c', `mkdir -p ${CONTAINER.scratch}; exec sleep infinity`]);
+      const td = lines.filter((l) => l.startsWith('      TMPDIR: '));
+      expect(td).toHaveLength(1);
+      expect(JSON.parse(td[0]!.slice('      TMPDIR: '.length))).toBe(CONTAINER.scratch);
+      // No tabs; every indentation is a multiple of two spaces.
+      for (const l of lines) {
+        expect(l, l).not.toMatch(/^\t/);
+        expect((/^ */.exec(l)![0].length) % 2, l).toBe(0);
+      }
+    }
+    // Absent tmpSizeMiB is the default, identical to an explicit default.
+    expect(composeYaml(project())).toBe(composeYaml(project({ tmpSizeMiB: DEFAULT_TMP_SIZE_MIB })));
+  });
+
   it('runtime env: the agents\' scratch root is the compose TMPDIR, lease scratch dirs live under it', () => {
     const y = composeYaml(project());
     const tmpdir = /^ {6}TMPDIR: "([^"]+)"$/m.exec(y)?.[1];
