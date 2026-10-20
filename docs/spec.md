@@ -608,6 +608,8 @@ Do not send every tool call or test log. Questions include a recommended answer 
 
 Plain-language controls map to pause intake, pause new task starts, cancel active owned workers best-effort, resume, status, and sync. Provide terminal equivalents independent of Claude.
 
+Paused intake is enforced, not advisory: while it is set, task creation from external input (owner requests, pasted tickets, agent ideas) is refused with POLICY_DENIED and a hint to resume intake, and the intake skill reports the pause instead of creating tasks. Creation that comes from work already in the backlog is exempt, so splits, follow-ups and QA findings can still be recorded: a parent task is set, the idempotency key starts with `split:`, `followup:` or `qa:`, or the provenance is `observed-result`. Keys starting with `intake:` always count as intake. Paused starts and paused intake are independent.
+
 Telegram outages must not discard work. Persist pending notifications with deduplication keys; retry on later supported interaction or sync, without waking an LLM solely to resend text.
 
 # 17 Skills and generated content

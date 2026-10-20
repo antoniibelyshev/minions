@@ -9,6 +9,7 @@ import { emit } from '../core/output.js';
 import { containerPaths } from '../core/paths.js';
 import { TASK_STATUSES } from './backlogmd.js';
 import { MemoryIdempotencyStore, openBacklog } from './factory.js';
+import { assertIntakeOpen } from './intake.js';
 import type { BacklogAdapter, IdempotencyStore, Provenance, ScopeFilter, Task, TaskStatus } from './types.js';
 
 // ---------------------------------------------------------------- hooks set by the runtime
@@ -16,11 +17,14 @@ import type { BacklogAdapter, IdempotencyStore, Provenance, ScopeFilter, Task, T
 export interface ReadyHookState { leased: Set<string>; paused: boolean }
 let readyContext: () => ReadyHookState | Promise<ReadyHookState> = () => ({ leased: new Set(), paused: false });
 let idempotencyStore: IdempotencyStore = new MemoryIdempotencyStore();
+let intakePaused: () => boolean | Promise<boolean> = () => false;
 
 /** Runtime installs this at startup: active-lease task ids and paused_starts from the DB. */
 export function setReadyContext(fn: () => ReadyHookState | Promise<ReadyHookState>): void { readyContext = fn; }
 /** Runtime installs the DB-backed idempotency store at startup. */
 export function setIdempotencyStore(store: IdempotencyStore): void { idempotencyStore = store; }
+/** Runtime installs this at startup: paused_intake from the DB (`backlog create` refuses new intake while set). */
+export function setIntakePausedContext(fn: () => boolean | Promise<boolean>): void { intakePaused = fn; }
 
 // ---------------------------------------------------------------- config + adapter
 
@@ -165,6 +169,7 @@ export function register(program: Command): void {
         priority: oneOf('priority', o.priority, PRIORITIES), status: oneOf<TaskStatus>('status', o.status, TASK_STATUSES),
         provenance: oneOf('provenance', o.provenance, PROVENANCES), idempotencyKey: o.key,
       };
+      assertIntakeOpen(input, await intakePaused());
       const { backlog } = await open();
       const r = await backlog.createTask(input);
       emit(r, { json: globalOpts(cmd).json, human: (d) => `${d.created ? 'Created' : 'Exists'} ${d.task.id}: ${d.task.title}` });
