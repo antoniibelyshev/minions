@@ -9,5 +9,8 @@ export default defineConfig({
   test: {
     include: ['test/**/*.test.ts'],
     exclude: ['node_modules/**', 'dist/**', ...(docker ? [] : ['test/docker/**'])],
+    // Claude Code never runs against the user's real ~/.claude (its plugins, e.g. the Telegram channel).
+    globalSetup: ['test/setup/global.ts'],
+    setupFiles: ['test/setup/claude-guard.ts'],
   },
 });

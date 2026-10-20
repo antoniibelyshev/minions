@@ -241,11 +241,16 @@ describe('renderPolicySummary', () => {
   });
 });
 
-const hasClaude = (() => { try { execFileSync('claude', ['--version'], { stdio: 'ignore' }); return true; } catch { return false; } })();
-describe.runIf(process.env.MINIONS_LIVE_CLAUDE === '1' && hasClaude)('claude plugin validate', () => {
+// Opt-in (MINIONS_LIVE_CLAUDE=1). The real claude runs with a temp HOME and CLAUDE_CONFIG_DIR so the
+// user's enabled plugins (e.g. the Telegram channel, which would take over a running poller) never load.
+const live = process.env.MINIONS_LIVE_CLAUDE === '1';
+const hasClaude = live && (() => { try { execFileSync('claude', ['--version'], { stdio: 'ignore' }); return true; } catch { return false; } })();
+describe.runIf(hasClaude)('claude plugin validate', () => {
   it('accepts the generated plugin', async () => {
     const { out } = await gen();
-    const res = spawnSync('claude', ['plugin', 'validate', '--strict', out], { encoding: 'utf8', timeout: 60_000 });
+    const home = await tmp();
+    const res = spawnSync('claude', ['plugin', 'validate', '--strict', out],
+      { encoding: 'utf8', timeout: 60_000, cwd: home, env: { ...process.env, HOME: home, CLAUDE_CONFIG_DIR: join(home, '.claude') } });
     expect(res.status, res.stdout + res.stderr).toBe(0);
   }, 70_000);
 });
