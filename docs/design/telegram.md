@@ -97,8 +97,15 @@ Decisions:
    servers. The recovery guide warns that starting an extra interactive `claude` in the container takes over the bot
    (PID-file takeover).
 6. **One bot per project** (spec §597). At provisioning the host records the non-secret bot ID (the numeric prefix of the
-   token) in the project registry. `doctor` warns when two registered projects share a bot ID. At runtime, a `409 Conflict`
-   in the plugin's stderr maps to the precise message "another process is polling this bot".
+   token) in the project registry. `doctor` warns when two registered projects share a bot ID. Before a Telegram
+   coordinator launch (`minions start`, the setup coordinator step, and the restart after `minions auth telegram`), the
+   host refuses (CONFLICT) when another registered Docker project with the same bot ID has a running coordinator session
+   whose launch record says Telegram is enabled (`src/host/bot-guard.ts`; a running session with an unreadable record
+   counts as polling). The message names the bot ID and the other project only, never the token, and offers terminal
+   mode (`minions channel set terminal`), stopping the other coordinator, or a separate bot. Terminal launches are never
+   checked. When this project's own coordinator session is already running, `minions start` warns and attaches to it
+   (plain `tmux attach-session`, no sync or relaunch), since attaching adds no second poller. At runtime, a `409 Conflict` in the plugin's stderr maps to the precise message "another process is polling
+   this bot".
 7. **Terminal stays the baseline** (spec §76, §813). Every Telegram failure degrades to a terminal-only launch with a
    precise reason. Doctor never reports Telegram as `fail`.
 

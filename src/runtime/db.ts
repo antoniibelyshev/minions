@@ -104,7 +104,8 @@ function loadSqlite(): typeof import('node:sqlite') {
 
 const nowIso = () => new Date().toISOString();
 
-function pidAlive(pid: number): boolean {
+/** Whether a process with this pid exists (EPERM: exists, owned by someone else). */
+export function pidAlive(pid: number): boolean {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try { process.kill(pid, 0); return true; } catch (e) { return (e as NodeJS.ErrnoException).code === 'EPERM'; }
 }
@@ -303,11 +304,14 @@ export class RuntimeDb {
     const v = this.getMeta('coordinator_lock');
     return v ? (JSON.parse(v) as CoordinatorLock) : undefined;
   }
-  /** Acquires the project coordinator lock; CONFLICT if another live holder has it. Re-entrant for the same pid+session. */
-  acquireCoordinatorLock(session: string, pid = process.pid): CoordinatorLock {
+  /**
+   * Acquires the project coordinator lock; CONFLICT if another live holder has it. Re-entrant for the
+   * same pid+session. A holder that is not `alive` (crashed wrapper, reused pid) is taken over.
+   */
+  acquireCoordinatorLock(session: string, pid = process.pid, alive: (pid: number) => boolean = pidAlive): CoordinatorLock {
     return this.transaction(() => {
       const cur = this.coordinatorLock();
-      if (cur && !(cur.pid === pid && cur.session === session) && pidAlive(cur.pid)) {
+      if (cur && !(cur.pid === pid && cur.session === session) && alive(cur.pid)) {
         throw new MinionsError('CONFLICT', `Another coordinator holds the project lock (pid ${cur.pid}, session ${cur.session}, since ${cur.acquiredAt}).`,
           'Attach to the existing coordinator (minions start) instead of launching a second one.', cur);
       }
