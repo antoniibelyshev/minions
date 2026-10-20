@@ -437,6 +437,11 @@ describe('app pinning through sync (attempt-2 probes, mocked gh)', () => {
     expect(s.tasks[0]!.gate?.state).toBe('unknown');
   });
 
+  it('a passing rollup run is dropped as a duplicate, yet the app-aware list alone satisfies the pinned check: pass', async () => {
+    const env = await pinnedEnv({ runs: { total_count: 1, check_runs: [cr('test', 'success', 15368)] }, rollup: passing });
+    expect((await sync(env)).tasks[0]!.gate?.state).toBe('pass');
+  });
+
   it('a protection app_id given as a string degrades to an unpinned (name-only) requirement', async () => {
     const env = await pinnedEnv({ protection: [{ context: 'test', app_id: '15368' }], runs: { total_count: 0, check_runs: [] } });
     const s = await sync(env);
