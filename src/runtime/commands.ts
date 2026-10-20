@@ -23,7 +23,7 @@ import {
 } from './coordinator.js';
 import { openDb, type DrainRequest, type Lease, type LeaseRole, type PauseChange, type RuntimeDb } from './db.js';
 import { clearDrain, requestDrain } from './drain.js';
-import { claimWithBrief, compactClaim, fetchBrief, recordSubmitted, submitResult, type CompactClaim } from './handoff.js';
+import { claimWithBrief, compactClaim, fetchBrief, recordSubmitted, submitResult, sweepScratchOnStart, type CompactClaim } from './handoff.js';
 import { runHook } from './hooks.js';
 import { runtimePaths } from './paths.js';
 import { capacityOf, LEASE_ROLES, Scheduler } from './scheduler.js';
@@ -369,7 +369,11 @@ export function register(program: Command): void {
       // A signal before claude starts (startup intake included): exit now rather than wait for work still in flight.
       process.exitCode = await coordinatorWrapper(getConfig, {
         ...(o.recover ? { startupPrompt: RECOVERY_PROMPT } : {}),
-        onStart: (c, l, stop) => intakeOnStart(c, l, undefined, undefined, stop),
+        onStart: async (c, l, stop) => {
+          // Restart/crash recovery: drop the scratch dirs of leases that ended (active ones keep theirs).
+          await sweepScratchOnStart(getDb(), runtimePaths(), l);
+          await intakeOnStart(c, l, undefined, undefined, stop);
+        },
         exitAfterSignal: (c) => process.exit(c),
       });
     }));

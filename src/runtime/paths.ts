@@ -48,7 +48,8 @@ export function missingApprovalKeyReason(file: string, env: NodeJS.ProcessEnv = 
  * the host runtime (MINIONS_RUNTIME=host, no Docker) points the same code at <project>/host/...:
  * MINIONS_STATE_DIR (/state), MINIONS_WORKSPACE (/workspace), MINIONS_CONFIG (effective config),
  * MINIONS_SECRETS_DIR (/opt/minions/secrets), MINIONS_PLUGIN_DIR (/opt/minions/plugin) and
- * MINIONS_TMUX_SOCKET (dedicated `tmux -L` server; unset = default server). Tests use them too.
+ * MINIONS_TMUX_SOCKET (dedicated `tmux -L` server; unset = default server) and MINIONS_SCRATCH_DIR
+ * (scratch root, default the container TMPDIR). Tests use them too.
  */
 export function runtimePaths(env: NodeJS.ProcessEnv = process.env, opts: { inContainer?: boolean } = {}) {
   const c = containerPaths();
@@ -56,6 +57,9 @@ export function runtimePaths(env: NodeJS.ProcessEnv = process.env, opts: { inCon
   const workspace = env.MINIONS_WORKSPACE || c.workspace;
   const secretsDir = env.MINIONS_SECRETS_DIR || c.secretsDir;
   const pluginDir = env.MINIONS_PLUGIN_DIR || c.pluginDir;
+  // Scratch root: the container's TMPDIR on the cache volume. A redirected state dir (host runtime,
+  // tests) keeps it inside that state dir (<state>/cache/tmp), never in the container path.
+  const tmp = env.MINIONS_SCRATCH_DIR || (env.MINIONS_STATE_DIR ? join(state, 'cache', 'tmp') : c.scratch);
   return {
     state,
     db: join(state, 'minions.db'),
@@ -68,6 +72,10 @@ export function runtimePaths(env: NodeJS.ProcessEnv = process.env, opts: { inCon
     import: join(state, 'import'),
     exports: join(state, 'exports'),
     logs: join(state, 'logs'),
+    /** Disk-backed, exec-allowed scratch root (the container's TMPDIR; MINIONS_SCRATCH_DIR overrides). */
+    tmp,
+    /** Per-lease scratch dirs `<scratch>/<leaseId>`: created at claim, removed when the lease ends and on coordinator start. */
+    scratch: join(tmp, 'leases'),
     /** Flag file present while a drain is requested (`minions pause --drain`); the worker drain hook tests only for it. */
     drainFlag: join(state, 'run', 'drain'),
     /** Host runtime: MINIONS_LOG_DIR (<project>/host/logs) keeps the unsandboxed hooks' log out of agent-writable dirs. */
