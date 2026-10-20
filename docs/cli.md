@@ -40,7 +40,7 @@ those choices. `minions doctor` is the same check as `minions status --check`.
 | `minions channel show` / `set <auto\|terminal\|telegram>` | Configured vs effective communication channel; set it in the project config (`configRevision` bump, `--yes`, `--dry-run`; restart-required; see [Communication](../README.md#communication)) |
 | `minions runtime show` / `set <docker\|host>` | Host-side agent runtime: Docker (default) or the less safe host runtime (`--global`, `--yes`, `--dry-run`; see [Running without Docker](../README.md#running-without-docker)) |
 | `minions import` | Refresh the container workspace from the committed base branch (Git bundle) |
-| `minions export` | Fetch `agent/*` branches into `refs/remotes/minions/*` in your repository; local branches are untouched |
+| `minions export` | Fetch the container clone's branches (`agent/*`, and the integrated base as `minions/<base>`) into `refs/remotes/minions/*` in your repository; local branches are untouched |
 | `minions pause` / `resume` | Persist scheduling controls. `--intake` / `--starts` select one (default: both). `pause --drain [--reason <text>]` also pauses starts and asks leased workers to wind down (commit `wip:`, return partial); `status` shows `draining`; `resume --starts` (or `resume --drain` alone) clears it. Paused starts stop new task starts; paused intake makes `minions backlog create` refuse new work from requests or tickets (`POLICY_DENIED`), while creation from existing work stays allowed: a `--parent`, a `split:` / `followup:` / `qa:` idempotency key, or provenance `observed-result` (keys starting with `intake:` are always refused) |
 
 ## Internal commands

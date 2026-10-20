@@ -236,7 +236,7 @@ export async function runWizard(input: WizardInput): Promise<WizardResult> {
     } else if (blocked) {
       io.info(`Delivery: local commits on agent/<slug> branches, fetched with \`minions export\`. Branch push and pull requests are not selectable: ${blocked}. Auto-merge ${NA}.`);
     } else {
-      io.info(`Delivery: local (commits stay in the container; \`minions export\`), branch (push agent/<slug> to origin), or pull-request (push and open a PR against ${cfg.git.baseBranch}). minions never merges; auto-merge ${NA}.`);
+      io.info(`Delivery: local (commits stay in the container; \`minions export\`), branch (push agent/<slug> to origin), or pull-request (push and open a PR against ${cfg.git.baseBranch}). minions never merges pull requests${cfg.profile === 'supervised' ? '' : `; with local delivery the coordinator integrates approved branches into the container's local ${cfg.git.baseBranch}${cfg.profile === 'personal-work' ? ' (asking before each merge)' : ''}`}; auto-merge ${NA}.`);
       cfg.delivery.mode = await ask('delivery.mode', 'Delivery mode (local/branch/pull-request)', cfg.delivery.mode, choice(DELIVERY_MODES));
       cfg.delivery.provider = cfg.delivery.mode === 'local' ? cfg.delivery.provider : 'github';
     }

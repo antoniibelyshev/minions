@@ -229,6 +229,7 @@ describe('reporting granularity', () => {
     expect(orch).toContain('Approvals for `ask` capabilities and sensitive paths are always requested explicitly');
     expect(orch).not.toMatch(/report the branch and `prUrl`/);
     expect(orch).toMatch(/`needs_split` → decide the split yourself/);
+    expect(await g.read('coordinator.md')).toMatch(/you may tell the owner first, then restart yourself/);
     const status = await g.read('skills/status/SKILL.md');
     expect(status).toContain('grouped by feature');
     expect(status).toContain('unprompted reports follow the reporting level');
@@ -487,31 +488,38 @@ describe('owner behaviour defaults (task-34)', () => {
     expect(owner).toMatch(/Turn owner requests into backlog tasks yourself .* without asking first/);
     expect(owner).toContain('Capabilities marked `ask` and sensitive paths still need explicit approval');
     expect(owner).toMatch(/Design first: .*show it to the owner, and build only after they agree/);
-    expect(owner).toMatch(/juniors growing into mid-levels: do the investigation yourself first, then give the context, the goal, where to look, pitfalls, what to preserve and how to verify, not every step/);
-    expect(owner).toContain('verification-environment workarounds');
-    expect(owner).toMatch(/routine engineers at `low` effort, reviewers and testers at `medium`/);
-    expect(owner).toMatch(/With API-key \(Console\) billing report USD cost; on a subscription plan report tokens only/);
-    expect(owner).toMatch(/warn at about 50% and 80% of it; at 100% pause starts \(`minions pause --starts --json`\)/);
+    expect(owner).toMatch(/juniors growing into mid-levels: do the investigation yourself first, then give the context, the goal, where to look, pitfalls, what to preserve and how to verify \(with exact environment workarounds, .*\), not every step/);
+    expect(owner).toMatch(/report it with deliveries and when asked: USD with API-key billing, tokens on a subscription/);
+    expect(owner).toContain('(per session for now)');
+    expect(owner).toMatch(/When the owner gives a budget in chat \(USD, or tokens on a subscription\), warn at about 50% and 80% of it; at 100% pause starts \(`minions pause --starts --json`\)/);
     expect(owner).toContain('"major things only, then stop"');
     expect(owner).toMatch(/pause or drain before restarts and upgrades .* keep uncommitted work/);
-    expect(owner).toMatch(/fold new features into existing commands \(for minions itself: setup, upgrade, status\)/);
+    expect(owner).toMatch(/Fold new features into existing commands \(for minions itself: setup, upgrade, status\)/);
     // Kept short: the prompt is read every session.
     expect(owner.length).toBeLessThan(4000);
+  });
+
+  it('staffing shows the per-role effort the host config resolves, never a per-call choice', async () => {
+    const base = defaults();
+    const unset = ownerSection(await (await gen(base)).read('coordinator.md'));
+    expect(unset).toContain('Effort is per role, set on the host (`models.effortByRole`; now engineer default, tester default, reviewer default), never per call');
+    expect(unset).not.toMatch(/engineers at `low` effort/);
+    const set = ownerSection(await (await gen({ ...base, models: { ...base.models, effortByRole: { engineer: 'low', reviewer: 'medium' } } })).read('coordinator.md'));
+    expect(set).toContain('now engineer `low`, tester default, reviewer `medium`');
   });
 
   it('budget and permission mode follow the config', async () => {
     const base = defaults();
     const none = ownerSection(await (await gen(base)).read('coordinator.md'));
-    expect(none).toContain('No budget is configured');
-    expect(none).toContain('runs in `auto` permission mode (the default; `coordinator.permissionMode`)');
+    expect(none).not.toContain('budgets');
+    expect(none).toContain('The coordinator is launched in `auto` by default (`coordinator.permissionMode`); the host runtime always uses `default`');
 
     const capped = ownerSection(await (await gen({ ...base, budgets: { taskUsd: 5, dailyUsd: 40 } })).read('coordinator.md'));
-    expect(capped).toContain('The config sets `budgets.dailyUsd` $40 per day and `budgets.taskUsd` $5 per task');
-    expect(capped).not.toContain('No budget is configured');
+    expect(capped).toContain("The config's `budgets` ($40 per day, $5 per task; not enforced in v0.1) counts as a budget until the owner gives one");
 
     const strict = ownerSection(await (await gen({ ...base, coordinator: { permissionMode: 'acceptEdits' } })).read('coordinator.md'));
     expect(strict).toContain('runs the coordinator in `acceptEdits` permission mode');
-    expect(strict).not.toContain('runs in `auto` permission mode');
+    expect(strict).not.toContain('launched in `auto`');
   });
 
   it('intake says when starting still needs authorization', async () => {
@@ -532,19 +540,47 @@ describe('owner behaviour defaults (task-34)', () => {
     expect(coord).toMatch(/When the channel was down, say so once it is back and ask the owner to resend anything important/);
   });
 
-  it('local delivery: the coordinator integrates approved branches into the local base after a clean merge-tree check', async () => {
-    const base = defaults();
-    const cfg = { ...base, git: { ...base.git, baseBranch: 'trunk' } };
+  it('local delivery, project-owner: verifies the merge before the base moves, then commits or aborts', async () => {
+    const base = defaults('project-owner');
+    const cfg = { ...base, delivery: { ...base.delivery, mode: 'local' as const, provider: 'none' as const }, git: { ...base.git, baseBranch: 'trunk' } };
     const g = await gen(cfg);
     const coord = await g.read('coordinator.md');
-    expect(coord).toContain('you are the single integrator and merge each delivered branch into the local `trunk` yourself');
-    expect(coord).toContain('`git merge-tree --write-tree trunk agent/<slug>`');
-    expect(coord).toMatch(/On a conflict, do not resolve it yourself: send the task back .* to merge `trunk` into the branch and re-test the merged tree/);
-    expect(coord).toMatch(/sensitive paths needs the user's explicit approval before it is merged/);
-    expect(coord).toMatch(/never reset `trunk`/);
+    expect(coord).toContain('Then integrate each delivered branch into the local `trunk` yourself, one at a time, in `/workspace/repo` with `trunk` checked out and a clean tree');
+    expect(coord).toContain('the integrated base arrives as `minions/trunk`');
+    const merge = coord.indexOf('`git merge --no-ff --no-commit agent/<slug>`');
+    const verify = coord.indexOf('then run the verification commands on the merged tree');
+    const commit = coord.indexOf('If they pass, `git commit --no-edit`');
+    expect(merge).toBeGreaterThan(-1);
+    expect(verify).toBeGreaterThan(merge);
+    expect(commit).toBeGreaterThan(verify);
+    expect(coord).toMatch(/On a conflict or a failure, `git merge --abort` \(`trunk` has not moved\), set the task back \(`minions backlog update <taskId> --status changes-requested`/);
+    expect(coord).toMatch(/Never resolve conflicts yourself or reset `trunk`/);
+    expect(coord).toContain('revert that revert before re-merging the repaired branch');
+    expect(coord).toMatch(/Sensitive-path changes need the user's explicit approval\./);
+    expect(coord).not.toContain('git revert -m 1');
+    expect(coord).not.toContain('merge-tree');
     expect(coord).not.toContain('never "merged"');
     const orch = await g.read('skills/orchestrate/SKILL.md');
-    expect(orch).toMatch(/Local delivery: after `delivered`, merge the branch into the local `trunk` yourself/);
+    expect(orch).toContain('Local delivery: then integrate it into the local `trunk` as described under Delivery (verify before committing the merge).');
+  });
+
+  it('local delivery, personal-work: asks before each merge', async () => {
+    const g = await gen(defaults('personal-work'));
+    const coord = await g.read('coordinator.md');
+    expect(coord).toContain("Sensitive-path changes need the user's explicit approval, and in this profile so does every merge: ask first (task, branch, head SHA).");
+    expect(coord).toContain('`git merge --no-ff --no-commit agent/<slug>`');
+    expect(await g.read('skills/orchestrate/SKILL.md')).toContain('verify before committing the merge; ask the user before each merge');
+  });
+
+  it('local delivery, supervised: never merges', async () => {
+    const g = await gen(defaults('supervised'));
+    const coord = await g.read('coordinator.md');
+    expect(coord).toContain('Never merge into the local `main`: the user integrates. Say "delivered", never "merged".');
+    expect(coord).not.toContain('git merge --no-ff');
+    expect(coord).not.toContain('Then integrate');
+    const orch = await g.read('skills/orchestrate/SKILL.md');
+    expect(orch).toContain('Never merge into the local `main`: the user integrates.');
+    expect(orch).not.toContain('Local delivery: then integrate');
   });
 
   it('GitHub delivery: never merges locally, PR merges are not the coordinator\'s', async () => {
@@ -553,10 +589,10 @@ describe('owner behaviour defaults (task-34)', () => {
       cfg.delivery.mode = mode;
       cfg.delivery.provider = 'github';
       const g = await gen(cfg);
-      expect(await g.read('coordinator.md')).not.toContain('single integrator');
+      expect(await g.read('coordinator.md')).not.toContain('Then integrate each delivered branch');
       const orch = await g.read('skills/orchestrate/SKILL.md');
-      expect(orch).toMatch(/GitHub delivery: never merge into the local `main`; every change lands through its pull request/);
-      expect(orch).not.toContain('Local delivery: after `delivered`');
+      expect(orch).toContain('GitHub delivery: never merge into the local `main`; changes land through pull requests');
+      expect(orch).not.toContain('Local delivery: then integrate');
     }
   });
 
@@ -576,9 +612,11 @@ describe('owner behaviour defaults (task-34)', () => {
     const g = await gen();
     const orch = await g.read('skills/orchestrate/SKILL.md');
     expect(orch).toMatch(/how to verify \(with exact environment workarounds\)/);
-    expect(orch).toMatch(/brief engineers like juniors growing into mid-levels/);
-    expect(orch).toMatch(/start nothing new when the owner's budget is used up or quota mode is on/);
-    expect(orch).toMatch(/A `complete` result with failing checks is rejected this way: ask for that single bounded correction with a concrete way to rerun the checks properly/);
+    expect(orch).toContain('Brief and staff as under Owner defaults.');
+    expect(orch).not.toContain('juniors');
+    expect(orch).toContain('Do not loop waiting for work. Start nothing new while the budget is used up or quota mode is on');
+    expect(orch).not.toContain('Do not poll');
+    expect(orch).toMatch(/A `complete` tester or reviewer result with failing checks is rejected this way; for an engineer `complete` with failing checks, ask the same correction yourself/);
     expect(orch).toContain('Include the spend so far');
     const status = await g.read('skills/status/SKILL.md');
     expect(status).toMatch(/Spend so far .*USD cost with API-key billing, tokens only on a subscription plan/);

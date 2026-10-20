@@ -222,16 +222,16 @@ Every project's coordinator follows these defaults unless you tell it otherwise.
 - **Intake:** turns your requests into backlog tasks without asking first. `ask` capabilities and sensitive paths still need your approval.
 - **Reporting:** reports high-level feature progress only, asks only high-level decisions, and records low-level decisions as notes (`communication.progress`).
 - **Polls:** asks decisions as numbered options, with the recommended one first and "Other" last. Replying with just a number answers the poll.
-- **Spend:** tallies coordinator and worker usage and reports it with deliveries and on request: USD with API-key billing, tokens on a subscription. With a budget (given in chat, or `budgets.*`), it warns at about 50% and 80% and pauses starts at 100%.
+- **Spend:** tallies coordinator and worker usage per session and reports it with deliveries and on request: USD with API-key billing, tokens on a subscription. With a budget you give in chat (USD, or tokens on a subscription), it warns at about 50% and 80% and pauses starts at 100%. `budgets.*` is USD-only and not enforced in v0.1.
 - **Quota mode:** on "major things only, then stop", it finishes or parks in-flight work, pauses starts, and asks before spending more.
-- **Briefs and staffing:** investigates first, then briefs engineers with context, goal, pitfalls and how to verify. Routine engineers run at low effort and reviewers and testers at medium (`models.effortByRole`). It uses the deep engineer for hard work or after a failure, and a small model for mechanical checks.
+- **Briefs and staffing:** investigates first, then briefs engineers with context, goal, pitfalls and how to verify. Reasoning effort is set per role on the host (`models.effortByRole`; unset means the Claude Code default), not per call. For hard work or after a failure it uses the deep engineer, then a stronger model; a small model for mechanical checks.
 - **Testing:** the reviewer owns test adequacy. Testers are for risky tasks and QA sweeps (see [Testing](#testing)).
-- **Merging:** with `local` delivery, the coordinator merges approved branches into the local base itself after a clean `git merge-tree` check. On a conflict it sends the branch back for a merge from the base and a re-test. With GitHub delivery it never merges locally, and merging a PR stays `ask`.
+- **Merging:** with `local` delivery, the `project-owner` coordinator merges approved branches into the container's local base itself, `personal-work` asks before each merge, and `supervised` never merges. The merge is verified before it is committed (`git merge --no-commit`, run the verification commands, then commit or abort); on a conflict or failure the task goes back for a repair. `minions export` brings the integrated base to the host as `minions/<base>`. With GitHub delivery it never merges locally, and merging a PR stays with you.
 - **Design first** for big features, shown to you before the build.
 - **Graceful operations:** pauses or drains before restarts and upgrades, and keeps uncommitted work.
 - **Channel:** answers on the channel you used. After an outage, it says so and asks you to resend anything important.
 - **Small CLI surface:** folds new features into existing commands rather than adding new ones.
-- **Permission mode:** `auto` by default (see [Coordinator permission mode](#coordinator-permission-mode)).
+- **Permission mode:** `auto` by default in the container; the host runtime uses `default` (see [Coordinator permission mode](#coordinator-permission-mode)).
 
 ### Testing
 
@@ -323,11 +323,11 @@ Briefs and worker results go through files under `/state`, not through the coord
 
 ## Delivery, review, and merging
 
-v0.1 supports `local`, `branch`, and `pull-request` delivery. `auto-when-eligible`, review publication, and merging are **deferred in v0.1**: minions never merges a pull request, and an open PR is reported as **delivered**, not merged. With `local` delivery, the coordinator merges approved branches into the local base branch itself (see [Coordinator defaults](#coordinator-defaults)).
+v0.1 supports `local`, `branch`, and `pull-request` delivery. `auto-when-eligible`, review publication, and merging are **deferred in v0.1**: minions never merges a pull request, and an open PR is reported as **delivered**, not merged. With `local` delivery, the coordinator integrates approved branches into the container's local base branch, depending on the profile (see [Coordinator defaults](#coordinator-defaults)).
 
 | Mode | Behavior | Needs GitHub write access |
 | - | - | - |
-| `local` | Commits locally, writes a handoff, and the coordinator merges approved branches into the local base | No |
+| `local` | Commits locally, writes a handoff; the coordinator integrates approved branches into the local base (by profile) | No |
 | `branch` | Pushes the branch | Yes |
 | `pull-request` | Opens a PR and waits for your established process | Yes |
 | `auto-when-eligible` | Requests a merge once every gate passes **(deferred in v0.1)** | Yes, plus a separate review identity |
