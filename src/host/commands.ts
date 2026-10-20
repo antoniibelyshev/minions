@@ -455,7 +455,7 @@ export function register(program: Command): void {
       if (!r.ok) process.exitCode = 1;
     }));
 
-  program.command('down')
+  program.command('down').alias('stop')
     .description('Stop the agent runtime: remove the container (volumes kept) or stop the host runtime tmux server')
     .option('--dry-run', 'show what would be stopped')
     .action(action(async (_o: unknown, cmd: Command) => {
