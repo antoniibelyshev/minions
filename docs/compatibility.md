@@ -91,6 +91,17 @@ fake GitHub API; the pre-filled token URL follows GitHub's documented template U
 - **Telegram preview**: `--channels` is a research-preview flag hidden from `claude --help`; whether the
   channel registered is visible only in the coordinator's startup notice. The plugin runs `bun install`
   at each start, so it needs npm registry access.
+- **One Telegram poller per bot**: the plugin's server allows a single poller per bot and state
+  dir. Any other `claude` session that loads the plugin (it is loaded whenever
+  `telegram@claude-plugins-official` is enabled in that session's config dir, with or without
+  `--channels`) logs `telegram channel: replacing stale poller pid=…` and kills the running
+  coordinator's poller. Telegram then stays down until the coordinator reconnects. minions cannot
+  stop this from outside the plugin. Do not enable the plugin in a config dir that other sessions
+  share with the coordinator. Start nested or ad-hoc `claude` runs with a separate
+  `CLAUDE_CONFIG_DIR`. The setup assistant (`minions setup assist`) passes no channel flags but
+  uses your host config, so it loads the plugin if you enabled it there. The test suite sets
+  `CLAUDE_CONFIG_DIR` to a temp dir (`test/setup/global.ts`), and `test/setup/claude-guard.ts`
+  fails any test that would start `claude` with the real `~/.claude`.
 - Native macOS/iOS builds (Xcode) cannot run inside the Linux runtime.
 - **Host runtime** is less safe by design: agents run as your macOS user. The Claude Code sandbox
   (Seatbelt) confines Bash writes and denies credential reads, but the Read/Edit tools rely on

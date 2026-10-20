@@ -1,10 +1,11 @@
 // AI setup assistant (`minions setup assist`, offered at the end of an interactive init): generated
 // claude argv (read-only allowlist, denied credential/runtime/publish commands, permission mode
-// default, never bypass), host plugin generation, launch with a fake `claude` on PATH (the real
-// Claude Code is never started), and the init offer (interactive only; --yes never launches).
+// default, never bypass), host plugin generation, launch with a fake `claude` as the only PATH entry
+// (the real Claude Code is never started; `claude plugin validate` runs with a temp config dir), and
+// the init offer (interactive only; --yes never launches).
 import { execFileSync, spawnSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { delimiter, join } from 'node:path';
+import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('../../src/plugin/generate.js', async (importOriginal) => {
@@ -25,9 +26,11 @@ vi.mock('../../src/plugin/generate.js', async (importOriginal) => {
 const A = await import('../../src/host/assistant.js');
 const { runInit } = await import('../../src/host/install.js');
 const { projectPaths, credentialStoreDir } = await import('../../src/core/paths.js');
+const { resolveOnPath } = await import('../../src/host/auth.js');
 const { dockerUp, makeRepo, withHome } = await import('./fixtures.js');
 
-// Resolved before any test changes PATH; used only for `claude plugin validate` (no session, no API).
+// Resolved before any test changes PATH; used only for `claude plugin validate` (no session, no API),
+// always with a temp HOME and CLAUDE_CONFIG_DIR so the user's enabled plugins (e.g. Telegram) never load.
 const realClaude = (() => { try { return execFileSync('which', ['claude'], { encoding: 'utf8' }).trim() || null; } catch { return null; } })();
 
 let env: ReturnType<typeof withHome>;
@@ -42,17 +45,20 @@ async function project(visibility: 'shared' | 'private' = 'private') {
   return { repo, id: r.plan.projectId, ctx };
 }
 
-/** Fake `claude` on PATH: records argv and cwd, prints nothing interactive, exits 7. */
-function fakeClaude(): { log: string } {
+/**
+ * Fake `claude` as the only PATH entry: records argv and cwd, prints nothing interactive, exits 0.
+ * PATH holds nothing else (node is called by absolute path), so a fake that cannot run (e.g. a noexec
+ * TMPDIR) fails the launch instead of falling through to the real claude next to node.
+ */
+function fakeClaude(): { log: string; bin: string } {
   const bin = join(env.root, 'bin');
   mkdirSync(bin, { recursive: true });
   const log = join(env.root, 'claude.json');
-  writeFileSync(join(bin, 'claude'), `#!/bin/sh\nexec node -e 'require("fs").writeFileSync(process.argv[1], JSON.stringify({ argv: process.argv.slice(2), cwd: process.cwd() }))' "${log}" "$@"\n`);
+  writeFileSync(join(bin, 'claude'), `#!/bin/sh\nexec "${process.execPath}" -e 'require("fs").writeFileSync(process.argv[1], JSON.stringify({ argv: process.argv.slice(2), cwd: process.cwd() }))' "${log}" "$@"\n`);
   chmodSync(join(bin, 'claude'), 0o755);
-  process.env.PATH = `${bin}${delimiter}${dirname(process.execPath)}${delimiter}/usr/bin${delimiter}/bin`;
-  return { log };
+  process.env.PATH = bin;
+  return { log, bin };
 }
-const dirname = (p: string) => p.slice(0, p.lastIndexOf('/'));
 
 /** Values of a variadic option: from after the flag up to the next option. */
 function variadic(args: string[], flag: string): string[] {
@@ -131,7 +137,8 @@ describe('assistant argv', () => {
 describe('launch (fake claude on PATH)', () => {
   it('writes the host plugin and runs claude in the repository root with the generated argv', async () => {
     const { id, repo, ctx } = await project();
-    const { log } = fakeClaude();
+    const { log, bin } = fakeClaude();
+    expect(await resolveOnPath('claude')).toBe(join(bin, 'claude'));
     const info: string[] = [];
     const code = await A.launchAssistant(ctx, { onInfo: (l) => info.push(l) });
     expect(code).toBe(0);
@@ -154,7 +161,10 @@ describe('launch (fake claude on PATH)', () => {
     it('accepts the generated assistant plugin', async () => {
       const { id, ctx } = await project();
       await A.writeAssistantPlugin(await A.planAssistant(ctx));
-      const res = spawnSync(realClaude!, ['plugin', 'validate', '--strict', A.assistantPluginDir(id)], { encoding: 'utf8', timeout: 60_000 });
+      const home = join(env.root, 'claude-home');
+      mkdirSync(join(home, '.claude'), { recursive: true });
+      const res = spawnSync(realClaude!, ['plugin', 'validate', '--strict', A.assistantPluginDir(id)],
+        { encoding: 'utf8', timeout: 60_000, cwd: env.root, env: { ...process.env, HOME: home, CLAUDE_CONFIG_DIR: join(home, '.claude') } });
       expect(res.status, res.stdout + res.stderr).toBe(0);
     }, 70_000);
   });
