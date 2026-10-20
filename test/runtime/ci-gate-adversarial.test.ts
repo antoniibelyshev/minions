@@ -366,3 +366,92 @@ describe('ciAuthority none: unchanged behaviour', () => {
     expect(v.ok).toBe(false);
   });
 });
+
+describe('app pinning through sync (attempt-2 probes, mocked gh)', () => {
+  const RUNS = (head: string) => `${R}/commits/${head}/check-runs?per_page=100`;
+  const protect = (checks: { context: string; app_id: unknown }[]) =>
+    ok(JSON.stringify({ protected: true, protection: { required_status_checks: { enforcement_level: 'everyone', contexts: checks.map((c) => c.context), checks } } }));
+  const cr = (name: string, conclusion: string | null, app: unknown, status = 'completed') => ({ name, status, conclusion, app: { id: app } });
+  const filler = (n: number) => Array.from({ length: n }, (_, k) => cr(`other-${k}`, 'success', 15368));
+  async function pinnedEnv(opts: { protection?: { context: string; app_id: unknown }[]; ruleset?: { context: string; integration_id: unknown }[]; runs: unknown; rollup?: unknown[] }) {
+    const env = await ciEnv();
+    env.st.rollup = opts.rollup ?? passing;
+    env.st.api = (p) => {
+      if (p === `${R}/branches/main`) return protect(opts.protection ?? [{ context: 'test', app_id: 15368 }]);
+      if (p === `${R}/rules/branches/main`) return ok(JSON.stringify(opts.ruleset ? [{ type: 'required_status_checks', parameters: { required_status_checks: opts.ruleset } }] : []));
+      if (p === RUNS(env.head)) return ok(JSON.stringify(opts.runs));
+      if (p.includes('/check-runs')) return fail(404, 'Not Found'); // any page-2 request: not served
+      return null;
+    };
+    return env;
+  }
+
+  it('pinned run only on page 2 of check-runs (>100 runs): not approval', async () => {
+    const env = await pinnedEnv({ runs: { total_count: 101, check_runs: filler(100) } });
+    const s = await sync(env);
+    expect(s.tasks[0]!.gate?.state).not.toBe('pass');
+    expect((await review(env)).rec).toMatchObject({ approved: false });
+  });
+
+  // DEFECT (fail-open): checkRunsWithApps reads only page 1 (per_page=100) and ignores total_count. When the
+  // pinned app has two runs named `test` (e.g. two workflows with the same job name) and the failing one
+  // falls on page 2, the gate sees only the passing run and approves. A truncated read (total_count >
+  // check_runs.length) should be treated as unreadable (unknown) or paginated.
+  it.fails('truncated check-runs read hides a failing pinned run on page 2: must not be approval', async () => {
+    const env = await pinnedEnv({
+      runs: { total_count: 101, check_runs: [cr('test', 'success', 15368), ...filler(99)] }, // page 2 would hold cr('test','failure',15368)
+      rollup: [...passing, { __typename: 'CheckRun', name: 'test', status: 'COMPLETED', conclusion: 'FAILURE' }],
+    });
+    const s = await sync(env);
+    expect(s.tasks[0]!.gate?.state).not.toBe('pass');
+  });
+
+  it('same app, two runs of the same name, one failing: fail', async () => {
+    const env = await pinnedEnv({ runs: { total_count: 2, check_runs: [cr('test', 'success', 15368), cr('test', 'failure', 15368)] } });
+    const s = await sync(env);
+    expect(s.tasks[0]!.gate?.state).toBe('fail');
+    expect((await review(env)).rec).toMatchObject({ approved: false, to: 'changes-requested' });
+  });
+
+  it('a check-run app id given as a string is not attributed to the pinned app (unknown, never pass)', async () => {
+    const env = await pinnedEnv({ runs: { total_count: 1, check_runs: [cr('test', 'success', '15368')] } });
+    const s = await sync(env);
+    expect(s.tasks[0]!.ci?.checks).toEqual([{ name: 'test', state: 'pass', source: 'check-run' }]);
+    expect(s.tasks[0]!.gate?.state).toBe('unknown');
+  });
+
+  it('a protection app_id given as a string degrades to an unpinned (name-only) requirement', async () => {
+    const env = await pinnedEnv({ protection: [{ context: 'test', app_id: '15368' }], runs: { total_count: 0, check_runs: [] } });
+    const s = await sync(env);
+    // No pin -> no check-runs read; the rollup's passing `test` satisfies it by name (documented residual).
+    expect(env.calls.some((c) => c.at(-1)!.includes('/check-runs'))).toBe(false);
+    expect(s.tasks[0]!.gate?.state).toBe('pass');
+  });
+
+  it('ruleset integration_id and protection app_id disagreeing: both apps must pass', async () => {
+    const both = { protection: [{ context: 'test', app_id: 15368 }], ruleset: [{ context: 'test', integration_id: 999 }] };
+    const one = await pinnedEnv({ ...both, runs: { total_count: 1, check_runs: [cr('test', 'success', 15368)] } });
+    expect((await sync(one)).tasks[0]!.gate?.state).toBe('pending');
+    const failing = await pinnedEnv({ ...both, runs: { total_count: 2, check_runs: [cr('test', 'success', 15368), cr('test', 'failure', 999)] } });
+    expect((await sync(failing)).tasks[0]!.gate?.state).toBe('fail');
+    const ok2 = await pinnedEnv({ ...both, runs: { total_count: 2, check_runs: [cr('test', 'success', 15368), cr('test', 'success', 999)] } });
+    expect((await sync(ok2)).tasks[0]!.gate?.state).toBe('pass');
+  });
+
+  it('pinned + unpinned requirement for the same context: the pin is required and the name-only one sees every source', async () => {
+    const env = await pinnedEnv({ protection: [{ context: 'test', app_id: null }], ruleset: [{ context: 'test', integration_id: 15368 }],
+      runs: { total_count: 1, check_runs: [cr('test', 'success', 15368)] },
+      rollup: [{ __typename: 'StatusContext', context: 'test', state: 'FAILURE' }] });
+    expect((await sync(env)).tasks[0]!.gate?.state).toBe('fail');
+  });
+
+  // Judgement: GitHub ignores statuses (and other apps) for a check pinned to an app, so a failing
+  // same-name commit status does not block the merge there either; the gate mirrors that.
+  it('a pinned check passing plus a same-name failing commit status: pass (mirrors GitHub pin semantics)', async () => {
+    const env = await pinnedEnv({ runs: { total_count: 1, check_runs: [cr('test', 'success', 15368)] },
+      rollup: [{ __typename: 'StatusContext', context: 'test', state: 'FAILURE' }, ...passing] });
+    const s = await sync(env);
+    expect(s.tasks[0]!.ci?.checks).toEqual(expect.arrayContaining([{ name: 'test', state: 'fail', source: 'status' }]));
+    expect(s.tasks[0]!.gate?.state).toBe('pass');
+  });
+});
