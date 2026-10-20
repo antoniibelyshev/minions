@@ -86,7 +86,16 @@ export class FakeBacklog implements BacklogAdapter {
 
 export interface Env { root: string; layout: WorkspaceLayout; db: RuntimeDb; backlog: FakeBacklog; config: MinionsConfig; sched: Scheduler; baseSha: string }
 
+/**
+ * Runtime env on the project-owner defaults, except `verification.testerRequired: true` so the existing
+ * pipeline tests keep exercising the full engineer → tester → reviewer flow (the opt-in old behaviour).
+ * Use makeDefaultEnv for the profile's real default (risk-based testing, testerRequired false).
+ */
 export function makeEnv(mutate?: (c: MinionsConfig) => void): Env {
+  return makeDefaultEnv((c) => { c.verification.testerRequired = true; mutate?.(c); });
+}
+
+export function makeDefaultEnv(mutate?: (c: MinionsConfig) => void): Env {
   const root = tmp();
   const layout = workspaceLayout(join(root, 'workspace'));
   const baseSha = initRepo(layout.repo);

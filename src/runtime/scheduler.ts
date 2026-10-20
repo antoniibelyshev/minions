@@ -1,6 +1,6 @@
 import { randomBytes } from 'node:crypto';
 import type { BacklogAdapter, ScopeFilter, Task, TaskStatus } from '../backlog/types.js';
-import { can } from '../config/capabilities.js';
+import { can, matchesAny } from '../config/capabilities.js';
 import { isGithubDelivery } from '../config/delivery.js';
 import type { MinionsConfig } from '../config/schema.js';
 import { MinionsError } from '../core/errors.js';
@@ -57,6 +57,19 @@ export interface Capacity {
   freeEngineerSlots: number;
 }
 
+/** Labels that opt a task into a per-task tester stage (verification.qaLabels, default ["qa"]). */
+export const qaLabelsOf = (cfg: MinionsConfig): string[] => cfg.verification.qaLabels ?? ['qa'];
+
+/**
+ * A task with this label is a QA sweep: a tester runs it against the current base branch (not a
+ * ticket branch), claimed from `ready`; its findings become new backlog tasks.
+ */
+export const QA_SWEEP_LABEL = 'qa-sweep';
+export const isQaSweep = (task: Pick<Task, 'labels'>): boolean => task.labels.includes(QA_SWEEP_LABEL);
+
+/** Why a task needs a tester stage; empty = engineer → reviewer only. `record` = add the QA label to the task. */
+export interface QaRequirement { reasons: string[]; record: boolean }
+
 /** Readiness scope from config (mirrors backlog/commands scopeOf, kept local so hooks don't load the CLI module). */
 export const scopeOf = (cfg: MinionsConfig): ScopeFilter => ({
   milestone: cfg.intake.scope.milestone, requiredLabels: [...cfg.intake.scope.requiredLabels], allowedPaths: [...cfg.intake.scope.allowedPaths],
@@ -79,6 +92,8 @@ export interface TaskBrief {
   briefMarker: string;
   leaseId: string;
   role: LeaseRole;
+  /** "qa-sweep": a tester checks the base branch head (detached, nothing to commit); "task": a ticket branch. */
+  kind: 'task' | 'qa-sweep';
   attempt: number;
   task: {
     id: string; locator: string; title: string; description: string; objective: string;
@@ -145,7 +160,8 @@ export class Scheduler {
 
   /** Branch for a task: recorded branch, else an earlier lease's branch, else agent/<slug>. */
   private branchForTask(task: Task): { slug: string; branch: string } {
-    const prior = this.db.leases({ taskId: task.id, all: true }).find((l) => l.branch)?.branch;
+    // Only agent/ branches: a QA sweep's tester lease records the base branch, which must never be reused.
+    const prior = this.db.leases({ taskId: task.id, all: true }).find((l) => l.branch?.startsWith(BRANCH_PREFIX))?.branch;
     const branch = (task.branch && task.branch.startsWith(BRANCH_PREFIX) ? task.branch : null) ?? prior ?? branchFor(taskSlug(task.id, task.title));
     return { branch, slug: branch.slice(BRANCH_PREFIX.length) };
   }
@@ -167,10 +183,15 @@ export class Scheduler {
       throw new MinionsError('CONFLICT', `Task ${task.id} already has an active ${held.role} lease (${held.id}).`,
         'One active stage per task: wait for it, record its result, or release it.', { leaseId: held.id, role: held.role });
     }
-    if (!ROLE_STATUSES[role].includes(task.status)) {
-      throw new MinionsError('PRECONDITION', `Task ${task.id} is "${task.status}"; a ${role} can only be claimed from ${ROLE_STATUSES[role].join('|')}.`);
+    const sweep = isQaSweep(task);
+    if (sweep && role !== 'tester') {
+      throw new MinionsError('PRECONDITION', `Task ${task.id} is a QA sweep (label ${QA_SWEEP_LABEL}); only a tester runs it.`, `Claim it with --role tester.`);
     }
-    if (role === 'engineer' && task.status === 'ready') {
+    const allowed: TaskStatus[] = sweep ? ['ready'] : ROLE_STATUSES[role];
+    if (!allowed.includes(task.status)) {
+      throw new MinionsError('PRECONDITION', `Task ${task.id} is "${task.status}"; a ${sweep ? 'QA sweep' : role} can only be claimed from ${allowed.join('|')}.`);
+    }
+    if ((role === 'engineer' || sweep) && task.status === 'ready') {
       if (!task.authorized) throw new MinionsError('POLICY_DENIED', `Task ${task.id} is not authorized to start.`, 'Label it minions:authorized or enable intake.startReady.');
       for (const dep of task.dependencies) {
         let d: Task;
@@ -182,7 +203,9 @@ export class Scheduler {
     }
     if (isGithubDelivery(cfg)) await this.syncBase(task.id, role);
     const allTasks = await this.backlog.listTasks();
-    const { branch, slug } = this.branchForTask(task);
+    // A QA sweep's lease is on the base branch itself; its worktree is detached at the base head.
+    const sweepBase = sweep ? await resolveBaseBranch(this.layout.repo, cfg.git.baseBranch) : null;
+    const { branch, slug } = sweepBase ? { branch: sweepBase.branch, slug: `qa-${taskSlug(task.id, task.title)}` } : this.branchForTask(task);
     const leaseId = newLeaseId();
     const holder = opts.holder ?? `pid:${process.pid}`;
 
@@ -204,12 +227,18 @@ export class Scheduler {
       const n = this.db.get<{ n: number }>('SELECT COUNT(*) AS n FROM leases WHERE task_id = ? AND role = ?', task.id, role)!.n + 1;
       this.db.exec(`INSERT INTO leases (id, task_id, role, attempt, holder, branch, config_revision, started_at, status)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active')`, leaseId, task.id, role, n, holder, branch, cfg.configRevision, nowIso());
-      this.db.addEvent('claim', task.id, { leaseId, role, attempt: n, fromStatus: task.status, holder });
+      this.db.addEvent('claim', task.id, { leaseId, role, attempt: n, fromStatus: task.status, holder, ...(sweep ? { kind: 'qa-sweep' } : {}) });
       return n;
     });
 
     let worktree: string, baseBranch: string, baseSha: string, head: string;
     try {
+      if (sweepBase) {
+        baseBranch = sweepBase.branch; baseSha = head = sweepBase.sha;
+        worktree = (await ensureReviewWorktree(this.layout, slug, head)).worktree;
+        this.db.exec('UPDATE leases SET worktree = ?, base_sha = ?, head_sha = ? WHERE id = ?', worktree, baseSha, head, leaseId);
+        return this.buildBrief(this.db.lease(leaseId)!, task, { attempt, branch, worktree, baseBranch, baseSha, head, startEffect, sweep });
+      }
       if (role !== 'engineer' && !(await headOf(this.layout.repo, branch))) {
         throw new MinionsError('PRECONDITION', `Task ${task.id} has no branch ${branch} to ${role === 'tester' ? 'test' : 'review'}.`, 'Run the engineer stage first.');
       }
@@ -255,7 +284,7 @@ export class Scheduler {
     }
   }
 
-  private buildBrief(lease: Lease, task: Task, x: { attempt: number; branch: string; worktree: string; baseBranch: string; baseSha: string; head: string; startEffect: string }): TaskBrief {
+  private buildBrief(lease: Lease, task: Task, x: { attempt: number; branch: string; worktree: string; baseBranch: string; baseSha: string; head: string; startEffect: string; sweep?: boolean }): TaskBrief {
     const cfg = this.config;
     const role = lease.role;
     const priorFindings = this.db.leases({ taskId: task.id, all: true })
@@ -269,6 +298,7 @@ export class Scheduler {
       briefMarker: `minions-lease: ${lease.id}`,
       leaseId: lease.id,
       role,
+      kind: x.sweep ? 'qa-sweep' : 'task',
       attempt: x.attempt,
       task: {
         id: task.id, locator: task.locator, title: task.title, description: task.description, objective: task.description,
@@ -285,9 +315,9 @@ export class Scheduler {
       verificationCommands: [...cfg.verification.commands],
       authorizedCommands: ['git', ...cfg.verification.commands],
       publication: {
-        'git.commit': role === 'reviewer' ? 'deny' : can(cfg, 'git.commit', { role }),
-        'git.push': can(cfg, 'git.push', { role }),
-        'pr.create': can(cfg, 'pr.create', { role }),
+        'git.commit': role === 'reviewer' || x.sweep ? 'deny' : can(cfg, 'git.commit', { role }),
+        'git.push': x.sweep ? 'deny' : can(cfg, 'git.push', { role }),
+        'pr.create': x.sweep ? 'deny' : can(cfg, 'pr.create', { role }),
       },
       policy: {
         taskStart: x.startEffect, codeEdit: can(cfg, 'code.edit', { role }), gitCommit: can(cfg, 'git.commit', { role }),
@@ -320,6 +350,44 @@ export class Scheduler {
   private preClaimStatus(lease: Lease): TaskStatus | undefined {
     const ev = this.db.events(lease.task_id, 'claim').find((e) => (e.data as { leaseId?: string })?.leaseId === lease.id);
     return (ev?.data as { fromStatus?: TaskStatus } | undefined)?.fromStatus;
+  }
+
+  private isSweepLease(lease: Lease): boolean {
+    if (lease.role !== 'tester') return false;
+    const ev = this.db.events(lease.task_id, 'claim').find((e) => (e.data as { leaseId?: string })?.leaseId === lease.id);
+    return (ev?.data as { kind?: string } | undefined)?.kind === 'qa-sweep';
+  }
+
+  /** Paths the branch changes against the base (null when the diff cannot be computed). */
+  private async changedPaths(head: string): Promise<string[] | null> {
+    try {
+      const base = await resolveBaseBranch(this.layout.repo, this.config.git.baseBranch);
+      const d = await git(this.layout.repo, ['diff', '--name-only', '--no-renames', '-z', `${base.ref}...${head}`], true);
+      return d.code === 0 ? d.stdout.split('\0').filter(Boolean) : null;
+    } catch { return null; }
+  }
+
+  /**
+   * Risk-based testing: a task needs a tester stage when verification.testerRequired is set, it carries a
+   * QA label (verification.qaLabels; the coordinator may add one), its diff (or the reported modifiedPaths)
+   * touches sensitive paths, the branch diff cannot be computed (fail closed), or the reviewer flagged it (`needsQa`). Sensitive paths and reviewer flags are
+   * recorded on the task as the first QA label so later stages and publication see the same requirement.
+   */
+  async qaRequirement(task: Task, head: string, opts: { paths?: string[]; flagged?: boolean } = {}): Promise<QaRequirement> {
+    const cfg = this.config;
+    const reasons: string[] = [];
+    let record = false;
+    if (cfg.verification.testerRequired) reasons.push('verification.testerRequired');
+    const label = task.labels.find((l) => qaLabelsOf(cfg).includes(l));
+    if (label) reasons.push(`label ${label}`);
+    const diff = await this.changedPaths(head);
+    // Fail closed: without the branch diff an unreported sensitive change could skip QA.
+    if (diff === null) { reasons.push('branch diff unavailable (QA required, fail closed)'); record = !label; }
+    const paths = [...new Set([...(opts.paths ?? []), ...(diff ?? [])])];
+    const sensitive = paths.filter((p) => matchesAny(p, cfg.sensitivePaths));
+    if (sensitive.length) { reasons.push(`sensitive paths (${sensitive.slice(0, 5).join(', ')}${sensitive.length > 5 ? ', …' : ''})`); record = !label; }
+    if (opts.flagged) { reasons.push('reviewer flagged needsQa'); record = !label; }
+    return { reasons, record };
   }
 
   /** Puts an engineer's task back to its pre-claim status so it can be claimed again (worktree kept). */
@@ -386,7 +454,13 @@ export class Scheduler {
     let errors: string[] = v.ok ? [] : v.errors;
     const result = v.ok ? v.result : undefined;
     let actualHead: string | null = null;
-    if (result) {
+    const sweep = this.isSweepLease(lease);
+    if (result && sweep) {
+      // A QA sweep checks the base head it was given; the base may move on meanwhile, and the sweep commits nothing.
+      actualHead = lease.head_sha;
+      if (result.branch !== lease.branch) errors.push(`branch: result names ${result.branch} but the QA sweep ran on ${lease.branch}`);
+      if (result.headSha !== lease.head_sha) errors.push(`stale head: result headSha ${result.headSha} but the QA sweep ran against ${lease.head_sha} (sweeps do not commit)`);
+    } else if (result) {
       actualHead = lease.branch ? await headOf(this.layout.repo, lease.branch) : null;
       if (result.branch !== lease.branch) errors.push(`branch: result names ${result.branch} but the lease is for ${lease.branch}`);
       if (!actualHead) errors.push(`stale head: branch ${lease.branch} no longer exists`);
@@ -428,19 +502,34 @@ export class Scheduler {
     let publish = false;
     let message = '';
     const afterTesting: TaskStatus = cfg.verification.reviewerRequired ? 'reviewing' : 'delivered';
+    // Per-task QA requirement (risk-based testing), evaluated when an engineer or reviewer finishes.
+    const flagged = lease.role === 'reviewer' && r.needsQa === true;
+    const qa: QaRequirement = !sweep && lease.role !== 'tester' && (r.status === 'complete' || flagged)
+      ? await this.qaRequirement(task, head, { paths: r.modifiedPaths, flagged })
+      : { reasons: [], record: false };
+    const qaWhy = qa.reasons.join('; ');
 
-    switch (r.status) {
+    if (sweep) {
+      if (r.status === 'complete' || r.status === 'needs_changes') {
+        to = 'done';
+        message = `QA sweep of ${lease.branch} at ${head} recorded (${r.findings.length} finding(s)). Create a backlog task for each finding (minions backlog create, idempotency key qa:${task.id}:<n>).`;
+      } else if (r.status === 'blocked') to = 'blocked';
+      else if (r.status === 'needs_split') { to = 'awaiting-human'; needsSplit = true; message = 'QA sweep reported needs_split: create smaller sweep tasks.'; }
+      else message = 'Partial QA sweep recorded; status unchanged (claim it again to finish).';
+    } else switch (r.status) {
       case 'complete':
-        if (lease.role === 'engineer') to = cfg.verification.testerRequired ? 'testing' : afterTesting;
-        else if (lease.role === 'tester') to = afterTesting;
+        if (lease.role === 'engineer') {
+          to = qa.reasons.length ? 'testing' : afterTesting;
+          if (qa.reasons.length && !cfg.verification.testerRequired) message = `Recorded engineer complete; QA required (${qaWhy}): task → testing.`;
+        } else if (lease.role === 'tester') to = afterTesting;
         else {
-          const testerOk = !cfg.verification.testerRequired ||
+          const testerOk = !qa.reasons.length ||
             this.db.evidenceFor(task.id, head, 'tester', cfg.configRevision).some((e) => e.outcome === 'complete');
           if (testerOk && cfg.delivery.mode !== 'local') {
             // Publication (below) decides the final status; the task is never delivered before it succeeds.
             approved = true; publish = true;
           } else if (testerOk) { to = 'delivered'; approved = true; message = `Approved at ${head}; delivered locally (export with minions export).`; }
-          else { to = 'testing'; message = `Approval not applied: no passing tester evidence for head ${head} at config revision ${cfg.configRevision}. Run the tester again.`; }
+          else { to = 'testing'; message = `Approval not applied: QA required (${qaWhy}) and no passing tester evidence for head ${head} at config revision ${cfg.configRevision}. Run the tester.`; }
         }
         break;
       case 'needs_changes':
@@ -459,10 +548,13 @@ export class Scheduler {
       case 'partial': to = lease.role === 'engineer' ? (this.preClaimStatus(lease) ?? 'ready') : from; message = 'Partial result recorded; status unchanged.'; break;
     }
 
-    if (to !== from) {
-      if (to === 'delivered') await this.backlog.closeTask(task.id, 'delivered');
-      else await this.backlog.updateTask(task.id, task.version, { status: to });
+    // Record the QA requirement on the task (first QA label) so later stages and publication see it.
+    const labels = qa.record && to !== 'delivered' ? [...task.labels, qaLabelsOf(cfg)[0]!] : undefined;
+    if (to !== from || labels) {
+      if (to === 'done' || to === 'delivered') await this.backlog.closeTask(task.id, to);
+      else await this.backlog.updateTask(task.id, task.version, { ...(to !== from ? { status: to } : {}), ...(labels ? { labels } : {}) });
     }
+    if (labels) this.db.addEvent('qa-required', task.id, { leaseId, role: lease.role, head, reasons: qa.reasons, label: labels.at(-1) });
 
     this.db.transaction(() => {
       this.db.addEvidence({ task_id: task.id, head_sha: head, kind: lease.role, config_revision: cfg.configRevision,
@@ -477,7 +569,7 @@ export class Scheduler {
     });
     await this.cleanupLeaseFiles(leaseId);
     try {
-      await this.backlog.addNote(task.id, `minions: ${lease.role} ${r.status}${r.verdict ? ` (${r.verdict})` : ''} at ${head.slice(0, 12)}: ${r.summary}`);
+      await this.backlog.addNote(task.id, `minions: ${lease.role} ${r.status}${r.verdict ? ` (${r.verdict})` : ''} at ${head.slice(0, 12)}: ${r.summary}${to === 'testing' && qa.reasons.length ? ` (QA required: ${qaWhy})` : ''}`);
     } catch (e) {
       this.db.addEvent('record-backlog-error', task.id, { leaseId, error: (e as Error).message });
     }
@@ -547,7 +639,8 @@ export class Scheduler {
       return failWith('PRECONDITION', `${pub.branch} is at ${head ?? '(missing)'}, not the approved head ${pub.head_sha}; test and review the new head before publishing.`, false);
     }
     const reviewed = this.db.evidenceFor(taskId, head, 'reviewer', cfg.configRevision).some((e) => e.outcome === 'complete');
-    const tested = !cfg.verification.testerRequired || this.db.evidenceFor(taskId, head, 'tester', cfg.configRevision).some((e) => e.outcome === 'complete');
+    const tested = this.db.evidenceFor(taskId, head, 'tester', cfg.configRevision).some((e) => e.outcome === 'complete') ||
+      !(await this.qaRequirement(task, head)).reasons.length;
     if (!reviewed || !tested) {
       return failWith('PRECONDITION', `no ${!reviewed ? 'reviewer approval' : 'passing tester evidence'} for ${head} at config revision ${cfg.configRevision}; run the stage again.`, false);
     }

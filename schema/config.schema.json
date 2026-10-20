@@ -409,6 +409,13 @@
         "reviewerRequired": {
           "type": "boolean"
         },
+        "qaLabels": {
+          "minItems": 1,
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/__schema0"
+          }
+        },
         "ciAuthority": {
           "type": "string",
           "enum": [

@@ -25,6 +25,10 @@ Keep your context small: never read or paste full briefs or worker result JSON; 
 
 Stage order per task: engineer → {{testerStage}} → {{reviewerStage}} → delivered. One active stage per task.
 
+## Testing
+
+{{testingGuidance}}
+
 ## Limits
 
 - At most {{maxActiveTasks}} active tasks and {{maxEngineers}} concurrent engineers. The CLI enforces these; on `CAPACITY` wait for a running worker instead of retrying.

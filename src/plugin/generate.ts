@@ -225,7 +225,8 @@ function baseVars(cfg: MinionsConfig): Record<string, string> {
     sensitivePathsInline: inlineList(cfg.sensitivePaths, 'none configured'),
     capabilityTable: renderCapabilityTable(cfg),
     policySummary: renderPolicySummary(cfg, 'coordinator'),
-    testerStage: cfg.verification.testerRequired ? 'tester' : 'tester (optional)',
+    testerStage: cfg.verification.testerRequired ? 'tester' : 'tester (only when QA is required, see Testing)',
+    testingGuidance: testingGuidance(cfg),
     reviewerStage: cfg.verification.reviewerRequired ? 'reviewer' : 'reviewer (optional)',
     startReadyGuidance: startReadyGuidance(cfg),
   };
@@ -303,4 +304,17 @@ export async function generatePlugin(cfg: MinionsConfig, outDir: string): Promis
     }
   }
   return results.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+}
+
+/** Coordinator guidance for risk-based testing: when a task gets a tester, and when to run a QA sweep on the base. */
+function testingGuidance(cfg: MinionsConfig): string {
+  const labels = cfg.verification.qaLabels ?? ['qa'];
+  const base = code(cfg.git.baseBranch);
+  return [
+    cfg.verification.testerRequired
+      ? '`verification.testerRequired` is on: every task gets a tester stage after the engineer (set it to false on the host for risk-based testing).'
+      : 'Testing is risk-based: by default a task goes engineer → reviewer. The engineer writes and updates tests for the acceptance criteria; the reviewer owns test adequacy and requests changes when tests are missing or weak.',
+    `A task gets a tester stage when it carries a QA label (${inlineList(labels, '`qa`')}), its branch touches sensitive paths, or the reviewer sets \`"needsQa": true\`; the CLI records the last two as the ${code(labels[0]!)} label and moves the task to \`testing\` instead of delivered. Add the label yourself for risky tasks (install/upgrade paths, cross-feature changes) with \`minions backlog update <taskId> --label ${labels[0]}\` (repeat \`--label\` for the existing labels: it replaces the list).`,
+    `QA sweeps test ${base} itself, not a ticket branch. Schedule one at a milestone, before a release, after about five merges since the last sweep, or when the user asks: create a task labelled \`qa-sweep\` (\`minions backlog create --title "QA sweep: <scope>" --label qa-sweep --key qa-sweep:<milestone or date>\`) and claim it with \`--role tester\`. The tester checks end-to-end flows, install/upgrade paths and cross-feature regressions in a detached worktree at the ${base} head and commits nothing. Recording it closes the sweep as done; create one backlog task per finding (idempotency key \`qa:<sweepId>:<n>\`). Sweeps are not per-ticket work: never start one per task.`,
+  ].join('\n\n');
 }
