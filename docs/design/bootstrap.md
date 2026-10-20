@@ -616,8 +616,21 @@ date is the source phase. It runs before everything else (see "Upgrade from the 
   acts only on subagents (hook input `agent_id`) of a `minions:<role>` type while an active lease of
   that role exists; the coordinator, other subagents and unleased sessions are never affected. The first
   call adds the checkpoint notice (commit `wip:`, return a partial result listing the remaining work;
-  reviewers return partial at once); after 10 more calls only read-only tools, non-destructive git and
-  `minions work submit` are allowed. A hook error allows the call, except for a leased worker during
+  reviewers return partial at once); after 10 more calls only read-only tools, the Handback tool and
+  allowlisted Bash commands are allowed. The Bash check (`drainSafeBash`, task-3.9) is a strict
+  allowlist of whole command forms, not a shell parser: anything it does not recognize is denied. A
+  one-line command is simple commands joined only by `&&` (optionally starting with `cd <path> &&`),
+  made of plain words (`[A-Za-z0-9_./:=@%+,-]`), single-quoted strings and double-quoted strings
+  without `$`, backticks or `\`; every other character outside quotes (substitutions, expansions,
+  globs, `;`, `|`, redirections, `#`, tabs) is denied, except the exact trailing tokens `>/dev/null`,
+  `2>&1` and `| head -<n>`/`| tail -<n>`. Allowed commands: `git [-C <path>] [--no-pager]` with
+  `status|log|diff|show|rev-parse` (no `--output`), `branch` (listing only), `add <paths|-A|-u>`
+  and `commit -m <quoted message>` (no other flags, so no `--amend`; `git -c` is denied), plus `ls`,
+  `cat <file>`, `pwd`, `echo` and `minions work submit|brief <lease> [--role <r>] --json`. Multi-line
+  commands must match one of three heredoc forms as a whole string, with single-quoted delimiters and
+  an unparsed body: the result-contract submit (`minions work submit … --json <<'RESULT'`), the Claude
+  Code commit (`git commit -m "$(cat <<'EOF'` … `EOF` `)"`, nothing after) and `git commit -F - <<'EOF'`,
+  each optionally preceded by `cd <path> &&` (commit forms also by `git add … &&`). The drain is a cooperative safeguard, not a sandbox: allowed git commands can run programs set in repo config/attributes (core.fsmonitor, diff.external, filter/textconv drivers, commit hooks), and `git -C <path>` or `cd <path>` can point at a repo with pre-staged config; this residual is accepted as the same trust class as worker code already running. A hook error allows the call, except for a leased worker during
   a drain, which is restricted the same way. The coordinator needs no new wake-up: worker completions
   wake it, claims are refused while starts are paused, and a partial from a lease that was active when
   a drain was requested is recorded with `drain: true` (not a failed attempt or a repair cycle). The

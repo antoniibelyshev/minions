@@ -169,53 +169,213 @@ export function preTelegramHook(input: unknown): HookOutput {
 /** Tool calls a leased worker may make freely after the first drain notice, before it is restricted. */
 export const DRAIN_GRACE_CALLS = 10;
 const DRAIN_READ_ONLY_TOOLS = new Set(['Read', 'Glob', 'Grep', 'LS', 'NotebookRead', 'TodoWrite']);
-/** git subcommands that record or inspect work; anything that could discard uncommitted changes is absent. */
-const DRAIN_GIT = new Set(['add', 'commit', 'status', 'log', 'diff', 'show', 'rev-parse', 'branch', 'ls-files']);
-const DRAIN_SHELL = new Set(['cd', 'pwd', 'ls', 'cat', 'head', 'tail', 'wc', 'echo', 'grep', 'true']);
-
 /**
- * Splits a shell line on unquoted `&&`, `||`, `;`, `|` and a lone `&` (not the `&` of `2>&1`, `>&2`, `&>`);
- * stops at an unquoted `<<` (the heredoc body is data).
+ * The upgrade-drain Bash check (task-3.9): a strict allowlist of whole command forms. Anything it does
+ * not recognize is denied; shell grammar beyond these forms is never interpreted.
+ *
+ * A line without a newline is one or more simple commands joined only by `&&`, optionally starting with
+ * `cd <path> &&`. Words are plain (`[A-Za-z0-9_./:=@%+,-]`), single-quoted (no newline), or double-quoted
+ * without `$`, a backtick, `\` or a newline; adjacent parts join into one word. Any other character
+ * outside quotes is denied, so substitutions, expansions, globs, `;`, `<`, `>`, `!`, `#`, tabs and
+ * newlines never reach a shell. A simple command may end with the exact tokens `>/dev/null` and `2>&1`,
+ * then `| head -<n>` or `| tail -<n>`. The command name must be a plain word and one of:
+ *
+ * - `git [-C <path>] [--no-pager] <sub>` with `status|log|diff|show|rev-parse` (no `--ou…` argument,
+ *   which git expands to `--output=<file>`), `branch` (no args or one of `--show-current -a -r --list`),
+ *   `add <paths|-A|-u>` and `commit -m <quoted message>` (no other flags: no `--amend`, `-a`, `-c`).
+ *   `git -c` is denied (core.fsmonitor, core.pager and aliases run commands).
+ * - `ls`, `cat <file>`, `pwd`, `echo`, and `minions work submit|brief <lease> [--role <r>] --json`.
+ *
+ * A line with a newline must be one of three heredoc forms, matched structurally; the body is not parsed:
+ * - `[cd <path> && ]minions work submit <lease> [--role <r>] --json <<'RESULT'\n<body>\nRESULT[\n]`,
+ *   with no body line exactly `RESULT` (the worker result contract).
+ * - `[cd <path> && ][git add … && ]git commit -m "$(cat <<'EOF'\n<body>\nEOF\n)"` and nothing after; no
+ *   body line may start with `EOF` (inside `$( )` bash also ends the body at a line like `EOF)`).
+ * - `[cd <path> && ][git add … && ]git commit -F - <<'EOF'\n<body>\nEOF[\n]`, no body line exactly `EOF`.
+ * The delimiters are single-quoted, so the shell never expands the body.
+ *
+ * This drain is a cooperative safeguard, not a sandbox: allowed git commands can run programs set in
+ * repo config/attributes (core.fsmonitor, diff.external, filter/textconv drivers, commit hooks), and
+ * `git -C <path>` or `cd <path>` can point at a repo with pre-staged config. This residual is accepted
+ * as the same trust class as worker code already running.
  */
-function shellSegments(cmd: string): { segments: string[]; redirect: boolean } {
-  const segments: string[] = [];
-  let cur = '';
-  let quote: string | null = null;
-  let redirect = false;
-  for (let i = 0; i < cmd.length; i++) {
-    const c = cmd[i]!;
-    if (quote) { if (c === quote) quote = null; else if (c === '\\' && quote === '"') { cur += c + (cmd[++i] ?? ''); continue; } cur += c; continue; }
-    if (c === "'" || c === '"') { quote = c; cur += c; continue; }
-    if (c === '<' && cmd[i + 1] === '<') break;
-    if (c === '\n' || c === ';' || c === '|' || (c === '&' && cmd[i - 1] !== '>' && cmd[i + 1] !== '>')) {
-      segments.push(cur); cur = '';
-      if ((c === '|' || c === '&') && cmd[i + 1] === c) i++;
-      continue;
+interface ShellWord { text: string; quoted: boolean }
+type ShellToken = { kind: 'and' | 'pipe' } | { kind: 'redirect'; text: string } | { kind: 'word'; word: ShellWord };
+
+const PLAIN_CHAR = /^[A-Za-z0-9_./:=@%+,-]$/;
+const DRAIN_REDIRECTS = ['2>&1', '>/dev/null'];
+
+function drainTokens(line: string): ShellToken[] | null {
+  const tokens: ShellToken[] = [];
+  const boundary = (n: number) => n === line.length || line[n] === ' ';
+  let i = 0;
+  while (i < line.length) {
+    if (line[i] === ' ') { i++; continue; }
+    if (line.startsWith('&&', i)) { tokens.push({ kind: 'and' }); i += 2; continue; }
+    if (line[i] === '|' && boundary(i + 1)) { tokens.push({ kind: 'pipe' }); i++; continue; }
+    const redirect = DRAIN_REDIRECTS.find((r) => line.startsWith(r, i) && boundary(i + r.length));
+    if (redirect) { tokens.push({ kind: 'redirect', text: redirect }); i += redirect.length; continue; }
+    let text = '';
+    let quoted = false;
+    const start = i;
+    while (i < line.length) {
+      const c = line[i]!;
+      if (c === "'" || c === '"') {
+        const end = line.indexOf(c, i + 1);
+        if (end < 0) return null;
+        const body = line.slice(i + 1, end);
+        if (body.includes('\n') || (c === '"' && /[$`\\]/.test(body))) return null;
+        text += body; quoted = true; i = end + 1;
+      } else if (PLAIN_CHAR.test(c)) { text += c; i++; }
+      else break;
     }
-    // Output redirection writes files; only `>/dev/null` and `2>&1` are harmless.
-    if (c === '>' && !/^>\s*\/dev\/null\b/.test(cmd.slice(i)) && !(cmd[i - 1] === '2' && cmd.startsWith('>&1', i))) redirect = true;
-    cur += c;
+    if (i === start || !(boundary(i) || line.startsWith('&&', i))) return null;
+    tokens.push({ kind: 'word', word: { text, quoted } });
   }
-  segments.push(cur);
-  return { segments: segments.map((s) => s.trim()).filter(Boolean), redirect };
+  return tokens;
 }
 
-/** True for Bash lines that only commit, inspect, or submit the result (no edits, no discarding). */
-export function drainSafeBash(command: string): boolean {
-  const { segments, redirect } = shellSegments(command);
-  if (redirect || !segments.length) return false;
-  return segments.every((s) => {
-    const words = s.split(/\s+/);
-    if (words[0] === 'git') {
-      let i = 1;
-      while (words[i] === '-C' || words[i] === '-c') i += 2;
-      while (words[i]?.startsWith('--no-pager') || words[i] === '--no-optional-locks') i++;
-      if (words.slice(i + 1).some((w) => w.startsWith('--output'))) return false; // `git diff --output=f` writes f
-      return DRAIN_GIT.has(words[i] ?? '') && !(words[i] === 'branch' && words.slice(i + 1).some((w) => /^-[dDmMfc]|^--(delete|move|force|copy)/.test(w)));
+/** A newline-free line as its `&&`-joined simple commands (words; `tail` when redirects or a pipe follow), or null. */
+function drainChain(line: string): { words: ShellWord[]; tail: boolean }[] | null {
+  if (line.includes('\n')) return null;
+  const tokens = drainTokens(line);
+  if (!tokens) return null;
+  const commands: { words: ShellWord[]; tail: boolean }[] = [];
+  let k = 0;
+  for (;;) {
+    const words: ShellWord[] = [];
+    while (tokens[k]?.kind === 'word') words.push((tokens[k++] as { word: ShellWord }).word);
+    if (!words.length) return null;
+    const seen = new Set<string>();
+    let tail = false;
+    for (let t = tokens[k]; t?.kind === 'redirect'; t = tokens[++k]) {
+      if (seen.has(t.text)) return null;
+      seen.add(t.text); tail = true;
     }
-    if (words[0] === 'minions') return words[1] === 'work' && (words[2] === 'submit' || words[2] === 'brief');
-    return DRAIN_SHELL.has(words[0]!);
+    if (tokens[k]?.kind === 'pipe') {
+      const [cmd, count] = [tokens[k + 1], tokens[k + 2]];
+      if (cmd?.kind !== 'word' || count?.kind !== 'word' || cmd.word.quoted || count.word.quoted) return null;
+      if (!['head', 'tail'].includes(cmd.word.text) || !/^-[1-9][0-9]{0,5}$/.test(count.word.text)) return null;
+      k += 3; tail = true;
+    }
+    commands.push({ words, tail });
+    if (k === tokens.length) return commands;
+    if (tokens[k]!.kind !== 'and') return null;
+    k++;
+  }
+}
+
+const DRAIN_GIT_READ = new Set(['status', 'log', 'diff', 'show', 'rev-parse']);
+const DRAIN_GIT_BRANCH_ARGS = new Set(['--show-current', '-a', '-r', '--list']);
+
+/** `git` with at most one `-C <path>` and one `--no-pager`: the index of the subcommand word, or -1. Other global options (`-c`) are denied. */
+function gitSubcommandAt(words: ShellWord[]): number {
+  let i = 1;
+  let cd = false;
+  let pager = false;
+  for (;;) {
+    const w = words[i];
+    if (!w || w.quoted) return -1;
+    if (w.text === '-C' && !cd && words[i + 1]) { cd = true; i += 2; }
+    else if (w.text === '--no-pager' && !pager) { pager = true; i++; }
+    else return w.text.startsWith('-') ? -1 : i;
+  }
+}
+
+const isGitCommit = (words: ShellWord[]) => words[0]?.text === 'git' && !words[0].quoted && gitSubcommandAt(words) === words.length - 1 && words.at(-1)!.text === 'commit';
+
+function drainGitOk(words: ShellWord[]): boolean {
+  const at = gitSubcommandAt(words);
+  if (at < 0) return false;
+  const sub = words[at]!.text;
+  const args = words.slice(at + 1);
+  // git expands unambiguous long-option prefixes: `--ou`, `--outp` all mean `--output=<file>`.
+  if (DRAIN_GIT_READ.has(sub)) return !args.some((a) => a.text.startsWith('--ou'));
+  if (sub === 'branch') return args.length === 0 || (args.length === 1 && DRAIN_GIT_BRANCH_ARGS.has(args[0]!.text));
+  if (sub === 'add') {
+    const dashdash = args.findIndex((a) => a.text === '--');
+    return (dashdash < 0 ? args : args.slice(0, dashdash)).every((a) => a.text === '-A' || a.text === '-u' || !a.text.startsWith('-'));
+  }
+  if (sub === 'commit') return args.length === 2 && args[0]!.text === '-m' && !args[0]!.quoted && args[1]!.quoted;
+  return false;
+}
+
+/** `minions work submit|brief <lease> [--role <r>] --json`. */
+function drainMinionsOk(words: ShellWord[], verbs: string[]): boolean {
+  const [, work, verb, lease, ...rest] = words.map((w) => (w.quoted ? '' : w.text));
+  if (work !== 'work' || !verbs.includes(verb ?? '') || !/^[A-Za-z0-9_-]+$/.test(lease ?? '')) return false;
+  const tail = rest.join(' ');
+  return tail === '--json' || /^--role [a-z-]+ --json$/.test(tail);
+}
+
+/** One simple command at `pos` of `total` in an `&&` chain. */
+function drainCommandOk(words: ShellWord[], pos: number, total: number): boolean {
+  const name = words[0]!;
+  if (name.quoted) return false;
+  switch (name.text) {
+    case 'cd': return pos === 0 && total > 1 && words.length === 2;
+    case 'pwd': return words.length === 1;
+    case 'cat': return words.length === 2;
+    case 'ls': case 'echo': return true;
+    case 'git': return drainGitOk(words);
+    case 'minions': return drainMinionsOk(words, ['submit', 'brief']);
+    default: return false;
+  }
+}
+
+/**
+ * The head line of a heredoc form (before ` <<'…'`): `[cd <path> && ]` then, for commit forms, `git add …`
+ * commands, then the final command, which `last` checks. No redirects or pipes anywhere.
+ */
+function drainHeredocHead(head: string, last: (words: ShellWord[]) => boolean, adds: boolean): boolean {
+  const chain = drainChain(head);
+  if (!chain || chain.some((c) => c.tail)) return false;
+  return chain.every(({ words }, pos) => {
+    if (pos === chain.length - 1) return last(words);
+    if (words[0]!.text === 'cd' && !words[0]!.quoted) return drainCommandOk(words, pos, chain.length);
+    return adds && words[0]!.text === 'git' && !words[0]!.quoted && words[gitSubcommandAt(words)]?.text === 'add' && drainGitOk(words);
   });
+}
+
+/** The body lines of a heredoc closed by `delim` on its own line (plus an optional final newline), or null. */
+function heredocBody(rest: string, delim: string): string[] | null {
+  const lines = rest.split('\n');
+  if (lines.at(-1) === '') lines.pop();
+  if (lines.pop() !== delim) return null;
+  return lines.includes(delim) ? null : lines;
+}
+
+const SUBMIT_OPEN = " <<'RESULT'";
+const COMMIT_MESSAGE_OPEN = ` -m "$(cat <<'EOF'`;
+const COMMIT_FILE_OPEN = " -F - <<'EOF'";
+
+/**
+ * True for Bash lines that only commit, inspect, or submit the result (see the allowlist above).
+ * Decisions (task-3.9): unknown forms are denied; `git -c` is denied; `git -C <path>` is allowed (workers
+ * use it instead of `cd`); `git commit --amend` is denied (it rewrites a commit that may already be recorded).
+ */
+export function drainSafeBash(command: string): boolean {
+  const nl = command.indexOf('\n');
+  if (nl < 0) {
+    const chain = drainChain(command);
+    return !!chain && chain.every(({ words }, pos) => drainCommandOk(words, pos, chain.length));
+  }
+  const first = command.slice(0, nl);
+  const rest = command.slice(nl + 1);
+  if (first.endsWith(SUBMIT_OPEN)) {
+    return drainHeredocHead(first.slice(0, -SUBMIT_OPEN.length), (w) => w[0]?.text === 'minions' && !w[0].quoted && drainMinionsOk(w, ['submit']), false)
+      && heredocBody(rest, 'RESULT') !== null;
+  }
+  if (first.endsWith(COMMIT_MESSAGE_OPEN)) {
+    if (!drainHeredocHead(first.slice(0, -COMMIT_MESSAGE_OPEN.length), isGitCommit, true)) return false;
+    const lines = rest.split('\n');
+    if (lines.pop() !== ')"' || lines.pop() !== 'EOF') return false;
+    return !lines.some((l) => l.startsWith('EOF'));
+  }
+  if (first.endsWith(COMMIT_FILE_OPEN)) {
+    return drainHeredocHead(first.slice(0, -COMMIT_FILE_OPEN.length), isGitCommit, true) && heredocBody(rest, 'EOF') !== null;
+  }
+  return false;
 }
 
 const drainAllowed = (tool: string, ti: Record<string, unknown>): boolean =>
@@ -229,7 +389,7 @@ export function drainNotice(role: LeaseRole, reason: string): string {
     : role === 'tester'
       ? `${head}: reach a safe checkpoint now. If you changed tests, commit them on your branch (message prefix \`wip:\`); if you have nothing to commit, return a partial WorkerResult right away. List the remaining testing in findings and nextAction.`
       : `${head}: reach a safe checkpoint now. Commit work in progress on your branch (message prefix \`wip:\`), then return a partial WorkerResult that lists the remaining work.`;
-  return `${what} Never discard uncommitted changes (no reset, checkout, restore, clean or stash). After about ${DRAIN_GRACE_CALLS} more tool calls only read-only tools, git (add/commit/status/log/diff) and \`minions work submit\` are allowed.`;
+  return `${what} Never discard uncommitted changes (no reset, checkout, restore, clean or stash). After about ${DRAIN_GRACE_CALLS} more tool calls only read-only tools, git status|log|diff|show|rev-parse, git add <paths|-A|-u>, git commit -m "<quoted msg>" or the $(cat <<'EOF' … EOF) / -F - <<'EOF' forms (no --amend, no -a), cd <path> && …, and minions work submit|brief <lease> [--role <r>] --json are allowed.`;
 }
 
 const addContext = (text: string, reason: string): HookOutput => ({
@@ -240,9 +400,10 @@ const addContext = (text: string, reason: string): HookOutput => ({
  * PreToolUse(every tool) drain hook; the plugin runs it only while the drain flag file exists. It acts
  * only on minions worker subagents (hook input `agent_id` + a `minions:<role>` `agent_type`) while an
  * active lease of that role exists: the first call gets the checkpoint notice as context, then after
- * DRAIN_GRACE_CALLS everything but read-only tools, git and `minions work submit` is denied. The
- * coordinator (no agent_id), other subagents and unleased sessions are always allowed. An error allows
- * the call, except for a minions worker during a drain, which is restricted (fails closed).
+ * DRAIN_GRACE_CALLS everything but read-only tools, the Handback tool, and allowlisted Bash commands
+ * is denied (see `drainSafeBash` for the allowlist). The coordinator (no agent_id), other subagents and
+ * unleased sessions are always allowed. An error allows the call, except for a minions worker during a
+ * drain, which is restricted (fails closed).
  */
 export async function drainHook(input: unknown, load: DrainLoader): Promise<HookOutput> {
   const inp = isObj(input) ? input : {};
@@ -261,11 +422,11 @@ export async function drainHook(input: unknown, load: DrainLoader): Promise<Hook
     const hits = db.drainHit(drain.eventId, agentId);
     if (hits === 1) return addContext(drainNotice(role, drain.reason), `context: drain notice to ${agentType} ${agentId}`);
     if (hits <= DRAIN_GRACE_CALLS + 1 || drainAllowed(tool, ti)) return { reason: `allow: ${agentType} ${agentId} ${tool} during drain (call ${hits})` };
-    return deny(`Drain in progress (${drain.reason}): only read-only tools, git (add/commit/status/log/diff) and \`minions work submit\` are allowed now. ` +
-      'Commit work in progress on your branch (message prefix `wip:`), then return a partial WorkerResult that lists the remaining work. Uncommitted changes are never discarded.');
+    return deny(`Drain in progress (${drain.reason}): git status|log|diff|show|rev-parse, git add <paths|-A|-u>, git commit -m "<quoted msg>" or the $(cat <<'EOF' … EOF) / -F - <<'EOF' forms, cd <path> && …, and minions work submit|brief are allowed. ` +
+      'Commit work in progress (`wip:`), then return a partial WorkerResult listing the remaining work. Uncommitted changes are never discarded.');
   } catch (e) {
     if (drainAllowed(tool, ti)) return { reason: `allow: ${tool} (drain state unreadable: ${(e as Error).message})` };
-    return deny(`minions could not read the drain state (${(e as Error).message}); while a drain is pending only read-only tools, git and \`minions work submit\` are allowed. Commit work in progress (\`wip:\`) and return a partial WorkerResult.`);
+    return deny(`minions could not read the drain state (${(e as Error).message}); while a drain is pending git status|log|diff|show|rev-parse, git add <paths|-A|-u>, git commit, cd <path> && …, and minions work submit|brief are allowed. Commit work in progress (\`wip:\`) and return a partial WorkerResult.`);
   }
 }
 

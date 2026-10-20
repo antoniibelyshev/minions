@@ -241,27 +241,248 @@ describe('drain hook gate and phases (tester additions)', () => {
     expect(out(await drainHook(worker('minions:tester', 'Edit'), load)).hookSpecificOutput.additionalContext).toMatch(/Upgrade pending/);
   });
 
-  it('drainSafeBash: the usual Claude Code commit forms and the plain submit forms pass', () => {
+  // task-3.9: drainSafeBash is a strict allowlist of whole command forms (see src/runtime/hooks.ts).
+  const longResult = JSON.stringify({
+    status: 'partial',
+    summary: 'Drained mid-task: $(not run) `nor this` > nothing; "quotes" and \'apostrophes\'.',
+    checks: [{ command: 'npm test', outcome: 'pass', details: '1 | 2 && 3' }],
+    findings: Array.from({ length: 40 }, (_, k) => `finding ${k}: EOF RESULT ) ;`),
+  }, null, 2);
+
+  it('drainSafeBash: the real worker finish and commit forms pass (templates and Claude Code)', () => {
+    // The finish command exactly as templates/plugin/_partials/result-contract.md renders it.
+    const template = readFileSync(new URL('../../templates/plugin/_partials/result-contract.md', import.meta.url), 'utf8');
+    const submit = /```bash\n([\s\S]*?)\n```/.exec(template)![1]!.replace('<leaseId>', 'lease-1').replace('{{workerRole}}', 'engineer').replace('{ ...WorkerResult JSON... }', longResult);
+    expect(submit.startsWith("minions work submit lease-1 --role engineer --json <<'RESULT'\n")).toBe(true);
+    // The brief command from worker-common.md.
+    const common = readFileSync(new URL('../../templates/plugin/_partials/worker-common.md', import.meta.url), 'utf8');
+    const brief = /^cd <worktree> && minions work brief .*$/m.exec(common)![0].replace('<worktree>', '/w').replace('<leaseId>', 'lease-1').replace('{{workerRole}}', 'tester');
     for (const ok of [
-      "git commit -m \"$(cat <<'EOF'\nwip: half of it\n\nCo-Authored-By: X <x@y>\nEOF\n)\"",
-      'git -C /w add -A && git -C /w commit -m "wip: x"',
+      submit,
+      `${submit}\n`,
+      brief,
+      `cd /w && minions work submit lease-1 --role tester --json <<'RESULT'\n${longResult}\nRESULT`,
       "minions work submit lease-1 --role tester --json <<'RESULT'\n{\"status\":\"partial\"}\nRESULT",
       "cd \"/w with space\" && minions work submit lease-1 --role tester --json <<'RESULT'\n{}\nRESULT",
-      "cd /w && minions work submit lease-1 --json <<'RESULT'\n{}\nRESULT",
-      'git status 2>&1 | head -5',
-    ]) expect(drainSafeBash(ok), ok).toBe(true);
+      "cd '/w with space' && minions work submit lease-1 --json <<'RESULT'\n{}\nRESULT",
+      "cd /w && minions work submit lease-1 --json <<'RESULT'\nRESULT",
+      "minions work submit lease-1 --json <<'RESULT'\n{\"summary\": \"a \\\\\n b\"}\nRESULT",
+      "git commit -m \"$(cat <<'EOF'\nwip: half of it\n\nCo-Authored-By: X <x@y>\nEOF\n)\"",
+      `git add -A && git commit -m "$(cat <<'EOF'\nwip: drain\n\n${longResult}\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\nEOF\n)"`,
+      `git -C "/w with space" commit -m "$(cat <<'EOF'\n${longResult}\nEOF\n)"`,
+      "git commit -m \"$(cat <<'EOF'\nwip: a ) b $(c) `d`\nEOF\n)\"",
+      "cd \"/w with space\" && git add -A && git add src/a.ts && git commit -m \"$(cat <<'EOF'\nwip\nEOF\n)\"",
+      "git add -A && git commit -m \"$(cat <<'EOF'\nwip: a \\\nb\nEOF\n)\"",
+      "git commit -F - <<'EOF'\nwip: a > b\nEOF",
+      "cd /w && git add -u && git commit -F - <<'EOF'\nwip\nEOF\n",
+    ]) expect(drainSafeBash(ok), JSON.stringify(ok.slice(0, 120))).toBe(true);
   });
 
-  it('drainSafeBash: no submit shortcut, a lone & separates commands, and git --output is rejected', () => {
+  it('drainSafeBash: allowed one-line commands', () => {
+    for (const ok of [
+      'git add -A && git commit -m "wip: half of it; tests next"',
+      'git -C /w add -A && git -C /w commit -m "wip: x"',
+      "git commit -m 'wip: $(literal) `x` ; | > <'",
+      'git commit -m "wip: amend later"',
+      'git status 2>&1 | head -5',
+      'git diff 2>&1 | head -5',
+      'git log --oneline -20 | tail -3',
+      'git status 2>&1',
+      'git status >/dev/null 2>&1',
+      'git rev-parse HEAD',
+      'git -C "/w with space" status',
+      'git --no-pager -C /w log -1',
+      "git -C /w --no-pager diff --stat 'HEAD~1'",
+      'git show HEAD:src/a.ts',
+      'git diff --name-only main...HEAD',
+      'git branch', 'git branch --show-current', 'git branch -a', 'git branch -r', 'git branch --list',
+      'git add -- -weird-name.ts',
+      'cd /w && git status && git log --oneline -1 && git diff --stat',
+      "echo '$(rm -rf src) `x`'",
+      'echo "done: a; b | c > d"',
+      'echo ' + 'a '.repeat(200_000),
+      'ls -la src', 'cat src/a.ts', 'pwd', 'cd /w && pwd',
+    ]) expect(drainSafeBash(ok), JSON.stringify(ok.slice(0, 120))).toBe(true);
+  });
+
+  it('drainSafeBash: commands after a heredoc terminator, or around a heredoc form, are denied', () => {
     for (const bad of [
-      'minions work submit L --json; git reset --hard',
-      'minions work submit L --json && rm -rf src',
-      'cd /w && minions work submit L --json & git checkout -- .',
-      'git status & rm -rf src',
-      'git status&rm -rf src',
-      'git diff --output=src/a.ts',
-      'git -C /w diff --output src/a.ts HEAD',
-    ]) expect(drainSafeBash(bad), bad).toBe(false);
+      'cat <<EOF; git reset --hard\nbody\nEOF',
+      "cat <<'EOF'\nbody\nEOF\ngit reset --hard",
+      "cat <<'EOF'\n$(rm -rf src) `rm x` > b\nEOF\ngit status",
+      "cat <<'A' <<'B'\na\nA\nb\nB\ngit status",
+      'cat <<EOF\nplain body\nEOF',
+      'cat <<"EOF"\n$(rm x)\nEOF\ngit status',
+      'cat <<EOF\nbody\nEOF \nrm x\nEOF',
+      "minions work submit L --json <<'RESULT'\n{}\nRESULT\ngit reset --hard",
+      "minions work submit L --json <<'RESULT'\n{}\nRESULT\nRESULT",
+      "minions work submit L --json <<'RESULT'\n{}\nRESULT\n\n",
+      "minions work submit L --json <<'RESULT' && rm -rf src\n{}\nRESULT",
+      "minions work submit L --json <<RESULT\n{}\nRESULT",
+      'minions work submit L --json <<"RESULT"\n{}\nRESULT',
+      "minions work submit L --json <<-'RESULT'\n{}\n\tRESULT",
+      "minions work submit L --json <<'RESULT'\n{}\nRESULT )",
+      "minions work submit L --json <<'RESULT'\nno terminator",
+      "rm -rf src && minions work submit L --json <<'RESULT'\n{}\nRESULT",
+      "git add -A && minions work submit L --json <<'RESULT'\n{}\nRESULT",
+      "minions work submit L --json 2>&1 <<'RESULT'\n{}\nRESULT",
+      "git commit -F - <<-'EOF'\n\twip\n\tEOF",
+      "git commit -F - <<-'EOF'\n\twip\n\tEOF\nrm -rf src",
+      "git commit -F - <<'EOF'\nwip\nEOF\nrm -rf src",
+      "git commit --amend -F - <<'EOF'\nwip\nEOF",
+      "cat <<'A' <<'B'\na\nA\nb\nB\nrm x",
+      "cat <<'EOF'\nno terminator",
+      'git status #<<EOF\nrm -rf src\nEOF',
+      'cat <<<"x"',
+    ]) expect(drainSafeBash(bad), JSON.stringify(bad)).toBe(false);
+  });
+
+  it('drainSafeBash: substitutions are denied except the cat-heredoc commit message form', () => {
+    for (const bad of [
+      'git commit -m "$(rm -rf src)"',
+      'git commit -m $(rm -rf src)',
+      'git commit -m "`rm -rf src`"',
+      'echo `rm x`',
+      'echo "\\$(not run) \\`x\\`"',
+      'echo "$HOME"',
+      "echo \"$'x\"",
+      'cat <(rm -rf src)',
+      'git diff >(cat)',
+      'cat <<EOF\n$(rm -rf src)\nEOF',
+      'cat <<EOF\n`rm x`\nEOF',
+      // The commit form with anything after it, or a variant of its fixed parts.
+      "git commit -m \"$(cat <<'EOF'\nwip\nEOF\n)\" && rm -rf src",
+      "git commit -m \"$(cat <<'EOF'\nwip\nEOF\n)\" && git status",
+      "git commit -m \"$(cat <<'EOF'\nwip\nEOF\n)\"; rm x",
+      "git commit -m \"$(cat <<'EOF'\nwip\nEOF\n)\"\nrm x",
+      "git commit -m \"$(cat <<'EOF'\nwip\nEOF\n)\" | sh",
+      "git commit -m \"$(cat <<'EOF'\nwip\nEOF\n)\"\n",
+      "git commit -m \"$(cat <<'EOF'\nmsg\nEOF\n)$(touch /tmp/p)\"",
+      `git -C "/w with space" commit -m "$(cat <<'EOF'\n${longResult}\nEOF\n)" && git status --short && git log --oneline -1`,
+      "git commit -m $(cat <<'EOF'\nwip\nEOF\n); rm -rf src",
+      "git commit -m \"$(cat <<'EOF'\nwip\n)\"",
+      'git commit -m "$(cat <<EOF\nwip\nEOF\n)"',
+      "git commit -m \"$(cat <<-'EOF'\nwip\nEOF\n)\"",
+      "git commit -m \"$(cat <<'EOF'\nwip\nEOF\n )\"",
+      "git commit -a -m \"$(cat <<'EOF'\nwip\nEOF\n)\"",
+      "git commit --amend -m \"$(cat <<'EOF'\nwip\nEOF\n)\"",
+      "git -c core.hooksPath=/tmp commit -m \"$(cat <<'EOF'\nwip\nEOF\n)\"",
+      "rm -rf src && git commit -m \"$(cat <<'EOF'\nwip\nEOF\n)\"",
+      "git status && git commit -m \"$(cat <<'EOF'\nwip\nEOF\n)\"",
+      // A body line that ends the heredoc early inside `$( )`.
+      "echo \"$(cat <<'EOF'\nwip\nEOF)\"\ntouch /tmp/p\nEOF\n)\"",
+      "git commit -m \"$(cat <<'EOF'\nwip\nEOF)\"\ntouch /tmp/p\nEOF\n)\"",
+      "git commit -m \"$(cat <<'EOF'\nwip\nEOF\ntouch /tmp/p\nEOF\n)\"",
+      "git commit -m \"$(cat <<'EOF'\nwip\nEOF )\ntouch /tmp/p\nEOF\n)\"",
+      // CRLF: the carriage return is not part of the allowed forms.
+      "git commit -m \"$(cat <<'EOF'\r\nwip\r\nEOF\r\n)\"",
+      'git status "unterminated',
+    ]) expect(drainSafeBash(bad), JSON.stringify(bad.slice(0, 120))).toBe(false);
+  });
+
+  it('drainSafeBash: only the listed command names and git subcommands, with their argument rules', () => {
+    for (const bad of [
+      'git checkout -- .', 'git clean -fd', 'git stash', 'git restore a.ts', 'git reset --hard', 'git rm a.ts',
+      'git switch main', 'git rebase main', 'git merge x', 'git push', 'git fetch', 'git pull', 'git tag x', 'git worktree remove /w',
+      'git apply p.diff', 'git am p', 'git cherry-pick x', 'git revert x', 'git update-ref -d HEAD', 'git config core.pager x', 'git ls-files',
+      'git branch -D x', 'git branch -d x', 'git branch -m x y', 'git branch x', 'git branch -vD x', 'git branch --del x', 'git branch -a -D x',
+      'git branch --show-current x', 'git branch -f main HEAD~1',
+      'git -c core.fsmonitor=x status', 'git -c core.pager=x log', 'git -C /w -c core.pager=x log', 'git --no-pager -c core.pager=x diff',
+      "git -c alias.st='!rm x' st", 'git --git-dir=/x status', 'git --exec-path=/x status', 'git -C', 'git',
+      'git commit --amend --no-edit', 'git commit --amend -m "wip"', 'git -C /w commit --ame --no-edit', 'git commit -m wip',
+      'git commit -am "wip"', 'git commit -a -m "wip"', 'git commit -m "wip" -a', 'git commit -c HEAD', 'git commit -m "a" -m "b"',
+      'git commit -m "wip" --no-verify', 'git commit', 'git commit --fixup=HEAD',
+      'git add -p', 'git add --chmod=+x a', 'git add -f build/', 'git add --pathspec-from-file=x',
+      'git diff --output=src/a.ts', 'git -C /w diff --output src/a.ts HEAD', 'git log --outp=x', 'git show --ou=x HEAD', 'git diff "--output=x"',
+      '"git" reset --hard', "'git' status", 'g"it" status', 'GIT_DIR=x git status', 'X=1 git status', 'env X=1 git status',
+      'rm -rf src', 'npm test', 'minions backlog create', 'minions work record L --json', 'minions work submit L', 'minions work submit L --role x',
+      'minions work submit "L" --json', 'minions work submit L --json --force', 'minions work submit L --role "x" --json',
+      'cd /w', 'git status && cd /w && git log', 'cd /w x && git status', 'cat a b', 'cat', 'pwd x', 'head -5 a', 'tail a', 'grep x a', 'true',
+      'cat a > b', 'git status; rm x', 'git status >x', 'git status >>/dev/null', 'git status 1>/dev/null', 'git status 2>&1x',
+      'git status 2>&1"x"', 'git status >/dev/null"x"', 'git status >/dev/null-x', 'git status >/dev/null >/dev/null', 'git status 2>&1 git log',
+      '>/dev/null git status', 'git status | sh', 'git status | head', 'git status | head -5 | sh', 'git status | head -0', 'git status | head -n 5',
+      'git status | head -5 2>&1', '&& git status', 'git status &&', 'git status && && git log', 'git status||rm x',
+      'minions work submit L --json; git reset --hard', 'minions work submit L --json && rm -rf src',
+      'cd /w && minions work submit L --json & git checkout -- .', 'git status & rm -rf src', 'git status&rm -rf src',
+    ]) expect(drainSafeBash(bad), JSON.stringify(bad)).toBe(false);
+  });
+
+  it('drainSafeBash: adversarial probe table, every entry denied (bypass classes from tester rounds 1-3 included)', () => {
+    const probes = [
+      // Round 1: ANSI-C quoting.
+      "echo $'\\'' ; touch PWNED #'",
+      "echo $'\\x3b' touch pwned",
+      // Round 2: backslash-newline continuations.
+      'git status \\\n; rm x',
+      'git status \\\n&& rm x',
+      "cat <<E\\\nOF\nEOF\ntouch /tmp/p5\nE\n",
+      'echo $\\\n(touch /tmp/p6)',
+      'echo "$\\\n(touch /tmp/p7)"',
+      "cat <\\\n(touch /tmp/p8)",
+      'git status 2>\\\n&1',
+      'echo a\\\nb',
+      "echo 'a\\\nb'",
+      'cat <<EOF\nE\\\nOF\ntouch PWNED\nEOF',
+      // Round 3: function definitions.
+      'echo () ( touch pwned ); echo',
+      'echo()(touch /tmp/p);echo',
+      'echo () { touch /tmp/p; }; echo',
+      // Round 3: parameter expansions that execute single-quoted text.
+      "echo ${x:='$(touch pwned)'} ${x@P}",
+      'echo $[x]',
+      "x='a[$(touch pwned)]' && echo ${y[x]}",
+      'echo ${y[x]}',
+      'echo ${x@P}',
+      // Round 3: bundled and abbreviated branch deletes.
+      'git branch -vD x', 'git branch --del x', 'git branch --delete x', 'git branch -Dv x', 'git branch --mov x y',
+      // Other grammar.
+      'eval "rm x"', 'exec rm x', "sh -c 'git status'", 'bash -c "rm x"', 'git${IFS}status', 'cat ${x:-$(rm x)}',
+      'echo $GIT_DIR ${IFS}', 'echo $"$(touch /tmp/p)"', 'echo $((1<<2))', '{touch,/tmp/p}', '{ touch /tmp/p; }',
+      'case x in x) touch /tmp/p;; esac', '! touch /tmp/p', '((a[$(touch /tmp/p)]))', '[[ -v a[$(touch /tmp/p)] ]]',
+      'echo $[$(touch /tmp/p)]', 'echo x 3>/tmp/p', 'cat <>/tmp/p', 'echo >|/tmp/p', 'echo &>/tmp/p', 'git status &>/dev/null',
+      'echo\tx', 'echo x;(touch /tmp/p)', 'echo x |& touch /tmp/p', 'coproc touch /tmp/p', 'git status # ; rm x', 'git status#; rm x',
+      'git status\r\nrm x', 'git status\rrm x', 'echo *', 'cat ~/.ssh/id_rsa', 'ls ?', 'echo a\\ b', 'echo [a]', 'cat a b',
+      'git status >/dev/null; git log >/dev/null 2>&1', 'cat <<EOF;\nx\nEOF', 'cat <<EOF|head\nx\nEOF', "echo \\>& touch /tmp/p",
+      "cat <<E'X'\nEX\ntouch /tmp/p\nE\n", 'cat <<EOF#x\nEOF#x\ntouch /tmp/p\nEOF\n', 'cat <<A <<B\na\nA\nb\nB\ntouch /tmp/p',
+      'echo x\ntouch /tmp/p', '\ngit status', 'git status\n', '', ' ', 'echo ' + 'a '.repeat(200_000) + '; touch /tmp/p',
+    ];
+    expect(probes.length).toBeGreaterThanOrEqual(40);
+    for (const bad of probes) expect(drainSafeBash(bad), JSON.stringify(bad.slice(0, 80))).toBe(false);
+  });
+
+  it('drainSafeBash: allowlist surface probes (tester round 4)', () => {
+    for (const bad of [
+      // git spellings of --output (parsed anywhere, also after --), and quoted option words.
+      'git diff --stat=1 --output=x', 'git log --format=%H --output=x', 'git diff -pz --output', 'git log -1 -- --output=x',
+      "git diff -- '--output=x'", 'git show --ou', "git add '-f'", 'git add "-p"', "git branch '-D'", 'git branch --list x',
+      'git --no-pager --no-pager status', 'git commit -m --amend', "git commit -m 'x' -F - <<'EOF'\nx\nEOF",
+      // Quoted or split command names.
+      "'echo' x", "'cd' /w && git status", "e'cho' x", '""echo x', "''git status", "git'' status",
+      // A body line equal to the delimiter ends the heredoc; whatever follows would run.
+      "minions work submit L --json <<'RESULT'\nRESULT\nRESULT",
+      "minions work submit L --json <<'RESULT'\nx\nRESULT\ntouch /tmp/p\nRESULT",
+      "git commit -F - <<'EOF'\nEOF\ntouch /tmp/p\nEOF",
+      "git commit -m \"$(cat <<'EOF'\nEOF\n)\" \nEOF\n)\"",
+      // CR and whitespace around the fixed heredoc parts; look-alike and invisible characters outside quotes.
+      "minions work submit L --json <<'RESULT'\r\nx\nRESULT", "git commit -F - <<'EOF' \nx\nEOF",
+      'git status && rm x', 'git status rm', 'git stаtus', 'git status rm x', 'git status \u0000; rm',
+      "echo 'a\u0000'; touch /tmp/p'",
+      // Heads of the heredoc forms beyond cd and git add.
+      "git status && minions work submit L --json <<'RESULT'\n{}\nRESULT",
+      "cd /w && git add -A && minions work submit L --json <<'RESULT'\n{}\nRESULT",
+      "git add -f x && git commit -F - <<'EOF'\nx\nEOF", "cd /w && cd /x && git commit -F - <<'EOF'\nx\nEOF",
+      'git log | head -1000000', 'git log | head -05',
+    ]) expect(drainSafeBash(bad), JSON.stringify(bad)).toBe(false);
+    // Allowed, and checked with bash 5.2: the quoted delimiters keep these bodies literal (nothing runs), and
+    // `RESULT\r` or ` EOF` is not a terminator line.
+    for (const ok of [
+      "git commit -m \"$(cat <<'EOF'\n EOF\nEOF\n)\"",
+      "git commit -m \"$(cat <<'EOF'\nx)\"; touch /tmp/p; echo \"(\nEOF\n)\"",
+      "git commit -m \"$(cat <<'EOF'\nit's\nEOF\n)\"",
+      "git commit -m \"$(cat <<'EOF'\na\"b\nEOF\n)\"",
+      "minions work submit L --json <<'RESULT'\nRESULT\r\ntouch /tmp/p\nRESULT",
+      "git -C '$(touch /tmp/p)' status", "git commit -m '--amend'", ' git status', 'git status ',
+    ]) expect(drainSafeBash(ok), JSON.stringify(ok)).toBe(true);
   });
 
   it('the gate handles a state dir with a space: exit 0 without the flag, runs minions with it', () => {
