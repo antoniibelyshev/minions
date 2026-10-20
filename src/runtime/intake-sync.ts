@@ -59,8 +59,11 @@ export interface Reconciliation { key: string; taskId: string; url: string; reas
 export interface IntakeSyncReport {
   enabled: boolean;
   repository: string | null;
-  /** Issues returned by the filter (pull requests excluded). */
-  matched: number;
+  /**
+   * Issues returned by the filter (pull requests excluded); a lower bound when the list was truncated.
+   * null when the list was not read (failed or aborted read, no repository): the count is unknown.
+   */
+  matched: number | null;
   created: string[];
   existing: number;
   /** New issues not imported because intake is paused (`minions resume --intake`). */
@@ -102,7 +105,7 @@ function abortable(api: ApiGet, signal: AbortSignal | undefined): ApiGet {
 const segs = (s: string) => s.split('/').map(encodeURIComponent).join('/');
 const sameSet = (a: string[], b: string[]) => a.length === b.length && [...a].sort().join('\n') === [...b].sort().join('\n');
 const emptyReport = (enabled: boolean, repository: string | null): IntakeSyncReport =>
-  ({ enabled, repository, matched: 0, created: [], existing: 0, skippedIntakePaused: 0, reconciliations: [], complete: false, warnings: [], errors: [] });
+  ({ enabled, repository, matched: enabled ? null : 0, created: [], existing: 0, skippedIntakePaused: 0, reconciliations: [], complete: false, warnings: [], errors: [] });
 
 /** `owner/repo` of the workspace origin, or null when it is not a github.com repository. */
 export async function originRepository(repoDir: string, git: GitFn): Promise<string | null> {
@@ -159,13 +162,27 @@ export async function queryIssues(api: ApiGet, repo: string, f: GithubIntakeConf
   return { issues, complete: false };
 }
 
-function loadState(db: RuntimeDb): IntakeState {
+function loadState(db: Pick<RuntimeDb, 'getMeta'>): IntakeState {
   try {
     const v = JSON.parse(db.getMeta(INTAKE_STATE_META) ?? '') as IntakeState;
     if (v && v.version === 1 && v.issues && typeof v.issues === 'object') return v;
   } catch { /* none yet */ }
   return { version: 1, issues: {} };
 }
+
+/** Ids of the backlog tasks this sync tracks (meta row `intake_github`). */
+export function intakeTrackedTaskIds(db: Pick<RuntimeDb, 'getMeta'>): Set<string> {
+  return new Set(Object.values(loadState(db).issues).map((r) => r?.taskId).filter((id): id is string => typeof id === 'string'));
+}
+
+/**
+ * Backlog provenance fallback (task-39): a tracked task whose meta block is missing or malformed reads
+ * as `external-requirement` (what the import wrote), never the adapter default `user-decision`, the most
+ * trusted value. Other tasks keep the default. Reads the meta row on every call (only tasks without a
+ * usable provenance reach it), so a sync that just ran is seen at once.
+ */
+export const intakeProvenanceFallback = (db: () => Pick<RuntimeDb, 'getMeta'>) =>
+  (taskId: string): 'external-requirement' | undefined => (intakeTrackedTaskIds(db()).has(taskId) ? 'external-requirement' : undefined);
 
 function describeIssue(issue: GhIssue): string {
   const body = (issue.body ?? '').trim();
@@ -205,9 +222,10 @@ export async function syncIntake(deps: IntakeSyncDeps): Promise<IntakeSyncReport
   const api = abortable(deps.api ?? ghApi(deps.gh), deps.signal);
   const aborted = () => deps.signal?.aborted === true;
   const q = await queryIssues(api, repo, f);
-  report.matched = q.issues.length;
   report.complete = q.complete;
+  // A failed or aborted list read leaves `matched` null: the pages read so far say nothing about the total.
   if (q.error) { report.errors.push(redact(q.error)); return finish(); }
+  report.matched = q.issues.length;
   if (!q.complete) report.warnings.push(`more than ${INTAKE_MAX_PAGES * PER_PAGE} matching issues: imported the first ${q.issues.length}; departures were not evaluated (narrow the filter)`);
 
   const state = loadState(db);
@@ -323,7 +341,11 @@ export async function syncIntake(deps: IntakeSyncDeps): Promise<IntakeSyncReport
 
 export function formatIntake(r: IntakeSyncReport): string {
   if (!r.enabled) return 'Intake sync: off (intake.github is not enabled).';
-  const L = [`Intake sync from ${r.repository ?? '(no repository)'}: ${r.matched} matching issue(s), ${r.created.length} imported${r.created.length ? ` (${r.created.join(', ')})` : ''}, ${r.existing} already in the backlog` +
+  const from = `Intake sync from ${r.repository ?? '(no repository)'}`;
+  if (r.matched === null) {
+    return [`${from}: issue list not read, nothing imported`, ...r.warnings.map((w) => `  warning: ${w}`), ...r.errors.map((e) => `  error: ${e}`)].join('\n');
+  }
+  const L = [`${from}: ${r.complete ? '' : 'at least '}${r.matched} matching issue(s), ${r.created.length} imported${r.created.length ? ` (${r.created.join(', ')})` : ''}, ${r.existing} already in the backlog` +
     (r.skippedIntakePaused ? `, ${r.skippedIntakePaused} skipped (intake is paused; \`minions resume --intake\`)` : '')];
   for (const c of r.reconciliations) L.push(`  ${c.taskId}: ${c.reason} -> ${c.action} (${c.detail})  ${c.url}`);
   for (const w of r.warnings) L.push(`  warning: ${w}`);

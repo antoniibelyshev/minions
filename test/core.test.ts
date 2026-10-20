@@ -48,6 +48,39 @@ describe('exec', () => {
     expect(Date.now() - t).toBeLessThan(5000);
   });
 
+  it('an abort signal kills the child (SIGTERM) and reports aborted; rejects unless allowFailure', async () => {
+    const t = Date.now();
+    const ctl = new AbortController();
+    setTimeout(() => ctl.abort(), 150);
+    const r = await run('node', ['-e', 'setTimeout(()=>{}, 10000)'], { allowFailure: true, signal: ctl.signal });
+    expect(r).toMatchObject({ aborted: true, code: 130 });
+    expect(r.timedOut).toBeUndefined();
+    expect(Date.now() - t).toBeLessThan(2000);
+    const ctl2 = new AbortController();
+    setTimeout(() => ctl2.abort(), 150);
+    await expect(run('node', ['-e', 'setTimeout(()=>{}, 10000)'], { signal: ctl2.signal })).rejects.toThrow(/was aborted/);
+  });
+
+  it('an abort escalates to SIGKILL after the grace when the child ignores SIGTERM', async () => {
+    const ctl = new AbortController();
+    const p = run('node', ['-e', 'process.on("SIGTERM",()=>{}); console.log("up"); setInterval(()=>{}, 1000)'], { allowFailure: true, signal: ctl.signal, timeoutMs: 60_000 });
+    await new Promise((res) => setTimeout(res, 300)); // let node install the handler
+    const t = Date.now();
+    ctl.abort();
+    const r = await p;
+    expect(r.aborted).toBe(true);
+    expect(Date.now() - t).toBeGreaterThanOrEqual(1900);
+    expect(Date.now() - t).toBeLessThan(4000);
+  });
+
+  it('an already aborted signal spawns nothing; no signal keeps the old behaviour', async () => {
+    const ctl = new AbortController(); ctl.abort();
+    expect(await run('definitely-not-a-command-xyz', [], { allowFailure: true, signal: ctl.signal })).toMatchObject({ aborted: true, code: 130 });
+    await expect(run('definitely-not-a-command-xyz', [], { signal: ctl.signal })).rejects.toThrow(/aborted before it started/);
+    const r = await run('node', ['-e', 'process.exit(0)'], { signal: new AbortController().signal });
+    expect(r).toEqual({ code: 0, stdout: '', stderr: '' });
+  });
+
   it('reports missing commands as NOT_FOUND', async () => {
     await expect(run('definitely-not-a-command-xyz', [])).rejects.toMatchObject({ code: 'NOT_FOUND' });
   });

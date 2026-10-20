@@ -495,7 +495,7 @@ Decision record for GitHub-filtered intake (`src/runtime/intake-sync.ts`, config
   coordinator wrapper runs one after taking the project lock and before claude starts (`onStart`,
   failures only logged). No polling loop and no new top-level command.
 - **Startup budget.** The startup pass has an overall budget of 25 s (`STARTUP_INTAKE_BUDGET_MS`):
-  gh calls are killed at the budget, an `AbortSignal` makes in-flight reads resolve as failed and
+  gh children are killed on the abort (see "Aborts kill gh" below), an `AbortSignal` makes in-flight reads resolve as failed and
   stops the import, and after a 2 s grace the coordinator starts whether or not the pass returned.
   An aborted pass keeps what it imported, evaluates no departures (pauses nothing) and is completed
   by the next `minions sync`, which keeps the 120 s per-call gh timeout.
@@ -528,7 +528,21 @@ Decision record for GitHub-filtered intake (`src/runtime/intake-sync.ts`, config
   than 1000 issues) evaluates no departures, so nothing is paused on missing data.
 - **Setup.** `minions setup` asks *Import GitHub issues into the backlog?* after CI (default no; on a
   rerun the current setting), then labels, assignee, milestone and state, and records `intake.github`
-  in `config.local.json`. No GitHub call is made at setup.
+  in `config.local.json`. No GitHub call is made at setup. A filter that anyone can satisfy (no labels,
+  assignee null or `none`, milestone null or `none`) gets a setup warning, as does the README: on a
+  public repository anyone can open an issue, while labels, assignees and milestones need triage
+  access. Warn only, nothing is blocked. An author (`creator`) filter was considered and deferred
+  (task-39): it needs a new config field, schema and prompt, and a maintainer-only label already covers it.
+- **Provenance fallback (task-39).** The Backlog.md adapter falls back to `user-decision` when a task's
+  meta block is missing or malformed. For tasks recorded in the meta row `intake_github` the runtime
+  installs a `provenanceFallback` (`intakeProvenanceFallback`), so they fall back to
+  `external-requirement` instead. The global default is unchanged for every other task: they are
+  created by the owner or the coordinator, and changing it could demote real owner decisions.
+- **Aborts kill gh.** `run()` (`src/core/exec.ts`) takes an optional `AbortSignal`: on abort it sends
+  SIGTERM, then SIGKILL after 2 s, like the timeout. The startup pass passes its signal to every gh
+  child (`ghWithTimeout(budget, signal)`), and that signal is aborted by both the budget and the
+  coordinator's pre-spawn guard (`stop`), so no gh child outlives the pass. A failed or aborted list
+  read reports `matched: null` ("issue list not read"), not the pages read so far.
 
 ## Guided setup
 

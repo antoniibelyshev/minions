@@ -29,8 +29,9 @@ import { git as realGit } from './worktree.js';
 export type GhFn = (args: string[], opts?: { input?: string; cwd?: string }) => Promise<RunResult>;
 
 /** gh via the PATH wrapper (/usr/local/bin/gh injects the mounted token for that process only). */
-export const ghWithTimeout = (timeoutMs: number): GhFn => (args, opts = {}) =>
-  run('gh', args, { cwd: opts.cwd, input: opts.input, allowFailure: true, timeoutMs, env: { ...process.env, GH_PROMPT_DISABLED: '1', GIT_TERMINAL_PROMPT: '0' } });
+/** `signal` (optional) kills an in-flight gh on abort (SIGTERM, then SIGKILL), like the timeout. */
+export const ghWithTimeout = (timeoutMs: number, signal?: AbortSignal): GhFn => (args, opts = {}) =>
+  run('gh', args, { cwd: opts.cwd, input: opts.input, allowFailure: true, timeoutMs, signal, env: { ...process.env, GH_PROMPT_DISABLED: '1', GIT_TERMINAL_PROMPT: '0' } });
 export const realGh: GhFn = ghWithTimeout(120_000);
 
 export interface PublishInput {

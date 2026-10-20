@@ -2,31 +2,49 @@ import { spawn } from 'node:child_process';
 import { MinionsError } from './errors.js';
 import { redact } from './output.js';
 
-export interface RunOptions { cwd?: string; input?: string; env?: NodeJS.ProcessEnv; timeoutMs?: number; allowFailure?: boolean }
-export interface RunResult { code: number; stdout: string; stderr: string; timedOut?: boolean }
+export interface RunOptions {
+  cwd?: string; input?: string; env?: NodeJS.ProcessEnv; timeoutMs?: number; allowFailure?: boolean;
+  /**
+   * Aborting kills the child like the timeout does (SIGTERM, SIGKILL after a short grace); the result then
+   * has `aborted: true` and code 130. Already aborted: nothing is spawned. Optional; no effect when absent.
+   */
+  signal?: AbortSignal;
+}
+export interface RunResult { code: number; stdout: string; stderr: string; timedOut?: boolean; aborted?: boolean }
+
+/** Grace between SIGTERM and SIGKILL (timeout and abort). */
+const KILL_GRACE_MS = 2000;
 
 const tail = (s: string, n = 2000) => (s.length > n ? '…' + s.slice(-n) : s);
 
-/** Spawns cmd with argv args (never through a shell). Throws INTERNAL on non-zero/timeout unless allowFailure. */
+/** Spawns cmd with argv args (never through a shell). Throws INTERNAL on non-zero/timeout/abort unless allowFailure. */
 export function run(cmd: string, args: string[], opts: RunOptions = {}): Promise<RunResult> {
   return new Promise((resolve, reject) => {
+    if (opts.signal?.aborted) {
+      if (opts.allowFailure) return resolve({ code: 130, stdout: '', stderr: '', aborted: true });
+      return reject(new MinionsError('INTERNAL', `${cmd} was aborted before it started`, undefined, { cmd, args: args.map(redact), aborted: true }));
+    }
     const child = spawn(cmd, args, {
       cwd: opts.cwd, env: opts.env ?? process.env, shell: false,
       stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true,
     });
-    let stdout = '', stderr = '', timedOut = false, settled = false;
+    let stdout = '', stderr = '', timedOut = false, aborted = false, settled = false;
     child.stdout.setEncoding('utf8').on('data', (d: string) => (stdout += d));
     child.stderr.setEncoding('utf8').on('data', (d: string) => (stderr += d));
     let killTimer: NodeJS.Timeout | undefined;
-    const timer = opts.timeoutMs ? setTimeout(() => {
-      timedOut = true;
+    const terminate = () => {
+      if (killTimer || settled) return;
       child.kill('SIGTERM');
-      killTimer = setTimeout(() => child.kill('SIGKILL'), 2000);
-    }, opts.timeoutMs) : undefined;
+      killTimer = setTimeout(() => child.kill('SIGKILL'), KILL_GRACE_MS);
+    };
+    const timer = opts.timeoutMs ? setTimeout(() => { if (!aborted) timedOut = true; terminate(); }, opts.timeoutMs) : undefined;
+    const onAbort = () => { if (!timedOut) aborted = true; terminate(); };
+    opts.signal?.addEventListener('abort', onAbort, { once: true });
     const finish = (fn: () => void) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer); clearTimeout(killTimer);
+      opts.signal?.removeEventListener('abort', onAbort);
       fn();
     };
     child.on('error', (err: NodeJS.ErrnoException) => finish(() => {
@@ -38,10 +56,11 @@ export function run(cmd: string, args: string[], opts: RunOptions = {}): Promise
     child.on('close', (code, signal) => finish(() => {
       const result: RunResult = { code: code ?? (signal ? 128 : 1), stdout, stderr };
       if (timedOut) { result.timedOut = true; result.code = 124; }
+      if (aborted) { result.aborted = true; result.code = 130; }
       if (result.code === 0 || opts.allowFailure) return resolve(result);
-      const why = timedOut ? `timed out after ${opts.timeoutMs}ms` : `exited with code ${result.code}`;
+      const why = timedOut ? `timed out after ${opts.timeoutMs}ms` : aborted ? 'was aborted' : `exited with code ${result.code}`;
       reject(new MinionsError('INTERNAL', `${cmd} ${why}${stderr.trim() ? `: ${redact(tail(stderr.trim()))}` : ''}`,
-        undefined, { cmd, args: args.map(redact), code: result.code, timedOut }));
+        undefined, { cmd, args: args.map(redact), code: result.code, timedOut, ...(aborted ? { aborted } : {}) }));
     }));
     child.stdin.on('error', () => {}); // child may exit before reading stdin
     child.stdin.end(opts.input ?? '');

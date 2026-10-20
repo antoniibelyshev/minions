@@ -494,6 +494,22 @@ type IntakeFilter = NonNullable<MinionsConfig['intake']['github']>;
 const describeFilter = (f: IntakeFilter) => [`repository ${f.repository ?? 'origin'}`, `state ${f.state}`,
   `labels ${f.labels.join(',') || 'any'}`, `assignee ${f.assignee ?? 'any'}`, `milestone ${f.milestone ?? 'any'}`].join(', ');
 
+/**
+ * Warning for an intake filter that any GitHub user can satisfy (task-39): no labels and no assignee
+ * (null or "none" = unassigned) and no milestone restriction. On a public repository anyone can open an
+ * issue, so such a filter imports issues from strangers. Labels, assignees and milestones can only be set
+ * by people with triage access (unless an issue template applies labels automatically). Warn only.
+ */
+export function openIntakeFilterWarning(f: IntakeFilter): string | null {
+  if (f.labels.length || (f.assignee !== null && f.assignee !== 'none') || (f.milestone !== null && f.milestone !== 'none')) return null;
+  return 'the intake filter has no labels and no assignee: on a public repository anyone can open an issue, so issues from anyone are imported. '
+    + 'Require a label that only maintainers apply (not one an issue template adds automatically), or an assignee.';
+}
+const filterLines = (f: IntakeFilter): Pick<SetupStep, 'lines'> => {
+  const w = f.enabled ? openIntakeFilterWarning(f) : null;
+  return w ? { lines: [`warning: ${w}`] } : {};
+};
+
 async function askText(io: WizardIO, q: string, def: string, ok: (v: string) => string | null): Promise<string> {
   for (let i = 0; i < 3; i++) {
     const a = (await io.ask(q, def)).trim();
@@ -511,11 +527,11 @@ async function askText(io: WizardIO, q: string, def: string, ok: (v: string) => 
 async function intakeStep(io: WizardIO | null, config: MinionsConfig, onGitHub: boolean, setLocal: (k: string, v: unknown) => void, later: string): Promise<SetupStep> {
   const cur = config.intake.github;
   if (!onGitHub && !cur?.repository) {
-    return cur?.enabled ? { id: 'intake', status: 'kept', detail: `intake.github on (${describeFilter(cur)}), but there is no github.com origin` }
+    return cur?.enabled ? { id: 'intake', status: 'kept', detail: `intake.github on (${describeFilter(cur)}), but there is no github.com origin`, ...filterLines(cur) }
       : { id: 'intake', status: 'skipped', detail: 'no GitHub remote: GitHub intake not applicable', later };
   }
   if (!io) {
-    return cur?.enabled ? { id: 'intake', status: 'kept', detail: `intake.github on (${describeFilter(cur)})` }
+    return cur?.enabled ? { id: 'intake', status: 'kept', detail: `intake.github on (${describeFilter(cur)})`, ...filterLines(cur) }
       : { id: 'intake', status: 'skipped', detail: 'GitHub intake not enabled', later };
   }
   io.info('  minions can import GitHub issues matching a filter into the backlog on `minions sync` and at coordinator start.');
@@ -527,6 +543,7 @@ async function intakeStep(io: WizardIO | null, config: MinionsConfig, onGitHub: 
     return { id: 'intake', status: 'changed', detail: 'intake.github disabled (already imported tasks stay in the backlog)' };
   }
   const list = (v: string) => (v === 'none' || v === '' ? [] : v.split(',').map((x) => x.trim()).filter(Boolean));
+  io.info('  On a public repository anyone can open an issue: filter by a label only maintainers apply, or by an assignee.');
   const labels = list(await askText(io, 'Issue labels to import (comma separated; all must match; "none" for any)', cur?.labels.join(',') || 'none',
     (v) => (/[\r\n]/.test(v) ? 'labels must be on one line' : null)));
   const assignee = await askText(io, 'Assignee filter (GitHub login, "none" = unassigned, "*" = anyone assigned, "any" = no filter)', cur?.assignee ?? 'any',
@@ -538,9 +555,9 @@ async function intakeStep(io: WizardIO | null, config: MinionsConfig, onGitHub: 
     enabled: true, repository: cur?.repository ?? null, labels,
     assignee: assignee === 'any' ? null : assignee, milestone: milestone === 'any' ? null : milestone, state,
   };
-  if (cur && JSON.stringify(cur) === JSON.stringify(next)) return { id: 'intake', status: 'kept', detail: `intake.github on (${describeFilter(next)})` };
+  if (cur && JSON.stringify(cur) === JSON.stringify(next)) return { id: 'intake', status: 'kept', detail: `intake.github on (${describeFilter(next)})`, ...filterLines(next) };
   setLocal('intake.github', next);
-  return { id: 'intake', status: cur?.enabled ? 'changed' : 'done', detail: `intake.github on (${describeFilter(next)}); imported on \`minions sync\` and coordinator start` };
+  return { id: 'intake', status: cur?.enabled ? 'changed' : 'done', detail: `intake.github on (${describeFilter(next)}); imported on \`minions sync\` and coordinator start`, ...filterLines(next) };
 }
 
 /** CI step: local workflow files plus (with a token) required checks read with GET only; prints the plan. */

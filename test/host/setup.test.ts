@@ -15,7 +15,7 @@ vi.mock('../../src/plugin/generate.js', async () => {
   };
 });
 
-const { runSetup, formatSetup } = await import('../../src/host/setup.js');
+const { runSetup, formatSetup, openIntakeFilterWarning } = await import('../../src/host/setup.js');
 const { loadCredentialRefs, readGithubToken, readTelegramToken } = await import('../../src/host/credentials.js');
 const { loadEffectiveConfig, loadProjectJson } = await import('../../src/host/project.js');
 const { loadRegistry } = await import('../../src/host/registry.js');
@@ -223,12 +223,35 @@ describe('minions setup', () => {
     expect(eff.intake.github).toEqual({ enabled: true, repository: null, labels: ['bug', 'minions'], assignee: 'octocat', milestone: 'v1', state: 'open' });
     expect(api.seen.every((c) => c.method === 'GET')).toBe(true);
     expect(api.seen.some((c) => c.url.includes('/issues'))).toBe(false);
+    expect(step(r, 'intake').lines ?? []).toEqual([]); // labels and an assignee: no open-filter warning
+
+    // task-39: a filter anyone can satisfy (no labels, no assignee) is accepted with a warning.
+    const open = scripted({
+      'Import GitHub issues into the backlog?': 'y', 'Issue labels to import': 'none', 'Assignee filter': 'any', 'Milestone filter': 'any', 'Issue state': 'open',
+    });
+    const o = await runSetup({ path: repo, yes: false, io: open.io, runtime: rt.runtime, dockerProbe: dockerUp, fetch: githubApi().f });
+    expect(step(o, 'intake')).toMatchObject({ status: 'changed', lines: [expect.stringMatching(/^warning: the intake filter has no labels and no assignee: on a public repository anyone/)] });
+    expect(formatSetup(o)).toContain('no labels and no assignee');
+    // Non-interactive rerun keeps it and still warns.
+    const kept = await runSetup({ path: repo, yes: true, runtime: rt.runtime, dockerProbe: dockerUp, fetch: githubApi().f });
+    expect(step(kept, 'intake')).toMatchObject({ status: 'kept', lines: [expect.stringContaining('anyone can open an issue')] });
 
     // Rerun: the question now defaults to the recorded "yes"; answering no disables it (tasks are kept).
     const b = scripted({ 'Import GitHub issues into the backlog?': 'n' });
     const off = await runSetup({ path: repo, yes: false, io: b.io, runtime: rt.runtime, dockerProbe: dockerUp, fetch: githubApi().f });
     expect(step(off, 'intake')).toMatchObject({ status: 'changed', detail: expect.stringContaining('disabled') });
     expect((await loadEffectiveConfig(await loadProjectJson(off.projectId))).config.intake.github?.enabled).toBe(false);
+  });
+
+  it('openIntakeFilterWarning: only a filter with no labels, no assignee and no milestone restriction warns (task-39)', () => {
+    const f = { enabled: true, repository: null, labels: [] as string[], assignee: null as string | null, milestone: null as string | null, state: 'open' as const };
+    expect(openIntakeFilterWarning(f)).toMatch(/anyone can open an issue/);
+    expect(openIntakeFilterWarning({ ...f, assignee: 'none' })).toMatch(/anyone/); // unassigned is what strangers file
+    expect(openIntakeFilterWarning({ ...f, milestone: 'none' })).toMatch(/anyone/);
+    expect(openIntakeFilterWarning({ ...f, labels: ['minions'] })).toBeNull();
+    expect(openIntakeFilterWarning({ ...f, assignee: 'octocat' })).toBeNull();
+    expect(openIntakeFilterWarning({ ...f, assignee: '*' })).toBeNull();
+    expect(openIntakeFilterWarning({ ...f, milestone: 'v1' })).toBeNull();
   });
 
   it('every printed command names the repository (shell-quoted), so it works from any directory', async () => {
