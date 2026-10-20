@@ -10,6 +10,7 @@ import { action, globalOpts, requireMode, runtimeMode } from '../core/cli-helper
 import { MinionsError } from '../core/errors.js';
 import { readJson } from '../core/fsutil.js';
 import { emit } from '../core/output.js';
+import { approveOnHost } from '../host/approvals.js';
 import { delegateToRuntime } from '../host/delegate.js';
 import { readTelegramAccess } from '../telegram/access.js';
 import { installTelegramPlugin } from '../telegram/install.js';
@@ -228,13 +229,17 @@ export function register(program: Command): void {
       emit(r, { json: globalOpts(cmd).json, human: (d) => d.message });
       if (r.state === 'failed') process.exitCode = 1;
     }));
-  work.command('approve <taskId>').description('Record a human approval to publish the approved head (sensitive paths / "ask" publication)')
-    .requiredOption('--head <sha>', 'the approved head SHA being authorized (binds the approval to that commit)')
-    .option('--by <name>', 'who approved')
+  work.command('approve <taskId>').description('Approve publishing the approved head (sensitive paths / "ask" publication); run on the host, which signs the approval')
+    .requiredOption('--head <sha>', 'the full approved head SHA being authorized (binds the approval to that commit)')
+    .option('--by <name>', 'who approved (default: the host user)')
     .option('--note <text>', 'why')
-    .action(action(async (taskId: string, o: { head: string; by?: string; note?: string }, cmd: Command) => {
-      if (runtimeMode() === 'host') return delegate(cmd);
-      const r = (await scheduler()).approvePublication(taskId, { head: o.head, by: o.by, note: o.note });
+    .addOption(new Option('--signature <token>', 'host-signed approval token (set by the host CLI when it delegates; never needed by hand)').hideHelp())
+    .action(action(async (taskId: string, o: { head: string; by?: string; note?: string; signature?: string }, cmd: Command) => {
+      if (runtimeMode() === 'host') {
+        if (o.signature) throw new MinionsError('PRECONDITION', 'The host CLI signs approvals itself; --signature is only accepted inside the agent runtime.');
+        process.exit(await approveOnHost(taskId, { head: o.head, by: o.by, note: o.note, json: globalOpts(cmd).json }));
+      }
+      const r = (await scheduler()).approvePublication(taskId, { head: o.head, by: o.by, note: o.note, signature: o.signature });
       emit(r, { json: globalOpts(cmd).json, human: (d) => d.message });
     }));
   work.command('list').description('List active leases')

@@ -7,7 +7,7 @@ import { git as realGit, taskSlug, branchFor } from '../../src/runtime/worktree.
 import { publishTask, type GhFn } from '../../src/runtime/publish.js';
 import type { GitFn } from '../../src/runtime/github.js';
 import { defaults } from '../helpers.js';
-import { commitFile, gitSync, tmp } from './fixtures.js';
+import { approvalKeys, commitFile, gitSync, tmp } from './fixtures.js';
 
 const TOKEN = 'ghp_' + 'b'.repeat(36);
 
@@ -91,9 +91,11 @@ describe('sensitive path detection and publication argv safety (fake git/gh)', (
       if (args[1] === 'list') return { code: 0, stdout: '[]', stderr: '' };
       return { code: 0, stdout: 'https://github.com/acme/demo/pull/9\n', stderr: '' };
     };
+    const keys = approvalKeys();
     const run = (humanApproved = false, title = 'T') => publishTask({
       config: cfg, task: { id: 'task-1', title, description: 'd', acceptanceCriteria: [] } as never,
-      repo, branch: 'agent/t', head, humanApproved, git, gh, tokenFile,
+      repo, branch: 'agent/t', head, git, gh, tokenFile,
+      approvals: humanApproved ? [keys.sign('task-1', head)] : [], approvalPublicKeyFile: keys.publicKeyFile,
     });
     return { run, calls, ghCalls };
   }

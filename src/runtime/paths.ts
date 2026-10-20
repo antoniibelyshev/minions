@@ -1,5 +1,5 @@
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { containerPaths } from '../core/paths.js';
 
 /**
@@ -34,6 +34,11 @@ export function runtimePaths(env: NodeJS.ProcessEnv = process.env) {
     worktrees: join(workspace, 'worktrees'),
     review: join(workspace, 'review'),
     configJson: env.MINIONS_CONFIG || c.configJson,
+    /**
+     * Public key verifying host-signed publication approvals. The container always uses the read-only
+     * bind (/opt/minions/config), never an env override; the host runtime uses its runtime config dir.
+     */
+    approvalPublicKey: env.MINIONS_RUNTIME === 'container' ? c.approvalPublicKey : join(dirname(env.MINIONS_CONFIG || c.configJson), 'approval-public-key.pem'),
     pluginDir,
     secretsDir,
     telegramTokenFile: join(secretsDir, 'telegram-bot-token'),

@@ -5,19 +5,24 @@
 //   calls it when a reviewer approval is accepted, `minions work publish <taskId>` retries it.
 // - Gates: git.push (and pr.create in pull-request mode) are evaluated against the paths the branch
 //   changes relative to the base. `deny` fails; `ask` (including the sensitive-path upgrade
-//   allow -> ask) requires a recorded human approval bound to the approved head SHA.
+//   allow -> ask) requires a host-signed human approval for exactly the approved head SHA, verified
+//   here against the runtime's read-only public key right before anything is pushed (src/core/approval.ts).
+//   Approval rows in the runtime DB are only carriers of tokens: an unsigned or forged row fails closed.
 // - Idempotent: the remote branch and open PRs are inspected first; an up-to-date remote branch is
 //   not pushed again and an existing PR for the head branch is reused, never duplicated.
 // - Never merges, never force-pushes, never passes the token anywhere (git uses the repository
 //   credential helper, gh the wrapper; see src/runtime/github.ts).
+import { readFile } from 'node:fs/promises';
 import { can, matchesAny } from '../config/capabilities.js';
 import type { Capability, MinionsConfig } from '../config/schema.js';
 import type { Task } from '../backlog/types.js';
 import type { ErrorCode } from '../core/errors.js';
 import { run, type RunResult } from '../core/exec.js';
 import { redact } from '../core/output.js';
+import { verifyAnyApproval } from '../core/approval.js';
 import { normalizeGithubRemote, readGithubToken, type GitFn } from './github.js';
 import { isHostRuntime } from './git-hardening.js';
+import { runtimePaths } from './paths.js';
 import { git as realGit } from './worktree.js';
 
 export type GhFn = (args: string[], opts?: { input?: string; cwd?: string }) => Promise<RunResult>;
@@ -33,8 +38,12 @@ export interface PublishInput {
   branch: string;
   /** Approved head; exactly this commit is published. */
   head: string;
-  /** A human approval (scope publish) is recorded for this head. */
-  humanApproved: boolean;
+  /** Host-signed approval tokens recorded for this task and head (scope publish); verified, never trusted as is. */
+  approvals: (string | null)[];
+  /** Public key verifying approvals (default: the runtime's read-only /opt/minions/config/approval-public-key.pem). */
+  approvalPublicKeyFile?: string;
+  /** Clock for approval expiry (tests). */
+  now?: Date;
   git?: GitFn;
   gh?: GhFn;
   tokenFile?: string;
@@ -43,7 +52,7 @@ export interface PublishInput {
 export type PublishOutcome =
   | { state: 'published'; mode: 'branch' | 'pull-request'; push: 'pushed' | 'already-current'; pr: 'created' | 'existing' | null;
       prUrl: string | null; repository: string; changedPaths: string[]; sensitivePaths: string[] }
-  | { state: 'awaiting-approval'; reasons: string[]; changedPaths: string[]; sensitivePaths: string[] }
+  | { state: 'awaiting-approval'; reasons: string[]; changedPaths: string[]; sensitivePaths: string[]; approvalError: string }
   | { state: 'failed'; code: ErrorCode; message: string; retryable: boolean };
 
 const fail = (code: ErrorCode, message: string): PublishOutcome =>
@@ -95,6 +104,11 @@ async function findPr(gh: GhFn, cwd: string, repository: string, branch: string,
   return { pr };
 }
 
+/** The public key PEM, or null when absent/unreadable (verification then fails closed). */
+async function readPublicKey(file: string): Promise<string | null> {
+  try { return await readFile(file, 'utf8'); } catch { return null; }
+}
+
 const PR_URL_RE = /https:\/\/github\.com\/[^\s/]+\/[^\s/]+\/pull\/\d+/;
 
 /** Publishes an approved head according to delivery.mode. Never throws for expected failures. */
@@ -140,7 +154,11 @@ export async function publishTask(input: PublishInput): Promise<PublishOutcome> 
         : `${cap} needs human approval by configuration`);
     }
   }
-  if (reasons.length && !input.humanApproved) return { state: 'awaiting-approval', reasons, changedPaths, sensitivePaths };
+  if (reasons.length) {
+    const check = verifyAnyApproval(input.approvals, await readPublicKey(input.approvalPublicKeyFile ?? runtimePaths().approvalPublicKey),
+      { taskId: input.task.id, head, now: input.now });
+    if (!check.ok) return { state: 'awaiting-approval', reasons, changedPaths, sensitivePaths, approvalError: check.reason };
+  }
 
   // 4. Remote branch: reconcile, fast-forward only, never force. The host runtime names the normalized
   // https URL instead of the agent-writable `origin` remote (no pushurl / receivepack from the workspace).

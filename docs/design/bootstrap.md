@@ -200,7 +200,7 @@ Decision record for `delivery.mode` `branch` / `pull-request` (`src/runtime/publ
   reports whether PR delivery is available and that auto-merge is deferred.
 - **Where publication runs.** Synchronously inside `minions work record` when a reviewer approval is
   accepted (tester evidence for the same head and config revision as before), plus
-  `minions work publish <taskId>` to retry. One `publications` row per task (DB schema 2) is
+  `minions work publish <taskId>` to retry. One `publications` row per task (DB schema 2; schema 3 adds `approvals.signature`) is
   written in the same transaction that ends the reviewer lease (`pending`, bound to the approved
   head and config revision), so a crash between approval and publication is resumable. The response
   carries `publication` (`state`, `status`, `prUrl`, `merged: false`).
@@ -212,12 +212,11 @@ Decision record for `delivery.mode` `branch` / `pull-request` (`src/runtime/publ
 - **Gates (deterministic).** `git.push` (and `pr.create` in pull-request mode) are evaluated with
   `can()` against the paths changed by `git diff --name-only --no-renames <base>...<head>` (renames split
   so moving a file out of a sensitive path counts). `deny` fails. `ask` — including the
-  sensitive-path upgrade allow→ask — requires a human approval recorded with
-  `minions work approve <taskId> --head <sha>` (`approvals` table, scope `publish`, bound to the head;
-  a new commit needs a new approval). The coordinator's Claude Code settings put that command under
-  `ask` (Claude Code prompts the user every time; ask beats the `minions *` allow) and deny
-  `git push` / `gh pr merge`; the user can also run it on the host (delegated into the container).
-  Within one container this is policy plus the permission prompt, not a cryptographic separation.
+  sensitive-path upgrade allow→ask — requires a **host-signed** human approval for exactly that head
+  (see "Host-signed publication approvals" below; a new commit needs a new approval). The coordinator's
+  Claude Code settings still put `minions work approve` under `ask` and deny `git push` /
+  `gh pr merge`, but those are now defence in depth: an approval recorded inside the runtime without
+  a valid host signature never authorizes publication.
 - **Idempotency.** `git ls-remote` first: a remote branch already at the approved head is not pushed
   again; a remote branch that is not an ancestor of the head is a `CONFLICT` (never force-pushed);
   otherwise `git push origin <head>:refs/heads/agent/<slug>` (exactly the approved commit, authenticated
@@ -228,6 +227,66 @@ Decision record for `delivery.mode` `branch` / `pull-request` (`src/runtime/publ
 - **PR text.** Title, objective (description, minions meta stripped) and acceptance criteria only.
   Shared installations append the task id and head SHA; private installations add nothing else. Notes,
   handoffs, worker results and decision records are never read for PR text.
+
+## Host-signed publication approvals
+
+Decision record (task-1.8; `src/core/approval.ts`, `src/host/approvals.ts`, the gate in
+`publishTask`, `Scheduler.approvePublication`).
+
+**Problem.** In task-1.4 an approval was only a row in the runtime's SQLite `approvals` table, written
+by `minions work approve`, which only the coordinator's Claude Code `ask` rule guarded. Any
+code-execution path inside the runtime (a worker editing a test or npm script that `npm test` runs,
+or writing `/state/minions.db` directly) could insert that row and get sensitive changes published by
+the normal flow.
+
+**Decision: asymmetric signatures, private key on the host only.**
+
+- **Key pair.** Ed25519 (`node:crypto`, no new dependency), one per project, created by the host CLI
+  on the first approval. Private key: `<MINIONS_HOME>/credentials/<projectId>/approval-signing-key`
+  (dir 0700, file 0600) — the host credential store, never mounted into the container and under the
+  host-runtime sandbox's `denyRead`. Public key: `<project>/runtime/approval-public-key.pem`, i.e.
+  `/opt/minions/config/approval-public-key.pem` in the container (the existing read-only directory
+  bind, so a key created later is visible without recreating the container). The host rewrites the
+  public key from the private key on every approval, so a deleted or swapped copy is repaired.
+  HMAC was rejected: the verifier would need the secret, and the verifier runs in the container.
+- **Issuing.** On the host, `minions work approve <taskId> --head <sha> [--by] [--note]` signs
+  `{v:1, scope:"publish", taskId, head, by, issuedAt, expiresAt, kid}` and delegates
+  `work approve … --signature <token>` into the runtime. Token: `mnap1.<b64url payload>.<b64url sig>`,
+  the signature covering `mnap1.<payload>`. `--head` must be a full 40/64-hex SHA (no abbreviation or
+  ref). Approvals expire after 7 days; a later retry needs a new one. No new top-level command: the
+  existing `work approve` changes behaviour by where it runs (minimal CLI surface).
+- **Recording.** Inside the runtime, `work approve` without `--signature` is refused; with one, it is
+  verified (fail fast) and stored in `approvals.signature` (DB schema 3, `ALTER TABLE ADD COLUMN`).
+- **Verification before push.** `publishTask` re-verifies, right after the capability gates and
+  before `ls-remote`/`push`/`gh`, every token stored for that task and head against the public key.
+  The DB row is only a carrier and is not trusted. It fails closed (publication stays
+  `awaiting-approval`, with `approvalError` naming the cause) when there is no public key, no token,
+  a malformed or tampered token, a signature from another key, another task or head, or an expired
+  approval. In the container the key path is fixed (`MINIONS_CONFIG` is not consulted, because an
+  agent could set it); the host runtime uses its runtime config dir (pinned by the shim).
+- **Scope.** Every human publication approval is signed: sensitive-path changes and "ask" capabilities
+  alike. Publication that needs no approval (allow, no sensitive paths) is unchanged and needs no key.
+
+**Remaining trust boundary (what this does not protect).** The signature stops in-runtime code from
+*laundering* a change through minions' own publication flow. It does not stop in-runtime code from
+using the GitHub token directly: the token is readable inside the container (the git credential helper
+and the gh wrapper need it), so a compromised worker can push any branch, or open a PR, with whatever
+the token allows. In the host runtime the agents run as the user under the Claude Code sandbox, so
+the separation is only as strong as that sandbox (its `denyRead` on the credential store). The final
+protection must therefore be server-side:
+
+- **Minimal token scope.** Use a fine-grained personal access token limited to the one repository with
+  `Contents: read and write`, `Pull requests: read and write` and `Metadata: read`. Do not grant
+  `Workflows` (GitHub then rejects any push that adds or changes `.github/workflows/**`, whatever the
+  runtime does), `Administration`, `Secrets`, `Actions`, `Environments` or any organization permission.
+  Prefer a short expiry and rotate with `minions auth github`.
+- **Branch protection / rulesets** on the base branch (and release branches): require a pull request,
+  at least one approving review from someone other than the token owner, review from Code Owners
+  (with a `CODEOWNERS` entry covering the sensitive paths), dismiss stale approvals on new commits,
+  require status checks, block force pushes and deletions, and do not let the token's user bypass the
+  rules. Optionally restrict the token's user to pushing `agent/*` branches with a ruleset.
+- With that, a compromised worker can at worst push an `agent/*` branch or open a PR; nothing reaches
+  the base branch without a human review on GitHub.
 
 ## Host runtime
 

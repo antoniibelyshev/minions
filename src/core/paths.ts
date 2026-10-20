@@ -28,6 +28,8 @@ export function projectPaths(projectId: string) {
     composeYaml: join(dir, 'compose.yaml'),
     runtimeDir: join(dir, 'runtime'),
     runtimeConfigJson: join(dir, 'runtime', 'config.json'),
+    /** Public half of the host-held approval signing key (read-only for agents; see src/host/approvals.ts). */
+    approvalPublicKey: join(dir, 'runtime', 'approval-public-key.pem'),
     pluginDir: join(dir, 'plugin'),
     /** Host-side plugin of the setup assistant (`minions setup assist`), regenerated on every launch. */
     assistantPluginDir: join(dir, 'assistant-plugin'),
@@ -108,6 +110,8 @@ export function containerPaths(root = process.env.MINIONS_CONTAINER_ROOT ?? '') 
     /** Host-provisioned Claude key (api-key/helper methods), read by the in-container apiKeyHelper. */
     apiKeyFile: p('/opt/minions/secrets/anthropic-api-key'),
     configJson: p('/opt/minions/config/config.json'),
+    /** Public key that verifies host-signed publication approvals (the private key never enters the container). */
+    approvalPublicKey: p('/opt/minions/config/approval-public-key.pem'),
     projectJson: p('/opt/minions/config/project.json'),
     workspace: p('/workspace'),
     repo: p('/workspace/repo'),
