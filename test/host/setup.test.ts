@@ -121,7 +121,7 @@ describe('minions setup', () => {
 
     // Order of the questions: project first, then each integration, then the container.
     const order = ['Starting profile', 'Installation visibility', 'Apply this plan?', 'Set up GitHub integration', 'secret:GitHub token', 'Delivery mode',
-      'Use CI?', 'Enable auto-merge?', 'Set up Telegram', 'secret:Telegram bot token', 'Check the token with Telegram', 'Build and start the container'];
+      'Use CI?', 'Import GitHub issues into the backlog?', 'Enable auto-merge?', 'Set up Telegram', 'secret:Telegram bot token', 'Check the token with Telegram', 'Build and start the container'];
     const idx = order.map((q) => a.asked.findIndex((x) => x.startsWith(q)));
     expect(idx.every((i) => i >= 0), JSON.stringify(a.asked)).toBe(true);
     expect([...idx].sort((x, y) => x - y)).toEqual(idx);
@@ -129,7 +129,7 @@ describe('minions setup', () => {
     expect(a.asked.some((q) => q.startsWith('Communication channel') || q.startsWith('Store a GitHub token') || q.startsWith('Store the Telegram'))).toBe(false);
 
     expect(r.steps.map((s) => [s.id, s.status])).toEqual([
-      ['init', 'done'], ['github', 'done'], ['delivery', 'changed'], ['ci', 'done'], ['autoMerge', 'deferred'],
+      ['init', 'done'], ['github', 'done'], ['delivery', 'changed'], ['ci', 'done'], ['intake', 'skipped'], ['autoMerge', 'deferred'],
       ['telegram', 'done'], ['container', 'done'], ['import', 'done'], ['coordinator', 'done'],
     ]);
     expect(rt.calls).toEqual(['running?', 'start', 'repo?', 'import', 'coordinator']);
@@ -180,11 +180,13 @@ describe('minions setup', () => {
     const q = (p: string) => a.asked.find((x) => x.startsWith(p));
     expect(q('Set up GitHub integration')).toBeDefined();
     expect(q('Use CI?')).toBeDefined();
+    expect(q('Import GitHub issues into the backlog?')).toContain('(y/n)');
+    expect(q('Issue labels to import')).toBeUndefined();
     expect(q('Enable auto-merge?')).toContain('not available yet');
     expect(q('Set up Telegram')).toBeDefined();
     expect(q('Delivery mode')).toBeUndefined();
     expect(a.asked.some((x) => x.startsWith('secret:'))).toBe(false);
-    for (const id of ['github', 'ci', 'telegram']) {
+    for (const id of ['github', 'ci', 'intake', 'telegram']) {
       expect(step(r, id).status).toBe('skipped');
       expect(step(r, id).later).toMatch(/minions setup/);
     }
@@ -196,6 +198,37 @@ describe('minions setup', () => {
     // Core steps default to yes.
     expect(rt.calls).toContain('start');
     expect(step(r, 'coordinator').status).toBe('done');
+  });
+
+  it('GitHub intake: the question defaults to no; yes records the filter in config.local.json (read-only import, no GitHub calls at setup)', async () => {
+    const repo = githubRepo();
+    const defaults = scripted({ 'Installation visibility': 'private' });
+    const prompts: { q: string; def: string }[] = [];
+    const io = { ...defaults.io, ask: async (q: string, def: string) => { prompts.push({ q, def }); return defaults.io.ask(q, def); } };
+    const rt = fakeRuntime();
+    const first = await runSetup({ path: repo, yes: false, io, runtime: rt.runtime, dockerProbe: dockerUp, fetch: githubApi().f });
+    expect(prompts.find((p) => p.q.startsWith('Import GitHub issues into the backlog?'))!.def).toBe('n');
+    expect(step(first, 'intake')).toMatchObject({ status: 'skipped', later: expect.stringMatching(/minions setup/) });
+    expect((await loadEffectiveConfig(await loadProjectJson(first.projectId))).config.intake.github).toBeUndefined();
+
+    const api = githubApi();
+    const a = scripted({
+      'Import GitHub issues into the backlog?': 'y', 'Issue labels to import': 'bug, minions', 'Assignee filter': 'octocat',
+      'Milestone filter': 'v1', 'Issue state': 'open',
+    });
+    const r = await runSetup({ path: repo, yes: false, io: a.io, runtime: rt.runtime, dockerProbe: dockerUp, fetch: api.f });
+    expect(step(r, 'intake')).toMatchObject({ status: 'done', detail: expect.stringContaining('labels bug,minions') });
+    expect(r.localConfig.changed).toContain('intake.github');
+    const eff = (await loadEffectiveConfig(await loadProjectJson(r.projectId))).config;
+    expect(eff.intake.github).toEqual({ enabled: true, repository: null, labels: ['bug', 'minions'], assignee: 'octocat', milestone: 'v1', state: 'open' });
+    expect(api.seen.every((c) => c.method === 'GET')).toBe(true);
+    expect(api.seen.some((c) => c.url.includes('/issues'))).toBe(false);
+
+    // Rerun: the question now defaults to the recorded "yes"; answering no disables it (tasks are kept).
+    const b = scripted({ 'Import GitHub issues into the backlog?': 'n' });
+    const off = await runSetup({ path: repo, yes: false, io: b.io, runtime: rt.runtime, dockerProbe: dockerUp, fetch: githubApi().f });
+    expect(step(off, 'intake')).toMatchObject({ status: 'changed', detail: expect.stringContaining('disabled') });
+    expect((await loadEffectiveConfig(await loadProjectJson(off.projectId))).config.intake.github?.enabled).toBe(false);
   });
 
   it('every printed command names the repository (shell-quoted), so it works from any directory', async () => {
@@ -302,7 +335,7 @@ describe('minions setup', () => {
     const rt = fakeRuntime();
     const r = await runSetup({ path: repo, yes: true, runtime: rt.runtime, dockerProbe: dockerUp });
     expect(r.steps.map((s) => [s.id, s.status])).toEqual([
-      ['init', 'done'], ['github', 'skipped'], ['delivery', 'kept'], ['ci', 'skipped'], ['autoMerge', 'deferred'],
+      ['init', 'done'], ['github', 'skipped'], ['delivery', 'kept'], ['ci', 'skipped'], ['intake', 'skipped'], ['autoMerge', 'deferred'],
       ['telegram', 'skipped'], ['container', 'done'], ['import', 'done'], ['coordinator', 'done'],
     ]);
     expect((await loadEffectiveConfig(await loadProjectJson(r.projectId))).config.delivery.mode).toBe('local');

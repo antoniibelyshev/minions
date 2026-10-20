@@ -116,6 +116,71 @@
             "allowedPaths"
           ],
           "additionalProperties": false
+        },
+        "github": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "repository": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "pattern": "^[A-Za-z0-9_.-]+\\/[A-Za-z0-9_.-]+$"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "labels": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "^[^,\\r\\n]+$"
+              }
+            },
+            "assignee": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "pattern": "^(?:\\*|none|[A-Za-z0-9][A-Za-z0-9-]{0,38})$"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "milestone": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "pattern": "^[^\\r\\n]+$"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "state": {
+              "type": "string",
+              "enum": [
+                "open",
+                "closed",
+                "all"
+              ]
+            }
+          },
+          "required": [
+            "enabled",
+            "repository",
+            "labels",
+            "assignee",
+            "milestone",
+            "state"
+          ],
+          "additionalProperties": false
         }
       },
       "required": [

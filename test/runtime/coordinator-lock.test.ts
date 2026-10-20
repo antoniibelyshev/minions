@@ -61,6 +61,22 @@ describe('project coordinator lock (wrapper)', () => {
     db.close();
   });
 
+  it('startup work (intake sync) runs with the lock held, before claude; a failure is logged and the coordinator still starts', async () => {
+    const { paths } = layout();
+    const order: string[] = [];
+    const logs: string[] = [];
+    const { spawn, calls } = fakeSpawn(() => order.push('claude'));
+    const onStart = async () => {
+      const db = new RuntimeDb(paths.db); order.push(db.coordinatorLock() ? 'start:locked' : 'start:unlocked'); db.close();
+      throw new Error('gh exploded');
+    };
+    const code = await coordinatorWrapper(async () => terminalCfg(), { paths, spawn, permissionModes: autoModes, env: { TMUX: '/tmp/tmux-1/default,1,0' }, log: (l) => logs.push(l), signals: noSignals, onStart });
+    expect(code).toBe(0);
+    expect(calls).toHaveLength(1);
+    expect(order).toEqual(['start:locked', 'claude']);
+    expect(logs.join('\n')).toContain('startup step failed (the coordinator starts anyway): gh exploded');
+  });
+
   it('a second coordinator for the same project is refused while the holder is alive', async () => {
     const { paths } = layout();
     const db = new RuntimeDb(paths.db);

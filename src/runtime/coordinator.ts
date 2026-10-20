@@ -956,6 +956,12 @@ export interface CoordinatorWrapperDeps extends RunCoordinatorDeps {
    * exit record written). The CLI passes process.exit: a probe still in flight must not keep it alive.
    */
   exitAfterSignal?: (code: number) => void;
+  /**
+   * Startup work run once the lock is held, before claude starts (the CLI passes the GitHub intake
+   * sync). Failures are logged and never stop the coordinator. It runs inside the pre-spawn guard:
+   * `stop` is aborted on a signal, and the wrapper does not wait for it after that.
+   */
+  onStart?: (cfg: MinionsConfig, log: (line: string) => void, stop: AbortSignal) => Promise<void>;
 }
 
 /**
@@ -976,15 +982,26 @@ export async function coordinatorWrapper(loadConfig: () => Promise<MinionsConfig
   try {
     const cfg = await loadConfig();
     // Before runCoordinator: a refused duplicate must not overwrite the running coordinator's launch record.
+    const log = deps.log ?? ((l: string) => process.stderr.write(l + '\n'));
     held = await acquireCoordinatorLockWaiting(store(), {
-      session: lockSession(deps.env ?? process.env), ...deps.lockWait, log: deps.log ?? ((l) => process.stderr.write(l + '\n')),
+      session: lockSession(deps.env ?? process.env), ...deps.lockWait, log,
     });
-    // Same tick as the lock: every await until claude is spawned is covered (see PreSpawnGuard).
+    // Same tick as the lock: every await until claude is spawned is covered (see PreSpawnGuard),
+    // the startup step (GitHub intake) included.
     guard = installPreSpawnGuard(deps.signals ?? process);
-    const run = runCoordinator(cfg, { ...deps, preSpawn: guard });
+    const g = guard;
+    const stop = new AbortController();
+    void g.aborted.then(() => stop.abort());
+    const run = (async () => {
+      if (deps.onStart) {
+        try { await deps.onStart(cfg, log, stop.signal); } catch (e) { log(`minions: startup step failed (the coordinator starts anyway): ${redact((e as Error).message).slice(0, 500)}`); }
+      }
+      // A signal during the startup step: the race below has already ended the wrapper; never spawn.
+      if (g.signal) return exitCodeOf(null, g.signal);
+      return runCoordinator(cfg, { ...deps, preSpawn: g });
+    })();
     // Errors still reach us through the race; after a pre-spawn signal a late one no longer matters.
     run.catch(() => { /* see above */ });
-    const g = guard;
     code = await Promise.race([run, g.aborted.then((s) => exitCodeOf(null, s))]);
     await write(g.signal ? { code, error: `stopped by ${g.signal} before claude started` } : { code });
   } catch (e) {

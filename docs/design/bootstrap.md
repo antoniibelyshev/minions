@@ -450,6 +450,54 @@ Decision record for required-checks readiness, `minions sync` and CI setup guida
   moved. A PR head differing from the approved publication head is reported as a warning. Per-task gh
   failures are reported and the command exits 1; nothing is thrown away.
 
+## GitHub intake sync
+
+Decision record for GitHub-filtered intake (`src/runtime/intake-sync.ts`, config `intake.github`).
+
+- **A source, not a backend.** Issues are imported into the Backlog.md backlog; the GitHub Issues backend
+  stays deferred. Config `intake.github` (optional, strict): `enabled`, `repository` (`owner/repo`,
+  null = workspace origin), `labels` (all must match), `assignee` (login, `none`, `*`, null),
+  `milestone` (title or number, `none`, `*`, null; a title is resolved through `GET /milestones`),
+  `state` (`open`/`closed`/`all`). Unset = off, so existing configs stay valid.
+- **When.** `minions sync` (no task ids) runs one intake pass before the PR/CI refresh; the
+  coordinator wrapper runs one after taking the project lock and before claude starts (`onStart`,
+  failures only logged). No polling loop and no new top-level command.
+- **Startup budget.** The startup pass has an overall budget of 25 s (`STARTUP_INTAKE_BUDGET_MS`):
+  gh calls are killed at the budget, an `AbortSignal` makes in-flight reads resolve as failed and
+  stops the import, and after a 2 s grace the coordinator starts whether or not the pass returned.
+  An aborted pass keeps what it imported, evaluates no departures (pauses nothing) and is completed
+  by the next `minions sync`, which keeps the 120 s per-call gh timeout.
+- **Untrusted text.** Issue titles and bodies are task data. Every `<!--` in them becomes
+  `&lt;!--` before import, so an issue cannot forge the minions meta block (provenance, links, PR URL)
+  or hide text. The Backlog.md adapter also only parses the LAST `<!-- minions:meta ... -->` block
+  (the one minions appends), `replaceMeta` updates that same block, and `composeDescription` /
+  `replaceMeta` neutralise meta markers in all user content they write, so no task text (pasted
+  tickets, worker-created tasks) can carry a second block. Notes are a separate section and are
+  never parsed for meta.
+- **Read-only.** `gh api --method GET /repos/{repo}/issues?state&labels&assignee&milestone` (100 per
+  page, at most 10 pages), plus `GET /repos/{repo}/issues/{n}` to explain a departure.
+- **Additive, idempotent.** Key `intake:gh:<owner>/<repo>#<n>` in the idempotency table, issue URL in
+  the task meta `externalLinks` (also used to re-link when the DB row is missing). New tasks: status
+  `idea`, provenance `external-requirement`, issue body plus an "Imported from" line. Reruns never
+  overwrite title/description (the coordinator may have triaged them), never delete, and never
+  re-create a task that was removed from the backlog. minions' own record of each imported issue
+  (task id, assignees, in-filter flag, pending pause) is the meta row `intake_github`.
+- **Intake pause.** The `intake:` keys are intake creation (`isIntakeCreation`): while paused, new
+  issues are skipped and counted (`skippedIntakePaused`), and the sync does not fail. Reconciliation
+  of already-imported issues still runs (it creates nothing).
+- **Reconciliation** (spec section 9). An imported issue missing from a *complete* query result left the
+  filter (reason `closed`, `not-visible`, `reassigned` or `left-filter`); an issue still in the
+  filter whose recorded non-empty assignee set changed was `reassigned` (first assignment of an
+  unassigned issue is not). Either pauses the linked task: status `blocked` and a note, plus an
+  `intake-reconcile` event. done/delivered/cancelled tasks are left (`finished`); an already blocked
+  task is `already-blocked`; a task with an active lease is not moved (`lease-active`) and the pause is
+  retried on each later sync. An issue that matches again is recorded as `returned` with a note; the
+  task is not resumed automatically. A failed query, an unknown milestone or a truncated result (more
+  than 1000 issues) evaluates no departures, so nothing is paused on missing data.
+- **Setup.** `minions setup` asks *Import GitHub issues into the backlog?* after CI (default no; on a
+  rerun the current setting), then labels, assignee, milestone and state, and records `intake.github`
+  in `config.local.json`. No GitHub call is made at setup.
+
 ## Guided setup
 
 Decision record for `minions setup` (`src/host/setup.ts`).

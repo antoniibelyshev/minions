@@ -73,6 +73,22 @@ export const MinionsConfigSchema = z.object({
       requiredLabels: z.array(nonEmpty),
       allowedPaths: z.array(nonEmpty).min(1),
     }).strict(),
+    /**
+     * GitHub-filtered intake sync (src/runtime/intake-sync.ts): `minions sync` and coordinator startup import
+     * matching issues into the backlog (read-only on GitHub, additive, idempotent). Unset or disabled = off.
+     */
+    github: z.object({
+      enabled: z.boolean(),
+      /** "owner/repo"; null = the workspace origin. */
+      repository: z.string().regex(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/, 'must be "owner/repo"').nullable(),
+      /** Issues must carry all of these labels. */
+      labels: z.array(z.string().regex(/^[^,\r\n]+$/, 'must be non-empty, without commas or newlines')),
+      /** GitHub login, "none" (unassigned) or "*" (any assignee); null = no assignee filter. */
+      assignee: z.string().regex(/^(?:\*|none|[A-Za-z0-9][A-Za-z0-9-]{0,38})$/, 'must be a GitHub login, "none" or "*"').nullable(),
+      /** Milestone title or number, "none" or "*"; null = no milestone filter. */
+      milestone: z.string().regex(/^[^\r\n]+$/, 'must be a single non-empty line').nullable(),
+      state: z.enum(['open', 'closed', 'all']),
+    }).strict().optional(),
   }).strict(),
   container: z.object({
     required: z.literal(true),
