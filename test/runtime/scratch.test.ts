@@ -1,8 +1,8 @@
-import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, utimesSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
-  briefPath, claimWithBrief, compactClaim, ensureScratchDir, removeLeaseFiles, scratchDirOf, sweepScratch, sweepScratchOnStart, type HandoffPaths,
+  briefPath, claimWithBrief, compactClaim, ensureScratchDir, removeLeaseFiles, scratchDirOf, sweepScratch, sweepScratchOnStart, sweepTmpRoot, type HandoffPaths,
 } from '../../src/runtime/handoff.js';
 import { runtimePaths } from '../../src/runtime/paths.js';
 import { Scheduler } from '../../src/runtime/scheduler.js';
@@ -231,5 +231,49 @@ describe('lease scratch deletion safety', () => {
     expect(brief.scratchDir).toBeUndefined();
     expect(existsSync(briefPath(p, brief.leaseId))).toBe(true);
     expect(readFileSync(p.scratch!, 'utf8')).toBe('not a dir');
+  });
+
+  it('start sweeps stale TMPDIR-root entries, keeping fresh ones and leases/', async () => {
+    const env = makeEnv();
+    const p = paths(env);
+    const root = join(p.scratch!, '..');
+    mkdirSync(p.scratch!, { recursive: true });
+    const old = join(root, 'minions-rt-old');
+    const fresh = join(root, 'minions-rt-fresh');
+    mkdirSync(join(old, 'x'), { recursive: true });
+    mkdirSync(fresh);
+    const outside = join(env.root, 'outside');
+    mkdirSync(outside);
+    writeFileSync(join(outside, 'keep'), 'k');
+    symlinkSync(outside, join(root, 'old-link'));
+    const past = new Date(Date.now() - 48 * 3600_000);
+    utimesSync(old, past, past);
+    utimesSync(p.scratch!, past, past);
+    const logs: string[] = [];
+    await sweepScratchOnStart(env.db, p, (l) => logs.push(l));
+    expect(existsSync(old)).toBe(false);
+    expect(existsSync(fresh)).toBe(true);
+    expect(existsSync(p.scratch!)).toBe(true);
+    expect(existsSync(join(outside, 'keep'))).toBe(true);
+    // A spent budget stops the sweep without throwing.
+    mkdirSync(old);
+    utimesSync(old, past, past);
+    const r = await sweepTmpRoot(root, 'leases', { budgetMs: -1 });
+    expect(r.removed).toEqual([]);
+    expect(existsSync(old)).toBe(true);
+  });
+
+  it('sweep and remove refuse a symlinked leases parent', async () => {
+    const env = makeEnv();
+    const p = paths(env);
+    const target = join(env.root, 'elsewhere');
+    mkdirSync(join(target, 'lease-abc123'), { recursive: true });
+    mkdirSync(join(p.scratch!, '..'), { recursive: true });
+    symlinkSync(target, p.scratch!);
+    const r = await sweepScratch(p, []);
+    expect(r.removed).toEqual([]);
+    expect(r.errors.join()).toMatch(/symlink/);
+    expect((await removeLeaseFiles(p, 'lease-abc123')).join()).toMatch(/symlink/);
+    expect(existsSync(join(target, 'lease-abc123'))).toBe(true);
   });
 });
