@@ -1,6 +1,5 @@
 // Adversarial tests for the CI evidence gate (task-1.11, tester). Everything runs on a temp runtime DB and a
-// mocked gh; nothing touches the live state. Tests marked `it.fails` pin known defects: they pass while the
-// defect exists and start failing (remove `.fails`) once production code is fixed.
+// mocked gh; nothing touches the live state.
 import { describe, expect, it } from 'vitest';
 import type { RunResult } from '../../src/core/exec.js';
 import { requiredChecksStatus, summarizeChecks, syncTasks, type ApiGet, type RequiredChecksReport } from '../../src/runtime/ci.js';
@@ -61,18 +60,35 @@ describe('required checks come only from protection/rulesets, never from what ra
     }
   });
 
-  // DEFECT: a partial read (one source readable with checks, the other erroring) is reported as `configured`
-  // with only the readable source's checks, so the gate passes without the unreadable source's required checks.
-  it.fails('a partial read (rulesets unreadable) is not evidence', async () => {
+  // Fixed defect: a partial read (one source readable with checks, the other erroring) is `unknown`, because the
+  // unreadable source may require more checks than the readable one lists.
+  it('a partial read (rulesets unreadable) is not evidence', async () => {
     const r = await requiredChecksStatus(api({ [`${R}/branches/main`]: protection(['lint']), [`${R}/rules/branches/main`]: { status: 500, error: 'HTTP 500' } }), 'acme/demo', 'main');
     expect(r.errors.length).toBeGreaterThan(0);
+    expect(r.state).toBe('unknown');
     // The unreadable ruleset may require `test`, which is failing here; the gate must not pass on `lint` alone.
     expect(gate({ required: r, observations: [obs([{ name: 'lint', state: 'pass' }, { name: 'test', state: 'fail' }])] }).state).not.toBe('pass');
   });
 
-  it.fails('a partial read (protection unreadable, rulesets readable) is not evidence', async () => {
+  it('a partial read (protection unreadable, rulesets readable) is not evidence', async () => {
     const r = await requiredChecksStatus(api({ [`${R}/branches/main`]: { status: 403, error: 'HTTP 403' }, [`${R}/rules/branches/main`]: rulesetsFor(['lint']) }), 'acme/demo', 'main');
-    expect(gate({ required: r, observations: [obs([{ name: 'lint', state: 'pass' }])] }).state).not.toBe('pass');
+    expect(r.state).toBe('unknown');
+    expect(gate({ required: r, observations: [obs([{ name: 'lint', state: 'pass' }])] }).state).toBe('unknown');
+  });
+
+  it('a 404 for rules still means "no rulesets" (protection alone is a complete read)', async () => {
+    const r = await requiredChecksStatus(api({ [`${R}/branches/main`]: protection(['lint']) }), 'acme/demo', 'main');
+    expect(r).toMatchObject({ state: 'configured', requiredChecks: ['lint'], requirements: [{ context: 'lint', appId: null }] });
+  });
+
+  it('app pins are read from protection checks[].app_id and ruleset integration_id (null / -1 = any source)', async () => {
+    const r = await requiredChecksStatus(api({
+      [`${R}/branches/main`]: { status: 200, body: { protected: true, protection: { required_status_checks: { enforcement_level: 'everyone', contexts: ['lint', 'build', 'any'], checks: [{ context: 'lint', app_id: 15368 }, { context: 'build', app_id: -1 }, { context: 'any', app_id: null }] } } } },
+      [`${R}/rules/branches/main`]: rulesetsFor(['test']),
+    }), 'acme/demo', 'main');
+    expect(r.requirements).toEqual([
+      { context: 'any', appId: null }, { context: 'build', appId: null }, { context: 'lint', appId: 15368 }, { context: 'test', appId: 15368 },
+    ]);
   });
 });
 
@@ -87,12 +103,30 @@ describe('check identity (name collisions, other apps)', () => {
     expect(gate({ observations: [obs(pending)] }).state).toBe('pending');
   });
 
-  // RESIDUAL (documented in findings): matching is by name only. Protection `checks[].app_id` / ruleset
-  // `integration_id` are not pinned and the rollup source is not kept, so a commit status named `test` posted
-  // by anyone with statuses:write satisfies a required `test` check when the real check has not reported yet.
-  it('residual: a lone commit status with the required name counts as the required check', () => {
+  // RESIDUAL (documented in docs/design/bootstrap.md): a required check that GitHub does not pin to an app is
+  // matched by name only, as GitHub itself does, so a commit status named `test` satisfies it.
+  it('residual: an unpinned required check is satisfied by a lone commit status with its name', () => {
     const forged = summarizeChecks([status('test', 'SUCCESS')]).checks;
     expect(gate({ observations: [obs(forged)] }).state).toBe('pass');
+  });
+
+  const pinned = (appId = 15368): RequiredChecksReport => ({ ...report(['test']), requirements: [{ context: 'test', appId }] });
+  const appRun = (name: string, conclusion: string | null, appId: number) => ({ ...run(name, conclusion), appId });
+
+  it('a pinned required check is satisfied only by a check run of that app', () => {
+    expect(gate({ required: pinned(), observations: [obs(summarizeChecks([appRun('test', 'SUCCESS', 15368)]).checks)] }).state).toBe('pass');
+    // A forged status or another app's run of the same name is ignored: still pending (then timeout), never pass.
+    const forged = summarizeChecks([status('test', 'SUCCESS'), appRun('test', 'SUCCESS', 999)]).checks;
+    expect(gate({ required: pinned(), observations: [obs(forged)] }).state).toBe('pending');
+    expect(gate({ required: pinned(), observations: [obs(forged)], now: new Date(Date.parse(T0) + 31 * 60_000) }).state).toBe('timeout');
+    // The pinned app's failure is not masked by an impostor's pass.
+    expect(gate({ required: pinned(), observations: [obs(summarizeChecks([appRun('test', 'FAILURE', 15368), appRun('test', 'SUCCESS', 999)]).checks)] }).state).toBe('fail');
+  });
+
+  it('a pinned required check whose run has no known app (rollup without apps) is unknown, never pass', () => {
+    const g = gate({ required: pinned(), observations: [obs(summarizeChecks([run('test', 'SUCCESS')]).checks)] });
+    expect(g.state).toBe('unknown');
+    expect(g.reasons.join(' ')).toMatch(/app 15368/);
   });
 
   it('neutral counts as pass (as GitHub does for required checks); skipped and stale do not', () => {
@@ -103,9 +137,8 @@ describe('check identity (name collisions, other apps)', () => {
     expect(gate({ observations: [obs(summarizeChecks([status('test', 'ERROR')]).checks)] }).state).toBe('fail');
   });
 
-  // DEFECT: a COMPLETED check run with a missing or unrecognised conclusion is classified `pass`
-  // (anything not in FAILED_CONCLUSIONS and not SKIPPED). Fail closed would be pending/unknown.
-  it.fails('a completed check with no or an unknown conclusion is not a pass', () => {
+  // Fixed defect: a COMPLETED check run with a missing or unrecognised conclusion is pending, not pass.
+  it('a completed check with no or an unknown conclusion is not a pass', () => {
     for (const c of [null, '', 'SOMETHING_NEW']) {
       const checks = summarizeChecks([{ __typename: 'CheckRun', name: 'test', status: 'COMPLETED', conclusion: c }]).checks;
       expect(gate({ observations: [obs(checks)] }).state).not.toBe('pass');
@@ -211,6 +244,45 @@ describe('scheduler: head binding and fail-closed paths (mocked gh)', () => {
     await sync(env);
     const rec = await env.sched.record(brief.leaseId, result({ branch: brief.branch, headSha: brief.expectedHead, verdict: 'approve', ...ciOnly }));
     expect(rec).toMatchObject({ approved: false, to: 'changes-requested' });
+  });
+
+  describe('a required check pinned to an app (protection checks[].app_id)', () => {
+    const pinnedProtection = (p: string) => p === `${R}/branches/main`
+      ? ok(JSON.stringify({ protected: true, protection: { required_status_checks: { enforcement_level: 'everyone', contexts: ['test'], checks: [{ context: 'test', app_id: 15368 }] } } }))
+      : null;
+    const runs = (appId: number, conclusion = 'success') => ok(JSON.stringify({ total_count: 1, check_runs: [{ name: 'test', status: 'completed', conclusion, app: { id: appId } }] }));
+
+    it('sync reads check-run apps for the head; the pinned app passing is approval', async () => {
+      const env = await ciEnv();
+      env.st.rollup = passing;
+      env.st.api = (p) => pinnedProtection(p) ?? (p === `${R}/commits/${env.head}/check-runs?per_page=100` ? runs(15368) : null);
+      const s = await sync(env);
+      expect(s.tasks[0]!.gate?.state).toBe('pass');
+      expect(s.tasks[0]!.ci?.checks).toEqual([{ name: 'test', state: 'pass', source: 'check-run', appId: 15368 }]);
+      const { rec } = await review(env);
+      expect(rec).toMatchObject({ approved: true });
+    });
+
+    it('a same-named check from another app, or a forged status, is not approval', async () => {
+      const env = await ciEnv();
+      env.st.rollup = [{ __typename: 'StatusContext', context: 'test', state: 'SUCCESS' }, ...passing];
+      env.st.api = (p) => pinnedProtection(p) ?? (p.includes('/check-runs') ? runs(999) : null);
+      const s = await sync(env);
+      expect(s.tasks[0]!.gate?.state).toBe('pending');
+      const { rec } = await review(env);
+      expect(rec).toMatchObject({ approved: false, to: 'reviewing' });
+    });
+
+    it('check runs unreadable: the pinned check cannot be attributed (unknown, warning), never approval', async () => {
+      const env = await ciEnv();
+      env.st.rollup = passing;
+      env.st.api = (p) => pinnedProtection(p) ?? (p.includes('/check-runs') ? fail(403, 'Resource not accessible') : null);
+      const s = await sync(env);
+      expect(s.tasks[0]!.gate?.state).toBe('unknown');
+      expect(s.tasks[0]!.warnings.join(' ')).toMatch(/pinned to an app cannot be verified/);
+      const { rec } = await review(env);
+      expect(rec).toMatchObject({ approved: false, to: 'reviewing' });
+    });
   });
 
   it('required checks becoming unreadable at record time (rate limit) is not approval', async () => {

@@ -231,7 +231,7 @@ describe('CI awareness edge cases (tester)', () => {
     ({ state, isDraft: false, headRefOid: head, mergedAt: null, mergeStateStatus: 'CLEAN', statusCheckRollup: rollup });
   const passRun = { __typename: 'CheckRun', name: 'build', status: 'COMPLETED', conclusion: 'SUCCESS' };
 
-  it('rules 404 with an unprotected branch is "none"; rules 403 makes it "unknown" unless protection already lists checks', async () => {
+  it('rules 404 with an unprotected branch is "none"; rules 403 makes it "unknown", even when protection lists checks', async () => {
     const r404 = fakeGh({ [`${R}/branches/main`]: branch(undefined, false) });
     const a = await requiredChecksStatus(ghApi(r404.fn), 'acme/demo', 'main');
     expect(a).toMatchObject({ state: 'none', rulesets: null, errors: [] });
@@ -242,7 +242,7 @@ describe('CI awareness edge cases (tester)', () => {
     expect(b.errors.join()).toMatch(/rulesets unreadable/);
 
     const prot = fakeGh({ [`${R}/branches/main`]: branch({ required_status_checks: { contexts: ['build'] } }), [`${R}/rules/branches/main`]: httpErr(403, 'Forbidden') });
-    expect(await requiredChecksStatus(ghApi(prot.fn), 'acme/demo', 'main')).toMatchObject({ state: 'configured', requiredChecks: ['build'] });
+    expect(await requiredChecksStatus(ghApi(prot.fn), 'acme/demo', 'main')).toMatchObject({ state: 'unknown', requiredChecks: ['build'] });
     expectReadOnly([...r404.calls, ...r403.calls, ...prot.calls]);
   });
 

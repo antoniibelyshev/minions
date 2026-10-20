@@ -7,17 +7,19 @@
 //
 // Fail closed. Evidence is only:
 // - required checks read from branch protection / rulesets through read-only GET calls
-//   (src/runtime/ci.ts requiredChecksStatus); unreadable or none configured -> `unknown`, never "zero
-//   required checks";
+//   (src/runtime/ci.ts requiredChecksStatus); unreadable (either source), or none configured ->
+//   `unknown`, never "zero required checks". A check pinned to a GitHub App (protection app_id /
+//   ruleset integration_id) counts only from a check run of that app; unpinned checks match by name;
 // - `minions sync` observations (evidence kind `ci`) recorded for the exact head SHA; an observation of
 //   another head never counts, and neither does a worker's own claim about CI.
 // Anything other than every required check passing (`pass`) is not approval: `fail`, `pending`
 // (within verification.ciPendingTimeoutMinutes of the first observation of the head), `timeout`,
 // `missing` (no observation of this head), `unknown` (required checks unreadable / none configured /
-// an observation without per-check results / a skipped required check), `disabled` (ciAuthority none).
+// an observation without per-check results / a skipped required check / a pinned check whose app
+// could not be read), `disabled` (ciAuthority none).
 import type { MinionsConfig } from '../config/schema.js';
 import type { EvidenceRow, RuntimeDb } from './db.js';
-import type { CheckState, CiSummary, RequiredChecksReport } from './ci.js';
+import type { CheckState, CiSummary, RequiredCheck, RequiredChecksReport } from './ci.js';
 
 export type CiGateState = 'pass' | 'fail' | 'pending' | 'timeout' | 'missing' | 'unknown' | 'disabled';
 
@@ -78,16 +80,42 @@ export function evaluateCiGate(i: CiGateInput): CiGate {
   if (!Array.isArray(checks)) return out('unknown', 'the CI observation has no per-check results (re-run `minions sync`)');
 
   const skipped: string[] = [];
+  const unverified: string[] = [];
+  // Requirements with their app pin; reports without `requirements` fall back to name-only matching.
+  const reqs: RequiredCheck[] = i.required.requirements?.length
+    ? i.required.requirements : g.requiredChecks.map((context) => ({ context, appId: null }));
+  const verdict = new Map<string, CheckState | 'unverified'>();
+  const order = ['pass', 'skipped', 'pending', 'unverified', 'fail'] as const;
+  for (const q of reqs) {
+    const named = checks.filter((c) => c?.name === q.context);
+    let v: CheckState | 'unverified';
+    if (q.appId === null) {
+      // Name-only (residual: GitHub accepts any source for an unpinned check). Worst run of the name counts.
+      const states = named.map((c) => c.state);
+      v = states.length ? states.reduce((a, b) => (rank[b] > rank[a] ? b : a)) : 'pending';
+    } else {
+      // Pinned: only check runs reported by that app count; statuses and other apps are ignored.
+      const states = named.filter((c) => c.source === 'check-run' && c.appId === q.appId).map((c) => c.state);
+      if (states.length) v = states.reduce((a, b) => (rank[b] > rank[a] ? b : a));
+      // A check run of that name whose app is unknown (rollup without apps) cannot be attributed.
+      else v = named.some((c) => c.source !== 'status' && typeof c.appId !== 'number') ? 'unverified' : 'pending';
+    }
+    const prev = verdict.get(q.context);
+    if (!prev || order.indexOf(v) > order.indexOf(prev)) verdict.set(q.context, v);
+  }
   for (const name of g.requiredChecks) {
-    const states = checks.filter((c) => c?.name === name).map((c) => c.state);
-    // Not reported yet = expected (pending); several runs of one name: the worst one counts.
-    const worst = states.length ? states.reduce((a, b) => (rank[b] > rank[a] ? b : a)) : 'pending';
-    if (worst === 'pass') g.passed.push(name);
-    else if (worst === 'fail') g.failed.push(name);
-    else if (worst === 'skipped') skipped.push(name);
+    const v = verdict.get(name) ?? 'pending';
+    if (v === 'pass') g.passed.push(name);
+    else if (v === 'fail') g.failed.push(name);
+    else if (v === 'skipped') skipped.push(name);
+    else if (v === 'unverified') unverified.push(name);
     else g.pending.push(name);
   }
   if (g.failed.length) return out('fail', `required checks failing at ${i.head.slice(0, 12)}: ${g.failed.join(', ')}`);
+  if (unverified.length) {
+    const apps = reqs.filter((q) => q.appId !== null && unverified.includes(q.context)).map((q) => `${q.context} (app ${q.appId})`);
+    return out('unknown', `required checks pinned to an app could not be attributed at ${i.head.slice(0, 12)}: ${apps.join(', ')} (check-run apps unreadable; re-run \`minions sync\`)`);
+  }
   if (skipped.length) return out('unknown', `required checks skipped at ${i.head.slice(0, 12)}: ${skipped.join(', ')} (a skipped check is not evidence)`);
   if (g.pending.length) {
     const since = Date.parse(g.firstObservedAt!);

@@ -55,7 +55,7 @@ describe('CI evidence gate (pure decision, fail closed)', () => {
 });
 
 describe('per-check results in sync observations', () => {
-  it('keeps each check by name; skipped stays apart from pass', () => {
+  it('keeps each check by name and source; skipped stays apart from pass', () => {
     expect(summarizeChecks([
       { __typename: 'CheckRun', name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' },
       { __typename: 'CheckRun', name: 'docs', status: 'COMPLETED', conclusion: 'SKIPPED' },
@@ -63,7 +63,7 @@ describe('per-check results in sync observations', () => {
       { __typename: 'CheckRun', name: 'e2e', status: 'QUEUED', conclusion: null },
       { __typename: 'StatusContext', context: 'ci/legacy', state: 'SUCCESS' },
     ]).checks).toEqual([
-      { name: 'test', state: 'pass' }, { name: 'docs', state: 'skipped' }, { name: 'lint', state: 'fail' }, { name: 'e2e', state: 'pending' }, { name: 'ci/legacy', state: 'pass' },
+      { name: 'test', state: 'pass', source: 'check-run' }, { name: 'docs', state: 'skipped', source: 'check-run' }, { name: 'lint', state: 'fail', source: 'check-run' }, { name: 'e2e', state: 'pending', source: 'check-run' }, { name: 'ci/legacy', state: 'pass', source: 'status' },
     ]);
   });
 });

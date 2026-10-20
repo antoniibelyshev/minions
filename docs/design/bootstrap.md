@@ -512,8 +512,28 @@ re-run the full verification when CI already proved it for the same commit.
 - **Result contract.** `checks[].source` is optional (`local` default). `ci` entries are rejected
   without `ciAuthority: github`, from engineers (they always run targeted local checks), and with
   outcome `skipped`. A worker's claim about CI is never evidence by itself.
+- **Partial reads are unknown.** Required checks are `configured` only when both sources were read
+  (branch protection, and rulesets or a 404 meaning none apply). If either is unreadable (403, 5xx,
+  rate limit, transport error) the state is `unknown` even when the other lists checks, because the
+  unreadable source may require more.
+- **Conclusions.** A check run passes only with conclusion `SUCCESS` or `NEUTRAL`; `SKIPPED` is kept
+  apart (never evidence); a completed run with a missing or unrecognised conclusion is `pending`
+  (so the gate waits, then times out). Commit statuses pass only with `SUCCESS`.
+- **Check source (app pinning).** When branch protection (`checks[].app_id`) or a ruleset
+  (`integration_id`) pins a required check to a GitHub App, only a check run reported by that app
+  counts: `minions sync` then also reads `GET /repos/{repo}/commits/{head}/check-runs` (read-only) and
+  records each check's `source` (`check-run`/`status`) and `appId`. A commit status or another app's
+  run with the same name is ignored (the check stays `pending`, then `timeout`). If the check runs
+  cannot be read, a pinned check is `unknown`. `app_id` null or -1 means "any source".
+- **Residual: name-only matching.** A required check that GitHub does not pin to an app (legacy
+  `contexts`, `app_id` null/-1, a ruleset entry without `integration_id`) is matched by name only, as
+  GitHub itself does: anyone who can post a commit status with that name (for example with the
+  delivery token) can satisfy it before the real check reports. A failing or pending run of the same
+  name still wins (worst result per name). Pin the check to its app in branch protection or the
+  ruleset to close this.
 - **Sync.** With `ciAuthority: github`, `minions sync` also reports the gate per PR head. Observations
-  now include per-check results (`ci.checks[]`: name and pass/fail/pending/skipped).
+  now include per-check results (`ci.checks[]`: name, pass/fail/pending/skipped, source, and app id
+  when known).
 - **Readiness.** `minions doctor` reports `ci.authority`: ready only with `ciAuthority: github`,
   pull-request delivery, and readable required checks; otherwise `warn` with what is missing
   (never `fail`). With `ciAuthority: none` it is `ok` and hints when required checks exist.
