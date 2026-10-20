@@ -171,6 +171,17 @@ describe('CLI surface (docs/design/cli-surface.md)', () => {
     expect(JSON.parse(out)).toEqual({ ok: true, data: { primary: [...PRIMARY_COMMANDS] } });
   });
 
+  it('`minions help <command> --json` prints structured help instead of text', async () => {
+    const { out, code } = await run(['help', 'work', 'brief', '--json']);
+    expect(code).toBe(0);
+    const d = JSON.parse(out).data;
+    expect(d).toMatchObject({ name: 'minions work brief', description: expect.stringContaining('brief') });
+    expect(d.options.map((o: { flags: string }) => o.flags)).toContain('--role <role>');
+    expect(d.tier).toBe('internal');
+    const w = JSON.parse((await run(['help', 'work', '--json'])).out).data;
+    expect(w.commands.map((c: { name: string }) => c.name)).toEqual(expect.arrayContaining(['brief', 'submit']));
+  });
+
   it('`minions help stop` resolves the alias to the `down` help', async () => {
     const { out, code } = await run(['help', 'stop']);
     expect(code).toBe(0);

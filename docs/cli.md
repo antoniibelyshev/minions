@@ -51,6 +51,8 @@ run these yourself. They are not listed by the default help.
 | Command | Purpose |
 | - | - |
 | `minions work claim` / `record` / `release` / `list` | Leases and worker results (used by the coordinator, inside the container) |
+| `minions work brief <leaseId> --role <role>` | Worker: fetch the full brief of your own lease (run from inside its worktree) |
+| `minions work submit <leaseId> --role <role> [--result-file <path>]` | Worker: submit your WorkerResult JSON (stdin or file) for the coordinator to record |
 | `minions work publish <taskId>` | Publish (or retry publishing) an approved task in branch / pull-request delivery; idempotent |
 | `minions work approve <taskId> --head <sha>` | Record your approval to publish that exact commit (sensitive paths, or `ask` publication) |
 | `minions backlog ready` / `list` / `show` / `create` / `update` / `note` / `export` | Backend-neutral task operations (inside the container) |
@@ -65,4 +67,4 @@ run these yourself. They are not listed by the default help.
 
 Planned, **deferred in v0.1**: `minions config plan` / `apply`, `minions review publish`, `minions merge request`, `minions migrate backlog`, and the plan/migration parts of `minions upgrade`.
 
-Every command supports `--json`, and mutating commands support `--dry-run`. Exit code 0 means the requested operation completed; it does not mean a whole task passed. Errors use stable codes for auth required, conflict, policy denied, invalid configuration, incompatible runtime, and retryable network failure. Secrets and large task text go through stdin or restricted temporary files, never through process arguments.
+Every command supports `--json`, and mutating commands support `--dry-run`. Exit code 0 means the requested operation completed (`doctor` and `status --check` exit non-zero when a check reports a blocking FAIL; warnings keep exit 0; `help <command> --json` prints the command's usage, subcommands and options); it does not mean a whole task passed. Errors use stable codes for auth required, conflict, policy denied, invalid configuration, incompatible runtime, and retryable network failure. Secrets and large task text go through stdin or restricted temporary files, never through process arguments.

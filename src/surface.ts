@@ -73,6 +73,10 @@ export function applySurface(program: Command): void {
         if (!next) throw new MinionsError('NOT_FOUND', `Unknown command: minions ${path.join(' ')}`, 'Run `minions help --all` to list every command.');
         target = next;
       }
+      if ((cmd.optsWithGlobals() as { json?: boolean }).json) {
+        emit(commandHelp(target), { json: true, human: () => '' });
+        return;
+      }
       target.outputHelp();
     }));
   program.configureHelp({
@@ -102,4 +106,25 @@ export interface SurfaceListing { primary: string[]; advanced?: string[]; intern
 export function surfaceListing(program: Command, all: boolean): SurfaceListing {
   const names = (tier: Tier) => LISTING_ORDER.filter((n) => n !== 'help' && tierOf(n) === tier && program.commands.some((c) => c.name() === n));
   return all ? { primary: names('primary'), advanced: names('advanced'), internal: names('internal') } : { primary: names('primary') };
+}
+
+export interface CommandHelp {
+  name: string; usage: string; description: string; tier?: Tier;
+  commands: { name: string; description: string }[];
+  options: { flags: string; description: string }[];
+}
+
+/** Machine-readable help for `minions help <command...> --json`. */
+export function commandHelp(cmd: Command): CommandHelp {
+  const names: string[] = [];
+  for (let c: Command | null = cmd; c; c = c.parent) names.unshift(c.name());
+  const top = names[1];
+  return {
+    name: names.join(' '),
+    usage: `${names.join(' ')} ${cmd.usage()}`.trim(),
+    description: cmd.description(),
+    ...(top && tierOf(top) ? { tier: tierOf(top) } : {}),
+    commands: cmd.commands.map((c) => ({ name: c.name(), description: c.description() })),
+    options: cmd.options.filter((o) => !o.hidden).map((o) => ({ flags: o.flags, description: o.description })),
+  };
 }
