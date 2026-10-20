@@ -65,6 +65,23 @@ describe('local verification matching', () => {
     expect(localVerificationComplete([], [])).toBe(false);
     expect(localVerificationComplete([{ command: 'x', outcome: 'pass' }], [])).toBe(true);
   });
+
+  it('does not loosen: no || split, lookalikes, case, a failing run, quoted && stay unmatched', () => {
+    const one = ['npm test'];
+    const m = (command: string, outcome = 'pass') => localVerificationComplete([{ command, outcome }], one);
+    expect(m('npm test')).toBe(true);
+    expect(m('npm test || true')).toBe(false);
+    expect(m('true || npm test')).toBe(false);
+    expect(m('npm test | tee out')).toBe(false);
+    expect(m('npm test:fast')).toBe(false);
+    expect(m('NPM TEST')).toBe(false);
+    expect(m('echo "a && npm test"')).toBe(false);
+    expect(m('npm test && echo done')).toBe(false);
+    expect(m('npm test', 'fail')).toBe(false);
+    expect(m('npm test', 'skipped')).toBe(false);
+    expect(localVerificationComplete([{ command: 'npm run typecheck:fast', outcome: 'pass' }], ['npm run typecheck'])).toBe(false);
+    expect(localVerificationComplete([{ command: 'npm   test', outcome: 'pass' }], one)).toBe(false);
+  });
 });
 
 describe('per-check results in sync observations', () => {
@@ -223,6 +240,16 @@ describe('CI authority in the reviewer stage (mocked gh)', () => {
     expect(third.rec).toMatchObject({ approved: true, to: 'delivered' });
     expect(JSON.parse(env.db.evidenceFor('task-1', env.head, 'ci-gate').at(-1)!.details_json!)).toMatchObject({ usedAs: 'local-fallback' });
     expect(reviewerOutcomes(env)).toEqual(['ci-pending', 'ci-timeout', 'ci-timeout', 'complete']);
+  });
+
+  it('a configured command reporting fail never approves (rejected as invalid, not approved)', async () => {
+    const env = await ciEnv({ mutate: (c) => { c.verification.commands = ['npm test']; } });
+    const { rec } = await review(env, { checks: [...ciOnly.checks, { command: 'npm test', outcome: 'fail', source: 'local' }] });
+    expect(rec).toMatchObject({ valid: false, correctionAllowed: true });
+    expect(rec.approved).toBeFalsy();
+    expect(rec.errors!.join(' ')).toMatch(/cannot report failing checks/);
+    expect(env.backlog.tasks.get('task-1')!.status).toBe('reviewing');
+    expect(reviewerOutcomes(env)).not.toContain('complete');
   });
 
   it('unreadable required checks are not evidence (never treated as zero required checks)', async () => {
