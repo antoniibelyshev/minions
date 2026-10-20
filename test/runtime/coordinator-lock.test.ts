@@ -28,6 +28,9 @@ function layout() {
   return { root, paths };
 }
 
+/** The installed Claude Code offers auto: no real `claude --help` (task-36) before the fake spawn. */
+const autoModes = async () => ['acceptEdits', 'auto'];
+
 const noSignals = { on() { return this; }, removeListener() { return this; } };
 
 /** Fake claude: records the spawn, and lets the test observe the lock while "claude" runs. */
@@ -49,7 +52,7 @@ describe('project coordinator lock (wrapper)', () => {
     const { paths } = layout();
     let during: unknown;
     const { spawn, calls } = fakeSpawn(() => { const db = new RuntimeDb(paths.db); during = db.coordinatorLock(); db.close(); });
-    const code = await coordinatorWrapper(async () => terminalCfg(), { paths, spawn, env: { TMUX: '/tmp/tmux-1/default,1,0' }, log: () => {}, signals: noSignals });
+    const code = await coordinatorWrapper(async () => terminalCfg(), { paths, spawn, permissionModes: autoModes, env: { TMUX: '/tmp/tmux-1/default,1,0' }, log: () => {}, signals: noSignals });
     expect(code).toBe(0);
     expect(calls).toHaveLength(1);
     expect(during).toMatchObject({ pid: process.pid, session: TMUX_SESSION });
@@ -67,7 +70,7 @@ describe('project coordinator lock (wrapper)', () => {
     const logs: string[] = [];
     const sleeps: number[] = [];
     const err = await coordinatorWrapper(async () => terminalCfg(), {
-      paths, spawn, env: {}, log: (l) => logs.push(l), signals: noSignals,
+      paths, spawn, permissionModes: autoModes, env: {}, log: (l) => logs.push(l), signals: noSignals,
       lockWait: { alive: (p) => p === OTHER_PID, waitMs: 1000, sleep: async (ms) => { sleeps.push(ms); } },
     }).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(MinionsError);
@@ -89,7 +92,7 @@ describe('project coordinator lock (wrapper)', () => {
     const sleeps: number[] = [];
     let during: unknown;
     const { spawn } = fakeSpawn(() => { during = db.coordinatorLock(); });
-    expect(await coordinatorWrapper(async () => terminalCfg(), { paths, spawn, env: {}, log: () => {}, signals: noSignals, lockWait: { sleep: async (ms) => { sleeps.push(ms); } } })).toBe(0);
+    expect(await coordinatorWrapper(async () => terminalCfg(), { paths, spawn, permissionModes: autoModes, env: {}, log: () => {}, signals: noSignals, lockWait: { sleep: async (ms) => { sleeps.push(ms); } } })).toBe(0);
     expect(sleeps).toEqual([]);
     expect(during).toMatchObject({ pid: process.pid, session: 'direct' });
     expect(db.coordinatorLock()).toBeUndefined();
@@ -104,7 +107,7 @@ describe('project coordinator lock (wrapper)', () => {
     const sleeps: number[] = [];
     const { spawn, calls } = fakeSpawn();
     const code = await coordinatorWrapper(async () => terminalCfg(), {
-      paths, spawn, env: { TMUX: 'x' }, log: () => {}, signals: noSignals,
+      paths, spawn, permissionModes: autoModes, env: { TMUX: 'x' }, log: () => {}, signals: noSignals,
       // The old wrapper exits after the second poll (tmux kill-session SIGHUP -> claude exits -> release).
       lockWait: { alive: (p) => p === OTHER_PID && oldAlive, sleep: async (ms) => { sleeps.push(ms); if (sleeps.length === 2) oldAlive = false; } },
     });
@@ -117,7 +120,7 @@ describe('project coordinator lock (wrapper)', () => {
   it('releases the lock even when claude fails to start, and never releases a lock it does not hold', async () => {
     const { paths } = layout();
     const failing: SpawnLike = () => { throw new Error('ENOENT claude'); };
-    await expect(coordinatorWrapper(async () => terminalCfg(), { paths, spawn: failing, env: {}, log: () => {}, signals: noSignals })).rejects.toMatchObject({ code: 'INCOMPATIBLE_RUNTIME' });
+    await expect(coordinatorWrapper(async () => terminalCfg(), { paths, spawn: failing, permissionModes: autoModes, env: {}, log: () => {}, signals: noSignals })).rejects.toMatchObject({ code: 'INCOMPATIBLE_RUNTIME' });
     const db = new RuntimeDb(paths.db);
     expect(db.coordinatorLock()).toBeUndefined();
     db.acquireCoordinatorLock('other', OTHER_PID, () => true);
@@ -355,7 +358,7 @@ describe('restart when the old wrapper is slow to exit', () => {
     const runNewWrapper = async () => {
       const { spawn, calls } = fakeSpawn();
       const result = await coordinatorWrapper(async () => terminalCfg(), {
-        paths, spawn, env: { TMUX: 'x' }, log: () => {}, signals: noSignals, lockWait: { alive, sleep },
+        paths, spawn, permissionModes: autoModes, env: { TMUX: 'x' }, log: () => {}, signals: noSignals, lockWait: { alive, sleep },
       }).then((code) => ({ code }), (e: unknown) => ({ error: e }));
       session = false; // the pane's only process exited: tmux ends the session
       return { result, claudeStarted: calls.length };
@@ -454,7 +457,7 @@ describe('wrapper signal handling releases the lock', () => {
     const bus = signalBus();
     const child = signalledChild();
     const t = manualTimer();
-    const p = coordinatorWrapper(async () => terminalCfg(), { paths, spawn: child.spawn, env: { TMUX: 'x' }, log: () => {}, signals: bus, timer: t.timer });
+    const p = coordinatorWrapper(async () => terminalCfg(), { paths, spawn: child.spawn, permissionModes: autoModes, env: { TMUX: 'x' }, log: () => {}, signals: bus, timer: t.timer });
     await started(paths);
     await new Promise((r) => setImmediate(r));
     const db = new RuntimeDb(paths.db);
@@ -476,7 +479,7 @@ describe('wrapper signal handling releases the lock', () => {
     const child = signalledChild(['SIGHUP', 'SIGTERM']);
     const t = manualTimer();
     let settled = false;
-    const p = coordinatorWrapper(async () => terminalCfg(), { paths, spawn: child.spawn, env: { TMUX: 'x' }, log: () => {}, signals: bus, timer: t.timer }).finally(() => { settled = true; });
+    const p = coordinatorWrapper(async () => terminalCfg(), { paths, spawn: child.spawn, permissionModes: autoModes, env: { TMUX: 'x' }, log: () => {}, signals: bus, timer: t.timer }).finally(() => { settled = true; });
     await started(paths);
     await new Promise((r) => setImmediate(r));
     bus.emit('SIGHUP');
@@ -502,7 +505,7 @@ describe('wrapper signal handling releases the lock', () => {
     const bus = signalBus();
     const child = signalledChild(['SIGTERM']);
     const t = manualTimer();
-    const p = coordinatorWrapper(async () => terminalCfg(), { paths, spawn: child.spawn, env: {}, log: () => {}, signals: bus, timer: t.timer });
+    const p = coordinatorWrapper(async () => terminalCfg(), { paths, spawn: child.spawn, permissionModes: autoModes, env: {}, log: () => {}, signals: bus, timer: t.timer });
     await started(paths);
     await new Promise((r) => setImmediate(r));
     bus.emit('SIGTERM');
