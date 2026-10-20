@@ -1,12 +1,15 @@
 import { randomBytes } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import type { BacklogAdapter, ScopeFilter, Task, TaskStatus } from '../backlog/types.js';
 import { can, matchesAny } from '../config/capabilities.js';
 import { isGithubDelivery } from '../config/delivery.js';
 import type { MinionsConfig } from '../config/schema.js';
+import { verifyApproval } from '../core/approval.js';
 import { MinionsError } from '../core/errors.js';
 import { syncBaseFromOrigin, type BaseSyncResult } from './base-sync.js';
 import type { Lease, LeaseRole, PublicationState, RuntimeDb } from './db.js';
 import { removeLeaseFiles, type HandoffPaths } from './handoff.js';
+import { runtimePaths } from './paths.js';
 import { publishTask, type PublishInput, type PublishOutcome } from './publish.js';
 import { validateResult, type WorkerResult } from './results.js';
 import { BRANCH_PREFIX, branchFor, ensureBranchWorktree, ensureReviewWorktree, git, headOf, resolveBaseBranch, taskSlug, workspaceLayout, type WorkspaceLayout } from './worktree.js';
@@ -34,6 +37,8 @@ export interface SchedulerDeps {
   handoff?: HandoffPaths;
   /** GitHub delivery: pre-claim fetch + fast-forward of the base from origin (tests may inject one). */
   baseSync?: (repo: string, base: string) => Promise<BaseSyncResult>;
+  /** Public key verifying host-signed publication approvals (default: runtimePaths().approvalPublicKey). */
+  approvalPublicKeyFile?: string;
 }
 
 /** Result of a publication attempt (`minions work publish`, or embedded in a record response). */
@@ -44,6 +49,8 @@ export interface PublishResponse {
   merged: false;
   push?: 'pushed' | 'already-current'; pr?: 'created' | 'existing' | null;
   reasons?: string[]; sensitivePaths?: string[];
+  /** awaiting-approval: why no recorded approval was accepted (missing, invalid signature, other head, expired). */
+  approvalError?: string;
   errorCode?: string; retryable?: boolean;
   message: string;
 }
@@ -143,6 +150,7 @@ export class Scheduler {
   private readonly publisher: (input: PublishInput) => Promise<PublishOutcome>;
   private readonly handoff: HandoffPaths | null;
   private readonly baseSync: (repo: string, base: string) => Promise<BaseSyncResult>;
+  private readonly approvalPublicKeyFile: string;
 
   constructor(deps: SchedulerDeps) {
     this.db = deps.db; this.backlog = deps.backlog; this.config = deps.config;
@@ -150,6 +158,7 @@ export class Scheduler {
     this.handoff = deps.handoff ?? null;
     this.publisher = deps.publisher ?? publishTask;
     this.baseSync = deps.baseSync ?? ((repo, base) => syncBaseFromOrigin(repo, base));
+    this.approvalPublicKeyFile = deps.approvalPublicKeyFile ?? runtimePaths().approvalPublicKey;
   }
 
   list(opts: { all?: boolean; taskId?: string } = {}): Lease[] { return this.db.leases(opts); }
@@ -647,18 +656,19 @@ export class Scheduler {
 
     const outcome = await this.publisher({
       config: cfg, task, repo: this.layout.repo, branch: pub.branch, head,
-      humanApproved: !!this.db.approval(taskId, 'publish', head),
+      approvals: this.db.approvals(taskId, 'publish', head).map((a) => a.signature),
+      approvalPublicKeyFile: this.approvalPublicKeyFile,
     });
 
     if (outcome.state === 'failed') return failWith(outcome.code, outcome.message, outcome.retryable);
     if (outcome.state === 'awaiting-approval') {
       this.db.setPublicationState(taskId, 'awaiting-approval');
-      this.db.addEvent('publish', taskId, { state: 'awaiting-approval', reasons: outcome.reasons, sensitivePaths: outcome.sensitivePaths });
+      this.db.addEvent('publish', taskId, { state: 'awaiting-approval', reasons: outcome.reasons, sensitivePaths: outcome.sensitivePaths, approvalError: outcome.approvalError });
       await this.setStatus(taskId, 'awaiting-human');
-      const how = `the user approves with \`minions work approve ${taskId} --head ${head}\`, then run \`minions work publish ${taskId}\``;
+      const how = `the user approves on the host (in the repository, outside the container) with \`minions work approve ${taskId} --head ${head}\`, which signs the approval with the host-held key; then run \`minions work publish ${taskId}\``;
       await this.note(taskId, `minions: publication of ${pub.branch} at ${head.slice(0, 12)} waits for human approval: ${outcome.reasons.join('; ')}.`);
-      return resp('awaiting-approval', 'awaiting-human', `Not published: ${outcome.reasons.join('; ')}. Nothing was pushed; ask the user — ${how}.`,
-        { reasons: outcome.reasons, sensitivePaths: outcome.sensitivePaths });
+      return resp('awaiting-approval', 'awaiting-human', `Not published: ${outcome.reasons.join('; ')} (${outcome.approvalError}). Nothing was pushed; ask the user — ${how}.`,
+        { reasons: outcome.reasons, sensitivePaths: outcome.sensitivePaths, approvalError: outcome.approvalError });
     }
 
     this.db.setPublicationState(taskId, 'published', { prUrl: outcome.prUrl });
@@ -675,20 +685,34 @@ export class Scheduler {
   }
 
   /**
-   * Records a human approval to publish the task's approved head (needed when publication touches
-   * sensitive paths or git.push / pr.create are "ask"). Bound to the head SHA: new commits need a
-   * new approval. Meant to be run by the user (host CLI) or by the coordinator only on the user's
-   * explicit instruction — the coordinator's Claude Code settings make this command always ask.
+   * Records a host-signed human approval to publish the task's approved head (needed when publication
+   * touches sensitive paths or git.push / pr.create are "ask"). The signature (made by the host CLI
+   * with a key the runtime cannot read) must cover exactly this task and head; it is checked here to
+   * fail fast and again by publishTask right before pushing, because the DB row itself is writable by
+   * in-runtime code and is not trusted. New commits need a new approval.
    */
-  approvePublication(taskId: string, opts: { head?: string; by?: string; note?: string } = {}): { taskId: string; headSha: string; approvalId: number; message: string } {
+  approvePublication(taskId: string, opts: { head?: string; by?: string; note?: string; signature?: string; now?: Date } = {}): { taskId: string; headSha: string; approvalId: number; expiresAt: string; message: string } {
     const pub = this.db.publication(taskId);
     if (!pub) throw new MinionsError('PRECONDITION', `Task ${taskId} has no approved publication to authorize.`, 'Approval applies after the reviewer approved the task.');
     if (pub.state === 'published') throw new MinionsError('PRECONDITION', `Task ${taskId} is already published at ${pub.head_sha}.`);
     if (opts.head && opts.head !== pub.head_sha) {
       throw new MinionsError('CONFLICT', `--head ${opts.head} is not the head awaiting publication (${pub.head_sha}).`, 'Approve the exact head that was reviewed.');
     }
-    const a = this.db.addApproval({ task_id: taskId, scope: 'publish', head_sha: pub.head_sha, approved_by: opts.by ?? null, note: opts.note ?? null });
-    this.db.addEvent('approval', taskId, { scope: 'publish', head: pub.head_sha, by: opts.by ?? null, approvalId: a.id });
-    return { taskId, headSha: pub.head_sha, approvalId: a.id, message: `Recorded human approval to publish ${pub.branch} at ${pub.head_sha}. Run \`minions work publish ${taskId}\`.` };
+    if (!opts.signature) {
+      throw new MinionsError('PRECONDITION', 'Publication approvals must be signed on the host; an unsigned approval is not accepted.',
+        `The user runs \`minions work approve ${taskId} --head ${pub.head_sha}\` on the host, in the repository (not inside the runtime).`);
+    }
+    let publicKey: string | null = null;
+    try { publicKey = readFileSync(this.approvalPublicKeyFile, 'utf8'); } catch { publicKey = null; }
+    const check = verifyApproval(opts.signature, publicKey, { taskId, head: pub.head_sha, now: opts.now });
+    if (!check.ok) {
+      throw new MinionsError('POLICY_DENIED', `Approval rejected: ${check.reason}.`,
+        `The user re-runs \`minions work approve ${taskId} --head ${pub.head_sha}\` on the host.`);
+    }
+    const by = check.payload.by ?? opts.by ?? null;
+    const a = this.db.addApproval({ task_id: taskId, scope: 'publish', head_sha: pub.head_sha, approved_by: by, note: opts.note ?? null, signature: opts.signature });
+    this.db.addEvent('approval', taskId, { scope: 'publish', head: pub.head_sha, by, approvalId: a.id, kid: check.payload.kid, expiresAt: check.payload.expiresAt });
+    return { taskId, headSha: pub.head_sha, approvalId: a.id, expiresAt: check.payload.expiresAt,
+      message: `Recorded host-signed approval to publish ${pub.branch} at ${pub.head_sha} (valid until ${check.payload.expiresAt}). Run \`minions work publish ${taskId}\`.` };
   }
 }

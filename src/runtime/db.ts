@@ -5,7 +5,7 @@ import type { IdempotencyStore } from '../backlog/types.js';
 import { MinionsError } from '../core/errors.js';
 import { runtimePaths } from './paths.js';
 
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
 
 export type LeaseRole = 'engineer' | 'tester' | 'reviewer';
 /** active: worker running (or awaiting a correction); completed: valid result; released: no result; unvalidated: invalid after correction. */
@@ -35,7 +35,8 @@ export interface PublicationRow {
   pr_url: string | null; error_code: string | null; error: string | null;
   config_revision: number; updated_at: string;
 }
-export interface ApprovalRow { id: number; task_id: string; scope: string; head_sha: string; approved_by: string | null; note: string | null; recorded_at: string }
+/** signature: host-signed approval token (src/core/approval.ts); verified again before every publication. */
+export interface ApprovalRow { id: number; task_id: string; scope: string; head_sha: string; approved_by: string | null; note: string | null; recorded_at: string; signature: string | null }
 
 export interface GuardRow { fingerprint: string | null; count: number; last_reason: string | null; updated_at: string | null }
 /** The last `controls` event that set one pause flag: its event id, time and the value it set. */
@@ -72,6 +73,10 @@ const MIGRATIONS: Record<number, string> = {
       id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, scope TEXT NOT NULL, head_sha TEXT NOT NULL,
       approved_by TEXT, note TEXT, recorded_at TEXT NOT NULL);
     CREATE INDEX IF NOT EXISTS approvals_task_head ON approvals(task_id, scope, head_sha);
+  `,
+  // Host-signed approvals: the token is stored with the row; rows without one never authorize publication.
+  3: `
+    ALTER TABLE approvals ADD COLUMN signature TEXT;
   `,
 };
 
@@ -261,10 +266,14 @@ export class RuntimeDb {
   }
 
   // Human approvals, bound to a head SHA (a new commit needs a new approval).
-  addApproval(a: { task_id: string; scope: string; head_sha: string; approved_by: string | null; note: string | null }): ApprovalRow {
-    const id = this.exec('INSERT INTO approvals (task_id, scope, head_sha, approved_by, note, recorded_at) VALUES (?, ?, ?, ?, ?, ?)',
-      a.task_id, a.scope, a.head_sha, a.approved_by, a.note, nowIso()).lastInsertRowid;
+  addApproval(a: { task_id: string; scope: string; head_sha: string; approved_by: string | null; note: string | null; signature?: string | null }): ApprovalRow {
+    const id = this.exec('INSERT INTO approvals (task_id, scope, head_sha, approved_by, note, recorded_at, signature) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      a.task_id, a.scope, a.head_sha, a.approved_by, a.note, nowIso(), a.signature ?? null).lastInsertRowid;
     return this.get<ApprovalRow>('SELECT * FROM approvals WHERE id = ?', id)!;
+  }
+  /** Every approval row for one head, newest first (the runtime verifies their signatures; rows are not trusted). */
+  approvals(taskId: string, scope: string, headSha: string): ApprovalRow[] {
+    return this.all<ApprovalRow>('SELECT * FROM approvals WHERE task_id = ? AND scope = ? AND head_sha = ? ORDER BY id DESC', taskId, scope, headSha);
   }
   approval(taskId: string, scope: string, headSha: string): ApprovalRow | undefined {
     return this.get<ApprovalRow>('SELECT * FROM approvals WHERE task_id = ? AND scope = ? AND head_sha = ? ORDER BY id DESC LIMIT 1', taskId, scope, headSha);

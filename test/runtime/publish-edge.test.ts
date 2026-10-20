@@ -5,9 +5,10 @@ import { describe, expect, it } from 'vitest';
 import { RuntimeDb, SCHEMA_VERSION } from '../../src/runtime/db.js';
 import { git as realGit, taskSlug, branchFor } from '../../src/runtime/worktree.js';
 import { publishTask, type GhFn } from '../../src/runtime/publish.js';
+import { verifyAnyApproval } from '../../src/core/approval.js';
 import type { GitFn } from '../../src/runtime/github.js';
 import { defaults } from '../helpers.js';
-import { commitFile, gitSync, tmp } from './fixtures.js';
+import { approvalKeys, commitFile, gitSync, tmp } from './fixtures.js';
 
 const TOKEN = 'ghp_' + 'b'.repeat(36);
 
@@ -63,6 +64,32 @@ describe('runtime db migration 1 -> 2', () => {
   });
 });
 
+describe('runtime db migration 2 -> 3 (host-signed approvals)', () => {
+  it('adds approvals.signature, keeps existing schema-2 approval rows, and those unsigned rows never verify', () => {
+    const path = join(tmp(), 'minions.db');
+    // A genuine v2 database with a task-1.4 style (unsigned) approval row.
+    const db = new RuntimeDb(path);
+    db.sql.exec('ALTER TABLE approvals DROP COLUMN signature');
+    db.sql.prepare("INSERT INTO approvals (task_id, scope, head_sha, approved_by, note, recorded_at) VALUES ('task-1', 'publish', ?, 'user', NULL, '2026-01-01T00:00:00Z')").run('a'.repeat(40));
+    db.setMeta('schema_version', '2');
+    db.close();
+
+    const up = new RuntimeDb(path);
+    expect(up.getMeta('schema_version')).toBe(String(SCHEMA_VERSION));
+    const rows = up.approvals('task-1', 'publish', 'a'.repeat(40));
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ approved_by: 'user', signature: null });
+    const keys = approvalKeys();
+    expect(verifyAnyApproval(rows.map((r) => r.signature), keys.publicKeyPem, { taskId: 'task-1', head: 'a'.repeat(40) }))
+      .toMatchObject({ ok: false, reason: expect.stringMatching(/no host-signed approval/) });
+    up.close();
+    // Idempotent: reopening does not re-run the ALTER.
+    const again = new RuntimeDb(path);
+    expect(again.approvals('task-1', 'publish', 'a'.repeat(40))).toHaveLength(1);
+    again.close();
+  });
+});
+
 describe('sensitive path detection and publication argv safety (fake git/gh)', () => {
   /** Real repo with a base commit; diff output is replaced so any path list can be tested. */
   function setup(diffPaths: string[], mutate?: (c: ReturnType<typeof defaults>) => void) {
@@ -91,9 +118,11 @@ describe('sensitive path detection and publication argv safety (fake git/gh)', (
       if (args[1] === 'list') return { code: 0, stdout: '[]', stderr: '' };
       return { code: 0, stdout: 'https://github.com/acme/demo/pull/9\n', stderr: '' };
     };
+    const keys = approvalKeys();
     const run = (humanApproved = false, title = 'T') => publishTask({
       config: cfg, task: { id: 'task-1', title, description: 'd', acceptanceCriteria: [] } as never,
-      repo, branch: 'agent/t', head, humanApproved, git, gh, tokenFile,
+      repo, branch: 'agent/t', head, git, gh, tokenFile,
+      approvals: humanApproved ? [keys.sign('task-1', head)] : [], approvalPublicKeyFile: keys.publicKeyFile,
     });
     return { run, calls, ghCalls };
   }

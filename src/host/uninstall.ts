@@ -6,6 +6,7 @@ import { MinionsError } from '../core/errors.js';
 import { sha256 } from '../core/fsutil.js';
 import { projectPaths, volumeNames } from '../core/paths.js';
 import { clearSecrets, loadCredentialRefs } from './credentials.js';
+import { removeApprovalKeys } from './approvals.js';
 import { Compose, type Runner } from './docker.js';
 import { loadManifest } from './install.js';
 import { loadRegistry, projectForPath, saveRegistry } from './registry.js';
@@ -97,6 +98,7 @@ export async function runUninstall(opts: UninstallOptions): Promise<UninstallRes
     // The container is gone: drop the materialized GitHub/Telegram token copies, the host-provisioned
     // Claude key copy (its original source is untouched), the mount dir, and the non-secret refresh state.
     await clearSecrets(projectId);
+    await removeApprovalKeys(projectId); // host-held approval signing key and its public half
     await rm(paths.secretsDir, { recursive: true, force: true });
     await rm(paths.authStateJson, { force: true });
     await rm(paths.logsDir, { recursive: true, force: true });
