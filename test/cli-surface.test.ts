@@ -26,6 +26,15 @@ async function run(args: string[]): Promise<{ out: string; code: number | undefi
   try { return await runHost(args); } finally { if (runtime !== undefined) process.env.MINIONS_RUNTIME = runtime; }
 }
 
+/** Like run(), but with MINIONS_RUNTIME forced to `mode` (only for commands that fail closed before touching state). */
+async function runIn(mode: 'container', args: string[]): Promise<{ out: string; code: number | undefined }> {
+  const runtime = process.env.MINIONS_RUNTIME;
+  process.env.MINIONS_RUNTIME = mode;
+  try { return await runHost(args); } finally {
+    if (runtime === undefined) delete process.env.MINIONS_RUNTIME; else process.env.MINIONS_RUNTIME = runtime;
+  }
+}
+
 async function runHost(args: string[]): Promise<{ out: string; code: number | undefined }> {
   const program = buildProgram();
   let out = '';
@@ -154,6 +163,34 @@ describe('CLI surface (docs/design/cli-surface.md)', () => {
     expect(find('doctor')).toBeDefined();
     expect(find('init')).toBeDefined();
     expect(find('status')?.options.map((o) => o.long)).toContain('--check');
+  });
+
+  it('`minions help --json` without --all returns only the primary tier', async () => {
+    const { out, code } = await run(['help', '--json']);
+    expect(code).toBe(0);
+    expect(JSON.parse(out)).toEqual({ ok: true, data: { primary: [...PRIMARY_COMMANDS] } });
+  });
+
+  it('`minions help stop` resolves the alias to the `down` help', async () => {
+    const { out, code } = await run(['help', 'stop']);
+    expect(code).toBe(0);
+    expect(out).toContain('Usage: minions down|stop');
+  });
+
+  it('`status --check` and `doctor` fail closed with INCOMPATIBLE_RUNTIME inside the container (no stack trace)', async () => {
+    // requireMode('host') runs before any runtime state is opened, so this never touches /state.
+    for (const args of [['status', '--check'], ['doctor']]) {
+      const { out, code } = await runIn('container', [...args, '--json']);
+      expect(code, args.join(' ')).toBe(6);
+      const parsed = JSON.parse(out) as { ok: boolean; error: { code: string; hint?: string } };
+      expect(parsed.ok).toBe(false);
+      expect(parsed.error.code).toBe('INCOMPATIBLE_RUNTIME');
+      expect(parsed.error.hint).toMatch(/host/);
+      const human = await runIn('container', [...args]);
+      expect(human.code).toBe(6);
+      expect(human.out).toContain('error [INCOMPATIBLE_RUNTIME]');
+      expect(human.out).not.toMatch(/\n\s+at /);
+    }
   });
 
   it('`minions help <unknown>` fails with NOT_FOUND', async () => {
