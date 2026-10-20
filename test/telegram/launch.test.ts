@@ -34,6 +34,8 @@ const factsOf = () => ({
 });
 
 /** Explicit terminal (the profile default is auto). */
+/** --permission-mode choices of Claude Code 2.1.292 (stub for `claude --help`). */
+const autoModes = async () => ['acceptEdits', 'auto', 'bypassPermissions', 'manual', 'dontAsk', 'plan'];
 const terminalCfg = (): MinionsConfig => { const c = defaults(); c.communication.channel = 'terminal'; return c; };
 
 const telegramCfg = (over: Partial<MinionsConfig['container']> = {}): MinionsConfig => {
@@ -122,7 +124,7 @@ describe('coordinator exec wrapper', () => {
     const { calls, spawn } = fakeSpawn();
     const logs: string[] = [];
     const parentEnv = { PATH: '/usr/bin', HOME: '/home/node' };
-    const code = await runCoordinator(telegramCfg(), { paths, spawn, env: parentEnv, probe: async () => available(), log: (l) => logs.push(l) });
+    const code = await runCoordinator(telegramCfg(), { paths, permissionModes: autoModes, spawn, env: parentEnv, probe: async () => available(), log: (l) => logs.push(l) });
     expect(code).toBe(0);
     expect(calls).toHaveLength(1);
     const c = calls[0]!;
@@ -145,7 +147,7 @@ describe('coordinator exec wrapper', () => {
     const { calls, spawn } = fakeSpawn();
     const logs: string[] = [];
     let probed = false;
-    await runCoordinator(telegramCfg(), { paths, spawn, env: { [TELEGRAM_TOKEN_ENV]: TOKEN }, probe: async () => { probed = true; return available(); }, log: (l) => logs.push(l) });
+    await runCoordinator(telegramCfg(), { paths, permissionModes: autoModes, spawn, env: { [TELEGRAM_TOKEN_ENV]: TOKEN }, probe: async () => { probed = true; return available(); }, log: (l) => logs.push(l) });
     expect(calls[0]!.args).not.toContain('--channels');
     expect(calls[0]!.env).not.toHaveProperty(TELEGRAM_TOKEN_ENV);
     expect(logs.join('\n')).toMatch(/Telegram disabled for this session: Telegram bot token is not provisioned.*Terminal mode is active/);
@@ -158,7 +160,7 @@ describe('coordinator exec wrapper', () => {
     const withTok = layout();
     const a = fakeSpawn();
     const logs: string[] = [];
-    await runCoordinator(auto, { paths: withTok.paths, spawn: a.spawn, env: {}, probe: async () => available(), log: (l) => logs.push(l) });
+    await runCoordinator(auto, { paths: withTok.paths, permissionModes: autoModes, spawn: a.spawn, env: {}, probe: async () => available(), log: (l) => logs.push(l) });
     expect(a.calls[0]!.args).toContain('--channels');
     expect(a.calls[0]!.env[TELEGRAM_TOKEN_ENV]).toBe(TOKEN);
     expect(logs.join('\n')).toMatch(/Telegram enabled \(communication.channel auto: bot token stored\)/);
@@ -166,7 +168,7 @@ describe('coordinator exec wrapper', () => {
     const noTok = layout(null);
     const b = fakeSpawn();
     const logs2: string[] = [];
-    await runCoordinator(auto, { paths: noTok.paths, spawn: b.spawn, env: { [TELEGRAM_TOKEN_ENV]: TOKEN }, probe: async () => { throw new Error('must not probe'); }, log: (l) => logs2.push(l) });
+    await runCoordinator(auto, { paths: noTok.paths, permissionModes: autoModes, spawn: b.spawn, env: { [TELEGRAM_TOKEN_ENV]: TOKEN }, probe: async () => { throw new Error('must not probe'); }, log: (l) => logs2.push(l) });
     expect(b.calls[0]!.args).not.toContain('--channels');
     expect(b.calls[0]!.env).not.toHaveProperty(TELEGRAM_TOKEN_ENV);
     expect(logs2.join('\n')).toMatch(/^minions: terminal mode \(auto: no Telegram bot token is stored/);
@@ -177,7 +179,7 @@ describe('coordinator exec wrapper', () => {
     const { paths } = layout();
     const { calls, spawn } = fakeSpawn();
     const logs: string[] = [];
-    await runCoordinator(terminalCfg(), { paths, spawn, env: {}, probe: async () => { throw new Error('must not probe'); }, log: (l) => logs.push(l) });
+    await runCoordinator(terminalCfg(), { paths, permissionModes: autoModes, spawn, env: {}, probe: async () => { throw new Error('must not probe'); }, log: (l) => logs.push(l) });
     expect(calls[0]!.args).not.toContain('--channels');
     expect(calls[0]!.env).not.toHaveProperty(TELEGRAM_TOKEN_ENV);
     expect(logs).toEqual([]);
@@ -187,7 +189,7 @@ describe('coordinator exec wrapper', () => {
     const { paths } = layout();
     const { calls, spawn } = fakeSpawn();
     const logs: string[] = [];
-    await runCoordinator(telegramCfg(), { paths, spawn, env: {}, probe: async () => noBun(), log: (l) => logs.push(l) });
+    await runCoordinator(telegramCfg(), { paths, permissionModes: autoModes, spawn, env: {}, probe: async () => noBun(), log: (l) => logs.push(l) });
     expect(calls[0]!.args).not.toContain('--channels');
     expect(calls[0]!.env).not.toHaveProperty(TELEGRAM_TOKEN_ENV);
     expect(logs.join('\n')).toMatch(/Telegram disabled for this session: .*Bun is not installed/);
@@ -210,7 +212,7 @@ describe('controlled coordinator restart', () => {
   }
   const launchWith = async (paths: ReturnType<typeof layout>['paths'], cfg: MinionsConfig) => {
     const { spawn } = fakeSpawn();
-    await runCoordinator(cfg, { paths, spawn, env: {}, probe: async () => available(), log: () => {} });
+    await runCoordinator(cfg, { paths, permissionModes: autoModes, spawn, env: {}, probe: async () => available(), log: () => {} });
   };
 
   it('no change: nothing is restarted', async () => {
@@ -275,7 +277,7 @@ describe('tester edge cases: terminal mode through the wrapper', () => {
     const { paths } = layout(null);
     const { calls, spawn } = fakeSpawn();
     const parentEnv = { PATH: '/usr/bin', HOME: '/home/node', TELEGRAM_BOT_TOKEN: TOKEN, CLAUDE_CONFIG_DIR: '/home/node/.claude' };
-    await runCoordinator(terminalCfg(), { paths, spawn, env: parentEnv, log: () => {} });
+    await runCoordinator(terminalCfg(), { paths, permissionModes: autoModes, spawn, env: parentEnv, log: () => {} });
     const expected = await buildClaudeCommand(terminalCfg(), paths);
     expect(calls[0]!.cmd).toBe('claude');
     expect(calls[0]!.args).toEqual(expected.args);
@@ -290,7 +292,7 @@ describe('tester edge cases: terminal mode through the wrapper', () => {
       const { paths } = layout(bad);
       const { calls, spawn } = fakeSpawn();
       const logs: string[] = [];
-      await runCoordinator(telegramCfg(), { paths, spawn, env: {}, probe: async () => available(), log: (l) => logs.push(l) });
+      await runCoordinator(telegramCfg(), { paths, permissionModes: autoModes, spawn, env: {}, probe: async () => available(), log: (l) => logs.push(l) });
       expect(calls[0]!.args, bad).not.toContain('--channels');
       expect(calls[0]!.env, bad).not.toHaveProperty(TELEGRAM_TOKEN_ENV);
       expect(logs.join('\n'), bad).toMatch(/Telegram disabled.*not a Telegram bot token/);
@@ -301,7 +303,7 @@ describe('tester edge cases: terminal mode through the wrapper', () => {
   it('missing coordinator prompt fails with a precise error before spawning claude', async () => {
     const { paths } = layout();
     const { calls, spawn } = fakeSpawn();
-    await expect(runCoordinator(terminalCfg(), { paths: { ...paths, coordinatorPrompt: join(paths.pluginDir, 'nope.md') }, spawn, env: {}, log: () => {} }))
+    await expect(runCoordinator(terminalCfg(), { paths: { ...paths, coordinatorPrompt: join(paths.pluginDir, 'nope.md') }, permissionModes: autoModes, spawn, env: {}, log: () => {} }))
       .rejects.toMatchObject({ code: 'NOT_FOUND', message: expect.stringMatching(/Coordinator prompt not found/) });
     expect(calls).toHaveLength(0);
   });
@@ -311,18 +313,18 @@ describe('tester edge cases: terminal mode through the wrapper', () => {
     const failing: SpawnLike = () => ({
       on(event: string, cb: (...a: unknown[]) => void) { if (event === 'error') setImmediate(() => cb(new Error('spawn claude ENOENT'))); return this; },
     } as ReturnType<SpawnLike>);
-    await expect(runCoordinator(terminalCfg(), { paths, spawn: failing, env: {}, log: () => {} }))
+    await expect(runCoordinator(terminalCfg(), { paths, permissionModes: autoModes, spawn: failing, env: {}, log: () => {} }))
       .rejects.toMatchObject({ code: 'INCOMPATIBLE_RUNTIME', message: expect.stringMatching(/Failed to start claude: spawn claude ENOENT/) });
     const exits: SpawnLike = () => ({
       on(event: string, cb: (...a: unknown[]) => void) { if (event === 'exit') setImmediate(() => cb(null, 'SIGTERM')); return this; },
     } as ReturnType<SpawnLike>);
-    expect(await runCoordinator(terminalCfg(), { paths, spawn: exits, env: {}, log: () => {}, signals: fakeSignals().target })).toBe(143); // 128 + SIGTERM(15)
+    expect(await runCoordinator(terminalCfg(), { paths, permissionModes: autoModes, spawn: exits, env: {}, log: () => {}, signals: fakeSignals().target })).toBe(143); // 128 + SIGTERM(15)
   });
 
   it('an unwritable state dir does not stop the session from launching', async () => {
     const { paths } = layout(null);
     const { calls, spawn } = fakeSpawn();
-    await runCoordinator(terminalCfg(), { paths: { ...paths, coordinatorLaunch: join(paths.coordinatorPrompt, 'x', 'launch.json') }, spawn, env: {}, log: () => {} });
+    await runCoordinator(terminalCfg(), { paths: { ...paths, coordinatorLaunch: join(paths.coordinatorPrompt, 'x', 'launch.json') }, permissionModes: autoModes, spawn, env: {}, log: () => {} });
     expect(calls).toHaveLength(1);
   });
 
@@ -350,7 +352,7 @@ describe('tester edge cases: restart with leases', () => {
   };
   const launched = async (paths: ReturnType<typeof layout>['paths'], cfg: MinionsConfig) => {
     const { spawn } = fakeSpawn();
-    await runCoordinator(cfg, { paths, spawn, env: {}, probe: async () => available(), log: () => {} });
+    await runCoordinator(cfg, { paths, permissionModes: autoModes, spawn, env: {}, probe: async () => available(), log: () => {} });
   };
 
   it('--force restarts but never touches the lease source; the leases are reported for recovery', async () => {
@@ -416,7 +418,7 @@ describe('wrapper signal handling', () => {
     const sig = fakeSignals();
     const child = controllableSpawn();
     let done: number | undefined;
-    const p = runCoordinator(defaults(), { paths, spawn: child.spawn, env: {}, log: () => {}, signals: sig.target }).then((c) => (done = c));
+    const p = runCoordinator(defaults(), { paths, permissionModes: autoModes, spawn: child.spawn, env: {}, log: () => {}, signals: sig.target }).then((c) => (done = c));
     for (let i = 0; i < 200 && sig.count() < 4; i++) await new Promise((r) => setTimeout(r, 5)); // until claude is spawned
     for (const s of ['SIGINT', 'SIGQUIT', 'SIGTERM', 'SIGHUP'] as const) expect(sig.listeners.get(s)?.size, s).toBe(1);
     sig.emit('SIGINT');
@@ -438,7 +440,7 @@ describe('wrapper signal handling', () => {
     const failing: SpawnLike = () => ({
       on(event: string, cb: (...a: unknown[]) => void) { if (event === 'error') setImmediate(() => cb(new Error('ENOENT'))); return this; },
     } as ReturnType<SpawnLike>);
-    await expect(runCoordinator(defaults(), { paths, spawn: failing, env: {}, log: () => {}, signals: sig.target })).rejects.toThrow(/ENOENT/);
+    await expect(runCoordinator(defaults(), { paths, permissionModes: autoModes, spawn: failing, env: {}, log: () => {}, signals: sig.target })).rejects.toThrow(/ENOENT/);
     expect(sig.count()).toBe(0);
   });
 

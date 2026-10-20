@@ -23,8 +23,10 @@ describe('profiles', () => {
       container: { mountDockerSocket: false, mountHostRepository: false, cpus: 4, memoryMiB: 6144, pidsLimit: 512 },
       execution: { maxActiveTasks: 2, maxEngineers: 2 },
       git: { baseBranch: 'main', identity: ctx.identity },
-      permissionMode: 'acceptEdits',
     });
+    // The coordinator permission mode is left unset: auto by default (opt-out: coordinator.permissionMode).
+    expect(c).not.toHaveProperty('permissionMode');
+    expect(c).not.toHaveProperty('coordinator');
     expect(Object.keys(c.capabilities).sort()).toEqual([...CAPABILITIES].sort());
     expect(c.capabilities['pr.merge']).toBe('ask');
     expect(c.capabilities['ci.edit']).toBe('ask');

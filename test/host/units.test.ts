@@ -276,7 +276,8 @@ describe('wizard', () => {
     const repo = makeRepo(env.root);
     const r = await runWizard({ discovery: await discover(repo), projectId: ID, yes: true });
     expect(r.asked).toEqual([]);
-    expect(r.config).toMatchObject({ profile: 'project-owner', visibility: 'shared', permissionMode: 'acceptEdits' });
+    expect(r.config).toMatchObject({ profile: 'project-owner', visibility: 'shared' });
+    expect(r.config).not.toHaveProperty('permissionMode');
   });
 
   it('--config uses a validated file; unknown fields fail', async () => {

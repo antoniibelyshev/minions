@@ -147,7 +147,20 @@ export const MinionsConfigSchema = z.object({
     baseBranch: branchName,
     identity: z.object({ name: nonEmpty, email: nonEmpty }).strict(),
   }).strict(),
-  permissionMode: z.enum(['default', 'acceptEdits', 'auto']),
+  /** Coordinator session settings (src/runtime/coordinator.ts). */
+  coordinator: z.object({
+    /**
+     * Claude Code permission mode of the coordinator session (container runtime). Unset = "auto": a
+     * classifier may approve actions outside the allow list; the deny and ask rules still apply.
+     * "acceptEdits" opts back into prompting for every non-allowlisted Bash call. Never bypassPermissions.
+     */
+    permissionMode: z.enum(['auto', 'acceptEdits']).optional(),
+  }).strict().optional(),
+  /**
+   * Legacy coordinator permission mode. Only "default" is still honoured (as a stricter choice) when
+   * coordinator.permissionMode is unset; "acceptEdits" and "auto" mean the default (auto).
+   */
+  permissionMode: z.enum(['default', 'acceptEdits', 'auto']).optional(),
 }).strict();
 
 export type MinionsConfig = z.infer<typeof MinionsConfigSchema>;

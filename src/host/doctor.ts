@@ -214,6 +214,14 @@ export function telegramReadiness(res: ChannelResolution, tgPlugin: Check | unde
   }
 }
 
+/** Launch permission mode reported by `minions coordinator --probe --json` (undefined: older output). */
+function probePermission(stdout: string): { mode: string; fallback: boolean; reason: string } | undefined {
+  try {
+    const p = (JSON.parse(stdout) as { data?: { permission?: { mode?: unknown; fallback?: unknown; reason?: unknown } } }).data?.permission;
+    return p && typeof p.mode === 'string' ? { mode: p.mode, fallback: p.fallback === true, reason: String(p.reason ?? '') } : undefined;
+  } catch { return undefined; }
+}
+
 /** Host runtime: coordinator session, Claude auth on the host, launch probe, Telegram plugin (via the runtime shim). */
 async function hostRuntimeChecks(project: ProjectJson, auth: ClaudeAuth, baseUrl: string | undefined, wantsTelegram: boolean,
   runner: Runner, add: Add, checks: Check[]): Promise<Check | undefined> {
@@ -383,7 +391,10 @@ export async function runDoctor(opts: { cwd: string; runner?: Runner; probe?: Do
         const bl = await ex(['backlog', '--version']);
         add('backlog.cli', bl.code === 0 ? 'ok' : 'fail', bl.code === 0 ? `backlog.md ${short(bl.stdout)}` : `backlog CLI not usable: ${short(bl.stderr || bl.stdout)}`);
         const probe = await ex(['minions', 'coordinator', '--probe', '--json']);
-        add('claude.capabilities', probe.code === 0 ? 'ok' : 'fail', probe.code === 0 ? 'Claude Code supports the coordinator launch flags; launch command resolves' : `coordinator probe failed (exit ${probe.code}): ${short(probe.stderr || probe.stdout)}`);
+        const perm = probe.code === 0 ? probePermission(probe.stdout) : undefined;
+        add('claude.capabilities', probe.code !== 0 ? 'fail' : perm?.fallback ? 'warn' : 'ok', probe.code === 0
+          ? `Claude Code supports the coordinator launch flags; launch command resolves${perm ? `; permission mode ${perm.mode}${perm.fallback ? ` (${perm.reason})` : ''}` : ''}`
+          : `coordinator probe failed (exit ${probe.code}): ${short(probe.stderr || probe.stdout)}`);
         // Credential-free; never 'fail' because terminal mode must stay usable without Telegram.
         const tg = telegramDoctorCheck(await ex(['minions', 'telegram', 'probe', '--json']));
         add('telegram.plugin', tg.status, tg.detail, tg.hint);

@@ -68,8 +68,8 @@ describe('host runtime claude launch (H1, M8)', () => {
 
   it('host: no user/project/local settings, no MCP servers, workspace+state as working dirs, permission mode forced to default', async () => {
     Object.assign(process.env, hostEnv(), { MINIONS_RUNTIME: 'host' });
-    const cfg = { ...defaults(), permissionMode: 'acceptEdits' as const };
-    const c = await C.buildClaudeCommand(cfg, runtimePaths());
+    const cfg = { ...defaults(), permissionMode: 'acceptEdits' as const, coordinator: { permissionMode: 'auto' as const } };
+    const c = await C.buildClaudeCommand(cfg, runtimePaths(), { permissionModes: ['acceptEdits', 'auto'] });
     expect(c.args).toContain('--setting-sources=');
     expect(c.args).toContain('--strict-mcp-config');
     expect(c.args).not.toContain('--mcp-config');
@@ -83,9 +83,11 @@ describe('host runtime claude launch (H1, M8)', () => {
   it('container launch is unchanged (no host flags, configured permission mode)', async () => {
     Object.assign(process.env, hostEnv());
     process.env.MINIONS_RUNTIME = 'container';
-    const c = await C.buildClaudeCommand({ ...defaults(), permissionMode: 'acceptEdits' }, runtimePaths());
+    const c = await C.buildClaudeCommand({ ...defaults(), coordinator: { permissionMode: 'acceptEdits' } }, runtimePaths());
     for (const f of ['--setting-sources=', '--strict-mcp-config', '--add-dir']) expect(c.args).not.toContain(f);
     expect(c.args[c.args.indexOf('--permission-mode') + 1]).toBe('acceptEdits');
+    const d = await C.buildClaudeCommand(defaults(), runtimePaths(), { permissionModes: ['acceptEdits', 'auto'] });
+    expect(d.args[d.args.indexOf('--permission-mode') + 1]).toBe('auto');
     const s = JSON.parse(c.args[c.args.indexOf('--settings') + 1]!);
     expect(s.permissions.allow).toContain('Bash(git *)');
     expect(s).not.toHaveProperty('sandbox');
