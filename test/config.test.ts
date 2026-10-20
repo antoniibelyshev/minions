@@ -195,6 +195,15 @@ describe('models.effort and models.coordinator', async () => {
     expect(validateConfig(base(), 'x').models.effort).toBeUndefined();
   });
 
+  it('accepts per-role effort (all keys optional) and rejects unknown roles or levels', () => {
+    const roles = { engineer: 'low', engineerDeep: 'high', tester: 'medium', reviewer: 'medium', coordinator: 'medium' } as const;
+    expect(validateConfig({ ...base(), models: { ...base().models, effort: 'medium', effortByRole: roles } }, 'x').models.effortByRole).toEqual(roles);
+    expect(validateConfig({ ...base(), models: { ...base().models, effortByRole: {} } }, 'x').models.effortByRole).toEqual({});
+    expect(validateConfig(base(), 'x').models.effortByRole).toBeUndefined();
+    expect(() => validateConfig({ ...base(), models: { ...base().models, effortByRole: { planner: 'low' } } }, 'x')).toThrow(expect.objectContaining({ code: 'INVALID_CONFIG' }));
+    expect(() => validateConfig({ ...base(), models: { ...base().models, effortByRole: { engineer: 'tiny' } } }, 'x')).toThrow(expect.objectContaining({ code: 'INVALID_CONFIG' }));
+  });
+
   it('rejects unknown effort levels and a coordinator model outside models.allowed', () => {
     expect(() => validateConfig({ ...base(), models: { ...base().models, effort: 'extreme' } }, 'x')).toThrow(expect.objectContaining({ code: 'INVALID_CONFIG' }));
     expect(() => validateConfig({ ...base(), models: { ...base().models, coordinator: 'gpt-x' } }, 'x')).toThrow(expect.objectContaining({ code: 'INVALID_CONFIG' }));

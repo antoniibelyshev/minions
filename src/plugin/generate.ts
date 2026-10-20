@@ -3,6 +3,7 @@ import { readdir, readFile } from 'node:fs/promises';
 import { dirname, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { CAPABILITIES, can, type Capability } from '../config/capabilities.js';
+import { AGENT_MODEL_ALIASES, engineerDeepEffort, isAgentModelAlias, roleEffort } from '../config/models.js';
 import { ROLES, type MinionsConfig, type Role } from '../config/schema.js';
 import { MinionsError } from '../core/errors.js';
 import { atomicWrite, sha256 } from '../core/fsutil.js';
@@ -11,6 +12,7 @@ export interface GeneratedFile { path: string; sha256: string }
 
 const PARTIALS_DIR = '_partials';
 const WORKER_ROLES: Role[] = ['engineer', 'tester', 'reviewer'];
+const ENGINEER_DEEP = 'agents/engineer-deep.md';
 
 /**
  * Directory holding the plugin templates. `MINIONS_TEMPLATES` (the templates root, i.e. the
@@ -81,23 +83,33 @@ function architectureGuidance(cfg: MinionsConfig): string {
     : 'agents propose architecture changes (in findings or to the user) and do not make them without approval.';
 }
 
+/**
+ * The worker definitions set `model: <models.default>` in frontmatter, which accepts full IDs; the Agent
+ * tool's `model` only accepts aliases (AGENT_MODEL_ALIASES). So the guidance says to omit `model` for the
+ * default and only ever names aliases as per-call overrides; the pre-agent hook denies anything else.
+ */
 function modelGuidance(cfg: MinionsConfig): string {
-  if (cfg.models.selection === 'fixed') return `Selection is fixed: always pass \`model: "${cfg.models.default}"\`.${effortGuidance(cfg)}`;
+  const aliasRule = ` Pass \`model\` only as one of the aliases ${inlineList([...AGENT_MODEL_ALIASES], '')}, never a full model ID: the Agent tool rejects it.`;
+  if (cfg.models.selection === 'fixed') {
+    return `Selection is fixed: omit \`model\` so every worker runs \`${cfg.models.default}\` from its definition.${effortGuidance(cfg)}`;
+  }
   const allowed = new Set(cfg.models.allowed);
-  const opt = (m: string, why: string) => (allowed.has(m) ? `\`${m}\` for ${why}` : null);
+  const fullIds = cfg.models.allowed.filter((m) => m !== cfg.models.default && !isAgentModelAlias(m));
+  const opt = (m: string, why: string) => (allowed.has(m) ? `\`model: "${m}"\` for ${why}` : null);
   const parts = [
-    `\`${cfg.models.default}\` for routine implementation, testing and review`,
+    `omit \`model\` (the definitions run \`${cfg.models.default}\`) for routine implementation, testing and review`,
     cfg.models.default !== 'haiku' ? opt('haiku', 'narrow inspection or mechanical analysis') : null,
     cfg.models.default !== 'opus' ? opt('opus', 'hard debugging, architecture, or repeated failures') : null,
   ].filter(Boolean);
-  return `Choose per attempt, only from the allowed list: ${parts.join('; ')}. Prefer a fresh worker for independent work.${effortGuidance(cfg)}`;
+  const unreachable = fullIds.length ? ` Allowed full IDs other than the default (${inlineList(fullIds, '')}) cannot be chosen per call.` : '';
+  return `Choose per attempt, only from the allowed list: ${parts.join('; ')}.${aliasRule}${unreachable} Prefer a fresh worker for independent work.${effortGuidance(cfg)}`;
 }
 
 /** Workers' reasoning effort comes from their definition (frontmatter `effort`); the Agent call cannot change it. */
 function effortGuidance(cfg: MinionsConfig): string {
-  return cfg.models.effort
-    ? ` Workers run at reasoning effort \`${cfg.models.effort}\` (set in their definitions; a call cannot change it): for work that needs deeper reasoning, pick a stronger allowed model rather than retrying at the same one.`
-    : '';
+  const level = (e: string | undefined) => (e ? `\`${e}\`` : 'the Claude Code default');
+  const roles = WORKER_ROLES.map((r) => `${r} ${level(roleEffort(cfg, r))}`).join(', ');
+  return ` Workers run at reasoning effort ${roles} (set in their definitions; a call cannot change it). For hard debugging, architecture work, or a retry after an engineer attempt failed (blocked or partial on difficulty, or a repair that did not fix the findings), spawn \`minions:engineer-deep\` instead of \`minions:engineer\`: the same engineer under the same engineer lease, at effort \`${engineerDeepEffort(cfg)}\`. Use a stronger allowed model as well when the deep engineer also fails.`;
 }
 
 function deliveryGuidance(cfg: MinionsConfig): string {
@@ -194,8 +206,10 @@ function baseVars(cfg: MinionsConfig): Record<string, string> {
     profile: cfg.profile,
     configRevision: String(cfg.configRevision),
     workerModel: cfg.models.default,
-    // Frontmatter line appended after `model:` only when models.effort is set (enum value, YAML-safe).
-    workerEffortLine: cfg.models.effort ? `\neffort: ${cfg.models.effort}` : '',
+    agentName: 'engineer',
+    engineerVariant: '',
+    // Frontmatter line appended after `model:` only when an effort is set (enum value, YAML-safe); set per worker file.
+    workerEffortLine: '',
     defaultModel: cfg.models.default,
     allowedModels: inlineList(cfg.models.allowed, 'none'),
     modelGuidance: modelGuidance(cfg),
@@ -265,13 +279,28 @@ export async function generatePlugin(cfg: MinionsConfig, outDir: string): Promis
   const vars = baseVars(cfg);
   const out = resolve(outDir);
   const results: GeneratedFile[] = [];
-  for (const f of all.filter((f) => !f.startsWith(`${PARTIALS_DIR}/`))) {
-    const role = /^agents\/(\w+)\.md$/.exec(f)?.[1] as Role | undefined;
-    const fileVars = role && WORKER_ROLES.includes(role) ? { ...vars, policySummary: renderPolicySummary(cfg, role), workerRole: role } : vars;
-    const text = renderTemplate(await readFile(join(src, f), 'utf8'), fileVars, partials, { name: f, json: f.endsWith('.json') });
-    const dest = join(out, ...f.split('/'));
+  const effortLine = (e: string | undefined) => (e ? `\neffort: ${e}` : '');
+  const emit = async (rel: string, text: string) => {
+    const dest = join(out, ...rel.split('/'));
     await atomicWrite(dest, text);
     results.push({ path: dest, sha256: sha256(text) });
+  };
+  for (const f of all.filter((f) => !f.startsWith(`${PARTIALS_DIR}/`))) {
+    const role = /^agents\/(\w+)\.md$/.exec(f)?.[1] as Role | undefined;
+    const tpl = await readFile(join(src, f), 'utf8');
+    if (!role || !WORKER_ROLES.includes(role)) {
+      await emit(f, renderTemplate(tpl, vars, partials, { name: f, json: f.endsWith('.json') }));
+      continue;
+    }
+    const fileVars = { ...vars, policySummary: renderPolicySummary(cfg, role), workerRole: role, workerEffortLine: effortLine(roleEffort(cfg, role)) };
+    await emit(f, renderTemplate(tpl, fileVars, partials, { name: f }));
+    if (role === 'engineer') {
+      // Same template, higher effort: the coordinator escalates hard or failed work to it (same engineer lease).
+      await emit(ENGINEER_DEEP, renderTemplate(tpl, {
+        ...fileVars, agentName: 'engineer-deep', workerEffortLine: effortLine(engineerDeepEffort(cfg)),
+        engineerVariant: ' (higher reasoning effort, for hard debugging, architecture work, or after a failed attempt)',
+      }, partials, { name: ENGINEER_DEEP }));
+    }
   }
   return results.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
 }

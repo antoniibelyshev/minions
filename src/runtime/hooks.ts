@@ -1,6 +1,7 @@
 import { closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, renameSync, writeSync } from 'node:fs';
 import { dirname } from 'node:path';
 import type { BacklogAdapter } from '../backlog/types.js';
+import { AGENT_MODEL_ALIASES, isAgentModelAlias } from '../config/models.js';
 import type { MinionsConfig } from '../config/schema.js';
 import { sha256 } from '../core/fsutil.js';
 import { redact } from '../core/output.js';
@@ -106,7 +107,8 @@ export async function stopHook(input: unknown, load: HookLoader): Promise<HookOu
   }
 }
 
-const WORKER = /^minions:(engineer|tester|reviewer)$/;
+/** Worker agent types; `engineer-deep` (the higher-effort engineer definition) runs under an engineer lease. */
+const WORKER = /^minions:(engineer|tester|reviewer)(-deep)?$/;
 const MARKER = /minions-lease:\s*(lease-[A-Za-z0-9_-]+)/g;
 
 const deny = (reason: string): HookOutput => ({
@@ -121,8 +123,12 @@ export async function preAgentHook(input: unknown, load: HookLoader): Promise<Ho
   const type = typeof ti.subagent_type === 'string' ? ti.subagent_type : '';
   if (!type.startsWith('minions:')) return { reason: `allow: not a minions worker (${type || 'none'})` };
   const m = WORKER.exec(type);
-  if (!m) return deny(`Unknown minions agent type "${type}".`);
+  if (!m || (m[2] && m[1] !== 'engineer')) return deny(`Unknown minions agent type "${type}".`);
   const role = m[1] as LeaseRole;
+  // The Agent tool only accepts model aliases; a full id would fail the launch with a less useful error.
+  if (typeof ti.model === 'string' && ti.model && !isAgentModelAlias(ti.model)) {
+    return deny(`model "${ti.model}" is not an Agent model alias (${AGENT_MODEL_ALIASES.join('|')}). Omit \`model\` to use the model set in the ${type} definition, or pass an allowed alias.`);
+  }
   try {
     const prompt = typeof ti.prompt === 'string' ? ti.prompt : '';
     const ids = [...prompt.matchAll(MARKER)].map((x) => x[1]!);
