@@ -365,7 +365,7 @@ describe('minions upgrade on the host runtime', () => {
     const up = program.commands.find((c) => c.name() === 'upgrade')!;
     const opt = (flag: string) => up.options.find((o) => o.long === flag);
     expect(opt('--rebuild-cli')?.description).toMatch(/rebuilding\/reinstalling the global CLI .*review it first/);
-    expect(opt('--from-container')?.description).toMatch(/strict fast-forward on a clean tree only$/);
+    expect(opt('--from-container')?.description).toMatch(/^local delivery only: .*strict fast-forward on a clean tree only \(GitHub delivery always takes origin\/<base>\)$/);
     expect(opt('--from-container')?.description).not.toMatch(/built|install/);
     expect(opt('--timeout')).toBeDefined();
     expect(opt('--now')).toBeDefined();

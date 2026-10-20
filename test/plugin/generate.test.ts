@@ -375,3 +375,21 @@ describe('file hand-off templates render completely (task-9 edge cases)', () => 
     expect(md).toContain('minions work submit <leaseId> --role reviewer --json');
   });
 });
+
+describe('coordinator prompt: origin/<base> as the single source of truth', () => {
+  it('GitHub delivery forbids local base merges and explains the pre-claim sync; local delivery does not', async () => {
+    for (const mode of ['branch', 'pull-request'] as const) {
+      const cfg = defaults();
+      cfg.delivery.mode = mode;
+      cfg.delivery.provider = 'github';
+      const md = await (await gen(cfg)).read('coordinator.md');
+      expect(md).toContain('`origin/main` is the single source of truth');
+      expect(md).toMatch(/never merge, rebase, cherry-pick or commit into the local `main`/);
+      expect(md).toMatch(/Every `minions work claim` first fetches origin and fast-forwards `main`/);
+      expect(md).toMatch(/do not repair it by merging or resetting yourself/);
+    }
+    const local = await (await gen(defaults())).read('coordinator.md');
+    expect(local).not.toContain('single source of truth');
+    expect(local).toContain('the user fetches branches with `minions export` on the host');
+  });
+});

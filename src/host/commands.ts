@@ -1,6 +1,7 @@
 import { resolve as resolvePath } from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import { Option, type Command } from 'commander';
+import { isGithubDelivery } from '../config/delivery.js';
 import { PROFILES, type Profile } from '../config/schema.js';
 import { action, globalOpts, requireMode } from '../core/cli-helpers.js';
 import { MinionsError } from '../core/errors.js';
@@ -28,7 +29,7 @@ import { githubStartHint, registerGithubSetup } from './github-setup.js';
 import { formatUninstall, runUninstall } from './uninstall.js';
 import { DELIVERY_MODES, formatSetup, runSetup, shellQuote, type DeliveryMode, type SetupRuntime } from './setup.js';
 import { DEFAULT_UPGRADE_TIMEOUT_SEC, formatUpgrade, runUpgrade, upgradeTimeout } from './upgrade.js';
-import { HANDOFF_ENV, isMinionsCheckout, runSourcePhase } from './upgrade-source.js';
+import { HANDOFF_ENV, isMinionsCheckout, runSourcePhase, upgradeSourceMode } from './upgrade-source.js';
 import { readSecret, readlineIO } from './wizard.js';
 import { initMayOfferAssistant, launchAssistant, loadAssistantContext, offerSetupAssistant, registerAssistant } from './assistant.js';
 
@@ -405,7 +406,7 @@ export function register(program: Command): void {
     .description('Upgrade the project container to the installed minions (drains workers, keeps volumes)')
     .option('--timeout <seconds>', `wait this long for active workers (default ${DEFAULT_UPGRADE_TIMEOUT_SEC}; 0 with --now)`)
     .option('--now', 'release workers still active when the wait ends (reported as interrupted, re-dispatched after)')
-    .option('--from-container [branch]', 'first export the container branches and fast-forward <branch> (default: the base branch) to minions/<base>; strict fast-forward on a clean tree only')
+    .option('--from-container [branch]', 'local delivery only: first export the container branches and fast-forward <branch> (default: the base branch) to minions/<base>; strict fast-forward on a clean tree only (GitHub delivery always takes origin/<base>)')
     .option('--rebuild-cli', 'in a minions checkout: allow rebuilding/reinstalling the global CLI from it (runs its npm scripts and build on the host; review it first)')
     .option('--dry-run', 'list the steps without changing anything')
     .action(action(async (o: { timeout?: string; now?: boolean; fromContainer?: string | boolean; rebuildCli?: boolean }, cmd: Command) => {
@@ -423,12 +424,17 @@ export function register(program: Command): void {
       if (!dryRun) await requireDocker();
       const compose = new Compose(project.projectId);
       // The rest of the upgrade, as run again by the new CLI after a reinstall (or by the user after a stop).
+      // GitHub delivery: origin/<base> is the only source (src/host/upgrade-source.ts, upgradeSourceMode).
+      const github = isGithubDelivery((await loadEffectiveConfig(project)).config);
+      const checkout = isMinionsCheckout(ref.repoPath) ? ref.repoPath : null;
+      const mode = upgradeSourceMode({ githubDelivery: github, fromContainer: o.fromContainer !== undefined, checkout, baseBranch: project.baseBranch });
       const flags = [...(o.timeout !== undefined ? ['--timeout', String(timeoutSec)] : []), ...(o.now ? ['--now'] : [])];
       const r = await runUpgrade({
         source: () => runSourcePhase({
           dryRun, handoff: process.env[HANDOFF_ENV] === '1', rebuildCli: !!o.rebuildCli, runningRoot: packageRoot(), log: (m) => say(json, m),
-          checkout: isMinionsCheckout(ref.repoPath) ? ref.repoPath : null,
-          sync: o.fromContainer === undefined ? null : {
+          checkout,
+          origin: mode === 'origin' ? { repo: ref.repoPath, baseBranch: project.baseBranch, remote: project.remoteUrl || 'origin' } : null,
+          sync: mode !== 'container' ? null : {
             repo: ref.repoPath, baseBranch: project.baseBranch,
             branch: typeof o.fromContainer === 'string' ? o.fromContainer : project.baseBranch,
             exportRepo: async () => {

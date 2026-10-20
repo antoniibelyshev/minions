@@ -9,7 +9,7 @@ import { MinionsError } from '../../src/core/errors.js';
 import { Compose } from '../../src/host/docker.js';
 import type { ExportResult } from '../../src/host/transfer.js';
 import { formatUpgrade, runUpgrade, type UpgradeResult } from '../../src/host/upgrade.js';
-import { checkCli, isMinionsCheckout, runSourcePhase, syncFromContainer, type SourcePhaseOptions } from '../../src/host/upgrade-source.js';
+import { checkCli, isMinionsCheckout, runSourcePhase, syncFromContainer, syncFromOrigin, upgradeSourceMode, type SourcePhaseOptions } from '../../src/host/upgrade-source.js';
 import { git, makeRepo, tempDir, withHome } from './fixtures.js';
 
 const ID = '3f2b8c1e-7d4a-4e9b-9c2f-1a2b3c4d5e6f';
@@ -593,6 +593,167 @@ describe('installed CLI check', () => {
     expect(isMinionsCheckout(checkout())).toBe(true);
     const p = await runSourcePhase(phaseBase());
     expect(p.steps).toEqual([expect.objectContaining({ id: 'cli', status: 'skipped' })]);
+  });
+});
+
+// ---------------------------------------------------------------- GitHub delivery: origin/<base>
+
+describe('GitHub delivery: the CLI comes from the reviewed origin/<base> commit', () => {
+  let g: string;
+  beforeEach(() => { g = tempDir('minions-global-'); });
+
+  /** Minions checkout as a git repo on main, pushed to a bare origin; `merge` lands a PR on origin/main. */
+  function originCheckout() {
+    const c = checkout();
+    writeFileSync(join(c, '.gitignore'), 'node_modules/\ndist/\n*.tgz\n');
+    git(c, 'init', '-q', '-b', 'main');
+    for (const [k, v] of [['user.name', 'Ada'], ['user.email', 'ada@example.com'], ['commit.gpgsign', 'false']]) git(c, 'config', k!, v!);
+    git(c, 'add', '.');
+    git(c, 'commit', '-q', '-m', 'init');
+    const bare = join(tempDir('minions-origin-'), 'origin.git');
+    git(home.root, 'init', '-q', '--bare', bare);
+    git(c, 'remote', 'add', 'origin', bare);
+    git(c, 'push', '-q', 'origin', 'main');
+    const gh = join(tempDir('minions-gh-'), 'gh');
+    git(home.root, 'clone', '-q', '-b', 'main', bare, gh);
+    for (const [k, v] of [['user.name', 'GitHub'], ['user.email', 'gh@example.com'], ['commit.gpgsign', 'false']]) git(gh, 'config', k!, v!);
+    const merge = (file: string) => {
+      mkdirSync(join(gh, 'src'), { recursive: true });
+      writeFileSync(join(gh, 'src', file), `export const x = '${file}';\n`);
+      git(gh, 'add', '.');
+      git(gh, 'commit', '-q', '-m', `Merge pull request: ${file}`);
+      git(gh, 'push', '-q', 'origin', 'main');
+      return git(gh, 'rev-parse', 'HEAD');
+    };
+    return { c, bare, merge, base: git(c, 'rev-parse', 'HEAD') };
+  }
+  const origin = (o: ReturnType<typeof originCheckout>) => ({ repo: o.c, baseBranch: 'main', remote: o.bare, runner: run });
+
+  it('fetches origin, fast-forwards the checked-out base, and builds that reviewed commit in the same run (--rebuild-cli)', async () => {
+    const o = originCheckout();
+    const merged = o.merge('feature.ts');
+    realInstall(g, '0.1.0', 'old0000000000000', 'packed');
+    const w: NpmWorld = { globalRoot: g, checkout: o.c, calls: [] };
+    const p = await runSourcePhase<UpgradeResult>(phaseBase({
+      checkout: o.c, origin: origin(o), runner: fakeNpm(w), rebuildCli: true,
+      spawnCli: async () => ({ code: 0, stdout: JSON.stringify({ ok: true, data: childResult() }) + '\n', stderr: '' }),
+    }));
+    expect(p.sync).toMatchObject({ source: 'origin', action: 'fast-forward', method: 'merge --ff-only', applied: true, from: o.base, to: merged, target: 'refs/remotes/origin/main' });
+    expect(head(o.c)).toBe(merged);
+    expect(readFileSync(join(o.c, 'src', 'feature.ts'), 'utf8')).toContain('feature.ts');
+    expect(mutatingNpm(w.calls).map((l) => l.split(' ').slice(0, 2).join(' '))).toEqual(['npm pack', 'npm install']);
+    expect(p.stop).toBeNull();
+    expect(p.steps.map((s) => s.id)).toEqual(['sync', 'cli']);
+  });
+
+  it('stops before building when the checkout is not exactly origin/<base> (local commits, other branch, dirty tree)', async () => {
+    const cases: [string, (o: ReturnType<typeof originCheckout>) => void, RegExp][] = [
+      ['local commit', (o) => { writeFileSync(join(o.c, 'src', 'local.ts'), 'export {};\n'); git(o.c, 'add', '.'); git(o.c, 'commit', '-q', '-m', 'local merge'); }, /is at [0-9a-f]{12}, not the reviewed origin\/main commit/],
+      ['other branch', (o) => { git(o.c, 'checkout', '-q', '-b', 'feature'); writeFileSync(join(o.c, 'src', 'f.ts'), 'export {};\n'); git(o.c, 'add', '.'); git(o.c, 'commit', '-q', '-m', 'wip'); }, /not the reviewed origin\/main commit/],
+      ['untracked file', (o) => { writeFileSync(join(o.c, 'src', 'scratch.ts'), 'export {};\n'); }, /uncommitted or untracked changes.*not the reviewed origin\/main commit/],
+    ];
+    for (const [name, mutate, re] of cases) {
+      home.cleanup(); home = withHome();
+      const gg = tempDir('minions-global-');
+      const o = originCheckout();
+      mutate(o);
+      realInstall(gg, '0.1.0', 'old0000000000000', 'packed');
+      const w: NpmWorld = { globalRoot: gg, checkout: o.c, calls: [] };
+      const p = await runSourcePhase(phaseBase({ checkout: o.c, origin: origin(o), runner: fakeNpm(w), rebuildCli: true, spawnCli: async () => { throw new Error('must not spawn'); } }));
+      expect(mutatingNpm(w.calls), name).toEqual([]);
+      expect(p.ok, name).toBe(false);
+      expect(p.stop?.reason, name).toMatch(re);
+      expect(p.stop?.reason, name).toMatch(/with GitHub delivery the CLI is built only from origin\/main/);
+      expect(p.stop?.command, name).toMatch(/git merge --ff-only origin\/main/);
+    }
+  });
+
+  it('base not checked out (checkout on another branch): the base moves by update-ref, but the CLI is not built from the other branch', async () => {
+    const o = originCheckout();
+    git(o.c, 'checkout', '-q', '-b', 'feature');
+    const merged = o.merge('feature.ts');
+    realInstall(g, '0.1.0', 'old0000000000000', 'packed');
+    const w: NpmWorld = { globalRoot: g, checkout: o.c, calls: [] };
+    const p = await runSourcePhase(phaseBase({ checkout: o.c, origin: origin(o), runner: fakeNpm(w), rebuildCli: true, spawnCli: async () => { throw new Error('must not spawn'); } }));
+    expect(p.sync).toMatchObject({ source: 'origin', action: 'fast-forward', method: 'update-ref', applied: true, from: o.base, to: merged, worktree: null });
+    expect(git(o.c, 'rev-parse', 'refs/heads/main')).toBe(merged);
+    expect(head(o.c, 'HEAD')).toBe(o.base);
+    expect(git(o.c, 'rev-parse', '--abbrev-ref', 'HEAD')).toBe('feature');
+    expect(mutatingNpm(w.calls)).toEqual([]);
+    expect(p.ok).toBe(false);
+    expect(p.stop?.reason).toMatch(/not the reviewed origin\/main commit/);
+    expect(p.stop?.command).toMatch(/git switch main/);
+  });
+
+  it('a diverged base refuses the whole upgrade; nothing is merged', async () => {
+    const o = originCheckout();
+    writeFileSync(join(o.c, 'src', 'local.ts'), 'export {};\n');
+    git(o.c, 'add', '.');
+    git(o.c, 'commit', '-q', '-m', 'local');
+    const local = head(o.c);
+    o.merge('remote.ts');
+    const e = await reason(runSourcePhase(phaseBase({ checkout: o.c, origin: origin(o) })));
+    expect(e.code).toBe('CONFLICT');
+    expect(e.message).toMatch(/upgrade \(origin\/main\): main .* and refs\/remotes\/origin\/main .* have diverged/);
+    expect(head(o.c)).toBe(local);
+    expect(git(o.c, 'rev-list', '--merges', '--count', 'main')).toBe('0');
+  });
+
+  it('a failed fetch refuses with NETWORK_RETRYABLE and changes nothing', async () => {
+    const o = originCheckout();
+    const e = await reason(syncFromOrigin({ repo: o.c, baseBranch: 'main', remote: join(home.root, 'missing.git') }));
+    expect(e.code).toBe('NETWORK_RETRYABLE');
+    expect(e.message).toMatch(/fetching main from origin failed/);
+    expect(head(o.c)).toBe(o.base);
+  });
+
+  it('dry run: no fetch and no ref change; the plan builds after the planned fast-forward', async () => {
+    const o = originCheckout();
+    git(o.c, 'fetch', '-q', 'origin');
+    const merged = o.merge('later.ts'); // not fetched yet: the dry run must not see it
+    const p = await runSourcePhase(phaseBase({ dryRun: true, checkout: o.c, origin: origin(o) }));
+    expect(p.sync).toMatchObject({ source: 'origin', action: 'up-to-date' });
+    expect(git(o.c, 'rev-parse', 'refs/remotes/origin/main')).not.toBe(merged);
+    expect(head(o.c)).toBe(o.base);
+  });
+
+  it('dry run with a planned origin fast-forward and --rebuild-cli plans the build (only container commits wait a run)', async () => {
+    const o = originCheckout();
+    o.merge('reviewed.ts');
+    git(o.c, 'fetch', '-q', 'origin');
+    realInstall(g, '0.1.0', 'old0000000000000', 'packed');
+    const w: NpmWorld = { globalRoot: g, checkout: o.c, calls: [] };
+    const logs: string[] = [];
+    const p = await runSourcePhase(phaseBase({ dryRun: true, checkout: o.c, origin: origin(o), runner: fakeNpm(w), rebuildCli: true, log: (m) => logs.push(m) }));
+    expect(p.sync).toMatchObject({ source: 'origin', action: 'fast-forward', applied: false });
+    expect(p.ok).toBe(true);
+    expect(p.stop).toBeNull();
+    const cli = p.steps.find((s) => s.id === 'cli');
+    expect(cli?.status).toBe('planned');
+    expect(cli?.detail).not.toMatch(/would stop|from the container/);
+    expect(logs.join('\n')).not.toMatch(/fetched from the container/);
+    expect(mutatingNpm(w.calls)).toEqual([]);
+    expect(head(o.c)).toBe(o.base);
+  });
+
+  it('upgradeSourceMode: --from-container is local-delivery only; GitHub delivery always takes origin', () => {
+    expect(upgradeSourceMode({ githubDelivery: false, fromContainer: true, checkout: null, baseBranch: 'main' })).toBe('container');
+    expect(upgradeSourceMode({ githubDelivery: false, fromContainer: false, checkout: '/c', baseBranch: 'main' })).toBe('checkout');
+    expect(upgradeSourceMode({ githubDelivery: false, fromContainer: false, checkout: null, baseBranch: 'main' })).toBe('none');
+    expect(upgradeSourceMode({ githubDelivery: true, fromContainer: false, checkout: '/c', baseBranch: 'main' })).toBe('origin');
+    expect(upgradeSourceMode({ githubDelivery: true, fromContainer: false, checkout: null, baseBranch: 'main' })).toBe('none');
+    let err: MinionsError | null = null;
+    try { upgradeSourceMode({ githubDelivery: true, fromContainer: true, checkout: '/c', baseBranch: 'trunk' }); } catch (e) { err = e as MinionsError; }
+    expect(err?.code).toBe('PRECONDITION');
+    expect(err?.message).toMatch(/--from-container is available with local delivery only.*origin\/trunk is the single source of truth/);
+  });
+
+  it('never combines the container sync with the origin source', async () => {
+    const o = originCheckout();
+    const s = syncRepo();
+    const e = await reason(runSourcePhase(phaseBase({ checkout: o.c, origin: origin(o), sync: { repo: s.repo, branch: 'main', baseBranch: 'main', exportRepo: s.exportRepo } })));
+    expect(e.code).toBe('PRECONDITION');
+    expect(s.exports()).toBe(0);
   });
 });
 

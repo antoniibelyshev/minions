@@ -20,8 +20,11 @@ export interface ImportResult {
  * Existing repo: fetch into refs/remotes/host/*; the local base branch is only fast-forwarded (so new
  * agent branches start from the refreshed base) and never rewritten — a diverged base is left alone.
  * `imported` is true when the repo was cloned, false when an existing clone was refreshed.
+ * `baseFrom: 'origin'` (GitHub delivery): the host refs are still fetched, but the local base is never
+ * moved to the host's base: origin/<base> is the single source of truth and every claim fast-forwards
+ * the base from it (./base-sync.ts).
  */
-export async function importWorkspace(bundlePath: string, opts: { base: string; remoteUrl?: string; config: Pick<MinionsConfig, 'git'>; layout?: WorkspaceLayout; tokenFile?: string }): Promise<ImportResult> {
+export async function importWorkspace(bundlePath: string, opts: { base: string; remoteUrl?: string; config: Pick<MinionsConfig, 'git'>; layout?: WorkspaceLayout; tokenFile?: string; baseFrom?: 'host' | 'origin' }): Promise<ImportResult> {
   const layout = opts.layout ?? workspaceLayout();
   const bundle = resolvePath(bundlePath);
   if (!validBranch(opts.base)) throw new MinionsError('PRECONDITION', `Invalid base branch name "${opts.base}".`);
@@ -42,7 +45,7 @@ export async function importWorkspace(bundlePath: string, opts: { base: string; 
     const inside = await git(repo, ['rev-parse', '--is-inside-work-tree'], true);
     if (inside.code !== 0) throw new MinionsError('PRECONDITION', `${repo} exists but is not a git repository.`, 'Inspect the workspace volume manually.');
     await git(repo, ['fetch', '--no-tags', bundle, '+refs/heads/*:refs/remotes/host/*']);
-    baseFastForwarded = await fastForwardBase(repo, opts.base);
+    if (opts.baseFrom !== 'origin') baseFastForwarded = await fastForwardBase(repo, opts.base);
   }
   const id = opts.config.git.identity;
   await git(repo, ['config', 'user.name', id.name]);

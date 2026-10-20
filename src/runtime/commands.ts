@@ -4,6 +4,7 @@ import { setIdempotencyStore, setReadyContext } from '../backlog/commands.js';
 import { openBacklog, writeBacklogConfig } from '../backlog/factory.js';
 import type { BacklogAdapter, IdempotencyStore } from '../backlog/types.js';
 import { validateConfig } from '../config/resolve.js';
+import { isGithubDelivery } from '../config/delivery.js';
 import type { MinionsConfig } from '../config/schema.js';
 import { action, globalOpts, requireMode, runtimeMode } from '../core/cli-helpers.js';
 import { MinionsError } from '../core/errors.js';
@@ -345,7 +346,8 @@ export function register(program: Command): void {
     .option('--remote-url <url>', 'origin URL to record (fetched over https only when a GitHub token is mounted)')
     .action(action(async (bundle: string, o: { base: string; remoteUrl?: string }, cmd: Command) => {
       requireMode('runtime');
-      const r = await importWorkspace(bundle, { base: o.base, remoteUrl: o.remoteUrl, config: await getConfig() });
+      const config = await getConfig();
+      const r = await importWorkspace(bundle, { base: o.base, remoteUrl: o.remoteUrl, config, baseFrom: isGithubDelivery(config) ? 'origin' : 'host' });
       emit(r, { json: globalOpts(cmd).json, human: (d: typeof r) => [`${d.imported ? 'Cloned' : 'Refreshed'} ${d.repo} at ${d.head} (base ${d.base})`,
         ...(d.origin ? [`origin ${d.origin.url}: ${d.origin.authenticated ? 'authenticated' : 'not authenticated'}, ${d.origin.fetched ? `fetched ${d.base}` : 'not fetched'}`] : []),
         ...(d.origin?.warnings ?? []).map((w) => `warning: ${w}`)].join('\n') });
