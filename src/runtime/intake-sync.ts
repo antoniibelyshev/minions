@@ -182,7 +182,14 @@ export function intakeTrackedTaskIds(db: Pick<RuntimeDb, 'getMeta'>): Set<string
  * usable provenance reach it), so a sync that just ran is seen at once.
  */
 export const intakeProvenanceFallback = (db: () => Pick<RuntimeDb, 'getMeta'>) =>
-  (taskId: string): 'external-requirement' | undefined => (intakeTrackedTaskIds(db()).has(taskId) ? 'external-requirement' : undefined);
+  (taskId: string): 'external-requirement' | undefined => {
+    try {
+      return intakeTrackedTaskIds(db()).has(taskId) ? 'external-requirement' : undefined;
+    } catch {
+      // If db() throws or getMeta fails, return undefined to use the default provenance
+      return undefined;
+    }
+  };
 
 function describeIssue(issue: GhIssue): string {
   const body = (issue.body ?? '').trim();

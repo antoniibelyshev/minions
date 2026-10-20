@@ -91,4 +91,9 @@ describe('provenance fallback hook: cost', () => {
     const fallback = intakeProvenanceFallback(() => ({ getMeta: () => { throw new Error('database is locked'); } }));
     expect(toTask({ id: 'TASK-1', description: 'x' }, { provenanceFallback: fallback }).provenance).toBe('user-decision');
   });
+
+  it('a db getter that throws falls back to the default instead of breaking the read', () => {
+    const fallback = intakeProvenanceFallback(() => { throw new Error('SQLITE_CANTOPEN'); });
+    expect(toTask({ id: 'TASK-1', description: 'x' }, { provenanceFallback: fallback }).provenance).toBe('user-decision');
+  });
 });

@@ -152,8 +152,17 @@ function mapPriority(p: string | null | undefined): Task['priority'] {
 export function toTask(raw: RawTask, opts: { startReady?: boolean; provenanceFallback?: ProvenanceFallback } = {}): Task {
   const { user, meta } = parseDescription(raw.description);
   const id = normalizeId(raw.id);
-  const provenance = PROVENANCES.includes(meta.provenance as Provenance) ? (meta.provenance as Provenance)
-    : (opts.provenanceFallback?.(id) ?? DEFAULT_PROVENANCE);
+  let provenance: Provenance;
+  if (PROVENANCES.includes(meta.provenance as Provenance)) {
+    provenance = meta.provenance as Provenance;
+  } else {
+    try {
+      provenance = opts.provenanceFallback?.(id) ?? DEFAULT_PROVENANCE;
+    } catch {
+      // If the fallback throws, use the default provenance
+      provenance = DEFAULT_PROVENANCE;
+    }
+  }
   const labels = raw.labels ?? [];
   const strArr = (v: unknown) => (Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : []);
   return {
