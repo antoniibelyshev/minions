@@ -11,7 +11,7 @@ import type { MinionsConfig } from '../config/schema.js';
 import { ciSetupPlan, fetchApi, requiredChecksStatus, type RequiredChecksReport } from '../runtime/ci.js';
 import { clearStaleSecrets, secretCopiesExist, githubCredentialStatus, readGithubToken, githubRepoFromRemote, telegramCredentialStatus, type CredentialStatus, type Fetch, type TelegramCredentialStatus } from './credentials.js';
 import { dockerProbe, type DockerProbe } from './discovery.js';
-import { Compose, buildFingerprint, imageBuildLabel, type Runner } from './docker.js';
+import { Compose, buildFingerprint, imageBuildLabel, tmpSizeMiB, type Runner } from './docker.js';
 import { telegramDoctorCheck } from '../telegram/probe.js';
 import { resolveChannel, type ChannelResolution } from '../telegram/channel.js';
 import { loadEffectiveConfig, loadProjectJson } from './project.js';
@@ -42,6 +42,66 @@ export const REACH_SCRIPT = 'fetch(process.env.ANTHROPIC_BASE_URL,{method:"HEAD"
   + '.then(r=>console.log("HTTP "+r.status),e=>{console.log("ERR "+((e.cause&&(e.cause.code||e.cause.message))||e.name));process.exitCode=1})';
 
 type Add = (name: string, status: CheckStatus, detail: string, hint?: string) => void;
+
+/** /tmp (RAM-backed tmpfs, counted against the container memory limit) usage at or above this percentage warns. */
+export const TMP_WARN_PERCENT = 80;
+/** Disk scratch (TMPDIR on the cache volume) usage at or above this percentage warns. */
+export const SCRATCH_WARN_PERCENT = 90;
+
+interface DfRow { sizeKiB: number; usedKiB: number; percent: number; mount: string }
+
+/** Parses `df -Pk <paths>` output (one row per argument, in order, after the header); unparseable rows are skipped. */
+export function parseDf(out: string): DfRow[] {
+  const rows: DfRow[] = [];
+  for (const line of out.split('\n').slice(1)) {
+    const f = line.trim().split(/\s+/);
+    if (f.length < 6) continue;
+    const [sizeKiB, usedKiB] = [Number(f[1]), Number(f[2])];
+    const percent = Number(f[4]!.replace('%', ''));
+    if (![sizeKiB, usedKiB, percent].every(Number.isFinite)) continue;
+    rows.push({ sizeKiB, usedKiB, percent, mount: f.slice(5).join(' ') });
+  }
+  return rows;
+}
+
+const mib = (kib: number) => `${Math.round(kib / 1024)} MiB`;
+
+/**
+ * container.tmp / container.scratch from `df -Pk /tmp <scratch>` run in the container. /tmp is RAM: high
+ * usage (leftover test data, deleted-but-open files) is memory pressure and ENOSPC for tests, so it warns
+ * from TMP_WARN_PERCENT. A /tmp size other than the configured cap, or a missing scratch dir, means the
+ * container was created from an older compose.yaml. Never 'fail'.
+ */
+export function tmpUsageChecks(r: { code: number; stdout: string; stderr: string }, o: { capMiB: number; scratch: string }): Check[] {
+  const rows = parseDf(r.stdout);
+  const recreate = 'Recreate the container to apply the current compose.yaml (`minions down`, then `minions start`).';
+  const tmp = rows.find((x) => x.mount === '/tmp');
+  const out: Check[] = [];
+  if (!tmp) {
+    out.push({ name: 'container.tmp', status: 'warn', detail: `could not read /tmp usage: ${short(r.stderr || r.stdout) || `exit ${r.code}`}` });
+  } else {
+    const detail = `/tmp ${tmp.percent}% used (${mib(tmp.usedKiB)} of ${mib(tmp.sizeKiB)}, RAM-backed tmpfs)`;
+    const capKiB = o.capMiB * 1024;
+    if (tmp.percent >= TMP_WARN_PERCENT) {
+      out.push({ name: 'container.tmp', status: 'warn', detail: `${detail}: at or above ${TMP_WARN_PERCENT}%; it counts against the container memory limit`,
+        hint: `Large temp data belongs in TMPDIR (${o.scratch}, on disk). Look for leftover test temp data or deleted-but-open files (lsof); \`minions down\` then \`minions start\` empties /tmp; raise container.tmpSizeMiB if more is really needed.` });
+    } else if (tmp.sizeKiB !== capKiB) {
+      out.push({ name: 'container.tmp', status: 'warn', detail: `${detail}; expected a ${o.capMiB} MiB cap (container created from an older compose.yaml)`, hint: recreate });
+    } else {
+      out.push({ name: 'container.tmp', status: 'ok', detail });
+    }
+  }
+  const scratch = rows.find((x) => x !== tmp);
+  if (!scratch) {
+    out.push({ name: 'container.scratch', status: 'warn', detail: `TMPDIR scratch dir ${o.scratch} not found in the container`, hint: recreate });
+  } else if (scratch.percent >= SCRATCH_WARN_PERCENT) {
+    out.push({ name: 'container.scratch', status: 'warn', detail: `${o.scratch} (TMPDIR, cache volume) disk ${scratch.percent}% used (${mib(scratch.usedKiB)} of ${mib(scratch.sizeKiB)})`,
+      hint: `Free disk space in Docker (docker system df) or remove leftover data under ${o.scratch}.` });
+  } else {
+    out.push({ name: 'container.scratch', status: 'ok', detail: `${o.scratch} (TMPDIR, disk-backed) on a volume ${scratch.percent}% used` });
+  }
+  return out;
+}
 
 /** Host-side auth checks that need no container: method, secret file, helper/source resolvable. */
 async function hostAuthChecks(projectId: string, a: ClaudeAuth, add: Add): Promise<void> {
@@ -388,6 +448,7 @@ export async function runDoctor(opts: { cwd: string; runner?: Runner; probe?: Do
             r.code === 0 && out.startsWith('HTTP ') ? `${maskValue(baseUrl)} reachable from the container (${out})` : `${maskValue(baseUrl)} not reachable from the container: ${out || short(r.stderr) || `exit ${r.code}`}`,
             r.code === 0 ? undefined : auth.preset === 'jbcentral' ? 'Make sure the Central proxy is running on the host (`minions auth refresh` starts it), then `minions start`.' : 'Check the URL and that the service listens on the host.');
         }
+        checks.push(...tmpUsageChecks(await ex(['df', '-Pk', '/tmp', CONTAINER.scratch]), { capMiB: tmpSizeMiB(project.container), scratch: CONTAINER.scratch }));
         const bl = await ex(['backlog', '--version']);
         add('backlog.cli', bl.code === 0 ? 'ok' : 'fail', bl.code === 0 ? `backlog.md ${short(bl.stdout)}` : `backlog CLI not usable: ${short(bl.stderr || bl.stdout)}`);
         const probe = await ex(['minions', 'coordinator', '--probe', '--json']);
@@ -402,7 +463,7 @@ export async function runDoctor(opts: { cwd: string; runner?: Runner; probe?: Do
         if (wantsTelegram) checks.push(telegramAccessCheck(await ex(['minions', 'telegram', 'status', '--json'])));
         if (github.onGitHub) ci = { rc: parseCiStatus(await ex(['minions', 'ci', 'status', '--json'])) };
       } else {
-        for (const n of ['claude.auth', ...(baseUrl ? ['claude.baseUrl'] : []), 'backlog.cli', 'claude.capabilities', 'telegram.plugin']) add(n, 'warn', 'skipped: container not running');
+        for (const n of ['claude.auth', ...(baseUrl ? ['claude.baseUrl'] : []), 'container.tmp', 'backlog.cli', 'claude.capabilities', 'telegram.plugin']) add(n, 'warn', 'skipped: container not running');
       }
     } else {
       add('container', 'fail', 'skipped: Docker unavailable');

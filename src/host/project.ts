@@ -27,6 +27,8 @@ export const ProjectJsonSchema = z.object({
     cpus: z.number().positive(),
     memoryMiB: z.number().int().min(512),
     pidsLimit: z.number().int().min(64),
+    /** Size cap of the /tmp tmpfs (RAM, counted against memoryMiB); absent = DEFAULT_TMP_SIZE_MIB (src/host/docker.ts). */
+    tmpSizeMiB: z.number().int().min(64).optional(),
     publishPorts: z.array(z.object({ host: port, container: port }).strict()),
     network: z.enum(['outbound-internet', 'none']),
   }).strict(),

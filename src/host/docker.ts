@@ -14,10 +14,16 @@ export type Runner = (cmd: string, args: string[], opts?: RunOptions) => Promise
 
 const q = (s: string | number) => JSON.stringify(String(s)); // JSON strings are valid YAML scalars
 
+/** Default size cap of the container's /tmp tmpfs (container.tmpSizeMiB overrides). tmpfs pages count against mem_limit. */
+export const DEFAULT_TMP_SIZE_MIB = 1024;
+export const tmpSizeMiB = (c: { tmpSizeMiB?: number }): number => c.tmpSizeMiB ?? DEFAULT_TMP_SIZE_MIB;
+
 /**
  * Generates compose.yaml for one project. Security baseline (spec §3A, bootstrap "Container"):
  * non-root, read-only rootfs, all caps dropped, no-new-privileges, resource limits, tmpfs for /tmp
- * and /home/node, named volumes for state, ro binds only for the plugin, runtime config and secrets dir,
+ * (size-capped: tmpfs is RAM and counts against mem_limit) and /home/node, TMPDIR on the cache volume
+ * (disk-backed and exec-allowed, unlike the noexec tmpfs mounts; created by the start command), named
+ * volumes for state, ro binds only for the plugin, runtime config and secrets dir,
  * loopback-only published ports, no Docker socket, no privileged mode, no host network/PID.
  * The secrets DIRECTORY is always a read-only bind (a directory, so atomically replaced files are
  * visible); Claude key methods (api-key/helper) add MINIONS_AUTH_METHOD/TTL env; secrets are never here.
@@ -45,7 +51,8 @@ export function composeYaml(p: ProjectJson): string {
     `    mem_limit: ${q(`${c.memoryMiB}m`)}`,
     `    pids_limit: ${c.pidsLimit}`,
     ...(c.network === 'none' ? ['    network_mode: "none"'] : []),
-    '    command: ["sleep", "infinity"]',
+    // The scratch dir must exist before anything uses TMPDIR; a failed mkdir never stops the container.
+    `    command: ["sh", "-c", ${q(`mkdir -p ${CONTAINER.scratch}; exec sleep infinity`)}]`,
     `    working_dir: ${q(CONTAINER.workspace)}`,
     '    environment:',
     '      MINIONS_RUNTIME: "container"',
@@ -58,6 +65,8 @@ export function composeYaml(p: ProjectJson): string {
     '      TERM: "xterm-256color"',
     '      npm_config_cache: "/home/node/.cache/npm"',
     '      XDG_CACHE_HOME: "/home/node/.cache"',
+    // Large temp data (test runs, tool scratch) goes to disk, not RAM; inherited by every exec, so workers and verification commands get it.
+    `      TMPDIR: ${q(CONTAINER.scratch)}`,
     `      MINIONS_AUTH_METHOD: ${q(auth.method)}`,
     ...(isKeyAuth(auth) ? [`      CLAUDE_CODE_API_KEY_HELPER_TTL_MS: ${q(KEY_HELPER_TTL_MS)}`] : []),
     // Bun (Telegram plugin dependencies) caches in the cache volume; /home/node itself is tmpfs.
@@ -67,7 +76,7 @@ export function composeYaml(p: ProjectJson): string {
     ...(process.platform !== 'darwin' && c.network !== 'none' && Object.values(extraEnv).some((v) => v.includes('host.docker.internal'))
       ? ['    extra_hosts:', '      - "host.docker.internal:host-gateway"'] : []),
     '    tmpfs:',
-    '      - "/tmp:rw,nosuid,nodev,uid=1000,gid=1000,mode=1777"',
+    `      - "/tmp:rw,nosuid,nodev,size=${tmpSizeMiB(c)}m,uid=1000,gid=1000,mode=1777"`,
     '      - "/home/node:rw,nosuid,nodev,uid=1000,gid=1000,mode=0755"',
     '    volumes:',
   ];
