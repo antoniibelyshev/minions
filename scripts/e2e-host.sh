@@ -103,7 +103,7 @@ expect_eq "$(json 'd.runtime' < "$P/project.json")" host "project.json runtime h
 expect_eq "$(git status --porcelain)" "$before" "private init leaves git status unchanged"
 
 step "doctor (host mode)"
-doc="$("$M" doctor --json)"
+doc="$("$M" doctor --json || true)"  # doctor exits 1 on blocking FAIL; the checks are asserted below
 expect_eq "$(json 'd.data.checks.find(c=>c.name==="runtime").status' <<<"$doc")" warn "doctor: runtime is a warn-level check"
 for t in tmux claude backlog git; do expect_eq "$(json "d.data.checks.find(c=>c.name===\"host.$t\").status" <<<"$doc")" ok "doctor: host.$t"; done
 expect_eq "$(json 'd.data.checks.some(c=>c.name.startsWith("docker."))' <<<"$doc")" false "doctor does not check Docker"
