@@ -169,158 +169,208 @@ export function preTelegramHook(input: unknown): HookOutput {
 /** Tool calls a leased worker may make freely after the first drain notice, before it is restricted. */
 export const DRAIN_GRACE_CALLS = 10;
 const DRAIN_READ_ONLY_TOOLS = new Set(['Read', 'Glob', 'Grep', 'LS', 'NotebookRead', 'TodoWrite']);
-/** git subcommands that record or inspect work; anything that could discard uncommitted changes is absent. */
-const DRAIN_GIT = new Set(['add', 'commit', 'status', 'log', 'diff', 'show', 'rev-parse', 'branch', 'ls-files']);
-const DRAIN_SHELL = new Set(['cd', 'pwd', 'ls', 'cat', 'head', 'tail', 'wc', 'echo', 'grep', 'true']);
-
 /**
- * Tokenizes a shell line into commands (lists of words, quotes removed), split on unquoted newlines,
- * `&&`, `||`, `;`, `|` and a lone `&` (not the `&` of `2>&1`, `>&2`, `&>`). A small, readable subset of
- * the shell grammar, not a full parser: anything outside it returns null so the caller fails closed.
+ * The upgrade-drain Bash check (task-3.9): a strict allowlist of whole command forms. Anything it does
+ * not recognize is denied; shell grammar beyond these forms is never interpreted.
  *
- * - Heredocs (`<<D`, `<<-D`, `<<'D'`, `<<"D"`): the delimiter is read, parsing continues on the rest of
- *   the line, and at the next newline the body is skipped up to its terminator line. A missing terminator
- *   is null. A body with an unquoted delimiter is expanded by the shell, so `$(` or a backtick in it is null.
- * - Command and process substitution (`$( )`, backticks, `<( )`, `>( )`) outside single quotes is null,
- *   except the literal commit message form `$(cat <<'EOF' ... EOF\n)`, which becomes one opaque word.
- * - Here-strings (`<<<`), ANSI-C quotes (`$'...'`) and unterminated quotes are null. A `#` at a word start comments out the line.
- * - A backslash-newline outside single quotes and outside a quoted-delimiter heredoc body is null: bash
- *   removes it before tokenizing, so it could split a construct this parser detects by peeking ahead.
- * - `redirect` is set for output redirection other than `>/dev/null` and `2>&1`.
+ * A line without a newline is one or more simple commands joined only by `&&`, optionally starting with
+ * `cd <path> &&`. Words are plain (`[A-Za-z0-9_./:=@%+,-]`), single-quoted (no newline), or double-quoted
+ * without `$`, a backtick, `\` or a newline; adjacent parts join into one word. Any other character
+ * outside quotes is denied, so substitutions, expansions, globs, `;`, `<`, `>`, `!`, `#`, tabs and
+ * newlines never reach a shell. A simple command may end with the exact tokens `>/dev/null` and `2>&1`,
+ * then `| head -<n>` or `| tail -<n>`. The command name must be a plain word and one of:
+ *
+ * - `git [-C <path>] [--no-pager] <sub>` with `status|log|diff|show|rev-parse` (no `--ou…` argument,
+ *   which git expands to `--output=<file>`), `branch` (no args or one of `--show-current -a -r --list`),
+ *   `add <paths|-A|-u>` and `commit -m <quoted message>` (no other flags: no `--amend`, `-a`, `-c`).
+ *   `git -c` is denied (core.fsmonitor, core.pager and aliases run commands).
+ * - `ls`, `cat <file>`, `pwd`, `echo`, and `minions work submit|brief <lease> [--role <r>] --json`.
+ *
+ * A line with a newline must be one of three heredoc forms, matched structurally; the body is not parsed:
+ * - `[cd <path> && ]minions work submit <lease> [--role <r>] --json <<'RESULT'\n<body>\nRESULT[\n]`,
+ *   with no body line exactly `RESULT` (the worker result contract).
+ * - `[cd <path> && ][git add … && ]git commit -m "$(cat <<'EOF'\n<body>\nEOF\n)"` and nothing after; no
+ *   body line may start with `EOF` (inside `$( )` bash also ends the body at a line like `EOF)`).
+ * - `[cd <path> && ][git add … && ]git commit -F - <<'EOF'\n<body>\nEOF[\n]`, no body line exactly `EOF`.
+ * The delimiters are single-quoted, so the shell never expands the body.
  */
-function shellSegments(cmd: string): { segments: string[][]; redirect: boolean } | null {
-  const segments: string[][] = [];
-  let words: string[] = [];
-  let word = '';
-  let inWord = false;
-  let quote: '"' | "'" | null = null;
-  let redirect = false;
-  let heredocs: { delim: string; strip: boolean; literal: boolean }[] = [];
-  let gtAt = -2; // index of the last unquoted `>` operator character
-  const endWord = () => { if (inWord) words.push(word); word = ''; inWord = false; };
-  const endSegment = () => { endWord(); if (words.length) segments.push(words); words = []; };
+interface ShellWord { text: string; quoted: boolean }
+type ShellToken = { kind: 'and' | 'pipe' } | { kind: 'redirect'; text: string } | { kind: 'word'; word: ShellWord };
+
+const PLAIN_CHAR = /^[A-Za-z0-9_./:=@%+,-]$/;
+const DRAIN_REDIRECTS = ['2>&1', '>/dev/null'];
+
+function drainTokens(line: string): ShellToken[] | null {
+  const tokens: ShellToken[] = [];
+  const boundary = (n: number) => n === line.length || line[n] === ' ';
   let i = 0;
-  while (i < cmd.length) {
-    const c = cmd[i]!;
-    if (quote === "'") { if (c === "'") quote = null; else word += c; i++; continue; }
-    // Unquoted or inside double quotes: escapes and substitutions apply in both.
-    if (c === '\\') {
-      const n = cmd[i + 1];
-      if (n === undefined) return null;
-      // bash deletes `\<newline>` before tokenizing, so it can split any multi-character construct this
-      // parser detects by peeking (`$(`, `<(`, `<<`, `$'`, a heredoc delimiter, `>&1`). Not modeled: fail closed.
-      if (n === '\n') return null;
-      word += quote && !'$`"\\'.includes(n) ? c + n : n;
-      inWord = true; i += 2; continue;
+  while (i < line.length) {
+    if (line[i] === ' ') { i++; continue; }
+    if (line.startsWith('&&', i)) { tokens.push({ kind: 'and' }); i += 2; continue; }
+    if (line[i] === '|' && boundary(i + 1)) { tokens.push({ kind: 'pipe' }); i++; continue; }
+    const redirect = DRAIN_REDIRECTS.find((r) => line.startsWith(r, i) && boundary(i + r.length));
+    if (redirect) { tokens.push({ kind: 'redirect', text: redirect }); i += redirect.length; continue; }
+    let text = '';
+    let quoted = false;
+    const start = i;
+    while (i < line.length) {
+      const c = line[i]!;
+      if (c === "'" || c === '"') {
+        const end = line.indexOf(c, i + 1);
+        if (end < 0) return null;
+        const body = line.slice(i + 1, end);
+        if (body.includes('\n') || (c === '"' && /[$`\\]/.test(body))) return null;
+        text += body; quoted = true; i = end + 1;
+      } else if (PLAIN_CHAR.test(c)) { text += c; i++; }
+      else break;
     }
-    if (c === '$' && cmd[i + 1] === '(') {
-      const end = catHeredocEnd(cmd, i);
-      if (end < 0) return null;
-      word += '<message>'; inWord = true; i = end; continue;
-    }
-    if (c === '`') return null;
-    if (quote === '"') { if (c === '"') quote = null; else word += c; i++; continue; }
-    // Unquoted.
-    if (c === "'" || c === '"') { quote = c; inWord = true; i++; continue; }
-    if (c === '$' && cmd[i + 1] === "'") return null; // ANSI-C `$'...'` has its own escapes (`\'`); not modeled
-    if (c === '#' && !inWord) { while (i < cmd.length && cmd[i] !== '\n') i++; continue; }
-    if ((c === '<' || c === '>') && cmd[i + 1] === '(') return null;
-    if (c === '<' && cmd[i + 1] === '<') {
-      if (cmd[i + 2] === '<') return null;
-      let j = i + 2;
-      const strip = cmd[j] === '-';
-      if (strip) j++;
-      while (cmd[j] === ' ' || cmd[j] === '\t') j++;
-      // The delimiter must end at a word boundary: bash joins `E'X'` or `EOF#x` into one delimiter word.
-      const m = /^(?:'([^'\n]+)'|"([^"$`\\\n]+)"|([\w.-]+))(?=$|[ \t\n;&|<>()])/.exec(cmd.slice(j));
-      if (!m) return null;
-      heredocs.push({ delim: (m[1] ?? m[2] ?? m[3])!, strip, literal: m[3] === undefined });
-      endWord(); i = j + m[0].length; continue;
-    }
-    if (c === '\n') {
-      endSegment(); i++;
-      for (const h of heredocs) { i = heredocBodyEnd(cmd, i, h.delim, h.strip, h.literal); if (i < 0) return null; }
-      heredocs = [];
-      continue;
-    }
-    // A `&` right after an unquoted `>` operator is part of `>&`; an escaped or quoted `>` is not an operator.
-    if (c === ';' || c === '|' || (c === '&' && gtAt !== i - 1 && cmd[i + 1] !== '>')) {
-      endSegment();
-      i += (c === '|' || c === '&') && cmd[i + 1] === c ? 2 : 1;
-      continue;
-    }
-    // Output redirection writes files; only `>/dev/null` and `2>&1` are harmless.
-    // `2>&1x` and `>/dev/null"x"` name other files, so the target must end at a word boundary.
-    if (c === '>') {
-      gtAt = i;
-      const rest = cmd.slice(i);
-      if (!/^>[ \t]*\/dev\/null(?=$|[\s;&|])/.test(rest) && !(cmd[i - 1] === '2' && /^>&1(?=$|[\s;&|])/.test(rest))) redirect = true;
-    }
-    if (c === ' ' || c === '\t') { endWord(); i++; continue; }
-    word += c; inWord = true; i++;
+    if (i === start || !(boundary(i) || line.startsWith('&&', i))) return null;
+    tokens.push({ kind: 'word', word: { text, quoted } });
   }
-  if (quote || heredocs.length) return null;
-  endSegment();
-  return { segments, redirect };
+  return tokens;
+}
+
+/** A newline-free line as its `&&`-joined simple commands (words; `tail` when redirects or a pipe follow), or null. */
+function drainChain(line: string): { words: ShellWord[]; tail: boolean }[] | null {
+  if (line.includes('\n')) return null;
+  const tokens = drainTokens(line);
+  if (!tokens) return null;
+  const commands: { words: ShellWord[]; tail: boolean }[] = [];
+  let k = 0;
+  for (;;) {
+    const words: ShellWord[] = [];
+    while (tokens[k]?.kind === 'word') words.push((tokens[k++] as { word: ShellWord }).word);
+    if (!words.length) return null;
+    const seen = new Set<string>();
+    let tail = false;
+    for (let t = tokens[k]; t?.kind === 'redirect'; t = tokens[++k]) {
+      if (seen.has(t.text)) return null;
+      seen.add(t.text); tail = true;
+    }
+    if (tokens[k]?.kind === 'pipe') {
+      const [cmd, count] = [tokens[k + 1], tokens[k + 2]];
+      if (cmd?.kind !== 'word' || count?.kind !== 'word' || cmd.word.quoted || count.word.quoted) return null;
+      if (!['head', 'tail'].includes(cmd.word.text) || !/^-[1-9][0-9]{0,5}$/.test(count.word.text)) return null;
+      k += 3; tail = true;
+    }
+    commands.push({ words, tail });
+    if (k === tokens.length) return commands;
+    if (tokens[k]!.kind !== 'and') return null;
+    k++;
+  }
+}
+
+const DRAIN_GIT_READ = new Set(['status', 'log', 'diff', 'show', 'rev-parse']);
+const DRAIN_GIT_BRANCH_ARGS = new Set(['--show-current', '-a', '-r', '--list']);
+
+/** `git` with at most one `-C <path>` and one `--no-pager`: the index of the subcommand word, or -1. Other global options (`-c`) are denied. */
+function gitSubcommandAt(words: ShellWord[]): number {
+  let i = 1;
+  let cd = false;
+  let pager = false;
+  for (;;) {
+    const w = words[i];
+    if (!w || w.quoted) return -1;
+    if (w.text === '-C' && !cd && words[i + 1]) { cd = true; i += 2; }
+    else if (w.text === '--no-pager' && !pager) { pager = true; i++; }
+    else return w.text.startsWith('-') ? -1 : i;
+  }
+}
+
+const isGitCommit = (words: ShellWord[]) => words[0]?.text === 'git' && !words[0].quoted && gitSubcommandAt(words) === words.length - 1 && words.at(-1)!.text === 'commit';
+
+function drainGitOk(words: ShellWord[]): boolean {
+  const at = gitSubcommandAt(words);
+  if (at < 0) return false;
+  const sub = words[at]!.text;
+  const args = words.slice(at + 1);
+  // git expands unambiguous long-option prefixes: `--ou`, `--outp` all mean `--output=<file>`.
+  if (DRAIN_GIT_READ.has(sub)) return !args.some((a) => a.text.startsWith('--ou'));
+  if (sub === 'branch') return args.length === 0 || (args.length === 1 && DRAIN_GIT_BRANCH_ARGS.has(args[0]!.text));
+  if (sub === 'add') {
+    const dashdash = args.findIndex((a) => a.text === '--');
+    return (dashdash < 0 ? args : args.slice(0, dashdash)).every((a) => a.text === '-A' || a.text === '-u' || !a.text.startsWith('-'));
+  }
+  if (sub === 'commit') return args.length === 2 && args[0]!.text === '-m' && !args[0]!.quoted && args[1]!.quoted;
+  return false;
+}
+
+/** `minions work submit|brief <lease> [--role <r>] --json`. */
+function drainMinionsOk(words: ShellWord[], verbs: string[]): boolean {
+  const [, work, verb, lease, ...rest] = words.map((w) => (w.quoted ? '' : w.text));
+  if (work !== 'work' || !verbs.includes(verb ?? '') || !/^[A-Za-z0-9_-]+$/.test(lease ?? '')) return false;
+  const tail = rest.join(' ');
+  return tail === '--json' || /^--role [a-z-]+ --json$/.test(tail);
+}
+
+/** One simple command at `pos` of `total` in an `&&` chain. */
+function drainCommandOk(words: ShellWord[], pos: number, total: number): boolean {
+  const name = words[0]!;
+  if (name.quoted) return false;
+  switch (name.text) {
+    case 'cd': return pos === 0 && total > 1 && words.length === 2;
+    case 'pwd': return words.length === 1;
+    case 'cat': return words.length === 2;
+    case 'ls': case 'echo': return true;
+    case 'git': return drainGitOk(words);
+    case 'minions': return drainMinionsOk(words, ['submit', 'brief']);
+    default: return false;
+  }
 }
 
 /**
- * Skips a heredoc body starting at `from` (the line after the `<<`), returning the index just past the
- * terminator line, or -1 when there is none or an expanded body (unquoted delimiter) contains a substitution
- * or a backslash line continuation.
+ * The head line of a heredoc form (before ` <<'…'`): `[cd <path> && ]` then, for commit forms, `git add …`
+ * commands, then the final command, which `last` checks. No redirects or pipes anywhere.
  */
-function heredocBodyEnd(cmd: string, from: number, delim: string, strip: boolean, literal: boolean, comsub = false): number {
-  let pos = from;
-  while (pos < cmd.length) {
-    const nl = cmd.indexOf('\n', pos);
-    const next = nl < 0 ? cmd.length : nl + 1;
-    const line = cmd.slice(pos, nl < 0 ? cmd.length : nl);
-    const bare = strip ? line.replace(/^\t+/, '') : line;
-    if (bare === delim) return next;
-    // Inside `$( )` bash also ends the body at a line like `EOF)` or `EOF )`; any such line is refused.
-    if (comsub && bare.startsWith(delim)) return -1;
-    // The shell joins `\<newline>` lines of an expanded body before matching the terminator; not modeled.
-    if (!literal && (line.includes('$(') || line.includes('`') || line.endsWith('\\'))) return -1;
-    pos = next;
-  }
-  return -1;
+function drainHeredocHead(head: string, last: (words: ShellWord[]) => boolean, adds: boolean): boolean {
+  const chain = drainChain(head);
+  if (!chain || chain.some((c) => c.tail)) return false;
+  return chain.every(({ words }, pos) => {
+    if (pos === chain.length - 1) return last(words);
+    if (words[0]!.text === 'cd' && !words[0]!.quoted) return drainCommandOk(words, pos, chain.length);
+    return adds && words[0]!.text === 'git' && !words[0]!.quoted && words[gitSubcommandAt(words)]?.text === 'add' && drainGitOk(words);
+  });
 }
 
-/** The end of a literal `$(cat <<'EOF'\n...\nEOF\n)` at `at` (the index of `$`), or -1 for any other `$(`. */
-function catHeredocEnd(cmd: string, at: number): number {
-  const m = /^\$\(\s*cat\s*<<(-?)\s*'([^'\n]+)'[ \t]*\n/.exec(cmd.slice(at));
-  if (!m) return -1;
-  const body = heredocBodyEnd(cmd, at + m[0].length, m[2]!, m[1] === '-', true, true);
-  if (body < 0) return -1;
-  const close = /^\s*\)/.exec(cmd.slice(body));
-  return close ? body + close[0].length : -1;
+/** The body lines of a heredoc closed by `delim` on its own line (plus an optional final newline), or null. */
+function heredocBody(rest: string, delim: string): string[] | null {
+  const lines = rest.split('\n');
+  if (lines.at(-1) === '') lines.pop();
+  if (lines.pop() !== delim) return null;
+  return lines.includes(delim) ? null : lines;
 }
+
+const SUBMIT_OPEN = " <<'RESULT'";
+const COMMIT_MESSAGE_OPEN = ` -m "$(cat <<'EOF'`;
+const COMMIT_FILE_OPEN = " -F - <<'EOF'";
 
 /**
- * True for Bash lines that only commit, inspect, or submit the result (no edits, no discarding).
- * Decisions (task-3.9): `git -c <key>=<value>` is rejected outright (core.fsmonitor, core.pager and others
- * run commands), and `git commit --amend` is rejected (it rewrites a commit that may already be recorded).
+ * True for Bash lines that only commit, inspect, or submit the result (see the allowlist above).
+ * Decisions (task-3.9): unknown forms are denied; `git -c` is denied; `git -C <path>` is allowed (workers
+ * use it instead of `cd`); `git commit --amend` is denied (it rewrites a commit that may already be recorded).
  */
 export function drainSafeBash(command: string): boolean {
-  const parsed = shellSegments(command);
-  if (!parsed || parsed.redirect || !parsed.segments.length) return false;
-  return parsed.segments.every((words) => {
-    if (words[0] === 'git') {
-      let i = 1;
-      for (;;) {
-        if (words[i] === '-C') i += 2;
-        else if (words[i] === '--no-pager' || words[i] === '--no-optional-locks') i++;
-        else break;
-      }
-      const sub = words[i] ?? '';
-      const args = words.slice(i + 1);
-      if (args.some((w) => w.startsWith('--output'))) return false; // `git diff --output=f` writes f
-      if (sub === 'commit' && args.some((w) => w.startsWith('--am'))) return false; // git accepts `--am`/`--ame` for --amend
-      return DRAIN_GIT.has(sub) && !(sub === 'branch' && args.some((w) => /^-[dDmMfc]|^--(delete|move|force|copy)/.test(w)));
-    }
-    if (words[0] === 'minions') return words[1] === 'work' && (words[2] === 'submit' || words[2] === 'brief');
-    return DRAIN_SHELL.has(words[0]!);
-  });
+  const nl = command.indexOf('\n');
+  if (nl < 0) {
+    const chain = drainChain(command);
+    return !!chain && chain.every(({ words }, pos) => drainCommandOk(words, pos, chain.length));
+  }
+  const first = command.slice(0, nl);
+  const rest = command.slice(nl + 1);
+  if (first.endsWith(SUBMIT_OPEN)) {
+    return drainHeredocHead(first.slice(0, -SUBMIT_OPEN.length), (w) => w[0]?.text === 'minions' && !w[0].quoted && drainMinionsOk(w, ['submit']), false)
+      && heredocBody(rest, 'RESULT') !== null;
+  }
+  if (first.endsWith(COMMIT_MESSAGE_OPEN)) {
+    if (!drainHeredocHead(first.slice(0, -COMMIT_MESSAGE_OPEN.length), isGitCommit, true)) return false;
+    const lines = rest.split('\n');
+    if (lines.pop() !== ')"' || lines.pop() !== 'EOF') return false;
+    return !lines.some((l) => l.startsWith('EOF'));
+  }
+  if (first.endsWith(COMMIT_FILE_OPEN)) {
+    return drainHeredocHead(first.slice(0, -COMMIT_FILE_OPEN.length), isGitCommit, true) && heredocBody(rest, 'EOF') !== null;
+  }
+  return false;
 }
 
 const drainAllowed = (tool: string, ti: Record<string, unknown>): boolean =>
