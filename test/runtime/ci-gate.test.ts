@@ -6,7 +6,7 @@ import { formatSync, summarizeChecks, syncTasks } from '../../src/runtime/ci.js'
 import { evaluateCiGate, type CiGateInput } from '../../src/runtime/ci-gate.js';
 import type { GhFn } from '../../src/runtime/publish.js';
 import { validateResult } from '../../src/runtime/results.js';
-import { Scheduler } from '../../src/runtime/scheduler.js';
+import { localVerificationComplete, Scheduler } from '../../src/runtime/scheduler.js';
 import { defaults } from '../helpers.js';
 import { commitFile, gitSync, makeDefaultEnv, result, type Env } from './fixtures.js';
 
@@ -51,6 +51,19 @@ describe('CI evidence gate (pure decision, fail closed)', () => {
     expect(gate({ observations: [obs(HEAD, [{ name: 'other', state: 'pass' }])], now: at(10) }).state).toBe('pending');
     // Timeout counts from the first observation of the head, not the latest.
     expect(gate({ observations: [...pending, obs(HEAD, [{ name: 'test', state: 'pending' }], at(29).toISOString())], now: at(31) })).toMatchObject({ state: 'timeout' });
+  });
+});
+
+describe('local verification matching', () => {
+  const cfgd = ['npm run typecheck', 'npm test'];
+  it('requires every configured command, exact after env assignments and chaining', () => {
+    expect(localVerificationComplete([{ command: 'npm run typecheck', outcome: 'pass' }, { command: 'npm test', outcome: 'pass' }], cfgd)).toBe(true);
+    expect(localVerificationComplete([{ command: 'npm run typecheck', outcome: 'pass' }, { command: 'mkdir -p x && TMPDIR=x npm test', outcome: 'pass' }], cfgd)).toBe(true);
+    expect(localVerificationComplete([{ command: 'TMPDIR=x npm test', outcome: 'pass' }], cfgd)).toBe(false);
+    expect(localVerificationComplete([{ command: 'npm test --silent', outcome: 'pass' }, { command: 'npm run typecheck', outcome: 'pass' }], cfgd)).toBe(false);
+    expect(localVerificationComplete([{ command: 'npm run typecheck', outcome: 'pass' }, { command: 'npm test', outcome: 'pass', source: 'ci' }], cfgd)).toBe(false);
+    expect(localVerificationComplete([], [])).toBe(false);
+    expect(localVerificationComplete([{ command: 'x', outcome: 'pass' }], [])).toBe(true);
   });
 });
 
@@ -187,8 +200,8 @@ describe('CI authority in the reviewer stage (mocked gh)', () => {
     expect(env.backlog.notes.at(-1)!.text).toMatch(/not approved: CI gate missing/);
   });
 
-  it('pending CI never approves; past the timeout it falls back to local checks', async () => {
-    const env = await ciEnv();
+  it('pending CI never approves; past the timeout it falls back to the full local verification', async () => {
+    const env = await ciEnv({ mutate: (c) => { c.verification.commands = ['npm run typecheck', 'npm test']; } });
     env.setRollup([run('test', null)]);
     await sync(env);
     const first = await review(env);
@@ -202,10 +215,14 @@ describe('CI authority in the reviewer stage (mocked gh)', () => {
     expect(second.rec.message).toMatch(/CI gate timeout/);
 
     // Local verification (the fallback) is accepted; CI is not what approved it.
-    const third = await review(env, { checks: [...ciOnly.checks, { command: 'npm test', outcome: 'pass', source: 'local' }] });
+    // A subset of the configured commands (or a CI-sourced entry) is not the full verification.
+    const subset = await review(env, { checks: [...ciOnly.checks, { command: 'npm test', outcome: 'pass', source: 'local' }] });
+    expect(subset.rec).toMatchObject({ approved: false, to: 'reviewing' });
+    // Env-prefixed / chained forms of the configured commands match; the full set approves.
+    const third = await review(env, { checks: [...ciOnly.checks, { command: 'npm run typecheck', outcome: 'pass', source: 'local' }, { command: 'mkdir -p /x && TMPDIR=/x npm test', outcome: 'pass', source: 'local' }] });
     expect(third.rec).toMatchObject({ approved: true, to: 'delivered' });
     expect(JSON.parse(env.db.evidenceFor('task-1', env.head, 'ci-gate').at(-1)!.details_json!)).toMatchObject({ usedAs: 'local-fallback' });
-    expect(reviewerOutcomes(env)).toEqual(['ci-pending', 'ci-timeout', 'complete']);
+    expect(reviewerOutcomes(env)).toEqual(['ci-pending', 'ci-timeout', 'ci-timeout', 'complete']);
   });
 
   it('unreadable required checks are not evidence (never treated as zero required checks)', async () => {

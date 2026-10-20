@@ -151,7 +151,7 @@ export const MinionsConfigSchema = z.object({
      * "github": tester/reviewer stages may rely on passing required CI checks (branch protection or
      * rulesets on the base) observed by `minions sync` for the exact head under test/review, instead of
      * re-running the full verification locally (src/runtime/ci-gate.ts). Missing, failing, unknown or
-     * pending-too-long CI never approves; the stage falls back to local verification. "none": local only.
+     * pending-too-long CI never approves; the stage falls back to the full local verification (every verification.commands entry passing locally). "none": local only.
      */
     ciAuthority: z.enum(['none', 'github']),
     /** ciAuthority github: minutes required checks may stay pending (from the first observation of a head) before CI counts as timed out. Default 60. */

@@ -168,6 +168,23 @@ const RESULT_CONTRACT = 'Return exactly one JSON object: {status: complete|needs
 const newLeaseId = () => `lease-${randomBytes(6).toString('hex')}`;
 const nowIso = () => new Date().toISOString();
 
+/**
+ * Command text reduced to what ran: the last `&&`/`;` segment with leading `VAR=value` assignments removed,
+ * so `mkdir -p x && TMPDIR=x npm test` matches the configured `npm test`. Still an exact match otherwise.
+ */
+export function normalizeCheckCommand(command: string): string {
+  const last = command.split(/&&|;/).map((p) => p.trim()).filter(Boolean).pop() ?? '';
+  return last.replace(/^(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)+/, '').trim();
+}
+
+/** The full configured verification passed locally (source not ci); with no commands configured, any passing local check. */
+export function localVerificationComplete(checks: { command: string; outcome: string; source?: 'local' | 'ci' }[], configured: string[]): boolean {
+  const passed = checks.filter((c) => !isCiCheck(c) && c.outcome === 'pass');
+  if (!configured.length) return passed.length > 0;
+  const ran = new Set(passed.map((c) => normalizeCheckCommand(c.command)));
+  return configured.every((cmd) => ran.has(normalizeCheckCommand(cmd)));
+}
+
 export class Scheduler {
   readonly db: RuntimeDb;
   readonly backlog: BacklogAdapter;
@@ -596,7 +613,7 @@ export class Scheduler {
     // A partial from a worker that was running when a drain was requested (even one cleared since) is a drain partial.
     const drained = r.status === 'partial' && !sweep && this.db.drainRequestedSince(lease.started_at);
     // CI not usable as evidence: failing -> repair; otherwise fall back to the result's own local checks, or no approval.
-    const localPass = r.checks.some((c) => !isCiCheck(c) && c.outcome === 'pass');
+    const localPass = localVerificationComplete(r.checks, cfg.verification.commands);
     const ciBlock: 'fail' | 'unverified' | null = !ciGate || ciGate.state === 'pass' ? null : ciGate.state === 'fail' ? 'fail' : localPass ? null : 'unverified';
     const ciFallback = !!ciGate && ciGate.state !== 'pass' && !ciBlock;
 
