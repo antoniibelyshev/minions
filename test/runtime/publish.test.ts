@@ -313,6 +313,7 @@ describe('sensitive-path gate', () => {
     const p = await env.sched.publish('task-1');
     expect(p.state).toBe('awaiting-approval');
     expect(p.approvalError).toMatch(/no approval public key/);
+    expect(p.approvalError).toContain(env.keys.publicKeyFile); // names the path it tried
     expect(remoteHead(env.bare, branch)).toBeNull();
     expect(() => env.sched.approvePublication('task-1', { head, signature: env.keys.sign('task-1', head) })).toThrow(/no approval public key/);
   });
@@ -383,6 +384,43 @@ describe('sensitive-path gate', () => {
     expect(p).toMatchObject({ state: 'awaiting-approval', approvalError: expect.stringMatching(/for head/) });
     expect(remoteHead(env.bare, second.branch)).toBeNull();
     expect(env.gh.calls).toHaveLength(0);
+  });
+
+  it('a local base ref moved to the branch head cannot hide sensitive paths: the gate diffs against the base recorded at claim', async () => {
+    const env = pubEnv();
+    env.backlog.add({ id: 'task-1', title: 'Touch CI' });
+    const eng = await env.sched.claim('task-1', 'engineer');
+    const claimBase = env.db.lease(eng.leaseId)!.base_sha!;
+    mkdirSync(join(eng.worktree, '.github/workflows'), { recursive: true });
+    const head = commitFile(eng.worktree, '.github/workflows/ci.yml', 'evil');
+    await env.sched.record(eng.leaseId, result({ branch: eng.branch, headSha: head }));
+    const t = await env.sched.claim('task-1', 'tester');
+    await env.sched.record(t.leaseId, result({ branch: t.branch, headSha: head }));
+    const rev = await env.sched.claim('task-1', 'reviewer');
+    // In-runtime code moves every base ref it can reach to the head, including origin's (with the token).
+    const repo = env.layout.repo;
+    gitSync(repo, 'update-ref', 'refs/heads/main', head);
+    gitSync(repo, 'update-ref', 'refs/remotes/origin/main', head);
+    gitSync(repo, 'push', '-q', env.bare, `${head}:refs/heads/main`);
+    expect(gitSync(repo, 'diff', '--name-only', `main...${head}`)).toBe(''); // the old ref-based diff would be empty
+    expect(claimBase).not.toBe(head);
+    const r = await env.sched.record(rev.leaseId, result({ branch: rev.branch, headSha: head, verdict: 'approve' }));
+    expect(r.publication).toMatchObject({ state: 'awaiting-approval', status: 'awaiting-human', sensitivePaths: ['.github/workflows/ci.yml'] });
+    expect(remoteHead(env.bare, rev.branch)).toBeNull();
+    expect(env.gh.calls).toHaveLength(0);
+  });
+
+  it('a moved local base ref with the recorded bases wiped from the DB: origin\'s base (ls-remote) still exposes sensitive paths', async () => {
+    const env = pubEnv();
+    env.backlog.add({ id: 'task-1', title: 'Touch CI' });
+    const { r, head, branch } = await approveTask(env, 'task-1', '.github/workflows/ci.yml');
+    expect(r.publication?.state).toBe('awaiting-approval');
+    env.db.exec('UPDATE leases SET base_sha = NULL WHERE task_id = ?', 'task-1');
+    gitSync(env.layout.repo, 'update-ref', 'refs/heads/main', head);
+    gitSync(env.layout.repo, 'update-ref', 'refs/remotes/origin/main', head);
+    const p = await env.sched.publish('task-1');
+    expect(p).toMatchObject({ state: 'awaiting-approval', sensitivePaths: ['.github/workflows/ci.yml'] });
+    expect(remoteHead(env.bare, branch)).toBeNull();
   });
 
   it('PR creation is gated too: a remote branch already at the head (pushed outside minions) does not bypass approval', async () => {

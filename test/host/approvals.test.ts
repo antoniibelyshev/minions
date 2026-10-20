@@ -7,7 +7,7 @@ import { CONTAINER, credentialStoreDir, projectPaths } from '../../src/core/path
 import { approvalPublicKeyFile, approvalSigningKeyFile, approveOnHost, ensureApprovalKey, issueApproval, removeApprovalKeys } from '../../src/host/approvals.js';
 import { composeYaml } from '../../src/host/docker.js';
 import { hostSettings } from '../../src/runtime/coordinator.js';
-import { approvalPublicKeyPath, CONTAINER_APPROVAL_PUBLIC_KEY, inMinionsContainer, runtimePaths } from '../../src/runtime/paths.js';
+import { approvalPublicKeyPath, CONTAINER_APPROVAL_PUBLIC_KEY, inMinionsContainer, missingApprovalKeyReason, runtimePaths } from '../../src/runtime/paths.js';
 import { withHome } from './fixtures.js';
 
 const HEAD = 'a1'.repeat(20);
@@ -168,6 +168,20 @@ describe('host-held approval key', () => {
     const pair = generateApprovalKeyPair();
     const t = signApproval(pair.privateKeyPem, { taskId: 'task-1', head: HEAD }).token;
     expect(verifyApproval(t, null, { taskId: 'task-1', head: HEAD })).toMatchObject({ ok: false, reason: expect.stringMatching(/no approval public key/) });
+  });
+
+  it('host runtime with MINIONS_CONFIG unset: the fail-closed reason names the key path it tried and the unset MINIONS_CONFIG, not a missing first approval', () => {
+    for (const env of [{ MINIONS_RUNTIME: 'host' }, { MINIONS_RUNTIME: 'host', MINIONS_CONFIG: '' }]) {
+      const file = approvalPublicKeyPath(env, false);
+      const reason = missingApprovalKeyReason(file, env, false);
+      expect(reason).toContain(`no approval public key at ${CONTAINER_APPROVAL_PUBLIC_KEY}`);
+      expect(reason).toMatch(/host runtime but MINIONS_CONFIG is unset/);
+      expect(reason).not.toMatch(/first .minions work approve/);
+    }
+    // Container, or a correctly launched host runtime: the path tried plus the first-approve hint.
+    expect(missingApprovalKeyReason(CONTAINER_APPROVAL_PUBLIC_KEY, {}, true)).toBe(`no approval public key at ${CONTAINER_APPROVAL_PUBLIC_KEY} (the host writes it on the first \`minions work approve\`)`);
+    const hostEnv = { MINIONS_RUNTIME: 'host', MINIONS_CONFIG: '/home/u/p/runtime/config.json' };
+    expect(missingApprovalKeyReason(approvalPublicKeyPath(hostEnv, false), hostEnv, false)).toMatch(/^no approval public key at \/home\/u\/p\/runtime\/approval-public-key\.pem \(the host writes it/);
   });
 
   it('host-mode `work approve` is refused inside the container before any key is written', async () => {

@@ -9,7 +9,7 @@ import { MinionsError } from '../core/errors.js';
 import { syncBaseFromOrigin, type BaseSyncResult } from './base-sync.js';
 import type { Lease, LeaseRole, PublicationState, RuntimeDb } from './db.js';
 import { removeLeaseFiles, type HandoffPaths } from './handoff.js';
-import { runtimePaths } from './paths.js';
+import { missingApprovalKeyReason, runtimePaths } from './paths.js';
 import { publishTask, type PublishInput, type PublishOutcome } from './publish.js';
 import { validateResult, type WorkerResult } from './results.js';
 import { BRANCH_PREFIX, branchFor, ensureBranchWorktree, ensureReviewWorktree, git, headOf, resolveBaseBranch, taskSlug, workspaceLayout, type WorkspaceLayout } from './worktree.js';
@@ -695,6 +695,8 @@ export class Scheduler {
     const outcome = await this.publisher({
       config: cfg, task, repo: this.layout.repo, branch: pub.branch, head,
       approvals: this.db.approvals(taskId, 'publish', head).map((a) => a.signature),
+      // Bases recorded at claim time: the sensitive-path gate must not depend on the movable local base ref.
+      baseShas: this.db.leases({ taskId, all: true }).map((l) => l.base_sha),
       approvalPublicKeyFile: this.approvalPublicKeyFile,
     });
 
@@ -742,7 +744,9 @@ export class Scheduler {
     }
     let publicKey: string | null = null;
     try { publicKey = readFileSync(this.approvalPublicKeyFile, 'utf8'); } catch { publicKey = null; }
-    const check = verifyApproval(opts.signature, publicKey, { taskId, head: pub.head_sha, now: opts.now });
+    const check = publicKey
+      ? verifyApproval(opts.signature, publicKey, { taskId, head: pub.head_sha, now: opts.now })
+      : { ok: false as const, reason: missingApprovalKeyReason(this.approvalPublicKeyFile) };
     if (!check.ok) {
       throw new MinionsError('POLICY_DENIED', `Approval rejected: ${check.reason}.`,
         `The user re-runs \`minions work approve ${taskId} --head ${pub.head_sha}\` on the host.`);

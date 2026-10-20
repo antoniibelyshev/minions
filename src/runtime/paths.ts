@@ -30,6 +30,20 @@ export function approvalPublicKeyPath(env: NodeJS.ProcessEnv = process.env, inCo
 }
 
 /**
+ * Why no approval public key could be read from `file`, naming the path tried. The host runtime with
+ * MINIONS_CONFIG unset falls back to the container's literal path, which never exists on the host:
+ * that is a misconfigured launch (the shim always sets MINIONS_CONFIG), not a missing first approval.
+ * Verification fails closed either way; this only makes the reason accurate.
+ */
+export function missingApprovalKeyReason(file: string, env: NodeJS.ProcessEnv = process.env, inContainer: boolean = inMinionsContainer()): string {
+  if (!inContainer && env.MINIONS_RUNTIME === 'host' && !env.MINIONS_CONFIG) {
+    return `no approval public key at ${file}: this is the host runtime but MINIONS_CONFIG is unset, so the verifier fell back to the container path; ` +
+      'start the host runtime through `minions start` (its shim sets MINIONS_CONFIG to the runtime config dir that holds the key)';
+  }
+  return `no approval public key at ${file} (the host writes it on the first \`minions work approve\`)`;
+}
+
+/**
  * Agent runtime paths. Defaults are the container paths; the environment overrides them, which is how
  * the host runtime (MINIONS_RUNTIME=host, no Docker) points the same code at <project>/host/...:
  * MINIONS_STATE_DIR (/state), MINIONS_WORKSPACE (/workspace), MINIONS_CONFIG (effective config),
