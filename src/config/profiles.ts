@@ -76,7 +76,7 @@ export function profileDefaults(profile: Profile, ctx: ProfileContext): { config
     sensitivePaths: [...DEFAULT_SENSITIVE_PATHS],
     architecture: owner ? 'decide' : 'propose',
     git: { baseBranch: ctx.baseBranch, identity: { ...ctx.identity } },
-    permissionMode: 'acceptEdits',
+    // coordinator.permissionMode is left unset: the coordinator runs in "auto" (src/runtime/coordinator.ts).
   };
   return { config, notes };
 }

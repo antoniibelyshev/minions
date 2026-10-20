@@ -625,6 +625,19 @@
       ],
       "additionalProperties": false
     },
+    "coordinator": {
+      "type": "object",
+      "properties": {
+        "permissionMode": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "acceptEdits"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
     "permissionMode": {
       "type": "string",
       "enum": [
@@ -653,8 +666,7 @@
     "capabilities",
     "sensitivePaths",
     "architecture",
-    "git",
-    "permissionMode"
+    "git"
   ],
   "additionalProperties": false,
   "$defs": {

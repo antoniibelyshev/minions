@@ -42,7 +42,7 @@ budgets, companion containers.
 - Container reads effective config from a read-only mount; it cannot change config in v0.1.
 - Workspace is seeded from a Git bundle of the host repo's committed HEAD branch (`minions import`), so no GitHub credentials are needed. The real `origin` URL is recorded; it is fetched (over https, via the credential helper) only when a GitHub token is mounted.
 - Commits inside the container use the host's `git config user.name/email` (copied as plain values at init, shown in the plan).
-- Coordinator permission mode defaults to `acceptEdits` with an allowlist for `minions`, `git`, and `backlog` commands. Never `bypassPermissions`.
+- Coordinator permission mode defaults to `auto` (task-36; previously `acceptEdits`) with an allowlist for `minions`, `git`, and `backlog` commands; the deny (push/merge) and ask (approve) rules and `disableBypassPermissionsMode` are emitted unchanged in every mode. `coordinator.permissionMode: "acceptEdits"` opts out. The launch reads the `--permission-mode` choices from `claude --help` and falls back to `acceptEdits` (logged; reported by `coordinator --probe` and doctor) when `auto` is not listed. Never `bypassPermissions`. The deny/ask rules are command patterns that match first, so the classifier cannot approve a literal `git push`, `gh pr merge` or `minions work approve`; equivalent commands they miss (`sh -c 'git push …'`, `gh api` merges, `curl` with the readable token) are judged by the classifier instead of prompting. The boundary for those is the token scope and branch protection (see the remaining trust boundary under [Host-signed publication approvals](#host-signed-publication-approvals)).
 - Pinned in image: base `node:22-bookworm-slim` (digest pinned in Dockerfile), `@anthropic-ai/claude-code@2.1.292`, `backlog.md@1.54.0`. Tested range documented in `docs/compatibility.md`.
 - No `--append-system-prompt-file` exists in Claude Code 2.1.292; the launcher reads the coordinator prompt file and passes it with `--append-system-prompt` as an argv element (no shell).
 
@@ -779,7 +779,8 @@ capabilities: Record<Capability, CapabilityRule>
 sensitivePaths: string[]   // spec §14 defaults
 architecture: 'decide' | 'propose'
 git: { baseBranch: string; identity: { name: string; email: string } }
-permissionMode: 'default' | 'acceptEdits' | 'auto'   // coordinator session; never bypass
+coordinator?: { permissionMode?: 'auto' | 'acceptEdits' }   // coordinator session; unset = auto; never bypass
+permissionMode?: 'default' | 'acceptEdits' | 'auto'   // legacy: only 'default' is still honoured (when coordinator.permissionMode is unset)
 ```
 Schema is `.strict()` everywhere (unknown fields fail). Cross-field checks: `delivery.mode` must be
 supported by this build; `delivery.merge==='auto-when-eligible'` requires `requiredChecksConfigured`

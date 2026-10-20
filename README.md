@@ -357,6 +357,18 @@ Authority is a set of independent capabilities. Each rule is `allow`, `ask`, or 
 - A prompt, task, ticket, or PR comment can't grant a capability.
 - minions keeps three questions separate, and `doctor` reports each one: Is the action **permitted**? Is the needed **credential** available? Can minions **enforce** the restriction mechanically?
 
+### Coordinator permission mode
+
+In the container, the coordinator Claude Code session runs in permission mode **`auto`** by default. The fixed rules stay the same in every mode: `git push` and `gh pr merge` are always denied, `minions work approve` / `minions approve` always ask you, and bypass mode is disabled for the session (`disableBypassPermissionsMode`). minions never launches with `bypassPermissions`, `dontAsk` or `--dangerously-skip-permissions`.
+
+**Trade-off.** With `auto`, a Claude Code classifier decides on actions outside the allow list (for example a Bash command that isn't `minions`, `git` or `backlog`) instead of asking you. You get far fewer prompts, but you are trusting the classifier with calls you would otherwise have reviewed yourself. The deny and ask rules above still match first, so the classifier can't approve a literal `git push`, `gh pr merge` or `minions work approve` (and since publication approvals must be signed on the host, an approval recorded in the container is rejected anyway). Those rules are command patterns, though. Other commands with the same effect that the patterns don't match (for example `sh -c 'git push ...'`, `gh api` calls that merge a PR, or `curl` with the push token, which is readable in the container) are now judged by the classifier instead of by you; under `acceptEdits` they would ask. The real boundary is server-side: a minimal-scope token and branch protection on GitHub (see the remaining trust boundary under [Host-signed publication approvals](docs/design/bootstrap.md#host-signed-publication-approvals)). If you'd rather review every such call, opt back into `acceptEdits`:
+
+```json
+{ "coordinator": { "permissionMode": "acceptEdits" } }
+```
+
+`minions coordinator --probe` (and `doctor`) report which mode the launch will use. If the installed Claude Code doesn't offer `--permission-mode auto`, the coordinator falls back to `acceptEdits`, prints why when it starts, and `doctor` shows a warning. A mode change takes effect when the coordinator restarts. The legacy top-level `permissionMode` key now matters only when it is `"default"` (stricter, still honoured). Its old default value `"acceptEdits"` doesn't opt out; use `coordinator.permissionMode` for that. Worker agents are unaffected. The host runtime always uses `default` (see [Running without Docker](#running-without-docker)).
+
 ## Sensitive changes
 
 Changes to these paths need human approval before publication or merge. Local planning and proposed edits can still be allowed.
