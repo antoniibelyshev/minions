@@ -1,7 +1,7 @@
 // Drain: a durable request that running workers wind down to a safe checkpoint (`minions upgrade`).
 // The request lives in the runtime DB (controls row `drain` + `drain-request` event); a flag file at
 // <state>/run/drain mirrors it so the per-tool-call worker hook can skip node entirely while no drain is
-// active (`[ ! -e <flag> ] || minions hook drain`). Starts stay paused for the whole drain.
+// active (`[ ! -e "<flag>" ] || minions hook drain`). Starts stay paused for the whole drain.
 import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import type { DrainRequest, PauseChange, RuntimeDb } from './db.js';
@@ -37,4 +37,4 @@ export function clearDrain(db: RuntimeDb, p: DrainPaths, by: string): DrainReque
 }
 
 /** The shell gate for the worker drain hook: node starts only while the flag file exists. */
-export const DRAIN_HOOK_COMMAND = '[ ! -e ${MINIONS_STATE_DIR:-/state}/run/drain ] || minions hook drain';
+export const DRAIN_HOOK_COMMAND = '[ ! -e "${MINIONS_STATE_DIR:-/state}/run/drain" ] || minions hook drain';

@@ -173,7 +173,10 @@ const DRAIN_READ_ONLY_TOOLS = new Set(['Read', 'Glob', 'Grep', 'LS', 'NotebookRe
 const DRAIN_GIT = new Set(['add', 'commit', 'status', 'log', 'diff', 'show', 'rev-parse', 'branch', 'ls-files']);
 const DRAIN_SHELL = new Set(['cd', 'pwd', 'ls', 'cat', 'head', 'tail', 'wc', 'echo', 'grep', 'true']);
 
-/** Splits a shell line on unquoted `&&`, `||`, `;`, `|`; stops at an unquoted `<<` (the heredoc body is data). */
+/**
+ * Splits a shell line on unquoted `&&`, `||`, `;`, `|` and a lone `&` (not the `&` of `2>&1`, `>&2`, `&>`);
+ * stops at an unquoted `<<` (the heredoc body is data).
+ */
 function shellSegments(cmd: string): { segments: string[]; redirect: boolean } {
   const segments: string[] = [];
   let cur = '';
@@ -184,9 +187,9 @@ function shellSegments(cmd: string): { segments: string[]; redirect: boolean } {
     if (quote) { if (c === quote) quote = null; else if (c === '\\' && quote === '"') { cur += c + (cmd[++i] ?? ''); continue; } cur += c; continue; }
     if (c === "'" || c === '"') { quote = c; cur += c; continue; }
     if (c === '<' && cmd[i + 1] === '<') break;
-    if (c === '\n' || c === ';' || c === '|' || (c === '&' && cmd[i + 1] === '&')) {
+    if (c === '\n' || c === ';' || c === '|' || (c === '&' && cmd[i - 1] !== '>' && cmd[i + 1] !== '>')) {
       segments.push(cur); cur = '';
-      if ((c === '|' && cmd[i + 1] === '|') || c === '&') i++;
+      if ((c === '|' || c === '&') && cmd[i + 1] === c) i++;
       continue;
     }
     // Output redirection writes files; only `>/dev/null` and `2>&1` are harmless.
@@ -199,7 +202,6 @@ function shellSegments(cmd: string): { segments: string[]; redirect: boolean } {
 
 /** True for Bash lines that only commit, inspect, or submit the result (no edits, no discarding). */
 export function drainSafeBash(command: string): boolean {
-  if (/^\s*(?:cd\s+\S+\s*&&\s*)?minions\s+work\s+(?:submit|brief)\b/.test(command)) return true;
   const { segments, redirect } = shellSegments(command);
   if (redirect || !segments.length) return false;
   return segments.every((s) => {
@@ -208,6 +210,7 @@ export function drainSafeBash(command: string): boolean {
       let i = 1;
       while (words[i] === '-C' || words[i] === '-c') i += 2;
       while (words[i]?.startsWith('--no-pager') || words[i] === '--no-optional-locks') i++;
+      if (words.slice(i + 1).some((w) => w.startsWith('--output'))) return false; // `git diff --output=f` writes f
       return DRAIN_GIT.has(words[i] ?? '') && !(words[i] === 'branch' && words.slice(i + 1).some((w) => /^-[dDmMfc]|^--(delete|move|force|copy)/.test(w)));
     }
     if (words[0] === 'minions') return words[1] === 'work' && (words[2] === 'submit' || words[2] === 'brief');

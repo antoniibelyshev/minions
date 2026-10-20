@@ -517,7 +517,7 @@ date is the source phase. It runs before everything else (see "Upgrade from the 
   start. The pause also records a drain request (runtime DB `controls` row `drain` with reason,
   time and event id, mirrored by the flag file `/state/run/drain`; `status --json` shows `draining`).
   Workers learn about it from a plugin PreToolUse hook on every tool, gated by a shell test
-  (`[ ! -e $MINIONS_STATE_DIR/run/drain ] || minions hook drain`) so node never starts otherwise. It
+  (`[ ! -e "$MINIONS_STATE_DIR/run/drain" ] || minions hook drain`) so node never starts otherwise. It
   acts only on subagents (hook input `agent_id`) of a `minions:<role>` type while an active lease of
   that role exists; the coordinator, other subagents and unleased sessions are never affected. The first
   call adds the checkpoint notice (commit `wip:`, return a partial result listing the remaining work;

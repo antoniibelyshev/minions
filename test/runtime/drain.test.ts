@@ -214,7 +214,7 @@ describe('drain hook gate and phases (tester additions)', () => {
       { hooks: { PreToolUse: { matcher: string; hooks: { command: string }[] }[] } };
     const entry = json.hooks.PreToolUse.find((h) => h.matcher === '*');
     expect(entry?.hooks[0]?.command).toBe(DRAIN_HOOK_COMMAND);
-    expect(DRAIN_HOOK_COMMAND).toContain('${MINIONS_STATE_DIR:-/state}/run/drain');
+    expect(DRAIN_HOOK_COMMAND).toContain('"${MINIONS_STATE_DIR:-/state}/run/drain"');
     // Shell expansion of the default, without touching the real /state.
     const expanded = execFileSync('sh', ['-c', 'echo ${MINIONS_STATE_DIR:-/state}/run/drain'], { env: { PATH: '/usr/bin:/bin' }, encoding: 'utf8' });
     expect(expanded.trim()).toBe('/state/run/drain');
@@ -247,7 +247,37 @@ describe('drain hook gate and phases (tester additions)', () => {
       'git -C /w add -A && git -C /w commit -m "wip: x"',
       "minions work submit lease-1 --role tester --json <<'RESULT'\n{\"status\":\"partial\"}\nRESULT",
       "cd \"/w with space\" && minions work submit lease-1 --role tester --json <<'RESULT'\n{}\nRESULT",
+      "cd /w && minions work submit lease-1 --json <<'RESULT'\n{}\nRESULT",
+      'git status 2>&1 | head -5',
     ]) expect(drainSafeBash(ok), ok).toBe(true);
+  });
+
+  it('drainSafeBash: no submit shortcut, a lone & separates commands, and git --output is rejected', () => {
+    for (const bad of [
+      'minions work submit L --json; git reset --hard',
+      'minions work submit L --json && rm -rf src',
+      'cd /w && minions work submit L --json & git checkout -- .',
+      'git status & rm -rf src',
+      'git status&rm -rf src',
+      'git diff --output=src/a.ts',
+      'git -C /w diff --output src/a.ts HEAD',
+    ]) expect(drainSafeBash(bad), bad).toBe(false);
+  });
+
+  it('the gate handles a state dir with a space: exit 0 without the flag, runs minions with it', () => {
+    const { dir } = gateEnv();
+    const state = join(dir, 'state with space');
+    mkdirSync(join(state, 'run'), { recursive: true });
+    const bin = join(dir, 'bin');
+    mkdirSync(bin);
+    writeFileSync(join(bin, 'minions'), `#!/bin/sh\necho "called $*" >> "${join(dir, 'calls')}"\n`);
+    chmodSync(join(bin, 'minions'), 0o755);
+    const env = { PATH: `${bin}:/usr/bin:/bin`, MINIONS_STATE_DIR: state };
+    expect(runGate(env)).toBe(0);
+    expect(existsSync(join(dir, 'calls'))).toBe(false);
+    writeFileSync(join(state, 'run', 'drain'), '{}');
+    expect(runGate(env)).toBe(0);
+    expect(readFileSync(join(dir, 'calls'), 'utf8')).toBe('called hook drain\n');
   });
 });
 
