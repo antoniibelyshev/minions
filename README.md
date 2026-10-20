@@ -642,7 +642,7 @@ minions auth show [--json]      # method, source, masked env, key file status an
 wins. The `init` wizard asks the same question (JetBrains Central is offered only when `central` is
 on your `PATH`; it is looked up, not run).
 
-`minions doctor` checks the method: for `login`, `claude auth status` inside the container; for keys,
+`minions doctor` checks the method (Docker runtime; the host runtime has no container to check): for `login`, `claude auth status` inside the container; for keys,
 that the key file is present and fresh, the helper resolves on `PATH`, the key is readable inside the
 container, and that `ANTHROPIC_BASE_URL` (when set) answers HTTP from inside the container. Doctor
 makes no API calls that use tokens.
@@ -674,7 +674,7 @@ gets the host `central` binary, your `~/.claude`, the Keychain, or a way to run 
 - Long-lived secrets stay on the host, in macOS Keychain or in 0600 files outside the repository.
 - The Keychain items are created without a `-T` access list, so any process running as your user can read them (normal macOS behaviour; the Keychain protects against other users and offline access, not against your own processes). The plaintext GitHub/Telegram token copies mounted into the container (`secrets/` in the project directory) are removed by `minions down`/uninstall, when `minions start` fails, or when `minions doctor` finds them with no running container. The host-provisioned Claude key copy in the same directory stays until you switch back to `login` or uninstall (each `minions start` re-provisions it).
 - Configuration holds references only.
-- GitHub access in v0.1 is a per-project fine-grained personal access token that you create and store with `minions auth github`. The host materializes it into a read-only secret file for the container. It is long-lived and not refreshed, so keep its scope minimal and its expiry short (see [GitHub credential](docs/design/bootstrap.md#github-credential)). Host-refreshed GitHub App installation tokens are planned (deferred).
+- GitHub access in v0.1 is a per-project fine-grained personal access token that you create and store with `minions auth github`. The host materializes it into a read-only secret file for the container (Docker runtime; the host runtime has no container, so its `gh` and git shims read the stored token file on the host). It is long-lived and not refreshed, so keep its scope minimal and its expiry short (see [GitHub credential](docs/design/bootstrap.md#github-credential)). Host-refreshed GitHub App installation tokens are planned (deferred).
 - Tokens, environment dumps, and private task payloads are never logged, and logs are kept bounded with predictable secret values redacted.
 - Issue, PR, and repository content is treated as untrusted. External commands use argument arrays, never shell strings built from that content.
 

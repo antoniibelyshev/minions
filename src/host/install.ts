@@ -430,7 +430,7 @@ async function prepare(opts: InitOptions, docker?: DockerStatus): Promise<Prepar
         'Repository is imported into the container from a Git bundle of committed history on first start.',
       ]),
       ...(discovery.git.hasGitHub ? [
-        `Optional GitHub token (mounted read-only at ${GITHUB_TOKEN_CONTAINER_PATH}; needed for upcoming push/PR delivery):`,
+        `Optional GitHub token (mounted read-only at ${GITHUB_TOKEN_CONTAINER_PATH}; needed for branch/pull-request delivery):`,
         ...githubTokenGuidance(discovery.git.remoteUrl).map((l) => `  ${l}`),
       ] : []),
       // Printed only: the installer never writes workflow files or changes branch protection.
