@@ -17,7 +17,16 @@ export interface BacklogMdOptions {
   timeoutMs?: number;
   /** Max concurrent `task view` calls in listTasks. */
   concurrency?: number;
+  /** Provenance of a task whose meta block is missing, malformed or has no valid provenance (see toTask). */
+  provenanceFallback?: ProvenanceFallback;
 }
+
+/**
+ * Provenance for a task without a usable meta provenance; undefined keeps DEFAULT_PROVENANCE. The runtime
+ * maps tasks that GitHub intake tracks to `external-requirement`, so a lost meta block never upgrades an
+ * imported issue to the most trusted value.
+ */
+export type ProvenanceFallback = (taskId: string) => Provenance | undefined;
 
 export const TASK_STATUSES: readonly TaskStatus[] = ['idea', 'ready', 'implementing', 'testing', 'reviewing',
   'changes-requested', 'awaiting-human', 'awaiting-ci', 'merging', 'done', 'delivered', 'blocked', 'cancelled'];
@@ -140,12 +149,24 @@ function mapPriority(p: string | null | undefined): Task['priority'] {
   return v === 'high' || v === 'medium' || v === 'low' ? v : null;
 }
 
-export function toTask(raw: RawTask, opts: { startReady?: boolean } = {}): Task {
+export function toTask(raw: RawTask, opts: { startReady?: boolean; provenanceFallback?: ProvenanceFallback } = {}): Task {
   const { user, meta } = parseDescription(raw.description);
+  const id = normalizeId(raw.id);
+  let provenance: Provenance;
+  if (PROVENANCES.includes(meta.provenance as Provenance)) {
+    provenance = meta.provenance as Provenance;
+  } else {
+    try {
+      provenance = opts.provenanceFallback?.(id) ?? DEFAULT_PROVENANCE;
+    } catch {
+      // If the fallback throws, use the default provenance
+      provenance = DEFAULT_PROVENANCE;
+    }
+  }
   const labels = raw.labels ?? [];
   const strArr = (v: unknown) => (Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : []);
   return {
-    id: normalizeId(raw.id),
+    id,
     locator: `backlogmd:${raw.id.toUpperCase()}`,
     title: raw.title ?? '',
     description: user,
@@ -160,7 +181,7 @@ export function toTask(raw: RawTask, opts: { startReady?: boolean } = {}): Task 
     branch: typeof meta.branch === 'string' ? meta.branch : null,
     commits: strArr(meta.commits),
     prUrl: typeof meta.prUrl === 'string' ? meta.prUrl : null,
-    provenance: PROVENANCES.includes(meta.provenance as Provenance) ? (meta.provenance as Provenance) : DEFAULT_PROVENANCE,
+    provenance,
     version: taskVersion(raw),
     milestone: raw.milestone ?? null,
   };
@@ -177,6 +198,7 @@ export class BacklogMdAdapter implements BacklogAdapter {
   private readonly startReady: boolean;
   private readonly timeoutMs: number;
   private readonly concurrency: number;
+  private readonly provenanceFallback?: ProvenanceFallback;
   private initialized = false;
 
   constructor(opts: BacklogMdOptions) {
@@ -186,6 +208,7 @@ export class BacklogMdAdapter implements BacklogAdapter {
     this.startReady = !!opts.startReady;
     this.timeoutMs = opts.timeoutMs ?? 30_000;
     this.concurrency = Math.max(1, opts.concurrency ?? 4);
+    this.provenanceFallback = opts.provenanceFallback;
   }
 
   private async cli(args: string[]): Promise<string> {
@@ -231,7 +254,7 @@ export class BacklogMdAdapter implements BacklogAdapter {
     return (r.tasks ?? []).filter((t) => typeof t.id === 'string' && !t.archived);
   }
 
-  private task(raw: RawTask): Task { return toTask(raw, { startReady: this.startReady }); }
+  private task(raw: RawTask): Task { return toTask(raw, { startReady: this.startReady, provenanceFallback: this.provenanceFallback }); }
 
   /** Views ids with bounded concurrency; failed lookups are undefined when tolerant. */
   private async viewMany(ids: string[], tolerant: boolean): Promise<(RawTask | undefined)[]> {

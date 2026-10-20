@@ -1,6 +1,6 @@
 import { readFile } from 'node:fs/promises';
 import { Option, type Command } from 'commander';
-import { setIdempotencyStore, setIntakePausedContext, setReadyContext } from '../backlog/commands.js';
+import { setIdempotencyStore, setIntakePausedContext, setProvenanceFallback, setReadyContext } from '../backlog/commands.js';
 import { openBacklog, writeBacklogConfig } from '../backlog/factory.js';
 import type { BacklogAdapter, IdempotencyStore } from '../backlog/types.js';
 import { validateConfig } from '../config/resolve.js';
@@ -29,7 +29,7 @@ import { runtimePaths } from './paths.js';
 import { capacityOf, LEASE_ROLES, Scheduler } from './scheduler.js';
 import { gitCredential } from './github.js';
 import { ciStatus, formatCiStatus, formatSync, syncTasks, type SyncReport } from './ci.js';
-import { formatIntake, originRepository, syncIntake, type IntakeSyncReport } from './intake-sync.js';
+import { formatIntake, intakeProvenanceFallback, originRepository, syncIntake, type IntakeSyncReport } from './intake-sync.js';
 import { ghWithTimeout, type GhFn } from './publish.js';
 import { exportWorkspace, importWorkspace, setupState } from './workspace.js';
 import { git, workspaceLayout } from './worktree.js';
@@ -55,7 +55,7 @@ const lazyIdempotency: IdempotencyStore = {
 };
 
 async function getBacklog(): Promise<BacklogAdapter> {
-  return (backlog ??= openBacklog(await getConfig(), { idempotency: lazyIdempotency, root: runtimePaths().backlog }));
+  return (backlog ??= openBacklog(await getConfig(), { idempotency: lazyIdempotency, root: runtimePaths().backlog, provenanceFallback: intakeProvenanceFallback(getDb) }));
 }
 
 async function context() {
@@ -82,7 +82,8 @@ const STARTUP_INTAKE_GRACE_MS = 2_000;
 
 /**
  * Coordinator startup: one intake pass when intake.github is enabled. Bounded by `budgetMs`: the pass
- * is aborted (gh calls are killed at the budget too) and, should it still not return, the coordinator
+ * is aborted (in-flight gh children are killed on the abort, SIGTERM then SIGKILL after 2 s; also when
+ * `stop` aborts) and, should it still not return, the coordinator
  * starts without waiting for it; the next `minions sync` completes the import.
  */
 export const intakeOnStart = async (
@@ -101,7 +102,8 @@ export const intakeOnStart = async (
     timers.push(setTimeout(() => ctl.abort(), budgetMs));
     timers.push(setTimeout(() => resolve(null), budgetMs + STARTUP_INTAKE_GRACE_MS));
   });
-  const pass = sync({ signal: ctl.signal, gh: ghWithTimeout(budgetMs) });
+  // The gh children share the pass signal: the budget abort and the pre-spawn guard (`stop`) kill them.
+  const pass = sync({ signal: ctl.signal, gh: ghWithTimeout(budgetMs, ctl.signal) });
   pass.catch(() => { /* reported below when it settles in time; ignored after the start */ });
   try {
     const r = await Promise.race([pass, late]);
@@ -249,6 +251,7 @@ export function register(program: Command): void {
       return { leased: new Set(d.activeLeases().map((l) => l.task_id)), paused: d.paused().starts };
     });
     setIntakePausedContext(() => getDb().paused().intake);
+    setProvenanceFallback(intakeProvenanceFallback(getDb));
   }
 
   // work
