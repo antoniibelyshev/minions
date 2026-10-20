@@ -184,6 +184,8 @@ const DRAIN_SHELL = new Set(['cd', 'pwd', 'ls', 'cat', 'head', 'tail', 'wc', 'ec
  * - Command and process substitution (`$( )`, backticks, `<( )`, `>( )`) outside single quotes is null,
  *   except the literal commit message form `$(cat <<'EOF' ... EOF\n)`, which becomes one opaque word.
  * - Here-strings (`<<<`), ANSI-C quotes (`$'...'`) and unterminated quotes are null. A `#` at a word start comments out the line.
+ * - A backslash-newline outside single quotes and outside a quoted-delimiter heredoc body is null: bash
+ *   removes it before tokenizing, so it could split a construct this parser detects by peeking ahead.
  * - `redirect` is set for output redirection other than `>/dev/null` and `2>&1`.
  */
 function shellSegments(cmd: string): { segments: string[][]; redirect: boolean } | null {
@@ -194,6 +196,7 @@ function shellSegments(cmd: string): { segments: string[][]; redirect: boolean }
   let quote: '"' | "'" | null = null;
   let redirect = false;
   let heredocs: { delim: string; strip: boolean; literal: boolean }[] = [];
+  let gtAt = -2; // index of the last unquoted `>` operator character
   const endWord = () => { if (inWord) words.push(word); word = ''; inWord = false; };
   const endSegment = () => { endWord(); if (words.length) segments.push(words); words = []; };
   let i = 0;
@@ -204,7 +207,10 @@ function shellSegments(cmd: string): { segments: string[][]; redirect: boolean }
     if (c === '\\') {
       const n = cmd[i + 1];
       if (n === undefined) return null;
-      if (n !== '\n') word += quote && !'$`"\\'.includes(n) ? c + n : n; // `\<newline>` is a line continuation
+      // bash deletes `\<newline>` before tokenizing, so it can split any multi-character construct this
+      // parser detects by peeking (`$(`, `<(`, `<<`, `$'`, a heredoc delimiter, `>&1`). Not modeled: fail closed.
+      if (n === '\n') return null;
+      word += quote && !'$`"\\'.includes(n) ? c + n : n;
       inWord = true; i += 2; continue;
     }
     if (c === '$' && cmd[i + 1] === '(') {
@@ -225,7 +231,8 @@ function shellSegments(cmd: string): { segments: string[][]; redirect: boolean }
       const strip = cmd[j] === '-';
       if (strip) j++;
       while (cmd[j] === ' ' || cmd[j] === '\t') j++;
-      const m = /^(?:'([^'\n]+)'|"([^"$`\\\n]+)"|([\w.-]+))/.exec(cmd.slice(j));
+      // The delimiter must end at a word boundary: bash joins `E'X'` or `EOF#x` into one delimiter word.
+      const m = /^(?:'([^'\n]+)'|"([^"$`\\\n]+)"|([\w.-]+))(?=$|[ \t\n;&|<>()])/.exec(cmd.slice(j));
       if (!m) return null;
       heredocs.push({ delim: (m[1] ?? m[2] ?? m[3])!, strip, literal: m[3] === undefined });
       endWord(); i = j + m[0].length; continue;
@@ -236,13 +243,19 @@ function shellSegments(cmd: string): { segments: string[][]; redirect: boolean }
       heredocs = [];
       continue;
     }
-    if (c === ';' || c === '|' || (c === '&' && cmd[i - 1] !== '>' && cmd[i + 1] !== '>')) {
+    // A `&` right after an unquoted `>` operator is part of `>&`; an escaped or quoted `>` is not an operator.
+    if (c === ';' || c === '|' || (c === '&' && gtAt !== i - 1 && cmd[i + 1] !== '>')) {
       endSegment();
       i += (c === '|' || c === '&') && cmd[i + 1] === c ? 2 : 1;
       continue;
     }
     // Output redirection writes files; only `>/dev/null` and `2>&1` are harmless.
-    if (c === '>' && !/^>\s*\/dev\/null(?=$|[\s;&|])/.test(cmd.slice(i)) && !(cmd[i - 1] === '2' && cmd.startsWith('>&1', i))) redirect = true;
+    // `2>&1x` and `>/dev/null"x"` name other files, so the target must end at a word boundary.
+    if (c === '>') {
+      gtAt = i;
+      const rest = cmd.slice(i);
+      if (!/^>[ \t]*\/dev\/null(?=$|[\s;&|])/.test(rest) && !(cmd[i - 1] === '2' && /^>&1(?=$|[\s;&|])/.test(rest))) redirect = true;
+    }
     if (c === ' ' || c === '\t') { endWord(); i++; continue; }
     word += c; inWord = true; i++;
   }
@@ -256,13 +269,16 @@ function shellSegments(cmd: string): { segments: string[][]; redirect: boolean }
  * terminator line, or -1 when there is none or an expanded body (unquoted delimiter) contains a substitution
  * or a backslash line continuation.
  */
-function heredocBodyEnd(cmd: string, from: number, delim: string, strip: boolean, literal: boolean): number {
+function heredocBodyEnd(cmd: string, from: number, delim: string, strip: boolean, literal: boolean, comsub = false): number {
   let pos = from;
   while (pos < cmd.length) {
     const nl = cmd.indexOf('\n', pos);
     const next = nl < 0 ? cmd.length : nl + 1;
     const line = cmd.slice(pos, nl < 0 ? cmd.length : nl);
-    if ((strip ? line.replace(/^\t+/, '') : line) === delim) return next;
+    const bare = strip ? line.replace(/^\t+/, '') : line;
+    if (bare === delim) return next;
+    // Inside `$( )` bash also ends the body at a line like `EOF)` or `EOF )`; any such line is refused.
+    if (comsub && bare.startsWith(delim)) return -1;
     // The shell joins `\<newline>` lines of an expanded body before matching the terminator; not modeled.
     if (!literal && (line.includes('$(') || line.includes('`') || line.endsWith('\\'))) return -1;
     pos = next;
@@ -274,7 +290,7 @@ function heredocBodyEnd(cmd: string, from: number, delim: string, strip: boolean
 function catHeredocEnd(cmd: string, at: number): number {
   const m = /^\$\(\s*cat\s*<<(-?)\s*'([^'\n]+)'[ \t]*\n/.exec(cmd.slice(at));
   if (!m) return -1;
-  const body = heredocBodyEnd(cmd, at + m[0].length, m[2]!, m[1] === '-', true);
+  const body = heredocBodyEnd(cmd, at + m[0].length, m[2]!, m[1] === '-', true, true);
   if (body < 0) return -1;
   const close = /^\s*\)/.exec(cmd.slice(body));
   return close ? body + close[0].length : -1;

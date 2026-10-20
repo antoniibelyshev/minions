@@ -376,6 +376,48 @@ describe('drain hook gate and phases (tester additions)', () => {
     ]) expect(drainSafeBash(ok), ok).toBe(true);
   });
 
+  it('drainSafeBash: a backslash-newline outside single quotes fails closed (task-3.9, tester attempt 2)', () => {
+    for (const bad of [
+      // Each of these ran `touch` in bash: the continuation splits a construct the parser peeks for.
+      "cat <<E\\\nOF\nEOF\ntouch /tmp/p5\nE\n",
+      "echo $\\\n(touch /tmp/p6)",
+      'echo "$\\\n(touch /tmp/p7)"',
+      "cat <\\\n(touch /tmp/p8)",
+      "cat <\\\n<true\necho '\ntrue\ntouch /tmp/p9\necho '\n",
+      "echo $\\\n'\\''\ntouch /tmp/p10\necho '",
+      // Same class, other constructs: `>&`, `2>&1`, a plain word.
+      'git status >\\\n&1',
+      'git status 2>\\\n&1',
+      'echo a\\\nb',
+    ]) expect(drainSafeBash(bad), JSON.stringify(bad)).toBe(false);
+    // Literal text keeps backslash-newlines: single quotes and quoted-delimiter heredoc bodies.
+    for (const ok of [
+      "echo 'a\\\nb'",
+      "minions work submit lease-1 --json <<'RESULT'\n{\"summary\": \"a \\\\\n b\"}\nRESULT",
+      "git add -A && git commit -m \"$(cat <<'EOF'\nwip: a \\\nb\nEOF\n)\"",
+    ]) expect(drainSafeBash(ok), JSON.stringify(ok)).toBe(true);
+  });
+
+  it('drainSafeBash: tokens bash joins differently from the peeking parser fail closed (task-3.9)', () => {
+    for (const bad of [
+      // The delimiter word continues past the matched part: bash's delimiter is `EX` / `EOF#x`.
+      "cat <<E'X'\nEX\ntouch /tmp/p\nE\n",
+      'cat <<EOF#x\nEOF#x\ntouch /tmp/p\nEOF\n',
+      // An escaped `>` is not an operator, so the `&` after it separates commands.
+      'echo \\>& touch /tmp/p',
+      // `>&1x` and `>/dev/null"x"` write other files.
+      'git status 2>&1x',
+      'git status 2>&1"x"',
+      'git status >/dev/null"x"',
+      // Inside `$( )` bash ends the heredoc at `EOF)` or `EOF )`, so the next lines run.
+      "echo \"$(cat <<'EOF'\nwip\nEOF)\"\ntouch /tmp/p\nEOF\n)\"",
+      "echo \"$(cat <<-'EOF'\n\twip\n\tEOF )\"\ntouch /tmp/p\nEOF\n)\"",
+    ]) expect(drainSafeBash(bad), JSON.stringify(bad)).toBe(false);
+    for (const ok of ['git status 2>&1', 'git status &>/dev/null', 'cat <<EOF;\nx\nEOF', 'cat <<EOF|head\nx\nEOF']) {
+      expect(drainSafeBash(ok), JSON.stringify(ok)).toBe(true);
+    }
+  });
+
   it('drainSafeBash: git -c and git commit --amend are rejected (task-3.9)', () => {
     for (const bad of [
       'git -c core.fsmonitor=x status',
