@@ -2,7 +2,7 @@ import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { hookLog, MAX_LOG_BYTES, preAgentHook, preTelegramHook, runHook, stopHook } from '../../src/runtime/hooks.js';
-import { makeEnv, tmp, type Env } from './fixtures.js';
+import { commitFile, makeEnv, result, tmp, type Env } from './fixtures.js';
 
 let stateDir: string;
 beforeAll(() => { stateDir = tmp('minions-hooks-'); process.env.MINIONS_STATE_DIR = stateDir; });
@@ -119,6 +119,17 @@ describe('pre-agent hook', () => {
     expect(gone.hookSpecificOutput.permissionDecision).toBe('deny');
     expect(gone.hookSpecificOutput.permissionDecisionReason).toMatch(/No active engineer lease/);
     expect(decision(await preAgentHook(agent('minions:engineer-deep', 'go'), loader(env))).hookSpecificOutput.permissionDecisionReason).toMatch(/--role engineer/);
+  });
+
+  it('denies minions:engineer-deep under a tester lease', async () => {
+    const env = makeEnv();
+    env.backlog.add({ id: 'task-1' });
+    const eng = await env.sched.claim('task-1', 'engineer');
+    const head = commitFile(eng.worktree, 'a.txt', 'x');
+    await env.sched.record(eng.leaseId, result({ branch: eng.branch, headSha: head }));
+    const tester = await env.sched.claim('task-1', 'tester');
+    const r = decision(await preAgentHook(agent('minions:engineer-deep', tester.briefMarker), loader(env)));
+    expect(r.hookSpecificOutput.permissionDecision).toBe('deny');
   });
 
   it('denies a full model id as the Agent model and allows aliases or an omitted model', async () => {
