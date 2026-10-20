@@ -630,7 +630,7 @@ date is the source phase. It runs before everything else (see "Upgrade from the 
   commands must match one of three heredoc forms as a whole string, with single-quoted delimiters and
   an unparsed body: the result-contract submit (`minions work submit … --json <<'RESULT'`), the Claude
   Code commit (`git commit -m "$(cat <<'EOF'` … `EOF` `)"`, nothing after) and `git commit -F - <<'EOF'`,
-  each optionally preceded by `cd <path> &&` (commit forms also by `git add … &&`). A hook error allows the call, except for a leased worker during
+  each optionally preceded by `cd <path> &&` (commit forms also by `git add … &&`). The drain is a cooperative safeguard, not a sandbox: allowed git commands can run programs set in repo config/attributes (core.fsmonitor, diff.external, filter/textconv drivers, commit hooks), and `git -C <path>` or `cd <path>` can point at a repo with pre-staged config; this residual is accepted as the same trust class as worker code already running. A hook error allows the call, except for a leased worker during
   a drain, which is restricted the same way. The coordinator needs no new wake-up: worker completions
   wake it, claims are refused while starts are paused, and a partial from a lease that was active when
   a drain was requested is recorded with `drain: true` (not a failed attempt or a repair cycle). The

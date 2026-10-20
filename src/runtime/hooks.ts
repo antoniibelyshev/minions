@@ -193,6 +193,11 @@ const DRAIN_READ_ONLY_TOOLS = new Set(['Read', 'Glob', 'Grep', 'LS', 'NotebookRe
  *   body line may start with `EOF` (inside `$( )` bash also ends the body at a line like `EOF)`).
  * - `[cd <path> && ][git add … && ]git commit -F - <<'EOF'\n<body>\nEOF[\n]`, no body line exactly `EOF`.
  * The delimiters are single-quoted, so the shell never expands the body.
+ *
+ * This drain is a cooperative safeguard, not a sandbox: allowed git commands can run programs set in
+ * repo config/attributes (core.fsmonitor, diff.external, filter/textconv drivers, commit hooks), and
+ * `git -C <path>` or `cd <path>` can point at a repo with pre-staged config. This residual is accepted
+ * as the same trust class as worker code already running.
  */
 interface ShellWord { text: string; quoted: boolean }
 type ShellToken = { kind: 'and' | 'pipe' } | { kind: 'redirect'; text: string } | { kind: 'word'; word: ShellWord };
@@ -384,7 +389,7 @@ export function drainNotice(role: LeaseRole, reason: string): string {
     : role === 'tester'
       ? `${head}: reach a safe checkpoint now. If you changed tests, commit them on your branch (message prefix \`wip:\`); if you have nothing to commit, return a partial WorkerResult right away. List the remaining testing in findings and nextAction.`
       : `${head}: reach a safe checkpoint now. Commit work in progress on your branch (message prefix \`wip:\`), then return a partial WorkerResult that lists the remaining work.`;
-  return `${what} Never discard uncommitted changes (no reset, checkout, restore, clean or stash). After about ${DRAIN_GRACE_CALLS} more tool calls only read-only tools, git (add/commit/status/log/diff) and \`minions work submit\` are allowed.`;
+  return `${what} Never discard uncommitted changes (no reset, checkout, restore, clean or stash). After about ${DRAIN_GRACE_CALLS} more tool calls only read-only tools, git status|log|diff|show|rev-parse, git add <paths|-A|-u>, git commit -m "<quoted msg>" or the $(cat <<'EOF' … EOF) / -F - <<'EOF' forms (no --amend, no -a), cd <path> && …, and minions work submit|brief <lease> [--role <r>] --json are allowed.`;
 }
 
 const addContext = (text: string, reason: string): HookOutput => ({
@@ -395,9 +400,10 @@ const addContext = (text: string, reason: string): HookOutput => ({
  * PreToolUse(every tool) drain hook; the plugin runs it only while the drain flag file exists. It acts
  * only on minions worker subagents (hook input `agent_id` + a `minions:<role>` `agent_type`) while an
  * active lease of that role exists: the first call gets the checkpoint notice as context, then after
- * DRAIN_GRACE_CALLS everything but read-only tools, git and `minions work submit` is denied. The
- * coordinator (no agent_id), other subagents and unleased sessions are always allowed. An error allows
- * the call, except for a minions worker during a drain, which is restricted (fails closed).
+ * DRAIN_GRACE_CALLS everything but read-only tools, the Handback tool, and allowlisted Bash commands
+ * is denied (see `drainSafeBash` for the allowlist). The coordinator (no agent_id), other subagents and
+ * unleased sessions are always allowed. An error allows the call, except for a minions worker during a
+ * drain, which is restricted (fails closed).
  */
 export async function drainHook(input: unknown, load: DrainLoader): Promise<HookOutput> {
   const inp = isObj(input) ? input : {};
@@ -416,11 +422,11 @@ export async function drainHook(input: unknown, load: DrainLoader): Promise<Hook
     const hits = db.drainHit(drain.eventId, agentId);
     if (hits === 1) return addContext(drainNotice(role, drain.reason), `context: drain notice to ${agentType} ${agentId}`);
     if (hits <= DRAIN_GRACE_CALLS + 1 || drainAllowed(tool, ti)) return { reason: `allow: ${agentType} ${agentId} ${tool} during drain (call ${hits})` };
-    return deny(`Drain in progress (${drain.reason}): only read-only tools, git (add/commit/status/log/diff) and \`minions work submit\` are allowed now. ` +
-      'Commit work in progress on your branch (message prefix `wip:`), then return a partial WorkerResult that lists the remaining work. Uncommitted changes are never discarded.');
+    return deny(`Drain in progress (${drain.reason}): git status|log|diff|show|rev-parse, git add <paths|-A|-u>, git commit -m "<quoted msg>" or the $(cat <<'EOF' … EOF) / -F - <<'EOF' forms, cd <path> && …, and minions work submit|brief are allowed. ` +
+      'Commit work in progress (`wip:`), then return a partial WorkerResult listing the remaining work. Uncommitted changes are never discarded.');
   } catch (e) {
     if (drainAllowed(tool, ti)) return { reason: `allow: ${tool} (drain state unreadable: ${(e as Error).message})` };
-    return deny(`minions could not read the drain state (${(e as Error).message}); while a drain is pending only read-only tools, git and \`minions work submit\` are allowed. Commit work in progress (\`wip:\`) and return a partial WorkerResult.`);
+    return deny(`minions could not read the drain state (${(e as Error).message}); while a drain is pending git status|log|diff|show|rev-parse, git add <paths|-A|-u>, git commit, cd <path> && …, and minions work submit|brief are allowed. Commit work in progress (\`wip:\`) and return a partial WorkerResult.`);
   }
 }
 
