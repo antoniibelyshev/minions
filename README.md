@@ -1,6 +1,6 @@
 # minions
 
-minions installs a small Claude Code development team into a Git project on your Mac. A **coordinator** takes requests from a terminal or Telegram, keeps an execution backlog, and hands bounded pieces of work to **engineer**, **tester**, and **reviewer** workers. It delivers the results as local commits, branches, or GitHub pull requests.
+minions installs a small Claude Code development team into a Git project on your Mac. A **coordinator** takes requests from a terminal or Telegram, keeps an execution backlog, and hands bounded pieces of work to **engineer**, **reviewer**, and (for QA) **tester** workers. It delivers the results as local commits, branches, or GitHub pull requests.
 
 Everything the model controls runs inside one Docker container per project. Your Mac runs only a small, trusted `minions` CLI. (You can explicitly opt into a less safe **host runtime** without Docker; see [Running without Docker](#running-without-docker).) That CLI installs the team, starts and stops the container, provisions the credentials you grant, and handles explicit import and export.
 
@@ -188,9 +188,9 @@ Talk to the coordinator in plain language in the attached terminal, or over Tele
 The coordinator turns each goal into backlog tasks with acceptance criteria and dispatches them:
 
 1. **Claim.** A helper takes a lease on the task. A task can't be claimed twice, and each task has only one active stage at a time.
-2. **Engineer.** Implements the task on `agent/<task-slug>` in its own worktree, branched from the configured base branch (not necessarily `main`).
-3. **Tester.** Runs after the engineer, never at the same time on the same branch. It runs the project's verification commands and may add tests within scope.
-4. **Reviewer.** Inspects the exact head commit in a separate checkout and returns a structured verdict. The reviewer never fixes production code and never publishes merges.
+2. **Engineer.** Implements the task on `agent/<task-slug>` in its own worktree, branched from the configured base branch (not necessarily `main`). It adds or updates tests for the acceptance criteria and runs the verification commands.
+3. **Tester (only when the task needs QA).** See [Testing](#testing). Runs after the engineer, never at the same time on the same branch.
+4. **Reviewer.** Inspects the exact head commit in a separate checkout and returns a structured verdict. It owns test adequacy: missing or weak tests are a reason to request changes. The reviewer never fixes production code and never publishes merges.
 5. **Deliver.** Commit, push, open a PR, or request a merge, depending on configuration.
 
 Each worker receives a compact task brief: objective, acceptance criteria, non-goals, relevant decisions and files, branch, worktree, expected head, authorized commands, model, and attempt limit. Each worker returns a validated result with one of these statuses: `complete`, `needs_changes`, `blocked`, `needs_split`, or `partial`. A malformed result gets one correction attempt. After that it is stored as unvalidated and is never promoted to an approval.
@@ -198,6 +198,25 @@ Each worker receives a compact task brief: objective, acceptance criteria, non-g
 If a task turns out to be too large, the worker reports `needs_split`. The coordinator then creates child tasks idempotently, links their dependencies, and keeps the parent as a tracking task. The parent closes only when its required children and its own acceptance criteria are done.
 
 After three repair cycles on a task (configurable), the coordinator replans instead of retrying again.
+
+### Testing
+
+Testing is risk-based. Per-ticket testers mostly re-ran the suite; the problems worth a tester were integration and system-level ones. So by default a task goes **engineer → reviewer → delivered**:
+
+- The **engineer** writes and updates tests for the acceptance criteria and runs the verification commands.
+- The **reviewer** judges whether those tests are meaningful and cover the criteria and edge cases, and requests changes if not.
+
+A task gets a **tester stage** (status `testing`, before delivery) only when it needs QA:
+
+- it has a QA label: `qa` by default, or the labels in `verification.qaLabels`. The coordinator adds one for risky tasks;
+- its branch touches a [sensitive path](#sensitive-changes) (checked against the diff and the engineer's `modifiedPaths`);
+- the reviewer sets `"needsQa": true` in its result. An approval with `needsQa` moves the task to `testing` instead of delivered, and it comes back to review afterwards.
+
+The last two are recorded on the task as its first QA label (plus a `qa-required` event), so later stages and publication apply the same requirement. A reviewer approval, and publication, need passing tester evidence for the exact head whenever the task needs QA.
+
+**QA sweeps.** Testers mainly run QA sweeps against the base branch, not a ticket branch. The coordinator schedules one at a milestone, before a release, after several merges (about five), or when you ask. A sweep is a backlog task labelled `qa-sweep`, claimed with `--role tester`. The tester works in a detached worktree at the base head and commits nothing. It checks end-to-end flows, install and upgrade paths, and regressions across features. Recording the sweep closes it as `done`, and the coordinator creates one backlog task per finding. There is no separate command for this: ask the coordinator ("run a QA sweep").
+
+To keep the old flow, with a tester for every task, set `verification.testerRequired` to `true`. The tester-evidence gate then applies to every approval and publication, as before.
 
 ### Built-in skills
 
@@ -240,6 +259,8 @@ idea → ready → implementing → testing → reviewing → awaiting-ci → me
                      └── changes-requested ←─┘
 Also: blocked · awaiting-human · cancelled
 ```
+
+`testing` happens only for tasks that need QA (see [Testing](#testing)); otherwise `implementing` goes straight to `reviewing`.
 
 Local and PR-only workflows can end a task at **delivered**. Reports keep that distinct from **merged**, because an open PR is not a merged task.
 
@@ -292,7 +313,7 @@ v0.1 supports `local`, `branch`, and `pull-request` delivery. `auto-when-eligibl
 - publication and merge capabilities are allowed
 - the head SHA is the expected one
 - a current, valid, independent review exists
-- the tester and local verification evidence required by config exist
+- the tester evidence (when the task needs QA, see [Testing](#testing)) and local verification evidence exist
 - required CI checks are configured and GitHub's requirements are satisfied
 - any sensitive-change approval has been given
 - no admin or bypass merge flag is used
@@ -391,7 +412,7 @@ Tightening permissions suspends the affected external actions immediately. A wor
   "execution": { "maxActiveTasks": 2, "maxEngineers": 2, "maxRepairCyclesBeforeReplan": 3, "attemptMaxTurns": 80 },
   "models": { "default": "sonnet", "allowed": ["sonnet", "opus", "haiku"], "selection": "coordinator" },
   "delivery": { "mode": "pull-request", "merge": "auto-when-eligible", "method": "squash", "requiredChecksConfigured": false },
-  "verification": { "commands": [], "testerRequired": true, "reviewerRequired": true },
+  "verification": { "commands": [], "testerRequired": false, "reviewerRequired": true, "qaLabels": ["qa"] },
   "communication": { "channel": "auto", "progress": "milestones" },
   "budgets": { "taskUsd": null, "dailyUsd": null }
 }

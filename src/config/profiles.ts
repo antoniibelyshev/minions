@@ -69,7 +69,7 @@ export function profileDefaults(profile: Profile, ctx: ProfileContext): { config
       provider: prDelivery ? 'github' : 'none', mode: prDelivery ? 'pull-request' : 'local', merge: 'disabled', method: 'squash', deleteMergedBranches: true,
       identityMode: 'git-identity', requireIndependentApproval: true, requiredChecksConfigured: false,
     },
-    verification: { commands: [], testerRequired: true, reviewerRequired: true, ciAuthority: 'none' },
+    verification: { commands: [], testerRequired: false, reviewerRequired: true, ciAuthority: 'none' },
     communication: { channel: 'auto', progress: 'milestones' },
     budgets: { taskUsd: null, dailyUsd: null },
     capabilities: defaultCapabilities(profile),

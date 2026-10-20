@@ -113,8 +113,11 @@ export const MinionsConfigSchema = z.object({
   }).strict(),
   verification: z.object({
     commands: z.array(nonEmpty),
+    /** true: every task gets a tester stage (the old flow). false: only tasks that need QA (qaLabels, sensitive paths, reviewer needsQa). */
     testerRequired: z.boolean(),
     reviewerRequired: z.boolean(),
+    /** Labels that opt a task into a tester stage; the first is added when the runtime records a QA need. Default ["qa"]. */
+    qaLabels: z.array(nonEmpty).min(1).optional(),
     ciAuthority: z.enum(['none', 'github']),
   }).strict(),
   communication: z.object({

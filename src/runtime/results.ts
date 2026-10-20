@@ -31,6 +31,8 @@ export const WorkerResultSchema = z.object({
   findings: z.array(FindingSchema),
   nextAction: text,
   verdict: z.enum(['approve', 'request-changes']).optional(),
+  /** Reviewer only: the change needs a tester (QA) stage before delivery; recorded on the task as a QA label. */
+  needsQa: z.boolean().optional(),
   usage: z.object({
     inputTokens: z.number().int().min(0).optional(),
     outputTokens: z.number().int().min(0).optional(),
@@ -78,6 +80,7 @@ export function validateResult(raw: unknown, role?: LeaseRole): ValidationOutcom
   const res = r.data;
   const errors: string[] = [];
   if (role && role !== 'reviewer' && res.verdict !== undefined) errors.push(`verdict: only reviewer results carry a verdict (role ${role})`);
+  if (role && role !== 'reviewer' && res.needsQa !== undefined) errors.push(`needsQa: only reviewer results can request a QA stage (role ${role})`);
   if ((role === 'tester' || role === 'reviewer') && res.status === 'complete') {
     const failed = res.checks.filter((c) => c.outcome === 'fail').map((c) => c.command);
     if (failed.length) errors.push(`checks: a complete ${role} result cannot report failing checks (${failed.join(', ')}); use needs_changes or blocked`);
