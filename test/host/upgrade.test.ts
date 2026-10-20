@@ -50,6 +50,10 @@ interface World {
   releaseEnded?: string[];
   /** Lease ids whose `work release` fails with another error. */
   releaseFail?: string[];
+  /** The runtime drain request (`pause --starts --drain`); null when none is active. */
+  draining?: { reason: string; requestedAt: string; eventId: number } | null;
+  /** A runtime from before task-3.7: `pause --drain` is an unknown option, status has no draining. */
+  noDrain?: boolean;
 }
 
 function world(over: Partial<World> = {}): World {
@@ -88,10 +92,19 @@ function harness(w: World) {
         if (statusCalls > 0 && w.statusFailures) { w.statusFailures--; events.push('status:failed'); return { code: 1, stdout: '', stderr: 'container busy' }; }
         if (statusCalls++ > 0 && w.leaseTimeline.length) w.leases = w.leaseTimeline.length > 1 ? w.leaseTimeline.shift()! : w.leaseTimeline[0]!;
         events.push('status');
-        return env({ paused: { ...w.paused }, activeLeases: w.leases, ...changes() });
+        return env({ paused: { ...w.paused }, activeLeases: w.leases, ...changes(), ...(w.noDrain ? {} : { draining: w.draining ?? null }) });
       }
+      if (line === 'pause --starts --drain --reason upgrade') {
+        if (w.noDrain) return { code: 1, stdout: '', stderr: "error: unknown option '--drain'" };
+        events.push(w.paused.starts ? 'drain' : 'pause');
+        if (w.fail?.pause) return { code: 1, stdout: '', stderr: 'db locked' };
+        if (!w.paused.starts) setStarts(true);
+        w.draining ??= { reason: 'upgrade', requestedAt: new Date().toISOString(), eventId: ++w.lastEvent };
+        return env({ paused: w.paused, ...changes(), draining: w.draining });
+      }
+      if (line === 'resume --drain') { events.push('undrain'); w.draining = null; return env({ paused: w.paused, ...changes(), draining: null }); }
       if (line === 'pause --starts') { events.push('pause'); if (w.fail?.pause) return { code: 1, stdout: '', stderr: 'db locked' }; setStarts(true); return env({ paused: w.paused, ...changes() }); }
-      if (line === 'resume --starts') { events.push('resume'); if (w.fail?.resume) return { code: 1, stdout: '', stderr: 'db locked' }; setStarts(false); return env({ paused: w.paused, ...changes() }); }
+      if (line === 'resume --starts') { events.push('resume'); if (w.fail?.resume) return { code: 1, stdout: '', stderr: 'db locked' }; setStarts(false); w.draining = null; return env({ paused: w.paused, ...changes() }); }
       if (m[1] === 'work' && m[2] === 'release') {
         events.push(`release:${m[3]}`);
         expect(m[5]).toBe(UPGRADE_RELEASE_REASON);
@@ -366,8 +379,10 @@ describe('runUpgrade: interruption and recovery', () => {
     const h = harness(w);
     const err = await runUpgrade(h.opts({ timeoutSec: 10 })).catch((e) => e);
     expect(err).toMatchObject({ code: 'PRECONDITION' });
-    expect(h.events.filter((e) => e !== 'status')).toEqual(['resume']);
+    // The inherited pause is kept (no new pause event); the drain request rides on it and resuming clears it.
+    expect(h.events.filter((e) => e !== 'status')).toEqual(['drain', 'resume']);
     expect(w.paused.starts).toBe(false);
+    expect(w.draining).toBeNull();
     expect(existsSync(markerFile())).toBe(false);
   });
 
@@ -549,15 +564,16 @@ describe('runUpgrade: SIGINT/SIGTERM', () => {
     expect(err.message).toMatch(/interrupted \(SIGTERM\)/);
   });
 
-  it('with starts paused by the user: nothing is resumed, only the hint', async () => {
+  it('with starts paused by the user: nothing is resumed; only the drain request is cleared, then the hint', async () => {
     const a = lease('l1', 'task-1');
     const w = world({ paused: { intake: false, starts: true }, startsChange: { id: 3, at: '2026-01-01T00:00:00.000Z', value: true }, lastEvent: 3, leases: [a], leaseTimeline: [[a]] });
     const h = harness(w);
     const sig = signals();
     await runUpgrade(h.opts({ interrupt: sig.hooks, sleep: async () => { await sig.fire('SIGINT'); } })).catch(() => undefined);
-    expect(h.events.filter((e) => e !== 'status')).toEqual([]);
+    expect(h.events.filter((e) => e !== 'status')).toEqual(['drain', 'undrain']);
     expect(w.paused.starts).toBe(true);
-    expect(sig.notices[0]).toMatch(/the container was not recreated\. Rerun `minions upgrade`/);
+    expect(w.draining).toBeNull();
+    expect(sig.notices[0]).toMatch(/the container was not recreated and the drain request cleared \(starts left paused\)\. Rerun `minions upgrade`/);
   });
 
   it('after the recreate started: only prints the hint (no resume from the handler); the marker stays for the rerun', async () => {
@@ -765,6 +781,94 @@ describe('runUpgrade: pause ownership (stale marker)', () => {
       expect(docker.filter((x) => x.includes('down') || x.includes('-v') || x.includes('--volumes') || x[0] === 'volume' || x.includes('rm'))).toEqual([]);
       expect(w.volumes).toEqual(before);
     }
+  });
+});
+
+describe('runUpgrade: drain request (workers wind down)', () => {
+  const execLines = (h: ReturnType<typeof harness>) => h.calls.map((c) => c.slice(1)).filter((a) => a[5] === 'exec').map((a) => a.slice(9).join(' '));
+
+  it('requests the drain with the pause, reports the wind-down, and clears it when starts resume at the end', async () => {
+    const a = lease('l1', 'task-1'), b = lease('l2', 'task-2', 'reviewer');
+    const w = world({ leases: [a, b], leaseTimeline: [[a, b], [b], []] });
+    const h = harness(w);
+    const logs: string[] = [];
+    const r = await runUpgrade(h.opts({ log: (m) => logs.push(m) }));
+    expect(r.ok).toBe(true);
+    expect(execLines(h)).toContain('pause --starts --drain --reason upgrade --json');
+    expect(execLines(h)).not.toContain('pause --starts --json');
+    expect(r.steps.find((s) => s.id === 'pause')?.detail).toBe('new starts paused; drain requested');
+    expect(logs).toContain('winding down 2 active lease(s): l1 (task-1, engineer), l2 (task-2, reviewer)');
+    expect(logs).toContain('winding down 1 active lease(s): l2 (task-2, reviewer)');
+    expect(r.steps.find((s) => s.id === 'drain')).toMatchObject({ status: 'done', detail: expect.stringMatching(/2 lease\(s\) wound down; their tasks are re-dispatched/) });
+    expect(w.draining).toBeNull();
+    expect(w.paused.starts).toBe(false);
+    expect(h.events.slice(-2)).toEqual(['resume', 'coordinator']);
+  });
+
+  it('an abort on --timeout clears the drain together with the pause', async () => {
+    const a = lease('l1', 'task-1');
+    const w = world({ leases: [a], leaseTimeline: [[a]] });
+    const h = harness(w);
+    const err = await runUpgrade(h.opts({ timeoutSec: 10 })).catch((e) => e);
+    expect(err).toMatchObject({ code: 'PRECONDITION' });
+    expect(w.draining).toBeNull();
+    expect(w.paused.starts).toBe(false);
+  });
+
+  it('--now stays the hard fallback: the drain is requested, then the rest is released', async () => {
+    const a = lease('l1', 'task-1');
+    const w = world({ leases: [a], leaseTimeline: [[a]] });
+    const h = harness(w);
+    const r = await runUpgrade(h.opts({ timeoutSec: 20, now: true }));
+    expect(r.ok).toBe(true);
+    expect(r.interrupted).toEqual([a]);
+    expect(h.events.filter((e) => e !== 'status').slice(0, 2)).toEqual(['pause', 'release:l1']);
+    expect(w.draining).toBeNull();
+  });
+
+  it('starts paused by the user: the drain is requested on top, and only the drain is cleared at the end', async () => {
+    const a = lease('l1', 'task-1');
+    const w = world({ paused: { intake: false, starts: true }, startsChange: { id: 3, at: '2026-01-01T00:00:00.000Z', value: true }, lastEvent: 3, leases: [a], leaseTimeline: [[a], []] });
+    const h = harness(w);
+    const r = await runUpgrade(h.opts());
+    expect(r.ok).toBe(true);
+    expect(h.events.filter((e) => e !== 'status')).toEqual(['drain', 'files', 'secrets', 'recreate', 'workspace', 'origin', 'undrain', 'coordinator']);
+    expect(w.startsChange?.id).toBe(3); // the user's pause event is untouched
+    expect(w.paused.starts).toBe(true);
+    expect(w.draining).toBeNull();
+    expect(r.steps.find((s) => s.id === 'resume')).toMatchObject({ status: 'done', detail: expect.stringMatching(/drain request cleared; starts were paused before the upgrade/) });
+  });
+
+  it('a drain left by an earlier run is cleared at the end even with nothing to wind down', async () => {
+    const w = world({ paused: { intake: false, starts: true }, draining: { reason: 'upgrade', requestedAt: '2026-01-01T00:00:00.000Z', eventId: 1 }, lastEvent: 1 });
+    const h = harness(w);
+    await runUpgrade(h.opts());
+    expect(h.events).toContain('undrain');
+    expect(h.events).not.toContain('drain');
+    expect(w.draining).toBeNull();
+  });
+
+  it('a runtime without drain support (older image) is paused the old way and only waited for', async () => {
+    const a = lease('l1', 'task-1');
+    const w = world({ noDrain: true, leases: [a], leaseTimeline: [[a], []] });
+    const h = harness(w);
+    const logs: string[] = [];
+    const r = await runUpgrade(h.opts({ log: (m) => logs.push(m) }));
+    expect(r.ok).toBe(true);
+    expect(execLines(h).slice(1, 3)).toEqual(['pause --starts --drain --reason upgrade --json', 'pause --starts --json']);
+    expect(logs.some((l) => /does not support drain requests/.test(l))).toBe(true);
+    expect(logs).toContain('waiting for 1 active lease(s): l1 (task-1, engineer)');
+    expect(r.steps.find((s) => s.id === 'pause')?.detail).toBe('new starts paused');
+    expect(w.paused.starts).toBe(false);
+  });
+
+  it('--dry-run plans the drain request', async () => {
+    const a = lease('l1', 'task-1');
+    const h = harness(world({ leases: [a] }));
+    const r = await runUpgrade(h.opts({ dryRun: true }));
+    expect(r.steps.find((s) => s.id === 'pause')?.detail).toMatch(/request a drain/);
+    expect(r.steps.find((s) => s.id === 'drain')?.detail).toMatch(/ask 1 worker\(s\) to commit work in progress and return partial results, wait up to 60s/);
+    expect(h.mutating()).toEqual([]);
   });
 });
 

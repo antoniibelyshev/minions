@@ -21,7 +21,8 @@ import {
   buildClaudeCommand, buildCoordinatorCommand, claudePermissionModes, configuredPermissionMode, coordinatorWrapper, launchCoordinator, probeRuntime, readLaunchRecord, readMountedToken, RECOVERY_PROMPT,
   restartCoordinator, runtimeChannelFacts, syncCoordinator,
 } from './coordinator.js';
-import { openDb, type Lease, type LeaseRole, type PauseChange, type RuntimeDb } from './db.js';
+import { openDb, type DrainRequest, type Lease, type LeaseRole, type PauseChange, type RuntimeDb } from './db.js';
+import { clearDrain, requestDrain } from './drain.js';
 import { claimWithBrief, compactClaim, fetchBrief, recordSubmitted, submitResult, type CompactClaim } from './handoff.js';
 import { runHook } from './hooks.js';
 import { runtimePaths } from './paths.js';
@@ -84,6 +85,8 @@ export interface StatusReport {
   paused: { intake: boolean; starts: boolean };
   /** Last event that set each pause flag (event id + time); `minions upgrade` uses it to recognize its own pause. */
   pauseChanges: { intake: PauseChange | null; starts: PauseChange | null };
+  /** Active drain request (`minions pause --starts --drain`): leased workers wind down and return partial results. */
+  draining: DrainRequest | null;
   configRevision: number;
   profile: string;
   deliveryMode: string;
@@ -124,7 +127,7 @@ export async function collectStatus(deps: { db: RuntimeDb; config: MinionsConfig
   const { db: d, config: cfg } = deps;
   const leases = d.activeLeases();
   const report: StatusReport = {
-    paused: d.paused(), pauseChanges: d.pauseChanges(), configRevision: cfg.configRevision, profile: cfg.profile, deliveryMode: cfg.delivery.mode,
+    paused: d.paused(), pauseChanges: d.pauseChanges(), draining: d.drain(), configRevision: cfg.configRevision, profile: cfg.profile, deliveryMode: cfg.delivery.mode,
     queue: {}, capacity: null,
     activeLeases: leases.map((l) => ({ id: l.id, task_id: l.task_id, role: l.role, attempt: l.attempt, branch: l.branch, worktree: l.worktree, head_sha: l.head_sha, started_at: l.started_at })),
     guard: { lastReason: d.guard().last_reason, updatedAt: d.guard().updated_at },
@@ -146,6 +149,7 @@ function humanStatus(s: StatusReport): string {
   const out = [
     `config revision ${s.configRevision}  profile ${s.profile}  delivery ${s.deliveryMode}`,
     `paused: intake=${s.paused.intake} starts=${s.paused.starts}`,
+    ...(s.draining ? [`draining: ${s.draining.reason} since ${s.draining.requestedAt} (${s.activeLeases.length} lease(s) winding down)`] : []),
     ...(s.channel ? [`channel: configured ${s.channel.configured}, effective ${s.channel.effective} (${s.channel.source === 'launch' ? 'running coordinator' : 'predicted'}: ${s.channel.reason})${s.channel.restartRequired ? '; restart required: `minions down && minions start`' : ''}`] : []),
     s.capacity ? `capacity: ${s.capacity.activeTasks}/${s.capacity.maxActiveTasks} tasks, ${s.capacity.activeEngineers}/${s.capacity.maxEngineers} engineers` : 'capacity: unknown',
     `queue: ${Object.entries(s.queue).map(([k, v]) => `${k}=${v}`).join(' ') || '(empty)'}`,
@@ -154,6 +158,30 @@ function humanStatus(s: StatusReport): string {
   if (s.backlogError) out.push(`backlog error: ${s.backlogError}`);
   out.push(s.activeLeases.length ? 'active leases:' : 'active leases: none', ...s.activeLeases.map((l) => `  ${l.id} ${l.task_id} ${l.role} #${l.attempt} ${l.branch ?? ''}`));
   return out.join('\n');
+}
+
+export interface PauseOptions { intake?: boolean; starts?: boolean; drain?: boolean; reason?: string }
+
+/**
+ * `minions pause|resume`. Without flags both intake and starts change. `pause --drain` pauses starts
+ * (keeping an existing pause and its event) and records a drain request; `resume --drain` only clears
+ * the drain; resuming starts always clears it too.
+ */
+export function pauseControl(d: RuntimeDb, paths: { drainFlag: string }, name: 'pause' | 'resume', o: PauseOptions) {
+  const value = name === 'pause';
+  let paused = d.paused();
+  if (o.drain) {
+    if (value) paused = requestDrain(d, paths, o.reason?.trim() || 'manual').paused;
+    else clearDrain(d, paths, 'resume --drain');
+    if (o.intake || (!value && o.starts)) paused = d.setPaused({ intake: o.intake ? value : undefined, starts: !value && o.starts ? false : undefined });
+  } else {
+    if (o.reason !== undefined) throw new MinionsError('PRECONDITION', '--reason is only used with --drain.');
+    const both = !o.intake && !o.starts;
+    const starts = both || o.starts ? value : undefined;
+    paused = d.setPaused({ intake: both || o.intake ? value : undefined, starts });
+    if (starts === false) clearDrain(d, paths, 'resume --starts');
+  }
+  return { paused, pauseChanges: d.pauseChanges(), draining: d.drain() };
 }
 
 /** Host CLI: run the same command in the project runtime (container or host runtime) and exit with its code. */
@@ -261,6 +289,9 @@ export function register(program: Command): void {
     .action(async () => { await runHook('pre-agent', hookLoader); process.exitCode = 0; });
   hook.command('pre-telegram').description('PreToolUse(Telegram tools) hook: only the coordinator itself may use them, never a subagent')
     .action(async () => { await runHook('pre-telegram', hookLoader); process.exitCode = 0; });
+  // DB only (no config or backlog): it runs on every worker tool call while a drain is requested.
+  hook.command('drain').description('PreToolUse(every tool) hook during a drain: leased workers commit work in progress and return partial results')
+    .action(async () => { await runHook('drain', () => ({ db: getDb() })); process.exitCode = 0; });
 
   // coordinator
   const coord = program.command('coordinator').description('Launch or attach the coordinator Claude Code session (tmux)')
@@ -421,17 +452,23 @@ export function register(program: Command): void {
       const r = await collectStatus({ db: getDb(), config: cfg, backlog: getBacklog, channel: () => runtimeChannelStatus(cfg) });
       emit(r, { json: globalOpts(cmd).json, human: humanStatus });
     }));
-  const pauseLike = (name: 'pause' | 'resume') => program.command(name)
-    .description(name === 'pause' ? 'Pause intake and/or new starts (default: both)' : 'Resume intake and/or new starts (default: both)')
-    .option('--intake', 'only intake')
-    .option('--starts', 'only new task starts')
-    .action(action(async (o: { intake?: boolean; starts?: boolean }, cmd: Command) => {
+  const pauseLike = (name: 'pause' | 'resume') => {
+    const c = program.command(name)
+      .description(name === 'pause'
+        ? 'Pause intake and/or new starts (default: both); --drain also asks running workers to wind down'
+        : 'Resume intake and/or new starts (default: both); resuming starts also clears a drain')
+      .option('--intake', 'only intake')
+      .option('--starts', 'only new task starts');
+    if (name === 'pause') {
+      c.option('--drain', 'pause starts and ask leased workers to commit work in progress and return partial results (used by `minions upgrade`)')
+        .option('--reason <text>', 'why the drain is requested (with --drain)');
+    } else c.option('--drain', 'only clear a drain request (starts stay as they are)');
+    return c.action(action(async (o: PauseOptions, cmd: Command) => {
       if (runtimeMode() === 'host') return delegate(cmd);
-      const both = !o.intake && !o.starts;
-      const value = name === 'pause';
-      const paused = getDb().setPaused({ intake: both || o.intake ? value : undefined, starts: both || o.starts ? value : undefined });
-      emit({ paused, pauseChanges: getDb().pauseChanges() }, { json: globalOpts(cmd).json, human: (d) => `paused: intake=${d.paused.intake} starts=${d.paused.starts}` });
+      emit(pauseControl(getDb(), runtimePaths(), name, o), { json: globalOpts(cmd).json,
+        human: (x) => `paused: intake=${x.paused.intake} starts=${x.paused.starts}${x.draining ? `; draining (${x.draining.reason})` : ''}` });
     }));
+  };
   pauseLike('pause');
   pauseLike('resume');
 }

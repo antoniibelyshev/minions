@@ -112,6 +112,9 @@ export function pidAlive(pid: number): boolean {
 
 export interface CoordinatorLock { pid: number; session: string; acquiredAt: string }
 
+/** A durable drain request (`minions pause --starts --drain`): workers wind down to a checkpoint and return partial. */
+export interface DrainRequest { reason: string; requestedAt: string; eventId: number }
+
 export class RuntimeDb {
   readonly path: string;
   readonly sql: DatabaseSync;
@@ -204,6 +207,49 @@ export class RuntimeDb {
   }
   pauseChanges(): { intake: PauseChange | null; starts: PauseChange | null } {
     return { intake: this.lastPauseChange('intake'), starts: this.lastPauseChange('starts') };
+  }
+
+  // Drain request (controls row `drain`; the flag file is kept in step by src/runtime/drain.ts)
+  drain(): DrainRequest | null {
+    const v = this.getControl('drain');
+    if (!v) return null;
+    try { return JSON.parse(v) as DrainRequest; } catch { return null; }
+  }
+  /** Records a drain request; an active one is kept as is (same eventId), so a repeated request is a no-op. */
+  setDrain(reason: string): DrainRequest {
+    return this.transaction(() => {
+      const cur = this.drain();
+      if (cur) return cur;
+      const requestedAt = nowIso();
+      const eventId = this.addEvent('drain-request', null, { reason, requestedAt });
+      const d: DrainRequest = { reason, requestedAt, eventId };
+      this.setControl('drain', JSON.stringify(d));
+      return d;
+    });
+  }
+  /** Clears the drain request; returns the cleared one (null when none was active). */
+  clearDrain(by: string): DrainRequest | null {
+    return this.transaction(() => {
+      const cur = this.drain();
+      if (!cur) return null;
+      this.exec("DELETE FROM controls WHERE key = 'drain'");
+      this.exec("DELETE FROM meta WHERE key LIKE 'drain_hits:%'");
+      this.addEvent('drain-cleared', null, { by, eventId: cur.eventId });
+      return cur;
+    });
+  }
+  /** Whether a drain was requested at or after `since` (ISO time), including one cleared since. */
+  drainRequestedSince(since: string): boolean {
+    return !!this.get<{ id: number }>("SELECT id FROM events WHERE kind = 'drain-request' AND at >= ? LIMIT 1", since);
+  }
+  /** Counts one drain-hook hit for a worker (per drain request); returns the new count. */
+  drainHit(eventId: number, worker: string): number {
+    return this.transaction(() => {
+      const key = `drain_hits:${eventId}:${worker}`;
+      const n = Number(this.getMeta(key) ?? 0) + 1;
+      this.setMeta(key, String(n));
+      return n;
+    });
   }
 
   addEvent(kind: string, taskId: string | null, data?: unknown): number {

@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 import { generatePlugin, renderPolicySummary, renderTemplate } from '../../src/plugin/generate.js';
+import { DRAIN_HOOK_COMMAND } from '../../src/runtime/drain.js';
 import type { MinionsConfig } from '../../src/config/schema.js';
 import { defaults } from '../helpers.js';
 
@@ -115,7 +116,23 @@ describe('generatePlugin', () => {
     const hooks = JSON.parse(await read('hooks/hooks.json'));
     expect(Object.keys(hooks)).toEqual(['hooks']);
     expect(hooks.hooks.Stop).toEqual([{ hooks: [{ type: 'command', command: 'minions hook stop' }] }]);
-    expect(hooks.hooks.PreToolUse).toEqual([{ matcher: 'Agent', hooks: [{ type: 'command', command: 'minions hook pre-agent' }] }]);
+    expect(hooks.hooks.PreToolUse).toEqual([
+      { matcher: 'Agent', hooks: [{ type: 'command', command: 'minions hook pre-agent' }] },
+      // Every tool; gated by a shell test so node starts only while a drain is requested.
+      { matcher: '*', hooks: [{ type: 'command', command: DRAIN_HOOK_COMMAND }] },
+    ]);
+  });
+
+  it('tells the coordinator, the skills and the workers how a drain winds work down', async () => {
+    const { read } = await gen(defaults());
+    expect(await read('coordinator.md')).toMatch(/Drain \(`minions status --json` shows `draining`.*start nothing.*`drain: true`: not a failed attempt or a repair cycle.*\/minions:recover` re-dispatches the drained tasks to the same role/);
+    expect(await read('skills/orchestrate/SKILL.md')).toMatch(/If `draining` is set .*start nothing/);
+    expect(await read('skills/recover/SKILL.md')).toMatch(/Drained tasks .*re-dispatch the same role/);
+    for (const role of ['engineer', 'tester', 'reviewer']) {
+      const md = await read(`agents/${role}.md`);
+      expect(md).toMatch(/upgrade is pending \(a drain\).*prefix `wip:`.*`partial` result.*Never discard uncommitted changes/);
+      expect(md).toMatch(/A `resume` field means the previous worker was wound down by a drain/);
+    }
   });
 
   it('is deterministic for the same config', async () => {

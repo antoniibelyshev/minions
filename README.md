@@ -166,7 +166,7 @@ These are the only commands you need day to day. `minions --help` lists exactly 
 | `minions setup [path]` | Install, configure or reconfigure minions for a repository. Safe to rerun. |
 | `minions start` | Start the team (if needed) and attach to the coordinator. Use it after a reboot or to resume work. |
 | `minions status` | Queue, workers, pause state and channel. `minions status --check` checks the host, Docker, the container and Claude authorization. |
-| `minions upgrade` | Move the running team onto the installed minions version without losing work. |
+| `minions upgrade` | Move the running team onto the installed minions version without losing work. Running workers commit their progress and hand back; they continue after the upgrade. |
 | `minions down` (or `minions stop`) | Stop the team. Data and progress are kept; `minions start` resumes. |
 | `minions uninstall` | Remove minions from the project, keeping task data unless you ask otherwise. |
 
