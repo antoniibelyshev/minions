@@ -24,22 +24,29 @@ const realDirs = (): Set<string> => {
 if (!process.env.CLAUDE_CONFIG_DIR && process.env.MINIONS_TEST_CLAUDE_CONFIG_DIR) process.env.CLAUDE_CONFIG_DIR = process.env.MINIONS_TEST_CLAUDE_CONFIG_DIR;
 
 /** `claude` as a word in a shell string: not `.claude/`, `claude-plugin`, or `claude_x`. */
-const CLAUDE_WORD = /(^|[\s;&|()`'"/])claude(?=$|[\s;&|()`'"])/;
-const SHELLS = new Set(['sh', 'bash', 'zsh', 'dash']);
+const CLAUDE_WORD = /(^|[\s;&|()`'"/=])claude(\.exe|\.js)?(?=$|[\s;&|()`'"])/;
+/** The Claude Code package (the claude symlink points at its bin/claude.exe). */
+const CLAUDE_PKG = /@anthropic-ai[\\/]claude-code[\\/]/;
+const SHELLS = new Set(['sh', 'bash', 'zsh', 'dash', 'ksh', 'fish']);
+/** Programs that run their arguments as a command (`env claude`, `timeout 60 claude`, `npx claude`). */
+const WRAPPERS = new Set(['tmux', 'env', 'timeout', 'nice', 'nohup', 'npx', 'stdbuf', 'xargs', 'sudo', 'setsid', 'script', 'time', 'ionice', 'unbuffer']);
 
-/** Whether the call would run claude: directly, through a shell string, or as a tmux pane command. */
+const isClaudeBin = (p: string) => /^claude(\.exe|\.js)?$/.test(basename(p)) || CLAUDE_PKG.test(p);
+const namesClaude = (s: string) => CLAUDE_WORD.test(s) || CLAUDE_PKG.test(s);
+
+/** Whether the call would run claude: directly, through a shell string, a shell or wrapper program, or as a tmux pane command. */
 export function startsClaude(cmd: string, args: readonly string[], shell: boolean): boolean {
+  if (isClaudeBin(cmd)) return true;
+  if (shell) return namesClaude([cmd, ...args].join(' '));
+  // Any shell flag form (`-c`, `-lc`, `-e -c`) and any wrapper: an argument naming claude counts.
   const name = basename(cmd);
-  if (name === 'claude') return true;
-  if (shell) return CLAUDE_WORD.test([cmd, ...args].join(' '));
-  if (SHELLS.has(name)) { const i = args.indexOf('-c'); return i >= 0 && CLAUDE_WORD.test(args[i + 1] ?? ''); }
-  if (name === 'tmux') return args.some((a) => basename(a) === 'claude' || CLAUDE_WORD.test(a));
+  if (SHELLS.has(name) || WRAPPERS.has(name)) return args.some(namesClaude);
   return false;
 }
 
-/** The config dir claude would use with this env (CLAUDE_CONFIG_DIR, else ~/.claude for HOME or the passwd home). */
-export function effectiveConfigDir(env: Env): string {
-  if (env.CLAUDE_CONFIG_DIR) return resolve(env.CLAUDE_CONFIG_DIR);
+/** The config dir claude would use with this env and cwd (CLAUDE_CONFIG_DIR, else ~/.claude for HOME or the passwd home). */
+export function effectiveConfigDir(env: Env, cwd?: string | URL): string {
+  if (env.CLAUDE_CONFIG_DIR) return resolve(cwd === undefined ? process.cwd() : cwd instanceof URL ? cwd.pathname : cwd, env.CLAUDE_CONFIG_DIR);
   let home = env.HOME;
   if (!home) { try { home = userInfo().homedir; } catch { home = '/'; } }
   return join(home, '.claude');
@@ -54,7 +61,7 @@ export const takeViolations = (): string[] => violations.splice(0);
 function check(cmd: unknown, args: readonly string[], opts: Opts): void {
   if (typeof cmd !== 'string') return;
   if (!startsClaude(cmd, args, !!opts?.shell)) return;
-  const dir = effectiveConfigDir(opts?.env ?? process.env);
+  const dir = effectiveConfigDir(opts?.env ?? process.env, opts?.cwd);
   if (!realDirs().has(dir)) return;
   const msg = `test guard: refusing to start \`${[cmd, ...args].join(' ').slice(0, 200)}\` with the real Claude Code config dir ${dir}. `
     + 'Set CLAUDE_CONFIG_DIR (and HOME if needed) to a temp dir in the child env.';
@@ -85,6 +92,10 @@ function wrap(name: string, inspect: (a: unknown[]) => void): void {
 for (const name of ['spawn', 'spawnSync', 'execFile', 'execFileSync']) {
   wrap(name, ([cmd, ...rest]) => { const { args, opts } = split(rest); check(cmd, args, opts); });
 }
+// fork runs a JS module with node: a fork of a Claude Code entry point starts claude.
+wrap('fork', ([modulePath, ...rest]) => {
+  if (typeof modulePath === 'string' && isClaudeBin(modulePath)) { const { args, opts } = split(rest); check('claude', args, opts); }
+});
 for (const name of ['exec', 'execSync']) {
   wrap(name, ([command, o]) => check(command, [], { ...(o && typeof o === 'object' ? (o as Opts) : {}), shell: true }));
 }
