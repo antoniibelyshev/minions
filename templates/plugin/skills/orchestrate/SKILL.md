@@ -36,9 +36,9 @@ The compact response has `leaseId`, `briefMarker`, `taskId`, `role`, `attempt`, 
 
 Call the Agent tool:
 
-- `subagent_type`: `minions:<role>`
+- `subagent_type`: `minions:<role>`; for an engineer lease, `minions:engineer-deep` instead of `minions:engineer` for hard debugging, architecture work, or a retry after an engineer attempt failed (see below)
 - `description`: short, e.g. `engineer task-12`
-- `model`: per attempt from {{allowedModels}} ({{modelGuidance}})
+- `model` (optional): allowed {{allowedModels}}. {{modelGuidance}}
 - `prompt`, nothing more than:
 
   ```
@@ -74,7 +74,7 @@ The record response says what happened. Typical transitions:
 - QA sweep `complete` → `done`: create one backlog task per finding (`minions backlog create`, idempotency key `qa:<sweepId>:<n>`).
 - tester `complete` → reviewer (`reviewing`); tester `needs_changes` → engineer repair (`changes-requested`), passing the tester's findings as prior findings.
 - reviewer `approve` → `delivered` (local delivery). In branch / pull-request delivery the record response has `publication`: `published` → `delivered`, keep the branch and `prUrl` (open, not merged) for the next report; `awaiting-approval` → `awaiting-human`, ask the user (reasons + head SHA), and only on their explicit instruction run `minions work approve <taskId> --head <sha>` then `minions work publish <taskId>`; `failed` → `blocked`, report the error and retry `minions work publish <taskId>` after the cause is fixed.
-- reviewer `request-changes` → engineer repair with the reviewer's findings. Prefer a fresh engineer; use a stronger model after repeated failure.
+- reviewer `request-changes` → engineer repair with the reviewer's findings. Prefer a fresh engineer; when the previous engineer attempt failed to address the findings, use `minions:engineer-deep`, and a stronger allowed model after repeated failure.
 - `replan: true` → stop repairing. Rethink: rewrite the task, split it, or ask the user. Do not dispatch another repair of the same approach.
 - `blocked` → record the reason (`minions backlog note`), tell the user what would unblock it if it needs them, move on.
 - `partial` → re-dispatch the same role with the remaining work in the prompt, or split.

@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { readFile, rm } from 'node:fs/promises';
 import { constants as osConstants } from 'node:os';
 import type { MinionsConfig } from '../config/schema.js';
+import { roleEffort } from '../config/models.js';
 import { MinionsError } from '../core/errors.js';
 import { run, type RunOptions, type RunResult } from '../core/exec.js';
 import { atomicWrite } from '../core/fsutil.js';
@@ -371,7 +372,7 @@ export async function buildClaudeCommand(cfg: MinionsConfig, paths: RuntimePaths
       ...(onHost ? HOST_CLAUDE_FLAGS : []),
       ...(onHost ? ['--add-dir', paths.workspace, paths.state] : []),
       ...(cfg.models.coordinator ? ['--model', cfg.models.coordinator] : []),
-      ...(cfg.models.effort ? ['--effort', cfg.models.effort] : []),
+      ...(roleEffort(cfg, 'coordinator') ? ['--effort', roleEffort(cfg, 'coordinator')!] : []),
       '--settings', JSON.stringify(coordinatorSettings(cfg, { ...opts, paths })),
       ...(opts.telegram ? ['--channels', TELEGRAM_CHANNEL_SPEC] : []),
       // After `--` so a variadic option (--channels) cannot swallow the prompt.
@@ -670,7 +671,7 @@ export async function probeRuntime(cfg?: Pick<MinionsConfig, 'models'>): Promise
   const text = help.stdout + help.stderr;
   const flags = ['--plugin-dir', '--append-system-prompt', '--permission-mode', '--settings',
     ...(onHost ? ['--setting-sources', '--strict-mcp-config', '--add-dir'] : []),
-    ...(cfg?.models.coordinator ? ['--model'] : []), ...(cfg?.models.effort ? ['--effort'] : [])];
+    ...(cfg?.models.coordinator ? ['--model'] : []), ...(cfg && roleEffort(cfg, 'coordinator') ? ['--effort'] : [])];
   const missing = flags.filter((f) => !text.includes(f));
   if (help.code !== 0 || missing.length) {
     throw new MinionsError('INCOMPATIBLE_RUNTIME',

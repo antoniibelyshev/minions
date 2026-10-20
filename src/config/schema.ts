@@ -96,8 +96,19 @@ export const MinionsConfigSchema = z.object({
     default: modelId,
     allowed: z.array(modelId).min(1),
     selection: z.enum(['coordinator', 'fixed']),
-    /** Reasoning effort for workers (agent frontmatter) and the coordinator (`--effort`); unset = Claude Code default. */
+    /** Reasoning effort for workers (agent frontmatter) and the coordinator (`--effort`); unset = Claude Code default. Fallback for `effortByRole`. */
     effort: z.enum(EFFORTS).optional(),
+    /**
+     * Per-role reasoning effort; each unset role falls back to `effort`. `engineerDeep` is the higher-effort
+     * engineer definition (`minions:engineer-deep`); unset = one level above the engineer's (`high` when that is unset).
+     */
+    effortByRole: z.object({
+      engineer: z.enum(EFFORTS).optional(),
+      engineerDeep: z.enum(EFFORTS).optional(),
+      tester: z.enum(EFFORTS).optional(),
+      reviewer: z.enum(EFFORTS).optional(),
+      coordinator: z.enum(EFFORTS).optional(),
+    }).strict().optional(),
     /** Model of the coordinator session (`--model`); unset = Claude Code default. Must be in `allowed`. */
     coordinator: modelId.optional(),
   }).strict(),

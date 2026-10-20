@@ -30,12 +30,14 @@ const toolList = (v: string | undefined) => (v ?? '').split(',').map((s) => s.tr
 
 const EXPECTED = [
   '.claude-plugin/plugin.json',
-  'agents/engineer.md', 'agents/reviewer.md', 'agents/tester.md',
+  'agents/engineer-deep.md', 'agents/engineer.md', 'agents/reviewer.md', 'agents/tester.md',
   'coordinator.md',
   'hooks/hooks.json',
   'skills/intake/SKILL.md', 'skills/maintain-context/SKILL.md', 'skills/orchestrate/SKILL.md',
   'skills/recover/SKILL.md', 'skills/status/SKILL.md',
 ];
+/** Generated worker definitions and the lease role each runs under. */
+const WORKER_AGENTS = [['engineer', 'engineer'], ['engineer-deep', 'engineer'], ['tester', 'tester'], ['reviewer', 'reviewer']] as const;
 const AGENT_FIELDS = new Set(['name', 'description', 'tools', 'disallowedTools', 'model', 'maxTurns', 'effort', 'skills', 'color']);
 
 describe('generatePlugin', () => {
@@ -61,10 +63,10 @@ describe('generatePlugin', () => {
   it('agent frontmatter uses only allowed fields; workers lack Agent; reviewer is read-only', async () => {
     const cfg = defaults();
     const { read } = await gen(cfg);
-    for (const role of ['engineer', 'tester', 'reviewer']) {
-      const fm = frontmatter(await read(`agents/${role}.md`));
-      for (const k of Object.keys(fm)) expect(AGENT_FIELDS.has(k), `${role}: ${k}`).toBe(true);
-      expect(fm.name).toBe(role);
+    for (const [agent, role] of WORKER_AGENTS) {
+      const fm = frontmatter(await read(`agents/${agent}.md`));
+      for (const k of Object.keys(fm)) expect(AGENT_FIELDS.has(k), `${agent}: ${k}`).toBe(true);
+      expect(fm.name).toBe(agent);
       expect(fm.description).toBeTruthy();
       expect(fm.model).toBe(cfg.models.default);
       expect(fm.maxTurns).toBe(String(cfg.execution.attemptMaxTurns));
@@ -83,8 +85,8 @@ describe('generatePlugin', () => {
 
   it('worker prompts include the result contract and role policy', async () => {
     const { read } = await gen();
-    for (const role of ['engineer', 'tester', 'reviewer']) {
-      const md = await read(`agents/${role}.md`);
+    for (const [agent, role] of WORKER_AGENTS) {
+      const md = await read(`agents/${agent}.md`);
       for (const f of ['status', 'summary', 'branch', 'headSha', 'modifiedPaths', 'checks', 'acceptanceEvidence', 'findings', 'nextAction']) {
         expect(md, `${role} ${f}`).toContain(`"${f}"`);
       }
@@ -143,7 +145,9 @@ describe('generatePlugin', () => {
   it('renders model guidance for fixed selection', async () => {
     const base = defaults();
     const g = await gen({ ...base, models: { ...base.models, selection: 'fixed' } });
-    expect(await g.read('coordinator.md')).toContain('Selection is fixed');
+    const coord = await g.read('coordinator.md');
+    expect(coord).toContain('Selection is fixed: omit `model` so every worker runs `sonnet` from its definition.');
+    expect(coord).not.toMatch(/model: "/);
   });
 });
 
@@ -260,7 +264,7 @@ describe('Telegram tools are coordinator-only', () => {
 
   it('worker agents have explicit tool allowlists with no MCP (Telegram) tools when Telegram is configured', async () => {
     const { read } = await gen(telegram());
-    for (const role of ['engineer', 'tester', 'reviewer']) {
+    for (const [role] of WORKER_AGENTS) {
       const md = await read(`agents/${role}.md`);
       const fm = frontmatter(md);
       const tools = toolList(fm.tools);
@@ -300,10 +304,64 @@ describe('models.effort / models.coordinator', () => {
       expect(fm.model).toBe('claude-opus-5-5');
       expect(fm.effort).toBe('medium');
     }
-    expect(await g.read('coordinator.md')).toMatch(/reasoning effort `medium`/);
+    expect(frontmatter(await g.read('agents/engineer-deep.md')).effort).toBe('high');
+    expect(await g.read('coordinator.md')).toMatch(/reasoning effort engineer `medium`, tester `medium`, reviewer `medium`/);
     const plain = await gen();
-    expect(frontmatter(await plain.read('agents/engineer.md'))).not.toHaveProperty('effort');
-    expect(await plain.read('coordinator.md')).not.toMatch(/reasoning effort/);
+    for (const a of ['engineer', 'tester', 'reviewer']) expect(frontmatter(await plain.read(`agents/${a}.md`)), a).not.toHaveProperty('effort');
+    expect(frontmatter(await plain.read('agents/engineer-deep.md')).effort).toBe('high');
+    expect(await plain.read('coordinator.md')).toMatch(/reasoning effort engineer the Claude Code default, tester the Claude Code default/);
+  });
+
+  it('effortByRole overrides models.effort per role; engineer-deep defaults to one level above the engineer', async () => {
+    const g = await gen(withModels({ effort: 'medium', effortByRole: { engineer: 'low', coordinator: 'high' } }));
+    const fx = async (a: string) => frontmatter(await g.read(`agents/${a}.md`)).effort;
+    expect(await fx('engineer')).toBe('low');
+    expect(await fx('engineer-deep')).toBe('medium');
+    expect(await fx('tester')).toBe('medium');
+    expect(await fx('reviewer')).toBe('medium');
+    const coord = await g.read('coordinator.md');
+    expect(coord).toMatch(/reasoning effort engineer `low`, tester `medium`, reviewer `medium`/);
+    expect(coord).toMatch(/spawn `minions:engineer-deep` instead of `minions:engineer`: the same engineer under the same engineer lease, at effort `medium`/);
+
+    const explicit = await gen(withModels({ effortByRole: { engineer: 'low', engineerDeep: 'xhigh', reviewer: 'high' } }));
+    expect(frontmatter(await explicit.read('agents/engineer-deep.md')).effort).toBe('xhigh');
+    expect(frontmatter(await explicit.read('agents/reviewer.md')).effort).toBe('high');
+    expect(frontmatter(await explicit.read('agents/tester.md'))).not.toHaveProperty('effort');
+    const capped = await gen(withModels({ effortByRole: { engineer: 'max' } }));
+    expect(frontmatter(await capped.read('agents/engineer-deep.md')).effort).toBe('max');
+  });
+
+  it('engineer-deep is the engineer template under its own name, model and engineer role', async () => {
+    const g = await gen(withModels({ effortByRole: { engineer: 'low' } }));
+    const deep = await g.read('agents/engineer-deep.md');
+    const eng = await g.read('agents/engineer.md');
+    const fm = frontmatter(deep);
+    expect(fm.name).toBe('engineer-deep');
+    expect(fm.model).toBe('claude-opus-5-5');
+    expect(fm.description).toMatch(/^Minions engineer \(higher reasoning effort, for hard debugging, architecture work, or after a failed attempt\)\./);
+    expect(frontmatter(eng).description).toMatch(/^Minions engineer\. /);
+    const body = (md: string) => md.slice(md.indexOf('\n---\n') + 5);
+    expect(body(deep)).toBe(body(eng));
+    expect(deep).toContain('Not permitted for the engineer');
+  });
+
+  it('never tells the coordinator to pass a full model id as the Agent `model`', async () => {
+    for (const cfg of [withModels({}), withModels({ selection: 'fixed' }), defaults(), withModels({ allowed: ['claude-opus-5-5', 'claude-sonnet-5', 'haiku'] })]) {
+      const g = await gen(cfg);
+      for (const f of ['coordinator.md', 'skills/orchestrate/SKILL.md']) {
+        const text = await g.read(f);
+        const passed = [...text.matchAll(/model: "([^"]+)"/g)].map((m) => m[1]);
+        for (const m of passed) expect(['sonnet', 'opus', 'haiku', 'fable'], `${f}: ${m}`).toContain(m);
+        if (cfg.models.selection === 'coordinator') expect(text, f).toMatch(/omit `model` \(the definitions run `[^`]+`\)/);
+      }
+    }
+    const g = await gen(withModels({}));
+    const coord = await g.read('coordinator.md');
+    expect(coord).toContain('Pass `model` only as one of the aliases `sonnet`, `opus`, `haiku`, `fable`, never a full model ID');
+    expect(coord).toContain('`model: "haiku"` for narrow inspection');
+    const extra = await (await gen(withModels({ allowed: ['claude-opus-5-5', 'claude-sonnet-5', 'haiku'] }))).read('coordinator.md');
+    expect(extra).toContain('Allowed full IDs other than the default (`claude-sonnet-5`) cannot be chosen per call.');
+    expect(await g.read('skills/orchestrate/SKILL.md')).toMatch(/`minions:engineer-deep` instead of `minions:engineer` for hard debugging, architecture work, or a retry after an engineer attempt failed/);
   });
 });
 
@@ -359,8 +417,8 @@ describe('file hand-off templates render completely (task-9 edge cases)', () => 
       expect(text, f).not.toMatch(/\{\{|\}\}/);
       expect(text, f).not.toContain('--role {{');
     }
-    for (const role of ['engineer', 'tester', 'reviewer']) {
-      const md = await read(`agents/${role}.md`);
+    for (const [agent, role] of WORKER_AGENTS) {
+      const md = await read(`agents/${agent}.md`);
       const roles = [...md.matchAll(/minions work (?:brief|submit) <leaseId> --role (\w+)/g)].map((m) => m[1]);
       expect(roles.length, role).toBeGreaterThanOrEqual(2);
       expect(new Set(roles), role).toEqual(new Set([role]));

@@ -142,6 +142,17 @@ describe('coordinator --model / --effort', () => {
       const args = (await buildClaudeCommand(cfg, paths)).args;
       expect(args.slice(args.indexOf('--model'), args.indexOf('--model') + 2)).toEqual(['--model', 'claude-opus-5-5']);
       expect(args.slice(args.indexOf('--effort'), args.indexOf('--effort') + 2)).toEqual(['--effort', 'medium']);
+      const byRole = defaults();
+      byRole.models = { ...byRole.models, effort: 'medium', effortByRole: { engineer: 'low', coordinator: 'high' } };
+      const ra = (await buildClaudeCommand(byRole, paths)).args;
+      expect(ra.slice(ra.indexOf('--effort'), ra.indexOf('--effort') + 2)).toEqual(['--effort', 'high']);
+      const onlyRole = defaults();
+      onlyRole.models = { ...onlyRole.models, effortByRole: { coordinator: 'low' } };
+      const oa = (await buildClaudeCommand(onlyRole, paths)).args;
+      expect(oa.slice(oa.indexOf('--effort'), oa.indexOf('--effort') + 2)).toEqual(['--effort', 'low']);
+      const workersOnly = defaults();
+      workersOnly.models = { ...workersOnly.models, effortByRole: { engineer: 'low' } };
+      expect((await buildClaudeCommand(workersOnly, paths)).args).not.toContain('--effort');
       const plain = (await buildClaudeCommand(defaults(), paths)).args;
       expect(plain).not.toContain('--model');
       expect(plain).not.toContain('--effort');
