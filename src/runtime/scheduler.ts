@@ -370,7 +370,7 @@ export class Scheduler {
     const at = last.head_sha ? ` at ${last.head_sha}` : '';
     const instruction = lease.role === 'reviewer'
       ? `The previous review was interrupted by a drain (upgrade). Review ${branch}${at} again from the start; the remaining work lists what was not reviewed yet.`
-      : `The previous ${lease.role} was interrupted by a drain (upgrade) and checkpointed on ${branch}${at} (\`wip:\` commit). Continue from that commit: keep the committed work, do the remaining work, and commit normally (you may fold the wip: commit into a proper message with new commits; never rewrite or discard it).`;
+      : `The previous ${lease.role} was interrupted by a drain (upgrade) and checkpointed on ${branch}${at} (\`wip:\` commit). Continue from that commit: keep the committed work, do the remaining work, and add normal commits on top (never rewrite or discard the wip: commit).`;
     return { fromLeaseId: last.id, role: last.role, reason: 'drain', headSha: last.head_sha, summary: r.summary, remainingWork: r.findings, nextAction: r.nextAction, instruction };
   }
 
