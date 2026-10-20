@@ -86,8 +86,14 @@ fake GitHub API; the pre-filled token URL follows GitHub's documented template U
   requires the top-level `permissionMode` and rejects the `coordinator` key. Before reinstalling an
   older build, remove `coordinator` from the project config and set `permissionMode` (for example
   `"acceptEdits"`), otherwise config validation fails.
+- **CI-gated auto-merge** (opt-in, `delivery.merge: "auto-when-eligible"`, default `disabled`) needs
+  pull-request delivery, required status checks on the base branch, `delivery.requiredChecksConfigured: true`,
+  `verification.ciAuthority: "github"`, and "Allow auto-merge" enabled in the GitHub repository settings.
+  It is evaluated on `minions sync` (no polling loop), so a merge happens only after a sync pass; a
+  required check matched by name only (not pinned to an app) can be satisfied by anyone who can post a
+  commit status with that name (see "CI as verification authority").
 - **Deferred features** (reported as unavailable by `minions doctor`): GitHub Issues backend,
-  auto-merge and merge requests, review publication, the notification outbox, config plan/apply transactions,
+  merge requests (`delivery.merge: "manual"`), review publication, the notification outbox, config plan/apply transactions,
   backlog migration, upgrade, budgets, companion containers, GitHub App short-lived tokens (a long-lived
   fine-grained PAT is used instead), CODEOWNERS mapping of sensitive paths, shared backlog versioned in Git.
 - **Telegram bot token exposure inside the container**: the token is mounted read-only and given only to

@@ -194,19 +194,20 @@ argv, environment files, tmux, or Claude Code settings.
 Decision record for `delivery.mode` `branch` / `pull-request` (`src/runtime/publish.ts`,
 `Scheduler.publish` / `approvePublication` in `src/runtime/scheduler.ts`).
 
-- **Config.** Both modes need `delivery.provider: "github"` (cross-field validation). `merge` stays
-  `disabled`; `manual` / `auto-when-eligible` validate but are reported unavailable (deferred).
+- **Config.** Both modes need `delivery.provider: "github"` (cross-field validation). `merge` defaults
+  to `disabled`; `auto-when-eligible` is the opt-in CI-gated auto-merge (see "CI-gated auto-merge"),
+  reported unavailable until its configuration prerequisites hold; `manual` validates but stays deferred.
   `project-owner` defaults to `pull-request` only when the repository has a github.com remote **and** a
   token is already stored for the project; otherwise `local` with a note. The init wizard offers
   `local/branch/pull-request` under the same condition and otherwise shows the reason and keeps
   `local` (also for `--config` files that ask for branch/PR delivery). `doctor` `merge.readiness`
-  reports whether PR delivery is available and that auto-merge is deferred.
+  reports whether PR delivery is available and whether auto-merge is off, ready, or not usable (with reasons).
 - **Where publication runs.** Synchronously inside `minions work record` when a reviewer approval is
   accepted (tester evidence for the same head and config revision as before), plus
   `minions work publish <taskId>` to retry. One `publications` row per task (DB schema 2; schema 3 adds `approvals.signature`) is
   written in the same transaction that ends the reviewer lease (`pending`, bound to the approved
   head and config revision), so a crash between approval and publication is resumable. The response
-  carries `publication` (`state`, `status`, `prUrl`, `merged: false`).
+  carries `publication` (`state`, `status`, `prUrl`, `merged`, and `merge` when auto-merge is on).
 - **Outcomes.** `published` → backlog `delivered` with `prUrl` (pull-request mode) and `branch` in the
   task meta; an open PR is reported as delivered, never merged. `awaiting-approval` → `awaiting-human`.
   `failed` (network, auth, permission, diverged remote, moved branch, stale evidence) → `blocked`
@@ -451,7 +452,8 @@ Decision record for required-checks readiness, `minions sync` and CI setup guida
 
 - **Read-only.** Every GitHub call is a GET: `gh api --method GET` in the container (the gh wrapper
   injects the token), or a plain `fetch` GET with the stored token on the host. minions never creates
-  workflows, never edits branch protection or rulesets, and never merges.
+  workflows and never edits branch protection or rulesets. The only write is the opt-in auto-merge
+  pass (see "CI-gated auto-merge"), which arms/disarms GitHub auto-merge and never merges past it.
 - **Required checks.** Union of classic branch protection (`GET /repos/{repo}/branches/{base}`,
   `protection.required_status_checks` unless `enforcement_level` is `off`; readable with repository
   read access, so no Administration permission is needed) and rulesets (`GET
@@ -477,7 +479,7 @@ Decision record for required-checks readiness, `minions sync` and CI setup guida
   failure/error), `passing`. The observation is recorded as `ci` evidence bound to the PR head SHA
   (outcome `<prState>:<ciState>`, details JSON), plus a `ci-observation` event; a task note is added
   only when the outcome changes. Open PRs keep their status (`delivered`; a failing PR is reported,
-  not reworked automatically). Reconciliation: `MERGED` → `done`; `CLOSED` without merge → `blocked`
+  not reworked automatically). Reconciliation: `MERGED` → `done` (plus `merge` evidence `merged` and a note); `CLOSED` without merge → `blocked`
   with a note (only from `delivered`/`awaiting-ci`/`merging`); tasks with an active lease are never
   moved. A PR head differing from the approved publication head is reported as a warning. Per-task gh
   failures are reported and the command exits 1; nothing is thrown away.
@@ -499,7 +501,7 @@ re-run the full verification when CI already proved it for the same commit.
   required checks; an observation without per-check results; a skipped required check); `disabled`
   (`ciAuthority: none`). Only `pass` is evidence. Observations of an earlier head never carry over.
   Checks that are not required are ignored. The same gate (`Scheduler.ciGate(taskId, head)`) is what
-  the merge gate of task-1.9 is meant to reuse for the approved head.
+  the auto-merge gate (task-1.9, "CI-gated auto-merge") evaluates for the approved head.
 - **Stages.** The claim brief of a tester/reviewer carries the gate for `expectedHead` (`ci`). A
   result may cite CI as `checks[]` entries with `"source": "ci"` (the check name as `command`,
   outcome `pass`/`fail`). The runtime re-evaluates the gate when recording: `pass` → the stage is
@@ -551,6 +553,63 @@ re-run the full verification when CI already proved it for the same commit.
   delivery answer, also to a project still on `local`; `local` and `branch` stay selectable.
   Without GitHub or a token nothing is offered and delivery stays `local`. Non-interactive runs keep
   the configured mode (project-owner defaults to `pull-request` when the token exists).
+
+## CI-gated auto-merge
+
+Decision record for `delivery.merge: "auto-when-eligible"` (task-1.9; `src/runtime/merge.ts`,
+`Scheduler.autoMerge` / `approveMerge`, the sync hook in `src/runtime/ci.ts`, `merge.readiness` in
+`src/host/doctor.ts`). Owner decision 2026-10-20: build auto-merge on top of the CI evidence gate.
+
+- **Opt-in.** `delivery.merge` defaults to `disabled`; `auto-when-eligible` turns it on. The setup
+  question *Enable auto-merge?* (only with pull-request delivery, default no) records it in
+  `config.local.json`. Configuration prerequisites (`autoMergeConfigReasons`): pull-request delivery to
+  GitHub, `delivery.requiredChecksConfigured: true`, `verification.ciAuthority: "github"` (required
+  checks, including app pinning, are only read as evidence under it), and `pr.merge` not `deny`.
+  `listUnavailable` and doctor `merge.readiness` report any that are missing; doctor also needs
+  required checks to be readable and configured on the base, and a usable GitHub credential.
+- **Where it runs.** Only in the runtime's own command path: after each PR observation in
+  `minions sync` (the hook runs after the `ci` evidence for the head is recorded) and after delivery in
+  `minions work publish` / `minions work record`. No polling loop, no new command. The coordinator's
+  Claude Code deny rules for `gh pr merge` stay; the runtime calls gh through the PATH wrapper like
+  publication does, with a PR URL and cwd `/` (gh never touches the workspace or its branches).
+- **Gates, all for the approved publication head** (`publications.head_sha`), re-evaluated on every
+  pass (`evaluateMergeGate`): the configuration prerequisites; the live PR (`gh pr view`, never a
+  cached observation) is open, not a draft, from the same repository, targets `git.baseBranch`, and its
+  head equals the approved head; reviewer evidence `complete` for that head at the current config
+  revision; `Scheduler.ciGate(taskId, head)` is `pass` (fail closed: unknown, missing, pending, timeout,
+  failing, unconfigured required checks all block); the sensitive-path diff over trusted bases
+  (`gateChangedPaths`, shared with publication; no trustworthy base blocks) and `can(pr.merge)`.
+  `deny` → `denied`. `ask` (the default in every profile that allows merging, and the sensitive-path
+  upgrade allow→ask) → a host-signed approval of scope `merge` for exactly that task and head must
+  verify against the runtime's read-only public key, otherwise `awaiting-approval`.
+- **Merge approvals.** `minions work approve <taskId> --head <sha> --merge` on the host signs
+  `{scope: "merge", taskId, head, …}` with the same per-project key as publication approvals and
+  delegates `work approve … --merge --signature <token>`; the runtime verifies it (`approveMerge`) and
+  stores it as an `approvals` row of scope `merge` (no schema change). Scopes never substitute for each
+  other: a publication approval does not authorize a merge, and a merge token is rejected by
+  publication. Unsigned rows, other heads, other tasks and expired tokens fail closed.
+- **Arm (native auto-merge).** Only when every gate passes: `gh pr merge <url> --auto --<method>
+  --match-head-commit <head>` (`delivery.method`). GitHub then merges when branch protection is
+  satisfied, so protection is enforced by GitHub at merge time. Never `--admin`, never a force merge.
+  When GitHub refuses to enable auto-merge because the PR is mergeable right now ("clean status"),
+  the same merge without `--auto` is run only if GitHub's `mergeStateStatus` is `CLEAN` (every
+  requirement met), still with `--match-head-commit`. The PR is read back afterwards (gh may merge at
+  once). A PR whose auto-merge is already enabled is not re-armed.
+- **Disarm.** If a PR minions armed (last `merge` evidence `armed`) no longer passes a gate — new PR
+  head, CI no longer passing, approval gone or expired, policy or config changed, including turning
+  `delivery.merge` off — the next pass runs `gh pr merge <url> --disable-auto`. Auto-merge enabled on
+  GitHub by someone else is left alone (reported). A failed disarm is reported (exit 1) and retried on
+  the next sync; GitHub still enforces protection, and `--match-head-commit` bound the arm to the head.
+- **States.** `merge` evidence bound to the approved head records `waiting`, `awaiting-approval`,
+  `denied`, `armed`, `disarmed`, `merged` (written on change, with a note). The task stays
+  `delivered` while armed (an open PR, not in-flight capacity) and becomes `done` when merged (by
+  GitHub, observed by sync, or by the direct merge above). Responses carry `merged` and `merge`
+  (`state`, `reasons`, `ci`, `approvalError`, `action`).
+- **Residuals.** A merge happens only after a `minions sync` pass observes passing checks and arms
+  auto-merge; between passes nothing is armed. Required checks matched by name only can be satisfied by
+  anyone who can post a status with that name (see "CI as verification authority"); pin them to their
+  app. Code that already runs in the container can still use the token directly (see "Host-signed
+  publication approvals"); branch protection on GitHub stays the final control.
 
 ## GitHub intake sync
 

@@ -45,7 +45,7 @@ export function profileDefaults(profile: Profile, ctx: ProfileContext): { config
   if (owner && ctx.hasGitHub) {
     notes.push('unavailable: GitHub Issues backlog (project-owner default) is deferred in v0.1; using Backlog.md.');
     if (githubBlocked) notes.push(`unavailable: pull-request delivery (project-owner default) needs a GitHub remote and token: ${githubBlocked}; using local delivery.`);
-    notes.push('unavailable: auto-merge-when-eligible is deferred in v0.1; merge stays disabled (minions never merges pull requests; with local delivery the coordinator integrates into the container\'s local base).');
+    notes.push('auto-merge is opt-in and starts disabled: with pull-request delivery, required checks (delivery.requiredChecksConfigured) and verification.ciAuthority "github", set delivery.merge "auto-when-eligible" (or answer yes in `minions setup`) to let minions arm GitHub auto-merge for reviewed heads whose required checks pass; pr.merge "ask" still needs a host-signed approval per PR.');
     notes.push('GitHub CI authority is opt-in: once required checks are configured on the base branch (`minions doctor` ci.authority), set verification.ciAuthority "github" so tester/reviewer stages can rely on passing required checks for the reviewed head.');
   } else if (profile === 'personal-work') {
     notes.push(githubBlocked

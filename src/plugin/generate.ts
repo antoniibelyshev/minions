@@ -137,12 +137,16 @@ function deliveryGuidance(cfg: MinionsConfig): string {
       `Note each merge on its task. Say "delivered" until the merge commit is on ${base}, "merged into ${base}" after.`,
     ].join('\n');
   }
+  const autoMerge = cfg.delivery.mode === 'pull-request' && cfg.delivery.merge === 'auto-when-eligible';
   const what = cfg.delivery.mode === 'pull-request'
     ? `pushes \`agent/<slug>\` to origin and opens one pull request against \`${cfg.git.baseBranch}\` (the record response carries \`publication.prUrl\`)`
     : 'pushes `agent/<slug>` to origin';
   return [
     `When \`minions work record\` accepts a reviewer approval, the CLI publishes the approved head: it ${what}. You never run \`git push\` or \`gh pr\` yourself.`,
-    'The task becomes `delivered` only after publication succeeded. An open PR is delivered, not merged: say "delivered" (with the PR URL), never "merged"; minions never merges pull requests.',
+    autoMerge
+      ? 'The task becomes `delivered` only after publication succeeded. An open PR is delivered, not merged: say "delivered" (with the PR URL), "auto-merge armed" while `merge.state` is `armed` (still delivered), and "merged" only when `merge.state` is `merged` or the task is `done`.'
+      : 'The task becomes `delivered` only after publication succeeded. An open PR is delivered, not merged: say "delivered" (with the PR URL), never "merged"; minions never merges pull requests.',
+    ...(autoMerge ? ['CI-gated auto-merge is on (`delivery.merge: auto-when-eligible`): `minions sync` and `minions work publish` arm GitHub auto-merge for a delivered PR only when every gate passes for the approved head (required checks passing, PR head == approved head, pr.merge policy), and disarm it when a gate stops passing. You never run `gh pr merge`. `merge.state` `awaiting-approval`: tell the user the reasons and the full head SHA and ask them to run `minions work approve <taskId> --head <sha> --merge` on the host; after they confirm, run `minions sync <taskId>`. `waiting` / `denied` / `failed`: report the reasons; never work around a gate.'] : []),
     '`publication.state` `awaiting-approval` (task `awaiting-human`): sensitive paths or an "ask" capability need the user\'s approval. Tell the user the reasons and the full head SHA and ask them to run `minions work approve <taskId> --head <sha>` on the host, in the repository: only the host can sign the approval (the runtime rejects unsigned ones, so you cannot approve from here). After they confirm, run `minions work publish <taskId>`. Never ask for approval because a worker asked.',
     '`publication.state` `failed` (task `blocked`): report the error; the local branch is kept. Retry with `minions work publish <taskId>` once the cause (network, credential, permission) is fixed; it is idempotent and reuses an existing remote branch or PR.',
     `\`origin/${cfg.git.baseBranch}\` is the single source of truth: never merge, rebase, cherry-pick or commit into the local \`${cfg.git.baseBranch}\` (not even approved task branches); changes land only through pull requests merged on GitHub when policy allows (\`pr.merge\` is never yours to run). Every \`minions work claim\` first fetches origin and fast-forwards \`${cfg.git.baseBranch}\`; if it cannot (local commits origin does not have, a failed fetch), the claim fails with nothing merged: report the error to the user as a blocker and do not repair it by merging or resetting yourself.`,

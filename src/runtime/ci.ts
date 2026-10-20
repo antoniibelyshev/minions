@@ -17,6 +17,7 @@ import type { RuntimeDb } from './db.js';
 import { normalizeGithubRemote, type GitFn } from './github.js';
 import { realGh, type GhFn } from './publish.js';
 import { ciTimeoutOf, evaluateCiGate, formatCiGate, type CiGate } from './ci-gate.js';
+import type { MergeResult } from './merge.js';
 
 // ---------------------------------------------------------------- read-only API access
 
@@ -267,12 +268,18 @@ export interface SyncTaskResult {
   statusChange?: { from: TaskStatus; to: TaskStatus };
   /** verification.ciAuthority github: the CI evidence gate for the PR head (src/runtime/ci-gate.ts). */
   gate?: CiGate;
+  /** delivery.merge "auto-when-eligible": the auto-merge pass for this task (src/runtime/merge.ts). */
+  merge?: MergeResult;
   warnings: string[];
   error?: string;
 }
 export interface SyncReport { tasks: SyncTaskResult[]; synced: number; failed: number }
 
-export interface SyncDeps { db: RuntimeDb; backlog: BacklogAdapter; config: MinionsConfig; gh?: GhFn }
+export interface SyncDeps {
+  db: RuntimeDb; backlog: BacklogAdapter; config: MinionsConfig; gh?: GhFn;
+  /** Auto-merge pass for an open PR after its observation is recorded (`Scheduler.autoMerge`); omitted: read-only sync. */
+  merge?: (taskId: string) => Promise<MergeResult>;
+}
 
 const PR_FIELDS = 'url,state,isDraft,headRefOid,baseRefName,mergedAt,closedAt,mergeStateStatus,statusCheckRollup';
 const SKIP_STATUSES: TaskStatus[] = ['done', 'cancelled'];
@@ -287,7 +294,9 @@ function describeObservation(r: { prState: PrState; ci: CiSummary; headSha: stri
 
 /**
  * Refreshes PR state and check results for tasks with a prUrl (all, or the given ids). Records `ci`
- * evidence per head, notes on change, and reconciles merged/closed PRs. Never merges or writes to GitHub.
+ * evidence per head, notes on change, and reconciles merged/closed PRs. Read-only on GitHub, except the
+ * optional auto-merge pass (`deps.merge`, delivery.merge "auto-when-eligible"), which arms or disarms
+ * GitHub auto-merge through its own gates; sync itself never merges.
  */
 export async function syncTasks(deps: SyncDeps, opts: { taskIds?: string[] } = {}): Promise<SyncReport> {
   const gh = deps.gh ?? realGh;
@@ -305,12 +314,12 @@ export async function syncTasks(deps: SyncDeps, opts: { taskIds?: string[] } = {
     if (!required.has(repository)) required.set(repository, requiredChecksStatus(ghApi(gh), repository, config.git.baseBranch).catch(() => null));
     return required.get(repository)!;
   };
-  for (const task of tasks) out.push(await syncOne(task, { db, backlog, config, gh, leased, requiredFor }));
+  for (const task of tasks) out.push(await syncOne(task, { db, backlog, config, gh, leased, requiredFor, merge: deps.merge }));
   db.addEvent('sync', null, { tasks: out.length, failed: out.filter((t) => t.error).length });
   return { tasks: out, synced: out.filter((t) => !t.error).length, failed: out.filter((t) => t.error).length };
 }
 
-async function syncOne(task: Task, x: { db: RuntimeDb; backlog: BacklogAdapter; config: MinionsConfig; gh: GhFn; leased: Set<string>; requiredFor: (prUrl: string) => Promise<RequiredChecksReport | null> }): Promise<SyncTaskResult> {
+async function syncOne(task: Task, x: { db: RuntimeDb; backlog: BacklogAdapter; config: MinionsConfig; gh: GhFn; leased: Set<string>; requiredFor: (prUrl: string) => Promise<RequiredChecksReport | null>; merge?: SyncDeps['merge'] }): Promise<SyncTaskResult> {
   const prUrl = task.prUrl!;
   const res: SyncTaskResult = { taskId: task.id, prUrl, changed: false, warnings: [] };
   const r = await x.gh(['pr', 'view', prUrl, '--json', PR_FIELDS]);
@@ -352,7 +361,7 @@ async function syncOne(task: Task, x: { db: RuntimeDb; backlog: BacklogAdapter; 
       timeoutMinutes: ciTimeoutOf(x.config), observations: x.db.evidenceFor(task.id, pr.headRefOid, 'ci') });
   }
   if (res.changed) {
-    await x.backlog.addNote(task.id, `minions sync: ${describeObservation({ prState, ci, headSha: pr.headRefOid })}. ${prState === 'OPEN' ? 'Not merged; minions never merges.' : ''}`.trim());
+    await x.backlog.addNote(task.id, `minions sync: ${describeObservation({ prState, ci, headSha: pr.headRefOid })}. ${prState === 'OPEN' ? (x.config.delivery.merge === 'auto-when-eligible' ? 'Not merged yet.' : 'Not merged; minions never merges.') : ''}`.trim());
   }
 
   // Reconcile merged / closed PRs (never while a worker holds the task).
@@ -361,6 +370,12 @@ async function syncOne(task: Task, x: { db: RuntimeDb; backlog: BacklogAdapter; 
   } else if (prState === 'MERGED' && !SKIP_STATUSES.includes(task.status)) {
     await x.backlog.closeTask(task.id, 'done');
     res.statusChange = { from: task.status, to: 'done' };
+    // Merged is recorded distinctly from delivered: `merge` evidence bound to the merged head.
+    if (!x.db.evidenceOfKind(task.id, 'merge').some((e) => e.outcome === 'merged')) {
+      x.db.addEvidence({ task_id: task.id, head_sha: pr.headRefOid, kind: 'merge', config_revision: x.config.configRevision, outcome: 'merged',
+        details_json: JSON.stringify({ prUrl, mergedAt: pr.mergedAt ?? null, how: 'github' }) });
+    }
+    await x.backlog.addNote(task.id, `minions sync: pull request ${prUrl} was merged${pr.mergedAt ? ` at ${pr.mergedAt}` : ''}; task done (merged).`);
   } else if (prState === 'CLOSED' && DELIVERY_STATUSES.includes(task.status)) {
     const cur = await x.backlog.getTask(task.id); // the note above may have changed the version
     await x.backlog.updateTask(task.id, cur.version, { status: 'blocked' });
@@ -368,6 +383,13 @@ async function syncOne(task: Task, x: { db: RuntimeDb; backlog: BacklogAdapter; 
     res.statusChange = { from: task.status, to: 'blocked' };
   }
   x.db.addEvent('ci-observation', task.id, { prUrl, prState, head: pr.headRefOid, ci: ci.state, statusChange: res.statusChange ?? null });
+  if (prState === 'OPEN' && x.merge) {
+    try {
+      const m = await x.merge(task.id);
+      if (m.state !== 'off') res.merge = m;
+      if (m.merged) res.statusChange = { from: task.status, to: 'done' };
+    } catch (e) { res.warnings.push(`auto-merge not evaluated: ${(e as Error).message}`); }
+  }
   return res;
 }
 
@@ -376,7 +398,7 @@ export function formatSync(r: SyncReport): string {
   const L = r.tasks.map((t) => t.error
     ? `${t.taskId}: error: ${t.error}`
     : `${t.taskId}: ${describeObservation({ prState: t.prState!, ci: t.ci!, headSha: t.headSha! })}${t.statusChange ? `; status ${t.statusChange.from} -> ${t.statusChange.to}` : ''}${t.changed ? '' : ' (unchanged)'}  ${t.prUrl}` +
-      (t.gate ? `\n  ${formatCiGate(t.gate)}` : '') + t.warnings.map((w) => `\n  warning: ${w}`).join(''));
+      (t.gate ? `\n  ${formatCiGate(t.gate)}` : '') + (t.merge ? `\n  merge ${t.merge.state}: ${t.merge.message}` : '') + t.warnings.map((w) => `\n  warning: ${w}`).join(''));
   L.push(`synced ${r.synced}, failed ${r.failed}`);
   return L.join('\n');
 }

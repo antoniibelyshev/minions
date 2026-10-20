@@ -126,7 +126,7 @@ describe('validation', () => {
     expect(SUPPORTED.delivery).toEqual(['local', 'branch', 'pull-request']);
   });
 
-  it('accepts branch and pull-request delivery with the github provider; merge stays deferred', () => {
+  it('accepts branch and pull-request delivery with the github provider; merge requests stay deferred, auto-merge is opt-in', () => {
     for (const mode of ['branch', 'pull-request'] as const) {
       const c = validateConfig({ ...defaults(), delivery: { ...defaults().delivery, provider: 'github', mode } });
       expect(c.delivery.mode).toBe(mode);
@@ -135,7 +135,12 @@ describe('validation', () => {
     const pr = { ...defaults(), delivery: { ...defaults().delivery, provider: 'github' as const, mode: 'pull-request' as const, merge: 'manual' as const } };
     expect(listUnavailable(validateConfig(pr)).find((u) => u.path === 'delivery.merge')?.reason).toMatch(/never merges/);
     const auto = { ...pr, delivery: { ...pr.delivery, merge: 'auto-when-eligible' as const, requiredChecksConfigured: true } };
-    expect(listUnavailable(validateConfig(auto)).find((u) => u.path === 'delivery.merge')?.reason).toMatch(/deferred/);
+    expect(listUnavailable(validateConfig(auto)).find((u) => u.path === 'delivery.merge')?.reason).toMatch(/ciAuthority is not "github"/);
+    // With every configuration prerequisite, auto-merge is available (each PR still passes its own gates).
+    const ready = { ...auto, verification: { ...auto.verification, ciAuthority: 'github' as const } };
+    expect(listUnavailable(validateConfig(ready)).map((u) => u.path)).not.toContain('delivery.merge');
+    const branchAuto = { ...ready, delivery: { ...ready.delivery, mode: 'branch' as const } };
+    expect(listUnavailable(validateConfig(branchAuto)).find((u) => u.path === 'delivery.merge')?.reason).toMatch(/needs pull-request delivery/);
     expect(resolve({ defaults: defaults(), project: { delivery: { provider: 'github', mode: 'branch' } } }).config.delivery.mode).toBe('branch');
   });
 });

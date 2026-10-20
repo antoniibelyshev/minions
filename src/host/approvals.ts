@@ -9,7 +9,7 @@
 import { chmod, readFile, rm } from 'node:fs/promises';
 import { userInfo } from 'node:os';
 import { dirname } from 'node:path';
-import { generateApprovalKeyPair, publicKeyOf, signApproval, type ApprovalPayload } from '../core/approval.js';
+import { generateApprovalKeyPair, publicKeyOf, signApproval, type ApprovalPayload, type ApprovalScope } from '../core/approval.js';
 import { MinionsError } from '../core/errors.js';
 import { atomicWrite, ensureDir } from '../core/fsutil.js';
 import { credentialStoreDir, credentialStoreFile, projectPaths } from '../core/paths.js';
@@ -60,8 +60,8 @@ export async function ensureApprovalKey(projectId: string): Promise<{ privateKey
   return { privateKeyPem, publicKeyPem, created };
 }
 
-/** Signs a publication approval for (taskId, head) with the project's host-held key. */
-export async function issueApproval(projectId: string, f: { taskId: string; head: string; by?: string | null; now?: Date; ttlMs?: number }): Promise<{ token: string; payload: ApprovalPayload; keyCreated: boolean }> {
+/** Signs an approval (publish, or merge) for (taskId, head) with the project's host-held key. */
+export async function issueApproval(projectId: string, f: { taskId: string; head: string; by?: string | null; now?: Date; ttlMs?: number; scope?: ApprovalScope }): Promise<{ token: string; payload: ApprovalPayload; keyCreated: boolean }> {
   const key = await ensureApprovalKey(projectId);
   try {
     const { token, payload } = signApproval(key.privateKeyPem, f);
@@ -84,7 +84,7 @@ export async function removeApprovalKeys(projectId: string): Promise<void> {
  * Refused inside the minions container (detected from the filesystem, so unsetting MINIONS_RUNTIME
  * does not help): a key minted there would be useless and would only litter the container.
  */
-export async function approveOnHost(taskId: string, o: { head: string; by?: string; note?: string; json: boolean; cwd?: string },
+export async function approveOnHost(taskId: string, o: { head: string; by?: string; note?: string; json: boolean; cwd?: string; merge?: boolean },
   deps: { delegate?: (args: string[], opts: { json: boolean; cwd?: string }) => Promise<number>; projectId?: string; inContainer?: boolean } = {}): Promise<number> {
   if (deps.inContainer ?? inMinionsContainer()) {
     throw new MinionsError('INCOMPATIBLE_RUNTIME', 'Approvals can only be signed by the host CLI; this is the minions container.',
@@ -92,8 +92,9 @@ export async function approveOnHost(taskId: string, o: { head: string; by?: stri
   }
   const projectId = deps.projectId ?? (await projectForPath(o.cwd ?? process.cwd())).projectId;
   const by = o.by ?? userInfo().username;
-  const { token } = await issueApproval(projectId, { taskId, head: o.head, by });
-  const args = ['work', 'approve', taskId, '--head', o.head, '--by', by, ...(o.note ? ['--note', o.note] : []), '--signature', token];
+  // --merge: a merge-scoped approval (pr.merge "ask"), never usable as a publication approval and vice versa.
+  const { token } = await issueApproval(projectId, { taskId, head: o.head, by, scope: o.merge ? 'merge' : 'publish' });
+  const args = ['work', 'approve', taskId, '--head', o.head, '--by', by, ...(o.merge ? ['--merge'] : []), ...(o.note ? ['--note', o.note] : []), '--signature', token];
   const delegate = deps.delegate ?? delegateToRuntime;
   return delegate(args, { json: o.json, cwd: o.cwd });
 }

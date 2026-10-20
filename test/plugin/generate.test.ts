@@ -471,7 +471,24 @@ describe('coordinator prompt: origin/<base> as the single source of truth', () =
     }
     const local = await (await gen(defaults())).read('coordinator.md');
     expect(local).not.toContain('single source of truth');
+    expect(local).not.toContain('CI-gated auto-merge is on');
     expect(local).toContain('the user fetches branches with `minions export` on the host');
+  });
+});
+
+describe('coordinator prompt: CI-gated auto-merge (task-1.9)', () => {
+  it('explains merge states and the host-signed --merge approval only when auto-merge is on', async () => {
+    const cfg = defaults();
+    Object.assign(cfg.delivery, { mode: 'pull-request', provider: 'github' });
+    const off = await (await gen(cfg)).read('coordinator.md');
+    expect(off).toContain('minions never merges pull requests');
+    expect(off).not.toContain('--merge');
+    cfg.delivery.merge = 'auto-when-eligible';
+    const on = await (await gen(cfg)).read('coordinator.md');
+    expect(on).toContain('CI-gated auto-merge is on');
+    expect(on).toContain('minions work approve <taskId> --head <sha> --merge');
+    expect(on).toMatch(/You never run `gh pr merge`/);
+    expect(on).not.toContain('minions never merges pull requests');
   });
 });
 
