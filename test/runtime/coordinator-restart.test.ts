@@ -41,6 +41,8 @@ function tmux(running: boolean) {
 }
 
 const noSleep = async () => {};
+/** --permission-mode choices of the installed Claude Code: never the real `claude --help` (task-38). */
+const autoModes = async () => ['acceptEdits', 'auto'];
 
 describe('coordinator restart --recover', () => {
   it('kills the running session and relaunches it detached with the recovery wrapper flag', async () => {
@@ -60,7 +62,7 @@ describe('coordinator restart --recover', () => {
   it('restarts even when the launch fingerprint is unchanged; without --recover the wrapper gets no flag', async () => {
     const paths = layout();
     const { spawn } = fakeSpawn();
-    await runCoordinator(defaults(), { paths, spawn, env: {}, log: () => {} }); // writes a current launch record
+    await runCoordinator(defaults(), { paths, spawn, permissionModes: autoModes, env: {}, log: () => {} }); // writes a current launch record
     const t = tmux(true);
     const r = await restartCoordinator(defaults(), { paths, runner: t.runner, activeLeases: () => [], sleep: noSleep });
     expect(r.action).toBe('restarted');
@@ -117,7 +119,7 @@ describe('recovery startup prompt', () => {
   it('the wrapper passes the recovery prompt to claude as the first user message, after --', async () => {
     const paths = layout();
     const { calls, spawn } = fakeSpawn();
-    await runCoordinator(defaults(), { paths, spawn, env: {}, log: () => {}, startupPrompt: RECOVERY_PROMPT });
+    await runCoordinator(defaults(), { paths, spawn, permissionModes: autoModes, env: {}, log: () => {}, startupPrompt: RECOVERY_PROMPT });
     expect(calls[0]!.args.slice(-2)).toEqual(['--', RECOVERY_PROMPT]);
     const plain = await buildClaudeCommand(defaults(), paths);
     expect(plain.args).not.toContain(RECOVERY_PROMPT);
@@ -162,7 +164,7 @@ describe('recovery prompt with Telegram enabled', () => {
       calls.push({ args, env: opts.env });
       return { on(event: string, cb: (...a: unknown[]) => void) { if (event === 'exit') setImmediate(() => cb(0, null)); return this; } } as ReturnType<SpawnLike>;
     };
-    await runCoordinator(telegramCfg(), { paths, spawn, env: {}, probe: async () => available(), log: () => {}, startupPrompt: RECOVERY_PROMPT });
+    await runCoordinator(telegramCfg(), { paths, spawn, permissionModes: autoModes, env: {}, probe: async () => available(), log: () => {}, startupPrompt: RECOVERY_PROMPT });
     const args = calls[0]!.args;
     expect(args.slice(-4)).toEqual(['--channels', TELEGRAM_CHANNEL_SPEC, '--', RECOVERY_PROMPT]);
     const dashdash = args.indexOf('--');
@@ -179,7 +181,7 @@ describe('recovery prompt with Telegram enabled', () => {
       calls.push(args);
       return { on(event: string, cb: (...a: unknown[]) => void) { if (event === 'exit') setImmediate(() => cb(0, null)); return this; } } as ReturnType<SpawnLike>;
     };
-    await runCoordinator(telegramCfg(), { paths, spawn, env: {}, probe: async () => available(), log: () => {} });
+    await runCoordinator(telegramCfg(), { paths, spawn, permissionModes: autoModes, env: {}, probe: async () => available(), log: () => {} });
     expect(calls[0]).not.toContain('--');
     expect(calls[0]!.slice(-2)).toEqual(['--channels', TELEGRAM_CHANNEL_SPEC]);
     expect(calls[0]!.indexOf('--settings')).toBeLessThan(calls[0]!.indexOf('--channels'));
@@ -251,7 +253,7 @@ describe('coordinator restart edge cases', () => {
   it('the forced restart event lists lease ids but never the bot token', async () => {
     const paths = tgLayout();
     const { spawn } = fakeSpawn();
-    await runCoordinator(telegramCfg(), { paths, spawn, env: {}, probe: async () => available(), log: () => {} });
+    await runCoordinator(telegramCfg(), { paths, spawn, permissionModes: autoModes, env: {}, probe: async () => available(), log: () => {} });
     const db = openDb(join(tmp('minions-restart-db-'), 'runtime.db'));
     const t = tmux(true);
     const r = await restartCoordinator(telegramCfg(), { paths, runner: t.runner, activeLeases: () => [{ id: 'lease-9' }], recordRestart: coordinatorRestartRecorder(db), sleep: noSleep }, { recover: true, force: true });
@@ -267,7 +269,7 @@ describe('coordinator restart edge cases', () => {
   it('a running session with a changed fingerprint keeps the config-change reason', async () => {
     const paths = tgLayout();
     const { spawn } = fakeSpawn();
-    await runCoordinator(telegramCfg(), { paths, spawn, env: {}, probe: async () => available(), log: () => {} });
+    await runCoordinator(telegramCfg(), { paths, spawn, permissionModes: autoModes, env: {}, probe: async () => available(), log: () => {} });
     const t = tmux(true);
     const r = await restartCoordinator(defaults(), { paths, runner: t.runner, activeLeases: () => [], sleep: noSleep });
     expect(r).toMatchObject({ action: 'restarted', reason: 'communication.channel changed (telegram -> auto); coordinator relaunched detached' });

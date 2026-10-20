@@ -319,7 +319,8 @@ export function register(program: Command): void {
     .option('--recover', 'start claude with the recovery prompt (recover skill, then resume the queue)')
     .action(action(async (o: { recover?: boolean }) => {
       requireMode('runtime');
-      process.exitCode = await coordinatorWrapper(getConfig, o.recover ? { startupPrompt: RECOVERY_PROMPT } : {});
+      // A signal before claude starts: exit now rather than wait for a probe still in flight.
+      process.exitCode = await coordinatorWrapper(getConfig, { ...(o.recover ? { startupPrompt: RECOVERY_PROMPT } : {}), exitAfterSignal: (c) => process.exit(c) });
     }));
   coord.command('sync').description('Apply restart-required Telegram changes with a controlled coordinator restart (container only)')
     .option('--force', 'restart even while worker leases are active (they stay recorded for recovery)')

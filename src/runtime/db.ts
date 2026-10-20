@@ -110,7 +110,11 @@ export function pidAlive(pid: number): boolean {
   try { process.kill(pid, 0); return true; } catch (e) { return (e as NodeJS.ErrnoException).code === 'EPERM'; }
 }
 
-export interface CoordinatorLock { pid: number; session: string; acquiredAt: string }
+/**
+ * `start`: the holder's process start time (/proc/<pid>/stat field 22, clock ticks since boot) when it
+ * could be read. With it a reused pid (a tmux client, `minions coordinator sync`) is never the holder.
+ */
+export interface CoordinatorLock { pid: number; session: string; acquiredAt: string; start?: string }
 
 /** A durable drain request (`minions pause --starts --drain`): workers wind down to a checkpoint and return partial. */
 export interface DrainRequest { reason: string; requestedAt: string; eventId: number }
@@ -354,14 +358,14 @@ export class RuntimeDb {
    * Acquires the project coordinator lock; CONFLICT if another live holder has it. Re-entrant for the
    * same pid+session. A holder that is not `alive` (crashed wrapper, reused pid) is taken over.
    */
-  acquireCoordinatorLock(session: string, pid = process.pid, alive: (pid: number) => boolean = pidAlive): CoordinatorLock {
+  acquireCoordinatorLock(session: string, pid = process.pid, alive: (pid: number, lock?: CoordinatorLock) => boolean = pidAlive, start?: string | null): CoordinatorLock {
     return this.transaction(() => {
       const cur = this.coordinatorLock();
-      if (cur && !(cur.pid === pid && cur.session === session) && alive(cur.pid)) {
+      if (cur && !(cur.pid === pid && cur.session === session) && alive(cur.pid, cur)) {
         throw new MinionsError('CONFLICT', `Another coordinator holds the project lock (pid ${cur.pid}, session ${cur.session}, since ${cur.acquiredAt}).`,
           'Attach to the existing coordinator (minions start) instead of launching a second one.', cur);
       }
-      const lock: CoordinatorLock = { pid, session, acquiredAt: cur && cur.pid === pid && cur.session === session ? cur.acquiredAt : nowIso() };
+      const lock: CoordinatorLock = { pid, session, acquiredAt: cur && cur.pid === pid && cur.session === session ? cur.acquiredAt : nowIso(), ...(start ? { start } : {}) };
       this.setMeta('coordinator_lock', JSON.stringify(lock));
       if (!cur || cur.pid !== pid || cur.session !== session) this.addEvent('coordinator-lock', null, { ...lock, replaced: cur ?? null });
       return lock;
