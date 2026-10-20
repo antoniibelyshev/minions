@@ -1,4 +1,4 @@
-import { chmodSync, utimesSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, lutimesSync, utimesSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
@@ -319,5 +319,31 @@ describe('lease scratch deletion safety', () => {
     expect(sl.removed).toEqual([]);
     expect(sl.errors.join()).toMatch(/symlink/);
     expect(existsSync(again)).toBe(true);
+  });
+
+  it('root sweep never follows a symlink inside an old entry; empty tmpRoot means no sweep', async () => {
+    const env = makeEnv();
+    const root = join(env.root, 'cache', 'tmp');
+    const outside = join(env.root, 'outside-target');
+    mkdirSync(outside, { recursive: true });
+    writeFileSync(join(outside, 'precious'), 'p');
+    const old = join(root, 'old-entry');
+    mkdirSync(old, { recursive: true });
+    symlinkSync(outside, join(old, 'link'));
+    const past = new Date(Date.now() - 48 * 3600_000);
+    lutimesSync(join(old, 'link'), past, past);
+    utimesSync(old, past, past);
+    const r = await sweepTmpRoot(root, 'leases');
+    expect(r.removed).toEqual(['old-entry']);
+    expect(existsSync(old)).toBe(false);
+    expect(readFileSync(join(outside, 'precious'), 'utf8')).toBe('p');
+    const env2 = makeEnv();
+    const p = paths(env2);
+    const old2 = join(p.scratch!, '..', 'old2');
+    mkdirSync(old2, { recursive: true });
+    utimesSync(old2, past, past);
+    p.tmpRoot = '';
+    await sweepScratchOnStart(env2.db, p, () => undefined);
+    expect(existsSync(old2)).toBe(true);
   });
 });
