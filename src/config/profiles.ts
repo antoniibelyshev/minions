@@ -19,8 +19,18 @@ export function githubDeliveryUnavailableReason(ctx: Pick<ProfileContext, 'hasGi
 }
 
 /**
+ * Delivery mode offered as the default answer (PR-first): pull-request whenever branch/PR delivery is
+ * selectable (GitHub remote + stored token, git.push not denied) and the current mode is local; an
+ * explicit branch / pull-request choice is kept. Blocked projects stay local. Local stays selectable.
+ */
+export function defaultDeliveryMode(current: MinionsConfig['delivery']['mode'], blocked: boolean): MinionsConfig['delivery']['mode'] {
+  if (blocked) return 'local';
+  return current === 'local' ? 'pull-request' : current;
+}
+
+/**
  * Explicit config values for a profile (spec §4). Where the profile's intent needs a feature this
- * build lacks (GitHub Issues, auto-merge, GitHub CI authority) or a prerequisite is missing (PR
+ * build lacks (GitHub Issues, auto-merge) or a prerequisite is missing (PR
  * delivery without a GitHub remote and token) the supported fallback is used and a note explains it.
  */
 export function profileDefaults(profile: Profile, ctx: ProfileContext): { config: MinionsConfig; notes: string[] } {
@@ -36,7 +46,7 @@ export function profileDefaults(profile: Profile, ctx: ProfileContext): { config
     notes.push('unavailable: GitHub Issues backlog (project-owner default) is deferred in v0.1; using Backlog.md.');
     if (githubBlocked) notes.push(`unavailable: pull-request delivery (project-owner default) needs a GitHub remote and token: ${githubBlocked}; using local delivery.`);
     notes.push('unavailable: auto-merge-when-eligible is deferred in v0.1; merge stays disabled (minions never merges pull requests; with local delivery the coordinator integrates into the container\'s local base).');
-    notes.push('unavailable: GitHub CI authority is deferred in v0.1; verification.ciAuthority is "none".');
+    notes.push('GitHub CI authority is opt-in: once required checks are configured on the base branch (`minions doctor` ci.authority), set verification.ciAuthority "github" so tester/reviewer stages can rely on passing required checks for the reviewed head.');
   } else if (profile === 'personal-work') {
     notes.push(githubBlocked
       ? `unavailable: pull-request delivery needs a GitHub remote and token: ${githubBlocked}; using local delivery.`

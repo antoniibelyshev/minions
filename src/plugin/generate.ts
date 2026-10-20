@@ -150,6 +150,29 @@ function deliveryGuidance(cfg: MinionsConfig): string {
   ].join(' ');
 }
 
+/** Tester/reviewer: when the brief's CI gate lets them rely on CI instead of re-running the full verification. */
+function ciWorkerGuidance(cfg: MinionsConfig): string {
+  if (cfg.verification.ciAuthority !== 'github') {
+    return 'CI is not a verification authority for this project (`verification.ciAuthority` is `none`): run the verification commands yourself and report what you ran. Never report a check with `"source": "ci"`; such a result is rejected.';
+  }
+  return [
+    'This project trusts GitHub CI (`verification.ciAuthority: github`). The brief\'s `ci` field is the runtime\'s CI evidence gate for exactly `expectedHead`: the base branch\'s required checks, matched against what `minions sync` observed on the pull request for that head.',
+    '',
+    '- `ci.state` `pass`: you may rely on CI instead of re-running the full verification. Report each required check you rely on as `{ "command": "<check name>", "outcome": "pass", "source": "ci", "details": "required CI check" }` (names from `ci.requiredChecks`). Still do your own job: the reviewer reads the diff and judges the tests; the tester does system-level QA and runs the targeted checks the change needs (report those as normal checks).',
+    '- Any other state (`fail`, `pending`, `timeout`, `missing`, `unknown`) or no `ci` field: CI is not evidence. Run the verification commands ({{verificationCommandsInline}}) locally and report them as normal checks. With `fail`, the failing required checks are findings.',
+    '- Never claim CI results you looked up yourself (PR page, `gh`). The runtime re-checks every `"source": "ci"` entry against the recorded observation for the head: an entry for a check that did not pass is rejected, and missing, failing, pending or unreadable CI never approves.',
+  ].join('\n');
+}
+
+/** Coordinator: how the CI evidence gate shows up in record responses. */
+function ciCoordinatorGuidance(cfg: MinionsConfig): string {
+  if (cfg.verification.ciAuthority !== 'github') return 'CI is not a verification authority (`verification.ciAuthority: none`): testers and reviewers verify locally.';
+  return [
+    'CI authority (`verification.ciAuthority: github`): a tester/reviewer may rely on passing required CI checks for the exact head instead of re-running the full verification. Run `minions sync` once before claiming a tester/reviewer for a task with a PR (never in a loop) so the observation is current; the claim brief carries the gate (`ci.state`).',
+    'The runtime decides, not the worker: a result citing CI is approved only when every required check passed for that head. Otherwise the record response says "Not approved": CI `fail` → `changes-requested` (repair with the failing checks); `pending` → the task stays in its stage: `minions sync` later and re-dispatch, or re-dispatch with the note "verify locally"; a result that falls back to local checks is approved only if every configured verification command passed locally; `missing`/`unknown`/`timeout` → re-dispatch the same role with the note "CI is not usable: run the verification commands locally". Never approve or report a task as verified on missing CI.',
+  ].join(' ');
+}
+
 /** One-line integration rule for the orchestrate skill, consistent with deliveryGuidance. */
 function integrationRule(cfg: MinionsConfig): string {
   const base = code(cfg.git.baseBranch);
@@ -305,6 +328,8 @@ function baseVars(cfg: MinionsConfig): Record<string, string> {
     testingGuidance: testingGuidance(cfg),
     reviewerStage: cfg.verification.reviewerRequired ? 'reviewer' : 'reviewer (optional)',
     startReadyGuidance: startReadyGuidance(cfg),
+    ciWorkerGuidance: ciWorkerGuidance(cfg).replace('{{verificationCommandsInline}}', inlineList(cfg.verification.commands, 'the project\'s own checks')),
+    ciCoordinatorGuidance: ciCoordinatorGuidance(cfg),
   };
 }
 

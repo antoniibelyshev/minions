@@ -16,6 +16,7 @@ import { redact } from '../core/output.js';
 import type { RuntimeDb } from './db.js';
 import { normalizeGithubRemote, type GitFn } from './github.js';
 import { realGh, type GhFn } from './publish.js';
+import { ciTimeoutOf, evaluateCiGate, formatCiGate, type CiGate } from './ci-gate.js';
 
 // ---------------------------------------------------------------- read-only API access
 
@@ -65,6 +66,11 @@ export interface RequiredChecksReport {
   /** configured: at least one required status check applies to the base; none: verified that none do; unknown: could not tell. */
   state: 'configured' | 'none' | 'unknown';
   requiredChecks: string[];
+  /**
+   * Required checks with the source GitHub pins them to: `appId` is the GitHub App that must report the
+   * check (protection `checks[].app_id`, ruleset `integration_id`); null = any source (name-only match).
+   */
+  requirements?: RequiredCheck[];
   protection: { protected: boolean; contexts: string[] } | null;
   rulesets: { contexts: string[] } | null;
   /** GitHub Actions workflows in the repository (null when not readable). */
@@ -72,11 +78,18 @@ export interface RequiredChecksReport {
   errors: string[];
 }
 
+export interface RequiredCheck { context: string; appId: number | null }
+
+/** A positive app id pins the check to that GitHub App; null / -1 / absent means any source. */
+export const pinOf = (v: unknown): number | null => (typeof v === 'number' && Number.isInteger(v) && v > 0 ? v : null);
+
 const segs = (s: string) => s.split('/').map(encodeURIComponent).join('/');
 
 /** Reads required status checks for the base branch. Read-only; never throws for API failures. */
 export async function requiredChecksStatus(api: ApiGet, repository: string, baseBranch: string): Promise<RequiredChecksReport> {
   const errors: string[] = [];
+  const reqs = new Map<string, RequiredCheck>();
+  const require = (context: string, appId: number | null) => { reqs.set(`${context}\0${appId ?? ''}`, { context, appId }); };
   const repo = segs(repository);
   const [b, rules, wf] = await Promise.all([
     api(`/repos/${repo}/branches/${segs(baseBranch)}`),
@@ -90,8 +103,15 @@ export async function requiredChecksStatus(api: ApiGet, repository: string, base
     const rsc = body.protection?.required_status_checks;
     const contexts = new Set<string>();
     if (rsc && rsc.enforcement_level !== 'off') {
-      if (Array.isArray(rsc.contexts)) for (const c of rsc.contexts) if (typeof c === 'string') contexts.add(c);
-      if (Array.isArray(rsc.checks)) for (const c of rsc.checks) if (typeof (c as { context?: unknown })?.context === 'string') contexts.add((c as { context: string }).context);
+      // `checks` (with app_id) supersedes the legacy `contexts` list for the same name.
+      const pinned = new Set<string>();
+      if (Array.isArray(rsc.checks)) {
+        for (const c of rsc.checks as { context?: unknown; app_id?: unknown }[]) {
+          if (typeof c?.context !== 'string') continue;
+          contexts.add(c.context); pinned.add(c.context); require(c.context, pinOf(c.app_id));
+        }
+      }
+      if (Array.isArray(rsc.contexts)) for (const c of rsc.contexts) if (typeof c === 'string') { contexts.add(c); if (!pinned.has(c)) require(c, null); }
     }
     protection = { protected: !!body.protected, contexts: [...contexts] };
   } else {
@@ -101,9 +121,9 @@ export async function requiredChecksStatus(api: ApiGet, repository: string, base
   let rulesets: RequiredChecksReport['rulesets'] = null;
   if (rules.status === 200 && Array.isArray(rules.body)) {
     const contexts = new Set<string>();
-    for (const r of rules.body as { type?: string; parameters?: { required_status_checks?: { context?: unknown }[] } }[]) {
+    for (const r of rules.body as { type?: string; parameters?: { required_status_checks?: { context?: unknown; integration_id?: unknown }[] } }[]) {
       if (r?.type !== 'required_status_checks') continue;
-      for (const c of r.parameters?.required_status_checks ?? []) if (typeof c?.context === 'string') contexts.add(c.context);
+      for (const c of r.parameters?.required_status_checks ?? []) if (typeof c?.context === 'string') { contexts.add(c.context); require(c.context, pinOf(c.integration_id)); }
     }
     rulesets = { contexts: [...contexts] };
   } else if (rules.status !== 404) {
@@ -114,9 +134,21 @@ export async function requiredChecksStatus(api: ApiGet, repository: string, base
     ? (wf.body as { total_count: number }).total_count : null;
 
   const requiredChecks = [...new Set([...(protection?.contexts ?? []), ...(rulesets?.contexts ?? [])])].sort();
-  // "none" only when both sources were read (a 404 for rules means no rulesets apply).
-  const state = requiredChecks.length ? 'configured' : protection && (rulesets || rules.status === 404) ? 'none' : 'unknown';
-  return { repository, baseBranch, state, requiredChecks, protection, rulesets, workflows, errors };
+  // Both sources must be read (a 404 for rules means no rulesets apply): a partial read is `unknown`
+  // even when the readable source lists checks, because the unreadable one may require more.
+  const complete = !!protection && (!!rulesets || rules.status === 404);
+  const state = !complete ? 'unknown' : requiredChecks.length ? 'configured' : 'none';
+  const requirements = [...reqs.values()].sort((a, b) => a.context.localeCompare(b.context) || (a.appId ?? 0) - (b.appId ?? 0));
+  return { repository, baseBranch, state, requiredChecks, requirements, protection, rulesets, workflows, errors };
+}
+
+/** Required checks of the base for the workspace origin via read-only `gh api` GETs; null when origin is not on GitHub. */
+export async function readRequiredChecks(repo: string, cfg: Pick<MinionsConfig, 'git'>, deps: { git: GitFn; gh: GhFn }): Promise<RequiredChecksReport | null> {
+  const o = await deps.git(repo, ['config', '--get', 'remote.origin.url'], true);
+  const https = o.code === 0 ? normalizeGithubRemote(o.stdout.trim()) : null;
+  if (!https) return null;
+  const repository = https.replace(/^https:\/\/github\.com\//, '').replace(/\.git$/, '');
+  return requiredChecksStatus(ghApi(deps.gh), repository, cfg.git.baseBranch);
 }
 
 // ---------------------------------------------------------------- setup guidance
@@ -144,9 +176,20 @@ export function ciSetupPlan(o: { hasWorkflows: boolean | null; requiredChecks: '
 // ---------------------------------------------------------------- check rollup
 
 export type CiState = 'no-checks' | 'awaiting-ci' | 'passing' | 'failing';
-export interface CiSummary { state: CiState; total: number; passed: number; failed: string[]; pending: string[] }
+/**
+ * Per-check result. pass = SUCCESS / NEUTRAL only; skipped is kept apart because it is never CI
+ * evidence; a completed check run with a missing or unrecognised conclusion is pending (fail closed).
+ */
+export type CheckState = 'pass' | 'fail' | 'pending' | 'skipped';
+/** One observed check. `source`: check run or commit status; `appId`: the GitHub App that reported a check run, when known. */
+export interface ObservedCheck { name: string; state: CheckState; source?: 'check-run' | 'status'; appId?: number }
+export interface CiSummary {
+  state: CiState; total: number; passed: number; failed: string[]; pending: string[];
+  /** Every check run / status context by name (the CI evidence gate matches required checks against these). */
+  checks: ObservedCheck[];
+}
 
-interface RollupItem { __typename?: string; name?: string; context?: string; status?: string; conclusion?: string | null; state?: string }
+interface RollupItem { __typename?: string; name?: string; context?: string; status?: string; conclusion?: string | null; state?: string; appId?: unknown }
 
 const FAILED_CONCLUSIONS = new Set(['FAILURE', 'TIMED_OUT', 'CANCELLED', 'ACTION_REQUIRED', 'STARTUP_FAILURE', 'STALE']);
 
@@ -154,24 +197,60 @@ const FAILED_CONCLUSIONS = new Set(['FAILURE', 'TIMED_OUT', 'CANCELLED', 'ACTION
 export function summarizeChecks(rollup: unknown): CiSummary {
   const items = Array.isArray(rollup) ? (rollup as RollupItem[]) : [];
   const failed: string[] = [], pending: string[] = [];
+  const checks: CiSummary['checks'] = [];
   let passed = 0;
+  const add = (name: string, state: CheckState, source: ObservedCheck['source'], appId?: unknown) => {
+    const app = pinOf(appId);
+    checks.push({ name, state, source, ...(app !== null ? { appId: app } : {}) });
+    if (state === 'fail') failed.push(name); else if (state === 'pending') pending.push(name); else passed++;
+  };
   for (const it of items) {
     const name = String(it.name ?? it.context ?? 'check');
     if (it.__typename === 'StatusContext' || (it.state !== undefined && it.status === undefined)) {
       const s = String(it.state ?? '').toUpperCase();
-      if (s === 'SUCCESS') passed++;
-      else if (s === 'FAILURE' || s === 'ERROR') failed.push(name);
-      else pending.push(name);
+      add(name, s === 'SUCCESS' ? 'pass' : s === 'FAILURE' || s === 'ERROR' ? 'fail' : 'pending', 'status');
       continue;
     }
-    if (String(it.status ?? '').toUpperCase() !== 'COMPLETED') { pending.push(name); continue; }
+    if (String(it.status ?? '').toUpperCase() !== 'COMPLETED') { add(name, 'pending', 'check-run', it.appId); continue; }
     const c = String(it.conclusion ?? '').toUpperCase();
-    if (FAILED_CONCLUSIONS.has(c)) failed.push(name);
-    else passed++; // SUCCESS, NEUTRAL, SKIPPED
+    // Only SUCCESS / NEUTRAL pass. SKIPPED stays apart (the rollup counts it as passed, but it is never CI
+    // evidence). A missing or unrecognised conclusion is not a pass: pending, so the gate waits / times out.
+    add(name, FAILED_CONCLUSIONS.has(c) ? 'fail' : c === 'SKIPPED' ? 'skipped' : c === 'SUCCESS' || c === 'NEUTRAL' ? 'pass' : 'pending', 'check-run', it.appId);
   }
   const state: CiState = !items.length ? 'no-checks' : failed.length ? 'failing' : pending.length ? 'awaiting-ci' : 'passing';
-  return { state, total: items.length, passed, failed, pending };
+  return { state, total: items.length, passed, failed, pending, checks };
 }
+
+/**
+ * Check runs of a commit with the reporting app (`GET /repos/{repo}/commits/{sha}/check-runs`, latest
+ * per name and app), as rollup items. null when unreadable. Read-only.
+ */
+export async function checkRunsWithApps(api: ApiGet, repository: string, sha: string): Promise<RollupItem[] | null> {
+  type Run = { name?: unknown; status?: unknown; conclusion?: unknown; app?: { id?: unknown } | null };
+  const base = `/repos/${segs(repository)}/commits/${encodeURIComponent(sha)}/check-runs?per_page=100`;
+  const all: Run[] = [];
+  // Paginate until total_count is reached. Any incomplete read (error, cap hit, inconsistent counts) is
+  // unreadable: a truncated list could hide a failing run, so a partial list is never returned.
+  for (let page = 1; ; page++) {
+    const r = await api(page === 1 ? base : `${base}&page=${page}`);
+    const body = r.body as { check_runs?: unknown; total_count?: unknown } | null;
+    const runs = body?.check_runs;
+    const total = body?.total_count;
+    if (r.status !== 200 || !Array.isArray(runs) || typeof total !== 'number' || !Number.isInteger(total) || total < 0) return null;
+    all.push(...(runs as Run[]));
+    if (all.length > total) return null;
+    if (all.length === total) break;
+    if (!runs.length || page >= CHECK_RUNS_MAX_PAGES) return null;
+  }
+  return all.map((c) => ({
+    __typename: 'CheckRun',
+    name: typeof c?.name === 'string' ? c.name : 'check',
+    status: String(c?.status ?? '').toUpperCase(),
+    conclusion: typeof c?.conclusion === 'string' ? c.conclusion.toUpperCase() : null,
+    appId: c?.app?.id,
+  }));
+}
+const CHECK_RUNS_MAX_PAGES = 10;
 
 // ---------------------------------------------------------------- sync
 
@@ -186,6 +265,8 @@ export interface SyncTaskResult {
   /** Observation differs from the last one recorded for this head (a note was added). */
   changed: boolean;
   statusChange?: { from: TaskStatus; to: TaskStatus };
+  /** verification.ciAuthority github: the CI evidence gate for the PR head (src/runtime/ci-gate.ts). */
+  gate?: CiGate;
   warnings: string[];
   error?: string;
 }
@@ -216,12 +297,20 @@ export async function syncTasks(deps: SyncDeps, opts: { taskIds?: string[] } = {
   const tasks = all.filter((t) => t.prUrl && (want ? want.has(t.id) : !SKIP_STATUSES.includes(t.status)));
   const leased = new Set(db.activeLeases().map((l) => l.task_id));
   const out: SyncTaskResult[] = [];
-  for (const task of tasks) out.push(await syncOne(task, { db, backlog, config, gh, leased }));
+  // CI authority: required checks per repository, read once per sync (read-only GETs).
+  const required = new Map<string, Promise<RequiredChecksReport | null>>();
+  const requiredFor = (prUrl: string) => {
+    const repository = /^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/\d+/.exec(prUrl)?.[1];
+    if (!repository) return Promise.resolve(null);
+    if (!required.has(repository)) required.set(repository, requiredChecksStatus(ghApi(gh), repository, config.git.baseBranch).catch(() => null));
+    return required.get(repository)!;
+  };
+  for (const task of tasks) out.push(await syncOne(task, { db, backlog, config, gh, leased, requiredFor }));
   db.addEvent('sync', null, { tasks: out.length, failed: out.filter((t) => t.error).length });
   return { tasks: out, synced: out.filter((t) => !t.error).length, failed: out.filter((t) => t.error).length };
 }
 
-async function syncOne(task: Task, x: { db: RuntimeDb; backlog: BacklogAdapter; config: MinionsConfig; gh: GhFn; leased: Set<string> }): Promise<SyncTaskResult> {
+async function syncOne(task: Task, x: { db: RuntimeDb; backlog: BacklogAdapter; config: MinionsConfig; gh: GhFn; leased: Set<string>; requiredFor: (prUrl: string) => Promise<RequiredChecksReport | null> }): Promise<SyncTaskResult> {
   const prUrl = task.prUrl!;
   const res: SyncTaskResult = { taskId: task.id, prUrl, changed: false, warnings: [] };
   const r = await x.gh(['pr', 'view', prUrl, '--json', PR_FIELDS]);
@@ -230,7 +319,21 @@ async function syncOne(task: Task, x: { db: RuntimeDb; backlog: BacklogAdapter; 
   try { pr = JSON.parse(r.stdout) as typeof pr; } catch { res.error = 'gh pr view returned invalid JSON'; return res; }
   const prState = (['OPEN', 'MERGED', 'CLOSED'] as const).find((s) => s === String(pr.state ?? '').toUpperCase());
   if (!prState || !pr.headRefOid) { res.error = `gh pr view returned an unexpected PR state (${String(pr.state)})`; return res; }
-  const ci = summarizeChecks(pr.statusCheckRollup);
+  const github = x.config.verification.ciAuthority === 'github';
+  const required = github ? await x.requiredFor(prUrl) : null;
+  let rollup = pr.statusCheckRollup;
+  if (required?.requirements?.some((q) => q.appId !== null)) {
+    // A required check is pinned to a GitHub App: the rollup carries no app, so read check runs (with
+    // app ids) for the head. On failure the rollup is kept without apps and pinned checks stay unverified.
+    const runs = await checkRunsWithApps(ghApi(x.gh), required.repository, pr.headRefOid);
+    // Merge, never replace: a failing rollup check run (no app) is kept next to the app-aware runs, so a
+    // failure seen in either source cannot disappear. Passing rollup runs are duplicates and are dropped.
+    const failedRollupRun = (i: RollupItem) => i.__typename !== 'StatusContext' && !(i.state !== undefined && i.status === undefined)
+      && String(i.status ?? '').toUpperCase() === 'COMPLETED' && FAILED_CONCLUSIONS.has(String(i.conclusion ?? '').toUpperCase());
+    if (runs) rollup = [...(Array.isArray(rollup) ? (rollup as RollupItem[]) : []).filter((i) => i.__typename === 'StatusContext' || (i.state !== undefined && i.status === undefined) || failedRollupRun(i)), ...runs];
+    else res.warnings.push('check runs (with apps) unreadable; required checks pinned to an app cannot be verified');
+  }
+  const ci = summarizeChecks(rollup);
   Object.assign(res, { prState, headSha: pr.headRefOid, ci });
 
   const approved = x.db.publication(task.id)?.head_sha;
@@ -244,6 +347,10 @@ async function syncOne(task: Task, x: { db: RuntimeDb; backlog: BacklogAdapter; 
     x.db.addEvidence({ task_id: task.id, head_sha: pr.headRefOid, kind: 'ci', config_revision: x.config.configRevision, outcome, details_json: JSON.stringify(details) });
   }
   res.changed = !prev || prev.outcome !== outcome;
+  if (github) {
+    res.gate = evaluateCiGate({ ciAuthority: 'github', head: pr.headRefOid, required, now: new Date(),
+      timeoutMinutes: ciTimeoutOf(x.config), observations: x.db.evidenceFor(task.id, pr.headRefOid, 'ci') });
+  }
   if (res.changed) {
     await x.backlog.addNote(task.id, `minions sync: ${describeObservation({ prState, ci, headSha: pr.headRefOid })}. ${prState === 'OPEN' ? 'Not merged; minions never merges.' : ''}`.trim());
   }
@@ -269,7 +376,7 @@ export function formatSync(r: SyncReport): string {
   const L = r.tasks.map((t) => t.error
     ? `${t.taskId}: error: ${t.error}`
     : `${t.taskId}: ${describeObservation({ prState: t.prState!, ci: t.ci!, headSha: t.headSha! })}${t.statusChange ? `; status ${t.statusChange.from} -> ${t.statusChange.to}` : ''}${t.changed ? '' : ' (unchanged)'}  ${t.prUrl}` +
-      t.warnings.map((w) => `\n  warning: ${w}`).join(''));
+      (t.gate ? `\n  ${formatCiGate(t.gate)}` : '') + t.warnings.map((w) => `\n  warning: ${w}`).join(''));
   L.push(`synced ${r.synced}, failed ${r.failed}`);
   return L.join('\n');
 }

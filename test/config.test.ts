@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { profileDefaults } from '../src/config/profiles.js';
+import { defaultDeliveryMode, profileDefaults } from '../src/config/profiles.js';
 import { listUnavailable, resolve, validateConfig, SUPPORTED } from '../src/config/resolve.js';
 import { CAPABILITIES } from '../src/config/schema.js';
 import { MinionsError } from '../src/core/errors.js';
@@ -217,5 +217,29 @@ describe('models.effort and models.coordinator', async () => {
     const cfg = validateConfig({ ...raw, git: { ...raw.git, identity: { name: 'x', email: 'x@example.com' } } }, '.minions/config.json');
     expect(cfg.models).toMatchObject({ default: 'claude-opus-5-5', effort: 'medium', selection: 'coordinator' });
     expect(cfg.models.allowed).toEqual(['claude-opus-5-5', 'sonnet', 'opus', 'haiku']);
+  });
+});
+
+describe('PR-first delivery default and CI authority', () => {
+  it('offers pull-request as the default when GitHub delivery is selectable; local stays local when blocked', () => {
+    expect(defaultDeliveryMode('local', false)).toBe('pull-request');
+    expect(defaultDeliveryMode('branch', false)).toBe('branch');
+    expect(defaultDeliveryMode('pull-request', false)).toBe('pull-request');
+    expect(defaultDeliveryMode('local', true)).toBe('local');
+    expect(defaultDeliveryMode('pull-request', true)).toBe('local');
+    // project-owner with a GitHub remote and a stored token defaults to pull-request; without the token, local.
+    expect(profileDefaults('project-owner', { ...ctx, hasGitHubCredential: true }).config.delivery).toMatchObject({ mode: 'pull-request', provider: 'github' });
+    expect(profileDefaults('project-owner', ctx).config.delivery.mode).toBe('local');
+  });
+
+  it('ciAuthority github is no longer reported unavailable; the pending timeout is optional and validated', () => {
+    const c = defaults();
+    c.verification.ciAuthority = 'github';
+    expect(listUnavailable(c).map((u) => u.path)).not.toContain('verification.ciAuthority');
+    expect(validateConfig({ ...c, verification: { ...c.verification, ciPendingTimeoutMinutes: 45 } }).verification.ciPendingTimeoutMinutes).toBe(45);
+    expect(fail(() => validateConfig({ ...c, verification: { ...c.verification, ciPendingTimeoutMinutes: 0 } })).code).toBe('INVALID_CONFIG');
+    const notes = profileDefaults('project-owner', { ...ctx, hasGitHubCredential: true }).notes.join('\n');
+    expect(notes).not.toMatch(/CI authority is deferred/);
+    expect(notes).toMatch(/CI authority is opt-in/);
   });
 });

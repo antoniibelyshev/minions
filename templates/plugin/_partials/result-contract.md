@@ -35,6 +35,7 @@ Field rules:
 - `headSha`: the real current head of your branch/worktree; the coordinator rejects a stale or invented SHA.
 - `modifiedPaths`: repository-relative paths changed by your commits this attempt (empty if none).
 - `checks[].outcome`: `pass` | `fail` | `skipped`; `details` is short. Report commands you actually ran; never claim a check you did not run.
+- `checks[].source` (optional): `local` (default, a command you ran) or `ci` (tester/reviewer only, a required CI check the brief's `ci` gate shows passing for your head; see CI evidence).
 - `acceptanceEvidence`: one entry per acceptance criterion; say plainly when a criterion is not met.
 - `findings`: short strings (problems, risks, sensitive-path changes, assumptions).
 - `verdict`: reviewer only, `approve` | `request-changes`. Engineers and testers omit it.

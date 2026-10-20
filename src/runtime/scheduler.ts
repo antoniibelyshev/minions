@@ -10,8 +10,10 @@ import { syncBaseFromOrigin, type BaseSyncResult } from './base-sync.js';
 import type { Lease, LeaseRole, PublicationState, RuntimeDb } from './db.js';
 import { removeLeaseFiles, type HandoffPaths } from './handoff.js';
 import { missingApprovalKeyReason, runtimePaths } from './paths.js';
-import { publishTask, type PublishInput, type PublishOutcome } from './publish.js';
-import { validateResult, type WorkerResult } from './results.js';
+import { publishTask, realGh, type GhFn, type PublishInput, type PublishOutcome } from './publish.js';
+import { isCiCheck, validateResult, type WorkerResult } from './results.js';
+import { readRequiredChecks, type RequiredChecksReport } from './ci.js';
+import { ciGateFromDb, formatCiGate, type CiGate } from './ci-gate.js';
 import { BRANCH_PREFIX, branchFor, ensureBranchWorktree, ensureReviewWorktree, git, headOf, resolveBaseBranch, taskSlug, workspaceLayout, type WorkspaceLayout } from './worktree.js';
 
 export const LEASE_ROLES: readonly LeaseRole[] = ['engineer', 'tester', 'reviewer'];
@@ -39,6 +41,10 @@ export interface SchedulerDeps {
   baseSync?: (repo: string, base: string) => Promise<BaseSyncResult>;
   /** Public key verifying host-signed publication approvals (default: runtimePaths().approvalPublicKey). */
   approvalPublicKeyFile?: string;
+  /** gh for read-only CI lookups (required checks); tests inject a mock. Default: the PATH wrapper. */
+  gh?: GhFn;
+  /** Clock for the CI pending timeout (tests). */
+  now?: () => Date;
 }
 
 /** Result of a publication attempt (`minions work publish`, or embedded in a record response). */
@@ -128,6 +134,11 @@ export interface TaskBrief {
   /** Present when the previous stage of this task was wound down by a drain (upgrade): continue from its checkpoint. */
   resume?: DrainResume;
   /**
+   * Tester/reviewer with verification.ciAuthority "github": the CI evidence gate for expectedHead at claim
+   * time. Only `state: "pass"` lets the worker rely on CI instead of re-running the full verification.
+   */
+  ci?: CiGate;
+  /**
    * The lease's own disk-backed, exec-allowed scratch dir (set by claimWithBrief): the worker uses it as TMPDIR
    * for test runs and tools. Removed when the lease ends and on coordinator start; absent = use the inherited TMPDIR.
    */
@@ -152,10 +163,27 @@ export interface RecordResponse {
   publication?: PublishResponse;
 }
 
-const RESULT_CONTRACT = 'Return exactly one JSON object: {status: complete|needs_changes|blocked|needs_split|partial, summary, branch, headSha (full SHA of the branch head you leave), modifiedPaths[], checks[{command, outcome: pass|fail|skipped, details?}], acceptanceEvidence[{criterion, evidence}], findings[], nextAction, verdict?: approve|request-changes (reviewer only), usage? (only when actually available)}.';
+const RESULT_CONTRACT = 'Return exactly one JSON object: {status: complete|needs_changes|blocked|needs_split|partial, summary, branch, headSha (full SHA of the branch head you leave), modifiedPaths[], checks[{command, outcome: pass|fail|skipped, details?, source?: local|ci (ci: a required CI check for this head; tester/reviewer with ciAuthority github only)}], acceptanceEvidence[{criterion, evidence}], findings[], nextAction, verdict?: approve|request-changes (reviewer only), usage? (only when actually available)}.';
 
 const newLeaseId = () => `lease-${randomBytes(6).toString('hex')}`;
 const nowIso = () => new Date().toISOString();
+
+/**
+ * Command text reduced to what ran: the last `&&`/`;` segment with leading `VAR=value` assignments removed,
+ * so `mkdir -p x && TMPDIR=x npm test` matches the configured `npm test`. Still an exact match otherwise.
+ */
+export function normalizeCheckCommand(command: string): string {
+  const last = command.split(/&&|;/).map((p) => p.trim()).filter(Boolean).pop() ?? '';
+  return last.replace(/^(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)+/, '').trim();
+}
+
+/** The full configured verification passed locally (source not ci); with no commands configured, any passing local check. */
+export function localVerificationComplete(checks: { command: string; outcome: string; source?: 'local' | 'ci' }[], configured: string[]): boolean {
+  const passed = checks.filter((c) => !isCiCheck(c) && c.outcome === 'pass');
+  if (!configured.length) return passed.length > 0;
+  const ran = new Set(passed.map((c) => normalizeCheckCommand(c.command)));
+  return configured.every((cmd) => ran.has(normalizeCheckCommand(cmd)));
+}
 
 export class Scheduler {
   readonly db: RuntimeDb;
@@ -166,6 +194,8 @@ export class Scheduler {
   private readonly handoff: HandoffPaths | null;
   private readonly baseSync: (repo: string, base: string) => Promise<BaseSyncResult>;
   private readonly approvalPublicKeyFile: string;
+  private readonly gh: GhFn;
+  private readonly now: () => Date;
 
   constructor(deps: SchedulerDeps) {
     this.db = deps.db; this.backlog = deps.backlog; this.config = deps.config;
@@ -174,6 +204,21 @@ export class Scheduler {
     this.publisher = deps.publisher ?? publishTask;
     this.baseSync = deps.baseSync ?? ((repo, base) => syncBaseFromOrigin(repo, base));
     this.approvalPublicKeyFile = deps.approvalPublicKeyFile ?? runtimePaths().approvalPublicKey;
+    this.gh = deps.gh ?? realGh;
+    this.now = deps.now ?? (() => new Date());
+  }
+
+  /**
+   * CI evidence gate for a task head (src/runtime/ci-gate.ts): required checks read now (read-only gh
+   * api), observations from `minions sync`. Never throws; unreadable required checks are `unknown`.
+   * Shared by the tester/reviewer stages and the merge gate (task-1.9).
+   */
+  async ciGate(taskId: string, head: string): Promise<CiGate> {
+    let required: RequiredChecksReport | null = null;
+    if (this.config.verification.ciAuthority === 'github') {
+      try { required = await readRequiredChecks(this.layout.repo, this.config, { git, gh: this.gh }); } catch { required = null; }
+    }
+    return ciGateFromDb(this.db, this.config, taskId, head, required, this.now());
   }
 
   list(opts: { all?: boolean; taskId?: string } = {}): Lease[] { return this.db.leases(opts); }
@@ -293,7 +338,9 @@ export class Scheduler {
       throw e;
     }
 
-    return this.buildBrief(this.db.lease(leaseId)!, task, { attempt, branch, worktree, baseBranch, baseSha, head, startEffect });
+    const brief = this.buildBrief(this.db.lease(leaseId)!, task, { attempt, branch, worktree, baseBranch, baseSha, head, startEffect });
+    if (role !== 'engineer' && cfg.verification.ciAuthority === 'github') brief.ci = await this.ciGate(task.id, head);
+    return brief;
   }
 
   /**
@@ -495,7 +542,7 @@ export class Scheduler {
       throw new MinionsError('PRECONDITION', `Lease ${leaseId} has no invalid result to correct.`, 'Record without --correction.');
     }
     const rawText = typeof raw === 'string' ? raw : JSON.stringify(raw);
-    const v = validateResult(raw, lease.role);
+    const v = validateResult(raw, lease.role, { ciAuthority: this.config.verification.ciAuthority });
     let errors: string[] = v.ok ? [] : v.errors;
     const result = v.ok ? v.result : undefined;
     let actualHead: string | null = null;
@@ -516,6 +563,16 @@ export class Scheduler {
         !(await this.isAncestor(lease.head_sha, actualHead))) {
         // Testers may add commits on top of the head they were given, but must not rewrite it.
         errors.push(`stale head: testing started at ${lease.head_sha} but ${lease.branch} at ${actualHead} no longer contains it`);
+      }
+    }
+
+    // CI evidence cited by a tester/reviewer: decided by the runtime gate for the exact head, never by the claim itself.
+    let ciGate: CiGate | null = null;
+    if (result && !errors.length && !sweep && result.status === 'complete' && (lease.role === 'tester' || lease.role === 'reviewer') && result.checks.some(isCiCheck)) {
+      ciGate = await this.ciGate(lease.task_id, actualHead!);
+      if (ciGate.state === 'pass') {
+        const bad = result.checks.filter((c) => isCiCheck(c) && c.outcome === 'pass' && !ciGate!.passed.includes(c.command)).map((c) => c.command);
+        if (bad.length) errors.push(`checks: CI evidence entries must name required checks that passed at ${actualHead} (required: ${ciGate.requiredChecks.join(', ')}); not: ${bad.join(', ')}`);
       }
     }
 
@@ -555,6 +612,10 @@ export class Scheduler {
     const qaWhy = qa.reasons.join('; ');
     // A partial from a worker that was running when a drain was requested (even one cleared since) is a drain partial.
     const drained = r.status === 'partial' && !sweep && this.db.drainRequestedSince(lease.started_at);
+    // CI not usable as evidence: failing -> repair; otherwise fall back to the result's own local checks, or no approval.
+    const localPass = localVerificationComplete(r.checks, cfg.verification.commands);
+    const ciBlock: 'fail' | 'unverified' | null = !ciGate || ciGate.state === 'pass' ? null : ciGate.state === 'fail' ? 'fail' : localPass ? null : 'unverified';
+    const ciFallback = !!ciGate && ciGate.state !== 'pass' && !ciBlock;
 
     if (sweep) {
       if (r.status === 'complete' || r.status === 'needs_changes') {
@@ -563,6 +624,19 @@ export class Scheduler {
       } else if (r.status === 'blocked') to = 'blocked';
       else if (r.status === 'needs_split') { to = 'awaiting-human'; needsSplit = true; message = 'QA sweep reported needs_split: create smaller sweep tasks.'; }
       else message = 'Partial QA sweep recorded; status unchanged (claim it again to finish).';
+    } else if (ciBlock === 'fail') {
+      to = 'changes-requested';
+      message = `Not approved: ${formatCiGate(ciGate!)}. Task → changes-requested; repair with the failing checks as findings.`;
+      if (lease.role === 'reviewer') {
+        repairCycles = this.db.incrementRepairs(task.id);
+        if (repairCycles >= cfg.execution.maxRepairCyclesBeforeReplan) {
+          replan = true; to = 'awaiting-human';
+          message += ` Repair cycle ${repairCycles} reached the limit (${cfg.execution.maxRepairCyclesBeforeReplan}); replan the task before more repairs.`;
+        }
+      }
+    } else if (ciBlock === 'unverified') {
+      to = from;
+      message = `Not approved: the ${lease.role} relied on CI, but ${formatCiGate(ciGate!)}. Task stays ${from}: ${ciGate!.state === 'pending' ? 'run \`minions sync\` after CI finishes and re-dispatch, or ' : ''}re-dispatch the ${lease.role} with local verification (run the verification commands).`;
     } else switch (r.status) {
       case 'complete':
         if (lease.role === 'engineer') {
@@ -609,11 +683,16 @@ export class Scheduler {
     if (labels) this.db.addEvent('qa-required', task.id, { leaseId, role: lease.role, head, reasons: qa.reasons, label: labels.at(-1) });
 
     this.db.transaction(() => {
+      // A stage blocked by the CI gate is not a complete stage (publication checks role evidence 'complete').
       this.db.addEvidence({ task_id: task.id, head_sha: head, kind: lease.role, config_revision: cfg.configRevision,
-        outcome: r.status, details_json: JSON.stringify({ leaseId, verdict: r.verdict ?? null, summary: r.summary }) });
+        outcome: ciBlock ? `ci-${ciGate!.state}` : r.status, details_json: JSON.stringify({ leaseId, verdict: r.verdict ?? null, summary: r.summary }) });
       for (const c of r.checks) {
         this.db.addEvidence({ task_id: task.id, head_sha: head, kind: 'check', config_revision: cfg.configRevision,
-          outcome: c.outcome, details_json: JSON.stringify({ leaseId, command: c.command, details: c.details ?? null }) });
+          outcome: c.outcome, details_json: JSON.stringify({ leaseId, command: c.command, details: c.details ?? null, source: c.source ?? 'local' }) });
+      }
+      if (ciGate) {
+        this.db.addEvidence({ task_id: task.id, head_sha: head, kind: 'ci-gate', config_revision: cfg.configRevision,
+          outcome: ciGate.state, details_json: JSON.stringify({ leaseId, role: lease.role, usedAs: ciGate.state === 'pass' ? 'ci' : ciFallback ? 'local-fallback' : 'none', gate: ciGate }) });
       }
       this.db.exec('UPDATE leases SET head_sha = ? WHERE id = ?', head, leaseId);
       if (publish) this.db.upsertPublication({ task_id: task.id, branch: lease.branch!, head_sha: head, mode: cfg.delivery.mode, config_revision: cfg.configRevision });
@@ -621,7 +700,8 @@ export class Scheduler {
     });
     await this.cleanupLeaseFiles(leaseId);
     try {
-      await this.backlog.addNote(task.id, `minions: ${lease.role} ${r.status}${drained ? ' (drain)' : ''}${r.verdict ? ` (${r.verdict})` : ''} at ${head.slice(0, 12)}: ${r.summary}${to === 'testing' && qa.reasons.length ? ` (QA required: ${qaWhy})` : ''}`);
+      const ciNote = ciGate ? (ciBlock ? ` (not approved: ${formatCiGate(ciGate)})` : ciFallback ? ` (CI not usable: ${ciGate.state}; accepted on local checks)` : ' (CI evidence: required checks passed)') : '';
+      await this.backlog.addNote(task.id, `minions: ${lease.role} ${r.status}${drained ? ' (drain)' : ''}${r.verdict ? ` (${r.verdict})` : ''} at ${head.slice(0, 12)}: ${r.summary}${to === 'testing' && qa.reasons.length ? ` (QA required: ${qaWhy})` : ''}${ciNote}`);
     } catch (e) {
       this.db.addEvent('record-backlog-error', task.id, { leaseId, error: (e as Error).message });
     }

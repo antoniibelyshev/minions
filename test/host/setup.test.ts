@@ -172,6 +172,37 @@ describe('minions setup', () => {
     }
   });
 
+  it('PR-first: with a GitHub remote and a stored token the delivery question defaults to pull-request; local stays selectable', async () => {
+    const offered = async (profile: string, answer?: string) => {
+      const repo = githubRepo();
+      const defaults: Record<string, string> = {};
+      const a = scripted({ 'Starting profile': profile, 'Installation visibility': 'private', 'Set up GitHub integration': 'y', ...(answer ? { 'Delivery mode': answer } : {}) }, [GH_TOKEN]);
+      const ask = a.io.ask;
+      a.io.ask = async (q: string, def: string) => { if (q.startsWith('Delivery mode')) defaults.delivery = def; return ask(q, def); };
+      const r = await runSetup({ path: repo, yes: false, io: a.io, runtime: fakeRuntime().runtime, dockerProbe: dockerUp, fetch: githubApi().f });
+      const eff = (await loadEffectiveConfig(await loadProjectJson(r.projectId))).config;
+      return { def: defaults.delivery, mode: eff.delivery.mode, provider: eff.delivery.provider, info: a.info.join('\n'), r };
+    };
+    // Accepting the default switches a local project to pull-request delivery (project-owner and personal-work).
+    const owner = await offered('1');
+    expect(owner).toMatchObject({ def: 'pull-request', mode: 'pull-request', provider: 'github' });
+    expect(owner.info).toMatch(/pull-request \(default: push agent\/<slug> and open a PR/);
+    expect(step(owner.r, 'delivery')).toMatchObject({ status: 'changed', detail: expect.stringMatching(/local -> pull-request/) });
+    env.cleanup(); env = withHome();
+    expect(await offered('2')).toMatchObject({ def: 'pull-request', mode: 'pull-request' });
+    // Local remains an explicit option.
+    env.cleanup(); env = withHome();
+    expect(await offered('1', 'local')).toMatchObject({ def: 'pull-request', mode: 'local', provider: 'none' });
+  });
+
+  it('without a GitHub remote setup never offers pull-request delivery and stays local', async () => {
+    const repo = makeRepo(env.root);
+    const a = scripted({ 'Installation visibility': 'private' });
+    const r = await runSetup({ path: repo, yes: false, io: a.io, runtime: fakeRuntime().runtime, dockerProbe: dockerUp, fetch: githubApi().f });
+    expect(a.asked.some((q) => q.startsWith('Delivery mode'))).toBe(false);
+    expect((await loadEffectiveConfig(await loadProjectJson(r.projectId))).config.delivery.mode).toBe('local');
+  });
+
   it('asks each optional integration with default no; declining skips cleanly with a note on enabling later', async () => {
     const repo = githubRepo();
     const a = scripted({ 'Installation visibility': 'private' });
@@ -397,7 +428,8 @@ describe('minions setup', () => {
     const r = await runSetup({ path: repo, yes: false, runtime: rt.runtime, dockerProbe: dockerUp, fetch: api.f,
       io: scripted({ 'Installation visibility': 'private', 'Set up GitHub integration': 'y', 'Use CI?': 'y' }, [GH_TOKEN]).io });
     expect(step(r, 'ci').detail).toContain('required checks configured');
-    expect(step(r, 'ci').lines!.join('\n')).toContain('setup does not change it');
+    expect(step(r, 'ci').lines!.join('\n')).toContain('setup changes neither');
+    expect(step(r, 'ci').lines!.join('\n')).toContain('verification.ciAuthority to "github"');
     expect(api.seen.every((s) => s.method === 'GET')).toBe(true);
     expect((await loadEffectiveConfig(await loadProjectJson(r.projectId))).config.delivery.requiredChecksConfigured).toBe(false);
 

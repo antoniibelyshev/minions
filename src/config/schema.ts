@@ -147,7 +147,15 @@ export const MinionsConfigSchema = z.object({
     reviewerRequired: z.boolean(),
     /** Labels that opt a task into a tester stage; the first is added when the runtime records a QA need. Default ["qa"]. */
     qaLabels: z.array(nonEmpty).min(1).optional(),
+    /**
+     * "github": tester/reviewer stages may rely on passing required CI checks (branch protection or
+     * rulesets on the base) observed by `minions sync` for the exact head under test/review, instead of
+     * re-running the full verification locally (src/runtime/ci-gate.ts). Missing, failing, unknown or
+     * pending-too-long CI never approves; the stage falls back to the full local verification (every verification.commands entry passing locally). "none": local only.
+     */
     ciAuthority: z.enum(['none', 'github']),
+    /** ciAuthority github: minutes required checks may stay pending (from the first observation of a head) before CI counts as timed out. Default 60. */
+    ciPendingTimeoutMinutes: z.number().int().min(1).optional(),
   }).strict(),
   communication: z.object({
     /** "auto": Telegram when a bot token is stored and the runtime supports it, else terminal (src/telegram/channel.ts). */

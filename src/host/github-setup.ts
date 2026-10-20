@@ -12,6 +12,7 @@
 //   expires_in and <permission>=<level>. Repository selection cannot be pre-filled.
 import type { Command } from 'commander';
 import { can } from '../config/capabilities.js';
+import { defaultDeliveryMode } from '../config/profiles.js';
 import type { MinionsConfig } from '../config/schema.js';
 import { action, globalOpts, requireMode } from '../core/cli-helpers.js';
 import { MinionsError } from '../core/errors.js';
@@ -321,7 +322,7 @@ export async function runGithubSetup(opts: GithubSetupOptions): Promise<GithubSe
     // The caller asks the delivery mode.
   } else if (tokenOk && !state.pushDenied && state.deliveryMode) {
     io.info('Delivery: pull-request (recommended: push agent/<slug> and open one PR, never merged), branch (push only), or local.');
-    const def = state.deliveryMode === 'local' ? 'pull-request' : state.deliveryMode;
+    const def = defaultDeliveryMode(state.deliveryMode, false);
     let mode: MinionsConfig['delivery']['mode'] | null = null;
     for (let i = 0; i < 3 && !mode; i++) {
       const a = (await io.ask('Delivery mode (local/branch/pull-request)', def)).trim();
