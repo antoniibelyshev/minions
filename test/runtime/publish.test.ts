@@ -355,6 +355,10 @@ describe('publication helpers', () => {
     const env = pubEnv();
     gitSync(env.layout.repo, 'remote', 'set-url', 'origin', 'https://gitlab.com/acme/demo.git');
     env.backlog.add({ id: 'task-1', title: 'Gitlab' });
+    // The pre-claim base sync refuses a non-GitHub origin too; stub it to reach publication.
+    env.sched = new Scheduler({ db: env.db, backlog: env.backlog, config: env.config, layout: env.layout,
+      baseSync: async (_repo, base) => ({ base, originRef: `refs/remotes/origin/${base}`, from: null, to: 'x', action: 'up-to-date', method: null }),
+      publisher: (input: PublishInput) => publishTask({ ...input, gh: env.gh.fn, tokenFile: env.tokenFile }) });
     const { r } = await approveTask(env, 'task-1');
     expect(r.publication).toMatchObject({ state: 'failed', errorCode: 'PRECONDITION' });
     expect(r.publication!.message).toMatch(/not a github\.com repository/);
