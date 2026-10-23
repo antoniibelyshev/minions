@@ -198,7 +198,7 @@ describe('reporting granularity', () => {
   it('default coordinator prompt reports high-level feature progress only', async () => {
     const g = await gen();
     const comm = section(await g.read('coordinator.md'));
-    expect(comm).toContain('Reporting level: features');
+    expect(comm).toContain('Reporting level: milestones');
     expect(comm).toContain('report high-level feature progress only');
     expect(comm).toMatch(/feature or epic delivered or materially changed/);
     expect(comm).toMatch(/batch them into one short message/);
@@ -241,7 +241,7 @@ describe('reporting granularity', () => {
     const g = await gen();
     const orch = await g.read('skills/orchestrate/SKILL.md');
     expect(orch).toContain('## 7. Report');
-    expect(orch).toContain('Reporting level `features`: do not report stage transitions, splits, follow-ups or individual task deliveries');
+    expect(orch).toContain('Reporting level `milestones` (feature-level): do not report stage transitions, splits, follow-ups or individual task deliveries');
     expect(orch).toContain('Approvals for `ask` capabilities and sensitive paths are always requested explicitly');
     expect(orch).not.toMatch(/report the branch and `prUrl`/);
     expect(orch).toMatch(/`needs_split` → decide the split yourself/);
@@ -252,6 +252,18 @@ describe('reporting granularity', () => {
 
     const tasksOrch = await (await withProgress('tasks')).read('skills/orchestrate/SKILL.md');
     expect(tasksOrch).toContain('Reporting level `tasks`: report each delivered task with its branch');
+  });
+});
+
+describe('reporting level wording', () => {
+  it('names only valid communication.progress values and keeps idle notes out of the channel', async () => {
+    const g = await gen();
+    for (const f of ['coordinator.md', 'skills/orchestrate/SKILL.md']) {
+      const text = await g.read(f);
+      expect(text).not.toMatch(/[Rr]eporting level:? `?features/);
+      expect(text).toMatch(/[Rr]eporting level:? `?(milestones|tasks|quiet)/);
+      expect(text).toMatch(/not a (Telegram or other )?channel message/);
+    }
   });
 });
 

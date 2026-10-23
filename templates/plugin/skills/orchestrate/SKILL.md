@@ -14,7 +14,7 @@ Run this loop until nothing is runnable. Every durable step uses a `minions ... 
 1. `minions status --json`. If starts are paused, report that and stop. If `draining` is set (an upgrade is winding workers down), start nothing: only record the workers that return (step 5), report briefly and stop.
 2. `minions work next --json` for the runnable stages: `runnable` (dispatch order: tasks under way first, then priority; capacity, per-role limits ({{roleLimits}}), pauses, drain and the budget already applied), `waiting` (with `waitingOn`: `starts`, `capacity`, `role-capacity`, `harness-capacity`, `requires`) and `stuck` (a stage status without a lease that no stage can be claimed from: recover it with `/minions:recover`). `minions work list --json` shows the active leases, `minions backlog list --compact --json` the whole queue.
 
-If `runnable` is empty, report briefly why (the `message`) and stop. Do not loop waiting for work. Start nothing new while the budget is used up (`spend.budget.exhausted` in the status) or quota mode is on (see Owner defaults): record returning workers, report, and ask.
+If `runnable` is empty, report briefly why (the `message`) and stop (a terminal end-of-turn note, not a channel message). Do not loop waiting for work. Start nothing new while the budget is used up (`spend.budget.exhausted` in the status) or quota mode is on (see Owner defaults): record returning workers, report, and ask.
 
 ## 2. Choose
 
