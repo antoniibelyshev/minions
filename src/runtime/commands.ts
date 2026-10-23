@@ -1,4 +1,5 @@
 import { readFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import { Option, type Command } from 'commander';
 import { setIdempotencyStore, setIntakePausedContext, setProvenanceFallback, setReadyContext } from '../backlog/commands.js';
 import { openBacklog, writeBacklogConfig } from '../backlog/factory.js';
@@ -20,7 +21,7 @@ import { formatTelegramProbe, probeTelegram } from '../telegram/probe.js';
 import { resolveChannel } from '../telegram/channel.js';
 import {
   buildClaudeCommand, buildCoordinatorCommand, claudePermissionModes, configuredPermissionMode, coordinatorWrapper, launchCoordinator, probeRuntime, readLaunchRecord, readMountedToken, RECOVERY_PROMPT,
-  restartCoordinator, runtimeChannelFacts, syncCoordinator, coordinatorLaunchStatus, type LaunchStatus,
+  restartCoordinator, runtimeChannelFacts, scheduleDetachedRestart, syncCoordinator, coordinatorLaunchStatus, type LaunchStatus,
 } from './coordinator.js';
 import { openDb, type DrainRequest, type Lease, type LeaseRole, type PauseChange, type RuntimeDb } from './db.js';
 import { clearDrain, requestDrain } from './drain.js';
@@ -28,6 +29,7 @@ import { claimWithBrief, compactClaim, fetchBrief, recordSubmitted, submitResult
 import { runHook } from './hooks.js';
 import { budgetNotice, humanSpend, parseTokens, recordLeaseUsage, recordSessionUsage, setBudget, spendReport, type SpendReport } from './spend.js';
 import { runtimePaths } from './paths.js';
+import { contextResetCheck, dueNotice, HANDOFF_MAX_BYTES, humanContextReset, readHandoff, writeHandoff, type ContextResetCheck } from './context-reset.js';
 import { capacityOf, LEASE_ROLES, Scheduler, type UsageFlag } from './scheduler.js';
 import { gitCredential } from './github.js';
 import { ciStatus, formatCiStatus, formatSync, syncTasks, type SyncReport } from './ci.js';
@@ -156,6 +158,8 @@ export interface StatusReport {
   notifications?: OutboxCounts;
   /** Spend tally (tokens; estimated USD with API-key billing) and the owner budget (src/runtime/spend.ts). */
   spend?: SpendReport;
+  /** Routine context resets (coordinator.contextReset; src/runtime/context-reset.ts): triggers and blockers for this session. */
+  contextReset?: Omit<ContextResetCheck, 'steps'>;
   backlogError?: string;
 }
 
@@ -196,6 +200,7 @@ export async function collectStatus(deps: { db: RuntimeDb; config: MinionsConfig
   if (deps.launch) report.coordinatorLaunch = await deps.launch().catch(() => undefined);
   try { report.notifications = outboxCounts(d); } catch { /* an older DB without the outbox: omit */ }
   try { report.spend = spendReport({ db: d, config: cfg }); } catch { /* status never fails on the tally */ }
+  try { const { steps: _s, ...c } = contextResetCheck({ db: d, config: cfg }); report.contextReset = c; } catch { /* status never fails on the reset check */ }
   try {
     const tasks = await (await deps.backlog()).listTasks();
     for (const t of tasks) report.queue[t.status] = (report.queue[t.status] ?? 0) + 1;
@@ -218,6 +223,7 @@ export function humanStatus(s: StatusReport): string {
     `stop guard: ${s.guard.lastReason ?? '-'}`,
     ...(s.notifications?.pending ? [formatCounts(s.notifications)] : []),
     ...(s.spend ? humanSpend(s.spend).split('\n') : []),
+    ...(s.contextReset?.enabled ? [humanContextReset(s.contextReset)] : []),
   ];
   if (s.backlogError) out.push(`backlog error: ${s.backlogError}`);
   out.push(s.activeLeases.length ? 'active leases:' : 'active leases: none', ...s.activeLeases.map((l) => `  ${l.id} ${l.task_id} ${l.role} #${l.attempt} ${l.branch ?? ''}`));
@@ -286,6 +292,18 @@ export async function spendCommand(o: { budget?: string; by?: string; lease?: st
   return { ...spendReport(ctx), ...(notice ? { notice } : {}) };
 }
 
+// ---------------------------------------------------------------- context reset
+
+/** Adds `contextReset` to a record/release response when a reset is due (task-45). Never fails the record. */
+export function withContextReset<T extends object>(r: T, deps: { db: RuntimeDb; config: MinionsConfig }): T & { contextReset?: ReturnType<typeof dueNotice> } {
+  try {
+    const notice = dueNotice(contextResetCheck({ db: deps.db, config: deps.config }));
+    return notice ? { ...r, contextReset: notice } : r;
+  } catch { return r; }
+}
+
+const resetLine = (d: { contextReset?: { reason: string } }) => (d.contextReset ? [d.contextReset.reason] : []);
+
 // ---------------------------------------------------------------- register
 
 /** Registers runtime commands on the root program. */
@@ -343,7 +361,8 @@ export function register(program: Command): void {
       const r = o.submitted
         ? await recordSubmitted(await scheduler(), runtimePaths(), leaseId, opts)
         : await (await scheduler()).record(leaseId, await readInput(o.resultFile), opts);
-      emit(r, { json: globalOpts(cmd).json, human: (d) => [d.message, ...(d.errors ?? []).map((e: string) => `  - ${e}`), ...(d.budget ? [d.budget.message] : [])].join('\n') });
+      const out = withContextReset(r, { db: getDb(), config: await getConfig() });
+      emit(out, { json: globalOpts(cmd).json, human: (d: typeof out) => [d.message, ...(d.errors ?? []).map((e: string) => `  - ${e}`), ...(d.budget ? [d.budget.message] : []), ...resetLine(d)].join('\n') });
     }));
   work.command('release <leaseId>').description('Release a lease without a result (worktree is kept)')
     .requiredOption('--reason <text>', 'why the lease is released')
@@ -351,8 +370,8 @@ export function register(program: Command): void {
     .option('--model <name>', 'model the worker ran on (for the USD estimate with API-key billing)')
     .action(action(async (leaseId: string, o: { reason: string; usage?: string; model?: string }, cmd: Command) => {
       requireMode('runtime');
-      const r = await (await scheduler()).release(leaseId, o.reason, { usage: usageFlag(o) });
-      emit(r, { json: globalOpts(cmd).json, human: (d) => [`Released ${d.leaseId} (${d.taskId}); worktree kept at ${d.worktree ?? '-'}`, ...(d.budget ? [d.budget.message] : [])].join('\n') });
+      const r = withContextReset(await (await scheduler()).release(leaseId, o.reason, { usage: usageFlag(o) }), { db: getDb(), config: await getConfig() });
+      emit(r, { json: globalOpts(cmd).json, human: (d: typeof r) => [`Released ${d.leaseId} (${d.taskId}); worktree kept at ${d.worktree ?? '-'}`, ...(d.budget ? [d.budget.message] : []), ...resetLine(d)].join('\n') });
     }));
   work.command('spend').description('Spend tally and owner budget: show it, set the budget in plain language, or record usage after the fact')
     .option('--budget <amount>', 'set the budget, e.g. "5M tokens", "500k tokens per day", "$50" (API-key billing), "20 attempts"; "off" clears it')
@@ -512,15 +531,45 @@ export function register(program: Command): void {
   coord.command('restart').description('Kill the coordinator session and relaunch it detached (container only; used by the host upgrade)')
     .option('--recover', 'start with the recovery prompt: reconcile leases, re-dispatch, resume the queue')
     .option('--force', 'restart even while worker leases are active (they stay recorded for recovery)')
-    .action(action(async (o: { force?: boolean; recover?: boolean }, cmd: Command) => {
+    .option('--detach', 'advanced: run the restart in a detached process and return at once (the coordinator restarting itself; output in <state>/logs/context-reset.log)')
+    .action(action(async (o: { force?: boolean; recover?: boolean; detach?: boolean }, cmd: Command) => {
       requireMode('runtime');
       const d = getDb();
+      if (o.detach) {
+        const paths = runtimePaths();
+        const s = scheduleDetachedRestart({ activeLeases: () => d.activeLeases(), log: join(paths.logs, 'context-reset.log'), cwd: paths.state }, o);
+        emit(s, { json: globalOpts(cmd).json, human: (x: typeof s) => `coordinator: ${x.action} (${x.reason})` });
+        return;
+      }
       const r = await restartCoordinator(await getConfig(), {
         activeLeases: () => d.activeLeases(),
         recordRestart: coordinatorRestartRecorder(d),
         lock: d,
       }, o);
       emit(r, { json: globalOpts(cmd).json, human: (x: typeof r) => `coordinator: ${x.action} (${x.reason})` });
+    }));
+
+  coord.command('handoff').description(`Advanced (used by the coordinator itself): write the context-reset handoff from stdin (at most ${HANDOFF_MAX_BYTES} bytes, secrets redacted, replaces the previous one), --read it at startup, or --check whether a reset is due (container only)`)
+    .option('--read', 'print the stored handoff (a fresh coordinator reads it at startup)')
+    .option('--check', 'report whether a context reset is due: triggers, blockers (active leases, drain) and the steps')
+    .action(action(async (o: { read?: boolean; check?: boolean }, cmd: Command) => {
+      requireMode('runtime');
+      if (o.read && o.check) throw new MinionsError('PRECONDITION', 'Use --read or --check, not both.');
+      const paths = runtimePaths();
+      const json = globalOpts(cmd).json;
+      if (o.read) {
+        const h = readHandoff(paths.coordinatorHandoff);
+        emit(h, { json, human: (d: typeof h) => (d.present ? `handoff written ${d.writtenAt} (${d.ageMinutes} min ago, ${d.bytes} bytes):\n${d.text}` : 'no handoff stored') });
+        return;
+      }
+      if (o.check) {
+        const c = contextResetCheck({ db: getDb(), config: await getConfig() });
+        emit(c, { json, human: (d: typeof c) => [d.reason, ...(d.steps ?? []).map((x, i) => `  ${i + 1}. ${x}`)].join('\n') });
+        return;
+      }
+      const raw = await readInput(undefined, 'the handoff text', 'Pipe the note in with a quoted heredoc; --read prints the stored one, --check reports whether a reset is due.');
+      const r = await writeHandoff({ db: getDb(), path: paths.coordinatorHandoff }, raw);
+      emit(r, { json, human: (d: typeof r) => `handoff stored (${d.bytes}/${d.maxBytes} bytes${d.redactions ? `, ${d.redactions} secret(s) redacted` : ''}${d.replaced ? ', replaced the previous one' : ''})` });
     }));
 
   // telegram: credential-free capability probe. Host mode delegates to the container, where Claude Code runs.

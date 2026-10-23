@@ -7,7 +7,7 @@ import { roleEffort } from '../config/models.js';
 import { MinionsError } from '../core/errors.js';
 import { run, type RunOptions, type RunResult } from '../core/exec.js';
 import { atomicWrite } from '../core/fsutil.js';
-import { existsSync, readdirSync, readFileSync, realpathSync } from 'node:fs';
+import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, sep } from 'node:path';
 import { runtimeMode } from '../core/cli-helpers.js';
@@ -46,10 +46,11 @@ export const TELEGRAM_HOOK_COMMAND = 'minions hook pre-telegram || exit 2';
 
 /**
  * First user message of a coordinator started by `minions coordinator restart --recover`: run the recover
- * skill (reconcile leases left by the previous session, re-dispatch), then resume the queue. Fixed text, no
- * secrets; the pause state still applies (orchestrate stops when starts are paused).
+ * skill (read the previous session's handoff, reconcile leases left by it, re-dispatch), then resume the queue. Fixed
+ * text, no secrets (the handoff is read with a command, never passed in argv); the pause state still applies (orchestrate stops when starts are paused).
  */
 export const RECOVERY_PROMPT = '/minions:recover The coordinator was just restarted (minions coordinator restart --recover). '
+  + 'First read the previous session\'s handoff (minions coordinator handoff --read --json) with minions status --json. '
   + 'Reconcile the leases left by the previous session, release those without a live worker, re-dispatch interrupted tasks, '
   + 'then resume the queue with /minions:orchestrate. If starts are paused, report that instead of dispatching.';
 
@@ -1179,6 +1180,46 @@ export async function restartCoordinator(cfg: MinionsConfig, deps: SyncDeps, opt
       'Wait for the workers to finish, or rerun with --force (their leases stay recorded for recovery).');
   }
   return r;
+}
+
+/** Spawns a detached process (own session, stdio to a log fd). Injectable for tests. */
+export type DetachedSpawn = (cmd: string, args: string[], opts: { cwd: string; detached: true; stdio: ['ignore', number, number]; env: NodeJS.ProcessEnv }) => { pid?: number; unref(): void; on(event: 'error', cb: (e: Error) => void): unknown };
+
+export interface DetachedRestartDeps {
+  activeLeases: () => { id: string }[];
+  /** Log file of the detached restart (the CLI uses <state>/logs/context-reset.log). */
+  log: string;
+  cwd: string;
+  spawn?: DetachedSpawn;
+  openLog?: (path: string) => number;
+  env?: NodeJS.ProcessEnv;
+}
+
+/**
+ * `minions coordinator restart --detach` (task-45): the coordinator restarting itself. The restart kills the
+ * tmux session it is called from, so the real restart runs in a detached process (new session, like
+ * `setsid -f`; output appended to `log`) and this call returns at once. Active leases are checked here first so
+ * the refusal reaches the caller in-band (the detached restart checks again), unless `force`.
+ */
+export function scheduleDetachedRestart(deps: DetachedRestartDeps, opts: { force?: boolean; recover?: boolean } = {}): { action: 'restart-scheduled'; log: string; pid: number | null; reason: string } {
+  const leases = deps.activeLeases().map((l) => l.id);
+  if (leases.length && !opts.force) {
+    throw new MinionsError('PRECONDITION', `Coordinator restart refused: ${leases.length} active worker lease(s) (${leases.join(', ')}).`,
+      'Wait for the workers to finish and record them; a context reset never interrupts workers.');
+  }
+  const open = deps.openLog ?? ((f: string) => { mkdirSync(dirname(f), { recursive: true }); return openSync(f, 'a', 0o600); });
+  const fd = open(deps.log);
+  try {
+    const spawn: DetachedSpawn = deps.spawn ?? ((c, a, o) => nodeSpawn(c, a, o));
+    const child = spawn('minions', ['coordinator', 'restart', ...(opts.recover ? ['--recover'] : []), ...(opts.force ? ['--force'] : [])],
+      { cwd: deps.cwd, detached: true, stdio: ['ignore', fd, fd], env: deps.env ?? process.env });
+    child.on('error', () => { /* the log shows nothing then; the caller's session keeps running and can retry */ });
+    child.unref();
+    return { action: 'restart-scheduled', log: deps.log, pid: child.pid ?? null,
+      reason: `coordinator restart${opts.recover ? ' --recover' : ''} runs detached; this session ends when it kills the tmux session (output: ${deps.log})` };
+  } finally {
+    try { closeSync(fd); } catch { /* the child holds its own copy */ }
+  }
 }
 
 export interface RuntimeProbe {

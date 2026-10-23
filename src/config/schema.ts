@@ -181,6 +181,21 @@ export const MinionsConfigSchema = z.object({
      * "acceptEdits" opts back into prompting for every non-allowlisted Bash call. Never bypassPermissions.
      */
     permissionMode: z.enum(['auto', 'acceptEdits']).optional(),
+    /**
+     * Routine context resets (src/runtime/context-reset.ts): the coordinator writes a short handoff
+     * (`minions coordinator handoff`) and restarts itself with a fresh context when no worker lease is active
+     * and a trigger holds. Unset = on with the defaults (existing and new projects alike);
+     * `{ enabled: false }` is the opt-out. Unset trigger fields take their defaults; `null` turns that trigger off.
+     */
+    contextReset: z.object({
+      enabled: z.boolean(),
+      /** Reset once a task was delivered in this session (default true). */
+      afterDelivery: z.boolean().optional(),
+      /** Reset once the session's context (latest transcript usage) reaches this many tokens (default 60000). */
+      contextTokens: z.number().int().min(1000).nullable().optional(),
+      /** Reset after this many worker hand-offs (records and releases) in this session (default 10). */
+      handoffs: z.number().int().min(1).nullable().optional(),
+    }).strict().optional(),
   }).strict().optional(),
   /**
    * Legacy coordinator permission mode. Only "default" is still honoured (as a stricter choice) when

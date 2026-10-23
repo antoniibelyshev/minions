@@ -26,6 +26,7 @@ describe('profiles', () => {
     });
     // The coordinator permission mode is left unset: auto by default (opt-out: coordinator.permissionMode).
     expect(c).not.toHaveProperty('permissionMode');
+    // Routine context resets are on by default with coordinator.contextReset unset (task-45).
     expect(c).not.toHaveProperty('coordinator');
     expect(Object.keys(c.capabilities).sort()).toEqual([...CAPABILITIES].sort());
     expect(c.capabilities['pr.merge']).toBe('ask');

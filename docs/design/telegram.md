@@ -272,6 +272,33 @@ Implemented in `src/runtime/outbox.ts` (transport-agnostic) with the `minions no
   undelivered item from the terminal), so nothing is lost if Telegram is never restored.
 - Semantics: at least once per key. A crash between `reply` and `ack` can repeat that one message; nothing else repeats.
 
+## Restart survival (context resets)
+
+Routine context resets (task-45, [bootstrap.md](bootstrap.md#coordinator-context-resets)) restart the coordinator
+often, so the pairing, inbound messages and queued notifications must survive a restart. Evidence:
+
+- Pairing and access: `access.json`, `approved/` and `inbox/` live in the Telegram state dir under `/state`, which
+  the restart never touches: it kills and relaunches only the tmux session, and the new wrapper's startup sweep only
+  clears lease scratch dirs and the TMPDIR root. Test: `test/runtime/context-reset.test.ts` ("Telegram survives a
+  restart"): the files are byte-identical after `restartCoordinator --recover` plus the startup sweep, and no
+  restart command references the Telegram state dir.
+- Outbox: pending notifications are rows in the runtime DB (see [Notification outbox](#notification-outbox)); the same
+  test reads them back through a fresh DB connection after the restart, and the new session sends them on its
+  first wake (orchestrate step 1).
+- Inbound queue: Telegram keeps unconfirmed `getUpdates` updates for 24 hours, and an update is confirmed only by
+  the next poll's offset. The plugin (`telegram@claude-plugins-official` 0.0.7, `server.ts`) starts polling with
+  `bot.start({ onStart })` and never passes `drop_pending_updates`, so messages sent while no session polls are
+  delivered to the next session. The same test file checks this against the installed plugin source. When the
+  plugin is not installed on the host, that test is reported as skipped, not passed.
+- The handoff carries open owner questions, so a question asked before the reset is re-asked only if it is still
+  unanswered (recover skill).
+
+Known gap (narrow, accepted): an inbound message that the plugin has already handed to the old session, after the
+coordinator ran `restart --detach` and before the detached restart kills the tmux session (about a second), is
+confirmed to Telegram but never handled. The model's context for it dies with the session. The coordinator keeps
+this window small by finishing the current owner exchange before writing the handoff and restarting at once. If
+the owner gets no answer, resending the message is enough.
+
 ## Terminal-equivalent controls
 
 Over Telegram, controls are plain-language messages to the coordinator. They are not slash commands, because the plugin

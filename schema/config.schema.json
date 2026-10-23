@@ -709,6 +709,45 @@
             "auto",
             "acceptEdits"
           ]
+        },
+        "contextReset": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "afterDelivery": {
+              "type": "boolean"
+            },
+            "contextTokens": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 1000,
+                  "maximum": 9007199254740991
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "handoffs": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 9007199254740991
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "enabled"
+          ],
+          "additionalProperties": false
         }
       },
       "additionalProperties": false

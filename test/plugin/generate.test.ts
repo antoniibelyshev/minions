@@ -245,7 +245,7 @@ describe('reporting granularity', () => {
     expect(orch).toContain('Approvals for `ask` capabilities and sensitive paths are always requested explicitly');
     expect(orch).not.toMatch(/report the branch and `prUrl`/);
     expect(orch).toMatch(/`needs_split` → decide the split yourself/);
-    expect(await g.read('coordinator.md')).toMatch(/you may tell the owner first, then restart yourself/);
+    expect(await g.read('coordinator.md')).toMatch(/reset before dispatching more work, without asking or announcing it/);
     const status = await g.read('skills/status/SKILL.md');
     expect(status).toContain('grouped by feature');
     expect(status).toContain('unprompted reports follow the reporting level');
@@ -435,11 +435,34 @@ describe('file hand-offs and compact reads', () => {
     expect(recover).toMatch(/On `PRECONDITION` about a pending correction.*--submitted --correction --json/);
   });
 
-  it('documents the opt-in idle context reset without making it automatic', async () => {
-    const coord = await (await gen()).read('coordinator.md');
-    expect(coord).toMatch(/Idle context reset \(opt-in\): only if the user has asked for idle resets/);
-    expect(coord).toContain('minions coordinator restart --recover');
-    expect(coord).toMatch(/no active leases/);
+  it('routine context resets (task-45, on by default with coordinator.contextReset unset): when to write the handoff, when to restart, read it on start', async () => {
+    const g = await gen();
+    const coord = await g.read('coordinator.md');
+    expect(coord).toContain('## Session start');
+    expect(coord).toContain('minions coordinator handoff --read --json');
+    expect(coord).toMatch(/Context resets \(on, `coordinator.contextReset`\)/);
+    expect(coord).toMatch(/only when no worker lease is active, no drain runs, and a task was delivered in this session, or this session's context reached 60k tokens, or 10 worker hand-offs happened/);
+    expect(coord).toMatch(/Write the handoff first: `minions coordinator handoff --json` with the note on stdin.*at most 4 KB/);
+    expect(coord).toMatch(/\*\*Open owner questions\*\* \(each with your recommended answer/);
+    expect(coord).toMatch(/an unanswered owner question goes into the handoff/);
+    expect(coord).toContain('`minions coordinator restart --recover --detach --json`');
+    expect(coord).toMatch(/Never restart while a worker lease is active \(the restart refuses; never use --force for a reset\)/);
+    expect(coord).not.toMatch(/setsid|Idle context reset \(opt-in\)/);
+    const orch = await g.read('skills/orchestrate/SKILL.md');
+    expect(orch).toMatch(/If the response carries `contextReset` \(`due: true`\), do the context reset now/);
+    expect(orch).toMatch(/unless a record or release response carried `contextReset`/);
+    const recover = await g.read('skills/recover/SKILL.md');
+    expect(recover).toMatch(/^1\. `minions coordinator handoff --read --json`/m);
+  });
+
+  it('coordinator.contextReset.enabled: false keeps resets opt-in (owner request only)', async () => {
+    const g = await gen({ ...defaults(), coordinator: { contextReset: { enabled: false } } } as MinionsConfig);
+    const coord = await g.read('coordinator.md');
+    expect(coord).toMatch(/Context resets are off \(`coordinator.contextReset.enabled`\)\. Only if the owner asks for one/);
+    expect(coord).toContain('`minions coordinator restart --recover --detach --json`');
+    expect(coord).toMatch(/Never restart with active leases or while waiting on the owner mid-question/);
+    expect(coord).toContain('minions coordinator handoff --read --json'); // a handoff is still read on start
+    expect(await g.read('skills/orchestrate/SKILL.md')).toContain('Context resets are off for this project');
   });
 });
 

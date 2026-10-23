@@ -90,9 +90,10 @@ describe('durable usage tally', () => {
     ]);
     reopened.close();
 
-    vi.stubEnv('MINIONS_AUTH_METHOD', 'subscription'); // hermetic: the container itself may use api-key billing
-    const status = await collectStatus({ db: env.db, config: env.config, backlog: async () => env.backlog });
-    vi.unstubAllEnvs();
+    // Billing is read from the environment: pin it so a host's MINIONS_AUTH_METHOD cannot change the line.
+    vi.stubEnv('MINIONS_AUTH_METHOD', 'subscription');
+    let status;
+    try { status = await collectStatus({ db: env.db, config: env.config, backlog: async () => env.backlog }); } finally { vi.unstubAllEnvs(); }
     expect(status.spend?.total.tokens).toBe(155947);
     expect(status.spend?.budget).toBeNull();
     expect(humanStatus(status)).toMatch(/spend \(subscription\): total 155,947 tokens, 2 attempt\(s\)/);
