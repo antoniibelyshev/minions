@@ -284,6 +284,25 @@ describe('credential masking of stored send errors', () => {
     expect(redactError('Authorization: Digest realm="a b", response=deadbeefcafe1234; next')).toBe('Authorization: Digest [redacted] next');
   });
 
+  it('masks a quoted Digest param whatever character follows its closing quote', () => {
+    // Python dict repr: the header value sits in single quotes.
+    const dict = `{'Authorization': 'Digest username="u", response="deadbeefcafe1234"'}`;
+    expect(redactError(dict)).not.toContain('deadbeefcafe1234');
+    expect(redactError(dict)).toBe("{'Authorization': 'Digest [redacted]");
+    const header = 'Authorization: Digest username="u", response="deadbeefcafe1234"';
+    for (const tail of [')', '.', ']', "'", '-', 'x', 'X', '_', '-> 401', '). retrying']) {
+      const out = redactError(`${header}${tail}`);
+      expect(out, tail).not.toContain('deadbeefcafe1234');
+      expect(out, tail).toMatch(/^Authorization: Digest \[redacted\]/);
+    }
+    expect(redactError(`(${header})`)).toBe('(Authorization: Digest [redacted]');
+    expect(redactError(`${header}.`)).toBe('Authorization: Digest [redacted]');
+    expect(redactError('Authorization: Digest response="deadbeefcafe1234"x nonce="n0nce42"')).toBe('Authorization: Digest [redacted]');
+    // Base64 padding before the closing quote of a JSON string is still not taken for a quoted value.
+    expect(redactError('{"Authorization":"Basic dXNlcjpwYXNzd29yZA==","x":"y"}')).toBe('{"Authorization":"Basic [redacted]","x":"y"}');
+    expect(redactError('["Authorization: Basic dXNlcjpwYXNzd29yZA==","next"]')).toBe('["Authorization: Basic [redacted]","next"]');
+  });
+
   it('masks Digest params after a backslash-escaped quote in a quoted value', () => {
     expect(redactError('Authorization: Digest username="a\\"b", response="deadbeefcafe1234"')).toBe('Authorization: Digest [redacted]');
     expect(redactError('Authorization: Digest username="a\\"b, c", response="deadbeefcafe1234" -> 401')).toBe('Authorization: Digest [redacted] -> 401');

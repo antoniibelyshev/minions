@@ -64,13 +64,17 @@ const HWS = String.raw`(?:[^\S\n]|\n(?=[ \t]))`;
  * `SignedHeaders=host;range`). Its parts, in order:
  * - a JSON escape (`\"`, `\\`) of a header logged inside a JSON string;
  * - whitespace around a param's `=` (`nc = 1`);
- * - a quoted value with `\"` escapes, closed by a quote before whitespace, `,`, `;` or the end (so the
- *   `="` of Base64 padding before the quote that closes an enclosing string is not taken for a value);
+ * - a quoted value with `\"` escapes, closed by a quote not followed by a word character, `"`, `\` or
+ *   `=` (so `)`, `.`, `]`, `'`, `-`, `,`, `;`, whitespace or the end may follow it, while the `="` of
+ *   Base64 padding before the quote that closes an enclosing string is not taken for a value);
+ * - a quoted value closed by a quote right before a word character (`response="x"y`), if it has no
+ *   whitespace or JSON separator (`,:;{}[]`): the text between Base64 padding and the next string's
+ *   opening quote in JSON always has one;
  * - an unterminated quoted value (a cut-off message), up to the line end;
  * - a JSON-escaped quoted value (`=\"John Doe\"`);
  * - any other character except whitespace, `"`, `\` and `,`. An unescaped quote ends the item.
  */
-const AUTH_ITEM = String.raw`(?:\\.|[^\S\n]+(?==)|=[^\S\n]*"(?:[^"\\\n]|\\.)*"(?=[\s,;]|$)|=[^\S\n]*"(?:[^\s"\\]|\\.)(?:[^"\\\n]|\\.)*(?=\n|$)|=[^\S\n]*\\"(?:[^"\\\n]|\\\\\\.|\\[^"\\\n])*\\"|(?<=[^\S\n])=[^\S\n]+|[^\s"\\,])+`;
+const AUTH_ITEM = String.raw`(?:\\.|[^\S\n]+(?==)|=[^\S\n]*"(?:[^"\\\n]|\\.)*"(?=[^\w"\\=]|$)|=[^\S\n]*"[^\s"\\,:;{}[\]]+"(?=\w)|=[^\S\n]*"(?:[^\s"\\]|\\.)(?:[^"\\\n]|\\.)*(?=\n|$)|=[^\S\n]*\\"(?:[^"\\\n]|\\\\\\.|\\[^"\\\n])*\\"|(?<=[^\S\n])=[^\S\n]+|[^\s"\\,])+`;
 /** Before a further item: `,` or whitespace, then the next `key=` param. */
 const AUTH_NEXT_ITEM = String.raw`(?:${HWS}*,${HWS}*|${HWS}+)(?=[\w-]+[^\S\n]*=)`;
 /**
