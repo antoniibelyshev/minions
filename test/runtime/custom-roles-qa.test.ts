@@ -128,7 +128,7 @@ describe('edit scope: history rewrites and the net diff', () => {
 
   // DEFECT (QA, task-33.4): editScopeErrors returns early for edits "any" before checking commits, so a
   // commits: false role can move the head. it.fails pins the bug; flip to it() once the scheduler is fixed.
-  it.fails('a role with commits: false must not move the head even when edits is "any"', async () => {
+  it('a role with commits: false must not move the head even when edits is "any"', async () => {
     const e = env();
     e.backlog.add({ id: 'task-1', workflow: 'scribe' });
     const b = await e.sched.claim('task-1', 'scribe');

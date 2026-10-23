@@ -717,10 +717,11 @@ export class Scheduler {
    */
   private async editScopeErrors(lease: Lease, def: RoleDef, head: string): Promise<string[]> {
     const from = lease.head_sha;
-    if (!from || from === head || def.edits === 'any') return [];
+    if (!from || from === head) return [];
     if (!def.commits || def.edits === 'none') {
       return def.contract === 'gate' ? [] : [`edits: role ${def.name} does not commit, but ${lease.branch} moved from ${from} to ${head} during the stage`];
     }
+    if (def.edits === 'any') return [];
     const changed = await this.diffPaths(from, head);
     if (changed === null) return [`edits: the stage diff ${from}..${head} cannot be computed, so role ${def.name}'s edit scope (${def.edits.paths.join(', ')}) cannot be verified`];
     const outside = changed.filter((p) => !matchesAny(p, def.edits === 'any' || def.edits === 'none' ? [] : def.edits.paths));
