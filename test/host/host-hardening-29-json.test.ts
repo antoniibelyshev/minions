@@ -93,3 +93,37 @@ describe('exec relay keeps --json stdout intact', () => {
     expect(execInherit).toHaveBeenLastCalledWith(['minions', 'status'], { tty: false, rawStdout: false });
   });
 });
+
+// QA (task-29 retest): rawStdout is chosen from the argv alone, so `--json` may be a positional value
+// while the runtime prints human output. That is safe only because the human emitter strips control
+// characters itself, including C1; these tests pin both halves of that argument.
+describe('--json detection cannot expose unfiltered human output', () => {
+  it('an option value that merely contains --json (--opt=--json) keeps the filter', async () => {
+    await delegateToRuntime(['pause', '--drain', '--reason=--json'], { json: false });
+    expect(execInherit).toHaveBeenLastCalledWith(['minions', 'pause', '--drain', '--reason=--json'], { tty: false, rawStdout: false });
+  });
+
+  it('a positional --json after `--` selects raw stdout (documented: human output must already be clean)', async () => {
+    await delegateToRuntime(['notify', 'ack', '--', '--json'], { json: false });
+    expect(execInherit).toHaveBeenLastCalledWith(['minions', 'notify', 'ack', '--', '--json'], { tty: false, rawStdout: true });
+  });
+
+  it('human emit/reportError strip C1 (U+009B CSI, U+009D OSC, U+0085) and DEL, so a raw relay of human output is still clean', () => {
+    const out = capture(() => emit({}, { json: false, human: () => 'a\u009b2Jb x\u009d0;title\u0007y line\u0085next d\u007fe' }));
+    expect(out).not.toMatch(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/);
+    expect(out).toContain('ab');
+    const err: string[] = [];
+    vi.spyOn(process.stderr, 'write').mockImplementation((s) => { err.push(String(s)); return true; });
+    reportError(new MinionsError('PRECONDITION', 'm\u009b2JX', 'h\u009d0;t\u0007Y'), { json: false });
+    vi.restoreAllMocks();
+    expect(err.join('')).not.toMatch(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/);
+  });
+
+  it('rawStdout does not apply to stderr even when the child writes human output there', async () => {
+    const o = bufSink(); const e = bufSink();
+    const script = 'process.stderr.write("e\\u009b2J\\u009d0;t\\u0007\\x1b[31mz\\n")';
+    expect(await spawnRelay(process.execPath, ['-e', script], { filter: true, rawStdout: true, out: o.w, err: e.w })).toBe(0);
+    expect(e.get().toString('utf8')).not.toMatch(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/);
+    expect(o.get().length).toBe(0);
+  });
+});
