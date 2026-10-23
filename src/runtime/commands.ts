@@ -24,14 +24,14 @@ import {
   buildClaudeCommand, buildCoordinatorCommand, telegramPollerStatus, claudePermissionModes, configuredPermissionMode, coordinatorWrapper, launchCoordinator, probeRuntime, readLaunchRecord, readMountedToken, RECOVERY_PROMPT,
   restartCoordinator, runtimeChannelFacts, scheduleDetachedRestart, syncCoordinator, coordinatorLaunchStatus, type LaunchStatus,
 } from './coordinator.js';
-import { openDb, type DrainNotice, type DrainRequest, type Lease, type LeaseRole, type PauseChange, type RuntimeDb } from './db.js';
+import { openDb, type DrainNotice, type DrainRequest, type Lease, type PauseChange, type RuntimeDb } from './db.js';
 import { clearDrain, requestDrain } from './drain.js';
 import { claimWithBrief, compactClaim, fetchBrief, recordSubmitted, requireWorkerRole, submitResult, sweepScratchOnStart, type CompactClaim } from './handoff.js';
 import { runHook } from './hooks.js';
 import { budgetNotice, humanSpend, parseTokens, recordLeaseUsage, recordSessionUsage, setBudget, spendReport, type SpendReport } from './spend.js';
 import { runtimePaths } from './paths.js';
 import { contextResetCheck, dueNotice, HANDOFF_MAX_BYTES, humanContextReset, readHandoff, writeHandoff, type ContextResetCheck } from './context-reset.js';
-import { capacityOf, LEASE_ROLES, Scheduler, type UsageFlag } from './scheduler.js';
+import { capacityOf, Scheduler, type UsageFlag } from './scheduler.js';
 import { gitCredential } from './github.js';
 import { ciStatus, formatCiStatus, formatSync, syncTasks, type SyncReport } from './ci.js';
 import { formatIntake, intakeProvenanceFallback, originRepository, syncIntake, type IntakeSyncReport } from './intake-sync.js';
@@ -341,12 +341,9 @@ export function register(program: Command): void {
     .option('--compact', 'print only leaseId, briefMarker, task, role, attempt, branch, worktree, expectedHead (the worker fetches the full brief)')
     .action(action(async (taskId: string, o: { role: string; holder?: string; compact?: boolean }, cmd: Command) => {
       requireMode('runtime');
+      // Built-ins and project roles alike: the stage machine places the role in the task's workflow (D6).
       const def = requireWorkerRole(await getConfig(), o.role);
-      // Project-role stages need the workflow stage machine (task-33.3/33.4); until then only built-ins are claimable.
-      if (!(LEASE_ROLES as readonly string[]).includes(def.name)) {
-        throw new MinionsError('PRECONDITION', `Role ${def.name} is a project role; claiming its stages needs workflow support, which this version does not have yet.`, 'Claim a built-in role (engineer, tester, reviewer).');
-      }
-      const brief = await claimWithBrief(await scheduler(), runtimePaths(), taskId, def.name as LeaseRole, { holder: o.holder });
+      const brief = await claimWithBrief(await scheduler(), runtimePaths(), taskId, def.name, { holder: o.holder });
       if (o.compact) emit(compactClaim(brief), { json: globalOpts(cmd).json, human: (c: CompactClaim) => `${c.briefMarker}\nworktree: ${c.worktree}\nbranch: ${c.branch} @ ${c.expectedHead}` });
       else emit(brief, { json: globalOpts(cmd).json, human: (b) => `${b.briefMarker}\n${JSON.stringify(b, null, 2)}` });
     }));

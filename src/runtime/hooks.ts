@@ -6,7 +6,7 @@ import { agentTypeRole, DEEP_SUFFIX, workerRoleNames } from '../config/roles.js'
 import type { MinionsConfig, RoleContract } from '../config/schema.js';
 import { sha256 } from '../core/fsutil.js';
 import { redact } from '../core/output.js';
-import type { DrainNoticeVia, LeaseRole, RuntimeDb } from './db.js';
+import type { BuiltinLeaseRole, DrainNoticeVia, LeaseRole, RuntimeDb } from './db.js';
 import { TELEGRAM_TOOL_PREFIX } from './coordinator.js';
 import { runtimePaths } from './paths.js';
 import { capacityOf, scopeOf } from './scheduler.js';
@@ -410,12 +410,12 @@ const drainAllowed = (tool: string, ti: Record<string, unknown>): boolean =>
 
 /** How a drain notice is worded (D10): by the role's contract variant, and whether the role commits at all. */
 export interface DrainVariant { contract: RoleContract; commits: boolean }
-const BUILTIN_DRAIN_VARIANTS: Record<LeaseRole, DrainVariant> = {
+const BUILTIN_DRAIN_VARIANTS: Record<BuiltinLeaseRole, DrainVariant> = {
   engineer: { contract: 'producer', commits: true },
   tester: { contract: 'verifier', commits: true },
   reviewer: { contract: 'gate', commits: false },
 };
-const builtinDrainVariant = (role: string): DrainVariant | undefined => (Object.hasOwn(BUILTIN_DRAIN_VARIANTS, role) ? BUILTIN_DRAIN_VARIANTS[role as LeaseRole] : undefined);
+const builtinDrainVariant = (role: string): DrainVariant | undefined => (Object.hasOwn(BUILTIN_DRAIN_VARIANTS, role) ? BUILTIN_DRAIN_VARIANTS[role as BuiltinLeaseRole] : undefined);
 
 /** What the worker is told on its first tool call after a drain request, by contract variant (a role name of a built-in is accepted too). */
 export function drainNotice(variant: DrainVariant | RoleContract | LeaseRole, reason: string): string {
