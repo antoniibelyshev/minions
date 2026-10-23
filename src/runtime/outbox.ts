@@ -47,13 +47,25 @@ const systemClock: Clock = () => new Date();
 
 export const backoffMs = (attempts: number): number => Math.min(BACKOFF_BASE_MS * 2 ** Math.max(0, attempts - 1), BACKOFF_MAX_MS);
 
-/** Shortens an error and masks anything that looks like a credential (bot tokens, bearer tokens, long hex/base64). */
+/**
+ * Credential-like keys whose `key=value` / `key: value` value is masked (case-insensitive, also with a
+ * prefix such as `client_secret`, `x-access-token` or a JSON-quoted key).
+ */
+const SECRET_KEY = String.raw`\b([\w-]*?(?:password|passwd|api[_-]?key|secret|token|authorization))`;
+
+/**
+ * Shortens an error and masks anything that looks like a credential: bot tokens, GitHub tokens, the
+ * token after `Bearer`, and the values of password/passwd/api_key/apikey/secret/token/authorization
+ * keys. Prose such as "Bearer token is missing" is left readable (a bearer token has 8+ characters).
+ */
 export function redactError(message: string): string {
   const masked = message
     .replace(/(?:bot)?\d{6,}:[A-Za-z0-9_-]{30,}(?![A-Za-z0-9_-])/gi, '[redacted]')
     .replace(/\b(gh[pousr]_|github_pat_)[A-Za-z0-9_]{20,}\b/g, '[redacted]')
-    .replace(/\bbearer\s+[^\s"']+/gi, 'Bearer [redacted]')
-    .replace(/(bearer|token|authorization)(["']?\s*[:=]?\s*["']?)(?!\[redacted\])[^\s"']{8,}/gi, '$1$2[redacted]')
+    .replace(/\bbearer\s+(?!\[redacted\])[^\s"',;]{8,}/gi, 'Bearer [redacted]')
+    .replace(new RegExp(`${SECRET_KEY}(\\s*["']?\\s*[:=]\\s*["']?)(?!\\[redacted\\]|bearer\\s)[^\\s"'&,;]+`, 'gi'), '$1$2[redacted]')
+    // "token <value>" without a separator: only values that look generated (12+ chars with a digit).
+    .replace(/\b(token|authorization)(\s+)(?!\[redacted\])(?=[^\s"']*\d)[^\s"']{12,}/gi, '$1$2[redacted]')
     .replace(/\s+/g, ' ')
     .trim();
   return masked.length > MAX_ERROR_LENGTH ? `${masked.slice(0, MAX_ERROR_LENGTH - 1)}…` : masked;

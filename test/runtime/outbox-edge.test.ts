@@ -164,7 +164,7 @@ describe('minions work cancel never deletes worktrees or branches', () => {
     const brief = await env.sched.claim('task-1', 'engineer');
     expect(existsSync(brief.worktree)).toBe(true);
 
-    const r = await cancelWork({ db: env.db, release: (id, why) => env.sched.release(id, why) }, { taskIds: ['TASK-1', 'task-404'] }, 'owner cancelled');
+    const r = await cancelWork({ db: env.db, release: (id, why) => env.sched.release(id, why), backlog: env.backlog }, { taskIds: ['TASK-1', 'task-404'] }, 'owner cancelled');
     expect(r.released.map((x) => x.leaseId)).toEqual([brief.leaseId]);
     expect(r.idle).toEqual(['task-404']);
     expect(existsSync(brief.worktree)).toBe(true);
@@ -172,16 +172,16 @@ describe('minions work cancel never deletes worktrees or branches', () => {
     expect(formatCancel(r)).toContain('worktrees kept');
 
     // Repeating the cancel is a harmless no-op.
-    const again = await cancelWork({ db: env.db, release: (id, why) => env.sched.release(id, why) }, { taskIds: ['task-1'] }, 'again');
-    expect(again).toEqual({ released: [], failed: [], idle: ['task-1'] });
+    const again = await cancelWork({ db: env.db, release: (id, why) => env.sched.release(id, why), backlog: env.backlog }, { taskIds: ['task-1'] }, 'again');
+    expect(again).toEqual({ released: [], failed: [], blocked: [], blockFailed: [], idle: ['task-1'] });
     expect(formatCancel(again)).toBe('no active leases released\nno active lease: task-1');
     expect(existsSync(brief.worktree)).toBe(true);
   });
 
   it('--all with no active leases releases nothing and reports no idle ids', async () => {
     const env = makeEnv();
-    const r = await cancelWork({ db: env.db, release: async () => { throw new Error('must not be called'); } }, { taskIds: [], all: true }, 'x');
-    expect(r).toEqual({ released: [], failed: [], idle: [] });
+    const r = await cancelWork({ db: env.db, release: async () => { throw new Error('must not be called'); }, backlog: env.backlog }, { taskIds: [], all: true }, 'x');
+    expect(r).toEqual({ released: [], failed: [], blocked: [], blockFailed: [], idle: [] });
   });
 });
 
@@ -193,6 +193,18 @@ describe('credential masking of stored send errors', () => {
     ['github_pat_11ABCDEFG0123456789_abcdefghijklmnopqrstuvwxyz', 'github_pat_11ABCDEFG0123456789_abcdefghijklmnopqrstuvwxyz'],
     ['Authorization: Bearer abcdefghijklmnop', 'abcdefghijklmnop'],
     ['token=abcdefghijklmnop', 'abcdefghijklmnop'],
+    ['login failed: password=hunter2 user=bob', 'hunter2'],
+    ['PASSWORD: Sup3rS3cret!', 'Sup3rS3cret!'],
+    ['db passwd=letmein', 'letmein'],
+    ['GET /v1?api_key=k-12345&q=1 failed', 'k-12345'],
+    ['ApiKey: abc123xyz', 'abc123xyz'],
+    ['apikey=QWERTY', 'QWERTY'],
+    ['api-key = zzz999', 'zzz999'],
+    ['secret: s3cr3t', 's3cr3t'],
+    ['client_secret=cs_live_42', 'cs_live_42'],
+    ['{"password":"p@ss word"}', 'p@ss'],
+    ["config {'Secret': 'shh'}", 'shh'],
+    ['upstream said token abc123def456ghi', 'abc123def456ghi'],
   ])('masks %s', (input, secret) => {
     expect(redactError(input)).not.toContain(secret);
     expect(redactError(input)).toContain('[redacted]');
@@ -205,6 +217,15 @@ describe('credential masking of stored send errors', () => {
   it('masks the bot token inside a Telegram Bot API URL', () => {
     expect(redactError('POST https://api.telegram.org/bot123456789:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw/sendMessage failed'))
       .not.toContain('AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw');
+  });
+
+  it('keeps prose readable: only an actual token after Bearer is masked', () => {
+    expect(redactError('401: Bearer token is missing')).toBe('401: Bearer token is missing');
+    expect(redactError('invalid Bearer token; Bearer abcdefghijklmnop rejected')).toBe('invalid Bearer token; Bearer [redacted] rejected');
+    expect(redactError('Authorization: Bearer abcdefghijklmnop')).toBe('Authorization: Bearer [redacted]');
+    expect(redactError('token expired, authorization required')).toBe('token expired, authorization required');
+    expect(redactError('2 secrets found; password reset needed')).toBe('2 secrets found; password reset needed');
+    expect(redactError('password=hunter2 api_key=abc')).toBe('password=[redacted] api_key=[redacted]');
   });
 
   it('masks a bearer token in a JSON-quoted Authorization header', () => {
