@@ -169,6 +169,13 @@ export async function gateChangedPaths(o: { git: GitFn; repo: string; remote: st
   }
   const changed = new Set<string>();
   for (const b of new Set([...bases.trusted, ...bases.local])) {
+    // Unrelated history (no merge base) is a state problem, not a transient one: a retry fails the same
+    // way. Fail closed and non-retryable; the base is never skipped, so no path can drop out (task-40).
+    const mb = await o.git(o.repo, ['merge-base', b, o.head], true);
+    if (mb.code === 1 && !mb.stdout.trim()) {
+      return { ok: false, code: 'PRECONDITION', message: `Cannot evaluate the sensitive-path gate for ${o.branch}: no merge base between ${o.base} (${b}) and ${o.head} (unrelated history). Rebuild the branch on ${o.base} or check whether the base ref was rewritten; a retry fails the same way.` };
+    }
+    if (mb.code !== 0) return { ok: false, code: 'INTERNAL', message: `Cannot find the merge base of ${o.branch} and ${o.base} (${b}): ${lastLines(mb.stderr)}` };
     const d = await o.git(o.repo, ['diff', '--name-only', '--no-renames', '-z', `${b}...${o.head}`], true);
     if (d.code !== 0) return { ok: false, code: 'INTERNAL', message: `Cannot diff ${o.branch} against ${o.base} (${b}): ${lastLines(d.stderr)}` };
     for (const f of d.stdout.split('\0')) if (f) changed.add(f);

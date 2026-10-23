@@ -615,8 +615,10 @@ export const PRE_SPAWN_SIGNALS: NodeJS.Signals[] = [...FORWARDED_SIGNALS, ...IGN
  * Decision (task-38): the probe window. Between taking the lock and spawning claude the wrapper awaits
  * the Telegram probe, `claude --help` (up to 30 s each) and any other start-up work. A signal there
  * used to kill the wrapper with Node's default action and leave a dead-pid lock. coordinatorWrapper
- * installs this guard in the same tick it takes the lock: the first PRE_SPAWN_SIGNALS signal is
- * recorded, `aborted` resolves, and the wrapper releases the lock and exits 128+n. runCoordinator calls
+ * installs this guard before it awaits the lock (task-40; previously right after it, which left a few
+ * microtask hops with no listener): the first PRE_SPAWN_SIGNALS signal is recorded, `aborted`
+ * resolves, a lock wait still in progress ends without taking the lock, and the wrapper releases the
+ * lock (if taken) and exits 128+n. runCoordinator calls
  * `handOff()` synchronously right before installing its own handlers and spawning, so there is no gap
  * in which a signal hits neither; after a signal `handOff()` returns false and claude is never started
  * (nor the launch record written).
@@ -828,7 +830,16 @@ export function procStartTime(pid: number): string | null {
 
 const defaultSleep = (ms: number) => new Promise<void>((res) => setTimeout(res, ms));
 
-export interface LockWaitOptions { pid?: number; session?: string; alive?: LockAlive; /** The holder's process start time recorded in the lock (default: read from /proc). */ start?: string | null; waitMs?: number; sleep?: (ms: number) => Promise<void>; log?: (line: string) => void }
+export interface LockWaitOptions {
+  pid?: number; session?: string; alive?: LockAlive; /** The holder's process start time recorded in the lock (default: read from /proc). */ start?: string | null; waitMs?: number; sleep?: (ms: number) => Promise<void>; log?: (line: string) => void;
+  /** Ends the wait (the pre-spawn guard's abort, task-40): no further attempt is made, and the wait rejects with LockWaitAborted. */
+  signal?: AbortSignal;
+}
+
+/** Rejection of acquireCoordinatorLockWaiting when its `signal` aborted before the lock was taken. */
+export class LockWaitAborted extends Error {
+  constructor() { super('Stopped while waiting for the project coordinator lock.'); this.name = 'LockWaitAborted'; }
+}
 
 /** Acquires the coordinator lock, waiting up to `waitMs` for a live holder to exit (restart); CONFLICT after that. */
 export async function acquireCoordinatorLockWaiting(store: CoordinatorLockStore, o: LockWaitOptions = {}): Promise<CoordinatorLock> {
@@ -840,7 +851,10 @@ export async function acquireCoordinatorLockWaiting(store: CoordinatorLockStore,
   const waitMs = o.waitMs ?? LOCK_WAIT_MS;
   let waited = 0;
   let announced = false;
+  const abort = o.signal;
+  const aborted = abort ? new Promise<void>((res) => { if (abort.aborted) res(); else abort.addEventListener('abort', () => res(), { once: true }); }) : null;
   for (;;) {
+    if (abort?.aborted) throw new LockWaitAborted();
     try { return store.acquireCoordinatorLock(session, pid, alive, start); } catch (e) {
       const conflict = e instanceof MinionsError && e.code === 'CONFLICT';
       if (!conflict) throw e;
@@ -849,7 +863,7 @@ export async function acquireCoordinatorLockWaiting(store: CoordinatorLockStore,
           'Attach to the running coordinator (`minions start`) instead; `minions coordinator restart` replaces it.', e.details);
       }
       if (!announced) { o.log?.(`minions: waiting for the previous coordinator (pid ${store.coordinatorLock()?.pid ?? '?'}) to exit...`); announced = true; }
-      await sleep(LOCK_POLL_MS);
+      await (aborted ? Promise.race([sleep(LOCK_POLL_MS), aborted]) : sleep(LOCK_POLL_MS));
       waited += LOCK_POLL_MS;
     }
   }
@@ -1025,16 +1039,23 @@ export async function coordinatorWrapper(loadConfig: () => Promise<MinionsConfig
     const cfg = await loadConfig();
     // Before runCoordinator: a refused duplicate must not overwrite the running coordinator's launch record.
     const log = deps.log ?? ((l: string) => process.stderr.write(l + '\n'));
-    held = await acquireCoordinatorLockWaiting(store(), {
-      session: lockSession(deps.env ?? process.env), ...deps.lockWait, log,
-    });
-    // Same tick as the lock: every await until claude is spawned is covered (see PreSpawnGuard),
-    // the startup step (GitHub intake) included.
+    // Before the lock is awaited (task-40): every hop from taking the lock until claude is spawned is
+    // covered (see PreSpawnGuard), the startup step (GitHub intake) included. A signal while waiting for
+    // a previous holder ends the wait; one right after the lock was taken releases it below.
     guard = installPreSpawnGuard(deps.signals ?? process);
     const g = guard;
     const stop = new AbortController();
     void g.aborted.then(() => stop.abort());
+    try {
+      held = await acquireCoordinatorLockWaiting(store(), {
+        session: lockSession(deps.env ?? process.env), ...deps.lockWait, log, signal: stop.signal,
+      });
+    } catch (e) {
+      if (!(e instanceof LockWaitAborted) || !g.signal) throw e;
+    }
     const run = (async () => {
+      // A signal during the lock wait or right after the lock: no startup step, never spawn.
+      if (g.signal) return exitCodeOf(null, g.signal);
       if (deps.onStart) {
         try { await deps.onStart(cfg, log, stop.signal); } catch (e) { log(`minions: startup step failed (the coordinator starts anyway): ${redact((e as Error).message).slice(0, 500)}`); }
       }
