@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import type { BacklogAdapter, ScopeFilter, Task, TaskStatus } from '../backlog/types.js';
 import { can, matchesAny } from '../config/capabilities.js';
 import { isGithubDelivery } from '../config/delivery.js';
+import { baseRoleName, ENGINEER_ROLE, roleLimit, workerRoleNames } from '../config/roles.js';
 import type { MinionsConfig } from '../config/schema.js';
 import { verifyApproval } from '../core/approval.js';
 import { MinionsError } from '../core/errors.js';
@@ -70,13 +71,21 @@ export interface PublishResponse {
   message: string;
 }
 
+/** Lease usage of one worker role; `limited` = an execution.maxByRole (or maxEngineers) limit is set, else max = maxActiveTasks. */
+export interface RoleCapacity { active: number; max: number; free: number; limited: boolean }
+
 export interface Capacity {
   activeTaskIds: string[];
+  /** Kept for older coordinators: same as byRole.engineer. */
   activeEngineers: number;
   maxActiveTasks: number;
+  /** Kept for older coordinators: byRole.engineer.max. */
   maxEngineers: number;
   freeTaskSlots: number;
+  /** Kept for older coordinators: byRole.engineer.free. */
   freeEngineerSlots: number;
+  /** Every registered worker role (`-deep` variants count as their base role). */
+  byRole: Record<string, RoleCapacity>;
 }
 
 /** Labels that opt a task into a per-task tester stage (verification.qaLabels, default ["qa"]). */
@@ -101,12 +110,20 @@ export const scopeOf = (cfg: MinionsConfig): ScopeFilter => ({
 export function capacityOf(config: MinionsConfig, leases: Lease[], tasks: Task[]): Capacity {
   const ids = new Set(leases.map((l) => l.task_id));
   for (const t of tasks) if (IN_FLIGHT.includes(t.status)) ids.add(t.id);
-  const activeEngineers = leases.filter((l) => l.role === 'engineer').length;
-  const { maxActiveTasks, maxEngineers } = config.execution;
+  const { maxActiveTasks } = config.execution;
+  const byRole: Record<string, RoleCapacity> = {};
+  for (const role of workerRoleNames(config)) {
+    const limit = roleLimit(config, role);
+    const max = limit ?? maxActiveTasks;
+    const active = leases.filter((l) => baseRoleName(config, l.role) === role).length;
+    byRole[role] = { active, max, free: Math.max(0, max - active), limited: limit !== undefined };
+  }
+  const eng = byRole[ENGINEER_ROLE]!;
   return {
-    activeTaskIds: [...ids].sort(), activeEngineers, maxActiveTasks, maxEngineers,
+    activeTaskIds: [...ids].sort(), activeEngineers: eng.active, maxActiveTasks, maxEngineers: eng.max,
     freeTaskSlots: Math.max(0, maxActiveTasks - ids.size),
-    freeEngineerSlots: Math.max(0, maxEngineers - activeEngineers),
+    freeEngineerSlots: eng.free,
+    byRole,
   };
 }
 
@@ -340,8 +357,10 @@ export class Scheduler {
         throw new MinionsError('CAPACITY', `Active task limit reached (${cap.activeTaskIds.length}/${cfg.execution.maxActiveTasks}: ${cap.activeTaskIds.join(', ')}).`,
           'Finish, block, or release an active task first.', cap);
       }
-      if (role === 'engineer' && cap.activeEngineers >= cfg.execution.maxEngineers) {
-        throw new MinionsError('CAPACITY', `Engineer limit reached (${cap.activeEngineers}/${cfg.execution.maxEngineers}).`, 'Wait for an engineer to finish.', cap);
+      const slots = Object.hasOwn(cap.byRole, role) ? cap.byRole[role] : undefined;
+      if (slots?.limited && slots.active >= slots.max) {
+        const label = role === ENGINEER_ROLE ? 'Engineer' : `Role ${role}`;
+        throw new MinionsError('CAPACITY', `${label} limit reached (${slots.active}/${slots.max}).`, `Wait for a${role === ENGINEER_ROLE ? 'n' : ''} ${role} to finish.`, cap);
       }
       const n = this.db.get<{ n: number }>('SELECT COUNT(*) AS n FROM leases WHERE task_id = ? AND role = ?', task.id, role)!.n + 1;
       this.db.exec(`INSERT INTO leases (id, task_id, role, attempt, holder, branch, config_revision, started_at, status)

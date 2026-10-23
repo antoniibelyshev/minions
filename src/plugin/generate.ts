@@ -4,7 +4,8 @@ import { dirname, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { CAPABILITIES, can, type Capability } from '../config/capabilities.js';
 import { AGENT_MODEL_ALIASES, engineerDeepEffort, isAgentModelAlias, roleEffort } from '../config/models.js';
-import { ROLES, type MinionsConfig, type Role } from '../config/schema.js';
+import { ENGINEER_ROLE, registeredRoleNames, roleLimit } from '../config/roles.js';
+import type { MinionsConfig, Role } from '../config/schema.js';
 import { MinionsError } from '../core/errors.js';
 import { atomicWrite, sha256 } from '../core/fsutil.js';
 import { configuredPermissionMode } from '../runtime/coordinator.js';
@@ -72,12 +73,13 @@ export function renderPolicySummary(cfg: MinionsConfig, role: Role = 'coordinato
   return lines.join('\n');
 }
 
-/** Markdown table of effective capability effects per role (path rules as notes). */
+/** Markdown table of effective capability effects, one column per registered role (coordinator, built-ins, project roles; path rules as notes). */
 export function renderCapabilityTable(cfg: MinionsConfig): string {
-  const rows = [`| Capability | ${ROLES.join(' | ')} | Path rules |`, `| - | ${ROLES.map(() => '-').join(' | ')} | - |`];
+  const roles = registeredRoleNames(cfg);
+  const rows = [`| Capability | ${roles.join(' | ')} | Path rules |`, `| - | ${roles.map(() => '-').join(' | ')} | - |`];
   for (const c of CAPABILITIES) {
     const notes = pathRuleNotes(cfg, c).join('; ') || '';
-    rows.push(`| ${c} | ${ROLES.map((r) => can(cfg, c, { role: r })).join(' | ')} | ${notes} |`);
+    rows.push(`| ${c} | ${roles.map((r) => can(cfg, c, { role: r })).join(' | ')} | ${notes} |`);
   }
   return rows.join('\n');
 }
@@ -384,7 +386,7 @@ function baseVars(cfg: MinionsConfig): Record<string, string> {
     modelGuidance: modelGuidance(cfg),
     attemptMaxTurns: String(cfg.execution.attemptMaxTurns),
     maxActiveTasks: String(cfg.execution.maxActiveTasks),
-    maxEngineers: String(cfg.execution.maxEngineers),
+    maxEngineers: String(roleLimit(cfg, ENGINEER_ROLE) ?? cfg.execution.maxActiveTasks),
     maxRepairCyclesBeforeReplan: String(cfg.execution.maxRepairCyclesBeforeReplan),
     deliveryMode: cfg.delivery.mode,
     deliveryGuidance: deliveryGuidance(cfg),

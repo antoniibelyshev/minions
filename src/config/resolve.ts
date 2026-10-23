@@ -1,6 +1,7 @@
 import { MinionsError, invalidConfig, zodIssues, type ConfigIssue } from '../core/errors.js';
-import { CAPABILITIES, ruleEffects, stricter, strictness } from './capabilities.js';
+import { CAPABILITIES, can, ruleEffects, stricter, strictness } from './capabilities.js';
 import { autoMergeConfigReasons } from './delivery.js';
+import { ENGINEER_ROLE, registeredRoleNames, roleConfigIssues, roleLimit } from './roles.js';
 import { MinionsConfigSchema, CapabilityRuleSchema, type Capability, type CapabilityRule, type MinionsConfig } from './schema.js';
 
 export const SUPPORTED = {
@@ -47,11 +48,12 @@ function crossFieldIssues(c: MinionsConfig): ConfigIssue[] {
   if (!(SUPPORTED.backlog as readonly string[]).includes(c.backlog.backend)) issues.push({ path: 'backlog.backend', message: `"${c.backlog.backend}" is not supported by this build (supported: ${SUPPORTED.backlog.join(', ')})` });
   if (!(SUPPORTED.communication as readonly string[]).includes(c.communication.channel)) issues.push({ path: 'communication.channel', message: `"${c.communication.channel}" is not supported by this build (supported: ${SUPPORTED.communication.join(', ')})` });
   if (c.delivery.mode !== 'local' && c.delivery.provider !== 'github') issues.push({ path: 'delivery.provider', message: `delivery.mode "${c.delivery.mode}" publishes to GitHub and needs delivery.provider "github" (got "${c.delivery.provider}")` });
-  if (c.execution.maxEngineers > c.execution.maxActiveTasks) issues.push({ path: 'execution.maxEngineers', message: `must be <= execution.maxActiveTasks (${c.execution.maxEngineers} > ${c.execution.maxActiveTasks})` });
   if (!c.models.allowed.includes(c.models.default)) issues.push({ path: 'models.default', message: `"${c.models.default}" is not in models.allowed [${c.models.allowed.join(', ')}]` });
   if (c.models.coordinator !== undefined && !c.models.allowed.includes(c.models.coordinator)) issues.push({ path: 'models.coordinator', message: `"${c.models.coordinator}" is not in models.allowed [${c.models.allowed.join(', ')}]` });
   if (c.container.mountDockerSocket) issues.push({ path: 'container.mountDockerSocket', message: 'must be false: the Docker socket grants host control' });
   if (c.container.mountHostRepository) issues.push({ path: 'container.mountHostRepository', message: 'must be false: the workspace lives in a named volume' });
+  // roles, role references in capability sub-rules, execution.maxByRole / maxEngineers (incl. <= maxActiveTasks).
+  issues.push(...roleConfigIssues(c));
   return issues;
 }
 
@@ -103,7 +105,30 @@ function overlay(base: Obj, layer: unknown, source: Source, prov: Record<string,
     for (const p of Object.keys(prov)) if (p.startsWith(key + '.')) delete prov[p];
     prov[key] = source;
   });
+  syncEngineerAlias(out, layer, source, prov);
   return out;
+}
+
+/**
+ * execution.maxEngineers is an alias of execution.maxByRole.engineer: a layer that sets only one of them
+ * replaces the other one inherited from lower layers, so e.g. a project that writes maxByRole.engineer is not
+ * contradicted by the maxEngineers of the defaults. Within one layer both may be set; validation then
+ * requires them to agree.
+ */
+function syncEngineerAlias(out: Obj, layer: Obj, source: Source, prov: Record<string, Source>): void {
+  const ex = isObj(layer.execution) ? layer.execution : undefined;
+  if (!ex || !isObj(out.execution)) return;
+  const byRole = isObj(ex.maxByRole) ? ex.maxByRole : undefined;
+  const setsAlias = ex.maxEngineers !== undefined, setsByRole = byRole?.engineer !== undefined;
+  if (setsAlias === setsByRole) return;
+  const outEx = out.execution as Obj;
+  if (setsAlias && isObj(outEx.maxByRole) && outEx.maxByRole.engineer !== undefined) {
+    outEx.maxByRole = { ...outEx.maxByRole, engineer: ex.maxEngineers };
+    prov['execution.maxByRole.engineer'] = source;
+  } else if (setsByRole && outEx.maxEngineers !== undefined) {
+    outEx.maxEngineers = byRole!.engineer;
+    prov['execution.maxEngineers'] = source;
+  }
 }
 
 const json = (v: unknown) => JSON.stringify(v);
@@ -118,6 +143,13 @@ function checkDenyPreserved(project: MinionsConfig, merged: MinionsConfig, label
     if (lost) {
       throw new MinionsError('POLICY_DENIED', `capabilities.${cap}: ${label} cannot remove a deny set by project configuration.`,
         'Change the project configuration explicitly to lift a denial.', { path: `capabilities.${cap}` });
+    }
+    // Project role columns (roles.<r>.capabilities and their defaults) are denials too.
+    for (const role of registeredRoleNames(project)) {
+      if (can(project, cap, { role }) === 'deny' && can(merged, cap, { role }) !== 'deny') {
+        throw new MinionsError('POLICY_DENIED', `roles.${role}: ${label} cannot lift the deny of ${cap} set by project configuration.`,
+          'Change the project configuration explicitly to lift a denial.', { path: `roles.${role}.capabilities.${cap}` });
+      }
     }
   }
 }
@@ -148,8 +180,18 @@ function applySession(base: MinionsConfig, session: unknown, prov: Record<string
       const e = parsed.data;
       // Raise every rule to at least the override so role/path rules cannot stay looser.
       out.capabilities[cap] = cur.rules.length ? { effect: stricter(cur.effect, e), rules: cur.rules.map((r) => ({ ...r, effect: stricter(r.effect, e) })) } : stricter(cur.effect, e);
-    } else if (head === 'execution' && segs.length === 2 && key !== 'oneActiveStagePerTask' && key! in out.execution) {
-      const k = key as 'maxActiveTasks' | 'maxEngineers' | 'maxRepairCyclesBeforeReplan' | 'attemptMaxTurns';
+    } else if (path === 'execution.maxEngineers') {
+      // Alias of maxByRole.engineer: narrow both so they keep agreeing; unset = bounded by maxActiveTasks.
+      const n = num(roleLimit(out, ENGINEER_ROLE) ?? out.execution.maxActiveTasks);
+      out.execution.maxEngineers = n;
+      if (out.execution.maxByRole?.[ENGINEER_ROLE] !== undefined) out.execution.maxByRole[ENGINEER_ROLE] = n;
+    } else if (head === 'execution' && key === 'maxByRole' && segs.length === 3) {
+      const role = segs[2]!;
+      const n = num(roleLimit(out, role) ?? out.execution.maxActiveTasks);
+      out.execution.maxByRole = { ...out.execution.maxByRole, [role]: n };
+      if (role === ENGINEER_ROLE && out.execution.maxEngineers !== undefined) out.execution.maxEngineers = n;
+    } else if (head === 'execution' && segs.length === 2 && key !== 'oneActiveStagePerTask' && key !== 'maxByRole' && key! in out.execution) {
+      const k = key as 'maxActiveTasks' | 'maxRepairCyclesBeforeReplan' | 'attemptMaxTurns';
       out.execution[k] = num(out.execution[k]);
     } else if (path === 'models.allowed') {
       if (!Array.isArray(v) || !v.length || !v.every((m) => out.models.allowed.includes(m))) throw widen(path, 'not a subset of allowed models');
