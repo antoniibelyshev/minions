@@ -22,7 +22,7 @@ describe('runtime db migration 1 -> 2', () => {
     const path = join(tmp(), 'minions.db');
     // Build a genuine v1 database with this build's own code, then roll its schema back.
     const db = new RuntimeDb(path);
-    db.sql.exec('DROP TABLE publications; DROP TABLE approvals');
+    db.sql.exec('DROP TABLE publications; DROP TABLE approvals; ALTER TABLE leases DROP COLUMN harness');
     db.sql.prepare("INSERT INTO leases (id, task_id, role, attempt, config_revision, started_at, status) VALUES ('lease-x','task-1','engineer',1,1,'2026-01-01T00:00:00Z','ended')").run();
     db.setMeta('schema_version', '1');
     db.close();
@@ -69,7 +69,7 @@ describe('runtime db migration 2 -> 3 (host-signed approvals)', () => {
     const path = join(tmp(), 'minions.db');
     // A genuine v2 database with a task-1.4 style (unsigned) approval row.
     const db = new RuntimeDb(path);
-    db.sql.exec('ALTER TABLE approvals DROP COLUMN signature');
+    db.sql.exec('ALTER TABLE approvals DROP COLUMN signature; ALTER TABLE leases DROP COLUMN harness');
     db.sql.prepare("INSERT INTO approvals (task_id, scope, head_sha, approved_by, note, recorded_at) VALUES ('task-1', 'publish', ?, 'user', NULL, '2026-01-01T00:00:00Z')").run('a'.repeat(40));
     db.setMeta('schema_version', '2');
     db.close();

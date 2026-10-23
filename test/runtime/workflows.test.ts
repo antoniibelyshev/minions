@@ -181,6 +181,7 @@ describe('workflows: legacy tasks and assignment', () => {
     const path = join(tmp(), 'm.db');
     const v4 = new RuntimeDb(path);
     v4.exec('DROP TABLE task_stages');
+    v4.exec('ALTER TABLE leases DROP COLUMN harness');
     v4.setMeta('schema_version', '4');
     v4.close();
     const up = new RuntimeDb(path);

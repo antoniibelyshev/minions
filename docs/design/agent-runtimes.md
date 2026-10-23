@@ -758,6 +758,16 @@ and `src/config/launch.ts` (the `launch` entry). Decisions made while building i
 - **Claude-side guards:** the plugin generator emits no agent file for a project role on a process harness. The
   pre-agent hook denies `minions:<role>[-deep]` for any role on a process harness, so a Claude subagent cannot stand
   in for it.
+- **Hardening (task-14.11, review follow-ups):**
+  - A gate role on a process harness must be read-only. Whether its own `harness` or `harnesses.default` put it
+    there, `validateConfig` refuses `worktree: "branch"`, `edits` other than `none` and `commits: true`
+    (`roles.<r>.worktree|edits|commits`). Config validation has no warning channel, so `work next` carries a
+    `warnings` list (absent when empty) naming every gate that `harnesses.default` moved onto a process harness.
+  - Each lease records the harness it was claimed on (`leases.harness`, schema 7). The phase 1 producer cap counts
+    active leases by that value, not by the current config. Leases from before schema 7 (NULL) count as `claude`.
+    A lease whose role is no longer configured counts as a producer, so the cap errs on the safe side.
+  - In `work next`, a process role without its `harnesses.<id>` block (a config that skipped validation) makes only
+    its own entry `stuck`, with the reason. The other entries are listed as usual.
 - **Not here:** the `fake` harness (registered with the runner, child task 3), the host-runtime refusal (the runner
   enforces it), setup and settings items, and `harness` in role proposals (child task 6).
 

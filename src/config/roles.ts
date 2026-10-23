@@ -326,7 +326,45 @@ export function harnessConfigIssues(c: MinionsConfig, phase: PhaseRules = CURREN
       push(at, `${phase.summary}; ${def.builtin ? 'the built-in' : 'project'} ${def.contract} role ${name} must stay on claude`);
     }
   }
+  // A gate on a process harness is read-only towards the squad (D9 phase 2 note, D3.7.4: nothing is fetched back),
+  // whether its own `harness` or harnesses.default put it there.
+  for (const def of roleRegistry(c)) {
+    if (def.contract !== 'gate' || roleNameProblem(def.name) !== null) continue;
+    const own = ownHarness(c, def.name);
+    const h = phaseRoleHarness(c, def, own, phase);
+    if (!isProcessHarness(h)) continue;
+    const via = own ? `roles.${def.name}.harness puts` : 'harnesses.default puts';
+    const why = (what: string) => `${via} the gate role ${def.name} on harness ${h}; a gate on a process harness is read-only: ${what} (or set roles.${def.name}.harness to claude)`;
+    if (def.worktree === 'branch') push(`roles.${def.name}.worktree`, why('its worktree must be "review"'));
+    if (def.edits !== 'none') push(`roles.${def.name}.edits`, why('edits must be "none"'));
+    if (def.commits) push(`roles.${def.name}.commits`, why('commits must be false'));
+  }
   return issues;
+}
+
+/** A role's own `roles.<r>.harness` (not harnesses.default), or undefined. */
+function ownHarness(c: RolesCfg, name: string): HarnessId | undefined {
+  return (ownEntry(rolesOf(c), name) as { harness?: HarnessId } | undefined)?.harness;
+}
+
+/** `def`'s harness under `phase` (RoleDef.harness is resolved for CURRENT_PHASE). */
+function phaseRoleHarness(c: RolesCfg, def: RoleDef, own: HarnessId | undefined, phase: PhaseRules): HarnessId {
+  return resolveRoleHarness(c, { contract: def.contract, builtin: def.builtin, ...(own ? { harness: own } : {}) }, phase);
+}
+
+/**
+ * Gate roles that `harnesses.default` (not their own `harness`) moves onto a process harness. Config validation has
+ * no warning channel, so `minions work next` lists these as warnings: a squad-wide default silently changing where an
+ * existing gate runs should be visible. Empty for Claude-only configs.
+ */
+export function defaultMovedGates(c: DefCfg, phase: PhaseRules = CURRENT_PHASE): { role: string; harness: HarnessId }[] {
+  const out: { role: string; harness: HarnessId }[] = [];
+  for (const def of roleRegistry(c)) {
+    if (def.contract !== 'gate' || roleNameProblem(def.name) !== null || ownHarness(c, def.name)) continue;
+    const h = phaseRoleHarness(c, def, undefined, phase);
+    if (isProcessHarness(h)) out.push({ role: def.name, harness: h });
+  }
+  return out;
 }
 
 const isRelativePath = (p: string) => !/^(?:[A-Za-z]:)?[\\/]/.test(p) && !p.split(/[\\/]/).includes('..');

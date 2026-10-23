@@ -196,12 +196,13 @@ describe('role_proposals table', () => {
     const path = join(tmp(), 'm.db');
     const v5 = new RuntimeDb(path);
     v5.exec('DROP TABLE role_proposals');
+    v5.exec('ALTER TABLE leases DROP COLUMN harness');
     v5.setMeta('schema_version', '5');
     v5.close();
     const up = new RuntimeDb(path);
     try {
-      expect(SCHEMA_VERSION).toBe(6);
-      expect(up.getMeta('schema_version')).toBe('6');
+      expect(SCHEMA_VERSION).toBeGreaterThanOrEqual(6);
+      expect(up.getMeta('schema_version')).toBe(String(SCHEMA_VERSION));
       up.addRoleProposal({ id: 'rp_00000009', name: 'a', json: '{}' });
       expect(up.roleProposals()).toHaveLength(1);
     } finally { up.close(); }
