@@ -113,7 +113,7 @@ fake GitHub API; the pre-filled token URL follows GitHub's documented template U
   `"enabledPlugins": {"telegram@claude-plugins-official": false}` to `$CLAUDE_CONFIG_DIR/settings.json`
   on every launch and passes `enabledPlugins: {…: true}` in its own `--settings` (flag settings win
   over user scope on Claude Code 2.1.292). `minions status` and `minions doctor` (`telegram.poller`)
-  report when `bot.pid` is missing, dead, or not a descendant of the coordinator wrapper; recover with
+  report when `bot.pid` is missing, dead, or not served by the coordinator claude itself (its nearest claude ancestor must be the wrapper's child; a nested `claude -p` under the coordinator is foreign); recover with
   /mcp → reconnect `plugin:telegram:telegram` in the coordinator terminal, or
   `minions coordinator restart --recover` when no worker runs. Do not enable the plugin in a config dir that other sessions
   share with the coordinator. Start nested or ad-hoc `claude` runs with a separate

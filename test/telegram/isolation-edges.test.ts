@@ -9,7 +9,7 @@ import type { RunResult } from '../../src/core/exec.js';
 import { telegramPollerCheck } from '../../src/host/doctor.js';
 import { runCoordinator, telegramPollerStatus, type SpawnLike } from '../../src/runtime/coordinator.js';
 import { runtimePaths } from '../../src/runtime/paths.js';
-import { checkTelegramPoller, disableTelegramAtUserScope, POLLER_RECOVERY_HINT, type PollerProc } from '../../src/telegram/isolation.js';
+import { checkTelegramPoller, disableTelegramAtUserScope, isClaudeCmdline, POLLER_RECOVERY_HINT, type PollerProc } from '../../src/telegram/isolation.js';
 import { evaluateTelegram, TELEGRAM_PLUGIN_ID, type TelegramProbeReport } from '../../src/telegram/probe.js';
 import { defaults } from '../helpers.js';
 import { tmp } from '../runtime/fixtures.js';
@@ -171,13 +171,49 @@ describe('poller detection corner cases', () => {
     expect(telegramPollerCheck({ code: 0, stdout: JSON.stringify({ ok: false }) })).toBeNull();
   });
 
-  // DEFECT (reported to the coordinator, task-51 tester): the incident's hijacker was a `claude -p`
-  // started from inside the coordinator's process tree (a worker subagent's Bash runs under the
-  // coordinator claude). Its server.ts descends from the wrapper too, so the ancestor walk calls it
-  // "ok". Expected: foreign (the nearest claude ancestor of the poller is not the wrapper's child).
-  // Remove `.fails` once checkTelegramPoller distinguishes the coordinator claude from nested ones.
-  it.fails('a poller started by a nested claude -p under the coordinator claude is foreign', async () => {
-    expect((await check('730')).state).toBe('foreign');
+  // The incident's hijacker was a `claude -p` started from inside the coordinator's process tree (a
+  // worker subagent's Bash runs under the coordinator claude). Its server.ts descends from the wrapper
+  // too; it is foreign because its nearest claude ancestor is not the wrapper's child.
+  it('a poller started by a nested claude -p under the coordinator claude is foreign', async () => {
+    expect(await check('730')).toMatchObject({ state: 'foreign', pid: 730, hint: POLLER_RECOVERY_HINT });
+  });
+
+  it('the real coordinator tree (wrapper -> claude -> bun run -> bun server.ts) is ok, also with claude run by node', async () => {
+    // Copied from the live container (ps, 2026-10-23): argv0 `claude`, a long --append-system-prompt.
+    const live: Record<number, { parent: number; cmd: string }> = {
+      1559057: { parent: 1559000, cmd: 'node /usr/local/bin/minions coordinator run' },
+      1559095: { parent: 1559057, cmd: 'claude --plugin-dir /opt/minions/plugin --append-system-prompt # Minions coordinator\n\nYou are the coordinator --permission-mode auto --settings {"permissions":{}}' },
+      1559142: { parent: 1559095, cmd: 'bun run --cwd /home/node/.claude/plugins/cache/claude-plugins-official/telegram/0.0.7 --shell=bun --silent start' },
+      1559149: { parent: 1559142, cmd: '/usr/local/bin/bun server.ts' },
+      1621313: { parent: 1559095, cmd: '/bin/bash -c source snap.sh && eval \'claude -p hi\'' },
+      1621320: { parent: 1621313, cmd: 'node /usr/local/lib/node_modules/@anthropic-ai/claude-code/cli.js -p hi' },
+      1621330: { parent: 1621320, cmd: 'bun run --cwd /p --shell=bun --silent start' },
+      1621340: { parent: 1621330, cmd: '/usr/local/bin/bun server.ts' },
+    };
+    const liveProc: PollerProc = { alive: (p) => p in live || p === 1559000, cmdline: (p) => live[p]?.cmd ?? null, parentOf: (p) => live[p]?.parent ?? null };
+    const run = (pid: string, coordinatorPid = 1559057, p = liveProc) => checkTelegramPoller({ pidFile: '/s/bot.pid', coordinatorPid, telegram: true, proc: p, readText: async () => pid });
+    expect(await run('1559149')).toMatchObject({ state: 'ok', pid: 1559149 });
+    expect((await run('1621340')).state).toBe('foreign'); // node-run nested claude under a worker's bash
+    const viaNode: Record<number, { parent: number; cmd: string }> = { ...live, 1559095: { parent: 1559057, cmd: 'node /usr/local/lib/node_modules/@anthropic-ai/claude-code/cli.js --channels x' } };
+    expect((await run('1559149', 1559057, { ...liveProc, cmdline: (p) => viaNode[p]?.cmd ?? null })).state).toBe('ok');
+  });
+
+  it('fails toward foreign when no claude sits between poller and wrapper, or an ancestor is unreadable', async () => {
+    const t: Record<number, { parent: number; cmd: string | null }> = {
+      200: { parent: 1, cmd: 'node minions coordinator run' },
+      310: { parent: 200, cmd: 'bun run start' }, 320: { parent: 310, cmd: 'bun server.ts' }, // server.ts straight under the wrapper
+      330: { parent: 200, cmd: null }, 340: { parent: 330, cmd: 'bun server.ts' }, // unreadable ancestor
+      350: { parent: 1, cmd: 'bun server.ts' }, // orphan reparented to init
+    };
+    const p: PollerProc = { alive: (x) => x in t, cmdline: (x) => t[x]?.cmd ?? null, parentOf: (x) => t[x]?.parent ?? null };
+    for (const pid of ['320', '340', '350']) expect((await check(pid, { proc: p })).state).toBe('foreign');
+  });
+
+  it('isClaudeCmdline looks at argv0 (and argv1 after an interpreter) only', () => {
+    for (const c of ['claude -p hi', '/usr/local/bin/claude --channels x', 'claude.exe', '/usr/local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe -p',
+      'node /usr/local/lib/node_modules/@anthropic-ai/claude-code/cli.js', 'bun /x/claude']) expect(isClaudeCmdline(c)).toBe(true);
+    for (const c of ['/bin/bash -c claude -p hi', 'timeout 60 claude -p', 'bun run start', 'bun server.ts', 'node minions coordinator run', 'claude-plugin x', '', 'vim claude'])
+      expect(isClaudeCmdline(c)).toBe(false);
   });
 
   it('telegramPollerStatus: a launch record without Telegram is not applicable; a dead wrapper too', async () => {

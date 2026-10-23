@@ -92,7 +92,7 @@ Decisions:
    winning, and `--channels` only gates notifications of servers already loaded. Rejected: a separate state dir or token
    for other sessions, because the plugin takes both from the environment, which the coordinator's Bash tool inherits.
    Detection: `minions status` / `minions telegram status` (`poller`) and doctor `telegram.poller` check that `bot.pid`
-   is a live `server.ts` descending from the coordinator wrapper (`src/telegram/isolation.ts`).
+   is a live `server.ts` whose nearest `claude` ancestor (by argv0) is the coordinator claude, the wrapper's direct child (`src/telegram/isolation.ts`). Descent from the wrapper alone is not enough: worker Bash commands and any nested `claude -p` run under the coordinator claude too. If `/mcp` does not list the plugin at all, it never loaded in the coordinator; restart instead of reconnecting.
 3. **Bun in the image.** Add a pinned Bun release with checksum verification to `docker/Dockerfile` at build time, and set
    `BUN_INSTALL_CACHE_DIR=/home/node/.cache/bun` (the `cache` volume, because `/home/node` is tmpfs). The plugin still runs
    `bun install` when it starts, so it needs registry access. With `container.network: none`, Telegram is reported unavailable.

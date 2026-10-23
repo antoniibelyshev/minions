@@ -18,7 +18,9 @@
 // MCP server inherits, its Bash tool inherits too, so no env-based split exists.
 //
 // Detection: checkTelegramPoller reads bot.pid and checks that the process is alive, is the plugin's
-// server.ts, and descends from the coordinator wrapper (the tmux pane's process).
+// server.ts, and that its nearest claude ancestor is the coordinator claude (the direct child of the
+// coordinator wrapper). Descending from the wrapper is not enough: worker Bash commands, and any
+// nested `claude -p` they start, run under the coordinator claude too.
 import { readFile } from 'node:fs/promises';
 import { atomicWrite } from '../core/fsutil.js';
 import { TELEGRAM_PLUGIN_ID } from './probe.js';
@@ -80,11 +82,27 @@ export interface PollerProc {
 /** How to get the channel back (coordinator guidance, status and doctor). */
 export const POLLER_RECOVERY_HINT = 'In the coordinator terminal (attach with `minions start`) run /mcp and reconnect plugin:telegram:telegram; '
   + 'or, when no worker is running, restart the coordinator: `minions coordinator restart --recover`. '
+  + 'If /mcp does not list plugin:telegram:telegram at all, the plugin never loaded in the coordinator: restart it (same command) instead, and check `minions doctor` (telegram.plugin). '
   + 'Never start other claude sessions with the Telegram plugin in this container.';
 
 /** server.ts of the plugin (bun runs it as `bun server.ts`, the pid the plugin writes). */
 const SERVER_CMDLINE = /(^|[\s/])server\.ts(\s|$)/;
 const MAX_DEPTH = 64;
+const CLAUDE_BIN = /^claude(\.exe|\.js)?$/;
+const CLAUDE_PKG = /@anthropic-ai[\\/]claude-code[\\/]/;
+const INTERPRETERS = new Set(['node', 'nodejs', 'bun']);
+const base = (p: string) => p.slice(p.lastIndexOf('/') + 1);
+
+/**
+ * Whether a /proc cmdline (argv joined by spaces) is a Claude Code process: argv0 is the claude binary,
+ * or node/bun running the Claude Code package. Only argv0 (and argv1 after an interpreter) count, so a
+ * shell whose command string mentions claude (`bash -c "claude -p hi"`) is not one.
+ */
+export function isClaudeCmdline(cmd: string): boolean {
+  const [argv0 = '', argv1 = ''] = cmd.trim().split(/\s+/);
+  if (CLAUDE_BIN.test(base(argv0)) || CLAUDE_PKG.test(argv0)) return true;
+  return INTERPRETERS.has(base(argv0)) && (CLAUDE_BIN.test(base(argv1)) || CLAUDE_PKG.test(argv1));
+}
 
 /**
  * Whether the Telegram poller named by bot.pid belongs to the running coordinator. `coordinatorPid`:
@@ -112,14 +130,27 @@ export async function checkTelegramPoller(input: {
   if (!proc.alive(pid)) return { state: 'dead', pid, detail: `Telegram poller pid ${pid} (bot.pid) has exited, so the coordinator's channel is not receiving messages`, hint: POLLER_RECOVERY_HINT };
   const cmd = proc.cmdline(pid);
   if (cmd !== null && !SERVER_CMDLINE.test(cmd)) return { state: 'dead', pid, detail: `bot.pid names pid ${pid}, which is not a Telegram plugin server (stale pid file); no poller is running`, hint: POLLER_RECOVERY_HINT };
-  let cur: number | null = pid;
-  for (let i = 0; i < MAX_DEPTH && cur !== null && cur > 1; i++) {
+  // Ownership: the nearest claude ancestor of the poller must be the coordinator claude, the wrapper's
+  // direct child. Every claude session started from inside the coordinator (a worker's Bash running
+  // `claude -p`) also descends from the wrapper, so plain ancestry is not enough. An ancestor whose
+  // cmdline is unreadable cannot be told apart from a claude, so the walk fails toward foreign.
+  const seen = new Set<number>([pid]);
+  let cur = pid;
+  for (let i = 0; i < MAX_DEPTH; i++) {
     const parent = proc.parentOf(cur);
     if (parent === null) {
       if (i === 0) return { state: 'unknown', pid, detail: `cannot tell which session owns Telegram poller pid ${pid} (no process table)` };
       break;
     }
-    if (parent === input.coordinatorPid) return { state: 'ok', pid, detail: `Telegram poller pid ${pid} belongs to the coordinator` };
+    // Reached init, the wrapper itself, or a cycle without passing a claude: not the coordinator's.
+    if (parent <= 1 || parent === input.coordinatorPid || seen.has(parent)) break;
+    seen.add(parent);
+    const pcmd = proc.cmdline(parent);
+    if (pcmd === null) break;
+    if (isClaudeCmdline(pcmd)) {
+      if (proc.parentOf(parent) === input.coordinatorPid) return { state: 'ok', pid, detail: `Telegram poller pid ${pid} belongs to the coordinator` };
+      break;
+    }
     cur = parent;
   }
   return { state: 'foreign', pid, detail: `Telegram poller pid ${pid} (bot.pid) is not the coordinator's: another claude session took the bot, and the coordinator no longer receives messages`, hint: POLLER_RECOVERY_HINT };

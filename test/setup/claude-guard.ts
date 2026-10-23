@@ -7,9 +7,10 @@
 // The child_process functions are wrapped on the builtin module and re-synced into its ESM named
 // exports, so `import { spawn } from 'node:child_process'` in src/ and test/ sees the guarded version.
 import cp from 'node:child_process';
+import fs from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 import { userInfo } from 'node:os';
-import { basename, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
 import { afterEach } from 'vitest';
 
@@ -99,6 +100,50 @@ wrap('fork', ([modulePath, ...rest]) => {
 for (const name of ['exec', 'execSync']) {
   wrap(name, ([command, o]) => check(command, [], { ...(o && typeof o === 'object' ? (o as Opts) : {}), shell: true }));
 }
+
+// The user's real Claude Code files a test must never write (task-51): settings.json (runCoordinator
+// turns the Telegram plugin off there; atomicWrite stages `.settings.json.*.tmp` beside it) and the
+// Telegram plugin state (bot.pid, access.json, .env). runtimePaths resolves them from
+// CLAUDE_CONFIG_DIR, which global.ts redirects; this catches a test that passes the real dir.
+export function protectedTarget(p: unknown): string | null {
+  if (typeof p !== 'string' && !(p instanceof URL)) return null;
+  const abs = resolve(p instanceof URL ? p.pathname : p);
+  for (const d of realDirs()) {
+    const tg = join(d, 'channels', 'telegram');
+    const settings = abs === join(d, 'settings.json') || (dirname(abs) === d && basename(abs).startsWith('.settings.json.'));
+    if (settings || abs === tg || abs.startsWith(tg + sep)) return abs;
+  }
+  return null;
+}
+function checkWrite(name: string, target: unknown): void {
+  const hit = protectedTarget(target);
+  if (!hit) return;
+  const msg = `test guard: refusing ${name}(${hit}): a test must not write the real Claude Code config. `
+    + 'Point CLAUDE_CONFIG_DIR / TELEGRAM_STATE_DIR (or MINIONS_STATE_DIR) at a temp dir.';
+  violations.push(msg);
+  throw new Error(msg);
+}
+/** `promise`: refuse by rejecting (fs/promises callers await), else by throwing. */
+function wrapFs(target: Record<string, AnyFn>, name: string, targets: (a: unknown[]) => unknown[], promise = false): void {
+  const orig = target[name];
+  if (!orig || orig[GUARDED]) return;
+  const wrapped: AnyFn = function (this: unknown, ...a: unknown[]) {
+    try { for (const t of targets(a)) checkWrite(name, t); } catch (e) { if (promise) return Promise.reject(e); throw e; }
+    return orig.apply(this, a);
+  };
+  wrapped[GUARDED] = true;
+  target[name] = wrapped;
+}
+const fsMod = fs as unknown as Record<string, AnyFn>;
+const fspMod = fs.promises as unknown as Record<string, AnyFn>;
+const first = (a: unknown[]) => [a[0]];
+const second = (a: unknown[]) => [a[1]];
+for (const [m, promise] of [[fsMod, false], [fspMod, true]] as const) {
+  for (const n of ['writeFile', 'appendFile', 'rm', 'unlink', 'truncate']) wrapFs(m, n, first, promise);
+  for (const n of ['rename', 'copyFile']) wrapFs(m, n, second, promise);
+}
+for (const n of ['writeFileSync', 'appendFileSync', 'rmSync', 'unlinkSync', 'truncateSync']) wrapFs(fsMod, n, first);
+for (const n of ['renameSync', 'copyFileSync']) wrapFs(fsMod, n, second);
 syncBuiltinESMExports();
 
 afterEach(() => {
