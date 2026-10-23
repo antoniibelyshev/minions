@@ -10,6 +10,7 @@ import { run, type RunOptions, type RunResult } from '../core/exec.js';
 import { CONTAINER, SERVICE_NAME, composeProjectName, projectPaths, volumeNames } from '../core/paths.js';
 import { KEY_HELPER_TTL_MS, authOf, containerEnv, isKeyAuth } from './auth.js';
 import type { ProjectJson } from './project.js';
+import { probeSecretsAccess, type SecretsAccess } from './secrets-access.js';
 
 export type Runner = (cmd: string, args: string[], opts?: RunOptions) => Promise<RunResult>;
 
@@ -28,8 +29,10 @@ export const tmpSizeMiB = (c: { tmpSizeMiB?: number }): number => c.tmpSizeMiB ?
  * loopback-only published ports, no Docker socket, no privileged mode, no host network/PID.
  * The secrets DIRECTORY is always a read-only bind (a directory, so atomically replaced files are
  * visible); Claude key methods (api-key/helper) add MINIONS_AUTH_METHOD/TTL env; secrets are never here.
+ * Linux host uid != 1000 with a private primary group: `group_add` with that gid, so the container
+ * user reads the 0640 secret files (secrets-access.ts); macOS and host uid 1000 get no group_add.
  */
-export function composeYaml(p: ProjectJson): string {
+export function composeYaml(p: ProjectJson, access: SecretsAccess = probeSecretsAccess()): string {
   const paths = projectPaths(p.projectId);
   const vols = volumeNames(p.projectId);
   const c = p.container;
@@ -43,6 +46,7 @@ export function composeYaml(p: ProjectJson): string {
     `    image: ${q(p.imageTag)}`,
     '    pull_policy: never',
     '    user: "1000:1000"',
+    ...(access.mode === 'group' ? [`    group_add: [${q(access.gid)}]`] : []),
     '    init: true',
     '    read_only: true',
     '    privileged: false',

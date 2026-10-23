@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { constants, createReadStream } from 'node:fs';
-import { access, chmod, lstat, mkdir, open, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { access, chmod, chown, lstat, mkdir, open, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { basename, dirname, join } from 'node:path';
 import type { z } from 'zod';
 import { MinionsError, invalidConfig, zodIssues } from './errors.js';
@@ -56,13 +56,15 @@ export async function copyRegularFileNoFollow(src: string, dst: string, mode = 0
 }
 
 /** Writes via a temp file in the same directory, then renames over the target. */
-export async function atomicWrite(path: string, data: string | Uint8Array, opts: { mode?: number } = {}): Promise<void> {
+export async function atomicWrite(path: string, data: string | Uint8Array, opts: { mode?: number; gid?: number } = {}): Promise<void> {
   const dir = dirname(path);
   await ensureDir(dir);
   const tmp = join(dir, `.${basename(path)}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`);
   try {
-    await writeFile(tmp, data, { mode: opts.mode ?? 0o644, flush: true });
-    if (opts.mode !== undefined) await chmod(tmp, opts.mode); // umask may have narrowed it
+    // With a group change the file stays owner-only until it carries the right group.
+    await writeFile(tmp, data, { mode: opts.gid !== undefined ? (opts.mode ?? 0o644) & 0o700 : opts.mode ?? 0o644, flush: true });
+    if (opts.gid !== undefined) await chown(tmp, -1, opts.gid);
+    if (opts.mode !== undefined || opts.gid !== undefined) await chmod(tmp, opts.mode ?? 0o644); // umask may have narrowed it
     await rename(tmp, path);
   } catch (e) {
     await rm(tmp, { force: true });

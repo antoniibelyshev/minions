@@ -134,13 +134,14 @@ describe('linuxHostFacts (fake runner)', () => {
     const f = await linuxHostFacts(runner, { ...up, compose: false, composeVersion: null },
       { env: { XDG_RUNTIME_DIR: '/run/user/1000' }, uid: 1000, exists: async (p) => p === '/run/user/1000/docker.sock' });
     expect(f).toEqual({ uid: 1000, securityOptions: ['name=seccomp,profile=builtin', 'name=selinux'], selinux: 'enforcing', dockerHost: null,
-      rootlessSocket: '/run/user/1000/docker.sock', composeV1: 'docker-compose version 1.29.2, build unknown' });
+      rootlessSocket: '/run/user/1000/docker.sock', composeV1: 'docker-compose version 1.29.2, build unknown', secretsAccess: { mode: 'owner' } });
   });
 
   it('leaves facts unknown when tools are missing; skips docker info when the daemon is down', async () => {
     const { calls, runner } = fake(() => undefined);
-    const f = await linuxHostFacts(runner, down('x'), { env: { DOCKER_HOST: 'unix:///run/user/1000/docker.sock' }, uid: 1001, exists: async () => false });
-    expect(f).toEqual({ ...unknownLinuxFacts(), uid: 1001, dockerHost: 'unix:///run/user/1000/docker.sock' });
+    const f = await linuxHostFacts(runner, down('x'), { env: { DOCKER_HOST: 'unix:///run/user/1000/docker.sock' }, uid: 1001, exists: async () => false, readFile: () => null });
+    expect(f).toEqual({ ...unknownLinuxFacts(), uid: 1001, dockerHost: 'unix:///run/user/1000/docker.sock',
+      secretsAccess: { mode: 'unsupported', reason: '/etc/passwd or /etc/group is unreadable, so the primary group cannot be checked' } });
     expect(calls.some((c) => c.cmd === 'docker' && c.args[0] === 'info')).toBe(false);
   });
 });

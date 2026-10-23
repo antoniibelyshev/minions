@@ -52,7 +52,7 @@ fake GitHub API; the pre-filled token URL follows GitHub's documented template U
 ### Linux hosts (preview)
 
 Status: implemented for Docker Engine and covered by unit tests with fakes
-(`test/host/linux-host.test.ts`, Secret Service cases in `test/host/credentials.test.ts`). **No live
+(`test/host/linux-host.test.ts`, `test/host/secrets-access.test.ts`, Secret Service cases in `test/host/credentials.test.ts`). **No live
 run on a Linux host has been recorded yet** (no Ubuntu LTS or RPM-distro result). Until it is, treat
 Linux as a preview, not a tested platform.
 
@@ -64,7 +64,7 @@ Linux as a preview, not a tested platform.
 | Compose | bundled | v2 plugin required. `doctor` names `docker-compose-plugin` (apt/dnf with Docker's repository) or `docker-compose-v2` (Ubuntu's own packages), and says when only legacy `docker-compose` v1 is installed. |
 | `host.docker.internal` | built in | `extra_hosts: host.docker.internal:host-gateway` is added on non-macOS hosts when the container environment references it (JetBrains Central / loopback base URL rewrite); nothing else relies on it. Needs Docker Engine 20.10+. |
 | SELinux | n/a | `doctor` (`docker.selinux`) warns when `getenforce` is Enforcing and the daemon labels containers (`name=selinux` in `docker info` SecurityOptions), with the exact `semanage fcontext … container_file_t` + `restorecon` fix for `<root>/projects`. compose.yaml is not changed (no `:z` relabel yet). |
-| Bind-mount ownership | Desktop maps ownership | Rootful Engine keeps host ownership. Host uid 1000 (the default first user on Ubuntu/Fedora): the 0600 secret files are readable by the container user (uid 1000) as is (`docker.uid: ok`). Other uids: `docker.uid` warns; not supported yet. Rootless Docker: `docker.rootless` warns (uid 1000 maps to a subordinate uid); not supported yet for host-provisioned secrets. |
+| Bind-mount ownership | Desktop maps ownership | Rootful Engine keeps host ownership. Host uid 1000 (the default first user on Ubuntu/Fedora): the 0600 secret files are readable by the container user (uid 1000) as is (`docker.uid: ok`). Other uids (rootful): supported when your primary group is a private user group (same name as your user, no other member in any `/etc/group` entry with that gid and no other account with that primary gid, per `/etc/passwd` + `/etc/group`; the Ubuntu/Fedora `useradd` default): compose.yaml gets `group_add: ["<gid>"]` and the secrets dir/files are 0750/0640 with that group (`docker.uid: ok`). A shared primary group (e.g. `users`), root, or an account only known through NSS/LDAP: `docker.uid` warns and the files stay 0600. Never a chown or ACL for uid 1000. macOS and host uid 1000 are unchanged (no `group_add`, 0700/0600). Rootless Docker: `docker.rootless` warns (uid 1000 maps to a subordinate uid); not supported yet for host-provisioned secrets, and the secrets stay 0700/0600 without `group_add` (rootless is detected from `DOCKER_HOST` or the current docker context pointing at a socket in `/run/user/<uid>/` or `$XDG_RUNTIME_DIR`). Limitation: group membership from LDAP/SSSD (NSS) is not visible, because the private-group rule reads only `/etc/group`; if a directory service adds members to your local primary gid, `doctor` cannot see it and reports `docker.uid: ok`. Check with `getent group <gid>` on such hosts. |
 | install.sh | as before | Prints a preview note instead of the macOS-only warning, and Docker Engine-specific fixes. |
 
 Nothing minions writes on the host is root-owned: every bind mount is read-only with
@@ -76,7 +76,8 @@ Linux gap list (audit of the macOS-specific host paths, 2026-10-23):
 - `src/host/credentials.ts`: Keychain only on macOS; Secret Service added (above). Downgrade: older builds
   reject the `secret-service` backend in `credentials.json`; re-provision with `MINIONS_CREDENTIAL_STORE=file` first.
 - `src/host/docker.ts`, `doctor.ts`, `install.ts`: Docker Desktop hints are now platform-aware. Remaining:
-  secrets readable for host uid ≠ 1000 and rootless Docker (see design below), `bind.selinux: z` in compose.yaml.
+  secrets readable for rootless Docker (see design below), `bind.selinux: z` in compose.yaml. Host uid ≠ 1000
+  (rootful, private group) is implemented in `src/host/secrets-access.ts`.
 - `src/host/setup.ts`, `wizard.ts`, `commands.ts`: credential messages name the actual backend. The
   wizard's Claude key source `keychain` (macOS `security`) has no Linux counterpart yet (`file` and `env` work).
   The GitHub token page is opened with `open` on macOS only; Linux prints the URL (no `xdg-open` yet).
@@ -88,12 +89,19 @@ Linux gap list (audit of the macOS-specific host paths, 2026-10-23):
 - Image: built natively on the host from the multi-arch base, so amd64 and arm64 Linux hosts build
   their own arch; no published multi-arch image and no amd64 run recorded.
 
+Host uid ≠ 1000, rootful (implemented, unit-tested with fakes; no live Linux run yet): `group_add:
+["<host primary gid>"]` is added to the service and the secrets dir is materialized as 0750 / files 0640
+with that group, only when the primary group is a private user group (single member, same name as the
+user, counting the members of every `/etc/group` entry with that gid); otherwise `doctor` refuses
+(`docker.uid` warns) and modes stay 0700/0600. Root (uid 0) is always refused. Rootless Docker keeps
+0700/0600 and no `group_add`. The group is changed before any mode is widened. Members granted through
+LDAP/SSSD (NSS) are not detected: the check reads only `/etc/passwd` and `/etc/group`, so `doctor` cannot
+see them. The decision is re-probed on every compose.yaml regeneration and secrets write, and existing
+files in the secrets dir are re-moded when it changes. Never chown to uid 1000 and never use ACLs for
+uid 1000: on the host that uid may be another person.
+
 Design for the open ownership cases (not implemented; needs live validation):
 
-- Host uid ≠ 1000, rootful: add `group_add: ["<host primary gid>"]` to the service and materialize the
-  secrets dir as 0750 / files 0640 with that group, only when the primary group is a private user group
-  (single member, same name as the user); otherwise refuse with the doctor hint. Never chown to uid
-  1000 and never use ACLs for uid 1000: on the host that uid may be another person.
 - Rootless Docker: container uid 1000 is host uid `subuid_start + 999`. Options to validate: run the
   container with `userns_mode: keep-id`-like mapping (Podman only), or materialize the secrets into a
   tmpfs volume via `docker compose exec` at start instead of a bind mount. Prefer the latter (no host

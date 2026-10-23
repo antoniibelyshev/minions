@@ -5,9 +5,9 @@ import { join } from 'node:path';
 import { hostRoot } from '../core/paths.js';
 import type { DockerStatus } from './discovery.js';
 import type { Runner } from './docker.js';
+import { CONTAINER_UID, probeSecretsAccess, type SecretsAccess } from './secrets-access.js';
 
-/** In-container uid/gid of the `node` user the compose file runs as (`user: "1000:1000"`). */
-export const CONTAINER_UID = 1000;
+export { CONTAINER_UID };
 
 export interface LinuxHostFacts {
   /** Host user running the CLI (process.getuid), null when unknown. */
@@ -22,15 +22,19 @@ export interface LinuxHostFacts {
   rootlessSocket: string | null;
   /** `docker-compose --version` output when only the legacy v1 binary is installed, else null. */
   composeV1: string | null;
+  /** How the container reads the secret files for this host user (from /etc/passwd + /etc/group); null when unknown. */
+  secretsAccess: SecretsAccess | null;
 }
 
 export const unknownLinuxFacts = (): LinuxHostFacts =>
-  ({ uid: null, securityOptions: null, selinux: null, dockerHost: null, rootlessSocket: null, composeV1: null });
+  ({ uid: null, securityOptions: null, selinux: null, dockerHost: null, rootlessSocket: null, composeV1: null, secretsAccess: null });
 
 export interface FactOptions {
   env?: NodeJS.ProcessEnv;
   uid?: number | null;
   exists?: (path: string) => Promise<boolean>;
+  /** Reads /etc/passwd and /etc/group (tests inject fakes); null when unreadable. */
+  readFile?: (path: string) => string | null;
 }
 
 const fileExists = (p: string) => stat(p).then(() => true, () => false);
@@ -53,6 +57,14 @@ export async function linuxHostFacts(runner: Runner, docker: DockerStatus, opts:
         if (Array.isArray(v) && v.every((s) => typeof s === 'string')) facts.securityOptions = v as string[];
       } catch { /* unknown */ }
     }
+  }
+  if (facts.uid !== null) {
+    // Rootless from `docker info` when known, else the env/context heuristic (same as compose generation).
+    const rootless = facts.securityOptions ? isRootless(facts) : undefined;
+    try {
+      facts.secretsAccess = probeSecretsAccess({ platform: 'linux', uid: facts.uid, env, ...(rootless !== undefined ? { rootless } : {}),
+        ...(opts.readFile ? { readFile: opts.readFile } : {}) });
+    } catch { /* unknown */ }
   }
   const se = await safe('getenforce', []);
   const mode = se?.code === 0 ? se.stdout.trim().toLowerCase() : '';
@@ -128,10 +140,15 @@ export function linuxDockerChecks(facts: LinuxHostFacts, root: string = hostRoot
   if (!rootless && facts.securityOptions && facts.uid !== null) {
     if (facts.uid === CONTAINER_UID) {
       out.push({ name: 'docker.uid', status: 'ok', detail: `host uid ${facts.uid} matches the container user (uid ${CONTAINER_UID}); mounted secret files are readable without changing their owner` });
+    } else if (facts.secretsAccess?.mode === 'group') {
+      const a = facts.secretsAccess;
+      out.push({ name: 'docker.uid', status: 'ok',
+        detail: `host uid ${facts.uid} differs from the container user (uid ${CONTAINER_UID}); your primary group ${a.group} (gid ${a.gid}) is a private user group, so the secrets directory (0750) and files (0640) carry that group and compose.yaml adds it to the container user (group_add)` });
     } else {
+      const why = facts.secretsAccess?.mode === 'unsupported' ? `: ${facts.secretsAccess.reason}` : '';
       out.push({ name: 'docker.uid', status: 'warn',
-        detail: `host uid ${facts.uid} differs from the container user (uid ${CONTAINER_UID}): Docker Engine keeps host ownership on bind mounts, so the 0600 secret files you own are unreadable in the container`,
-        hint: `Not supported yet: run minions as a user with uid ${CONTAINER_UID} for host-provisioned secrets (GitHub/Telegram tokens, Claude key). minions never chowns them to uid ${CONTAINER_UID}, because on the host that uid may be another user.` });
+        detail: `host uid ${facts.uid} differs from the container user (uid ${CONTAINER_UID}) and the secrets cannot be shared through a private group${why}. Docker Engine keeps host ownership on bind mounts, so the 0600 secret files you own are unreadable in the container`,
+        hint: `Host-provisioned secrets (GitHub/Telegram tokens, Claude key) need either a host uid of ${CONTAINER_UID} or a private primary group (same name as your user, no other member; the default for \`useradd\` with USERGROUPS_ENAB on Ubuntu/Fedora). An interactive \`/login\` inside the container still works. minions never chowns the secrets to uid ${CONTAINER_UID} and never grants it ACLs, because on the host that uid may be another user.` });
     }
   }
   if (facts.selinux === 'enforcing') {

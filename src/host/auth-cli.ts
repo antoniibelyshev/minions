@@ -14,6 +14,7 @@ import {
 import { projectJsonBytes, refreshDerived, writeGenerated } from './install.js';
 import { loadEffectiveConfig, loadProjectJson } from './project.js';
 import { projectForPath } from './registry.js';
+import { probeSecretsAccess, secretFileMode, type SecretsAccess } from './secrets-access.js';
 
 export interface AuthSetFlags {
   file?: string;
@@ -96,7 +97,8 @@ export interface AuthPlan {
   notes: string[];
 }
 
-export function authPlan(a: ClaudeAuth, projectId: string | null): AuthPlan {
+/** `access` decides the key file mode shown in `writes` (0600, or 0640 with a private group on Linux). */
+export function authPlan(a: ClaudeAuth, projectId: string | null, access: SecretsAccess = probeSecretsAccess()): AuthPlan {
   const paths = projectId ? projectPaths(projectId) : null;
   const notes: string[] = [];
   if (isKeyAuth(a)) {
@@ -112,7 +114,7 @@ export function authPlan(a: ClaudeAuth, projectId: string | null): AuthPlan {
     hostReads: a.method === 'login' ? 'nothing (no key is provisioned)'
       : `${summarize(a).source}; on every \`minions start\`, \`minions auth refresh\`${a.method === 'helper' ? ` and every ${a.refreshMinutes ?? 30} min while \`minions start\` is attached` : ''}`,
     containerSettings: isKeyAuth(a) ? { apiKeyHelper: API_KEY_HELPER } : null,
-    writes: projectId ? [paths!.projectJson, paths!.composeYaml, ...(isKeyAuth(a) ? [`${paths!.apiKeyFile} (0600)`] : [])] : [defaultsPath()],
+    writes: projectId ? [paths!.projectJson, paths!.composeYaml, ...(isKeyAuth(a) ? [`${paths!.apiKeyFile} (${secretFileMode(access).toString(8).padStart(4, '0')})`] : [])] : [defaultsPath()],
     notes,
   };
 }
