@@ -131,7 +131,7 @@ describe('CLI surface (docs/design/cli-surface.md)', () => {
 
   it('hidden commands still parse and dispatch, with their own subcommand help', async () => {
     for (const [args, expected] of [
-      [['work', '--help'], ['claim', 'brief', 'submit', 'record', 'release', 'publish', 'approve', 'list']],
+      [['work', '--help'], ['claim', 'brief', 'submit', 'record', 'release', 'publish', 'approve', 'list', 'spend']],
       [['backlog', '--help'], ['ready', 'list', 'show', 'create', 'update', 'note', 'export']],
       [['hook', '--help'], ['stop', 'pre-agent', 'pre-telegram']],
       [['coordinator', '--help'], ['run', 'sync', 'restart']],

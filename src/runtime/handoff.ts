@@ -4,7 +4,7 @@ import { basename, dirname, join, relative, isAbsolute, resolve } from 'node:pat
 import { MinionsError } from '../core/errors.js';
 import { atomicWrite, writeJson } from '../core/fsutil.js';
 import type { Lease, LeaseRole, RuntimeDb } from './db.js';
-import type { RecordResponse, Scheduler, TaskBrief } from './scheduler.js';
+import type { RecordResponse, Scheduler, TaskBrief, UsageFlag } from './scheduler.js';
 
 /**
  * File-based worker hand-offs (keeps large JSON out of the coordinator's context).
@@ -294,7 +294,7 @@ export async function readSubmission(p: HandoffPaths, leaseId: string, opts: { c
  * once the result is final (valid, or unvalidated after the correction) the lease's files are removed (the DB keeps it).
  * The lease is checked first, so an ended lease reports CONFLICT rather than a missing file.
  */
-export async function recordSubmitted(sched: Scheduler, p: HandoffPaths, leaseId: string, opts: { correction?: boolean } = {}): Promise<RecordResponse> {
+export async function recordSubmitted(sched: Scheduler, p: HandoffPaths, leaseId: string, opts: { correction?: boolean; usage?: UsageFlag } = {}): Promise<RecordResponse> {
   checkId(leaseId);
   await sched.requireActive(leaseId);
   const raw = await readSubmission(p, leaseId, opts);

@@ -226,7 +226,7 @@ describe('CLI wiring', () => {
   it('registers work brief/submit, record --submitted and claim --compact', () => {
     expect(flags('work', 'brief')).toEqual(['--role']);
     expect(flags('work', 'submit')).toEqual(['--result-file', '--role']);
-    expect(flags('work', 'record')).toEqual(['--correction', '--result-file', '--submitted']);
+    expect(flags('work', 'record')).toEqual(['--correction', '--model', '--result-file', '--submitted', '--usage']);
     expect(flags('work', 'claim')).toEqual(['--compact', '--holder', '--role']);
   });
 

@@ -8,6 +8,7 @@ import { redact } from '../core/output.js';
 import type { LeaseRole, RuntimeDb } from './db.js';
 import { runtimePaths } from './paths.js';
 import { capacityOf, scopeOf } from './scheduler.js';
+import { currentBudget } from './spend.js';
 
 export interface HookDeps { db: RuntimeDb; backlog: BacklogAdapter; config: MinionsConfig }
 export type HookLoader = () => HookDeps | Promise<HookDeps>;
@@ -69,6 +70,7 @@ export async function stopHook(input: unknown, load: HookLoader): Promise<HookOu
   };
   try {
     if (db.paused().starts) return allow('paused');
+    if (currentBudget({ db, config })?.exhausted) return allow('budget', 'the owner budget is used up (new claims are refused)');
     if (backgroundRunning(inp)) return allow('background-running', 'a background subagent is still running');
     const leases = db.activeLeases();
     const leased = new Set(leases.map((l) => l.task_id));

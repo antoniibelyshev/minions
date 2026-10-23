@@ -26,8 +26,9 @@ import { openDb, type DrainRequest, type Lease, type LeaseRole, type PauseChange
 import { clearDrain, requestDrain } from './drain.js';
 import { claimWithBrief, compactClaim, fetchBrief, recordSubmitted, submitResult, sweepScratchOnStart, type CompactClaim } from './handoff.js';
 import { runHook } from './hooks.js';
+import { budgetNotice, humanSpend, parseTokens, recordLeaseUsage, recordSessionUsage, setBudget, spendReport, type SpendReport } from './spend.js';
 import { runtimePaths } from './paths.js';
-import { capacityOf, LEASE_ROLES, Scheduler } from './scheduler.js';
+import { capacityOf, LEASE_ROLES, Scheduler, type UsageFlag } from './scheduler.js';
 import { gitCredential } from './github.js';
 import { ciStatus, formatCiStatus, formatSync, syncTasks, type SyncReport } from './ci.js';
 import { formatIntake, intakeProvenanceFallback, originRepository, syncIntake, type IntakeSyncReport } from './intake-sync.js';
@@ -153,6 +154,8 @@ export interface StatusReport {
   coordinatorLaunch?: LaunchStatus;
   /** Notification outbox: undelivered items wait here until the coordinator sends them (`minions notify pending`). */
   notifications?: OutboxCounts;
+  /** Spend tally (tokens; estimated USD with API-key billing) and the owner budget (src/runtime/spend.ts). */
+  spend?: SpendReport;
   backlogError?: string;
 }
 
@@ -192,6 +195,7 @@ export async function collectStatus(deps: { db: RuntimeDb; config: MinionsConfig
   if (deps.channel) report.channel = await deps.channel().catch(() => undefined);
   if (deps.launch) report.coordinatorLaunch = await deps.launch().catch(() => undefined);
   try { report.notifications = outboxCounts(d); } catch { /* an older DB without the outbox: omit */ }
+  try { report.spend = spendReport({ db: d, config: cfg }); } catch { /* status never fails on the tally */ }
   try {
     const tasks = await (await deps.backlog()).listTasks();
     for (const t of tasks) report.queue[t.status] = (report.queue[t.status] ?? 0) + 1;
@@ -213,6 +217,7 @@ export function humanStatus(s: StatusReport): string {
     `queue: ${Object.entries(s.queue).map(([k, v]) => `${k}=${v}`).join(' ') || '(empty)'}`,
     `stop guard: ${s.guard.lastReason ?? '-'}`,
     ...(s.notifications?.pending ? [formatCounts(s.notifications)] : []),
+    ...(s.spend ? humanSpend(s.spend).split('\n') : []),
   ];
   if (s.backlogError) out.push(`backlog error: ${s.backlogError}`);
   out.push(s.activeLeases.length ? 'active leases:' : 'active leases: none', ...s.activeLeases.map((l) => `  ${l.id} ${l.task_id} ${l.role} #${l.attempt} ${l.branch ?? ''}`));
@@ -247,6 +252,38 @@ export function pauseControl(d: RuntimeDb, paths: { drainFlag: string }, name: '
 async function delegate(cmd: Command): Promise<void> {
   const code = await delegateToRuntime(process.argv.slice(2), { json: globalOpts(cmd).json });
   process.exit(code);
+}
+
+// ---------------------------------------------------------------- spend
+
+const USAGE_HELP = 'the worker\'s token total from the task notification (subagent_tokens; cumulative, the latest figure per lease counts)';
+
+function usageFlag(o: { usage?: string; model?: string }): UsageFlag | undefined {
+  if (o.usage === undefined) {
+    if (o.model !== undefined) throw new MinionsError('PRECONDITION', '--model is only used with --usage.');
+    return undefined;
+  }
+  return { tokens: parseTokens(o.usage), model: o.model ?? null };
+}
+
+/** `minions work spend`: optional budget change and usage record, then the spend report. */
+export async function spendCommand(o: { budget?: string; by?: string; lease?: string; session?: string | boolean; tokens?: string; model?: string },
+  deps: { db?: RuntimeDb; config?: MinionsConfig } = {}): Promise<SpendReport & { notice?: string }> {
+  const d = deps.db ?? getDb();
+  const cfg = deps.config ?? await getConfig();
+  const ctx = { db: d, config: cfg };
+  if ((o.lease || o.session) && o.tokens === undefined) throw new MinionsError('PRECONDITION', '--lease and --session need --tokens <n>.');
+  if (o.tokens !== undefined && !o.lease && !o.session) throw new MinionsError('PRECONDITION', '--tokens needs --lease <leaseId> or --session.');
+  if (o.lease && o.session) throw new MinionsError('PRECONDITION', 'Use --lease or --session, not both.');
+  if (o.by !== undefined && o.budget === undefined) throw new MinionsError('PRECONDITION', '--by is only used with --budget.');
+  if (o.budget !== undefined) setBudget(ctx, o.budget, o.by ?? null);
+  if (o.tokens !== undefined) {
+    const u = { tokens: parseTokens(o.tokens), model: o.model ?? null, source: 'manual' as const };
+    if (o.lease) recordLeaseUsage(d, o.lease, u);
+    else recordSessionUsage(d, typeof o.session === 'string' ? o.session : d.coordinatorLock()?.session ?? 'coordinator', u);
+  }
+  const notice = o.tokens !== undefined || o.budget !== undefined ? budgetNotice(ctx)?.message : undefined;
+  return { ...spendReport(ctx), ...(notice ? { notice } : {}) };
 }
 
 // ---------------------------------------------------------------- register
@@ -297,20 +334,36 @@ export function register(program: Command): void {
     .option('--submitted', 'record the result the worker stored with `minions work submit` (no JSON passes through the coordinator)')
     .option('--result-file <path>', 'read the WorkerResult from a file ("-" = stdin)')
     .option('--correction', 'the single allowed correction after an invalid result')
-    .action(action(async (leaseId: string, o: { submitted?: boolean; resultFile?: string; correction?: boolean }, cmd: Command) => {
+    .option('--usage <tokens>', USAGE_HELP)
+    .option('--model <name>', 'model the worker ran on (for the USD estimate with API-key billing)')
+    .action(action(async (leaseId: string, o: { submitted?: boolean; resultFile?: string; correction?: boolean; usage?: string; model?: string }, cmd: Command) => {
       requireMode('runtime');
       if (o.submitted && o.resultFile) throw new MinionsError('PRECONDITION', 'Use --submitted or --result-file, not both.');
+      const opts = { correction: !!o.correction, usage: usageFlag(o) };
       const r = o.submitted
-        ? await recordSubmitted(await scheduler(), runtimePaths(), leaseId, { correction: !!o.correction })
-        : await (await scheduler()).record(leaseId, await readInput(o.resultFile), { correction: !!o.correction });
-      emit(r, { json: globalOpts(cmd).json, human: (d) => [d.message, ...(d.errors ?? []).map((e: string) => `  - ${e}`)].join('\n') });
+        ? await recordSubmitted(await scheduler(), runtimePaths(), leaseId, opts)
+        : await (await scheduler()).record(leaseId, await readInput(o.resultFile), opts);
+      emit(r, { json: globalOpts(cmd).json, human: (d) => [d.message, ...(d.errors ?? []).map((e: string) => `  - ${e}`), ...(d.budget ? [d.budget.message] : [])].join('\n') });
     }));
   work.command('release <leaseId>').description('Release a lease without a result (worktree is kept)')
     .requiredOption('--reason <text>', 'why the lease is released')
-    .action(action(async (leaseId: string, o: { reason: string }, cmd: Command) => {
+    .option('--usage <tokens>', USAGE_HELP)
+    .option('--model <name>', 'model the worker ran on (for the USD estimate with API-key billing)')
+    .action(action(async (leaseId: string, o: { reason: string; usage?: string; model?: string }, cmd: Command) => {
       requireMode('runtime');
-      const r = await (await scheduler()).release(leaseId, o.reason);
-      emit(r, { json: globalOpts(cmd).json, human: (d) => `Released ${d.leaseId} (${d.taskId}); worktree kept at ${d.worktree ?? '-'}` });
+      const r = await (await scheduler()).release(leaseId, o.reason, { usage: usageFlag(o) });
+      emit(r, { json: globalOpts(cmd).json, human: (d) => [`Released ${d.leaseId} (${d.taskId}); worktree kept at ${d.worktree ?? '-'}`, ...(d.budget ? [d.budget.message] : [])].join('\n') });
+    }));
+  work.command('spend').description('Spend tally and owner budget: show it, set the budget in plain language, or record usage after the fact')
+    .option('--budget <amount>', 'set the budget, e.g. "5M tokens", "500k tokens per day", "$50" (API-key billing), "20 attempts"; "off" clears it')
+    .option('--by <name>', 'who set the budget (e.g. owner via Telegram)')
+    .option('--lease <leaseId>', 'record the token total for this lease (any status; the latest figure per lease counts)')
+    .option('--session [id]', 'record the coordinator session\'s own token total (default id: the coordinator lock session)')
+    .option('--tokens <n>', 'cumulative token total for --lease or --session')
+    .option('--model <name>', 'model, for the USD estimate with API-key billing')
+    .action(action(async (o: { budget?: string; by?: string; lease?: string; session?: string | boolean; tokens?: string; model?: string }, cmd: Command) => {
+      if (runtimeMode() === 'host') return delegate(cmd);
+      emit(await spendCommand(o), { json: globalOpts(cmd).json, human: (d) => [humanSpend(d), ...(d.notice ? [d.notice] : [])].join('\n') });
     }));
   work.command('cancel [taskIds...]').description('Best-effort cancel: release every active worker lease of the given tasks (or --all) without a result; worktrees and branches are kept')
     .option('--all', 'cancel every active lease')

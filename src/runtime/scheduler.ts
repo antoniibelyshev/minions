@@ -12,6 +12,7 @@ import { removeLeaseFiles, type HandoffPaths } from './handoff.js';
 import { missingApprovalKeyReason, runtimePaths } from './paths.js';
 import { publishTask, realGh, type GhFn, type PublishInput, type PublishOutcome } from './publish.js';
 import { isCiCheck, validateResult, type WorkerResult } from './results.js';
+import { assertBudgetAllowsStart, billingOf, budgetNotice, recordLeaseUsage, tokensFromResultUsage, type Billing, type BudgetNotice, type SpendContext } from './spend.js';
 import { readRequiredChecks, type RequiredChecksReport } from './ci.js';
 import { ciGateFromDb, formatCiGate, type CiGate } from './ci-gate.js';
 import { autoMergeTask, type MergeResult } from './merge.js';
@@ -44,9 +45,14 @@ export interface SchedulerDeps {
   approvalPublicKeyFile?: string;
   /** gh for read-only CI lookups (required checks); tests inject a mock. Default: the PATH wrapper. */
   gh?: GhFn;
-  /** Clock for the CI pending timeout (tests). */
+  /** Clock for the CI pending timeout and the spend tally (tests). */
   now?: () => Date;
+  /** API-key billing or a Claude subscription (default: MINIONS_AUTH_METHOD); only units and wording differ. */
+  billing?: Billing;
 }
+
+/** The worker's token total from the coordinator's task notification (`--usage`); cumulative per agent. */
+export interface UsageFlag { tokens: number; model?: string | null }
 
 /** Result of a publication attempt (`minions work publish`, or embedded in a record response). */
 export interface PublishResponse {
@@ -164,6 +170,10 @@ export interface RecordResponse {
   drain?: boolean;
   /** Present when the approval started branch/PR publication. */
   publication?: PublishResponse;
+  /** The token total stored for this lease (from --usage, else the result's usage block). */
+  usage?: { tokens: number; model: string | null; source: string };
+  /** Budget state after this record; `crossed` = a 50/80/100% threshold reached now (report it). */
+  budget?: BudgetNotice;
 }
 
 const RESULT_CONTRACT = 'Return exactly one JSON object: {status: complete|needs_changes|blocked|needs_split|partial, summary, branch, headSha (full SHA of the branch head you leave), modifiedPaths[], checks[{command, outcome: pass|fail|skipped, details?, source?: local|ci (ci: a required CI check for this head; tester/reviewer with ciAuthority github only)}], acceptanceEvidence[{criterion, evidence}], findings[], nextAction, verdict?: approve|request-changes (reviewer only), usage? (only when actually available)}.';
@@ -209,6 +219,36 @@ export class Scheduler {
     this.approvalPublicKeyFile = deps.approvalPublicKeyFile ?? runtimePaths().approvalPublicKey;
     this.gh = deps.gh ?? realGh;
     this.now = deps.now ?? (() => new Date());
+    this.billing = deps.billing ?? billingOf();
+  }
+
+  private readonly billing: Billing;
+  spendContext(): SpendContext { return { db: this.db, billing: this.billing, config: this.config, now: this.now() }; }
+
+  /**
+   * Stores the lease's token total: the coordinator's --usage, else the result's usage block. Recorded
+   * before the transition so spend is kept even when the record is rejected; the latest figure per lease
+   * counts, so re-recording (or a correction) never double-counts.
+   */
+  private noteUsage(lease: Lease, raw: unknown, flag: UsageFlag | undefined, source: 'record' | 'release'): RecordResponse['usage'] {
+    let tokens = flag?.tokens ?? null;
+    let model = flag?.model ?? null;
+    let from: 'record' | 'release' | 'result' = source;
+    if (raw !== undefined) {
+      const v = validateResult(raw);
+      if (v.ok && v.result.usage) {
+        model ??= v.result.usage.model ?? null;
+        if (tokens === null) { tokens = tokensFromResultUsage(v.result.usage); from = 'result'; }
+      }
+    }
+    if (tokens === null) return undefined;
+    recordLeaseUsage(this.db, lease.id, { tokens, model, source: from });
+    return { tokens, model, source: from };
+  }
+
+  private withBudget<T extends object>(r: T, usage: RecordResponse['usage']): T & Pick<RecordResponse, 'usage' | 'budget'> {
+    const budget = budgetNotice(this.spendContext()) ?? undefined;
+    return { ...r, ...(usage ? { usage } : {}), ...(budget ? { budget } : {}) };
   }
 
   /**
@@ -249,6 +289,8 @@ export class Scheduler {
       }
       throw new MinionsError('POLICY_DENIED', 'Starts are paused (paused_starts).', 'Run `minions resume` to allow new work.');
     }
+    // Owner budget used up: refuse new claims (running leases continue and are recorded as usual).
+    assertBudgetAllowsStart(this.spendContext());
     const startEffect = can(cfg, 'task.start', { role });
     if (startEffect === 'deny') throw new MinionsError('POLICY_DENIED', `task.start is denied for role ${role} by configuration.`);
 
@@ -520,8 +562,9 @@ export class Scheduler {
   }
 
   /** Releases a lease without a result. The worktree and branch are always preserved. */
-  async release(leaseId: string, reason: string): Promise<{ leaseId: string; taskId: string; worktree: string | null; branch: string | null; status: TaskStatus | null }> {
+  async release(leaseId: string, reason: string, opts: { usage?: UsageFlag } = {}): Promise<{ leaseId: string; taskId: string; worktree: string | null; branch: string | null; status: TaskStatus | null } & Pick<RecordResponse, 'usage' | 'budget'>> {
     const lease = await this.requireActive(leaseId);
+    const usage = this.noteUsage(lease, undefined, opts.usage, 'release');
     this.endLease(leaseId, 'released', { reason });
     await this.cleanupLeaseFiles(leaseId);
     let status: TaskStatus | null = null;
@@ -531,11 +574,20 @@ export class Scheduler {
     } catch (e) {
       this.db.addEvent('release-backlog-error', lease.task_id, { leaseId, error: (e as Error).message });
     }
-    return { leaseId, taskId: lease.task_id, worktree: lease.worktree, branch: lease.branch, status };
+    return this.withBudget({ leaseId, taskId: lease.task_id, worktree: lease.worktree, branch: lease.branch, status }, usage);
   }
 
-  /** Validates and records a worker result, applies the transition and releases the lease. */
-  async record(leaseId: string, raw: unknown, opts: { correction?: boolean } = {}): Promise<RecordResponse> {
+  /**
+   * Validates and records a worker result, applies the transition and releases the lease. `usage`: the
+   * worker's token total (task notification); the response carries the budget state after it.
+   */
+  async record(leaseId: string, raw: unknown, opts: { correction?: boolean; usage?: UsageFlag } = {}): Promise<RecordResponse> {
+    const lease = await this.requireActive(leaseId);
+    const usage = this.noteUsage(lease, raw, opts.usage, 'record');
+    return this.withBudget(await this.recordResult(leaseId, raw, opts), usage);
+  }
+
+  private async recordResult(leaseId: string, raw: unknown, opts: { correction?: boolean }): Promise<RecordResponse> {
     const lease = await this.requireActive(leaseId);
     const base = { leaseId, taskId: lease.task_id, role: lease.role, approved: false, replan: false, needsSplit: false };
     if (lease.result_valid === 0 && !opts.correction) {

@@ -46,6 +46,8 @@ export const WorkerResultSchema = z.object({
     inputTokens: z.number().int().min(0).optional(),
     outputTokens: z.number().int().min(0).optional(),
     cacheReadTokens: z.number().int().min(0).optional(),
+    /** Total tokens for the attempt (e.g. the task-notification total); the coordinator's --usage wins over it. */
+    totalTokens: z.number().int().min(0).optional(),
     costUsd: z.number().min(0).optional(),
     turns: z.number().int().min(0).optional(),
     durationMs: z.number().int().min(0).optional(),

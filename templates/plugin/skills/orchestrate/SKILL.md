@@ -15,7 +15,7 @@ Run this loop until nothing is runnable. Every durable step uses a `minions ... 
 2. `minions work list --json` to see active leases. Count active tasks (limit {{maxActiveTasks}}) and engineers (limit {{maxEngineers}}).
 3. `minions backlog ready --compact --json` for runnable tasks (`minions backlog list --compact --json` for the whole queue). Also note tasks in `testing`, `reviewing` or `changes-requested` without an active lease: they need the next stage.
 
-If there is no ready or next-stage work, or capacity is full, report briefly and stop. Do not loop waiting for work. Start nothing new while the budget is used up or quota mode is on (see Owner defaults): record returning workers, report, and ask.
+If there is no ready or next-stage work, or capacity is full, report briefly and stop. Do not loop waiting for work. Start nothing new while the budget is used up (`spend.budget.exhausted` in the status) or quota mode is on (see Owner defaults): record returning workers, report, and ask.
 
 ## 2. Choose
 
@@ -29,7 +29,7 @@ Role by status: `ready` or `changes-requested` → engineer; `testing` → teste
 
 - `CONFLICT`: another stage is active for that task; pick another task.
 - `CAPACITY`: stop dispatching new work until a worker finishes.
-- `POLICY_DENIED`: the task may not start (paused or not authorized). Report it; do not retry.
+- `POLICY_DENIED`: the task may not start (paused, not authorized, or `Budget reached`: the owner's budget is used up). Report it with the reason; do not retry. At the budget, running workers continue: record them as usual.
 - `PRECONDITION`: the task status does not fit the role; re-read it with `minions backlog show <taskId> --json`.
 
 The compact response has `leaseId`, `briefMarker`, `taskId`, `role`, `attempt`, `branch`, `worktree` and `expectedHead`. The full brief (description, criteria, prior findings, policy) is stored for the worker; do not fetch or paste it.
@@ -58,15 +58,20 @@ Independent tasks may run in parallel up to the limits. A task never has two wor
 
 ## 5. Record
 
-When a worker returns, it has submitted its result with `minions work submit` and ends with one line. Do not ask for or copy its JSON. Record:
+When a worker returns, it has submitted its result with `minions work submit` and ends with one line. Do not ask for or copy its JSON. Record it with the worker's token total from its task notification (`subagent_tokens`):
 
-`minions work record <leaseId> --submitted --json`
+`minions work record <leaseId> --submitted --usage <subagent_tokens> --json`
+
+Always pass `--usage` (also on `--correction` records and `work release`): it is the durable spend tally. The figure is cumulative per agent, so after a correction pass the resumed agent's new total; the latest figure per lease counts and nothing is double-counted. If the notification came after you recorded, add it with `minions work spend --lease <leaseId> --tokens <n> --json`.
+
+Then check the response's `budget` (present when the owner set one): `crossed` 50 or 80 → tell the owner the spend against the budget; `crossed` 100 or `exhausted` → new claims are refused: tell the owner why starts stopped and ask before spending more. Running workers are never stopped for the budget.
 
 - No submission (`NOT_FOUND`, hint names `minions work submit`): if the worker's final message contains the JSON instead, pipe that to `minions work record <leaseId> --json` on stdin; otherwise ask the worker to submit (once), or release the lease.
 - Invalid result (`valid: false`, `correctionAllowed: true`): send the worker only the listed `errors`, ask it to fix them and submit again, then `minions work record <leaseId> --submitted --correction --json`. If it is still invalid, it is stored unvalidated; decide yourself (usually re-dispatch or ask the user). Never treat it as approval. A `complete` tester or reviewer result with failing checks is rejected this way; for an engineer `complete` with failing checks, ask the same correction yourself. Either way, give one bounded correction: a concrete way to rerun the checks (exact command and environment, e.g. an exec-allowed `TMPDIR`), or a status that matches the failure.
 - Worker ended with `brief unavailable: <error>` (no result): do not record it. Release the lease (`minions work release <leaseId> --reason "brief unavailable" --json`), claim again without `--compact`, and re-dispatch with the brief pasted in a ```json fence.
 - Stale head: the worker reported a SHA that is not the branch head; re-dispatch the same role.
-- If a worker died or will not finish, `minions work release <leaseId> --reason "<why>" --json`.
+- If a worker died or will not finish, `minions work release <leaseId> --reason "<why>" --usage <subagent_tokens> --json`.
+- A worker that failed on a plan usage or rate limit (subscription session or weekly window): pause starts (`minions pause --starts --json`), report it to the owner, and release or keep the lease for re-dispatch after the limit resets.
 
 ## 6. Follow the next step
 
@@ -87,4 +92,4 @@ Then go back to step 1. Stop when nothing is runnable. (When idle after many han
 
 ## 7. Report
 
-{{reportingRule}} Include the spend so far (see Owner defaults) with delivery reports. Stage transitions and repairs are recorded in the backlog (notes), not messaged to the user. Approvals for `ask` capabilities and sensitive paths are always requested explicitly, whatever the reporting level.
+{{reportingRule}} Include the spend so far (see Owner defaults; `spend` in `minions status --json`: total, today, per task, against the budget) with delivery reports. Stage transitions and repairs are recorded in the backlog (notes), not messaged to the user. Approvals for `ask` capabilities and sensitive paths are always requested explicitly, whatever the reporting level.
