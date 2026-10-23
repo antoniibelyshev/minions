@@ -19,8 +19,9 @@ import { readTelegramAccess } from '../telegram/access.js';
 import { installTelegramPlugin } from '../telegram/install.js';
 import { formatTelegramProbe, probeTelegram } from '../telegram/probe.js';
 import { resolveChannel } from '../telegram/channel.js';
+import type { PollerCheck } from '../telegram/isolation.js';
 import {
-  buildClaudeCommand, buildCoordinatorCommand, claudePermissionModes, configuredPermissionMode, coordinatorWrapper, launchCoordinator, probeRuntime, readLaunchRecord, readMountedToken, RECOVERY_PROMPT,
+  buildClaudeCommand, buildCoordinatorCommand, telegramPollerStatus, claudePermissionModes, configuredPermissionMode, coordinatorWrapper, launchCoordinator, probeRuntime, readLaunchRecord, readMountedToken, RECOVERY_PROMPT,
   restartCoordinator, runtimeChannelFacts, scheduleDetachedRestart, syncCoordinator, coordinatorLaunchStatus, type LaunchStatus,
 } from './coordinator.js';
 import { openDb, type DrainNotice, type DrainRequest, type Lease, type LeaseRole, type PauseChange, type RuntimeDb } from './db.js';
@@ -156,6 +157,8 @@ export interface StatusReport {
   channel?: ChannelStatus;
   /** Running coordinator vs the current launch fingerprint (stale: restart required; the host reports `minions upgrade`). */
   coordinatorLaunch?: LaunchStatus;
+  /** Task-51: whether the Telegram poller (bot.pid) is the running coordinator's; another claude session can take the bot. */
+  telegramPoller?: PollerCheck;
   /** Notification outbox: undelivered items wait here until the coordinator sends them (`minions notify pending`). */
   notifications?: OutboxCounts;
   /** Spend tally (tokens; estimated USD with API-key billing) and the owner budget (src/runtime/spend.ts). */
@@ -188,7 +191,7 @@ export async function runtimeChannelStatus(cfg: MinionsConfig, paths = runtimePa
   return { configured: r.configured, effective: r.effective, reason: r.reason, source: 'predicted' };
 }
 
-export async function collectStatus(deps: { db: RuntimeDb; config: MinionsConfig; backlog: () => Promise<BacklogAdapter>; channel?: () => Promise<ChannelStatus>; launch?: () => Promise<LaunchStatus> }): Promise<StatusReport> {
+export async function collectStatus(deps: { db: RuntimeDb; config: MinionsConfig; backlog: () => Promise<BacklogAdapter>; channel?: () => Promise<ChannelStatus>; launch?: () => Promise<LaunchStatus>; poller?: () => Promise<PollerCheck> }): Promise<StatusReport> {
   const { db: d, config: cfg } = deps;
   const leases = d.activeLeases();
   const report: StatusReport = {
@@ -201,6 +204,7 @@ export async function collectStatus(deps: { db: RuntimeDb; config: MinionsConfig
   try { report.lastDrainNotice = d.lastDrainNotice(); } catch { /* status never fails on it */ }
   if (deps.channel) report.channel = await deps.channel().catch(() => undefined);
   if (deps.launch) report.coordinatorLaunch = await deps.launch().catch(() => undefined);
+  if (deps.poller) report.telegramPoller = await deps.poller().catch(() => undefined);
   try { report.notifications = outboxCounts(d); } catch { /* an older DB without the outbox: omit */ }
   try { report.spend = spendReport({ db: d, config: cfg }); } catch { /* status never fails on the tally */ }
   try { const { steps: _s, ...c } = contextResetCheck({ db: d, config: cfg }); report.contextReset = c; } catch { /* status never fails on the reset check */ }
@@ -222,6 +226,7 @@ export function humanStatus(s: StatusReport): string {
     ...(s.draining ? [`draining: ${s.draining.reason} since ${s.draining.requestedAt} (${s.activeLeases.length} lease(s) winding down)`] : []),
     ...(s.lastDrainNotice ? [`last drain notice: ${s.lastDrainNotice.at} to ${s.lastDrainNotice.agentType} ${s.lastDrainNotice.agentId} (lease ${s.lastDrainNotice.leaseId}, ${s.lastDrainNotice.taskId ?? '-'}, drain event ${s.lastDrainNotice.eventId}, via ${s.lastDrainNotice.via})`] : []),
     ...(s.channel ? [`channel: configured ${s.channel.configured}, effective ${s.channel.effective} (${s.channel.source === 'launch' ? 'running coordinator' : 'predicted'}: ${s.channel.reason})${s.channel.restartRequired ? '; restart required: `minions down && minions start`' : ''}`] : []),
+    ...(s.telegramPoller && s.telegramPoller.state !== 'not-applicable' ? [humanPoller(s.telegramPoller)] : []),
     s.capacity ? `capacity: ${s.capacity.activeTasks}/${s.capacity.maxActiveTasks} tasks, ${s.capacity.activeEngineers}/${s.capacity.maxEngineers} engineers` : 'capacity: unknown',
     `queue: ${Object.entries(s.queue).map(([k, v]) => `${k}=${v}`).join(' ') || '(empty)'}`,
     `stop guard: ${s.guard.lastReason ?? '-'}`,
@@ -232,6 +237,11 @@ export function humanStatus(s: StatusReport): string {
   if (s.backlogError) out.push(`backlog error: ${s.backlogError}`);
   out.push(s.activeLeases.length ? 'active leases:' : 'active leases: none', ...s.activeLeases.map((l) => `  ${l.id} ${l.task_id} ${l.role} #${l.attempt} ${l.branch ?? ''}`));
   return out.join('\n');
+}
+
+/** One status line for the Telegram poller; a problem carries the recovery hint. */
+export function humanPoller(p: PollerCheck): string {
+  return `telegram poller: ${p.state === 'ok' ? 'ok' : `PROBLEM (${p.state})`}: ${p.detail}${p.hint ? `\n  hint: ${p.hint}` : ''}`;
 }
 
 export interface PauseOptions { intake?: boolean; starts?: boolean; drain?: boolean; reason?: string }
@@ -600,10 +610,11 @@ export function register(program: Command): void {
     .action(action(async (_o: unknown, cmd: Command) => {
       if (runtimeMode() === 'host') return delegate(cmd);
       const paths = runtimePaths();
-      const r = { access: await readTelegramAccess(paths.telegramStateDir), coordinator: await readLaunchRecord(paths) };
+      const r = { access: await readTelegramAccess(paths.telegramStateDir), coordinator: await readLaunchRecord(paths), poller: await telegramPollerStatus({ paths }) };
       emit(r, { json: globalOpts(cmd).json, human: (d: typeof r) => [
         `access: ${d.access.state} - ${d.access.detail}${d.access.hint ? `\n  hint: ${d.access.hint}` : ''}`,
         `coordinator: ${d.coordinator ? (d.coordinator.telegram.enabled ? 'Telegram enabled' : `terminal only (${d.coordinator.telegram.reason})`) : 'no launch recorded'}`,
+        ...(d.poller.state !== 'not-applicable' ? [humanPoller(d.poller)] : []),
       ].join('\n') });
     }));
 
@@ -707,7 +718,7 @@ export function register(program: Command): void {
         return;
       }
       const cfg = await getConfig();
-      const r = await collectStatus({ db: getDb(), config: cfg, backlog: getBacklog, channel: () => runtimeChannelStatus(cfg), launch: () => coordinatorLaunchStatus(cfg) });
+      const r = await collectStatus({ db: getDb(), config: cfg, backlog: getBacklog, channel: () => runtimeChannelStatus(cfg), launch: () => coordinatorLaunchStatus(cfg), poller: () => telegramPollerStatus() });
       emit(r, { json: globalOpts(cmd).json, human: humanStatus });
     }));
   const pauseLike = (name: 'pause' | 'resume') => {

@@ -316,6 +316,20 @@ function telegramAccessCheck(r: { code: number; stdout: string; stderr: string }
 }
 
 /**
+ * telegram.poller (task-51): whether the bot.pid poller is the running coordinator's, from the same
+ * `minions telegram status --json`. Another claude session in the container that loads the plugin
+ * replaces the coordinator's poller; this says so, with the recovery hint. Absent from older images.
+ */
+export function telegramPollerCheck(r: { code: number; stdout: string }): Check | null {
+  if (r.code !== 0) return null;
+  let p: { state?: string; detail?: string; hint?: string } | undefined;
+  try { const env = JSON.parse(r.stdout) as { ok?: boolean; data?: { poller?: typeof p } }; if (env.ok) p = env.data?.poller; } catch { return null; }
+  if (!p?.state || p.state === 'not-applicable') return null;
+  const status = p.state === 'ok' ? 'ok' : 'warn';
+  return { name: 'telegram.poller', status, detail: redact(p.detail ?? p.state), ...(p.hint && status !== 'ok' ? { hint: redact(p.hint) } : {}) };
+}
+
+/**
  * setup: obvious configuration gaps left after init (no verification commands, GitHub remote without a
  * working token, Telegram selected without a bot token), with a pointer to the setup assistant.
  */
@@ -390,7 +404,7 @@ async function hostRuntimeChecks(project: ProjectJson, auth: ClaudeAuth, baseUrl
   const tg = telegramDoctorCheck(await ex(['minions', 'telegram', 'probe', '--json']));
   add('telegram.plugin', tg.status, tg.detail, tg.hint);
   const tgPlugin = checks[checks.length - 1];
-  if (wantsTelegram) checks.push(telegramAccessCheck(await ex(['minions', 'telegram', 'status', '--json'])));
+  if (wantsTelegram) { const tg = await ex(['minions', 'telegram', 'status', '--json']); checks.push(telegramAccessCheck(tg)); const pc = telegramPollerCheck(tg); if (pc) checks.push(pc); }
   return tgPlugin;
 }
 
@@ -559,7 +573,7 @@ export async function runDoctor(opts: { cwd: string; runner?: Runner; probe?: Do
         const tg = telegramDoctorCheck(await ex(['minions', 'telegram', 'probe', '--json']));
         add('telegram.plugin', tg.status, tg.detail, tg.hint);
         tgPlugin = checks[checks.length - 1];
-        if (wantsTelegram) checks.push(telegramAccessCheck(await ex(['minions', 'telegram', 'status', '--json'])));
+        if (wantsTelegram) { const tg = await ex(['minions', 'telegram', 'status', '--json']); checks.push(telegramAccessCheck(tg)); const pc = telegramPollerCheck(tg); if (pc) checks.push(pc); }
         if (github.onGitHub) ci = { rc: parseCiStatus(await ex(['minions', 'ci', 'status', '--json'])) };
       } else {
         for (const n of ['claude.auth', ...(baseUrl ? ['claude.baseUrl'] : []), 'container.tmp', 'container.scratch', 'backlog.cli', 'claude.capabilities', 'telegram.plugin']) add(n, 'warn', 'skipped: container not running');

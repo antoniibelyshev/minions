@@ -106,8 +106,16 @@ fake GitHub API; the pre-filled token URL follows GitHub's documented template U
   dir. Any other `claude` session that loads the plugin (it is loaded whenever
   `telegram@claude-plugins-official` is enabled in that session's config dir, with or without
   `--channels`) logs `telegram channel: replacing stale poller pid=…` and kills the running
-  coordinator's poller. Telegram then stays down until the coordinator reconnects. minions cannot
-  stop this from outside the plugin. Do not enable the plugin in a config dir that other sessions
+  coordinator's poller. Telegram then stays down until the coordinator reconnects. Inside the
+  container every session would see the token (the coordinator's Bash tool, and so every worker,
+  inherits its environment), so minions keeps the plugin **off at user scope** and enables it only
+  in the coordinator launch (task-51): `minions coordinator run` writes
+  `"enabledPlugins": {"telegram@claude-plugins-official": false}` to `$CLAUDE_CONFIG_DIR/settings.json`
+  on every launch and passes `enabledPlugins: {…: true}` in its own `--settings` (flag settings win
+  over user scope on Claude Code 2.1.292). `minions status` and `minions doctor` (`telegram.poller`)
+  report when `bot.pid` is missing, dead, or not served by the coordinator claude itself (its nearest claude ancestor must be the wrapper's child; a nested `claude -p` under the coordinator is foreign); recover with
+  /mcp → reconnect `plugin:telegram:telegram` in the coordinator terminal, or
+  `minions coordinator restart --recover` when no worker runs. Do not enable the plugin in a config dir that other sessions
   share with the coordinator. Start nested or ad-hoc `claude` runs with a separate
   `CLAUDE_CONFIG_DIR`. The setup assistant (`minions setup assist`) passes no channel flags but
   uses your host config, so it loads the plugin if you enabled it there. The test suite sets

@@ -69,9 +69,10 @@ describe('telegram capability probe: evaluation', () => {
     expect(item(noMarket, 'marketplace').hint).toBe('claude plugin marketplace add anthropics/claude-plugins-official');
     expect(item(noMarket, 'plugin').hint).toBe(`claude plugin install ${TELEGRAM_PLUGIN_ID} --scope user`);
 
-    const disabled = evaluateTelegram(facts({ plugins: ok(JSON.stringify([pluginEntry({ enabled: false })])) }));
-    expect(disabled.availability).toBe('not-installed');
-    expect(disabled.summary).toMatch(/installed but disabled/);
+    // Task-51: off at user scope is the intended state; the coordinator launch enables it for itself.
+    const userOff = evaluateTelegram(facts({ plugins: ok(JSON.stringify([pluginEntry({ enabled: false })])) }));
+    expect(userOff.availability).toBe('available');
+    expect(item(userOff, 'plugin').detail).toMatch(/off at user scope, enabled only by the coordinator launch/);
 
     const other = evaluateTelegram(facts({ plugins: ok(JSON.stringify([{ ...pluginEntry(), id: 'telegram@someone-else' }])) }));
     expect(other.availability).toBe('not-installed');
