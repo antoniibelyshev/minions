@@ -1236,6 +1236,8 @@ export type DetachedSpawn = (cmd: string, args: string[], opts: { cwd: string; d
 
 export interface DetachedRestartDeps {
   activeLeases: () => { id: string }[];
+  /** The active drain request (db.drain()), if any: the upgrade behind a drain restarts the coordinator itself. */
+  drain: () => { reason: string } | null;
   /** Log file of the detached restart (the CLI uses <state>/logs/context-reset.log). */
   log: string;
   cwd: string;
@@ -1248,13 +1250,20 @@ export interface DetachedRestartDeps {
  * `minions coordinator restart --detach` (task-45): the coordinator restarting itself. The restart kills the
  * tmux session it is called from, so the real restart runs in a detached process (new session, like
  * `setsid -f`; output appended to `log`) and this call returns at once. Active leases are checked here first so
- * the refusal reaches the caller in-band (the detached restart checks again), unless `force`.
+ * the refusal reaches the caller in-band (the detached restart checks again), unless `force`. An active drain
+ * also refuses unless `force` (task-49): the upgrade behind it restarts the coordinator itself. Only this
+ * self-restart checks the drain; plain `coordinator restart` (what the host upgrade runs) does not.
  */
 export function scheduleDetachedRestart(deps: DetachedRestartDeps, opts: { force?: boolean; recover?: boolean } = {}): { action: 'restart-scheduled'; log: string; pid: number | null; reason: string } {
   const leases = deps.activeLeases().map((l) => l.id);
   if (leases.length && !opts.force) {
     throw new MinionsError('PRECONDITION', `Coordinator restart refused: ${leases.length} active worker lease(s) (${leases.join(', ')}).`,
       'Wait for the workers to finish and record them; a context reset never interrupts workers.');
+  }
+  const drain = deps.drain();
+  if (drain && !opts.force) {
+    throw new MinionsError('PRECONDITION', `Coordinator restart refused: a drain is in progress (${drain.reason}).`,
+      'Let the drain and its upgrade finish; the upgrade restarts the coordinator itself.');
   }
   const open = deps.openLog ?? ((f: string) => { mkdirSync(dirname(f), { recursive: true }); return openSync(f, 'a', 0o600); });
   const fd = open(deps.log);

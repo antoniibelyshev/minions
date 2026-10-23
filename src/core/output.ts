@@ -1,3 +1,4 @@
+import { stripControlChars } from './control-chars.js';
 import { EXIT_CODES, MinionsError, type ErrorCode } from './errors.js';
 
 const SECRET_PATTERNS: [RegExp, string][] = [
@@ -8,6 +9,9 @@ const SECRET_PATTERNS: [RegExp, string][] = [
   [/\b(bot)?\d{6,12}:[A-Za-z0-9_-]{30,}/g, '[REDACTED_BOT_TOKEN]'],
 ];
 
+/** Human-readable text for the terminal: secrets masked, escape sequences and control characters (except newline/tab) removed. */
+const terminalText = (text: string): string => stripControlChars(redact(text));
+
 /** Masks credential-shaped substrings (Anthropic keys, GitHub tokens, Bearer tokens, Telegram bot tokens). */
 export function redact(text: string): string {
   let out = text;
@@ -17,13 +21,22 @@ export function redact(text: string): string {
 
 const redactDeep = (v: unknown): unknown => JSON.parse(redact(JSON.stringify(v ?? null)));
 
+/**
+ * JSON.stringify with every control character escaped: it already escapes C0, but leaves DEL and C1
+ * (U+007F-U+009F) raw, which terminals interpret (U+009B is CSI, U+009D is OSC). The result is still
+ * valid JSON that parses to the same value, and safe to show on a terminal or pass through a filter.
+ */
+export function jsonLine(v: unknown): string {
+  return JSON.stringify(v).replace(/[\u007f-\u009f]/g, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`);
+}
+
 export function emit(data: unknown, opts: { json: boolean; human?: (d: any) => string }): void {
   if (opts.json) {
-    process.stdout.write(JSON.stringify({ ok: true, data: redactDeep(data) }) + '\n');
+    process.stdout.write(jsonLine({ ok: true, data: redactDeep(data) }) + '\n');
     return;
   }
   const text = opts.human ? opts.human(data) : typeof data === 'string' ? data : JSON.stringify(data, null, 2);
-  if (text) process.stdout.write(redact(text).replace(/\n?$/, '\n'));
+  if (text) process.stdout.write(terminalText(text).replace(/\n?$/, '\n'));
 }
 
 export function toMinionsError(err: unknown): MinionsError {
@@ -39,10 +52,10 @@ export function reportError(err: unknown, opts: { json: boolean }): number {
     const error: Record<string, unknown> = { code: e.code, message: redact(e.message) };
     if (e.hint) error.hint = redact(e.hint);
     if (e.details !== undefined) error.details = redactDeep(e.details);
-    process.stdout.write(JSON.stringify({ ok: false, error }) + '\n');
+    process.stdout.write(jsonLine({ ok: false, error }) + '\n');
   } else {
-    process.stderr.write(`error [${e.code}]: ${redact(e.message)}\n`);
-    if (e.hint) process.stderr.write(`hint: ${redact(e.hint)}\n`);
+    process.stderr.write(`error [${e.code}]: ${terminalText(e.message)}\n`);
+    if (e.hint) process.stderr.write(`hint: ${terminalText(e.hint)}\n`);
   }
   if (process.env.MINIONS_DEBUG === '1' && err instanceof Error && err.stack) process.stderr.write(redact(err.stack) + '\n');
   return EXIT_CODES[e.code as ErrorCode] ?? 1;

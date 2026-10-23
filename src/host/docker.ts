@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { relayStripped } from '../core/control-chars.js';
 import { MinionsError } from '../core/errors.js';
 import { run, type RunOptions, type RunResult } from '../core/exec.js';
 import { CONTAINER, SERVICE_NAME, composeProjectName, projectPaths, volumeNames } from '../core/paths.js';
@@ -211,18 +212,42 @@ export class Compose {
     return this.compose(['exec', '-T', SERVICE_NAME, ...args], opts);
   }
 
-  /** Exec with inherited stdio. `tty` allocates a pseudo-TTY (interactive sessions). Returns exit code. */
-  execInherit(args: string[], opts: { tty: boolean }): Promise<number> {
+  /**
+   * Exec with inherited stdin. `tty` allocates a pseudo-TTY and inherits stdout/stderr (interactive
+   * sessions: tmux attach needs its escapes). Without a TTY the container's stdout/stderr are relayed
+   * through the control-character filter, so container output cannot drive the host terminal. `rawStdout`
+   * (non-TTY only) copies stdout byte-exact for machine-readable output (`--json`: the emitter already
+   * escapes every control character, and the filter would corrupt C1 characters inside JSON strings);
+   * stderr stays filtered. Returns exit code.
+   */
+  execInherit(args: string[], opts: { tty: boolean; rawStdout?: boolean }): Promise<number> {
     const argv = this.argv('exec', ...(opts.tty ? [] : ['-T']), SERVICE_NAME, ...args);
-    return new Promise((resolve, reject) => {
-      const child = spawn('docker', argv, { stdio: 'inherit', shell: false });
-      child.on('error', (e: NodeJS.ErrnoException) => reject(e.code === 'ENOENT'
-        ? new MinionsError('DOCKER_UNAVAILABLE', 'docker CLI not found.', process.platform === 'linux' ? 'Install and start Docker Engine (https://docs.docker.com/engine/install/).' : 'Install and start Docker Desktop.') : e));
-      child.on('close', (code, signal) => resolve(code ?? (signal ? 128 : 1)));
+    return spawnRelay('docker', argv, { filter: !opts.tty, rawStdout: opts.rawStdout }).catch((e: NodeJS.ErrnoException) => {
+      throw e.code === 'ENOENT'
+        ? new MinionsError('DOCKER_UNAVAILABLE', 'docker CLI not found.', process.platform === 'linux' ? 'Install and start Docker Engine (https://docs.docker.com/engine/install/).' : 'Install and start Docker Desktop.') : e;
     });
   }
 
   async cp(src: string, dst: string): Promise<void> { await this.compose(['cp', src, dst]); }
+}
+
+/**
+ * Spawns `cmd` with inherited stdin and returns its exit code. `filter`: stdout/stderr are piped through
+ * the control-character filter to `out`/`err` (default process.stdout/stderr); otherwise inherited.
+ * `rawStdout` (with `filter`): stdout chunks are copied to `out` unchanged (as Buffers); only stderr is filtered.
+ */
+export function spawnRelay(cmd: string, argv: string[], opts: { filter: boolean; rawStdout?: boolean; out?: Pick<NodeJS.WritableStream, 'write'>; err?: Pick<NodeJS.WritableStream, 'write'> }): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(cmd, argv, { stdio: opts.filter ? ['inherit', 'pipe', 'pipe'] : 'inherit', shell: false });
+    if (opts.filter) {
+      const out = opts.out ?? process.stdout;
+      if (opts.rawStdout) child.stdout!.on('data', (chunk: Buffer) => { out.write(chunk); });
+      else relayStripped(child.stdout!, out);
+      relayStripped(child.stderr!, opts.err ?? process.stderr);
+    }
+    child.on('error', reject);
+    child.on('close', (code, signal) => resolve(code ?? (signal ? 128 : 1)));
+  });
 }
 
 export const BUILD_LABEL = 'minions.build';

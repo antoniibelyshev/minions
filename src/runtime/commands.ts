@@ -8,6 +8,7 @@ import { validateConfig } from '../config/resolve.js';
 import { isGithubDelivery } from '../config/delivery.js';
 import type { MinionsConfig } from '../config/schema.js';
 import { action, globalOpts, requireMode, runtimeMode } from '../core/cli-helpers.js';
+import { stripControlChars } from '../core/control-chars.js';
 import { MinionsError } from '../core/errors.js';
 import { readJson } from '../core/fsutil.js';
 import { emit } from '../core/output.js';
@@ -581,7 +582,7 @@ export function register(program: Command): void {
       const d = getDb();
       if (o.detach) {
         const paths = runtimePaths();
-        const s = scheduleDetachedRestart({ activeLeases: () => d.activeLeases(), log: join(paths.logs, 'context-reset.log'), cwd: paths.state }, o);
+        const s = scheduleDetachedRestart({ activeLeases: () => d.activeLeases(), drain: () => d.drain(), log: join(paths.logs, 'context-reset.log'), cwd: paths.state }, o);
         emit(s, { json: globalOpts(cmd).json, human: (x: typeof s) => `coordinator: ${x.action} (${x.reason})` });
         return;
       }
@@ -732,8 +733,9 @@ export function register(program: Command): void {
         const h = await hostStatus({ cwd: process.cwd() });
         if (h.kind === 'delegate') return delegate(cmd);
         if (h.kind === 'raw') {
-          if (h.result.stdout) process.stdout.write(h.result.stdout);
-          if (h.result.stderr) process.stderr.write(h.result.stderr);
+          // Container output relayed as-is otherwise: strip escapes/control characters first.
+          if (h.result.stdout) process.stdout.write(stripControlChars(h.result.stdout));
+          if (h.result.stderr) process.stderr.write(stripControlChars(h.result.stderr));
           process.exitCode = h.result.code || 1;
           return;
         }

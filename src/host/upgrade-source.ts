@@ -288,9 +288,14 @@ export async function detectInstalled(opts: { runner?: Runner; runningRoot?: str
 
 const missingDeps = (checkout: string) => BUILD_DEPS.filter((d) => !existsSync(join(checkout, 'node_modules', d, 'package.json')));
 
+/** `./minions-<version>.tgz` (what `npm pack` writes), shell-quoted: the version comes from the checkout's package.json. */
+export function packedTarball(version: string | null): string {
+  return version === null ? './minions-<version>.tgz' : shellQuote(`./minions-${version}.tgz`);
+}
+
 /** The manual sequence: build and pack the checkout, then replace the global install (uninstall first). */
 export function manualReinstallCommand(checkout: string, version: string | null): string {
-  return `cd ${shellQuote(checkout)} && npm ci && MINIONS_BUILD_KIND=packed npm pack && npm uninstall -g minions && npm install -g ./minions-${version ?? '<version>'}.tgz`;
+  return `cd ${shellQuote(checkout)} && npm ci && MINIONS_BUILD_KIND=packed npm pack && npm uninstall -g minions && npm install -g ${packedTarball(version)}`;
 }
 
 export async function checkCli(opts: { checkout: string; runner?: Runner; runningRoot?: string; handoff?: boolean }): Promise<CliCheck> {
@@ -314,7 +319,7 @@ export async function checkCli(opts: { checkout: string; runner?: Runner; runnin
   if (installed.kind === 'packed') {
     const deps = missingDeps(checkout);
     return { ...base, differs, reason, action: 'reinstall',
-      command: `cd ${shellQuote(checkout)} && ${deps.length ? 'npm ci && ' : ''}MINIONS_BUILD_KIND=packed npm pack && npm install -g ./minions-${checkoutVersion}.tgz` };
+      command: `cd ${shellQuote(checkout)} && ${deps.length ? 'npm ci && ' : ''}MINIONS_BUILD_KIND=packed npm pack && npm install -g ${packedTarball(checkoutVersion)}` };
   }
   return manual;
 }
