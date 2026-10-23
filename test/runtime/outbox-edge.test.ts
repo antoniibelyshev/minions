@@ -460,3 +460,80 @@ describe('Authorization credential masking over every follower and context', () 
     expect(redactError('{"password": "p@ss word", "user": "bob"}')).toBe('{"password": "[redacted]", "user": "bob"}');
   });
 });
+
+// A `"` stops masking only where it can close a string (the end, or whitespace , : ; . ) ] } ' after it):
+// in valid JSON that is the only kind of unescaped quote inside a string. Any other `"` is a quoted value
+// or a stray quote, so it never lets a credential through.
+describe('quoted credentials and stray quotes in plain text', () => {
+  it.each([
+    ['Authorization: Bearer "Zq9S3cr3tVal"', 'Authorization: Bearer [redacted]'],
+    ["Authorization: Bearer 'Zq9S3cr3tVal'", 'Authorization: Bearer [redacted]'],
+    ['Authorization: Bearer \\"Zq9S3cr3tVal\\"', 'Authorization: Bearer [redacted]'],
+    ['Authorization: Token "abc123def456"', 'Authorization: Token [redacted]'],
+    ['Authorization: Basic "dXNlcjpwYXNzd29yZA=="', 'Authorization: Basic [redacted]'],
+    ['auth failed; Authorization: Bearer "Zq9S3cr3tVal", retrying', 'auth failed; Authorization: Bearer [redacted], retrying'],
+    ['Authorization: Bearer "Zq9S3cr3tVal" -> 401 Unauthorized', 'Authorization: Bearer [redacted] -> 401 Unauthorized'],
+    ['Proxy-Authorization: Bearer "Zq9S3cr3tVal" (retrying)', 'Proxy-Authorization: Bearer [redacted] (retrying)'],
+    ['Bearer "Zq9S3cr3tVal"', 'Bearer "[redacted]"'],
+    ["got Bearer 'Zq9S3cr3tVal' back", "got Bearer '[redacted]' back"],
+    // The JSON-escaped form inside a JSON string.
+    [JSON.stringify({ error: 'Authorization: Bearer "Zq9S3cr3tVal"', code: 401 }), '{"error":"Authorization: Bearer [redacted]","code":401}'],
+    [JSON.stringify({ error: 'got Bearer "Zq9S3cr3tVal" back' }), '{"error":"got Bearer \\"[redacted]\\" back"}'],
+  ])('masks a quoted credential after the scheme: %s', (input, expected) => {
+    expect(redactError(input)).toBe(expected);
+  });
+
+  it.each([
+    ['msg "oops password=hunter2', 'msg "oops password=[redacted]'],
+    ['msg "oops password=hunter2 user=bob', 'msg "oops password=[redacted] user=bob'],
+    ['login "failed: password="Zq9S3cr3tVal" rejected', 'login "failed: password="[redacted]" rejected'],
+    ['"API_KEY="Zq9S3cr3tVal"', '"API_KEY="[redacted]"'],
+    ['""password":"Zq9S3cr3tVal', '""password":"[redacted]'],
+    ['msg "oops api_key: "Zq9S3cr3tVal" end', 'msg "oops api_key: "[redacted]" end'],
+    ["msg \"oops api_key='Zq9S3cr3tVal' end", "msg \"oops api_key='[redacted]' end"],
+    // Over-masking accepted: after a stray quote the credential runs to where that "string" ends.
+    ['msg "oops Authorization: Bearer "Zq9S3cr3tVal" retrying', 'msg "oops Authorization: Bearer [redacted]'],
+  ])('masks password/api_key/Authorization values after an unbalanced quote: %s', (input, expected) => {
+    expect(redactError(input)).toBe(expected);
+  });
+
+  it.each([
+    ['he said "hi; Authorization: Bearer "Zq9S3cr3tVal" and password="hunter2pw"', 'he said "hi; Authorization: Bearer [redacted]'],
+    ['retry "1 of 3": Authorization: Basic "dXNlcjpwYXNzd29yZA==", password=hunter2pw, api_key="k-123456"', 'retry "1 of 3": Authorization: Basic [redacted]'],
+    ['msg "oops Bearer "Zq9S3cr3tVal" then token=abc123def456ghi', 'msg "oops Bearer "[redacted]" then token=[redacted]'],
+    ['x "a" Authorization: Token "abc123def456" password="hunter2pw" done', 'x "a" Authorization: Token [redacted] done'],
+  ])('masks every secret on a mixed line: %s', (input, expected) => {
+    expect(redactError(input)).toBe(expected);
+  });
+
+  it('masks every stray-quote prefix, quoted credential and follower combination', () => {
+    const prefixes = ['', 'msg "', 'msg "oops ', '"', '""', '"a" "', "it's ", 'x="', '\\"', 'login "failed: '];
+    const credentials = [
+      'Authorization: Bearer "Zq9S3cr3tVal"', "Authorization: Bearer 'Zq9S3cr3tVal'", 'Authorization: Bearer \\"Zq9S3cr3tVal\\"',
+      'Authorization: Token "Zq9S3cr3tVal"', 'Authorization: Digest username="u", response="Zq9S3cr3tVal"',
+      'password=Zq9S3cr3tVal', 'password="Zq9S3cr3tVal"', "password='Zq9S3cr3tVal'", 'api_key="Zq9S3cr3tVal"',
+      'API_KEY: "Zq9S3cr3tVal"', 'Bearer "Zq9S3cr3tVal"',
+    ];
+    const followers = ['', '"', '" rejected', ' rejected', ', retrying', '")', '"x', '\\', ' and password=Zq9S3cr3tVal'];
+    for (const p of prefixes) for (const c of credentials) for (const f of followers) {
+      const input = `${p}${c}${f}`;
+      const out = redactError(input);
+      for (const w of ['Zq9S3c', 'S3cr3t', 'cr3tVa', '3tVal']) expect(out, `${JSON.stringify(input)} -> ${JSON.stringify(out)}`).not.toContain(w);
+    }
+  });
+
+  it('still leaves the quote that closes a JSON string alone, so JSON stays valid', () => {
+    for (const input of ['["Authorization: Bearer ","x"]', '{"Bearer ":12345678}', '{"m":"password=","n":"x"}', '{"m":"x \\"password=\\"","n":1}']) {
+      expect(redactError(input), input).toBe(input);
+    }
+    for (const input of [
+      JSON.stringify({ error: 'msg "oops password="hunter2pw" rejected', a: 1 }),
+      JSON.stringify({ error: 'he said "hi; Authorization: Bearer "hunter2pw" and api_key="hunter2pw"' }),
+      JSON.stringify(['Bearer "hunter2pw"', 'Authorization: Token "hunter2pw"']),
+    ]) {
+      const out = redactError(input);
+      expect(out, input).not.toContain('hunter2pw');
+      expect(() => JSON.parse(out), `${input} -> ${out}`).not.toThrow();
+    }
+  });
+});
