@@ -29,8 +29,8 @@ function realHelper(): string | null {
 const UNIFIED = { setxattrat: 463, removexattrat: 466, file_setattr: 469, fchmodat2: 452 };
 /** Syscall numbers the script needs that Perl has no builtin for. */
 const NR: Record<string, Record<string, number>> = {
-  arm64: { ptrace: 117, pidfd_open: 434, pidfd_send_signal: 424, pidfd_getfd: 438, tgkill: 131, sched_setaffinity: 122, ioprio_set: 30, io_uring_setup: 425, setxattr: 5, unshare: 97, setpriority: 140, getpriority: 141, fchmodat: 53, ...UNIFIED },
-  x64: { ptrace: 101, pidfd_open: 434, pidfd_send_signal: 424, pidfd_getfd: 438, tgkill: 234, sched_setaffinity: 203, ioprio_set: 251, io_uring_setup: 425, setxattr: 188, unshare: 272, setpriority: 141, getpriority: 140, fchmodat: 268, ...UNIFIED },
+  arm64: { ptrace: 117, pidfd_open: 434, pidfd_send_signal: 424, pidfd_getfd: 438, tgkill: 131, sched_setaffinity: 122, ioprio_set: 30, io_uring_setup: 425, setxattr: 5, fsetxattr: 7, ioctl: 29, unshare: 97, setpriority: 140, getpriority: 141, fchmodat: 53, ...UNIFIED },
+  x64: { ptrace: 101, pidfd_open: 434, pidfd_send_signal: 424, pidfd_getfd: 438, tgkill: 234, sched_setaffinity: 203, ioprio_set: 251, io_uring_setup: 425, setxattr: 188, fsetxattr: 190, ioctl: 16, unshare: 272, setpriority: 141, getpriority: 140, fchmodat: 268, ...UNIFIED },
 };
 const REAL = realHelper();
 const SYS = NR[process.arch];
@@ -98,6 +98,17 @@ r('utime:protected', utime(1, 1, $file), "$!");
   r('removexattrat:protected', sc('removexattrat', -100, $file, 0, $un) == 0, "$!");
   my $fa = pack('QQ', 0, 0); # struct file_attr: fa_xflags 0 would clear the inode flags
   r('file_setattr:protected', sc('file_setattr', -100, $file, $fa, length($fa), 0) == 0, "$!"); }
+# fsetxattr on an fd to the protected file (round 3). Landlock lets O_PATH open a protected file, so a worker
+# can hold such an fd; fsetxattr of a system.posix_acl_access ACL with no bits would be chmod 000 by another
+# name. fsetxattr is denied outright by the seccomp filter, so neither an O_PATH fd nor one reopened through
+# /proc/self/fd can rewrite the mode.
+{ my $an = 'system.posix_acl_access';
+  my $acl = pack('L<', 2) . pack('S<S<L<', 1, 0, 0xffffffff) . pack('S<S<L<', 4, 0, 0xffffffff) . pack('S<S<L<', 0x20, 0, 0xffffffff);
+  my $opath = sysopen(my $op, $file, $c->{oPath} + 0);
+  r('fsetxattr:opath-protected', $opath && sc('fsetxattr', fileno($op), $an, $acl, length($acl), 0) == 0, $opath ? "$!" : "O_PATH open: $!");
+  if ($opath) { my $re = sysopen(my $rf, "/proc/self/fd/" . fileno($op), $c->{oPath} + 0);
+    r('fsetxattr:reopened-protected', $re && sc('fsetxattr', fileno($rf), $an, $acl, length($acl), 0) == 0, $re ? "$!" : "reopen: $!"); }
+  else { r('fsetxattr:reopened-protected', 0, 'no O_PATH fd'); } }
 
 my $p = $c->{outsidePid} + 0;
 r('kill0:outside', kill(0, $p), "$!");
@@ -121,11 +132,22 @@ r('ioprio_set:outside', sc('ioprio_set', 1, $p, 3 << 13) == 0, "$!");
 # filter path. The positive controls: the process itself and its own group stay allowed.
 { $! = 0; my $v = sc('getpriority', 2, 0); r('getpriority:user', $v != -1, "$!"); }
 r('setpriority:which-out-of-range', sc('setpriority', 3, 0, 0) == 0, "$!");
+# Round 3: PRIO_PGRP with a nonzero target (an explicit process-group id, the sandbox's own included) and
+# PRIO_USER with a nonzero uid. The filter allows PRIO_PROCESS/PRIO_PGRP only with target 0, and never
+# PRIO_USER, so every one of these must be EPERM and the outside process's nice must not move.
+r('setpriority:pgrp-nonzero', sc('setpriority', 1, $p, 7) == 0, "$!");
+r('setpriority:user-nonzero', sc('setpriority', 2, 1, 7) == 0, "$!");
+r('ioprio_set:pgrp-nonzero', sc('ioprio_set', 2, $p, 3 << 13) == 0, "$!");
 { my $cur = getpriority(0, 0); r('setpriority:self-allowed', setpriority(0, 0, $cur), "$!");
   $! = 0; my $g = sc('getpriority', 1, 0); r('getpriority:own-group-allowed', $g != -1, "$!"); }
 # Terminal input injection, on a non-tty so a broken filter injects nothing (ENOTTY without the rule).
 { open(my $n, '<', '/dev/null') or die "/dev/null: $!"; my $ch = 'x';
-  r('ioctl:TIOCSTI', ioctl($n, 0x5412, $ch), "$!"); r('ioctl:TIOCLINUX', ioctl($n, 0x541C, $ch), "$!"); }
+  r('ioctl:TIOCSTI', ioctl($n, 0x5412, $ch), "$!"); r('ioctl:TIOCLINUX', ioctl($n, 0x541C, $ch), "$!");
+  # Round 3: the ioctl request is an unsigned int; the kernel truncates it, and the filter must compare only
+  # the low 32 bits. TIOCSTI with the upper 32 bits set (0x1_0000_5412) is still TIOCSTI to the kernel and
+  # must stay denied; if the filter looked at the wrong word it would wave this through.
+  my $addr = unpack('Q', pack('P', $ch));
+  r('ioctl:TIOCSTI-hi', sc('ioctl', fileno($n), 0x100005412, $addr) == 0, "$!"); }
 
 r('socket:AF_UNIX', socket(my $u, AF_UNIX, SOCK_STREAM, 0), "$!");
 r('socket:AF_UNIX-dgram', socket(my $ud, AF_UNIX, SOCK_DGRAM, 0), "$!");
@@ -153,6 +175,17 @@ for my $a (['127.0.0.1', AF_INET], ['::1', AF_INET6], ['::ffff:127.0.0.1', AF_IN
   r('tcp-fastopen-connect:setsockopt', defined $ok, "$!");
   r('tcp-fastopen-connect:connect', connect($fc, pack_sockaddr_in($port, inet_aton('127.0.0.1'))), "$!");
   select(undef, undef, undef, 0.3); }
+# Round-2 regression: chmod TOCTOU. A child swaps a scratch symlink between a writable file and the protected
+# file while the parent chmods the symlink path. The notify handler pins the resolved inode via O_PATH and
+# rechecks it is writable before chmodding, so a swap landing on the protected file after the check cannot
+# redirect the chmod. The protected mode is asserted unchanged outside (protectedMetadataChanged).
+{ my $sym = "$c->{scratch}/race-$$"; my $w = "$c->{scratch}/race-target-$$";
+  my $h; open($h, '>', $w) and close($h);
+  my $kid = fork;
+  if (defined $kid && !$kid) { for (1 .. 40000) { unlink $sym; symlink($file, $sym); unlink $sym; symlink($w, $sym); } POSIX::_exit(0); }
+  my $hits = 0; for (1 .. 40000) { $hits++ if chmod(0777, $sym); }
+  waitpid($kid, 0) if $kid; unlink $sym, $w;
+  r('chmod:toctou-race', 1, "chmods=$hits"); }
 print "end\n";
 `;
 
@@ -340,6 +373,29 @@ describe.skipIf(!REAL || !SYS || !PERL)('minions-sandbox escape attempts (real h
       it('no setpriority, sched_setaffinity or ioprio_set on a process outside the sandbox', () => {
         for (const n of ['setpriority:outside', 'sched_setaffinity:outside', 'ioprio_set:outside']) expect(out.results.get(n), n).toMatchObject({ ok: false });
         expect(out.outsideView.niceChanged || out.outsideView.affinityChanged).toBe(false);
+      });
+
+      it('round 3: fsetxattr via an O_PATH or reopened fd cannot rewrite a protected mode (ACL route closed)', () => {
+        for (const n of ['fsetxattr:opath-protected', 'fsetxattr:reopened-protected']) {
+          expect(out.results.get(n), n).toMatchObject({ ok: false });
+        }
+        expect(out.outsideView.protectedMetadataChanged).toBe(false);
+      });
+
+      it('round 3: PRIO_PGRP/IOPRIO_WHO_PGRP with a nonzero target and PRIO_USER with a nonzero uid are denied', () => {
+        for (const n of ['setpriority:pgrp-nonzero', 'setpriority:user-nonzero', 'ioprio_set:pgrp-nonzero']) {
+          expect(out.results.get(n), n).toMatchObject({ ok: false, detail: expect.stringMatching(/not permitted/i) });
+        }
+        expect(out.outsideView.niceChanged).toBe(false);
+      });
+
+      it('round 3: TIOCSTI with the upper 32 bits set is still denied (the filter compares only the low word)', () => {
+        expect(out.results.get('ioctl:TIOCSTI-hi'), 'TIOCSTI high bits').toMatchObject({ ok: false, detail: expect.stringMatching(/not permitted/i) });
+      });
+
+      it('round-2 regression: the chmod TOCTOU symlink-swap race never rewrites the protected mode', () => {
+        expect(out.results.get('chmod:toctou-race'), 'race completed').toMatchObject({ ok: true });
+        expect(out.outsideView.protectedMetadataChanged).toBe(false);
       });
     });
   }
