@@ -118,6 +118,39 @@ describe('handoff file (capped, redacted, replaced on write)', () => {
     expect(stored).toContain('https://bob:[REDACTED]@example.com');
     expect(redactHandoff('nothing secret here').redactions).toBe(0);
   });
+
+  it('masks short values after secret-like keys (task-49), quoted or prefixed, and leaves ordinary prose alone', () => {
+    const cases: [string, string][] = [
+      ['password: hunter2', 'password: [REDACTED]'],
+      ['passwd=abc', 'passwd=[REDACTED]'],
+      ['DB_PASSWORD=x1', 'DB_PASSWORD=[REDACTED]'],
+      ['token: abc123', 'token: [REDACTED]'],
+      ['GITHUB_TOKEN=ghx', 'GITHUB_TOKEN=[REDACTED]'],
+      ['client_secret = s3', 'client_secret = [REDACTED]'],
+      ['api_key: k1', 'api_key: [REDACTED]'],
+      ['apikey=k2', 'apikey=[REDACTED]'],
+      ['X-Api-Key: k3', 'X-Api-Key: [REDACTED]'],
+      ['access_key: AK', 'access_key: [REDACTED]'],
+      ['private_key: pk', 'private_key: [REDACTED]'],
+      ['Secret: shh', 'Secret: [REDACTED]'],
+      ['{"password": "hunter 2"}', '{"password": "[REDACTED]"}'],
+      ["passphrase='open sesame'", "passphrase='[REDACTED]'"],
+      ['owner said password: hunter2, then left', 'owner said password: [REDACTED] then left'],
+    ];
+    for (const [input, want] of cases) {
+      const r = redactHandoff(input);
+      expect(r.text, input).toBe(want);
+      expect(r.redactions, input).toBe(1);
+    }
+    // Already masked by the generic pattern: masked once, not counted twice.
+    expect(redactHandoff('password: hunter2hunter2')).toEqual({ text: 'password: [REDACTED]', redactions: 1 });
+    // Ordinary prose: no separator after the word, plural/compound words, empty values, a value on the next line.
+    const prose = [
+      'the token total is 1.2M', 'tokens: 1.2M used today', 'token budget 5M', 'secrets live in the secrets dir',
+      'password_hint: blue', 'tokenizer: tiktoken', 'password:', 'password: ""', 'token:\nnext line stays', 'pwd: /tmp',
+    ];
+    for (const p of prose) expect(redactHandoff(p), p).toEqual({ text: p, redactions: 0 });
+  });
 });
 
 describe('settings (config defaults keep existing configs valid)', () => {
@@ -286,16 +319,33 @@ describe('self-restart (coordinator restart --detach)', () => {
   it('refuses in-band with active leases and spawns nothing', () => {
     const f = fakeSpawn();
     const dir = tmp('minions-detach-');
-    expect(() => scheduleDetachedRestart({ activeLeases: () => [{ id: 'lease-1' }], log: join(dir, 'logs', 'context-reset.log'), cwd: dir, spawn: f.spawn }, { recover: true }))
+    expect(() => scheduleDetachedRestart({ activeLeases: () => [{ id: 'lease-1' }], drain: () => null, log: join(dir, 'logs', 'context-reset.log'), cwd: dir, spawn: f.spawn }, { recover: true }))
       .toThrow(expect.objectContaining({ code: 'PRECONDITION', message: 'Coordinator restart refused: 1 active worker lease(s) (lease-1).' }));
     expect(f.calls).toHaveLength(0);
+  });
+
+  it('refuses in-band during a drain (no leases) and opens/spawns nothing; --force passes through to the detached restart', () => {
+    const f = fakeSpawn();
+    const dir = tmp('minions-detach-');
+    const db = freshDb();
+    db.setDrain('upgrade to 0.9');
+    const log = join(dir, 'logs', 'context-reset.log');
+    const deps = { activeLeases: () => db.activeLeases(), drain: () => db.drain(), log, cwd: dir, spawn: f.spawn };
+    expect(() => scheduleDetachedRestart(deps, { recover: true })).toThrow(expect.objectContaining({
+      code: 'PRECONDITION', message: 'Coordinator restart refused: a drain is in progress (upgrade to 0.9).', hint: expect.stringContaining('upgrade restarts the coordinator'),
+    }));
+    expect(f.calls).toHaveLength(0);
+    expect(existsSync(log)).toBe(false);
+    const r = scheduleDetachedRestart(deps, { recover: true, force: true });
+    expect(r.action).toBe('restart-scheduled');
+    expect(f.calls[0]!.args).toEqual(['coordinator', 'restart', '--recover', '--force']);
   });
 
   it('idle: runs `minions coordinator restart --recover` in its own session, output to the log, and returns at once', () => {
     const f = fakeSpawn();
     const dir = tmp('minions-detach-');
     const log = join(dir, 'logs', 'context-reset.log');
-    const r = scheduleDetachedRestart({ activeLeases: () => [], log, cwd: dir, spawn: f.spawn, env: { PATH: '/usr/bin' } }, { recover: true });
+    const r = scheduleDetachedRestart({ activeLeases: () => [], drain: () => null, log, cwd: dir, spawn: f.spawn, env: { PATH: '/usr/bin' } }, { recover: true });
     expect(r).toMatchObject({ action: 'restart-scheduled', log, pid: 777 });
     expect(f.calls).toEqual([{ cmd: 'minions', args: ['coordinator', 'restart', '--recover'], opts: expect.objectContaining({ cwd: dir, detached: true, env: { PATH: '/usr/bin' } }) }]);
     expect(f.calls[0]!.opts.stdio[0]).toBe('ignore');
@@ -436,7 +486,7 @@ describe('edge cases (tester, task-45)', () => {
     const calls: string[][] = [];
     const spawn: DetachedSpawn = (_c, args) => { calls.push(args); return { pid: 1, unref: () => undefined, on: () => undefined }; };
     const dir = tmp('minions-detach-');
-    const deps = { activeLeases: () => db.activeLeases(), log: join(dir, 'l.log'), cwd: dir, spawn };
+    const deps = { activeLeases: () => db.activeLeases(), drain: () => db.drain(), log: join(dir, 'l.log'), cwd: dir, spawn };
     expect(() => scheduleDetachedRestart(deps, { recover: true })).toThrow(expect.objectContaining({ code: 'PRECONDITION', message: expect.stringContaining('lease-late') }));
     expect(calls).toHaveLength(0);
     expect(existsSync(join(dir, 'l.log'))).toBe(false); // refused before anything was opened

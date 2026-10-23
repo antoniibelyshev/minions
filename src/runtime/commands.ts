@@ -557,7 +557,7 @@ export function register(program: Command): void {
       const d = getDb();
       if (o.detach) {
         const paths = runtimePaths();
-        const s = scheduleDetachedRestart({ activeLeases: () => d.activeLeases(), log: join(paths.logs, 'context-reset.log'), cwd: paths.state }, o);
+        const s = scheduleDetachedRestart({ activeLeases: () => d.activeLeases(), drain: () => d.drain(), log: join(paths.logs, 'context-reset.log'), cwd: paths.state }, o);
         emit(s, { json: globalOpts(cmd).json, human: (x: typeof s) => `coordinator: ${x.action} (${x.reason})` });
         return;
       }
