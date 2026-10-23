@@ -1,6 +1,8 @@
 import { realpathSync } from 'node:fs';
 import { lstat, mkdir, readdir, readFile, rename, rm, stat } from 'node:fs/promises';
 import { basename, dirname, join, relative, isAbsolute, resolve } from 'node:path';
+import { exactWorkerRole, workerRoleNames, type RoleDef } from '../config/roles.js';
+import type { MinionsConfig } from '../config/schema.js';
 import { MinionsError } from '../core/errors.js';
 import { atomicWrite, writeJson } from '../core/fsutil.js';
 import type { Lease, LeaseRole, RuntimeDb } from './db.js';
@@ -192,8 +194,27 @@ function inside(dir: string, cwd: string): boolean {
   return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
 }
 
+/**
+ * The worker role `work claim|brief|submit --role` names (D8, D10): only registered worker roles (built-ins
+ * and configured project roles, exact names: a `-deep` variant runs under its base role). Anything else,
+ * including the coordinator and prototype keys, is POLICY_DENIED.
+ */
+export function requireWorkerRole(cfg: Pick<MinionsConfig, 'roles' | 'execution'>, role: string): RoleDef {
+  const def = typeof role === 'string' ? exactWorkerRole(cfg, role) : undefined;
+  if (!def) {
+    const shown = JSON.stringify(String(role).slice(0, 40));
+    throw new MinionsError('POLICY_DENIED', `--role ${shown} is not a registered worker role (known: ${workerRoleNames(cfg).join(', ')}).`,
+      'Use the role from your prompt (for `minions:<role>-deep` it is `<role>`); project roles are added on the host (`roles` in the project config).');
+  }
+  return def;
+}
+
+/** Caller of a lease's brief/submission; with `config`, its role must be a registered worker role. */
+export interface LeaseCaller { role: string; cwd: string; config?: Pick<MinionsConfig, 'roles' | 'execution'> }
+
 /** Throws unless the caller (role + cwd) is the worker of this active lease. Returns the lease. */
-export function assertLeaseOwner(db: RuntimeDb, leaseId: string, caller: { role: string; cwd: string }): Lease {
+export function assertLeaseOwner(db: RuntimeDb, leaseId: string, caller: LeaseCaller): Lease {
+  if (caller.config) requireWorkerRole(caller.config, caller.role);
   checkId(leaseId);
   const lease = db.lease(leaseId);
   if (!lease) throw new MinionsError('NOT_FOUND', `Lease ${leaseId} does not exist.`);
@@ -246,7 +267,7 @@ export const compactClaim = (b: TaskBrief): CompactClaim => ({
 });
 
 /** Returns the stored brief, only to the lease's own worker. */
-export async function fetchBrief(db: RuntimeDb, p: HandoffPaths, leaseId: string, caller: { role: string; cwd: string }): Promise<TaskBrief> {
+export async function fetchBrief(db: RuntimeDb, p: HandoffPaths, leaseId: string, caller: LeaseCaller): Promise<TaskBrief> {
   assertLeaseOwner(db, leaseId, caller);
   try {
     return JSON.parse(await readFile(briefPath(p, leaseId), 'utf8')) as TaskBrief;
@@ -264,7 +285,7 @@ export interface SubmitResponse { leaseId: string; path: string; bytes: number; 
  * Stores a worker's raw result for the coordinator to record. Content is not judged here: `record`
  * validates it exactly as a piped result. A later submit replaces an earlier one (until recorded).
  */
-export async function submitResult(db: RuntimeDb, p: HandoffPaths, leaseId: string, raw: string, caller: { role: string; cwd: string }): Promise<SubmitResponse> {
+export async function submitResult(db: RuntimeDb, p: HandoffPaths, leaseId: string, raw: string, caller: LeaseCaller): Promise<SubmitResponse> {
   assertLeaseOwner(db, leaseId, caller);
   if (!raw.trim()) throw new MinionsError('PRECONDITION', 'Empty result: nothing submitted.', 'Pipe the WorkerResult JSON on stdin.');
   const path = submissionPath(p, leaseId);

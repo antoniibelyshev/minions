@@ -2,7 +2,8 @@ import { closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readSy
 import { basename, dirname, join } from 'node:path';
 import type { BacklogAdapter } from '../backlog/types.js';
 import { AGENT_MODEL_ALIASES, isAgentModelAlias } from '../config/models.js';
-import type { MinionsConfig } from '../config/schema.js';
+import { agentTypeRole, DEEP_SUFFIX, workerRoleNames } from '../config/roles.js';
+import type { MinionsConfig, RoleContract } from '../config/schema.js';
 import { sha256 } from '../core/fsutil.js';
 import { redact } from '../core/output.js';
 import type { DrainNoticeVia, LeaseRole, RuntimeDb } from './db.js';
@@ -15,7 +16,9 @@ import { noteTranscript } from './context-reset.js';
 export interface HookDeps { db: RuntimeDb; backlog: BacklogAdapter; config: MinionsConfig }
 export type HookLoader = () => HookDeps | Promise<HookDeps>;
 /** The drain hook needs only the runtime DB (it runs on every worker tool call during a drain). */
-export type DrainLoader = () => Pick<HookDeps, 'db'> | Promise<Pick<HookDeps, 'db'>>;
+export type DrainLoader = () => DrainDeps | Promise<DrainDeps>;
+/** The config is optional for the drain hook: without it the lease roles decide and the notice falls back to a generic wording. */
+export type DrainDeps = Pick<HookDeps, 'db'> & { config?: MinionsConfig };
 /** stdout: exact text Claude Code reads (absent = allow). Exit code is always 0. */
 export interface HookOutput { stdout?: string; reason: string }
 
@@ -115,8 +118,11 @@ export async function stopHook(input: unknown, load: HookLoader): Promise<HookOu
   }
 }
 
-/** Worker agent types; `engineer-deep` (the higher-effort engineer definition) runs under an engineer lease. */
-const WORKER = /^minions:(engineer|tester|reviewer)(-deep)?$/;
+/**
+ * Shape of a worker agent type: `minions:<name>` with a role-name-like name (`<role>-deep` included). Whether
+ * the name is a registered role (and whether its `-deep` variant exists) is decided against the config.
+ */
+const WORKER_TYPE = /^minions:[a-z][a-z0-9-]{0,40}$/;
 const MARKER = /minions-lease:\s*(lease-[A-Za-z0-9_-]+)/g;
 
 const deny = (reason: string): HookOutput => ({
@@ -124,29 +130,36 @@ const deny = (reason: string): HookOutput => ({
   reason: `deny: ${reason}`,
 });
 
-/** PreToolUse(Agent) guard: minions workers need a prompt naming an active lease for that role. Fails closed. */
+/**
+ * PreToolUse(Agent) guard (D10): `minions:<role>` and `minions:<role>-deep` (only for a role with a deep
+ * variant) are accepted iff the role is in the registry of the runtime config and the prompt names an active
+ * lease of that role. Every other `minions:*` type is denied. Fails closed (an unreadable config or DB denies).
+ */
 export async function preAgentHook(input: unknown, load: HookLoader): Promise<HookOutput> {
   const inp = isObj(input) ? input : {};
   const ti = isObj(inp.tool_input) ? inp.tool_input : {};
   const type = typeof ti.subagent_type === 'string' ? ti.subagent_type : '';
   if (!type.startsWith('minions:')) return { reason: `allow: not a minions worker (${type || 'none'})` };
-  const m = WORKER.exec(type);
-  if (!m || (m[2] && m[1] !== 'engineer')) return deny(`Unknown minions agent type "${type}".`);
-  const role = m[1] as LeaseRole;
+  const shown = JSON.stringify(type.slice(0, 80)).slice(1, -1);
+  // Cheap syntactic check first: no config or DB read for a type no role could have.
+  if (!WORKER_TYPE.test(type)) return deny(`Unknown minions agent type "${shown}".`);
   // The Agent tool only accepts model aliases; a full id would fail the launch with a less useful error.
   if (typeof ti.model === 'string' && ti.model && !isAgentModelAlias(ti.model)) {
     return deny(`model "${ti.model}" is not an Agent model alias (${AGENT_MODEL_ALIASES.join('|')}). Omit \`model\` to use the model set in the ${type} definition, or pass an allowed alias.`);
   }
   try {
+    const { db, config } = await load();
+    const def = agentTypeRole(config, type);
+    if (!def) return deny(`Unknown minions agent type "${shown}": not a registered worker role (${workerRoleNames(config).join(', ')}) or the deep variant of one.`);
+    const role = def.name;
     const prompt = typeof ti.prompt === 'string' ? ti.prompt : '';
     const ids = [...prompt.matchAll(MARKER)].map((x) => x[1]!);
     if (!ids.length) {
       return deny(`${type} needs a claimed lease: run \`minions work claim <taskId> --role ${role} --json\` and include its briefMarker ("minions-lease: <leaseId>") in the prompt.`);
     }
-    const { db } = await load();
     for (const id of ids) {
       const l = db.lease(id);
-      if (l && l.status === 'active' && l.role === role) return { reason: `allow: ${type} under lease ${id} for ${l.task_id}` };
+      if (l && l.status === 'active' && (l.role as string) === role) return { reason: `allow: ${type} under lease ${id} for ${l.task_id}` };
     }
     return deny(`No active ${role} lease matches ${ids.join(', ')}. Claim the task with \`minions work claim <taskId> --role ${role} --json\` first.`);
   } catch (e) {
@@ -395,14 +408,27 @@ export function drainSafeBash(command: string): boolean {
 const drainAllowed = (tool: string, ti: Record<string, unknown>): boolean =>
   DRAIN_READ_ONLY_TOOLS.has(tool) || /Handback$/.test(tool) || (tool === 'Bash' && typeof ti.command === 'string' && drainSafeBash(ti.command));
 
-/** What the worker is told on its first tool call after a drain request, by role. */
-export function drainNotice(role: LeaseRole, reason: string): string {
+/** How a drain notice is worded (D10): by the role's contract variant, and whether the role commits at all. */
+export interface DrainVariant { contract: RoleContract; commits: boolean }
+const BUILTIN_DRAIN_VARIANTS: Record<LeaseRole, DrainVariant> = {
+  engineer: { contract: 'producer', commits: true },
+  tester: { contract: 'verifier', commits: true },
+  reviewer: { contract: 'gate', commits: false },
+};
+const builtinDrainVariant = (role: string): DrainVariant | undefined => (Object.hasOwn(BUILTIN_DRAIN_VARIANTS, role) ? BUILTIN_DRAIN_VARIANTS[role as LeaseRole] : undefined);
+
+/** What the worker is told on its first tool call after a drain request, by contract variant (a role name of a built-in is accepted too). */
+export function drainNotice(variant: DrainVariant | RoleContract | LeaseRole, reason: string): string {
+  const v: DrainVariant = typeof variant !== 'string' ? variant
+    : builtinDrainVariant(variant) ?? { contract: variant as RoleContract, commits: variant !== 'gate' };
   const head = reason === 'upgrade' ? 'Upgrade pending' : `Drain requested (${reason})`;
-  const what = role === 'reviewer'
+  const what = v.contract === 'gate'
     ? `${head}: stop the review now. You have nothing to commit: return a partial WorkerResult right away (findings so far; the remaining review work in findings and nextAction). The review reruns later at the same head.`
-    : role === 'tester'
-      ? `${head}: reach a safe checkpoint now. If you changed tests, commit them on your branch (message prefix \`wip:\`); if you have nothing to commit, return a partial WorkerResult right away. List the remaining testing in findings and nextAction.`
-      : `${head}: reach a safe checkpoint now. Commit work in progress on your branch (message prefix \`wip:\`), then return a partial WorkerResult that lists the remaining work.`;
+    : !v.commits
+      ? `${head}: stop now. Your role does not commit: return a partial WorkerResult right away (what you found so far; the remaining work in findings and nextAction).`
+      : v.contract === 'verifier'
+        ? `${head}: reach a safe checkpoint now. If you changed tests, commit them on your branch (message prefix \`wip:\`); if you have nothing to commit, return a partial WorkerResult right away. List the remaining testing in findings and nextAction.`
+        : `${head}: reach a safe checkpoint now. Commit work in progress on your branch (message prefix \`wip:\`), then return a partial WorkerResult that lists the remaining work.`;
   return `${what} Never discard uncommitted changes (no reset, checkout, restore, clean or stash). After about ${DRAIN_GRACE_CALLS} more tool calls only read-only tools, git status|log|diff|show|rev-parse, git add <paths|-A|-u>, git commit -m "<quoted msg>" or the $(cat <<'EOF' … EOF) / -F - <<'EOF' forms (no --amend, no -a), cd <path> && …, and minions work submit|brief <lease> [--role <r>] --json are allowed.`;
 }
 
@@ -468,15 +494,22 @@ export async function drainHook(input: unknown, load: DrainLoader): Promise<Hook
   const agentType = typeof inp.agent_type === 'string' ? inp.agent_type : '';
   const tool = typeof inp.tool_name === 'string' ? inp.tool_name : '';
   const ti = isObj(inp.tool_input) ? inp.tool_input : {};
-  const m = WORKER.exec(agentType);
-  if (!agentId || !m) return { reason: `allow: not a minions worker (${agentId ? agentType || 'unknown type' : 'main thread'})` };
-  const role = m[1] as LeaseRole;
+  if (!agentId || !WORKER_TYPE.test(agentType)) return { reason: `allow: not a minions worker (${agentId ? agentType || 'unknown type' : 'main thread'})` };
   try {
-    const { db } = await load();
+    const { db, config } = await load();
     const drain = db.drain();
     if (!drain) return { reason: 'allow: no drain requested' };
-    const roleLeases = db.activeLeases().filter((l) => l.role === role);
+    const name = agentType.slice('minions:'.length);
+    // With the config the registry decides; without it (unreadable) the lease roles do: `<r>-deep` runs under an `<r>` lease.
+    const def = config ? agentTypeRole(config, agentType) : undefined;
+    if (config && !def) return { reason: `allow: ${agentType} is not a registered worker role` };
+    const active = db.activeLeases();
+    // Role names never end in `-deep`, so a `-deep` type without the config runs under its base role's lease.
+    const role = def?.name ?? (name.endsWith(DEEP_SUFFIX) ? name.slice(0, -DEEP_SUFFIX.length) : name);
+    const roleLeases = active.filter((l) => (l.role as string) === role);
     if (!roleLeases.length) return { reason: `allow: no active ${role} lease` };
+    // Unknown contract (config unreadable, project role): the verifier wording covers both "commit" and "nothing to commit".
+    const variant: DrainVariant = def ? { contract: def.contract, commits: def.commits } : builtinDrainVariant(role) ?? { contract: 'verifier', commits: true };
     const hits = db.drainHit(drain.eventId, agentId);
     if (hits === 1) {
       // Only on delivery (an agent's first call of this drain): tie the notice to its lease (task-3.10).
@@ -486,7 +519,7 @@ export async function drainHook(input: unknown, load: DrainLoader): Promise<Hook
         for (const l of leases) db.recordDrainNotice(l, { eventId: drain.eventId, agentId, agentType, tool, via });
         noted = `lease ${leases.map((l) => l.id).join(',')} via ${via}`;
       } catch (e) { noted = `notice not recorded: ${(e as Error).message}`; }
-      return addContext(drainNotice(role, drain.reason), `context: drain notice to ${agentType} ${agentId} (${noted})`);
+      return addContext(drainNotice(variant, drain.reason), `context: drain notice to ${agentType} ${agentId} (${noted})`);
     }
     if (hits <= DRAIN_GRACE_CALLS + 1 || drainAllowed(tool, ti)) return { reason: `allow: ${agentType} ${agentId} ${tool} during drain (call ${hits})` };
     return deny(`Drain in progress (${drain.reason}): git status|log|diff|show|rev-parse, git add <paths|-A|-u>, git commit -m "<quoted msg>" or the $(cat <<'EOF' … EOF) / -F - <<'EOF' forms, cd <path> && …, and minions work submit|brief are allowed. ` +

@@ -1,10 +1,13 @@
 import { existsSync, readFileSync } from 'node:fs';
-import { readdir, readFile } from 'node:fs/promises';
-import { dirname, join, relative, resolve, sep } from 'node:path';
+import { readdir, readFile, realpath } from 'node:fs/promises';
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { CAPABILITIES, can, type Capability } from '../config/capabilities.js';
 import { AGENT_MODEL_ALIASES, engineerDeepEffort, isAgentModelAlias, roleEffort } from '../config/models.js';
-import { ENGINEER_ROLE, registeredRoleNames, roleLimit } from '../config/roles.js';
+import {
+  BUILTIN_TOOLS, customRoles, deepVariantEffort, DEEP_SUFFIX, ENGINEER_ROLE, registeredRoleNames, roleLimit, workerRole,
+  type BuiltinWorkerRole, type RoleDef,
+} from '../config/roles.js';
 import type { MinionsConfig, Role } from '../config/schema.js';
 import { MinionsError } from '../core/errors.js';
 import { atomicWrite, sha256 } from '../core/fsutil.js';
@@ -18,6 +21,26 @@ export interface GeneratedFile { path: string; sha256: string }
 const PARTIALS_DIR = '_partials';
 const WORKER_ROLES: Role[] = ['engineer', 'tester', 'reviewer'];
 const ENGINEER_DEEP = 'agents/engineer-deep.md';
+/** Generic template of project-defined roles (D10); never emitted itself. */
+const ROLE_TEMPLATE = 'agents/_role.md';
+/** Where `_role.md` takes the project prompt; replaced after rendering, so `{{` in a prompt stays literal text. */
+export const PROJECT_PROMPT_MARKER = '<!-- minions:project-prompt -->';
+/** Largest role prompt (file or inline) the plugin accepts. */
+export const MAX_ROLE_PROMPT_BYTES = 64 * 1024;
+/** Never in a worker's tool list: spawning or messaging agents (`Task` is the Agent tool's old name). MCP tools are removed too. */
+const NEVER_WORKER_TOOLS = new Set(['Agent', 'Task', 'SendMessage']);
+/** Removed when a role may not edit (edits `none` or a review worktree). */
+const EDIT_TOOLS = new Set(['Edit', 'Write', 'NotebookEdit', 'MultiEdit']);
+/** Tools of a project role that does not list its own (edit tools are removed again when it may not edit). */
+const DEFAULT_ROLE_TOOLS = ['Read', 'Grep', 'Glob', 'Bash', 'Edit', 'Write'];
+
+export interface GenerateOptions {
+  /**
+   * Directory role `prompt` files are relative to: the project config dir on the host (`.minions/` for
+   * shared installs, the project dir otherwise). Required only when a role names a prompt file.
+   */
+  configDir?: string;
+}
 
 /**
  * Directory holding the plugin templates. `MINIONS_TEMPLATES` (the templates root, i.e. the
@@ -439,8 +462,82 @@ async function listFiles(root: string, dir = root): Promise<string[]> {
   return out.sort();
 }
 
+const promptError = (role: string, msg: string, hint?: string) =>
+  new MinionsError('INVALID_CONFIG', `roles.${role}: ${msg}`, hint);
+
+/**
+ * The project prompt of a role (D1, D9, D10): inline text, or the file `roles.<r>.prompt` names, read on the
+ * host relative to `configDir` (it must stay inside it, symlinks included). Rejects an empty prompt, one
+ * over MAX_ROLE_PROMPT_BYTES and one starting with a frontmatter fence (`---`): it would read as a second
+ * frontmatter block. Undefined when the role has none.
+ */
+export async function resolveRolePrompt(def: Pick<RoleDef, 'name' | 'prompt' | 'promptText'>, configDir?: string): Promise<string | undefined> {
+  let text: string;
+  if (def.promptText !== undefined) text = def.promptText;
+  else if (def.prompt !== undefined) {
+    if (!configDir) throw promptError(def.name, `prompt file "${def.prompt}" cannot be read here (no config directory)`, 'Role prompt files are resolved on the host: run `minions start` (or the config command) there.');
+    if (isAbsolute(def.prompt) || def.prompt.split(/[\\/]/).includes('..')) throw promptError(def.name, `prompt "${def.prompt}" must be relative to the config directory, without ".."`);
+    let root: string, file: string;
+    try {
+      root = await realpath(configDir);
+      file = await realpath(resolve(configDir, def.prompt));
+    } catch (e) {
+      throw promptError(def.name, `prompt file "${def.prompt}" not found in ${configDir} (${(e as NodeJS.ErrnoException).code ?? (e as Error).message})`);
+    }
+    const rel = relative(root, file);
+    if (!rel || rel.startsWith('..') || isAbsolute(rel)) throw promptError(def.name, `prompt file "${def.prompt}" resolves outside ${configDir}`);
+    const buf = await readFile(file);
+    if (buf.length > MAX_ROLE_PROMPT_BYTES) throw promptError(def.name, `prompt file "${def.prompt}" is larger than ${MAX_ROLE_PROMPT_BYTES / 1024} KB`);
+    text = buf.toString('utf8');
+  } else return undefined;
+  if (Buffer.byteLength(text) > MAX_ROLE_PROMPT_BYTES) throw promptError(def.name, `prompt is larger than ${MAX_ROLE_PROMPT_BYTES / 1024} KB`);
+  const body = text.replace(/^﻿/, '').replace(/\r\n?/g, '\n').replace(/^\s*\n/, '').trimEnd();
+  if (!body.trim()) throw promptError(def.name, 'prompt is empty');
+  if (/^\s*---/.test(body)) throw promptError(def.name, 'prompt must not start with a frontmatter fence (---); the role\'s frontmatter comes from its config fields');
+  return body;
+}
+
+/** Frontmatter tool list of a role: its allowlist minus Agent/SendMessage/MCP tools, minus edit tools when it may not edit. */
+export function roleTools(def: Pick<RoleDef, 'tools' | 'edits' | 'worktree'>, fallback: readonly string[] = DEFAULT_ROLE_TOOLS): string[] {
+  const readOnly = def.edits === 'none' || def.worktree === 'review';
+  const seen = new Set<string>();
+  return (def.tools ?? fallback).filter((t) => {
+    if (seen.has(t)) return false;
+    seen.add(t);
+    // `*` patterns could match MCP or agent tools; minions only renders concrete names.
+    return !NEVER_WORKER_TOOLS.has(t) && !/^mcp/i.test(t) && !t.includes('*') && !(readOnly && EDIT_TOOLS.has(t));
+  });
+}
+
+/** A YAML double-quoted scalar (JSON strings are valid YAML): role descriptions are free text. */
+const yamlString = (s: string) => JSON.stringify(s.replace(/\s+/g, ' ').trim());
+
+const STATUS_GUIDE: Record<RoleDef['contract'], string> = {
+  producer: 'Status guide (producer stage): `complete` when the stage\'s work is done (and committed, if your role commits) and verified; `needs_changes` only when the task itself must be replanned (say why in `findings`); `partial`/`blocked`/`needs_split` as described above. Omit `verdict` and `needsQa`, and never report a check with `"source": "ci"`.',
+  verifier: 'Status guide (verifier stage): `complete` only when every acceptance criterion has passing evidence at the head you report (a `complete` result with a failing check is rejected); `needs_changes` when the work is wrong or criteria are not met (each defect in `findings`, with how to reproduce); `partial`/`blocked` as described above. Never rewrite history: commits you add go on top of the branch. Omit `verdict`.',
+  gate: 'Status and verdict (gate stage): `complete` with `"verdict": "approve"` only when every criterion is met and nothing blocking remains; `needs_changes` with `"verdict": "request-changes"` otherwise, each required change in `findings` (file, line, problem, expected fix). Set `"needsQa": true` when the change needs a tester stage before delivery. `branch` is the task branch and `headSha` the head you judged; it must not move.',
+};
+
+function roleWorktreeGuide(def: RoleDef): string {
+  return def.worktree === 'review'
+    ? 'Your worktree is a read-only review worktree detached at the brief\'s `expectedHead`. Confirm with `git rev-parse HEAD` first; if it differs from `expectedHead`, report `blocked`. Never `git checkout`, `git reset`, `git stash` or commit.'
+    : 'Your worktree is the task branch checkout named in the brief (`worktree`, `branch`), at `expectedHead` when you start. Stay on that branch.';
+}
+
+function roleEditGuide(def: RoleDef, verify: string): string {
+  const scope = def.edits === 'none'
+    ? 'You may not edit, create or delete files in the repository or worktree: read, search and run read-only commands only (the `minions work brief` and `minions work submit` commands are allowed: they read and write minions state, not your worktree).'
+    : def.edits === 'any'
+      ? 'You may edit and create files in your worktree as the task needs.'
+      : `You may edit and create files only under ${def.edits.paths.map(code).join(', ')}; changes elsewhere make your result invalid.`;
+  const commits = def.commits
+    ? 'Commit your changes on the assigned branch with clear messages (`git add`/`git commit` only; nothing that rewrites history or touches other refs). Leave no uncommitted changes you want delivered.'
+    : 'Never `git commit`, push, or open/merge pull requests.';
+  return `${scope} ${commits} Run the verification commands from the brief (project defaults: ${verify}) when they apply to your work and report each outcome honestly.`;
+}
+
 /** Renders templates/plugin into outDir and returns written files (absolute paths), sorted by path. */
-export async function generatePlugin(cfg: MinionsConfig, outDir: string): Promise<GeneratedFile[]> {
+export async function generatePlugin(cfg: MinionsConfig, outDir: string, opts: GenerateOptions = {}): Promise<GeneratedFile[]> {
   const src = templatesDir();
   if (!existsSync(src)) throw new MinionsError('INTERNAL', `Plugin templates not found at ${src}`);
   const all = await listFiles(src);
@@ -457,21 +554,71 @@ export async function generatePlugin(cfg: MinionsConfig, outDir: string): Promis
     await atomicWrite(dest, text);
     results.push({ path: dest, sha256: sha256(text) });
   };
-  for (const f of all.filter((f) => !f.startsWith(`${PARTIALS_DIR}/`))) {
+  // D9: the built-in body, then the project's instructions under their own heading (inserted after rendering).
+  const withProjectPrompt = (text: string, prompt: string | undefined) =>
+    (prompt === undefined ? text : `${text.replace(/\n*$/, '\n')}\n## Project instructions\n\n${prompt}\n`);
+  // D9: a built-in override may only remove tools; the template's order is kept.
+  const withTools = (text: string, role: BuiltinWorkerRole, tools: string[] | undefined) => {
+    if (!tools) return text;
+    const keep = roleTools({ tools: BUILTIN_TOOLS[role].filter((t) => tools.includes(t)), edits: 'any', worktree: 'branch' });
+    return text.replace(/^tools: .*$/m, `tools: ${keep.join(', ')}`);
+  };
+  for (const f of all.filter((f) => !f.startsWith(`${PARTIALS_DIR}/`) && f !== ROLE_TEMPLATE)) {
     const role = /^agents\/(\w+)\.md$/.exec(f)?.[1] as Role | undefined;
     const tpl = await readFile(join(src, f), 'utf8');
     if (!role || !WORKER_ROLES.includes(role)) {
       await emit(f, renderTemplate(tpl, vars, partials, { name: f, json: f.endsWith('.json') }));
       continue;
     }
-    const fileVars = { ...vars, policySummary: renderPolicySummary(cfg, role), workerRole: role, workerEffortLine: effortLine(roleEffort(cfg, role)) };
-    await emit(f, renderTemplate(tpl, fileVars, partials, { name: f }));
+    const builtin = role as BuiltinWorkerRole;
+    const def = workerRole(cfg, builtin)!;
+    const prompt = await resolveRolePrompt(def, opts.configDir);
+    const fileVars = {
+      ...vars, policySummary: renderPolicySummary(cfg, role), workerRole: role, workerEffortLine: effortLine(roleEffort(cfg, role)),
+      workerModel: def.model ?? cfg.models.default, attemptMaxTurns: String(def.maxTurns),
+    };
+    const render = (name: string, v: Record<string, string>) => withProjectPrompt(withTools(renderTemplate(tpl, v, partials, { name }), builtin, def.tools), prompt);
+    await emit(f, render(f, fileVars));
     if (role === 'engineer') {
       // Same template, higher effort: the coordinator escalates hard or failed work to it (same engineer lease).
-      await emit(ENGINEER_DEEP, renderTemplate(tpl, {
+      await emit(ENGINEER_DEEP, render(ENGINEER_DEEP, {
         ...fileVars, agentName: 'engineer-deep', workerEffortLine: effortLine(engineerDeepEffort(cfg)),
         engineerVariant: ' (higher reasoning effort, for hard debugging, architecture work, or after a failed attempt)',
-      }, partials, { name: ENGINEER_DEEP }));
+      }));
+    }
+  }
+  const custom = customRoles(cfg);
+  if (custom.length) {
+    if (!all.includes(ROLE_TEMPLATE)) throw new MinionsError('INTERNAL', `Plugin template ${ROLE_TEMPLATE} not found in ${src}`);
+    const tpl = await readFile(join(src, ROLE_TEMPLATE), 'utf8');
+    const verify = inlineList(cfg.verification.commands, 'none configured (find and run the project\'s own checks)');
+    for (const [name] of custom) {
+      const def = workerRole(cfg, name);
+      if (!def || def.builtin || def.name !== name) throw new MinionsError('INVALID_CONFIG', `roles.${name}: not a valid project role name.`);
+      const prompt = await resolveRolePrompt(def, opts.configDir);
+      if (prompt === undefined) throw promptError(name, 'set exactly one of prompt and promptText');
+      const tools = roleTools(def);
+      if (!tools.length) throw promptError(name, 'no usable tools left after removing Agent, SendMessage, MCP, pattern and (read-only role) edit tools');
+      const readOnly = def.edits === 'none' || def.worktree === 'review';
+      const disallowed = ['Agent', 'SendMessage', ...(readOnly ? ['Edit', 'Write', 'NotebookEdit'] : [])];
+      const roleVars = {
+        ...vars, workerRole: name, policySummary: renderPolicySummary(cfg, name),
+        workerModel: def.model ?? cfg.models.default, attemptMaxTurns: String(def.maxTurns),
+        roleTools: tools.join(', '), roleDisallowedTools: disallowed.join(', '), roleContract: def.contract,
+        roleWorktreeGuide: roleWorktreeGuide(def), roleEditGuide: roleEditGuide(def, verify), roleStatusGuide: STATUS_GUIDE[def.contract],
+      };
+      const variants: { agent: string; effort: string | undefined; variant: string }[] = [{ agent: name, effort: roleEffort(cfg, name), variant: '' }];
+      if (def.deepVariant) variants.push({ agent: `${name}${DEEP_SUFFIX}`, effort: deepVariantEffort(cfg, name), variant: ' (higher reasoning effort)' });
+      for (const v of variants) {
+        const rel = `agents/${v.agent}.md`;
+        const rendered = renderTemplate(tpl, {
+          ...roleVars, agentName: v.agent, roleVariant: v.variant, workerEffortLine: effortLine(v.effort),
+          roleDescription: yamlString(`Minions ${name}${v.variant}: ${def.description} Launched only by the minions coordinator with a minions-lease marker.`),
+        }, partials, { name: rel });
+        const parts = rendered.split(PROJECT_PROMPT_MARKER);
+        if (parts.length !== 2) throw new MinionsError('INTERNAL', `Template ${ROLE_TEMPLATE}: expected exactly one ${PROJECT_PROMPT_MARKER}`);
+        await emit(rel, parts.join(prompt));
+      }
     }
   }
   return results.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));

@@ -1,7 +1,7 @@
 // init: inspect → propose (plan) → apply (journal, atomic writes, manifest, rollback) → verify.
 import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join, relative, sep } from 'node:path';
+import { dirname, join, relative, sep } from 'node:path';
 import { z } from 'zod';
 import { can } from '../config/capabilities.js';
 import { DEFERRED_FEATURES, listUnavailable, validateConfig, type Unavailable } from '../config/resolve.js';
@@ -19,7 +19,7 @@ import {
   type CredentialsJson, type Fetch, type ProvisionResult, type TelegramProvisionResult,
 } from './credentials.js';
 import { composeYaml, type Runner } from './docker.js';
-import { ProjectJsonSchema, resolveEffective, runtimeProjectInfo, sharedConfigView, type ProjectJson } from './project.js';
+import { ProjectJsonSchema, projectConfigPath, resolveEffective, runtimeProjectInfo, sharedConfigView, type ProjectJson } from './project.js';
 import { bindProject, gitCommonDir, loadRegistry, repoRoot, resolveIdentity, saveRegistry, sharedProjectId, type Identity, type Registry } from './registry.js';
 import { runWizard, type WizardIO } from './wizard.js';
 import { runGithubSetup, type GithubSetupResult } from './github-setup.js';
@@ -353,7 +353,7 @@ async function prepare(opts: InitOptions, docker?: DockerStatus): Promise<Prepar
   const staging = await mkdtemp(join(tmpdir(), 'minions-plugin-'));
   const cleanup = () => rm(staging, { recursive: true, force: true });
   try {
-    await generatePlugin(effective, staging);
+    await generatePlugin(effective, staging, { configDir: roleConfigDir(project) });
     for (const f of await walkFiles(staging)) add(join(paths.pluginDir, relative(staging, f)), await readFile(f));
   } catch (e) { await cleanup(); throw e; }
 
@@ -533,11 +533,14 @@ async function apply(prep: Prepared): Promise<ApplyResult> {
 
 // ---------------------------------------------------------------- derived files at start
 
+/** Directory role prompt files (`roles.<r>.prompt`) are relative to: next to the project config, read on the host (D1). */
+const roleConfigDir = (project: Pick<ProjectJson, 'visibility' | 'repoPath' | 'projectId'>) => dirname(projectConfigPath(project));
+
 /** Renders the plugin from the installed package's templates: [absolute path under pluginDir, content]. */
-async function renderPlugin(pluginDir: string, effective: MinionsConfig): Promise<[string, Buffer][]> {
+async function renderPlugin(pluginDir: string, effective: MinionsConfig, project: ProjectJson): Promise<[string, Buffer][]> {
   const staging = await mkdtemp(join(tmpdir(), 'minions-plugin-'));
   try {
-    await generatePlugin(effective, staging);
+    await generatePlugin(effective, staging, { configDir: roleConfigDir(project) });
     const out: [string, Buffer][] = [];
     for (const f of await walkFiles(staging)) out.push([join(pluginDir, relative(staging, f)), await readFile(f)]);
     return out;
@@ -558,7 +561,7 @@ export async function refreshDerived(project: ProjectJson, effective: MinionsCon
   const paths = projectPaths(project.projectId);
   const manifest = (await loadManifest(project.projectId)) ?? { version: 1 as const, packageVersion: VERSION, files: [] };
   const warnings: string[] = [];
-  const plugin = await renderPlugin(paths.pluginDir, effective);
+  const plugin = await renderPlugin(paths.pluginDir, effective, project);
   const files: [string, Buffer][] = [
     [paths.composeYaml, Buffer.from(composeYaml(project))],
     [join(paths.runtimeDir, 'config.json'), json(effective)],
@@ -607,7 +610,7 @@ export interface PluginCheck {
 /** Renders the plugin from the installed package and compares it with <project dir>/plugin (read-only). */
 export async function checkPlugin(project: ProjectJson, effective: MinionsConfig): Promise<PluginCheck> {
   const dir = projectPaths(project.projectId).pluginDir;
-  const plugin = await renderPlugin(dir, effective);
+  const plugin = await renderPlugin(dir, effective, project);
   const differs: string[] = [], missing: string[] = [];
   for (const [path, data] of plugin) {
     const cur = await fileHash(path);
