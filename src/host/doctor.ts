@@ -13,7 +13,8 @@ import type { MinionsConfig } from '../config/schema.js';
 import { ciSetupPlan, fetchApi, requiredChecksStatus, type RequiredChecksReport } from '../runtime/ci.js';
 import { DEFAULT_CI_PENDING_TIMEOUT_MINUTES } from '../runtime/ci-gate.js';
 import { clearStaleSecrets, secretCopiesExist, githubCredentialStatus, readGithubToken, githubRepoFromRemote, telegramCredentialStatus, type CredentialStatus, type Fetch, type TelegramCredentialStatus } from './credentials.js';
-import { dockerProbe, type DockerProbe } from './discovery.js';
+import { dockerProbe, type DockerProbe, type DockerStatus } from './discovery.js';
+import { composeHint, daemonHint, linuxDockerChecks, linuxHostFacts, unknownLinuxFacts, type LinuxHostFacts } from './linux-host.js';
 import { Compose, buildFingerprint, imageBuildLabel, tmpSizeMiB, type Runner } from './docker.js';
 import { RESTART_COMMAND, checkRestartRequired, notApplicable, restartUnknown, type RestartRequired } from './restart-required.js';
 import { telegramDoctorCheck } from '../telegram/probe.js';
@@ -437,7 +438,13 @@ export function restartCheck(r: RestartRequired): Check {
   }
 }
 
-export async function runDoctor(opts: { cwd: string; runner?: Runner; probe?: DockerProbe; fetch?: Fetch; fingerprint?: string | null; version?: string }): Promise<DoctorReport> {
+export async function runDoctor(opts: {
+  cwd: string; runner?: Runner; probe?: DockerProbe; fetch?: Fetch; fingerprint?: string | null; version?: string;
+  /** Host platform (tests); defaults to process.platform. */
+  platform?: NodeJS.Platform;
+  /** Linux fact probe (tests); defaults to linuxHostFacts through the runner. */
+  linuxFacts?: (runner: Runner, docker: DockerStatus) => Promise<LinuxHostFacts>;
+}): Promise<DoctorReport> {
   const runner = opts.runner ?? run;
   const checks: Check[] = [];
   let restart: RestartRequired = restartUnknown('project not found');
@@ -459,10 +466,16 @@ export async function runDoctor(opts: { cwd: string; runner?: Runner; probe?: Do
     }
   } else {
     if (pre) add('runtime', 'ok', 'docker (hardened container)');
+    // Linux (Docker Engine, no Desktop): probed facts pick the exact fix; other platforms keep the Desktop hints.
+    const platform = opts.platform ?? process.platform;
+    const facts = platform === 'linux'
+      ? await (opts.linuxFacts ?? ((r, d) => linuxHostFacts(r, d)))(runner, docker).catch(() => unknownLinuxFacts())
+      : unknownLinuxFacts();
     add('docker.daemon', docker.daemon ? 'ok' : 'fail', docker.daemon ? `Docker ${docker.serverVersion}` : `not reachable${docker.error ? `: ${short(docker.error)}` : ''}`,
-      docker.daemon ? undefined : 'Start Docker Desktop.');
+      docker.daemon ? undefined : daemonHint(platform, docker, facts));
     add('docker.compose', docker.compose ? 'ok' : 'fail', docker.composeVersion ? `Compose ${docker.composeVersion}` : 'docker compose not found',
-      docker.compose ? undefined : 'Install Docker Compose v2 or newer (bundled with Docker Desktop).');
+      docker.compose ? undefined : composeHint(platform, docker, facts));
+    if (platform === 'linux' && docker.daemon) for (const c of linuxDockerChecks(facts)) checks.push(c);
   }
 
   let projectId: string | null = null;

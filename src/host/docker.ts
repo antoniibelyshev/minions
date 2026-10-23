@@ -217,7 +217,7 @@ export class Compose {
     return new Promise((resolve, reject) => {
       const child = spawn('docker', argv, { stdio: 'inherit', shell: false });
       child.on('error', (e: NodeJS.ErrnoException) => reject(e.code === 'ENOENT'
-        ? new MinionsError('DOCKER_UNAVAILABLE', 'docker CLI not found.', 'Install and start Docker Desktop.') : e));
+        ? new MinionsError('DOCKER_UNAVAILABLE', 'docker CLI not found.', process.platform === 'linux' ? 'Install and start Docker Engine (https://docs.docker.com/engine/install/).' : 'Install and start Docker Desktop.') : e));
       child.on('close', (code, signal) => resolve(code ?? (signal ? 128 : 1)));
     });
   }

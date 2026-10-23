@@ -66,8 +66,8 @@ Everything the model controls runs inside one Docker container per project. Your
 
 ## Requirements
 
-- macOS on Apple Silicon or Intel
-- Docker Desktop with Docker Compose v2, installed by you, for the default `docker` runtime. minions never falls back to running agents on the host by itself; the host runtime is an explicit, less safe opt-in ([Running without Docker](#running-without-docker)).
+- macOS on Apple Silicon or Intel, or Linux (preview: Docker Engine; implemented and unit-tested with fakes, not yet validated on a live distro, see [Linux hosts](docs/compatibility.md#linux-hosts-preview))
+- Docker Desktop (macOS) or Docker Engine (Linux) with Docker Compose v2, installed by you, for the default `docker` runtime. On Linux, `minions doctor` names the exact fix for socket permissions (docker group or rootless Docker), a missing Compose plugin, and SELinux labeling. minions never falls back to running agents on the host by itself; the host runtime is an explicit, less safe opt-in ([Running without Docker](#running-without-docker)).
 - Node.js 22.13 or later, for the host CLI
 - A Git repository. A remote is recommended; repositories without a usable remote are supported through explicit snapshot import.
 - A Claude account or API key. By default you log in to Claude inside the container; your host login is not reused. You can instead let the host provision an API key (see [Claude authorization](#claude-authorization)).
@@ -696,7 +696,7 @@ gets the host `central` binary, your `~/.claude`, the Keychain, or a way to run 
 
 **Credential handling:**
 
-- Long-lived secrets stay on the host, in macOS Keychain or in 0600 files outside the repository.
+- Long-lived secrets stay on the host, in macOS Keychain, the Linux Secret Service keyring (`secret-tool`, when a desktop session provides one), or in 0600 files outside the repository.
 - The Keychain items are created without a `-T` access list, so any process running as your user can read them (normal macOS behaviour; the Keychain protects against other users and offline access, not against your own processes). The plaintext GitHub/Telegram token copies mounted into the container (`secrets/` in the project directory) are removed by `minions down`/uninstall, when `minions start` fails, or when `minions doctor` finds them with no running container. The host-provisioned Claude key copy in the same directory stays until you switch back to `login` or uninstall (each `minions start` re-provisions it).
 - Configuration holds references only.
 - GitHub access in v0.1 is a per-project fine-grained personal access token that you create and store with `minions auth github`. The host materializes it into a read-only secret file for the container (Docker runtime; the host runtime has no container, so its `gh` and git shims read the stored token file on the host). It is long-lived and not refreshed, so keep its scope minimal and its expiry short (see [GitHub credential](docs/design/bootstrap.md#github-credential)). Host-refreshed GitHub App installation tokens are planned (deferred).

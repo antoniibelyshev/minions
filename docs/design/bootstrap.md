@@ -68,8 +68,10 @@ container"), and branch/pull-request delivery publishes with it; `minions sync` 
   failure stores it with a warning. `doctor` repeats the call and reports
   `github.credential: ok | missing | invalid | unverified`.
 - **Storage.** macOS Keychain (generic password, service `minions.github`, account = project id)
-  when `security` works; otherwise `<host data root>/credentials/<projectId>/github-token`
-  (0600 file, 0700 dirs). `MINIONS_CREDENTIAL_STORE=file|keychain` overrides. Storage is refused
+  when `security` works; on Linux the Secret Service keyring through libsecret's `secret-tool`
+  (attributes `service=minions.github`, `account=<project id>`; the token goes on stdin) when a
+  session bus and a Secret Service provider answer; otherwise `<host data root>/credentials/<projectId>/github-token`
+  (0600 file, 0700 dirs). `MINIONS_CREDENTIAL_STORE=file|keychain|secret-service` overrides. Storage is refused
   if the host data root is inside the repository. `security add-generic-password -w <secret>`
   would expose the token in argv, so the Keychain write goes through `security -i` with the
   command on stdin and is verified by reading it back.

@@ -26,7 +26,7 @@ import { readJsonIfExists, writeJson } from '../core/fsutil.js';
 import { projectPaths } from '../core/paths.js';
 import { ciSetupPlan, fetchApi, requiredChecksStatus, type RequiredChecksReport } from '../runtime/ci.js';
 import {
-  githubRepoFromRemote, githubTokenGuidance, loadCredentialRefs, provisionGithubToken, provisionTelegramToken, readGithubToken,
+  backendLabel, githubRepoFromRemote, githubTokenGuidance, loadCredentialRefs, provisionGithubToken, provisionTelegramToken, readGithubToken,
   removeGithubToken, telegramBotGuidance, type CredentialsJson, type Fetch,
 } from './credentials.js';
 import type { DockerProbe } from './discovery.js';
@@ -285,7 +285,7 @@ export async function runSetup(opts: SetupOptions): Promise<SetupResult> {
         const r = await provisionGithubToken({ projectId, token, repoPath: project.repoPath, remoteUrl: git.remoteUrl, runner: opts.runner, fetch: opts.fetch });
         hasToken = true;
         step({ id: 'github', status: action === 'change' ? 'changed' : 'done',
-          detail: `token stored in ${r.backend === 'keychain' ? 'the macOS Keychain' : 'a 0600 host file'}${r.verification ? ` (verification: ${r.verification.status})` : ''}`,
+          detail: `token stored in ${backendLabel(r.backend)}${r.verification ? ` (verification: ${r.verification.status})` : ''}`,
           ...(r.warnings.length ? { lines: r.warnings.map((w) => `warning: ${w}`) } : {}) });
       } catch (e) {
         step({ id: 'github', status: 'failed', detail: `${errMsg(e, 'could not store the token')}; nothing was stored`, later: LATER.github });
@@ -382,7 +382,7 @@ export async function runSetup(opts: SetupOptions): Promise<SetupResult> {
         const r = await provisionTelegramToken({ projectId, token, repoPath: project.repoPath, verify, runner: opts.runner, fetch: opts.fetch });
         channel = telegramChannel;
         step({ id: 'telegram', status: action === 'change' ? 'changed' : 'done',
-          detail: `bot ${r.botId} stored in ${r.backend === 'keychain' ? 'the macOS Keychain' : 'a 0600 host file'}; communication.channel ${channel}`,
+          detail: `bot ${r.botId} stored in ${backendLabel(r.backend)}; communication.channel ${channel}`,
           ...(r.warnings.length ? { lines: r.warnings.map((w) => `warning: ${w}`) } : {}) });
       } catch (e) {
         step({ id: 'telegram', status: 'failed', detail: `${errMsg(e, 'could not store the token')}; nothing was stored, the coordinator stays terminal-only`, later: LATER.telegram });

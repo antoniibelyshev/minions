@@ -12,7 +12,7 @@ import { registerAuth } from './auth-cli.js';
 import { authOf, isKeyAuth, refreshKey, startRefreshTimer } from './auth.js';
 import type { MinionsConfig } from '../config/schema.js';
 import {
-  clearSecrets, upClearingSecretsOnFailure, githubTokenGuidance, materializeSecrets, provisionGithubToken, provisionTelegramToken, removeGithubToken,
+  backendLabel, clearSecrets, upClearingSecretsOnFailure, githubTokenGuidance, materializeSecrets, provisionGithubToken, provisionTelegramToken, removeGithubToken,
   removeTelegramToken, telegramBotGuidance,
 } from './credentials.js';
 import { assertBotFree, startBotCheck } from './bot-guard.js';
@@ -595,7 +595,7 @@ export function register(program: Command): void {
       if (vis === 'mounted') { await materialize(json, project.projectId); mounted = true; }
       else if (vis === 'restart-required') needsRestart = true; // container predates the secrets mount: a copy would not reach it
       emit({ ...r, mountedPath: CONTAINER.githubTokenFile, visibleInRunningContainer: mounted, ...(needsRestart ? { restartRequired: true } : {}) }, { json, human: () => [
-        `Stored the GitHub token in ${r.backend === 'keychain' ? 'the macOS Keychain' : 'a 0600 host file'} (${r.ref}).`,
+        `Stored the GitHub token in ${backendLabel(r.backend)} (${r.ref}).`,
         r.verification ? `Verification: ${r.verification.status} — ${r.verification.detail}` : 'Verification skipped (--no-verify).',
         ...r.warnings.map((w) => `warning: ${w}`),
         mounted ? `Updated ${CONTAINER.githubTokenFile} in the running container.`
@@ -656,7 +656,7 @@ export function register(program: Command): void {
       const resolved = eff ? await hostChannel(project, eff.config) : null;
       emit({ ...r, mountedPath: CONTAINER.telegramTokenFile, appliedToRunningContainer: applied, ...(needsRestart ? { restartRequired: true } : {}),
         channel: { configured: resolved?.configured ?? channel.configured, effective: resolved?.effective ?? 'terminal', reason: resolved?.reason ?? null, switchedToAuto: channel.switched, hint: channel.hint } }, { json, human: () => [
-        `Stored the Telegram bot token for bot ${r.botId} in ${r.backend === 'keychain' ? 'the macOS Keychain' : 'a 0600 host file'} (${r.ref}).`,
+        `Stored the Telegram bot token for bot ${r.botId} in ${backendLabel(r.backend)} (${r.ref}).`,
         r.verification ? `Verification: ${r.verification.status} — ${r.verification.detail}` : 'Not checked with Telegram (pass --verify to call getMe).',
         ...r.warnings.map((w) => `warning: ${w}`),
         applied ? 'Applied to the running container (controlled coordinator restart when needed).'
