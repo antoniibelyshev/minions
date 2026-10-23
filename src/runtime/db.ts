@@ -126,6 +126,22 @@ export interface CoordinatorLock { pid: number; session: string; acquiredAt: str
 
 /** A durable drain request (`minions pause --starts --drain`): workers wind down to a checkpoint and return partial. */
 export interface DrainRequest { reason: string; requestedAt: string; eventId: number }
+/**
+ * How the drain hook tied a delivered notice to a lease: `only` (the single active lease of the role),
+ * `transcript` (the lease marker in the subagent's own transcript), `role` (fallback: every active lease
+ * of the role, when neither identifies it).
+ */
+export type DrainNoticeVia = 'only' | 'transcript' | 'role';
+/** A `drain-notice` event: the drain hook delivered the notice of drain `eventId` to a worker under `leaseId`. */
+export interface DrainNotice { id: number; at: string; taskId: string | null; leaseId: string; eventId: number; agentId: string; agentType: string; tool: string; via: DrainNoticeVia }
+type EventRow = { id: number; at: string; task_id: string | null; data_json: string | null };
+const drainNoticeOf = (r: EventRow): DrainNotice[] => {
+  let d: Record<string, unknown> | null = null;
+  try { d = r.data_json ? JSON.parse(r.data_json) as Record<string, unknown> : null; } catch { /* not a notice payload */ }
+  if (!d || typeof d.leaseId !== 'string' || typeof d.eventId !== 'number') return [];
+  const via = d.via === 'only' || d.via === 'transcript' ? d.via : 'role';
+  return [{ id: r.id, at: r.at, taskId: r.task_id, leaseId: d.leaseId, eventId: d.eventId, agentId: String(d.agentId ?? ''), agentType: String(d.agentType ?? ''), tool: String(d.tool ?? ''), via }];
+};
 
 export class RuntimeDb {
   readonly path: string;
@@ -250,9 +266,30 @@ export class RuntimeDb {
       return cur;
     });
   }
-  /** Whether a drain was requested at or after `since` (ISO time), including one cleared since. */
-  drainRequestedSince(since: string): boolean {
-    return !!this.get<{ id: number }>("SELECT id FROM events WHERE kind = 'drain-request' AND at >= ? LIMIT 1", since);
+  /**
+   * Records that the drain hook delivered the notice of the active drain `eventId` to a worker under
+   * `lease` (task-3.10). The hook writes it only on an agent's first call of a drain, never per call.
+   */
+  recordDrainNotice(lease: { id: string; task_id: string }, n: { eventId: number; agentId: string; agentType: string; tool: string; via: DrainNoticeVia }): number {
+    return this.addEvent('drain-notice', lease.task_id, { leaseId: lease.id, eventId: n.eventId, agentId: n.agentId, agentType: n.agentType, tool: n.tool, via: n.via });
+  }
+  /**
+   * Whether this lease received the notice of a drain that was active when it was delivered: a
+   * `drain-notice` event for the lease naming a recorded `drain-request`. A drain the lease merely
+   * spanned (requested and cleared between two of its tool calls) never reached it and does not count.
+   */
+  drainNoticeReceived(lease: { id: string; task_id: string }): boolean {
+    return this.drainNotices(lease.task_id).some((n) => n.leaseId === lease.id &&
+      !!this.get<{ id: number }>("SELECT id FROM events WHERE id = ? AND kind = 'drain-request'", n.eventId));
+  }
+  /** The `drain-notice` events of a task, oldest first. */
+  drainNotices(taskId: string): DrainNotice[] {
+    return this.all<EventRow>("SELECT id, at, task_id, data_json FROM events WHERE kind = 'drain-notice' AND task_id = ? ORDER BY id", taskId).flatMap(drainNoticeOf);
+  }
+  /** The most recent delivered drain notice of any lease (`minions status`: shows the hook fired in a subagent). */
+  lastDrainNotice(): DrainNotice | null {
+    const r = this.get<EventRow>("SELECT id, at, task_id, data_json FROM events WHERE kind = 'drain-notice' ORDER BY id DESC LIMIT 1");
+    return r ? drainNoticeOf(r)[0] ?? null : null;
   }
   /** Counts one drain-hook hit for a worker (per drain request); returns the new count. */
   drainHit(eventId: number, worker: string): number {

@@ -4,7 +4,7 @@ import { execFileSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { beforeAll, describe, expect, it } from 'vitest';
-import { collectStatus, pauseControl } from '../../src/runtime/commands.js';
+import { collectStatus, humanStatus, pauseControl } from '../../src/runtime/commands.js';
 import { clearDrain, DRAIN_HOOK_COMMAND, requestDrain } from '../../src/runtime/drain.js';
 import { DRAIN_GRACE_CALLS, drainHook, drainSafeBash, runHook } from '../../src/runtime/hooks.js';
 import { MinionsError } from '../../src/core/errors.js';
@@ -533,6 +533,7 @@ describe('drain partials (record + re-dispatch)', () => {
     env.backlog.add({ id: 'task-1' });
     const b = await env.sched.claim('task-1', 'engineer');
     requestDrain(env.db, flagOf(env), 'upgrade');
+    await drainHook(worker('minions:engineer', 'Bash'), () => ({ db: env.db }));
     const wip = commitFile(b.worktree, 'a.txt', 'half', 'wip: half of the feature');
     // Recorded after the upgrade already cleared the drain (recovery): still a drain partial.
     pauseControl(env.db, flagOf(env), 'resume', { starts: true });
@@ -555,6 +556,7 @@ describe('drain partials (record + re-dispatch)', () => {
     await env.sched.record(e.leaseId, result({ branch: e.branch, headSha: head }));
     const rv = await env.sched.claim('task-1', 'reviewer');
     requestDrain(env.db, flagOf(env), 'upgrade');
+    await drainHook(worker('minions:reviewer', 'Read'), () => ({ db: env.db }));
     const r = await env.sched.record(rv.leaseId, result({ status: 'partial', branch: rv.branch, headSha: head, checks: [], findings: ['src/ not reviewed yet'] }));
     expect(r).toMatchObject({ drain: true, to: 'reviewing' });
     clearDrain(env.db, flagOf(env), 'test');
@@ -573,5 +575,182 @@ describe('drain partials (record + re-dispatch)', () => {
     expect(r.drain).toBeUndefined();
     expect(r.message).toBe('Partial result recorded; status unchanged.');
     expect((await env.sched.claim('task-1', 'engineer')).resume).toBeUndefined();
+  });
+});
+
+// task-3.10: a partial is a drain partial only when the hook delivered that lease the notice of an active drain.
+describe('drain partials are tied to the delivered notice', () => {
+  const load = (env: Env) => () => ({ db: env.db });
+
+  it('a lease that spans a drain cleared before its next tool call is an ordinary partial', async () => {
+    const env = makeEnv();
+    env.backlog.add({ id: 'task-1' });
+    const b = await env.sched.claim('task-1', 'engineer');
+    requestDrain(env.db, flagOf(env), 'upgrade');
+    clearDrain(env.db, flagOf(env), 'test');
+    env.db.setPaused({ starts: false });
+    // The worker's next tool call sees no drain: nothing is delivered or recorded.
+    expect((await drainHook(worker('minions:engineer', 'Edit'), load(env))).reason).toMatch(/no drain requested/);
+    expect(env.db.drainNotices('task-1')).toEqual([]);
+    const head = commitFile(b.worktree, 'a.txt', 'half');
+    const r = await env.sched.record(b.leaseId, result({ status: 'partial', branch: b.branch, headSha: head }));
+    expect(r.drain).toBeUndefined();
+    expect(r.message).toBe('Partial result recorded; status unchanged.');
+  });
+
+  it('a lease started after a cleared drain is an ordinary partial (the notice of an earlier lease does not carry over)', async () => {
+    const env = makeEnv();
+    env.backlog.add({ id: 'task-1' });
+    const b0 = await env.sched.claim('task-1', 'engineer');
+    requestDrain(env.db, flagOf(env), 'upgrade');
+    await drainHook(worker('minions:engineer', 'Edit', {}, 'agent-old'), load(env));
+    // The earlier lease got the notice; the next lease (after the clear) never did.
+    expect(env.db.drainNoticeReceived({ id: b0.leaseId, task_id: 'task-1' })).toBe(true);
+    await env.sched.record(b0.leaseId, result({ status: 'partial', branch: b0.branch, headSha: commitFile(b0.worktree, 'a.txt', 'wip', 'wip: a') }));
+    pauseControl(env.db, flagOf(env), 'resume', { starts: true });
+    const b = await env.sched.claim('task-1', 'engineer');
+    const head = commitFile(b.worktree, 'b.txt', 'half');
+    const r = await env.sched.record(b.leaseId, result({ status: 'partial', branch: b.branch, headSha: head }));
+    expect(r.drain).toBeUndefined();
+  });
+
+  it('the notice is recorded once per agent and drain, with agent_id/agent_type, and shown by status', async () => {
+    const env = makeEnv();
+    env.backlog.add({ id: 'task-1' });
+    const b = await env.sched.claim('task-1', 'engineer');
+    const status = () => collectStatus({ db: env.db, config: env.config, backlog: async () => env.backlog });
+    expect((await status()).lastDrainNotice).toBeNull();
+    const { eventId } = requestDrain(env.db, flagOf(env), 'upgrade').drain;
+    const first = await drainHook(worker('minions:engineer-deep', 'Edit', {}, 'agent-x'), load(env));
+    expect(first.reason).toMatch(new RegExp(`drain notice to minions:engineer-deep agent-x \\(lease ${b.leaseId} via only\\)`));
+    for (let i = 0; i < 3; i++) await drainHook(worker('minions:engineer-deep', 'Read', {}, 'agent-x'), load(env));
+    expect(env.db.drainNotices('task-1')).toEqual([expect.objectContaining({ leaseId: b.leaseId, eventId, agentId: 'agent-x', agentType: 'minions:engineer-deep', tool: 'Edit', via: 'only' })]);
+    expect((await status()).lastDrainNotice).toMatchObject({ leaseId: b.leaseId, taskId: 'task-1', agentId: 'agent-x', agentType: 'minions:engineer-deep' });
+  });
+
+  it('with several leases of the role, the subagent transcript marker picks the lease; otherwise all of them (role fallback)', async () => {
+    const env = makeEnv();
+    env.backlog.add({ id: 'task-1' });
+    env.backlog.add({ id: 'task-2' });
+    const a = await env.sched.claim('task-1', 'engineer');
+    const b = await env.sched.claim('task-2', 'engineer');
+    const dir = tmp('minions-drain-transcript-');
+    const main = join(dir, 'sess-1.jsonl');
+    writeFileSync(main, '{}\n');
+    mkdirSync(join(dir, 'sess-1', 'subagents'), { recursive: true });
+    writeFileSync(join(dir, 'sess-1', 'subagents', 'agent-b1.jsonl'), JSON.stringify({ message: { content: `brief ... minions-lease: ${b.leaseId}` } }) + '\n');
+    requestDrain(env.db, flagOf(env), 'upgrade');
+    const r = await drainHook({ ...worker('minions:engineer', 'Edit', {}, 'b1'), transcript_path: main }, load(env));
+    expect(r.reason).toMatch(new RegExp(`lease ${b.leaseId} via transcript`));
+    expect(env.db.drainNoticeReceived({ id: b.leaseId, task_id: 'task-2' })).toBe(true);
+    expect(env.db.drainNoticeReceived({ id: a.leaseId, task_id: 'task-1' })).toBe(false);
+    // No transcript: both engineer leases are marked (conservative).
+    const r2 = await drainHook(worker('minions:engineer', 'Edit', {}, 'a1'), load(env));
+    expect(r2.reason).toMatch(/via role/);
+    expect(env.db.drainNoticeReceived({ id: a.leaseId, task_id: 'task-1' })).toBe(true);
+  });
+
+  it('a notice naming no recorded drain request does not count', async () => {
+    const env = makeEnv();
+    env.backlog.add({ id: 'task-1' });
+    const b = await env.sched.claim('task-1', 'engineer');
+    const lease = { id: b.leaseId, task_id: 'task-1' };
+    env.db.recordDrainNotice(lease, { eventId: 999_999, agentId: 'a', agentType: 'minions:engineer', tool: 'Edit', via: 'only' });
+    expect(env.db.drainNoticeReceived(lease)).toBe(false);
+  });
+
+  it('a failure to record the notice still delivers it (the hook stays on the hot path)', async () => {
+    const env = makeEnv();
+    env.backlog.add({ id: 'task-1' });
+    await env.sched.claim('task-1', 'engineer');
+    requestDrain(env.db, flagOf(env), 'upgrade');
+    env.db.recordDrainNotice = () => { throw new Error('disk full'); };
+    const r = await drainHook(worker('minions:engineer', 'Edit'), load(env));
+    expect(out(r).hookSpecificOutput.additionalContext).toMatch(/Upgrade pending/);
+    expect(r.reason).toMatch(/notice not recorded: disk full/);
+  });
+});
+
+// task-3.10 (tester): robustness and rendering edges of the drain notice.
+describe('drain notice edges', () => {
+  const load = (env: Env) => () => ({ db: env.db });
+  const twoLeases = async (env: Env) => {
+    env.backlog.add({ id: 'task-1' });
+    env.backlog.add({ id: 'task-2' });
+    const a = await env.sched.claim('task-1', 'engineer');
+    const b = await env.sched.claim('task-2', 'engineer');
+    return { a, b };
+  };
+
+  it('writes nothing without a drain, without a role lease, or for the coordinator', async () => {
+    const env = makeEnv();
+    env.backlog.add({ id: 'task-1' });
+    await env.sched.claim('task-1', 'engineer');
+    await drainHook(worker('minions:engineer', 'Edit'), load(env));
+    expect(env.db.lastDrainNotice()).toBeNull();
+    requestDrain(env.db, flagOf(env), 'upgrade');
+    // Coordinator: no agent_id/agent_type.
+    await drainHook({ hook_event_name: 'PreToolUse', tool_name: 'Edit', tool_input: {}, cwd: '/workspace/repo' }, load(env));
+    // Worker of a role with no active lease.
+    await drainHook(worker('minions:reviewer', 'Read'), load(env));
+    // Non-minions subagent.
+    await drainHook(worker('general-purpose', 'Edit'), load(env));
+    expect(env.db.lastDrainNotice()).toBeNull();
+  });
+
+  it('tolerates a missing or garbled transcript (falls back to the role) and a marker past 256 KB is not read', async () => {
+    const env = makeEnv();
+    const { b } = await twoLeases(env);
+    const dir = tmp('minions-drain-transcript-edge-');
+    const main = join(dir, 's.jsonl');
+    writeFileSync(main, '{}\n');
+    requestDrain(env.db, flagOf(env), 'upgrade');
+    // Missing subagent transcript.
+    const missing = await drainHook({ ...worker('minions:engineer', 'Edit', {}, 'm1'), transcript_path: main }, load(env));
+    expect(missing.reason).toMatch(/via role/);
+    // Garbled (binary) transcript.
+    mkdirSync(join(dir, 's', 'subagents'), { recursive: true });
+    writeFileSync(join(dir, 's', 'subagents', 'agent-g1.jsonl'), Buffer.from([0xff, 0xfe, 0x00, 0x80, 0x01]));
+    const garbled = await drainHook({ ...worker('minions:engineer', 'Edit', {}, 'g1'), transcript_path: main }, load(env));
+    expect(garbled.reason).toMatch(/via role/);
+    // Marker beyond the bounded head is ignored.
+    writeFileSync(join(dir, 's', 'subagents', 'agent-big.jsonl'), 'x'.repeat(256 * 1024 + 10) + ` minions-lease: ${b.leaseId}`);
+    const big = await drainHook({ ...worker('minions:engineer', 'Edit', {}, 'big'), transcript_path: main }, load(env));
+    expect(big.reason).toMatch(/via role/);
+    // A path-traversing agent id never builds a transcript path.
+    const evil = await drainHook({ ...worker('minions:engineer', 'Edit', {}, '../x'), transcript_path: main }, load(env));
+    expect(evil.reason).toMatch(/via role/);
+  });
+
+  it('renders status text and JSON with and without a notice', async () => {
+    const env = makeEnv();
+    env.backlog.add({ id: 'task-1' });
+    const b = await env.sched.claim('task-1', 'engineer');
+    const status = () => collectStatus({ db: env.db, config: env.config, backlog: async () => env.backlog });
+    const none = await status();
+    expect(humanStatus(none)).not.toMatch(/last drain notice/);
+    expect(JSON.parse(JSON.stringify(none)).lastDrainNotice).toBeNull();
+    requestDrain(env.db, flagOf(env), 'upgrade');
+    await drainHook(worker('minions:engineer', 'Edit', {}, 'agent-z'), load(env));
+    const s = await status();
+    expect(humanStatus(s)).toMatch(new RegExp(`last drain notice: .* to minions:engineer agent-z \\(lease ${b.leaseId}, task-1, drain event \\d+, via only\\)`));
+    expect(JSON.parse(JSON.stringify(s)).lastDrainNotice).toMatchObject({ agentId: 'agent-z', via: 'only', leaseId: b.leaseId });
+  });
+
+  it('a second drain notifies again, and the older notice does not mark a lease of a cleared later drain', async () => {
+    const env = makeEnv();
+    env.backlog.add({ id: 'task-1' });
+    const b = await env.sched.claim('task-1', 'engineer');
+    requestDrain(env.db, flagOf(env), 'one');
+    await drainHook(worker('minions:engineer', 'Edit'), load(env));
+    clearDrain(env.db, flagOf(env), 'test');
+    requestDrain(env.db, flagOf(env), 'two');
+    await drainHook(worker('minions:engineer', 'Edit'), load(env));
+    const ns = env.db.drainNotices('task-1');
+    expect(ns).toHaveLength(2);
+    expect(ns[0]!.eventId).not.toBe(ns[1]!.eventId);
+    expect(env.db.drainNoticeReceived({ id: b.leaseId, task_id: 'task-1' })).toBe(true);
+    // A different lease id on the same task has no notice.
+    expect(env.db.drainNoticeReceived({ id: 'lease-other', task_id: 'task-1' })).toBe(false);
   });
 });
