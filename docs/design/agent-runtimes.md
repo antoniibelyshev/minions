@@ -544,6 +544,19 @@ validation refuses `fake` otherwise.
 It sends no model request and needs no key. An optional, separate `--live` mode later could send one tiny prompt
 with the key. Implementing the probe is child task 2, not part of this design task.
 
+Implemented in task-14.3:
+
+- The helper is `docker/minions-sandbox/minions-sandbox.c`, built statically in the `sandbox` stage of
+  `docker/Dockerfile`.
+- The rules JSON contract and per-role generation are in `src/runtime/sandbox/rules.ts`. Generation refuses any
+  rule that would open or contain a protected path. The helper refuses unknown keys.
+- The self-test is `minions-sandbox --self-test <rules>`. It prints one tab-separated `check` line per canary and a
+  `result` line. `src/runtime/sandbox/selftest.ts` parses this strictly: a missing canary, an error or a skip
+  outside x32/compat on non-x86_64 is a failure, whatever the helper says.
+- The probe runs in the container as `minions work probe --json` (internal). `status --check` / `doctor` show
+  `harness.<id>` (and `harness.network` warnings) only when a process harness is configured.
+- The helper's supervisor kills what the harness leaves behind as soon as the harness exits, not only on SIGTERM.
+
 ### D8. Config shape, schema impact, CLI surface
 
 ```jsonc

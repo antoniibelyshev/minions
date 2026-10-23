@@ -38,7 +38,8 @@ describe('idle restart is portable (no setsid)', () => {
       for (const e of readdirSync(d, { withFileTypes: true })) {
         const p = join(d, e.name);
         if (e.isDirectory()) scan(p);
-        else if (e.isFile() && /\bsetsid\b/.test(readFileSync(p, 'utf8'))) hits.push(p);
+        // C sources (docker/minions-sandbox) call the setsid(2) syscall inside the Linux container; not the command.
+        else if (e.isFile() && !p.endsWith('.c') && /\bsetsid\b/.test(readFileSync(p, 'utf8'))) hits.push(p);
       }
     };
     for (const d of ['templates', 'scripts', 'docker']) scan(join(ROOT, d));

@@ -285,7 +285,7 @@ export async function imageBuildLabel(tag: string, runner: Runner = run): Promis
 
 /** Fingerprint of what goes into the image from the package (null when dist/ is not built). */
 export function buildFingerprint(root: string = packageRoot()): string | null {
-  const files = [join('dist', 'cli.js'), join('docker', 'Dockerfile'), join('docker', 'gh-wrapper.sh'), 'package.json'];
+  const files = [join('dist', 'cli.js'), join('docker', 'Dockerfile'), join('docker', 'gh-wrapper.sh'), join('docker', 'minions-sandbox', 'minions-sandbox.c'), 'package.json'];
   if (!existsSync(join(root, files[0]!))) return null;
   const h = createHash('sha256');
   for (const f of files) h.update(f).update('\0').update(existsSync(join(root, f)) ? readFileSync(join(root, f)) : '').update('\0');

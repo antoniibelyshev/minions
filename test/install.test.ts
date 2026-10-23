@@ -24,7 +24,7 @@ const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')) as {
 const cleanEnv = () => Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^npm_/i.test(k)));
 
 /** Files the CLI and the runtime image build read from the installed package root. */
-const RUNTIME_ASSETS = ['package.json', 'docker/Dockerfile', 'docker/gh-wrapper.sh', 'schema/config.schema.json', 'templates/plugin'];
+const RUNTIME_ASSETS = ['package.json', 'docker/Dockerfile', 'docker/gh-wrapper.sh', 'docker/minions-sandbox/minions-sandbox.c', 'schema/config.schema.json', 'templates/plugin'];
 
 describe('package.json for git-URL installs', () => {
   it('builds on install through the prepare hook', () => {
