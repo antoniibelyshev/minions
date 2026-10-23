@@ -37,7 +37,12 @@ export interface TransferTarget {
   exec(args: string[], opts?: RunOptions): Promise<RunResult>;
   putFile(local: string, remote: string): Promise<void>;
   getFile(remote: string, local: string): Promise<void>;
+  /** Best-effort removal of a runtime transfer file (a state archive copy once it was fetched or restored). */
+  removeFile?(remote: string): Promise<void>;
 }
+
+/** Removes a transfer copy in the runtime; a failure leaves only a stale file, never fails the command. */
+const discard = async (target: TransferTarget, remote: string) => { await target.removeFile?.(remote).catch(() => undefined); };
 
 export function composeTarget(compose: Compose): TransferTarget {
   return {
@@ -45,10 +50,11 @@ export function composeTarget(compose: Compose): TransferTarget {
     exec: (args, opts) => compose.exec(args, opts),
     putFile: (local, remote) => compose.cp(local, `${SERVICE_NAME}:${remote}`),
     getFile: (remote, local) => compose.cp(`${SERVICE_NAME}:${remote}`, local),
+    removeFile: async (remote) => { await compose.exec(['rm', '-f', '--', remote], { allowFailure: true, timeoutMs: 30_000 }); },
   };
 }
 
-interface Envelope<T> { ok: boolean; data?: T; error?: { code: string; message: string; hint?: string } }
+interface Envelope<T> { ok: boolean; data?: T; error?: { code: string; message: string; hint?: string; details?: unknown } }
 /** Data of the last `{ok,data}` JSON line printed by a container-side `minions … --json` command. */
 export function parseEnvelope<T>(stdout: string, what: string): T {
   const line = stdout.trim().split('\n').filter(Boolean).at(-1) ?? '';
@@ -164,6 +170,12 @@ export async function exportState(project: ProjectJson, opts: { out?: string; ru
   const local = opts.out ? resolvePath(opts.out) : join(projectPaths(project.projectId).exportsDir, file);
   if (await lstat(local).catch(() => null)) throw new MinionsError('CONFLICT', `${local} already exists; refusing to overwrite it.`, 'Choose another file name or remove it.');
   const remote = `${target.dirs.exports}/${file}`;
+  try {
+    return await fetchStateBackup(target, remote, local);
+  } finally { await discard(target, remote); }
+}
+
+async function fetchStateBackup(target: TransferTarget, remote: string, local: string): Promise<StateExportHostResult> {
   const r = await target.exec(['minions', 'workspace', 'state-export', remote, '--json'], { allowFailure: true, timeoutMs: 600_000 });
   const data = parseEnvelope<StateExportResult>(r.stdout, 'workspace state-export');
   await ensureDir(dirname(local));
@@ -205,14 +217,17 @@ export async function importState(project: ProjectJson, file: string, opts: { fo
   const target = opts.target ?? composeTarget(opts.compose ?? new Compose(project.projectId, runner));
   const name = `import-${stateBackupName(opts.now)}`;
   const remote = `${target.dirs.import}/${name}`;
-  await target.putFile(archive, remote);
-  const r = await target.exec(['minions', 'workspace', 'state-import', remote, ...(opts.force ? ['--force'] : []), '--json'], { allowFailure: true, timeoutMs: 600_000 });
   let data: StateImportResult;
-  try { data = parseEnvelope<StateImportResult>(r.stdout, 'workspace state-import'); } catch (e) {
-    // Keep the runtime's own error code (CONFLICT while in use, PRECONDITION for an invalid archive).
-    const d = (e as MinionsError).details as { code?: string; message?: string; hint?: string } | undefined;
-    if (e instanceof MinionsError && d?.code && d.message) throw new MinionsError(d.code as MinionsError['code'], d.message, d.hint, d);
+  try {
+    await target.putFile(archive, remote);
+    const r = await target.exec(['minions', 'workspace', 'state-import', remote, ...(opts.force ? ['--force'] : []), '--json'], { allowFailure: true, timeoutMs: 600_000 });
+    data = parseEnvelope<StateImportResult>(r.stdout, 'workspace state-import');
+  } catch (e) {
+    // Keep the runtime's own error code (CONFLICT while in use, PRECONDITION for an invalid archive)
+    // and its own details (not the whole error envelope nested under details).
+    const d = (e as MinionsError).details as { code?: string; message?: string; hint?: string; details?: unknown } | undefined;
+    if (e instanceof MinionsError && d?.code && d.message) throw new MinionsError(d.code as MinionsError['code'], d.message, d.hint, d.details);
     throw e;
-  }
+  } finally { await discard(target, remote); }
   return { archive, createdAt: manifest.createdAt, schemaVersion: manifest.schemaVersion, files: manifest.files.length, container: data };
 }

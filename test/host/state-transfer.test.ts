@@ -1,5 +1,5 @@
 import { copyFile } from 'node:fs/promises';
-import { existsSync, mkdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { projectPaths } from '../../src/core/paths.js';
@@ -40,11 +40,12 @@ function fakeRuntime(root: string): TransferTarget & { puts: string[]; execs: st
         return { code: 0, stderr: '', stdout: JSON.stringify({ ok: true, data }) };
       } catch (e) {
         const m = e as MinionsError;
-        return { code: 1, stderr: '', stdout: JSON.stringify({ ok: false, error: { code: m.code, message: m.message, hint: m.hint } }) };
+        return { code: 1, stderr: '', stdout: JSON.stringify({ ok: false, error: { code: m.code, message: m.message, hint: m.hint, ...(m.details !== undefined ? { details: m.details } : {}) } }) };
       }
     },
     async putFile(local, remote) { puts.push(remote); await copyFile(local, remote); },
     async getFile(remote, local) { await copyFile(remote, local); },
+    async removeFile(remote) { rmSync(remote, { force: true }); },
   };
 }
 
@@ -162,11 +163,18 @@ describe('minions export --state / import --state (host side)', () => {
     const d = openDb(rtPaths(dstRoot).db);
     d.exec(`INSERT INTO leases (id, task_id, role, attempt, config_revision, started_at, status) VALUES ('busy', 'task-9', 'engineer', 1, 3, 'now', 'active')`);
     d.close();
-    await expect(importState(project, archive, { target: dst })).rejects.toMatchObject({ code: 'CONFLICT' });
+    const err = await importState(project, archive, { target: dst }).then(() => null, (e: unknown) => e as MinionsError);
+    expect(err).toMatchObject({ code: 'CONFLICT' });
+    // The runtime's own details, not the whole error envelope nested under details.
+    expect(err!.details).toEqual({ activeLeases: ['busy'], coordinatorPid: null });
+    expect(err!.hint).toMatch(/minions settings restart/);
     const r = await importState(project, archive, { target: dst, force: true });
     expect(dst.execs.at(-1)).toContain('--force');
     expect(r.container.forced).toBe(true);
     expect(existsSync(join(rtPaths(dstRoot).notes, 'n.md'))).toBe(true);
+    // Archive copies do not pile up in the runtime transfer dirs (success or refusal).
+    expect(readdirSync(dst.dirs.import)).toEqual([]);
+    expect(readdirSync(src.dirs.exports)).toEqual([]);
   });
 });
 

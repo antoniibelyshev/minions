@@ -242,6 +242,7 @@ export class HostRuntime {
       exec: async (args: string[], opts?: RunOptions) => { await dirs(hp.exports); return this.exec(args, opts); },
       putFile: async (local: string, remote: string) => { await dirs(hp.import); await rm(remote, { force: true }); await copyRegularFileNoFollow(local, remote); },
       getFile: async (remote: string, local: string) => { await copyRegularFileNoFollow(remote, local); },
+      removeFile: async (remote: string) => { await rm(remote, { force: true }); },
     };
   }
 }

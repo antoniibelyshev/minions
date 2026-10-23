@@ -40,9 +40,16 @@ minions import --state ~/backups/proj.tar.gz
 The archive is validated on the host and again in the runtime (manifest, checksums, allowed paths,
 regular files only, DB integrity and schema) before anything changes. The restore is refused
 (`CONFLICT`) while a worker lease is active or a live coordinator holds the project lock: let the
-workers finish or cancel them (`minions work cancel --all`), or pass `--force` and then run
-`minions settings restart` so the coordinator reloads the restored state. The replaced state is moved
-to `<state>/pre-restore/<time>/` inside the runtime, never deleted.
+workers finish or cancel them (`minions work cancel --all`), then rerun; or pass `--force`.
+
+Leases the backup has marked active are released by the restore (no worker holds them in this
+runtime), and their tasks go back to the queue; worktrees and branches are kept. After `--force`,
+workers that were still running lose their lease (their submit is refused), and the running
+coordinator keeps the project lock (its lock row is carried into the restored DB, so no second
+coordinator can start). Then run `minions settings restart`: it restarts the coordinator with the
+recovery prompt (`/minions:recover`), which re-dispatches the released tasks. The replaced state is
+moved to `<state>/pre-restore/<time>/` inside the runtime; the newest three copies are kept, older ones
+are removed. The archive copies in the runtime import and export dirs are removed after use.
 
 ## Docker is not running
 

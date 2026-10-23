@@ -6,8 +6,13 @@ import { describe, expect, it } from 'vitest';
 import { openDb, SCHEMA_VERSION, type RuntimeDb } from '../../src/runtime/db.js';
 import { runtimePaths } from '../../src/runtime/paths.js';
 import {
-  createStateBackup, parseStateBackup, readTar, restoreStateBackup, writeTar, type StateManifest, type TarEntry,
+  createStateBackup, MINIONS_SECRET_FILE_NAMES, parseStateBackup, PRE_RESTORE_KEEP, readTar, releaseRestoredLeases, restoreStateBackup, RESTORE_RELEASE_REASON, writeTar,
+  type StateManifest, type TarEntry,
 } from '../../src/runtime/state-backup.js';
+import { projectPaths } from '../../src/core/paths.js';
+import { APPROVAL_SIGNING_KEY_NAME } from '../../src/host/approvals.js';
+import { GITHUB_CREDENTIAL, TELEGRAM_CREDENTIAL } from '../../src/host/credentials.js';
+import { basename } from 'node:path';
 import { tmp } from './fixtures.js';
 
 const SECRET = 'ghp_TESTSECRETVALUE0123456789';
@@ -111,7 +116,9 @@ describe('state backup', () => {
     expect(readFileSync(dst.p.coordinatorHandoff, 'utf8')).toBe('{"text":"handoff"}\n');
     const after = rows(dst.p.db);
     expect(after.leases).toEqual(before.leases);
-    expect(after.events).toEqual(before.events);
+    // The restore appends one audit event; every backed-up event is unchanged.
+    expect(after.events.slice(0, -1)).toEqual(before.events);
+    expect(after.events.at(-1)).toMatchObject({ kind: 'state-restore' });
     expect(after.controls).toEqual(before.controls);
     expect(after.meta).toEqual(before.meta);
     expect(after.lock).toBeNull(); // the source runtime's lock row is cleared
@@ -254,5 +261,100 @@ describe('state backup validation', () => {
     const es = await entries();
     await expectUntouched(write(withManifest(es, (m) => { m.version = 2; })), 'INCOMPATIBLE_RUNTIME');
     await expectUntouched(write(withManifest(es, (m) => { m.schemaVersion = SCHEMA_VERSION + 1; })), 'INCOMPATIBLE_RUNTIME');
+  });
+});
+
+describe('state backup: minions secret file names (task-20.1)', () => {
+  it('lists the real secret file names of the host and the runtime', () => {
+    const pp = projectPaths('3f2b8c1e-7d4a-4e9b-9c2f-1a2b3c4d5e6f');
+    const rp = runtimePaths();
+    const real = [pp.apiKeyFile, pp.githubTokenFile, pp.telegramTokenFile, rp.apiKeyFile, rp.githubTokenFile, rp.telegramTokenFile].map((f) => basename(f));
+    for (const n of [...real, GITHUB_CREDENTIAL.fileName, TELEGRAM_CREDENTIAL.fileName, APPROVAL_SIGNING_KEY_NAME]) expect(MINIONS_SECRET_FILE_NAMES).toContain(n);
+    expect([...MINIONS_SECRET_FILE_NAMES].sort()).toEqual(['anthropic-api-key', 'approval-signing-key', 'github-token', 'telegram-bot-token']);
+  });
+
+  it('never archives a copy of a minions secret file inside an archived dir', async () => {
+    const src = seed();
+    const names = ['notes/telegram-bot-token', 'briefs/sub/github-token', 'results/anthropic-api-key', 'backlog/approval-signing-key'];
+    for (const n of names) put(join(src.p.state, n), 'not-a-mounted-value\n');
+    put(join(src.p.notes, 'github-token-rotation.md'), 'a note about rotating the token\n'); // a similar name is still archived
+    const file = join(tmp('minions-state-out-'), 'state.tar.gz');
+    const r = await createStateBackup(src.p, file);
+    src.db.close();
+    for (const n of names) expect(r.skipped).toContainEqual({ path: n, reason: 'secret-like name' });
+    const paths = readTar(gunzipSync(readFileSync(file))).map((e) => e.path);
+    for (const n of names) expect(paths).not.toContain(n);
+    expect(paths).toContain('notes/github-token-rotation.md');
+  });
+});
+
+describe('state restore: coordinator lock, restored leases, pre-restore pruning (task-20.1)', () => {
+  it('a forced restore over a live coordinator carries its lock row into the restored DB', async () => {
+    const { src, file } = await backup(); src.db.close();
+    const dst = freshTarget();
+    const lock = { pid: 4242, session: 'coordinator', acquiredAt: '2026-10-23T10:00:00.000Z' };
+    const d = openDb(dst.p.db); d.setMeta('coordinator_lock', JSON.stringify(lock)); d.close();
+    const alive = (pid: number) => pid === 4242;
+    const r = await restoreStateBackup(dst.p, file, { alive, force: true });
+    expect(r.preservedLockPid).toBe(4242);
+    expect(r.warnings.join('\n')).toMatch(/running coordinator \(pid 4242\).*minions settings restart/s);
+    const after = openDb(dst.p.db);
+    try {
+      expect(after.coordinatorLock()).toEqual(lock); // not the backup's pid 999999, and not cleared
+      expect(() => after.acquireCoordinatorLock('second', 5151, alive)).toThrow(/Another coordinator holds the project lock/);
+      expect(after.all<{ data_json: string }>("SELECT data_json FROM events WHERE kind = 'state-restore'").map((e) => JSON.parse(e.data_json))).toEqual([
+        expect.objectContaining({ forced: true, preservedLockPid: 4242, restoredActiveLeases: [] }),
+      ]);
+    } finally { after.close(); }
+  });
+
+  it('a dead holder\'s lock row is not carried over', async () => {
+    const { src, file } = await backup(); src.db.close();
+    const dst = freshTarget();
+    const d = openDb(dst.p.db); d.setMeta('coordinator_lock', JSON.stringify({ pid: 4242, session: 'coordinator', acquiredAt: 'x' })); d.close();
+    const r = await restoreStateBackup(dst.p, file, { alive: () => false });
+    expect(r.preservedLockPid).toBeNull();
+    expect(rows(dst.p.db).lock).toBeNull();
+  });
+
+  it('reports the backup\'s active leases; releaseRestoredLeases ends them (DB fallback without a scheduler)', async () => {
+    const src = seed();
+    insertLease(src.db, 'a1', 'active', 'task-a');
+    insertLease(src.db, 'a2', 'active', 'task-b');
+    const file = join(tmp('minions-state-out-'), 'state.tar.gz');
+    await createStateBackup(src.p, file); src.db.close();
+    const dst = freshTarget();
+    const r = await restoreStateBackup(dst.p, file, { alive: () => false });
+    expect(r.restoredActiveLeases.sort()).toEqual(['a1', 'a2']);
+    expect(r.warnings.join('\n')).toMatch(/2 lease\(s\) marked active/);
+    const d = openDb(dst.p.db);
+    try {
+      const calls: string[] = [];
+      // a1: the scheduler release fails; a2: no lease is left active either way.
+      const rel = await releaseRestoredLeases(d, async (id) => { calls.push(id); if (id === 'a1') throw new Error('backlog unavailable'); d.exec("UPDATE leases SET status = 'released' WHERE id = ?", id); });
+      expect(calls.sort()).toEqual(['a1', 'a2']);
+      expect(rel.released.sort()).toEqual(['a1', 'a2']);
+      expect(rel.failed).toEqual([{ leaseId: 'a1', error: 'backlog unavailable' }]);
+      expect(d.activeLeases()).toEqual([]);
+      expect(d.events('task-a', 'release').at(-1)!.data).toMatchObject({ leaseId: 'a1', reason: RESTORE_RELEASE_REASON, direct: true });
+      // No scheduler at all: everything is ended in the DB.
+      insertLease(d, 'a3', 'active', 'task-c');
+      expect((await releaseRestoredLeases(d, null)).failed.map((f) => f.leaseId)).toEqual(['a3']);
+      expect(d.activeLeases()).toEqual([]);
+    } finally { d.close(); }
+  });
+
+  it(`keeps only the newest ${PRE_RESTORE_KEEP} pre-restore copies and drops empty stamp dirs`, async () => {
+    const { src, file } = await backup(); src.db.close();
+    const dst = freshTarget();
+    mkdirSync(join(dst.p.state, 'pre-restore', '2020-01-01T00-00-00-000Z'), { recursive: true }); // empty leftover
+    const prev: string[] = [];
+    for (let i = 0; i < PRE_RESTORE_KEEP + 2; i++) {
+      const r = await restoreStateBackup(dst.p, file, { alive: () => false, now: new Date(Date.UTC(2026, 9, 23, 12, i)) });
+      prev.push(r.previous!);
+    }
+    const left = readdirSync(join(dst.p.state, 'pre-restore')).sort();
+    expect(left).toEqual(prev.slice(-PRE_RESTORE_KEEP).map((x) => basename(x)));
+    for (const n of left) expect(existsSync(join(dst.p.state, 'pre-restore', n, 'minions.db'))).toBe(true);
   });
 });
