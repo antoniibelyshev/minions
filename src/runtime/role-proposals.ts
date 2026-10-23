@@ -16,7 +16,7 @@ import { validateConfig } from '../config/resolve.js';
 import { isBuiltinWorkerRole, roleNameProblem, workerRole, type RoleDef } from '../config/roles.js';
 import { CAPABILITIES, type Capability, type Effect, type MinionsConfig } from '../config/schema.js';
 import { normalizeStage } from '../config/workflows.js';
-import { stripControlChars } from '../core/control-chars.js';
+import { displayText, FORMAT_CHAR } from '../core/control-chars.js';
 import { MinionsError, invalidConfig, zodIssues } from '../core/errors.js';
 import { resolveRolePrompt, roleTools } from '../plugin/generate.js';
 import type { RoleProposalRow, RuntimeDb } from './db.js';
@@ -41,22 +41,43 @@ export const proposalPromptPath = (name: string) => `agents/${name}.md`;
 
 // Proposal text reaches the owner's terminal in the apply plan, so it must not carry terminal controls: no
 // C0/C1 control character (ESC, CSI, CR, ...) anywhere, and no newline either except in the prompt body.
+// Unicode format/invisible characters (bidi overrides and isolates, zero-width characters, BOM, tag
+// characters, line/paragraph separators) are refused everywhere too: they reorder or hide what the owner
+// reads. Single-line strings are capped so padding cannot wrap text onto a line that looks like a plan line.
 // eslint-disable-next-line no-control-regex
 const SINGLE_LINE_CONTROL = /[\x00-\x1f\x7f-\x9f]/;
 // eslint-disable-next-line no-control-regex
 const MULTI_LINE_CONTROL = /[\x00-\x08\x0b-\x1f\x7f-\x9f]/;
+const FORMAT_MESSAGE = 'contains a Unicode format or invisible character (bidi control, zero-width, tag or separator)';
+/** Longest single-line proposal string (description, reason, paths, ...); the prompt body is not capped. */
+export const MAX_PROPOSAL_LINE = 240;
 
-/** Paths of strings in `v` (recursively) that contain a control character. */
-function controlCharPaths(v: unknown, path: string, out: string[] = []): string[] {
-  if (typeof v === 'string') { if (SINGLE_LINE_CONTROL.test(v)) out.push(path); }
-  else if (Array.isArray(v)) v.forEach((x, i) => controlCharPaths(x, `${path}[${i}]`, out));
+/** Why a single-line proposal string cannot be shown safely (null when fine). */
+function singleLineProblem(s: string): string | null {
+  if (SINGLE_LINE_CONTROL.test(s)) return 'contains a control character or line break';
+  if (FORMAT_CHAR.test(s)) return FORMAT_MESSAGE;
+  if (s.length > MAX_PROPOSAL_LINE) return `is longer than ${MAX_PROPOSAL_LINE} characters`;
+  return null;
+}
+
+/** Strings in `v` (recursively, keys included) that cannot be shown safely, with the reason. */
+function textProblems(v: unknown, path: string, out: { path: string; message: string }[] = []): { path: string; message: string }[] {
+  if (typeof v === 'string') { const m = singleLineProblem(v); if (m) out.push({ path, message: m }); }
+  else if (Array.isArray(v)) v.forEach((x, i) => textProblems(x, `${path}[${i}]`, out));
   else if (v && typeof v === 'object') {
     for (const [k, x] of Object.entries(v)) {
-      if (SINGLE_LINE_CONTROL.test(k)) out.push(`${path} (a key)`);
-      controlCharPaths(x, `${path}.${k}`, out);
+      const m = singleLineProblem(k);
+      if (m) out.push({ path: `${path} (a key)`, message: m });
+      textProblems(x, `${path}.${k}`, out);
     }
   }
   return out;
+}
+
+function promptTextProblem(s: string): string | null {
+  if (MULTI_LINE_CONTROL.test(s)) return 'contains a control character (only newline and tab are allowed)';
+  if (FORMAT_CHAR.test(s)) return FORMAT_MESSAGE;
+  return null;
 }
 
 /** Parses a proposal object (shape and name only; `checkProposal` validates it against a config). */
@@ -70,14 +91,15 @@ export function parseProposal(raw: unknown, source = 'role proposal'): RolePropo
     throw invalidConfig([{ path: 'name', message: `"${p.name}" is a built-in role; proposals add or change project roles only` }], source,
       'Customize a built-in (prompt append, model, effort, tools) by editing roles.<name> in the project config on the host (D9).');
   }
+  const promptProblem = promptTextProblem(p.promptText);
   const bad = [
-    ...controlCharPaths(p.name, 'name'), ...controlCharPaths(p.reason, 'reason'),
-    ...controlCharPaths(p.role, 'role'), ...controlCharPaths(p.workflows, 'workflows'),
-    ...(MULTI_LINE_CONTROL.test(p.promptText) ? ['promptText'] : []),
+    ...textProblems(p.name, 'name'), ...textProblems(p.reason, 'reason'),
+    ...textProblems(p.role, 'role'), ...textProblems(p.workflows, 'workflows'),
+    ...(promptProblem ? [{ path: 'promptText', message: promptProblem }] : []),
   ];
   if (bad.length) {
-    throw invalidConfig(bad.map((path) => ({ path, message: path === 'promptText' ? 'contains a control character (only newline and tab are allowed)' : 'contains a control character or line break' })), source,
-      'Proposal text is shown to the owner on the terminal: use plain single-line text (the prompt body may use newlines and tabs).');
+    throw invalidConfig(bad, source,
+      `Proposal text is shown to the owner on the terminal: use plain single-line text of at most ${MAX_PROPOSAL_LINE} characters (the prompt body may use newlines and tabs).`);
   }
   for (const k of ['prompt', 'promptText', 'promptAppend']) {
     if (Object.hasOwn(p.role, k)) throw invalidConfig([{ path: `role.${k}`, message: 'the prompt goes into the top-level promptText (apply writes it to the role\'s prompt file)' }], source);
@@ -158,10 +180,10 @@ export function formatLoosens(s: Pick<ProposalSummary, 'loosens'>): string | nul
   return l.length ? `  LOOSENS: ${l.map((x) => `${x.capability} ${x.profile} -> ${x.proposed}`).join(', ')} (looser than the active profile)` : null;
 }
 
-/** Human summary of a proposal (fields, tools, edit scope, policy row, loosening, workflows); control characters stripped. */
+/** Human summary of a proposal (fields, tools, edit scope, policy row, loosening, workflows); control characters stripped, format characters escaped. */
 export function formatSummary(s: ProposalSummary): string {
   const loosens = formatLoosens(s);
-  return stripControlChars([
+  return displayText([
     `role ${s.name} (${s.change === 'add' ? 'new' : 'changed'}): ${s.description}`,
     ...(loosens ? [loosens] : []),
     `  contract ${s.contract}, worktree ${s.worktree}, stage status ${s.stageStatus}, max turns ${s.maxTurns}${s.model ? `, model ${s.model}` : ''}${s.effort ? `, effort ${s.effort}` : ''}${s.deepVariant ? ', deep variant' : ''}`,
@@ -306,22 +328,22 @@ export function showRole(cfg: MinionsConfig, name: string): ShowRole {
 }
 
 export function formatRoleLine(r: RoleView): string {
-  return stripControlChars(`${r.name}${r.builtin ? ' (built-in)' : ''}  ${r.contract}  edits ${editScope(r.edits)}${r.workflows.length ? `  workflows ${r.workflows.join(', ')}` : ''}  - ${r.description}`);
+  return displayText(`${r.name}${r.builtin ? ' (built-in)' : ''}  ${r.contract}  edits ${editScope(r.edits)}${r.workflows.length ? `  workflows ${r.workflows.join(', ')}` : ''}  - ${r.description}`);
 }
 
 export function formatProposalLine(p: ProposalView): string {
-  return stripControlChars(`${p.id}  ${p.name}  ${p.state}${p.appliedRevision !== null ? ` (revision ${p.appliedRevision})` : ''}  ${p.createdAt}  - ${p.reason}`);
+  return displayText(`${p.id}  ${p.name}  ${p.state}${p.appliedRevision !== null ? ` (revision ${p.appliedRevision})` : ''}  ${p.createdAt}  - ${p.reason}`);
 }
 
 export function formatShow(d: ShowRole | ShowProposal): string {
   if (d.kind === 'proposal') {
-    return stripControlChars([
+    return displayText([
       formatProposalLine(d.view),
       d.summary ? formatSummary(d.summary) : `no longer valid against the current config: ${d.problem}`,
       ...(d.view.state === 'pending' ? [`apply on the host: minions config roles apply ${d.view.id}`] : []),
     ].join('\n'));
   }
-  return stripControlChars([
+  return displayText([
     formatRoleLine(d.role),
     `  worktree ${d.role.worktree}, stage status ${d.role.stageStatus}, commits ${d.role.commits ? 'yes' : 'no'}, max turns ${d.maxTurns}${d.deepVariant ? ', deep variant' : ''}`,
     ...(d.tools ? [`  tools: ${d.tools.join(', ')}`] : []),

@@ -14,7 +14,7 @@ import { validateConfig } from '../config/resolve.js';
 import { isBuiltinRole, roleRegistry } from '../config/roles.js';
 import type { MinionsConfig } from '../config/schema.js';
 import { action, globalOpts, requireMode, runtimeMode } from '../core/cli-helpers.js';
-import { stripControlChars } from '../core/control-chars.js';
+import { displayText } from '../core/control-chars.js';
 import { MinionsError } from '../core/errors.js';
 import { atomicWrite, ensureDir, readJson } from '../core/fsutil.js';
 import { emit } from '../core/output.js';
@@ -189,11 +189,11 @@ export async function applyRoleProposal(project: ProjectJson, id: string, o: { y
   return result;
 }
 
-/** The plan shown before the question. Control characters are stripped; the prompt body is fenced and every
+/** The plan shown before the question. Control characters are stripped and format characters escaped; the prompt body is fenced and every
  * line is prefixed with `  | `, so proposal text cannot pose as a summary or diff line. */
 export function formatApplyPlan(r: ApplyResult): string {
   const loosens = formatLoosens(r.summary);
-  return stripControlChars([
+  return displayText([
     formatSummary(r.summary),
     '',
     `config ${r.file} (configRevision ${r.revision}):`,
@@ -208,7 +208,7 @@ export function formatApplyPlan(r: ApplyResult): string {
 }
 
 export function formatApply(r: ApplyResult): string {
-  return stripControlChars([
+  return displayText([
     ...(r.dryRun ? [formatApplyPlan(r), '', 'dry run: nothing written'] : [
       `applied role proposal ${r.proposalId} (${r.name}): ${r.file} (configRevision ${r.revision}), prompt ${r.promptFile}`,
       'Derived files regenerated (runtime config, plugin).',
@@ -261,7 +261,7 @@ export async function removeRole(project: ProjectJson, name: string, o: { yes?: 
   const result: RemoveResult = { name, file: plan.path, revision: plan.revision, dryRun: !!o.dryRun, written: false, diff, restartRequired: true, restart: ROLES_RESTART, warnings: [], nextSteps: [] };
   if (o.dryRun) return result;
   if (!o.yes) {
-    deps.show?.(stripControlChars([`config ${plan.path}:`, ...formatDiff(diff)].join('\n')));
+    deps.show?.(displayText([`config ${plan.path}:`, ...formatDiff(diff)].join('\n')));
     await confirmOrRefuse(deps, `Remove role ${name} from ${plan.path}? (y/N)`, `Removing role ${name}`);
   }
   const edit = await editProjectConfig(project, mutate);
@@ -276,7 +276,7 @@ export async function removeRole(project: ProjectJson, name: string, o: { yes?: 
 }
 
 export function formatRemove(r: RemoveResult): string {
-  return stripControlChars([
+  return displayText([
     ...(r.dryRun ? [`config ${r.file}:`, ...formatDiff(r.diff), '', 'dry run: nothing written'] : [`removed role ${r.name} from ${r.file} (configRevision ${r.revision})`, 'Derived files regenerated (runtime config, plugin).']),
     ...r.warnings.map((w) => `warning: ${w}`),
     ...r.nextSteps.map((s) => `next: ${s}`),
@@ -290,7 +290,7 @@ export interface RolesList { roles: RoleView[]; proposals: ProposalView[] | null
 const listRoles = (cfg: MinionsConfig): RoleView[] => roleRegistry(cfg).map((d) => roleView(cfg, d));
 
 function formatList(d: RolesList): string {
-  return stripControlChars([
+  return displayText([
     'roles:', ...d.roles.map((r) => `  ${formatRoleLine(r)}`),
     d.proposals === null ? `proposals: ${d.note ?? 'unavailable'}` : d.proposals.length ? 'proposals:' : 'proposals: none',
     ...(d.proposals ?? []).map((p) => `  ${formatProposalLine(p)}`),
@@ -364,7 +364,7 @@ export function registerRoles(config: Command, io: RolesCliIO): Command {
     .action(action(async (o: { file: string }, cmd: Command) => {
       requireMode('runtime');
       const r = await withRuntime((ctx) => proposeRole(ctx, o.file));
-      emit(r, { json: globalOpts(cmd).json, human: (d: typeof r) => stripControlChars([`proposal ${d.proposalId} stored (pending; not effective)`, formatSummary(d.summary), ...(d.superseded.length ? [`supersedes ${d.superseded.join(', ')}`] : []), `owner applies it on the host: ${d.applyCommand}`].join('\n')) });
+      emit(r, { json: globalOpts(cmd).json, human: (d: typeof r) => displayText([`proposal ${d.proposalId} stored (pending; not effective)`, formatSummary(d.summary), ...(d.superseded.length ? [`supersedes ${d.superseded.join(', ')}`] : []), `owner applies it on the host: ${d.applyCommand}`].join('\n')) });
     }));
 
   roles.command('apply <proposalId>')

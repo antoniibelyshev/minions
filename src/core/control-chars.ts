@@ -94,3 +94,21 @@ export function relayStripped(from: NodeJS.ReadableStream, to: Pick<NodeJS.Writa
   from.on('data', (chunk: Buffer | string) => { const s = st.push(chunk); if (s) to.write(s); });
   from.on('end', () => { const s = st.end(); if (s) to.write(s); });
 }
+
+/**
+ * Unicode format and invisible characters: general category Cf (bidi embeddings/overrides/isolates, zero-width
+ * space/joiners, BOM, ...), tag characters (U+E0000..U+E007F, including unassigned ones) and the line/paragraph
+ * separators. They are not terminal escapes, but they reorder or hide what the user reads.
+ */
+export const FORMAT_CHAR = /[\p{Cf}\u2028\u2029\u{E0000}-\u{E007F}]/u;
+const FORMAT_CHARS_G = new RegExp(FORMAT_CHAR.source, 'gu');
+
+/** `s` with every Unicode format/invisible character replaced by a visible `<U+XXXX>` marker. */
+export function escapeFormatChars(s: string): string {
+  return s.replace(FORMAT_CHARS_G, (ch) => `<U+${ch.codePointAt(0)!.toString(16).toUpperCase().padStart(4, '0')}>`);
+}
+
+/** Text that came from an untrusted source, made safe to show: control characters stripped, format characters escaped. */
+export function displayText(s: string): string {
+  return escapeFormatChars(stripControlChars(s));
+}

@@ -15,7 +15,8 @@ import { loadProjectJson, type ProjectJson } from '../../src/host/project.js';
 import { applyRoleProposal, formatApplyPlan, type RolesHostDeps } from '../../src/host/roles-cli.js';
 import type { SettingsRuntime } from '../../src/host/settings-cli.js';
 import { RuntimeDb } from '../../src/runtime/db.js';
-import { checkProposal, formatSummary, markApplied, proposeRole, showProposal } from '../../src/runtime/role-proposals.js';
+import { checkProposal, formatSummary, markApplied, MAX_PROPOSAL_LINE, proposeRole, showProposal } from '../../src/runtime/role-proposals.js';
+import { displayText, escapeFormatChars } from '../../src/core/control-chars.js';
 import { defaults } from '../helpers.js';
 import { dockerUp, makeRepo, withHome } from './fixtures.js';
 
@@ -90,8 +91,8 @@ describe('spoofing the apply plan', () => {
     ['zero-width joiner U+200D', '\u200d'], ['line separator U+2028', '\u2028'], ['paragraph separator U+2029', '\u2029'],
     ['BOM U+FEFF', '\ufeff'], ['tag characters U+E0049.. (invisible ASCII smuggling)', '\u{e0049}\u{e0047}\u{e004e}'],
   ];
-  // DEFECT (pinned with it.fails): Unicode format/invisible characters pass propose and are rendered as is.
-  it.fails.each(FORMAT_CHARS)('apply plan renders no %s from description, reason or prompt', async (_what, ch) => {
+  // Unicode format/invisible characters are rejected at propose and escaped at render.
+  it.each(FORMAT_CHARS)('apply plan renders no %s from description, reason or prompt', async (_what, ch) => {
     const { project } = await initProject();
     let rendered = '';
     try {
@@ -102,6 +103,36 @@ describe('spoofing the apply plan', () => {
       return;
     }
     expect(rendered.includes(ch)).toBe(false);
+  });
+
+  it.each(FORMAT_CHARS)('propose rejects %s in the prompt body and in role fields', async (_what, ch) => {
+    const { project } = await initProject();
+    await expect(propose(project, { name: 'researcher', role: ROLE, promptText: `Be ${ch}good.`, reason: 'r' })).rejects.toThrow(/format or invisible/);
+    await expect(propose(project, { name: 'researcher', role: { ...ROLE, edits: { paths: [`docs/${ch}x/**`] } }, promptText: 'x', reason: 'r' })).rejects.toThrow(/format or invisible/);
+    await expect(propose(project, { name: 'researcher', role: ROLE, promptText: 'x', reason: 'r', workflows: { [`re${ch}search`]: ['researcher', 'reviewer'] } })).rejects.toThrow(/format or invisible/);
+  });
+
+  it.each(FORMAT_CHARS)('a stored value with %s that bypassed propose is escaped in the apply plan', async (_what, ch) => {
+    const { project } = await initProject();
+    const p = await propose(project, { name: 'researcher', role: ROLE, promptText: 'Be good.', reason: 'r' });
+    const plan = await applyRoleProposal(project, p.proposalId, { dryRun: true }, deps(project));
+    const tampered = { ...plan, summary: { ...plan.summary, description: `notes ${ch}x` }, prompt: { ...plan.prompt, lines: [`Be ${ch}good.`] } };
+    const rendered = formatApplyPlan(tampered);
+    expect(rendered.includes(ch)).toBe(false);
+    expect(rendered).toMatch(/notes <U\+[0-9A-F]{4,5}>/);
+    expect(rendered).toContain(`  | Be <U+${ch.codePointAt(0)!.toString(16).toUpperCase().padStart(4, '0')}>`);
+  });
+
+  it('escapeFormatChars keeps ordinary non-ASCII text and is idempotent', () => {
+    expect(escapeFormatChars('café ü 日本 ‮x')).toBe('café ü 日本 <U+202E>x');
+    expect(escapeFormatChars(escapeFormatChars('\u{e0049}'))).toBe('<U+E0049>');
+    expect(displayText('a\x1b[2Jb​c')).toBe('ab<U+200B>c');
+  });
+
+  it('a single-line field at the length cap is accepted, one over is rejected', async () => {
+    const { project } = await initProject();
+    await expect(propose(project, { name: 'researcher', role: { ...ROLE, description: 'd'.repeat(MAX_PROPOSAL_LINE) }, promptText: 'x', reason: 'r' })).resolves.toBeTruthy();
+    await expect(propose(project, { name: 'researcher', role: ROLE, promptText: 'x', reason: 'r'.repeat(MAX_PROPOSAL_LINE + 1) })).rejects.toThrow(/longer than/);
   });
 
   it('a prompt line that mimics the end fence stays inside the fence (prefixed)', async () => {
@@ -115,8 +146,8 @@ describe('spoofing the apply plan', () => {
     expect(end).toBe(lines.length - 1); // no LOOSENS: the real fence is the last line
   });
 
-  // DEFECT (low, pinned with it.fails): no length limit on single-line fields; padding wraps text to a fake line.
-  it.fails('a very long single-line description cannot wrap into fake plan lines', async () => {
+  // Single-line fields are length-capped so padding cannot wrap text onto a fake plan line.
+  it('a very long single-line description cannot wrap into fake plan lines', async () => {
     const { project } = await initProject();
     const desc = `notes${' '.repeat(400)}policy: deny everything; ask none`;
     let summary: string;
