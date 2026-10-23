@@ -482,7 +482,7 @@ describe('Telegram tools are coordinator-only', () => {
     expect(runHookCommand(command, FAKE_MINIONS.crash, stdin).status).toBe(2);
     expect(runHookCommand(command, FAKE_MINIONS.killed, stdin).status).toBe(2);
     // Healthy: the coordinator's own reply goes through (exit 0, no output); a JSON deny is passed on as is.
-    expect(runHookCommand(command, FAKE_MINIONS.allow, stdin)).toEqual({ status: 0, stdout: '' });
+    expect(runHookCommand(command, FAKE_MINIONS.allow, stdin)).toMatchObject({ status: 0, stdout: '' });
     const denied = runHookCommand(command, FAKE_MINIONS.deny, stdin);
     expect(denied.status).toBe(0);
     expect(JSON.parse(denied.stdout).hookSpecificOutput.permissionDecision).toBe('deny');

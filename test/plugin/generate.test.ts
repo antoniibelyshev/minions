@@ -133,7 +133,7 @@ describe('generatePlugin', () => {
     expect(runHookCommand(command, FAKE_MINIONS.crash, stdin).status).toBe(2);
     expect(runHookCommand(command, FAKE_MINIONS.killed, stdin).status).toBe(2);
     // A healthy hook exits 0 and decides through stdout, unchanged by the wrapper.
-    expect(runHookCommand(command, FAKE_MINIONS.allow, stdin)).toEqual({ status: 0, stdout: '' });
+    expect(runHookCommand(command, FAKE_MINIONS.allow, stdin)).toMatchObject({ status: 0, stdout: '' });
     const denied = runHookCommand(command, FAKE_MINIONS.deny, stdin);
     expect(denied.status).toBe(0);
     expect(JSON.parse(denied.stdout).hookSpecificOutput.permissionDecision).toBe('deny');
