@@ -53,13 +53,22 @@ export const backoffMs = (attempts: number): number => Math.min(BACKOFF_BASE_MS 
  */
 const SECRET_KEY = String.raw`\b([\w-]*?(?:password|passwd|api[_-]?key|(?:secret|access|private)[_-]?key|secret|token|authorization))`;
 /** Auth scheme words after an authorization key: they belong to the separator, the value follows them. */
-const AUTH_SCHEME = String.raw`(?:bearer|token|basic|digest)\s`;
+const AUTH_SCHEME = String.raw`(?:bearer|token|basic|digest|negotiate|ntlm)\s`;
+/** Schemes whose header value is masked whole (Bearer has its own rule that keeps prose readable). */
+const AUTH_HEADER_SCHEME = String.raw`(?:token|basic|digest|negotiate|ntlm)`;
+/**
+ * The rest of an Authorization header value: up to the end of the line or an unescaped quote (the end
+ * of an enclosing JSON string). JSON-escaped characters (`\"`) and quoted Digest parameters
+ * (`key="v", ...`, the closing quote followed by `,`, `;` or the line end) belong to the value.
+ */
+const AUTH_HEADER_VALUE = String.raw`(?:\\.|=\s*"[^"\\\n]*"(?=\s*[,;]|[^\S\n]*(?:\n|$))|[^"\\\n])+`;
 /** Longer inputs are cut before masking: the patterns cost O(n^2) on long runs, and only 300 chars are kept. */
 const MAX_REDACT_INPUT = 4000;
 
 /**
  * Shortens an error and masks anything that looks like a credential: bot tokens, GitHub tokens, URL
- * userinfo passwords, the value after `Bearer` or `Authorization: token|Basic|Digest`, and the values
+ * userinfo passwords, the value after `Bearer`, the whole rest of an `Authorization:` or
+ * `Proxy-Authorization:` header after its token/Basic/Digest/Negotiate/NTLM scheme, and the values
  * (whole, when quoted) of password/passwd/api_key/apikey/secret/token/authorization and
  * secret_key/access_key/private_key keys. Prose such as "Bearer token is missing" is left readable
  * (a bearer token has 8+ characters).
@@ -71,7 +80,8 @@ export function redactError(message: string): string {
     // https://user:pass@host
     .replace(/\b([a-z][a-z0-9+.-]*:\/\/[^\s/:@]*:)[^\s/@]+@/gi, '$1[redacted]@')
     .replace(/\bbearer\s+(?!\[redacted\])[^\s"',;]{8,}/gi, 'Bearer [redacted]')
-    .replace(/\b(authorization\s*["']?\s*[:=]\s*["']?(?:token|basic|digest)\s+)(?!\[redacted\])[^\s"',;]+/gi, '$1[redacted]')
+    // Authorization / Proxy-Authorization header with a scheme: mask the whole rest of the value.
+    .replace(new RegExp(String.raw`\b((?:proxy-)?authorization\s*["']?\s*[:=]\s*["']?${AUTH_HEADER_SCHEME}\s+)(?!\[redacted\])${AUTH_HEADER_VALUE}`, 'gi'), '$1[redacted]')
     // Quoted value: mask up to the closing quote.
     .replace(new RegExp(`${SECRET_KEY}(\\s*["']?\\s*[:=]\\s*)(["'])(?!\\[redacted\\]|${AUTH_SCHEME})(?:(?!\\3)[^\\n])+`, 'gi'), '$1$2$3[redacted]')
     .replace(new RegExp(`${SECRET_KEY}(\\s*["']?\\s*[:=]\\s*["']?)(?!\\[redacted\\]|${AUTH_SCHEME})[^\\s"'&,;]+`, 'gi'), '$1$2[redacted]')

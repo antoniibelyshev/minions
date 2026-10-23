@@ -253,6 +253,25 @@ describe('credential masking of stored send errors', () => {
     expect(redactError(`password=hunter2 ${'x'.repeat(10_000)}`)).not.toContain('hunter2');
   });
 
+  it('masks the whole Digest Authorization header value (response, nonce, cnonce)', () => {
+    expect(redactError('Authorization: Digest username="u", response="deadbeefcafe1234"')).toBe('Authorization: Digest [redacted]');
+    const full = 'Authorization: Digest username="u", realm="r", nonce="n0nce42", uri="/", qop=auth, nc=00000001, cnonce="cn0nce42", response="deadbeef"\nretry later';
+    expect(redactError(full)).toBe('Authorization: Digest [redacted] retry later');
+  });
+
+  it('masks Proxy-Authorization header values', () => {
+    expect(redactError('Proxy-Authorization: Basic dXNlcjpwYXNzd29yZA==')).toBe('Proxy-Authorization: Basic [redacted]');
+    expect(redactError('Proxy-Authorization: Digest username="u", response="deadbeefcafe1234"')).toBe('Proxy-Authorization: Digest [redacted]');
+  });
+
+  it('masks an Authorization header inside a JSON string up to the closing quote', () => {
+    expect(redactError('{"error":"bad header Authorization: Digest username=\\"u\\", response=\\"deadbeefcafe1234\\"","code":401}'))
+      .toBe('{"error":"bad header Authorization: Digest [redacted]","code":401}');
+    expect(redactError('{"Authorization":"Digest username=\\"u\\", nonce=\\"n0nce42\\"","x":"y"}')).toBe('{"Authorization":"Digest [redacted]","x":"y"}');
+    expect(redactError('{"Authorization":"Basic dXNlcjpwYXNzd29yZA==","x":"y"}')).toBe('{"Authorization":"Basic [redacted]","x":"y"}');
+    expect(redactError('error: "Authorization: Basic dXNlcjpwYXNzd29yZA==" rejected')).toBe('error: "Authorization: Basic [redacted]" rejected');
+  });
+
   it('masks a bearer token in a JSON-quoted Authorization header', () => {
     expect(redactError('{"Authorization":"Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig"}')).not.toContain('eyJhbGciOiJIUzI1NiJ9');
   });
