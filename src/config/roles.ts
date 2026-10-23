@@ -201,6 +201,38 @@ export function engineerDeepEffort(cfg: Pick<MinionsConfig, 'models'> & RolesCfg
   return EFFORTS[Math.min(EFFORTS.indexOf(base) + 1, EFFORTS.length - 1)]!;
 }
 
+/**
+ * Effort of a role's `-deep` variant: the engineer's from engineerDeepEffort; a project role's is one level
+ * above its own effort (capped), else `high`.
+ */
+export function deepVariantEffort(cfg: Pick<MinionsConfig, 'models'> & RolesCfg, role: string): Effort {
+  if (role === ENGINEER_ROLE) return engineerDeepEffort(cfg);
+  const base = roleEffort(cfg, role);
+  if (!base) return 'high';
+  return EFFORTS[Math.min(EFFORTS.indexOf(base) + 1, EFFORTS.length - 1)]!;
+}
+
+/**
+ * The worker role a `minions:<agent>` type runs as (D10): `<name>` for every registered worker role and
+ * `<name>-deep` only when the role has a deep variant. Undefined for anything else (the coordinator,
+ * unknown names, prototype keys, `-deep` of a role without one).
+ */
+export function agentTypeRole(cfg: DefCfg, agentType: string): RoleDef | undefined {
+  const m = /^minions:([a-z][a-z0-9-]{0,40})$/.exec(agentType);
+  if (!m) return undefined;
+  const name = m[1]!;
+  const def = workerRole(cfg, name);
+  if (!def) return undefined;
+  if (name === def.name) return def;
+  return def.deepVariant && name === `${def.name}${DEEP_SUFFIX}` ? def : undefined;
+}
+
+/** The registered worker role named exactly `name` (no `-deep`), else undefined: what `work claim|brief|submit --role` accept. */
+export function exactWorkerRole(cfg: DefCfg, name: string): RoleDef | undefined {
+  const def = workerRole(cfg, name);
+  return def && def.name === name ? def : undefined;
+}
+
 export interface RoleSubRule { effect: Effect; roles: string[]; paths?: string[] }
 
 /**
