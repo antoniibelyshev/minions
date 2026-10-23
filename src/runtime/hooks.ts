@@ -3,6 +3,7 @@ import { basename, dirname, join } from 'node:path';
 import { filterReady } from '../backlog/ready.js';
 import type { BacklogAdapter, Task } from '../backlog/types.js';
 import { AGENT_MODEL_ALIASES, isAgentModelAlias } from '../config/models.js';
+import { HARNESSES, isProcessHarness } from '../config/harnesses.js';
 import { agentTypeRole, DEEP_SUFFIX, workerRoleNames } from '../config/roles.js';
 import type { MinionsConfig, RoleContract } from '../config/schema.js';
 import { sha256 } from '../core/fsutil.js';
@@ -155,6 +156,11 @@ export async function preAgentHook(input: unknown, load: HookLoader): Promise<Ho
     const def = agentTypeRole(config, type);
     if (!def) return deny(`Unknown minions agent type "${shown}": not a registered worker role (${workerRoleNames(config).join(', ')}) or the deep variant of one.`);
     const role = def.name;
+    // A role on a process harness (docs/design/agent-runtimes.md D1) is never a Claude subagent: it runs through
+    // `minions work run` after claim. Without this a Claude worker would silently stand in for it.
+    if (isProcessHarness(def.harness)) {
+      return deny(`${role} runs on ${HARNESSES[def.harness].label} (harness ${def.harness}), not as a Claude subagent: claim it, then run the launch command from \`minions work next --json\` (\`minions work run <leaseId> --json\`).`);
+    }
     const prompt = typeof ti.prompt === 'string' ? ti.prompt : '';
     const ids = [...prompt.matchAll(MARKER)].map((x) => x[1]!);
     if (!ids.length) {

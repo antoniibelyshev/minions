@@ -1,3 +1,5 @@
+import { MinionsError } from '../core/errors.js';
+import { harnessModels, isProcessHarness, type HarnessId } from './harnesses.js';
 import type { MinionsConfig } from './schema.js';
 
 /**
@@ -36,6 +38,8 @@ export interface ModelInput {
   repairAfterFailure?: boolean;
   /** The role has a `-deep` agent variant. */
   deepVariant: boolean;
+  /** The role's harness (agent-runtimes D8); unset = claude. */
+  harness?: HarnessId;
 }
 
 export interface ModelSuggestion {
@@ -52,7 +56,7 @@ export interface ModelSuggestion {
   rule: 'fixed' | 'stage' | 'role' | 'risk-high' | 'repair-after-failure' | 'risk-low' | 'default';
 }
 
-type ModelsCfg = Pick<MinionsConfig, 'models'>;
+type ModelsCfg = Pick<MinionsConfig, 'models'> & Partial<Pick<MinionsConfig, 'harnesses'>>;
 
 /** The cheapest (`dir` 1) or strongest (`dir` -1) tiered alias in models.allowed, or undefined. */
 function tierPick(cfg: ModelsCfg, dir: 1 | -1): string | undefined {
@@ -66,10 +70,23 @@ function tierPick(cfg: ModelsCfg, dir: 1 | -1): string | undefined {
  * failed attempt = the strongest allowed alias (and the `-deep` variant); `risk:low` or an all-hinted workflow =
  * the cheapest allowed alias for gate and verifier stages. With `models.selection` "fixed" the model is always
  * models.default (the `-deep` variant is an effort choice and still applies).
+ *
+ * A role on a process harness (agent-runtimes D8) uses that harness's models: fixed = harnesses.<id>.models.default;
+ * else stage hint > role model > the harness default. There is no tier ranking for non-Claude models, so the risk
+ * rule only picks the `-deep` variant there, and `agentModel` is always null (no Agent call).
  */
 export function suggestModel(cfg: ModelsCfg, x: ModelInput): ModelSuggestion {
   const high = x.labels.includes(RISK_HIGH_LABEL);
   const deep = x.deepVariant && (high || !!x.repairAfterFailure);
+  if (x.harness && isProcessHarness(x.harness)) {
+    const hm = harnessModels(cfg, x.harness);
+    if (!hm) throw new MinionsError('INVALID_CONFIG', `harness "${x.harness}" has no harnesses.${x.harness} block.`);
+    const run = (model: string, rule: ModelSuggestion['rule']): ModelSuggestion => ({ model, rule, deep, agentModel: null });
+    if (cfg.models.selection === 'fixed') return run(hm.default, 'fixed');
+    if (x.stageModel) return run(x.stageModel, 'stage');
+    if (x.roleModel) return run(x.roleModel, 'role');
+    return run(hm.default, 'default');
+  }
   const definition = x.roleModel ?? cfg.models.default;
   const out = (model: string, rule: ModelSuggestion['rule']): ModelSuggestion => ({
     model, rule, deep, agentModel: model === definition || !isAgentModelAlias(model) ? null : model,

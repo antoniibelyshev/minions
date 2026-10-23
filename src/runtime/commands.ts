@@ -45,7 +45,9 @@ import { git, workspaceLayout } from './worktree.js';
 
 /** Human output of `minions work next`. */
 export function humanNext(r: NextReport): string {
-  const line = (x: NextStage) => `  ${x.taskId} ${x.role} -> ${x.agentType}${x.agentModel ? ` (model ${x.agentModel})` : ''}: ${x.reason}`;
+  const line = (x: NextStage) => x.launch.kind === 'run'
+    ? `  ${x.taskId} ${x.role} -> claim, then ${x.launch.command} (${x.launch.harness}, model ${x.launch.model}${x.launch.deep ? ', deep' : ''}): ${x.reason}`
+    : `  ${x.taskId} ${x.role} -> ${x.agentType}${x.agentModel ? ` (model ${x.agentModel})` : ''}: ${x.reason}`;
   return [
     r.message,
     ...r.runnable.map(line),

@@ -48,6 +48,7 @@ describe('work next: runnable stages from the stage machine', () => {
       taskId: 'task-1', title: 'First', status: 'ready', priority: 'medium', kind: 'task',
       role: 'engineer', agentType: 'minions:engineer', position: 0, count: 3, workflow: 'default',
       suggestedModel: 'sonnet', agentModel: null, modelRule: 'default',
+      harness: 'claude', launch: { kind: 'agent', agentType: 'minions:engineer', agentModel: null },
       reason: 'ready: stage 1/3 (engineer) of workflow default; model: default',
     }]);
     expect(n).toMatchObject({ waiting: [], stuck: [], startsBlocked: null, message: '1 runnable stage(s): task-1 engineer' });

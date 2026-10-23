@@ -731,6 +731,36 @@ Explicitly, for every phase before 3:
 5. Anything for the owner goes into the WorkerResult `findings`, which the coordinator reads and relays. This is the
    same rule as for Claude workers.
 
+### Addendum: child task 1 implementation decisions (task-14.2)
+
+The owner chose phase 1 option (b). The config, registry and plumbing are in `src/config/harnesses.ts` (registry,
+phase rules, effort scales), `src/config/roles.ts` (`RoleDef.harness`, `harnessConfigIssues`, `harnessRoleEffort`)
+and `src/config/launch.ts` (the `launch` entry). Decisions made while building it:
+
+- **Phase rules are data selected by `CURRENT_PHASE`** (`1b` now; `1a` and `2` are defined). `1a` allows producer
+  roles (built-in and project) and keeps the project-gate allowance of `1b`, so a `codex-reviewer` pilot config stays
+  valid after the switch. Both phase 1 rules carry `processProducerCap: 1`; claim (inside the lease transaction) and
+  `work next` (`waitingOn: "harness-capacity"`) enforce it. Claim also refuses a role whose process harness the
+  phase does not allow, for a config that skipped `validateConfig`.
+- **`harnesses.default` applies only where the phase allows it.** Other roles stay on `claude` without an error, as
+  D8 describes for "authorize one harness for the whole squad". An explicit `roles.<r>.harness` that the phase does
+  not allow is a config error.
+- **Effort stays on the minions scale in config** (`roles.<r>.effort`, `harnesses.<id>.effort`) and is mapped at
+  launch. For a process role the precedence is `roles.<r>.effort` > `models.effortByRole.<r>` >
+  `harnesses.<id>.effort` > `models.effort`. `-deep` follows `engineerDeepEffort` / `deepVariantEffort` on that precedence. Codex `max`
+  clamps to `xhigh` and Junie clamps to `high`.
+- **The brief** gets `harness` for every role. For a process role, `model` is the stage hint, then the role model,
+  then `harnesses.<id>.models.default` (always the default with `selection: "fixed"`). `allowedModels` is that
+  harness's list and `effort` is the mapped base effort. Claude briefs are unchanged.
+- **`work next`** keeps `agentType` / `agentModel` and adds `harness` and `launch`. `launch.kind: "run"` carries
+  `command: "minions work run <leaseId> --json"` (a template: the coordinator substitutes the claimed lease),
+  `harness`, `model`, the mapped `effort` and `deep`. How `deep` reaches the runner is left to the runner task.
+- **Claude-side guards:** the plugin generator emits no agent file for a project role on a process harness. The
+  pre-agent hook denies `minions:<role>[-deep]` for any role on a process harness, so a Claude subagent cannot stand
+  in for it.
+- **Not here:** the `fake` harness (registered with the runner, child task 3), the host-runtime refusal (the runner
+  enforces it), setup and settings items, and `harness` in role proposals (child task 6).
+
 ## Evaluation: OpenAI Codex CLI
 
 Sources accessed 2026-10-23. `developers.openai.com/codex/*` now redirects to `learn.chatgpt.com/docs/*`; the

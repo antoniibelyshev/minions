@@ -7,7 +7,8 @@
  */
 import type { TaskStatus } from '../backlog/types.js';
 import type { ConfigIssue } from '../core/errors.js';
-import { COORDINATOR_ROLE, REVIEWER_ROLE, ROLE_NAME_PATTERN, TESTER_ROLE, workerRole, workerRoleNames, type RoleDef } from './roles.js';
+import { harnessModels } from './harnesses.js';
+import { COORDINATOR_ROLE, REVIEWER_ROLE, ROLE_NAME_PATTERN, TESTER_ROLE, modelsPath, workerRole, workerRoleNames, type RoleDef } from './roles.js';
 import type { MinionsConfig, RoleContract, WorkflowStageConfig } from './schema.js';
 
 export const DEFAULT_WORKFLOW = 'default';
@@ -19,7 +20,7 @@ export const DEFAULT_WORKFLOW = 'default';
 export interface Stage { role: string; when?: 'qa'; model?: string; inserted?: 'qa' | 'legacy' }
 export interface Workflow { name: string; stages: Stage[] }
 
-type WfCfg = Pick<MinionsConfig, 'verification' | 'execution' | 'models'> & Partial<Pick<MinionsConfig, 'roles' | 'workflows'>>;
+type WfCfg = Pick<MinionsConfig, 'verification' | 'execution' | 'models'> & Partial<Pick<MinionsConfig, 'roles' | 'workflows' | 'harnesses'>>;
 
 const own = <T>(obj: Record<string, T> | undefined, key: string): T | undefined => (obj && Object.hasOwn(obj, key) ? obj[key] : undefined);
 
@@ -155,7 +156,10 @@ export function workflowProblems(cfg: WfCfg, stages: Stage[]): { index: number |
   stages.forEach((s, i) => {
     if (s.role === COORDINATOR_ROLE) out.push({ index: i, message: 'the coordinator cannot be a workflow stage' });
     else if (!workerRole(cfg, s.role) || s.role.endsWith('-deep')) out.push({ index: i, message: `unknown role "${s.role}" (known: ${workers.join(', ')})` });
-    if (s.model !== undefined && !cfg.models.allowed.includes(s.model)) out.push({ index: i, message: `model "${s.model}" is not in models.allowed [${cfg.models.allowed.join(', ')}]` });
+    // A hint is a model of the stage role's harness, never a harness (agent-runtimes D8); no block = reported elsewhere.
+    const harness = workerRole(cfg, s.role)?.harness ?? 'claude';
+    const models = harnessModels(cfg, harness);
+    if (s.model !== undefined && models && !models.allowed.includes(s.model)) out.push({ index: i, message: `model "${s.model}" is not in ${modelsPath(harness)} [${models.allowed.join(', ')}]` });
   });
   if (out.length) return out;
   if (cfg.verification.reviewerRequired) {

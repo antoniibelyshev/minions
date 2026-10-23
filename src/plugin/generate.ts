@@ -3,6 +3,7 @@ import { readdir, readFile, realpath, stat } from 'node:fs/promises';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { CAPABILITIES, can, type Capability } from '../config/capabilities.js';
+import { isProcessHarness } from '../config/harnesses.js';
 import { AGENT_MODEL_ALIASES, engineerDeepEffort, isAgentModelAlias, roleEffort } from '../config/models.js';
 import {
   BUILTIN_TOOLS, customRoles, deepVariantEffort, DEEP_SUFFIX, ENGINEER_ROLE, registeredRoleNames, roleLimit, workerRole, workerRoleNames,
@@ -599,7 +600,9 @@ export async function generatePlugin(cfg: MinionsConfig, outDir: string, opts: G
     const prompt = await resolveRolePrompt(def, opts.configDir);
     const fileVars = {
       ...vars, policySummary: renderPolicySummary(cfg, role), workerRole: role, workerEffortLine: effortLine(roleEffort(cfg, role)),
-      workerModel: def.model ?? cfg.models.default, attemptMaxTurns: String(def.maxTurns),
+      // A built-in on a process harness (a later phase, agent-runtimes D9) keeps its file, which the pre-agent hook
+      // refuses to spawn; its model is a harness-native id, so the file gets models.default instead.
+      workerModel: (isProcessHarness(def.harness) ? undefined : def.model) ?? cfg.models.default, attemptMaxTurns: String(def.maxTurns),
     };
     const render = (name: string, v: Record<string, string>) => withProjectPrompt(withTools(renderTemplate(tpl, v, partials, { name }), builtin, def.tools), prompt);
     await emit(f, render(f, fileVars));
@@ -621,6 +624,9 @@ export async function generatePlugin(cfg: MinionsConfig, outDir: string, opts: G
       if (!def || def.builtin || def.name !== name) throw new MinionsError('INVALID_CONFIG', `roles.${name}: not a valid project role name.`);
       const prompt = await resolveRolePrompt(def, opts.configDir);
       if (prompt === undefined) throw promptError(name, 'set exactly one of prompt and promptText');
+      // A project role on a process harness is not a Claude subagent (agent-runtimes D1): no agent definition (its
+      // prompt is still checked above). The harness instructions are rendered by the runner's adapter (child tasks 3-4).
+      if (isProcessHarness(def.harness)) continue;
       const tools = roleTools(def);
       if (!tools.length) throw promptError(name, 'no usable tools left after removing Agent, SendMessage, MCP, pattern and (read-only role) edit tools');
       const readOnly = def.edits === 'none' || def.worktree === 'review';
