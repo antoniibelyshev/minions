@@ -195,20 +195,41 @@ export class RuntimeDb {
     this.migrate();
   }
 
+  /**
+   * Brings the schema up to date. An already-current database is checked with plain reads only: taking
+   * the write lock (`BEGIN IMMEDIATE`) on every open made each read-mostly caller (state backup, status,
+   * hooks) contend with live writers, and SQLite's busy handler is not fair (it sleeps and polls), so a
+   * busy writer could starve an opener past busy_timeout and fail it with "database is locked" (task-20.2).
+   */
   private migrate(): void {
+    const tooNew = (current: number) => new MinionsError('INCOMPATIBLE_RUNTIME',
+      `Runtime database schema ${current} is newer than this build supports (${SCHEMA_VERSION}).`,
+      'Upgrade minions; do not downgrade a running installation.');
+    if (this.schemaCurrent(tooNew)) return;
     this.sql.exec('CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)');
     this.transaction(() => {
       const current = Number(this.getMeta('schema_version') ?? 0);
-      if (current > SCHEMA_VERSION) {
-        throw new MinionsError('INCOMPATIBLE_RUNTIME', `Runtime database schema ${current} is newer than this build supports (${SCHEMA_VERSION}).`,
-          'Upgrade minions; do not downgrade a running installation.');
-      }
+      if (current > SCHEMA_VERSION) throw tooNew(current);
       for (let v = current + 1; v <= SCHEMA_VERSION; v++) {
         this.sql.exec(MIGRATIONS[v]!);
         this.setMeta('schema_version', String(v));
       }
       this.sql.prepare('INSERT OR IGNORE INTO guard (id, count) VALUES (1, 0)').run();
     });
+  }
+
+  /** Read-only check in one read snapshot (no write lock): schema at SCHEMA_VERSION and the guard row present. Throws when newer. */
+  private schemaCurrent(tooNew: (current: number) => MinionsError): boolean {
+    this.sql.exec('BEGIN DEFERRED');
+    try {
+      const tables = new Set((this.sql.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('meta', 'guard')").all() as { name: string }[]).map((r) => r.name));
+      if (!tables.has('meta')) return false;
+      const current = Number(this.getMeta('schema_version') ?? 0);
+      if (current > SCHEMA_VERSION) throw tooNew(current);
+      return current === SCHEMA_VERSION && tables.has('guard') && this.sql.prepare('SELECT 1 FROM guard WHERE id = 1').get() !== undefined;
+    } finally {
+      this.sql.exec('COMMIT');
+    }
   }
 
   close(): void { if (this.sql.isOpen) this.sql.close(); }

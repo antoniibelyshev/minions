@@ -190,7 +190,11 @@ describe('state backup: DB snapshot under a concurrent writer', () => {
       })();
     `, p.db], { stdio: ['pipe', 'pipe', 'ignore'] });
     try {
-      await new Promise<void>((res) => writer.stdout.once('data', () => res()));
+      await new Promise<void>((res, rej) => {
+        writer.stdout.once('data', () => res());
+        writer.once('error', rej);
+        writer.once('exit', (code, signal) => rej(new Error(`writer exited before it was ready (code ${code}, signal ${signal})`)));
+      });
       await new Promise((r) => setTimeout(r, 200));
       const counts: number[] = [];
       for (let i = 0; i < 3; i++) {
@@ -210,8 +214,10 @@ describe('state backup: DB snapshot under a concurrent writer', () => {
       }
       expect(counts.at(-1)!).toBeGreaterThan(0);
     } finally {
-      writer.stdin.write('stop\n');
-      await new Promise((r) => writer.once('exit', r));
+      if (writer.pid !== undefined && writer.exitCode === null && writer.signalCode === null) {
+        writer.stdin.write('stop\n');
+        await new Promise((r) => writer.once('exit', r));
+      }
     }
   }, 60_000);
 });
