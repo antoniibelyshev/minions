@@ -104,6 +104,11 @@ export const CustomRoleSchema = z.object({
   requires: z.array(z.enum(CAPABILITIES)).optional(),
   /** This role's column in the policy table (D8): each entry becomes a sub-rule `{effect, roles: [name]}`. */
   capabilities: effectColumn.optional(),
+  /**
+   * Gate/verifier roles: the role whose stage a `needs_changes` sends the task back to (D7). Default: the
+   * nearest earlier producer stage that can commit. Checked by workflowConfigIssues (src/config/workflows.ts).
+   */
+  repairTo: nonEmpty.optional(),
 }).strict();
 export type CustomRoleConfig = z.infer<typeof CustomRoleSchema>;
 
@@ -136,6 +141,20 @@ export const RolesSchema = z.object({
   tester: BuiltinRoleOverrideSchema.optional(),
   reviewer: BuiltinRoleOverrideSchema.optional(),
 }).catchall(CustomRoleSchema);
+
+/** Conditions of a conditional workflow stage (D5): `qa` = run only when the task needs QA. */
+export const STAGE_WHEN = ['qa'] as const;
+/** One workflow stage (D5): a role name, or `{ role, when?, model? }`; `model` is an Agent alias hint (must be in models.allowed). */
+export const WorkflowStageSchema = z.union([
+  nonEmpty,
+  z.object({ role: nonEmpty, when: z.enum(STAGE_WHEN).optional(), model: modelId.optional() }).strict(),
+]);
+export type WorkflowStageConfig = z.infer<typeof WorkflowStageSchema>;
+/**
+ * Named workflows (D5): ordered stage lists. `default` replaces the derived default workflow. Names and
+ * invariants (roles exist, gate after the last committing stage) are checked by workflowConfigIssues.
+ */
+export const WorkflowsSchema = z.record(z.string(), z.array(WorkflowStageSchema).min(1));
 
 export const MinionsConfigSchema = z.object({
   schemaVersion: z.literal(1),
@@ -257,6 +276,8 @@ export const MinionsConfigSchema = z.object({
   capabilities: CapabilitiesSchema,
   /** Built-in role overrides and project-defined worker roles (docs/design/roles-and-workflows.md D3, D9). */
   roles: RolesSchema.optional(),
+  /** Named per-task workflows (docs/design/roles-and-workflows.md D5); unset = only the derived default. */
+  workflows: WorkflowsSchema.optional(),
   sensitivePaths: z.array(nonEmpty),
   architecture: z.enum(['decide', 'propose']),
   git: z.object({

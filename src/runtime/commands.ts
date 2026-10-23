@@ -497,7 +497,7 @@ export function register(program: Command): void {
     .action(async () => { await runHook('pre-agent', hookLoader); exitHook(); });
   hook.command('pre-telegram').description('PreToolUse(Telegram tools) hook: only the coordinator itself may use them, never a subagent')
     .action(async () => { await runHook('pre-telegram', hookLoader); exitHook(); });
-  // DB only (no config or backlog): it runs on every worker tool call while a drain is requested.
+  // DB plus the config when it loads (role contracts for the notice; no backlog): it runs on every worker tool call while a drain is requested.
   hook.command('drain').description('PreToolUse(every tool) hook during a drain: leased workers commit work in progress and return partial results')
     .action(async () => { await runHook('drain', async () => ({ db: getDb(), config: await getConfig().catch(() => undefined) })); exitHook(); });
 

@@ -178,4 +178,15 @@ describe.skipIf(!hasCli)('Backlog.md adapter (real CLI)', () => {
     expect((await code(a.getTask('task-77')))?.code).toBe('NOT_FOUND');
     expect((await a.exportTasks()).length).toBe(5);
   });
+
+  it('stores the workflow name in the meta block (create, update, clear)', async () => {
+    const t = (await a.createTask({ title: 'Docs task', description: 'Write docs', workflow: 'docs', idempotencyKey: 'k-wf' })).task;
+    expect(t).toMatchObject({ workflow: 'docs', description: 'Write docs' });
+    const u = await a.updateTask(t.id, t.version, { workflow: 'research', branch: 'agent/docs' });
+    expect(u).toMatchObject({ workflow: 'research', branch: 'agent/docs', description: 'Write docs' });
+    const cleared = await a.updateTask(t.id, u.version, { workflow: null });
+    expect(cleared.workflow).toBeUndefined();
+    expect(cleared.branch).toBe('agent/docs');
+    expect('workflow' in (await a.getTask('task-1'))).toBe(false);
+  });
 });

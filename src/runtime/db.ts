@@ -5,7 +5,7 @@ import type { IdempotencyStore } from '../backlog/types.js';
 import { MinionsError } from '../core/errors.js';
 import { runtimePaths } from './paths.js';
 
-export const SCHEMA_VERSION = 4;
+export const SCHEMA_VERSION = 5;
 
 export type LeaseRole = 'engineer' | 'tester' | 'reviewer';
 /** active: worker running (or awaiting a correction); completed: valid result; released: no result; unvalidated: invalid after correction. */
@@ -37,6 +37,9 @@ export interface PublicationRow {
 }
 /** signature: host-signed approval token (src/core/approval.ts); verified again before every publication. */
 export interface ApprovalRow { id: number; task_id: string; scope: string; head_sha: string; approved_by: string | null; note: string | null; recorded_at: string; signature: string | null }
+
+/** A task's workflow position (D6); `stages_json` holds the stage list including runtime insertions. */
+export interface TaskStageRow { task_id: string; workflow: string; stages_json: string; position: number; updated_at: string }
 
 export interface GuardRow { fingerprint: string | null; count: number; last_reason: string | null; updated_at: string | null }
 /** The last `controls` event that set one pause flag: its event id, time and the value it set. */
@@ -85,6 +88,13 @@ const MIGRATIONS: Record<number, string> = {
       created_at TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT,
       next_attempt_at TEXT, delivered_at TEXT, delivered_via TEXT);
     CREATE INDEX IF NOT EXISTS outbox_pending ON outbox(delivered_at, created_at);
+  `,
+  // Workflow position per task (docs/design/roles-and-workflows.md D6), written by claim and record. Tasks
+  // without a row (legacy, or never claimed) derive their position from the backlog status.
+  5: `
+    CREATE TABLE IF NOT EXISTS task_stages (
+      task_id TEXT PRIMARY KEY, workflow TEXT NOT NULL, stages_json TEXT NOT NULL,
+      position INTEGER NOT NULL, updated_at TEXT NOT NULL);
   `,
 };
 
@@ -347,6 +357,14 @@ export class RuntimeDb {
   incrementRepairs(taskId: string): number {
     this.exec('INSERT INTO repairs (task_id, cycles) VALUES (?, 1) ON CONFLICT(task_id) DO UPDATE SET cycles = cycles + 1', taskId);
     return this.repairCycles(taskId);
+  }
+
+  // Workflow position (task_stages)
+  taskStage(taskId: string): TaskStageRow | undefined { return this.get<TaskStageRow>('SELECT * FROM task_stages WHERE task_id = ?', taskId); }
+  setTaskStage(taskId: string, workflow: string, stages: unknown[], position: number): void {
+    this.exec(`INSERT INTO task_stages (task_id, workflow, stages_json, position, updated_at) VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(task_id) DO UPDATE SET workflow = excluded.workflow, stages_json = excluded.stages_json, position = excluded.position, updated_at = excluded.updated_at`,
+      taskId, workflow, JSON.stringify(stages), position, nowIso());
   }
 
   // Publications (branch / pull-request delivery)

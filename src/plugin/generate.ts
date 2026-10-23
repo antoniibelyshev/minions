@@ -487,7 +487,7 @@ export async function resolveRolePrompt(def: Pick<RoleDef, 'name' | 'prompt' | '
       throw promptError(def.name, `prompt file "${def.prompt}" not found in ${configDir} (${(e as NodeJS.ErrnoException).code ?? (e as Error).message})`);
     }
     const rel = relative(root, file);
-    if (!rel || rel.startsWith('..') || isAbsolute(rel)) throw promptError(def.name, `prompt file "${def.prompt}" resolves outside ${configDir}`);
+    if (!rel || rel === '..' || rel.startsWith('..' + sep) || isAbsolute(rel)) throw promptError(def.name, `prompt file "${def.prompt}" resolves outside ${configDir}`);
     if (!(await stat(file)).isFile()) throw promptError(def.name, `prompt file "${def.prompt}" is not a regular file`);
     const buf = await readFile(file);
     if (buf.length > MAX_ROLE_PROMPT_BYTES) throw promptError(def.name, `prompt file "${def.prompt}" is larger than ${MAX_ROLE_PROMPT_BYTES / 1024} KB`);
