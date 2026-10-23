@@ -129,8 +129,10 @@ describe('drain notice by contract variant (D10)', () => {
     expect(context(await drainHook(worker('minions:researcher-deep', 'Edit', 'a1'), load))).toMatch(/Commit work in progress/);
     expect(context(await drainHook(worker('minions:auditor', 'Read', 'a2'), load))).toMatch(/stop the review now/);
     expect(context(await drainHook(worker('minions:analyst', 'Read', 'a3'), load))).toMatch(/Your role does not commit/);
-    // an unregistered type is not a minions worker for the drain hook
-    expect((await drainHook(worker('minions:writer', 'Edit', 'a4'), load)).reason).toMatch(/not a registered worker role/);
+    // an unregistered type falls back to the lease-role match: no lease, nothing to do; an active lease of that role still gets the notice
+    expect((await drainHook(worker('minions:writer', 'Edit', 'a4'), load)).reason).toMatch(/no active writer lease/);
+    lease(env, 'writer', 'task-4');
+    expect(context(await drainHook(worker('minions:writer', 'Edit', 'a5'), load))).toMatch(/If you changed tests, commit them/);
     // without the config (unreadable) the lease roles decide; the generic wording applies to project roles
     const dbOnly = () => ({ db: env.db });
     expect(context(await drainHook(worker('minions:researcher-deep', 'Edit', 'b1'), dbOnly))).toMatch(/If you changed tests, commit them/);

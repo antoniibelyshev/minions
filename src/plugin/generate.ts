@@ -1,5 +1,5 @@
 import { existsSync, readFileSync } from 'node:fs';
-import { readdir, readFile, realpath } from 'node:fs/promises';
+import { readdir, readFile, realpath, stat } from 'node:fs/promises';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { CAPABILITIES, can, type Capability } from '../config/capabilities.js';
@@ -28,7 +28,7 @@ export const PROJECT_PROMPT_MARKER = '<!-- minions:project-prompt -->';
 /** Largest role prompt (file or inline) the plugin accepts. */
 export const MAX_ROLE_PROMPT_BYTES = 64 * 1024;
 /** Never in a worker's tool list: spawning or messaging agents (`Task` is the Agent tool's old name). MCP tools are removed too. */
-const NEVER_WORKER_TOOLS = new Set(['Agent', 'Task', 'SendMessage']);
+const NEVER_WORKER_TOOLS = new Set(['agent', 'task', 'sendmessage']);
 /** Removed when a role may not edit (edits `none` or a review worktree). */
 const EDIT_TOOLS = new Set(['Edit', 'Write', 'NotebookEdit', 'MultiEdit']);
 /** Tools of a project role that does not list its own (edit tools are removed again when it may not edit). */
@@ -486,6 +486,7 @@ export async function resolveRolePrompt(def: Pick<RoleDef, 'name' | 'prompt' | '
     }
     const rel = relative(root, file);
     if (!rel || rel.startsWith('..') || isAbsolute(rel)) throw promptError(def.name, `prompt file "${def.prompt}" resolves outside ${configDir}`);
+    if (!(await stat(file)).isFile()) throw promptError(def.name, `prompt file "${def.prompt}" is not a regular file`);
     const buf = await readFile(file);
     if (buf.length > MAX_ROLE_PROMPT_BYTES) throw promptError(def.name, `prompt file "${def.prompt}" is larger than ${MAX_ROLE_PROMPT_BYTES / 1024} KB`);
     text = buf.toString('utf8');
@@ -505,7 +506,7 @@ export function roleTools(def: Pick<RoleDef, 'tools' | 'edits' | 'worktree'>, fa
     if (seen.has(t)) return false;
     seen.add(t);
     // `*` patterns could match MCP or agent tools; minions only renders concrete names.
-    return !NEVER_WORKER_TOOLS.has(t) && !/^mcp/i.test(t) && !t.includes('*') && !(readOnly && EDIT_TOOLS.has(t));
+    return !NEVER_WORKER_TOOLS.has(t.split('(')[0]!.trim().toLowerCase()) && !/^mcp/i.test(t) && !t.includes('*') && !(readOnly && EDIT_TOOLS.has(t));
   });
 }
 

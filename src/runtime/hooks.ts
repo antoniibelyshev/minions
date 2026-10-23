@@ -500,9 +500,8 @@ export async function drainHook(input: unknown, load: DrainLoader): Promise<Hook
     const drain = db.drain();
     if (!drain) return { reason: 'allow: no drain requested' };
     const name = agentType.slice('minions:'.length);
-    // With the config the registry decides; without it (unreadable) the lease roles do: `<r>-deep` runs under an `<r>` lease.
+    // A registered role is resolved by the config; otherwise (config unreadable, or the role no longer registered) the lease roles decide: `<r>-deep` runs under an `<r>` lease.
     const def = config ? agentTypeRole(config, agentType) : undefined;
-    if (config && !def) return { reason: `allow: ${agentType} is not a registered worker role` };
     const active = db.activeLeases();
     // Role names never end in `-deep`, so a `-deep` type without the config runs under its base role's lease.
     const role = def?.name ?? (name.endsWith(DEEP_SUFFIX) ? name.slice(0, -DEEP_SUFFIX.length) : name);
