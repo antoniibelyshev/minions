@@ -443,14 +443,17 @@ from inside:
 - survive the runner: the runner process is SIGKILLed and the canary tree, including a `setsid` grandchild, must
   be gone within 20 s.
 
-The self-test also checks that `/proc/self/status` has `Seccomp_filters` (used by the escapee sweep). If any canary
+The self-test also checks that `/proc/self/status` has `Seccomp_filters` (used by the escapee sweep); a failed open
+or read is reported with its errno, apart from a status file without the line. If any canary
 succeeds, or Landlock ABI is below 6, every process-harness launch is refused with
 `PRECONDITION: process isolation unavailable`, and `status --check` reports why. There is no opt-out flag in
 phase 1.
 
 **What the worker can still do** (accepted, documented risk):
 
-- reach the network on allowed TCP ports and UDP DNS (exfiltrate the repository, as a Claude worker can today);
+- reach the network on allowed TCP ports (exfiltrate the repository, as a Claude worker can today). Landlock governs
+  only TCP connects, so UDP (not only DNS), SCTP and ICMP-ping sockets reach any address and port. MPTCP connects
+  are not covered by Landlock either, so seccomp refuses `IPPROTO_MPTCP` sockets;
 - read any object in the shared object store by id, other branches included (Claude workers can read the whole
   repository today);
 - read its own harness credential (it is in its environment; mitigated by a scoped key and, for Codex, by
@@ -569,20 +572,32 @@ seccomp now covers them too:
   with `openat(O_PATH)` against the worker's root, cwd or dirfd. It accepts the result only if `/proc/self/fd/N` is
   inside the realpath of a writable rule. It then chmods that pinned inode itself and never answers CONTINUE, so
   rewriting the path after the check gains nothing. Anything else gets `EPERM`. `fchmod(fd)` stays allowed.
-- **Denied outright (`EPERM`):** the chown family, set/remove xattr (`l`/`f` variants included), and
-  `utime`/`utimes`/`futimesat`/`utimensat`.
+- **Denied outright (`EPERM`):** the chown family, set/remove xattr (`l`/`f` variants and the 6.13 `setxattrat`/
+  `removexattrat` included), `file_setattr`, and `utime`/`utimes`/`futimesat`/`utimensat`. The `*at` xattr forms
+  matter: a `system.posix_acl_access` ACL rewrites the mode bits (chmod 000 under another name), and `setxattrat`
+  works on an O_PATH fd, which Landlock lets a worker open on a protected file. These numbers come from the unified
+  table (463, 466, 469 on both architectures). Seccomp does not rely on Docker's profile here.
+- **Terminal injection.** `ioctl(TIOCSTI)` and `ioctl(TIOCLINUX)` fail with `EPERM`: the harness keeps fds 0-2 and
+  its controlling tty (`setpgid`, not `setsid`), and `legacy_tiocsti` may be on, so it could otherwise type into a
+  terminal the runner shares with the coordinator. Other ioctls are untouched.
 - **Self-only scheduling.** `setpriority`, `ioprio_set`, `sched_setaffinity`/`setscheduler`/`setattr`/`setparam`
   and `prlimit64` are allowed only when the target argument is 0 (the caller). Any explicit pid, pgrp or -1 is
-  denied, because otherwise a worker could slow down or limit the coordinator.
-- Self-test canaries: `tcp.fastopen`, `meta.{chmod,chown,setxattr,utimensat}`,
-  `sched.{setpriority,setaffinity,ioprio,prlimit}` and `control.chmod-scratch`. `io_uring.setup` now requires the
-  helper's own `ENOSYS`.
+  denied, because otherwise a worker could slow down or limit the coordinator. `setpriority`/`getpriority` must also
+  name `PRIO_PROCESS` or `PRIO_PGRP` (0 is then the caller or the sandbox's own group), and `ioprio_set`
+  `IOPRIO_WHO_PROCESS` or `IOPRIO_WHO_PGRP`: `PRIO_USER` with 0 means every process of the uid.
+- Self-test canaries: `tcp.fastopen`, `socket.mptcp`, `meta.{chmod,chown,setxattr,setxattrat,removexattrat,
+  file_setattr,utimensat}`, `sched.{setpriority,setaffinity,ioprio,prlimit,getpriority-user,setpriority-which}`,
+  `ioctl.{tiocsti,tioclinux}` and `control.chmod-scratch`. `io_uring.setup` requires the helper's own `ENOSYS`, and
+  the newer canaries require its own `EPERM` (`EACCES` for MPTCP), so a dropped rule fails even where the kernel or
+  Docker's profile would also refuse the call. Each probe is harmless if the rule is missing (a non-tty, an
+  out-of-range `which`, a user xattr, a NULL `file_setattr` buffer).
 
 Accepted residual risks:
 
 1. **`fchmod` on a read-only fd.** A worker can still fchmod a same-uid file it may read but not write, such as a
    git object. A chmod 000 there would break the shared repo for others. Accepted because objects are
-   content-addressed and recoverable with `git fsck` or a refetch, and secrets and state cannot be opened at all.
+   content-addressed and secrets and state cannot be opened at all. Recovery is `chmod -R u+r <common>/objects`:
+   `git fsck` or a refetch does not repair it, because the object exists and is merely unreadable.
    To close it, route `fchmod` through the notify handler too (checking `/proc/<pid>/fd/<n>` against the writable
    set).
 2. **No timestamp or xattr changes, even in the worktree.** `touch -d`, `cp -p` and tar mtime restore fail inside
