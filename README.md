@@ -405,6 +405,16 @@ In the container, the coordinator Claude Code session runs in permission mode **
 
 `minions coordinator --probe` (and `doctor`) report which mode the launch will use. If the installed Claude Code doesn't offer `--permission-mode auto`, the coordinator falls back to `acceptEdits`, prints why when it starts, and `doctor` shows a warning. A mode change takes effect when the coordinator restarts. The legacy top-level `permissionMode` key now matters only when it is `"default"` (stricter, still honoured). Its old default value `"acceptEdits"` doesn't opt out; use `coordinator.permissionMode` for that. Worker agents are unaffected. The host runtime always uses `default` (see [Running without Docker](#running-without-docker)).
 
+### Coordinator startup context
+
+Every coordinator turn re-sends the session's tool definitions and skill listing, so their size is paid on each turn. The coordinator launch removes Claude Code built-in tools it never uses (`--disallowedTools`: Artifact*, DesignSync, Workflow, Cron*, Monitor, ScheduleWakeup, RemoteTrigger, NotebookEdit, worktree and plan-mode tools, WebSearch/WebFetch, SendFeedback, ReportFindings), turns tool search on (`ENABLE_TOOL_SEARCH` in its settings, so rarely used tools such as the Telegram ones are loaded on demand) and hides Claude Code's bundled skills. The minions and Telegram plugin skills, Agent, SendMessage, Bash, Read/Edit/Write, Skill and the hooks stay. Worker agents are unaffected. To change it (takes effect at the next coordinator restart):
+
+```json
+{ "coordinator": { "disallowedTools": ["Artifact", "Monitor"], "toolSearch": false, "bundledSkills": true } }
+```
+
+A `disallowedTools` list replaces the default (`[]` keeps every tool); tools the coordinator needs are rejected.
+
 ## Sensitive changes
 
 Changes to these paths need human approval before publication or merge. Local planning and proposed edits can still be allowed.
