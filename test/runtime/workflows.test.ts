@@ -184,8 +184,8 @@ describe('workflows: legacy tasks and assignment', () => {
     v4.setMeta('schema_version', '4');
     v4.close();
     const up = new RuntimeDb(path);
-    expect(SCHEMA_VERSION).toBe(5);
-    expect(up.getMeta('schema_version')).toBe('5');
+    expect(SCHEMA_VERSION).toBeGreaterThanOrEqual(5);
+    expect(up.getMeta('schema_version')).toBe(String(SCHEMA_VERSION));
     up.setTaskStage('task-1', 'default', [{ role: 'engineer' }], 0);
     expect(up.taskStage('task-1')).toMatchObject({ workflow: 'default', position: 0 });
     up.close();

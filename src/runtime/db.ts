@@ -5,7 +5,7 @@ import type { IdempotencyStore } from '../backlog/types.js';
 import { MinionsError } from '../core/errors.js';
 import { runtimePaths } from './paths.js';
 
-export const SCHEMA_VERSION = 5;
+export const SCHEMA_VERSION = 6;
 
 /** The built-in worker roles (always registered). */
 export type BuiltinLeaseRole = 'engineer' | 'tester' | 'reviewer';
@@ -43,6 +43,15 @@ export interface PublicationRow {
 }
 /** signature: host-signed approval token (src/core/approval.ts); verified again before every publication. */
 export interface ApprovalRow { id: number; task_id: string; scope: string; head_sha: string; approved_by: string | null; note: string | null; recorded_at: string; signature: string | null }
+
+/**
+ * A role proposal (docs/design/roles-and-workflows.md D2): drafted by the coordinator with
+ * `minions config roles propose`, applied on the host with `minions config roles apply <id>`. Never effective
+ * by itself. pending: waiting for the owner; applied: the host applied it; superseded: a later proposal for the
+ * same role name replaced it.
+ */
+export type RoleProposalState = 'pending' | 'applied' | 'superseded';
+export interface RoleProposalRow { id: string; name: string; json: string; created_at: string; state: RoleProposalState; updated_at: string; applied_revision: number | null }
 
 /** A task's workflow position (D6); `stages_json` holds the stage list including runtime insertions. */
 export interface TaskStageRow { task_id: string; workflow: string; stages_json: string; position: number; updated_at: string }
@@ -101,6 +110,13 @@ const MIGRATIONS: Record<number, string> = {
     CREATE TABLE IF NOT EXISTS task_stages (
       task_id TEXT PRIMARY KEY, workflow TEXT NOT NULL, stages_json TEXT NOT NULL,
       position INTEGER NOT NULL, updated_at TEXT NOT NULL);
+  `,
+  // Role proposals (D2): stored by the runtime, applied by the host; a row never makes a role effective.
+  6: `
+    CREATE TABLE IF NOT EXISTS role_proposals (
+      id TEXT PRIMARY KEY, name TEXT NOT NULL, json TEXT NOT NULL, created_at TEXT NOT NULL,
+      state TEXT NOT NULL, updated_at TEXT NOT NULL, applied_revision INTEGER);
+    CREATE INDEX IF NOT EXISTS role_proposals_name ON role_proposals(name, state);
   `,
 };
 
@@ -371,6 +387,37 @@ export class RuntimeDb {
     this.exec(`INSERT INTO task_stages (task_id, workflow, stages_json, position, updated_at) VALUES (?, ?, ?, ?, ?)
       ON CONFLICT(task_id) DO UPDATE SET workflow = excluded.workflow, stages_json = excluded.stages_json, position = excluded.position, updated_at = excluded.updated_at`,
       taskId, workflow, JSON.stringify(stages), position, nowIso());
+  }
+
+  // Role proposals (D2)
+  roleProposal(id: string): RoleProposalRow | undefined { return this.get<RoleProposalRow>('SELECT * FROM role_proposals WHERE id = ?', id); }
+  /** Pending proposals (all: every state), oldest first. */
+  roleProposals(opts: { all?: boolean } = {}): RoleProposalRow[] {
+    return opts.all
+      ? this.all<RoleProposalRow>('SELECT * FROM role_proposals ORDER BY created_at, id')
+      : this.all<RoleProposalRow>("SELECT * FROM role_proposals WHERE state = 'pending' ORDER BY created_at, id");
+  }
+  /** Stores a pending proposal; earlier pending proposals for the same role name become `superseded`. */
+  addRoleProposal(p: { id: string; name: string; json: string }): { row: RoleProposalRow; superseded: string[] } {
+    return this.transaction(() => {
+      const at = nowIso();
+      const superseded = this.all<{ id: string }>("SELECT id FROM role_proposals WHERE name = ? AND state = 'pending'", p.name).map((r) => r.id);
+      this.exec("UPDATE role_proposals SET state = 'superseded', updated_at = ? WHERE name = ? AND state = 'pending'", at, p.name);
+      this.exec("INSERT INTO role_proposals (id, name, json, created_at, state, updated_at) VALUES (?, ?, ?, ?, 'pending', ?)", p.id, p.name, p.json, at, at);
+      this.addEvent('role-proposed', null, { id: p.id, name: p.name, superseded });
+      return { row: this.roleProposal(p.id)!, superseded };
+    });
+  }
+  /** pending -> applied (idempotent for an applied row); false when the proposal is missing or superseded. */
+  markRoleProposalApplied(id: string, revision: number | null): boolean {
+    return this.transaction(() => {
+      const row = this.roleProposal(id);
+      if (!row || row.state === 'superseded') return false;
+      if (row.state === 'applied') return true;
+      this.exec("UPDATE role_proposals SET state = 'applied', applied_revision = ?, updated_at = ? WHERE id = ?", revision, nowIso(), id);
+      this.addEvent('role-applied', null, { id, name: row.name, revision });
+      return true;
+    });
   }
 
   // Publications (branch / pull-request delivery)
