@@ -13,13 +13,14 @@ import { emit } from '../core/output.js';
 import { approveOnHost } from '../host/approvals.js';
 import { delegateToRuntime } from '../host/delegate.js';
 import { applyDoctorExit, formatDoctor, runDoctor } from '../host/doctor.js';
+import { formatRestartRequired, hostStatus } from '../host/restart-required.js';
 import { readTelegramAccess } from '../telegram/access.js';
 import { installTelegramPlugin } from '../telegram/install.js';
 import { formatTelegramProbe, probeTelegram } from '../telegram/probe.js';
 import { resolveChannel } from '../telegram/channel.js';
 import {
   buildClaudeCommand, buildCoordinatorCommand, claudePermissionModes, configuredPermissionMode, coordinatorWrapper, launchCoordinator, probeRuntime, readLaunchRecord, readMountedToken, RECOVERY_PROMPT,
-  restartCoordinator, runtimeChannelFacts, syncCoordinator,
+  restartCoordinator, runtimeChannelFacts, syncCoordinator, coordinatorLaunchStatus, type LaunchStatus,
 } from './coordinator.js';
 import { openDb, type DrainRequest, type Lease, type LeaseRole, type PauseChange, type RuntimeDb } from './db.js';
 import { clearDrain, requestDrain } from './drain.js';
@@ -146,6 +147,8 @@ export interface StatusReport {
   coordinatorLock: unknown;
   /** communication.channel: configured vs effective (running coordinator's launch decision, else predicted). */
   channel?: ChannelStatus;
+  /** Running coordinator vs the current launch fingerprint (stale: restart required; the host reports `minions upgrade`). */
+  coordinatorLaunch?: LaunchStatus;
   backlogError?: string;
 }
 
@@ -172,7 +175,7 @@ export async function runtimeChannelStatus(cfg: MinionsConfig, paths = runtimePa
   return { configured: r.configured, effective: r.effective, reason: r.reason, source: 'predicted' };
 }
 
-export async function collectStatus(deps: { db: RuntimeDb; config: MinionsConfig; backlog: () => Promise<BacklogAdapter>; channel?: () => Promise<ChannelStatus> }): Promise<StatusReport> {
+export async function collectStatus(deps: { db: RuntimeDb; config: MinionsConfig; backlog: () => Promise<BacklogAdapter>; channel?: () => Promise<ChannelStatus>; launch?: () => Promise<LaunchStatus> }): Promise<StatusReport> {
   const { db: d, config: cfg } = deps;
   const leases = d.activeLeases();
   const report: StatusReport = {
@@ -183,6 +186,7 @@ export async function collectStatus(deps: { db: RuntimeDb; config: MinionsConfig
     coordinatorLock: d.coordinatorLock() ?? null,
   };
   if (deps.channel) report.channel = await deps.channel().catch(() => undefined);
+  if (deps.launch) report.coordinatorLaunch = await deps.launch().catch(() => undefined);
   try {
     const tasks = await (await deps.backlog()).listTasks();
     for (const t of tasks) report.queue[t.status] = (report.queue[t.status] ?? 0) + 1;
@@ -194,7 +198,7 @@ export async function collectStatus(deps: { db: RuntimeDb; config: MinionsConfig
   return report;
 }
 
-function humanStatus(s: StatusReport): string {
+export function humanStatus(s: StatusReport): string {
   const out = [
     `config revision ${s.configRevision}  profile ${s.profile}  delivery ${s.deliveryMode}`,
     `paused: intake=${s.paused.intake} starts=${s.paused.starts}`,
@@ -515,9 +519,25 @@ export function register(program: Command): void {
         applyDoctorExit(r);
         return;
       }
-      if (runtimeMode() === 'host') return delegate(cmd);
+      if (runtimeMode() === 'host') {
+        // Docker runtime: the container's status plus the host-side restart-required check (`minions upgrade`).
+        const h = await hostStatus({ cwd: process.cwd() });
+        if (h.kind === 'delegate') return delegate(cmd);
+        if (h.kind === 'raw') {
+          if (h.result.stdout) process.stdout.write(h.result.stdout);
+          if (h.result.stderr) process.stderr.write(h.result.stderr);
+          process.exitCode = h.result.code || 1;
+          return;
+        }
+        emit({ ...h.status, restartRequired: h.restartRequired }, { json: globalOpts(cmd).json, human: () => {
+          let base: string;
+          try { base = humanStatus(h.status as unknown as StatusReport); } catch { base = JSON.stringify(h.status, null, 2); }
+          return [base, ...formatRestartRequired(h.restartRequired)].join('\n');
+        } });
+        return;
+      }
       const cfg = await getConfig();
-      const r = await collectStatus({ db: getDb(), config: cfg, backlog: getBacklog, channel: () => runtimeChannelStatus(cfg) });
+      const r = await collectStatus({ db: getDb(), config: cfg, backlog: getBacklog, channel: () => runtimeChannelStatus(cfg), launch: () => coordinatorLaunchStatus(cfg) });
       emit(r, { json: globalOpts(cmd).json, human: humanStatus });
     }));
   const pauseLike = (name: 'pause' | 'resume') => {
