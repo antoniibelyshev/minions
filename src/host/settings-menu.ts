@@ -1,8 +1,9 @@
 // The interactive `minions settings` menu over the settings model (src/host/settings.ts). On a TTY it is
 // a small readline renderer: grouped sections, arrow keys (or j/k) move, Enter edits, q / Esc quits; each
 // row shows the current value and its source, and the selected row its one-line effect. Without a TTY it
-// degrades to numbered prompts. Edits go through applySetting (validation, loosening confirmation, layer
-// write, regeneration); restarts are collected and offered once when leaving the menu.
+// degrades to numbered prompts; token items then only point to `minions auth <kind> --stdin` (the auth
+// flow must not read the menu's piped stdin). Edits go through applySetting (validation, loosening
+// confirmation, layer write, regeneration); restarts are collected and offered once when leaving the menu.
 import { emitKeypressEvents } from 'node:readline';
 import { createInterface } from 'node:readline/promises';
 import { MinionsError } from '../core/errors.js';
@@ -151,6 +152,12 @@ export async function runSettingsMenu(project: ProjectJson, deps: MenuDeps): Pro
       io.write(`\n${v.key}: ${v.description}\n${v.effect}\n`);
       if (v.type === 'secret') {
         const kind = v.key === 'secrets.github' ? 'github' : 'telegram';
+        if (!io.tty) {
+          // The numbered menu reads a piped (non-TTY) stdin: the auth flow would read the token from that same
+          // stream (the menu's next lines) or fail without a terminal. Point to the piped auth form instead.
+          status = [`${v.label}: not changed here (no terminal to enter a token without echo)`, `hint: run \`minions auth ${kind} --stdin < token-file\` instead`];
+          continue;
+        }
         await deps.runAuth(kind);
         ctx = await load();
         status = [`${v.label}: ${formatValue(currentToken(ctx, kind))}`];

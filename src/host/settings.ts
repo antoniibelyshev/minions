@@ -18,6 +18,7 @@ import { COORDINATOR_DISALLOWED_TOOLS } from '../config/coordinator-tools.js';
 import type { Source } from '../config/resolve.js';
 import { EFFORTS, type CapabilityRule, type MinionsConfig } from '../config/schema.js';
 import { MinionsError } from '../core/errors.js';
+import { usdPerMTok } from '../runtime/spend.js';
 import { atomicWrite, readJsonIfExists } from '../core/fsutil.js';
 import { projectPaths } from '../core/paths.js';
 import { editProjectConfig } from './config-write.js';
@@ -58,6 +59,22 @@ const RESTART_WHY: Record<SettingApply, string> = {
 
 const more = (what: string) => (from: Value, to: Value) => (typeof from === 'number' && typeof to === 'number' && to > from ? `${what} (${from} -> ${to})` : null);
 const turnsOff = (what: string) => (from: Value, to: Value) => (from === true && to === false ? what : null);
+const turnsOn = (what: string) => (from: Value, to: Value) => (from !== true && to === true ? what : null);
+const price = (m: Value) => (typeof m === 'string' ? usdPerMTok(m) : null);
+const priceText = (m: Value) => { const p = price(m); return p === null ? `${String(m)} (no known price)` : `${String(m)} ~$${p}/MTok`; };
+/** A default model that costs more per token (or whose price is unknown: it may cost more) loosens spend. */
+const pricierDefault = (from: Value, to: Value): string | null => {
+  if (from === to || typeof to !== 'string') return null;
+  const pf = price(from); const pt = price(to);
+  if (pf !== null && pt !== null && pt <= pf) return null;
+  return `workers default to a ${pf !== null && pt !== null ? 'pricier' : 'possibly pricier'} model (${priceText(from)} -> ${priceText(to)}; higher spend)`;
+};
+/** Models newly added to the allowed list: the coordinator may pick them per worker. */
+const widensModels = (from: Value, to: Value): string | null => {
+  const was = Array.isArray(from) ? (from as string[]) : [];
+  const added = (Array.isArray(to) ? (to as string[]) : []).filter((m) => !was.includes(m));
+  return added.length ? `the coordinator may pick ${added.join(', ')} for workers (higher spend possible)` : null;
+};
 /** Effective coordinator tool trim: unset = the default list. */
 const trimOf = (v: Value): string[] => (Array.isArray(v) ? (v as string[]) : [...COORDINATOR_DISALLOWED_TOOLS]);
 const capRank =(r: Value): number => {
@@ -73,7 +90,7 @@ export const SETTINGS: readonly SettingDef[] = [
     loosens: (f, t) => (f === 'local' && t !== 'local' ? `agents push agent/<slug> branches to GitHub${t === 'pull-request' ? ' and open pull requests' : ''}` : f === 'branch' && t === 'pull-request' ? 'agents open pull requests on GitHub' : null) },
   { key: 'delivery.merge', group: 'Delivery', label: 'Merge mode', type: 'enum', choices: ['disabled', 'manual', 'auto-when-eligible'], apply: 'prompt',
     description: 'whether minions merges pull requests: never, on request, or automatically when CI and approvals pass',
-    loosens: (_f, t) => (t === 'auto-when-eligible' ? 'pull requests that pass every gate are merged on GitHub without asking' : null) },
+    loosens: (f, t) => (t === 'auto-when-eligible' ? 'pull requests that pass every gate are merged on GitHub without asking' : f === 'disabled' && t === 'manual' ? 'minions may merge pull requests on GitHub when asked' : null) },
   // ---- Verification
   { key: 'verification.testerRequired', group: 'Verification', label: 'Tester on every task', type: 'bool', apply: 'prompt',
     description: 'true: every task gets a tester stage; false: only tasks that need QA (labels, sensitive paths, reviewer request)',
@@ -91,9 +108,11 @@ export const SETTINGS: readonly SettingDef[] = [
     description: 'where the coordinator talks to you; auto = Telegram when a bot token is stored' },
   // ---- Models
   { key: 'models.default', group: 'Models', label: 'Default model', type: 'model', apply: 'prompt',
-    description: 'model of the worker definitions (must be in the allowed list)' },
+    description: 'model of the worker definitions (must be in the allowed list)',
+    loosens: pricierDefault },
   { key: 'models.allowed', group: 'Models', label: 'Allowed models', type: 'models', apply: 'prompt',
-    description: 'models the coordinator may pick per worker (comma-separated)' },
+    description: 'models the coordinator may pick per worker (comma-separated)',
+    loosens: widensModels },
   { key: 'models.selection', group: 'Models', label: 'Model selection', type: 'enum', choices: ['coordinator', 'fixed'], apply: 'prompt',
     description: 'coordinator: picks an allowed model per worker; fixed: always the default model' },
   { key: 'models.coordinator', group: 'Models', label: 'Coordinator model', type: 'model', optional: true, apply: 'launch',
@@ -117,7 +136,8 @@ export const SETTINGS: readonly SettingDef[] = [
     description: 'turn budget of one worker attempt (worker definitions: needs a coordinator restart)',
     loosens: more('each worker attempt may run longer (higher spend)') },
   { key: 'execution.maxRepairCyclesBeforeReplan', group: 'Concurrency', label: 'Repair cycles before replan', type: 'int', min: 1, apply: 'live',
-    description: 'failed fix cycles before the coordinator replans a task' },
+    description: 'failed fix cycles before the coordinator replans a task',
+    loosens: more('more failed fix cycles may run before a task is replanned (higher spend)') },
   // ---- Policy
   { key: 'intake.startReady', group: 'Policy', label: 'Start ready tasks', type: 'bool', apply: 'prompt',
     description: 'whether the coordinator starts ready tasks without asking you first',
@@ -139,7 +159,8 @@ export const SETTINGS: readonly SettingDef[] = [
   { key: 'coordinator.toolSearch', group: 'Policy', label: 'Coordinator tool search', type: 'bool', optional: true, apply: 'launch',
     description: 'true: rarely used tools are loaded on demand (smaller requests); false: Claude Code decides' },
   { key: 'coordinator.bundledSkills', group: 'Policy', label: 'Coordinator bundled skills', type: 'bool', optional: true, apply: 'launch',
-    description: "Claude Code's bundled skills in the coordinator session (plugin skills always stay)" },
+    description: "Claude Code's bundled skills in the coordinator session (plugin skills always stay)",
+    loosens: turnsOn("the coordinator session gets Claude Code's bundled skills (more tools and context)") },
   // ---- Permissions (capabilities)
   ...CAPABILITIES.map((cap): SettingDef => ({
     key: `capabilities.${cap}`, group: 'Permissions', label: cap, type: 'enum', choices: ['allow', 'ask', 'deny'], apply: 'prompt',
