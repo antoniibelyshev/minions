@@ -69,13 +69,15 @@ export class FakeBacklog implements BacklogAdapter {
   }
   async getTask(id: string) { return structuredClone(this.must(id)); }
   async createTask(input: CreateTaskInput) {
-    const t = this.add({ id: `task-${this.tasks.size + 1}`, title: input.title, status: input.status ?? 'idea' });
+    const t = this.add({ id: `task-${this.tasks.size + 1}`, title: input.title, status: input.status ?? 'idea', ...(input.workflow ? { workflow: input.workflow } : {}) });
     return { task: t, created: true };
   }
-  async updateTask(id: string, expectedVersion: string, patch: Partial<Pick<Task, 'status' | 'title' | 'description' | 'priority' | 'labels' | 'branch' | 'prUrl'>>) {
+  async updateTask(id: string, expectedVersion: string, patch: Partial<Pick<Task, 'status' | 'title' | 'description' | 'priority' | 'labels' | 'branch' | 'prUrl'>> & { workflow?: string | null }) {
     const t = this.must(id);
     if (t.version !== expectedVersion) throw new MinionsError('CONFLICT', `version mismatch for ${id}`);
-    Object.assign(t, patch);
+    const { workflow, ...rest } = patch;
+    Object.assign(t, rest);
+    if (workflow === null) delete t.workflow; else if (workflow !== undefined) t.workflow = workflow;
     return structuredClone(this.bump(t));
   }
   async addDependency(id: string, dep: string) { const t = this.must(id); t.dependencies.push(dep); return structuredClone(this.bump(t)); }

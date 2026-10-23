@@ -336,6 +336,37 @@ Decisions taken while implementing the registry (`src/config/roles.ts`), recorde
   `validateResult` by contract stay in 33.4; custom roles get the shared result-contract partial plus a status
   guide for their variant.
 
+## Implementation notes (task-33.3)
+
+Decisions taken while implementing the workflow model (`src/config/workflows.ts`) and the stage machine
+(`Scheduler.claim` / `recordResult`, table `task_stages`, runtime DB migration 5 in `src/runtime/db.ts`):
+
+- **Config.** `workflows.<name>` is a non-empty stage list; names follow the role-name pattern. Invariants 1-2 and
+  stage `model` hints (must be in `models.allowed`) are cross-field checks in `validateConfig`
+  (`workflowConfigIssues`). `roles.<r>.repairTo` exists on project roles only (built-ins keep the D9 fields); it
+  must name another worker role and is refused on producers. Assignment (`backlog create|update --workflow`)
+  accepts configured names (and `default`) only; `update --workflow` is refused while the task has an active lease.
+- **Repair target (D7).** "Nearest earlier stage whose role can commit" is read as nearest earlier *producer*
+  that can commit: the built-in tester can commit, but a reviewer's request-changes must keep going to the
+  engineer. A verifier becomes a repair target only through `repairTo`. A later stage is claimable from
+  `changes-requested` only when some later gate/verifier repairs to it, so a stale row never captures a status that
+  the CI sync or the coordinator set.
+- **Position source.** The `task_stages` row is used when its workflow name and configured stages still match the
+  config and the task's status is consistent with its position (claimable, or the stage's `stageStatus`);
+  otherwise the position is derived from the status (legacy rule of D6). A workflow change between stages
+  therefore takes effect at the next claim by status, not by evidence at the head (the evidence-based reset of
+  D5 is left for later; conservative and enough for built-in roles). Runtime insertions are stored in
+  `stages_json` with `inserted: "qa"` (invariant 3) or `"legacy"` (a `reviewing` task whose workflow has no
+  reviewing stage, e.g. the optional reviewer without `reviewerRequired`).
+- **Record.** A gate approves only with complete verifier evidence for the head when QA is required (else back to
+  the nearest verifier after the last producer before it, inserting the tester). When the last stage completes:
+  a gate (or complete gate evidence for the current head) means approval and delivery/publication as before;
+  with `reviewerRequired` and a gate in the workflow but no gate evidence for the head, the task goes back to the
+  final gate; without a gate the task is `delivered` directly, as engineer/tester did without a reviewer.
+  Publication checks evidence by contract (gate, verifier), which for built-ins is reviewer/tester as before.
+- **Brief.** `stage: {workflow, position, count, role, model?}`; a stage model hint replaces `models.default` in
+  `model`. Worktree kind, CI evidence and the result contract stay per built-in role until 33.4.
+
 ## Back-compat summary
 
 Existing configs validate unchanged (`roles`, `workflows`, `maxByRole` optional; `maxEngineers` and
