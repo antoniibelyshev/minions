@@ -11,7 +11,7 @@ import { emit } from './core/output.js';
  * default help never disables it: agents, hooks, install.sh and docs keep calling it as before.
  * Adding a top-level command requires classifying it here (test/cli-surface.test.ts pins this).
  */
-export const PRIMARY_COMMANDS = ['setup', 'start', 'status', 'upgrade', 'down', 'uninstall'] as const;
+export const PRIMARY_COMMANDS = ['setup', 'start', 'status', 'settings', 'upgrade', 'down', 'uninstall'] as const;
 /** User commands for single steps and fine-grained control (shown by `minions help --all`). */
 export const ADVANCED_COMMANDS = ['init', 'doctor', 'auth', 'config', 'channel', 'runtime', 'import', 'export', 'pause', 'resume'] as const;
 /** Used by the coordinator, workers, hooks and the container (shown by `minions help --all`). */

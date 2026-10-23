@@ -1,3 +1,4 @@
+import { spawn } from 'node:child_process';
 import { resolve as resolvePath } from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import { Option, type Command } from 'commander';
@@ -32,6 +33,8 @@ import { DELIVERY_MODES, formatSetup, runSetup, shellQuote, type DeliveryMode, t
 import { DEFAULT_UPGRADE_TIMEOUT_SEC, formatUpgrade, runUpgrade, upgradeTimeout } from './upgrade.js';
 import { HANDOFF_ENV, isMinionsCheckout, runSourcePhase, upgradeSourceMode } from './upgrade-source.js';
 import { readSecret, readlineIO } from './wizard.js';
+import { addListCommand, addSetCommand, defaultSettingsRuntime, registerSettings } from './settings-cli.js';
+import { runSettingsMenu, terminalMenuIO } from './settings-menu.js';
 import { initMayOfferAssistant, launchAssistant, loadAssistantContext, offerSetupAssistant, registerAssistant } from './assistant.js';
 
 const say = (json: boolean, msg: string) => { if (!json) process.stderr.write(msg + '\n'); };
@@ -237,6 +240,25 @@ async function confirmOrNull(question: string): Promise<boolean | null> {
   if (!process.stdin.isTTY) return null;
   const rl = createInterface({ input: process.stdin, output: process.stderr });
   try { return !/^n(o)?$/i.test((await rl.question(`${question} `)).trim()); } finally { rl.close(); }
+}
+
+/** The settings menu's token items: runs the existing `minions auth github|telegram` flow in this terminal. */
+function runAuthFlow(kind: 'github' | 'telegram'): Promise<void> {
+  return new Promise((resolve) => {
+    const child = spawn(process.execPath, [...process.execArgv, process.argv[1]!, 'auth', kind], { stdio: 'inherit' });
+    child.on('error', () => resolve());
+    child.on('close', () => resolve());
+  });
+}
+
+/** Yes/no; the default follows the (Y/n) / (y/N) marker; null without a terminal. */
+async function confirmMarked(question: string): Promise<boolean | null> {
+  if (!process.stdin.isTTY) return null;
+  const rl = createInterface({ input: process.stdin, output: process.stderr });
+  try {
+    const a = (await rl.question(`${question} `)).trim();
+    return a ? /^y(es)?$/i.test(a) : /\(Y\/n\)/.test(question);
+  } finally { rl.close(); }
 }
 
 async function confirm(question: string): Promise<boolean> {
@@ -654,7 +676,17 @@ export function register(program: Command): void {
   registerChannel(program, { confirm: confirmOrNull });
   registerAssistant(registerGithubSetup(setupCmd));
 
-  const config = program.command('config').description('Inspect configuration');
+  registerSettings(program, {
+    confirm: confirmMarked,
+    menu: async (project, o) => {
+      await runSettingsMenu(project, { io: terminalMenuIO(), runtime: defaultSettingsRuntime, layer: o.layer, runAuth: runAuthFlow });
+    },
+  });
+
+  // Advanced alias of `minions settings` (kept for scripts): `config show` (raw effective config), `config list`, `config set`.
+  const config = program.command('config').description('Alias of `minions settings`: show the raw effective config, list or set settings');
+  addListCommand(config);
+  addSetCommand(config, { confirm: confirmMarked });
   config.command('show')
     .description('Show the effective configuration')
     .option('--explain', 'include the source of every value (default/project/local/session)')

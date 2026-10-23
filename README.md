@@ -4,7 +4,7 @@ minions installs a small Claude Code development team into a Git project on your
 
 Everything the model controls runs inside one Docker container per project. Your Mac runs only a small, trusted `minions` CLI. (You can explicitly opt into a less safe **host runtime** without Docker; see [Running without Docker](#running-without-docker).) That CLI installs the team, starts and stops the container, provisions the credentials you grant, and handles explicit import and export.
 
-> **Status:** version 0.1 (bootstrap) is installable from GitHub or from source (see [Install in another project](#install-in-another-project)). It implements the terminal workflow on the host through six everyday commands (`setup`, `start`, `status`, `upgrade`, `down`, `uninstall`; see [Everyday use](#everyday-use)) plus advanced commands for single steps (see [docs/cli.md](docs/cli.md)); an opt-in host runtime without Docker ([Running without Docker](#running-without-docker)); optional Telegram communication through the official Claude Code channel plugin (see [docs/design/telegram.md](docs/design/telegram.md), including a durable notification outbox and plain-language controls with terminal equivalents); the Backlog.md backend; `local` delivery (commits on `agent/<slug>` branches, fetched to the host with `minions export`); and `branch` / `pull-request` delivery to GitHub (push `agent/<slug>`, open one PR; merged only through opt-in CI-gated GitHub auto-merge, see [CI-gated auto-merge](#ci-gated-auto-merge-opt-in)). The rest of this README describes the intended version 1 behavior. Sections marked **(deferred in v0.1)** are not implemented yet, and `minions status --check` reports them as unavailable: GitHub Issues backend, merge requests (`delivery.merge: "manual"`), review publication, config plan/apply, backlog migration, the plan/migration parts of upgrade, budgets, companion containers, GitHub App short-lived tokens (a fine-grained PAT is used instead), CODEOWNERS mapping of sensitive paths, and versioning a shared backlog in Git. `minions auth github` stores a per-project fine-grained GitHub token on the host (see [docs/design/bootstrap.md](docs/design/bootstrap.md#github-credential)); the container uses it for branch/pull-request delivery. The v0.1 contract is [docs/design/bootstrap.md](docs/design/bootstrap.md); the full requirements are in [docs/spec.md](docs/spec.md).
+> **Status:** version 0.1 (bootstrap) is installable from GitHub or from source (see [Install in another project](#install-in-another-project)). It implements the terminal workflow on the host through seven everyday commands (`setup`, `start`, `status`, `settings`, `upgrade`, `down`, `uninstall`; see [Everyday use](#everyday-use)) plus advanced commands for single steps (see [docs/cli.md](docs/cli.md)); an opt-in host runtime without Docker ([Running without Docker](#running-without-docker)); optional Telegram communication through the official Claude Code channel plugin (see [docs/design/telegram.md](docs/design/telegram.md), including a durable notification outbox and plain-language controls with terminal equivalents); the Backlog.md backend; `local` delivery (commits on `agent/<slug>` branches, fetched to the host with `minions export`); and `branch` / `pull-request` delivery to GitHub (push `agent/<slug>`, open one PR; merged only through opt-in CI-gated GitHub auto-merge, see [CI-gated auto-merge](#ci-gated-auto-merge-opt-in)). The rest of this README describes the intended version 1 behavior. Sections marked **(deferred in v0.1)** are not implemented yet, and `minions status --check` reports them as unavailable: GitHub Issues backend, merge requests (`delivery.merge: "manual"`), review publication, config plan/apply, backlog migration, the plan/migration parts of upgrade, budgets, companion containers, GitHub App short-lived tokens (a fine-grained PAT is used instead), CODEOWNERS mapping of sensitive paths, and versioning a shared backlog in Git. `minions auth github` stores a per-project fine-grained GitHub token on the host (see [docs/design/bootstrap.md](docs/design/bootstrap.md#github-credential)); the container uses it for branch/pull-request delivery. The v0.1 contract is [docs/design/bootstrap.md](docs/design/bootstrap.md); the full requirements are in [docs/spec.md](docs/spec.md).
 
 ## Contents
 
@@ -166,6 +166,7 @@ These are the only commands you need day to day. `minions --help` lists exactly 
 | `minions setup [path]` | Install, configure or reconfigure minions for a repository. Safe to rerun. |
 | `minions start` | Start the team (if needed) and attach to the coordinator. Use it after a reboot or to resume work. |
 | `minions status` | Queue, workers, pause state and channel. `minions status --check` checks the host, Docker, the container and Claude authorization. |
+| `minions settings` | Change everyday settings in a menu: delivery and merge mode, testing, reporting, models, concurrency, permissions, tokens (shown only as provisioned/missing), pause/resume. `minions settings --list` and `minions settings set <key> <value>` do the same from scripts. See [Changing settings](#changing-settings). |
 | `minions upgrade` | Move the running team onto the installed minions version without losing work. Running workers commit their progress and hand back; they continue after the upgrade. |
 | `minions down` (or `minions stop`) | Stop the team. Data and progress are kept; `minions start` resumes. |
 | `minions uninstall` | Remove minions from the project, keeping task data unless you ask otherwise. |
@@ -413,7 +414,7 @@ Every coordinator turn re-sends the session's tool definitions and skill listing
 { "coordinator": { "disallowedTools": ["Artifact", "Monitor"], "toolSearch": false, "bundledSkills": true } }
 ```
 
-A `disallowedTools` list replaces the default (`[]` keeps every tool); tools the coordinator needs are rejected.
+A `disallowedTools` list replaces the default (`[]` keeps every tool); tools the coordinator needs are rejected. `minions settings` (Policy) edits all three: `settings set coordinator.disallowedTools none` keeps every tool (a loosening change that needs a yes), `default` restores the built-in trim.
 
 ## Sensitive changes
 
@@ -441,28 +442,36 @@ Settings resolve in this order, with later sources overriding earlier ones:
 Each effective value records where it came from:
 
 ```sh
-minions config show
-minions config show --explain     # every value with its source (default/project/local/session)
+minions settings --list           # every setting with its value and source (profile default / project or shared config / local override)
+minions config show --explain     # advanced: the raw effective config, every value with its source
 ```
 
-### Changing settings mid-project (deferred in v0.1)
+### Changing settings
 
-In v0.1, edit the project config on the host and run `minions start` again; the container reads it read-only.
-
-Ask the coordinator, which uses `minions-configure`, or use the CLI:
+`minions settings` opens a menu in the terminal: arrow keys (or j/k) move through grouped sections (Delivery, Verification, Reporting, Models, Concurrency, Policy, Permissions, Integrations, Pause), Enter edits the selected item, q quits. Each row shows the current value and where it comes from; the selected row shows a one-line description and how a change takes effect. Without a terminal the menu falls back to numbered prompts. For scripts:
 
 ```sh
-minions config plan  ...   # typed patch, impact classification, diff
-minions config apply ...   # apply, bump configRevision, regenerate artifacts
+minions settings --list [--json]                      # every setting, value, source, restart/loosening flags
+minions settings set execution.maxActiveTasks 3 --yes # one change; --json for an envelope
+minions settings set execution.maxEngineers 3 --yes   # (maxEngineers must stay <= maxActiveTasks: raise that first)
+minions settings set models.effort default            # "default" removes an optional setting
+minions settings restart                              # graceful coordinator restart for pending changes
 ```
 
-Each change is classified by when it takes effect:
+- **Validation first.** Every edit is checked with the full config schema against all layers before anything is written; an invalid value (say `maxEngineers` above `maxActiveTasks`) is rejected with the reason.
+- **Where it is saved.** Changes go to the host-only `config.local.json` of the project. On a shared install, `--shared` writes the committed `.minions/config.json` instead (with a `configRevision` bump; commit it yourself). A local override can't lift a `deny` set in the project config.
+- **No silent loosening.** A change that widens what the team may do (more concurrency or turns, skipping the reviewer or tester, CI instead of local verification, push/PR delivery, auto-merge, starting tasks without asking, a looser capability or permission mode) shows what it allows and needs a yes; `set` needs `--yes` without a terminal.
+- **Taking effect.** Each save regenerates the runtime config and the mounted plugin. Concurrency (max active tasks and engineers), repair cycles, context resets and pause/resume take effect on the runtime's next command. Settings the coordinator and worker definitions read at session start (delivery, verification, reporting, models including the default model, the per-attempt turn limit, permissions) and launch settings (channel, coordinator model, effort, permission mode, the coordinator tool trim, tool search and bundled skills) need a coordinator restart: `settings` offers it (`set --restart` / `--no-restart` decide up front). The restart is graceful: it is refused while workers are active, and `minions settings restart` retries it later.
+- **Tokens.** The GitHub and Telegram items show only provisioned/missing; selecting one runs `minions auth github` / `minions auth telegram`.
+
+`minions config` stays as an advanced alias: `config show [--explain]` (raw effective config), `config list` (= `settings --list`), `config set` (= `settings set`).
+
+Each change is classified by when it takes effect (`minions settings --list --json` reports it per setting as `apply`):
 
 | Impact | Example |
 | - | - |
-| immediate | Lowering concurrency stops new starts; running work continues |
-| next-dispatch | Changing the default model |
-| restart-required | Updated prompts or tool permissions, Telegram changes (`minions channel set`, `minions auth telegram`) |
+| immediate (`live`) | Lowering concurrency stops new starts; running work continues. Pause/resume, repair cycles, context resets |
+| restart-required (`prompt`, `launch`) | Changing the default model or the per-attempt turn limit: workers run the `model` and `maxTurns` of their definitions, which the coordinator session loads at start (a brief's `model` / `maxTurns` fields already show the new value at the next claim, but they are informational). Updated prompts or tool permissions, coordinator launch settings, Telegram changes (`minions channel set`, `minions auth telegram`) |
 | migration | Switching backlog backend, switching private and shared visibility |
 
 Tightening permissions suspends the affected external actions immediately. A worker still running on an older config revision is blocked from sensitive external operations. Broadening permissions always needs an explicit request from you; the agent can't grant itself authority. Container mounts, image, resources, published ports, and credential grants are host-controlled. Claude can only propose a change plan for them, which you apply through the host CLI.
@@ -501,7 +510,7 @@ The full shape is defined by the JSON Schema shipped with the package. Unknown f
 - `models.default` is written into every worker definition (agent frontmatter `model`), so it may be a full model ID. The Agent tool only accepts the aliases `sonnet`, `opus`, `haiku` and `fable` as a per-call `model`, so the coordinator omits `model` for the default and passes only an allowed alias to override it; the launch hook denies a full ID. Other full IDs in `models.allowed` can't be chosen per call (they still count for `models.coordinator`).
 - `models.effort` (`low` | `medium` | `high` | `xhigh` | `max`, unset = Claude Code's default) sets the workers' reasoning effort (agent frontmatter `effort`) and the coordinator's (`--effort`). An Agent call can't change effort, so it comes from the definitions. `models.effortByRole` (`engineer`, `engineerDeep`, `tester`, `reviewer`, `coordinator`; each optional) overrides it per role, falling back to `models.effort`. `models.coordinator` picks the coordinator session's model (`--model`; must be in `models.allowed`).
 - Two engineer definitions are generated from the same template: `minions:engineer` for routine work and `minions:engineer-deep` at `effortByRole.engineerDeep` (default: one level above the engineer's effort, `high` when that is unset). The coordinator uses engineer-deep for hard debugging, architecture work, or a retry after an engineer attempt failed. Both run under the same engineer lease.
-- Example, routine engineers at low effort with medium testers, reviewers and coordinator, and a medium-effort deep engineer: `"models": { "default": "claude-opus-5-5", "allowed": ["claude-opus-5-5", "sonnet", "opus", "haiku"], "selection": "coordinator", "effort": "medium", "effortByRole": { "engineer": "low" } }`. Edit these in the project config (`.minions/config.json`), then run `minions upgrade` to regenerate the definitions.
+- Example, routine engineers at low effort with medium testers, reviewers and coordinator, and a medium-effort deep engineer: `"models": { "default": "claude-opus-5-5", "allowed": ["claude-opus-5-5", "sonnet", "opus", "haiku"], "selection": "coordinator", "effort": "medium", "effortByRole": { "engineer": "low" } }`. Change them with `minions settings` (Models), which regenerates the definitions and offers the coordinator restart.
 - Each attempt is capped at 80 turns, and a task replans after 3 repair cycles. These are attempt limits; they don't cancel the task.
 - Per-task and per-day USD caps are optional and off by default. When set, minions checks known usage before starting each attempt and stops new starts once a cap is reached. Usage figures may be estimates, and minions records how reliable they are. It doesn't promise hard billing enforcement.
 - minions tracks completion time, attempts, repairs, human interventions, and available usage per task.

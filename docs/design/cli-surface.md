@@ -15,12 +15,12 @@ Every top-level command belongs to exactly one tier:
 
 | Tier | Commands | Listed by |
 | - | - | - |
-| Primary | `setup`, `start`, `status`, `upgrade`, `down` (alias `stop`), `uninstall` (+ `help`) | `minions --help`, `minions help`, README quick start and everyday use |
+| Primary | `setup`, `start`, `status`, `settings`, `upgrade`, `down` (alias `stop`), `uninstall` (+ `help`) | `minions --help`, `minions help`, README quick start and everyday use |
 | Advanced | `init`, `doctor`, `auth`, `config`, `channel`, `runtime`, `import`, `export`, `pause`, `resume` | `minions help --all`, docs/cli.md |
 | Internal | `work`, `backlog`, `hook`, `coordinator`, `telegram`, `workspace`, `sync`, `ci` | `minions help --all`, docs/cli.md |
 | Unlisted | `git-credential` (git credential-helper protocol entry point) | nowhere (already hidden before this change) |
 
-Rationale for the primary set (six commands, the lifecycle of an installation):
+Rationale for the primary set (seven commands, the lifecycle of an installation):
 
 - `setup` installs, configures and reconfigures. It already runs `init`, `auth github`,
   `auth telegram`, CI guidance, `start` and `import` in order and is safe to rerun, so those become
@@ -28,6 +28,8 @@ Rationale for the primary set (six commands, the lifecycle of an installation):
 - `start` resumes work after a reboot or a `down` and attaches to the coordinator.
 - `status` is the one "how is it going" command. `status --check` runs the host health checks
   (the same report as `doctor`), so users don't need `doctor` as a separate name.
+- `settings` (task-23) is the everyday settings menu (`--list` / `set <key> <value>` for scripts); `setup`
+  stays the first-time and integration wizard. `config` is an advanced alias (`config show`, `list`, `set`).
 - `upgrade` (task-3.2) moves a running team onto the installed version.
 - `down` stops the team; `stop` is an alias because that is the word users look for (the README
   previously listed `minions stop` as planned).
