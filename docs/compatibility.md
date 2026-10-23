@@ -94,7 +94,7 @@ fake GitHub API; the pre-filled token URL follows GitHub's documented template U
   commit status with that name (see "CI as verification authority").
 - **Deferred features** (reported as unavailable by `minions doctor`): GitHub Issues backend,
   merge requests (`delivery.merge: "manual"`), review publication, the notification outbox, config plan/apply transactions,
-  backlog migration, upgrade, budgets, companion containers, GitHub App short-lived tokens (a long-lived
+  backlog migration, upgrade plan and schema migration (drift checks, journal), budgets, companion containers, GitHub App short-lived tokens (a long-lived
   fine-grained PAT is used instead), CODEOWNERS mapping of sensitive paths, shared backlog versioned in Git.
 - **Telegram bot token exposure inside the container**: the token is mounted read-only and given only to
   the coordinator's `claude` process environment, but the coordinator's tools (and workers' Bash, which
@@ -124,3 +124,57 @@ fake GitHub API; the pre-filled token URL follows GitHub's documented template U
   process running as your macOS user can read them (normal macOS behaviour). The plaintext copy mounted into the
   container is cleared when `minions start` fails to bring the container up and by `minions doctor` when the container is
   confirmed gone (exited, dead or absent; an uncertain state only produces a warning); the Keychain/file-store originals are never removed by that cleanup.
+
+## Upgrading (`minions upgrade`)
+
+`minions upgrade` (Docker runtime) moves a running project onto the installed minions package. The host
+runtime has no image or container: install the new CLI, wait for no active workers, then run
+`minions down && minions start`. Contract: [design/bootstrap.md](design/bootstrap.md#upgrade).
+
+Flags: `--timeout <seconds>` (default 1800; 0 with `--now`), `--now`, `--from-container [branch]`,
+`--rebuild-cli`, `--dry-run` (lists the steps, changes nothing), and the global `--json` (the result
+envelope: steps, interrupted leases, image, coordinator, `plugin`, and for the source phase `sync`,
+`cli`, `stopped`, `continued`). Exit code 1 when a step failed or the upgrade stopped.
+
+Steps, in order (names as in `--json`):
+
+1. `sync`, `cli` (source phase, before anything touches the container). `--from-container` (local
+   delivery only, container must be running) exports the container branches and fast-forwards a host
+   branch (default: the base branch) to `minions/<base>`, only on a strict fast-forward with clean trees;
+   a dirty tree or divergence refuses and changes nothing. With GitHub delivery the host base is instead
+   fast-forwarded to `origin/<base>` and `--from-container` is refused. When the project repository is a
+   minions checkout whose build differs from the installed CLI, the CLI is rebuilt or reinstalled, but
+   only with `--rebuild-cli` (it runs the checkout's npm scripts on the host; review it first), and the
+   rest of the upgrade is handed off to the newly installed CLI (`continued: true`). Without
+   `--rebuild-cli`, or for installs npm cannot replace in place (git URL, unknown), the exact command and
+   the rerun command are printed and the upgrade stops before any container step.
+2. `preflight` (read-only), `pause` (new starts, plus a drain request), `drain`. Workers commit work in
+   progress (`wip:`) and return partial results; recovery re-dispatches their tasks. If workers outlast
+   `--timeout`, the default aborts and resumes starts; `--now` releases them and reports them as
+   interrupted. Starts you paused yourself stay paused.
+3. `files`: regenerates compose.yaml, the runtime config and the plugin the container mounts from the
+   installed package, and reports whether the plugin matches it (`plugin` in `--json`; files you edited
+   are kept with a warning). `minions doctor` has a `plugin` check for the same staleness.
+4. `image`: rebuilt only when the `minions.build` fingerprint changed, otherwise skipped.
+5. `secrets`, `recreate` (`docker compose up --force-recreate`), `workspace`, `origin` (the repository
+   import is refreshed and origin reconfigured; the existing clone is kept).
+6. `resume` (starts, before the coordinator restarts so recovery can dispatch), `coordinator`
+   (`minions coordinator restart --recover`). The new coordinator session reads its handoff file if one
+   exists, runs with the trimmed tool set (`coordinator.disallowedTools`, `toolSearch`, `bundledSkills`
+   to adjust) and, unless `coordinator.contextReset` has `enabled: false`, resets its own context
+   routinely afterwards.
+
+Safety: the upgrade never runs `compose down -v`, never removes volumes and never re-clones the
+workspace (clone, worktrees, backlog, runtime DB and Claude login live in named volumes). Any failure
+before the container is recreated resumes starts and leaves the running container as is; after the
+recreate, remaining steps are still attempted and failures reported. An interrupt (Ctrl-C) before the
+recreate resumes the starts this upgrade paused; a rerun finishes an interrupted upgrade.
+
+Restart-required: `minions status` and `minions doctor` (both with `--json`) report when the running
+container no longer matches what the upgrade would give it (outdated image, container CLI version,
+credential mounts, coordinator launch settings). Run `minions upgrade` to apply it. This check never
+fails `doctor`.
+
+Deferred (v0.1): the upgrade plan and the schema/config migration (config backup, drift checks of
+managed files, the interrupted-operation journal). `minions doctor` lists "upgrade plan and schema
+migration" as unavailable.
