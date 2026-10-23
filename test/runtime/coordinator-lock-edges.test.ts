@@ -8,9 +8,9 @@ import { describe, expect, it } from 'vitest';
 import type { RunOptions, RunResult } from '../../src/core/exec.js';
 import {
   acquireCoordinatorLockWaiting, coordinatorWrapper, LockWaitAborted, readExitRecord, syncCoordinator, TMUX_SESSION,
-  type CoordinatorLock, type CoordinatorLockStore, type SpawnLike,
+  type CoordinatorLockStore, type SpawnLike,
 } from '../../src/runtime/coordinator.js';
-import { RuntimeDb } from '../../src/runtime/db.js';
+import { RuntimeDb, type CoordinatorLock } from '../../src/runtime/db.js';
 import { runtimePaths } from '../../src/runtime/paths.js';
 import { defaults } from '../helpers.js';
 import { tmp } from './fixtures.js';

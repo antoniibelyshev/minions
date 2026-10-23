@@ -48,7 +48,7 @@ is used instead), CODEOWNERS mapping of sensitive paths, shared backlog versione
 - Pinned in image: base `node:22-bookworm-slim` (digest pinned in Dockerfile), `@anthropic-ai/claude-code@2.1.292`, `backlog.md@1.54.0`. Tested range documented in `docs/compatibility.md`.
 - No `--append-system-prompt-file` exists in Claude Code 2.1.292; the launcher reads the coordinator prompt file and passes it with `--append-system-prompt` as an argv element (no shell).
 - One coordinator per project (spec §447, task-17): the runtime DB lock (`meta.coordinator_lock`, `{pid, session, acquiredAt}`) is enforced by `minions coordinator run`, on top of `tmux new-session -A` (which only dedupes one session name on one tmux server). The holder is the wrapper, which spawns claude as a child (no exec) and releases the lock when claude exits; it is taken before the launch record is written, so a refused duplicate changes nothing. Takeover rule: a holder whose pid is gone (SIGKILL, container restart) is replaced; on Linux a live pid whose `/proc/<pid>/cmdline` is not a coordinator wrapper counts as gone (pid reuse). Restarts (`coordinator restart`/`sync`, upgrades, idle self-restart) cannot deadlock or leave the project without a coordinator: the wrapper escalates a forwarded SIGHUP/SIGTERM to SIGTERM (4 s) and SIGKILL (8 s) on its own claude child; after `kill-session` the sync waits up to 15 s for the old wrapper to release, then SIGTERMs the lock holder and, 5 s later, SIGKILLs its claude children and the holder. Each signal goes only to a pid re-checked right before it (still the pid the project lock names or its direct child, alive, `/proc` cmdline `coordinator run` or `claude`); without `/proc` nothing is signalled and the restart fails with CONFLICT instead of relaunching. A (re)launch reports `running` only once the new wrapper holds the lock (or its session outlived the wrapper's 10 s lock wait); a session that ends first is an error. A starting wrapper waits up to 10 s for a live holder before refusing with CONFLICT ("attach with `minions start`").
-- Lock hardening (task-38): the lock also records the holder's process start time (`start`, `/proc/<pid>/stat` field 22). A live pid whose start time differs from the recorded one is not the holder, so a reused pid (a tmux client whose argv carries `minions coordinator run`, or `minions coordinator sync/status`) is never waited for or signalled; the cmdline check now requires `coordinator run` and rejects a `tmux` argv[0] (older locks without `start`). Without `/proc` a live pid still counts as the holder and is never signalled. The probe window between taking the lock and spawning claude (Telegram probe, `claude --help`, any start-up work) is guarded: the wrapper installs SIGTERM/SIGHUP/SIGINT/SIGQUIT handlers in the same tick it takes the lock; a signal there cancels the launch (no claude, no launch record), releases the lock, writes the exit record and exits 128+n at once. runCoordinator hands the guard over to its own handlers in the same tick it spawns claude. Before the wrapper's SIGKILL escalation (and the sync's SIGKILL of a stuck holder's claude) claude's descendants, the MCP servers such as the Telegram poller, are SIGKILLed deepest first, each re-verified through its `/proc` parent; the pane's process group is never signalled. Without `/proc` they rely on the stdin EOF they get when claude dies.
+- Lock hardening (task-38): the lock also records the holder's process start time (`start`, `/proc/<pid>/stat` field 22). A live pid whose start time differs from the recorded one is not the holder, so a reused pid (a tmux client whose argv carries `minions coordinator run`, or `minions coordinator sync/status`) is never waited for or signalled; the cmdline check now requires `coordinator run` and rejects a `tmux` argv[0] (older locks without `start`). Without `/proc` a live pid still counts as the holder and is never signalled. The probe window between taking the lock and spawning claude (Telegram probe, `claude --help`, any start-up work) is guarded: the wrapper installs SIGTERM/SIGHUP/SIGINT/SIGQUIT handlers before it awaits the lock (task-40; installing them right after the lock left a few microtask hops in which a signal took Node's default action with the lock held); a signal there cancels the launch (no claude, no launch record), releases the lock if it was taken, writes the exit record and exits 128+n at once. A signal during the wait for a previous holder ends the wait without taking the lock. runCoordinator hands the guard over to its own handlers in the same tick it spawns claude. A re-entrant acquire (same pid and session) whose recorded start time differs from the caller's (both known) is a reused pid, i.e. a new holder: it gets a fresh `acquiredAt` and a `coordinator-lock` event (task-40), so a relaunch watching `(pid, acquiredAt)` and the context-reset session scope both see the handover. Before the wrapper's SIGKILL escalation (and the sync's SIGKILL of a stuck holder's claude) claude's descendants, the MCP servers such as the Telegram poller, are SIGKILLed deepest first, each re-verified through its `/proc` parent; the pane's process group is never signalled. Without `/proc` they rely on the stdin EOF they get when claude dies.
 
 ## GitHub credential
 
@@ -225,7 +225,37 @@ Decision record for `delivery.mode` `branch` / `pull-request` (`src/runtime/publ
   The local refs are movable by in-runtime code (`git update-ref`), so they can only add paths; at least
   one of the first two must resolve, otherwise publication fails closed (`PRECONDITION`, nothing
   pushed). Moving the local base ref to the branch head therefore no longer empties the diff
-  (task-1.12). Local delivery never runs this gate. `deny` fails. `ask` — including the
+  (task-1.12). A base with no merge base against the head (unrelated history) fails the gate with
+  `PRECONDITION` (not retryable): it is a state problem, and the base is never skipped, so no path can
+  drop out of the union (task-40). Local delivery never runs this gate.
+- **Where the gate's bases come from (trust boundary, task-40).** `leases.base_sha` is written by the
+  scheduler at every claim (each stage of each attempt) from the workspace's *local* base ref at that
+  moment (`resolveBaseBranch`: `refs/heads/<base>`, else `refs/remotes/host/<base>`, else
+  `refs/remotes/origin/<base>`). The runtime records it, but its value is only as trustworthy as that
+  ref was at claim time, and the ref is agent-writable (worktrees share the repository's refs). It
+  is a good anchor because the *earliest* claim of a task predates the task's own commits; later
+  claims add bases, never remove one. Origin's base is read with `git ls-remote` against the remote;
+  in the container that is the `origin` remote, which resolves through the workspace git config
+  (`remote.origin.url`, `url.<x>.insteadOf`, `remote.origin.uploadpack`), and that config is
+  agent-writable, so an agent can point the "server" read at a repository it controls. The host
+  runtime passes the normalized https URL instead and hardens git (`src/runtime/git-hardening.ts`:
+  only https for network operations), but repository-level `url.<x>.insteadOf` rewrites from one
+  https URL to another still apply. Neither source is trusted to *remove* a path: each base can only
+  add paths to the union, which is why the union stays safe when one of them is forged.
+- **Decision (task-40): main merged into a branch after the claim is still over-reported.** When main
+  moves on after a task's first claim and the branch merges it, the diff against the earliest recorded
+  base also lists main's own changes, so sensitive paths main changed ask for approval again. Fixing
+  that means *excluding* paths explained by a later base (dropping an older recorded base when a later
+  one supersedes it, or subtracting paths that a later base already has). Every such scheme trusts the
+  later base to be genuine main: a later `leases.base_sha` comes from the agent-writable local ref at
+  that claim, and origin's base comes through agent-writable git config (above). An agent that sets
+  `refs/heads/<base>` to its own commit before the next claim (or redirects `ls-remote`) would then
+  hide its own sensitive change, while today the earliest base still reports it. Over-reporting costs
+  an approval; hiding costs the gate, so the union stays. A safe fix needs a base the agents cannot
+  influence, for example origin's base read with `ls-remote` from a neutral directory with no
+  repository or global config (`GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM=1`, only the
+  credential helper via `-c`), diffed with `--no-replace-objects`, and then only used to drop
+  *recorded* bases that are its ancestors, never the remote base itself. That is a separate design task. `deny` fails. `ask` — including the
   sensitive-path upgrade allow→ask — requires a **host-signed** human approval for exactly that head
   (see "Host-signed publication approvals" below; a new commit needs a new approval). The coordinator's
   Claude Code settings still put `minions work approve` under `ask` and deny `git push` /
@@ -320,7 +350,10 @@ cases in the same class, named explicitly:
   at claim time. Code that can rewrite the DB (and move the local base refs) can make those bases
   point at the head, leaving origin's base, read live from the server, as the remaining check; code
   that also moves origin's base needs push rights on the base branch, i.e. the token. Rewriting the
-  DB is therefore the same trust class as using the token directly.
+  DB is therefore the same trust class as using the token directly. The recorded bases are written by
+  the runtime but sourced from the agent-writable local base ref at each claim, and in the container
+  origin's base is read through agent-writable git config (see "Where the gate's bases come from"
+  above); that is why every base can only add paths and none is trusted to hide one.
 
 The final protection must therefore be server-side:
 
@@ -675,6 +708,13 @@ Decision record for GitHub-filtered intake (`src/runtime/intake-sync.ts`, config
   child (`ghWithTimeout(budget, signal)`), and that signal is aborted by both the budget and the
   coordinator's pre-spawn guard (`stop`), so no gh child outlives the pass. A failed or aborted list
   read reports `matched: null` ("issue list not read"), not the pages read so far.
+- **Creates in flight (task-40).** `backlog task create` is a subprocess, and a wrapper stopped by a
+  pre-spawn signal exits without waiting for it, so the task can appear after its pass is gone, with
+  neither the idempotency row nor the sync record written. Each create is marked in the meta row
+  `intake_github_inflight` (key -> start time) before the subprocess starts and unmarked once it
+  settles (recorded or failed). A pass that meets an issue with no linked task and a mark younger than
+  10 minutes skips it with a warning instead of creating a second task; once the task shows up (found
+  by its issue link) the mark is dropped, and an older mark counts as a create that never happened.
 
 ## Guided setup
 

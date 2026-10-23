@@ -126,7 +126,10 @@ const FULL_SHA_RE = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
  * Bases for the sensitive-path diff. `trusted`: base SHAs recorded in the runtime DB at claim time
  * and origin's current base (read with ls-remote, i.e. from the server), each only when the commit is
  * present locally. `local`: the workspace's base refs, which in-runtime code can move; they are
- * diffed too (they can only add paths) but never suffice on their own.
+ * diffed too (they can only add paths) but never suffice on their own. "Trusted" is relative: the
+ * recorded SHAs come from the local base ref at each claim and, in the container, ls-remote resolves
+ * through agent-writable git config, so no base is ever used to remove a path (decision task-40 in
+ * docs/design/bootstrap.md, "Where the gate's bases come from").
  */
 async function gateBases(git: GitFn, repo: string, remote: string, base: string, recorded: (string | null)[]): Promise<{ trusted: string[]; local: string[] }> {
   const hasCommit = async (rev: string) => (await git(repo, ['rev-parse', '--verify', '--quiet', `${rev}^{commit}`], true)).code === 0;
