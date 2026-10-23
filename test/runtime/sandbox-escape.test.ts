@@ -26,11 +26,11 @@ function realHelper(): string | null {
 }
 
 /** Syscalls from the unified table (Linux 6.13+): the same number on every architecture. */
-const UNIFIED = { setxattrat: 463, removexattrat: 466, file_setattr: 469 };
+const UNIFIED = { setxattrat: 463, removexattrat: 466, file_setattr: 469, fchmodat2: 452 };
 /** Syscall numbers the script needs that Perl has no builtin for. */
 const NR: Record<string, Record<string, number>> = {
-  arm64: { ptrace: 117, pidfd_open: 434, pidfd_send_signal: 424, pidfd_getfd: 438, tgkill: 131, sched_setaffinity: 122, ioprio_set: 30, io_uring_setup: 425, setxattr: 5, unshare: 97, setpriority: 140, getpriority: 141, ...UNIFIED },
-  x64: { ptrace: 101, pidfd_open: 434, pidfd_send_signal: 424, pidfd_getfd: 438, tgkill: 234, sched_setaffinity: 203, ioprio_set: 251, io_uring_setup: 425, setxattr: 188, unshare: 272, setpriority: 141, getpriority: 140, ...UNIFIED },
+  arm64: { ptrace: 117, pidfd_open: 434, pidfd_send_signal: 424, pidfd_getfd: 438, tgkill: 131, sched_setaffinity: 122, ioprio_set: 30, io_uring_setup: 425, setxattr: 5, unshare: 97, setpriority: 140, getpriority: 141, fchmodat: 53, ...UNIFIED },
+  x64: { ptrace: 101, pidfd_open: 434, pidfd_send_signal: 424, pidfd_getfd: 438, tgkill: 234, sched_setaffinity: 203, ioprio_set: 251, io_uring_setup: 425, setxattr: 188, unshare: 272, setpriority: 141, getpriority: 140, fchmodat: 268, ...UNIFIED },
 };
 const REAL = realHelper();
 const SYS = NR[process.arch];
@@ -72,6 +72,20 @@ r('chmod:via-proc-self-root', chmod(0777, "/proc/self/root$file"), "$!");
 { my $w = "$c->{scratch}/chmod-ok-$$"; my $h; open($h, '>', $w) and close($h);
   r('chmod:scratch-allowed', chmod(0750, $w), "$!"); unlink $w; }
 r('utime:protected', utime(1, 1, $file), "$!");
+# The chmod notify handler follows the kernel's rules: an empty path is ENOENT unless AT_EMPTY_PATH, which names
+# the dirfd itself (any file); AT_SYMLINK_NOFOLLOW on a symlink is EOPNOTSUPP; a bad pointer is EFAULT. An O_PATH
+# fd to a protected file stays refused through AT_EMPTY_PATH.
+{ my ($empty, $w, $l) = ('', "$c->{scratch}/chmod-flags-$$", "$c->{scratch}/chmod-flags-link-$$");
+  my $h; open($h, '>', $w) and close($h); symlink($w, $l);
+  r('fchmodat:empty-path', sc('fchmodat', -100, $empty, 0750) == 0, "$!");
+  sysopen(my $ws, $w, $c->{oPath} + 0) or die "O_PATH $w: $!";
+  r('fchmodat2:empty-path-scratch', sc('fchmodat2', fileno($ws), $empty, 0751, 0x1000) == 0, "$!");
+  r('fchmodat2:nofollow-symlink', sc('fchmodat2', -100, $l, 0752, 0x100) == 0, "$!");
+  r('fchmodat2:nofollow-file', sc('fchmodat2', -100, $w, 0753, 0x100) == 0, "$!");
+  r('fchmodat2:bad-pointer', sc('fchmodat2', -100, 16, 0754, 0) == 0, "$!");
+  my $ok = sysopen(my $pp, $file, $c->{oPath} + 0);
+  r('fchmodat2:empty-path-protected', $ok && sc('fchmodat2', fileno($pp), $empty, 0, 0x1000) == 0, $ok ? "$!" : "O_PATH open: $!");
+  print join("\t", 'mode:scratch-file', 'ok', sprintf('%o', (stat($w))[2] & 07777)), "\n"; unlink $l, $w; }
 { my ($n, $v) = ('user.minions-escape', 'x'); r('setxattr:protected', sc('setxattr', $file, $n, $v, 1, 0) == 0, "$!"); }
 # chmod 000 under another name: a POSIX access ACL with no permissions rewrites the mode bits. By path, and
 # through an O_PATH fd (Landlock lets O_PATH open a protected file) with AT_EMPTY_PATH.
@@ -309,6 +323,18 @@ describe.skipIf(!REAL || !SYS || !PERL)('minions-sandbox escape attempts (real h
         for (const n of ['socket:MPTCP', 'socket:MPTCP6']) {
           expect(out.results.get(n), n).toMatchObject({ ok: false, detail: expect.stringMatching(/permission denied/i) });
         }
+      });
+
+      it('the chmod handler honours empty paths, AT_EMPTY_PATH, AT_SYMLINK_NOFOLLOW and bad pointers like the kernel', () => {
+        expect(out.results.get('fchmodat:empty-path')).toMatchObject({ ok: false, detail: expect.stringMatching(/no such file/i) });
+        expect(out.results.get('fchmodat2:empty-path-scratch')).toMatchObject({ ok: true });
+        expect(out.results.get('fchmodat2:nofollow-symlink')).toMatchObject({ ok: false, detail: expect.stringMatching(/not supported/i) });
+        expect(out.results.get('fchmodat2:nofollow-file')).toMatchObject({ ok: true });
+        expect(out.results.get('fchmodat2:bad-pointer')).toMatchObject({ ok: false, detail: expect.stringMatching(/bad address/i) });
+        expect(out.results.get('mode:scratch-file')?.detail).toBe('753');
+        // AT_EMPTY_PATH on an O_PATH fd to a protected file is still checked against the writable set.
+        expect(out.results.get('fchmodat2:empty-path-protected')).toMatchObject({ ok: false, detail: expect.stringMatching(/not permitted/i) });
+        expect(out.outsideView.protectedMetadataChanged).toBe(false);
       });
 
       it('no setpriority, sched_setaffinity or ioprio_set on a process outside the sandbox', () => {

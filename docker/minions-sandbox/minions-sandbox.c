@@ -666,62 +666,97 @@ static int recv_fd(int sock) {
   return -1;
 }
 
-/* Read a NUL-terminated path from another process's memory at <addr>. */
-static int read_remote_path(pid_t pid, unsigned long long addr, char *buf, size_t len) {
+/* The canonical writable dirs, resolved once in the supervisor before the fork (the rules do not change). */
+static char **writable_canon;
+static size_t nwritable_canon;
+
+static void resolve_writable(const struct rules *r) {
+  writable_canon = xmalloc((r->nfs + 1) * sizeof(char *));
+  for (size_t i = 0; i < r->nfs; i++) {
+    if (!(r->fs[i].access & A_WRITE) || strcmp(r->fs[i].path, "/dev/null") == 0) continue;
+    char resolved[PATH_MAX];
+    if (realpath(r->fs[i].path, resolved)) writable_canon[nwritable_canon++] = strdup(resolved);
+  }
+}
+
+/* The notification is still pending, so <pid> is still the process that made the call and the descriptors
+ * opened from /proc/<pid> since are that process's, not a recycled pid's (seccomp_unotify(2)). */
+static int notif_live(int listener, uint64_t id) { return ioctl(listener, SECCOMP_IOCTL_NOTIF_ID_VALID, &id) == 0; }
+
+/* Read a NUL-terminated path from another process's memory at <addr>. Returns 0, or a negated errno:
+ * EPERM when the memory cannot be opened (or the call is gone), EFAULT for a bad address, ENAMETOOLONG
+ * when there is no terminator within PATH_MAX. */
+static int read_remote_path(int listener, uint64_t id, pid_t pid, unsigned long long addr, char *buf, size_t len) {
   char mp[64];
   snprintf(mp, sizeof mp, "/proc/%d/mem", (int)pid);
   int fd = open(mp, O_RDONLY | O_CLOEXEC);
-  if (fd < 0) return -1;
+  if (fd < 0) return -EPERM;
+  if (!notif_live(listener, id)) { close(fd); return -EPERM; }
   size_t got = 0;
   while (got < len - 1) {
     ssize_t k = pread(fd, buf + got, len - 1 - got, (off_t)(addr + got));
-    if (k < 0) { if (errno == EINTR) continue; close(fd); return -1; }
+    if (k < 0) { if (errno == EINTR) continue; close(fd); return -EFAULT; }
     if (k == 0) break;
     for (ssize_t i = 0; i < k; i++) if (buf[got + i] == '\0') { close(fd); return 0; }
     got += (size_t)k;
   }
   close(fd);
-  return -1; /* no terminator within PATH_MAX: reject */
+  return got == 0 ? -EFAULT : -ENAMETOOLONG;
 }
 
 /* True when <canon> (an already-resolved absolute path) is one of, or beneath, the rules' writable dirs. */
-static int path_within_writable(const struct rules *r, const char *canon) {
+static int path_within_writable(const char *canon) {
   size_t cl = strlen(canon);
-  for (size_t i = 0; i < r->nfs; i++) {
-    if (!(r->fs[i].access & A_WRITE) || strcmp(r->fs[i].path, "/dev/null") == 0) continue;
-    char resolved[PATH_MAX];
-    if (!realpath(r->fs[i].path, resolved)) continue;
-    size_t wl = strlen(resolved);
-    if (cl == wl && memcmp(canon, resolved, wl) == 0) return 1;
-    if (cl > wl && memcmp(canon, resolved, wl) == 0 && canon[wl] == '/') return 1;
+  for (size_t i = 0; i < nwritable_canon; i++) {
+    const char *w = writable_canon[i];
+    size_t wl = strlen(w);
+    if (cl == wl && memcmp(canon, w, wl) == 0) return 1;
+    if (cl > wl && memcmp(canon, w, wl) == 0 && canon[wl] == '/') return 1;
   }
   return 0;
 }
 
+#ifndef AT_EMPTY_PATH
+# define AT_EMPTY_PATH 0x1000
+#endif
+
 /* Resolve the chmod target in the caller's filesystem view, verify it is writable, and chmod the pinned
- * inode. Returns 0 on success or a negated errno for the worker. */
-static long chmod_in_writable(const struct rules *r, pid_t pid, int dirfd, unsigned long long pathaddr, mode_t mode) {
+ * inode. <flags> are fchmodat2's (0 for chmod/fchmodat): AT_SYMLINK_NOFOLLOW and AT_EMPTY_PATH are
+ * honoured as the kernel does. Returns 0 on success or a negated errno for the worker. */
+static long chmod_in_writable(int listener, uint64_t id, pid_t pid, int dirfd, unsigned long long pathaddr, mode_t mode, unsigned flags) {
+  if (flags & ~(unsigned)(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH)) return -EINVAL;
   char path[PATH_MAX];
-  if (read_remote_path(pid, pathaddr, path, sizeof path) < 0) return -ENAMETOOLONG;
+  int rr = read_remote_path(listener, id, pid, pathaddr, path, sizeof path);
+  if (rr < 0) return rr;
+  int empty = path[0] == '\0';
+  if (empty && !(flags & AT_EMPTY_PATH)) return -ENOENT;
   char basepath[64];
   int base;
   if (path[0] == '/') { snprintf(basepath, sizeof basepath, "/proc/%d/root", (int)pid); base = open(basepath, O_PATH | O_CLOEXEC); }
   else if (dirfd == AT_FDCWD) { snprintf(basepath, sizeof basepath, "/proc/%d/cwd", (int)pid); base = open(basepath, O_PATH | O_DIRECTORY | O_CLOEXEC); }
-  else { snprintf(basepath, sizeof basepath, "/proc/%d/fd/%d", (int)pid, dirfd); base = open(basepath, O_PATH | O_DIRECTORY | O_CLOEXEC); }
-  if (base < 0) return -errno;
-  const char *rel = path[0] == '/' ? path + 1 : path;
-  if (!*rel) rel = ".";
-  /* O_PATH without O_NOFOLLOW follows the final symlink as chmod would; the fd then pins that inode. */
-  int tfd = openat(base, rel, O_PATH | O_CLOEXEC);
-  int oerr = errno;
-  close(base);
-  if (tfd < 0) return -oerr;
+  /* AT_EMPTY_PATH names the dirfd itself, which may be any file; otherwise it must be a directory. */
+  else { snprintf(basepath, sizeof basepath, "/proc/%d/fd/%d", (int)pid, dirfd); base = open(basepath, O_PATH | O_CLOEXEC | (empty ? 0 : O_DIRECTORY)); }
+  if (base < 0) return errno == ENOENT && dirfd != AT_FDCWD && path[0] != '/' ? -EBADF : -errno;
+  if (!notif_live(listener, id)) { close(base); return -EPERM; }
+  int tfd;
+  if (empty) tfd = base;
+  else {
+    /* O_PATH follows the final symlink as chmod would (unless AT_SYMLINK_NOFOLLOW); the fd pins that inode. */
+    tfd = openat(base, path[0] == '/' ? path + 1 : path, O_PATH | O_CLOEXEC | ((flags & AT_SYMLINK_NOFOLLOW) ? O_NOFOLLOW : 0));
+    int oerr = errno;
+    close(base);
+    if (tfd < 0) return -oerr;
+  }
+  struct stat st;
+  if (fstat(tfd, &st) < 0) { int e = errno; close(tfd); return -e; }
+  /* Linux cannot change a symlink's own mode: fchmodat2(AT_SYMLINK_NOFOLLOW) on one says EOPNOTSUPP. */
+  if (S_ISLNK(st.st_mode)) { close(tfd); return -EOPNOTSUPP; }
   char link[64], canon[PATH_MAX];
   snprintf(link, sizeof link, "/proc/self/fd/%d", tfd);
   ssize_t cl = readlink(link, canon, sizeof canon - 1);
   if (cl < 0) { int e = errno; close(tfd); return -e; }
   canon[cl] = '\0';
-  if (!path_within_writable(r, canon)) { close(tfd); return -EPERM; }
+  if (!path_within_writable(canon)) { close(tfd); return -EPERM; }
   /* chmod the inode by its magic /proc/self/fd link: swapping the original path cannot redirect it. */
   long rc = fchmodat(AT_FDCWD, link, mode & 07777, 0) < 0 ? -errno : 0;
   close(tfd);
@@ -729,7 +764,7 @@ static long chmod_in_writable(const struct rules *r, pid_t pid, int dirfd, unsig
 }
 
 /* Service one pending notification on the listener fd. */
-static void handle_notif(int listener, const struct rules *r) {
+static void handle_notif(int listener) {
   struct seccomp_notif req;
   memset(&req, 0, sizeof req);
   if (ioctl(listener, SECCOMP_IOCTL_NOTIF_RECV, &req) < 0) return; /* EINTR / target vanished */
@@ -737,16 +772,15 @@ static void handle_notif(int listener, const struct rules *r) {
   memset(&resp, 0, sizeof resp);
   resp.id = req.id;
   int nr = req.data.nr;
-  int dirfd = AT_FDCWD;
-  unsigned long long pathaddr;
-  mode_t mode;
-  if (nr == __NR_fchmodat || nr == __NR_fchmodat2) { dirfd = (int)req.data.args[0]; pathaddr = req.data.args[1]; mode = (mode_t)req.data.args[2]; resp.error = (int)chmod_in_writable(r, (pid_t)req.pid, dirfd, pathaddr, mode); }
+  pid_t pid = (pid_t)req.pid;
+  if (nr == __NR_fchmodat) resp.error = (int)chmod_in_writable(listener, req.id, pid, (int)req.data.args[0], req.data.args[1], (mode_t)req.data.args[2], 0);
+  else if (nr == __NR_fchmodat2) resp.error = (int)chmod_in_writable(listener, req.id, pid, (int)req.data.args[0], req.data.args[1], (mode_t)req.data.args[2], (unsigned)req.data.args[3]);
 #ifdef __NR_chmod
-  else if (nr == __NR_chmod) { pathaddr = req.data.args[0]; mode = (mode_t)req.data.args[1]; resp.error = (int)chmod_in_writable(r, (pid_t)req.pid, dirfd, pathaddr, mode); }
+  else if (nr == __NR_chmod) resp.error = (int)chmod_in_writable(listener, req.id, pid, AT_FDCWD, req.data.args[0], (mode_t)req.data.args[1], 0);
 #endif
   else resp.error = -ENOSYS;
   /* Only answer if the request is still live, else the SEND would race a dead target. */
-  if (ioctl(listener, SECCOMP_IOCTL_NOTIF_ID_VALID, &req.id) == 0) ioctl(listener, SECCOMP_IOCTL_NOTIF_SEND, &resp);
+  if (notif_live(listener, req.id)) ioctl(listener, SECCOMP_IOCTL_NOTIF_SEND, &resp);
 }
 
 static int install_seccomp(void) {
@@ -958,7 +992,7 @@ static void signal_tree(int sig) {
   closedir(d);
 }
 
-static int supervise(pid_t child, const sigset_t *waitset, int listener, const struct rules *r) {
+static int supervise(pid_t child, const sigset_t *waitset, int listener) {
   int status = 0, have_status = 0, terminating = 0, killing = 0;
   long long deadline = 0;
   /* The blocked signals are read through a signalfd so the same poll() can wait on them and on the chmod
@@ -995,7 +1029,7 @@ static int supervise(pid_t child, const sigset_t *waitset, int listener, const s
         }
       }
     }
-    if (li >= 0 && (pfd[li].revents & POLLIN)) handle_notif(listener, r);
+    if (li >= 0 && (pfd[li].revents & POLLIN)) handle_notif(listener);
     if (li >= 0 && (pfd[li].revents & (POLLERR | POLLHUP | POLLNVAL))) { close(listener); listener = -1; }
   }
 done:
@@ -1030,6 +1064,7 @@ static int run_wrapped(const struct rules *r, char **cmd) {
   int sp[2];
   if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sp) < 0) die("socketpair: %s", strerror(errno));
 
+  resolve_writable(r); /* for the chmod handler, once, before the fork */
   pid_t wrapper = getpid();
   pid_t child = fork();
   if (child < 0) die("fork: %s", strerror(errno));
@@ -1048,7 +1083,7 @@ static int run_wrapped(const struct rules *r, char **cmd) {
   close(sp[1]);
   int listener = recv_fd(sp[0]); /* -1 if the child died before confinement */
   close(sp[0]);
-  return supervise(child, &waitset, listener, r);
+  return supervise(child, &waitset, listener);
 }
 
 /* ------------------------------------------------------------------ canaries (run inside the sandbox) */
