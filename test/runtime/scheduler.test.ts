@@ -67,6 +67,18 @@ describe('scheduler claim', () => {
     expect((err as MinionsError).message).toMatch(/Engineer limit/);
   });
 
+  it('the engineer CAPACITY message and hint are unchanged, and a full engineer limit does not stop tester claims', async () => {
+    const env = makeEnv((c) => { c.execution.maxActiveTasks = 3; c.execution.maxEngineers = 1; });
+    for (const id of ['task-1', 'task-2', 'task-3']) env.backlog.add({ id });
+    await engineerPass(env, 'task-1');
+    await env.sched.claim('task-2', 'engineer');
+    const err = (await env.sched.claim('task-3', 'engineer').catch((e: MinionsError) => e)) as MinionsError;
+    expect(err.code).toBe('CAPACITY');
+    expect(err.message).toBe('Engineer limit reached (1/1).');
+    expect(err.hint).toBe('Wait for an engineer to finish.');
+    expect(await code(env.sched.claim('task-1', 'tester'))).toBe('OK');
+  });
+
   it('a task between stages still occupies active capacity', async () => {
     const env = makeEnv();
     for (const id of ['task-1', 'task-2', 'task-3']) env.backlog.add({ id });
