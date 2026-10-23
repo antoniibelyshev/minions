@@ -173,6 +173,15 @@ describe('policy columns', () => {
     expect(() => resolve({ defaults: defaults(), project, local: { roles: { researcher: { maxTurns: 10 } } } })).not.toThrow();
   });
 
+  it('a local layer cannot lift a project capability deny even when roles are configured', () => {
+    const d = defaults();
+    const project = { roles: { researcher }, capabilities: { 'pr.review': 'deny' } };
+    expect(fail(() => resolve({ defaults: d, project, local: { capabilities: { 'pr.review': 'allow' } } })).code).toBe('POLICY_DENIED');
+    const roleDeny = { roles: { researcher: { ...researcher, capabilities: { 'external.read': 'deny' } } } };
+    const e2 = fail(() => resolve({ defaults: d, project: roleDeny, local: { roles: { researcher: { capabilities: { 'external.read': 'allow' } } } } }));
+    expect(e2.code).toBe('POLICY_DENIED');
+  });
+
   it('renders one capability-table column per registered role', () => {
     const header = (cfg: MinionsConfig) => renderCapabilityTable(cfg).split('\n')[0];
     expect(header(defaults())).toBe('| Capability | coordinator | engineer | tester | reviewer | Path rules |');
@@ -223,6 +232,15 @@ describe('per-role capacity', () => {
     const s = resolve({ defaults: defaults(), project: { execution: { maxByRole: { engineer: 2, tester: 2 } } }, session: { execution: { maxEngineers: 1, maxByRole: { tester: 1 } } } }).config;
     expect(s.execution).toMatchObject({ maxEngineers: 1, maxByRole: { engineer: 1, tester: 1 } });
     expect(fail(() => resolve({ defaults: defaults(), session: { execution: { maxByRole: { tester: 5 } } } })).code).toBe('POLICY_DENIED');
+  });
+
+  it('maxEngineers set alone (as `settings set execution.maxEngineers` does) works without maxByRole', () => {
+    const r = resolve({ defaults: defaults(), local: { execution: { maxEngineers: 1 } } }).config;
+    expect(r.execution.maxEngineers).toBe(1);
+    expect(roleLimit(r, 'engineer')).toBe(1);
+    expect(fail(() => resolve({ defaults: defaults(), local: { execution: { maxEngineers: 3 } } })).code).toBe('INVALID_CONFIG');
+    const r3 = resolve({ defaults: defaults(), local: { execution: { maxActiveTasks: 3, maxEngineers: 3 } } }).config;
+    expect(roleLimit(r3, 'engineer')).toBe(3);
   });
 
   it('reports byRole and keeps the engineer fields', () => {
