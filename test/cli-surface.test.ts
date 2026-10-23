@@ -84,7 +84,7 @@ describe('CLI surface (docs/design/cli-surface.md)', () => {
   it('pins the commands visible in the default `minions --help`', () => {
     const help = buildProgram().helpInformation();
     // Changing this list is a product decision: update src/surface.ts, docs/design/cli-surface.md and README.
-    expect(listed(help).sort()).toEqual(['down', 'help', 'setup', 'start', 'status', 'uninstall', 'upgrade']);
+    expect(listed(help).sort()).toEqual(['down', 'help', 'settings', 'setup', 'start', 'status', 'uninstall', 'upgrade']);
     expect(PRIMARY_COMMANDS.length).toBeGreaterThanOrEqual(5);
     expect(PRIMARY_COMMANDS.length).toBeLessThanOrEqual(7);
     expect(help).not.toMatch(/Advanced commands:|Internal commands/);
@@ -107,7 +107,7 @@ describe('CLI surface (docs/design/cli-surface.md)', () => {
     for (const args of [['--help'], ['help']]) {
       const { out, code } = await run(args);
       expect(code).toBe(0);
-      expect(listed(out).sort()).toEqual(['down', 'help', 'setup', 'start', 'status', 'uninstall', 'upgrade']);
+      expect(listed(out).sort()).toEqual(['down', 'help', 'settings', 'setup', 'start', 'status', 'uninstall', 'upgrade']);
       expect(out).toContain('Run `minions help --all` for advanced and internal commands');
     }
   });
