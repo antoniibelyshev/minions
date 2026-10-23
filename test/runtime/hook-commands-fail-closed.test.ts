@@ -77,3 +77,14 @@ describe('hook entries carry a timeout larger than the wrapper', () => {
     expect(HOOK_SETTINGS_TIMEOUT_S).toBeGreaterThan(wrapper(TELEGRAM_HOOK_COMMAND));
   });
 });
+
+describe('task-2.7: wrapper shape and shell safety', () => {
+  const shape = /^timeout (\d+) minions hook (pre-agent|pre-telegram) \|\| exit 2$/;
+  it('both gating hooks use the same wrapper, with plain shell-safe words only', () => {
+    const agent = (template.hooks.PreToolUse.find((e) => e.matcher === 'Agent')!.hooks[0] as { command: string; timeout?: number });
+    expect(agent.command).toMatch(shape);
+    expect(TELEGRAM_HOOK_COMMAND).toMatch(shape);
+    expect(agent.command.replace('pre-agent', 'X')).toBe(TELEGRAM_HOOK_COMMAND.replace('pre-telegram', 'X'));
+    expect(agent.timeout).toBe(HOOK_SETTINGS_TIMEOUT_S);
+  });
+});
