@@ -200,9 +200,10 @@ hardened helper (D3a), and everything it needs to clean up after a crash is pers
      neutralizes what they could run.
    - Cost: one checkout per running process worker (objects shared). See U-G4.
 5. **Spawn** `adapter.plan(...)` under the isolation wrapper (D4) with these properties:
-   - the wrapper starts its own process group, sets `PR_SET_PDEATHSIG` and becomes a child subreaper (D4, "Process
-     lifetime"). The runner spawns from its main thread, because the parent-death signal is tied to the thread
-     that forked (Node's `child_process` spawns from the main thread);
+   - the wrapper starts its own session (and so its own process group), sets `PR_SET_PDEATHSIG` and becomes a
+     child subreaper (D4, "Process lifetime"). The runner spawns from its main thread, because the parent-death
+     signal is tied to the thread that forked (Node's `child_process` spawns from the main thread). Node's plain
+     spawn and `detached` both work; only a process-group leader inside another session is refused (D4);
    - stdin, stdout and stderr are the only descriptors passed. The wrapper's child calls
      `close_range(3, ~0U, 0)` before exec, so no inherited unix socket, DB handle or pipe leaks into the worker;
    - an environment built from an allowlist (`PATH`, `HOME=<harnessHome>`, `TMPDIR=<scratch>/tmp`, `LANG`,
@@ -402,8 +403,11 @@ are used when present.
   nothing the runner or coordinator holds open (DB, sockets, pipes) is inherited.
 - **Process lifetime.** The wrapper is a tiny supervisor. It stays outside the domain and is the only process that
   does:
-  1. `setpgid(0, 0)`, then `prctl(PR_SET_CHILD_SUBREAPER, 1)` and `prctl(PR_SET_PDEATHSIG, SIGTERM)`. If
-     `getppid()` is no longer the runner (the runner died before the prctl), it exits at once.
+  1. `setsid()`, which also makes it the leader of a new process group (pgid = its pid), then
+     `prctl(PR_SET_CHILD_SUBREAPER, 1)` and `prctl(PR_SET_PDEATHSIG, SIGTERM)`. If `getppid()` is no longer the
+     runner (the runner died before the prctl), it exits at once. A wrapper that already leads its own session
+     (started with `setsid`) keeps it. A process-group leader in another session cannot call `setsid` and is
+     refused, rather than run in a shared session (see the task-14.3 round-4 addendum).
   2. Fork. The child closes descriptors, installs seccomp, calls `landlock_restrict_self` and execs the harness.
   3. On SIGTERM (cancel, timeout, drain or runner death): `kill(-pgid, SIGTERM)`, then SIGKILL after 15 s. Then it
      SIGKILLs and reaps every child until `waitpid` returns `ECHILD`. As subreaper it inherits every orphaned
@@ -580,17 +584,22 @@ seccomp now covers them too:
   matter: a `system.posix_acl_access` ACL rewrites the mode bits (chmod 000 under another name), and `setxattrat`
   works on an O_PATH fd, which Landlock lets a worker open on a protected file. These numbers come from the unified
   table (463, 466, 469 on both architectures). Seccomp does not rely on Docker's profile here.
-- **Terminal injection.** `ioctl(TIOCSTI)` and `ioctl(TIOCLINUX)` fail with `EPERM`: the harness keeps fds 0-2 and
-  its controlling tty (`setpgid`, not `setsid`), and `legacy_tiocsti` may be on, so it could otherwise type into a
-  terminal the runner shares with the coordinator. Other ioctls are untouched.
+- **Terminal injection.** `ioctl(TIOCSTI)` and `ioctl(TIOCLINUX)` fail with `EPERM`: the harness keeps fds 0-2,
+  which may be a terminal the runner shares with the coordinator, and `legacy_tiocsti` may be on, so it could
+  otherwise type into that terminal. The wrapper's `setsid` (round 4) drops the controlling tty, which the
+  kernel's TIOCSTI check wants, but the filter does not rely on that. Other ioctls are untouched.
 - **Self-only scheduling.** `setpriority`, `ioprio_set`, `sched_setaffinity`/`setscheduler`/`setattr`/`setparam`
   and `prlimit64` are allowed only when the target argument is 0 (the caller). Any explicit pid, pgrp or -1 is
-  denied, because otherwise a worker could slow down or limit the coordinator. `setpriority`/`getpriority` must also
-  name `PRIO_PROCESS` or `PRIO_PGRP` (0 is then the caller or the sandbox's own group), and `ioprio_set`
-  `IOPRIO_WHO_PROCESS` or `IOPRIO_WHO_PGRP`: `PRIO_USER` with 0 means every process of the uid.
+  denied, because otherwise a worker could slow down or limit the coordinator. `setpriority` must also name
+  `PRIO_PROCESS` and `ioprio_set` `IOPRIO_WHO_PROCESS`, so 0 is always the calling process. The group forms
+  (`PRIO_PGRP`, `IOPRIO_WHO_PGRP`) are denied even with 0: 0 means "my current group", and `setpgid` can make
+  that any group of the caller's session (round 4). `PRIO_USER` with 0 means every process of the uid.
+  `getpriority` only reads, so it may name `PRIO_PROCESS` or `PRIO_PGRP` with 0, but not `PRIO_USER` or an
+  explicit target.
 - Self-test canaries: `tcp.fastopen`, `socket.mptcp`, `meta.{chmod,chown,setxattr,setxattrat,removexattrat,
-  file_setattr,utimensat}`, `sched.{setpriority,setaffinity,ioprio,prlimit,getpriority-user,setpriority-which}`,
-  `ioctl.{tiocsti,tioclinux}` and `control.chmod-scratch`. `io_uring.setup` requires the helper's own `ENOSYS`, and
+  file_setattr,utimensat}`, `sched.{setpriority,setaffinity,ioprio,prlimit,getpriority-user,setpriority-which,
+  setpriority-pgrp,ioprio-pgrp}`, `proc.setpgid-outside`, `ioctl.{tiocsti,tioclinux}` and
+  `control.chmod-scratch`. `io_uring.setup` requires the helper's own `ENOSYS`, and
   the newer canaries require its own `EPERM` (`EACCES` for MPTCP), so a dropped rule fails even where the kernel or
   Docker's profile would also refuse the call. Each probe is harmless if the rule is missing (a non-tty, an
   out-of-range `which`, a user xattr, a NULL `file_setattr` buffer).
@@ -609,6 +618,44 @@ Accepted residual risks:
 3. **Scheduling calls must name 0, not the caller's own pid or tid.** For example, `pthread_setaffinity_np` with a
    tid gets `EPERM`. Accepted because the harnesses do not pin threads and the failure is a harmless error. To
    close it, have the notify handler allow ids that belong to the sandbox's own tree.
+
+Addendum (task-14.3 round 4: process groups). The filter used to allow `setpriority(PRIO_PGRP, 0, …)` and
+`ioprio_set(IOPRIO_WHO_PGRP, 0, …)` on the premise that group 0 is the sandbox's own. It is not a fixed group:
+`setpgid(0, X)` accepts any group X of the caller's session, and the wrapper used `setpgid(0, 0)`, so the harness
+stayed in the runner's session. A worker could join the runner's group and then renice or IO-idle every same-uid
+member of it (shown live against the previous build: nice 0 → 7, IO class idle). Two layers now close it:
+
+1. **The filter** allows the set calls only in the process form with target 0 (see "Self-only scheduling").
+   `getpriority` keeps `PRIO_PGRP`, because reading changes nothing.
+2. **Own session.** The wrapper calls `setsid()` instead of `setpgid(0, 0)`. A new session contains only the
+   wrapper and its descendants, so `setpgid` into the runner's or coordinator's group fails with `EPERM`. Options
+   considered:
+   - Filtering `setpgid` (allow only `pgid` 0 or the caller's own pid) was rejected. Seccomp cannot tell whether a
+     pgid belongs to the sandbox, so the filter would also break job control inside the sandbox (a shell
+     moving a child into an existing job's group). The session boundary is enforced by the kernel and needs no
+     list.
+   - Making only the harness child call `setsid` was rejected. Its group would then differ from the wrapper's,
+     and `kill(-pgid)` by the runner or `reapRun` after a wrapper SIGKILL would no longer reach the tree.
+
+   With `setsid` in the wrapper, the wrapper's pid is still the session's pgid, so `signal_tree`, the
+   subreaper loop, both parent-death signals and `kill(-pgid)` work as before. The harness loses the controlling
+   tty. Process harnesses run with pipes and `TERM=dumb`, so nothing needs it, and it also takes away the
+   ctty condition the kernel's TIOCSTI check wants. Terminal signals (Ctrl-C, hangup) no longer reach the
+   sandbox directly. They reach the runner, and when it exits the wrapper's death signal stops the tree.
+
+   `setsid` fails for a process-group leader. A wrapper that already leads its own session (Node `detached`,
+   `setsid -w`) keeps it. A group leader in another session (an interactive shell job) is refused with a hint
+   to use `setsid -w`, because running in a shared session would reopen the join. One gap is accepted: a
+   session leader that started other jobs before it exec'd the wrapper (a login shell running
+   `exec minions-sandbox`) shares its session with them. There the filter is the only layer. The runner never
+   starts the wrapper that way.
+3. **Canaries and escape test.** `sched.setpriority-pgrp` and `sched.ioprio-pgrp` (own group, current values, so a
+   dropped rule changes nothing) require the helper's own `EPERM`. `proc.setpgid-outside` tries to join the
+   runner's group from a throwaway child and must get `EPERM`. `test/runtime/sandbox-escape.test.ts` (round 4)
+   spawns a lone outside process that leads its own group in the test's session. The worker calls `setpgid`
+   into that group, then `setpriority(PRIO_PGRP, 0, 7)` and `ioprio_set(IOPRIO_WHO_PGRP, 0, idle)`. All three
+   must be `EPERM`, and the outside process's own reading of its nice value and IO priority must not change. The
+   test also checks that the harness's session and group are the wrapper's.
 
 ### D8. Config shape, schema impact, CLI surface
 
