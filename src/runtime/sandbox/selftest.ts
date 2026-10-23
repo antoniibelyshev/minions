@@ -39,6 +39,7 @@ export const FIXED_CANARIES = [
   'seccomp.af-unix', 'unix.path', 'unix.abstract', 'tcp.loopback', 'tcp.fastopen',
   'meta.chmod', 'meta.chown', 'meta.setxattr', 'meta.setxattrat', 'meta.removexattrat', 'meta.file_setattr', 'meta.utimensat',
   'sched.setpriority', 'sched.setaffinity', 'sched.ioprio', 'sched.prlimit', 'sched.getpriority-user', 'sched.setpriority-which',
+  'sched.setpriority-pgrp', 'sched.ioprio-pgrp', 'proc.setpgid-outside',
   'ioctl.tiocsti', 'ioctl.tioclinux', 'socket.mptcp',
   'io_uring.setup', 'abi.x32', 'abi.compat-socketcall', 'proc.seccomp-filters',
   'canary.exit', 'lifetime.runner-death',

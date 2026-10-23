@@ -29,8 +29,8 @@ function realHelper(): string | null {
 const UNIFIED = { setxattrat: 463, removexattrat: 466, file_setattr: 469, fchmodat2: 452 };
 /** Syscall numbers the script needs that Perl has no builtin for. */
 const NR: Record<string, Record<string, number>> = {
-  arm64: { ptrace: 117, pidfd_open: 434, pidfd_send_signal: 424, pidfd_getfd: 438, tgkill: 131, sched_setaffinity: 122, ioprio_set: 30, io_uring_setup: 425, setxattr: 5, fsetxattr: 7, ioctl: 29, unshare: 97, setpriority: 140, getpriority: 141, fchmodat: 53, ...UNIFIED },
-  x64: { ptrace: 101, pidfd_open: 434, pidfd_send_signal: 424, pidfd_getfd: 438, tgkill: 234, sched_setaffinity: 203, ioprio_set: 251, io_uring_setup: 425, setxattr: 188, fsetxattr: 190, ioctl: 16, unshare: 272, setpriority: 141, getpriority: 140, fchmodat: 268, ...UNIFIED },
+  arm64: { ptrace: 117, pidfd_open: 434, pidfd_send_signal: 424, pidfd_getfd: 438, tgkill: 131, sched_setaffinity: 122, ioprio_set: 30, ioprio_get: 31, io_uring_setup: 425, setxattr: 5, fsetxattr: 7, ioctl: 29, unshare: 97, setpriority: 140, getpriority: 141, fchmodat: 53, ...UNIFIED },
+  x64: { ptrace: 101, pidfd_open: 434, pidfd_send_signal: 424, pidfd_getfd: 438, tgkill: 234, sched_setaffinity: 203, ioprio_set: 251, ioprio_get: 252, io_uring_setup: 425, setxattr: 188, fsetxattr: 190, ioctl: 16, unshare: 272, setpriority: 141, getpriority: 140, fchmodat: 268, ...UNIFIED },
 };
 const REAL = realHelper();
 const SYS = NR[process.arch];
@@ -129,17 +129,33 @@ r('setpriority:outside', setpriority(0, $p, 7), "$!");
 r('ioprio_set:outside', sc('ioprio_set', 1, $p, 3 << 13) == 0, "$!");
 # PRIO_USER with who 0 is every process of the uid. Setting it is not attempted (a broken filter would
 # renice the whole uid, the coordinator included); reading it and an out-of-range which take the same
-# filter path. The positive controls: the process itself and its own group stay allowed.
+# filter path. The positive controls: the process itself (set and get) and reading its own group stay allowed.
 { $! = 0; my $v = sc('getpriority', 2, 0); r('getpriority:user', $v != -1, "$!"); }
 r('setpriority:which-out-of-range', sc('setpriority', 3, 0, 0) == 0, "$!");
 # Round 3: PRIO_PGRP with a nonzero target (an explicit process-group id, the sandbox's own included) and
-# PRIO_USER with a nonzero uid. The filter allows PRIO_PROCESS/PRIO_PGRP only with target 0, and never
-# PRIO_USER, so every one of these must be EPERM and the outside process's nice must not move.
+# PRIO_USER with a nonzero uid. The set calls allow only PRIO_PROCESS/IOPRIO_WHO_PROCESS with target 0, so
+# every one of these must be EPERM and the outside process's nice must not move.
 r('setpriority:pgrp-nonzero', sc('setpriority', 1, $p, 7) == 0, "$!");
 r('setpriority:user-nonzero', sc('setpriority', 2, 1, 7) == 0, "$!");
 r('ioprio_set:pgrp-nonzero', sc('ioprio_set', 2, $p, 3 << 13) == 0, "$!");
 { my $cur = getpriority(0, 0); r('setpriority:self-allowed', setpriority(0, 0, $cur), "$!");
   $! = 0; my $g = sc('getpriority', 1, 0); r('getpriority:own-group-allowed', $g != -1, "$!"); }
+# Round 4: join an outside process group, then renice / IO-deprioritise "my group" (target 0). setpgid(2)
+# accepts any group of the caller's session, so this worked while the sandbox shared the runner's session
+# and the filter allowed PRIO_PGRP/IOPRIO_WHO_PGRP with 0. The wrapper's own session must refuse the join
+# (EPERM), and the filter must refuse both group forms even so. The outside group is a lone process that the
+# test spawned in the test's session and that made a group of its own, so a broken helper can only renice
+# that process. Run in a throwaway child so the rest of the script keeps its group.
+{ open(my $st, '<', '/proc/self/stat') or die "/proc/self/stat: $!"; my $l = <$st>; $l =~ s/^.*\) //;
+  my @f = split / /, $l; print join("\t", 'ids', 'ok', "pgrp=$f[2] sid=$f[3] ppid=" . getppid()), "\n"; }
+{ my $g = $c->{outsideGroup} + 0; my $kid = fork;
+  if (defined $kid && !$kid) {
+    r('setpgid:outside-group', setpgrp(0, $g), "$!");
+    r('setpgid:joined', getpgrp(0) == $g, 'pgrp=' . getpgrp(0));
+    r('setpriority:pgrp-joined', sc('setpriority', 1, 0, 7) == 0, "$!");
+    r('ioprio_set:pgrp-joined', sc('ioprio_set', 2, 0, 3 << 13) == 0, "$!");
+    POSIX::_exit(0); }
+  waitpid($kid, 0) if $kid; }
 # Terminal input injection, on a non-tty so a broken filter injects nothing (ENOTTY without the rule).
 { open(my $n, '<', '/dev/null') or die "/dev/null: $!"; my $ch = 'x';
   r('ioctl:TIOCSTI', ioctl($n, 0x5412, $ch), "$!"); r('ioctl:TIOCLINUX', ioctl($n, 0x541C, $ch), "$!");
@@ -198,6 +214,7 @@ describe.skipIf(!REAL || !SYS || !PERL)('minions-sandbox escape attempts (real h
   let port = 0;
   const tcpSeen: string[] = [];
   let outside: Outside;
+  let outsideGroup: { pid: number; proc: ChildProcess; state: () => Promise<string> };
 
   beforeAll(async () => {
     root = await mkdtemp(join(tmpdir(), 'sbx-escape-'));
@@ -209,9 +226,31 @@ describe.skipIf(!REAL || !SYS || !PERL)('minions-sandbox escape attempts (real h
     const signals: string[] = [];
     await new Promise<void>((r) => proc.stdout!.on('data', (d: Buffer) => { for (const l of String(d).split('\n').filter(Boolean)) { if (l === 'ready') r(); else signals.push(l); } }));
     outside = { pid: proc.pid!, signals, proc };
+    // A joinable outside process group: a lone process in the test's session (the session the wrapper is
+    // started from) that leads a group of its own. Each line on stdin makes it report its nice value and
+    // its IO priority, read by the process itself.
+    const gproc = spawn(PERL!, ['-e', `setpgrp(0, 0) or die "setpgrp: $!"; $| = 1; print "ready\\n";
+      while (<STDIN>) { my $n = getpriority(0, 0); my $io = syscall(${SYS!.ioprio_get}, 1, 0); print "state $n $io\\n"; }`], { stdio: ['pipe', 'pipe', 'ignore'] });
+    const waiters: ((s: string) => void)[] = [];
+    await new Promise<void>((r) => {
+      let buf = '';
+      gproc.stdout!.on('data', (d: Buffer) => {
+        buf += String(d);
+        let i;
+        while ((i = buf.indexOf('\n')) >= 0) {
+          const l = buf.slice(0, i); buf = buf.slice(i + 1);
+          if (l === 'ready') r(); else if (l.startsWith('state ')) waiters.shift()?.(l.slice(6));
+        }
+      });
+    });
+    outsideGroup = {
+      pid: gproc.pid!, proc: gproc,
+      state: () => new Promise<string>((r) => { waiters.push(r); gproc.stdin!.write('?\n'); }),
+    };
   });
   afterAll(async () => {
     outside?.proc.kill('SIGKILL');
+    outsideGroup?.proc.kill('SIGKILL');
     await new Promise<void>((r) => server ? server.close(() => r()) : r());
     if (root) await rm(root, { recursive: true, force: true });
   });
@@ -234,7 +273,7 @@ describe.skipIf(!REAL || !SYS || !PERL)('minions-sandbox escape attempts (real h
     await writeFile(rulesFile, serializeRules(rules), { mode: 0o600 });
     const protectedFile = d('secrets', 'github-token');
     const plan = {
-      nr: SYS, scratch: d('scratch'), protectedFile, outsidePid: outside.pid, port, oAsync: 0o20000, oPath: 0o10000000, // O_ASYNC and O_PATH on x86_64 and aarch64
+      nr: SYS, scratch: d('scratch'), protectedFile, outsidePid: outside.pid, outsideGroup: outsideGroup.pid, port, oAsync: 0o20000, oPath: 0o10000000, // O_ASYNC and O_PATH on x86_64 and aarch64
       read: [d('state', 'minions.db'), d('state'), protectedFile, d('secrets'), d('common', 'config'), d('common', 'refs'), d('worktrees', 'other', 'README'), d('lease'), d('other-lease', 'scratch'), root],
       write: [d('state'), d('secrets'), d('common', 'objects'), d('common', 'refs', 'heads'), d('worktrees', 'other'), d('lease'), d('other-lease', 'scratch'), root],
     };
@@ -244,6 +283,7 @@ describe.skipIf(!REAL || !SYS || !PERL)('minions-sandbox escape attempts (real h
     const nice = async () => Number((await readFile(`/proc/${outside.pid}/stat`, 'utf8')).split(') ')[1]!.split(' ')[16]);
     const affinity = async () => /Cpus_allowed_list:\s*(\S+)/.exec(await readFile(`/proc/${outside.pid}/status`, 'utf8'))?.[1];
     const niceBefore = await nice();
+    const groupBefore = await outsideGroup.state();
     const affinityBefore = await affinity();
     const argv = sandboxArgv(rulesFile, [PERL!, d('scratch', 'attack.pl'), d('scratch', 'plan.json')], { bin, scratchDir: d('scratch'), secretValues: ['not-a-real-token'] });
     const r = await run(argv[0]!, argv.slice(1), { allowFailure: true, timeoutMs: 30_000 });
@@ -259,6 +299,8 @@ describe.skipIf(!REAL || !SYS || !PERL)('minions-sandbox escape attempts (real h
         tcp: [...tcpSeen],
         signals: [...outside.signals],
         niceChanged: (await nice()) !== niceBefore,
+        groupBefore, groupAfter: await outsideGroup.state(),
+        testSid: Number((await readFile(`/proc/${outsideGroup.pid}/stat`, 'utf8')).split(') ')[1]!.split(' ')[3]),
         affinityChanged: (await affinity()) !== affinityBefore,
         protectedMetadataChanged: !after || after.mode !== before.mode || after.mtimeMs !== before.mtimeMs,
       },
@@ -341,7 +383,7 @@ describe.skipIf(!REAL || !SYS || !PERL)('minions-sandbox escape attempts (real h
         expect(out.outsideView.protectedMetadataChanged).toBe(false);
       });
 
-      it('no priority call on the whole uid (PRIO_USER); the process itself and its own group stay allowed', () => {
+      it('no priority call on the whole uid (PRIO_USER); the process itself and reading its own group stay allowed', () => {
         for (const n of ['getpriority:user', 'setpriority:which-out-of-range']) {
           expect(out.results.get(n), n).toMatchObject({ ok: false, detail: expect.stringMatching(/not permitted/i) });
         }
@@ -389,6 +431,25 @@ describe.skipIf(!REAL || !SYS || !PERL)('minions-sandbox escape attempts (real h
         expect(out.outsideView.niceChanged).toBe(false);
       });
 
+      it('round 4: no joining an outside process group, and no PRIO_PGRP/IOPRIO_WHO_PGRP set with target 0 after the attempt', () => {
+        // The wrapper runs the harness in a session of its own, so setpgid into a group of the runner's session
+        // is EPERM. The group forms of the set calls are refused by the filter on top of that.
+        expect(out.results.get('setpgid:outside-group'), 'setpgid into the outside group').toMatchObject({ ok: false, detail: expect.stringMatching(/not permitted/i) });
+        expect(out.results.get('setpgid:joined'), 'still in the sandbox group').toMatchObject({ ok: false });
+        for (const n of ['setpriority:pgrp-joined', 'ioprio_set:pgrp-joined']) {
+          expect(out.results.get(n), n).toMatchObject({ ok: false, detail: expect.stringMatching(/not permitted/i) });
+        }
+        // The harness's session and group are the wrapper's (its parent), not the test's.
+        const ids = /^pgrp=(\d+) sid=(\d+) ppid=(\d+)$/.exec(out.results.get('ids')?.detail ?? '');
+        expect(ids, out.results.get('ids')?.detail).not.toBeNull();
+        expect(ids![1]).toBe(ids![3]);
+        expect(ids![2]).toBe(ids![3]);
+        expect(Number(ids![2])).not.toBe(out.outsideView.testSid);
+        // The outside group's member reports its own nice and IO priority: neither moved.
+        expect(out.outsideView.groupBefore).toMatch(/^-?\d+ -?\d+$/);
+        expect(out.outsideView.groupAfter).toBe(out.outsideView.groupBefore);
+      });
+
       it('round 3: TIOCSTI with the upper 32 bits set is still denied (the filter compares only the low word)', () => {
         expect(out.results.get('ioctl:TIOCSTI-hi'), 'TIOCSTI high bits').toMatchObject({ ok: false, detail: expect.stringMatching(/not permitted/i) });
       });
@@ -399,6 +460,25 @@ describe.skipIf(!REAL || !SYS || !PERL)('minions-sandbox escape attempts (real h
       });
     });
   }
+
+  it('round 4: the wrapper takes its own session; it keeps one it already leads and refuses to start as a group leader in a shared session', async () => {
+    const rulesFile = join(root, 'engineer', 'rules.json');
+    const ids = String.raw`open(my $s, '<', '/proc/self/stat') or die; my $l = <$s>; $l =~ s/^.*\) //; my @f = split / /, $l; print "pgrp=$f[2] sid=$f[3] ppid=", getppid(), "\n";`;
+    // Started by a process that leads its own process group in the test's session: setsid is impossible, so
+    // the wrapper refuses instead of running the harness in the shared session.
+    const leader = await run(PERL!, ['-e', 'setpgrp(0, 0) or die "setpgrp: $!"; exec @ARGV or die "exec: $!"', bin, '--rules', rulesFile, '--', PERL!, '-e', 'print "RAN\\n"'],
+      { allowFailure: true, timeoutMs: 20_000 });
+    expect(leader.code).toBe(125);
+    expect(leader.stdout).not.toContain('RAN');
+    expect(leader.stderr).toMatch(/setsid: .*process-group leader/);
+    // Started as the leader of a new session (Node's `detached`): kept; the harness is in it.
+    const child = spawn(bin, ['--rules', rulesFile, '--', PERL!, '-e', ids], { detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '';
+    child.stdout!.on('data', (d: Buffer) => { stdout += String(d); });
+    const code = await new Promise<number | null>((r) => child.on('close', (c) => r(c)));
+    expect(code, stdout).toBe(0);
+    expect(stdout.trim()).toBe(`pgrp=${child.pid} sid=${child.pid} ppid=${child.pid}`);
+  }, 40_000);
 
   it('supervisor: nothing survives the harness (double fork + setsid, nested subreaper, new process group, runaway fork chain)', async () => {
     const scratch = join(root, 'engineer', 'scratch');

@@ -3,8 +3,8 @@
  * (docs/design/agent-runtimes.md, D4 "L1, the isolation wrapper", D7).
  *
  *   minions-sandbox --rules <rules.json> [--] <command> [args...]
- *       Supervise <command> in its own process group (subreaper, parent-death signal) and run it under
- *       Landlock (filesystem allowlist, TCP-connect allowlist, signal and abstract-socket scoping) and a
+ *       Supervise <command> in its own session and process group (subreaper, parent-death signal) and
+ *       run it under Landlock (filesystem allowlist, TCP-connect allowlist, signal and abstract-socket scoping) and a
  *       seccomp filter (native architecture only, socket families, no io_uring), with every descriptor
  *       above 2 closed. Exits with the command's status (128 + signal when it was killed).
  *   minions-sandbox --self-test <rules.json>
@@ -565,12 +565,27 @@ static uint64_t fs_rights(unsigned access, int is_dir, uint64_t handled) {
   BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW), \
   BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | (err))
 
-/* Like DENY_UNLESS_SELF for the calls whose arg0 says what arg1 names (setpriority/getpriority: PRIO_*,
- * ioprio_set: IOPRIO_WHO_*): allow only when arg0 is <self_which> or <pgrp_which> and arg1 is 0, i.e.
- * the caller itself or its own process group (the sandbox's, by setpgid). The "user" form with 0 means
- * "every process of the caller's uid" (coordinator and runner included), so it is denied, like any other
- * value; only the low word of arg0 is tested because the kernel takes it as an int (11 insns). */
-#define DENY_UNLESS_SELF_WHICH(nr, self_which, pgrp_which, err) \
+/* Like DENY_UNLESS_SELF for the calls whose arg0 says what arg1 names (setpriority: PRIO_*, ioprio_set:
+ * IOPRIO_WHO_*): allow only when arg0 is <which> and arg1 is 0. The set calls use it with PRIO_PROCESS /
+ * IOPRIO_WHO_PROCESS, i.e. the caller itself. Only the low word of arg0 is tested because the kernel
+ * takes it as an int (9 insns). */
+#define DENY_UNLESS_SELF_WHICH(nr, which, err) \
+  BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, (nr), 0, 8), \
+  BPF_STMT(BPF_LD | BPF_W | BPF_ABS, ARG_LO(0)), \
+  BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, (which), 0, 5), \
+  BPF_STMT(BPF_LD | BPF_W | BPF_ABS, ARG_HI(1)), \
+  BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 3), \
+  BPF_STMT(BPF_LD | BPF_W | BPF_ABS, ARG_LO(1)), \
+  BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 1), \
+  BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW), \
+  BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | (err))
+
+/* The read-only variant for getpriority: arg0 may be <self_which> or <pgrp_which> and arg1 must be 0 (the
+ * caller or its current process group). Reading a group's nice changes nothing, so the group form stays
+ * allowed here. The set calls never get it: setpgid(2) can move a process into another group of its
+ * session first. The "user" form with 0 means "every process of the caller's uid" (coordinator and runner
+ * included), so it is denied, like any other value (10 insns). */
+#define DENY_UNLESS_SELF_OR_GROUP_WHICH(nr, self_which, pgrp_which, err) \
   BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, (nr), 0, 9), \
   BPF_STMT(BPF_LD | BPF_W | BPF_ABS, ARG_LO(0)), \
   BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, (self_which), 1, 0), \
@@ -582,7 +597,7 @@ static uint64_t fs_rights(unsigned access, int is_dir, uint64_t handled) {
   BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW), \
   BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | (err))
 #define IOPRIO_WHO_PROCESS_ 1
-#define IOPRIO_WHO_PGRP_ 2
+#define IOPRIO_WHO_PGRP_ 2 /* never allowed by the filter; named for the canary */
 
 #ifndef __NR_fchmodat2
 # define __NR_fchmodat2 452
@@ -864,12 +879,15 @@ static int install_seccomp(void) {
 
     /* Scheduling and resource controls Landlock scoping does not cover: lowering the nice/affinity/IO
      * priority or limits of same-uid processes outside the sandbox (coordinator, runner). Allow only a
-     * target of 0 (the calling process itself); any explicit pid/who is denied. For the PRIO_* and
-     * IOPRIO_WHO_* calls the kind of target must also be the process or its own group: PRIO_USER with
-     * who 0 would renice every process of the uid. getpriority is limited the same way (no peeking). */
-    DENY_UNLESS_SELF_WHICH(__NR_setpriority, PRIO_PROCESS, PRIO_PGRP, EPERM),
-    DENY_UNLESS_SELF_WHICH(__NR_getpriority, PRIO_PROCESS, PRIO_PGRP, EPERM),
-    DENY_UNLESS_SELF_WHICH(__NR_ioprio_set, IOPRIO_WHO_PROCESS_, IOPRIO_WHO_PGRP_, EPERM),
+     * target of 0 (the calling process itself); any explicit pid/who is denied. setpriority and
+     * ioprio_set must also name the process form (PRIO_PROCESS, IOPRIO_WHO_PROCESS): PRIO_USER with who 0
+     * would renice every process of the uid, and the group form with 0 means "my current group", which
+     * setpgid(2) can make any group of the caller's session. The wrapper's setsid() keeps outside groups
+     * out of that session too; the filter does not rely on it. getpriority, read-only, may still name
+     * the caller's own group, but no other target and not the whole uid (no peeking). */
+    DENY_UNLESS_SELF_WHICH(__NR_setpriority, PRIO_PROCESS, EPERM),
+    DENY_UNLESS_SELF_OR_GROUP_WHICH(__NR_getpriority, PRIO_PROCESS, PRIO_PGRP, EPERM),
+    DENY_UNLESS_SELF_WHICH(__NR_ioprio_set, IOPRIO_WHO_PROCESS_, EPERM),
     DENY_UNLESS_SELF(__NR_sched_setaffinity, 0, EPERM),
     DENY_UNLESS_SELF(__NR_sched_setscheduler, 0, EPERM),
     DENY_UNLESS_SELF(__NR_sched_setattr, 0, EPERM),
@@ -877,7 +895,9 @@ static int install_seccomp(void) {
     DENY_UNLESS_SELF(__NR_prlimit64, 0, EPERM),
 
     /* TIOCSTI pushes bytes into a terminal's input queue and TIOCLINUX can paste the console selection:
-     * with an inherited controlling tty the worker could type into the coordinator's TUI. The command is
+     * with an inherited tty fd the worker could type into the coordinator's TUI. The wrapper's setsid drops
+     * the controlling tty, which the kernel's TIOCSTI check wants, but the filter does not rely on it. The
+     * command is
      * an unsigned int, so only the low word of arg1 is tested; every other ioctl is allowed. */
     BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_ioctl, 0, 5),
     BPF_STMT(BPF_LD | BPF_W | BPF_ABS, ARG_LO(1)),
@@ -1043,7 +1063,13 @@ done:
 
 static int run_wrapped(const struct rules *r, char **cmd) {
   pid_t runner = getppid();
-  if (setpgid(0, 0) < 0) die("setpgid: %s", strerror(errno));
+  /* A session of its own, which also makes the wrapper the leader of a new process group (pgid = its
+   * pid), the group signal_tree and reapRun kill. setpgid(2) only joins groups of the caller's session, so
+   * no sandboxed process can move into the runner's or coordinator's group. It also drops the controlling
+   * tty. setsid fails for a process-group leader; one that already leads its own session (spawned with
+   * setsid, e.g. Node's `detached`) keeps it. Anything else is refused rather than run in a shared session. */
+  if (getsid(0) != getpid() && setsid() < 0)
+    die("setsid: %s (the wrapper must not start as a process-group leader; run it as `setsid -w minions-sandbox ...` from an interactive shell)", strerror(errno));
   if (prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) < 0) die("PR_SET_CHILD_SUBREAPER: %s", strerror(errno));
   if (prctl(PR_SET_PDEATHSIG, SIGTERM, 0, 0, 0) < 0) die("PR_SET_PDEATHSIG: %s", strerror(errno));
   if (getppid() != runner) die("the runner exited before supervision started");
@@ -1384,6 +1410,31 @@ static void canary_sched(pid_t runner) {
   int up = getpriority(PRIO_USER, 0);
   expect_filtered("sched.getpriority-user", !(up == -1 && errno), errno);
   expect_filtered("sched.setpriority-which", syscall(__NR_setpriority, 3, 0, 0) == 0, errno);
+  /* The group forms with 0 ("my current group") are refused for the set calls, because setpgid(2) could
+   * make that group the runner's. Probed on the canary's own group (the wrapper's) with the values it
+   * already has, so a dropped rule changes nothing; the kernel would allow both. */
+  errno = 0;
+  int own = getpriority(PRIO_PROCESS, 0);
+  expect_filtered("sched.setpriority-pgrp", setpriority(PRIO_PGRP, 0, own == -1 && errno ? 0 : own) == 0, errno);
+  long own_io = syscall(__NR_ioprio_get, IOPRIO_WHO_PROCESS_, 0);
+  expect_filtered("sched.ioprio-pgrp", syscall(__NR_ioprio_set, IOPRIO_WHO_PGRP_, 0, own_io < 0 ? 0 : own_io) == 0, errno);
+}
+
+/* Joining the runner's process group: the wrapper's own session keeps every outside group out of reach of
+ * setpgid(2) (EPERM). Tried in a throwaway child, so a success moves nothing that keeps running. */
+static void canary_setpgid(pid_t runner) {
+  pid_t target = getpgid(runner);
+  if (target < 0) { report("proc.setpgid-outside", "error", "getpgid(runner): %s", strerror(errno)); return; }
+  if (target == getpgrp()) { report("proc.setpgid-outside", "escaped", "the sandbox shares the runner's process group"); return; }
+  fflush(stdout);
+  pid_t c = fork();
+  if (c < 0) { report("proc.setpgid-outside", "error", "fork: %s", strerror(errno)); return; }
+  if (c == 0) {
+    int rc = setpgid(0, target);
+    expect_denied("proc.setpgid-outside", rc == 0, errno);
+    _exit(0);
+  }
+  while (waitpid(c, NULL, 0) < 0 && errno == EINTR) {}
 }
 
 /* Terminal input injection: TIOCSTI/TIOCLINUX on a non-tty (/dev/null) so a dropped rule cannot inject
@@ -1451,6 +1502,7 @@ static int canary_main(void) {
   /* Metadata writes and outside-process scheduling: on the first protected dir and the runner. */
   if (deny_write.n) canary_metadata(deny_write.v[0]);
   canary_sched(runner);
+  canary_setpgid(runner);
   char environ_path[64];
   snprintf(environ_path, sizeof environ_path, "/proc/%d/environ", (int)runner);
   int fd = open(environ_path, O_RDONLY | O_CLOEXEC);

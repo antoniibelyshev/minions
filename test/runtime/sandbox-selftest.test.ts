@@ -272,6 +272,11 @@ describe.skipIf(!REAL)('the real minions-sandbox (Landlock ABI >= 6)', () => {
     expect(r.checks.filter((c) => c.outcome !== 'pass' && c.outcome !== 'skip')).toEqual([]);
     expect(r.state).toBe('ok');
     expect(r.checks.find((c) => c.name === 'lifetime.runner-death')?.outcome).toBe('pass');
+    // Round 4: the group forms of the set calls are the helper's own EPERM, and the harness cannot join the
+    // runner's process group (the wrapper's own session).
+    for (const n of ['sched.setpriority-pgrp', 'sched.ioprio-pgrp', 'proc.setpgid-outside']) {
+      expect(r.checks.find((c) => c.name === n), n).toMatchObject({ outcome: 'pass', detail: expect.stringMatching(/not permitted/i) });
+    }
   }, 60_000);
 
   it('self-test catches a rule that opens a denied path', async () => {
