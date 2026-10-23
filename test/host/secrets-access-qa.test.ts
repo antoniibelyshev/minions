@@ -32,9 +32,8 @@ const mode = (p: string) => statSync(p).mode & 0o777;
 describe('private-group decision edge cases', () => {
   const linux = (uid: number, p: string, g: string) => secretsAccessFor({ platform: 'linux', uid, passwd: p, group: g });
 
-  // KNOWN DEFECT (QA lease-5780628b324c): secretsAccessFor only looks at the first /etc/group entry with
-  // the gid, so members of a second entry with the same gid are missed. Flip `it.fails` to `it` with the fix.
-  it.fails('a second /etc/group entry with the same gid and other members is not a private group', () => {
+  // Regression (QA lease-5780628b324c): members of every /etc/group entry with the gid count, not just the first.
+  it('a second /etc/group entry with the same gid and other members is not a private group', () => {
     // Two group names sharing one gid: bob is a member of gid 1001 through the alias entry.
     const a = linux(1001, 'ada:x:1001:1001::/h:/bin/sh\n', 'ada:x:1001:\nada-alias:x:1001:bob\n');
     expect(a.mode).toBe('unsupported');

@@ -46,9 +46,6 @@ export async function linuxHostFacts(runner: Runner, docker: DockerStatus, opts:
   const facts = unknownLinuxFacts();
   facts.uid = opts.uid !== undefined ? opts.uid : (typeof process.getuid === 'function' ? process.getuid() : null);
   facts.dockerHost = env.DOCKER_HOST || null;
-  if (facts.uid !== null) {
-    try { facts.secretsAccess = probeSecretsAccess({ platform: 'linux', uid: facts.uid, ...(opts.readFile ? { readFile: opts.readFile } : {}) }); } catch { /* unknown */ }
-  }
   const safe = async (cmd: string, args: string[]) => {
     try { return await runner(cmd, args, { allowFailure: true, timeoutMs: 15_000 }); } catch { return null; }
   };
@@ -60,6 +57,14 @@ export async function linuxHostFacts(runner: Runner, docker: DockerStatus, opts:
         if (Array.isArray(v) && v.every((s) => typeof s === 'string')) facts.securityOptions = v as string[];
       } catch { /* unknown */ }
     }
+  }
+  if (facts.uid !== null) {
+    // Rootless from `docker info` when known, else the env/context heuristic (same as compose generation).
+    const rootless = facts.securityOptions ? isRootless(facts) : undefined;
+    try {
+      facts.secretsAccess = probeSecretsAccess({ platform: 'linux', uid: facts.uid, env, ...(rootless !== undefined ? { rootless } : {}),
+        ...(opts.readFile ? { readFile: opts.readFile } : {}) });
+    } catch { /* unknown */ }
   }
   const se = await safe('getenforce', []);
   const mode = se?.code === 0 ? se.stdout.trim().toLowerCase() : '';

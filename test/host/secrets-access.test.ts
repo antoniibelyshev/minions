@@ -1,16 +1,18 @@
 // Secrets ownership for Linux hosts with uid != 1000 (task-25.2): private-group sharing via group_add
 // and 0750/0640 modes, refusal for shared groups, and the unchanged macOS / uid-1000 path.
 // All identity facts are fakes (no getent, no real /etc/passwd).
+import { createHash } from 'node:crypto';
 import { lstatSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { projectPaths } from '../../src/core/paths.js';
 import { writeKeyFile, ensureSecretsDir } from '../../src/host/auth.js';
+import { authPlan } from '../../src/host/auth-cli.js';
 import { materializeSecrets, provisionGithubToken } from '../../src/host/credentials.js';
 import { composeYaml } from '../../src/host/docker.js';
 import { linuxDockerChecks, linuxHostFacts, unknownLinuxFacts, type LinuxHostFacts } from '../../src/host/linux-host.js';
 import type { ProjectJson } from '../../src/host/project.js';
 import {
-  parseGroup, parsePasswd, prepareSecretsDir, probeSecretsAccess, secretsAccessFor, type SecretsAccess,
+  dockerLooksRootless, parseGroup, parsePasswd, prepareSecretsDir, probeSecretsAccess, secretsAccessFor, type SecretsAccess,
 } from '../../src/host/secrets-access.js';
 import { makeRepo, withHome } from './fixtures.js';
 
@@ -220,5 +222,99 @@ describe('doctor docker.uid', () => {
     const read = fakeRead({ '/etc/passwd': PASSWD, '/etc/group': GROUP });
     expect((await linuxHostFacts(runner, down, { env: {}, uid: 1001, exists: async () => false, readFile: read })).secretsAccess).toEqual(GROUP_ACCESS);
     expect((await linuxHostFacts(runner, down, { env: {}, uid: 1002, exists: async () => false, readFile: read })).secretsAccess?.mode).toBe('unsupported');
+  });
+});
+
+describe('task-25.2 repair: duplicate gids, chown ordering, rootless, plan label', () => {
+  it('every /etc/group entry with the gid counts: an alias entry with another member makes the group shared', () => {
+    const p = 'ada:x:1001:1001::/h:/bin/sh\n';
+    const a = secretsAccessFor({ platform: 'linux', uid: 1001, passwd: p, group: 'ada:x:1001:\nada-alias:x:1001:bob\n' });
+    expect(a).toEqual({ mode: 'unsupported', reason: expect.stringContaining('other members: bob') });
+    // An alias without other members is still private; the first (getgrgid) entry must carry the user's name.
+    expect(secretsAccessFor({ platform: 'linux', uid: 1001, passwd: p, group: 'ada:x:1001:\nada-alias:x:1001:ada\n' }).mode).toBe('group');
+    expect(secretsAccessFor({ platform: 'linux', uid: 1001, passwd: p, group: 'ada-alias:x:1001:\nada:x:1001:\n' }).mode).toBe('unsupported');
+    // Another passwd account with the same primary gid, even with a clean /etc/group.
+    expect(secretsAccessFor({ platform: 'linux', uid: 1001, passwd: p + 'svc:x:1500:1001::/h:/bin/sh\n', group: 'ada:x:1001:\n' }).mode).toBe('unsupported');
+  });
+
+  it('rootless Docker (env/context heuristic or explicit) keeps owner mode and compose.yaml without group_add', () => {
+    const files = { '/etc/passwd': PASSWD, '/etc/group': GROUP };
+    const probe = (env: NodeJS.ProcessEnv, extra: Record<string, string> = {}, rootless?: boolean) =>
+      probeSecretsAccess({ platform: 'linux', uid: 1001, env, readFile: fakeRead({ ...files, ...extra }), ...(rootless !== undefined ? { rootless } : {}) });
+    expect(probe({})).toEqual(GROUP_ACCESS);
+    expect(probe({ DOCKER_HOST: 'unix:///var/run/docker.sock' })).toEqual(GROUP_ACCESS);
+    expect(probe({ DOCKER_HOST: 'tcp://10.0.0.1:2376' })).toEqual(GROUP_ACCESS);
+    expect(probe({ DOCKER_HOST: 'unix:///run/user/1001/docker.sock' })).toEqual({ mode: 'owner' });
+    expect(probe({ DOCKER_HOST: 'unix:///xdg/docker.sock', XDG_RUNTIME_DIR: '/xdg/' })).toEqual({ mode: 'owner' });
+    expect(probe({}, {}, true)).toEqual({ mode: 'owner' });
+    expect(probe({ DOCKER_HOST: 'unix:///run/user/1001/docker.sock' }, {}, false)).toEqual(GROUP_ACCESS); // docker info wins
+    expect(composeYaml(project, probe({ DOCKER_HOST: 'unix:///run/user/1001/docker.sock' }))).toBe(composeYaml(project, { mode: 'owner' }));
+    expect(secretsAccessFor({ platform: 'linux', uid: 1001, passwd: PASSWD, group: GROUP, rootless: true })).toEqual({ mode: 'owner' });
+  });
+
+  it('dockerLooksRootless follows DOCKER_CONTEXT / currentContext to the context endpoint', () => {
+    const cfg = '/h/.docker';
+    const meta = (name: string) => `${cfg}/contexts/meta/${createHash('sha256').update(name).digest('hex')}/meta.json`;
+    const ep = (host: string) => JSON.stringify({ Name: 'x', Endpoints: { docker: { Host: host } } });
+    const read = fakeRead({
+      [`${cfg}/config.json`]: JSON.stringify({ currentContext: 'rootless' }),
+      [meta('rootless')]: ep('unix:///run/user/1001/docker.sock'),
+      [meta('remote')]: ep('ssh://me@box'),
+    });
+    expect(dockerLooksRootless({ uid: 1001, env: { HOME: '/h' }, readFile: read })).toBe(true);
+    expect(dockerLooksRootless({ uid: 1001, env: { HOME: '/h', DOCKER_CONTEXT: 'remote' }, readFile: read })).toBe(false);
+    expect(dockerLooksRootless({ uid: 1001, env: { HOME: '/h', DOCKER_CONTEXT: 'default' }, readFile: read })).toBe(false);
+    expect(dockerLooksRootless({ uid: 1001, env: { DOCKER_CONFIG: '/none' }, readFile: read })).toBe(false);
+    expect(dockerLooksRootless({ uid: 1001, env: { DOCKER_CONFIG: '/none', DOCKER_CONTEXT: 'rootless' }, readFile: read })).toBe(true);
+    expect(dockerLooksRootless({ uid: 1001, env: { DOCKER_HOST: 'unix:///run/user/1002/docker.sock' }, readFile: read })).toBe(false);
+  });
+
+  it('doctor: rootless from docker info gives owner mode, the rootless warning and no uid check', async () => {
+    const runner = async (cmd: string) => (cmd === 'docker'
+      ? { code: 0, stdout: '["name=seccomp,profile=builtin","name=rootless","name=cgroupns"]\n', stderr: '' }
+      : { code: 127, stdout: '', stderr: 'ENOENT' });
+    const up = { daemon: true, serverVersion: '27.0', compose: true, composeVersion: '2.29.1' };
+    const read = fakeRead({ '/etc/passwd': PASSWD, '/etc/group': GROUP });
+    const f = await linuxHostFacts(runner, up, { env: {}, uid: 1001, exists: async () => false, readFile: read });
+    expect(f.secretsAccess).toEqual({ mode: 'owner' });
+    const checks = linuxDockerChecks(f, '/r');
+    expect(checks.map((c) => [c.name, c.status])).toEqual([['docker.rootless', 'warn']]);
+  });
+
+  describe('chown before widening', () => {
+    let env: ReturnType<typeof withHome>;
+    beforeEach(() => { env = withHome(); });
+    afterEach(() => env.cleanup());
+    const mode = (p: string) => statSync(p).mode & 0o777;
+    // gid 0 is never ours in an unprivileged run, so chown(-1, 0) fails with EPERM.
+    const foreign: SecretsAccess = { mode: 'group', gid: 0, group: 'root', user: 'x' };
+    const privileged = () => process.getuid!() === 0 || process.getgid!() === 0;
+
+    it('a failed group change leaves an existing dir 0700 and its files 0600', async () => {
+      if (privileged()) return;
+      const dir = `${env.root}/sec`;
+      await prepareSecretsDir(dir, { mode: 'owner' });
+      writeFileSync(`${dir}/k`, 'x', { mode: 0o600 });
+      await expect(prepareSecretsDir(dir, foreign)).rejects.toThrow();
+      expect(mode(dir)).toBe(0o700);
+      expect(mode(`${dir}/k`)).toBe(0o600);
+    });
+
+    it('a failed group change on a new dir leaves it 0700', async () => {
+      if (privileged()) return;
+      const dir = `${env.root}/fresh`;
+      await expect(prepareSecretsDir(dir, foreign)).rejects.toThrow();
+      expect(mode(dir)).toBe(0o700);
+    });
+  });
+
+  it('auth plan shows the real key file mode (0600 owner, 0640 private group)', () => {
+    const env = withHome();
+    try {
+      const key = { method: 'api-key' as const, source: { type: 'env' as const, name: 'MY_KEY' } };
+      expect(authPlan(key, ID, { mode: 'owner' }).writes.at(-1)).toMatch(/\(0600\)$/);
+      expect(authPlan(key, ID, GROUP_ACCESS).writes.at(-1)).toMatch(/\(0640\)$/);
+      expect(authPlan(key, ID, GROUP_ACCESS).writes.join(' ')).not.toContain('0600');
+    } finally { env.cleanup(); }
   });
 });
