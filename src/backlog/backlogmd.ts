@@ -419,9 +419,13 @@ export class BacklogMdAdapter implements BacklogAdapter {
   }
 
   async addDependency(id: string, dependsOn: string): Promise<Task> {
-    const [task, dep] = await Promise.all([this.getTask(id), this.getTask(dependsOn)]);
-    if (task.dependencies.includes(dep.id)) return task;
+    // One listing (task-24.2): both ends and the cycle graph come from it; an id it lacks (archived,
+    // unknown) is viewed as before, so a missing task still fails NOT_FOUND.
     const all = await this.listTasks();
+    const byId = new Map(all.map((t) => [t.id, t]));
+    const find = async (x: string) => byId.get(normalizeId(x)) ?? this.getTask(x);
+    const [task, dep] = await Promise.all([find(id), find(dependsOn)]);
+    if (task.dependencies.includes(dep.id)) return task;
     const graph = new Map(all.map((t) => [t.id, t.dependencies]));
     graph.set(task.id, task.dependencies);
     const cycle = cycleIfAdded(graph, task.id, dep.id);

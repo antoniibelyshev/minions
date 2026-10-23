@@ -1,6 +1,7 @@
 import { closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readSync, renameSync, writeSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
-import type { BacklogAdapter } from '../backlog/types.js';
+import { filterReady } from '../backlog/ready.js';
+import type { BacklogAdapter, Task } from '../backlog/types.js';
 import { AGENT_MODEL_ALIASES, isAgentModelAlias } from '../config/models.js';
 import { agentTypeRole, DEEP_SUFFIX, workerRoleNames } from '../config/roles.js';
 import type { MinionsConfig, RoleContract } from '../config/schema.js';
@@ -81,13 +82,15 @@ export async function stopHook(input: unknown, load: HookLoader): Promise<HookOu
     if (backgroundRunning(inp)) return allow('background-running', 'a background subagent is still running');
     const leases = db.activeLeases();
     const leased = new Set(leases.map((l) => l.task_id));
-    let ready, tasks;
+    // One backlog snapshot per turn end (task-24.2): ready tasks, capacity and continuing stages all derive from it.
+    let tasks: Task[];
     try {
-      ready = await backlog.listReady(50, leased, scopeOf(config));
       tasks = await backlog.listTasks();
     } catch (e) {
       return allow('backlog-error', `backlog query failed (${(e as Error).message})`);
     }
+    const byId = new Map(tasks.map((t) => [t.id, t]));
+    const ready = filterReady(tasks, { leased, scope: scopeOf(config), lookup: (id) => byId.get(id) }, 50);
     const cap = capacityOf(config, leases, tasks);
     const canStart = cap.freeTaskSlots > 0 && cap.freeEngineerSlots > 0;
     const startable = canStart ? ready.filter((t) => !leased.has(t.id)) : [];
