@@ -25,10 +25,12 @@ function realHelper(): string | null {
   } catch { return null; }
 }
 
+/** Syscalls from the unified table (Linux 6.13+): the same number on every architecture. */
+const UNIFIED = { setxattrat: 463, removexattrat: 466, file_setattr: 469 };
 /** Syscall numbers the script needs that Perl has no builtin for. */
 const NR: Record<string, Record<string, number>> = {
-  arm64: { ptrace: 117, pidfd_open: 434, pidfd_send_signal: 424, pidfd_getfd: 438, tgkill: 131, sched_setaffinity: 122, ioprio_set: 30, io_uring_setup: 425, setxattr: 5, unshare: 97 },
-  x64: { ptrace: 101, pidfd_open: 434, pidfd_send_signal: 424, pidfd_getfd: 438, tgkill: 234, sched_setaffinity: 203, ioprio_set: 251, io_uring_setup: 425, setxattr: 188, unshare: 272 },
+  arm64: { ptrace: 117, pidfd_open: 434, pidfd_send_signal: 424, pidfd_getfd: 438, tgkill: 131, sched_setaffinity: 122, ioprio_set: 30, io_uring_setup: 425, setxattr: 5, unshare: 97, setpriority: 140, getpriority: 141, ...UNIFIED },
+  x64: { ptrace: 101, pidfd_open: 434, pidfd_send_signal: 424, pidfd_getfd: 438, tgkill: 234, sched_setaffinity: 203, ioprio_set: 251, io_uring_setup: 425, setxattr: 188, unshare: 272, setpriority: 141, getpriority: 140, ...UNIFIED },
 };
 const REAL = realHelper();
 const SYS = NR[process.arch];
@@ -71,6 +73,17 @@ r('chmod:via-proc-self-root', chmod(0777, "/proc/self/root$file"), "$!");
   r('chmod:scratch-allowed', chmod(0750, $w), "$!"); unlink $w; }
 r('utime:protected', utime(1, 1, $file), "$!");
 { my ($n, $v) = ('user.minions-escape', 'x'); r('setxattr:protected', sc('setxattr', $file, $n, $v, 1, 0) == 0, "$!"); }
+# chmod 000 under another name: a POSIX access ACL with no permissions rewrites the mode bits. By path, and
+# through an O_PATH fd (Landlock lets O_PATH open a protected file) with AT_EMPTY_PATH.
+{ my $acl = pack('L<', 2) . pack('S<S<L<', 1, 0, 0xffffffff) . pack('S<S<L<', 4, 0, 0xffffffff) . pack('S<S<L<', 0x20, 0, 0xffffffff);
+  my $args = pack('QLL', unpack('Q', pack('p', $acl)), length($acl), 0);
+  my ($an, $empty, $un) = ('system.posix_acl_access', '', 'user.minions-escape'); # syscall() needs variables, not literals
+  r('setxattrat:acl-protected', sc('setxattrat', -100, $file, 0, $an, $args, length($args)) == 0, "$!");
+  my $opath = sysopen(my $op, $file, $c->{oPath} + 0);
+  r('setxattrat:acl-opath', $opath && sc('setxattrat', fileno($op), $empty, 0x1000, $an, $args, length($args)) == 0, $opath ? "$!" : "O_PATH open: $!");
+  r('removexattrat:protected', sc('removexattrat', -100, $file, 0, $un) == 0, "$!");
+  my $fa = pack('QQ', 0, 0); # struct file_attr: fa_xflags 0 would clear the inode flags
+  r('file_setattr:protected', sc('file_setattr', -100, $file, $fa, length($fa), 0) == 0, "$!"); }
 
 my $p = $c->{outsidePid} + 0;
 r('kill0:outside', kill(0, $p), "$!");
@@ -89,6 +102,16 @@ r('tgkill0:outside', sc('tgkill', $p, $p, 0) == 0, "$!");
 r('setpriority:outside', setpriority(0, $p, 7), "$!");
 { my $mask = pack('Q', 1); r('sched_setaffinity:outside', sc('sched_setaffinity', $p, 8, $mask) == 0, "$!"); }
 r('ioprio_set:outside', sc('ioprio_set', 1, $p, 3 << 13) == 0, "$!");
+# PRIO_USER with who 0 is every process of the uid. Setting it is not attempted (a broken filter would
+# renice the whole uid, the coordinator included); reading it and an out-of-range which take the same
+# filter path. The positive controls: the process itself and its own group stay allowed.
+{ $! = 0; my $v = sc('getpriority', 2, 0); r('getpriority:user', $v != -1, "$!"); }
+r('setpriority:which-out-of-range', sc('setpriority', 3, 0, 0) == 0, "$!");
+{ my $cur = getpriority(0, 0); r('setpriority:self-allowed', setpriority(0, 0, $cur), "$!");
+  $! = 0; my $g = sc('getpriority', 1, 0); r('getpriority:own-group-allowed', $g != -1, "$!"); }
+# Terminal input injection, on a non-tty so a broken filter injects nothing (ENOTTY without the rule).
+{ open(my $n, '<', '/dev/null') or die "/dev/null: $!"; my $ch = 'x';
+  r('ioctl:TIOCSTI', ioctl($n, 0x5412, $ch), "$!"); r('ioctl:TIOCLINUX', ioctl($n, 0x541C, $ch), "$!"); }
 
 r('socket:AF_UNIX', socket(my $u, AF_UNIX, SOCK_STREAM, 0), "$!");
 r('socket:AF_UNIX-dgram', socket(my $ud, AF_UNIX, SOCK_DGRAM, 0), "$!");
@@ -97,6 +120,8 @@ r('socket:raw-icmp', socket(my $ri, AF_INET, SOCK_RAW, 1), "$!");
 r('socket:raw-ipv6', socket(my $r6, AF_INET6, SOCK_RAW, 58), "$!");
 r('socket:AF_ALG', socket(my $alg, 38, 5, 0), "$!");
 r('socket:AF_VSOCK', socket(my $vs, 40, SOCK_STREAM, 0), "$!");
+r('socket:MPTCP', socket(my $mp, AF_INET, SOCK_STREAM, 262), "$!");
+r('socket:MPTCP6', socket(my $mp6, AF_INET6, SOCK_STREAM, 262), "$!");
 { my $b = "\0" x 256; r('io_uring_setup', sc('io_uring_setup', 4, $b) >= 0, "$!"); }
 r('unshare:user', sc('unshare', 0x10000000) == 0, "$!");
 
@@ -162,7 +187,7 @@ describe.skipIf(!REAL || !SYS || !PERL)('minions-sandbox escape attempts (real h
     await writeFile(rulesFile, serializeRules(rules), { mode: 0o600 });
     const protectedFile = d('secrets', 'github-token');
     const plan = {
-      nr: SYS, scratch: d('scratch'), protectedFile, outsidePid: outside.pid, port, oAsync: 0o20000, // O_ASYNC on x86_64 and aarch64
+      nr: SYS, scratch: d('scratch'), protectedFile, outsidePid: outside.pid, port, oAsync: 0o20000, oPath: 0o10000000, // O_ASYNC and O_PATH on x86_64 and aarch64
       read: [d('state', 'minions.db'), d('state'), protectedFile, d('secrets'), d('common', 'config'), d('common', 'refs'), d('worktrees', 'other', 'README'), d('lease'), d('other-lease', 'scratch'), root],
       write: [d('state'), d('secrets'), d('common', 'objects'), d('common', 'refs', 'heads'), d('worktrees', 'other'), d('lease'), d('other-lease', 'scratch'), root],
     };
@@ -259,6 +284,31 @@ describe.skipIf(!REAL || !SYS || !PERL)('minions-sandbox escape attempts (real h
         // Positive control: the chmod user-notification handler must still allow a chmod inside the scratch
         // dir, else it would be a blanket deny that breaks the harness's own git.
         expect(out.results.get('chmod:scratch-allowed'), 'chmod inside scratch').toMatchObject({ ok: true });
+      });
+
+      it('no setxattrat/removexattrat/file_setattr on a protected file: the ACL route to chmod 000 is closed by the helper', () => {
+        // EPERM is the helper's own rule (Docker's profile may answer ENOSYS for syscalls it does not know).
+        for (const n of ['setxattrat:acl-protected', 'setxattrat:acl-opath', 'removexattrat:protected', 'file_setattr:protected']) {
+          expect(out.results.get(n), n).toMatchObject({ ok: false, detail: expect.stringMatching(/not permitted/i) });
+        }
+        expect(out.outsideView.protectedMetadataChanged).toBe(false);
+      });
+
+      it('no priority call on the whole uid (PRIO_USER); the process itself and its own group stay allowed', () => {
+        for (const n of ['getpriority:user', 'setpriority:which-out-of-range']) {
+          expect(out.results.get(n), n).toMatchObject({ ok: false, detail: expect.stringMatching(/not permitted/i) });
+        }
+        expect(out.results.get('setpriority:self-allowed')).toMatchObject({ ok: true });
+        expect(out.results.get('getpriority:own-group-allowed')).toMatchObject({ ok: true });
+      });
+
+      it('no TIOCSTI/TIOCLINUX terminal injection and no MPTCP socket (Landlock does not cover MPTCP connects)', () => {
+        for (const n of ['ioctl:TIOCSTI', 'ioctl:TIOCLINUX']) {
+          expect(out.results.get(n), n).toMatchObject({ ok: false, detail: expect.stringMatching(/not permitted/i) });
+        }
+        for (const n of ['socket:MPTCP', 'socket:MPTCP6']) {
+          expect(out.results.get(n), n).toMatchObject({ ok: false, detail: expect.stringMatching(/permission denied/i) });
+        }
       });
 
       it('no setpriority, sched_setaffinity or ioprio_set on a process outside the sandbox', () => {

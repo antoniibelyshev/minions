@@ -37,8 +37,9 @@ export const FIXED_CANARIES = [
   'control.write-scratch', 'control.chmod-scratch', 'control.read', 'control.socketpair',
   'proc.environ', 'signal.runner', 'signal.wrapper',
   'seccomp.af-unix', 'unix.path', 'unix.abstract', 'tcp.loopback', 'tcp.fastopen',
-  'meta.chmod', 'meta.chown', 'meta.setxattr', 'meta.utimensat',
-  'sched.setpriority', 'sched.setaffinity', 'sched.ioprio', 'sched.prlimit',
+  'meta.chmod', 'meta.chown', 'meta.setxattr', 'meta.setxattrat', 'meta.removexattrat', 'meta.file_setattr', 'meta.utimensat',
+  'sched.setpriority', 'sched.setaffinity', 'sched.ioprio', 'sched.prlimit', 'sched.getpriority-user', 'sched.setpriority-which',
+  'ioctl.tiocsti', 'ioctl.tioclinux', 'socket.mptcp',
   'io_uring.setup', 'abi.x32', 'abi.compat-socketcall', 'proc.seccomp-filters',
   'canary.exit', 'lifetime.runner-death',
 ] as const;

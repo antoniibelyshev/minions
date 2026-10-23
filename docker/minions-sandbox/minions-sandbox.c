@@ -565,8 +565,47 @@ static uint64_t fs_rights(unsigned access, int is_dir, uint64_t handled) {
   BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW), \
   BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | (err))
 
+/* Like DENY_UNLESS_SELF for the calls whose arg0 says what arg1 names (setpriority/getpriority: PRIO_*,
+ * ioprio_set: IOPRIO_WHO_*): allow only when arg0 is <self_which> or <pgrp_which> and arg1 is 0, i.e.
+ * the caller itself or its own process group (the sandbox's, by setpgid). The "user" form with 0 means
+ * "every process of the caller's uid" (coordinator and runner included), so it is denied, like any other
+ * value; only the low word of arg0 is tested because the kernel takes it as an int (11 insns). */
+#define DENY_UNLESS_SELF_WHICH(nr, self_which, pgrp_which, err) \
+  BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, (nr), 0, 9), \
+  BPF_STMT(BPF_LD | BPF_W | BPF_ABS, ARG_LO(0)), \
+  BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, (self_which), 1, 0), \
+  BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, (pgrp_which), 0, 5), \
+  BPF_STMT(BPF_LD | BPF_W | BPF_ABS, ARG_HI(1)), \
+  BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 3), \
+  BPF_STMT(BPF_LD | BPF_W | BPF_ABS, ARG_LO(1)), \
+  BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 1), \
+  BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW), \
+  BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | (err))
+#define IOPRIO_WHO_PROCESS_ 1
+#define IOPRIO_WHO_PGRP_ 2
+
 #ifndef __NR_fchmodat2
 # define __NR_fchmodat2 452
+#endif
+/* The *xattrat family (Linux 6.13) and file_setattr (6.17) come from the unified syscall table, so the
+ * numbers are the same on x86_64 and aarch64. Denying a number the kernel does not have is harmless. */
+#ifndef __NR_setxattrat
+# define __NR_setxattrat 463
+#endif
+#ifndef __NR_removexattrat
+# define __NR_removexattrat 466
+#endif
+#ifndef __NR_file_setattr
+# define __NR_file_setattr 469
+#endif
+#ifndef TIOCSTI
+# define TIOCSTI 0x5412
+#endif
+#ifndef TIOCLINUX
+# define TIOCLINUX 0x541C
+#endif
+#ifndef IPPROTO_MPTCP
+# define IPPROTO_MPTCP 262
 #endif
 #ifndef MSG_FASTOPEN
 # define MSG_FASTOPEN 0x20000000
@@ -772,6 +811,12 @@ static int install_seccomp(void) {
     DENY_NR(__NR_removexattr, EPERM),
     DENY_NR(__NR_lremovexattr, EPERM),
     DENY_NR(__NR_fremovexattr, EPERM),
+    /* The dirfd-relative forms. setxattrat also works on an O_PATH fd with AT_EMPTY_PATH, and Landlock
+     * lets O_PATH open a protected file; a system.posix_acl_access ACL rewrites the mode bits (chmod 000
+     * under another name), so these must be denied as well. file_setattr writes the inode flags. */
+    DENY_NR(__NR_setxattrat, EPERM),
+    DENY_NR(__NR_removexattrat, EPERM),
+    DENY_NR(__NR_file_setattr, EPERM),
 #ifdef __NR_utime
     DENY_NR(__NR_utime, EPERM),
 #endif
@@ -785,22 +830,41 @@ static int install_seccomp(void) {
 
     /* Scheduling and resource controls Landlock scoping does not cover: lowering the nice/affinity/IO
      * priority or limits of same-uid processes outside the sandbox (coordinator, runner). Allow only a
-     * target of 0 (the calling process itself); any explicit pid/who is denied. */
-    DENY_UNLESS_SELF(__NR_setpriority, 1, EPERM),
-    DENY_UNLESS_SELF(__NR_ioprio_set, 1, EPERM),
+     * target of 0 (the calling process itself); any explicit pid/who is denied. For the PRIO_* and
+     * IOPRIO_WHO_* calls the kind of target must also be the process or its own group: PRIO_USER with
+     * who 0 would renice every process of the uid. getpriority is limited the same way (no peeking). */
+    DENY_UNLESS_SELF_WHICH(__NR_setpriority, PRIO_PROCESS, PRIO_PGRP, EPERM),
+    DENY_UNLESS_SELF_WHICH(__NR_getpriority, PRIO_PROCESS, PRIO_PGRP, EPERM),
+    DENY_UNLESS_SELF_WHICH(__NR_ioprio_set, IOPRIO_WHO_PROCESS_, IOPRIO_WHO_PGRP_, EPERM),
     DENY_UNLESS_SELF(__NR_sched_setaffinity, 0, EPERM),
     DENY_UNLESS_SELF(__NR_sched_setscheduler, 0, EPERM),
     DENY_UNLESS_SELF(__NR_sched_setattr, 0, EPERM),
     DENY_UNLESS_SELF(__NR_sched_setparam, 0, EPERM),
     DENY_UNLESS_SELF(__NR_prlimit64, 0, EPERM),
 
+    /* TIOCSTI pushes bytes into a terminal's input queue and TIOCLINUX can paste the console selection:
+     * with an inherited controlling tty the worker could type into the coordinator's TUI. The command is
+     * an unsigned int, so only the low word of arg1 is tested; every other ioctl is allowed. */
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_ioctl, 0, 5),
+    BPF_STMT(BPF_LD | BPF_W | BPF_ABS, ARG_LO(1)),
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, TIOCSTI, 2, 0),
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, TIOCLINUX, 1, 0),
+    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM),
+
     BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_socket, 1, 0),
     BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
-    /* socket(): the family is an int passed by value (no pointer, so no race). */
+    /* socket(): the family and protocol are ints passed by value (no pointer, so no race). */
     BPF_STMT(BPF_LD | BPF_W | BPF_ABS, ARG0_LOW),
-    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AF_INET, 3, 0),
-    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AF_INET6, 2, 0),
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AF_INET, 4, 0),
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AF_INET6, 3, 0),
     BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AF_NETLINK, 1, 0),
+    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EACCES),
+    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+    /* AF_INET/AF_INET6: Landlock's TCP-connect rule does not cover MPTCP, so IPPROTO_MPTCP is refused
+     * (plain TCP, UDP and ICMP-ping sockets keep working; Landlock governs the TCP connects). */
+    BPF_STMT(BPF_LD | BPF_W | BPF_ABS, ARG_LO(2)),
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, IPPROTO_MPTCP, 0, 1),
     BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EACCES),
     BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
   };
@@ -1131,6 +1195,42 @@ static void expect_killed(const char *name, void (*fn)(void)) {
 }
 #endif
 
+/* The escapee sweep (D3b) finds sandboxed processes by the Seccomp_filters count in /proc/<pid>/status, so
+ * the line must be there and count at least the helper's filter. A failed open or read is reported with its
+ * errno, apart from a status file that lacks the line: they have different causes and fixes. The whole file
+ * is read with read(2) (no stdio line buffer that a long line could split). */
+static void canary_seccomp_filters(void) {
+  const char *path = "/proc/self/status";
+  int fd = open(path, O_RDONLY | O_CLOEXEC);
+  if (fd < 0) { report("proc.seccomp-filters", "error", "cannot open %s: %s", path, strerror(errno)); return; }
+  static char buf[65536];
+  size_t got = 0;
+  for (;;) {
+    ssize_t k = read(fd, buf + got, sizeof buf - 1 - got);
+    if (k < 0) {
+      if (errno == EINTR) continue;
+      int e = errno;
+      close(fd);
+      report("proc.seccomp-filters", "error", "cannot read %s: %s", path, strerror(e));
+      return;
+    }
+    if (k == 0 || got + (size_t)k >= sizeof buf - 1) { got += (size_t)k; break; }
+    got += (size_t)k;
+  }
+  close(fd);
+  buf[got] = '\0';
+  static const char key[] = "Seccomp_filters:";
+  const char *at = NULL;
+  for (const char *p = buf; p && *p; p = strchr(p, '\n'), p = p ? p + 1 : NULL)
+    if (strncmp(p, key, sizeof key - 1) == 0) { at = p + sizeof key - 1; break; }
+  if (!at) { report("proc.seccomp-filters", "error", "no Seccomp_filters line in %s (%zu bytes read)", path, got); return; }
+  char *end;
+  long n = strtol(at, &end, 10);
+  if (end == at) report("proc.seccomp-filters", "error", "unparsable Seccomp_filters line in %s", path);
+  else if (n < 1) report("proc.seccomp-filters", "error", "Seccomp_filters is %ld: the helper's filter is not counted", n);
+  else report("proc.seccomp-filters", "pass", "%ld", n);
+}
+
 static void canary_seccomp(void) {
   unsigned char params[256];
   memset(params, 0, sizeof params);
@@ -1148,15 +1248,7 @@ static void canary_seccomp(void) {
   report("abi.x32", "skip", "no x32 ABI on " ARCH_NAME);
   report("abi.compat-socketcall", "skip", "AArch32 cannot be entered from a 64-bit process");
 #endif
-  FILE *f = fopen("/proc/self/status", "re");
-  int filters = -1;
-  char line[256];
-  if (f) {
-    while (fgets(line, sizeof line, f)) if (sscanf(line, "Seccomp_filters: %d", &filters) == 1) break;
-    fclose(f);
-  }
-  if (filters >= 1) report("proc.seccomp-filters", "pass", "%d", filters);
-  else report("proc.seccomp-filters", "error", "Seccomp_filters missing from /proc/self/status");
+  canary_seccomp_filters();
 }
 
 static void canary_tcp(unsigned port) {
@@ -1191,13 +1283,26 @@ static void canary_tcp_fastopen(unsigned port) {
   else report("tcp.fastopen", "pass", "127.0.0.1:%u: %s", port, strerror(err));
 }
 
+/* The helper's own rule must answer: EPERM from its filter, not merely any failure (a kernel without the
+ * syscall says ENOSYS, a bad argument EINVAL/EFAULT, a non-tty ENOTTY), so a dropped rule is caught even
+ * where the probe could not have done harm. */
+static void expect_filtered(const char *name, int ok, int err) {
+  if (ok) report(name, "escaped", "operation succeeded");
+  else if (err == EPERM) report(name, "pass", "%s", strerror(err));
+  else report(name, "escaped", "not denied by the helper's own filter (%s)", strerror(err));
+}
+
+/* struct xattr_args (Linux 6.13 UAPI), defined here so the build does not need new headers. */
+struct ms_xattr_args { uint64_t value; uint32_t size; uint32_t flags; };
+
 /* Metadata writes Landlock does not cover, on a protected path (a denyWrite dir). Non-destructive: each
  * call uses the path's current values, so a working seccomp filter denies it and a broken one changes
  * nothing visible. */
 static void canary_metadata(const char *path) {
   struct stat st;
   if (lstat(path, &st) < 0) {
-    static const char *const names[] = { "meta.chmod", "meta.chown", "meta.setxattr", "meta.utimensat" };
+    static const char *const names[] = { "meta.chmod", "meta.chown", "meta.setxattr", "meta.setxattrat", "meta.removexattrat",
+                                         "meta.file_setattr", "meta.utimensat" };
     for (size_t i = 0; i < sizeof names / sizeof names[0]; i++) report(names[i], "error", "target missing (%s)", strerror(errno));
     return;
   }
@@ -1207,6 +1312,18 @@ static void canary_metadata(const char *path) {
   int xe = errno;
   if (xr == 0) removexattr(path, "user.minions-sandbox-canary");
   expect_denied("meta.setxattr", xr == 0, xe);
+  /* The dirfd-relative forms (the system.posix_acl_access route to a mode change). A user.* name keeps the
+   * probe harmless; removexattrat names an attribute that does not exist (ENODATA without the rule). */
+  struct ms_xattr_args xa = { (uint64_t)(uintptr_t)"x", 1, 0 };
+  xr = (int)syscall(__NR_setxattrat, AT_FDCWD, path, 0U, "user.minions-sandbox-canary", &xa, sizeof xa);
+  xe = errno;
+  if (xr == 0) removexattr(path, "user.minions-sandbox-canary");
+  expect_filtered("meta.setxattrat", xr == 0, xe);
+  xr = (int)syscall(__NR_removexattrat, AT_FDCWD, path, 0U, "user.minions-sandbox-canary-absent");
+  expect_filtered("meta.removexattrat", xr == 0, errno);
+  /* A NULL attribute buffer of size 0 is refused by the kernel (EINVAL) before it touches the inode. */
+  xr = (int)syscall(__NR_file_setattr, AT_FDCWD, path, (void *)0, (size_t)0, 0U);
+  expect_filtered("meta.file_setattr", xr == 0, errno);
   struct timespec times[2] = { st.st_atim, st.st_mtim };
   expect_denied("meta.utimensat", utimensat(AT_FDCWD, path, times, 0) == 0, errno);
 }
@@ -1225,6 +1342,38 @@ static void canary_sched(pid_t runner) {
   expect_denied("sched.ioprio", syscall(__NR_ioprio_set, 1, runner, cur < 0 ? 0 : cur) == 0, errno);
   struct rlimit rl;
   expect_denied("sched.prlimit", syscall(__NR_prlimit64, runner, RLIMIT_NOFILE, (void *)0, &rl) == 0, errno);
+  /* PRIO_USER with who 0 names every process of the uid. Reading it is the harmless probe of that form;
+   * setting it is probed with an out-of-range which (the filter allows only PRIO_PROCESS and PRIO_PGRP,
+   * so any other value takes the same path; the kernel would answer EINVAL and change nothing). */
+  errno = 0;
+  int up = getpriority(PRIO_USER, 0);
+  expect_filtered("sched.getpriority-user", !(up == -1 && errno), errno);
+  expect_filtered("sched.setpriority-which", syscall(__NR_setpriority, 3, 0, 0) == 0, errno);
+}
+
+/* Terminal input injection: TIOCSTI/TIOCLINUX on a non-tty (/dev/null) so a dropped rule cannot inject
+ * anything; without the rule the kernel says ENOTTY, with it the filter says EPERM. */
+static void canary_tty(void) {
+  int fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    report("ioctl.tiocsti", "error", "/dev/null: %s", strerror(errno));
+    report("ioctl.tioclinux", "error", "/dev/null: %s", strerror(errno));
+    return;
+  }
+  char c = 0;
+  expect_filtered("ioctl.tiocsti", ioctl(fd, TIOCSTI, &c) == 0, errno);
+  char sub = 0;
+  expect_filtered("ioctl.tioclinux", ioctl(fd, TIOCLINUX, &sub) == 0, errno);
+  close(fd);
+}
+
+/* MPTCP: Landlock's TCP-connect rule does not cover it, so the filter refuses the protocol (EACCES). */
+static void canary_mptcp(void) {
+  int s = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, IPPROTO_MPTCP);
+  int err = errno;
+  if (s >= 0) { close(s); report("socket.mptcp", "escaped", "socket(AF_INET, IPPROTO_MPTCP) succeeded"); }
+  else if (err == EACCES) report("socket.mptcp", "pass", "%s", strerror(err));
+  else report("socket.mptcp", "escaped", "not denied by the helper's own filter (%s)", strerror(err));
 }
 
 /* The main canary. Its plan comes from the self-test on stdin (the rules file may be unreadable here). */
@@ -1280,6 +1429,8 @@ static int canary_main(void) {
   canary_unix(sock_path, abstract);
   canary_tcp(port);
   canary_tcp_fastopen(port);
+  canary_mptcp();
+  canary_tty();
   canary_seccomp();
   return 0;
 }
