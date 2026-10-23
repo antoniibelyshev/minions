@@ -272,6 +272,71 @@ describe('credential masking of stored send errors', () => {
     expect(redactError('error: "Authorization: Basic dXNlcjpwYXNzd29yZA==" rejected')).toBe('error: "Authorization: Basic [redacted]" rejected');
   });
 
+  it('masks every Digest param when readable text follows the header', () => {
+    expect(redactError('Authorization: Digest username="u", response="deadbeefcafe1234" -> 401 Unauthorized'))
+      .toBe('Authorization: Digest [redacted] -> 401 Unauthorized');
+    expect(redactError('Authorization: Digest username="u", response="deadbeefcafe1234" (retrying)'))
+      .toBe('Authorization: Digest [redacted] (retrying)');
+    expect(redactError('Authorization: Digest username="u" response="deadbeefcafe1234" nonce=n0nce42 tail words'))
+      .toBe('Authorization: Digest [redacted] tail words');
+    expect(redactError('Authorization: Digest username = "u" , nc = 00000001, response = "deadbeefcafe1234" end'))
+      .toBe('Authorization: Digest [redacted] end');
+    expect(redactError('Authorization: Digest realm="a b", response=deadbeefcafe1234; next')).toBe('Authorization: Digest [redacted] next');
+  });
+
+  it('masks Digest params after a backslash-escaped quote in a quoted value', () => {
+    expect(redactError('Authorization: Digest username="a\\"b", response="deadbeefcafe1234"')).toBe('Authorization: Digest [redacted]');
+    expect(redactError('Authorization: Digest username="a\\"b, c", response="deadbeefcafe1234" -> 401')).toBe('Authorization: Digest [redacted] -> 401');
+    // The same header logged inside a JSON string: the raw `\"` becomes `\\\"`, the param quotes `\"`.
+    expect(redactError('{"error":"Authorization: Digest username=\\"a\\\\\\"b c\\", response=\\"deadbeefcafe1234\\"","code":401}'))
+      .toBe('{"error":"Authorization: Digest [redacted]","code":401}');
+    expect(redactError('{"error":"Authorization: Digest username=\\"John Doe\\", response=\\"deadbeefcafe1234\\""}'))
+      .toBe('{"error":"Authorization: Digest [redacted]"}');
+  });
+
+  it('masks an unterminated quoted Digest value (a cut-off message) up to the line end', () => {
+    expect(redactError('Authorization: Digest username="u", response="deadbeef cafe…\nnext')).toBe('Authorization: Digest [redacted] next');
+  });
+
+  it('masks a folded multi-line Authorization header', () => {
+    expect(redactError('Authorization: Digest username="u",\n  response="deadbeefcafe1234"\nretry later')).toBe('Authorization: Digest [redacted] retry later');
+  });
+
+  it('keeps text after a token68 credential readable and the enclosing JSON intact', () => {
+    expect(redactError('Authorization: Basic dXNlcjpwYXNzd29yZA==, retrying later')).toBe('Authorization: Basic [redacted], retrying later');
+    expect(redactError('Authorization: NTLM TlRMTVNTUAABAAAAB4IIog== (step 1)')).toBe('Authorization: NTLM [redacted] (step 1)');
+    expect(redactError('{"Authorization":"Basic dXNlcg=","x":"y"}')).toBe('{"Authorization":"Basic [redacted]","x":"y"}');
+    expect(redactError('{"Authorization":"Basic dXNlcg==", "x": 1}')).toBe('{"Authorization":"Basic [redacted]", "x": 1}');
+  });
+
+  it('masks AWS SigV4 credentials and signatures', () => {
+    const header = 'Authorization: AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20130524/us-east-1/s3/aws4_request, '
+      + 'SignedHeaders=host;range;x-amz-date, Signature=fe5f80f77d5fa3beca038a248ff027d0445342fe2855ddc963176630326f1024 failed';
+    expect(redactError(header)).toBe('Authorization: AWS4-HMAC-SHA256 [redacted] failed');
+    expect(redactError('GET /b?X-Amz-Credential=AKIDEXAMPLE%2F2013&X-Amz-Signature=fe5f80f77d5fa3 403'))
+      .toBe('GET /b?X-Amz-Credential=[redacted]&X-Amz-Signature=[redacted] 403');
+  });
+
+  it('masks a generated-looking value after apikey without a separator, but keeps prose', () => {
+    expect(redactError('apikey sk_live_0123456789abcd rejected')).toBe('apikey [redacted] rejected');
+    expect(redactError('apikey is missing')).toBe('apikey is missing');
+  });
+
+  it('masks a URL-encoded Authorization header', () => {
+    expect(redactError('GET /x?h=Authorization%3A%20Basic%20dXNlcjpwYXNzd29yZA%3D%3D&y=1')).toBe('GET /x?h=Authorization%3A%20Basic%20[redacted]&y=1');
+  });
+
+  it.each(['="', 'a="', '\\', '\\"', ', a=', ' a=', '= ', ' ', '=\\"', 'a=\\"\\\\', ',', '"', '=', ' =  ', 'a="\\'])(
+    'redacts a 100 KB adversarial Authorization value of %j quickly',
+    (unit) => {
+      const value = unit.repeat(Math.ceil(100_000 / unit.length));
+      const t0 = Date.now();
+      redactError(`Authorization: Digest ${value}`);
+      redactError(`x Authorization: Basic ${value} Proxy-Authorization: Digest ${value}`);
+      expect(Date.now() - t0).toBeLessThan(500);
+    },
+  );
+
   it('masks a bearer token in a JSON-quoted Authorization header', () => {
     expect(redactError('{"Authorization":"Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig"}')).not.toContain('eyJhbGciOiJIUzI1NiJ9');
   });

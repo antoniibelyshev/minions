@@ -49,28 +49,47 @@ export const backoffMs = (attempts: number): number => Math.min(BACKOFF_BASE_MS 
 
 /**
  * Credential-like keys whose `key=value` / `key: value` value is masked (case-insensitive, also with a
- * prefix such as `client_secret`, `x-access-token`, `aws_secret_access_key` or a JSON-quoted key).
+ * prefix such as `client_secret`, `x-access-token`, `aws_secret_access_key`, `X-Amz-Signature` or a
+ * JSON-quoted key).
  */
-const SECRET_KEY = String.raw`\b([\w-]*?(?:password|passwd|api[_-]?key|(?:secret|access|private)[_-]?key|secret|token|authorization))`;
+const SECRET_KEY = String.raw`\b([\w-]*?(?:password|passwd|api[_-]?key|(?:secret|access|private)[_-]?key|secret|token|authorization|signature|credentials?))`;
 /** Auth scheme words after an authorization key: they belong to the separator, the value follows them. */
-const AUTH_SCHEME = String.raw`(?:bearer|token|basic|digest|negotiate|ntlm)\s`;
-/** Schemes whose header value is masked whole (Bearer has its own rule that keeps prose readable). */
-const AUTH_HEADER_SCHEME = String.raw`(?:token|basic|digest|negotiate|ntlm)`;
+const AUTH_SCHEME = String.raw`(?:bearer|token|basic|digest|negotiate|ntlm|aws4-hmac-sha256)\s`;
+/** Schemes whose header credential is masked whole (Bearer has its own rule that keeps prose readable). */
+const AUTH_HEADER_SCHEME = String.raw`(?:token|basic|digest|negotiate|ntlm|aws4-hmac-sha256)`;
+/** Horizontal whitespace, or a line break that folds the header onto an indented next line. */
+const HWS = String.raw`(?:[^\S\n]|\n(?=[ \t]))`;
 /**
- * The rest of an Authorization header value: up to the end of the line or an unescaped quote (the end
- * of an enclosing JSON string). JSON-escaped characters (`\"`) and quoted Digest parameters
- * (`key="v", ...`, the closing quote followed by `,`, `;` or the line end) belong to the value.
+ * One credential item: a token68 (`dXNlcjpw==`) or an auth param (`key=token`, `key = "quoted"`,
+ * `SignedHeaders=host;range`). Its parts, in order:
+ * - a JSON escape (`\"`, `\\`) of a header logged inside a JSON string;
+ * - whitespace around a param's `=` (`nc = 1`);
+ * - a quoted value with `\"` escapes, closed by a quote before whitespace, `,`, `;` or the end (so the
+ *   `="` of Base64 padding before the quote that closes an enclosing string is not taken for a value);
+ * - an unterminated quoted value (a cut-off message), up to the line end;
+ * - a JSON-escaped quoted value (`=\"John Doe\"`);
+ * - any other character except whitespace, `"`, `\` and `,`. An unescaped quote ends the item.
  */
-const AUTH_HEADER_VALUE = String.raw`(?:\\.|=\s*"[^"\\\n]*"(?=\s*[,;]|[^\S\n]*(?:\n|$))|[^"\\\n])+`;
+const AUTH_ITEM = String.raw`(?:\\.|[^\S\n]+(?==)|=[^\S\n]*"(?:[^"\\\n]|\\.)*"(?=[\s,;]|$)|=[^\S\n]*"(?:[^\s"\\]|\\.)(?:[^"\\\n]|\\.)*(?=\n|$)|=[^\S\n]*\\"(?:[^"\\\n]|\\\\\\.|\\[^"\\\n])*\\"|(?<=[^\S\n])=[^\S\n]+|[^\s"\\,])+`;
+/** Before a further item: `,` or whitespace, then the next `key=` param. */
+const AUTH_NEXT_ITEM = String.raw`(?:${HWS}*,${HWS}*|${HWS}+)(?=[\w-]+[^\S\n]*=)`;
+/**
+ * The whole credential of an Authorization header: its items up to the first thing that is not one,
+ * so trailing prose such as ` -> 401 Unauthorized`, ` (retrying)` or `, retrying` stays readable. A
+ * folded header (a line break before an indented continuation) counts as whitespace. Nothing follows
+ * this pattern in its rule, so a match never fails after the first item and nothing backtracks into it.
+ */
+const AUTH_HEADER_VALUE = String.raw`${AUTH_ITEM}(?:${AUTH_NEXT_ITEM}${AUTH_ITEM})*`;
 /** Longer inputs are cut before masking: the patterns cost O(n^2) on long runs, and only 300 chars are kept. */
 const MAX_REDACT_INPUT = 4000;
 
 /**
  * Shortens an error and masks anything that looks like a credential: bot tokens, GitHub tokens, URL
- * userinfo passwords, the value after `Bearer`, the whole rest of an `Authorization:` or
- * `Proxy-Authorization:` header after its token/Basic/Digest/Negotiate/NTLM scheme, and the values
- * (whole, when quoted) of password/passwd/api_key/apikey/secret/token/authorization and
- * secret_key/access_key/private_key keys. Prose such as "Bearer token is missing" is left readable
+ * userinfo passwords, the value after `Bearer`, the whole credential (every param) of an
+ * `Authorization:` or `Proxy-Authorization:` header (also URL-encoded) after its
+ * token/Basic/Digest/Negotiate/NTLM/AWS4-HMAC-SHA256 scheme, the values (whole, when quoted) of
+ * password/passwd/api_key/apikey/secret/token/authorization/signature/credential and
+ * secret_key/access_key/private_key keys, and generated-looking values after `token`/`apikey`. Prose such as "Bearer token is missing" is left readable
  * (a bearer token has 8+ characters).
  */
 export function redactError(message: string): string {
@@ -82,11 +101,13 @@ export function redactError(message: string): string {
     .replace(/\bbearer\s+(?!\[redacted\])[^\s"',;]{8,}/gi, 'Bearer [redacted]')
     // Authorization / Proxy-Authorization header with a scheme: mask the whole rest of the value.
     .replace(new RegExp(String.raw`\b((?:proxy-)?authorization\s*["']?\s*[:=]\s*["']?${AUTH_HEADER_SCHEME}\s+)(?!\[redacted\])${AUTH_HEADER_VALUE}`, 'gi'), '$1[redacted]')
+    // URL-encoded header (`Authorization%3A%20Basic%20...` in a query string or a logged request).
+    .replace(new RegExp(String.raw`\b((?:proxy-)?authorization(?:%22)?%3A(?:%20|\+)*(?:%22)?${AUTH_HEADER_SCHEME}(?:%20|\+)+)(?!\[redacted\])[^\s&"']+`, 'gi'), '$1[redacted]')
     // Quoted value: mask up to the closing quote.
     .replace(new RegExp(`${SECRET_KEY}(\\s*["']?\\s*[:=]\\s*)(["'])(?!\\[redacted\\]|${AUTH_SCHEME})(?:(?!\\3)[^\\n])+`, 'gi'), '$1$2$3[redacted]')
     .replace(new RegExp(`${SECRET_KEY}(\\s*["']?\\s*[:=]\\s*["']?)(?!\\[redacted\\]|${AUTH_SCHEME})[^\\s"'&,;]+`, 'gi'), '$1$2[redacted]')
-    // "token <value>" without a separator: only values that look generated (12+ chars with a digit).
-    .replace(/\b(token|authorization)(\s+)(?!\[redacted\])(?=[^\s"']*\d)[^\s"']{12,}/gi, '$1$2[redacted]')
+    // "token <value>" / "apikey <value>" without a separator: only generated-looking values (12+ chars with a digit).
+    .replace(/\b(token|authorization|api[_-]?key)(\s+)(?!\[redacted\])(?=[^\s"']*\d)[^\s"']{12,}/gi, '$1$2[redacted]')
     .replace(/\s+/g, ' ')
     .trim();
   return masked.length > MAX_ERROR_LENGTH ? `${masked.slice(0, MAX_ERROR_LENGTH - 1)}…` : masked;
