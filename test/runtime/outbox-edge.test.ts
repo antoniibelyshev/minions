@@ -203,8 +203,19 @@ describe('credential masking of stored send errors', () => {
     ['secret: s3cr3t', 's3cr3t'],
     ['client_secret=cs_live_42', 'cs_live_42'],
     ['{"password":"p@ss word"}', 'p@ss'],
+    ['{"password":"p@ss phrase"}', 'phrase'],
+    ["password='two words here'", 'words here'],
     ["config {'Secret': 'shh'}", 'shh'],
     ['upstream said token abc123def456ghi', 'abc123def456ghi'],
+    ['Authorization: token 0123456789abcdef0123456789abcdef01234567', '0123456789abcdef0123456789abcdef01234567'],
+    ['Authorization: Basic dXNlcjpwYXNzd29yZA==', 'dXNlcjpwYXNzd29yZA=='],
+    ['authorization=Digest username-and-response', 'username-and-response'],
+    ['{"Authorization":"token 0123456789abcdef"}', '0123456789abcdef'],
+    ['secret_key=sk-abc', 'sk-abc'],
+    ['access_key: AKIAEXAMPLE', 'AKIAEXAMPLE'],
+    ['private-key=pk_9', 'pk_9'],
+    ['AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG', 'wJalrXUtnFEMI'],
+    ['clone https://bob:hunter2@example.com/r.git failed', 'hunter2'],
   ])('masks %s', (input, secret) => {
     expect(redactError(input)).not.toContain(secret);
     expect(redactError(input)).toContain('[redacted]');
@@ -226,6 +237,20 @@ describe('credential masking of stored send errors', () => {
     expect(redactError('token expired, authorization required')).toBe('token expired, authorization required');
     expect(redactError('2 secrets found; password reset needed')).toBe('2 secrets found; password reset needed');
     expect(redactError('password=hunter2 api_key=abc')).toBe('password=[redacted] api_key=[redacted]');
+    expect(redactError('Authorization: token 0123456789abcdef0123456789abcdef01234567')).toBe('Authorization: token [redacted]');
+    expect(redactError('Authorization: Basic dXNlcjpwYXNzd29yZA==')).toBe('Authorization: Basic [redacted]');
+    expect(redactError('{"password":"p@ss word","user":"bob"}')).toBe('{"password":"[redacted]","user":"bob"}');
+    expect(redactError('https://bob:hunter2@example.com/r.git')).toBe('https://bob:[redacted]@example.com/r.git');
+    expect(redactError('see https://example.com:8080/path and monkey=banana')).toBe('see https://example.com:8080/path and monkey=banana');
+  });
+
+  it('cuts very long input before masking, so redaction stays fast and no secret survives', () => {
+    const long = `${'a-'.repeat(100_000)} password=hunter2`;
+    const t0 = Date.now();
+    const out = redactError(long);
+    expect(Date.now() - t0).toBeLessThan(1000);
+    expect(out.length).toBeLessThanOrEqual(300);
+    expect(redactError(`password=hunter2 ${'x'.repeat(10_000)}`)).not.toContain('hunter2');
   });
 
   it('masks a bearer token in a JSON-quoted Authorization header', () => {

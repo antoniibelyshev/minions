@@ -49,21 +49,32 @@ export const backoffMs = (attempts: number): number => Math.min(BACKOFF_BASE_MS 
 
 /**
  * Credential-like keys whose `key=value` / `key: value` value is masked (case-insensitive, also with a
- * prefix such as `client_secret`, `x-access-token` or a JSON-quoted key).
+ * prefix such as `client_secret`, `x-access-token`, `aws_secret_access_key` or a JSON-quoted key).
  */
-const SECRET_KEY = String.raw`\b([\w-]*?(?:password|passwd|api[_-]?key|secret|token|authorization))`;
+const SECRET_KEY = String.raw`\b([\w-]*?(?:password|passwd|api[_-]?key|(?:secret|access|private)[_-]?key|secret|token|authorization))`;
+/** Auth scheme words after an authorization key: they belong to the separator, the value follows them. */
+const AUTH_SCHEME = String.raw`(?:bearer|token|basic|digest)\s`;
+/** Longer inputs are cut before masking: the patterns cost O(n^2) on long runs, and only 300 chars are kept. */
+const MAX_REDACT_INPUT = 4000;
 
 /**
- * Shortens an error and masks anything that looks like a credential: bot tokens, GitHub tokens, the
- * token after `Bearer`, and the values of password/passwd/api_key/apikey/secret/token/authorization
- * keys. Prose such as "Bearer token is missing" is left readable (a bearer token has 8+ characters).
+ * Shortens an error and masks anything that looks like a credential: bot tokens, GitHub tokens, URL
+ * userinfo passwords, the value after `Bearer` or `Authorization: token|Basic|Digest`, and the values
+ * (whole, when quoted) of password/passwd/api_key/apikey/secret/token/authorization and
+ * secret_key/access_key/private_key keys. Prose such as "Bearer token is missing" is left readable
+ * (a bearer token has 8+ characters).
  */
 export function redactError(message: string): string {
-  const masked = message
+  const masked = message.slice(0, MAX_REDACT_INPUT)
     .replace(/(?:bot)?\d{6,}:[A-Za-z0-9_-]{30,}(?![A-Za-z0-9_-])/gi, '[redacted]')
     .replace(/\b(gh[pousr]_|github_pat_)[A-Za-z0-9_]{20,}\b/g, '[redacted]')
+    // https://user:pass@host
+    .replace(/\b([a-z][a-z0-9+.-]*:\/\/[^\s/:@]*:)[^\s/@]+@/gi, '$1[redacted]@')
     .replace(/\bbearer\s+(?!\[redacted\])[^\s"',;]{8,}/gi, 'Bearer [redacted]')
-    .replace(new RegExp(`${SECRET_KEY}(\\s*["']?\\s*[:=]\\s*["']?)(?!\\[redacted\\]|bearer\\s)[^\\s"'&,;]+`, 'gi'), '$1$2[redacted]')
+    .replace(/\b(authorization\s*["']?\s*[:=]\s*["']?(?:token|basic|digest)\s+)(?!\[redacted\])[^\s"',;]+/gi, '$1[redacted]')
+    // Quoted value: mask up to the closing quote.
+    .replace(new RegExp(`${SECRET_KEY}(\\s*["']?\\s*[:=]\\s*)(["'])(?!\\[redacted\\]|${AUTH_SCHEME})(?:(?!\\3)[^\\n])+`, 'gi'), '$1$2$3[redacted]')
+    .replace(new RegExp(`${SECRET_KEY}(\\s*["']?\\s*[:=]\\s*["']?)(?!\\[redacted\\]|${AUTH_SCHEME})[^\\s"'&,;]+`, 'gi'), '$1$2[redacted]')
     // "token <value>" without a separator: only values that look generated (12+ chars with a digit).
     .replace(/\b(token|authorization)(\s+)(?!\[redacted\])(?=[^\s"']*\d)[^\s"']{12,}/gi, '$1$2[redacted]')
     .replace(/\s+/g, ' ')
