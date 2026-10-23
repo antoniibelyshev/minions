@@ -138,12 +138,23 @@ const fsMod = fs as unknown as Record<string, AnyFn>;
 const fspMod = fs.promises as unknown as Record<string, AnyFn>;
 const first = (a: unknown[]) => [a[0]];
 const second = (a: unknown[]) => [a[1]];
-for (const [m, promise] of [[fsMod, false], [fspMod, true]] as const) {
-  for (const n of ['writeFile', 'appendFile', 'rm', 'unlink', 'truncate']) wrapFs(m, n, first, promise);
-  for (const n of ['rename', 'copyFile']) wrapFs(m, n, second, promise);
+const { O_WRONLY, O_RDWR, O_CREAT, O_TRUNC, O_APPEND } = fs.constants;
+/** open/openSync/fs.promises.open flags that can create or change the file ('r' and O_RDONLY are reads). */
+export function writesWithFlags(flags: unknown): boolean {
+  if (typeof flags === 'number') return (flags & (O_WRONLY | O_RDWR | O_CREAT | O_TRUNC | O_APPEND)) !== 0;
+  return typeof flags === 'string' && /[wa+]/.test(flags);
 }
-for (const n of ['writeFileSync', 'appendFileSync', 'rmSync', 'unlinkSync', 'truncateSync']) wrapFs(fsMod, n, first);
-for (const n of ['renameSync', 'copyFileSync']) wrapFs(fsMod, n, second);
+// open: only a writing open is refused, so tests can still read the real config.
+const openTarget = (a: unknown[]) => (writesWithFlags(a[1]) ? [a[0]] : []);
+for (const [m, promise] of [[fsMod, false], [fspMod, true]] as const) {
+  // mkdir/symlink (task-52): creating channels/telegram, or a symlink named settings.json or inside it.
+  for (const n of ['writeFile', 'appendFile', 'rm', 'rmdir', 'unlink', 'truncate', 'mkdir']) wrapFs(m, n, first, promise);
+  for (const n of ['rename', 'copyFile', 'cp', 'symlink', 'link']) wrapFs(m, n, second, promise);
+  wrapFs(m, 'open', openTarget, promise);
+}
+for (const n of ['writeFileSync', 'appendFileSync', 'rmSync', 'rmdirSync', 'unlinkSync', 'truncateSync', 'mkdirSync', 'createWriteStream']) wrapFs(fsMod, n, first);
+for (const n of ['renameSync', 'copyFileSync', 'cpSync', 'symlinkSync', 'linkSync']) wrapFs(fsMod, n, second);
+wrapFs(fsMod, 'openSync', openTarget);
 syncBuiltinESMExports();
 
 afterEach(() => {

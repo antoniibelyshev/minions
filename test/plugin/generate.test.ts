@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
-import { generatePlugin, renderPolicySummary, renderTemplate } from '../../src/plugin/generate.js';
+import { generatePlugin, LIVE_CLAUDE_RUN_GUIDANCE, renderPolicySummary, renderTemplate } from '../../src/plugin/generate.js';
 import { DRAIN_HOOK_COMMAND } from '../../src/runtime/drain.js';
 import type { MinionsConfig } from '../../src/config/schema.js';
 import { defaults, FAKE_MINIONS, runHookCommand } from '../helpers.js';
@@ -354,7 +354,7 @@ describe('Telegram tools are coordinator-only', () => {
     expect(coord).toMatch(/\*\*When the channel drops\*\*.*`minions status` shows a `telegram poller` problem/);
     expect(coord).toContain('run /mcp and reconnect plugin:telegram:telegram');
     expect(coord).toContain('`minions coordinator restart --recover`');
-    expect(coord).toMatch(/Never launch nested claude sessions .* and never ask a worker to/);
+    expect(coord).toMatch(/Never launch other claude sessions yourself outside a controlled live run \(see Testing\), and never ask a worker to/);
     for (const [role] of WORKER_AGENTS) {
       const md = await read(`agents/${role}.md`);
       expect(md, role).toMatch(/Never launch nested Claude Code sessions \(`claude -p`/);
@@ -363,6 +363,24 @@ describe('Telegram tools are coordinator-only', () => {
     // Also in terminal mode: the rule is about the container's live state, not the configured channel.
     const terminal = defaults(); terminal.communication.channel = 'terminal';
     expect(await (await gen(terminal)).read('agents/engineer.md')).toMatch(/Never launch nested Claude Code sessions/);
+  });
+
+  it('task-52: coordinator and worker guidance agree on controlled live claude runs (no active worker, separate CLAUDE_CONFIG_DIR)', async () => {
+    const terminal = defaults(); terminal.communication.channel = 'terminal';
+    for (const cfg of [telegram(), terminal]) {
+      const { read } = await gen(cfg);
+      const coord = await read('coordinator.md');
+      // In every channel mode: the rule protects the container's live state, not the configured channel.
+      expect(coord).toContain(LIVE_CLAUDE_RUN_GUIDANCE);
+      expect(coord).toMatch(/Only you run it, at a controlled moment: no worker lease is active/);
+      expect(coord).toMatch(/separate, fresh `CLAUDE_CONFIG_DIR`/);
+      expect(coord).toMatch(/workers never launch claude sessions/);
+      expect(coord).not.toMatch(/Never launch nested claude sessions \(`claude -p` and the like\) yourself/);
+      for (const [role] of WORKER_AGENTS) {
+        const md = await read(`agents/${role}.md`);
+        expect(md, role).toMatch(/only the coordinator runs it, at a controlled moment: no worker running, with a separate `CLAUDE_CONFIG_DIR`/);
+      }
+    }
   });
 });
 

@@ -167,6 +167,17 @@ describe('telegram capability probe: fact gathering', () => {
 
 describe('telegram doctor check (host side)', () => {
   const envelope = (data: unknown) => ok(JSON.stringify({ ok: true, data }));
+  it('task-52: passes the plugin user-scope state through (absent from older images)', () => {
+    expect(item(evaluateTelegram(facts()), 'plugin').userScope).toBe('enabled');
+    const off = evaluateTelegram(facts({ plugins: ok(JSON.stringify([pluginEntry({ enabled: false })])) }));
+    expect(item(off, 'plugin').userScope).toBe('disabled');
+    expect(telegramDoctorCheck(envelope(off))).toMatchObject({ status: 'ok', userScope: 'disabled' });
+    expect(telegramDoctorCheck(envelope(evaluateTelegram(facts()))).userScope).toBe('enabled');
+    const old = { ...off, items: off.items.map(({ userScope: _u, ...i }) => i) };
+    expect(telegramDoctorCheck(envelope(old))).not.toHaveProperty('userScope');
+    const odd = { ...off, items: off.items.map((i) => (i.name === 'plugin' ? { ...i, userScope: 'maybe' } : i)) };
+    expect(telegramDoctorCheck(envelope(odd))).not.toHaveProperty('userScope');
+  });
   it('maps an available report to ok', () => {
     const c = telegramDoctorCheck(envelope(evaluateTelegram(facts())));
     expect(c.status).toBe('ok');
