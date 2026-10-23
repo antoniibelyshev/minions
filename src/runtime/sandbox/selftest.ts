@@ -34,9 +34,11 @@ export interface SelfTestReport {
 
 /** Canaries the helper must report for every rules file, besides one per selfTest path and descriptor. */
 export const FIXED_CANARIES = [
-  'control.write-scratch', 'control.read', 'control.socketpair',
+  'control.write-scratch', 'control.chmod-scratch', 'control.read', 'control.socketpair',
   'proc.environ', 'signal.runner', 'signal.wrapper',
-  'seccomp.af-unix', 'unix.path', 'unix.abstract', 'tcp.loopback',
+  'seccomp.af-unix', 'unix.path', 'unix.abstract', 'tcp.loopback', 'tcp.fastopen',
+  'meta.chmod', 'meta.chown', 'meta.setxattr', 'meta.utimensat',
+  'sched.setpriority', 'sched.setaffinity', 'sched.ioprio', 'sched.prlimit',
   'io_uring.setup', 'abi.x32', 'abi.compat-socketcall', 'proc.seccomp-filters',
   'canary.exit', 'lifetime.runner-death',
 ] as const;

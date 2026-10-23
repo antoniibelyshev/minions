@@ -59,7 +59,9 @@
 #include <netinet/tcp.h>
 #include <poll.h>
 #include <sys/ioctl.h>
+#include <sched.h>
 #include <sys/prctl.h>
+#include <sys/resource.h>
 #include <sys/signalfd.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -67,6 +69,7 @@
 #include <sys/types.h>
 #include <sys/un.h>
 #include <sys/wait.h>
+#include <sys/xattr.h>
 
 #define HELPER_VERSION "1.0.0"
 #define RULES_VERSION 1
@@ -766,6 +769,9 @@ static int install_seccomp(void) {
     DENY_NR(__NR_setxattr, EPERM),
     DENY_NR(__NR_lsetxattr, EPERM),
     DENY_NR(__NR_fsetxattr, EPERM),
+    DENY_NR(__NR_removexattr, EPERM),
+    DENY_NR(__NR_lremovexattr, EPERM),
+    DENY_NR(__NR_fremovexattr, EPERM),
 #ifdef __NR_utime
     DENY_NR(__NR_utime, EPERM),
 #endif
@@ -1040,6 +1046,12 @@ static void canary_controls(const char *allow_write, const struct strlist *allow
   else {
     int ok = write(fd, "ok\n", 3) == 3;
     close(fd);
+    /* The chmod user-notification handler must allow chmod on a file inside the writable set (git needs
+     * it on its own worktree files); prove that here before the probe file is removed. */
+    if (ok) {
+      if (chmod(probe, 0640) == 0) report("control.chmod-scratch", "pass", "chmod inside the scratch dir is allowed");
+      else report("control.chmod-scratch", "error", "chmod inside the scratch dir was refused: %s", strerror(errno));
+    }
     unlink(probe);
     if (ok) report("control.write-scratch", "pass", "scratch is writable");
     else report("control.write-scratch", "error", "short write in the scratch dir");
@@ -1124,8 +1136,11 @@ static void canary_seccomp(void) {
   memset(params, 0, sizeof params);
   long fd = syscall(__NR_io_uring_setup, 1U, params);
   int err = errno;
+  /* Require the helper's own ENOSYS, not merely any failure: Docker's profile may return EPERM and mask a
+   * regression in the helper's own io_uring rule. */
   if (fd >= 0) { close((int)fd); report("io_uring.setup", "escaped", "io_uring_setup returned a ring"); }
-  else report("io_uring.setup", "pass", "%s", strerror(err));
+  else if (err == ENOSYS) report("io_uring.setup", "pass", "%s", strerror(err));
+  else report("io_uring.setup", "error", "not denied by the helper's own filter (%s)", strerror(err));
 #if defined(__x86_64__)
   expect_killed("abi.x32", x32_getpid);
   expect_killed("abi.compat-socketcall", compat_socketcall);
@@ -1158,6 +1173,58 @@ static void canary_tcp(unsigned port) {
   if (rc == 0) report("tcp.loopback", "escaped", "connected to 127.0.0.1:%u", port);
   else if (err == ECONNREFUSED) report("tcp.loopback", "error", "listener on %u refused (fixture missing)", port);
   else report("tcp.loopback", "pass", "127.0.0.1:%u: %s", port, strerror(err));
+}
+
+/* TCP Fast Open: a connect-less send to a port outside the allowlist must not reach the listener. */
+static void canary_tcp_fastopen(unsigned port) {
+  int s = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  if (s < 0) { report("tcp.fastopen", "pass", "socket(AF_INET): %s", strerror(errno)); return; }
+  struct sockaddr_in a;
+  memset(&a, 0, sizeof a);
+  a.sin_family = AF_INET;
+  a.sin_port = htons((uint16_t)port);
+  a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  ssize_t n = sendto(s, "x", 1, MSG_FASTOPEN, (struct sockaddr *)&a, sizeof a);
+  int err = errno;
+  close(s);
+  if (n >= 0) report("tcp.fastopen", "escaped", "sendto(MSG_FASTOPEN) to 127.0.0.1:%u sent %zd byte(s)", port, n);
+  else report("tcp.fastopen", "pass", "127.0.0.1:%u: %s", port, strerror(err));
+}
+
+/* Metadata writes Landlock does not cover, on a protected path (a denyWrite dir). Non-destructive: each
+ * call uses the path's current values, so a working seccomp filter denies it and a broken one changes
+ * nothing visible. */
+static void canary_metadata(const char *path) {
+  struct stat st;
+  if (lstat(path, &st) < 0) {
+    static const char *const names[] = { "meta.chmod", "meta.chown", "meta.setxattr", "meta.utimensat" };
+    for (size_t i = 0; i < sizeof names / sizeof names[0]; i++) report(names[i], "error", "target missing (%s)", strerror(errno));
+    return;
+  }
+  expect_denied("meta.chmod", chmod(path, st.st_mode & 07777) == 0, errno);
+  expect_denied("meta.chown", chown(path, (uid_t)-1, (gid_t)-1) == 0, errno);
+  int xr = setxattr(path, "user.minions-sandbox-canary", "x", 1, 0);
+  int xe = errno;
+  if (xr == 0) removexattr(path, "user.minions-sandbox-canary");
+  expect_denied("meta.setxattr", xr == 0, xe);
+  struct timespec times[2] = { st.st_atim, st.st_mtim };
+  expect_denied("meta.utimensat", utimensat(AT_FDCWD, path, times, 0) == 0, errno);
+}
+
+/* Scheduling and resource controls on a process outside the sandbox (the runner). Non-destructive: each
+ * set uses the process's current value, read first through the un-filtered "get" counterpart. */
+static void canary_sched(pid_t runner) {
+  errno = 0;
+  int prio = getpriority(PRIO_PROCESS, runner);
+  expect_denied("sched.setpriority", setpriority(PRIO_PROCESS, runner, prio == -1 && errno ? 0 : prio) == 0, errno);
+  cpu_set_t set;
+  CPU_ZERO(&set);
+  if (sched_getaffinity(runner, sizeof set, &set) < 0) CPU_SET(0, &set);
+  expect_denied("sched.setaffinity", sched_setaffinity(runner, sizeof set, &set) == 0, errno);
+  long cur = syscall(__NR_ioprio_get, 1 /* IOPRIO_WHO_PROCESS */, runner);
+  expect_denied("sched.ioprio", syscall(__NR_ioprio_set, 1, runner, cur < 0 ? 0 : cur) == 0, errno);
+  struct rlimit rl;
+  expect_denied("sched.prlimit", syscall(__NR_prlimit64, runner, RLIMIT_NOFILE, (void *)0, &rl) == 0, errno);
 }
 
 /* The main canary. Its plan comes from the self-test on stdin (the rules file may be unreadable here). */
@@ -1197,6 +1264,9 @@ static int canary_main(void) {
   canary_controls(allow_write, &allow_read);
   for (size_t i = 0; i < deny_write.n; i++) canary_write(deny_write.v[i]);
   for (size_t i = 0; i < deny_read.n; i++) canary_read(deny_read.v[i]);
+  /* Metadata writes and outside-process scheduling: on the first protected dir and the runner. */
+  if (deny_write.n) canary_metadata(deny_write.v[0]);
+  canary_sched(runner);
   char environ_path[64];
   snprintf(environ_path, sizeof environ_path, "/proc/%d/environ", (int)runner);
   int fd = open(environ_path, O_RDONLY | O_CLOEXEC);
@@ -1209,6 +1279,7 @@ static int canary_main(void) {
   expect_denied("signal.wrapper", rc == 0, errno);
   canary_unix(sock_path, abstract);
   canary_tcp(port);
+  canary_tcp_fastopen(port);
   canary_seccomp();
   return 0;
 }
