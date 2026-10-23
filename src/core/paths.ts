@@ -1,11 +1,18 @@
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { isAbsolute, join } from 'node:path';
 
-/** Host data root. MINIONS_HOME overrides (tests). */
-export function hostRoot(): string {
-  if (process.env.MINIONS_HOME) return process.env.MINIONS_HOME;
-  if (process.platform === 'darwin') return join(homedir(), 'Library', 'Application Support', 'Minions');
-  return join(process.env.XDG_DATA_HOME || join(homedir(), '.local', 'share'), 'minions');
+/**
+ * Host data root. MINIONS_HOME overrides (tests). macOS: ~/Library/Application Support/Minions.
+ * Linux and others: $XDG_DATA_HOME/minions, or ~/.local/share/minions when XDG_DATA_HOME is unset,
+ * empty or relative (the XDG Base Directory spec says relative values must be ignored). Everything
+ * (registry, host-wide defaults, projects, credential file store) stays under this one root;
+ * XDG_CONFIG_HOME is deliberately not used, so a project's state is never split across two trees.
+ */
+export function hostRoot(env: NodeJS.ProcessEnv = process.env, platform: NodeJS.Platform = process.platform, home: string = homedir()): string {
+  if (env.MINIONS_HOME) return env.MINIONS_HOME;
+  if (platform === 'darwin') return join(home, 'Library', 'Application Support', 'Minions');
+  const xdg = env.XDG_DATA_HOME;
+  return join(xdg && isAbsolute(xdg) ? xdg : join(home, '.local', 'share'), 'minions');
 }
 
 export const registryPath = () => join(hostRoot(), 'registry.json');

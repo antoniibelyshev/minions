@@ -258,6 +258,104 @@ describe('keychain store', () => {
   });
 });
 
+describe('secret service store (Linux, secret-tool)', () => {
+  const DBUS = { DBUS_SESSION_BUS_ADDRESS: 'unix:path=/run/user/1000/bus' };
+  /** Fake libsecret: items keyed by "service/account"; lookup exits 1 with empty stderr when absent. */
+  function fakeSecretTool(opts: { broken?: string } = {}) {
+    const items = new Map<string, string>();
+    const key = (a: string[]) => `${a[a.indexOf('service') + 1]}/${a[a.indexOf('account') + 1]}`;
+    const rec = recorder(({ cmd, args, opts: o }) => {
+      if (cmd !== 'secret-tool') return undefined;
+      if (opts.broken) return { code: 1, stdout: '', stderr: opts.broken };
+      if (args[0] === 'store') { items.set(key(args), o?.input ?? ''); return { code: 0, stdout: '', stderr: '' }; }
+      if (args[0] === 'lookup') { const v = items.get(key(args)); return v === undefined ? { code: 1, stdout: '', stderr: '' } : { code: 0, stdout: v, stderr: '' }; }
+      if (args[0] === 'clear') { items.delete(key(args)); return { code: 0, stdout: '', stderr: '' }; }
+      return undefined;
+    });
+    return { ...rec, items };
+  }
+
+  it('passes the token on stdin (secret-tool store), never in argv, and verifies by reading back', async () => {
+    const { calls, runner, items } = fakeSecretTool();
+    const ss = new C.SecretServiceStore(runner);
+    await ss.set(ID, TOKEN);
+    expect(await ss.get(ID)).toBe(TOKEN);
+    const store = calls.find((c) => c.args[0] === 'store')!;
+    expect(store.args).toEqual(['store', '--label=minions-github-token', 'service', 'minions.github', 'account', ID]);
+    expect(store.opts?.input).toBe(TOKEN);
+    for (const c of calls) expect(c.args.join(' ')).not.toContain(TOKEN);
+    expect(ss.ref(ID)).toBe(`secret-service:minions.github/${ID}`);
+    await ss.delete(ID);
+    expect(await ss.get(ID)).toBeNull();
+    expect(items.size).toBe(0);
+  });
+
+  it('a locked or unreachable keyring is an error, not a missing token; a failed store fails loudly', async () => {
+    const { runner } = fakeSecretTool({ broken: 'secret-tool: Cannot autolaunch D-Bus without X11 $DISPLAY' });
+    await expect(new C.SecretServiceStore(runner).get(ID)).rejects.toMatchObject({ code: 'AUTH_REQUIRED' });
+    await expect(new C.SecretServiceStore(runner).set(ID, TOKEN)).rejects.toMatchObject({ code: 'AUTH_REQUIRED' });
+  });
+
+  it('selectStore: Secret Service on Linux when secret-tool reaches one, else the 0600 file; macOS unchanged', async () => {
+    const { runner } = fakeSecretTool();
+    expect((await C.selectStore({ runner, platform: 'linux', env: DBUS, hostRuntime: false })).backend).toBe('secret-service');
+    // No session bus (headless/SSH): no probe at all, file store.
+    expect((await C.selectStore({ runner, platform: 'linux', env: {}, hostRuntime: false })).backend).toBe('file');
+    // secret-tool missing or no provider: file store.
+    expect((await C.selectStore({ runner: recorder().runner, platform: 'linux', env: DBUS, hostRuntime: false })).backend).toBe('file');
+    expect((await C.selectStore({ runner: fakeSecretTool({ broken: 'No such interface org.freedesktop.Secret.Service' }).runner, platform: 'linux', env: DBUS, hostRuntime: false })).backend).toBe('file');
+    // macOS never probes secret-tool.
+    const mac = fakeSecretTool();
+    expect((await C.selectStore({ runner: mac.runner, platform: 'darwin', env: DBUS, hostRuntime: false })).backend).toBe('file');
+    expect(mac.calls.some((c) => c.cmd === 'secret-tool')).toBe(false);
+    // Overrides: file always wins; secret-service forced; host runtime forces the file store.
+    expect((await C.selectStore({ runner, platform: 'linux', env: { ...DBUS, MINIONS_CREDENTIAL_STORE: 'file' }, hostRuntime: false })).backend).toBe('file');
+    expect((await C.selectStore({ runner, platform: 'darwin', env: { MINIONS_CREDENTIAL_STORE: 'secret-service' }, hostRuntime: false })).backend).toBe('secret-service');
+    expect((await C.selectStore({ runner, platform: 'linux', env: DBUS, hostRuntime: true })).backend).toBe('file');
+  });
+
+  it('provisioning records a secret-service reference, materializes a 0600 copy, and removal clears the keyring item', async () => {
+    const repo = makeRepo(env.root);
+    const { calls, runner, items } = fakeSecretTool();
+    const r = await C.provisionGithubToken({ projectId: ID, token: TOKEN, repoPath: repo, verify: false, runner, env: DBUS, platform: 'linux' });
+    expect(r.backend).toBe('secret-service');
+    expect(C.backendLabel(r.backend)).toBe('the Secret Service keyring (secret-tool)');
+    expect(existsSync(new C.FileStore().path(ID))).toBe(false);
+    expect((await C.loadCredentialRefs(ID)).github).toMatchObject({ backend: 'secret-service', ref: `secret-service:minions.github/${ID}` });
+    expect(await C.materializeSecrets(ID, runner)).toEqual({ github: true, telegram: false });
+    expect(readFileSync(projectPaths(ID).githubTokenFile, 'utf8')).toBe(TOKEN + '\n');
+    expect(mode(projectPaths(ID).githubTokenFile)).toBe(0o600);
+    expect((await C.githubCredentialStatus({ projectId: ID, remoteUrl: null }, { runner, fetch: github(200, { login: 'x' }).f })).detail).toContain('Secret Service keyring');
+    for (const c of calls) expect(c.args.join(' ')).not.toContain(TOKEN);
+    await C.removeGithubToken(ID, runner);
+    expect(items.size).toBe(0);
+  });
+
+  it('switching to the file store deletes the keyring copy', async () => {
+    const repo = makeRepo(env.root);
+    const { runner, items } = fakeSecretTool();
+    await C.provisionGithubToken({ projectId: ID, token: TOKEN, repoPath: repo, verify: false, runner, env: DBUS, platform: 'linux' });
+    expect(items.size).toBe(1);
+    await C.provisionGithubToken({ projectId: ID, token: TOKEN2, repoPath: repo, verify: false, runner, env: {}, platform: 'linux' });
+    expect(items.size).toBe(0);
+    expect((await C.loadCredentialRefs(ID)).github?.backend).toBe('file');
+    expect(await C.readGithubToken(ID, runner)).toBe(TOKEN2);
+  });
+  it('host runtime: moveKeychainTokensToFileStore also moves Secret Service tokens to the 0600 file store', async () => {
+    const repo = makeRepo(env.root);
+    const { runner, items } = fakeSecretTool();
+    const r = await runInit({ path: repo, yes: true, visibility: 'private', dockerProbe: async () => ({ daemon: true, serverVersion: '1', compose: true, composeVersion: '2.29.1' }) });
+    const pid = r.plan.projectId;
+    await C.provisionGithubToken({ projectId: pid, token: TOKEN, repoPath: repo, verify: false, runner, env: DBUS, platform: 'linux', hostRuntime: false });
+    expect((await C.loadCredentialRefs(pid)).github?.backend).toBe('secret-service');
+    const moved = await C.moveKeychainTokensToFileStore(runner);
+    expect(moved).toEqual({ moved: [{ projectId: pid, kind: 'github' }], warnings: [] });
+    expect((await C.loadCredentialRefs(pid)).github?.backend).toBe('file');
+    expect(items.size).toBe(0);
+    expect(mode(new C.FileStore().path(pid))).toBe(0o600);
+  });
+});
+
 describe('container mount', () => {
   it('mounts the secrets directory read-only at a fixed path; never the credential store or a single file', () => {
     const y = composeYaml({
