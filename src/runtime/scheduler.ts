@@ -679,18 +679,23 @@ export class Scheduler {
     if (!sweep) this.assertClaimableStage(task, role, plan);
     // D8 `requires`: capabilities the stage cannot work without (deny refuses; ask needs the owner).
     this.assertStageRequires(task, def);
+    // One backlog listing per claim (task-24.2): dependency status and capacity both come from it.
+    let snapshot: Task[] | undefined;
+    const listing = async () => (snapshot ??= await this.backlog.listTasks());
     if ((sweep || plan?.position === 0) && task.status === 'ready') {
       if (!task.authorized) throw new MinionsError('POLICY_DENIED', `Task ${task.id} is not authorized to start.`, 'Label it minions:authorized or enable intake.startReady.');
+      const byId = task.dependencies.length ? new Map((await listing()).map((t) => [t.id, t])) : new Map<string, Task>();
       for (const dep of task.dependencies) {
         let d: Task;
-        try { d = await this.backlog.getTask(dep); } catch (e) {
+        // Not in the listing (e.g. archived or an id spelled differently): view it, as before.
+        try { d = byId.get(dep) ?? await this.backlog.getTask(dep); } catch (e) {
           throw new MinionsError('PRECONDITION', `Task ${task.id}: dependency ${dep} cannot be read (${(e as Error).message}).`);
         }
         if (d.status !== 'done' && d.status !== 'delivered') throw new MinionsError('PRECONDITION', `Task ${task.id} depends on ${dep}, which is "${d.status}".`);
       }
     }
     if (isGithubDelivery(cfg)) await this.syncBase(task.id, role);
-    const allTasks = await this.backlog.listTasks();
+    const allTasks = await listing();
     // A QA sweep's lease is on the base branch itself; its worktree is detached at the base head.
     const sweepBase = sweep ? await resolveBaseBranch(this.layout.repo, cfg.git.baseBranch) : null;
     const { branch, slug } = sweepBase ? { branch: sweepBase.branch, slug: `qa-${taskSlug(task.id, task.title)}` } : this.branchForTask(task);

@@ -159,6 +159,13 @@ describe.skipIf(!hasCli)('Backlog.md adapter (real CLI)', () => {
     expect((await code(a.addDependency('task-1', 'task-99')))?.code).toBe('NOT_FOUND');
   });
 
+  it('reads the backlog with one listing when adding a dependency (task-24.2)', async () => {
+    // task-3 already depends on task-4: the listing answers it, no task view per end.
+    const before = a.spawnCount;
+    expect((await a.addDependency('TASK-3', 'task-4')).dependencies.sort()).toEqual(['task-2', 'task-4']);
+    expect(a.spawnCount - before).toBe(1);
+  });
+
   it('lists ready tasks per contract', async () => {
     const scope = { milestone: null, requiredLabels: [], allowedPaths: ['**'] };
     const r = (await a.createTask({ title: 'Ready one', status: 'ready', labels: ['minions:authorized'], idempotencyKey: 'k5', dependencies: ['task-4'] })).task;
