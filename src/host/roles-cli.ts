@@ -46,8 +46,8 @@ export function lineDiff(before: string | null, after: string | null): string[] 
   let i = 0, j = 0;
   while (i < n || j < m) {
     if (i < n && j < m && a[i] === b[j]) { out.push(`  ${a[i]}`); i++; j++; }
-    else if (j < m && (i >= n || lcs[i]![j + 1]! >= lcs[i + 1]![j]!)) { out.push(`+ ${b[j]}`); j++; }
-    else { out.push(`- ${a[i]}`); i++; }
+    else if (i < n && (j >= m || lcs[i + 1]![j]! >= lcs[i]![j + 1]!)) { out.push(`- ${a[i]}`); i++; }
+    else { out.push(`+ ${b[j]}`); j++; }
   }
   return out;
 }
