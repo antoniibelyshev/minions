@@ -32,6 +32,8 @@ export function secretLikePaths(tracked: string[]): string[] {
  */
 export interface TransferTarget {
   dirs: { import: string; exports: string };
+  /** True when `dirs` are paths on the host filesystem (host runtime); false for container paths. */
+  hostFs?: boolean;
   exec(args: string[], opts?: RunOptions): Promise<RunResult>;
   putFile(local: string, remote: string): Promise<void>;
   getFile(remote: string, local: string): Promise<void>;
@@ -123,7 +125,7 @@ export async function exportRepo(project: ProjectJson, opts: { runner?: Runner; 
   // regular file (an agent could swap it for a symlink or directory inside the container).
   const local = join(exportsDir, file);
   // Host runtime: refuse a non-regular bundle before copying it (copyFile follows symlinks).
-  if (!opts.compose && opts.target) {
+  if (target.hostFs) {
     const src = await lstat(`${target.dirs.exports}/${file}`).catch(() => null);
     if (!src?.isFile()) throw new MinionsError('PRECONDITION', 'The exported bundle is not a regular file; refusing to fetch it.', `Inspect ${target.dirs.exports}.`);
   }
@@ -165,7 +167,7 @@ export async function exportState(project: ProjectJson, opts: { out?: string; ru
   const r = await target.exec(['minions', 'workspace', 'state-export', remote, '--json'], { allowFailure: true, timeoutMs: 600_000 });
   const data = parseEnvelope<StateExportResult>(r.stdout, 'workspace state-export');
   await ensureDir(dirname(local));
-  if (!opts.compose && opts.target) {
+  if (target.hostFs) {
     const src = await lstat(remote).catch(() => null);
     if (!src?.isFile()) throw new MinionsError('PRECONDITION', 'The state backup is not a regular file; refusing to fetch it.', `Inspect ${target.dirs.exports}.`);
   }

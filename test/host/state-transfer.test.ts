@@ -5,7 +5,8 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { projectPaths } from '../../src/core/paths.js';
 import { MinionsError } from '../../src/core/errors.js';
 import type { ProjectJson } from '../../src/host/project.js';
-import { exportState, importState, type TransferTarget } from '../../src/host/transfer.js';
+import { Compose, type Runner } from '../../src/host/docker.js';
+import { composeTarget, exportState, importState, type TransferTarget } from '../../src/host/transfer.js';
 import { buildProgram } from '../../src/program.js';
 import { openDb } from '../../src/runtime/db.js';
 import { runtimePaths } from '../../src/runtime/paths.js';
@@ -87,6 +88,33 @@ describe('minions export --state / import --state (host side)', () => {
     const d = openDb(p.db);
     expect(d.all<{ id: string }>('SELECT id FROM leases').map((l) => l.id)).toEqual(['l1']);
     d.close();
+  });
+
+  it('works through a compose/Runner fake (container paths are never lstat-ed on the host)', async () => {
+    const src = fakeRuntime(join(env.root, 'src'));
+    seedRuntime(join(env.root, 'src'));
+    const dstRoot = join(env.root, 'dst');
+    const dst = fakeRuntime(dstRoot);
+    openDb(rtPaths(dstRoot).db).close();
+    // Container paths do not exist on the host: map them onto the fake runtime dirs.
+    const calls: string[][] = [];
+    const mk = (t: TransferTarget): Runner => async (_cmd, args) => {
+      calls.push(args);
+      const mapPath = (x: string) => x.replace(/^[^:/]*:/, '').replace('/state/exports', t.dirs.exports).replace('/state/import', t.dirs.import);
+      if (args.includes('exec')) return t.exec(args.slice(args.indexOf('minions')).map(mapPath));
+      if (args.includes('cp')) {
+        const [a, b] = args.slice(-2) as [string, string];
+        await copyFile(mapPath(a), mapPath(b));
+        return { code: 0, stdout: '', stderr: '' };
+      }
+      throw new Error('unexpected ' + args.join(' '));
+    };
+    const out = await exportState(project, { target: composeTarget(new Compose(ID, mk(src))) });
+    expect(existsSync(out.archive)).toBe(true);
+    expect(calls.some((a) => a.includes('cp'))).toBe(true);
+    const r = await importState(project, out.archive, { target: composeTarget(new Compose(ID, mk(dst))) });
+    expect(r.files).toBe(out.files);
+    expect(readFileSync(join(rtPaths(dstRoot).notes, 'n.md'), 'utf8')).toBe('note\n');
   });
 
   it('writes to an explicit file and never overwrites one', async () => {
