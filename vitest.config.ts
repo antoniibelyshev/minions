@@ -12,5 +12,12 @@ export default defineConfig({
     // Claude Code never runs against the user's real ~/.claude (its plugins, e.g. the Telegram channel).
     globalSetup: ['test/setup/global.ts'],
     setupFiles: ['test/setup/claude-guard.ts', 'test/setup/tmpdir.ts'],
+    // Only active with --coverage (`npm run coverage`); `npm test` does not instrument.
+    coverage: {
+      provider: 'v8',
+      include: ['src/**/*.ts'],
+      reporter: ['text', 'json-summary', 'html'],
+      reportsDirectory: 'coverage',
+    },
   },
 });
