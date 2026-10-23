@@ -166,11 +166,35 @@ export class Compose {
     return { state: 'unknown', reason: `container is ${st}` };
   }
 
-  /** True when the running container has the secrets dir bind-mounted (false for one created from a pre-upgrade compose.yaml). */
-  async hasSecretsMount(): Promise<boolean> {
+  /** Id of the running app container, or null (not running, or `docker compose ps` failed). */
+  async runningContainerId(): Promise<string | null> {
     const ps = await this.compose(['ps', '--status', 'running', '-q', SERVICE_NAME], { allowFailure: true, timeoutMs: 30_000 });
     const id = ps.stdout.trim().split('\n')[0]?.trim();
-    if (ps.code !== 0 || !id) return false;
+    return ps.code === 0 && id ? id : null;
+  }
+
+  /**
+   * What the running container was created from: image id, the `minions.build` label it carries
+   * (inherited from the image; '' when unlabeled) and its mounts. Null when not running or unreadable.
+   */
+  async inspectRunning(): Promise<RunningContainer | null> {
+    const id = await this.runningContainerId();
+    if (!id) return null;
+    const r = await this.runner('docker', ['inspect', id], { allowFailure: true, timeoutMs: 30_000 });
+    if (r.code !== 0) return null;
+    try {
+      const parsed = JSON.parse(r.stdout) as unknown;
+      const c = (Array.isArray(parsed) ? parsed[0] : parsed) as { Image?: unknown; Config?: { Labels?: Record<string, string> | null }; Mounts?: unknown } | undefined;
+      if (!c || typeof c.Image !== 'string') return null;
+      const mounts = Array.isArray(c.Mounts) ? (c.Mounts as { Type?: string; Source?: string; Destination?: string; RW?: boolean }[]) : [];
+      return { id, image: c.Image, buildLabel: c.Config?.Labels?.[BUILD_LABEL] ?? '', mounts: mounts.map((m) => ({ type: m.Type ?? '', source: m.Source ?? '', destination: m.Destination ?? '', rw: m.RW !== false })) };
+    } catch { return null; }
+  }
+
+  /** True when the running container has the secrets dir bind-mounted (false for one created from a pre-upgrade compose.yaml). */
+  async hasSecretsMount(): Promise<boolean> {
+    const id = await this.runningContainerId();
+    if (!id) return false;
     const r = await this.runner('docker', ['inspect', '--format', '{{json .Mounts}}', id], { allowFailure: true, timeoutMs: 30_000 });
     if (r.code !== 0) return false;
     try { return (JSON.parse(r.stdout) as { Destination?: string }[]).some((m) => m.Destination === CONTAINER.secretsDir); } catch { return false; }
@@ -202,6 +226,21 @@ export class Compose {
 }
 
 export const BUILD_LABEL = 'minions.build';
+
+export interface RunningContainer {
+  id: string;
+  /** Image id (sha256:...) the container was created from. */
+  image: string;
+  buildLabel: string;
+  mounts: { type: string; source: string; destination: string; rw: boolean }[];
+}
+
+/** Image id (sha256:...) of `tag`, or null when the image is missing or docker failed. */
+export async function imageId(tag: string, runner: Runner = run): Promise<string | null> {
+  const r = await runner('docker', ['image', 'inspect', '--format', '{{.Id}}', tag], { allowFailure: true, timeoutMs: 30_000 });
+  const v = r.stdout.trim();
+  return r.code === 0 && v.startsWith('sha256:') ? v : null;
+}
 
 export async function imageExists(tag: string, runner: Runner = run): Promise<boolean> {
   return (await imageBuildLabel(tag, runner)) !== null;

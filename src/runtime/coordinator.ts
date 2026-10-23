@@ -1059,6 +1059,26 @@ export const DETACHED_SETTLE_MS = 2000;
 const tmuxHas = async (runner: Runner, paths: RuntimePaths) => (await runner('tmux', [...tmuxBase(paths), 'has-session', '-t', TMUX_SESSION], { allowFailure: true, timeoutMs: 10_000 })).code === 0;
 
 /**
+ * Whether the running coordinator was launched with the current launch fingerprint (channel, network,
+ * bot token hash). `stale`: a restart-required change (the host reports it as a `minions upgrade`
+ * reason); `unrecorded`: running without a launch record (started by an older minions, or the record
+ * could not be written), so the fingerprint cannot be compared. Never throws.
+ */
+export interface LaunchStatus { state: 'current' | 'stale' | 'unrecorded' | 'not-running'; reason: string }
+export async function coordinatorLaunchStatus(cfg: MinionsConfig, deps: { paths?: RuntimePaths; runner?: Runner; readText?: (p: string) => Promise<string> } = {}): Promise<LaunchStatus> {
+  const paths = deps.paths ?? runtimePaths();
+  const running = await tmuxHas(deps.runner ?? run, paths).catch(() => false);
+  if (!running) return { state: 'not-running', reason: 'coordinator is not running' };
+  const rec = await readLaunchRecord(paths);
+  if (!rec) return { state: 'unrecorded', reason: 'coordinator is running without a launch record (started by an older minions)' };
+  const want = launchFingerprint(cfg, await readMountedToken(paths.telegramTokenFile, deps.readText));
+  if (rec.fingerprint === want) return { state: 'current', reason: `coordinator launched ${rec.startedAt} with the current channel and Telegram configuration` };
+  return { state: 'stale', reason: rec.channel !== cfg.communication.channel
+    ? `communication.channel changed since the coordinator launched (${rec.channel} -> ${cfg.communication.channel})`
+    : 'Telegram configuration changed since the coordinator launched (bot token or network)' };
+}
+
+/**
  * `minions coordinator sync`: applies restart-required Telegram changes with a controlled restart.
  * When the running coordinator was launched with a different channel/token, it is stopped (tmux
  * session killed) only if no worker lease is active (or `force`); in-flight leases stay recorded in

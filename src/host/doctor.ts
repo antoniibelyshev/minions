@@ -15,6 +15,7 @@ import { DEFAULT_CI_PENDING_TIMEOUT_MINUTES } from '../runtime/ci-gate.js';
 import { clearStaleSecrets, secretCopiesExist, githubCredentialStatus, readGithubToken, githubRepoFromRemote, telegramCredentialStatus, type CredentialStatus, type Fetch, type TelegramCredentialStatus } from './credentials.js';
 import { dockerProbe, type DockerProbe } from './discovery.js';
 import { Compose, buildFingerprint, imageBuildLabel, tmpSizeMiB, type Runner } from './docker.js';
+import { RESTART_COMMAND, checkRestartRequired, notApplicable, restartUnknown, type RestartRequired } from './restart-required.js';
 import { telegramDoctorCheck } from '../telegram/probe.js';
 import { resolveChannel, type ChannelResolution } from '../telegram/channel.js';
 import { loadEffectiveConfig, loadProjectJson } from './project.js';
@@ -28,7 +29,8 @@ import { constants } from 'node:fs';
 
 export type CheckStatus = 'ok' | 'warn' | 'fail' | 'unavailable';
 export interface Check { name: string; status: CheckStatus; detail: string; hint?: string }
-export interface DoctorReport { healthy: boolean; projectId: string | null; checks: Check[] }
+/** `restartRequired`: the shared restart-required check (also the `restart` check; never a FAIL). */
+export interface DoctorReport { healthy: boolean; projectId: string | null; checks: Check[]; restartRequired: RestartRequired }
 
 const short = (s: string) => redact(s.trim().split('\n').slice(-1)[0] ?? '').slice(0, 300);
 
@@ -412,9 +414,22 @@ async function hostRequiredChecks(project: { projectId: string; remoteUrl: strin
   return { rc: await requiredChecksStatus(fetchApi(token, f), `${r.owner}/${r.repo}`, config.git.baseBranch) };
 }
 
-export async function runDoctor(opts: { cwd: string; runner?: Runner; probe?: DockerProbe; fetch?: Fetch }): Promise<DoctorReport> {
+/** The `restart` check from the shared restart-required result. Never 'fail': it only advises `minions upgrade`. */
+export function restartCheck(r: RestartRequired): Check {
+  const name = 'restart';
+  switch (r.state) {
+    case 'required': return { name, status: 'warn', detail: `restart required: ${r.reasons.map((x) => `${x.kind}: ${x.detail}`).join('; ')}`, hint: `Run \`${RESTART_COMMAND}\`.` };
+    case 'current': return { name, status: 'ok', detail: r.detail };
+    case 'not-running': return { name, status: 'ok', detail: r.detail };
+    case 'not-applicable': return { name, status: 'unavailable', detail: r.detail };
+    default: return { name, status: 'warn', detail: `unknown: ${r.detail}` };
+  }
+}
+
+export async function runDoctor(opts: { cwd: string; runner?: Runner; probe?: DockerProbe; fetch?: Fetch; fingerprint?: string | null; version?: string }): Promise<DoctorReport> {
   const runner = opts.runner ?? run;
   const checks: Check[] = [];
+  let restart: RestartRequired = restartUnknown('project not found');
   const add = (name: string, status: CheckStatus, detail: string, hint?: string) => checks.push({ name, status, detail, ...(hint ? { hint } : {}) });
 
   add('node', nodeVersionOk(process.version) ? 'ok' : 'fail', `host Node ${process.version} (requires >= 22.13)`,
@@ -480,10 +495,11 @@ export async function runDoctor(opts: { cwd: string; runner?: Runner; probe?: Do
     let tgPlugin: Check | undefined;
 
     if (hostMode) {
+      restart = notApplicable('host runtime: no container to restart');
       tgPlugin = await hostRuntimeChecks(project, auth, baseUrl, wantsTelegram, runner, add, checks);
     } else if (docker.daemon && docker.compose) {
       const label = await imageBuildLabel(project.imageTag, runner);
-      const fp = buildFingerprint();
+      const fp = opts.fingerprint !== undefined ? opts.fingerprint : buildFingerprint();
       if (label === null) add('image', 'warn', `${project.imageTag} not built yet`, '`minions start` builds it.');
       else if (fp !== null && label !== fp) add('image', 'warn', `${project.imageTag} was built from a different minions package`, '`minions start` rebuilds it and recreates the container.');
       else add('image', 'ok', project.imageTag);
@@ -536,8 +552,11 @@ export async function runDoctor(opts: { cwd: string; runner?: Runner; probe?: Do
       } else {
         for (const n of ['claude.auth', ...(baseUrl ? ['claude.baseUrl'] : []), 'container.tmp', 'container.scratch', 'backlog.cli', 'claude.capabilities', 'telegram.plugin']) add(n, 'warn', 'skipped: container not running');
       }
+      restart = await checkRestartRequired({ projectId: project.projectId, imageTag: project.imageTag, compose, runner,
+        ...(opts.fingerprint !== undefined ? { fingerprint: opts.fingerprint } : {}), ...(opts.version !== undefined ? { version: opts.version } : {}) });
     } else {
       add('container', 'fail', 'skipped: Docker unavailable');
+      restart = restartUnknown('Docker unavailable');
     }
     if (github.onGitHub && !ci.rc) ci = await hostRequiredChecks(project, config, github.credential, runner, opts.fetch);
     // Overall Telegram readiness: ok / missing / unavailable (never fail; terminal is the baseline).
@@ -556,8 +575,9 @@ export async function runDoctor(opts: { cwd: string; runner?: Runner; probe?: Do
   checks.push(requiredChecksReadiness(effective, ci.rc, { onGitHub: github.onGitHub, unknownReason: ci.reason }));
   checks.push(ciAuthorityReadiness(effective, ci.rc, { onGitHub: github.onGitHub, unknownReason: ci.reason }));
   add('features', 'unavailable', DEFERRED_FEATURES.join(', '));
+  if (projectId) checks.push(restartCheck(restart));
   add('package', 'ok', `minions ${VERSION}`);
-  return { healthy: !checks.some((c) => c.status === 'fail'), projectId, checks };
+  return { healthy: !checks.some((c) => c.status === 'fail'), projectId, checks, restartRequired: restart };
 }
 
 export function formatDoctor(r: DoctorReport): string {
