@@ -537,3 +537,41 @@ describe('quoted credentials and stray quotes in plain text', () => {
     }
   });
 });
+
+describe('tester adversarial inputs for quoted credentials (task-2.6 QA)', () => {
+  const SECRET = 'Zq9S3cr3tVal';
+  it('masks quoted, escaped and doubled-quote credentials and keys after earlier quotes', () => {
+    for (const input of [
+      'Authorization: Bearer \\"Zq9S3cr3tVal\\"',
+      'Authorization: Bearer ""Zq9S3cr3tVal""',
+      'Authorization: Bearer   "Zq9S3cr3tVal"',
+      'Authorization = Bearer "Zq9S3cr3tVal"',
+      'Proxy-Authorization: Basic Zq9S3cr3tVal',
+      'got "x Authorization: Bearer "Zq9S3cr3tVal" ok',
+      'he said "no" then "maybe password="Zq9S3cr3tVal"',
+      'failed "connect" password="Zq9S3cr3tVal"',
+      '"oops api_key=Zq9S3cr3tVal" next',
+      'x"y password = "Zq9S3cr3tVal"',
+      'x"y "password": "Zq9S3cr3tVal"',
+      'x"y https://u:Zq9S3cr3tVal@host/',
+    ]) {
+      const out = redactError(input);
+      expect(out, `${JSON.stringify(input)} -> ${JSON.stringify(out)}`).not.toContain(SECRET);
+    }
+  });
+
+  it('keeps nested command lines inside JSON valid while masking them', () => {
+    for (const value of [
+      'curl -H "Authorization: Bearer Zq9S3cr3tVal" x',
+      'run password="Zq9S3cr3tVal"',
+      'mysql --password=Zq9S3cr3tVal',
+      'auth "x" password=Zq9S3cr3tVal, retry',
+    ]) {
+      for (const input of [JSON.stringify({ cmd: value }), JSON.stringify({ cmd: value }, null, 2)]) {
+        const out = redactError(input);
+        expect(out, input).not.toContain(SECRET);
+        expect(() => JSON.parse(out), `${input} -> ${out}`).not.toThrow();
+      }
+    }
+  });
+});
