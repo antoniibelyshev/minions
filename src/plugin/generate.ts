@@ -227,7 +227,11 @@ function decisionGuidance(): string {
   ].join('\n\n');
 }
 
-/** Usage-based spend guidance. The budget is one the owner gives in chat; `budgets.*` is USD-only and unenforced in v0.1. */
+/**
+ * Usage-based spend guidance (task-32): the coordinator passes each worker's notification token total on
+ * record, the runtime keeps the tally (src/runtime/spend.ts) and refuses claims at the owner's budget.
+ * `budgets.*` is USD-only and unenforced in v0.1.
+ */
 function spendGuidance(cfg: MinionsConfig): string {
   const caps = [
     cfg.budgets.dailyUsd !== null ? `$${cfg.budgets.dailyUsd} per day` : null,
@@ -235,8 +239,8 @@ function spendGuidance(cfg: MinionsConfig): string {
   ].filter(Boolean);
   const configured = caps.length ? ` The config's \`budgets\` (${caps.join(', ')}; not enforced in v0.1) counts as a budget until the owner gives one.` : '';
   return [
-    '**Spend.** Tally what this session and its workers spend (per session for now), from reported usage only (never invent figures), and report it with deliveries and when asked: USD with API-key billing, tokens on a subscription.',
-    `When the owner gives a budget in chat (USD, or tokens on a subscription), warn at about 50% and 80% of it; at 100% pause starts (\`minions pause --starts --json\`) and ask before spending more.${configured}`,
+    '**Spend.** Pass each worker\'s token total from its task notification (`subagent_tokens`) whenever you record or release it (`--usage <tokens>`; after a correction pass the new cumulative figure, the latest counts). The tally is durable: `minions status --json` shows `spend` (total, today, per task, budget). Report it with deliveries and when asked: tokens plus a rough USD estimate with API-key billing (the Console usage page is authoritative), tokens only on a subscription (its remaining plan quota is not visible). Never invent figures.',
+    `When the owner gives a budget in plain language, set it: \`minions work spend --budget "<their words>" --json\` (tokens or attempts; USD only with API-key billing; \`off\` clears). Record responses carry \`budget\`: tell the owner when \`budget.crossed\` is 50 or 80; at 100 new claims are refused (running workers continue): say why starts stopped and ask before spending more. If workers hit a plan usage or rate limit, pause starts (\`minions pause --starts --json\`) and report it.${configured}`,
   ].join(' ');
 }
 
