@@ -1,9 +1,9 @@
 // Explicit repository transfer between host and container via Git bundles (spec §3A "Repository access").
 // Import copies committed history of the base branch only; export fetches agent branches into
 // refs/remotes/minions/* on the host (never touches local branches or the working tree).
-import { lstat, mkdtemp, rm } from 'node:fs/promises';
+import { chmod, lstat, mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join, resolve as resolvePath } from 'node:path';
 import { matchesAny } from '../config/capabilities.js';
 import { MinionsError } from '../core/errors.js';
 import { run, type RunOptions, type RunResult } from '../core/exec.js';
@@ -11,6 +11,7 @@ import { ensureDir } from '../core/fsutil.js';
 import { CONTAINER, SERVICE_NAME, projectPaths } from '../core/paths.js';
 import { HOST_GIT } from './discovery.js';
 import { Compose, type Runner } from './docker.js';
+import { parseStateBackup, stateBackupName, type StateExportResult, type StateImportResult, type StateManifest } from '../runtime/state-backup.js';
 import type { ProjectJson } from './project.js';
 
 /** Tracked paths that commonly hold secrets. Detection is best effort, never complete. */
@@ -142,4 +143,74 @@ export async function exportRepo(project: ProjectJson, opts: { runner?: Runner; 
     if (from !== to) changes.push({ ref, from, to });
   }
   return { bundle: local, refs: data.refs ?? [], changes: changes.sort((a, b) => a.ref.localeCompare(b.ref)) };
+}
+
+export interface StateExportHostResult {
+  archive: string; bytes: number; sha256: string; createdAt: string; schemaVersion: number; files: number;
+  skipped: StateManifest['skipped']; activeLeases: number;
+}
+
+/**
+ * State backup (`minions export --state [file]`): the runtime writes the archive into its exports dir
+ * (`minions workspace state-export`), the host copies it out (regular file only) to `out` (default
+ * <project>/exports/state-<time>.tar.gz; never overwritten) and validates it before reporting success.
+ */
+export async function exportState(project: ProjectJson, opts: { out?: string; runner?: Runner; compose?: Compose; target?: TransferTarget; now?: Date } = {}): Promise<StateExportHostResult> {
+  const runner = opts.runner ?? run;
+  const target = opts.target ?? composeTarget(opts.compose ?? new Compose(project.projectId, runner));
+  const file = stateBackupName(opts.now);
+  const local = opts.out ? resolvePath(opts.out) : join(projectPaths(project.projectId).exportsDir, file);
+  if (await lstat(local).catch(() => null)) throw new MinionsError('CONFLICT', `${local} already exists; refusing to overwrite it.`, 'Choose another file name or remove it.');
+  const remote = `${target.dirs.exports}/${file}`;
+  const r = await target.exec(['minions', 'workspace', 'state-export', remote, '--json'], { allowFailure: true, timeoutMs: 600_000 });
+  const data = parseEnvelope<StateExportResult>(r.stdout, 'workspace state-export');
+  await ensureDir(dirname(local));
+  if (!opts.compose && opts.target) {
+    const src = await lstat(remote).catch(() => null);
+    if (!src?.isFile()) throw new MinionsError('PRECONDITION', 'The state backup is not a regular file; refusing to fetch it.', `Inspect ${target.dirs.exports}.`);
+  }
+  await target.getFile(remote, local);
+  const st = await lstat(local).catch(() => null);
+  if (!st?.isFile()) {
+    await rm(local, { recursive: true, force: true });
+    throw new MinionsError('PRECONDITION', 'The state backup is not a regular file; refusing to fetch it.', `Inspect ${target.dirs.exports} in the runtime.`);
+  }
+  await chmod(local, 0o600);
+  // Validate the copy (structure, manifest, checksums) so a reported backup is a restorable one.
+  try { parseStateBackup(await readFile(local)); } catch (e) { await rm(local, { force: true }); throw e; }
+  return { archive: local, bytes: st.size, sha256: data.sha256, createdAt: data.createdAt, schemaVersion: data.schemaVersion, files: data.files, skipped: data.skipped ?? [], activeLeases: data.activeLeases ?? 0 };
+}
+
+/** Reads and validates a state backup on the host (no runtime state is touched). */
+export async function inspectStateBackup(file: string): Promise<{ archive: string; manifest: StateManifest }> {
+  const path = resolvePath(file);
+  const st = await lstat(path).catch(() => null);
+  if (!st) throw new MinionsError('NOT_FOUND', `State backup not found: ${path}`);
+  if (!st.isFile()) throw new MinionsError('PRECONDITION', `${path} is not a regular file; refusing to read it.`);
+  return { archive: path, manifest: parseStateBackup(await readFile(path)).manifest };
+}
+
+export interface StateImportHostResult { archive: string; createdAt: string; schemaVersion: number; files: number; container: StateImportResult }
+
+/**
+ * State restore (`minions import --state <file> [--force]`): the archive is validated on the host
+ * first (nothing is copied when it is invalid), copied into the runtime import dir, and restored by
+ * `minions workspace state-import`, which validates again and refuses while the runtime is in use.
+ */
+export async function importState(project: ProjectJson, file: string, opts: { force?: boolean; runner?: Runner; compose?: Compose; target?: TransferTarget; now?: Date } = {}): Promise<StateImportHostResult> {
+  const { archive, manifest } = await inspectStateBackup(file);
+  const runner = opts.runner ?? run;
+  const target = opts.target ?? composeTarget(opts.compose ?? new Compose(project.projectId, runner));
+  const name = `import-${stateBackupName(opts.now)}`;
+  const remote = `${target.dirs.import}/${name}`;
+  await target.putFile(archive, remote);
+  const r = await target.exec(['minions', 'workspace', 'state-import', remote, ...(opts.force ? ['--force'] : []), '--json'], { allowFailure: true, timeoutMs: 600_000 });
+  let data: StateImportResult;
+  try { data = parseEnvelope<StateImportResult>(r.stdout, 'workspace state-import'); } catch (e) {
+    // Keep the runtime's own error code (CONFLICT while in use, PRECONDITION for an invalid archive).
+    const d = (e as MinionsError).details as { code?: string; message?: string; hint?: string } | undefined;
+    if (e instanceof MinionsError && d?.code && d.message) throw new MinionsError(d.code as MinionsError['code'], d.message, d.hint, d);
+    throw e;
+  }
+  return { archive, createdAt: manifest.createdAt, schemaVersion: manifest.schemaVersion, files: manifest.files.length, container: data };
 }
