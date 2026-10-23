@@ -35,6 +35,7 @@ import { HANDOFF_ENV, isMinionsCheckout, runSourcePhase, upgradeSourceMode } fro
 import { readSecret, readlineIO } from './wizard.js';
 import { addListCommand, addSetCommand, defaultSettingsRuntime, registerSettings } from './settings-cli.js';
 import { runSettingsMenu, terminalMenuIO } from './settings-menu.js';
+import { registerRoles } from './roles-cli.js';
 import { initMayOfferAssistant, launchAssistant, loadAssistantContext, offerSetupAssistant, registerAssistant } from './assistant.js';
 
 const say = (json: boolean, msg: string) => { if (!json) process.stderr.write(msg + '\n'); };
@@ -683,10 +684,12 @@ export function register(program: Command): void {
     },
   });
 
-  // Advanced alias of `minions settings` (kept for scripts): `config show` (raw effective config), `config list`, `config set`.
-  const config = program.command('config').description('Alias of `minions settings`: show the raw effective config, list or set settings');
+  // Advanced alias of `minions settings` (kept for scripts): `config show` (raw effective config), `config list`, `config set`;
+  // plus `config roles ...`, the role proposal/approval path (src/host/roles-cli.ts).
+  const config = program.command('config').description('Alias of `minions settings`: show the raw effective config, list or set settings; `config roles`: project worker roles');
   addListCommand(config);
   addSetCommand(config, { confirm: confirmMarked });
+  registerRoles(config, { confirm: confirmMarked });
   config.command('show')
     .description('Show the effective configuration')
     .option('--explain', 'include the source of every value (default/project/local/session)')
