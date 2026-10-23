@@ -151,6 +151,15 @@ function loadSqlite(): typeof import('node:sqlite') {
 
 const nowIso = () => new Date().toISOString();
 
+/** busy_timeout for every connection, and the time budget for retrying the WAL switch. */
+const BUSY_TIMEOUT_MS = 5000;
+/** SQLITE_BUSY (primary result code 5, any extended code) as thrown by node:sqlite. */
+const isBusy = (e: unknown): boolean => {
+  const code = (e as { errcode?: unknown } | null)?.errcode;
+  return typeof code === 'number' && (code & 0xff) === 5;
+};
+const sleepSync = (ms: number): void => { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); };
+
 /** Whether a process with this pid exists (EPERM: exists, owned by someone else). */
 export function pidAlive(pid: number): boolean {
   if (!Number.isInteger(pid) || pid <= 0) return false;
@@ -196,10 +205,39 @@ export class RuntimeDb {
     } catch (e) {
       throw new MinionsError('INTERNAL', `Cannot open runtime database ${path}: ${(e as Error).message}`);
     }
-    this.sql.exec('PRAGMA busy_timeout = 5000');
-    if (path !== ':memory:') this.sql.exec('PRAGMA journal_mode = WAL');
+    this.sql.exec(`PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS}`);
+    if (path !== ':memory:') this.enableWal();
     this.sql.exec('PRAGMA foreign_keys = ON');
     this.migrate();
+  }
+
+  /**
+   * Switches the database to WAL. The switch needs an exclusive lock and SQLite returns SQLITE_BUSY for it
+   * at once, without calling the busy handler, so concurrent first opens of a fresh database failed with
+   * "database is locked" (task-20.3). Retry with a short bounded backoff, then require WAL or fail loudly.
+   * On a database already in WAL the pragma is a no-op that takes no write lock.
+   */
+  private enableWal(): void {
+    const deadline = Date.now() + BUSY_TIMEOUT_MS;
+    let delay = 5;
+    let last = '';
+    for (;;) {
+      try {
+        const mode = (this.sql.prepare('PRAGMA journal_mode = WAL').get() as { journal_mode?: unknown } | undefined)?.journal_mode;
+        if (String(mode).toLowerCase() === 'wal') return;
+        last = `journal_mode is ${String(mode)}`;
+      } catch (e) {
+        if (!isBusy(e)) { this.sql.close(); throw e; }
+        last = (e as Error).message;
+      }
+      if (Date.now() >= deadline) {
+        this.sql.close();
+        throw new MinionsError('INTERNAL', `Cannot switch runtime database ${this.path} to WAL mode: ${last}`,
+          'Another process kept the database locked; retry, and check for a stuck minions process.');
+      }
+      sleepSync(Math.max(1, Math.min(delay + Math.floor(Math.random() * delay), deadline - Date.now())));
+      delay = Math.min(delay * 2, 100);
+    }
   }
 
   /**
