@@ -87,6 +87,7 @@ export function profileDefaults(profile: Profile, ctx: ProfileContext): { config
     architecture: owner ? 'decide' : 'propose',
     git: { baseBranch: ctx.baseBranch, identity: { ...ctx.identity } },
     // coordinator.permissionMode is left unset: the coordinator runs in "auto" (src/runtime/coordinator.ts).
+    // coordinator.contextReset is left unset too: routine context resets are on by default (task-45).
   };
   return { config, notes };
 }

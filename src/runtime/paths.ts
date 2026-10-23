@@ -101,6 +101,8 @@ export function runtimePaths(env: NodeJS.ProcessEnv = process.env, opts: { inCon
     coordinatorLaunch: join(state, 'coordinator-launch.json'),
     /** Written by `minions coordinator run` when it exits (code, signal, error; no secrets). Read by a detached start. */
     coordinatorExit: join(state, 'coordinator-exit.json'),
+    /** The coordinator's context-reset handoff (`minions coordinator handoff`; capped, redacted, replaced on each write). */
+    coordinatorHandoff: join(state, 'coordinator-handoff.json'),
     coordinatorPrompt: join(pluginDir, 'coordinator.md'),
   };
 }

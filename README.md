@@ -321,7 +321,7 @@ Briefs and worker results go through files under `/state`, not through the coord
 
 `minions backlog list|ready --compact --json` (or `--fields id,title,status,...`) leaves out descriptions and other bulky fields.
 
-**Idle context reset (opt-in).** If you ask for it, the coordinator can restart itself once the queue is idle (nothing runnable, no active leases) after many hand-offs. It runs `minions coordinator restart --recover` detached and starts again with a fresh context. All state is durable, so nothing is lost. This is guidance in the coordinator prompt, and nothing restarts on its own.
+**Routine context resets (on by default).** To keep its context small, the coordinator restarts itself with a fresh context when no worker is running and a trigger holds: a task was delivered, its context reached about 60k tokens, or 10 worker hand-offs happened. It first writes a short handoff (`minions coordinator handoff`: open questions, pending decisions, what it waits on; at most 4 KB, secrets redacted), which the new session reads at startup. All other state is durable, and the runtime never restarts the coordinator on its own. Tune or turn it off with `coordinator.contextReset` (`{ "enabled": false }`); see [design/bootstrap.md](docs/design/bootstrap.md#coordinator-context-resets).
 
 ## Delivery, review, and merging
 

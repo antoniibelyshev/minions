@@ -10,6 +10,7 @@ import { TELEGRAM_TOOL_PREFIX } from './coordinator.js';
 import { runtimePaths } from './paths.js';
 import { capacityOf, scopeOf } from './scheduler.js';
 import { currentBudget } from './spend.js';
+import { noteTranscript } from './context-reset.js';
 
 export interface HookDeps { db: RuntimeDb; backlog: BacklogAdapter; config: MinionsConfig }
 export type HookLoader = () => HookDeps | Promise<HookDeps>;
@@ -65,6 +66,8 @@ export async function stopHook(input: unknown, load: HookLoader): Promise<HookOu
   let deps: HookDeps;
   try { deps = await load(); } catch (e) { return { reason: `allow: state unavailable (${(e as Error).message})` }; }
   const { db, backlog, config } = deps;
+  // Context-reset trigger input (task-45): the main session's transcript, for its latest usage. Never affects the decision.
+  try { noteTranscript(db, inp); } catch { /* best-effort */ }
   const allow = (reason: string, detail = reason): HookOutput => {
     try { db.setGuard({ fingerprint: null, count: 0, last_reason: reason }); } catch { /* ignore */ }
     return { reason: `allow: ${detail}` };

@@ -64,6 +64,8 @@ When a worker returns, it has submitted its result with `minions work submit` an
 
 Always pass `--usage` (also on `--correction` records and `work release`): it is the durable spend tally. The figure is cumulative per agent, so after a correction pass the resumed agent's new total; the latest figure per lease counts and nothing is double-counted. If the notification came after you recorded, add it with `minions work spend --lease <leaseId> --tokens <n> --json`.
 
+{{contextResetRule}}
+
 Then check the response's `budget` (present when the owner set one): `crossed` 50 or 80 → tell the owner the spend against the budget; `crossed` 100 or `exhausted` → new claims are refused: tell the owner why starts stopped and ask before spending more. Running workers are never stopped for the budget.
 
 - No submission (`NOT_FOUND`, hint names `minions work submit`): if the worker's final message contains the JSON instead, pipe that to `minions work record <leaseId> --json` on stdin; otherwise ask the worker to submit (once), or release the lease.
@@ -88,7 +90,7 @@ The record response says what happened. Typical transitions:
 - `partial` → re-dispatch the same role with the remaining work in the prompt, or split. A `drain: true` partial (wound down for an upgrade) is not a failed attempt: while draining do nothing; afterwards re-dispatch the same role (no `engineer-deep` escalation). Its brief carries `resume` (remaining work and the `wip:` checkpoint), so the prompt only needs `Continue from the wip: commit.`
 - `needs_split` → decide the split yourself (no need to ask the user); create each proposed child with `minions backlog create --json` using an idempotency key `split:<parentId>:<n>`, the parent id, acceptance criteria and dependencies between children; note the split on the parent. The parent stays as the tracking task.
 
-Then go back to step 1. Stop when nothing is runnable. (When idle after many hand-offs, see the opt-in idle context reset in your coordinator instructions.)
+Then go back to step 1, unless a record or release response carried `contextReset`: then do the context reset (handoff, then restart; Limits in your coordinator instructions) and stop. Stop when nothing is runnable.
 
 ## 7. Report
 
