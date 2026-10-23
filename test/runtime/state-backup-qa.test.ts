@@ -190,7 +190,11 @@ describe('state backup: DB snapshot under a concurrent writer', () => {
       })();
     `, p.db], { stdio: ['pipe', 'pipe', 'ignore'] });
     try {
-      await new Promise<void>((res, rej) => { writer.stdout.once('data', () => res()); writer.once('error', rej); });
+      await new Promise<void>((res, rej) => {
+        writer.stdout.once('data', () => res());
+        writer.once('error', rej);
+        writer.once('exit', (code, signal) => rej(new Error(`writer exited before it was ready (code ${code}, signal ${signal})`)));
+      });
       await new Promise((r) => setTimeout(r, 200));
       const counts: number[] = [];
       for (let i = 0; i < 3; i++) {
