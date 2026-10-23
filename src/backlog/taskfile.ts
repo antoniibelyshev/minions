@@ -29,11 +29,40 @@ type Yaml = string | number | boolean | null | string[];
 
 // ---------------------------------------------------------------- frontmatter (YAML subset)
 
-const PLAIN_RESERVED = /^(?:null|~|true|false|yes|no|on|off)$/i;
+const PLAIN_RESERVED = /^(?:null|~|true|false|yes|no|on|off|y|n)$/i;
+/**
+ * Unquoted strings the parser trusts to read back as exactly themselves. Deliberately an allowlist, not a
+ * YAML implementation: letters, digits, marks, punctuation, symbols and spaces only (no tabs, control,
+ * format or line-separator characters). The first character must not be a YAML indicator, a digit, a sign
+ * or a dot, which rules out every YAML 1.1 int/float/sexagesimal/.inf/.nan and date/timestamp form.
+ * PLAIN_UNSAFE then rejects any `#` (comments) and any `:` not followed by a visible character (mappings
+ * such as `x:` or `a: b`), while `https://a/b` stays plain. Anything else returns undefined and the caller
+ * falls back to `task view`; being strict only costs that one spawn.
+ */
+const PLAIN_SAFE = /^[^\s\d\-+.?:,[\]{}#&*!|>'"%@`<=~\\][\p{L}\p{N}\p{M}\p{P}\p{S} ]*$/u;
+const PLAIN_UNSAFE = /#|:(?![\p{L}\p{N}\p{P}\p{S}])/u;
+
+/**
+ * A YAML double-quoted scalar on one line. JSON.parse handles the escapes both languages share; js-yaml's
+ * dumper also writes non-BMP characters (emoji) as `\UXXXXXXXX`, decoded here to the same code point
+ * Backlog.md's reader yields. Any other YAML-only escape (`\x`, `\e`, `\N`, `\_`, ...) makes JSON.parse
+ * throw, which falls back.
+ */
+function decodeDoubleQuoted(s: string): string | undefined {
+  let bad = false;
+  const json = s.replace(/\\(?:U([0-9A-Fa-f]{8})|[\s\S])/g, (m, hex: string | undefined) => {
+    if (hex === undefined) return m;
+    const cp = parseInt(hex, 16);
+    if (cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff)) { bad = true; return m; }
+    return String.fromCodePoint(cp);
+  });
+  if (bad) return undefined;
+  try { const v: unknown = JSON.parse(json); return typeof v === 'string' ? v : undefined; } catch { return undefined; }
+}
 
 /** One YAML scalar as js-yaml dumps it; undefined when outside the supported subset. */
 function scalar(src: string): string | number | null | undefined {
-  const s = src.trim();
+  const s = src.replace(/^[ \t]+|[ \t]+$/g, ''); // YAML trims only spaces and tabs
   if (s === '') return null;
   if (s.startsWith("'")) {
     if (!s.endsWith("'") || s.length < 2) return undefined;
@@ -41,12 +70,11 @@ function scalar(src: string): string | number | null | undefined {
     if (/'(?!')/.test(body.replace(/''/g, ''))) return undefined;
     return body.replace(/''/g, "'");
   }
-  if (s.startsWith('"')) {
-    try { const v: unknown = JSON.parse(s); return typeof v === 'string' ? v : undefined; } catch { return undefined; }
-  }
-  if (/^-?\d+$/.test(s)) return Number(s);
-  // Anything YAML could read as something other than a plain string is left to Backlog.md.
-  if (PLAIN_RESERVED.test(s) || /^[-?:,[\]{}#&*!|>%@`]/.test(s) || /: | #/.test(s) || /^[-+.\d]/.test(s) && !Number.isNaN(Number(s))) return undefined;
+  if (s.startsWith('"')) return decodeDoubleQuoted(s);
+  // Plain decimal integers only (no leading zero: YAML 1.1 reads 010 as octal), within the exact range.
+  if (/^-?(?:0|[1-9]\d{0,14})$/.test(s)) return Number(s);
+  // Anything YAML could read as something other than this exact string is left to Backlog.md.
+  if (PLAIN_RESERVED.test(s) || !PLAIN_SAFE.test(s) || PLAIN_UNSAFE.test(s)) return undefined;
   return s;
 }
 
@@ -58,7 +86,7 @@ export function parseFrontmatter(lines: string[]): Map<string, Yaml> | undefined
     const m = /^([a-z_]+):(?: (.*))?$/.exec(lines[i]!);
     if (!m || out.has(m[1]!)) return undefined;
     const key = m[1]!;
-    const rest = (m[2] ?? '').trim();
+    const rest = (m[2] ?? '').replace(/^[ \t]+|[ \t]+$/g, '');
     i++;
     if (rest === '') {
       // Block sequence (possibly empty: `key:` alone is null).

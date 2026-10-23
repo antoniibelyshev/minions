@@ -39,12 +39,12 @@ describe('task file parser: plain scalars outside the summary cross-check', () =
     for (const v of ['docs/x y.md', 'TASK-34', 'a-b_c', 'https://a/b']) expect(parseTaskFile(doc(v))?.documentation).toEqual([v]);
   });
 
-  // KNOWN DEFECT (task-24.1 QA): documentation and dependencies are not in the `task list` summary, so the
+  // Regression (task-24.1 QA): documentation and dependencies are not in the `task list` summary, so the
   // cross-check cannot catch these. Backlog.md (js-yaml) resolves them to a number, a Date, a mapping or a
-  // comment-stripped string, so `task view` reports e.g. "80", "Infinity", "[object Object]", "TASK-1",
-  // while the parser keeps the literal text: a different Task, a different version, and CONFLICT on update.
-  // Each must return null (fall back to task view). Flip `it.fails` to `it` once the parser rejects them.
-  it.fails.each([
+  // comment-stripped string, so `task view` reports e.g. "80", "Infinity", "[object Object]", "TASK-1".
+  // Keeping the literal text would give a different Task, a different version, and CONFLICT on update, so
+  // each must return null (fall back to task view).
+  it.each([
     ['sexagesimal', '1:20'], ['underscore int', '1_000'], ['.inf', '.inf'], ['.NaN', '.NaN'], ['date', '2026-10-23'],
     ['timestamp', '2026-10-23 10:00:00'], ['colon-tab mapping', 'a:\tb'], ['trailing colon mapping', 'TASK-1:'],
     ['tab comment', 'a\t#c'],
@@ -52,7 +52,31 @@ describe('task file parser: plain scalars outside the summary cross-check', () =
     expect(parseTaskFile(doc(v))).toBeNull();
   });
 
-  it.fails('returns null for a dependency followed by a tab comment', () => {
+  it.each([
+    ['bare colon mapping', 'x:'], ['colon-space mapping', 'a: b'], ['space comment', 'a #c'], ['hash', 'a#b'],
+    ['hex', '0x1F'], ['octal', '010'], ['float', '1.5'], ['exponent', '1e3'], ['signed', '+1'], ['negative', '-1'],
+    ['dot float', '.5'], ['-.inf', '-.inf'], ['.nan lower', '.nan'], ['ISO timestamp', '2026-10-23T10:00:00Z'],
+    ['sexagesimal float', '190:20:30.15'], ['bool', 'True'], ['null', 'NULL'], ['tilde', '~'], ['yes', 'yes'],
+    ['merge key', '<<'], ['value key', '='], ['anchor', '&a'], ['alias', '*a'], ['tag', '!x'], ['flow seq', '[a]'],
+    ['flow map', '{a}'], ['question', '? a'], ['inner tab', 'a\tb'], ['nbsp', 'TASK-1\u00a0'], ['bom', '\ufeffTASK-1'],
+    ['line separator', 'a\u2028b'], ['nel', 'a\u0085b'], ['zero width', 'a\u200bb'], ['backslash start', '\\x'],
+  ])('returns null for another plain list item outside the allowlist (%s)', (_n, v) => {
+    expect(parseTaskFile(doc(v))).toBeNull();
+  });
+
+  it('accepts conservative plain items and quoted forms, decoding js-yaml \\U escapes', () => {
+    for (const v of ['task-1.2', 'src/a_b.ts', 'Ünïcödé — “quotes”', 'a :b', 'x - y', 'a, b'])
+      expect(parseTaskFile(doc(v))?.documentation).toEqual([v]);
+    expect(parseTaskFile(doc('TASK-3 \t'))?.documentation).toEqual(['TASK-3']);
+    expect(parseTaskFile(doc("'1:20'"))?.documentation).toEqual(['1:20']);
+    expect(parseTaskFile(doc('"a\\t#c"'))?.documentation).toEqual(['a\t#c']);
+    expect(parseTaskFile(doc('"rocket \\U0001F680 \\u00e9"'))?.documentation).toEqual(['rocket 🚀 é']);
+    expect(parseTaskFile(doc('"\\\\U0001F680"'))?.documentation).toEqual(['\\U0001F680']);
+    for (const bad of ['"\\U00110000"', '"\\U0000D800"', '"\\x41"', '"\\e"', '"\\N"', '"\\_"', '"\\U0001F68"'])
+      expect(parseTaskFile(doc(bad))).toBeNull();
+  });
+
+  it('returns null for a dependency followed by a tab comment', () => {
     expect(parseTaskFile(doc('ok').replace('  - TASK-2', '  - TASK-2\t# blocked on auth'))).toBeNull();
   });
 });
@@ -95,12 +119,13 @@ describe.skipIf(!hasCli)('fast listing edge cases vs task view (real CLI)', { ti
   }, 60_000);
   afterAll(() => rmSync(root, { recursive: true, force: true }));
 
-  it('matches task view for Backlog.md-written edge cases, viewing only the \\U-escaped file', async () => {
+  it('matches task view for Backlog.md-written edge cases, without any task view', async () => {
     const { tasks, spawns } = await compare();
     expect(tasks.find((t) => t.id === 'task-1.1')?.acceptanceCriteria.map((a) => a.done)).toEqual([true, false, true]);
     expect(tasks.find((t) => t.id === 'task-5')?.dependencies).toEqual(['task-1', 'task-2', 'task-3', 'task-4']);
-    // Only TASK-2 (emoji written as "\U0001F680", which JSON.parse rejects) falls back; TASK-7 ("\t") is read in-process.
-    expect(spawns).toBe(1 + 1);
+    // TASK-2 (emoji written as "\U0001F680") and TASK-7 ("\t") are both decoded in-process: only the list call spawns.
+    expect(readFileSync(file('task-2'), 'utf8')).toContain('\\U0001F680');
+    expect(spawns).toBe(1);
   });
 
   it('stays equivalent after hand edits (CRLF, BOM, no trailing newline, reordered sections, whitespace)', async () => {
@@ -132,5 +157,17 @@ describe.skipIf(!hasCli)('fast listing edge cases vs task view (real CLI)', { ti
       await expect(a.updateTask(id, u.version, { priority: 'high' })).rejects.toMatchObject({ code: 'CONFLICT' });
     }
     await compare();
+  });
+
+  it('falls back for hand-edited YAML-ambiguous dependencies and documentation, so updates do not CONFLICT', async () => {
+    edit('task-5', (t) => t.replace(/\n {2}- TASK-1\n/, '\n  - TASK-1\t# blocked on auth\n')
+      .replace(/\ndocumentation: \[\]\n|\n(?=---\n\n)/, '\ndocumentation:\n  - 1:20\n  - TASK-9:\n'));
+    expect(readFileSync(file('task-5'), 'utf8')).toContain('TASK-1\t# blocked on auth');
+    expect(parseTaskFile(readFileSync(file('task-5'), 'utf8'))).toBeNull();
+    const { tasks } = await compare();
+    const t5 = tasks.find((t) => t.id === 'task-5')!;
+    expect(t5.dependencies).toContain('task-1');
+    const a = fresh();
+    await expect(a.updateTask('task-5', t5.version, { priority: 'low' })).resolves.toMatchObject({ priority: 'low' });
   });
 });
