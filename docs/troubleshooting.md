@@ -152,13 +152,14 @@ restart-required, the bot does not start.
 minions auth github                     # store a new fine-grained token (prompted without echo; --stdin to pipe it)
 minions auth github --remove            # delete a revoked token
 minions auth telegram                   # store a new bot token (BotFather /token or /revoke)
-minions down && minions start           # mount the new token copies into the runtime
+minions upgrade                         # mount the new token copies and restart the coordinator
+                                        # (host runtime: minions down && minions start)
 minions work publish <taskId>           # retry a failed publication (idempotent)
 ```
 
 `minions setup github` walks through the remote, base branch and token again. Tokens are stored only on
-the host (Keychain or a 0600 file) and copied into the runtime's read-only secrets mount at start; they
-never enter the state volume or a state backup.
+the host (Keychain or a 0600 file) and copied into the runtime's read-only secrets mount at start and
+on `minions upgrade`; they never enter the state volume or a state backup.
 
 ## A failed or interrupted upgrade
 

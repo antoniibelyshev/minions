@@ -81,7 +81,7 @@ const mib = (kib: number) => `${Math.round(kib / 1024)} MiB`;
  */
 export function tmpUsageChecks(r: { code: number; stdout: string; stderr: string }, o: { capMiB: number; scratch: string }): Check[] {
   const rows = parseDf(r.stdout);
-  const recreate = 'Recreate the container to apply the current compose.yaml (`minions down`, then `minions start`).';
+  const recreate = 'Run `minions upgrade` to regenerate compose.yaml and recreate the container from it (volumes kept).';
   const tmp = rows.find((x) => x.mount === '/tmp');
   const out: Check[] = [];
   if (!tmp) {
