@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { isRequiredCoordinatorTool } from './coordinator-tools.js';
+import { HARNESS_IDS, PROCESS_HARNESS_IDS } from './harnesses.js';
 
 export const CAPABILITIES = [
   'task.read', 'task.create', 'task.update', 'task.start',
@@ -91,8 +92,10 @@ export const CustomRoleSchema = z.object({
   /** Default: true unless `edits` is `none`. `review` worktrees imply false. */
   commits: z.boolean().optional(),
   tools: z.array(toolName).min(1).optional(),
-  /** Must be in models.allowed. Default models.default. */
+  /** Must be in the role harness's allowed models (models.allowed for claude). Default: that harness's default model. */
   model: modelId.optional(),
+  /** Agent runtime of the role (docs/design/agent-runtimes.md D8); default harnesses.default where the phase allows it, else claude. */
+  harness: z.enum(HARNESS_IDS).optional(),
   effort: z.enum(EFFORTS).optional(),
   /** Default execution.attemptMaxTurns. */
   maxTurns: z.number().int().min(1).optional(),
@@ -121,6 +124,8 @@ const builtinRoleOverride = {
   model: modelId.optional(),
   effort: z.enum(EFFORTS).optional(),
   maxTurns: z.number().int().min(1).optional(),
+  /** Agent runtime (agent-runtimes D8); a process harness only where the current phase allows it for the role (D9). */
+  harness: z.enum(HARNESS_IDS).optional(),
   /** May only remove tools from the built-in definition. */
   tools: z.array(toolName).min(1).optional(),
 };
@@ -142,9 +147,38 @@ export const RolesSchema = z.object({
   reviewer: BuiltinRoleOverrideSchema.optional(),
 }).catchall(CustomRoleSchema);
 
+/** Models of a process harness: harness-native ids or aliases, chosen by the owner (agent-runtimes D8). */
+const HarnessModelsSchema = z.object({ default: modelId, allowed: z.array(modelId).min(1) }).strict();
+/** One process harness (`harnesses.codex`, `harnesses.junie`). */
+export const ProcessHarnessSchema = z.object({
+  models: HarnessModelsSchema,
+  /** Reasoning effort of roles on this harness without their own (minions scale, mapped onto the harness's at launch). */
+  effort: z.enum(EFFORTS).optional(),
+  /** Wall clock per attempt (D3.6); default 60. */
+  timeoutMinutes: z.number().int().min(1).max(24 * 60).optional(),
+}).strict();
+export type ProcessHarnessConfig = z.infer<typeof ProcessHarnessSchema>;
+/**
+ * Agent runtimes (docs/design/agent-runtimes.md D8). Unset = every worker runs on Claude Code. Cross-field checks
+ * (referenced blocks, phase rules, models) are in harnessConfigIssues (src/config/roles.ts).
+ */
+export const HarnessesSchema = z.object({
+  /** Harness of every worker role without its own `harness`, where the current phase allows it (D9); default claude. */
+  default: z.enum(HARNESS_IDS).optional(),
+  ...(Object.fromEntries(PROCESS_HARNESS_IDS.map((id) => [id, ProcessHarnessSchema.optional()])) as Record<(typeof PROCESS_HARNESS_IDS)[number], z.ZodOptional<typeof ProcessHarnessSchema>>),
+  network: z.object({
+    /** Landlock TCP connect allowlist for every process worker (D4); never empty (the harness itself needs 443). */
+    tcpConnectPorts: z.array(port).min(1, 'must list at least one port (the harness itself needs 443)'),
+  }).strict().optional(),
+}).strict();
+export type HarnessesConfig = z.infer<typeof HarnessesSchema>;
+
 /** Conditions of a conditional workflow stage (D5): `qa` = run only when the task needs QA. */
 export const STAGE_WHEN = ['qa'] as const;
-/** One workflow stage (D5): a role name, or `{ role, when?, model? }`; `model` is an Agent alias hint (must be in models.allowed). */
+/**
+ * One workflow stage (D5): a role name, or `{ role, when?, model? }`; `model` is a model hint validated against the
+ * stage role's harness (models.allowed for claude). A hint never names a harness (agent-runtimes D8).
+ */
 export const WorkflowStageSchema = z.union([
   nonEmpty,
   z.object({ role: nonEmpty, when: z.enum(STAGE_WHEN).optional(), model: modelId.optional() }).strict(),
@@ -278,6 +312,8 @@ export const MinionsConfigSchema = z.object({
   roles: RolesSchema.optional(),
   /** Named per-task workflows (docs/design/roles-and-workflows.md D5); unset = only the derived default. */
   workflows: WorkflowsSchema.optional(),
+  /** Agent runtimes per role (docs/design/agent-runtimes.md D8); unset = every worker runs on Claude Code. */
+  harnesses: HarnessesSchema.optional(),
   sensitivePaths: z.array(nonEmpty),
   architecture: z.enum(['decide', 'propose']),
   git: z.object({

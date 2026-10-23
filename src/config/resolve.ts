@@ -1,7 +1,7 @@
 import { MinionsError, invalidConfig, zodIssues, type ConfigIssue } from '../core/errors.js';
 import { CAPABILITIES, can, ruleEffects, stricter, strictness } from './capabilities.js';
 import { autoMergeConfigReasons } from './delivery.js';
-import { ENGINEER_ROLE, registeredRoleNames, roleConfigIssues, roleLimit } from './roles.js';
+import { ENGINEER_ROLE, harnessConfigIssues, registeredRoleNames, roleConfigIssues, roleLimit } from './roles.js';
 import { workflowConfigIssues } from './workflows.js';
 import { MinionsConfigSchema, CapabilityRuleSchema, type Capability, type CapabilityRule, type MinionsConfig } from './schema.js';
 
@@ -55,6 +55,8 @@ function crossFieldIssues(c: MinionsConfig): ConfigIssue[] {
   if (c.container.mountHostRepository) issues.push({ path: 'container.mountHostRepository', message: 'must be false: the workspace lives in a named volume' });
   // roles, role references in capability sub-rules, execution.maxByRole / maxEngineers (incl. <= maxActiveTasks).
   issues.push(...roleConfigIssues(c));
+  // harnesses blocks, roles.<r>.harness and the phase rules (docs/design/agent-runtimes.md D8, D9).
+  issues.push(...harnessConfigIssues(c));
   // workflows (D5 invariants 1-2, stage model hints) and roles.<r>.repairTo.
   issues.push(...workflowConfigIssues(c));
   return issues;

@@ -128,6 +128,8 @@ export interface ProposalSummary {
   tools: string[];
   model: string | null;
   effort: string | null;
+  /** Agent runtime the role would run on (docs/design/agent-runtimes.md D8); shown so the owner sees a non-Claude harness. */
+  harness: RoleDef['harness'];
   maxTurns: number;
   deepVariant: boolean;
   requires: Capability[];
@@ -161,7 +163,7 @@ export async function checkProposal(cfg: MinionsConfig, raw: unknown, source?: s
     name: p.name,
     change: Object.hasOwn(cfg.roles ?? {}, p.name) ? 'change' : 'add',
     description: def.description, contract: def.contract, worktree: def.worktree, stageStatus: def.stageStatus,
-    edits: def.edits, commits: def.commits, tools: roleTools(def), model: def.model ?? null, effort: def.effort ?? null,
+    edits: def.edits, commits: def.commits, tools: roleTools(def), model: def.model ?? null, effort: def.effort ?? null, harness: def.harness,
     maxTurns: def.maxTurns, deepVariant: def.deepVariant, requires: def.requires, policy, loosens,
     workflows: Object.keys(p.workflows ?? {}).map((name) => ({
       name, stages: (candidate.workflows?.[name] ?? []).map((s) => normalizeStage(s).role),
@@ -186,7 +188,7 @@ export function formatSummary(s: ProposalSummary): string {
   return displayText([
     `role ${s.name} (${s.change === 'add' ? 'new' : 'changed'}): ${s.description}`,
     ...(loosens ? [loosens] : []),
-    `  contract ${s.contract}, worktree ${s.worktree}, stage status ${s.stageStatus}, max turns ${s.maxTurns}${s.model ? `, model ${s.model}` : ''}${s.effort ? `, effort ${s.effort}` : ''}${s.deepVariant ? ', deep variant' : ''}`,
+    `  contract ${s.contract}, worktree ${s.worktree}, stage status ${s.stageStatus}, max turns ${s.maxTurns}${s.model ? `, model ${s.model}` : ''}${s.effort ? `, effort ${s.effort}` : ''}${s.deepVariant ? ', deep variant' : ''}${s.harness !== 'claude' ? `, harness ${s.harness}` : ''}`,
     `  edits: ${editScope(s.edits)}; commits: ${s.commits ? 'yes' : 'no'}`,
     `  tools: ${s.tools.join(', ')}`,
     `  requires: ${s.requires.length ? s.requires.join(', ') : 'none'}`,

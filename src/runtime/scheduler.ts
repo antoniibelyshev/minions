@@ -4,8 +4,10 @@ import type { BacklogAdapter, ScopeFilter, Task, TaskStatus } from '../backlog/t
 import { can, matchesAny } from '../config/capabilities.js';
 import { isGithubDelivery } from '../config/delivery.js';
 import { notReadyReason, sortByPriority } from '../backlog/ready.js';
+import { CURRENT_PHASE, harnessModels, isProcessHarness, phaseAllows, type HarnessId, type PhaseRules } from '../config/harnesses.js';
+import { launchFor, type Launch } from '../config/launch.js';
 import { suggestModel, type ModelSuggestion } from '../config/models.js';
-import { baseRoleName, DEEP_SUFFIX, ENGINEER_ROLE, exactWorkerRole, TESTER_ROLE, roleLimit, workerRole, workerRoleNames, type RoleDef } from '../config/roles.js';
+import { baseRoleName, ENGINEER_ROLE, exactWorkerRole, harnessRoleEffort, TESTER_ROLE, roleLimit, workerRole, workerRoleNames, type RoleDef } from '../config/roles.js';
 import type { MinionsConfig, RoleContract } from '../config/schema.js';
 import {
   claimableStatuses, configuredStages, contractOf, derivePosition, finalGateIndex, nextRunnable, parseStages, positionForRole, repairTarget,
@@ -56,6 +58,8 @@ export interface SchedulerDeps {
   now?: () => Date;
   /** API-key billing or a Claude subscription (default: MINIONS_AUTH_METHOD); only units and wording differ. */
   billing?: Billing;
+  /** Harness phase rules (docs/design/agent-runtimes.md D9); default CURRENT_PHASE. Tests inject later phases. */
+  phase?: PhaseRules;
 }
 
 /** The worker's token total from the coordinator's task notification (`--usage`); cumulative per agent. */
@@ -125,13 +129,23 @@ export interface NextStage {
   /** The Agent call's `model`: null = omit it (the definition runs suggestedModel, or it is a full ID). */
   agentModel: string | null;
   modelRule: ModelSuggestion['rule'];
+  /** The stage role's agent runtime (agent-runtimes D8); `claude` unless the role is on a process harness. */
+  harness: HarnessId;
+  /**
+   * How to start the stage: `agent` = Agent tool with agentType / agentModel (as above); `run` = claim, then the
+   * runner command with the lease id (process harness).
+   */
+  launch: Launch;
   reason: string;
 }
 
 /** A stage that could run but cannot start now. */
 export interface WaitingStage extends NextStage {
-  /** starts: paused, draining or the owner budget; capacity: active task limit; role-capacity: execution.maxByRole; requires: a stage capability not allowed. */
-  waitingOn: 'starts' | 'capacity' | 'role-capacity' | 'requires';
+  /**
+   * starts: paused, draining or the owner budget; capacity: active task limit; role-capacity: execution.maxByRole;
+   * harness-capacity: the phase cap on process-harness producers (agent-runtimes D9); requires: a stage capability not allowed.
+   */
+  waitingOn: 'starts' | 'capacity' | 'role-capacity' | 'harness-capacity' | 'requires';
   why: string;
 }
 
@@ -203,6 +217,8 @@ export interface TaskBrief {
   model: string;
   allowedModels: string[];
   effort: string | null;
+  /** The role's agent runtime (docs/design/agent-runtimes.md D8); `claude` = an Agent-tool subagent, as before. */
+  harness: HarnessId;
   maxTurns: number;
   configRevision: number;
   deliveryMode: string;
@@ -294,7 +310,10 @@ export class Scheduler {
     this.gh = deps.gh ?? realGh;
     this.now = deps.now ?? (() => new Date());
     this.billing = deps.billing ?? billingOf();
+    this.phase = deps.phase ?? CURRENT_PHASE;
   }
+
+  private readonly phase: PhaseRules;
 
   private readonly billing: Billing;
   spendContext(): SpendContext { return { db: this.db, billing: this.billing, config: this.config, now: this.now() }; }
@@ -546,7 +565,7 @@ export class Scheduler {
         // A QA sweep has no stage plan: a tester checks the base branch, claimed from ready only.
         if (task.status !== 'ready') { stuck.push({ taskId: task.id, status: task.status, reason: `QA sweep in "${task.status}" without a lease; a sweep is only claimed from ready` }); continue; }
         const def = workerRole(cfg, TESTER_ROLE)!;
-        const m = suggestModel(cfg, { roleModel: def.model, contract: def.contract, labels: task.labels, deepVariant: def.deepVariant, repairAfterFailure: this.attemptFailed(task, TESTER_ROLE, def) });
+        const m = suggestModel(cfg, { roleModel: def.model, contract: def.contract, labels: task.labels, deepVariant: def.deepVariant, harness: def.harness, repairAfterFailure: this.attemptFailed(task, TESTER_ROLE, def) });
         candidates.push(this.nextEntry(task, def, m, { kind: 'qa-sweep', position: null, count: null, workflow: null },
           `QA sweep of ${cfg.git.baseBranch}: a tester checks the base branch head`));
         continue;
@@ -567,7 +586,7 @@ export class Scheduler {
       const def = workerRole(cfg, stage.role);
       if (!def) { stuck.push({ taskId: task.id, status: task.status, reason: `stage role ${stage.role} is not registered` }); continue; }
       const m = suggestModel(cfg, {
-        stageModel: stage.model, roleModel: def.model, contract: def.contract, labels: task.labels, deepVariant: def.deepVariant,
+        stageModel: stage.model, roleModel: def.model, contract: def.contract, labels: task.labels, deepVariant: def.deepVariant, harness: def.harness,
         allHinted: configuredStages(plan.stages).every((x) => x.model !== undefined), repairAfterFailure: this.attemptFailed(task, def.name, def),
       });
       const at = `stage ${plan.position + 1}/${plan.stages.length} (${stage.role}) of workflow ${plan.workflow}`;
@@ -596,6 +615,7 @@ export class Scheduler {
     const runnable: NextStage[] = [];
     const active = new Set(cap.activeTaskIds);
     const roleActive = new Map(Object.entries(cap.byRole).map(([r, c]) => [r, c.active]));
+    let processProducers = this.processProducerLeases(leases);
     for (const c of ordered) {
       if (startsBlocked) { waiting.push({ ...c, waitingOn: 'starts', why: startsBlocked.message }); continue; }
       if (!active.has(c.taskId) && active.size >= cfg.execution.maxActiveTasks) {
@@ -604,6 +624,12 @@ export class Scheduler {
       const slots = Object.hasOwn(cap.byRole, c.role) ? cap.byRole[c.role]! : undefined;
       const used = roleActive.get(c.role) ?? 0;
       if (slots?.limited && used >= slots.max) { waiting.push({ ...c, waitingOn: 'role-capacity', why: `${c.role} limit (${used}/${slots.max})` }); continue; }
+      const processProducer = this.isProcessProducer(c.role);
+      const producerCap = this.phase.processProducerCap;
+      if (processProducer && producerCap !== null && processProducers >= producerCap) {
+        waiting.push({ ...c, waitingOn: 'harness-capacity', why: `process-harness producer cap (${processProducers}/${producerCap}, ${this.phase.summary})` }); continue;
+      }
+      if (processProducer) processProducers++;
       active.add(c.taskId);
       roleActive.set(c.role, used + 1);
       runnable.push(c);
@@ -617,12 +643,42 @@ export class Scheduler {
   }
 
   private nextEntry(task: Task, def: RoleDef, m: ModelSuggestion, at: Pick<NextStage, 'kind' | 'position' | 'count' | 'workflow'>, reason: string): NextStage {
+    const launch = launchFor(this.config, def, m);
     return {
       taskId: task.id, title: task.title, status: task.status, priority: task.priority, ...at,
-      role: def.name, agentType: `minions:${def.name}${m.deep ? DEEP_SUFFIX : ''}`,
-      suggestedModel: m.model, agentModel: m.agentModel, modelRule: m.rule,
+      // agentType names the Claude agent definition; a process-harness role has none to spawn (launch.kind "run").
+      role: def.name, agentType: launch.kind === 'agent' ? launch.agentType : `minions:${def.name}`,
+      suggestedModel: m.model, agentModel: m.agentModel, modelRule: m.rule, harness: def.harness, launch,
       reason: `${reason}; model: ${m.rule}${m.deep ? ', deep variant' : ''}`,
     };
+  }
+
+  /** Whether a lease of `role` is a producer on a process harness (counted by the phase cap, agent-runtimes D9). */
+  private isProcessProducer(role: string): boolean {
+    const def = workerRole(this.config, role);
+    return !!def && def.contract === 'producer' && isProcessHarness(def.harness);
+  }
+
+  private processProducerLeases(leases: Lease[]): number {
+    return leases.filter((l) => this.isProcessProducer(l.role)).length;
+  }
+
+  /**
+   * Phase rules at claim (agent-runtimes D9): the role's process harness must be allowed for it (validateConfig
+   * refuses such a config too; this guards a config that skipped it), and the squad-wide cap on active
+   * process-harness producer leases holds. Runs inside the claim transaction.
+   */
+  private assertHarnessAllowed(def: RoleDef, active: Lease[]): void {
+    if (!isProcessHarness(def.harness)) return;
+    if (!phaseAllows(def.harness, def, this.phase)) {
+      throw new MinionsError('POLICY_DENIED', `Role ${def.name} cannot run on harness ${def.harness}: ${this.phase.summary}.`, `Set roles.${def.name}.harness to claude on the host.`);
+    }
+    const cap = this.phase.processProducerCap;
+    if (def.contract !== 'producer' || cap === null) return;
+    const n = this.processProducerLeases(active);
+    if (n >= cap) {
+      throw new MinionsError('CAPACITY', `Process-harness producer cap reached (${n}/${cap}; ${this.phase.summary}).`, 'Wait for the running process-harness producer to finish.', { active: n, max: cap });
+    }
   }
 
   /** Refuses new starts while paused, draining or over the owner budget (claim; `work next` reports the same). */
@@ -714,6 +770,7 @@ export class Scheduler {
         const label = role === ENGINEER_ROLE ? 'Engineer' : `Role ${role}`;
         throw new MinionsError('CAPACITY', `${label} limit reached (${slots.active}/${slots.max}).`, `Wait for a${role === ENGINEER_ROLE ? 'n' : ''} ${role} to finish.`, cap);
       }
+      this.assertHarnessAllowed(def, active);
       const n = this.db.get<{ n: number }>('SELECT COUNT(*) AS n FROM leases WHERE task_id = ? AND role = ?', task.id, role)!.n + 1;
       this.db.exec(`INSERT INTO leases (id, task_id, role, attempt, holder, branch, config_revision, started_at, status)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active')`, leaseId, task.id, role, n, holder, branch, cfg.configRevision, nowIso());
@@ -824,10 +881,8 @@ export class Scheduler {
         taskStart: x.startEffect, codeEdit: can(cfg, 'code.edit', { role }), gitCommit: can(cfg, 'git.commit', { role }),
         sensitivePaths: [...cfg.sensitivePaths], architecture: cfg.architecture,
       },
-      // A stage model hint (D5; in models.allowed by config validation) replaces the default.
-      model: stage?.model ?? cfg.models.default,
-      allowedModels: [...cfg.models.allowed],
-      effort: null,
+      harness: def.harness,
+      ...this.briefModel(def, stage),
       maxTurns: cfg.execution.attemptMaxTurns,
       configRevision: cfg.configRevision,
       deliveryMode: cfg.delivery.mode,
@@ -838,6 +893,20 @@ export class Scheduler {
       // A QA sweep checks the base head and commits nothing: the verifier contract without commits.
       resultContract: resultContractText(def.contract, { commits: def.commits && !x.sweep }),
     };
+  }
+
+  /**
+   * Brief model fields. Claude (unchanged): a stage model hint (D5; in models.allowed by config validation) replaces
+   * models.default, effort is in the agent definition. A process harness (agent-runtimes D8): stage hint > role model >
+   * harnesses.<id>.models.default (always the default with selection "fixed"), its allowed list, and the base effort
+   * mapped onto the harness's scale (the `-deep` choice is the launch entry's).
+   */
+  private briefModel(def: RoleDef, stage: Stage | undefined): Pick<TaskBrief, 'model' | 'allowedModels' | 'effort'> {
+    const cfg = this.config;
+    const hm = isProcessHarness(def.harness) ? harnessModels(cfg, def.harness) : undefined;
+    if (!hm) return { model: stage?.model ?? cfg.models.default, allowedModels: [...cfg.models.allowed], effort: null };
+    const model = cfg.models.selection === 'fixed' ? hm.default : stage?.model ?? def.model ?? hm.default;
+    return { model, allowedModels: [...hm.allowed], effort: harnessRoleEffort(cfg, def, false).native };
   }
 
   /** The last ended lease of the task, when it was a drain partial of the same role: what to continue from. */

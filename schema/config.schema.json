@@ -688,8 +688,11 @@
             "maxTurns": {
               "$ref": "#/$defs/__schema13"
             },
-            "tools": {
+            "harness": {
               "$ref": "#/$defs/__schema14"
+            },
+            "tools": {
+              "$ref": "#/$defs/__schema15"
             },
             "deepEffort": {
               "type": "string",
@@ -705,10 +708,10 @@
           "additionalProperties": false
         },
         "tester": {
-          "$ref": "#/$defs/__schema16"
+          "$ref": "#/$defs/__schema17"
         },
         "reviewer": {
-          "$ref": "#/$defs/__schema16"
+          "$ref": "#/$defs/__schema17"
         }
       },
       "additionalProperties": {
@@ -772,11 +775,19 @@
             "minItems": 1,
             "type": "array",
             "items": {
-              "$ref": "#/$defs/__schema15"
+              "$ref": "#/$defs/__schema16"
             }
           },
           "model": {
             "$ref": "#/$defs/__schema3"
+          },
+          "harness": {
+            "type": "string",
+            "enum": [
+              "claude",
+              "codex",
+              "junie"
+            ]
           },
           "effort": {
             "type": "string",
@@ -922,9 +933,45 @@
         "minItems": 1,
         "type": "array",
         "items": {
-          "$ref": "#/$defs/__schema17"
+          "$ref": "#/$defs/__schema18"
         }
       }
+    },
+    "harnesses": {
+      "type": "object",
+      "properties": {
+        "default": {
+          "type": "string",
+          "enum": [
+            "claude",
+            "codex",
+            "junie"
+          ]
+        },
+        "codex": {
+          "$ref": "#/$defs/__schema19"
+        },
+        "junie": {
+          "$ref": "#/$defs/__schema19"
+        },
+        "network": {
+          "type": "object",
+          "properties": {
+            "tcpConnectPorts": {
+              "minItems": 1,
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/__schema2"
+              }
+            }
+          },
+          "required": [
+            "tcpConnectPorts"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
     },
     "sensitivePaths": {
       "type": "array",
@@ -1179,17 +1226,25 @@
       "maximum": 9007199254740991
     },
     "__schema14": {
+      "type": "string",
+      "enum": [
+        "claude",
+        "codex",
+        "junie"
+      ]
+    },
+    "__schema15": {
       "minItems": 1,
       "type": "array",
       "items": {
-        "$ref": "#/$defs/__schema15"
+        "$ref": "#/$defs/__schema16"
       }
     },
-    "__schema15": {
+    "__schema16": {
       "type": "string",
       "pattern": "^[A-Za-z0-9_*()-]+$"
     },
-    "__schema16": {
+    "__schema17": {
       "type": "object",
       "properties": {
         "promptAppend": {
@@ -1207,13 +1262,16 @@
         "maxTurns": {
           "$ref": "#/$defs/__schema13"
         },
-        "tools": {
+        "harness": {
           "$ref": "#/$defs/__schema14"
+        },
+        "tools": {
+          "$ref": "#/$defs/__schema15"
         }
       },
       "additionalProperties": false
     },
-    "__schema17": {
+    "__schema18": {
       "anyOf": [
         {
           "$ref": "#/$defs/__schema0"
@@ -1240,6 +1298,50 @@
           "additionalProperties": false
         }
       ]
+    },
+    "__schema19": {
+      "type": "object",
+      "properties": {
+        "models": {
+          "type": "object",
+          "properties": {
+            "default": {
+              "$ref": "#/$defs/__schema3"
+            },
+            "allowed": {
+              "minItems": 1,
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/__schema3"
+              }
+            }
+          },
+          "required": [
+            "default",
+            "allowed"
+          ],
+          "additionalProperties": false
+        },
+        "effort": {
+          "type": "string",
+          "enum": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        },
+        "timeoutMinutes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1440
+        }
+      },
+      "required": [
+        "models"
+      ],
+      "additionalProperties": false
     }
   }
 }

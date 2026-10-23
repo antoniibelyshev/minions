@@ -5,6 +5,10 @@
  */
 import type { ConfigIssue } from '../core/errors.js';
 import {
+  CURRENT_PHASE, HARNESSES, PROCESS_HARNESS_IDS, harnessBlock, harnessModels, isProcessHarness, phaseAllows, resolveRoleHarness,
+  type HarnessId, type PhaseRules,
+} from './harnesses.js';
+import {
   CAPABILITIES, EFFORTS, ROLES,
   type BuiltinRoleOverride, type Capability, type CustomRoleConfig, type Effect, type Effort, type MinionsConfig,
   type Role, type RoleContract, type RoleWorktree, type StageStatus,
@@ -73,6 +77,8 @@ export interface RoleDef {
   effort?: Effort;
   maxTurns: number;
   deepVariant: boolean;
+  /** Agent runtime (docs/design/agent-runtimes.md D8): own `harness` > harnesses.default where the phase allows it > claude. */
+  harness: HarnessId;
   requires: Capability[];
   /** The role's policy column (project roles only; built-ins use the hand-written capability table). */
   capabilities: Partial<Record<Capability, Effect>>;
@@ -81,7 +87,7 @@ export interface RoleDef {
   promptText?: string;
 }
 
-type RolesCfg = Partial<Pick<MinionsConfig, 'roles'>>;
+type RolesCfg = Partial<Pick<MinionsConfig, 'roles' | 'harnesses'>>;
 type Entries = Record<string, unknown>;
 const rolesOf = (cfg: RolesCfg): Entries => (cfg.roles ?? {}) as Entries;
 /** Own-property lookup: never finds keys inherited from Object.prototype (`constructor`, `__proto__`, ...). */
@@ -112,6 +118,7 @@ function builtinDef(cfg: DefCfg, name: BuiltinWorkerRole): RoleDef {
     ...(o?.effort ? { effort: o.effort } : {}),
     maxTurns: o?.maxTurns ?? cfg.execution.attemptMaxTurns,
     deepVariant: name === ENGINEER_ROLE,
+    harness: resolveRoleHarness(cfg, { contract: BUILTIN_DEFS[name].contract, builtin: true, ...(o?.harness ? { harness: o.harness } : {}) }),
     requires: [], capabilities: {},
     ...(o?.prompt ? { prompt: o.prompt } : {}),
     ...(o?.promptAppend ? { promptText: o.promptAppend } : {}),
@@ -131,6 +138,7 @@ function customDef(cfg: DefCfg, name: string, r: CustomRoleConfig): RoleDef {
     ...(r.effort ? { effort: r.effort } : {}),
     maxTurns: r.maxTurns ?? cfg.execution.attemptMaxTurns,
     deepVariant: r.deepVariant ?? false,
+    harness: resolveRoleHarness(cfg, { contract: r.contract, builtin: false, ...(r.harness ? { harness: r.harness } : {}) }),
     requires: [...(r.requires ?? [])],
     capabilities: { ...(r.capabilities ?? {}) },
     ...(r.prompt ? { prompt: r.prompt } : {}),
@@ -190,32 +198,57 @@ export function roleLimit(cfg: Pick<MinionsConfig, 'execution'>, role: Role): nu
  * Effective reasoning effort of a role (D9): `roles.<r>.effort` > `models.effortByRole.<r>` (built-ins and the
  * coordinator) > `models.effort`; undefined = Claude Code default.
  */
-export function roleEffort(cfg: Pick<MinionsConfig, 'models'> & RolesCfg, role: Role): Effort | undefined {
+export function roleEffort(cfg: Pick<MinionsConfig, 'models'> & RolesCfg, role: Role, harnessDefault?: Effort): Effort | undefined {
   const own = role === COORDINATOR_ROLE ? undefined : (ownEntry(rolesOf(cfg), role) as { effort?: Effort } | undefined)?.effort;
   const byRole = (BUILTIN_ROLES as readonly string[]).includes(role)
     ? cfg.models.effortByRole?.[role as (typeof BUILTIN_ROLES)[number]]
     : undefined;
-  return own ?? byRole ?? cfg.models.effort;
+  // `harnessDefault`: harnesses.<id>.effort of a role on a process harness, between the role's own and models.effort.
+  return own ?? byRole ?? harnessDefault ?? cfg.models.effort;
 }
 
+const oneAbove = (e: Effort): Effort => EFFORTS[Math.min(EFFORTS.indexOf(e) + 1, EFFORTS.length - 1)]!;
+
 /** Effort of `minions:engineer-deep`: roles.engineer.deepEffort > effortByRole.engineerDeep > one level above the engineer's (capped), else `high`. */
-export function engineerDeepEffort(cfg: Pick<MinionsConfig, 'models'> & RolesCfg): Effort {
+export function engineerDeepEffort(cfg: Pick<MinionsConfig, 'models'> & RolesCfg, harnessDefault?: Effort): Effort {
   const explicit = overrideOf(cfg, ENGINEER_ROLE)?.deepEffort ?? cfg.models.effortByRole?.engineerDeep;
   if (explicit) return explicit;
-  const base = roleEffort(cfg, ENGINEER_ROLE);
-  if (!base) return 'high';
-  return EFFORTS[Math.min(EFFORTS.indexOf(base) + 1, EFFORTS.length - 1)]!;
+  const base = roleEffort(cfg, ENGINEER_ROLE, harnessDefault);
+  return base ? oneAbove(base) : 'high';
 }
 
 /**
  * Effort of a role's `-deep` variant: the engineer's from engineerDeepEffort; a project role's is one level
  * above its own effort (capped), else `high`.
  */
-export function deepVariantEffort(cfg: Pick<MinionsConfig, 'models'> & RolesCfg, role: string): Effort {
-  if (role === ENGINEER_ROLE) return engineerDeepEffort(cfg);
-  const base = roleEffort(cfg, role);
-  if (!base) return 'high';
-  return EFFORTS[Math.min(EFFORTS.indexOf(base) + 1, EFFORTS.length - 1)]!;
+export function deepVariantEffort(cfg: Pick<MinionsConfig, 'models'> & RolesCfg, role: string, harnessDefault?: Effort): Effort {
+  if (role === ENGINEER_ROLE) return engineerDeepEffort(cfg, harnessDefault);
+  const base = roleEffort(cfg, role, harnessDefault);
+  return base ? oneAbove(base) : 'high';
+}
+
+/** The effort a role runs at on its harness (agent-runtimes D8), base or `-deep`. */
+export interface HarnessEffort {
+  /** minions scale (EFFORTS); undefined = the harness's own default. */
+  effort: Effort | undefined;
+  /** The harness's value for `effort` (Codex model_reasoning_effort, Junie --effort, clamped); null = none passed. */
+  native: string | null;
+  /** False when `-deep` was asked for but the harness has no effort control: it runs like the base role. */
+  deepApplied: boolean;
+}
+
+/**
+ * Effort of `role` on its harness. Precedence as for Claude, with `harnesses.<id>.effort` before models.effort for a
+ * process harness; `-deep` is engineerDeepEffort / deepVariantEffort on the same precedence, mapped onto the
+ * harness's scale. A harness without effort control runs `-deep` like the base role.
+ */
+export function harnessRoleEffort(cfg: Pick<MinionsConfig, 'models'> & RolesCfg, def: Pick<RoleDef, 'name' | 'harness' | 'deepVariant'>, deep: boolean): HarnessEffort {
+  const info = HARNESSES[def.harness];
+  const harnessDefault = harnessBlock(cfg, def.harness)?.effort;
+  const wantDeep = deep && def.deepVariant;
+  if (!info.capabilities.effort || !info.effortMap) return { effort: undefined, native: null, deepApplied: false };
+  const effort = wantDeep ? deepVariantEffort(cfg, def.name, harnessDefault) : roleEffort(cfg, def.name, harnessDefault);
+  return { effort, native: effort ? info.effortMap[effort] : null, deepApplied: wantDeep };
 }
 
 /**
@@ -261,20 +294,58 @@ export function roleColumnRules(cfg: RolesCfg, role: string, capability: Capabil
   return out;
 }
 
+/** Where a harness's allowed models live in the config, for messages. */
+export const modelsPath = (h: HarnessId): string => (isProcessHarness(h) ? `harnesses.${h}.models.allowed` : 'models.allowed');
+
+/**
+ * Cross-field checks of `harnesses` and `roles.<r>.harness` (agent-runtimes D8, D9; run by validateConfig): a
+ * referenced process harness needs its block, a harness's default model is one of its allowed models, the
+ * coordinator never takes a harness, and an explicit role harness must be allowed by the phase rules. Port range
+ * and the non-empty tcpConnectPorts list are schema checks. `phase` is a parameter for tests of later phases.
+ */
+export function harnessConfigIssues(c: MinionsConfig, phase: PhaseRules = CURRENT_PHASE): ConfigIssue[] {
+  const issues: ConfigIssue[] = [];
+  const push = (path: string, message: string) => issues.push({ path, message });
+  const missingBlock = (h: HarnessId) => isProcessHarness(h) && !harnessBlock(c, h);
+  const needsBlock = (h: HarnessId) => `harness "${h}" has no harnesses.${h} block (set at least its models: {default, allowed})`;
+  const d = c.harnesses?.default;
+  if (d && missingBlock(d)) push('harnesses.default', needsBlock(d));
+  for (const id of PROCESS_HARNESS_IDS) {
+    const m = harnessBlock(c, id)?.models;
+    if (m && !m.allowed.includes(m.default)) push(`harnesses.${id}.models.default`, `"${m.default}" is not in harnesses.${id}.models.allowed [${m.allowed.join(', ')}]`);
+  }
+  for (const [name, raw] of Object.entries(rolesOf(c))) {
+    const h = (raw as { harness?: HarnessId } | undefined)?.harness;
+    if (h === undefined) continue;
+    const at = `roles.${name}.harness`;
+    if (name === COORDINATOR_ROLE) { push(at, 'the coordinator always runs on Claude Code; it cannot be assigned a harness (agent-runtimes D9 phase 3)'); continue; }
+    const def = roleNameProblem(name) === null ? workerRole(c, name) : undefined;
+    if (!def) continue;
+    if (missingBlock(h)) push(at, needsBlock(h));
+    if (!phaseAllows(h, def, phase)) {
+      push(at, `${phase.summary}; ${def.builtin ? 'the built-in' : 'project'} ${def.contract} role ${name} must stay on claude`);
+    }
+  }
+  return issues;
+}
+
 const isRelativePath = (p: string) => !/^(?:[A-Za-z]:)?[\\/]/.test(p) && !p.split(/[\\/]/).includes('..');
 
 /** Cross-field checks of `roles`, role references in capability sub-rules and `execution.maxByRole` (run by validateConfig). */
 export function roleConfigIssues(c: MinionsConfig): ConfigIssue[] {
   const issues: ConfigIssue[] = [];
   const push = (path: string, message: string) => issues.push({ path, message });
-  const allowed = c.models.allowed;
   for (const [name, raw] of Object.entries(rolesOf(c))) {
     if (raw === undefined) continue;
     const at = `roles.${name}`;
     const problem = roleNameProblem(name);
     if (problem) { push(at, problem); continue; }
     const r = raw as Partial<CustomRoleConfig> & Partial<BuiltinRoleOverride>;
-    if (r.model !== undefined && !allowed.includes(r.model)) push(`${at}.model`, `"${r.model}" is not in models.allowed [${allowed.join(', ')}]`);
+    // The role model is validated against the role's harness (agent-runtimes D8); a missing harness block is
+    // reported by harnessConfigIssues.
+    const harness = workerRole(c, name)?.harness ?? 'claude';
+    const models = harnessModels(c, harness);
+    if (r.model !== undefined && models && !models.allowed.includes(r.model)) push(`${at}.model`, `"${r.model}" is not in ${modelsPath(harness)} [${models.allowed.join(', ')}]`);
     if (r.prompt !== undefined && !isRelativePath(r.prompt)) push(`${at}.prompt`, 'must be a path relative to the config directory, without ".."');
     if (isBuiltinWorkerRole(name)) {
       if (r.prompt !== undefined && r.promptAppend !== undefined) push(at, 'set at most one of prompt and promptAppend');
