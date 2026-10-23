@@ -25,7 +25,7 @@ describe('idle restart is portable (no setsid)', () => {
     const calls: { cmd: string; args: string[]; opts: Parameters<DetachedSpawn>[2] }[] = [];
     const spawn: DetachedSpawn = (cmd, args, opts) => { calls.push({ cmd, args, opts }); return { pid: 1, unref: () => undefined, on: () => undefined }; };
     const dir = tmp('minions-t29-');
-    scheduleDetachedRestart({ activeLeases: () => [], log: join(dir, 'restart.log'), cwd: dir, spawn }, { recover: true });
+    scheduleDetachedRestart({ activeLeases: () => [], drain: () => null, log: join(dir, 'restart.log'), cwd: dir, spawn }, { recover: true });
     expect(calls).toHaveLength(1);
     expect(calls[0]!.cmd).toBe('minions');
     expect(calls[0]!.opts.detached).toBe(true);

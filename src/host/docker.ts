@@ -215,11 +215,14 @@ export class Compose {
   /**
    * Exec with inherited stdin. `tty` allocates a pseudo-TTY and inherits stdout/stderr (interactive
    * sessions: tmux attach needs its escapes). Without a TTY the container's stdout/stderr are relayed
-   * through the control-character filter, so container output cannot drive the host terminal. Returns exit code.
+   * through the control-character filter, so container output cannot drive the host terminal. `rawStdout`
+   * (non-TTY only) copies stdout byte-exact for machine-readable output (`--json`: the emitter already
+   * escapes every control character, and the filter would corrupt C1 characters inside JSON strings);
+   * stderr stays filtered. Returns exit code.
    */
-  execInherit(args: string[], opts: { tty: boolean }): Promise<number> {
+  execInherit(args: string[], opts: { tty: boolean; rawStdout?: boolean }): Promise<number> {
     const argv = this.argv('exec', ...(opts.tty ? [] : ['-T']), SERVICE_NAME, ...args);
-    return spawnRelay('docker', argv, { filter: !opts.tty }).catch((e: NodeJS.ErrnoException) => {
+    return spawnRelay('docker', argv, { filter: !opts.tty, rawStdout: opts.rawStdout }).catch((e: NodeJS.ErrnoException) => {
       throw e.code === 'ENOENT'
         ? new MinionsError('DOCKER_UNAVAILABLE', 'docker CLI not found.', process.platform === 'linux' ? 'Install and start Docker Engine (https://docs.docker.com/engine/install/).' : 'Install and start Docker Desktop.') : e;
     });
@@ -231,12 +234,15 @@ export class Compose {
 /**
  * Spawns `cmd` with inherited stdin and returns its exit code. `filter`: stdout/stderr are piped through
  * the control-character filter to `out`/`err` (default process.stdout/stderr); otherwise inherited.
+ * `rawStdout` (with `filter`): stdout chunks are copied to `out` unchanged (as Buffers); only stderr is filtered.
  */
-export function spawnRelay(cmd: string, argv: string[], opts: { filter: boolean; out?: Pick<NodeJS.WritableStream, 'write'>; err?: Pick<NodeJS.WritableStream, 'write'> }): Promise<number> {
+export function spawnRelay(cmd: string, argv: string[], opts: { filter: boolean; rawStdout?: boolean; out?: Pick<NodeJS.WritableStream, 'write'>; err?: Pick<NodeJS.WritableStream, 'write'> }): Promise<number> {
   return new Promise((resolve, reject) => {
     const child = spawn(cmd, argv, { stdio: opts.filter ? ['inherit', 'pipe', 'pipe'] : 'inherit', shell: false });
     if (opts.filter) {
-      relayStripped(child.stdout!, opts.out ?? process.stdout);
+      const out = opts.out ?? process.stdout;
+      if (opts.rawStdout) child.stdout!.on('data', (chunk: Buffer) => { out.write(chunk); });
+      else relayStripped(child.stdout!, out);
       relayStripped(child.stderr!, opts.err ?? process.stderr);
     }
     child.on('error', reject);

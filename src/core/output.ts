@@ -21,9 +21,18 @@ export function redact(text: string): string {
 
 const redactDeep = (v: unknown): unknown => JSON.parse(redact(JSON.stringify(v ?? null)));
 
+/**
+ * JSON.stringify with every control character escaped: it already escapes C0, but leaves DEL and C1
+ * (U+007F-U+009F) raw, which terminals interpret (U+009B is CSI, U+009D is OSC). The result is still
+ * valid JSON that parses to the same value, and safe to show on a terminal or pass through a filter.
+ */
+export function jsonLine(v: unknown): string {
+  return JSON.stringify(v).replace(/[\u007f-\u009f]/g, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`);
+}
+
 export function emit(data: unknown, opts: { json: boolean; human?: (d: any) => string }): void {
   if (opts.json) {
-    process.stdout.write(JSON.stringify({ ok: true, data: redactDeep(data) }) + '\n');
+    process.stdout.write(jsonLine({ ok: true, data: redactDeep(data) }) + '\n');
     return;
   }
   const text = opts.human ? opts.human(data) : typeof data === 'string' ? data : JSON.stringify(data, null, 2);
@@ -43,7 +52,7 @@ export function reportError(err: unknown, opts: { json: boolean }): number {
     const error: Record<string, unknown> = { code: e.code, message: redact(e.message) };
     if (e.hint) error.hint = redact(e.hint);
     if (e.details !== undefined) error.details = redactDeep(e.details);
-    process.stdout.write(JSON.stringify({ ok: false, error }) + '\n');
+    process.stdout.write(jsonLine({ ok: false, error }) + '\n');
   } else {
     process.stderr.write(`error [${e.code}]: ${terminalText(e.message)}\n`);
     if (e.hint) process.stderr.write(`hint: ${terminalText(e.hint)}\n`);
