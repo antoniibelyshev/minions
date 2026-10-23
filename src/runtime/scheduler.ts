@@ -357,7 +357,7 @@ export class Scheduler {
         throw new MinionsError('CAPACITY', `Active task limit reached (${cap.activeTaskIds.length}/${cfg.execution.maxActiveTasks}: ${cap.activeTaskIds.join(', ')}).`,
           'Finish, block, or release an active task first.', cap);
       }
-      const slots = cap.byRole[role];
+      const slots = Object.hasOwn(cap.byRole, role) ? cap.byRole[role] : undefined;
       if (slots?.limited && slots.active >= slots.max) {
         const label = role === ENGINEER_ROLE ? 'Engineer' : `Role ${role}`;
         throw new MinionsError('CAPACITY', `${label} limit reached (${slots.active}/${slots.max}).`, `Wait for a${role === ENGINEER_ROLE ? 'n' : ''} ${role} to finish.`, cap);

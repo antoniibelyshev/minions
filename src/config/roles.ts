@@ -78,7 +78,9 @@ export interface RoleDef {
 type RolesCfg = Partial<Pick<MinionsConfig, 'roles'>>;
 type Entries = Record<string, unknown>;
 const rolesOf = (cfg: RolesCfg): Entries => (cfg.roles ?? {}) as Entries;
-const overrideOf = (cfg: RolesCfg, name: BuiltinWorkerRole): BuiltinRoleOverride | undefined => rolesOf(cfg)[name] as BuiltinRoleOverride | undefined;
+/** Own-property lookup: never finds keys inherited from Object.prototype (`constructor`, `__proto__`, ...). */
+const ownEntry = <T>(obj: Record<string, T> | undefined, key: string): T | undefined => (obj && Object.hasOwn(obj, key) ? obj[key] : undefined);
+const overrideOf = (cfg: RolesCfg, name: BuiltinWorkerRole): BuiltinRoleOverride | undefined => ownEntry(rolesOf(cfg), name) as BuiltinRoleOverride | undefined;
 
 /** Configured project roles (not the built-in overrides), in config order. */
 export function customRoles(cfg: RolesCfg): [string, CustomRoleConfig][] {
@@ -139,7 +141,7 @@ export function roleRegistry(cfg: DefCfg): RoleDef[] {
 export function workerRole(cfg: DefCfg, name: string): RoleDef | undefined {
   const base = baseRoleName(cfg, name);
   if (isBuiltinWorkerRole(base)) return builtinDef(cfg, base);
-  const r = rolesOf(cfg)[base] as CustomRoleConfig | undefined;
+  const r = ownEntry(rolesOf(cfg), base) as CustomRoleConfig | undefined;
   return r && roleNameProblem(base) === null ? customDef(cfg, base, r) : undefined;
 }
 
@@ -164,7 +166,7 @@ export function baseRoleName(cfg: RolesCfg, name: string): string {
   if (!name.endsWith(DEEP_SUFFIX)) return name;
   const base = name.slice(0, -DEEP_SUFFIX.length);
   if (base === ENGINEER_ROLE) return base;
-  const r = rolesOf(cfg)[base] as CustomRoleConfig | undefined;
+  const r = ownEntry(rolesOf(cfg), base) as CustomRoleConfig | undefined;
   return r && !isBuiltinWorkerRole(base) && r.deepVariant ? base : name;
 }
 
@@ -173,7 +175,7 @@ export function baseRoleName(cfg: RolesCfg, name: string): string {
  * `execution.maxEngineers`; undefined = bounded only by maxActiveTasks.
  */
 export function roleLimit(cfg: Pick<MinionsConfig, 'execution'>, role: Role): number | undefined {
-  const byRole = cfg.execution.maxByRole?.[role];
+  const byRole = ownEntry(cfg.execution.maxByRole, role);
   if (byRole !== undefined) return byRole;
   return role === ENGINEER_ROLE ? cfg.execution.maxEngineers : undefined;
 }
@@ -183,7 +185,7 @@ export function roleLimit(cfg: Pick<MinionsConfig, 'execution'>, role: Role): nu
  * coordinator) > `models.effort`; undefined = Claude Code default.
  */
 export function roleEffort(cfg: Pick<MinionsConfig, 'models'> & RolesCfg, role: Role): Effort | undefined {
-  const own = role === COORDINATOR_ROLE ? undefined : (rolesOf(cfg)[role] as { effort?: Effort } | undefined)?.effort;
+  const own = role === COORDINATOR_ROLE ? undefined : (ownEntry(rolesOf(cfg), role) as { effort?: Effort } | undefined)?.effort;
   const byRole = (BUILTIN_ROLES as readonly string[]).includes(role)
     ? cfg.models.effortByRole?.[role as (typeof BUILTIN_ROLES)[number]]
     : undefined;
@@ -208,7 +210,7 @@ export interface RoleSubRule { effect: Effect; roles: string[]; paths?: string[]
  */
 export function roleColumnRules(cfg: RolesCfg, role: string, capability: Capability): RoleSubRule[] {
   if (isBuiltinRole(role)) return [];
-  const r = rolesOf(cfg)[role] as CustomRoleConfig | undefined;
+  const r = ownEntry(rolesOf(cfg), role) as CustomRoleConfig | undefined;
   if (!r || roleNameProblem(role) !== null) return [];
   const worktree = r.worktree ?? (r.contract === 'gate' ? 'review' : 'branch');
   const edits = worktree === 'review' ? 'none' : (r.edits ?? 'none');
@@ -267,7 +269,7 @@ export function roleConfigIssues(c: MinionsConfig): ConfigIssue[] {
   const engineerByRole = maxByRole?.[ENGINEER_ROLE];
   if (maxEngineers !== undefined && engineerByRole !== undefined && maxEngineers !== engineerByRole) {
     push('execution.maxEngineers', `is an alias of execution.maxByRole.engineer and must agree with it (${maxEngineers} != ${engineerByRole}); set only maxByRole.engineer`);
-  } else if (maxEngineers !== undefined && maxEngineers > maxActiveTasks) {
+  } else if (engineerByRole === undefined && maxEngineers !== undefined && maxEngineers > maxActiveTasks) {
     push('execution.maxEngineers', `must be <= execution.maxActiveTasks (${maxEngineers} > ${maxActiveTasks})`);
   }
   return issues;

@@ -3,7 +3,7 @@ import { can } from '../src/config/capabilities.js';
 import { resolve, validateConfig } from '../src/config/resolve.js';
 import {
   BUILTIN_WORKER_ROLES, CUSTOM_ROLE_DENY_BY_DEFAULT, baseRoleName, engineerDeepEffort, isRegisteredRole, registeredRoleNames,
-  roleEffort, roleLimit, roleNameProblem, roleRegistry, workerRole, workerRoleNames,
+  roleColumnRules, roleEffort, roleLimit, roleNameProblem, roleRegistry, workerRole, workerRoleNames,
 } from '../src/config/roles.js';
 import { CAPABILITIES, type MinionsConfig } from '../src/config/schema.js';
 import { MinionsError } from '../src/core/errors.js';
@@ -190,6 +190,24 @@ describe('policy columns', () => {
     expect(table[0]).toBe('| Capability | coordinator | engineer | tester | reviewer | researcher | Path rules |');
     expect(table[1]).toBe('| - | - | - | - | - | - | - |');
     expect(table.find((l) => l.startsWith('| pr.merge |'))).toBe('| pr.merge | ask | ask | ask | ask | deny |  |');
+  });
+});
+
+describe('prototype keys', () => {
+  it('are not roles, limits or column rules unless configured', () => {
+    const d = defaults();
+    for (const n of ['constructor', '__proto__', 'toString']) {
+      expect(workerRole(d, n)).toBeUndefined();
+      expect(roleColumnRules(d, n, 'code.edit')).toEqual([]);
+    }
+    const cfg = validateConfig({ ...d, execution: { ...d.execution, maxByRole: { tester: 1 } } });
+    expect(roleLimit(cfg, 'constructor')).toBeUndefined();
+    expect(roleLimit(cfg, 'toString')).toBeUndefined();
+  });
+
+  it('a project role may still be named constructor', () => {
+    const cfg = withRoles({ constructor: researcher });
+    expect(workerRole(cfg, 'constructor')).toMatchObject({ builtin: false, contract: 'producer' });
   });
 });
 
