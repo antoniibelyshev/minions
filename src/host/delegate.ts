@@ -24,7 +24,8 @@ export async function delegateToRuntime(args: string[], opts: { json: boolean; c
   if (!(await compose.isRunning())) {
     throw new MinionsError('PRECONDITION', 'The project container is not running.', 'Run `minions start` (or `minions start --no-attach`) first.');
   }
-  return compose.execInherit(argv, { tty: false });
+  // --json stdout must stay byte-exact for parsers; the JSON emitter already escapes all control characters.
+  return compose.execInherit(argv, { tty: false, rawStdout: argv.includes('--json') });
 }
 
 /** @deprecated name kept for existing callers; delegates to the configured runtime. */
