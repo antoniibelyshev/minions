@@ -91,9 +91,11 @@ describe.skipIf(!hasCli)('fast listing edge cases vs task view (real CLI)', { ti
   const edit = (id: string, fn: (t: string) => string) => writeFileSync(file(id), fn(readFileSync(file(id), 'utf8')));
   const compare = async () => {
     const fast = fresh(), slow = fresh(false);
+    await fast.capabilities(); // asks `backlog --version` once (task-24.9); the listings below reuse the cached answer
+    const base = fast.spawnCount;
     const ft = await fast.listTasks();
     expect(ft).toEqual(await slow.listTasks());
-    const spawns = fast.spawnCount;
+    const spawns = fast.spawnCount - base;
     expect(await fast.listReady(50, new Set(), scope)).toEqual(await slow.listReady(50, new Set(), scope));
     return { tasks: ft, spawns };
   };

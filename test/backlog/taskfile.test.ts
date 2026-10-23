@@ -144,7 +144,7 @@ describe('task file parser', () => {
   });
 });
 
-describe.skipIf(!hasCli)('fast listing vs task view (real CLI)', () => {
+describe.skipIf(!hasCli)('fast listing vs task view (real CLI)', { timeout: 30_000 }, () => {
   let root: string;
   let a: BacklogMdAdapter;
   const scope = { milestone: null, requiredLabels: [], allowedPaths: ['**'] };
@@ -154,12 +154,14 @@ describe.skipIf(!hasCli)('fast listing vs task view (real CLI)', () => {
   /** Fast and view paths agree on listTasks and listReady; returns the fast path's spawn counts. */
   const compare = async () => {
     const fast = fresh(), slow = fresh(false);
+    await fast.capabilities(); // asks `backlog --version` once (task-24.9); the listings below reuse the cached answer
+    const base = fast.spawnCount;
     const [ft, st] = [await fast.listTasks(), await slow.listTasks()];
     expect(ft).toEqual(st);
-    const listSpawns = fast.spawnCount;
+    const listSpawns = fast.spawnCount - base;
     const [fr, sr] = [await fast.listReady(50, new Set(), scope), await slow.listReady(50, new Set(), scope)];
     expect(fr).toEqual(sr);
-    return { tasks: ft, listSpawns, readySpawns: fast.spawnCount - listSpawns };
+    return { tasks: ft, listSpawns, readySpawns: fast.spawnCount - base - listSpawns };
   };
 
   beforeAll(async () => {
@@ -187,7 +189,7 @@ describe.skipIf(!hasCli)('fast listing vs task view (real CLI)', () => {
     cli('task', 'create', 'To archive');
     cli('task', 'archive', 'TASK-4');
     cli('task', 'create', 'A draft', '--draft');
-  });
+  }, 60_000);
   afterAll(() => rmSync(root, { recursive: true, force: true }));
 
   it('gives identical Tasks (and versions) to task view with one Backlog.md process per listing', async () => {

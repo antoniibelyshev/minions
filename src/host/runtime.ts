@@ -24,6 +24,7 @@ import { moveKeychainTokensToFileStore, type MovedToken } from './credentials.js
 import { KEY_HELPER_TTL_MS, authOf, isKeyAuth, resolveOnPath } from './auth.js';
 import { packageRoot, type Runner } from './docker.js';
 import type { ProjectJson } from './project.js';
+import { fastPathHint } from '../backlog/taskfile.js';
 
 export { RUNTIMES, RuntimeKindSchema, runtimeOf, type RuntimeKind } from './runtime-kind.js';
 
@@ -251,10 +252,11 @@ export class HostRuntime {
 
 export interface HostTool { name: string; required: boolean; ok: boolean; version: string | null; hint: string; detail: string }
 
-const TOOLS: { name: string; args: string[]; required: boolean; hint: string; tested?: string; purpose: string }[] = [
+/** `note`: extra detail for an installed version (e.g. a slower code path it selects); null adds nothing. */
+const TOOLS: { name: string; args: string[]; required: boolean; hint: string; tested?: string; purpose: string; note?: (version: string) => string | null }[] = [
   { name: 'tmux', args: ['-V'], required: true, hint: 'brew install tmux', purpose: 'runs the coordinator session' },
   { name: 'claude', args: ['--version'], required: true, hint: 'npm install -g @anthropic-ai/claude-code (or brew install --cask claude-code)', tested: '2.1.292', purpose: 'Claude Code' },
-  { name: 'backlog', args: ['--version'], required: true, hint: 'npm install -g backlog.md@1.54.0', tested: '1.54.0', purpose: 'Backlog.md CLI' },
+  { name: 'backlog', args: ['--version'], required: true, hint: 'npm install -g backlog.md@1.54.0', tested: '1.54.0', purpose: 'Backlog.md CLI', note: fastPathHint },
   { name: 'git', args: ['--version'], required: true, hint: 'xcode-select --install (or brew install git)', purpose: 'workspace clone' },
   { name: 'gh', args: ['--version'], required: false, hint: 'brew install gh (needed only for pull-request delivery)', purpose: 'GitHub CLI' },
 ];
@@ -269,8 +271,9 @@ export async function hostTools(runner: Runner = run, env: NodeJS.ProcessEnv = p
     const ok = r.code === 0;
     const version = ok ? firstLine(r.stdout || r.stderr) : null;
     const untested = ok && t.tested && !version!.includes(t.tested) ? ` (tested with ${t.tested})` : '';
+    const note = ok && t.note ? t.note(version!) : null;
     out.push({ name: t.name, required: t.required, ok, version, hint: t.hint,
-      detail: ok ? `${version}${untested}` : `${t.name} not found on PATH (${t.purpose})` });
+      detail: ok ? `${version}${untested}${note ? `; ${note}` : ''}` : `${t.name} not found on PATH (${t.purpose})` });
   }
   return out;
 }

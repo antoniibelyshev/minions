@@ -66,8 +66,10 @@ describe.skipIf(!hasCli)('plain-scalar allowlist vs task view (real CLI)', { tim
       }
     }
     const fast = new BacklogMdAdapter({ root, idempotency: new MemoryIdempotencyStore() });
+    await fast.capabilities(); // asks `backlog --version` once (task-24.9); the listing below reuses the cached answer
+    const base = fast.spawnCount;
     fastTasks = await fast.listTasks();
-    fastSpawns = fast.spawnCount;
+    fastSpawns = fast.spawnCount - base;
     // Fallback tasks were already viewed by the fast listing; only the accepted ones need a task view to compare.
     const slow = new BacklogMdAdapter({ root, idempotency: new MemoryIdempotencyStore(), readFiles: false });
     const listedIds = new Set(fastTasks.map((t) => t.id));
