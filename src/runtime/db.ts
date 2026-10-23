@@ -7,7 +7,13 @@ import { runtimePaths } from './paths.js';
 
 export const SCHEMA_VERSION = 5;
 
-export type LeaseRole = 'engineer' | 'tester' | 'reviewer';
+/** The built-in worker roles (always registered). */
+export type BuiltinLeaseRole = 'engineer' | 'tester' | 'reviewer';
+/**
+ * A lease's worker role: a built-in or a project role registered in the config (src/config/roles.ts),
+ * validated against the registry at claim. Leases in the DB keep their role text.
+ */
+export type LeaseRole = string;
 /** active: worker running (or awaiting a correction); completed: valid result; released: no result; unvalidated: invalid after correction. */
 export type LeaseStatus = 'active' | 'completed' | 'released' | 'unvalidated';
 

@@ -1,5 +1,6 @@
 import { z } from 'zod';
-import type { LeaseRole } from './db.js';
+import { ROLE_CONTRACTS, type RoleContract } from '../config/schema.js';
+import type { BuiltinLeaseRole } from './db.js';
 
 export const RESULT_STATUSES = ['complete', 'needs_changes', 'blocked', 'needs_split', 'partial'] as const;
 export type ResultStatus = (typeof RESULT_STATUSES)[number];
@@ -72,12 +73,7 @@ function parseText(raw: string): { value?: unknown; error?: string } {
   return { error };
 }
 
-/**
- * Validates a worker result (object or JSON text). With a role, also checks role rules:
- * only reviewers give a verdict; reviewer `complete` means `approve`, `needs_changes` means `request-changes`;
- * a tester/reviewer `complete` may not report failing checks; CI-sourced checks need ciAuthority "github"
- * and a tester/reviewer role (whether CI really passed for the head is decided by the runtime gate).
- */
+/** Options of validateResult. */
 export interface ValidateOptions {
   /** verification.ciAuthority; with "none" (or unset) CI-sourced checks are rejected. */
   ciAuthority?: 'none' | 'github';
@@ -85,7 +81,25 @@ export interface ValidateOptions {
 
 export const isCiCheck = (c: { source?: 'local' | 'ci' }): boolean => c.source === 'ci';
 
-export function validateResult(raw: unknown, role?: LeaseRole, opts: ValidateOptions = {}): ValidationOutcome {
+/** Contract variant of a built-in worker (engineer = producer, tester = verifier, reviewer = gate). */
+const BUILTIN_CONTRACT: Record<BuiltinLeaseRole, RoleContract> = { engineer: 'producer', tester: 'verifier', reviewer: 'gate' };
+/** How the rule texts name a variant (the built-in role that has it, so existing wording stays readable). */
+const VARIANT_LABEL: Record<RoleContract, string> = { producer: 'producer (engineer)', verifier: 'verifier (tester)', gate: 'gate (reviewer)' };
+
+/** A contract variant, or the built-in worker role whose variant it is (back-compat: `validateResult(raw, 'reviewer')`). */
+export type ContractRef = RoleContract | BuiltinLeaseRole;
+export const contractOfRef = (ref: ContractRef): RoleContract =>
+  (ROLE_CONTRACTS as readonly string[]).includes(ref) ? ref as RoleContract : BUILTIN_CONTRACT[ref as BuiltinLeaseRole];
+
+/**
+ * Validates a worker result (object or JSON text). With a contract variant (D4; a built-in role name maps to
+ * its variant), also checks the variant's rules: only a gate gives a verdict or sets needsQa; a gate
+ * `complete` means `approve`, `needs_changes` means `request-changes`; a verifier/gate `complete` may not
+ * report failing checks; CI-sourced checks need ciAuthority "github" and a verifier/gate (whether CI really
+ * passed for the head is decided by the runtime gate). `blocked`, `needs_split` and `partial` mean the same
+ * for every variant.
+ */
+export function validateResult(raw: unknown, contractRef?: ContractRef, opts: ValidateOptions = {}): ValidationOutcome {
   let value = raw;
   if (typeof raw === 'string') {
     const p = parseText(raw);
@@ -98,23 +112,42 @@ export function validateResult(raw: unknown, role?: LeaseRole, opts: ValidateOpt
   }
   const res = r.data;
   const errors: string[] = [];
-  if (role && role !== 'reviewer' && res.verdict !== undefined) errors.push(`verdict: only reviewer results carry a verdict (role ${role})`);
-  if (role && role !== 'reviewer' && res.needsQa !== undefined) errors.push(`needsQa: only reviewer results can request a QA stage (role ${role})`);
+  const contract = contractRef === undefined ? undefined : contractOfRef(contractRef);
+  const as = contract ? `contract ${VARIANT_LABEL[contract]}` : '';
+  if (contract && contract !== 'gate' && res.verdict !== undefined) errors.push(`verdict: only reviewer (gate) results carry a verdict (${as})`);
+  if (contract && contract !== 'gate' && res.needsQa !== undefined) errors.push(`needsQa: only reviewer (gate) results can request a QA stage (${as})`);
   const ci = res.checks.filter(isCiCheck);
   if (ci.length) {
     if (opts.ciAuthority !== 'github') errors.push('checks: CI evidence entries (source "ci") need verification.ciAuthority "github"; report the checks you ran locally');
-    if (role && role !== 'tester' && role !== 'reviewer') errors.push(`checks: only tester and reviewer results may cite CI evidence (role ${role}); engineers report the checks they ran`);
+    if (contract === 'producer') errors.push(`checks: only tester and reviewer (verifier and gate) results may cite CI evidence (${as}); producers report the checks they ran`);
     const skipped = ci.filter((c) => c.outcome === 'skipped').map((c) => c.command);
     if (skipped.length) errors.push(`checks: a CI evidence entry must be pass or fail, not skipped (${skipped.join(', ')})`);
   }
-  if ((role === 'tester' || role === 'reviewer') && res.status === 'complete') {
+  if ((contract === 'verifier' || contract === 'gate') && res.status === 'complete') {
     const failed = res.checks.filter((c) => c.outcome === 'fail').map((c) => c.command);
-    if (failed.length) errors.push(`checks: a complete ${role} result cannot report failing checks (${failed.join(', ')}); use needs_changes or blocked`);
+    if (failed.length) errors.push(`checks: a complete ${VARIANT_LABEL[contract]} result cannot report failing checks (${failed.join(', ')}); use needs_changes or blocked`);
   }
-  if (role === 'reviewer') {
-    if (res.status === 'complete' && res.verdict !== 'approve') errors.push('verdict: a complete reviewer result must have verdict "approve"');
+  if (contract === 'gate') {
+    if (res.status === 'complete' && res.verdict !== 'approve') errors.push('verdict: a complete reviewer (gate) result must have verdict "approve"');
     if (res.status === 'needs_changes' && res.verdict === 'approve') errors.push('verdict: needs_changes cannot carry verdict "approve"');
     if (res.status !== 'complete' && res.verdict === 'approve') errors.push('verdict: "approve" requires status "complete"');
   }
   return errors.length ? { ok: false, errors } : { ok: true, result: res };
+}
+
+/**
+ * The result-contract text of a brief (D4), rendered per variant: a producer is never told about `verdict`,
+ * `needsQa` or CI evidence; a gate is told its verdict rule and that the head must not move.
+ */
+export function resultContractText(contract: RoleContract, opts: { commits?: boolean } = {}): string {
+  const commits = opts.commits ?? contract !== 'gate';
+  const head = contract === 'gate' || !commits ? 'headSha (full SHA of the exact head you were given; you do not commit)' : 'headSha (full SHA of the branch head you leave)';
+  const source = contract === 'producer' ? '' : ', source?: local|ci (ci: a required CI check for this head; with ciAuthority github only)';
+  const gate = contract === 'gate' ? ', verdict: approve|request-changes (complete requires approve; needs_changes = request-changes), needsQa? (true: a tester must run before delivery)' : '';
+  const rule = contract === 'producer'
+    ? ' No verdict, needsQa or CI-sourced checks. complete = your stage is done; needs_changes = the task must be replanned.'
+    : contract === 'verifier'
+      ? ' No verdict or needsQa. complete = verified at the head you report (no failing checks); needs_changes = defects for the repair stage. Commits go on top of the head you were given (never rewrite it).'
+      : ' complete = approved at the head (no failing checks); needs_changes = request changes. The head must not move.';
+  return `Return exactly one JSON object: {status: complete|needs_changes|blocked|needs_split|partial, summary, branch, ${head}, modifiedPaths[], checks[{command, outcome: pass|fail|skipped, details?${source}}], acceptanceEvidence[{criterion, evidence}], findings[], nextAction${gate}, usage? (only when actually available)}.${rule}`;
 }

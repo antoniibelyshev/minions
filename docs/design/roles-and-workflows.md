@@ -367,6 +367,40 @@ Decisions taken while implementing the workflow model (`src/config/workflows.ts`
 - **Brief.** `stage: {workflow, position, count, role, model?}`; a stage model hint replaces `models.default` in
   `model`. Worktree kind, CI evidence and the result contract stay per built-in role until 33.4.
 
+## Implementation notes (task-33.4)
+
+- **Contract variants.** `validateResult(raw, contract, opts)` checks the D4 rules by variant; a built-in role name
+  is still accepted and maps to its variant (engineer = producer, tester = verifier, reviewer = gate), so the
+  built-in rules are unchanged. Error texts name the variant with its built-in (`only reviewer (gate) results ...`).
+  `resultContractText(contract, {commits})` renders the brief's `resultContract` per variant (producers never see
+  `verdict`, `needsQa` or CI sources; roles that do not commit are told to report the head they were given). The
+  built-in briefs therefore get the variant text too (the only built-in brief change).
+- **Roles in the scheduler.** `LeaseRole` is a string validated against the registry at claim (`exactWorkerRole`;
+  unknown = `INVALID_CONFIG`) and at record (a lease whose role was removed from the config is refused; release it).
+  Worktree kind comes from `role.worktree`; only a producer may start the branch; CI evidence and the brief's `ci`
+  gate are for verifiers/gates; the head rules are by contract (gate: pinned, verifier: on top, never rewritten).
+  The claim moves the task to the stage's `stageStatus` when it differs (the engineer's ready → implementing, as
+  before), and release / an unvalidated correction restores the pre-claim status of a producer, or of any stage
+  whose claim changed the status (generalized `restoreAfterEngineer`). A producer's `partial` returns to the
+  pre-claim status like the engineer's. Project-role briefs carry `editScope` (built-in briefs do not).
+- **Edit scope (D3).** At record, before the transition: a role that does not commit (or has `edits: none`) must
+  leave the head at the claim head; a role with `edits.paths` may only change matching paths in
+  `git diff --no-renames <claim head> <result head>` (a rename counts on both sides; the net diff counts, so new
+  commits that revert an out-of-scope change make the stage valid again). An uncomputable diff is a violation
+  (fail closed). A violation is an invalid result with the usual single correction. Built-in engineer/tester
+  (`edits: any`) are not checked; the reviewer's pinned head is the gate rule.
+- **`requires` (D8).** Checked at claim after the stage check and before any lease exists: `deny` and `ask` both
+  refuse with `POLICY_DENIED` naming the capability (`details: {capability, effect, awaitingHuman?}`); the `ask`
+  hint tells the coordinator to move the task to `awaiting-human` and ask the owner. The runtime does not change
+  the task status itself. Each refusal is a `stage-refused` event.
+- **Workflow change between stages (33.3 review nit).** At claim, when the stage row names another workflow than
+  the task's, the position resets by evidence at the current head (D5): the first stage without `complete`
+  evidence of its role (`when: qa` stages only when QA is required); all done = the final gate again. The status
+  moves to that stage's when it cannot be claimed from the current one (position 0: `changes-requested`), and a
+  `workflow-reset` event records it. A changed stage list of the *same* workflow (a config edit on the host) keeps
+  the status-derived position of 33.3 (pinned by its tests); revisit together with `work next` (33.5).
+- **Reserved names.** `check` and `ci-gate` (runtime evidence kinds) cannot be role names.
+
 ## Back-compat summary
 
 Existing configs validate unchanged (`roles`, `workflows`, `maxByRole` optional; `maxEngineers` and

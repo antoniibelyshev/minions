@@ -20,7 +20,7 @@ const loader = (env: Env) => () => ({ db: env.db, backlog: env.backlog, config: 
 const decision = (o: { stdout?: string }) => (o.stdout ? JSON.parse(o.stdout).hookSpecificOutput : undefined);
 const agent = (subagent_type: string, prompt: string) => ({ hook_event_name: 'PreToolUse', tool_name: 'Agent', tool_input: { subagent_type, prompt, description: 'x' } });
 
-/** Project-role leases cannot be claimed yet (stage machine: task-33.3/33.4); insert one as the claim would. */
+/** Inserts an active lease as a claim would (these hook tests need no task, worktree or workflow). */
 function lease(env: Env, role: string, taskId = 'task-1', id = `lease-${role}0001`): string {
   env.db.exec(`INSERT INTO leases (id, task_id, role, attempt, holder, worktree, branch, config_revision, started_at, status)
     VALUES (?, ?, ?, 1, NULL, ?, 'agent/x', 1, ?, 'active')`, id, taskId, role, env.layout.repo, new Date().toISOString());

@@ -1,5 +1,5 @@
 // CLI wiring of the role registry (task-33.2): `work claim|brief|submit --role` accept registered worker
-// roles only; a project role is recognized but its stages are not claimable before the workflow work.
+// roles only; project roles are claimable through the stage machine (task-33.4).
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { Command } from 'commander';
@@ -52,9 +52,11 @@ describe('work claim|brief|submit --role (runtime)', () => {
     }
   });
 
-  it('recognizes a configured project role: claim says its stages are not claimable yet, brief reaches the lease check', async () => {
+  it('recognizes a configured project role: claim passes the role check (task-33.4: project-role stages are claimable), brief reaches the lease check', async () => {
     const claim = await run('work', 'claim', 'task-1', '--role', 'researcher');
-    expect(claim.error).toMatchObject({ code: 'PRECONDITION', message: expect.stringMatching(/Role researcher is a project role/) });
+    // The role is accepted; the claim gets as far as the backlog (not initialized in this fixture).
+    expect(claim.error).toMatchObject({ code: 'PRECONDITION', message: expect.stringMatching(/Backlog\.md project not initialized/) });
+    expect(claim.error!.message).not.toMatch(/registered worker role|project role/);
     const brief = await run('work', 'brief', 'lease-abc', '--role', 'researcher');
     expect(brief.error).toMatchObject({ code: 'NOT_FOUND', message: expect.stringMatching(/Lease lease-abc does not exist/) });
   });

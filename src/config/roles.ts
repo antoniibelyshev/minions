@@ -28,11 +28,17 @@ export const ROLE_NAME_PATTERN = /^[a-z][a-z0-9-]{1,30}$/;
 /** Plugin skill names; a role may not shadow them (`minions:<name>`). */
 export const SKILL_NAMES = ['orchestrate', 'status', 'recover', 'intake', 'maintain-context'] as const;
 export const DEEP_SUFFIX = '-deep';
+/**
+ * Evidence kinds the runtime records next to role evidence (`evidence.kind` is the lease role otherwise): a
+ * role with one of these names would be confused with them (src/runtime/scheduler.ts passedAt).
+ */
+export const RESERVED_EVIDENCE_KINDS = ['check', 'ci-gate'] as const;
 
 /** Why `name` cannot be a project role, or null when it can. Built-in worker names are allowed (D9 overrides). */
 export function roleNameProblem(name: string): string | null {
   if (!ROLE_NAME_PATTERN.test(name)) return `role name must match ${ROLE_NAME_PATTERN.source}`;
   if (name === COORDINATOR_ROLE) return 'the coordinator is not a configurable role';
+  if ((RESERVED_EVIDENCE_KINDS as readonly string[]).includes(name)) return `"${name}" is reserved (an evidence kind of the runtime)`;
   if (name.endsWith(DEEP_SUFFIX)) return `role name must not end in "${DEEP_SUFFIX}" (use deepVariant)`;
   if ((SKILL_NAMES as readonly string[]).includes(name)) return `"${name}" is a minions skill name`;
   return null;
