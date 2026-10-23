@@ -10,6 +10,7 @@ The npm package is a thin Node launcher (`cli.js`). It spawns a prebuilt Bun bin
 - Errors go to **stderr**, the exit code is **1**, and stdout is empty. Error output is never JSON, even with `--json`.
 - `task create` has **no `--json`**. Parse the ID from stdout line 1, `Created task TASK-7`, or from line 2, `File: <abs path>`. Then call `task view <id> --json`.
 - `task list --json` does **not** include `description`, `dependencies`, AC items, notes, or comments. Use `task view <id> --json` for those.
+  No command returns full task bodies in bulk (`search --json` and `--watch` emit the same summaries), so listings read `backlog/tasks/*.md` in-process (`src/backlog/taskfile.ts`, task-24.1): one `task list --json` for the set, order and archived/draft filtering, then a strict parser for the file layout Backlog.md 1.54 writes. A file outside that layout (comments, legacy unmarked sections, unknown keys, CRLF, `[X]` boxes, AC index gaps, duplicate ids) or one that disagrees with its list summary falls back to `task view` for that task only. Writes still go through the CLI.
 - **Terminal ("completed") status is hard-coded as the LAST entry of `statuses`.** The name "done" means nothing special. Readiness, `isReady`, `--ready`, `dependencyGraph.nodes[].completed`, and `backlog cleanup` all use the last status. See "Statuses" below.
 - Statuses with hyphens work fine. You can't set them with `config set`. Write `config.yml` directly.
 - `task edit --dep` **replaces** the whole dependency list. It does not append.

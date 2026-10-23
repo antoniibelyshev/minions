@@ -1,9 +1,11 @@
+import { readdir, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { MinionsError } from '../core/errors.js';
 import { run } from '../core/exec.js';
 import { exists, sha256 } from '../core/fsutil.js';
 import { redact } from '../core/output.js';
 import { AUTHORIZED_LABEL, cycleIfAdded, filterReady } from './ready.js';
+import { matchesSummary, type ParsedTaskFile, parseTaskFile } from './taskfile.js';
 import type { BacklogAdapter, CreateTaskInput, IdempotencyStore, Provenance, ScopeFilter, Task, TaskStatus } from './types.js';
 
 export interface BacklogMdOptions {
@@ -15,8 +17,13 @@ export interface BacklogMdOptions {
   /** Profile allows starting ready tasks without the minions:authorized label. */
   startReady?: boolean;
   timeoutMs?: number;
-  /** Max concurrent `task view` calls in listTasks. */
+  /** Max concurrent `task view` calls in listings (only for tasks the file reader falls back on). */
   concurrency?: number;
+  /**
+   * Read task files in-process for listings (default true). False views every listed task with the CLI
+   * (the behaviour before task-24.1); tests use it to compare both paths.
+   */
+  readFiles?: boolean;
   /** Provenance of a task whose meta block is missing, malformed or has no valid provenance (see toTask). */
   provenanceFallback?: ProvenanceFallback;
 }
@@ -200,7 +207,10 @@ export class BacklogMdAdapter implements BacklogAdapter {
   private readonly timeoutMs: number;
   private readonly concurrency: number;
   private readonly provenanceFallback?: ProvenanceFallback;
+  private readonly readFiles: boolean;
   private initialized = false;
+  /** Backlog.md CLI processes this adapter started (diagnostics and tests). */
+  spawnCount = 0;
 
   constructor(opts: BacklogMdOptions) {
     this.root = opts.root ?? '/state/backlog';
@@ -210,6 +220,7 @@ export class BacklogMdAdapter implements BacklogAdapter {
     this.timeoutMs = opts.timeoutMs ?? 30_000;
     this.concurrency = Math.max(1, opts.concurrency ?? 4);
     this.provenanceFallback = opts.provenanceFallback;
+    this.readFiles = opts.readFiles ?? true;
   }
 
   private async cli(args: string[]): Promise<string> {
@@ -220,6 +231,7 @@ export class BacklogMdAdapter implements BacklogAdapter {
       }
       this.initialized = true;
     }
+    this.spawnCount++;
     const r = await run(this.bin, args, {
       cwd: this.root, allowFailure: true, timeoutMs: this.timeoutMs,
       env: { ...process.env, BACKLOG_CWD: this.root, NO_COLOR: '1', FORCE_COLOR: '0' },
@@ -255,6 +267,39 @@ export class BacklogMdAdapter implements BacklogAdapter {
     return (r.tasks ?? []).filter((t) => typeof t.id === 'string' && !t.archived);
   }
 
+  /**
+   * Full details for listed tasks (same order). Parsed in-process from `backlog/tasks/*.md` when the file
+   * has the layout Backlog.md writes and agrees with the list summary; viewed with the CLI otherwise. A
+   * listing costs one `task list` plus one `task view` per task the reader cannot vouch for (none for
+   * files Backlog.md wrote itself). Writes still go through the CLI.
+   */
+  private async details(list: RawTask[], tolerant: boolean): Promise<(RawTask | undefined)[]> {
+    const files = this.readFiles && list.length ? await this.readTaskFiles() : new Map<string, ParsedTaskFile | null>();
+    const out: (RawTask | undefined)[] = list.map((s) => {
+      const f = files.get(s.id);
+      return f && matchesSummary(f, s) ? { ...f } : undefined;
+    });
+    const missing = out.flatMap((r, i) => (r ? [] : [i]));
+    const viewed = await this.viewMany(missing.map((i) => list[i]!.id), tolerant);
+    missing.forEach((i, k) => { out[i] = viewed[k]; });
+    return out;
+  }
+
+  /** Parsed task files by id; null marks an id the reader cannot use (unparseable is absent, duplicates null). */
+  private async readTaskFiles(): Promise<Map<string, ParsedTaskFile | null>> {
+    const dir = join(this.root, 'backlog', 'tasks');
+    const out = new Map<string, ParsedTaskFile | null>();
+    let names: string[];
+    try { names = (await readdir(dir)).filter((n) => n.endsWith('.md')); } catch { return out; }
+    const parsed = await Promise.all(names.map(async (n) => {
+      try { return parseTaskFile(await readFile(join(dir, n), 'utf8')); } catch { return null; }
+    }));
+    for (const p of parsed) {
+      if (p) out.set(p.id, out.has(p.id) ? null : p);
+    }
+    return out;
+  }
+
   private task(raw: RawTask): Task { return toTask(raw, { startReady: this.startReady, provenanceFallback: this.provenanceFallback }); }
 
   /** Views ids with bounded concurrency; failed lookups are undefined when tolerant. */
@@ -278,7 +323,7 @@ export class BacklogMdAdapter implements BacklogAdapter {
 
   async listTasks(): Promise<Task[]> {
     const list = await this.listRaw();
-    const raws = await this.viewMany(list.map((t) => t.id), false);
+    const raws = await this.details(list, false);
     return raws.map((r) => this.task(r!));
   }
 
@@ -287,8 +332,8 @@ export class BacklogMdAdapter implements BacklogAdapter {
     const list = await this.listRaw();
     const summary = new Map(list.map((t) => [normalizeId(t.id), this.task(t)]));
     // Only candidates need full details (dependencies); dependency status comes from the list.
-    const candidates = list.filter((t) => mapStatus(t.status) === 'ready').map((t) => t.id);
-    const viewed = (await this.viewMany(candidates, true)).filter((r): r is RawTask => !!r).map((r) => this.task(r));
+    const candidates = list.filter((t) => mapStatus(t.status) === 'ready');
+    const viewed = (await this.details(candidates, true)).filter((r): r is RawTask => !!r).map((r) => this.task(r));
     return filterReady(viewed, { leased: new Set([...leasedIds].map(normalizeId)), scope, lookup: (id) => summary.get(id) }, limit);
   }
 
