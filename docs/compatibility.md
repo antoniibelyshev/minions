@@ -151,7 +151,10 @@ Steps, in order (names as in `--json`):
 2. `preflight` (read-only), `pause` (new starts, plus a drain request), `drain`. Workers commit work in
    progress (`wip:`) and return partial results; recovery re-dispatches their tasks. If workers outlast
    `--timeout`, the default aborts and resumes starts; `--now` releases them and reports them as
-   interrupted. Starts you paused yourself stay paused.
+   interrupted. Starts you paused yourself stay paused. A partial counts as a drain partial (no failed
+   attempt, no repair cycle) only when the worker hook delivered that lease the drain notice; each
+   delivery is a `drain-notice` event with the subagent's `agent_id` / `agent_type`, and
+   `minions status` shows the last one (`lastDrainNotice` in `--json`).
 3. `files`: regenerates compose.yaml, the runtime config and the plugin the container mounts from the
    installed package, and reports whether the plugin matches it (`plugin` in `--json`; files you edited
    are kept with a warning). `minions doctor` has a `plugin` check for the same staleness.
