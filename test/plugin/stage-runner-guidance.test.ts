@@ -55,6 +55,14 @@ describe('coordinator.md and orchestrate dispatch from work next', () => {
     expect(await (await gen())('skills/orchestrate/SKILL.md')).toMatch(/fits a configured workflow \(none configured yet\)/);
   });
 
+  it('proposing a role names the propose command and the host apply command (task-33.6)', async () => {
+    const read = await gen();
+    const orch = await read('skills/orchestrate/SKILL.md');
+    expect(orch).toMatch(/\*\*Proposing a role\*\*:.*store it with `minions config roles propose --file <f> --json`.*returns `proposalId`, a `summary`.*Nothing becomes effective\..*host command `minions config roles apply <proposalId>`.*never edit `\.minions\/\*\*` yourself/);
+    const coord = await read('coordinator.md');
+    expect(coord).toContain('- Roles: `minions config roles list|show|propose ... --json` (propose only; the owner applies a proposal on the host with `minions config roles apply <proposalId>`');
+  });
+
   it('configured workflows and per-role limits are rendered', async () => {
     const read = await gen(withWorkflows());
     const coord = await read('coordinator.md');

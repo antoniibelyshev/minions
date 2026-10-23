@@ -6,7 +6,7 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { Command } from 'commander';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
-import { RuntimeDb } from '../../src/runtime/db.js';
+import { RuntimeDb, SCHEMA_VERSION } from '../../src/runtime/db.js';
 import { defaults } from '../helpers.js';
 import { tmp } from './fixtures.js';
 
@@ -192,6 +192,22 @@ describe('host-only operations inside the runtime', () => {
 });
 
 describe('role_proposals table', () => {
+  it('migration 6 adds the table to a v5 database', () => {
+    const path = join(tmp(), 'm.db');
+    const v5 = new RuntimeDb(path);
+    v5.exec('DROP TABLE role_proposals');
+    v5.setMeta('schema_version', '5');
+    v5.close();
+    const up = new RuntimeDb(path);
+    try {
+      expect(SCHEMA_VERSION).toBe(6);
+      expect(up.getMeta('schema_version')).toBe('6');
+      up.addRoleProposal({ id: 'rp_00000009', name: 'a', json: '{}' });
+      expect(up.roleProposals()).toHaveLength(1);
+    } finally { up.close(); }
+  });
+
+
   it('migrates, supersedes per name and marks applied idempotently', () => {
     const db = new RuntimeDb(':memory:');
     try {
