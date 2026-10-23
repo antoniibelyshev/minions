@@ -322,6 +322,23 @@ describe('Telegram tools are coordinator-only', () => {
     const auto = await gen();
     expect(await auto.read('coordinator.md')).toContain('Communication channel: auto (Telegram when a bot token is provisioned for this project, otherwise terminal)');
   });
+
+  it('task-51: the coordinator knows how to recover a dropped channel; workers never launch nested claude sessions', async () => {
+    const { read } = await gen(telegram());
+    const coord = await read('coordinator.md');
+    expect(coord).toMatch(/\*\*When the channel drops\*\*.*`minions status` shows a `telegram poller` problem/);
+    expect(coord).toContain('run /mcp and reconnect plugin:telegram:telegram');
+    expect(coord).toContain('`minions coordinator restart --recover`');
+    expect(coord).toMatch(/Never launch nested claude sessions .* and never ask a worker to/);
+    for (const [role] of WORKER_AGENTS) {
+      const md = await read(`agents/${role}.md`);
+      expect(md, role).toMatch(/Never launch nested Claude Code sessions \(`claude -p`/);
+      expect(md, role).toMatch(/channel plugins against the live state dir/);
+    }
+    // Also in terminal mode: the rule is about the container's live state, not the configured channel.
+    const terminal = defaults(); terminal.communication.channel = 'terminal';
+    expect(await (await gen(terminal)).read('agents/engineer.md')).toMatch(/Never launch nested Claude Code sessions/);
+  });
 });
 
 describe('models.effort / models.coordinator', () => {

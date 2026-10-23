@@ -17,7 +17,6 @@ function fakeClaude(state: { marketplaces: unknown[]; plugins: Record<string, un
     if (a === 'plugin list --json') return ok(JSON.stringify(state.plugins));
     if (a === 'plugin marketplace add anthropics/claude-plugins-official') { state.marketplaces.push(official); return ok(); }
     if (a === `plugin install ${TELEGRAM_PLUGIN_ID} --scope user`) { state.plugins.push(plugin()); return ok(); }
-    if (a === `plugin enable ${TELEGRAM_PLUGIN_ID}`) { state.plugins[0]!.enabled = true; return ok(); }
     return { code: 1, stdout: '', stderr: `unexpected: ${a}` };
   };
   return { calls, runner };
@@ -34,13 +33,14 @@ describe('minions telegram install', () => {
     expect(flat.some((c) => /--plugin-dir|plugin update/.test(c))).toBe(false);
   });
 
-  it('is idempotent and enables a disabled install; warns on unverified versions', async () => {
+  it('is idempotent, never re-enables a plugin that is off at user scope (task-51); warns on unverified versions', async () => {
     const present = fakeClaude({ marketplaces: [official], plugins: [plugin()] });
     expect(await installTelegramPlugin({ runner: present.runner })).toMatchObject({ marketplace: 'present', plugin: 'present' });
     expect(present.calls.every((c) => c.includes('--json'))).toBe(true);
     const disabled = fakeClaude({ marketplaces: [official], plugins: [plugin({ enabled: false, version: '0.1.0' })] });
     const r = await installTelegramPlugin({ runner: disabled.runner });
-    expect(r.plugin).toBe('enabled');
+    expect(r.plugin).toBe('present');
+    expect(disabled.calls.some((c) => c.includes('enable'))).toBe(false);
     expect(r.warnings.join()).toMatch(/0\.1\.0 is not a verified version/);
   });
 

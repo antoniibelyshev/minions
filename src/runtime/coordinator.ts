@@ -14,7 +14,8 @@ import { basename, dirname, isAbsolute, join, sep } from 'node:path';
 import { runtimeMode } from '../core/cli-helpers.js';
 import { redact } from '../core/output.js';
 import { CONTAINER, credentialStoreDir } from '../core/paths.js';
-import { probeTelegram, TELEGRAM_CHANNEL_SPEC, type TelegramProbeReport } from '../telegram/probe.js';
+import { probeTelegram, TELEGRAM_CHANNEL_SPEC, TELEGRAM_PLUGIN_ID, type TelegramProbeReport } from '../telegram/probe.js';
+import { checkTelegramPoller, disableTelegramAtUserScope, type PollerCheck, type UserScopeResult } from '../telegram/isolation.js';
 import { checkTelegramTokenFormat } from '../telegram/token.js';
 import { HOST_TELEGRAM_REASON, resolveChannel, type ChannelFacts } from '../telegram/channel.js';
 import { runtimePaths, type RuntimePaths } from './paths.js';
@@ -316,6 +317,9 @@ export function coordinatorSettings(cfg: MinionsConfig, opts: { telegram?: boole
     // definitions are deferred, not sent in full every turn) and no bundled skills; plugin skills stay.
     ...(cfg.coordinator?.toolSearch === false ? {} : { env: { ENABLE_TOOL_SEARCH: 'true' } }),
     ...(cfg.coordinator?.bundledSkills ? {} : { disableBundledSkills: true }),
+    // Task-51: the plugin is off at user scope (runCoordinator, src/telegram/isolation.ts); only this
+    // launch enables it, so no other claude session in the container starts a competing poller.
+    ...(opts.telegram ? { enabledPlugins: { [TELEGRAM_PLUGIN_ID]: true } } : {}),
     ...(opts.telegram ? {
       hooks: { PreToolUse: [{ matcher: TELEGRAM_HOOK_MATCHER, hooks: [{ type: 'command', command: TELEGRAM_HOOK_COMMAND, timeout: HOOK_SETTINGS_TIMEOUT_S }] }] },
     } : {}),
@@ -600,6 +604,8 @@ export interface RunCoordinatorDeps {
   preSpawn?: PreSpawnGuard;
   /** Process table for stopping claude's MCP children on SIGKILL (default: /proc). */
   proc?: ProcessControl;
+  /** Turns the Telegram plugin off at user scope before claude starts (default: disableTelegramAtUserScope on paths.claudeUserSettings). */
+  userScope?: (file: string, opts: { create: boolean }) => Promise<UserScopeResult>;
 }
 
 /** Signals that end the wrapper cleanly before claude starts (Ctrl-C there is meant for the wrapper). */
@@ -691,6 +697,15 @@ export async function runCoordinator(cfg: MinionsConfig, deps: RunCoordinatorDep
   const perm = decidePermissionMode(cfg, { modes: permissionModes });
   if (perm.fallback) log(`minions: ${perm.reason}`);
   const c = await buildClaudeCommand(cfg, paths, { telegram: decision.enabled, startupPrompt: deps.startupPrompt, permissionModes });
+  if (cancelled() !== null) return cancelled()!;
+  // Task-51: the plugin stays off at user scope, so only this launch (its --settings enabledPlugins)
+  // loads it. Re-applied on every launch: existing setups get it on the next start, restart or upgrade.
+  // The host runtime loads no user settings at all.
+  if (runtimeMode() !== 'host-runtime') {
+    const u = await (deps.userScope ?? disableTelegramAtUserScope)(paths.claudeUserSettings, { create: decision.enabled }).catch((e: unknown) => ({ state: 'error' as const, detail: (e as Error).message }));
+    if (u.state === 'disabled') log(`minions: ${u.detail}.`);
+    else if (u.state === 'error') log(`minions: warning: could not turn the Telegram plugin off at user scope (${u.detail}); other claude sessions in this container may take over the bot.`);
+  }
   // Before the launch record: a cancelled wrapper must not overwrite its successor's record.
   if (cancelled() !== null) return cancelled()!;
   const env: NodeJS.ProcessEnv = { ...(deps.env ?? process.env) };
@@ -1103,6 +1118,19 @@ export async function coordinatorLaunchStatus(cfg: MinionsConfig, deps: { paths?
   return { state: 'stale', reason: rec.channel !== cfg.communication.channel
     ? `communication.channel changed since the coordinator launched (${rec.channel} -> ${cfg.communication.channel})`
     : 'Telegram configuration changed since the coordinator launched (bot token or network)' };
+}
+
+/**
+ * Task-51: whether the Telegram poller (bot.pid in the plugin's state dir) is the running coordinator's.
+ * Applies only when the launch record says the coordinator has Telegram; the record's pid is the
+ * wrapper, an ancestor of claude's MCP servers. Never throws.
+ */
+export async function telegramPollerStatus(deps: { paths?: RuntimePaths; proc?: Pick<ProcessControl, 'alive' | 'cmdline' | 'parentOf'>; readText?: (p: string) => Promise<string> } = {}): Promise<PollerCheck> {
+  const paths = deps.paths ?? runtimePaths();
+  const rec = await readLaunchRecord(paths);
+  if (!rec) return { state: 'not-applicable', detail: 'no coordinator launch recorded' };
+  return checkTelegramPoller({ pidFile: join(paths.telegramStateDir, 'bot.pid'), coordinatorPid: rec.pid, telegram: rec.telegram.enabled, proc: deps.proc ?? systemProcessControl, readText: deps.readText })
+    .catch((e: unknown) => ({ state: 'unknown' as const, detail: (e as Error).message }));
 }
 
 /**

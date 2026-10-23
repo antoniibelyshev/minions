@@ -96,6 +96,13 @@ export function runtimePaths(env: NodeJS.ProcessEnv = process.env, opts: { inCon
     apiKeyFile: join(secretsDir, 'anthropic-api-key'),
     tmuxSocket: env.MINIONS_TMUX_SOCKET || null,
     /** The official plugin's state dir (same resolution as the plugin: TELEGRAM_STATE_DIR, else CLAUDE_CONFIG_DIR/channels/telegram). */
+    /**
+     * User-scope Claude Code settings the coordinator's claude reads (CLAUDE_CONFIG_DIR/settings.json).
+     * runCoordinator turns the Telegram plugin off here (task-51: only the coordinator launch enables it).
+     * Like the scratch root, a redirected state dir without CLAUDE_CONFIG_DIR (tests) keeps it inside
+     * that state dir, so a test never edits the real ~/.claude/settings.json.
+     */
+    claudeUserSettings: join(env.CLAUDE_CONFIG_DIR || (env.MINIONS_STATE_DIR ? join(state, 'claude') : env.MINIONS_RUNTIME === 'host' ? join(homedir(), '.claude') : c.claudeHome), 'settings.json'),
     telegramStateDir: env.TELEGRAM_STATE_DIR || join(env.CLAUDE_CONFIG_DIR || (env.MINIONS_RUNTIME === 'host' ? join(homedir(), '.claude') : c.claudeHome), 'channels', 'telegram'),
     /** Written by `minions coordinator run`: what the running coordinator was launched with (no secrets). */
     coordinatorLaunch: join(state, 'coordinator-launch.json'),

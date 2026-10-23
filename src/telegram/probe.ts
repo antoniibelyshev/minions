@@ -126,9 +126,12 @@ function pluginItem(f: TelegramFacts): ProbeItem {
     return { name: 'plugin', status: 'missing', detail: `${TELEGRAM_PLUGIN_ID} is not installed`, hint: `claude plugin install ${TELEGRAM_PLUGIN_ID} --scope user` };
   }
   const where = `${TELEGRAM_PLUGIN_ID} ${typeof p.version === 'string' ? p.version : '(unknown version)'} (scope ${String(p.scope ?? '?')})`;
-  if (p.enabled === false) return { name: 'plugin', status: 'missing', detail: `${where} is installed but disabled`, hint: `claude plugin enable ${TELEGRAM_PLUGIN_ID}` };
   const refused = Array.isArray(p.noteDetails) && p.noteDetails.some((n) => isObj(n) && n.type === 'dependencies-refused');
-  return { name: 'plugin', status: 'ok', detail: `${where} installed and enabled${refused ? '; Claude Code reported its dependencies were not installed (Bun missing at install time)' : ''}` };
+  const deps = refused ? '; Claude Code reported its dependencies were not installed (Bun missing at install time)' : '';
+  // Task-51: off at user scope is the intended state (src/telegram/isolation.ts): the coordinator launch
+  // enables it with --settings enabledPlugins, so no other claude session starts its poller.
+  if (p.enabled === false) return { name: 'plugin', status: 'ok', detail: `${where} installed; off at user scope, enabled only by the coordinator launch${deps}` };
+  return { name: 'plugin', status: 'ok', detail: `${where} installed and enabled at user scope (the next coordinator launch turns it off there, enabling it only for itself)${deps}` };
 }
 
 function policyItem(f: TelegramFacts): ProbeItem {

@@ -1,6 +1,7 @@
 // `minions telegram install` (container): installs the official Telegram channel plugin at user
 // scope into the project's claude volume (CLAUDE_CONFIG_DIR). It is never loaded with --plugin-dir,
-// so the channel keeps its allowlisted id plugin:telegram@claude-plugins-official. Never updates an
+// so the channel keeps its allowlisted id plugin:telegram@claude-plugins-official. Never re-enables it
+// at user scope (only the coordinator launch enables it, task-51). Never updates an
 // installed plugin (`claude plugin update` stays an explicit user action). Needs network, no login.
 import { MinionsError } from '../core/errors.js';
 import { run } from '../core/exec.js';
@@ -12,7 +13,7 @@ export const VERIFIED_PLUGIN_VERSIONS: readonly string[] = ['0.0.7'];
 
 export interface TelegramInstallResult {
   marketplace: 'present' | 'added';
-  plugin: 'present' | 'installed' | 'enabled';
+  plugin: 'present' | 'installed';
   version: string | null;
   warnings: string[];
 }
@@ -58,10 +59,9 @@ export async function installTelegramPlugin(opts: { runner?: Runner } = {}): Pro
     plugin = 'installed';
     p = await find();
     if (!p) throw new MinionsError('INCOMPATIBLE_RUNTIME', `${TELEGRAM_PLUGIN_ID} is not listed after installation.`);
-  } else if (p.enabled === false) {
-    await step(runner, ['plugin', 'enable', TELEGRAM_PLUGIN_ID], `Enabling ${TELEGRAM_PLUGIN_ID}`);
-    plugin = 'enabled';
   }
+  // Off at user scope is intended (task-51, src/telegram/isolation.ts): never re-enabled here. The
+  // coordinator launch turns it off at user scope and enables it for itself only.
   const version = typeof p.version === 'string' ? p.version : null;
   if (!version || !VERIFIED_PLUGIN_VERSIONS.includes(version)) {
     warnings.push(`${TELEGRAM_PLUGIN_ID} ${version ?? '(unknown version)'} is not a verified version (${VERIFIED_PLUGIN_VERSIONS.join(', ')}); behavior may differ (docs/compatibility.md).`);
