@@ -104,6 +104,16 @@ describe('coordinator restart --recover', () => {
     expect(JSON.parse(rows[0]!.data_json)).toMatchObject({ reason: 'restart requested', leases: [], recover: true });
     expect(JSON.parse(db.getMeta('coordinator_restart')!)).toMatchObject({ recover: true });
   });
+
+  it('plain restart still runs during a drain: the host upgrade relies on it (only --detach refuses, task-49)', async () => {
+    const db = openDb(join(tmp('minions-restart-db-'), 'runtime.db'));
+    db.setDrain('upgrade');
+    const t = tmux(true);
+    const r = await restartCoordinator(defaults(), { paths: layout(), runner: t.runner, activeLeases: () => db.activeLeases(), recordRestart: coordinatorRestartRecorder(db), sleep: noSleep }, { recover: true });
+    expect(r).toMatchObject({ action: 'restarted', running: true });
+    expect(t.calls.some((a) => a[0] === 'kill-session')).toBe(true);
+    expect(db.drain()).toMatchObject({ reason: 'upgrade' }); // the drain is left to the upgrade
+  });
 });
 
 function fakeSpawn() {
