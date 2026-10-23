@@ -396,6 +396,43 @@ describe('minions setup', () => {
     check(blocked);
   });
 
+  it('every printed command in the intake, auto-merge, CI and dry-run branches also names the repository', async () => {
+    const repo = githubRepo("my repo's dir");
+    const rt = fakeRuntime();
+    const a = scripted({ 'Installation visibility': 'private', 'Set up GitHub integration': 'n', 'Delivery mode': 'pull-request', 'Use CI?': 'y', 'Import GitHub issues into the backlog?': 'y', 'Enable auto-merge?': 'y' });
+    // token piped in: pull-request delivery, CI step reads required checks (none), auto-merge not usable yet
+    const r = await runSetup({ path: repo, yes: false, io: a.io, runtime: rt.runtime, dockerProbe: dockerUp, tokens: { github: GH_TOKEN }, fetch: githubApi().f });
+    const q = `'${r.init.plan.repoPath.replace(/'/g, `'\\''`)}'`;
+    const inRepo = (c: string) => `\`cd ${q} && ${c}\``;
+    const check = (text: string) => {
+      for (const m of text.matchAll(/\`([^\`]*minions [^\`]*)\`/g)) {
+        expect(m[1]!.startsWith(`cd ${q} && `) || m[1] === `minions setup ${q}`, m[1]).toBe(true);
+      }
+    };
+    // The wizard's own plan text (before the integration steps) is not part of the setup steps.
+    const stepInfo = (info: string[]) => info.slice(info.findIndex((l) => l.includes('minions can import GitHub issues'))).join('\n');
+    check(stepInfo(a.info) + '\n' + formatSetup(r));
+    expect(a.info.join('\n')).toContain(inRepo('minions sync'));
+    expect(a.info.join('\n')).toContain(inRepo('minions work approve <taskId> --head <sha> --merge'));
+    expect(a.info.join('\n')).toContain(inRepo('minions doctor'));
+    expect(step(r, 'intake').detail).toContain(inRepo('minions sync'));
+    expect(step(r, 'autoMerge').detail).toContain(inRepo('minions doctor'));
+    // declining auto-merge on a project that has it on
+    const off = scripted({ 'Enable auto-merge?': 'n' });
+    const r2 = await runSetup({ path: repo, yes: false, io: off.io, runtime: rt.runtime, dockerProbe: dockerUp, fetch: githubApi().f });
+    expect(step(r2, 'autoMerge').detail).toContain(inRepo('minions sync'));
+    check(formatSetup(r2));
+    // dry run
+    const repo3 = githubRepo("my repo's dir 3");
+    const d = await runSetup({ path: repo3, yes: false, dryRun: true, io: scripted().io, runtime: rt.runtime, dockerProbe: dockerUp });
+    const q3 = `'${d.init.plan.repoPath.replace(/'/g, `'\\''`)}'`;
+    expect(step(d, 'intake').detail).toContain(`\`cd ${q3} && minions sync\``);
+    const planned = formatSetup(d); // the init plan above the setup plan is shared with `minions init`
+    for (const m of planned.slice(planned.indexOf('Setup plan')).matchAll(/\`([^\`]*minions [^\`]*)\`/g)) {
+      expect(m[1]!.startsWith(`cd ${q3} && `) || m[1] === `minions setup ${q3}`, m[1]).toBe(true);
+    }
+  });
+
   it('rerun with "change" reruns the wizard with the existing values as defaults; integrations can be changed or disabled', async () => {
     const repo = githubRepo();
     const rt = fakeRuntime();
