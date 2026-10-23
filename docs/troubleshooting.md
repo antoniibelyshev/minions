@@ -40,7 +40,8 @@ minions import --state ~/backups/proj.tar.gz
 The archive is validated on the host and again in the runtime (manifest, checksums, allowed paths,
 regular files only, DB integrity and schema) before anything changes. The restore is refused
 (`CONFLICT`) while a worker lease is active or a live coordinator holds the project lock: let the
-workers finish or cancel them (`minions work cancel --all`), then rerun; or pass `--force`.
+workers finish or cancel them (`minions work cancel --all`), then rerun; or pass `--force`. Before a forced restore run `minions pause --starts`: a still-running
+coordinator could otherwise claim new leases before the restart.
 
 Leases the backup has marked active are released by the restore (no worker holds them in this
 runtime), and their tasks go back to the queue; worktrees and branches are kept. After `--force`,

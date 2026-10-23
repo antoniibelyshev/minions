@@ -357,4 +357,17 @@ describe('state restore: coordinator lock, restored leases, pre-restore pruning 
     expect(left).toEqual(prev.slice(-PRE_RESTORE_KEEP).map((x) => basename(x)));
     for (const n of left) expect(existsSync(join(dst.p.state, 'pre-restore', n, 'minions.db'))).toBe(true);
   });
+
+  it('never prunes the copy the current restore made, even when the clock is behind existing stamps', async () => {
+    const { src, file } = await backup(); src.db.close();
+    const dst = freshTarget();
+    for (let i = 0; i < PRE_RESTORE_KEEP + 1; i++) {
+      const d = join(dst.p.state, 'pre-restore', `2099-01-0${i + 1}T00-00-00-000Z`);
+      mkdirSync(d, { recursive: true });
+      writeFileSync(join(d, 'marker'), 'x');
+    }
+    const r = await restoreStateBackup(dst.p, file, { alive: () => false, now: new Date(Date.UTC(2026, 9, 23, 12, 0)) });
+    expect(existsSync(r.previous!)).toBe(true);
+    expect(readdirSync(join(dst.p.state, 'pre-restore')).length).toBeLessThanOrEqual(PRE_RESTORE_KEEP);
+  });
 });

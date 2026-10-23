@@ -359,7 +359,7 @@ export async function restoreStateBackup(paths: Pick<RuntimePaths, 'state' | 'db
           ...(lockLive ? [`a running coordinator (pid ${lock!.pid})`] : [])].join(' and ');
         if (!opts.force) {
           throw new MinionsError('CONFLICT', `Refusing to restore runtime state while it is in use: ${what}.`,
-            `Let the workers finish (minions status) or cancel them (minions work cancel --all), then rerun; or pass --force (leases the backup has active are released) and then ${RESTORE_RESTART_HINT}.`,
+            `Let the workers finish (minions status) or cancel them (minions work cancel --all), then rerun; or run minions pause --starts first (a running coordinator could claim new leases) and pass --force (leases the backup has active are released) and then ${RESTORE_RESTART_HINT}.`,
             { activeLeases: leases.map((l) => l.id), coordinatorPid: lockLive ? lock!.pid : null });
         }
         warnings.push(`Restored over ${what} (--force). Workers still running lose their lease (their submit is refused; worktrees and branches are kept). Now ${RESTORE_RESTART_HINT}.`);
@@ -424,7 +424,7 @@ export async function restoreStateBackup(paths: Pick<RuntimePaths, 'state' | 'db
   } finally {
     await rm(staging, { recursive: true, force: true });
   }
-  const pruned = await prunePreRestore(join(paths.state, 'pre-restore'), PRE_RESTORE_KEEP);
+  const pruned = await prunePreRestore(join(paths.state, 'pre-restore'), PRE_RESTORE_KEEP, previous);
   if (restoredActiveLeases.length) {
     warnings.push(`The backup has ${restoredActiveLeases.length} lease(s) marked active (${restoredActiveLeases.join(', ')}); no worker holds them in this runtime, so they are released.`);
   }
@@ -435,8 +435,9 @@ export async function restoreStateBackup(paths: Pick<RuntimePaths, 'state' | 'db
   };
 }
 
-/** Removes empty `pre-restore/<stamp>` dirs and all but the newest `keep` others (stamps sort by time). */
-export async function prunePreRestore(dir: string, keep: number): Promise<string[]> {
+/** Removes empty `pre-restore/<stamp>` dirs and all but the newest `keep` others (stamps sort by time).
+ * `protect` (the copy this restore just made) is never removed and counts as one of the kept. */
+export async function prunePreRestore(dir: string, keep: number, protect: string | null = null): Promise<string[]> {
   const names = (await readdir(dir).catch(() => [] as string[])).sort();
   const removed: string[] = [];
   const kept: string[] = [];
@@ -446,7 +447,9 @@ export async function prunePreRestore(dir: string, keep: number): Promise<string
     if (!st?.isDirectory()) continue;
     if ((await readdir(p).catch(() => ['?'])).length === 0) { await rmdir(p).catch(() => undefined); removed.push(p); } else kept.push(p);
   }
-  for (const p of kept.slice(0, Math.max(0, kept.length - keep))) {
+  const others = kept.filter((p) => p !== protect);
+  const room = Math.max(0, keep - (protect && kept.includes(protect) ? 1 : 0));
+  for (const p of others.slice(0, Math.max(0, others.length - room))) {
     await rm(p, { recursive: true, force: true });
     removed.push(p);
   }
