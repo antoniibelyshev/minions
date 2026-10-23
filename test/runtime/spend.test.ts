@@ -1,5 +1,5 @@
 import { Command } from 'commander';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type { MinionsError } from '../../src/core/errors.js';
 import { collectStatus, humanStatus, register as registerRuntime, spendCommand } from '../../src/runtime/commands.js';
 import { RuntimeDb } from '../../src/runtime/db.js';
@@ -90,7 +90,9 @@ describe('durable usage tally', () => {
     ]);
     reopened.close();
 
+    vi.stubEnv('MINIONS_AUTH_METHOD', 'subscription'); // hermetic: the container itself may use api-key billing
     const status = await collectStatus({ db: env.db, config: env.config, backlog: async () => env.backlog });
+    vi.unstubAllEnvs();
     expect(status.spend?.total.tokens).toBe(155947);
     expect(status.spend?.budget).toBeNull();
     expect(humanStatus(status)).toMatch(/spend \(subscription\): total 155,947 tokens, 2 attempt\(s\)/);

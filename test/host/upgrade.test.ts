@@ -1,14 +1,16 @@
 // `minions upgrade` core with a fake Runner behind the real Compose and ensureImage: step order, lease
 // drain (wait / timeout / --now), fingerprint-gated rebuild, volume and backlog preservation, failure paths.
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, cpSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { RunOptions, RunResult } from '../../src/core/exec.js';
 import { projectPaths } from '../../src/core/paths.js';
 import { Compose, buildFingerprint } from '../../src/host/docker.js';
+import { checkPlugin, pluginMismatch, refreshDerived, runInit } from '../../src/host/install.js';
+import { loadEffectiveConfig, loadProjectJson } from '../../src/host/project.js';
 import type { ImportResult } from '../../src/host/transfer.js';
 import { STATUS_RETRY_MS, UPGRADE_RELEASE_REASON, formatUpgrade, inheritedPause, runUpgrade, upgradeTimeout, type InterruptHooks, type LeaseInfo, type UpgradeMarker, type UpgradeOptions } from '../../src/host/upgrade.js';
-import { tempDir, withHome } from './fixtures.js';
+import { dockerUp, makeRepo, tempDir, withHome } from './fixtures.js';
 
 const ID = '3f2b8c1e-7d4a-4e9b-9c2f-1a2b3c4d5e6f';
 const TAG = 'minions-runtime:test';
@@ -881,5 +883,82 @@ describe('upgradeTimeout (--timeout)', () => {
     for (const bad of ['', ' ', '-1', '1.5', 'abc', '1e3', '0x10']) {
       expect(() => upgradeTimeout(bad, false)).toThrow(/--timeout must be a whole number of seconds/);
     }
+  });
+});
+
+// task-46: after the cli step rebuilds/reinstalls the CLI, the files step runs in the new CLI (the hand-off)
+// and renders the plugin from the new package, so the directory the container mounts is current.
+describe('plugin regeneration after a CLI rebuild in the same upgrade run', () => {
+  const NEW_LINE = 'NEW PACKAGE: hand results off with `minions work submit`.';
+  let prevTemplates: string | undefined;
+  beforeEach(() => { prevTemplates = process.env.MINIONS_TEMPLATES; });
+  afterEach(() => { if (prevTemplates === undefined) delete process.env.MINIONS_TEMPLATES; else process.env.MINIONS_TEMPLATES = prevTemplates; });
+  const templates = (name: string) => {
+    const dir = join(home.root, name); // removed with the test home
+    cpSync(join(import.meta.dirname, '..', '..', 'templates', 'plugin'), join(dir, 'plugin'), { recursive: true });
+    return dir;
+  };
+
+  it('the continued run regenerates the mounted plugin from the rebuilt package and reports that it matches', async () => {
+    const oldPkg = templates('old-pkg');
+    const newPkg = templates('new-pkg');
+    for (const f of ['agents/engineer.md', 'coordinator.md']) appendFileSync(join(newPkg, 'plugin', f), `\n${NEW_LINE}\n`);
+    // Installed with the old package.
+    process.env.MINIONS_TEMPLATES = oldPkg;
+    const init = await runInit({ path: makeRepo(home.root), yes: true, visibility: 'private', dockerProbe: dockerUp });
+    const project = await loadProjectJson(init.plan.projectId);
+    const config = (await loadEffectiveConfig(project)).config;
+    const pluginDir = projectPaths(project.projectId).pluginDir;
+    const engineer = join(pluginDir, 'agents', 'engineer.md');
+    expect(readFileSync(engineer, 'utf8')).not.toContain(NEW_LINE);
+
+    const w = world();
+    const h = harness(w);
+    const order: string[] = [];
+    const r = await runUpgrade(h.opts({
+      projectId: project.projectId,
+      // The old process must not refresh anything: everything after the cli step runs in the new CLI.
+      refresh: async () => { throw new Error('the old CLI must not regenerate files'); },
+      source: async () => {
+        order.push('cli: rebuilt');
+        // The hand-off: the new CLI (a fresh process whose templates are the new package's) runs the rest.
+        process.env.MINIONS_TEMPLATES = newPkg;
+        const continued = await runUpgrade(h.opts({
+          projectId: project.projectId,
+          refresh: async () => { order.push('files'); return refreshDerived(project, config); },
+          checkPlugin: async () => pluginMismatch(await checkPlugin(project, config)),
+        }));
+        return { steps: [{ id: 'cli', status: 'done', detail: 'rebuilt' }], ok: true, sync: null, cli: null, stop: null, continued };
+      },
+    }));
+    expect(order).toEqual(['cli: rebuilt', 'files']);
+    expect(r.ok).toBe(true);
+    expect(r.continued).toBe(true);
+    // The plugin regeneration lands before the recreate, so the new container mounts the new definitions.
+    expect(h.events.indexOf('files')).toBeLessThan(h.events.indexOf('recreate'));
+    expect(readFileSync(engineer, 'utf8')).toContain(NEW_LINE);
+    expect(readFileSync(join(pluginDir, 'coordinator.md'), 'utf8')).toContain(NEW_LINE);
+    expect(r.plugin).toEqual({ matches: true, detail: 'matches the installed package' });
+    expect(r.steps.find((s) => s.id === 'files')?.detail).toBe('derived files regenerated; plugin matches the installed package');
+  });
+
+  it('reports a plugin that still differs after the refresh (a file the user edited is kept)', async () => {
+    const w = world();
+    const h = harness(w);
+    const logs: string[] = [];
+    const r = await runUpgrade(h.opts({ log: (m) => logs.push(m), checkPlugin: async () => '1 file(s) differ from the installed package (coordinator.md)' }));
+    expect(r.ok).toBe(true);
+    expect(r.plugin).toEqual({ matches: false, detail: '1 file(s) differ from the installed package (coordinator.md)' });
+    expect(r.steps.find((s) => s.id === 'files')?.detail).toContain('plugin 1 file(s) differ from the installed package');
+    expect(logs).toContain('warning: plugin 1 file(s) differ from the installed package (coordinator.md)');
+    expect(formatUpgrade(r)).toContain('plugin 1 file(s) differ');
+  });
+
+  it('a failing plugin comparison is reported, not fatal', async () => {
+    const h = harness(world());
+    const r = await runUpgrade(h.opts({ checkPlugin: async () => { throw new Error('templates missing'); } }));
+    expect(r.ok).toBe(true);
+    expect(r.plugin?.matches).toBe(false);
+    expect(r.plugin?.detail).toContain('could not be compared with the installed package: templates missing');
   });
 });

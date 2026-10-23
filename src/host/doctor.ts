@@ -19,6 +19,7 @@ import { RESTART_COMMAND, checkRestartRequired, notApplicable, restartUnknown, t
 import { telegramDoctorCheck } from '../telegram/probe.js';
 import { resolveChannel, type ChannelResolution } from '../telegram/channel.js';
 import { loadEffectiveConfig, loadProjectJson } from './project.js';
+import { checkPlugin, pluginMismatch, type PluginCheck } from './install.js';
 import { projectForPath } from './registry.js';
 import { githubHints, inspectGithub } from './github-setup.js';
 import { HOST_RUNTIME_SHORT, HostRuntime, hostTools, prepareHostRuntime, runtimeOf } from './runtime.js';
@@ -414,6 +415,16 @@ async function hostRequiredChecks(project: { projectId: string; remoteUrl: strin
   return { rc: await requiredChecksStatus(fetchApi(token, f), `${r.owner}/${r.repo}`, config.git.baseBranch) };
 }
 
+/** The generated plugin (mounted read-only into the container) against what the installed package renders. */
+export function pluginDoctorCheck(c: PluginCheck | Error, hostRuntime = false): Check {
+  const refresh = hostRuntime ? '`minions down && minions start`' : '`minions upgrade` (or `minions down && minions start`)';
+  if (c instanceof Error) return { name: 'plugin', status: 'warn', detail: `could not compare the plugin with the installed package: ${short(c.message)}` };
+  const mismatch = pluginMismatch(c);
+  if (mismatch === null) return { name: 'plugin', status: 'ok', detail: `${c.files} file(s) match the installed package (minions ${VERSION})` };
+  return { name: 'plugin', status: 'warn', detail: `${c.dir}: ${mismatch}; the coordinator and workers run with these definitions`,
+    hint: `Run ${refresh} to regenerate it from the installed package; files you edited are kept (delete them to regenerate).` };
+}
+
 /** The `restart` check from the shared restart-required result. Never 'fail': it only advises `minions upgrade`. */
 export function restartCheck(r: RestartRequired): Check {
   const name = 'restart';
@@ -473,6 +484,7 @@ export async function runDoctor(opts: { cwd: string; runner?: Runner; probe?: Do
       effective = config = eff.config;
       add('config', 'ok', `valid (revision ${eff.config.configRevision}, package ${eff.config.packageVersion})`);
       for (const u of listUnavailable(eff.config)) add(`config.${u.path}`, 'unavailable', u.reason);
+      checks.push(pluginDoctorCheck(await checkPlugin(project, eff.config).catch((e: unknown) => e instanceof Error ? e : new Error(String(e))), hostMode));
     } catch (e) {
       add('config', 'fail', isMinionsError(e) ? e.message : String(e), 'Fix the configuration file, then rerun doctor.');
     }

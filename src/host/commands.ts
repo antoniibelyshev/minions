@@ -18,7 +18,7 @@ import { assertBotFree, startBotCheck } from './bot-guard.js';
 import { dockerProbe } from './discovery.js';
 import { Compose, ensureImage, packageRoot } from './docker.js';
 import { applyDoctorExit, formatDoctor, runDoctor } from './doctor.js';
-import { dockerUnavailable, formatInit, refreshDerived, runInit } from './install.js';
+import { checkPlugin, dockerUnavailable, formatInit, pluginMismatch, refreshDerived, runInit } from './install.js';
 import { loadEffectiveConfig, loadProjectJson } from './project.js';
 import { projectForPath } from './registry.js';
 import { exportRepo, importRepo } from './transfer.js';
@@ -460,6 +460,7 @@ export function register(program: Command): void {
         }),
         projectId: project.projectId, imageTag: project.imageTag, compose, timeoutSec, now: o.now, dryRun,
         refresh: async () => refreshDerived(project, (await loadEffectiveConfig(project)).config),
+        checkPlugin: async () => pluginMismatch(await checkPlugin(project, (await loadEffectiveConfig(project)).config)),
         importRepo: () => importRepo(project, { repoPath: ref.repoPath }),
         materialize: () => materializeSecrets(project.projectId),
         log: (m) => say(json, m),
