@@ -31,6 +31,8 @@
     "schema": "node esbuild.config.mjs --schema-only",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
+    "coverage": "vitest run --coverage",
+    "qa:perf": "npm run build && node scripts/qa-perf.mjs",
     "pack": "npm run build && npm pack",
     "e2e": "bash scripts/e2e.sh",
     "e2e:host": "bash scripts/e2e-host.sh",
@@ -39,6 +41,7 @@
   "dependencies": {},
   "devDependencies": {
     "@types/node": "^22.20.5",
+    "@vitest/coverage-v8": "^4.1.12",
     "commander": "^15.0.0",
     "esbuild": "^0.28.2",
     "typescript": "^5.9.3",
