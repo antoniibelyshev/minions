@@ -4,8 +4,9 @@
 // path), on x86_64 or aarch64. Every attempt is a Perl script inside the sandbox; the outside view
 // (listener logs, the outside process's signals, nice value and affinity, fixture metadata) is checked too.
 //
-// `it.fails` marks known gaps found in QA (TCP Fast Open, metadata writes, scheduling of outside
-// processes). When the helper closes a gap, that test starts failing: drop its `.fails`.
+// The TCP Fast Open, metadata-write (chmod/utime/setxattr) and outside-scheduling escapes found in the
+// first QA pass are now closed by the seccomp filter and its chmod user-notification handler; the matching
+// tests assert they stay closed. A separate test proves git still works (path chmod inside the worktree).
 import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
 import { accessSync, constants, existsSync } from 'node:fs';
 import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
@@ -231,17 +232,17 @@ describe.skipIf(!REAL || !SYS || !PERL)('minions-sandbox escape attempts (real h
         for (const a of ['127.0.0.1', '::1', '::ffff:127.0.0.1']) expect(out.results.get(`tcp-connect:${a}`), a).toMatchObject({ ok: false });
       });
 
-      it.fails('KNOWN GAP: TCP Fast Open (sendto MSG_FASTOPEN) does not reach a port outside tcpConnectPorts', () => {
+      it('TCP Fast Open (sendto MSG_FASTOPEN) does not reach a port outside tcpConnectPorts', () => {
         expect(out.results.get('tcp-fastopen:127.0.0.1')).toMatchObject({ ok: false });
         expect(out.outsideView.tcp).toEqual([]);
       });
 
-      it.fails('KNOWN GAP: no chmod, utime or setxattr on a protected file', () => {
+      it('no chmod, utime or setxattr on a protected file', () => {
         for (const n of ['chmod:protected', 'utime:protected', 'setxattr:protected']) expect(out.results.get(n), n).toMatchObject({ ok: false });
         expect(out.outsideView.protectedMetadataChanged).toBe(false);
       });
 
-      it.fails('KNOWN GAP: no setpriority, sched_setaffinity or ioprio_set on a process outside the sandbox', () => {
+      it('no setpriority, sched_setaffinity or ioprio_set on a process outside the sandbox', () => {
         for (const n of ['setpriority:outside', 'sched_setaffinity:outside', 'ioprio_set:outside']) expect(out.results.get(n), n).toMatchObject({ ok: false });
         expect(out.outsideView.niceChanged || out.outsideView.affinityChanged).toBe(false);
       });
@@ -278,5 +279,46 @@ sleep 1; exit 0;
       // A broken helper leaves the tree behind (the runaway chain keeps forking): sweep it.
       for (let i = 0; i < 200 && leftovers().length; i++) for (const l of leftovers()) { try { process.kill(Number(l.split(' ')[0]), 'SIGKILL'); } catch { /* gone */ } }
     }
+  }, 40_000);
+
+  // The chmod user-notification handler must still let the harness's own git work: git chmods its loose
+  // objects, lock files and the executable bit on checked-out files, all inside the writable worktree.
+  const GIT = ['/usr/bin/git', '/bin/git'].find((p) => existsSync(p));
+  const SH = ['/bin/sh'].find((p) => existsSync(p));
+  it.skipIf(!GIT || !SH)('git still works inside the sandbox (path chmod on files in the worktree is allowed)', async () => {
+    const base = join(root, 'git');
+    const scratch = join(base, 'scratch');
+    await mkdir(join(base, 'common', 'objects'), { recursive: true });
+    await mkdir(scratch, { recursive: true });
+    const rules = buildSandboxRules({
+      role: { name: 'engineer', contract: 'producer', harness: 'codex' }, leaseId: 'lease-git',
+      layout: { scratchDir: scratch, gitObjectsDir: join(base, 'common', 'objects'), harnessDir: null },
+      protectedPaths: [join(base, 'common')],
+    });
+    const rulesFile = join(base, 'rules.json');
+    await writeFile(rulesFile, serializeRules(rules), { mode: 0o600 });
+    const script = String.raw`
+set -e
+export HOME="${scratch}" GIT_CONFIG_NOSYSTEM=1
+export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
+cd "${scratch}"
+git init -q repo
+cd repo
+printf '#!/bin/sh\nexit 0\n' > run.sh
+chmod 0755 run.sh
+echo data > file.txt
+git add -A
+git commit -qm first
+echo changed > file.txt
+git checkout -- file.txt
+test -x run.sh && echo EXEC_BIT_KEPT
+echo "content: $(cat file.txt)"
+echo GIT_OK
+`;
+    const r = await run(bin, ['--rules', rulesFile, '--', SH!, '-c', script], { allowFailure: true, timeoutMs: 30_000 });
+    expect(r.stdout, r.stderr).toContain('GIT_OK');
+    expect(r.stdout).toContain('EXEC_BIT_KEPT');
+    expect(r.stdout).toContain('content: data');
+    expect(r.code).toBe(0);
   }, 40_000);
 });

@@ -56,7 +56,11 @@
 #include <linux/filter.h>
 #include <linux/seccomp.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <poll.h>
+#include <sys/ioctl.h>
 #include <sys/prctl.h>
+#include <sys/signalfd.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -108,6 +112,15 @@
 #endif
 #ifndef SECCOMP_RET_KILL_PROCESS
 # define SECCOMP_RET_KILL_PROCESS 0x80000000U
+#endif
+#ifndef SECCOMP_RET_USER_NOTIF
+# define SECCOMP_RET_USER_NOTIF 0x7fc00000U
+#endif
+#ifndef SECCOMP_SET_MODE_FILTER
+# define SECCOMP_SET_MODE_FILTER 1
+#endif
+#ifndef SECCOMP_FILTER_FLAG_NEW_LISTENER
+# define SECCOMP_FILTER_FLAG_NEW_LISTENER (1UL << 3)
 #endif
 #define X32_SYSCALL_BIT 0x40000000U
 
@@ -504,16 +517,197 @@ static uint64_t fs_rights(unsigned access, int is_dir, uint64_t handled) {
   return r & handled;
 }
 
+/* Each 64-bit syscall argument is two 32-bit words in struct seccomp_data; load the low or the high
+ * word by endianness. ARG0_LOW is kept for the socket() family check below. */
 #if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
-# define ARG0_LOW offsetof(struct seccomp_data, args[0])
+# define ARG_LO(i) (offsetof(struct seccomp_data, args[i]))
+# define ARG_HI(i) (offsetof(struct seccomp_data, args[i]) + 4)
 #else
-# define ARG0_LOW (offsetof(struct seccomp_data, args[0]) + 4)
+# define ARG_LO(i) (offsetof(struct seccomp_data, args[i]) + 4)
+# define ARG_HI(i) (offsetof(struct seccomp_data, args[i]))
 #endif
+#define ARG0_LOW ARG_LO(0)
+
+/* These blocks leave the accumulator holding the syscall number on the "not this syscall" path, so the
+ * next block can keep matching; on the "this syscall" path every branch returns, so A is never stale. */
+
+/* Unconditional deny by number (2 insns). */
 #define DENY_NR(nr, err) \
   BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, (nr), 0, 1), \
   BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | (err))
 
-static void install_seccomp(void) {
+/* Hand <nr> to the supervisor over the user-notification fd, which allows it only when its target path is
+ * inside the writable set and performs it TOCTOU-safely, else returns EPERM (2 insns). */
+#define NOTIFY_NR(nr) \
+  BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, (nr), 0, 1), \
+  BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_USER_NOTIF)
+
+/* Deny <nr> when the given argument's low word has any bit of <mask> set, else allow (5 insns).
+ * MSG_FASTOPEN lives in the low word, so only the low word is tested. */
+#define DENY_FLAG(nr, argidx, mask, err) \
+  BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, (nr), 0, 4), \
+  BPF_STMT(BPF_LD | BPF_W | BPF_ABS, ARG_LO(argidx)), \
+  BPF_JUMP(BPF_JMP | BPF_JSET | BPF_K, (mask), 0, 1), \
+  BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | (err)), \
+  BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW)
+
+/* Allow <nr> only when argument <argidx> is 0 (self: pid/who 0), else deny (7 insns). Both 32-bit words
+ * must be 0, so a negative value (a process group, or -1 for "every process") is also denied. */
+#define DENY_UNLESS_SELF(nr, argidx, err) \
+  BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, (nr), 0, 6), \
+  BPF_STMT(BPF_LD | BPF_W | BPF_ABS, ARG_HI(argidx)), \
+  BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 3), \
+  BPF_STMT(BPF_LD | BPF_W | BPF_ABS, ARG_LO(argidx)), \
+  BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 1), \
+  BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW), \
+  BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | (err))
+
+#ifndef __NR_fchmodat2
+# define __NR_fchmodat2 452
+#endif
+#ifndef MSG_FASTOPEN
+# define MSG_FASTOPEN 0x20000000
+#endif
+#ifndef TCP_FASTOPEN_CONNECT
+# define TCP_FASTOPEN_CONNECT 30
+#endif
+
+/* ------------------------------------------------------------------ user-notification handler for the
+ * path-based chmod syscalls. It runs in the supervisor, outside the Landlock domain, and allows a chmod
+ * only when its target resolves inside the writable set; it then performs the chmod on the pinned inode
+ * (TOCTOU-safe), so a symlink swap after the check cannot redirect it. */
+
+/* A file descriptor is carried over a connected AF_UNIX socket with SCM_RIGHTS: the child creates the
+ * notification fd after close_range, so it cannot simply be inherited; it is sent to the supervisor. */
+static int send_fd(int sock, int fd) {
+  char cbuf[CMSG_SPACE(sizeof(int))];
+  char data = 'F';
+  struct iovec io = { &data, 1 };
+  struct msghdr msg;
+  memset(&msg, 0, sizeof msg);
+  memset(cbuf, 0, sizeof cbuf);
+  msg.msg_iov = &io;
+  msg.msg_iovlen = 1;
+  msg.msg_control = cbuf;
+  msg.msg_controllen = sizeof cbuf;
+  struct cmsghdr *cm = CMSG_FIRSTHDR(&msg);
+  cm->cmsg_level = SOL_SOCKET;
+  cm->cmsg_type = SCM_RIGHTS;
+  cm->cmsg_len = CMSG_LEN(sizeof(int));
+  memcpy(CMSG_DATA(cm), &fd, sizeof(int));
+  ssize_t n;
+  do { n = sendmsg(sock, &msg, 0); } while (n < 0 && errno == EINTR);
+  return n < 0 ? -1 : 0;
+}
+
+static int recv_fd(int sock) {
+  char cbuf[CMSG_SPACE(sizeof(int))];
+  char data = 0;
+  struct iovec io = { &data, 1 };
+  struct msghdr msg;
+  memset(&msg, 0, sizeof msg);
+  memset(cbuf, 0, sizeof cbuf);
+  msg.msg_iov = &io;
+  msg.msg_iovlen = 1;
+  msg.msg_control = cbuf;
+  msg.msg_controllen = sizeof cbuf;
+  ssize_t n;
+  do { n = recvmsg(sock, &msg, MSG_CMSG_CLOEXEC); } while (n < 0 && errno == EINTR);
+  if (n <= 0) return -1;
+  for (struct cmsghdr *cm = CMSG_FIRSTHDR(&msg); cm; cm = CMSG_NXTHDR(&msg, cm)) {
+    if (cm->cmsg_level == SOL_SOCKET && cm->cmsg_type == SCM_RIGHTS && cm->cmsg_len == CMSG_LEN(sizeof(int))) {
+      int fd;
+      memcpy(&fd, CMSG_DATA(cm), sizeof(int));
+      return fd;
+    }
+  }
+  return -1;
+}
+
+/* Read a NUL-terminated path from another process's memory at <addr>. */
+static int read_remote_path(pid_t pid, unsigned long long addr, char *buf, size_t len) {
+  char mp[64];
+  snprintf(mp, sizeof mp, "/proc/%d/mem", (int)pid);
+  int fd = open(mp, O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return -1;
+  size_t got = 0;
+  while (got < len - 1) {
+    ssize_t k = pread(fd, buf + got, len - 1 - got, (off_t)(addr + got));
+    if (k < 0) { if (errno == EINTR) continue; close(fd); return -1; }
+    if (k == 0) break;
+    for (ssize_t i = 0; i < k; i++) if (buf[got + i] == '\0') { close(fd); return 0; }
+    got += (size_t)k;
+  }
+  close(fd);
+  return -1; /* no terminator within PATH_MAX: reject */
+}
+
+/* True when <canon> (an already-resolved absolute path) is one of, or beneath, the rules' writable dirs. */
+static int path_within_writable(const struct rules *r, const char *canon) {
+  size_t cl = strlen(canon);
+  for (size_t i = 0; i < r->nfs; i++) {
+    if (!(r->fs[i].access & A_WRITE) || strcmp(r->fs[i].path, "/dev/null") == 0) continue;
+    char resolved[PATH_MAX];
+    if (!realpath(r->fs[i].path, resolved)) continue;
+    size_t wl = strlen(resolved);
+    if (cl == wl && memcmp(canon, resolved, wl) == 0) return 1;
+    if (cl > wl && memcmp(canon, resolved, wl) == 0 && canon[wl] == '/') return 1;
+  }
+  return 0;
+}
+
+/* Resolve the chmod target in the caller's filesystem view, verify it is writable, and chmod the pinned
+ * inode. Returns 0 on success or a negated errno for the worker. */
+static long chmod_in_writable(const struct rules *r, pid_t pid, int dirfd, unsigned long long pathaddr, mode_t mode) {
+  char path[PATH_MAX];
+  if (read_remote_path(pid, pathaddr, path, sizeof path) < 0) return -ENAMETOOLONG;
+  char basepath[64];
+  int base;
+  if (path[0] == '/') { snprintf(basepath, sizeof basepath, "/proc/%d/root", (int)pid); base = open(basepath, O_PATH | O_CLOEXEC); }
+  else if (dirfd == AT_FDCWD) { snprintf(basepath, sizeof basepath, "/proc/%d/cwd", (int)pid); base = open(basepath, O_PATH | O_DIRECTORY | O_CLOEXEC); }
+  else { snprintf(basepath, sizeof basepath, "/proc/%d/fd/%d", (int)pid, dirfd); base = open(basepath, O_PATH | O_DIRECTORY | O_CLOEXEC); }
+  if (base < 0) return -errno;
+  const char *rel = path[0] == '/' ? path + 1 : path;
+  if (!*rel) rel = ".";
+  /* O_PATH without O_NOFOLLOW follows the final symlink as chmod would; the fd then pins that inode. */
+  int tfd = openat(base, rel, O_PATH | O_CLOEXEC);
+  int oerr = errno;
+  close(base);
+  if (tfd < 0) return -oerr;
+  char link[64], canon[PATH_MAX];
+  snprintf(link, sizeof link, "/proc/self/fd/%d", tfd);
+  ssize_t cl = readlink(link, canon, sizeof canon - 1);
+  if (cl < 0) { int e = errno; close(tfd); return -e; }
+  canon[cl] = '\0';
+  if (!path_within_writable(r, canon)) { close(tfd); return -EPERM; }
+  /* chmod the inode by its magic /proc/self/fd link: swapping the original path cannot redirect it. */
+  long rc = fchmodat(AT_FDCWD, link, mode & 07777, 0) < 0 ? -errno : 0;
+  close(tfd);
+  return rc;
+}
+
+/* Service one pending notification on the listener fd. */
+static void handle_notif(int listener, const struct rules *r) {
+  struct seccomp_notif req;
+  memset(&req, 0, sizeof req);
+  if (ioctl(listener, SECCOMP_IOCTL_NOTIF_RECV, &req) < 0) return; /* EINTR / target vanished */
+  struct seccomp_notif_resp resp;
+  memset(&resp, 0, sizeof resp);
+  resp.id = req.id;
+  int nr = req.data.nr;
+  int dirfd = AT_FDCWD;
+  unsigned long long pathaddr;
+  mode_t mode;
+  if (nr == __NR_fchmodat || nr == __NR_fchmodat2) { dirfd = (int)req.data.args[0]; pathaddr = req.data.args[1]; mode = (mode_t)req.data.args[2]; resp.error = (int)chmod_in_writable(r, (pid_t)req.pid, dirfd, pathaddr, mode); }
+#ifdef __NR_chmod
+  else if (nr == __NR_chmod) { pathaddr = req.data.args[0]; mode = (mode_t)req.data.args[1]; resp.error = (int)chmod_in_writable(r, (pid_t)req.pid, dirfd, pathaddr, mode); }
+#endif
+  else resp.error = -ENOSYS;
+  /* Only answer if the request is still live, else the SEND would race a dead target. */
+  if (ioctl(listener, SECCOMP_IOCTL_NOTIF_ID_VALID, &req.id) == 0) ioctl(listener, SECCOMP_IOCTL_NOTIF_SEND, &resp);
+}
+
+static int install_seccomp(void) {
   struct sock_filter f[] = {
     /* Any non-native ABI ends the process: on x86_64 the i386 compat table (socketcall included). */
     BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, arch)),
@@ -529,6 +723,71 @@ static void install_seccomp(void) {
     DENY_NR(__NR_io_uring_setup, ENOSYS),
     DENY_NR(__NR_io_uring_enter, ENOSYS),
     DENY_NR(__NR_io_uring_register, ENOSYS),
+
+    /* TCP Fast Open: sendto/sendmsg/sendmmsg with MSG_FASTOPEN connect a TCP socket without connect(),
+     * past Landlock's TCP-connect allowlist. Deny that flag; plain sends are untouched. (flags is arg3
+     * for sendto/sendmmsg, arg2 for sendmsg.) The i386 socketcall path is already killed by the arch
+     * check, and x32 by the __X32_SYSCALL_BIT check, so filtering the native numbers is enough. */
+    DENY_FLAG(__NR_sendto, 3, MSG_FASTOPEN, EOPNOTSUPP),
+    DENY_FLAG(__NR_sendmsg, 2, MSG_FASTOPEN, EOPNOTSUPP),
+    DENY_FLAG(__NR_sendmmsg, 3, MSG_FASTOPEN, EOPNOTSUPP),
+    /* setsockopt(IPPROTO_TCP, TCP_FASTOPEN_CONNECT) arms the same client-side fast-open path. Deny it;
+     * other setsockopt calls (and TCP_FASTOPEN on a listener, which only governs inbound accepts and
+     * cannot reach an outside address) are left alone. (level is arg1, optname is arg2.) */
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_setsockopt, 0, 6),
+    BPF_STMT(BPF_LD | BPF_W | BPF_ABS, ARG_LO(1)),
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, IPPROTO_TCP, 0, 3),
+    BPF_STMT(BPF_LD | BPF_W | BPF_ABS, ARG_LO(2)),
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, TCP_FASTOPEN_CONNECT, 0, 1),
+    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EOPNOTSUPP),
+    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+
+    /* Metadata writes that Landlock (ABI <= 8) does not govern: a worker could chmod 000 a protected
+     * file of the same uid (e.g. /state/minions.db) or rewrite timestamps/xattrs. Git inside the worktree
+     * does need chmod on its own files (loose objects, lock files), so a blanket deny breaks it; path
+     * chmod cannot be scoped by seccomp (the path is a pointer). So the path-based chmod forms are routed
+     * to the supervisor over the user-notification fd, which allows them only within the writable set and
+     * performs them TOCTOU-safely. fchmod on an fd is left allowed: a worker can only hold an fd to a file
+     * Landlock let it open, i.e. one in the writable set; it cannot open a protected file at all. The
+     * chown, xattr and utimes families are not needed by git or the harnesses, so they are denied. */
+#ifdef __NR_chmod
+    NOTIFY_NR(__NR_chmod),
+#endif
+    NOTIFY_NR(__NR_fchmodat),
+    NOTIFY_NR(__NR_fchmodat2),
+#ifdef __NR_chown
+    DENY_NR(__NR_chown, EPERM),
+#endif
+#ifdef __NR_lchown
+    DENY_NR(__NR_lchown, EPERM),
+#endif
+    DENY_NR(__NR_fchown, EPERM),
+    DENY_NR(__NR_fchownat, EPERM),
+    DENY_NR(__NR_setxattr, EPERM),
+    DENY_NR(__NR_lsetxattr, EPERM),
+    DENY_NR(__NR_fsetxattr, EPERM),
+#ifdef __NR_utime
+    DENY_NR(__NR_utime, EPERM),
+#endif
+#ifdef __NR_utimes
+    DENY_NR(__NR_utimes, EPERM),
+#endif
+#ifdef __NR_futimesat
+    DENY_NR(__NR_futimesat, EPERM),
+#endif
+    DENY_NR(__NR_utimensat, EPERM),
+
+    /* Scheduling and resource controls Landlock scoping does not cover: lowering the nice/affinity/IO
+     * priority or limits of same-uid processes outside the sandbox (coordinator, runner). Allow only a
+     * target of 0 (the calling process itself); any explicit pid/who is denied. */
+    DENY_UNLESS_SELF(__NR_setpriority, 1, EPERM),
+    DENY_UNLESS_SELF(__NR_ioprio_set, 1, EPERM),
+    DENY_UNLESS_SELF(__NR_sched_setaffinity, 0, EPERM),
+    DENY_UNLESS_SELF(__NR_sched_setscheduler, 0, EPERM),
+    DENY_UNLESS_SELF(__NR_sched_setattr, 0, EPERM),
+    DENY_UNLESS_SELF(__NR_sched_setparam, 0, EPERM),
+    DENY_UNLESS_SELF(__NR_prlimit64, 0, EPERM),
+
     BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_socket, 1, 0),
     BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
     /* socket(): the family is an int passed by value (no pointer, so no race). */
@@ -540,12 +799,17 @@ static void install_seccomp(void) {
     BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
   };
   struct sock_fprog prog = { (unsigned short)(sizeof f / sizeof f[0]), f };
-  if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog, 0, 0) < 0) die("seccomp filter refused: %s", strerror(errno));
+  /* NEW_LISTENER returns the user-notification fd for the path-chmod rules above; the supervisor keeps it. */
+  long lf = syscall(__NR_seccomp, SECCOMP_SET_MODE_FILTER, (unsigned long)SECCOMP_FILTER_FLAG_NEW_LISTENER, &prog);
+  if (lf < 0) die("seccomp filter refused: %s", strerror(errno));
+  return (int)lf;
 }
 
-static void confine(const struct rules *r, int abi) {
-  /* 1. Nothing the runner holds open (DB, sockets, pipes) survives into the worker. */
-  if (syscall(__NR_close_range, 3U, ~0U, 0U) < 0) die("close_range: %s", strerror(errno));
+static void confine(const struct rules *r, int abi, int passfd) {
+  /* 1. Nothing the runner holds open (DB, sockets, pipes) survives into the worker, except the socket the
+   * seccomp listener fd is handed back to the supervisor over (closed below once the fd has been sent). */
+  if (passfd > 3 && syscall(__NR_close_range, 3U, (unsigned)passfd - 1, 0U) < 0) die("close_range: %s", strerror(errno));
+  if (syscall(__NR_close_range, (unsigned)passfd + 1, ~0U, 0U) < 0) die("close_range: %s", strerror(errno));
 
   /* 2. Landlock: filesystem allowlist, TCP connect allowlist, signal and abstract-socket scoping. */
   uint64_t handled = fs_handled(abi);
@@ -577,8 +841,12 @@ static void confine(const struct rules *r, int abi) {
   if (syscall(__NR_landlock_restrict_self, rs, 0U) < 0) die("landlock_restrict_self: %s", strerror(errno));
   close(rs);
 
-  /* 3. seccomp last, so none of the setup above is filtered. */
-  install_seccomp();
+  /* 3. seccomp last, so none of the setup above is filtered. Hand the notification listener to the
+   * supervisor and drop our own copy; the harness must not keep it. */
+  int listener = install_seccomp();
+  if (send_fd(passfd, listener) < 0) die("could not hand the seccomp listener to the supervisor: %s", strerror(errno));
+  close(listener);
+  close(passfd);
 }
 
 /* ------------------------------------------------------------------ supervisor (stays outside the domain) */
@@ -620,9 +888,13 @@ static void signal_tree(int sig) {
   closedir(d);
 }
 
-static int supervise(pid_t child, const sigset_t *waitset) {
+static int supervise(pid_t child, const sigset_t *waitset, int listener, const struct rules *r) {
   int status = 0, have_status = 0, terminating = 0, killing = 0;
   long long deadline = 0;
+  /* The blocked signals are read through a signalfd so the same poll() can wait on them and on the chmod
+   * notification fd; a slow 1 s tick still drives reaping and the terminate-then-kill deadline. */
+  int sfd = signalfd(-1, waitset, SFD_CLOEXEC | SFD_NONBLOCK);
+  if (sfd < 0) die("signalfd: %s", strerror(errno));
   for (;;) {
     for (;;) {
       int st;
@@ -636,16 +908,29 @@ static int supervise(pid_t child, const sigset_t *waitset) {
     if (have_status) killing = 1;
     if (terminating && !killing && now_ms() >= deadline) killing = 1;
     if (killing) signal_tree(SIGKILL);
-    struct timespec tick = { 1, 0 };
-    siginfo_t si;
-    int sig = sigtimedwait(waitset, &si, &tick);
-    if ((sig == SIGTERM || sig == SIGINT || sig == SIGHUP) && !terminating) {
-      terminating = 1;
-      deadline = now_ms() + GRACE_SECONDS * 1000LL;
-      signal_tree(SIGTERM);
+    struct pollfd pfd[2];
+    pfd[0].fd = sfd; pfd[0].events = POLLIN; pfd[0].revents = 0;
+    int li = -1;
+    if (listener >= 0) { li = 1; pfd[1].fd = listener; pfd[1].events = POLLIN; pfd[1].revents = 0; }
+    int pr = poll(pfd, li >= 0 ? 2 : 1, 1000);
+    if (pr < 0) { if (errno == EINTR) continue; die("poll: %s", strerror(errno)); }
+    if (pfd[0].revents & POLLIN) {
+      struct signalfd_siginfo ssi;
+      while (read(sfd, &ssi, sizeof ssi) == (ssize_t)sizeof ssi) {
+        int sig = (int)ssi.ssi_signo;
+        if ((sig == SIGTERM || sig == SIGINT || sig == SIGHUP) && !terminating) {
+          terminating = 1;
+          deadline = now_ms() + GRACE_SECONDS * 1000LL;
+          signal_tree(SIGTERM);
+        }
+      }
     }
+    if (li >= 0 && (pfd[li].revents & POLLIN)) handle_notif(listener, r);
+    if (li >= 0 && (pfd[li].revents & (POLLERR | POLLHUP | POLLNVAL))) { close(listener); listener = -1; }
   }
 done:
+  close(sfd);
+  if (listener >= 0) close(listener);
   if (!have_status) return EXIT_SANDBOX;
   if (WIFEXITED(status)) return WEXITSTATUS(status);
   if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
@@ -671,21 +956,29 @@ static int run_wrapped(const struct rules *r, char **cmd) {
   sigaddset(&waitset, SIGCHLD);
   if (sigprocmask(SIG_BLOCK, &waitset, &old) < 0) die("sigprocmask: %s", strerror(errno));
 
+  /* A connected socket pair carries the seccomp notification fd from the confined child back here. */
+  int sp[2];
+  if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sp) < 0) die("socketpair: %s", strerror(errno));
+
   pid_t wrapper = getpid();
   pid_t child = fork();
   if (child < 0) die("fork: %s", strerror(errno));
   if (child == 0) {
+    close(sp[0]);
     if (prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0) < 0 || getppid() != wrapper) _exit(EXIT_SANDBOX);
     static const int reset[] = { SIGTERM, SIGINT, SIGHUP, SIGCHLD, SIGPIPE };
     for (size_t i = 0; i < sizeof reset / sizeof reset[0]; i++) signal(reset[i], SIG_DFL);
     sigprocmask(SIG_SETMASK, &old, NULL);
-    confine(r, abi);
+    confine(r, abi, sp[1]);
     execvp(cmd[0], cmd);
     int err = errno;
     say("cannot execute %s: %s", cmd[0], strerror(err));
     _exit(err == ENOENT ? 127 : 126);
   }
-  return supervise(child, &waitset);
+  close(sp[1]);
+  int listener = recv_fd(sp[0]); /* -1 if the child died before confinement */
+  close(sp[0]);
+  return supervise(child, &waitset, listener, r);
 }
 
 /* ------------------------------------------------------------------ canaries (run inside the sandbox) */
