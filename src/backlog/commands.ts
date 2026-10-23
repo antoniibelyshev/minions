@@ -1,6 +1,7 @@
 import { readFile } from 'node:fs/promises';
 import type { Command } from 'commander';
 import { validateConfig } from '../config/resolve.js';
+import { workflowNames } from '../config/workflows.js';
 import type { MinionsConfig } from '../config/schema.js';
 import { action, globalOpts, requireMode } from '../core/cli-helpers.js';
 import { MinionsError } from '../core/errors.js';
@@ -63,6 +64,19 @@ function oneOf<T extends string>(name: string, v: string | undefined, allowed: r
 
 const collect = (v: string, prev: string[] = []) => [...prev, v];
 
+/**
+ * --workflow: a named workflow from config (docs/design/roles-and-workflows.md D5). Only configured names
+ * are accepted (they passed the config invariants); an inline stage list is not.
+ */
+export function checkWorkflowName(cfg: MinionsConfig, name: string): string {
+  const known = workflowNames(cfg);
+  if (!known.includes(name)) {
+    throw new MinionsError('PRECONDITION', `Unknown workflow "${name}" (configured: ${known.join(', ')}).`,
+      'Use a workflow configured under "workflows" in the project config; the owner adds new ones on the host.');
+  }
+  return name;
+}
+
 async function readStdin(): Promise<string> {
   if (process.stdin.isTTY) throw new MinionsError('PRECONDITION', 'Expected input on stdin', 'Pipe the text in, or pass it as an option.');
   const chunks: Buffer[] = [];
@@ -77,7 +91,7 @@ const lines = (ts: Task[]) => (ts.length ? ts.map(line).join('\n') : '(no tasks)
 function detail(t: Task): string {
   const out = [`${t.id}  ${t.title}`, `status: ${t.status}  priority: ${t.priority ?? '-'}  authorized: ${t.authorized}`,
     `labels: ${t.labels.join(', ') || '-'}  deps: ${t.dependencies.join(', ') || '-'}  parent: ${t.parent ?? '-'}`,
-    `branch: ${t.branch ?? '-'}  provenance: ${t.provenance}`, `version: ${t.version}`];
+    `branch: ${t.branch ?? '-'}  provenance: ${t.provenance}  workflow: ${t.workflow ?? 'default'}`, `version: ${t.version}`];
   if (t.description) out.push('', t.description);
   if (t.acceptanceCriteria.length) out.push('', ...t.acceptanceCriteria.map((a, i) => `[${a.done ? 'x' : ' '}] #${i + 1} ${a.text}`));
   return out.join('\n');
@@ -88,7 +102,7 @@ function detail(t: Task): string {
 /** Fields `--compact` keeps for `backlog list|ready` (coordinator reads without full descriptions). */
 export const COMPACT_FIELDS = ['id', 'title', 'status', 'priority', 'dependencies'] as const;
 export const TASK_FIELDS: readonly (keyof Task)[] = ['id', 'locator', 'title', 'description', 'acceptanceCriteria', 'status', 'priority',
-  'dependencies', 'parent', 'externalLinks', 'labels', 'authorized', 'branch', 'commits', 'prUrl', 'provenance', 'version', 'milestone'];
+  'dependencies', 'parent', 'externalLinks', 'labels', 'authorized', 'branch', 'commits', 'prUrl', 'provenance', 'version', 'milestone', 'workflow'];
 
 /** Resolves `--fields a,b` / `--compact` into a field list (undefined = full tasks). Unknown fields are an error. */
 export function selectFields(o: { fields?: string; compact?: boolean }): (keyof Task)[] | undefined {
@@ -161,9 +175,10 @@ export function register(program: Command): void {
     .option('--label <label>', 'label (repeatable)', collect)
     .option('--status <status>', 'initial status (default idea)')
     .option('--provenance <p>', PROVENANCES.join(' | '))
+    .option('--workflow <name>', 'named workflow from config (default: the default workflow)')
     .requiredOption('--key <idempotencyKey>', 'idempotency key; repeating it returns the existing task')
     .action(action(async (o: { title: string; description?: string; descriptionFile?: string; ac?: string[]; priority?: string;
-      dep?: string[]; parent?: string; label?: string[]; status?: string; provenance?: string; key: string }, cmd: Command) => {
+      dep?: string[]; parent?: string; label?: string[]; status?: string; provenance?: string; workflow?: string; key: string }, cmd: Command) => {
       requireMode('runtime');
       if (o.description !== undefined && o.descriptionFile !== undefined) throw new MinionsError('PRECONDITION', 'Use --description or --description-file, not both');
       const description = o.descriptionFile !== undefined ? await readTextFile(o.descriptionFile) : o.description;
@@ -173,8 +188,8 @@ export function register(program: Command): void {
         provenance: oneOf('provenance', o.provenance, PROVENANCES), idempotencyKey: o.key,
       };
       assertIntakeOpen(input, await intakePaused());
-      const { backlog } = await open();
-      const r = await backlog.createTask(input);
+      const { cfg, backlog } = await open();
+      const r = await backlog.createTask({ ...input, ...(o.workflow !== undefined ? { workflow: checkWorkflowName(cfg, o.workflow) } : {}) });
       emit(r, { json: globalOpts(cmd).json, human: (d) => `${d.created ? 'Created' : 'Exists'} ${d.task.id}: ${d.task.title}` });
     }));
 
@@ -186,8 +201,9 @@ export function register(program: Command): void {
     .option('--label <label>', 'replace labels (repeatable)', collect)
     .option('--description-file <file>', 'replace the description from a file ("-" = stdin)')
     .option('--branch <branch>', 'record the task branch')
+    .option('--workflow <name>', 'assign a named workflow from config (only between stages)')
     .action(action(async (id: string, o: { expectedVersion: string; status?: string; title?: string; priority?: string;
-      label?: string[]; descriptionFile?: string; branch?: string }, cmd: Command) => {
+      label?: string[]; descriptionFile?: string; branch?: string; workflow?: string }, cmd: Command) => {
       requireMode('runtime');
       const patch: Parameters<BacklogAdapter['updateTask']>[2] = {};
       const status = oneOf<TaskStatus>('status', o.status, TASK_STATUSES);
@@ -198,7 +214,15 @@ export function register(program: Command): void {
       if (o.label) patch.labels = o.label;
       if (o.branch !== undefined) patch.branch = o.branch;
       if (o.descriptionFile !== undefined) patch.description = await readTextFile(o.descriptionFile);
-      const { backlog } = await open();
+      const { cfg, backlog } = await open();
+      if (o.workflow !== undefined) {
+        patch.workflow = checkWorkflowName(cfg, o.workflow);
+        // Only between stages (D5): a running stage keeps the workflow it was claimed under.
+        const task = await backlog.getTask(id);
+        if ((await readyContext()).leased.has(task.id)) {
+          throw new MinionsError('CONFLICT', `Task ${task.id} has an active stage; change its workflow between stages.`, 'Wait for the running stage to be recorded or released.');
+        }
+      }
       const t = await backlog.updateTask(id, o.expectedVersion, patch);
       emit(t, { json: globalOpts(cmd).json, human: (d) => `Updated ${d.id} (version ${d.version.slice(0, 12)})` });
     }));

@@ -45,7 +45,7 @@ describe('runtime db migration 3 -> 4 (notification outbox)', () => {
 
     const up = new RuntimeDb(path);
     expect(up.getMeta('schema_version')).toBe(String(SCHEMA_VERSION));
-    expect(SCHEMA_VERSION).toBe(4);
+    expect(SCHEMA_VERSION).toBeGreaterThanOrEqual(4);
     expect(up.get<{ id: string; status: string }>("SELECT id, status FROM leases WHERE id = 'lease-x'")).toEqual({ id: 'lease-x', status: 'completed' });
     expect(up.approvals('task-1', 'publish', 'a'.repeat(40))).toEqual([expect.objectContaining({ approved_by: 'owner', signature: 'sig' })]);
     expect(up.events('task-1').map((e) => e.kind)).toContain('note');

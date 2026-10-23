@@ -37,7 +37,7 @@ const DEFAULT_PROVENANCE: Provenance = 'user-decision';
 
 export interface MinionsMeta {
   provenance?: Provenance; branch?: string | null; externalLinks?: string[];
-  commits?: string[]; prUrl?: string | null; [k: string]: unknown;
+  commits?: string[]; prUrl?: string | null; workflow?: string; [k: string]: unknown;
 }
 
 const META_OPEN = '<!-- minions:meta ';
@@ -184,6 +184,7 @@ export function toTask(raw: RawTask, opts: { startReady?: boolean; provenanceFal
     provenance,
     version: taskVersion(raw),
     milestone: raw.milestone ?? null,
+    ...(typeof meta.workflow === 'string' && meta.workflow ? { workflow: meta.workflow } : {}),
   };
 }
 
@@ -310,6 +311,7 @@ export class BacklogMdAdapter implements BacklogAdapter {
     checkLabels(labels);
     const meta: MinionsMeta = { provenance: input.provenance ?? DEFAULT_PROVENANCE };
     if (input.externalLinks?.length) meta.externalLinks = [...input.externalLinks];
+    if (input.workflow) meta.workflow = input.workflow;
     const args = ['task', 'create', `--description=${composeDescription(input.description ?? '', meta)}`];
     for (const ac of input.acceptanceCriteria ?? []) args.push(`--ac=${ac}`);
     if (input.priority) args.push(`--priority=${input.priority}`);
@@ -356,11 +358,13 @@ export class BacklogMdAdapter implements BacklogAdapter {
     const descChanged = patch.description !== undefined && patch.description.trim() !== cur.description;
     const branchChanged = 'branch' in patch && patch.branch !== undefined && patch.branch !== cur.branch;
     const prUrlChanged = 'prUrl' in patch && patch.prUrl !== undefined && patch.prUrl !== cur.prUrl;
-    if (descChanged || branchChanged || prUrlChanged) {
+    const workflowChanged = patch.workflow !== undefined && (patch.workflow ?? undefined) !== cur.workflow;
+    if (descChanged || branchChanged || prUrlChanged || workflowChanged) {
       const parsed = parseDescription(raw.description);
       const meta: MinionsMeta = { provenance: cur.provenance, ...parsed.meta };
       if (branchChanged) meta.branch = patch.branch ?? null;
       if (prUrlChanged) meta.prUrl = patch.prUrl ?? null;
+      if (workflowChanged) { if (patch.workflow) meta.workflow = patch.workflow; else delete meta.workflow; }
       const desc = descChanged ? composeDescription(patch.description!, meta) : replaceMeta(raw.description ?? '', meta);
       args.push(`--description=${desc}`);
     }
