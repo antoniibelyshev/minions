@@ -2,7 +2,8 @@
 // (after delivery when idle, context threshold, hand-off count) that never fire with active leases, the
 // detached self-restart, and that the Telegram pairing, inbound queue and the outbox survive a restart.
 // Temp state dirs and SQLite DBs only; tmux, claude and the restart child are fakes.
-import { mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import type { RunResult } from '../../src/core/exec.js';
@@ -21,6 +22,15 @@ import { enqueue, pending } from '../../src/runtime/outbox.js';
 import { runtimePaths } from '../../src/runtime/paths.js';
 import { defaults } from '../helpers.js';
 import { commitFile, makeDefaultEnv, result, tmp, type Env } from './fixtures.js';
+
+/** The installed official Telegram plugin's server source (any cached version), or null when it is not installed. */
+const TELEGRAM_SERVER = ((): string | null => {
+  const dir = join(process.env.HOME ?? homedir(), '.claude', 'plugins', 'cache', 'claude-plugins-official', 'telegram');
+  try {
+    for (const v of readdirSync(dir).sort().reverse()) if (existsSync(join(dir, v, 'server.ts'))) return join(dir, v, 'server.ts');
+  } catch { /* not installed */ }
+  return null;
+})();
 
 const withReset = (c: NonNullable<NonNullable<MinionsConfig['coordinator']>['contextReset']> | undefined): MinionsConfig => {
   const cfg = defaults();
@@ -111,14 +121,18 @@ describe('handoff file (capped, redacted, replaced on write)', () => {
 });
 
 describe('settings (config defaults keep existing configs valid)', () => {
-  it('an existing config without contextReset validates and means off; new projects default to on', () => {
-    const { coordinator: _c, ...legacy } = defaults();
+  it('unset contextReset validates and means on with the defaults (existing and new projects); enabled: false opts out', () => {
+    const legacy = defaults();
+    expect(legacy.coordinator).toBeUndefined();
     expect(validateConfig(legacy, 'x').coordinator).toBeUndefined();
-    expect(contextResetSettings(legacy)).toEqual({ enabled: false, afterDelivery: true, contextTokens: DEFAULT_CONTEXT_TOKENS, handoffs: DEFAULT_HANDOFFS });
-    expect(validateConfig({ ...legacy, coordinator: { permissionMode: 'acceptEdits' } }, 'x').coordinator).toEqual({ permissionMode: 'acceptEdits' });
-    expect(defaults().coordinator?.contextReset).toEqual({ enabled: true });
-    expect(contextResetSettings(defaults())).toEqual({ enabled: true, afterDelivery: true, contextTokens: 60_000, handoffs: 10 });
+    expect(contextResetSettings(legacy)).toEqual({ enabled: true, afterDelivery: true, contextTokens: DEFAULT_CONTEXT_TOKENS, handoffs: DEFAULT_HANDOFFS });
+    expect(DEFAULT_CONTEXT_TOKENS).toBe(60_000);
+    expect(DEFAULT_HANDOFFS).toBe(10);
+    const pm = validateConfig({ ...legacy, coordinator: { permissionMode: 'acceptEdits' } }, 'x');
+    expect(pm.coordinator).toEqual({ permissionMode: 'acceptEdits' });
+    expect(contextResetSettings(pm).enabled).toBe(true);
     for (const p of ['personal-work', 'supervised'] as const) expect(contextResetSettings(defaults(p)).enabled).toBe(true);
+    expect(contextResetSettings(withReset({ enabled: false }))).toMatchObject({ enabled: false });
   });
 
   it('triggers are configurable: null turns one off; invalid values are rejected', () => {
@@ -163,6 +177,22 @@ describe('restart triggers', () => {
     // An active lease blocks it, whatever the count.
     addLease(db, 'lease-b', 'task-3');
     expect(contextResetCheck({ db, config: cfg })).toMatchObject({ due: false, triggers: ['handoffs'] });
+  });
+
+  it('session scope is by event id: a previous session\'s events in the same millisecond as the lock do not count', () => {
+    const db = freshDb();
+    handoffs(db, 4);
+    session(db);
+    const at = db.coordinatorLock()!.acquiredAt;
+    db.exec('UPDATE events SET at = ?', at); // same timestamp as the lock, but written before it
+    const cfg = withReset({ enabled: true, handoffs: 3, afterDelivery: false });
+    expect(contextResetCheck({ db, config: cfg })).toMatchObject({ due: false, session: { handoffs: 0 } });
+    // A re-entrant acquire by the same holder keeps the session; a takeover by a new holder starts a new one.
+    handoffs(db, 3);
+    db.acquireCoordinatorLock('coordinator', 4242, () => false);
+    expect(contextResetCheck({ db, config: cfg }).session.handoffs).toBe(3);
+    db.acquireCoordinatorLock('coordinator', 5151, () => false);
+    expect(contextResetCheck({ db, config: cfg }).session.handoffs).toBe(0);
   });
 
   it('context threshold: latest main-session usage from the transcript the Stop hook recorded this session', () => {
@@ -215,8 +245,7 @@ describe('restart triggers', () => {
     expect(contextResetCheck({ db, config: defaults() })).toMatchObject({ due: false, blockers: ['no coordinator session holds the project lock'] });
     session(db);
     db.addEvent('record', 'task-1', { leaseId: 'lease-r2', status: 'completed', to: 'done' });
-    const { coordinator: _c, ...legacy } = defaults();
-    expect(contextResetCheck({ db, config: legacy as MinionsConfig })).toMatchObject({ enabled: false, due: false, triggers: ['delivered'] });
+    expect(contextResetCheck({ db, config: withReset({ enabled: false }) })).toMatchObject({ enabled: false, due: false, triggers: ['delivered'] });
     db.setDrain('upgrade');
     expect(contextResetCheck({ db, config: defaults() }).blockers).toEqual(['a drain is in progress (the upgrade restarts the coordinator itself)']);
   });
@@ -323,13 +352,13 @@ describe('Telegram survives a restart (pairing, inbound queue, outbox)', () => {
     expect(calls.flat().join(' ')).not.toContain(paths.telegramStateDir);
   });
 
-  it('the plugin keeps unconfirmed inbound updates across a restart (no drop_pending_updates), per its source', () => {
+  // Skipped explicitly (reported as skipped, never a silent pass) when the plugin is not installed on this
+  // host; docs/design/telegram.md records the same evidence.
+  it.skipIf(!TELEGRAM_SERVER)(`the plugin keeps unconfirmed inbound updates across a restart (no drop_pending_updates), per its source${TELEGRAM_SERVER ? '' : ' (skipped: Telegram plugin not installed on this host)'}`, () => {
     // Evidence for the inbound queue: Telegram holds unconfirmed getUpdates for 24 h; the plugin starts polling
     // with bot.start({ onStart }) and never passes drop_pending_updates, so messages sent while no session polls
-    // are delivered to the next session. Checked against the installed plugin when it is present.
-    const server = '/home/node/.claude/plugins/cache/claude-plugins-official/telegram/0.0.7/server.ts';
-    let src: string;
-    try { src = readFileSync(server, 'utf8'); } catch { return; } // plugin not installed here: docs/design/telegram.md records the evidence
+    // are delivered to the next session.
+    const src = readFileSync(TELEGRAM_SERVER!, 'utf8');
     expect(src).toMatch(/await bot\.start\(\{/);
     expect(src).not.toMatch(/drop_pending_updates/);
     expect(src).toMatch(/const ACCESS_FILE = join\(STATE_DIR, 'access\.json'\)/);

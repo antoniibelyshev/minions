@@ -35,11 +35,14 @@ export const TRANSCRIPT_META = 'coordinator_transcript';
 
 export interface ContextResetSettings { enabled: boolean; afterDelivery: boolean; contextTokens: number | null; handoffs: number | null }
 
-/** Effective settings: unset config = off; unset trigger fields = defaults; null = that trigger off. */
+/**
+ * Effective settings: unset config = on with the defaults (existing projects get resets without a config
+ * edit; `enabled: false` is the opt-out); unset trigger fields = defaults; null = that trigger off.
+ */
 export function contextResetSettings(cfg: Pick<MinionsConfig, 'coordinator'>): ContextResetSettings {
   const c = cfg.coordinator?.contextReset;
   return {
-    enabled: c?.enabled ?? false,
+    enabled: c?.enabled ?? true,
     afterDelivery: c?.afterDelivery ?? true,
     contextTokens: c?.contextTokens === undefined ? DEFAULT_CONTEXT_TOKENS : c.contextTokens,
     handoffs: c?.handoffs === undefined ? DEFAULT_HANDOFFS : c.handoffs,
@@ -196,13 +199,26 @@ export interface ContextResetDeps {
 
 interface EventRow { kind: string; task_id: string | null; data_json: string | null }
 
+/** Id of the `coordinator-lock` event that started the current holder's session, or null when none is found. */
+export function sessionStartEventId(db: RuntimeDb, lock: { pid: number; session: string }): number | null {
+  const rows = db.all<{ id: number; data_json: string | null }>("SELECT id, data_json FROM events WHERE kind = 'coordinator-lock' ORDER BY id DESC LIMIT 20");
+  for (const r of rows) {
+    try {
+      const d = r.data_json ? JSON.parse(r.data_json) as { pid?: number; session?: string } : null;
+      if (d && d.pid === lock.pid && d.session === lock.session) return r.id;
+    } catch { /* unreadable event: keep looking */ }
+  }
+  return null;
+}
+
 /** The restart the coordinator runs on itself: detached, because the restart ends the calling session; refused with active leases. */
 export const RESET_RESTART_COMMAND = 'minions coordinator restart --recover --detach --json';
 
 export function contextResetCheck(deps: ContextResetDeps): ContextResetCheck {
   const { db } = deps;
   const settings = contextResetSettings(deps.config);
-  const since = db.coordinatorLock()?.acquiredAt ?? null;
+  const lock = db.coordinatorLock();
+  const since = lock?.acquiredAt ?? null;
   const blockers: string[] = [];
   if (!settings.enabled) blockers.push('context resets are off (coordinator.contextReset.enabled)');
   const leases = db.activeLeases();
@@ -210,9 +226,16 @@ export function contextResetCheck(deps: ContextResetDeps): ContextResetCheck {
   if (db.drain()) blockers.push('a drain is in progress (the upgrade restarts the coordinator itself)');
   if (!since) blockers.push('no coordinator session holds the project lock');
 
-  const rows = since
-    ? db.all<EventRow>("SELECT kind, task_id, data_json FROM events WHERE at >= ? AND kind IN ('record', 'release', 'coordinator-handoff') ORDER BY id", since)
-    : [];
+  // Scope by event id, not timestamp: events from the same millisecond as the lock would otherwise leak in.
+  // acquireCoordinatorLock (the only writer of the lock) adds a `coordinator-lock` event on every holder
+  // change; re-entrant acquires keep the lock and add none. The latest such event naming the current holder
+  // marks the session start. Without one (a DB older than the event), fall back to the lock's timestamp.
+  const sinceId = lock ? sessionStartEventId(db, lock) : null;
+  const kinds = "kind IN ('record', 'release', 'coordinator-handoff')";
+  const rows = !lock ? []
+    : sinceId !== null
+      ? db.all<EventRow>(`SELECT kind, task_id, data_json FROM events WHERE id > ? AND ${kinds} ORDER BY id`, sinceId)
+      : db.all<EventRow>(`SELECT kind, task_id, data_json FROM events WHERE at >= ? AND ${kinds} ORDER BY id`, lock.acquiredAt);
   let handoffs = 0;
   let handoffWritten = false;
   const delivered: string[] = [];

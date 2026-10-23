@@ -1165,6 +1165,46 @@ Hooks:
   0 and denies through JSON, while a missing binary or a crash becomes exit 2, the only blocking
   PreToolUse exit, so the gate fails closed.
 
+## Coordinator context resets
+
+Owner decision (task-45): keep the coordinator's context small by restarting the session routinely with a short
+handoff, instead of one long session whose re-read context grows every turn. Implemented in
+`src/runtime/context-reset.ts`; guidance in `coordinator.md` (Limits), the orchestrate and recover skills.
+
+- Handoff: `minions coordinator handoff --json` (note on stdin) writes `<state>/coordinator-handoff.json` (mode
+  0600, atomic, replaced on every write). The text is redacted (the CLI-wide `redact()` plus private keys, AWS keys,
+  `sk-`/`xox*-` tokens, `password=`-style assignments, URL credentials) and capped at 4 KB after redaction; an
+  oversized note is refused (`PRECONDITION`) and the previous handoff is kept, nothing is cut off silently. The
+  `coordinator-handoff` event records only size and redaction count, never the text. It holds what only the
+  conversation knows: open owner questions with the recommended answers, pending decisions, what the session waits
+  on, the spend tally, chat context. A fresh coordinator reads it first (`handoff --read --json`, named in the
+  recovery prompt and step 1 of the recover skill), together with `minions status`.
+- Settings: `coordinator.contextReset` `{ enabled, afterDelivery?, contextTokens?, handoffs? }`. Unset means on with
+  the defaults (existing projects get resets without a config edit); `enabled: false` is the opt-out, which leaves
+  resets to an explicit owner request. Unset trigger fields take the defaults (after delivery on, 60000 context
+  tokens, 10 hand-offs); `null` turns one trigger off.
+- Triggers are evaluated on demand from DB events, never by a timer. The session is scoped to the current lock by
+  event id: events after the latest `coordinator-lock` event naming the current holder (pid and session). That
+  event is written by `acquireCoordinatorLock`, the only writer of the lock, on every holder change; a re-entrant
+  acquire keeps the session. Ids rather than timestamps, so a previous session's events from the same millisecond
+  never count; a DB without such an event falls back to the lock's `acquiredAt`. A reset is due when no lease is
+  active, no drain runs, a coordinator holds the lock, and one trigger holds: a task reached `delivered`/`done` in
+  this session, the context reached `contextTokens`, or `handoffs` worker records/releases happened.
+- Context figure: the Stop hook stores the main session's `transcript_path` (meta only, no event, so the stop
+  guard's fingerprint is unchanged); the check reads the transcript's last 512 KB and takes the latest
+  main-session (non-sidechain) assistant turn's usage: input + cache read + cache creation + output tokens. When no
+  usage is readable (no hook record yet for this session, unknown format), the context trigger is inactive and the
+  hand-off count is the fallback.
+- Surfacing: `work record|release` responses carry `contextReset` (`due`, `reason`, `steps`) only when due, to keep
+  responses small; `coordinator handoff --check --json` shows the full check (triggers, blockers, session counts);
+  `minions status` adds a `context reset:` line and `contextReset` in `--json`.
+- The runtime never restarts the coordinator by itself. The coordinator, told by a response, finishes the current
+  owner exchange, sends pending notifications, writes the handoff, then runs
+  `minions coordinator restart --recover --detach --json`. `--detach` is needed because the restart kills the tmux
+  session the caller runs in: it checks active leases in-band (refusing with `PRECONDITION`), then runs the real
+  `coordinator restart --recover` in a detached process (own session, output appended to
+  `<state>/logs/context-reset.log`), which checks the leases again, kills the session and relaunches it detached.
+
 ## Plugin (`templates/plugin` → `projects/<id>/plugin`)
 
 ```

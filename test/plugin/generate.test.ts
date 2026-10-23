@@ -435,7 +435,7 @@ describe('file hand-offs and compact reads', () => {
     expect(recover).toMatch(/On `PRECONDITION` about a pending correction.*--submitted --correction --json/);
   });
 
-  it('routine context resets (task-45, on for new projects): when to write the handoff, when to restart, read it on start', async () => {
+  it('routine context resets (task-45, on by default with coordinator.contextReset unset): when to write the handoff, when to restart, read it on start', async () => {
     const g = await gen();
     const coord = await g.read('coordinator.md');
     expect(coord).toContain('## Session start');
@@ -455,9 +455,8 @@ describe('file hand-offs and compact reads', () => {
     expect(recover).toMatch(/^1\. `minions coordinator handoff --read --json`/m);
   });
 
-  it('an existing config without coordinator.contextReset keeps resets opt-in (owner request only)', async () => {
-    const { coordinator: _c, ...legacy } = defaults();
-    const g = await gen(legacy as MinionsConfig);
+  it('coordinator.contextReset.enabled: false keeps resets opt-in (owner request only)', async () => {
+    const g = await gen({ ...defaults(), coordinator: { contextReset: { enabled: false } } } as MinionsConfig);
     const coord = await g.read('coordinator.md');
     expect(coord).toMatch(/Context resets are off \(`coordinator.contextReset.enabled`\)\. Only if the owner asks for one/);
     expect(coord).toContain('`minions coordinator restart --recover --detach --json`');

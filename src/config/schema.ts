@@ -184,8 +184,8 @@ export const MinionsConfigSchema = z.object({
     /**
      * Routine context resets (src/runtime/context-reset.ts): the coordinator writes a short handoff
      * (`minions coordinator handoff`) and restarts itself with a fresh context when no worker lease is active
-     * and a trigger holds. Unset = off (existing projects keep the opt-in behaviour); new projects get
-     * `{ enabled: true }`. Unset trigger fields take their defaults; `null` turns that trigger off.
+     * and a trigger holds. Unset = on with the defaults (existing and new projects alike);
+     * `{ enabled: false }` is the opt-out. Unset trigger fields take their defaults; `null` turns that trigger off.
      */
     contextReset: z.object({
       enabled: z.boolean(),
