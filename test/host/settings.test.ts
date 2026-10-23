@@ -479,6 +479,7 @@ describe('remaining loosening changes (task-50)', () => {
   const cases: { key: string; to: string; back: string; seed?: Record<string, unknown>; msg: RegExp }[] = [
     { key: 'models.allowed', to: 'sonnet, opus, haiku, claude-opus-4-1', back: 'sonnet, opus, haiku', msg: /the coordinator may pick claude-opus-4-1 for workers \(higher spend possible\)/ },
     { key: 'models.default', to: 'opus', back: 'sonnet', msg: /workers default to a pricier model \(sonnet ~\$3\/MTok -> opus ~\$5\/MTok; higher spend\)/ },
+    { key: 'models.selection', to: 'coordinator', back: 'fixed', seed: { models: { selection: 'fixed' } }, msg: /the coordinator may pick other allowed models per worker \(possibly pricier\)/ },
     { key: 'coordinator.bundledSkills', to: 'true', back: 'false', msg: /the coordinator session gets Claude Code's bundled skills/ },
     { key: 'delivery.merge', to: 'manual', back: 'disabled', seed: { delivery: { provider: 'github', mode: 'pull-request' } }, msg: /minions may merge pull requests on GitHub when asked/ },
     { key: 'execution.maxRepairCyclesBeforeReplan', to: '5', back: '3', msg: /more failed fix cycles may run before a task is replanned \(higher spend\) \(3 -> 5\)/ },
