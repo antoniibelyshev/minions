@@ -64,6 +64,11 @@ symlink($file, "$c->{scratch}/sym-$$");
 { my $ok = open(my $h, '<', "$c->{scratch}/sym-$$"); r('read:via-symlink', $ok, "$!"); }
 { my $ok = open(my $h, '<', "/proc/self/root$file"); r('read:via-proc-self-root', $ok, "$!"); }
 r('chmod:protected', chmod(0640, $file), "$!");
+{ my $sym = "$c->{scratch}/chsym-$$"; symlink($file, $sym);
+  r('chmod:via-symlink', chmod(0777, $sym), "$!"); unlink $sym; }
+r('chmod:via-proc-self-root', chmod(0777, "/proc/self/root$file"), "$!");
+{ my $w = "$c->{scratch}/chmod-ok-$$"; my $h; open($h, '>', $w) and close($h);
+  r('chmod:scratch-allowed', chmod(0750, $w), "$!"); unlink $w; }
 r('utime:protected', utime(1, 1, $file), "$!");
 { my ($n, $v) = ('user.minions-escape', 'x'); r('setxattr:protected', sc('setxattr', $file, $n, $v, 1, 0) == 0, "$!"); }
 
@@ -104,6 +109,11 @@ for my $a (['127.0.0.1', AF_INET], ['::1', AF_INET6], ['::ffff:127.0.0.1', AF_IN
 { socket(my $t, AF_INET, SOCK_STREAM, 0);
   my $n = send($t, "fastopen\n", MSG_FASTOPEN, pack_sockaddr_in($port, inet_aton('127.0.0.1')));
   r('tcp-fastopen:127.0.0.1', defined $n, "$!"); select(undef, undef, undef, 0.3); }
+{ socket(my $fc, AF_INET, SOCK_STREAM, 0);
+  my $ok = setsockopt($fc, IPPROTO_TCP, 30, pack('l', 1)); # TCP_FASTOPEN_CONNECT = 30
+  r('tcp-fastopen-connect:setsockopt', defined $ok, "$!");
+  r('tcp-fastopen-connect:connect', connect($fc, pack_sockaddr_in($port, inet_aton('127.0.0.1'))), "$!");
+  select(undef, undef, undef, 0.3); }
 print "end\n";
 `;
 
@@ -232,14 +242,23 @@ describe.skipIf(!REAL || !SYS || !PERL)('minions-sandbox escape attempts (real h
         for (const a of ['127.0.0.1', '::1', '::ffff:127.0.0.1']) expect(out.results.get(`tcp-connect:${a}`), a).toMatchObject({ ok: false });
       });
 
-      it('TCP Fast Open (sendto MSG_FASTOPEN) does not reach a port outside tcpConnectPorts', () => {
+      it('TCP Fast Open does not reach a port outside tcpConnectPorts (sendto MSG_FASTOPEN and setsockopt TCP_FASTOPEN_CONNECT)', () => {
         expect(out.results.get('tcp-fastopen:127.0.0.1')).toMatchObject({ ok: false });
+        // The client-side fast-open path armed through setsockopt must also be refused, and the follow-up
+        // connect to the disallowed port must still be blocked by Landlock.
+        expect(out.results.get('tcp-fastopen-connect:setsockopt'), 'setsockopt TCP_FASTOPEN_CONNECT').toMatchObject({ ok: false });
+        expect(out.results.get('tcp-fastopen-connect:connect'), 'connect after TFO setsockopt').toMatchObject({ ok: false });
         expect(out.outsideView.tcp).toEqual([]);
       });
 
-      it('no chmod, utime or setxattr on a protected file', () => {
-        for (const n of ['chmod:protected', 'utime:protected', 'setxattr:protected']) expect(out.results.get(n), n).toMatchObject({ ok: false });
+      it('no chmod, utime or setxattr on a protected file (incl. the user-notification routes: symlink and /proc/self/root)', () => {
+        for (const n of ['chmod:protected', 'chmod:via-symlink', 'chmod:via-proc-self-root', 'utime:protected', 'setxattr:protected']) {
+          expect(out.results.get(n), n).toMatchObject({ ok: false });
+        }
         expect(out.outsideView.protectedMetadataChanged).toBe(false);
+        // Positive control: the chmod user-notification handler must still allow a chmod inside the scratch
+        // dir, else it would be a blanket deny that breaks the harness's own git.
+        expect(out.results.get('chmod:scratch-allowed'), 'chmod inside scratch').toMatchObject({ ok: true });
       });
 
       it('no setpriority, sched_setaffinity or ioprio_set on a process outside the sandbox', () => {
