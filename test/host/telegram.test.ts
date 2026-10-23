@@ -240,7 +240,7 @@ describe('wizard', () => {
 });
 
 describe('init and doctor', () => {
-  const container = (opts: { probe: 'available' | 'no-bun'; access?: string }) => recorder((c) => {
+  const container = (opts: { probe: 'available' | 'no-bun'; access?: string; offAtUserScope?: boolean; poller?: string }) => recorder((c) => {
     const a = c.args.join(' ');
     if (c.cmd !== 'docker') return undefined;
     if (a.startsWith('image inspect')) return { code: 0, stdout: 'x\n', stderr: '' };
@@ -251,12 +251,13 @@ describe('init and doctor', () => {
       const report = evaluateTelegram({
         claude: ok('2.1.292 (Claude Code)'), bun: opts.probe === 'available' ? ok('1.4.3') : { code: 127, stdout: '', stderr: 'not found' },
         marketplaces: ok(JSON.stringify([{ name: 'claude-plugins-official', source: 'github', repo: 'anthropics/claude-plugins-official' }])),
-        plugins: ok(JSON.stringify([{ id: TELEGRAM_PLUGIN_ID, version: '0.0.7', scope: 'user', enabled: true }])), managed: { present: false },
+        plugins: ok(JSON.stringify([{ id: TELEGRAM_PLUGIN_ID, version: '0.0.7', scope: 'user', enabled: !opts.offAtUserScope }])), managed: { present: false },
       });
       return ok(JSON.stringify({ ok: true, data: report }));
     }
     if (a.endsWith('telegram status --json')) {
-      return { code: 0, stdout: JSON.stringify({ ok: true, data: { access: { state: opts.access ?? 'ok', detail: 'paired with one owner' }, coordinator: null } }), stderr: '' };
+      return { code: 0, stdout: JSON.stringify({ ok: true, data: { access: { state: opts.access ?? 'ok', detail: 'paired with one owner' }, coordinator: null,
+        ...(opts.poller ? { poller: { state: opts.poller, detail: `poller ${opts.poller}` } } : {}) } }), stderr: '' };
     }
     return undefined;
   });
@@ -286,6 +287,27 @@ describe('init and doctor', () => {
     expect(by('features')!.detail).not.toContain('Telegram');
     expect(ok.healthy).toBe(true);
     expect(JSON.stringify(ok) + formatDoctor(ok)).not.toContain(TOKEN);
+
+    // Task-52: plugin off at user scope (the task-51 state) and a coordinator without a live poller: the
+    // launch's flag enabledPlugins may have been ignored. telegram.plugin warns (never fails); readiness
+    // still follows the probe.
+    for (const poller of ['missing', 'dead']) {
+      const w = await runDoctor({ cwd: repo, probe: dockerUp, runner: container({ probe: 'available', offAtUserScope: true, poller }).runner });
+      expect(w.checks.find((c) => c.name === 'telegram.plugin'), poller).toMatchObject({ status: 'warn',
+        detail: expect.stringMatching(new RegExp(`off at user scope and the running coordinator has no live poller \\(bot.pid ${poller}\\).*enabledPlugins may have been ignored`)),
+        hint: expect.stringContaining('minions coordinator restart --recover') });
+      expect(w.checks.find((c) => c.name === 'telegram.poller')?.status).toBe('warn');
+      expect(w.checks.find((c) => c.name === 'telegram')).toMatchObject({ status: 'ok' });
+      expect(w.checks.some((c) => c.name.startsWith('telegram') && c.status === 'fail')).toBe(false);
+    }
+    // Off at user scope with a live coordinator poller, or no running Telegram coordinator: ok.
+    for (const poller of ['ok', 'not-applicable', undefined]) {
+      const fine = await runDoctor({ cwd: repo, probe: dockerUp, runner: container({ probe: 'available', offAtUserScope: true, ...(poller ? { poller } : {}) }).runner });
+      expect(fine.checks.find((c) => c.name === 'telegram.plugin'), String(poller)).toMatchObject({ status: 'ok', detail: expect.not.stringMatching(/no live poller/) });
+    }
+    // Enabled at user scope (pre-launch state) with no poller: telegram.poller reports it, telegram.plugin stays ok.
+    const en = await runDoctor({ cwd: repo, probe: dockerUp, runner: container({ probe: 'available', poller: 'missing' }).runner });
+    expect(en.checks.find((c) => c.name === 'telegram.plugin')?.status).toBe('ok');
 
     // Plugin unavailable (e.g. outdated image without Bun): unavailable, never fail.
     const un = await runDoctor({ cwd: repo, probe: dockerUp, runner: container({ probe: 'no-bun', access: 'unpaired' }).runner });

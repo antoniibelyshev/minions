@@ -17,7 +17,8 @@ export const VERIFIED_CLAUDE_VERSIONS: readonly string[] = ['2.1.292'];
 export const MANAGED_SETTINGS_PATH = '/etc/claude-code/managed-settings.json';
 
 export type ProbeItemStatus = 'ok' | 'missing' | 'blocked' | 'unknown';
-export interface ProbeItem { name: string; status: ProbeItemStatus; detail: string; hint?: string }
+/** userScope (plugin item only, task-52): whether `claude plugin list` reports the plugin enabled in the user settings. */
+export interface ProbeItem { name: string; status: ProbeItemStatus; detail: string; hint?: string; userScope?: 'enabled' | 'disabled' }
 /** available: every credential-free precondition holds. Anything else names the first blocking reason. */
 export type TelegramAvailability = 'available' | 'blocked' | 'unavailable' | 'not-installed';
 export interface TelegramProbeReport {
@@ -130,8 +131,8 @@ function pluginItem(f: TelegramFacts): ProbeItem {
   const deps = refused ? '; Claude Code reported its dependencies were not installed (Bun missing at install time)' : '';
   // Task-51: off at user scope is the intended state (src/telegram/isolation.ts): the coordinator launch
   // enables it with --settings enabledPlugins, so no other claude session starts its poller.
-  if (p.enabled === false) return { name: 'plugin', status: 'ok', detail: `${where} installed; off at user scope, enabled only by the coordinator launch${deps}` };
-  return { name: 'plugin', status: 'ok', detail: `${where} installed and enabled at user scope (the next coordinator launch turns it off there, enabling it only for itself)${deps}` };
+  if (p.enabled === false) return { name: 'plugin', status: 'ok', userScope: 'disabled', detail: `${where} installed; off at user scope, enabled only by the coordinator launch${deps}` };
+  return { name: 'plugin', status: 'ok', userScope: 'enabled', detail: `${where} installed and enabled at user scope (the next coordinator launch turns it off there, enabling it only for itself)${deps}` };
 }
 
 function policyItem(f: TelegramFacts): ProbeItem {
@@ -185,7 +186,7 @@ export function formatTelegramProbe(r: TelegramProbeReport): string {
 }
 
 /** Host doctor: maps the in-container `minions telegram probe --json` result to a doctor check. Never 'fail': terminal mode must stay usable. */
-export function telegramDoctorCheck(r: RunResult): { status: 'ok' | 'warn' | 'unavailable'; detail: string; hint?: string } {
+export function telegramDoctorCheck(r: RunResult): { status: 'ok' | 'warn' | 'unavailable'; detail: string; hint?: string; userScope?: 'enabled' | 'disabled' } {
   if (r.code !== 0) {
     return { status: 'warn', detail: `telegram probe failed (exit ${r.code}): ${short(r.stderr || r.stdout) || 'no output'}`, hint: '`minions start` rebuilds an outdated image.' };
   }
@@ -196,7 +197,9 @@ export function telegramDoctorCheck(r: RunResult): { status: 'ok' | 'warn' | 'un
     if (isObj(data) && typeof data.availability === 'string' && typeof data.summary === 'string' && Array.isArray(data.items)) report = data as unknown as TelegramProbeReport;
   } catch { /* handled below */ }
   if (!report) return { status: 'warn', detail: `telegram probe returned unexpected output: ${short(r.stdout) || 'no output'}` };
-  if (report.available) return { status: 'ok', detail: redact(report.summary) };
+  // userScope is absent from older images; only the two known values pass through.
+  const userScope = report.items.find((i) => isObj(i) && i.name === 'plugin')?.userScope;
+  if (report.available) return { status: 'ok', detail: redact(report.summary), ...(userScope === 'enabled' || userScope === 'disabled' ? { userScope } : {}) };
   const reason = report.items.find((i) => i.status === 'blocked') ?? report.items.find((i) => i.status === 'missing') ?? report.items.find((i) => i.status === 'unknown');
   return { status: 'unavailable', detail: redact(report.summary), ...(reason?.hint ? { hint: redact(reason.hint) } : {}) };
 }

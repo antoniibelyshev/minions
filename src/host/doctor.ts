@@ -332,6 +332,40 @@ export function telegramPollerCheck(r: { code: number; stdout: string }): Check 
 }
 
 /**
+ * telegram.plugin (task-52): the probe reports `ok` when the plugin is off at user scope, because the
+ * coordinator launch enables it through its --settings enabledPlugins. If Claude Code ever ignores that
+ * flag setting, the coordinator runs without the plugin and nothing else would say so. So: plugin off at
+ * user scope AND a running Telegram coordinator without a live poller (bot.pid missing or dead) turns the
+ * check into a warning (never a fail: terminal mode stays usable). A foreign poller is telegram.poller's
+ * business (some session did load the plugin). `status`: `minions telegram status --json`, or null.
+ */
+export function telegramPluginCheck(tg: ReturnType<typeof telegramDoctorCheck>, status: { code: number; stdout: string } | null): Check {
+  const base: Check = { name: 'telegram.plugin', status: tg.status, detail: tg.detail, ...(tg.hint ? { hint: tg.hint } : {}) };
+  if (tg.status !== 'ok' || tg.userScope !== 'disabled' || !status || status.code !== 0) return base;
+  let state: unknown;
+  try { const env = JSON.parse(status.stdout) as { ok?: boolean; data?: { poller?: { state?: unknown } } }; if (env.ok) state = env.data?.poller?.state; } catch { return base; }
+  if (state !== 'missing' && state !== 'dead') return base;
+  return {
+    name: 'telegram.plugin', status: 'warn',
+    detail: `${tg.detail}; but the plugin is off at user scope and the running coordinator has no live poller (bot.pid ${state}), so the coordinator launch's --settings enabledPlugins may have been ignored`,
+    hint: 'Restart the coordinator when no worker runs (`minions coordinator restart --recover`) and check /mcp for plugin:telegram:telegram. '
+      + 'If it is still missing, this Claude Code version may not apply flag enabledPlugins: report it, and see docs/compatibility.md (One Telegram poller per bot).',
+  };
+}
+
+/**
+ * telegram.plugin, telegram.access and telegram.poller from the runtime. Returns the probe-only plugin
+ * check: channel readiness follows the probe, not the task-52 load warning.
+ */
+async function telegramRuntimeChecks(ex: (args: string[]) => Promise<{ code: number; stdout: string; stderr: string }>, wantsTelegram: boolean, checks: Check[]): Promise<Check> {
+  const tg = telegramDoctorCheck(await ex(['minions', 'telegram', 'probe', '--json']));
+  const status = wantsTelegram ? await ex(['minions', 'telegram', 'status', '--json']) : null;
+  checks.push(telegramPluginCheck(tg, status));
+  if (status) { checks.push(telegramAccessCheck(status)); const pc = telegramPollerCheck(status); if (pc) checks.push(pc); }
+  return { name: 'telegram.plugin', status: tg.status, detail: tg.detail, ...(tg.hint ? { hint: tg.hint } : {}) };
+}
+
+/**
  * setup: obvious configuration gaps left after init (no verification commands, GitHub remote without a
  * working token, Telegram selected without a bot token), with a pointer to the setup assistant.
  */
@@ -403,11 +437,7 @@ async function hostRuntimeChecks(project: ProjectJson, auth: ClaudeAuth, baseUrl
   const ex = (args: string[]) => host.exec(args, { allowFailure: true, timeoutMs: 60_000 });
   const probe = await ex(['minions', 'coordinator', '--probe', '--json']);
   add('claude.capabilities', probe.code === 0 ? 'ok' : 'fail', probe.code === 0 ? 'Claude Code supports the coordinator launch flags; launch command resolves; sandbox settings applied' : `coordinator probe failed (exit ${probe.code}): ${short(probe.stderr || probe.stdout)}`);
-  const tg = telegramDoctorCheck(await ex(['minions', 'telegram', 'probe', '--json']));
-  add('telegram.plugin', tg.status, tg.detail, tg.hint);
-  const tgPlugin = checks[checks.length - 1];
-  if (wantsTelegram) { const tg = await ex(['minions', 'telegram', 'status', '--json']); checks.push(telegramAccessCheck(tg)); const pc = telegramPollerCheck(tg); if (pc) checks.push(pc); }
-  return tgPlugin;
+  return telegramRuntimeChecks(ex, wantsTelegram, checks);
 }
 
 /** `minions ci status --json` output from the container (gh api); null when unavailable (e.g. an older image). */
@@ -598,10 +628,7 @@ export async function runDoctor(opts: {
           ? `Claude Code supports the coordinator launch flags; launch command resolves${perm ? `; permission mode ${perm.mode}${perm.fallback ? ` (${perm.reason})` : ''}` : ''}`
           : `coordinator probe failed (exit ${probe.code}): ${short(probe.stderr || probe.stdout)}`);
         // Credential-free; never 'fail' because terminal mode must stay usable without Telegram.
-        const tg = telegramDoctorCheck(await ex(['minions', 'telegram', 'probe', '--json']));
-        add('telegram.plugin', tg.status, tg.detail, tg.hint);
-        tgPlugin = checks[checks.length - 1];
-        if (wantsTelegram) { const tg = await ex(['minions', 'telegram', 'status', '--json']); checks.push(telegramAccessCheck(tg)); const pc = telegramPollerCheck(tg); if (pc) checks.push(pc); }
+        tgPlugin = await telegramRuntimeChecks(ex, wantsTelegram, checks);
         if (github.onGitHub) ci = { rc: parseCiStatus(await ex(['minions', 'ci', 'status', '--json'])) };
       } else {
         for (const n of ['claude.auth', ...(baseUrl ? ['claude.baseUrl'] : []), 'container.tmp', 'container.scratch', 'backlog.cli', 'claude.capabilities', 'telegram.plugin']) add(n, 'warn', 'skipped: container not running');

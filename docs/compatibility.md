@@ -179,7 +179,16 @@ Design for the open ownership cases (not implemented; needs live validation):
   /mcp → reconnect `plugin:telegram:telegram` in the coordinator terminal, or
   `minions coordinator restart --recover` when no worker runs. Do not enable the plugin in a config dir that other sessions
   share with the coordinator. Start nested or ad-hoc `claude` runs with a separate
-  `CLAUDE_CONFIG_DIR`. The setup assistant (`minions setup assist`) passes no channel flags but
+  `CLAUDE_CONFIG_DIR`. Workers never start `claude`; when a task needs a live run, the coordinator
+  runs it only while no worker lease is active, with a fresh `CLAUDE_CONFIG_DIR` (task-52). If
+  Claude Code ever stops applying the flag `enabledPlugins`, the coordinator starts without the
+  plugin: `minions doctor` then warns on `telegram.plugin` (off at user scope and no live poller).
+  **Rollback**: a build from before task-51 does not enable the plugin in its coordinator launch, so
+  after downgrading, the plugin stays off at user scope (the setting task-51 wrote persists) and the
+  coordinator runs without Telegram. Fix it inside the runtime with
+  `claude plugin enable telegram@claude-plugins-official` (user scope by default; a non-session
+  subcommand, it starts no poller) and restart the coordinator,
+  or upgrade back to a task-51 or later build. The setup assistant (`minions setup assist`) passes no channel flags but
   uses your host config, so it loads the plugin if you enabled it there. The test suite sets
   `CLAUDE_CONFIG_DIR` to a temp dir (`test/setup/global.ts`), and `test/setup/claude-guard.ts`
   fails any test that would start `claude` with the real `~/.claude`.

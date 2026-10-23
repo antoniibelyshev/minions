@@ -2,7 +2,7 @@
 // `claude` with the real config dir throws and fails the test. Every call here uses PATH=/nonexistent,
 // so nothing would run even if the guard let it through.
 import { execSync, fork, spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, renameSync, writeFileSync } from 'node:fs';
+import { constants as fsConstants, createWriteStream, existsSync, linkSync, mkdirSync, mkdtempSync, open, openSync, readdirSync, renameSync, symlinkSync, writeFileSync } from 'node:fs';
 import fsp from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -10,7 +10,7 @@ import { afterEach, describe, expect, it, onTestFinished } from 'vitest';
 import { run } from '../src/core/exec.js';
 import { atomicWrite } from '../src/core/fsutil.js';
 import { runtimePaths } from '../src/runtime/paths.js';
-import { effectiveConfigDir, protectedTarget, startsClaude, takeViolations } from './setup/claude-guard.js';
+import { effectiveConfigDir, protectedTarget, startsClaude, takeViolations, writesWithFlags } from './setup/claude-guard.js';
 
 const realDirs = JSON.parse(process.env.MINIONS_TEST_REAL_CLAUDE_DIRS ?? '[]') as string[];
 const isolated = process.env.MINIONS_TEST_CLAUDE_CONFIG_DIR!;
@@ -117,5 +117,37 @@ describe('test write guard for the real Claude Code config (task-51)', () => {
     expect(existsSync(settings)).toBe(false);
     expect(existsSync(botPid)).toBe(false);
     expect(readdirSync(real).filter((f) => f.startsWith('.settings.json.'))).toEqual([]);
+  });
+
+  it('task-52: also refuses createWriteStream, writing opens, mkdir and symlink/link into the protected paths; reads stay allowed', async () => {
+    const real = mkdtempSync(join(tmpdir(), 'minions-guard-fake-real-'));
+    const saved = process.env.MINIONS_TEST_REAL_CLAUDE_DIRS;
+    process.env.MINIONS_TEST_REAL_CLAUDE_DIRS = JSON.stringify([real]);
+    onTestFinished(() => { process.env.MINIONS_TEST_REAL_CLAUDE_DIRS = saved; });
+    const settings = join(real, 'settings.json');
+    const tg = join(real, 'channels', 'telegram');
+    const src = join(isolated, 'guard-src.txt');
+    expect(() => createWriteStream(settings)).toThrow(/test guard: refusing createWriteStream/);
+    expect(() => openSync(settings, 'w')).toThrow(/test guard: refusing openSync/);
+    expect(() => openSync(settings, fsConstants.O_WRONLY | fsConstants.O_CREAT)).toThrow(/test guard: refusing openSync/);
+    await expect(fsp.open(join(tg, 'bot.pid'), 'a')).rejects.toThrow(/test guard: refusing open/);
+    expect(() => open(settings, 'r+', () => undefined)).toThrow(/test guard: refusing open/);
+    expect(() => mkdirSync(tg, { recursive: true })).toThrow(/test guard: refusing mkdirSync/);
+    await expect(fsp.mkdir(tg, { recursive: true })).rejects.toThrow(/test guard: refusing mkdir/);
+    expect(() => symlinkSync(src, settings)).toThrow(/test guard: refusing symlinkSync/);
+    await expect(fsp.symlink(src, settings)).rejects.toThrow(/test guard: refusing symlink/);
+    expect(() => linkSync(src, settings)).toThrow(/test guard: refusing linkSync/);
+    expect(takeViolations()).toHaveLength(10);
+    expect(existsSync(settings)).toBe(false);
+    expect(existsSync(tg)).toBe(false);
+    // Reading opens (default 'r', O_RDONLY) are not writes: they reach the fs and fail with ENOENT.
+    expect(() => (openSync as (p: string) => number)(settings)).toThrow(/ENOENT/);
+    expect(() => openSync(settings, fsConstants.O_RDONLY)).toThrow(/ENOENT/);
+    await expect(fsp.open(settings, 'r')).rejects.toThrow(/ENOENT/);
+    expect(takeViolations()).toEqual([]);
+    expect(writesWithFlags('r')).toBe(false);
+    expect(writesWithFlags(undefined)).toBe(false);
+    expect(writesWithFlags('wx')).toBe(true);
+    expect(writesWithFlags(fsConstants.O_RDWR)).toBe(true);
   });
 });
