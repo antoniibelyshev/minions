@@ -709,6 +709,18 @@
             "auto",
             "acceptEdits"
           ]
+        },
+        "disallowedTools": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/__schema0"
+          }
+        },
+        "toolSearch": {
+          "type": "boolean"
+        },
+        "bundledSkills": {
+          "type": "boolean"
         }
       },
       "additionalProperties": false

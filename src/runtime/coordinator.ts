@@ -4,6 +4,7 @@ import { readFile, rm } from 'node:fs/promises';
 import { constants as osConstants } from 'node:os';
 import type { MinionsConfig } from '../config/schema.js';
 import { roleEffort } from '../config/models.js';
+import { COORDINATOR_DISALLOWED_TOOLS } from '../config/coordinator-tools.js';
 import { MinionsError } from '../core/errors.js';
 import { run, type RunOptions, type RunResult } from '../core/exec.js';
 import { atomicWrite } from '../core/fsutil.js';
@@ -302,6 +303,10 @@ export function coordinatorSettings(cfg: MinionsConfig, opts: { telegram?: boole
     },
     ...(auth === 'login' ? {} : { apiKeyHelper: opts.paths ? apiKeyHelperFor(opts.paths) : host ? apiKeyHelperFor(runtimePaths()) : API_KEY_HELPER }),
     ...(hs ? { sandbox: hs.sandbox } : {}),
+    // Startup context trim (task-48, src/config/coordinator-tools.ts): tool search on (rarely used tool
+    // definitions are deferred, not sent in full every turn) and no bundled skills; plugin skills stay.
+    ...(cfg.coordinator?.toolSearch === false ? {} : { env: { ENABLE_TOOL_SEARCH: 'true' } }),
+    ...(cfg.coordinator?.bundledSkills ? {} : { disableBundledSkills: true }),
     ...(opts.telegram ? {
       hooks: { PreToolUse: [{ matcher: TELEGRAM_HOOK_MATCHER, hooks: [{ type: 'command', command: TELEGRAM_HOOK_COMMAND }] }] },
     } : {}),
@@ -435,6 +440,11 @@ Repository and user Claude Code settings, hooks and MCP servers are not loaded i
  */
 export const HOST_CLAUDE_FLAGS = ['--setting-sources=', '--strict-mcp-config'];
 
+/** Tools removed from the coordinator session: coordinator.disallowedTools, else the default trim. */
+export function coordinatorDisallowedTools(cfg: Pick<MinionsConfig, 'coordinator'>): string[] {
+  return [...(cfg.coordinator?.disallowedTools ?? COORDINATOR_DISALLOWED_TOOLS)];
+}
+
 /**
  * argv of the coordinator's claude process. Never contains a secret. `startupPrompt` becomes the first user message.
  * `permissionModes`: the installed Claude Code's --permission-mode choices (claudePermissionModes); undefined = not checked.
@@ -443,6 +453,7 @@ export async function buildClaudeCommand(cfg: MinionsConfig, paths: RuntimePaths
   assertNoBypass(cfg);
   const onHost = runtimeMode() === 'host-runtime';
   const prompt = await readPrompt(paths) + (onHost ? hostPromptNote(paths) : '');
+  const disallowed = coordinatorDisallowedTools(cfg);
   return {
     cmd: 'claude',
     cwd: paths.repo,
@@ -458,6 +469,8 @@ export async function buildClaudeCommand(cfg: MinionsConfig, paths: RuntimePaths
       ...(onHost ? ['--add-dir', paths.workspace, paths.state] : []),
       ...(cfg.models.coordinator ? ['--model', cfg.models.coordinator] : []),
       ...(roleEffort(cfg, 'coordinator') ? ['--effort', roleEffort(cfg, 'coordinator')!] : []),
+      // Startup context trim (task-48). One comma-separated value: the option is variadic.
+      ...(disallowed.length ? ['--disallowedTools', disallowed.join(',')] : []),
       '--settings', JSON.stringify(coordinatorSettings(cfg, { ...opts, paths })),
       ...(opts.telegram ? ['--channels', TELEGRAM_CHANNEL_SPEC] : []),
       // After `--` so a variadic option (--channels) cannot swallow the prompt.

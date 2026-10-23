@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { isRequiredCoordinatorTool } from './coordinator-tools.js';
 
 export const CAPABILITIES = [
   'task.read', 'task.create', 'task.update', 'task.start',
@@ -181,6 +182,23 @@ export const MinionsConfigSchema = z.object({
      * "acceptEdits" opts back into prompting for every non-allowlisted Bash call. Never bypassPermissions.
      */
     permissionMode: z.enum(['auto', 'acceptEdits']).optional(),
+    /**
+     * Claude Code tools removed from the coordinator session (`--disallowedTools`). Unset = the default
+     * trim (COORDINATOR_DISALLOWED_TOOLS, src/config/coordinator-tools.ts); a list replaces it; [] keeps
+     * every tool. Agent, SendMessage, Bash, Read/Edit/Write, Skill, the Telegram tools and the other
+     * tools the coordinator needs cannot be listed. Takes effect at the next coordinator restart.
+     */
+    disallowedTools: z.array(nonEmpty).refine((l) => !l.some(isRequiredCoordinatorTool), {
+      message: 'must not name a tool the coordinator needs (Agent, Task, SendMessage, TaskStop, ListAgents, PushNotification, AskUserQuestion, Bash, Read, Edit, Write, Grep, Glob, Skill, ToolSearch, Telegram MCP tools)',
+    }).optional(),
+    /**
+     * Tool search for the coordinator (ENABLE_TOOL_SEARCH in the session's settings env): rarely used
+     * tools are loaded on demand instead of sent in full with every request. Unset = on; false leaves
+     * the choice to Claude Code.
+     */
+    toolSearch: z.boolean().optional(),
+    /** Claude Code's bundled skills (dataviz, code-review, loop, ...) in the coordinator session. Unset = off; plugin skills (minions:*, telegram:*) always stay. */
+    bundledSkills: z.boolean().optional(),
   }).strict().optional(),
   /**
    * Legacy coordinator permission mode. Only "default" is still honoured (as a stricter choice) when
