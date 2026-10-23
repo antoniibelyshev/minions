@@ -117,7 +117,7 @@ describe('generatePlugin', () => {
     expect(Object.keys(hooks)).toEqual(['hooks']);
     expect(hooks.hooks.Stop).toEqual([{ hooks: [{ type: 'command', command: 'minions hook stop' }] }]);
     expect(hooks.hooks.PreToolUse).toEqual([
-      { matcher: 'Agent', hooks: [{ type: 'command', command: 'minions hook pre-agent || exit 2' }] },
+      { matcher: 'Agent', hooks: [{ type: 'command', command: 'timeout 20 minions hook pre-agent || exit 2', timeout: 30 }] },
       // Every tool; gated by a shell test so node starts only while a drain is requested.
       { matcher: '*', hooks: [{ type: 'command', command: DRAIN_HOOK_COMMAND }] },
     ]);

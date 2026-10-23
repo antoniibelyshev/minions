@@ -471,16 +471,19 @@ export function register(program: Command): void {
 
   // hooks (never fail toward Claude Code: always exit 0)
   const hook = program.command('hook').description('Claude Code hook handlers (container only)');
+  // Exit explicitly once the decision is written: an open stdin or DB handle must not keep node alive (a hang
+  // would defeat the fail-closed gates). The empty write's callback fires after earlier stdout writes flushed.
+  const exitHook = () => { process.stdout.write('', () => process.exit(0)); };
   const hookLoader = async () => context();
   hook.command('stop').description('Stop hook: continue only when runnable work and capacity exist')
-    .action(async () => { await runHook('stop', hookLoader); process.exitCode = 0; });
+    .action(async () => { await runHook('stop', hookLoader); exitHook(); });
   hook.command('pre-agent').description('PreToolUse(Agent) hook: minions workers need an active lease')
-    .action(async () => { await runHook('pre-agent', hookLoader); process.exitCode = 0; });
+    .action(async () => { await runHook('pre-agent', hookLoader); exitHook(); });
   hook.command('pre-telegram').description('PreToolUse(Telegram tools) hook: only the coordinator itself may use them, never a subagent')
-    .action(async () => { await runHook('pre-telegram', hookLoader); process.exitCode = 0; });
+    .action(async () => { await runHook('pre-telegram', hookLoader); exitHook(); });
   // DB only (no config or backlog): it runs on every worker tool call while a drain is requested.
   hook.command('drain').description('PreToolUse(every tool) hook during a drain: leased workers commit work in progress and return partial results')
-    .action(async () => { await runHook('drain', () => ({ db: getDb() })); process.exitCode = 0; });
+    .action(async () => { await runHook('drain', () => ({ db: getDb() })); exitHook(); });
 
   // coordinator
   const coord = program.command('coordinator').description('Launch or attach the coordinator Claude Code session (tmux)')

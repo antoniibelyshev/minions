@@ -461,7 +461,7 @@ describe('Telegram tools are coordinator-only', () => {
     const settings = JSON.parse(on.args[on.args.indexOf('--settings') + 1]!);
     const entries = settings.hooks.PreToolUse as { matcher: string; hooks: { type: string; command: string }[] }[];
     expect(entries).toHaveLength(1);
-    expect(entries[0]!.hooks).toEqual([{ type: 'command', command: TELEGRAM_HOOK_COMMAND }]);
+    expect(entries[0]!.hooks).toEqual([{ type: 'command', command: TELEGRAM_HOOK_COMMAND, timeout: 30 }]);
     const matcher = new RegExp(`^(?:${entries[0]!.matcher})$`);
     for (const t of TELEGRAM_ALL_TOOLS) expect(matcher.test(t), t).toBe(true);
     expect(TELEGRAM_ALL_TOOLS).toEqual(['reply', 'react', 'edit_message', 'download_attachment'].map((t) => `mcp__plugin_telegram_telegram__${t}`));
@@ -475,7 +475,7 @@ describe('Telegram tools are coordinator-only', () => {
     const on = await buildClaudeCommand(telegramCfg(), paths, { telegram: true });
     const settings = JSON.parse(on.args[on.args.indexOf('--settings') + 1]!);
     const command = settings.hooks.PreToolUse[0].hooks[0].command as string;
-    expect(command).toBe('minions hook pre-telegram || exit 2');
+    expect(command).toBe('timeout 20 minions hook pre-telegram || exit 2');
     const stdin = JSON.stringify({ hook_event_name: 'PreToolUse', tool_name: 'mcp__plugin_telegram_telegram__reply', tool_input: { chat_id: '1', text: 'hi' } });
     // Exit 2 is the only blocking PreToolUse exit; 127 (not found), 1 (crash) or 137 (killed) would allow the call.
     expect(runHookCommand(command, null, stdin).status).toBe(2);
