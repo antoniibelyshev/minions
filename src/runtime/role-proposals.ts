@@ -296,6 +296,8 @@ export function markApplied(deps: { db: RuntimeDb; config: MinionsConfig }, id: 
 export interface RoleView {
   name: string; builtin: boolean; description: string; contract: RoleDef['contract']; worktree: RoleDef['worktree'];
   stageStatus: RoleDef['stageStatus']; edits: RoleDef['edits']; commits: boolean; model: string | null;
+  /** The agent runtime the role runs on (own harness > harnesses.default where the phase allows > claude). */
+  harness: RoleDef['harness'];
   /** Named workflows whose stages use the role. */
   workflows: string[];
 }
@@ -308,7 +310,7 @@ export function workflowsUsing(cfg: Pick<MinionsConfig, 'workflows'>, role: stri
 export function roleView(cfg: MinionsConfig, def: RoleDef): RoleView {
   return {
     name: def.name, builtin: def.builtin, description: def.description, contract: def.contract, worktree: def.worktree,
-    stageStatus: def.stageStatus, edits: def.edits, commits: def.commits, model: def.model ?? null, workflows: workflowsUsing(cfg, def.name),
+    stageStatus: def.stageStatus, edits: def.edits, commits: def.commits, model: def.model ?? null, harness: def.harness, workflows: workflowsUsing(cfg, def.name),
   };
 }
 
@@ -330,7 +332,7 @@ export function showRole(cfg: MinionsConfig, name: string): ShowRole {
 }
 
 export function formatRoleLine(r: RoleView): string {
-  return displayText(`${r.name}${r.builtin ? ' (built-in)' : ''}  ${r.contract}  edits ${editScope(r.edits)}${r.workflows.length ? `  workflows ${r.workflows.join(', ')}` : ''}  - ${r.description}`);
+  return displayText(`${r.name}${r.builtin ? ' (built-in)' : ''}  ${r.contract}  edits ${editScope(r.edits)}  harness ${r.harness}${r.workflows.length ? `  workflows ${r.workflows.join(', ')}` : ''}  - ${r.description}`);
 }
 
 export function formatProposalLine(p: ProposalView): string {
