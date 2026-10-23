@@ -7,7 +7,8 @@ import { PROFILES, type Profile } from '../config/schema.js';
 import { action, globalOpts, requireMode } from '../core/cli-helpers.js';
 import { MinionsError } from '../core/errors.js';
 import { emit } from '../core/output.js';
-import { CONTAINER } from '../core/paths.js';
+import { CONTAINER, projectPaths } from '../core/paths.js';
+import { STATE_BACKUP_DIRS, STATE_BACKUP_FILES } from '../runtime/state-backup.js';
 import { registerAuth } from './auth-cli.js';
 import { authOf, isKeyAuth, refreshKey, startRefreshTimer } from './auth.js';
 import type { MinionsConfig } from '../config/schema.js';
@@ -20,9 +21,9 @@ import { dockerProbe } from './discovery.js';
 import { Compose, ensureImage, packageRoot } from './docker.js';
 import { applyDoctorExit, formatDoctor, runDoctor } from './doctor.js';
 import { checkPlugin, dockerUnavailable, formatInit, pluginMismatch, refreshDerived, runInit } from './install.js';
-import { loadEffectiveConfig, loadProjectJson } from './project.js';
+import { loadEffectiveConfig, loadProjectJson, type ProjectJson } from './project.js';
 import { projectForPath } from './registry.js';
-import { exportRepo, importRepo } from './transfer.js';
+import { composeTarget, exportRepo, exportState, importRepo, importState, inspectStateBackup, type TransferTarget } from './transfer.js';
 import { HOST_RUNTIME_WARNING, HostRuntime, RUNTIMES, prepareHostRuntime, requireHostTools, runtimeOf, type RuntimeKind } from './runtime.js';
 import { registerRuntime } from './runtime-cli.js';
 import { HOST_CHANNEL_WARNING, formatChannelSet, hostChannel, offerAutoChannel, registerChannel } from './channel-cli.js';
@@ -269,6 +270,53 @@ async function confirm(question: string): Promise<boolean> {
 }
 
 /** Registers host commands on the root program. */
+/** The running runtime's transfer target (no auto-start: a backup or restore needs the runtime already up). */
+async function runningTarget(projectId: string): Promise<{ project: ProjectJson; target: TransferTarget; runtime: 'host' | 'docker' }> {
+  const project = await loadProjectJson(projectId);
+  if (runtimeOf(project) === 'host') {
+    const host = new HostRuntime(project);
+    if (!(await host.prepared())) throw new MinionsError('PRECONDITION', 'The host runtime has not been started for this project.', 'Run `minions start --no-attach` first.');
+    await prepareHostRuntime(project);
+    return { project, target: host.transferTarget(), runtime: 'host' };
+  }
+  await requireDocker();
+  const compose = new Compose(projectId);
+  if (!(await compose.isRunning())) throw new MinionsError('PRECONDITION', 'The project container is not running.', 'Run `minions start --no-attach` first.');
+  return { project, target: composeTarget(compose), runtime: 'docker' };
+}
+
+async function exportStateCommand(out: string | undefined, o: { json: boolean; dryRun: boolean }): Promise<void> {
+  const { projectId } = await projectForPath(process.cwd());
+  if (o.dryRun) {
+    emit({ dryRun: true, archive: out ? resolvePath(out) : `${projectPaths(projectId).exportsDir}/state-<time>.tar.gz`, includes: [...STATE_BACKUP_DIRS, ...STATE_BACKUP_FILES, 'minions.db (snapshot)'],
+      excludes: ['secrets and tokens', 'the Claude login', 'import/', 'exports/', 'logs/', 'cache/', 'the workspace (use `minions export` for branches)'] }, { json: o.json });
+    return;
+  }
+  const { project, target } = await runningTarget(projectId);
+  const r = await exportState(project, { out, target });
+  emit(r, { json: o.json, human: (d: typeof r) => [`State backup: ${d.archive} (${d.files} files, ${d.bytes} bytes, schema ${d.schemaVersion})`,
+    ...d.skipped.map((s) => `  skipped ${s.path}: ${s.reason}`),
+    ...(d.activeLeases ? [`warning: ${d.activeLeases} worker lease(s) were active; their in-flight work is not in the backup.`] : []),
+    `Restore with: minions import --state ${d.archive}`].join('\n') });
+}
+
+async function importStateCommand(file: string, o: { force: boolean; json: boolean; dryRun: boolean }): Promise<void> {
+  const { projectId } = await projectForPath(process.cwd());
+  if (o.dryRun) {
+    const { archive, manifest } = await inspectStateBackup(file);
+    emit({ dryRun: true, archive, valid: true, createdAt: manifest.createdAt, minionsVersion: manifest.minionsVersion, schemaVersion: manifest.schemaVersion, files: manifest.files.length, force: o.force },
+      { json: o.json, human: () => `Would restore ${manifest.files.length} files from a valid backup of ${manifest.createdAt} (schema ${manifest.schemaVersion}); the current state would be kept under <state>/pre-restore/.` });
+    return;
+  }
+  // Validate before touching the runtime (importState validates again before copying).
+  await inspectStateBackup(file);
+  const { project, target, runtime } = await runningTarget(projectId);
+  const r = await importState(project, file, { force: o.force, target });
+  emit(r, { json: o.json, human: (d: typeof r) => [`Restored ${d.files} files into the ${runtime === 'host' ? 'host runtime' : 'container'} state from ${d.archive} (backup of ${d.createdAt}).`,
+    ...(d.container.previous ? [`Previous state kept in ${d.container.previous} (inside the runtime).`] : []),
+    ...d.container.warnings.map((w) => `warning: ${w}`)].join('\n') });
+}
+
 export function register(program: Command): void {
   const auth = registerAuth(program, async (plan) => { process.stderr.write(plan + '\n'); return confirm('Apply? (y/n)'); });
   program.command('init [path]')
@@ -515,11 +563,15 @@ export function register(program: Command): void {
     }));
 
   program.command('import')
-    .description('Import committed history of the base branch into the runtime workspace (git bundle)')
+    .description('Import committed history of the base branch into the runtime workspace (git bundle); with --state, restore a state backup instead')
+    .option('--state <file>', 'restore runtime state (backlog, notes, briefs, results, runtime DB) from a backup written by `minions export --state`')
+    .option('--force', 'with --state: restore even while worker leases are active or the coordinator holds the project lock')
     .option('--dry-run', 'show what would be imported')
-    .action(action(async (_o: unknown, cmd: Command) => {
+    .action(action(async (o: { state?: string; force?: boolean }, cmd: Command) => {
       requireMode('host');
       const { json, dryRun } = globalOpts(cmd);
+      if (o.force && !o.state) throw new MinionsError('PRECONDITION', '--force applies only to --state.', 'Use `minions import --state <file> --force`.');
+      if (o.state) return importStateCommand(o.state, { force: !!o.force, json, dryRun });
       if (dryRun) {
         const { projectId } = await projectForPath(process.cwd());
         const p = await loadProjectJson(projectId);
@@ -537,11 +589,13 @@ export function register(program: Command): void {
     }));
 
   program.command('export')
-    .description('Fetch agent branches from the runtime workspace into refs/remotes/minions/* (non-destructive)')
+    .description('Fetch agent branches from the runtime workspace into refs/remotes/minions/* (non-destructive); with --state, write a state backup instead')
+    .option('--state [file]', 'write a backup of the runtime state (backlog, notes, briefs, results, runtime DB snapshot; no secrets, no Claude login) to <file> (default: <project>/exports/state-<time>.tar.gz)')
     .option('--dry-run', 'show what would be exported')
-    .action(action(async (_o: unknown, cmd: Command) => {
+    .action(action(async (o: { state?: string | boolean }, cmd: Command) => {
       requireMode('host');
       const { json, dryRun } = globalOpts(cmd);
+      if (o.state !== undefined) return exportStateCommand(typeof o.state === 'string' ? o.state : undefined, { json, dryRun });
       const ref = await projectForPath(process.cwd());
       if (dryRun) { emit({ dryRun: true, target: 'refs/remotes/minions/*' }, { json }); return; }
       const project = await loadProjectJson(ref.projectId);

@@ -238,6 +238,7 @@ export class HostRuntime {
     const dirs = async (d: string) => { await ensureRealDir(hp.root); await ensureRealDir(hp.transfer); await ensureRealDir(d); };
     return {
       dirs: { import: hp.import, exports: hp.exports },
+      hostFs: true,
       exec: async (args: string[], opts?: RunOptions) => { await dirs(hp.exports); return this.exec(args, opts); },
       putFile: async (local: string, remote: string) => { await dirs(hp.import); await rm(remote, { force: true }); await copyRegularFileNoFollow(local, remote); },
       getFile: async (remote: string, local: string) => { await copyRegularFileNoFollow(remote, local); },

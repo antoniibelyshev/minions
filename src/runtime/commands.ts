@@ -38,6 +38,7 @@ import { ciStatus, formatCiStatus, formatSync, syncTasks, type SyncReport } from
 import { formatIntake, intakeProvenanceFallback, originRepository, syncIntake, type IntakeSyncReport } from './intake-sync.js';
 import { ghWithTimeout, type GhFn } from './publish.js';
 import { exportWorkspace, importWorkspace, setupState } from './workspace.js';
+import { createStateBackup, restoreStateBackup } from './state-backup.js';
 import { cancelWork, formatCancel } from './controls.js';
 import { ack, counts as outboxCounts, enqueue, fail, formatCounts, formatItems, pending, type OutboxCounts } from './outbox.js';
 import { git, workspaceLayout } from './worktree.js';
@@ -686,6 +687,23 @@ export function register(program: Command): void {
       requireMode('runtime');
       const r = await exportWorkspace(out, { base: (await getConfig()).git.baseBranch });
       emit(r, { json: globalOpts(cmd).json, human: (d) => `Wrote ${d.path}\n${d.refs.join('\n')}` });
+    }));
+
+  // State backup/restore (host: `minions export --state` / `minions import --state`; src/runtime/state-backup.ts).
+  ws.command('state-export <outPath>').description('Write a state backup (backlog, notes, briefs, results, DB snapshot; no secrets) to a new file')
+    .action(action(async (out: string, _o: unknown, cmd: Command) => {
+      requireMode('runtime');
+      const r = await createStateBackup(runtimePaths(), out);
+      emit(r, { json: globalOpts(cmd).json, human: (d: typeof r) => [`Wrote ${d.path} (${d.files} files, ${d.bytes} bytes, schema ${d.schemaVersion})`,
+        ...d.skipped.map((s) => `skipped ${s.path}: ${s.reason}`)].join('\n') });
+    }));
+  ws.command('state-import <archive>').description('Restore a state backup written by state-export (refused while leases or the coordinator are active unless --force)')
+    .option('--force', 'restore even while worker leases are active or a coordinator holds the project lock')
+    .action(action(async (archive: string, o: { force?: boolean }, cmd: Command) => {
+      requireMode('runtime');
+      const r = await restoreStateBackup(runtimePaths(), archive, { force: o.force });
+      emit(r, { json: globalOpts(cmd).json, human: (d: typeof r) => [`Restored ${d.restored.files} files from a backup of ${d.restored.createdAt} (schema ${d.restored.schemaVersion}).`,
+        ...(d.previous ? [`Previous state moved to ${d.previous}`] : []), ...d.warnings.map((w) => `warning: ${w}`)].join('\n') });
     }));
 
   // sync: one-shot GitHub intake import (when intake.github is enabled) plus a refresh of PR state and
