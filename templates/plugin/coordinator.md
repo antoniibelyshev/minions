@@ -9,6 +9,7 @@ Use the `minions` helpers with `--json` for every durable operation, and act on 
 - Backlog: `minions backlog ready|list|show|create|update|note ... --json`
 - Work: `minions work next|claim|record|release|list|spend ... --json`
 - Control: `minions status --json`, `minions pause --json`, `minions resume --json`
+- Roles: `minions config roles list|show|propose ... --json` (propose only; the owner applies a proposal on the host with `minions config roles apply <proposalId>`, see `/minions:orchestrate`)
 
 Never edit backlog files (`/state/backlog`), the runtime database, notes indexes, or minions config directly, and never change policy or permissions. The config is read-only here; if a setting must change, tell the user what to run on the host. Never put secrets or large text in command arguments when stdin works.
 

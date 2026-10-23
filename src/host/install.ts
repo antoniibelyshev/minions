@@ -1,7 +1,7 @@
 // init: inspect → propose (plan) → apply (journal, atomic writes, manifest, rollback) → verify.
 import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { dirname, join, relative, sep } from 'node:path';
+import { dirname, join, relative, resolve, sep } from 'node:path';
 import { z } from 'zod';
 import { can } from '../config/capabilities.js';
 import { DEFERRED_FEATURES, listUnavailable, validateConfig, type Unavailable } from '../config/resolve.js';
@@ -388,8 +388,12 @@ async function prepare(opts: InitOptions, docker?: DockerStatus): Promise<Prepar
     writes.push({ path: sharedPath, action: 'keep', inRepo: true, note: 'existing shared configuration is the source of truth' });
   }
   const wanted = new Set(desired.map((d) => d.path));
+  // Role prompt files the config references are owner content and are never removed. An older
+  // `config roles apply` tracked them in the manifest; such an entry is dropped from the manifest here.
+  const configDir = roleConfigDir(project);
+  const rolePrompts = new Set(Object.values(effective.roles ?? {}).flatMap((r) => (typeof r?.prompt === 'string' ? [resolve(configDir, r.prompt)] : [])));
   for (const [p, h] of inManifest) {
-    if (wanted.has(p) || p === sharedPath) continue;
+    if (wanted.has(p) || p === sharedPath || rolePrompts.has(resolve(p))) continue;
     const cur = await fileHash(p);
     if (cur === undefined) continue;
     writes.push(cur === h ? { path: p, action: 'remove', inRepo: isInside(p, repoPath) }
