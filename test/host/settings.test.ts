@@ -410,6 +410,31 @@ describe('tester additions (task-23)', () => {
     expect(text).toMatch(/Setting to change \[1-\d+, q = quit\]/);
   });
 
+  it('terminalMenuIO on a non-TTY stdin: end of input at the restart prompt is no, not the (Y/n) default', async () => {
+    const { PassThrough } = await import('node:stream');
+    const { project } = await install('private');
+    const f = fakeRuntime({ running: true });
+    const stdin = new PassThrough();
+    const out = new PassThrough();
+    let text = '';
+    out.on('data', (d: Buffer) => { text += d.toString(); });
+    // communication.progress milestones -> tasks (choice 2): needs a restart, loosens nothing; then 'q' and end of input.
+    stdin.end([indexOf('communication.progress') + 1, 2, 'q'].join('\n') + '\n');
+    const changed = await M.runSettingsMenu(project, { io: M.terminalMenuIO(stdin as unknown as NodeJS.ReadStream, out), runtime: f.runtime, runAuth: async () => {} });
+    expect(changed).toEqual(['communication.progress']);
+    expect(text).toContain('Restart later');
+    expect(f.calls.some((c) => c[1] === 'coordinator')).toBe(false);
+  });
+
+  it('TTY: Enter at the restart prompt takes the shown default (restart)', async () => {
+    const { project } = await install('private');
+    const f = fakeRuntime();
+    const down = indexOf('communication.progress');
+    const t = fakeIO(true, [...Array(down).fill('down'), 'enter', 'down', 'enter', 'quit'], ['']);
+    await M.runSettingsMenu(project, { io: t.io, runtime: f.runtime, runAuth: async () => {} });
+    expect(f.calls).toContainEqual(['minions', 'coordinator', 'restart', '--recover', '--json']);
+  });
+
   it('terminalMenuIO on a non-TTY stdin: end of input quits the menu without changes', async () => {
     const { PassThrough } = await import('node:stream');
     const { project, local } = await install('private');

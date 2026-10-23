@@ -19,8 +19,8 @@ export interface MenuIO {
   write(text: string): void;
   /** Next key press (tty mode only). */
   key(): Promise<MenuKey>;
-  /** One line of input (no secrets are ever asked here). */
-  line(prompt: string): Promise<string>;
+  /** One line of input (no secrets are ever asked here); null = end of input. */
+  line(prompt: string): Promise<string | null>;
   close?(): void;
 }
 
@@ -64,7 +64,7 @@ const ordered = (views: SettingView[]) => SETTING_GROUPS.flatMap((g) => views.fi
 async function pick(io: MenuIO, title: string, options: string[], current: number): Promise<number | null> {
   if (!io.tty) {
     io.write(`${title}\n${options.map((o, i) => `  ${i + 1}) ${o}${i === current ? ' (current)' : ''}`).join('\n')}\n`);
-    const a = (await io.line(`Choice [1-${options.length}, Enter = keep]: `)).trim();
+    const a = ((await io.line(`Choice [1-${options.length}, Enter = keep]: `)) ?? '').trim();
     if (!a) return null;
     const n = Number(a);
     if (!Number.isInteger(n) || n < 1 || n > options.length) { io.write(`Not a choice: ${a}\n`); return null; }
@@ -82,8 +82,10 @@ async function pick(io: MenuIO, title: string, options: string[], current: numbe
 }
 
 const yesNo = (io: MenuIO) => async (q: string): Promise<boolean> => {
-  const a = (await io.line(`${q} `)).trim().toLowerCase();
-  if (!a) return /\(Y\/n\)/.test(q);
+  const raw = await io.line(`${q} `);
+  if (raw === null) return false; // end of input is never a yes
+  const a = raw.trim().toLowerCase();
+  if (!a) return io.tty && /\(Y\/n\)/.test(q); // Enter takes the shown default on a TTY only
   return a === 'y' || a === 'yes';
 };
 
@@ -102,7 +104,7 @@ async function askValue(io: MenuIO, v: SettingView): Promise<string | null> {
     const i = await pick(io, `${v.label} (${v.key})`, choices, choices.indexOf(formatValue(v.value)));
     return i === null ? null : choices[i]!;
   }
-  const a = (await io.line(`${v.label} (${v.key}) [${formatValue(v.value)}]${v.type === 'models' ? ' (comma-separated)' : v.type === 'list' ? ' (comma-separated; none = keep every tool; default = unset)' : ''}: `)).trim();
+  const a = ((await io.line(`${v.label} (${v.key}) [${formatValue(v.value)}]${v.type === 'models' ? ' (comma-separated)' : v.type === 'list' ? ' (comma-separated; none = keep every tool; default = unset)' : ''}: `)) ?? '').trim();
   return a || null;
 }
 
@@ -139,7 +141,7 @@ export async function runSettingsMenu(project: ProjectJson, deps: MenuDeps): Pro
           lines.push(`  ${String(i + 1).padStart(2)}) ${rowText(v)}`);
         });
         io.write([...lines, ...status, ''].join('\n'));
-        const a = (await io.line(`Setting to change [1-${views.length}, q = quit]: `)).trim();
+        const a = ((await io.line(`Setting to change [1-${views.length}, q = quit]: `)) ?? '').trim();
         if (!a || a === 'q') break;
         const n = Number(a);
         if (!Number.isInteger(n) || n < 1 || n > views.length) { status = [`Not a setting number: ${a}`]; continue; }
@@ -185,17 +187,17 @@ const currentToken = (ctx: Awaited<ReturnType<typeof loadSettingsContext>>, kind
 /**
  * Line reader for a non-TTY stdin (a pipe or a terminal emulator without a TTY): one readline interface for
  * the whole menu, so lines that arrive together are queued instead of lost between prompts. At end of input
- * every read answers "" (the menu's "quit" / "keep" / the prompt's default), so the menu always ends.
+ * every read answers null (the menu's "quit" / "keep"; never a yes), so the menu always ends.
  */
-function pipedLines(stdin: NodeJS.ReadableStream): { next(): Promise<string>; close(): void } {
+function pipedLines(stdin: NodeJS.ReadableStream): { next(): Promise<string | null>; close(): void } {
   const rl = createInterface({ input: stdin, terminal: false });
   const queue: string[] = [];
-  const waiting: ((l: string) => void)[] = [];
+  const waiting: ((l: string | null) => void)[] = [];
   let ended = false;
   rl.on('line', (l) => { const w = waiting.shift(); if (w) w(l); else queue.push(l); });
-  rl.on('close', () => { ended = true; while (waiting.length) waiting.shift()!(''); });
+  rl.on('close', () => { ended = true; while (waiting.length) waiting.shift()!(null); });
   return {
-    next: () => (queue.length ? Promise.resolve(queue.shift()!) : ended ? Promise.resolve('') : new Promise((r) => { waiting.push(r); })),
+    next: () => (queue.length ? Promise.resolve(queue.shift()!) : ended ? Promise.resolve(null) : new Promise((r) => { waiting.push(r); })),
     close: () => rl.close(),
   };
 }
