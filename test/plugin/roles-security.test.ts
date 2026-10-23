@@ -125,6 +125,20 @@ describe('tool stripping: a project role never gets Agent, SendMessage, Task or 
     'Agent(worker)', 'Task(x)', 'SendMessage(x)', 'agent(x)',
     'mcp__plugin_telegram_telegram__reply', 'MCP__x__y', 'Mcp__x', 'mcp', 'mcp__x__*', '*', 'Agent*', 'A*'];
 
+  it('roleTools strips spaced and padded spellings but keeps tools that merely contain those words', () => {
+    const kept = ['TaskOutput', 'AgentLogs', 'tasklist', 'TaskStop', 'MySendMessage', 'Read'];
+    const stripped = ['Agent (x)', ' agent', 'agent ', '\tTask', 'Task (x)', ' SendMessage (y)', 'SENDMESSAGE '];
+    expect(roleTools({ tools: [...stripped, ...kept], edits: 'any', worktree: 'branch' })).toEqual(kept);
+  });
+
+  it('resolveRolePrompt rejects a directory as the prompt file with INVALID_CONFIG', async () => {
+    const configDir = mk('minions-roles-dir-');
+    mkdirSync(join(configDir, 'prompts'));
+    const e = await failure(resolveRolePrompt({ name: 'r', prompt: 'prompts' }, configDir));
+    expect(e.code).toBe('INVALID_CONFIG');
+    expect(e.message).toMatch(/not a regular file/);
+  });
+
   it('roleTools strips every spelling', () => {
     expect(roleTools({ tools: ['Read', ...hostile, 'Bash'], edits: 'any', worktree: 'branch' })).toEqual(['Read', 'Bash']);
   });
