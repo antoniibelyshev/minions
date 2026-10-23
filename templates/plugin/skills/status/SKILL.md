@@ -11,8 +11,8 @@ description: Concise minions project status - queue, active workers, blockers, d
 
 Answer in a few lines:
 
-- Paused or running; active tasks/limits ({{maxActiveTasks}} tasks, {{maxEngineers}} engineers).
-- In progress: task, stage, attempt.
+- Paused or running; active tasks/limits ({{maxActiveTasks}} tasks; per role from `capacity.byRole` in the status, limits {{roleLimits}}).
+- In progress: task, stage (role and workflow position), attempt. `minions work next --json` shows what can start next and what waits (and why).
 - Waiting on the user: each item with the question and your recommended answer.
 - Blocked: task and reason.
 - Delivered since last report: task and `agent/<slug>` branch, grouped by feature (parent task or goal) when several belong together. Remind the user that `minions export` on the host fetches them.

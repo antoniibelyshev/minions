@@ -5,10 +5,11 @@ import { fileURLToPath } from 'node:url';
 import { CAPABILITIES, can, type Capability } from '../config/capabilities.js';
 import { AGENT_MODEL_ALIASES, engineerDeepEffort, isAgentModelAlias, roleEffort } from '../config/models.js';
 import {
-  BUILTIN_TOOLS, customRoles, deepVariantEffort, DEEP_SUFFIX, ENGINEER_ROLE, registeredRoleNames, roleLimit, workerRole,
+  BUILTIN_TOOLS, customRoles, deepVariantEffort, DEEP_SUFFIX, ENGINEER_ROLE, registeredRoleNames, roleLimit, workerRole, workerRoleNames,
   type BuiltinWorkerRole, type RoleDef,
 } from '../config/roles.js';
 import type { MinionsConfig, Role } from '../config/schema.js';
+import { DEFAULT_WORKFLOW, resolveWorkflow, workflowNames } from '../config/workflows.js';
 import { MinionsError } from '../core/errors.js';
 import { atomicWrite, sha256 } from '../core/fsutil.js';
 import { configuredPermissionMode } from '../runtime/coordinator.js';
@@ -383,6 +384,23 @@ function outboxCheck(cfg: MinionsConfig): string {
   return 'First, even when paused or draining, when this session has the Telegram channel: send what `minions notify pending --json` lists with `reply` and ack each (`minions notify ack <key> --json`); on a failure run `minions notify fail <key> --error "<reason>" --json` and stop sending until the next wake. Never wait or loop for the channel to come back.';
 }
 
+/** Configured workflows for the coordinator (D11): names and stages, and how a task gets one. */
+function workflowGuidance(cfg: MinionsConfig): string {
+  const named = Object.keys(cfg.workflows ?? {}).filter((n) => n !== DEFAULT_WORKFLOW);
+  const stages = (n: string) => (resolveWorkflow(cfg, n)?.stages ?? []).map((st) => st.role + (st.when === 'qa' ? ' (QA)' : '') + (st.model ? ` [${st.model}]` : '')).join(' → ');
+  const own = Object.hasOwn(cfg.workflows ?? {}, DEFAULT_WORKFLOW) ? ` The project configures \`default\` itself: ${stages(DEFAULT_WORKFLOW)}.` : '';
+  if (!named.length) return `No other workflows are configured: tasks run the default.${own}`;
+  return `Configured workflows: ${named.map((n) => `${code(n)} (${stages(n)})`).join('; ')}. A task runs the workflow assigned at creation (\`--workflow <name>\`, see \`/minions:orchestrate\`), else the default.${own}`;
+}
+
+/** Worker roles with a concurrency limit (execution.maxByRole / maxEngineers); the others only count against the task limit. */
+function roleLimits(cfg: MinionsConfig): string {
+  const roles = workerRoleNames(cfg);
+  const limited = roles.flatMap((r) => { const n = roleLimit(cfg, r); return n === undefined ? [] : [`${r} ${n}`]; });
+  const rest = roles.length > limited.length ? 'other roles only by the task limit' : '';
+  return [limited.join(', '), rest].filter(Boolean).join('; ') || 'none';
+}
+
 function baseVars(cfg: MinionsConfig): Record<string, string> {
   return {
     telegramGuidance: telegramGuidance(cfg),
@@ -411,6 +429,9 @@ function baseVars(cfg: MinionsConfig): Record<string, string> {
     maxActiveTasks: String(cfg.execution.maxActiveTasks),
     maxEngineers: String(roleLimit(cfg, ENGINEER_ROLE) ?? cfg.execution.maxActiveTasks),
     maxRepairCyclesBeforeReplan: String(cfg.execution.maxRepairCyclesBeforeReplan),
+    roleLimits: roleLimits(cfg),
+    workflowGuidance: workflowGuidance(cfg),
+    workflowNames: inlineList(workflowNames(cfg).filter((n) => n !== DEFAULT_WORKFLOW), 'none configured yet'),
     deliveryMode: cfg.delivery.mode,
     deliveryGuidance: deliveryGuidance(cfg),
     baseBranch: cfg.git.baseBranch,

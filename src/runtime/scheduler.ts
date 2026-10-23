@@ -3,7 +3,9 @@ import { readFileSync } from 'node:fs';
 import type { BacklogAdapter, ScopeFilter, Task, TaskStatus } from '../backlog/types.js';
 import { can, matchesAny } from '../config/capabilities.js';
 import { isGithubDelivery } from '../config/delivery.js';
-import { baseRoleName, ENGINEER_ROLE, exactWorkerRole, roleLimit, workerRole, workerRoleNames, type RoleDef } from '../config/roles.js';
+import { notReadyReason, sortByPriority } from '../backlog/ready.js';
+import { suggestModel, type ModelSuggestion } from '../config/models.js';
+import { baseRoleName, DEEP_SUFFIX, ENGINEER_ROLE, exactWorkerRole, TESTER_ROLE, roleLimit, workerRole, workerRoleNames, type RoleDef } from '../config/roles.js';
 import type { MinionsConfig, RoleContract } from '../config/schema.js';
 import {
   claimableStatuses, configuredStages, contractOf, derivePosition, finalGateIndex, nextRunnable, parseStages, positionForRole, repairTarget,
@@ -108,6 +110,43 @@ export const isQaSweep = (task: Pick<Task, 'labels'>): boolean => task.labels.in
  */
 export interface StagePlan { workflow: string; stages: Stage[]; position: number }
 
+
+/** One stage `minions work next` lists (D12): claim it with `work claim <taskId>`, spawn `agentType`. */
+export interface NextStage {
+  taskId: string; title: string; status: TaskStatus; priority: Task['priority'];
+  /** "qa-sweep": a tester against the base branch (no workflow, position or count). */
+  kind: 'task' | 'qa-sweep';
+  role: string;
+  /** The Agent `subagent_type`: `minions:<role>`, or `minions:<role>-deep` for risk:high / a repair after a failed attempt. */
+  agentType: string;
+  position: number | null; count: number | null; workflow: string | null;
+  /** D12: stage hint > role model > risk rule > models.default (always the default with selection "fixed"). */
+  suggestedModel: string;
+  /** The Agent call's `model`: null = omit it (the definition runs suggestedModel, or it is a full ID). */
+  agentModel: string | null;
+  modelRule: ModelSuggestion['rule'];
+  reason: string;
+}
+
+/** A stage that could run but cannot start now. */
+export interface WaitingStage extends NextStage {
+  /** starts: paused, draining or the owner budget; capacity: active task limit; role-capacity: execution.maxByRole; requires: a stage capability not allowed. */
+  waitingOn: 'starts' | 'capacity' | 'role-capacity' | 'requires';
+  why: string;
+}
+
+/** A task in a stage status without a lease from which no stage can be claimed (or whose workflow is not configured). */
+export interface StuckTask { taskId: string; status: TaskStatus; reason: string }
+
+export interface NextReport {
+  runnable: NextStage[];
+  waiting: WaitingStage[];
+  stuck: StuckTask[];
+  /** Why nothing may start (the error a claim would return), or null. */
+  startsBlocked: { code: string; message: string; hint?: string } | null;
+  capacity: Capacity;
+  message: string;
+}
 
 /** Why a task needs a tester stage; empty = engineer → reviewer only. `record` = add the QA label to the task. */
 export interface QaRequirement { reasons: string[]; record: boolean }
@@ -387,14 +426,26 @@ export class Scheduler {
    * status-derived position of stagePlan. Without a stage row or a branch head nothing changes.
    */
   private async reconcileWorkflowChange(task: Task): Promise<Task> {
+    const r = await this.workflowReset(task);
+    if (!r) return task;
+    const updated = r.status !== task.status ? await this.backlog.updateTask(task.id, task.version, { status: r.status }) : task;
+    this.db.transaction(() => {
+      this.db.setTaskStage(task.id, r.workflow.name, r.workflow.stages, r.position);
+      this.db.addEvent('workflow-reset', task.id, { from: r.from, to: r.workflow.name, head: r.head, position: r.position, role: r.workflow.stages[r.position]!.role, fromStatus: task.status, status: r.status });
+    });
+    return updated;
+  }
+
+  /** The reset reconcileWorkflowChange would apply (read-only; `work next` previews it): null = no reset. */
+  private async workflowReset(task: Task): Promise<{ from: string; workflow: Workflow; head: string; position: number; status: TaskStatus } | null> {
     const cfg = this.config;
     const row = this.db.taskStage(task.id);
-    if (!row) return task;
+    if (!row) return null;
     const wf = this.workflowOf(task);
-    if (row.workflow === wf.name || !wf.stages.length) return task;
-    if (!(['ready', 'changes-requested', 'implementing', 'testing', 'reviewing'] as TaskStatus[]).includes(task.status)) return task;
+    if (row.workflow === wf.name || !wf.stages.length) return null;
+    if (!(['ready', 'changes-requested', 'implementing', 'testing', 'reviewing'] as TaskStatus[]).includes(task.status)) return null;
     const head = await headOf(this.layout.repo, this.branchForTask(task).branch);
-    if (!head) return task;
+    if (!head) return null;
     const evidence = this.db.evidenceFor(task.id, head, undefined, cfg.configRevision);
     const done = (s: Stage) => evidence.some((e) => e.kind === s.role && e.outcome === 'complete');
     const qa = wf.stages.some((s) => s.when === 'qa') && (await this.qaRequirement(task, head)).reasons.length > 0;
@@ -402,12 +453,33 @@ export class Scheduler {
     if (position < 0) { const gate = finalGateIndex(cfg, wf.stages); position = gate >= 0 ? gate : wf.stages.length - 1; }
     const status: TaskStatus = claimableStatuses(cfg, wf.stages, position).includes(task.status) ? task.status
       : position === 0 ? 'changes-requested' : stageStatusOf(cfg, wf.stages[position]!);
-    const updated = status !== task.status ? await this.backlog.updateTask(task.id, task.version, { status }) : task;
-    this.db.transaction(() => {
-      this.db.setTaskStage(task.id, wf.name, wf.stages, position);
-      this.db.addEvent('workflow-reset', task.id, { from: row.workflow, to: wf.name, head, position, role: wf.stages[position]!.role, fromStatus: task.status, status });
-    });
-    return updated;
+    return { from: row.workflow, workflow: wf, head, position, status };
+  }
+
+  /**
+   * The stage a claim of this task would run, without changing anything: the workflow reset of a changed
+   * workflow previewed (with the status it would move to), else stagePlan. null plan = no stage can run.
+   */
+  private async previewStage(task: Task): Promise<{ plan: StagePlan | null; status: TaskStatus; reset: boolean }> {
+    const r = await this.workflowReset(task);
+    if (r) return { plan: { workflow: r.workflow.name, stages: r.workflow.stages, position: r.position }, status: r.status, reset: true };
+    return { plan: this.stagePlan(task), status: task.status, reset: false };
+  }
+
+  /**
+   * The role a claim without --role runs: the tester for a QA sweep, else the current stage's role (after a
+   * previewed workflow reset). PRECONDITION when no stage can run from the task's status.
+   */
+  async stageRole(taskId: string): Promise<LeaseRole> {
+    const task = await this.backlog.getTask(taskId);
+    if (isQaSweep(task)) return 'tester';
+    const { plan } = await this.previewStage(task);
+    const stage = plan?.stages[plan.position];
+    if (!plan || !stage) {
+      throw new MinionsError('PRECONDITION', `Task ${task.id} is "${task.status}"; no stage of its workflow can be claimed from it.`,
+        'Run `minions work next --json` for the runnable stages; re-read the task with `minions backlog show <taskId> --json`.');
+    }
+    return stage.role;
   }
 
   /** The stage a lease runs: the row written at claim when it names the lease's role, else the first stage of that role. */
@@ -426,11 +498,135 @@ export class Scheduler {
       .some((e) => e.outcome === 'complete' && e.kind !== 'check' && workerRole(cfg, e.kind)?.contract === contract);
   }
 
-  async claim(taskId: string, role: LeaseRole, opts: { holder?: string } = {}): Promise<TaskBrief> {
+  /** Whether an ended lease's result was a drain partial (wound down for an upgrade: not a failed attempt). */
+  private wasDrained(lease: Lease): boolean {
+    return this.db.events(lease.task_id, 'record').some((e) => (e.data as { leaseId?: string; drain?: boolean } | null)?.leaseId === lease.id && (e.data as { drain?: boolean }).drain === true);
+  }
+
+  /**
+   * D12 "repair after a failed attempt": the role's last recorded attempt on the task failed (an unvalidated
+   * result, `blocked` or a non-drain `partial`, or a producer's `needs_changes`), or a producer repairs after
+   * an earlier repair did not fix the findings (two or more repair cycles). Released leases do not count.
+   */
+  private attemptFailed(task: Task, role: string, def: RoleDef): boolean {
     const cfg = this.config;
-    // Built-ins and project roles from the registry (exact names; `-deep` is an agent type, not a role).
-    const def = typeof role === 'string' ? exactWorkerRole(cfg, role) : undefined;
-    if (!def) throw new MinionsError('INVALID_CONFIG', `Unknown role "${String(role).slice(0, 40)}" (${workerRoleNames(cfg).join('|')}).`);
+    const last = this.db.leases({ taskId: task.id, all: true })
+      .filter((l) => baseRoleName(cfg, l.role) === role && (l.status === 'completed' || l.status === 'unvalidated')).at(-1);
+    if (last) {
+      if (last.status === 'unvalidated' || last.result_valid !== 1 || !last.result_json) return true;
+      const st = (JSON.parse(last.result_json) as WorkerResult).status;
+      if (st === 'blocked' || (st === 'needs_changes' && def.contract === 'producer')) return true;
+      if (st === 'partial' && !this.wasDrained(last)) return true;
+    }
+    return def.contract === 'producer' && task.status === 'changes-requested' && this.db.repairCycles(task.id) >= 2;
+  }
+
+  /**
+   * `minions work next` (D12, thin runner): every stage a claim could start now, from the stage machine
+   * (stagePlan, with a changed workflow's reset previewed), in dispatch order: tasks already under way first,
+   * then priority. Capacity is applied greedily in that order (`runnable` fits together; the rest is
+   * `waiting` with the limit). Pauses, a drain and the owner budget move everything to `waiting`. Tasks in a
+   * stage status that no stage can be claimed from are `stuck` (recover them). Read-only.
+   */
+  async next(): Promise<NextReport> {
+    const cfg = this.config;
+    const tasks = await this.backlog.listTasks();
+    const leases = this.db.activeLeases();
+    const leased = new Set(leases.map((l) => l.task_id));
+    const byId = new Map(tasks.map((t) => [t.id, t]));
+    const readyCtx = { leased, scope: scopeOf(cfg), lookup: (id: string) => byId.get(id) };
+    const candidates: NextStage[] = [];
+    const stuck: StuckTask[] = [];
+    const waiting: WaitingStage[] = [];
+    const STAGE_STATUSES: TaskStatus[] = ['ready', 'changes-requested', 'implementing', 'testing', 'reviewing'];
+    for (const task of tasks) {
+      if (leased.has(task.id) || !STAGE_STATUSES.includes(task.status)) continue;
+      if (task.status === 'ready' && notReadyReason(task, readyCtx) !== null) continue;
+      if (isQaSweep(task)) {
+        // A QA sweep has no stage plan: a tester checks the base branch, claimed from ready only.
+        if (task.status !== 'ready') { stuck.push({ taskId: task.id, status: task.status, reason: `QA sweep in "${task.status}" without a lease; a sweep is only claimed from ready` }); continue; }
+        const def = workerRole(cfg, TESTER_ROLE)!;
+        const m = suggestModel(cfg, { roleModel: def.model, contract: def.contract, labels: task.labels, deepVariant: def.deepVariant, repairAfterFailure: this.attemptFailed(task, TESTER_ROLE, def) });
+        candidates.push(this.nextEntry(task, def, m, { kind: 'qa-sweep', position: null, count: null, workflow: null },
+          `QA sweep of ${cfg.git.baseBranch}: a tester checks the base branch head`));
+        continue;
+      }
+      let preview: Awaited<ReturnType<Scheduler['previewStage']>>;
+      try { preview = await this.previewStage(task); } catch (e) {
+        stuck.push({ taskId: task.id, status: task.status, reason: (e as Error).message });
+        continue;
+      }
+      const { plan, status, reset } = preview;
+      const stage = plan?.stages[plan.position];
+      if (!plan || !stage || !claimableStatuses(cfg, plan.stages, plan.position).includes(status)) {
+        stuck.push({ taskId: task.id, status: task.status, reason: stage
+          ? `"${task.status}" without a lease: the current stage (${stage.role}, ${plan!.position + 1}/${plan!.stages.length}) cannot be claimed from it; recover the task (release/restore its status)`
+          : `no stage of workflow ${plan?.workflow ?? task.workflow ?? 'default'} runs from "${task.status}"` });
+        continue;
+      }
+      const def = workerRole(cfg, stage.role);
+      if (!def) { stuck.push({ taskId: task.id, status: task.status, reason: `stage role ${stage.role} is not registered` }); continue; }
+      const m = suggestModel(cfg, {
+        stageModel: stage.model, roleModel: def.model, contract: def.contract, labels: task.labels, deepVariant: def.deepVariant,
+        allHinted: configuredStages(plan.stages).every((x) => x.model !== undefined), repairAfterFailure: this.attemptFailed(task, def.name, def),
+      });
+      const at = `stage ${plan.position + 1}/${plan.stages.length} (${stage.role}) of workflow ${plan.workflow}`;
+      const why = [
+        task.status === 'changes-requested' ? `changes-requested: repair (cycle ${this.db.repairCycles(task.id)}) at ${at}` : `${task.status}: ${at}`,
+        stage.inserted === 'qa' ? 'tester inserted: QA required' : stage.inserted === 'legacy' ? 'stage added for a legacy status' : null,
+        reset ? `workflow changed: the claim resets the position by evidence at the head${status !== task.status ? ` and moves the task to ${status}` : ''}` : null,
+      ].filter(Boolean).join('; ');
+      const entry = this.nextEntry(task, def, m, { kind: 'task', position: plan.position, count: plan.stages.length, workflow: plan.workflow }, why);
+      const refused = def.requires.find((cap) => can(cfg, cap, { role: def.name }) !== 'allow');
+      if (refused) {
+        const effect = can(cfg, refused, { role: def.name });
+        waiting.push({ ...entry, waitingOn: 'requires', why: `the ${def.name} stage requires ${refused}, which is ${effect === 'deny' ? 'denied' : 'ask (needs the owner)'} for role ${def.name}` });
+        continue;
+      }
+      candidates.push(entry);
+    }
+    const started = (t: NextStage) => (t.status === 'ready' ? 1 : 0);
+    const ordered = sortByPriority(candidates.map((c) => ({ ...c, id: c.taskId }))).sort((a, b) => started(a) - started(b)).map(({ id: _id, ...c }) => c);
+    const cap = capacityOf(cfg, leases, tasks);
+    let startsBlocked: NextReport['startsBlocked'] = null;
+    try { this.assertStartsAllowed(); } catch (e) {
+      const err = e as MinionsError;
+      startsBlocked = { code: err.code, message: err.message, ...(err.hint ? { hint: err.hint } : {}) };
+    }
+    const runnable: NextStage[] = [];
+    const active = new Set(cap.activeTaskIds);
+    const roleActive = new Map(Object.entries(cap.byRole).map(([r, c]) => [r, c.active]));
+    for (const c of ordered) {
+      if (startsBlocked) { waiting.push({ ...c, waitingOn: 'starts', why: startsBlocked.message }); continue; }
+      if (!active.has(c.taskId) && active.size >= cfg.execution.maxActiveTasks) {
+        waiting.push({ ...c, waitingOn: 'capacity', why: `active task limit (${active.size}/${cfg.execution.maxActiveTasks})` }); continue;
+      }
+      const slots = Object.hasOwn(cap.byRole, c.role) ? cap.byRole[c.role]! : undefined;
+      const used = roleActive.get(c.role) ?? 0;
+      if (slots?.limited && used >= slots.max) { waiting.push({ ...c, waitingOn: 'role-capacity', why: `${c.role} limit (${used}/${slots.max})` }); continue; }
+      active.add(c.taskId);
+      roleActive.set(c.role, used + 1);
+      runnable.push(c);
+    }
+    const message = runnable.length
+      ? `${runnable.length} runnable stage(s): ${runnable.slice(0, 5).map((r) => `${r.taskId} ${r.role}`).join(', ')}${runnable.length > 5 ? ', …' : ''}`
+      : startsBlocked ? `Nothing runnable: ${startsBlocked.message}`
+        : waiting.length ? `Nothing runnable: ${waiting.length} stage(s) waiting (${[...new Set(waiting.map((w) => w.waitingOn))].join(', ')}).`
+          : 'Nothing runnable: no ready task and no task waiting for its next stage.';
+    return { runnable, waiting, stuck, startsBlocked, capacity: cap, message };
+  }
+
+  private nextEntry(task: Task, def: RoleDef, m: ModelSuggestion, at: Pick<NextStage, 'kind' | 'position' | 'count' | 'workflow'>, reason: string): NextStage {
+    return {
+      taskId: task.id, title: task.title, status: task.status, priority: task.priority, ...at,
+      role: def.name, agentType: `minions:${def.name}${m.deep ? DEEP_SUFFIX : ''}`,
+      suggestedModel: m.model, agentModel: m.agentModel, modelRule: m.rule,
+      reason: `${reason}; model: ${m.rule}${m.deep ? ', deep variant' : ''}`,
+    };
+  }
+
+  /** Refuses new starts while paused, draining or over the owner budget (claim; `work next` reports the same). */
+  private assertStartsAllowed(): void {
     if (this.db.paused().starts) {
       const drain = this.db.drain();
       if (drain) {
@@ -441,6 +637,23 @@ export class Scheduler {
     }
     // Owner budget used up: refuse new claims (running leases continue and are recorded as usual).
     assertBudgetAllowsStart(this.spendContext());
+  }
+
+  /**
+   * Claims the task's current stage. Without `role` the stage machine picks it (stageRole); with it, the role
+   * must be the current stage's (checked below, as before).
+   */
+  async claim(taskId: string, role?: LeaseRole, opts: { holder?: string } = {}): Promise<TaskBrief> {
+    const cfg = this.config;
+    if (role !== undefined) {
+      // Built-ins and project roles from the registry (exact names; `-deep` is an agent type, not a role).
+      const known = typeof role === 'string' ? exactWorkerRole(cfg, role) : undefined;
+      if (!known) throw new MinionsError('INVALID_CONFIG', `Unknown role "${String(role).slice(0, 40)}" (${workerRoleNames(cfg).join('|')}).`);
+    }
+    this.assertStartsAllowed();
+    role ??= await this.stageRole(taskId);
+    const def = exactWorkerRole(cfg, role);
+    if (!def) throw new MinionsError('INVALID_CONFIG', `Unknown role "${String(role).slice(0, 40)}" (${workerRoleNames(cfg).join('|')}).`);
     const startEffect = can(cfg, 'task.start', { role });
     if (startEffect === 'deny') throw new MinionsError('POLICY_DENIED', `task.start is denied for role ${role} by configuration.`);
 
@@ -631,8 +844,7 @@ export class Scheduler {
   private drainResume(taskId: string, lease: Lease, branch: string): DrainResume | undefined {
     const last = this.db.leases({ taskId, all: true }).filter((l) => l.id !== lease.id && l.status !== 'active').at(-1);
     if (!last || last.role !== lease.role || last.result_valid !== 1 || !last.result_json) return undefined;
-    const drained = this.db.events(taskId, 'record').some((e) => (e.data as { leaseId?: string; drain?: boolean } | null)?.leaseId === last.id && (e.data as { drain?: boolean }).drain === true);
-    if (!drained) return undefined;
+    if (!this.wasDrained(last)) return undefined;
     const r = JSON.parse(last.result_json) as WorkerResult;
     const at = last.head_sha ? ` at ${last.head_sha}` : '';
     const def = workerRole(this.config, lease.role);
@@ -722,11 +934,12 @@ export class Scheduler {
       return def.contract === 'gate' ? [] : [`edits: role ${def.name} does not commit, but ${lease.branch} moved from ${from} to ${head} during the stage`];
     }
     if (def.edits === 'any') return [];
+    const scope = def.edits.paths;
     const changed = await this.diffPaths(from, head);
-    if (changed === null) return [`edits: the stage diff ${from}..${head} cannot be computed, so role ${def.name}'s edit scope (${def.edits.paths.join(', ')}) cannot be verified`];
-    const outside = changed.filter((p) => !matchesAny(p, def.edits === 'any' || def.edits === 'none' ? [] : def.edits.paths));
+    if (changed === null) return [`edits: the stage diff ${from}..${head} cannot be computed, so role ${def.name}'s edit scope (${scope.join(', ')}) cannot be verified`];
+    const outside = changed.filter((p) => !matchesAny(p, scope));
     if (!outside.length) return [];
-    return [`edits: role ${def.name} may only change ${def.edits.paths.join(', ')}; the stage changed ${outside.slice(0, 10).join(', ')}${outside.length > 10 ? `, … (${outside.length} paths)` : ''} outside that scope. Move those changes out of the branch history of this stage (new commits only; the next stage or an engineer handles them)`];
+    return [`edits: role ${def.name} may only change ${scope.join(', ')}; the stage changed ${outside.slice(0, 10).join(', ')}${outside.length > 10 ? `, … (${outside.length} paths)` : ''} outside that scope. Move those changes out of the branch history of this stage (new commits only; the next stage or an engineer handles them)`];
   }
 
   /**
