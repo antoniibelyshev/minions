@@ -364,3 +364,83 @@ describe('Telegram survives a restart (pairing, inbound queue, outbox)', () => {
     expect(src).toMatch(/const ACCESS_FILE = join\(STATE_DIR, 'access\.json'\)/);
   });
 });
+
+describe('edge cases (tester, task-45)', () => {
+  it('handoff cap is in bytes: multi-byte text exactly at the cap is stored, one byte over is refused', async () => {
+    const db = freshDb();
+    const path = join(tmp('minions-handoff-'), 'coordinator-handoff.json');
+    const atCap = 'é'.repeat(HANDOFF_MAX_BYTES / 2); // 2 bytes each
+    expect((await writeHandoff({ db, path }, atCap)).bytes).toBe(HANDOFF_MAX_BYTES);
+    expect((readHandoff(path) as { text: string }).text).toBe(atCap);
+    await expect(writeHandoff({ db, path }, atCap + 'a')).rejects.toMatchObject({ code: 'PRECONDITION' });
+    await expect(writeHandoff({ db, path }, '€'.repeat(1366))).rejects.toMatchObject({ code: 'PRECONDITION' }); // 4098 bytes
+    expect((readHandoff(path) as { text: string }).text).toBe(atCap); // previous kept
+  });
+
+  it('a secret embedded in normal text is masked, the cap applies to the redacted text, and the DB never sees it', async () => {
+    const db = freshDb();
+    const path = join(tmp('minions-handoff-'), 'coordinator-handoff.json');
+    const key = 'sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123456789';
+    const note = `Owner said the deploy (see task-4) failed; they pasted ${key} in chat, then asked about spend.`;
+    const r = await writeHandoff({ db, path }, note);
+    expect(r.redactions).toBeGreaterThanOrEqual(1);
+    const stored = readFileSync(path, 'utf8');
+    expect(stored).not.toContain(key);
+    expect(stored).toContain('then asked about spend.');
+    expect(db.all<{ data_json: string }>("SELECT data_json FROM events").map((e) => e.data_json).join('')).not.toContain(key);
+  });
+
+  it('a missing, unreadable or throwing transcript falls back (no throw, context unavailable)', () => {
+    const db = freshDb();
+    session(db);
+    const cfg = withReset({ enabled: true, afterDelivery: false, handoffs: null });
+    noteTranscript(db, { transcript_path: join(tmp('minions-transcript-'), 'gone.jsonl') });
+    expect(contextResetCheck({ db, config: cfg })).toMatchObject({ due: false, session: { contextTokens: null, contextSource: 'unavailable' } });
+    expect(contextResetCheck({ db, config: cfg, readTranscript: () => { throw new Error('EACCES'); } })).toMatchObject({ due: false, session: { contextSource: 'unavailable' } });
+    // A directory where the file should be.
+    const dir = tmp('minions-transcript-');
+    mkdirSync(join(dir, 'd.jsonl'));
+    noteTranscript(db, { transcript_path: join(dir, 'd.jsonl') });
+    expect(contextResetCheck({ db, config: cfg }).due).toBe(false);
+    // Corrupt meta value.
+    db.setMeta(TRANSCRIPT_META, '{not json');
+    expect(contextResetCheck({ db, config: cfg }).session.contextTokens).toBeNull();
+    // The hand-off count still works as the fallback.
+    handoffs(db, 10);
+    expect(contextResetCheck({ db, config: withReset({ enabled: true, afterDelivery: false }) })).toMatchObject({ due: true, triggers: ['handoffs'] });
+  });
+
+  it('enabled: false suppresses every trigger (delivered, context, hand-offs) and the due notice', () => {
+    const db = freshDb();
+    session(db);
+    const file = join(tmp('minions-transcript-'), 's.jsonl');
+    writeFileSync(file, transcript([usageLine(1, 500_000)]));
+    noteTranscript(db, { transcript_path: file });
+    db.addEvent('record', 'task-1', { leaseId: 'lease-r1', status: 'completed', to: 'delivered' });
+    handoffs(db, 20);
+    const on = contextResetCheck({ db, config: defaults() });
+    expect(on.due).toBe(true);
+    expect(on.triggers.sort()).toEqual(['context', 'delivered', 'handoffs']);
+    const off = contextResetCheck({ db, config: withReset({ enabled: false, afterDelivery: true, contextTokens: 1, handoffs: 1 }) });
+    expect(off.due).toBe(false);
+    expect(off.steps).toBeUndefined();
+    expect(off.blockers[0]).toMatch(/off/);
+  });
+
+  it('detach refuses when a lease became active after the check; --force is the only bypass', () => {
+    const db = freshDb();
+    session(db);
+    db.addEvent('record', 'task-1', { leaseId: 'lease-r1', status: 'completed', to: 'delivered' });
+    expect(contextResetCheck({ db, config: defaults() }).due).toBe(true);
+    addLease(db, 'lease-late', 'task-2'); // a worker starts between the check and the restart
+    const calls: string[][] = [];
+    const spawn: DetachedSpawn = (_c, args) => { calls.push(args); return { pid: 1, unref: () => undefined, on: () => undefined }; };
+    const dir = tmp('minions-detach-');
+    const deps = { activeLeases: () => db.activeLeases(), log: join(dir, 'l.log'), cwd: dir, spawn };
+    expect(() => scheduleDetachedRestart(deps, { recover: true })).toThrow(expect.objectContaining({ code: 'PRECONDITION', message: expect.stringContaining('lease-late') }));
+    expect(calls).toHaveLength(0);
+    expect(existsSync(join(dir, 'l.log'))).toBe(false); // refused before anything was opened
+    scheduleDetachedRestart(deps, { recover: true, force: true });
+    expect(calls[0]).toEqual(['coordinator', 'restart', '--recover', '--force']);
+  });
+});
