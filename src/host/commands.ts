@@ -8,7 +8,7 @@ import { action, globalOpts, requireMode } from '../core/cli-helpers.js';
 import { MinionsError } from '../core/errors.js';
 import { emit } from '../core/output.js';
 import { CONTAINER, projectPaths } from '../core/paths.js';
-import { STATE_BACKUP_DIRS, STATE_BACKUP_FILES } from '../runtime/state-backup.js';
+import { PRE_RESTORE_KEEP, STATE_BACKUP_DIRS, STATE_BACKUP_FILES } from '../runtime/state-backup.js';
 import { registerAuth } from './auth-cli.js';
 import { authOf, isKeyAuth, refreshKey, startRefreshTimer } from './auth.js';
 import type { MinionsConfig } from '../config/schema.js';
@@ -305,7 +305,7 @@ async function importStateCommand(file: string, o: { force: boolean; json: boole
   if (o.dryRun) {
     const { archive, manifest } = await inspectStateBackup(file);
     emit({ dryRun: true, archive, valid: true, createdAt: manifest.createdAt, minionsVersion: manifest.minionsVersion, schemaVersion: manifest.schemaVersion, files: manifest.files.length, force: o.force },
-      { json: o.json, human: () => `Would restore ${manifest.files.length} files from a valid backup of ${manifest.createdAt} (schema ${manifest.schemaVersion}); the current state would be kept under <state>/pre-restore/.` });
+      { json: o.json, human: () => `Would restore ${manifest.files.length} files from a valid backup of ${manifest.createdAt} (schema ${manifest.schemaVersion}); the current state would be kept under <state>/pre-restore/ (the newest ${PRE_RESTORE_KEEP} copies are kept).` });
     return;
   }
   // Validate before touching the runtime (importState validates again before copying).
@@ -314,6 +314,7 @@ async function importStateCommand(file: string, o: { force: boolean; json: boole
   const r = await importState(project, file, { force: o.force, target });
   emit(r, { json: o.json, human: (d: typeof r) => [`Restored ${d.files} files into the ${runtime === 'host' ? 'host runtime' : 'container'} state from ${d.archive} (backup of ${d.createdAt}).`,
     ...(d.container.previous ? [`Previous state kept in ${d.container.previous} (inside the runtime).`] : []),
+    ...(d.container.releasedLeases?.length ? [`Released restored lease(s): ${d.container.releasedLeases.join(', ')}`] : []),
     ...d.container.warnings.map((w) => `warning: ${w}`)].join('\n') });
 }
 

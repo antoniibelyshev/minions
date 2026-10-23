@@ -6,13 +6,14 @@
 // as defence in depth, symlinks, hard-linked files, secret-looking names and files that contain a
 // mounted secret value are skipped (and listed in the manifest), never archived.
 import { createHash } from 'node:crypto';
-import { lstat, mkdir, mkdtemp, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, readdir, readFile, rename, rm, rmdir, writeFile } from 'node:fs/promises';
 import { basename, dirname, join } from 'node:path';
 import { gunzipSync, gzipSync } from 'node:zlib';
 import { matchesAny } from '../config/capabilities.js';
 import { MinionsError } from '../core/errors.js';
 import { VERSION } from '../core/version.js';
 import { coordinatorPidAlive, type LockAlive } from './coordinator.js';
+import type { CoordinatorLock, RuntimeDb } from './db.js';
 import { openDb, SCHEMA_VERSION } from './db.js';
 import type { RuntimePaths } from './paths.js';
 
@@ -27,10 +28,18 @@ export const STATE_BACKUP_FILES = ['coordinator-handoff.json'] as const;
 /** Largest archive (and largest unpacked content) a restore reads. */
 export const STATE_BACKUP_MAX_BYTES = 1024 * 1024 * 1024;
 
+/**
+ * minions' own secret file names: the mounted secrets (src/core/paths.ts `apiKeyFile`, `githubTokenFile`,
+ * `telegramTokenFile`; src/host/credentials.ts `fileName`) and the host's approval signing key
+ * (src/host/approvals.ts). A copy of one of them inside an archived dir is never archived.
+ */
+export const MINIONS_SECRET_FILE_NAMES = ['anthropic-api-key', 'github-token', 'telegram-bot-token', 'approval-signing-key'] as const;
+
 /** File names that commonly hold secrets; never archived even inside an allowed dir. */
-const SECRET_NAME_PATTERNS = [
+export const SECRET_NAME_PATTERNS = [
   '**/.env', '**/.env.*', '**/*.pem', '**/*.key', '**/*.p12', '**/*.pfx', '**/id_rsa', '**/id_rsa.*', '**/id_ed25519', '**/id_ed25519.*',
   '**/id_ecdsa', '**/.npmrc', '**/.netrc', '**/credentials.json', '**/.credentials.json',
+  ...MINIONS_SECRET_FILE_NAMES.map((n) => `**/${n}`),
 ];
 
 export interface ManifestFile { path: string; size: number; sha256: string }
@@ -297,17 +306,37 @@ export interface StateImportResult {
   previous: string | null;
   forced: boolean;
   warnings: string[];
+  /** Leases the backup had marked active (no worker holds them in this runtime; the command layer releases them). */
+  restoredActiveLeases: string[];
+  /** Leases released after the restore (`minions workspace state-import`; absent from older runtimes). */
+  releasedLeases?: string[];
+  /** pid of the live coordinator whose lock row was carried into the restored DB, or null. */
+  preservedLockPid: number | null;
+  /** Older `pre-restore/<stamp>` dirs removed (the newest PRE_RESTORE_KEEP are kept). */
+  pruned: string[];
 }
 
 /** Top-level state entries a restore replaces (the DB together with its WAL files). */
 const REPLACED = [...STATE_BACKUP_DIRS, ...STATE_BACKUP_FILES, DB_NAME, `${DB_NAME}-wal`, `${DB_NAME}-shm`];
+/** How many `<state>/pre-restore/<stamp>/` copies of replaced state a restore keeps (newest first). */
+export const PRE_RESTORE_KEEP = 3;
+/** Release reason of the leases a restore brought back as active. */
+export const RESTORE_RELEASE_REASON = 'state restore: the restored lease has no worker in this runtime';
+/** What to run after a forced restore (host command; it runs `minions coordinator restart --recover`). */
+export const RESTORE_RESTART_HINT = 'run `minions settings restart` (host) so the coordinator restarts with the recovery prompt and re-dispatches the released tasks';
+
+const clashCodes = new Set(['EEXIST', 'ENOTDIR', 'EISDIR']);
 
 /**
  * Restores a state backup into `paths.state`. Validates the whole archive first, refuses while a
  * worker lease is active or a live coordinator holds the project lock (unless `force`), stages the
  * files inside the state dir, checks the DB snapshot (opens, migrates, integrity_check), then swaps
- * the replaced entries out to `<state>/pre-restore/<stamp>/` and the staged ones in. The restored
- * DB's coordinator lock row is cleared: it named a process of the source runtime.
+ * the replaced entries out to `<state>/pre-restore/<stamp>/` and the staged ones in, and prunes all
+ * but the newest PRE_RESTORE_KEEP pre-restore copies. The restored DB's coordinator lock row named a
+ * process of the source runtime: it is replaced with the live coordinator's row when one holds the
+ * lock (forced restore; so no second coordinator can start before the restart), else cleared.
+ * Leases the backup had active are reported in `restoredActiveLeases`; `releaseRestoredLeases`
+ * releases them (the command layer does so right after the restore).
  */
 export async function restoreStateBackup(paths: Pick<RuntimePaths, 'state' | 'db'>, archive: string, opts: { force?: boolean; alive?: LockAlive; now?: Date } = {}): Promise<StateImportResult> {
   const st = await lstat(archive).catch(() => null);
@@ -315,6 +344,7 @@ export async function restoreStateBackup(paths: Pick<RuntimePaths, 'state' | 'db
   if (!st.isFile()) throw new MinionsError('PRECONDITION', `${archive} is not a regular file; refusing to read it.`);
   const parsed = parseStateBackup(await readFile(archive));
   const warnings: string[] = [];
+  let liveLock: CoordinatorLock | null = null;
 
   const live = await lstat(paths.db).catch(() => null);
   if (live) {
@@ -323,15 +353,16 @@ export async function restoreStateBackup(paths: Pick<RuntimePaths, 'state' | 'db
       const leases = db.activeLeases();
       const lock = db.coordinatorLock();
       const lockLive = !!lock && (opts.alive ?? coordinatorPidAlive)(lock.pid, lock);
+      if (lockLive) liveLock = lock!;
       if (leases.length || lockLive) {
         const what = [...(leases.length ? [`${leases.length} active worker lease(s) (${leases.map((l) => l.id).join(', ')})`] : []),
           ...(lockLive ? [`a running coordinator (pid ${lock!.pid})`] : [])].join(' and ');
         if (!opts.force) {
           throw new MinionsError('CONFLICT', `Refusing to restore runtime state while it is in use: ${what}.`,
-            'Let the workers finish (minions status) or cancel them (minions work cancel --all), then rerun; or pass --force and afterwards run `minions settings restart` so the coordinator reloads the restored state.',
+            `Let the workers finish (minions status) or cancel them (minions work cancel --all), then rerun; or run minions pause --starts first (a running coordinator could claim new leases) and pass --force (leases the backup has active are released) and then ${RESTORE_RESTART_HINT}.`,
             { activeLeases: leases.map((l) => l.id), coordinatorPid: lockLive ? lock!.pid : null });
         }
-        warnings.push(`Restored over ${what} (--force); restart the coordinator (minions settings restart).`);
+        warnings.push(`Restored over ${what} (--force). Workers still running lose their lease (their submit is refused; worktrees and branches are kept). Now ${RESTORE_RESTART_HINT}.`);
       }
     } finally { db.close(); }
   }
@@ -340,13 +371,21 @@ export async function restoreStateBackup(paths: Pick<RuntimePaths, 'state' | 'db
   await mkdir(paths.state, { recursive: true });
   const staging = await mkdtemp(join(paths.state, '.restore-staging-'));
   let previous: string | null = null;
+  let restoredActiveLeases: string[] = [];
   try {
-    for (const d of new Set([...STATE_BACKUP_DIRS, ...parsed.dirs])) await mkdir(join(staging, ...d.split('/')), { recursive: true });
-    for (const [p, e] of parsed.files) {
-      const dst = join(staging, ...p.split('/'));
-      await mkdir(dirname(dst), { recursive: true });
-      const mode = p === DB_NAME ? 0o644 : (e.mode & 0o666) || 0o644;
-      await writeFile(dst, e.data, { flag: 'wx', mode });
+    let current = '';
+    try {
+      for (const d of new Set([...STATE_BACKUP_DIRS, ...parsed.dirs])) { current = d; await mkdir(join(staging, ...d.split('/')), { recursive: true }); }
+      for (const [p, e] of parsed.files) {
+        current = p;
+        const dst = join(staging, ...p.split('/'));
+        await mkdir(dirname(dst), { recursive: true });
+        const mode = p === DB_NAME ? 0o644 : (e.mode & 0o666) || 0o644;
+        await writeFile(dst, e.data, { flag: 'wx', mode });
+      }
+    } catch (err) {
+      if (clashCodes.has((err as NodeJS.ErrnoException).code ?? '')) throw invalid(`entry ${JSON.stringify(current)} clashes with another entry (a file and a directory share a path)`);
+      throw err;
     }
     // The snapshot must open, migrate to this build's schema and pass an integrity check.
     const sdb = (() => {
@@ -355,9 +394,10 @@ export async function restoreStateBackup(paths: Pick<RuntimePaths, 'state' | 'db
     try {
       const ok = sdb.get<{ integrity_check: string }>('PRAGMA integrity_check');
       if (ok?.integrity_check !== 'ok') throw invalid(`the database snapshot fails its integrity check (${ok?.integrity_check ?? 'no result'})`);
-      sdb.deleteMeta('coordinator_lock');
-      const active = sdb.activeLeases().length;
-      if (active) warnings.push(`The backup has ${active} lease(s) marked active; the coordinator's start-up recovery releases those whose workers are gone.`);
+      if (liveLock) sdb.setMeta('coordinator_lock', JSON.stringify(liveLock));
+      else sdb.deleteMeta('coordinator_lock');
+      restoredActiveLeases = sdb.activeLeases().map((l) => l.id);
+      sdb.addEvent('state-restore', null, { backupCreatedAt: parsed.manifest.createdAt, forced: !!opts.force, restoredActiveLeases, preservedLockPid: liveLock?.pid ?? null });
       sdb.sql.exec('PRAGMA wal_checkpoint(TRUNCATE)');
     } finally { sdb.close(); }
 
@@ -376,17 +416,69 @@ export async function restoreStateBackup(paths: Pick<RuntimePaths, 'state' | 'db
     } catch (err) {
       for (const n of movedIn) await rename(join(paths.state, n), join(staging, n)).catch(() => undefined);
       for (const n of movedOut) await rename(join(previous!, n), join(paths.state, n)).catch(() => undefined);
+      // Everything moved back: drop the now empty stamp dir (rmdir refuses a non-empty one).
+      if (previous) { await rmdir(previous).catch(() => undefined); await rmdir(dirname(previous)).catch(() => undefined); }
       throw new MinionsError('INTERNAL', `Restoring the runtime state failed while swapping files: ${(err as Error).message}`,
         previous ? `The previous state was moved back; anything left over is in ${previous}.` : undefined);
     }
   } finally {
     await rm(staging, { recursive: true, force: true });
   }
+  const pruned = await prunePreRestore(join(paths.state, 'pre-restore'), PRE_RESTORE_KEEP, previous);
+  if (restoredActiveLeases.length) {
+    warnings.push(`The backup has ${restoredActiveLeases.length} lease(s) marked active (${restoredActiveLeases.join(', ')}); no worker holds them in this runtime, so they are released.`);
+  }
   const m = parsed.manifest;
   return {
     restored: { files: parsed.files.size, dirs: parsed.dirs.length, createdAt: m.createdAt, schemaVersion: m.schemaVersion, minionsVersion: m.minionsVersion },
-    previous, forced: !!opts.force, warnings,
+    previous, forced: !!opts.force, warnings, restoredActiveLeases, preservedLockPid: liveLock?.pid ?? null, pruned,
   };
+}
+
+/** Removes empty `pre-restore/<stamp>` dirs and all but the newest `keep` others (stamps sort by time).
+ * `protect` (the copy this restore just made) is never removed and counts as one of the kept. */
+export async function prunePreRestore(dir: string, keep: number, protect: string | null = null): Promise<string[]> {
+  const names = (await readdir(dir).catch(() => [] as string[])).sort();
+  const removed: string[] = [];
+  const kept: string[] = [];
+  for (const n of names) {
+    const p = join(dir, n);
+    const st = await lstat(p).catch(() => null);
+    if (!st?.isDirectory()) continue;
+    if ((await readdir(p).catch(() => ['?'])).length === 0) { await rmdir(p).catch(() => undefined); removed.push(p); } else kept.push(p);
+  }
+  const others = kept.filter((p) => p !== protect);
+  const room = Math.max(0, keep - (protect && kept.includes(protect) ? 1 : 0));
+  for (const p of others.slice(0, Math.max(0, others.length - room))) {
+    await rm(p, { recursive: true, force: true });
+    removed.push(p);
+  }
+  return removed;
+}
+
+export interface RestoredLeaseRelease { released: string[]; failed: { leaseId: string; error: string }[] }
+
+/**
+ * Releases every lease the restored DB has active (task-20.1): no worker holds them in this runtime,
+ * and `minions coordinator restart` refuses while any is active. `release` is the scheduler's release
+ * (pre-claim backlog status, backlog note, hand-off files); a lease it fails on is ended directly in
+ * the DB so the restart is never blocked by it.
+ */
+export async function releaseRestoredLeases(db: RuntimeDb, release: ((leaseId: string, reason: string) => Promise<unknown>) | null, reason = RESTORE_RELEASE_REASON): Promise<RestoredLeaseRelease> {
+  const out: RestoredLeaseRelease = { released: [], failed: [] };
+  for (const l of db.activeLeases()) {
+    let err: Error | null = release ? null : new Error('the scheduler is unavailable');
+    if (release) { try { await release(l.id, reason); } catch (e) { err = e as Error; } }
+    if (err && db.lease(l.id)?.status === 'active') {
+      db.transaction(() => {
+        db.exec("UPDATE leases SET status = 'released', ended_at = ? WHERE id = ? AND status = 'active'", new Date().toISOString(), l.id);
+        db.addEvent('release', l.task_id, { leaseId: l.id, status: 'released', reason, direct: true, error: err!.message });
+      });
+      out.failed.push({ leaseId: l.id, error: err.message });
+    }
+    out.released.push(l.id);
+  }
+  return out;
 }
 
 /** Archive name for a backup written at `now` (chosen by the host, never taken from runtime output). */

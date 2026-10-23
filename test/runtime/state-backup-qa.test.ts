@@ -128,8 +128,8 @@ describe('state restore: crafted tar headers', () => {
     const { entries } = await backupFile();
     const f = join(tmp('minions-qa-bad-'), 'bad.tar.gz');
     writeFileSync(f, gzipSync(writeTar(addListed(entries, [{ path: 'notes/memo.md/child', type: 'file', data: Buffer.from('x'), mode: 0o644 }]))));
-    // Today a raw fs error (EEXIST) escapes; the CLI reports it as INTERNAL. What matters: nothing changed.
-    await expectUntouched(f, /^(EEXIST|ENOTDIR|INTERNAL|PRECONDITION)$/, /EEXIST|ENOTDIR|not a valid/i);
+    // The raw fs error (EEXIST/ENOTDIR) is mapped to a clear PRECONDITION naming the entry; nothing changed.
+    await expectUntouched(f, 'PRECONDITION', /not a valid minions state backup: entry "notes\/memo\.md\/child" clashes with another entry/i);
   });
 
   it('the archive is readable by the system tar (plain ustar + gzip)', async (ctx) => {
@@ -164,6 +164,7 @@ describe('state restore: rollback', () => {
     expect(after).toEqual(before);
     expect(readFileSync(join(p.notes, 'current.md'), 'utf8')).toBe('current\n');
     expect(readdirSync(p.state).filter((n) => n.startsWith('.restore-staging-'))).toEqual([]);
+    expect(existsSync(join(p.state, 'pre-restore'))).toBe(false); // the emptied stamp dir is not left behind
   });
 });
 

@@ -38,7 +38,7 @@ import { ciStatus, formatCiStatus, formatSync, syncTasks, type SyncReport } from
 import { formatIntake, intakeProvenanceFallback, originRepository, syncIntake, type IntakeSyncReport } from './intake-sync.js';
 import { ghWithTimeout, type GhFn } from './publish.js';
 import { exportWorkspace, importWorkspace, setupState } from './workspace.js';
-import { createStateBackup, restoreStateBackup } from './state-backup.js';
+import { createStateBackup, releaseRestoredLeases, restoreStateBackup } from './state-backup.js';
 import { cancelWork, formatCancel } from './controls.js';
 import { ack, counts as outboxCounts, enqueue, fail, formatCounts, formatItems, pending, type OutboxCounts } from './outbox.js';
 import { git, workspaceLayout } from './worktree.js';
@@ -63,6 +63,12 @@ let config: MinionsConfig | undefined;
 let backlog: BacklogAdapter | undefined;
 
 const getDb = (): RuntimeDb => (db ??= openDb(runtimePaths().db));
+/** Drops the cached DB and backlog handles (a state restore swaps the files under them). */
+function resetRuntimeHandles(): void {
+  db?.close();
+  db = undefined;
+  backlog = undefined;
+}
 
 /** Effective config from MINIONS_CONFIG (default /opt/minions/config/config.json), strictly validated. */
 export async function loadRuntimeConfig(path = runtimePaths().configJson): Promise<MinionsConfig> {
@@ -699,13 +705,22 @@ export function register(program: Command): void {
       emit(r, { json: globalOpts(cmd).json, human: (d: typeof r) => [`Wrote ${d.path} (${d.files} files, ${d.bytes} bytes, schema ${d.schemaVersion})`,
         ...d.skipped.map((s) => `skipped ${s.path}: ${s.reason}`)].join('\n') });
     }));
-  ws.command('state-import <archive>').description('Restore a state backup written by state-export (refused while leases or the coordinator are active unless --force)')
+  ws.command('state-import <archive>').description('Restore a state backup written by state-export (refused while leases or the coordinator are active unless --force); leases the backup has active are released')
     .option('--force', 'restore even while worker leases are active or a coordinator holds the project lock')
     .action(action(async (archive: string, o: { force?: boolean }, cmd: Command) => {
       requireMode('runtime');
+      // The swap replaces the DB and backlog files: handles opened before it would keep the replaced ones.
+      resetRuntimeHandles();
       const r = await restoreStateBackup(runtimePaths(), archive, { force: o.force });
-      emit(r, { json: globalOpts(cmd).json, human: (d: typeof r) => [`Restored ${d.restored.files} files from a backup of ${d.restored.createdAt} (schema ${d.restored.schemaVersion}).`,
-        ...(d.previous ? [`Previous state moved to ${d.previous}`] : []), ...d.warnings.map((w) => `warning: ${w}`)].join('\n') });
+      resetRuntimeHandles();
+      // The restored leases have no worker here, and `coordinator restart` refuses while any is active.
+      const s = r.restoredActiveLeases.length ? await scheduler().catch(() => null) : null;
+      const rel = await releaseRestoredLeases(getDb(), s ? (id, why) => s.release(id, why) : null);
+      for (const f of rel.failed) r.warnings.push(`Lease ${f.leaseId} was ended directly in the DB (${f.error}); check its task's backlog status.`);
+      const out = { ...r, releasedLeases: rel.released };
+      emit(out, { json: globalOpts(cmd).json, human: (d: typeof out) => [`Restored ${d.restored.files} files from a backup of ${d.restored.createdAt} (schema ${d.restored.schemaVersion}).`,
+        ...(d.previous ? [`Previous state moved to ${d.previous}`] : []), ...(d.releasedLeases.length ? [`Released restored lease(s): ${d.releasedLeases.join(', ')}`] : []),
+        ...d.warnings.map((w) => `warning: ${w}`)].join('\n') });
     }));
 
   // sync: one-shot GitHub intake import (when intake.github is enabled) plus a refresh of PR state and
