@@ -11,7 +11,7 @@
       {
         "matcher": "Agent",
         "hooks": [
-          { "type": "command", "command": "minions hook pre-agent" }
+          { "type": "command", "command": "minions hook pre-agent || exit 2" }
         ]
       },
       {

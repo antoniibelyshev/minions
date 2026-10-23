@@ -1161,7 +1161,9 @@ Hooks:
 - `hook pre-agent` (PreToolUse, matcher `Agent`): if `tool_input.subagent_type` is
   `minions:engineer|tester|reviewer`, require `minions-lease: <id>` in `tool_input.prompt` naming an
   active lease for that role; otherwise deny via `hookSpecificOutput.permissionDecision: "deny"`.
-  Other agent types pass through.
+  Other agent types pass through. Registered as `minions hook pre-agent || exit 2`: the CLI always exits
+  0 and denies through JSON, while a missing binary or a crash becomes exit 2, the only blocking
+  PreToolUse exit, so the gate fails closed.
 
 ## Plugin (`templates/plugin` → `projects/<id>/plugin`)
 
@@ -1169,7 +1171,7 @@ Hooks:
 .claude-plugin/plugin.json   { "name": "minions", "version": <pkg>, "description": ... }
 agents/engineer.md  agents/tester.md  agents/reviewer.md
 skills/{orchestrate,status,intake,recover,maintain-context}/SKILL.md
-hooks/hooks.json             Stop -> minions hook stop ; PreToolUse(Agent) -> minions hook pre-agent (exec form)
+hooks/hooks.json             Stop -> minions hook stop ; PreToolUse(Agent) -> minions hook pre-agent || exit 2
 coordinator.md               appended to the coordinator system prompt
 ```
 `models.effort` (optional; `low|medium|high|xhigh|max`) adds `effort:` to the worker frontmatter and

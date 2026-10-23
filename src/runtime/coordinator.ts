@@ -37,7 +37,12 @@ export const TELEGRAM_ALL_TOOLS = [...TELEGRAM_TOOLS, `${TELEGRAM_TOOL_PREFIX}do
  * rules cannot be scoped per agent, so the allow above would otherwise extend to subagents.
  */
 export const TELEGRAM_HOOK_MATCHER = `${TELEGRAM_TOOL_PREFIX}.*`;
-export const TELEGRAM_HOOK_COMMAND = 'minions hook pre-telegram';
+/**
+ * Fails closed: Claude Code treats any PreToolUse exit other than 2 as a non-blocking error and lets the
+ * call through, so a missing binary (127) or a crash (1) becomes exit 2 (block). `minions hook` itself
+ * always exits 0 and denies through its JSON output, so healthy coordinator calls are unaffected.
+ */
+export const TELEGRAM_HOOK_COMMAND = 'minions hook pre-telegram || exit 2';
 
 /**
  * First user message of a coordinator started by `minions coordinator restart --recover`: run the recover

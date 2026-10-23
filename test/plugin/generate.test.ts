@@ -6,7 +6,7 @@ import { afterAll, describe, expect, it } from 'vitest';
 import { generatePlugin, renderPolicySummary, renderTemplate } from '../../src/plugin/generate.js';
 import { DRAIN_HOOK_COMMAND } from '../../src/runtime/drain.js';
 import type { MinionsConfig } from '../../src/config/schema.js';
-import { defaults } from '../helpers.js';
+import { defaults, FAKE_MINIONS, runHookCommand } from '../helpers.js';
 
 const dirs: string[] = [];
 const tmp = async () => { const d = await mkdtemp(join(tmpdir(), 'minions-plugin-')); dirs.push(d); return d; };
@@ -117,10 +117,26 @@ describe('generatePlugin', () => {
     expect(Object.keys(hooks)).toEqual(['hooks']);
     expect(hooks.hooks.Stop).toEqual([{ hooks: [{ type: 'command', command: 'minions hook stop' }] }]);
     expect(hooks.hooks.PreToolUse).toEqual([
-      { matcher: 'Agent', hooks: [{ type: 'command', command: 'minions hook pre-agent' }] },
+      { matcher: 'Agent', hooks: [{ type: 'command', command: 'minions hook pre-agent || exit 2' }] },
       // Every tool; gated by a shell test so node starts only while a drain is requested.
       { matcher: '*', hooks: [{ type: 'command', command: DRAIN_HOOK_COMMAND }] },
     ]);
+  });
+
+  it('the generated pre-agent hook fails closed: a missing or crashing minions blocks the Agent launch', async () => {
+    const hooks = JSON.parse(await (await gen()).read('hooks/hooks.json'));
+    const entry = (hooks.hooks.PreToolUse as { matcher: string; hooks: { command: string }[] }[]).find((h) => h.matcher === 'Agent');
+    const command = entry!.hooks[0]!.command;
+    const stdin = JSON.stringify({ hook_event_name: 'PreToolUse', tool_name: 'Agent', tool_input: { subagent_type: 'minions:engineer', prompt: 'x' } });
+    // Exit 2 is the only blocking PreToolUse exit; 127 (not found), 1 (crash) or 137 (killed) would let the launch through.
+    expect(runHookCommand(command, null, stdin).status).toBe(2);
+    expect(runHookCommand(command, FAKE_MINIONS.crash, stdin).status).toBe(2);
+    expect(runHookCommand(command, FAKE_MINIONS.killed, stdin).status).toBe(2);
+    // A healthy hook exits 0 and decides through stdout, unchanged by the wrapper.
+    expect(runHookCommand(command, FAKE_MINIONS.allow, stdin)).toMatchObject({ status: 0, stdout: '' });
+    const denied = runHookCommand(command, FAKE_MINIONS.deny, stdin);
+    expect(denied.status).toBe(0);
+    expect(JSON.parse(denied.stdout).hookSpecificOutput.permissionDecision).toBe('deny');
   });
 
   it('tells the coordinator, the skills and the workers how a drain winds work down', async () => {
