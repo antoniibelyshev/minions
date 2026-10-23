@@ -1,6 +1,6 @@
 ---
 name: orchestrate
-description: Dispatch loop for the minions coordinator - pick ready tasks, claim, spawn workers, record results, follow next steps.
+description: Dispatch loop for the minions coordinator - pick runnable stages (work next), claim, spawn workers, record results, follow next steps.
 ---
 
 # Orchestrate minions work
@@ -12,25 +12,24 @@ Run this loop until nothing is runnable. Every durable step uses a `minions ... 
 {{outboxCheck}}
 
 1. `minions status --json`. If starts are paused, report that and stop. If `draining` is set (an upgrade is winding workers down), start nothing: only record the workers that return (step 5), report briefly and stop.
-2. `minions work list --json` to see active leases. Count active tasks (limit {{maxActiveTasks}}) and engineers (limit {{maxEngineers}}).
-3. `minions backlog ready --compact --json` for runnable tasks (`minions backlog list --compact --json` for the whole queue). Also note tasks in `testing`, `reviewing` or `changes-requested` without an active lease: they need the next stage.
+2. `minions work next --json` for the runnable stages: `runnable` (dispatch order: tasks under way first, then priority; capacity, per-role limits ({{roleLimits}}), pauses, drain and the budget already applied), `waiting` (with `waitingOn`: `starts`, `capacity`, `role-capacity`, `requires`) and `stuck` (a stage status without a lease that no stage can be claimed from: recover it with `/minions:recover`). `minions work list --json` shows the active leases, `minions backlog list --compact --json` the whole queue.
 
-If there is no ready or next-stage work, or capacity is full, report briefly and stop. Do not loop waiting for work. Start nothing new while the budget is used up (`spend.budget.exhausted` in the status) or quota mode is on (see Owner defaults): record returning workers, report, and ask.
+If `runnable` is empty, report briefly why (the `message`) and stop. Do not loop waiting for work. Start nothing new while the budget is used up (`spend.budget.exhausted` in the status) or quota mode is on (see Owner defaults): record returning workers, report, and ask.
 
 ## 2. Choose
 
 Prefer, in order: tasks waiting for their next stage (finish what is started), then higher priority, then tasks that unblock others. Skip tasks whose requirements are unclear: ask the user instead (with a recommended answer).
 
-Role by status: `ready` or `changes-requested` → engineer; `testing` → tester; `reviewing` → reviewer. A `ready` task labelled `qa-sweep` → tester (QA sweep against `{{baseBranch}}`; see Testing in your coordinator instructions).
+Take stages from `runnable` in its order unless one of these reasons says otherwise. Each entry names the stage: `role`, `agentType`, `position` in its `workflow`, `suggestedModel`/`agentModel` and the `reason`. The CLI tracks the workflow position (repairs, inserted QA testers, multi-stage workflows), so never pick a role from the task status. A `ready` task labelled `qa-sweep` → tester (QA sweep against `{{baseBranch}}`, `kind: "qa-sweep"`, no workflow; see Testing in your coordinator instructions).
 
 ## 3. Claim
 
-`minions work claim <taskId> --role <role> --compact --json`
+`minions work claim <taskId> --compact --json` (the CLI picks the stage's role; `--role <role>` is optional and must match it)
 
 - `CONFLICT`: another stage is active for that task; pick another task.
 - `CAPACITY`: stop dispatching new work until a worker finishes.
 - `POLICY_DENIED`: the task may not start (paused, not authorized, or `Budget reached`: the owner's budget is used up). Report it with the reason; do not retry. At the budget, running workers continue: record them as usual.
-- `PRECONDITION`: the task status does not fit the role; re-read it with `minions backlog show <taskId> --json`.
+- `PRECONDITION`: the task status does not fit the stage (it moved since `work next`); run `minions work next --json` again.
 
 The compact response has `leaseId`, `briefMarker`, `taskId`, `role`, `attempt`, `branch`, `worktree` and `expectedHead`. The full brief (description, criteria, prior findings, policy) is stored for the worker; do not fetch or paste it.
 
@@ -38,9 +37,9 @@ The compact response has `leaseId`, `briefMarker`, `taskId`, `role`, `attempt`, 
 
 Call the Agent tool:
 
-- `subagent_type`: `minions:<role>`; for an engineer lease, `minions:engineer-deep` instead of `minions:engineer` for hard debugging, architecture work, or a retry after an engineer attempt failed (see below)
+- `subagent_type`: the stage's `agentType` from `work next` (`minions:<role>`, or `minions:<role>-deep` when it escalates: `risk:high` or a repair after a failed attempt); for an engineer lease you may still choose `minions:engineer-deep` instead of `minions:engineer` for hard debugging, architecture work, or a retry after an engineer attempt failed that `work next` did not flag (see below)
 - `description`: short, e.g. `engineer task-12`
-- `model` (optional): allowed {{allowedModels}}. {{modelGuidance}}
+- `model`: the stage's `agentModel`; omit it when null. Allowed {{allowedModels}}. {{modelGuidance}}
 - `prompt`, nothing more than:
 
   ```
@@ -91,6 +90,12 @@ The record response says what happened. Typical transitions:
 - `needs_split` → decide the split yourself (no need to ask the user); create each proposed child with `minions backlog create --json` using an idempotency key `split:<parentId>:<n>`, the parent id, acceptance criteria and dependencies between children; note the split on the parent. The parent stays as the tracking task.
 
 Then go back to step 1, unless a record or release response carried `contextReset`: then do the context reset (handoff, then restart; Limits in your coordinator instructions) and stop. Stop when nothing is runnable.
+
+## Workflows, roles and models
+
+- **Assigning a workflow** when you create a task: the default unless the task fits a configured workflow ({{workflowNames}}), e.g. docs-only work → a docs workflow, research → a research workflow. Pass it in the create call (`minions backlog create ... --workflow <name>`); do not report the choice. Change it later only between stages (`minions backlog update <taskId> --expected-version <v> --workflow <name>`); the next claim resets the position by evidence at the head.
+- **Proposing a role**: only when recurring project work does not fit engineer, tester and reviewer (a different output than code, different tools, or a different gate), never for a one-off task. Draft the smallest role: no edits unless needed, `edits.paths` scoped to what it writes, no extra capabilities, and the workflow that uses it. Ask the owner once, with the draft and what to add on the host; never edit `.minions/**` yourself.
+- **Cheap stages**: follow `suggestedModel` (stage hint, then role model, then the risk rule: `risk:low` → the cheapest allowed model for gates and verifiers, `risk:high` or a repair after a failed attempt → the strongest and the deep variant). Label a task `risk:low` or `risk:high` when you create it if the risk is clear. Downgrade further only for mechanical stages (a small rename, a doc fix); effort is per role and set on the host.
 
 ## 7. Report
 

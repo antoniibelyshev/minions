@@ -238,7 +238,7 @@ export async function saveBrief(p: HandoffPaths, brief: TaskBrief): Promise<stri
 }
 
 /** Claims a task, creates its scratch dir and stores its brief; releases the lease again if the brief cannot be stored. */
-export async function claimWithBrief(sched: Scheduler, p: HandoffPaths, taskId: string, role: LeaseRole, opts: { holder?: string } = {}): Promise<TaskBrief> {
+export async function claimWithBrief(sched: Scheduler, p: HandoffPaths, taskId: string, role: LeaseRole | undefined, opts: { holder?: string } = {}): Promise<TaskBrief> {
   const claimed = await sched.claim(taskId, role, opts);
   const scratchDir = await ensureScratchDir(p, claimed.leaseId);
   const brief: TaskBrief = scratchDir ? { ...claimed, scratchDir } : claimed;
