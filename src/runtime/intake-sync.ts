@@ -162,6 +162,35 @@ export async function queryIssues(api: ApiGet, repo: string, f: GithubIntakeConf
   return { issues, complete: false };
 }
 
+/**
+ * Decision (task-40): imports in flight. `backlog task create` is a subprocess; a wrapper stopped by a
+ * signal before claude starts exits without waiting for it (task-38), so the task can appear after the
+ * pass that started it is gone, with neither the idempotency row nor the sync record written. A
+ * successor pass that lists the backlog before that child finishes would import the issue a second
+ * time. Each create is therefore marked in meta row `intake_github_inflight` (key -> start time) before
+ * the subprocess starts and unmarked when it settles. A pass that finds a fresh mark and no linked task
+ * skips the issue (warning) instead of creating it; once the task shows up (by its issue link) the mark
+ * is dropped, and a mark older than INTAKE_INFLIGHT_TTL_MS (far beyond the backlog CLI's 30 s timeout)
+ * counts as a create that never happened.
+ */
+export const INTAKE_INFLIGHT_META = 'intake_github_inflight';
+export const INTAKE_INFLIGHT_TTL_MS = 10 * 60_000;
+
+function loadInflight(db: Pick<RuntimeDb, 'getMeta'>): Record<string, string> {
+  try {
+    const v = JSON.parse(db.getMeta(INTAKE_INFLIGHT_META) ?? '') as Record<string, string>;
+    if (v && typeof v === 'object' && !Array.isArray(v)) return v;
+  } catch { /* none */ }
+  return {};
+}
+
+/** Read-modify-write of one mark against the current row (another process may have changed others). */
+function setInflight(db: Pick<RuntimeDb, 'getMeta' | 'setMeta' | 'deleteMeta'>, key: string, at: string | null): void {
+  const cur = loadInflight(db);
+  if (at === null) { if (!(key in cur)) return; delete cur[key]; } else cur[key] = at;
+  if (Object.keys(cur).length) db.setMeta(INTAKE_INFLIGHT_META, JSON.stringify(cur)); else db.deleteMeta(INTAKE_INFLIGHT_META);
+}
+
 function loadState(db: Pick<RuntimeDb, 'getMeta'>): IntakeState {
   try {
     const v = JSON.parse(db.getMeta(INTAKE_STATE_META) ?? '') as IntakeState;
@@ -215,6 +244,7 @@ export async function syncIntake(deps: IntakeSyncDeps): Promise<IntakeSyncReport
   if (!f?.enabled) return emptyReport(false, f?.repository ?? null);
   const { db, backlog } = deps;
   const now = () => (deps.now?.() ?? new Date()).toISOString();
+  const nowMs = () => (deps.now?.() ?? new Date()).getTime();
   const repo = f.repository ?? (await deps.originRepository?.().catch(() => null)) ?? null;
   const report = emptyReport(true, repo);
   const finish = () => {
@@ -280,6 +310,7 @@ export async function syncIntake(deps: IntakeSyncDeps): Promise<IntakeSyncReport
     let rec = state.issues[key];
     const linked = rec?.taskId ?? db.idempotency.get(key) ?? byLink.get(issue.html_url)?.id;
     if (linked) {
+      setInflight(db, key, null); // an earlier, interrupted create landed (or none was in flight)
       if (!byId.has(linked)) { report.warnings.push(`${key}: linked task ${linked} is no longer in the backlog; not imported again`); continue; }
       report.existing++;
       try { db.idempotency.put(key, linked); } catch { /* the key maps elsewhere; keep the recorded link */ }
@@ -302,6 +333,13 @@ export async function syncIntake(deps: IntakeSyncDeps): Promise<IntakeSyncReport
       idempotencyKey: key, externalLinks: [issue.html_url],
     };
     if (intakePaused && isIntakeCreation(input)) { report.skippedIntakePaused++; continue; }
+    const mark = loadInflight(db)[key];
+    const markAge = mark ? nowMs() - Date.parse(mark) : Number.NaN;
+    if (mark && markAge >= 0 && markAge < INTAKE_INFLIGHT_TTL_MS) {
+      report.warnings.push(`${key}: an import started at ${mark} by an earlier pass may still be finishing; not imported now so it cannot be imported twice; a later \`minions sync\` links the task once it lands, or imports the issue after ${Math.round(INTAKE_INFLIGHT_TTL_MS / 60_000)} min`);
+      continue;
+    }
+    setInflight(db, key, now());
     try {
       const r = await backlog.createTask(input);
       db.idempotency.put(key, r.task.id);
@@ -312,6 +350,9 @@ export async function syncIntake(deps: IntakeSyncDeps): Promise<IntakeSyncReport
       } else report.existing++;
     } catch (e) {
       report.errors.push(`${key}: import failed: ${redact((e as Error).message)}`);
+    } finally {
+      // Settled here: either recorded above or failed (the CLI exited or was killed on its timeout).
+      setInflight(db, key, null);
     }
   }
 
