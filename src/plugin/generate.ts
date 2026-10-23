@@ -159,11 +159,11 @@ function deliveryGuidance(cfg: MinionsConfig): string {
     return [
       `${delivered} (the integrated base arrives as \`minions/${b}\`).`,
       '',
-      `Then integrate each delivered branch into the local ${base} yourself, one at a time, in \`/workspace/repo\` with ${base} checked out and a clean tree:`,
+      `Then integrate each delivered branch into the local ${base} yourself, one at a time, in \`/workspace/repo\` with ${base} checked out and a clean tree, never while draining:`,
       '',
       `1. Check that the branch head is the approved head SHA. Sensitive-path changes need the user's explicit approval${askEach}.`,
       '2. `git merge --no-ff --no-commit agent/<slug>`, then run the verification commands on the merged tree.',
-      `3. If they pass, \`git commit --no-edit\`. On a conflict or a failure, \`git merge --abort\` (${base} has not moved), set the task back (\`minions backlog update <taskId> --status changes-requested\` with a note) and dispatch an engineer repair that merges ${base} into the branch and re-tests. Never resolve conflicts yourself or reset ${base}. If a merge ever has to be reverted, revert that revert before re-merging the repaired branch, or the feature stays missing.`,
+      `3. If they pass, \`git commit --no-edit\`. On a conflict or a failure, \`git merge --abort\` (${base} has not moved), set the task back (\`minions backlog update <taskId> --expected-version <v> --status changes-requested\` with a note; \`<v>\` is the \`version\` from \`minions backlog show <taskId> --json\`) and dispatch an engineer repair that merges ${base} into the branch and re-tests. Never resolve conflicts yourself or reset ${base}. If a merge ever has to be reverted, revert that revert before re-merging the repaired branch, or the feature stays missing.`,
       '',
       `Note each merge on its task. Say "delivered" until the merge commit is on ${base}, "merged into ${base}" after.`,
     ].join('\n');
@@ -662,7 +662,7 @@ function testingGuidance(cfg: MinionsConfig): string {
     cfg.verification.testerRequired
       ? '`verification.testerRequired` is on: every task gets a tester stage after the engineer (set it to false on the host for risk-based testing).'
       : 'Testing is risk-based: by default a task goes engineer → reviewer. The engineer writes and updates tests for the acceptance criteria; the reviewer owns test adequacy and requests changes when tests are missing or weak.',
-    `A task gets a tester stage when it carries a QA label (${inlineList(labels, '`qa`')}), its branch touches sensitive paths, or the reviewer sets \`"needsQa": true\`; the CLI records the last two as the ${code(labels[0]!)} label and moves the task to \`testing\` instead of delivered. Add the label yourself for risky tasks (install/upgrade paths, cross-feature changes) with \`minions backlog update <taskId> --label ${labels[0]}\` (repeat \`--label\` for the existing labels: it replaces the list).`,
+    `A task gets a tester stage when it carries a QA label (${inlineList(labels, '`qa`')}), its branch touches sensitive paths, or the reviewer sets \`"needsQa": true\`; the CLI records the last two as the ${code(labels[0]!)} label and moves the task to \`testing\` instead of delivered. Add the label yourself for risky tasks (install/upgrade paths, cross-feature changes) with \`minions backlog update <taskId> --expected-version <v> --label ${labels[0]}\` (\`<v>\`: the \`version\` from \`minions backlog show <taskId> --json\`; repeat \`--label\` for the existing labels: it replaces the list).`,
     `QA sweeps test ${base} itself, not a ticket branch. Schedule one at a milestone, before a release, after about five merges since the last sweep, or when the user asks: create a task labelled \`qa-sweep\` (\`minions backlog create --title "QA sweep: <scope>" --label qa-sweep --key qa-sweep:<milestone or date>\`) and claim it with \`--role tester\`. The tester checks end-to-end flows, install/upgrade paths and cross-feature regressions in a detached worktree at the ${base} head and commits nothing. Recording it closes the sweep as done; create one backlog task per finding (idempotency key \`qa:<sweepId>:<n>\`). Sweeps are not per-ticket work: never start one per task. Scheduling a sweep is new work, not a follow-up: while intake is paused, \`qa-sweep:\` tasks are refused like any other intake, so wait until intake reopens.`,
   ].join('\n\n');
 }

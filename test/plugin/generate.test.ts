@@ -53,6 +53,18 @@ describe('generatePlugin', () => {
     expect(rel.some((r) => r.includes('_partials'))).toBe(false);
   });
 
+  it('passes --expected-version in every `minions backlog update` it tells the coordinator to run', async () => {
+    const { rel, read } = await gen();
+    let seen = 0;
+    for (const r of rel) {
+      for (const m of (await read(r)).matchAll(/minions backlog update [^`]*/g)) {
+        seen++;
+        expect(m[0], r).toContain('--expected-version <v>');
+      }
+    }
+    expect(seen).toBeGreaterThanOrEqual(4);
+  });
+
   it('renders every placeholder', async () => {
     const { rel, read } = await gen();
     for (const r of rel) {
@@ -142,6 +154,7 @@ describe('generatePlugin', () => {
   it('tells the coordinator, the skills and the workers how a drain winds work down', async () => {
     const { read } = await gen(defaults());
     expect(await read('coordinator.md')).toMatch(/Drain \(`minions status --json` shows `draining`.*start nothing.*`drain: true`: not a failed attempt or a repair cycle.*\/minions:recover` re-dispatches the drained tasks to the same role/);
+    expect(await read('coordinator.md')).toContain('re-dispatch nothing, and start no local integration merge (an upgrade could interrupt a `--no-commit` merge and leave the repo mid-merge)');
     expect(await read('skills/orchestrate/SKILL.md')).toMatch(/If `draining` is set .*start nothing/);
     expect(await read('skills/recover/SKILL.md')).toMatch(/Drained tasks .*re-dispatch the same role/);
     for (const role of ['engineer', 'tester', 'reviewer']) {
@@ -640,7 +653,8 @@ describe('owner behaviour defaults (task-34)', () => {
     expect(merge).toBeGreaterThan(-1);
     expect(verify).toBeGreaterThan(merge);
     expect(commit).toBeGreaterThan(verify);
-    expect(coord).toMatch(/On a conflict or a failure, `git merge --abort` \(`trunk` has not moved\), set the task back \(`minions backlog update <taskId> --status changes-requested`/);
+    expect(coord).toMatch(/On a conflict or a failure, `git merge --abort` \(`trunk` has not moved\), set the task back \(`minions backlog update <taskId> --expected-version <v> --status changes-requested` with a note; `<v>` is the `version` from `minions backlog show <taskId> --json`\)/);
+    expect(coord).toContain("with `trunk` checked out and a clean tree, never while draining:");
     expect(coord).toMatch(/Never resolve conflicts yourself or reset `trunk`/);
     expect(coord).toContain('revert that revert before re-merging the repaired branch');
     expect(coord).toMatch(/Sensitive-path changes need the user's explicit approval\./);

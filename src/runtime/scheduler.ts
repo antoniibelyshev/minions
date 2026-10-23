@@ -384,7 +384,7 @@ export class Scheduler {
     const wf = resolveWorkflow(this.config, task.workflow);
     if (!wf) {
       throw new MinionsError('PRECONDITION', `Task ${task.id} uses workflow "${task.workflow}", which is not configured (configured: ${workflowNames(this.config).join(', ')}).`,
-        `Assign a configured workflow (minions backlog update ${task.id} --workflow <name>) or ask the owner to configure it.`);
+        `Assign a configured workflow (minions backlog update ${task.id} --expected-version <v> --workflow <name>) or ask the owner to configure it.`);
     }
     return wf;
   }
@@ -440,7 +440,7 @@ export class Scheduler {
           `The task stops at this stage. Do not retry: block the task or ask the owner; only a host-side policy change (capabilities.${cap}, roles.${def.name}.capabilities) lets it run.`, details);
       }
       throw new MinionsError('POLICY_DENIED', `Task ${task.id}: the ${def.name} stage requires ${cap}, which needs human approval ("ask") for role ${def.name}.`,
-        `Move the task to awaiting-human (minions backlog update ${task.id} --status awaiting-human) and ask the owner to allow ${cap} for role ${def.name} on the host; a stage capability cannot be approved per task.`, details);
+        `Move the task to awaiting-human (minions backlog update ${task.id} --expected-version <v> --status awaiting-human) and ask the owner to allow ${cap} for role ${def.name} on the host; a stage capability cannot be approved per task.`, details);
     }
   }
 
