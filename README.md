@@ -18,6 +18,7 @@ Everything the model controls runs inside one Docker container per project. Your
 - [Working with the team](#working-with-the-team)
 - [Backlogs and task intake](#backlogs-and-task-intake)
 - [Task lifecycle](#task-lifecycle)
+- [Custom roles](#custom-roles)
 - [Delivery, review, and merging](#delivery-review-and-merging)
 - [Permissions and capabilities](#permissions-and-capabilities)
 - [Sensitive changes](#sensitive-changes)
@@ -323,6 +324,56 @@ Briefs and worker results go through files under `/state`, not through the coord
 `minions backlog list|ready --compact --json` (or `--fields id,title,status,...`) leaves out descriptions and other bulky fields.
 
 **Routine context resets (on by default).** To keep its context small, the coordinator restarts itself with a fresh context when no worker is running and a trigger holds: a task was delivered, its context reached about 60k tokens, or 10 worker hand-offs happened. It first writes a short handoff (`minions coordinator handoff`: open questions, pending decisions, what it waits on; at most 4 KB, secrets redacted), which the new session reads at startup. All other state is durable, and the runtime never restarts the coordinator on its own. Tune or turn it off with `coordinator.contextReset` (`{ "enabled": false }`); see [design/bootstrap.md](docs/design/bootstrap.md#coordinator-context-resets).
+
+## Custom roles
+
+The engineer, tester and reviewer are the built-in roles. A project can add its own worker roles (a researcher, a writer, a deploy engineer, ...) and plug them into a task's **workflow**. No custom role ships with minions. The design is [docs/design/roles-and-workflows.md](docs/design/roles-and-workflows.md).
+
+**Where a role lives.** A role is project configuration: `roles.<name>` in the project config (`.minions/config.json` for shared installs, the private `config.json` otherwise) plus a Markdown prompt next to it (`agents/<name>.md`: `.minions/agents/` shared, the project directory private). The host resolves both into the runtime config and the generated plugin, so the container only ever sees the approved version; editing `.minions/agents/x.md` on a worker branch changes nothing. The main fields:
+
+- `contract`: `producer` (does the stage's work, like the engineer), `verifier` (verifies the head, like the tester) or `gate` (approves the exact head, like the reviewer; read-only).
+- `edits`: `none` (default), `any`, or `{ "paths": [globs] }`; `commits` (default: true when it may edit). Enforced: a stage that changes a file outside `edits.paths` is an invalid result.
+- `tools`, `model`, `effort`, `maxTurns`, `requires` (capabilities the stage needs; a `deny` or `ask` refuses the claim) and `capabilities` (the role's column in the policy table; `pr.merge`, `external.*`, `ci.edit`, `infrastructure.edit` and `deploy.execute` default to `deny`).
+
+**Workflows.** `workflows.<name>` is an ordered list of stages, each a role name or `{ "role", "when": "qa", "model" }`. The coordinator assigns one when it creates a task (`minions backlog create ... --workflow <name>`); tasks without one run the default (engineer, tester when QA is required, reviewer). With `verification.reviewerRequired`, a gate must come after the last stage that commits, and a task that needs QA always gets a tester before its final gate, whatever its workflow.
+
+**Approval path.** The coordinator can only propose a role; you apply it on the host:
+
+1. The coordinator writes a proposal and stores it with `minions config roles propose --file <f> --json`. The CLI validates it with the config rules and stores it in the runtime database. Nothing becomes effective; you get a summary (fields, tools, edit scope, the policy row the role implies) and the apply command.
+2. You run `minions config roles apply <proposalId>` **on the host**, in the repository. It reads the proposal from the running runtime, validates it again against the host config, shows the config diff and the prompt, and asks (`--yes` to skip, `--dry-run` to only show the diff). It writes `roles.<name>`, the proposed workflows and the prompt file, bumps `configRevision`, regenerates the runtime config and the plugin, and marks the proposal applied. Inside the container (or by an agent of the host runtime) `apply` is rejected.
+3. Apply never commits and never restarts. Shared installs: commit `.minions/config.json` and `.minions/agents/<name>.md`. The coordinator loads agent definitions at session start, so restart it: `minions settings restart` (graceful, refused while workers run) or `minions down && minions start`, or let its idle restart pick it up.
+
+`minions config roles list` and `minions config roles show <name|proposalId>` are read-only. `minions config roles remove <name>` (host only) removes a project role; it is refused while a configured workflow or an active lease uses the role. You can also edit `roles` and `workflows` by hand on the host; validation is the same.
+
+**Worked example: a researcher.** Research questions keep coming up, and their output is a notes file, not code. The coordinator proposes a researcher that may write only under `docs/research/`, plus a `research` workflow that sends its notes to the reviewer:
+
+```json
+{
+  "name": "researcher",
+  "role": {
+    "description": "Researches a question and writes findings to a notes file. No code edits.",
+    "contract": "producer",
+    "edits": { "paths": ["docs/research/**"] },
+    "tools": ["Read", "Grep", "Glob", "Bash", "Edit", "Write", "WebSearch", "WebFetch"],
+    "model": "sonnet",
+    "requires": ["network.use"]
+  },
+  "promptText": "You research the question in the task. Read the code and the sources you need, then write your findings to docs/research/<task-id>.md: the question, the answer, the evidence (links, file references), open points. Never edit code, tests or configuration. Commit the notes file on the task branch.",
+  "reason": "Recurring research tasks need web access and a notes file, not code edits.",
+  "workflows": { "research": ["researcher", "reviewer"] }
+}
+```
+
+```sh
+# inside the runtime (the coordinator does this)
+minions config roles propose --file /tmp/researcher.json --json   # -> proposalId rp_1a2b3c4d, summary, applyCommand
+
+# on the host, after reading the summary
+minions config roles apply rp_1a2b3c4d     # shows the diff and agents/researcher.md, asks, writes, configRevision + 1
+minions settings restart                   # the coordinator now knows minions:researcher
+```
+
+After the restart, the coordinator creates research tasks with `--workflow research`. `minions work next` then offers a `researcher` stage first (agent `minions:researcher`, model `sonnet`) and a `reviewer` stage after it. The researcher's commit may touch only `docs/research/**`, so a code edit makes its result invalid. `requires: ["network.use"]` makes the claim fail with a clear reason under a policy that does not allow the network. WebSearch and WebFetch also need a container network that allows outbound traffic.
 
 ## Delivery, review, and merging
 

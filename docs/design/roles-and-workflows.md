@@ -430,12 +430,54 @@ Decisions taken while implementing the workflow model (`src/config/workflows.ts`
   worker role); the generated status skill and coordinator.md name the configured per-role limits.
 - **Guidance (D11).** coordinator.md and the orchestrate skill dispatch from `work next` (no role-by-status
   table), spawn the entry's `agentType` with `agentModel`, and cover assigning a workflow at creation, proposing a
-  role and cheap stages. The proposing-a-role text names no command yet: `config roles propose|apply` comes with
-  task-33.6, which should update that text.
+  role and cheap stages. The proposing-a-role text named no command; task-33.6 added `config roles propose|apply` to it.
 - **Deferred.** A verifier added by editing the stage list of the *same* workflow is still skipped (the
   evidence-at-head reset runs only when the workflow name changes; the 33.3 behaviour stays pinned). The stop hook
   (`src/runtime/hooks.ts`) still checks fixed statuses (ready/testing/reviewing/changes-requested), so it misses a
   multi-producer task in `implementing` without a lease; a follow-up could use `Scheduler.next()` there.
+
+## Implementation notes (task-33.6)
+
+- **Where it lives.** `config roles list|show|propose|apply|remove` are registered under the existing `config` command
+  (`src/host/roles-cli.ts`, one `registerRoles` call in `src/host/commands.ts`; `src/runtime/commands.ts` is unchanged).
+  Validation, the summary and the runtime operations are in `src/runtime/role-proposals.ts`; the table is runtime DB
+  migration 6 (`role_proposals`: id, name, json, created_at, state, updated_at, applied_revision).
+- **Proposal file.** `{name, role, promptText, reason, workflows?}`, strict. The prompt is only the top-level
+  `promptText` (`role.prompt|promptText|promptAppend` are refused): `apply` writes it to `agents/<name>.md` next to the
+  project config and sets `roles.<name>.prompt` to that path. `workflows` entries are added or replace configured ones
+  of the same name. Proposals add or change **project roles only**: a built-in name is refused (D9 overrides stay a
+  hand edit on the host), as is anything `roleNameProblem` rejects.
+- **Validation = the config rules.** The proposal is merged into the effective config (runtime config in `propose`, the
+  host's effective config in `apply`) and the result goes through `validateConfig` (schema, role-name rules,
+  cross-field role checks, workflow invariants), plus `resolveRolePrompt` for the prompt (size, empty, frontmatter
+  fence). `apply` validates again on the host (the runtime DB is not trusted) and once more through
+  `editProjectConfig`'s dry run on the raw project layer; nothing is written before all three pass.
+- **Ids and states.** Ids are `rp_` + 8 hex characters (the underscore keeps them apart from role names, so
+  `show <name|proposalId>` is unambiguous). States: `pending`, `applied`, `superseded` (a newer proposal for the same
+  name supersedes the pending one; only `pending` can be applied). Events `role-proposed` / `role-applied`.
+- **Host reads the runtime.** `apply` and the host's `list|show` of proposals run `minions config roles ... --json` in the
+  runtime with captured output (the settings runtime seam, `SettingsRuntime`), not the inherited-stdio delegate. A
+  runtime that is not running is a `PRECONDITION` for `apply` and `remove`; the host `list` then shows roles only.
+- **Marking applied.** After the write, the host runs the hidden runtime command `config roles mark-applied <id>
+  --revision <n>`; the runtime marks only a proposal whose role is in the (regenerated) runtime config, so it cannot
+  record an apply that did not happen. A failure there is a warning; the role is applied either way.
+- **Write order.** The prompt file is written first (the plugin regeneration inside `editProjectConfig` reads it), then
+  the config; if the config write fails before the revision moved, the prompt file is restored. The prompt file is a
+  manifest-tracked generated file (`writeGenerated`), like the config.
+- **Remove.** Refused for built-ins and the coordinator, for roles not in the project layer (e.g. only in
+  `config.local.json`), while a configured workflow or another role's `repairTo` names it, while an active lease has the
+  role, and when the runtime is not running (the leases cannot be checked; conservative). Other references
+  (`execution.maxByRole.<name>`, capability sub-rules) are reported by config validation. The prompt file is left in
+  place (named in `nextSteps`).
+- **Rejected in the runtime.** `apply` / `remove` refuse with `INCOMPATIBLE_RUNTIME` in the container, in the host
+  runtime, and in host mode inside the minions container (filesystem check, as for `work approve`); the hint names the
+  host command for the owner.
+- **Never commits, never restarts.** The result has `restartRequired: true` and the restart options
+  (`minions settings restart`, `minions down && minions start`, the coordinator's idle restart); shared installs get the
+  commit reminder for `.minions/config.json` and `.minions/agents/<name>.md`.
+- **Deferred.** Switching profile defaults from `maxEngineers` to `execution.maxByRole` (33.1 note) is not part of the
+  proposal flow (a proposal never touches `execution`); a per-role limit for a new role stays a host edit or a later
+  `settings` item.
 
 ## Back-compat summary
 
