@@ -202,12 +202,12 @@ describe('credential masking of stored send errors', () => {
   // (`/bot<id>:<secret>/`) has no word boundary before the id, and a JSON-quoted Authorization header
   // lets the `token|authorization` rule consume the quote instead of the bearer value. `it.fails`
   // keeps the suite green while documenting the leak; it turns red once redactError is fixed.
-  it.fails('masks the bot token inside a Telegram Bot API URL', () => {
+  it('masks the bot token inside a Telegram Bot API URL', () => {
     expect(redactError('POST https://api.telegram.org/bot123456789:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw/sendMessage failed'))
       .not.toContain('AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw');
   });
 
-  it.fails('masks a bearer token in a JSON-quoted Authorization header', () => {
+  it('masks a bearer token in a JSON-quoted Authorization header', () => {
     expect(redactError('{"Authorization":"Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig"}')).not.toContain('eyJhbGciOiJIUzI1NiJ9');
   });
 });

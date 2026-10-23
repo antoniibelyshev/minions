@@ -50,9 +50,10 @@ export const backoffMs = (attempts: number): number => Math.min(BACKOFF_BASE_MS 
 /** Shortens an error and masks anything that looks like a credential (bot tokens, bearer tokens, long hex/base64). */
 export function redactError(message: string): string {
   const masked = message
-    .replace(/\b\d{6,}:[A-Za-z0-9_-]{30,}\b/g, '[redacted]')
+    .replace(/(?:bot)?\d{6,}:[A-Za-z0-9_-]{30,}(?![A-Za-z0-9_-])/gi, '[redacted]')
     .replace(/\b(gh[pousr]_|github_pat_)[A-Za-z0-9_]{20,}\b/g, '[redacted]')
-    .replace(/(bearer|token|authorization)(\s*[:=]?\s*)\S{8,}/gi, '$1$2[redacted]')
+    .replace(/\bbearer\s+[^\s"']+/gi, 'Bearer [redacted]')
+    .replace(/(bearer|token|authorization)(["']?\s*[:=]?\s*["']?)(?!\[redacted\])[^\s"']{8,}/gi, '$1$2[redacted]')
     .replace(/\s+/g, ' ')
     .trim();
   return masked.length > MAX_ERROR_LENGTH ? `${masked.slice(0, MAX_ERROR_LENGTH - 1)}…` : masked;
