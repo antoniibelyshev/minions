@@ -226,7 +226,7 @@ export async function runSetup(opts: SetupOptions): Promise<SetupResult> {
   const refs = await loadCredentialRefs(projectId).catch((): CredentialsJson => ({ version: 1 }));
   const localPath = projectPaths(projectId).configLocalJson;
 
-  if (opts.dryRun) return dryRunResult(opts, init, steps, refs, priorId !== null, localPath);
+  if (opts.dryRun) return dryRunResult(opts, init, steps, refs, priorId !== null, localPath, cmds.inRepo);
   const unused = (name: string) => `; the token piped with --${name}-token-stdin was not used (nothing was stored)`;
 
   const project = await loadProjectJson(projectId);
@@ -295,7 +295,7 @@ export async function runSetup(opts: SetupOptions): Promise<SetupResult> {
       hasToken = false;
       step({ id: 'github', status: 'changed', detail: r.removed ? `token removed (${r.backend})` : 'no token was stored', later: LATER.github });
     } else if (action === 'keep') {
-      step({ id: 'github', status: 'kept', detail: `token already stored (${refs.github!.backend}); replace it with \`minions auth github\`` });
+      step({ id: 'github', status: 'kept', detail: `token already stored (${refs.github!.backend}); replace it with ${cmds.inRepo('minions auth github')}` });
     } else {
       step({ id: 'github', status: 'skipped', detail: 'GitHub integration not set up; delivery stays local', later: LATER.github });
     }
@@ -313,7 +313,7 @@ export async function runSetup(opts: SetupOptions): Promise<SetupResult> {
   } else if (interactive && !opts.configFile && !blocked && steps.find((s) => s.id === 'github')?.status !== 'skipped') {
     // PR-first: with a GitHub remote and a stored token pull-request delivery is the offered default
     // (a project still on local is offered the switch); local and branch stay selectable.
-    say('  Delivery: pull-request (default: push agent/<slug> and open a PR, CI runs on it), branch (push agent/<slug> only), or local (commits stay in the container; `minions export`). minions merges only through opt-in CI-gated auto-merge (asked below).');
+    say(`  Delivery: pull-request (default: push agent/<slug> and open a PR, CI runs on it), branch (push agent/<slug> only), or local (commits stay in the container; ${cmds.inRepo('minions export')}). minions merges only through opt-in CI-gated auto-merge (asked below).`);
     mode = await choose(io!, 'Delivery mode', defaultDeliveryMode(current, false), DELIVERY_MODES);
   } else if (blocked && current !== 'local' && !hasToken && refs.github) {
     mode = 'local'; // the token was just removed: branch/PR delivery could no longer publish
@@ -324,7 +324,7 @@ export async function runSetup(opts: SetupOptions): Promise<SetupResult> {
       setLocal('delivery.provider', mode === 'local' ? 'none' : 'github');
       step({ id: 'delivery', status: 'changed', detail: `delivery.mode ${current} -> ${mode} (recorded in ${localPath})` });
     } else {
-      step({ id: 'delivery', status: 'kept', detail: `delivery.mode ${current}${current !== 'local' && blocked ? ` (cannot publish: ${blocked}; see \`minions doctor\`)` : ''}`,
+      step({ id: 'delivery', status: 'kept', detail: `delivery.mode ${current}${current !== 'local' && blocked ? ` (cannot publish: ${blocked}; see ${cmds.inRepo('minions doctor')})` : ''}`,
         ...(current === 'local' && blocked ? { later: LATER.github } : {}) });
     }
   }
@@ -334,18 +334,18 @@ export async function runSetup(opts: SetupOptions): Promise<SetupResult> {
   if (!onGitHub) {
     step({ id: 'ci', status: 'skipped', detail: 'no GitHub remote: CI observation not applicable', later: LATER.ci });
   } else if (interactive && await yesNo(io!, 'Use CI? (check workflows and required status checks read-only, and print the setup plan; nothing is changed)', false)) {
-    step(await ciStep(opts, config, remoteUrl, hasToken, projectId, init.plan.discovery.ciWorkflows));
+    step(await ciStep(opts, config, remoteUrl, hasToken, projectId, init.plan.discovery.ciWorkflows, cmds.inRepo));
   } else {
     step({ id: 'ci', status: 'skipped', detail: 'CI guidance not requested', later: LATER.ci });
   }
 
   // ---------------------------------------------------------------- 3b. GitHub intake sync (read-only import)
   if (interactive) say('\n== GitHub intake ==');
-  step(await intakeStep(interactive && !opts.configFile ? io! : null, config, onGitHub, setLocal, LATER.intake));
+  step(await intakeStep(interactive && !opts.configFile ? io! : null, config, onGitHub, setLocal, LATER.intake, cmds.inRepo));
 
   // ---------------------------------------------------------------- 4. auto-merge (opt-in, default no)
   if (interactive) say('\n== Auto-merge ==');
-  step(await autoMergeStep(interactive && !opts.configFile ? io! : null, config, mode, setLocal, LATER.autoMerge));
+  step(await autoMergeStep(interactive && !opts.configFile ? io! : null, config, mode, setLocal, LATER.autoMerge, cmds.inRepo));
 
   // ---------------------------------------------------------------- 5. Telegram
   if (interactive) say('\n== Telegram ==');
@@ -356,7 +356,7 @@ export async function runSetup(opts: SetupOptions): Promise<SetupResult> {
   const telegramChannel = channel === 'auto' ? 'auto' : 'telegram';
   if (hostRuntime) {
     step({ id: 'telegram', status: 'skipped', detail: `the host runtime has no Telegram (no user plugins or MCP servers); the coordinator runs in the terminal${opts.tokens?.telegram ? unused('telegram') : ''}`,
-      later: 'Telegram needs the Docker runtime: `minions runtime set docker`.' });
+      later: `Telegram needs the Docker runtime: ${cmds.inRepo('minions runtime set docker')}.` });
   } else if (config.container.network === 'none') {
     step({ id: 'telegram', status: 'skipped', detail: `container.network is none; the Telegram plugin needs api.telegram.org and the npm registry${opts.tokens?.telegram ? unused('telegram') : ''}`, later: LATER.telegram });
   } else {
@@ -392,7 +392,7 @@ export async function runSetup(opts: SetupOptions): Promise<SetupResult> {
       step({ id: 'telegram', status: 'changed', detail: `using the stored bot ${tg!.botId}; communication.channel ${channel}` });
     } else if (action === 'disable') {
       channel = 'terminal';
-      step({ id: 'telegram', status: 'changed', detail: 'communication.channel terminal; the bot token is kept (remove it with `minions auth telegram --remove`)', later: LATER.telegram });
+      step({ id: 'telegram', status: 'changed', detail: `communication.channel terminal; the bot token is kept (remove it with ${cmds.inRepo('minions auth telegram --remove')})`, later: LATER.telegram });
     } else if (action === 'keep') {
       step({ id: 'telegram', status: 'kept', detail: `bot ${tg!.botId}; communication.channel ${channel}` });
     } else {
@@ -432,7 +432,7 @@ export async function runSetup(opts: SetupOptions): Promise<SetupResult> {
       if (await opts.runtime.repoPresent(projectId)) {
         const again = interactive && await yesNo(io!, `The repository is already imported. Import ${project.baseBranch} again (committed history only)?`, false);
         if (again) step(importStep(await opts.runtime.importRepo(projectId), 'changed'));
-        else step({ id: 'import', status: 'kept', detail: 'repository already imported; run `minions import` to refresh it' });
+        else step({ id: 'import', status: 'kept', detail: `repository already imported; run ${cmds.inRepo('minions import')} to refresh it` });
       } else {
         say(`  Importing committed history of ${project.baseBranch} into the ${hostRuntime ? 'host runtime workspace' : 'container'}…`);
         step(importStep(await opts.runtime.importRepo(projectId), 'done'));
@@ -525,7 +525,7 @@ async function askText(io: WizardIO, q: string, def: string, ok: (v: string) => 
  * Intake step: asks whether `minions sync` and coordinator startup should import GitHub issues matching a
  * filter (default no), then the filter. Recorded in config.local.json as intake.github. Read-only on GitHub.
  */
-async function intakeStep(io: WizardIO | null, config: MinionsConfig, onGitHub: boolean, setLocal: (k: string, v: unknown) => void, later: string): Promise<SetupStep> {
+async function intakeStep(io: WizardIO | null, config: MinionsConfig, onGitHub: boolean, setLocal: (k: string, v: unknown) => void, later: string, inRepo: (c: string) => string): Promise<SetupStep> {
   const cur = config.intake.github;
   if (!onGitHub && !cur?.repository) {
     return cur?.enabled ? { id: 'intake', status: 'kept', detail: `intake.github on (${describeFilter(cur)}), but there is no github.com origin`, ...filterLines(cur) }
@@ -535,7 +535,7 @@ async function intakeStep(io: WizardIO | null, config: MinionsConfig, onGitHub: 
     return cur?.enabled ? { id: 'intake', status: 'kept', detail: `intake.github on (${describeFilter(cur)})`, ...filterLines(cur) }
       : { id: 'intake', status: 'skipped', detail: 'GitHub intake not enabled', later };
   }
-  io.info('  minions can import GitHub issues matching a filter into the backlog on `minions sync` and at coordinator start.');
+  io.info(`  minions can import GitHub issues matching a filter into the backlog on ${inRepo('minions sync')} and at coordinator start.`);
   io.info('  It only reads GitHub (no comments, labels or status changes) and never deletes tasks; issues that leave the filter pause their task.');
   const enable = await yesNo(io, 'Import GitHub issues into the backlog?', cur?.enabled ?? false);
   if (!enable) {
@@ -558,7 +558,7 @@ async function intakeStep(io: WizardIO | null, config: MinionsConfig, onGitHub: 
   };
   if (cur && JSON.stringify(cur) === JSON.stringify(next)) return { id: 'intake', status: 'kept', detail: `intake.github on (${describeFilter(next)})`, ...filterLines(next) };
   setLocal('intake.github', next);
-  return { id: 'intake', status: cur?.enabled ? 'changed' : 'done', detail: `intake.github on (${describeFilter(next)}); imported on \`minions sync\` and coordinator start`, ...filterLines(next) };
+  return { id: 'intake', status: cur?.enabled ? 'changed' : 'done', detail: `intake.github on (${describeFilter(next)}); imported on ${inRepo('minions sync')} and coordinator start`, ...filterLines(next) };
 }
 
 /**
@@ -566,7 +566,7 @@ async function intakeStep(io: WizardIO | null, config: MinionsConfig, onGitHub: 
  * i.e. no on a new project). Yes records delivery.merge "auto-when-eligible" in config.local.json and
  * lists what is still missing; nothing is changed on GitHub.
  */
-async function autoMergeStep(io: WizardIO | null, config: MinionsConfig, mode: DeliveryMode, setLocal: (k: string, v: unknown) => void, later: string): Promise<SetupStep> {
+async function autoMergeStep(io: WizardIO | null, config: MinionsConfig, mode: DeliveryMode, setLocal: (k: string, v: unknown) => void, later: string, inRepo: (c: string) => string): Promise<SetupStep> {
   const on = config.delivery.merge === 'auto-when-eligible';
   const missing = () => autoMergeConfigReasons({ ...config, delivery: { ...config.delivery, mode, provider: mode === 'local' ? 'none' : 'github', merge: 'auto-when-eligible' } });
   const lines = () => missing().map((r) => `still needed: ${r}`);
@@ -581,21 +581,21 @@ async function autoMergeStep(io: WizardIO | null, config: MinionsConfig, mode: D
   }
   io.info('  minions can arm GitHub auto-merge for a delivered PR, only when the base branch has required status checks and they all pass');
   io.info('  for the reviewed head, the PR head is that head, and pr.merge policy allows it ("ask": you approve each PR on the host with');
-  io.info('  `minions work approve <taskId> --head <sha> --merge`). GitHub branch protection still decides; minions never force-merges.');
+  io.info(`  ${inRepo('minions work approve <taskId> --head <sha> --merge')}). GitHub branch protection still decides; minions never force-merges.`);
   const yes = await yesNo(io, 'Enable auto-merge?', on);
   if (yes === on) {
     return on ? { id: 'autoMerge', status: 'kept', detail: 'delivery.merge auto-when-eligible', ...(missing().length ? { lines: lines() } : {}) }
       : { id: 'autoMerge', status: 'skipped', detail: 'auto-merge not enabled', later };
   }
   setLocal('delivery.merge', yes ? 'auto-when-eligible' : 'disabled');
-  if (!yes) return { id: 'autoMerge', status: 'changed', detail: 'delivery.merge disabled (minions no longer arms auto-merge; `minions sync` disarms what it armed)' };
+  if (!yes) return { id: 'autoMerge', status: 'changed', detail: `delivery.merge disabled (minions no longer arms auto-merge; ${inRepo('minions sync')} disarms what it armed)` };
   const l = lines();
   for (const x of l) io.info(`  ${x}`);
-  return { id: 'autoMerge', status: 'done', detail: `delivery.merge auto-when-eligible${l.length ? ' (not usable yet; see below and `minions doctor` merge.readiness)' : ''}`, ...(l.length ? { lines: l } : {}) };
+  return { id: 'autoMerge', status: 'done', detail: `delivery.merge auto-when-eligible${l.length ? ` (not usable yet; see below and ${inRepo('minions doctor')} merge.readiness)` : ''}`, ...(l.length ? { lines: l } : {}) };
 }
 
 /** CI step: local workflow files plus (with a token) required checks read with GET only; prints the plan. */
-async function ciStep(opts: SetupOptions, config: MinionsConfig, remoteUrl: string | null, hasToken: boolean, projectId: string, ciWorkflows: string[]): Promise<SetupStep> {
+async function ciStep(opts: SetupOptions, config: MinionsConfig, remoteUrl: string | null, hasToken: boolean, projectId: string, ciWorkflows: string[], inRepo: (c: string) => string): Promise<SetupStep> {
   const workflows = ciWorkflows.filter((f) => f.startsWith('.github/workflows/'));
   const gh = githubRepoFromRemote(remoteUrl);
   const repository = gh ? `${gh.owner}/${gh.repo}` : null;
@@ -617,21 +617,21 @@ async function ciStep(opts: SetupOptions, config: MinionsConfig, remoteUrl: stri
     `Required checks on ${base}: ${state === 'configured' ? rc!.requiredChecks.join(', ') : state === 'none' ? 'none' : `unknown (${unknownWhy})`}`,
   ];
   const plan = ciSetupPlan({ hasWorkflows, requiredChecks: state, verificationCommands: config.verification.commands, baseBranch: base, repository });
-  if (plan.length && state === 'unknown') lines.push('Required checks could not be read; follow the steps below if they are missing (rerun `minions doctor` to check).');
-  lines.push(...plan);
-  if (!plan.length) lines.push(`CI is in place. Set delivery.requiredChecksConfigured to true to record that these checks gate merging, and verification.ciAuthority to "github" to let tester/reviewer stages rely on them (setup changes neither; \`minions doctor\` reports ci.authority).`);
+  if (plan.length && state === 'unknown') lines.push(`Required checks could not be read; follow the steps below if they are missing (rerun ${inRepo('minions doctor')} to check).`);
+  lines.push(...plan.map((l) => l.split('`minions doctor`').join(inRepo('minions doctor'))));
+  if (!plan.length) lines.push(`CI is in place. Set delivery.requiredChecksConfigured to true to record that these checks gate merging, and verification.ciAuthority to "github" to let tester/reviewer stages rely on them (setup changes neither; ${inRepo('minions doctor')} reports ci.authority).`);
   for (const l of lines) opts.io?.info(`  ${l}`);
   return { id: 'ci', status: 'done', detail: `${workflows.length} workflow file(s); required checks ${state}; nothing was changed`, lines };
 }
 
-function dryRunResult(opts: SetupOptions, init: InitResult, steps: SetupStep[], refs: CredentialsJson, rerun: boolean, localPath: string): SetupResult {
+function dryRunResult(opts: SetupOptions, init: InitResult, steps: SetupStep[], refs: CredentialsJson, rerun: boolean, localPath: string, inRepo: (c: string) => string): SetupResult {
   const git = init.plan.discovery.git;
   const would = (id: StepId, detail: string) => steps.push({ id, status: 'planned', detail });
   would('github', !git.hasGitHub ? 'skipped: no github.com origin'
     : refs.github ? `token stored (${refs.github.backend}): would offer keep/change/remove` : opts.tokens?.github ? 'would store the token from stdin' : 'would ask "Set up GitHub integration?" (default no); token entered without echo');
   would('delivery', `delivery.mode ${opts.delivery ?? 'unchanged'}; branch/pull-request need a GitHub remote and a stored token (then pull-request is the offered default)`);
   would('ci', git.hasGitHub ? 'would ask "Use CI?" (default no): read-only check of workflows and required checks, setup plan printed only' : 'skipped: no GitHub remote');
-  would('intake', git.hasGitHub ? 'would ask "Import GitHub issues into the backlog?" (default no): read-only filtered import on `minions sync` and coordinator start' : 'skipped: no GitHub remote');
+  would('intake', git.hasGitHub ? `would ask "Import GitHub issues into the backlog?" (default no): read-only filtered import on ${inRepo('minions sync')} and coordinator start` : 'skipped: no GitHub remote');
   would('autoMerge', 'with pull-request delivery, would ask "Enable auto-merge?" (default no); yes records delivery.merge "auto-when-eligible" in the local layer');
   would('telegram', refs.telegram ? `bot ${refs.telegram.botId} stored: would offer keep/change/disable` : 'would ask "Set up Telegram?" (default no); bot token entered without echo');
   would('container', 'would build the image if needed and start the container (idempotent)');
