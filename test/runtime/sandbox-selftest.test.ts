@@ -282,6 +282,18 @@ describe.skipIf(!REAL)('the real minions-sandbox (Landlock ABI >= 6)', () => {
     expect(r).toMatchObject({ state: 'fail', detail: expect.stringMatching(/^fs\.read:.*\/fixture\/secret escaped/) });
   }, 60_000);
 
+  it('proc.seccomp-filters names an unreadable /proc/self/status (Landlock, no /proc rule) instead of calling the line missing', async () => {
+    // The escapee sweep (D3b) needs Seccomp_filters, so the check stays strict; it must say why it failed.
+    const l = await prepareSelfTestLayout(await tmp('sbx-real-'), { protectedPaths: [], helperDir: dirname(bin) });
+    const noProc: SandboxRules = { ...l.rules, fs: l.rules.fs.filter((f) => f.path !== '/proc') };
+    await writeFile(l.rulesFile, serializeRules(noProc));
+    const r = parseSelfTest(await run(bin, ['--self-test', l.rulesFile], { allowFailure: true, timeoutMs: 60_000 }), noProc);
+    expect(r.state).toBe('fail');
+    expect(r.checks.find((c) => c.name === 'proc.seccomp-filters')).toMatchObject({
+      outcome: 'error', detail: expect.stringMatching(/^cannot open \/proc\/self\/status: Permission denied/),
+    });
+  }, 60_000);
+
   it('run mode: scratch writable, protected paths denied, exit status passed through, helper refuses bad rules', async () => {
     const l = await prepareSelfTestLayout(await tmp('sbx-real-'), { protectedPaths: [] });
     const scratch = join(l.root, 'scratch');
