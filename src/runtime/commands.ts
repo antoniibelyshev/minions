@@ -9,13 +9,13 @@ import { isGithubDelivery } from '../config/delivery.js';
 import type { MinionsConfig } from '../config/schema.js';
 import { action, globalOpts, requireMode, runtimeMode } from '../core/cli-helpers.js';
 import { stripControlChars } from '../core/control-chars.js';
-import { MinionsError } from '../core/errors.js';
+import { EXIT_CODES, MinionsError, type ErrorCode } from '../core/errors.js';
 import { readJson } from '../core/fsutil.js';
-import { emit } from '../core/output.js';
+import { emit, reportError } from '../core/output.js';
 import { approveOnHost } from '../host/approvals.js';
 import { delegateToRuntime } from '../host/delegate.js';
 import { applyDoctorExit, formatDoctor, runDoctor } from '../host/doctor.js';
-import { formatRestartRequired, hostStatus } from '../host/restart-required.js';
+import { formatRestartRequired, hostStatus, parseErrorEnvelope } from '../host/restart-required.js';
 import { readTelegramAccess } from '../telegram/access.js';
 import { installTelegramPlugin } from '../telegram/install.js';
 import { formatTelegramProbe, probeTelegram } from '../telegram/probe.js';
@@ -196,7 +196,7 @@ export interface ChannelStatus {
   reason: string;
   /** launch: decided by the running coordinator; predicted: no launch recorded (the probe runs at launch). */
   source: 'launch' | 'predicted';
-  /** The running coordinator was launched with another channel setting: `minions down && minions start`. */
+  /** The running coordinator was launched with another channel setting: `minions upgrade`. */
   restartRequired?: boolean;
 }
 
@@ -254,7 +254,7 @@ export function humanStatus(s: StatusReport): string {
     `paused: intake=${s.paused.intake} starts=${s.paused.starts}`,
     ...(s.draining ? [`draining: ${s.draining.reason} since ${s.draining.requestedAt} (${s.activeLeases.length} lease(s) winding down)`] : []),
     ...(s.lastDrainNotice ? [`last drain notice: ${s.lastDrainNotice.at} to ${s.lastDrainNotice.agentType} ${s.lastDrainNotice.agentId} (lease ${s.lastDrainNotice.leaseId}, ${s.lastDrainNotice.taskId ?? '-'}, drain event ${s.lastDrainNotice.eventId}, via ${s.lastDrainNotice.via})`] : []),
-    ...(s.channel ? [`channel: configured ${s.channel.configured}, effective ${s.channel.effective} (${s.channel.source === 'launch' ? 'running coordinator' : 'predicted'}: ${s.channel.reason})${s.channel.restartRequired ? '; restart required: `minions down && minions start`' : ''}`] : []),
+    ...(s.channel ? [`channel: configured ${s.channel.configured}, effective ${s.channel.effective} (${s.channel.source === 'launch' ? 'running coordinator' : 'predicted'}: ${s.channel.reason})${s.channel.restartRequired ? '; restart required: `minions upgrade`' : ''}`] : []),
     ...(s.telegramPoller && s.telegramPoller.state !== 'not-applicable' ? [humanPoller(s.telegramPoller)] : []),
     s.capacity ? `capacity: ${s.capacity.activeTasks}/${s.capacity.maxActiveTasks} tasks, ${roleCapacityLine(s.capacity)}` : 'capacity: unknown',
     `queue: ${Object.entries(s.queue).map(([k, v]) => `${k}=${v}`).join(' ') || '(empty)'}`,
@@ -298,6 +298,23 @@ export function pauseControl(d: RuntimeDb, paths: { drainFlag: string }, name: '
 }
 
 /** Host CLI: run the same command in the project runtime (container or host runtime) and exit with its code. */
+/**
+ * Relays the container's `minions status --json` output the host cannot use as a report. Human mode shows an
+ * `ok:false` envelope as a formatted error (message and hint); everything else is passed through with control
+ * characters stripped. The container's exit code is kept (1 when it reported none).
+ */
+export function relayRawStatus(result: { code: number; stdout: string; stderr: string }, opts: { json: boolean }): void {
+  const env = opts.json ? null : parseErrorEnvelope(result.stdout);
+  if (env) {
+    const known = Object.hasOwn(EXIT_CODES, env.code) ? env.code as ErrorCode : 'INTERNAL';
+    reportError(new MinionsError(known, env.message, env.hint), { json: false });
+  } else {
+    if (result.stdout) process.stdout.write(stripControlChars(result.stdout));
+    if (result.stderr) process.stderr.write(stripControlChars(result.stderr));
+  }
+  process.exitCode = result.code || 1;
+}
+
 async function delegate(cmd: Command): Promise<void> {
   const code = await delegateToRuntime(process.argv.slice(2), { json: globalOpts(cmd).json });
   process.exit(code);
@@ -765,13 +782,10 @@ export function register(program: Command): void {
       }
       if (runtimeMode() === 'host') {
         // Docker runtime: the container's status plus the host-side restart-required check (`minions upgrade`).
-        const h = await hostStatus({ cwd: process.cwd() });
+        const h = await hostStatus({ cwd: process.cwd(), args: cmd.args });
         if (h.kind === 'delegate') return delegate(cmd);
         if (h.kind === 'raw') {
-          // Container output relayed as-is otherwise: strip escapes/control characters first.
-          if (h.result.stdout) process.stdout.write(stripControlChars(h.result.stdout));
-          if (h.result.stderr) process.stderr.write(stripControlChars(h.result.stderr));
-          process.exitCode = h.result.code || 1;
+          relayRawStatus(h.result, { json: globalOpts(cmd).json });
           return;
         }
         emit({ ...h.status, restartRequired: h.restartRequired }, { json: globalOpts(cmd).json, human: () => {

@@ -98,6 +98,17 @@ export function parseStatusEnvelope(stdout: string): Record<string, unknown> | n
   } catch { return null; }
 }
 
+/** The error of an `ok:false` envelope in `stdout` (last line), or null when it is anything else. */
+export function parseErrorEnvelope(stdout: string): { code: string; message: string; hint?: string } | null {
+  const line = stdout.trim().split('\n').filter(Boolean).at(-1) ?? '';
+  try {
+    const env = JSON.parse(line) as { ok?: boolean; error?: { code?: unknown; message?: unknown; hint?: unknown } };
+    if (env.ok !== false || !env.error || typeof env.error.message !== 'string') return null;
+    return { code: typeof env.error.code === 'string' ? env.error.code : 'INTERNAL', message: env.error.message,
+      ...(typeof env.error.hint === 'string' ? { hint: env.error.hint } : {}) };
+  } catch { return null; }
+}
+
 /** Compares the running container with what `minions upgrade` would give it now. Never throws. */
 export async function checkRestartRequired(opts: RestartCheckOptions): Promise<RestartRequired> {
   try {
@@ -191,7 +202,7 @@ export type HostStatus =
  * restart-required check. The host runtime keeps the plain delegation (`delegate`); output the host
  * cannot parse is passed through (`raw`).
  */
-export async function hostStatus(opts: { cwd: string; runner?: Runner; fingerprint?: string | null; version?: string }): Promise<HostStatus> {
+export async function hostStatus(opts: { cwd: string; args?: string[]; runner?: Runner; fingerprint?: string | null; version?: string }): Promise<HostStatus> {
   const runner = opts.runner ?? run;
   const { projectId } = await projectForPath(opts.cwd);
   const project = await loadProjectJson(projectId);
@@ -200,7 +211,8 @@ export async function hostStatus(opts: { cwd: string; runner?: Runner; fingerpri
   if (!(await compose.isRunning())) {
     throw new MinionsError('PRECONDITION', 'The project container is not running.', 'Run `minions start` (or `minions start --no-attach`) first.');
   }
-  const r = await compose.exec(['minions', 'status', '--json'], { allowFailure: true, timeoutMs: 60_000 });
+  // Extra status arguments are forwarded to the container's `minions status` (never silently dropped).
+  const r = await compose.exec(['minions', 'status', ...(opts.args ?? []).filter((a) => a !== '--json'), '--json'], { allowFailure: true, timeoutMs: 60_000 });
   const status = parseStatusEnvelope(r.stdout);
   if (!status) return { kind: 'raw', result: r };
   const restartRequired = await checkRestartRequired({

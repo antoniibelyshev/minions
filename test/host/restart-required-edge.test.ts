@@ -11,7 +11,7 @@ import {
   RESTART_COMMAND, RESTART_REASON_KINDS, checkRestartRequired, formatRestartRequired, hostStatus, notApplicable, parseStatusEnvelope, restartUnknown,
   type RestartRequired,
 } from '../../src/host/restart-required.js';
-import { humanStatus, type StatusReport } from '../../src/runtime/commands.js';
+import { humanStatus, relayRawStatus, type StatusReport } from '../../src/runtime/commands.js';
 
 vi.mock('../../src/plugin/generate.js', async () => {
   const { mkdir, writeFile } = await import('node:fs/promises');
@@ -256,6 +256,38 @@ describe('host status', () => {
       const h = await hostStatus({ cwd: repo, runner: fakeDocker(world(projectId, { statusResult })), fingerprint: FP, version: HOST_VERSION });
       expect(h).toEqual({ kind: 'raw', result: statusResult });
     }
+  });
+
+  it('forwards extra status arguments to the container before --json', async () => {
+    const { repo, projectId } = await dockerProject();
+    const inner = fakeDocker(world(projectId, { statusResult: ok(JSON.stringify({ ok: true, data: STATUS_DATA })) }));
+    const seen: string[] = [];
+    const runner: typeof inner = async (cmd, args, o) => {
+      const a = [cmd, ...args].join(' ');
+      if (a.includes('minions status')) { seen.push(a.slice(a.indexOf('minions status'))); return ok(JSON.stringify({ ok: true, data: STATUS_DATA })); }
+      return inner(cmd, args, o);
+    };
+    await hostStatus({ cwd: repo, args: ['--foo', 'bar', '--json'], runner, fingerprint: FP, version: HOST_VERSION });
+    expect(seen).toContain('minions status --foo bar --json');
+  });
+
+  it('human mode renders an ok:false envelope as a formatted error and keeps the exit code; json mode relays it', () => {
+    const stdout = JSON.stringify({ ok: false, error: { code: 'PRECONDITION', message: 'queue broken', hint: 'fix the queue' } }) + '\n';
+    const out = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+    const err = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const prev = process.exitCode;
+    try {
+      relayRawStatus({ code: 11, stdout, stderr: '' }, { json: false });
+      expect(err.mock.calls.map((c) => String(c[0])).join('')).toBe('error [PRECONDITION]: queue broken\nhint: fix the queue\n');
+      expect(out).not.toHaveBeenCalled();
+      expect(process.exitCode).toBe(11);
+      err.mockClear();
+      relayRawStatus({ code: 11, stdout, stderr: '' }, { json: true });
+      expect(out.mock.calls.map((c) => String(c[0])).join('')).toBe(stdout);
+      expect(process.exitCode).toBe(11);
+      relayRawStatus({ code: 0, stdout, stderr: '' }, { json: false });
+      expect(process.exitCode).toBe(1);
+    } finally { out.mockRestore(); err.mockRestore(); process.exitCode = prev; }
   });
 
   it('host runtime delegates unchanged', async () => {
