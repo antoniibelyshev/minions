@@ -1,7 +1,7 @@
 import { copyFile } from 'node:fs/promises';
-import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { projectPaths } from '../../src/core/paths.js';
 import { MinionsError } from '../../src/core/errors.js';
 import type { ProjectJson } from '../../src/host/project.js';
@@ -115,6 +115,24 @@ describe('minions export --state / import --state (host side)', () => {
     const r = await importState(project, out.archive, { target: composeTarget(new Compose(ID, mk(dst))) });
     expect(r.files).toBe(out.files);
     expect(readFileSync(join(rtPaths(dstRoot).notes, 'n.md'), 'utf8')).toBe('note\n');
+  });
+
+  it('host runtime (hostFs) refuses a non-regular backup before copying it', async () => {
+    const root = join(env.root, 'src');
+    const base = fakeRuntime(root);
+    seedRuntime(root);
+    const getFile = vi.fn(base.getFile);
+    const evil: TransferTarget = {
+      ...base, hostFs: true, getFile,
+      async exec(args) {
+        const r = await base.exec(args);
+        const f = args[3]!;
+        rmSync(f); symlinkSync('/etc/hostname', f); // swap the backup for a symlink
+        return r;
+      },
+    };
+    await expect(exportState(project, { target: evil })).rejects.toMatchObject({ code: 'PRECONDITION' });
+    expect(getFile).not.toHaveBeenCalled();
   });
 
   it('writes to an explicit file and never overwrites one', async () => {
