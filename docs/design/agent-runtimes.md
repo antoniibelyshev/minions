@@ -571,7 +571,10 @@ seccomp now covers them too:
   Landlock and receives the listener fd over a socketpair. It reads the path from `/proc/<pid>/mem` and resolves it
   with `openat(O_PATH)` against the worker's root, cwd or dirfd. It accepts the result only if `/proc/self/fd/N` is
   inside the realpath of a writable rule. It then chmods that pinned inode itself and never answers CONTINUE, so
-  rewriting the path after the check gains nothing. Anything else gets `EPERM`. `fchmod(fd)` stays allowed.
+  rewriting the path after the check gains nothing. Anything else gets `EPERM`. `fchmod(fd)` stays allowed. The
+  handler re-checks `SECCOMP_IOCTL_NOTIF_ID_VALID` after opening `/proc/<pid>/mem` and the base, so a recycled pid
+  cannot redirect it. It follows the kernel on flags: an empty path is `ENOENT` unless `AT_EMPTY_PATH` (then the
+  dirfd itself), `AT_SYMLINK_NOFOLLOW` on a symlink is `EOPNOTSUPP`, and a bad pointer is `EFAULT`.
 - **Denied outright (`EPERM`):** the chown family, set/remove xattr (`l`/`f` variants and the 6.13 `setxattrat`/
   `removexattrat` included), `file_setattr`, and `utime`/`utimes`/`futimesat`/`utimensat`. The `*at` xattr forms
   matter: a `system.posix_acl_access` ACL rewrites the mode bits (chmod 000 under another name), and `setxattrat`
