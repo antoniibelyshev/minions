@@ -736,6 +736,14 @@ date is the source phase. It runs before everything else (see "Upgrade from the 
 - **Order.** Preflight (read-only) → `pause --starts --drain --reason upgrade` → drain → regenerate derived files → image →
   materialize secrets → `compose up --force-recreate` → `workspace setup` → `importRepo` (refreshes
   the clone, which is never re-cloned, and configures origin) → `resume --starts` → `coordinator restart --recover`.
+- **Derived files.** compose.yaml, the runtime config and the plugin (`<project dir>/plugin`, bind-mounted
+  read-only at /opt/minions/plugin) are rendered from the package of the CLI that runs the step: after a
+  CLI rebuild/reinstall that is the new CLI the upgrade hands off to. Files are replaced one by one
+  (atomic rename inside the directory, never the directory itself, so the mount sees them); files the
+  user edited are kept with a warning, files no longer generated are removed when unchanged. The same
+  refresh runs on every `minions start` and config/auth/runtime change. Afterwards the files step reports
+  whether the plugin matches the installed package (`plugin` in the result), and `minions doctor` has a
+  `plugin` check. Until task-46 only `minions init` wrote the plugin, so upgrades left it stale.
 - **Drain.** Workers are Agent subagents of the coordinator's claude process, so draining means
   waiting until their leases end (recorded or released by the coordinator) while no new stage can
   start. The pause also records a drain request (runtime DB `controls` row `drain` with reason,

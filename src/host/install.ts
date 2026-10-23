@@ -533,18 +533,37 @@ async function apply(prep: Prepared): Promise<ApplyResult> {
 
 // ---------------------------------------------------------------- derived files at start
 
+/** Renders the plugin from the installed package's templates: [absolute path under pluginDir, content]. */
+async function renderPlugin(pluginDir: string, effective: MinionsConfig): Promise<[string, Buffer][]> {
+  const staging = await mkdtemp(join(tmpdir(), 'minions-plugin-'));
+  try {
+    await generatePlugin(effective, staging);
+    const out: [string, Buffer][] = [];
+    for (const f of await walkFiles(staging)) out.push([join(pluginDir, relative(staging, f)), await readFile(f)]);
+    return out;
+  } finally { await rm(staging, { recursive: true, force: true }); }
+}
+
 /**
- * Regenerates compose.yaml and runtime/{config,project}.json from project.json + config (used by
- * `minions start`). Files edited by the user (hash ≠ manifest) are not replaced; a warning is returned.
+ * Regenerates compose.yaml, runtime/{config,project}.json and the plugin (agents, coordinator prompt,
+ * hooks, skills, rendered from the installed package's templates) from project.json + config. Used by
+ * `minions start`, the `files` step of `minions upgrade` and the config/auth/runtime setters, so the
+ * plugin directory the container mounts follows the installed package (task-46: before, only
+ * `minions init` wrote the plugin, and an upgrade left it stale). Files are replaced one by one
+ * (atomic rename inside the directory), never the directory itself, so the bind mount sees them.
+ * Files edited by the user (hash ≠ manifest) are not replaced; a warning is returned. Plugin files
+ * the package no longer generates are removed when unchanged since generation.
  */
 export async function refreshDerived(project: ProjectJson, effective: MinionsConfig): Promise<string[]> {
   const paths = projectPaths(project.projectId);
   const manifest = (await loadManifest(project.projectId)) ?? { version: 1 as const, packageVersion: VERSION, files: [] };
   const warnings: string[] = [];
+  const plugin = await renderPlugin(paths.pluginDir, effective);
   const files: [string, Buffer][] = [
     [paths.composeYaml, Buffer.from(composeYaml(project))],
     [join(paths.runtimeDir, 'config.json'), json(effective)],
     [join(paths.runtimeDir, 'project.json'), json(runtimeProjectInfo(project))],
+    ...plugin,
   ];
   let changed = false;
   for (const [path, data] of files) {
@@ -557,8 +576,58 @@ export async function refreshDerived(project: ProjectJson, effective: MinionsCon
     if (entry) entry.sha256 = want; else manifest.files.push({ path, sha256: want, owner: 'minions' });
     changed = true;
   }
+  // Plugin files the installed package no longer generates.
+  const wanted = new Set(plugin.map(([p]) => p));
+  for (const entry of [...manifest.files]) {
+    if (!isInside(entry.path, paths.pluginDir) || wanted.has(entry.path)) continue;
+    const cur = await fileHash(entry.path);
+    if (cur !== undefined && cur !== entry.sha256) { warnings.push(`${entry.path} is no longer generated but was edited; left in place.`); continue; }
+    if (cur !== undefined) await rm(entry.path, { force: true });
+    manifest.files.splice(manifest.files.indexOf(entry), 1);
+    changed = true;
+  }
   if (changed) await writeJson(paths.manifestJson, manifest);
   return warnings;
+}
+
+/** How the plugin on disk (the directory the container mounts) compares with the installed package. */
+export interface PluginCheck {
+  dir: string;
+  /** Number of files the installed package generates. */
+  files: number;
+  /** Generated files whose content on disk differs (stale, or edited by the user). Relative to dir. */
+  differs: string[];
+  /** Generated files missing on disk. */
+  missing: string[];
+  /** Files on disk the installed package does not generate. */
+  extra: string[];
+  matches: boolean;
+}
+
+/** Renders the plugin from the installed package and compares it with <project dir>/plugin (read-only). */
+export async function checkPlugin(project: ProjectJson, effective: MinionsConfig): Promise<PluginCheck> {
+  const dir = projectPaths(project.projectId).pluginDir;
+  const plugin = await renderPlugin(dir, effective);
+  const differs: string[] = [], missing: string[] = [];
+  for (const [path, data] of plugin) {
+    const cur = await fileHash(path);
+    if (cur === undefined) missing.push(relative(dir, path));
+    else if (cur !== sha256(data)) differs.push(relative(dir, path));
+  }
+  const wanted = new Set(plugin.map(([p]) => p));
+  const extra = (await exists(dir) ? await walkFiles(dir) : []).filter((p) => !wanted.has(p)).map((p) => relative(dir, p));
+  return { dir, files: plugin.length, differs, missing, extra, matches: !differs.length && !missing.length && !extra.length };
+}
+
+/** One line on how the plugin differs from what the installed package generates; null when it matches. */
+export function pluginMismatch(c: PluginCheck): string | null {
+  if (c.matches) return null;
+  const list = (xs: string[]) => xs.slice(0, 5).join(', ') + (xs.length > 5 ? ', ...' : '');
+  return [
+    ...(c.differs.length ? [`${c.differs.length} file(s) differ from the installed package (${list(c.differs)})`] : []),
+    ...(c.missing.length ? [`${c.missing.length} file(s) missing (${list(c.missing)})`] : []),
+    ...(c.extra.length ? [`${c.extra.length} file(s) not generated by it (${list(c.extra)})`] : []),
+  ].join('; ');
 }
 
 /** Writes a manifest-tracked generated file (e.g. project.json after `minions auth set`) and records its hash. */

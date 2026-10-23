@@ -72,6 +72,8 @@ export interface UpgradeResult {
   stopped?: SourceStop | null;
   /** The container steps ran on the newly installed CLI (after a rebuild/reinstall). */
   continued?: boolean;
+  /** After the files step: how the plugin the container mounts compares with the installed package (null: not checked). */
+  plugin?: { matches: boolean; detail: string } | null;
 }
 
 export interface UpgradeOptions {
@@ -89,6 +91,8 @@ export interface UpgradeOptions {
   root?: string;
   /** Regenerates compose.yaml, the runtime config and the plugin from the installed package. */
   refresh: () => Promise<string[]>;
+  /** After the refresh: how the plugin on disk differs from the installed package (null: it matches). */
+  checkPlugin?: () => Promise<string | null>;
   /** Re-runs the repository import, which (re)configures origin; an existing clone is only refreshed. */
   importRepo: () => Promise<ImportResult>;
   materialize?: () => Promise<unknown>;
@@ -438,7 +442,15 @@ export async function runUpgrade(opts: UpgradeOptions): Promise<UpgradeResult> {
     try {
       const warnings = await opts.refresh();
       for (const w of warnings) log(`warning: ${w}`);
-      step('files', 'done', 'derived files regenerated');
+      // Report a plugin that still differs (files edited by the user are kept): the container mounts it as is.
+      let plugin = '';
+      if (opts.checkPlugin) {
+        const mismatch = await opts.checkPlugin().catch((e: unknown) => `could not be compared with the installed package: ${errMsg(e)}`);
+        result.plugin = { matches: mismatch === null, detail: mismatch ?? 'matches the installed package' };
+        plugin = `; plugin ${result.plugin.detail}`;
+        if (mismatch !== null) log(`warning: plugin ${mismatch}`);
+      }
+      step('files', 'done', `derived files regenerated${plugin}`);
       await checkpoint();
     } catch (e) { await abort('files', e); }
     try {
