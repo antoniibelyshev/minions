@@ -1,6 +1,7 @@
 // QA for task-25.2: end-to-end probe -> compose.yaml / secret file writes with fake /etc/passwd and
 // /etc/group, mode transitions on real files, and edge cases of the private-group decision.
 // The test user's own primary gid stands in for the private group (chown to it needs no privilege).
+import { createHash } from 'node:crypto';
 import { readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { atomicWrite } from '../../src/core/fsutil.js';
@@ -9,7 +10,7 @@ import { ensureSecretsDir, writeKeyFile } from '../../src/host/auth.js';
 import { materializeSecrets, provisionGithubToken } from '../../src/host/credentials.js';
 import { composeYaml } from '../../src/host/docker.js';
 import type { ProjectJson } from '../../src/host/project.js';
-import { probeSecretsAccess, secretsAccessFor, type SecretsAccess } from '../../src/host/secrets-access.js';
+import { dockerLooksRootless, probeSecretsAccess, secretsAccessFor, type SecretsAccess } from '../../src/host/secrets-access.js';
 import { makeRepo, withHome } from './fixtures.js';
 
 const ID = '7a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d';
@@ -123,5 +124,93 @@ describe('real secret writes and transitions', () => {
     expect(readFileSync(f, 'utf8')).toBe('old');
     expect(mode(f)).toBe(0o600);
     expect(readdirSync(dir)).toEqual(['k']);
+  });
+});
+
+// QA retest (lease-9efabf6b6c0c): more private-group variants, the rootless heuristic on odd inputs, and
+// byte-identical output for uid 1000 / macOS whatever the Docker env says.
+describe('private-group variants (retest)', () => {
+  const P = 'ada:x:1001:1001::/h:/bin/sh\n';
+  const linux = (g: string, p = P) => secretsAccessFor({ platform: 'linux', uid: 1001, passwd: p, group: g });
+
+  it('another member listed in the primary entry itself is refused', () => {
+    expect(linux('ada:x:1001:bob\n')).toEqual({ mode: 'unsupported', reason: expect.stringContaining('other members: bob') });
+    expect(linux('ada:x:1001:ada,bob\n').mode).toBe('unsupported');
+  });
+
+  it('second passwd account with the same primary gid is refused even when it is listed nowhere in /etc/group', () => {
+    const a = linux('ada:x:1001:\n', `${P}svc:x:1500:1001::/h:/bin/sh\n`);
+    expect(a).toEqual({ mode: 'unsupported', reason: expect.stringContaining('other members: svc') });
+    // A duplicate passwd entry for the same uid under another name also counts as another account.
+    expect(linux('ada:x:1001:\n', `${P}ada2:x:1001:1001::/h:/bin/sh\n`).mode).toBe('unsupported');
+  });
+
+  it('whitespace, trailing commas and CRLF in member lists neither hide members nor invent them', () => {
+    expect(linux('ada:x:1001:bob,\n').mode).toBe('unsupported');
+    expect(linux('ada:x:1001: bob \n').mode).toBe('unsupported');
+    expect(linux('ada:x:1001:,bob\r\n').mode).toBe('unsupported');
+    expect(linux('ada:x:1001:ada , \n').mode).toBe('group');
+    expect(linux('ada:x:1001:,,\r\n').mode).toBe('group');
+    expect(linux('ada:x:1001:\r\n', 'ada:x:1001:1001::/h:/bin/sh\r\n').mode).toBe('group');
+  });
+
+  it('malformed lines are skipped without throwing and never turn a shared group private', () => {
+    const junk = 'garbage\n::\n:x:1001:bob\nnogid:x::bob\nneg:x:-1:bob\n';
+    expect(linux(`${junk}ada:x:1001:\n`, `${P}broken\n:x:1:1001\nzz:x:abc:1001\n`).mode).toBe('group');
+    expect(linux(`ada:x:1001:\n${junk}alias:x:1001:carol\n`).mode).toBe('unsupported');
+    // An alias with the same gid but a different first entry name stays refused.
+    expect(linux('staff:x:1001:\nada:x:1001:\n').mode).toBe('unsupported');
+    // Empty files: no passwd entry / no group entry.
+    expect(linux('', '').mode).toBe('unsupported');
+    expect(linux('').mode).toBe('unsupported');
+  });
+});
+
+describe('dockerLooksRootless on odd env and context files (retest)', () => {
+  const meta = (cfg: string, name: string) => `${cfg}/contexts/meta/${createHash('sha256').update(name).digest('hex')}/meta.json`;
+  const reader = (files: Record<string, string>) => (p: string) => (p in files ? files[p]! : null);
+
+  it('never throws on malformed config.json / meta.json and treats them as rootful', () => {
+    const cfg = '/c';
+    const bad = ['', '{', 'null', '5', '"x"', '[]', '{"currentContext":5}', '{"currentContext":{}}', '{"currentContext":""}'];
+    for (const c of bad) {
+      expect(dockerLooksRootless({ uid: 1001, env: { DOCKER_CONFIG: cfg }, readFile: reader({ [`${cfg}/config.json`]: c }) })).toBe(false);
+    }
+    const metas = ['', '{', 'null', '[]', '{"Endpoints":null}', '{"Endpoints":{"docker":null}}', '{"Endpoints":{"docker":{"Host":5}}}',
+      '{"Endpoints":{"docker":"unix:///run/user/1001/docker.sock"}}'];
+    for (const m of metas) {
+      const files = { [`${cfg}/config.json`]: '{"currentContext":"work"}', [meta(cfg, 'work')]: m };
+      expect(dockerLooksRootless({ uid: 1001, env: { DOCKER_CONFIG: cfg }, readFile: reader(files) })).toBe(false);
+      // A context literally named "rootless" with an unreadable endpoint is taken as rootless.
+      const rl = { [`${cfg}/config.json`]: '{"currentContext":"rootless"}', [meta(cfg, 'rootless')]: m };
+      expect(dockerLooksRootless({ uid: 1001, env: { DOCKER_CONFIG: cfg }, readFile: reader(rl) })).toBe(true);
+    }
+    const throwing = () => { throw new Error('io'); };
+    expect(() => dockerLooksRootless({ uid: 1001, env: { DOCKER_HOST: 'unix:///run/user/1001/d.sock' }, readFile: throwing })).not.toThrow();
+  });
+
+  it('odd DOCKER_HOST / XDG_RUNTIME_DIR values', () => {
+    const r = (env: NodeJS.ProcessEnv) => dockerLooksRootless({ uid: 1001, env: { DOCKER_CONFIG: '/none', ...env }, readFile: () => null });
+    expect(r({ DOCKER_HOST: 'unix://' })).toBe(false);
+    expect(r({ DOCKER_HOST: '' })).toBe(false);
+    expect(r({ DOCKER_HOST: 'ssh://me@box' })).toBe(false);
+    expect(r({ DOCKER_HOST: 'unix:///run/user/10011/docker.sock' })).toBe(false); // another uid's prefix
+    expect(r({ DOCKER_HOST: 'unix:///run/user/1001/docker.sock' })).toBe(true);
+    expect(r({ DOCKER_HOST: 'unix:///xdg/docker.sock', XDG_RUNTIME_DIR: '/xdg///' })).toBe(true);
+    expect(r({ DOCKER_HOST: 'unix:///xdgx/docker.sock', XDG_RUNTIME_DIR: '/xdg' })).toBe(false);
+    expect(r({ DOCKER_HOST: 'unix:///var/run/docker.sock', XDG_RUNTIME_DIR: '' })).toBe(false);
+    expect(r({ DOCKER_HOST: 'unix:///var/run/docker.sock', XDG_RUNTIME_DIR: 'relative' })).toBe(false);
+  });
+
+  it('uid 1000 and macOS: compose.yaml is byte-identical whatever the Docker env says, and nothing is read', () => {
+    const never = () => { throw new Error('must not read'); };
+    const base = composeYaml(project, { mode: 'owner' });
+    const envs: NodeJS.ProcessEnv[] = [{}, { DOCKER_HOST: 'unix:///run/user/1000/docker.sock' }, { DOCKER_CONTEXT: 'rootless' },
+      { DOCKER_HOST: 'unix:///var/run/docker.sock' }, { XDG_RUNTIME_DIR: '/run/user/1000' }];
+    for (const e of envs) {
+      expect(composeYaml(project, probeSecretsAccess({ platform: 'linux', uid: 1000, env: e, readFile: never }))).toBe(base);
+      expect(composeYaml(project, probeSecretsAccess({ platform: 'darwin', uid: 501, env: e, readFile: never }))).toBe(base);
+    }
+    expect(base).not.toContain('group_add');
   });
 });
