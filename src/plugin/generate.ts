@@ -236,7 +236,7 @@ function reportingGuidance(cfg: MinionsConfig): string {
       ].join(' ');
     default:
       return [
-        'Reporting level: features (`communication.progress: milestones`, the default). Be concise and report high-level feature progress only:',
+        'Reporting level: milestones (feature-level; `communication.progress: milestones`, the default). Be concise and report high-level feature progress only:',
         '',
         '- new goals acknowledged (one or two lines);',
         '- a user-visible feature or epic delivered or materially changed (scope, plan, or expected outcome), naming its branches; when several land close together, batch them into one short message;',
@@ -313,7 +313,7 @@ function reportingRule(cfg: MinionsConfig): string {
     case 'quiet':
       return 'Reporting level `quiet`: do not report routine progress or deliveries; message the user only for blockers that need them, approvals, and high-level questions.';
     default:
-      return 'Reporting level `features`: do not report stage transitions, splits, follow-ups or individual task deliveries; report when a user-visible feature is delivered or materially changes (batch several into one short message), plus significant blockers, approvals and high-level questions.';
+      return 'Reporting level `milestones` (feature-level): do not report stage transitions, splits, follow-ups or individual task deliveries; report when a user-visible feature is delivered or materially changes (batch several into one short message), plus significant blockers, approvals and high-level questions.';
   }
 }
 
