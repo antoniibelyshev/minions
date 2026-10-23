@@ -23,7 +23,7 @@ import {
   buildClaudeCommand, buildCoordinatorCommand, claudePermissionModes, configuredPermissionMode, coordinatorWrapper, launchCoordinator, probeRuntime, readLaunchRecord, readMountedToken, RECOVERY_PROMPT,
   restartCoordinator, runtimeChannelFacts, scheduleDetachedRestart, syncCoordinator, coordinatorLaunchStatus, type LaunchStatus,
 } from './coordinator.js';
-import { openDb, type DrainRequest, type Lease, type LeaseRole, type PauseChange, type RuntimeDb } from './db.js';
+import { openDb, type DrainNotice, type DrainRequest, type Lease, type LeaseRole, type PauseChange, type RuntimeDb } from './db.js';
 import { clearDrain, requestDrain } from './drain.js';
 import { claimWithBrief, compactClaim, fetchBrief, recordSubmitted, submitResult, sweepScratchOnStart, type CompactClaim } from './handoff.js';
 import { runHook } from './hooks.js';
@@ -142,6 +142,8 @@ export interface StatusReport {
   pauseChanges: { intake: PauseChange | null; starts: PauseChange | null };
   /** Active drain request (`minions pause --starts --drain`): leased workers wind down and return partial results. */
   draining: DrainRequest | null;
+  /** The last drain notice the worker hook delivered (task-3.10): proof the '*' PreToolUse hook fired in a subagent with agent_id/agent_type. */
+  lastDrainNotice?: DrainNotice | null;
   configRevision: number;
   profile: string;
   deliveryMode: string;
@@ -196,6 +198,7 @@ export async function collectStatus(deps: { db: RuntimeDb; config: MinionsConfig
     guard: { lastReason: d.guard().last_reason, updatedAt: d.guard().updated_at },
     coordinatorLock: d.coordinatorLock() ?? null,
   };
+  try { report.lastDrainNotice = d.lastDrainNotice(); } catch { /* status never fails on it */ }
   if (deps.channel) report.channel = await deps.channel().catch(() => undefined);
   if (deps.launch) report.coordinatorLaunch = await deps.launch().catch(() => undefined);
   try { report.notifications = outboxCounts(d); } catch { /* an older DB without the outbox: omit */ }
@@ -217,6 +220,7 @@ export function humanStatus(s: StatusReport): string {
     `config revision ${s.configRevision}  profile ${s.profile}  delivery ${s.deliveryMode}`,
     `paused: intake=${s.paused.intake} starts=${s.paused.starts}`,
     ...(s.draining ? [`draining: ${s.draining.reason} since ${s.draining.requestedAt} (${s.activeLeases.length} lease(s) winding down)`] : []),
+    ...(s.lastDrainNotice ? [`last drain notice: ${s.lastDrainNotice.at} to ${s.lastDrainNotice.agentType} ${s.lastDrainNotice.agentId} (lease ${s.lastDrainNotice.leaseId}, ${s.lastDrainNotice.taskId ?? '-'}, drain event ${s.lastDrainNotice.eventId}, via ${s.lastDrainNotice.via})`] : []),
     ...(s.channel ? [`channel: configured ${s.channel.configured}, effective ${s.channel.effective} (${s.channel.source === 'launch' ? 'running coordinator' : 'predicted'}: ${s.channel.reason})${s.channel.restartRequired ? '; restart required: `minions down && minions start`' : ''}`] : []),
     s.capacity ? `capacity: ${s.capacity.activeTasks}/${s.capacity.maxActiveTasks} tasks, ${s.capacity.activeEngineers}/${s.capacity.maxEngineers} engineers` : 'capacity: unknown',
     `queue: ${Object.entries(s.queue).map(([k, v]) => `${k}=${v}`).join(' ') || '(empty)'}`,

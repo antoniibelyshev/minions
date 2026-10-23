@@ -665,8 +665,9 @@ export class Scheduler {
       ? await this.qaRequirement(task, head, { paths: r.modifiedPaths, flagged })
       : { reasons: [], record: false };
     const qaWhy = qa.reasons.join('; ');
-    // A partial from a worker that was running when a drain was requested (even one cleared since) is a drain partial.
-    const drained = r.status === 'partial' && !sweep && this.db.drainRequestedSince(lease.started_at);
+    // A drain partial: this lease received the drain notice (the drain hook records it on delivery) for a
+    // drain that was active then, even if the drain is cleared by now. Merely spanning a drain does not count.
+    const drained = r.status === 'partial' && !sweep && this.db.drainNoticeReceived(lease);
     // CI not usable as evidence: failing -> repair; otherwise fall back to the result's own local checks, or no approval.
     const localPass = localVerificationComplete(r.checks, cfg.verification.commands);
     const ciBlock: 'fail' | 'unverified' | null = !ciGate || ciGate.state === 'pass' ? null : ciGate.state === 'fail' ? 'fail' : localPass ? null : 'unverified';

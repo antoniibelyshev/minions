@@ -1,11 +1,11 @@
-import { closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, renameSync, writeSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readSync, renameSync, writeSync } from 'node:fs';
+import { basename, dirname, join } from 'node:path';
 import type { BacklogAdapter } from '../backlog/types.js';
 import { AGENT_MODEL_ALIASES, isAgentModelAlias } from '../config/models.js';
 import type { MinionsConfig } from '../config/schema.js';
 import { sha256 } from '../core/fsutil.js';
 import { redact } from '../core/output.js';
-import type { LeaseRole, RuntimeDb } from './db.js';
+import type { DrainNoticeVia, LeaseRole, RuntimeDb } from './db.js';
 import { TELEGRAM_TOOL_PREFIX } from './coordinator.js';
 import { runtimePaths } from './paths.js';
 import { capacityOf, scopeOf } from './scheduler.js';
@@ -410,6 +410,49 @@ const addContext = (text: string, reason: string): HookOutput => ({
   stdout: JSON.stringify({ hookSpecificOutput: { hookEventName: 'PreToolUse', additionalContext: text } }), reason,
 });
 
+/** How much of a subagent transcript is searched for its lease marker (the brief is the first message). */
+const TRANSCRIPT_HEAD_BYTES = 256 * 1024;
+
+/**
+ * The subagent's own transcript: Claude Code keeps it at <session dir>/<session id>/subagents/agent-<agent_id>.jsonl
+ * next to the main transcript (`transcript_path`); an `agent_transcript_path` or a `transcript_path`
+ * already naming the agent is used as is.
+ */
+function agentTranscriptPaths(inp: Record<string, unknown>, agentId: string): string[] {
+  const out: string[] = [];
+  if (typeof inp.agent_transcript_path === 'string') out.push(inp.agent_transcript_path);
+  const tp = typeof inp.transcript_path === 'string' ? inp.transcript_path : '';
+  if (tp && /^[A-Za-z0-9_-]+$/.test(agentId)) {
+    if (basename(tp).includes(agentId)) out.push(tp);
+    else out.push(join(dirname(tp), basename(tp, '.jsonl'), 'subagents', `agent-${agentId}.jsonl`));
+  }
+  return out;
+}
+
+function readHead(path: string, max: number): string {
+  const fd = openSync(path, 'r');
+  try {
+    const buf = Buffer.alloc(max);
+    return buf.subarray(0, readSync(fd, buf, 0, max, 0)).toString('utf8');
+  } finally { closeSync(fd); }
+}
+
+/**
+ * The active lease(s) of the worker's role a delivered drain notice belongs to: the only one, else the
+ * one whose `minions-lease:` marker is in the subagent's transcript, else (conservatively) all of them.
+ */
+export function noticeLeases<L extends { id: string }>(candidates: L[], inp: Record<string, unknown>, agentId: string): { leases: L[]; via: DrainNoticeVia } {
+  if (candidates.length === 1) return { leases: candidates, via: 'only' };
+  for (const p of agentTranscriptPaths(inp, agentId)) {
+    let text: string;
+    try { text = readHead(p, TRANSCRIPT_HEAD_BYTES); } catch { continue; }
+    const ids = new Set([...text.matchAll(MARKER)].map((m) => m[1]!));
+    const hit = candidates.filter((l) => ids.has(l.id));
+    if (hit.length) return { leases: hit, via: 'transcript' };
+  }
+  return { leases: candidates, via: 'role' };
+}
+
 /**
  * PreToolUse(every tool) drain hook; the plugin runs it only while the drain flag file exists. It acts
  * only on minions worker subagents (hook input `agent_id` + a `minions:<role>` `agent_type`) while an
@@ -432,9 +475,19 @@ export async function drainHook(input: unknown, load: DrainLoader): Promise<Hook
     const { db } = await load();
     const drain = db.drain();
     if (!drain) return { reason: 'allow: no drain requested' };
-    if (!db.activeLeases().some((l) => l.role === role)) return { reason: `allow: no active ${role} lease` };
+    const roleLeases = db.activeLeases().filter((l) => l.role === role);
+    if (!roleLeases.length) return { reason: `allow: no active ${role} lease` };
     const hits = db.drainHit(drain.eventId, agentId);
-    if (hits === 1) return addContext(drainNotice(role, drain.reason), `context: drain notice to ${agentType} ${agentId}`);
+    if (hits === 1) {
+      // Only on delivery (an agent's first call of this drain): tie the notice to its lease (task-3.10).
+      let noted: string;
+      try {
+        const { leases, via } = noticeLeases(roleLeases, inp, agentId);
+        for (const l of leases) db.recordDrainNotice(l, { eventId: drain.eventId, agentId, agentType, tool, via });
+        noted = `lease ${leases.map((l) => l.id).join(',')} via ${via}`;
+      } catch (e) { noted = `notice not recorded: ${(e as Error).message}`; }
+      return addContext(drainNotice(role, drain.reason), `context: drain notice to ${agentType} ${agentId} (${noted})`);
+    }
     if (hits <= DRAIN_GRACE_CALLS + 1 || drainAllowed(tool, ti)) return { reason: `allow: ${agentType} ${agentId} ${tool} during drain (call ${hits})` };
     return deny(`Drain in progress (${drain.reason}): git status|log|diff|show|rev-parse, git add <paths|-A|-u>, git commit -m "<quoted msg>" or the $(cat <<'EOF' … EOF) / -F - <<'EOF' forms, cd <path> && …, and minions work submit|brief are allowed. ` +
       'Commit work in progress (`wip:`), then return a partial WorkerResult listing the remaining work. Uncommitted changes are never discarded.');
