@@ -5,7 +5,7 @@ import { run } from '../core/exec.js';
 import { exists, sha256 } from '../core/fsutil.js';
 import { redact } from '../core/output.js';
 import { AUTHORIZED_LABEL, cycleIfAdded, filterReady } from './ready.js';
-import { matchesSummary, type ParsedTaskFile, parseTaskFile } from './taskfile.js';
+import { fastPathVersionOk, matchesSummary, type ParsedTaskFile, parseTaskFile } from './taskfile.js';
 import type { BacklogAdapter, CreateTaskInput, IdempotencyStore, Provenance, ScopeFilter, Task, TaskStatus } from './types.js';
 
 export interface BacklogMdOptions {
@@ -24,6 +24,13 @@ export interface BacklogMdOptions {
    * (the behaviour before task-24.1); tests use it to compare both paths.
    */
   readFiles?: boolean;
+  /**
+   * `backlog --version` output to assume instead of asking the CLI (tests). By default the adapter asks
+   * once, on its first listing that would read task files, and caches the answer for its lifetime. The
+   * in-process reader is used only for a tested release (see fastPathVersionOk); any other version, or
+   * a failed probe, lists through `task view`.
+   */
+  cliVersion?: string | null;
   /** Provenance of a task whose meta block is missing, malformed or has no valid provenance (see toTask). */
   provenanceFallback?: ProvenanceFallback;
 }
@@ -209,6 +216,8 @@ export class BacklogMdAdapter implements BacklogAdapter {
   private readonly provenanceFallback?: ProvenanceFallback;
   private readonly readFiles: boolean;
   private initialized = false;
+  /** Cached `backlog --version` (trimmed; null when the probe failed), asked at most once per instance. */
+  private version?: Promise<string | null>;
   /** Backlog.md CLI processes this adapter started (diagnostics and tests). */
   spawnCount = 0;
 
@@ -221,6 +230,18 @@ export class BacklogMdAdapter implements BacklogAdapter {
     this.concurrency = Math.max(1, opts.concurrency ?? 4);
     this.provenanceFallback = opts.provenanceFallback;
     this.readFiles = opts.readFiles ?? true;
+    if (opts.cliVersion !== undefined) this.version = Promise.resolve(opts.cliVersion);
+  }
+
+  /** The installed Backlog.md version, probed once and cached; null when `--version` failed. */
+  private cliVersion(): Promise<string | null> {
+    this.version ??= this.cli(['--version']).then((v) => v.trim(), () => null);
+    return this.version;
+  }
+
+  /** True when listings may read task files in-process: readFiles is on and the CLI is a tested release. */
+  private async fastPath(): Promise<boolean> {
+    return this.readFiles && fastPathVersionOk(await this.cliVersion());
   }
 
   private async cli(args: string[]): Promise<string> {
@@ -271,10 +292,11 @@ export class BacklogMdAdapter implements BacklogAdapter {
    * Full details for listed tasks (same order). Parsed in-process from `backlog/tasks/*.md` when the file
    * has the layout Backlog.md writes and agrees with the list summary; viewed with the CLI otherwise. A
    * listing costs one `task list` plus one `task view` per task the reader cannot vouch for (none for
-   * files Backlog.md wrote itself). Writes still go through the CLI.
+   * files Backlog.md wrote itself). Writes still go through the CLI. The reader is used only when the
+   * installed Backlog.md is a tested release (task-24.9); any other version views every listed task.
    */
   private async details(list: RawTask[], tolerant: boolean): Promise<(RawTask | undefined)[]> {
-    const files = this.readFiles && list.length ? await this.readTaskFiles() : new Map<string, ParsedTaskFile | null>();
+    const files = list.length && await this.fastPath() ? await this.readTaskFiles() : new Map<string, ParsedTaskFile | null>();
     const out: (RawTask | undefined)[] = list.map((s) => {
       const f = files.get(s.id);
       return f && matchesSummary(f, s) ? { ...f } : undefined;
@@ -318,6 +340,7 @@ export class BacklogMdAdapter implements BacklogAdapter {
 
   async capabilities() {
     const v = (await this.cli(['--version'])).trim();
+    this.version ??= Promise.resolve(v);
     return { backend: 'backlogmd', version: v, supports: ['create', 'update', 'dependencies', 'notes', 'labels', 'priority', 'parent', 'acceptance-criteria', 'milestone'] };
   }
 
