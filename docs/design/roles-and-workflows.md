@@ -279,6 +279,33 @@ Decision:
   follows it verbatim, a `work next --claim` that returns ready-made Agent call arguments is the next
   step.
 
+## Implementation notes (task-33.1)
+
+Decisions taken while implementing the registry (`src/config/roles.ts`), recorded here so later children follow them:
+
+- **Field defaults (D3).** `contract` is required. `edits` defaults to `none` (the conservative choice; a
+  producer that edits says so), `commits` to `edits != none`. `commits: true` with `edits: none` is a config
+  error, as are `edits`/`commits` that contradict a `review` worktree. Exactly one of `prompt` / `promptText`;
+  `prompt` must be relative to the config dir without `..`. Built-ins accept `promptAppend` or `prompt`
+  (at most one), `model`, `effort`, `maxTurns`, `tools` (a subset of the template's tools) and, for the
+  engineer, `deepEffort`; anything else is a strict-schema error. `repairTo` (D7) is added with the stage machine.
+- **Where the checks live.** Name rules, sub-rule role references, `maxByRole` keys and the
+  `maxEngineers` alias are cross-field checks in `validateConfig` (`roleConfigIssues`), not a zod refinement,
+  like the other cross-field rules; every config load goes through `validateConfig`.
+- **Policy columns (D8).** `external.*` in the custom-role default denies includes `external.read`. A column
+  entry is one more sub-rule for that role, so a hand-written path rule matching the role still applies
+  (strictest wins). Built-in columns are the hand-written table, unchanged. A `config.local.json` layer cannot
+  lift a deny a project role column produces (same rule as capability denies).
+- **`maxEngineers` alias (D8).** Both keys are optional. Within one layer both may be set and must agree; a layer
+  that sets only one replaces the other inherited from lower layers (so the defaults' `maxEngineers` never
+  contradicts a project's `maxByRole.engineer`). Session overrides narrow both. Profile defaults still write
+  `maxEngineers` for now: `minions settings` edits that key, and switching new configs to `maxByRole` is left
+  to the settings/proposal work (task-33.6).
+- **Capacity (D8).** `Capacity.byRole[role] = {active, max, free, limited}` for every worker role; a role without
+  a limit reports `max = maxActiveTasks` and `limited: false`, and claim only enforces `limited` roles.
+- **Seams.** `Role` is `string`; `LeaseRole`, `work claim|brief|submit --role` and the hook still accept only
+  the built-in workers until tasks 33.2 / 33.3 widen them through `isRegisteredRole` / `workerRole`.
+
 ## Back-compat summary
 
 Existing configs validate unchanged (`roles`, `workflows`, `maxByRole` optional; `maxEngineers` and

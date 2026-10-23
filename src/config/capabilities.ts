@@ -1,3 +1,4 @@
+import { isRegisteredRole, roleColumnRules } from './roles.js';
 import { CAPABILITIES, type Capability, type CapabilityRule, type Effect, type MinionsConfig, type Profile, type Role } from './schema.js';
 
 export { CAPABILITIES };
@@ -44,17 +45,21 @@ export const matchesAny = (path: string, globs: string[]) => globs.some((g) => g
 export interface CanContext { role?: Role; paths?: string[] }
 
 /**
- * Evaluates a capability. Deny anywhere (base or matching rule) wins; otherwise matching
- * role/path rules override the base (strictest among them). Sensitive paths upgrade allow→ask
+ * Evaluates a capability. A role that is not in the registry (coordinator, built-in workers, configured
+ * `roles`) is denied everything. Deny anywhere (base or matching rule) wins; otherwise matching
+ * role/path rules override the base (strictest among them); a project role's column (`roles.<r>.capabilities`
+ * and its defaults, src/config/roles.ts) adds sub-rules for that role. Sensitive paths upgrade allow→ask
  * for publication capabilities.
  */
-export function can(config: Pick<MinionsConfig, 'capabilities' | 'sensitivePaths'>, capability: Capability, ctx: CanContext = {}): Effect {
+export function can(config: Pick<MinionsConfig, 'capabilities' | 'sensitivePaths'> & Partial<Pick<MinionsConfig, 'roles'>>, capability: Capability, ctx: CanContext = {}): Effect {
+  if (ctx.role !== undefined && !isRegisteredRole(config, ctx.role)) return 'deny';
   const rule = config.capabilities[capability];
   const base: Effect = typeof rule === 'string' ? rule : rule.effect;
   const paths = ctx.paths ?? [];
   let effect = base;
-  if (typeof rule !== 'string' && rule.rules?.length && base !== 'deny') {
-    const matching = rule.rules.filter((r) =>
+  const rules = [...(typeof rule === 'string' ? [] : rule.rules ?? []), ...(ctx.role !== undefined ? roleColumnRules(config, ctx.role, capability) : [])];
+  if (rules.length && base !== 'deny') {
+    const matching = rules.filter((r) =>
       (!r.roles || (ctx.role !== undefined && r.roles.includes(ctx.role))) &&
       (!r.paths || paths.some((p) => matchesAny(p, r.paths!))));
     if (matching.length) effect = matching.map((r) => r.effect).reduce(stricter);

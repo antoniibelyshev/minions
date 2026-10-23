@@ -13,8 +13,14 @@ export const CAPABILITIES = [
 ] as const;
 export type Capability = (typeof CAPABILITIES)[number];
 
+/** Built-in role names (coordinator + the three built-in workers). Project roles extend this set (src/config/roles.ts). */
 export const ROLES = ['coordinator', 'engineer', 'tester', 'reviewer'] as const;
-export type Role = (typeof ROLES)[number];
+export type BuiltinRole = (typeof ROLES)[number];
+/**
+ * A role name: a built-in or a project role from `roles` (docs/design/roles-and-workflows.md D8). Any string
+ * type-checks; runtime boundaries validate it against the registry (`isRegisteredRole`; `can()` denies unknown roles).
+ */
+export type Role = string;
 
 export const EffectSchema = z.enum(['allow', 'ask', 'deny']);
 export type Effect = z.infer<typeof EffectSchema>;
@@ -25,7 +31,8 @@ export const CapabilityRuleSchema = z.union([
     effect: EffectSchema,
     rules: z.array(z.object({
       effect: EffectSchema,
-      roles: z.array(z.enum(ROLES)).min(1).optional(),
+      /** Registered role names (built-ins or `roles` keys); checked by roleConfigIssues (src/config/roles.ts). */
+      roles: z.array(z.string().min(1)).min(1).optional(),
       paths: z.array(z.string().min(1)).min(1).optional(),
     }).strict()).optional(),
   }).strict(),
@@ -52,6 +59,83 @@ const port = z.number().int().min(1).max(65535);
 /** Claude Code reasoning effort levels (`--effort`, agent frontmatter `effort`; Claude Code 2.1.292). */
 export const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'] as const;
 export type Effort = (typeof EFFORTS)[number];
+
+/** Result-contract variants (D4). */
+export const ROLE_CONTRACTS = ['producer', 'verifier', 'gate'] as const;
+export type RoleContract = (typeof ROLE_CONTRACTS)[number];
+export const ROLE_WORKTREES = ['branch', 'review'] as const;
+export type RoleWorktree = (typeof ROLE_WORKTREES)[number];
+/** Backlog statuses a stage of the role sits in (D6). */
+export const STAGE_STATUSES = ['implementing', 'testing', 'reviewing'] as const;
+export type StageStatus = (typeof STAGE_STATUSES)[number];
+
+/** Claude Code tool names (or patterns); minions does not pin the list, only the character set (D3). */
+const toolName = z.string().regex(/^[A-Za-z0-9_*()-]+$/, 'must be a tool name (letters, digits, _ * ( ) -)');
+/** Prompt file relative to the config directory; checked further by roleConfigIssues. */
+const promptFile = z.string().min(1);
+const effectColumn = z.object(
+  Object.fromEntries(CAPABILITIES.map((c) => [c, EffectSchema.optional()])) as Record<Capability, z.ZodOptional<typeof EffectSchema>>,
+).strict();
+
+/** A project-defined worker role (D3). */
+export const CustomRoleSchema = z.object({
+  description: nonEmpty,
+  /** Markdown prompt body, relative to the config dir (e.g. `agents/researcher.md`). Exactly one of prompt / promptText. */
+  prompt: promptFile.optional(),
+  promptText: nonEmpty.optional(),
+  contract: z.enum(ROLE_CONTRACTS),
+  /** Default: `review` for gates, else `branch`. */
+  worktree: z.enum(ROLE_WORKTREES).optional(),
+  /** Default `none`. `review` worktrees imply `none`. */
+  edits: z.union([z.enum(['none', 'any']), z.object({ paths: z.array(nonEmpty).min(1) }).strict()]).optional(),
+  /** Default: true unless `edits` is `none`. `review` worktrees imply false. */
+  commits: z.boolean().optional(),
+  tools: z.array(toolName).min(1).optional(),
+  /** Must be in models.allowed. Default models.default. */
+  model: modelId.optional(),
+  effort: z.enum(EFFORTS).optional(),
+  /** Default execution.attemptMaxTurns. */
+  maxTurns: z.number().int().min(1).optional(),
+  /** Also generate `minions:<name>-deep`. */
+  deepVariant: z.boolean().optional(),
+  /** Default: `reviewing` for gates, `testing` for verifiers, `implementing` for producers. */
+  stageStatus: z.enum(STAGE_STATUSES).optional(),
+  /** Capabilities the stage cannot work without; a deny refuses the claim. */
+  requires: z.array(z.enum(CAPABILITIES)).optional(),
+  /** This role's column in the policy table (D8): each entry becomes a sub-rule `{effect, roles: [name]}`. */
+  capabilities: effectColumn.optional(),
+}).strict();
+export type CustomRoleConfig = z.infer<typeof CustomRoleSchema>;
+
+/** Overrides a project may set on a built-in worker (D9); contract, stage status and policy column stay fixed. */
+const builtinRoleOverride = {
+  /** Appended to the built-in body under "Project instructions". At most one of promptAppend / prompt. */
+  promptAppend: nonEmpty.optional(),
+  /** File (relative to the config dir) appended like promptAppend. */
+  prompt: promptFile.optional(),
+  model: modelId.optional(),
+  effort: z.enum(EFFORTS).optional(),
+  maxTurns: z.number().int().min(1).optional(),
+  /** May only remove tools from the built-in definition. */
+  tools: z.array(toolName).min(1).optional(),
+};
+export const BuiltinRoleOverrideSchema = z.object(builtinRoleOverride).strict();
+export const EngineerRoleOverrideSchema = z.object({
+  ...builtinRoleOverride,
+  /** Effort of `minions:engineer-deep`; mirrors models.effortByRole.engineerDeep and wins over it. */
+  deepEffort: z.enum(EFFORTS).optional(),
+}).strict();
+export type BuiltinRoleOverride = z.infer<typeof EngineerRoleOverrideSchema>;
+
+/**
+ * `roles`: built-in overrides under their names, project roles under any other name. Name rules and
+ * cross-field checks (prompt, model, tools, policy) are in roleConfigIssues (src/config/roles.ts).
+ */
+export const RolesSchema = z.object({
+  engineer: EngineerRoleOverrideSchema.optional(),
+  tester: BuiltinRoleOverrideSchema.optional(),
+  reviewer: BuiltinRoleOverrideSchema.optional(),
+}).catchall(CustomRoleSchema);
 
 export const MinionsConfigSchema = z.object({
   schemaVersion: z.literal(1),
@@ -106,7 +190,10 @@ export const MinionsConfigSchema = z.object({
   }).strict(),
   execution: z.object({
     maxActiveTasks: z.number().int().min(1),
-    maxEngineers: z.number().int().min(1),
+    /** Alias of maxByRole.engineer (kept for older configs); when both are set they must agree. */
+    maxEngineers: z.number().int().min(1).optional(),
+    /** Concurrent leases per worker role (`-deep` variants count as their base role); a role without a limit is bounded by maxActiveTasks only. */
+    maxByRole: z.record(z.string(), z.number().int().min(1)).optional(),
     oneActiveStagePerTask: z.literal(true),
     maxRepairCyclesBeforeReplan: z.number().int().min(1),
     attemptMaxTurns: z.number().int().min(1),
@@ -168,6 +255,8 @@ export const MinionsConfigSchema = z.object({
     dailyUsd: z.number().positive().nullable(),
   }).strict(),
   capabilities: CapabilitiesSchema,
+  /** Built-in role overrides and project-defined worker roles (docs/design/roles-and-workflows.md D3, D9). */
+  roles: RolesSchema.optional(),
   sensitivePaths: z.array(nonEmpty),
   architecture: z.enum(['decide', 'propose']),
   git: z.object({

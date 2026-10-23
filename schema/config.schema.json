@@ -279,6 +279,17 @@
           "minimum": 1,
           "maximum": 9007199254740991
         },
+        "maxByRole": {
+          "type": "object",
+          "propertyNames": {
+            "type": "string"
+          },
+          "additionalProperties": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          }
+        },
         "oneActiveStagePerTask": {
           "type": "boolean",
           "const": true
@@ -296,7 +307,6 @@
       },
       "required": [
         "maxActiveTasks",
-        "maxEngineers",
         "oneActiveStagePerTask",
         "maxRepairCyclesBeforeReplan",
         "attemptMaxTurns"
@@ -657,6 +667,249 @@
       ],
       "additionalProperties": false
     },
+    "roles": {
+      "type": "object",
+      "properties": {
+        "engineer": {
+          "type": "object",
+          "properties": {
+            "promptAppend": {
+              "$ref": "#/$defs/__schema8"
+            },
+            "prompt": {
+              "$ref": "#/$defs/__schema9"
+            },
+            "model": {
+              "$ref": "#/$defs/__schema11"
+            },
+            "effort": {
+              "$ref": "#/$defs/__schema12"
+            },
+            "maxTurns": {
+              "$ref": "#/$defs/__schema13"
+            },
+            "tools": {
+              "$ref": "#/$defs/__schema14"
+            },
+            "deepEffort": {
+              "type": "string",
+              "enum": [
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        "tester": {
+          "$ref": "#/$defs/__schema16"
+        },
+        "reviewer": {
+          "$ref": "#/$defs/__schema16"
+        }
+      },
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "description": {
+            "$ref": "#/$defs/__schema0"
+          },
+          "prompt": {
+            "$ref": "#/$defs/__schema10"
+          },
+          "promptText": {
+            "$ref": "#/$defs/__schema0"
+          },
+          "contract": {
+            "type": "string",
+            "enum": [
+              "producer",
+              "verifier",
+              "gate"
+            ]
+          },
+          "worktree": {
+            "type": "string",
+            "enum": [
+              "branch",
+              "review"
+            ]
+          },
+          "edits": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "none",
+                  "any"
+                ]
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "paths": {
+                    "minItems": 1,
+                    "type": "array",
+                    "items": {
+                      "$ref": "#/$defs/__schema0"
+                    }
+                  }
+                },
+                "required": [
+                  "paths"
+                ],
+                "additionalProperties": false
+              }
+            ]
+          },
+          "commits": {
+            "type": "boolean"
+          },
+          "tools": {
+            "minItems": 1,
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/__schema15"
+            }
+          },
+          "model": {
+            "$ref": "#/$defs/__schema3"
+          },
+          "effort": {
+            "type": "string",
+            "enum": [
+              "low",
+              "medium",
+              "high",
+              "xhigh",
+              "max"
+            ]
+          },
+          "maxTurns": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "deepVariant": {
+            "type": "boolean"
+          },
+          "stageStatus": {
+            "type": "string",
+            "enum": [
+              "implementing",
+              "testing",
+              "reviewing"
+            ]
+          },
+          "requires": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "task.read",
+                "task.create",
+                "task.update",
+                "task.start",
+                "external.read",
+                "external.comment",
+                "external.changeStatus",
+                "external.create",
+                "code.edit",
+                "dependencies.edit",
+                "architecture.change",
+                "migrations.edit",
+                "git.commit",
+                "git.push",
+                "pr.create",
+                "pr.review",
+                "pr.merge",
+                "ci.edit",
+                "infrastructure.edit",
+                "network.use",
+                "deploy.execute"
+              ]
+            }
+          },
+          "capabilities": {
+            "type": "object",
+            "properties": {
+              "task.read": {
+                "$ref": "#/$defs/__schema5"
+              },
+              "task.create": {
+                "$ref": "#/$defs/__schema5"
+              },
+              "task.update": {
+                "$ref": "#/$defs/__schema5"
+              },
+              "task.start": {
+                "$ref": "#/$defs/__schema5"
+              },
+              "external.read": {
+                "$ref": "#/$defs/__schema5"
+              },
+              "external.comment": {
+                "$ref": "#/$defs/__schema5"
+              },
+              "external.changeStatus": {
+                "$ref": "#/$defs/__schema5"
+              },
+              "external.create": {
+                "$ref": "#/$defs/__schema5"
+              },
+              "code.edit": {
+                "$ref": "#/$defs/__schema5"
+              },
+              "dependencies.edit": {
+                "$ref": "#/$defs/__schema5"
+              },
+              "architecture.change": {
+                "$ref": "#/$defs/__schema5"
+              },
+              "migrations.edit": {
+                "$ref": "#/$defs/__schema5"
+              },
+              "git.commit": {
+                "$ref": "#/$defs/__schema5"
+              },
+              "git.push": {
+                "$ref": "#/$defs/__schema5"
+              },
+              "pr.create": {
+                "$ref": "#/$defs/__schema5"
+              },
+              "pr.review": {
+                "$ref": "#/$defs/__schema5"
+              },
+              "pr.merge": {
+                "$ref": "#/$defs/__schema5"
+              },
+              "ci.edit": {
+                "$ref": "#/$defs/__schema5"
+              },
+              "infrastructure.edit": {
+                "$ref": "#/$defs/__schema5"
+              },
+              "network.use": {
+                "$ref": "#/$defs/__schema5"
+              },
+              "deploy.execute": {
+                "$ref": "#/$defs/__schema5"
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "description",
+          "contract"
+        ],
+        "additionalProperties": false
+      }
+    },
     "sensitivePaths": {
       "type": "array",
       "items": {
@@ -875,16 +1128,74 @@
     },
     "__schema6": {
       "type": "string",
-      "enum": [
-        "coordinator",
-        "engineer",
-        "tester",
-        "reviewer"
-      ]
+      "minLength": 1
     },
     "__schema7": {
       "type": "string",
       "minLength": 1
+    },
+    "__schema8": {
+      "$ref": "#/$defs/__schema0"
+    },
+    "__schema9": {
+      "$ref": "#/$defs/__schema10"
+    },
+    "__schema10": {
+      "type": "string",
+      "minLength": 1
+    },
+    "__schema11": {
+      "$ref": "#/$defs/__schema3"
+    },
+    "__schema12": {
+      "type": "string",
+      "enum": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ]
+    },
+    "__schema13": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991
+    },
+    "__schema14": {
+      "minItems": 1,
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/__schema15"
+      }
+    },
+    "__schema15": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_*()-]+$"
+    },
+    "__schema16": {
+      "type": "object",
+      "properties": {
+        "promptAppend": {
+          "$ref": "#/$defs/__schema8"
+        },
+        "prompt": {
+          "$ref": "#/$defs/__schema9"
+        },
+        "model": {
+          "$ref": "#/$defs/__schema11"
+        },
+        "effort": {
+          "$ref": "#/$defs/__schema12"
+        },
+        "maxTurns": {
+          "$ref": "#/$defs/__schema13"
+        },
+        "tools": {
+          "$ref": "#/$defs/__schema14"
+        }
+      },
+      "additionalProperties": false
     }
   }
 }
