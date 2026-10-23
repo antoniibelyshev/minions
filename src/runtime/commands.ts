@@ -32,6 +32,8 @@ import { ciStatus, formatCiStatus, formatSync, syncTasks, type SyncReport } from
 import { formatIntake, intakeProvenanceFallback, originRepository, syncIntake, type IntakeSyncReport } from './intake-sync.js';
 import { ghWithTimeout, type GhFn } from './publish.js';
 import { exportWorkspace, importWorkspace, setupState } from './workspace.js';
+import { cancelWork, formatCancel } from './controls.js';
+import { ack, counts as outboxCounts, enqueue, fail, formatCounts, formatItems, pending, type OutboxCounts } from './outbox.js';
 import { git, workspaceLayout } from './worktree.js';
 
 // ---------------------------------------------------------------- lazy runtime context
@@ -118,9 +120,9 @@ export const intakeOnStart = async (
 
 const scheduler = async () => new Scheduler({ ...(await context()), layout: workspaceLayout(), handoff: runtimePaths() });
 
-async function readInput(file?: string): Promise<string> {
+async function readInput(file?: string, what = 'the worker result', hint = 'Pipe the JSON in, pass --result-file <path>, or (record) use --submitted.'): Promise<string> {
   if (file && file !== '-') return readFile(file, 'utf8');
-  if (process.stdin.isTTY) throw new MinionsError('PRECONDITION', 'Expected the worker result on stdin.', 'Pipe the JSON in, pass --result-file <path>, or (record) use --submitted.');
+  if (process.stdin.isTTY) throw new MinionsError('PRECONDITION', `Expected ${what} on stdin.`, hint);
   const chunks: Buffer[] = [];
   for await (const c of process.stdin) chunks.push(c as Buffer);
   return Buffer.concat(chunks).toString('utf8');
@@ -146,6 +148,8 @@ export interface StatusReport {
   coordinatorLock: unknown;
   /** communication.channel: configured vs effective (running coordinator's launch decision, else predicted). */
   channel?: ChannelStatus;
+  /** Notification outbox: undelivered items wait here until the coordinator sends them (`minions notify pending`). */
+  notifications?: OutboxCounts;
   backlogError?: string;
 }
 
@@ -183,6 +187,7 @@ export async function collectStatus(deps: { db: RuntimeDb; config: MinionsConfig
     coordinatorLock: d.coordinatorLock() ?? null,
   };
   if (deps.channel) report.channel = await deps.channel().catch(() => undefined);
+  try { report.notifications = outboxCounts(d); } catch { /* an older DB without the outbox: omit */ }
   try {
     const tasks = await (await deps.backlog()).listTasks();
     for (const t of tasks) report.queue[t.status] = (report.queue[t.status] ?? 0) + 1;
@@ -203,6 +208,7 @@ function humanStatus(s: StatusReport): string {
     s.capacity ? `capacity: ${s.capacity.activeTasks}/${s.capacity.maxActiveTasks} tasks, ${s.capacity.activeEngineers}/${s.capacity.maxEngineers} engineers` : 'capacity: unknown',
     `queue: ${Object.entries(s.queue).map(([k, v]) => `${k}=${v}`).join(' ') || '(empty)'}`,
     `stop guard: ${s.guard.lastReason ?? '-'}`,
+    ...(s.notifications?.pending ? [formatCounts(s.notifications)] : []),
   ];
   if (s.backlogError) out.push(`backlog error: ${s.backlogError}`);
   out.push(s.activeLeases.length ? 'active leases:' : 'active leases: none', ...s.activeLeases.map((l) => `  ${l.id} ${l.task_id} ${l.role} #${l.attempt} ${l.branch ?? ''}`));
@@ -302,6 +308,18 @@ export function register(program: Command): void {
       const r = await (await scheduler()).release(leaseId, o.reason);
       emit(r, { json: globalOpts(cmd).json, human: (d) => `Released ${d.leaseId} (${d.taskId}); worktree kept at ${d.worktree ?? '-'}` });
     }));
+  work.command('cancel [taskIds...]').description('Best-effort cancel: release every active worker lease of the given tasks (or --all) without a result; worktrees and branches are kept')
+    .option('--all', 'cancel every active lease')
+    .option('--reason <text>', 'why (recorded in the backlog note)', 'cancelled by the owner')
+    .action(action(async (taskIds: string[], o: { all?: boolean; reason: string }, cmd: Command) => {
+      if (runtimeMode() === 'host') return delegate(cmd);
+      if (!o.all && !taskIds.length) throw new MinionsError('PRECONDITION', 'Name the task(s) to cancel, or pass --all.');
+      if (o.all && taskIds.length) throw new MinionsError('PRECONDITION', 'Use task ids or --all, not both.');
+      const s = await scheduler();
+      const r = await cancelWork({ db: getDb(), release: (id, why) => s.release(id, why) }, { taskIds, all: !!o.all }, o.reason);
+      emit(r, { json: globalOpts(cmd).json, human: formatCancel });
+      if (r.failed.length) process.exitCode = 1;
+    }));
   work.command('publish <taskId>').description('Publish an approved task (branch / pull-request delivery); idempotent, retryable')
     .action(action(async (taskId: string, _o: unknown, cmd: Command) => {
       if (runtimeMode() === 'host') return delegate(cmd);
@@ -331,6 +349,44 @@ export function register(program: Command): void {
       requireMode('runtime');
       const leases = getDb().leases({ all: !!o.all });
       emit({ leases }, { json: globalOpts(cmd).json, human: (d) => (d.leases.length ? d.leases.map(leaseLine).join('\n') : '(no leases)') });
+    }));
+
+  // notify: the durable notification outbox (src/runtime/outbox.ts). Record before sending, ack after.
+  const notify = program.command('notify').description('Notification outbox: record owner notifications before sending, list pending ones, acknowledge or fail them (no LLM is woken to resend)');
+  notify.command('enqueue').description('Record a notification (text on stdin) under a dedup key; an existing key is a no-op')
+    .requiredOption('--key <key>', 'dedup key, e.g. delivered:<taskId>:<headSha>, goal-ack:<messageId>, blocker:<taskId>:<attempt>')
+    .requiredOption('--kind <kind>', 'goal-ack | delivered | feature | blocker | approval | question | status | other')
+    .option('--task <taskId>', 'related task')
+    .option('--text-file <path>', 'read the text from a file ("-" = stdin, the default)')
+    .action(action(async (o: { key: string; kind: string; task?: string; textFile?: string }, cmd: Command) => {
+      if (runtimeMode() === 'host') return delegate(cmd);
+      const text = await readInput(o.textFile, 'the notification text', 'Pipe the text in (never pass it as an argument) or use --text-file <path>.');
+      const r = enqueue(getDb(), { key: o.key, kind: o.kind, taskId: o.task ?? null, text });
+      emit(r, { json: globalOpts(cmd).json, human: (x: typeof r) => (x.created ? `queued ${x.item.key}` : `${x.item.key} already ${x.item.deliveredAt ? 'delivered' : 'queued'} (no-op)`) });
+    }));
+  notify.command('pending').description('List undelivered notifications due now, oldest first (send each, then ack it)')
+    .option('--all', 'include those waiting for a retry backoff')
+    .option('--limit <n>', 'at most n items', (v) => Number.parseInt(v, 10))
+    .action(action(async (o: { all?: boolean; limit?: number }, cmd: Command) => {
+      if (runtimeMode() === 'host') return delegate(cmd);
+      const d = getDb();
+      const r = { items: pending(d, { includeWaiting: !!o.all, limit: o.limit }), counts: outboxCounts(d) };
+      emit(r, { json: globalOpts(cmd).json, human: (x: typeof r) => `${formatItems(x.items)}\n${formatCounts(x.counts)}` });
+    }));
+  notify.command('ack <keys...>').description('Mark notifications delivered (after the send succeeded); repeating it is a no-op')
+    .option('--via <transport>', 'the transport that delivered it', 'telegram')
+    .action(action(async (keys: string[], o: { via: string }, cmd: Command) => {
+      if (runtimeMode() === 'host') return delegate(cmd);
+      const d = getDb();
+      const r = { acked: keys.map((k) => { const a = ack(d, k, o.via); return { key: k, alreadyDelivered: a.alreadyDelivered }; }) };
+      emit(r, { json: globalOpts(cmd).json, human: (x: typeof r) => x.acked.map((a) => `${a.key}: ${a.alreadyDelivered ? 'already delivered' : 'delivered'}`).join('\n') });
+    }));
+  notify.command('fail <key>').description('Record a failed send; the notification stays pending and is retried after a backoff')
+    .requiredOption('--error <message>', 'short error (credentials are masked; truncated)')
+    .action(action(async (key: string, o: { error: string }, cmd: Command) => {
+      if (runtimeMode() === 'host') return delegate(cmd);
+      const r = fail(getDb(), key, o.error);
+      emit(r, { json: globalOpts(cmd).json, human: (x: typeof r) => `${x.key}: attempt ${x.attempts} failed; next retry after ${x.nextAttemptAt ?? '-'}` });
     }));
 
   // hooks (never fail toward Claude Code: always exit 0)
@@ -490,8 +546,13 @@ export function register(program: Command): void {
       const intake = taskIds.length ? null : await runIntakeSync();
       // Auto-merge (delivery.merge "auto-when-eligible") runs here, through the runtime's own gates.
       const sched = await scheduler();
-      const r: SyncReport & { intake: IntakeSyncReport | null } = { ...(await syncTasks({ db: d, backlog: b, config: cfg, merge: (id) => sched.autoMerge(id) }, { taskIds })), intake };
-      emit(r, { json: globalOpts(cmd).json, human: (x) => [...(x.intake?.enabled ? [formatIntake(x.intake)] : []), formatSync(x)].join('\n') });
+      const r: SyncReport & { intake: IntakeSyncReport | null; notifications: OutboxCounts } = {
+        ...(await syncTasks({ db: d, backlog: b, config: cfg, merge: (id) => sched.autoMerge(id) }, { taskIds })), intake,
+        // Pending notifications are retried by whoever runs sync (the coordinator sends them; nothing is woken).
+        notifications: outboxCounts(d),
+      };
+      emit(r, { json: globalOpts(cmd).json, human: (x) => [...(x.intake?.enabled ? [formatIntake(x.intake)] : []), formatSync(x),
+        ...(x.notifications.pending ? [`${formatCounts(x.notifications)} (send with \`minions notify pending\`)`] : [])].join('\n') });
       if (r.failed || intake?.errors.length || r.tasks.some((t) => t.merge?.state === 'failed')) process.exitCode = 1;
     }));
 

@@ -5,7 +5,7 @@ import type { IdempotencyStore } from '../backlog/types.js';
 import { MinionsError } from '../core/errors.js';
 import { runtimePaths } from './paths.js';
 
-export const SCHEMA_VERSION = 3;
+export const SCHEMA_VERSION = 4;
 
 export type LeaseRole = 'engineer' | 'tester' | 'reviewer';
 /** active: worker running (or awaiting a correction); completed: valid result; released: no result; unvalidated: invalid after correction. */
@@ -77,6 +77,14 @@ const MIGRATIONS: Record<number, string> = {
   // Host-signed approvals: the token is stored with the row; rows without one never authorize publication.
   3: `
     ALTER TABLE approvals ADD COLUMN signature TEXT;
+  `,
+  // Notification outbox (src/runtime/outbox.ts): one row per dedup key; delivered rows are kept so a key is sent once.
+  4: `
+    CREATE TABLE IF NOT EXISTS outbox (
+      dedup_key TEXT PRIMARY KEY, kind TEXT NOT NULL, task_id TEXT, text TEXT NOT NULL,
+      created_at TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT,
+      next_attempt_at TEXT, delivered_at TEXT, delivered_via TEXT);
+    CREATE INDEX IF NOT EXISTS outbox_pending ON outbox(delivered_at, created_at);
   `,
 };
 

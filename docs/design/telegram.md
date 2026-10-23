@@ -1,8 +1,8 @@
 # Telegram channel integration: design
 
-Status: **implemented** except the notification outbox (task-2.3): bot token provisioning, the
-wizard step, plugin install, the coordinator exec wrapper with `--channels`, controlled restarts, and
-doctor readiness (see [Implementation](#implementation-step-7)). The outbox section is still a plan.
+Status: **implemented**: bot token provisioning, the wizard step, plugin install, the coordinator exec
+wrapper with `--channels`, controlled restarts, doctor readiness (see [Implementation](#implementation-step-7)),
+the notification outbox and the terminal-equivalent controls (task-2.3).
 Everything marked **verified** was observed on Claude Code 2.1.292 in a Linux container on
 2026-10-19 or read from the sources below. Everything marked **unknown** is listed in
 [Unknowns and fallbacks](#unknowns-and-fallbacks) and is not assumed.
@@ -248,42 +248,51 @@ input. Check that in the same run: a `general-purpose` subagent asked to call `r
 ## Notification outbox
 
 Goal (spec §611): Telegram outages never discard notifications, retries use dedup keys, and no LLM is woken only to resend.
+Implemented in `src/runtime/outbox.ts` (transport-agnostic) with the `minions notify` helpers.
 
-- Store: a new runtime DB table `outbox(dedup_key TEXT PRIMARY KEY, kind, task_id, payload_json, created_at, attempts,
-  last_error, delivered_at)`. It is added in a migration with the runtime DB, which is a sensitive path, so it needs human
-  approval when it is implemented.
-- Producers: deterministic CLI events enqueue with stable keys, for example `question:<taskId>:<questionId>`,
-  `delivered:<taskId>:<headSha>`, `blocked:<taskId>:<attempt>`, `milestone:<taskId>:<status>`. Enqueueing an existing key is
-  a no-op.
-- Reporting level: producers follow `communication.progress` (see the README Communication section). At the default
-  `milestones` (feature-level) only feature-level items are enqueued: a feature or epic (parent task or goal) delivered
-  or materially changed, batched when several land together, plus questions and blockers that need the user. Per-task
-  `delivered:` items are enqueued only at `tasks`; at `quiet` only questions, approvals and blockers are. Per-stage
-  transitions (engineer/tester/reviewer, splits, follow-ups) are never enqueued. Approval requests are enqueued at
-  every level.
-- Delivery: only the coordinator model can call the plugin's `reply` tool, because minions does not duplicate the transport.
-  When the coordinator is already awake (an inbound Telegram message, a worker result, a sync, or a user turn), the
-  orchestrate skill runs `minions notify pending --json`, sends each item with `reply`, and then calls
-  `minions notify ack <key>`. A `reply` error goes to `minions notify fail <key> --error <msg>`, which increments the
-  attempt count with backoff.
-- No wake-ups: the Stop hook never continues the session only because the outbox is non-empty.
-- Semantics: at least once. A crash between `reply` and `ack` can duplicate one message, which is documented. The terminal
-  `minions status` shows the outbox count, so nothing is lost if Telegram is never restored.
+- Store: runtime DB table `outbox(dedup_key PRIMARY KEY, kind, task_id, text, created_at, attempts, last_error,
+  next_attempt_at, delivered_at, delivered_via)`, added by schema migration 4 inline in `src/runtime/db.ts` (the runtime
+  DB migrations are not files under a `migrations/` directory). Delivered rows are kept, so a key is never sent twice.
+- Kinds: `goal-ack`, `delivered`, `feature`, `blocker`, `approval`, `question`, `status`, `other`. Text at most 4000
+  characters (Telegram's limit is 4096), always passed on stdin, never as an argument.
+- Keys name the event: `goal-ack:<message_id>`, `delivered:<taskId>:<headSha>`, `feature:<parentId>:<headSha>`,
+  `blocker:<taskId>:<attempt>`, `approval:<taskId>:<headSha>`, `status:<message_id>`. Enqueueing an existing key
+  (pending or delivered) is a no-op that returns the stored row.
+- Producer: the coordinator, following `communication.progress` (per-stage transitions are never sent; approvals always).
+  It records first (`minions notify enqueue --key … --kind … [--task …] --json` with the text on stdin), sends with
+  `reply`, then `minions notify ack <key> --json`. A `reply` error goes to `minions notify fail <key> --error <msg>`: the
+  attempt is counted, the error is stored masked and truncated, and the next try waits 30 s doubling per attempt (cap 30 min).
+- Delivery: only the coordinator model can call the plugin's `reply` tool, because minions does not duplicate the
+  transport. Whenever it is awake anyway (an inbound Telegram message, a worker result, `minions sync`, a terminal turn),
+  the orchestrate skill first sends what `minions notify pending --json` lists (oldest first, due items only) and acks
+  each, stopping at the first failure (`flush` in `outbox.ts` is the reference loop; tests drive it with a fake transport).
+- No wake-ups: the Stop hook never continues the session because the outbox is non-empty, and the coordinator never
+  loops or schedules wake-ups to resend.
+- Visibility: `minions status` and `minions sync` show the pending count (and `minions notify pending --all` lists every
+  undelivered item from the terminal), so nothing is lost if Telegram is never restored.
+- Semantics: at least once per key. A crash between `reply` and `ack` can repeat that one message; nothing else repeats.
 
 ## Terminal-equivalent controls
 
 Over Telegram, controls are plain-language messages to the coordinator. They are not slash commands, because the plugin
-owns `/start`, `/help`, and `/status`. The coordinator maps each control to the same deterministic CLI, which also works
-from the host without Claude:
+owns `/start`, `/help`, and `/status`. `src/runtime/controls.ts` holds the mapping (`CONTROLS`, rendered into the
+coordinator prompt); each control runs the same deterministic CLI, which also works from the host terminal without
+Claude (the host CLI delegates it to the project runtime):
 
 | Control | Telegram (to coordinator) | Terminal / host CLI |
 | - | - | - |
-| pause intake | "pause intake" | `minions pause --intake` (exists) |
-| pause new starts | "pause starts" | `minions pause --starts` (exists) |
-| resume | "resume" | `minions resume` (exists) |
-| status | "status" | `minions status` (exists) |
-| cancel workers | "cancel <task or all>" | `minions work release <lease> --reason` (exists, per lease); a bulk `cancel` is planned |
-| sync | "sync" | planned `minions sync` (backlog/outbox sync) |
+| pause intake | "pause intake" | `minions pause --intake` |
+| pause new starts | "pause starts" | `minions pause --starts` |
+| pause both | "pause" | `minions pause` |
+| resume | "resume" (or "resume intake" / "resume starts") | `minions resume [--intake\|--starts]` |
+| status | "status" | `minions status` (includes pending notifications) |
+| sync | "sync" | `minions sync` (intake, PR/CI refresh, pending notification count) |
+| cancel workers | "cancel <task>" / "cancel all" | `minions work cancel <taskId…> \| --all [--reason …]` |
+
+Cancel is best effort: it releases the task's active leases without a result (worktrees and branches are kept, a backlog
+note is written, a late worker submit is refused) and continues past a failing release. It cannot kill a running worker
+subagent itself; the coordinator stops the released workers' subagents. Only exact short phrases count as controls;
+anything longer is an ordinary request for the coordinator.
 
 Access changes (pair, allow, remove) are terminal-only by design, because the plugin's skill refuses channel-originated requests.
 
@@ -330,7 +339,7 @@ use a separate bot per project". Startup notice "not on the approved allowlist" 
   (owner-only policy, unpaired senders cannot control, no codes or ids in status), `test/telegram/install.test.ts` (fake
   `claude plugin` CLI), `test/host/telegram.test.ts` (format, stores, Keychain stdin-only, getMe, bot-ID collisions, wizard
   and init with fake IO, doctor ok/missing/unavailable), and `test/plugin/generate.test.ts` (workers get no Telegram tools).
-- Planned with task-2.3: outbox enqueue/dedup/ack/fail/backoff on a temp SQLite DB, and control mapping.
+- Task-2.3: `test/runtime/outbox.test.ts` (enqueue/dedup/ack/fail/backoff on a temp SQLite DB; a fake transport through an outage, a runtime restart and recovery delivers each key exactly once) and `test/runtime/controls.test.ts` (control mapping, every control resolves to a registered command that the host CLI delegates, best-effort `work cancel`).
 - Container boundary (`MINIONS_DOCKER_TESTS=1`): the image has Bun at the pinned version, the token mount is read-only and absent
   from `docker inspect` env, and `minions telegram probe --json` reports `available` after `minions telegram install` (needs network, no token).
 - Live (opt-in only, never in CI): `MINIONS_LIVE_TELEGRAM=1` plus a disposable bot token and a logged-in container. A manual
