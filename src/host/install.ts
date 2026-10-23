@@ -13,7 +13,7 @@ import { VERSION } from '../core/version.js';
 import { generatePlugin } from '../plugin/generate.js';
 import { ciSetupPlan } from '../runtime/ci.js';
 import { discover, dockerProbe, type Discovery, type DockerProbe, type DockerStatus } from './discovery.js';
-import { authOf, isKeyAuth, loadDefaults, resolveOnPath, summarize, type AuthSummary, type ClaudeAuth } from './auth.js';
+import { authOf, ensureSecretsDir, isKeyAuth, loadDefaults, resolveOnPath, summarize, type AuthSummary, type ClaudeAuth } from './auth.js';
 import {
   backendLabel, githubRepoFromRemote, githubTokenGuidance, loadCredentialRefs, provisionTelegramToken,
   type CredentialsJson, type Fetch, type ProvisionResult, type TelegramProvisionResult,
@@ -738,7 +738,7 @@ export async function runInit(opts: InitOptions): Promise<InitResult> {
     const after = hostRuntime ? docker : await probe();
     if (!hostRuntime && (!after.daemon || !after.compose)) throw dockerUnavailable(after);
     // The secrets directory must exist: compose bind-mounts it with create_host_path: false.
-    await ensureDir(projectPaths(plan.projectId).secretsDir, 0o700);
+    await ensureSecretsDir(plan.projectId);
     // `minions setup` runs the GitHub and Telegram steps itself after the plan is applied.
     const setup = opts.skipIntegrations ? undefined : await githubStep(opts, plan);
     const github = setup?.interactive && setup.state.repository ? setup.token : undefined;

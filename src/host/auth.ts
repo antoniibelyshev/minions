@@ -3,17 +3,19 @@
 // Methods: `login` (interactive /login inside the container, state in the claude volume), `api-key`
 // (the host reads a key from a file, the Keychain or an environment variable) and `helper` (the host
 // runs a fixed argv command that prints a key). For the key methods the trusted host CLI writes the
-// key to projects/<id>/secrets/anthropic-api-key (dir 0700, file 0600, atomic replace); the secrets
+// key to projects/<id>/secrets/anthropic-api-key (dir 0700, file 0600, atomic replace; Linux host uid != 1000
+// with a private primary group: 0750/0640 with that group, see secrets-access.ts); the secrets
 // DIRECTORY is bind-mounted read-only so refreshed files (new inodes) are visible in the container.
 // This setting lives only in host-side files: a repository can never make the host run a command.
 import { constants } from 'node:fs';
-import { access, appendFile, chmod, readFile, rm, stat, truncate } from 'node:fs/promises';
+import { access, appendFile, readFile, rm, stat, truncate } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { delimiter, isAbsolute, join } from 'node:path';
 import { z } from 'zod';
 import { MinionsError } from '../core/errors.js';
 import { run, type RunOptions, type RunResult } from '../core/exec.js';
 import { atomicWrite, ensureDir, readJsonIfExists, writeJson } from '../core/fsutil.js';
+import { prepareSecretsDir, probeSecretsAccess, secretFileMode, secretGid, type SecretsAccess } from './secrets-access.js';
 import { redact } from '../core/output.js';
 import { CONTAINER, defaultsPath, projectPaths } from '../core/paths.js';
 import { RuntimeKindSchema } from './runtime-kind.js';
@@ -276,17 +278,16 @@ export type AuthState = z.infer<typeof AuthStateSchema>;
 export const loadAuthState = async (projectId: string): Promise<AuthState> =>
   (await readJsonIfExists(projectPaths(projectId).authStateJson, AuthStateSchema).catch(() => undefined)) ?? {};
 
-/** Creates projects/<id>/secrets with mode 0700 (the compose bind source must exist). */
-export async function ensureSecretsDir(projectId: string): Promise<string> {
+/** Creates projects/<id>/secrets (0700, or 0750 with the private group; the compose bind source must exist). */
+export async function ensureSecretsDir(projectId: string, access: SecretsAccess = probeSecretsAccess()): Promise<string> {
   const dir = projectPaths(projectId).secretsDir;
-  await ensureDir(dir, 0o700);
-  await chmod(dir, 0o700);
+  await prepareSecretsDir(dir, access);
   return dir;
 }
 
-export async function writeKeyFile(projectId: string, key: string): Promise<void> {
-  await ensureSecretsDir(projectId);
-  await atomicWrite(projectPaths(projectId).apiKeyFile, key, { mode: 0o600 });
+export async function writeKeyFile(projectId: string, key: string, access: SecretsAccess = probeSecretsAccess()): Promise<void> {
+  await ensureSecretsDir(projectId, access);
+  await atomicWrite(projectPaths(projectId).apiKeyFile, key, { mode: secretFileMode(access), gid: secretGid(access) });
 }
 
 export async function removeKeyFile(projectId: string): Promise<boolean> {
