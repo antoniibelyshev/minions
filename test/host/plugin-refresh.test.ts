@@ -99,6 +99,35 @@ describe('plugin refresh from the installed package', () => {
     expect(pluginDoctorCheck(c, true).hint).toContain('minions down && minions start');
   });
 
+  it('keeps an edited file the new package no longer generates (warning), and still reports it as extra', async () => {
+    const { project, config, dir } = await initOld();
+    const gone = join(dir, 'skills', 'maintain-context', 'SKILL.md');
+    writeFileSync(gone, 'my skill\n');
+    process.env.MINIONS_TEMPLATES = newPkg;
+    const warnings = await refreshDerived(project, config);
+    expect(warnings).toEqual([`${gone} is no longer generated but was edited; left in place.`]);
+    expect(readFileSync(gone, 'utf8')).toBe('my skill\n');
+    expect((await checkPlugin(project, config)).extra).toEqual([join('skills', 'maintain-context', 'SKILL.md')]);
+  });
+
+  it('refresh recreates a missing or partially written plugin dir; the check reports it without throwing', async () => {
+    const { project, config, dir } = await initOld();
+    process.env.MINIONS_TEMPLATES = newPkg;
+    rmSync(dir, { recursive: true, force: true });
+    const c = await checkPlugin(project, config);
+    expect(c.matches).toBe(false);
+    expect(c.missing.length).toBe(c.files);
+    expect(c.extra).toEqual([]);
+    expect(await refreshDerived(project, config)).toEqual([]);
+    expect((await checkPlugin(project, config)).matches).toBe(true);
+    // Partially written: one file and a whole subdirectory gone.
+    rmSync(join(dir, 'agents', 'engineer.md'));
+    rmSync(join(dir, 'skills'), { recursive: true });
+    expect((await checkPlugin(project, config)).missing).toContain(join('agents', 'engineer.md'));
+    expect(await refreshDerived(project, config)).toEqual([]);
+    expect((await checkPlugin(project, config)).matches).toBe(true);
+  });
+
   it('the doctor check reports a comparison failure as a warning, not a crash', () => {
     expect(pluginDoctorCheck(new Error('Plugin templates not found at /x'))).toMatchObject({ name: 'plugin', status: 'warn', detail: expect.stringContaining('could not compare') });
   });
