@@ -295,7 +295,7 @@ export async function runSetup(opts: SetupOptions): Promise<SetupResult> {
       hasToken = false;
       step({ id: 'github', status: 'changed', detail: r.removed ? `token removed (${r.backend})` : 'no token was stored', later: LATER.github });
     } else if (action === 'keep') {
-      step({ id: 'github', status: 'kept', detail: `token already stored (${refs.github!.backend}); replace it with \`minions auth github\`` });
+      step({ id: 'github', status: 'kept', detail: `token already stored (${refs.github!.backend}); replace it with ${cmds.inRepo('minions auth github')}` });
     } else {
       step({ id: 'github', status: 'skipped', detail: 'GitHub integration not set up; delivery stays local', later: LATER.github });
     }
@@ -313,7 +313,7 @@ export async function runSetup(opts: SetupOptions): Promise<SetupResult> {
   } else if (interactive && !opts.configFile && !blocked && steps.find((s) => s.id === 'github')?.status !== 'skipped') {
     // PR-first: with a GitHub remote and a stored token pull-request delivery is the offered default
     // (a project still on local is offered the switch); local and branch stay selectable.
-    say('  Delivery: pull-request (default: push agent/<slug> and open a PR, CI runs on it), branch (push agent/<slug> only), or local (commits stay in the container; `minions export`). minions merges only through opt-in CI-gated auto-merge (asked below).');
+    say(`  Delivery: pull-request (default: push agent/<slug> and open a PR, CI runs on it), branch (push agent/<slug> only), or local (commits stay in the container; ${cmds.inRepo('minions export')}). minions merges only through opt-in CI-gated auto-merge (asked below).`);
     mode = await choose(io!, 'Delivery mode', defaultDeliveryMode(current, false), DELIVERY_MODES);
   } else if (blocked && current !== 'local' && !hasToken && refs.github) {
     mode = 'local'; // the token was just removed: branch/PR delivery could no longer publish
@@ -324,7 +324,7 @@ export async function runSetup(opts: SetupOptions): Promise<SetupResult> {
       setLocal('delivery.provider', mode === 'local' ? 'none' : 'github');
       step({ id: 'delivery', status: 'changed', detail: `delivery.mode ${current} -> ${mode} (recorded in ${localPath})` });
     } else {
-      step({ id: 'delivery', status: 'kept', detail: `delivery.mode ${current}${current !== 'local' && blocked ? ` (cannot publish: ${blocked}; see \`minions doctor\`)` : ''}`,
+      step({ id: 'delivery', status: 'kept', detail: `delivery.mode ${current}${current !== 'local' && blocked ? ` (cannot publish: ${blocked}; see ${cmds.inRepo('minions doctor')})` : ''}`,
         ...(current === 'local' && blocked ? { later: LATER.github } : {}) });
     }
   }
@@ -356,7 +356,7 @@ export async function runSetup(opts: SetupOptions): Promise<SetupResult> {
   const telegramChannel = channel === 'auto' ? 'auto' : 'telegram';
   if (hostRuntime) {
     step({ id: 'telegram', status: 'skipped', detail: `the host runtime has no Telegram (no user plugins or MCP servers); the coordinator runs in the terminal${opts.tokens?.telegram ? unused('telegram') : ''}`,
-      later: 'Telegram needs the Docker runtime: `minions runtime set docker`.' });
+      later: `Telegram needs the Docker runtime: ${cmds.inRepo('minions runtime set docker')}.` });
   } else if (config.container.network === 'none') {
     step({ id: 'telegram', status: 'skipped', detail: `container.network is none; the Telegram plugin needs api.telegram.org and the npm registry${opts.tokens?.telegram ? unused('telegram') : ''}`, later: LATER.telegram });
   } else {
@@ -392,7 +392,7 @@ export async function runSetup(opts: SetupOptions): Promise<SetupResult> {
       step({ id: 'telegram', status: 'changed', detail: `using the stored bot ${tg!.botId}; communication.channel ${channel}` });
     } else if (action === 'disable') {
       channel = 'terminal';
-      step({ id: 'telegram', status: 'changed', detail: 'communication.channel terminal; the bot token is kept (remove it with `minions auth telegram --remove`)', later: LATER.telegram });
+      step({ id: 'telegram', status: 'changed', detail: `communication.channel terminal; the bot token is kept (remove it with ${cmds.inRepo('minions auth telegram --remove')})`, later: LATER.telegram });
     } else if (action === 'keep') {
       step({ id: 'telegram', status: 'kept', detail: `bot ${tg!.botId}; communication.channel ${channel}` });
     } else {
@@ -432,7 +432,7 @@ export async function runSetup(opts: SetupOptions): Promise<SetupResult> {
       if (await opts.runtime.repoPresent(projectId)) {
         const again = interactive && await yesNo(io!, `The repository is already imported. Import ${project.baseBranch} again (committed history only)?`, false);
         if (again) step(importStep(await opts.runtime.importRepo(projectId), 'changed'));
-        else step({ id: 'import', status: 'kept', detail: 'repository already imported; run `minions import` to refresh it' });
+        else step({ id: 'import', status: 'kept', detail: `repository already imported; run ${cmds.inRepo('minions import')} to refresh it` });
       } else {
         say(`  Importing committed history of ${project.baseBranch} into the ${hostRuntime ? 'host runtime workspace' : 'container'}…`);
         step(importStep(await opts.runtime.importRepo(projectId), 'done'));

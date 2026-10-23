@@ -16,7 +16,7 @@ vi.mock('../../src/plugin/generate.js', async () => {
 });
 
 const { runSetup, formatSetup, openIntakeFilterWarning } = await import('../../src/host/setup.js');
-const { loadCredentialRefs, readGithubToken, readTelegramToken } = await import('../../src/host/credentials.js');
+const { loadCredentialRefs, readGithubToken, readTelegramToken, removeGithubToken } = await import('../../src/host/credentials.js');
 const { loadEffectiveConfig, loadProjectJson } = await import('../../src/host/project.js');
 const { loadRegistry } = await import('../../src/host/registry.js');
 const { projectPaths, repoPaths } = await import('../../src/core/paths.js');
@@ -91,8 +91,8 @@ function githubApi(opts: { requiredChecks?: string[]; rules?: number } = {}) {
   return { f, seen };
 }
 
-function githubRepo(): string {
-  const repo = makeRepo(env.root);
+function githubRepo(name?: string): string {
+  const repo = makeRepo(env.root, name);
   git(repo, 'remote', 'add', 'origin', REMOTE);
   return repo;
 }
@@ -368,6 +368,32 @@ describe('minions setup', () => {
     expect(await loadCredentialRefs(first.projectId)).toEqual(refsBefore);
     expect(Object.keys((await loadRegistry()).projects)).toEqual([first.projectId]);
     expect(rt.calls).not.toContain('import');
+  });
+
+  it('every printed command in the kept, blocked, remove and import branches also names the repository', async () => {
+    const repo = githubRepo("my repo's dir");
+    const rt = fakeRuntime();
+    const first = await runSetup({ path: repo, yes: true, runtime: rt.runtime, dockerProbe: dockerUp, tokens: { github: GH_TOKEN, telegram: TG_TOKEN }, delivery: 'branch', visibility: 'private', fetch: githubApi().f });
+    const q = `'${first.init.plan.repoPath.replace(/'/g, `'\\''`)}'`;
+    const inRepo = (c: string) => `\`cd ${q} && ${c}\``;
+    const check = (r: Awaited<ReturnType<typeof runSetup>>) => {
+      for (const m of formatSetup(r).matchAll(/\`([^\`]*minions [^\`]*)\`/g)) {
+        expect(m[1]!.startsWith(`cd ${q} && `) || m[1] === `minions setup ${q}`, m[1]).toBe(true);
+      }
+    };
+    // kept github + kept import + telegram disabled (token kept)
+    const kept = await runSetup({ path: repo, yes: false, runtime: rt.runtime, dockerProbe: dockerUp, fetch: githubApi().f,
+      io: scripted({ 'A GitHub token is stored': 'keep', 'Telegram is set up': 'disable' }).io });
+    expect(step(kept, 'github').detail).toContain(inRepo('minions auth github'));
+    expect(step(kept, 'import').detail).toContain(inRepo('minions import'));
+    expect(step(kept, 'telegram').detail).toContain(inRepo('minions auth telegram --remove'));
+    check(kept);
+    // token gone (removed outside setup) on a branch-delivery project: delivery is kept but cannot publish
+    await removeGithubToken(first.projectId);
+    const blocked = await runSetup({ path: repo, yes: true, runtime: rt.runtime, dockerProbe: dockerUp, fetch: githubApi().f });
+    expect(step(blocked, 'delivery').detail).toContain(`cannot publish`);
+    expect(step(blocked, 'delivery').detail).toContain(inRepo('minions doctor'));
+    check(blocked);
   });
 
   it('rerun with "change" reruns the wizard with the existing values as defaults; integrations can be changed or disabled', async () => {
