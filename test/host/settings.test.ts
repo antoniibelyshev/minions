@@ -314,3 +314,122 @@ describe('interactive menu', () => {
     expect(t.text()).toContain('GitHub token: missing');
   });
 });
+
+describe('tester additions (task-23)', () => {
+  it('coordinator tool keys (task-48): launch-class, need a restart; a required tool is rejected; dropping the trim is loosening', async () => {
+    const { project, local } = await install('private');
+    const views = S.listSettings(await ctxOf(project));
+    const by = (k: string) => views.find((v) => v.key === k)!;
+    expect(by('coordinator.disallowedTools')).toMatchObject({ value: undefined, apply: 'launch', needsRestart: true, canLoosen: true, source: 'profile default' });
+    expect(by('coordinator.toolSearch')).toMatchObject({ value: true, apply: 'launch', needsRestart: true });
+    expect(by('coordinator.bundledSkills')).toMatchObject({ value: false, apply: 'launch', needsRestart: true });
+    const { runtime, calls } = fakeRuntime({ running: false });
+    for (const bad of ['Bash', 'Artifact, Agent', 'Read(*)', 'mcp__plugin_telegram_telegram__reply']) {
+      await expect(SC.applySetting(await ctxOf(project), 'coordinator.disallowedTools', bad, { yes: true }, { runtime, confirm: never }))
+        .rejects.toMatchObject({ code: 'INVALID_CONFIG' });
+    }
+    expect(existsSync(local)).toBe(false);
+    // "none" keeps every tool: loosening, needs a confirmation (refused without a terminal).
+    await expect(SC.applySetting(await ctxOf(project), 'coordinator.disallowedTools', 'none', {}, { runtime, confirm: async () => null }))
+      .rejects.toMatchObject({ code: 'POLICY_DENIED' });
+    const r = await SC.applySetting(await ctxOf(project), 'coordinator.disallowedTools', 'none', { yes: true }, { runtime, confirm: never });
+    expect(r).toMatchObject({ written: true, needsRestart: true, restart: { action: 'not-running' } });
+    expect(r.loosens).toMatch(/the coordinator gets back Artifact/);
+    expect(readJson(local)).toEqual({ coordinator: { disallowedTools: [] } });
+    expect(runtimeCfg(project.projectId).coordinator.disallowedTools).toEqual([]);
+    // Adding a tool back to the trim tightens: no confirmation; "default" unsets it.
+    const t = await SC.applySetting(await ctxOf(project), 'coordinator.disallowedTools', 'WebFetch, WebSearch', {}, { runtime, confirm: never });
+    expect(t).toMatchObject({ loosens: null, written: true });
+    await SC.applySetting(await ctxOf(project), 'coordinator.disallowedTools', 'default', { yes: true }, { runtime, confirm: async () => true });
+    expect(readJson(local)).toEqual({ coordinator: {} });
+    const ts = await SC.applySetting(await ctxOf(project), 'coordinator.toolSearch', 'false', {}, { runtime, confirm: never });
+    expect(ts).toMatchObject({ from: true, to: false, needsRestart: true, written: true });
+    expect(calls).toEqual([]);
+  });
+
+  it('a local override cannot lift a project-level deny rule either (rule-level deny, plain allow attempt)', async () => {
+    const { project, file, local } = await install('private');
+    const cfg = readJson(file);
+    cfg.capabilities['git.push'] = { effect: 'ask', rules: [{ effect: 'deny', roles: ['reviewer'] }] };
+    writeFileSync(file, JSON.stringify(cfg));
+    const { runtime } = fakeRuntime({ running: false });
+    await expect(SC.applySetting(await ctxOf(project), 'capabilities.git.push', 'allow', { yes: true }, { runtime, confirm: async () => true }))
+      .rejects.toMatchObject({ code: 'POLICY_DENIED' });
+    expect(existsSync(local)).toBe(false);
+  });
+
+  it('the menu (TTY and numbered) never shows a stored token', async () => {
+    const { repo, project } = await install('private');
+    await C.provisionTelegramToken({ projectId: project.projectId, token: TOKEN, repoPath: repo, verify: false });
+    const f = fakeRuntime({ running: false });
+    const g = indexOf('secrets.telegram');
+    const tty = fakeIO(true, [...Array(g).fill('down'), 'enter', 'quit'], []);
+    await M.runSettingsMenu(project, { io: tty.io, runtime: f.runtime, runAuth: async () => {} });
+    const num = fakeIO(false, [], [String(g + 1), 'q']);
+    await M.runSettingsMenu(project, { io: num.io, runtime: f.runtime, runAuth: async () => {} });
+    for (const t of [tty.text(), num.text()]) {
+      expect(plain(t)).toMatch(/Telegram bot token\s+provisioned\s+credential store/);
+      expect(t).not.toContain('AAHfake');
+    }
+  });
+
+  it('menu: the restart offered on exit is graceful; refused while leases are active, never forced', async () => {
+    const { project } = await install('private');
+    const busy = fakeRuntime({ restart: 'refused' });
+    const n = indexOf('communication.progress') + 1;
+    const t = fakeIO(false, [], [String(n), '3', 'q', 'y']);
+    await M.runSettingsMenu(project, { io: t.io, runtime: busy.runtime, runAuth: async () => {} });
+    expect(t.text()).toMatch(/coordinator restart: refused - .*active worker lease/);
+    expect(t.text()).toContain('minions settings restart');
+    expect(busy.calls.filter((c) => c[1] === 'coordinator')).toEqual([['minions', 'coordinator', 'restart', '--recover', '--json']]);
+    expect(busy.calls.flat()).not.toContain('--force');
+    // Declining the restart issues no restart at all.
+    const ok = fakeRuntime();
+    const d = fakeIO(false, [], [String(n), '2', 'q', 'n']);
+    await M.runSettingsMenu(project, { io: d.io, runtime: ok.runtime, runAuth: async () => {} });
+    expect(ok.calls.some((c) => c[1] === 'coordinator')).toBe(false);
+    expect(d.text()).toContain('Restart later with `minions settings restart`');
+  });
+
+  it('terminalMenuIO on a piped (non-TTY) stdin: numbered prompts read every line of one chunk; owner raises concurrency to 3', async () => {
+    const { PassThrough } = await import('node:stream');
+    const { project, local } = await install('private');
+    const f = fakeRuntime({ running: false });
+    const stdin = new PassThrough() as unknown as NodeJS.ReadStream;
+    const out = new PassThrough();
+    let text = '';
+    out.on('data', (d: Buffer) => { text += d.toString(); });
+    const a = indexOf('execution.maxActiveTasks') + 1, e = indexOf('execution.maxEngineers') + 1;
+    (stdin as unknown as NodeJS.WritableStream).end([a, 3, 'y', e, 3, 'y', 'q'].join('\n') + '\n');
+    const io = M.terminalMenuIO(stdin, out);
+    expect(io.tty).toBe(false);
+    const changed = await M.runSettingsMenu(project, { io, runtime: f.runtime, runAuth: async () => {} });
+    expect(changed).toEqual(['execution.maxActiveTasks', 'execution.maxEngineers']);
+    expect(readJson(local)).toEqual({ execution: { maxActiveTasks: 3, maxEngineers: 3 } });
+    expect(runtimeCfg(project.projectId).execution).toMatchObject({ maxActiveTasks: 3, maxEngineers: 3 });
+    expect(text).toMatch(/Setting to change \[1-\d+, q = quit\]/);
+  });
+
+  it('terminalMenuIO on a non-TTY stdin: end of input quits the menu without changes', async () => {
+    const { PassThrough } = await import('node:stream');
+    const { project, local } = await install('private');
+    const stdin = new PassThrough();
+    stdin.end();
+    const changed = await M.runSettingsMenu(project, { io: M.terminalMenuIO(stdin as unknown as NodeJS.ReadStream, new PassThrough()), runtime: fakeRuntime({ running: false }).runtime, runAuth: async () => {} });
+    expect(changed).toEqual([]);
+    expect(existsSync(local)).toBe(false);
+  });
+});
+
+describe('apply classes match what reads each value', () => {
+  it('default model and turn limit need a restart (worker definitions); concurrency and repair cycles are live', async () => {
+    const { project } = await install('private');
+    const views = S.listSettings(await ctxOf(project));
+    const by = (k: string) => views.find((v) => v.key === k)!;
+    expect(by('models.default')).toMatchObject({ apply: 'prompt', needsRestart: true });
+    expect(by('execution.attemptMaxTurns')).toMatchObject({ apply: 'prompt', needsRestart: true });
+    for (const k of ['execution.maxActiveTasks', 'execution.maxEngineers', 'execution.maxRepairCyclesBeforeReplan']) expect(by(k)).toMatchObject({ apply: 'live', needsRestart: false });
+    const tpl = (f: string) => readFileSync(join(process.cwd(), 'templates', 'plugin', 'agents', f), 'utf8');
+    for (const f of ['engineer.md', 'tester.md', 'reviewer.md']) expect(tpl(f)).toMatch(/^maxTurns: \{\{attemptMaxTurns\}\}$/m);
+  });
+});

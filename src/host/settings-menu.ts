@@ -102,7 +102,7 @@ async function askValue(io: MenuIO, v: SettingView): Promise<string | null> {
     const i = await pick(io, `${v.label} (${v.key})`, choices, choices.indexOf(formatValue(v.value)));
     return i === null ? null : choices[i]!;
   }
-  const a = (await io.line(`${v.label} (${v.key}) [${formatValue(v.value)}]${v.type === 'models' ? ' (comma-separated)' : ''}: `)).trim();
+  const a = (await io.line(`${v.label} (${v.key}) [${formatValue(v.value)}]${v.type === 'models' ? ' (comma-separated)' : v.type === 'list' ? ' (comma-separated; none = keep every tool; default = unset)' : ''}: `)).trim();
   return a || null;
 }
 
@@ -182,10 +182,38 @@ export async function runSettingsMenu(project: ProjectJson, deps: MenuDeps): Pro
 
 const currentToken = (ctx: Awaited<ReturnType<typeof loadSettingsContext>>, kind: 'github' | 'telegram') => (ctx.credentials[kind] ? 'provisioned' : 'missing');
 
-/** The real terminal: raw-mode key presses on stdin, output on stderr (stdout stays clean). */
-export function terminalMenuIO(stdin: NodeJS.ReadStream = process.stdin, out: NodeJS.WriteStream = process.stderr): MenuIO {
+/**
+ * Line reader for a non-TTY stdin (a pipe or a terminal emulator without a TTY): one readline interface for
+ * the whole menu, so lines that arrive together are queued instead of lost between prompts. At end of input
+ * every read answers "" (the menu's "quit" / "keep" / the prompt's default), so the menu always ends.
+ */
+function pipedLines(stdin: NodeJS.ReadableStream): { next(): Promise<string>; close(): void } {
+  const rl = createInterface({ input: stdin, terminal: false });
+  const queue: string[] = [];
+  const waiting: ((l: string) => void)[] = [];
+  let ended = false;
+  rl.on('line', (l) => { const w = waiting.shift(); if (w) w(l); else queue.push(l); });
+  rl.on('close', () => { ended = true; while (waiting.length) waiting.shift()!(''); });
+  return {
+    next: () => (queue.length ? Promise.resolve(queue.shift()!) : ended ? Promise.resolve('') : new Promise((r) => { waiting.push(r); })),
+    close: () => rl.close(),
+  };
+}
+
+/** The real terminal: raw-mode key presses on stdin, output on stderr (stdout stays clean). Without a TTY: numbered prompts. */
+export function terminalMenuIO(stdin: NodeJS.ReadStream = process.stdin, out: NodeJS.WritableStream = process.stderr): MenuIO {
   const tty = !!stdin.isTTY;
   if (tty) emitKeypressEvents(stdin);
+  let piped: ReturnType<typeof pipedLines> | undefined;
+  if (!tty) {
+    return {
+      tty,
+      write: (t) => { out.write(t); },
+      key: async () => 'quit',
+      line: async (prompt) => { out.write(prompt); piped ??= pipedLines(stdin); return piped.next(); },
+      close: () => piped?.close(),
+    };
+  }
   return {
     tty,
     write: (t) => { out.write(t); },
@@ -204,7 +232,7 @@ export function terminalMenuIO(stdin: NodeJS.ReadStream = process.stdin, out: No
       });
     }),
     line: async (prompt) => {
-      const rl = createInterface({ input: stdin, output: out });
+      const rl = createInterface({ input: stdin, output: out as NodeJS.WriteStream });
       try { return await rl.question(prompt); } finally { rl.close(); }
     },
   };

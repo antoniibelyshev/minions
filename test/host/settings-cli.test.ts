@@ -1,6 +1,6 @@
 // `minions settings --list --json` and `minions settings set <key> <value>` through the real program
 // (commander wiring, --json envelopes, --yes, the `config list|set` aliases). Docker is faked as not running.
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import type { Command } from 'commander';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -108,10 +108,73 @@ describe('minions settings (CLI)', () => {
     expect(envelope(s.out).error).toMatchObject({ code: 'PRECONDITION' });
   });
 
-  it('without a terminal, plain `minions settings` points at --list / set', async () => {
+  it('without a terminal, plain `minions settings` opens the menu (numbered prompts), not a refusal; --list never opens it', async () => {
     const { repo } = await install();
-    const r = await cli(repo, ['settings']);
+    const { Command } = await import('commander');
+    const { registerSettings } = await import('../../src/host/settings-cli.js');
+    const tty = process.stdin.isTTY;
+    Object.defineProperty(process.stdin, 'isTTY', { value: undefined, configurable: true });
+    vi.spyOn(process, 'cwd').mockReturnValue(repo);
+    try {
+      const opened: { layer: string }[] = [];
+      const program = new Command().option('--json');
+      registerSettings(program, { confirm: async () => null, menu: async (_p, o) => { opened.push(o); } });
+      program.exitOverride();
+      await program.parseAsync(['node', 'minions', 'settings']);
+      expect(opened).toEqual([{ layer: 'local' }]);
+      const w = process.stdout.write.bind(process.stdout);
+      process.stdout.write = (() => true) as typeof process.stdout.write;
+      try { await program.parseAsync(['node', 'minions', 'settings', '--list']); } finally { process.stdout.write = w; }
+      expect(opened).toHaveLength(1);
+    } finally {
+      Object.defineProperty(process.stdin, 'isTTY', { value: tty, configurable: true });
+    }
+  });
+
+  it('settings --list / --list --json and set errors never contain a stored token', async () => {
+    const { repo, projectId } = await install();
+    await C.provisionTelegramToken({ projectId, token: TOKEN, repoPath: repo, verify: false });
+    const outs = [
+      await cli(repo, ['settings', '--list']),
+      await cli(repo, ['settings', '--list', '--json']),
+      await cli(repo, ['config', 'list']),
+      await cli(repo, ['settings', 'set', 'secrets.telegram', TOKEN]),
+      await cli(repo, ['settings', 'set', 'secrets.telegram', TOKEN, '--json']),
+    ];
+    expect(outs[0]!.out).toMatch(/secrets\.telegram = provisioned/);
+    expect(outs[3]!.code).not.toBe(0);
+    for (const { out } of outs) {
+      expect(out).not.toContain(TOKEN);
+      expect(out).not.toContain('AAHfake');
+    }
+  });
+
+  it('set: the reverse order (maxEngineers before maxActiveTasks) fails with a clear message and writes nothing', async () => {
+    const { repo, local } = await install();
+    const r = await cli(repo, ['settings', 'set', 'execution.maxEngineers', '3', '--yes', '--json']);
     expect(r.code).not.toBe(0);
-    expect(r.out).toMatch(/needs a terminal/);
+    const err = envelope(r.out).error!;
+    expect(err.code).toBe('INVALID_CONFIG');
+    expect(err.message).toMatch(/maxEngineers/);
+    expect(err.message).toMatch(/maxActiveTasks/);
+    const human = await cli(repo, ['settings', 'set', 'execution.maxEngineers', '3', '--yes']);
+    expect(human.code).not.toBe(0);
+    expect(human.out).toMatch(/maxEngineers[\s\S]*maxActiveTasks/);
+    expect(existsSync(local)).toBe(false);
+  });
+
+  it('set without --yes and without a terminal (human output): a loosening change is refused with a hint to pass --yes', async () => {
+    const { repo, local } = await install();
+    const tty = process.stdin.isTTY;
+    Object.defineProperty(process.stdin, 'isTTY', { value: undefined, configurable: true });
+    try {
+      const r = await cli(repo, ['settings', 'set', 'execution.maxActiveTasks', '3']);
+      expect(r.code).not.toBe(0);
+      expect(r.out).toMatch(/loosens policy/);
+      expect(r.out).toMatch(/--yes/);
+    } finally {
+      Object.defineProperty(process.stdin, 'isTTY', { value: tty, configurable: true });
+    }
+    expect(existsSync(local)).toBe(false);
   });
 });

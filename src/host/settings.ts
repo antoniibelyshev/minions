@@ -14,6 +14,7 @@
 // full config schema (resolveEffective) before anything is written. Secrets are never read or shown: token
 // items report only provisioned / missing.
 import { CAPABILITIES, strictness, ruleEffects } from '../config/capabilities.js';
+import { COORDINATOR_DISALLOWED_TOOLS } from '../config/coordinator-tools.js';
 import type { Source } from '../config/resolve.js';
 import { EFFORTS, type CapabilityRule, type MinionsConfig } from '../config/schema.js';
 import { MinionsError } from '../core/errors.js';
@@ -29,7 +30,7 @@ export type SettingGroup = (typeof SETTING_GROUPS)[number];
 
 /** live: enforced by the runtime from the regenerated config; prompt/launch: needs a coordinator restart. */
 export type SettingApply = 'live' | 'prompt' | 'launch';
-export type SettingType = 'enum' | 'int' | 'bool' | 'model' | 'models' | 'secret' | 'control';
+export type SettingType = 'enum' | 'int' | 'bool' | 'model' | 'models' | 'list' | 'secret' | 'control';
 export type SettingLayer = 'local' | 'shared';
 
 type Value = unknown;
@@ -57,7 +58,9 @@ const RESTART_WHY: Record<SettingApply, string> = {
 
 const more = (what: string) => (from: Value, to: Value) => (typeof from === 'number' && typeof to === 'number' && to > from ? `${what} (${from} -> ${to})` : null);
 const turnsOff = (what: string) => (from: Value, to: Value) => (from === true && to === false ? what : null);
-const capRank = (r: Value): number => {
+/** Effective coordinator tool trim: unset = the default list. */
+const trimOf = (v: Value): string[] => (Array.isArray(v) ? (v as string[]) : [...COORDINATOR_DISALLOWED_TOOLS]);
+const capRank =(r: Value): number => {
   if (r === undefined || r === null) return 0;
   const effects = ruleEffects(r as CapabilityRule);
   return Math.max(...effects.map(strictness));
@@ -108,8 +111,10 @@ export const SETTINGS: readonly SettingDef[] = [
   { key: 'execution.maxEngineers', group: 'Concurrency', label: 'Max engineers', type: 'int', min: 1, apply: 'live',
     description: 'engineer workers at once (must be <= max active tasks)',
     loosens: more('more engineers may run at once (higher spend)') },
-  { key: 'execution.attemptMaxTurns', group: 'Concurrency', label: 'Max turns per attempt', type: 'int', min: 1, apply: 'live',
-    description: 'turn budget of one worker attempt',
+  // prompt, not live: the cap Claude Code enforces is the worker definitions' `maxTurns` frontmatter (read at
+  // session start); only the brief's informational maxTurns follows the new value at the next claim.
+  { key: 'execution.attemptMaxTurns', group: 'Concurrency', label: 'Max turns per attempt', type: 'int', min: 1, apply: 'prompt',
+    description: 'turn budget of one worker attempt (worker definitions: needs a coordinator restart)',
     loosens: more('each worker attempt may run longer (higher spend)') },
   { key: 'execution.maxRepairCyclesBeforeReplan', group: 'Concurrency', label: 'Repair cycles before replan', type: 'int', min: 1, apply: 'live',
     description: 'failed fix cycles before the coordinator replans a task' },
@@ -125,6 +130,16 @@ export const SETTINGS: readonly SettingDef[] = [
     loosens: (f, t) => ((f === 'acceptEdits') && (t === 'auto' || t === undefined) ? 'a classifier may approve coordinator actions outside the allow list without prompting' : null) },
   { key: 'coordinator.contextReset.enabled', group: 'Policy', label: 'Routine context resets', type: 'bool', apply: 'live',
     description: 'the coordinator hands off and restarts with a fresh context when idle' },
+  { key: 'coordinator.disallowedTools', group: 'Policy', label: 'Coordinator tool trim', type: 'list', optional: true, apply: 'launch',
+    description: 'Claude Code tools removed from the coordinator session (default: the built-in trim; none: keep every tool; tools it needs cannot be listed)',
+    loosens: (f, t) => {
+      const back = trimOf(f).filter((x) => !trimOf(t).includes(x));
+      return back.length ? `the coordinator gets back ${back.length > 5 ? `${back.slice(0, 5).join(', ')} and ${back.length - 5} more` : back.join(', ')}` : null;
+    } },
+  { key: 'coordinator.toolSearch', group: 'Policy', label: 'Coordinator tool search', type: 'bool', optional: true, apply: 'launch',
+    description: 'true: rarely used tools are loaded on demand (smaller requests); false: Claude Code decides' },
+  { key: 'coordinator.bundledSkills', group: 'Policy', label: 'Coordinator bundled skills', type: 'bool', optional: true, apply: 'launch',
+    description: "Claude Code's bundled skills in the coordinator session (plugin skills always stay)" },
   // ---- Permissions (capabilities)
   ...CAPABILITIES.map((cap): SettingDef => ({
     key: `capabilities.${cap}`, group: 'Permissions', label: cap, type: 'enum', choices: ['allow', 'ask', 'deny'], apply: 'prompt',
@@ -228,6 +243,8 @@ export function currentValue(def: SettingDef, ctx: SettingsContext): Value {
   }
   const v = getPath(ctx.config, def.key);
   if (def.key === 'coordinator.contextReset.enabled' && v === undefined) return true; // unset = on
+  if (def.key === 'coordinator.toolSearch' && v === undefined) return true; // unset = on
+  if (def.key === 'coordinator.bundledSkills' && v === undefined) return false; // unset = off
   return v;
 }
 
@@ -284,6 +301,12 @@ export function parseSettingValue(def: SettingDef, input: string): Value {
     case 'model':
       if (!s) throw bad('must not be empty');
       return s;
+    case 'list': {
+      if (s === 'none') return [];
+      const list = s.split(',').map((x) => x.trim()).filter(Boolean);
+      if (!list.length) throw bad('must list at least one entry, or none');
+      return list;
+    }
     case 'models': {
       const list = s.split(',').map((x) => x.trim()).filter(Boolean);
       if (!list.length) throw bad('must list at least one model');

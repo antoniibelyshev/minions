@@ -414,7 +414,7 @@ Every coordinator turn re-sends the session's tool definitions and skill listing
 { "coordinator": { "disallowedTools": ["Artifact", "Monitor"], "toolSearch": false, "bundledSkills": true } }
 ```
 
-A `disallowedTools` list replaces the default (`[]` keeps every tool); tools the coordinator needs are rejected.
+A `disallowedTools` list replaces the default (`[]` keeps every tool); tools the coordinator needs are rejected. `minions settings` (Policy) edits all three: `settings set coordinator.disallowedTools none` keeps every tool (a loosening change that needs a yes), `default` restores the built-in trim.
 
 ## Sensitive changes
 
@@ -461,18 +461,17 @@ minions settings restart                              # graceful coordinator res
 - **Validation first.** Every edit is checked with the full config schema against all layers before anything is written; an invalid value (say `maxEngineers` above `maxActiveTasks`) is rejected with the reason.
 - **Where it is saved.** Changes go to the host-only `config.local.json` of the project. On a shared install, `--shared` writes the committed `.minions/config.json` instead (with a `configRevision` bump; commit it yourself). A local override can't lift a `deny` set in the project config.
 - **No silent loosening.** A change that widens what the team may do (more concurrency or turns, skipping the reviewer or tester, CI instead of local verification, push/PR delivery, auto-merge, starting tasks without asking, a looser capability or permission mode) shows what it allows and needs a yes; `set` needs `--yes` without a terminal.
-- **Taking effect.** Each save regenerates the runtime config and the mounted plugin. Concurrency, turn limits, context resets and pause/resume take effect on the runtime's next command. Settings the coordinator and worker definitions read at session start (delivery, verification, reporting, models, permissions) and launch settings (channel, coordinator model, effort, permission mode) need a coordinator restart: `settings` offers it (`set --restart` / `--no-restart` decide up front). The restart is graceful: it is refused while workers are active, and `minions settings restart` retries it later.
+- **Taking effect.** Each save regenerates the runtime config and the mounted plugin. Concurrency (max active tasks and engineers), repair cycles, context resets and pause/resume take effect on the runtime's next command. Settings the coordinator and worker definitions read at session start (delivery, verification, reporting, models including the default model, the per-attempt turn limit, permissions) and launch settings (channel, coordinator model, effort, permission mode, the coordinator tool trim, tool search and bundled skills) need a coordinator restart: `settings` offers it (`set --restart` / `--no-restart` decide up front). The restart is graceful: it is refused while workers are active, and `minions settings restart` retries it later.
 - **Tokens.** The GitHub and Telegram items show only provisioned/missing; selecting one runs `minions auth github` / `minions auth telegram`.
 
 `minions config` stays as an advanced alias: `config show [--explain]` (raw effective config), `config list` (= `settings --list`), `config set` (= `settings set`).
 
-Each change is classified by when it takes effect:
+Each change is classified by when it takes effect (`minions settings --list --json` reports it per setting as `apply`):
 
 | Impact | Example |
 | - | - |
-| immediate | Lowering concurrency stops new starts; running work continues |
-| next-dispatch | Changing the default model |
-| restart-required | Updated prompts or tool permissions, Telegram changes (`minions channel set`, `minions auth telegram`) |
+| immediate (`live`) | Lowering concurrency stops new starts; running work continues. Pause/resume, repair cycles, context resets |
+| restart-required (`prompt`, `launch`) | Changing the default model or the per-attempt turn limit: workers run the `model` and `maxTurns` of their definitions, which the coordinator session loads at start (a brief's `model` / `maxTurns` fields already show the new value at the next claim, but they are informational). Updated prompts or tool permissions, coordinator launch settings, Telegram changes (`minions channel set`, `minions auth telegram`) |
 | migration | Switching backlog backend, switching private and shared visibility |
 
 Tightening permissions suspends the affected external actions immediately. A worker still running on an older config revision is blocked from sensitive external operations. Broadening permissions always needs an explicit request from you; the agent can't grant itself authority. Container mounts, image, resources, published ports, and credential grants are host-controlled. Claude can only propose a change plan for them, which you apply through the host CLI.

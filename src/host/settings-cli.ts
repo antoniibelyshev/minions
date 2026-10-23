@@ -181,11 +181,11 @@ export function registerSettings(program: Command, io: SettingsCliIO): Command {
       requireMode('host');
       const { json } = globalOpts(c);
       const project = await currentProject();
-      if (o.list || json || !process.stdin.isTTY) {
-        if (!o.list && !json) throw new MinionsError('PRECONDITION', 'The settings menu needs a terminal.', 'Use `minions settings --list` or `minions settings set <key> <value>`.');
+      if (o.list || json) {
         await listAction(project, json, runtime);
         return;
       }
+      // Without a TTY the menu degrades to numbered prompts (terminalMenuIO); end of input quits it.
       await io.menu(project, { layer: o.shared ? 'shared' : 'local' });
     }));
   addSetCommand(cmd, io, runtime);
