@@ -453,8 +453,10 @@ Decision record for running agents without Docker (`src/host/runtime.ts`, `src/h
 Decision record for required-checks readiness, `minions sync` and CI setup guidance
 (`src/runtime/ci.ts`, `ci.requiredChecks` in `src/host/doctor.ts`).
 
-- **Read-only.** Every GitHub call is a GET: `gh api --method GET` in the container (the gh wrapper
-  injects the token), or a plain `fetch` GET with the stored token on the host. minions never creates
+- **Read-only.** GitHub access is read-only (REST GETs plus a read-only `gh pr view` GraphQL query):
+  REST reads use `gh api --method GET` in the container (the gh wrapper injects the token), or a plain
+  `fetch` GET with the stored token on the host; `minions sync` reads PR state with `gh pr view
+  --json`, which gh sends as a GraphQL POST carrying a query, never a mutation. minions never creates
   workflows and never edits branch protection or rulesets. The only write is the opt-in auto-merge
   pass (see "CI-gated auto-merge"), which arms/disarms GitHub auto-merge and never merges past it.
 - **Required checks.** Union of classic branch protection (`GET /repos/{repo}/branches/{base}`,
@@ -474,7 +476,11 @@ Decision record for required-checks readiness, `minions sync` and CI setup guida
   configured verification commands, let it report once, mark it required in branch protection or a
   ruleset, then set `delivery.requiredChecksConfigured`). Shown by `minions init` (external setup,
   GitHub remotes only; no workflow step when `.github/workflows` exists), by doctor, and by
-  `minions ci status`. The installer never writes workflow files.
+  `minions ci status`. The installer never writes workflow files. `hasWorkflows` is tri-state: `true`
+  (no workflow step), `false` (add a workflow), `null` = the workflow count could not be read (the
+  workflow step is worded conditionally, "if the repository has no CI workflow yet", and never claims
+  workflows are missing). With required checks configured the plan is empty unless workflows are
+  definitely absent.
 - **`minions sync [taskIds...]`.** One explicit pass (no LLM polling loop), host delegates into the
   container. For tasks with a `prUrl` (default: all except `done`/`cancelled`) it runs `gh pr view
   <url> --json …statusCheckRollup` and summarizes checks: `no-checks`, `awaiting-ci` (any check pending),
@@ -482,10 +488,16 @@ Decision record for required-checks readiness, `minions sync` and CI setup guida
   failure/error), `passing`. The observation is recorded as `ci` evidence bound to the PR head SHA
   (outcome `<prState>:<ciState>`, details JSON), plus a `ci-observation` event; a task note is added
   only when the outcome changes. Open PRs keep their status (`delivered`; a failing PR is reported,
-  not reworked automatically). Reconciliation: `MERGED` → `done` (plus `merge` evidence `merged` and a note); `CLOSED` without merge → `blocked`
+  not reworked automatically). They are deliberately not moved to `awaiting-ci`: the scheduler counts
+  `awaiting-ci`/`merging` as in-flight (`IN_FLIGHT` in `src/runtime/scheduler.ts`), so every open PR
+  waiting on human review would hold an active-task slot (`maxActiveTasks`) and starve new work.
+  `delivered` is outside that set, so open PRs cost no scheduler capacity. Reconciliation: `MERGED` → `done` (plus `merge` evidence `merged` and a note); `CLOSED` without merge → `blocked`
   with a note (only from `delivered`/`awaiting-ci`/`merging`); tasks with an active lease are never
   moved. A PR head differing from the approved publication head is reported as a warning. Per-task gh
-  failures are reported and the command exits 1; nothing is thrown away.
+  failures and per-task backlog write errors (for example a version conflict on `addNote`,
+  `closeTask` or `updateTask`) are reported on that task's result, the remaining tasks are still
+  synced, and the command exits 1; nothing is thrown away. A task whose backlog update failed gets no
+  auto-merge pass in that run.
 
 ## CI as verification authority
 
@@ -719,8 +731,9 @@ Decision record for `minions setup` (`src/host/setup.ts`).
   token it offers keep, change, or remove. For Telegram it offers keep, change, or disable. A running
   container is reused, and an imported repository is kept unless you ask to import again. Keeping
   every answer writes nothing.
-- **Unknown required checks.** `ciSetupPlan` treats `hasWorkflows: null` as missing, so setup always
-  passes a boolean: local `.github/workflows` files, or GitHub's workflow count when that is readable.
+- **Unknown required checks.** Setup passes `ciSetupPlan` a boolean `hasWorkflows`: local
+  `.github/workflows` files of this checkout, or GitHub's workflow count when that is readable
+  (`ciSetupPlan` itself treats `null` as unknown, not as missing).
   Required checks that cannot be read (no token, API error) are reported as `unknown`, never as `none`,
   and the plan is labelled conditional.
 - **Never.** Setup never writes workflow files, never changes branch protection, never sets

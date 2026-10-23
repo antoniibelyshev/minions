@@ -227,7 +227,7 @@ export function mergeReadiness(
 export function requiredChecksReadiness(
   config: Pick<MinionsConfig, 'delivery' | 'verification' | 'git'> | null,
   rc: RequiredChecksReport | null,
-  ctx: { onGitHub: boolean; unknownReason?: string; localWorkflows?: number },
+  ctx: { onGitHub: boolean; unknownReason?: string },
 ): Check {
   const name = 'ci.requiredChecks';
   const noMerge = 'usable for local work and pull-request delivery; automatic merge unavailable';
@@ -240,7 +240,7 @@ export function requiredChecksReadiness(
     return { name, status: 'warn', detail: `unknown: required checks on ${base} could not be read (${why}); delivery.requiredChecksConfigured ${flag}`,
       hint: 'Rerun doctor with the container running and a GitHub token that can read the repository (`minions auth github`).' };
   }
-  const workflows = rc.workflows ?? ctx.localWorkflows ?? null;
+  const workflows = rc.workflows;
   if (rc.state === 'configured') {
     const detail = `required checks on ${base}: ${rc.requiredChecks.join(', ')}; delivery.requiredChecksConfigured ${flag}`;
     return flag
