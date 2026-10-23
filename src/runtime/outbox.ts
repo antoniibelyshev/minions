@@ -55,63 +55,204 @@ export const backoffMs = (attempts: number): number => Math.min(BACKOFF_BASE_MS 
 const SECRET_KEY = String.raw`\b([\w-]*?(?:password|passwd|api[_-]?key|(?:secret|access|private)[_-]?key|secret|token|authorization|signature|credentials?))`;
 /** Auth scheme words after an authorization key: they belong to the separator, the value follows them. */
 const AUTH_SCHEME = String.raw`(?:bearer|token|basic|digest|negotiate|ntlm|aws4-hmac-sha256)\s`;
-/** Schemes whose header credential is masked whole (Bearer has its own rule that keeps prose readable). */
-const AUTH_HEADER_SCHEME = String.raw`(?:token|basic|digest|negotiate|ntlm|aws4-hmac-sha256)`;
-/** Horizontal whitespace, or a line break that folds the header onto an indented next line. */
-const HWS = String.raw`(?:[^\S\n]|\n(?=[ \t]))`;
-/**
- * One credential item: a token68 (`dXNlcjpw==`) or an auth param (`key=token`, `key = "quoted"`,
- * `SignedHeaders=host;range`). Its parts, in order:
- * - a JSON escape (`\"`, `\\`) of a header logged inside a JSON string;
- * - whitespace around a param's `=` (`nc = 1`);
- * - a quoted value with `\"` escapes, closed by a quote not followed by a word character, `"`, `\` or
- *   `=` (so `)`, `.`, `]`, `'`, `-`, `,`, `;`, whitespace or the end may follow it, while the `="` of
- *   Base64 padding before the quote that closes an enclosing string is not taken for a value);
- * - a quoted value closed by a quote right before a word character (`response="x"y`), if it has no
- *   whitespace or JSON separator (`,:;{}[]`): the text between Base64 padding and the next string's
- *   opening quote in JSON always has one;
- * - an unterminated quoted value (a cut-off message), up to the line end;
- * - a JSON-escaped quoted value (`=\"John Doe\"`);
- * - any other character except whitespace, `"`, `\` and `,`. An unescaped quote ends the item.
- */
-const AUTH_ITEM = String.raw`(?:\\.|[^\S\n]+(?==)|=[^\S\n]*"(?:[^"\\\n]|\\.)*"(?=[^\w"\\=]|$)|=[^\S\n]*"[^\s"\\,:;{}[\]]+"(?=\w)|=[^\S\n]*"(?:[^\s"\\]|\\.)(?:[^"\\\n]|\\.)*(?=\n|$)|=[^\S\n]*\\"(?:[^"\\\n]|\\\\\\.|\\[^"\\\n])*\\"|(?<=[^\S\n])=[^\S\n]+|[^\s"\\,])+`;
-/** Before a further item: `,` or whitespace, then the next `key=` param. */
-const AUTH_NEXT_ITEM = String.raw`(?:${HWS}*,${HWS}*|${HWS}+)(?=[\w-]+[^\S\n]*=)`;
-/**
- * The whole credential of an Authorization header: its items up to the first thing that is not one,
- * so trailing prose such as ` -> 401 Unauthorized`, ` (retrying)` or `, retrying` stays readable. A
- * folded header (a line break before an indented continuation) counts as whitespace. Nothing follows
- * this pattern in its rule, so a match never fails after the first item and nothing backtracks into it.
- */
-const AUTH_HEADER_VALUE = String.raw`${AUTH_ITEM}(?:${AUTH_NEXT_ITEM}${AUTH_ITEM})*`;
-/** Longer inputs are cut before masking: the patterns cost O(n^2) on long runs, and only 300 chars are kept. */
+/** Schemes whose header credential is masked whole by {@link maskAuthHeaders}. */
+const AUTH_HEADER_SCHEME = String.raw`(?:bearer|token|basic|digest|negotiate|ntlm|aws4-hmac-sha256)`;
+/** An `Authorization:` / `Proxy-Authorization=` header up to its scheme; the credential follows. */
+const AUTH_HEADER = new RegExp(String.raw`\b((?:proxy-)?authorization\s*["']?\s*[:=]\s*["']?${AUTH_HEADER_SCHEME}\s+)(?!\[redacted\])`, 'gi');
+/** One character of an unquoted value: anything but whitespace, quotes and the listed separators, or an escape pair other than `\"`. */
+const valueChar = (exclude: string) => String.raw`(?:[^\s"'\\${exclude}]|\\[^\s"])`;
+/** Longer inputs are cut before masking: some patterns cost O(n^2) on long runs, and only 300 chars are kept. */
 const MAX_REDACT_INPUT = 4000;
+
+const isHws = (c: string | undefined): c is string => c !== undefined && c !== '\n' && /\s/.test(c);
+/** A line break that folds a header onto an indented next line. */
+const isFold = (s: string, i: number) => s[i] === '\n' && (s[i + 1] === ' ' || s[i + 1] === '\t');
+/** After a `"` that follows `=`: these characters mean the quote closes a string, not opens a value. */
+const CLOSES_STRING = /[\s,:;.)\]}']/;
+const NEXT_PARAM = /[\w-]+[^\S\n]*=/y;
+
+/** True when `i` sits inside a double-quoted (JSON) string: an odd number of unescaped `"` precede it on its line. */
+function insideString(s: string, i: number): boolean {
+  let open = false;
+  for (let k = s.lastIndexOf('\n', i - 1) + 1; k < i; k++) {
+    if (s[k] === '\\') k++;
+    else if (s[k] === '"') open = !open;
+  }
+  return open;
+}
+
+/** Index after a `"`-quoted value starting at `i` (its `\` escapes included), or the line end if it is not closed. */
+function skipQuoted(s: string, i: number): number {
+  for (let k = i + 1; k < s.length; k++) {
+    if (s[k] === '\\' && s[k + 1] !== undefined && s[k + 1] !== '\n') k++;
+    else if (s[k] === '"') return k + 1;
+    else if (s[k] === '\n') return k;
+  }
+  return s.length;
+}
+
+/** Index after a JSON-escaped quoted value (`\"John Doe\"`, a raw `\"` inside it being `\\\"`) starting at `i`. */
+function skipEscapedQuoted(s: string, i: number): number {
+  for (let k = i + 2; k < s.length; k++) {
+    if (s.startsWith('\\\\\\', k)) k += 3;
+    else if (s.startsWith('\\"', k)) return k + 2;
+    else if (s[k] === '\\' && s[k + 1] !== undefined && s[k + 1] !== '\n') k++;
+    else if (s[k] === '"' || s[k] === '\n') return k;
+  }
+  return s.length;
+}
+
+/**
+ * The credential inside a double-quoted string: everything up to the string's end, i.e. the first
+ * unescaped `"` (`\"` and `\\` are escape pairs), or a line end that does not fold the header. A `"`
+ * right after `=` that is not followed by a string-closing character opens a quoted param value (a
+ * header logged with raw quotes), which is skipped whole; Base64 padding (`==",`) is not taken for one.
+ */
+function credentialInString(s: string, i: number): number {
+  while (i < s.length) {
+    const c = s[i];
+    if (c === '\\') { i += s[i + 1] !== undefined && s[i + 1] !== '\n' ? 2 : 1; continue; }
+    if (c === '\n' && !isFold(s, i)) break;
+    if (c === '"') {
+      let p = i - 1;
+      while (isHws(s[p])) p--;
+      const next = s[i + 1];
+      if (s[p] === '=' && next !== undefined && !CLOSES_STRING.test(next)) { i = skipQuoted(s, i); continue; }
+      break;
+    }
+    i++;
+  }
+  return i;
+}
+
+/**
+ * One credential item in plain text: a token68 (`dXNlcjpw==`) or an auth param (`key=token`,
+ * `key = "quoted"`, `SignedHeaders=host;range`), with `\` escape pairs. A quoted value after `=` is
+ * skipped whole (also when JSON-escaped); the item then goes on up to whitespace, `,`, a line end or an
+ * unescaped `"` that does not open a value, so punctuation after the value (`")`, `"'}`, `"x`) is masked too.
+ */
+function credentialItem(s: string, i: number): number {
+  while (i < s.length) {
+    const c = s[i];
+    if (c === '\\') { i += s[i + 1] !== undefined && s[i + 1] !== '\n' ? 2 : 1; continue; }
+    if (c === '=') {
+      let k = i + 1;
+      while (isHws(s[k])) k++;
+      if (s[k] === '"') i = skipQuoted(s, k);
+      else if (s.startsWith('\\"', k)) i = skipEscapedQuoted(s, k);
+      // Whitespace after `=` (`nc = 1`, `response= x`) belongs to the param, except after `==` Base64 padding.
+      else i = s[i - 1] === '=' ? i + 1 : k;
+      continue;
+    }
+    if (c === '"' || c === ',' || c === '\n') break;
+    if (isHws(c)) {
+      let k = i;
+      while (isHws(s[k])) k++;
+      if (s[k] === '=') { i = k; continue; }
+      break;
+    }
+    i++;
+  }
+  return i;
+}
+
+/** Skips the separators between credential items: whitespace, commas and folded line breaks. */
+function skipSeparators(s: string, i: number): number {
+  while (i < s.length && (isHws(s[i]) || s[i] === ',' || isFold(s, i))) i++;
+  return i;
+}
+
+/**
+ * The credential in plain text: its items, separated by whitespace or commas, while the next one is a
+ * `key=` param. Trailing prose such as ` -> 401 Unauthorized`, ` (retrying)` or `, retrying` stays readable.
+ */
+function credentialInText(s: string, start: number): number {
+  let end = credentialItem(s, skipSeparators(s, start));
+  for (;;) {
+    const next = skipSeparators(s, end);
+    NEXT_PARAM.lastIndex = next;
+    if (next === end || !NEXT_PARAM.test(s)) return end;
+    end = credentialItem(s, next);
+  }
+}
+
+/**
+ * Masks the whole credential of every `Authorization:` / `Proxy-Authorization:` header after its scheme.
+ * One rule decides where it ends: inside a double-quoted (JSON) string, at the string's end (see
+ * {@link credentialInString}), so the enclosing JSON stays valid; in plain text, after its last
+ * credential item (see {@link credentialInText}). Over-masking a trailing character is accepted; a
+ * credential character is never left unmasked before that boundary.
+ */
+function maskAuthHeaders(s: string): string {
+  let out = '';
+  let from = 0;
+  AUTH_HEADER.lastIndex = 0;
+  for (let m = AUTH_HEADER.exec(s); m; m = AUTH_HEADER.exec(s)) {
+    const start = m.index + m[0].length;
+    const end = insideString(s, start) ? credentialInString(s, start) : credentialInText(s, start);
+    if (end > start) {
+      out += `${s.slice(from, start)}[redacted]`;
+      from = end;
+    }
+    AUTH_HEADER.lastIndex = Math.max(end, start);
+  }
+  return out + s.slice(from);
+}
+
+/** Index of the first unescaped `"` in `s` (`\` escape pairs skipped), or -1. */
+function unescapedQuote(s: string): number {
+  for (let k = 0; k < s.length; k++) {
+    if (s[k] === '\\') k++;
+    else if (s[k] === '"') return k;
+  }
+  return -1;
+}
+
+/**
+ * Replacer for `key = "value"` / `key: 'value'`. Inside a JSON string, a `"` after the separator closes
+ * that string (the value is empty: nothing is masked), and a `'`-quoted value ends at the string's end.
+ */
+function maskQuotedValue(match: string, key: string, sep: string, quote: string, offset: number, text: string): string {
+  const at = offset + key.length + sep.length;
+  const inString = insideString(text, at);
+  if (quote === '"' && inString) return match;
+  const value = match.slice(key.length + sep.length + 1);
+  const end = inString ? unescapedQuote(value) : -1;
+  if (end === 0) return match;
+  return `${key}${sep}${quote}[redacted]${end < 0 ? '' : value.slice(end)}`;
+}
+
+/** Replacer for `key=value`: a `"` that ends the separator but closes a JSON string is not an opening quote. */
+function maskUnquotedValue(match: string, key: string, sep: string, offset: number, text: string): string {
+  const quoteAt = offset + key.length + sep.length - 1;
+  if (sep.endsWith('"') && !sep.endsWith('\\"') && insideString(text, quoteAt)) return match;
+  return `${key}${sep}[redacted]`;
+}
 
 /**
  * Shortens an error and masks anything that looks like a credential: bot tokens, GitHub tokens, URL
- * userinfo passwords, the value after `Bearer`, the whole credential (every param) of an
- * `Authorization:` or `Proxy-Authorization:` header (also URL-encoded) after its
- * token/Basic/Digest/Negotiate/NTLM/AWS4-HMAC-SHA256 scheme, the values (whole, when quoted) of
- * password/passwd/api_key/apikey/secret/token/authorization/signature/credential and
- * secret_key/access_key/private_key keys, and generated-looking values after `token`/`apikey`. Prose such as "Bearer token is missing" is left readable
- * (a bearer token has 8+ characters).
+ * userinfo passwords, the whole credential (every param) of an `Authorization:` or
+ * `Proxy-Authorization:` header (also URL-encoded) after its
+ * Bearer/token/Basic/Digest/Negotiate/NTLM/AWS4-HMAC-SHA256 scheme, the value after a bare `Bearer`, the
+ * values (whole, when quoted) of password/passwd/api_key/apikey/secret/token/authorization/signature/
+ * credential and secret_key/access_key/private_key keys, and generated-looking values after
+ * `token`/`apikey`. Prose such as "Bearer token is missing" is left readable (a bearer token has 8+
+ * characters). Masking never consumes the `\` of a `\"` escape, so a JSON text stays valid JSON.
  */
 export function redactError(message: string): string {
-  const masked = message.slice(0, MAX_REDACT_INPUT)
+  const masked = maskAuthHeaders(message.slice(0, MAX_REDACT_INPUT)
     .replace(/(?:bot)?\d{6,}:[A-Za-z0-9_-]{30,}(?![A-Za-z0-9_-])/gi, '[redacted]')
     .replace(/\b(gh[pousr]_|github_pat_)[A-Za-z0-9_]{20,}\b/g, '[redacted]')
     // https://user:pass@host
-    .replace(/\b([a-z][a-z0-9+.-]*:\/\/[^\s/:@]*:)[^\s/@]+@/gi, '$1[redacted]@')
-    .replace(/\bbearer\s+(?!\[redacted\])[^\s"',;]{8,}/gi, 'Bearer [redacted]')
-    // Authorization / Proxy-Authorization header with a scheme: mask the whole rest of the value.
-    .replace(new RegExp(String.raw`\b((?:proxy-)?authorization\s*["']?\s*[:=]\s*["']?${AUTH_HEADER_SCHEME}\s+)(?!\[redacted\])${AUTH_HEADER_VALUE}`, 'gi'), '$1[redacted]')
+    .replace(/\b([a-z][a-z0-9+.-]*:\/\/[^\s/:@"]*:)(?:[^\s/@"\\]|\\\S)+@/gi, '$1[redacted]@'))
+    .replace(new RegExp(String.raw`\bbearer\s+(?!\[redacted\])${valueChar(',;')}{8,}`, 'gi'), 'Bearer [redacted]')
     // URL-encoded header (`Authorization%3A%20Basic%20...` in a query string or a logged request).
-    .replace(new RegExp(String.raw`\b((?:proxy-)?authorization(?:%22)?%3A(?:%20|\+)*(?:%22)?${AUTH_HEADER_SCHEME}(?:%20|\+)+)(?!\[redacted\])[^\s&"']+`, 'gi'), '$1[redacted]')
-    // Quoted value: mask up to the closing quote.
-    .replace(new RegExp(`${SECRET_KEY}(\\s*["']?\\s*[:=]\\s*)(["'])(?!\\[redacted\\]|${AUTH_SCHEME})(?:(?!\\3)[^\\n])+`, 'gi'), '$1$2$3[redacted]')
-    .replace(new RegExp(`${SECRET_KEY}(\\s*["']?\\s*[:=]\\s*["']?)(?!\\[redacted\\]|${AUTH_SCHEME})[^\\s"'&,;]+`, 'gi'), '$1$2[redacted]')
+    .replace(new RegExp(String.raw`\b((?:proxy-)?authorization(?:%22)?%3A(?:%20|\+)*(?:%22)?${AUTH_HEADER_SCHEME}(?:%20|\+)+)(?!\[redacted\])${valueChar('&')}+`, 'gi'), '$1[redacted]')
+    // Quoted value: mask up to the closing quote (`\` escapes included).
+    .replace(new RegExp(`${SECRET_KEY}(\\s*["']?\\s*[:=]\\s*)(["'])(?!\\[redacted\\]|${AUTH_SCHEME})(?:\\\\[^\\n]|(?!\\3)[^\\\\\\n])+`, 'gi'), maskQuotedValue)
+    .replace(new RegExp(`${SECRET_KEY}(\\s*\\\\?["']?\\s*[:=]\\s*(?:\\\\?["'])?)(?!\\[redacted\\]|${AUTH_SCHEME})${valueChar('&,;')}+`, 'gi'), maskUnquotedValue)
     // "token <value>" / "apikey <value>" without a separator: only generated-looking values (12+ chars with a digit).
-    .replace(/\b(token|authorization|api[_-]?key)(\s+)(?!\[redacted\])(?=[^\s"']*\d)[^\s"']{12,}/gi, '$1$2[redacted]')
+    .replace(new RegExp(String.raw`\b(token|authorization|api[_-]?key)(\s+)(?!\[redacted\])(?=[^\s"']*\d)${valueChar('')}{12,}`, 'gi'), '$1$2[redacted]')
     .replace(/\s+/g, ' ')
     .trim();
   return masked.length > MAX_ERROR_LENGTH ? `${masked.slice(0, MAX_ERROR_LENGTH - 1)}…` : masked;

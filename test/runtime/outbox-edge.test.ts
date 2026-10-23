@@ -360,3 +360,103 @@ describe('credential masking of stored send errors', () => {
     expect(redactError('{"Authorization":"Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig"}')).not.toContain('eyJhbGciOiJIUzI1NiJ9');
   });
 });
+
+// One rule ends an Authorization credential: the end of the enclosing double-quoted (JSON) string, or in
+// plain text the last credential item. Whatever character follows the credential, no part of a secret
+// may survive and a JSON text must stay valid JSON.
+describe('Authorization credential masking over every follower and context', () => {
+  const FOLLOWERS = ['\\', '"', "'", ')', ']', '.', ',', ';', '-', ' ', '\n', '\\"'];
+  const CREDENTIALS: { name: string; scheme: string; credential: string; secrets: string[] }[] = [
+    { name: 'Bearer', scheme: 'Bearer', credential: 'eyJhbGciOiJIUzI1NiJ9.c2VjcmV0Sk3y.S1gnatur3XyZ', secrets: ['eyJhbGciOiJIUzI1NiJ9.c2VjcmV0Sk3y.S1gnatur3XyZ'] },
+    { name: 'Basic with padding', scheme: 'Basic', credential: 'dXNlcjpwYXNzd29yZA==', secrets: ['dXNlcjpwYXNzd29yZA'] },
+    { name: 'Basic without padding', scheme: 'Basic', credential: 'QWxhZGRpbjpvcGVuIHNlc2FtZQ', secrets: ['QWxhZGRpbjpvcGVuIHNlc2FtZQ'] },
+    {
+      name: 'Digest, quoted params', scheme: 'Digest',
+      credential: 'username="u", realm="r", nonce="N0nceS3cretVal", qop=auth, nc=00000001, response="R3spS3cretVal"',
+      secrets: ['N0nceS3cretVal', 'R3spS3cretVal'],
+    },
+    {
+      name: 'Digest, unquoted params', scheme: 'Digest',
+      credential: 'username=u, nonce=N0nceS3cretVal, response=R3spS3cretVal',
+      secrets: ['N0nceS3cretVal', 'R3spS3cretVal'],
+    },
+  ];
+  /** Every 6-character window of each secret: a partly masked secret leaks too. */
+  const windows = (secrets: string[]) => secrets.flatMap((s) => Array.from({ length: s.length - 5 }, (_, i) => s.slice(i, i + 6)));
+  const cases = CREDENTIALS.flatMap((c) => FOLLOWERS.map((follower) => ({ ...c, follower })));
+
+  it.each(cases)('$name followed by $follower', ({ scheme, credential, secrets, follower }) => {
+    const value = `${scheme} ${credential}${follower}`;
+    const header = `Authorization: ${value}`;
+    const plain = [header, `${header} retrying`, `send failed: ${header} -> 401 Unauthorized`, `Proxy-Authorization: ${value} (retrying)`, `{'Authorization': '${value}'}`];
+    const json = [
+      JSON.stringify({ error: `bad header ${header}`, code: 401 }),
+      JSON.stringify({ error: `${header} -> 401`, code: 401 }),
+      JSON.stringify([header, 'next']),
+      JSON.stringify({ Authorization: value, x: 'y' }),
+      JSON.stringify({ headers: { 'Proxy-Authorization': value }, status: 407 }, null, 2),
+      JSON.stringify(header),
+    ];
+    for (const input of [...plain, ...json]) {
+      const out = redactError(input);
+      for (const w of windows(secrets)) expect(out, `${JSON.stringify(input)} -> ${JSON.stringify(out)}`).not.toContain(w);
+      expect(out).toContain('[redacted]');
+    }
+    for (const input of json) {
+      const out = redactError(input);
+      expect(() => JSON.parse(out), `${JSON.stringify(input)} -> ${JSON.stringify(out)}`).not.toThrow();
+    }
+  });
+
+  it('masks the earlier repros: a backslash or quote after a closing Digest quote, a JSON-escaped quote after a Bearer token', () => {
+    for (const tail of ['\\', '"', '"}', "\"}'", '""']) {
+      for (const header of ['Authorization', 'Proxy-Authorization']) {
+        const out = redactError(`${header}: Digest username="u", nonce="N0nceS3cretVal", response="sEcr3tValue123XYZ"${tail}`);
+        expect(out, tail).not.toContain('sEcr3tValue123XYZ');
+        expect(out, tail).not.toContain('N0nceS3cretVal');
+      }
+    }
+    const json = redactError(JSON.stringify({ error: 'bad Authorization: Bearer abcdefghijklmnop"', code: 401 }));
+    expect(json).toBe('{"error":"bad Authorization: Bearer [redacted]","code":401}');
+    expect(JSON.parse(json)).toEqual({ error: 'bad Authorization: Bearer [redacted]', code: 401 });
+    // A bare Bearer token (no Authorization header) stops before the `\` of a `\"` escape.
+    expect(redactError(JSON.stringify({ error: 'got Bearer abcdefghijklmnop" back' }))).toBe('{"error":"got Bearer [redacted]\\" back"}');
+  });
+
+  it('masks Digest params after a stray quote earlier on the line (no JSON string actually open)', () => {
+    const out = redactError('curl said "oops: Authorization: Digest username="u", response="R3spS3cretVal" -> 401');
+    expect(out).not.toContain('R3spS3cretVal');
+    expect(redactError('Authorization: Digest  , response="R3spS3cretVal"')).toBe('Authorization: Digest [redacted]');
+    expect(redactError('Authorization: Digest username=""response="R3spS3cretVal"')).toBe('Authorization: Digest [redacted]');
+    expect(redactError('Authorization: Digest response="x"y, cnonce=R3spS3cretVal')).toBe('Authorization: Digest [redacted]');
+    expect(redactError('Authorization: Digest response= R3spS3cretVal, nc = 1 done')).toBe('Authorization: Digest [redacted] done');
+  });
+
+  it('keeps JSON valid when other credential values hold escaped quotes', () => {
+    for (const input of [
+      JSON.stringify({ secret: 'hunter2pw"x', a: 1 }),
+      JSON.stringify({ error: 'login failed: password="hunter2pw" for bob', a: 1 }),
+      JSON.stringify({ error: 'api_key=hunter2pw" rejected' }),
+      JSON.stringify({ error: 'token abc123def456ghi"' }),
+      JSON.stringify({ url: 'GET /x?h=Authorization%3A%20Basic%20hunter2pw"&y=1' }),
+    ]) {
+      const out = redactError(input);
+      expect(out, input).not.toContain('hunter2pw');
+      expect(out, input).not.toContain('abc123def456ghi');
+      expect(() => JSON.parse(out), `${input} -> ${out}`).not.toThrow();
+    }
+    expect(redactError('{"secret":"hunter2pw\\"x","a":1}')).toBe('{"secret":"[redacted]","a":1}');
+  });
+
+  it('does not take the quote that closes a JSON string for the opening quote of a value', () => {
+    // An empty value at the end of a JSON string: nothing to mask, the JSON stays as it is.
+    for (const input of ['["password=","n"]', '{"msg":"bad Authorization: ","code":401}', '["token:"]', '["https://u:","b@c"]']) {
+      expect(redactError(input), input).toBe(input);
+    }
+    // A single-quoted value inside a JSON string ends where that string ends.
+    expect(redactError(JSON.stringify({ e: "password='hunter2pw", n: 1 }))).toBe(`{"e":"password='[redacted]","n":1}`);
+    expect(redactError(JSON.stringify({ url: 'https://bob:hunter2"pw@example.com/r.git' }))).toBe('{"url":"https://bob:[redacted]@example.com/r.git"}');
+    // Outside a string a quote after the separator still opens the value.
+    expect(redactError('{"password": "p@ss word", "user": "bob"}')).toBe('{"password": "[redacted]", "user": "bob"}');
+  });
+});
