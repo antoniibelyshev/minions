@@ -415,7 +415,6 @@ async function hostRequiredChecks(project: { projectId: string; remoteUrl: strin
   return { rc: await requiredChecksStatus(fetchApi(token, f), `${r.owner}/${r.repo}`, config.git.baseBranch) };
 }
 
-/** The `restart` check from the shared restart-required result. Never 'fail': it only advises `minions upgrade`. */
 /** The generated plugin (mounted read-only into the container) against what the installed package renders. */
 export function pluginDoctorCheck(c: PluginCheck | Error, hostRuntime = false): Check {
   const refresh = hostRuntime ? '`minions down && minions start`' : '`minions upgrade` (or `minions down && minions start`)';
@@ -426,6 +425,7 @@ export function pluginDoctorCheck(c: PluginCheck | Error, hostRuntime = false): 
     hint: `Run ${refresh} to regenerate it from the installed package; files you edited are kept (delete them to regenerate).` };
 }
 
+/** The `restart` check from the shared restart-required result. Never 'fail': it only advises `minions upgrade`. */
 export function restartCheck(r: RestartRequired): Check {
   const name = 'restart';
   switch (r.state) {
