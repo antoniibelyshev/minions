@@ -557,6 +557,41 @@ Implemented in task-14.3:
   `harness.<id>` (and `harness.network` warnings) only when a process harness is configured.
 - The helper's supervisor kills what the harness leaves behind as soon as the harness exits, not only on SIGTERM.
 
+Addendum (task-14.3 QA fixes). Landlock does not govern TCP Fast Open, metadata writes or scheduling, so
+seccomp now covers them too:
+
+- **TCP Fast Open.** `sendto`/`sendmsg`/`sendmmsg` with `MSG_FASTOPEN` and `setsockopt(TCP_FASTOPEN_CONNECT)` fail
+  with `EOPNOTSUPP`, because they connect without `connect()` and so bypass the TCP allowlist. `TCP_FASTOPEN` on a
+  listener stays allowed, since it only affects inbound connections. x32 and i386 `socketcall` are already killed.
+- **chmod via seccomp notify.** Git needs path chmod on its own files (`git init` fails without it), and seccomp
+  cannot see a path. So `chmod`/`fchmodat`/`fchmodat2` return `SECCOMP_RET_USER_NOTIF`. The supervisor sits outside
+  Landlock and receives the listener fd over a socketpair. It reads the path from `/proc/<pid>/mem` and resolves it
+  with `openat(O_PATH)` against the worker's root, cwd or dirfd. It accepts the result only if `/proc/self/fd/N` is
+  inside the realpath of a writable rule. It then chmods that pinned inode itself and never answers CONTINUE, so
+  rewriting the path after the check gains nothing. Anything else gets `EPERM`. `fchmod(fd)` stays allowed.
+- **Denied outright (`EPERM`):** the chown family, set/remove xattr (`l`/`f` variants included), and
+  `utime`/`utimes`/`futimesat`/`utimensat`.
+- **Self-only scheduling.** `setpriority`, `ioprio_set`, `sched_setaffinity`/`setscheduler`/`setattr`/`setparam`
+  and `prlimit64` are allowed only when the target argument is 0 (the caller). Any explicit pid, pgrp or -1 is
+  denied, because otherwise a worker could slow down or limit the coordinator.
+- Self-test canaries: `tcp.fastopen`, `meta.{chmod,chown,setxattr,utimensat}`,
+  `sched.{setpriority,setaffinity,ioprio,prlimit}` and `control.chmod-scratch`. `io_uring.setup` now requires the
+  helper's own `ENOSYS`.
+
+Accepted residual risks:
+
+1. **`fchmod` on a read-only fd.** A worker can still fchmod a same-uid file it may read but not write, such as a
+   git object. A chmod 000 there would break the shared repo for others. Accepted because objects are
+   content-addressed and recoverable with `git fsck` or a refetch, and secrets and state cannot be opened at all.
+   To close it, route `fchmod` through the notify handler too (checking `/proc/<pid>/fd/<n>` against the writable
+   set).
+2. **No timestamp or xattr changes, even in the worktree.** `touch -d`, `cp -p` and tar mtime restore fail inside
+   the sandbox. Accepted because git and the harnesses do not need them. To close it, handle `utimensat` in the
+   notify handler like chmod.
+3. **Scheduling calls must name 0, not the caller's own pid or tid.** For example, `pthread_setaffinity_np` with a
+   tid gets `EPERM`. Accepted because the harnesses do not pin threads and the failure is a harmless error. To
+   close it, have the notify handler allow ids that belong to the sandbox's own tree.
+
 ### D8. Config shape, schema impact, CLI surface
 
 ```jsonc
