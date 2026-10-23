@@ -9,6 +9,7 @@ import { can } from '../config/capabilities.js';
 import { defaultDeliveryMode, githubDeliveryUnavailableReason, profileDefaults } from '../config/profiles.js';
 import { validateConfig } from '../config/resolve.js';
 import { PROFILES, type MinionsConfig, type Profile } from '../config/schema.js';
+import { stripTerminalEscapes } from '../core/control-chars.js';
 import { MinionsError } from '../core/errors.js';
 import { parseWith, readJson } from '../core/fsutil.js';
 import { VERSION } from '../core/version.js';
@@ -68,7 +69,7 @@ export function readSecret(prompt: string, input: SecretInput = process.stdin, o
       if (err) reject(err); else resolve(buf);
     };
     const onData = (chunk: Buffer | string) => {
-      const s = String(chunk).replace(/\x1b\[[0-9;]*[A-Za-z~]/g, '').replace(/\x1b./g, '');
+      const s = stripTerminalEscapes(String(chunk));
       for (const ch of s) {
         if (ch === '\r' || ch === '\n') return finish();
         if (ch === '\u0003' || (ch === '\u0004' && !buf)) return finish(new MinionsError('PRECONDITION', 'Secret entry cancelled; nothing was stored.'));

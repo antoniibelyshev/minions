@@ -1,3 +1,4 @@
+import { stripControlChars } from './control-chars.js';
 import { EXIT_CODES, MinionsError, type ErrorCode } from './errors.js';
 
 const SECRET_PATTERNS: [RegExp, string][] = [
@@ -7,6 +8,9 @@ const SECRET_PATTERNS: [RegExp, string][] = [
   [/\b(Bearer)\s+[A-Za-z0-9._~+/=-]{8,}/gi, '$1 [REDACTED]'],
   [/\b(bot)?\d{6,12}:[A-Za-z0-9_-]{30,}/g, '[REDACTED_BOT_TOKEN]'],
 ];
+
+/** Human-readable text for the terminal: secrets masked, escape sequences and control characters (except newline/tab) removed. */
+const terminalText = (text: string): string => stripControlChars(redact(text));
 
 /** Masks credential-shaped substrings (Anthropic keys, GitHub tokens, Bearer tokens, Telegram bot tokens). */
 export function redact(text: string): string {
@@ -23,7 +27,7 @@ export function emit(data: unknown, opts: { json: boolean; human?: (d: any) => s
     return;
   }
   const text = opts.human ? opts.human(data) : typeof data === 'string' ? data : JSON.stringify(data, null, 2);
-  if (text) process.stdout.write(redact(text).replace(/\n?$/, '\n'));
+  if (text) process.stdout.write(terminalText(text).replace(/\n?$/, '\n'));
 }
 
 export function toMinionsError(err: unknown): MinionsError {
@@ -41,8 +45,8 @@ export function reportError(err: unknown, opts: { json: boolean }): number {
     if (e.details !== undefined) error.details = redactDeep(e.details);
     process.stdout.write(JSON.stringify({ ok: false, error }) + '\n');
   } else {
-    process.stderr.write(`error [${e.code}]: ${redact(e.message)}\n`);
-    if (e.hint) process.stderr.write(`hint: ${redact(e.hint)}\n`);
+    process.stderr.write(`error [${e.code}]: ${terminalText(e.message)}\n`);
+    if (e.hint) process.stderr.write(`hint: ${terminalText(e.hint)}\n`);
   }
   if (process.env.MINIONS_DEBUG === '1' && err instanceof Error && err.stack) process.stderr.write(redact(err.stack) + '\n');
   return EXIT_CODES[e.code as ErrorCode] ?? 1;
