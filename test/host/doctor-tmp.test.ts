@@ -62,7 +62,7 @@ describe('tmpUsageChecks', () => {
 
   it('warns when /tmp is not capped at the configured size (container from an older compose.yaml)', () => {
     const [tmp] = tmpUsageChecks(df([3 * GiB, 1024], [100 * GiB, GiB]), opts);
-    expect(tmp).toMatchObject({ status: 'warn', detail: expect.stringContaining('expected a 1024 MiB cap'), hint: expect.stringContaining('minions down') });
+    expect(tmp).toMatchObject({ status: 'warn', detail: expect.stringContaining('expected a 1024 MiB cap'), hint: expect.stringContaining('minions upgrade') });
     expect(tmpUsageChecks(df([2 * GiB, 1024], [100 * GiB, GiB]), { ...opts, capMiB: 2048 })[0]!.status).toBe('ok');
   });
 
