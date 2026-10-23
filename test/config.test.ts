@@ -26,7 +26,8 @@ describe('profiles', () => {
     });
     // The coordinator permission mode is left unset: auto by default (opt-out: coordinator.permissionMode).
     expect(c).not.toHaveProperty('permissionMode');
-    expect(c).not.toHaveProperty('coordinator');
+    // Routine context resets are on for new projects (task-45); nothing else under coordinator is set.
+    expect(c.coordinator).toEqual({ contextReset: { enabled: true } });
     expect(Object.keys(c.capabilities).sort()).toEqual([...CAPABILITIES].sort());
     expect(c.capabilities['pr.merge']).toBe('ask');
     expect(c.capabilities['ci.edit']).toBe('ask');

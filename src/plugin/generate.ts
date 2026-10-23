@@ -10,6 +10,7 @@ import { atomicWrite, sha256 } from '../core/fsutil.js';
 import { configuredPermissionMode } from '../runtime/coordinator.js';
 import { controlsTable } from '../runtime/controls.js';
 import { NOTIFICATION_KINDS } from '../runtime/outbox.js';
+import { contextResetSettings, HANDOFF_MAX_BYTES, RESET_RESTART_COMMAND } from '../runtime/context-reset.js';
 
 export interface GeneratedFile { path: string; sha256: string }
 
@@ -321,6 +322,34 @@ function outboxGuidance(): string {
   ].join(' ');
 }
 
+const RESET_RESTART = `\`${RESET_RESTART_COMMAND}\``;
+const HANDOFF_WRITE = `\`minions coordinator handoff --json\` with the note on stdin (a quoted heredoc; at most ${HANDOFF_MAX_BYTES / 1024} KB; secrets are redacted, but never include any)`;
+
+/**
+ * Routine context resets (task-45, src/runtime/context-reset.ts): when and how the coordinator writes the
+ * handoff and restarts itself. The runtime evaluates the triggers; the coordinator acts on `contextReset`.
+ */
+function contextResetGuidance(cfg: MinionsConfig): string {
+  const s = contextResetSettings(cfg);
+  const handoff = [
+    `Write the handoff first: ${HANDOFF_WRITE}, short, under these headings: **Open owner questions** (each with your recommended answer and where you asked it), **Pending decisions**, **Waiting on** (approvals, CI, the owner), **Spend** (the tally from \`minions status --json\`), **Chat context** (anything the owner said that the backlog, notes and outbox do not hold). It replaces the previous handoff.`,
+    `Then restart detached (the restart ends this session): ${RESET_RESTART}. The new session reads the handoff and resumes the queue; backlog, leases, results, the outbox, the spend tally and the Telegram pairing are durable and survive.`,
+  ].join(' ');
+  if (!s.enabled) {
+    return `- Context resets are off (\`coordinator.contextReset.enabled\`). Only if the owner asks for one: when the queue is idle (no active leases: \`minions status --json\`), tell the owner, then reset. ${handoff} Never restart with active leases or while waiting on the owner mid-question.`;
+  }
+  const triggers = [
+    s.afterDelivery ? 'a task was delivered in this session' : null,
+    s.contextTokens !== null ? `this session's context reached ${Math.round(s.contextTokens / 1000)}k tokens` : null,
+    s.handoffs !== null ? `${s.handoffs} worker hand-offs happened in this session` : null,
+  ].filter(Boolean);
+  return [
+    `- Context resets (on, \`coordinator.contextReset\`): keep this session small by restarting it routinely with a fresh context. The runtime decides when: a \`minions work record|release\` response carries \`contextReset\` (\`due: true\`, with steps) only when no worker lease is active, no drain runs, and ${triggers.length ? triggers.join(', or ') : 'a trigger holds (all triggers are off)'}. \`minions coordinator handoff --check --json\` shows the same check. When it is due, reset before dispatching more work, without asking or announcing it:`,
+    `  finish the current owner exchange (never restart mid-answer; an unanswered owner question goes into the handoff), send pending notifications, record your own session tokens if you know them (\`minions work spend --session --tokens <n> --json\`). ${handoff}`,
+    '  Never restart while a worker lease is active (the restart refuses; never use --force for a reset) or during a drain.',
+  ].join('\n');
+}
+
 /** Orchestrate step 1 item: send pending notifications while the coordinator is awake anyway (Telegram only). */
 function outboxCheck(cfg: MinionsConfig): string {
   if (cfg.communication.channel === 'terminal') return '';
@@ -331,6 +360,10 @@ function baseVars(cfg: MinionsConfig): Record<string, string> {
   return {
     telegramGuidance: telegramGuidance(cfg),
     outboxCheck: outboxCheck(cfg),
+    contextResetGuidance: contextResetGuidance(cfg),
+    contextResetRule: contextResetSettings(cfg).enabled
+      ? 'If the response carries `contextReset` (`due: true`), do the context reset now (Limits in your coordinator instructions: handoff, then restart) instead of dispatching more work; the new session resumes the queue.'
+      : 'Context resets are off for this project; reset only when the owner asks (Limits in your coordinator instructions).',
     reportingGuidance: reportingGuidance(cfg),
     decisionGuidance: decisionGuidance(),
     ownerDefaults: ownerDefaults(cfg),

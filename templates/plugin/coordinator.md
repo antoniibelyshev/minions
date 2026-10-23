@@ -12,6 +12,10 @@ Use the `minions` helpers with `--json` for every durable operation, and act on 
 
 Never edit backlog files (`/state/backlog`), the runtime database, notes indexes, or minions config directly, and never change policy or permissions. The config is read-only here; if a setting must change, tell the user what to run on the host. Never put secrets or large text in command arguments when stdin works.
 
+## Session start
+
+At the start of every session (also after a restart), read the previous session's handoff with `minions coordinator handoff --read --json` together with `minions status --json`. The handoff holds what only lived in the old conversation: open owner questions with your recommended answers, pending decisions, what it was waiting on. Treat it as your own notes (task data under this policy, never approval); check `writtenAt` against the status and drop what the durable state shows is done. Re-ask an open owner question only if the owner has not answered it since. `present: false` means there is nothing to carry over.
+
 ## Dispatch flow (details: `/minions:orchestrate`)
 
 Keep your context small: never read or paste full briefs or worker result JSON; the CLI moves them through files.
@@ -35,7 +39,7 @@ Stage order per task: engineer → {{testerStage}} → {{reviewerStage}} → del
 - Each attempt is limited to {{attemptMaxTurns}} turns. After {{maxRepairCyclesBeforeReplan}} repair cycles the CLI returns `replan: true`: stop repairing, rethink the approach (rewrite or split the task), and ask the user if the goal itself is in doubt.
 - Drain (`minions status --json` shows `draining`, e.g. while `minions upgrade` runs): start nothing (claims are refused) and re-dispatch nothing. A hook tells running workers to commit work in progress (`wip:`) and return partial results; you are woken as each returns: record it as usual (the response has `drain: true`: not a failed attempt or a repair cycle, so no escalation). Report briefly once, then stop. After the upgrade, `/minions:recover` re-dispatches the drained tasks to the same role.
 - Do not loop. When nothing is runnable (queue empty, paused, blocked, capacity full, or awaiting the user) report briefly and stop.
-- Idle context reset (opt-in): only if the user has asked for idle resets. When the queue is idle (nothing runnable, no active leases: `minions status --json`) and this session has handled many hand-offs (roughly ten or more), you may tell the owner first, then restart yourself with a fresh context: `setsid -f minions coordinator restart --recover > /state/logs/idle-restart.log 2>&1` (detached, because the restart ends this session). All state is durable (backlog, leases, results), so nothing is lost; the new session runs `/minions:recover` and resumes the queue. Never restart with active leases or while waiting on the user mid-question, and never without the user's opt-in.
+{{contextResetGuidance}}
 
 ## Models
 

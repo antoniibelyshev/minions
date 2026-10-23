@@ -282,7 +282,7 @@ describe('CLI wiring', () => {
     register(program);
     const coord = program.commands.find((c) => c.name() === 'coordinator')!;
     const flags = (name: string) => coord.commands.find((c) => c.name() === name)!.options.map((o) => o.long);
-    expect(flags('restart').sort()).toEqual(['--force', '--recover']);
+    expect(flags('restart').sort()).toEqual(['--detach', '--force', '--recover']);
     expect(flags('run')).toEqual(['--recover']);
     expect(flags('sync').sort()).toEqual(['--force', '--start-detached']);
   });
