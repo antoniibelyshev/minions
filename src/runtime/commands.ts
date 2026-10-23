@@ -26,7 +26,7 @@ import {
 } from './coordinator.js';
 import { openDb, type DrainNotice, type DrainRequest, type Lease, type LeaseRole, type PauseChange, type RuntimeDb } from './db.js';
 import { clearDrain, requestDrain } from './drain.js';
-import { claimWithBrief, compactClaim, fetchBrief, recordSubmitted, submitResult, sweepScratchOnStart, type CompactClaim } from './handoff.js';
+import { claimWithBrief, compactClaim, fetchBrief, recordSubmitted, requireWorkerRole, submitResult, sweepScratchOnStart, type CompactClaim } from './handoff.js';
 import { runHook } from './hooks.js';
 import { budgetNotice, humanSpend, parseTokens, recordLeaseUsage, recordSessionUsage, setBudget, spendReport, type SpendReport } from './spend.js';
 import { runtimePaths } from './paths.js';
@@ -336,30 +336,36 @@ export function register(program: Command): void {
   // work
   const work = program.command('work').description('Claim, record and release worker leases (container only)');
   work.command('claim <taskId>').description('Claim a task for a worker role; returns the task brief (stored for `work brief`)')
-    .requiredOption('--role <role>', 'engineer | tester | reviewer')
+    .requiredOption('--role <role>', 'a registered worker role: engineer | tester | reviewer | a project role')
     .option('--holder <holder>', 'who holds the lease (default: this process)')
     .option('--compact', 'print only leaseId, briefMarker, task, role, attempt, branch, worktree, expectedHead (the worker fetches the full brief)')
     .action(action(async (taskId: string, o: { role: string; holder?: string; compact?: boolean }, cmd: Command) => {
       requireMode('runtime');
-      if (!(LEASE_ROLES as readonly string[]).includes(o.role)) throw new MinionsError('PRECONDITION', `--role must be engineer, tester or reviewer (got ${o.role}).`);
-      const brief = await claimWithBrief(await scheduler(), runtimePaths(), taskId, o.role as LeaseRole, { holder: o.holder });
+      const def = requireWorkerRole(await getConfig(), o.role);
+      // Project-role stages need the workflow stage machine (task-33.3/33.4); until then only built-ins are claimable.
+      if (!(LEASE_ROLES as readonly string[]).includes(def.name)) {
+        throw new MinionsError('PRECONDITION', `Role ${def.name} is a project role; claiming its stages needs workflow support, which this version does not have yet.`, 'Claim a built-in role (engineer, tester, reviewer).');
+      }
+      const brief = await claimWithBrief(await scheduler(), runtimePaths(), taskId, def.name as LeaseRole, { holder: o.holder });
       if (o.compact) emit(compactClaim(brief), { json: globalOpts(cmd).json, human: (c: CompactClaim) => `${c.briefMarker}\nworktree: ${c.worktree}\nbranch: ${c.branch} @ ${c.expectedHead}` });
       else emit(brief, { json: globalOpts(cmd).json, human: (b) => `${b.briefMarker}\n${JSON.stringify(b, null, 2)}` });
     }));
   work.command('brief <leaseId>').description('Worker: fetch the full brief of your own lease (run from inside its worktree)')
-    .requiredOption('--role <role>', 'your role: engineer | tester | reviewer')
+    .requiredOption('--role <role>', 'your role (as in your prompt): engineer | tester | reviewer | a project role')
     .action(action(async (leaseId: string, o: { role: string }, cmd: Command) => {
       requireMode('runtime');
-      const b = await fetchBrief(getDb(), runtimePaths(), leaseId, { role: o.role, cwd: process.cwd() });
+      const b = await fetchBrief(getDb(), runtimePaths(), leaseId, { role: o.role, cwd: process.cwd(), config: await getConfig() });
       emit(b, { json: globalOpts(cmd).json, human: (x) => JSON.stringify(x, null, 2) });
     }));
   work.command('submit <leaseId>').description('Worker: submit your WorkerResult JSON (stdin or --result-file) for the coordinator to record')
-    .requiredOption('--role <role>', 'your role: engineer | tester | reviewer')
+    .requiredOption('--role <role>', 'your role (as in your prompt): engineer | tester | reviewer | a project role')
     .option('--result-file <path>', 'read the WorkerResult from a file ("-" = stdin)')
     .action(action(async (leaseId: string, o: { role: string; resultFile?: string }, cmd: Command) => {
       requireMode('runtime');
+      const cfg = await getConfig();
+      requireWorkerRole(cfg, o.role); // before reading the result: an unknown role never gets that far
       const raw = await readInput(o.resultFile);
-      const r = await submitResult(getDb(), runtimePaths(), leaseId, raw, { role: o.role, cwd: process.cwd() });
+      const r = await submitResult(getDb(), runtimePaths(), leaseId, raw, { role: o.role, cwd: process.cwd(), config: cfg });
       emit(r, { json: globalOpts(cmd).json, human: (d) => d.message });
     }));
   work.command('record <leaseId>').description('Record a worker result (submitted file, JSON on stdin, or --result-file)')
@@ -493,7 +499,7 @@ export function register(program: Command): void {
     .action(async () => { await runHook('pre-telegram', hookLoader); exitHook(); });
   // DB only (no config or backlog): it runs on every worker tool call while a drain is requested.
   hook.command('drain').description('PreToolUse(every tool) hook during a drain: leased workers commit work in progress and return partial results')
-    .action(async () => { await runHook('drain', () => ({ db: getDb() })); exitHook(); });
+    .action(async () => { await runHook('drain', async () => ({ db: getDb(), config: await getConfig().catch(() => undefined) })); exitHook(); });
 
   // coordinator
   const coord = program.command('coordinator').description('Launch or attach the coordinator Claude Code session (tmux)')

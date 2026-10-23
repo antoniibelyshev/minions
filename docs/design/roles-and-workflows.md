@@ -306,6 +306,36 @@ Decisions taken while implementing the registry (`src/config/roles.ts`), recorde
 - **Seams.** `Role` is `string`; `LeaseRole`, `work claim|brief|submit --role` and the hook still accept only
   the built-in workers until tasks 33.2 / 33.3 widen them through `isRegisteredRole` / `workerRole`.
 
+## Implementation notes (task-33.2)
+
+- **Prompt files are read on the host, by the generator.** `generatePlugin(cfg, out, { configDir })` reads
+  `roles.<r>.prompt` relative to the project config dir (`.minions/` shared, the project dir private); every
+  host call site (`init`, `refreshDerived`, `checkPlugin`) passes it. The runtime config keeps the path, not the
+  text: nothing in the container reads the file. The real path must stay inside the config dir (a symlink out is
+  refused), at most 64 KB, not empty, and the prompt may not start with `---` (checked for inline text too).
+  Without a config dir a role with a prompt file is an `INVALID_CONFIG` error, never a plugin without the prompt.
+- **Insertion after rendering.** `_role.md` carries a `<!-- minions:project-prompt -->` marker replaced after
+  `renderTemplate`; built-in overrides are appended after the rendered body under `## Project instructions`.
+  So `{{` in a prompt is text. With no overrides the built-in files are byte-identical to before (tested).
+- **Tools.** Agent, `Task` (its old name), SendMessage, any `mcp*` tool and any `*` pattern are always dropped;
+  Edit/Write/NotebookEdit/MultiEdit when `edits` is `none` or the worktree is `review`. A project role without
+  `tools` gets Read, Grep, Glob, Bash (+ Edit, Write when it may edit). `disallowedTools` is Agent, SendMessage
+  (+ the edit tools for read-only roles). Built-in `tools` overrides keep the template's order. Descriptions are
+  rendered as YAML double-quoted scalars (free text from config).
+- **Deep variants.** `<name>-deep` for `deepVariant` roles, effort one level above the role's own (else `high`),
+  same body and the same `--role <name>`.
+- **Hook.** `minions:<x>` first must look like a role name (cheap, no I/O); then the registry of the runtime
+  config decides (`agentTypeRole`: own-property lookups, so `constructor`/`__proto__` are unknown), then an
+  active lease whose role equals the base name. Config or DB failure denies. The drain hook takes the config
+  optionally: with it, unregistered types are not workers and the notice is worded by the role's contract
+  variant and `commits`; without it (unreadable), the lease roles decide and project roles get the verifier
+  wording (covers both "commit wip" and "nothing to commit").
+- **CLI.** `work claim|brief|submit --role` accept exact registered worker names only (`POLICY_DENIED`
+  otherwise; `-deep` is not a role). `claim` of a project role is a `PRECONDITION` error until the stage machine
+  (33.3/33.4) can place it; `LeaseRole` and the scheduler are unchanged. Per-variant contract text and
+  `validateResult` by contract stay in 33.4; custom roles get the shared result-contract partial plus a status
+  guide for their variant.
+
 ## Back-compat summary
 
 Existing configs validate unchanged (`roles`, `workflows`, `maxByRole` optional; `maxEngineers` and
