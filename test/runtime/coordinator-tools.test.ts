@@ -84,3 +84,20 @@ describe('coordinator startup trim: settings', () => {
     expect(s).not.toHaveProperty('disableBundledSkills');
   });
 });
+
+describe('coordinator startup trim: argv and merge with contextReset', () => {
+  it('passes --disallowedTools exactly once, as one shell-safe argument', async () => {
+    const { args } = await buildClaudeCommand(defaults(), paths(), { telegram: true, startupPrompt: 'go' });
+    expect(args.filter((a) => a === '--disallowedTools')).toHaveLength(1);
+    expect(valueOf(args, '--disallowedTools')).toMatch(/^[A-Za-z0-9_]+(,[A-Za-z0-9_]+)*$/);
+  });
+
+  it('a user list is not extended by the default, and a bad entry names the offending key', () => {
+    expect(() => validateConfig(withCoord({ disallowedTools: ['Monitor', 'mcp__plugin_telegram_telegram__reply'] }))).toThrow(/coordinator\.disallowedTools.*must not name a tool the coordinator needs/s);
+  });
+
+  it('the trim keys and coordinator.contextReset validate together', () => {
+    const c = validateConfig(withCoord({ disallowedTools: [], contextReset: { enabled: false }, toolSearch: false })).coordinator;
+    expect(c).toEqual({ disallowedTools: [], contextReset: { enabled: false }, toolSearch: false });
+  });
+});
