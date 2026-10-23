@@ -240,6 +240,23 @@ describe('work next: suggested model and agent type', () => {
     expect((await e.sched.next()).runnable[0]).toMatchObject({ agentType: 'minions:engineer-deep', suggestedModel: 'opus', modelRule: 'repair-after-failure' });
   });
 
+  it('a drained partial is not a failed attempt; an ordinary partial is', async () => {
+    const e = env();
+    e.backlog.add({ id: 'task-1' });
+    e.backlog.add({ id: 'task-2' });
+    const b = await e.sched.claim('task-1', undefined);
+    const d = e.db.setDrain('upgrade');
+    e.db.recordDrainNotice({ id: b.leaseId, task_id: 'task-1' }, { eventId: d.eventId, agentId: 'agent-1', agentType: 'minions:engineer', tool: 'Bash', via: 'only' });
+    const wip = commit(b.worktree, 'a.txt');
+    const r = await e.sched.record(b.leaseId, result({ status: 'partial', branch: b.branch, headSha: wip, modifiedPaths: ['a.txt'] }));
+    expect(r).toMatchObject({ valid: true, drain: true });
+    e.db.clearDrain('test');
+    await stageIn(e, 'task-2', undefined, ['b.txt'], { status: 'partial' });
+    const n = await e.sched.next();
+    expect(n.runnable.find((x) => x.taskId === 'task-1')).toMatchObject({ agentType: 'minions:engineer', modelRule: 'default' });
+    expect(n.runnable.find((x) => x.taskId === 'task-2')).toMatchObject({ agentType: 'minions:engineer-deep', suggestedModel: 'opus', modelRule: 'repair-after-failure' });
+  });
+
   it('selection fixed: always the default model (omit model)', async () => {
     const e = env((c) => { c.models.selection = 'fixed'; });
     e.backlog.add({ id: 'task-1', labels: ['risk:high'] });

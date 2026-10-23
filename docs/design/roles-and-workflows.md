@@ -401,6 +401,42 @@ Decisions taken while implementing the workflow model (`src/config/workflows.ts`
   the status-derived position of 33.3 (pinned by its tests); revisit together with `work next` (33.5).
 - **Reserved names.** `check` and `ci-gate` (runtime evidence kinds) cannot be role names.
 
+## Implementation notes (task-33.5)
+
+- **`work next` is the claim's stage machine, read-only.** `Scheduler.next()` takes each unleased task in a stage
+  status through the same `stagePlan` as `claim`, including the evidence-at-head reset that a changed workflow
+  would make (previewed, not written), so `next` and `claim` cannot disagree. A QA sweep has no plan: a tester from
+  `ready` (`kind: "qa-sweep"`, `position`/`count`/`workflow` null). Order: tasks under way (not `ready`) first,
+  then backlog priority. Capacity (task limit, `execution.maxByRole` / `maxEngineers`) is applied greedily in that
+  order, so the `runnable` entries fit together; the rest goes to `waiting` with `waitingOn` (`starts` for a pause,
+  a drain or the budget; `capacity`; `role-capacity`; `requires` for a stage whose capability is `deny`/`ask`).
+  A task whose status no stage can be claimed from (e.g. `implementing` without a lease) is `stuck`, for
+  `/minions:recover`. Besides the AC fields, entries carry `title`, `status`, `priority`, `kind`, `count`,
+  `agentModel` and `modelRule`.
+- **Claim without `--role`.** The stage machine picks the role; `--role` is still accepted and refused unless it
+  is the current stage's role.
+- **`suggestedModel` details (D12).** `suggestModel()` in `src/config/models.ts`. Tier order haiku < sonnet <
+  opus; `fable` is not ranked, so the risk rule never picks it (it can still be a stage hint, a role model or the
+  default). `risk:high` beats `risk:low`. The risk:low rule (and the all-hinted workflow) applies only to gate and
+  verifier stages; producers keep the default. Without an allowed tiered alias the default stays. `agentModel` is
+  null (omit `model` in the Agent call) when the model is what the agent definition already runs (the role
+  model, else `models.default`) or a full model ID, which the Agent tool rejects. With `models.selection: "fixed"`
+  the model is always `models.default` and `agentModel` null, but the `-deep` variant still applies: it is an
+  effort choice, not a model choice.
+- **Repair after a failed attempt** = the role's last finished attempt on the task was unvalidated or invalid,
+  `blocked`, a `partial` that was not a drain, or a producer `needs_changes`; or a producer repair
+  (`changes-requested`) after at least 2 repair cycles. A drained partial never counts.
+- **Status capacity.** `minions status --json` has `capacity.byRole` (`active`, `max`, `free`, `limited` per
+  worker role); the generated status skill and coordinator.md name the configured per-role limits.
+- **Guidance (D11).** coordinator.md and the orchestrate skill dispatch from `work next` (no role-by-status
+  table), spawn the entry's `agentType` with `agentModel`, and cover assigning a workflow at creation, proposing a
+  role and cheap stages. The proposing-a-role text names no command yet: `config roles propose|apply` comes with
+  task-33.6, which should update that text.
+- **Deferred.** A verifier added by editing the stage list of the *same* workflow is still skipped (the
+  evidence-at-head reset runs only when the workflow name changes; the 33.3 behaviour stays pinned). The stop hook
+  (`src/runtime/hooks.ts`) still checks fixed statuses (ready/testing/reviewing/changes-requested), so it misses a
+  multi-producer task in `implementing` without a lease; a follow-up could use `Scheduler.next()` there.
+
 ## Back-compat summary
 
 Existing configs validate unchanged (`roles`, `workflows`, `maxByRole` optional; `maxEngineers` and
