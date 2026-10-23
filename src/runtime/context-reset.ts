@@ -61,11 +61,26 @@ const HANDOFF_SECRET_PATTERNS: [RegExp, string][] = [
   [/(\/\/[^\s:/@]+:)[^\s@/]{3,}@/g, '$1[REDACTED]@'],
 ];
 
+/**
+ * Any non-empty value after a secret-like key and a `:`/`=` separator on the same line (task-49: the generic
+ * pattern above needs 8+ characters, so `password: hunter2` slipped through). The key may carry prefixes
+ * (`DB_PASSWORD`, `client_secret`, `x-api-key`) and JSON quotes (`"token": "abc"`); quoted values are masked
+ * whole. Plain words without a separator ("the token total") stay. `pwd` is left to the long-value pattern:
+ * `pwd: /tmp` is usually a path.
+ */
+const SECRET_KEY_VALUE = /\b((?:[A-Za-z0-9]+[_-])*(?:password|passwd|passphrase|secret|token|api[_-]?key|apikey|access[_-]?key|private[_-]?key|secret[_-]?key|credentials?)["']?[ \t]*[:=][ \t]*)(?!\[REDACTED)("[^"\n]+"|'[^'\n]+'|[^\s"']+)/gi;
+
+const maskSecretValue = (_m: string, head: string, value: string): string => {
+  const q = value[0] === '"' || value[0] === "'" ? value[0] : '';
+  return `${head}${q}[REDACTED]${q}`;
+};
+
 /** Masks credential-shaped substrings; returns the text and how many were masked. */
 export function redactHandoff(text: string): { text: string; redactions: number } {
   const marks = (s: string) => (s.match(/\[REDACTED/g) ?? []).length;
   let out = redact(text);
   for (const [re, rep] of HANDOFF_SECRET_PATTERNS) out = out.replace(re, rep);
+  out = out.replace(SECRET_KEY_VALUE, maskSecretValue);
   return { text: out, redactions: Math.max(0, marks(out) - marks(text)) };
 }
 

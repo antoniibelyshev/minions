@@ -32,7 +32,7 @@ import { runHook } from './hooks.js';
 import { budgetNotice, humanSpend, parseTokens, recordLeaseUsage, recordSessionUsage, setBudget, spendReport, type SpendReport } from './spend.js';
 import { runtimePaths } from './paths.js';
 import { contextResetCheck, dueNotice, HANDOFF_MAX_BYTES, humanContextReset, readHandoff, writeHandoff, type ContextResetCheck } from './context-reset.js';
-import { capacityOf, Scheduler, type UsageFlag } from './scheduler.js';
+import { capacityOf, Scheduler, type NextReport, type NextStage, type RoleCapacity, type UsageFlag } from './scheduler.js';
 import { gitCredential } from './github.js';
 import { ciStatus, formatCiStatus, formatSync, syncTasks, type SyncReport } from './ci.js';
 import { formatIntake, intakeProvenanceFallback, originRepository, syncIntake, type IntakeSyncReport } from './intake-sync.js';
@@ -41,6 +41,17 @@ import { exportWorkspace, importWorkspace, setupState } from './workspace.js';
 import { cancelWork, formatCancel } from './controls.js';
 import { ack, counts as outboxCounts, enqueue, fail, formatCounts, formatItems, pending, type OutboxCounts } from './outbox.js';
 import { git, workspaceLayout } from './worktree.js';
+
+/** Human output of `minions work next`. */
+export function humanNext(r: NextReport): string {
+  const line = (x: NextStage) => `  ${x.taskId} ${x.role} -> ${x.agentType}${x.agentModel ? ` (model ${x.agentModel})` : ''}: ${x.reason}`;
+  return [
+    r.message,
+    ...r.runnable.map(line),
+    ...(r.waiting.length ? ['waiting:', ...r.waiting.map((w) => `  ${w.taskId} ${w.role}: ${w.why}`)] : []),
+    ...(r.stuck.length ? ['stuck:', ...r.stuck.map((t) => `  ${t.taskId} (${t.status}): ${t.reason}`)] : []),
+  ].join('\n');
+}
 
 // ---------------------------------------------------------------- lazy runtime context
 
@@ -151,7 +162,8 @@ export interface StatusReport {
   deliveryMode: string;
   queue: Record<string, number>;
   activeLeases: Pick<Lease, 'id' | 'task_id' | 'role' | 'attempt' | 'branch' | 'worktree' | 'head_sha' | 'started_at'>[];
-  capacity: { activeTasks: number; maxActiveTasks: number; activeEngineers: number; maxEngineers: number } | null;
+  /** byRole: lease usage per worker role (`limited` = an execution.maxByRole / maxEngineers limit applies). */
+  capacity: { activeTasks: number; maxActiveTasks: number; activeEngineers: number; maxEngineers: number; byRole: Record<string, RoleCapacity> } | null;
   guard: { lastReason: string | null; updatedAt: string | null };
   coordinatorLock: unknown;
   /** communication.channel: configured vs effective (running coordinator's launch decision, else predicted). */
@@ -213,11 +225,18 @@ export async function collectStatus(deps: { db: RuntimeDb; config: MinionsConfig
     const tasks = await (await deps.backlog()).listTasks();
     for (const t of tasks) report.queue[t.status] = (report.queue[t.status] ?? 0) + 1;
     const cap = capacityOf(cfg, leases, tasks);
-    report.capacity = { activeTasks: cap.activeTaskIds.length, maxActiveTasks: cap.maxActiveTasks, activeEngineers: cap.activeEngineers, maxEngineers: cap.maxEngineers };
+    report.capacity = { activeTasks: cap.activeTaskIds.length, maxActiveTasks: cap.maxActiveTasks, activeEngineers: cap.activeEngineers, maxEngineers: cap.maxEngineers, byRole: cap.byRole };
   } catch (e) {
     report.backlogError = (e as Error).message;
   }
   return report;
+}
+
+/** Per-role usage for humanStatus: limited roles as active/max, the others as an active count (bounded by the task limit). */
+function roleCapacityLine(c: NonNullable<StatusReport['capacity']>): string {
+  const roles = c.byRole ? Object.entries(c.byRole) : [];
+  if (!roles.length) return `${c.activeEngineers}/${c.maxEngineers} engineers`;
+  return roles.map(([r, x]) => (x.limited ? `${x.active}/${x.max} ${r}` : `${x.active} ${r}`)).join(', ');
 }
 
 export function humanStatus(s: StatusReport): string {
@@ -228,7 +247,7 @@ export function humanStatus(s: StatusReport): string {
     ...(s.lastDrainNotice ? [`last drain notice: ${s.lastDrainNotice.at} to ${s.lastDrainNotice.agentType} ${s.lastDrainNotice.agentId} (lease ${s.lastDrainNotice.leaseId}, ${s.lastDrainNotice.taskId ?? '-'}, drain event ${s.lastDrainNotice.eventId}, via ${s.lastDrainNotice.via})`] : []),
     ...(s.channel ? [`channel: configured ${s.channel.configured}, effective ${s.channel.effective} (${s.channel.source === 'launch' ? 'running coordinator' : 'predicted'}: ${s.channel.reason})${s.channel.restartRequired ? '; restart required: `minions down && minions start`' : ''}`] : []),
     ...(s.telegramPoller && s.telegramPoller.state !== 'not-applicable' ? [humanPoller(s.telegramPoller)] : []),
-    s.capacity ? `capacity: ${s.capacity.activeTasks}/${s.capacity.maxActiveTasks} tasks, ${s.capacity.activeEngineers}/${s.capacity.maxEngineers} engineers` : 'capacity: unknown',
+    s.capacity ? `capacity: ${s.capacity.activeTasks}/${s.capacity.maxActiveTasks} tasks, ${roleCapacityLine(s.capacity)}` : 'capacity: unknown',
     `queue: ${Object.entries(s.queue).map(([k, v]) => `${k}=${v}`).join(' ') || '(empty)'}`,
     `stop guard: ${s.guard.lastReason ?? '-'}`,
     ...(s.notifications?.pending ? [formatCounts(s.notifications)] : []),
@@ -336,15 +355,20 @@ export function register(program: Command): void {
 
   // work
   const work = program.command('work').description('Claim, record and release worker leases (container only)');
-  work.command('claim <taskId>').description('Claim a task for a worker role; returns the task brief (stored for `work brief`)')
-    .requiredOption('--role <role>', 'a registered worker role: engineer | tester | reviewer | a project role')
+  work.command('next').description('List the stages that can be claimed now (task, role, agent type, workflow position, suggested model, reason), in dispatch order')
+    .action(action(async (_o: unknown, cmd: Command) => {
+      requireMode('runtime');
+      emit(await (await scheduler()).next(), { json: globalOpts(cmd).json, human: humanNext });
+    }));
+  work.command('claim <taskId>').description('Claim the current stage of a task; returns the task brief (stored for `work brief`)')
+    .option('--role <role>', 'expected stage role (engineer | tester | reviewer | a project role); refused unless it is the current stage\'s. Default: the stage machine picks it')
     .option('--holder <holder>', 'who holds the lease (default: this process)')
     .option('--compact', 'print only leaseId, briefMarker, task, role, attempt, branch, worktree, expectedHead (the worker fetches the full brief)')
-    .action(action(async (taskId: string, o: { role: string; holder?: string; compact?: boolean }, cmd: Command) => {
+    .action(action(async (taskId: string, o: { role?: string; holder?: string; compact?: boolean }, cmd: Command) => {
       requireMode('runtime');
-      // Built-ins and project roles alike: the stage machine places the role in the task's workflow (D6).
-      const def = requireWorkerRole(await getConfig(), o.role);
-      const brief = await claimWithBrief(await scheduler(), runtimePaths(), taskId, def.name, { holder: o.holder });
+      // Built-ins and project roles alike: the stage machine places the role in the task's workflow (D6); without --role it picks it.
+      const def = o.role === undefined ? undefined : requireWorkerRole(await getConfig(), o.role);
+      const brief = await claimWithBrief(await scheduler(), runtimePaths(), taskId, def?.name, { holder: o.holder });
       if (o.compact) emit(compactClaim(brief), { json: globalOpts(cmd).json, human: (c: CompactClaim) => `${c.briefMarker}\nworktree: ${c.worktree}\nbranch: ${c.branch} @ ${c.expectedHead}` });
       else emit(brief, { json: globalOpts(cmd).json, human: (b) => `${b.briefMarker}\n${JSON.stringify(b, null, 2)}` });
     }));
@@ -558,7 +582,7 @@ export function register(program: Command): void {
       const d = getDb();
       if (o.detach) {
         const paths = runtimePaths();
-        const s = scheduleDetachedRestart({ activeLeases: () => d.activeLeases(), log: join(paths.logs, 'context-reset.log'), cwd: paths.state }, o);
+        const s = scheduleDetachedRestart({ activeLeases: () => d.activeLeases(), drain: () => d.drain(), log: join(paths.logs, 'context-reset.log'), cwd: paths.state }, o);
         emit(s, { json: globalOpts(cmd).json, human: (x: typeof s) => `coordinator: ${x.action} (${x.reason})` });
         return;
       }

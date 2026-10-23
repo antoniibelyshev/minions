@@ -61,3 +61,15 @@ describe('work claim|brief|submit --role (runtime)', () => {
     expect(brief.error).toMatchObject({ code: 'NOT_FOUND', message: expect.stringMatching(/Lease lease-abc does not exist/) });
   });
 });
+
+describe('work claim without --role, work next (task-33.5)', () => {
+  it('claim without --role is accepted by the CLI and goes to the stage machine (here: the uninitialized backlog)', async () => {
+    const claim = await run('work', 'claim', 'task-1');
+    expect(claim.error).toMatchObject({ code: 'PRECONDITION', message: expect.stringMatching(/Backlog\.md project not initialized/) });
+  });
+
+  it('work next is a work subcommand that reads the backlog', async () => {
+    const next = await run('work', 'next');
+    expect(next.error).toMatchObject({ code: 'PRECONDITION', message: expect.stringMatching(/Backlog\.md project not initialized/) });
+  });
+});
