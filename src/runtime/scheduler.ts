@@ -4,10 +4,10 @@ import type { BacklogAdapter, ScopeFilter, Task, TaskStatus } from '../backlog/t
 import { can, matchesAny } from '../config/capabilities.js';
 import { isGithubDelivery } from '../config/delivery.js';
 import { notReadyReason, sortByPriority } from '../backlog/ready.js';
-import { CURRENT_PHASE, harnessModels, isProcessHarness, phaseAllows, type HarnessId, type PhaseRules } from '../config/harnesses.js';
+import { CURRENT_PHASE, HARNESSES, harnessModels, isHarnessId, isProcessHarness, phaseAllows, type HarnessId, type PhaseRules } from '../config/harnesses.js';
 import { launchFor, type Launch } from '../config/launch.js';
 import { suggestModel, type ModelSuggestion } from '../config/models.js';
-import { baseRoleName, ENGINEER_ROLE, exactWorkerRole, harnessRoleEffort, TESTER_ROLE, roleLimit, workerRole, workerRoleNames, type RoleDef } from '../config/roles.js';
+import { baseRoleName, defaultMovedGates, ENGINEER_ROLE, exactWorkerRole, harnessRoleEffort, TESTER_ROLE, roleLimit, workerRole, workerRoleNames, type RoleDef } from '../config/roles.js';
 import type { MinionsConfig, RoleContract } from '../config/schema.js';
 import {
   claimableStatuses, configuredStages, contractOf, derivePosition, finalGateIndex, nextRunnable, parseStages, positionForRole, repairTarget,
@@ -98,6 +98,9 @@ export interface Capacity {
   byRole: Record<string, RoleCapacity>;
 }
 
+/** The harness a lease was claimed on; null (a lease from before schema 7) or an unknown id = claude. */
+export const leaseHarness = (l: Pick<Lease, 'harness'>): HarnessId => (isHarnessId(l.harness) ? l.harness : 'claude');
+
 /** Labels that opt a task into a per-task tester stage (verification.qaLabels, default ["qa"]). */
 export const qaLabelsOf = (cfg: MinionsConfig): string[] => cfg.verification.qaLabels ?? ['qa'];
 
@@ -160,6 +163,11 @@ export interface NextReport {
   startsBlocked: { code: string; message: string; hint?: string } | null;
   capacity: Capacity;
   message: string;
+  /**
+   * Config notes the coordinator should relay (absent when there are none): gate roles that `harnesses.default`
+   * moved onto a process harness (agent-runtimes D8). Config validation has no warning channel.
+   */
+  warnings?: string[];
 }
 
 /** Why a task needs a tester stage; empty = engineer → reviewer only. `record` = add the QA label to the task. */
@@ -565,7 +573,8 @@ export class Scheduler {
         // A QA sweep has no stage plan: a tester checks the base branch, claimed from ready only.
         if (task.status !== 'ready') { stuck.push({ taskId: task.id, status: task.status, reason: `QA sweep in "${task.status}" without a lease; a sweep is only claimed from ready` }); continue; }
         const def = workerRole(cfg, TESTER_ROLE)!;
-        const m = suggestModel(cfg, { roleModel: def.model, contract: def.contract, labels: task.labels, deepVariant: def.deepVariant, harness: def.harness, repairAfterFailure: this.attemptFailed(task, TESTER_ROLE, def) });
+        const m = this.stageSuggestion(def, { roleModel: def.model, contract: def.contract, labels: task.labels, deepVariant: def.deepVariant, harness: def.harness, repairAfterFailure: this.attemptFailed(task, TESTER_ROLE, def) });
+        if ('stuck' in m) { stuck.push({ taskId: task.id, status: task.status, reason: m.stuck }); continue; }
         candidates.push(this.nextEntry(task, def, m, { kind: 'qa-sweep', position: null, count: null, workflow: null },
           `QA sweep of ${cfg.git.baseBranch}: a tester checks the base branch head`));
         continue;
@@ -585,10 +594,11 @@ export class Scheduler {
       }
       const def = workerRole(cfg, stage.role);
       if (!def) { stuck.push({ taskId: task.id, status: task.status, reason: `stage role ${stage.role} is not registered` }); continue; }
-      const m = suggestModel(cfg, {
+      const m = this.stageSuggestion(def, {
         stageModel: stage.model, roleModel: def.model, contract: def.contract, labels: task.labels, deepVariant: def.deepVariant, harness: def.harness,
         allHinted: configuredStages(plan.stages).every((x) => x.model !== undefined), repairAfterFailure: this.attemptFailed(task, def.name, def),
       });
+      if ('stuck' in m) { stuck.push({ taskId: task.id, status: task.status, reason: m.stuck }); continue; }
       const at = `stage ${plan.position + 1}/${plan.stages.length} (${stage.role}) of workflow ${plan.workflow}`;
       const why = [
         task.status === 'changes-requested' ? `changes-requested: repair (cycle ${this.db.repairCycles(task.id)}) at ${at}` : `${task.status}: ${at}`,
@@ -624,7 +634,7 @@ export class Scheduler {
       const slots = Object.hasOwn(cap.byRole, c.role) ? cap.byRole[c.role]! : undefined;
       const used = roleActive.get(c.role) ?? 0;
       if (slots?.limited && used >= slots.max) { waiting.push({ ...c, waitingOn: 'role-capacity', why: `${c.role} limit (${used}/${slots.max})` }); continue; }
-      const processProducer = this.isProcessProducer(c.role);
+      const processProducer = this.isProcessProducer(c.role, c.harness);
       const producerCap = this.phase.processProducerCap;
       if (processProducer && producerCap !== null && processProducers >= producerCap) {
         waiting.push({ ...c, waitingOn: 'harness-capacity', why: `process-harness producer cap (${processProducers}/${producerCap}, ${this.phase.summary})` }); continue;
@@ -639,7 +649,9 @@ export class Scheduler {
       : startsBlocked ? `Nothing runnable: ${startsBlocked.message}`
         : waiting.length ? `Nothing runnable: ${waiting.length} stage(s) waiting (${[...new Set(waiting.map((w) => w.waitingOn))].join(', ')}).`
           : 'Nothing runnable: no ready task and no task waiting for its next stage.';
-    return { runnable, waiting, stuck, startsBlocked, capacity: cap, message };
+    const warnings = defaultMovedGates(cfg, this.phase).map(({ role, harness }) =>
+      `harnesses.default moves the gate role ${role} onto ${HARNESSES[harness].label} (harness ${harness}); set roles.${role}.harness to claude on the host to keep it on Claude Code, or to ${harness} to make it explicit`);
+    return { runnable, waiting, stuck, startsBlocked, capacity: cap, message, ...(warnings.length ? { warnings } : {}) };
   }
 
   private nextEntry(task: Task, def: RoleDef, m: ModelSuggestion, at: Pick<NextStage, 'kind' | 'position' | 'count' | 'workflow'>, reason: string): NextStage {
@@ -653,14 +665,35 @@ export class Scheduler {
     };
   }
 
-  /** Whether a lease of `role` is a producer on a process harness (counted by the phase cap, agent-runtimes D9). */
-  private isProcessProducer(role: string): boolean {
-    const def = workerRole(this.config, role);
-    return !!def && def.contract === 'producer' && isProcessHarness(def.harness);
+  /**
+   * The model suggestion of one `work next` entry, or why the entry is stuck: a role on a process harness without
+   * its `harnesses.<id>` block (a config that skipped validateConfig) must not fail the whole listing.
+   */
+  private stageSuggestion(def: RoleDef, x: Parameters<typeof suggestModel>[1]): ModelSuggestion | { stuck: string } {
+    if (isProcessHarness(def.harness) && !harnessModels(this.config, def.harness)) {
+      return { stuck: `role ${def.name} runs on harness ${def.harness}, which has no harnesses.${def.harness} block (add it with its models on the host, or set roles.${def.name}.harness to claude)` };
+    }
+    try { return suggestModel(this.config, x); } catch (e) {
+      if (e instanceof MinionsError) return { stuck: `role ${def.name}: ${e.message}` };
+      throw e;
+    }
   }
 
+  /**
+   * Whether a stage of `role` on `harness` is a producer on a process harness (counted by the phase cap,
+   * agent-runtimes D9). A role no longer in the config counts as a producer: the cap errs on the safe side.
+   */
+  private isProcessProducer(role: string, harness: HarnessId): boolean {
+    if (!isProcessHarness(harness)) return false;
+    return (workerRole(this.config, role)?.contract ?? 'producer') === 'producer';
+  }
+
+  /**
+   * Active process-harness producer leases, by the harness each lease recorded at claim: a later config change does
+   * not move a running lease in or out of the cap. Leases from before schema 7 have none and count as claude.
+   */
   private processProducerLeases(leases: Lease[]): number {
-    return leases.filter((l) => this.isProcessProducer(l.role)).length;
+    return leases.filter((l) => this.isProcessProducer(l.role, leaseHarness(l))).length;
   }
 
   /**
@@ -777,8 +810,8 @@ export class Scheduler {
       }
       this.assertHarnessAllowed(def, active);
       const n = this.db.get<{ n: number }>('SELECT COUNT(*) AS n FROM leases WHERE task_id = ? AND role = ?', task.id, role)!.n + 1;
-      this.db.exec(`INSERT INTO leases (id, task_id, role, attempt, holder, branch, config_revision, started_at, status)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active')`, leaseId, task.id, role, n, holder, branch, cfg.configRevision, nowIso());
+      this.db.exec(`INSERT INTO leases (id, task_id, role, attempt, holder, branch, config_revision, started_at, status, harness)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)`, leaseId, task.id, role, n, holder, branch, cfg.configRevision, nowIso(), def.harness);
       this.db.addEvent('claim', task.id, { leaseId, role, attempt: n, fromStatus: task.status, holder, ...(sweep ? { kind: 'qa-sweep' } : {}) });
       if (plan) this.db.setTaskStage(task.id, plan.workflow, plan.stages, plan.position);
       return n;

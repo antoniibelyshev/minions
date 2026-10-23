@@ -5,7 +5,7 @@ import type { IdempotencyStore } from '../backlog/types.js';
 import { MinionsError } from '../core/errors.js';
 import { runtimePaths } from './paths.js';
 
-export const SCHEMA_VERSION = 6;
+export const SCHEMA_VERSION = 7;
 
 /** The built-in worker roles (always registered). */
 export type BuiltinLeaseRole = 'engineer' | 'tester' | 'reviewer';
@@ -22,6 +22,8 @@ export interface Lease {
   worktree: string | null; branch: string | null; base_sha: string | null; head_sha: string | null;
   config_revision: number; started_at: string; ended_at: string | null; status: LeaseStatus;
   result_json: string | null; result_valid: number | null;
+  /** Agent runtime the lease was claimed on (agent-runtimes D9 cap); null = a lease from before schema 7, i.e. claude. */
+  harness: string | null;
 }
 
 export interface EvidenceRow {
@@ -117,6 +119,11 @@ const MIGRATIONS: Record<number, string> = {
       id TEXT PRIMARY KEY, name TEXT NOT NULL, json TEXT NOT NULL, created_at TEXT NOT NULL,
       state TEXT NOT NULL, updated_at TEXT NOT NULL, applied_revision INTEGER);
     CREATE INDEX IF NOT EXISTS role_proposals_name ON role_proposals(name, state);
+  `,
+  // The harness a lease was claimed on (docs/design/agent-runtimes.md D9): the phase 1 process-producer cap counts
+  // leases by it, not by the current config. Older rows stay NULL and count as claude.
+  7: `
+    ALTER TABLE leases ADD COLUMN harness TEXT;
   `,
 };
 

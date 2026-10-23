@@ -36,7 +36,7 @@ describe('runtime db migration 3 -> 4 (notification outbox)', () => {
     const path = dbPath();
     // A genuine v3 database: this build's schema with the outbox rolled back, plus existing rows.
     const v3 = new RuntimeDb(path);
-    v3.sql.exec('DROP INDEX outbox_pending; DROP TABLE outbox');
+    v3.sql.exec('DROP INDEX outbox_pending; DROP TABLE outbox; ALTER TABLE leases DROP COLUMN harness');
     v3.sql.prepare("INSERT INTO leases (id, task_id, role, attempt, config_revision, started_at, status) VALUES ('lease-x','task-1','engineer',1,1,'2026-01-01T00:00:00Z','completed')").run();
     v3.sql.prepare("INSERT INTO approvals (task_id, scope, head_sha, approved_by, note, recorded_at, signature) VALUES ('task-1','publish',?,'owner',NULL,'2026-01-01T00:00:00Z','sig')").run('a'.repeat(40));
     v3.addEvent('note', 'task-1', { before: 'upgrade' });

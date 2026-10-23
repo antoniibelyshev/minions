@@ -53,6 +53,7 @@ export function humanNext(r: NextReport): string {
     ...r.runnable.map(line),
     ...(r.waiting.length ? ['waiting:', ...r.waiting.map((w) => `  ${w.taskId} ${w.role}: ${w.why}`)] : []),
     ...(r.stuck.length ? ['stuck:', ...r.stuck.map((t) => `  ${t.taskId} (${t.status}): ${t.reason}`)] : []),
+    ...(r.warnings ?? []).map((w) => `warning: ${w}`),
   ].join('\n');
 }
 

@@ -10,12 +10,12 @@ import { tmp } from './fixtures.js';
 const paths = (root: string) => runtimePaths({ MINIONS_STATE_DIR: join(root, 'state'), MINIONS_SECRETS_DIR: join(root, 'secrets'), MINIONS_WORKSPACE: join(root, 'ws') } as NodeJS.ProcessEnv, { inContainer: false });
 
 describe('runtime DB upgrade from an older schema', () => {
-  it('migrates a schema_version 3 DB (no outbox/task_stages/role_proposals) and keeps its data', () => {
+  it('migrates a schema_version 3 DB (no outbox/task_stages/role_proposals/leases.harness) and keeps its data', () => {
     const p = paths(tmp('minions-open-upgrade-'));
     openDb(p.db).close();
     const raw = new DatabaseSync(p.db);
     raw.exec("INSERT INTO events (kind, task_id, data_json, at) VALUES ('keep', NULL, NULL, 'now')");
-    raw.exec('DROP TABLE outbox; DROP TABLE task_stages; DROP INDEX role_proposals_name; DROP TABLE role_proposals');
+    raw.exec('DROP TABLE outbox; DROP TABLE task_stages; DROP INDEX role_proposals_name; DROP TABLE role_proposals; ALTER TABLE leases DROP COLUMN harness');
     raw.exec("UPDATE meta SET value = '3' WHERE key = 'schema_version'");
     raw.close();
     const db = openDb(p.db);

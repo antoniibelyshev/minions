@@ -57,6 +57,7 @@ describe('migration 6 on a populated v5 database', () => {
     const v5 = new RuntimeDb(path);
     v5.exec('DROP INDEX role_proposals_name');
     v5.exec('DROP TABLE role_proposals');
+    v5.exec('ALTER TABLE leases DROP COLUMN harness');
     v5.setMeta('schema_version', '5');
     v5.exec("INSERT INTO leases (id, task_id, role, attempt, config_revision, started_at, status) VALUES ('lease-a', 'task-1', 'engineer', 1, 3, '2026-10-23T00:00:00Z', 'active')");
     v5.setMeta('qa_marker', 'kept');
