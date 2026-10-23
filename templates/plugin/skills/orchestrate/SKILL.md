@@ -9,6 +9,8 @@ Run this loop until nothing is runnable. Every durable step uses a `minions ... 
 
 ## 1. Check state
 
+{{outboxCheck}}
+
 1. `minions status --json`. If starts are paused, report that and stop. If `draining` is set (an upgrade is winding workers down), start nothing: only record the workers that return (step 5), report briefly and stop.
 2. `minions work list --json` to see active leases. Count active tasks (limit {{maxActiveTasks}}) and engineers (limit {{maxEngineers}}).
 3. `minions backlog ready --compact --json` for runnable tasks (`minions backlog list --compact --json` for the whole queue). Also note tasks in `testing`, `reviewing` or `changes-requested` without an active lease: they need the next stage.

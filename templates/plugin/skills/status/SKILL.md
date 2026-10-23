@@ -5,7 +5,7 @@ description: Concise minions project status - queue, active workers, blockers, d
 
 # Minions status
 
-1. `minions status --json` (controls, counts, config revision).
+1. `minions status --json` (controls, counts, config revision, pending notifications).
 2. `minions work list --json` (active leases: task, role, attempt, started).
 3. If needed, `minions backlog list --json` for tasks in `blocked`, `awaiting-human` or `changes-requested`.
 
