@@ -14,18 +14,18 @@ import { validateConfig } from '../config/resolve.js';
 import { isBuiltinRole, roleRegistry } from '../config/roles.js';
 import type { MinionsConfig } from '../config/schema.js';
 import { action, globalOpts, requireMode, runtimeMode } from '../core/cli-helpers.js';
+import { stripControlChars } from '../core/control-chars.js';
 import { MinionsError } from '../core/errors.js';
 import { atomicWrite, ensureDir, readJson } from '../core/fsutil.js';
 import { emit } from '../core/output.js';
 import { openDb, type Lease, type RuntimeDb } from '../runtime/db.js';
 import { inMinionsContainer, runtimePaths } from '../runtime/paths.js';
 import {
-  checkProposal, formatProposalLine, formatRoleLine, formatShow, formatSummary, isProposalId, markApplied, mergeProposal, proposalPromptPath,
+  checkProposal, formatLoosens, formatProposalLine, formatRoleLine, formatShow, formatSummary, isProposalId, markApplied, mergeProposal, proposalPromptPath,
   proposalView, proposeRole, roleView, showProposal, showRole, workflowsUsing,
   type ProposalSummary, type ShowRole, type ProposalView, type RoleView, type ShowProposal,
 } from '../runtime/role-proposals.js';
 import { editProjectConfig, readProjectConfigRaw } from './config-write.js';
-import { writeGenerated } from './install.js';
 import { loadEffectiveConfig, loadProjectJson, projectConfigPath, type ProjectJson } from './project.js';
 import { projectForPath } from './registry.js';
 import { defaultSettingsRuntime, type SettingsRuntime } from './settings-cli.js';
@@ -160,9 +160,10 @@ export async function applyRoleProposal(project: ProjectJson, id: string, o: { y
     deps.show?.(formatApplyPlan(result));
     await confirmOrRefuse(deps, `Apply role proposal ${id} (${proposal.name}) to ${plan.path}? (y/N)`, `Applying role proposal ${id}`);
   }
-  // The prompt file first: regenerating the plugin (inside editProjectConfig) reads it.
+  // The prompt file first: regenerating the plugin (inside editProjectConfig) reads it. It is owner content
+  // (like the config), so it is not recorded in the install manifest: `minions init` never removes it.
   await ensureDir(dirname(promptFile));
-  if (prompt.change !== 'unchanged') await writeGenerated(project.projectId, promptFile, Buffer.from(newPrompt));
+  if (prompt.change !== 'unchanged') await atomicWrite(promptFile, newPrompt);
   let edit;
   try {
     edit = await editProjectConfig(project, mutate);
@@ -188,20 +189,26 @@ export async function applyRoleProposal(project: ProjectJson, id: string, o: { y
   return result;
 }
 
+/** The plan shown before the question. Control characters are stripped; the prompt body is fenced and every
+ * line is prefixed with `  | `, so proposal text cannot pose as a summary or diff line. */
 export function formatApplyPlan(r: ApplyResult): string {
-  return [
+  const loosens = formatLoosens(r.summary);
+  return stripControlChars([
     formatSummary(r.summary),
     '',
     `config ${r.file} (configRevision ${r.revision}):`,
     ...formatDiff(r.diff),
     '',
-    `prompt ${r.promptFile} (${r.prompt.change}):`,
-    ...r.prompt.lines.map((l) => `  ${l}`),
-  ].join('\n');
+    `prompt ${r.promptFile} (${r.prompt.change}), between the fence lines:`,
+    '  ,---- prompt',
+    ...r.prompt.lines.map((l) => `  | ${l}`),
+    "  '---- end of prompt",
+    ...(loosens ? ['', loosens.trim()] : []),
+  ].join('\n'));
 }
 
 export function formatApply(r: ApplyResult): string {
-  return [
+  return stripControlChars([
     ...(r.dryRun ? [formatApplyPlan(r), '', 'dry run: nothing written'] : [
       `applied role proposal ${r.proposalId} (${r.name}): ${r.file} (configRevision ${r.revision}), prompt ${r.promptFile}`,
       'Derived files regenerated (runtime config, plugin).',
@@ -209,7 +216,7 @@ export function formatApply(r: ApplyResult): string {
     ]),
     ...r.warnings.map((w) => `warning: ${w}`),
     ...r.nextSteps.map((s) => `next: ${s}`),
-  ].join('\n');
+  ].join('\n'));
 }
 
 // ---------------------------------------------------------------- remove
@@ -254,7 +261,7 @@ export async function removeRole(project: ProjectJson, name: string, o: { yes?: 
   const result: RemoveResult = { name, file: plan.path, revision: plan.revision, dryRun: !!o.dryRun, written: false, diff, restartRequired: true, restart: ROLES_RESTART, warnings: [], nextSteps: [] };
   if (o.dryRun) return result;
   if (!o.yes) {
-    deps.show?.([`config ${plan.path}:`, ...formatDiff(diff)].join('\n'));
+    deps.show?.(stripControlChars([`config ${plan.path}:`, ...formatDiff(diff)].join('\n')));
     await confirmOrRefuse(deps, `Remove role ${name} from ${plan.path}? (y/N)`, `Removing role ${name}`);
   }
   const edit = await editProjectConfig(project, mutate);
@@ -269,11 +276,11 @@ export async function removeRole(project: ProjectJson, name: string, o: { yes?: 
 }
 
 export function formatRemove(r: RemoveResult): string {
-  return [
+  return stripControlChars([
     ...(r.dryRun ? [`config ${r.file}:`, ...formatDiff(r.diff), '', 'dry run: nothing written'] : [`removed role ${r.name} from ${r.file} (configRevision ${r.revision})`, 'Derived files regenerated (runtime config, plugin).']),
     ...r.warnings.map((w) => `warning: ${w}`),
     ...r.nextSteps.map((s) => `next: ${s}`),
-  ].join('\n');
+  ].join('\n'));
 }
 
 // ---------------------------------------------------------------- list / show
@@ -283,11 +290,11 @@ export interface RolesList { roles: RoleView[]; proposals: ProposalView[] | null
 const listRoles = (cfg: MinionsConfig): RoleView[] => roleRegistry(cfg).map((d) => roleView(cfg, d));
 
 function formatList(d: RolesList): string {
-  return [
+  return stripControlChars([
     'roles:', ...d.roles.map((r) => `  ${formatRoleLine(r)}`),
     d.proposals === null ? `proposals: ${d.note ?? 'unavailable'}` : d.proposals.length ? 'proposals:' : 'proposals: none',
     ...(d.proposals ?? []).map((p) => `  ${formatProposalLine(p)}`),
-  ].join('\n');
+  ].join('\n'));
 }
 
 // ---------------------------------------------------------------- register
@@ -357,7 +364,7 @@ export function registerRoles(config: Command, io: RolesCliIO): Command {
     .action(action(async (o: { file: string }, cmd: Command) => {
       requireMode('runtime');
       const r = await withRuntime((ctx) => proposeRole(ctx, o.file));
-      emit(r, { json: globalOpts(cmd).json, human: (d: typeof r) => [`proposal ${d.proposalId} stored (pending; not effective)`, formatSummary(d.summary), ...(d.superseded.length ? [`supersedes ${d.superseded.join(', ')}`] : []), `owner applies it on the host: ${d.applyCommand}`].join('\n') });
+      emit(r, { json: globalOpts(cmd).json, human: (d: typeof r) => stripControlChars([`proposal ${d.proposalId} stored (pending; not effective)`, formatSummary(d.summary), ...(d.superseded.length ? [`supersedes ${d.superseded.join(', ')}`] : []), `owner applies it on the host: ${d.applyCommand}`].join('\n')) });
     }));
 
   roles.command('apply <proposalId>')
@@ -383,7 +390,7 @@ export function registerRoles(config: Command, io: RolesCliIO): Command {
     }));
 
   roles.command('mark-applied <proposalId>', { hidden: true })
-    .description('Runtime only, called by the host\'s `config roles apply`: mark a proposal applied (only when its role is in the runtime config)')
+    .description('Runtime only, called by the host\'s `config roles apply`: mark a proposal applied (only when the runtime config has its role and workflows as proposed)')
     .option('--revision <n>', 'the configRevision the host wrote')
     .action(action(async (id: string, o: { revision?: string }, cmd: Command) => {
       requireMode('runtime');

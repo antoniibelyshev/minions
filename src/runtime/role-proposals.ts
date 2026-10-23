@@ -11,11 +11,12 @@
 import { randomBytes } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { z } from 'zod';
-import { can } from '../config/capabilities.js';
+import { can, strictness } from '../config/capabilities.js';
 import { validateConfig } from '../config/resolve.js';
 import { isBuiltinWorkerRole, roleNameProblem, workerRole, type RoleDef } from '../config/roles.js';
 import { CAPABILITIES, type Capability, type Effect, type MinionsConfig } from '../config/schema.js';
 import { normalizeStage } from '../config/workflows.js';
+import { stripControlChars } from '../core/control-chars.js';
 import { MinionsError, invalidConfig, zodIssues } from '../core/errors.js';
 import { resolveRolePrompt, roleTools } from '../plugin/generate.js';
 import type { RoleProposalRow, RuntimeDb } from './db.js';
@@ -38,6 +39,26 @@ export type RoleProposal = z.infer<typeof RoleProposalSchema>;
 /** Where `apply` writes the prompt, relative to the config dir (`.minions/` shared, the project dir private). */
 export const proposalPromptPath = (name: string) => `agents/${name}.md`;
 
+// Proposal text reaches the owner's terminal in the apply plan, so it must not carry terminal controls: no
+// C0/C1 control character (ESC, CSI, CR, ...) anywhere, and no newline either except in the prompt body.
+// eslint-disable-next-line no-control-regex
+const SINGLE_LINE_CONTROL = /[\x00-\x1f\x7f-\x9f]/;
+// eslint-disable-next-line no-control-regex
+const MULTI_LINE_CONTROL = /[\x00-\x08\x0b-\x1f\x7f-\x9f]/;
+
+/** Paths of strings in `v` (recursively) that contain a control character. */
+function controlCharPaths(v: unknown, path: string, out: string[] = []): string[] {
+  if (typeof v === 'string') { if (SINGLE_LINE_CONTROL.test(v)) out.push(path); }
+  else if (Array.isArray(v)) v.forEach((x, i) => controlCharPaths(x, `${path}[${i}]`, out));
+  else if (v && typeof v === 'object') {
+    for (const [k, x] of Object.entries(v)) {
+      if (SINGLE_LINE_CONTROL.test(k)) out.push(`${path} (a key)`);
+      controlCharPaths(x, `${path}.${k}`, out);
+    }
+  }
+  return out;
+}
+
 /** Parses a proposal object (shape and name only; `checkProposal` validates it against a config). */
 export function parseProposal(raw: unknown, source = 'role proposal'): RoleProposal {
   const r = RoleProposalSchema.safeParse(raw);
@@ -48,6 +69,15 @@ export function parseProposal(raw: unknown, source = 'role proposal'): RolePropo
   if (isBuiltinWorkerRole(p.name)) {
     throw invalidConfig([{ path: 'name', message: `"${p.name}" is a built-in role; proposals add or change project roles only` }], source,
       'Customize a built-in (prompt append, model, effort, tools) by editing roles.<name> in the project config on the host (D9).');
+  }
+  const bad = [
+    ...controlCharPaths(p.name, 'name'), ...controlCharPaths(p.reason, 'reason'),
+    ...controlCharPaths(p.role, 'role'), ...controlCharPaths(p.workflows, 'workflows'),
+    ...(MULTI_LINE_CONTROL.test(p.promptText) ? ['promptText'] : []),
+  ];
+  if (bad.length) {
+    throw invalidConfig(bad.map((path) => ({ path, message: path === 'promptText' ? 'contains a control character (only newline and tab are allowed)' : 'contains a control character or line break' })), source,
+      'Proposal text is shown to the owner on the terminal: use plain single-line text (the prompt body may use newlines and tabs).');
   }
   for (const k of ['prompt', 'promptText', 'promptAppend']) {
     if (Object.hasOwn(p.role, k)) throw invalidConfig([{ path: `role.${k}`, message: 'the prompt goes into the top-level promptText (apply writes it to the role\'s prompt file)' }], source);
@@ -81,6 +111,8 @@ export interface ProposalSummary {
   requires: Capability[];
   /** The role's effective policy column: capabilities that are not `allow`. */
   policy: { deny: Capability[]; ask: Capability[] };
+  /** Capabilities the role gets with a looser effect than the active profile's (e.g. pr.merge ask -> allow). */
+  loosens: { capability: Capability; profile: Effect; proposed: Effect }[];
   workflows: { name: string; stages: string[]; change: 'add' | 'change' }[];
   promptBytes: number;
 }
@@ -95,9 +127,12 @@ export async function checkProposal(cfg: MinionsConfig, raw: unknown, source?: s
   const prompt = await resolveRolePrompt({ name: p.name, promptText: p.promptText });
   const def = workerRole(candidate, p.name)!;
   const policy: { deny: Capability[]; ask: Capability[] } = { deny: [], ask: [] };
+  const loosens: ProposalSummary['loosens'] = [];
   for (const c of CAPABILITIES) {
     const e: Effect = can(candidate, c, { role: p.name });
     if (e !== 'allow') policy[e].push(c);
+    const profile = can(cfg, c); // the active profile's (and project override's) base effect
+    if (strictness(e) < strictness(profile)) loosens.push({ capability: c, profile, proposed: e });
   }
   const existingWf = cfg.workflows ?? {};
   const summary: ProposalSummary = {
@@ -105,7 +140,7 @@ export async function checkProposal(cfg: MinionsConfig, raw: unknown, source?: s
     change: Object.hasOwn(cfg.roles ?? {}, p.name) ? 'change' : 'add',
     description: def.description, contract: def.contract, worktree: def.worktree, stageStatus: def.stageStatus,
     edits: def.edits, commits: def.commits, tools: roleTools(def), model: def.model ?? null, effort: def.effort ?? null,
-    maxTurns: def.maxTurns, deepVariant: def.deepVariant, requires: def.requires, policy,
+    maxTurns: def.maxTurns, deepVariant: def.deepVariant, requires: def.requires, policy, loosens,
     workflows: Object.keys(p.workflows ?? {}).map((name) => ({
       name, stages: (candidate.workflows?.[name] ?? []).map((s) => normalizeStage(s).role),
       change: Object.hasOwn(existingWf, name) ? 'change' as const : 'add' as const,
@@ -117,10 +152,18 @@ export async function checkProposal(cfg: MinionsConfig, raw: unknown, source?: s
 
 const editScope = (e: RoleDef['edits']) => (typeof e === 'string' ? e : e.paths.join(', '));
 
-/** Human summary of a proposal (fields, tools, edit scope, policy row, workflows). */
+/** The prominent loosening line: capabilities the role gets looser than the active profile (null when none). */
+export function formatLoosens(s: Pick<ProposalSummary, 'loosens'>): string | null {
+  const l = s.loosens ?? [];
+  return l.length ? `  LOOSENS: ${l.map((x) => `${x.capability} ${x.profile} -> ${x.proposed}`).join(', ')} (looser than the active profile)` : null;
+}
+
+/** Human summary of a proposal (fields, tools, edit scope, policy row, loosening, workflows); control characters stripped. */
 export function formatSummary(s: ProposalSummary): string {
-  return [
+  const loosens = formatLoosens(s);
+  return stripControlChars([
     `role ${s.name} (${s.change === 'add' ? 'new' : 'changed'}): ${s.description}`,
+    ...(loosens ? [loosens] : []),
     `  contract ${s.contract}, worktree ${s.worktree}, stage status ${s.stageStatus}, max turns ${s.maxTurns}${s.model ? `, model ${s.model}` : ''}${s.effort ? `, effort ${s.effort}` : ''}${s.deepVariant ? ', deep variant' : ''}`,
     `  edits: ${editScope(s.edits)}; commits: ${s.commits ? 'yes' : 'no'}`,
     `  tools: ${s.tools.join(', ')}`,
@@ -128,7 +171,7 @@ export function formatSummary(s: ProposalSummary): string {
     `  policy: deny ${s.policy.deny.join(', ') || 'none'}; ask ${s.policy.ask.join(', ') || 'none'}; everything else allow`,
     ...s.workflows.map((w) => `  workflow ${w.name} (${w.change === 'add' ? 'new' : 'changed'}): ${w.stages.join(' -> ')}`),
     `  prompt: ${s.promptBytes} bytes`,
-  ].join('\n');
+  ].join('\n'));
 }
 
 // ---------------------------------------------------------------- runtime operations
@@ -180,15 +223,45 @@ export async function showProposal(deps: { db: RuntimeDb; config: MinionsConfig 
   }
 }
 
+/** JSON with sorted object keys, for comparing config values regardless of key order. */
+const stableJson = (v: unknown): string => JSON.stringify(v, (_k, x: unknown) =>
+  (x && typeof x === 'object' && !Array.isArray(x) ? Object.fromEntries(Object.entries(x).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) : x));
+
+/**
+ * Why the runtime config does not contain proposal `p` (null when it does): the configured role must equal the
+ * proposed role field by field (as validated), its prompt must be the file apply writes (or the same inline
+ * text), and every proposed workflow must be configured as proposed.
+ */
+export function proposalMismatch(cfg: MinionsConfig, p: RoleProposal): string | null {
+  const have = (cfg.roles ?? {})[p.name] as Record<string, unknown> | undefined;
+  if (!have) return `role ${p.name} is not in the runtime configuration`;
+  let want: MinionsConfig;
+  try {
+    want = validateConfig(mergeProposal(structuredClone(cfg) as unknown as Record<string, unknown>, p, { promptText: p.promptText }), 'role proposal');
+  } catch (e) { return `the proposal does not validate against the runtime configuration (${(e as Error).message})`; }
+  const fields = (r: Record<string, unknown>) => { const { prompt: _p, promptText: _t, ...rest } = r; return stableJson(rest); };
+  if (fields(have) !== fields((want.roles ?? {})[p.name] as Record<string, unknown>)) return `the configured role ${p.name} differs from the proposal`;
+  const promptOk = have.prompt !== undefined ? have.prompt === proposalPromptPath(p.name) : have.promptText === p.promptText;
+  if (!promptOk) return `the configured prompt of ${p.name} is not the proposal's (${proposalPromptPath(p.name)})`;
+  for (const w of Object.keys(p.workflows ?? {})) {
+    if (stableJson(cfg.workflows?.[w] ?? null) !== stableJson(want.workflows?.[w] ?? null)) return `workflow ${w} differs from the proposal`;
+  }
+  return null;
+}
+
 /**
  * Hidden `config roles mark-applied <id>` (runtime; called by the host's apply). Only marks a proposal whose
- * role is in the runtime config the host just regenerated, so it cannot record an apply that did not happen.
+ * content (role fields, prompt file, workflows) is what the runtime config the host just regenerated has, so it
+ * cannot record an apply that did not happen, nor mark a changed (e.g. widened) proposal for an older role.
+ * The prompt file body itself is resolved on the host and is not checked here.
  */
 export function markApplied(deps: { db: RuntimeDb; config: MinionsConfig }, id: string, revision: number | null): ProposalView {
   const row = deps.db.roleProposal(id);
   if (!row) throw new MinionsError('NOT_FOUND', `No role proposal ${id}.`);
-  if (!Object.hasOwn(deps.config.roles ?? {}, row.name)) {
-    throw new MinionsError('PRECONDITION', `Role ${row.name} is not in the runtime configuration; proposal ${id} was not applied.`, 'Apply it on the host: `minions config roles apply <id>`.');
+  let mismatch: string | null;
+  try { mismatch = proposalMismatch(deps.config, parseProposal(JSON.parse(row.json))); } catch (e) { mismatch = `the stored proposal is invalid (${(e as Error).message})`; }
+  if (mismatch) {
+    throw new MinionsError('PRECONDITION', `Proposal ${id} was not applied: ${mismatch}.`, 'Apply it on the host: `minions config roles apply <id>`.');
   }
   if (!deps.db.markRoleProposalApplied(id, revision)) throw new MinionsError('PRECONDITION', `Proposal ${id} is ${row.state}; not marked applied.`);
   return proposalView(deps.db.roleProposal(id)!);
@@ -233,27 +306,27 @@ export function showRole(cfg: MinionsConfig, name: string): ShowRole {
 }
 
 export function formatRoleLine(r: RoleView): string {
-  return `${r.name}${r.builtin ? ' (built-in)' : ''}  ${r.contract}  edits ${editScope(r.edits)}${r.workflows.length ? `  workflows ${r.workflows.join(', ')}` : ''}  - ${r.description}`;
+  return stripControlChars(`${r.name}${r.builtin ? ' (built-in)' : ''}  ${r.contract}  edits ${editScope(r.edits)}${r.workflows.length ? `  workflows ${r.workflows.join(', ')}` : ''}  - ${r.description}`);
 }
 
 export function formatProposalLine(p: ProposalView): string {
-  return `${p.id}  ${p.name}  ${p.state}${p.appliedRevision !== null ? ` (revision ${p.appliedRevision})` : ''}  ${p.createdAt}  - ${p.reason}`;
+  return stripControlChars(`${p.id}  ${p.name}  ${p.state}${p.appliedRevision !== null ? ` (revision ${p.appliedRevision})` : ''}  ${p.createdAt}  - ${p.reason}`);
 }
 
 export function formatShow(d: ShowRole | ShowProposal): string {
   if (d.kind === 'proposal') {
-    return [
+    return stripControlChars([
       formatProposalLine(d.view),
       d.summary ? formatSummary(d.summary) : `no longer valid against the current config: ${d.problem}`,
       ...(d.view.state === 'pending' ? [`apply on the host: minions config roles apply ${d.view.id}`] : []),
-    ].join('\n');
+    ].join('\n'));
   }
-  return [
+  return stripControlChars([
     formatRoleLine(d.role),
     `  worktree ${d.role.worktree}, stage status ${d.role.stageStatus}, commits ${d.role.commits ? 'yes' : 'no'}, max turns ${d.maxTurns}${d.deepVariant ? ', deep variant' : ''}`,
     ...(d.tools ? [`  tools: ${d.tools.join(', ')}`] : []),
     ...(d.requires.length ? [`  requires: ${d.requires.join(', ')}`] : []),
     ...(d.policy ? [`  policy: deny ${d.policy.deny.join(', ') || 'none'}; ask ${d.policy.ask.join(', ') || 'none'}`] : []),
     ...(d.prompt ? [`  prompt: ${d.prompt}`] : []),
-  ].join('\n');
+  ].join('\n'));
 }

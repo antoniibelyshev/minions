@@ -459,11 +459,24 @@ Decisions taken while implementing the workflow model (`src/config/workflows.ts`
   runtime with captured output (the settings runtime seam, `SettingsRuntime`), not the inherited-stdio delegate. A
   runtime that is not running is a `PRECONDITION` for `apply` and `remove`; the host `list` then shows roles only.
 - **Marking applied.** After the write, the host runs the hidden runtime command `config roles mark-applied <id>
-  --revision <n>`; the runtime marks only a proposal whose role is in the (regenerated) runtime config, so it cannot
-  record an apply that did not happen. A failure there is a warning; the role is applied either way.
+  --revision <n>`; the runtime marks only a proposal whose content is in the (regenerated) runtime config: the
+  configured role equals the proposed one field by field (as validated), its prompt is `agents/<name>.md` (or the
+  same inline text), and each proposed workflow is configured as proposed. So it cannot record an apply that did not
+  happen, nor mark a changed (e.g. widened) proposal applied for an older role. The prompt file body is resolved on the
+  host and is not checked by the runtime. A failure there is a warning; the role is applied either way.
+- **Terminal safety.** Proposal text reaches the owner's terminal. `parseProposal` (run at propose and again on host
+  apply) rejects any C0/C1 control character in `name`, `reason`, every string of `role` and `workflows` (newlines
+  included), and in `promptText` everything except newline and tab. All human output (summary, apply plan, list, show)
+  also goes through `stripControlChars`; the apply plan fences the prompt body and prefixes each of its lines with
+  `  | `, so prompt text cannot pose as a summary or diff line.
+- **Loosening is explicit.** The summary lists every capability the role gets with a looser effect than the active
+  profile's base effect (e.g. `pr.merge ask -> allow`) on a `LOOSENS:` line right under the role line, in the
+  propose output and in the host apply plan (repeated as the plan's last line, just before the question).
 - **Write order.** The prompt file is written first (the plugin regeneration inside `editProjectConfig` reads it), then
-  the config; if the config write fails before the revision moved, the prompt file is restored. The prompt file is a
-  manifest-tracked generated file (`writeGenerated`), like the config.
+  the config; if the config write fails before the revision moved, the prompt file is restored. The prompt file is owner
+  content, written with `atomicWrite` and not recorded in the install manifest, so `minions init` never removes it;
+  as defence in depth `planInstall` never plans removal of a prompt file the config references (an entry an earlier
+  apply recorded is dropped from the manifest, the file stays).
 - **Remove.** Refused for built-ins and the coordinator, for roles not in the project layer (e.g. only in
   `config.local.json`), while a configured workflow or another role's `repairTo` names it, while an active lease has the
   role, and when the runtime is not running (the leases cannot be checked; conservative). Other references
