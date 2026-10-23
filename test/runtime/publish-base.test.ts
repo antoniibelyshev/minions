@@ -80,7 +80,24 @@ describe('sensitive-path gate: bases the runtime cannot move', () => {
     const orphan = gitSync(t.repo, 'commit-tree', `${head}^{tree}`, '-m', 'orphan');
     const out = await t.run(head, [orphan]);
     // No merge base: the gate fails closed rather than evaluating a partial diff; nothing is pushed.
-    expect(out).toMatchObject({ state: 'failed', code: 'INTERNAL', message: expect.stringMatching(/no merge base/) });
+    // A state problem, not a transient one (task-40): PRECONDITION and not retryable, never INTERNAL.
+    expect(out).toMatchObject({ state: 'failed', code: 'PRECONDITION', retryable: false, message: expect.stringMatching(/no merge base.*unrelated history/) });
+    expect(t.remoteHead('refs/heads/agent/t')).toBeNull();
+    expect(t.calls.some((a) => a[0] === 'push')).toBe(false);
+  });
+
+  it('an unrelated recorded base is never skipped: even next to a usable base it fails closed (PRECONDITION, not retryable)', async () => {
+    const t = setup();
+    put(t.repo, 'a.txt', 'a');
+    const head = commit(t.repo, 'plain');
+    const orphan = gitSync(t.repo, 'commit-tree', `${head}^{tree}`, '-m', 'orphan');
+    for (const recorded of [[t.claimBase, orphan], [orphan, t.claimBase]]) {
+      expect(await t.run(head, recorded)).toMatchObject({ state: 'failed', code: 'PRECONDITION', retryable: false });
+    }
+    // A local base ref rewritten to unrelated history fails the same way (state, not a transient error).
+    gitSync(t.repo, 'update-ref', 'refs/remotes/host/main', orphan);
+    expect(await t.run(head, [t.claimBase])).toMatchObject({ state: 'failed', code: 'PRECONDITION', retryable: false, message: expect.stringMatching(/refs\/remotes\/host\/main/) });
+    expect(t.calls.some((a) => a[0] === 'push')).toBe(false);
     expect(t.remoteHead('refs/heads/agent/t')).toBeNull();
   });
 

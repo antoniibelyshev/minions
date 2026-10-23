@@ -126,7 +126,10 @@ const FULL_SHA_RE = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
  * Bases for the sensitive-path diff. `trusted`: base SHAs recorded in the runtime DB at claim time
  * and origin's current base (read with ls-remote, i.e. from the server), each only when the commit is
  * present locally. `local`: the workspace's base refs, which in-runtime code can move; they are
- * diffed too (they can only add paths) but never suffice on their own.
+ * diffed too (they can only add paths) but never suffice on their own. "Trusted" is relative: the
+ * recorded SHAs come from the local base ref at each claim and, in the container, ls-remote resolves
+ * through agent-writable git config, so no base is ever used to remove a path (decision task-40 in
+ * docs/design/bootstrap.md, "Where the gate's bases come from").
  */
 async function gateBases(git: GitFn, repo: string, remote: string, base: string, recorded: (string | null)[]): Promise<{ trusted: string[]; local: string[] }> {
   const hasCommit = async (rev: string) => (await git(repo, ['rev-parse', '--verify', '--quiet', `${rev}^{commit}`], true)).code === 0;
@@ -169,6 +172,13 @@ export async function gateChangedPaths(o: { git: GitFn; repo: string; remote: st
   }
   const changed = new Set<string>();
   for (const b of new Set([...bases.trusted, ...bases.local])) {
+    // Unrelated history (no merge base) is a state problem, not a transient one: a retry fails the same
+    // way. Fail closed and non-retryable; the base is never skipped, so no path can drop out (task-40).
+    const mb = await o.git(o.repo, ['merge-base', b, o.head], true);
+    if (mb.code === 1 && !mb.stdout.trim()) {
+      return { ok: false, code: 'PRECONDITION', message: `Cannot evaluate the sensitive-path gate for ${o.branch}: no merge base between ${o.base} (${b}) and ${o.head} (unrelated history). Rebuild the branch on ${o.base} or check whether the base ref was rewritten; a retry fails the same way.` };
+    }
+    if (mb.code !== 0) return { ok: false, code: 'INTERNAL', message: `Cannot find the merge base of ${o.branch} and ${o.base} (${b}): ${lastLines(mb.stderr)}` };
     const d = await o.git(o.repo, ['diff', '--name-only', '--no-renames', '-z', `${b}...${o.head}`], true);
     if (d.code !== 0) return { ok: false, code: 'INTERNAL', message: `Cannot diff ${o.branch} against ${o.base} (${b}): ${lastLines(d.stderr)}` };
     for (const f of d.stdout.split('\0')) if (f) changed.add(f);

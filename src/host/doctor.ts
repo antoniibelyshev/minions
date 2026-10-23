@@ -18,6 +18,7 @@ import { composeHint, daemonHint, linuxDockerChecks, linuxHostFacts, unknownLinu
 import { Compose, buildFingerprint, imageBuildLabel, tmpSizeMiB, type Runner } from './docker.js';
 import { RESTART_COMMAND, checkRestartRequired, notApplicable, restartUnknown, type RestartRequired } from './restart-required.js';
 import { telegramDoctorCheck } from '../telegram/probe.js';
+import { fastPathHint } from '../backlog/taskfile.js';
 import { resolveChannel, type ChannelResolution } from '../telegram/channel.js';
 import { loadEffectiveConfig, loadProjectJson } from './project.js';
 import { checkPlugin, pluginMismatch, type PluginCheck } from './install.js';
@@ -227,7 +228,7 @@ export function mergeReadiness(
 export function requiredChecksReadiness(
   config: Pick<MinionsConfig, 'delivery' | 'verification' | 'git'> | null,
   rc: RequiredChecksReport | null,
-  ctx: { onGitHub: boolean; unknownReason?: string; localWorkflows?: number },
+  ctx: { onGitHub: boolean; unknownReason?: string },
 ): Check {
   const name = 'ci.requiredChecks';
   const noMerge = 'usable for local work and pull-request delivery; automatic merge unavailable';
@@ -240,7 +241,7 @@ export function requiredChecksReadiness(
     return { name, status: 'warn', detail: `unknown: required checks on ${base} could not be read (${why}); delivery.requiredChecksConfigured ${flag}`,
       hint: 'Rerun doctor with the container running and a GitHub token that can read the repository (`minions auth github`).' };
   }
-  const workflows = rc.workflows ?? ctx.localWorkflows ?? null;
+  const workflows = rc.workflows;
   if (rc.state === 'configured') {
     const detail = `required checks on ${base}: ${rc.requiredChecks.join(', ')}; delivery.requiredChecksConfigured ${flag}`;
     return flag
@@ -430,6 +431,21 @@ async function hostRequiredChecks(project: { projectId: string; remoteUrl: strin
   return { rc: await requiredChecksStatus(fetchApi(token, f), `${r.owner}/${r.repo}`, config.git.baseBranch) };
 }
 
+/**
+ * The `backlog.cli` check from `backlog --version` in the container. A release outside the line the
+ * in-process task reader was validated against is a warning, not a failure: listings still work, through
+ * one `backlog task view` per task (task-24.9).
+ */
+export function backlogCliCheck(r: { code: number; stdout: string; stderr: string }): Check {
+  const name = 'backlog.cli';
+  if (r.code !== 0) return { name, status: 'fail', detail: `backlog CLI not usable: ${short(r.stderr || r.stdout)}` };
+  const v = short(r.stdout);
+  const note = fastPathHint(v);
+  return note
+    ? { name, status: 'warn', detail: `backlog.md ${v}: ${note}`, hint: 'Use the backlog.md version the minions image ships (`minions upgrade`), or ignore if listings are fast enough.' }
+    : { name, status: 'ok', detail: `backlog.md ${v}` };
+}
+
 /** The generated plugin (mounted read-only into the container) against what the installed package renders. */
 export function pluginDoctorCheck(c: PluginCheck | Error, hostRuntime = false): Check {
   const refresh = hostRuntime ? '`minions down && minions start`' : '`minions upgrade` (or `minions down && minions start`)';
@@ -575,8 +591,7 @@ export async function runDoctor(opts: {
             r.code === 0 ? undefined : auth.preset === 'jbcentral' ? 'Make sure the Central proxy is running on the host (`minions auth refresh` starts it), then `minions start`.' : 'Check the URL and that the service listens on the host.');
         }
         checks.push(...tmpUsageChecks(await ex(['df', '-Pk', '/tmp', CONTAINER.scratch]), { capMiB: tmpSizeMiB(project.container), scratch: CONTAINER.scratch }));
-        const bl = await ex(['backlog', '--version']);
-        add('backlog.cli', bl.code === 0 ? 'ok' : 'fail', bl.code === 0 ? `backlog.md ${short(bl.stdout)}` : `backlog CLI not usable: ${short(bl.stderr || bl.stdout)}`);
+        checks.push(backlogCliCheck(await ex(['backlog', '--version'])));
         const probe = await ex(['minions', 'coordinator', '--probe', '--json']);
         const perm = probe.code === 0 ? probePermission(probe.stdout) : undefined;
         add('claude.capabilities', probe.code !== 0 ? 'fail' : perm?.fallback ? 'warn' : 'ok', probe.code === 0

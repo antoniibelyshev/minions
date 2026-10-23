@@ -543,18 +543,24 @@ export class RuntimeDb {
   }
   /**
    * Acquires the project coordinator lock; CONFLICT if another live holder has it. Re-entrant for the
-   * same pid+session. A holder that is not `alive` (crashed wrapper, reused pid) is taken over.
+   * same pid+session and process start time. A holder that is not `alive` (crashed wrapper, reused pid)
+   * is taken over. Same pid and session but a different recorded start time (both known) is a reused
+   * pid, i.e. a new holder: it gets a fresh `acquiredAt` and a `coordinator-lock` event, so a restart
+   * watching (pid, acquiredAt) sees the handover (task-40). No live process can share our pid, so no
+   * liveness check is needed for it.
    */
   acquireCoordinatorLock(session: string, pid = process.pid, alive: (pid: number, lock?: CoordinatorLock) => boolean = pidAlive, start?: string | null): CoordinatorLock {
     return this.transaction(() => {
       const cur = this.coordinatorLock();
-      if (cur && !(cur.pid === pid && cur.session === session) && alive(cur.pid, cur)) {
+      const samePid = !!cur && cur.pid === pid && cur.session === session;
+      const reentrant = samePid && !(cur!.start && start && cur!.start !== start);
+      if (cur && !samePid && alive(cur.pid, cur)) {
         throw new MinionsError('CONFLICT', `Another coordinator holds the project lock (pid ${cur.pid}, session ${cur.session}, since ${cur.acquiredAt}).`,
           'Attach to the existing coordinator (minions start) instead of launching a second one.', cur);
       }
-      const lock: CoordinatorLock = { pid, session, acquiredAt: cur && cur.pid === pid && cur.session === session ? cur.acquiredAt : nowIso(), ...(start ? { start } : {}) };
+      const lock: CoordinatorLock = { pid, session, acquiredAt: reentrant ? cur!.acquiredAt : nowIso(), ...(start ? { start } : {}) };
       this.setMeta('coordinator_lock', JSON.stringify(lock));
-      if (!cur || cur.pid !== pid || cur.session !== session) this.addEvent('coordinator-lock', null, { ...lock, replaced: cur ?? null });
+      if (!reentrant) this.addEvent('coordinator-lock', null, { ...lock, replaced: cur ?? null });
       return lock;
     });
   }

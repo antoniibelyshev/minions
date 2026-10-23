@@ -1,8 +1,9 @@
 // CI awareness for GitHub delivery (decision record: docs/design/bootstrap.md, "CI awareness").
 //
-// - Read-only against GitHub: every API call is a GET (`gh api --method GET` in the container, a plain
-//   GET with the stored token on the host). minions never creates workflows, never edits branch
-//   protection or rulesets, and never merges.
+// - Read-only against GitHub: REST GETs (`gh api --method GET` in the container, a plain GET with the
+//   stored token on the host) plus a read-only `gh pr view --json` GraphQL query in sync (sent as a
+//   POST, but a query, never a mutation). minions never creates workflows, never edits branch
+//   protection or rulesets, and never merges (the opt-in auto-merge pass lives in merge.ts).
 // - Required checks: classic branch protection (`GET /repos/{repo}/branches/{base}`, whose
 //   `protection.required_status_checks` is readable with repository read access) plus rulesets
 //   (`GET /repos/{repo}/rules/branches/{base}`, rules of type `required_status_checks`).
@@ -22,12 +23,16 @@ import type { MergeResult } from './merge.js';
 // ---------------------------------------------------------------- read-only API access
 
 export interface ApiResponse { status: number; body: unknown; error?: string }
-/** Read-only GitHub REST GET (path relative to https://api.github.com, e.g. `/repos/o/r`). status 0 = transport failure. */
+/**
+ * Read-only GitHub REST GET (path relative to https://api.github.com, e.g. `/repos/o/r`). status 0 =
+ * transport failure. Only REST reads go through ApiGet; sync's `gh pr view --json` is a separate
+ * read-only GraphQL query.
+ */
 export type ApiGet = (path: string) => Promise<ApiResponse>;
 
 const short = (s: string) => redact(s.trim().split('\n').slice(-2).join(' | ')).slice(0, 300);
 
-/** ApiGet over `gh api` (container: the gh wrapper injects the mounted token). Always `--method GET`. */
+/** ApiGet over `gh api` (container: the gh wrapper injects the mounted token). Always a REST `--method GET`. */
 export function ghApi(gh: GhFn = realGh): ApiGet {
   return async (path) => {
     const r = await gh(['api', '--method', 'GET', '-H', 'Accept: application/vnd.github+json', path]);
@@ -39,7 +44,7 @@ export function ghApi(gh: GhFn = realGh): ApiGet {
   };
 }
 
-/** ApiGet over fetch with a token (host side, e.g. doctor when the container is not running). Always GET. */
+/** ApiGet over fetch with a token (host side, e.g. doctor when the container is not running). Always a REST GET. */
 export function fetchApi(token: string, f: typeof fetch = fetch, timeoutMs = 10_000): ApiGet {
   return async (path) => {
     try {
@@ -157,14 +162,19 @@ export async function readRequiredChecks(repo: string, cfg: Pick<MinionsConfig, 
 /**
  * Step-by-step external CI setup plan, printed (never applied) when workflows or required checks are
  * missing. minions does not write workflow files or change branch protection.
+ * hasWorkflows is tri-state: true = workflows exist (no workflow step), false = none (add one),
+ * null = unknown (the workflow step is conditional; never claims they are missing).
  */
 export function ciSetupPlan(o: { hasWorkflows: boolean | null; requiredChecks: 'configured' | 'none' | 'unknown'; verificationCommands: string[]; baseBranch: string; repository?: string | null }): string[] {
-  if (o.hasWorkflows && o.requiredChecks === 'configured') return [];
+  // Required checks configured: something already reports them, so nothing to set up unless workflows are definitely absent.
+  if (o.requiredChecks === 'configured' && o.hasWorkflows !== false) return [];
   const where = o.repository ? `https://github.com/${o.repository}/settings/branches` : 'the repository Settings -> Branches (or Rules -> Rulesets)';
   const cmds = o.verificationCommands.length ? o.verificationCommands : ['<your build/test commands>'];
   const steps: string[] = ['CI setup (manual; minions never creates workflows or changes branch protection):'];
   let n = 1;
-  if (!o.hasWorkflows) {
+  if (o.hasWorkflows === null) {
+    steps.push(`  ${n++}. If the repository has no CI workflow yet (workflows could not be read), add one yourself (for example .github/workflows/ci.yml, reviewed like any change) that runs on pull_request against ${o.baseBranch} and executes the verification commands: ${cmds.join('; ')}.`);
+  } else if (o.hasWorkflows === false) {
     steps.push(`  ${n++}. Add a CI workflow yourself (for example .github/workflows/ci.yml, reviewed like any change) that runs on pull_request against ${o.baseBranch} and executes the verification commands: ${cmds.join('; ')}.`);
   }
   steps.push(`  ${n++}. Push it and open a pull request so the check reports at least once (its job name becomes the check name).`);
@@ -306,7 +316,7 @@ export async function syncTasks(deps: SyncDeps, opts: { taskIds?: string[] } = {
   const tasks = all.filter((t) => t.prUrl && (want ? want.has(t.id) : !SKIP_STATUSES.includes(t.status)));
   const leased = new Set(db.activeLeases().map((l) => l.task_id));
   const out: SyncTaskResult[] = [];
-  // CI authority: required checks per repository, read once per sync (read-only GETs).
+  // CI authority: required checks per repository, read once per sync (read-only REST GETs).
   const required = new Map<string, Promise<RequiredChecksReport | null>>();
   const requiredFor = (prUrl: string) => {
     const repository = /^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/\d+/.exec(prUrl)?.[1];
@@ -314,7 +324,11 @@ export async function syncTasks(deps: SyncDeps, opts: { taskIds?: string[] } = {
     if (!required.has(repository)) required.set(repository, requiredChecksStatus(ghApi(gh), repository, config.git.baseBranch).catch(() => null));
     return required.get(repository)!;
   };
-  for (const task of tasks) out.push(await syncOne(task, { db, backlog, config, gh, leased, requiredFor, merge: deps.merge }));
+  for (const task of tasks) {
+    // One task's failure (e.g. a backlog version conflict) is reported on that task; the run continues.
+    out.push(await syncOne(task, { db, backlog, config, gh, leased, requiredFor, merge: deps.merge })
+      .catch((e: unknown): SyncTaskResult => ({ taskId: task.id, prUrl: task.prUrl!, changed: false, warnings: [], error: `sync failed: ${short(String((e as Error)?.message ?? e))}` })));
+  }
   db.addEvent('sync', null, { tasks: out.length, failed: out.filter((t) => t.error).length });
   return { tasks: out, synced: out.filter((t) => !t.error).length, failed: out.filter((t) => t.error).length };
 }
@@ -360,6 +374,29 @@ async function syncOne(task: Task, x: { db: RuntimeDb; backlog: BacklogAdapter; 
     res.gate = evaluateCiGate({ ciAuthority: 'github', head: pr.headRefOid, required, now: new Date(),
       timeoutMinutes: ciTimeoutOf(x.config), observations: x.db.evidenceFor(task.id, pr.headRefOid, 'ci') });
   }
+  try {
+    await reconcileBacklog(task, res, x, { prState, ci, headSha: pr.headRefOid, mergedAt: pr.mergedAt ?? null });
+  } catch (e) {
+    // Backlog write failed (e.g. a version conflict): the observation is already recorded as evidence;
+    // report it on this task and leave the rest of the run alone. No auto-merge pass on a failed task.
+    res.error = `backlog update failed: ${short(String((e as Error)?.message ?? e))}`;
+  }
+  x.db.addEvent('ci-observation', task.id, { prUrl, prState, head: pr.headRefOid, ci: ci.state, statusChange: res.statusChange ?? null, ...(res.error ? { error: res.error } : {}) });
+  if (prState === 'OPEN' && x.merge && !res.error) {
+    try {
+      const m = await x.merge(task.id);
+      if (m.state !== 'off') res.merge = m;
+      if (m.merged) res.statusChange = { from: task.status, to: 'done' };
+    } catch (e) { res.warnings.push(`auto-merge not evaluated: ${(e as Error).message}`); }
+  }
+  return res;
+}
+
+/** Backlog side of a sync observation: change note, then merged -> done / closed -> blocked. Throws on backlog errors. */
+async function reconcileBacklog(task: Task, res: SyncTaskResult, x: { db: RuntimeDb; backlog: BacklogAdapter; config: MinionsConfig; leased: Set<string> }, o: { prState: PrState; ci: CiSummary; headSha: string; mergedAt: string | null }): Promise<void> {
+  const { prState, ci } = o;
+  const prUrl = res.prUrl;
+  const pr = { headRefOid: o.headSha, mergedAt: o.mergedAt };
   if (res.changed) {
     await x.backlog.addNote(task.id, `minions sync: ${describeObservation({ prState, ci, headSha: pr.headRefOid })}. ${prState === 'OPEN' ? (x.config.delivery.merge === 'auto-when-eligible' ? 'Not merged yet.' : 'Not merged; minions never merges.') : ''}`.trim());
   }
@@ -382,15 +419,6 @@ async function syncOne(task: Task, x: { db: RuntimeDb; backlog: BacklogAdapter; 
     await x.backlog.addNote(task.id, `minions sync: pull request ${prUrl} was closed without merging; task blocked. Reopen the PR (then \`minions sync\`) or decide how to proceed.`);
     res.statusChange = { from: task.status, to: 'blocked' };
   }
-  x.db.addEvent('ci-observation', task.id, { prUrl, prState, head: pr.headRefOid, ci: ci.state, statusChange: res.statusChange ?? null });
-  if (prState === 'OPEN' && x.merge) {
-    try {
-      const m = await x.merge(task.id);
-      if (m.state !== 'off') res.merge = m;
-      if (m.merged) res.statusChange = { from: task.status, to: 'done' };
-    } catch (e) { res.warnings.push(`auto-merge not evaluated: ${(e as Error).message}`); }
-  }
-  return res;
 }
 
 export function formatSync(r: SyncReport): string {

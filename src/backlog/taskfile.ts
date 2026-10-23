@@ -231,3 +231,25 @@ export function matchesSummary(parsed: ParsedTaskFile, summary: Record<string, u
     && summary.acceptanceCriteriaCompleted !== parsed.acceptanceCriteria.filter((a) => a.checked).length) return false;
   return true;
 }
+
+// ---------------------------------------------------------------- tested CLI versions
+
+/** Backlog.md release line the file layout above was validated against (task-24.9). */
+export const FAST_PATH_TESTED = '1.54.x';
+
+/**
+ * True when `backlog --version` output names a release the in-process reader was validated against
+ * (1.54.x). Anything else (another minor or major, a pre-release tag, unparseable output, no output)
+ * is false: listings then view every task with the CLI, which is slower but never misreads a file
+ * layout a newer Backlog.md might write.
+ */
+export function fastPathVersionOk(version: string | null | undefined): boolean {
+  const m = /^\s*v?(\d+)\.(\d+)\.(\d+)\s*$/.exec((version ?? '').split('\n')[0] ?? '');
+  return !!m && m[1] === '1' && m[2] === '54';
+}
+
+/** One-line note for doctor/status when the installed Backlog.md is outside the tested line; null when it is tested. */
+export function fastPathHint(version: string | null | undefined): string | null {
+  return fastPathVersionOk(version) ? null
+    : `untested for in-process task reading (tested ${FAST_PATH_TESTED}); listings use one \`backlog task view\` per task (slower)`;
+}

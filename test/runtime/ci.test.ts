@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { RunResult } from '../../src/core/exec.js';
 import { requiredChecksReadiness } from '../../src/host/doctor.js';
-import { ciSetupPlan, ciStatus, fetchApi, ghApi, requiredChecksStatus, summarizeChecks, syncTasks, formatSync, type ApiGet } from '../../src/runtime/ci.js';
+import { ciSetupPlan, ciStatus, fetchApi, formatCiStatus, ghApi, requiredChecksStatus, summarizeChecks, syncTasks, formatSync, type ApiGet } from '../../src/runtime/ci.js';
 import type { GitFn } from '../../src/runtime/github.js';
 import type { GhFn } from '../../src/runtime/publish.js';
 import { defaults } from '../helpers.js';
@@ -121,6 +121,33 @@ describe('CI setup plan (printed, never applied)', () => {
     expect(plan.join('\n')).toMatch(/Mark the check required for main/);
     expect(ciSetupPlan({ hasWorkflows: true, requiredChecks: 'configured', verificationCommands: [], baseBranch: 'main' })).toEqual([]);
   });
+  it('treats unknown workflows (null) as unknown, never as missing', () => {
+    const plan = ciSetupPlan({ hasWorkflows: null, requiredChecks: 'none', verificationCommands: ['npm test'], baseBranch: 'main' }).join('\n');
+    expect(plan).not.toMatch(/Add a CI workflow yourself/);
+    expect(plan).toMatch(/1\. If the repository has no CI workflow yet \(workflows could not be read\), add one yourself.*npm test/);
+    expect(plan).toMatch(/Mark the check required for main/);
+    // Required checks configured and workflows unknown: nothing to set up; only definite absence adds the step.
+    expect(ciSetupPlan({ hasWorkflows: null, requiredChecks: 'configured', verificationCommands: [], baseBranch: 'main' })).toEqual([]);
+    expect(ciSetupPlan({ hasWorkflows: false, requiredChecks: 'configured', verificationCommands: [], baseBranch: 'main' }).join('\n')).toMatch(/Add a CI workflow yourself/);
+  });
+  it('ciStatus words the workflow step conditionally when the workflow count is unreadable', async () => {
+    const config = defaults();
+    const gitFor = (url: string): GitFn => async () => ok(url + '\n');
+    const gh = fakeGh({ [`${R}/branches/main`]: branch(undefined, false), [`${R}/rules/branches/main`]: rules([]), [`${R}/actions/workflows?per_page=1`]: httpErr(403, 'Resource not accessible') });
+    const s = await ciStatus('/repo', config, { git: gitFor('git@github.com:acme/demo.git'), gh: gh.fn });
+    expect(s.requiredChecks).toMatchObject({ state: 'none', workflows: null });
+    const plan = s.setupPlan.join('\n');
+    expect(plan).not.toMatch(/Add a CI workflow yourself/);
+    expect(plan).toMatch(/If the repository has no CI workflow yet/);
+    expect(formatCiStatus(s)).toMatch(/workflows: unknown/);
+    expectReadOnly(gh.calls);
+  });
+  it('doctor readiness does not claim missing workflows when the count is unknown', () => {
+    const c = requiredChecksReadiness(defaults(), { repository: 'acme/demo', baseBranch: 'main', state: 'none', requiredChecks: [], protection: null, rulesets: { contexts: [] }, workflows: null, errors: [] }, { onGitHub: true });
+    expect(c.detail).not.toMatch(/no CI workflows/);
+    expect(c.hint).toMatch(/If the repository has no CI workflow yet/);
+    expect(c.hint).not.toMatch(/Add a CI workflow yourself/);
+  });
 });
 
 describe('doctor ci.requiredChecks readiness', () => {
@@ -221,6 +248,33 @@ describe('minions sync', () => {
     expect(r.tasks[1]!.warnings.join()).toMatch(/differs from the approved head/);
     const only = await syncTasks({ db: env.db, backlog: env.backlog, config: env.config, gh: gh.fn }, { taskIds: ['task-2'] });
     expect(only.tasks.map((t) => t.taskId)).toEqual(['task-2']);
+  });
+
+  it('a backlog error on one task (version conflict) is reported on that task; the other tasks still sync', async () => {
+    const env = makeEnv();
+    env.backlog.add({ id: 'task-1', status: 'delivered', prUrl: url(1) });
+    env.backlog.add({ id: 'task-2', status: 'delivered', prUrl: url(2) });
+    env.backlog.add({ id: 'task-3', status: 'delivered', prUrl: url(3) });
+    env.backlog.add({ id: 'task-4', status: 'delivered', prUrl: url(4) });
+    const conflict = () => { throw new Error('version conflict: expected 1, found 2'); };
+    const b = env.backlog as unknown as Record<string, (...a: unknown[]) => unknown>;
+    const wrap = (name: string, failFor: string) => { const orig = b[name]!.bind(env.backlog); b[name] = async (id: unknown, ...rest: unknown[]) => id === failFor ? conflict() : orig(id, ...rest); };
+    wrap('addNote', 'task-1'); // change note on an open PR
+    wrap('closeTask', 'task-2'); // merged -> done
+    wrap('updateTask', 'task-3'); // closed -> blocked
+    const merges: string[] = [];
+    const gh = fakeGh({}, { [url(1)]: pr(1, 'OPEN', [run('build', 'SUCCESS')]), [url(2)]: pr(2, 'MERGED', []), [url(3)]: pr(3, 'CLOSED', []), [url(4)]: pr(4, 'MERGED', []) });
+    const r = await syncTasks({ db: env.db, backlog: env.backlog, config: env.config, gh: gh.fn, merge: async (id) => { merges.push(id); return { state: 'off', message: '' } as never; } });
+    expect(r).toMatchObject({ synced: 1, failed: 3 });
+    for (const id of ['task-1', 'task-2', 'task-3']) expect(r.tasks.find((t) => t.taskId === id)!.error).toMatch(/backlog update failed: version conflict/);
+    expect(r.tasks.find((t) => t.taskId === 'task-4')).toMatchObject({ prState: 'MERGED', statusChange: { from: 'delivered', to: 'done' } });
+    expect(r.tasks.find((t) => t.taskId === 'task-4')!.error).toBeUndefined();
+    expect(env.backlog.status('task-4')).toBe('done');
+    expect([env.backlog.status('task-2'), env.backlog.status('task-3')]).toEqual(['delivered', 'delivered']);
+    // The observation is still recorded as head-bound evidence for the failed task; no auto-merge pass on it.
+    expect(env.db.evidenceFor('task-1', HEAD, 'ci')).toHaveLength(1);
+    expect(merges).toEqual([]);
+    expect(formatSync(r)).toMatch(/task-1: error: backlog update failed: version conflict[\s\S]*task-4: PR merged[\s\S]*synced 1, failed 3/);
   });
 });
 

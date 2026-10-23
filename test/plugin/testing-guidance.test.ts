@@ -69,6 +69,6 @@ describe('risk-based testing in the generated plugin', () => {
     expect(coord).toMatch(/Stage order per task: engineer → tester → reviewer → delivered/);
     expect(coord).toMatch(/`verification.testerRequired` is on: every task gets a tester stage/);
     expect(coord).toContain('QA label (`needs-qa`)');
-    expect(coord).toContain('--label needs-qa');
+    expect(coord).toContain('`minions backlog update <taskId> --expected-version <v> --label needs-qa` (`<v>`: the `version` from `minions backlog show <taskId> --json`;');
   });
 });

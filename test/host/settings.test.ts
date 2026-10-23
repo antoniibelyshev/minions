@@ -299,19 +299,34 @@ describe('interactive menu', () => {
     expect(t.prompts.some((p) => /loosens policy/.test(p))).toBe(true);
   });
 
-  it('numbered fallback: enum choices by number, declined loosening keeps the value; token items run the auth flow', async () => {
+  it('numbered fallback: enum choices by number, declined loosening keeps the value; token items refuse with a --stdin hint', async () => {
     const { project, local } = await install('private');
     const f = fakeRuntime({ running: false });
     const auth: string[] = [];
     const n = indexOf('verification.reviewerRequired') + 1;
     const g = indexOf('secrets.github') + 1;
-    // reviewerRequired: choose 2) false -> loosening -> decline. Then the GitHub token item -> auth flow. Quit.
-    const t = fakeIO(false, [], [String(n), '2', 'n', String(g), 'q']);
+    const tg = indexOf('secrets.telegram') + 1;
+    // reviewerRequired: choose 2) false -> loosening -> decline. Then both token items: refused, no auth flow on
+    // the piped stdin (the next line is still read as a menu choice, not as a token). Quit.
+    const t = fakeIO(false, [], [String(n), '2', 'n', String(g), String(tg), 'q']);
     await M.runSettingsMenu(project, { io: t.io, runtime: f.runtime, runAuth: async (k) => { auth.push(k); } });
     expect(existsSync(local)).toBe(false);
-    expect(auth).toEqual(['github']);
+    expect(auth).toEqual([]);
     expect(t.text()).toContain('not saved: Not confirmed');
-    expect(t.text()).toContain('GitHub token: missing');
+    expect(t.text()).toContain('GitHub token: not changed here (no terminal to enter a token without echo)');
+    expect(t.text()).toContain('hint: run `minions auth github --stdin < token-file` instead');
+    expect(t.text()).toContain('hint: run `minions auth telegram --stdin < token-file` instead');
+    expect(t.prompts.filter((p) => /^Setting to change/.test(p))).toHaveLength(4);
+  });
+
+  it('TTY: a token item runs the auth flow and then shows provisioned / missing', async () => {
+    const { project } = await install('private');
+    const f = fakeRuntime({ running: false });
+    const auth: string[] = [];
+    const t = fakeIO(true, [...Array(indexOf('secrets.github')).fill('down'), 'enter', 'quit'], []);
+    await M.runSettingsMenu(project, { io: t.io, runtime: f.runtime, runAuth: async (k) => { auth.push(k); } });
+    expect(auth).toEqual(['github']);
+    expect(plain(t.text())).toContain('GitHub token: missing');
   });
 });
 
@@ -456,5 +471,76 @@ describe('apply classes match what reads each value', () => {
     for (const k of ['execution.maxActiveTasks', 'execution.maxEngineers', 'execution.maxRepairCyclesBeforeReplan']) expect(by(k)).toMatchObject({ apply: 'live', needsRestart: false });
     const tpl = (f: string) => readFileSync(join(process.cwd(), 'templates', 'plugin', 'agents', f), 'utf8');
     for (const f of ['engineer.md', 'tester.md', 'reviewer.md']) expect(tpl(f)).toMatch(/^maxTurns: \{\{attemptMaxTurns\}\}$/m);
+  });
+});
+
+describe('remaining loosening changes (task-50)', () => {
+  /** Each change: refused without a terminal and without --yes; applied with --yes; the reverse is not loosening. */
+  const cases: { key: string; to: string; back: string; seed?: Record<string, unknown>; msg: RegExp }[] = [
+    { key: 'models.allowed', to: 'sonnet, opus, haiku, claude-opus-4-1', back: 'sonnet, opus, haiku', msg: /the coordinator may pick claude-opus-4-1 for workers \(higher spend possible\)/ },
+    { key: 'models.default', to: 'opus', back: 'sonnet', msg: /workers default to a pricier model \(sonnet ~\$3\/MTok -> opus ~\$5\/MTok; higher spend\)/ },
+    { key: 'coordinator.bundledSkills', to: 'true', back: 'false', msg: /the coordinator session gets Claude Code's bundled skills/ },
+    { key: 'delivery.merge', to: 'manual', back: 'disabled', seed: { delivery: { provider: 'github', mode: 'pull-request' } }, msg: /minions may merge pull requests on GitHub when asked/ },
+    { key: 'execution.maxRepairCyclesBeforeReplan', to: '5', back: '3', msg: /more failed fix cycles may run before a task is replanned \(higher spend\) \(3 -> 5\)/ },
+  ];
+  for (const c of cases) {
+    it(`${c.key} -> ${c.to}: needs a confirmation or --yes; back to ${c.back} needs none`, async () => {
+      const { project, local } = await install('private');
+      if (c.seed) writeFileSync(local, JSON.stringify(c.seed));
+      const seeded = c.seed ? readFileSync(local, 'utf8') : undefined;
+      const { runtime } = fakeRuntime({ running: false });
+      // No terminal, no --yes: refused, nothing written.
+      await expect(SC.applySetting(await ctxOf(project), c.key, c.to, {}, { runtime, confirm: async () => null }))
+        .rejects.toMatchObject({ code: 'POLICY_DENIED' });
+      // Declined confirmation: nothing written.
+      const asked: string[] = [];
+      await expect(SC.applySetting(await ctxOf(project), c.key, c.to, {}, { runtime, confirm: async (q) => { asked.push(q); return false; } }))
+        .rejects.toMatchObject({ code: 'PRECONDITION' });
+      expect(asked[0]).toMatch(/loosens policy/);
+      expect(asked[0]).toMatch(c.msg);
+      if (seeded === undefined) expect(existsSync(local)).toBe(false); else expect(readFileSync(local, 'utf8')).toBe(seeded);
+      // --yes applies it without asking.
+      const r = await SC.applySetting(await ctxOf(project), c.key, c.to, { yes: true }, { runtime, confirm: never });
+      expect(r).toMatchObject({ changed: true, written: true });
+      expect(r.loosens).toMatch(c.msg);
+      // The reverse change tightens: no confirmation.
+      const b = await SC.applySetting(await ctxOf(project), c.key, c.back, {}, { runtime, confirm: never });
+      expect(b).toMatchObject({ loosens: null, written: true });
+    });
+  }
+
+  it('models.default: a cheaper default is not loosening; one without a known price is; models.allowed narrowing is not', async () => {
+    const { project, local } = await install('private');
+    const { runtime } = fakeRuntime({ running: false });
+    writeFileSync(local, JSON.stringify({ models: { allowed: ['sonnet', 'opus', 'haiku', 'custom-model-x'] } }));
+    const cheaper = await SC.applySetting(await ctxOf(project), 'models.default', 'haiku', {}, { runtime, confirm: never });
+    expect(cheaper).toMatchObject({ from: 'sonnet', to: 'haiku', loosens: null, written: true });
+    const unknown = await S.planSetting(await ctxOf(project), 'models.default', 'custom-model-x');
+    expect(unknown.loosens).toMatch(/workers default to a possibly pricier model \(haiku ~\$1\/MTok -> custom-model-x \(no known price\); higher spend\)/);
+    const narrow = await SC.applySetting(await ctxOf(project), 'models.allowed', 'sonnet, haiku', {}, { runtime, confirm: never });
+    expect(narrow).toMatchObject({ loosens: null, written: true });
+    // Swapping one model for another still adds a model: loosening.
+    expect((await S.planSetting(await ctxOf(project), 'models.allowed', ['haiku', 'opus'])).loosens).toMatch(/may pick opus/);
+  });
+
+  it('delivery.merge: manual -> disabled and auto -> manual are not loosening; the settings list flags every new key as canLoosen', async () => {
+    const { project, local } = await install('private');
+    writeFileSync(local, JSON.stringify({ delivery: { provider: 'github', mode: 'pull-request', merge: 'auto-when-eligible' } }));
+    const ctx = await ctxOf(project);
+    expect((await S.planSetting(ctx, 'delivery.merge', 'manual')).loosens).toBeNull();
+    expect((await S.planSetting(ctx, 'delivery.merge', 'disabled')).loosens).toBeNull();
+    const views = S.listSettings(ctx);
+    for (const k of ['models.allowed', 'models.default', 'coordinator.bundledSkills', 'delivery.merge', 'execution.maxRepairCyclesBeforeReplan']) {
+      expect(views.find((v) => v.key === k)).toMatchObject({ canLoosen: true });
+    }
+  });
+
+  it('numbered menu: raising repair cycles asks for confirmation; declining writes nothing', async () => {
+    const { project, local } = await install('private');
+    const f = fakeRuntime({ running: false });
+    const t = fakeIO(false, [], [String(indexOf('execution.maxRepairCyclesBeforeReplan') + 1), '6', 'n', 'q']);
+    await M.runSettingsMenu(project, { io: t.io, runtime: f.runtime, runAuth: async () => {} });
+    expect(t.prompts.some((p) => /loosens policy: more failed fix cycles/.test(p))).toBe(true);
+    expect(existsSync(local)).toBe(false);
   });
 });
