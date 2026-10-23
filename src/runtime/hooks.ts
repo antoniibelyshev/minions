@@ -6,6 +6,7 @@ import type { MinionsConfig } from '../config/schema.js';
 import { sha256 } from '../core/fsutil.js';
 import { redact } from '../core/output.js';
 import type { LeaseRole, RuntimeDb } from './db.js';
+import { TELEGRAM_TOOL_PREFIX } from './coordinator.js';
 import { runtimePaths } from './paths.js';
 import { capacityOf, scopeOf } from './scheduler.js';
 
@@ -152,14 +153,22 @@ export async function preAgentHook(input: unknown, load: HookLoader): Promise<Ho
  * PreToolUse(Telegram MCP tools) guard, registered by the coordinator's --settings when Telegram is on.
  * Telegram tools are coordinator-only: a call from any subagent (Claude Code sets agent_id/agent_type in
  * hook input inside a subagent) is denied, whatever its type. The main coordinator thread is allowed.
+ *
+ * Fails closed on input it cannot decide: non-object input and a missing or non-Telegram tool_name are
+ * denied. agent_id / agent_type count as set whenever they are anything but undefined/null, so a
+ * non-string or empty value is treated as a subagent marker (deny) rather than ignored.
  */
 export function preTelegramHook(input: unknown): HookOutput {
-  const inp = isObj(input) ? input : {};
-  const tool = typeof inp.tool_name === 'string' ? inp.tool_name : 'a Telegram tool';
-  const agentId = typeof inp.agent_id === 'string' ? inp.agent_id : '';
-  const agentType = typeof inp.agent_type === 'string' ? inp.agent_type : '';
-  if (agentId || agentType) {
-    return deny(`${tool} is coordinator-only; subagents (${agentType || 'unknown type'}) cannot use Telegram tools. Return what you want sent to the coordinator instead.`);
+  if (!isObj(input)) return deny('minions could not read the Telegram hook input (not a JSON object); refusing the call.');
+  const tool = input.tool_name;
+  if (typeof tool !== 'string' || !tool.startsWith(TELEGRAM_TOOL_PREFIX) || tool.length === TELEGRAM_TOOL_PREFIX.length) {
+    const what = typeof tool === 'string' ? `a non-Telegram tool_name (${JSON.stringify(tool.slice(0, 80))})` : 'no tool_name';
+    return deny(`minions pre-telegram hook got ${what}; refusing the call.`);
+  }
+  const isSet = (v: unknown) => v !== undefined && v !== null;
+  if (isSet(input.agent_id) || isSet(input.agent_type)) {
+    const agentType = typeof input.agent_type === 'string' && input.agent_type ? input.agent_type : 'unknown type';
+    return deny(`${tool} is coordinator-only; subagents (${agentType}) cannot use Telegram tools. Return what you want sent to the coordinator instead.`);
   }
   return { reason: `allow: ${tool} from the coordinator` };
 }

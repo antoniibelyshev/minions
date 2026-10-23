@@ -211,6 +211,51 @@ describe('pre-telegram hook', () => {
   });
 });
 
+describe('pre-telegram hook fails closed on input it cannot decide', () => {
+  const permission = (o: { stdout?: string }) => decision(o)?.hookSpecificOutput?.permissionDecision;
+  const reply = 'mcp__plugin_telegram_telegram__reply';
+
+  it('denies a missing, non-string or non-Telegram tool_name', () => {
+    for (const tool_name of [undefined, null, 42, {}, '', 'Bash', 'Agent', 'mcp__other__reply', 'mcp__plugin_telegram_telegram__', 'xmcp__plugin_telegram_telegram__reply']) {
+      const r = preTelegramHook({ hook_event_name: 'PreToolUse', tool_name, tool_input: {} });
+      expect(permission(r), String(tool_name)).toBe('deny');
+      expect(decision(r).hookSpecificOutput.permissionDecisionReason).toMatch(/minions pre-telegram hook got (no tool_name|a non-Telegram tool_name)/);
+    }
+  });
+
+  it('denies non-object input', () => {
+    for (const input of [null, undefined, 'x', 1, [], [{ tool_name: reply }]]) {
+      expect(permission(preTelegramHook(input)), JSON.stringify(input)).toBe('deny');
+    }
+  });
+
+  it('treats any set agent_id / agent_type (non-string or empty included) as a subagent', () => {
+    for (const v of ['', 0, 1, false, true, {}, [], 'a1']) {
+      expect(permission(preTelegramHook({ tool_name: reply, agent_id: v })), `agent_id=${JSON.stringify(v)}`).toBe('deny');
+      expect(permission(preTelegramHook({ tool_name: reply, agent_type: v })), `agent_type=${JSON.stringify(v)}`).toBe('deny');
+    }
+    const r = preTelegramHook({ tool_name: reply, agent_id: 7, agent_type: '' });
+    expect(decision(r).hookSpecificOutput.permissionDecisionReason).toMatch(/subagents \(unknown type\)/);
+  });
+
+  it('main-thread Telegram calls still pass (absent or null agent fields), with no explicit allow', () => {
+    for (const extra of [{}, { agent_id: null }, { agent_type: null }, { agent_id: undefined, agent_type: undefined }]) {
+      const r = preTelegramHook({ hook_event_name: 'PreToolUse', tool_name: reply, tool_input: { chat_id: '1', text: 'hi' }, session_id: 's', ...extra });
+      expect(r.stdout, JSON.stringify(extra)).toBeUndefined();
+      expect(r.reason).toBe(`allow: ${reply} from the coordinator`);
+    }
+  });
+
+  it('runHook denies empty stdin and JSON that is not an object', async () => {
+    const env = makeEnv();
+    vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+    for (const text of ['', '   ', 'null', '[]', '"x"', '42', '{"tool_name":']) {
+      expect(permission(await runHook('pre-telegram', loader(env), text)), text).toBe('deny');
+    }
+    expect((await runHook('pre-telegram', loader(env), JSON.stringify({ tool_name: reply }))).stdout).toBeUndefined();
+  });
+});
+
 describe('tester: pre-telegram edge cases', () => {
   const permission = (o: { stdout?: string }) => decision(o)?.hookSpecificOutput?.permissionDecision;
 

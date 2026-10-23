@@ -12,7 +12,7 @@ import {
 } from '../../src/runtime/coordinator.js';
 import { runtimePaths } from '../../src/runtime/paths.js';
 import { evaluateTelegram, TELEGRAM_CHANNEL_SPEC, TELEGRAM_PLUGIN_ID, type TelegramProbeReport } from '../../src/telegram/probe.js';
-import { defaults } from '../helpers.js';
+import { defaults, FAKE_MINIONS, runHookCommand } from '../helpers.js';
 import { tmp } from '../runtime/fixtures.js';
 
 const TOKEN = '123456789:AAHfakefakefakefakefakefakefake_-0123';
@@ -468,6 +468,24 @@ describe('Telegram tools are coordinator-only', () => {
     for (const t of ['Bash', 'Agent', 'mcp__other__reply', 'mcp__plugin_telegram_telegramx']) expect(matcher.test(t), t).toBe(false);
     // Terminal launches carry no Telegram hook (and no Telegram allow).
     expect(coordinatorSettings(telegramCfg())).not.toHaveProperty('hooks');
+  });
+
+  it('the generated pre-telegram hook fails closed: a missing or crashing minions blocks the Telegram call', async () => {
+    const { paths } = layout();
+    const on = await buildClaudeCommand(telegramCfg(), paths, { telegram: true });
+    const settings = JSON.parse(on.args[on.args.indexOf('--settings') + 1]!);
+    const command = settings.hooks.PreToolUse[0].hooks[0].command as string;
+    expect(command).toBe('minions hook pre-telegram || exit 2');
+    const stdin = JSON.stringify({ hook_event_name: 'PreToolUse', tool_name: 'mcp__plugin_telegram_telegram__reply', tool_input: { chat_id: '1', text: 'hi' } });
+    // Exit 2 is the only blocking PreToolUse exit; 127 (not found), 1 (crash) or 137 (killed) would allow the call.
+    expect(runHookCommand(command, null, stdin).status).toBe(2);
+    expect(runHookCommand(command, FAKE_MINIONS.crash, stdin).status).toBe(2);
+    expect(runHookCommand(command, FAKE_MINIONS.killed, stdin).status).toBe(2);
+    // Healthy: the coordinator's own reply goes through (exit 0, no output); a JSON deny is passed on as is.
+    expect(runHookCommand(command, FAKE_MINIONS.allow, stdin)).toEqual({ status: 0, stdout: '' });
+    const denied = runHookCommand(command, FAKE_MINIONS.deny, stdin);
+    expect(denied.status).toBe(0);
+    expect(JSON.parse(denied.stdout).hookSpecificOutput.permissionDecision).toBe('deny');
   });
 });
 
