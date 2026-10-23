@@ -219,7 +219,7 @@ export function hostSettings(h: HostHardening): { sandbox: Record<string, unknow
   deny.push(`Edit(${ws}/repo/.git/config)`, `Edit(${ws}/repo/.git/config.worktree)`, `Edit(${ws}/repo/.git/hooks/**)`,
     `Edit(${ws}/repo/.git/worktrees/*/config.worktree)`, `Edit(${ws}/**/.claude/**)`, `Edit(${ws}/**/.mcp.json)`);
   // Keychain and credential CLIs (best effort: the sandbox and the file store are the real protection).
-  deny.push('Bash(security *)', 'Bash(security)', 'Bash(gh auth *)');
+  deny.push('Bash(security *)', 'Bash(security)', 'Bash(secret-tool *)', 'Bash(secret-tool)', 'Bash(gh auth *)');
   // Git options that change configuration or programs (the allowlist below has no `git config` either).
   deny.push('Bash(git -c *)', 'Bash(git -c*)', 'Bash(git config *)', 'Bash(git config)', 'Bash(git --config-env*)', 'Bash(git -C * -c *)',
     'Bash(git -C * config *)', 'Bash(git --exec-path*)', 'Bash(git --git-dir*)', 'Bash(git --work-tree*)');

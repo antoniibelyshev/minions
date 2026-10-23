@@ -23,7 +23,7 @@ import { emit } from '../core/output.js';
 import { projectPaths } from '../core/paths.js';
 import { normalizeGithubRemote } from '../runtime/github.js';
 import {
-  GITHUB_TOKEN_CREATE_URL, GITHUB_TOKEN_PERMISSIONS, githubCredentialStatus, githubRepoFromRemote, loadCredentialRefs,
+  GITHUB_TOKEN_CREATE_URL, GITHUB_TOKEN_PERMISSIONS, backendLabel, githubCredentialStatus, githubRepoFromRemote, loadCredentialRefs,
   provisionGithubToken, type CredentialsJson, type Fetch, type ProvisionResult,
 } from './credentials.js';
 import { HOST_GIT, sanitizeRemoteUrl } from './discovery.js';
@@ -306,7 +306,7 @@ export async function runGithubSetup(opts: GithubSetupOptions): Promise<GithubSe
           const { projectId: _id, ...provisioned } = await provisionGithubToken({
             projectId: project.projectId, token, repoPath: opts.repoPath, remoteUrl: state.remoteUrl, runner: opts.runner, fetch: opts.fetch,
           });
-          result.token = { status: 'stored', detail: `stored in ${provisioned.backend === 'keychain' ? 'the macOS Keychain' : 'a 0600 host file'}${provisioned.verification ? `; ${provisioned.verification.status}: ${provisioned.verification.detail}` : ''}`, provisioned };
+          result.token = { status: 'stored', detail: `stored in ${backendLabel(provisioned.backend)}${provisioned.verification ? `; ${provisioned.verification.status}: ${provisioned.verification.detail}` : ''}`, provisioned };
           tokenOk = true;
         } catch (e) {
           result.token = { status: 'failed', detail: `${e instanceof MinionsError ? e.message : 'could not store the token'}; run \`minions auth github\` to retry.` };

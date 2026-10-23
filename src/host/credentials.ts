@@ -2,8 +2,9 @@
 // Telegram bot token). Per project:
 //
 // - The token is entered on the host only (non-echoing TTY prompt or piped stdin), never as argv.
-// - Long-lived storage: macOS Keychain (`security`) when available, else a 0600 file in a 0700
-//   directory under the host data root (`<root>/credentials/<projectId>/`), outside the repository.
+// - Long-lived storage: macOS Keychain (`security`) or, on Linux, the Secret Service keyring
+//   (libsecret `secret-tool`) when available, else a 0600 file in a 0700 directory under the host
+//   data root (`<root>/credentials/<projectId>/`), outside the repository.
 // - `projects/<id>/credentials.json` holds only a reference (backend + locator), never the token.
 // - For the container, each token is materialized into `projects/<id>/secrets/<kind file>` (0600),
 //   whose *directory* is bind-mounted read-only at /opt/minions/secrets. The credential store itself
@@ -141,8 +142,17 @@ export const CREDENTIAL_KINDS = [GITHUB_CREDENTIAL, TELEGRAM_CREDENTIAL] as cons
 
 // ---------------------------------------------------------------- storage backends
 
-export type Backend = 'keychain' | 'file';
+export const BACKENDS = ['keychain', 'secret-service', 'file'] as const;
+export type Backend = typeof BACKENDS[number];
 export const KEYCHAIN_SERVICE = GITHUB_CREDENTIAL.keychainService;
+
+/** Where a token of this backend lives, for user-facing messages ("stored in <label>"). */
+export function backendLabel(backend: Backend): string {
+  if (backend === 'keychain') return 'the macOS Keychain';
+  if (backend === 'secret-service') return 'the Secret Service keyring (secret-tool)';
+  return 'a 0600 host file';
+}
+const shortWhere = (backend: Backend) => (backend === 'keychain' ? 'macOS Keychain' : backend === 'secret-service' ? 'Secret Service keyring' : '0600 file');
 
 export interface SecretStore {
   readonly backend: Backend;
@@ -185,6 +195,56 @@ export class KeychainStore implements SecretStore {
   async delete(projectId: string): Promise<void> {
     await this.runner('security', ['delete-generic-password', '-s', this.kind.keychainService, '-a', projectId], { allowFailure: true, timeoutMs: 30_000 });
   }
+}
+
+/**
+ * Linux Secret Service (GNOME Keyring, KWallet's Secret Service bridge, KeePassXC, ...) via libsecret's
+ * `secret-tool`. Items carry the attributes `service=<kind service>` and `account=<projectId>` (the
+ * same names as the Keychain item). `secret-tool store` reads the secret from stdin, so the token
+ * never appears in argv. `lookup` exits 1 with empty stderr when no item matches; any stderr output
+ * (no D-Bus session, locked or denied collection) is an error.
+ */
+export class SecretServiceStore implements SecretStore {
+  readonly backend = 'secret-service' as const;
+  constructor(private readonly runner: Runner = run, readonly kind: CredentialKind = GITHUB_CREDENTIAL) {}
+  ref(projectId: string) { return `secret-service:${this.kind.keychainService}/${projectId}`; }
+  private attrs(projectId: string) { return ['service', this.kind.keychainService, 'account', projectId]; }
+
+  async get(projectId: string): Promise<string | null> {
+    const r = await this.runner('secret-tool', ['lookup', ...this.attrs(projectId)], { allowFailure: true, timeoutMs: 30_000 });
+    if (r.code === 0) return r.stdout.replace(/\r?\n$/, '') || null;
+    if (r.code === 1 && !r.stderr.trim()) return null; // no matching item
+    throw new MinionsError('AUTH_REQUIRED', `Could not read the ${this.kind.label} from the Secret Service keyring (secret-tool exit ${r.code}).`,
+      'Unlock the login keyring (or log in to a desktop session with D-Bus), then retry; or set MINIONS_CREDENTIAL_STORE=file to use a 0600 file.');
+  }
+
+  async set(projectId: string, token: string): Promise<void> {
+    assertProjectId(projectId);
+    this.kind.check(token);
+    await this.runner('secret-tool', ['store', `--label=${this.kind.keychainLabel}`, ...this.attrs(projectId)], { input: token, allowFailure: true, timeoutMs: 30_000 });
+    // Verify by reading back, like the Keychain store.
+    if ((await this.get(projectId).catch(() => null)) !== token) {
+      throw new MinionsError('AUTH_REQUIRED', `Could not store the ${this.kind.label} in the Secret Service keyring.`,
+        'Unlock the login keyring and retry, or set MINIONS_CREDENTIAL_STORE=file to use a 0600 file.');
+    }
+  }
+
+  async delete(projectId: string): Promise<void> {
+    await this.runner('secret-tool', ['clear', ...this.attrs(projectId)], { allowFailure: true, timeoutMs: 30_000 });
+  }
+}
+
+/**
+ * True when `secret-tool` runs and reaches a Secret Service: a lookup of an item that never exists
+ * exits 1 with no stderr. A missing binary, no D-Bus session bus (headless or SSH hosts) or no Secret
+ * Service provider print an error or fail to spawn, so those hosts use the file store.
+ */
+export async function secretServiceAvailable(runner: Runner, env: NodeJS.ProcessEnv = process.env): Promise<boolean> {
+  if (!env.DBUS_SESSION_BUS_ADDRESS && !env.XDG_RUNTIME_DIR) return false;
+  try {
+    const r = await runner('secret-tool', ['lookup', 'service', 'minions.probe', 'account', 'probe'], { allowFailure: true, timeoutMs: 15_000 });
+    return (r.code === 0 || r.code === 1) && !r.stderr.trim();
+  } catch { return false; }
 }
 
 /** 0600 file in a 0700 directory under the host data root. */
@@ -242,28 +302,33 @@ export async function hostRuntimeInUse(): Promise<boolean> {
 }
 
 /**
- * Keychain on macOS when `security` works; else the file store. MINIONS_CREDENTIAL_STORE=file|keychain
- * overrides, except that the file store is always used while the host runtime is in use (see hostRuntimeInUse).
+ * Keychain on macOS when `security` works; the Secret Service on Linux when `secret-tool` reaches one;
+ * else the file store. MINIONS_CREDENTIAL_STORE=file|keychain|secret-service overrides, except that the
+ * file store is always used while the host runtime is in use (see hostRuntimeInUse).
  */
 export async function selectStore(opts: StoreOptions = {}): Promise<SecretStore> {
   const runner = opts.runner ?? run;
   const kind = opts.kind ?? GITHUB_CREDENTIAL;
-  const pref = (opts.env ?? process.env).MINIONS_CREDENTIAL_STORE;
+  const env = opts.env ?? process.env;
+  const pref = env.MINIONS_CREDENTIAL_STORE;
   if (pref === 'file') return new FileStore(kind);
   if (opts.hostRuntime ?? await hostRuntimeInUse()) return new FileStore(kind);
   if (pref === 'keychain') return new KeychainStore(runner, kind);
-  if ((opts.platform ?? process.platform) !== 'darwin') return new FileStore(kind);
+  if (pref === 'secret-service') return new SecretServiceStore(runner, kind);
+  const platform = opts.platform ?? process.platform;
+  if (platform === 'linux') return (await secretServiceAvailable(runner, env)) ? new SecretServiceStore(runner, kind) : new FileStore(kind);
+  if (platform !== 'darwin') return new FileStore(kind);
   const probe = await runner('security', ['list-keychains', '-d', 'user'], { allowFailure: true, timeoutMs: 15_000 });
   return probe.code === 0 ? new KeychainStore(runner, kind) : new FileStore(kind);
 }
 
 const storeFor = (backend: Backend, runner: Runner, kind: CredentialKind = GITHUB_CREDENTIAL): SecretStore =>
-  (backend === 'keychain' ? new KeychainStore(runner, kind) : new FileStore(kind));
+  (backend === 'keychain' ? new KeychainStore(runner, kind) : backend === 'secret-service' ? new SecretServiceStore(runner, kind) : new FileStore(kind));
 
 export interface MovedToken { projectId: string; kind: CredentialKind['name'] }
 
 /**
- * Host runtime: moves every registered project's tokens from the macOS Keychain to the 0600 file store
+ * Host runtime: moves every registered project's tokens from the macOS Keychain or the Secret Service keyring to the 0600 file store
  * (read from Keychain, written to the file store, reference updated, Keychain item deleted). A token
  * that cannot be read (locked keychain, denied prompt) stays where it is and yields a warning.
  */
@@ -275,9 +340,9 @@ export async function moveKeychainTokensToFileStore(runner: Runner = run): Promi
     const refs = await loadCredentialRefs(projectId).catch((): CredentialsJson => ({ version: 1 }));
     for (const kind of CREDENTIAL_KINDS) {
       const ref = refs[kind.name];
-      if (ref?.backend !== 'keychain') continue;
+      if (!ref || ref.backend === 'file') continue;
       try {
-        const keychain = new KeychainStore(runner, kind);
+        const keychain = storeFor(ref.backend, runner, kind);
         const token = await keychain.get(projectId);
         if (!token) continue;
         const file = new FileStore(kind);
@@ -288,7 +353,7 @@ export async function moveKeychainTokensToFileStore(runner: Runner = run): Promi
         await keychain.delete(projectId);
         moved.push({ projectId, kind: kind.name });
       } catch (e) {
-        warnings.push(`The ${kind.label} of project ${projectId} is still in the macOS Keychain (${redact((e as Error).message).split('\n')[0]}); agents of a host-runtime project could read it with /usr/bin/security. Re-provision it with \`${kind.command}\`.`);
+        warnings.push(`The ${kind.label} of project ${projectId} is still in ${backendLabel(ref.backend)} (${redact((e as Error).message).split('\n')[0]}); agents of a host-runtime project could read it with ${ref.backend === 'keychain' ? '/usr/bin/security' : 'secret-tool'}. Re-provision it with \`${kind.command}\`.`);
       }
     }
   }
@@ -300,13 +365,13 @@ export async function moveKeychainTokensToFileStore(runner: Runner = run): Promi
 export const CredentialsJsonSchema = z.object({
   version: z.literal(1),
   github: z.object({
-    backend: z.enum(['keychain', 'file']),
+    backend: z.enum(BACKENDS),
     ref: z.string().min(1),
     kind: z.enum(['fine-grained-pat', 'classic-pat']),
     updatedAt: z.string(),
   }).strict().optional(),
   telegram: z.object({
-    backend: z.enum(['keychain', 'file']),
+    backend: z.enum(BACKENDS),
     ref: z.string().min(1),
     /** Non-secret numeric bot id (token prefix): detects one bot shared by two projects. */
     botId: z.string().regex(/^\d{6,12}$/),
@@ -583,7 +648,7 @@ export async function githubCredentialStatus(project: { projectId: string; remot
     if (p) problems.push(p);
   }
   const v = await verifyGithubToken(token, { remoteUrl: project.remoteUrl, fetch: opts.fetch });
-  const where = ref.backend === 'keychain' ? 'macOS Keychain' : '0600 file';
+  const where = shortWhere(ref.backend);
   if (v.status === 'invalid') return { state: 'invalid', backend: ref.backend, detail: `${v.detail} (stored in ${where})` };
   if (v.status === 'unverified') return { state: 'unverified', backend: ref.backend, detail: `stored in ${where}; ${v.detail}` };
   return { state: problems.length ? 'invalid' : 'ok', backend: ref.backend, detail: [`${v.detail}; stored in ${where}`, ...problems].join('; ') };
@@ -605,7 +670,7 @@ export async function telegramCredentialStatus(projectId: string, opts: { runner
     return { state: 'invalid', backend: ref.backend, botId: ref.botId, detail: redact((e as Error).message) };
   }
   if (!token) return { state: 'missing', backend: ref.backend, botId: ref.botId, detail: `reference ${ref.ref} exists but the token is gone` };
-  const where = ref.backend === 'keychain' ? 'macOS Keychain' : '0600 file';
+  const where = shortWhere(ref.backend);
   const problems: string[] = [];
   try {
     if (checkTelegramTokenFormat(token).botId !== ref.botId) problems.push('stored token does not match the recorded bot id');

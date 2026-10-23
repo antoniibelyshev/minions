@@ -15,10 +15,11 @@ import { ciSetupPlan } from '../runtime/ci.js';
 import { discover, dockerProbe, type Discovery, type DockerProbe, type DockerStatus } from './discovery.js';
 import { authOf, isKeyAuth, loadDefaults, resolveOnPath, summarize, type AuthSummary, type ClaudeAuth } from './auth.js';
 import {
-  githubRepoFromRemote, githubTokenGuidance, loadCredentialRefs, provisionTelegramToken,
+  backendLabel, githubRepoFromRemote, githubTokenGuidance, loadCredentialRefs, provisionTelegramToken,
   type CredentialsJson, type Fetch, type ProvisionResult, type TelegramProvisionResult,
 } from './credentials.js';
 import { composeYaml, type Runner } from './docker.js';
+import { composeHint, daemonHint } from './linux-host.js';
 import { ProjectJsonSchema, projectConfigPath, resolveEffective, runtimeProjectInfo, sharedConfigView, type ProjectJson } from './project.js';
 import { bindProject, gitCommonDir, loadRegistry, repoRoot, resolveIdentity, saveRegistry, sharedProjectId, type Identity, type Registry } from './registry.js';
 import { runWizard, type WizardIO } from './wizard.js';
@@ -422,7 +423,7 @@ async function prepare(opts: InitOptions, docker?: DockerStatus): Promise<Prepar
           : 'Claude Code uses your existing host login (run `claude` once and /login if you are not logged in).',
         'The coordinator gets the Claude Code sandbox (Bash writes limited to the workspace/state, credential directories unreadable) and never bypassPermissions.',
       ] : [
-        'Docker Desktop running (compose v2+).',
+        process.platform === 'linux' ? 'Docker Engine running and reachable by your user (compose v2+ plugin).' : 'Docker Desktop running (compose v2+).',
         `Runtime image ${project.imageTag} is built from the installed package on first \`minions start\`.`,
         isKeyAuth(authOf(project))
           ? `Claude key from ${summarize(authOf(project)).source} is provisioned by the host on every \`minions start\` (mounted read-only; no /login needed).`
@@ -685,7 +686,7 @@ async function offerTelegramToken(opts: InitOptions, plan: InitResult['plan']): 
     const { projectId: _id, ...provisioned } = await provisionTelegramToken({
       projectId: plan.projectId, token, repoPath: plan.repoPath, verify, runner: opts.runner, fetch: opts.fetch,
     });
-    return { status: 'stored', detail: `bot ${provisioned.botId} stored in ${provisioned.backend === 'keychain' ? 'the macOS Keychain' : 'a 0600 host file'}`, provisioned };
+    return { status: 'stored', detail: `bot ${provisioned.botId} stored in ${backendLabel(provisioned.backend)}`, provisioned };
   } catch (e) {
     return { status: 'failed', detail: `${e instanceof MinionsError ? e.message : 'could not store the token'}; ${TERMINAL_UNTIL_TOKEN}.` };
   }
@@ -704,10 +705,13 @@ async function githubStep(opts: InitOptions, plan: InitResult['plan']): Promise<
   });
 }
 
-export function dockerUnavailable(s: DockerStatus): MinionsError {
+export function dockerUnavailable(s: DockerStatus, platform: NodeJS.Platform = process.platform): MinionsError {
   const what = !s.daemon ? `Docker daemon is not reachable${s.error ? ` (${s.error})` : ''}` : `Docker Compose v2+ is required (found: ${s.composeVersion ?? 'none'})`;
+  const fix = platform === 'linux'
+    ? `${!s.daemon ? daemonHint(platform, s) : composeHint(platform, s)} Then rerun; \`minions doctor\` names the exact fix.`
+    : 'Start Docker Desktop (or install Compose v2), then rerun.';
   return new MinionsError('DOCKER_UNAVAILABLE', `${what}. The docker runtime needs Docker; minions never falls back to the host on its own.`,
-    'Start Docker Desktop (or install Compose v2), then rerun. Running without Docker is an explicit, less safe choice: `minions runtime set host` (see README "Running without Docker").', s);
+    `${fix} Running without Docker is an explicit, less safe choice: \`minions runtime set host\` (see README "Running without Docker").`, s);
 }
 
 export async function runInit(opts: InitOptions): Promise<InitResult> {

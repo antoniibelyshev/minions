@@ -49,12 +49,66 @@ fake GitHub API; the pre-filled token URL follows GitHub's documented template U
 | tmux (host) | fake only in e2e | `brew install tmux`; any 3.x expected to work (`-L`, `new-session -A/-d`, `has-session`, `kill-server`). |
 | gh (host) | not exercised | Optional, for pull-request delivery; wrapped by `host/bin/gh`. |
 
+### Linux hosts (preview)
+
+Status: implemented for Docker Engine and covered by unit tests with fakes
+(`test/host/linux-host.test.ts`, Secret Service cases in `test/host/credentials.test.ts`). **No live
+run on a Linux host has been recorded yet** (no Ubuntu LTS or RPM-distro result). Until it is, treat
+Linux as a preview, not a tested platform.
+
+| Area | macOS (unchanged) | Linux |
+| - | - | - |
+| Host data root | `~/Library/Application Support/Minions` | `$XDG_DATA_HOME/minions` (absolute values only, per the XDG spec), else `~/.local/share/minions`. Everything stays under this one root; `XDG_CONFIG_HOME` is not used, so a project's state is never split. `MINIONS_HOME` overrides on both. |
+| Credential store | Keychain (`security`), else 0600 file | Secret Service via libsecret `secret-tool` (GNOME Keyring, KWallet bridge, KeePassXC) when a session bus answers and a lookup succeeds; else the 0600 file store. Token on stdin, never argv; verified by read-back. Host runtime: forced to the file store, like the Keychain. |
+| Docker | Docker Desktop | Docker Engine (rootful). `doctor` hints: socket `permission denied` → `sudo usermod -aG docker "$USER"` + re-login (root-equivalent) or rootless Docker with `DOCKER_HOST`; daemon down → `sudo systemctl enable --now docker`, rootless socket present but `DOCKER_HOST` unset → the exact `export`, rootless service down → `systemctl --user start docker`. |
+| Compose | bundled | v2 plugin required. `doctor` names `docker-compose-plugin` (apt/dnf with Docker's repository) or `docker-compose-v2` (Ubuntu's own packages), and says when only legacy `docker-compose` v1 is installed. |
+| `host.docker.internal` | built in | `extra_hosts: host.docker.internal:host-gateway` is added on non-macOS hosts when the container environment references it (JetBrains Central / loopback base URL rewrite); nothing else relies on it. Needs Docker Engine 20.10+. |
+| SELinux | n/a | `doctor` (`docker.selinux`) warns when `getenforce` is Enforcing and the daemon labels containers (`name=selinux` in `docker info` SecurityOptions), with the exact `semanage fcontext … container_file_t` + `restorecon` fix for `<root>/projects`. compose.yaml is not changed (no `:z` relabel yet). |
+| Bind-mount ownership | Desktop maps ownership | Rootful Engine keeps host ownership. Host uid 1000 (the default first user on Ubuntu/Fedora): the 0600 secret files are readable by the container user (uid 1000) as is (`docker.uid: ok`). Other uids: `docker.uid` warns; not supported yet. Rootless Docker: `docker.rootless` warns (uid 1000 maps to a subordinate uid); not supported yet for host-provisioned secrets. |
+| install.sh | as before | Prints a preview note instead of the macOS-only warning, and Docker Engine-specific fixes. |
+
+Nothing minions writes on the host is root-owned: every bind mount is read-only with
+`create_host_path: false` (the daemon never creates a missing source dir as root), all container
+writes go to named volumes, and exports are copied out by the CLI running as you (`docker compose cp`).
+
+Linux gap list (audit of the macOS-specific host paths, 2026-10-23):
+
+- `src/host/credentials.ts`: Keychain only on macOS; Secret Service added (above). Downgrade: older builds
+  reject the `secret-service` backend in `credentials.json`; re-provision with `MINIONS_CREDENTIAL_STORE=file` first.
+- `src/host/docker.ts`, `doctor.ts`, `install.ts`: Docker Desktop hints are now platform-aware. Remaining:
+  secrets readable for host uid ≠ 1000 and rootless Docker (see design below), `bind.selinux: z` in compose.yaml.
+- `src/host/setup.ts`, `wizard.ts`, `commands.ts`: credential messages name the actual backend. The
+  wizard's Claude key source `keychain` (macOS `security`) has no Linux counterpart yet (`file` and `env` work).
+  The GitHub token page is opened with `open` on macOS only; Linux prints the URL (no `xdg-open` yet).
+- `src/core/paths.ts`: XDG handled (above). `tmuxSocket` comment cites the 104-byte macOS limit; Linux's
+  limit is 108, so nothing changes.
+- Host runtime (`runtime: host`) on Linux: not reviewed. Its sandbox settings target Seatbelt (macOS);
+  `secret-tool` is denied at the permission layer like `security`, but bubblewrap-based sandboxing,
+  `/tmp/tmux-<uid>` handling and the warning text ("your macOS user") need their own task.
+- Image: built natively on the host from the multi-arch base, so amd64 and arm64 Linux hosts build
+  their own arch; no published multi-arch image and no amd64 run recorded.
+
+Design for the open ownership cases (not implemented; needs live validation):
+
+- Host uid ≠ 1000, rootful: add `group_add: ["<host primary gid>"]` to the service and materialize the
+  secrets dir as 0750 / files 0640 with that group, only when the primary group is a private user group
+  (single member, same name as the user); otherwise refuse with the doctor hint. Never chown to uid
+  1000 and never use ACLs for uid 1000: on the host that uid may be another person.
+- Rootless Docker: container uid 1000 is host uid `subuid_start + 999`. Options to validate: run the
+  container with `userns_mode: keep-id`-like mapping (Podman only), or materialize the secrets into a
+  tmpfs volume via `docker compose exec` at start instead of a bind mount. Prefer the latter (no host
+  files owned by subordinate uids).
+- SELinux: add `bind: { selinux: z }` to the three read-only binds when the doctor condition holds,
+  recorded in project.json so the generated compose.yaml is stable.
+- Multi-arch: `docker buildx build --platform linux/amd64,linux/arm64` for a published image; local
+  builds stay native.
+
 ## Known gaps
 
 - **Intel (amd64) hosts** are not tested. The image is built natively on the host from a multi-arch
   base, so amd64 should work, but no amd64 run has been recorded.
-- **Linux / Windows hosts** are untested; the host data root falls back to `$XDG_DATA_HOME/minions`
-  on non-macOS hosts.
+- **Linux hosts** are a preview with no live run recorded (see [Linux hosts (preview)](#linux-hosts-preview)).
+  **Windows** is not supported (later, low priority).
 - **No prebuilt image** is published; the first `minions start` builds `minions-runtime:<version>`
   locally (needs network access to Docker Hub, Debian mirrors, and npm). The image carries a
   `minions.build` label (hash of `dist/cli.js`, the Dockerfile and `package.json`); `minions start`
@@ -74,7 +128,7 @@ fake GitHub API; the pre-filled token URL follows GitHub's documented template U
 - **Secret file ownership**: the materialized files in `/opt/minions/secrets` (GitHub token, Telegram
   bot token, Claude key) are 0600 files owned by the host user. Docker Desktop on macOS maps bind-mount ownership so the
   container user (uid 1000) can read it. On a Linux Docker Engine whose host user is not uid 1000,
-  the container cannot read it (untested).
+  or with rootless Docker, the container cannot read it; `minions doctor` warns (`docker.uid`, `docker.rootless`).
 - **Outbound network is unrestricted** in the container (`network: outbound-internet`). There is no
   egress allowlist, and the container can reach the host/LAN like any Docker Desktop container.
 - **Single container, shared credentials**: engineer, tester, and reviewer run in one container and
