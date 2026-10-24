@@ -119,7 +119,8 @@ minions resume --starts               # if starts were left paused (status shows
 ```
 
 Cancelling keeps worktrees and branches; a late submit from the cancelled worker is refused, and the
-coordinator re-dispatches the task on its next pass. If an upgrade drain is waiting on the lease,
+task is marked `blocked` ("owner cancelled" note) so the coordinator does not re-dispatch it. Set it
+back to `ready` (`minions backlog update` or Backlog.md) to have it picked up again. If an upgrade drain is waiting on the lease,
 `minions upgrade --now` releases the remaining workers instead (reported as interrupted).
 
 ## Telegram: pairing, no replies, or "another process is polling this bot"

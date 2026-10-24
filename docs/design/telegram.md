@@ -328,7 +328,10 @@ Claude (the host CLI delegates it to the project runtime):
 | cancel workers | "cancel <task>" / "cancel all" | `minions work cancel <taskId…> \| --all [--reason …]` |
 
 Cancel is best effort: it releases the task's active leases without a result (worktrees and branches are kept, a backlog
-note is written, a late worker submit is refused) and continues past a failing release. It cannot kill a running worker
+note is written, a late worker submit is refused) and continues past a failing release. Every task with a released lease
+(engineer, tester or reviewer stage alike; also with `--all`) is then marked `blocked` with an "owner cancelled" note, so
+the next orchestrate pass does not re-dispatch it; the owner sets it back to `ready` to resume. Done, delivered and
+cancelled tasks keep their status; a backlog error while blocking is reported (`blockFailed`, exit code 1). It cannot kill a running worker
 subagent itself; the coordinator stops the released workers' subagents. Only exact short phrases count as controls;
 anything longer is an ordinary request for the coordinator.
 

@@ -453,7 +453,7 @@ export function register(program: Command): void {
       if (runtimeMode() === 'host') return delegate(cmd);
       emit(await spendCommand(o), { json: globalOpts(cmd).json, human: (d) => [humanSpend(d), ...(d.notice ? [d.notice] : [])].join('\n') });
     }));
-  work.command('cancel [taskIds...]').description('Best-effort cancel: release every active worker lease of the given tasks (or --all) without a result; worktrees and branches are kept')
+  work.command('cancel [taskIds...]').description('Best-effort cancel: release every active worker lease of the given tasks (or --all) without a result and mark those tasks blocked; worktrees and branches are kept')
     .option('--all', 'cancel every active lease')
     .option('--reason <text>', 'why (recorded in the backlog note)', 'cancelled by the owner')
     .action(action(async (taskIds: string[], o: { all?: boolean; reason: string }, cmd: Command) => {
@@ -461,9 +461,9 @@ export function register(program: Command): void {
       if (!o.all && !taskIds.length) throw new MinionsError('PRECONDITION', 'Name the task(s) to cancel, or pass --all.');
       if (o.all && taskIds.length) throw new MinionsError('PRECONDITION', 'Use task ids or --all, not both.');
       const s = await scheduler();
-      const r = await cancelWork({ db: getDb(), release: (id, why) => s.release(id, why) }, { taskIds, all: !!o.all }, o.reason);
+      const r = await cancelWork({ db: getDb(), release: (id, why) => s.release(id, why), backlog: await getBacklog() }, { taskIds, all: !!o.all }, o.reason);
       emit(r, { json: globalOpts(cmd).json, human: formatCancel });
-      if (r.failed.length) process.exitCode = 1;
+      if (r.failed.length || r.blockFailed.length) process.exitCode = 1;
     }));
   work.command('publish <taskId>').description('Publish an approved task (branch / pull-request delivery); idempotent, retryable')
     .action(action(async (taskId: string, _o: unknown, cmd: Command) => {
