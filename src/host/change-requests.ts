@@ -34,7 +34,7 @@ import { inMinionsContainer } from '../runtime/paths.js';
 import {
   assertOfferOpen, consumeOffer, findOffer, isOwnerRequest, isOwnerRequestId, readJournal, recordOffer, recordOutcome, type OfferEntry, type RequestSnapshot,
 } from './change-journal.js';
-import { applyUndo, beginHistory, checkUndo, completeHistory, validateRestore } from './config-history.js';
+import { applyUndo, beginHistory, checkUndo, completeHistory, strongestEffect, undoDiff, validateRestore } from './config-history.js';
 import { packageRoot } from './docker.js';
 import { loadEffectiveConfig, loadProjectJson, type ProjectJson } from './project.js';
 import { projectForPath } from './registry.js';
@@ -42,7 +42,7 @@ import {
   applySetting, effectText, formatSet, restartCoordinator, RESTART_LATER, UPGRADE_LATER,
   type RestartOutcome, type SetResult, type SettingsRuntime,
 } from './settings-cli.js';
-import { formatValue, loadSettingsContext, parseSettingValue, planSetting, requireSetting, settingDef, takesEffectOf, type SettingLayer, type TakesEffect } from './settings.js';
+import { formatValue, loadSettingsContext, parseSettingValue, planSetting, requireSetting, takesEffectOf, type SettingLayer, type TakesEffect } from './settings.js';
 
 // ---------------------------------------------------------------- plan and digest
 
@@ -55,8 +55,11 @@ export interface ChangePlan {
   kind: PlanKind;
   /** 'owner': typed by the owner in the manager chat (absent for a container request, so older digests stay valid). */
   origin?: 'owner';
-  /** undo: the change it reverts and the sha256 of the file text that change wrote (the compare-and-swap value). */
-  undo?: { target: string; expectSha256: string };
+  /**
+   * undo: the change it reverts, the sha256 of the file text that change wrote (the compare-and-swap value) and of the
+   * text it restores, and every setting the restore changes in that file (`change` is the first, the entry's own key).
+   */
+  undo?: { target: string; expectSha256: string; restoreSha256: string; changes: { key: string; from: unknown; to: unknown; class: string }[] };
   /** The effective configRevision the plan was computed against. */
   configRevision: number;
   /** The request's reason as shown to the owner: quoted, control characters stripped, cut to 300 characters. */
@@ -231,24 +234,29 @@ export async function buildPlan(project: ProjectJson, req: RequestSnapshot, deps
   throw new MinionsError('PRECONDITION', `Change request ${req.id}: unknown kind "${displayText(String(req.kind))}"; nothing to apply.`, `Reject it: \`minions settings reject ${req.id}\`.`);
 }
 
-/** The undo of a config change applied by the host manager: restore the file text before it (compare-and-swap). */
+/**
+ * The undo of a config change applied by the host manager: restore the file text before it (compare-and-swap). The
+ * history entry is not trusted: the file comes from the project and the entry's layer, and the plan lists every
+ * setting the restore changes (the loosening check runs over all of them); anything else changing refuses.
+ */
 async function planUndo(project: ProjectJson, req: RequestSnapshot, base: Omit<ChangePlan, 'kind' | 'configRevision' | 'interrupts' | 'steps'>, configRevision: number): Promise<{ plan: ChangePlan; notes: string[] }> {
   const target = req.payload.target;
   if (typeof target !== 'string') throw new MinionsError('PRECONDITION', `Request ${req.id}: malformed undo payload; nothing to apply.`);
-  const { entry, expectSha256 } = await checkUndo(project, target);
-  await validateRestore(project, entry);
-  const def = settingDef(entry.key);
-  const cls = def?.class ?? 'live';
-  const takesEffect = takesEffectOf(cls);
-  const from = entry.to ?? undefined;
-  const to = entry.from ?? undefined;
+  const check = await checkUndo(project, target);
+  const { entry, file, expectSha256, restoreSha256 } = check;
+  const restored = await validateRestore(project, entry);
+  const changes = undoDiff(await loadSettingsContext(project), check, restored);
+  const first = changes[0]!;
+  const takesEffect = strongestEffect(changes);
+  const loosening = changes.filter((c) => c.loosens);
   return {
     plan: {
-      ...base, kind: 'undo', configRevision, undo: { target, expectSha256 },
-      change: { key: entry.key, from, to, layer: entry.layer, file: entry.file, class: cls, takesEffect },
-      loosens: def?.loosens ? def.loosens(from, to) : null,
+      ...base, kind: 'undo', configRevision,
+      undo: { target, expectSha256, restoreSha256, changes: changes.map((c) => ({ key: c.key, from: c.from, to: c.to, class: c.class })) },
+      change: { key: first.key, from: first.from, to: first.to, layer: entry.layer, file, class: first.class, takesEffect },
+      loosens: loosening.length === 0 ? null : changes.length === 1 ? loosening[0]!.loosens : loosening.map((c) => `${c.key}: ${c.loosens}`).join('; '),
       interrupts: takesEffect === 'restart' ? `nothing now; ${RESTART_LATER}` : takesEffect === 'upgrade' ? `nothing now; ${UPGRADE_LATER}` : null,
-      steps: [`restore ${entry.file} as it was before ${target} (in the host manager; refused unless the file is still exactly what ${target} wrote, sha256 ${expectSha256.slice(0, 12)})`],
+      steps: [`restore ${file} as it was before ${target} (in the host manager; refused unless the file is still exactly what ${target} wrote, sha256 ${expectSha256.slice(0, 12)})`],
     },
     notes: [effectText(takesEffect), `the whole file returns to its text before ${target} (${entry.at})${entry.layer === 'shared' ? '; configRevision still moves forward' : ''}`].filter(Boolean),
   };
@@ -260,7 +268,9 @@ export function formatPlan(plan: ChangePlan, digest: string, notes: string[]): s
     `${owner ? 'owner request' : 'change request'} ${plan.requestId} (${plan.kind}) for project ${plan.projectId}, configRevision ${plan.configRevision}`,
     owner ? 'requested by you in the manager chat (typing the command is not consent: confirm this exact plan)' : `reason (from the container, untrusted): ${plan.reason}`,
     ...(plan.undo ? [`undoes: ${plan.undo.target}`] : []),
-    ...(plan.change ? [`change: ${plan.change.key}: ${formatValue(plan.change.from)} -> ${formatValue(plan.change.to)} (${plan.change.layer} layer, ${plan.change.file}; class ${plan.change.class})`] : []),
+    ...(plan.undo && plan.undo.changes.length > 1
+      ? plan.undo.changes.map((c) => `change: ${c.key}: ${formatValue(c.from)} -> ${formatValue(c.to)} (${plan.change?.layer ?? ''} layer, ${plan.change?.file ?? ''}; class ${c.class})`)
+      : plan.change ? [`change: ${plan.change.key}: ${formatValue(plan.change.from)} -> ${formatValue(plan.change.to)} (${plan.change.layer} layer, ${plan.change.file}; class ${plan.change.class})`] : []),
     ...(plan.loosens ? [`LOOSENS POLICY: ${plan.loosens}`] : []),
     ...(plan.interrupts ? [`interrupts: ${plan.interrupts}`] : []),
     'runs:', ...plan.steps.map((s) => `  ${s}`),
@@ -446,7 +456,7 @@ async function execute(project: ProjectJson, plan: ChangePlan, offer: OfferEntry
     return;
   }
   if (plan.kind === 'undo') {
-    const r = await applyUndo(project, { target: plan.undo!.target, expectSha256: plan.undo!.expectSha256, undoId: plan.requestId, now: deps.now?.() });
+    const r = await applyUndo(project, { target: plan.undo!.target, expectSha256: plan.undo!.expectSha256, restoreSha256: plan.undo!.restoreSha256, undoId: plan.requestId, now: deps.now?.() });
     out.applied = true;
     out.status = 'applied';
     out.detail = undoDetail(plan);
@@ -470,7 +480,7 @@ async function execute(project: ProjectJson, plan: ChangePlan, offer: OfferEntry
 }
 
 export const undoDetail = (plan: ChangePlan) =>
-  `undid ${plan.undo?.target ?? '?'}: ${plan.change?.key ?? 'setting'}: ${formatValue(plan.change?.from)} -> ${formatValue(plan.change?.to)} (${plan.change?.file ?? ''} restored)`;
+  `undid ${plan.undo?.target ?? '?'}: ${(plan.undo?.changes.length ? plan.undo.changes : plan.change ? [plan.change] : []).map((c) => `${c.key}: ${formatValue(c.from)} -> ${formatValue(c.to)}`).join(', ') || 'setting'} (${plan.change?.file ?? ''} restored)`;
 
 async function finish(project: ProjectJson, out: ApplyOutcome, deps: ChangeRequestDeps): Promise<void> {
   const r = await recordApplyResult(project, { requestId: out.requestId, digest: out.digest, status: out.status === 'applied' ? 'applied' : 'failed', detail: out.detail }, deps);

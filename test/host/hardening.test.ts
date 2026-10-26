@@ -130,6 +130,13 @@ describe('host runtime sandbox settings (H4, M3, M5, M7, L1)', () => {
     expect(s.blockReadsOutsideWorkingDirectories).toBe(true);
   });
 
+  it('the config history (<project dir>/config-history, what /undo restores from) is not editable (task-53.5.3)', () => {
+    const dir = `//${h.projectDir.slice(1)}/config-history`;
+    expect(s.deny).toContain(`Edit(${dir}/**)`);
+    // `*.json` of the project dir does not match across '/': the subdirectory needs its own rule.
+    expect(s.deny).toContain(`Edit(//${h.projectDir.slice(1)}/*.json)`);
+  });
+
   it('host manager state under the data root is denied to Read and Edit (directory rule, task-53.5.5)', () => {
     const mgr = `//${h.hostRoot.slice(1)}/manager`;
     expect(s.deny).toEqual(expect.arrayContaining([`Edit(${mgr})`, `Edit(${mgr}/**)`, `Read(${mgr})`, `Read(${mgr}/**)`]));

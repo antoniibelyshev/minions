@@ -444,6 +444,17 @@ Built in task-53.5.3 (phase 4, part 3): the owner change commands `/set <key> <v
   `config.local.json` when it did not exist before. The undo runs in the manager process: there is no CLI command for it.
   An undo has its own history entry, so it can be undone in turn. Known gap: a terminal edit of the same file between
   the history snapshot and the child's write would be reverted too by a later undo (the window is one child process).
+- **The history entry is not trusted.** It is a file on the host, and a tampered one must not write anywhere else or
+  change more than the plan shows. The file to restore comes from the project and the entry's layer
+  (`config.local.json` or the project config). An entry that names another file, project or request id is refused,
+  and so is one that names the shared layer of a private install. The plan lists every setting the restore changes in
+  that file (the file now compared with the saved text). Each one shows its effective value now and after. The
+  loosening check runs over all of them, and any loosening asks twice. The entry's own key comes first. The restore
+  is refused when it does not change that key, when it changes no setting, or when it changes anything in the file
+  that is not a setting. `configRevision` of the shared layer is the exception, since it moves forward anyway. The
+  plan also carries the sha256 of the saved text, and the write is refused if the entry changed after the plan was
+  made. The host-runtime agent may not edit `<project dir>/config-history/`: there is an
+  `Edit(<project dir>/config-history/**)` deny next to the other project subdirectories.
 - **Follow-ups.** After an applied config change that needs a restart or an upgrade, the outcome says to send
   `/restart` or `/upgrade` (each its own plan to confirm). The manager does not offer them by itself yet.
 

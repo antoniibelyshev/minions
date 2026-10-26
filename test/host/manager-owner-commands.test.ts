@@ -366,6 +366,109 @@ describe('/undo: restore the config file a change wrote, compare-and-swap', () =
   });
 });
 
+// ---------------------------------------------------------------- /undo with a tampered history entry
+
+describe('/undo never trusts the history entry (file, layer, hidden keys)', () => {
+  async function applied() {
+    const i = await install();
+    const s = setup([i.project]);
+    const o = await s.cmds.propose(null, { kind: 'config-set', key: 'execution.maxActiveTasks', value: '4', layer: 'local' });
+    const before = existsSync(i.local) ? readFileSync(i.local, 'utf8') : null;
+    await s.confirm(o);
+    const entryFile = join(H.configHistoryDir(i.project.projectId), `${o.requestId}.json`);
+    const tamper = (f: (e: Record<string, any>) => void) => { const e = readJson(entryFile); f(e); writeFileSync(entryFile, JSON.stringify(e, null, 2)); };
+    return { ...i, s, set: o, before, entryFile, tamper };
+  }
+  const offers = () => journal().filter((x) => x.type === 'offer');
+
+  it('a key hidden in the saved text is listed in the plan, and its loosening asks twice', async () => {
+    const { project, s, set, local, tamper } = await applied();
+    expect((await loadEffectiveConfig(project)).config.verification.reviewerRequired).toBe(true);
+    // `after` is untouched, so the compare-and-swap still passes; `before` now also turns the reviewer off.
+    tamper((e) => { const b = JSON.parse(e.before ?? '{}'); e.before = JSON.stringify({ ...b, verification: { reviewerRequired: false } }, null, 2) + '\n'; });
+    const u = await s.cmds.propose(null, { kind: 'undo', target: set.requestId });
+    expect(u.summary).toMatch(/^undo ow_[0-9a-f]{8}: execution.maxActiveTasks: 4 -> .* \(\+1 more setting\)$/);
+    expect(u.text).toMatch(/change: execution.maxActiveTasks: 4 -> /);
+    expect(u.text).toContain('change: verification.reviewerRequired: true -> false');
+    expect(u.text).toContain('LOOSENS POLICY: verification.reviewerRequired: tasks can be delivered without a reviewer approval');
+    // A loosening plan: the transport asks for a second tap.
+    expect(u.loosens).toMatch(/without a reviewer approval/);
+    const plan = offers().at(-1)!.plan;
+    expect(plan.undo.changes.map((c: { key: string }) => c.key)).toEqual(['execution.maxActiveTasks', 'verification.reviewerRequired']);
+    expect(readJson(local).execution.maxActiveTasks).toBe(4); // nothing written yet
+  });
+
+  it('refuses when the saved text would change anything that is not a setting', async () => {
+    const { s, set, local, tamper } = await applied();
+    const text = readFileSync(local, 'utf8');
+    tamper((e) => { const b = JSON.parse(e.before ?? '{}'); e.before = JSON.stringify({ ...b, sensitivePaths: [] }); }); // valid config, but no setting
+    const e = await reason(s.cmds.propose(null, { kind: 'undo', target: set.requestId }));
+    expect(e.code).toBe('PRECONDITION');
+    expect(e.details).toMatchObject({ refusal: 'history-mismatch' });
+    expect(e.message).toMatch(/would also change sensitivePaths, which \/undo does not restore/);
+    expect(offers()).toHaveLength(1);
+    expect(readFileSync(local, 'utf8')).toBe(text);
+  });
+
+  it("refuses when the entry's key is not what the restore changes", async () => {
+    const { s, set, tamper } = await applied();
+    tamper((e) => { e.key = 'execution.maxEngineers'; });
+    const e = await reason(s.cmds.propose(null, { kind: 'undo', target: set.requestId }));
+    expect(e.message).toMatch(/names execution.maxEngineers, but restoring it would change execution.maxActiveTasks instead/);
+    expect(offers()).toHaveLength(1);
+  });
+
+  it("an entry pointing at another file is refused and that file is never read or written", async () => {
+    const { s, set, local, tamper } = await applied();
+    const evil = join(env.root, 'evil.json');
+    const text = readFileSync(local, 'utf8');
+    // The tampered entry claims to have written `evil` (its after matches what is there).
+    writeFileSync(evil, text);
+    tamper((e) => { e.file = evil; e.before = '{"execution":{"maxActiveTasks":1}}\n'; });
+    const e = await reason(s.cmds.propose(null, { kind: 'undo', target: set.requestId }));
+    expect(e.code).toBe('PRECONDITION');
+    expect(e.details).toMatchObject({ refusal: 'history-mismatch' });
+    expect(e.message).toContain(`expected ${local}`);
+    expect(readFileSync(evil, 'utf8')).toBe(text);
+    expect(readFileSync(local, 'utf8')).toBe(text);
+    // Nor at write time, whatever the caller passes.
+    const w = await reason(H.applyUndo(await loadProjectJson(set.projectId), { target: set.requestId, expectSha256: H.textSha(text), restoreSha256: H.textSha('{"execution":{"maxActiveTasks":1}}\n'), undoId: 'ow_eeeeeeee' }));
+    expect(w.details).toMatchObject({ refusal: 'history-mismatch' });
+    expect(readFileSync(evil, 'utf8')).toBe(text);
+    expect(offers()).toHaveLength(1);
+  });
+
+  it('an entry of another layer, project or request is refused', async () => {
+    const { s, set, tamper } = await applied();
+    tamper((e) => { e.layer = 'shared'; }); // a private install has no shared layer
+    expect((await reason(s.cmds.propose(null, { kind: 'undo', target: set.requestId }))).code).toBe('PRECONDITION');
+    tamper((e) => { e.layer = 'local'; e.projectId = 'other'; });
+    expect((await reason(s.cmds.propose(null, { kind: 'undo', target: set.requestId }))).details).toMatchObject({ refusal: 'history-mismatch' });
+    tamper((e) => { e.projectId = set.projectId; e.requestId = 'ow_00000001'; });
+    expect((await reason(s.cmds.propose(null, { kind: 'undo', target: set.requestId }))).details).toMatchObject({ refusal: 'history-mismatch' });
+    expect(offers()).toHaveLength(1);
+  });
+
+  it('an entry tampered after the undo was offered: the confirm is refused and nothing is written', async () => {
+    const { s, set, local, tamper } = await applied();
+    const u = await s.cmds.propose(null, { kind: 'undo', target: set.requestId });
+    expect(u.loosens).toBeNull();
+    const text = readFileSync(local, 'utf8');
+    tamper((e) => { const b = JSON.parse(e.before ?? '{}'); e.before = JSON.stringify({ ...b, verification: { reviewerRequired: false } }); });
+    await s.confirm(u);
+    expect(s.outcomes.at(-1)!.status).not.toBe('applied');
+    expect(readFileSync(local, 'utf8')).toBe(text);
+    // At write time too: the restored text must be the one the plan was computed from.
+    // The plan as first offered (a refused confirmation is re-offered with a fresh plan).
+    const plan = offers().find((x) => x.requestId === u.requestId)!.plan;
+    const project = await loadProjectJson(set.projectId);
+    const w = await reason(H.applyUndo(project, { target: set.requestId, expectSha256: plan.undo.expectSha256, restoreSha256: plan.undo.restoreSha256, undoId: 'ow_dddddddd' }));
+    expect(w.code).toBe('CONFLICT');
+    expect(w.details).toMatchObject({ refusal: 'history-mismatch' });
+    expect(readFileSync(local, 'utf8')).toBe(text);
+  });
+});
+
 // ---------------------------------------------------------------- sync only (upgrade --sync-only)
 
 describe('runSyncOnly (minions upgrade --sync-only)', () => {
@@ -635,7 +738,7 @@ describe('QA: owner command security edges', () => {
     const o = await s.cmds.propose(null, { kind: 'config-set', key: 'execution.maxActiveTasks', value: '4', layer: 'local' });
     await s.confirm(o);
     const text = readFileSync(local, 'utf8');
-    const e = await reason(H.applyUndo(project, { target: o.requestId, expectSha256: 'f'.repeat(64), undoId: 'ow_ffffffff' }));
+    const e = await reason(H.applyUndo(project, { target: o.requestId, expectSha256: 'f'.repeat(64), restoreSha256: H.textSha(null), undoId: 'ow_ffffffff' }));
     expect(e.code).toBe('CONFLICT');
     expect(e.details).toMatchObject({ refusal: 'drift' });
     expect(readFileSync(local, 'utf8')).toBe(text);

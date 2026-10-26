@@ -221,7 +221,10 @@ function wellFormed(r: unknown): r is ChangeRequestView {
 export function planSummary(plan: ChangePlan): string {
   if (plan.kind === 'config-set' && plan.change) return `set ${plan.change.key}: ${formatValue(plan.change.from)} -> ${formatValue(plan.change.to)}`;
   if (plan.kind === 'restart') return 'restart the coordinator';
-  if (plan.kind === 'undo' && plan.change) return `undo ${plan.undo?.target ?? '?'}: ${plan.change.key}: ${formatValue(plan.change.from)} -> ${formatValue(plan.change.to)}`;
+  if (plan.kind === 'undo' && plan.change) {
+    const more = (plan.undo?.changes.length ?? 1) - 1;
+    return `undo ${plan.undo?.target ?? '?'}: ${plan.change.key}: ${formatValue(plan.change.from)} -> ${formatValue(plan.change.to)}${more > 0 ? ` (+${more} more setting${more === 1 ? '' : 's'})` : ''}`;
+  }
   if (plan.kind === 'sync') return 'sync the host base branch (strict fast-forward)';
   return plan.steps[0] ?? plan.kind;
 }
@@ -440,7 +443,7 @@ export class HostManager {
           ? { fromContainer: null, dryRun: false, syncOnly: true } : { fromContainer: fromContainerOf(offer.request.payload), dryRun: false });
         result = { status: r.ok ? 'applied' : 'failed', detail: `${plan.kind}: ${r.summary}` };
       } else if (plan.kind === 'undo') {
-        const u = await applyUndo(project, { target: plan.undo!.target, expectSha256: plan.undo!.expectSha256, undoId: offer.requestId, now: this.deps.now() });
+        const u = await applyUndo(project, { target: plan.undo!.target, expectSha256: plan.undo!.expectSha256, restoreSha256: plan.undo!.restoreSha256, undoId: offer.requestId, now: this.deps.now() });
         warnings.push(...u.warnings);
         result = { status: 'applied', detail: undoDetail(plan) };
       } else if (plan.kind === 'config-set' && plan.change) {
