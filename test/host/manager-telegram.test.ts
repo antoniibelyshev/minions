@@ -498,3 +498,119 @@ describe('HostManager views and transport choice', () => {
     expect((await M.chooseTransport(base)).kind).toBe('log');
   });
 });
+
+// ---------------------------------------------------------------- QA edge cases (task-53.5.2 QA)
+
+describe('QA edge cases', () => {
+  const LOOSE = 'agents may push branches to GitHub';
+  const fwd = (u: TelegramUpdate, extra: Record<string, unknown>): TelegramUpdate => ({ ...u, message: { ...u.message!, ...extra } as TelegramUpdate['message'] });
+
+  it('a tap by another user on the owner\'s private message, inline-mode taps and edited messages are dropped silently', async () => {
+    const api = botApi([[
+      tap(1, `c:${RID}:${NONCE}`, { from: STRANGER, chat: OWNER }),
+      tap(2, `r:${RID}:${NONCE}`, { from: STRANGER, chat: OWNER }),
+      { update_id: 3, callback_query: { id: 'cb3', data: `c:${RID}:${NONCE}`, from: { id: OWNER } } }, // inline message: no chat
+      { update_id: 4, edited_message: { message_id: 7, text: '/status', from: { id: OWNER }, chat: { id: OWNER, type: 'private' } } } as unknown as TelegramUpdate,
+      { update_id: 5, callback_query: { id: 'cb5', data: `c:${RID}:${NONCE}`, from: { id: OWNER, is_bot: true }, message: { message_id: 1, chat: { id: OWNER, type: 'private' } } } },
+    ]]);
+    const t = transport(api);
+    t.attach(fakeCommands());
+    await t.sendOffer(offer({ loosens: LOOSE }));
+    const before = api.calls.length;
+    expect(await t.receive(30_000)).toEqual([]);
+    expect(api.calls.slice(before).map((c) => c.method)).toEqual(['getUpdates']);
+  });
+
+  it('a stranger\'s d: tap after the owner\'s first tap neither confirms nor disarms; the owner\'s d: tap still confirms', async () => {
+    const api = botApi([
+      [tap(1, `c:${RID}:${NONCE}`)],
+      [tap(2, `d:${RID}:${NONCE}`, { from: STRANGER, chat: OWNER })],
+      [tap(3, `d:${RID}:${NONCE}`)],
+    ]);
+    const t = transport(api);
+    await t.sendOffer(offer({ loosens: LOOSE }));
+    expect(await t.receive(30_000)).toEqual([]);
+    expect(await t.receive(30_000)).toEqual([]);
+    expect(await t.receive(30_000)).toEqual([{ type: 'confirm', requestId: RID, nonce: NONCE }]);
+  });
+
+  it('the second tap at exactly 2 minutes confirms; one millisecond later it does not', async () => {
+    const api = botApi([[tap(1, `c:${RID}:${NONCE}`)], [tap(2, `d:${RID}:${NONCE}`)], [tap(3, `c:${RID}:${NONCE}`)], [tap(4, `d:${RID}:${NONCE}`)]]);
+    const t = transport(api);
+    await t.sendOffer(offer({ loosens: LOOSE }));
+    await t.receive(30_000);
+    api.clock.t += T.DOUBLE_TAP_MS;
+    expect(await t.receive(30_000)).toEqual([{ type: 'confirm', requestId: RID, nonce: NONCE }]);
+    await t.receive(30_000);
+    api.clock.t += T.DOUBLE_TAP_MS + 1;
+    expect(await t.receive(30_000)).toEqual([]);
+  });
+
+  it('a replayed d: tap sends nothing; repeated c: taps on a loosening offer never confirm', async () => {
+    const api = botApi([[tap(1, `c:${RID}:${NONCE}`), tap(2, `c:${RID}:${NONCE}`), tap(3, `c:${RID}:${NONCE}`)], [tap(4, `d:${RID}:${NONCE}`), tap(5, `d:${RID}:${NONCE}`)]]);
+    const t = transport(api);
+    await t.sendOffer(offer({ loosens: LOOSE }));
+    expect(await t.receive(30_000)).toEqual([]);
+    expect(await t.receive(30_000)).toEqual([{ type: 'confirm', requestId: RID, nonce: NONCE }]);
+  });
+
+  it('a c: tap on a loosening offer from the journal never confirms, and a failing journal lookup sends nothing', async () => {
+    const api = botApi([[tap(1, `c:${RID}:${NONCE}`)]]);
+    const t = transport(api, { lookup: async () => ({ requestId: RID, summary: 's', loosens: LOOSE }) });
+    expect(await t.receive(30_000)).toEqual([]);
+    const logs: string[] = [];
+    const api2 = botApi([[tap(2, `c:${RID}:${NONCE}`)]]);
+    const t2 = transport(api2, { logs, lookup: async () => { throw new Error('journal unreadable'); } });
+    expect(await t2.receive(30_000)).toEqual([]);
+    expect(api2.of('answerCallbackQuery')[0]!.body.text).toContain('nothing done');
+  });
+
+  it('oversized callback data is answered and refused', async () => {
+    const api = botApi([[tap(1, `c:${RID}:${NONCE}${'f'.repeat(40)}`), tap(2, 'x'.repeat(5000))]]);
+    const t = transport(api);
+    expect(await t.receive(30_000)).toEqual([]);
+    expect(api.of('answerCallbackQuery')).toHaveLength(2);
+  });
+
+  it('a corrupt offset file is logged (without the token) and ignored; the next batch rewrites it', async () => {
+    mkdirSync(managerDir(), { recursive: true });
+    writeFileSync(T.telegramOffsetPath(), '{not json');
+    const logs: string[] = [];
+    const api = botApi([[msg(9, '/help')]]);
+    await transport(api, { logs }).receive(30_000);
+    expect(api.of('getUpdates')[0]!.body.offset).toBeUndefined();
+    expect(logs.join('\n')).toContain('unreadable getUpdates offset');
+    expect(JSON.parse(readFileSync(T.telegramOffsetPath(), 'utf8'))).toMatchObject({ offset: 10 });
+    writeFileSync(T.telegramOffsetPath(), JSON.stringify({ version: 1, botId: '555666777', offset: -3 }));
+    const api2 = botApi();
+    await transport(api2, { logs }).receive(30_000);
+    expect(api2.of('getUpdates')[0]!.body.offset).toBeUndefined();
+  });
+
+  it('404 is a rejected token; a 429 error and every log line never include the token', async () => {
+    const denied = await transport(botApi([], { statuses: [404] })).receive(30_000).then(() => null, (e) => e);
+    expect(denied).toMatchObject({ code: 'AUTH_REQUIRED' });
+    const secret = TOKEN.split(':')[1]!;
+    const logs: string[] = [];
+    const leaky = (async (url: string | URL | Request, init?: RequestInit) => {
+      const method = String(url).split('/').at(-1);
+      if (method === 'getUpdates') return json(200, { ok: true, result: [tap(1, `c:${RID}:${NONCE}`, { messageId: 100 })] });
+      if (method === 'answerCallbackQuery' || method === 'editMessageText') throw new TypeError(`Failed to fetch ${String(url)}`);
+      if (method === 'sendMessage') return json(400, { ok: false, description: `Bad Request: echo ${String(url)}` });
+      return json(200, { ok: true, result: true });
+    }) as typeof fetch;
+    const t = T.telegramTransport({ token: TOKEN, access: ACCESS, fetch: leaky, log: (l) => logs.push(l), lookupOffer: async () => null, sleep: async () => undefined });
+    await t.receive(30_000);
+    await t.sendOutcome({ status: 'applying', projectId: PID, requestId: RID, text: 'Applying…' }).catch((e) => logs.push(String(e.message)));
+    expect(logs.length).toBeGreaterThanOrEqual(3);
+    for (const l of logs) expect(l).not.toContain(secret);
+  });
+
+  it('a forwarded message from the owner is handled like the owner\'s own (read-only commands only)', async () => {
+    const api = botApi([[fwd(msg(1, '/status'), { forward_origin: { type: 'user', sender_user: { id: STRANGER } } })]]);
+    const t = transport(api);
+    t.attach(fakeCommands());
+    expect(await t.receive(30_000)).toEqual([]);
+    expect(api.of('sendMessage').map((c) => c.body.text)).toEqual(['status for all']);
+  });
+});
