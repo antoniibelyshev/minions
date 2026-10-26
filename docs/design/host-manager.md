@@ -189,6 +189,14 @@ The build task adds the `recreate` class to `SettingApply` (today `live | prompt
 both meaning restart here), a `hostOwned` flag on `SettingDef`, and a guard test that fails when a schema key has no
 class. The guard test also checks each class against the code that applies the key.
 
+Built in task-53.2: the table lives in `src/config/setting-classes.ts` (`KEY_CLASSES`; an entry covers its subtree,
+the most specific wins). `test/setting-classes.test.ts` walks `MinionsConfigSchema` and fails on an unclassified or
+stale key, checks every `settings` item against the table, and checks that every `prompt` item changes the generated
+plugin. `settings set` reports `takesEffect` (`now` / `restart` / `upgrade`). No `settings` item is `recreate` yet:
+the compose limits come from `project.json` `container` (written by install / setup), not from the config layers, so
+a `settings set container.*` would not be picked up by `minions upgrade`; exposing them needs that sync first.
+`git.identity` (no single-value setting type yet) is left to `minions setup` for now.
+
 ### Host-owned settings
 
 Host-owned keys are writable only by `minions settings` in the host terminal, or by an owner-initiated `/set` in the

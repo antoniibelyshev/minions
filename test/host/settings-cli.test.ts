@@ -178,3 +178,48 @@ describe('minions settings (CLI)', () => {
     expect(existsSync(local)).toBe(false);
   });
 });
+
+describe('settings set: what took effect now vs needs a restart or an upgrade (task-53.2)', () => {
+  it('--json reports class, hostOwned and takesEffect for live, restart and host-owned keys; --list --json carries the new fields', async () => {
+    const { repo } = await install();
+    const live = envelope((await cli(repo, ['settings', 'set', 'execution.maxActiveTasks', '3', '--yes', '--json'])).out);
+    expect(live.ok).toBe(true);
+    expect(live.data).toMatchObject({ key: 'execution.maxActiveTasks', class: 'live', hostOwned: false, takesEffect: 'now',
+      needsRestart: false, needsUpgrade: false, restart: null, written: true });
+    expect(live.data.effect).toMatch(/^takes effect now: the runtime reads the regenerated config on its next command/);
+
+    const restart = envelope((await cli(repo, ['settings', 'set', 'communication.progress', 'quiet', '--no-restart', '--json'])).out);
+    expect(restart.data).toMatchObject({ class: 'restart', hostOwned: false, takesEffect: 'restart', needsRestart: true, needsUpgrade: false,
+      restart: { action: 'offered' } });
+    expect(restart.data.effect).toMatch(/after a coordinator restart/);
+
+    const owned = envelope((await cli(repo, ['settings', 'set', 'capabilities.git.push', 'deny', '--no-restart', '--json'])).out);
+    expect(owned.data).toMatchObject({ class: 'restart', hostOwned: true, takesEffect: 'restart' });
+
+    // Unchanged: nothing takes effect.
+    const same = envelope((await cli(repo, ['settings', 'set', 'execution.maxActiveTasks', '3', '--yes', '--json'])).out);
+    expect(same.data).toMatchObject({ changed: false, takesEffect: null, effect: '' });
+
+    const list = envelope((await cli(repo, ['settings', '--list', '--json'])).out).data as { settings: Record<string, unknown>[] };
+    const row = (k: string) => list.settings.find((s) => s.key === k)!;
+    expect(row('execution.maxActiveTasks')).toMatchObject({ apply: 'live', class: 'live', hostOwned: false, needsRestart: false, needsUpgrade: false });
+    expect(row('delivery.mode')).toMatchObject({ apply: 'prompt', class: 'restart', hostOwned: true, needsRestart: true, needsUpgrade: false });
+    expect(row('models.coordinator')).toMatchObject({ apply: 'launch', class: 'restart', hostOwned: false, needsRestart: true });
+    for (const s of list.settings) expect(Object.keys(s), String(s.key)).toEqual(expect.arrayContaining(['class', 'hostOwned', 'needsUpgrade', 'apply', 'needsRestart']));
+  });
+
+  it('human output says when the change takes effect; --dry-run says it would', async () => {
+    const { repo } = await install();
+    const live = (await cli(repo, ['settings', 'set', 'execution.maxRepairCyclesBeforeReplan', '2'])).out;
+    expect(live).toMatch(/takes effect now: the runtime reads the regenerated config on its next command/);
+    expect(live).not.toMatch(/coordinator restart:/);
+    const restart = (await cli(repo, ['settings', 'set', 'models.effortByRole.coordinator', 'high', '--no-restart'])).out;
+    expect(restart).toMatch(/takes effect after a coordinator restart/);
+    expect(restart).toMatch(/coordinator restart: offered/);
+    const dry = (await cli(repo, ['settings', 'set', 'communication.progress', 'tasks', '--dry-run'])).out;
+    expect(dry).toMatch(/would take effect after a coordinator restart/);
+    const list = (await cli(repo, ['settings', '--list'])).out;
+    expect(list).toMatch(/delivery\.mode = \S+ +\([^)]*; restart; host-owned\)/);
+    expect(list).toMatch(/execution\.maxActiveTasks = \S+ +\(project config\)\n/);
+  });
+});
