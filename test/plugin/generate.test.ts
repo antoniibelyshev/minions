@@ -661,6 +661,22 @@ describe('owner behaviour defaults (task-34)', () => {
     expect(coord).toMatch(/When the channel was down, say so once it is back and ask the owner to resend anything important/);
   });
 
+  it('task-58: threads Telegram replies under the owner message they answer', async () => {
+    const base = defaults();
+    const coord = await (await gen({ ...base, communication: { ...base.communication, channel: 'telegram' } })).read('coordinator.md');
+    const comm = coord.slice(coord.indexOf('## Communicating with the user'));
+    expect(comm).toMatch(/\*\*Threads\.\*\* When you answer an owner Telegram message .*pass `reply_to` = that message's `message_id` to `reply`, even when it is the latest message/);
+    expect(comm).toContain('End every Telegram message with `ref: #<id>`');
+    expect(comm).toContain('an owner message without a ref answers your latest message or poll');
+    expect(comm).toMatch(/Unsolicited notifications \(delivered, blocker\) stay unthreaded unless you know the owner message that requested the work/);
+    expect(comm).toMatch(/On an outbox resend, take `reply_to` from the message id the key carries/);
+    // The threading rule sits right before the outbox bullet.
+    expect(comm.indexOf('**Threads.**')).toBeGreaterThan(-1);
+    expect(comm.indexOf('**Threads.**')).toBeLessThan(comm.indexOf('**Notification outbox.**'));
+    const terminal = defaults(); terminal.communication.channel = 'terminal';
+    expect(await (await gen(terminal)).read('coordinator.md')).not.toContain('**Threads.**');
+  });
+
   it('local delivery, project-owner: verifies the merge before the base moves, then commits or aborts', async () => {
     const base = defaults('project-owner');
     const cfg = { ...base, delivery: { ...base.delivery, mode: 'local' as const, provider: 'none' as const }, git: { ...base.git, baseBranch: 'trunk' } };
