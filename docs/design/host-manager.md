@@ -192,9 +192,15 @@ class. The guard test also checks each class against the code that applies the k
 Built in task-53.2: the table lives in `src/config/setting-classes.ts` (`KEY_CLASSES`; an entry covers its subtree,
 the most specific wins). `test/setting-classes.test.ts` walks `MinionsConfigSchema` and fails on an unclassified or
 stale key, checks every `settings` item against the table, and checks that every `prompt` item changes the generated
-plugin. `settings set` reports `takesEffect` (`now` / `restart` / `upgrade`). No `settings` item is `recreate` yet:
-the compose limits come from `project.json` `container` (written by install / setup), not from the config layers, so
-a `settings set container.*` would not be picked up by `minions upgrade`; exposing them needs that sync first.
+plugin. `settings set` reports `takesEffect` (`now` / `restart` / `upgrade`).
+
+Task-53.9: the compose limits come from `project.json` `container` (written by install / setup). The `files` step of
+`minions upgrade` (`refreshForUpgrade`, `syncContainerLimits` in `src/host/install.ts`) now copies
+`container.cpus`, `memoryMiB`, `pidsLimit` and `tmpSizeMiB` from the effective config into `project.json` before it
+regenerates compose, so the recreate uses them. They are the `recreate` items of the Container group. Chosen over
+reading the config at compose time so `project.json` stays the one record that compose, `doctor` and the install plan
+read. `minions start` does not sync: a new limit waits for the upgrade the setting announces. `container.network` and
+`publishPorts` (host-owned isolation) are not copied and are not settings items: they stay with `minions setup`.
 `git.identity` (no single-value setting type yet) is left to `minions setup` for now.
 
 ### Host-owned settings

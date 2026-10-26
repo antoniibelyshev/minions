@@ -20,7 +20,7 @@ import {
 } from './credentials.js';
 import { composeYaml, type Runner } from './docker.js';
 import { composeHint, daemonHint } from './linux-host.js';
-import { ProjectJsonSchema, projectConfigPath, resolveEffective, runtimeProjectInfo, sharedConfigView, type ProjectJson } from './project.js';
+import { ProjectJsonSchema, loadEffectiveConfig, projectConfigPath, resolveEffective, runtimeProjectInfo, sharedConfigView, type ProjectJson } from './project.js';
 import { bindProject, gitCommonDir, loadRegistry, repoRoot, resolveIdentity, saveRegistry, sharedProjectId, type Identity, type Registry } from './registry.js';
 import { runWizard, type WizardIO } from './wizard.js';
 import { runGithubSetup, type GithubSetupResult } from './github-setup.js';
@@ -596,6 +596,37 @@ export async function refreshDerived(project: ProjectJson, effective: MinionsCon
   }
   if (changed) await writeJson(paths.manifestJson, manifest);
   return warnings;
+}
+
+/** The container resource limits (recreate class) that `minions upgrade` copies from the config into project.json. */
+export const CONTAINER_LIMIT_KEYS = ['cpus', 'memoryMiB', 'pidsLimit', 'tmpSizeMiB'] as const;
+
+/**
+ * project.json with its container resource limits taken from the effective config (task-53.9). compose.yaml is
+ * generated from project.json, which install / setup wrote from the config once; without this a
+ * `settings set container.cpus` would never reach the container. Only the limits are copied: network and
+ * publishPorts are isolation settings and stay as setup wrote them. An unset tmpSizeMiB drops the override
+ * (the default cap applies). Writes project.json only when a value changed; returns the (possibly new) record.
+ */
+export async function syncContainerLimits(project: ProjectJson, effective: MinionsConfig): Promise<ProjectJson> {
+  const container = { ...project.container };
+  for (const k of CONTAINER_LIMIT_KEYS) {
+    const v = effective.container[k];
+    if (v === undefined) delete container[k]; else container[k] = v;
+  }
+  if (CONTAINER_LIMIT_KEYS.every((k) => container[k] === project.container[k])) return project;
+  const next = ProjectJsonSchema.parse({ ...project, container });
+  await writeGenerated(project.projectId, projectPaths(project.projectId).projectJson, projectJsonBytes(next));
+  return next;
+}
+
+/**
+ * The `files` step of `minions upgrade`: copies the config's container limits into project.json, then
+ * regenerates compose.yaml, the runtime config and the plugin, so the recreate that follows applies them.
+ */
+export async function refreshForUpgrade(project: ProjectJson): Promise<string[]> {
+  const effective = (await loadEffectiveConfig(project)).config;
+  return refreshDerived(await syncContainerLimits(project, effective), effective);
 }
 
 /** How the plugin on disk (the directory the container mounts) compares with the installed package. */

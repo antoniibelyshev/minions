@@ -107,6 +107,12 @@ describe('the settings model agrees with the classification', () => {
     expect(byKey('capabilities.git.push')).toMatchObject({ class: 'restart', hostOwned: true });
     expect(byKey('execution.maxActiveTasks')).toMatchObject({ class: 'live', hostOwned: false });
   });
+
+  it('the container resource limits are recreate items (task-53.9: `minions upgrade` copies them into project.json)', () => {
+    const recreate = SETTINGS.filter((d) => d.class === 'recreate').map((d) => d.key).sort();
+    expect(recreate).toEqual(['container.cpus', 'container.memoryMiB', 'container.pidsLimit', 'container.tmpSizeMiB']);
+    for (const k of recreate) expect(SETTINGS.find((d) => d.key === k), k).toMatchObject({ apply: 'recreate', hostOwned: false });
+  });
 });
 
 /** A different valid value for a setting (for the plugin comparison). */

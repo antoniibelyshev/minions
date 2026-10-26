@@ -9,7 +9,8 @@
 // - `prompt` settings live in the coordinator's prompt and the agent definitions (the plugin), which Claude
 //   Code reads at session start; `launch` settings are coordinator launch arguments (channel, model,
 //   effort, permission mode). Both need a coordinator restart (offered, graceful: refused while workers run);
-// - `recreate` settings are compose, image or mount settings: `minions upgrade` applies them (container recreated).
+// - `recreate` settings are compose, image or mount settings: `minions upgrade` applies them (container recreated;
+//   its files step copies the container limits into project.json, which compose is generated from).
 // Each setting also carries its class (live / restart / recreate) and hostOwned flag, consistent with the schema
 // classification (src/config/setting-classes.ts); a change request from the runtime (src/runtime/change-requests.ts)
 // for a hostOwned key is refused when recorded and again by the host (src/host/change-requests.ts).
@@ -38,7 +39,7 @@ import { loadCredentialRefs, type CredentialsJson } from './credentials.js';
 import { refreshDerived } from './install.js';
 import { loadEffectiveConfig, projectConfigPath, resolveEffective, type ProjectJson } from './project.js';
 
-export const SETTING_GROUPS = ['Delivery', 'Verification', 'Reporting', 'Models', 'Concurrency', 'Policy', 'Permissions', 'Integrations', 'Pause', 'Agents'] as const;
+export const SETTING_GROUPS = ['Delivery', 'Verification', 'Reporting', 'Models', 'Concurrency', 'Policy', 'Permissions', 'Integrations', 'Pause', 'Agents', 'Container'] as const;
 export type SettingGroup = (typeof SETTING_GROUPS)[number];
 
 /** live: enforced by the runtime from the regenerated config; prompt/launch: needs a coordinator restart; recreate: needs `minions upgrade`. */
@@ -53,7 +54,7 @@ export const applyClass = (apply: SettingApply): Exclude<SettingClass, 'fixed'> 
 export type TakesEffect = 'now' | 'restart' | 'upgrade';
 export const takesEffectOf = (cls: SettingClass): TakesEffect | null =>
   cls === 'live' ? 'now' : cls === 'restart' ? 'restart' : cls === 'recreate' ? 'upgrade' : null;
-export type SettingType = 'enum' | 'int' | 'bool' | 'model' | 'models' | 'list' | 'secret' | 'control';
+export type SettingType = 'enum' | 'int' | 'number' | 'bool' | 'model' | 'models' | 'list' | 'secret' | 'control';
 export type SettingLayer = 'local' | 'shared';
 
 type Value = unknown;
@@ -228,6 +229,16 @@ const DECLARED: readonly DeclaredSetting[] = [
     loosens: ontoProcessHarness('worker roles without their own harness that this version allows') },
   { key: 'secrets.codex', group: 'Agents', label: 'OpenAI API key (Codex)', type: 'secret', apply: 'live', hostOwned: true,
     description: 'OpenAI API key for Codex process workers (`minions auth codex`); the runner reads it at each `work run`' },
+  // ---- Container (resource limits: `minions upgrade` copies them into project.json and recreates the container;
+  // syncContainerLimits in src/host/install.ts). network and publishPorts are isolation (host-owned) and stay setup-only.
+  { key: 'container.cpus', group: 'Container', label: 'Container CPUs', type: 'number', apply: 'recreate',
+    description: 'CPU limit of the project container (compose cpus; fractions allowed)' },
+  { key: 'container.memoryMiB', group: 'Container', label: 'Container memory (MiB)', type: 'int', min: 512, apply: 'recreate',
+    description: 'memory limit of the project container (compose mem_limit; the /tmp tmpfs counts against it)' },
+  { key: 'container.pidsLimit', group: 'Container', label: 'Container process limit', type: 'int', min: 64, apply: 'recreate',
+    description: 'maximum number of processes in the project container (compose pids_limit)' },
+  { key: 'container.tmpSizeMiB', group: 'Container', label: 'Container /tmp size (MiB)', type: 'int', min: 64, optional: true, apply: 'recreate',
+    description: 'size cap of the /tmp tmpfs (RAM, counted against the memory limit; default 1024)' },
 ];
 
 export const SETTINGS: readonly SettingDef[] = DECLARED.map(withClass);
@@ -398,6 +409,13 @@ export function parseSettingValue(def: SettingDef, input: string): Value {
     case 'int': {
       if (!/^\d+$/.test(s)) throw bad('must be a whole number');
       const n = Number(s);
+      if (def.min !== undefined && n < def.min) throw bad(`must be at least ${def.min}`);
+      return n;
+    }
+    case 'number': {
+      if (!/^(?:\d+(?:\.\d*)?|\.\d+)$/.test(s)) throw bad('must be a number');
+      const n = Number(s);
+      if (!(n > 0)) throw bad('must be greater than 0');
       if (def.min !== undefined && n < def.min) throw bad(`must be at least ${def.min}`);
       return n;
     }
