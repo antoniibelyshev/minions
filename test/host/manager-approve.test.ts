@@ -552,3 +552,136 @@ describe('/approve QA: the chat side', () => {
     expect(readFileSync(J.journalPath(), 'utf8')).not.toContain('mnap1.');
   });
 });
+
+// Repair 2: redaction must survive what displayText strips or escapes inside the token, and the cut at the limit.
+describe('/approve QA: token redaction against injected characters', () => {
+  const SIG = `mnap1.${'P'.repeat(40)}.${'S'.repeat(86)}`;
+  const PAYLOAD = 'P'.repeat(40);
+  const SIGPART = 'S'.repeat(86);
+  const plan = { taskId: 'task-12', head: HEAD, scope: 'publish' } as never;
+  /** No run of 12 or more characters of the token survives, in any of its parts. */
+  const leaks = (text: string, token = SIG) => {
+    const bare = text.replace(/<U\+[0-9A-F]{4,6}>|\p{M}|\s/gu, '');
+    for (let i = 0; i + 12 <= token.length; i++) if (bare.includes(token.slice(i, i + 12))) return token.slice(i, i + 12);
+    return null;
+  };
+  const split = (t: string, at: number, junk: string) => t.slice(0, at) + junk + t.slice(at);
+
+  it('control characters, ESC/CSI/OSC sequences and C1 introducers inside the real token are redacted after displayText', () => {
+    const junks = ['\u0000', '\u0007', '\u001f', '\u007f', '\u0085', '\u001b[31m', '\u001b[0m', '\u001b(B', '\u001b]0;title\u0007', '\u001b]8;;http://x\u001b\\',
+      '\u009b31m', '\u009d0;x\u009c', '\u001bP1;2|x\u001b\\', '\r', '\u001bc'];
+    for (const junk of junks) {
+      for (const at of [1, 4, 5, 6, 20, 46, 47, 100, SIG.length - 1]) {
+        const raw = `bad signature ${split(SIG, at, junk)} for task-12`;
+        const out = M.redactApprovalText(raw, SIG);
+        expect(leaks(out), JSON.stringify({ junk, at, out })).toBeNull();
+        expect(out, JSON.stringify({ junk, at, out })).toContain('[REDACTED]');
+        // At most one character before the marker: the final byte of an escape whose rest joined the token in the raw text.
+        expect(out).toMatch(/^bad signature .?\[REDACTED\] for task-12$/);
+        expect(out).not.toMatch(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/);
+      }
+    }
+  });
+
+  it('zero-width, bidi, BOM, tag and combining characters inside the real token are redacted (escaped markers do not split it)', () => {
+    for (const junk of ['​', '‌', '‍', '⁠', '﻿', '‮', '⁦', '\u{e0041}', '­', '́', ' ', '<U+200B>']) {
+      for (const at of [2, 6, 30, 47, 120]) {
+        const out = M.redactApprovalText(`echo: ${split(SIG, at, junk + junk)}!`, SIG);
+        expect(leaks(out), JSON.stringify({ junk, at, out })).toBeNull();
+        expect(out).toBe('echo: [REDACTED]!');
+      }
+    }
+  });
+
+  it('several kinds of junk at once, and whitespace inside the real token, still redact it', () => {
+    let t = SIG;
+    for (const [at, junk] of [[130, '​'], [90, ' '], [60, '\u001b[1m'], [30, '\t'], [3, '\u0000‮']] as const) t = split(t, at, junk);
+    const out = M.redactApprovalText(`x ${t} y`, SIG);
+    expect(leaks(out)).toBeNull();
+    expect(out).toBe('x [REDACTED] y');
+  });
+
+  it('the signature part or the payload part alone (with or without junk) is redacted too', () => {
+    for (const part of [SIGPART, PAYLOAD, split(SIGPART, 40, '\u001b[0m'), split(PAYLOAD, 10, '​')]) {
+      const out = M.redactApprovalText(`part ${part} end`, SIG);
+      expect(leaks(out)).toBeNull();
+      expect(out).toBe('part [REDACTED] end');
+    }
+  });
+
+  it('a token-shaped string that is not the real token, with injected characters, is redacted', () => {
+    for (const raw of ['mnap1.AA\u001b[31mAA.BBBB', 'mn\u0000ap1.AAAA.BBBB', 'mnap1​.AAAA.B‍BBB', 'mnap1.AAAA.\u001b]0;x\u0007BBBB', 'ḿnap1.AAAA.BBBB', 'mnap1.AA<U+202E>AA.BBBB']) {
+      const out = M.redactApprovalText(`bad ${raw} end`, 'FAKE-TOKEN-SECRET');
+      expect(out, JSON.stringify(raw)).toBe('bad [REDACTED] end');
+    }
+    // No signature known at all (an error before signing): the shape is still redacted.
+    expect(M.redactApprovalText('x mnap1.A\u0000A.B​B y', undefined)).toBe('x [REDACTED] y');
+  });
+
+  it('a token across the truncation cut leaves no part of it, and the result is within the limit', () => {
+    for (let pad = 380; pad <= 505; pad += 3) {
+      for (const junk of ['', '​', '\u001b[0m']) {
+        const raw = `${'z'.repeat(pad)} ${split(SIG, 50, junk)} tail`;
+        const out = M.redactApprovalText(raw, SIG);
+        expect(out.length).toBeLessThanOrEqual(M.APPROVE_MESSAGE_MAX);
+        expect(leaks(out), JSON.stringify({ pad, junk })).toBeNull();
+        expect(out).not.toMatch(/mnap1/);
+      }
+    }
+    // An unknown token-shaped string at the cut: the redaction runs before the cut, so no partial shape survives.
+    for (let pad = 470; pad <= 500; pad++) {
+      const out = M.redactApprovalText(`${'z'.repeat(pad)} mnap1.${'Q'.repeat(30)}.${'R'.repeat(30)}`, undefined);
+      expect(out).not.toMatch(/QQQQ|RRRR|mnap1/);
+    }
+  });
+
+  it('ordinary text is kept (controls stripped, format characters shown), and a short token segment is not searched for alone', () => {
+    expect(M.redactApprovalText('Recorded host-signed approval\u001b[31m to publish\n agent/x ​ at abc.', 'mnap1.ab.cd')).toBe('Recorded host-signed approval to publish agent/x <U+200B> at abc.');
+  });
+
+  it('approveOutcome: both envelope paths go through the redaction', () => {
+    const tok = split(SIG, 47, '\u001b[31m​');
+    const okA = M.approveOutcome(plan, 0, ok({ message: `recorded ${tok}` }), SIG);
+    expect(okA).toEqual({ status: 'applied', detail: `publication approval for task-12 at ${HEAD} recorded: recorded [REDACTED]` });
+    const bad = M.approveOutcome(plan, 1, refused('CONFLICT', `bad ${tok}`), SIG);
+    expect(bad).toEqual({ status: 'failed', detail: `publication approval for task-12 at ${HEAD} refused by the runtime: bad [REDACTED]` });
+  });
+
+  let repos = 0;
+  async function hostile(message: (token: string) => string, o: { ok?: boolean; realApprove?: boolean; throws?: boolean } = {}) {
+    const { project } = await install(`repo-${++repos}`);
+    const s = setup([project], { realApprove: o.realApprove });
+    let token = '';
+    s.deps.delegate = async (_p, argv) => {
+      s.delegateCalls.push(argv);
+      token = argv[argv.indexOf('--signature') + 1]!;
+      if (o.throws) throw new Error(message(token));
+      return o.ok ? { code: 0, stdout: JSON.stringify({ ok: true, data: { message: message(token) } }) + '\n', stderr: '' } : refused('CONFLICT', message(token));
+    };
+    const offer = await s.cmds.propose(null, { kind: 'approve', taskId: 'task-12', head: HEAD, merge: false });
+    await s.confirm(offer);
+    const places = { chat: JSON.stringify(s.outcomes), log: s.logs.join('\n'), journal: readFileSync(J.journalPath(), 'utf8') };
+    return { s, token, places };
+  }
+
+  it('end to end with the real signed token: injected characters do not get it into the chat, the log or the journal', async () => {
+    for (const o of [{ ok: false }, { ok: true }, { throws: true }]) {
+      const { s, token, places } = await hostile((t) => `bad \u001b[31m${split(split(t, 70, '\u0000'), 20, '​\u001b]0;x\u0007')}\u001b[0m (${t.split('.')[2]})`, { ...o, realApprove: true });
+      expect(token.startsWith('mnap1.')).toBe(true);
+      expect(s.outcomes.at(-1)!.status).toBe(o.ok ? 'applied' : 'failed');
+      expect(s.outcomes.at(-1)!.text).toContain('[REDACTED]');
+      for (const [where, text] of Object.entries(places)) {
+        // The journal is JSON: undo its string escapes before looking.
+        const plain = where === 'log' ? text : text.split('\n').filter(Boolean).map((l) => JSON.stringify(JSON.parse(l))).join('\n').replace(/\\u[0-9a-f]{4}/g, '');
+        expect(leaks(plain, token), `${JSON.stringify(o)} ${where}`).toBeNull();
+      }
+      const failed = journal().filter((e) => e.type === 'failed' || e.type === 'applied').at(-1)!;
+      expect(String(failed.detail)).toContain('[REDACTED]');
+    }
+  });
+
+  it('end to end with the stub token across the truncation cut: nothing of it in the chat, the log or the journal', async () => {
+    const { places } = await hostile((t) => `${'z'.repeat(485)} ${split(t, 5, '​')}`);
+    for (const text of Object.values(places)) expect(text.replace(/<U\+200B>|\\u200b/gi, '')).not.toMatch(/FAKE-TOKEN|TOKEN-SECRET|FAKE-TOK/);
+  });
+});

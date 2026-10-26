@@ -476,7 +476,12 @@ Built in task-53.5.4 (phase 4, part 4): `/approve <task> <sha> [merge]`. Decisio
 - **Signing.** The manager calls `approveOnHost` (`src/host/approvals.ts`, injectable as `ManagerDeps.approveOnHost`)
   in its own process with the project id and a delegate that runs `minions work approve ... --signature <token> --json`
   through the bounded runtime. The token is in that argv only: it is never logged, journaled or sent to the chat (the
-  outcome shows only the runtime's envelope message). The terminal `settings apply --confirm` refuses an approve plan
+  outcome shows only the runtime's envelope message). The runtime has the token and may echo it, so its message, and an
+  error thrown while approving, go through `redactApprovalText`: the whole token is replaced in the raw text; then, after
+  `displayText` and whitespace collapsing, the token, each long segment of it and anything shaped `mnap1.<a>.<b>` are
+  replaced on a copy without the invisible noise (`<U+XXXX>` markers, combining marks; for the real token also
+  whitespace), so controls, escape sequences or zero-width characters injected into the token do not hide it; the text
+  is cut to 500 characters last and checked once more. A runtime that re-encodes the token on purpose is out of reach. The terminal `settings apply --confirm` refuses an approve plan
   (it is confirmed only in the chat; `minions work approve` stays the terminal route).
 - **Not undoable.** `/undo` of an approval request is refused ("approvals cannot be undone"); an unused approval
   expires and a new commit needs a new one anyway.
