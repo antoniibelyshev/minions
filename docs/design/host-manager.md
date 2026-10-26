@@ -101,8 +101,9 @@ with the help text):
 | `/set <key> <value>` | Same model as `minions settings set` (validation, layer, loosening text), then the confirmation |
 | `/sync` | Outer repo sync (see [Change kinds](#change-kinds)) |
 | `/upgrade` | `minions upgrade` with a dry-run plan as the confirmation text |
-| `/restart` | Graceful coordinator restart |
+| `/restart` | Graceful coordinator restart (refused while workers are active: then **Restart when idle** and **Drain now** are offered) |
 | `/undo <id>` | Proposes the inverse of an applied config change (confirmed like any change) |
+| `/rebuild_cli` | Dev only (owner decision Q3): `minions upgrade --rebuild-cli` with the commit range, diffstat and sensitive paths in the plan; not registered on normal installs |
 | `/project <name>` | Picks the project for the commands above when several are registered |
 
 An owner command goes through the same confirmation as a coordinator proposal. Typing `/set` is not consent to the
@@ -486,6 +487,65 @@ Built in task-53.5.4 (phase 4, part 4): `/approve <task> <sha> [merge]`. Decisio
 - **Not undoable.** `/undo` of an approval request is refused ("approvals cannot be undone"); an unused approval
   expires and a new commit needs a new one anyway.
 
+Built in task-53.7 (phase 6): Restart when idle / Drain now, the CLI backup and **Roll back CLI**, and the dev-only
+`/rebuild_cli`. Config history with `/undo` compare-and-swap and the last-20 retention were already built in
+task-53.5.3 and are reused unchanged. Decisions made here:
+
+- **Follow-ups are offers.** A plain restart whose child answers `refused` (active worker leases) is reported as
+  failed, and the manager then journals and sends two owner requests (`ow_` ids, minted by the manager on the
+  owner's behalf): kind `restart` with payload `mode: when-idle` and `mode: drain`. Each is its own plan with its
+  own nonce, confirmed like any other; nothing is queued or drained without that tap. Only an owner request may
+  carry a mode (`buildPlan` refuses one from the container), and a plan without a mode has no `restart` field, so
+  the digests of plain restarts are unchanged. The container's request stays `failed` and is re-offered as before.
+- **The queue lives in the manager.** A confirmed when-idle or drain plan is kept in memory (one per project; a
+  second one is refused as "already queued"). Its journal entry stays `applying` with the detail
+  `queued: …`, so a manager restart reports it as interrupted (the startup message repeats that detail, including
+  how to resume starts) and never resumes it. Persisting the queue was rejected: a queued restart that survives a
+  manager restart would run long after the owner looked at it.
+- **Each poll** runs the queue first: `minions status --json` through the bounded delegate, and at zero active
+  leases `minions settings restart` as a child (the same graceful path). A runtime that is not running gets the
+  child too, which reports `not-running` and closes the request. A status that cannot be read is reported once and
+  the entry stays queued. A restart refused at that moment (a lease started in between) stays queued for the next
+  idle poll: the same plan, never another strategy.
+- **Drain now** first reads the pause state, then runs `minions pause --starts --drain --reason restart` in the
+  runtime; a failure there queues nothing. At the idle poll, just before the restart, it resumes only what it
+  paused: `minions resume --starts` when starts were running before, otherwise `minions resume --drain` (the
+  owner's pause stays). Starts are resumed before the restart because the recovery prompt dispatches only when
+  starts are not paused (the same order as `minions upgrade`).
+- **CLI backup** (`src/host/cli-backup.ts`). `applyCli` packs the packed global install with
+  `npm pack <install dir> --ignore-scripts` (none of its scripts run) right before `npm install -g`, into
+  `<MINIONS_HOME>/manager/cli-backup/minions-<version>-<UTC stamp>.tgz` (0600, directory 0700, last 2). A backup
+  that fails stops the reinstall, nothing installed. A linked checkout is rebuilt in place and has no backup. The
+  backup is made by `minions upgrade` itself, so a terminal upgrade keeps one too.
+- **CLI check.** After an `upgrade` or `rebuild-cli` apply whose `cli` step ran npm (done, or a reinstall/rebuild
+  that failed or finished wrong), the manager runs `minions --version` (exit 0 and a version line) and
+  `minions --json status` (an ok envelope) in fresh processes of the host CLI (`ManagerDeps.cliHealth`). The
+  result is a line of the outcome. When it fails and a backup exists, a `cli-rollback` owner offer follows; with no
+  backup the outcome says so.
+- **Roll back CLI** (kind `cli-rollback`, owner only, one Confirm: it reinstalls what was installed before). The
+  payload names the backup; the plan takes the file only from the backup directory (a regular file whose name
+  matches the backup pattern, never a symlink) and digests its sha256. At apply time the sha256 is checked again,
+  then `npm install -g --no-audit --no-fund <file>` runs through the injectable `ManagerDeps.npm`, then the check
+  once more. A check that still fails is reported as failed and nothing else is tried.
+- **Dev-only `/rebuild_cli`** (`src/host/cli-rebuild.ts`, kind `rebuild-cli`, owner only). Available when the
+  running CLI's package root is a minions source checkout (`package.json` name plus `src/cli.ts`; a packed install
+  has no `src/`) and the project's repository is one too. `ManagerCommands.devRebuild` tells the transport: without
+  it the command is not in the help text and is answered like any unknown command; `propose` and `buildPlan`
+  refuse it as well (`details.refusal: unavailable`). Local delivery only (GitHub delivery builds only from
+  `origin/<base>` through `/upgrade`), and a dirty checkout is refused (the build would include what the plan does
+  not show). The range starts at the commit the running CLI was built from: `esbuild.config.mjs` now stamps
+  `commit` and `dirty` into `dist/build.json`; a CLI built before that is refused with the terminal command.
+  The plan carries `from`, `to` (HEAD), the commit count, `git log --oneline` (50 lines), `git diff --stat` (40
+  lines) and the files matching the project's `sensitivePaths`, all digested, plus the step ids of
+  `minions upgrade --rebuild-cli --dry-run` (the dry run must plan a `cli` step). `loosens` is always set, so the
+  chat asks twice. Right before the child runs, the range is read again and a moved HEAD or build commit refuses.
+  The apply is `minions upgrade --rebuild-cli`, followed by the CLI check above. All git commands go through the
+  injectable runner (`ManagerDeps.cli.runner`).
+- **Terminal route.** `settings apply --confirm` refuses `rebuild-cli`, `cli-rollback` and a restart with a mode:
+  they run only in the manager (the terminal has `minions upgrade --rebuild-cli` and `minions settings restart`).
+- **Command name.** Telegram commands allow only letters, digits and underscores, so the request is
+  `/rebuild_cli`; the command parser now accepts `_` in command names.
+
 
 Child tasks, filed as task-53.2 to task-53.7 (phases 1 to 6) and task-53.8 (coordinator proposal):
 
@@ -508,7 +568,7 @@ Child tasks, filed as task-53.2 to task-53.7 (phases 1 to 6) and task-53.8 (coor
 5. **child: Supervisor and status** | criteria: `setup` installs and removes a launchd agent (macOS) or a
    systemd --user unit (Linux); restart after a self-upgrade; `status` shows the manager and pending requests;
    `uninstall` removes everything | depends: 4
-6. **child: Restart-when-idle and rollback** | criteria: queued restart at the first idle poll; drain-now option;
+6. **child: Restart-when-idle and rollback** (built in task-53.7) | criteria: queued restart at the first idle poll; drain-now option;
    config history with `/undo` compare-and-swap; CLI backup and roll back; dev-only `--rebuild-cli` request (registered only when the host CLI runs from a minions
    source checkout and the managed project is minions); docs (README, cli.md, bootstrap.md) | depends: 4
 
