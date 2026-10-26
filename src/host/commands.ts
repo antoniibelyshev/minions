@@ -22,7 +22,7 @@ import { assertBotFree, startBotCheck } from './bot-guard.js';
 import { dockerProbe } from './discovery.js';
 import { Compose, ensureImage, packageRoot } from './docker.js';
 import { applyDoctorExit, formatDoctor, runDoctor } from './doctor.js';
-import { checkPlugin, dockerUnavailable, formatInit, pluginMismatch, refreshDerived, runInit } from './install.js';
+import { checkPlugin, dockerUnavailable, formatInit, pluginMismatch, refreshDerived, refreshForUpgrade, runInit } from './install.js';
 import { loadEffectiveConfig, loadProjectJson, type ProjectJson } from './project.js';
 import { projectForPath } from './registry.js';
 import { composeTarget, exportRepo, exportState, importRepo, importState, inspectStateBackup, type TransferTarget } from './transfer.js';
@@ -544,7 +544,7 @@ export function register(program: Command): void {
           rerun: ['minions', 'upgrade', ...flags].join(' '),
         }),
         projectId: project.projectId, imageTag: project.imageTag, compose, timeoutSec, now: o.now, dryRun,
-        refresh: async () => refreshDerived(project, (await loadEffectiveConfig(project)).config),
+        refresh: () => refreshForUpgrade(project),
         checkPlugin: async () => pluginMismatch(await checkPlugin(project, (await loadEffectiveConfig(project)).config)),
         importRepo: () => importRepo(project, { repoPath: ref.repoPath }),
         materialize: () => materializeSecrets(project.projectId),
