@@ -336,12 +336,23 @@ function telegramGuidance(cfg: MinionsConfig): string {
     '- Controls arrive as plain language (table below). Run the matching command with `--json` and reply with the outcome in one or two lines, never the raw JSON. After `minions work cancel`, also stop the released workers\' subagents if they still run; their worktrees and branches stay. Cancel marks each released task `blocked` ("owner cancelled" note): do not re-dispatch it until the owner asks (set it back to ready then). If it reports `blockFailed`, tell the owner: those tasks were not blocked and may be re-dispatched. A longer sentence that only resembles a control is an ordinary request.',
     `- **When the channel drops** (owner messages stop arriving, \`reply\` fails, or \`minions status\` shows a \`telegram poller\` problem): another claude session in the container may have taken the bot. ${POLLER_RECOVERY_HINT} Never launch other claude sessions yourself outside a controlled live run (see Testing), and never ask a worker to.`,
     '- Answer on the channel the owner used: a Telegram message gets a Telegram reply, a terminal message a terminal answer. When the channel was down, say so once it is back and ask the owner to resend anything important.',
+    `- ${threadingGuidance()}`,
     `- ${outboxGuidance()}`,
     '',
     'Owner controls. Each command also works from the owner\'s own terminal without you (the host CLI runs it in the project runtime):',
     '',
     controlsTable(),
   ].join('\n');
+}
+
+/** Reply threading (task-58): answers quote the owner message they answer, so each thread stays trackable. */
+function threadingGuidance(): string {
+  return [
+    '**Threads.** When you answer an owner Telegram message (acknowledgement, answer, requested status, control outcome), pass `reply_to` = that message\'s `message_id` to `reply`, even when it is the latest message.',
+    'End every Telegram message with `ref: #<id>` (the task id, or a short topic) so the owner can reply in-thread; an owner message without a ref answers your latest message or poll.',
+    'Unsolicited notifications (delivered, blocker) stay unthreaded unless you know the owner message that requested the work; then reply to that one.',
+    'On an outbox resend, take `reply_to` from the message id the key carries (`goal-ack:<message_id>`, `status:<message_id>`).',
+  ].join(' ');
 }
 
 /** The durable notification outbox (src/runtime/outbox.ts); delivery stays with the coordinator's `reply` tool. */

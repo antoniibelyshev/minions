@@ -282,6 +282,10 @@ Implemented in `src/runtime/outbox.ts` (transport-agnostic) with the `minions no
 - Visibility: `minions status` and `minions sync` show the pending count (and `minions notify pending --all` lists every
   undelivered item from the terminal), so nothing is lost if Telegram is never restored.
 - Semantics: at least once per key. A crash between `reply` and `ack` can repeat that one message; nothing else repeats.
+- Threading (task-58): answers to an owner message pass `reply_to` = its `message_id`; every message ends with
+  `ref: #<id>` (task id or topic), and an owner message without a ref answers the coordinator's latest message or poll.
+  Unsolicited notifications stay unthreaded unless the requesting message is known. The outbox stores no reply-to
+  column: a resend takes it from the key (`goal-ack:<message_id>`, `status:<message_id>`), which avoids a schema change.
 
 ## Restart survival (context resets)
 
