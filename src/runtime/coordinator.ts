@@ -211,6 +211,8 @@ export function hostSettings(h: HostHardening): { sandbox: Record<string, unknow
   for (const f of ['anthropic-api-key', 'telegram-bot-token']) deny.push(`Read(${secretsAbs}/${f})`);
   // File globs only (`*.json`): a directory-matching wildcard would also become a sandbox write deny of its contents.
   if (root) deny.push(`Read(${ruleAbs(root)}/*.json)`, `Edit(${ruleAbs(root)}/*.json)`);
+  // Host manager state (owner pairing, token reference, journal): the directory rule is also a sandbox write deny.
+  if (root) readEdit(`${ruleAbs(root)}/manager`);
   deny.push(`Read(${ruleAbs(h.projectDir)}/credentials.json)`,
     `Edit(${ruleAbs(h.projectDir)}/*.json)`, `Edit(${ruleAbs(h.projectDir)}/*.yaml)`, `Edit(${secretsAbs}/**)`);
   for (const d of ['runtime', 'plugin', 'logs', 'exports', 'host/bin', 'host/logs', 'host/transfer']) deny.push(`Edit(${ruleAbs(h.projectDir)}/${d}/**)`);
