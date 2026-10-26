@@ -20,6 +20,13 @@
 //   (src/host/manager-telegram.ts: owner check, inline buttons, double tap for a plan with `loosens`, /status,
 //   /requests, /project). Unpaired it uses a log transport (JSON lines on stdout, no events: confirm in the terminal
 //   with the printed `settings apply --confirm` command, which uses the same journal).
+// - Owner change commands (task-53.5.3): /set, /sync, /upgrade, /restart and /undo reach the core through
+//   ManagerCommands.propose. The core mints an `ow_` request id, builds the same host plan (buildPlan), journals the
+//   offer and hands it back to the transport, which shows it with Confirm / Reject. Typing the command is never
+//   consent: only the tap (twice for a plan that loosens) applies it, through the same confirmOffer and apply path.
+//   Owner requests have no runtime row, so nothing is marked for them; a refused one is re-offered from its journaled
+//   snapshot. Every config write the manager applies saves the layer file first (src/host/config-history.ts), so
+//   /undo <id> can restore it while the file is still what that change wrote.
 import { open, readFile, rm } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 import type { Command } from 'commander';
@@ -32,13 +39,14 @@ import { procStartTime } from '../runtime/coordinator.js';
 import { isChangeRequestId, type ChangeRequestView } from '../runtime/change-requests.js';
 import { pidAlive } from '../runtime/db.js';
 import {
-  findOfferByNonce, interruptedEntries, lastOutcome, managerDir, readJournal, recordOutcome, writer, writerAlive,
-  type JournalEntry, type OfferEntry, type OutcomeEntry,
+  findOfferByNonce, interruptedEntries, isOfferRequestId, isOwnerRequest, lastOutcome, managerDir, newOwnerRequestId, readJournal, recordOutcome, writer, writerAlive,
+  type JournalEntry, type OfferEntry, type OutcomeEntry, type RequestSnapshot,
 } from './change-journal.js';
 import {
   childUpgrade, confirmOffer, fetchRequests, formatPlan, fromContainerOf, hostCli, mark, offerRequest, planArgv,
-  recordApplyResult, rejectRequest, snapshotOf, type ChangePlan, type ChangeRequestDeps,
+  recordApplyResult, rejectRequest, snapshotOf, undoDetail, type ChangePlan, type ChangeRequestDeps,
 } from './change-requests.js';
+import { applyUndo, beginHistory, completeHistory } from './config-history.js';
 import { readManagerToken } from './credentials.js';
 import { DELEGATE_MAX_OUTPUT_BYTES, DELEGATE_TIMEOUT_MS, delegateCapture } from './delegate.js';
 import { loadManagerAccess, type ManagerAccess } from './manager-bot.js';
@@ -96,7 +104,21 @@ export interface ManagerCommands {
   status(projectId: string | null): Promise<string>;
   /** The offers still waiting for the owner (newest journal entry is the offer), oldest first. */
   pending(projectId: string | null): Promise<ManagerOffer[]>;
+  /**
+   * An owner change command (/set, /sync, /upgrade, /restart, /undo): builds the host plan and journals an offer for
+   * an owner request (`ow_` id). Nothing is applied: the returned offer still needs the owner's Confirm. Throws
+   * (nothing journaled) when the plan cannot be built, for example an invalid value or a refused sync.
+   */
+  propose(projectId: string | null, command: OwnerCommand): Promise<ManagerOffer>;
 }
+
+/** An owner change command as the transport parsed it (the core validates everything again). */
+export type OwnerCommand =
+  | { kind: 'config-set'; key: string; value: string; layer: 'local' | 'shared' }
+  | { kind: 'restart' }
+  | { kind: 'upgrade' }
+  | { kind: 'sync' }
+  | { kind: 'undo'; target: string };
 
 // ---------------------------------------------------------------- deps
 
@@ -199,8 +221,19 @@ function wellFormed(r: unknown): r is ChangeRequestView {
 export function planSummary(plan: ChangePlan): string {
   if (plan.kind === 'config-set' && plan.change) return `set ${plan.change.key}: ${formatValue(plan.change.from)} -> ${formatValue(plan.change.to)}`;
   if (plan.kind === 'restart') return 'restart the coordinator';
+  if (plan.kind === 'undo' && plan.change) {
+    const more = (plan.undo?.changes.length ?? 1) - 1;
+    return `undo ${plan.undo?.target ?? '?'}: ${plan.change.key}: ${formatValue(plan.change.from)} -> ${formatValue(plan.change.to)}${more > 0 ? ` (+${more} more setting${more === 1 ? '' : 's'})` : ''}`;
+  }
+  if (plan.kind === 'sync') return 'sync the host base branch (strict fast-forward)';
   return plan.steps[0] ?? plan.kind;
 }
+
+/** The transport's view of a journaled offer. */
+const offerOf = (b: Awaited<ReturnType<typeof offerRequest>>): ManagerOffer => ({
+  projectId: b.offer.projectId, requestId: b.offer.requestId, kind: b.plan.kind, nonce: b.offer.nonce, digest: b.digest, expiresAt: b.offer.expiresAt,
+  summary: planSummary(b.plan), text: formatPlan(b.plan, b.digest, b.notes), loosens: b.plan.loosens,
+});
 
 /** Reads the host CLI child's `--json` answer into an outcome. */
 export function childOutcome(plan: ChangePlan, r: RunResult): { status: 'applied' | 'failed'; detail: string } {
@@ -293,7 +326,7 @@ export class HostManager {
       if (!wellFormed(row)) { malformed++; continue; }
       if (row.status !== 'proposed' && row.status !== 'failed') continue;
       if (!this.needsOffer(entries, project.projectId, row.id)) continue;
-      const o = await this.offer(project, row);
+      const o = await this.offer(project, snapshotOf(row));
       if (o) sent.push(o);
     }
     if (malformed) {
@@ -311,16 +344,13 @@ export class HostManager {
   }
 
   /** Builds the plan, journals the offer and sends it. A plan that cannot be built is reported once. */
-  private async offer(project: ProjectJson, row: Pick<ChangeRequestView, 'id' | 'kind' | 'payload' | 'reason'>): Promise<ManagerOffer | null> {
+  private async offer(project: ProjectJson, row: RequestSnapshot): Promise<ManagerOffer | null> {
     let built: Awaited<ReturnType<typeof offerRequest>>;
-    try { built = await offerRequest(project, snapshotOf(row), this.cr); } catch (e) {
+    try { built = await offerRequest(project, row, this.cr); } catch (e) {
       await this.reportOnce(`plan:${project.projectId}:${row.id}`, { status: 'error', projectId: project.projectId, requestId: row.id, text: `change request ${row.id} (project ${project.projectId}) cannot be offered: ${(e as Error).message}` });
       return null;
     }
-    const o: ManagerOffer = {
-      projectId: project.projectId, requestId: row.id, kind: built.plan.kind, nonce: built.offer.nonce, digest: built.digest, expiresAt: built.offer.expiresAt,
-      summary: planSummary(built.plan), text: formatPlan(built.plan, built.digest, built.notes), loosens: built.plan.loosens,
-    };
+    const o = offerOf(built);
     try {
       await this.deps.transport.sendOffer(o);
       this.deps.log(`offered ${project.projectId} ${row.id}: ${o.summary}`);
@@ -336,12 +366,12 @@ export class HostManager {
     try {
       await (ev.type === 'confirm' ? this.confirm(ev) : this.reject(ev));
     } catch (e) {
-      await this.notify({ status: 'error', projectId: null, requestId: typeof ev.requestId === 'string' && isChangeRequestId(ev.requestId) ? ev.requestId : null, text: `handling a ${String(ev.type)}: ${(e as Error).message}` });
+      await this.notify({ status: 'error', projectId: null, requestId: typeof ev.requestId === 'string' && isOfferRequestId(ev.requestId) ? ev.requestId : null, text: `handling a ${String(ev.type)}: ${(e as Error).message}` });
     }
   }
 
   private async findOffer(ev: ManagerEvent): Promise<{ offer: OfferEntry; spent: boolean; project: ProjectJson } | null> {
-    if (typeof ev.requestId !== 'string' || !isChangeRequestId(ev.requestId) || typeof ev.nonce !== 'string' || !NONCE_PATTERN.test(ev.nonce)) {
+    if (typeof ev.requestId !== 'string' || !isOfferRequestId(ev.requestId) || typeof ev.nonce !== 'string' || !NONCE_PATTERN.test(ev.nonce)) {
       await this.notify({ status: 'refused', projectId: null, requestId: null, text: 'refused: malformed confirmation (unknown request or nonce); nothing applied.' });
       return null;
     }
@@ -372,17 +402,24 @@ export class HostManager {
         return;
       }
       await this.notify({ status: 'refused', ...ids, text: `refused: ${(e as Error).message}` });
-      if (why === 'expired' || why === 'revision' || why === 'digest') await this.reoffer(project, offer.requestId);
+      if (why === 'expired' || why === 'revision' || why === 'digest') await this.reoffer(project, offer);
       return;
     }
     await this.apply(project, offer);
   }
 
   /** After a refusal: a fresh offer when the request is still open in the runtime. */
-  private async reoffer(project: ProjectJson, requestId: string): Promise<void> {
+  private async reoffer(project: ProjectJson, offer: OfferEntry): Promise<void> {
+    const requestId = offer.requestId;
     try {
+      // An owner request has no runtime row: it is offered again from its journaled snapshot (rebuilt from scratch).
+      if (isOwnerRequest(offer.request)) {
+        const fresh = await offerRequest(project, offer.request, this.cr);
+        await this.deps.transport.sendOffer(offerOf(fresh));
+        return;
+      }
       const row = (await fetchRequests(project, this.runtime, false) as unknown[]).filter(wellFormed).find((r) => r.id === requestId);
-      if (row && (row.status === 'proposed' || row.status === 'failed')) { await this.offer(project, row); return; }
+      if (row && (row.status === 'proposed' || row.status === 'failed')) { await this.offer(project, snapshotOf(row)); return; }
       await this.notify({ status: 'refused', projectId: project.projectId, requestId, text: `change request ${requestId} is no longer open in the runtime; no fresh offer.` });
     } catch (e) {
       await this.notify({ status: 'error', projectId: project.projectId, requestId, text: `no fresh offer for ${requestId}: ${(e as Error).message}` });
@@ -396,16 +433,26 @@ export class HostManager {
     const warnings: string[] = [];
     const w = await mark(project, this.runtime, offer.requestId, 'confirmed', `confirmed in the host manager (digest ${offer.digest.slice(0, 12)})`);
     if (w) warnings.push(w);
-    const argv = planArgv(plan, offer.request);
+    const argv = plan.kind === 'undo' ? null : planArgv(plan, offer.request);
     await this.notify({ status: 'applying', ...ids, text: `Applying change request ${offer.requestId} (project ${offer.projectId}): ${planSummary(plan)}…` });
     let result: { status: 'applied' | 'failed'; detail: string };
     try {
-      await recordOutcome({ type: 'applying', ...ids, nonce: offer.nonce, digest: offer.digest, detail: `minions ${argv.join(' ')}`, ...writer() }, this.deps.now());
-      if (plan.kind === 'upgrade') {
-        const r = await this.deps.upgrade(project, { fromContainer: fromContainerOf(offer.request.payload), dryRun: false });
-        result = { status: r.ok ? 'applied' : 'failed', detail: `upgrade: ${r.summary}` };
+      await recordOutcome({ type: 'applying', ...ids, nonce: offer.nonce, digest: offer.digest, detail: argv ? `minions ${argv.join(' ')}` : plan.steps[0] ?? plan.kind, ...writer() }, this.deps.now());
+      if (plan.kind === 'upgrade' || plan.kind === 'sync') {
+        const r = await this.deps.upgrade(project, plan.kind === 'sync'
+          ? { fromContainer: null, dryRun: false, syncOnly: true } : { fromContainer: fromContainerOf(offer.request.payload), dryRun: false });
+        result = { status: r.ok ? 'applied' : 'failed', detail: `${plan.kind}: ${r.summary}` };
+      } else if (plan.kind === 'undo') {
+        const u = await applyUndo(project, { target: plan.undo!.target, expectSha256: plan.undo!.expectSha256, restoreSha256: plan.undo!.restoreSha256, undoId: offer.requestId, now: this.deps.now() });
+        warnings.push(...u.warnings);
+        result = { status: 'applied', detail: undoDetail(plan) };
+      } else if (plan.kind === 'config-set' && plan.change) {
+        // The layer file as it is now goes to the config history first, so /undo can restore it.
+        const h = await beginHistory(project, offer.requestId, plan.change, this.deps.now());
+        result = childOutcome(plan, await this.deps.runChild(project, argv!));
+        if (result.status === 'applied') await completeHistory(h);
       } else {
-        result = childOutcome(plan, await this.deps.runChild(project, argv));
+        result = childOutcome(plan, await this.deps.runChild(project, argv!));
       }
     } catch (e) {
       result = { status: 'failed', detail: (e as Error).message };
@@ -416,6 +463,7 @@ export class HostManager {
       status: result.status, ...ids,
       text: [`change request ${offer.requestId} (project ${offer.projectId}): ${result.status === 'applied' ? 'applied' : 'FAILED'} - ${displayText(result.detail)}`,
         ...(plan.interrupts && result.status === 'applied' ? [`note: ${plan.interrupts}`] : []),
+        ...(result.status === 'applied' ? followUp(plan) : []),
         ...warnings.map((x) => `warning: ${displayText(x)}`)].join('\n'),
     });
   }
@@ -442,7 +490,30 @@ export class HostManager {
       projects: async () => (await this.deps.projects()).map((p) => ({ projectId: p.projectId, name: basename(p.repoPath) })),
       status: (projectId) => this.statusText(projectId),
       pending: (projectId) => this.pendingOffers(projectId),
+      propose: (projectId, command) => this.propose(projectId, command),
     };
+  }
+
+  /**
+   * An owner change command: the plan of an owner request (`ow_` id), journaled as an offer. Nothing is applied here.
+   * Without a picked project it needs exactly one registered project.
+   */
+  async propose(projectId: string | null, c: OwnerCommand): Promise<ManagerOffer> {
+    let project: ProjectJson;
+    if (projectId) project = await this.deps.loadProject(projectId);
+    else {
+      const all = await this.deps.projects();
+      if (all.length !== 1) {
+        throw new MinionsError('PRECONDITION', all.length ? `${all.length} projects are registered: pick one with /project <name> first.` : 'No registered projects.');
+      }
+      project = all[0]!;
+    }
+    const payload: Record<string, unknown> = c.kind === 'config-set' ? { key: c.key, value: c.value, layer: c.layer } : c.kind === 'undo' ? { target: c.target } : {};
+    const req: RequestSnapshot = { id: newOwnerRequestId(), kind: c.kind, payload, reason: null, origin: 'owner' };
+    const built = await offerRequest(project, req, this.cr);
+    const o = offerOf(built);
+    this.deps.log(`owner request ${project.projectId} ${req.id}: ${o.summary}`);
+    return o;
   }
 
   /**
@@ -515,6 +586,14 @@ export class HostManager {
       }
     }
   }
+}
+
+/** After an applied config change: the command that applies what it still needs (each confirmed on its own). */
+function followUp(plan: ChangePlan): string[] {
+  if ((plan.kind !== 'config-set' && plan.kind !== 'undo') || !plan.change) return [];
+  if (plan.change.takesEffect === 'restart') return ['next: send /restart here to restart the coordinator (shown as its own plan to confirm)'];
+  if (plan.change.takesEffect === 'upgrade') return ['next: send /upgrade here to recreate the container (shown as its own plan to confirm)'];
+  return [];
 }
 
 /** Takes the manager lock, runs the loop until signal aborts, releases the lock. */

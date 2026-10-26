@@ -88,6 +88,7 @@ const fakeCommands = (o: Partial<ManagerCommands> = {}): ManagerCommands => ({
   projects: async () => [{ projectId: PID, name: 'acme' }, { projectId: '9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d', name: 'other' }],
   status: async (id) => `status for ${id ?? 'all'}`,
   pending: async () => [],
+  propose: async () => { throw new Error('propose not faked'); },
   ...o,
 });
 
@@ -351,13 +352,13 @@ describe('getUpdates', () => {
 
 describe('commands', () => {
   it('anything outside the fixed command set gets the help text', async () => {
-    const api = botApi([[msg(1, 'hello'), msg(2, '/set execution.maxActiveTasks 9'), msg(3, '/start'), msg(4, '/help'), msg(5, ''), msg(6, '/approve x y')]]);
+    const api = botApi([[msg(1, 'hello'), msg(2, '/reboot now'), msg(3, '/start'), msg(4, '/help'), msg(5, ''), msg(6, '/approve x y')]]);
     const t = transport(api);
     t.attach(fakeCommands());
     await t.receive(30_000);
     const texts = api.of('sendMessage').map((c) => c.body.text);
     expect(texts).toEqual(Array(6).fill(T.HELP_TEXT));
-    for (const c of ['/status', '/requests', '/project', '/help']) expect(T.HELP_TEXT).toContain(c);
+    for (const c of ['/status', '/requests', '/project', '/help', '/set', '/sync', '/upgrade', '/restart', '/undo']) expect(T.HELP_TEXT).toContain(c);
   });
 
   it('/status and /requests use the attached commands; /requests sends each pending offer with its buttons', async () => {

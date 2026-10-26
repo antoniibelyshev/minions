@@ -200,7 +200,7 @@ describe('settings restart and upgrade in the runtime record requests', () => {
     const fcb = await cli(['upgrade', '--from-container', 'release/1.2', '--reason', 'sync']);
     expect(fcb.env.data.request.payload).toEqual({ fromContainer: 'release/1.2' });
     expect((await cli(['upgrade', '--from-container', '--evil', '--reason', 'x'])).env.ok).toBe(false);
-    for (const flag of [['--now'], ['--timeout', '10'], ['--rebuild-cli']]) {
+    for (const flag of [['--now'], ['--timeout', '10'], ['--rebuild-cli'], ['--sync-only']]) {
       const r = await cli(['upgrade', ...flag, '--reason', 'x']);
       expect(r.env.error!.code, flag.join(' ')).toBe('PRECONDITION');
       expect(r.env.error!.message).toMatch(/not available in an upgrade request/);

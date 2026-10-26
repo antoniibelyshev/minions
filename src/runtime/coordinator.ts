@@ -215,7 +215,7 @@ export function hostSettings(h: HostHardening): { sandbox: Record<string, unknow
   if (root) readEdit(`${ruleAbs(root)}/manager`);
   deny.push(`Read(${ruleAbs(h.projectDir)}/credentials.json)`,
     `Edit(${ruleAbs(h.projectDir)}/*.json)`, `Edit(${ruleAbs(h.projectDir)}/*.yaml)`, `Edit(${secretsAbs}/**)`);
-  for (const d of ['runtime', 'plugin', 'logs', 'exports', 'host/bin', 'host/logs', 'host/transfer']) deny.push(`Edit(${ruleAbs(h.projectDir)}/${d}/**)`);
+  for (const d of ['runtime', 'plugin', 'logs', 'exports', 'config-history', 'host/bin', 'host/logs', 'host/transfer']) deny.push(`Edit(${ruleAbs(h.projectDir)}/${d}/**)`);
   // Workspace git and Claude Code control files: hooks/config would run outside the sandbox (minions runs git there).
   const ws = ruleAbs(h.workspace);
   deny.push(`Edit(${ws}/repo/.git/config)`, `Edit(${ws}/repo/.git/config.worktree)`, `Edit(${ws}/repo/.git/hooks/**)`,
