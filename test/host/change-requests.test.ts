@@ -170,6 +170,34 @@ describe('settings apply (host): plan, digest, confirmation', () => {
     await expect(CR.applyRequest(project, id, { confirm: 'f'.repeat(64) }, deps(runtime), io([]).io)).rejects.toMatchObject({ code: 'PRECONDITION', message: expect.stringMatching(/No offered plan/) });
   });
 
+  it('QA: a row tampered after the offer cannot change what --confirm applies (the plan comes from the journal)', async () => {
+    const { project, local } = await install();
+    const id = requestSet(project, 'execution.maxActiveTasks', '6');
+    const { runtime } = fakeRuntime();
+    const offered = await CR.applyRequest(project, id, {}, deps(runtime), io([null]).io);
+    expect(offered.status).toBe('offered');
+    // The container rewrites its row: another value, then a host-owned key.
+    db.exec('UPDATE change_requests SET payload = ? WHERE id = ?', JSON.stringify({ key: 'execution.maxActiveTasks', value: '9', layer: 'local' }), id);
+    db.exec('UPDATE change_requests SET payload = ?, reason = ? WHERE id = ?', JSON.stringify({ key: 'capabilities.git.push', value: 'allow', layer: 'local' }), 'forged', id);
+    const r = await CR.applyRequest(project, id, { confirm: offered.digest }, deps(runtime), io([]).io);
+    expect(r).toMatchObject({ status: 'applied', applied: true, digest: offered.digest });
+    expect(r.plan.change).toMatchObject({ key: 'execution.maxActiveTasks', to: 6 });
+    const after = readJson(local);
+    expect(after.execution.maxActiveTasks).toBe(6);
+    expect(after.capabilities).toBeUndefined();
+  });
+
+  it('QA: a digest offered for one request or project cannot confirm another', async () => {
+    const { project } = await install();
+    const a = requestSet(project, 'execution.maxActiveTasks', '6');
+    const b = requestSet(project, 'communication.progress', 'quiet');
+    const { runtime } = fakeRuntime();
+    const offeredA = await CR.applyRequest(project, a, {}, deps(runtime), io([null]).io);
+    await expect(CR.applyRequest(project, b, { confirm: offeredA.digest }, deps(runtime), io([]).io)).rejects.toMatchObject({ code: 'PRECONDITION', message: expect.stringMatching(/No offered plan/) });
+    await expect(CR.applyRequest({ ...project, projectId: 'other-project' }, a, { confirm: offeredA.digest }, deps(runtime), io([]).io)).rejects.toMatchObject({ code: 'PRECONDITION', message: expect.stringMatching(/No offered plan/) });
+    expect(journal().filter((e) => e.type === 'confirmed')).toHaveLength(0);
+  });
+
   it('a confirmation after 30 minutes is refused and applies nothing', async () => {
     const { project, local } = await install();
     const id = requestSet(project, 'execution.maxActiveTasks', '6');
