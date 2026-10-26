@@ -343,6 +343,84 @@ describe('settings apply (host): restart and upgrade requests', () => {
     // A failed request stays open: it can be applied again (new plan, new confirmation).
     expect((await CR.applyRequest(project, uid2, { yes: true }, deps(fakeRuntime().runtime, { upgrade: u.upgrade }), io([]).io)).status).toBe('applied');
   });
+
+  /** An upgrade whose confirm-time dry run (the second dry run: the first one is the offer's) waits for release(). */
+  function slowUpgrade() {
+    const inner = fakeUpgrade();
+    let dryRuns = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    let entered!: () => void;
+    const started = new Promise<void>((r) => { entered = r; });
+    const upgrade: typeof inner.upgrade = async (p, x) => {
+      if (x.dryRun && ++dryRuns === 2) { entered(); await gate; }
+      return inner.upgrade(p, x);
+    };
+    return { upgrade, runs: inner.runs, release, started };
+  }
+  const snapshot = (id: string) => CR.snapshotOf(RT.listChangeRequests(db, { all: true }).find((r) => r.id === id)!);
+
+  it('task-53.11: the confirm-time upgrade dry run runs outside the journal lock; a concurrent reject does not wait for it', async () => {
+    const { project } = await install();
+    const uid = RT.recordUpgradeRequest({ db, config: runtimeConfig(project) }, { reason: 'sync' }).request!.id;
+    const other = requestSet(project, 'execution.maxActiveTasks', '5');
+    const slow = slowUpgrade();
+    const d = deps(fakeRuntime().runtime, { upgrade: slow.upgrade });
+    const offered = await CR.offerRequest(project, snapshot(uid), d);
+    const confirming = CR.confirmRequest(project, uid, offered.digest, d);
+    await slow.started;
+    // The dry run is in flight: the lock is free (a 200 ms wait suffices) and a reject journals at once.
+    await expect(J.withJournalLock(async () => 'free', 200)).resolves.toBe('free');
+    const t0 = Date.now();
+    await expect(CR.rejectRequest(project, other, { reason: 'not now' }, d)).resolves.toMatchObject({ status: 'rejected' });
+    expect(Date.now() - t0).toBeLessThan(2000);
+    expect(journal().some((e) => e.type === 'confirmed' && e.requestId === uid)).toBe(false);
+    slow.release();
+    await expect(confirming).resolves.toMatchObject({ status: 'applied', applied: true });
+    expect(slow.runs).toEqual([{ fromContainer: null, dryRun: true }, { fromContainer: null, dryRun: true }, { fromContainer: null, dryRun: false }]);
+    expect(journal().filter((e) => e.requestId === uid).map((e) => e.type)).toEqual(['offer', 'confirmed', 'applied']);
+  });
+
+  it('task-53.11: replay protection holds across the unlocked dry run (reject, confirm or config change meanwhile -> refused)', async () => {
+    const { project } = await install();
+    // A reject of the same request while the dry run runs: the check under the lock refuses (handled).
+    const uid = RT.recordUpgradeRequest({ db, config: runtimeConfig(project) }, {}).request!.id;
+    const slow = slowUpgrade();
+    const d = deps(fakeRuntime().runtime, { upgrade: slow.upgrade });
+    const offered = await CR.offerRequest(project, snapshot(uid), d);
+    const confirming = CR.confirmRequest(project, uid, offered.digest, d);
+    await slow.started;
+    await CR.rejectRequest(project, uid, {}, d);
+    slow.release();
+    await expect(confirming).rejects.toMatchObject({ code: 'CONFLICT', details: { refusal: 'handled' } });
+    expect(slow.runs.some((r) => !r.dryRun)).toBe(false);
+    expect(journal().some((e) => e.type === 'confirmed' && e.requestId === uid)).toBe(false);
+
+    // Two confirmations of the same offer race: the one that takes the lock first wins, the other finds the nonce spent.
+    const uid2 = RT.recordUpgradeRequest({ db, config: runtimeConfig(project) }, {}).request!.id;
+    const slow2 = slowUpgrade();
+    const d2 = deps(fakeRuntime().runtime, { upgrade: slow2.upgrade });
+    const offer2 = await CR.offerRequest(project, snapshot(uid2), d2);
+    const first = CR.confirmRequest(project, uid2, offer2.digest, d2);
+    await slow2.started;
+    await expect(CR.confirmOffer(project, offer2.offer, deps(fakeRuntime().runtime))).resolves.toMatchObject({ plan: { kind: 'upgrade' } });
+    slow2.release();
+    await expect(first).rejects.toMatchObject({ code: 'CONFLICT', details: { refusal: 'spent' } });
+    expect(slow2.runs.some((r) => !r.dryRun)).toBe(false);
+    expect(journal().filter((e) => e.type === 'confirmed' && e.requestId === uid2)).toHaveLength(1);
+
+    // A configuration change while the dry run runs: the revision read under the lock refuses.
+    const uid3 = RT.recordUpgradeRequest({ db, config: runtimeConfig(project) }, {}).request!.id;
+    const slow3 = slowUpgrade();
+    const d3 = deps(fakeRuntime().runtime, { upgrade: slow3.upgrade });
+    const offer3 = await CR.offerRequest(project, snapshot(uid3), d3);
+    const third = CR.confirmRequest(project, uid3, offer3.digest, d3);
+    await slow3.started;
+    await editProjectConfig(project, (raw) => ({ ...raw, architecture: 'propose' }));
+    slow3.release();
+    await expect(third).rejects.toMatchObject({ code: 'CONFLICT', details: { refusal: 'revision' } });
+    expect(slow3.runs.some((r) => !r.dryRun)).toBe(false);
+  });
 });
 
 describe('settings reject and requests (host)', () => {

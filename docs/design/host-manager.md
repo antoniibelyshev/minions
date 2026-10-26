@@ -313,6 +313,15 @@ Built in task-53.4 (phase 3): the manager core in `src/host/manager.ts`, entry p
   example a terminal `settings apply`, is left alone.
 - **Lock.** `<MINIONS_HOME>/manager/lock` holds `{pid, start, at}`, taken with `O_EXCL`. A live holder makes a second
   manager fail with CONFLICT. The lock of a dead or reused pid is taken over. The lock is released on exit.
+- **Dry run outside the journal lock (task-53.11).** Other journal writers (`settings reject`, offers, outcomes, the
+  manager) wait at most 10 s for the journal lock, and `minions upgrade --dry-run` can take longer. So for an upgrade
+  `confirmOffer` first checks spent, handled and expiry without the lock (an early refusal, advisory only), then runs
+  the dry run without the lock (`upgradeDryRun`). Under the lock it checks spent, handled and expiry again and
+  rebuilds the plan from the journaled request with that dry run: `configRevision` and the delivery check are read
+  again there (cheap), and the digest is compared as before. The nonce check and the `confirmed` entry stay one
+  step, so replay protection is unchanged. A config change, reject or second confirmation during the dry run is still
+  refused (`details.refusal` revision, handled or spent). Only the upgrade dry run moves out of the lock. Config-set
+  and restart plans are cheap and are still built entirely under it.
 
 
 Child tasks, filed as task-53.2 to task-53.7 (phases 1 to 6) and task-53.8 (coordinator proposal):
