@@ -130,6 +130,16 @@ describe('host runtime sandbox settings (H4, M3, M5, M7, L1)', () => {
     expect(s.blockReadsOutsideWorkingDirectories).toBe(true);
   });
 
+  it('host manager state under the data root is denied to Read and Edit (directory rule, task-53.5.5)', () => {
+    const mgr = `//${h.hostRoot.slice(1)}/manager`;
+    expect(s.deny).toEqual(expect.arrayContaining([`Edit(${mgr})`, `Edit(${mgr}/**)`, `Read(${mgr})`, `Read(${mgr}/**)`]));
+    // No safe data root (not explicit, project not under <root>/projects): no manager rule at all.
+    const noRoot = C.hostSettings({ ...h, hostRoot: undefined, projectDir: '/srv/p1' });
+    expect(noRoot.deny.some((d) => d.includes('/manager'))).toBe(false);
+    // Unsafe root (home itself) is not a deny target either.
+    expect(C.hostSettings({ ...h, hostRoot: h.home }).deny.some((d) => d.includes('/manager'))).toBe(false);
+  });
+
   it('no home paths writable (caches go to state); git config/hooks and Claude files in the workspace protected', () => {
     expect(fs.allowWrite).toEqual([h.workspace, h.state]);
     expect(fs.allowWrite.some((p) => p.startsWith('~'))).toBe(false);

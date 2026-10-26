@@ -149,6 +149,30 @@ describe('reusable helpers', () => {
     expect(M.isOwnerUpdate(access, { update_id: 3, callback_query: { from: { id: OWNER } } })).toBe(false);
   });
 
+  it('isOwnerUpdate takes sender and chat from the same part: mixed message/callback updates are rejected (task-53.5.5)', () => {
+    const ownerFrom = { id: OWNER };
+    const ownerChat = { id: OWNER, type: 'private' };
+    const strangerFrom = { id: OWNER + 1 };
+    const strangerChat = { id: OWNER + 1, type: 'private' };
+    // message without a sender + the owner's button tap
+    expect(M.isOwnerUpdate(access, { update_id: 10, message: { chat: ownerChat }, callback_query: { from: ownerFrom, message: { chat: ownerChat } } })).toBe(false);
+    // message without a chat + the owner's button tap in the owner chat
+    expect(M.isOwnerUpdate(access, { update_id: 11, message: { from: ownerFrom }, callback_query: { from: ownerFrom, message: { chat: ownerChat } } })).toBe(false);
+    // owner sender on the message, the private chat only on the callback
+    expect(M.isOwnerUpdate(access, { update_id: 12, message: { from: ownerFrom }, callback_query: { message: { chat: ownerChat } } })).toBe(false);
+    // stranger message in the owner chat + owner callback elsewhere
+    expect(M.isOwnerUpdate(access, { update_id: 13, message: { from: strangerFrom, chat: ownerChat }, callback_query: { from: ownerFrom, message: { chat: strangerChat } } })).toBe(false);
+    // callback from a stranger on a message in the owner chat, with an owner-sender message lacking a chat
+    expect(M.isOwnerUpdate(access, { update_id: 14, message: { from: ownerFrom }, callback_query: { from: strangerFrom, message: { chat: ownerChat } } })).toBe(false);
+    // callback: owner sender but no message chat
+    expect(M.isOwnerUpdate(access, { update_id: 15, callback_query: { from: ownerFrom, message: {} } })).toBe(false);
+    // callback: chat but no sender
+    expect(M.isOwnerUpdate(access, { update_id: 16, callback_query: { message: { chat: ownerChat } } })).toBe(false);
+    // well-formed single parts still pass
+    expect(M.isOwnerUpdate(access, { update_id: 17, message: { from: ownerFrom, chat: ownerChat } })).toBe(true);
+    expect(M.isOwnerUpdate(access, { update_id: 18, callback_query: { from: ownerFrom, message: { chat: ownerChat } } })).toBe(true);
+  });
+
   it('does not poll back to back with timeout 0 in the last second before the deadline', async () => {
     const b = api([]);
     // Short TTL and polls that return quickly (400 ms of fake time each, never 1 s+): the old loop reached

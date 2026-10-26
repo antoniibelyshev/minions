@@ -131,10 +131,13 @@ export interface TelegramUpdate {
 /**
  * True only for an update from the paired owner in the paired private chat (a message or a button tap). Everything
  * else (other users, groups, channels, the owner in a group) is dropped by the transport without a reply.
+ * Sender and chat come from the same part (the message if present, else the button tap), never one from each.
  */
 export function isOwnerUpdate(access: ManagerAccess, u: TelegramUpdate): boolean {
-  const from = u.message?.from ?? u.callback_query?.from;
-  const chat = u.message?.chat ?? u.callback_query?.message?.chat;
+  const part = u.message ? { from: u.message.from, chat: u.message.chat }
+    : u.callback_query ? { from: u.callback_query.from, chat: u.callback_query.message?.chat } : undefined;
+  const from = part?.from;
+  const chat = part?.chat;
   return !!from && !!chat && from.is_bot !== true && chat.type === 'private' && from.id === access.userId && chat.id === access.chatId;
 }
 
