@@ -200,7 +200,7 @@ describe('keychain store', () => {
     const r = await C.provisionGithubToken({ projectId: ID, token: TOKEN, repoPath: repo, verify: false, runner, env: {}, platform: 'darwin' });
     expect(r.backend).toBe('keychain');
     expect(existsSync(new C.FileStore().path(ID))).toBe(false);
-    expect(await C.materializeSecrets(ID, runner)).toEqual({ github: true, telegram: false });
+    expect(await C.materializeSecrets(ID, runner)).toEqual({ github: true, telegram: false, codex: false });
     expect(readFileSync(projectPaths(ID).githubTokenFile, 'utf8')).toBe(TOKEN + '\n');
     for (const c of calls) expect(c.args.join(' ')).not.toContain(TOKEN);
   });
@@ -228,7 +228,7 @@ describe('keychain store', () => {
     const p = projectPaths(ID);
     await C.provisionGithubToken({ projectId: ID, token: TOKEN, repoPath: repo, verify: false, runner, env: {}, platform: 'darwin' });
     await C.provisionTelegramToken({ projectId: ID, token: TG, repoPath: repo, runner, env: {}, platform: 'linux' });
-    expect(await C.materializeSecrets(ID, runner)).toEqual({ github: true, telegram: true });
+    expect(await C.materializeSecrets(ID, runner)).toEqual({ github: true, telegram: true, codex: false });
     // Rotate the file-stored telegram token, then lock the keychain that holds the github token.
     await C.provisionTelegramToken({ projectId: ID, token: TG2, repoPath: repo, runner, env: {}, platform: 'linux' });
     await expect(C.materializeSecrets(ID, lockedKeychain())).rejects.toMatchObject({ code: 'AUTH_REQUIRED' });
@@ -322,7 +322,7 @@ describe('secret service store (Linux, secret-tool)', () => {
     expect(C.backendLabel(r.backend)).toBe('the Secret Service keyring (secret-tool)');
     expect(existsSync(new C.FileStore().path(ID))).toBe(false);
     expect((await C.loadCredentialRefs(ID)).github).toMatchObject({ backend: 'secret-service', ref: `secret-service:minions.github/${ID}` });
-    expect(await C.materializeSecrets(ID, runner)).toEqual({ github: true, telegram: false });
+    expect(await C.materializeSecrets(ID, runner)).toEqual({ github: true, telegram: false, codex: false });
     expect(readFileSync(projectPaths(ID).githubTokenFile, 'utf8')).toBe(TOKEN + '\n');
     expect(mode(projectPaths(ID).githubTokenFile)).toBe(0o600);
     expect((await C.githubCredentialStatus({ projectId: ID, remoteUrl: null }, { runner, fetch: github(200, { login: 'x' }).f })).detail).toContain('Secret Service keyring');
@@ -379,7 +379,7 @@ describe('container mount', () => {
     const repo = makeRepo(env.root);
     await C.provisionGithubToken({ projectId: ID, token: TOKEN, repoPath: repo, verify: false });
     const p = projectPaths(ID);
-    expect(await C.materializeSecrets(ID)).toEqual({ github: true, telegram: false });
+    expect(await C.materializeSecrets(ID)).toEqual({ github: true, telegram: false, codex: false });
     expect(mode(p.secretsDir)).toBe(0o700);
     expect(mode(p.githubTokenFile)).toBe(0o600);
     const ino = statSync(p.githubTokenFile).ino;
@@ -394,7 +394,7 @@ describe('container mount', () => {
   });
 
   it('materialize without a provisioned token leaves an empty secrets dir', async () => {
-    expect(await C.materializeSecrets(ID)).toEqual({ github: false, telegram: false });
+    expect(await C.materializeSecrets(ID)).toEqual({ github: false, telegram: false, codex: false });
     expect(readdirSync(projectPaths(ID).secretsDir)).toEqual([]);
   });
 });

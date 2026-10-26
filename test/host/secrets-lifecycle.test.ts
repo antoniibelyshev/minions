@@ -33,21 +33,21 @@ describe('container copy lifecycle', () => {
     await plant(ID);
     const err = new Error('up failed');
     await expect(C.upClearingSecretsOnFailure({ up: async () => { throw err; } }, ID)).rejects.toBe(err);
-    expect(copies(ID)).toEqual([false, false]);
+    expect(copies(ID)).toEqual([false, false, false]);
   });
 
   it('keeps the copies when compose.up succeeds', async () => {
     await plant(ID);
     await C.upClearingSecretsOnFailure({ up: async () => undefined }, ID);
-    expect(copies(ID)).toEqual([true, true]);
+    expect(copies(ID)).toEqual([true, true, true]);
   });
 
   it('clearStaleSecrets removes copies only when no container is running', async () => {
     await plant(ID);
     expect(await C.clearStaleSecrets(ID, true)).toBe(false);
-    expect(copies(ID)).toEqual([true, true]);
+    expect(copies(ID)).toEqual([true, true, true]);
     expect(await C.clearStaleSecrets(ID, false)).toBe(true);
-    expect(copies(ID)).toEqual([false, false]);
+    expect(copies(ID)).toEqual([false, false, false]);
     expect(await C.clearStaleSecrets(ID, false)).toBe(false);
   });
 
@@ -60,7 +60,7 @@ describe('container copy lifecycle', () => {
     const runner = async (_c: string, args: string[]): Promise<RunResult> => ok(args.includes('ps') ? '' : '');
     const doc = await runDoctor({ cwd: repo, probe: dockerUp, runner });
     expect(doc.checks.find((c) => c.name === 'secrets.copy')).toMatchObject({ status: 'warn' });
-    expect(copies(id)).toEqual([false, false]);
+    expect(copies(id)).toEqual([false, false, false]);
     expect(existsSync(new C.FileStore().path(id))).toBe(true);
   });
 
@@ -72,7 +72,7 @@ describe('container copy lifecycle', () => {
     const runner = async (_c: string, args: string[]): Promise<RunResult> => args.includes('ps') ? ok('abc\n') : ok('{}');
     const doc = await runDoctor({ cwd: repo, probe: dockerUp, runner });
     expect(doc.checks.find((c) => c.name === 'secrets.copy')).toBeUndefined();
-    expect(copies(id)).toEqual([true, true]);
+    expect(copies(id)).toEqual([true, true, true]);
   });
 });
 
@@ -153,7 +153,7 @@ describe('doctor keeps copies unless the container is confirmed gone', () => {
         return args.includes('-a') ? res : ok(''); // `--status running` lookup finds nothing
       };
       const doc = await runDoctor({ cwd: repo, probe: dockerUp, runner });
-      expect(copies(id)).toEqual([true, true]);
+      expect(copies(id)).toEqual([true, true, true]);
       expect(doc.checks.find((c) => c.name === 'secrets.copy')).toMatchObject({ status: 'warn', detail: expect.stringContaining('not removed') });
     });
   }
@@ -164,7 +164,7 @@ describe('doctor keeps copies unless the container is confirmed gone', () => {
     const runner = async (_c: string, args: string[]): Promise<RunResult> =>
       args.includes('ps') && args.includes('-a') ? ok(JSON.stringify({ State: 'exited' })) : ok('');
     await runDoctor({ cwd: repo, probe: dockerUp, runner });
-    expect(copies(r.plan.projectId)).toEqual([false, false]);
+    expect(copies(r.plan.projectId)).toEqual([false, false, false]);
   });
 });
 
@@ -203,7 +203,7 @@ describe('doctor never deletes when Docker or ps is unreachable (tester)', () =>
     const r = await runInit({ path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
     await plant(r.plan.projectId);
     await runDoctor({ cwd: repo, probe: dockerDown, runner: async () => ok('') });
-    expect(copies(r.plan.projectId)).toEqual([true, true]);
+    expect(copies(r.plan.projectId)).toEqual([true, true, true]);
   });
   it('keeps copies when ps -a throws (timeout) at doctor level', async () => {
     const repo = makeRepo(env.root);
@@ -214,7 +214,7 @@ describe('doctor never deletes when Docker or ps is unreachable (tester)', () =>
       return ok('');
     };
     const doc = await runDoctor({ cwd: repo, probe: dockerUp, runner });
-    expect(copies(r.plan.projectId)).toEqual([true, true]);
+    expect(copies(r.plan.projectId)).toEqual([true, true, true]);
     expect(doc.checks.find((c) => c.name === 'secrets.copy')?.status).toBe('warn');
   });
   it('keeps copies when another service is running but ours is restarting (filtered ps -a returns ours only)', async () => {
@@ -224,6 +224,6 @@ describe('doctor never deletes when Docker or ps is unreachable (tester)', () =>
     const runner = async (_c: string, args: string[]): Promise<RunResult> =>
       args.includes('ps') && args.includes('-a') ? ok(JSON.stringify({ Service: 'app', State: 'restarting' })) : ok('');
     await runDoctor({ cwd: repo, probe: dockerUp, runner });
-    expect(copies(r.plan.projectId)).toEqual([true, true]);
+    expect(copies(r.plan.projectId)).toEqual([true, true, true]);
   });
 });
