@@ -34,8 +34,10 @@ import { requireSandbox, type SelfTestReport } from '../sandbox/selftest.js';
 import { checkPlanEnv, type LaunchPlan, type ProcessAdapter, type UsageEvent } from './adapter.js';
 import {
   cancelMarked, createRunRecord, groupMembers, procStat, hostIdentity, isAlive, procIdentity, readRunRecord, runDir, sameHost, updateRunRecord, markCancel,
-  type RunRecord, type RunRole, type HostIdentity,
+  acquireOwner, listRunRecords, ownerAlive, ownerToken, ownsRun, readOwner, releaseOwner, removeRunRecord,
+  type ProcIdentity, type RunRecord, type RunRole, type HostIdentity,
 } from './record.js';
+import { RUN_MARKER_ENV, sweepEscapees, type EscapeeSweep } from './escapees.js';
 import { branchRuleAndFetch, createClone, diffLeaseGit, restoreLeaseGit, sanitizeClone, sharedTarget, snapshotLeaseGit, wipCommit, writeNoFollow, type RepoContext } from './repo.js';
 import { DEFAULT_TIMING, supervise, type StopReason, type SuperviseTiming } from './supervise.js';
 
@@ -199,15 +201,22 @@ function synthesized(rec: RunRecord, head: string, status: 'blocked' | 'partial'
   return JSON.stringify({ status, summary, branch: rec.branch, headSha: head, modifiedPaths: [], checks: [], acceptanceEvidence: [], findings, nextAction }, null, 2) + '\n';
 }
 
-export interface PostExit { violations: string[]; head: string; fetched: boolean; wipCommit: string | null }
+export interface PostExit { violations: string[]; head: string; fetched: boolean; wipCommit: string | null; note?: string }
 
 /**
  * D3.7.1 to 7.5: lease git files against the snapshot (restored on a difference), the clone sanitized, an optional
  * `wip:` commit, the branch rule and the fast-forward-only fetch-back. Any violation means nothing is fetched.
  */
-export async function postExit(rec: RunRecord, deps: Pick<RunnerDeps, 'env' | 'paths'>, wip: string | null): Promise<PostExit> {
+export async function postExit(rec: RunRecord, deps: Pick<RunnerDeps, 'env' | 'paths'>, wip: string | null, opts: { leaseEnded?: boolean } = {}): Promise<PostExit> {
   const snap = rec.leaseGit;
   if (!snap) return { violations: [], head: rec.claimHead, fetched: false, wipCommit: null };
+  // After the lease ended, its scratch dir (the clone) or its worktree may be gone legitimately (lease cleanup,
+  // worktree removal): nothing can be fetched, and that is no harness violation (task-14.4 review).
+  if (opts.leaseEnded) {
+    const gone = !(await lstat(rec.checkout).catch(() => null)) ? 'the per-lease clone was removed when the lease ended'
+      : !(await lstat(join(rec.leaseWorktree, '.git')).catch(() => null)) ? 'the lease worktree was removed after the lease ended' : null;
+    if (gone) return { violations: [], head: rec.claimHead, fetched: false, wipCommit: null, note: `${gone}; nothing fetched` };
+  }
   const ctx = repoContext(rec, deps);
   const violations: string[] = [];
   const changed = await diffLeaseGit(snap);
@@ -241,14 +250,20 @@ export async function runLease(leaseId: string, deps: RunnerDeps): Promise<RunOu
   const block = harnessBlock(deps.config, harness)!;
   const timing: SuperviseTiming = { ...DEFAULT_TIMING, timeoutMs: (block.timeoutMinutes ?? DEFAULT_HARNESS_TIMEOUT_MINUTES) * 60_000, ...deps.timing };
   const host = await hostIdentity(proc);
+  const runner = await procIdentity(process.pid, proc);
+  // Fail closed: recovery tells a live runner from a dead one by these; without them it could race this run.
+  if (!host || !runner) throw new MinionsError('PRECONDITION', `Cannot identify this runner or its host from ${proc} (boot id, start times): recovery could not tell whether it is alive.`);
   const at = now().toISOString();
   let rec: RunRecord = {
     version: 1, leaseId, taskId: lease.task_id, role: runRole(def), branch: lease.branch, claimHead: lease.head_sha, leaseWorktree: lease.worktree,
-    scratchDir: scratch, checkout: join(scratch, 'work'), host, runner: await procIdentity(process.pid, proc), wrapper: null, pgid: null,
+    scratchDir: scratch, checkout: join(scratch, 'work'), host, runner, wrapper: null, pgid: null,
     phase: 'prepared', leaseGit: null, deadline: null, createdAt: at, updatedAt: at,
   };
   const dir = await createRunRecord(deps.paths.state, rec);
   const state = deps.paths.state;
+  const owner = ownerToken(runner, 'runner', host);
+  const got = await acquireOwner(state, leaseId, owner, proc);
+  if (!got.ok) throw new MinionsError('CONFLICT', `Lease ${leaseId}'s run is owned by pid ${got.holder.pid} (${got.holder.role}).`);
   const update = async (patch: Partial<RunRecord>) => (rec = await updateRunRecord(state, rec, patch, now()));
   const out: RunOutput = { leaseId, exit: null, submitted: false, status: null, violations: [], usage: null, wipCommit: null, head: null };
   const usageEvents: UsageEvent[] = [];
@@ -291,8 +306,10 @@ export async function runLease(leaseId: string, deps: RunnerDeps): Promise<RunOu
     }
     const childEnv: Record<string, string> = {
       PATH: env.PATH ?? '/usr/local/bin:/usr/bin:/bin', HOME: harnessHome, TMPDIR: tmpDir, LANG: env.LANG ?? 'C.UTF-8', TERM: 'dumb',
-      MINIONS_WORKER_LEASE: leaseId, MINIONS_ROLE: lease.role, MINIONS_BRIEF_FILE: briefFile, MINIONS_RESULT_FILE: resultFile,
+      MINIONS_ROLE: lease.role, MINIONS_BRIEF_FILE: briefFile, MINIONS_RESULT_FILE: resultFile,
       ...plan.env, ...secrets,
+      // Last, so that no plan can change it: the escapee sweep identifies this run's processes by it.
+      [RUN_MARKER_ENV]: leaseId,
     };
     let argv = plan.argv;
     const secretValues = Object.values(secrets);
@@ -329,14 +346,16 @@ export async function runLease(leaseId: string, deps: RunnerDeps): Promise<RunOu
     });
     out.exit = { code: sup.code, signal: sup.signal, stopped: sup.stopped };
     // Recovery (reapRun) took the record over while this runner looked dead or stuck: it owns post-exit now.
+    // A reaper takes the owner lock only from a dead holder, so while this runner holds it no reaper touches the run.
     const cur = await readRunRecord(state, leaseId).catch(() => null);
-    if (!cur || cur.phase === 'done' || cur.runner?.pid !== rec.runner?.pid || cur.runner?.startTime !== rec.runner?.startTime) {
+    if (!cur || cur.phase === 'done' || !(await ownsRun(state, leaseId, owner)) || cur.runner?.pid !== rec.runner?.pid || cur.runner?.startTime !== rec.runner?.startTime) {
       out.error = 'the run was taken over by recovery (reapRun); nothing submitted';
       return out;
     }
     await update({ phase: 'post-exit' });
     const stoppedEarly = sup.stopped === 'drain' || sup.stopped === 'timeout' || sup.stopped === 'cancel' || sup.stopped === 'lease-ended';
-    const post = await postExit(rec, deps, stoppedEarly ? (sup.stopped as string) : null);
+    const leaseEnded = sup.stopped === 'lease-ended' || deps.db.lease(leaseId)?.status !== 'active';
+    const post = await postExit(rec, deps, stoppedEarly ? (sup.stopped === 'cancel' ? 'cancel: recovery' : sup.stopped as string) : null, { leaseEnded });
     out.violations = post.violations; out.head = post.head; out.wipCommit = post.wipCommit;
     out.usage = (adapter.finalUsage ?? (() => null))(usageEvents);
 
@@ -345,9 +364,12 @@ export async function runLease(leaseId: string, deps: RunnerDeps): Promise<RunOu
       deps.db.addEvent('harness-violation', lease.task_id, { leaseId, harness, violations: post.violations });
       raw = synthesized(rec, post.head, 'blocked', `The process runner found a harness violation (${harness}); nothing was fetched.`,
         post.violations.map((v) => `harness-violation: ${v}`), 'Terminal for this attempt: inspect the violation before dispatching the task again.');
-    } else if (sup.stopped === 'drain' || sup.stopped === 'timeout') {
+    } else if (sup.stopped === 'drain' || sup.stopped === 'timeout' || sup.stopped === 'cancel') {
+      // cancel: only reapRun marks it, right before the lease ends (release) or at coordinator start (recovery).
+      const why = sup.stopped === 'drain' ? 'drain reached' : sup.stopped === 'cancel' ? 'cancelled by recovery (the lease is being released or recovered)'
+        : `wall-clock limit of ${Math.round(timing.timeoutMs / 1000)} s reached`;
       raw = synthesized(rec, post.head, 'partial', `Stopped by the runner (${sup.stopped})${post.wipCommit ? `; work in progress is committed as ${post.wipCommit}` : '; nothing to commit'}.`,
-        [`runner: ${sup.stopped === 'drain' ? 'drain' : `wall-clock limit of ${Math.round(timing.timeoutMs / 1000)} s`} reached`], 'Continue from the wip: commit on the branch.');
+        [`runner: ${why}`], 'Continue from the wip: commit on the branch.');
     } else {
       const fromFile = await readWorkerFile(join(scratch, 'result.json'));
       const fm = finalMessage as string | null;
@@ -369,7 +391,7 @@ export async function runLease(leaseId: string, deps: RunnerDeps): Promise<RunOu
       try { out.status = (JSON.parse(raw) as { status?: string }).status ?? null; } catch { out.status = null; }
     }
     if (out.usage) recordLeaseUsage(deps.db, leaseId, { tokens: out.usage.tokens, model: gate.brief.model ?? null, source: 'runner', harness });
-    await update({ phase: 'done', outcome: { status: out.status, submitted: out.submitted, wipCommit: out.wipCommit, violations: out.violations, head: out.head, reason: sup.stopped ?? 'exit' } });
+    await update({ phase: 'done', outcome: { status: out.status, submitted: out.submitted, wipCommit: out.wipCommit, violations: out.violations, head: out.head, reason: sup.stopped ?? 'exit', ...(post.note ? { note: post.note } : {}) } });
     return out;
   } catch (e) {
     const msg = (e as Error).message;
@@ -383,57 +405,174 @@ export async function runLease(leaseId: string, deps: RunnerDeps): Promise<RunOu
     // A failure during post-exit leaves the record for recovery; before the spawn there is nothing to reap.
     if (rec.phase === 'prepared') await update({ phase: 'done', outcome: { status: out.status, submitted: out.submitted, wipCommit: null, violations: [], head: rec.claimHead, reason: 'error' } }).catch(() => undefined);
     return out;
+  } finally {
+    await releaseOwner(state, leaseId, owner).catch(() => undefined);
   }
 }
 
 // --------------------------------------------------------------------------------------------------- reapRun
 
-export interface ReapOutcome { leaseId: string; action: 'none' | 'cancelled' | 'recovered'; killed: number[]; post: PostExit | null; note: string | null }
+export interface ReapOutcome {
+  leaseId: string;
+  action: 'none' | 'cancelled' | 'recovered';
+  killed: number[];
+  post: PostExit | null;
+  /** For the release note: the wip commit or why nothing was fetched; null when there was no run. */
+  note: string | null;
+  escapees?: EscapeeSweep | null;
+}
+
+/** The escapee sweep's /proc root and kill function (tests inject a fake tree); null skips the sweep (tests only). */
+export interface EscapeeSweepDeps { proc?: string; kill?: (pid: number) => void }
+
+export type ReapDeps = Pick<RunnerDeps, 'env' | 'paths' | 'db' | 'proc' | 'now'> & {
+  waitMs?: number;
+  pollMs?: number;
+  /** Required so that every caller decides: production passes `{}` (the real /proc); tests pass a fake or null. */
+  escapees: EscapeeSweepDeps | null;
+};
+
+const sleepMs = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** The release-note text of a finished record. */
+function outcomeNote(rec: RunRecord): string | null {
+  const o = rec.outcome;
+  if (!o) return null;
+  const parts = [o.reason === 'recovered' ? 'recovered: runner lost' : `run ended (${o.reason})`];
+  if (o.wipCommit) parts.push(`work in progress is committed as ${o.wipCommit}`);
+  if (o.violations.length) parts.push(`harness violation, nothing fetched: ${o.violations.join('; ').slice(0, 300)}`);
+  if (o.note) parts.push(o.note);
+  return parts.join('; ');
+}
+
+/** Waits up to `ms` for the record to be `done`; returns it then, else null. */
+async function waitDone(state: string, leaseId: string, ms: number, poll: number): Promise<RunRecord | null> {
+  const until = Date.now() + ms;
+  for (;;) {
+    const r = await readRunRecord(state, leaseId);
+    if (!r || r.phase === 'done') return r ?? null;
+    if (Date.now() >= until) return null;
+    await sleepMs(poll);
+  }
+}
 
 /**
- * D3b: recovery driven by the run record, before a lease ends or a task is re-dispatched. Nothing to do for no
- * record or `done`. A live runner gets a cancel mark and `waitMs` to finish. Otherwise (or on timeout) the recorded
- * runner, wrapper and process group are killed (each checked against its recorded start time; skipped for a record
- * from another boot or container start), post-exit runs with a drain-style `wip:` commit, and the record is `done`.
+ * D3b: recovery driven by the run record, before a lease ends or a task is re-dispatched. Never races the live
+ * runner: the runner holds the record's owner lock for its whole life, and a reaper takes it only from a dead
+ * holder.
+ * 1. No record or `done`: nothing to do (the note repeats a finished run's outcome).
+ * 2. The runner (or another reaper) is alive: mark cancel and wait `waitMs` (60 s) for `done`.
+ * 3. Otherwise, or on timeout: SIGKILL the recorded runner, wrapper and process group (each checked against its
+ *    recorded start time), then sweep for sandboxed escapees whose ancestry reaches no live wrapper. A record from
+ *    another boot or container start skips this step: its processes are gone.
+ * 4. Take the owner lock, run post-exit with a drain-style `wip:` commit, mark the record `done`.
+ * A live reaper that still holds the lock after the wait is a CONFLICT (the caller retries; the lease stays).
  */
-export async function reapRun(leaseId: string, deps: Pick<RunnerDeps, 'env' | 'paths' | 'db' | 'proc' | 'now'> & { waitMs?: number; pollMs?: number }): Promise<ReapOutcome> {
+export async function reapRun(leaseId: string, deps: ReapDeps): Promise<ReapOutcome> {
   const state = deps.paths.state;
   const proc = deps.proc ?? '/proc';
+  const waitMs = deps.waitMs ?? 60_000;
+  const pollMs = deps.pollMs ?? 500;
   let rec = await readRunRecord(state, leaseId);
-  if (!rec || rec.phase === 'done') return { leaseId, action: 'none', killed: [], post: null, note: null };
+  if (!rec || rec.phase === 'done') return { leaseId, action: 'none', killed: [], post: null, note: rec ? outcomeNote(rec) : null };
   const host: HostIdentity | null = await hostIdentity(proc);
   const live = sameHost(rec.host, host);
-  if (live && await isAlive(rec.runner, proc)) {
-    await markCancel(state, leaseId, 'reap');
-    const until = Date.now() + (deps.waitMs ?? 60_000);
-    while (Date.now() < until) {
-      await new Promise((r) => setTimeout(r, deps.pollMs ?? 500));
-      rec = (await readRunRecord(state, leaseId))!;
-      if (rec.phase === 'done') return { leaseId, action: 'cancelled', killed: [], post: null, note: null };
+  const self = await procIdentity(process.pid, proc);
+  if (!self || !host) throw new MinionsError('PRECONDITION', `Cannot identify this process or its host from ${proc}: recovery of ${leaseId} could race its runner.`);
+  const mine = ownerToken(self, 'reaper', host);
+
+  // 2. A live owner (the runner, or another reaper) finishes on its own, or is killed below on timeout.
+  const holder = await readOwner(state, leaseId);
+  const runnerAlive = live && await isAlive(rec.runner, proc);
+  const holderAlive = !!holder && await ownerAlive(holder, proc);
+  if (runnerAlive || holderAlive) {
+    if (runnerAlive || holder?.role === 'runner') await markCancel(state, leaseId, 'reap');
+    const done = await waitDone(state, leaseId, waitMs, pollMs);
+    if (done) return { leaseId, action: 'cancelled', killed: [], post: null, note: outcomeNote(done) };
+    if (holderAlive && holder!.role === 'reaper' && await ownerAlive(holder!, proc)) {
+      throw new MinionsError('CONFLICT', `Recovery of ${leaseId} is already in progress (pid ${holder!.pid}).`, 'Retry once it finishes; the lease stays active until then.');
     }
+    rec = (await readRunRecord(state, leaseId))!;
   }
+
+  // 3. Kill the runner, the wrapper and its group, then the escapees.
   const killed: number[] = [];
+  let escapees: EscapeeSweep | null = null;
   if (live) {
-    for (const p of [rec.runner, rec.wrapper]) {
-      if (p && p.pid !== process.pid && await isAlive(p, proc)) { try { process.kill(p.pid, 'SIGKILL'); killed.push(p.pid); } catch { /* gone */ } }
+    const targets: (ProcIdentity | null)[] = [rec.runner, rec.wrapper, holder?.role === 'runner' && sameHost(holder.host, host) ? holder : null];
+    for (const p of targets) {
+      if (p && p.pid !== process.pid && !killed.includes(p.pid) && await isAlive(p, proc)) { try { process.kill(p.pid, 'SIGKILL'); killed.push(p.pid); } catch { /* gone */ } }
     }
     if (rec.pgid && rec.wrapper) {
       for (const pid of await groupMembers(rec.pgid, rec.wrapper.startTime, proc)) {
-        if (pid === process.pid) continue;
+        if (pid === process.pid || killed.includes(pid)) continue;
         try { process.kill(pid, 'SIGKILL'); killed.push(pid); } catch { /* gone */ }
       }
+    }
+    const sweepProc = deps.escapees?.proc ?? proc;
+    if (deps.escapees) {
+      escapees = await sweepEscapees({ leaseId, proc: sweepProc, liveWrappers: await liveWrappers(state, leaseId, host, proc), ...(deps.escapees.kill ? { kill: deps.escapees.kill } : {}) });
     }
     // Wait (bounded) until every killed process is gone before post-exit touches the clone.
     const until = Date.now() + 5_000;
     while (Date.now() < until) {
-      const states = await Promise.all(killed.map((pid) => procStat(pid, proc)));
+      const states = await Promise.all([...killed.map((pid) => procStat(pid, proc)), ...(escapees?.killed ?? []).map((pid) => procStat(pid, sweepProc))]);
       if (states.every((x) => !x || x.state === 'Z')) break;
-      await new Promise((r) => setTimeout(r, 50));
+      await sleepMs(50);
     }
+    killed.push(...(escapees?.killed ?? []));
   }
-  const post = rec.leaseGit ? await postExit(rec, deps, 'recovered: runner lost') : null;
-  if (post?.violations.length) deps.db.addEvent('harness-violation', rec.taskId, { leaseId, harness: rec.role.harness, violations: post.violations, recovered: true });
-  const note = post?.wipCommit ? `recovered: runner lost; work in progress is committed as ${post.wipCommit}` : 'recovered: runner lost';
-  await updateRunRecord(state, rec, { phase: 'done', outcome: { status: null, submitted: false, wipCommit: post?.wipCommit ?? null, violations: post?.violations ?? [], head: post?.head ?? rec.claimHead, reason: 'recovered' } }, (deps.now ?? (() => new Date()))());
-  return { leaseId, action: 'recovered', killed, post, note };
+
+  // 4. Own the record, then post-exit.
+  const got = await acquireOwner(state, leaseId, mine, proc);
+  if (!got.ok) throw new MinionsError('CONFLICT', `The run of ${leaseId} is still owned by pid ${got.holder.pid} (${got.holder.role}).`, 'Retry; the lease stays active until recovery finishes.');
+  try {
+    rec = await readRunRecord(state, leaseId);
+    if (!rec || rec.phase === 'done') return { leaseId, action: 'none', killed, post: null, note: rec ? outcomeNote(rec) : null, escapees };
+    const leaseEnded = deps.db.lease(leaseId)?.status !== 'active';
+    const post = rec.leaseGit ? await postExit(rec, deps, 'recovered: runner lost', { leaseEnded }) : null;
+    if (post?.violations.length) deps.db.addEvent('harness-violation', rec.taskId, { leaseId, harness: rec.role.harness, violations: post.violations, recovered: true });
+    rec = await updateRunRecord(state, rec, { phase: 'done', outcome: { status: null, submitted: false, wipCommit: post?.wipCommit ?? null, violations: post?.violations ?? [], head: post?.head ?? rec.claimHead, reason: 'recovered', ...(post?.note ? { note: post.note } : {}) } }, (deps.now ?? (() => new Date()))());
+    deps.db.addEvent('run-recovered', rec.taskId, { leaseId, killed, wipCommit: post?.wipCommit ?? null, violations: post?.violations ?? [], escapees: escapees?.killed ?? [], ...(escapees?.skipped ? { sweep: escapees.skipped } : {}) });
+    return { leaseId, action: 'recovered', killed, post, note: outcomeNote(rec), escapees };
+  } finally {
+    await releaseOwner(state, leaseId, mine).catch(() => undefined);
+  }
+}
+
+/**
+ * Wrappers and runners of other records that are still alive on this host: their descendants are supervised. (The
+ * sweep's lease marker already spares them; this is a second guard. A record that cannot be read is skipped, and
+ * its processes are not candidates anyway, as they carry their own lease's marker.)
+ */
+async function liveWrappers(state: string, except: string, host: HostIdentity, proc: string): Promise<ProcIdentity[]> {
+  const out: ProcIdentity[] = [];
+  for (const id of await listRunRecords(state)) {
+    if (id === except) continue;
+    const r = await readRunRecord(state, id).catch(() => null);
+    if (!r || !sameHost(r.host, host)) continue;
+    for (const p of [r.wrapper, r.runner]) if (p && await isAlive(p, proc)) out.push(p);
+  }
+  return out;
+}
+
+export interface RecoverySweep { reaped: ReapOutcome[]; removed: string[]; errors: { leaseId: string; error: string }[] }
+
+/**
+ * Coordinator start and restarts (D3b): reaps every record that is not `done` (`scope: 'all'`, coordinator start:
+ * no runner of the previous session may outlive it) or only those whose lease is no longer active
+ * (`scope: 'orphans'`, before a restart counts the runs), and removes `done` records of ended leases. Errors are
+ * collected per lease, never thrown: an unreaped record keeps counting as a running worker.
+ */
+export async function recoverRuns(deps: ReapDeps, scope: 'all' | 'orphans'): Promise<RecoverySweep> {
+  const out: RecoverySweep = { reaped: [], removed: [], errors: [] };
+  for (const id of await listRunRecords(deps.paths.state)) {
+    try {
+      const active = deps.db.lease(id)?.status === 'active';
+      const rec = await readRunRecord(deps.paths.state, id);
+      if (rec && rec.phase !== 'done' && (scope === 'all' || !active)) out.reaped.push(await reapRun(id, deps));
+      if (!active && await removeRunRecord(deps.paths.state, id)) out.removed.push(id);
+    } catch (e) { out.errors.push({ leaseId: id, error: redact((e as Error).message).slice(0, 300) }); }
+  }
+  return out;
 }

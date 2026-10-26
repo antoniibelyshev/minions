@@ -98,13 +98,13 @@ export async function sweepScratch(p: HandoffPaths, activeLeaseIds: Iterable<str
  * best-effort: returns the failures instead of throwing so the caller can log them without failing the transition.
  * The DB keeps the recorded `result_json`.
  */
-export async function removeLeaseFiles(p: HandoffPaths, leaseId: string): Promise<string[]> {
+export async function removeLeaseFiles(p: HandoffPaths, leaseId: string, opts: { keepScratch?: boolean } = {}): Promise<string[]> {
   if (!LEASE_ID.test(leaseId)) return [];
   const errors: string[] = [];
   for (const path of [briefPath(p, leaseId), submissionPath(p, leaseId), rejectedPath(p, leaseId)]) {
     try { await rm(path, { force: true }); } catch (e) { errors.push(`${path}: ${(e as Error).message}`); }
   }
-  errors.push(...await removeScratch(p, leaseId));
+  if (!opts.keepScratch) errors.push(...await removeScratch(p, leaseId));
   return errors;
 }
 
@@ -164,9 +164,9 @@ export async function sweepTmpRoot(root: string, skip: string, o: { maxAgeMs?: n
 }
 
 /** Coordinator startup step: sweeps leftover scratch dirs of ended leases and logs what it did. Never throws. */
-export async function sweepScratchOnStart(db: Pick<RuntimeDb, 'activeLeases'>, p: HandoffPaths, log: (line: string) => void): Promise<void> {
+export async function sweepScratchOnStart(db: Pick<RuntimeDb, 'activeLeases'>, p: HandoffPaths, log: (line: string) => void, keep: string[] = []): Promise<void> {
   try {
-    const r = await sweepScratch(p, db.activeLeases().map((l) => l.id));
+    const r = await sweepScratch(p, [...db.activeLeases().map((l) => l.id), ...keep]);
     if (r.removed.length) log(`minions: removed ${r.removed.length} leftover lease scratch dir(s) under ${p.scratch}`);
     if (r.errors.length) log(`minions: could not remove some lease scratch dirs: ${r.errors.join('; ').slice(0, 500)}`);
     if (p.scratch && p.tmpRoot && resolve(dirname(p.scratch)) === resolve(p.tmpRoot)) {

@@ -49,7 +49,8 @@ import { cachedSandboxSelfTest, containerRealTargets, probeIdentity, runSandboxS
 import { SANDBOX_BIN } from './sandbox/rules.js';
 import { HARNESS_PROMPTS_DIR } from '../plugin/generate.js';
 import { PROCESS_ADAPTERS } from './runner/adapters.js';
-import { runLease, type RunOutput } from './runner/run.js';
+import { reapRun, recoverRuns, runLease, type ReapDeps, type RecoverySweep, type RunOutput } from './runner/run.js';
+import { hasOpenRun, openRunsSync, withOpenRuns } from './runner/record.js';
 
 /** Human output of `minions work next`. */
 export function humanNext(r: NextReport): string {
@@ -153,7 +154,27 @@ export const intakeOnStart = async (
   }
 };
 
-const scheduler = async () => new Scheduler({ ...(await context()), layout: workspaceLayout(), handoff: runtimePaths() });
+/** reapRun in production: the real /proc, including the escapee sweep (agent-runtimes D3b). */
+const reapDeps = (): ReapDeps => ({ db: getDb(), paths: runtimePaths(), env: process.env, escapees: {} });
+const scheduler = async () => new Scheduler({
+  ...(await context()), layout: workspaceLayout(), handoff: runtimePaths(),
+  runs: { state: runtimePaths().state, reap: (leaseId) => reapRun(leaseId, reapDeps()) },
+});
+
+/**
+ * Restarts count process runs that are not `done` as running workers (D3b). Records whose lease already ended
+ * are reaped first (the result is logged to stderr); what is left counts.
+ */
+async function restartWorkers(d: RuntimeDb): Promise<() => { id: string }[]> {
+  const r = await recoverRuns(reapDeps(), 'orphans');
+  logRecovery(r, (line) => process.stderr.write(line + '\n'));
+  return withOpenRuns(() => d.activeLeases(), runtimePaths().state);
+}
+
+function logRecovery(r: RecoverySweep, log: (line: string) => void): void {
+  for (const x of r.reaped) log(`minions: process run ${x.leaseId}: ${x.action}${x.note ? ` (${x.note})` : ''}`);
+  for (const e of r.errors) log(`minions: could not reap the process run of ${e.leaseId}: ${e.error}`);
+}
 
 async function readInput(file?: string, what = 'the worker result', hint = 'Pipe the JSON in, pass --result-file <path>, or (record) use --submitted.'): Promise<string> {
   if (file && file !== '-') return readFile(file, 'utf8');
@@ -448,7 +469,7 @@ export function register(program: Command): void {
     .action(action(async (leaseId: string, o: { reason: string; usage?: string; model?: string }, cmd: Command) => {
       requireMode('runtime');
       const r = withContextReset(await (await scheduler()).release(leaseId, o.reason, { usage: usageFlag(o) }), { db: getDb(), config: await getConfig() });
-      emit(r, { json: globalOpts(cmd).json, human: (d: typeof r) => [`Released ${d.leaseId} (${d.taskId}); worktree kept at ${d.worktree ?? '-'}`, ...(d.budget ? [d.budget.message] : []), ...resetLine(d)].join('\n') });
+      emit(r, { json: globalOpts(cmd).json, human: (d: typeof r) => [`Released ${d.leaseId} (${d.taskId}); worktree kept at ${d.worktree ?? '-'}`, ...(d.run ? [`process run: ${d.run}`] : []), ...(d.budget ? [d.budget.message] : []), ...resetLine(d)].join('\n') });
     }));
   work.command('spend').description('Spend tally and owner budget: show it, set the budget in plain language, or record usage after the fact')
     .option('--budget <amount>', 'set the budget, e.g. "5M tokens", "500k tokens per day", "$50" (API-key billing), "20 attempts"; "off" clears it')
@@ -597,6 +618,8 @@ export function register(program: Command): void {
     .action(async () => { await runHook('stop', hookLoader); exitHook(); });
   hook.command('pre-agent').description('PreToolUse(Agent) hook: minions workers need an active lease')
     .action(async () => { await runHook('pre-agent', hookLoader); exitHook(); });
+  hook.command('pre-bash').description('PreToolUse(Bash) hook: subagents cannot run minions work run|claim|release (coordinator-only)')
+    .action(async () => { await runHook('pre-bash', async () => { throw new Error('pre-bash needs no runtime context'); }); exitHook(); });
   hook.command('pre-telegram').description('PreToolUse(Telegram tools) hook: only the coordinator itself may use them, never a subagent')
     .action(async () => { await runHook('pre-telegram', hookLoader); exitHook(); });
   // DB plus the config when it loads (role contracts for the notice; no backlog): it runs on every worker tool call while a drain is requested.
@@ -633,8 +656,15 @@ export function register(program: Command): void {
       process.exitCode = await coordinatorWrapper(getConfig, {
         ...(o.recover ? { startupPrompt: RECOVERY_PROMPT } : {}),
         onStart: async (c, l, stop) => {
-          // Restart/crash recovery: drop the scratch dirs of leases that ended (active ones keep theirs).
-          await sweepScratchOnStart(getDb(), runtimePaths(), l);
+          // D3b: no process run of the previous session outlives it. Every record that is not done is reaped
+          // (cancel or kill, escapee sweep, wip: checkpoint) before anything else touches its scratch dir.
+          let open: string[] = [];
+          try {
+            logRecovery(await recoverRuns(reapDeps(), 'all'), l);
+            open = openRunsSync(runtimePaths().state);
+          } catch (e) { l(`minions: process-run recovery failed: ${(e as Error).message.slice(0, 300)}`); open = openRunsSync(runtimePaths().state); }
+          // Restart/crash recovery: drop the scratch dirs of leases that ended (active ones, and unreaped runs, keep theirs).
+          await sweepScratchOnStart(getDb(), runtimePaths(), l, open);
           await intakeOnStart(c, l, undefined, undefined, stop);
         },
         exitAfterSignal: (c) => process.exit(c),
@@ -646,8 +676,9 @@ export function register(program: Command): void {
     .action(action(async (o: { force?: boolean; startDetached?: boolean }, cmd: Command) => {
       requireMode('runtime');
       const d = getDb();
+      const workers = await restartWorkers(d);
       const r = await syncCoordinator(await getConfig(), {
-        activeLeases: () => d.activeLeases(),
+        activeLeases: workers,
         recordRestart: (info) => d.setMeta('coordinator_restart', JSON.stringify(info)),
         lock: d,
       }, o);
@@ -660,14 +691,15 @@ export function register(program: Command): void {
     .action(action(async (o: { force?: boolean; recover?: boolean; detach?: boolean }, cmd: Command) => {
       requireMode('runtime');
       const d = getDb();
+      const workers = await restartWorkers(d);
       if (o.detach) {
         const paths = runtimePaths();
-        const s = scheduleDetachedRestart({ activeLeases: () => d.activeLeases(), drain: () => d.drain(), log: join(paths.logs, 'context-reset.log'), cwd: paths.state }, o);
+        const s = scheduleDetachedRestart({ activeLeases: workers, drain: () => d.drain(), log: join(paths.logs, 'context-reset.log'), cwd: paths.state }, o);
         emit(s, { json: globalOpts(cmd).json, human: (x: typeof s) => `coordinator: ${x.action} (${x.reason})` });
         return;
       }
       const r = await restartCoordinator(await getConfig(), {
-        activeLeases: () => d.activeLeases(),
+        activeLeases: workers,
         recordRestart: coordinatorRestartRecorder(d),
         lock: d,
       }, o);
@@ -786,8 +818,13 @@ export function register(program: Command): void {
       resetRuntimeHandles();
       // The restored leases have no worker here, and `coordinator restart` refuses while any is active.
       const s = r.restoredActiveLeases.length ? await scheduler().catch(() => null) : null;
-      const rel = await releaseRestoredLeases(getDb(), s ? (id, why) => s.release(id, why) : null);
+      const state = runtimePaths().state;
+      const rel = await releaseRestoredLeases(getDb(), s ? (id, why) => s.release(id, why) : null, undefined, (id) => hasOpenRun(state, id));
       for (const f of rel.failed) r.warnings.push(`Lease ${f.leaseId} was ended directly in the DB (${f.error}); check its task's backlog status.`);
+      for (const k of rel.kept) {
+        r.warnings.push(`Lease ${k.leaseId} stays active: it has an unfinished process run and its release failed (${k.error}). `
+          + `Run \`minions work release ${k.leaseId} --reason restored\` once that is fixed (or \`minions coordinator restart --recover\`).`);
+      }
       const out = { ...r, releasedLeases: rel.released };
       emit(out, { json: globalOpts(cmd).json, human: (d: typeof out) => [`Restored ${d.restored.files} files from a backup of ${d.restored.createdAt} (schema ${d.restored.schemaVersion}).`,
         ...(d.previous ? [`Previous state moved to ${d.previous}`] : []), ...(d.releasedLeases.length ? [`Released restored lease(s): ${d.releasedLeases.join(', ')}`] : []),

@@ -5,6 +5,7 @@ import { join, relative } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 import { generatePlugin, LIVE_CLAUDE_RUN_GUIDANCE, renderPolicySummary, renderTemplate } from '../../src/plugin/generate.js';
 import { DRAIN_HOOK_COMMAND } from '../../src/runtime/drain.js';
+import { PRE_BASH_HOOK_COMMAND } from '../../src/runtime/hooks.js';
 import type { MinionsConfig } from '../../src/config/schema.js';
 import { defaults, FAKE_MINIONS, runHookCommand } from '../helpers.js';
 
@@ -130,6 +131,8 @@ describe('generatePlugin', () => {
     expect(hooks.hooks.Stop).toEqual([{ hooks: [{ type: 'command', command: 'minions hook stop' }] }]);
     expect(hooks.hooks.PreToolUse).toEqual([
       { matcher: 'Agent', hooks: [{ type: 'command', command: 'timeout 20 minions hook pre-agent || exit 2', timeout: 30 }] },
+      // Subagents cannot run minions work run|claim|release (task-14.5); node starts only for subagent calls naming minions.
+      { matcher: 'Bash', hooks: [{ type: 'command', command: PRE_BASH_HOOK_COMMAND, timeout: 30 }] },
       // Every tool; gated by a shell test so node starts only while a drain is requested.
       { matcher: '*', hooks: [{ type: 'command', command: DRAIN_HOOK_COMMAND }] },
     ]);

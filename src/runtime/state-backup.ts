@@ -456,19 +456,35 @@ export async function prunePreRestore(dir: string, keep: number, protect: string
   return removed;
 }
 
-export interface RestoredLeaseRelease { released: string[]; failed: { leaseId: string; error: string }[] }
+export interface RestoredLeaseRelease {
+  released: string[];
+  /** Ended directly in the DB after the scheduler release failed (no unfinished process run). */
+  failed: { leaseId: string; error: string }[];
+  /** Left active: the release failed and the lease may still have an unfinished process run (task-14.5). */
+  kept: { leaseId: string; error: string }[];
+}
 
 /**
  * Releases every lease the restored DB has active (task-20.1): no worker holds them in this runtime,
  * and `minions coordinator restart` refuses while any is active. `release` is the scheduler's release
- * (pre-claim backlog status, backlog note, hand-off files); a lease it fails on is ended directly in
- * the DB so the restart is never blocked by it.
+ * (pre-claim backlog status, backlog note, hand-off files, and the reap of a process run); a lease it
+ * fails on is ended directly in the DB so the restart is never blocked by it, except when
+ * `hasOpenRun` says the lease may still have an unfinished process run (task-14.5): then the release
+ * most likely failed in its reap, and the lease stays active (as `work release` keeps it), reported
+ * in `kept`, so it never ends while its worker may still write. `hasOpenRun` should fail closed
+ * (true for a record it cannot read).
  */
-export async function releaseRestoredLeases(db: RuntimeDb, release: ((leaseId: string, reason: string) => Promise<unknown>) | null, reason = RESTORE_RELEASE_REASON): Promise<RestoredLeaseRelease> {
-  const out: RestoredLeaseRelease = { released: [], failed: [] };
+export async function releaseRestoredLeases(db: RuntimeDb, release: ((leaseId: string, reason: string) => Promise<unknown>) | null, reason = RESTORE_RELEASE_REASON,
+  hasOpenRun: (leaseId: string) => Promise<boolean> = async () => false): Promise<RestoredLeaseRelease> {
+  const out: RestoredLeaseRelease = { released: [], failed: [], kept: [] };
   for (const l of db.activeLeases()) {
     let err: Error | null = release ? null : new Error('the scheduler is unavailable');
     if (release) { try { await release(l.id, reason); } catch (e) { err = e as Error; } }
+    if (err && db.lease(l.id)?.status === 'active' && await hasOpenRun(l.id).catch(() => true)) {
+      db.addEvent('release-refused', l.task_id, { leaseId: l.id, reason, error: err.message });
+      out.kept.push({ leaseId: l.id, error: err.message });
+      continue;
+    }
     if (err && db.lease(l.id)?.status === 'active') {
       db.transaction(() => {
         db.exec("UPDATE leases SET status = 'released', ended_at = ? WHERE id = ? AND status = 'active'", new Date().toISOString(), l.id);

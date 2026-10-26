@@ -15,6 +15,12 @@
         ]
       },
       {
+        "matcher": "Bash",
+        "hooks": [
+          { "type": "command", "command": "i=$(cat) || exit 2; case \"$i\" in *'\"agent_id\"'*) printf '%s' \"$i\" | grep -Eq 'minions[^:]|cli\\.[cm]?js'; m=$?; [ \"$m\" = 1 ] && exit 0; [ \"$m\" = 0 ] || exit 2; printf '%s' \"$i\" | timeout 20 minions hook pre-bash || exit 2;; esac", "timeout": 30 }
+        ]
+      },
+      {
         "matcher": "*",
         "hooks": [
           { "type": "command", "command": "[ ! -e \"${MINIONS_STATE_DIR:-/state}/run/drain\" ] || minions hook drain" }

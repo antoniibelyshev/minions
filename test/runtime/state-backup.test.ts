@@ -344,6 +344,33 @@ describe('state restore: coordinator lock, restored leases, pre-restore pruning 
     } finally { d.close(); }
   });
 
+  it('a lease whose release fails while it may have an unfinished process run stays active (task-14.5)', async () => {
+    const src = seed();
+    insertLease(src.db, 'b1', 'active', 'task-a');
+    insertLease(src.db, 'b2', 'active', 'task-b');
+    insertLease(src.db, 'b3', 'active', 'task-c');
+    const file = join(tmp('minions-state-out-'), 'state.tar.gz');
+    await createStateBackup(src.p, file); src.db.close();
+    const dst = freshTarget();
+    await restoreStateBackup(dst.p, file, { alive: () => false });
+    const d = openDb(dst.p.db);
+    try {
+      // b1: the reap fails (open run); b2: the backlog fails (no run); b3: hasOpenRun itself throws (fails closed).
+      const open = async (id: string) => { if (id === 'b3') throw new Error('unreadable'); return id === 'b1'; };
+      const rel = await releaseRestoredLeases(d, async (id) => { throw new Error(id === 'b2' ? 'backlog unavailable' : 'CONFLICT: runner alive'); }, RESTORE_RELEASE_REASON, open);
+      expect(rel.kept.map((k) => k.leaseId).sort()).toEqual(['b1', 'b3']);
+      expect(rel.kept.find((k) => k.leaseId === 'b1')?.error).toBe('CONFLICT: runner alive');
+      expect(rel.failed.map((f) => f.leaseId)).toEqual(['b2']);
+      expect(rel.released).toEqual(['b2']);
+      expect(d.activeLeases().map((l) => l.id).sort()).toEqual(['b1', 'b3']);
+      expect(d.events('task-a', 'release-refused').at(-1)!.data).toMatchObject({ leaseId: 'b1', reason: RESTORE_RELEASE_REASON });
+      expect(d.events('task-a', 'release')).toEqual([]);
+      // No scheduler: an open run still keeps the lease.
+      expect((await releaseRestoredLeases(d, null, RESTORE_RELEASE_REASON, async (id) => id === 'b1')).kept.map((k) => k.leaseId)).toEqual(['b1']);
+      expect(d.activeLeases().map((l) => l.id)).toEqual(['b1']);
+    } finally { d.close(); }
+  });
+
   it(`keeps only the newest ${PRE_RESTORE_KEEP} pre-restore copies and drops empty stamp dirs`, async () => {
     const { src, file } = await backup(); src.db.close();
     const dst = freshTarget();

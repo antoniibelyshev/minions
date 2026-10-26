@@ -11,7 +11,7 @@ import type { MinionsError } from '../../src/core/errors.js';
 import { requestDrain } from '../../src/runtime/drain.js';
 import { recordSubmitted, submissionPath } from '../../src/runtime/handoff.js';
 import { fakeAdapter } from '../../src/runtime/runner/adapter.js';
-import { createRunRecord, readRunRecord, runRecordPath, type RunRecord } from '../../src/runtime/runner/record.js';
+import { createRunRecord, ownerLockPath, readOwner, readRunRecord, runRecordPath, type RunRecord } from '../../src/runtime/runner/record.js';
 import { reapRun, runLease, type RunnerDeps } from '../../src/runtime/runner/run.js';
 import { Scheduler, type TaskBrief } from '../../src/runtime/scheduler.js';
 import { commitFile, gitSync, makeDefaultEnv, result, type Env } from './fixtures.js';
@@ -394,7 +394,11 @@ describe('reapRun: orphans and recovery', () => {
   /** Simulates a runner that died (SIGKILL): the record names a process that is gone. */
   function forgeDeadRunner(r: Rig, rec: RunRecord, patch: Partial<RunRecord> = {}) {
     const dead = spawnSync(process.execPath, ['-e', 'console.log(process.pid)'], { encoding: 'utf8' });
-    writeFileSync(runRecordPath(r.paths.state, rec.leaseId), JSON.stringify({ ...rec, runner: { pid: Number(dead.stdout.trim()), startTime: '1' }, ...patch }));
+    const runner = { pid: Number(dead.stdout.trim()), startTime: '1' };
+    writeFileSync(runRecordPath(r.paths.state, rec.leaseId), JSON.stringify({ ...rec, runner, ...patch }));
+    // The runner's owner lock names the same (dead) process.
+    const lock = JSON.parse(readFileSync(ownerLockPath(r.paths.state, rec.leaseId), 'utf8')) as Record<string, unknown>;
+    writeFileSync(ownerLockPath(r.paths.state, rec.leaseId), JSON.stringify({ ...lock, ...runner }));
   }
 
   it('runner lost: the wrapper group is killed, post-exit runs with a wip: commit on the branch, the record is done', async () => {
@@ -403,7 +407,7 @@ describe('reapRun: orphans and recovery', () => {
     const { p, rec } = await running(r, b, [{ op: 'write', path: 'w.txt', content: 'w\n' }, { op: 'sleep', ms: 60_000 }]);
     await sleep(200);
     forgeDeadRunner(r, rec);
-    const reaped = await reapRun(b.leaseId, { db: r.db, paths: r.paths, env: process.env });
+    const reaped = await reapRun(b.leaseId, { db: r.db, paths: r.paths, env: process.env, escapees: null });
     expect(reaped.action).toBe('recovered');
     expect(reaped.killed).toContain(rec.pgid);
     expect(reaped.note).toMatch(/^recovered: runner lost; work in progress is committed as [0-9a-f]{40}$/);
@@ -419,7 +423,7 @@ describe('reapRun: orphans and recovery', () => {
     const { p, rec } = await running(r, b, [{ op: 'write', path: 'w.txt', content: 'w\n' }, { op: 'sleep', ms: 60_000 }]);
     await sleep(200);
     forgeDeadRunner(r, rec, { host: { bootId: 'another-boot', containerStart: '1' } });
-    const reaped = await reapRun(b.leaseId, { db: r.db, paths: r.paths, env: process.env });
+    const reaped = await reapRun(b.leaseId, { db: r.db, paths: r.paths, env: process.env, escapees: null });
     expect(reaped).toMatchObject({ action: 'recovered', killed: [] });
     expect(reaped.post?.wipCommit).toBe(headOf(r, b.branch));
     try { process.kill(-rec.pgid!, 'SIGKILL'); } catch { /* gone */ }
@@ -429,12 +433,13 @@ describe('reapRun: orphans and recovery', () => {
   it('a live runner is asked to cancel and finishes on its own; no record and done records are no-ops', async () => {
     const r = rig();
     const b = await claim(r);
-    expect((await reapRun(b.leaseId, { db: r.db, paths: r.paths })).action).toBe('none');
+    expect((await reapRun(b.leaseId, { db: r.db, paths: r.paths, escapees: null })).action).toBe('none');
     const { p } = await running(r, b, [{ op: 'sleep', ms: 60_000 }]);
-    const reaped = await reapRun(b.leaseId, { db: r.db, paths: r.paths, waitMs: 10_000, pollMs: 50 });
+    const reaped = await reapRun(b.leaseId, { db: r.db, paths: r.paths, waitMs: 10_000, pollMs: 50, escapees: null });
     expect(reaped.action).toBe('cancelled');
-    expect(await p).toMatchObject({ exit: { stopped: 'cancel' }, submitted: true, status: 'blocked' });
-    expect((await reapRun(b.leaseId, { db: r.db, paths: r.paths })).action).toBe('none');
+    expect(await p).toMatchObject({ exit: { stopped: 'cancel' }, submitted: true, status: 'partial' });
+    expect(await readOwner(r.paths.state, b.leaseId)).toBeNull();
+    expect((await reapRun(b.leaseId, { db: r.db, paths: r.paths, escapees: null })).action).toBe('none');
     expect(lstatSync(join(r.paths.state, 'run', 'leases', b.leaseId)).isDirectory()).toBe(true);
   });
 });
