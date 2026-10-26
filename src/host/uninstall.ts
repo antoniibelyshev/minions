@@ -13,6 +13,9 @@ import { loadRegistry, projectForPath, saveRegistry } from './registry.js';
 import { readJsonIfExists } from '../core/fsutil.js';
 import { ProjectJsonSchema } from './project.js';
 import { HostRuntime, runtimeOf } from './runtime.js';
+import { managerPaths } from '../core/paths.js';
+import { loadManagerCredentialRef } from './credentials.js';
+import { loadServiceRecord, removeManagerService, serviceHost, type ServiceHost } from './manager-service.js';
 
 export interface UninstallOptions {
   cwd: string;
@@ -21,6 +24,8 @@ export interface UninstallOptions {
   dryRun?: boolean;
   confirm?: (question: string) => Promise<boolean>;
   runner?: Runner;
+  /** The host manager service host (tests); its runner defaults to `runner`. */
+  managerService?: Partial<ServiceHost>;
 }
 export interface UninstallResult {
   projectId: string;
@@ -32,6 +37,11 @@ export interface UninstallResult {
   runtime: 'docker' | 'host';
   /** Host runtime workspace/state (<project>/host): kept unless --delete-data. */
   hostData: { path: string; deleted: boolean } | null;
+  /**
+   * The host manager service (host-wide): removed with the last registered project (`removed`), kept while other
+   * projects are registered (`kept`), none installed (`absent`), or the removal failed (`failed`, listed in kept).
+   */
+  managerService: 'removed' | 'kept' | 'absent' | 'failed';
 }
 
 async function pruneEmptyDirs(start: string, stop: string): Promise<void> {
@@ -77,6 +87,7 @@ export async function runUninstall(opts: UninstallOptions): Promise<UninstallRes
   if (refs?.telegram) kept.push({ path: refs.telegram.ref, reason: 'Telegram bot token kept; run `minions auth telegram --remove` before uninstalling to delete it (or revoke it in BotFather)' });
 
   let container: UninstallResult['container'] = 'skipped';
+  let managerService: UninstallResult['managerService'] = 'absent';
   let hostDeleted = false;
   if (!opts.dryRun) {
     if (project && runtime === 'host') await new HostRuntime(project, opts.runner).down().catch(() => false);
@@ -106,15 +117,49 @@ export async function runUninstall(opts: UninstallOptions): Promise<UninstallRes
     await pruneEmptyDirs(paths.dir, dirname(paths.dir));
     const reg = await loadRegistry();
     if (reg.projects[projectId]) { delete reg.projects[projectId]; await saveRegistry(reg); }
+    managerService = await uninstallManagerService(opts, Object.keys(reg.projects).length, removed, kept);
   } else {
     removed.push(...toRemove);
+    const rec = await loadServiceRecord(serviceHost(opts.managerService)).catch(() => null);
+    if (rec) {
+      const others = Object.keys((await loadRegistry()).projects).filter((id) => id !== projectId).length;
+      if (others) { kept.push({ path: rec.path, reason: `host manager service kept: ${others} other project(s) are registered` }); managerService = 'kept'; }
+      else { removed.push(rec.path); managerService = 'removed'; }
+    }
   }
   if (hasHostData && !opts.deleteData) kept.push({ path: hostDir, reason: 'host runtime workspace and state kept; `minions uninstall --delete-data` deletes them' });
   return {
     projectId, dryRun: !!opts.dryRun, removed, kept, container,
     volumesKept: opts.deleteData || (runtime === 'host' && container !== 'stopped') ? [] : vols,
-    runtime, hostData: hasHostData ? { path: hostDir, deleted: hostDeleted } : null,
+    runtime, hostData: hasHostData ? { path: hostDir, deleted: hostDeleted } : null, managerService,
   };
+}
+
+/**
+ * The host manager serves every project: its service and files (unit file, record, heartbeat, log) go with the last
+ * registered project. The manager bot token, pairing and journal stay like every credential (`minions setup`, manager
+ * step "remove", deletes the token, which also removes the service).
+ */
+async function uninstallManagerService(opts: UninstallOptions, remaining: number, removed: string[], kept: UninstallResult['kept']): Promise<UninstallResult['managerService']> {
+  const mp = managerPaths();
+  const rec = await loadServiceRecord(serviceHost(opts.managerService)).catch(() => null);
+  if (remaining) {
+    if (rec) kept.push({ path: rec.path, reason: `host manager service kept: ${remaining} other project(s) are registered` });
+    return rec ? 'kept' : 'absent';
+  }
+  let out: UninstallResult['managerService'];
+  try {
+    const r = await removeManagerService(serviceHost({ ...(opts.runner ? { runner: opts.runner } : {}), ...opts.managerService }));
+    if (r.action === 'removed' && r.path) removed.push(r.path);
+    out = r.action === 'removed' ? 'removed' : 'absent';
+  } catch (e) {
+    kept.push({ path: rec?.path ?? mp.serviceJson, reason: `host manager service could not be removed: ${(e as Error).message}` });
+    out = 'failed';
+  }
+  if (await loadManagerCredentialRef().catch(() => null)) {
+    kept.push({ path: mp.credentialJson, reason: 'host manager bot token kept; run `minions setup` (manager step: remove) to delete it' });
+  }
+  return out;
 }
 
 export function formatUninstall(r: UninstallResult): string {
@@ -122,6 +167,7 @@ export function formatUninstall(r: UninstallResult): string {
   for (const k of r.kept) L.push(`  kept ${k.path} (${k.reason})`);
   L.push(`Container: ${r.container}.`);
   if (r.hostData) L.push(r.hostData.deleted ? `Deleted host runtime data ${r.hostData.path}.` : `Host runtime data kept: ${r.hostData.path}.`);
+  if (r.managerService === 'removed') L.push(`${r.dryRun ? 'Would remove' : 'Removed'} the host manager service (it served the last registered project).`);
   if (r.volumesKept.length) L.push(`Data volumes kept: ${r.volumesKept.join(', ')}.`, `  To delete them later: docker volume rm ${r.volumesKept.join(' ')}`);
   return L.join('\n');
 }

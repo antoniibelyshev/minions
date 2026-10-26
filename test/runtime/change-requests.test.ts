@@ -228,6 +228,17 @@ describe('settings requests (runtime)', () => {
     expect((await cli(['settings', 'requests', 'mark', a, '--status', 'failed'])).env.error!.code).toBe('CONFLICT');
   });
 
+  it('status lists the open requests, so nothing is lost while the host manager is down (task-53.6)', async () => {
+    const { humanStatus } = await import('../../src/runtime/commands.js');
+    expect((await cli(['status'])).env.data.changeRequests).toEqual({ open: 0, items: [] });
+    const id = (await cli(['settings', 'restart'])).env.data.request.id as string;
+    const st = (await cli(['status'])).env.data;
+    expect(st.changeRequests).toEqual({ open: 1, items: [expect.objectContaining({ id, kind: 'restart', status: 'proposed' })] });
+    const text = humanStatus(st);
+    expect(text).toContain('change requests: 1 open');
+    expect(text).toMatch(new RegExp(`${id} proposed `));
+  });
+
   it('apply and reject are host-only', async () => {
     const id = (await cli(['settings', 'restart'])).env.data.request.id as string;
     for (const sub of ['apply', 'reject']) {

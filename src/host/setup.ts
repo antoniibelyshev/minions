@@ -5,7 +5,8 @@
 // `minions setup github`: remote, base branch, pre-filled token link, token; then the delivery mode) ->
 // CI guidance -> auto-merge (opt-in, default no) -> Telegram (token + pairing guidance) -> agents (which harness does
 // the work; src/host/harness-setup.ts) -> host manager bot (optional, host-wide: token and terminal pairing;
-// src/host/manager-bot.ts) -> runtime start
+// src/host/manager-bot.ts) -> host manager service (optional: launchd agent / systemd --user unit;
+// src/host/manager-service.ts) -> runtime start
 // (container, or the host runtime), repository import, coordinator launch -> attach/pair instructions.
 // The CLI then offers the AI setup assistant (`minions setup assist`) for whatever is left.
 //
@@ -33,6 +34,7 @@ import {
 } from './credentials.js';
 import { checkTelegramTokenFormat } from '../telegram/token.js';
 import { clearManagerAccess, loadManagerAccess, managerBotGuidance, pairManagerBot, provisionManagerToken, type PairingOptions } from './manager-bot.js';
+import { installManagerService, loadServiceRecord, removeManagerService, serviceHost, serviceKind, type ServiceHost } from './manager-service.js';
 import type { DockerProbe } from './discovery.js';
 import type { Runner } from './docker.js';
 import { runGithubSetup, type GithubSetupResult } from './github-setup.js';
@@ -89,6 +91,8 @@ export interface SetupOptions {
   tokens?: { github?: string; telegram?: string; manager?: string };
   /** Manager bot pairing clock, code and TTL (tests); fetch is `fetch` above. */
   managerPairing?: Pick<PairingOptions, 'now' | 'sleep' | 'ttlMs' | 'pollSeconds' | 'code'>;
+  /** The manager service host (tests: platform, home, runner for launchctl / systemctl, program). */
+  managerService?: Partial<ServiceHost>;
   runtime: SetupRuntime;
   /** --runtime: forwarded to runInit (same semantics as `minions init --runtime`). */
   runtimeKind?: RuntimeKind;
@@ -100,7 +104,7 @@ export interface SetupOptions {
   platform?: NodeJS.Platform;
 }
 
-export type StepId = 'init' | 'github' | 'delivery' | 'ci' | 'intake' | 'autoMerge' | 'telegram' | 'harness' | 'manager' | 'container' | 'import' | 'coordinator';
+export type StepId = 'init' | 'github' | 'delivery' | 'ci' | 'intake' | 'autoMerge' | 'telegram' | 'harness' | 'manager' | 'service' | 'container' | 'import' | 'coordinator';
 export type StepStatus = 'done' | 'kept' | 'changed' | 'skipped' | 'failed' | 'deferred' | 'planned';
 export interface SetupStep { id: StepId; status: StepStatus; detail: string; later?: string; lines?: string[] }
 
@@ -420,7 +424,10 @@ export async function runSetup(opts: SetupOptions): Promise<SetupResult> {
 
   // ---------------------------------------------------------------- 5c. host manager bot (host-wide, optional)
   if (interactive) say('\n== Host manager bot ==');
-  step(await managerStep({ io: interactive ? io! : null, token: opts.tokens?.manager, runner: opts.runner, fetch: opts.fetch, pairing: opts.managerPairing, setupCmd: cmds.setup }));
+  const mgr = await managerStep({ io: interactive ? io! : null, token: opts.tokens?.manager, runner: opts.runner, fetch: opts.fetch, pairing: opts.managerPairing, setupCmd: cmds.setup });
+  step(mgr);
+  const svc = await serviceStep({ io: interactive ? io! : null, manager: mgr, host: opts.managerService, platform: opts.platform, setupCmd: cmds.setup });
+  if (svc) step(svc);
 
   // ---------------------------------------------------------------- record choices, regenerate derived files
   if (changed.length) {
@@ -566,6 +573,67 @@ async function managerStep(o: { io: WizardIO | null; token?: string; runner?: Ru
   } catch (e) {
     if (action === 'pair') return { id: 'manager', status: 'failed', detail: `${errMsg(e, 'pairing failed')}; the previous pairing is unchanged`, later };
     return { id: 'manager', status: done, detail: `${stored}; not paired`, lines: [...lines, `warning: pairing failed: ${errMsg(e, 'unexpected error')}`, `not paired: ${later}`] };
+  }
+}
+
+/**
+ * Host manager service (optional, rerunnable; docs/design/host-manager.md phase 5): a launchd agent or systemd --user
+ * unit that runs `minions manager run` and restarts it when it exits (also after a CLI reinstall). Only offered while a
+ * manager bot token is stored; removed when the token is gone. Installing asks first (default no), also never with
+ * --yes; an installed service is kept up to date on every rerun, and restarted after a token or pairing change.
+ * Returns null (no step) when there is neither a token nor a service.
+ */
+async function serviceStep(o: { io: WizardIO | null; manager: SetupStep; host?: Partial<ServiceHost>; platform?: NodeJS.Platform; setupCmd: string }): Promise<SetupStep | null> {
+  const later = `Run ${o.setupCmd} again in a terminal to install the host manager service.`;
+  const host = serviceHost({ ...(o.platform ? { platform: o.platform } : {}), ...o.host });
+  const hasToken = !!(await loadManagerCredentialRef().catch(() => null));
+  // A corrupt or foreign record counts as absent (the unit it names is never touched); install rewrites it, and
+  // without a token removeManagerService deletes it (and only this home's own default unit).
+  let rec: Awaited<ReturnType<typeof loadServiceRecord>>;
+  let invalid: string | null = null;
+  try { rec = await loadServiceRecord(host); } catch (e) {
+    rec = null;
+    invalid = `warning: ignored the invalid manager service record (${errMsg(e, 'unreadable').split('\n')[0]})`;
+  }
+  if (!hasToken && !rec && !invalid) return null;
+  const step = await serviceAction(o, host, later, hasToken, rec);
+  return invalid ? { ...step, lines: [invalid, ...(step.lines ?? [])] } : step;
+}
+
+async function serviceAction(o: { io: WizardIO | null; manager: SetupStep }, host: ServiceHost, later: string, hasToken: boolean,
+  rec: Awaited<ReturnType<typeof loadServiceRecord>>): Promise<SetupStep> {
+  const kind = serviceKind(host.platform);
+  const what = kind === 'launchd' ? 'launchd agent' : 'systemd --user unit';
+  if (!hasToken) {
+    try {
+      const r = await removeManagerService(host);
+      return { id: 'service', status: 'changed', detail: `no manager bot token: the manager service was removed${r.path ? ` (${r.path})` : ''}` };
+    } catch (e) { return { id: 'service', status: 'failed', detail: errMsg(e, 'could not remove the manager service'), later }; }
+  }
+  if (!kind) {
+    return { id: 'service', status: 'skipped', detail: `no supported user service manager on ${host.platform}: run \`minions manager run\` under your own supervisor` };
+  }
+  let action: 'install' | 'keep' | 'remove' | 'skip';
+  if (rec) {
+    action = o.io ? await choose(o.io, `The host manager runs as a ${what} (${rec.path}). Keep it (brought up to date) or remove it?`, 'keep', ['keep', 'remove'] as const) : 'keep';
+  } else if (o.io) {
+    action = await yesNo(o.io, `Install the host manager as a ${what} (runs in the background, starts at login, and restarts after it exits, also after a CLI upgrade)?`, false) ? 'install' : 'skip';
+  } else action = 'skip';
+  if (action === 'skip') return { id: 'service', status: 'skipped', detail: `host manager service not installed (optional)${o.io ? '' : '; an interactive setup asks'}`, later };
+  try {
+    if (action === 'remove') {
+      const r = await removeManagerService(host);
+      return { id: 'service', status: 'changed', detail: `${what} removed${r.path ? ` (${r.path})` : ''}`, later };
+    }
+    // A new token or pairing is read only at start: restart a running manager after one.
+    const restart = o.manager.status === 'done' || o.manager.status === 'changed';
+    const r = await installManagerService(host, { restart });
+    const lines = r.warnings.map((w) => `warning: ${w}`);
+    if (r.action === 'installed') return { id: 'service', status: 'done', detail: `${what} installed and started (${r.path})`, ...(lines.length ? { lines } : {}) };
+    if (r.action === 'updated') return { id: 'service', status: 'changed', detail: `${what} updated and restarted (${r.path})`, ...(lines.length ? { lines } : {}) };
+    return { id: 'service', status: 'kept', detail: `${what} up to date${restart ? '; restarted for the new token or pairing' : ''} (${r.path})`, ...(lines.length ? { lines } : {}) };
+  } catch (e) {
+    return { id: 'service', status: 'failed', detail: errMsg(e, `could not ${action === 'remove' ? 'remove' : 'install'} the ${what}`), later };
   }
 }
 
@@ -739,6 +807,7 @@ function dryRunResult(opts: SetupOptions, init: InitResult, steps: SetupStep[], 
   would('telegram', refs.telegram ? `bot ${refs.telegram.botId} stored: would offer keep/change/disable` : 'would ask "Set up Telegram?" (default no); bot token entered without echo');
   would('harness', 'would ask "Which agent should do the work?" (default Claude Code; OpenAI Codex: OpenAI API key without echo, model, and in this version the read-only codex-reviewer stage after the Claude reviewer)');
   would('manager', 'would ask "Set up the host manager bot?" (default no; host-wide): its own bot token entered without echo, then a one-time pairing code sent to the bot within 10 minutes');
+  would('service', 'with a manager bot token: would ask to install the host manager as a launchd agent (macOS) or systemd --user unit (Linux), default no; an installed one is kept up to date');
   would('container', 'would build the image if needed and start the container (idempotent)');
   would('import', 'would import committed history of the base branch unless already imported, and configure origin');
   would('coordinator', 'would launch the coordinator detached and print how to attach and pair');

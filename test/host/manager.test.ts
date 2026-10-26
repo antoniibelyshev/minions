@@ -435,6 +435,37 @@ describe('host manager: startup, lock, loop', () => {
     expect(polls[1]! - polls[0]!).toBe(20_000);
     expect(() => readFileSync(M.managerLockPath())).toThrow();
   });
+
+  it('run(): after a CLI reinstall the running child finishes and reports first, then the loop ends with restart (task-53.6)', async () => {
+    const { project, local } = await install();
+    const id = requestSet(project, 'execution.maxActiveTasks', '5');
+    const s = setup([project]);
+    let reinstalled = false;
+    const child = s.deps.runChild;
+    s.deps.runChild = async (p, argv) => { const r = await child(p, argv); reinstalled = true; return r; };
+    const polls: Date[] = [];
+    let receives = 0;
+    s.deps.transport.receive = async (waitMs) => {
+      receives++;
+      if (receives === 1) return [{ type: 'confirm', requestId: id, nonce: s.t.offers[0]!.nonce }];
+      s.advance(waitMs);
+      return [];
+    };
+    const end = await M.runManager({ ...s.deps, onPoll: (at) => { polls.push(at); }, cliChanged: () => reinstalled }, new AbortController().signal);
+    expect(end).toBe('restart');
+    expect(receives).toBe(1);
+    expect(polls).toHaveLength(1);
+    expect(readJson(local).execution.maxActiveTasks).toBe(5);
+    const statuses = s.t.outcomes.map((o) => o.status);
+    expect(statuses.slice(-3)).toEqual(['applying', 'applied', 'restarting']);
+    expect(s.t.outcomes.at(-1)!.text).toMatch(/reinstalled.*restarts on the new version/);
+    expect(() => readFileSync(M.managerLockPath())).toThrow();
+    // Without a reinstall the loop only stops on abort.
+    const ctl = new AbortController();
+    const quiet = setup([project]);
+    quiet.deps.transport.receive = async (waitMs) => { quiet.advance(waitMs); ctl.abort(); return []; };
+    expect(await M.runManager({ ...quiet.deps, cliChanged: () => false }, ctl.signal)).toBe('stopped');
+  });
 });
 
 describe('bounded delegate', () => {

@@ -32,6 +32,12 @@ export function managerPaths() {
     accessJson: join(dir, 'access.json'),
     /** Non-secret reference to the stored manager bot token (backend, locator, bot id), 0600. Never the token. */
     credentialJson: join(dir, 'credential.json'),
+    /** The installed supervisor service (kind, unit file path, its sha256), 0600. Written by setup. */
+    serviceJson: join(dir, 'service.json'),
+    /** The running manager's heartbeat ({pid, start, transport, botId, lastPollAt}), 0600. */
+    stateJson: join(dir, 'state.json'),
+    /** stdout/stderr of the launchd agent (systemd uses the journal). */
+    logFile: join(dir, 'manager.log'),
   };
 }
 
