@@ -22,6 +22,18 @@ export const defaultsPath = () => join(hostRoot(), 'defaults.json');
 export const credentialStoreDir = () => join(hostRoot(), 'credentials');
 export const credentialStoreFile = (projectId: string, name: string) => join(credentialStoreDir(), projectId, name);
 export const projectDir = (projectId: string) => join(hostRoot(), 'projects', projectId);
+/** Host manager state (docs/design/host-manager.md): journal, lock, owner pairing. Host-only, never mounted. */
+export const managerDir = () => join(hostRoot(), 'manager');
+export function managerPaths() {
+  const dir = managerDir();
+  return {
+    dir,
+    /** Owner pairing of the manager bot (numeric user id and private chat id), 0600. */
+    accessJson: join(dir, 'access.json'),
+    /** Non-secret reference to the stored manager bot token (backend, locator, bot id), 0600. Never the token. */
+    credentialJson: join(dir, 'credential.json'),
+  };
+}
 
 export function projectPaths(projectId: string) {
   const dir = projectDir(projectId);

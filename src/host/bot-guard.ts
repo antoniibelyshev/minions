@@ -3,9 +3,16 @@
 // launched, the host looks for other registered projects whose stored token has the same bot id (the
 // non-secret token prefix recorded in credentials.json) and whose coordinator is running with Telegram,
 // and refuses the launch. The token itself is never read or printed here.
+//
+// Manager bot (docs/design/host-manager.md, "Token isolation for the manager bot"): the host manager's bot and the
+// coordinator bots are never the same bot, in both directions. A manager token whose bot id is any registered
+// project's coordinator bot is refused (assertManagerBotDistinct), and a coordinator token whose bot id is the
+// manager's is refused (assertNotManagerBot, enforced inside provisionTelegramToken). Bot id = numeric token prefix.
 import type { MinionsConfig } from '../config/schema.js';
 import { MinionsError } from '../core/errors.js';
-import { loadCredentialRefs, projectsUsingBot, type CredentialsJson } from './credentials.js';
+import { assertNotManagerBot, loadCredentialRefs, loadManagerCredentialRef, projectsUsingBot, type CredentialsJson } from './credentials.js';
+
+export { assertNotManagerBot };
 import { Compose, type Runner } from './docker.js';
 import { loadProjectJson, type ProjectJson } from './project.js';
 import { runtimeOf } from './runtime.js';
@@ -112,4 +119,25 @@ export async function startBotCheck(project: ProjectJson, config: Pick<MinionsCo
       + "This project's coordinator is already running, so start attaches to it without relaunching or changing it. "
       + 'Stop one of them (`minions down` in that project) or give one its own bot to avoid Telegram conflicts.' };
   }
+}
+
+// ---------------------------------------------------------------- manager bot vs coordinator bots
+
+export const managerBotClashError = (botId: string, projects: string[]) => new MinionsError('CONFLICT',
+  `Telegram bot ${botId} is the coordinator bot of project(s) ${projects.join(', ')}; the host manager needs its own bot, so the token was not stored.`,
+  'The coordinator token is mounted into the container and the manager token never is. Create a new bot for the manager '
+  + '(BotFather /newbot) and enter that token.',
+  { botId, projects });
+
+/** Refuses (CONFLICT) a manager bot id that is any registered project's coordinator bot (its stored Telegram token). */
+export async function assertManagerBotDistinct(botId: string, deps: Pick<BotGuardDeps, 'projectsUsingBot'> = {}): Promise<void> {
+  const projects = await (deps.projectsUsingBot ?? projectsUsingBot)(botId, '');
+  if (projects.length) throw managerBotClashError(botId, projects);
+}
+
+/** Doctor: the stored manager bot against every coordinator bot. Null when no manager token is stored. */
+export async function managerBotClash(deps: Pick<BotGuardDeps, 'projectsUsingBot'> = {}): Promise<BotConflict | null> {
+  const ref = await loadManagerCredentialRef();
+  if (!ref) return null;
+  return { botId: ref.botId, projects: await (deps.projectsUsingBot ?? projectsUsingBot)(ref.botId, '') };
 }

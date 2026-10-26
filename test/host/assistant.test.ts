@@ -96,6 +96,8 @@ describe('assistant argv', () => {
     for (const d of ['Read(~/.ssh/**)', 'Read(~/.aws/**)', 'Read(~/.config/gh/**)', 'Read(~/.netrc)', 'Read(~/Library/Keychains/**)']) expect(denied).toContain(d);
     for (const f of [p.projectJson, join(env.home, 'defaults.json'), p.credentialsJson]) expect(denied).toContain(`Edit(/${f})`);
     expect(denied).toContain(`Edit(/${p.secretsDir}/**)`);
+    // Host manager pairing, token reference and journal (task-53.5.1): re-pairing stays a terminal action.
+    expect(denied).toContain(`Edit(/${join(env.home, 'manager')}/**)`);
     expect(denied.every((d) => !d.startsWith('Read(//') || d.startsWith(`Read(//${env.home.slice(1)}`))).toBe(true);
     // No allowed rule is also a write/credential command.
     expect(variadic(args, '--allowedTools').some((a) => /push|auth set|runtime set|Edit|Write/.test(a))).toBe(false);

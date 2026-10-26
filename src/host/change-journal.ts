@@ -16,14 +16,14 @@ import { appendFile, chmod, open, readFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { MinionsError } from '../core/errors.js';
 import { ensureDir } from '../core/fsutil.js';
-import { hostRoot } from '../core/paths.js';
+import { managerDir } from '../core/paths.js';
 import { procStartTime } from '../runtime/coordinator.js';
 import { pidAlive } from '../runtime/db.js';
 
 /** How long the owner has to confirm an offered plan. */
 export const CONFIRM_TTL_MS = 30 * 60 * 1000;
 
-export const managerDir = () => join(hostRoot(), 'manager');
+export { managerDir };
 export const journalPath = () => join(managerDir(), 'journal.jsonl');
 const lockPath = () => join(managerDir(), 'journal.lock');
 

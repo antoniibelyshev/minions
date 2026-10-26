@@ -249,7 +249,7 @@ describe('CLI wiring', () => {
   it('registers setup with stdin-only token flags (no option takes a token value)', () => {
     const cmd = setupCmd();
     const longs = cmd.options.map((o) => o.long).sort();
-    expect(longs).toEqual(['--attach', '--config', '--delivery', '--dry-run', '--github-token-stdin', '--new-identity', '--no-assistant', '--no-attach-coordinator', '--private', '--profile', '--runtime', '--shared', '--telegram-token-stdin', '--yes'].sort());
+    expect(longs).toEqual(['--attach', '--config', '--delivery', '--dry-run', '--github-token-stdin', '--manager-token-stdin', '--new-identity', '--no-assistant', '--no-attach-coordinator', '--private', '--profile', '--runtime', '--shared', '--telegram-token-stdin', '--yes'].sort());
     for (const o of cmd.options.filter((x) => /token/.test(x.long ?? ''))) expect(o.required || o.optional).toBe(false);
   });
 
