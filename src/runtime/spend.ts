@@ -1,6 +1,7 @@
 import type { MinionsConfig } from '../config/schema.js';
 import { MinionsError } from '../core/errors.js';
 import type { RuntimeDb } from './db.js';
+import { sessionStates, totalOf, weightedMTok, type CoordinatorSessionState, type SessionEndTrigger, type UsageComponents } from './coordinator-usage.js';
 
 /**
  * Spend monitoring (task-32): a durable usage tally and an owner budget, kept in the runtime DB without a
@@ -8,8 +9,9 @@ import type { RuntimeDb } from './db.js';
  *
  * Source of the numbers: the coordinator passes the worker's token total from its task notification
  * (`subagent_tokens`) with `minions work record|release <leaseId> --usage <tokens>`, or later with
- * `minions work spend --lease <id> --tokens <n>`; the coordinator's own session total (when it knows it)
- * with `minions work spend --session --tokens <n>`. A WorkerResult `usage` block is the fallback when no
+ * `minions work spend --lease <id> --tokens <n>`. The coordinator's own sessions are measured from their
+ * transcript by the Stop hook (coordinator-usage.ts); a figure set by hand
+ * with `minions work spend --session --tokens <n>` overrides that session. A WorkerResult `usage` block is the fallback when no
  * flag is given. Each figure is stored as a `usage` event (events table). The figure is cumulative for that
  * agent (a resumed agent's notification includes the earlier turns), so the latest figure per lease or
  * session replaces the earlier one: a correction never double-counts.
@@ -61,7 +63,7 @@ export function usdPerMTok(model: string | null | undefined): number | null {
   return null;
 }
 
-export const ESTIMATE_NOTE = 'USD is a rough estimate: notification token totals do not separate input, output and cache tokens (priced at the model\'s input rate). The Console usage page has the authoritative numbers.';
+export const ESTIMATE_NOTE = 'USD is a rough estimate: worker notification totals do not separate input, output and cache tokens (priced at the model\'s input rate); measured coordinator tokens are weighted by component. The Console usage page has the authoritative numbers.';
 export const SUBSCRIPTION_NOTE = 'Claude subscription: tokens only. The remaining plan quota (session and weekly limits) is not visible to minions.';
 
 // ---------------------------------------------------------------- parsing
@@ -119,13 +121,13 @@ export function parseBudget(text: string): Pick<Budget, 'limit' | 'unit' | 'peri
 export interface UsageInput {
   tokens: number;
   model?: string | null;
-  /** record | release | result (the WorkerResult usage block) | manual (`work spend`) | runner (a process harness, `work run`). */
-  source: 'record' | 'release' | 'result' | 'manual' | 'runner';
+  /** record | release | result (the WorkerResult usage block) | manual (`work spend`) | runner (a process harness, `work run`) | transcript (the coordinator's Stop hook, coordinator-usage.ts). */
+  source: 'record' | 'release' | 'result' | 'manual' | 'runner' | 'transcript';
   /** The process harness that reported it (`work run`); absent for Claude workers. */
   harness?: string;
 }
 
-interface UsageEventData { key: string; scope: 'lease' | 'session'; leaseId?: string; role?: string; attempt?: number; session?: string; tokens: number; model: string | null; source: string; harness?: string }
+interface UsageEventData { key: string; scope: 'lease' | 'session'; leaseId?: string; role?: string; attempt?: number; session?: string; tokens: number; model: string | null; source: string; harness?: string; components?: UsageComponents }
 
 function checkTokens(tokens: number): void {
   if (!Number.isInteger(tokens) || tokens < 0) throw new MinionsError('PRECONDITION', `Usage must be a whole, non-negative number of tokens (got ${tokens}).`);
@@ -190,20 +192,37 @@ function usageRows(db: RuntimeDb): UsageRow[] {
   return out;
 }
 
-interface KeyTally { key: string; scope: 'lease' | 'session'; taskId: string | null; tokens: number; model: string | null }
+interface KeyTally { key: string; scope: 'lease' | 'session'; taskId: string | null; tokens: number; model: string | null; components?: UsageComponents }
 
-/** Per lease/session: the latest cumulative figure minus the last figure recorded before `since` (all of it without `since`). */
+const COMPONENT_KEYS = ['input', 'cacheRead', 'cacheWrite', 'output'] as const;
+const isComponents = (c: unknown): c is UsageComponents => typeof c === 'object' && c !== null && COMPONENT_KEYS.every((k) => typeof (c as Record<string, unknown>)[k] === 'number');
+
+/**
+ * Per lease/session: the latest cumulative figure minus the last figure recorded before `since` (all of
+ * it without `since`). A session figure set by hand (`work spend --session --tokens`, source manual) is an
+ * override: once a session key has one, its measured (transcript) figures no longer count, so the two are
+ * never added up.
+ */
 function tally(rows: UsageRow[], since?: string): KeyTally[] {
+  const overridden = new Set(rows.filter((r) => r.data.scope === 'session' && r.data.source === 'manual').map((r) => r.data.key));
   const latest = new Map<string, UsageRow>();
-  const before = new Map<string, number>();
+  const before = new Map<string, UsageRow>();
   for (const r of rows) {
+    if (overridden.has(r.data.key) && r.data.source === 'transcript') continue;
     latest.set(r.data.key, r);
-    if (since && r.at < since) before.set(r.data.key, r.data.tokens);
+    if (since && r.at < since) before.set(r.data.key, r);
   }
-  return [...latest.values()].map((r) => ({
-    key: r.data.key, scope: r.data.scope, taskId: r.taskId,
-    tokens: Math.max(0, r.data.tokens - (before.get(r.data.key) ?? 0)), model: r.data.model,
-  }));
+  return [...latest.values()].map((r) => {
+    const b = before.get(r.data.key);
+    const c = r.data.components;
+    const bc = b?.data.components;
+    const components = isComponents(c) && (!b || isComponents(bc))
+      ? Object.fromEntries(COMPONENT_KEYS.map((k) => [k, Math.max(0, c[k] - (bc ? bc[k] : 0))])) as unknown as UsageComponents : undefined;
+    return {
+      key: r.data.key, scope: r.data.scope, taskId: r.taskId,
+      tokens: Math.max(0, r.data.tokens - (b?.data.tokens ?? 0)), model: r.data.model, ...(components ? { components } : {}),
+    };
+  });
 }
 
 export interface SpendFigures { tokens: number; attempts: number; estimatedUsd?: number }
@@ -212,7 +231,8 @@ function figures(entries: KeyTally[], attempts: number, billing: Billing, fallba
   const tokens = entries.reduce((a, e) => a + e.tokens, 0);
   if (billing !== 'api-key') return { tokens, attempts };
   let usd = 0;
-  for (const e of entries) usd += (e.tokens / 1e6) * (usdPerMTok(e.model) ?? usdPerMTok(fallbackModel) ?? 0);
+  // Measured figures (components known) are weighted: cache read 0.1x, cache write 1.25x, output 5x the input rate.
+  for (const e of entries) usd += (e.components ? weightedMTok(e.components) : e.tokens / 1e6) * (usdPerMTok(e.model) ?? usdPerMTok(fallbackModel) ?? 0);
   return { tokens, attempts, estimatedUsd: Math.round(usd * 100) / 100 };
 }
 
@@ -241,12 +261,99 @@ export interface SpendReport {
   /** Since the UTC day start. */
   today: SpendFigures & { since: string };
   perTask: ({ taskId: string } & SpendFigures)[];
-  /** The coordinator sessions' own totals (when recorded). */
-  coordinator: SpendFigures;
+  /** The coordinator sessions' own totals: measured from the transcript by the Stop hook, or set by hand. */
+  coordinator: SpendFigures & { baseline: CoordinatorBaseline };
   budget: BudgetStatus | null;
   /** Shortcut for budget.percent (null without a budget). */
   percent: number | null;
   notes: string[];
+}
+
+/**
+ * Measured coordinator baseline (task-57.1, docs/design/coordinator-sessions.md "Step 1"): the numbers the
+ * cost model needs. From the Stop hook's per-session states (meta `coordinator_usage:<session_id>`).
+ */
+export interface CoordinatorBaseline {
+  /** Start of the first measured session (null: nothing measured yet). */
+  since: string | null;
+  sessions: number;
+  /** Sessions still running (not yet ended). */
+  open: number;
+  /** Ended sessions by what ended them: context-reset (self-restart), restart (upgrade, settings, sync), exit (no restart recorded). */
+  endedBy: Partial<Record<SessionEndTrigger, number>>;
+  /** Context resets by the reset trigger that held (delivered, context, handoffs, requested). */
+  resetTriggers: Record<string, number>;
+  tokens: number;
+  components: UsageComponents;
+  turns: { total: number; perSession: number | null };
+  contextPerTurn: { mean: number | null; max: number };
+  ownerMessages: number;
+  /** Distinct tasks delivered (or done) since `since`. */
+  deliveredTasks: number;
+  tokensPerDeliveredTask: number | null;
+  tokensPerOwnerMessage: number | null;
+  /** Tokens recovered sessions spent before their first claim or Telegram reply. */
+  resetOverhead: { recoveredSessions: number; tokens: number; perRecovery: number | null };
+  /** Measured coordinator tokens / all tokens since `since` (0..1; null when nothing is counted). */
+  share: number | null;
+  /** API-key billing: USD with the components weighted (cache read 0.1x, cache write 1.25x, output 5x). */
+  estimatedUsd?: number;
+  /** API-key billing: the coordinator's share of the estimated USD since `since`. */
+  usdShare?: number | null;
+  model: string | null;
+}
+
+const ratio = (a: number, b: number) => (b > 0 ? Math.round(a / b) : null);
+
+function deliveredSince(db: RuntimeDb, since: string): number {
+  const ids = new Set<string>();
+  for (const r of db.all<{ task_id: string | null; data_json: string | null }>("SELECT task_id, data_json FROM events WHERE kind = 'record' AND at >= ?", since)) {
+    try {
+      const d = JSON.parse(r.data_json ?? 'null') as { to?: string; leaseId?: string } | null;
+      if (d && (d.to === 'delivered' || d.to === 'done')) ids.add(r.task_id ?? d.leaseId ?? '?');
+    } catch { /* unreadable record */ }
+  }
+  return ids.size;
+}
+
+export function coordinatorBaseline(ctx: { db: RuntimeDb; billing: Billing; fallbackModel: string | null; rows: UsageRow[]; states?: CoordinatorSessionState[] }): CoordinatorBaseline {
+  const states = ctx.states ?? sessionStates(ctx.db);
+  const since = states[0]?.firstAt ?? null;
+  const components: UsageComponents = { input: 0, cacheRead: 0, cacheWrite: 0, output: 0 };
+  const endedBy: Partial<Record<SessionEndTrigger, number>> = {};
+  const resetTriggers: Record<string, number> = {};
+  let turns = 0; let contextSum = 0; let maxContext = 0; let ownerMessages = 0; let recovered = 0; let overhead = 0; let usd = 0;
+  for (const s of states) {
+    for (const k of COMPONENT_KEYS) components[k] += s.components[k];
+    turns += s.turns; contextSum += s.contextSum; maxContext = Math.max(maxContext, s.maxContext); ownerMessages += s.ownerMessages;
+    if (s.recovered) { recovered++; overhead += s.overhead; }
+    if (s.ended) {
+      endedBy[s.ended.trigger] = (endedBy[s.ended.trigger] ?? 0) + 1;
+      if (s.ended.trigger === 'context-reset') for (const t of (s.ended.detail ?? 'requested').split(',')) resetTriggers[t] = (resetTriggers[t] ?? 0) + 1;
+    }
+    usd += weightedMTok(s.components) * (usdPerMTok(s.model) ?? usdPerMTok(ctx.fallbackModel) ?? 0);
+  }
+  const tokens = totalOf(components);
+  const delivered = since ? deliveredSince(ctx.db, since) : 0;
+  let share: number | null = null;
+  let usdShare: number | null = null;
+  if (since) {
+    const all = figures(tally(ctx.rows, since), 0, 'api-key', ctx.fallbackModel);
+    share = all.tokens > 0 ? Math.round((Math.min(tokens, all.tokens) / all.tokens) * 1000) / 1000 : null;
+    usdShare = all.estimatedUsd ? Math.round((Math.min(usd, all.estimatedUsd) / all.estimatedUsd) * 1000) / 1000 : null;
+  }
+  return {
+    since, sessions: states.length, open: states.filter((s) => !s.ended).length, endedBy, resetTriggers,
+    tokens, components,
+    turns: { total: turns, perSession: states.length ? Math.round((turns / states.length) * 10) / 10 : null },
+    contextPerTurn: { mean: ratio(contextSum, turns), max: maxContext },
+    ownerMessages, deliveredTasks: delivered,
+    tokensPerDeliveredTask: ratio(tokens, delivered), tokensPerOwnerMessage: ratio(tokens, ownerMessages),
+    resetOverhead: { recoveredSessions: recovered, tokens: overhead, perRecovery: ratio(overhead, recovered) },
+    share,
+    ...(ctx.billing === 'api-key' ? { estimatedUsd: Math.round(usd * 100) / 100, usdShare } : {}),
+    model: [...states].reverse().find((s) => s.model)?.model ?? null,
+  };
 }
 
 export interface SpendContext { db: RuntimeDb; billing?: Billing; config?: Pick<MinionsConfig, 'models'>; now?: Date }
@@ -295,13 +402,13 @@ export function spendReport(ctx: SpendContext): SpendReport {
   const b = readBudget(ctx.db);
   const budget = b ? budgetStatus(ctx, b, rows) : null;
   const notes = [billing === 'api-key' ? ESTIMATE_NOTE : SUBSCRIPTION_NOTE,
-    'Tokens come from the coordinator (task-notification totals passed with --usage); spend not passed in is not counted.'];
+    'Worker tokens come from the coordinator (task-notification totals passed with --usage); coordinator tokens are measured from its transcript by the Stop hook (`work spend --session --tokens` overrides a session). Spend not reported is not counted.'];
   return {
     billing,
     total: figures(all, attemptsSince(ctx.db), billing, fallback),
     today: { ...figures(tally(rows, day), attemptsSince(ctx.db, day), billing, fallback), since: day },
     perTask: perTask.filter((t) => t.tokens > 0 || t.attempts > 0),
-    coordinator: figures(all.filter((e) => e.scope === 'session'), 0, billing, fallback),
+    coordinator: { ...figures(all.filter((e) => e.scope === 'session'), 0, billing, fallback), baseline: coordinatorBaseline({ db: ctx.db, billing, fallbackModel: ctx.config?.models.coordinator ?? fallback, rows }) },
     budget, percent: budget?.percent ?? null, notes,
   };
 }
@@ -374,8 +481,25 @@ export function budgetNotice(ctx: SpendContext): BudgetNotice | null {
 export function humanSpend(r: SpendReport): string {
   const usd = (f: SpendFigures) => (f.estimatedUsd !== undefined ? `, ~$${f.estimatedUsd.toFixed(2)} est.` : '');
   const tok = (f: SpendFigures) => `${f.tokens.toLocaleString('en-US')} tokens${usd(f)}, ${f.attempts} attempt(s)`;
+  const c = r.coordinator;
   return [
     `spend (${r.billing}): total ${tok(r.total)}; today ${tok(r.today)}`,
+    `coordinator: ${c.tokens.toLocaleString('en-US')} tokens${usd(c)}; workers: ${Math.max(0, r.total.tokens - c.tokens).toLocaleString('en-US')} tokens`,
     r.budget ? `budget: ${describeBudget(r.budget)}${r.budget.exhausted ? ' - new starts refused' : ''}` : 'budget: none',
+  ].join('\n');
+}
+
+const k = (n: number | null) => (n === null ? '-' : n >= 10_000 ? `${Math.round(n / 1000)}k` : n.toLocaleString('en-US'));
+const pct = (n: number | null | undefined) => (n === null || n === undefined ? '-' : `${Math.round(n * 1000) / 10}%`);
+
+/** The baseline in a few lines (`work spend`; `status` shows only the coordinator total). */
+export function humanBaseline(b: CoordinatorBaseline): string {
+  if (!b.sessions) return 'coordinator baseline: no session measured yet (the Stop hook records it after each coordinator turn)';
+  const ended = Object.entries(b.endedBy).map(([t, n]) => `${t} ${n}`).join(', ') || 'none';
+  const resets = Object.entries(b.resetTriggers).map(([t, n]) => `${t} ${n}`).join(', ');
+  return [
+    `coordinator baseline since ${b.since}: ${b.sessions} session(s) (${b.open} open; ended: ${ended}${resets ? `; resets by trigger: ${resets}` : ''}), ${b.turns.total} turns (${b.turns.perSession ?? '-'}/session)`,
+    `  context/turn mean ${k(b.contextPerTurn.mean)}, max ${k(b.contextPerTurn.max)}; tokens/delivered task ${k(b.tokensPerDeliveredTask)} (${b.deliveredTasks} delivered); tokens/owner message ${k(b.tokensPerOwnerMessage)} (${b.ownerMessages})`,
+    `  reset overhead ${k(b.resetOverhead.perRecovery)}/recovery (${b.resetOverhead.recoveredSessions} recovered); coordinator share ${pct(b.share)} of tokens${b.estimatedUsd !== undefined ? `, ~$${b.estimatedUsd.toFixed(2)} weighted est. (${pct(b.usdShare)} of USD)` : ''}`,
   ].join('\n');
 }
