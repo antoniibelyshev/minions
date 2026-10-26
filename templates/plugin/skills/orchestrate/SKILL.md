@@ -53,7 +53,7 @@ Call the Agent tool:
 
 Older CLI fallback: if `--compact`, `work brief` or `--submitted` is rejected as an unknown option or command, claim without `--compact` and paste the brief in a ```json fence after the marker and worktree lines; in step 5, record by piping the worker's final JSON to `minions work record <leaseId> --json` on stdin.
 
-Independent tasks may run in parallel up to the limits. A task never has two workers at once.
+{{processRunGuidance}}Independent tasks may run in parallel up to the limits. A task never has two workers at once.
 
 ## 5. Record
 
@@ -61,7 +61,7 @@ When a worker returns, it has submitted its result with `minions work submit` an
 
 `minions work record <leaseId> --submitted --usage <subagent_tokens> --json`
 
-Always pass `--usage` (also on `--correction` records and `work release`): it is the durable spend tally. The figure is cumulative per agent, so after a correction pass the resumed agent's new total; the latest figure per lease counts and nothing is double-counted. If the notification came after you recorded, add it with `minions work spend --lease <leaseId> --tokens <n> --json`.
+Always pass `--usage` for Agent workers (also on `--correction` records and `work release`): it is the durable spend tally. A process-harness run (`launch.kind: "run"`) records its own usage: record it without `--usage`. The figure is cumulative per agent, so after a correction pass the resumed agent's new total; the latest figure per lease counts and nothing is double-counted. If the notification came after you recorded, add it with `minions work spend --lease <leaseId> --tokens <n> --json`.
 
 {{contextResetRule}}
 

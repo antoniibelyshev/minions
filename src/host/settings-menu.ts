@@ -9,7 +9,7 @@ import { createInterface } from 'node:readline/promises';
 import { MinionsError } from '../core/errors.js';
 import type { ProjectJson } from './project.js';
 import { applySetting, formatSet, restartCoordinator, runtimePaused, type SettingsRuntime } from './settings-cli.js';
-import { SETTING_GROUPS, formatValue, listSettings, loadSettingsContext, type SettingLayer, type SettingView } from './settings.js';
+import { SETTING_GROUPS, formatValue, secretKind, listSettings, loadSettingsContext, type SettingLayer, type SettingView } from './settings.js';
 
 export type MenuKey = 'up' | 'down' | 'enter' | 'quit' | 'other';
 
@@ -29,7 +29,7 @@ export interface MenuDeps {
   io: MenuIO;
   runtime: SettingsRuntime;
   /** Runs the existing auth flow for a token item (`minions auth github|telegram`). */
-  runAuth: (kind: 'github' | 'telegram') => Promise<void>;
+  runAuth: (kind: 'github' | 'telegram' | 'codex') => Promise<void>;
   layer?: SettingLayer;
 }
 
@@ -151,7 +151,7 @@ export async function runSettingsMenu(project: ProjectJson, deps: MenuDeps): Pro
       const v = views[choice]!;
       io.write(`\n${v.key}: ${v.description}\n${v.effect}\n`);
       if (v.type === 'secret') {
-        const kind = v.key === 'secrets.github' ? 'github' : 'telegram';
+        const kind = secretKind(v.key);
         if (!io.tty) {
           // The numbered menu reads a piped (non-TTY) stdin: the auth flow would read the token from that same
           // stream (the menu's next lines) or fail without a terminal. Point to the piped auth form instead.
@@ -189,7 +189,7 @@ export async function runSettingsMenu(project: ProjectJson, deps: MenuDeps): Pro
   }
 }
 
-const currentToken = (ctx: Awaited<ReturnType<typeof loadSettingsContext>>, kind: 'github' | 'telegram') => (ctx.credentials[kind] ? 'provisioned' : 'missing');
+const currentToken = (ctx: Awaited<ReturnType<typeof loadSettingsContext>>, kind: 'github' | 'telegram' | 'codex') => (ctx.credentials[kind] ? 'provisioned' : 'missing');
 
 /**
  * Line reader for a non-TTY stdin (a pipe or a terminal emulator without a TTY): one readline interface for

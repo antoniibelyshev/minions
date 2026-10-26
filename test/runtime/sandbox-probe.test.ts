@@ -1,6 +1,6 @@
 // task-14.3: the credential-free process-harness probe (docs/design/agent-runtimes.md D7): harness binaries
 // and pinned versions, loopback listeners on allowed connect ports, the config view, and `work probe`.
-import { chmod, mkdir, mkdtemp, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -139,5 +139,24 @@ describe('CLI surface', () => {
     const probe = work.commands.find((c) => c.name() === 'probe');
     expect(probe?.description()).toMatch(/no credentials/);
     expect(probe?.options.map((o) => o.long)).toEqual(['--refresh']);
+  });
+});
+
+describe('the runtime image pins the Codex CLI (task-14.15)', () => {
+  const repo = join(import.meta.dirname, '..', '..');
+  it('installs @openai/codex at the pinned version next to Claude Code and exposes the pin as the probe env', async () => {
+    const dockerfile = await readFile(join(repo, 'docker', 'Dockerfile'), 'utf8');
+    const pin = /^ARG CODEX_VERSION=(\d+\.\d+\.\d+)$/m.exec(dockerfile)?.[1];
+    expect(pin).toBe('0.164.0');
+    // One `npm install -g` step installs Claude Code and Codex together.
+    const npmStep = /RUN npm install -g [^\n]*\\\n([^\n]*)\n/.exec(dockerfile)?.[1] ?? '';
+    expect(npmStep).toContain('"@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"');
+    expect(npmStep).toContain('"@openai/codex@${CODEX_VERSION}"');
+    // The final stage carries the pin as the env var `work probe` compares `codex --version` against.
+    const finalStage = dockerfile.slice(dockerfile.lastIndexOf('\nFROM '));
+    expect(finalStage).toContain('ARG CODEX_VERSION=');
+    expect(finalStage).toMatch(new RegExp(`^\\s+${PROCESS_HARNESSES.codex!.pinEnv}=\\$\\{CODEX_VERSION\\} \\\\$`, 'm'));
+    const compat = await readFile(join(repo, 'docs', 'compatibility.md'), 'utf8');
+    expect(compat).toContain(`\`@openai/codex@${pin}\``);
   });
 });

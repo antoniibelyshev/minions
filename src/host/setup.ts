@@ -3,7 +3,8 @@
 //
 // Order: init wizard (repo/profile/visibility/runtime/Claude auth) -> GitHub (the guided flow of
 // `minions setup github`: remote, base branch, pre-filled token link, token; then the delivery mode) ->
-// CI guidance -> auto-merge (opt-in, default no) -> Telegram (token + pairing guidance) -> runtime start
+// CI guidance -> auto-merge (opt-in, default no) -> Telegram (token + pairing guidance) -> agents (which harness does
+// the work; src/host/harness-setup.ts) -> runtime start
 // (container, or the host runtime), repository import, coordinator launch -> attach/pair instructions.
 // The CLI then offers the AI setup assistant (`minions setup assist`) for whatever is left.
 //
@@ -26,12 +27,13 @@ import { readJsonIfExists, writeJson } from '../core/fsutil.js';
 import { projectPaths } from '../core/paths.js';
 import { ciSetupPlan, fetchApi, requiredChecksStatus, type RequiredChecksReport } from '../runtime/ci.js';
 import {
-  backendLabel, githubRepoFromRemote, githubTokenGuidance, loadCredentialRefs, provisionGithubToken, provisionTelegramToken, readGithubToken,
+  backendLabel, githubRepoFromRemote, provisionCodexKey, githubTokenGuidance, loadCredentialRefs, provisionGithubToken, provisionTelegramToken, readGithubToken,
   removeGithubToken, telegramBotGuidance, type CredentialsJson, type Fetch,
 } from './credentials.js';
 import type { DockerProbe } from './discovery.js';
 import type { Runner } from './docker.js';
 import { runGithubSetup, type GithubSetupResult } from './github-setup.js';
+import { harnessStep } from './harness-setup.js';
 import { formatPlan, runInit, type InitResult } from './install.js';
 import { loadEffectiveConfig, loadProjectJson } from './project.js';
 import { findByCommonDir, gitCommonDir, loadRegistry, repoRoot } from './registry.js';
@@ -93,7 +95,7 @@ export interface SetupOptions {
   platform?: NodeJS.Platform;
 }
 
-export type StepId = 'init' | 'github' | 'delivery' | 'ci' | 'intake' | 'autoMerge' | 'telegram' | 'container' | 'import' | 'coordinator';
+export type StepId = 'init' | 'github' | 'delivery' | 'ci' | 'intake' | 'autoMerge' | 'telegram' | 'harness' | 'container' | 'import' | 'coordinator';
 export type StepStatus = 'done' | 'kept' | 'changed' | 'skipped' | 'failed' | 'deferred' | 'planned';
 export interface SetupStep { id: StepId; status: StepStatus; detail: string; later?: string; lines?: string[] }
 
@@ -401,6 +403,15 @@ export async function runSetup(opts: SetupOptions): Promise<SetupResult> {
   }
   if (channel !== config.communication.channel) setLocal('communication.channel', channel);
 
+  // ---------------------------------------------------------------- 5b. agents (harnesses; agent-runtimes D8)
+  if (interactive && !hostRuntime && !opts.configFile) say('\n== Agents ==');
+  const h = await harnessStep({
+    io: interactive && !opts.configFile ? io! : null, config, project, local, setLocal, hostRuntime,
+    codexKeyStored: !!refs.codex, inRepo: cmds.inRepo, setupCmd: cmds.setup,
+    storeCodexKey: async (token) => backendLabel((await provisionCodexKey({ projectId, token, repoPath: project.repoPath, runner: opts.runner })).backend),
+  });
+  step({ id: 'harness', ...h });
+
   // ---------------------------------------------------------------- record choices, regenerate derived files
   if (changed.length) {
     await writeJson(localPath, local);
@@ -634,6 +645,7 @@ function dryRunResult(opts: SetupOptions, init: InitResult, steps: SetupStep[], 
   would('intake', git.hasGitHub ? `would ask "Import GitHub issues into the backlog?" (default no): read-only filtered import on ${inRepo('minions sync')} and coordinator start` : 'skipped: no GitHub remote');
   would('autoMerge', 'with pull-request delivery, would ask "Enable auto-merge?" (default no); yes records delivery.merge "auto-when-eligible" in the local layer');
   would('telegram', refs.telegram ? `bot ${refs.telegram.botId} stored: would offer keep/change/disable` : 'would ask "Set up Telegram?" (default no); bot token entered without echo');
+  would('harness', 'would ask "Which agent should do the work?" (default Claude Code; OpenAI Codex: OpenAI API key without echo, model, and in this version the read-only codex-reviewer stage after the Claude reviewer)');
   would('container', 'would build the image if needed and start the container (idempotent)');
   would('import', 'would import committed history of the base branch unless already imported, and configure origin');
   would('coordinator', 'would launch the coordinator detached and print how to attach and pair');

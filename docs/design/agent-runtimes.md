@@ -1164,14 +1164,63 @@ worker; needs `codex` on PATH and `CODEX_API_KEY`; model from `MINIONS_LIVE_CODE
   the file in the secrets mount is readable by Claude workers in the container; only process workers are kept out
   of it, by L1.
 
-**Pinned install: pending owner approval.** The Dockerfile is not changed by this task (infrastructure change). The
-proposal: add `ARG CODEX_VERSION=0.164.0` and install `"@openai/codex@${CODEX_VERSION}"` in the same `npm install -g`
+**Pinned install: approved and done in task-14.15** (owner, 2026-10-26), exactly as proposed below. The Dockerfile was
+not changed by this task (infrastructure change). The proposal: add `ARG CODEX_VERSION=0.164.0` and install `"@openai/codex@${CODEX_VERSION}"` in the same `npm install -g`
 line as `@anthropic-ai/claude-code`, and set `ENV MINIONS_CODEX_VERSION=${CODEX_VERSION}` so `work probe` checks the
 pin. The source fingerprint already covers the Dockerfile, so the change rebuilds the image. Integrity of
 `@openai/codex@0.164.0`: `sha512-TWj7UGyPRe3Pj/A3ddNAxs1te3a/W/xAd+J0LHrrFTmsSfahGMOLF/vn88D3QCIgAT3B1rm1y/Z3NYE0rx6cZQ==`
 (shasum `82693f5ef4b08b724dc1370f1622bc752e5d1bf4`); native optional dependencies linux-x64
 `sha512-XLAoaWsGOT2khzl+P4FYDPTkzAr9W0VFXFaVkqlFdkM0soa1gH/4S0wSD57Ek3HHwkirAEGz2/Mwehseh+l5Mg==`, linux-arm64
 `sha512-LL5iTQjyDL4YRX44EWqhIfEQ5uGnmgxkQBJSxjZSeJ8L1Og83pdlzUJW/PRJ76oaVwOVgh6HXwuPEiBNEHU4lg==`.
+
+### Addendum: child task 6 implementation decisions (task-14.7)
+
+Setup, settings and coordinator guidance. Code: `src/host/harness-setup.ts` (the setup step), `src/host/settings.ts`
+(the Agents items), `processDispatchGuidance` / `processRunGuidance` in `src/plugin/generate.ts`. Tests:
+`test/host/setup-harness.test.ts`, `test/host/settings-harness.test.ts`, `test/plugin/process-harness-guidance.test.ts`.
+
+- **Setup question.** "Which agent should do the work?" with `claude/codex/junie/later`, asked after Telegram and
+  before the container (step id `harness`). It is not asked with `--yes`, with `--config`, or in the host runtime (which
+  refuses process harnesses). The answer defaults to the current `harnesses.default`. Junie has no adapter yet, so
+  that answer keeps Claude Code and says so. Before the answer, setup states what the choice covers in this phase,
+  and that Claude credentials are still needed.
+- **Codex in phase 1 (b) wires the pilot.** Choosing Codex stores the OpenAI key (hidden prompt, `provisionCodexKey`),
+  asks for the model (offered default: the existing `harnesses.codex.models.default`, else `gpt-6.1-sol`, the id of
+  the D8 example; it is only checked as a model id), and records `harnesses.default: "codex"`, `harnesses.codex.models`,
+  the `codex-reviewer` role (gate, `harness: codex`, inline prompt, read-only by the gate defaults) and its stage after
+  the last `reviewer` stage of the workflow the owner picks (default `default`; at the end when the workflow has no
+  reviewer). An existing `codex-reviewer` gate is kept as configured; a non-gate role of that name is refused. Picking
+  an unconfigured `default` writes the derived stages out, so `verification.testerRequired` / `reviewerRequired` no
+  longer reshape it; the step says so. Under phase `1a` or `2` only `harnesses.default` and the Codex block are
+  written (no pilot).
+- **Where it is written.** The host-only `config.local.json`, like every setup integration choice. The whole planned
+  layer is validated with the full config rules first; a refusal (for example another project gate with edits, which
+  `harnesses.default` would move onto Codex) records nothing. A key stored earlier in the same step stays stored and
+  the step names it. Other gates that `harnesses.default` moves are listed as a warning.
+- **Settings.** A new `Agents` group, placed last so the menu numbers of the existing items do not move:
+  `harnesses.default`, `secrets.codex` (provisioned / missing; the menu runs `minions auth codex`) and one
+  `roles.<role>.harness` item per worker role of the current config (built-ins and project roles). Role items are
+  resolved from the key pattern, not from the static list, because the roles come from the config; `planSetting`
+  refuses an unknown role and the coordinator. All are `restart` and host-owned (the classification of `roles` and
+  `harnesses`), apply `prompt` (the plugin and prompts change). A move onto a process harness counts as loosening. The
+  phase rule stays in `validateConfig`, so `roles.engineer.harness codex` fails with the phase message before any
+  write. There is no settings item for `harnesses.<id>.models`: setup writes it, and the validation error for a
+  missing block names it.
+- **Coordinator guidance is conditional.** The `launch.kind: "run"` text in `coordinator.md` (dispatch flow) and the
+  orchestrate skill (step 4, "Process-harness stages") is rendered only when a role resolves to a process harness, so
+  Claude-only prompts are unchanged. It says: claim, run `launch.command` with the lease through Bash
+  `run_in_background` from the repository, no Agent call and no notes, wait for the notification, record with
+  `--submitted` and **without `--usage`** (the runner's usage event has the same `lease:<id>` key, so a coordinator
+  figure would replace it), report violations to the owner, release on a gate refusal, and for an invalid result
+  release and claim again instead of a correction (there is no live worker). A run is stopped only through
+  `work release`.
+- **Install.** The Dockerfile is unchanged (owner approval pending, see the task-14.6 addendum). Setup, README and
+  `docs/cli.md` say the `codex` CLI must be installed in the runtime image; without it a run ends with a synthesized
+  `blocked` result. Superseded by task-14.15: the image now ships `@openai/codex@0.164.0` (`ARG CODEX_VERSION`,
+  `ENV MINIONS_CODEX_VERSION`), and setup, README and `docs/cli.md` say so; a missing or mismatched binary still ends
+  a run with a synthesized `blocked` result.
+- **Role proposals** already accept `harness` on a project role (task-14.2 plumbing; covered by
+  `test/runtime/harness-runtime.test.ts`); nothing changed there.
 
 ## Child tasks
 

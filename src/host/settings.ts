@@ -17,9 +17,16 @@
 // committed path) only with an explicit `shared` choice on a shared install. Values are validated with the
 // full config schema (resolveEffective) before anything is written. Secrets are never read or shown: token
 // items report only provisioned / missing.
+//
+// Agents (docs/design/agent-runtimes.md D8): `harnesses.default` and one `roles.<r>.harness` item per worker role
+// (built-ins and the configured project roles, so the list follows the config: see roleHarnessDef). Whether a role
+// may run on a process harness is the phase rule (D9) that config validation applies, so a refused value fails
+// before anything is written, with the validation message.
 import { CAPABILITIES, strictness, ruleEffects } from '../config/capabilities.js';
 import { COORDINATOR_DISALLOWED_TOOLS } from '../config/coordinator-tools.js';
 import type { Source } from '../config/resolve.js';
+import { HARNESS_IDS, HARNESSES, isHarnessId, isProcessHarness } from '../config/harnesses.js';
+import { COORDINATOR_ROLE, ROLE_NAME_PATTERN, workerRole, workerRoleNames } from '../config/roles.js';
 import { EFFORTS, type CapabilityRule, type MinionsConfig } from '../config/schema.js';
 import { classifyKey, type SettingClass } from '../config/setting-classes.js';
 import { MinionsError } from '../core/errors.js';
@@ -31,7 +38,7 @@ import { loadCredentialRefs, type CredentialsJson } from './credentials.js';
 import { refreshDerived } from './install.js';
 import { loadEffectiveConfig, projectConfigPath, resolveEffective, type ProjectJson } from './project.js';
 
-export const SETTING_GROUPS = ['Delivery', 'Verification', 'Reporting', 'Models', 'Concurrency', 'Policy', 'Permissions', 'Integrations', 'Pause'] as const;
+export const SETTING_GROUPS = ['Delivery', 'Verification', 'Reporting', 'Models', 'Concurrency', 'Policy', 'Permissions', 'Integrations', 'Pause', 'Agents'] as const;
 export type SettingGroup = (typeof SETTING_GROUPS)[number];
 
 /** live: enforced by the runtime from the regenerated config; prompt/launch: needs a coordinator restart; recreate: needs `minions upgrade`. */
@@ -101,6 +108,13 @@ const capRank =(r: Value): number => {
   if (r === undefined || r === null) return 0;
   const effects = ruleEffects(r as CapabilityRule);
   return Math.max(...effects.map(strictness));
+};
+
+/** A move onto a process harness: the roles it affects then run as separate processes, billed by that vendor. */
+const ontoProcessHarness = (who: string) => (from: Value, to: Value): string | null => {
+  const proc = (v: Value) => isHarnessId(v) && isProcessHarness(v);
+  if (!proc(to) || from === to) return null;
+  return `${who} run on ${HARNESSES[to as keyof typeof HARNESSES].label} (a process worker under minions-sandbox, billed to its own API key)`;
 };
 
 /** A setting as declared below; class and hostOwned are filled in by withClass. */
@@ -208,11 +222,42 @@ const DECLARED: readonly DeclaredSetting[] = [
     description: 'paused: the coordinator takes no new tasks into the backlog' },
   { key: 'pause.starts', group: 'Pause', label: 'Starts paused', type: 'control', apply: 'live', hostOwned: false,
     description: 'paused: no new task starts; running workers continue' },
+  // ---- Agents (harnesses; per-role items come from roleHarnessDef)
+  { key: 'harnesses.default', group: 'Agents', label: 'Agent for the squad', type: 'enum', choices: HARNESS_IDS, optional: true, apply: 'prompt',
+    description: 'harness of every worker role without its own, where this version allows it (phase 1: project gate roles such as codex-reviewer); the other roles stay on Claude Code. A process harness needs its harnesses.<id> block (`minions setup` writes it), the CLI in the runtime image and its key',
+    loosens: ontoProcessHarness('worker roles without their own harness that this version allows') },
+  { key: 'secrets.codex', group: 'Agents', label: 'OpenAI API key (Codex)', type: 'secret', apply: 'live', hostOwned: true,
+    description: 'OpenAI API key for Codex process workers (`minions auth codex`); the runner reads it at each `work run`' },
 ];
 
 export const SETTINGS: readonly SettingDef[] = DECLARED.map(withClass);
 
-export const settingDef = (key: string): SettingDef | undefined => SETTINGS.find((s) => s.key === key);
+const ROLE_HARNESS_KEY = /^roles\.([^.]+)\.harness$/;
+
+/**
+ * The `roles.<name>.harness` item. Not in SETTINGS: the roles come from the config, so listSettings adds one per
+ * worker role and settingDef resolves any valid role name (planSetting then checks that the role exists).
+ */
+export function roleHarnessDef(name: string): SettingDef {
+  return withClass({
+    key: `roles.${name}.harness`, group: 'Agents', label: `Agent: ${name}`, type: 'enum', choices: HARNESS_IDS, optional: true, apply: 'prompt',
+    description: `harness of the ${name} role (default: harnesses.default where this version allows it, else claude); a process harness only where the phase allows the role (phase 1: project gate roles)`,
+    loosens: ontoProcessHarness(`${name} stages`),
+  });
+}
+
+/** The role name of a `roles.<name>.harness` key, or null. */
+export function roleHarnessKey(key: string): string | null {
+  const m = ROLE_HARNESS_KEY.exec(key);
+  return m && ROLE_NAME_PATTERN.test(m[1]!) && m[1] !== COORDINATOR_ROLE ? m[1]! : null;
+}
+
+export const settingDef = (key: string): SettingDef | undefined => {
+  const d = SETTINGS.find((s) => s.key === key);
+  if (d) return d;
+  const role = roleHarnessKey(key);
+  return role ? roleHarnessDef(role) : undefined;
+};
 
 export function requireSetting(key: string): SettingDef {
   const d = settingDef(key);
@@ -296,8 +341,11 @@ function sourceOf(def: SettingDef, ctx: SettingsContext): SourceLabel {
   return 'profile default';
 }
 
+/** The credential kind of a `secrets.<kind>` item. */
+export const secretKind = (key: string): 'github' | 'telegram' | 'codex' => key.slice('secrets.'.length) as 'github' | 'telegram' | 'codex';
+
 export function currentValue(def: SettingDef, ctx: SettingsContext): Value {
-  if (def.type === 'secret') return ctx.credentials[def.key === 'secrets.github' ? 'github' : 'telegram'] ? 'provisioned' : 'missing';
+  if (def.type === 'secret') return ctx.credentials[secretKind(def.key)] ? 'provisioned' : 'missing';
   if (def.type === 'control') {
     if (!ctx.paused) return null;
     return ctx.paused[def.key === 'pause.intake' ? 'intake' : 'starts'] ? 'paused' : 'running';
@@ -321,7 +369,9 @@ export function viewSetting(def: SettingDef, ctx: SettingsContext): SettingView 
   };
 }
 
-export const listSettings = (ctx: SettingsContext): SettingView[] => SETTINGS.map((d) => viewSetting(d, ctx));
+/** Every setting: the static ones plus a harness item per worker role of the config. */
+export const listSettings = (ctx: SettingsContext): SettingView[] =>
+  [...SETTINGS, ...workerRoleNames(ctx.config).map(roleHarnessDef)].map((d) => viewSetting(d, ctx));
 
 export interface SettingsDeps {
   /** Pause flags of the running runtime (null when it is not running or did not answer). */
@@ -428,6 +478,10 @@ export async function planSetting(ctx: SettingsContext, key: string, to: Value, 
   const def = requireSetting(key);
   if (def.type === 'secret' || def.type === 'control') throw new MinionsError('PRECONDITION', `${key} is not a configuration setting.`);
   const { project } = ctx;
+  const role = roleHarnessKey(key);
+  if (role && !workerRole(ctx.config, role)) {
+    throw new MinionsError('INVALID_CONFIG', `${key}: there is no worker role "${role}"`, `Worker roles: ${workerRoleNames(ctx.config).join(', ')}.`, { path: key });
+  }
   const file = layerFile(project, layer);
   const projectFile = projectConfigPath(project);
   const projectRaw = (await readJsonIfExists<Record<string, unknown>>(projectFile)) ?? {};

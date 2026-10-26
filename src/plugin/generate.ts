@@ -3,7 +3,8 @@ import { readdir, readFile, realpath, stat } from 'node:fs/promises';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { CAPABILITIES, can, type Capability } from '../config/capabilities.js';
-import { isProcessHarness } from '../config/harnesses.js';
+import { HARNESSES, isProcessHarness } from '../config/harnesses.js';
+import { RUN_COMMAND_TEMPLATE } from '../config/launch.js';
 import { AGENT_MODEL_ALIASES, engineerDeepEffort, isAgentModelAlias, roleEffort } from '../config/models.js';
 import {
   BUILTIN_TOOLS, customRoles, deepVariantEffort, DEEP_SUFFIX, ENGINEER_ROLE, registeredRoleNames, roleLimit, workerRole, workerRoleNames,
@@ -399,6 +400,48 @@ function workflowGuidance(cfg: MinionsConfig): string {
   return `Configured workflows: ${named.map((n) => `${code(n)} (${stages(n)})`).join('; ')}. A task runs the workflow assigned at creation (\`--workflow <name>\`, see \`/minions:orchestrate\`), else the default.${own}`;
 }
 
+/** Worker roles that run on a process harness (agent-runtimes D1): `work next` gives them `launch.kind: "run"`. */
+function processRoles(cfg: MinionsConfig): RoleDef[] {
+  return workerRoleNames(cfg).flatMap((n) => { const d = workerRole(cfg, n); return d && isProcessHarness(d.harness) ? [d] : []; });
+}
+const processRoleList = (roles: RoleDef[]) => roles.map((d) => `${code(d.name)} on ${HARNESSES[d.harness].label}`).join(', ');
+
+/**
+ * Coordinator prompt, dispatch flow (agent-runtimes D8): how a `launch.kind: "run"` stage starts. Empty when every
+ * role runs on Claude Code, so Claude-only projects keep their prompt unchanged.
+ */
+function processDispatchGuidance(cfg: MinionsConfig): string {
+  const roles = processRoles(cfg);
+  if (!roles.length) return '';
+  return 'Process-harness stages (' + processRoleList(roles) + '): their `work next` entry has `launch.kind: "run"` instead of an Agent to spawn. '
+    + 'Claim as usual, then start the worker with Bash (`run_in_background: true`, from the repository, not a worktree): `launch.command` with the claimed lease, '
+    + code(RUN_COMMAND_TEMPLATE) + '. Never use the Agent tool for them (the hook refuses it) and pass no notes: the runner hands the brief to the worker and submits its result. '
+    + 'When the background command exits, read its one JSON line and record with `minions work record <leaseId> --submitted --json` '
+    + '(no `--usage`: the runner recorded the usage). A lease runs at most once. Details: `/minions:orchestrate`.\n\n';
+}
+
+/** Orchestrate step 4: the `launch.kind: "run"` procedure. Empty when every role runs on Claude Code. */
+function processRunGuidance(cfg: MinionsConfig): string {
+  const roles = processRoles(cfg);
+  if (!roles.length) return '';
+  return [
+    '### Process-harness stages (`launch.kind: "run"`)',
+    '',
+    `Roles on a process harness here: ${processRoleList(roles)}. Their \`work next\` entry has \`launch: {kind: "run", command, harness, model, effort, deep}\`; its \`agentType\` is not an Agent to spawn.`,
+    '',
+    `1. Claim as above, then run \`launch.command\` with \`<leaseId>\` replaced by the claimed lease (${code(RUN_COMMAND_TEMPLATE)}) through Bash with \`run_in_background: true\`, from the repository (the runner refuses to start inside a lease worktree). No Agent call, model or prompt: model and effort come from the config (\`launch.model\`, \`launch.effort\`), and the worker gets only the brief and its role prompt. Put anything it must know into the task or a backlog note before the claim.`,
+    '2. Do not poll or wait in a loop: the background task notification wakes you when the runner exits (at the latest after the harness wall clock, `harnesses.<id>.timeoutMinutes`, default 60). Meanwhile dispatch other work as usual. A lease runs at most once: never start `work run` again for the same lease.',
+    '3. The runner prints one JSON line: `{leaseId, exit, submitted, status, violations, usage, wipCommit, head, error?}`.',
+    '   - `submitted: true`: record with `minions work record <leaseId> --submitted --json`, without `--usage` (the runner already recorded the usage; a coordinator figure would replace it), then follow the next step (step 6) as for any worker.',
+    '   - `violations` not empty: the result is `blocked` with `harness-violation:` findings and nothing was fetched. Record it, tell the owner (a security event: the worker tried to leave its sandbox or break its branch rule) and do not run that role again until the owner has looked.',
+    '   - An error envelope (`ok: false`: the launch gate refused, e.g. `PRECONDITION` for the host runtime, a failed sandbox self-test or a missing key, `POLICY_DENIED` for a drain, the budget or a second run) or `submitted: false` with `error`: nothing was submitted. Release the lease (`minions work release <leaseId> --reason "<error>" --json`) and report the reason. A `blocked` result whose findings name the exit status usually means the harness could not start (its CLI is not installed in the runtime image). The owner fixes these on the host (install the harness, `minions auth codex` for the key); do not retry until then.',
+    '   - Invalid result (`valid: false`): there is no live worker to correct. Send no correction and do not run it again: release the lease with the errors as the reason and claim the stage again (a new attempt), or report it when it repeats.',
+    '4. Stop a running process worker only with `minions work release <leaseId> --reason "<why>" --json`: the release reaps the run (cancel, `wip:` checkpoint) before the lease ends. Never kill the runner or edit `/state/run/leases/` yourself. During a drain the runner winds the worker down by itself (`wip:` commit, `partial`): record it as usual.',
+    '',
+    '',
+  ].join('\n');
+}
+
 /** Worker roles with a concurrency limit (execution.maxByRole / maxEngineers); the others only count against the task limit. */
 function roleLimits(cfg: MinionsConfig): string {
   const roles = workerRoleNames(cfg);
@@ -437,6 +480,8 @@ function baseVars(cfg: MinionsConfig): Record<string, string> {
     maxRepairCyclesBeforeReplan: String(cfg.execution.maxRepairCyclesBeforeReplan),
     roleLimits: roleLimits(cfg),
     workflowGuidance: workflowGuidance(cfg),
+    processDispatchGuidance: processDispatchGuidance(cfg),
+    processRunGuidance: processRunGuidance(cfg),
     workflowNames: inlineList(workflowNames(cfg).filter((n) => n !== DEFAULT_WORKFLOW), 'none configured yet'),
     deliveryMode: cfg.delivery.mode,
     deliveryGuidance: deliveryGuidance(cfg),
