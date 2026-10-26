@@ -112,3 +112,15 @@ export function escapeFormatChars(s: string): string {
 export function displayText(s: string): string {
   return escapeFormatChars(stripControlChars(s));
 }
+
+/**
+ * `s` cut to at most `max` UTF-16 code units without splitting a surrogate pair: if the cut would leave a lone high
+ * surrogate at the end, that unit is dropped too. The result is well formed whenever `s` is (no half of an emoji that a
+ * strict UTF-8 consumer such as the Telegram Bot API could reject).
+ */
+export function truncateCodePoints(s: string, max: number): string {
+  if (s.length <= max) return s;
+  const n = Math.max(0, Math.floor(max));
+  const code = n > 0 ? s.charCodeAt(n - 1) : 0;
+  return s.slice(0, code >= 0xd800 && code <= 0xdbff ? n - 1 : n);
+}

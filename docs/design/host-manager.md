@@ -367,6 +367,39 @@ checks. The Bot API transport, the commands and `/approve` are task-53.5.2 to ta
 - **Setup assistant.** `<MINIONS_HOME>/manager/**` is on the assistant's Edit deny list. An agent must not be able to
   rewrite the pairing, the token reference or the journal.
 
+Built in task-53.5.2 (phase 4, part 2): the Bot API transport (`src/host/manager-telegram.ts`) and the read-only
+commands. Decisions made here:
+
+- **Transport choice.** `manager run` uses the Telegram transport when `access.json` exists and a manager token of
+  the same bot is stored (`chooseTransport`); otherwise the log transport, with one log line saying why. An unreadable
+  pairing or store is an error, not a silent fallback.
+- **Owner only.** Updates that `isOwnerUpdate` rejects are dropped without any reply, not even
+  `answerCallbackQuery`. A forwarded message (any of `forward_origin`, `forward_from`, `forward_from_chat` or
+  `forward_date`) is ignored the same way, even when the owner forwards it: only what the owner types is a command.
+  Messages are plain text (no `parse_mode`), and all text goes through `displayText`.
+- **Buttons.** `c:<requestId>:<nonce>` (Confirm), `r:<requestId>:<nonce>` (Reject) and `d:<requestId>:<nonce>` (the
+  second confirmation). They are 46 bytes, and `callbackData` refuses anything over 64. Every owner tap is answered.
+- **Double tap.** The first Confirm on a plan with `loosens` sends no event. It sends a second message with the
+  risk on one line and a "Confirm again" (`d:`) button. Only a `d:` tap within 2 minutes of that first tap, for the
+  same request and nonce, sends the confirm event. The armed state is in memory: after a restart the owner taps
+  Confirm again. For an offer this process did not send, `loosens` is read from the journal's plan.
+- **Applying and outcomes.** The `applying` outcome edits the tapped offer message (the text replaces it, the buttons
+  go). Without a known message, or when the edit fails, it is sent as a new message. A `rejected` outcome also edits
+  the offer. Every other outcome is a new message.
+- **Offset.** `<MINIONS_HOME>/manager/telegram-offset.json` (`{version, botId, offset}`, 0600, directory 0700) is
+  written when a batch arrives, before it is handled (at most once). An offset of another bot is ignored. 409 is
+  CONFLICT "another process polls the manager bot" and 401/404 is AUTH_REQUIRED. The core logs both and retries after
+  5 s. A 429 waits `retry_after`. A send is retried once after a 429 of at most 30 s.
+- **Commands.** Fixed set `/status`, `/requests`, `/project [name|all]`, `/help` (`/start`). Anything else gets the
+  help text. `/set`, `/sync`, `/upgrade`, `/restart`, `/undo` and `/approve` come in task-53.5.3 and task-53.5.4.
+  The core gives the transport read-only views (`ManagerCommands`, through `ManagerTransport.attach`). `/requests`
+  resends every request whose newest journal entry is an offer, with buttons. An expired one is included: Confirm
+  then brings a fresh offer. `/status` shows, per project: runtime running, coordinator (from the runtime's
+  `minions status --json` through the bounded delegate, typed fields only: launch state, active leases, paused),
+  pending requests, and the last poll problem. The restart-required check of `minions status` on the host (image and
+  build fingerprint) is not repeated there. Only a stale coordinator launch is shown as "restart required". The
+  `/project` choice is kept in memory.
+
 
 Child tasks, filed as task-53.2 to task-53.7 (phases 1 to 6) and task-53.8 (coordinator proposal):
 
