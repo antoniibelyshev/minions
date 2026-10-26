@@ -43,7 +43,7 @@ describe('schema 7 upgrade (task-14.11 QA)', () => {
     for (const r of await Promise.all(kids)) expect(r.code, r.err).toBe(0);
     const db = openDb(p.db);
     try {
-      expect(db.getMeta('schema_version')).toBe('7');
+      expect(db.getMeta('schema_version')).toBe(String(SCHEMA_VERSION));
       expect(db.activeLeases()).toHaveLength(1);
       expect(db.activeLeases()[0]).toMatchObject({ id: 'lease-a', harness: null });
       expect(db.get<{ c: number }>("SELECT count(*) AS c FROM pragma_table_info('leases') WHERE name = 'harness'")!.c).toBe(1);
@@ -86,7 +86,7 @@ describe('schema 7 upgrade (task-14.11 QA)', () => {
     const src = paths(tmp('minions-v7-src-'));
     openDb(src.db).close();
     const file = join(tmp('minions-v7-out-'), 'state.tar.gz');
-    expect((await createStateBackup(src, file)).schemaVersion).toBe(7);
+    expect((await createStateBackup(src, file)).schemaVersion).toBe(SCHEMA_VERSION);
     // Emulate older code by forging schema SCHEMA_VERSION+1: the same `schemaVersion > known` check an older build applies to 7.
     const entries = readTar(gunzipSync(readFileSync(file))).map((e) => e.path === 'manifest.json'
       ? { ...e, data: Buffer.from(JSON.stringify({ ...JSON.parse(e.data.toString()), schemaVersion: SCHEMA_VERSION + 1 })) } : e);

@@ -199,11 +199,11 @@ describe('(2) migration 7: leases.harness', () => {
     v6.setMeta('schema_version', '6');
     v6.exec("INSERT INTO leases (id, task_id, role, attempt, config_revision, started_at, status) VALUES ('lease-a', 'task-1', 'engineer', 1, 3, '2026-10-23T00:00:00Z', 'active')");
     v6.close();
-    expect(SCHEMA_VERSION).toBe(7);
+    expect(SCHEMA_VERSION).toBeGreaterThanOrEqual(7); // later migrations run on top
     for (const round of [1, 2]) {
       const db = new RuntimeDb(path);
       try {
-        expect(db.getMeta('schema_version')).toBe('7');
+        expect(db.getMeta('schema_version')).toBe(String(SCHEMA_VERSION));
         const [l] = db.activeLeases();
         expect(l).toMatchObject({ id: 'lease-a', harness: round === 1 ? null : 'codex' });
         expect(leaseHarness(l!)).toBe(round === 1 ? 'claude' : 'codex');
