@@ -2,7 +2,7 @@
 // and `settings set ... --reason`, `settings restart`, `upgrade` recording requests in the runtime (never applying
 // them), validated against the runtime config, host-owned keys refused with CONFLICT; `settings requests` lists
 // them and the hidden `settings requests mark` records the host's outcome. Real program, temp state, no Docker.
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Command } from 'commander';
@@ -144,6 +144,25 @@ describe('settings set in the runtime records a request', () => {
     expect((await cli(['settings', 'set', 'execution.maxActiveTasks', '5', '--yes', '--reason', 'r'])).env.error!.message).toMatch(/--yes: host-only/);
     expect((await cli(['settings', 'set', 'execution.maxActiveTasks', '5', '--expect-revision', '1', '--reason', 'r'])).env.error!.message).toMatch(/--expect-revision: host-only/);
     expect(rows()).toHaveLength(0);
+  });
+
+  it('the `config set` alias records the same request and refuses the same direct-apply options (task-53.10)', async () => {
+    const { code, env } = await cli(['config', 'set', 'execution.maxActiveTasks', '5', '--reason', 'more parallelism']);
+    expect(code).toBe(0);
+    expect(env.data).toMatchObject({ recorded: true, applied: false, unchanged: false, dryRun: false });
+    expect(env.data.request).toMatchObject({ kind: 'config-set', status: 'proposed', reason: 'more parallelism',
+      payload: { key: 'execution.maxActiveTasks', value: '5', layer: 'local' } });
+    expect(env.data.applyCommand).toBe(`minions settings apply ${env.data.request.id}`);
+    expect(rows()).toHaveLength(1);
+    expect(JSON.parse(readFileSync(configFile, 'utf8')).execution.maxActiveTasks).toBe(defaults().execution.maxActiveTasks);
+    for (const [flag, extra] of [['--yes', []], ['--restart', []], ['--no-restart', []], ['--expect-revision', ['1']]] as const) {
+      const r = await cli(['config', 'set', 'execution.maxActiveTasks', '6', flag, ...extra, '--reason', 'r']);
+      expect(r.env.ok, flag).toBe(false);
+      expect(r.env.error, flag).toMatchObject({ code: 'PRECONDITION' });
+      expect(r.env.error!.message, flag).toMatch(new RegExp(`${flag}: host-only`));
+    }
+    expect((await cli(['config', 'set', 'execution.maxActiveTasks', '6'])).env.error!.message).toMatch(/needs a reason/);
+    expect(rows()).toHaveLength(1); // only the first request was recorded
   });
 
   it('an unchanged value and --dry-run record nothing', async () => {
