@@ -4,6 +4,7 @@ import { MinionsError } from '../core/errors.js';
 import { atomicWrite } from '../core/fsutil.js';
 import { redact } from '../core/output.js';
 import type { RuntimeDb } from './db.js';
+import { withOpenRuns } from './runner/record.js';
 
 /**
  * Routine coordinator context resets (task-45). The coordinator session's context grows with every turn;
@@ -208,6 +209,11 @@ export interface ContextResetCheck {
 export interface ContextResetDeps {
   db: RuntimeDb;
   config: Pick<MinionsConfig, 'coordinator'>;
+  /**
+   * The runtime state dir: when given, unfinished process runs (run records not `done`) block a reset like active
+   * leases, counted exactly as `coordinator restart` counts them (withOpenRuns). Every runtime caller passes it.
+   */
+  state?: string;
   /** Transcript tail reader (tests inject it). */
   readTranscript?: (path: string) => string | null;
 }
@@ -236,7 +242,8 @@ export function contextResetCheck(deps: ContextResetDeps): ContextResetCheck {
   const since = lock?.acquiredAt ?? null;
   const blockers: string[] = [];
   if (!settings.enabled) blockers.push('context resets are off (coordinator.contextReset.enabled)');
-  const leases = db.activeLeases();
+  // The workers a restart would count (the restart refuses while any exist): active leases, plus unfinished runs.
+  const leases = deps.state !== undefined ? withOpenRuns(() => db.activeLeases(), deps.state)() : db.activeLeases();
   if (leases.length) blockers.push(`${leases.length} active worker lease(s) (${leases.map((l) => l.id).join(', ')})`);
   if (db.drain()) blockers.push('a drain is in progress (the upgrade restarts the coordinator itself)');
   if (!since) blockers.push('no coordinator session holds the project lock');

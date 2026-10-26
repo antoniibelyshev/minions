@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { coordinatorOnlyWorkCommand, preBashHook, PRE_BASH_HOOK_COMMAND, runHook } from '../../src/runtime/hooks.js';
 import { FAKE_MINIONS, runHookCommand } from '../helpers.js';
+import { scanShell } from '../../src/runtime/shell-scan.js';
 
 const template = JSON.parse(readFileSync(new URL('../../templates/plugin/hooks/hooks.json', import.meta.url), 'utf8')) as {
   hooks: { PreToolUse: { matcher: string; hooks: { command: string; timeout?: number }[] }[] };
@@ -166,22 +167,22 @@ describe('tester regressions: pre-bash bypass variants', () => {
   });
 
   // Gaps found in QA (task-14.5), fixed by the command-position scanner (src/runtime/shell-scan.ts).
-  it('FIXED: a line continuation (backslash-newline) between words is ordinary shell, but bypasses the check', () => {
+  it('denies a line continuation (backslash-newline) between words', () => {
     expect(coordinatorOnlyWorkCommand('minions \\\nwork run lease-1')).not.toBeNull();
   });
-  it('FIXED: a redirection glued to a word (run>/dev/null, minions>log, run<in) bypasses the check', () => {
+  it('denies a redirection glued to a word (run>/dev/null, minions>log, run<in)', () => {
     for (const cmd of ['minions work run>/dev/null lease-1', 'minions>/tmp/log work claim t', 'minions work release<in lease-1']) {
       expect(coordinatorOnlyWorkCommand(cmd)).not.toBeNull();
     }
   });
-  it('FIXED: the bin target run directly (node .../minions/pkg/dist/cli.js) bypasses the check', () => {
+  it('denies the bin target run directly (node .../minions/pkg/dist/cli.js)', () => {
     expect(coordinatorOnlyWorkCommand('node /opt/minions/pkg/dist/cli.js work release lease-1')).not.toBeNull();
   });
-  it('FIXED (false positive): a worker submit heredoc whose findings mention the command is denied', () => {
+  it('allows a worker submit heredoc whose findings mention the command', () => {
     const cmd = 'minions work submit lease-1 --role tester --json <<\'RESULT\'\n{"findings":["repro: run minions work release lease-1 while a runner is live"]}\nRESULT';
     expect(preBashHook(bash(cmd, sub)).stdout).toBeUndefined();
   });
-  it('FIXED (false positive): a commit message naming the command is denied', () => {
+  it('allows a commit message naming the command', () => {
     expect(preBashHook(bash('git commit -m "Add the process runner (minions work run) and the fake harness"', sub)).stdout).toBeUndefined();
   });
 });
@@ -252,8 +253,7 @@ describe('coordinatorOnlyWorkCommand: command position, not raw text', () => {
 });
 
 // Tester re-test (task-14.5 attempt 2) of the shell scanner. Normal worker commands stay allowed; wrapped,
-// substituted and heredoc-fed forms are denied. `it.fails` marks scanner gaps found in this pass: each passes while
-// the gap exists and starts failing once it is fixed (turn it into a plain `it` then).
+// substituted and heredoc-fed forms are denied. The last three cases were gaps found in this pass (fixed in task-14.13).
 describe('tester re-test: shell scanner edge cases', () => {
   it.each([
     "minions work submit lease-1 --role tester --result-file /scratch/result.json",
@@ -295,19 +295,67 @@ describe('tester re-test: shell scanner edge cases', () => {
     expect(coordinatorOnlyWorkCommand(cmd)).toMatch(/^minions work (run|claim|release)$/);
   });
 
-  it.fails('KNOWN GAP: an arithmetic shift (<<) is read as a heredoc and hides the following lines', () => {
-    // bash runs `(( … << … ))` and `$(( … << … ))` as arithmetic, then the next line; the scanner skips it as a body.
+  it('an arithmetic shift (<<) starts no heredoc and hides no following line', () => {
+    // bash runs `(( … << … ))` and `$(( … << … ))` as arithmetic, then the next line.
     expect(coordinatorOnlyWorkCommand('(( x = 1 << 2 ))\nminions work run l')).toBe('minions work run');
     expect(coordinatorOnlyWorkCommand('echo $(( 1 << 2 ))\nminions work run l')).toBe('minions work run');
     expect(coordinatorOnlyWorkCommand('x=$((1<<2))\nminions work release l')).toBe('minions work release');
   });
 
-  it.fails('KNOWN GAP: a `function name { … }` definition body is not in command position', () => {
+  it('a `function name { … }` definition body is in command position', () => {
     expect(coordinatorOnlyWorkCommand('function f { minions work run l; }; f')).toBe('minions work run');
   });
 
-  it.fails('KNOWN GAP: a script fed to a shell on stdin (heredoc or pipe) is not scanned', () => {
+  it('a script fed to a shell on stdin (heredoc, here-string or pipe) is scanned', () => {
     expect(coordinatorOnlyWorkCommand('bash <<EOF\nminions work run l\nEOF')).toBe('minions work run');
     expect(coordinatorOnlyWorkCommand('echo minions work run l | bash')).toBe('minions work run');
+  });
+
+  it.each([
+    ["sh <<'EOF'\nminions work claim t\nEOF", 'minions work claim'],
+    ['sudo bash -s <<-EOF\n\tminions work release l\n\tEOF', 'minions work release'],
+    ['bash <<< "minions work run l"', 'minions work run'],
+    ["printf '%s\\n' 'minions work run l' | sh", 'minions work run'],
+    ["printf 'cd /w\\nminions work claim t\\n' | bash", 'minions work claim'],
+    ["echo 'minions work release l' |& bash -s", 'minions work release'],
+    ["cat <<'EOF' | bash\nminions work run l\nEOF", 'minions work run'],
+    ['echo "minions work run l" |\n  bash', 'minions work run'],
+    ['echo $(( (1 << 2) > 3 )); minions work claim t', 'minions work claim'],
+    ['((cd /w && minions work run l))', 'minions work run'],
+  ])('denies stdin/arithmetic form %j', (cmd, verb) => {
+    expect(coordinatorOnlyWorkCommand(cmd)).toBe(verb);
+  });
+
+  it.each([
+    'echo minions work run l | grep minions',
+    'echo minions work run l || bash -c true',
+    "cat <<'EOF'\nminions work run l\nEOF\nbash -c 'npm test'",
+    'echo "minions work run l" > notes.txt; bash ./check.sh',
+    'echo $(( 1 << 2 )) > out.txt',
+    'function f { npm test; }; f',
+    "minions work submit lease-1 --role engineer --json <<'RESULT'\n{\"findings\":[\"bash: run minions work release l\"]}\nRESULT",
+  ])('allows %j', (cmd) => {
+    expect(coordinatorOnlyWorkCommand(cmd)).toBeNull();
+  });
+});
+
+describe('scanShell: stdin, pipes and arithmetic', () => {
+  it('keeps heredoc bodies and here-strings as the stdin of their command', () => {
+    const r = scanShell("cat <<A <<<'x y'; wc <<-B\nbody a\nA\n\tbody b\n\tB");
+    expect(r.commands).toEqual([['cat'], ['wc']]);
+    expect(r.stdin.get(r.commands[0]!)).toEqual(['x y', 'body a']);
+    expect(r.stdin.get(r.commands[1]!)).toEqual(['body b']);
+  });
+  it('links each pipeline stage to the one before it, not across || or ;', () => {
+    const r = scanShell('a 1 | b 2 |& c; d || e');
+    expect(r.commands).toEqual([['a', '1'], ['b', '2'], ['c'], ['d'], ['e']]);
+    expect(r.pipedFrom.get(r.commands[1]!)).toBe(r.commands[0]);
+    expect(r.pipedFrom.get(r.commands[2]!)).toBe(r.commands[1]);
+    expect(r.pipedFrom.has(r.commands[3]!)).toBe(false);
+    expect(r.pipedFrom.has(r.commands[4]!)).toBe(false);
+  });
+  it('reads < and > inside (( )) and $(( )) as characters, outside as redirections', () => {
+    expect(scanShell('(( x = 1 << 2 ))\nnext').commands).toEqual([['x', '=', '1', '<<', '2'], ['next']]);
+    expect(scanShell('echo $((1<<2)) >out\nnext').commands).toEqual([['1<<2'], ['echo', '\u0000'], ['next']]);
   });
 });
