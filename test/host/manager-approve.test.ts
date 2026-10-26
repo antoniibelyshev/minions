@@ -341,3 +341,186 @@ describe('/approve in the manager chat', () => {
     expect(T.HELP_TEXT).toMatch(/\/approve <task> <sha> \[merge\]/);
   });
 });
+
+// ---------------------------------------------------------------- QA (task-53.5.4): security edges
+
+describe('/approve QA: parsing edges', () => {
+  it('refuses control characters, a "-" prefix, unicode look-alikes and a flag-shaped scope', () => {
+    for (const a of [`task-12\u0000 ${HEAD}`, `task-12‮ ${HEAD}`, `task-1\u00002 ${HEAD}`, `-task-12 ${HEAD}`, `--task-12 ${HEAD}`, `task-12 -${HEAD.slice(1)}`,
+      `task-١٢ ${HEAD}`, `task‑12 ${HEAD}`, `task-12. ${HEAD}`, `task-12..3 ${HEAD}`, `task- ${HEAD}`, `task-12 ${HEAD}\u0000`, `task-12 ${HEAD} --merge`,
+      `task-12 ${HEAD} MERGE`, `task-12 ${HEAD} merge\u0000`, `${HEAD} task-12`, `task-12 ${HEAD.slice(0, 20)}​${HEAD.slice(20)}`]) {
+      expect(T.parseOwnerCommand('approve', a), JSON.stringify(a)).toBeNull();
+    }
+  });
+
+  it('buildPlan refuses control characters and a "-" prefix in a journaled payload too (the second check)', async () => {
+    const { project } = await install();
+    const s = setup([project]);
+    const d = { runtime: s.manager.runtime, upgrade: s.deps.upgrade };
+    const owner = (payload: Record<string, unknown>) => ({ id: 'ow_0a1b2c3d', kind: 'approve', payload, reason: null, origin: 'owner' as const });
+    for (const p of [{ taskId: 'task-1\n', head: HEAD, merge: false }, { taskId: '-task-1', head: HEAD, merge: false }, { taskId: 'task-1', head: `${HEAD}\n`, merge: false },
+      { taskId: 'task-1', head: 'A'.repeat(40), merge: false }, { taskId: 'task-1', head: 'c'.repeat(64), merge: false }, { taskId: 'task-1', head: HEAD }, { taskId: ['task-1'], head: HEAD, merge: false }]) {
+      expect((await reason(CR.buildPlan(project, owner(p), d))).code, JSON.stringify(p)).toBe('PRECONDITION');
+    }
+  });
+});
+
+describe('/approve QA: replay, forgery and failures', () => {
+  it('a forged nonce, or the old nonce of a re-offered request, signs nothing', async () => {
+    const { project } = await install();
+    const s = setup([project]);
+    const o = await s.cmds.propose(null, { kind: 'approve', taskId: 'task-12', head: HEAD, merge: false });
+    await s.manager.handle({ type: 'confirm', requestId: o.requestId, nonce: 'f'.repeat(o.nonce.length) });
+    expect(s.outcomes.at(-1)!.status).toBe('refused');
+    // Expire it: the confirm is refused and a fresh offer (fresh nonce) is sent.
+    await s.deps.sleep(31 * 60_000);
+    await s.confirm(o);
+    const fresh = s.offers.at(-1)!;
+    expect(fresh.nonce).not.toBe(o.nonce);
+    expect(fresh.loosens).toBe(o.loosens);
+    // The old nonce again: spent (the expired confirm did not sign, and it never will).
+    await s.confirm(o);
+    expect(s.approveCalls).toEqual([]);
+    expect(s.delegateCalls).toEqual([]);
+    // The fresh offer works once.
+    await s.confirm(fresh);
+    await s.confirm(fresh);
+    expect(s.approveCalls).toHaveLength(1);
+    expect(s.outcomes.at(-1)!.status).toBe('already-handled');
+  });
+
+  it('two concurrent confirms of the same offer sign once', async () => {
+    const { project } = await install();
+    const s = setup([project]);
+    const o = await s.cmds.propose(null, { kind: 'approve', taskId: 'task-12', head: HEAD, merge: false });
+    await Promise.all([s.confirm(o), s.confirm(o), s.confirm(o)]);
+    expect(s.approveCalls).toHaveLength(1);
+    expect(s.outcomes.filter((x) => x.status === 'applied')).toHaveLength(1);
+  });
+
+  it('a runtime that times out, or answers garbage, is a clear failed outcome; the token is not shown or logged', async () => {
+    const { project } = await install();
+    for (const answer of [{ code: 0, stdout: '', stderr: '', timedOut: true } as RunResult, { code: 1, stdout: 'not json FAKE-TOKEN-SECRET?', stderr: 'FAKE-TOKEN-SECRET' } as RunResult]) {
+      const s = setup([project]);
+      s.deps.delegate = async (_p, argv) => { s.delegateCalls.push(argv); return answer; };
+      const o = await s.cmds.propose(null, { kind: 'approve', taskId: 'task-12', head: HEAD, merge: false });
+      await s.confirm(o);
+      const last = s.outcomes.at(-1)!;
+      expect(last.status).toBe('failed');
+      expect(last.text).toMatch(answer.timedOut ? /timed out/ : /publication approval for task-12 at a{40}: no result from the runtime \(exit 1\)/);
+      expect(JSON.stringify(s.outcomes)).not.toContain('FAKE-TOKEN-SECRET');
+      expect(s.logs.join('\n')).not.toContain('FAKE-TOKEN-SECRET');
+      expect(readFileSync(J.journalPath(), 'utf8')).not.toContain('FAKE-TOKEN-SECRET');
+    }
+  });
+
+  it('a failed approval is final for that offer: confirming it again signs nothing more', async () => {
+    const { project } = await install();
+    const s = setup([project], { awaiting: OTHER });
+    const o = await s.cmds.propose(null, { kind: 'approve', taskId: 'task-12', head: HEAD, merge: true });
+    await s.confirm(o);
+    expect(s.outcomes.at(-1)!.status).toBe('failed');
+    await s.confirm(o);
+    expect(s.outcomes.at(-1)!.status).toBe('already-handled');
+    expect(s.approveCalls).toHaveLength(1);
+    expect(readFileSync(J.journalPath(), 'utf8')).not.toContain('FAKE-TOKEN-SECRET');
+    expect(s.logs.join('\n')).not.toContain('FAKE-TOKEN-SECRET');
+  });
+
+  it('a container row of kind approve (even claiming the owner origin) is never offered or signed', async () => {
+    const { project } = await install();
+    const s = setup([project]);
+    const rows = [{ id: 'cr_0a1b2c3d', kind: 'approve', status: 'proposed', payload: { taskId: 'task-12', head: HEAD, merge: false }, reason: 'please', origin: 'owner' },
+      { id: 'cr_0a1b2c3e', kind: 'approve', status: 'proposed', payload: { taskId: 'task-12', head: HEAD, merge: true }, reason: null }];
+    s.deps.delegate = async (_p, argv) => { s.delegateCalls.push(argv); return ok({ requests: rows }); };
+    expect(await s.manager.pollProject(project)).toEqual([]);
+    expect(s.offers).toEqual([]);
+    expect(journal().filter((e) => e.type === 'offer')).toEqual([]);
+    expect(s.outcomes.every((x) => x.status === 'error')).toBe(true);
+    expect(s.approveCalls).toEqual([]);
+  });
+
+  it('after `settings apply --confirm` refused it in the terminal, the chat confirm of that offer signs nothing either', async () => {
+    const { project } = await install();
+    const s = setup([project]);
+    const o = await s.cmds.propose(null, { kind: 'approve', taskId: 'task-12', head: HEAD, merge: false });
+    await reason(CR.confirmRequest(project, o.requestId, o.digest, { runtime: s.manager.runtime, upgrade: s.deps.upgrade, now: s.deps.now }));
+    await s.confirm(o);
+    expect(s.outcomes.at(-1)!.status).toBe('already-handled');
+    expect(s.approveCalls).toEqual([]);
+    expect(s.delegateCalls.filter((a) => a[2] === 'approve')).toEqual([]);
+  });
+});
+
+describe('/approve QA: the chat side', () => {
+  const foreign = (update_id: number, text: string, o: { from?: number; chat?: number; type?: string; extra?: Record<string, unknown> } = {}): TelegramUpdate => ({
+    update_id, message: { message_id: 2000 + update_id, text, from: { id: o.from ?? OWNER, is_bot: false }, chat: { id: o.chat ?? OWNER, type: o.type ?? 'private' }, ...(o.extra ?? {}) } as never,
+  });
+
+  it('a forwarded /approve, or one from another user, chat or group, is ignored: no reply, nothing journaled', async () => {
+    const { project } = await install();
+    const s = setup([project]);
+    const cmd = `/approve task-12 ${HEAD} merge`;
+    const api = botApi([[
+      foreign(1, cmd, { extra: { forward_origin: { type: 'user', sender_user: { id: OWNER } } } }),
+      foreign(2, cmd, { extra: { forward_from: { id: OWNER } } }),
+      foreign(3, cmd, { extra: { forward_date: 1 } }),
+      foreign(4, cmd, { from: 999 }),
+      foreign(5, cmd, { chat: -100123, type: 'group' }),
+      foreign(6, cmd, { from: 999, chat: 999 }),
+    ]]);
+    const t = T.telegramTransport({ token: TOKEN, access: ACCESS, fetch: api.f, now: () => api.clock.t, sleep: async () => undefined });
+    t.attach(s.cmds);
+    expect(await t.receive(30_000)).toEqual([]);
+    expect(api.sent()).toEqual([]);
+    expect(journal()).toEqual([]);
+  });
+
+  it('a non-owner tap on an approve offer does nothing; a forged "Confirm again" without the first tap is expired', async () => {
+    const { project } = await install();
+    const s = setup([project]);
+    const o = await s.cmds.propose(null, { kind: 'approve', taskId: 'task-12', head: HEAD, merge: false });
+    const strangerTap: TelegramUpdate = { update_id: 1, callback_query: { id: 'cb1', data: T.callbackData('c', o.requestId, o.nonce), from: { id: 999 }, message: { message_id: 50, chat: { id: 999, type: 'private' } } } };
+    const api = botApi([[strangerTap, tap(2, T.callbackData('d', o.requestId, o.nonce))]]);
+    const t = T.telegramTransport({ token: TOKEN, access: ACCESS, fetch: api.f, now: () => api.clock.t, sleep: async () => undefined });
+    t.attach(s.cmds);
+    expect(await t.receive(30_000)).toEqual([]);
+    expect(api.texts()).toHaveLength(1);
+    expect(api.texts()[0]).toMatch(/second confirmation .* expired/);
+    expect(api.calls.filter((c) => c.method === 'answerCallbackQuery').map((c) => c.body.callback_query_id)).toEqual(['cb2']);
+    expect(s.approveCalls).toEqual([]);
+  });
+
+  it('/approve@bot works; a flag-shaped scope gets the usage line', async () => {
+    const { project } = await install();
+    const s = setup([project]);
+    const api = botApi([[msg(1, `/approve task-12 ${HEAD} --merge`), msg(2, `/approve@MinionsManagerBot task-12 ${HEAD}`)]]);
+    const t = T.telegramTransport({ token: TOKEN, access: ACCESS, fetch: api.f, now: () => api.clock.t, sleep: async () => undefined });
+    t.attach(s.cmds);
+    await t.receive(30_000);
+    expect(api.texts()[0]).toMatch(/^Usage: \/approve/);
+    expect(api.texts()[1]).toMatch(/^Your request ow_[0-9a-f]{8} .*approve publishing task-12 at a{40}/);
+    expect(journal().map((e) => e.type)).toEqual(['offer']);
+    expect(s.approveCalls).toEqual([]);
+  });
+
+  // Known gap (QA finding): approveOutcome shows the runtime's refusal message as written, so a runtime that echoes
+  // the --signature argument puts the token in the chat, the manager log and the journal. The runtime already holds the
+  // token (it is the recipient), so the host key does not leak, but the "never shown" property does not hold. it.fails:
+  // turns red once approveOutcome scrubs the token; make it a plain it() then.
+  it.fails('a hostile runtime that echoes the token in its refusal does not get it into the chat, the log or the journal', async () => {
+    const { project } = await install();
+    const s = setup([project]);
+    s.deps.delegate = async (_p, argv) => {
+      s.delegateCalls.push(argv);
+      return refused('CONFLICT', `bad signature ${argv[argv.indexOf('--signature') + 1]}`);
+    };
+    const o = await s.cmds.propose(null, { kind: 'approve', taskId: 'task-12', head: HEAD, merge: false });
+    await s.confirm(o);
+    expect(s.outcomes.at(-1)!.status).toBe('failed');
+    expect(s.outcomes.at(-1)!.text).toContain('refused by the runtime');
+    expect(JSON.stringify(s.outcomes)).not.toContain('FAKE-TOKEN-SECRET');
+    expect(s.logs.join('\n')).not.toContain('FAKE-TOKEN-SECRET');
+    expect(readFileSync(J.journalPath(), 'utf8')).not.toContain('FAKE-TOKEN-SECRET');
+  });
+});
