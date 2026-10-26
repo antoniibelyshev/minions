@@ -151,15 +151,23 @@ describe('reusable helpers', () => {
 
   it('does not poll back to back with timeout 0 in the last second before the deadline', async () => {
     const b = api([]);
-    // A fake clock that does not advance on the empty poll: a tight loop would never end.
-    let polls = 0;
+    // Short TTL and polls that return quickly (400 ms of fake time each, never 1 s+): the old loop reached
+    // timeout-0 polls in the last second. The clock otherwise moves only through the fake sleep.
+    const timeouts: number[] = [];
+    let overflow = false;
     const f = (async (url: string | URL | Request, init?: RequestInit) => {
-      if (String(url).endsWith('/getUpdates')) { polls++; if (polls > 100) throw new Error('tight loop'); }
+      if (String(url).endsWith('/getUpdates')) {
+        const body = JSON.parse(String(init?.body ?? '{}')) as { timeout?: number };
+        timeouts.push(Number(body.timeout));
+        if (timeouts.length > 20) { overflow = true; b.clock.t += 10 * 60_000; } else b.clock.t += 400;
+        return new Response(JSON.stringify({ ok: true, result: [] }), { status: 200 });
+      }
       return b.f(url, init);
     }) as typeof fetch;
-    const r = await M.pairManagerBot({ token: MGR, botId: '555666777', fetch: f, now: b.now, sleep: b.sleep, code: 'AAAA-BBBB' });
+    const r = await M.pairManagerBot({ token: MGR, botId: '555666777', fetch: f, now: b.now, sleep: b.sleep, code: 'AAAA-BBBB', ttlMs: 1500 });
     expect(r.status).toBe('expired');
-    expect(b.sent.filter((s) => s.method === 'getUpdates' && s.body.timeout === 0)).toEqual([]);
-    expect(polls).toBeLessThan(40);
+    expect(overflow).toBe(false);
+    expect(timeouts).not.toContain(0);
+    expect(timeouts.length).toBeLessThanOrEqual(3);
   });
 });
