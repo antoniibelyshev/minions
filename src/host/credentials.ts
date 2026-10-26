@@ -770,11 +770,12 @@ export async function managerCredentialStatus(opts: { runner?: Runner } = {}): P
   try {
     if (checkTelegramTokenFormat(token).botId !== ref.botId) problems.push('stored token does not match the recorded bot id');
   } catch { problems.push('stored value is not a Telegram bot token'); }
+  let modeProblem = false;
   if (ref.backend === 'file') {
     const p = await fileModeProblem(MANAGER_CREDENTIAL, MANAGER_ACCOUNT);
-    if (p) problems.push(p);
+    if (p) { problems.push(p); modeProblem = true; }
   }
-  const where = shortWhere(ref.backend);
+  const where = modeProblem ? "host file" : shortWhere(ref.backend);
   return { state: problems.length ? 'invalid' : 'ok', backend: ref.backend, botId: ref.botId, detail: [`bot ${ref.botId}; stored in ${where}`, ...problems].join('; ') };
 }
 
