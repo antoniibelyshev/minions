@@ -24,6 +24,8 @@ import { loadEffectiveConfig, loadProjectJson } from './project.js';
 import { checkPlugin, pluginMismatch, type PluginCheck } from './install.js';
 import { projectForPath } from './registry.js';
 import { githubHints, inspectGithub } from './github-setup.js';
+import { harnessChecks, harnessSkipChecks, parseWorkProbe } from './harness-checks.js';
+import { harnessView } from '../runtime/sandbox/probe.js';
 import { HOST_RUNTIME_SHORT, HostRuntime, hostTools, prepareHostRuntime, runtimeOf } from './runtime.js';
 import type { ProjectJson } from './project.js';
 import { projectPaths } from '../core/paths.js';
@@ -579,9 +581,12 @@ export async function runDoctor(opts: {
     }
     let tgPlugin: Check | undefined;
 
+    // Process harnesses (D7): only when the config assigns one; Claude-only projects get no harness.* checks.
+    const harnesses = harnessView(config);
     if (hostMode) {
       restart = notApplicable('host runtime: no container to restart');
       tgPlugin = await hostRuntimeChecks(project, auth, baseUrl, wantsTelegram, runner, add, checks);
+      checks.push(...harnessSkipChecks(harnesses, 'host-runtime'));
     } else if (docker.daemon && docker.compose) {
       const label = await imageBuildLabel(project.imageTag, runner);
       const fp = opts.fingerprint !== undefined ? opts.fingerprint : buildFingerprint();
@@ -630,13 +635,20 @@ export async function runDoctor(opts: {
         // Credential-free; never 'fail' because terminal mode must stay usable without Telegram.
         tgPlugin = await telegramRuntimeChecks(ex, wantsTelegram, checks);
         if (github.onGitHub) ci = { rc: parseCiStatus(await ex(['minions', 'ci', 'status', '--json'])) };
+        // The self-test takes a few seconds on the first run per container start (cached after that).
+        if (harnesses.processHarnesses.length) {
+          const probe = await compose.exec(['minions', 'work', 'probe', '--json'], { allowFailure: true, timeoutMs: 180_000 });
+          checks.push(...harnessChecks(harnesses, parseWorkProbe(probe)));
+        }
       } else {
         for (const n of ['claude.auth', ...(baseUrl ? ['claude.baseUrl'] : []), 'container.tmp', 'container.scratch', 'backlog.cli', 'claude.capabilities', 'telegram.plugin']) add(n, 'warn', 'skipped: container not running');
+        checks.push(...harnessSkipChecks(harnesses, 'not-running'));
       }
       restart = await checkRestartRequired({ projectId: project.projectId, imageTag: project.imageTag, compose, runner,
         ...(opts.fingerprint !== undefined ? { fingerprint: opts.fingerprint } : {}), ...(opts.version !== undefined ? { version: opts.version } : {}) });
     } else {
       add('container', 'fail', 'skipped: Docker unavailable');
+      checks.push(...harnessSkipChecks(harnesses, 'no-docker'));
       restart = restartUnknown('Docker unavailable');
     }
     if (github.onGitHub && !ci.rc) ci = await hostRequiredChecks(project, config, github.credential, runner, opts.fetch);

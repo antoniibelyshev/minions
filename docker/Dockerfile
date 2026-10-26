@@ -38,6 +38,17 @@ RUN mkdir /gh/out \
  && tar -xzf "/gh/${TARGETARCH}.tar.gz" -C /gh/out --strip-components=1 "gh_${GH_VERSION}_linux_${TARGETARCH}/bin/gh" \
  && /gh/out/bin/gh --version | grep -q "^gh version ${GH_VERSION} "
 
+# minions-sandbox: the isolation wrapper for process-harness workers (Landlock, seccomp, process-lifetime
+# supervisor; docs/design/agent-runtimes.md D4), one small C file in docker/minions-sandbox/. Compiler image
+# pinned by multi-arch index digest (gcc:14.3.0-bookworm, resolved 2026-10-23). The binary is static, so
+# only it reaches the runtime image.
+FROM gcc:14.3.0-bookworm@sha256:5e927c284bf55a7dc796262e311a0703344f62f41f5621eb56843111b1d37e15 AS sandbox
+COPY docker/minions-sandbox/minions-sandbox.c /src/minions-sandbox.c
+RUN mkdir /out \
+ && gcc -std=gnu11 -O2 -Wall -Wextra -fstack-protector-strong -D_FORTIFY_SOURCE=2 -static -s \
+      -o /out/minions-sandbox /src/minions-sandbox.c \
+ && /out/minions-sandbox --version | grep -q "^minions-sandbox 1.0.0 "
+
 
 FROM base
 
@@ -55,11 +66,12 @@ RUN npm install -g --no-fund --no-audit \
  && rm -rf /root/.npm /tmp/*
 
 COPY --from=bun /usr/local/bin/bun /usr/local/bin/bun
+COPY --from=sandbox /out/minions-sandbox /usr/local/bin/minions-sandbox
 
 # Real gh off PATH; /usr/local/bin/gh is the wrapper that reads the mounted token at exec time.
 COPY --from=gh /gh/out/bin/gh /opt/gh/bin/gh
 COPY docker/gh-wrapper.sh /usr/local/bin/gh
-RUN chmod 0755 /opt/gh/bin/gh /usr/local/bin/gh
+RUN chmod 0755 /opt/gh/bin/gh /usr/local/bin/gh /usr/local/bin/minions-sandbox
 
 COPY package.json /opt/minions/pkg/package.json
 COPY dist/ /opt/minions/pkg/dist/

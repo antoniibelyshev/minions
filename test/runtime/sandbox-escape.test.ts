@@ -1,0 +1,555 @@
+// task-14.3 QA: adversarial escape attempts against the real minions-sandbox helper, under the rules
+// buildSandboxRules generates for an engineer (producer) and a reviewer (gate). Runs only when a built
+// helper with Landlock ABI >= 6 and /usr/bin/perl are available (MINIONS_SANDBOX_TEST_BIN, or the image
+// path), on x86_64 or aarch64. Every attempt is a Perl script inside the sandbox; the outside view
+// (listener logs, the outside process's signals, nice value and affinity, fixture metadata) is checked too.
+//
+// The TCP Fast Open, metadata-write (chmod/utime/setxattr) and outside-scheduling escapes found in the
+// first QA pass are now closed by the seccomp filter and its chmod user-notification handler; the matching
+// tests assert they stay closed. A separate test proves git still works (path chmod inside the worktree).
+import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
+import { accessSync, constants, existsSync } from 'node:fs';
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { createServer, type Server } from 'node:net';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { run } from '../../src/core/exec.js';
+import { SANDBOX_BIN, buildSandboxRules, sandboxArgv, serializeRules, type SandboxRoleView } from '../../src/runtime/sandbox/rules.js';
+
+function realHelper(): string | null {
+  const bin = process.env.MINIONS_SANDBOX_TEST_BIN || SANDBOX_BIN;
+  try {
+    accessSync(bin, constants.X_OK);
+    return Number(execFileSync(bin, ['--abi'], { encoding: 'utf8' }).trim()) >= 6 ? bin : null;
+  } catch { return null; }
+}
+
+/** Syscalls from the unified table (Linux 6.13+): the same number on every architecture. */
+const UNIFIED = { setxattrat: 463, removexattrat: 466, file_setattr: 469, fchmodat2: 452 };
+/** Syscall numbers the script needs that Perl has no builtin for. */
+const NR: Record<string, Record<string, number>> = {
+  arm64: { ptrace: 117, pidfd_open: 434, pidfd_send_signal: 424, pidfd_getfd: 438, tgkill: 131, sched_setaffinity: 122, ioprio_set: 30, ioprio_get: 31, io_uring_setup: 425, setxattr: 5, fsetxattr: 7, ioctl: 29, unshare: 97, setpriority: 140, getpriority: 141, fchmodat: 53, ...UNIFIED },
+  x64: { ptrace: 101, pidfd_open: 434, pidfd_send_signal: 424, pidfd_getfd: 438, tgkill: 234, sched_setaffinity: 203, ioprio_set: 251, ioprio_get: 252, io_uring_setup: 425, setxattr: 188, fsetxattr: 190, ioctl: 16, unshare: 272, setpriority: 141, getpriority: 140, fchmodat: 268, ...UNIFIED },
+};
+const REAL = realHelper();
+const SYS = NR[process.arch];
+const PERL = existsSync('/usr/bin/perl') ? '/usr/bin/perl' : null;
+
+/** Prints `name \t ok|denied \t detail` per attempt; `ok` means the operation succeeded. */
+const ATTACK = String.raw`
+use strict; use warnings; use Socket qw(:all); use POSIX (); use JSON::PP;
+$| = 1;
+my $c = decode_json(do { local $/; open(my $f, '<', $ARGV[0]) or die "plan: $!"; <$f> });
+my %nr = %{$c->{nr}};
+sub r { my ($n, $ok, $d) = @_; print join("\t", $n, $ok ? 'ok' : 'denied', $d // ''), "\n"; }
+sub sc { my $n = shift; syscall($nr{$n}, @_) }
+for my $p (@{$c->{read}}) {
+  if (-d $p) { my $ok = opendir(my $d, $p); r("read:$p", $ok, "$!"); }
+  else { my $ok = open(my $f, '<', $p); r("read:$p", $ok, "$!"); }
+}
+for my $d (@{$c->{write}}) {
+  my $ok = sysopen(my $f, "$d/.escape-$$", POSIX::O_WRONLY|POSIX::O_CREAT|POSIX::O_EXCL, 0600);
+  if ($ok) { close $f; unlink "$d/.escape-$$"; }
+  r("create:$d", $ok, "$!");
+  $ok = mkdir("$d/.escdir-$$"); rmdir "$d/.escdir-$$" if $ok;
+  r("mkdir:$d", $ok, "$!");
+}
+my $file = $c->{protectedFile};
+{ my $ok = open(my $h, '>>', $file); r('append:protected', $ok, "$!"); }
+r('truncate:protected', truncate($file, 0), "$!");
+r('unlink:protected', unlink($file), "$!");
+r('rename:protected', rename($file, "$file.moved"), "$!");
+r('hardlink:protected->scratch', link($file, "$c->{scratch}/hl-$$"), "$!");
+r('rename:protected->scratch', rename($file, "$c->{scratch}/mv-$$"), "$!");
+symlink($file, "$c->{scratch}/sym-$$");
+{ my $ok = open(my $h, '<', "$c->{scratch}/sym-$$"); r('read:via-symlink', $ok, "$!"); }
+{ my $ok = open(my $h, '<', "/proc/self/root$file"); r('read:via-proc-self-root', $ok, "$!"); }
+r('chmod:protected', chmod(0640, $file), "$!");
+{ my $sym = "$c->{scratch}/chsym-$$"; symlink($file, $sym);
+  r('chmod:via-symlink', chmod(0777, $sym), "$!"); unlink $sym; }
+r('chmod:via-proc-self-root', chmod(0777, "/proc/self/root$file"), "$!");
+{ my $w = "$c->{scratch}/chmod-ok-$$"; my $h; open($h, '>', $w) and close($h);
+  r('chmod:scratch-allowed', chmod(0750, $w), "$!"); unlink $w; }
+r('utime:protected', utime(1, 1, $file), "$!");
+# The chmod notify handler follows the kernel's rules: an empty path is ENOENT unless AT_EMPTY_PATH, which names
+# the dirfd itself (any file); AT_SYMLINK_NOFOLLOW on a symlink is EOPNOTSUPP; a bad pointer is EFAULT. An O_PATH
+# fd to a protected file stays refused through AT_EMPTY_PATH.
+{ my ($empty, $w, $l) = ('', "$c->{scratch}/chmod-flags-$$", "$c->{scratch}/chmod-flags-link-$$");
+  my $h; open($h, '>', $w) and close($h); symlink($w, $l);
+  r('fchmodat:empty-path', sc('fchmodat', -100, $empty, 0750) == 0, "$!");
+  sysopen(my $ws, $w, $c->{oPath} + 0) or die "O_PATH $w: $!";
+  r('fchmodat2:empty-path-scratch', sc('fchmodat2', fileno($ws), $empty, 0751, 0x1000) == 0, "$!");
+  r('fchmodat2:nofollow-symlink', sc('fchmodat2', -100, $l, 0752, 0x100) == 0, "$!");
+  r('fchmodat2:nofollow-file', sc('fchmodat2', -100, $w, 0753, 0x100) == 0, "$!");
+  r('fchmodat2:bad-pointer', sc('fchmodat2', -100, 16, 0754, 0) == 0, "$!");
+  my $ok = sysopen(my $pp, $file, $c->{oPath} + 0);
+  r('fchmodat2:empty-path-protected', $ok && sc('fchmodat2', fileno($pp), $empty, 0, 0x1000) == 0, $ok ? "$!" : "O_PATH open: $!");
+  print join("\t", 'mode:scratch-file', 'ok', sprintf('%o', (stat($w))[2] & 07777)), "\n"; unlink $l, $w; }
+{ my ($n, $v) = ('user.minions-escape', 'x'); r('setxattr:protected', sc('setxattr', $file, $n, $v, 1, 0) == 0, "$!"); }
+# chmod 000 under another name: a POSIX access ACL with no permissions rewrites the mode bits. By path, and
+# through an O_PATH fd (Landlock lets O_PATH open a protected file) with AT_EMPTY_PATH.
+{ my $acl = pack('L<', 2) . pack('S<S<L<', 1, 0, 0xffffffff) . pack('S<S<L<', 4, 0, 0xffffffff) . pack('S<S<L<', 0x20, 0, 0xffffffff);
+  my $args = pack('QLL', unpack('Q', pack('p', $acl)), length($acl), 0);
+  my ($an, $empty, $un) = ('system.posix_acl_access', '', 'user.minions-escape'); # syscall() needs variables, not literals
+  r('setxattrat:acl-protected', sc('setxattrat', -100, $file, 0, $an, $args, length($args)) == 0, "$!");
+  my $opath = sysopen(my $op, $file, $c->{oPath} + 0);
+  r('setxattrat:acl-opath', $opath && sc('setxattrat', fileno($op), $empty, 0x1000, $an, $args, length($args)) == 0, $opath ? "$!" : "O_PATH open: $!");
+  r('removexattrat:protected', sc('removexattrat', -100, $file, 0, $un) == 0, "$!");
+  my $fa = pack('QQ', 0, 0); # struct file_attr: fa_xflags 0 would clear the inode flags
+  r('file_setattr:protected', sc('file_setattr', -100, $file, $fa, length($fa), 0) == 0, "$!"); }
+# fsetxattr on an fd to the protected file (round 3). Landlock lets O_PATH open a protected file, so a worker
+# can hold such an fd; fsetxattr of a system.posix_acl_access ACL with no bits would be chmod 000 by another
+# name. fsetxattr is denied outright by the seccomp filter, so neither an O_PATH fd nor one reopened through
+# /proc/self/fd can rewrite the mode.
+{ my $an = 'system.posix_acl_access';
+  my $acl = pack('L<', 2) . pack('S<S<L<', 1, 0, 0xffffffff) . pack('S<S<L<', 4, 0, 0xffffffff) . pack('S<S<L<', 0x20, 0, 0xffffffff);
+  my $opath = sysopen(my $op, $file, $c->{oPath} + 0);
+  r('fsetxattr:opath-protected', $opath && sc('fsetxattr', fileno($op), $an, $acl, length($acl), 0) == 0, $opath ? "$!" : "O_PATH open: $!");
+  if ($opath) { my $re = sysopen(my $rf, "/proc/self/fd/" . fileno($op), $c->{oPath} + 0);
+    r('fsetxattr:reopened-protected', $re && sc('fsetxattr', fileno($rf), $an, $acl, length($acl), 0) == 0, $re ? "$!" : "reopen: $!"); }
+  else { r('fsetxattr:reopened-protected', 0, 'no O_PATH fd'); } }
+
+my $p = $c->{outsidePid} + 0;
+r('kill0:outside', kill(0, $p), "$!");
+r('kill-usr1:outside', kill('USR1', $p), "$!");
+r('tgkill0:outside', sc('tgkill', $p, $p, 0) == 0, "$!");
+{ my $ok = open(my $h, '<', "/proc/$p/environ"); r('read:/proc/outside/environ', $ok, "$!"); }
+{ my $ok = open(my $h, '<', "/proc/$p/mem"); r('read:/proc/outside/mem', $ok, "$!"); }
+{ my $l = readlink("/proc/$p/cwd"); r('readlink:/proc/outside/cwd', defined $l, "$!"); }
+{ my $ok = sc('ptrace', 0x4206, $p, 0, 0) == 0; r('ptrace-seize:outside', $ok, "$!"); sc('ptrace', 17, $p, 0, 0) if $ok; }
+{ my $fd = sc('pidfd_open', $p, 0);
+  r('pidfd_send_signal:outside', $fd >= 0 && sc('pidfd_send_signal', $fd, 10, 0, 0) == 0, "$!");
+  r('pidfd_getfd:outside', $fd >= 0 && sc('pidfd_getfd', $fd, 0, 0) >= 0, "$!"); }
+{ socketpair(my $a, my $b, AF_UNIX, SOCK_STREAM, 0) or die "socketpair: $!";
+  fcntl($a, 8, $p); my $fl = fcntl($a, 3, 0); fcntl($a, 4, $fl | ($c->{oAsync} + 0)); syswrite($b, 'x');
+  select(undef, undef, undef, 0.2); }
+r('setpriority:outside', setpriority(0, $p, 7), "$!");
+{ my $mask = pack('Q', 1); r('sched_setaffinity:outside', sc('sched_setaffinity', $p, 8, $mask) == 0, "$!"); }
+r('ioprio_set:outside', sc('ioprio_set', 1, $p, 3 << 13) == 0, "$!");
+# PRIO_USER with who 0 is every process of the uid. Setting it is not attempted (a broken filter would
+# renice the whole uid, the coordinator included); reading it and an out-of-range which take the same
+# filter path. The positive controls: the process itself (set and get) and reading its own group stay allowed.
+{ $! = 0; my $v = sc('getpriority', 2, 0); r('getpriority:user', $v != -1, "$!"); }
+r('setpriority:which-out-of-range', sc('setpriority', 3, 0, 0) == 0, "$!");
+# Round 3: PRIO_PGRP with a nonzero target (an explicit process-group id, the sandbox's own included) and
+# PRIO_USER with a nonzero uid. The set calls allow only PRIO_PROCESS/IOPRIO_WHO_PROCESS with target 0, so
+# every one of these must be EPERM and the outside process's nice must not move.
+r('setpriority:pgrp-nonzero', sc('setpriority', 1, $p, 7) == 0, "$!");
+r('setpriority:user-nonzero', sc('setpriority', 2, 1, 7) == 0, "$!");
+r('ioprio_set:pgrp-nonzero', sc('ioprio_set', 2, $p, 3 << 13) == 0, "$!");
+{ my $cur = getpriority(0, 0); r('setpriority:self-allowed', setpriority(0, 0, $cur), "$!");
+  $! = 0; my $g = sc('getpriority', 1, 0); r('getpriority:own-group-allowed', $g != -1, "$!"); }
+# Round 4: join an outside process group, then renice / IO-deprioritise "my group" (target 0). setpgid(2)
+# accepts any group of the caller's session, so this worked while the sandbox shared the runner's session
+# and the filter allowed PRIO_PGRP/IOPRIO_WHO_PGRP with 0. The wrapper's own session must refuse the join
+# (EPERM), and the filter must refuse both group forms even so. The outside group is a lone process that the
+# test spawned in the test's session and that made a group of its own, so a broken helper can only renice
+# that process. Run in a throwaway child so the rest of the script keeps its group.
+{ open(my $st, '<', '/proc/self/stat') or die "/proc/self/stat: $!"; my $l = <$st>; $l =~ s/^.*\) //;
+  my @f = split / /, $l; print join("\t", 'ids', 'ok', "pgrp=$f[2] sid=$f[3] ppid=" . getppid()), "\n"; }
+{ my $g = $c->{outsideGroup} + 0; my $kid = fork;
+  if (defined $kid && !$kid) {
+    r('setpgid:outside-group', setpgrp(0, $g), "$!");
+    r('setpgid:joined', getpgrp(0) == $g, 'pgrp=' . getpgrp(0));
+    r('setpriority:pgrp-joined', sc('setpriority', 1, 0, 7) == 0, "$!");
+    r('ioprio_set:pgrp-joined', sc('ioprio_set', 2, 0, 3 << 13) == 0, "$!");
+    POSIX::_exit(0); }
+  waitpid($kid, 0) if $kid; }
+# Terminal input injection, on a non-tty so a broken filter injects nothing (ENOTTY without the rule).
+{ open(my $n, '<', '/dev/null') or die "/dev/null: $!"; my $ch = 'x';
+  r('ioctl:TIOCSTI', ioctl($n, 0x5412, $ch), "$!"); r('ioctl:TIOCLINUX', ioctl($n, 0x541C, $ch), "$!");
+  # Round 3: the ioctl request is an unsigned int; the kernel truncates it, and the filter must compare only
+  # the low 32 bits. TIOCSTI with the upper 32 bits set (0x1_0000_5412) is still TIOCSTI to the kernel and
+  # must stay denied; if the filter looked at the wrong word it would wave this through.
+  my $addr = unpack('Q', pack('P', $ch));
+  r('ioctl:TIOCSTI-hi', sc('ioctl', fileno($n), 0x100005412, $addr) == 0, "$!"); }
+
+r('socket:AF_UNIX', socket(my $u, AF_UNIX, SOCK_STREAM, 0), "$!");
+r('socket:AF_UNIX-dgram', socket(my $ud, AF_UNIX, SOCK_DGRAM, 0), "$!");
+r('socket:AF_PACKET', socket(my $pk, 17, SOCK_RAW, 0), "$!");
+r('socket:raw-icmp', socket(my $ri, AF_INET, SOCK_RAW, 1), "$!");
+r('socket:raw-ipv6', socket(my $r6, AF_INET6, SOCK_RAW, 58), "$!");
+r('socket:AF_ALG', socket(my $alg, 38, 5, 0), "$!");
+r('socket:AF_VSOCK', socket(my $vs, 40, SOCK_STREAM, 0), "$!");
+r('socket:MPTCP', socket(my $mp, AF_INET, SOCK_STREAM, 262), "$!");
+r('socket:MPTCP6', socket(my $mp6, AF_INET6, SOCK_STREAM, 262), "$!");
+{ my $b = "\0" x 256; r('io_uring_setup', sc('io_uring_setup', 4, $b) >= 0, "$!"); }
+r('unshare:user', sc('unshare', 0x10000000) == 0, "$!");
+
+my $port = $c->{port} + 0;
+for my $a (['127.0.0.1', AF_INET], ['::1', AF_INET6], ['::ffff:127.0.0.1', AF_INET6]) {
+  socket(my $s, $a->[1], SOCK_STREAM, 0) or do { r("tcp-connect:$a->[0]", 0, "socket: $!"); next };
+  my $sa = $a->[1] == AF_INET ? pack_sockaddr_in($port, inet_aton($a->[0])) : pack_sockaddr_in6($port, inet_pton(AF_INET6, $a->[0]));
+  r("tcp-connect:$a->[0]", connect($s, $sa), "$!");
+}
+{ socket(my $t, AF_INET, SOCK_STREAM, 0);
+  my $n = send($t, "fastopen\n", MSG_FASTOPEN, pack_sockaddr_in($port, inet_aton('127.0.0.1')));
+  r('tcp-fastopen:127.0.0.1', defined $n, "$!"); select(undef, undef, undef, 0.3); }
+{ socket(my $fc, AF_INET, SOCK_STREAM, 0);
+  my $ok = setsockopt($fc, IPPROTO_TCP, 30, pack('l', 1)); # TCP_FASTOPEN_CONNECT = 30
+  r('tcp-fastopen-connect:setsockopt', defined $ok, "$!");
+  r('tcp-fastopen-connect:connect', connect($fc, pack_sockaddr_in($port, inet_aton('127.0.0.1'))), "$!");
+  select(undef, undef, undef, 0.3); }
+# Round-2 regression: chmod TOCTOU. A child swaps a scratch symlink between a writable file and the protected
+# file while the parent chmods the symlink path. The notify handler pins the resolved inode via O_PATH and
+# rechecks it is writable before chmodding, so a swap landing on the protected file after the check cannot
+# redirect the chmod. The protected mode is asserted unchanged outside (protectedMetadataChanged).
+{ my $sym = "$c->{scratch}/race-$$"; my $w = "$c->{scratch}/race-target-$$";
+  my $h; open($h, '>', $w) and close($h);
+  my $kid = fork;
+  if (defined $kid && !$kid) { for (1 .. 40000) { unlink $sym; symlink($file, $sym); unlink $sym; symlink($w, $sym); } POSIX::_exit(0); }
+  my $hits = 0; for (1 .. 40000) { $hits++ if chmod(0777, $sym); }
+  waitpid($kid, 0) if $kid; unlink $sym, $w;
+  r('chmod:toctou-race', 1, "chmods=$hits"); }
+print "end\n";
+`;
+
+interface Outside { pid: number; signals: string[]; proc: ChildProcess }
+
+describe.skipIf(!REAL || !SYS || !PERL)('minions-sandbox escape attempts (real helper, engineer and gate rules)', () => {
+  const bin = REAL!;
+  let root: string;
+  let server: Server;
+  let port = 0;
+  const tcpSeen: string[] = [];
+  let outside: Outside;
+  let outsideGroup: { pid: number; proc: ChildProcess; state: () => Promise<string> };
+
+  beforeAll(async () => {
+    root = await mkdtemp(join(tmpdir(), 'sbx-escape-'));
+    server = createServer((s) => { tcpSeen.push('connection'); s.on('data', (d) => tcpSeen.push(String(d))); s.end(); });
+    await new Promise<void>((r) => server.listen(0, '::', () => r()));
+    port = (server.address() as { port: number }).port;
+    // An unrelated process outside the sandbox (stands in for the coordinator/runner): logs every signal.
+    const proc = spawn(PERL!, ['-e', '$|=1; for my $s (qw(IO USR1 USR2 URG)) { $SIG{$s} = sub { print "SIG$_[0]\\n" } } print "ready\\n"; sleep 1 while 1;'], { stdio: ['ignore', 'pipe', 'ignore'] });
+    const signals: string[] = [];
+    await new Promise<void>((r) => proc.stdout!.on('data', (d: Buffer) => { for (const l of String(d).split('\n').filter(Boolean)) { if (l === 'ready') r(); else signals.push(l); } }));
+    outside = { pid: proc.pid!, signals, proc };
+    // A joinable outside process group: a lone process in the test's session (the session the wrapper is
+    // started from) that leads a group of its own. Each line on stdin makes it report its nice value and
+    // its IO priority, read by the process itself.
+    const gproc = spawn(PERL!, ['-e', `setpgrp(0, 0) or die "setpgrp: $!"; $| = 1; print "ready\\n";
+      while (<STDIN>) { my $n = getpriority(0, 0); my $io = syscall(${SYS!.ioprio_get}, 1, 0); print "state $n $io\\n"; }`], { stdio: ['pipe', 'pipe', 'ignore'] });
+    const waiters: ((s: string) => void)[] = [];
+    await new Promise<void>((r) => {
+      let buf = '';
+      gproc.stdout!.on('data', (d: Buffer) => {
+        buf += String(d);
+        let i;
+        while ((i = buf.indexOf('\n')) >= 0) {
+          const l = buf.slice(0, i); buf = buf.slice(i + 1);
+          if (l === 'ready') r(); else if (l.startsWith('state ')) waiters.shift()?.(l.slice(6));
+        }
+      });
+    });
+    outsideGroup = {
+      pid: gproc.pid!, proc: gproc,
+      state: () => new Promise<string>((r) => { waiters.push(r); gproc.stdin!.write('?\n'); }),
+    };
+  });
+  afterAll(async () => {
+    outside?.proc.kill('SIGKILL');
+    outsideGroup?.proc.kill('SIGKILL');
+    await new Promise<void>((r) => server ? server.close(() => r()) : r());
+    if (root) await rm(root, { recursive: true, force: true });
+  });
+
+  async function attack(role: SandboxRoleView) {
+    const base = join(root, role.name);
+    const d = (...p: string[]) => join(base, ...p);
+    for (const dir of [d('scratch'), d('common', 'objects'), d('common', 'refs', 'heads'), d('state'), d('secrets'), d('worktrees', 'other'), d('lease'), d('other-lease', 'scratch')]) await mkdir(dir, { recursive: true });
+    await writeFile(d('common', 'config'), '[core]\n');
+    await writeFile(d('state', 'minions.db'), 'db');
+    await writeFile(d('secrets', 'github-token'), 'not-a-real-token');
+    await chmod(d('secrets', 'github-token'), 0o600);
+    await writeFile(d('worktrees', 'other', 'README'), 'x');
+    const rules = buildSandboxRules({
+      role, leaseId: 'lease-escape',
+      layout: { scratchDir: d('scratch'), gitObjectsDir: d('common', 'objects'), harnessDir: null },
+      protectedPaths: [d('state'), d('secrets'), d('common'), d('worktrees'), d('lease')],
+    });
+    const rulesFile = d('rules.json');
+    await writeFile(rulesFile, serializeRules(rules), { mode: 0o600 });
+    const protectedFile = d('secrets', 'github-token');
+    const plan = {
+      nr: SYS, scratch: d('scratch'), protectedFile, outsidePid: outside.pid, outsideGroup: outsideGroup.pid, port, oAsync: 0o20000, oPath: 0o10000000, // O_ASYNC and O_PATH on x86_64 and aarch64
+      read: [d('state', 'minions.db'), d('state'), protectedFile, d('secrets'), d('common', 'config'), d('common', 'refs'), d('worktrees', 'other', 'README'), d('lease'), d('other-lease', 'scratch'), root],
+      write: [d('state'), d('secrets'), d('common', 'objects'), d('common', 'refs', 'heads'), d('worktrees', 'other'), d('lease'), d('other-lease', 'scratch'), root],
+    };
+    await writeFile(d('scratch', 'plan.json'), JSON.stringify(plan));
+    await writeFile(d('scratch', 'attack.pl'), ATTACK);
+    const before = await stat(protectedFile);
+    const nice = async () => Number((await readFile(`/proc/${outside.pid}/stat`, 'utf8')).split(') ')[1]!.split(' ')[16]);
+    const affinity = async () => /Cpus_allowed_list:\s*(\S+)/.exec(await readFile(`/proc/${outside.pid}/status`, 'utf8'))?.[1];
+    const niceBefore = await nice();
+    const groupBefore = await outsideGroup.state();
+    const affinityBefore = await affinity();
+    const argv = sandboxArgv(rulesFile, [PERL!, d('scratch', 'attack.pl'), d('scratch', 'plan.json')], { bin, scratchDir: d('scratch'), secretValues: ['not-a-real-token'] });
+    const r = await run(argv[0]!, argv.slice(1), { allowFailure: true, timeoutMs: 30_000 });
+    const results = new Map<string, { ok: boolean; detail: string }>();
+    for (const line of r.stdout.split('\n')) {
+      const [name, outcome, detail] = line.split('\t');
+      if (name && outcome) results.set(name, { ok: outcome === 'ok', detail: detail ?? '' });
+    }
+    const after = await stat(protectedFile).catch(() => null);
+    return {
+      r, results, plan,
+      outsideView: {
+        tcp: [...tcpSeen],
+        signals: [...outside.signals],
+        niceChanged: (await nice()) !== niceBefore,
+        groupBefore, groupAfter: await outsideGroup.state(),
+        testSid: Number((await readFile(`/proc/${outsideGroup.pid}/stat`, 'utf8')).split(') ')[1]!.split(' ')[3]),
+        affinityChanged: (await affinity()) !== affinityBefore,
+        protectedMetadataChanged: !after || after.mode !== before.mode || after.mtimeMs !== before.mtimeMs,
+      },
+    };
+  }
+
+  const roles: SandboxRoleView[] = [
+    { name: 'engineer', contract: 'producer', harness: 'codex' },
+    { name: 'reviewer', contract: 'gate', harness: 'codex' },
+  ];
+
+  for (const role of roles) {
+    describe(`${role.name} (${role.contract})`, () => {
+      let out: Awaited<ReturnType<typeof attack>>;
+      beforeAll(async () => { tcpSeen.length = 0; outside.signals.length = 0; out = await attack(role); }, 60_000);
+
+      it('the attack script ran to completion inside the sandbox', () => {
+        expect(out.r.stdout).toContain('\nend\n');
+        expect(out.r.code).toBe(0);
+      });
+
+      it('no read of state, secrets, the shared repo, other worktrees or another lease scratch', () => {
+        for (const p of out.plan.read) expect(out.results.get(`read:${p}`), p).toMatchObject({ ok: false });
+        for (const n of ['read:via-symlink', 'read:via-proc-self-root']) expect(out.results.get(n), n).toMatchObject({ ok: false });
+      });
+
+      it('no write outside the scratch dir (create, mkdir, append, truncate, unlink, rename, hard link)', () => {
+        for (const p of out.plan.write) {
+          expect(out.results.get(`create:${p}`), p).toMatchObject({ ok: false });
+          expect(out.results.get(`mkdir:${p}`), p).toMatchObject({ ok: false });
+        }
+        for (const n of ['append:protected', 'truncate:protected', 'unlink:protected', 'rename:protected', 'hardlink:protected->scratch', 'rename:protected->scratch']) {
+          expect(out.results.get(n), n).toMatchObject({ ok: false });
+        }
+      });
+
+      it('no signal, ptrace, pidfd or /proc access to a process outside the sandbox', () => {
+        for (const n of ['kill0:outside', 'kill-usr1:outside', 'tgkill0:outside', 'read:/proc/outside/environ', 'read:/proc/outside/mem',
+          'readlink:/proc/outside/cwd', 'ptrace-seize:outside', 'pidfd_send_signal:outside', 'pidfd_getfd:outside']) {
+          expect(out.results.get(n), n).toMatchObject({ ok: false });
+        }
+        expect(out.outsideView.signals).toEqual([]); // includes SIGIO through F_SETOWN + O_ASYNC
+      });
+
+      it('no unix, packet, raw, AF_ALG or vsock socket; no io_uring; no user namespace', () => {
+        for (const n of ['socket:AF_UNIX', 'socket:AF_UNIX-dgram', 'socket:AF_PACKET', 'socket:raw-icmp', 'socket:raw-ipv6', 'socket:AF_ALG', 'socket:AF_VSOCK', 'io_uring_setup', 'unshare:user']) {
+          expect(out.results.get(n), n).toMatchObject({ ok: false });
+        }
+        expect(out.results.get('io_uring_setup')?.detail).toMatch(/not implemented/i); // the helper's own ENOSYS, not Docker's EPERM
+      });
+
+      it('no TCP connect to a port outside tcpConnectPorts (IPv4, IPv6, IPv4-mapped)', () => {
+        for (const a of ['127.0.0.1', '::1', '::ffff:127.0.0.1']) expect(out.results.get(`tcp-connect:${a}`), a).toMatchObject({ ok: false });
+      });
+
+      it('TCP Fast Open does not reach a port outside tcpConnectPorts (sendto MSG_FASTOPEN and setsockopt TCP_FASTOPEN_CONNECT)', () => {
+        expect(out.results.get('tcp-fastopen:127.0.0.1')).toMatchObject({ ok: false });
+        // The client-side fast-open path armed through setsockopt must also be refused, and the follow-up
+        // connect to the disallowed port must still be blocked by Landlock.
+        expect(out.results.get('tcp-fastopen-connect:setsockopt'), 'setsockopt TCP_FASTOPEN_CONNECT').toMatchObject({ ok: false });
+        expect(out.results.get('tcp-fastopen-connect:connect'), 'connect after TFO setsockopt').toMatchObject({ ok: false });
+        expect(out.outsideView.tcp).toEqual([]);
+      });
+
+      it('no chmod, utime or setxattr on a protected file (incl. the user-notification routes: symlink and /proc/self/root)', () => {
+        for (const n of ['chmod:protected', 'chmod:via-symlink', 'chmod:via-proc-self-root', 'utime:protected', 'setxattr:protected']) {
+          expect(out.results.get(n), n).toMatchObject({ ok: false });
+        }
+        expect(out.outsideView.protectedMetadataChanged).toBe(false);
+        // Positive control: the chmod user-notification handler must still allow a chmod inside the scratch
+        // dir, else it would be a blanket deny that breaks the harness's own git.
+        expect(out.results.get('chmod:scratch-allowed'), 'chmod inside scratch').toMatchObject({ ok: true });
+      });
+
+      it('no setxattrat/removexattrat/file_setattr on a protected file: the ACL route to chmod 000 is closed by the helper', () => {
+        // EPERM is the helper's own rule (Docker's profile may answer ENOSYS for syscalls it does not know).
+        for (const n of ['setxattrat:acl-protected', 'setxattrat:acl-opath', 'removexattrat:protected', 'file_setattr:protected']) {
+          expect(out.results.get(n), n).toMatchObject({ ok: false, detail: expect.stringMatching(/not permitted/i) });
+        }
+        expect(out.outsideView.protectedMetadataChanged).toBe(false);
+      });
+
+      it('no priority call on the whole uid (PRIO_USER); the process itself and reading its own group stay allowed', () => {
+        for (const n of ['getpriority:user', 'setpriority:which-out-of-range']) {
+          expect(out.results.get(n), n).toMatchObject({ ok: false, detail: expect.stringMatching(/not permitted/i) });
+        }
+        expect(out.results.get('setpriority:self-allowed')).toMatchObject({ ok: true });
+        expect(out.results.get('getpriority:own-group-allowed')).toMatchObject({ ok: true });
+      });
+
+      it('no TIOCSTI/TIOCLINUX terminal injection and no MPTCP socket (Landlock does not cover MPTCP connects)', () => {
+        for (const n of ['ioctl:TIOCSTI', 'ioctl:TIOCLINUX']) {
+          expect(out.results.get(n), n).toMatchObject({ ok: false, detail: expect.stringMatching(/not permitted/i) });
+        }
+        for (const n of ['socket:MPTCP', 'socket:MPTCP6']) {
+          expect(out.results.get(n), n).toMatchObject({ ok: false, detail: expect.stringMatching(/permission denied/i) });
+        }
+      });
+
+      it('the chmod handler honours empty paths, AT_EMPTY_PATH, AT_SYMLINK_NOFOLLOW and bad pointers like the kernel', () => {
+        expect(out.results.get('fchmodat:empty-path')).toMatchObject({ ok: false, detail: expect.stringMatching(/no such file/i) });
+        expect(out.results.get('fchmodat2:empty-path-scratch')).toMatchObject({ ok: true });
+        expect(out.results.get('fchmodat2:nofollow-symlink')).toMatchObject({ ok: false, detail: expect.stringMatching(/not supported/i) });
+        expect(out.results.get('fchmodat2:nofollow-file')).toMatchObject({ ok: true });
+        expect(out.results.get('fchmodat2:bad-pointer')).toMatchObject({ ok: false, detail: expect.stringMatching(/bad address/i) });
+        expect(out.results.get('mode:scratch-file')?.detail).toBe('753');
+        // AT_EMPTY_PATH on an O_PATH fd to a protected file is still checked against the writable set.
+        expect(out.results.get('fchmodat2:empty-path-protected')).toMatchObject({ ok: false, detail: expect.stringMatching(/not permitted/i) });
+        expect(out.outsideView.protectedMetadataChanged).toBe(false);
+      });
+
+      it('no setpriority, sched_setaffinity or ioprio_set on a process outside the sandbox', () => {
+        for (const n of ['setpriority:outside', 'sched_setaffinity:outside', 'ioprio_set:outside']) expect(out.results.get(n), n).toMatchObject({ ok: false });
+        expect(out.outsideView.niceChanged || out.outsideView.affinityChanged).toBe(false);
+      });
+
+      it('round 3: fsetxattr via an O_PATH or reopened fd cannot rewrite a protected mode (ACL route closed)', () => {
+        for (const n of ['fsetxattr:opath-protected', 'fsetxattr:reopened-protected']) {
+          expect(out.results.get(n), n).toMatchObject({ ok: false });
+        }
+        expect(out.outsideView.protectedMetadataChanged).toBe(false);
+      });
+
+      it('round 3: PRIO_PGRP/IOPRIO_WHO_PGRP with a nonzero target and PRIO_USER with a nonzero uid are denied', () => {
+        for (const n of ['setpriority:pgrp-nonzero', 'setpriority:user-nonzero', 'ioprio_set:pgrp-nonzero']) {
+          expect(out.results.get(n), n).toMatchObject({ ok: false, detail: expect.stringMatching(/not permitted/i) });
+        }
+        expect(out.outsideView.niceChanged).toBe(false);
+      });
+
+      it('round 4: no joining an outside process group, and no PRIO_PGRP/IOPRIO_WHO_PGRP set with target 0 after the attempt', () => {
+        // The wrapper runs the harness in a session of its own, so setpgid into a group of the runner's session
+        // is EPERM. The group forms of the set calls are refused by the filter on top of that.
+        expect(out.results.get('setpgid:outside-group'), 'setpgid into the outside group').toMatchObject({ ok: false, detail: expect.stringMatching(/not permitted/i) });
+        expect(out.results.get('setpgid:joined'), 'still in the sandbox group').toMatchObject({ ok: false });
+        for (const n of ['setpriority:pgrp-joined', 'ioprio_set:pgrp-joined']) {
+          expect(out.results.get(n), n).toMatchObject({ ok: false, detail: expect.stringMatching(/not permitted/i) });
+        }
+        // The harness's session and group are the wrapper's (its parent), not the test's.
+        const ids = /^pgrp=(\d+) sid=(\d+) ppid=(\d+)$/.exec(out.results.get('ids')?.detail ?? '');
+        expect(ids, out.results.get('ids')?.detail).not.toBeNull();
+        expect(ids![1]).toBe(ids![3]);
+        expect(ids![2]).toBe(ids![3]);
+        expect(Number(ids![2])).not.toBe(out.outsideView.testSid);
+        // The outside group's member reports its own nice and IO priority: neither moved.
+        expect(out.outsideView.groupBefore).toMatch(/^-?\d+ -?\d+$/);
+        expect(out.outsideView.groupAfter).toBe(out.outsideView.groupBefore);
+      });
+
+      it('round 3: TIOCSTI with the upper 32 bits set is still denied (the filter compares only the low word)', () => {
+        expect(out.results.get('ioctl:TIOCSTI-hi'), 'TIOCSTI high bits').toMatchObject({ ok: false, detail: expect.stringMatching(/not permitted/i) });
+      });
+
+      it('round-2 regression: the chmod TOCTOU symlink-swap race never rewrites the protected mode', () => {
+        expect(out.results.get('chmod:toctou-race'), 'race completed').toMatchObject({ ok: true });
+        expect(out.outsideView.protectedMetadataChanged).toBe(false);
+      });
+    });
+  }
+
+  it('round 4: the wrapper takes its own session; it keeps one it already leads and refuses to start as a group leader in a shared session', async () => {
+    const rulesFile = join(root, 'engineer', 'rules.json');
+    const ids = String.raw`open(my $s, '<', '/proc/self/stat') or die; my $l = <$s>; $l =~ s/^.*\) //; my @f = split / /, $l; print "pgrp=$f[2] sid=$f[3] ppid=", getppid(), "\n";`;
+    // Started by a process that leads its own process group in the test's session: setsid is impossible, so
+    // the wrapper refuses instead of running the harness in the shared session.
+    const leader = await run(PERL!, ['-e', 'setpgrp(0, 0) or die "setpgrp: $!"; exec @ARGV or die "exec: $!"', bin, '--rules', rulesFile, '--', PERL!, '-e', 'print "RAN\\n"'],
+      { allowFailure: true, timeoutMs: 20_000 });
+    expect(leader.code).toBe(125);
+    expect(leader.stdout).not.toContain('RAN');
+    expect(leader.stderr).toMatch(/setsid: .*process-group leader/);
+    // Started as the leader of a new session (Node's `detached`): kept; the harness is in it.
+    const child = spawn(bin, ['--rules', rulesFile, '--', PERL!, '-e', ids], { detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '';
+    child.stdout!.on('data', (d: Buffer) => { stdout += String(d); });
+    const code = await new Promise<number | null>((r) => child.on('close', (c) => r(c)));
+    expect(code, stdout).toBe(0);
+    expect(stdout.trim()).toBe(`pgrp=${child.pid} sid=${child.pid} ppid=${child.pid}`);
+  }, 40_000);
+
+  it('supervisor: nothing survives the harness (double fork + setsid, nested subreaper, new process group, runaway fork chain)', async () => {
+    const scratch = join(root, 'engineer', 'scratch');
+    const tag = String(4000 + (process.pid % 1000));
+    const script = join(scratch, 'daemonize.pl');
+    await writeFile(script, String.raw`
+use POSIX (); $| = 1; my $t = shift;
+if (!fork) { POSIX::setsid(); if (!fork) { $SIG{$_} = 'IGNORE' for qw(TERM HUP INT); exec 'sleep', "${'$'}{t}1" } exit 0 }
+if (!fork) { syscall(${process.arch === 'arm64' ? 167 : 157}, 36, 1, 0, 0, 0); if (!fork) { if (!fork) { exec 'sleep', "${'$'}{t}2" } exit 0 } sleep 600; exit }
+if (!fork) { setpgrp(0, 0); exec 'sleep', "${'$'}{t}3" }
+if (!fork) { while (1) { my $p = fork; exit 0 if $p; POSIX::setsid(); select(undef, undef, undef, 0.001); } }
+sleep 1; exit 0;
+`);
+    const rulesFile = join(root, 'engineer', 'rules.json');
+    const leftovers = () => execFileSync('ps', ['-eo', 'pid=,args='], { encoding: 'utf8' }).split('\n').map((l) => l.trim())
+      .filter((l) => /^\d+ /.test(l) && (l.includes(` sleep ${tag}`) || l.includes(script)));
+    const t0 = Date.now();
+    try {
+      // stdio ignored: a leftover holding an inherited pipe must not make this wait for EOF.
+      const child = spawn(bin, ['--rules', rulesFile, '--', PERL!, script, tag], { stdio: 'ignore' });
+      const code = await new Promise<number | null>((r) => {
+        const timer = setTimeout(() => { child.kill('SIGKILL'); r(null); }, 15_000);
+        child.on('exit', (c) => { clearTimeout(timer); r(c); });
+      });
+      expect(code).toBe(0);
+      expect(Date.now() - t0).toBeLessThan(10_000);
+      expect(leftovers()).toEqual([]);
+    } finally {
+      // A broken helper leaves the tree behind (the runaway chain keeps forking): sweep it.
+      for (let i = 0; i < 200 && leftovers().length; i++) for (const l of leftovers()) { try { process.kill(Number(l.split(' ')[0]), 'SIGKILL'); } catch { /* gone */ } }
+    }
+  }, 40_000);
+
+  // The chmod user-notification handler must still let the harness's own git work: git chmods its loose
+  // objects, lock files and the executable bit on checked-out files, all inside the writable worktree.
+  const GIT = ['/usr/bin/git', '/bin/git'].find((p) => existsSync(p));
+  const SH = ['/bin/sh'].find((p) => existsSync(p));
+  it.skipIf(!GIT || !SH)('git still works inside the sandbox (path chmod on files in the worktree is allowed)', async () => {
+    const base = join(root, 'git');
+    const scratch = join(base, 'scratch');
+    await mkdir(join(base, 'common', 'objects'), { recursive: true });
+    await mkdir(scratch, { recursive: true });
+    const rules = buildSandboxRules({
+      role: { name: 'engineer', contract: 'producer', harness: 'codex' }, leaseId: 'lease-git',
+      layout: { scratchDir: scratch, gitObjectsDir: join(base, 'common', 'objects'), harnessDir: null },
+      protectedPaths: [join(base, 'common')],
+    });
+    const rulesFile = join(base, 'rules.json');
+    await writeFile(rulesFile, serializeRules(rules), { mode: 0o600 });
+    const script = String.raw`
+set -e
+export HOME="${scratch}" GIT_CONFIG_NOSYSTEM=1
+export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
+cd "${scratch}"
+git init -q repo
+cd repo
+printf '#!/bin/sh\nexit 0\n' > run.sh
+chmod 0755 run.sh
+echo data > file.txt
+git add -A
+git commit -qm first
+echo changed > file.txt
+git checkout -- file.txt
+test -x run.sh && echo EXEC_BIT_KEPT
+echo "content: $(cat file.txt)"
+echo GIT_OK
+`;
+    const r = await run(bin, ['--rules', rulesFile, '--', SH!, '-c', script], { allowFailure: true, timeoutMs: 30_000 });
+    expect(r.stdout, r.stderr).toContain('GIT_OK');
+    expect(r.stdout).toContain('EXEC_BIT_KEPT');
+    expect(r.stdout).toContain('content: data');
+    expect(r.code).toBe(0);
+  }, 40_000);
+});

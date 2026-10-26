@@ -42,6 +42,10 @@ import { createStateBackup, releaseRestoredLeases, restoreStateBackup } from './
 import { cancelWork, formatCancel } from './controls.js';
 import { ack, counts as outboxCounts, enqueue, fail, formatCounts, formatItems, pending, type OutboxCounts } from './outbox.js';
 import { git, workspaceLayout } from './worktree.js';
+import { containerPaths } from '../core/paths.js';
+import { formatWorkProbe, workProbe } from './sandbox/probe.js';
+import { containerProtectedPaths } from './sandbox/rules.js';
+import { containerRealTargets } from './sandbox/selftest.js';
 
 /** Human output of `minions work next`. */
 export function humanNext(r: NextReport): string {
@@ -487,6 +491,26 @@ export function register(program: Command): void {
       const opts = { head: o.head, by: o.by, note: o.note, signature: o.signature };
       const r = o.merge ? s.approveMerge(taskId, opts) : s.approvePublication(taskId, opts);
       emit(r, { json: globalOpts(cmd).json, human: (d) => d.message });
+    }));
+  work.command('probe').description('Process-harness probe (no credentials, no model request): configured harness binaries and pinned versions, the minions-sandbox isolation self-test (cached per container start), loopback listeners on allowed TCP connect ports')
+    .option('--refresh', 'run the isolation self-test again instead of using the cached result')
+    .action(action(async (o: { refresh?: boolean }, cmd: Command) => {
+      if (runtimeMode() === 'host') return delegate(cmd);
+      if (runtimeMode() === 'host-runtime') {
+        throw new MinionsError('PRECONDITION', 'Process harnesses run only in the Docker runtime; the host runtime refuses them.', 'Switch with `minions runtime set docker`.');
+      }
+      const paths = runtimePaths();
+      const c = containerPaths();
+      const r = await workProbe({
+        config: await getConfig(),
+        cacheFile: join(paths.state, 'run', 'sandbox-probe.json'),
+        scratchRoot: paths.tmp,
+        protectedPaths: containerProtectedPaths({ state: paths.state, secretsDir: paths.secretsDir, configDir: c.configDir, pluginDir: paths.pluginDir, claudeHome: c.claudeHome, workspace: paths.workspace },
+          { commonDir: join(paths.repo, '.git') }),
+        real: await containerRealTargets({ db: paths.db, secretsDir: paths.secretsDir, claudeHome: c.claudeHome, repo: paths.repo, state: paths.state, worktrees: paths.worktrees }),
+        refresh: !!o.refresh,
+      });
+      emit(r, { json: globalOpts(cmd).json, human: formatWorkProbe });
     }));
   work.command('list').description('List active leases')
     .option('--all', 'include ended leases')
