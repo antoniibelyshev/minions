@@ -36,6 +36,7 @@ import { open, readFile, rm } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 import type { Command } from 'commander';
 import { action, requireMode } from '../core/cli-helpers.js';
+import { APPROVAL_TOKEN_PREFIX } from '../core/approval.js';
 import { displayText, truncateCodePoints } from '../core/control-chars.js';
 import { MinionsError, isMinionsError } from '../core/errors.js';
 import { run, type RunResult } from '../core/exec.js';
@@ -492,16 +493,19 @@ export class HostManager {
     const a = plan.approval;
     if (!a) throw new MinionsError('INTERNAL', `approve plan ${plan.requestId} without an approval.`);
     let answer: RunResult | null = null;
+    let signature: string | undefined;
     const code = await (this.deps.approveOnHost ?? approveOnHost)(a.taskId, {
       head: a.head, merge: a.scope === 'merge', json: true, cwd: project.repoPath, note: `approved in the host manager chat (${plan.requestId})`,
     }, {
       projectId: project.projectId,
       delegate: async (args) => {
+        const i = args.indexOf('--signature');
+        if (i >= 0) signature = args[i + 1];
         answer = await this.runtime.exec(project, ['minions', ...args, '--json']);
         return answer.code;
       },
     });
-    return approveOutcome(a, code, answer);
+    return approveOutcome(a, code, answer, signature);
   }
 
   private async reject(ev: ManagerEvent): Promise<void> {
@@ -626,11 +630,15 @@ export class HostManager {
 }
 
 /** Reads the runtime's answer to `work approve` (untrusted: only the envelope's message, displayText'd and bounded). */
-export function approveOutcome(a: NonNullable<ChangePlan['approval']>, code: number, r: RunResult | null): { status: 'applied' | 'failed'; detail: string } {
+export function approveOutcome(a: NonNullable<ChangePlan['approval']>, code: number, r: RunResult | null, signature?: string): { status: 'applied' | 'failed'; detail: string } {
   let env: { ok?: boolean; data?: { message?: unknown }; error?: { message?: unknown } } | null = null;
   try { env = r ? JSON.parse(r.stdout.trim().split('\n').filter(Boolean).at(-1) ?? '') : null; } catch { env = null; }
   const what = `${a.scope === 'merge' ? 'merge' : 'publication'} approval for ${a.taskId} at ${a.head}`;
-  const msg = (v: unknown) => truncateCodePoints(displayText(String(v ?? '')).replace(/\s+/g, ' ').trim(), 500);
+  // The runtime is untrusted and may echo the token: scrub the exact --signature value and anything token-shaped first.
+  const escRe = (x: string) => x.replace(/[.*+?^${}()|[\]\\]/g, (c) => `\\${c}`);
+  const tokenShape = new RegExp(`${escRe(APPROVAL_TOKEN_PREFIX)}\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+`, 'g');
+  const scrub = (t: string) => (signature ? t.split(signature).join('[REDACTED]') : t).replace(tokenShape, '[REDACTED]');
+  const msg = (v: unknown) => truncateCodePoints(displayText(scrub(String(v ?? ''))).replace(/\s+/g, ' ').trim(), 500);
   if (env && env.ok === true && code === 0) return { status: 'applied', detail: `${what} recorded: ${msg(env.data?.message)}` };
   if (env && env.ok === false) return { status: 'failed', detail: `${what} refused by the runtime: ${msg(env.error?.message)}` };
   return { status: 'failed', detail: `${what}: no result from the runtime (exit ${code})` };

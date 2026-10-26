@@ -504,11 +504,8 @@ describe('/approve QA: the chat side', () => {
     expect(s.approveCalls).toEqual([]);
   });
 
-  // Known gap (QA finding): approveOutcome shows the runtime's refusal message as written, so a runtime that echoes
-  // the --signature argument puts the token in the chat, the manager log and the journal. The runtime already holds the
-  // token (it is the recipient), so the host key does not leak, but the "never shown" property does not hold. it.fails:
-  // turns red once approveOutcome scrubs the token; make it a plain it() then.
-  it.fails('a hostile runtime that echoes the token in its refusal does not get it into the chat, the log or the journal', async () => {
+  // approveOutcome scrubs the --signature value and token-shaped strings from the runtime's answer.
+  it('a hostile runtime that echoes the token in its refusal does not get it into the chat, the log or the journal', async () => {
     const { project } = await install();
     const s = setup([project]);
     s.deps.delegate = async (_p, argv) => {
@@ -522,5 +519,36 @@ describe('/approve QA: the chat side', () => {
     expect(JSON.stringify(s.outcomes)).not.toContain('FAKE-TOKEN-SECRET');
     expect(s.logs.join('\n')).not.toContain('FAKE-TOKEN-SECRET');
     expect(readFileSync(J.journalPath(), 'utf8')).not.toContain('FAKE-TOKEN-SECRET');
+  });
+
+  it('scrubs the token from an ok:true answer too', async () => {
+    const { project } = await install();
+    const s = setup([project]);
+    s.deps.delegate = async (_p, argv) => {
+      s.delegateCalls.push(argv);
+      return { code: 0, stdout: JSON.stringify({ ok: true, data: { message: `recorded with ${argv[argv.indexOf('--signature') + 1]}` } }) + '\n', stderr: '' };
+    };
+    const o = await s.cmds.propose(null, { kind: 'approve', taskId: 'task-12', head: HEAD, merge: false });
+    await s.confirm(o);
+    expect(s.outcomes.at(-1)!.status).toBe('applied');
+    expect(s.outcomes.at(-1)!.text).toContain('[REDACTED]');
+    expect(JSON.stringify(s.outcomes)).not.toContain('FAKE-TOKEN-SECRET');
+    expect(s.logs.join('\n')).not.toContain('FAKE-TOKEN-SECRET');
+    expect(readFileSync(J.journalPath(), 'utf8')).not.toContain('FAKE-TOKEN-SECRET');
+  });
+
+  it('scrubs a token-shaped string that is not the real token', async () => {
+    const { project } = await install();
+    const s = setup([project]);
+    s.deps.delegate = async (_p, argv) => {
+      s.delegateCalls.push(argv);
+      return refused('CONFLICT', 'bad mnap1.eyJhIjoxfQ.c2ln_-x and mnap1.AAA.BBB');
+    };
+    const o = await s.cmds.propose(null, { kind: 'approve', taskId: 'task-12', head: HEAD, merge: false });
+    await s.confirm(o);
+    const text = s.outcomes.at(-1)!.text;
+    expect(text).not.toMatch(/mnap1\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/);
+    expect(text).toContain('bad [REDACTED] and [REDACTED]');
+    expect(readFileSync(J.journalPath(), 'utf8')).not.toContain('mnap1.');
   });
 });
