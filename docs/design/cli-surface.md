@@ -17,7 +17,7 @@ Every top-level command belongs to exactly one tier:
 | - | - | - |
 | Primary | `setup`, `start`, `status`, `settings`, `upgrade`, `down` (alias `stop`), `uninstall` (+ `help`) | `minions --help`, `minions help`, README quick start and everyday use |
 | Advanced | `init`, `doctor`, `auth`, `config`, `channel`, `runtime`, `import`, `export`, `pause`, `resume` | `minions help --all`, docs/cli.md |
-| Internal | `work`, `backlog`, `hook`, `coordinator`, `telegram`, `workspace`, `sync`, `ci` | `minions help --all`, docs/cli.md |
+| Internal | `work`, `backlog`, `hook`, `coordinator`, `telegram`, `workspace`, `sync`, `ci`, `notify`, `manager` | `minions help --all`, docs/cli.md |
 | Unlisted | `git-credential` (git credential-helper protocol entry point) | nowhere (already hidden before this change) |
 
 Rationale for the primary set (seven commands, the lifecycle of an installation):

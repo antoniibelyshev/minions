@@ -11,6 +11,7 @@ import { CONTAINER, projectPaths } from '../core/paths.js';
 import { PRE_RESTORE_KEEP, STATE_BACKUP_DIRS, STATE_BACKUP_FILES } from '../runtime/state-backup.js';
 import { formatRecord, recordUpgradeRequest, withRequestContext } from '../runtime/change-requests.js';
 import { registerChangeRequestCommands } from './change-requests.js';
+import { registerManager } from './manager.js';
 import { registerAuth } from './auth-cli.js';
 import { authOf, isKeyAuth, refreshKey, startRefreshTimer } from './auth.js';
 import type { MinionsConfig } from '../config/schema.js';
@@ -798,6 +799,7 @@ export function register(program: Command): void {
     },
   });
   registerChangeRequestCommands(settings, { runtime: defaultSettingsRuntime, confirm: confirmMarked, show: (t) => process.stderr.write(`${t}\n`) });
+  registerManager(program);
 
   // Advanced alias of `minions settings` (kept for scripts): `config show` (raw effective config), `config list`, `config set`;
   // plus `config roles ...`, the role proposal/approval path (src/host/roles-cli.ts).

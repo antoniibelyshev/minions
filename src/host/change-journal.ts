@@ -6,14 +6,18 @@
 //   reason): a confirmation recomputes the plan from that snapshot, never from the container's row again.
 // - `confirmed`: consumes the nonce. Checking the nonce and appending this entry happen under the journal lock,
 //   so a second confirmation of the same offer finds it spent ("already handled").
+// - `applying` (manager): the child command started. `confirmed` and `applying` carry the writer's pid and process
+//   start time, so a manager that starts again can tell an entry of a dead process (interrupted, state unknown) from
+//   an apply still running in another process.
 // - `applied` / `failed` / `rejected`: the outcome.
-// The manager (task-53.4) adds its own lock and the Telegram offer messages on top of this file.
+// The manager (task-53.4, src/host/manager.ts) adds its own process lock and the offer messages on top of this file.
 import { randomBytes } from 'node:crypto';
 import { appendFile, chmod, open, readFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { MinionsError } from '../core/errors.js';
 import { ensureDir } from '../core/fsutil.js';
 import { hostRoot } from '../core/paths.js';
+import { procStartTime } from '../runtime/coordinator.js';
 import { pidAlive } from '../runtime/db.js';
 
 /** How long the owner has to confirm an offered plan. */
@@ -32,8 +36,10 @@ export interface OfferEntry {
   request: RequestSnapshot; plan: unknown;
 }
 export interface OutcomeEntry {
-  type: 'confirmed' | 'applied' | 'failed' | 'rejected'; at: string; projectId: string; requestId: string;
+  type: 'confirmed' | 'applying' | 'applied' | 'failed' | 'rejected'; at: string; projectId: string; requestId: string;
   nonce?: string; digest?: string; detail?: string;
+  /** confirmed / applying: the process that wrote it (pid and /proc start time when readable). */
+  pid?: number; start?: string | null;
 }
 export type JournalEntry = OfferEntry | OutcomeEntry;
 
@@ -107,21 +113,55 @@ export async function consumeOffer(offer: OfferEntry, check: () => Promise<void>
   await withJournalLock(async () => {
     const entries = await readJournal();
     if (entries.some((e) => e.type === 'confirmed' && e.nonce === offer.nonce)) {
-      throw new MinionsError('CONFLICT', `Change request ${offer.requestId}: this confirmation was already used (already handled).`, 'List requests with `minions settings requests --all`.');
+      throw new MinionsError('CONFLICT', `Change request ${offer.requestId}: this confirmation was already used (already handled).`, 'List requests with `minions settings requests --all`.', { refusal: 'spent' });
     }
     // Another offer of the same request: applied or rejected is final; confirmed without an outcome is in flight or
     // was interrupted (state unknown). Only a failed request may be confirmed again.
-    const last = entries.filter((e) => e.type !== 'offer' && e.projectId === offer.projectId && e.requestId === offer.requestId).at(-1);
+    const last = lastOutcome(entries, offer.projectId, offer.requestId);
     if (last && last.type !== 'failed') {
-      throw new MinionsError('CONFLICT', last.type === 'confirmed'
+      throw new MinionsError('CONFLICT', last.type === 'confirmed' || last.type === 'applying'
         ? `Change request ${offer.requestId} was already confirmed at ${last.at} and has no recorded outcome (in progress, or interrupted: state unknown).`
-        : `Change request ${offer.requestId} was already ${last.type} at ${last.at} (already handled).`, 'List requests with `minions settings requests --all`.');
+        : `Change request ${offer.requestId} was already ${last.type} at ${last.at} (already handled).`, 'List requests with `minions settings requests --all`.', { refusal: 'handled' });
     }
     await check();
-    await append({ type: 'confirmed', at: nowIso(now), projectId: offer.projectId, requestId: offer.requestId, nonce: offer.nonce, digest: offer.digest });
+    await append({ type: 'confirmed', at: nowIso(now), projectId: offer.projectId, requestId: offer.requestId, nonce: offer.nonce, digest: offer.digest, ...writer() });
   });
 }
 
 export async function recordOutcome(e: Omit<OutcomeEntry, 'at'>, now = new Date()): Promise<void> {
   await withJournalLock(() => append({ ...e, at: nowIso(now) }));
+}
+
+/** The pid and process start time of this process (recorded in confirmed / applying entries). */
+export const writer = (): { pid: number; start: string | null } => ({ pid: process.pid, start: procStartTime(process.pid) });
+
+/** Whether the process that wrote an entry still runs (same pid and, when both are known, the same start time). */
+export function writerAlive(e: { pid?: number; start?: string | null }, alive: (pid: number) => boolean = pidAlive, startOf: (pid: number) => string | null = procStartTime): boolean {
+  if (e.pid === undefined || !alive(e.pid)) return false;
+  if (!e.start) return true;
+  const now = startOf(e.pid);
+  return now === null || now === e.start;
+}
+
+/** The newest non-offer entry of a request (its current outcome), if any. */
+export function lastOutcome(entries: JournalEntry[], projectId: string, requestId: string): OutcomeEntry | undefined {
+  return entries.filter((e): e is OutcomeEntry => e.type !== 'offer' && e.projectId === projectId && e.requestId === requestId).at(-1);
+}
+
+/** The offer with this nonce (nonces are 128-bit random, unique across projects), with whether it is spent. */
+export async function findOfferByNonce(nonce: string): Promise<{ offer: OfferEntry; spent: boolean } | null> {
+  const entries = await readJournal();
+  const offer = entries.find((e): e is OfferEntry => e.type === 'offer' && e.nonce === nonce);
+  if (!offer) return null;
+  return { offer, spent: entries.some((e) => e.type === 'confirmed' && e.nonce === nonce) };
+}
+
+/**
+ * Requests whose newest outcome is `confirmed` or `applying` and whose writer process is gone: the apply was
+ * interrupted and its state is unknown. An entry of a process that still runs (another `settings apply`) is left out.
+ */
+export function interruptedEntries(entries: JournalEntry[], alive: (e: OutcomeEntry) => boolean = (e) => writerAlive(e)): OutcomeEntry[] {
+  const lastBy = new Map<string, OutcomeEntry>();
+  for (const e of entries) if (e.type !== 'offer') lastBy.set(`${e.projectId}\0${e.requestId}`, e);
+  return [...lastBy.values()].filter((e) => (e.type === 'confirmed' || e.type === 'applying') && !alive(e));
 }
