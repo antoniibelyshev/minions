@@ -8,6 +8,7 @@ const T = await import('../../src/host/manager-telegram.js');
 const M = await import('../../src/host/manager.js');
 const J = await import('../../src/host/change-journal.js');
 const { managerDir } = await import('../../src/core/paths.js');
+const { truncateCodePoints } = await import('../../src/core/control-chars.js');
 const { withHome } = await import('./fixtures.js');
 type TelegramUpdate = import('../../src/host/manager-bot.js').TelegramUpdate;
 type ManagerAccess = import('../../src/host/manager-bot.js').ManagerAccess;
@@ -606,11 +607,89 @@ describe('QA edge cases', () => {
     for (const l of logs) expect(l).not.toContain(secret);
   });
 
-  it('a forwarded message from the owner is handled like the owner\'s own (read-only commands only)', async () => {
-    const api = botApi([[fwd(msg(1, '/status'), { forward_origin: { type: 'user', sender_user: { id: STRANGER } } })]]);
+  it.each([
+    ['forward_origin', { forward_origin: { type: 'user', sender_user: { id: STRANGER } } }],
+    ['forward_from (older API shape)', { forward_from: { id: STRANGER } }],
+    ['forward_from_chat (older API shape)', { forward_from_chat: { id: -100123, type: 'channel' } }],
+    ['forward_date alone (older API shape)', { forward_date: 1_790_000_000 }],
+  ])('a message the owner forwards (%s) is ignored silently', async (_name, extra) => {
+    const api = botApi([[fwd(msg(1, '/status'), extra), fwd(msg(2, '/help'), extra), fwd(msg(3, 'hello'), extra)]]);
+    const t = transport(api);
+    t.attach(fakeCommands());
+    expect(await t.receive(30_000)).toEqual([]);
+    expect(api.of('sendMessage')).toEqual([]);
+    expect(api.of('answerCallbackQuery')).toEqual([]);
+  });
+
+  it('the owner\'s own message next to a forwarded one is still answered', async () => {
+    const api = botApi([[fwd(msg(1, '/status'), { forward_date: 1_790_000_000 }), msg(2, '/status')]]);
     const t = transport(api);
     t.attach(fakeCommands());
     expect(await t.receive(30_000)).toEqual([]);
     expect(api.of('sendMessage').map((c) => c.body.text)).toEqual(['status for all']);
+  });
+
+  it('isForwarded sees every forward field and nothing else', () => {
+    expect(T.isForwarded({ text: '/status' })).toBe(false);
+    expect(T.isForwarded({ text: '/status', forward_origin: {} })).toBe(true);
+    expect(T.isForwarded({ text: '/status', forward_from: { id: 1 } })).toBe(true);
+    expect(T.isForwarded({ text: '/status', forward_from_chat: { id: 1 } })).toBe(true);
+    expect(T.isForwarded({ text: '/status', forward_date: 0 })).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------- code-point-safe truncation
+
+describe('truncation never splits a surrogate pair', () => {
+  const EMOJI = '\u{1F600}'; // two UTF-16 units
+  /** String.prototype.isWellFormed (Node 20+; the TS lib here predates it). */
+  const wellFormed = (s: string) => (s as unknown as { isWellFormed(): boolean }).isWellFormed();
+
+  it('truncateCodePoints backs off a lone high surrogate and stays within the limit', () => {
+    for (const prefix of ['', 'a', 'ab', 'abc']) {
+      const s = prefix + EMOJI.repeat(50);
+      for (let max = 0; max <= 20; max++) {
+        const t = truncateCodePoints(s, max);
+        expect(wellFormed(t)).toBe(true);
+        expect(t.length).toBeLessThanOrEqual(max);
+        expect(t.length).toBeGreaterThanOrEqual(max - 1);
+        expect(s.startsWith(t)).toBe(true);
+      }
+    }
+    expect(truncateCodePoints('short', 100)).toBe('short');
+    expect(truncateCodePoints(`ab${EMOJI}`, 4)).toBe(`ab${EMOJI}`);
+  });
+
+  it.each(['', 'a', 'ab', 'abc'])('long emoji offers, summaries and risk lines are cut well formed (prefix %j)', async (prefix) => {
+    const api = botApi([[tap(1, `c:${RID}:${NONCE}`, { messageId: 100 })]]);
+    const t = transport(api);
+    const long = prefix + EMOJI.repeat(3000);
+    await t.sendOffer(offer({ text: long, summary: long, loosens: long }));
+    expect(await t.receive(30_000)).toEqual([]); // first tap of a loosening plan: the risk line message
+    const sent = api.of('sendMessage').map((c) => String(c.body.text));
+    expect(sent).toHaveLength(2);
+    for (const text of sent) {
+      expect(wellFormed(text)).toBe(true);
+      expect(text.length).toBeLessThanOrEqual(T.MESSAGE_MAX_CHARS);
+    }
+    await t.sendOutcome({ status: 'applied', projectId: PID, requestId: RID, text: long });
+    await t.sendOutcome({ status: 'applying', projectId: PID, requestId: RID, text: long });
+    for (const c of [...api.of('sendMessage'), ...api.of('editMessageText')]) expect(wellFormed(String(c.body.text))).toBe(true);
+  });
+
+  it.each(['', 'a'])('a network error with emoji is cut well formed (prefix %j)', async (prefix) => {
+    const f = (async () => { throw new TypeError(prefix + EMOJI.repeat(300)); }) as typeof fetch;
+    const t = T.telegramTransport({ token: TOKEN, access: ACCESS, fetch: f, log: () => undefined, lookupOffer: async () => null, sleep: async () => undefined });
+    const err = await t.receive(30_000).then(() => null, (e: Error) => e);
+    expect(err?.message).toContain('could not reach the Telegram Bot API');
+    expect(wellFormed(err!.message)).toBe(true);
+  });
+
+  it.each(['', 'a'])('/status lines from the runtime are cut well formed (prefix %j)', (prefix) => {
+    const long = prefix + EMOJI.repeat(300);
+    const lines = M.runtimeStatusLines({ coordinatorLaunch: { state: 'stale', reason: long }, activeLeases: [{ task_id: long, role: long }] });
+    expect(lines.length).toBeGreaterThan(0);
+    for (const l of lines) expect(wellFormed(l)).toBe(true);
+    expect(lines.join('\n')).toContain(EMOJI);
   });
 });

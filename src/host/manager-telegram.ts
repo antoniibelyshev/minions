@@ -5,7 +5,8 @@
 // - fetch only (getUpdates long poll, sendMessage with an inline keyboard, answerCallbackQuery, editMessageText). The
 //   token travels only in the request URL path; errors are redacted and never include it.
 // - Owner only: an update that isOwnerUpdate rejects (another user, a group, a bot) is dropped without any reply, not
-//   even answerCallbackQuery. This transport never pairs or re-pairs.
+//   even answerCallbackQuery. A forwarded message (forward_origin, forward_from, forward_from_chat or forward_date) is
+//   ignored the same way, even from the owner: only what the owner types counts. This transport never pairs or re-pairs.
 // - Plain text only (no parse_mode), so untrusted text cannot inject markup; it is displayText'd anyway.
 // - Offers carry Confirm / Reject buttons: callback_data `c:<requestId>:<nonce>` and `r:<requestId>:<nonce>` (46 bytes,
 //   within Telegram's 64). The core trusts only the nonce; the transport only turns taps into events.
@@ -21,7 +22,7 @@
 import { chmod } from 'node:fs/promises';
 import { join } from 'node:path';
 import { z } from 'zod';
-import { displayText } from '../core/control-chars.js';
+import { displayText, truncateCodePoints } from '../core/control-chars.js';
 import { MinionsError } from '../core/errors.js';
 import { ensureDir, readJsonIfExists, writeJson } from '../core/fsutil.js';
 import { redact } from '../core/output.js';
@@ -59,12 +60,17 @@ export function parseCallbackData(data: unknown): { action: CallbackAction; requ
   return { action: m[1] as CallbackAction, requestId: m[2]!, nonce: m[3]! };
 }
 
+/** True for a forwarded message, in the current (forward_origin) or the older (forward_from, forward_date, ...) shape. */
+export function isForwarded(m: NonNullable<TelegramUpdate['message']>): boolean {
+  return m.forward_origin != null || m.forward_from != null || m.forward_from_chat != null || m.forward_date != null;
+}
+
 /** One line, plain, bounded: for the risk line of the double tap. */
 const oneLine = (s: string, max = 300) => {
   const t = displayText(s).replace(/\s+/g, ' ').trim();
-  return t.length > max ? `${t.slice(0, max - 1)}…` : t;
+  return t.length > max ? `${truncateCodePoints(t, max - 1)}…` : t;
 };
-const clip = (s: string) => (s.length > MESSAGE_MAX_CHARS ? `${s.slice(0, MESSAGE_MAX_CHARS - 40)}\n… (cut: the message was too long)` : s);
+const clip = (s: string) => (s.length > MESSAGE_MAX_CHARS ? `${truncateCodePoints(s, MESSAGE_MAX_CHARS - 40)}\n… (cut: the message was too long)` : s);
 
 export const HELP_TEXT = [
   'minions host manager. Commands:',
@@ -146,7 +152,7 @@ export class TelegramTransport implements ManagerTransport {
         signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
       });
     } catch (e) {
-      throw new MinionsError('NETWORK_RETRYABLE', `could not reach the Telegram Bot API (${method}): ${redact(String((e as Error)?.message ?? e)).slice(0, 200)}`);
+      throw new MinionsError('NETWORK_RETRYABLE', `could not reach the Telegram Bot API (${method}): ${truncateCodePoints(redact(String((e as Error)?.message ?? e)), 200)}`);
     }
     if (res.status === 401 || res.status === 404) {
       throw new MinionsError('AUTH_REQUIRED', 'The manager bot token was rejected by Telegram (revoked or mistyped).',
@@ -196,7 +202,7 @@ export class TelegramTransport implements ManagerTransport {
 
   private async answer(callbackId: string | undefined, text: string): Promise<void> {
     if (!callbackId) return;
-    await this.call('answerCallbackQuery', { callback_query_id: callbackId, text: text.slice(0, 190) })
+    await this.call('answerCallbackQuery', { callback_query_id: callbackId, text: truncateCodePoints(text, 190) })
       .catch((e) => this.log(`telegram: answerCallbackQuery failed: ${(e as Error).message}`));
   }
 
@@ -280,6 +286,7 @@ export class TelegramTransport implements ManagerTransport {
           const ev = await this.onTap(u.callback_query);
           if (ev) events.push(ev);
         } else if (u.message) {
+          if (isForwarded(u.message)) continue; // ignored silently: a forward is not the owner's own command
           await this.onMessage(typeof u.message.text === 'string' ? u.message.text : '');
         }
       } catch (e) {

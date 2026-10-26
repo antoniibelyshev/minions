@@ -24,7 +24,7 @@ import { open, readFile, rm } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 import type { Command } from 'commander';
 import { action, requireMode } from '../core/cli-helpers.js';
-import { displayText } from '../core/control-chars.js';
+import { displayText, truncateCodePoints } from '../core/control-chars.js';
 import { MinionsError, isMinionsError } from '../core/errors.js';
 import { run, type RunResult } from '../core/exec.js';
 import { ensureDir } from '../core/fsutil.js';
@@ -551,7 +551,7 @@ export function logTransport(write: (line: string) => void): ManagerTransport {
 /** Lines of /status from the runtime's `minions status --json` (untrusted: only typed fields, bounded, displayText). */
 export function runtimeStatusLines(st: Record<string, unknown>): string[] {
   const out: string[] = [];
-  const short = (v: unknown, max = 200) => displayText(String(v)).replace(/\s+/g, ' ').slice(0, max);
+  const short = (v: unknown, max = 200) => truncateCodePoints(displayText(String(v)).replace(/\s+/g, ' '), max);
   const launch = st.coordinatorLaunch as { state?: unknown; reason?: unknown } | undefined;
   const state = typeof launch?.state === 'string' && ['current', 'stale', 'unrecorded', 'not-running'].includes(launch.state) ? launch.state : null;
   if (!state) out.push('  coordinator: unknown');

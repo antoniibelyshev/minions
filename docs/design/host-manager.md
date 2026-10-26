@@ -374,7 +374,9 @@ commands. Decisions made here:
   the same bot is stored (`chooseTransport`); otherwise the log transport, with one log line saying why. An unreadable
   pairing or store is an error, not a silent fallback.
 - **Owner only.** Updates that `isOwnerUpdate` rejects are dropped without any reply, not even
-  `answerCallbackQuery`. Messages are plain text (no `parse_mode`), and all text goes through `displayText`.
+  `answerCallbackQuery`. A forwarded message (any of `forward_origin`, `forward_from`, `forward_from_chat` or
+  `forward_date`) is ignored the same way, even when the owner forwards it: only what the owner types is a command.
+  Messages are plain text (no `parse_mode`), and all text goes through `displayText`.
 - **Buttons.** `c:<requestId>:<nonce>` (Confirm), `r:<requestId>:<nonce>` (Reject) and `d:<requestId>:<nonce>` (the
   second confirmation). They are 46 bytes, and `callbackData` refuses anything over 64. Every owner tap is answered.
 - **Double tap.** The first Confirm on a plan with `loosens` sends no event. It sends a second message with the

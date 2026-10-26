@@ -117,7 +117,11 @@ export async function clearManagerAccess(): Promise<void> {
 /** The parts of a Bot API update the owner check reads. */
 export interface TelegramUpdate {
   update_id: number;
-  message?: { message_id?: number; text?: string; from?: { id: number; is_bot?: boolean }; chat?: { id: number; type?: string } };
+  message?: {
+    message_id?: number; text?: string; from?: { id: number; is_bot?: boolean }; chat?: { id: number; type?: string };
+    /** Set on a forwarded message (forward_origin in Bot API 7+, forward_from / forward_from_chat / forward_date before). */
+    forward_origin?: unknown; forward_from?: unknown; forward_from_chat?: unknown; forward_date?: unknown;
+  };
   callback_query?: {
     id?: string; data?: string; from?: { id: number; is_bot?: boolean };
     message?: { message_id?: number; chat?: { id: number; type?: string } };
