@@ -15,8 +15,8 @@
 //   same run stays stored and is reported).
 // - Junie has no adapter yet (U-J1), so the Junie answer keeps Claude Code. The host runtime refuses process harnesses
 //   (D9), so the question is not asked there.
-// - The Codex CLI is not installed in the default runtime image yet (owner approval pending); the step says the
-//   harness must be installed and that `minions doctor` reports it (harness.codex).
+// - The default runtime image ships the pinned Codex CLI (task-14.15); the step says so and that `minions doctor`
+//   reports it (harness.codex).
 import { CURRENT_PHASE, HARNESSES, isProcessHarness, type HarnessId } from '../config/harnesses.js';
 import { defaultMovedGates, REVIEWER_ROLE, workerRole, workerRoleNames } from '../config/roles.js';
 import type { CustomRoleConfig, MinionsConfig, WorkflowStageConfig } from '../config/schema.js';
@@ -230,7 +230,7 @@ async function codexChoice(x: HarnessStepInput, current: HarnessId): Promise<Har
   if (moved.length) lines.push(`warning: harnesses.default also moves these gate roles onto Codex: ${moved.join(', ')} (set roles.<r>.harness to claude to keep one on Claude Code)`);
   lines.push(
     ...phaseScopeLines(HARNESSES.codex.label),
-    'The Codex CLI must be installed in the runtime image (the default image does not include it yet); `minions doctor` reports harness.codex.',
+    'The runtime image ships the pinned Codex CLI; `minions doctor` reports harness.codex (binary, version, sandbox).',
   );
   const scope = workflow ? `; ${PILOT_ROLE} runs after the reviewer in workflow ${workflow}` : '';
   return { status: same ? 'kept' : current === 'codex' ? 'changed' : 'done', detail: `harnesses.default codex (model ${model})${scope}; ${keyNote}`, lines };

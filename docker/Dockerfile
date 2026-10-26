@@ -54,6 +54,9 @@ FROM base
 
 ARG CLAUDE_CODE_VERSION=2.1.292
 ARG BACKLOG_MD_VERSION=1.54.0
+# OpenAI Codex CLI for process-harness workers (docs/design/agent-runtimes.md, task-14.6 addendum). npm integrity of
+# @openai/codex@0.164.0: sha512-TWj7UGyPRe3Pj/A3ddNAxs1te3a/W/xAd+J0LHrrFTmsSfahGMOLF/vn88D3QCIgAT3B1rm1y/Z3NYE0rx6cZQ==
+ARG CODEX_VERSION=0.164.0
 
 # Reviewed system packages only; nothing is installed as root at runtime.
 RUN apt-get update \
@@ -61,7 +64,7 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
 RUN npm install -g --no-fund --no-audit \
-      "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" "backlog.md@${BACKLOG_MD_VERSION}" \
+      "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" "@openai/codex@${CODEX_VERSION}" "backlog.md@${BACKLOG_MD_VERSION}" \
  && npm cache clean --force \
  && rm -rf /root/.npm /tmp/*
 
@@ -84,6 +87,7 @@ RUN chmod 0755 /opt/minions/pkg/dist/cli.js \
  && test "$(id -u node)" = 1000
 
 ENV MINIONS_RUNTIME=container \
+    MINIONS_CODEX_VERSION=${CODEX_VERSION} \
     CLAUDE_CONFIG_DIR=/home/node/.claude \
     MINIONS_CONFIG=/opt/minions/config/config.json \
     DISABLE_AUTOUPDATER=1 \
