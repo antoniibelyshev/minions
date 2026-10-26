@@ -18,7 +18,7 @@ import { MinionsError } from '../core/errors.js';
 import { syncBaseFromOrigin, type BaseSyncResult } from './base-sync.js';
 import type { BuiltinLeaseRole, Lease, LeaseRole, PublicationState, RuntimeDb } from './db.js';
 import { removeLeaseFiles, type HandoffPaths } from './handoff.js';
-import { hasOpenRun, removeRunRecord } from './runner/record.js';
+import { corruptRecordHint, hasOpenRun, readRunRecord, removeRunRecord } from './runner/record.js';
 import { missingApprovalKeyReason, runtimePaths } from './paths.js';
 import { publishTask, realGh, type GhFn, type PublishInput, type PublishOutcome } from './publish.js';
 import { isCiCheck, resultContractText, validateResult, type WorkerResult } from './results.js';
@@ -1119,6 +1119,11 @@ export class Scheduler {
     if (!this.runs) return;
     for (const l of this.db.leases({ taskId, all: true })) {
       if (await hasOpenRun(this.runs.state, l.id)) {
+        const corrupt = await readRunRecord(this.runs.state, l.id).then(() => null, (e: unknown) => e as Error);
+        if (corrupt) {
+          throw new MinionsError('POLICY_DENIED', `Task ${taskId} has a process run (${l.id}) whose record cannot be read (${corrupt.message.slice(0, 200)}); it counts as unfinished.`,
+            corruptRecordHint(this.runs.state, l.id), { leaseId: l.id });
+        }
         throw new MinionsError('POLICY_DENIED', `Task ${taskId} has an unfinished process run (${l.id}): its post-exit checks must finish before the task is claimed again.`,
           `Release ${l.id} if it is still active, or restart the coordinator (\`minions coordinator restart --recover\`), so recovery reaps it.`, { leaseId: l.id });
       }

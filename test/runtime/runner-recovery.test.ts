@@ -13,7 +13,7 @@ import type { MinionsError } from '../../src/core/errors.js';
 import { scheduleDetachedRestart } from '../../src/runtime/coordinator.js';
 import { claimWithBrief } from '../../src/runtime/handoff.js';
 import { fakeAdapter } from '../../src/runtime/runner/adapter.js';
-import { sweepEscapees } from '../../src/runtime/runner/escapees.js';
+import { hasRunMarker, sweepEscapees } from '../../src/runtime/runner/escapees.js';
 import {
   acquireOwner, createRunRecord, hostIdentity, openRunsSync, ownerLockPath, ownerToken, procIdentity, readOwner, readRunRecord, runDir, runRecordPath,
   withOpenRuns, type RunRecord,
@@ -213,6 +213,24 @@ describe('re-claim gate in work claim', () => {
     expect(openRunsSync(r.paths.state)).toEqual([b.leaseId]);
   });
 
+  it('a corrupt record names its file and says how to recover; removing the record dir clears the gate', async () => {
+    const r = rig();
+    const b = await claim(r);
+    await strayRecord(r, b.leaseId);
+    writeFileSync(runRecordPath(r.paths.state, b.leaseId), '{not json');
+    const rel = await err(r.sched.release(b.leaseId, 'x'));
+    expect(rel.message).toContain(runRecordPath(r.paths.state, b.leaseId));
+    expect(rel.hint).toContain(`MINIONS_WORKER_LEASE=${b.leaseId}`);
+    expect(rel.hint).toContain(runDir(r.paths.state, b.leaseId));
+    await r.plain.release(b.leaseId, 'x');
+    const gate = await err(claim(r));
+    expect(gate.code).toBe('POLICY_DENIED');
+    expect(gate.message).toMatch(/cannot be read/);
+    expect(gate.hint).toContain(runDir(r.paths.state, b.leaseId));
+    rmSync(runDir(r.paths.state, b.leaseId), { recursive: true });
+    expect((await claim(r)).leaseId).not.toBe(b.leaseId);
+  });
+
   it('a scheduler release keeps the scratch dir of a run that is not done (recovery still checkpoints its clone)', async () => {
     const r = rig();
     const b = await claim(r);
@@ -291,7 +309,9 @@ describe('lease ended before post-exit (task-14.4 review false positive)', () =>
 
 // ------------------------------------------------------------------------------------- escapee sweep (fake /proc)
 
-interface FakeProc { pid: number; ppid: number; filters?: number | null; state?: string; start?: string; pgrp?: number }
+// `lease`: the run marker in environ (default: SWEPT for a sandboxed process, none otherwise); null: no environ file.
+interface FakeProc { pid: number; ppid: number; filters?: number | null; state?: string; start?: string; pgrp?: number; lease?: string | null }
+const SWEPT = 'lease-swept';
 function fakeProc(root: string, procs: FakeProc[]): string {
   const dir = join(root, 'proc');
   for (const p of procs) {
@@ -299,6 +319,8 @@ function fakeProc(root: string, procs: FakeProc[]): string {
     const rest = [p.state ?? 'S', p.ppid, p.pgrp ?? p.pid, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 20, 0, 1, 0, p.start ?? '100'];
     writeFileSync(join(dir, String(p.pid), 'stat'), `${p.pid} (x y) ${rest.join(' ')} 0 0\n`);
     writeFileSync(join(dir, String(p.pid), 'status'), `Name:\tx\nPPid:\t${p.ppid}\n${p.filters === null ? '' : `Seccomp:\t2\nSeccomp_filters:\t${p.filters ?? 1}\n`}`);
+    const lease = p.lease === undefined ? ((p.filters ?? 1) > 1 ? SWEPT : undefined) : p.lease;
+    if (lease !== null) writeFileSync(join(dir, String(p.pid), 'environ'), `PATH=/usr/bin\0${lease ? `MINIONS_WORKER_LEASE=${lease}\0` : ''}HOME=/h\0`);
   }
   mkdirSync(join(dir, 'sys', 'kernel', 'random'), { recursive: true });
   writeFileSync(join(dir, 'sys', 'kernel', 'random', 'boot_id'), 'fake-boot\n');
@@ -324,7 +346,7 @@ describe('escapee sweep (Seccomp_filters above the container baseline, injectabl
   it('kills only sandboxed processes whose ancestry reaches no live wrapper, never the sweeper, its ancestors or init', async () => {
     const proc = tree(makeDefaultEnv().root);
     const killed: number[] = [];
-    const r = await sweepEscapees({ proc, self: 50, liveWrappers: [{ pid: 100, startTime: '500' }, { pid: 500, startTime: '1' }], kill: (pid) => killed.push(pid) });
+    const r = await sweepEscapees({ leaseId: SWEPT, proc, self: 50, liveWrappers: [{ pid: 100, startTime: '500' }, { pid: 500, startTime: '1' }], kill: (pid) => killed.push(pid) });
     expect(r).toMatchObject({ baseline: 1, skipped: null });
     expect(killed.sort((a, b) => a - b)).toEqual([200, 201, 501]);
   });
@@ -332,14 +354,14 @@ describe('escapee sweep (Seccomp_filters above the container baseline, injectabl
   it('the baseline is init\'s count, so a sweeper that is itself sandboxed still sees escapees', async () => {
     const proc = fakeProc(makeDefaultEnv().root, [{ pid: 1, ppid: 0 }, { pid: 60, ppid: 1, filters: 2 }, { pid: 61, ppid: 1, filters: 2 }]);
     const killed: number[] = [];
-    await sweepEscapees({ proc, self: 60, liveWrappers: [], kill: (pid) => killed.push(pid) });
+    await sweepEscapees({ leaseId: SWEPT, proc, self: 60, liveWrappers: [], kill: (pid) => killed.push(pid) });
     expect(killed).toEqual([61]);
   });
 
   it('skips (and says so) when Seccomp_filters is unavailable', async () => {
     const proc = fakeProc(makeDefaultEnv().root, [{ pid: 1, ppid: 0, filters: null }, { pid: 50, ppid: 1, filters: null }, { pid: 70, ppid: 1, filters: null }]);
     const killed: number[] = [];
-    const r = await sweepEscapees({ proc, self: 50, liveWrappers: [], kill: (pid) => killed.push(pid) });
+    const r = await sweepEscapees({ leaseId: SWEPT, proc, self: 50, liveWrappers: [], kill: (pid) => killed.push(pid) });
     expect(r.skipped).toMatch(/Seccomp_filters is not available/);
     expect(killed).toEqual([]);
   });
@@ -349,7 +371,7 @@ describe('escapee sweep (Seccomp_filters above the container baseline, injectabl
     const b = await claim(r);
     const { p, rec } = await running(r, b, [{ op: 'sleep', ms: 60_000 }]);
     forgeDeadRunner(r, rec);
-    const proc = fakeProc(r.root, [{ pid: 1, ppid: 0 }, { pid: process.pid, ppid: 1 }, { pid: 777, ppid: 1, filters: 2 }]);
+    const proc = fakeProc(r.root, [{ pid: 1, ppid: 0 }, { pid: process.pid, ppid: 1 }, { pid: 777, ppid: 1, filters: 2, lease: b.leaseId }, { pid: 778, ppid: 1, filters: 2, lease: 'lease-other' }]);
     const killed: number[] = [];
     // The fake kill removes the process from the fake tree, as a real SIGKILL would.
     const reaped = await reapRun(b.leaseId, r.reapDeps({ escapees: { proc, kill: (pid) => { killed.push(pid); rmSync(join(proc, String(pid)), { recursive: true }); } } }));
@@ -452,7 +474,7 @@ describe('tester regressions: escapee sweep protection', () => {
       { pid: 60, ppid: 1, filters: 2 }, // a real escapee
     ]);
     const killed: number[] = [];
-    await sweepEscapees({ proc, self: 50, liveWrappers: [], kill: (pid) => killed.push(pid) });
+    await sweepEscapees({ leaseId: SWEPT, proc, self: 50, liveWrappers: [], kill: (pid) => killed.push(pid) });
     expect(killed).toEqual([60]);
   });
 
@@ -460,8 +482,40 @@ describe('tester regressions: escapee sweep protection', () => {
     const proc = fakeProc(makeDefaultEnv().root, [{ pid: 1, ppid: 0, filters: 5 }, { pid: 50, ppid: 1 }, { pid: 70, ppid: 1, filters: 2 }]);
     rmSync(join(proc, '1', 'status'));
     const killed: number[] = [];
-    const r = await sweepEscapees({ proc, self: 50, liveWrappers: [], kill: (pid) => killed.push(pid) });
+    const r = await sweepEscapees({ leaseId: SWEPT, proc, self: 50, liveWrappers: [], kill: (pid) => killed.push(pid) });
     expect(r.baseline).toBe(1);
     expect(killed).toEqual([70]);
+  });
+});
+
+describe('escapee sweep: only processes marked with the recovered lease are candidates (task-14.5 repair)', () => {
+  it('spares unrelated seccomp processes, other runs\' children (also a starting run with no recorded wrapper) and unreadable environs', async () => {
+    const proc = fakeProc(makeDefaultEnv().root, [
+      { pid: 1, ppid: 0 },
+      { pid: 50, ppid: 1 }, // the sweeper
+      { pid: 80, ppid: 1, filters: 2, lease: undefined }, // default marker: SWEPT, an escapee of the recovered lease
+      { pid: 81, ppid: 1, filters: 3, lease: '' }, // a Chromium renderer or another tool under seccomp-bpf: no marker
+      { pid: 82, ppid: 1, filters: 2, lease: 'lease-starting' }, // the sandboxed child of a run whose wrapper is not recorded yet
+      { pid: 83, ppid: 1, filters: 2, lease: null }, // environ unreadable (gone, or another user)
+      { pid: 84, ppid: 1, filters: 2, lease: `${SWEPT}2` }, // a lease id that only starts with the recovered one
+    ]);
+    const killed: number[] = [];
+    const r = await sweepEscapees({ leaseId: SWEPT, proc, self: 50, liveWrappers: [], kill: (pid) => killed.push(pid) });
+    expect(r.skipped).toBeNull();
+    expect(killed).toEqual([80]);
+  });
+
+  it('hasRunMarker matches the exact NUL-separated entry and is false for a missing file', async () => {
+    const proc = fakeProc(makeDefaultEnv().root, [{ pid: 1, ppid: 0 }, { pid: 90, ppid: 1, filters: 2, lease: 'lease-a' }, { pid: 91, ppid: 1, filters: 2, lease: null }]);
+    expect(await hasRunMarker(90, 'lease-a', proc)).toBe(true);
+    expect(await hasRunMarker(90, 'lease-', proc)).toBe(false);
+    expect(await hasRunMarker(91, 'lease-a', proc)).toBe(false);
+    expect(await hasRunMarker(999, 'lease-a', proc)).toBe(false);
+  });
+
+  it('the runner sets the marker last in the child environment, so a plan cannot override it', () => {
+    const src = readFileSync(new URL('../../src/runtime/runner/run.ts', import.meta.url), 'utf8');
+    const env = /const childEnv[^]*?\n {4}\};/.exec(src)?.[0] ?? '';
+    expect(env.trim().split('\n').at(-2)?.trim()).toBe('[RUN_MARKER_ENV]: leaseId,');
   });
 });

@@ -49,7 +49,7 @@ import { cachedSandboxSelfTest, containerRealTargets, probeIdentity, runSandboxS
 import { SANDBOX_BIN } from './sandbox/rules.js';
 import { PROCESS_ADAPTERS } from './runner/adapters.js';
 import { reapRun, recoverRuns, runLease, type ReapDeps, type RecoverySweep, type RunOutput } from './runner/run.js';
-import { openRunsSync, withOpenRuns } from './runner/record.js';
+import { hasOpenRun, openRunsSync, withOpenRuns } from './runner/record.js';
 
 /** Human output of `minions work next`. */
 export function humanNext(r: NextReport): string {
@@ -817,8 +817,13 @@ export function register(program: Command): void {
       resetRuntimeHandles();
       // The restored leases have no worker here, and `coordinator restart` refuses while any is active.
       const s = r.restoredActiveLeases.length ? await scheduler().catch(() => null) : null;
-      const rel = await releaseRestoredLeases(getDb(), s ? (id, why) => s.release(id, why) : null);
+      const state = runtimePaths().state;
+      const rel = await releaseRestoredLeases(getDb(), s ? (id, why) => s.release(id, why) : null, undefined, (id) => hasOpenRun(state, id));
       for (const f of rel.failed) r.warnings.push(`Lease ${f.leaseId} was ended directly in the DB (${f.error}); check its task's backlog status.`);
+      for (const k of rel.kept) {
+        r.warnings.push(`Lease ${k.leaseId} stays active: it has an unfinished process run and its release failed (${k.error}). `
+          + `Run \`minions work release ${k.leaseId} --reason restored\` once that is fixed (or \`minions coordinator restart --recover\`).`);
+      }
       const out = { ...r, releasedLeases: rel.released };
       emit(out, { json: globalOpts(cmd).json, human: (d: typeof out) => [`Restored ${d.restored.files} files from a backup of ${d.restored.createdAt} (schema ${d.restored.schemaVersion}).`,
         ...(d.previous ? [`Previous state moved to ${d.previous}`] : []), ...(d.releasedLeases.length ? [`Released restored lease(s): ${d.releasedLeases.join(', ')}`] : []),

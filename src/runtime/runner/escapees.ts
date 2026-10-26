@@ -1,9 +1,16 @@
-// The escapee sweep of recovery (docs/design/agent-runtimes.md D3b step 3, U-G6). Only the minions-sandbox
-// wrapper adds a seccomp filter, so a process whose `Seccomp_filters` count in /proc/<pid>/status is above the
-// container baseline is a sandboxed worker. One whose ancestry does not reach a live wrapper has lost its
-// supervisor (wrapper SIGKILLed, e.g. by OOM) and is killed.
+// The escapee sweep of recovery (docs/design/agent-runtimes.md D3b step 3, U-G6). A process is an escapee of the
+// lease being recovered only when all of these hold: its `Seccomp_filters` count in /proc/<pid>/status is above the
+// container baseline (it runs under a seccomp filter), its /proc/<pid>/environ carries the runner's marker
+// `MINIONS_WORKER_LEASE=<that lease>` (set by the runner for the wrapper and inherited by everything under it), and
+// its ancestry reaches no live wrapper. Such a process has lost its supervisor (wrapper SIGKILLed, e.g. by OOM).
 //
 // Decisions (task-14.5):
+// - The marker check keeps the sweep away from unrelated seccomp users (Chromium/Playwright renderers, Claude Code
+//   sandboxed commands of other workers) and from the sandboxed children of other runs, including a run that is
+//   starting and has not recorded its wrapper yet: those carry another lease id or none. An unreadable environ
+//   (another user, a race with exit) counts as unmarked: the sweep never kills what it cannot identify.
+// - Residual: a sandboxed process that re-execs with a cleared environment drops the marker and is not swept; the
+//   recorded process-group kill still reaches it unless it also left the group.
 // - The baseline is PID 1's count (the container init carries Docker's filter, which everything inherits); when
 //   PID 1's status is unreadable, the sweeping process's own count.
 // - When neither status has the field (Linux < 5.9), the sweep is skipped and says so: the isolation self-test
@@ -25,7 +32,19 @@ export async function procStatus(pid: number, proc = '/proc'): Promise<ProcStatu
   return { seccompFilters: field('Seccomp_filters'), ppid: field('PPid') };
 }
 
+/** The runner's per-run marker (an environment variable of the wrapper and all its descendants). */
+export const RUN_MARKER_ENV = 'MINIONS_WORKER_LEASE';
+
+/** True when /proc/<pid>/environ has `MINIONS_WORKER_LEASE=<leaseId>`; false when it has not or is unreadable. */
+export async function hasRunMarker(pid: number, leaseId: string, proc = '/proc'): Promise<boolean> {
+  let env: string;
+  try { env = await readFile(join(proc, String(pid), 'environ'), 'utf8'); } catch { return false; }
+  return env.split('\0').includes(`${RUN_MARKER_ENV}=${leaseId}`);
+}
+
 export interface EscapeeSweepOptions {
+  /** The lease being recovered: only processes carrying its marker are candidates. */
+  leaseId: string;
   /** The /proc root (tests: a fake tree). */
   proc?: string;
   /** Wrappers that are still supervising a run: their descendants are spared. */
@@ -79,6 +98,7 @@ export async function sweepEscapees(o: EscapeeSweepOptions): Promise<EscapeeSwee
       const st = await procStatus(pid, proc);
       if (!st || st.seccompFilters === null || st.seccompFilters <= baseline) continue;
       if ((await procStat(pid, proc))?.state === 'Z') continue;
+      if (!(await hasRunMarker(pid, o.leaseId, proc))) continue;
       let supervised = false;
       for (const a of await ancestors(pid, proc)) if (await isLiveWrapper(a)) { supervised = true; break; }
       if (supervised) continue;

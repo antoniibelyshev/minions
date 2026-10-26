@@ -97,8 +97,19 @@ export async function readRunRecord(state: string, leaseId: string): Promise<Run
   }
   try { return JSON.parse(text) as RunRecord; } catch {
     // Fail closed: an unreadable record counts as a run that is not done.
-    throw new MinionsError('INTERNAL', `The run record of ${leaseId} is unreadable.`, `Inspect ${runRecordPath(state, leaseId)}.`);
+    throw new MinionsError('INTERNAL', `The run record of ${leaseId} (${runRecordPath(state, leaseId)}) is not valid JSON: recovery cannot tell which processes belong to the run.`,
+      corruptRecordHint(state, leaseId));
   }
+}
+
+/**
+ * How to recover from a run record that cannot be parsed (manual: recovery fails closed on it). The run's processes
+ * carry the marker `MINIONS_WORKER_LEASE=<lease>` in their environment, which identifies any that are left.
+ */
+export function corruptRecordHint(state: string, leaseId: string): string {
+  return `Inspect ${runRecordPath(state, leaseId)}. Check that no process of the run is left (\`grep -ls 'MINIONS_WORKER_LEASE=${leaseId}' /proc/[0-9]*/environ\`; `
+    + `SIGKILL any it lists), then remove the record dir ${runDir(state, leaseId)} and retry (\`minions work release ${leaseId}\` if the lease is still active, `
+    + 'or the claim). The clone of the run is then not checkpointed: inspect the lease scratch dir for work to keep first.';
 }
 
 /** Atomically rewrites the record with `patch` applied; returns the new record. */

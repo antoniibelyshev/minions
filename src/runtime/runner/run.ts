@@ -34,7 +34,7 @@ import {
   acquireOwner, listRunRecords, ownerAlive, ownerToken, ownsRun, readOwner, releaseOwner, removeRunRecord,
   type ProcIdentity, type RunRecord, type RunRole, type HostIdentity,
 } from './record.js';
-import { sweepEscapees, type EscapeeSweep } from './escapees.js';
+import { RUN_MARKER_ENV, sweepEscapees, type EscapeeSweep } from './escapees.js';
 import { branchRuleAndFetch, createClone, diffLeaseGit, restoreLeaseGit, sanitizeClone, sharedTarget, snapshotLeaseGit, wipCommit, writeNoFollow, type RepoContext } from './repo.js';
 import { DEFAULT_TIMING, supervise, type StopReason, type SuperviseTiming } from './supervise.js';
 
@@ -289,8 +289,10 @@ export async function runLease(leaseId: string, deps: RunnerDeps): Promise<RunOu
     }
     const childEnv: Record<string, string> = {
       PATH: env.PATH ?? '/usr/local/bin:/usr/bin:/bin', HOME: harnessHome, TMPDIR: tmpDir, LANG: env.LANG ?? 'C.UTF-8', TERM: 'dumb',
-      MINIONS_WORKER_LEASE: leaseId, MINIONS_ROLE: lease.role, MINIONS_BRIEF_FILE: briefFile, MINIONS_RESULT_FILE: resultFile,
+      MINIONS_ROLE: lease.role, MINIONS_BRIEF_FILE: briefFile, MINIONS_RESULT_FILE: resultFile,
       ...plan.env, ...secrets,
+      // Last, so that no plan can change it: the escapee sweep identifies this run's processes by it.
+      [RUN_MARKER_ENV]: leaseId,
     };
     let argv = plan.argv;
     const secretValues = Object.values(secrets);
@@ -489,7 +491,7 @@ export async function reapRun(leaseId: string, deps: ReapDeps): Promise<ReapOutc
     }
     const sweepProc = deps.escapees?.proc ?? proc;
     if (deps.escapees) {
-      escapees = await sweepEscapees({ proc: sweepProc, liveWrappers: await liveWrappers(state, leaseId, host, proc), ...(deps.escapees.kill ? { kill: deps.escapees.kill } : {}) });
+      escapees = await sweepEscapees({ leaseId, proc: sweepProc, liveWrappers: await liveWrappers(state, leaseId, host, proc), ...(deps.escapees.kill ? { kill: deps.escapees.kill } : {}) });
     }
     // Wait (bounded) until every killed process is gone before post-exit touches the clone.
     const until = Date.now() + 5_000;
@@ -518,13 +520,18 @@ export async function reapRun(leaseId: string, deps: ReapDeps): Promise<ReapOutc
   }
 }
 
-/** Wrappers of other records that are still alive on this host (their sandboxed descendants are supervised). */
+/**
+ * Wrappers and runners of other records that are still alive on this host: their descendants are supervised. (The
+ * sweep's lease marker already spares them; this is a second guard. A record that cannot be read is skipped, and
+ * its processes are not candidates anyway, as they carry their own lease's marker.)
+ */
 async function liveWrappers(state: string, except: string, host: HostIdentity, proc: string): Promise<ProcIdentity[]> {
   const out: ProcIdentity[] = [];
   for (const id of await listRunRecords(state)) {
     if (id === except) continue;
     const r = await readRunRecord(state, id).catch(() => null);
-    if (r?.wrapper && sameHost(r.host, host) && await isAlive(r.wrapper, proc)) out.push(r.wrapper);
+    if (!r || !sameHost(r.host, host)) continue;
+    for (const p of [r.wrapper, r.runner]) if (p && await isAlive(p, proc)) out.push(p);
   }
   return out;
 }
