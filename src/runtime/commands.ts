@@ -45,7 +45,10 @@ import { git, workspaceLayout } from './worktree.js';
 import { containerPaths } from '../core/paths.js';
 import { formatWorkProbe, workProbe } from './sandbox/probe.js';
 import { containerProtectedPaths } from './sandbox/rules.js';
-import { containerRealTargets } from './sandbox/selftest.js';
+import { cachedSandboxSelfTest, containerRealTargets, probeIdentity, runSandboxSelfTest } from './sandbox/selftest.js';
+import { SANDBOX_BIN } from './sandbox/rules.js';
+import { PROCESS_ADAPTERS } from './runner/adapters.js';
+import { runLease, type RunOutput } from './runner/run.js';
 
 /** Human output of `minions work next`. */
 export function humanNext(r: NextReport): string {
@@ -511,6 +514,31 @@ export function register(program: Command): void {
         refresh: !!o.refresh,
       });
       emit(r, { json: globalOpts(cmd).json, human: formatWorkProbe });
+    }));
+  work.command('run <leaseId>').description('Coordinator: run the process-harness worker of a claimed lease (launch gate, isolated per-lease clone, supervision, post-exit checks, fast-forward fetch-back, submit by proxy); prints one JSON line when the worker ends')
+    .action(action(async (leaseId: string, _o: unknown, cmd: Command) => {
+      requireMode('runtime');
+      if (runtimeMode() === 'host-runtime') {
+        throw new MinionsError('PRECONDITION', 'Process harnesses run only in the Docker runtime; the host runtime refuses them.', 'Switch with `minions runtime set docker`.');
+      }
+      const paths = runtimePaths();
+      const c = containerPaths();
+      const cfg = await getConfig();
+      const protectedPaths = containerProtectedPaths({ state: paths.state, secretsDir: paths.secretsDir, configDir: c.configDir, pluginDir: paths.pluginDir, claudeHome: c.claudeHome, workspace: paths.workspace },
+        { commonDir: join(paths.repo, '.git') });
+      const real = await containerRealTargets({ db: paths.db, secretsDir: paths.secretsDir, claudeHome: c.claudeHome, repo: paths.repo, state: paths.state, worktrees: paths.worktrees });
+      const r = await runLease(leaseId, {
+        db: getDb(), config: cfg, paths, commonDir: join(paths.repo, '.git'), adapters: PROCESS_ADAPTERS,
+        isolation: {
+          kind: 'sandbox', protectedPaths,
+          selfTest: async () => cachedSandboxSelfTest({
+            cacheFile: join(paths.state, 'run', 'sandbox-probe.json'), identity: await probeIdentity(SANDBOX_BIN),
+            run: () => runSandboxSelfTest({ parent: paths.tmp, protectedPaths, tcpConnectPorts: cfg.harnesses?.network?.tcpConnectPorts, real }),
+          }),
+        },
+      });
+      emit(r, { json: globalOpts(cmd).json, human: (d: RunOutput) => JSON.stringify(d) });
+      if (r.error) process.exitCode = 1;
     }));
   work.command('list').description('List active leases')
     .option('--all', 'include ended leases')
