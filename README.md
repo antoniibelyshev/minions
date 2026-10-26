@@ -24,6 +24,7 @@ Everything the model controls runs inside one Docker container per project. Your
 - [Sensitive changes](#sensitive-changes)
 - [Configuration](#configuration)
 - [Models and budgets](#models-and-budgets)
+- [Other agents (OpenAI Codex)](#other-agents-openai-codex)
 - [Communication](#communication)
 - [GitHub setup](#github-setup)
 - [Setup assistant](#setup-assistant)
@@ -499,7 +500,7 @@ minions config show --explain     # advanced: the raw effective config, every va
 
 ### Changing settings
 
-`minions settings` opens a menu in the terminal: arrow keys (or j/k) move through grouped sections (Delivery, Verification, Reporting, Models, Concurrency, Policy, Permissions, Integrations, Pause), Enter edits the selected item, q quits. Each row shows the current value and where it comes from; the selected row shows a one-line description and how a change takes effect. Without a terminal the menu falls back to numbered prompts. For scripts:
+`minions settings` opens a menu in the terminal: arrow keys (or j/k) move through grouped sections (Delivery, Verification, Reporting, Models, Concurrency, Policy, Permissions, Integrations, Pause, Agents), Enter edits the selected item, q quits. Each row shows the current value and where it comes from; the selected row shows a one-line description and how a change takes effect. Without a terminal the menu falls back to numbered prompts. For scripts:
 
 ```sh
 minions settings --list [--json]                      # every setting, value, source, restart/loosening flags
@@ -513,7 +514,7 @@ minions settings restart                              # graceful coordinator res
 - **Where it is saved.** Changes go to the host-only `config.local.json` of the project. On a shared install, `--shared` writes the committed `.minions/config.json` instead (with a `configRevision` bump; commit it yourself). A local override can't lift a `deny` set in the project config.
 - **No silent loosening.** A change that widens what the team may do (more concurrency or turns, skipping the reviewer or tester, CI instead of local verification, push/PR delivery, auto-merge, starting tasks without asking, a looser capability or permission mode) shows what it allows and needs a yes; `set` needs `--yes` without a terminal.
 - **Taking effect.** Each save regenerates the runtime config and the mounted plugin. Concurrency (max active tasks and engineers), repair cycles, context resets and pause/resume take effect on the runtime's next command. Settings the coordinator and worker definitions read at session start (delivery, verification, reporting, models including the default model, the per-attempt turn limit, permissions) and launch settings (channel, coordinator model, effort, permission mode, the coordinator tool trim, tool search and bundled skills) need a coordinator restart: `settings` offers it (`set --restart` / `--no-restart` decide up front). The restart is graceful: it is refused while workers are active, and `minions settings restart` retries it later.
-- **Tokens.** The GitHub and Telegram items show only provisioned/missing; selecting one runs `minions auth github` / `minions auth telegram`.
+- **Tokens.** The GitHub, Telegram and OpenAI (Codex) key items show only provisioned/missing; selecting one runs `minions auth github` / `minions auth telegram` / `minions auth codex`.
 
 `minions config` stays as an advanced alias: `config show [--explain]` (raw effective config), `config list` (= `settings --list`), `config set` (= `settings set`).
 
@@ -566,6 +567,27 @@ The full shape is defined by the JSON Schema shipped with the package. Unknown f
 - Each attempt is capped at 80 turns, and a task replans after 3 repair cycles. These are attempt limits; they don't cancel the task.
 - Per-task and per-day USD caps are optional and off by default. When set, minions checks known usage before starting each attempt and stops new starts once a cap is reached. Usage figures may be estimates, and minions records how reliable they are. It doesn't promise hard billing enforcement.
 - minions tracks completion time, attempts, repairs, human interventions, and available usage per task.
+
+## Other agents (OpenAI Codex)
+
+By default every worker is a Claude Code subagent. minions can also run workers on another agent harness as a separate, sandboxed process: OpenAI Codex CLI today, JetBrains Junie later (its adapter is not built yet). The design is in [docs/design/agent-runtimes.md](docs/design/agent-runtimes.md).
+
+**What this version allows (phase 1, option b).** Codex runs only as a read-only extra reviewer: a project role `codex-reviewer` (contract `gate`, harness `codex`) is added as a stage after the Claude reviewer in one workflow you pick, and both must approve. Engineering, testing, the built-in review and coordination stay on Claude Code, so Claude credentials are still needed. Nothing a Codex worker writes reaches a branch: a gate on a process harness has a review worktree, no edits and no commits.
+
+**Turning it on.** `minions setup` asks "Which agent should do the work?" (Claude Code, OpenAI Codex CLI, JetBrains Junie, or later). Choosing Codex:
+
+1. stores an OpenAI API key (prompted without echo; the same as `minions auth codex`). Use a key of a dedicated OpenAI project with a usage limit: it is billed at API prices;
+2. asks for the Codex model (an OpenAI model id your key can use) and writes `harnesses.codex.models`;
+3. sets `harnesses.default: "codex"`. It applies only to the roles this version allows on a process harness (project gate roles); every other role stays on Claude Code;
+4. adds the `codex-reviewer` role and its stage after the reviewer in the workflow you choose (`default` writes the derived default stages out explicitly, so `verification.testerRequired` / `reviewerRequired` no longer reshape it).
+
+Everything goes to the host-only `config.local.json` and is validated before it is written. The host runtime refuses process harnesses, so setup does not ask there.
+
+**The harness must be installed.** The runtime image does not include the Codex CLI yet. Codex workers can start only when `codex` is installed in the image; until then a Codex stage ends without a result (the runner reports it as `blocked` with the exit status), and the coordinator tells you. `minions doctor` (`harness.codex`, `harness.network`) and `minions work probe` in the runtime show the binary, its version and the sandbox self-test.
+
+**Changing it later.** `minions settings` (Agents) has `harnesses.default`, the OpenAI key, and one `roles.<role>.harness` item per worker role. A process harness is refused where this version does not allow it (for example `roles.engineer.harness codex`), with the reason. `minions settings set roles.codex-reviewer.harness claude` keeps the second review but runs it on Claude Code; `harnesses.default claude` (or rerunning setup and choosing Claude) turns the squad-wide choice off. Harness changes need a coordinator restart, which `settings` offers.
+
+**How the coordinator runs it.** For a Codex stage `minions work next` returns `launch: {kind: "run", command: "minions work run <leaseId> --json", ...}` instead of an Agent to spawn. The coordinator claims the stage, runs that command in the background and records the result when it exits (the runner submits the result and records the token usage itself). The runner gives the worker a private clone of the branch, runs it under `minions-sandbox` (Landlock and seccomp: no access to `/state`, the secrets mount or the Telegram bot), enforces a wall clock (`harnesses.codex.timeoutMinutes`, default 60) and checks the result before it is submitted.
 
 ## Communication
 
