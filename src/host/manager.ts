@@ -27,6 +27,11 @@
 //   Owner requests have no runtime row, so nothing is marked for them; a refused one is re-offered from its journaled
 //   snapshot. Every config write the manager applies saves the layer file first (src/host/config-history.ts), so
 //   /undo <id> can restore it while the file is still what that change wrote.
+// - /approve <task> <sha> [merge] (task-53.5.4) is an owner request of kind approve: its plan always loosens (two
+//   taps), and the confirmed plan runs approveOnHost in this process (src/host/approvals.ts, injectable as
+//   ManagerDeps.approveOnHost): the host key signs and the runtime's `work approve --signature` goes through the
+//   bounded delegate. The runtime refuses a head that is not the one awaiting approval. The token is never logged,
+//   journaled or sent to the chat; approvals cannot be undone.
 import { open, readFile, rm } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 import type { Command } from 'commander';
@@ -46,6 +51,7 @@ import {
   childUpgrade, confirmOffer, fetchRequests, formatPlan, fromContainerOf, hostCli, mark, offerRequest, planArgv,
   recordApplyResult, rejectRequest, snapshotOf, undoDetail, type ChangePlan, type ChangeRequestDeps,
 } from './change-requests.js';
+import { approveOnHost } from './approvals.js';
 import { applyUndo, beginHistory, completeHistory } from './config-history.js';
 import { readManagerToken } from './credentials.js';
 import { DELEGATE_MAX_OUTPUT_BYTES, DELEGATE_TIMEOUT_MS, delegateCapture } from './delegate.js';
@@ -118,7 +124,9 @@ export type OwnerCommand =
   | { kind: 'restart' }
   | { kind: 'upgrade' }
   | { kind: 'sync' }
-  | { kind: 'undo'; target: string };
+  | { kind: 'undo'; target: string }
+  /** A host-signed approval for exactly this task and full head SHA; merge: true approves merging instead of publishing. */
+  | { kind: 'approve'; taskId: string; head: string; merge: boolean };
 
 // ---------------------------------------------------------------- deps
 
@@ -140,6 +148,8 @@ export interface ManagerDeps {
   log: (line: string) => void;
   /** Whether the process that wrote a confirmed / applying entry still runs. */
   writerAlive?: (e: OutcomeEntry) => boolean;
+  /** Signs and records an approval (default: approveOnHost of src/host/approvals.ts); tests stub it. */
+  approveOnHost?: typeof approveOnHost;
 }
 
 /**
@@ -226,6 +236,9 @@ export function planSummary(plan: ChangePlan): string {
     return `undo ${plan.undo?.target ?? '?'}: ${plan.change.key}: ${formatValue(plan.change.from)} -> ${formatValue(plan.change.to)}${more > 0 ? ` (+${more} more setting${more === 1 ? '' : 's'})` : ''}`;
   }
   if (plan.kind === 'sync') return 'sync the host base branch (strict fast-forward)';
+  if (plan.kind === 'approve' && plan.approval) {
+    return `approve ${plan.approval.scope === 'merge' ? 'merging' : 'publishing'} ${plan.approval.taskId} at ${plan.approval.head}`;
+  }
   return plan.steps[0] ?? plan.kind;
 }
 
@@ -433,7 +446,7 @@ export class HostManager {
     const warnings: string[] = [];
     const w = await mark(project, this.runtime, offer.requestId, 'confirmed', `confirmed in the host manager (digest ${offer.digest.slice(0, 12)})`);
     if (w) warnings.push(w);
-    const argv = plan.kind === 'undo' ? null : planArgv(plan, offer.request);
+    const argv = plan.kind === 'undo' || plan.kind === 'approve' ? null : planArgv(plan, offer.request);
     await this.notify({ status: 'applying', ...ids, text: `Applying change request ${offer.requestId} (project ${offer.projectId}): ${planSummary(plan)}…` });
     let result: { status: 'applied' | 'failed'; detail: string };
     try {
@@ -442,6 +455,8 @@ export class HostManager {
         const r = await this.deps.upgrade(project, plan.kind === 'sync'
           ? { fromContainer: null, dryRun: false, syncOnly: true } : { fromContainer: fromContainerOf(offer.request.payload), dryRun: false });
         result = { status: r.ok ? 'applied' : 'failed', detail: `${plan.kind}: ${r.summary}` };
+      } else if (plan.kind === 'approve') {
+        result = await this.approve(project, plan);
       } else if (plan.kind === 'undo') {
         const u = await applyUndo(project, { target: plan.undo!.target, expectSha256: plan.undo!.expectSha256, restoreSha256: plan.undo!.restoreSha256, undoId: offer.requestId, now: this.deps.now() });
         warnings.push(...u.warnings);
@@ -466,6 +481,27 @@ export class HostManager {
         ...(result.status === 'applied' ? followUp(plan) : []),
         ...warnings.map((x) => `warning: ${displayText(x)}`)].join('\n'),
     });
+  }
+
+  /**
+   * Applies an approve plan: approveOnHost signs with the host key (which never leaves the host) and delegates
+   * `work approve <task> --head <sha> [--merge] --signature <token>` through the bounded runtime. Only the runtime's
+   * envelope message is reported; the argv (it carries the token) is never logged or shown.
+   */
+  private async approve(project: ProjectJson, plan: ChangePlan): Promise<{ status: 'applied' | 'failed'; detail: string }> {
+    const a = plan.approval;
+    if (!a) throw new MinionsError('INTERNAL', `approve plan ${plan.requestId} without an approval.`);
+    let answer: RunResult | null = null;
+    const code = await (this.deps.approveOnHost ?? approveOnHost)(a.taskId, {
+      head: a.head, merge: a.scope === 'merge', json: true, cwd: project.repoPath, note: `approved in the host manager chat (${plan.requestId})`,
+    }, {
+      projectId: project.projectId,
+      delegate: async (args) => {
+        answer = await this.runtime.exec(project, ['minions', ...args, '--json']);
+        return answer.code;
+      },
+    });
+    return approveOutcome(a, code, answer);
   }
 
   private async reject(ev: ManagerEvent): Promise<void> {
@@ -508,7 +544,8 @@ export class HostManager {
       }
       project = all[0]!;
     }
-    const payload: Record<string, unknown> = c.kind === 'config-set' ? { key: c.key, value: c.value, layer: c.layer } : c.kind === 'undo' ? { target: c.target } : {};
+    const payload: Record<string, unknown> = c.kind === 'config-set' ? { key: c.key, value: c.value, layer: c.layer }
+      : c.kind === 'undo' ? { target: c.target } : c.kind === 'approve' ? { taskId: c.taskId, head: c.head, merge: c.merge } : {};
     const req: RequestSnapshot = { id: newOwnerRequestId(), kind: c.kind, payload, reason: null, origin: 'owner' };
     const built = await offerRequest(project, req, this.cr);
     const o = offerOf(built);
@@ -586,6 +623,17 @@ export class HostManager {
       }
     }
   }
+}
+
+/** Reads the runtime's answer to `work approve` (untrusted: only the envelope's message, displayText'd and bounded). */
+export function approveOutcome(a: NonNullable<ChangePlan['approval']>, code: number, r: RunResult | null): { status: 'applied' | 'failed'; detail: string } {
+  let env: { ok?: boolean; data?: { message?: unknown }; error?: { message?: unknown } } | null = null;
+  try { env = r ? JSON.parse(r.stdout.trim().split('\n').filter(Boolean).at(-1) ?? '') : null; } catch { env = null; }
+  const what = `${a.scope === 'merge' ? 'merge' : 'publication'} approval for ${a.taskId} at ${a.head}`;
+  const msg = (v: unknown) => truncateCodePoints(displayText(String(v ?? '')).replace(/\s+/g, ' ').trim(), 500);
+  if (env && env.ok === true && code === 0) return { status: 'applied', detail: `${what} recorded: ${msg(env.data?.message)}` };
+  if (env && env.ok === false) return { status: 'failed', detail: `${what} refused by the runtime: ${msg(env.error?.message)}` };
+  return { status: 'failed', detail: `${what}: no result from the runtime (exit ${code})` };
 }
 
 /** After an applied config change: the command that applies what it still needs (each confirmed on its own). */

@@ -18,6 +18,10 @@
 //   so they may set host-owned keys (owner decision Q2; a container request never may), there is no runtime row to
 //   mark, and two kinds exist only for them: `sync` (`minions upgrade --sync-only`) and `undo` (restore a config
 //   file from the config history, src/host/config-history.ts).
+// - `approve` (task-53.5.4: /approve <task> <sha> [merge] in the manager chat) is owner-only too: a signed publication
+//   (or, with merge, merge) approval for exactly (task, full head SHA). Its plan always loosens (so the chat asks
+//   twice), the host manager applies it in-process through approveOnHost (src/host/approvals.ts: the host key signs,
+//   the runtime's `work approve` checks the head and records the token), and it can never be undone.
 import { spawn } from 'node:child_process';
 import type { Command } from 'commander';
 import { isGithubDelivery } from '../config/delivery.js';
@@ -46,8 +50,17 @@ import { formatValue, loadSettingsContext, parseSettingValue, planSetting, requi
 
 // ---------------------------------------------------------------- plan and digest
 
-/** The kinds of a plan: the container's request kinds, plus the owner-only sync and undo. */
-export type PlanKind = ChangeRequestKind | 'sync' | 'undo';
+/** The kinds of a plan: the container's request kinds, plus the owner-only sync, undo and approve. */
+export type PlanKind = ChangeRequestKind | 'sync' | 'undo' | 'approve';
+
+/** Task ids an approval may name (the backlog's `task-<n>[.<n>...]`). */
+export const APPROVE_TASK_ID_PATTERN = /^task-\d+(?:\.\d+)*$/;
+/** The head an approval is bound to: the full 40-character lowercase commit SHA (short SHAs are refused). */
+export const APPROVE_HEAD_PATTERN = /^[0-9a-f]{40}$/;
+export type ApprovalPlanScope = 'publish' | 'merge';
+export const approvalScopeText = (scope: ApprovalPlanScope) => scope === 'merge'
+  ? 'merge (arms the merge of the delivered pull request at this exact head)'
+  : 'publish (push the branch / open the pull request for this exact head)';
 
 export interface ChangePlan {
   requestId: string;
@@ -60,6 +73,8 @@ export interface ChangePlan {
    * text it restores, and every setting the restore changes in that file (`change` is the first, the entry's own key).
    */
   undo?: { target: string; expectSha256: string; restoreSha256: string; changes: { key: string; from: unknown; to: unknown; class: string }[] };
+  /** approve: the task, the exact full head SHA and the scope the host signs. */
+  approval?: { taskId: string; head: string; scope: ApprovalPlanScope };
   /** The effective configRevision the plan was computed against. */
   configRevision: number;
   /** The request's reason as shown to the owner: quoted, control characters stripped, cut to 300 characters. */
@@ -127,6 +142,7 @@ export function planArgv(plan: Pick<ChangePlan, 'kind' | 'change' | 'configRevis
   }
   if (plan.kind === 'sync') return ['upgrade', '--sync-only'];
   if (plan.kind === 'undo') throw new MinionsError('INTERNAL', 'an undo runs in the host manager, not as a child command.');
+  if (plan.kind === 'approve') throw new MinionsError('INTERNAL', 'an approval is signed in the host manager, not as a child command.');
   throw new MinionsError('PRECONDITION', `Unknown change kind "${displayText(String(plan.kind))}".`);
 }
 
@@ -172,7 +188,7 @@ async function assertUpgradeDelivery(project: ProjectJson, req: RequestSnapshot,
  */
 export async function buildPlan(project: ProjectJson, req: RequestSnapshot, deps: ChangeRequestDeps, pre: { dry?: UpgradeRun } = {}): Promise<{ plan: ChangePlan; notes: string[] }> {
   const owner = isOwnerRequest(req);
-  if (!owner && (req.kind === 'sync' || req.kind === 'undo' || req.origin !== undefined || isOwnerRequestId(req.id))) {
+  if (!owner && (req.kind === 'sync' || req.kind === 'undo' || req.kind === 'approve' || req.origin !== undefined || isOwnerRequestId(req.id))) {
     throw new MinionsError('PRECONDITION', `Change request ${displayText(req.id)}: kind "${displayText(String(req.kind))}" comes only from the owner in the manager chat; nothing to apply.`);
   }
   const base = { requestId: req.id, projectId: project.projectId, reason: quotedReason(req.reason), change: null, loosens: null, upgradeSteps: null, ...(owner ? { origin: 'owner' as const } : {}) };
@@ -219,6 +235,7 @@ export async function buildPlan(project: ProjectJson, req: RequestSnapshot, deps
     };
   }
   if (req.kind === 'undo') return planUndo(project, req, base, configRevision);
+  if (req.kind === 'approve') return planApprove(req, base, configRevision);
   if (req.kind === 'upgrade') {
     let dry = pre.dry;
     if (dry) await assertUpgradeDelivery(project, req, fromContainerOf(req.payload));
@@ -235,6 +252,37 @@ export async function buildPlan(project: ProjectJson, req: RequestSnapshot, deps
 }
 
 /**
+ * An owner approval: a host-signed approval for exactly (taskId, full head SHA), scope publish or merge. It always
+ * loosens (it authorizes a publication or a merge), so the chat asks twice. The head is checked against the task's
+ * awaiting head by the runtime's `work approve` at apply time (refused there on a mismatch, nothing recorded).
+ */
+function planApprove(req: RequestSnapshot, base: Omit<ChangePlan, 'kind' | 'configRevision' | 'interrupts' | 'steps'>, configRevision: number): { plan: ChangePlan; notes: string[] } {
+  const { taskId, head, merge } = req.payload as { taskId?: unknown; head?: unknown; merge?: unknown };
+  if (typeof taskId !== 'string' || !APPROVE_TASK_ID_PATTERN.test(taskId)) {
+    throw new MinionsError('PRECONDITION', `Request ${displayText(req.id)}: the task id must look like task-12 or task-12.3; nothing to approve.`);
+  }
+  if (typeof head !== 'string' || !APPROVE_HEAD_PATTERN.test(head)) {
+    throw new MinionsError('PRECONDITION', `Request ${displayText(req.id)}: the head must be the full 40-character lowercase commit SHA (short SHAs are refused); nothing to approve.`,
+      'Copy the full head SHA from the awaiting-approval message.');
+  }
+  if (typeof merge !== 'boolean') throw new MinionsError('PRECONDITION', `Request ${displayText(req.id)}: malformed approve payload; nothing to approve.`);
+  const scope: ApprovalPlanScope = merge ? 'merge' : 'publish';
+  return {
+    plan: {
+      ...base, kind: 'approve', configRevision,
+      approval: { taskId, head, scope },
+      loosens: `signs a ${merge ? 'merge' : 'publication'} approval for ${taskId} at ${head}`,
+      interrupts: null,
+      steps: [`minions work approve ${taskId} --head ${head}${merge ? ' --merge' : ''} (signed with the host key in the host manager; the token never leaves the host)`],
+    },
+    notes: [
+      'the runtime refuses the approval when this is not the exact head awaiting it; nothing is recorded then',
+      'an approval cannot be undone: a new commit needs a new approval, and an unused one expires',
+    ],
+  };
+}
+
+/**
  * The undo of a config change applied by the host manager: restore the file text before it (compare-and-swap). The
  * history entry is not trusted: the file comes from the project and the entry's layer, and the plan lists every
  * setting the restore changes (the loosening check runs over all of them); anything else changing refuses.
@@ -242,6 +290,10 @@ export async function buildPlan(project: ProjectJson, req: RequestSnapshot, deps
 async function planUndo(project: ProjectJson, req: RequestSnapshot, base: Omit<ChangePlan, 'kind' | 'configRevision' | 'interrupts' | 'steps'>, configRevision: number): Promise<{ plan: ChangePlan; notes: string[] }> {
   const target = req.payload.target;
   if (typeof target !== 'string') throw new MinionsError('PRECONDITION', `Request ${req.id}: malformed undo payload; nothing to apply.`);
+  if ((await readJournal()).some((e) => e.type === 'offer' && e.projectId === project.projectId && e.requestId === target && e.request.kind === 'approve')) {
+    throw new MinionsError('PRECONDITION', `${target} is an approval: approvals cannot be undone. Nothing was changed.`,
+      'An unused approval expires by itself, and a new commit needs a new approval anyway.', { refusal: 'approval' });
+  }
   const check = await checkUndo(project, target);
   const { entry, file, expectSha256, restoreSha256 } = check;
   const restored = await validateRestore(project, entry);
@@ -268,6 +320,7 @@ export function formatPlan(plan: ChangePlan, digest: string, notes: string[]): s
     `${owner ? 'owner request' : 'change request'} ${plan.requestId} (${plan.kind}) for project ${plan.projectId}, configRevision ${plan.configRevision}`,
     owner ? 'requested by you in the manager chat (typing the command is not consent: confirm this exact plan)' : `reason (from the container, untrusted): ${plan.reason}`,
     ...(plan.undo ? [`undoes: ${plan.undo.target}`] : []),
+    ...(plan.approval ? [`approves: ${plan.approval.taskId} at head ${plan.approval.head}`, `scope: ${approvalScopeText(plan.approval.scope)}`] : []),
     ...(plan.undo && plan.undo.changes.length > 1
       ? plan.undo.changes.map((c) => `change: ${c.key}: ${formatValue(c.from)} -> ${formatValue(c.to)} (${plan.change?.layer ?? ''} layer, ${plan.change?.file ?? ''}; class ${c.class})`)
       : plan.change ? [`change: ${plan.change.key}: ${formatValue(plan.change.from)} -> ${formatValue(plan.change.to)} (${plan.change.layer} layer, ${plan.change.file}; class ${plan.change.class})`] : []),
@@ -454,6 +507,10 @@ async function execute(project: ProjectJson, plan: ChangePlan, offer: OfferEntry
     out.status = out.applied ? 'applied' : 'failed';
     out.detail = `coordinator restart: ${r.action} - ${r.detail}`;
     return;
+  }
+  if (plan.kind === 'approve') {
+    throw new MinionsError('PRECONDITION', `Request ${plan.requestId}: an approval offered in the manager chat is confirmed only there; nothing signed.`,
+      'Tap Confirm in the manager chat, or run `minions work approve <task> --head <sha>` on the host.');
   }
   if (plan.kind === 'undo') {
     const r = await applyUndo(project, { target: plan.undo!.target, expectSha256: plan.undo!.expectSha256, restoreSha256: plan.undo!.restoreSha256, undoId: plan.requestId, now: deps.now?.() });
