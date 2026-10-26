@@ -173,7 +173,7 @@ describe('QA: queued restarts', () => {
     expect(s.manager.queuedRestarts()).toEqual([]);
   });
 
-  it('Drain now refused again at the idle poll: the pause is resumed once, never re-paused, and only `settings restart` is retried', async () => {
+  it('Drain now refused again at the idle poll: it pauses again with the drain, stays queued, and only `settings restart` is retried', async () => {
     const { project } = await install();
     let refuse = 2; // the first (plain) restart and the first idle poll
     const w: World = { leases: 1, pausedStarts: false, running: true, restart: () => (refuse-- > 0 ? 'refused' : 'restarted') };
@@ -182,12 +182,45 @@ describe('QA: queued restarts', () => {
     await s.confirm(s.offers.find((o) => o.summary.startsWith('Drain now'))!);
     w.leases = 0;
     await s.manager.pollAll();
+    // Resumed before the restart, refused, then paused again with the drain: still queued, starts closed.
+    expect(s.delegateCalls.filter((c) => c[1] === 'resume' || c[1] === 'pause').map((c) => c.join(' '))).toEqual([
+      'minions pause --starts --drain --reason restart --json',
+      'minions resume --starts --json',
+      'minions pause --starts --drain --reason restart --json',
+    ]);
+    expect(w.pausedStarts).toBe(true);
     expect(s.manager.queuedRestarts()).toHaveLength(1);
+    expect(s.outcomes.at(-1)!.status).toBe('queued');
     await s.manager.pollAll();
     expect(s.outcomes.at(-1)).toMatchObject({ status: 'applied' });
-    expect(s.delegateCalls.filter((c) => c[1] === 'pause')).toHaveLength(1);
-    expect(s.delegateCalls.filter((c) => c[1] === 'resume')).toHaveLength(1);
+    expect(s.delegateCalls.filter((c) => c[1] === 'pause')).toHaveLength(2);
+    expect(s.delegateCalls.filter((c) => c[1] === 'resume')).toHaveLength(2);
+    expect(w.pausedStarts).toBe(false);
     expect(new Set(s.runs.map((r) => r.join(' ')))).toEqual(new Set(['settings restart']));
+  });
+
+  it('Drain now refused again and the re-pause fails: reported once, it stays queued as a plain restart when idle', async () => {
+    const { project } = await install();
+    let refuse = 2;
+    let pauses = 0;
+    const w: World = { leases: 1, pausedStarts: false, running: true, restart: () => (refuse-- > 0 ? 'refused' : 'restarted') };
+    const s = setup([project], w);
+    const base = s.deps.delegate!;
+    s.deps.delegate = async (p, argv) => {
+      if (argv[1] === 'pause' && ++pauses > 1) { s.delegateCalls.push(argv); return { code: 1, stdout: JSON.stringify({ ok: false, error: { message: 'database is locked' } }) + '\n', stderr: '' }; }
+      return base(p, argv);
+    };
+    await s.confirm(await s.cmds.propose(null, { kind: 'restart' }));
+    await s.confirm(s.offers.find((o) => o.summary.startsWith('Drain now'))!);
+    w.leases = 0;
+    await s.manager.pollAll();
+    expect(s.outcomes.at(-1)).toMatchObject({ status: 'error', text: expect.stringMatching(/pause --starts --drain failed: database is locked; starts stay open[\s\S]*it stays queued/) });
+    expect(s.manager.queuedRestarts()).toHaveLength(1);
+    expect(w.pausedStarts).toBe(false);
+    await s.manager.pollAll();
+    expect(s.outcomes.at(-1)).toMatchObject({ status: 'applied' });
+    // No second resume: nothing of ours is paused any more.
+    expect(s.delegateCalls.filter((c) => c[1] === 'resume')).toHaveLength(1);
   });
 
   it('a queued restart for one project does not block a restart queued for another', async () => {
@@ -237,20 +270,50 @@ describe('QA: queued restarts', () => {
     expect(s.delegateCalls.filter((c) => c[1] === 'resume')).toEqual([]);
   });
 
-  it('Drain now at the idle poll: starts stay paused while `settings restart` runs and are resumed right after it', async () => {
+  it('Drain now at the idle poll: the pause made here is resumed after a fresh status read and before the restart child', async () => {
     const { project } = await install();
-    const seen: boolean[] = [];
-    const w: World = { leases: 1, pausedStarts: false, running: true, restart: () => { if (w.leases === 0) seen.push(w.pausedStarts); return w.leases > 0 ? 'refused' : 'restarted'; } };
+    const seen: { paused: boolean; calls: string[] }[] = [];
+    const w: World = { leases: 1, pausedStarts: false, running: true, restart: () => (w.leases > 0 ? 'refused' : 'restarted') };
     const s = setup([project], w);
+    const child = s.deps.runChild!;
+    s.deps.runChild = async (p, argv) => { if (w.leases === 0) seen.push({ paused: w.pausedStarts, calls: s.delegateCalls.map((c) => c[1]!) }); return child(p, argv); };
     await s.confirm(await s.cmds.propose(null, { kind: 'restart' }));
     await s.confirm(s.offers.find((o) => o.summary.startsWith('Drain now'))!);
+    const before = s.delegateCalls.length;
     w.leases = 0;
     await s.manager.pollAll();
-    expect(seen).toEqual([true]);
+    // The restarted coordinator's recovery prompt dispatches only with starts open: they are open when it runs.
+    expect(seen).toHaveLength(1);
+    expect(seen[0]!.paused).toBe(false);
+    expect(seen[0]!.calls.slice(before)).toEqual(['status', 'resume']);
     expect(w.pausedStarts).toBe(false);
-    const order = s.delegateCalls.map((c) => c[1]);
-    expect(order.lastIndexOf('resume')).toBeGreaterThan(order.lastIndexOf('status'));
+    expect(s.delegateCalls.filter((c) => c[1] === 'resume').map((c) => c.join(' '))).toEqual(['minions resume --starts --json']);
     expect(s.outcomes.at(-1)).toMatchObject({ status: 'applied' });
+  });
+
+  it('Drain now whose resume fails at the idle poll: no restart runs, it is reported once and stays queued', async () => {
+    const { project } = await install();
+    let failResume = true;
+    const w: World = { leases: 1, pausedStarts: false, running: true, restart: () => (w.leases > 0 ? 'refused' : 'restarted') };
+    const s = setup([project], w);
+    const base = s.deps.delegate!;
+    s.deps.delegate = async (p, argv) => {
+      if (argv[1] === 'resume' && failResume) { s.delegateCalls.push(argv); return { code: 1, stdout: JSON.stringify({ ok: false, error: { message: 'busy' } }) + '\n', stderr: '' }; }
+      return base(p, argv);
+    };
+    await s.confirm(await s.cmds.propose(null, { kind: 'restart' }));
+    await s.confirm(s.offers.find((o) => o.summary.startsWith('Drain now'))!);
+    const runsBefore = s.runs.length;
+    w.leases = 0;
+    await s.manager.pollAll();
+    await s.manager.pollAll();
+    expect(s.runs.length).toBe(runsBefore);
+    expect(s.outcomes.filter((o) => o.status === 'error' && /resume --starts failed before the restart: busy[\s\S]*it stays queued/.test(o.text))).toHaveLength(1);
+    expect(s.manager.queuedRestarts()).toHaveLength(1);
+    failResume = false;
+    await s.manager.pollAll();
+    expect(s.outcomes.at(-1)).toMatchObject({ status: 'applied' });
+    expect(w.pausedStarts).toBe(false);
   });
 
   it('Drain now whose restart fails at the idle poll: the pause made here is still resumed, and the outcome is failed', async () => {

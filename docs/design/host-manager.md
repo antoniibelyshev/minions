@@ -508,13 +508,17 @@ task-53.5.3 and are reused unchanged. Decisions made here:
   the entry stays queued. A restart refused at that moment (a lease started in between) stays queued for the next
   idle poll: the same plan, never another strategy.
 - **Drain now** first reads the pause state, then runs `minions pause --starts --drain --reason restart` in the
-  runtime; a failure there queues nothing. At the idle poll, right after the restart ran (whatever it answered:
-  restarted, refused or failed), it resumes only what it paused: `minions resume --starts` when starts were
-  running before, otherwise `minions resume --drain` (the owner's pause stays). Resuming after the restart keeps
-  starts closed until the restart is done, so a worker started in between cannot refuse it; the restarted
-  coordinator's recovery prompt then finds starts open again a moment later. A runtime that is stopped at the
-  idle poll cannot be resumed: the request closes as failed and the outcome names the pause left in place and the
-  command that clears it.
+  runtime; a failure there queues nothing. It undoes only what it paused. When starts were running before, the
+  idle poll (a fresh status read with no active lease) runs `minions resume --starts` first and then the restart:
+  the restarted coordinator's recovery prompt dispatches only when starts are not paused, and a later resume does
+  not wake a coordinator that already reported "starts paused" and went idle (the same order as `minions
+  upgrade`). A failed resume runs no restart and keeps the entry queued (reported once). If the restart is then
+  refused because a lease started in between, the manager pauses again with `minions pause --starts --drain
+  --reason restart` and keeps the entry queued for the next idle poll; no other strategy is tried (if that pause
+  fails, the problem is reported and the entry waits as a plain restart when idle). When the owner had paused
+  starts already, the owner's pause stays: only the drain is cleared, with `minions resume --drain` right after
+  the restart ran (whatever it answered). A runtime that is stopped at the idle poll cannot be resumed: the
+  request closes as failed and the outcome names the pause left in place and the command that clears it.
 - **CLI backup** (`src/host/cli-backup.ts`). `applyCli` packs the packed global install with
   `npm pack <install dir> --ignore-scripts` (none of its scripts run) right before `npm install -g`, into
   `<MINIONS_HOME>/manager/cli-backup/minions-<version>-<UTC stamp>.tgz` (0600, directory 0700, last 2). A backup

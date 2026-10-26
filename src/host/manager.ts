@@ -36,10 +36,11 @@
 // - Restart when idle / Drain now (task-53.7): a plain restart refused because worker leases are active is followed by
 //   two owner offers, restart mode when-idle and drain. A confirmed one is queued here (in memory; its journal entry
 //   stays `applying`, so a manager restart reports it as interrupted and never resumes it): drain first runs
-//   `pause --starts --drain` in the runtime. Every poll re-checks the active leases; the first idle poll runs
-//   `minions settings restart` and then resumes the pause made here (drain), whatever the restart answered (a stopped
-//   runtime cannot be resumed: the outcome says so). A restart refused again at that moment (a lease
-//   started in between) stays queued; nothing else is tried.
+//   `pause --starts --drain` in the runtime. Every poll re-checks the active leases; the first idle poll resumes a
+//   pause made here (`resume --starts`, before the restart, since the recovery prompt dispatches only with starts
+//   open) and runs `minions settings restart`; an owner's own pause stays and only its drain is cleared after the
+//   restart (a stopped runtime cannot be resumed: the outcome says so). A restart refused again at that moment (a
+//   lease started in between) is paused again with the drain and stays queued; nothing else is tried.
 // - CLI check and roll back (task-53.7): after an upgrade that rebuilt or reinstalled the CLI, `minions --version` and
 //   `minions status` run in fresh processes; when either fails and a backup exists (src/host/cli-backup.ts), a
 //   cli-rollback offer follows (one Confirm reinstalls it). The dev-only rebuild-cli request (src/host/cli-rebuild.ts)
@@ -647,6 +648,11 @@ export class HostManager {
     }
   }
 
+  /** A runtime command's failure as text (null when it succeeded). */
+  private async execWhy(project: ProjectJson, argv: string[]): Promise<string | null> {
+    try { return envelopeError(await this.runtime.exec(project, argv)); } catch (e) { return (e as Error).message; }
+  }
+
   private async tryQueued(q: QueuedRestart): Promise<void> {
     const project = await this.deps.loadProject(q.projectId);
     const ids = { projectId: q.projectId, requestId: q.offer.requestId };
@@ -657,22 +663,37 @@ export class HostManager {
       if (!st || !Array.isArray(st.activeLeases)) throw new MinionsError('INTERNAL', 'the runtime gave no active lease count');
       if (st.activeLeases.length > 0) return;
     }
+    // A pause made here (starts were running before Drain now) is resumed BEFORE the restart: the recovery prompt
+    // of the new coordinator dispatches only when starts are not paused (the same order as `minions upgrade`).
+    const resumedFirst = running && q.resumeStarts;
+    if (resumedFirst) {
+      const why = await this.execWhy(project, ['minions', 'resume', '--starts', '--json']);
+      if (why !== null) throw new MinionsError('INTERNAL', `minions resume --starts failed before the restart: ${why}`);
+      q.resumeStarts = false;
+    }
     const result = childOutcome(q.plan, await this.deps.runChild(project, planArgv(q.plan, q.offer.request)));
-    // The pause made here (Drain now) is undone after the restart ran, so no worker can start in between and
-    // refuse it; it is undone whatever the restart answered. With the runtime stopped it cannot be undone: say so.
+    if (resumedFirst && result.refused) {
+      // A lease started between the status read and the restart: pause again with the drain, same plan next idle poll.
+      const why = await this.execWhy(project, ['minions', 'pause', '--starts', '--drain', '--reason', 'restart', '--json']);
+      if (why !== null) {
+        throw new MinionsError('INTERNAL', `the restart was refused again (a worker lease started) and minions pause --starts --drain failed: ${why}; starts stay open, so it waits as a plain restart when idle`);
+      }
+      q.resumeStarts = true;
+    }
+    // The owner's own pause stays; only the drain made here is cleared, right after the restart ran (whatever it
+    // answered). With the runtime stopped nothing can be undone: say so.
     if (q.resumeStarts || q.clearDrain) {
       const argv = q.resumeStarts ? ['minions', 'resume', '--starts', '--json'] : ['minions', 'resume', '--drain', '--json'];
       const cmd = argv.slice(0, 3).join(' ');
-      if (running) {
-        try {
-          const why = envelopeError(await this.runtime.exec(project, argv));
-          if (why !== null) warnings.push(`${cmd} failed: ${why}`);
-        } catch (e) { warnings.push(`${cmd} failed: ${(e as Error).message}`); }
-      } else {
+      if (!running) {
         warnings.push(`the runtime is not running, so the pause made by Drain now was left in place: run \`${cmd}\` in the project once it is back`);
+        q.resumeStarts = false;
+        q.clearDrain = false;
+      } else if (q.clearDrain) {
+        const why = await this.execWhy(project, argv);
+        if (why !== null) warnings.push(`${cmd} failed: ${why}`);
+        q.clearDrain = false;
       }
-      q.resumeStarts = false;
-      q.clearDrain = false;
     }
     if (result.refused) {
       // A lease started between the status read and the restart: same plan, next idle poll.
