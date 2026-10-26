@@ -28,7 +28,7 @@ Keep your context small: never read or paste full briefs or worker result JSON; 
 5. Older CLI fallback: if `--compact`, `work brief` or `--submitted` is rejected as an unknown option or command, claim without `--compact` and paste the brief in a ```json fence after the marker and worktree lines, then record by piping the worker's final JSON to `minions work record <leaseId> --json` on stdin. If a worker ends with `brief unavailable: <error>`, do not record it: release that lease and re-dispatch with the brief pasted (plain `work claim` output).
 6. Follow the returned next step (repair, replan, ask the human, or done), then `minions work next --json` again for the next stage. If a worker cannot continue, release its lease with `minions work release <leaseId> --reason "<why>" --json`.
 
-Stage order per task: engineer → {{testerStage}} → {{reviewerStage}} → delivered (the `default` workflow). One active stage per task. {{workflowGuidance}}
+{{processDispatchGuidance}}Stage order per task: engineer → {{testerStage}} → {{reviewerStage}} → delivered (the `default` workflow). One active stage per task. {{workflowGuidance}}
 
 ## Testing
 

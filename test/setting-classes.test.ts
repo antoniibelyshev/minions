@@ -11,7 +11,7 @@ import { z } from 'zod';
 import { validateConfig } from '../src/config/resolve.js';
 import { MinionsConfigSchema, type MinionsConfig } from '../src/config/schema.js';
 import { KEY_CLASSES, SETTING_CLASSES, classifyKey, schemaKeyPaths } from '../src/config/setting-classes.js';
-import { SETTINGS, getPath, setPath, type SettingDef } from '../src/host/settings.js';
+import { SETTINGS, getPath, roleHarnessDef, setPath, type SettingDef } from '../src/host/settings.js';
 import { generatePlugin } from '../src/plugin/generate.js';
 import { defaults } from './helpers.js';
 
@@ -139,6 +139,14 @@ describe('classes match the code that applies the key', () => {
     // enforced by the runtime gates): compare there.
     const probes: Record<string, { base: (c: MinionsConfig) => void; to: unknown }> = {
       'delivery.merge': { base: (c) => { c.delivery.mode = 'pull-request'; c.delivery.requiredChecksConfigured = true; c.verification.ciAuthority = 'github'; }, to: 'auto-when-eligible' },
+      // harnesses.default only reaches roles the phase allows (phase 1 b: project gates): compare with one configured.
+      'harnesses.default': {
+        base: (c) => {
+          c.harnesses = { codex: { models: { default: 'gpt-test', allowed: ['gpt-test'] } } };
+          c.roles = { 'codex-reviewer': { description: 'Second review.', promptText: 'Review.', contract: 'gate' } };
+        },
+        to: 'codex',
+      },
     };
     const prompt = SETTINGS.filter((d) => d.apply === 'prompt');
     expect(prompt.length).toBeGreaterThan(20);
@@ -153,4 +161,21 @@ describe('classes match the code that applies the key', () => {
     }
     expect(unchanged).toEqual([]);
   }, 60_000);
+});
+
+describe('per-role harness items (agent-runtimes D8)', () => {
+  it('roles.<r>.harness agrees with the classification and changes the generated plugin', async () => {
+    const d = roleHarnessDef('codex-reviewer');
+    const c = classifyKey(d.key)!;
+    expect({ class: d.class, hostOwned: d.hostOwned }).toEqual({ class: c.class, hostOwned: c.hostOwned });
+    expect(d).toMatchObject({ group: 'Agents', apply: 'prompt', type: 'enum', optional: true });
+    const base = defaults();
+    base.harnesses = { codex: { models: { default: 'gpt-test', allowed: ['gpt-test'] } } };
+    base.roles = { 'codex-reviewer': { description: 'Second review.', promptText: 'Review.', contract: 'gate' } };
+    const before = await pluginText(validateConfig(structuredClone(base), 'test'));
+    const after = await pluginText(validateConfig(setPath(structuredClone(base) as unknown as Record<string, unknown>, d.key, 'codex'), 'test'));
+    expect([...after].some(([k, v]) => before.get(k) !== v)).toBe(true);
+    expect(after.has('agents/codex-reviewer.md')).toBe(false);
+    expect(after.get('harness-prompts/codex-reviewer.md')).toBe('Review.\n');
+  });
 });

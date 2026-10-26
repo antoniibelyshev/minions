@@ -244,8 +244,8 @@ async function confirmOrNull(question: string): Promise<boolean | null> {
   try { return !/^n(o)?$/i.test((await rl.question(`${question} `)).trim()); } finally { rl.close(); }
 }
 
-/** The settings menu's token items: runs the existing `minions auth github|telegram` flow in this terminal. */
-function runAuthFlow(kind: 'github' | 'telegram'): Promise<void> {
+/** The settings menu's token items: runs the existing `minions auth github|telegram|codex` flow in this terminal. */
+function runAuthFlow(kind: 'github' | 'telegram' | 'codex'): Promise<void> {
   return new Promise((resolve) => {
     const child = spawn(process.execPath, [...process.execArgv, process.argv[1]!, 'auth', kind], { stdio: 'inherit' });
     child.on('error', () => resolve());

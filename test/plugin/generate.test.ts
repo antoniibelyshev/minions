@@ -741,7 +741,7 @@ describe('owner behaviour defaults (task-34)', () => {
     expect(orch).toMatch(/A `complete` tester or reviewer result with failing checks is rejected this way; for an engineer `complete` with failing checks, ask the same correction yourself/);
     expect(orch).toContain('Include the spend so far');
     expect(orch).toContain('`minions work record <leaseId> --submitted --usage <subagent_tokens> --json`');
-    expect(orch).toMatch(/Always pass `--usage` \(also on `--correction` records and `work release`\)/);
+    expect(orch).toMatch(/Always pass `--usage` for Agent workers \(also on `--correction` records and `work release`\)/);
     expect(orch).toMatch(/`crossed` 50 or 80 → tell the owner/);
     expect(orch).toContain('`Budget reached`');
     expect(await g.read('coordinator.md')).toContain('--submitted --usage <subagent_tokens> --json');
