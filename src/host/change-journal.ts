@@ -11,10 +11,14 @@
 //   start time, so a manager that starts again can tell an entry of a dead process (interrupted, state unknown) from
 //   an apply still running in another process.
 // - `applied` / `failed` / `rejected`: the outcome.
+// - Owner-initiated requests (task-53.5.3: /set, /sync, /upgrade, /restart, /undo in the manager chat) have no
+//   container row. Their id is host-generated (`ow_` + 8 hex, never the container's `cr_`), their snapshot says
+//   `origin: 'owner'`, and they live only in this journal: nothing marks a runtime row for them.
 // The manager (task-53.4, src/host/manager.ts) adds its own process lock and the offer messages on top of this file.
 import { randomBytes } from 'node:crypto';
 import { appendFile, chmod, open, readFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
+import { isChangeRequestId } from '../runtime/change-requests.js';
 import { MinionsError } from '../core/errors.js';
 import { ensureDir } from '../core/fsutil.js';
 import { managerDir } from '../core/paths.js';
@@ -28,8 +32,21 @@ export { managerDir };
 export const journalPath = () => join(managerDir(), 'journal.jsonl');
 const lockPath = () => join(managerDir(), 'journal.lock');
 
-/** The request as the host read it when it built the plan (untrusted content; re-validated on every use). */
-export interface RequestSnapshot { id: string; kind: string; payload: Record<string, unknown>; reason: string | null }
+/**
+ * The request as the host read it when it built the plan (untrusted content; re-validated on every use).
+ * `origin: 'owner'`: typed by the owner in the manager chat (an `ow_` id that only the host mints); absent for a
+ * container request.
+ */
+export interface RequestSnapshot { id: string; kind: string; payload: Record<string, unknown>; reason: string | null; origin?: 'owner' }
+
+/** Ids of owner-initiated requests: minted by the host manager, never by the container (whose ids are `cr_`). */
+export const OWNER_REQUEST_ID_PATTERN = /^ow_[0-9a-f]{8}$/;
+export const isOwnerRequestId = (s: string) => OWNER_REQUEST_ID_PATTERN.test(s);
+export const newOwnerRequestId = () => `ow_${randomBytes(4).toString('hex')}`;
+/** A request id an offer may carry: a container request (`cr_`) or an owner-initiated one (`ow_`). */
+export const isOfferRequestId = (s: string) => isChangeRequestId(s) || isOwnerRequestId(s);
+/** True only for an owner-initiated request: the host-minted id and the owner origin together. */
+export const isOwnerRequest = (r: Pick<RequestSnapshot, 'id' | 'origin'>) => r.origin === 'owner' && isOwnerRequestId(r.id);
 
 export interface OfferEntry {
   type: 'offer'; at: string; projectId: string; requestId: string;

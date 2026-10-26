@@ -560,3 +560,31 @@ export function upgradeSourceMode(o: { githubDelivery: boolean; fromContainer: b
   if (o.fromContainer) return 'container';
   return o.checkout ? 'checkout' : 'none';
 }
+
+// ---------------------------------------------------------------- sync only (the manager's /sync)
+
+export interface SyncOnlyResult { ok: boolean; steps: SourceStep[]; sync: SyncResult | null; stopped: null }
+
+/**
+ * `minions upgrade --sync-only` (task-53.5.3, the manager's /sync): only the source sync, no CLI and no container
+ * steps. Local delivery: export the container branches and strictly fast-forward the host base (`sync`); GitHub
+ * delivery: fetch origin/<base> and strictly fast-forward (`origin`). Never forces, resets, stashes or checks out:
+ * a dirty tree or a divergence refuses with the reason. A dry run reports a refusal as a failed step (ok false).
+ */
+export async function runSyncOnly(o: { sync: SyncOptions | null; origin: OriginSyncOptions | null; dryRun?: boolean; runner?: Runner }): Promise<SyncOnlyResult> {
+  const dryRun = !!o.dryRun;
+  if (!!o.sync === !!o.origin) throw new MinionsError('INTERNAL', 'upgrade --sync-only needs exactly one source (container or origin).');
+  try {
+    const sync = o.sync
+      ? await syncFromContainer({ ...o.sync, dryRun, runner: o.sync.runner ?? o.runner })
+      : await syncFromOrigin({ ...o.origin!, dryRun, runner: o.origin!.runner ?? o.runner });
+    return { ok: true, steps: [syncStep(sync, dryRun)], sync, stopped: null };
+  } catch (e) {
+    if (!dryRun || !(e instanceof MinionsError)) throw e;
+    return { ok: false, steps: [{ id: 'sync', status: 'failed', detail: `would refuse: ${e.message}` }], sync: null, stopped: null };
+  }
+}
+
+export function formatSyncOnly(r: SyncOnlyResult): string {
+  return [...r.steps.map((s) => `${s.id}: ${s.status} - ${s.detail}`), r.ok ? 'Only the source was synced; run `minions upgrade` for the container.' : 'Nothing was changed.'].join('\n');
+}

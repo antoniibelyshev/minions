@@ -18,7 +18,10 @@
 //   is handled, so a restart does not replay old taps (and the journal's single-use nonce covers the rest).
 // - 409 is "another process polls the manager bot" (CONFLICT); 401/404 is a rejected token (AUTH_REQUIRED); 429 waits
 //   retry_after.
-// - A fixed command set: /status, /requests, /project [name], /help (and /start). Anything else gets the help text.
+// - A fixed command set: /status, /requests, /project [name], /help (and /start), and the owner change commands
+//   /set <key> <value> [shared], /sync, /upgrade, /restart, /undo <id> (task-53.5.3). Anything else gets the help text.
+//   A change command only asks the core for a plan (ManagerCommands.propose) and shows it as an offer with Confirm /
+//   Reject: typing it is never consent, and the tap goes through the same confirmation as a container request.
 import { chmod } from 'node:fs/promises';
 import { join } from 'node:path';
 import { z } from 'zod';
@@ -27,11 +30,10 @@ import { MinionsError } from '../core/errors.js';
 import { ensureDir, readJsonIfExists, writeJson } from '../core/fsutil.js';
 import { redact } from '../core/output.js';
 import { managerDir } from '../core/paths.js';
-import { isChangeRequestId } from '../runtime/change-requests.js';
-import { findOfferByNonce } from './change-journal.js';
+import { findOfferByNonce, isOfferRequestId, isOwnerRequestId } from './change-journal.js';
 import type { Fetch } from './credentials.js';
 import { isOwnerUpdate, type ManagerAccess, type TelegramUpdate } from './manager-bot.js';
-import type { ManagerCommands, ManagerEvent, ManagerOffer, ManagerOutcome, ManagerTransport } from './manager.js';
+import type { ManagerCommands, ManagerEvent, ManagerOffer, ManagerOutcome, ManagerTransport, OwnerCommand } from './manager.js';
 
 /** Telegram's callback_data limit. */
 export const CALLBACK_DATA_MAX_BYTES = 64;
@@ -47,7 +49,7 @@ export type CallbackAction = 'c' | 'r' | 'd';
 /** `c` confirm, `r` reject, `d` the second confirmation of a plan that loosens policy. */
 export function callbackData(action: CallbackAction, requestId: string, nonce: string): string {
   const data = `${action}:${requestId}:${nonce}`;
-  if (!isChangeRequestId(requestId) || !NONCE_PATTERN.test(nonce) || Buffer.byteLength(data) > CALLBACK_DATA_MAX_BYTES) {
+  if (!isOfferRequestId(requestId) || !NONCE_PATTERN.test(nonce) || Buffer.byteLength(data) > CALLBACK_DATA_MAX_BYTES) {
     throw new MinionsError('INTERNAL', `callback data for ${displayText(requestId)} is malformed or over ${CALLBACK_DATA_MAX_BYTES} bytes.`);
   }
   return data;
@@ -56,7 +58,7 @@ export function callbackData(action: CallbackAction, requestId: string, nonce: s
 export function parseCallbackData(data: unknown): { action: CallbackAction; requestId: string; nonce: string } | null {
   if (typeof data !== 'string' || Buffer.byteLength(data) > CALLBACK_DATA_MAX_BYTES) return null;
   const m = /^([crd]):([^:]+):([^:]+)$/.exec(data);
-  if (!m || !isChangeRequestId(m[2]!) || !NONCE_PATTERN.test(m[3]!)) return null;
+  if (!m || !isOfferRequestId(m[2]!) || !NONCE_PATTERN.test(m[3]!)) return null;
   return { action: m[1] as CallbackAction, requestId: m[2]!, nonce: m[3]! };
 }
 
@@ -76,10 +78,40 @@ export const HELP_TEXT = [
   'minions host manager. Commands:',
   '/status - per project: runtime, coordinator, active leases, pending change requests',
   '/requests - pending change requests, each with Confirm / Reject buttons',
-  '/project [name] - list the projects, or pick the one /status and /requests show',
+  '/project [name] - list the projects, or pick the one the other commands use',
+  '/set <key> <value> [shared] - change a setting (like minions settings set; local layer unless "shared"); host-owned keys too',
+  '/sync - fast-forward the host base branch (local delivery: from the container; GitHub delivery: from origin)',
+  '/upgrade - minions upgrade; the dry-run plan is shown first',
+  '/restart - graceful coordinator restart (refused while workers are active)',
+  '/undo <id> - restore the config file as it was before change <id> (only while nothing changed it since)',
   '/help - this text',
-  'Change requests from the coordinators arrive here by themselves; nothing is applied until you tap Confirm.',
+  'Change requests from the coordinators arrive here by themselves. A command you type only shows a plan: nothing is applied until you tap Confirm (twice when it loosens policy).',
 ].join('\n');
+
+/** Usage line per change command (sent when the arguments do not parse). */
+const USAGE: Record<string, string> = {
+  set: 'Usage: /set <key> <value> [shared], e.g. /set execution.maxActiveTasks 3 (value "default" unsets an optional setting). Keys: minions settings --list on the host.',
+  undo: 'Usage: /undo <id>, the id of an applied config change (cr_... or ow_...).',
+  sync: 'Usage: /sync (no arguments).', upgrade: 'Usage: /upgrade (no arguments).', restart: 'Usage: /restart (no arguments).',
+};
+const CHANGE_COMMANDS = ['set', 'sync', 'upgrade', 'restart', 'undo'];
+
+/** Parses the arguments of an owner change command; null when they do not parse (the usage line is sent). */
+export function parseOwnerCommand(cmd: string, arg: string): OwnerCommand | null {
+  const words = arg.split(/\s+/).filter(Boolean);
+  if (cmd === 'set') {
+    const shared = words.at(-1) === 'shared' && words.length >= 3;
+    const parts = shared ? words.slice(0, -1) : words;
+    const [key, ...rest] = parts;
+    const value = rest.join(' ');
+    // A value is passed to `minions settings set` as one argv element: one that starts with "-" would read as a flag.
+    if (!key || !/^[A-Za-z0-9_.-]+$/.test(key) || !value || value.startsWith('-') || value.length > 500) return null;
+    return { kind: 'config-set', key, value, layer: shared ? 'shared' : 'local' };
+  }
+  if (cmd === 'undo') return words.length === 1 && isOfferRequestId(words[0]!) ? { kind: 'undo', target: words[0]! } : null;
+  if (cmd === 'sync' || cmd === 'upgrade' || cmd === 'restart') return words.length ? null : { kind: cmd };
+  return null;
+}
 
 const OffsetSchema = z.object({ version: z.literal(1), botId: z.string(), offset: z.number().int().nonnegative() }).strict();
 
@@ -235,7 +267,7 @@ export class TelegramTransport implements ManagerTransport {
     ]];
     const expired = Date.parse(o.expiresAt) <= this.now();
     const text = [
-      `Change request ${o.requestId} (project ${o.projectId}): ${oneLine(o.summary)}`,
+      `${isOwnerRequestId(o.requestId) ? 'Your request' : 'Change request'} ${o.requestId} (project ${o.projectId}): ${oneLine(o.summary)}`,
       '',
       displayText(o.text),
       '',
@@ -351,15 +383,26 @@ export class TelegramTransport implements ManagerTransport {
     const m = /^\/([a-z]+)(?:@[A-Za-z0-9_]+)?(?:\s+([\s\S]*))?$/.exec(text.trim());
     const cmd = m?.[1] ?? '';
     const arg = (m?.[2] ?? '').trim();
-    if (!['status', 'requests', 'project'].includes(cmd)) { await this.send(HELP_TEXT); return; }
+    const change = CHANGE_COMMANDS.includes(cmd);
+    if (!['status', 'requests', 'project'].includes(cmd) && !change) { await this.send(HELP_TEXT); return; }
     if (!this.commands) { await this.send('The host manager is starting; try again in a moment.'); return; }
     try {
-      if (cmd === 'status') await this.send(displayText(await this.commands.status(this.selected)));
+      if (change) await this.change(cmd, arg);
+      else if (cmd === 'status') await this.send(displayText(await this.commands.status(this.selected)));
       else if (cmd === 'requests') await this.requests();
       else await this.project(arg);
     } catch (e) {
       await this.send(`/${cmd} failed: ${displayText(redact((e as Error).message))}`);
     }
+  }
+
+  /** An owner change command: the core builds and journals the plan; it is shown as an offer. Nothing applies here. */
+  private async change(cmd: string, arg: string): Promise<void> {
+    const c = parseOwnerCommand(cmd, arg);
+    if (!c) { await this.send(USAGE[cmd]!); return; }
+    if (c.kind === 'upgrade' || c.kind === 'sync') await this.send(`Planning /${cmd} (a dry run on the host)…`);
+    const offer = await this.commands!.propose(this.selected, c);
+    await this.sendOffer(offer);
   }
 
   private async requests(): Promise<void> {

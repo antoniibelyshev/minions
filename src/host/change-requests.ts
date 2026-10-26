@@ -13,6 +13,11 @@
 // - Apply runs the existing host paths: applySetting with --expect-revision (no restart: a needed restart is
 //   offered as its own step), the graceful coordinator restart, or `minions upgrade` as a child process. The runtime
 //   row then becomes applied / failed (best effort: a runtime that cannot be reached leaves a warning).
+// - Owner-initiated requests (task-53.5.3: /set, /sync, /upgrade, /restart, /undo in the manager chat) take the same
+//   plan, digest, offer and confirmation. Their snapshot has `origin: 'owner'` and an `ow_` id minted by the host,
+//   so they may set host-owned keys (owner decision Q2; a container request never may), there is no runtime row to
+//   mark, and two kinds exist only for them: `sync` (`minions upgrade --sync-only`) and `undo` (restore a config
+//   file from the config history, src/host/config-history.ts).
 import { spawn } from 'node:child_process';
 import type { Command } from 'commander';
 import { isGithubDelivery } from '../config/delivery.js';
@@ -26,7 +31,10 @@ import {
   formatRequestLine, formatRequests, listChangeRequests, markChangeRequest, quotedReason, requestSummary, withRequestContext, type ChangeRequestView,
 } from '../runtime/change-requests.js';
 import { inMinionsContainer } from '../runtime/paths.js';
-import { assertOfferOpen, consumeOffer, findOffer, readJournal, recordOffer, recordOutcome, type OfferEntry, type RequestSnapshot } from './change-journal.js';
+import {
+  assertOfferOpen, consumeOffer, findOffer, isOwnerRequest, isOwnerRequestId, readJournal, recordOffer, recordOutcome, type OfferEntry, type RequestSnapshot,
+} from './change-journal.js';
+import { applyUndo, beginHistory, checkUndo, completeHistory, validateRestore } from './config-history.js';
 import { packageRoot } from './docker.js';
 import { loadEffectiveConfig, loadProjectJson, type ProjectJson } from './project.js';
 import { projectForPath } from './registry.js';
@@ -34,14 +42,21 @@ import {
   applySetting, effectText, formatSet, restartCoordinator, RESTART_LATER, UPGRADE_LATER,
   type RestartOutcome, type SetResult, type SettingsRuntime,
 } from './settings-cli.js';
-import { formatValue, loadSettingsContext, parseSettingValue, planSetting, requireSetting, takesEffectOf, type SettingLayer, type TakesEffect } from './settings.js';
+import { formatValue, loadSettingsContext, parseSettingValue, planSetting, requireSetting, settingDef, takesEffectOf, type SettingLayer, type TakesEffect } from './settings.js';
 
 // ---------------------------------------------------------------- plan and digest
+
+/** The kinds of a plan: the container's request kinds, plus the owner-only sync and undo. */
+export type PlanKind = ChangeRequestKind | 'sync' | 'undo';
 
 export interface ChangePlan {
   requestId: string;
   projectId: string;
-  kind: ChangeRequestKind;
+  kind: PlanKind;
+  /** 'owner': typed by the owner in the manager chat (absent for a container request, so older digests stay valid). */
+  origin?: 'owner';
+  /** undo: the change it reverts and the sha256 of the file text that change wrote (the compare-and-swap value). */
+  undo?: { target: string; expectSha256: string };
   /** The effective configRevision the plan was computed against. */
   configRevision: number;
   /** The request's reason as shown to the owner: quoted, control characters stripped, cut to 300 characters. */
@@ -76,8 +91,11 @@ export interface UpgradeRun { ok: boolean; steps: { id: string; status: string; 
 /** What change requests need from the host (faked in tests). */
 export interface ChangeRequestDeps {
   runtime: SettingsRuntime;
-  /** Runs `minions upgrade [--from-container [branch]] [--dry-run]` for the project as a child process. */
-  upgrade: (project: ProjectJson, o: { fromContainer: string | true | null; dryRun: boolean }) => Promise<UpgradeRun>;
+  /**
+   * Runs `minions upgrade [--from-container [branch]] [--dry-run]` for the project as a child process; with syncOnly,
+   * `minions upgrade --sync-only` (the source sync only: export and strict fast-forward, or origin with GitHub delivery).
+   */
+  upgrade: (project: ProjectJson, o: { fromContainer: string | true | null; dryRun: boolean; syncOnly?: boolean }) => Promise<UpgradeRun>;
   now?: () => Date;
 }
 
@@ -104,6 +122,8 @@ export function planArgv(plan: Pick<ChangePlan, 'kind' | 'change' | 'configRevis
     const fc = fromContainerOf(req.payload);
     return ['upgrade', ...(fc === true ? ['--from-container'] : fc ? ['--from-container', fc] : [])];
   }
+  if (plan.kind === 'sync') return ['upgrade', '--sync-only'];
+  if (plan.kind === 'undo') throw new MinionsError('INTERNAL', 'an undo runs in the host manager, not as a child command.');
   throw new MinionsError('PRECONDITION', `Unknown change kind "${displayText(String(plan.kind))}".`);
 }
 
@@ -119,6 +139,14 @@ export const snapshotOf = (v: Pick<ChangeRequestView, 'id' | 'kind' | 'payload' 
  * journal lock and hands the result to buildPlan (task-53.11).
  */
 export async function upgradeDryRun(project: ProjectJson, req: RequestSnapshot, deps: Pick<ChangeRequestDeps, 'upgrade'>): Promise<UpgradeRun> {
+  if (req.kind === 'sync') {
+    const dry = await deps.upgrade(project, { fromContainer: null, dryRun: true, syncOnly: true });
+    if (!dry.ok) {
+      throw new MinionsError('PRECONDITION', `Request ${req.id}: \`minions upgrade --sync-only --dry-run\` reports that the sync would be refused (nothing is ever forced, reset or stashed): ${dry.summary}`,
+        'Fix that on the host first (commit or stash yourself, or merge a divergence), then send /sync again.');
+    }
+    return dry;
+  }
   const fromContainer = fromContainerOf(req.payload);
   await assertUpgradeDelivery(project, req, fromContainer);
   const dry = await deps.upgrade(project, { fromContainer, dryRun: true });
@@ -140,14 +168,18 @@ async function assertUpgradeDelivery(project: ProjectJson, req: RequestSnapshot,
  * run already made for this request (upgradeDryRun); everything else is still read now.
  */
 export async function buildPlan(project: ProjectJson, req: RequestSnapshot, deps: ChangeRequestDeps, pre: { dry?: UpgradeRun } = {}): Promise<{ plan: ChangePlan; notes: string[] }> {
-  const base = { requestId: req.id, projectId: project.projectId, reason: quotedReason(req.reason), change: null, loosens: null, upgradeSteps: null };
+  const owner = isOwnerRequest(req);
+  if (!owner && (req.kind === 'sync' || req.kind === 'undo' || req.origin !== undefined || isOwnerRequestId(req.id))) {
+    throw new MinionsError('PRECONDITION', `Change request ${displayText(req.id)}: kind "${displayText(String(req.kind))}" comes only from the owner in the manager chat; nothing to apply.`);
+  }
+  const base = { requestId: req.id, projectId: project.projectId, reason: quotedReason(req.reason), change: null, loosens: null, upgradeSteps: null, ...(owner ? { origin: 'owner' as const } : {}) };
   if (req.kind === 'config-set') {
     const { key, value, layer } = req.payload as { key?: unknown; value?: unknown; layer?: unknown };
     if (typeof key !== 'string' || typeof value !== 'string' || (layer !== 'local' && layer !== 'shared')) {
       throw new MinionsError('PRECONDITION', `Change request ${req.id}: malformed config-set payload; nothing to apply.`, `Reject it: \`minions settings reject ${req.id}\`.`);
     }
     const def = requireSetting(key);
-    if (def.hostOwned) {
+    if (def.hostOwned && !owner) {
       throw new MinionsError('CONFLICT', `Change request ${req.id}: ${key} is host-owned; a request from the container is never applied.`,
         `If you want this change, make it yourself: \`minions settings set ${key} ${q(value)}\`. Then \`minions settings reject ${req.id}\`.`, { path: key, hostOwned: true });
     }
@@ -176,6 +208,14 @@ export async function buildPlan(project: ProjectJson, req: RequestSnapshot, deps
       notes: [],
     };
   }
+  if (req.kind === 'sync') {
+    const dry = pre.dry ?? await upgradeDryRun(project, req, deps);
+    return {
+      plan: { ...base, kind: 'sync', configRevision, upgradeSteps: dry.steps.map((s) => s.id), steps: [stepText(planArgv({ kind: 'sync', change: null, configRevision }, req))], interrupts: null },
+      notes: dry.steps.map((s) => `${s.id}: ${s.detail}`),
+    };
+  }
+  if (req.kind === 'undo') return planUndo(project, req, base, configRevision);
   if (req.kind === 'upgrade') {
     let dry = pre.dry;
     if (dry) await assertUpgradeDelivery(project, req, fromContainerOf(req.payload));
@@ -191,10 +231,35 @@ export async function buildPlan(project: ProjectJson, req: RequestSnapshot, deps
   throw new MinionsError('PRECONDITION', `Change request ${req.id}: unknown kind "${displayText(String(req.kind))}"; nothing to apply.`, `Reject it: \`minions settings reject ${req.id}\`.`);
 }
 
+/** The undo of a config change applied by the host manager: restore the file text before it (compare-and-swap). */
+async function planUndo(project: ProjectJson, req: RequestSnapshot, base: Omit<ChangePlan, 'kind' | 'configRevision' | 'interrupts' | 'steps'>, configRevision: number): Promise<{ plan: ChangePlan; notes: string[] }> {
+  const target = req.payload.target;
+  if (typeof target !== 'string') throw new MinionsError('PRECONDITION', `Request ${req.id}: malformed undo payload; nothing to apply.`);
+  const { entry, expectSha256 } = await checkUndo(project, target);
+  await validateRestore(project, entry);
+  const def = settingDef(entry.key);
+  const cls = def?.class ?? 'live';
+  const takesEffect = takesEffectOf(cls);
+  const from = entry.to ?? undefined;
+  const to = entry.from ?? undefined;
+  return {
+    plan: {
+      ...base, kind: 'undo', configRevision, undo: { target, expectSha256 },
+      change: { key: entry.key, from, to, layer: entry.layer, file: entry.file, class: cls, takesEffect },
+      loosens: def?.loosens ? def.loosens(from, to) : null,
+      interrupts: takesEffect === 'restart' ? `nothing now; ${RESTART_LATER}` : takesEffect === 'upgrade' ? `nothing now; ${UPGRADE_LATER}` : null,
+      steps: [`restore ${entry.file} as it was before ${target} (in the host manager; refused unless the file is still exactly what ${target} wrote, sha256 ${expectSha256.slice(0, 12)})`],
+    },
+    notes: [effectText(takesEffect), `the whole file returns to its text before ${target} (${entry.at})${entry.layer === 'shared' ? '; configRevision still moves forward' : ''}`].filter(Boolean),
+  };
+}
+
 export function formatPlan(plan: ChangePlan, digest: string, notes: string[]): string {
+  const owner = plan.origin === 'owner';
   return displayText([
-    `change request ${plan.requestId} (${plan.kind}) for project ${plan.projectId}, configRevision ${plan.configRevision}`,
-    `reason (from the container, untrusted): ${plan.reason}`,
+    `${owner ? 'owner request' : 'change request'} ${plan.requestId} (${plan.kind}) for project ${plan.projectId}, configRevision ${plan.configRevision}`,
+    owner ? 'requested by you in the manager chat (typing the command is not consent: confirm this exact plan)' : `reason (from the container, untrusted): ${plan.reason}`,
+    ...(plan.undo ? [`undoes: ${plan.undo.target}`] : []),
     ...(plan.change ? [`change: ${plan.change.key}: ${formatValue(plan.change.from)} -> ${formatValue(plan.change.to)} (${plan.change.layer} layer, ${plan.change.file}; class ${plan.change.class})`] : []),
     ...(plan.loosens ? [`LOOSENS POLICY: ${plan.loosens}`] : []),
     ...(plan.interrupts ? [`interrupts: ${plan.interrupts}`] : []),
@@ -238,6 +303,7 @@ async function fetchRequest(project: ProjectJson, runtime: SettingsRuntime, id: 
 
 /** Marks the runtime row; returns a warning instead of throwing (the host's outcome stands either way). */
 export async function mark(project: ProjectJson, runtime: SettingsRuntime, id: string, status: string, detail: string): Promise<string | null> {
+  if (isOwnerRequestId(id)) return null; // owner-initiated: no runtime row (the journal is its only record)
   try {
     await runtimeJson(project, runtime, ['settings', 'requests', 'mark', id, '--status', status, '--detail', detail.slice(0, 900)], `marking change request ${id} ${status}`);
     return null;
@@ -252,7 +318,7 @@ const openStatus = (s: string) => s === 'proposed' || s === 'failed';
 
 export interface ApplyOutcome {
   requestId: string;
-  kind: ChangeRequestKind;
+  kind: PlanKind;
   /** planned: dry run; offered: recorded for confirmation, nothing applied; applied / failed: the outcome. */
   status: 'planned' | 'offered' | 'applied' | 'failed';
   applied: boolean;
@@ -332,7 +398,7 @@ export async function confirmOffer(project: ProjectJson, offer: OfferEntry, deps
     }
   };
   let pre: { dry?: UpgradeRun } = {};
-  if (offer.request.kind === 'upgrade') {
+  if (offer.request.kind === 'upgrade' || offer.request.kind === 'sync') {
     // Outside the lock: refuse early what would be refused anyway, then the slow dry run.
     assertOfferOpen(await readJournal(), offer);
     assertUnexpired();
@@ -358,8 +424,10 @@ async function execute(project: ProjectJson, plan: ChangePlan, offer: OfferEntry
     const c = plan.change!;
     const value = String((offer.request.payload as { value?: unknown }).value);
     const ctx = await loadSettingsContext(project);
+    const h = await beginHistory(project, plan.requestId, c, deps.now?.());
     const r = await applySetting(ctx, c.key, value, { layer: c.layer, yes: true, restart: false, expectRevision: plan.configRevision },
       { runtime: deps.runtime, confirm: async () => null });
+    if (r.written) await completeHistory(h);
     out.set = r;
     out.applied = r.written;
     out.status = r.written ? 'applied' : 'failed';
@@ -377,6 +445,22 @@ async function execute(project: ProjectJson, plan: ChangePlan, offer: OfferEntry
     out.detail = `coordinator restart: ${r.action} - ${r.detail}`;
     return;
   }
+  if (plan.kind === 'undo') {
+    const r = await applyUndo(project, { target: plan.undo!.target, expectSha256: plan.undo!.expectSha256, undoId: plan.requestId, now: deps.now?.() });
+    out.applied = true;
+    out.status = 'applied';
+    out.detail = undoDetail(plan);
+    out.warnings.push(...r.warnings);
+    return;
+  }
+  if (plan.kind === 'sync') {
+    const r = await deps.upgrade(project, { fromContainer: null, dryRun: false, syncOnly: true });
+    out.upgrade = r;
+    out.applied = r.ok;
+    out.status = r.ok ? 'applied' : 'failed';
+    out.detail = `sync: ${r.summary}`;
+    return;
+  }
   const r = await deps.upgrade(project, { fromContainer: fromContainerOf(offer.request.payload), dryRun: false });
   out.upgrade = r;
   out.applied = r.ok;
@@ -384,6 +468,9 @@ async function execute(project: ProjectJson, plan: ChangePlan, offer: OfferEntry
   out.detail = `upgrade: ${r.summary}`;
   if (!r.ok) out.nextSteps.push(`Fix the failed step, then rerun \`${plan.steps[0]}\` on the host (the upgrade marker lets a rerun finish the job).`);
 }
+
+export const undoDetail = (plan: ChangePlan) =>
+  `undid ${plan.undo?.target ?? '?'}: ${plan.change?.key ?? 'setting'}: ${formatValue(plan.change?.from)} -> ${formatValue(plan.change?.to)} (${plan.change?.file ?? ''} restored)`;
 
 async function finish(project: ProjectJson, out: ApplyOutcome, deps: ChangeRequestDeps): Promise<void> {
   const r = await recordApplyResult(project, { requestId: out.requestId, digest: out.digest, status: out.status === 'applied' ? 'applied' : 'failed', detail: out.detail }, deps);
@@ -450,6 +537,12 @@ export interface RejectOutcome { requestId: string; status: 'rejected'; marked: 
 
 /** `minions settings reject <id>` (host): marks an open request rejected (nothing is applied). */
 export async function rejectRequest(project: ProjectJson, id: string, o: { reason?: string }, deps: Pick<ChangeRequestDeps, 'runtime' | 'now'>): Promise<RejectOutcome> {
+  if (isOwnerRequestId(id)) {
+    // Owner-initiated: no runtime row; the journal entry is the whole record.
+    const detail = `rejected by the owner${o.reason?.trim() ? ` ${o.reason.trim()}` : ''}`;
+    await recordOutcome({ type: 'rejected', projectId: project.projectId, requestId: id, detail }, deps.now?.());
+    return { requestId: id, status: 'rejected', marked: false, detail, warnings: [] };
+  }
   const req = await fetchRequest(project, deps.runtime, id);
   if (!openStatus(req.status)) throw new MinionsError('PRECONDITION', `Change request ${id} is ${req.status}; nothing to reject.`, 'List open requests with `minions settings requests`.');
   const detail = `rejected on the host${o.reason?.trim() ? `: ${o.reason.trim()}` : ''}`;
@@ -485,7 +578,7 @@ export function hostCli(): { cmd: string; args: string[]; env: NodeJS.ProcessEnv
 export const childUpgrade: ChangeRequestDeps['upgrade'] = (project, o) => new Promise((resolve) => {
   const flag = o.fromContainer === true ? ['--from-container'] : o.fromContainer ? ['--from-container', o.fromContainer] : [];
   const host = hostCli();
-  const child = spawn(host.cmd, [...host.args, '--json', 'upgrade', ...flag, ...(o.dryRun ? ['--dry-run'] : [])],
+  const child = spawn(host.cmd, [...host.args, '--json', 'upgrade', ...flag, ...(o.syncOnly ? ['--sync-only'] : []), ...(o.dryRun ? ['--dry-run'] : [])],
     { cwd: project.repoPath, env: host.env, stdio: ['ignore', 'pipe', 'inherit'] });
   let stdout = '';
   child.stdout.setEncoding('utf8').on('data', (d: string) => { stdout += d; });

@@ -35,7 +35,7 @@ import { githubStartHint, registerGithubSetup } from './github-setup.js';
 import { formatUninstall, runUninstall } from './uninstall.js';
 import { DELIVERY_MODES, formatSetup, runSetup, shellQuote, type DeliveryMode, type SetupRuntime } from './setup.js';
 import { DEFAULT_UPGRADE_TIMEOUT_SEC, formatUpgrade, runUpgrade, upgradeTimeout } from './upgrade.js';
-import { HANDOFF_ENV, isMinionsCheckout, runSourcePhase, upgradeSourceMode } from './upgrade-source.js';
+import { HANDOFF_ENV, formatSyncOnly, isMinionsCheckout, runSourcePhase, runSyncOnly, upgradeSourceMode } from './upgrade-source.js';
 import { readSecret, readlineIO } from './wizard.js';
 import { addListCommand, addSetCommand, defaultSettingsRuntime, registerSettings } from './settings-cli.js';
 import { runSettingsMenu, terminalMenuIO } from './settings-menu.js';
@@ -499,13 +499,14 @@ export function register(program: Command): void {
     .option('--now', 'release workers still active when the wait ends (reported as interrupted, re-dispatched after)')
     .option('--from-container [branch]', 'local delivery only: first export the container branches and fast-forward <branch> (default: the base branch) to minions/<base>; strict fast-forward on a clean tree only (GitHub delivery always takes origin/<base>)')
     .option('--rebuild-cli', 'in a minions checkout: allow rebuilding/reinstalling the global CLI from it (runs its npm scripts and build on the host; review it first)')
+    .option('--sync-only', 'only the source sync (the host manager /sync): local delivery exports the container branches and fast-forwards the base branch; GitHub delivery fetches origin/<base> and fast-forwards; no CLI or container steps')
     .option('--dry-run', 'list the steps without changing anything')
     .option('--reason <text>', 'runtime: why the upgrade is needed (shown to the owner)')
-    .action(action(async (o: { timeout?: string; now?: boolean; fromContainer?: string | boolean; rebuildCli?: boolean; reason?: string }, cmd: Command) => {
+    .action(action(async (o: { timeout?: string; now?: boolean; fromContainer?: string | boolean; rebuildCli?: boolean; syncOnly?: boolean; reason?: string }, cmd: Command) => {
       const { json, dryRun } = globalOpts(cmd);
       if (runtimeMode() !== 'host') {
         // The container can only propose (docs/design/host-manager.md): record a request; the owner applies it on the host.
-        const hostOnly = [o.timeout !== undefined ? '--timeout' : null, o.now ? '--now' : null, o.rebuildCli ? '--rebuild-cli' : null].filter(Boolean);
+        const hostOnly = [o.timeout !== undefined ? '--timeout' : null, o.now ? '--now' : null, o.rebuildCli ? '--rebuild-cli' : null, o.syncOnly ? '--sync-only' : null].filter(Boolean);
         if (hostOnly.length) {
           throw new MinionsError('PRECONDITION', `${hostOnly.join(', ')}: not available in an upgrade request (the owner picks how to drain, and a CLI rebuild is never requested from the container).`, 'Request `minions upgrade [--from-container [branch]] --reason <text>`.');
         }
@@ -514,6 +515,7 @@ export function register(program: Command): void {
         return;
       }
       if (o.reason !== undefined) throw new MinionsError('PRECONDITION', '--reason is for upgrade requests recorded in the runtime; on the host the upgrade runs directly.');
+      if (o.syncOnly) { await upgradeSyncOnly(o, { json, dryRun }); return; }
       const timeoutSec = upgradeTimeout(o.timeout, !!o.now);
       const ref = await projectForPath(process.cwd());
       const project = await loadProjectJson(ref.projectId);
@@ -557,6 +559,35 @@ export function register(program: Command): void {
       emit(r, { json, human: formatUpgrade });
       if (!r.ok) process.exitCode = 1;
     }));
+
+  /** `minions upgrade --sync-only`: the source sync alone (docs/design/host-manager.md, "Change kinds", outer repo sync). */
+  async function upgradeSyncOnly(o: { timeout?: string; now?: boolean; fromContainer?: string | boolean; rebuildCli?: boolean }, g: { json: boolean; dryRun: boolean }): Promise<void> {
+    if (o.timeout !== undefined || o.now || o.rebuildCli) throw new MinionsError('PRECONDITION', '--sync-only takes no --timeout, --now or --rebuild-cli (it moves no container and builds nothing).');
+    const ref = await projectForPath(process.cwd());
+    const project = await loadProjectJson(ref.projectId);
+    const github = isGithubDelivery((await loadEffectiveConfig(project)).config);
+    // GitHub delivery with --from-container: refused (local delivery only).
+    if (github && o.fromContainer !== undefined) upgradeSourceMode({ githubDelivery: true, fromContainer: true, checkout: null, baseBranch: project.baseBranch });
+    const exportFrom = async () => {
+      if (runtimeOf(project) === 'host') {
+        const host = new HostRuntime(project);
+        if (!(await host.prepared())) throw new MinionsError('PRECONDITION', 'The host runtime has not been started for this project, so there is nothing to export.', 'Run `minions start --no-attach` first.');
+        await prepareHostRuntime(project);
+        return exportRepo(project, { repoPath: ref.repoPath, target: host.transferTarget() });
+      }
+      await requireDocker();
+      const compose = new Compose(project.projectId);
+      if (!(await compose.isRunning())) throw new MinionsError('PRECONDITION', 'The sync needs the project container running (it exports from it).', 'Run `minions start --no-attach` first.');
+      return exportRepo(project, { repoPath: ref.repoPath, compose });
+    };
+    const r = await runSyncOnly({
+      dryRun: g.dryRun,
+      origin: github ? { repo: ref.repoPath, baseBranch: project.baseBranch, remote: project.remoteUrl || 'origin' } : null,
+      sync: github ? null : { repo: ref.repoPath, baseBranch: project.baseBranch, branch: typeof o.fromContainer === 'string' ? o.fromContainer : project.baseBranch, exportRepo: exportFrom },
+    });
+    emit(r, { json: g.json, human: formatSyncOnly });
+    if (!r.ok) process.exitCode = 1;
+  }
 
   program.command('down').alias('stop')
     .description('Stop the agent runtime: remove the container (volumes kept) or stop the host runtime tmux server')

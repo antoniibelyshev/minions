@@ -391,7 +391,7 @@ commands. Decisions made here:
   CONFLICT "another process polls the manager bot" and 401/404 is AUTH_REQUIRED. The core logs both and retries after
   5 s. A 429 waits `retry_after`. A send is retried once after a 429 of at most 30 s.
 - **Commands.** Fixed set `/status`, `/requests`, `/project [name|all]`, `/help` (`/start`). Anything else gets the
-  help text. `/set`, `/sync`, `/upgrade`, `/restart`, `/undo` and `/approve` come in task-53.5.3 and task-53.5.4.
+  help text. `/set`, `/sync`, `/upgrade`, `/restart` and `/undo` came in task-53.5.3 (below); `/approve` is task-53.5.4.
   The core gives the transport read-only views (`ManagerCommands`, through `ManagerTransport.attach`). `/requests`
   resends every request whose newest journal entry is an offer, with buttons. An expired one is included: Confirm
   then brings a fresh offer. `/status` shows, per project: runtime running, coordinator (from the runtime's
@@ -399,6 +399,53 @@ commands. Decisions made here:
   pending requests, and the last poll problem. The restart-required check of `minions status` on the host (image and
   build fingerprint) is not repeated there. Only a stale coordinator launch is shown as "restart required". The
   `/project` choice is kept in memory.
+
+Built in task-53.5.3 (phase 4, part 3): the owner change commands `/set <key> <value> [shared]`, `/sync`, `/upgrade`,
+`/restart` and `/undo <id>`. Decisions made here:
+
+- **Same path as a proposal.** The transport parses the command (`parseOwnerCommand`) and calls
+  `ManagerCommands.propose`. The core builds the plan with the same `buildPlan`, journals an offer and returns it; the
+  transport shows it with Confirm / Reject. Typing the command is never consent: only the tap applies it, through the
+  same `confirmOffer` (nonce, expiry, revision, digest) and apply code. A plan that loosens asks twice (`d:` tap). A
+  plan that cannot be built (an invalid value, an unchanged one, a refused sync dry run, an undo with drift) is
+  answered with `/<cmd> failed: <reason>` and nothing is journaled.
+- **Owner requests.** Their id is host-minted, `ow_` + 8 hex (the container's are `cr_`), so the callback data stays
+  46 bytes. The journaled snapshot carries `origin: 'owner'`, and the plan `origin: 'owner'` (absent for container
+  plans, so their digests are unchanged). `buildPlan` treats a request as the owner's only when both the `ow_` id and
+  the origin are present; a `cr_` snapshot claiming the owner origin, an `ow_` id without it, or a container
+  `sync` / `undo` is refused. Owner requests have no runtime row: `mark` is skipped for them (no warning), Reject only
+  journals `rejected`, startup closes an interrupted one in the journal only, and a refused confirmation is re-offered
+  from the journaled snapshot.
+- **Host-owned keys.** `/set` may target them (owner decision Q2), with the usual loosening text and double tap. A
+  container request for one is still refused when recorded and by `buildPlan`. `/set` writes the local layer
+  (`config.local.json`) unless the last word is `shared` (a shared install only). A value starting with `-` is refused
+  by the parser, since it is passed to `minions settings set` as one argv element.
+- **Project.** A command targets the project picked with `/project`; with no pick it needs exactly one registered
+  project, otherwise it asks for `/project <name>` first.
+- **`/upgrade`** is plain `minions upgrade` (no `--from-container`, never `--rebuild-cli`); the plan shows its dry-run
+  steps. `/restart` is `minions settings restart` (graceful).
+- **`/sync`** is a new host flag, `minions upgrade --sync-only` (no new command): `runSyncOnly`
+  (`src/host/upgrade-source.ts`) runs only the source sync, `syncFromContainer` for local delivery (export, then the
+  strict fast-forward) or `syncFromOrigin` for GitHub delivery. Nothing is forced, reset, stashed or checked out; a dirty
+  tree or a divergence refuses. The plan comes from `--sync-only --dry-run` (it compares with the last export, as the
+  upgrade dry run does). Like the upgrade dry run it runs before the journal lock is taken. The digest covers the step
+  ids, not their details. The container cannot request `--sync-only`.
+- **Config history** (`src/host/config-history.ts`). Before the manager runs a confirmed config-set (container or
+  owner) or an undo, it saves `<project dir>/config-history/<requestId>.json` (0600, directory 0700) with the key,
+  layer, file, the effective from/to and the file text before; after a successful write it adds the text after and
+  `completed: true`. The last 20 are kept. The terminal `settings apply` path saves it as well. Entries are named by
+  the request id, not the configRevision, because a local-layer write does not bump the revision.
+- **`/undo <id>`** proposes restoring the whole layer file to its text before `<id>`, shown as the inverse diff of that
+  key, with the loosening check run on the inverse (undoing a tightening can loosen). Compare-and-swap: the file must
+  still be exactly the text `<id>` wrote (its sha256 is in the plan and the digest); otherwise the plan is refused with
+  the drift (the key as `<id>` wrote it and as it is now) and nothing is written. The check runs again when the
+  plan is rebuilt under the journal lock at confirm time, and once more right before the write. A shared-layer restore
+  keeps configRevision moving forward (the restored file gets the current revision + 1); a local-layer restore removes
+  `config.local.json` when it did not exist before. The undo runs in the manager process: there is no CLI command for it.
+  An undo has its own history entry, so it can be undone in turn. Known gap: a terminal edit of the same file between
+  the history snapshot and the child's write would be reverted too by a later undo (the window is one child process).
+- **Follow-ups.** After an applied config change that needs a restart or an upgrade, the outcome says to send
+  `/restart` or `/upgrade` (each its own plan to confirm). The manager does not offer them by itself yet.
 
 
 Child tasks, filed as task-53.2 to task-53.7 (phases 1 to 6) and task-53.8 (coordinator proposal):
