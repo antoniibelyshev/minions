@@ -51,7 +51,10 @@ for (const s of scenario.steps ?? []) {
       break;
     }
     case 'echoEnv': writeFileSync(process.env.MINIONS_RESULT_FILE + '.env', JSON.stringify({ env: process.env, argv: process.argv, stdin })); break;
-    case 'ignoreTerm': process.on('SIGTERM', () => {}); break;
+    // Ignores the runner's graceful stop signals (SIGINT, then SIGTERM), so only the SIGKILL ends it.
+    case 'ignoreTerm': process.on('SIGINT', () => {}); process.on('SIGTERM', () => {}); break;
+    // Appends each stop signal received to s.path ("<SIG> <ms>" per line) and otherwise ignores it.
+    case 'logSignals': for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => appendFileSync(s.path, `${sig} ${Date.now()}\n`)); break;
     case 'grandchild': {
       // A detached (setsid) grandchild that outlives this process unless something kills it.
       const c = spawn(process.execPath, ['-e', `require('fs').writeFileSync(${JSON.stringify(s.pidFile)}, String(process.pid)); setInterval(() => {}, 1000)`], { detached: !!s.setsid, stdio: 'ignore' });

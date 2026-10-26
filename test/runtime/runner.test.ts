@@ -210,6 +210,36 @@ describe('work run: supervise, cancel, timeout, drain', () => {
     expect(submitted(r, b)).toMatchObject({ status: 'partial', headSha: out.wipCommit });
   });
 
+  it('task-14.14: a stop sends SIGINT first, SIGTERM after the interrupt grace, then SIGKILL', async () => {
+    const r = rig();
+    const b = await claim(r);
+    const log = join(r.root, 'signals.log');
+    const out = await runLease(b.leaseId, r.deps({ steps: [{ op: 'logSignals', path: log }, { op: 'sleep', ms: 30_000 }] },
+      { timing: { timeoutMs: 300, pollMs: 50, killGraceMs: 300, interruptGraceMs: 250, drainGraceMs: 100 } }));
+    expect(out).toMatchObject({ status: 'partial', exit: { stopped: 'timeout', signal: 'SIGKILL' } });
+    const lines = readFileSync(log, 'utf8').trim().split('\n').map((l) => l.split(' '));
+    expect(lines.map(([sig]) => sig)).toEqual(['SIGINT', 'SIGTERM']);
+    expect(Number(lines[1]![1]) - Number(lines[0]![1])).toBeGreaterThanOrEqual(200);
+  });
+
+  it('task-14.14: a worker that stops on SIGINT gets nothing more; the interrupt grace never exceeds the kill grace', async () => {
+    const r = rig();
+    const b = await claim(r);
+    const started = Date.now();
+    const out = await runLease(b.leaseId, r.deps({ steps: [{ op: 'sleep', ms: 30_000 }] },
+      { timing: { timeoutMs: 300, pollMs: 50, killGraceMs: 300, interruptGraceMs: 60_000, drainGraceMs: 100 } }));
+    expect(out).toMatchObject({ status: 'partial', exit: { stopped: 'timeout', signal: 'SIGINT' } });
+    expect(Date.now() - started).toBeLessThan(20_000);
+
+    await r.sched.release(b.leaseId, 'next');
+    const b2 = await claim(r);
+    const log = join(r.root, 'signals2.log');
+    const out2 = await runLease(b2.leaseId, r.deps({ steps: [{ op: 'logSignals', path: log }, { op: 'sleep', ms: 30_000 }] },
+      { timing: { timeoutMs: 300, pollMs: 50, killGraceMs: 300, interruptGraceMs: 60_000, drainGraceMs: 100 } }));
+    expect(out2).toMatchObject({ exit: { stopped: 'timeout', signal: 'SIGKILL' } });
+    expect(readFileSync(log, 'utf8').trim().split('\n').map((l) => l.split(' ')[0])).toEqual(['SIGINT', 'SIGTERM']);
+  });
+
   it('drain: after the grace the worker is stopped with a wip: commit and a partial result', async () => {
     const r = rig();
     const b = await claim(r);
