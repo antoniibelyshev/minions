@@ -528,6 +528,9 @@ describe('doctor manager.* checks', () => {
     const { chmodSync } = await import('node:fs');
     chmodSync(managerFile(), 0o644);
     expect(by(await managerChecks(), 'manager.token')).toMatchObject({ status: 'warn', detail: expect.stringContaining('token file mode is 644') });
+    const d = by(await managerChecks(), 'manager.token')?.detail;
+    expect(d).toContain('stored in host file');
+    expect(d).not.toContain('0600');
   });
 
   it('runDoctor (doctor and status --check) includes the manager checks and they never change healthy', async () => {

@@ -188,7 +188,10 @@ export async function pairManagerBot(opts: PairingOptions): Promise<PairingResul
   let offset: number | undefined;
   let lastProblem = '';
   while (now() < deadline) {
-    const wait = Math.max(0, Math.min(poll, Math.floor((deadline - now()) / 1000)));
+    const remainingMs = deadline - now();
+    // Less than a second left: a 0 s long poll would loop back to back until the deadline, so sleep the remainder.
+    if (remainingMs < 1000) { await sleep(Math.max(remainingMs, 0)); break; }
+    const wait = Math.min(poll, Math.floor(remainingMs / 1000));
     let res: Response;
     try {
       res = await call('getUpdates', { ...(offset !== undefined ? { offset } : {}), timeout: wait, allowed_updates: ['message'] }, (wait + 15) * 1000);

@@ -148,4 +148,18 @@ describe('reusable helpers', () => {
     expect(M.isOwnerUpdate(access, { update_id: 2, callback_query: { from: { id: OWNER }, message: { chat: { id: OWNER, type: 'group' } } } })).toBe(false);
     expect(M.isOwnerUpdate(access, { update_id: 3, callback_query: { from: { id: OWNER } } })).toBe(false);
   });
+
+  it('does not poll back to back with timeout 0 in the last second before the deadline', async () => {
+    const b = api([]);
+    // A fake clock that does not advance on the empty poll: a tight loop would never end.
+    let polls = 0;
+    const f = (async (url: string | URL | Request, init?: RequestInit) => {
+      if (String(url).endsWith('/getUpdates')) { polls++; if (polls > 100) throw new Error('tight loop'); }
+      return b.f(url, init);
+    }) as typeof fetch;
+    const r = await M.pairManagerBot({ token: MGR, botId: '555666777', fetch: f, now: b.now, sleep: b.sleep, code: 'AAAA-BBBB' });
+    expect(r.status).toBe('expired');
+    expect(b.sent.filter((s) => s.method === 'getUpdates' && s.body.timeout === 0)).toEqual([]);
+    expect(polls).toBeLessThan(40);
+  });
 });
