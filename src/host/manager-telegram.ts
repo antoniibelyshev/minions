@@ -22,6 +22,8 @@
 //   /set <key> <value> [shared], /sync, /upgrade, /restart, /undo <id> (task-53.5.3). Anything else gets the help text.
 //   A change command only asks the core for a plan (ManagerCommands.propose) and shows it as an offer with Confirm /
 //   Reject: typing it is never consent, and the tap goes through the same confirmation as a container request.
+// - /approve <task> <sha> [merge] (task-53.5.4): only a full 40-character lowercase head SHA parses (a short or
+//   non-hex one gets the usage line). Its plan always loosens, so it always needs the double tap.
 import { chmod } from 'node:fs/promises';
 import { join } from 'node:path';
 import { z } from 'zod';
@@ -31,6 +33,7 @@ import { ensureDir, readJsonIfExists, writeJson } from '../core/fsutil.js';
 import { redact } from '../core/output.js';
 import { managerDir } from '../core/paths.js';
 import { findOfferByNonce, isOfferRequestId, isOwnerRequestId } from './change-journal.js';
+import { APPROVE_HEAD_PATTERN, APPROVE_TASK_ID_PATTERN } from './change-requests.js';
 import type { Fetch } from './credentials.js';
 import { isOwnerUpdate, type ManagerAccess, type TelegramUpdate } from './manager-bot.js';
 import type { ManagerCommands, ManagerEvent, ManagerOffer, ManagerOutcome, ManagerTransport, OwnerCommand } from './manager.js';
@@ -84,6 +87,7 @@ export const HELP_TEXT = [
   '/upgrade - minions upgrade; the dry-run plan is shown first',
   '/restart - graceful coordinator restart (refused while workers are active)',
   '/undo <id> - restore the config file as it was before change <id> (only while nothing changed it since)',
+  '/approve <task> <sha> [merge] - sign an approval to publish (or with "merge": to merge) <task> at that full head SHA (always asks twice)',
   '/help - this text',
   'Change requests from the coordinators arrive here by themselves. A command you type only shows a plan: nothing is applied until you tap Confirm (twice when it loosens policy).',
 ].join('\n');
@@ -92,9 +96,10 @@ export const HELP_TEXT = [
 const USAGE: Record<string, string> = {
   set: 'Usage: /set <key> <value> [shared], e.g. /set execution.maxActiveTasks 3 (value "default" unsets an optional setting). Keys: minions settings --list on the host.',
   undo: 'Usage: /undo <id>, the id of an applied config change (cr_... or ow_...).',
+  approve: 'Usage: /approve <task> <sha> [merge], e.g. /approve task-12 <sha>. <sha> must be the full 40-character lowercase head SHA from the awaiting-approval message (short or non-hex SHAs are refused). Without "merge" it approves publishing that head; with "merge" it approves merging its delivered pull request.',
   sync: 'Usage: /sync (no arguments).', upgrade: 'Usage: /upgrade (no arguments).', restart: 'Usage: /restart (no arguments).',
 };
-const CHANGE_COMMANDS = ['set', 'sync', 'upgrade', 'restart', 'undo'];
+const CHANGE_COMMANDS = ['set', 'sync', 'upgrade', 'restart', 'undo', 'approve'];
 
 /** Parses the arguments of an owner change command; null when they do not parse (the usage line is sent). */
 export function parseOwnerCommand(cmd: string, arg: string): OwnerCommand | null {
@@ -109,6 +114,12 @@ export function parseOwnerCommand(cmd: string, arg: string): OwnerCommand | null
     return { kind: 'config-set', key, value, layer: shared ? 'shared' : 'local' };
   }
   if (cmd === 'undo') return words.length === 1 && isOfferRequestId(words[0]!) ? { kind: 'undo', target: words[0]! } : null;
+  if (cmd === 'approve') {
+    const [taskId, head, scope, ...extra] = words;
+    if (!taskId || !head || extra.length || (scope !== undefined && scope !== 'merge')) return null;
+    if (!APPROVE_TASK_ID_PATTERN.test(taskId) || !APPROVE_HEAD_PATTERN.test(head)) return null;
+    return { kind: 'approve', taskId, head, merge: scope === 'merge' };
+  }
   if (cmd === 'sync' || cmd === 'upgrade' || cmd === 'restart') return words.length ? null : { kind: cmd };
   return null;
 }

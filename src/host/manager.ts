@@ -27,10 +27,17 @@
 //   Owner requests have no runtime row, so nothing is marked for them; a refused one is re-offered from its journaled
 //   snapshot. Every config write the manager applies saves the layer file first (src/host/config-history.ts), so
 //   /undo <id> can restore it while the file is still what that change wrote.
+// - /approve <task> <sha> [merge] (task-53.5.4) is an owner request of kind approve: its plan always loosens (two
+//   taps), and the confirmed plan runs approveOnHost in this process (src/host/approvals.ts, injectable as
+//   ManagerDeps.approveOnHost): the host key signs and the runtime's `work approve --signature` goes through the
+//   bounded delegate. The runtime refuses a head that is not the one awaiting approval. The token is never logged,
+//   journaled or sent to the chat: the runtime's answer (and an error while approving) goes through redactApprovalText
+//   before it becomes the outcome detail. Approvals cannot be undone.
 import { open, readFile, rm } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 import type { Command } from 'commander';
 import { action, requireMode } from '../core/cli-helpers.js';
+import { APPROVAL_TOKEN_PREFIX } from '../core/approval.js';
 import { displayText, truncateCodePoints } from '../core/control-chars.js';
 import { MinionsError, isMinionsError } from '../core/errors.js';
 import { run, type RunResult } from '../core/exec.js';
@@ -46,6 +53,7 @@ import {
   childUpgrade, confirmOffer, fetchRequests, formatPlan, fromContainerOf, hostCli, mark, offerRequest, planArgv,
   recordApplyResult, rejectRequest, snapshotOf, undoDetail, type ChangePlan, type ChangeRequestDeps,
 } from './change-requests.js';
+import { approveOnHost } from './approvals.js';
 import { applyUndo, beginHistory, completeHistory } from './config-history.js';
 import { readManagerToken } from './credentials.js';
 import { DELEGATE_MAX_OUTPUT_BYTES, DELEGATE_TIMEOUT_MS, delegateCapture } from './delegate.js';
@@ -118,7 +126,9 @@ export type OwnerCommand =
   | { kind: 'restart' }
   | { kind: 'upgrade' }
   | { kind: 'sync' }
-  | { kind: 'undo'; target: string };
+  | { kind: 'undo'; target: string }
+  /** A host-signed approval for exactly this task and full head SHA; merge: true approves merging instead of publishing. */
+  | { kind: 'approve'; taskId: string; head: string; merge: boolean };
 
 // ---------------------------------------------------------------- deps
 
@@ -140,6 +150,8 @@ export interface ManagerDeps {
   log: (line: string) => void;
   /** Whether the process that wrote a confirmed / applying entry still runs. */
   writerAlive?: (e: OutcomeEntry) => boolean;
+  /** Signs and records an approval (default: approveOnHost of src/host/approvals.ts); tests stub it. */
+  approveOnHost?: typeof approveOnHost;
 }
 
 /**
@@ -226,6 +238,9 @@ export function planSummary(plan: ChangePlan): string {
     return `undo ${plan.undo?.target ?? '?'}: ${plan.change.key}: ${formatValue(plan.change.from)} -> ${formatValue(plan.change.to)}${more > 0 ? ` (+${more} more setting${more === 1 ? '' : 's'})` : ''}`;
   }
   if (plan.kind === 'sync') return 'sync the host base branch (strict fast-forward)';
+  if (plan.kind === 'approve' && plan.approval) {
+    return `approve ${plan.approval.scope === 'merge' ? 'merging' : 'publishing'} ${plan.approval.taskId} at ${plan.approval.head}`;
+  }
   return plan.steps[0] ?? plan.kind;
 }
 
@@ -433,7 +448,7 @@ export class HostManager {
     const warnings: string[] = [];
     const w = await mark(project, this.runtime, offer.requestId, 'confirmed', `confirmed in the host manager (digest ${offer.digest.slice(0, 12)})`);
     if (w) warnings.push(w);
-    const argv = plan.kind === 'undo' ? null : planArgv(plan, offer.request);
+    const argv = plan.kind === 'undo' || plan.kind === 'approve' ? null : planArgv(plan, offer.request);
     await this.notify({ status: 'applying', ...ids, text: `Applying change request ${offer.requestId} (project ${offer.projectId}): ${planSummary(plan)}…` });
     let result: { status: 'applied' | 'failed'; detail: string };
     try {
@@ -442,6 +457,8 @@ export class HostManager {
         const r = await this.deps.upgrade(project, plan.kind === 'sync'
           ? { fromContainer: null, dryRun: false, syncOnly: true } : { fromContainer: fromContainerOf(offer.request.payload), dryRun: false });
         result = { status: r.ok ? 'applied' : 'failed', detail: `${plan.kind}: ${r.summary}` };
+      } else if (plan.kind === 'approve') {
+        result = await this.approve(project, plan);
       } else if (plan.kind === 'undo') {
         const u = await applyUndo(project, { target: plan.undo!.target, expectSha256: plan.undo!.expectSha256, restoreSha256: plan.undo!.restoreSha256, undoId: offer.requestId, now: this.deps.now() });
         warnings.push(...u.warnings);
@@ -466,6 +483,36 @@ export class HostManager {
         ...(result.status === 'applied' ? followUp(plan) : []),
         ...warnings.map((x) => `warning: ${displayText(x)}`)].join('\n'),
     });
+  }
+
+  /**
+   * Applies an approve plan: approveOnHost signs with the host key (which never leaves the host) and delegates
+   * `work approve <task> --head <sha> [--merge] --signature <token>` through the bounded runtime. Only the runtime's
+   * envelope message is reported; the argv (it carries the token) is never logged or shown.
+   */
+  private async approve(project: ProjectJson, plan: ChangePlan): Promise<{ status: 'applied' | 'failed'; detail: string }> {
+    const a = plan.approval;
+    if (!a) throw new MinionsError('INTERNAL', `approve plan ${plan.requestId} without an approval.`);
+    let answer: RunResult | null = null;
+    let signature: string | undefined;
+    let code: number;
+    try {
+      code = await (this.deps.approveOnHost ?? approveOnHost)(a.taskId, {
+        head: a.head, merge: a.scope === 'merge', json: true, cwd: project.repoPath, note: `approved in the host manager chat (${plan.requestId})`,
+      }, {
+        projectId: project.projectId,
+        delegate: async (args) => {
+          const i = args.indexOf('--signature');
+          if (i >= 0) signature = args[i + 1];
+          answer = await this.runtime.exec(project, ['minions', ...args, '--json']);
+          return answer.code;
+        },
+      });
+    } catch (e) {
+      // An error thrown once the token exists (the delegate, the runtime) may carry it: same redaction as an answer.
+      return { status: 'failed', detail: redactApprovalText(String((e as Error)?.message ?? e), signature, 2000) };
+    }
+    return approveOutcome(a, code, answer, signature);
   }
 
   private async reject(ev: ManagerEvent): Promise<void> {
@@ -508,7 +555,8 @@ export class HostManager {
       }
       project = all[0]!;
     }
-    const payload: Record<string, unknown> = c.kind === 'config-set' ? { key: c.key, value: c.value, layer: c.layer } : c.kind === 'undo' ? { target: c.target } : {};
+    const payload: Record<string, unknown> = c.kind === 'config-set' ? { key: c.key, value: c.value, layer: c.layer }
+      : c.kind === 'undo' ? { target: c.target } : c.kind === 'approve' ? { taskId: c.taskId, head: c.head, merge: c.merge } : {};
     const req: RequestSnapshot = { id: newOwnerRequestId(), kind: c.kind, payload, reason: null, origin: 'owner' };
     const built = await offerRequest(project, req, this.cr);
     const o = offerOf(built);
@@ -586,6 +634,91 @@ export class HostManager {
       }
     }
   }
+}
+
+/** Reads the runtime's answer to `work approve` (untrusted: only the envelope's message, through redactApprovalText). */
+export function approveOutcome(a: NonNullable<ChangePlan['approval']>, code: number, r: RunResult | null, signature?: string): { status: 'applied' | 'failed'; detail: string } {
+  let env: { ok?: boolean; data?: { message?: unknown }; error?: { message?: unknown } } | null = null;
+  try { env = r ? JSON.parse(r.stdout.trim().split('\n').filter(Boolean).at(-1) ?? '') : null; } catch { env = null; }
+  const what = `${a.scope === 'merge' ? 'merge' : 'publication'} approval for ${a.taskId} at ${a.head}`;
+  const msg = (v: unknown) => redactApprovalText(String(v ?? ''), signature, APPROVE_MESSAGE_MAX);
+  if (env && env.ok === true && code === 0) return { status: 'applied', detail: `${what} recorded: ${msg(env.data?.message)}` };
+  if (env && env.ok === false) return { status: 'failed', detail: `${what} refused by the runtime: ${msg(env.error?.message)}` };
+  return { status: 'failed', detail: `${what}: no result from the runtime (exit ${code})` };
+}
+
+/** The longest runtime message an approve outcome shows (UTF-16 code units, after redaction). */
+export const APPROVE_MESSAGE_MAX = 500;
+const REDACTED = '[REDACTED]';
+const escRe = (x: string) => x.replace(/[.*+?^${}()|[\]\\]/g, (c) => `\\${c}`);
+/** Anything shaped like an approval token (`mnap1.<payload>.<signature>`), real or not. */
+const TOKEN_SHAPE = new RegExp(`${escRe(APPROVAL_TOKEN_PREFIX)}\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+`, 'g');
+/** What a reader skips over in display-safe text: the <U+XXXX> markers escapeFormatChars writes, and combining marks. */
+const INVISIBLE_NOISE = /<U\+[0-9A-F]{4,6}>|\p{M}/uy;
+/** A segment of the real token shorter than this is not searched for on its own (too short to be a secret). */
+const MIN_SECRET_PART = 16;
+
+/** `s` without the noise (and whitespace, if `dropSpace`), with the index in `s` of every code unit kept. */
+function skeleton(s: string, dropSpace: boolean): { text: string; at: number[] } {
+  let text = '';
+  const at: number[] = [];
+  for (let i = 0; i < s.length;) {
+    INVISIBLE_NOISE.lastIndex = i;
+    const m = INVISIBLE_NOISE.exec(s);
+    if (m) { i += m[0].length; continue; }
+    const ch = String.fromCodePoint(s.codePointAt(i)!);
+    if (!(dropSpace && /\s/u.test(ch))) for (let k = 0; k < ch.length; k++) { text += ch[k]; at.push(i + k); }
+    i += ch.length;
+  }
+  return { text, at };
+}
+
+/**
+ * Replaces the real token, each long segment of it, and anything token-shaped in display-safe `s` with [REDACTED].
+ * Matching runs on a skeleton of `s` without the invisible noise (format-char markers, combining marks; for the real
+ * token also whitespace), so a token with such characters injected is still found; the span replaced in `s` runs from
+ * the first to the last matched character, noise included.
+ */
+function redactDisplayed(s: string, needles: string[]): string {
+  const spans: [number, number][] = [];
+  const exact = skeleton(s, true);
+  for (const n of needles) {
+    for (let i = exact.text.indexOf(n); i >= 0; i = exact.text.indexOf(n, i + 1)) spans.push([exact.at[i]!, exact.at[i + n.length - 1]! + 1]);
+  }
+  const shaped = skeleton(s, false);
+  for (const m of shaped.text.matchAll(TOKEN_SHAPE)) spans.push([shaped.at[m.index]!, shaped.at[m.index + m[0].length - 1]! + 1]);
+  if (!spans.length) return s;
+  spans.sort((x, y) => x[0] - y[0]);
+  const merged: [number, number][] = [];
+  for (const sp of spans) {
+    const last = merged.at(-1);
+    if (last && sp[0] <= last[1]) last[1] = Math.max(last[1], sp[1]); else merged.push([...sp]);
+  }
+  let out = '';
+  let from = 0;
+  for (const [a, b] of merged) { out += s.slice(from, a) + REDACTED; from = b; }
+  return out + s.slice(from);
+}
+
+/**
+ * Untrusted runtime text made safe to show, with the approval token gone: the one helper every place the runtime's
+ * answer to `work approve` lands goes through (the outcome detail, which is the chat text, the manager log line and the
+ * journal entry; and an error thrown while approving). The runtime holds the token (it is in its argv), so it may
+ * echo it, also with characters displayText strips (C0/C1 controls, ANSI/OSC sequences) or escapes (zero-width and
+ * bidi characters) inside it to dodge a plain match. Order: redact the whole token in the raw text; displayText;
+ * collapse whitespace; redact the token, its long segments and token shapes on the skeleton (see redactDisplayed);
+ * truncate to `max`; redact once more. The raw pass is exact-match only: a token-shape match there could stop at an
+ * injected character and leave the rest of the real token for the later passes to miss. A runtime that re-encodes the
+ * token on purpose (reversed, with visible separators) is not caught: that is outside what redaction can do.
+ */
+export function redactApprovalText(raw: string, signature: string | undefined, max = APPROVE_MESSAGE_MAX): string {
+  const sig = signature?.trim() ? signature : undefined;
+  const needles = sig ? [...new Set([sig, ...sig.split('.').filter((p) => p.length >= MIN_SECRET_PART)])].sort((x, y) => y.length - x.length) : [];
+  // NUL first: an escape sequence left open just before the token ends at the NUL (which displayText drops), not inside the marker.
+  let s = sig ? raw.split(sig).join(`\u0000${REDACTED}`) : raw;
+  s = redactDisplayed(displayText(s).replace(/\s+/g, ' ').trim(), needles);
+  s = redactDisplayed(truncateCodePoints(s, max), needles);
+  return truncateCodePoints(s, max);
 }
 
 /** After an applied config change: the command that applies what it still needs (each confirmed on its own). */

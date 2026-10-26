@@ -209,8 +209,9 @@ Host-owned keys are writable only by `minions settings` in the host terminal, or
 manager chat, with the double tap (see [Owner decisions](#owner-decisions) Q2). They are refused when recorded in the runtime, refused by the
 manager for any request from the container, and never present in a writable file the container can reach. That
 matches task-44's criterion "Security-relevant settings (policy, permissions, sensitive paths, approvals) stay
-host-owned and are never writable from the container". Approvals stay host-signed: `/approve <task> <sha>` in the manager chat
-runs the host's `work approve`, so the signing key never leaves the host (see [Owner decisions](#owner-decisions) Q5).
+host-owned and are never writable from the container". Approvals stay host-signed: `/approve <task> <sha> [merge]` in the manager chat
+runs the host's `work approve` (`approveOnHost`), so the signing key never leaves the host (see [Owner decisions](#owner-decisions) Q5;
+built in task-53.5.4).
 
 ## Failure and rollback
 
@@ -391,7 +392,7 @@ commands. Decisions made here:
   CONFLICT "another process polls the manager bot" and 401/404 is AUTH_REQUIRED. The core logs both and retries after
   5 s. A 429 waits `retry_after`. A send is retried once after a 429 of at most 30 s.
 - **Commands.** Fixed set `/status`, `/requests`, `/project [name|all]`, `/help` (`/start`). Anything else gets the
-  help text. `/set`, `/sync`, `/upgrade`, `/restart` and `/undo` came in task-53.5.3 (below); `/approve` is task-53.5.4.
+  help text. `/set`, `/sync`, `/upgrade`, `/restart` and `/undo` came in task-53.5.3 (below); `/approve` came in task-53.5.4 (below).
   The core gives the transport read-only views (`ManagerCommands`, through `ManagerTransport.attach`). `/requests`
   resends every request whose newest journal entry is an offer, with buttons. An expired one is included: Confirm
   then brings a fresh offer. `/status` shows, per project: runtime running, coordinator (from the runtime's
@@ -458,6 +459,33 @@ Built in task-53.5.3 (phase 4, part 3): the owner change commands `/set <key> <v
 - **Follow-ups.** After an applied config change that needs a restart or an upgrade, the outcome says to send
   `/restart` or `/upgrade` (each its own plan to confirm). The manager does not offer them by itself yet.
 
+Built in task-53.5.4 (phase 4, part 4): `/approve <task> <sha> [merge]`. Decisions made here:
+
+- **Same path again.** `parseOwnerCommand` turns it into `{ kind: 'approve', taskId, head, merge }`; `propose` journals
+  an owner request (`ow_` id) of plan kind `approve` with `approval: { taskId, head, scope }`. Only the confirmed
+  plan signs anything, through the same `confirmOffer` and apply code.
+- **Exact head.** The parser accepts only `task-<n>[.<n>...]` and a full 40-character lowercase hex SHA; a short,
+  uppercase or non-hex SHA gets the usage line, and `buildPlan` validates the payload again. The manager does not
+  read the task's head itself (there is no bounded runtime read of the publication head today): the runtime's
+  `work approve` already refuses (CONFLICT) a head that is not the one awaiting publication, or for `merge` the
+  delivered head, before it records anything. That refusal is the failed outcome the owner sees.
+- **Always two taps.** The plan's `loosens` is always set ("signs a publication approval for <task> at <sha>", or a
+  merge approval), so the transport asks twice, also for an offer read back from the journal.
+- **Scope.** Without `merge` it is a publish approval; with `merge` a merge-scoped one (`approveOnHost` with
+  `merge: true`). The offer says which, in the summary and on its own `scope:` line.
+- **Signing.** The manager calls `approveOnHost` (`src/host/approvals.ts`, injectable as `ManagerDeps.approveOnHost`)
+  in its own process with the project id and a delegate that runs `minions work approve ... --signature <token> --json`
+  through the bounded runtime. The token is in that argv only: it is never logged, journaled or sent to the chat (the
+  outcome shows only the runtime's envelope message). The runtime has the token and may echo it, so its message, and an
+  error thrown while approving, go through `redactApprovalText`: the whole token is replaced in the raw text; then, after
+  `displayText` and whitespace collapsing, the token, each long segment of it and anything shaped `mnap1.<a>.<b>` are
+  replaced on a copy without the invisible noise (`<U+XXXX>` markers, combining marks; for the real token also
+  whitespace), so controls, escape sequences or zero-width characters injected into the token do not hide it; the text
+  is cut to 500 characters last and checked once more. A runtime that re-encodes the token on purpose is out of reach. The terminal `settings apply --confirm` refuses an approve plan
+  (it is confirmed only in the chat; `minions work approve` stays the terminal route).
+- **Not undoable.** `/undo` of an approval request is refused ("approvals cannot be undone"); an unused approval
+  expires and a new commit needs a new one anyway.
+
 
 Child tasks, filed as task-53.2 to task-53.7 (phases 1 to 6) and task-53.8 (coordinator proposal):
 
@@ -504,5 +532,6 @@ Answered by the owner on 2026-10-26 (Telegram msg 250). They replace the open qu
    the request. Where it exists, it keeps the plan (commit range, diffstat, sensitive paths) and the double tap.
 4. **How the manager runs.** A user service (launchd or systemd --user) installed by `setup`.
 5. **Approvals from the manager chat.** `/approve <task> <sha>` is part of phase 4. It is bound to the head SHA,
-   needs the double tap, and the signing key stays on the host (the manager runs the host's `work approve`).
+   needs the double tap, and the signing key stays on the host (the manager runs the host's `work approve`). Landed in
+   task-53.5.4.
 6. **Confirmation expiry.** 30 minutes.

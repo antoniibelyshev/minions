@@ -352,13 +352,13 @@ describe('getUpdates', () => {
 
 describe('commands', () => {
   it('anything outside the fixed command set gets the help text', async () => {
-    const api = botApi([[msg(1, 'hello'), msg(2, '/reboot now'), msg(3, '/start'), msg(4, '/help'), msg(5, ''), msg(6, '/approve x y')]]);
+    const api = botApi([[msg(1, 'hello'), msg(2, '/reboot now'), msg(3, '/start'), msg(4, '/help'), msg(5, ''), msg(6, '/deploy x y')]]);
     const t = transport(api);
     t.attach(fakeCommands());
     await t.receive(30_000);
     const texts = api.of('sendMessage').map((c) => c.body.text);
     expect(texts).toEqual(Array(6).fill(T.HELP_TEXT));
-    for (const c of ['/status', '/requests', '/project', '/help', '/set', '/sync', '/upgrade', '/restart', '/undo']) expect(T.HELP_TEXT).toContain(c);
+    for (const c of ['/status', '/requests', '/project', '/help', '/set', '/sync', '/upgrade', '/restart', '/undo', '/approve']) expect(T.HELP_TEXT).toContain(c);
   });
 
   it('/status and /requests use the attached commands; /requests sends each pending offer with its buttons', async () => {
