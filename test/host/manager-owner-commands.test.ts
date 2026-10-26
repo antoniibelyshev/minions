@@ -409,6 +409,37 @@ describe('runSyncOnly (minions upgrade --sync-only)', () => {
   });
 });
 
+describe('QA: runSyncOnly never forces', () => {
+  it('a divergence (a host commit not in minions/main): the dry run refuses, the run throws; main and the tree stay', async () => {
+    const repo = makeRepo(env.root, 'diverge');
+    git(repo, 'checkout', '-q', '-b', 'tmp');
+    writeFileSync(join(repo, 'agent.txt'), 'agent\n');
+    git(repo, 'add', '.');
+    git(repo, 'commit', '-q', '-m', 'agent work');
+    git(repo, 'update-ref', 'refs/remotes/minions/main', git(repo, 'rev-parse', 'HEAD'));
+    git(repo, 'checkout', '-q', 'main');
+    git(repo, 'branch', '-q', '-D', 'tmp');
+    writeFileSync(join(repo, 'host.txt'), 'host\n');
+    git(repo, 'add', '.');
+    git(repo, 'commit', '-q', '-m', 'host work');
+    const head = git(repo, 'rev-parse', 'HEAD');
+    let exports = 0;
+    const sync = { repo, branch: 'main', baseBranch: 'main', exportRepo: async () => { exports++; return { bundle: 'b', refs: [], changes: [] }; } };
+    const dry = await US.runSyncOnly({ sync, origin: null, dryRun: true });
+    expect(dry.ok).toBe(false);
+    expect(dry.steps[0]!.detail).toMatch(/^would refuse: /);
+    await expect(US.runSyncOnly({ sync, origin: null })).rejects.toThrow();
+    expect(git(repo, 'rev-parse', 'HEAD')).toBe(head);
+    expect(git(repo, 'status', '--porcelain')).toBe('');
+    expect(existsSync(join(repo, 'agent.txt'))).toBe(false);
+    expect(exports).toBeLessThanOrEqual(1);
+  });
+
+  it('needs exactly one source', async () => {
+    await expect(US.runSyncOnly({ sync: null, origin: null })).rejects.toThrow(/exactly one source/);
+  });
+});
+
 // ---------------------------------------------------------------- the chat side
 
 const OWNER = 4242;
@@ -501,5 +532,139 @@ describe('the manager chat: owner change commands', () => {
     expect(texts[6]).toMatch(/^Your request ow_[0-9a-f]{8} \(project [^)]+\): restart the coordinator/);
     expect(texts[6]).toContain(a.project.projectId);
     expect(texts).toHaveLength(7);
+  });
+});
+
+// ---------------------------------------------------------------- QA (task-53.5.3): security edges
+
+describe('QA: owner command security edges', () => {
+  const rows = (list: unknown[]) => async (_p: ProjectJson, argv: string[]) => (argv[1] === 'settings' && argv[2] === 'requests' && !argv.includes('mark') ? ok({ requests: list }) : ok({}));
+
+  it('container rows through the poll: an ow_ id is dropped as malformed; a cr_ row claiming the owner origin or an owner-only kind is never offered', async () => {
+    const { project, local } = await install();
+    const s = setup([project]);
+    const before = existsSync(local) ? readFileSync(local, 'utf8') : null;
+    const base = { status: 'proposed', reason: 'please', createdAt: '2026-10-26T09:00:00Z' };
+    const m = new M.HostManager({ ...s.deps, delegate: rows([
+      { ...base, id: 'ow_0a1b2c3d', kind: 'config-set', payload: { key: 'verification.reviewerRequired', value: 'false', layer: 'local' } },
+      { ...base, id: 'cr_0a1b2c3d', kind: 'config-set', origin: 'owner', payload: { key: 'verification.reviewerRequired', value: 'false', layer: 'local' } },
+      { ...base, id: 'cr_0a1b2c3e', kind: 'sync', payload: {} },
+      { ...base, id: 'cr_0a1b2c3f', kind: 'undo', payload: { target: 'cr_00000000' } },
+    ]) });
+    expect(await m.pollProject(project)).toEqual([]);
+    expect(s.offers).toEqual([]);
+    expect(journal().filter((e) => e.type === 'offer')).toEqual([]);
+    const texts = s.outcomes.map((o) => o.text).join('\n');
+    expect(texts).toMatch(/ignored 1 malformed change request row/);
+    expect(texts).toMatch(/cr_0a1b2c3d .*cannot be offered: .*host-owned/);
+    expect(texts).toMatch(/cr_0a1b2c3e .*cannot be offered: .*only from the owner/);
+    expect(texts).toMatch(/cr_0a1b2c3f .*cannot be offered: .*only from the owner/);
+    expect(existsSync(local) ? readFileSync(local, 'utf8') : null).toBe(before);
+    expect(s.runs).toEqual([]);
+  });
+
+  it('nonce replay: a made-up nonce, a nonce of another offer, and the old nonce after a re-offer never apply', async () => {
+    const { project } = await install();
+    const s = setup([project]);
+    const a = await s.cmds.propose(null, { kind: 'restart' });
+    const b = await s.cmds.propose(null, { kind: 'restart' });
+    await s.manager.handle({ type: 'confirm', requestId: a.requestId, nonce: '0'.repeat(32) });
+    expect(s.outcomes.at(-1)).toMatchObject({ status: 'refused', text: expect.stringMatching(/no offer for change request ow_.* with this nonce/) });
+    await s.manager.handle({ type: 'confirm', requestId: a.requestId, nonce: b.nonce });
+    expect(s.outcomes.at(-1)).toMatchObject({ status: 'refused', text: expect.stringMatching(/with this nonce/) });
+    await s.manager.handle({ type: 'confirm', requestId: 'ow_XYZ', nonce: a.nonce });
+    expect(s.outcomes.at(-1)).toMatchObject({ status: 'refused', text: expect.stringMatching(/malformed confirmation/) });
+    expect(s.runs).toEqual([]);
+    // Expired: refused and re-offered; the old nonce stays dead after that.
+    s.advance(31 * 60_000);
+    await s.confirm(a);
+    const fresh = s.offers.find((o) => o.requestId === a.requestId)!;
+    expect(fresh.nonce).not.toBe(a.nonce);
+    const n = s.outcomes.length;
+    await s.confirm(a);
+    expect(s.outcomes.slice(n).map((o) => o.status)).not.toContain('applied');
+    expect(s.runs).toEqual([]);
+    await s.confirm(fresh);
+    expect(s.runs).toEqual([['settings', 'restart']]);
+    await s.confirm(fresh);
+    expect(s.outcomes.at(-1)!.status).toBe('already-handled');
+    expect(s.runs).toHaveLength(1);
+  });
+
+  it('the double tap survives a transport restart: a loosening owner plan read from the journal still asks twice', async () => {
+    const { project, local } = await install();
+    const s = setup([project]);
+    const on = await s.cmds.propose(null, { kind: 'config-set', key: 'verification.reviewerRequired', value: 'true', layer: 'local' }).catch(() => null);
+    if (on) await s.confirm(on);
+    const o = await s.cmds.propose(null, { kind: 'config-set', key: 'verification.reviewerRequired', value: 'false', layer: 'local' });
+    expect(o.loosens).toBeTruthy();
+    const snap = existsSync(local) ? readFileSync(local, 'utf8') : null;
+    // A fresh transport that never sent this offer (no in-memory copy): the default journal lookup.
+    const api = botApi([[tap(1, T.callbackData('c', o.requestId, o.nonce))]]);
+    const t = T.telegramTransport({ token: TOKEN, access: ACCESS, fetch: api.f, now: () => api.clock.t, sleep: async () => undefined });
+    t.attach(s.cmds);
+    expect(await t.receive(30_000)).toEqual([]);
+    expect(api.texts().at(-1)).toMatch(/^Second confirmation for change request ow_/);
+    expect(existsSync(local) ? readFileSync(local, 'utf8') : null).toBe(snap);
+    // A forged `d` without the armed first tap is refused by the transport.
+    const api2 = botApi([[tap(2, T.callbackData('d', o.requestId, o.nonce))]]);
+    const t2 = T.telegramTransport({ token: TOKEN, access: ACCESS, fetch: api2.f, now: () => api2.clock.t, sleep: async () => undefined });
+    t2.attach(s.cmds);
+    expect(await t2.receive(30_000)).toEqual([]);
+    expect(api2.texts().at(-1)).toMatch(/second confirmation .* expired/);
+  });
+
+  it('a non-owner typing /set is dropped silently: no reply, no plan, nothing journaled', async () => {
+    const { project } = await install();
+    const s = setup([project]);
+    const propose = vi.spyOn(s.cmds, 'propose');
+    const stranger = (update_id: number, text: string, from: number, chat: number): TelegramUpdate =>
+      ({ update_id, message: { message_id: 1000 + update_id, text, from: { id: from, is_bot: false }, chat: { id: chat, type: 'private' } } });
+    const api = botApi([[stranger(1, '/set verification.reviewerRequired false', 999, 999), stranger(2, '/restart', 999, OWNER), stranger(3, '/sync', OWNER, 999)]]);
+    const t = T.telegramTransport({ token: TOKEN, access: ACCESS, fetch: api.f, now: () => api.clock.t, sleep: async () => undefined });
+    t.attach(s.cmds);
+    expect(await t.receive(30_000)).toEqual([]);
+    expect(api.texts()).toEqual([]);
+    expect(propose).not.toHaveBeenCalled();
+    expect(journal()).toEqual([]);
+  });
+
+  it('undo write-time compare-and-swap: a stale expected sha is refused and the file is untouched', async () => {
+    const { project, local } = await install();
+    const s = setup([project]);
+    const o = await s.cmds.propose(null, { kind: 'config-set', key: 'execution.maxActiveTasks', value: '4', layer: 'local' });
+    await s.confirm(o);
+    const text = readFileSync(local, 'utf8');
+    const e = await reason(H.applyUndo(project, { target: o.requestId, expectSha256: 'f'.repeat(64), undoId: 'ow_ffffffff' }));
+    expect(e.code).toBe('CONFLICT');
+    expect(e.details).toMatchObject({ refusal: 'drift' });
+    expect(readFileSync(local, 'utf8')).toBe(text);
+    expect(await H.loadHistory(project.projectId, 'ow_ffffffff')).toBeNull();
+  });
+
+  it('a config-set whose write failed leaves an incomplete history entry that /undo refuses', async () => {
+    const { project, local } = await install();
+    const s = setup([project]);
+    const o = await s.cmds.propose(null, { kind: 'config-set', key: 'execution.maxActiveTasks', value: '4', layer: 'local' });
+    const m = new M.HostManager({ ...s.deps, runChild: async () => ({ code: 1, stdout: '', stderr: 'boom' }) });
+    await m.handle({ type: 'confirm', requestId: o.requestId, nonce: o.nonce });
+    expect(s.outcomes.at(-1)!.status).toBe('failed');
+    expect(await H.loadHistory(project.projectId, o.requestId)).toMatchObject({ completed: false });
+    expect((await reason(s.cmds.propose(null, { kind: 'undo', target: o.requestId }))).message).toMatch(/no completed write/);
+    expect(existsSync(local) ? readJson(local).execution?.maxActiveTasks : undefined).not.toBe(4);
+  });
+
+  it('config history files are private (dir 0700, files 0600) and ids are validated before any path is built', async () => {
+    const { project, local } = await install();
+    const s = setup([project]);
+    const o = await s.cmds.propose(null, { kind: 'config-set', key: 'execution.maxActiveTasks', value: '4', layer: 'local' });
+    await s.confirm(o);
+    const { statSync } = await import('node:fs');
+    expect(statSync(H.configHistoryDir(project.projectId)).mode & 0o777).toBe(0o700);
+    expect(statSync(join(H.configHistoryDir(project.projectId), `${o.requestId}.json`)).mode & 0o777).toBe(0o600);
+    for (const bad of ['../config', 'cr_../../x', 'ow_0a1b2c3d/../../y']) {
+      await expect(H.loadHistory(project.projectId, bad)).rejects.toThrow(/not a change request id/);
+    }
+    void local;
   });
 });
