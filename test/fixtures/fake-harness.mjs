@@ -29,6 +29,8 @@ for (const s of scenario.steps ?? []) {
       git('commit', '-q', '--no-verify', '-m', s.message ?? `edit ${s.file}`);
       break;
     case 'git': git(...s.args); break;
+    // A shell script in the clone (forged objects, replace refs, FIFOs); $BRANCH is the lease branch, $CLAIM the claim head.
+    case 'sh': execFileSync('sh', ['-c', s.script], { cwd: process.cwd(), env: { ...process.env, BRANCH: brief.branch, CLAIM: brief.expectedHead }, stdio: ['ignore', 'pipe', 'pipe'] }); break;
     case 'dotgitCommit': {
       // A commit whose tree has a `.git` entry (fsck hasDotgit): built with plumbing, the porcelain refuses it.
       const blob = execFileSync('git', ['hash-object', '-w', '--stdin'], { input: '[core]\n\thooksPath = /tmp/evil\n', encoding: 'utf8' }).trim();
