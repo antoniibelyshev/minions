@@ -5,8 +5,8 @@
  * config: no adapter code (plan, probe, usage parsing) lives here yet.
  *
  * Architecture decisions recorded here (task-14.2):
- * - The registry is a static list (claude, codex, junie). The test-only `fake` adapter (D6) is added with the
- *   runner (child task 3); config validation refuses it until then because the schema enum does not list it.
+ * - The registry is a static list (claude, codex, junie). The test-only `fake` adapter (D6) lives with the runner
+ *   (src/runtime/runner/adapter.ts) and is injected by tests only; config validation refuses it (not in the schema enum).
  * - Phase rules are code (D9), selected by CURRENT_PHASE. The owner picked phase 1 option (b): a process harness
  *   only for project gate roles. Option (a) keeps that allowance, so a `codex-reviewer` pilot config stays valid
  *   when the switch to (a) happens, and adds producer roles with the squad-wide cap of one.

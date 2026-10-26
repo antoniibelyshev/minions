@@ -989,6 +989,43 @@ not, Junie is deferred with a clear `status --check` message.
 - U-G7: Absolute paths. Tools that bake the checkout path into caches or lockfiles will see
   `<scratch>/work` instead of the lease worktree. Expected harmless, since nothing outside git is fetched back.
 
+### Addendum: child task 3 implementation decisions (task-14.4)
+
+The runner is `src/runtime/runner/` (`run.ts` gate, `runLease` and `reapRun`; `record.ts`; `repo.ts` clone, snapshot,
+sanitize and fetch-back; `supervise.ts`; `adapter.ts` contract and the fake adapter). Runner git is `runnerGit` in
+`src/runtime/git-hardening.ts`. Decisions made while building it:
+
+- **No production adapter yet.** `PROCESS_ADAPTERS` is empty until child tasks 4 and 5, so `work run` refuses with
+  `PRECONDITION`. The `fake` adapter is injected by tests only and cannot be selected from config.
+- **Gate codes.** The refusals in D3.1 are `POLICY_DENIED`, capacity included. Budget refusals reuse the claim check.
+  These are `PRECONDITION`: the host runtime, a missing adapter or `harnesses.<id>` block, a lease claimed on a
+  harness other than its role's current one, a QA sweep (the base branch moves with merges), and a self-test that is
+  not `ok`.
+- **The snapshot also records the worktree admin dir's `HEAD`.** It belongs to the lease alone, and the
+  fast-forward needs it to name the lease branch.
+- **Sanitizing goes further than D3.7.2.** The `lstat` walk covers the whole `.git` tree (refs, objects, logs), not
+  just the control paths. Besides the files listed there, the runner also removes `info/` (grafts, attributes),
+  `modules/`, `shallow`, the commit graph and leftover lock files. It rewrites `HEAD` too. Runner git also turns off
+  the commit graph and replace refs (`core.commitGraph=false`, `core.useReplaceRefs=false`, `GIT_NO_REPLACE_OBJECTS`),
+  because a worker could use either to fake the ancestry check. `core.logAllRefUpdates=false` is in the clone's
+  template config and in every runner call.
+- **A violation is a synthesized `blocked` result.** Its `findings` name each violation (`harness-violation: ...`),
+  and the runner logs a `harness-violation` event. `blocked` already ends the attempt. Turning it into an invalid
+  submission that skips the correction rule is left to the record path (child task 8).
+- **Cancel mark.** The mark is a separate `cancel` file in the record dir, so the reaper never races the runner's
+  own record rewrites. A runner that comes back after `reapRun` took the record over (the record names another
+  runner, or says `done`) submits nothing.
+- **Usage** goes into the task-32 `usage` event with `source: "runner"` and `harness: <id>`.
+- **Worker instructions** are a minimal runner text: the brief file, the result file and the result contract, with the
+  brief inlined. Rendering the full role prompt is the adapters' job (child task 4).
+- **Without the wrapper** (tests; the CLI always uses `minions-sandbox`), the worker runs in its own process group
+  (`detached`). The group is SIGKILLed once the leader exits. Surviving a SIGKILLed runner depends on the wrapper's
+  parent-death signal, which the task-14.3 self-test canary covers. The runner tests simulate a lost runner by
+  pointing the record at a dead process.
+- **Not here (child task 8):** calling `reapRun` from `work release`, the stale-lease path and coordinator start; the
+  seccomp-count escapee sweep (`reapRun` kills only the recorded group); the re-claim gate in `work claim`; removing
+  `done` records when the lease ends (`removeRunRecord` exists); restart counting.
+
 ## Child tasks
 
 The order of 3, 4 and 7 depends on the phase 1 option (D9). Under option (b), child task 4 starts with the gate

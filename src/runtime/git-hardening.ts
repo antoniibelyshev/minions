@@ -19,7 +19,7 @@
 //
 // Residual: the filter list is read just before the command runs, so a concurrently running agent
 // could race a new driver in between (the sandbox already denies sandboxed writes to <repo>/.git/config
-// and minions denies Edit/Write there). The container runtime is unchanged (no hardening applied).
+// and minions denies Edit/Write there). In the container, only the process runner (runnerGit below) uses it.
 import { lstat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { MinionsError } from '../core/errors.js';
@@ -117,4 +117,104 @@ export async function hardenedGit(cwd: string, args: string[], allowFailure: boo
     }
   }
   return runner('git', [...lead, ...extra, ...args], { cwd, env: hardenedGitEnv(base, workTree), allowFailure, timeoutMs });
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Runner git (docs/design/agent-runtimes.md D3a). The process runner (`minions work run`) and its recovery run
+// every git command through `runnerGit`, in the container and on the host alike: on the shared repository and
+// on the per-lease clone a process worker wrote. On top of the host hardening above:
+//
+// - explicit `--git-dir` (and `--work-tree` where one is used): git never discovers a repository through a
+//   `.git` file, and every inherited GIT_* variable is dropped (GIT_DIR, GIT_COMMON_DIR, GIT_OBJECT_DIRECTORY,
+//   GIT_ALTERNATE_OBJECT_DIRECTORIES, ...);
+// - GIT_CONFIG_GLOBAL is a runner-owned file, so no user or worker config is read besides the repository's own
+//   (the clone's is rewritten by the runner before any call, the shared one is not worker-writable);
+// - no untracked cache, commit graph or replace refs (all worker-writable lies about the history), no signing;
+// - transfer/fetch/receive fsck on, and the `file` transport only for the runner's local clone and fetch-back,
+//   with an explicit `--upload-pack=git-upload-pack`;
+// - `--no-verify` and `--no-gpg-sign` on every commit and merge.
+
+/** Leading `-c` options of every runner git call (after `--git-dir` / `--work-tree`). */
+export function runnerGitArgs(opts: { localTransport?: boolean } = {}): string[] {
+  const host = hardenedGitArgs({ network: !opts.localTransport });
+  const extra = [
+    'core.untrackedCache=false', 'core.commitGraph=false', 'core.useReplaceRefs=false', 'core.logAllRefUpdates=false',
+    'core.symlinks=true', 'commit.gpgSign=false', 'tag.gpgSign=false', 'merge.verifySignatures=false',
+    'transfer.fsckObjects=true', 'fetch.fsckObjects=true', 'receive.fsckObjects=true',
+    'uploadpack.allowAnySHA1InWant=false', 'credential.interactive=false',
+  ];
+  // hardenedGitArgs ends with --no-pager; keep it last.
+  return [...host.slice(0, -1), ...extra.flatMap((v) => ['-c', v]), '--no-pager'];
+}
+
+/** Environment of a runner git call: no inherited GIT_*, the runner-owned global config, no replace objects. */
+export function runnerGitEnv(base: NodeJS.ProcessEnv, globalConfig: string): NodeJS.ProcessEnv {
+  const env = hardenedGitEnv(base);
+  Object.assign(env, { GIT_CONFIG_GLOBAL: globalConfig, GIT_NO_REPLACE_OBJECTS: '1', GIT_OPTIONAL_LOCKS: '0', GIT_EDITOR: '/usr/bin/false', GIT_SEQUENCE_EDITOR: '/usr/bin/false' });
+  return env;
+}
+
+/** Which repository a runner git call targets. Both paths absolute; `workTree` only where the command needs one. */
+export interface RunnerGitTarget {
+  gitDir: string;
+  workTree?: string;
+  /**
+   * Runs before every call and throws when the target's pointer/control files are not the ones the runner
+   * recorded or just rewrote (D3a: "before the call, the pointer and control files of that git dir must match").
+   */
+  verify?: () => Promise<void>;
+}
+
+/** Subcommands that the runner may run with the local `file` transport (clone and fetch-back only). */
+const LOCAL_TRANSPORT_CMDS = new Set(['clone', 'fetch']);
+
+/**
+ * Builds the argv of one runner git call. Pure (tested): explicit git dir and work tree, the hardened `-c` set,
+ * the filter overrides, `--no-verify --no-gpg-sign` for commit/merge and `--upload-pack` for fetch/clone.
+ */
+export function runnerGitArgv(target: Pick<RunnerGitTarget, 'gitDir' | 'workTree'> | null, args: string[], filters: string[] = []): string[] {
+  const sub = subcommand(args);
+  for (const p of [target?.gitDir, target?.workTree]) {
+    if (p !== undefined && (!p.startsWith('/') || p.includes('\n'))) throw new MinionsError('INTERNAL', `runner git: not an absolute path: ${JSON.stringify(p)}`);
+  }
+  if (sub === 'clone' && target) throw new MinionsError('INTERNAL', 'runner git: clone takes no --git-dir');
+  if (sub !== 'clone' && !target) throw new MinionsError('INTERNAL', 'runner git: every command but clone needs an explicit --git-dir');
+  const lead = [
+    ...(target ? [`--git-dir=${target.gitDir}`] : []),
+    ...(target?.workTree ? [`--work-tree=${target.workTree}`] : []),
+  ];
+  const tail = [...args];
+  const i = tail.indexOf(sub);
+  if (sub === 'commit' || sub === 'merge') tail.splice(i + 1, 0, '--no-verify', '--no-gpg-sign');
+  if (LOCAL_TRANSPORT_CMDS.has(sub)) tail.splice(i + 1, 0, '--upload-pack=git-upload-pack');
+  return [...lead, ...runnerGitArgs({ localTransport: LOCAL_TRANSPORT_CMDS.has(sub) }), ...filters, ...tail];
+}
+
+export interface RunnerGitOptions {
+  globalConfig: string; env?: NodeJS.ProcessEnv; run?: RawRun; timeoutMs?: number; cwd?: string;
+  /** Author and committer of a runner commit (the only GIT_* variables a runner call sets besides the hardening). */
+  identity?: { name: string; email: string };
+}
+
+/**
+ * Runs one runner git command. `target` null only for `clone`. Work-tree commands first read the filter
+ * drivers the target's config defines (with the same hardening) and empty them.
+ */
+export async function runnerGit(target: RunnerGitTarget | null, args: string[], allowFailure: boolean, opts: RunnerGitOptions): Promise<RunResult> {
+  const runner = opts.run ?? ((c, a, o) => run(c, a, o));
+  const env = runnerGitEnv(opts.env ?? process.env, opts.globalConfig);
+  if (opts.identity) Object.assign(env, { GIT_AUTHOR_NAME: opts.identity.name, GIT_AUTHOR_EMAIL: opts.identity.email, GIT_COMMITTER_NAME: opts.identity.name, GIT_COMMITTER_EMAIL: opts.identity.email });
+  const timeoutMs = opts.timeoutMs ?? 120_000;
+  const cwd = opts.cwd ?? '/';
+  await target?.verify?.();
+  let filters: string[] = [];
+  if (target && WORKTREE_CMDS.has(subcommand(args))) {
+    const list = await runner('git', runnerGitArgv(target, ['config', '--show-scope', '--name-only', '--get-regexp', '^filter\\.']), { cwd, env, allowFailure: true, timeoutMs: 30_000 });
+    if (list.code !== 0 && list.code !== 1) {
+      if (allowFailure) return list;
+      throw new MinionsError('INTERNAL', `git config could not be read in ${target.gitDir}: ${list.stderr.trim().slice(0, 300)}`);
+    }
+    filters = filterOverrides(list.stdout);
+  }
+  return runner('git', runnerGitArgv(target, args, filters), { cwd, env, allowFailure, timeoutMs });
 }

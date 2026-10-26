@@ -131,7 +131,7 @@ describe('CLI surface (docs/design/cli-surface.md)', () => {
 
   it('hidden commands still parse and dispatch, with their own subcommand help', async () => {
     for (const [args, expected] of [
-      [['work', '--help'], ['claim', 'brief', 'submit', 'record', 'release', 'publish', 'approve', 'list', 'spend']],
+      [['work', '--help'], ['claim', 'brief', 'submit', 'record', 'release', 'publish', 'approve', 'list', 'spend', 'run', 'probe']],
       [['backlog', '--help'], ['ready', 'list', 'show', 'create', 'update', 'note', 'export']],
       [['hook', '--help'], ['stop', 'pre-agent', 'pre-telegram']],
       [['coordinator', '--help'], ['run', 'sync', 'restart']],
@@ -149,7 +149,7 @@ describe('CLI surface (docs/design/cli-surface.md)', () => {
 
   it('hidden commands reach their action handlers (not commander\'s unknown-command error)', async () => {
     // Runtime-only commands run on the host fail closed inside their action with INCOMPATIBLE_RUNTIME.
-    for (const args of [['workspace', 'setup'], ['work', 'list'], ['backlog', 'ready']]) {
+    for (const args of [['workspace', 'setup'], ['work', 'list'], ['work', 'run', 'lease-x'], ['backlog', 'ready']]) {
       const { out, code } = await run([...args, '--json']);
       expect(code, args.join(' ')).toBe(6);
       expect(JSON.parse(out).error.code).toBe('INCOMPATIBLE_RUNTIME');

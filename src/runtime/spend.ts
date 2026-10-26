@@ -119,11 +119,13 @@ export function parseBudget(text: string): Pick<Budget, 'limit' | 'unit' | 'peri
 export interface UsageInput {
   tokens: number;
   model?: string | null;
-  /** record | release | result (the WorkerResult usage block) | manual (`work spend`). */
-  source: 'record' | 'release' | 'result' | 'manual';
+  /** record | release | result (the WorkerResult usage block) | manual (`work spend`) | runner (a process harness, `work run`). */
+  source: 'record' | 'release' | 'result' | 'manual' | 'runner';
+  /** The process harness that reported it (`work run`); absent for Claude workers. */
+  harness?: string;
 }
 
-interface UsageEventData { key: string; scope: 'lease' | 'session'; leaseId?: string; role?: string; attempt?: number; session?: string; tokens: number; model: string | null; source: string }
+interface UsageEventData { key: string; scope: 'lease' | 'session'; leaseId?: string; role?: string; attempt?: number; session?: string; tokens: number; model: string | null; source: string; harness?: string }
 
 function checkTokens(tokens: number): void {
   if (!Number.isInteger(tokens) || tokens < 0) throw new MinionsError('PRECONDITION', `Usage must be a whole, non-negative number of tokens (got ${tokens}).`);
@@ -134,7 +136,7 @@ export function recordLeaseUsage(db: RuntimeDb, leaseId: string, u: UsageInput):
   checkTokens(u.tokens);
   const lease = db.lease(leaseId);
   if (!lease) throw new MinionsError('NOT_FOUND', `Lease ${leaseId} does not exist.`);
-  const data: UsageEventData = { key: `lease:${leaseId}`, scope: 'lease', leaseId, role: lease.role, attempt: lease.attempt, tokens: u.tokens, model: u.model ?? null, source: u.source };
+  const data: UsageEventData = { key: `lease:${leaseId}`, scope: 'lease', leaseId, role: lease.role, attempt: lease.attempt, tokens: u.tokens, model: u.model ?? null, source: u.source, ...(u.harness ? { harness: u.harness } : {}) };
   db.addEvent('usage', lease.task_id, data);
   return data;
 }
