@@ -128,7 +128,7 @@ back to `ready` (`minions backlog update` or Backlog.md) to have it picked up ag
 ```sh
 minions channel show          # configured vs effective channel, and why Telegram is off
 minions telegram status       # pairing policy, whether the running coordinator has Telegram, the poller check
-minions status --check        # telegram, telegram.credential, telegram.bot, telegram.plugin, telegram.poller checks
+minions status --check        # telegram, telegram.credential, telegram.bot, telegram.plugin, telegram.poller checks (manager.* for the host manager bot)
 ```
 
 - **Pairing.** DM your bot; it answers with a code. In the coordinator terminal (`minions start`), type

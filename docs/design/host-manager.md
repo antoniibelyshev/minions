@@ -323,6 +323,50 @@ Built in task-53.4 (phase 3): the manager core in `src/host/manager.ts`, entry p
   refused (`details.refusal` revision, handled or spent). Only the upgrade dry run moves out of the lock. Config-set
   and restart plans are cheap and are still built entirely under it.
 
+Built in task-53.5.1 (phase 4, part 1): the manager-bot-token, the bot-id guard, terminal pairing and the doctor
+checks. The Bot API transport, the commands and `/approve` are task-53.5.2 to task-53.5.4. Decisions made here:
+
+- **Host-wide store account.** The stores stay keyed by an account. `MANAGER_CREDENTIAL` (`src/host/credentials.ts`)
+  has the fixed account `manager` instead of a project UUID. A store accepts that account only for that kind, and a
+  project kind never accepts it. So the file store path is `credentialStoreFile('manager', 'manager-bot-token')` =
+  `<MINIONS_HOME>/credentials/manager/manager-bot-token` (0600 in a 0700 directory). The Keychain item is service
+  `minions.manager`, account `manager`. The Secret Service item has the same attributes. Store selection is the same
+  as for the other kinds (the file store whenever a host-runtime project exists).
+- **Not a project credential.** The kind is not a `CredentialKind` and is not in `CREDENTIAL_KINDS`, so
+  `materializeSecrets` and `clearSecrets` never see it. The Keychain-to-file move (`moveKeychainTokensToFileStore`)
+  handles it separately from that reference file, so a host-runtime project also moves it to the file store. The
+  type system keeps it out of
+  `readToken` / `materializeSecrets`. Its non-secret reference (backend, locator, bot id) is
+  `<MINIONS_HOME>/manager/credential.json` (0600), never a project's `credentials.json`. `readManagerToken` refuses a
+  stored value whose bot id differs from that reference, so the guard cannot be bypassed by swapping the stored token.
+- **Guard placement.** `assertManagerBotDistinct` (`src/host/bot-guard.ts`) refuses a manager token whose bot id is
+  the stored Telegram bot of any registered project, including the project being set up. The reverse,
+  `assertNotManagerBot`, runs inside `provisionTelegramToken`, so `auth telegram`, `setup` and `init` are all covered
+  by one check. It lives in `credentials.ts` (bot-guard imports credentials, not the other way round) and bot-guard
+  re-exports it. If the manager reference cannot be read, the check refuses (fail closed). The bot id is the numeric
+  token prefix, so no network call is needed.
+- **Entry.** `minions setup` has an optional `manager` step after the agents step. It offers keep / change / pair /
+  remove when a token is stored, and asks "Set up the host manager bot?" (default no) when none is. The token comes from
+  the hidden prompt or `--manager-token-stdin`. The stdin lines come in the order github, telegram, manager, one line
+  per flag given. `getMe` runs only after the owner agrees. A token of a different bot removes the old pairing. There
+  is no `auth manager` subcommand: setup is the only entry.
+- **Pairing** (`src/host/manager-bot.ts`, `pairManagerBot`). It runs only in an interactive setup, never with `--yes`
+  or a piped token. Setup shows an 8-character code (40 bits, no 0/O/1/I, shown as `XXXX-XXXX`) and long-polls
+  `getUpdates` (`allowed_updates: ["message"]`, 25 s) until the deadline, 10 minutes later. Only a private chat with a
+  human sender whose text is the code (case, spaces and dashes ignored) pairs. Groups, bots and other text are skipped
+  without a reply. On a match, `access.json` (0600) gets `{version, botId, userId, chatId, pairedAt}`, and only then
+  replaces an older pairing. Setup acknowledges the code message (offset) and sends one confirmation. A 409 is reported
+  as "another process polls the manager bot" (CONFLICT), and a 401/404 as a rejected token. Network errors, 5xx and 429
+  (`retry_after`) are retried until the deadline. Clock, sleep, code and fetch can be injected.
+- **Transport hooks.** `loadManagerAccess`, `isOwnerUpdate` (the paired user in the paired private chat, for a
+  message or a button tap) and `readManagerToken` are what task-53.5.2 builds on. The transport must never pair.
+- **Doctor / `status --check`.** The checks are `manager.token` (ok "not set up (optional)" when there is no token;
+  otherwise presence, format, bot id and file mode), `manager.bot` (the manager bot against every coordinator bot) and
+  `manager.pairing` (paired for the stored bot). When there is no token, `manager.bot` and `manager.pairing` are
+  `unavailable`. They warn and never fail. They make no network call.
+- **Setup assistant.** `<MINIONS_HOME>/manager/**` is on the assistant's Edit deny list. An agent must not be able to
+  rewrite the pairing, the token reference or the journal.
+
 
 Child tasks, filed as task-53.2 to task-53.7 (phases 1 to 6) and task-53.8 (coordinator proposal):
 

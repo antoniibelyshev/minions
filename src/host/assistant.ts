@@ -20,7 +20,7 @@ import { action, globalOpts, requireMode } from '../core/cli-helpers.js';
 import { MinionsError } from '../core/errors.js';
 import { atomicWrite, sha256 } from '../core/fsutil.js';
 import { emit } from '../core/output.js';
-import { credentialStoreDir, defaultsPath, hostRoot, projectPaths, registryPath } from '../core/paths.js';
+import { credentialStoreDir, defaultsPath, hostRoot, managerDir, projectPaths, registryPath } from '../core/paths.js';
 import { VERSION } from '../core/version.js';
 import { HOST_SECRET_DIRS } from '../runtime/coordinator.js';
 import { renderTemplate, templatesDir } from '../plugin/generate.js';
@@ -72,7 +72,9 @@ export function assistantDeniedPaths(projectId: string): string[] {
     join(projects, '*', 'secrets') + '/**', join(projects, '*', 'credentials.json')].map((p) => `Read(${abs(p)})`)
     .concat(HOST_SECRET_DIRS.flatMap((d) => [`Read(~/${d})`, `Read(~/${d}/**)`]), ['Read(**/.env)', 'Read(**/.env.*)']);
   const edit = [defaultsPath(), registryPath(), credentialStoreDir() + '/**', pp.projectJson, pp.credentialsJson, pp.secretsDir + '/**',
-    pp.manifestJson, pp.journalJson, pp.composeYaml, pp.pluginDir + '/**', pp.runtimeDir + '/**', pp.hostDir + '/**', assistantPluginDir(projectId) + '/**']
+    pp.manifestJson, pp.journalJson, pp.composeYaml, pp.pluginDir + '/**', pp.runtimeDir + '/**', pp.hostDir + '/**', assistantPluginDir(projectId) + '/**',
+    // Host manager state: the owner pairing (re-pairing is a terminal action only), the token reference and the journal.
+    managerDir() + '/**']
     .map((p) => `Edit(${abs(p)})`);
   return [...read, ...edit];
 }

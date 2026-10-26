@@ -4,7 +4,8 @@
 // Order: init wizard (repo/profile/visibility/runtime/Claude auth) -> GitHub (the guided flow of
 // `minions setup github`: remote, base branch, pre-filled token link, token; then the delivery mode) ->
 // CI guidance -> auto-merge (opt-in, default no) -> Telegram (token + pairing guidance) -> agents (which harness does
-// the work; src/host/harness-setup.ts) -> runtime start
+// the work; src/host/harness-setup.ts) -> host manager bot (optional, host-wide: token and terminal pairing;
+// src/host/manager-bot.ts) -> runtime start
 // (container, or the host runtime), repository import, coordinator launch -> attach/pair instructions.
 // The CLI then offers the AI setup assistant (`minions setup assist`) for whatever is left.
 //
@@ -28,8 +29,10 @@ import { projectPaths } from '../core/paths.js';
 import { ciSetupPlan, fetchApi, requiredChecksStatus, type RequiredChecksReport } from '../runtime/ci.js';
 import {
   backendLabel, githubRepoFromRemote, provisionCodexKey, githubTokenGuidance, loadCredentialRefs, provisionGithubToken, provisionTelegramToken, readGithubToken,
-  removeGithubToken, telegramBotGuidance, type CredentialsJson, type Fetch,
+  removeGithubToken, telegramBotGuidance, loadManagerCredentialRef, readManagerToken, removeManagerToken, type CredentialsJson, type Fetch,
 } from './credentials.js';
+import { checkTelegramTokenFormat } from '../telegram/token.js';
+import { clearManagerAccess, loadManagerAccess, managerBotGuidance, pairManagerBot, provisionManagerToken, type PairingOptions } from './manager-bot.js';
 import type { DockerProbe } from './discovery.js';
 import type { Runner } from './docker.js';
 import { runGithubSetup, type GithubSetupResult } from './github-setup.js';
@@ -83,7 +86,9 @@ export interface SetupOptions {
   /** --delivery: explicit delivery mode (non-interactive). */
   delivery?: DeliveryMode;
   /** Tokens read from stdin by the CLI (never from argv). */
-  tokens?: { github?: string; telegram?: string };
+  tokens?: { github?: string; telegram?: string; manager?: string };
+  /** Manager bot pairing clock, code and TTL (tests); fetch is `fetch` above. */
+  managerPairing?: Pick<PairingOptions, 'now' | 'sleep' | 'ttlMs' | 'pollSeconds' | 'code'>;
   runtime: SetupRuntime;
   /** --runtime: forwarded to runInit (same semantics as `minions init --runtime`). */
   runtimeKind?: RuntimeKind;
@@ -95,7 +100,7 @@ export interface SetupOptions {
   platform?: NodeJS.Platform;
 }
 
-export type StepId = 'init' | 'github' | 'delivery' | 'ci' | 'intake' | 'autoMerge' | 'telegram' | 'harness' | 'container' | 'import' | 'coordinator';
+export type StepId = 'init' | 'github' | 'delivery' | 'ci' | 'intake' | 'autoMerge' | 'telegram' | 'harness' | 'manager' | 'container' | 'import' | 'coordinator';
 export type StepStatus = 'done' | 'kept' | 'changed' | 'skipped' | 'failed' | 'deferred' | 'planned';
 export interface SetupStep { id: StepId; status: StepStatus; detail: string; later?: string; lines?: string[] }
 
@@ -189,10 +194,11 @@ export async function runSetup(opts: SetupOptions): Promise<SetupResult> {
   }
   // A piped token that is empty is an error, not "no integration": fail before anything is written.
   // The message never includes the input.
-  for (const [name, label] of [['github', 'GitHub'], ['telegram', 'Telegram']] as const) {
+  const pipedNames = (['github', 'telegram', 'manager'] as const).filter((n) => opts.tokens?.[n] !== undefined);
+  for (const [name, label] of [['github', 'GitHub'], ['telegram', 'Telegram'], ['manager', 'manager bot']] as const) {
     const t = opts.tokens?.[name];
     if (t !== undefined && t.trim() === '') {
-      const line = name === 'telegram' && opts.tokens?.github !== undefined ? 'second' : 'first';
+      const line = ['first', 'second', 'third'][pipedNames.indexOf(name)];
       throw new MinionsError('PRECONDITION', `--${name}-token-stdin: no ${label} token was read from stdin (empty input); nothing was changed.`,
         `Pipe the token as the ${line} line of stdin, or omit --${name}-token-stdin.`);
     }
@@ -412,6 +418,10 @@ export async function runSetup(opts: SetupOptions): Promise<SetupResult> {
   });
   step({ id: 'harness', ...h });
 
+  // ---------------------------------------------------------------- 5c. host manager bot (host-wide, optional)
+  if (interactive) say('\n== Host manager bot ==');
+  step(await managerStep({ io: interactive ? io! : null, token: opts.tokens?.manager, runner: opts.runner, fetch: opts.fetch, pairing: opts.managerPairing, setupCmd: cmds.setup }));
+
   // ---------------------------------------------------------------- record choices, regenerate derived files
   if (changed.length) {
     await writeJson(localPath, local);
@@ -475,6 +485,88 @@ export async function runSetup(opts: SetupOptions): Promise<SetupResult> {
       `Run ${cmds.inRepo('minions doctor')} to check readiness at any time; rerun ${cmds.setup} to keep or change any of these choices.`,
     ],
   };
+}
+
+/**
+ * Host manager bot (host-wide, optional, rerunnable; docs/design/host-manager.md). Token: hidden prompt or
+ * --manager-token-stdin, format check, bot-id guard, optional consented getMe. Pairing: terminal only (never with
+ * --yes or a piped token), a one-time code the owner sends to the bot in a private chat within 10 minutes.
+ */
+async function managerStep(o: { io: WizardIO | null; token?: string; runner?: Runner; fetch?: Fetch; pairing?: SetupOptions['managerPairing']; setupCmd: string }): Promise<SetupStep> {
+  const later = `Run ${o.setupCmd} again in a terminal to set up or pair the host manager bot.`;
+  let ref: Awaited<ReturnType<typeof loadManagerCredentialRef>>;
+  try { ref = await loadManagerCredentialRef(); } catch (e) {
+    return { id: 'manager', status: 'failed', detail: errMsg(e, 'the manager credential reference is unreadable'), later };
+  }
+  const access = await loadManagerAccess().catch(() => null);
+  const paired = !!ref && access?.botId === ref.botId;
+  const pairState = (userId?: number) => (userId !== undefined ? `paired with Telegram user ${userId}` : 'not paired');
+  type Action = 'keep' | 'change' | 'pair' | 'remove' | 'setup' | 'skip';
+  let action: Action;
+  if (o.token) action = ref ? 'change' : 'setup';
+  else if (!o.io) action = ref ? 'keep' : 'skip';
+  else if (ref) {
+    action = await choose(o.io, `The host manager bot is set up (bot ${ref.botId}, ${paired ? 'paired' : 'not paired'}). Keep it, change the token, pair your Telegram account again, or remove it?`,
+      paired ? 'keep' : 'pair', ['keep', 'change', 'pair', 'remove'] as const);
+  } else {
+    action = await yesNo(o.io, 'Set up the host manager bot (a second Telegram bot, separate from coordinator bots, that asks you to confirm setup changes)?', false) ? 'setup' : 'skip';
+  }
+
+  if (action === 'skip') return { id: 'manager', status: 'skipped', detail: `host manager bot not set up (optional)${o.io ? '' : '; pairing needs a terminal'}`, later };
+  if (action === 'keep') {
+    return { id: 'manager', status: 'kept', detail: `bot ${ref!.botId}; ${pairState(paired ? access!.userId : undefined)}`,
+      ...(paired ? {} : { lines: [`not paired: ${later}`] }) };
+  }
+  if (action === 'remove') {
+    const r = await removeManagerToken(o.runner);
+    await clearManagerAccess();
+    return { id: 'manager', status: 'changed', detail: `manager bot token removed${r.backend ? ` (${r.backend})` : ''}; pairing cleared`, later };
+  }
+
+  const lines: string[] = [];
+  let botId = ref?.botId ?? '';
+  let token: string | null = null;
+  let username: string | undefined;
+  let stored = '';
+  if (action === 'setup' || action === 'change') {
+    for (const l of managerBotGuidance()) o.io?.info(`  ${l}`);
+    try {
+      const raw = o.token ?? (o.io?.secret ? await o.io.secret('Manager bot token (input hidden): ')
+        : (() => { throw new MinionsError('PRECONDITION', 'no terminal for a non-echoing prompt; pipe it with --manager-token-stdin'); })());
+      const verify = o.io ? await yesNo(o.io, 'Check the token with Telegram now (Bot API getMe; sends it to api.telegram.org)?', false) : false;
+      const r = await provisionManagerToken({ token: raw, verify, runner: o.runner, fetch: o.fetch });
+      botId = r.botId;
+      token = checkTelegramTokenFormat(raw).token;
+      username = r.verification?.login;
+      stored = `bot ${r.botId} stored in ${backendLabel(r.backend)}`;
+      lines.push(...r.warnings.map((w) => `warning: ${w}`));
+      if (r.pairingCleared) lines.push('the previous pairing belonged to another bot and was removed');
+    } catch (e) {
+      return { id: 'manager', status: 'failed', detail: `${errMsg(e, 'could not store the manager bot token')}; nothing was stored`, later };
+    }
+  }
+  const done: StepStatus = action === 'setup' ? 'done' : 'changed';
+  const wantPair = action === 'pair' || (!!o.io && await yesNo(o.io,
+    'Pair your Telegram account with the manager bot now (a one-time code you send to the bot within 10 minutes; polls api.telegram.org)?', true));
+  if (!wantPair) return { id: 'manager', status: done, detail: `${stored}; not paired`, lines: [...lines, `not paired: ${later}`] };
+
+  try {
+    token ??= await readManagerToken(o.runner);
+    if (!token) throw new MinionsError('NOT_FOUND', 'no manager bot token is stored');
+    const p = await pairManagerBot({ token, botId, fetch: o.fetch, ...o.pairing, onCode: (code) => {
+      o.io?.info(`  Send this one-time code to ${username ? `@${username}` : 'your manager bot'} in a private chat (not a group) within 10 minutes:`);
+      o.io?.info(`      ${code}`);
+      o.io?.info('  Waiting for it… (Ctrl-C cancels; nothing is recorded until the code arrives)');
+    } });
+    if (p.status === 'paired') {
+      return { id: 'manager', status: action === 'pair' ? 'changed' : done, detail: `${stored ? `${stored}; ` : `bot ${botId}; `}${pairState(p.access.userId)} (private chat)`, ...(lines.length ? { lines } : {}) };
+    }
+    if (action === 'pair') return { id: 'manager', status: 'failed', detail: `pairing code expired: ${p.detail}; the previous pairing is unchanged`, later };
+    return { id: 'manager', status: done, detail: `${stored}; not paired (code expired)`, lines: [...lines, `warning: ${p.detail}`, `not paired: ${later}`] };
+  } catch (e) {
+    if (action === 'pair') return { id: 'manager', status: 'failed', detail: `${errMsg(e, 'pairing failed')}; the previous pairing is unchanged`, later };
+    return { id: 'manager', status: done, detail: `${stored}; not paired`, lines: [...lines, `warning: pairing failed: ${errMsg(e, 'unexpected error')}`, `not paired: ${later}`] };
+  }
 }
 
 /** The github step from the guided flow's result. */
@@ -646,6 +738,7 @@ function dryRunResult(opts: SetupOptions, init: InitResult, steps: SetupStep[], 
   would('autoMerge', 'with pull-request delivery, would ask "Enable auto-merge?" (default no); yes records delivery.merge "auto-when-eligible" in the local layer');
   would('telegram', refs.telegram ? `bot ${refs.telegram.botId} stored: would offer keep/change/disable` : 'would ask "Set up Telegram?" (default no); bot token entered without echo');
   would('harness', 'would ask "Which agent should do the work?" (default Claude Code; OpenAI Codex: OpenAI API key without echo, model, and in this version the read-only codex-reviewer stage after the Claude reviewer)');
+  would('manager', 'would ask "Set up the host manager bot?" (default no; host-wide): its own bot token entered without echo, then a one-time pairing code sent to the bot within 10 minutes');
   would('container', 'would build the image if needed and start the container (idempotent)');
   would('import', 'would import committed history of the base branch unless already imported, and configure origin');
   would('coordinator', 'would launch the coordinator detached and print how to attach and pair');

@@ -362,7 +362,7 @@ export function register(program: Command): void {
     }));
 
   const setupCmd = program.command('setup [path]')
-    .description('Guided end-to-end setup: init wizard, GitHub, CI guidance, Telegram, runtime start, import, coordinator, then the setup assistant (subcommands: github, assist)')
+    .description('Guided end-to-end setup: init wizard, GitHub, CI guidance, Telegram, host manager bot, runtime start, import, coordinator, then the setup assistant (subcommands: github, assist)')
     .addOption(new Option('--profile <profile>', 'starting profile').choices([...PROFILES]))
     .option('--private', 'private install: nothing is written into the repository')
     .option('--shared', 'shared install: writes .minions/config.json and .minions/README.md')
@@ -371,6 +371,7 @@ export function register(program: Command): void {
     .addOption(new Option('--delivery <mode>', 'delivery mode (branch/pull-request need a stored GitHub token)').choices([...DELIVERY_MODES]))
     .option('--github-token-stdin', 'read the GitHub token from the first line of piped stdin')
     .option('--telegram-token-stdin', 'read the Telegram bot token from piped stdin (second line when combined with --github-token-stdin)')
+    .option('--manager-token-stdin', 'read the host manager bot token from piped stdin (after the GitHub and Telegram lines when combined); pairing needs a terminal run')
     // Same semantics as `minions init` (install.sh passes init options through to setup).
     .option('--config <file>', 'use a validated config file instead of the init wizard (skips the questions it covers)')
     .option('--attach', 'attach this repository to the project id in .minions/config.json')
@@ -378,22 +379,24 @@ export function register(program: Command): void {
     .addOption(new Option('--runtime <runtime>', 'agent runtime: docker (default) or host (no Docker, less safe; prints a warning)').choices([...RUNTIMES]))
     .option('--no-attach-coordinator', 'do not offer to attach the coordinator at the end')
     .option('--no-assistant', 'do not offer the AI setup assistant at the end')
-    .action(action(async (path: string | undefined, o: { profile?: Profile; private?: boolean; shared?: boolean; yes?: boolean; dryRun?: boolean; delivery?: DeliveryMode; githubTokenStdin?: boolean; telegramTokenStdin?: boolean; config?: string; attach?: boolean; newIdentity?: boolean; runtime?: RuntimeKind; attachCoordinator: boolean; assistant: boolean }, cmd: Command) => {
+    .action(action(async (path: string | undefined, o: { profile?: Profile; private?: boolean; shared?: boolean; yes?: boolean; dryRun?: boolean; delivery?: DeliveryMode; githubTokenStdin?: boolean; telegramTokenStdin?: boolean; managerTokenStdin?: boolean; config?: string; attach?: boolean; newIdentity?: boolean; runtime?: RuntimeKind; attachCoordinator: boolean; assistant: boolean }, cmd: Command) => {
       requireMode('host');
       const { json } = globalOpts(cmd);
       if (o.private && o.shared) throw new MinionsError('INVALID_CONFIG', '--private and --shared are mutually exclusive.');
-      const piped = !!(o.githubTokenStdin || o.telegramTokenStdin);
+      const piped = !!(o.githubTokenStdin || o.telegramTokenStdin || o.managerTokenStdin);
       const interactive = !o.yes && !o.dryRun && !json && !piped && !!process.stdin.isTTY;
       // Like init, --config is a non-interactive alternative to --yes (token questions then need stdin).
       if (!o.yes && !o.config && !o.dryRun && !interactive) {
-        throw new MinionsError('PRECONDITION', 'setup needs a terminal for its questions.', 'Pass --yes to accept the defaults or --config <file> (tokens can be piped with --github-token-stdin / --telegram-token-stdin), or --dry-run.');
+        throw new MinionsError('PRECONDITION', 'setup needs a terminal for its questions.', 'Pass --yes to accept the defaults or --config <file> (tokens can be piped with --github-token-stdin / --telegram-token-stdin / --manager-token-stdin), or --dry-run.');
       }
       const target = resolvePath(path ?? '.');
-      let tokens: { github?: string; telegram?: string } | undefined;
+      let tokens: { github?: string; telegram?: string; manager?: string } | undefined;
       if (piped && !o.dryRun) {
-        const lines = await readStdinLines(o.githubTokenStdin && o.telegramTokenStdin ? 2 : 1);
+        // One line per selected flag, in the order github, telegram, manager.
+        const names = (['github', 'telegram', 'manager'] as const).filter((n) => o[`${n}TokenStdin`]);
+        const lines = await readStdinLines(names.length);
         // A missing line is an empty token: runSetup rejects it instead of silently skipping the step.
-        tokens = o.githubTokenStdin ? { github: lines[0] ?? '', ...(o.telegramTokenStdin ? { telegram: lines[1] ?? '' } : {}) } : { telegram: lines[0] ?? '' };
+        tokens = Object.fromEntries(names.map((n, i) => [n, lines[i] ?? '']));
       }
       const io = interactive ? readlineIO() : undefined;
       try {
