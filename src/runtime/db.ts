@@ -5,7 +5,7 @@ import type { IdempotencyStore } from '../backlog/types.js';
 import { MinionsError } from '../core/errors.js';
 import { runtimePaths } from './paths.js';
 
-export const SCHEMA_VERSION = 7;
+export const SCHEMA_VERSION = 8;
 
 /** The built-in worker roles (always registered). */
 export type BuiltinLeaseRole = 'engineer' | 'tester' | 'reviewer';
@@ -54,6 +54,21 @@ export interface ApprovalRow { id: number; task_id: string; scope: string; head_
  */
 export type RoleProposalState = 'pending' | 'applied' | 'superseded';
 export interface RoleProposalRow { id: string; name: string; json: string; created_at: string; state: RoleProposalState; updated_at: string; applied_revision: number | null }
+
+/**
+ * A change request (docs/design/host-manager.md): a setup change the coordinator proposes from the runtime.
+ * proposed: waiting for the owner; confirmed: the owner confirmed the host plan and the host is applying it;
+ * applied / failed: the host's outcome; rejected: the owner said no; expired: superseded by a newer request of
+ * the same kind (and key). Only the host moves a request past proposed.
+ */
+export const CHANGE_REQUEST_STATUSES = ['proposed', 'confirmed', 'applied', 'failed', 'rejected', 'expired'] as const;
+export type ChangeRequestStatus = (typeof CHANGE_REQUEST_STATUSES)[number];
+export const CHANGE_REQUEST_KINDS = ['config-set', 'restart', 'upgrade'] as const;
+export type ChangeRequestKind = (typeof CHANGE_REQUEST_KINDS)[number];
+export interface ChangeRequestRow {
+  id: string; kind: ChangeRequestKind; payload: string; reason: string | null; created_at: string;
+  status: ChangeRequestStatus; updated_at: string; detail: string | null;
+}
 
 /** A task's workflow position (D6); `stages_json` holds the stage list including runtime insertions. */
 export interface TaskStageRow { task_id: string; workflow: string; stages_json: string; position: number; updated_at: string }
@@ -124,6 +139,15 @@ const MIGRATIONS: Record<number, string> = {
   // leases by it, not by the current config. Older rows stay NULL and count as claude.
   7: `
     ALTER TABLE leases ADD COLUMN harness TEXT;
+  `,
+  // Change requests (docs/design/host-manager.md, task-53.3): setup changes the coordinator proposes from the
+  // runtime (settings set, settings restart, upgrade). A row is a claim, never an authorization: the host
+  // re-validates it against its own config and applies only after the owner confirms the host-computed plan.
+  8: `
+    CREATE TABLE IF NOT EXISTS change_requests (
+      id TEXT PRIMARY KEY, kind TEXT NOT NULL, payload TEXT NOT NULL, reason TEXT, created_at TEXT NOT NULL,
+      status TEXT NOT NULL, updated_at TEXT NOT NULL, detail TEXT);
+    CREATE INDEX IF NOT EXISTS change_requests_status ON change_requests(status, created_at);
   `,
 };
 
@@ -483,6 +507,50 @@ export class RuntimeDb {
       this.exec("UPDATE role_proposals SET state = 'applied', applied_revision = ?, updated_at = ? WHERE id = ?", revision, nowIso(), id);
       this.addEvent('role-applied', null, { id, name: row.name, revision });
       return true;
+    });
+  }
+
+  // Change requests (docs/design/host-manager.md)
+  changeRequest(id: string): ChangeRequestRow | undefined { return this.get<ChangeRequestRow>('SELECT * FROM change_requests WHERE id = ?', id); }
+  /** Open requests (proposed, confirmed, failed: the owner may retry or reject a failed one); all: every status. Oldest first. */
+  changeRequests(opts: { all?: boolean } = {}): ChangeRequestRow[] {
+    return opts.all
+      ? this.all<ChangeRequestRow>('SELECT * FROM change_requests ORDER BY created_at, id')
+      : this.all<ChangeRequestRow>("SELECT * FROM change_requests WHERE status IN ('proposed', 'confirmed', 'failed') ORDER BY created_at, id");
+  }
+  /**
+   * Stores a proposed request. Earlier open requests (proposed or failed) for the same thing (the same kind; for
+   * config-set the same key) become `expired`: the newer request replaces them.
+   */
+  addChangeRequest(r: { id: string; kind: ChangeRequestKind; payload: Record<string, unknown>; reason: string | null }): { row: ChangeRequestRow; expired: string[] } {
+    return this.transaction(() => {
+      const at = nowIso();
+      const keyOf = (payload: string): unknown => { try { return (JSON.parse(payload) as { key?: unknown }).key; } catch { return undefined; } };
+      const expired = this.all<{ id: string; payload: string }>("SELECT id, payload FROM change_requests WHERE kind = ? AND status IN ('proposed', 'failed')", r.kind)
+        .filter((x) => r.kind !== 'config-set' || keyOf(x.payload) === r.payload.key).map((x) => x.id);
+      for (const id of expired) this.exec("UPDATE change_requests SET status = 'expired', detail = ?, updated_at = ? WHERE id = ?", `superseded by ${r.id}`, at, id);
+      this.exec("INSERT INTO change_requests (id, kind, payload, reason, created_at, status, updated_at) VALUES (?, ?, ?, ?, ?, 'proposed', ?)",
+        r.id, r.kind, JSON.stringify(r.payload), r.reason, at, at);
+      this.addEvent('change-requested', null, { id: r.id, kind: r.kind, expired });
+      return { row: this.changeRequest(r.id)!, expired };
+    });
+  }
+  /**
+   * Moves a request to a new status (the host reports its outcome). Allowed: proposed or failed -> confirmed, applied,
+   * failed, rejected or expired; confirmed -> applied or failed; the same status again is a no-op. applied, rejected
+   * and expired are final. Throws NOT_FOUND / CONFLICT.
+   */
+  setChangeRequestStatus(id: string, status: ChangeRequestStatus, detail: string | null = null): ChangeRequestRow {
+    return this.transaction(() => {
+      const row = this.changeRequest(id);
+      if (!row) throw new MinionsError('NOT_FOUND', `No change request ${id}.`, 'List requests with `minions settings requests --all`.');
+      if (row.status === status) return row;
+      const open = row.status === 'proposed' || row.status === 'failed';
+      const ok = (open && status !== 'proposed') || (row.status === 'confirmed' && (status === 'applied' || status === 'failed'));
+      if (!ok) throw new MinionsError('CONFLICT', `Change request ${id} is ${row.status}; it cannot become ${status}.`, 'List requests with `minions settings requests --all`.');
+      this.exec('UPDATE change_requests SET status = ?, detail = ?, updated_at = ? WHERE id = ?', status, detail, nowIso(), id);
+      this.addEvent('change-request', null, { id, from: row.status, to: status });
+      return this.changeRequest(id)!;
     });
   }
 

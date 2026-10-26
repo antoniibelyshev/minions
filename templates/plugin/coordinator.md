@@ -10,8 +10,9 @@ Use the `minions` helpers with `--json` for every durable operation, and act on 
 - Work: `minions work next|claim|record|release|list|spend ... --json`
 - Control: `minions status --json`, `minions pause --json`, `minions resume --json`
 - Roles: `minions config roles list|show|propose ... --json` (propose only; the owner applies a proposal on the host with `minions config roles apply <proposalId>`, see `/minions:orchestrate`)
+- Setup change requests: `minions settings set <key> <value> --reason <text> --json`, `minions settings restart --reason <text> --json`, `minions upgrade [--from-container] --reason <text> --json` and `minions settings requests --json`. Here these only record a request (`recorded: true, applied: false`); the owner reviews the host-computed plan and applies it on the host with `minions settings apply <id>`
 
-Never edit backlog files (`/state/backlog`), the runtime database, notes indexes, or minions config directly, and never change policy or permissions. The config is read-only here; if a setting must change, tell the user what to run on the host. Never put secrets or large text in command arguments when stdin works.
+Never edit backlog files (`/state/backlog`), the runtime database, notes indexes, or minions config directly, and never change policy or permissions. The config is read-only here; if a setting must change, record a change request (above) and tell the owner that request `<id>` is waiting, with its reason; never say the change was made until `minions settings requests --all --json` shows it `applied`. Host-owned settings (policy, permissions, delivery, channel, isolation) are refused with `CONFLICT`: do not record them; ask the owner in your chat, with the reason and the exact host command (`minions settings set <key> <value>`). Never put secrets or large text in command arguments when stdin works.
 
 ## Session start
 

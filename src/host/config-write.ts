@@ -2,6 +2,9 @@
 // <MINIONS_HOME>/projects/<id>/config.json, whichever the install uses):
 // - the file is parsed first; a file that is missing or fails to parse is never overwritten
 //   (INVALID_CONFIG / NOT_FOUND are thrown before anything is written);
+// - with expectRevision, the edit is refused (CONFLICT, nothing written) when the file's configRevision is no
+//   longer the expected one: a change planned (and confirmed) against an older config is never applied on top
+//   of a newer one (`settings set --expect-revision`, the change requests of docs/design/host-manager.md);
 // - configRevision is bumped and the result is validated like any config (with config.local.json);
 // - the write is atomic; the manifest hash is updated only when the file was unchanged since
 //   minions generated it (a hand-edited file stays "edited" for uninstall);
@@ -36,6 +39,14 @@ export interface ConfigEditOptions {
   dryRun?: boolean;
   /** Refuse (changed: false, no write) when the file was edited since minions generated it. */
   requireUnedited?: boolean;
+  /** Refuse (CONFLICT, nothing written) unless the file is at this configRevision (compare-and-swap). */
+  expectRevision?: number;
+}
+
+/** CONFLICT for a config that moved on since a change was planned against `expected`. */
+export function revisionConflict(path: string, expected: number, actual: number): MinionsError {
+  return new MinionsError('CONFLICT', `${path} is at configRevision ${actual}, not ${expected}: the configuration changed since this change was planned; nothing written.`,
+    'Review the current settings (`minions settings --list`) and plan the change again.', { path, expectedRevision: expected, revision: actual });
 }
 
 /** Reads the project config file strictly: NOT_FOUND when absent, INVALID_CONFIG when it is not a JSON object. */
@@ -66,6 +77,7 @@ export async function editProjectConfig(project: ProjectJson, mutate: (raw: Raw)
   const sources = { project: path, local: projectPaths(project.projectId).configLocalJson };
   const mutated = mutate(structuredClone(raw));
   const revision = Number(raw.configRevision ?? 1);
+  if (opts.expectRevision !== undefined && revision !== opts.expectRevision) throw revisionConflict(path, opts.expectRevision, revision);
   if (mutated === null) {
     const effective = resolveEffective(project, raw, local, sources).config;
     return { path, before: raw, after: raw, effective, edited, changed: false, written: false, revision, warnings: [] };

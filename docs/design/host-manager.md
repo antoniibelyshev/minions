@@ -267,6 +267,15 @@ No new primary command. The proposed folds:
 
 ## Phases
 
+Built in task-53.3 (phase 2): the `change_requests` table (runtime DB schema 8, `src/runtime/db.ts`), recording in the
+runtime (`src/runtime/change-requests.ts`), and the host route (`src/host/change-requests.ts`: plan, digest, offer and
+confirmation; `src/host/change-journal.ts`: the journal, its lock and the 30 minute expiry). `settings apply` without a
+terminal and without `--yes` only offers the plan; `--confirm <digest>` applies it. A newer request for the same thing
+(same kind; for config-set the same key) expires the older one. A `failed` request stays open (it can be applied again or
+rejected). Local-layer writes (config.local.json) do not bump `configRevision`, so `--expect-revision` detects changes of
+the project config; the plan digest (which covers the `from` value) catches a local edit in between.
+
+
 Child tasks, filed as task-53.2 to task-53.7 (phases 1 to 6) and task-53.8 (coordinator proposal):
 
 1. **child: Settings classification and host-owned flag (task-44 part 1)** | criteria: every schema key has a class

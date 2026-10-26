@@ -4,11 +4,13 @@ import { createInterface } from 'node:readline/promises';
 import { Option, type Command } from 'commander';
 import { isGithubDelivery } from '../config/delivery.js';
 import { PROFILES, type Profile } from '../config/schema.js';
-import { action, globalOpts, requireMode } from '../core/cli-helpers.js';
+import { action, globalOpts, requireMode, runtimeMode } from '../core/cli-helpers.js';
 import { MinionsError } from '../core/errors.js';
 import { emit } from '../core/output.js';
 import { CONTAINER, projectPaths } from '../core/paths.js';
 import { PRE_RESTORE_KEEP, STATE_BACKUP_DIRS, STATE_BACKUP_FILES } from '../runtime/state-backup.js';
+import { formatRecord, recordUpgradeRequest, withRequestContext } from '../runtime/change-requests.js';
+import { registerChangeRequestCommands } from './change-requests.js';
 import { registerAuth } from './auth-cli.js';
 import { authOf, isKeyAuth, refreshKey, startRefreshTimer } from './auth.js';
 import type { MinionsConfig } from '../config/schema.js';
@@ -488,15 +490,26 @@ export function register(program: Command): void {
     }));
 
   program.command('upgrade')
-    .description('Upgrade the project container to the installed minions (drains workers, keeps volumes)')
+    .description('Upgrade the project container to the installed minions (drains workers, keeps volumes); in the runtime: record an upgrade request for the owner')
     .option('--timeout <seconds>', `wait this long for active workers (default ${DEFAULT_UPGRADE_TIMEOUT_SEC}; 0 with --now)`)
     .option('--now', 'release workers still active when the wait ends (reported as interrupted, re-dispatched after)')
     .option('--from-container [branch]', 'local delivery only: first export the container branches and fast-forward <branch> (default: the base branch) to minions/<base>; strict fast-forward on a clean tree only (GitHub delivery always takes origin/<base>)')
     .option('--rebuild-cli', 'in a minions checkout: allow rebuilding/reinstalling the global CLI from it (runs its npm scripts and build on the host; review it first)')
     .option('--dry-run', 'list the steps without changing anything')
-    .action(action(async (o: { timeout?: string; now?: boolean; fromContainer?: string | boolean; rebuildCli?: boolean }, cmd: Command) => {
-      requireMode('host');
+    .option('--reason <text>', 'runtime: why the upgrade is needed (shown to the owner)')
+    .action(action(async (o: { timeout?: string; now?: boolean; fromContainer?: string | boolean; rebuildCli?: boolean; reason?: string }, cmd: Command) => {
       const { json, dryRun } = globalOpts(cmd);
+      if (runtimeMode() !== 'host') {
+        // The container can only propose (docs/design/host-manager.md): record a request; the owner applies it on the host.
+        const hostOnly = [o.timeout !== undefined ? '--timeout' : null, o.now ? '--now' : null, o.rebuildCli ? '--rebuild-cli' : null].filter(Boolean);
+        if (hostOnly.length) {
+          throw new MinionsError('PRECONDITION', `${hostOnly.join(', ')}: not available in an upgrade request (the owner picks how to drain, and a CLI rebuild is never requested from the container).`, 'Request `minions upgrade [--from-container [branch]] --reason <text>`.');
+        }
+        const r = await withRequestContext((ctx) => recordUpgradeRequest(ctx, { fromContainer: o.fromContainer, reason: o.reason, dryRun }));
+        emit(r, { json, human: formatRecord });
+        return;
+      }
+      if (o.reason !== undefined) throw new MinionsError('PRECONDITION', '--reason is for upgrade requests recorded in the runtime; on the host the upgrade runs directly.');
       const timeoutSec = upgradeTimeout(o.timeout, !!o.now);
       const ref = await projectForPath(process.cwd());
       const project = await loadProjectJson(ref.projectId);
@@ -778,12 +791,13 @@ export function register(program: Command): void {
   registerChannel(program, { confirm: confirmOrNull });
   registerAssistant(registerGithubSetup(setupCmd));
 
-  registerSettings(program, {
+  const settings = registerSettings(program, {
     confirm: confirmMarked,
     menu: async (project, o) => {
       await runSettingsMenu(project, { io: terminalMenuIO(), runtime: defaultSettingsRuntime, layer: o.layer, runAuth: runAuthFlow });
     },
   });
+  registerChangeRequestCommands(settings, { runtime: defaultSettingsRuntime, confirm: confirmMarked, show: (t) => process.stderr.write(`${t}\n`) });
 
   // Advanced alias of `minions settings` (kept for scripts): `config show` (raw effective config), `config list`, `config set`;
   // plus `config roles ...`, the role proposal/approval path (src/host/roles-cli.ts).

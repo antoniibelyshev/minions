@@ -1,0 +1,493 @@
+// Change requests, host side (docs/design/host-manager.md, "Confirmation model"): the terminal route of
+// `minions settings requests | apply <id> | reject <id>`. The manager (task-53.4) reuses the same plan, digest and
+// journal functions.
+//
+// - A request row is a claim, never an authorization. The host reads it through the runtime, re-validates it
+//   against the host's own config (planSetting -> resolveEffective), and computes the plan itself: the exact diff,
+//   the layer and file, the class, what it loosens, what it interrupts and the commands it runs. Host-owned keys are
+//   refused again here, whatever the row says.
+// - digest = sha256(canonical plan JSON). The offer (digest, configRevision, single-use nonce, 30 minute expiry,
+//   and the request as read) goes to the host journal (src/host/change-journal.ts). A confirmation names the
+//   digest; the host then rebuilds the plan from the journaled request (not from the container's row), and applies
+//   only when the digest and the configRevision are unchanged and the offer is unexpired and unspent.
+// - Apply runs the existing host paths: applySetting with --expect-revision (no restart: a needed restart is
+//   offered as its own step), the graceful coordinator restart, or `minions upgrade` as a child process. The runtime
+//   row then becomes applied / failed (best effort: a runtime that cannot be reached leaves a warning).
+import { spawn } from 'node:child_process';
+import type { Command } from 'commander';
+import { isGithubDelivery } from '../config/delivery.js';
+import { action, globalOpts, requireMode, runtimeMode } from '../core/cli-helpers.js';
+import { displayText } from '../core/control-chars.js';
+import { MinionsError, type ErrorCode } from '../core/errors.js';
+import { sha256 } from '../core/fsutil.js';
+import { emit } from '../core/output.js';
+import type { ChangeRequestKind } from '../runtime/db.js';
+import {
+  formatRequestLine, formatRequests, listChangeRequests, markChangeRequest, quotedReason, requestSummary, withRequestContext, type ChangeRequestView,
+} from '../runtime/change-requests.js';
+import { inMinionsContainer } from '../runtime/paths.js';
+import { consumeOffer, findOffer, recordOffer, recordOutcome, type OfferEntry, type RequestSnapshot } from './change-journal.js';
+import { packageRoot } from './docker.js';
+import { loadEffectiveConfig, loadProjectJson, type ProjectJson } from './project.js';
+import { projectForPath } from './registry.js';
+import {
+  applySetting, effectText, formatSet, restartCoordinator, RESTART_LATER, UPGRADE_LATER,
+  type RestartOutcome, type SetResult, type SettingsRuntime,
+} from './settings-cli.js';
+import { formatValue, loadSettingsContext, parseSettingValue, planSetting, requireSetting, takesEffectOf, type SettingLayer, type TakesEffect } from './settings.js';
+
+// ---------------------------------------------------------------- plan and digest
+
+export interface ChangePlan {
+  requestId: string;
+  projectId: string;
+  kind: ChangeRequestKind;
+  /** The effective configRevision the plan was computed against. */
+  configRevision: number;
+  /** The request's reason as shown to the owner: quoted, control characters stripped, cut to 300 characters. */
+  reason: string;
+  /** config-set: the host-computed diff. */
+  change: { key: string; from: unknown; to: unknown; layer: SettingLayer; file: string; class: string; takesEffect: TakesEffect | null } | null;
+  /** What the change newly allows (null: does not loosen policy). */
+  loosens: string | null;
+  /** What applying it interrupts or still needs afterwards. */
+  interrupts: string | null;
+  /** The host commands applying it runs. */
+  steps: string[];
+  /** upgrade: the step ids of `minions upgrade --dry-run` (their details are shown, not digested). */
+  upgradeSteps: string[] | null;
+}
+
+/** JSON with sorted keys (undefined members dropped), the input of the digest. */
+export function canonicalJson(v: unknown): string {
+  if (v === undefined) return 'null';
+  if (Array.isArray(v)) return `[${v.map((x) => (x === undefined ? 'null' : canonicalJson(x))).join(',')}]`;
+  if (v && typeof v === 'object') {
+    return `{${Object.keys(v).sort().filter((k) => (v as Record<string, unknown>)[k] !== undefined)
+      .map((k) => `${JSON.stringify(k)}:${canonicalJson((v as Record<string, unknown>)[k])}`).join(',')}}`;
+  }
+  return JSON.stringify(v);
+}
+
+export const planDigest = (plan: ChangePlan): string => sha256(canonicalJson(plan));
+
+export interface UpgradeRun { ok: boolean; steps: { id: string; status: string; detail: string }[]; summary: string }
+
+/** What change requests need from the host (faked in tests). */
+export interface ChangeRequestDeps {
+  runtime: SettingsRuntime;
+  /** Runs `minions upgrade [--from-container [branch]] [--dry-run]` for the project as a child process. */
+  upgrade: (project: ProjectJson, o: { fromContainer: string | true | null; dryRun: boolean }) => Promise<UpgradeRun>;
+  now?: () => Date;
+}
+
+const q = (s: string) => (/^[A-Za-z0-9._,:/=@+-]+$/.test(s) ? s : `'${s.replace(/'/g, `'\\''`)}'`);
+
+/** The request as read from the runtime (only the fields the plan uses). */
+export const snapshotOf = (v: Pick<ChangeRequestView, 'id' | 'kind' | 'payload' | 'reason'>): RequestSnapshot =>
+  ({ id: v.id, kind: v.kind, payload: v.payload, reason: v.reason });
+
+/**
+ * Builds the host plan of a request: validated against the host's config, never trusting the row's own view.
+ * Throws CONFLICT for host-owned keys, PRECONDITION for anything that cannot be applied.
+ */
+export async function buildPlan(project: ProjectJson, req: RequestSnapshot, deps: ChangeRequestDeps): Promise<{ plan: ChangePlan; notes: string[] }> {
+  const base = { requestId: req.id, projectId: project.projectId, reason: quotedReason(req.reason), change: null, loosens: null, upgradeSteps: null };
+  if (req.kind === 'config-set') {
+    const { key, value, layer } = req.payload as { key?: unknown; value?: unknown; layer?: unknown };
+    if (typeof key !== 'string' || typeof value !== 'string' || (layer !== 'local' && layer !== 'shared')) {
+      throw new MinionsError('PRECONDITION', `Change request ${req.id}: malformed config-set payload; nothing to apply.`, `Reject it: \`minions settings reject ${req.id}\`.`);
+    }
+    const def = requireSetting(key);
+    if (def.hostOwned) {
+      throw new MinionsError('CONFLICT', `Change request ${req.id}: ${key} is host-owned; a request from the container is never applied.`,
+        `If you want this change, make it yourself: \`minions settings set ${key} ${q(value)}\`. Then \`minions settings reject ${req.id}\`.`, { path: key, hostOwned: true });
+    }
+    if (def.type === 'secret' || def.type === 'control') throw new MinionsError('PRECONDITION', `Change request ${req.id}: ${key} is not a configuration setting.`);
+    const ctx = await loadSettingsContext(project);
+    const change = await planSetting(ctx, key, parseSettingValue(def, value), layer);
+    if (!change.changed) {
+      throw new MinionsError('PRECONDITION', `Change request ${req.id}: ${key} is already ${formatValue(change.from)} on the host; nothing to apply.`, `Reject it: \`minions settings reject ${req.id}\`.`);
+    }
+    const takesEffect = takesEffectOf(change.class);
+    return {
+      plan: {
+        ...base, kind: 'config-set', configRevision: change.revision,
+        change: { key, from: change.from, to: change.to, layer, file: change.file, class: change.class, takesEffect },
+        loosens: change.loosens,
+        interrupts: change.needsRestart ? `nothing now; ${RESTART_LATER}` : change.needsUpgrade ? `nothing now; ${UPGRADE_LATER}` : null,
+        steps: [`minions settings set ${key} ${q(value)}${layer === 'shared' ? ' --shared' : ''} --yes --no-restart --expect-revision ${change.revision}`],
+      },
+      notes: [effectText(takesEffect), ...change.warnings.map((w) => `warning: ${w}`)].filter(Boolean),
+    };
+  }
+  const configRevision = (await loadEffectiveConfig(project)).config.configRevision;
+  if (req.kind === 'restart') {
+    return {
+      plan: { ...base, kind: 'restart', configRevision, interrupts: 'the coordinator session restarts (graceful: refused while worker leases are active; running workers are never interrupted)', steps: ['minions settings restart'] },
+      notes: [],
+    };
+  }
+  if (req.kind === 'upgrade') {
+    const fc = (req.payload as { fromContainer?: unknown }).fromContainer;
+    const fromContainer = fc === true ? true : typeof fc === 'string' ? fc : null;
+    if (fromContainer !== null && isGithubDelivery((await loadEffectiveConfig(project)).config)) {
+      throw new MinionsError('PRECONDITION', `Change request ${req.id}: --from-container is for local delivery only; this project delivers through GitHub.`, `Reject it: \`minions settings reject ${req.id}\`.`);
+    }
+    const dry = await deps.upgrade(project, { fromContainer, dryRun: true });
+    if (!dry.ok) {
+      throw new MinionsError('PRECONDITION', `Change request ${req.id}: \`minions upgrade --dry-run\` reports that the upgrade would fail: ${dry.summary}`, 'Fix that first (run `minions upgrade --dry-run` for the details), then apply again.');
+    }
+    const flag = fromContainer === true ? ' --from-container' : fromContainer ? ` --from-container ${q(fromContainer)}` : '';
+    return {
+      plan: {
+        ...base, kind: 'upgrade', configRevision, upgradeSteps: dry.steps.map((s) => s.id), steps: [`minions upgrade${flag}`],
+        interrupts: 'pauses starts and drains active workers (they commit wip: and hand back), recreates the container (volumes kept) and restarts the coordinator',
+      },
+      notes: dry.steps.map((s) => `${s.id}: ${s.detail}`),
+    };
+  }
+  throw new MinionsError('PRECONDITION', `Change request ${req.id}: unknown kind "${displayText(String(req.kind))}"; nothing to apply.`, `Reject it: \`minions settings reject ${req.id}\`.`);
+}
+
+export function formatPlan(plan: ChangePlan, digest: string, notes: string[]): string {
+  return displayText([
+    `change request ${plan.requestId} (${plan.kind}) for project ${plan.projectId}, configRevision ${plan.configRevision}`,
+    `reason (from the container, untrusted): ${plan.reason}`,
+    ...(plan.change ? [`change: ${plan.change.key}: ${formatValue(plan.change.from)} -> ${formatValue(plan.change.to)} (${plan.change.layer} layer, ${plan.change.file}; class ${plan.change.class})`] : []),
+    ...(plan.loosens ? [`LOOSENS POLICY: ${plan.loosens}`] : []),
+    ...(plan.interrupts ? [`interrupts: ${plan.interrupts}`] : []),
+    'runs:', ...plan.steps.map((s) => `  ${s}`),
+    ...(notes.length ? ['notes:', ...notes.map((n) => `  ${n}`)] : []),
+    `digest: ${digest}`,
+  ].join('\n'));
+}
+
+// ---------------------------------------------------------------- runtime access
+
+const lastEnvelope = <T>(stdout: string): { ok: boolean; data?: T; error?: { code?: string; message?: string; hint?: string } } | null => {
+  try { return JSON.parse(stdout.trim().split('\n').filter(Boolean).at(-1) ?? ''); } catch { return null; }
+};
+const PASS_CODES: readonly string[] = ['NOT_FOUND', 'PRECONDITION', 'CONFLICT'];
+
+async function runtimeJson<T>(project: ProjectJson, runtime: SettingsRuntime, args: string[], what: string): Promise<T> {
+  if (!(await runtime.running(project))) {
+    throw new MinionsError('PRECONDITION', `The runtime is not running, so ${what} cannot be reached.`, 'Run `minions start --no-attach` first (change requests live in the runtime database).');
+  }
+  const r = await runtime.exec(project, ['minions', ...args, '--json']);
+  const env = lastEnvelope<T>(r.stdout);
+  if (!env) throw new MinionsError('INTERNAL', `${what}: unexpected output from the runtime.`, undefined, { stdout: r.stdout.slice(-500), stderr: r.stderr.slice(-500) });
+  if (!env.ok) {
+    const code = (PASS_CODES.includes(env.error?.code ?? '') ? env.error!.code : 'INTERNAL') as ErrorCode;
+    throw new MinionsError(code, `${what}: ${displayText(env.error?.message ?? 'failed in the runtime')}`, env.error?.hint ? displayText(env.error.hint) : undefined);
+  }
+  return env.data as T;
+}
+
+export async function fetchRequests(project: ProjectJson, runtime: SettingsRuntime, all: boolean): Promise<ChangeRequestView[]> {
+  const d = await runtimeJson<{ requests: ChangeRequestView[] }>(project, runtime, ['settings', 'requests', ...(all ? ['--all'] : [])], 'change requests');
+  return Array.isArray(d?.requests) ? d.requests : [];
+}
+
+async function fetchRequest(project: ProjectJson, runtime: SettingsRuntime, id: string): Promise<ChangeRequestView> {
+  const found = (await fetchRequests(project, runtime, true)).find((r) => r.id === id);
+  if (!found) throw new MinionsError('NOT_FOUND', `No change request ${displayText(id)} in the runtime.`, 'List requests with `minions settings requests`.');
+  return found;
+}
+
+/** Marks the runtime row; returns a warning instead of throwing (the host's outcome stands either way). */
+async function mark(project: ProjectJson, runtime: SettingsRuntime, id: string, status: string, detail: string): Promise<string | null> {
+  try {
+    await runtimeJson(project, runtime, ['settings', 'requests', 'mark', id, '--status', status, '--detail', detail.slice(0, 900)], `marking change request ${id} ${status}`);
+    return null;
+  } catch (e) {
+    return `change request ${id} could not be marked ${status} in the runtime: ${(e as Error).message}`;
+  }
+}
+
+const openStatus = (s: string) => s === 'proposed' || s === 'failed';
+
+// ---------------------------------------------------------------- apply / reject
+
+export interface ApplyOutcome {
+  requestId: string;
+  kind: ChangeRequestKind;
+  /** planned: dry run; offered: recorded for confirmation, nothing applied; applied / failed: the outcome. */
+  status: 'planned' | 'offered' | 'applied' | 'failed';
+  applied: boolean;
+  plan: ChangePlan;
+  digest: string;
+  notes: string[];
+  expiresAt: string | null;
+  /** offered: the command that confirms exactly this plan. */
+  confirmCommand: string | null;
+  detail: string;
+  set?: SetResult;
+  restart?: RestartOutcome;
+  upgrade?: UpgradeRun;
+  marked: boolean;
+  warnings: string[];
+  nextSteps: string[];
+}
+
+const outcomeBase = (offer: { plan: ChangePlan; digest: string; notes: string[] }) => ({
+  requestId: offer.plan.requestId, kind: offer.plan.kind, plan: offer.plan, digest: offer.digest, notes: offer.notes,
+  marked: false, warnings: [] as string[], nextSteps: [] as string[],
+});
+
+/** Builds the plan and records an offer (30 minutes) in the host journal. Nothing is applied. */
+export async function offerRequest(project: ProjectJson, req: RequestSnapshot, deps: ChangeRequestDeps): Promise<{ offer: OfferEntry; plan: ChangePlan; digest: string; notes: string[] }> {
+  const { plan, notes } = await buildPlan(project, req, deps);
+  const digest = planDigest(plan);
+  const offer = await recordOffer({ projectId: project.projectId, request: req, plan, digest, configRevision: plan.configRevision, now: deps.now?.() });
+  return { offer, plan, digest, notes };
+}
+
+/**
+ * Confirms the offer with this digest and applies it. Refuses (nothing applied) when there is no such offer, when it
+ * was already used, when it expired, or when the plan recomputed now from the journaled request differs (digest or
+ * configRevision).
+ */
+export async function confirmRequest(project: ProjectJson, requestId: string, digest: string, deps: ChangeRequestDeps): Promise<ApplyOutcome> {
+  const found = await findOffer(project.projectId, requestId, digest);
+  const again = `Run \`minions settings apply ${requestId}\` again for a fresh plan.`;
+  if (!found) throw new MinionsError('PRECONDITION', `No offered plan for change request ${displayText(requestId)} with digest ${displayText(digest)}.`, again);
+  if (found.spent) throw new MinionsError('CONFLICT', `Change request ${requestId}: this confirmation was already used (already handled).`, 'List requests with `minions settings requests --all`.');
+  const { offer } = found;
+  let current: { plan: ChangePlan; notes: string[] } | undefined;
+  await consumeOffer(offer, async () => {
+    const now = deps.now?.() ?? new Date();
+    if (now.getTime() > Date.parse(offer.expiresAt)) {
+      throw new MinionsError('PRECONDITION', `Change request ${requestId}: the confirmation expired at ${offer.expiresAt} (plans are valid for 30 minutes); nothing applied.`, again);
+    }
+    // Recompute from the request as journaled (never the container's row again) against the host as it is now.
+    current = await buildPlan(project, offer.request, deps);
+    if (current.plan.configRevision !== offer.configRevision) {
+      throw new MinionsError('CONFLICT', `Change request ${requestId}: the configuration moved from revision ${offer.configRevision} to ${current.plan.configRevision} since the plan was shown; nothing applied.`, again);
+    }
+    if (planDigest(current.plan) !== offer.digest) {
+      throw new MinionsError('CONFLICT', `Change request ${requestId}: the plan changed since it was shown (digest mismatch); nothing applied.`, again);
+    }
+  }, deps.now?.());
+  const plan = offer.plan as ChangePlan;
+  const out: ApplyOutcome = { ...outcomeBase({ plan, digest, notes: current!.notes }), status: 'failed', applied: false, expiresAt: offer.expiresAt, confirmCommand: null, detail: '' };
+  const w = await mark(project, deps.runtime, requestId, 'confirmed', `confirmed on the host (digest ${digest.slice(0, 12)})`);
+  if (w) out.warnings.push(w);
+  try {
+    await execute(project, plan, offer, out, deps);
+  } catch (e) {
+    out.status = 'failed';
+    out.detail = (e as Error).message;
+    await finish(project, out, deps);
+    throw e;
+  }
+  await finish(project, out, deps);
+  return out;
+}
+
+async function execute(project: ProjectJson, plan: ChangePlan, offer: OfferEntry, out: ApplyOutcome, deps: ChangeRequestDeps): Promise<void> {
+  if (plan.kind === 'config-set') {
+    const c = plan.change!;
+    const value = String((offer.request.payload as { value?: unknown }).value);
+    const ctx = await loadSettingsContext(project);
+    const r = await applySetting(ctx, c.key, value, { layer: c.layer, yes: true, restart: false, expectRevision: plan.configRevision },
+      { runtime: deps.runtime, confirm: async () => null });
+    out.set = r;
+    out.applied = r.written;
+    out.status = r.written ? 'applied' : 'failed';
+    out.detail = r.written ? `${c.key}: ${formatValue(r.from)} -> ${formatValue(r.to)} written to ${r.file}` : `${c.key} was not written`;
+    out.warnings.push(...r.warnings);
+    out.nextSteps.push(...r.nextSteps);
+    if (r.restart?.action === 'offered') out.nextSteps.push(r.restart.detail);
+    return;
+  }
+  if (plan.kind === 'restart') {
+    const r = await restartCoordinator(project, deps.runtime);
+    out.restart = r;
+    out.applied = r.action === 'restarted';
+    out.status = out.applied ? 'applied' : 'failed';
+    out.detail = `coordinator restart: ${r.action} - ${r.detail}`;
+    return;
+  }
+  const fc = (offer.request.payload as { fromContainer?: unknown }).fromContainer;
+  const r = await deps.upgrade(project, { fromContainer: fc === true ? true : typeof fc === 'string' ? fc : null, dryRun: false });
+  out.upgrade = r;
+  out.applied = r.ok;
+  out.status = r.ok ? 'applied' : 'failed';
+  out.detail = `upgrade: ${r.summary}`;
+  if (!r.ok) out.nextSteps.push(`Fix the failed step, then rerun \`${plan.steps[0]}\` on the host (the upgrade marker lets a rerun finish the job).`);
+}
+
+async function finish(project: ProjectJson, out: ApplyOutcome, deps: ChangeRequestDeps): Promise<void> {
+  const status = out.status === 'applied' ? 'applied' : 'failed';
+  await recordOutcome({ type: status, projectId: project.projectId, requestId: out.requestId, digest: out.digest, detail: out.detail }, deps.now?.())
+    .catch((e: unknown) => { out.warnings.push(`journal: ${(e as Error).message}`); });
+  const w = await mark(project, deps.runtime, out.requestId, status, out.detail);
+  if (w) out.warnings.push(w); else out.marked = true;
+}
+
+export interface ApplyIO {
+  /** Yes/no question; null when no terminal can answer. */
+  confirm: (question: string) => Promise<boolean | null>;
+  /** Shows the plan before the question (human mode: stderr). */
+  show?: (text: string) => void;
+}
+
+/**
+ * `minions settings apply <id>` (host): dry run -> the plan; --confirm <digest> -> applies that offered plan;
+ * otherwise records an offer and confirms it (--yes, or a terminal question; loosening plans ask twice). Without
+ * a terminal and without --yes the offer is returned with its confirm command: nothing is applied.
+ */
+export async function applyRequest(project: ProjectJson, id: string, o: { yes?: boolean; confirm?: string; dryRun?: boolean }, deps: ChangeRequestDeps, io: ApplyIO): Promise<ApplyOutcome> {
+  if (o.confirm !== undefined) {
+    if (o.dryRun) throw new MinionsError('PRECONDITION', '--confirm and --dry-run exclude each other.');
+    return confirmRequest(project, id, o.confirm.trim(), deps);
+  }
+  const req = await fetchRequest(project, deps.runtime, id);
+  if (!openStatus(req.status)) {
+    throw new MinionsError('PRECONDITION', `Change request ${id} is ${req.status}; nothing to apply.`, 'List open requests with `minions settings requests`.');
+  }
+  if (o.dryRun) {
+    const { plan, notes } = await buildPlan(project, snapshotOf(req), deps);
+    return { ...outcomeBase({ plan, digest: planDigest(plan), notes }), status: 'planned', applied: false, expiresAt: null, confirmCommand: null, detail: 'dry run: nothing offered or applied' };
+  }
+  const offered = await offerRequest(project, snapshotOf(req), deps);
+  const confirmCommand = `minions settings apply ${id} --confirm ${offered.digest}`;
+  const offeredOut = (): ApplyOutcome => ({
+    ...outcomeBase(offered), status: 'offered', applied: false, expiresAt: offered.offer.expiresAt, confirmCommand,
+    detail: `offered, not applied: confirm this exact plan before ${offered.offer.expiresAt}`,
+  });
+  if (!o.yes) {
+    io.show?.(formatPlan(offered.plan, offered.digest, offered.notes));
+    const ok = await io.confirm(`Apply change request ${id} (${requestSummary(req.kind, req.payload)})? (y/N)`);
+    if (ok === null) return offeredOut();
+    if (!ok) throw new MinionsError('PRECONDITION', `Not confirmed; change request ${id} was not applied (it stays ${req.status}).`, `Reject it with \`minions settings reject ${id}\`, or apply it later.`);
+    if (offered.plan.loosens) {
+      const again = await io.confirm(`This loosens policy: ${offered.plan.loosens}. Apply it anyway? (y/N)`);
+      if (again !== true) throw new MinionsError('PRECONDITION', `Not confirmed twice; change request ${id} was not applied (it stays ${req.status}).`);
+    }
+  }
+  return confirmRequest(project, id, offered.digest, deps);
+}
+
+export interface RejectOutcome { requestId: string; status: 'rejected'; marked: boolean; detail: string; warnings: string[] }
+
+/** `minions settings reject <id>` (host): marks an open request rejected (nothing is applied). */
+export async function rejectRequest(project: ProjectJson, id: string, o: { reason?: string }, deps: Pick<ChangeRequestDeps, 'runtime' | 'now'>): Promise<RejectOutcome> {
+  const req = await fetchRequest(project, deps.runtime, id);
+  if (!openStatus(req.status)) throw new MinionsError('PRECONDITION', `Change request ${id} is ${req.status}; nothing to reject.`, 'List open requests with `minions settings requests`.');
+  const detail = `rejected on the host${o.reason?.trim() ? `: ${o.reason.trim()}` : ''}`;
+  await runtimeJson(project, deps.runtime, ['settings', 'requests', 'mark', id, '--status', 'rejected', '--detail', detail.slice(0, 900)], `marking change request ${id} rejected`);
+  const warnings: string[] = [];
+  await recordOutcome({ type: 'rejected', projectId: project.projectId, requestId: id, detail }, deps.now?.()).catch((e: unknown) => { warnings.push(`journal: ${(e as Error).message}`); });
+  return { requestId: id, status: 'rejected', marked: true, detail, warnings };
+}
+
+export function formatApplyOutcome(r: ApplyOutcome): string {
+  const head = r.status === 'planned' ? [formatPlan(r.plan, r.digest, r.notes), '', 'dry run: nothing offered or applied']
+    : r.status === 'offered' ? [formatPlan(r.plan, r.digest, r.notes), '', `NOT applied: offered until ${r.expiresAt}. To apply exactly this plan, run:`, `  ${r.confirmCommand}`]
+      : [`change request ${r.requestId}: ${r.status === 'applied' ? 'applied' : 'FAILED'} - ${displayText(r.detail)}`, ...(r.set ? [formatSet(r.set)] : [])];
+  return [
+    ...head,
+    ...(r.status === 'applied' || r.status === 'failed' ? [r.marked ? `runtime request marked ${r.status}` : 'runtime request not marked (see warning)'] : []),
+    ...r.warnings.map((x) => `warning: ${displayText(x)}`),
+    ...r.nextSteps.map((x) => `next: ${x}`),
+  ].join('\n');
+}
+
+// ---------------------------------------------------------------- default deps
+
+/** `minions upgrade` of this CLI as a child process in the project's repository (progress on stderr). */
+export const childUpgrade: ChangeRequestDeps['upgrade'] = (project, o) => new Promise((resolve) => {
+  const flag = o.fromContainer === true ? ['--from-container'] : o.fromContainer ? ['--from-container', o.fromContainer] : [];
+  const cli = process.argv[1] ?? `${packageRoot()}/dist/cli.js`;
+  const env = { ...process.env };
+  delete env.MINIONS_RUNTIME;
+  const child = spawn(process.execPath, [...process.execArgv, cli, '--json', 'upgrade', ...flag, ...(o.dryRun ? ['--dry-run'] : [])],
+    { cwd: project.repoPath, env, stdio: ['ignore', 'pipe', 'inherit'] });
+  let stdout = '';
+  child.stdout.setEncoding('utf8').on('data', (d: string) => { stdout += d; });
+  const done = (code: number | null, err?: string) => {
+    const env2 = lastEnvelope<{ ok?: boolean; steps?: UpgradeRun['steps']; stopped?: { reason?: string } | null }>(stdout);
+    const steps = Array.isArray(env2?.data?.steps) ? env2!.data!.steps! : [];
+    const failed = steps.filter((s) => s.status === 'failed');
+    const ok = !!(env2?.ok && env2.data?.ok && !env2.data.stopped && code === 0);
+    const summary = err ?? (!env2 ? `no result (exit ${code})` : !env2.ok ? displayText(env2.error?.message ?? 'failed')
+      : env2.data?.stopped ? `stopped: ${displayText(env2.data.stopped.reason ?? '')}` : failed.length ? `failed: ${failed.map((s) => `${s.id} (${displayText(s.detail)})`).join(', ')}`
+        : o.dryRun ? `${steps.length} steps planned` : 'complete');
+    resolve({ ok, steps, summary });
+  };
+  child.on('error', (e) => done(null, e.message));
+  child.on('close', (code) => done(code));
+});
+
+// ---------------------------------------------------------------- register (under `settings`)
+
+const refuseInRuntime = (what: string, id: string) => {
+  if (runtimeMode() !== 'host' || inMinionsContainer()) {
+    throw new MinionsError('INCOMPATIBLE_RUNTIME', `${what} runs only in the host CLI: the owner confirms change requests on the host.`,
+      `Tell the owner that change request ${id} is waiting; they run \`minions settings apply ${id}\` (or \`reject\`) on the host.`);
+  }
+};
+
+async function currentProject(): Promise<ProjectJson> {
+  const { projectId } = await projectForPath(process.cwd());
+  return loadProjectJson(projectId);
+}
+
+/**
+ * `settings requests [--all]` (runtime: its own DB; host: through the runtime), the hidden runtime-only
+ * `settings requests mark <id> --status <s>` the host calls, and the host-only `settings apply <id>` / `settings reject <id>`.
+ */
+export function registerChangeRequestCommands(settings: Command, io: ApplyIO & { runtime: SettingsRuntime; upgrade?: ChangeRequestDeps['upgrade'] }): void {
+  const deps = (): ChangeRequestDeps => ({ runtime: io.runtime, upgrade: io.upgrade ?? childUpgrade });
+  const requests = settings.command('requests')
+    .description('List change requests (settings set, settings restart and upgrade recorded in the runtime): open ones, or every status with --all')
+    .option('--all', 'include applied, rejected and expired requests')
+    .action(action(async (o: { all?: boolean }, cmd: Command) => {
+      const { json } = globalOpts(cmd);
+      if (runtimeMode() !== 'host') {
+        const list = await withRequestContext(({ db }) => listChangeRequests(db, { all: !!o.all }));
+        emit({ requests: list }, { json, human: () => formatRequests(list) });
+        return;
+      }
+      await hostListRequests(io.runtime, !!o.all, json);
+    }));
+  requests.command('mark <requestId>', { hidden: true })
+    .description('Runtime only, called by the host: record the host\'s outcome of a change request')
+    .requiredOption('--status <status>', 'confirmed | applied | failed | rejected | expired')
+    .option('--detail <text>', 'what happened')
+    .action(action(async (id: string, o: { status: string; detail?: string }, cmd: Command) => {
+      requireMode('runtime');
+      const v = await withRequestContext(({ db }) => markChangeRequest(db, id, o.status, o.detail));
+      emit(v, { json: globalOpts(cmd).json, human: formatRequestLine });
+    }));
+  settings.command('apply <requestId>')
+    .description('Host only: review and apply a change request from the runtime (host-computed plan and digest; confirm in the terminal, with --yes, or later with --confirm <digest> within 30 minutes)')
+    .option('-y, --yes', 'apply the plan without asking (after reviewing it, e.g. with --dry-run)')
+    .option('--confirm <digest>', 'apply the plan offered earlier with this digest (refused if it expired or anything changed)')
+    .option('--dry-run', 'show the plan and its digest; offer and apply nothing')
+    .action(action(async (id: string, o: { yes?: boolean; confirm?: string }, cmd: Command) => {
+      refuseInRuntime('`settings apply`', id);
+      const { json, dryRun } = globalOpts(cmd);
+      const r = await applyRequest(await currentProject(), id, { yes: o.yes, confirm: o.confirm, dryRun }, deps(),
+        { confirm: json ? async () => null : io.confirm, show: json ? undefined : io.show });
+      emit(r, { json, human: formatApplyOutcome });
+      if (r.status === 'failed') process.exitCode = 1;
+    }));
+  settings.command('reject <requestId>')
+    .description('Host only: reject a change request (marks it rejected in the runtime; nothing is applied)')
+    .option('--reason <text>', 'why (stored with the request)')
+    .action(action(async (id: string, o: { reason?: string }, cmd: Command) => {
+      refuseInRuntime('`settings reject`', id);
+      const r = await rejectRequest(await currentProject(), id, o, deps());
+      emit(r, { json: globalOpts(cmd).json, human: (x: RejectOutcome) => [`change request ${x.requestId} rejected (nothing applied)`, ...x.warnings.map((w) => `warning: ${w}`)].join('\n') });
+    }));
+}
+
+/** Host side of `settings requests [--all]`: lists the runtime's requests. */
+export async function hostListRequests(runtime: SettingsRuntime, all: boolean, json: boolean): Promise<void> {
+  const project = await currentProject();
+  const requests = await fetchRequests(project, runtime, all);
+  emit({ projectId: project.projectId, requests }, { json, human: () => formatRequests(requests) });
+}

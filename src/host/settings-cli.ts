@@ -3,11 +3,15 @@
 // right layer, regeneration of the derived files, and the graceful coordinator restart
 // (`minions coordinator restart --recover` in the runtime, the same call `minions upgrade` makes; it is
 // refused while worker leases are active, so running workers are never interrupted).
+// In the agent runtime, `settings set` and `settings restart` record a change request instead
+// (src/runtime/change-requests.ts); the owner applies it on the host (`settings apply`, src/host/change-requests.ts).
 import type { Command } from 'commander';
-import { action, globalOpts, requireMode } from '../core/cli-helpers.js';
+import { action, globalOpts, requireMode, runtimeMode } from '../core/cli-helpers.js';
 import type { RunResult } from '../core/exec.js';
 import { MinionsError } from '../core/errors.js';
 import { emit } from '../core/output.js';
+import { formatRecord, recordRestartRequest, recordSettingRequest, withRequestContext, type RecordResult } from '../runtime/change-requests.js';
+import { revisionConflict } from './config-write.js';
 import { Compose } from './docker.js';
 import { loadProjectJson, type ProjectJson } from './project.js';
 import { projectForPath } from './registry.js';
@@ -67,6 +71,15 @@ export interface SetOptions {
   /** true: restart without asking; false: never restart (only offer); undefined: ask. */
   restart?: boolean;
   dryRun?: boolean;
+  /** Refuse (CONFLICT, nothing written) unless the config is still at this configRevision. */
+  expectRevision?: number;
+}
+
+/** Parses --expect-revision (a whole number >= 1). */
+export function parseRevision(raw: string): number {
+  const n = /^\s*\d+\s*$/.test(raw) ? Number(raw) : NaN;
+  if (!Number.isSafeInteger(n) || n < 1) throw new MinionsError('PRECONDITION', `--expect-revision must be a whole number >= 1 (got "${raw}").`);
+  return n;
 }
 
 export interface SetResult {
@@ -113,6 +126,7 @@ export async function applySetting(ctx: SettingsContext, key: string, input: str
   const { project } = ctx;
   const dryRun = !!o.dryRun;
   if (def.type === 'control') {
+    if (o.expectRevision !== undefined) throw new MinionsError('PRECONDITION', `--expect-revision applies to configuration settings; ${key} is a runtime control.`);
     const which = key === 'pause.intake' ? 'intake' : 'starts';
     const from = ctx.paused ? (ctx.paused[which] ? 'paused' : 'running') : null;
     const base = { key, from, to: value, layer: 'runtime' as const, file: null, dryRun, loosens: null, needsRestart: false, needsUpgrade: false,
@@ -129,6 +143,8 @@ export async function applySetting(ctx: SettingsContext, key: string, input: str
   }
   const layer = o.layer ?? 'local';
   const change = await planSetting(ctx, key, value, layer);
+  // Checked before any question; writeSetting checks again against the files right before it writes.
+  if (o.expectRevision !== undefined && change.revision !== o.expectRevision) throw revisionConflict(change.file, o.expectRevision, change.revision);
   const result: SetResult = {
     key, from: change.from, to: change.to, layer, file: change.file, changed: change.changed, written: false, dryRun,
     loosens: change.loosens, needsRestart: change.needsRestart, needsUpgrade: change.needsUpgrade, class: change.class, hostOwned: change.hostOwned,
@@ -141,7 +157,7 @@ export async function applySetting(ctx: SettingsContext, key: string, input: str
     if (ok === null) throw new MinionsError('POLICY_DENIED', `${key}: this change loosens policy (${change.loosens}) and needs a confirmation.`, 'Run it in a terminal, or pass --yes to confirm.', { path: key });
     if (!ok) throw new MinionsError('PRECONDITION', `Not confirmed; ${key} was not changed.`);
   }
-  result.warnings.push(...await writeSetting(project, change));
+  result.warnings.push(...await writeSetting(project, change, { expectRevision: o.expectRevision }));
   result.written = true;
   if (layer === 'shared') result.nextSteps.push(`Commit ${change.file} so the change reaches everyone using this repository.`);
   if (change.needsRestart) result.restart = await maybeRestart(project, o, deps);
@@ -217,9 +233,22 @@ export function registerSettings(program: Command, io: SettingsCliIO): Command {
     }));
   addSetCommand(cmd, io, runtime);
   cmd.command('restart')
-    .description('Restart the coordinator gracefully so prompt/launch settings take effect (refused while workers are active)')
-    .action(action(async (_o: unknown, c: Command) => {
-      requireMode('host');
+    .description('Restart the coordinator gracefully so prompt/launch settings take effect (refused while workers are active); in the runtime: record a restart request for the owner')
+    .option('--reason <text>', 'runtime: why the restart is needed (shown to the owner)')
+    .option('--dry-run', 'runtime: validate; record nothing')
+    .action(action(async (o: { reason?: string }, c: Command) => {
+      if (runtimeMode() !== 'host') {
+        const { json, dryRun } = globalOpts(c);
+        const r = await withRequestContext((ctx) => recordRestartRequest(ctx, { reason: o.reason, dryRun }));
+        emit(r, { json, human: formatRecord });
+        return;
+      }
+      if (o.reason !== undefined) throw new MinionsError('PRECONDITION', '--reason is for restart requests recorded in the runtime; on the host the restart runs directly.');
+      if (globalOpts(c).dryRun) {
+        const skipped: RestartOutcome = { action: 'skipped', detail: 'dry run: would run `minions coordinator restart --recover` in the runtime (graceful; refused while worker leases are active)' };
+        emit(skipped, { json: globalOpts(c).json, human: (x: RestartOutcome) => `coordinator restart: ${x.action} - ${x.detail}` });
+        return;
+      }
       const r = await restartCoordinator(await currentProject(), runtime);
       emit(r, { json: globalOpts(c).json, human: (x: RestartOutcome) => `coordinator restart: ${x.action} - ${x.detail}` });
       if (r.action === 'refused' || r.action === 'failed') process.exitCode = 1;
@@ -242,16 +271,28 @@ export function addSetCommand(parent: Command, io: Pick<SettingsCliIO, 'confirm'
     .option('--restart', 'restart the coordinator when the change needs it, without asking')
     .option('--no-restart', 'never restart the coordinator (print how to do it later)')
     .option('--dry-run', 'validate and show the change; write nothing')
-    .action(action(async (key: string, value: string, o: { shared?: boolean; yes?: boolean; restart?: boolean }, c: Command) => {
-      requireMode('host');
+    .option('--expect-revision <n>', 'refuse (CONFLICT, nothing written) unless the config is still at this configRevision')
+    .option('--reason <text>', 'runtime (required there): why the change is needed; the change is recorded as a request for the owner, not applied')
+    .action(action(async (key: string, value: string, o: { shared?: boolean; yes?: boolean; restart?: boolean; expectRevision?: string; reason?: string }, c: Command) => {
       const { json, dryRun } = globalOpts(c);
+      const shared = !!(o.shared || (c.parent?.opts() as { shared?: boolean } | undefined)?.shared);
+      if (runtimeMode() !== 'host') {
+        const hostOnly = [o.yes ? '--yes' : null, c.getOptionValueSource('restart') === 'cli' ? (o.restart ? '--restart' : '--no-restart') : null, o.expectRevision !== undefined ? '--expect-revision' : null].filter(Boolean);
+        if (hostOnly.length) {
+          throw new MinionsError('PRECONDITION', `${hostOnly.join(', ')}: host-only option(s); in the runtime \`settings set\` only records a change request.`, 'Drop them: the owner confirms and applies the request on the host.');
+        }
+        const r: RecordResult = await withRequestContext((ctx) => recordSettingRequest(ctx, key, value, { layer: shared ? 'shared' : 'local', reason: o.reason, dryRun }));
+        emit(r, { json, human: formatRecord });
+        return;
+      }
+      if (o.reason !== undefined) throw new MinionsError('PRECONDITION', '--reason is for change requests recorded in the runtime; on the host the change is made directly.');
+      const expectRevision = o.expectRevision === undefined ? undefined : parseRevision(o.expectRevision);
       const project = await currentProject();
       const def = requireSetting(key);
       const ctx = await loadSettingsContext(project, def.type === 'control' ? { pausedState: (p) => runtimePaused(p, runtime) } : {});
       // --restart / --no-restart: true / false; neither: ask (commander's default for --no-restart is true).
       const restart = c.getOptionValueSource('restart') === 'cli' ? o.restart : undefined;
-      const shared = !!(o.shared || (c.parent?.opts() as { shared?: boolean } | undefined)?.shared);
-      const r = await applySetting(ctx, key, value, { layer: shared ? 'shared' : 'local', yes: o.yes, restart, dryRun }, { runtime, confirm: json ? async () => null : io.confirm });
+      const r = await applySetting(ctx, key, value, { layer: shared ? 'shared' : 'local', yes: o.yes, restart, dryRun, expectRevision }, { runtime, confirm: json ? async () => null : io.confirm });
       emit(r, { json, human: formatSet });
     }));
 }

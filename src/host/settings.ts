@@ -11,8 +11,8 @@
 //   effort, permission mode). Both need a coordinator restart (offered, graceful: refused while workers run);
 // - `recreate` settings are compose, image or mount settings: `minions upgrade` applies them (container recreated).
 // Each setting also carries its class (live / restart / recreate) and hostOwned flag, consistent with the schema
-// classification (src/config/setting-classes.ts); hostOwned is metadata and display for now (task-53.3 refuses
-// container-originated changes of host-owned keys).
+// classification (src/config/setting-classes.ts); a change request from the runtime (src/runtime/change-requests.ts)
+// for a hostOwned key is refused when recorded and again by the host (src/host/change-requests.ts).
 // Writes go to the host-only config.local.json by default; the shared .minions/config.json (a sensitive,
 // committed path) only with an explicit `shared` choice on a shared install. Values are validated with the
 // full config schema (resolveEffective) before anything is written. Secrets are never read or shown: token
@@ -26,7 +26,7 @@ import { MinionsError } from '../core/errors.js';
 import { usdPerMTok } from '../runtime/spend.js';
 import { atomicWrite, readJsonIfExists } from '../core/fsutil.js';
 import { projectPaths } from '../core/paths.js';
-import { editProjectConfig } from './config-write.js';
+import { editProjectConfig, revisionConflict } from './config-write.js';
 import { loadCredentialRefs, type CredentialsJson } from './credentials.js';
 import { refreshDerived } from './install.js';
 import { loadEffectiveConfig, projectConfigPath, resolveEffective, type ProjectJson } from './project.js';
@@ -402,6 +402,8 @@ export interface SettingChange {
   hostOwned: boolean;
   /** The effective config after the change (validated). */
   effective: MinionsConfig;
+  /** The effective configRevision the change was planned against (`--expect-revision` compares with it). */
+  revision: number;
   warnings: string[];
 }
 
@@ -435,6 +437,7 @@ export async function planSetting(ctx: SettingsContext, key: string, to: Value, 
     throw new MinionsError('INVALID_CONFIG', `${localFile}: must be a JSON object; not changed.`, 'Fix the file by hand, then rerun.');
   }
   const from = currentValue(def, ctx);
+  const revision = resolveEffective(project, projectRaw, localRaw, { project: projectFile, local: localFile }).config.configRevision;
   const nextProject = layer === 'shared' ? setPath(structuredClone(projectRaw), key, to) : projectRaw;
   const nextLocal = layer === 'local' ? setPath(structuredClone(localRaw ?? {}), key, to) : localRaw;
   const effective = resolveEffective(project, nextProject, nextLocal, { project: projectFile, local: localFile }).config;
@@ -447,20 +450,29 @@ export async function planSetting(ctx: SettingsContext, key: string, to: Value, 
   return {
     key, from, to, layer, file, changed, loosens: changed && def.loosens ? def.loosens(from, now) : null,
     needsRestart: changed && def.class === 'restart', needsUpgrade: changed && def.class === 'recreate',
-    apply: def.apply, class: def.class, hostOwned: def.hostOwned, effective, warnings,
+    apply: def.apply, class: def.class, hostOwned: def.hostOwned, effective, revision, warnings,
   };
 }
 
-/** Writes a planned change to its layer and regenerates the derived files. Returns refresh warnings. */
-export async function writeSetting(project: ProjectJson, change: SettingChange): Promise<string[]> {
+/**
+ * Writes a planned change to its layer and regenerates the derived files. Returns refresh warnings.
+ * expectRevision: refuse (CONFLICT, nothing written) unless the config is still at that revision (the shared
+ * file's configRevision, which editProjectConfig checks; for the local layer the effective configRevision of
+ * the current files). A local-layer write does not bump configRevision (config.local.json is host-only).
+ */
+export async function writeSetting(project: ProjectJson, change: SettingChange, opts: { expectRevision?: number } = {}): Promise<string[]> {
   if (change.layer === 'shared') {
-    const r = await editProjectConfig(project, (raw) => setPath(raw, change.key, change.to));
+    const r = await editProjectConfig(project, (raw) => setPath(raw, change.key, change.to), { expectRevision: opts.expectRevision });
     return r.warnings;
   }
   const localFile = projectPaths(project.projectId).configLocalJson;
   const localRaw = (await readJsonIfExists<Record<string, unknown>>(localFile)) ?? {};
   const next = setPath(structuredClone(localRaw), change.key, change.to);
   const projectRaw = (await readJsonIfExists<Record<string, unknown>>(projectConfigPath(project))) ?? {};
+  if (opts.expectRevision !== undefined) {
+    const now = resolveEffective(project, projectRaw, localRaw, { project: projectConfigPath(project), local: localFile }).config.configRevision;
+    if (now !== opts.expectRevision) throw revisionConflict(projectConfigPath(project), opts.expectRevision, now);
+  }
   const effective = resolveEffective(project, projectRaw, next, { project: projectConfigPath(project), local: localFile }).config; // re-validate against the current files
   await atomicWrite(localFile, JSON.stringify(next, null, 2) + '\n', { mode: 0o600 });
   return refreshDerived(project, effective);

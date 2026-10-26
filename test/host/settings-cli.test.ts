@@ -20,6 +20,8 @@ vi.mock('../../src/host/docker.js', async (orig) => {
   class Compose extends real.Compose { override async isRunning() { return false; } }
   return { ...real, Compose };
 });
+// This suite runs the host CLI; the dev container it may run in has /opt/minions/config (the container marker).
+vi.mock('../../src/runtime/paths.js', async (orig) => ({ ...await orig<typeof import('../../src/runtime/paths.js')>(), inMinionsContainer: () => false }));
 
 const { buildProgram } = await import('../../src/program.js');
 const { runInit } = await import('../../src/host/install.js');
@@ -221,5 +223,32 @@ describe('settings set: what took effect now vs needs a restart or an upgrade (t
     const list = (await cli(repo, ['settings', '--list'])).out;
     expect(list).toMatch(/delivery\.mode = \S+ +\([^)]*; restart; host-owned\)/);
     expect(list).toMatch(/execution\.maxActiveTasks = \S+ +\(project config\)\n/);
+  });
+});
+
+describe('settings change requests on the host CLI (task-53.3)', () => {
+  it('set --expect-revision: a stale revision is refused with CONFLICT (exit 4) and writes nothing; the current one writes', async () => {
+    const { repo, local } = await install();
+    const stale = await cli(repo, ['settings', 'set', 'communication.progress', 'quiet', '--no-restart', '--expect-revision', '99', '--json']);
+    expect(stale.code).toBe(4);
+    expect(envelope(stale.out).error).toMatchObject({ code: 'CONFLICT' });
+    expect(envelope(stale.out).error!.message).toMatch(/not 99: the configuration changed since this change was planned; nothing written/);
+    expect(existsSync(local) ? JSON.parse(readFileSync(local, 'utf8')).communication?.progress : undefined).toBeUndefined();
+    const ok = await cli(repo, ['settings', 'set', 'communication.progress', 'quiet', '--no-restart', '--expect-revision', '1', '--json']);
+    expect(ok.code).toBe(0);
+    expect(envelope(ok.out).data).toMatchObject({ written: true });
+    expect((await cli(repo, ['settings', 'set', 'communication.progress', 'tasks', '--expect-revision', 'x', '--json'])).out).toMatch(/--expect-revision must be a whole number/);
+    expect((await cli(repo, ['settings', 'set', 'communication.progress', 'tasks', '--reason', 'r', '--json'])).out).toMatch(/--reason is for change requests recorded in the runtime/);
+  });
+
+  it('settings requests / apply / reject need the runtime (it holds the requests); restart --dry-run restarts nothing', async () => {
+    const { repo } = await install();
+    for (const args of [['settings', 'requests'], ['settings', 'apply', 'cr_00000001'], ['settings', 'reject', 'cr_00000001']]) {
+      const r = await cli(repo, [...args, '--json']);
+      expect(envelope(r.out).error, args.join(' ')).toMatchObject({ code: 'PRECONDITION' });
+      expect(envelope(r.out).error!.message).toMatch(/runtime is not running/);
+    }
+    const dry = await cli(repo, ['settings', 'restart', '--dry-run', '--json']);
+    expect(envelope(dry.out).data).toMatchObject({ action: 'skipped' });
   });
 });
