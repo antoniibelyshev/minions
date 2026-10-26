@@ -22,7 +22,7 @@ import { corruptRecordHint, hasOpenRun, readRunRecord, removeRunRecord } from '.
 import { missingApprovalKeyReason, runtimePaths } from './paths.js';
 import { publishTask, realGh, type GhFn, type PublishInput, type PublishOutcome } from './publish.js';
 import { isCiCheck, resultContractText, validateResult, type WorkerResult } from './results.js';
-import { assertBudgetAllowsStart, billingOf, budgetNotice, recordLeaseUsage, tokensFromResultUsage, type Billing, type BudgetNotice, type SpendContext } from './spend.js';
+import { assertBudgetAllowsStart, billingOf, budgetNotice, latestLeaseUsage, recordLeaseUsage, tokensFromResultUsage, type Billing, type BudgetNotice, type SpendContext } from './spend.js';
 import { readRequiredChecks, type RequiredChecksReport } from './ci.js';
 import { ciGateFromDb, formatCiGate, type CiGate } from './ci-gate.js';
 import { autoMergeTask, type MergeResult } from './merge.js';
@@ -342,6 +342,12 @@ export class Scheduler {
    * Stores the lease's token total: the coordinator's --usage, else the result's usage block. Recorded
    * before the transition so spend is kept even when the record is rejected; the latest figure per lease
    * counts, so re-recording (or a correction) never double-counts.
+   *
+   * Precedence (task-14.16): a measured figure beats a self-reported one. Measured means any stored source
+   * other than `result` (runner = the process harness's own count, record/release = coordinator --usage,
+   * manual = `work spend --lease`). The result file is written by the worker and may be hand-edited, so its
+   * usage block only fills in when the lease has no measured figure yet; otherwise the stored figure is
+   * kept and returned unchanged. An explicit coordinator --usage still always wins and is stored.
    */
   private noteUsage(lease: Lease, raw: unknown, flag: UsageFlag | undefined, source: 'record' | 'release'): RecordResponse['usage'] {
     let tokens = flag?.tokens ?? null;
@@ -355,6 +361,10 @@ export class Scheduler {
       }
     }
     if (tokens === null) return undefined;
+    if (from === 'result') {
+      const stored = latestLeaseUsage(this.db, lease.id);
+      if (stored && stored.source !== 'result') return stored;
+    }
     recordLeaseUsage(this.db, lease.id, { tokens, model, source: from });
     return { tokens, model, source: from };
   }

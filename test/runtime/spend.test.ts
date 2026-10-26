@@ -131,6 +131,38 @@ describe('durable usage tally', () => {
     expect(spendReport({ db: env.db, billing: 'subscription' }).total.tokens).toBe(8500);
   });
 
+  it('runner-measured usage is not replaced by a hand-written result usage block on record (task-14.16)', async () => {
+    const env = makeEnv();
+    env.backlog.add({ id: 'task-1' });
+    env.backlog.add({ id: 'task-2' });
+    const sched = schedWith(env);
+    // Runner lease: the process harness already stored its measured figure (as `work run` does).
+    const b1 = await sched.claim('task-1', 'engineer');
+    recordLeaseUsage(env.db, b1.leaseId, { tokens: 42_000, model: 'gpt-5', source: 'runner', harness: 'codex' });
+    const h1 = commitFile(b1.worktree, 'a.txt', 'x');
+    const r1 = await sched.record(b1.leaseId, result({ branch: b1.branch, headSha: h1, usage: { totalTokens: 10, model: 'haiku' } }));
+    expect(r1.usage).toEqual({ tokens: 42_000, model: 'gpt-5', source: 'runner' });
+    expect(spendReport({ db: env.db, billing: 'subscription' }).total.tokens).toBe(42_000);
+    // No measured figure: the result usage block still fills in.
+    const b2 = await sched.claim('task-2', 'engineer');
+    const h2 = commitFile(b2.worktree, 'b.txt', 'y');
+    const r2 = await sched.record(b2.leaseId, result({ branch: b2.branch, headSha: h2, usage: { totalTokens: 900, model: 'opus' } }));
+    expect(r2.usage).toEqual({ tokens: 900, model: 'opus', source: 'result' });
+    expect(spendReport({ db: env.db, billing: 'subscription' }).total.tokens).toBe(42_900);
+  });
+
+  it('a coordinator --usage still overrides a runner figure; the latest figure per lease counts once', async () => {
+    const env = makeEnv();
+    env.backlog.add({ id: 'task-3' });
+    const sched = schedWith(env);
+    const b3 = await sched.claim('task-3', 'engineer');
+    recordLeaseUsage(env.db, b3.leaseId, { tokens: 3000, source: 'runner', harness: 'codex' });
+    const h3 = commitFile(b3.worktree, 'c.txt', 'z');
+    const r3 = await sched.record(b3.leaseId, result({ branch: b3.branch, headSha: h3, usage: { totalTokens: 10 } }), { usage: { tokens: 5000 } });
+    expect(r3.usage).toEqual({ tokens: 5000, model: null, source: 'record' });
+    expect(spendReport({ db: env.db, billing: 'subscription' }).total.tokens).toBe(5000);
+  });
+
   it('release records usage; a figure added after the record (work spend --lease) replaces it; the coordinator session counts', async () => {
     const env = makeEnv();
     env.backlog.add({ id: 'task-1' });
