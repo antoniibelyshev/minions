@@ -169,7 +169,7 @@ const scheduler = async () => new Scheduler({
 async function restartWorkers(d: RuntimeDb): Promise<() => { id: string }[]> {
   const r = await recoverRuns(reapDeps(), 'orphans');
   logRecovery(r, (line) => process.stderr.write(line + '\n'));
-  return withOpenRuns(() => d.activeLeases(), runtimePaths().state);
+  return withOpenRuns(() => d.activeLeases(), runtimePaths().state); // contextResetCheck counts the same way
 }
 
 function logRecovery(r: RecoverySweep, log: (line: string) => void): void {
@@ -244,7 +244,7 @@ export async function runtimeChannelStatus(cfg: MinionsConfig, paths = runtimePa
   return { configured: r.configured, effective: r.effective, reason: r.reason, source: 'predicted' };
 }
 
-export async function collectStatus(deps: { db: RuntimeDb; config: MinionsConfig; backlog: () => Promise<BacklogAdapter>; channel?: () => Promise<ChannelStatus>; launch?: () => Promise<LaunchStatus>; poller?: () => Promise<PollerCheck> }): Promise<StatusReport> {
+export async function collectStatus(deps: { db: RuntimeDb; config: MinionsConfig; state?: string; backlog: () => Promise<BacklogAdapter>; channel?: () => Promise<ChannelStatus>; launch?: () => Promise<LaunchStatus>; poller?: () => Promise<PollerCheck> }): Promise<StatusReport> {
   const { db: d, config: cfg } = deps;
   const leases = d.activeLeases();
   const report: StatusReport = {
@@ -260,7 +260,7 @@ export async function collectStatus(deps: { db: RuntimeDb; config: MinionsConfig
   if (deps.poller) report.telegramPoller = await deps.poller().catch(() => undefined);
   try { report.notifications = outboxCounts(d); } catch { /* an older DB without the outbox: omit */ }
   try { report.spend = spendReport({ db: d, config: cfg }); } catch { /* status never fails on the tally */ }
-  try { const { steps: _s, ...c } = contextResetCheck({ db: d, config: cfg }); report.contextReset = c; } catch { /* status never fails on the reset check */ }
+  try { const { steps: _s, ...c } = contextResetCheck({ db: d, config: cfg, ...(deps.state !== undefined ? { state: deps.state } : {}) }); report.contextReset = c; } catch { /* status never fails on the reset check */ }
   try {
     const tasks = await (await deps.backlog()).listTasks();
     for (const t of tasks) report.queue[t.status] = (report.queue[t.status] ?? 0) + 1;
@@ -400,9 +400,9 @@ export async function spendCommand(o: { budget?: string; by?: string; lease?: st
 // ---------------------------------------------------------------- context reset
 
 /** Adds `contextReset` to a record/release response when a reset is due (task-45). Never fails the record. */
-export function withContextReset<T extends object>(r: T, deps: { db: RuntimeDb; config: MinionsConfig }): T & { contextReset?: ReturnType<typeof dueNotice> } {
+export function withContextReset<T extends object>(r: T, deps: { db: RuntimeDb; config: MinionsConfig; state?: string }): T & { contextReset?: ReturnType<typeof dueNotice> } {
   try {
-    const notice = dueNotice(contextResetCheck({ db: deps.db, config: deps.config }));
+    const notice = dueNotice(contextResetCheck({ db: deps.db, config: deps.config, ...(deps.state !== undefined ? { state: deps.state } : {}) }));
     return notice ? { ...r, contextReset: notice } : r;
   } catch { return r; }
 }
@@ -474,7 +474,7 @@ export function register(program: Command): void {
       const r = o.submitted
         ? await recordSubmitted(await scheduler(), runtimePaths(), leaseId, opts)
         : await (await scheduler()).record(leaseId, await readInput(o.resultFile), opts);
-      const out = withContextReset(r, { db: getDb(), config: await getConfig() });
+      const out = withContextReset(r, { db: getDb(), config: await getConfig(), state: runtimePaths().state });
       emit(out, { json: globalOpts(cmd).json, human: (d: typeof out) => [d.message, ...(d.errors ?? []).map((e: string) => `  - ${e}`), ...(d.budget ? [d.budget.message] : []), ...resetLine(d)].join('\n') });
     }));
   work.command('release <leaseId>').description('Release a lease without a result (worktree is kept)')
@@ -483,7 +483,7 @@ export function register(program: Command): void {
     .option('--model <name>', 'model the worker ran on (for the USD estimate with API-key billing)')
     .action(action(async (leaseId: string, o: { reason: string; usage?: string; model?: string }, cmd: Command) => {
       requireMode('runtime');
-      const r = withContextReset(await (await scheduler()).release(leaseId, o.reason, { usage: usageFlag(o) }), { db: getDb(), config: await getConfig() });
+      const r = withContextReset(await (await scheduler()).release(leaseId, o.reason, { usage: usageFlag(o) }), { db: getDb(), config: await getConfig(), state: runtimePaths().state });
       emit(r, { json: globalOpts(cmd).json, human: (d: typeof r) => [`Released ${d.leaseId} (${d.taskId}); worktree kept at ${d.worktree ?? '-'}`, ...(d.run ? [`process run: ${d.run}`] : []), ...(d.budget ? [d.budget.message] : []), ...resetLine(d)].join('\n') });
     }));
   work.command('spend').description('Spend tally and owner budget: show it, set the budget in plain language, or record usage after the fact')
@@ -713,7 +713,7 @@ export function register(program: Command): void {
         const paths = runtimePaths();
         const s = scheduleDetachedRestart({ activeLeases: workers, drain: () => d.drain(), log: join(paths.logs, 'context-reset.log'), cwd: paths.state }, o);
         // The ending session's trigger for the coordinator baseline (task-57.1): which reset triggers held.
-        try { noteResetRequest(d, contextResetCheck({ db: d, config: await getConfig() }).triggers); } catch { /* best-effort */ }
+        try { noteResetRequest(d, contextResetCheck({ db: d, config: await getConfig(), state: paths.state }).triggers); } catch { /* best-effort */ }
         emit(s, { json: globalOpts(cmd).json, human: (x: typeof s) => `coordinator: ${x.action} (${x.reason})` });
         return;
       }
@@ -739,7 +739,7 @@ export function register(program: Command): void {
         return;
       }
       if (o.check) {
-        const c = contextResetCheck({ db: getDb(), config: await getConfig() });
+        const c = contextResetCheck({ db: getDb(), config: await getConfig(), state: paths.state });
         emit(c, { json, human: (d: typeof c) => [d.reason, ...(d.steps ?? []).map((x, i) => `  ${i + 1}. ${x}`)].join('\n') });
         return;
       }
@@ -906,7 +906,7 @@ export function register(program: Command): void {
         return;
       }
       const cfg = await getConfig();
-      const r = await collectStatus({ db: getDb(), config: cfg, backlog: getBacklog, channel: () => runtimeChannelStatus(cfg), launch: () => coordinatorLaunchStatus(cfg), poller: () => telegramPollerStatus() });
+      const r = await collectStatus({ db: getDb(), config: cfg, state: runtimePaths().state, backlog: getBacklog, channel: () => runtimeChannelStatus(cfg), launch: () => coordinatorLaunchStatus(cfg), poller: () => telegramPollerStatus() });
       emit(r, { json: globalOpts(cmd).json, human: humanStatus });
     }));
   const pauseLike = (name: 'pause' | 'resume') => {

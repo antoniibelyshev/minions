@@ -20,6 +20,7 @@ import { sweepScratchOnStart } from '../../src/runtime/handoff.js';
 import { stopHook } from '../../src/runtime/hooks.js';
 import { enqueue, pending } from '../../src/runtime/outbox.js';
 import { runtimePaths } from '../../src/runtime/paths.js';
+import { runDir, runRecordPath, withOpenRuns } from '../../src/runtime/runner/record.js';
 import { defaults } from '../helpers.js';
 import { commitFile, makeDefaultEnv, result, tmp, type Env } from './fixtures.js';
 
@@ -305,6 +306,55 @@ describe('restart triggers', () => {
     const status = await collectStatus({ db: env.db, config: env.config, backlog: async () => env.backlog });
     expect(status.contextReset).toMatchObject({ enabled: true, due: true, triggers: ['delivered'] });
     expect(humanStatus(status)).toMatch(/context reset: due \(3\/10 hand-offs, context unknown, delivered task-1\)/);
+  });
+});
+
+describe('unfinished process runs (task-14.13)', () => {
+  const writeRun = (state: string, leaseId: string, body: string) => {
+    mkdirSync(runDir(state, leaseId), { recursive: true });
+    writeFileSync(runRecordPath(state, leaseId), body);
+  };
+
+  it('contextResetCheck counts unfinished run records exactly as coordinator restart does', () => {
+    const db = freshDb();
+    session(db);
+    const state = tmp('minions-reset-runs-');
+    db.addEvent('record', 'task-1', { leaseId: 'lease-r1', status: 'completed', to: 'delivered' });
+    // No lease and no unfinished run: due, and the restart would go ahead.
+    writeRun(state, 'lease-done', JSON.stringify({ phase: 'done' }));
+    expect(contextResetCheck({ db, config: defaults(), state })).toMatchObject({ due: true, blockers: [] });
+    expect(withOpenRuns(() => db.activeLeases(), state)()).toEqual([]);
+
+    addLease(db, 'lease-a', 'task-2');
+    writeRun(state, 'lease-a', JSON.stringify({ phase: 'running' })); // has an active lease: counted once
+    writeRun(state, 'lease-orphan', JSON.stringify({ phase: 'running' })); // no lease
+    writeRun(state, 'lease-garbled', '{ not json'); // unreadable: counts as not done
+    const c = contextResetCheck({ db, config: defaults(), state });
+    expect(c.due).toBe(false);
+    expect(c.blockers).toEqual(['3 active worker lease(s) (lease-a, lease-garbled (unfinished process run), lease-orphan (unfinished process run))']);
+
+    // The restart command's count (withOpenRuns, as restartWorkers builds it) refuses with the same list.
+    const dir = tmp('minions-detach-');
+    let refusal = '';
+    try {
+      scheduleDetachedRestart({ activeLeases: withOpenRuns(() => db.activeLeases(), state), drain: () => null, log: join(dir, 'context-reset.log'), cwd: dir, spawn: () => { throw new Error('must not spawn'); } }, {});
+    } catch (e) { refusal = (e as Error).message; }
+    expect(refusal).toBe(`Coordinator restart refused: ${c.blockers[0]}.`);
+
+    // Once the lease ends and the runs are done, both agree again: nothing blocks.
+    db.exec("UPDATE leases SET status = 'completed' WHERE id = 'lease-a'");
+    for (const id of ['lease-a', 'lease-orphan', 'lease-garbled']) writeRun(state, id, JSON.stringify({ phase: 'done' }));
+    expect(withOpenRuns(() => db.activeLeases(), state)()).toEqual([]);
+    expect(contextResetCheck({ db, config: defaults(), state })).toMatchObject({ due: true, blockers: [] });
+  });
+
+  it('an unfinished run alone (no active lease) blocks the reset', () => {
+    const db = freshDb();
+    session(db);
+    const state = tmp('minions-reset-runs-');
+    db.addEvent('record', 'task-1', { leaseId: 'lease-r1', status: 'completed', to: 'delivered' });
+    writeRun(state, 'lease-o', JSON.stringify({ phase: 'post-exit' }));
+    expect(contextResetCheck({ db, config: defaults(), state })).toMatchObject({ due: false, blockers: ['1 active worker lease(s) (lease-o (unfinished process run))'] });
   });
 });
 

@@ -231,7 +231,7 @@ const COMMAND_WRAPPERS = new Set([
   'env', 'command', 'builtin', 'exec', 'nohup', 'timeout', 'sudo', 'doas', 'xargs', 'nice', 'ionice', 'stdbuf', 'time', 'setsid', 'chrt', 'taskset',
   'unshare', 'nsenter', 'flock', 'strace', 'ltrace', 'chroot', 'busybox', 'setpriv', 'capsh', 'firejail', 'chpst', 'find', 'parallel', 'watch', 'entr',
   'node', 'nodejs', 'npx', 'npm', 'pnpm', 'yarn', 'bun', 'bunx', 'deno', 'tsx', 'ts-node',
-  'if', 'then', 'else', 'elif', 'do', 'while', 'until', '!', '{', '}', 'coproc',
+  'if', 'then', 'else', 'elif', 'do', 'while', 'until', '!', '{', '}', 'coproc', 'function',
 ]);
 
 /** Commands whose arguments are shell scripts (`sh -c '…'`, `su -c '…'`, `ssh host '…'`): each argument is scanned. */
@@ -245,6 +245,38 @@ function coordinatorVerb(words: readonly string[], entry: number): string | null
   if (w < 0) return null;
   const verb = words.slice(w + 1).find((x) => !x.startsWith('-'));
   return verb && (COORDINATOR_ONLY_WORK_VERBS as readonly string[]).includes(verb) ? `minions work ${verb}` : null;
+}
+
+/** Commands whose arguments are printed as text (so piping them into a shell runs that text). */
+const PRINTERS = new Set(['echo', 'printf']);
+
+/**
+ * What a command writes to a pipe, as far as a text check can tell: the arguments of echo/printf (joined, and each
+ * on its own, with `\n` escapes as newlines) and any heredoc or here-string fed to the command (`cat <<EOF | bash`).
+ */
+function pipedText(scan: ShellScan, words: readonly string[]): string[] {
+  const out = [...(scan.stdin.get(words) ?? [])];
+  let s = 0;
+  while (s < words.length && ASSIGNMENT.test(words[s]!)) s++;
+  if (s < words.length && PRINTERS.has(basename(words[s]!))) {
+    const args = words.slice(s + 1).map((a) => a.replace(/\\n/g, '\n'));
+    out.push(args.join(' '), ...args);
+  }
+  return out;
+}
+
+/**
+ * Scripts a shell in this command may read on stdin: its own heredocs and here-strings, and what the command
+ * before it in a pipeline prints. Checked only when the command runs a shell (SCRIPT_RUNNERS) somewhere.
+ */
+function stdinHit(scan: ShellScan, words: readonly string[], depth: number): string | null {
+  if (!words.some((w) => SCRIPT_RUNNERS.has(basename(w)))) return null;
+  const from = scan.pipedFrom.get(words);
+  for (const text of [...(scan.stdin.get(words) ?? []), ...(from ? pipedText(scan, from) : [])]) {
+    const hit = scriptHit(text, depth + 1);
+    if (hit) return hit;
+  }
+  return null;
 }
 
 /** One simple command: assignments skipped, then the command word (or, after a wrapper, any later word). */
@@ -296,7 +328,7 @@ function scriptHit(script: string, depth: number): string | null {
     if (e instanceof ShellParseError) return coarseHit(script);
     throw e;
   }
-  for (const words of scan.commands) { const hit = simpleCommandHit(words, depth); if (hit) return hit; }
+  for (const words of scan.commands) { const hit = simpleCommandHit(words, depth) ?? stdinHit(scan, words, depth); if (hit) return hit; }
   for (const nested of scan.scripts) { const hit = scriptHit(nested, depth + 1); if (hit) return hit; }
   return null;
 }
@@ -307,7 +339,8 @@ function scriptHit(script: string, depth: number): string | null {
  * heredoc bodies, substitutions); a command matches when, after assignments, its command word runs minions
  * (`minions` by any path, or `…/cli.js`), or a wrapper (env, sudo, timeout, xargs, node, …) has such a word
  * later, followed by `work` and a coordinator-only verb as the next non-option word. Script arguments of shells
- * (`bash -c '…'`, `eval`) are scanned recursively. Quoted arguments of other commands (commit messages, grep
+ * (`bash -c '…'`, `eval`) are scanned recursively, and so are scripts fed to a shell on stdin (its heredoc or
+ * here-string, or what echo/printf or a heredoc-fed command pipes into it: `bash <<EOF`, `echo … | bash`). Quoted arguments of other commands (commit messages, grep
  * patterns) and heredoc bodies are data and never match. When the line cannot be scanned, it fails closed on the
  * raw text (coarseHit). Defence-in-depth, not a security boundary: variables, aliases, functions and
  * substitutions in command position are out of reach of any text check, which is why `work run` keeps its own
