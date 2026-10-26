@@ -86,6 +86,8 @@ in `/state/minions.db`: `{id, kind, payload, reason, createdAt, status}`, with s
 config and refuses host-owned keys (CONFLICT, with a message telling the coordinator to ask the owner instead). The
 coordinator then tells the owner in its own chat that a request is waiting. It never says that the change was made.
 
+Host-owned keys are refused at recording. For those the coordinator only posts a proposal in its own chat: the reason, `/set <key> <value>` for the manager and the equivalent `minions settings set <key> <value>` for the host terminal. It is a suggestion, never recorded or treated as a request; the owner's `/set` and the confirmation flow stay the only path.
+
 The manager polls each running project every 20 s with `docker compose exec app minions settings requests --json`,
 the existing delegate mechanism (`src/host/delegate.ts`). Each exec has a timeout (30 s) and an output cap (256 KiB);
 anything over either is dropped and reported as a project error, since the output is untrusted. It gets no new mount and no host-visible file under
