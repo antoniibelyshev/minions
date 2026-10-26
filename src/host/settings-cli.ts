@@ -13,8 +13,8 @@ import { loadProjectJson, type ProjectJson } from './project.js';
 import { projectForPath } from './registry.js';
 import { HostRuntime, runtimeOf } from './runtime.js';
 import {
-  SETTING_GROUPS, formatValue, listSettings, loadSettingsContext, parseSettingValue, planSetting, requireSetting, writeSetting,
-  type SettingChange, type SettingLayer, type SettingView, type SettingsContext,
+  SETTING_GROUPS, formatValue, listSettings, loadSettingsContext, parseSettingValue, planSetting, requireSetting, takesEffectOf, writeSetting,
+  type SettingChange, type SettingClass, type SettingLayer, type SettingView, type SettingsContext, type TakesEffect,
 } from './settings.js';
 
 /** The runtime operations settings needs (faked in tests). */
@@ -80,9 +80,30 @@ export interface SetResult {
   dryRun: boolean;
   loosens: string | null;
   needsRestart: boolean;
+  /** The change needs `minions upgrade` (class recreate); never run from here, only offered as a next step. */
+  needsUpgrade: boolean;
+  /** How a change of this setting takes effect (live / restart / recreate). */
+  class: SettingClass;
+  /** Host-owned setting (policy, permissions, isolation). */
+  hostOwned: boolean;
+  /** When this change takes effect: now, after a coordinator restart, or after an upgrade; null when nothing changed. */
+  takesEffect: TakesEffect | null;
+  /** One-line explanation of takesEffect (empty when nothing changed). */
+  effect: string;
   restart: RestartOutcome | null;
   warnings: string[];
   nextSteps: string[];
+}
+
+export const UPGRADE_LATER = 'Run `minions upgrade` to recreate the container with the new value (volumes are kept).';
+
+/** The one-line explanation of when a change takes effect. */
+export function effectText(t: TakesEffect | null, dryRun = false): string {
+  const w = dryRun ? 'would take' : 'takes';
+  if (t === 'now') return `${w} effect now: the runtime reads the regenerated config on its next command (the coordinator prompt catches up at its next restart)`;
+  if (t === 'restart') return `${w} effect after a coordinator restart (\`minions settings restart\`; graceful, refused while workers are active)`;
+  if (t === 'upgrade') return `${w} effect after \`minions upgrade\` (the container is recreated, volumes kept)`;
+  return '';
 }
 
 /** Applies one setting (config or runtime control). Never prints secrets; throws before writing on invalid input. */
@@ -94,22 +115,26 @@ export async function applySetting(ctx: SettingsContext, key: string, input: str
   if (def.type === 'control') {
     const which = key === 'pause.intake' ? 'intake' : 'starts';
     const from = ctx.paused ? (ctx.paused[which] ? 'paused' : 'running') : null;
-    const base = { key, from, to: value, layer: 'runtime' as const, file: null, dryRun, loosens: null, needsRestart: false, restart: null, warnings: [] };
+    const base = { key, from, to: value, layer: 'runtime' as const, file: null, dryRun, loosens: null, needsRestart: false, needsUpgrade: false,
+      class: def.class, hostOwned: def.hostOwned, restart: null, warnings: [] };
+    const now = (changed: boolean) => ({ takesEffect: changed ? 'now' as const : null, effect: changed ? `${dryRun ? 'would take' : 'takes'} effect now: applied to the running runtime` : '' });
     if (!(await deps.runtime.running(project))) {
       throw new MinionsError('PRECONDITION', 'The runtime is not running, so there is nothing to pause or resume.', 'Run `minions start` first.');
     }
-    if (from === value || dryRun) return { ...base, changed: from !== value, written: false, nextSteps: [] };
+    if (from === value || dryRun) return { ...base, changed: from !== value, written: false, ...now(from !== value), nextSteps: [] };
     const r = await deps.runtime.exec(project, ['minions', value === 'paused' ? 'pause' : 'resume', `--${which}`, '--json']);
     const env = lastJson(r.stdout);
     if (!env?.ok) throw new MinionsError('INTERNAL', `minions ${value === 'paused' ? 'pause' : 'resume'} failed in the runtime: ${env?.error?.message ?? 'no output'}`);
-    return { ...base, changed: true, written: true, nextSteps: [] };
+    return { ...base, changed: true, written: true, ...now(true), nextSteps: [] };
   }
   const layer = o.layer ?? 'local';
   const change = await planSetting(ctx, key, value, layer);
   const result: SetResult = {
     key, from: change.from, to: change.to, layer, file: change.file, changed: change.changed, written: false, dryRun,
-    loosens: change.loosens, needsRestart: change.needsRestart, restart: null, warnings: [...change.warnings], nextSteps: [],
+    loosens: change.loosens, needsRestart: change.needsRestart, needsUpgrade: change.needsUpgrade, class: change.class, hostOwned: change.hostOwned,
+    takesEffect: change.changed ? takesEffectOf(change.class) : null, effect: '', restart: null, warnings: [...change.warnings], nextSteps: [],
   };
+  result.effect = effectText(result.takesEffect, dryRun);
   if (!change.changed || dryRun) return result;
   if (change.loosens && !o.yes) {
     const ok = await deps.confirm(`${key}: ${formatValue(change.from)} -> ${formatValue(change.to)} loosens policy: ${change.loosens}. Apply? (y/N)`);
@@ -120,6 +145,7 @@ export async function applySetting(ctx: SettingsContext, key: string, input: str
   result.written = true;
   if (layer === 'shared') result.nextSteps.push(`Commit ${change.file} so the change reaches everyone using this repository.`);
   if (change.needsRestart) result.restart = await maybeRestart(project, o, deps);
+  if (change.needsUpgrade) result.nextSteps.push(UPGRADE_LATER);
   return result;
 }
 
@@ -142,7 +168,7 @@ export function formatList(views: SettingView[]): string {
     const items = views.filter((v) => v.group === g);
     if (!items.length) continue;
     out.push(`${g}:`);
-    for (const v of items) out.push(`  ${v.key} = ${formatValue(v.value)}  (${v.source}${v.needsRestart ? '; restart' : ''})`);
+    for (const v of items) out.push(`  ${v.key} = ${formatValue(v.value)}  (${v.source}${v.needsRestart ? '; restart' : ''}${v.needsUpgrade ? '; upgrade' : ''}${v.hostOwned ? '; host-owned' : ''})`);
   }
   return out.join('\n');
 }
@@ -151,6 +177,7 @@ export function formatSet(r: SetResult): string {
   return [
     `${r.key}: ${formatValue(r.from)} -> ${formatValue(r.to)}${r.dryRun ? ' (dry run: nothing changed)' : !r.changed ? ' (unchanged)' : r.file ? ` (written to ${r.file})` : ' (applied to the runtime)'}`,
     ...(r.loosens ? [`loosens policy: ${r.loosens}`] : []),
+    ...(r.effect ? [r.effect] : []),
     ...(r.written && r.layer !== 'runtime' ? ['Derived files regenerated (runtime config, plugin).'] : []),
     ...(r.restart ? [`coordinator restart: ${r.restart.action} - ${r.restart.detail}`] : []),
     ...r.warnings.map((w) => `warning: ${w}`),

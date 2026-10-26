@@ -8,7 +8,11 @@
 //   call reads the regenerated runtime config);
 // - `prompt` settings live in the coordinator's prompt and the agent definitions (the plugin), which Claude
 //   Code reads at session start; `launch` settings are coordinator launch arguments (channel, model,
-//   effort, permission mode). Both need a coordinator restart (offered, graceful: refused while workers run).
+//   effort, permission mode). Both need a coordinator restart (offered, graceful: refused while workers run);
+// - `recreate` settings are compose, image or mount settings: `minions upgrade` applies them (container recreated).
+// Each setting also carries its class (live / restart / recreate) and hostOwned flag, consistent with the schema
+// classification (src/config/setting-classes.ts); hostOwned is metadata and display for now (task-53.3 refuses
+// container-originated changes of host-owned keys).
 // Writes go to the host-only config.local.json by default; the shared .minions/config.json (a sensitive,
 // committed path) only with an explicit `shared` choice on a shared install. Values are validated with the
 // full config schema (resolveEffective) before anything is written. Secrets are never read or shown: token
@@ -17,6 +21,7 @@ import { CAPABILITIES, strictness, ruleEffects } from '../config/capabilities.js
 import { COORDINATOR_DISALLOWED_TOOLS } from '../config/coordinator-tools.js';
 import type { Source } from '../config/resolve.js';
 import { EFFORTS, type CapabilityRule, type MinionsConfig } from '../config/schema.js';
+import { classifyKey, type SettingClass } from '../config/setting-classes.js';
 import { MinionsError } from '../core/errors.js';
 import { usdPerMTok } from '../runtime/spend.js';
 import { atomicWrite, readJsonIfExists } from '../core/fsutil.js';
@@ -29,8 +34,18 @@ import { loadEffectiveConfig, projectConfigPath, resolveEffective, type ProjectJ
 export const SETTING_GROUPS = ['Delivery', 'Verification', 'Reporting', 'Models', 'Concurrency', 'Policy', 'Permissions', 'Integrations', 'Pause'] as const;
 export type SettingGroup = (typeof SETTING_GROUPS)[number];
 
-/** live: enforced by the runtime from the regenerated config; prompt/launch: needs a coordinator restart. */
-export type SettingApply = 'live' | 'prompt' | 'launch';
+/** live: enforced by the runtime from the regenerated config; prompt/launch: needs a coordinator restart; recreate: needs `minions upgrade`. */
+export type SettingApply = 'live' | 'prompt' | 'launch' | 'recreate';
+export type { SettingClass };
+
+/** The class of an apply mode (prompt and launch both mean a coordinator restart). */
+export const applyClass = (apply: SettingApply): Exclude<SettingClass, 'fixed'> =>
+  apply === 'live' ? 'live' : apply === 'recreate' ? 'recreate' : 'restart';
+
+/** When a change takes effect: now (the next runtime command), after a coordinator restart, or after `minions upgrade`. */
+export type TakesEffect = 'now' | 'restart' | 'upgrade';
+export const takesEffectOf = (cls: SettingClass): TakesEffect | null =>
+  cls === 'live' ? 'now' : cls === 'restart' ? 'restart' : cls === 'recreate' ? 'upgrade' : null;
 export type SettingType = 'enum' | 'int' | 'bool' | 'model' | 'models' | 'list' | 'secret' | 'control';
 export type SettingLayer = 'local' | 'shared';
 
@@ -47,6 +62,10 @@ export interface SettingDef {
   /** May be unset (value `default` removes it from the layer). */
   optional?: boolean;
   apply: SettingApply;
+  /** How a change takes effect (from apply; the guard test checks it against the schema classification). */
+  class: SettingClass;
+  /** Host-owned: policy, permissions or isolation; the container can never propose it. */
+  hostOwned: boolean;
   /** What a change from `from` to `to` newly allows, or null when it does not loosen policy. */
   loosens?: (from: Value, to: Value) => string | null;
 }
@@ -55,6 +74,7 @@ const RESTART_WHY: Record<SettingApply, string> = {
   live: 'takes effect on the next runtime command (the coordinator prompt catches up on its next restart)',
   prompt: 'the coordinator and worker definitions read it at session start: needs a coordinator restart',
   launch: 'a coordinator launch setting: needs a coordinator restart',
+  recreate: 'a container setting (compose, image or mounts): needs `minions upgrade` (the container is recreated, volumes kept)',
 };
 
 const more = (what: string) => (from: Value, to: Value) => (typeof from === 'number' && typeof to === 'number' && to > from ? `${what} (${from} -> ${to})` : null);
@@ -83,7 +103,17 @@ const capRank =(r: Value): number => {
   return Math.max(...effects.map(strictness));
 };
 
-export const SETTINGS: readonly SettingDef[] = [
+/** A setting as declared below; class and hostOwned are filled in by withClass. */
+type DeclaredSetting = Omit<SettingDef, 'class' | 'hostOwned'> & { hostOwned?: boolean };
+
+/**
+ * Fills in class (from apply) and hostOwned: schema keys take the flag from the classification table
+ * (src/config/setting-classes.ts); items outside the schema (secrets, pause controls) declare it.
+ */
+const withClass = (d: DeclaredSetting): SettingDef =>
+  ({ ...d, class: applyClass(d.apply), hostOwned: d.hostOwned ?? classifyKey(d.key)?.hostOwned ?? false });
+
+const DECLARED: readonly DeclaredSetting[] = [
   // ---- Delivery
   { key: 'delivery.mode', group: 'Delivery', label: 'Delivery mode', type: 'enum', choices: ['local', 'branch', 'pull-request'], apply: 'prompt',
     description: 'local: commits stay in the runtime; branch: push agent/<slug>; pull-request: push and open a PR',
@@ -120,7 +150,7 @@ export const SETTINGS: readonly SettingDef[] = [
     description: 'model of the coordinator session (default: the Claude Code default)' },
   { key: 'models.effort', group: 'Models', label: 'Effort (all roles)', type: 'enum', choices: EFFORTS, optional: true, apply: 'launch',
     description: 'reasoning effort fallback for every role (default: the Claude Code default)' },
-  ...(['engineer', 'engineerDeep', 'tester', 'reviewer', 'coordinator'] as const).map((role): SettingDef => ({
+  ...(['engineer', 'engineerDeep', 'tester', 'reviewer', 'coordinator'] as const).map((role): DeclaredSetting => ({
     key: `models.effortByRole.${role}`, group: 'Models', label: `Effort: ${role}`, type: 'enum', choices: EFFORTS, optional: true,
     apply: role === 'coordinator' ? 'launch' : 'prompt', description: `reasoning effort of the ${role} (default: models.effort)`,
   })),
@@ -163,22 +193,24 @@ export const SETTINGS: readonly SettingDef[] = [
     description: "Claude Code's bundled skills in the coordinator session (plugin skills always stay)",
     loosens: turnsOn("the coordinator session gets Claude Code's bundled skills (more tools and context)") },
   // ---- Permissions (capabilities)
-  ...CAPABILITIES.map((cap): SettingDef => ({
+  ...CAPABILITIES.map((cap): DeclaredSetting => ({
     key: `capabilities.${cap}`, group: 'Permissions', label: cap, type: 'enum', choices: ['allow', 'ask', 'deny'], apply: 'prompt',
     description: `allow: agents may ${cap} on their own; ask: needs your approval; deny: never`,
     loosens: (f, t) => (capRank(t) < capRank(f) ? `${cap} becomes "${String(t)}" (was ${JSON.stringify(f)}): ${t === 'allow' ? 'agents may do it without asking' : 'agents may do it with your approval'}` : null),
   })),
   // ---- Integrations (never shows a secret)
-  { key: 'secrets.github', group: 'Integrations', label: 'GitHub token', type: 'secret', apply: 'live',
+  { key: 'secrets.github', group: 'Integrations', label: 'GitHub token', type: 'secret', apply: 'live', hostOwned: true,
     description: 'GitHub token for branch/PR delivery (`minions auth github`)' },
-  { key: 'secrets.telegram', group: 'Integrations', label: 'Telegram bot token', type: 'secret', apply: 'launch',
+  { key: 'secrets.telegram', group: 'Integrations', label: 'Telegram bot token', type: 'secret', apply: 'launch', hostOwned: true,
     description: 'Telegram bot token for the Telegram channel (`minions auth telegram`)' },
   // ---- Pause (runtime controls)
-  { key: 'pause.intake', group: 'Pause', label: 'Intake paused', type: 'control', apply: 'live',
+  { key: 'pause.intake', group: 'Pause', label: 'Intake paused', type: 'control', apply: 'live', hostOwned: false,
     description: 'paused: the coordinator takes no new tasks into the backlog' },
-  { key: 'pause.starts', group: 'Pause', label: 'Starts paused', type: 'control', apply: 'live',
+  { key: 'pause.starts', group: 'Pause', label: 'Starts paused', type: 'control', apply: 'live', hostOwned: false,
     description: 'paused: no new task starts; running workers continue' },
 ];
+
+export const SETTINGS: readonly SettingDef[] = DECLARED.map(withClass);
 
 export const settingDef = (key: string): SettingDef | undefined => SETTINGS.find((s) => s.key === key);
 
@@ -205,8 +237,15 @@ export interface SettingView {
   value: Value;
   source: SourceLabel;
   apply: SettingApply;
+  /** live / restart / recreate. */
+  class: SettingClass;
+  /** Host-owned: the container can never propose a change. */
+  hostOwned: boolean;
   needsRegenerate: boolean;
+  /** A change needs a coordinator restart (class restart). */
   needsRestart: boolean;
+  /** A change needs `minions upgrade` (class recreate: the container is recreated). */
+  needsUpgrade: boolean;
   /** One-line note on how a change takes effect. */
   effect: string;
   /** Whether a change of this setting can loosen policy (a confirmation lists what it allows). */
@@ -275,8 +314,8 @@ export function viewSetting(def: SettingDef, ctx: SettingsContext): SettingView 
   return {
     key: def.key, group: def.group, label: def.label, description: def.description, type: def.type,
     ...(def.choices ? { choices: def.choices } : {}), ...(def.optional ? { optional: true } : {}),
-    value: currentValue(def, ctx), source: sourceOf(def, ctx), apply: def.apply,
-    needsRegenerate: isConfig, needsRestart: isConfig && def.apply !== 'live',
+    value: currentValue(def, ctx), source: sourceOf(def, ctx), apply: def.apply, class: def.class, hostOwned: def.hostOwned,
+    needsRegenerate: isConfig, needsRestart: isConfig && def.class === 'restart', needsUpgrade: isConfig && def.class === 'recreate',
     effect: isConfig ? RESTART_WHY[def.apply] : def.type === 'secret' ? `run \`minions auth ${def.key.slice('secrets.'.length)}\` to change it` : 'applied to the running runtime at once',
     canLoosen: !!def.loosens,
   };
@@ -354,8 +393,13 @@ export interface SettingChange {
   changed: boolean;
   /** What the change newly allows (null: does not loosen policy). */
   loosens: string | null;
+  /** The change needs a coordinator restart (class restart). */
   needsRestart: boolean;
+  /** The change needs `minions upgrade` (class recreate). */
+  needsUpgrade: boolean;
   apply: SettingApply;
+  class: SettingClass;
+  hostOwned: boolean;
   /** The effective config after the change (validated). */
   effective: MinionsConfig;
   warnings: string[];
@@ -402,7 +446,8 @@ export async function planSetting(ctx: SettingsContext, key: string, to: Value, 
   const changed = !same(from, now);
   return {
     key, from, to, layer, file, changed, loosens: changed && def.loosens ? def.loosens(from, now) : null,
-    needsRestart: changed && def.apply !== 'live', apply: def.apply, effective, warnings,
+    needsRestart: changed && def.class === 'restart', needsUpgrade: changed && def.class === 'recreate',
+    apply: def.apply, class: def.class, hostOwned: def.hostOwned, effective, warnings,
   };
 }
 
