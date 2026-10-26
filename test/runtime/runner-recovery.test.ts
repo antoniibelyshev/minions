@@ -3,7 +3,7 @@
 // reaper from racing the live runner, the escapee sweep against a fake /proc tree (no real process is signalled),
 // the re-claim gate in `work claim`, restart counting of unfinished runs, and the lease-ended fetch-back false
 // positive from the task-14.4 review. Isolation is `none`; never starts a real harness or a Claude session.
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -358,5 +358,110 @@ describe('escapee sweep (Seccomp_filters above the container baseline, injectabl
     expect(reaped.killed).toEqual(expect.arrayContaining([rec.pgid, 777]));
     expect(r.db.events('task-1', 'run-recovered').map((e) => e.data)).toContainEqual(expect.objectContaining({ escapees: [777] }));
     await p;
+  });
+});
+
+// ------------------------------------------------------------------------------- tester regressions (task-14.5 QA)
+
+/** A real, harmless child process of this test (the only process these tests ever SIGKILL). */
+async function stuckChild() {
+  const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+  for (let i = 0; i < 100; i++) {
+    const id = child.pid ? await procIdentity(child.pid) : null;
+    if (id) return { child, id };
+    await sleep(20);
+  }
+  child.kill('SIGKILL');
+  throw new Error('the child never started');
+}
+
+describe('tester regressions: reapRun against a live runner that ignores the cancel', () => {
+  it('cancel mark, bounded wait, then SIGKILL of the runner and only then the owner lock; record done, lock dropped', async () => {
+    const r = rig();
+    const b = await claim(r);
+    const host = await hostIdentity();
+    const { child, id } = await stuckChild();
+    try {
+      await strayRecord(r, b.leaseId, 'task-1', { host, runner: id } as Partial<RunRecord>);
+      // The "runner" holds the owner lock and never reacts to the cancel mark.
+      expect(await acquireOwner(r.paths.state, b.leaseId, ownerToken(id, 'runner', host))).toEqual({ ok: true });
+      const exited = new Promise<NodeJS.Signals | null>((res) => child.once('exit', (_c, s) => res(s)));
+      const t0 = Date.now();
+      const reaped = await reapRun(b.leaseId, r.reapDeps({ waitMs: 400, pollMs: 50 }));
+      expect(Date.now() - t0).toBeGreaterThanOrEqual(400);
+      expect(existsSync(join(runDir(r.paths.state, b.leaseId), 'cancel'))).toBe(true);
+      expect(reaped).toMatchObject({ action: 'recovered' });
+      expect(reaped.killed).toContain(id.pid);
+      expect(await exited).toBe('SIGKILL');
+      expect((await readRunRecord(r.paths.state, b.leaseId))?.phase).toBe('done');
+      expect(await readOwner(r.paths.state, b.leaseId)).toBeNull();
+    } finally { child.kill('SIGKILL'); }
+  });
+
+  it('a runner that finishes within the wait is never killed (cancelled, not recovered)', async () => {
+    const r = rig();
+    const b = await claim(r);
+    const host = await hostIdentity();
+    const { child, id } = await stuckChild();
+    try {
+      await strayRecord(r, b.leaseId, 'task-1', { host, runner: id } as Partial<RunRecord>);
+      await acquireOwner(r.paths.state, b.leaseId, ownerToken(id, 'runner', host));
+      const p = reapRun(b.leaseId, r.reapDeps({ waitMs: 5_000, pollMs: 50 }));
+      await sleep(200);
+      const rec = (await readRunRecord(r.paths.state, b.leaseId))!;
+      writeFileSync(runRecordPath(r.paths.state, b.leaseId), JSON.stringify({ ...rec, phase: 'done', outcome: { status: 'partial', submitted: true, wipCommit: null, violations: [], head: null, reason: 'cancel' } }));
+      const reaped = await p;
+      expect(reaped).toMatchObject({ action: 'cancelled', killed: [] });
+      expect(child.exitCode).toBeNull();
+      expect(child.signalCode).toBeNull();
+    } finally { child.kill('SIGKILL'); }
+  });
+});
+
+describe('tester regressions: a refused reap keeps the lease', () => {
+  it('a release while another live reaper holds the lock is a CONFLICT: the lease stays active and the record is not done', async () => {
+    const r = rig();
+    const b = await claim(r);
+    await strayRecord(r, b.leaseId);
+    const me = (await procIdentity(process.pid))!;
+    await acquireOwner(r.paths.state, b.leaseId, ownerToken(me, 'reaper', await hostIdentity()));
+    const s = new Scheduler({ db: r.db, backlog: r.backlog, config: r.config, layout: r.layout, handoff: r.paths, phase, runs: { state: r.paths.state, reap: (id) => reapRun(id, r.reapDeps({ waitMs: 200 })) } });
+    expect((await err(s.release(b.leaseId, 'x'))).code).toBe('CONFLICT');
+    expect(r.db.lease(b.leaseId)?.status).toBe('active');
+    expect((await readRunRecord(r.paths.state, b.leaseId))?.phase).toBe('running');
+    expect(existsSync(runDir(r.paths.state, b.leaseId))).toBe(true);
+  });
+
+  it('a corrupt record refuses the release (fails closed) and keeps the lease active', async () => {
+    const r = rig();
+    const b = await claim(r);
+    await strayRecord(r, b.leaseId);
+    writeFileSync(runRecordPath(r.paths.state, b.leaseId), '{not json');
+    await expect(r.sched.release(b.leaseId, 'x')).rejects.toThrow();
+    expect(r.db.lease(b.leaseId)?.status).toBe('active');
+  });
+});
+
+describe('tester regressions: escapee sweep protection', () => {
+  it('never kills a sandboxed ancestor of the sweeper (e.g. a coordinator under another sandbox) nor PID 1', async () => {
+    const proc = fakeProc(makeDefaultEnv().root, [
+      { pid: 1, ppid: 0 },
+      { pid: 40, ppid: 1, filters: 2 }, // sandboxed grandparent of the sweeper
+      { pid: 45, ppid: 40, filters: 3 }, // sandboxed parent
+      { pid: 50, ppid: 45, filters: 3 }, // the sweeper itself
+      { pid: 60, ppid: 1, filters: 2 }, // a real escapee
+    ]);
+    const killed: number[] = [];
+    await sweepEscapees({ proc, self: 50, liveWrappers: [], kill: (pid) => killed.push(pid) });
+    expect(killed).toEqual([60]);
+  });
+
+  it('with PID 1 unreadable the baseline is the sweeper\'s own count, and PID 1 is still never signalled', async () => {
+    const proc = fakeProc(makeDefaultEnv().root, [{ pid: 1, ppid: 0, filters: 5 }, { pid: 50, ppid: 1 }, { pid: 70, ppid: 1, filters: 2 }]);
+    rmSync(join(proc, '1', 'status'));
+    const killed: number[] = [];
+    const r = await sweepEscapees({ proc, self: 50, liveWrappers: [], kill: (pid) => killed.push(pid) });
+    expect(r.baseline).toBe(1);
+    expect(killed).toEqual([70]);
   });
 });

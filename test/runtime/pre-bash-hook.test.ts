@@ -121,3 +121,61 @@ describe('the plugin hooks.json Bash entry', () => {
     expect(runHookCommand(command, echo, subCall).stderr).toBe(subCall);
   });
 });
+
+// ------------------------------------------------------------------------------- tester regressions (task-14.5 QA)
+
+describe('tester regressions: pre-bash bypass variants', () => {
+  it.each([
+    'command minions work claim t',
+    'env -i PATH=/usr/bin minions work claim t',
+    'exec minions work release lease-1',
+    'nohup minions work run lease-1 &',
+    'timeout 5 minions work run lease-1',
+    'sudo -u node minions work run lease-1',
+    'bash -lc "minions work claim t"',
+    'minions work -- run lease-1',
+    'minions\twork\trelease lease-1',
+    'cd /w && npm test && minions work release lease-1 --reason done',
+    'xargs -I{} minions work release {}',
+    "/opt/minions/pkg/node_modules/.bin/minions work 'claim' t",
+  ])('denies a subagent: %s', (cmd) => {
+    expect(decision(preBashHook(bash(cmd, sub)))?.permissionDecision).toBe('deny');
+  });
+
+  it('the coordinator (no agent_id) is never denied, whatever the command', () => {
+    for (const cmd of ['minions work run lease-1', 'minions work release lease-1 --reason x', 'minions work claim t']) {
+      expect(preBashHook(bash(cmd)).stdout).toBeUndefined();
+    }
+  });
+
+  it('a subagent\'s ordinary worker commands pass', () => {
+    for (const cmd of [
+      'cd /w && minions work brief lease-1 --role tester --json',
+      'minions work submit lease-1 --role tester --result-file /s/result.json',
+      'minions work submit lease-1 --role engineer --json <<\'RESULT\'\n{"status":"complete","summary":"ok"}\nRESULT',
+      'minions status --json',
+      'minions --help',
+    ]) expect(preBashHook(bash(cmd, sub)).stdout).toBeUndefined();
+  });
+
+  // Known gaps found in QA (task-14.5). `it.fails` passes while the gap exists; when the matcher is fixed these
+  // start failing: turn them into plain `it` cases then.
+  it.fails('KNOWN GAP: a line continuation (backslash-newline) between words is ordinary shell, but bypasses the check', () => {
+    expect(coordinatorOnlyWorkCommand('minions \\\nwork run lease-1')).not.toBeNull();
+  });
+  it.fails('KNOWN GAP: a redirection glued to a word (run>/dev/null, minions>log, run<in) bypasses the check', () => {
+    for (const cmd of ['minions work run>/dev/null lease-1', 'minions>/tmp/log work claim t', 'minions work release<in lease-1']) {
+      expect(coordinatorOnlyWorkCommand(cmd)).not.toBeNull();
+    }
+  });
+  it.fails('KNOWN GAP: the bin target run directly (node .../minions/pkg/dist/cli.js) bypasses the check', () => {
+    expect(coordinatorOnlyWorkCommand('node /opt/minions/pkg/dist/cli.js work release lease-1')).not.toBeNull();
+  });
+  it.fails('KNOWN GAP (false positive): a worker submit heredoc whose findings mention the command is denied', () => {
+    const cmd = 'minions work submit lease-1 --role tester --json <<\'RESULT\'\n{"findings":["repro: run minions work release lease-1 while a runner is live"]}\nRESULT';
+    expect(preBashHook(bash(cmd, sub)).stdout).toBeUndefined();
+  });
+  it.fails('KNOWN GAP (false positive): a commit message naming the command is denied', () => {
+    expect(preBashHook(bash('git commit -m "Add the process runner (minions work run) and the fake harness"', sub)).stdout).toBeUndefined();
+  });
+});
