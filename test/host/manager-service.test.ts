@@ -1,7 +1,7 @@
 // task-53.6 (docs/design/host-manager.md, phase 5): the manager's supervisor service (launchd agent / systemd --user
 // unit), the self-upgrade restart, the heartbeat, and the manager in `minions status` / `status --check`. Every
 // launchctl / systemctl / loginctl call goes to a fake runner; the "home" is a temp dir. Temp MINIONS_HOME.
-import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
@@ -199,6 +199,56 @@ describe('the service record is not trusted', () => {
     // A recorded path where nothing exists names nothing to delete; only this home's own unit name is used.
     writeFileSync(managerPaths().serviceJson, JSON.stringify({ version: 1, kind: 'systemd', name: unit, path: missing, sha256: 'x', installedAt: 'now' }));
     expect((await S.loadServiceRecord(h))!.path).toBe(missing);
+  });
+
+  it("a unit recorded outside this home is accepted only as the exact file setup wrote: symlinks, hash mismatches and odd names are refused", async () => {
+    const { sha256 } = await import('../../src/core/fsutil.js');
+    const h = host('linux', fakeRunner().runner);
+    const unit = S.serviceNames(h.env).unit;
+    const dir = join(env.root, 'elsewhere', 'systemd', 'user');
+    mkdirSync(dir, { recursive: true });
+    mkdirSync(managerPaths().dir, { recursive: true });
+    const rec = (name: string, path: string, sha: string) => writeFileSync(managerPaths().serviceJson, JSON.stringify({ version: 1, kind: 'systemd', name, path, sha256: sha, installedAt: 'now' }));
+    const body = '[Service]\nExecStart=/usr/bin/true\n';
+    const real = join(dir, unit);
+    writeFileSync(real, body);
+    rec(unit, real, sha256(body));
+    expect((await S.loadServiceRecord(h))!.path).toBe(real);
+    rec(unit, real, 'deadbeef');
+    await expect(S.loadServiceRecord(h)).rejects.toThrow(/does not name/);
+    // symlink (to a file with a matching hash, and dangling)
+    const target = join(env.root, 'target.service');
+    writeFileSync(target, body);
+    const link = join(env.root, 'link', 'systemd', 'user');
+    mkdirSync(link, { recursive: true });
+    symlinkSync(target, join(link, unit));
+    rec(unit, join(link, unit), sha256(body));
+    await expect(S.loadServiceRecord(h)).rejects.toThrow(/does not name/);
+    const dangling = join(env.root, 'd', 'systemd', 'user');
+    mkdirSync(dangling, { recursive: true });
+    symlinkSync(join(env.root, 'nowhere'), join(dangling, unit));
+    rec(unit, join(dangling, unit), sha256(body));
+    await expect(S.loadServiceRecord(h)).rejects.toThrow(/does not name/);
+    // a directory at the path, traversal, a different filename or a relative path
+    mkdirSync(join(env.root, 'dd', 'systemd', 'user', unit), { recursive: true });
+    rec(unit, join(env.root, 'dd', 'systemd', 'user', unit), sha256(body));
+    await expect(S.loadServiceRecord(h)).rejects.toThrow(/does not name/);
+    rec(unit, `${dir}/../../../x/systemd/user/${unit}`, sha256(body));
+    await expect(S.loadServiceRecord(h)).rejects.toThrow(/does not name/);
+    rec(unit, join(dir, 'other.service'), sha256(body));
+    await expect(S.loadServiceRecord(h)).rejects.toThrow(/does not name/);
+    rec(unit, `systemd/user/${unit}`, sha256(body));
+    await expect(S.loadServiceRecord(h)).rejects.toThrow(/does not name/);
+    // refused records never make remove touch the named file, nor the symlink target
+    for (const p of [join(link, unit), real]) {
+      rec(unit, p, 'deadbeef');
+      const f = fakeRunner();
+      await S.removeManagerService(host('linux', f.runner));
+      expect(f.calls.every((c) => !c.includes(p))).toBe(true);
+    }
+    expect(readFileSync(target, 'utf8')).toBe(body);
+    expect(readFileSync(real, 'utf8')).toBe(body);
+    expect(existsSync(join(link, unit))).toBe(true);
   });
 
   it("the default home's unit (or another home's) is refused while a custom MINIONS_HOME is in use", async () => {
