@@ -22,13 +22,18 @@
 //   (or, with merge, merge) approval for exactly (task, full head SHA). Its plan always loosens (so the chat asks
 //   twice), the host manager applies it in-process through approveOnHost (src/host/approvals.ts: the host key signs,
 //   the runtime's `work approve` checks the head and records the token), and it can never be undone.
+// - task-53.7 adds three owner-only shapes: a restart with `mode` when-idle or drain (the follow-ups the host manager
+//   offers when a restart is refused because workers are active; queued in the manager), `cli-rollback` (reinstall
+//   the CLI backup after a failed CLI check, src/host/cli-backup.ts) and the dev-only `rebuild-cli`
+//   (`minions upgrade --rebuild-cli` with the commit range in the plan, src/host/cli-rebuild.ts). None of them is
+//   confirmed in the terminal: `settings apply --confirm` refuses them.
 import { spawn } from 'node:child_process';
 import type { Command } from 'commander';
 import { isGithubDelivery } from '../config/delivery.js';
 import { action, globalOpts, requireMode, runtimeMode } from '../core/cli-helpers.js';
 import { displayText } from '../core/control-chars.js';
 import { MinionsError, type ErrorCode } from '../core/errors.js';
-import { sha256 } from '../core/fsutil.js';
+import { sha256, sha256File } from '../core/fsutil.js';
 import { emit } from '../core/output.js';
 import type { ChangeRequestKind } from '../runtime/db.js';
 import {
@@ -38,6 +43,8 @@ import { inMinionsContainer } from '../runtime/paths.js';
 import {
   assertOfferOpen, consumeOffer, findOffer, isOwnerRequest, isOwnerRequestId, readJournal, recordOffer, recordOutcome, type OfferEntry, type RequestSnapshot,
 } from './change-journal.js';
+import { findCliBackup } from './cli-backup.js';
+import { rebuildRange, type CliDevDeps } from './cli-rebuild.js';
 import { applyUndo, beginHistory, checkUndo, completeHistory, strongestEffect, undoDiff, validateRestore } from './config-history.js';
 import { packageRoot } from './docker.js';
 import { loadEffectiveConfig, loadProjectJson, type ProjectJson } from './project.js';
@@ -50,8 +57,13 @@ import { formatValue, loadSettingsContext, parseSettingValue, planSetting, requi
 
 // ---------------------------------------------------------------- plan and digest
 
-/** The kinds of a plan: the container's request kinds, plus the owner-only sync, undo and approve. */
-export type PlanKind = ChangeRequestKind | 'sync' | 'undo' | 'approve';
+/** The kinds of a plan: the container's request kinds, plus the owner-only sync, undo, approve, rebuild-cli and cli-rollback. */
+export type PlanKind = ChangeRequestKind | 'sync' | 'undo' | 'approve' | 'rebuild-cli' | 'cli-rollback';
+/** Kinds only the owner (or the host manager on the owner's behalf) may request; a container request is refused. */
+export const OWNER_ONLY_KINDS: readonly string[] = ['sync', 'undo', 'approve', 'rebuild-cli', 'cli-rollback'];
+/** A restart queued in the host manager: run at the first poll without active leases; drain asks the workers to wind down first. */
+export type RestartMode = 'when-idle' | 'drain';
+export const RESTART_MODES: readonly string[] = ['when-idle', 'drain'];
 
 /** Task ids an approval may name (the backlog's `task-<n>[.<n>...]`). */
 export const APPROVE_TASK_ID_PATTERN = /^task-\d+(?:\.\d+)*$/;
@@ -75,6 +87,12 @@ export interface ChangePlan {
   undo?: { target: string; expectSha256: string; restoreSha256: string; changes: { key: string; from: unknown; to: unknown; class: string }[] };
   /** approve: the task, the exact full head SHA and the scope the host signs. */
   approval?: { taskId: string; head: string; scope: ApprovalPlanScope };
+  /** restart queued in the host manager (absent: the plain graceful restart, so older digests stay valid). */
+  restart?: { mode: RestartMode };
+  /** rebuild-cli: the commit range the build takes (all of it is digested: a moved HEAD refuses the confirmation). */
+  rebuild?: { checkout: string; from: string; to: string; count: number; commits: string[]; diffstat: string[]; sensitive: string[]; builtDirty: boolean };
+  /** cli-rollback: the backup to reinstall and its sha256 (refused at apply time if the file changed). */
+  rollback?: { name: string; file: string; version: string; sha256: string };
   /** The effective configRevision the plan was computed against. */
   configRevision: number;
   /** The request's reason as shown to the owner: quoted, control characters stripped, cut to 300 characters. */
@@ -113,8 +131,10 @@ export interface ChangeRequestDeps {
    * Runs `minions upgrade [--from-container [branch]] [--dry-run]` for the project as a child process; with syncOnly,
    * `minions upgrade --sync-only` (the source sync only: export and strict fast-forward, or origin with GitHub delivery).
    */
-  upgrade: (project: ProjectJson, o: { fromContainer: string | true | null; dryRun: boolean; syncOnly?: boolean }) => Promise<UpgradeRun>;
+  upgrade: (project: ProjectJson, o: { fromContainer: string | true | null; dryRun: boolean; syncOnly?: boolean; rebuildCli?: boolean }) => Promise<UpgradeRun>;
   now?: () => Date;
+  /** The running CLI's root and a git runner for the dev-only rebuild-cli plan (defaults: packageRoot(), run). */
+  cli?: CliDevDeps;
 }
 
 const q = (s: string) => (/^[A-Za-z0-9._,:/=@+-]+$/.test(s) ? s : `'${s.replace(/'/g, `'\\''`)}'`);
@@ -136,6 +156,8 @@ export function planArgv(plan: Pick<ChangePlan, 'kind' | 'change' | 'configRevis
     return ['settings', 'set', c.key, String(req.payload.value), ...(c.layer === 'shared' ? ['--shared'] : []), '--yes', '--no-restart', '--expect-revision', String(plan.configRevision)];
   }
   if (plan.kind === 'restart') return ['settings', 'restart'];
+  if (plan.kind === 'rebuild-cli') return ['upgrade', '--rebuild-cli'];
+  if (plan.kind === 'cli-rollback') throw new MinionsError('INTERNAL', 'a CLI roll back runs in the host manager, not as a child command.');
   if (plan.kind === 'upgrade') {
     const fc = fromContainerOf(req.payload);
     return ['upgrade', ...(fc === true ? ['--from-container'] : fc ? ['--from-container', fc] : [])];
@@ -158,6 +180,18 @@ export const snapshotOf = (v: Pick<ChangeRequestView, 'id' | 'kind' | 'payload' 
  * journal lock and hands the result to buildPlan (task-53.11).
  */
 export async function upgradeDryRun(project: ProjectJson, req: RequestSnapshot, deps: Pick<ChangeRequestDeps, 'upgrade'>): Promise<UpgradeRun> {
+  if (req.kind === 'rebuild-cli') {
+    const dry = await deps.upgrade(project, { fromContainer: null, dryRun: true, rebuildCli: true });
+    if (!dry.ok) {
+      throw new MinionsError('PRECONDITION', `Request ${req.id}: \`minions upgrade --rebuild-cli --dry-run\` reports that the upgrade would fail: ${dry.summary}`,
+        'Fix that first (run `minions upgrade --rebuild-cli --dry-run` for the details), then send /rebuild_cli again.');
+    }
+    const cli = dry.steps.find((x) => x.id === 'cli');
+    if (!cli || cli.status !== 'planned') {
+      throw new MinionsError('PRECONDITION', `Request ${req.id}: nothing to rebuild: ${displayText(cli?.detail ?? 'the dry run plans no CLI step')}.`, 'Send /upgrade for the container steps.');
+    }
+    return dry;
+  }
   if (req.kind === 'sync') {
     const dry = await deps.upgrade(project, { fromContainer: null, dryRun: true, syncOnly: true });
     if (!dry.ok) {
@@ -188,7 +222,7 @@ async function assertUpgradeDelivery(project: ProjectJson, req: RequestSnapshot,
  */
 export async function buildPlan(project: ProjectJson, req: RequestSnapshot, deps: ChangeRequestDeps, pre: { dry?: UpgradeRun } = {}): Promise<{ plan: ChangePlan; notes: string[] }> {
   const owner = isOwnerRequest(req);
-  if (!owner && (req.kind === 'sync' || req.kind === 'undo' || req.kind === 'approve' || req.origin !== undefined || isOwnerRequestId(req.id))) {
+  if (!owner && (OWNER_ONLY_KINDS.includes(req.kind) || req.origin !== undefined || isOwnerRequestId(req.id))) {
     throw new MinionsError('PRECONDITION', `Change request ${displayText(req.id)}: kind "${displayText(String(req.kind))}" comes only from the owner in the manager chat; nothing to apply.`);
   }
   const base = { requestId: req.id, projectId: project.projectId, reason: quotedReason(req.reason), change: null, loosens: null, upgradeSteps: null, ...(owner ? { origin: 'owner' as const } : {}) };
@@ -221,6 +255,25 @@ export async function buildPlan(project: ProjectJson, req: RequestSnapshot, deps
     };
   }
   const configRevision = (await loadEffectiveConfig(project)).config.configRevision;
+  if (req.kind === 'restart' && req.payload.mode !== undefined) {
+    const mode = req.payload.mode;
+    if (!owner || typeof mode !== 'string' || !RESTART_MODES.includes(mode)) {
+      throw new MinionsError('PRECONDITION', `Request ${displayText(req.id)}: malformed restart payload; nothing to apply.`);
+    }
+    const restart = stepText(planArgv({ kind: 'restart', change: null, configRevision }, req));
+    return {
+      plan: {
+        ...base, kind: 'restart', configRevision, restart: { mode: mode as RestartMode },
+        interrupts: mode === 'drain'
+          ? 'starts are paused and the active workers are asked to wind down now (they commit wip: and hand back; recovery re-dispatches their tasks); the coordinator restarts at the first idle poll'
+          : 'the coordinator session restarts at the first host manager poll (every 20 s) that finds no active worker leases; running workers are never interrupted',
+        steps: mode === 'drain'
+          ? ['minions pause --starts --drain --reason restart (in the runtime, now)', `at the first idle poll: minions resume --starts (only a pause made here), then ${restart}`]
+          : [`queue in the host manager; at the first idle poll: ${restart}`],
+      },
+      notes: ['the queue lives in the host manager: if the manager stops before the restart ran, it is reported as interrupted and not resumed'],
+    };
+  }
   if (req.kind === 'restart') {
     return {
       plan: { ...base, kind: 'restart', configRevision, interrupts: 'the coordinator session restarts (graceful: refused while worker leases are active; running workers are never interrupted)', steps: [stepText(planArgv({ kind: 'restart', change: null, configRevision }, req))] },
@@ -235,6 +288,25 @@ export async function buildPlan(project: ProjectJson, req: RequestSnapshot, deps
     };
   }
   if (req.kind === 'undo') return planUndo(project, req, base, configRevision);
+  if (req.kind === 'cli-rollback') return planRollback(req, base, configRevision);
+  if (req.kind === 'rebuild-cli') {
+    const range = await rebuildRange(project, deps.cli);
+    const dry = pre.dry ?? await upgradeDryRun(project, req, deps);
+    const n = range.count;
+    const touched = range.sensitive.length;
+    return {
+      plan: {
+        ...base, kind: 'rebuild-cli', configRevision, rebuild: range, upgradeSteps: dry.steps.map((x) => x.id),
+        steps: [stepText(planArgv({ kind: 'rebuild-cli', change: null, configRevision }, req))],
+        loosens: `runs build scripts from ${n} commit${n === 1 ? '' : 's'} made in the container on your host (npm scripts, esbuild config, lockfile dependencies) and installs the result as the global CLI${touched ? `; the range touches ${touched} sensitive path${touched === 1 ? '' : 's'}` : ''}`,
+        interrupts: 'rebuilds or reinstalls the host CLI (a packed install is backed up first), then pauses starts and drains active workers, recreates the container and restarts the coordinator',
+      },
+      notes: [
+        ...(range.builtDirty ? [`the running CLI was built from ${range.from.slice(0, 12)} with uncommitted changes; the range starts there`] : []),
+        ...dry.steps.map((x) => `${x.id}: ${x.detail}`),
+      ],
+    };
+  }
   if (req.kind === 'approve') return planApprove(req, base, configRevision);
   if (req.kind === 'upgrade') {
     let dry = pre.dry;
@@ -283,6 +355,27 @@ function planApprove(req: RequestSnapshot, base: Omit<ChangePlan, 'kind' | 'conf
 }
 
 /**
+ * Reinstalling the CLI backup (offered by the host manager after a failed CLI check). The backup is named by the
+ * payload and must be a regular file in <MINIONS_HOME>/manager/cli-backup/; its sha256 goes into the plan and is
+ * checked again right before `npm install -g`.
+ */
+async function planRollback(req: RequestSnapshot, base: Omit<ChangePlan, 'kind' | 'configRevision' | 'interrupts' | 'steps'>, configRevision: number): Promise<{ plan: ChangePlan; notes: string[] }> {
+  const name = req.payload.backup;
+  const b = typeof name === 'string' ? await findCliBackup(name) : null;
+  if (!b) throw new MinionsError('PRECONDITION', `Request ${displayText(req.id)}: no such CLI backup; nothing to roll back to.`, 'Backups are kept in <MINIONS_HOME>/manager/cli-backup/ (the last 2).');
+  const sha = await sha256File(b.file);
+  return {
+    plan: {
+      ...base, kind: 'cli-rollback', configRevision,
+      rollback: { name: b.name, file: b.file, version: b.version, sha256: sha },
+      interrupts: 'replaces the global minions CLI with the backup; the running host manager keeps its code until it restarts',
+      steps: [`npm install -g --no-audit --no-fund ${q(b.file)} (in the host manager; refused unless the backup still has sha256 ${sha.slice(0, 12)})`, 'then the check again: minions --version and minions status'],
+    },
+    notes: [`the backup of minions ${b.version} was kept at ${b.stamp}`],
+  };
+}
+
+/**
  * The undo of a config change applied by the host manager: restore the file text before it (compare-and-swap). The
  * history entry is not trusted: the file comes from the project and the entry's layer, and the plan lists every
  * setting the restore changes (the loosening check runs over all of them); anything else changing refuses.
@@ -321,6 +414,16 @@ export function formatPlan(plan: ChangePlan, digest: string, notes: string[]): s
     owner ? 'requested by you in the manager chat (typing the command is not consent: confirm this exact plan)' : `reason (from the container, untrusted): ${plan.reason}`,
     ...(plan.undo ? [`undoes: ${plan.undo.target}`] : []),
     ...(plan.approval ? [`approves: ${plan.approval.taskId} at head ${plan.approval.head}`, `scope: ${approvalScopeText(plan.approval.scope)}`] : []),
+    ...(plan.restart ? [`restart: ${plan.restart.mode === 'drain' ? 'drain now, then restart when idle' : 'restart when idle (queued)'}`] : []),
+    ...(plan.rollback ? [`rolls the CLI back to: minions ${plan.rollback.version} (${plan.rollback.file}, sha256 ${plan.rollback.sha256})`] : []),
+    ...(plan.rebuild ? [
+      `builds: ${plan.rebuild.checkout} at ${plan.rebuild.to} (the running CLI was built from ${plan.rebuild.from})`,
+      `commits (git log --oneline ${plan.rebuild.from.slice(0, 12)}..${plan.rebuild.to.slice(0, 12)}): ${plan.rebuild.count}`,
+      ...plan.rebuild.commits.map((c) => `  ${c}`),
+      ...(plan.rebuild.count > plan.rebuild.commits.length ? [`  ... (${plan.rebuild.count - plan.rebuild.commits.length} more)`] : []),
+      'diffstat:', ...(plan.rebuild.diffstat.length ? plan.rebuild.diffstat.map((l) => `  ${l.trim()}`) : ['  (no changes)']),
+      plan.rebuild.sensitive.length ? `SENSITIVE PATHS TOUCHED: ${plan.rebuild.sensitive.join(', ')}` : 'sensitive paths touched: none',
+    ] : []),
     ...(plan.undo && plan.undo.changes.length > 1
       ? plan.undo.changes.map((c) => `change: ${c.key}: ${formatValue(c.from)} -> ${formatValue(c.to)} (${plan.change?.layer ?? ''} layer, ${plan.change?.file ?? ''}; class ${c.class})`)
       : plan.change ? [`change: ${plan.change.key}: ${formatValue(plan.change.from)} -> ${formatValue(plan.change.to)} (${plan.change.layer} layer, ${plan.change.file}; class ${plan.change.class})`] : []),
@@ -461,7 +564,7 @@ export async function confirmOffer(project: ProjectJson, offer: OfferEntry, deps
     }
   };
   let pre: { dry?: UpgradeRun } = {};
-  if (offer.request.kind === 'upgrade' || offer.request.kind === 'sync') {
+  if (offer.request.kind === 'upgrade' || offer.request.kind === 'sync' || offer.request.kind === 'rebuild-cli') {
     // Outside the lock: refuse early what would be refused anyway, then the slow dry run.
     assertOfferOpen(await readJournal(), offer);
     assertUnexpired();
@@ -499,6 +602,10 @@ async function execute(project: ProjectJson, plan: ChangePlan, offer: OfferEntry
     out.nextSteps.push(...r.nextSteps);
     if (r.restart?.action === 'offered') out.nextSteps.push(r.restart.detail);
     return;
+  }
+  if (plan.kind === 'rebuild-cli' || plan.kind === 'cli-rollback' || plan.restart) {
+    throw new MinionsError('PRECONDITION', `Request ${plan.requestId}: a ${plan.restart ? `queued restart (${plan.restart.mode})` : plan.kind} plan runs only in the host manager; nothing applied.`,
+      plan.kind === 'rebuild-cli' ? 'Tap Confirm in the manager chat, or run `minions upgrade --rebuild-cli` on the host.' : 'Tap Confirm in the manager chat.');
   }
   if (plan.kind === 'restart') {
     const r = await restartCoordinator(project, deps.runtime);
@@ -645,7 +752,7 @@ export function hostCli(): { cmd: string; args: string[]; env: NodeJS.ProcessEnv
 export const childUpgrade: ChangeRequestDeps['upgrade'] = (project, o) => new Promise((resolve) => {
   const flag = o.fromContainer === true ? ['--from-container'] : o.fromContainer ? ['--from-container', o.fromContainer] : [];
   const host = hostCli();
-  const child = spawn(host.cmd, [...host.args, '--json', 'upgrade', ...flag, ...(o.syncOnly ? ['--sync-only'] : []), ...(o.dryRun ? ['--dry-run'] : [])],
+  const child = spawn(host.cmd, [...host.args, '--json', 'upgrade', ...flag, ...(o.syncOnly ? ['--sync-only'] : []), ...(o.rebuildCli ? ['--rebuild-cli'] : []), ...(o.dryRun ? ['--dry-run'] : [])],
     { cwd: project.repoPath, env: host.env, stdio: ['ignore', 'pipe', 'inherit'] });
   let stdout = '';
   child.stdout.setEncoding('utf8').on('data', (d: string) => { stdout += d; });
