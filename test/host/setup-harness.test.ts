@@ -94,7 +94,8 @@ describe('setup: which agent does the work', () => {
 
     const s = step(r, 'harness');
     expect(s).toMatchObject({ status: 'done', detail: expect.stringMatching(/^harnesses\.default codex \(model gpt-pilot\); codex-reviewer runs after the reviewer in workflow default; OpenAI API key stored in/) });
-    expect(s.lines!.join('\n')).toMatch(/Codex CLI must be installed in the runtime image/);
+    expect(s.lines!.join('\n')).toMatch(/runtime image ships the pinned Codex CLI/);
+    expect(s.lines!.join('\n')).not.toMatch(/must be installed|does not include/);
     expect(s.lines!.join('\n')).toMatch(/workflows\.default is now written out/);
     expect(await readCodexKey(r.projectId)).toBe(OPENAI_KEY);
     expect(JSON.stringify(r) + formatSetup(r) + a.info.join('\n')).not.toContain(OPENAI_KEY);

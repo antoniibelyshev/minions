@@ -1164,8 +1164,8 @@ worker; needs `codex` on PATH and `CODEX_API_KEY`; model from `MINIONS_LIVE_CODE
   the file in the secrets mount is readable by Claude workers in the container; only process workers are kept out
   of it, by L1.
 
-**Pinned install: pending owner approval.** The Dockerfile is not changed by this task (infrastructure change). The
-proposal: add `ARG CODEX_VERSION=0.164.0` and install `"@openai/codex@${CODEX_VERSION}"` in the same `npm install -g`
+**Pinned install: approved and done in task-14.15** (owner, 2026-10-26), exactly as proposed below. The Dockerfile was
+not changed by this task (infrastructure change). The proposal: add `ARG CODEX_VERSION=0.164.0` and install `"@openai/codex@${CODEX_VERSION}"` in the same `npm install -g`
 line as `@anthropic-ai/claude-code`, and set `ENV MINIONS_CODEX_VERSION=${CODEX_VERSION}` so `work probe` checks the
 pin. The source fingerprint already covers the Dockerfile, so the change rebuilds the image. Integrity of
 `@openai/codex@0.164.0`: `sha512-TWj7UGyPRe3Pj/A3ddNAxs1te3a/W/xAd+J0LHrrFTmsSfahGMOLF/vn88D3QCIgAT3B1rm1y/Z3NYE0rx6cZQ==`
@@ -1216,7 +1216,9 @@ Setup, settings and coordinator guidance. Code: `src/host/harness-setup.ts` (the
   `work release`.
 - **Install.** The Dockerfile is unchanged (owner approval pending, see the task-14.6 addendum). Setup, README and
   `docs/cli.md` say the `codex` CLI must be installed in the runtime image; without it a run ends with a synthesized
-  `blocked` result.
+  `blocked` result. Superseded by task-14.15: the image now ships `@openai/codex@0.164.0` (`ARG CODEX_VERSION`,
+  `ENV MINIONS_CODEX_VERSION`), and setup, README and `docs/cli.md` say so; a missing or mismatched binary still ends
+  a run with a synthesized `blocked` result.
 - **Role proposals** already accept `harness` on a project role (task-14.2 plumbing; covered by
   `test/runtime/harness-runtime.test.ts`); nothing changed there.
 
