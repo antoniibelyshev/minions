@@ -250,3 +250,64 @@ describe('coordinatorOnlyWorkCommand: command position, not raw text', () => {
     expect(coordinatorOnlyWorkCommand(deep)).toBe('minions work release');
   });
 });
+
+// Tester re-test (task-14.5 attempt 2) of the shell scanner. Normal worker commands stay allowed; wrapped,
+// substituted and heredoc-fed forms are denied. `it.fails` marks scanner gaps found in this pass: each passes while
+// the gap exists and starts failing once it is fixed (turn it into a plain `it` then).
+describe('tester re-test: shell scanner edge cases', () => {
+  it.each([
+    "minions work submit lease-1 --role tester --result-file /scratch/result.json",
+    "cd /w && minions work brief lease-1 --role tester --json",
+    'minions work submit lease-1 --role tester --json <<RESULT\n{"findings":["run minions work release lease-1"]}\nRESULT',
+    'git commit -m "$(cat <<\'EOF\'\nmention minions work release here\nEOF\n)"',
+    'git commit -F - <<EOF\nminions work claim stuff\nEOF',
+    'grep -rn "minions work run" docs | head',
+    "rg 'minions work (run|claim|release)' src",
+    'timeout 60 npm test -- -t "minions work run"',
+    'npx vitest run test/runtime/pre-bash-hook.test.ts -t "denies minions work release"',
+    "sed -i 's/minions work run/x/' notes.md",
+    'git grep -n "cli.js work run"',
+    'git commit -m "unbalanced',
+    'minions work cancel lease-1',
+  ])('allows %j', (cmd) => {
+    expect(coordinatorOnlyWorkCommand(cmd)).toBeNull();
+  });
+
+  it.each([
+    'cat <<EOF; minions work run l\nbody\nEOF',
+    'cat <<-EOF\n\tbody\n\tEOF\nminions work run l',
+    'cat <<EOF\n$(minions work run l)\nEOF',
+    'echo "${x:-$(minions work run l)}"',
+    'cat <(minions work claim t)',
+    'minions work run l<<<x',
+    'minions 2>&1 work run l',
+    'minions work 2>/dev/null run l',
+    'xargs minions work release <<< l',
+    'f() { minions work run l; }; f',
+    'case x in x) minions work run l;; esac',
+    'for i in 1; do minions work run l; done',
+    '/bin/bash -lc "minions work release l"',
+    'su -c "minions work run l"',
+    'node dist/cli.mjs work run l',
+    'minions\twork\trun l',
+    'git commit -m "minions work run',
+  ])('denies %j', (cmd) => {
+    expect(coordinatorOnlyWorkCommand(cmd)).toMatch(/^minions work (run|claim|release)$/);
+  });
+
+  it.fails('KNOWN GAP: an arithmetic shift (<<) is read as a heredoc and hides the following lines', () => {
+    // bash runs `(( … << … ))` and `$(( … << … ))` as arithmetic, then the next line; the scanner skips it as a body.
+    expect(coordinatorOnlyWorkCommand('(( x = 1 << 2 ))\nminions work run l')).toBe('minions work run');
+    expect(coordinatorOnlyWorkCommand('echo $(( 1 << 2 ))\nminions work run l')).toBe('minions work run');
+    expect(coordinatorOnlyWorkCommand('x=$((1<<2))\nminions work release l')).toBe('minions work release');
+  });
+
+  it.fails('KNOWN GAP: a `function name { … }` definition body is not in command position', () => {
+    expect(coordinatorOnlyWorkCommand('function f { minions work run l; }; f')).toBe('minions work run');
+  });
+
+  it.fails('KNOWN GAP: a script fed to a shell on stdin (heredoc or pipe) is not scanned', () => {
+    expect(coordinatorOnlyWorkCommand('bash <<EOF\nminions work run l\nEOF')).toBe('minions work run');
+    expect(coordinatorOnlyWorkCommand('echo minions work run l | bash')).toBe('minions work run');
+  });
+});
