@@ -324,7 +324,9 @@ checks. The Bot API transport, the commands and `/approve` are task-53.5.2 to ta
   `minions.manager`, account `manager`. The Secret Service item has the same attributes. Store selection is the same
   as for the other kinds (the file store whenever a host-runtime project exists).
 - **Not a project credential.** The kind is not a `CredentialKind` and is not in `CREDENTIAL_KINDS`, so
-  `materializeSecrets`, `clearSecrets` and the Keychain-to-file move never see it. The type system keeps it out of
+  `materializeSecrets` and `clearSecrets` never see it. The Keychain-to-file move (`moveKeychainTokensToFileStore`)
+  handles it separately from that reference file, so a host-runtime project also moves it to the file store. The
+  type system keeps it out of
   `readToken` / `materializeSecrets`. Its non-secret reference (backend, locator, bot id) is
   `<MINIONS_HOME>/manager/credential.json` (0600), never a project's `credentials.json`. `readManagerToken` refuses a
   stored value whose bot id differs from that reference, so the guard cannot be bypassed by swapping the stored token.

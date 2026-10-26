@@ -379,12 +379,14 @@ export async function selectStore(opts: StoreOptions = {}): Promise<SecretStore>
 export const storeFor = (backend: Backend, runner: Runner, kind: StoreKind = GITHUB_CREDENTIAL): SecretStore =>
   (backend === 'keychain' ? new KeychainStore(runner, kind) : backend === 'secret-service' ? new SecretServiceStore(runner, kind) : new FileStore(kind));
 
-export interface MovedToken { projectId: string; kind: CredentialKind['name'] }
+/** A moved token: a project's (projectId set) or the host-wide manager bot token (projectId null). */
+export type MovedToken = { projectId: string; kind: CredentialKind['name'] } | { projectId: null; kind: typeof MANAGER_CREDENTIAL.name };
 
 /**
- * Host runtime: moves every registered project's tokens from the macOS Keychain or the Secret Service keyring to the 0600 file store
- * (read from Keychain, written to the file store, reference updated, Keychain item deleted). A token
- * that cannot be read (locked keychain, denied prompt) stays where it is and yields a warning.
+ * Host runtime: moves every registered project's tokens, and the host-wide manager bot token, from the macOS Keychain
+ * or the Secret Service keyring to the 0600 file store (read from Keychain, written to the file store, reference
+ * updated, Keychain item deleted). A token that cannot be read (locked keychain, denied prompt) stays where it is and
+ * yields a warning.
  */
 export async function moveKeychainTokensToFileStore(runner: Runner = run): Promise<{ moved: MovedToken[]; warnings: string[] }> {
   const moved: MovedToken[] = [];
@@ -409,6 +411,27 @@ export async function moveKeychainTokensToFileStore(runner: Runner = run): Promi
       } catch (e) {
         warnings.push(`The ${kind.label} of project ${projectId} is still in ${backendLabel(ref.backend)} (${redact((e as Error).message).split('\n')[0]}); agents of a host-runtime project could read it with ${ref.backend === 'keychain' ? '/usr/bin/security' : 'secret-tool'}. Re-provision it with \`${kind.command}\`.`);
       }
+    }
+  }
+  // The manager bot token: its reference is <MINIONS_HOME>/manager/credential.json, not a project's credentials.json.
+  const mgr = await loadManagerCredentialRef().catch(() => null);
+  if (mgr && mgr.backend !== 'file') {
+    try {
+      const keychain = storeFor(mgr.backend, runner, MANAGER_CREDENTIAL);
+      const token = await keychain.get(MANAGER_ACCOUNT);
+      if (token) {
+        const file = new FileStore(MANAGER_CREDENTIAL);
+        await file.set(MANAGER_ACCOUNT, token);
+        const cur = await loadManagerCredentialRef();
+        if (cur) {
+          const ref: ManagerCredentialRef = { ...cur, backend: 'file', ref: file.ref(MANAGER_ACCOUNT), updatedAt: new Date().toISOString() };
+          await writeJson(managerPaths().credentialJson, ref, { mode: 0o600 });
+        }
+        await keychain.delete(MANAGER_ACCOUNT);
+        moved.push({ projectId: null, kind: MANAGER_CREDENTIAL.name });
+      }
+    } catch (e) {
+      warnings.push(`The host manager bot token is still in ${backendLabel(mgr.backend)} (${redact((e as Error).message).split('\n')[0]}); agents of a host-runtime project could read it with ${mgr.backend === 'keychain' ? '/usr/bin/security' : 'secret-tool'}. Store it again with \`${MANAGER_CREDENTIAL.command}\`.`);
     }
   }
   return { moved, warnings };
@@ -650,8 +673,9 @@ export const removeTelegramToken = (projectId: string, runner: Runner = run) => 
 //
 // One token per host (MANAGER_CREDENTIAL, store account "manager"). Its non-secret reference lives in
 // <MINIONS_HOME>/manager/credential.json (0600: backend, locator, bot id), never in a project's credentials.json,
-// so materializeSecrets / clearSecrets / moveKeychainTokensToFileStore never see it. Entry, the bot-id guard
-// and pairing are in src/host/manager-bot.ts and src/host/bot-guard.ts.
+// so materializeSecrets / clearSecrets never see it. moveKeychainTokensToFileStore reads that file separately to move
+// it to the file store under the host runtime. Entry, the bot-id guard and pairing are in src/host/manager-bot.ts and
+// src/host/bot-guard.ts.
 
 export const ManagerCredentialRefSchema = z.object({
   version: z.literal(1),

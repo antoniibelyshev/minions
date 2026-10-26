@@ -17,7 +17,7 @@ vi.mock('../../src/plugin/generate.js', async () => {
 });
 
 const C = await import('../../src/host/credentials.js');
-const { CONTAINER, GITHUB_TOKEN_CONTAINER_PATH, credentialStoreDir, projectPaths } = await import('../../src/core/paths.js');
+const { CONTAINER, GITHUB_TOKEN_CONTAINER_PATH, credentialStoreDir, managerPaths, projectPaths } = await import('../../src/core/paths.js');
 const { composeYaml } = await import('../../src/host/docker.js');
 const { runInit, formatInit } = await import('../../src/host/install.js');
 const { runDoctor, formatDoctor } = await import('../../src/host/doctor.js');
@@ -353,6 +353,42 @@ describe('secret service store (Linux, secret-tool)', () => {
     expect((await C.loadCredentialRefs(pid)).github?.backend).toBe('file');
     expect(items.size).toBe(0);
     expect(mode(new C.FileStore().path(pid))).toBe(0o600);
+  });
+
+  const MGR = '555666777:MMHmanagermanagermanagermanager_-9876';
+  it('host runtime: moveKeychainTokensToFileStore moves a keyring-stored manager bot token to the file store', async () => {
+    const { runner, items, calls } = fakeSecretTool();
+    await C.storeManagerToken(MGR, { runner, env: DBUS, platform: 'linux', hostRuntime: false });
+    expect((await C.loadManagerCredentialRef())?.backend).toBe('secret-service');
+    expect(items.get('minions.manager/manager')).toBe(MGR);
+    const moved = await C.moveKeychainTokensToFileStore(runner);
+    expect(moved).toEqual({ moved: [{ projectId: null, kind: 'manager-bot-token' }], warnings: [] });
+    const ref = await C.loadManagerCredentialRef();
+    const file = new C.FileStore(C.MANAGER_CREDENTIAL);
+    expect(ref).toMatchObject({ backend: 'file', ref: file.ref(C.MANAGER_ACCOUNT), botId: '555666777' });
+    expect(mode(managerPaths().credentialJson)).toBe(0o600);
+    expect(mode(file.path(C.MANAGER_ACCOUNT))).toBe(0o600);
+    expect(items.size).toBe(0);
+    expect(await C.readManagerToken(runner)).toBe(MGR);
+    for (const c of calls) expect(c.args.join(' ')).not.toContain(MGR);
+    // Already in the file store: nothing more to move.
+    expect(await C.moveKeychainTokensToFileStore(runner)).toEqual({ moved: [], warnings: [] });
+  });
+
+  it('host runtime: a manager bot token that cannot be read stays where it is and yields a warning', async () => {
+    const { runner } = fakeSecretTool();
+    await C.storeManagerToken(MGR, { runner, env: DBUS, platform: 'linux', hostRuntime: false });
+    const before = readFileSync(managerPaths().credentialJson, 'utf8');
+    const locked = fakeSecretTool({ broken: 'secret-tool: Cannot autolaunch D-Bus without X11 $DISPLAY' });
+    const r = await C.moveKeychainTokensToFileStore(locked.runner);
+    expect(r.moved).toEqual([]);
+    expect(r.warnings).toHaveLength(1);
+    expect(r.warnings[0]).toMatch(/manager bot token is still in the Secret Service keyring/);
+    expect(r.warnings[0]).toContain('`minions setup`');
+    expect(r.warnings[0]).not.toContain(MGR);
+    expect(readFileSync(managerPaths().credentialJson, 'utf8')).toBe(before);
+    expect(existsSync(new C.FileStore(C.MANAGER_CREDENTIAL).path(C.MANAGER_ACCOUNT))).toBe(false);
+    expect(await C.readManagerToken(runner)).toBe(MGR);
   });
 });
 
