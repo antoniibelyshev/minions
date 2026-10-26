@@ -587,11 +587,21 @@ async function serviceStep(o: { io: WizardIO | null; manager: SetupStep; host?: 
   const later = `Run ${o.setupCmd} again in a terminal to install the host manager service.`;
   const host = serviceHost({ ...(o.platform ? { platform: o.platform } : {}), ...o.host });
   const hasToken = !!(await loadManagerCredentialRef().catch(() => null));
+  // A corrupt or foreign record counts as absent (the unit it names is never touched); install rewrites it, and
+  // without a token removeManagerService deletes it (and only this home's own default unit).
   let rec: Awaited<ReturnType<typeof loadServiceRecord>>;
-  try { rec = await loadServiceRecord(); } catch (e) {
-    return { id: 'service', status: 'failed', detail: errMsg(e, 'the manager service record is unreadable'), later };
+  let invalid: string | null = null;
+  try { rec = await loadServiceRecord(host); } catch (e) {
+    rec = null;
+    invalid = `warning: ignored the invalid manager service record (${errMsg(e, 'unreadable').split('\n')[0]})`;
   }
-  if (!hasToken && !rec) return null;
+  if (!hasToken && !rec && !invalid) return null;
+  const step = await serviceAction(o, host, later, hasToken, rec);
+  return invalid ? { ...step, lines: [invalid, ...(step.lines ?? [])] } : step;
+}
+
+async function serviceAction(o: { io: WizardIO | null; manager: SetupStep }, host: ServiceHost, later: string, hasToken: boolean,
+  rec: Awaited<ReturnType<typeof loadServiceRecord>>): Promise<SetupStep> {
   const kind = serviceKind(host.platform);
   const what = kind === 'launchd' ? 'launchd agent' : 'systemd --user unit';
   if (!hasToken) {

@@ -120,7 +120,7 @@ export async function runUninstall(opts: UninstallOptions): Promise<UninstallRes
     managerService = await uninstallManagerService(opts, Object.keys(reg.projects).length, removed, kept);
   } else {
     removed.push(...toRemove);
-    const rec = await loadServiceRecord().catch(() => null);
+    const rec = await loadServiceRecord(serviceHost(opts.managerService)).catch(() => null);
     if (rec) {
       const others = Object.keys((await loadRegistry()).projects).filter((id) => id !== projectId).length;
       if (others) { kept.push({ path: rec.path, reason: `host manager service kept: ${others} other project(s) are registered` }); managerService = 'kept'; }
@@ -142,7 +142,7 @@ export async function runUninstall(opts: UninstallOptions): Promise<UninstallRes
  */
 async function uninstallManagerService(opts: UninstallOptions, remaining: number, removed: string[], kept: UninstallResult['kept']): Promise<UninstallResult['managerService']> {
   const mp = managerPaths();
-  const rec = await loadServiceRecord().catch(() => null);
+  const rec = await loadServiceRecord(serviceHost(opts.managerService)).catch(() => null);
   if (remaining) {
     if (rec) kept.push({ path: rec.path, reason: `host manager service kept: ${remaining} other project(s) are registered` });
     return rec ? 'kept' : 'absent';

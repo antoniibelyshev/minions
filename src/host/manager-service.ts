@@ -13,7 +13,7 @@
 //   status, doctor and uninstall know what is installed without probing the real home directory.
 // - The program is `/usr/bin/env node <cli> manager run` with PATH set from the installing shell, so a node upgrade
 //   that moves the binary does not break the unit, and a CLI reinstall at the same path is picked up on restart.
-import { readFileSync, statSync } from 'node:fs';
+import { lstatSync, readFileSync, statSync } from 'node:fs';
 import { readFile, rm } from 'node:fs/promises';
 import { homedir, userInfo } from 'node:os';
 import { delimiter, dirname, isAbsolute, join } from 'node:path';
@@ -194,8 +194,36 @@ function recordShapeOk(r: { kind: ServiceKind; name: string; path: string }): bo
 }
 export type ServiceRecord = z.infer<typeof ServiceRecordSchema>;
 
-export async function loadServiceRecord(): Promise<ServiceRecord | null> {
-  return (await readJsonIfExists(managerPaths().serviceJson, ServiceRecordSchema)) ?? null;
+/**
+ * Whether a well-formed record names a unit that this minions home's install produced. The name must be exactly this
+ * home's label / unit (so neither the default home's unit nor another home's is ever accepted under a custom
+ * MINIONS_HOME). The path must be the one this home and this user would install now, or (an install under another
+ * home directory or XDG_CONFIG_HOME, still to be cleaned up) a path where either nothing exists or the very file setup
+ * wrote exists: a regular file (no symlink) owned by this process's user with the recorded sha256. Another user's unit
+ * or any other file is never accepted.
+ */
+function recordBelongsHere(r: ServiceRecord, host: Pick<ServiceHost, 'home' | 'env'>): boolean {
+  const names = serviceNames(host.env);
+  if (r.name !== (r.kind === 'launchd' ? names.label : names.unit)) return false;
+  if (r.path === serviceFile(r.kind, host)) return true;
+  let st: ReturnType<typeof lstatSync>;
+  try { st = lstatSync(r.path); } catch (e) { return (e as NodeJS.ErrnoException).code === 'ENOENT'; }
+  const uid = typeof process.getuid === 'function' ? process.getuid() : null;
+  if (!st.isFile() || uid === null || st.uid !== uid) return false;
+  try { return sha256(readFileSync(r.path, 'utf8')) === r.sha256; } catch { return false; }
+}
+
+/**
+ * The recorded service, or null when none is recorded. Throws when service.json is unreadable, malformed, or names a
+ * unit this minions home did not install (see recordBelongsHere); callers then never touch the unit it names.
+ */
+export async function loadServiceRecord(host: Pick<ServiceHost, 'home' | 'env'> = { home: homedir(), env: process.env }): Promise<ServiceRecord | null> {
+  const rec = (await readJsonIfExists(managerPaths().serviceJson, ServiceRecordSchema)) ?? null;
+  if (rec && !recordBelongsHere(rec, host)) {
+    throw new MinionsError('PRECONDITION', `${managerPaths().serviceJson} does not name a minions manager unit file of this minions home (${rec.name} at ${rec.path}).`,
+      'Rerun `minions setup`: it replaces the record.');
+  }
+  return rec;
 }
 
 // ---------------------------------------------------------------- install / remove
@@ -244,7 +272,7 @@ export async function installManagerService(host: ServiceHost, o: { restart?: bo
   const warnings: string[] = [];
 
   // A unit recorded elsewhere (another XDG_CONFIG_HOME, another name) is removed first: one service per minions home.
-  const before = await loadServiceRecord().catch(() => null);
+  const before = await loadServiceRecord(host).catch(() => null);
   if (before && (before.path !== path || before.name !== name || before.kind !== kind)) {
     await unload(host, before.kind, before.name);
     await rm(before.path, { force: true });
@@ -292,7 +320,7 @@ export async function removeManagerService(host: ServiceHost): Promise<ServiceRe
   // setup installed one: then the default location of this minions home is used.
   let rec: ServiceRecord | null;
   let corrupt = false;
-  try { rec = await loadServiceRecord(); } catch { rec = null; corrupt = true; }
+  try { rec = await loadServiceRecord(host); } catch { rec = null; corrupt = true; }
   const kind = rec?.kind ?? (corrupt ? serviceKind(host.platform) : null);
   if (!kind) {
     if (corrupt) await rm(managerPaths().serviceJson, { force: true });
@@ -326,7 +354,7 @@ export interface ServiceState {
 export async function serviceState(host: ServiceHost): Promise<ServiceState> {
   const kind = serviceKind(host.platform);
   let rec: ServiceRecord | null;
-  try { rec = await loadServiceRecord(); } catch (e) {
+  try { rec = await loadServiceRecord(host); } catch (e) {
     return { kind, installed: false, path: null, active: 'unknown', detail: `service.json is unreadable: ${(e as Error).message.split('\n')[0]}`, fileMatches: null };
   }
   if (!rec) return { kind, installed: false, path: null, active: null, detail: 'not installed', fileMatches: null };

@@ -556,6 +556,44 @@ describe('minions setup and uninstall: host manager service', () => {
     expect(f.calls[0]).toMatch(/^systemctl --user disable --now minions-manager/);
   });
 
+  it('a corrupt or foreign service.json never fails setup: ignored with a warning, then rewritten or removed', async () => {
+    const repo = makeRepo(env.root);
+    const f = serviceFake();
+    const victim = join(env.root, 'sshd.service');
+    writeFileSync(victim, 'keep');
+    const corrupt = (text: string) => { mkdirSync(managerPaths().dir, { recursive: true }); writeFileSync(managerPaths().serviceJson, text); };
+    const foreign = JSON.stringify({ version: 1, kind: 'systemd', name: 'sshd.service', path: victim, sha256: 'x', installedAt: 't' });
+    const noFail = (r: { steps: { status: string }[] }) => expect(r.steps.filter((s) => s.status === 'failed')).toEqual([]);
+
+    // No token: the record is removed (only this home's own default unit is disabled), setup succeeds.
+    for (const text of ['{oops', foreign]) {
+      corrupt(text);
+      f.calls.length = 0;
+      const r = await runSetup({ path: repo, yes: true, runtime: fakeRuntime(), dockerProbe: dockerUp, managerService: f.managerService });
+      noFail(r);
+      expect(svcStep(r)).toMatchObject({ status: 'changed', lines: [expect.stringContaining('ignored the invalid manager service record')] });
+      expect(existsSync(managerPaths().serviceJson)).toBe(false);
+      expect(f.calls.join('\n')).not.toContain('sshd');
+    }
+
+    // With a token and --yes: skipped (never installs) with the warning, nothing touched.
+    corrupt(foreign);
+    f.calls.length = 0;
+    const piped = await runSetup({ path: repo, yes: true, tokens: { manager: MGR }, runtime: fakeRuntime(), dockerProbe: dockerUp, managerService: f.managerService });
+    noFail(piped);
+    expect(svcStep(piped)).toMatchObject({ status: 'skipped', lines: [expect.stringContaining('ignored the invalid manager service record')] });
+    expect(f.calls).toEqual([]);
+
+    // Interactive install rewrites the record to this home's own unit.
+    corrupt('{oops');
+    const yes = scripted({ 'Project configuration': 'keep', 'Install the host manager': 'y' });
+    const r = await runSetup({ path: repo, yes: false, io: yes.io, runtime: fakeRuntime(), dockerProbe: dockerUp, managerService: f.managerService });
+    expect(svcStep(r)).toMatchObject({ status: 'done', lines: [expect.stringContaining('ignored the invalid manager service record')] });
+    expect(JSON.parse(readFileSync(managerPaths().serviceJson, 'utf8'))).toMatchObject({ kind: 'systemd', name: expect.stringMatching(/^minions-manager-[0-9a-f]{8}\.service$/) });
+    expect(readFileSync(victim, 'utf8')).toBe('keep');
+    expect(f.calls.join('\n')).not.toContain('sshd');
+  });
+
   it('macOS: a launchd agent; "remove" in the service step keeps the bot', async () => {
     const repo = makeRepo(env.root);
     await M.provisionManagerToken({ token: MGR });

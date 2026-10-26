@@ -174,6 +174,63 @@ describe('the service record is not trusted', () => {
     expect(existsSync(managerPaths().serviceJson)).toBe(false);
   });
 
+  it("another user's unit named like this home's is refused: remove and install never disable or delete it", async () => {
+    const h = host('linux', fakeRunner().runner);
+    const unit = S.serviceNames(h.env).unit;
+    // Same unit name as this home's, but in another user's home: setup never wrote it (another owner or content).
+    const other = join(env.root, 'otheruser', '.config', 'systemd', 'user', unit);
+    mkdirSync(join(other, '..'), { recursive: true });
+    writeFileSync(other, '[Service]\nExecStart=/usr/bin/true\n');
+    const missing = '/home/otheruser-' + process.pid + '/.config/systemd/user/' + unit;
+    const foreign = JSON.stringify({ version: 1, kind: 'systemd', name: unit, path: other, sha256: 'x', installedAt: 'now' });
+    mkdirSync(managerPaths().dir, { recursive: true });
+    writeFileSync(managerPaths().serviceJson, foreign);
+    await expect(S.loadServiceRecord(h)).rejects.toThrow(/does not name a minions manager unit file/);
+    const rmd = await S.removeManagerService(host('linux', fakeRunner().runner));
+    expect(rmd.path).toBe(S.serviceFile('systemd', h));
+    expect(rmd.warnings).toEqual([expect.stringContaining('unreadable')]);
+    expect(readFileSync(other, 'utf8')).toContain('/usr/bin/true');
+    // install: the foreign record is ignored, its file stays, and the record is rewritten to this home's own unit.
+    writeFileSync(managerPaths().serviceJson, foreign);
+    const r = await S.installManagerService(host('linux', fakeRunner().runner));
+    expect(r.warnings.join('\n')).not.toContain('removed the previous service file');
+    expect(readFileSync(other, 'utf8')).toContain('/usr/bin/true');
+    expect((await S.loadServiceRecord(h))!.path).toBe(S.serviceFile('systemd', h));
+    // A recorded path where nothing exists names nothing to delete; only this home's own unit name is used.
+    writeFileSync(managerPaths().serviceJson, JSON.stringify({ version: 1, kind: 'systemd', name: unit, path: missing, sha256: 'x', installedAt: 'now' }));
+    expect((await S.loadServiceRecord(h))!.path).toBe(missing);
+  });
+
+  it("the default home's unit (or another home's) is refused while a custom MINIONS_HOME is in use", async () => {
+    const h = host('linux', fakeRunner().runner);
+    const own = S.serviceFile('systemd', h);
+    const cfg = join(own, '..');
+    const otherHome = S.serviceNames({ MINIONS_HOME: join(env.root, 'other-home') }).unit;
+    for (const name of ['minions-manager.service', otherHome]) {
+      mkdirSync(cfg, { recursive: true });
+      writeFileSync(join(cfg, name), 'the default home manager');
+      mkdirSync(managerPaths().dir, { recursive: true });
+      writeFileSync(managerPaths().serviceJson, JSON.stringify({ version: 1, kind: 'systemd', name, path: join(cfg, name), sha256: 'x', installedAt: 'now' }));
+      await expect(S.loadServiceRecord(h)).rejects.toThrow(/does not name a minions manager unit file/);
+      const f = fakeRunner();
+      await S.removeManagerService(host('linux', f.runner));
+      expect(f.calls.join('\n')).not.toContain(name);
+      expect(f.calls[0]).toBe(`systemctl --user disable --now ${S.serviceNames(h.env).unit}`);
+      expect(readFileSync(join(cfg, name), 'utf8')).toBe('the default home manager');
+    }
+    // launchd: the default label under a custom MINIONS_HOME is refused too.
+    const d = host('darwin', fakeRunner().runner);
+    const plist = join(env.root, 'userhome', 'Library', 'LaunchAgents', 'dev.minions.manager.plist');
+    mkdirSync(join(plist, '..'), { recursive: true });
+    writeFileSync(plist, 'default');
+    writeFileSync(managerPaths().serviceJson, JSON.stringify({ version: 1, kind: 'launchd', name: 'dev.minions.manager', path: plist, sha256: 'x', installedAt: 'now' }));
+    await expect(S.loadServiceRecord(d)).rejects.toThrow(/does not name a minions manager unit file/);
+    const f = fakeRunner();
+    await S.removeManagerService(host('darwin', f.runner));
+    expect(f.calls).toEqual([`launchctl bootout gui/501/${S.serviceNames(d.env).label}`]);
+    expect(readFileSync(plist, 'utf8')).toBe('default');
+  });
+
   it('names: the default home has the plain names, a MINIONS_HOME gets a stable suffix', () => {
     expect(S.serviceNames({})).toEqual({ label: 'dev.minions.manager', unit: 'minions-manager.service' });
     const a = S.serviceNames({ MINIONS_HOME: '/a' });
