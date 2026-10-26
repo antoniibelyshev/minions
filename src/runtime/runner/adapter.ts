@@ -46,6 +46,8 @@ export interface ProcessAdapter {
   plan(input: LaunchInput): LaunchPlan;
   /** One stdout line -> event (usage, the final message). */
   parseEvent?(line: string): { usage?: UsageEvent; finalMessage?: string } | null;
+  /** The worker's result text (result file or final message) -> WorkerResult JSON text, e.g. strict-schema nulls dropped. */
+  normalizeResult?(raw: string): string;
   /** Final usage after exit, from the collected events. */
   finalUsage?(events: UsageEvent[]): { tokens: number; detail: Record<string, number> } | null;
 }

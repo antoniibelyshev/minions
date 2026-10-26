@@ -493,7 +493,8 @@ phase 1.
 
 ### D6. Adapter details
 
-**Codex CLI** (`codex exec`). Planned invocation:
+**Codex CLI** (`codex exec`). Planned invocation (the sketch from the design; the built adapter deviates, see
+"Addendum: child task 4 implementation decisions (task-14.6)"):
 
 ```
 codex exec --json --ephemeral --ignore-user-config --ignore-rules
@@ -508,7 +509,8 @@ codex exec --json --ephemeral --ignore-user-config --ignore-rules
 
 - Reviewers get the same flags. Read-only towards the squad comes from L1 and the no-fetch-back rule for gates
   (D3.7.4), because Codex's own `read-only` sandbox also needs bwrap (unknown U-C2).
-- Usage: sum the `usage` object of every `turn.completed` JSONL event [C-noninteractive].
+- Usage: sum the `usage` object of every `turn.completed` JSONL event [C-noninteractive]. (Superseded in task-14.6:
+  the usage is a running total, so the adapter takes the last event; U-C7.)
 - `--output-schema` gets the WorkerResult JSON schema (generated from `WorkerResultSchema`, like `schema/`).
 - Tool restriction: Codex has no per-run tool allowlist comparable to Claude frontmatter. MCP servers come only
   from config, and with `--ignore-user-config` and an empty per-lease `CODEX_HOME` there are none. Web search is
@@ -902,7 +904,8 @@ Markdown pages (`.md` suffix) were used.
 | Install / pin | `npm install -g @openai/codex`, the standalone installer (`CODEX_NON_INTERACTIVE=1`), Homebrew. Pin with `@openai/codex@<version>` in the Dockerfile, the same way `@anthropic-ai/claude-code` is pinned. `CODEX_HOME` must exist if set. | [C-cli], [C-env] |
 | Licensing / terms | The CLI is open source (`openai/codex`, Apache-2.0 LICENSE). Use is under the OpenAI terms for the auth method (API platform terms for keys, ChatGPT plan terms for sign-in). The docs warn: "Don't expose Codex execution in untrusted or public environments", and do not use ChatGPT-managed auth in CI for public or open-source repositories. | [C-oss], [C-license], [C-auth], [C-noninteractive] |
 
-**Codex unknowns** (to settle in child task 3 with a live, opt-in run):
+**Codex unknowns** (resolved in task-14.6 against the rust-v0.164.0 source and the docs; see "Resolutions" in the
+child task 4 addendum below; U-C8 still needs the opt-in live run):
 
 - U-C1: Whether `codex exec` has a documented per-run turn/step limit. None was found, so the runner relies on the
   wall clock.
@@ -998,7 +1001,7 @@ sanitize and fetch-back; `supervise.ts`; `adapter.ts` contract and the fake adap
 `src/runtime/git-hardening.ts`. Decisions made while building it:
 
 - **No production adapter yet.** `PROCESS_ADAPTERS` is empty until child tasks 4 and 5, so `work run` refuses with
-  `PRECONDITION`. The `fake` adapter is injected by tests only and cannot be selected from config.
+  `PRECONDITION`. (Superseded: task-14.6 registers Codex, gate plan only.) The `fake` adapter is injected by tests only and cannot be selected from config.
 - **Gate codes.** The refusals in D3.1 are `POLICY_DENIED`, capacity included. Budget refusals reuse the claim check.
   These are `PRECONDITION`: the host runtime, a missing adapter or `harnesses.<id>` block, a lease claimed on a
   harness other than its role's current one, a QA sweep (the base branch moves with merges), and a self-test that is
@@ -1101,6 +1104,74 @@ Orphan recovery and launch guards, on top of the task-14.4 runner:
   reach of any text check, and a name split by quotes or backslashes inside the word (`mi''nions`) passes the
   pre-filter, so the `work run` gate (L0) keeps its own checks.
 - **Not here:** a distinct outcome when the lease branch moves during a run (task-14.12).
+
+### Addendum: child task 4 implementation decisions (task-14.6)
+
+The adapter is `src/runtime/runner/codex.ts`, registered in `src/runtime/runner/adapters.ts` (the only production
+adapter). Tests: `test/runtime/codex-adapter.test.ts` (plan, schema, parser), `test/runtime/codex-runner.test.ts`
+(`runLease` on the phase 1 b gate pilot against `test/fixtures/fake-codex.mjs`), `test/host/codex-credential.test.ts`
+and the opt-in `test/runtime/codex-live.test.ts` (skipped unless `MINIONS_LIVE_HARNESS=codex`, and never inside a
+worker; needs `codex` on PATH and `CODEX_API_KEY`; model from `MINIONS_LIVE_CODEX_MODEL`). The coordinator runs it.
+
+**Resolutions of U-C1 to U-C8** (Codex rust-v0.164.0 source and learn.chatgpt.com docs, read 2026-10-26):
+
+- U-C1: there is no per-run turn or step limit flag (`exec/src/cli.rs`). The runner's wall clock stays the only
+  limit; `maxSteps` is not passed to Codex.
+- U-C2: `--sandbox read-only` uses the same Linux sandbox (bwrap, or a bundled helper that needs unprivileged user
+  namespaces), so it is not used. `danger-full-access` stays, with L1 as the boundary.
+- U-C3: exit 0 on success. Exit 1 on a failed or interrupted turn, a non-retried error, a config or `-c` parse
+  error, or an unreadable or invalid `--output-schema` file. Clap usage errors exit 2. The schema is sent with
+  `strict: true`, so a completed turn's final message conforms. The runner judges the result, not the exit code: no
+  object result means a synthesized `blocked` result with the redacted stderr tail.
+- U-C4: only SIGINT is handled (it interrupts the turn gracefully). SIGTERM kills at once: complete JSONL lines are
+  already out, but the `-o` file is not written. The runner still stops workers with SIGTERM, then SIGKILL; the
+  final message is taken from the JSONL `agent_message` event, so `-o` is only a debugging copy. Follow-up: send
+  SIGINT before SIGTERM for Codex.
+- U-C5: `exec` forces `approval_policy = never` and rejects approval and `request_user_input` requests; it never
+  blocks. `codex exec` has no `--ask-for-approval` flag in 0.164 (clap would refuse it), so the adapter omits it;
+  the generated config repeats `approval_policy = "never"`.
+- U-C6: `AGENTS.md` discovery walks from the project (git) root down to the cwd and never above the checkout. It
+  also reads `$CODEX_HOME/AGENTS.md`; that is the per-lease harness home, which holds only the generated config.
+- U-C7: `turn.completed.usage` is the primary thread's cumulative total (`last_total_token_usage`); sub-agent
+  threads are filtered out. The adapter takes the last event, not a sum. Cached input is inside `input_tokens` and
+  reasoning inside `output_tokens`, so tokens = input + output. Usage of sub-agent (collab) threads is not counted.
+- U-C8: not verifiable without a live run. Expected needs: the install under `/usr/local` (covered by the `/usr`
+  read-execute rule), `/etc` certificates and `resolv.conf`, `/proc`, `CODEX_HOME` and `TMPDIR` in the scratch dir,
+  and TCP 443. The check is the opt-in live test under `minions-sandbox` plus the sandbox self-test.
+
+**Deviations from the D6 sketch:**
+
+- **Config file, not `-c`.** The adapter writes `$CODEX_HOME/config.toml` in the per-lease harness home (the only
+  user config Codex loads, because `CODEX_HOME` is per lease and otherwise empty) and passes `--strict-config`, so a
+  renamed key after a version bump is a startup error instead of a silently ignored safety setting.
+  `--ignore-user-config` and the `-c` overrides are dropped. Paths stay out of argv quoting; the TOML is
+  snapshot-tested, with checkout paths written as escaped basic strings.
+- **No `--ask-for-approval`** (U-C5).
+- **Web search off.** `web_search = "disabled"` is required: with `danger-full-access` the default becomes live search.
+  Analytics, feedback, history and the update check are off too.
+- **Spawned commands** get `shell_environment_policy.inherit = "core"` with the default `*KEY*/*SECRET*/*TOKEN*`
+  excludes (so not `CODEX_API_KEY`), plus the `MINIONS_*` lease variables.
+- **Gate plan first.** `plan()` refuses producer and verifier roles with `PRECONDITION` until their plans land.
+- **The final message is the result.** `--output-schema` gets a strict-mode subset of the WorkerResult (every key
+  required, optional fields nullable, `additionalProperties: false`, no `usage`; `verdict`/`needsQa` only for a
+  gate). A new `ProcessAdapter.normalizeResult` hook drops the null optional fields before the runner submits.
+- **Role prompts.** The project prompt of a process role is part of the worker instructions: inline `promptText`,
+  else the copy the host generates into the plugin's `harness-prompts/<role>.md` (`RunnerDeps.rolePromptDir`). A
+  missing copy fails the run (a synthesized `blocked` result).
+- **SIGINT note.** See U-C4: the runner does not send SIGINT yet.
+- **Credential.** `minions auth codex` stores an OpenAI API key (kind `codex`, file `codex-api-key`); the runner
+  reads it into `CODEX_API_KEY` at spawn, never into argv. `redact` masks `sk-...` keys. Risk: like the GitHub token,
+  the file in the secrets mount is readable by Claude workers in the container; only process workers are kept out
+  of it, by L1.
+
+**Pinned install: pending owner approval.** The Dockerfile is not changed by this task (infrastructure change). The
+proposal: add `ARG CODEX_VERSION=0.164.0` and install `"@openai/codex@${CODEX_VERSION}"` in the same `npm install -g`
+line as `@anthropic-ai/claude-code`, and set `ENV MINIONS_CODEX_VERSION=${CODEX_VERSION}` so `work probe` checks the
+pin. The source fingerprint already covers the Dockerfile, so the change rebuilds the image. Integrity of
+`@openai/codex@0.164.0`: `sha512-TWj7UGyPRe3Pj/A3ddNAxs1te3a/W/xAd+J0LHrrFTmsSfahGMOLF/vn88D3QCIgAT3B1rm1y/Z3NYE0rx6cZQ==`
+(shasum `82693f5ef4b08b724dc1370f1622bc752e5d1bf4`); native optional dependencies linux-x64
+`sha512-XLAoaWsGOT2khzl+P4FYDPTkzAr9W0VFXFaVkqlFdkM0soa1gH/4S0wSD57Ek3HHwkirAEGz2/Mwehseh+l5Mg==`, linux-arm64
+`sha512-LL5iTQjyDL4YRX44EWqhIfEQ5uGnmgxkQBJSxjZSeJ8L1Og83pdlzUJW/PRJ76oaVwOVgh6HXwuPEiBNEHU4lg==`.
 
 ## Child tasks
 

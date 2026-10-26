@@ -3,9 +3,11 @@
 // supervision, post-exit checks and fetch-back, submit by proxy. `reapRun` drives recovery from the record.
 //
 // Architecture decisions (task-14.4):
-// - Adapters are injected (`RunnerDeps.adapters`); production has none until the Codex/Junie adapters land
-//   (child tasks 4, 5), so `work run` refuses with PRECONDITION. The test-only `fake` adapter is never selectable
-//   from config.
+// - Adapters are injected (`RunnerDeps.adapters`); production registers Codex (child task 4, gate plan first;
+//   adapters.ts). The test-only `fake` adapter is never selectable from config.
+// - The worker instructions carry the role's project prompt (task-14.6): inline `promptText`, else the copy the host
+//   generated into the plugin's `harness-prompts/` (prompt files are resolved on the host only). An adapter may
+//   normalize the result text (`normalizeResult`, e.g. Codex strict-schema nulls) before it is submitted.
 // - A harness violation becomes a synthesized `blocked` result whose findings name it (terminal for the attempt;
 //   the coordinator sees it in `work record`), plus a `harness-violation` event. Nothing is fetched.
 // - The cancel mark is a separate file in the record dir (`cancel`), so the reaper never races the runner's own
@@ -18,6 +20,7 @@ import { dirname, join, relative, isAbsolute } from 'node:path';
 import { realpathSync } from 'node:fs';
 import { harnessBlock, isProcessHarness, phaseAllows, CURRENT_PHASE, DEFAULT_HARNESS_TIMEOUT_MINUTES, type PhaseRules, type HarnessId } from '../../config/harnesses.js';
 import { baseRoleName, roleLimit, workerRole, type RoleDef } from '../../config/roles.js';
+import { MAX_ROLE_PROMPT_BYTES, resolveRolePrompt } from '../../plugin/generate.js';
 import type { MinionsConfig } from '../../config/schema.js';
 import { MinionsError } from '../../core/errors.js';
 import { redact } from '../../core/output.js';
@@ -54,6 +57,11 @@ export interface RunnerDeps {
   adapters: Readonly<Record<string, ProcessAdapter>>;
   isolation: Isolation;
   phase?: PhaseRules;
+  /**
+   * The generated plugin's `harness-prompts` dir: the resolved prompt of a process role whose `roles.<r>.prompt`
+   * names a file (resolved on the host). Inline `promptText` needs none.
+   */
+  rolePromptDir?: string;
   /** The caller's environment and cwd (hints for honest callers: a worker must not start workers). */
   callerEnv?: NodeJS.ProcessEnv;
   callerCwd?: string;
@@ -166,16 +174,25 @@ async function readWorkerFile(path: string, max = 1 << 20): Promise<string | nul
   } catch { return null; }
 }
 
-function instructionsFor(brief: TaskBrief): string {
+function instructionsFor(brief: TaskBrief, rolePrompt: string | undefined): string {
   return [
     `You are the minions ${brief.role} for lease ${brief.leaseId}. Work only in ${brief.worktree} (your private clone of branch ${brief.branch}).`,
     'Your brief is in the file named by $MINIONS_BRIEF_FILE (also below). Do not run `minions work brief` or `minions work submit`:',
     'write exactly one WorkerResult JSON object to the file named by $MINIONS_RESULT_FILE before you finish.',
     `Result contract: ${brief.resultContract}`,
+    ...(rolePrompt ? ['', 'Role instructions (from the project):', '', rolePrompt] : []),
     '',
     'Brief:',
     JSON.stringify(brief, null, 2),
   ].join('\n');
+}
+
+/** The project prompt of a process role: inline text, else the copy the host generated into the plugin. */
+async function rolePromptOf(def: RoleDef, dir: string | undefined): Promise<string | undefined> {
+  if (def.promptText !== undefined || def.prompt === undefined) return resolveRolePrompt(def);
+  const text = dir ? await readWorkerFile(join(dir, `${def.name}.md`), MAX_ROLE_PROMPT_BYTES) : null;
+  if (!text?.trim()) throw new MinionsError('PRECONDITION', `The prompt of role ${def.name} (${def.prompt}) is not in the generated plugin.`, 'Regenerate it with `minions start` on the host.');
+  return text.trimEnd();
 }
 
 const isObjectJson = (s: string): boolean => { try { const v = JSON.parse(s) as unknown; return !!v && typeof v === 'object' && !Array.isArray(v); } catch { return false; } };
@@ -271,7 +288,7 @@ export async function runLease(leaseId: string, deps: RunnerDeps): Promise<RunOu
     const plan: LaunchPlan = adapter.plan({
       lease: { id: leaseId, taskId: lease.task_id, role: lease.role, attempt: lease.attempt }, role: { name: def.name, contract: def.contract, edits: def.edits, commits: def.commits },
       checkout: rec.checkout, leaseWorktree: lease.worktree, gitObjectsDir: join(snap.commonDir, 'objects'), scratchDir: scratch, harnessHome,
-      instructions: instructionsFor(workerBrief), briefFile, resultFile, model: gate.brief.model ?? null, effort: gate.brief.effort ?? null,
+      instructions: instructionsFor(workerBrief, await rolePromptOf(def, deps.rolePromptDir)), briefFile, resultFile, model: gate.brief.model ?? null, effort: gate.brief.effort ?? null,
       maxSteps: gate.brief.maxTurns, credential: null,
     });
     checkPlanEnv([...Object.keys(plan.env), ...Object.keys(plan.secretEnv)]);
@@ -356,7 +373,10 @@ export async function runLease(leaseId: string, deps: RunnerDeps): Promise<RunOu
     } else {
       const fromFile = await readWorkerFile(join(scratch, 'result.json'));
       const fm = finalMessage as string | null;
-      raw = fromFile && isObjectJson(fromFile) ? fromFile : fm && isObjectJson(fm) ? fm : null;
+      const norm = (t: string | null) => (t && adapter.normalizeResult ? adapter.normalizeResult(t) : t);
+      const file = norm(fromFile);
+      const final = norm(fm);
+      raw = file && isObjectJson(file) ? file : final && isObjectJson(final) ? final : null;
       if (!raw) {
         const tail = redact(sup.stderrTail).slice(-2048);
         raw = synthesized(rec, post.head, 'blocked', `The ${harness} worker ended without a result (exit ${sup.code ?? sup.signal ?? sup.spawnError ?? 'unknown'}).`,

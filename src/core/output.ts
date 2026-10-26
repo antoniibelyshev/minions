@@ -7,12 +7,14 @@ const SECRET_PATTERNS: [RegExp, string][] = [
   [/\bgh[pousr]_[A-Za-z0-9]{20,}/g, 'gh*_[REDACTED]'],
   [/\b(Bearer)\s+[A-Za-z0-9._~+/=-]{8,}/gi, '$1 [REDACTED]'],
   [/\b(bot)?\d{6,12}:[A-Za-z0-9_-]{30,}/g, '[REDACTED_BOT_TOKEN]'],
+  // OpenAI API keys (sk-…, sk-proj-…, sk-svcacct-…), the `codex` credential; after the Anthropic pattern.
+  [/\bsk-[A-Za-z0-9_-]{20,}/g, 'sk-[REDACTED]'],
 ];
 
 /** Human-readable text for the terminal: secrets masked, escape sequences and control characters (except newline/tab) removed. */
 const terminalText = (text: string): string => stripControlChars(redact(text));
 
-/** Masks credential-shaped substrings (Anthropic keys, GitHub tokens, Bearer tokens, Telegram bot tokens). */
+/** Masks credential-shaped substrings (Anthropic and OpenAI keys, GitHub tokens, Bearer tokens, Telegram bot tokens). */
 export function redact(text: string): string {
   let out = text;
   for (const [re, rep] of SECRET_PATTERNS) out = out.replace(re, rep);
