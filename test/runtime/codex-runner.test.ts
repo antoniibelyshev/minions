@@ -137,4 +137,49 @@ describe('work run with the Codex adapter (gate pilot, fake codex)', () => {
     expect(out).toMatchObject({ submitted: true, status: 'complete' });
     expect((JSON.parse(readFileSync(echo, 'utf8')) as { stdin: string }).stdin).toContain('Generated reviewer prompt from the host.');
   });
+  it('malformed JSONL noise and no final message (exit 0) yield a blocked result with a cause, never a crash', async () => {
+    const r = rig();
+    const b = await toGate(r);
+    const out = await runLease(b.leaseId, r.deps({ junk: '{"type":"turn.completed","usage":\nnot json at all\n{"type":\n', noFinal: true, usage: [] }));
+    expect(out).toMatchObject({ submitted: true, status: 'blocked', exit: { code: 0 } });
+    expect(submitted(r, b).findings.join('\n')).toMatch(/no WorkerResult/);
+  });
+
+  it('malformed usage events do not fail a valid review', async () => {
+    const r = rig();
+    const b = await toGate(r);
+    const out = await runLease(b.leaseId, r.deps({ junk: '{"type":"turn.completed","usage":{"input_tokens":"x"}}\n[1,2]\nnull\n' }));
+    expect(out).toMatchObject({ submitted: true, status: 'complete' });
+  });
+
+  it('a key echoed on stderr never reaches the submission or the run events', async () => {
+    const r = rig();
+    const b = await toGate(r);
+    await runLease(b.leaseId, r.deps({ stderr: `debug ${KEY}\n`, exitCode: 1, message: 'no result' }));
+    expect(JSON.stringify(r.db.events('task-1'))).not.toContain(KEY);
+    expect(readFileSync(submissionPath(r.paths, b.leaseId), 'utf8')).not.toContain(KEY);
+  });
+
+  it('a Codex producer role is refused cleanly (gate plan only), nothing starts', async () => {
+    const e = makeDefaultEnv((c) => set(c, {
+      harnesses: { codex: CODEX },
+      roles: { 'codex-dev': { description: 'Codex producer.', contract: 'producer', harness: 'codex', promptText: 'Build it.' } },
+      workflows: { pilot: ['codex-dev'] },
+    }));
+    const state = join(e.root, 'state');
+    const paths = { state, briefs: join(state, 'briefs'), results: join(state, 'results'), scratch: join(e.root, 'scratch'), secretsDir: join(e.root, 'secrets'), drainFlag: join(state, 'run', 'drain') };
+    mkdirSync(paths.secretsDir, { recursive: true });
+    writeFileSync(join(paths.secretsDir, 'codex-api-key'), KEY + '\n', { mode: 0o600 });
+    const sched = new Scheduler({ db: e.db, backlog: e.backlog, config: e.config, layout: e.layout, handoff: paths, phase: PHASE_RULES['1b'] });
+    e.backlog.add({ id: 'task-1', workflow: 'pilot' });
+    let leaseId: string;
+    try { leaseId = (await claimWithBrief(sched, paths, 'task-1', undefined)).leaseId; } catch (err) { expect(String(err)).toMatch(/codex|harness|phase/i); return; }
+    const echo = join(e.root, 'echo.json');
+    const file = join(e.root, 'sc.json');
+    writeFileSync(file, JSON.stringify({ echo }));
+    const out = await runLease(leaseId, { db: e.db, config: e.config, paths, commonDir: join(e.layout.repo, '.git'), adapters: { codex: codexAdapter({ command: [process.execPath, FAKE, file] }) },
+      isolation: { kind: 'none' }, phase: PHASE_RULES['1b'], callerEnv: {}, callerCwd: e.root, env: process.env, timing: { pollMs: 50, killGraceMs: 400, drainGraceMs: 200 } });
+    expect(out.status).not.toBe('complete');
+    expect(existsSync(echo)).toBe(false);
+  });
 });

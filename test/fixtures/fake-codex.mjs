@@ -35,6 +35,7 @@ if (scenario.echo) {
 }
 if (scenario.stderr) process.stderr.write(scenario.stderr);
 
+if (scenario.junk) process.stdout.write(scenario.junk);
 out({ type: 'thread.started', thread_id: '0199a213-81c0-7800-8aa1-bbab2a035a53' });
 out({ type: 'turn.started' });
 out({ type: 'item.completed', item: { id: 'item_0', type: 'reasoning', text: '**Reviewing the diff**' } });
@@ -48,7 +49,7 @@ const text = typeof scenario.message === 'string' ? scenario.message : JSON.stri
   acceptanceEvidence: [{ criterion: 'works', evidence: 'fake review' }], findings: [], nextAction: 'merge', verdict: 'approve', ...nul,
   ...(scenario.result ?? {}),
 });
-out({ type: 'item.completed', item: { id: 'item_2', type: 'agent_message', text } });
-writeFileSync(lastFile, text);
+if (!scenario.noFinal) out({ type: 'item.completed', item: { id: 'item_2', type: 'agent_message', text } });
+if (!scenario.noFinal) writeFileSync(lastFile, text);
 for (const [i, o, c] of scenario.usage ?? [[1000, 100, 800]]) out({ type: 'turn.completed', usage: { input_tokens: i, cached_input_tokens: c, output_tokens: o } });
 process.exit(scenario.exitCode ?? 0);
