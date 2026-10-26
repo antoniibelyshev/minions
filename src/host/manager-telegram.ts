@@ -20,6 +20,8 @@
 //   retry_after.
 // - A fixed command set: /status, /requests, /project [name], /help (and /start), and the owner change commands
 //   /set <key> <value> [shared], /sync, /upgrade, /restart, /undo <id> (task-53.5.3). Anything else gets the help text.
+// - The dev-only /rebuild_cli (task-53.7) is accepted and listed in the help text only when
+//   ManagerCommands.devRebuild says it exists; elsewhere it is an unknown command like any other.
 //   A change command only asks the core for a plan (ManagerCommands.propose) and shows it as an offer with Confirm /
 //   Reject: typing it is never consent, and the tap goes through the same confirmation as a container request.
 // - /approve <task> <sha> [merge] (task-53.5.4): only a full 40-character lowercase head SHA parses (a short or
@@ -77,7 +79,10 @@ const oneLine = (s: string, max = 300) => {
 };
 const clip = (s: string) => (s.length > MESSAGE_MAX_CHARS ? `${truncateCodePoints(s, MESSAGE_MAX_CHARS - 40)}\n… (cut: the message was too long)` : s);
 
-export const HELP_TEXT = [
+const REBUILD_HELP_MARK = '\u0000rebuild';
+/** Shown only where the dev-only request exists (host CLI from a minions source checkout, project minions). */
+export const REBUILD_HELP_LINE = '/rebuild_cli - dev only: rebuild the host CLI from the commits in this checkout, then upgrade (shows git log, diffstat and sensitive paths; always asks twice)';
+const HELP_LINES = [
   'minions host manager. Commands:',
   '/status - per project: runtime, coordinator, active leases, pending change requests',
   '/requests - pending change requests, each with Confirm / Reject buttons',
@@ -85,12 +90,16 @@ export const HELP_TEXT = [
   '/set <key> <value> [shared] - change a setting (like minions settings set; local layer unless "shared"); host-owned keys too',
   '/sync - fast-forward the host base branch (local delivery: from the container; GitHub delivery: from origin)',
   '/upgrade - minions upgrade; the dry-run plan is shown first',
-  '/restart - graceful coordinator restart (refused while workers are active)',
+  '/restart - graceful coordinator restart (refused while workers are active; then "Restart when idle" and "Drain now" are offered)',
   '/undo <id> - restore the config file as it was before change <id> (only while nothing changed it since)',
   '/approve <task> <sha> [merge] - sign an approval to publish (or with "merge": to merge) <task> at that full head SHA (always asks twice)',
   '/help - this text',
+  REBUILD_HELP_MARK,
   'Change requests from the coordinators arrive here by themselves. A command you type only shows a plan: nothing is applied until you tap Confirm (twice when it loosens policy).',
-].join('\n');
+];
+/** The help text; the /rebuild_cli line only when the dev-only request exists. */
+export const helpText = (devRebuild = false) => HELP_LINES.flatMap((l) => (l === REBUILD_HELP_MARK ? (devRebuild ? [REBUILD_HELP_LINE] : []) : [l])).join('\n');
+export const HELP_TEXT = helpText(false);
 
 /** Usage line per change command (sent when the arguments do not parse). */
 const USAGE: Record<string, string> = {
@@ -98,8 +107,11 @@ const USAGE: Record<string, string> = {
   undo: 'Usage: /undo <id>, the id of an applied config change (cr_... or ow_...).',
   approve: 'Usage: /approve <task> <sha> [merge], e.g. /approve task-12 <sha>. <sha> must be the full 40-character lowercase head SHA from the awaiting-approval message (short or non-hex SHAs are refused). Without "merge" it approves publishing that head; with "merge" it approves merging its delivered pull request.',
   sync: 'Usage: /sync (no arguments).', upgrade: 'Usage: /upgrade (no arguments).', restart: 'Usage: /restart (no arguments).',
+  rebuild_cli: 'Usage: /rebuild_cli (no arguments).',
 };
 const CHANGE_COMMANDS = ['set', 'sync', 'upgrade', 'restart', 'undo', 'approve'];
+/** Dev-only: accepted only when ManagerCommands.devRebuild says so; otherwise it is an unknown command (help text). */
+const DEV_COMMANDS = ['rebuild_cli'];
 
 /** Parses the arguments of an owner change command; null when they do not parse (the usage line is sent). */
 export function parseOwnerCommand(cmd: string, arg: string): OwnerCommand | null {
@@ -121,6 +133,7 @@ export function parseOwnerCommand(cmd: string, arg: string): OwnerCommand | null
     return { kind: 'approve', taskId, head, merge: scope === 'merge' };
   }
   if (cmd === 'sync' || cmd === 'upgrade' || cmd === 'restart') return words.length ? null : { kind: cmd };
+  if (cmd === 'rebuild_cli') return words.length ? null : { kind: 'rebuild-cli' };
   return null;
 }
 
@@ -391,11 +404,12 @@ export class TelegramTransport implements ManagerTransport {
   // ------------------------------------------------------------ commands
 
   private async onMessage(text: string): Promise<void> {
-    const m = /^\/([a-z]+)(?:@[A-Za-z0-9_]+)?(?:\s+([\s\S]*))?$/.exec(text.trim());
+    const m = /^\/([a-z][a-z_]*)(?:@[A-Za-z0-9_]+)?(?:\s+([\s\S]*))?$/.exec(text.trim());
     const cmd = m?.[1] ?? '';
     const arg = (m?.[2] ?? '').trim();
-    const change = CHANGE_COMMANDS.includes(cmd);
-    if (!['status', 'requests', 'project'].includes(cmd) && !change) { await this.send(HELP_TEXT); return; }
+    const dev = await this.devRebuild();
+    const change = CHANGE_COMMANDS.includes(cmd) || (dev && DEV_COMMANDS.includes(cmd));
+    if (!['status', 'requests', 'project'].includes(cmd) && !change) { await this.send(helpText(dev)); return; }
     if (!this.commands) { await this.send('The host manager is starting; try again in a moment.'); return; }
     try {
       if (change) await this.change(cmd, arg);
@@ -411,9 +425,14 @@ export class TelegramTransport implements ManagerTransport {
   private async change(cmd: string, arg: string): Promise<void> {
     const c = parseOwnerCommand(cmd, arg);
     if (!c) { await this.send(USAGE[cmd]!); return; }
-    if (c.kind === 'upgrade' || c.kind === 'sync') await this.send(`Planning /${cmd} (a dry run on the host)…`);
+    if (c.kind === 'upgrade' || c.kind === 'sync' || c.kind === 'rebuild-cli') await this.send(`Planning /${cmd} (a dry run on the host)…`);
     const offer = await this.commands!.propose(this.selected, c);
     await this.sendOffer(offer);
+  }
+
+  /** Whether the dev-only /rebuild_cli exists for the picked project (or any); false when it cannot be told. */
+  private async devRebuild(): Promise<boolean> {
+    try { return (await this.commands?.devRebuild?.(this.selected)) === true; } catch { return false; }
   }
 
   private async requests(): Promise<void> {
