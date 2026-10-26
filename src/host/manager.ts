@@ -16,11 +16,12 @@
 //   reported as "interrupted, state unknown" and closed as `failed` (row marked failed). It is never resumed: the
 //   owner sees it re-offered and confirms it again, or rejects it.
 // - The transport (ManagerTransport) is the only channel to the owner: send an offer, receive confirm / reject
-//   events, send an outcome. Phase 4 plugs in the manager bot (owner check, inline buttons, double tap for a plan
-//   with `loosens`); until then `manager run` uses a log transport (JSON lines on stdout, no events: confirm in the
-//   terminal with the printed `settings apply --confirm` command, which uses the same journal).
+//   events, send an outcome. Once the manager bot is paired, `manager run` uses the Bot API transport
+//   (src/host/manager-telegram.ts: owner check, inline buttons, double tap for a plan with `loosens`, /status,
+//   /requests, /project). Unpaired it uses a log transport (JSON lines on stdout, no events: confirm in the terminal
+//   with the printed `settings apply --confirm` command, which uses the same journal).
 import { open, readFile, rm } from 'node:fs/promises';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import type { Command } from 'commander';
 import { action, requireMode } from '../core/cli-helpers.js';
 import { displayText } from '../core/control-chars.js';
@@ -38,9 +39,13 @@ import {
   childUpgrade, confirmOffer, fetchRequests, formatPlan, fromContainerOf, hostCli, mark, offerRequest, planArgv,
   recordApplyResult, rejectRequest, snapshotOf, type ChangePlan, type ChangeRequestDeps,
 } from './change-requests.js';
+import { readManagerToken } from './credentials.js';
 import { DELEGATE_MAX_OUTPUT_BYTES, DELEGATE_TIMEOUT_MS, delegateCapture } from './delegate.js';
+import { loadManagerAccess, type ManagerAccess } from './manager-bot.js';
+import { telegramTransport } from './manager-telegram.js';
 import { loadProjectJson, type ProjectJson } from './project.js';
 import { loadRegistry } from './registry.js';
+import { parseStatusEnvelope } from './restart-required.js';
 import { defaultSettingsRuntime, type SettingsRuntime } from './settings-cli.js';
 import { formatValue } from './settings.js';
 
@@ -79,6 +84,18 @@ export interface ManagerTransport {
   /** Waits up to waitMs (or until signal aborts) for owner events; returns them (possibly none). */
   receive(waitMs: number, signal?: AbortSignal): Promise<ManagerEvent[]>;
   sendOutcome(outcome: ManagerOutcome): Promise<void>;
+  /** Gives the transport the read-only owner commands (/status, /requests, /project); called once before the loop. */
+  attach?(commands: ManagerCommands): void;
+}
+
+/** Read-only views for the owner commands of a transport. They never confirm or apply anything. */
+export interface ManagerCommands {
+  /** The registered projects (name: the repository directory name). */
+  projects(): Promise<{ projectId: string; name: string }[]>;
+  /** Plain text: per project (or only projectId), runtime, coordinator, active leases, pending change requests. */
+  status(projectId: string | null): Promise<string>;
+  /** The offers still waiting for the owner (newest journal entry is the offer), oldest first. */
+  pending(projectId: string | null): Promise<ManagerOffer[]>;
 }
 
 // ---------------------------------------------------------------- deps
@@ -417,6 +434,64 @@ export class HostManager {
     await this.notify({ status: 'rejected', ...ids, text: [`change request ${offer.requestId} rejected (nothing applied)`, ...r.warnings.map((x) => `warning: ${x}`)].join('\n') });
   }
 
+  // ------------------------------------------------------------ read-only owner commands
+
+  /** The read-only owner commands (/status, /requests, /project) for the transport. */
+  commands(): ManagerCommands {
+    return {
+      projects: async () => (await this.deps.projects()).map((p) => ({ projectId: p.projectId, name: basename(p.repoPath) })),
+      status: (projectId) => this.statusText(projectId),
+      pending: (projectId) => this.pendingOffers(projectId),
+    };
+  }
+
+  /**
+   * Offers still waiting for the owner: requests whose newest journal entry is an offer (expired ones included: a
+   * Confirm then brings a fresh offer). Built from the journal's own plan, never from the container.
+   */
+  async pendingOffers(projectId: string | null): Promise<ManagerOffer[]> {
+    const last = new Map<string, JournalEntry>();
+    for (const e of await readJournal()) last.set(`${e.projectId}\0${e.requestId}`, e);
+    const out: ManagerOffer[] = [];
+    for (const e of last.values()) {
+      if (e.type !== 'offer' || (projectId && e.projectId !== projectId)) continue;
+      try {
+        const plan = e.plan as ChangePlan;
+        out.push({
+          projectId: e.projectId, requestId: e.requestId, kind: plan.kind, nonce: e.nonce, digest: e.digest, expiresAt: e.expiresAt,
+          summary: planSummary(plan), text: formatPlan(plan, e.digest, []), loosens: plan.loosens ?? null,
+        });
+      } catch (err) { this.deps.log(`journal: the offer of ${e.requestId} cannot be shown: ${(err as Error).message}`); }
+    }
+    return out;
+  }
+
+  /** /status: per project the runtime, the coordinator and active leases (from the runtime's status), pending requests. */
+  async statusText(projectId: string | null): Promise<string> {
+    const projects = (await this.deps.projects()).filter((p) => !projectId || p.projectId === projectId);
+    if (!projects.length) return projectId ? `Project ${projectId} is not registered.` : 'No registered projects.';
+    const pending = await this.pendingOffers(projectId);
+    const blocks: string[] = [];
+    for (const p of projects) {
+      const lines = [`${basename(p.repoPath)} (${p.projectId})`];
+      let running = false;
+      try { running = await this.deps.running(p); } catch (e) { lines.push(`  runtime: unknown (${(e as Error).message})`); }
+      if (running) {
+        lines.push('  runtime: running');
+        try {
+          const st = parseStatusEnvelope((await this.runtime.exec(p, ['minions', 'status', '--json'])).stdout);
+          lines.push(...(st ? runtimeStatusLines(st) : ['  coordinator: unknown (the runtime gave no status)']));
+        } catch (e) { lines.push(`  coordinator: unknown (${(e as Error).message})`); }
+      } else if (!lines[1]) lines.push('  runtime: stopped');
+      const mine = pending.filter((o) => o.projectId === p.projectId);
+      lines.push(`  pending change requests: ${mine.length}${mine.length ? ` (${mine.map((o) => `${o.requestId}: ${o.summary}`).join('; ')})` : ''}`);
+      const problem = this.reported.get(`project:${p.projectId}`);
+      if (problem) lines.push(`  last poll problem: ${problem}`);
+      blocks.push(lines.join('\n'));
+    }
+    return displayText(blocks.join('\n\n'));
+  }
+
   /**
    * The loop: startup report, then every 20 s a poll of every project; between polls the transport's owner events
    * are handled as they arrive. Returns when signal aborts.
@@ -445,7 +520,11 @@ export class HostManager {
 /** Takes the manager lock, runs the loop until signal aborts, releases the lock. */
 export async function runManager(deps: ManagerDeps, signal: AbortSignal): Promise<void> {
   const lock = await acquireManagerLock({ now: deps.now() });
-  try { await new HostManager(deps).run(signal); } finally { await lock.release(); }
+  try {
+    const m = new HostManager(deps);
+    deps.transport.attach?.(m.commands());
+    await m.run(signal);
+  } finally { await lock.release(); }
 }
 
 // ---------------------------------------------------------------- defaults and the command
@@ -458,7 +537,7 @@ export const abortableSleep = (ms: number, signal?: AbortSignal) => new Promise<
 });
 
 /**
- * Until the manager bot (phase 4): offers and outcomes as JSON lines; no owner events. The printed confirm command
+ * Without a paired manager bot (chooseTransport): offers and outcomes as JSON lines; no owner events. The printed confirm command
  * applies exactly the offered plan from the terminal (same journal, same checks).
  */
 export function logTransport(write: (line: string) => void): ManagerTransport {
@@ -467,6 +546,29 @@ export function logTransport(write: (line: string) => void): ManagerTransport {
     receive: async (waitMs, signal) => { await abortableSleep(waitMs, signal); return []; },
     sendOutcome: async (o) => write(JSON.stringify({ event: 'outcome', ...o })),
   };
+}
+
+/** Lines of /status from the runtime's `minions status --json` (untrusted: only typed fields, bounded, displayText). */
+export function runtimeStatusLines(st: Record<string, unknown>): string[] {
+  const out: string[] = [];
+  const short = (v: unknown, max = 200) => displayText(String(v)).replace(/\s+/g, ' ').slice(0, max);
+  const launch = st.coordinatorLaunch as { state?: unknown; reason?: unknown } | undefined;
+  const state = typeof launch?.state === 'string' && ['current', 'stale', 'unrecorded', 'not-running'].includes(launch.state) ? launch.state : null;
+  if (!state) out.push('  coordinator: unknown');
+  else if (state === 'not-running') out.push('  coordinator: not running');
+  else if (state === 'stale') out.push(`  coordinator: running, restart required (${short(launch?.reason ?? '')}): \`minions upgrade\``);
+  else out.push(`  coordinator: running${state === 'unrecorded' ? ' (no launch record)' : ''}`);
+  if (Array.isArray(st.activeLeases)) {
+    const leases = st.activeLeases.filter((l): l is Record<string, unknown> => !!l && typeof l === 'object');
+    const shown = leases.slice(0, 5).map((l) => `${short(l.task_id ?? '?', 40)} ${short(l.role ?? '?', 20)}`);
+    out.push(`  active leases: ${leases.length}${shown.length ? ` (${shown.join(', ')}${leases.length > shown.length ? ', …' : ''})` : ''}`);
+  }
+  if (st.paused && typeof st.paused === 'object') {
+    const p = st.paused as { intake?: unknown; starts?: unknown };
+    const what = [p.intake === true ? 'intake' : '', p.starts === true ? 'starts' : ''].filter(Boolean);
+    if (what.length) out.push(`  paused: ${what.join(', ')}`);
+  }
+  return out;
 }
 
 async function registeredProjects(log: (l: string) => void): Promise<ProjectJson[]> {
@@ -498,6 +600,30 @@ export function defaultManagerDeps(transport: ManagerTransport, log: (line: stri
   };
 }
 
+export interface TransportChoice { kind: 'telegram' | 'log'; transport: ManagerTransport; detail: string }
+
+/**
+ * The manager bot transport when the bot is paired (a stored manager-bot-token and access.json of the same bot);
+ * otherwise the log transport (JSON lines on stdout, confirm in the terminal). An unreadable store or pairing file is
+ * an error, not a silent fallback.
+ */
+export async function chooseTransport(o: {
+  write: (line: string) => void; log: (line: string) => void;
+  loadAccess?: () => Promise<ManagerAccess | null>; readToken?: () => Promise<string | null>;
+  fetch?: typeof fetch;
+}): Promise<TransportChoice> {
+  const access = await (o.loadAccess ?? loadManagerAccess)();
+  const token = access ? await (o.readToken ?? (() => readManagerToken()))() : null;
+  const fallback = (detail: string): TransportChoice => ({ kind: 'log', transport: logTransport(o.write), detail });
+  if (!access) return fallback('the manager bot is not paired (run `minions setup`): offers are printed as JSON lines');
+  if (!token) return fallback('no manager bot token is stored (run `minions setup`): offers are printed as JSON lines');
+  if (!token.startsWith(`${access.botId}:`)) return fallback('the pairing belongs to another manager bot (pair again with `minions setup`): offers are printed as JSON lines');
+  return {
+    kind: 'telegram', detail: `talking to the paired owner through manager bot ${access.botId}`,
+    transport: telegramTransport({ token, access, log: o.log, ...(o.fetch ? { fetch: o.fetch } : {}) }),
+  };
+}
+
 /** `minions manager run` (internal tier; started by the supervisor in phase 5). */
 export function registerManager(program: Command): void {
   const manager = program.command('manager')
@@ -512,7 +638,9 @@ export function registerManager(program: Command): void {
       process.once('SIGINT', stop);
       process.once('SIGTERM', stop);
       try {
-        await runManager(defaultManagerDeps(logTransport((l) => process.stdout.write(`${l}\n`)), log), ctl.signal);
+        const choice = await chooseTransport({ write: (l) => process.stdout.write(`${l}\n`), log });
+        log(choice.detail);
+        await runManager(defaultManagerDeps(choice.transport, log), ctl.signal);
       } finally {
         process.off('SIGINT', stop);
         process.off('SIGTERM', stop);
