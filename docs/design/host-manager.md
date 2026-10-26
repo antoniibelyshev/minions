@@ -275,6 +275,39 @@ terminal and without `--yes` only offers the plan; `--confirm <digest>` applies 
 rejected). Local-layer writes (config.local.json) do not bump `configRevision`, so `--expect-revision` detects changes of
 the project config; the plan digest (which covers the `from` value) catches a local edit in between.
 
+Built in task-53.4 (phase 3): the manager core in `src/host/manager.ts`, entry point the hidden internal-tier
+`minions manager run`. Decisions made there:
+
+- **Transport interface.** `ManagerTransport` has three methods: `sendOffer(offer)`, `receive(waitMs, signal)` (returns
+  `confirm` / `reject` events, each naming a request id and the offer's nonce) and `sendOutcome(outcome)` (applying,
+  applied, failed, refused, rejected, already-handled, interrupted, error). The offer carries the host's plan text, a
+  one-line summary, the digest, the expiry and `loosens`. The transport owns everything Telegram-specific: the owner
+  check, the buttons, editing a message to "Applying…", and the double tap for a plan with `loosens`. The core trusts
+  only the nonce, never the event's wording. Until phase 4, `manager run` uses a log transport (JSON lines on stdout,
+  no events): the printed `settings apply <id> --confirm <digest>` confirms from the terminal against the same journal.
+- **Loop.** A single sequential loop: the startup report, then every 20 s a poll of every registered project, with the
+  transport's events handled one at a time between polls. Because nothing runs concurrently, a long apply delays the
+  next poll. An error in one project is reported once per distinct message and does not stop the others. A stopped
+  runtime is skipped quietly.
+- **Polling.** The delegate runs `minions settings requests --json` in the runtime with captured output
+  (`delegateCapture`, `src/host/delegate.ts`), 30 s timeout and 256 KiB cap (`run()` gained `maxOutputBytes`). The
+  manager drops a timed-out or oversize answer, whatever the delegate returned. Malformed rows are ignored and
+  reported once. A request is offered when the journal has nothing for it or its newest entry is `failed`: that fresh
+  offer is the retry or rerun. A pending offer is not repeated, except when sending it failed.
+- **Confirm and apply.** `confirmOffer` (shared with `settings apply --confirm`) runs the nonce, handled, expiry,
+  revision and digest checks and appends `confirmed` as one step under the journal lock. An expired, revision or digest
+  refusal sends a fresh offer if the request is still open. Then the manager appends `applying` (with the command) and
+  runs the child `minions --json <argv>`. `planArgv` builds that argv from the journal's plan and request snapshot, and
+  the plan's `steps` text is the same argv, so the digest covers exactly what runs. Upgrades run through the existing
+  `childUpgrade`. The outcome is journaled and the row marked (`recordApplyResult`).
+- **Interrupted entries.** `confirmed` and `applying` entries record the writer's pid and process start time. At
+  startup, a request whose newest entry is one of them, written by a process that is gone, is reported as
+  "interrupted, state unknown". It is closed as `failed` in the journal and the row, and never re-run: the next poll
+  offers it afresh, and the owner confirms it again (re-run) or rejects it. An entry of a process that still runs, for
+  example a terminal `settings apply`, is left alone.
+- **Lock.** `<MINIONS_HOME>/manager/lock` holds `{pid, start, at}`, taken with `O_EXCL`. A live holder makes a second
+  manager fail with CONFLICT. The lock of a dead or reused pid is taken over. The lock is released on exit.
+
 
 Child tasks, filed as task-53.2 to task-53.7 (phases 1 to 6) and task-53.8 (coordinator proposal):
 

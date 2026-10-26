@@ -3,7 +3,8 @@
 // the host runtime's `minions` shim (same code, MINIONS_RUNTIME=host and the host paths).
 import { MinionsError } from '../core/errors.js';
 import { Compose } from './docker.js';
-import { loadProjectJson } from './project.js';
+import type { RunResult } from '../core/exec.js';
+import { loadProjectJson, type ProjectJson } from './project.js';
 import { projectForPath } from './registry.js';
 import { HostRuntime, prepareHostRuntime, runtimeOf } from './runtime.js';
 
@@ -30,3 +31,17 @@ export async function delegateToRuntime(args: string[], opts: { json: boolean; c
 
 /** @deprecated name kept for existing callers; delegates to the configured runtime. */
 export const delegateToContainer = delegateToRuntime;
+
+/** Limits of a captured delegate exec whose output is untrusted (the host manager's polls). */
+export const DELEGATE_TIMEOUT_MS = 30_000;
+export const DELEGATE_MAX_OUTPUT_BYTES = 256 * 1024;
+
+/**
+ * Runs `minions <args>` (args include the leading `minions`) in the project's runtime with captured output, a
+ * timeout and an output cap (the child is killed when either is hit; see `timedOut` / `outputLimited`). Never
+ * throws for a failing command: the caller decides (the output is untrusted container output).
+ */
+export function delegateCapture(project: ProjectJson, args: string[], o: { timeoutMs?: number; maxOutputBytes?: number } = {}): Promise<RunResult> {
+  const opts = { allowFailure: true, timeoutMs: o.timeoutMs ?? DELEGATE_TIMEOUT_MS, maxOutputBytes: o.maxOutputBytes ?? DELEGATE_MAX_OUTPUT_BYTES };
+  return runtimeOf(project) === 'host' ? new HostRuntime(project).exec(args, opts) : new Compose(project.projectId).exec(args, opts);
+}

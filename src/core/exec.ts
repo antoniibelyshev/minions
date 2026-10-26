@@ -9,8 +9,13 @@ export interface RunOptions {
    * has `aborted: true` and code 130. Already aborted: nothing is spawned. Optional; no effect when absent.
    */
   signal?: AbortSignal;
+  /**
+   * Cap on stdout plus stderr in bytes: once exceeded, the child is killed like on a timeout, the output kept so far
+   * stays (cut at the cap) and the result has `outputLimited: true` (code 125 unless it timed out or was aborted).
+   */
+  maxOutputBytes?: number;
 }
-export interface RunResult { code: number; stdout: string; stderr: string; timedOut?: boolean; aborted?: boolean }
+export interface RunResult { code: number; stdout: string; stderr: string; timedOut?: boolean; aborted?: boolean; outputLimited?: boolean }
 
 /** Grace between SIGTERM and SIGKILL (timeout and abort). */
 const KILL_GRACE_MS = 2000;
@@ -28,10 +33,21 @@ export function run(cmd: string, args: string[], opts: RunOptions = {}): Promise
       cwd: opts.cwd, env: opts.env ?? process.env, shell: false,
       stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true,
     });
-    let stdout = '', stderr = '', timedOut = false, aborted = false, settled = false;
-    child.stdout.setEncoding('utf8').on('data', (d: string) => (stdout += d));
-    child.stderr.setEncoding('utf8').on('data', (d: string) => (stderr += d));
+    let stdout = '', stderr = '', timedOut = false, aborted = false, settled = false, outputLimited = false, bytes = 0;
     let killTimer: NodeJS.Timeout | undefined;
+    const take = (d: string): string => {
+      if (opts.maxOutputBytes === undefined) return d;
+      if (outputLimited) return '';
+      const n = Buffer.byteLength(d);
+      if (bytes + n <= opts.maxOutputBytes) { bytes += n; return d; }
+      const keep = Buffer.from(d).subarray(0, Math.max(0, opts.maxOutputBytes - bytes)).toString('utf8');
+      bytes = opts.maxOutputBytes;
+      outputLimited = true;
+      terminate();
+      return keep;
+    };
+    child.stdout.setEncoding('utf8').on('data', (d: string) => (stdout += take(d)));
+    child.stderr.setEncoding('utf8').on('data', (d: string) => (stderr += take(d)));
     const terminate = () => {
       if (killTimer || settled) return;
       child.kill('SIGTERM');
@@ -57,8 +73,9 @@ export function run(cmd: string, args: string[], opts: RunOptions = {}): Promise
       const result: RunResult = { code: code ?? (signal ? 128 : 1), stdout, stderr };
       if (timedOut) { result.timedOut = true; result.code = 124; }
       if (aborted) { result.aborted = true; result.code = 130; }
+      if (outputLimited) { result.outputLimited = true; if (!timedOut && !aborted) result.code = 125; }
       if (result.code === 0 || opts.allowFailure) return resolve(result);
-      const why = timedOut ? `timed out after ${opts.timeoutMs}ms` : aborted ? 'was aborted' : `exited with code ${result.code}`;
+      const why = timedOut ? `timed out after ${opts.timeoutMs}ms` : aborted ? 'was aborted' : outputLimited ? `wrote more than ${opts.maxOutputBytes} bytes of output` : `exited with code ${result.code}`;
       reject(new MinionsError('INTERNAL', `${cmd} ${why}${stderr.trim() ? `: ${redact(tail(stderr.trim()))}` : ''}`,
         undefined, { cmd, args: args.map(redact), code: result.code, timedOut, ...(aborted ? { aborted } : {}) }));
     }));
