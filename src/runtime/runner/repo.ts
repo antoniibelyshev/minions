@@ -3,8 +3,9 @@
 // in the shared repository, the post-exit sanitizing of the worker-written clone, the branch rule and the
 // fast-forward-only fetch-back with fsck. Every git command goes through runnerGit (git-hardening.ts).
 import { constants, realpathSync } from 'node:fs';
-import { lstat, mkdir, open, readdir, readFile, rm } from 'node:fs/promises';
-import { dirname, isAbsolute, join, resolve } from 'node:path';
+import { randomBytes } from 'node:crypto';
+import { lstat, mkdir, open, readdir, readFile, rename, rm } from 'node:fs/promises';
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { MinionsError } from '../../core/errors.js';
 import { runnerGit, type RawRun, type RunnerGitTarget } from '../git-hardening.js';
 import type { RunResult } from '../../core/exec.js';
@@ -29,21 +30,40 @@ export interface RepoContext {
 
 const real = (p: string) => { try { return realpathSync(p); } catch { return p; } };
 
-/** O_NOFOLLOW write: a symlink (or another non-file) at `path` is removed first, never followed. */
+/**
+ * Atomic, link-safe write: the content goes to a fresh temp file in the same directory (O_EXCL | O_NOFOLLOW), which
+ * is then renamed over `path`. The target is replaced, never opened, so neither a symlink nor a hard link at `path`
+ * is written through. A directory (or another non-file) in its place is removed first.
+ */
 export async function writeNoFollow(path: string, content: string, mode = 0o644): Promise<void> {
   const st = await lstat(path).catch(() => null);
-  if (st && !st.isFile()) await rm(path, { recursive: true, force: true });
-  const fh = await open(path, constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW, mode);
-  try { await fh.writeFile(content); } finally { await fh.close(); }
+  if (st && !st.isFile() && !st.isSymbolicLink()) await rm(path, { recursive: true, force: true });
+  const tmp = join(dirname(path), `.${basename(path)}.minions-${process.pid}-${randomBytes(6).toString('hex')}.tmp`);
+  const fh = await open(tmp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, mode);
+  try {
+    try { await fh.writeFile(content); await fh.chmod(mode); } finally { await fh.close(); }
+    await rename(tmp, path);
+  } catch (e) {
+    await rm(tmp, { force: true });
+    throw e;
+  }
 }
 
-/** Reads a regular file without following a symlink; null when absent; throws `not a regular file` otherwise. */
+/**
+ * Reads a regular file without following a symlink; null when absent; throws `not a regular file` otherwise, and
+ * `hard-linked` when it has more than one link (a hard link can tie it to a file outside the repository).
+ */
 async function readRegular(path: string): Promise<string | null> {
   const st = await lstat(path).catch(() => null);
   if (!st) return null;
   if (!st.isFile()) throw new Error(`${path} is not a regular file`);
   const fh = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
-  try { return await fh.readFile('utf8'); } finally { await fh.close(); }
+  try {
+    const fst = await fh.stat();
+    if (!fst.isFile()) throw new Error(`${path} is not a regular file`);
+    if (fst.nlink > 1) throw new Error(`${path} is hard-linked (${fst.nlink} links)`);
+    return await fh.readFile('utf8');
+  } finally { await fh.close(); }
 }
 
 // ------------------------------------------------------------------------------------------ lease git files
@@ -174,8 +194,8 @@ async function branchHead(ctx: RepoContext): Promise<string | null> {
 
 /**
  * Post-exit 7.2: `lstat` the whole `.git` tree of the clone first. `.git` must be a real directory and nothing
- * below it may be a symlink or a special file (a symlink would turn the runner's next write into a write anywhere,
- * `/state` included). Returns the violations; when there are none, the control files are rewritten.
+ * below it may be a symlink, a special file or a file with more than one link (a symlink or a hard link would
+ * turn the runner's next write into a write anywhere, `/state` included). Returns the violations; when there are none, the control files are rewritten.
  */
 export async function sanitizeClone(ctx: RepoContext, commonDir: string): Promise<string[]> {
   const violations: string[] = [];
@@ -190,6 +210,10 @@ export async function sanitizeClone(ctx: RepoContext, commonDir: string): Promis
       if (e.isSymbolicLink()) violations.push(`clone: symlink in the git dir: ${p}`);
       else if (e.isDirectory()) await walk(p);
       else if (!e.isFile()) violations.push(`clone: special file in the git dir: ${p}`);
+      else {
+        const st = await lstat(p).catch(() => null);
+        if (st && st.nlink > 1) violations.push(`clone: hard link in the git dir: ${p} (${st.nlink} links)`);
+      }
       if (violations.length >= 20) return;
     }
   };

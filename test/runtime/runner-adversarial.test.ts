@@ -263,11 +263,10 @@ describe('tester: the shared side', () => {
 });
 
 describe('tester: hard links in the git dirs the runner rewrites', () => {
-  // KNOWN DEFECT (task-14.4 QA): a hard link passes lstat as a regular file, and writeNoFollow (repo.ts) opens it
-  // with O_TRUNC, so the runner writes through it to whatever file it is linked to. Under L1 the link into /state
-  // is denied (Landlock REFER); without L1 the post-exit rewrite must still not write through, as with symlinks.
-  // These are it.fails until the runner refuses nlink > 1 or replaces files by rename: flip them to it() then.
-  it.fails('.git/config hard-linked to a "state" file is not overwritten by the sanitize rewrite', async () => {
+  // Regression (task-14.4 QA): a hard link passes lstat as a regular file. The runner refuses nlink > 1 in the clone
+  // .git walk and on the lease git files, and writeNoFollow (repo.ts) replaces files by rename, so it never writes
+  // through a link even if a check is missed. Under L1 the link into /state is also denied (Landlock REFER).
+  it('.git/config hard-linked to a "state" file is not overwritten by the sanitize rewrite', async () => {
     const r = rig();
     const b = await claim(r);
     const stateFile = join(r.root, 'state-dir', 'precious');
@@ -279,7 +278,7 @@ describe('tester: hard links in the git dirs the runner rewrites', () => {
     expect(readFileSync(stateFile, 'utf8')).toBe('precious\n');
   });
 
-  it.fails('the lease worktree .git pointer hard-linked to a "state" file is not overwritten by the restore', async () => {
+  it('the lease worktree .git pointer hard-linked to a "state" file is not overwritten by the restore', async () => {
     const r = rig();
     const b = await claim(r);
     const stateFile = join(r.root, 'state-dir', 'precious');
@@ -289,5 +288,55 @@ describe('tester: hard links in the git dirs the runner rewrites', () => {
     const out = await runLease(b.leaseId, r.deps({ steps: [{ op: 'commit', file: 'a.txt' }, { op: 'result' }, { op: 'sh', script: `rm ${dotGit} && ln ${stateFile} ${dotGit}` }] }));
     expect(out.violations.join('\n')).toMatch(/lease git files changed/);
     expect(readFileSync(stateFile, 'utf8')).toBe('precious\n');
+  });
+});
+
+describe('engineer: hard-link refusal and link-safe rewrites (task-14.4 repair)', () => {
+  it('reports a hard link anywhere in the clone .git tree as a violation and fetches nothing', async () => {
+    const r = rig();
+    const b = await claim(r);
+    const outside = join(r.root, 'outside-file');
+    writeFileSync(outside, 'outside\n');
+    const out = await runLease(b.leaseId, r.deps({ steps: [{ op: 'commit', file: 'a.txt' }, { op: 'result' }, { op: 'sh', script: `ln ${outside} .git/refs/heads/planted` }] }));
+    expect(out.violations.join('\n')).toMatch(/hard link in the git dir: .*planted/);
+    expect(readFileSync(outside, 'utf8')).toBe('outside\n');
+    expect(headOf(r, b.branch)).toBe(b.expectedHead);
+    expect(submitted(r, b).status).toBe('blocked');
+  });
+
+  it('a hard-linked lease worktree .git pointer is replaced by a fresh file, the link target untouched', async () => {
+    const r = rig();
+    const b = await claim(r);
+    const outside = join(r.root, 'outside-file');
+    writeFileSync(outside, 'outside\n');
+    const dotGit = join(b.worktree, '.git');
+    const pointer = readFileSync(dotGit, 'utf8');
+    await runLease(b.leaseId, r.deps({ steps: [{ op: 'result' }, { op: 'sh', script: `rm ${dotGit} && ln ${outside} ${dotGit}` }] }));
+    expect(readFileSync(outside, 'utf8')).toBe('outside\n');
+    expect(readFileSync(dotGit, 'utf8')).toBe(pointer);
+    expect(statSync(dotGit).nlink).toBe(1);
+  });
+});
+
+describe('engineer: writeNoFollow replaces instead of writing through', () => {
+  it('leaves hard-link and symlink targets untouched and leaves no temp file behind', async () => {
+    const { writeNoFollow } = await import('../../src/runtime/runner/repo.js');
+    const { linkSync, mkdtempSync, symlinkSync, lstatSync } = await import('node:fs');
+    const dir = mkdtempSync(join(process.env.TMPDIR ?? '/tmp', 'wnf-'));
+    const target = join(dir, 'target');
+    writeFileSync(target, 'keep\n');
+    linkSync(target, join(dir, 'hard'));
+    symlinkSync(target, join(dir, 'soft'));
+    await writeNoFollow(join(dir, 'hard'), 'new-hard\n');
+    await writeNoFollow(join(dir, 'soft'), 'new-soft\n', 0o600);
+    expect(readFileSync(target, 'utf8')).toBe('keep\n');
+    expect(readFileSync(join(dir, 'hard'), 'utf8')).toBe('new-hard\n');
+    expect(lstatSync(join(dir, 'soft')).isSymbolicLink()).toBe(false);
+    expect(readFileSync(join(dir, 'soft'), 'utf8')).toBe('new-soft\n');
+    expect(lstatSync(join(dir, 'soft')).mode & 0o777).toBe(0o600);
+    mkdirSync(join(dir, 'adir'));
+    await writeNoFollow(join(dir, 'adir'), 'was-a-dir\n');
+    expect(readFileSync(join(dir, 'adir'), 'utf8')).toBe('was-a-dir\n');
+    expect(readdirSync(dir).sort()).toEqual(['adir', 'hard', 'soft', 'target']);
   });
 });
