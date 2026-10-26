@@ -141,6 +141,24 @@ export function recordLeaseUsage(db: RuntimeDb, leaseId: string, u: UsageInput):
   return data;
 }
 
+/**
+ * The latest usage figure stored for a lease, or null. Used by `record`/`release` to keep a measured figure
+ * (runner, coordinator --usage, `work spend --lease`) from being replaced by a worker's self-reported block.
+ */
+export function latestLeaseUsage(db: RuntimeDb, leaseId: string): { tokens: number; model: string | null; source: string } | null {
+  const lease = db.lease(leaseId);
+  if (!lease) return null;
+  const key = `lease:${leaseId}`;
+  let found: UsageEventData | null = null;
+  for (const r of db.all<{ data_json: string | null }>("SELECT data_json FROM events WHERE kind = 'usage' AND task_id = ? ORDER BY id", lease.task_id)) {
+    try {
+      const d = JSON.parse(r.data_json ?? 'null') as UsageEventData | null;
+      if (d && d.key === key && typeof d.tokens === 'number') found = d;
+    } catch { /* not a usage payload */ }
+  }
+  return found ? { tokens: found.tokens, model: found.model ?? null, source: found.source } : null;
+}
+
 /** Stores the coordinator session's own cumulative total; the latest figure per session counts. */
 export function recordSessionUsage(db: RuntimeDb, session: string, u: UsageInput): UsageEventData {
   checkTokens(u.tokens);
