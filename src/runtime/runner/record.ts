@@ -3,8 +3,9 @@
 // It is the one-process-per-lease lock and everything recovery (`reapRun`) needs after a crash: cleanup is
 // driven by the record, never by runner memory. The record dir also holds the runner-owned files the worker
 // must never write (sandbox rules, the runner's git global config and clone template) and the cancel mark.
-import { constants } from 'node:fs';
-import { mkdir, open, readFile, readdir, rm, stat } from 'node:fs/promises';
+import { constants, readdirSync, readFileSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
+import { link, mkdir, open, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { MinionsError } from '../../core/errors.js';
 import { atomicWrite } from '../../core/fsutil.js';
@@ -50,7 +51,7 @@ export interface RunRecord {
   createdAt: string;
   updatedAt: string;
   /** Set at `done`: what happened (submitted status, wip commit, violations). */
-  outcome?: { status: string | null; submitted: boolean; wipCommit: string | null; violations: string[]; head: string | null; reason: string };
+  outcome?: { status: string | null; submitted: boolean; wipCommit: string | null; violations: string[]; head: string | null; reason: string; note?: string };
 }
 
 const LEASE_ID = /^lease-[A-Za-z0-9_-]+$/;
@@ -62,6 +63,7 @@ export function runDir(state: string, leaseId: string): string {
 }
 export const runRecordPath = (state: string, leaseId: string) => join(runDir(state, leaseId), 'run.json');
 export const cancelMarkPath = (state: string, leaseId: string) => join(runDir(state, leaseId), 'cancel');
+export const ownerLockPath = (state: string, leaseId: string) => join(runDir(state, leaseId), 'owner.lock');
 
 /**
  * Creates the record exclusively: a second `work run` of one lease (or a run after a crash that left the record)
@@ -85,7 +87,9 @@ export async function createRunRecord(state: string, rec: RunRecord): Promise<st
   return dir;
 }
 
+/** Null for no record; an id that is not a lease id (`lease-…`) can never have one. */
 export async function readRunRecord(state: string, leaseId: string): Promise<RunRecord | null> {
+  if (!LEASE_ID.test(leaseId)) return null;
   let text: string;
   try { text = await readFile(runRecordPath(state, leaseId), 'utf8'); } catch (e) {
     if ((e as NodeJS.ErrnoException).code === 'ENOENT') return null;
@@ -109,6 +113,32 @@ export async function hasOpenRun(state: string, leaseId: string): Promise<boolea
   try { const r = await readRunRecord(state, leaseId); return !!r && r.phase !== 'done'; } catch { return true; }
 }
 
+/**
+ * Lease ids whose record is not `done` (an unreadable record counts as not done). Synchronous, for the restart
+ * checks that count unfinished runs as running workers.
+ */
+export function openRunsSync(state: string): string[] {
+  let names: string[];
+  try { names = readdirSync(runLeasesDir(state)).filter((n) => LEASE_ID.test(n)).sort(); } catch { return []; }
+  return names.filter((n) => {
+    let text: string;
+    try { text = readFileSync(join(runLeasesDir(state), n, 'run.json'), 'utf8'); } catch (e) { return (e as NodeJS.ErrnoException).code !== 'ENOENT'; }
+    try { return (JSON.parse(text) as RunRecord).phase !== 'done'; } catch { return true; }
+  });
+}
+
+/**
+ * D3b restarts: the workers a restart must count, i.e. the active leases plus every run record that is not `done`
+ * and has no active lease (labelled as such).
+ */
+export function withOpenRuns(activeLeases: () => { id: string }[], state: string): () => { id: string }[] {
+  return () => {
+    const leases = activeLeases().map((l) => ({ id: l.id }));
+    const runs = openRunsSync(state).filter((id) => !leases.some((l) => l.id === id)).map((id) => ({ id: `${id} (unfinished process run)` }));
+    return [...leases, ...runs];
+  };
+}
+
 /** Lease ids with a record dir (any phase). */
 export async function listRunRecords(state: string): Promise<string[]> {
   try { return (await readdir(runLeasesDir(state))).filter((n) => LEASE_ID.test(n)).sort(); } catch { return []; }
@@ -121,11 +151,85 @@ export const cancelMarked = (state: string, leaseId: string): Promise<boolean> =
 
 /** Removes a `done` record dir (when the lease has ended). Refuses any other phase. */
 export async function removeRunRecord(state: string, leaseId: string): Promise<boolean> {
+  if (!LEASE_ID.test(leaseId)) return false;
   const r = await readRunRecord(state, leaseId).catch(() => undefined);
   if (r === null) { await rm(runDir(state, leaseId), { recursive: true, force: true }); return true; }
   if (!r || r.phase !== 'done') return false;
   await rm(runDir(state, leaseId), { recursive: true, force: true });
   return true;
+}
+
+// ------------------------------------------------------------------------------------------------ owner lock
+
+/**
+ * Who may run post-exit for a record (D3b: recovery never races the live runner). The runner takes it when it
+ * creates the record and keeps it to the end; a reaper takes it only from a holder that is dead (pid, start time
+ * and host checked), so it first asks a live runner to cancel and, on timeout, kills it. A runner whose token is no
+ * longer the lock's backs off. Created with link(2), so the file appears with its content in one step.
+ */
+export interface OwnerToken extends ProcIdentity { nonce: string; role: 'runner' | 'reaper'; host: HostIdentity | null }
+
+export function ownerToken(me: ProcIdentity, role: OwnerToken['role'], host: HostIdentity | null): OwnerToken {
+  return { ...me, role, host, nonce: randomBytes(8).toString('hex') };
+}
+
+/** The lock holder; null when there is none. Fails closed: an unreadable lock throws. */
+export async function readOwner(state: string, leaseId: string): Promise<OwnerToken | null> {
+  let text: string;
+  try { text = await readFile(ownerLockPath(state, leaseId), 'utf8'); } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw e;
+  }
+  try {
+    const t = JSON.parse(text) as OwnerToken;
+    if (typeof t.pid !== 'number' || typeof t.startTime !== 'string' || typeof t.nonce !== 'string') throw new Error('shape');
+    return t;
+  } catch {
+    throw new MinionsError('INTERNAL', `The run owner lock of ${leaseId} is unreadable.`, `Inspect ${ownerLockPath(state, leaseId)}.`);
+  }
+}
+
+/** Whether the holder still runs: same boot and container start, and the same live process. */
+export async function ownerAlive(t: OwnerToken, proc = '/proc'): Promise<boolean> {
+  return sameHost(t.host, await hostIdentity(proc)) && isAlive(t, proc);
+}
+
+async function createOwner(path: string, t: OwnerToken): Promise<boolean> {
+  const tmp = `${path}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;
+  await writeFile(tmp, JSON.stringify(t) + '\n', { mode: 0o600, flag: 'wx' });
+  try { await link(tmp, path); return true; } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === 'EEXIST') return false;
+    throw e;
+  } finally { await rm(tmp, { force: true }); }
+}
+
+/** Takes the owner lock, or reports the live holder. A dead holder's lock is moved aside and taken. */
+export async function acquireOwner(state: string, leaseId: string, t: OwnerToken, proc = '/proc'): Promise<{ ok: true } | { ok: false; holder: OwnerToken }> {
+  const path = ownerLockPath(state, leaseId);
+  for (let i = 0; i < 5; i++) {
+    if (await createOwner(path, t)) return { ok: true };
+    const holder = await readOwner(state, leaseId);
+    if (!holder) continue;
+    if (holder.nonce === t.nonce) return { ok: true };
+    if (await ownerAlive(holder, proc)) return { ok: false, holder };
+    const aside = `${path}.stale-${randomBytes(6).toString('hex')}`;
+    try { await rename(path, aside); } catch (e) { if ((e as NodeJS.ErrnoException).code === 'ENOENT') continue; throw e; }
+    // Another taker may have replaced the dead lock between our read and the rename: give that one back.
+    const moved = await readFile(aside, 'utf8').then((x) => JSON.parse(x) as OwnerToken, () => null);
+    if (moved && moved.nonce !== holder.nonce) await link(aside, path).catch(() => undefined);
+    await rm(aside, { force: true });
+  }
+  const holder = await readOwner(state, leaseId);
+  if (holder && holder.nonce !== t.nonce) return { ok: false, holder };
+  throw new MinionsError('CONFLICT', `Could not take the run owner lock of ${leaseId}.`, 'Retry; another recovery may be in progress.');
+}
+
+export const ownsRun = async (state: string, leaseId: string, t: OwnerToken): Promise<boolean> =>
+  (await readOwner(state, leaseId).catch(() => null))?.nonce === t.nonce;
+
+/** Drops the lock if `t` still holds it. */
+export async function releaseOwner(state: string, leaseId: string, t: OwnerToken): Promise<void> {
+  if (await ownsRun(state, leaseId, t)) await rm(ownerLockPath(state, leaseId), { force: true });
 }
 
 // ------------------------------------------------------------------------------------------------ identities

@@ -1026,6 +1026,56 @@ sanitize and fetch-back; `supervise.ts`; `adapter.ts` contract and the fake adap
   seccomp-count escapee sweep (`reapRun` kills only the recorded group); the re-claim gate in `work claim`; removing
   `done` records when the lease ends (`removeRunRecord` exists); restart counting.
 
+### Addendum: child task 8 implementation decisions (task-14.5)
+
+Orphan recovery and launch guards, on top of the task-14.4 runner:
+
+- **Owner lock.** `<record dir>/owner.lock` (pid, start time, host identity, nonce, role `runner` or `reaper`),
+  created with `link(2)` so it appears with its content in one step. The runner takes it when it creates the record
+  and holds it to the end. A reaper takes it only from a dead holder (other boot or container start, or pid and
+  start time no longer match); a stale lock is renamed aside, and given back if another taker replaced it in
+  between. So `reapRun` never races the live runner: a live runner gets the cancel mark and 60 s, then it is
+  SIGKILLed before the reaper takes the lock. A second live reaper is a `CONFLICT` (the release is refused and
+  can be retried). A runner whose token is no longer the lock's backs off and submits nothing. `work run` refuses
+  to start (`PRECONDITION`) when it cannot read its own start time or the host identity, since recovery could not
+  tell it is alive; an unreadable lock fails closed (`INTERNAL`).
+- **Cancel means partial.** The cancel mark is written only by `reapRun`. The runner treats it like a drain: a
+  `wip: runner checkpoint (cancel: recovery)` commit and a synthesized `partial`. When the reap came from a
+  release, the submission is dropped with the lease files; at coordinator start the recover skill can record it.
+- **Where `reapRun` runs.** `Scheduler.release` (every release: `work release`, the recover skill's
+  "worker not running" release, which is the stale-lease path since leases do not expire on their own,
+  `work cancel` and `state-import`) reaps before the lease ends; a failed reap refuses the release. The response
+  (`run`) and the backlog note name the `wip:` commit. Coordinator start (`coordinator run`, so also
+  `coordinator restart --recover` and `/minions:recover`) reaps every record that is not `done` before the
+  scratch sweep, and the sweep keeps the scratch dir of any record still open. `work record` does not reap: a
+  process lease is recorded only after its runner submitted.
+- **Record lifetime.** When a lease ends, its `done` record is removed. A record that is not `done` keeps its
+  record dir and its scratch dir (the clone that recovery still checkpoints). `done` records of ended leases left
+  behind are removed by the next coordinator start or restart.
+- **Escapee sweep** (`src/runtime/runner/escapees.ts`): the baseline is PID 1's `Seccomp_filters` (the
+  sweeper's own when PID 1 is unreadable). The live wrappers are the wrappers of other run records. The sweeper,
+  its ancestors and PID 1 are never killed, and zombies are skipped. Without the field the sweep is skipped, and
+  the run-recovered event says why; the self-test refuses launches on such a kernel anyway. The /proc root and the
+  kill function are injected, and unit tests use a fake tree. `reapRun` requires an explicit `escapees` choice:
+  production passes the real /proc, tests a fake tree or none.
+- **Re-claim gate.** `work claim` refuses (`POLICY_DENIED`) while any lease of the task has a record that is not
+  `done` (an unreadable record counts as not done).
+- **Restarts.** `coordinator restart` (with or without `--detach`) and `coordinator sync` first reap the
+  records that are not `done` and whose lease ended. Then they count the records still open as running workers,
+  next to the active leases. The context-reset check does not count them: the restart it leads to reaps those
+  orphans first, so counting them there would only wedge the reset.
+- **Lease ended before post-exit.** When the lease ended before post-exit (the task-14.4 review false positive) and
+  its clone or worktree is gone, post-exit reports "nothing fetched" with the reason in the record's
+  `outcome.note`. That is not a harness violation, and nothing is restored into a removed worktree.
+- **The Claude-subagent hook.** It is a `PreToolUse(Bash)` entry in the plugin's `hooks.json` that runs
+  `minions hook pre-bash`. That hook denies `minions work run|claim|release` whenever `agent_id` is set to
+  anything but null. The text check is coarse on purpose: quotes are dropped, the line is cut at shell separators,
+  and `minions … work <verb>` is matched. Two shell pre-filters start node only for a subagent call whose input
+  has `minions` followed by anything but `:` (`"agent_type":"minions:<role>"` alone does not count). Stdin, grep
+  and minions failures all exit 2. Obfuscated forms stay out of reach of any text check, so the `work run` gate
+  (L0) keeps its own checks.
+- **Not here:** a distinct outcome when the lease branch moves during a run (task-14.12).
+
 ## Child tasks
 
 The order of 3, 4 and 7 depends on the phase 1 option (D9). Under option (b), child task 4 starts with the gate

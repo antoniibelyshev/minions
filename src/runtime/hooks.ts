@@ -200,6 +200,60 @@ export function preTelegramHook(input: unknown): HookOutput {
   return { reason: `allow: ${tool} from the coordinator` };
 }
 
+// ---------------------------------------------------------------- pre-bash (PreToolUse, Bash)
+
+/**
+ * The plugin's PreToolUse(Bash) entry (agent-runtimes D10, task-14.5). Node starts only for a subagent call (the
+ * input has an `"agent_id"` key) whose input has `minions` followed by anything but `:` (so a worker's own
+ * `"agent_type":"minions:<role>"` alone does not count); the coordinator's own calls never reach it. These are
+ * speed filters only: any command that runs minions contains such a match. Reading stdin, a grep error and every
+ * failure of minions itself block (exit 2).
+ */
+export const PRE_BASH_HOOK_COMMAND = `i=$(cat) || exit 2; case "$i" in *'"agent_id"'*) printf '%s' "$i" | grep -q 'minions[^:]'; m=$?; [ "$m" = 1 ] && exit 0; [ "$m" = 0 ] || exit 2; printf '%s' "$i" | timeout 20 minions hook pre-bash || exit 2;; esac`;
+
+/** The verbs a Claude subagent must never run: they start, claim or end worker leases (coordinator-only). */
+export const COORDINATOR_ONLY_WORK_VERBS = ['run', 'claim', 'release'] as const;
+
+/**
+ * The first `minions work run|claim|release` in a Bash command line, or null. Deliberately coarse and
+ * conservative: quotes and backslashes are dropped first (so `sh -c '…'` bodies and quoted words are scanned
+ * too), the line is cut at shell separators, and within one piece any word whose basename is `minions` followed
+ * later by `work` and then, as the next non-option word, a coordinator-only verb matches. A false positive only
+ * blocks a subagent's command; obfuscated forms (variables, substitutions) are out of reach of any text check,
+ * which is why `work run` keeps its own gate (D4 L0).
+ */
+export function coordinatorOnlyWorkCommand(command: string): string | null {
+  const flat = command.replace(/["'\\]/g, '');
+  for (const piece of flat.split(/[;&|()`\n]|\$\(/)) {
+    const words = piece.split(/\s+/).filter(Boolean);
+    for (let i = 0; i < words.length; i++) {
+      if (basename(words[i]!) !== 'minions') continue;
+      const w = words.indexOf('work', i + 1);
+      if (w < 0) continue;
+      const verb = words.slice(w + 1).find((x) => !x.startsWith('-'));
+      if (verb && (COORDINATOR_ONLY_WORK_VERBS as readonly string[]).includes(verb)) return `minions work ${verb}`;
+    }
+  }
+  return null;
+}
+
+/**
+ * PreToolUse(Bash): a Claude subagent (`agent_id` set to anything but undefined/null, as for pre-telegram) may not
+ * run `minions work run|claim|release`: only the coordinator starts, claims and releases workers. The coordinator's
+ * own calls (no agent_id) are allowed. Fails closed on input it cannot decide: non-object input, another tool or a
+ * missing command are denied.
+ */
+export function preBashHook(input: unknown): HookOutput {
+  if (!isObj(input)) return deny('minions could not read the Bash hook input (not a JSON object); refusing the call.');
+  if (input.tool_name !== 'Bash') return deny(`minions pre-bash hook got ${typeof input.tool_name === 'string' ? `tool ${JSON.stringify(input.tool_name.slice(0, 80))}` : 'no tool_name'}; refusing the call.`);
+  const ti = isObj(input.tool_input) ? input.tool_input : null;
+  if (!ti || typeof ti.command !== 'string') return deny('minions pre-bash hook got no Bash command; refusing the call.');
+  if (input.agent_id === undefined || input.agent_id === null) return { reason: 'allow: Bash from the coordinator' };
+  const hit = coordinatorOnlyWorkCommand(ti.command);
+  if (hit) return deny(`\`${hit}\` is coordinator-only: a worker cannot start, claim or release workers. Finish your own task and return your result instead.`);
+  return { reason: 'allow: Bash from a subagent (no coordinator-only minions command)' };
+}
+
 // ---------------------------------------------------------------- drain (PreToolUse, every tool)
 
 /** Tool calls a leased worker may make freely after the first drain notice, before it is restricted. */
@@ -550,7 +604,7 @@ async function readStdin(timeoutMs = 5000): Promise<string> {
   });
 }
 
-export type HookKind = 'stop' | 'pre-agent' | 'pre-telegram' | 'drain';
+export type HookKind = 'stop' | 'pre-agent' | 'pre-telegram' | 'pre-bash' | 'drain';
 
 /** Hooks that allow on unreadable input or an internal error (the others fail closed). */
 const failsOpen = (kind: HookKind) => kind === 'stop' || kind === 'drain';
@@ -566,7 +620,7 @@ export async function runHook(kind: HookKind, load: HookLoader | DrainLoader, st
     if (parseError) {
       out = failsOpen(kind) ? { reason: `allow: unreadable hook input (${parseError})` } : deny(`minions could not parse the hook input (${parseError}).`);
     } else {
-      out = kind === 'drain' ? await drainHook(input, load) : kind === 'pre-telegram' ? preTelegramHook(input)
+      out = kind === 'drain' ? await drainHook(input, load) : kind === 'pre-telegram' ? preTelegramHook(input) : kind === 'pre-bash' ? preBashHook(input)
         : kind === 'stop' ? await stopHook(input, load as HookLoader) : await preAgentHook(input, load as HookLoader);
     }
   } catch (e) {

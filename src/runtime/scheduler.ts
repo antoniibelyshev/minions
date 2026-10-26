@@ -18,6 +18,7 @@ import { MinionsError } from '../core/errors.js';
 import { syncBaseFromOrigin, type BaseSyncResult } from './base-sync.js';
 import type { BuiltinLeaseRole, Lease, LeaseRole, PublicationState, RuntimeDb } from './db.js';
 import { removeLeaseFiles, type HandoffPaths } from './handoff.js';
+import { hasOpenRun, removeRunRecord } from './runner/record.js';
 import { missingApprovalKeyReason, runtimePaths } from './paths.js';
 import { publishTask, realGh, type GhFn, type PublishInput, type PublishOutcome } from './publish.js';
 import { isCiCheck, resultContractText, validateResult, type WorkerResult } from './results.js';
@@ -60,7 +61,16 @@ export interface SchedulerDeps {
   billing?: Billing;
   /** Harness phase rules (docs/design/agent-runtimes.md D9); default CURRENT_PHASE. Tests inject later phases. */
   phase?: PhaseRules;
+  /** Process-harness run records (agent-runtimes D3b). Omitted: no run records are consulted (tests of other paths). */
+  runs?: RunControl;
 }
+
+/**
+ * Run-record hooks of the scheduler (agent-runtimes D3b, task-14.5): `reap` (reapRun) runs before a release ends
+ * the lease and may throw to refuse it; claims are refused while a lease of the task has a record that is not
+ * `done`; `done` records are removed once their lease ended.
+ */
+export interface RunControl { state: string; reap(leaseId: string): Promise<{ note: string | null }> }
 
 /** The worker's token total from the coordinator's task notification (`--usage`); cumulative per agent. */
 export interface UsageFlag { tokens: number; model?: string | null }
@@ -307,8 +317,10 @@ export class Scheduler {
   private readonly approvalPublicKeyFile: string;
   private readonly gh: GhFn;
   private readonly now: () => Date;
+  private readonly runs: RunControl | null;
 
   constructor(deps: SchedulerDeps) {
+    this.runs = deps.runs ?? null;
     this.db = deps.db; this.backlog = deps.backlog; this.config = deps.config;
     this.layout = deps.layout ?? workspaceLayout();
     this.handoff = deps.handoff ?? null;
@@ -754,6 +766,7 @@ export class Scheduler {
       throw new MinionsError('CONFLICT', `Task ${current.id} already has an active ${held.role} lease (${held.id}).`,
         'One active stage per task: wait for it, record its result, or release it.', { leaseId: held.id, role: held.role });
     }
+    await this.assertNoOpenRun(current.id);
     const sweep = isQaSweep(current);
     // A workflow assigned between stages resets the position by evidence at the head (D5); may update the status.
     const task = sweep ? current : await this.reconcileWorkflowChange(current);
@@ -1073,9 +1086,15 @@ export class Scheduler {
    * delete is logged as a `handoff-cleanup-error` event and never fails the transition.
    */
   private async cleanupLeaseFiles(leaseId: string): Promise<void> {
+    // A run that is not done keeps its scratch dir (the clone recovery still checkpoints); a done one is removed.
+    let keepScratch = false;
+    if (this.runs) {
+      keepScratch = await hasOpenRun(this.runs.state, leaseId);
+      if (!keepScratch) await removeRunRecord(this.runs.state, leaseId).catch(() => undefined);
+    }
     if (!this.handoff) return;
     let errors: string[];
-    try { errors = await removeLeaseFiles(this.handoff, leaseId); } catch (e) { errors = [(e as Error).message]; }
+    try { errors = await removeLeaseFiles(this.handoff, leaseId, { keepScratch }); } catch (e) { errors = [(e as Error).message]; }
     if (errors.length) {
       try { this.db.addEvent('handoff-cleanup-error', this.db.lease(leaseId)?.task_id ?? null, { leaseId, errors }); } catch { /* logging only */ }
     }
@@ -1092,20 +1111,38 @@ export class Scheduler {
     return lease;
   }
 
+  /**
+   * D3b re-claim gate: a task is refused while any of its leases has a run record that is not `done` (its
+   * post-exit checks must finish first), so a re-dispatched task never gets a second writer.
+   */
+  private async assertNoOpenRun(taskId: string): Promise<void> {
+    if (!this.runs) return;
+    for (const l of this.db.leases({ taskId, all: true })) {
+      if (await hasOpenRun(this.runs.state, l.id)) {
+        throw new MinionsError('POLICY_DENIED', `Task ${taskId} has an unfinished process run (${l.id}): its post-exit checks must finish before the task is claimed again.`,
+          `Release ${l.id} if it is still active, or restart the coordinator (\`minions coordinator restart --recover\`), so recovery reaps it.`, { leaseId: l.id });
+      }
+    }
+  }
+
   /** Releases a lease without a result. The worktree and branch are always preserved. */
-  async release(leaseId: string, reason: string, opts: { usage?: UsageFlag } = {}): Promise<{ leaseId: string; taskId: string; worktree: string | null; branch: string | null; status: TaskStatus | null } & Pick<RecordResponse, 'usage' | 'budget'>> {
-    const lease = await this.requireActive(leaseId);
+  async release(leaseId: string, reason: string, opts: { usage?: UsageFlag } = {}): Promise<{ leaseId: string; taskId: string; worktree: string | null; branch: string | null; status: TaskStatus | null; run?: string } & Pick<RecordResponse, 'usage' | 'budget'>> {
+    let lease = await this.requireActive(leaseId);
+    // D3b: a process run is reaped (cancelled, or killed and checkpointed) before the lease ends; a failed reap
+    // refuses the release, so the lease never ends while its worker may still write.
+    const run = this.runs ? (await this.runs.reap(leaseId)).note : null;
+    if (this.runs) lease = await this.requireActive(leaseId);
     const usage = this.noteUsage(lease, undefined, opts.usage, 'release');
-    this.endLease(leaseId, 'released', { reason });
+    this.endLease(leaseId, 'released', { reason, ...(run ? { run } : {}) });
     await this.cleanupLeaseFiles(leaseId);
     let status: TaskStatus | null = null;
     try {
       status = (await this.restorePreClaim(lease)) ?? (await this.backlog.getTask(lease.task_id)).status;
-      await this.backlog.addNote(lease.task_id, `minions: ${lease.role} lease ${leaseId} released: ${reason}. Worktree kept at ${lease.worktree ?? '(none)'}.`);
+      await this.backlog.addNote(lease.task_id, `minions: ${lease.role} lease ${leaseId} released: ${reason}.${run ? ` Process run: ${run}.` : ''} Worktree kept at ${lease.worktree ?? '(none)'}.`);
     } catch (e) {
       this.db.addEvent('release-backlog-error', lease.task_id, { leaseId, error: (e as Error).message });
     }
-    return this.withBudget({ leaseId, taskId: lease.task_id, worktree: lease.worktree, branch: lease.branch, status }, usage);
+    return this.withBudget({ leaseId, taskId: lease.task_id, worktree: lease.worktree, branch: lease.branch, status, ...(run ? { run } : {}) }, usage);
   }
 
   /**
