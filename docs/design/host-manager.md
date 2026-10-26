@@ -1,0 +1,308 @@
+# Host manager for live setup changes: design
+
+Status: **proposed** (task-53, design only, nothing built). Folds in task-44 (live settings). The owner has to
+agree with this design before any build task starts. The child tasks are listed under [Phases](#phases); the
+coordinator files them after the owner agrees.
+
+## Goal
+
+Owner request (Telegram msg 238, 2026-10-23): the coordinator should be able to change the setup while it runs,
+without the owner restarting the container by hand. Today every such change is a host-terminal job: `minions export`
+and `minions upgrade --from-container` to sync the outer repo, `minions upgrade` for a new version, `minions settings`
+for config, and `minions settings restart` for the coordinator.
+
+Owner direction (poll, option 1): a **deterministic host manager**. It is a plain minions process on the host, not
+a Claude agent. It has **its own Telegram bot**, separate from the coordinator's bot. It applies a change **only after
+the owner confirms that change**. Nothing applies on its own.
+
+## Decisions
+
+1. **The manager is a thin, deterministic process.** It long-polls its own bot, reads requests from each registered
+   project, asks the owner, and runs the existing host commands as child processes (`minions settings set`,
+   `minions upgrade`, `minions settings restart`, `minions export`). It does not interpret free text and it has no
+   model. Every apply path it uses already exists and is tested. The manager adds only routing, confirmation and a
+   journal. A child process also means that a CLI the manager just reinstalled runs in a fresh process (the
+   "no self-continuation" rule in [bootstrap.md, Upgrade from the container](bootstrap.md#upgrade-from-the-container)).
+2. **One manager per host, one manager bot per host.** It serves every registered project, and the owner picks the
+   project with `/project <name>`, or by tapping a request that already names it. One bot per project would double
+   the bots and the pairing work for no gain in isolation: all projects already share one host user and one
+   credential store.
+3. **The container can only propose.** In the container, the commands that change the setup no longer fail with "host
+   only". They record a **change request** in the runtime DB, the same way `work approve` changes its behaviour by
+   where it runs ([bootstrap.md, Host-signed publication approvals](bootstrap.md#host-signed-publication-approvals))
+   and like `config roles propose` ([roles-and-workflows.md](roles-and-workflows.md) D2). No new container command
+   is needed.
+4. **Security-relevant settings are host-owned.** A container request for one of them is refused when it is
+   recorded, and refused again by the manager. Only the owner changes them, from the host (see
+   [Host-owned settings](#host-owned-settings)).
+5. **Every change is confirmed and bound to its exact content.** A confirmation covers one request digest, the config
+   revision it was computed against, and an expiry. If anything changed in between, the owner is asked again.
+6. **The terminal stays the baseline.** Everything the manager does stays available as the same host command. When
+   the manager is down, nothing is lost: requests wait in the runtime DB, and `minions status` lists them.
+
+## Trust boundary
+
+```
+host (owner's user)                                   project container (untrusted for setup changes)
+──────────────────────────────────────                ─────────────────────────────────────────────
+credential store: GitHub, coordinator bot,            /state/minions.db  (writable by agents)
+  manager bot token, approval signing key               change_requests rows ── proposals only
+minions manager  ⇄ api.telegram.org (manager bot)     /opt/minions/config (ro bind: runtime config,
+  │ docker compose exec app minions … --json ───────►    approval public key)
+  │ (reads requests, runs restarts)                   /opt/minions/secrets (ro bind: GitHub +
+  └─ child: minions settings | upgrade | export         coordinator bot tokens; never the manager's)
+     writes config.local.json / .minions/config.json  coordinator ⇄ api.telegram.org (coordinator bot)
+```
+
+- **Host privileges.** The manager runs as the owner's host user. It can write project config, rebuild images,
+  recreate containers, move host branches and reinstall the CLI. Those are exactly the actions it must never take on
+  the container's word alone.
+- **Container privileges, unchanged.** The container can write `/state` (so it can write change requests, but also
+  forge or edit them) and it can read the GitHub and coordinator-bot tokens. It cannot read the host credential
+  store, the manager token, the host journal or the host config files. The config dir is a read-only bind.
+- **What a request carries.** A request is a claim, never an authorization. The manager re-reads it through
+  `docker compose exec`, re-validates it against the **host's** config (`resolveEffective`), and recomputes the diff
+  and the "what this loosens" text itself (`SettingDef.loosens`, `src/host/settings.ts`). The owner sees the
+  manager's text, not the container's. The request's free-text `reason` is shown as quoted, untrusted text, cut to
+  300 characters.
+- **The authority is the owner's tap, on the host.** For publication approvals the container verifies, so the host
+  signs with a key the container cannot reach (Ed25519, `src/core/approval.ts`). For setup changes the host is both
+  the issuer and the enforcer, so no signature is needed. The same properties hold in another form: the change is
+  bound to its exact content (digest plus config revision, like approvals bind the task plus the exact head SHA), it
+  expires (30 minutes, against 7 days for approvals, because a setup change is applied right away), and it can only
+  come from a party the container cannot reach (the owner's Telegram account, through a bot token that only the host
+  holds). The container cannot mint a confirmation: it has neither the manager token nor write access to the host
+  journal.
+- **Host runtime** (`runtime: host`, no container). Requests live in the host runtime DB and agents run under the
+  Claude Code sandbox. The boundary is that sandbox's `denyRead` on the credential store, which the manager token
+  joins. That is weaker, as it already is for approvals, and the docs say so.
+
+## How requests reach the manager
+
+**From the coordinator (proposals).** In the runtime, `minions settings set <key> <value> --reason <text>`,
+`minions upgrade [--from-container]` and `minions settings restart` record a row in a new `change_requests` table
+in `/state/minions.db`: `{id, kind, payload, reason, createdAt, status}`, with status
+`proposed | confirmed | applied | failed | rejected | expired`. Recording validates the request against the runtime
+config and refuses host-owned keys (CONFLICT, with a message telling the coordinator to ask the owner instead). The
+coordinator then tells the owner in its own chat that a request is waiting. It never says that the change was made.
+
+The manager polls each running project every 20 s with `docker compose exec app minions settings requests --json`,
+the existing delegate mechanism (`src/host/delegate.ts`). Each exec has a timeout (30 s) and an output cap (256 KiB);
+anything over either is dropped and reported as a project error, since the output is untrusted. It gets no new mount and no host-visible file under
+`/state`. A file queue on a host bind mount was rejected: it would be the first host path the container can write.
+
+**From the owner (manager chat).** The manager accepts a fixed set of commands and ignores everything else (it replies
+with the help text):
+
+| Command | Does |
+| - | - |
+| `/status` | Per project: running, coordinator, active leases, restart-required (task-3.4), pending requests |
+| `/requests` | Pending requests, each with Confirm / Reject buttons |
+| `/set <key> <value>` | Same model as `minions settings set` (validation, layer, loosening text), then the confirmation |
+| `/sync` | Outer repo sync (see [Change kinds](#change-kinds)) |
+| `/upgrade` | `minions upgrade` with a dry-run plan as the confirmation text |
+| `/restart` | Graceful coordinator restart |
+| `/undo <id>` | Proposes the inverse of an applied config change (confirmed like any change) |
+| `/project <name>` | Picks the project for the commands above when several are registered |
+
+An owner command goes through the same confirmation as a coordinator proposal. Typing `/set` is not consent to the
+diff the manager computes from it.
+
+## Confirmation model
+
+1. The manager builds the **plan**: kind, project, exact diff (`key: from -> to`, layer and file), apply class (see
+   [Settings classification](#settings-classification-task-44)), what it loosens, what will be interrupted (a coordinator
+   restart; active-lease counts are shown to the owner but kept out of the digest, as they change every poll), and the steps for an upgrade (`upgrade --dry-run --json`).
+2. `digest = sha256(canonical plan JSON)`. The manager stores `{requestId, digest, configRevision, nonce, expiresAt}`
+   in its host journal (`<MINIONS_HOME>/manager/journal.jsonl`, 0600) and sends the plan with inline buttons
+   `Confirm` / `Reject`. The `callback_data` is `c:<requestId>:<nonce>` (a 128-bit random nonce, within the
+   64-byte limit).
+3. On a tap, the manager checks every point and refuses if any fails: the sender is the paired owner id, in the
+   private chat; the nonce is the one in the journal and is still unused; the offer has not expired; the digest it
+   recomputes now is unchanged; the project's `configRevision` is unchanged. A refusal replies with the reason and
+   sends a fresh offer.
+4. It journals `confirmed` (this consumes the nonce), edits the message to "Applying…", runs the child command,
+   journals the result, and sends a **new** message with the outcome, so the owner's phone notifies.
+
+**Replay.** The nonce is single-use. Checking it and recording `confirmed` happen as one step under the manager lock,
+so a double tap, a redelivered callback or a manager restart cannot apply a plan twice: a second tap finds the nonce
+spent and only answers "already handled". The manager persists its `getUpdates` offset (in the journal directory) so a
+restart does not replay old callbacks.
+
+**Apply from the journal, not from the container.** The manager applies the plan it stored in its own journal, the one
+the digest covers. It never re-reads the container's request row at apply time, since a forged or edited row could
+differ from what the owner saw. The container's row is only a trigger, and its status is updated afterwards.
+
+Nothing applies without step 3. That includes tightening changes, rejects of stale requests (they are only marked
+expired) and restarts. Read-only commands (`/status`, `/requests`) need no confirmation.
+
+**Loosening and code-execution changes ask twice.** A plan that loosens policy (any non-null `loosens`), or that
+builds and installs a CLI on the host, gets a second message that names the risk in one line ("agents may push
+branches to GitHub", "runs build scripts from 3 commits made in the container on your host"). It needs a second
+tap within 2 minutes. This is the Telegram form of the existing terminal confirmation for loosening settings.
+
+## Change kinds
+
+| Kind | Runs | Notes |
+| - | - | - |
+| Config edit | `minions settings set <key> <value> --yes` | Validated before writing, atomic, refused if the revision changed since the plan (`--expect-revision`), `configRevision + 1`, derived files regenerated (`src/host/config-write.ts`). Then it follows the key's class: `live` done; `restart` offers a restart; `recreate` offers an upgrade (both confirmed separately). |
+| Coordinator restart | `minions settings restart` | The existing graceful path (`coordinator restart --recover`). It is refused while leases are active, and the manager then offers **Restart when idle** (queued, re-checked every poll, run at the first idle moment) or **Drain now** (`pause --starts --drain`: workers commit `wip:` and hand back, recovery re-dispatches). |
+| Outer repo sync | `local` delivery: `minions upgrade --from-container` source phase only (export, strict fast-forward of the host base). GitHub delivery: fetch `origin/<base>` and fast-forward. | Never forces, resets, stashes or checks out. Refused on a dirty host tree or a divergence, with the reason. |
+| Upgrade | `minions upgrade [--from-container] [--rebuild-cli]` | Pause, drain, image, recreate, workspace and origin setup, resume, coordinator recovery: unchanged. A CLI rebuild from commits that came from the container is its own request. Its plan shows `git log --oneline <from>..<to>`, the diffstat and any sensitive paths touched, and it always asks twice (see [Open questions](#open-questions) 3). |
+
+Out of scope: secrets (`minions auth …` stays a terminal job: tokens never pass through Telegram), pairing changes,
+`uninstall`, and any `docker` command outside `minions upgrade`.
+
+## Settings classification (task-44)
+
+Classes: **live**: the runtime reads the regenerated `runtime/config.json` on its next command or claim. The
+coordinator's prompt text catches up at its next restart, which the manager mentions but does not force.
+**restart**: baked into the generated prompt, the plugin or the coordinator launch arguments, so the graceful
+coordinator restart applies it. **recreate**: compose, the image or mounts, so `minions upgrade` applies it (the
+container is recreated, volumes kept). **fixed**: identity or derived; change it with `minions setup`, not here.
+**H** marks host-owned keys: the container can never propose them.
+
+| Key | Class | Reason |
+| - | - | - |
+| `execution.maxActiveTasks`, `maxEngineers`, `maxByRole`, `maxRepairCyclesBeforeReplan` | live | Enforced by `work claim` / the scheduler on each call |
+| `execution.attemptMaxTurns` | restart | Written into the agent definitions (plugin) |
+| `coordinator.contextReset.*` | live | Read by `context-reset.ts` on each check |
+| `verification.commands`, `qaLabels`, `ciPendingTimeoutMinutes` | live | Briefs and the CI gate read them per lease |
+| `budgets.*` | restart | Prompt text only (not enforced in v0.1) |
+| `intake.github.*` | live | `minions sync` and coordinator startup read them per run |
+| `intake.scope.*`, `intake.sources` | live | Backlog readiness filter per call |
+| `communication.progress` | restart | Prompt text |
+| `models.default`, `allowed`, `selection`, `effortByRole` (workers) | restart | Agent definitions and prompt |
+| `models.coordinator`, `models.effort`, `effortByRole.coordinator` | restart | Coordinator `--model` / `--effort` |
+| `coordinator.toolSearch` | restart | Coordinator `--settings` env |
+| `git.identity` | recreate | Applied only by workspace setup (`src/runtime/workspace.ts:50`) during install, upgrade or start, not by `settings restart`. The manager offers `minions upgrade` (workspace setup is one of its steps), confirmed separately |
+| `communication.channel` | restart, **H** | Coordinator `--channels`. It decides who can steer the coordinator |
+| `capabilities.*`, `sensitivePaths`, `architecture`, `intake.startReady` | restart, **H** | Policy and approvals (prompt plus runtime gates) |
+| `delivery.*`, `verification.testerRequired`, `reviewerRequired`, `ciAuthority` | restart, **H** | What reaches GitHub, and with which checks |
+| `coordinator.permissionMode`, `disallowedTools`, `bundledSkills`, legacy `permissionMode` | restart, **H** | Coordinator permissions |
+| `roles`, `workflows`, `harnesses` | restart, **H** | Tools, edit scopes and process harnesses. Roles keep their own propose/apply path (`config roles`) |
+| `container.cpus`, `memoryMiB`, `pidsLimit`, `tmpSizeMiB` | recreate | Compose resource limits |
+| `container.network`, `publishPorts`, `mountHostRepository`, `mountDockerSocket` | recreate, **H** | Isolation of the container |
+| `schemaVersion`, `configRevision`, `projectId`, `packageVersion`, `profile`, `visibility`, `backlog.*`, `git.baseBranch`, `container.required`, `container.workspace`, `execution.oneActiveStagePerTask` | fixed | Identity, literals or derived. Changing them is a re-setup |
+
+The build task adds the `recreate` class to `SettingApply` (today `live | prompt | launch`, with `prompt` and `launch`
+both meaning restart here), a `hostOwned` flag on `SettingDef`, and a guard test that fails when a schema key has no
+class. The guard test also checks each class against the code that applies the key.
+
+### Host-owned settings
+
+Host-owned keys are writable only by `minions settings` in the host terminal, or by an owner-initiated `/set` in the
+manager chat (see [Open questions](#open-questions) 2). They are refused when recorded in the runtime, refused by the
+manager for any request from the container, and never present in a writable file the container can reach. That
+matches task-44's criterion "Security-relevant settings (policy, permissions, sensitive paths, approvals) stay
+host-owned and are never writable from the container". Approvals themselves stay host-signed (`work approve` on the
+host). This design does not move them into the manager (see [Open questions](#open-questions) 5).
+
+## Failure and rollback
+
+- **Config edits.** Validated before writing and written atomically, so a failed edit changes nothing. Before every
+  write the manager saves the previous file as `<project dir>/config-history/<revision>.json` (last 20 kept).
+  `/undo <id>` proposes the inverse diff. It applies only while the config is still at the revision the change wrote
+  (compare-and-swap). Otherwise it shows the drift and stops.
+- **Restart.** The restart is either refused, which leaves the old coordinator running, or it relaunches and reports
+  `running` only once the new wrapper holds the lock (bootstrap.md, coordinator lock). If it fails, the manager
+  reports the error and offers **Retry**. It never tries a second strategy on its own.
+- **Upgrade.** The semantics stay as they are: a failure before the recreate resumes starts and keeps the running
+  container, and after the recreate every remaining step is still attempted and reported. The marker in
+  `upgrade.json` makes a rerun finish the job. The manager's outcome message includes the failed step and offers
+  **Rerun**.
+- **CLI reinstall.** Before `npm install -g`, the packed tarball of the current install is kept in
+  `<MINIONS_HOME>/manager/cli-backup/` (last 2). If the new CLI fails `minions --version` or a status call, the
+  manager offers **Roll back CLI** (reinstall the backup, confirmed).
+- **Sync.** Fast-forward only, so there is nothing to undo on the host branch beyond the reflog. The outcome names
+  the old and new SHA.
+- **Manager crash or restart mid-apply.** A journal entry left in `confirmed` or `applying` is reported as
+  "interrupted, state unknown" when the manager starts. It is never resumed automatically: the owner re-runs or
+  rejects it.
+- **The manager upgrading itself.** After a CLI reinstall the manager finishes the current child, reports, and exits
+  with a distinct code, and its supervisor starts it again on the new CLI.
+
+## Token isolation for the manager bot
+
+- **Credential kind `manager-bot-token`** in the host store (`src/host/credentials.ts`: Keychain service
+  `minions.manager`, Secret Service, or `<MINIONS_HOME>/credentials/manager/manager-bot-token` 0600). Same entry
+  rules as `auth telegram`: hidden prompt or `--stdin`, format check, optional `getMe`.
+- **Never materialized** under `projects/<id>/secrets/` (the directory bind-mounted into containers), never in compose
+  env, argv, config, logs or `--json`. Only the manager process reads it, and it holds it in memory.
+- **Two bots, never the same one.** Setup refuses a manager token whose bot id equals any project's coordinator bot
+  id, and `auth telegram` refuses the reverse (extends `src/host/bot-guard.ts`). Doctor checks both.
+- **Single poller.** Telegram allows one `getUpdates` consumer per token. The manager takes
+  `<MINIONS_HOME>/manager/lock` (`{pid, start}`, the same reuse-safe rule as the coordinator lock). A second manager
+  refuses with CONFLICT. A `409 Conflict` from the Bot API is reported as "another process polls the manager bot".
+  No container process ever has the token, so the task-51 class of takeover cannot happen.
+- **Owner-only access, paired in the terminal.** `minions setup` shows a one-time code, and the owner sends it to the
+  manager bot within 10 minutes. The manager records that sender's numeric user id and private chat id in
+  `<MINIONS_HOME>/manager/access.json` (0600). From then on, updates from anyone else are dropped without a reply.
+  Re-pairing is a terminal action only. No group chats.
+- **Transport.** The manager calls the Bot API directly with `fetch` (`getUpdates` long poll, `sendMessage` with
+  `reply_markup`, `answerCallbackQuery`, `editMessageText`). It adds no dependency and does not use the Claude
+  plugin. Because this is our own code, the inline buttons that [telegram-decisions.md](telegram-decisions.md) has
+  to work around in the plugin are available here directly.
+
+## CLI surface
+
+No new primary command. The proposed folds:
+
+- `minions setup` gains an optional **manager** step: token, pairing and installing the supervisor service. Rerunnable.
+- `minions status` shows the manager (running, bot id, paired, last poll) and pending change requests per project.
+  `status --check` adds `manager.*` checks that never fail doctor.
+- `minions settings requests [--json]`, plus `settings apply <id>` / `settings reject <id>` on the host: the terminal
+  route for the same requests (`apply` uses the same plan and confirmation, interactive or `--yes`).
+- In the runtime, `settings set`, `settings restart` and `upgrade` record requests instead of failing.
+- The process the supervisor starts needs an entry point. This is a new top-level command, so it is an owner
+  question (see [Open questions](#open-questions) 1). It is not decided here.
+
+## Phases
+
+Proposed child tasks (the coordinator files them after the owner agrees):
+
+1. **child: Settings classification and host-owned flag (task-44 part 1)** | criteria: every schema key has a class
+   live/restart/recreate/fixed and a hostOwned flag, with a guard test; `settings set` reports what took effect now
+   and what needs a restart or upgrade; live keys are tested to take effect without a restart | depends: none
+2. **child: Change requests in the runtime** | criteria: `change_requests` table (DB migration); in the runtime,
+   `settings set`, `settings restart` and `upgrade` record requests and refuse host-owned keys; host
+   `settings requests/apply/reject` with the plan, digest and confirmation; `editProjectConfig`
+   (`src/host/config-write.ts:59`) has no expected-revision guard today, so add `settings set --expect-revision <n>`
+   (refuse if the revision changed; `/undo` relies on it); the migration is under `**/migrations/**`, a sensitive
+   path that needs owner approval; tested with fakes | depends: 1
+3. **child: Manager core without Telegram** | criteria: host manager process with lock, journal, per-project polling
+   through delegate, plan/digest/expiry checks, child-command apply, interrupted-entry reporting; driven by a fake
+   transport in tests | depends: 2, owner answer to Q1
+4. **child: Manager bot** | criteria: `manager-bot-token` credential, bot-id guard in both directions, terminal pairing
+   in `setup`, Bot API transport with inline Confirm/Reject and the double tap for loosening, fixed command set;
+   doctor `manager.*` checks | depends: 3
+5. **child: Supervisor and status** | criteria: `setup` installs and removes a launchd agent (macOS) or a
+   systemd --user unit (Linux); restart after a self-upgrade; `status` shows the manager and pending requests;
+   `uninstall` removes everything | depends: 4
+6. **child: Restart-when-idle and rollback** | criteria: queued restart at the first idle poll; drain-now option;
+   config history with `/undo` compare-and-swap; CLI backup and roll back; docs (README, cli.md, bootstrap.md) |
+   depends: 4
+
+task-3 (upgrade) and task-3.4 (restart-required) are building blocks that already exist. The manager calls
+`minions upgrade` unchanged, and it shows task-3.4's restart-required reasons in `/status` and as a push message
+offering `/upgrade`.
+
+## Open questions
+
+1. **Entry point for the manager process.** (1) `minions manager run`, an internal-tier command like
+   `coordinator run`, hidden from default help (recommended); (2) a hidden flag on `minions start`
+   (`start --manager-daemon`); (3) Other. The same decision covers the new `settings requests/apply/reject`
+   subcommands: they fold under `settings` (recommended) rather than becoming new top-level commands.
+2. **Loosening host-owned settings from Telegram.** (1) Allowed only as an owner-initiated `/set` with the double
+   tap, never from a coordinator request (recommended); (2) Terminal only: the manager may tighten host-owned keys
+   but refuses to loosen them; (3) Other.
+3. **Building container-made commits into the host CLI from Telegram.** (1) Allowed as its own request that shows the
+   commit range, diffstat and sensitive paths, with the double tap (recommended, because the owner develops minions
+   in minions); (2) Terminal only (`minions upgrade --rebuild-cli`); (3) Other.
+4. **How the manager runs.** (1) A user service (launchd / systemd --user) installed by `setup` (recommended:
+   survives reboots and logouts); (2) A host tmux session started by `minions start`; (3) Foreground only, started by
+   hand; (4) Other.
+5. **Publication and merge approvals from the manager chat** (today host-terminal `work approve`). (1) Not now: a
+   separate follow-up after phase 4, since it would move a signing step to the phone (recommended); (2) Include
+   `/approve <task> <sha>` in phase 4; (3) Other.
+6. **Confirmation expiry.** (1) 30 minutes (recommended); (2) 24 hours; (3) Other.
