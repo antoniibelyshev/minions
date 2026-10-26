@@ -26,7 +26,7 @@ import {
   formatRequestLine, formatRequests, listChangeRequests, markChangeRequest, quotedReason, requestSummary, withRequestContext, type ChangeRequestView,
 } from '../runtime/change-requests.js';
 import { inMinionsContainer } from '../runtime/paths.js';
-import { consumeOffer, findOffer, recordOffer, recordOutcome, type OfferEntry, type RequestSnapshot } from './change-journal.js';
+import { assertOfferOpen, consumeOffer, findOffer, readJournal, recordOffer, recordOutcome, type OfferEntry, type RequestSnapshot } from './change-journal.js';
 import { packageRoot } from './docker.js';
 import { loadEffectiveConfig, loadProjectJson, type ProjectJson } from './project.js';
 import { projectForPath } from './registry.js';
@@ -114,10 +114,32 @@ export const snapshotOf = (v: Pick<ChangeRequestView, 'id' | 'kind' | 'payload' 
   ({ id: v.id, kind: v.kind, payload: v.payload, reason: v.reason });
 
 /**
- * Builds the host plan of a request: validated against the host's config, never trusting the row's own view.
- * Throws CONFLICT for host-owned keys, PRECONDITION for anything that cannot be applied.
+ * The slow part of an upgrade plan: `minions upgrade --dry-run` as a child process (after the cheap delivery check).
+ * Throws PRECONDITION when the dry run reports that the upgrade would fail. confirmOffer runs it before taking the
+ * journal lock and hands the result to buildPlan (task-53.11).
  */
-export async function buildPlan(project: ProjectJson, req: RequestSnapshot, deps: ChangeRequestDeps): Promise<{ plan: ChangePlan; notes: string[] }> {
+export async function upgradeDryRun(project: ProjectJson, req: RequestSnapshot, deps: Pick<ChangeRequestDeps, 'upgrade'>): Promise<UpgradeRun> {
+  const fromContainer = fromContainerOf(req.payload);
+  await assertUpgradeDelivery(project, req, fromContainer);
+  const dry = await deps.upgrade(project, { fromContainer, dryRun: true });
+  if (!dry.ok) {
+    throw new MinionsError('PRECONDITION', `Change request ${req.id}: \`minions upgrade --dry-run\` reports that the upgrade would fail: ${dry.summary}`, 'Fix that first (run `minions upgrade --dry-run` for the details), then apply again.');
+  }
+  return dry;
+}
+
+async function assertUpgradeDelivery(project: ProjectJson, req: RequestSnapshot, fromContainer: string | true | null): Promise<void> {
+  if (fromContainer !== null && isGithubDelivery((await loadEffectiveConfig(project)).config)) {
+    throw new MinionsError('PRECONDITION', `Change request ${req.id}: --from-container is for local delivery only; this project delivers through GitHub.`, `Reject it: \`minions settings reject ${req.id}\`.`);
+  }
+}
+
+/**
+ * Builds the host plan of a request: validated against the host's config, never trusting the row's own view.
+ * Throws CONFLICT for host-owned keys, PRECONDITION for anything that cannot be applied. `pre.dry`: an upgrade dry
+ * run already made for this request (upgradeDryRun); everything else is still read now.
+ */
+export async function buildPlan(project: ProjectJson, req: RequestSnapshot, deps: ChangeRequestDeps, pre: { dry?: UpgradeRun } = {}): Promise<{ plan: ChangePlan; notes: string[] }> {
   const base = { requestId: req.id, projectId: project.projectId, reason: quotedReason(req.reason), change: null, loosens: null, upgradeSteps: null };
   if (req.kind === 'config-set') {
     const { key, value, layer } = req.payload as { key?: unknown; value?: unknown; layer?: unknown };
@@ -155,14 +177,9 @@ export async function buildPlan(project: ProjectJson, req: RequestSnapshot, deps
     };
   }
   if (req.kind === 'upgrade') {
-    const fromContainer = fromContainerOf(req.payload);
-    if (fromContainer !== null && isGithubDelivery((await loadEffectiveConfig(project)).config)) {
-      throw new MinionsError('PRECONDITION', `Change request ${req.id}: --from-container is for local delivery only; this project delivers through GitHub.`, `Reject it: \`minions settings reject ${req.id}\`.`);
-    }
-    const dry = await deps.upgrade(project, { fromContainer, dryRun: true });
-    if (!dry.ok) {
-      throw new MinionsError('PRECONDITION', `Change request ${req.id}: \`minions upgrade --dry-run\` reports that the upgrade would fail: ${dry.summary}`, 'Fix that first (run `minions upgrade --dry-run` for the details), then apply again.');
-    }
+    let dry = pre.dry;
+    if (dry) await assertUpgradeDelivery(project, req, fromContainerOf(req.payload));
+    else dry = await upgradeDryRun(project, req, deps);
     return {
       plan: {
         ...base, kind: 'upgrade', configRevision, upgradeSteps: dry.steps.map((s) => s.id), steps: [stepText(planArgv({ kind: 'upgrade', change: null, configRevision }, req))],
@@ -300,18 +317,32 @@ export async function confirmRequest(project: ProjectJson, requestId: string, di
  * protection): refuses when the nonce is spent or the request already handled (CONFLICT), when the offer expired,
  * or when the plan recomputed now from the journaled request differs (configRevision or digest). Errors carry
  * `details.refusal`: spent | handled | expired | revision | digest. Returns the recomputed plan and its notes.
+ *
+ * The upgrade dry run (a child process that can outlast the 10 s other writers wait for the lock) runs before the
+ * lock is taken, after an advisory early check of the same refusals; under the lock the refusals are checked again
+ * and the rest of the plan (configRevision, delivery, digest) is rebuilt with that dry run (task-53.11).
  */
 export async function confirmOffer(project: ProjectJson, offer: OfferEntry, deps: ChangeRequestDeps, again?: string): Promise<{ plan: ChangePlan; notes: string[] }> {
   const requestId = offer.requestId;
   const hint = again ?? `Run \`minions settings apply ${requestId}\` again for a fresh plan.`;
-  let current: { plan: ChangePlan; notes: string[] } | undefined;
-  await consumeOffer(offer, async () => {
+  const assertUnexpired = () => {
     const now = deps.now?.() ?? new Date();
     if (now.getTime() > Date.parse(offer.expiresAt)) {
       throw new MinionsError('PRECONDITION', `Change request ${requestId}: the confirmation expired at ${offer.expiresAt} (plans are valid for 30 minutes); nothing applied.`, hint, { refusal: 'expired' });
     }
+  };
+  let pre: { dry?: UpgradeRun } = {};
+  if (offer.request.kind === 'upgrade') {
+    // Outside the lock: refuse early what would be refused anyway, then the slow dry run.
+    assertOfferOpen(await readJournal(), offer);
+    assertUnexpired();
+    pre = { dry: await upgradeDryRun(project, offer.request, deps) };
+  }
+  let current: { plan: ChangePlan; notes: string[] } | undefined;
+  await consumeOffer(offer, async () => {
+    assertUnexpired();
     // Recompute from the request as journaled (never the container's row again) against the host as it is now.
-    current = await buildPlan(project, offer.request, deps);
+    current = await buildPlan(project, offer.request, deps, pre);
     if (current.plan.configRevision !== offer.configRevision) {
       throw new MinionsError('CONFLICT', `Change request ${requestId}: the configuration moved from revision ${offer.configRevision} to ${current.plan.configRevision} since the plan was shown; nothing applied.`, hint, { refusal: 'revision' });
     }

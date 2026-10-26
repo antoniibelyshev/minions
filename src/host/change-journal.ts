@@ -5,7 +5,8 @@
 //   single-use nonce and the expiry (30 minutes). It also keeps the request as it was read then (kind, payload,
 //   reason): a confirmation recomputes the plan from that snapshot, never from the container's row again.
 // - `confirmed`: consumes the nonce. Checking the nonce and appending this entry happen under the journal lock,
-//   so a second confirmation of the same offer finds it spent ("already handled").
+//   so a second confirmation of the same offer finds it spent ("already handled"). Slow work (the upgrade dry run)
+//   stays outside the lock: other writers give up after 10 s (task-53.11).
 // - `applying` (manager): the child command started. `confirmed` and `applying` carry the writer's pid and process
 //   start time, so a manager that starts again can tell an entry of a dead process (interrupted, state unknown) from
 //   an apply still running in another process.
@@ -111,21 +112,29 @@ export async function findOffer(projectId: string, requestId: string, digest: st
  */
 export async function consumeOffer(offer: OfferEntry, check: () => Promise<void> = async () => undefined, now = new Date()): Promise<void> {
   await withJournalLock(async () => {
-    const entries = await readJournal();
-    if (entries.some((e) => e.type === 'confirmed' && e.nonce === offer.nonce)) {
-      throw new MinionsError('CONFLICT', `Change request ${offer.requestId}: this confirmation was already used (already handled).`, 'List requests with `minions settings requests --all`.', { refusal: 'spent' });
-    }
-    // Another offer of the same request: applied or rejected is final; confirmed without an outcome is in flight or
-    // was interrupted (state unknown). Only a failed request may be confirmed again.
-    const last = lastOutcome(entries, offer.projectId, offer.requestId);
-    if (last && last.type !== 'failed') {
-      throw new MinionsError('CONFLICT', last.type === 'confirmed' || last.type === 'applying'
-        ? `Change request ${offer.requestId} was already confirmed at ${last.at} and has no recorded outcome (in progress, or interrupted: state unknown).`
-        : `Change request ${offer.requestId} was already ${last.type} at ${last.at} (already handled).`, 'List requests with `minions settings requests --all`.', { refusal: 'handled' });
-    }
+    assertOfferOpen(await readJournal(), offer);
     await check();
     await append({ type: 'confirmed', at: nowIso(now), projectId: offer.projectId, requestId: offer.requestId, nonce: offer.nonce, digest: offer.digest, ...writer() });
   });
+}
+
+/**
+ * Throws CONFLICT when the offer's nonce is spent (`details.refusal` spent) or the request already handled
+ * (handled). consumeOffer runs it under the lock; callers may also run it before slow work as an early refusal
+ * (that read is advisory only: the check under the lock decides).
+ */
+export function assertOfferOpen(entries: JournalEntry[], offer: OfferEntry): void {
+  if (entries.some((e) => e.type === 'confirmed' && e.nonce === offer.nonce)) {
+    throw new MinionsError('CONFLICT', `Change request ${offer.requestId}: this confirmation was already used (already handled).`, 'List requests with `minions settings requests --all`.', { refusal: 'spent' });
+  }
+  // Another offer of the same request: applied or rejected is final; confirmed without an outcome is in flight or
+  // was interrupted (state unknown). Only a failed request may be confirmed again.
+  const last = lastOutcome(entries, offer.projectId, offer.requestId);
+  if (last && last.type !== 'failed') {
+    throw new MinionsError('CONFLICT', last.type === 'confirmed' || last.type === 'applying'
+      ? `Change request ${offer.requestId} was already confirmed at ${last.at} and has no recorded outcome (in progress, or interrupted: state unknown).`
+      : `Change request ${offer.requestId} was already ${last.type} at ${last.at} (already handled).`, 'List requests with `minions settings requests --all`.', { refusal: 'handled' });
+  }
 }
 
 export async function recordOutcome(e: Omit<OutcomeEntry, 'at'>, now = new Date()): Promise<void> {
