@@ -14,6 +14,8 @@ import { ciSetupPlan, fetchApi, requiredChecksStatus, type RequiredChecksReport 
 import { DEFAULT_CI_PENDING_TIMEOUT_MINUTES } from '../runtime/ci-gate.js';
 import { managerBotClash } from './bot-guard.js';
 import { loadManagerAccess } from './manager-bot.js';
+import { serviceHost } from './manager-service.js';
+import { managerOverview, managerServiceChecks } from './manager-status.js';
 import { clearStaleSecrets, managerCredentialStatus, secretCopiesExist, githubCredentialStatus, readGithubToken, githubRepoFromRemote, telegramCredentialStatus, type CredentialStatus, type Fetch, type TelegramCredentialStatus } from './credentials.js';
 import { dockerProbe, type DockerProbe, type DockerStatus } from './discovery.js';
 import { composeHint, daemonHint, linuxDockerChecks, linuxHostFacts, unknownLinuxFacts, type LinuxHostFacts } from './linux-host.js';
@@ -535,6 +537,20 @@ export async function managerChecks(opts: { runner?: Runner } = {}): Promise<Che
   return out;
 }
 
+/**
+ * manager.service / manager.process: the supervisor service and the running manager (src/host/manager-status.ts).
+ * Never 'fail'. Asks launchctl / systemctl (through the runner) only when setup recorded a service.
+ */
+export async function managerSupervisorChecks(opts: { runner?: Runner; platform?: NodeJS.Platform; now?: Date } = {}): Promise<Check[]> {
+  const platform = opts.platform ?? process.platform;
+  try {
+    const m = await managerOverview({ host: serviceHost({ platform, ...(opts.runner ? { runner: opts.runner } : {}) }), ...(opts.now ? { now: opts.now } : {}) });
+    return managerServiceChecks(m, { platform, ...(opts.now ? { now: opts.now } : {}) });
+  } catch (e) {
+    return [{ name: 'manager.service', status: 'warn', detail: `could not check (${short(String((e as Error).message ?? e))})` }];
+  }
+}
+
 export async function runDoctor(opts: {
   cwd: string; runner?: Runner; probe?: DockerProbe; fetch?: Fetch; fingerprint?: string | null; version?: string;
   /** Host platform (tests); defaults to process.platform. */
@@ -703,6 +719,7 @@ export async function runDoctor(opts: {
   checks.push(requiredChecksReadiness(effective, ci.rc, { onGitHub: github.onGitHub, unknownReason: ci.reason }));
   checks.push(ciAuthorityReadiness(effective, ci.rc, { onGitHub: github.onGitHub, unknownReason: ci.reason }));
   checks.push(...await managerChecks({ runner }));
+  checks.push(...await managerSupervisorChecks({ runner, platform: opts.platform ?? process.platform }));
   add('features', 'unavailable', DEFERRED_FEATURES.join(', '));
   if (projectId) checks.push(restartCheck(restart));
   add('package', 'ok', `minions ${VERSION}`);

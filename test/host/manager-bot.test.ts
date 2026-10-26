@@ -485,6 +485,123 @@ describe('minions setup: host manager bot step', () => {
     const repo = makeRepo(env.root);
     const r = await runSetup({ path: repo, yes: false, dryRun: true, runtime: fakeRuntime() });
     expect(r.steps.find((s) => s.id === 'manager')).toMatchObject({ status: 'planned', detail: expect.stringContaining('one-time pairing code') });
+    expect(r.steps.find((s) => s.id === 'service')).toMatchObject({ status: 'planned', detail: expect.stringContaining('systemd --user unit') });
+  });
+});
+
+// ---------------------------------------------------------------- setup / uninstall: the manager service (task-53.6)
+
+describe('minions setup and uninstall: host manager service', () => {
+  /** systemctl / launchctl / loginctl answered by a fake; the "home" is a temp dir. */
+  function serviceFake(platform: NodeJS.Platform = 'linux') {
+    const calls: string[] = [];
+    const runner = async (cmd: string, args: string[]): Promise<RunResult> => {
+      calls.push([cmd, ...args].join(' '));
+      if (cmd === 'launchctl' && args[0] === 'print') return { code: 113, stdout: '', stderr: 'not loaded' };
+      return { code: 0, stdout: '', stderr: '' };
+    };
+    const home = join(env.root, 'userhome');
+    return { calls, home, managerService: { platform, home, runner, uid: 501, user: null, program: ['/usr/bin/env', 'node', '/opt/cli.js', 'manager', 'run'] } };
+  }
+  const svcStep = (r: { steps: { id: string }[] }) => r.steps.find((s) => s.id === 'service');
+
+  it('no token and no service: no step; --yes never installs; interactive asks (default no) and installs on yes', async () => {
+    const repo = makeRepo(env.root);
+    const f = serviceFake();
+    const none = await runSetup({ path: repo, yes: true, runtime: fakeRuntime(), dockerProbe: dockerUp, managerService: f.managerService });
+    expect(svcStep(none)).toBeUndefined();
+    const piped = await runSetup({ path: repo, yes: true, tokens: { manager: MGR }, runtime: fakeRuntime(), dockerProbe: dockerUp, managerService: f.managerService });
+    expect(svcStep(piped)).toMatchObject({ status: 'skipped', detail: expect.stringContaining('an interactive setup asks') });
+    expect(f.calls).toEqual([]);
+
+    // Interactive, default answer: not installed.
+    const dflt = scripted({ 'Project configuration': 'keep' });
+    const r0 = await runSetup({ path: repo, yes: false, io: dflt.io, runtime: fakeRuntime(), dockerProbe: dockerUp, managerService: f.managerService });
+    expect(dflt.asked.some((q) => q.startsWith('Install the host manager as a systemd --user unit'))).toBe(true);
+    expect(svcStep(r0)).toMatchObject({ status: 'skipped' });
+    expect(f.calls).toEqual([]);
+
+    const yes = scripted({ 'Project configuration': 'keep', 'Install the host manager': 'y' });
+    const r1 = await runSetup({ path: repo, yes: false, io: yes.io, runtime: fakeRuntime(), dockerProbe: dockerUp, managerService: f.managerService });
+    expect(svcStep(r1)).toMatchObject({ status: 'done', detail: expect.stringMatching(/^systemd --user unit installed and started \(.*userhome\/\.config\/systemd\/user\/minions-manager-[0-9a-f]{8}\.service\)$/) });
+    expect(f.calls).toContain('systemctl --user daemon-reload');
+    expect(formatSetup(r1)).toContain('service');
+    // The token never reaches the unit file.
+    const rec = JSON.parse(readFileSync(managerPaths().serviceJson, 'utf8')) as { path: string };
+    expect(readFileSync(rec.path, 'utf8')).not.toContain(MGR_SECRET);
+
+    // Rerun: keep is the default and an unchanged unit is only started; --yes keeps it up to date too.
+    f.calls.length = 0;
+    const keep = scripted({ 'Project configuration': 'keep' });
+    const r2 = await runSetup({ path: repo, yes: false, io: keep.io, runtime: fakeRuntime(), dockerProbe: dockerUp, managerService: f.managerService });
+    expect(keep.asked.some((q) => q.startsWith('The host manager runs as a systemd --user unit'))).toBe(true);
+    expect(svcStep(r2)).toMatchObject({ status: 'kept', detail: expect.stringContaining('up to date') });
+    expect(f.calls.filter((c) => c.startsWith('systemctl'))).toEqual([expect.stringContaining('enable'), expect.stringContaining('start minions-manager')]);
+    const r3 = await runSetup({ path: repo, yes: true, runtime: fakeRuntime(), dockerProbe: dockerUp, managerService: f.managerService });
+    expect(svcStep(r3)).toMatchObject({ status: 'kept' });
+
+    // A changed token restarts the running manager (it reads token and pairing at start).
+    f.calls.length = 0;
+    const r4 = await runSetup({ path: repo, yes: true, tokens: { manager: MGR2 }, runtime: fakeRuntime(), dockerProbe: dockerUp, managerService: f.managerService });
+    expect(svcStep(r4)).toMatchObject({ status: 'kept', detail: expect.stringContaining('restarted for the new token or pairing') });
+    expect(f.calls.some((c) => /^systemctl --user restart minions-manager/.test(c))).toBe(true);
+
+    // Removing the token removes the service as well.
+    f.calls.length = 0;
+    const rm = scripted({ 'Project configuration': 'keep', 'The host manager bot is set up': 'remove' });
+    const r5 = await runSetup({ path: repo, yes: false, io: rm.io, runtime: fakeRuntime(), dockerProbe: dockerUp, managerService: f.managerService });
+    expect(svcStep(r5)).toMatchObject({ status: 'changed', detail: expect.stringContaining('the manager service was removed') });
+    expect(existsSync(rec.path)).toBe(false);
+    expect(existsSync(managerPaths().serviceJson)).toBe(false);
+    expect(f.calls[0]).toMatch(/^systemctl --user disable --now minions-manager/);
+  });
+
+  it('macOS: a launchd agent; "remove" in the service step keeps the bot', async () => {
+    const repo = makeRepo(env.root);
+    await M.provisionManagerToken({ token: MGR });
+    const f = serviceFake('darwin');
+    const a = scripted({ 'Installation visibility': 'private', 'Install the host manager as a launchd agent': 'y' });
+    const r = await runSetup({ path: repo, yes: false, io: a.io, runtime: fakeRuntime(), dockerProbe: dockerUp, platform: 'darwin', managerService: f.managerService });
+    expect(svcStep(r)).toMatchObject({ status: 'done', detail: expect.stringContaining('launchd agent installed and started') });
+    expect(f.calls.some((c) => c.startsWith('launchctl bootstrap gui/501 '))).toBe(true);
+    const b = scripted({ 'Project configuration': 'keep', 'The host manager runs as a launchd agent': 'remove' });
+    const r2 = await runSetup({ path: repo, yes: false, io: b.io, runtime: fakeRuntime(), dockerProbe: dockerUp, platform: 'darwin', managerService: f.managerService });
+    expect(svcStep(r2)).toMatchObject({ status: 'changed', detail: expect.stringContaining('launchd agent removed') });
+    expect(await C.readManagerToken()).toBe(MGR);
+  });
+
+  it('uninstall removes the service with the last registered project and keeps it while others remain', async () => {
+    const { runUninstall, formatUninstall } = await import('../../src/host/uninstall.js');
+    const S = await import('../../src/host/manager-service.js');
+    const a = makeRepo(env.root, 'a');
+    const b = makeRepo(env.root, 'b');
+    const f = serviceFake();
+    await runSetup({ path: a, yes: true, tokens: { manager: MGR }, runtime: fakeRuntime(), dockerProbe: dockerUp, managerService: f.managerService });
+    await runSetup({ path: b, yes: true, runtime: fakeRuntime(), dockerProbe: dockerUp, managerService: f.managerService });
+    await S.installManagerService(S.serviceHost(f.managerService));
+    const rec = (await S.loadServiceRecord())!;
+    const docker = recorder(() => ({ code: 0, stdout: '', stderr: '' })).runner;
+
+    const dry = await runUninstall({ cwd: a, dryRun: true, runner: docker, managerService: f.managerService });
+    expect(dry.managerService).toBe('kept');
+    const first = await runUninstall({ cwd: a, yes: true, runner: docker, managerService: f.managerService });
+    expect(first.managerService).toBe('kept');
+    expect(first.kept).toContainEqual({ path: rec.path, reason: 'host manager service kept: 1 other project(s) are registered' });
+    expect(existsSync(rec.path)).toBe(true);
+
+    f.calls.length = 0;
+    const dry2 = await runUninstall({ cwd: b, dryRun: true, runner: docker, managerService: f.managerService });
+    expect(dry2.managerService).toBe('removed');
+    expect(formatUninstall(dry2)).toContain('Would remove the host manager service');
+    expect(f.calls).toEqual([]);
+    const last = await runUninstall({ cwd: b, yes: true, runner: docker, managerService: f.managerService });
+    expect(last.managerService).toBe('removed');
+    expect(last.removed).toContain(rec.path);
+    expect(f.calls).toEqual([`systemctl --user disable --now ${rec.name}`, 'systemctl --user daemon-reload']);
+    expect(existsSync(rec.path)).toBe(false);
+    expect(existsSync(managerPaths().serviceJson)).toBe(false);
+    expect(last.kept.some((k) => k.path === managerPaths().credentialJson && /manager bot token kept/.test(k.reason))).toBe(true);
+    expect(formatUninstall(last)).toContain('Removed the host manager service');
   });
 });
 
@@ -536,7 +653,7 @@ describe('doctor manager.* checks', () => {
   it('runDoctor (doctor and status --check) includes the manager checks and they never change healthy', async () => {
     const opts = { cwd: env.root, probe: dockerUp, runner: recorder().runner, platform: 'darwin' as const };
     const before = await runDoctor(opts);
-    expect(before.checks.filter((x) => x.name.startsWith('manager.')).map((x) => x.name)).toEqual(['manager.token', 'manager.bot', 'manager.pairing']);
+    expect(before.checks.filter((x) => x.name.startsWith('manager.')).map((x) => x.name)).toEqual(['manager.token', 'manager.bot', 'manager.pairing', 'manager.service', 'manager.process']);
     await M.provisionManagerToken({ token: MGR });
     writeFileSync(managerPaths().accessJson, 'garbage');
     const after = await runDoctor(opts);

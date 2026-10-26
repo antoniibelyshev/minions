@@ -58,6 +58,7 @@ import { applyUndo, beginHistory, completeHistory } from './config-history.js';
 import { readManagerToken } from './credentials.js';
 import { DELEGATE_MAX_OUTPUT_BYTES, DELEGATE_TIMEOUT_MS, delegateCapture } from './delegate.js';
 import { loadManagerAccess, type ManagerAccess } from './manager-bot.js';
+import { MANAGER_RESTART_EXIT_CODE, cliChangeWatcher, managerHeartbeat } from './manager-service.js';
 import { telegramTransport } from './manager-telegram.js';
 import { loadProjectJson, type ProjectJson } from './project.js';
 import { loadRegistry } from './registry.js';
@@ -90,7 +91,7 @@ export interface ManagerOffer {
 /** What the owner did with an offer. The transport authenticates the sender (phase 4: the paired owner only). */
 export interface ManagerEvent { type: 'confirm' | 'reject'; requestId: string; nonce: string }
 
-export type ManagerOutcomeStatus = 'applying' | 'applied' | 'failed' | 'refused' | 'rejected' | 'already-handled' | 'interrupted' | 'error';
+export type ManagerOutcomeStatus = 'applying' | 'applied' | 'failed' | 'refused' | 'rejected' | 'already-handled' | 'interrupted' | 'error' | 'restarting';
 /** A report to the owner (one new message each, so the phone notifies). */
 export interface ManagerOutcome { status: ManagerOutcomeStatus; projectId: string | null; requestId: string | null; text: string }
 
@@ -152,6 +153,10 @@ export interface ManagerDeps {
   writerAlive?: (e: OutcomeEntry) => boolean;
   /** Signs and records an approval (default: approveOnHost of src/host/approvals.ts); tests stub it. */
   approveOnHost?: typeof approveOnHost;
+  /** Called after every poll of the projects (the heartbeat for `minions status`). */
+  onPoll?: (at: Date) => unknown;
+  /** Whether the installed CLI changed under this process (a reinstall): the loop then stops with 'restart'. */
+  cliChanged?: () => boolean;
 }
 
 /**
@@ -615,13 +620,19 @@ export class HostManager {
    * The loop: startup report, then every 20 s a poll of every project; between polls the transport's owner events
    * are handled as they arrive. Returns when signal aborts.
    */
-  async run(signal: AbortSignal): Promise<void> {
+  /**
+   * The loop. Returns 'restart' when the installed CLI changed (checked after each poll and each batch of events, so
+   * a running child always finishes and reports first); the caller exits with MANAGER_RESTART_EXIT_CODE.
+   */
+  async run(signal: AbortSignal): Promise<'stopped' | 'restart'> {
     await this.startup();
     while (!signal.aborted) {
       await this.pollAll();
+      try { await this.deps.onPoll?.(this.deps.now()); } catch { /* the heartbeat is best effort */ }
+      if (await this.restartDue()) return 'restart';
       const due = this.deps.now().getTime() + POLL_INTERVAL_MS;
       for (;;) {
-        if (signal.aborted) return;
+        if (signal.aborted) return 'stopped';
         const left = due - this.deps.now().getTime();
         if (left <= 0) break;
         let events: ManagerEvent[];
@@ -631,8 +642,16 @@ export class HostManager {
           continue;
         }
         for (const ev of events) await this.handle(ev);
+        if (events.length && await this.restartDue()) return 'restart';
       }
     }
+    return 'stopped';
+  }
+
+  private async restartDue(): Promise<boolean> {
+    if (!this.deps.cliChanged?.()) return false;
+    await this.notify({ status: 'restarting', projectId: null, requestId: null, text: 'The host CLI was reinstalled: the manager restarts on the new version (its service starts it again).' });
+    return true;
   }
 }
 
@@ -729,13 +748,13 @@ function followUp(plan: ChangePlan): string[] {
   return [];
 }
 
-/** Takes the manager lock, runs the loop until signal aborts, releases the lock. */
-export async function runManager(deps: ManagerDeps, signal: AbortSignal): Promise<void> {
+/** Takes the manager lock, runs the loop until signal aborts (or the CLI is reinstalled: 'restart'), releases the lock. */
+export async function runManager(deps: ManagerDeps, signal: AbortSignal): Promise<'stopped' | 'restart'> {
   const lock = await acquireManagerLock({ now: deps.now() });
   try {
     const m = new HostManager(deps);
     deps.transport.attach?.(m.commands());
-    await m.run(signal);
+    return await m.run(signal);
   } finally { await lock.release(); }
 }
 
@@ -812,7 +831,7 @@ export function defaultManagerDeps(transport: ManagerTransport, log: (line: stri
   };
 }
 
-export interface TransportChoice { kind: 'telegram' | 'log'; transport: ManagerTransport; detail: string }
+export interface TransportChoice { kind: 'telegram' | 'log'; transport: ManagerTransport; detail: string; botId?: string }
 
 /**
  * The manager bot transport when the bot is paired (a stored manager-bot-token and access.json of the same bot);
@@ -831,12 +850,12 @@ export async function chooseTransport(o: {
   if (!token) return fallback('no manager bot token is stored (run `minions setup`): offers are printed as JSON lines');
   if (!token.startsWith(`${access.botId}:`)) return fallback('the pairing belongs to another manager bot (pair again with `minions setup`): offers are printed as JSON lines');
   return {
-    kind: 'telegram', detail: `talking to the paired owner through manager bot ${access.botId}`,
+    kind: 'telegram', botId: access.botId, detail: `talking to the paired owner through manager bot ${access.botId}`,
     transport: telegramTransport({ token, access, log: o.log, ...(o.fetch ? { fetch: o.fetch } : {}) }),
   };
 }
 
-/** `minions manager run` (internal tier; started by the supervisor in phase 5). */
+/** `minions manager run` (internal tier; started by its launchd / systemd --user service, src/host/manager-service.ts). */
 export function registerManager(program: Command): void {
   const manager = program.command('manager')
     .description('Host manager: confirms and applies change requests from the projects (internal; started by its service)');
@@ -852,7 +871,16 @@ export function registerManager(program: Command): void {
       try {
         const choice = await chooseTransport({ write: (l) => process.stdout.write(`${l}\n`), log });
         log(choice.detail);
-        await runManager(defaultManagerDeps(choice.transport, log), ctl.signal);
+        const deps = defaultManagerDeps(choice.transport, log);
+        const beat = managerHeartbeat({ transport: choice.kind, botId: choice.botId ?? null, now: deps.now, log });
+        await beat.start();
+        const end = await runManager({ ...deps, onPoll: (at) => beat.poll(at), cliChanged: cliChangeWatcher() }, ctl.signal);
+        if (end === 'restart') {
+          // The supervisor (launchd / systemd --user) starts the manager again, now on the new CLI.
+          log(`the installed CLI changed: exiting with ${MANAGER_RESTART_EXIT_CODE} so the service restarts the manager`);
+          process.exitCode = MANAGER_RESTART_EXIT_CODE;
+          setTimeout(() => process.exit(MANAGER_RESTART_EXIT_CODE), 2_000).unref();
+        }
       } finally {
         process.off('SIGINT', stop);
         process.off('SIGTERM', stop);

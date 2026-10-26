@@ -8,7 +8,8 @@ import { validateConfig } from '../config/resolve.js';
 import { isGithubDelivery } from '../config/delivery.js';
 import type { MinionsConfig } from '../config/schema.js';
 import { action, globalOpts, requireMode, runtimeMode } from '../core/cli-helpers.js';
-import { stripControlChars } from '../core/control-chars.js';
+import { displayText, stripControlChars, truncateCodePoints } from '../core/control-chars.js';
+import { writeSync } from 'node:fs';
 import { EXIT_CODES, MinionsError, type ErrorCode } from '../core/errors.js';
 import { readJson } from '../core/fsutil.js';
 import { emit, reportError } from '../core/output.js';
@@ -16,6 +17,8 @@ import { approveOnHost } from '../host/approvals.js';
 import { delegateToRuntime } from '../host/delegate.js';
 import { applyDoctorExit, formatDoctor, runDoctor } from '../host/doctor.js';
 import { formatRestartRequired, hostStatus, parseErrorEnvelope } from '../host/restart-required.js';
+import { formatManagerOverview, managerOverview, managerOverviewJson } from '../host/manager-status.js';
+import { listChangeRequests } from './change-requests.js';
 import { readTelegramAccess } from '../telegram/access.js';
 import { installTelegramPlugin } from '../telegram/install.js';
 import { formatTelegramProbe, probeTelegram } from '../telegram/probe.js';
@@ -218,6 +221,8 @@ export interface StatusReport {
   spend?: SpendReport;
   /** Routine context resets (coordinator.contextReset; src/runtime/context-reset.ts): triggers and blockers for this session. */
   contextReset?: Omit<ContextResetCheck, 'steps'>;
+  /** Open change requests (proposed, confirmed, failed) waiting for the host: the manager or `minions settings apply`. */
+  changeRequests?: { open: number; items: { id: string; kind: string; status: string; summary: string; createdAt: string }[] };
   backlogError?: string;
 }
 
@@ -259,6 +264,10 @@ export async function collectStatus(deps: { db: RuntimeDb; config: MinionsConfig
   if (deps.launch) report.coordinatorLaunch = await deps.launch().catch(() => undefined);
   if (deps.poller) report.telegramPoller = await deps.poller().catch(() => undefined);
   try { report.notifications = outboxCounts(d); } catch { /* an older DB without the outbox: omit */ }
+  try {
+    const open = listChangeRequests(d);
+    report.changeRequests = { open: open.length, items: open.slice(0, CHANGE_REQUESTS_SHOWN).map((r) => ({ id: r.id, kind: r.kind, status: r.status, summary: r.summary, createdAt: r.createdAt })) };
+  } catch { /* an older DB without change requests: omit */ }
   try { report.spend = spendReport({ db: d, config: cfg }); } catch { /* status never fails on the tally */ }
   try { const { steps: _s, ...c } = contextResetCheck({ db: d, config: cfg, ...(deps.state !== undefined ? { state: deps.state } : {}) }); report.contextReset = c; } catch { /* status never fails on the reset check */ }
   try {
@@ -291,12 +300,25 @@ export function humanStatus(s: StatusReport): string {
     `queue: ${Object.entries(s.queue).map(([k, v]) => `${k}=${v}`).join(' ') || '(empty)'}`,
     `stop guard: ${s.guard.lastReason ?? '-'}`,
     ...(s.notifications?.pending ? [formatCounts(s.notifications)] : []),
+    ...(s.changeRequests?.open ? humanChangeRequests(s.changeRequests) : []),
     ...(s.spend ? humanSpend(s.spend).split('\n') : []),
     ...(s.contextReset?.enabled ? [humanContextReset(s.contextReset)] : []),
   ];
   if (s.backlogError) out.push(`backlog error: ${s.backlogError}`);
   out.push(s.activeLeases.length ? 'active leases:' : 'active leases: none', ...s.activeLeases.map((l) => `  ${l.id} ${l.task_id} ${l.role} #${l.attempt} ${l.branch ?? ''}`));
   return out.join('\n');
+}
+
+const CHANGE_REQUESTS_SHOWN = 10;
+
+/** Change requests in `minions status`: they wait in the runtime until the host manager (or the terminal) handles them. */
+function humanChangeRequests(c: NonNullable<StatusReport['changeRequests']>): string[] {
+  const line = (v: string, max: number) => truncateCodePoints(displayText(v).replace(/\s+/g, ' '), max);
+  return [
+    `change requests: ${c.open} open (the host manager offers them; on the host: \`minions settings requests\`, \`settings apply <id>\`)`,
+    ...c.items.map((r) => `  ${line(r.id, 20)} ${line(r.status, 12)} ${line(r.summary, 160)}`),
+    ...(c.open > c.items.length ? [`  … ${c.open - c.items.length} more`] : []),
+  ];
 }
 
 /** One status line for the Telegram poller; a problem carries the recovery hint. */
@@ -893,15 +915,21 @@ export function register(program: Command): void {
       if (runtimeMode() === 'host') {
         // Docker runtime: the container's status plus the host-side restart-required check (`minions upgrade`).
         const h = await hostStatus({ cwd: process.cwd(), args: cmd.args });
-        if (h.kind === 'delegate') return delegate(cmd);
+        // The host manager (service, process, bot, pending requests): host-wide, read-only, never fails status.
+        const mgr = await managerOverview().catch(() => null);
+        if (h.kind === 'delegate') {
+          // The host runtime answers itself; the manager block goes first (human mode only, so --json stays one envelope).
+          if (mgr && !globalOpts(cmd).json) writeSync(1, `${formatManagerOverview(mgr).join('\n')}\n\n`);
+          return delegate(cmd);
+        }
         if (h.kind === 'raw') {
           relayRawStatus(h.result, { json: globalOpts(cmd).json });
           return;
         }
-        emit({ ...h.status, restartRequired: h.restartRequired }, { json: globalOpts(cmd).json, human: () => {
+        emit({ ...h.status, restartRequired: h.restartRequired, ...(mgr ? { manager: managerOverviewJson(mgr) } : {}) }, { json: globalOpts(cmd).json, human: () => {
           let base: string;
           try { base = humanStatus(h.status as unknown as StatusReport); } catch { base = JSON.stringify(h.status, null, 2); }
-          return [base, ...formatRestartRequired(h.restartRequired)].join('\n');
+          return [base, ...formatRestartRequired(h.restartRequired), ...(mgr ? ['', ...formatManagerOverview(mgr)] : [])].join('\n');
         } });
         return;
       }
