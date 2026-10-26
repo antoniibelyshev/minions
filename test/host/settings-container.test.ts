@@ -142,3 +142,25 @@ describe('settings set container.<key> followed by minions upgrade applies the n
     expect(readFileSync(file, 'utf8')).toBe(bytes);
   });
 });
+
+describe('edges (QA)', () => {
+  it('refreshDerived (the path of start and every other command) does not sync limits: project.json and compose keep the old values', async () => {
+    const { refreshDerived } = await import('../../src/host/install.js');
+    const project = await install();
+    const file = projectPaths(project.projectId).projectJson;
+    const bytes = readFileSync(file, 'utf8');
+    const before = limits(composeText(project));
+    await set(project, 'container.cpus', '3.5');
+    await refreshDerived(project, (await loadEffectiveConfig(project)).config);
+    expect(readFileSync(file, 'utf8')).toBe(bytes);
+    expect(limits(composeText(project))).toEqual(before);
+  });
+
+  it('a fractional cpus value is synced into project.json', async () => {
+    const project = await install();
+    const cfg = (await loadEffectiveConfig(project)).config;
+    const next = await syncContainerLimits(project, { ...cfg, container: { ...cfg.container, cpus: 0.5 } });
+    expect(next.container.cpus).toBe(0.5);
+    expect((await loadProjectJson(project.projectId)).container.cpus).toBe(0.5);
+  });
+});
