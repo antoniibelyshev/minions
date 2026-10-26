@@ -87,7 +87,8 @@ config and refuses host-owned keys (CONFLICT, with a message telling the coordin
 coordinator then tells the owner in its own chat that a request is waiting. It never says that the change was made.
 
 The manager polls each running project every 20 s with `docker compose exec app minions settings requests --json`,
-the existing delegate mechanism (`src/host/delegate.ts`). It gets no new mount and no host-visible file under
+the existing delegate mechanism (`src/host/delegate.ts`). Each exec has a timeout (30 s) and an output cap (256 KiB);
+anything over either is dropped and reported as a project error, since the output is untrusted. It gets no new mount and no host-visible file under
 `/state`. A file queue on a host bind mount was rejected: it would be the first host path the container can write.
 
 **From the owner (manager chat).** The manager accepts a fixed set of commands and ignores everything else (it replies
@@ -110,17 +111,27 @@ diff the manager computes from it.
 ## Confirmation model
 
 1. The manager builds the **plan**: kind, project, exact diff (`key: from -> to`, layer and file), apply class (see
-   [Settings classification](#settings-classification-task-44)), what it loosens, what will be interrupted (active
-   leases, a coordinator restart), and the steps for an upgrade (`upgrade --dry-run --json`).
+   [Settings classification](#settings-classification-task-44)), what it loosens, what will be interrupted (a coordinator
+   restart; active-lease counts are shown to the owner but kept out of the digest, as they change every poll), and the steps for an upgrade (`upgrade --dry-run --json`).
 2. `digest = sha256(canonical plan JSON)`. The manager stores `{requestId, digest, configRevision, nonce, expiresAt}`
    in its host journal (`<MINIONS_HOME>/manager/journal.jsonl`, 0600) and sends the plan with inline buttons
    `Confirm` / `Reject`. The `callback_data` is `c:<requestId>:<nonce>` (a 128-bit random nonce, within the
    64-byte limit).
 3. On a tap, the manager checks every point and refuses if any fails: the sender is the paired owner id, in the
-   private chat; the nonce is the one in the journal; the offer has not expired; the digest it recomputes now is
-   unchanged; the project's `configRevision` is unchanged. A refusal replies with the reason and sends a fresh offer.
-4. It journals `confirmed`, edits the message to "Applying…", runs the child command, journals the result, and sends
-   a **new** message with the outcome, so the owner's phone notifies.
+   private chat; the nonce is the one in the journal and is still unused; the offer has not expired; the digest it
+   recomputes now is unchanged; the project's `configRevision` is unchanged. A refusal replies with the reason and
+   sends a fresh offer.
+4. It journals `confirmed` (this consumes the nonce), edits the message to "Applying…", runs the child command,
+   journals the result, and sends a **new** message with the outcome, so the owner's phone notifies.
+
+**Replay.** The nonce is single-use. Checking it and recording `confirmed` happen as one step under the manager lock,
+so a double tap, a redelivered callback or a manager restart cannot apply a plan twice: a second tap finds the nonce
+spent and only answers "already handled". The manager persists its `getUpdates` offset (in the journal directory) so a
+restart does not replay old callbacks.
+
+**Apply from the journal, not from the container.** The manager applies the plan it stored in its own journal, the one
+the digest covers. It never re-reads the container's request row at apply time, since a forged or edited row could
+differ from what the owner saw. The container's row is only a trigger, and its status is updated afterwards.
 
 Nothing applies without step 3. That includes tightening changes, rejects of stale requests (they are only marked
 expired) and restarts. Read-only commands (`/status`, `/requests`) need no confirmation.
@@ -134,7 +145,7 @@ tap within 2 minutes. This is the Telegram form of the existing terminal confirm
 
 | Kind | Runs | Notes |
 | - | - | - |
-| Config edit | `minions settings set <key> <value> --yes` | Validated before writing, atomic, `configRevision + 1`, derived files regenerated (`src/host/config-write.ts`). Then it follows the key's class: `live` done; `restart` offers a restart; `recreate` offers an upgrade (both confirmed separately). |
+| Config edit | `minions settings set <key> <value> --yes` | Validated before writing, atomic, refused if the revision changed since the plan (`--expect-revision`), `configRevision + 1`, derived files regenerated (`src/host/config-write.ts`). Then it follows the key's class: `live` done; `restart` offers a restart; `recreate` offers an upgrade (both confirmed separately). |
 | Coordinator restart | `minions settings restart` | The existing graceful path (`coordinator restart --recover`). It is refused while leases are active, and the manager then offers **Restart when idle** (queued, re-checked every poll, run at the first idle moment) or **Drain now** (`pause --starts --drain`: workers commit `wip:` and hand back, recovery re-dispatches). |
 | Outer repo sync | `local` delivery: `minions upgrade --from-container` source phase only (export, strict fast-forward of the host base). GitHub delivery: fetch `origin/<base>` and fast-forward. | Never forces, resets, stashes or checks out. Refused on a dirty host tree or a divergence, with the reason. |
 | Upgrade | `minions upgrade [--from-container] [--rebuild-cli]` | Pause, drain, image, recreate, workspace and origin setup, resume, coordinator recovery: unchanged. A CLI rebuild from commits that came from the container is its own request. Its plan shows `git log --oneline <from>..<to>`, the diffstat and any sensitive paths touched, and it always asks twice (see [Open questions](#open-questions) 3). |
@@ -164,7 +175,7 @@ container is recreated, volumes kept). **fixed**: identity or derived; change it
 | `models.default`, `allowed`, `selection`, `effortByRole` (workers) | restart | Agent definitions and prompt |
 | `models.coordinator`, `models.effort`, `effortByRole.coordinator` | restart | Coordinator `--model` / `--effort` |
 | `coordinator.toolSearch` | restart | Coordinator `--settings` env |
-| `git.identity` | restart | Applied by workspace setup, which the manager runs before the restart |
+| `git.identity` | recreate | Applied only by workspace setup (`src/runtime/workspace.ts:50`) during install, upgrade or start, not by `settings restart`. The manager offers `minions upgrade` (workspace setup is one of its steps), confirmed separately |
 | `communication.channel` | restart, **H** | Coordinator `--channels`. It decides who can steer the coordinator |
 | `capabilities.*`, `sensitivePaths`, `architecture`, `intake.startReady` | restart, **H** | Policy and approvals (prompt plus runtime gates) |
 | `delivery.*`, `verification.testerRequired`, `reviewerRequired`, `ciAuthority` | restart, **H** | What reaches GitHub, and with which checks |
@@ -176,7 +187,7 @@ container is recreated, volumes kept). **fixed**: identity or derived; change it
 
 The build task adds the `recreate` class to `SettingApply` (today `live | prompt | launch`, with `prompt` and `launch`
 both meaning restart here), a `hostOwned` flag on `SettingDef`, and a guard test that fails when a schema key has no
-class. The classification of `intake.scope.*` and `git.identity` must be checked against the code in that task.
+class. The guard test also checks each class against the code that applies the key.
 
 ### Host-owned settings
 
@@ -255,7 +266,10 @@ Proposed child tasks (the coordinator files them after the owner agrees):
    and what needs a restart or upgrade; live keys are tested to take effect without a restart | depends: none
 2. **child: Change requests in the runtime** | criteria: `change_requests` table (DB migration); in the runtime,
    `settings set`, `settings restart` and `upgrade` record requests and refuse host-owned keys; host
-   `settings requests/apply/reject` with the plan, digest and confirmation; tested with fakes | depends: 1
+   `settings requests/apply/reject` with the plan, digest and confirmation; `editProjectConfig`
+   (`src/host/config-write.ts:59`) has no expected-revision guard today, so add `settings set --expect-revision <n>`
+   (refuse if the revision changed; `/undo` relies on it); the migration is under `**/migrations/**`, a sensitive
+   path that needs owner approval; tested with fakes | depends: 1
 3. **child: Manager core without Telegram** | criteria: host manager process with lock, journal, per-project polling
    through delegate, plan/digest/expiry checks, child-command apply, interrupted-entry reporting; driven by a fake
    transport in tests | depends: 2, owner answer to Q1
@@ -277,7 +291,8 @@ offering `/upgrade`.
 
 1. **Entry point for the manager process.** (1) `minions manager run`, an internal-tier command like
    `coordinator run`, hidden from default help (recommended); (2) a hidden flag on `minions start`
-   (`start --manager-daemon`); (3) Other.
+   (`start --manager-daemon`); (3) Other. The same decision covers the new `settings requests/apply/reject`
+   subcommands: they fold under `settings` (recommended) rather than becoming new top-level commands.
 2. **Loosening host-owned settings from Telegram.** (1) Allowed only as an owner-initiated `/set` with the double
    tap, never from a coordinator request (recommended); (2) Terminal only: the manager may tighten host-owned keys
    but refuses to loosen them; (3) Other.
