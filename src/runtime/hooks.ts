@@ -14,6 +14,7 @@ import { runtimePaths } from './paths.js';
 import { capacityOf, scopeOf } from './scheduler.js';
 import { currentBudget } from './spend.js';
 import { noteTranscript } from './context-reset.js';
+import { scanShell, ShellParseError, type ShellScan } from './shell-scan.js';
 
 export interface HookDeps { db: RuntimeDb; backlog: BacklogAdapter; config: MinionsConfig }
 export type HookLoader = () => HookDeps | Promise<HookDeps>;
@@ -205,36 +206,111 @@ export function preTelegramHook(input: unknown): HookOutput {
 /**
  * The plugin's PreToolUse(Bash) entry (agent-runtimes D10, task-14.5). Node starts only for a subagent call (the
  * input has an `"agent_id"` key) whose input has `minions` followed by anything but `:` (so a worker's own
- * `"agent_type":"minions:<role>"` alone does not count); the coordinator's own calls never reach it. These are
- * speed filters only: any command that runs minions contains such a match. Reading stdin, a grep error and every
+ * `"agent_type":"minions:<role>"` alone does not count) or names the entry script (`cli.js`); the coordinator's
+ * own calls never reach it. These are speed filters only: any plain command that runs minions contains such a
+ * match (a name split by quotes or backslashes does not; like variables, that is out of reach of a text check). Reading stdin, a grep error and every
  * failure of minions itself block (exit 2).
  */
-export const PRE_BASH_HOOK_COMMAND = `i=$(cat) || exit 2; case "$i" in *'"agent_id"'*) printf '%s' "$i" | grep -q 'minions[^:]'; m=$?; [ "$m" = 1 ] && exit 0; [ "$m" = 0 ] || exit 2; printf '%s' "$i" | timeout 20 minions hook pre-bash || exit 2;; esac`;
+export const PRE_BASH_HOOK_COMMAND = `i=$(cat) || exit 2; case "$i" in *'"agent_id"'*) printf '%s' "$i" | grep -Eq 'minions[^:]|cli\\.[cm]?js'; m=$?; [ "$m" = 1 ] && exit 0; [ "$m" = 0 ] || exit 2; printf '%s' "$i" | timeout 20 minions hook pre-bash || exit 2;; esac`;
 
 /** The verbs a Claude subagent must never run: they start, claim or end worker leases (coordinator-only). */
 export const COORDINATOR_ONLY_WORK_VERBS = ['run', 'claim', 'release'] as const;
 
+/** A program word that runs the minions CLI: `minions` (any path) or its entry script (`…/dist/cli.js`). */
+const MINIONS_ENTRY = /^(minions|cli\.[cm]?js)$/;
+
 /**
- * The first `minions work run|claim|release` in a Bash command line, or null. Deliberately coarse and
- * conservative: quotes and backslashes are dropped first (so `sh -c '…'` bodies and quoted words are scanned
- * too), the line is cut at shell separators, and within one piece any word whose basename is `minions` followed
- * later by `work` and then, as the next non-option word, a coordinator-only verb matches. A false positive only
- * blocks a subagent's command; obfuscated forms (variables, substitutions) are out of reach of any text check,
- * which is why `work run` keeps its own gate (D4 L0).
+ * Commands that run another command from their arguments (option parsing differs, so every later word is tried
+ * as the command), and shell keywords that precede a command.
  */
-export function coordinatorOnlyWorkCommand(command: string): string | null {
-  const flat = command.replace(/["'\\]/g, '');
+const COMMAND_WRAPPERS = new Set([
+  'env', 'command', 'builtin', 'exec', 'nohup', 'timeout', 'sudo', 'doas', 'xargs', 'nice', 'ionice', 'stdbuf', 'time', 'setsid', 'chrt', 'taskset',
+  'unshare', 'nsenter', 'flock', 'strace', 'ltrace', 'chroot', 'busybox', 'setpriv', 'capsh', 'firejail', 'chpst', 'find', 'parallel', 'watch', 'entr',
+  'node', 'nodejs', 'npx', 'npm', 'pnpm', 'yarn', 'bun', 'bunx', 'deno', 'tsx', 'ts-node',
+  'if', 'then', 'else', 'elif', 'do', 'while', 'until', '!', '{', '}', 'coproc',
+]);
+
+/** Commands whose arguments are shell scripts (`sh -c '…'`, `su -c '…'`, `ssh host '…'`): each argument is scanned. */
+const SCRIPT_RUNNERS = new Set(['sh', 'bash', 'dash', 'zsh', 'ksh', 'mksh', 'ash', 'fish', 'su', 'runuser', 'script', 'ssh', 'watch']);
+
+const ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*(\[[^\]]*\])?\+?=/;
+
+/** `work` after the entry word, then a coordinator-only verb as the next non-option word. */
+function coordinatorVerb(words: readonly string[], entry: number): string | null {
+  const w = words.indexOf('work', entry + 1);
+  if (w < 0) return null;
+  const verb = words.slice(w + 1).find((x) => !x.startsWith('-'));
+  return verb && (COORDINATOR_ONLY_WORK_VERBS as readonly string[]).includes(verb) ? `minions work ${verb}` : null;
+}
+
+/** One simple command: assignments skipped, then the command word (or, after a wrapper, any later word). */
+function simpleCommandHit(words: readonly string[], depth: number): string | null {
+  let s = 0;
+  while (s < words.length && ASSIGNMENT.test(words[s]!)) s++;
+  if (s >= words.length) return null;
+  const head = basename(words[s]!);
+  const last = COMMAND_WRAPPERS.has(head) || SCRIPT_RUNNERS.has(head) ? words.length - 1 : s;
+  for (let j = s; j <= last; j++) {
+    const b = basename(words[j]!);
+    if (MINIONS_ENTRY.test(b)) {
+      const hit = coordinatorVerb(words, j);
+      if (hit) return hit;
+    }
+    if (SCRIPT_RUNNERS.has(b)) {
+      for (const arg of words.slice(j + 1)) { const hit = scriptHit(arg, depth + 1); if (hit) return hit; }
+    }
+    if (b === 'eval') { const hit = scriptHit(words.slice(j + 1).join(' '), depth + 1); if (hit) return hit; }
+  }
+  return null;
+}
+
+const MAX_SCRIPT_DEPTH = 8;
+
+/**
+ * The fallback for a command line the scanner cannot parse (unbalanced quotes, deep nesting): coarse on the raw
+ * text, so it fails closed only when the text names the forbidden command at all. Quotes and backslashes are
+ * dropped (line continuations joined first), the text is cut at shell separators, words also split at `<` and
+ * `>`, and an entry word followed later by `work` and a coordinator-only verb matches.
+ */
+function coarseHit(command: string): string | null {
+  const flat = command.replace(/\\\r?\n/g, ' ').replace(/["'\\]/g, '');
   for (const piece of flat.split(/[;&|()`\n]|\$\(/)) {
-    const words = piece.split(/\s+/).filter(Boolean);
+    const words = piece.split(/[\s<>]+/).filter(Boolean);
     for (let i = 0; i < words.length; i++) {
-      if (basename(words[i]!) !== 'minions') continue;
-      const w = words.indexOf('work', i + 1);
-      if (w < 0) continue;
-      const verb = words.slice(w + 1).find((x) => !x.startsWith('-'));
-      if (verb && (COORDINATOR_ONLY_WORK_VERBS as readonly string[]).includes(verb)) return `minions work ${verb}`;
+      if (!MINIONS_ENTRY.test(basename(words[i]!))) continue;
+      const hit = coordinatorVerb(words, i);
+      if (hit) return hit;
     }
   }
   return null;
+}
+
+function scriptHit(script: string, depth: number): string | null {
+  if (depth > MAX_SCRIPT_DEPTH) return coarseHit(script);
+  let scan: ShellScan;
+  try { scan = scanShell(script); } catch (e) {
+    if (e instanceof ShellParseError) return coarseHit(script);
+    throw e;
+  }
+  for (const words of scan.commands) { const hit = simpleCommandHit(words, depth); if (hit) return hit; }
+  for (const nested of scan.scripts) { const hit = scriptHit(nested, depth + 1); if (hit) return hit; }
+  return null;
+}
+
+/**
+ * The first `minions work run|claim|release` a Bash command line would run, or null (task-14.5). The line is
+ * scanned into simple commands (src/runtime/shell-scan.ts: quotes, continuations, separators, redirections,
+ * heredoc bodies, substitutions); a command matches when, after assignments, its command word runs minions
+ * (`minions` by any path, or `…/cli.js`), or a wrapper (env, sudo, timeout, xargs, node, …) has such a word
+ * later, followed by `work` and a coordinator-only verb as the next non-option word. Script arguments of shells
+ * (`bash -c '…'`, `eval`) are scanned recursively. Quoted arguments of other commands (commit messages, grep
+ * patterns) and heredoc bodies are data and never match. When the line cannot be scanned, it fails closed on the
+ * raw text (coarseHit). Defence-in-depth, not a security boundary: variables, aliases, functions and
+ * substitutions in command position are out of reach of any text check, which is why `work run` keeps its own
+ * gate (D4 L0).
+ */
+export function coordinatorOnlyWorkCommand(command: string): string | null {
+  return scriptHit(command, 0);
 }
 
 /**

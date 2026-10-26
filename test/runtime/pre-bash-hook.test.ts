@@ -111,8 +111,15 @@ describe('the plugin hooks.json Bash entry', () => {
     expect(runHookCommand(command, null, JSON.stringify(bash('gh issue list --label minions:authorized', sub)))).toMatchObject({ status: 0, stdout: '' });
   });
 
+  it('a subagent call naming the entry script (cli.js) reaches minions too', () => {
+    const direct = JSON.stringify(bash('node ./dist/cli.js work release lease-1', sub));
+    expect(runHookCommand(command, null, direct).status).toBe(2);
+    expect(JSON.parse(runHookCommand(command, FAKE_MINIONS.deny, direct).stdout).hookSpecificOutput.permissionDecision).toBe('deny');
+    expect(runHookCommand(command, null, JSON.stringify(bash('node ./dist/clixjs', sub)))).toMatchObject({ status: 0, stdout: '' });
+  });
+
   it('a grep failure (missing or broken) blocks rather than skipping the check', () => {
-    const noGrep = command.replace("grep -q", '/nonexistent/grep -q');
+    const noGrep = command.replace("grep -Eq", '/nonexistent/grep -Eq');
     expect(runHookCommand(noGrep, FAKE_MINIONS.allow, JSON.stringify(bash('npm test', sub))).status).toBe(2);
   });
 
@@ -158,24 +165,88 @@ describe('tester regressions: pre-bash bypass variants', () => {
     ]) expect(preBashHook(bash(cmd, sub)).stdout).toBeUndefined();
   });
 
-  // Known gaps found in QA (task-14.5). `it.fails` passes while the gap exists; when the matcher is fixed these
-  // start failing: turn them into plain `it` cases then.
-  it.fails('KNOWN GAP: a line continuation (backslash-newline) between words is ordinary shell, but bypasses the check', () => {
+  // Gaps found in QA (task-14.5), fixed by the command-position scanner (src/runtime/shell-scan.ts).
+  it('FIXED: a line continuation (backslash-newline) between words is ordinary shell, but bypasses the check', () => {
     expect(coordinatorOnlyWorkCommand('minions \\\nwork run lease-1')).not.toBeNull();
   });
-  it.fails('KNOWN GAP: a redirection glued to a word (run>/dev/null, minions>log, run<in) bypasses the check', () => {
+  it('FIXED: a redirection glued to a word (run>/dev/null, minions>log, run<in) bypasses the check', () => {
     for (const cmd of ['minions work run>/dev/null lease-1', 'minions>/tmp/log work claim t', 'minions work release<in lease-1']) {
       expect(coordinatorOnlyWorkCommand(cmd)).not.toBeNull();
     }
   });
-  it.fails('KNOWN GAP: the bin target run directly (node .../minions/pkg/dist/cli.js) bypasses the check', () => {
+  it('FIXED: the bin target run directly (node .../minions/pkg/dist/cli.js) bypasses the check', () => {
     expect(coordinatorOnlyWorkCommand('node /opt/minions/pkg/dist/cli.js work release lease-1')).not.toBeNull();
   });
-  it.fails('KNOWN GAP (false positive): a worker submit heredoc whose findings mention the command is denied', () => {
+  it('FIXED (false positive): a worker submit heredoc whose findings mention the command is denied', () => {
     const cmd = 'minions work submit lease-1 --role tester --json <<\'RESULT\'\n{"findings":["repro: run minions work release lease-1 while a runner is live"]}\nRESULT';
     expect(preBashHook(bash(cmd, sub)).stdout).toBeUndefined();
   });
-  it.fails('KNOWN GAP (false positive): a commit message naming the command is denied', () => {
+  it('FIXED (false positive): a commit message naming the command is denied', () => {
     expect(preBashHook(bash('git commit -m "Add the process runner (minions work run) and the fake harness"', sub)).stdout).toBeUndefined();
+  });
+});
+
+// ------------------------------------------------------------------- command-position scanner (task-14.5 repair)
+
+describe('coordinatorOnlyWorkCommand: command position, not raw text', () => {
+  it.each([
+    ['continuation inside the verb list', 'minions work \\\nrelease lease-1'],
+    ['continuation in a wrapper', 'env \\\n  FOO=1 \\\n  minions work claim t'],
+    ['fd redirection before the verb', 'minions work 2>/dev/null run lease-1'],
+    ['&> redirection glued', 'minions work run&>/dev/null lease-1'],
+    ['heredoc on the command itself', "minions work release lease-1 --reason x <<'EOF'\nbody\nEOF"],
+    ['command after a heredoc body', "cat <<'EOF'\nminions work release lease-1\nEOF\nminions work run lease-1"],
+    ['substitution in an unquoted heredoc body', 'cat <<EOF\n$(minions work claim t)\nEOF'],
+    ['backticks in an unquoted heredoc body', 'cat <<EOF\n`minions work release lease-1`\nEOF'],
+    ['substitution inside double quotes', 'echo "now: $(minions work claim t)"'],
+    ['backticks inside double quotes', 'echo "`minions work run x`"'],
+    ['nested substitutions', 'echo $(echo $(minions work run x))'],
+    ['process substitution', 'cat <(minions work claim t)'],
+    ['parameter expansion with a substitution', 'echo ${X:-$(minions work run x)}'],
+    ['a subshell', '(cd /w && minions work release lease-1)'],
+    ['a brace group', '{ minions work claim t; }'],
+    ['if/then', 'if true; then minions work run x; fi'],
+    ['a pipeline after a quoted pipe char', 'echo "a|b" | minions work claim t'],
+    ['the entry script, direct', '/opt/minions/pkg/dist/cli.js work run lease-1'],
+    ['the entry script, relative under node', 'node ./dist/cli.js work claim t'],
+    ['node with options', 'node --enable-source-maps /opt/minions/pkg/dist/cli.js --json work release x'],
+    ['npx', 'npx minions work run x'],
+    ['eval', 'eval "minions work" run x'],
+    ['sh -c with a nested quoted script', 'sh -c "bash -c \'minions work release x\'"'],
+    ['ssh with a remote command string', "ssh host 'minions work claim t'"],
+    ['find -exec', 'find . -name x -exec minions work release {} \\;'],
+    ['an assignment with an array index', 'A[0]=1 minions work run x'],
+    ['after a comment line', '# release it\nminions work release lease-1'],
+    ['carriage returns', 'minions work run x\r\n'],
+  ])('denies %s', (_name, cmd) => {
+    expect(coordinatorOnlyWorkCommand(cmd)).toMatch(/^minions work (run|claim|release)$/);
+  });
+
+  it.each([
+    ['a quoted heredoc body', "minions work submit lease-1 --role tester --json <<'RESULT'\n{\"findings\":[\"run minions work release lease-1; then minions work claim t\"]}\nRESULT"],
+    ['an unquoted heredoc body (plain text, no substitution)', 'minions work submit lease-1 --role tester --json <<RESULT\n{"findings":["repro: minions work release lease-1 | minions work run x"]}\nRESULT'],
+    ['a <<- heredoc body', 'cat <<-EOF > /s/notes\n\tminions work run x\n\tEOF'],
+    ['a commit message', 'git commit -m "Add the process runner (minions work run) and the fake harness"'],
+    ['a commit message from a heredoc substitution', "git commit -m \"$(cat <<'EOF'\nDon't let minions work release end the lease (or minions work run)\n\nBody.\nEOF\n)\""],
+    ['a grep pattern', 'grep -rn "minions work release" src'],
+    ['a single-quoted grep pattern', "grep -rn 'minions work run\\|minions work claim' src test"],
+    ['echo with quotes', 'echo "use: minions work claim <task>"'],
+    ['a comment', 'npm test # then minions work release lease-1'],
+    ['a file name', 'cat docs/minions-work-run.md'],
+    ['a redirection target named minions', 'npm test > minions; work run'],
+    ['wrappers whose quoted argument mentions it', 'timeout 60 git commit -m "minions work run"'],
+    ['sh -c with a quoted inner argument', 'sh -c \'git commit -m "minions work release x"\''],
+    ['a here-string', 'cat <<< "minions work run x"'],
+    ['the worker\'s own submit', 'cd /w && minions work submit lease-1 --role engineer --result-file /s/r.json'],
+  ])('allows %s', (_name, cmd) => {
+    expect(coordinatorOnlyWorkCommand(cmd)).toBeNull();
+  });
+
+  it('fails closed on a line it cannot scan, but only when the raw text names the command', () => {
+    expect(coordinatorOnlyWorkCommand("echo 'unterminated; minions work run x")).toBe('minions work run');
+    expect(coordinatorOnlyWorkCommand('echo "unterminated $(minions work claim t')).toBe('minions work claim');
+    expect(coordinatorOnlyWorkCommand("echo 'unterminated; npm test")).toBeNull();
+    const deep = `${'$('.repeat(40)}minions work release x${')'.repeat(40)}`;
+    expect(coordinatorOnlyWorkCommand(deep)).toBe('minions work release');
   });
 });

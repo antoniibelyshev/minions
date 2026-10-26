@@ -312,10 +312,11 @@ the coordinator's background Bash, OOM or SIGKILL. In each case:
   2. The runner is alive (pid, start time and boot id match): mark cancel in the record, then wait up to 60 s for
      `done`.
   3. Otherwise, or on timeout: SIGKILL the recorded wrapper and pgid (each pid checked against its recorded start
-     time). Then sweep for escapees: every process whose `Seccomp_filters` count in `/proc/<pid>/status` is above
-     the container baseline is a sandboxed worker, because only the wrapper adds a filter. Each one whose ancestry
-     does not reach a live wrapper is killed. A record from another boot or container start skips this step, since
-     its processes are already gone.
+     time). Then sweep for escapees: a process whose `Seccomp_filters` count in `/proc/<pid>/status` is above
+     the container baseline and whose `/proc/<pid>/environ` carries this lease's run marker
+     (`MINIONS_WORKER_LEASE=<lease>`, set by the runner) is a sandboxed worker of this run. Each one whose
+     ancestry does not reach a live wrapper is killed. A record from another boot or container start skips this
+     step, since its processes are already gone.
   4. Run post-exit steps 7.1 to 7.5 with a drain-style `wip:` commit. The work is preserved on the lease branch, as
      with drains, and the release note names the `wip:` commit ("recovered: runner lost"). Then `phase: done`, and
      only then does the lease end.
@@ -983,9 +984,10 @@ not, Junie is deferred with a clear `status --check` message.
   for Claude API-key billing, and per-harness pricing is not configured. The budget wording says "approximate
   across harnesses".
 - U-G6: The escapee sweep (D3b) relies on `Seccomp_filters` in `/proc/<pid>/status` (Linux ≥ 5.9) and on the
-  wrapper being the only source of an extra filter. The self-test checks the field. A process that is both
-  outside the wrapper's tree and sandboxed some other way would be killed by mistake; no such process exists in
-  the container today.
+  run marker in `/proc/<pid>/environ`. The self-test checks the field. Other seccomp users (Chromium renderers,
+  Claude Code sandboxed commands) carry no marker of the recovered lease and are never killed (task-14.5 repair).
+  A sandboxed process that re-execs with a cleared environment drops the marker and escapes the sweep; the
+  recorded process-group kill still reaches it unless it also left the group.
 - U-G7: Absolute paths. Tools that bake the checkout path into caches or lockfiles will see
   `<scratch>/work` instead of the lease worktree. Expected harmless, since nothing outside git is fetched back.
 
@@ -1053,13 +1055,26 @@ Orphan recovery and launch guards, on top of the task-14.4 runner:
   record dir and its scratch dir (the clone that recovery still checkpoints). `done` records of ended leases left
   behind are removed by the next coordinator start or restart.
 - **Escapee sweep** (`src/runtime/runner/escapees.ts`): the baseline is PID 1's `Seccomp_filters` (the
-  sweeper's own when PID 1 is unreadable). The live wrappers are the wrappers of other run records. The sweeper,
+  sweeper's own when PID 1 is unreadable). A candidate must also carry the recovered lease's marker
+  `MINIONS_WORKER_LEASE=<lease>` in its environ: the runner sets it last in the child environment, so no plan
+  overrides it, and the wrapper's whole tree inherits it. This keeps the sweep away from unrelated seccomp
+  processes and from the children of other runs, including a run that is starting and has not recorded its
+  wrapper yet (its children carry their own lease id). An unreadable environ counts as unmarked: the sweep never
+  kills what it cannot identify. The live wrappers and runners of other run records are spared as a second
+  guard; a record that cannot be read is skipped. The sweeper,
   its ancestors and PID 1 are never killed, and zombies are skipped. Without the field the sweep is skipped, and
   the run-recovered event says why; the self-test refuses launches on such a kernel anyway. The /proc root and the
   kill function are injected, and unit tests use a fake tree. `reapRun` requires an explicit `escapees` choice:
   production passes the real /proc, tests a fake tree or none.
 - **Re-claim gate.** `work claim` refuses (`POLICY_DENIED`) while any lease of the task has a record that is not
-  `done` (an unreadable record counts as not done).
+  `done` (an unreadable record counts as not done). A record that is not valid JSON blocks release, recovery and
+  the claim alike; the error names the file, and the hint says how to recover by hand: check for leftover
+  processes with the marker (`grep -ls 'MINIONS_WORKER_LEASE=<lease>' /proc/[0-9]*/environ`), then remove the
+  record dir and retry. There is no forced recovery option.
+- **state-import.** The restored active leases are released through `Scheduler.release`. When that fails and the
+  lease may still have an unfinished run (`hasOpenRun`, true for an unreadable record), the lease stays active
+  and is reported as a warning (event `release-refused`), as `work release` keeps it; only a lease without an
+  open run is ended directly in the DB.
 - **Restarts.** `coordinator restart` (with or without `--detach`) and `coordinator sync` first reap the
   records that are not `done` and whose lease ended. Then they count the records still open as running workers,
   next to the active leases. The context-reset check does not count them: the restart it leads to reaps those
@@ -1069,11 +1084,22 @@ Orphan recovery and launch guards, on top of the task-14.4 runner:
   `outcome.note`. That is not a harness violation, and nothing is restored into a removed worktree.
 - **The Claude-subagent hook.** It is a `PreToolUse(Bash)` entry in the plugin's `hooks.json` that runs
   `minions hook pre-bash`. That hook denies `minions work run|claim|release` whenever `agent_id` is set to
-  anything but null. The text check is coarse on purpose: quotes are dropped, the line is cut at shell separators,
-  and `minions … work <verb>` is matched. Two shell pre-filters start node only for a subagent call whose input
-  has `minions` followed by anything but `:` (`"agent_type":"minions:<role>"` alone does not count). Stdin, grep
-  and minions failures all exit 2. Obfuscated forms stay out of reach of any text check, so the `work run` gate
-  (L0) keeps its own checks.
+  anything but null. The hook is defence-in-depth, not a security boundary. It reasons about words in command
+  position (task-14.5 repair, `src/runtime/shell-scan.ts`): a small scanner joins line continuations, removes
+  quotes and escapes, splits at `;`, `&`, `|`, newlines and parentheses, drops redirections (also when glued to
+  a word, as in `run>/dev/null`), skips heredoc bodies (an unquoted delimiter's `$(…)` and backticks are still
+  scanned, as the shell runs them) and scans command substitutions. A simple command matches when, after
+  assignments, its command word runs minions (`minions` by any path, or the entry `…/cli.js`), or a wrapper
+  (`env`, `sudo`, `timeout`, `xargs`, `node`, `npx`, shell keywords, …) has such a word later, followed by
+  `work` and `run|claim|release` as the next non-option word. Script arguments of shells (`bash -c`, `sh -c`,
+  `su -c`, `ssh`) and `eval` are scanned recursively. Quoted arguments of other commands (commit messages,
+  grep patterns) and heredoc bodies are data, so workers can name these commands in results and commits. A line
+  the scanner cannot parse (unbalanced quotes, deep nesting) fails closed on the raw text, but only when it names
+  the command. Two shell pre-filters start node only for a subagent call whose input has `minions` followed by
+  anything but `:` (`"agent_type":"minions:<role>"` alone does not count) or names `cli.js`. Stdin, grep and
+  minions failures all exit 2. Variables, aliases, functions and substitutions in command position are out of
+  reach of any text check, and a name split by quotes or backslashes inside the word (`mi''nions`) passes the
+  pre-filter, so the `work run` gate (L0) keeps its own checks.
 - **Not here:** a distinct outcome when the lease branch moves during a run (task-14.12).
 
 ## Child tasks
