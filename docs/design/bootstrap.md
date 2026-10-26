@@ -878,15 +878,19 @@ The source phase (`src/host/upgrade-source.ts`) adds two steps, `sync` and `cli`
   resets, stashes or checks out. `--dry-run` does not export; it checks against the refs from the last
   export and reports a refusal as a failed step.
 - **Installed CLI vs checkout.** This check runs only when the project repository is a minions
-  checkout. `esbuild.config.mjs` writes `dist/build.json` = `{version, source, kind}`. `source` is
+  checkout. `esbuild.config.mjs` writes `dist/build.json` = `{version, source, kind, commit, dirty}`. `source` is
   `scripts/source-fingerprint.mjs`, a hash of `src/ templates/ docker/ scripts/` plus the package,
   lock and esbuild files, regular files only. The upgrade recomputes that hash on the checkout and
-  compares it, together with the version, against the global install at `<npm root -g>/minions`.
+  compares it, together with the version, against the global install at `<npm root -g>/minions`. `commit` is
+  the HEAD of the package's own git checkout at build time and `dirty` whether its tree had changes (both null
+  outside a checkout); only the host manager's dev-only rebuild-cli plan reads them (task-53.7).
 - **Install kinds and what happens.** A symlink is a `link` (`npm install -g <dir>`). If it points at the
   checkout, the upgrade rebuilds it (`npm run build`, or `npm ci` when build deps are missing). A real
   directory stamped `kind: packed` comes from `install.sh`, which exports `MINIONS_BUILD_KIND=packed`.
   The upgrade reinstalls it in place: `npm pack` of the checkout into a temp dir, then
-  `npm install -g <tgz>`. A real directory whose `npm ls -g --long` `resolved` or package.json
+  `npm install -g <tgz>`. Before that install the current one is packed (`npm pack <install dir>
+  --ignore-scripts`) into `<MINIONS_HOME>/manager/cli-backup/minions-<version>-<stamp>.tgz` (0600, last 2 kept,
+  `src/host/cli-backup.ts`); a backup that fails stops the reinstall with nothing installed. A real directory whose `npm ls -g --long` `resolved` or package.json
   `_resolved`/`_from` is a git spec is a `git` install. Any other real directory is `unknown`; npm 10
   records nothing that tells a git-URL install from a tarball install. For `git`, `unknown`, a link
   elsewhere, or a missing install, the upgrade does not touch npm. It prints
@@ -904,6 +908,14 @@ The source phase (`src/host/upgrade-source.ts`) adds two steps, `sync` and `cli`
   rerun that opts in. Commits fast-forwarded by `--from-container` are never built in the same run,
   even with `--rebuild-cli`: the upgrade stops, names the range to review and logs it
   (`git log --oneline <from>..<to>`, up to 20 commits). A dry run plans these stops (`ok: false`).
+- **From the host manager (task-53.7).** The manager's `/upgrade` never passes `--rebuild-cli`. After any upgrade
+  that rebuilt or reinstalled the CLI it runs `minions --version` and `minions --json status` in fresh processes;
+  if either fails it offers **Roll back CLI** (reinstall the newest backup, one confirmation, sha256 checked again
+  before `npm install -g`; never retried or tried another way). The dev-only `/rebuild_cli` runs
+  `minions upgrade --rebuild-cli` for commits already on the host branch (after `/sync`). It exists only when
+  the host CLI runs from a minions source checkout and the project is minions, with local delivery and a clean
+  checkout; its plan shows `git log --oneline <build commit>..HEAD`, the diffstat and the sensitive paths the
+  range touches, and it always asks twice. Details: [host-manager.md](host-manager.md#phases).
 
 ### origin/<base> as the single source of truth
 

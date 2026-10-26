@@ -26,6 +26,7 @@ import { join } from 'node:path';
 import { sourceFingerprint } from '../../scripts/source-fingerprint.mjs';
 import { MinionsError } from '../core/errors.js';
 import { run, type RunResult } from '../core/exec.js';
+import { backupInstalledCli } from './cli-backup.js';
 import { HOST_GIT } from './discovery.js';
 import type { Runner } from './docker.js';
 import { shellQuote } from './setup.js';
@@ -324,8 +325,12 @@ export async function checkCli(opts: { checkout: string; runner?: Runner; runnin
   return manual;
 }
 
-/** Runs the rebuild/reinstall chosen by checkCli (npm in the checkout; the global prefix only for `install -g`). */
-export async function applyCli(c: CliCheck, opts: { runner?: Runner; log?: (m: string) => void } = {}): Promise<void> {
+/**
+ * Runs the rebuild/reinstall chosen by checkCli (npm in the checkout; the global prefix only for `install -g`).
+ * Before `npm install -g` the current install is kept in <MINIONS_HOME>/manager/cli-backup/ (src/host/cli-backup.ts,
+ * last 2); when that backup fails nothing is installed.
+ */
+export async function applyCli(c: CliCheck, opts: { runner?: Runner; log?: (m: string) => void; backup?: typeof backupInstalledCli } = {}): Promise<void> {
   const runner = opts.runner ?? run;
   const env: NodeJS.ProcessEnv = { ...process.env };
   if (c.action === 'reinstall') env.MINIONS_BUILD_KIND = 'packed'; else delete env.MINIONS_BUILD_KIND;
@@ -343,6 +348,11 @@ export async function applyCli(c: CliCheck, opts: { runner?: Runner; log?: (m: s
     await npm(['pack', '--pack-destination', dir], c.checkout);
     const tgz = join(dir, `minions-${c.checkoutVersion}.tgz`);
     if (!existsSync(tgz)) throw new MinionsError('INTERNAL', `npm pack did not produce ${tgz}.`);
+    if (c.installed.realPath) {
+      try { await (opts.backup ?? backupInstalledCli)(c.installed.realPath, c.installed.version, { runner, env, log: opts.log }); } catch (e) {
+        throw new MinionsError('INTERNAL', `backing up the current CLI failed, so nothing was installed: ${(e as Error).message}`);
+      }
+    }
     await npm(['install', '-g', '--no-audit', '--no-fund', tgz], dir);
   } finally { await rm(dir, { recursive: true, force: true }); }
 }

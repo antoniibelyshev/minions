@@ -352,8 +352,11 @@ describe('host manager: confirm, apply, replay', () => {
     expect(s.c.runs).toEqual([['settings', 'restart']]);
     expect(s.t.outcomes.at(-1)).toMatchObject({ status: 'failed', text: expect.stringMatching(/coordinator restart: refused/) });
     expect(db.changeRequest(rid)).toMatchObject({ status: 'failed' });
+    // task-53.7: the refusal is followed by the two owner plans "Restart when idle" and "Drain now" (each its own offer).
+    expect(s.t.offers.slice(1).map((o) => [o.kind, o.summary.split(':')[0]])).toEqual([['restart', 'Restart when idle'], ['restart', 'Drain now']]);
     await s.manager.pollAll();
-    expect(s.t.offers).toHaveLength(2);
+    expect(s.t.offers).toHaveLength(4);
+    expect(s.t.offers[3]!.requestId).toBe(rid);
 
     const uid = RT.recordUpgradeRequest({ db, config: runtimeConfig(project) }, {}).request!.id;
     await s.manager.pollAll();

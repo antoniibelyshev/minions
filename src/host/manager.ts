@@ -33,6 +33,18 @@
 //   bounded delegate. The runtime refuses a head that is not the one awaiting approval. The token is never logged,
 //   journaled or sent to the chat: the runtime's answer (and an error while approving) goes through redactApprovalText
 //   before it becomes the outcome detail. Approvals cannot be undone.
+// - Restart when idle / Drain now (task-53.7): a plain restart refused because worker leases are active is followed by
+//   two owner offers, restart mode when-idle and drain. A confirmed one is queued here (in memory; its journal entry
+//   stays `applying`, so a manager restart reports it as interrupted and never resumes it): drain first runs
+//   `pause --starts --drain` in the runtime. Every poll re-checks the active leases; the first idle poll resumes a
+//   pause made here (`resume --starts`, before the restart, since the recovery prompt dispatches only with starts
+//   open) and runs `minions settings restart`; an owner's own pause stays and only its drain is cleared after the
+//   restart (a stopped runtime cannot be resumed: the outcome says so). A restart refused again at that moment (a
+//   lease started in between) is paused again with the drain and stays queued; nothing else is tried.
+// - CLI check and roll back (task-53.7): after an upgrade that rebuilt or reinstalled the CLI, `minions --version` and
+//   `minions status` run in fresh processes; when either fails and a backup exists (src/host/cli-backup.ts), a
+//   cli-rollback offer follows (one Confirm reinstalls it). The dev-only rebuild-cli request (src/host/cli-rebuild.ts)
+//   exists only when the host CLI runs from a minions source checkout and the project is minions.
 import { open, readFile, rm } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 import type { Command } from 'commander';
@@ -51,9 +63,12 @@ import {
 } from './change-journal.js';
 import {
   childUpgrade, confirmOffer, fetchRequests, formatPlan, fromContainerOf, hostCli, mark, offerRequest, planArgv,
-  recordApplyResult, rejectRequest, snapshotOf, undoDetail, type ChangePlan, type ChangeRequestDeps,
+  recordApplyResult, rejectRequest, RESTART_MODES, snapshotOf, undoDetail, type ChangePlan, type ChangeRequestDeps, type UpgradeRun,
 } from './change-requests.js';
 import { approveOnHost } from './approvals.js';
+import { checkCliHealth, installCliBackup, listCliBackups, type CliHealth } from './cli-backup.js';
+import { devRebuildAvailable, notAvailable, rebuildRange, type CliDevDeps } from './cli-rebuild.js';
+import type { Runner } from './docker.js';
 import { applyUndo, beginHistory, completeHistory } from './config-history.js';
 import { readManagerToken } from './credentials.js';
 import { DELEGATE_MAX_OUTPUT_BYTES, DELEGATE_TIMEOUT_MS, delegateCapture } from './delegate.js';
@@ -90,7 +105,7 @@ export interface ManagerOffer {
 /** What the owner did with an offer. The transport authenticates the sender (phase 4: the paired owner only). */
 export interface ManagerEvent { type: 'confirm' | 'reject'; requestId: string; nonce: string }
 
-export type ManagerOutcomeStatus = 'applying' | 'applied' | 'failed' | 'refused' | 'rejected' | 'already-handled' | 'interrupted' | 'error';
+export type ManagerOutcomeStatus = 'applying' | 'queued' | 'applied' | 'failed' | 'refused' | 'rejected' | 'already-handled' | 'interrupted' | 'error';
 /** A report to the owner (one new message each, so the phone notifies). */
 export interface ManagerOutcome { status: ManagerOutcomeStatus; projectId: string | null; requestId: string | null; text: string }
 
@@ -118,6 +133,11 @@ export interface ManagerCommands {
    * (nothing journaled) when the plan cannot be built, for example an invalid value or a refused sync.
    */
   propose(projectId: string | null, command: OwnerCommand): Promise<ManagerOffer>;
+  /**
+   * Whether the dev-only /rebuild_cli exists for projectId (or, with null, for any registered project): the host CLI
+   * runs from a minions source checkout and the project is minions. Elsewhere it is neither advertised nor accepted.
+   */
+  devRebuild?(projectId: string | null): Promise<boolean>;
 }
 
 /** An owner change command as the transport parsed it (the core validates everything again). */
@@ -128,7 +148,9 @@ export type OwnerCommand =
   | { kind: 'sync' }
   | { kind: 'undo'; target: string }
   /** A host-signed approval for exactly this task and full head SHA; merge: true approves merging instead of publishing. */
-  | { kind: 'approve'; taskId: string; head: string; merge: boolean };
+  | { kind: 'approve'; taskId: string; head: string; merge: boolean }
+  /** Dev-only: `minions upgrade --rebuild-cli` with the commit range in the plan (see ManagerCommands.devRebuild). */
+  | { kind: 'rebuild-cli' };
 
 // ---------------------------------------------------------------- deps
 
@@ -152,7 +174,16 @@ export interface ManagerDeps {
   writerAlive?: (e: OutcomeEntry) => boolean;
   /** Signs and records an approval (default: approveOnHost of src/host/approvals.ts); tests stub it. */
   approveOnHost?: typeof approveOnHost;
+  /** The running CLI's root and a git runner for the dev-only rebuild-cli request (defaults: packageRoot(), run). */
+  cli?: CliDevDeps;
+  /** Checks the host CLI after a rebuild/reinstall or a roll back (default: --version and status in fresh processes). */
+  cliHealth?: (project: ProjectJson) => Promise<CliHealth>;
+  /** npm for the CLI roll back (default: run). */
+  npm?: Runner;
 }
+
+/** A restart confirmed with mode when-idle or drain, waiting in the manager for the first poll without active leases. */
+interface QueuedRestart { projectId: string; offer: OfferEntry; plan: ChangePlan; since: string; resumeStarts: boolean; clearDrain: boolean }
 
 /**
  * The runtime as the manager sees it: every answer is bounded. A timeout or an answer over the cap throws (a project
@@ -232,7 +263,10 @@ function wellFormed(r: unknown): r is ChangeRequestView {
 /** One line for a plan, from the host's own view. */
 export function planSummary(plan: ChangePlan): string {
   if (plan.kind === 'config-set' && plan.change) return `set ${plan.change.key}: ${formatValue(plan.change.from)} -> ${formatValue(plan.change.to)}`;
+  if (plan.kind === 'restart' && plan.restart) return plan.restart.mode === 'drain' ? 'Drain now: pause starts, let the workers hand back, then restart the coordinator' : 'Restart when idle: restart the coordinator at the first poll without active workers';
   if (plan.kind === 'restart') return 'restart the coordinator';
+  if (plan.kind === 'rebuild-cli' && plan.rebuild) return `rebuild the host CLI from ${plan.rebuild.count} commit${plan.rebuild.count === 1 ? '' : 's'} (${plan.rebuild.from.slice(0, 12)}..${plan.rebuild.to.slice(0, 12)}), then upgrade`;
+  if (plan.kind === 'cli-rollback' && plan.rollback) return `Roll back CLI: reinstall minions ${plan.rollback.version} from the backup`;
   if (plan.kind === 'undo' && plan.change) {
     const more = (plan.undo?.changes.length ?? 1) - 1;
     return `undo ${plan.undo?.target ?? '?'}: ${plan.change.key}: ${formatValue(plan.change.from)} -> ${formatValue(plan.change.to)}${more > 0 ? ` (+${more} more setting${more === 1 ? '' : 's'})` : ''}`;
@@ -251,7 +285,7 @@ const offerOf = (b: Awaited<ReturnType<typeof offerRequest>>): ManagerOffer => (
 });
 
 /** Reads the host CLI child's `--json` answer into an outcome. */
-export function childOutcome(plan: ChangePlan, r: RunResult): { status: 'applied' | 'failed'; detail: string } {
+export function childOutcome(plan: ChangePlan, r: RunResult): { status: 'applied' | 'failed'; detail: string; refused?: boolean } {
   let env: { ok?: boolean; data?: Record<string, unknown>; error?: { message?: string } } | null = null;
   try { env = JSON.parse(r.stdout.trim().split('\n').filter(Boolean).at(-1) ?? ''); } catch { env = null; }
   const cmd = plan.kind === 'config-set' ? 'minions settings set' : 'minions settings restart';
@@ -265,7 +299,9 @@ export function childOutcome(plan: ChangePlan, r: RunResult): { status: 'applied
       : { status: 'failed', detail: `${plan.change?.key ?? 'setting'} was not written (exit ${r.code})` };
   }
   const detail = `coordinator restart: ${displayText(String(d.action ?? 'unknown'))} - ${displayText(String(d.detail ?? ''))}`;
-  return { status: d.action === 'restarted' && r.code === 0 ? 'applied' : 'failed', detail };
+  if (d.action === 'restarted' && r.code === 0) return { status: 'applied', detail };
+  // `settings restart` refuses while worker leases are active (restartCoordinator: action refused).
+  return { status: 'failed', detail, ...(d.action === 'refused' ? { refused: true } : {}) };
 }
 
 export class HostManager {
@@ -274,12 +310,21 @@ export class HostManager {
   private readonly reported = new Map<string, string>();
   /** Offers whose sendOffer failed: offered again on the next poll. */
   private readonly unsent = new Set<string>();
+  /** Restarts waiting for an idle poll, by project (at most one per project). */
+  private readonly queued = new Map<string, QueuedRestart>();
 
   constructor(private readonly deps: ManagerDeps) {
     this.runtime = boundedRuntime(deps);
   }
 
-  private get cr(): ChangeRequestDeps { return { runtime: this.runtime, upgrade: this.deps.upgrade, now: this.deps.now }; }
+  private get cr(): ChangeRequestDeps {
+    return { runtime: this.runtime, upgrade: this.deps.upgrade, now: this.deps.now, ...(this.deps.cli ? { cli: this.deps.cli } : {}) };
+  }
+
+  /** The restarts queued in this process (projectId, request id, mode, since). */
+  queuedRestarts(): { projectId: string; requestId: string; mode: string; since: string }[] {
+    return [...this.queued.values()].map((q) => ({ projectId: q.projectId, requestId: q.offer.requestId, mode: q.plan.restart?.mode ?? 'when-idle', since: q.since }));
+  }
 
   private async notify(o: ManagerOutcome): Promise<void> {
     this.deps.log(`${o.status}${o.projectId ? ` ${o.projectId}` : ''}${o.requestId ? ` ${o.requestId}` : ''}: ${o.text.split('\n')[0]}`);
@@ -301,7 +346,8 @@ export class HostManager {
     const found = interruptedEntries(await readJournal(), this.deps.writerAlive ?? ((e) => writerAlive(e)));
     for (const e of found) {
       const detail = `interrupted, state unknown: the apply was ${e.type} at ${e.at} by process ${e.pid ?? 'unknown'}, which stopped before it recorded an outcome. `
-        + 'It is not resumed: check the project, then confirm the request again or reject it.';
+        + 'It is not resumed: check the project, then confirm the request again or reject it.'
+        + (e.detail?.startsWith('queued') ? ` It was ${e.detail}.` : '');
       await recordOutcome({ type: 'failed', projectId: e.projectId, requestId: e.requestId, digest: e.digest, detail }, this.deps.now());
       let warning = '';
       try {
@@ -320,6 +366,7 @@ export class HostManager {
       await this.reportOnce('registry', { status: 'error', projectId: null, requestId: null, text: `cannot read the project registry: ${(e as Error).message}` });
       return;
     }
+    await this.runQueued();
     for (const p of projects) {
       try {
         await this.pollProject(p);
@@ -448,15 +495,31 @@ export class HostManager {
     const warnings: string[] = [];
     const w = await mark(project, this.runtime, offer.requestId, 'confirmed', `confirmed in the host manager (digest ${offer.digest.slice(0, 12)})`);
     if (w) warnings.push(w);
-    const argv = plan.kind === 'undo' || plan.kind === 'approve' ? null : planArgv(plan, offer.request);
+    if (plan.kind === 'restart' && plan.restart) { await this.enqueue(project, offer, plan, warnings); return; }
+    const inManager = plan.kind === 'undo' || plan.kind === 'approve' || plan.kind === 'cli-rollback';
+    const argv = inManager ? null : planArgv(plan, offer.request);
     await this.notify({ status: 'applying', ...ids, text: `Applying change request ${offer.requestId} (project ${offer.projectId}): ${planSummary(plan)}…` });
-    let result: { status: 'applied' | 'failed'; detail: string };
+    let result: { status: 'applied' | 'failed'; detail: string; refused?: boolean };
+    /** Lines after the outcome, and owner offers sent after it (each still needs its own Confirm). */
+    const after: string[] = [];
+    const nextOffers: RequestSnapshot[] = [];
     try {
       await recordOutcome({ type: 'applying', ...ids, nonce: offer.nonce, digest: offer.digest, detail: argv ? `minions ${argv.join(' ')}` : plan.steps[0] ?? plan.kind, ...writer() }, this.deps.now());
-      if (plan.kind === 'upgrade' || plan.kind === 'sync') {
-        const r = await this.deps.upgrade(project, plan.kind === 'sync'
-          ? { fromContainer: null, dryRun: false, syncOnly: true } : { fromContainer: fromContainerOf(offer.request.payload), dryRun: false });
+      if (plan.kind === 'upgrade' || plan.kind === 'sync' || plan.kind === 'rebuild-cli') {
+        if (plan.kind === 'rebuild-cli') await this.assertRangeUnchanged(project, plan);
+        const r = await this.deps.upgrade(project, plan.kind === 'sync' ? { fromContainer: null, dryRun: false, syncOnly: true }
+          : plan.kind === 'rebuild-cli' ? { fromContainer: null, dryRun: false, rebuildCli: true } : { fromContainer: fromContainerOf(offer.request.payload), dryRun: false });
         result = { status: r.ok ? 'applied' : 'failed', detail: `${plan.kind}: ${r.summary}` };
+        if (plan.kind !== 'sync' && cliReplaced(r)) {
+          const f = await this.cliFollowUp(project);
+          after.push(...f.lines);
+          if (f.offer) nextOffers.push(f.offer);
+        }
+      } else if (plan.kind === 'cli-rollback') {
+        const done = await installCliBackup(plan.rollback!.name, plan.rollback!.sha256, { runner: this.deps.npm, log: this.deps.log });
+        const h = await this.cliHealth(project);
+        result = h.ok ? { status: 'applied', detail: `${done}; CLI check: ${h.detail}` }
+          : { status: 'failed', detail: `${done}, but the CLI check still fails: ${h.detail}. Nothing else is tried: fix the CLI in the terminal.` };
       } else if (plan.kind === 'approve') {
         result = await this.approve(project, plan);
       } else if (plan.kind === 'undo') {
@@ -470,6 +533,11 @@ export class HostManager {
         if (result.status === 'applied') await completeHistory(h);
       } else {
         result = childOutcome(plan, await this.deps.runChild(project, argv!));
+        if (plan.kind === 'restart' && result.refused) {
+          // Refused because workers are active: the owner may pick one of two follow-ups (never run on our own).
+          after.push('Two plans follow: "Restart when idle" (queued here, it runs at the first poll that finds no active worker leases) and "Drain now" (pause --starts --drain, so the workers commit wip: and hand back, then the same restart once idle). Confirm one of them, or neither.');
+          for (const mode of RESTART_MODES) nextOffers.push({ id: newOwnerRequestId(), kind: 'restart', payload: { mode }, reason: null, origin: 'owner' });
+        }
       }
     } catch (e) {
       result = { status: 'failed', detail: (e as Error).message };
@@ -481,7 +549,163 @@ export class HostManager {
       text: [`change request ${offer.requestId} (project ${offer.projectId}): ${result.status === 'applied' ? 'applied' : 'FAILED'} - ${displayText(result.detail)}`,
         ...(plan.interrupts && result.status === 'applied' ? [`note: ${plan.interrupts}`] : []),
         ...(result.status === 'applied' ? followUp(plan) : []),
+        ...after.map((x) => displayText(x)),
         ...warnings.map((x) => `warning: ${displayText(x)}`)].join('\n'),
+    });
+    for (const req of nextOffers) await this.offerOwner(project, req);
+  }
+
+  /** Journals and sends an offer the manager makes on the owner's behalf (a follow-up); a failure is reported. */
+  private async offerOwner(project: ProjectJson, req: RequestSnapshot): Promise<void> {
+    try {
+      const built = await offerRequest(project, req, this.cr);
+      await this.deps.transport.sendOffer(offerOf(built));
+      this.deps.log(`offered ${project.projectId} ${req.id}: ${planSummary(built.plan)}`);
+    } catch (e) {
+      await this.notify({ status: 'error', projectId: project.projectId, requestId: null, text: `the follow-up plan (${req.kind}) cannot be offered: ${(e as Error).message}` });
+    }
+  }
+
+  private async cliHealth(project: ProjectJson): Promise<CliHealth> {
+    try { return await (this.deps.cliHealth ?? defaultCliHealth)(project); } catch (e) { return { ok: false, detail: `the check itself failed: ${(e as Error).message}` }; }
+  }
+
+  /** After an upgrade that replaced the CLI: check it; when the check fails and a backup exists, a roll back plan follows. */
+  private async cliFollowUp(project: ProjectJson): Promise<{ lines: string[]; offer: RequestSnapshot | null }> {
+    const h = await this.cliHealth(project);
+    if (h.ok) return { lines: [`CLI check: ${h.detail}`], offer: null };
+    const b = (await listCliBackups()).at(-1);
+    if (!b) return { lines: [`CLI CHECK FAILED: ${h.detail}`, 'There is no CLI backup to roll back to (a linked checkout is rebuilt in place): fix the CLI in the terminal.'], offer: null };
+    return {
+      lines: [`CLI CHECK FAILED: ${h.detail}`, `A "Roll back CLI" plan follows: it reinstalls minions ${b.version} from the backup kept at ${b.stamp}. Confirm it to roll back; nothing happens otherwise.`],
+      offer: { id: newOwnerRequestId(), kind: 'cli-rollback', payload: { backup: b.name }, reason: null, origin: 'owner' },
+    };
+  }
+
+  /** Right before a rebuild: the checkout must still be at the HEAD the plan showed (the window since the confirmation). */
+  private async assertRangeUnchanged(project: ProjectJson, plan: ChangePlan): Promise<void> {
+    const now = await rebuildRange(project, this.deps.cli);
+    if (now.to !== plan.rebuild?.to || now.from !== plan.rebuild.from) {
+      throw new MinionsError('CONFLICT', `the checkout or the running CLI moved since the plan (${plan.rebuild?.from.slice(0, 12)}..${plan.rebuild?.to.slice(0, 12)} -> ${now.from.slice(0, 12)}..${now.to.slice(0, 12)}); nothing was built. Send /rebuild_cli again for a fresh plan.`);
+    }
+  }
+
+  // ------------------------------------------------------------ restart when idle / drain now
+
+  /** A confirmed when-idle / drain restart: drain first if asked, then queue it for the first idle poll. */
+  private async enqueue(project: ProjectJson, offer: OfferEntry, plan: ChangePlan, warnings: string[]): Promise<void> {
+    const ids = { projectId: offer.projectId, requestId: offer.requestId };
+    const mode = plan.restart!.mode;
+    const what = mode === 'drain' ? 'drain now, then restart when idle' : 'restart when idle';
+    const finish = async (detail: string) => {
+      const rec = await recordApplyResult(project, { ...ids, digest: offer.digest, status: 'failed', detail }, this.cr);
+      await this.notify({ status: 'failed', ...ids, text: [`change request ${offer.requestId} (project ${offer.projectId}): FAILED - ${displayText(detail)}`, ...[...warnings, ...rec.warnings].map((x) => `warning: ${displayText(x)}`)].join('\n') });
+    };
+    const existing = this.queued.get(project.projectId);
+    if (existing) { await finish(`a restart is already queued for this project (${existing.offer.requestId}, since ${existing.since}); this one was not queued`); return; }
+    await recordOutcome({
+      type: 'applying', ...ids, nonce: offer.nonce, digest: offer.digest, ...writer(),
+      detail: `queued: ${what}${mode === 'drain' ? ' (the host manager may have paused starts with a drain: check `minions status` in the project; `minions resume --starts` brings them back)' : ''}`,
+    }, this.deps.now());
+    let resumeStarts = false;
+    let clearDrain = false;
+    if (mode === 'drain') {
+      try {
+        const st = parseStatusEnvelope((await this.runtime.exec(project, ['minions', 'status', '--json'])).stdout);
+        const paused = st?.paused && typeof st.paused === 'object' ? (st.paused as { starts?: unknown }).starts : undefined;
+        if (typeof paused !== 'boolean') throw new MinionsError('INTERNAL', 'the runtime gave no pause state');
+        const r = await this.runtime.exec(project, ['minions', 'pause', '--starts', '--drain', '--reason', 'restart', '--json']);
+        const why = envelopeError(r);
+        if (why !== null) throw new MinionsError('INTERNAL', `minions pause --starts --drain: ${why}`);
+        // Resume only a pause made here; a pause the owner made stays, and only the drain is cleared then.
+        resumeStarts = !paused;
+        clearDrain = paused;
+      } catch (e) {
+        await finish(`drain now failed, nothing queued: ${(e as Error).message}`);
+        return;
+      }
+    }
+    const since = this.deps.now().toISOString();
+    this.queued.set(project.projectId, { projectId: project.projectId, offer, plan, since, resumeStarts, clearDrain });
+    await this.notify({
+      status: 'queued', ...ids,
+      text: [`change request ${offer.requestId} (project ${offer.projectId}): queued - ${what}.`,
+        mode === 'drain' ? 'Starts are paused and the active workers were asked to wind down (they commit wip: and hand back).' : 'Running workers are not interrupted.',
+        'The coordinator restarts at the first poll (every 20 s) that finds no active worker leases; the outcome follows then.',
+        ...warnings.map((x) => `warning: ${displayText(x)}`)].join('\n'),
+    });
+  }
+
+  /** Each poll: every queued restart whose project has no active lease now runs (a problem is reported once; it stays queued). */
+  private async runQueued(): Promise<void> {
+    for (const q of [...this.queued.values()]) {
+      try {
+        await this.tryQueued(q);
+        this.reported.delete(`queue:${q.projectId}`);
+      } catch (e) {
+        await this.reportOnce(`queue:${q.projectId}`, { status: 'error', projectId: q.projectId, requestId: q.offer.requestId, text: `queued restart ${q.offer.requestId} (project ${q.projectId}): ${(e as Error).message}; it stays queued` });
+      }
+    }
+  }
+
+  /** A runtime command's failure as text (null when it succeeded). */
+  private async execWhy(project: ProjectJson, argv: string[]): Promise<string | null> {
+    try { return envelopeError(await this.runtime.exec(project, argv)); } catch (e) { return (e as Error).message; }
+  }
+
+  private async tryQueued(q: QueuedRestart): Promise<void> {
+    const project = await this.deps.loadProject(q.projectId);
+    const ids = { projectId: q.projectId, requestId: q.offer.requestId };
+    const warnings: string[] = [];
+    const running = await this.deps.running(project);
+    if (running) {
+      const st = parseStatusEnvelope((await this.runtime.exec(project, ['minions', 'status', '--json'])).stdout);
+      if (!st || !Array.isArray(st.activeLeases)) throw new MinionsError('INTERNAL', 'the runtime gave no active lease count');
+      if (st.activeLeases.length > 0) return;
+    }
+    // A pause made here (starts were running before Drain now) is resumed BEFORE the restart: the recovery prompt
+    // of the new coordinator dispatches only when starts are not paused (the same order as `minions upgrade`).
+    const resumedFirst = running && q.resumeStarts;
+    if (resumedFirst) {
+      const why = await this.execWhy(project, ['minions', 'resume', '--starts', '--json']);
+      if (why !== null) throw new MinionsError('INTERNAL', `minions resume --starts failed before the restart: ${why}`);
+      q.resumeStarts = false;
+    }
+    const result = childOutcome(q.plan, await this.deps.runChild(project, planArgv(q.plan, q.offer.request)));
+    if (resumedFirst && result.refused) {
+      // A lease started between the status read and the restart: pause again with the drain, same plan next idle poll.
+      const why = await this.execWhy(project, ['minions', 'pause', '--starts', '--drain', '--reason', 'restart', '--json']);
+      if (why !== null) {
+        throw new MinionsError('INTERNAL', `the restart was refused again (a worker lease started) and minions pause --starts --drain failed: ${why}; starts stay open, so it waits as a plain restart when idle`);
+      }
+      q.resumeStarts = true;
+    }
+    // The owner's own pause stays; only the drain made here is cleared, right after the restart ran (whatever it
+    // answered). With the runtime stopped nothing can be undone: say so.
+    if (q.resumeStarts || q.clearDrain) {
+      const argv = q.resumeStarts ? ['minions', 'resume', '--starts', '--json'] : ['minions', 'resume', '--drain', '--json'];
+      const cmd = argv.slice(0, 3).join(' ');
+      if (!running) {
+        warnings.push(`the runtime is not running, so the pause made by Drain now was left in place: run \`${cmd}\` in the project once it is back`);
+        q.resumeStarts = false;
+        q.clearDrain = false;
+      } else if (q.clearDrain) {
+        const why = await this.execWhy(project, argv);
+        if (why !== null) warnings.push(`${cmd} failed: ${why}`);
+        q.clearDrain = false;
+      }
+    }
+    if (result.refused) {
+      // A lease started between the status read and the restart: same plan, next idle poll.
+      this.deps.log(`queued restart ${q.offer.requestId} (project ${q.projectId}): refused again (a worker lease started); still queued${warnings.length ? `; ${warnings.join('; ')}` : ''}`);
+      return;
+    }
+    this.queued.delete(q.projectId);
+    const rec = await recordApplyResult(project, { ...ids, digest: q.offer.digest, status: result.status, detail: result.detail }, this.cr);
+    await this.notify({
+      status: result.status, ...ids,
+      text: [`change request ${q.offer.requestId} (project ${q.projectId}): ${result.status === 'applied' ? 'applied' : 'FAILED'} - ${displayText(result.detail)}`,
+        ...[...warnings, ...rec.warnings].map((x) => `warning: ${displayText(x)}`)].join('\n'),
     });
   }
 
@@ -538,7 +762,14 @@ export class HostManager {
       status: (projectId) => this.statusText(projectId),
       pending: (projectId) => this.pendingOffers(projectId),
       propose: (projectId, command) => this.propose(projectId, command),
+      devRebuild: (projectId) => this.devRebuild(projectId),
     };
+  }
+
+  /** Whether the dev-only rebuild-cli request exists for the project (or, with null, any registered project). */
+  async devRebuild(projectId: string | null): Promise<boolean> {
+    const projects = (await this.deps.projects()).filter((p) => !projectId || p.projectId === projectId);
+    return projects.some((p) => devRebuildAvailable(p, this.deps.cli));
   }
 
   /**
@@ -555,6 +786,8 @@ export class HostManager {
       }
       project = all[0]!;
     }
+    // Not registered outside a minions source checkout: refused before anything is planned or journaled.
+    if (c.kind === 'rebuild-cli' && !devRebuildAvailable(project, this.deps.cli)) throw notAvailable();
     const payload: Record<string, unknown> = c.kind === 'config-set' ? { key: c.key, value: c.value, layer: c.layer }
       : c.kind === 'undo' ? { target: c.target } : c.kind === 'approve' ? { taskId: c.taskId, head: c.head, merge: c.merge } : {};
     const req: RequestSnapshot = { id: newOwnerRequestId(), kind: c.kind, payload, reason: null, origin: 'owner' };
@@ -604,6 +837,8 @@ export class HostManager {
       } else if (!lines[1]) lines.push('  runtime: stopped');
       const mine = pending.filter((o) => o.projectId === p.projectId);
       lines.push(`  pending change requests: ${mine.length}${mine.length ? ` (${mine.map((o) => `${o.requestId}: ${o.summary}`).join('; ')})` : ''}`);
+      const q = this.queued.get(p.projectId);
+      if (q) lines.push(`  queued restart: ${q.offer.requestId} (${q.plan.restart?.mode === 'drain' ? 'drain now, then restart when idle' : 'restart when idle'}, since ${q.since})`);
       const problem = this.reported.get(`project:${p.projectId}`);
       if (problem) lines.push(`  last poll problem: ${problem}`);
       blocks.push(lines.join('\n'));
@@ -719,6 +954,26 @@ export function redactApprovalText(raw: string, signature: string | undefined, m
   s = redactDisplayed(displayText(s).replace(/\s+/g, ' ').trim(), needles);
   s = redactDisplayed(truncateCodePoints(s, max), needles);
   return truncateCodePoints(s, max);
+}
+
+/** The upgrade ran npm for the CLI (a rebuild or reinstall finished, or failed half way): the CLI must be checked. */
+export function cliReplaced(r: UpgradeRun): boolean {
+  const s = r.steps.find((x) => x.id === 'cli');
+  return !!s && (s.status === 'done' || (s.status === 'failed' && /\b(?:reinstall|rebuild) (?:failed|finished)\b/.test(s.detail)));
+}
+
+/** null when the runtime's answer is an ok envelope; otherwise why not (display-safe, bounded). */
+function envelopeError(r: RunResult): string | null {
+  let env: { ok?: unknown; error?: { message?: unknown } } | null = null;
+  try { env = JSON.parse(r.stdout.trim().split('\n').filter(Boolean).at(-1) ?? ''); } catch { env = null; }
+  if (env?.ok === true) return null;
+  return truncateCodePoints(displayText(String(env?.error?.message ?? (r.stderr.trim() || `no result (exit ${r.code})`))).replace(/\s+/g, ' '), 300);
+}
+
+/** The default CLI check: `minions --version` and `minions --json status` of the host CLI in fresh processes. */
+async function defaultCliHealth(project: ProjectJson): Promise<CliHealth> {
+  const h = hostCli();
+  return checkCliHealth((argv) => run(h.cmd, [...h.args, ...argv], { cwd: project.repoPath, env: h.env, allowFailure: true, timeoutMs: 120_000 }));
 }
 
 /** After an applied config change: the command that applies what it still needs (each confirmed on its own). */
