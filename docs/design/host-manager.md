@@ -498,7 +498,7 @@ Built in task-53.6 (phase 5): the supervisor service and the manager in `minions
 - **Program.** `/usr/bin/env node <cli> manager run`, with `PATH` from the installing shell (with the node directory
   first) plus `MINIONS_HOME`, `XDG_DATA_HOME`, `MINIONS_CREDENTIAL_STORE`, `DOCKER_HOST` and `DOCKER_CONTEXT` when set.
   A node upgrade that moves the binary does not break the unit, and a CLI reinstall at the same path is picked up on
-  the next start. Values with control characters are refused, and values are quoted for systemd (`\"`, `\\`, `%` and `$` escaped).
+  the next start. Values with control characters are refused, and values are quoted for systemd (backslash and double quote escaped, `%` doubled, and `$` doubled in the program line).
 - **Install is a setup step.** `minions setup` asks whether to install the service; the default is no, and `--yes`
   never installs it. Installing writes `<MINIONS_HOME>/manager/service.json`, a record bound to this home's exact unit
   name or label (and the unit path), so setup, status and uninstall only touch a unit that this home created.
