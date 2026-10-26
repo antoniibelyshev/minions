@@ -49,7 +49,7 @@ async function toGate(r: Rig): Promise<TaskBrief> {
   const eng = await r.sched.claim('task-1', 'engineer');
   const head = commitFile(eng.worktree, 'a.txt', 'x\n');
   await r.sched.record(eng.leaseId, result({ branch: eng.branch, headSha: head }));
-  const b = await claimWithBrief(r.sched, r.paths, 'task-1');
+  const b = await claimWithBrief(r.sched, r.paths, 'task-1', undefined);
   expect(b.role).toBe('codex-reviewer');
   return b;
 }
