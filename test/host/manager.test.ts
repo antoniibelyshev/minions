@@ -455,3 +455,126 @@ describe('bounded delegate', () => {
       .toEqual(['settings', 'set', 'a.b', '2', '--shared', '--yes', '--no-restart', '--expect-revision', '3']);
   });
 });
+
+// QA (task-53.4 tester): edges of replay, interruption, the lock, cross-path confirmation and the real delegate limits.
+describe('host manager: QA edges', () => {
+  it('QA: the nonce of an interrupted apply (closed as failed at startup) stays spent: re-sending it never re-runs', async () => {
+    const { project } = await install();
+    const id = requestSet(project, 'execution.maxActiveTasks', '5');
+    const s = setup([project]);
+    await s.manager.pollAll();
+    const o = s.t.offers[0]!;
+    // A manager that confirmed and started applying, then died (its pid is gone).
+    const at = '2026-10-26T10:01:00.000Z';
+    const add = (e: object) => writeFileSync(J.journalPath(), readFileSync(J.journalPath(), 'utf8') + JSON.stringify(e) + '\n');
+    add({ type: 'confirmed', at, projectId: project.projectId, requestId: id, nonce: o.nonce, digest: o.digest, pid: 999_999_3, start: '1' });
+    add({ type: 'applying', at, projectId: project.projectId, requestId: id, nonce: o.nonce, digest: o.digest, pid: 999_999_3, start: '1' });
+    const m = new M.HostManager(s.deps);
+    expect((await m.startup()).map((e) => e.requestId)).toEqual([id]);
+    // A redelivered callback of the old offer (e.g. Telegram retry after the restart).
+    await m.handle({ type: 'confirm', requestId: id, nonce: o.nonce });
+    expect(s.t.outcomes.at(-1)).toMatchObject({ status: 'already-handled' });
+    expect(s.c.runs).toHaveLength(0);
+    // Only a fresh offer, confirmed by the owner, re-runs it (once).
+    await m.pollAll();
+    const fresh = s.t.offers.at(-1)!;
+    expect(fresh.nonce).not.toBe(o.nonce);
+    await m.handle({ type: 'confirm', requestId: id, nonce: fresh.nonce });
+    await m.handle({ type: 'confirm', requestId: id, nonce: o.nonce });
+    expect(s.c.runs).toHaveLength(1);
+    expect(db.changeRequest(id)).toMatchObject({ status: 'applied' });
+  });
+
+  it('QA: an `applying` entry of a process that still runs is left alone at startup and not re-offered; a reused pid is interrupted', async () => {
+    const { project } = await install();
+    const id = requestSet(project, 'execution.maxActiveTasks', '5');
+    const s = setup([project]);
+    await s.manager.pollAll();
+    const o = s.t.offers[0]!;
+    const me = J.writer();
+    writeFileSync(J.journalPath(), readFileSync(J.journalPath(), 'utf8')
+      + JSON.stringify({ type: 'confirmed', at: '2026-10-26T10:01:00.000Z', projectId: project.projectId, requestId: id, nonce: o.nonce, digest: o.digest, ...me }) + '\n'
+      + JSON.stringify({ type: 'applying', at: '2026-10-26T10:01:00.000Z', projectId: project.projectId, requestId: id, nonce: o.nonce, digest: o.digest, ...me }) + '\n');
+    // Default writerAlive (real pid and /proc start time): this process runs, so the apply is in flight.
+    const m = new M.HostManager({ ...s.deps, writerAlive: undefined });
+    expect(await m.startup()).toEqual([]);
+    await m.pollAll();
+    expect(s.t.offers).toHaveLength(1);
+    expect(s.t.outcomes.filter((x) => x.status === 'interrupted')).toHaveLength(0);
+    expect(J.lastOutcome(await J.readJournal(), project.projectId, id)).toMatchObject({ type: 'applying' });
+    // writerAlive: same pid with a different start time is a reused pid (gone); an unknown start trusts the pid.
+    expect(J.writerAlive({ pid: 42, start: 'a' }, () => true, () => 'b')).toBe(false);
+    expect(J.writerAlive({ pid: 42, start: 'a' }, () => true, () => 'a')).toBe(true);
+    expect(J.writerAlive({ pid: 42, start: null }, () => true, () => 'b')).toBe(true);
+    expect(J.writerAlive({ pid: 42, start: 'a' }, () => false, () => 'a')).toBe(false);
+    expect(J.writerAlive({}, () => true, () => 'a')).toBe(false);
+  });
+
+  it('QA: the terminal command printed for a manager offer applies it once; the manager then answers "already handled" (and vice versa)', async () => {
+    const { project, local } = await install();
+    const a = requestSet(project, 'execution.maxActiveTasks', '5');
+    const b = requestSet(project, 'communication.progress', 'quiet');
+    const lines: string[] = [];
+    const s = setup([project]);
+    const m = new M.HostManager({ ...s.deps, transport: M.logTransport((l) => lines.push(l)) });
+    await m.pollAll();
+    const printed = lines.map((l) => JSON.parse(l) as Record<string, any>).filter((l) => l.event === 'offer');
+    expect(printed).toHaveLength(2);
+    const pa = printed.find((p) => p.requestId === a)!;
+    expect(pa.confirmCommand).toBe(`minions settings apply ${a} --confirm ${pa.digest}`);
+    const cr = { runtime: m.runtime, upgrade: s.deps.upgrade, now: s.deps.now };
+    const quiet = { confirm: async () => null, show: () => undefined };
+    expect((await CR.applyRequest(project, a, { confirm: pa.digest }, cr, quiet)).status).toBe('applied');
+    expect(readJson(local).execution.maxActiveTasks).toBe(5);
+    await m.handle({ type: 'confirm', requestId: a, nonce: pa.nonce });
+    expect(JSON.parse(lines.at(-1)!)).toMatchObject({ event: 'outcome', status: 'already-handled', requestId: a });
+    // The other way round: the manager applies b, then the printed terminal command is refused.
+    const pb = printed.find((p) => p.requestId === b)!;
+    await m.handle({ type: 'confirm', requestId: b, nonce: pb.nonce });
+    expect(db.changeRequest(b)).toMatchObject({ status: 'applied' });
+    await expect(CR.applyRequest(project, b, { confirm: pb.digest }, cr, quiet)).rejects.toMatchObject({ code: 'CONFLICT', message: expect.stringMatching(/already used/) });
+    expect(s.c.runs).toHaveLength(1);
+  });
+
+  it('QA: a runtime that times out while the row is marked does not stop the apply; the outcome is journaled with a warning', async () => {
+    const { project, local } = await install();
+    const id = requestSet(project, 'execution.maxActiveTasks', '5');
+    const s = setup([project]);
+    await s.manager.pollAll();
+    s.d.setOverride((argv) => (argv[3] === 'mark' ? { code: 124, stdout: '', stderr: '', timedOut: true } : null));
+    await s.manager.handle({ type: 'confirm', requestId: id, nonce: s.t.offers[0]!.nonce });
+    expect(readJson(local).execution.maxActiveTasks).toBe(5);
+    expect(journal().map((e) => e.type)).toEqual(['offer', 'confirmed', 'applying', 'applied']);
+    expect(s.t.outcomes.at(-1)).toMatchObject({ status: 'applied', text: expect.stringMatching(/warning: .*timed out after 30 s/) });
+  });
+
+  it('QA: two managers racing for a free lock: exactly one wins', async () => {
+    const results = await Promise.allSettled([M.acquireManagerLock(), M.acquireManagerLock(), M.acquireManagerLock()]);
+    const won = results.filter((r) => r.status === 'fulfilled');
+    expect(won).toHaveLength(1);
+    expect(results.filter((r) => r.status === 'rejected').every((r) => (r as PromiseRejectedResult).reason.code === 'CONFLICT')).toBe(true);
+    await (won[0] as PromiseFulfilledResult<{ release: () => Promise<void> }>).value.release();
+  });
+
+  it('QA: delegateCapture enforces the output cap and the timeout on a real (host runtime) child', async () => {
+    const { mkdirSync, chmodSync } = await import('node:fs');
+    const { hostRuntimePaths } = await import('../../src/core/paths.js');
+    const { delegateCapture, DELEGATE_MAX_OUTPUT_BYTES } = await import('../../src/host/delegate.js');
+    const { project } = await install();
+    const hp = hostRuntimePaths(project.projectId);
+    mkdirSync(join(hp.minionsShim, '..'), { recursive: true });
+    mkdirSync(hp.workspace, { recursive: true });
+    writeFileSync(hp.minionsShim, `#!${process.execPath}\nif (process.argv[2] === 'big') { process.stdout.write('x'.repeat(1 << 20)); setTimeout(() => {}, 20000); } else { setTimeout(() => {}, 20000); }\n`);
+    chmodSync(hp.minionsShim, 0o755);
+    const host = { ...project, runtime: 'host' as const };
+    const big = await delegateCapture(host, ['minions', 'big']);
+    expect(big.outputLimited).toBe(true);
+    expect(Buffer.byteLength(big.stdout) + Buffer.byteLength(big.stderr)).toBeLessThanOrEqual(DELEGATE_MAX_OUTPUT_BYTES);
+    const slow = await delegateCapture(host, ['minions', 'slow'], { timeoutMs: 300 });
+    expect(slow.timedOut).toBe(true);
+    // Through the manager's bounded runtime both are project errors.
+    const rt = M.boundedRuntime({ running: async () => true, delegate: (p, argv) => delegateCapture(p, argv, { timeoutMs: 300 }) });
+    await expect(rt.exec(host, ['minions', 'big'])).rejects.toMatchObject({ message: expect.stringMatching(/more than 256 KiB/) });
+    await expect(rt.exec(host, ['minions', 'slow'])).rejects.toMatchObject({ message: expect.stringMatching(/timed out/) });
+  }, 20_000);
+});
