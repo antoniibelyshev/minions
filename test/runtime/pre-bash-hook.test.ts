@@ -359,3 +359,31 @@ describe('scanShell: stdin, pipes and arithmetic', () => {
     expect(scanShell('echo $((1<<2)) >out\nnext').commands).toEqual([['1<<2'], ['echo', '\u0000'], ['next']]);
   });
 });
+
+describe('coordinatorOnlyWorkCommand: arithmetic, heredocs and pipes (task-14.13 QA)', () => {
+  it.each([
+    '(( x << 1 )); bash <<EOF\nminions work run l\nEOF',
+    'echo $((1<<2)) $(( (1<<2) + 1 )); bash <<EOF\nminions work release l\nEOF',
+    'echo "$((" ; bash <<<"minions work run l"',
+    'echo "a << b"; bash <<<"minions work run l"',
+    'bash <<< "minions work run l"',
+    'cat <<EOF | bash\nminions work run l\nEOF',
+    'x=$(( 1 > 2 )); minions work run l',
+    '(( a > b )) && minions work claim t',
+    'function f { minions work run x; }; f',
+  ])('denies %j', (cmd) => {
+    expect(coordinatorOnlyWorkCommand(cmd)).toMatch(/^minions work (run|claim|release)$/);
+  });
+
+  it.each([
+    '(( x << 1 )); cat <<EOF\nhello\nEOF',
+    '(( x << 1 )); cat <<EOF\nminions work run l\nEOF',
+    'echo "a << b"; cat <<EOF\nminions work run l\nEOF',
+    'echo x | tr a b | bash',
+    'git commit -F - <<EOF\nbash minions work run\nEOF',
+    'node - <<EOF\nconsole.log(1)\nEOF',
+    'echo $(( 1 < 2 )) ; cat <<EOF\nok\nEOF',
+  ])('allows %j', (cmd) => {
+    expect(coordinatorOnlyWorkCommand(cmd)).toBeNull();
+  });
+});
