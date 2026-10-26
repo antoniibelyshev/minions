@@ -517,13 +517,14 @@ minions settings restart                              # graceful coordinator res
 
 `minions config` stays as an advanced alias: `config show [--explain]` (raw effective config), `config list` (= `settings --list`), `config set` (= `settings set`).
 
-Each change is classified by when it takes effect (`minions settings --list --json` reports it per setting as `apply`):
+Each change is classified by when it takes effect (`minions settings --list --json` reports it per setting as `apply` and `class`, plus `hostOwned`; `settings set` prints the matching line, and its `--json` envelope has `class`, `hostOwned`, `takesEffect` (`now` / `restart` / `upgrade`, null when nothing changed), `needsRestart` and `needsUpgrade`). Every key of the config schema has a class (`live`, `restart`, `recreate` or `fixed`) and a host-owned flag (`src/config/setting-classes.ts`, docs/design/host-manager.md):
 
 | Impact | Example |
 | - | - |
 | immediate (`live`) | Lowering concurrency stops new starts; running work continues. Pause/resume, repair cycles, context resets |
 | restart-required (`prompt`, `launch`) | Changing the default model or the per-attempt turn limit: workers run the `model` and `maxTurns` of their definitions, which the coordinator session loads at start (a brief's `model` / `maxTurns` fields already show the new value at the next claim, but they are informational). Updated prompts or tool permissions, coordinator launch settings, Telegram changes (`minions channel set`, `minions auth telegram`) |
-| migration | Switching backlog backend, switching private and shared visibility |
+| upgrade (`recreate`) | Container resources, network, published ports and mounts, the git identity: `minions upgrade` recreates the container (volumes kept) |
+| migration (`fixed`) | Switching backlog backend, switching private and shared visibility |
 
 Tightening permissions suspends the affected external actions immediately. A worker still running on an older config revision is blocked from sensitive external operations. Broadening permissions always needs an explicit request from you; the agent can't grant itself authority. Container mounts, image, resources, published ports, and credential grants are host-controlled. Claude can only propose a change plan for them, which you apply through the host CLI.
 
