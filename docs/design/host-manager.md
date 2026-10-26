@@ -1,8 +1,8 @@
 # Host manager for live setup changes: design
 
-Status: **proposed** (task-53, design only, nothing built). Folds in task-44 (live settings). The owner has to
-agree with this design before any build task starts. The child tasks are listed under [Phases](#phases); the
-coordinator files them after the owner agrees.
+Status: **agreed** (task-53, design only, nothing built). Folds in task-44 (live settings). The owner answered the
+open questions on 2026-10-26 (see [Owner decisions](#owner-decisions)). The build tasks are listed under
+[Phases](#phases) and are filed as task-53.2 to task-53.8.
 
 ## Goal
 
@@ -148,7 +148,7 @@ tap within 2 minutes. This is the Telegram form of the existing terminal confirm
 | Config edit | `minions settings set <key> <value> --yes` | Validated before writing, atomic, refused if the revision changed since the plan (`--expect-revision`), `configRevision + 1`, derived files regenerated (`src/host/config-write.ts`). Then it follows the key's class: `live` done; `restart` offers a restart; `recreate` offers an upgrade (both confirmed separately). |
 | Coordinator restart | `minions settings restart` | The existing graceful path (`coordinator restart --recover`). It is refused while leases are active, and the manager then offers **Restart when idle** (queued, re-checked every poll, run at the first idle moment) or **Drain now** (`pause --starts --drain`: workers commit `wip:` and hand back, recovery re-dispatches). |
 | Outer repo sync | `local` delivery: `minions upgrade --from-container` source phase only (export, strict fast-forward of the host base). GitHub delivery: fetch `origin/<base>` and fast-forward. | Never forces, resets, stashes or checks out. Refused on a dirty host tree or a divergence, with the reason. |
-| Upgrade | `minions upgrade [--from-container] [--rebuild-cli]` | Pause, drain, image, recreate, workspace and origin setup, resume, coordinator recovery: unchanged. A CLI rebuild from commits that came from the container is its own request. Its plan shows `git log --oneline <from>..<to>`, the diffstat and any sensitive paths touched, and it always asks twice (see [Open questions](#open-questions) 3). |
+| Upgrade | `minions upgrade [--from-container] [--rebuild-cli]` | Pause, drain, image, recreate, workspace and origin setup, resume, coordinator recovery: unchanged. A CLI rebuild from commits that came from the container is its own request, and a **dev-only** one: it exists only when the host CLI runs from a minions source checkout and the managed project is minions. Normal installs do not register, advertise or accept it. Its plan shows `git log --oneline <from>..<to>`, the diffstat and any sensitive paths touched, and it always asks twice (see [Owner decisions](#owner-decisions) Q3). |
 
 Out of scope: secrets (`minions auth …` stays a terminal job: tokens never pass through Telegram), pairing changes,
 `uninstall`, and any `docker` command outside `minions upgrade`.
@@ -200,11 +200,11 @@ a `settings set container.*` would not be picked up by `minions upgrade`; exposi
 ### Host-owned settings
 
 Host-owned keys are writable only by `minions settings` in the host terminal, or by an owner-initiated `/set` in the
-manager chat (see [Open questions](#open-questions) 2). They are refused when recorded in the runtime, refused by the
+manager chat, with the double tap (see [Owner decisions](#owner-decisions) Q2). They are refused when recorded in the runtime, refused by the
 manager for any request from the container, and never present in a writable file the container can reach. That
 matches task-44's criterion "Security-relevant settings (policy, permissions, sensitive paths, approvals) stay
-host-owned and are never writable from the container". Approvals themselves stay host-signed (`work approve` on the
-host). This design does not move them into the manager (see [Open questions](#open-questions) 5).
+host-owned and are never writable from the container". Approvals stay host-signed: `/approve <task> <sha>` in the manager chat
+runs the host's `work approve`, so the signing key never leaves the host (see [Owner decisions](#owner-decisions) Q5).
 
 ## Failure and rollback
 
@@ -262,12 +262,12 @@ No new primary command. The proposed folds:
 - `minions settings requests [--json]`, plus `settings apply <id>` / `settings reject <id>` on the host: the terminal
   route for the same requests (`apply` uses the same plan and confirmation, interactive or `--yes`).
 - In the runtime, `settings set`, `settings restart` and `upgrade` record requests instead of failing.
-- The process the supervisor starts needs an entry point. This is a new top-level command, so it is an owner
-  question (see [Open questions](#open-questions) 1). It is not decided here.
+- The process the supervisor starts needs an entry point. This is the hidden `minions manager run` (see
+  [Owner decisions](#owner-decisions) Q1).
 
 ## Phases
 
-Proposed child tasks (the coordinator files them after the owner agrees):
+Child tasks, filed as task-53.2 to task-53.7 (phases 1 to 6) and task-53.8 (coordinator proposal):
 
 1. **child: Settings classification and host-owned flag (task-44 part 1)** | criteria: every schema key has a class
    live/restart/recreate/fixed and a hostOwned flag, with a guard test; `settings set` reports what took effect now
@@ -280,37 +280,37 @@ Proposed child tasks (the coordinator files them after the owner agrees):
    path that needs owner approval; tested with fakes | depends: 1
 3. **child: Manager core without Telegram** | criteria: host manager process with lock, journal, per-project polling
    through delegate, plan/digest/expiry checks, child-command apply, interrupted-entry reporting; driven by a fake
-   transport in tests | depends: 2, owner answer to Q1
+   transport in tests | depends: 2
 4. **child: Manager bot** | criteria: `manager-bot-token` credential, bot-id guard in both directions, terminal pairing
    in `setup`, Bot API transport with inline Confirm/Reject and the double tap for loosening, fixed command set;
-   doctor `manager.*` checks | depends: 3
+   `/approve <task> <sha>` (bound to the head SHA, double tap, runs the host's `work approve` so the signing key stays
+   on host); confirmation expiry 30 minutes; doctor `manager.*` checks | depends: 3
 5. **child: Supervisor and status** | criteria: `setup` installs and removes a launchd agent (macOS) or a
    systemd --user unit (Linux); restart after a self-upgrade; `status` shows the manager and pending requests;
    `uninstall` removes everything | depends: 4
 6. **child: Restart-when-idle and rollback** | criteria: queued restart at the first idle poll; drain-now option;
-   config history with `/undo` compare-and-swap; CLI backup and roll back; docs (README, cli.md, bootstrap.md) |
-   depends: 4
+   config history with `/undo` compare-and-swap; CLI backup and roll back; dev-only `--rebuild-cli` request (registered only when the host CLI runs from a minions
+   source checkout and the managed project is minions); docs (README, cli.md, bootstrap.md) | depends: 4
 
 task-3 (upgrade) and task-3.4 (restart-required) are building blocks that already exist. The manager calls
 `minions upgrade` unchanged, and it shows task-3.4's restart-required reasons in `/status` and as a push message
 offering `/upgrade`.
 
-## Open questions
+## Owner decisions
 
-1. **Entry point for the manager process.** (1) `minions manager run`, an internal-tier command like
-   `coordinator run`, hidden from default help (recommended); (2) a hidden flag on `minions start`
-   (`start --manager-daemon`); (3) Other. The same decision covers the new `settings requests/apply/reject`
-   subcommands: they fold under `settings` (recommended) rather than becoming new top-level commands.
-2. **Loosening host-owned settings from Telegram.** (1) Allowed only as an owner-initiated `/set` with the double
-   tap, never from a coordinator request (recommended); (2) Terminal only: the manager may tighten host-owned keys
-   but refuses to loosen them; (3) Other.
-3. **Building container-made commits into the host CLI from Telegram.** (1) Allowed as its own request that shows the
-   commit range, diffstat and sensitive paths, with the double tap (recommended, because the owner develops minions
-   in minions); (2) Terminal only (`minions upgrade --rebuild-cli`); (3) Other.
-4. **How the manager runs.** (1) A user service (launchd / systemd --user) installed by `setup` (recommended:
-   survives reboots and logouts); (2) A host tmux session started by `minions start`; (3) Foreground only, started by
-   hand; (4) Other.
-5. **Publication and merge approvals from the manager chat** (today host-terminal `work approve`). (1) Not now: a
-   separate follow-up after phase 4, since it would move a signing step to the phone (recommended); (2) Include
-   `/approve <task> <sha>` in phase 4; (3) Other.
-6. **Confirmation expiry.** (1) 30 minutes (recommended); (2) 24 hours; (3) Other.
+Answered by the owner on 2026-10-26 (Telegram msg 250). They replace the open questions of the first draft.
+
+1. **Entry point.** The hidden internal-tier command `minions manager run`, like `coordinator run`. The new
+   `settings requests`, `settings apply` and `settings reject` subcommands fold under `settings`; there are no new
+   top-level commands.
+2. **Loosening host-owned settings.** Only by an owner-initiated `/set` in the manager chat with the double tap,
+   never from a coordinator request. The coordinator may post a **proposal** in its own Telegram chat, with the reason
+   and the exact manager `/set` command and terminal command. A proposal is never recorded as a change request and
+   the manager never acts on it.
+3. **CLI rebuild from container commits.** A dev-only feature. It is available only when the host CLI runs from a
+   minions source checkout and the managed project is minions. Normal installs do not register, advertise or accept
+   the request. Where it exists, it keeps the plan (commit range, diffstat, sensitive paths) and the double tap.
+4. **How the manager runs.** A user service (launchd or systemd --user) installed by `setup`.
+5. **Approvals from the manager chat.** `/approve <task> <sha>` is part of phase 4. It is bound to the head SHA,
+   needs the double tap, and the signing key stays on the host (the manager runs the host's `work approve`).
+6. **Confirmation expiry.** 30 minutes.
