@@ -24,6 +24,7 @@ const CR = await import('../../src/host/change-requests.js');
 const B = await import('../../src/host/cli-backup.js');
 const M = await import('../../src/host/manager.js');
 const T = await import('../../src/host/manager-telegram.js');
+const PATHS = await import('../../src/core/paths.js');
 const { makeRepo, withHome, dockerUp, git, tempDir } = await import('./fixtures.js');
 type ProjectJson = import('../../src/host/project.js').ProjectJson;
 type RunResult = import('../../src/core/exec.js').RunResult;
@@ -202,12 +203,9 @@ describe('QA: queued restarts', () => {
     expect(s.manager.queuedRestarts().map((q) => q.projectId).sort()).toEqual([a.project.projectId, b.project.projectId].sort());
   });
 
-  // DEFECT (reported to the coordinator): when the runtime is stopped at the idle poll, tryQueued skips the
-  // status/resume branch and runs `settings restart`, which answers not-running; the queue entry is dropped as
-  // failed and the `pause --starts --drain` that Drain now made stays in the runtime's state, with no warning in the
-  // outcome. Expected: the outcome at least names the pause the manager left (`minions resume --starts`), or the
-  // restart stays queued until the runtime is back. Flip to `it` when fixed.
-  it.fails('Drain now with the runtime stopped at the idle poll: the outcome says the pause it made was left in place', async () => {
+  // Fixed defect: with the runtime stopped at the idle poll the pause made by Drain now cannot be resumed; the
+  // request closes as failed and the outcome names the pause left in place and how to clear it.
+  it('Drain now with the runtime stopped at the idle poll: the outcome says the pause it made was left in place', async () => {
     const { project } = await install();
     const w: World = { leases: 1, pausedStarts: false, running: true, restart: () => (!w.running ? 'not-running' : w.leases > 0 ? 'refused' : 'restarted') };
     const s = setup([project], w);
@@ -221,6 +219,59 @@ describe('QA: queued restarts', () => {
     const resumed = s.delegateCalls.some((c) => c[1] === 'resume');
     const queued = s.manager.queuedRestarts().length === 1;
     expect(resumed || queued || /resume --starts/.test(last.text)).toBe(true);
+    expect(last).toMatchObject({ status: 'failed' });
+    expect(last.text).toMatch(/warning: the runtime is not running, so the pause made by Drain now was left in place: run `minions resume --starts`/);
+    expect(queued).toBe(false);
+  });
+
+  it('Drain now over the owner\'s own pause with the runtime stopped: the outcome names `minions resume --drain` (the owner\'s pause stays)', async () => {
+    const { project } = await install();
+    const w: World = { leases: 1, pausedStarts: true, running: true, restart: () => (!w.running ? 'not-running' : w.leases > 0 ? 'refused' : 'restarted') };
+    const s = setup([project], w);
+    await s.confirm(await s.cmds.propose(null, { kind: 'restart' }));
+    await s.confirm(s.offers.find((o) => o.summary.startsWith('Drain now'))!);
+    w.leases = 0;
+    w.running = false;
+    await s.manager.pollAll();
+    expect(s.outcomes.at(-1)!.text).toMatch(/left in place: run `minions resume --drain`/);
+    expect(s.delegateCalls.filter((c) => c[1] === 'resume')).toEqual([]);
+  });
+
+  it('Drain now at the idle poll: starts stay paused while `settings restart` runs and are resumed right after it', async () => {
+    const { project } = await install();
+    const seen: boolean[] = [];
+    const w: World = { leases: 1, pausedStarts: false, running: true, restart: () => { if (w.leases === 0) seen.push(w.pausedStarts); return w.leases > 0 ? 'refused' : 'restarted'; } };
+    const s = setup([project], w);
+    await s.confirm(await s.cmds.propose(null, { kind: 'restart' }));
+    await s.confirm(s.offers.find((o) => o.summary.startsWith('Drain now'))!);
+    w.leases = 0;
+    await s.manager.pollAll();
+    expect(seen).toEqual([true]);
+    expect(w.pausedStarts).toBe(false);
+    const order = s.delegateCalls.map((c) => c[1]);
+    expect(order.lastIndexOf('resume')).toBeGreaterThan(order.lastIndexOf('status'));
+    expect(s.outcomes.at(-1)).toMatchObject({ status: 'applied' });
+  });
+
+  it('Drain now whose restart fails at the idle poll: the pause made here is still resumed, and the outcome is failed', async () => {
+    const { project } = await install();
+    const w: World = { leases: 1, pausedStarts: false, running: true, restart: () => (w.leases > 0 ? 'refused' : 'failed') };
+    const s = setup([project], w, {
+      runChild: async (_p, argv) => {
+        s.runs.push(argv);
+        const action = w.restart();
+        return action === 'failed' ? { code: 1, stdout: JSON.stringify({ ok: false, error: { code: 'INTERNAL', message: 'tmux died' } }) + '\n', stderr: '' }
+          : ok({ action, detail: action === 'refused' ? '1 active worker lease' : 'recover' });
+      },
+    });
+    await s.confirm(await s.cmds.propose(null, { kind: 'restart' }));
+    await s.confirm(s.offers.find((o) => o.summary.startsWith('Drain now'))!);
+    w.leases = 0;
+    await s.manager.pollAll();
+    expect(s.outcomes.at(-1)).toMatchObject({ status: 'failed' });
+    expect(s.delegateCalls.filter((c) => c[1] === 'resume').map((c) => c.join(' '))).toEqual(['minions resume --starts --json']);
+    expect(w.pausedStarts).toBe(false);
+    expect(s.manager.queuedRestarts()).toEqual([]);
   });
 });
 
@@ -306,6 +357,18 @@ describe('QA: dev-only /rebuild_cli', () => {
     expect(chat.proposed).toEqual([]);
     await chat.say('/rebuild_cli@minions_manager_bot');
     expect(chat.proposed).toEqual([{ kind: 'rebuild-cli' }]);
+  });
+
+  it('with GitHub delivery the plan is refused (local delivery only); nothing is upgraded', async () => {
+    const { project, repo } = await install('minions-repo', { minions: true });
+    const from = git(repo, 'rev-parse', 'HEAD');
+    writeFileSync(join(repo, 'a.txt'), 'a\n'); git(repo, 'add', '-A'); git(repo, 'commit', '-q', '-m', 'a');
+    writeFileSync(PATHS.projectPaths(project.projectId).configLocalJson, JSON.stringify({ delivery: { provider: 'github', mode: 'pull-request' } }));
+    const s = setup([project], { leases: 0, pausedStarts: false, running: true, restart: () => 'restarted' }, { cli: { runningRoot: runningRoot(from) } });
+    const e = await reason(s.cmds.propose(null, { kind: 'rebuild-cli' }));
+    expect(e.code).toBe('PRECONDITION');
+    expect(e.message).toMatch(/rebuild-cli is for local delivery: with GitHub delivery the CLI is built only from the reviewed origin\/<base>/);
+    expect(s.upgrades).toEqual([]);
   });
 
   it('parseOwnerCommand: rebuild_cli takes no arguments', () => {
