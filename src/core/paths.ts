@@ -45,12 +45,13 @@ export function projectPaths(projectId: string) {
     credentialsJson: join(dir, 'credentials.json'),
     /**
      * Host-provisioned secret files (dir 0700, files 0600), bind-mounted read-only as a directory at
-     * /opt/minions/secrets: the Claude key copy plus materialized GitHub/Telegram tokens.
+     * /opt/minions/secrets: the Claude key copy plus materialized GitHub/Telegram tokens and the Codex key.
      */
     secretsDir: join(dir, 'secrets'),
     apiKeyFile: join(dir, 'secrets', 'anthropic-api-key'),
     githubTokenFile: join(dir, 'secrets', 'github-token'),
     telegramTokenFile: join(dir, 'secrets', 'telegram-bot-token'),
+    codexKeyFile: join(dir, 'secrets', 'codex-api-key'),
     /** Non-secret record of the last key refresh (time, redacted error). */
     authStateJson: join(dir, 'auth-state.json'),
     logsDir: join(dir, 'logs'),
@@ -114,6 +115,8 @@ export function containerPaths(root = process.env.MINIONS_CONTAINER_ROOT ?? '') 
     secretsDir: p('/opt/minions/secrets'),
     githubTokenFile: p('/opt/minions/secrets/github-token'),
     telegramTokenFile: p('/opt/minions/secrets/telegram-bot-token'),
+    /** OpenAI API key for Codex process workers; read only by the process runner (agent-runtimes D5). */
+    codexKeyFile: p('/opt/minions/secrets/codex-api-key'),
     /** Host-provisioned Claude key (api-key/helper methods), read by the in-container apiKeyHelper. */
     apiKeyFile: p('/opt/minions/secrets/anthropic-api-key'),
     configJson: p('/opt/minions/config/config.json'),
