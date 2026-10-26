@@ -213,6 +213,32 @@ alone.
 - **Tests:** fixture transcripts (duplicate message ids, sidechain lines, a truncated tail, two sessions across a
   reset, a missing file), no live Claude run.
 
+Built decisions (task-57.1, `src/runtime/coordinator-usage.ts`):
+
+- **Storage without a schema change.** Per-session state (offset, components, turns, context sum and max, owner
+  messages, recovered flag and overhead, the last 500 message ids, end trigger) is the meta row
+  `coordinator_usage:<session_id>`; each turn that adds tokens writes one cumulative `usage` event (source
+  `transcript`, with the components), so `today` and budget windows work as for workers. The stop guard's progress
+  fingerprint now ignores `usage` events, otherwise a turn would always look like progress.
+- **Which Stop counts:** no `agent_id`/`agent_type` in the input, no `MINIONS_ROLE` (process workers), and a
+  coordinator lock held. Session ids must be plain (`[A-Za-z0-9_.-]`).
+- **Bounded:** one read of at most 4 MB per Stop (a long transcript catches up over turns); a line without its
+  newline is left for later; a file shorter than the offset is not re-read.
+- **Duplicates:** lines with the same message id in one read are merged (largest of each component); an id
+  counted in an earlier read is skipped. A turn is one counted assistant message (one API call); context per turn
+  is input + cache read + cache write.
+- **End trigger:** `context-reset` (with the reset triggers that held, recorded by `coordinator restart
+  --detach` in meta `coordinator_reset_request`), `restart` (meta `coordinator_restart`: upgrade, settings,
+  sync) or `exit` (nothing recorded: crash, container stop). Open sessions are completed at coordinator start
+  (`coordinator run` onStart) and when a Stop first sees a new session id.
+- **Reset overhead:** a session whose first user message is the recovery prompt; tokens until the first
+  assistant message with a `minions work claim` Bash call or a Telegram `reply` tool use.
+- **Manual override:** `work spend --session --tokens` defaults to the current Claude session id; once a session
+  key has a manual figure, its measured figures no longer count (never added up). The coordinator prompt no longer
+  asks to record its own tokens by hand.
+- **Model:** the transcript's `message.model`, else `models.coordinator`. USD weights: input 1, cache read 0.1,
+  cache write 1.25, output 5 times the spend.ts input rate.
+
 ## Alternatives rejected
 
 - **The router starts `claude -p` from its own Bash.** That is a nested claude: it inherits the router's env,

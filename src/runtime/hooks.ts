@@ -14,6 +14,7 @@ import { runtimePaths } from './paths.js';
 import { capacityOf, scopeOf } from './scheduler.js';
 import { currentBudget } from './spend.js';
 import { noteTranscript } from './context-reset.js';
+import { trackCoordinatorUsage } from './coordinator-usage.js';
 import { scanShell, ShellParseError, type ShellScan } from './shell-scan.js';
 
 export interface HookDeps { db: RuntimeDb; backlog: BacklogAdapter; config: MinionsConfig }
@@ -74,6 +75,8 @@ export async function stopHook(input: unknown, load: HookLoader): Promise<HookOu
   const { db, backlog, config } = deps;
   // Context-reset trigger input (task-45): the main session's transcript, for its latest usage. Never affects the decision.
   try { noteTranscript(db, inp); } catch { /* best-effort */ }
+  // Coordinator token tracking (task-57.1): this turn's main-session usage from the transcript. Bounded, never throws, never affects the decision.
+  try { trackCoordinatorUsage({ db, config }, inp); } catch { /* best-effort */ }
   const allow = (reason: string, detail = reason): HookOutput => {
     try { db.setGuard({ fingerprint: null, count: 0, last_reason: reason }); } catch { /* ignore */ }
     return { reason: `allow: ${detail}` };
@@ -105,7 +108,8 @@ export async function stopHook(input: unknown, load: HookLoader): Promise<HookOu
       ready: ready.map((t) => t.id).sort(),
       continuing: continuing.map((t) => `${t.id}:${t.status}`).sort(),
       leases: leases.map((l) => l.id).sort(),
-      lastEvent: db.lastEventId(),
+      // Usage events are not progress: the coordinator's own usage is recorded on every Stop (task-57.1).
+      lastEvent: db.get<{ id: number | null }>("SELECT MAX(id) AS id FROM events WHERE kind != 'usage'")?.id ?? 0,
     }));
     const g = db.guard();
     if (g.fingerprint === fingerprint && g.count >= NO_PROGRESS_LIMIT) {

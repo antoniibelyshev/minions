@@ -29,9 +29,10 @@ import { openDb, type DrainNotice, type DrainRequest, type Lease, type PauseChan
 import { clearDrain, requestDrain } from './drain.js';
 import { claimWithBrief, compactClaim, fetchBrief, recordSubmitted, requireWorkerRole, submitResult, sweepScratchOnStart, type CompactClaim } from './handoff.js';
 import { runHook } from './hooks.js';
-import { budgetNotice, humanSpend, parseTokens, recordLeaseUsage, recordSessionUsage, setBudget, spendReport, type SpendReport } from './spend.js';
+import { completeOpenSessions, noteResetRequest } from './coordinator-usage.js';
+import { budgetNotice, humanBaseline, humanSpend, parseTokens, recordLeaseUsage, recordSessionUsage, setBudget, spendReport, type SpendReport } from './spend.js';
 import { runtimePaths } from './paths.js';
-import { contextResetCheck, dueNotice, HANDOFF_MAX_BYTES, humanContextReset, readHandoff, writeHandoff, type ContextResetCheck } from './context-reset.js';
+import { contextResetCheck, dueNotice, HANDOFF_MAX_BYTES, humanContextReset, readHandoff, TRANSCRIPT_META, writeHandoff, type ContextResetCheck } from './context-reset.js';
 import { capacityOf, Scheduler, type NextReport, type NextStage, type RoleCapacity, type UsageFlag } from './scheduler.js';
 import { gitCredential } from './github.js';
 import { ciStatus, formatCiStatus, formatSync, syncTasks, type SyncReport } from './ci.js';
@@ -362,6 +363,20 @@ function usageFlag(o: { usage?: string; model?: string }): UsageFlag | undefined
   return { tokens: parseTokens(o.usage), model: o.model ?? null };
 }
 
+/**
+ * Default id for `work spend --session`: the Claude session the Stop hook saw in the current coordinator
+ * session (so a figure set by hand overrides that session's measured one instead of adding to it), else
+ * the lock session name.
+ */
+export function currentSessionKey(d: RuntimeDb): string {
+  const lock = d.coordinatorLock();
+  try {
+    const t = JSON.parse(d.getMeta(TRANSCRIPT_META) ?? 'null') as { sessionId?: string | null; at?: string } | null;
+    if (t?.sessionId && lock && t.at && t.at >= lock.acquiredAt) return t.sessionId;
+  } catch { /* unreadable: fall back */ }
+  return lock?.session ?? 'coordinator';
+}
+
 /** `minions work spend`: optional budget change and usage record, then the spend report. */
 export async function spendCommand(o: { budget?: string; by?: string; lease?: string; session?: string | boolean; tokens?: string; model?: string },
   deps: { db?: RuntimeDb; config?: MinionsConfig } = {}): Promise<SpendReport & { notice?: string }> {
@@ -376,7 +391,7 @@ export async function spendCommand(o: { budget?: string; by?: string; lease?: st
   if (o.tokens !== undefined) {
     const u = { tokens: parseTokens(o.tokens), model: o.model ?? null, source: 'manual' as const };
     if (o.lease) recordLeaseUsage(d, o.lease, u);
-    else recordSessionUsage(d, typeof o.session === 'string' ? o.session : d.coordinatorLock()?.session ?? 'coordinator', u);
+    else recordSessionUsage(d, typeof o.session === 'string' ? o.session : currentSessionKey(d), u);
   }
   const notice = o.tokens !== undefined || o.budget !== undefined ? budgetNotice(ctx)?.message : undefined;
   return { ...spendReport(ctx), ...(notice ? { notice } : {}) };
@@ -480,7 +495,7 @@ export function register(program: Command): void {
     .option('--model <name>', 'model, for the USD estimate with API-key billing')
     .action(action(async (o: { budget?: string; by?: string; lease?: string; session?: string | boolean; tokens?: string; model?: string }, cmd: Command) => {
       if (runtimeMode() === 'host') return delegate(cmd);
-      emit(await spendCommand(o), { json: globalOpts(cmd).json, human: (d) => [humanSpend(d), ...(d.notice ? [d.notice] : [])].join('\n') });
+      emit(await spendCommand(o), { json: globalOpts(cmd).json, human: (d) => [humanSpend(d), humanBaseline(d.coordinator.baseline), ...(d.notice ? [d.notice] : [])].join('\n') });
     }));
   work.command('cancel [taskIds...]').description('Best-effort cancel: release every active worker lease of the given tasks (or --all) without a result and mark those tasks blocked; worktrees and branches are kept')
     .option('--all', 'cancel every active lease')
@@ -663,6 +678,8 @@ export function register(program: Command): void {
             logRecovery(await recoverRuns(reapDeps(), 'all'), l);
             open = openRunsSync(runtimePaths().state);
           } catch (e) { l(`minions: process-run recovery failed: ${(e as Error).message.slice(0, 300)}`); open = openRunsSync(runtimePaths().state); }
+          // Coordinator token tracking (task-57.1): the previous session's last turns, from its transcript, and why it ended.
+          try { completeOpenSessions({ db: getDb(), config: c }); } catch { /* best-effort */ }
           // Restart/crash recovery: drop the scratch dirs of leases that ended (active ones, and unreaped runs, keep theirs).
           await sweepScratchOnStart(getDb(), runtimePaths(), l, open);
           await intakeOnStart(c, l, undefined, undefined, stop);
@@ -695,6 +712,8 @@ export function register(program: Command): void {
       if (o.detach) {
         const paths = runtimePaths();
         const s = scheduleDetachedRestart({ activeLeases: workers, drain: () => d.drain(), log: join(paths.logs, 'context-reset.log'), cwd: paths.state }, o);
+        // The ending session's trigger for the coordinator baseline (task-57.1): which reset triggers held.
+        try { noteResetRequest(d, contextResetCheck({ db: d, config: await getConfig() }).triggers); } catch { /* best-effort */ }
         emit(s, { json: globalOpts(cmd).json, human: (x: typeof s) => `coordinator: ${x.action} (${x.reason})` });
         return;
       }
