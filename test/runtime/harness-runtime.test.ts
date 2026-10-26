@@ -1,7 +1,7 @@
 // task-14.2: `harness` in the brief, `harness` + `launch` in `work next`, the phase rules at claim and the pre-agent
 // hook for process-harness roles (docs/design/agent-runtimes.md D1, D8, D9). No runner yet (`work run` is child task 3).
 import { mkdirSync } from 'node:fs';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, relative } from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -91,13 +91,14 @@ describe('phase 1 (b) pilot: codex-reviewer gate after the Claude engineer', () 
     }
   });
 
-  it('the plugin has no Claude agent file for a process-harness role', async () => {
+  it('the plugin has no Claude agent file for a process-harness role, only its resolved prompt for the runner', async () => {
     const e = pilotEnv();
     const out = await mkdtemp(join(tmpdir(), 'minions-harness-plugin-'));
     try {
       const files = (await generatePlugin(e.config, out)).map((f) => relative(out, f.path).split('\\').join('/'));
       expect(files).toContain('agents/reviewer.md');
-      expect(files.filter((f) => f.includes('codex-reviewer'))).toEqual([]);
+      expect(files.filter((f) => f.includes('codex-reviewer'))).toEqual(['harness-prompts/codex-reviewer.md']);
+      expect(await readFile(join(out, 'harness-prompts', 'codex-reviewer.md'), 'utf8')).toBe('Review the head.\n');
     } finally { await rm(out, { recursive: true, force: true }); }
   });
 });

@@ -30,6 +30,11 @@ const ROLE_TEMPLATE = 'agents/_role.md';
 export const PROJECT_PROMPT_MARKER = '<!-- minions:project-prompt -->';
 /** Largest role prompt (file or inline) the plugin accepts. */
 export const MAX_ROLE_PROMPT_BYTES = 64 * 1024;
+/**
+ * Plugin subdirectory with the resolved project prompts of process-harness roles (`<role>.md`). They have no agent
+ * definition; the process runner reads the prompt from here, because prompt files are resolved on the host only.
+ */
+export const HARNESS_PROMPTS_DIR = 'harness-prompts';
 /** Never in a worker's tool list: spawning or messaging agents (`Task` is the Agent tool's old name). MCP tools are removed too. */
 const NEVER_WORKER_TOOLS = new Set(['agent', 'task', 'sendmessage']);
 /** Removed when a role may not edit (edits `none` or a review worktree). */
@@ -626,7 +631,7 @@ export async function generatePlugin(cfg: MinionsConfig, outDir: string, opts: G
       if (prompt === undefined) throw promptError(name, 'set exactly one of prompt and promptText');
       // A project role on a process harness is not a Claude subagent (agent-runtimes D1): no agent definition (its
       // prompt is still checked above). The harness instructions are rendered by the runner's adapter (child tasks 3-4).
-      if (isProcessHarness(def.harness)) continue;
+      if (isProcessHarness(def.harness)) { await emit(`${HARNESS_PROMPTS_DIR}/${name}.md`, prompt + '\n'); continue; }
       const tools = roleTools(def);
       if (!tools.length) throw promptError(name, 'no usable tools left after removing Agent, SendMessage, MCP, pattern and (read-only role) edit tools');
       const readOnly = def.edits === 'none' || def.worktree === 'review';

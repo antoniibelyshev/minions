@@ -77,6 +77,29 @@ export function checkTokenFormat(raw: string): { token: string; fineGrained: boo
     `Create a fine-grained personal access token at ${GITHUB_TOKEN_CREATE_URL}.`);
 }
 
+// ---------------------------------------------------------------- OpenAI API key (Codex harness)
+
+export const OPENAI_API_KEYS_URL = 'https://platform.openai.com/api-keys';
+const OPENAI_KEY = /^sk-[A-Za-z0-9_-]{20,500}$/;
+
+/** Validates an OpenAI API key's shape (no whitespace or quotes, so it is safe on a `security -i` line). */
+export function checkOpenAiKeyFormat(raw: string): { token: string } {
+  const token = raw.trim();
+  if (!token) throw new MinionsError('INVALID_CONFIG', 'No key entered.', 'Paste the key at the prompt.');
+  if (!OPENAI_KEY.test(token)) throw new MinionsError('INVALID_CONFIG', 'That does not look like an OpenAI API key (expected sk-…).', `Create a project API key at ${OPENAI_API_KEYS_URL}.`);
+  return { token };
+}
+
+/** Key creation guidance for the Codex harness (agent-runtimes D5). Contains no secret. */
+export function codexKeyGuidance(): string[] {
+  return [
+    'Codex process workers (agent-runtimes D5) use an OpenAI API key, billed at API prices.',
+    `  Create a key for a dedicated OpenAI project at ${OPENAI_API_KEYS_URL} and set a usage limit on that project.`,
+    '  Only the minions process runner reads it; it reaches `codex exec` as CODEX_API_KEY, never as an argument.',
+    'Store it with `minions auth codex` (prompted without echo, or --stdin).',
+  ];
+}
+
 // ---------------------------------------------------------------- Telegram bot token
 
 /** Bot creation, pairing and allowlisting steps (docs/design/telegram.md, "Wizard flow"). Contains no secret. */
@@ -119,7 +142,7 @@ export async function verifyTelegramToken(token: string, opts: { fetch?: Fetch; 
 
 /** One host-held secret type. Every kind shares the stores, reference file and secrets mount. */
 export interface CredentialKind {
-  readonly name: 'github' | 'telegram';
+  readonly name: 'github' | 'telegram' | 'codex';
   /** Human label used in messages. */
   readonly label: string;
   readonly keychainService: string;
@@ -140,7 +163,12 @@ export const TELEGRAM_CREDENTIAL: CredentialKind = {
   name: 'telegram', label: 'Telegram bot token', keychainService: 'minions.telegram', keychainLabel: 'minions-telegram-bot-token',
   fileName: 'telegram-bot-token', check: (raw) => checkTelegramTokenFormat(raw).token, command: 'minions auth telegram',
 };
-export const CREDENTIAL_KINDS = [GITHUB_CREDENTIAL, TELEGRAM_CREDENTIAL] as const;
+/** OpenAI API key for the Codex process harness (agent-runtimes D5); the runner reads the `codex-api-key` file. */
+export const CODEX_CREDENTIAL: CredentialKind = {
+  name: 'codex', label: 'OpenAI API key (Codex)', keychainService: 'minions.codex', keychainLabel: 'minions-codex-api-key',
+  fileName: 'codex-api-key', check: (raw) => checkOpenAiKeyFormat(raw).token, command: 'minions auth codex',
+};
+export const CREDENTIAL_KINDS = [GITHUB_CREDENTIAL, TELEGRAM_CREDENTIAL, CODEX_CREDENTIAL] as const;
 
 // ---------------------------------------------------------------- storage backends
 
@@ -379,10 +407,16 @@ export const CredentialsJsonSchema = z.object({
     botId: z.string().regex(/^\d{6,12}$/),
     updatedAt: z.string(),
   }).strict().optional(),
+  codex: z.object({
+    backend: z.enum(BACKENDS),
+    ref: z.string().min(1),
+    updatedAt: z.string(),
+  }).strict().optional(),
 }).strict();
 export type CredentialsJson = z.infer<typeof CredentialsJsonSchema>;
 export type GithubCredentialRef = NonNullable<CredentialsJson['github']>;
 export type TelegramCredentialRef = NonNullable<CredentialsJson['telegram']>;
+export type CodexCredentialRef = NonNullable<CredentialsJson['codex']>;
 
 export async function loadCredentialRefs(projectId: string): Promise<CredentialsJson> {
   return (await readJsonIfExists(projectPaths(projectId).credentialsJson, CredentialsJsonSchema)) ?? { version: 1 };
@@ -486,7 +520,7 @@ export async function provisionGithubToken(opts: ProvisionOptions): Promise<Prov
 }
 
 /** Stores the token in the selected backend and deletes a copy left in a previous backend. */
-async function storeToken(opts: ProvisionOptions | TelegramProvisionOptions, kind: CredentialKind, token: string, runner: Runner): Promise<{ backend: Backend; ref: string }> {
+async function storeToken(opts: ProvisionOptions | TelegramProvisionOptions | CodexProvisionOptions, kind: CredentialKind, token: string, runner: Runner): Promise<{ backend: Backend; ref: string }> {
   const store = opts.store ?? await selectStore({ ...opts, runner, kind });
   const prev = (await loadCredentialRefs(opts.projectId))[kind.name];
   await store.set(opts.projectId, token);
@@ -587,6 +621,54 @@ export async function provisionTelegramToken(opts: TelegramProvisionOptions): Pr
 export const readTelegramToken = (projectId: string, runner: Runner = run) => readToken(projectId, TELEGRAM_CREDENTIAL, runner);
 export const removeTelegramToken = (projectId: string, runner: Runner = run) => removeToken(projectId, TELEGRAM_CREDENTIAL, runner);
 
+// ---------------------------------------------------------------- Codex (OpenAI API key) provisioning
+
+export interface CodexProvisionOptions extends StoreOptions {
+  projectId: string;
+  token: string;
+  repoPath: string;
+  store?: SecretStore;
+}
+export interface CodexProvisionResult { projectId: string; backend: Backend; ref: string; warnings: string[] }
+
+/** Validates the key shape, stores it and records the reference. No network call (the key is checked by its first run). */
+export async function provisionCodexKey(opts: CodexProvisionOptions): Promise<CodexProvisionResult> {
+  const runner = opts.runner ?? run;
+  const { token } = checkOpenAiKeyFormat(opts.token);
+  assertOutsideRepo(opts.projectId, opts.repoPath);
+  const { backend, ref } = await storeToken(opts, CODEX_CREDENTIAL, token, runner);
+  const refs = await loadCredentialRefs(opts.projectId);
+  await saveCredentialRefs(opts.projectId, { ...refs, codex: { backend, ref, updatedAt: new Date().toISOString() } });
+  return { projectId: opts.projectId, backend, ref, warnings: [] };
+}
+
+export const readCodexKey = (projectId: string, runner: Runner = run) => readToken(projectId, CODEX_CREDENTIAL, runner);
+export const removeCodexKey = (projectId: string, runner: Runner = run) => removeToken(projectId, CODEX_CREDENTIAL, runner);
+
+/** Codex key: presence, format and file mode. No network call; never includes the key. */
+export async function codexCredentialStatus(projectId: string, opts: { runner?: Runner } = {}): Promise<CredentialStatus> {
+  const runner = opts.runner ?? run;
+  let refs: CredentialsJson;
+  try { refs = await loadCredentialRefs(projectId); } catch (e) {
+    return { state: 'invalid', detail: `credential reference file is invalid: ${redact((e as Error).message).split('\n')[0]}` };
+  }
+  const ref = refs.codex;
+  if (!ref) return { state: 'missing', detail: 'no OpenAI API key provisioned for Codex' };
+  let token: string | null;
+  try { token = await storeFor(ref.backend, runner, CODEX_CREDENTIAL).get(projectId); } catch (e) {
+    return { state: 'invalid', backend: ref.backend, detail: redact((e as Error).message) };
+  }
+  if (!token) return { state: 'missing', backend: ref.backend, detail: `reference ${ref.ref} exists but the key is gone` };
+  const problems: string[] = [];
+  try { checkOpenAiKeyFormat(token); } catch { problems.push('stored value is not an OpenAI API key'); }
+  if (ref.backend === 'file') {
+    const p = await fileModeProblem(CODEX_CREDENTIAL, projectId);
+    if (p) problems.push(p);
+  }
+  const where = shortWhere(ref.backend);
+  return { state: problems.length ? 'invalid' : 'ok', backend: ref.backend, detail: [`stored in ${where}`, ...problems].join('; ') };
+}
+
 // ---------------------------------------------------------------- container secrets dir
 
 /** Host path of a kind's materialized copy inside the mounted secrets directory. */
@@ -602,7 +684,7 @@ export type Materialized = Record<CredentialKind['name'], boolean>;
  */
 export async function materializeSecrets(projectId: string, runner: Runner = run, access: SecretsAccess = probeSecretsAccess()): Promise<Materialized> {
   await prepareSecretsDir(projectPaths(projectId).secretsDir, access);
-  const out = { github: false, telegram: false } as Materialized;
+  const out = { github: false, telegram: false, codex: false } as Materialized;
   let failure: unknown;
   for (const kind of CREDENTIAL_KINDS) {
     const file = secretFile(projectId, kind);

@@ -14,7 +14,7 @@ import { authOf, isKeyAuth, refreshKey, startRefreshTimer } from './auth.js';
 import type { MinionsConfig } from '../config/schema.js';
 import {
   backendLabel, clearSecrets, upClearingSecretsOnFailure, githubTokenGuidance, materializeSecrets, provisionGithubToken, provisionTelegramToken, removeGithubToken,
-  removeTelegramToken, telegramBotGuidance,
+  removeTelegramToken, telegramBotGuidance, codexKeyGuidance, provisionCodexKey, removeCodexKey,
 } from './credentials.js';
 import { assertBotFree, startBotCheck } from './bot-guard.js';
 import { dockerProbe } from './discovery.js';
@@ -726,6 +726,52 @@ export function register(program: Command): void {
           'Then pair in the coordinator terminal: DM your bot, type /telegram:access pair <code>, then /telegram:access policy allowlist.',
         ] : []),
       ].filter(Boolean).join('\n') });
+    }));
+
+  auth.command('codex')
+    .description('Store the OpenAI API key for Codex process workers (prompted without echo; Keychain or a 0600 host file)')
+    .option('--stdin', 'read the key from piped stdin instead of the terminal prompt')
+    .option('--remove', 'delete the stored key and its reference')
+    .option('--dry-run', 'show the guidance and storage location without prompting')
+    .action(action(async (o: { stdin?: boolean; remove?: boolean }, cmd: Command) => {
+      requireMode('host');
+      const { json, dryRun } = globalOpts(cmd);
+      const ref = await projectForPath(process.cwd());
+      const project = await loadProjectJson(ref.projectId);
+      const compose = new Compose(project.projectId);
+      // The runner reads the file at each `work run`: a copy into a running container's secrets mount applies at once.
+      let needsRestart = false;
+      const apply = async () => {
+        if (runtimeOf(project) === 'host') return false; // process harnesses run only in the Docker runtime
+        const vis = await compose.secretsVisibility();
+        if (vis === 'restart-required') needsRestart = true;
+        if (vis !== 'mounted') return false;
+        await materialize(json, project.projectId);
+        return true;
+      };
+      if (o.remove) {
+        const r = dryRun ? { removed: false, backend: null } : await removeCodexKey(project.projectId);
+        const applied = !dryRun && r.removed ? await apply() : false;
+        emit({ projectId: project.projectId, dryRun, ...r, appliedToRunningContainer: applied }, { json, human: () => dryRun ? 'Would remove the stored OpenAI API key (Codex).'
+          : r.removed ? `Removed the OpenAI API key (${r.backend}).` : 'No OpenAI API key was stored.' });
+        return;
+      }
+      const guidance = codexKeyGuidance();
+      if (dryRun) { emit({ projectId: project.projectId, dryRun: true, guidance, mountedPath: CONTAINER.codexKeyFile }, { json, human: () => guidance.join('\n') }); return; }
+      say(json, guidance.join('\n'));
+      // The key is read only here, from the host terminal (no echo) or a pipe; never from argv.
+      const token = o.stdin ? await readStdinSecret()
+        : process.stdin.isTTY ? await readSecret('OpenAI API key (input hidden): ')
+          : (() => { throw new MinionsError('PRECONDITION', 'No terminal to prompt for the key.', 'Run in a terminal, or pipe it: `minions auth codex --stdin < key-file`.'); })();
+      const r = await provisionCodexKey({ projectId: project.projectId, token, repoPath: ref.repoPath });
+      const applied = await apply();
+      emit({ ...r, mountedPath: CONTAINER.codexKeyFile, appliedToRunningContainer: applied, ...(needsRestart ? { restartRequired: true } : {}) }, { json, human: () => [
+        `Stored the OpenAI API key in ${backendLabel(r.backend)} (${r.ref}).`,
+        ...r.warnings.map((w) => `warning: ${w}`),
+        applied ? `Updated ${CONTAINER.codexKeyFile} in the running container.`
+          : needsRestart ? 'The running container has no secrets mount (created before this feature); run `minions start` to recreate it so the key becomes visible.'
+            : `It is mounted read-only at ${CONTAINER.codexKeyFile} on the next \`minions start\`.`,
+      ].join('\n') });
     }));
 
   registerRuntime(program, { confirm, ask: askLine });

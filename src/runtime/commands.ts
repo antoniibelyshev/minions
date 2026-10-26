@@ -47,6 +47,7 @@ import { formatWorkProbe, workProbe } from './sandbox/probe.js';
 import { containerProtectedPaths } from './sandbox/rules.js';
 import { cachedSandboxSelfTest, containerRealTargets, probeIdentity, runSandboxSelfTest } from './sandbox/selftest.js';
 import { SANDBOX_BIN } from './sandbox/rules.js';
+import { HARNESS_PROMPTS_DIR } from '../plugin/generate.js';
 import { PROCESS_ADAPTERS } from './runner/adapters.js';
 import { runLease, type RunOutput } from './runner/run.js';
 
@@ -528,7 +529,7 @@ export function register(program: Command): void {
         { commonDir: join(paths.repo, '.git') });
       const real = await containerRealTargets({ db: paths.db, secretsDir: paths.secretsDir, claudeHome: c.claudeHome, repo: paths.repo, state: paths.state, worktrees: paths.worktrees });
       const r = await runLease(leaseId, {
-        db: getDb(), config: cfg, paths, commonDir: join(paths.repo, '.git'), adapters: PROCESS_ADAPTERS,
+        db: getDb(), config: cfg, paths, commonDir: join(paths.repo, '.git'), adapters: PROCESS_ADAPTERS, rolePromptDir: join(paths.pluginDir, HARNESS_PROMPTS_DIR),
         isolation: {
           kind: 'sandbox', protectedPaths,
           selfTest: async () => cachedSandboxSelfTest({

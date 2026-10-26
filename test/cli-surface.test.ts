@@ -136,7 +136,7 @@ describe('CLI surface (docs/design/cli-surface.md)', () => {
       [['hook', '--help'], ['stop', 'pre-agent', 'pre-telegram']],
       [['coordinator', '--help'], ['run', 'sync', 'restart']],
       [['workspace', '--help'], ['setup', 'import', 'export']],
-      [['auth', '--help'], ['show', 'set', 'refresh', 'github', 'telegram']],
+      [['auth', '--help'], ['show', 'set', 'refresh', 'github', 'telegram', 'codex']],
       [['help', 'work'], ['claim', 'record']],
     ] as const) {
       const { out, code } = await run([...args]);

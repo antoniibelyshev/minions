@@ -230,10 +230,10 @@ const collect = (v: string, prev: string[] = []) => [...prev, v];
 
 /**
  * Registers the `minions auth …` group with the Claude subcommands (show/set/refresh) and returns it,
- * so host credential subcommands (github, telegram) join the same group. `confirm` prints the plan and asks (TTY only).
+ * so host credential subcommands (github, telegram, codex) join the same group. `confirm` prints the plan and asks (TTY only).
  */
 export function registerAuth(program: Command, confirm: (plan: string) => Promise<boolean>): Command {
-  const auth = program.command('auth').description('Claude authorization (show/set/refresh) and host-held GitHub/Telegram credentials for this project');
+  const auth = program.command('auth').description('Claude authorization (show/set/refresh) and host-held GitHub/Telegram/Codex credentials for this project');
 
   auth.command('show')
     .description('Show the method, source, container env (masked) and secret file status; never the key')
