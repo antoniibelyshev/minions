@@ -285,6 +285,17 @@ describe('settings apply (host): plan, digest, confirmation', () => {
     expect(journal().filter((e) => e.type === 'confirmed')).toHaveLength(0);
   });
 
+  it('Agents keys are all host-owned: refused when recorded by the container and by the host plan, never applied', async () => {
+    const { project } = await install();
+    const { runtime } = fakeRuntime();
+    for (const [key, value] of [['secrets.codex', 'sk-test'], ['harnesses.default', 'codex'], ['roles.engineer.harness', 'codex']] as const) {
+      expect(() => requestSet(project, key, value)).toThrow(/host-owned/);
+      const id = requestSet(project, 'execution.maxActiveTasks', '5');
+      await expect(CR.buildPlan(project, { id, kind: 'config-set', reason: 'x', payload: { key, value, layer: 'local' } }, deps(runtime)))
+        .rejects.toMatchObject({ code: 'CONFLICT' });
+    }
+  });
+
   it('the digest is stable for the same plan and covers its content', async () => {
     const { project } = await install();
     const id = requestSet(project, 'execution.maxActiveTasks', '5');
