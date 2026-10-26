@@ -1,6 +1,7 @@
 // Bundles src/cli.ts into a single dependency-free dist/cli.js and regenerates schema/config.schema.json.
+import { execFileSync } from 'node:child_process';
 import { build } from 'esbuild';
-import { readFileSync, rmSync, chmodSync, writeFileSync } from 'node:fs';
+import { readFileSync, realpathSync, rmSync, chmodSync, writeFileSync } from 'node:fs';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { sourceFingerprint } from './scripts/source-fingerprint.mjs';
 
@@ -14,6 +15,21 @@ const common = {
   define: { __MINIONS_VERSION__: JSON.stringify(pkg.version) },
   logLevel: 'warning',
 };
+
+/**
+ * The commit a source build is made from (null outside a git checkout), and whether the tree had changes. The host
+ * manager's dev-only rebuild-cli plan shows `git log <commit>..HEAD` from it (docs/design/host-manager.md, task-53.7).
+ */
+function buildCommit() {
+  const dir = realpathSync(fileURLToPath(new URL('.', import.meta.url)));
+  const git = (...args) => execFileSync('git', ['-c', 'core.fsmonitor=false', ...args], { cwd: dir, stdio: ['ignore', 'pipe', 'ignore'], encoding: 'utf8' }).trim();
+  try {
+    // Only this package's own checkout counts (not a repository it happens to sit in).
+    if (realpathSync(git('rev-parse', '--show-toplevel')) !== dir) return { commit: null, dirty: null };
+    const commit = git('rev-parse', '--verify', 'HEAD^{commit}');
+    return /^[0-9a-f]{40}$/.test(commit) ? { commit, dirty: git('status', '--porcelain').length > 0 } : { commit: null, dirty: null };
+  } catch { return { commit: null, dirty: null }; }
+}
 
 async function generateSchema() {
   const tmp = 'dist/.schema-gen.mjs';
@@ -44,6 +60,7 @@ if (!process.argv.includes('--schema-only')) {
     version: pkg.version,
     source: sourceFingerprint(fileURLToPath(new URL('.', import.meta.url))),
     kind: process.env.MINIONS_BUILD_KIND === 'packed' ? 'packed' : 'source',
+    ...buildCommit(),
   }) + '\n');
 }
 await generateSchema();
