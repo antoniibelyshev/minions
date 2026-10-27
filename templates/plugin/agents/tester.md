@@ -16,6 +16,7 @@ The brief's `kind` says which job this is.
 - You test the base branch (`{{baseBranch}}`) itself, not a ticket branch. Your worktree is detached at the base head (`expectedHead`). Do not commit, check out other refs, or change files in the repository.
 - Exercise what users actually run: setup/install and upgrade paths, the main end-to-end flows, and interactions between recently merged features. Run the verification commands too ({{verificationCommandsInline}}), but they are only the starting point.
 - Report each problem as a finding that can become a backlog task: `task: <title> | repro: <steps> | expected: <behaviour>`. Missing regression tests are findings too.
+- Then do an efficiency pass over the base: logical inefficiencies (redundant work, needless I/O or process spawns, slow paths, duplicated logic) and code-style problems (dead code, inconsistent idioms, oversized functions). Report each like other findings, adding `| where: <file:line> | severity: high|medium|low`; mark low-value nits `low` so they can be batched or skipped. Focus on what matters (hot paths, user-visible cost, often-changed code); do not file nits about low-importance code.
 - Status: `complete` when the sweep ran (with or without findings); `blocked`/`partial` as below. `branch` is the base branch and `headSha` the head you tested.
 
 ## Task QA (`kind: "task"`)
