@@ -45,6 +45,12 @@
 //   `minions status` run in fresh processes; when either fails and a backup exists (src/host/cli-backup.ts), a
 //   cli-rollback offer follows (one Confirm reinstalls it). The dev-only rebuild-cli request (src/host/cli-rebuild.ts)
 //   exists only when the host CLI runs from a minions source checkout and the project is minions.
+// - Routine watchdog (task-68.2, docs/design/unattended-delivery.md decision 2): every WATCHDOG_CHECK_MS per running
+//   project, `minions sync --routine --trigger watchdog --json` runs through the delegate in its own lane (5 minute
+//   timeout, never awaited by the poll, at most one per project), so offers are never delayed. The runtime decides:
+//   it runs the pass only when routine.enabled is on and the last pass is older than 2 intervals (the wrapper clock is
+//   not ticking: the coordinator is down or hangs). A coordinator that is not running is reported once ("coordinator
+//   not running since <t>"), with the pass's decision (a crash start, or why none).
 import { open, readFile, rm } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 import type { Command } from 'commander';
@@ -82,6 +88,11 @@ import { defaultSettingsRuntime, type SettingsRuntime } from './settings-cli.js'
 import { formatValue } from './settings.js';
 
 export const POLL_INTERVAL_MS = 20_000;
+/** How often the watchdog asks a project's runtime for a routine pass (the runtime refuses while the last one is fresh). */
+export const WATCHDOG_CHECK_MS = 5 * 60_000;
+/** Bound of one watchdog pass through the delegate. */
+export const WATCHDOG_TIMEOUT_MS = 5 * 60_000;
+export const WATCHDOG_ARGV = ['minions', 'sync', '--routine', '--trigger', 'watchdog', '--json'] as const;
 export const managerLockPath = () => join(managerDir(), 'lock');
 
 // ---------------------------------------------------------------- transport
@@ -185,6 +196,8 @@ export interface ManagerDeps {
   cliHealth?: (project: ProjectJson) => Promise<CliHealth>;
   /** npm for the CLI roll back (default: run). */
   npm?: Runner;
+  /** The watchdog's routine pass through the delegate (5 minute timeout; default delegateCapture). Unset in tests: no watchdog. */
+  routine?: (project: ProjectJson, argv: string[]) => Promise<RunResult>;
 }
 
 /** A restart confirmed with mode when-idle or drain, waiting in the manager for the first poll without active leases. */
@@ -317,6 +330,9 @@ export class HostManager {
   private readonly unsent = new Set<string>();
   /** Restarts waiting for an idle poll, by project (at most one per project). */
   private readonly queued = new Map<string, QueuedRestart>();
+  /** Watchdog lane: the pass in flight and the time of the last check, by project. */
+  private readonly watchdogRuns = new Map<string, Promise<void>>();
+  private readonly watchdogChecked = new Map<string, number>();
 
   constructor(private readonly deps: ManagerDeps) {
     this.runtime = boundedRuntime(deps);
@@ -385,6 +401,7 @@ export class HostManager {
   /** Reads the project's open requests and offers each one that has no pending offer. Returns the offers sent. */
   async pollProject(project: ProjectJson): Promise<ManagerOffer[]> {
     if (!(await this.deps.running(project))) return [];
+    this.watchdog(project);
     const rows = await fetchRequests(project, this.runtime, false);
     const entries = await readJournal();
     const sent: ManagerOffer[] = [];
@@ -400,6 +417,54 @@ export class HostManager {
       await this.reportOnce(`malformed:${project.projectId}`, { status: 'error', projectId: project.projectId, requestId: null, text: `project ${project.projectId}: ignored ${malformed} malformed change request row(s) in the runtime's answer.` });
     }
     return sent;
+  }
+
+  /**
+   * Starts the project's watchdog pass when its check is due and none is in flight. Never awaited by the poll (its own
+   * lane) and never throws: a failure is reported once.
+   */
+  watchdog(project: ProjectJson): void {
+    const routine = this.deps.routine;
+    if (!routine || this.watchdogRuns.has(project.projectId)) return;
+    const now = this.deps.now().getTime();
+    const last = this.watchdogChecked.get(project.projectId);
+    if (last !== undefined && now - last < WATCHDOG_CHECK_MS) return;
+    this.watchdogChecked.set(project.projectId, now);
+    const id = project.projectId;
+    const p = (async () => {
+      try {
+        const r = await routine(project, [...WATCHDOG_ARGV]);
+        if (r.timedOut) throw new Error(`the routine pass timed out after ${WATCHDOG_TIMEOUT_MS / 60_000} min`);
+        type Envelope = { ok?: boolean; data?: Record<string, unknown>; error?: { message?: unknown } } | null;
+        let env: Envelope = null;
+        try { env = JSON.parse(r.stdout) as Envelope; } catch { env = null; }
+        if (!env || typeof env !== 'object' || !env.data || typeof env.data !== 'object') {
+          throw new Error(`the routine pass gave no readable answer (exit ${r.code})${env?.error?.message ? `: ${displayText(String(env.error.message)).slice(0, 200)}` : ''}`);
+        }
+        this.reported.delete(`watchdog:${id}`);
+        const d = env.data;
+        if (d.ran === true) this.deps.log(`watchdog ${id}: routine pass ran (${displayText(String(d.why ?? '')).slice(0, 200)})`);
+        const c = d.coordinator as { running?: unknown; since?: unknown } | undefined;
+        if (d.skipped === 'disabled' || !c || typeof c.running !== 'boolean') return;
+        if (c.running) { this.reported.delete(`coordinator:${id}`); return; }
+        const since = typeof c.since === 'string' ? displayText(c.since).slice(0, 40) : 'unknown';
+        const decision = d.ran === true ? ` (${displayText(String(d.why ?? '')).slice(0, 300)})` : '';
+        // Keyed by the down-since time: one report per outage, not per pass.
+        if (!this.reported.has(`coordinator:${id}`) || !this.reported.get(`coordinator:${id}`)!.includes(`since ${since}`)) {
+          await this.reportOnce(`coordinator:${id}`, { status: 'error', projectId: id, requestId: null, text: `project ${id}: coordinator not running since ${since}${decision}` });
+        }
+      } catch (e) {
+        await this.reportOnce(`watchdog:${id}`, { status: 'error', projectId: id, requestId: null, text: `project ${id}: watchdog routine pass failed: ${(e as Error).message}` });
+      } finally {
+        this.watchdogRuns.delete(id);
+      }
+    })();
+    this.watchdogRuns.set(id, p);
+  }
+
+  /** Resolves when every watchdog pass in flight has finished (tests; the loop never waits). */
+  async watchdogSettled(): Promise<void> {
+    await Promise.all([...this.watchdogRuns.values()]);
   }
 
   /** No journal entry, or the last one is `failed` (offer again: retry), or an offer whose message was never sent. */
@@ -1075,6 +1140,7 @@ export function defaultManagerDeps(transport: ManagerTransport, log: (line: stri
     loadProject: loadProjectJson,
     running: defaultSettingsRuntime.running,
     delegate: (p, argv) => delegateCapture(p, argv),
+    routine: (p, argv) => delegateCapture(p, argv, { timeoutMs: WATCHDOG_TIMEOUT_MS }),
     runChild: (p, argv) => {
       const h = hostCli();
       return run(h.cmd, [...h.args, '--json', ...argv], { cwd: p.repoPath, env: h.env, allowFailure: true, timeoutMs: CHILD_TIMEOUT_MS });

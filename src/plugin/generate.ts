@@ -17,6 +17,8 @@ import { atomicWrite, sha256 } from '../core/fsutil.js';
 import { configuredPermissionMode } from '../runtime/coordinator.js';
 import { controlsTable } from '../runtime/controls.js';
 import { NOTIFICATION_KINDS } from '../runtime/outbox.js';
+import { routineSettings } from '../runtime/routine.js';
+import { autoPromoteSettings, NEEDS_OWNER_LABEL } from '../runtime/auto-promote.js';
 import { POLLER_RECOVERY_HINT } from '../telegram/isolation.js';
 import { contextResetSettings, HANDOFF_MAX_BYTES, RESET_RESTART_COMMAND } from '../runtime/context-reset.js';
 
@@ -295,6 +297,15 @@ function permissionModeGuidance(cfg: MinionsConfig): string {
  * reporting, polls, testing, merging and the channel rule live in their own sections, and the
  * orchestrate skill points here instead of repeating them.
  */
+/** Own ideas (task-68.6, unattended-delivery decision 8): runtime-capped promotion of agent-hypothesis tasks. */
+function ownIdeasRule(cfg: MinionsConfig): string {
+  const a = autoPromoteSettings(cfg);
+  const caps = a.perDay === 0
+    ? 'Auto-promotion is off in this project (`routine.autoPromote.perDay` 0): they stay `idea` until the owner says go.'
+    : `The runtime refuses \`--status ready\` on one (\`POLICY_DENIED\`, "Auto-promotion refused") beyond ${a.perDay} a day, at ${a.maxBudgetPercent}% budget or more, when the owner has been silent for more than ${a.ownerSilentDays} days, or when its parent is labelled \`${NEEDS_OWNER_LABEL}\`.`;
+  return `- **Own ideas.** Label a design task \`${NEEDS_OWNER_LABEL}\` until the owner agrees to it, and remove the label only on their yes. Tasks from your own guesses (QA findings, follow-ups, split children: provenance \`agent-hypothesis\`) start as \`idea\`. ${caps} On a refusal leave the task as \`idea\` and put it to the owner as a digest question; never change its provenance or labels to get around the caps. Pass \`--owner-approved\` only right after the owner asked for that very task (it needs an owner message in the last 30 minutes). Every auto-promotion is listed in the digest; when the owner replies "cancel <id>" set it \`cancelled\`, "hold <id>" set it back to \`idea\`. Owner requests and imported issues are not capped.`;
+}
+
 function ownerDefaults(cfg: MinionsConfig): string {
   const level = (e: string | undefined) => (e ? `\`${e}\`` : 'default');
   const efforts = WORKER_ROLES.map((r) => `${r} ${level(roleEffort(cfg, r))}`).join(', ');
@@ -337,7 +348,7 @@ function telegramGuidance(cfg: MinionsConfig): string {
     `- **When the channel drops** (owner messages stop arriving, \`reply\` fails, or \`minions status\` shows a \`telegram poller\` problem): another claude session in the container may have taken the bot. ${POLLER_RECOVERY_HINT} Never launch other claude sessions yourself outside a controlled live run (see Testing), and never ask a worker to.`,
     '- Answer on the channel the owner used: a Telegram message gets a Telegram reply, a terminal message a terminal answer. When the channel was down, say so once it is back and ask the owner to resend anything important.',
     `- ${threadingGuidance()}`,
-    `- ${outboxGuidance()}`,
+    `- ${outboxGuidance(cfg)}`,
     '',
     'Owner controls. Each command also works from the owner\'s own terminal without you (the host CLI runs it in the project runtime):',
     '',
@@ -356,7 +367,7 @@ function threadingGuidance(): string {
 }
 
 /** The durable notification outbox (src/runtime/outbox.ts); delivery stays with the coordinator's `reply` tool. */
-function outboxGuidance(): string {
+function outboxGuidance(cfg: MinionsConfig): string {
   return [
     '**Notification outbox.** Every Telegram message you owe the owner (goal acknowledgement, delivery with its branch or PR link, blocker, approval request, requested status) goes through the outbox, so an outage loses nothing and nothing is sent twice:',
     'record it first with `minions notify enqueue --key <key> --kind <kind> [--task <taskId>] --json` and the text on stdin (a quoted heredoc; never in arguments, never with tokens or secrets),',
@@ -364,7 +375,20 @@ function outboxGuidance(): string {
     'Keys name the event, so a repeat is a no-op: `goal-ack:<message_id>`, `delivered:<taskId>:<headSha>`, `feature:<parentId>:<headSha>`, `blocker:<taskId>:<attempt>`, `approval:<taskId>:<headSha>`, `status:<message_id>`',
     `(kinds: ${NOTIFICATION_KINDS.join(', ')}).`,
     'Whenever you are awake anyway (a Telegram message, a worker result, `minions sync`, a terminal turn), first send what `minions notify pending --json` lists, oldest first, acking each; stop at the first failure.',
+    holdGuidance(cfg),
     'Never stay awake, loop or schedule wake-ups only to resend, and never send tool logs or test output.',
+  ].join(' ');
+}
+
+/** Held notifications and the owner digest (task-68.5, src/runtime/digest.ts). */
+function holdGuidance(cfg: MinionsConfig): string {
+  const r = routineSettings(cfg);
+  if (!r.enabled) return 'Nothing is held for a digest while the routine is off (`routine.enabled`); `--hold digest` still holds one item until the next digest time.';
+  return [
+    `**Digest** (${r.digestAt.join(', ')} ${r.timezone}): the owner reads once or twice a day, so batch what can wait.`,
+    'The runtime holds `delivered`, `feature` and `question` items for the digest by default (not while the owner wrote in the last 30 minutes); `goal-ack`, `status` (owner-requested), `approval` and `blocker` go out at once.',
+    'Override per item with `--hold digest` (a non-urgent update or question) or `--hold none` (the owner needs it now: a live conversation, an urgent decision). A held item is not listed by `notify pending`; only the digest sends it.',
+    'Write a question item as the question on the first line and one option per line (`1. ...`), the recommended one first and marked "(recommended)"; the digest numbers it as a poll (Q1, Q2) and adds "Other". An owner answer such as `Q2 1` answers poll 2 of the latest digest.',
   ].join(' ');
 }
 
@@ -397,6 +421,18 @@ function contextResetGuidance(cfg: MinionsConfig): string {
 }
 
 /** Orchestrate step 1 item: send pending notifications while the coordinator is awake anyway (Telegram only). */
+/** Orchestrate step 0: the digest wake (task-68.5). */
+function digestRule(cfg: MinionsConfig): string {
+  const r = routineSettings(cfg);
+  if (!r.enabled) return '';
+  return [
+    `\n\n**Digest** (\`digest\` among the reasons; ${r.digestAt.join(', ')} ${r.timezone}): do it before anything else, including pending notifications.`,
+    'Run `minions notify digest --json`: it composes the text deterministically (merged and delivered, held updates, waiting for you with the exact `/approve` lines for the manager chat, blockers, auto-promotions, spend, next up, questions as numbered polls) and stores it under `key`.',
+    'Send `text` exactly as given with one `reply` (no greeting, no rewording), then ack every key it returns: `minions notify ack <keys...> --json` (the digest key and the items it covered; items in `left` stay for the next digest; a closing "<n> more item(s): send /status" line is part of the text, send it as is). If `reply` fails, run `minions notify fail <key> --error "<reason>" --json` for the digest key only.',
+    'Then handle the other reasons as below. At 100% budget the digest is the only reason a wake happens: send it and stop (claims are refused).',
+  ].join(' ');
+}
+
 function outboxCheck(cfg: MinionsConfig): string {
   if (cfg.communication.channel === 'terminal') return '';
   return 'First, even when paused or draining, when this session has the Telegram channel: send what `minions notify pending --json` lists with `reply` and ack each (`minions notify ack <key> --json`); on a failure run `minions notify fail <key> --error "<reason>" --json` and stop sending until the next wake. Never wait or loop for the channel to come back.';
@@ -465,6 +501,7 @@ function baseVars(cfg: MinionsConfig): Record<string, string> {
   return {
     telegramGuidance: telegramGuidance(cfg),
     outboxCheck: outboxCheck(cfg),
+    digestRule: digestRule(cfg),
     contextResetGuidance: contextResetGuidance(cfg),
     contextResetRule: contextResetSettings(cfg).enabled
       ? 'If the response carries `contextReset` (`due: true`), do the context reset now (Limits in your coordinator instructions: handoff, then restart) instead of dispatching more work; the new session resumes the queue.'
@@ -472,6 +509,7 @@ function baseVars(cfg: MinionsConfig): Record<string, string> {
     reportingGuidance: reportingGuidance(cfg),
     decisionGuidance: decisionGuidance(),
     ownerDefaults: ownerDefaults(cfg),
+    ownIdeasRule: ownIdeasRule(cfg),
     integrationRule: integrationRule(cfg),
     reportingRule: reportingRule(cfg),
     packageVersion: cfg.packageVersion,

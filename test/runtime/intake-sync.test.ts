@@ -12,7 +12,7 @@ import type { MinionsConfig } from '../../src/config/schema.js';
 import type { RunResult } from '../../src/core/exec.js';
 import { RuntimeDb } from '../../src/runtime/db.js';
 import {
-  formatIntake, INTAKE_MAX_PAGES, INTAKE_STATE_META, intakeKey, issuesPath, originRepository, syncIntake, type GithubIntakeConfig,
+  formatIntake, importStatus, INTAKE_MAX_PAGES, INTAKE_STATE_META, intakeKey, issuesPath, originRepository, syncIntake, type GithubIntakeConfig,
 } from '../../src/runtime/intake-sync.js';
 import { intakeOnStart } from '../../src/runtime/commands.js';
 import type { GhFn } from '../../src/runtime/publish.js';
@@ -361,7 +361,7 @@ describe('intake sync: config and startup', () => {
   it('coordinator startup runs one intake pass only when enabled, and logs the summary', async () => {
     const logs: string[] = [];
     let calls = 0;
-    const sync = async () => { calls++; return { enabled: true, repository: REPO, matched: 1, created: ['task-1'], existing: 0, skippedIntakePaused: 0, reconciliations: [], complete: true, warnings: [], errors: [] }; };
+    const sync = async () => { calls++; return { enabled: true, repository: REPO, matched: 1, created: ['task-1'], createdReady: [], existing: 0, skippedIntakePaused: 0, reconciliations: [], complete: true, warnings: [], errors: [] }; };
     await intakeOnStart(defaults(), (l) => logs.push(l), sync);
     expect(calls).toBe(0);
     const on = defaults(); on.intake.github = { ...FILTER };
@@ -449,4 +449,47 @@ describe.skipIf(!process.env.MINIONS_BACKLOG_BIN && !(() => { try { execFileSync
       expect(await backlog.listTasks()).toHaveLength(1);
     } finally { db.close(); rmSync(root, { recursive: true, force: true }); }
   }, 60_000);
+});
+
+// task-68.6 (unattended delivery phase 5): intake.github.readyLabels, host-owned.
+describe('intake sync: readyLabels import ready', () => {
+  it('importStatus: every ready label present (case-insensitive) -> ready; one missing, unset or [] -> idea', () => {
+    expect(importStatus({ labels: ['minions', 'minions:ready'] }, ['minions:ready'])).toBe('ready');
+    expect(importStatus({ labels: ['Minions:Ready', 'P1'] }, ['minions:ready', 'p1'])).toBe('ready');
+    expect(importStatus({ labels: ['minions:ready'] }, ['minions:ready', 'p1'])).toBe('idea');
+    expect(importStatus({ labels: ['minions:ready'] }, [])).toBe('idea');
+    expect(importStatus({ labels: ['minions:ready'] }, undefined)).toBe('idea');
+  });
+
+  it('imports labelled issues as ready, the rest as idea; reports and records the status', async () => {
+    const x = env({ ...FILTER, readyLabels: ['minions:ready'] });
+    x.gh.set([{ number: 1, labels: ['minions', 'minions:ready'] }, { number: 2, labels: ['minions'] }]);
+    const r = await x.run();
+    expect(r).toMatchObject({ created: ['task-1', 'task-2'], createdReady: ['task-1'], errors: [] });
+    const tasks = await x.backlog.listTasks();
+    expect(byLink(tasks, 1)).toMatchObject({ status: 'ready', provenance: 'external-requirement' });
+    expect(byLink(tasks, 2)).toMatchObject({ status: 'idea' });
+    expect(events(x.db, 'intake-import').map((e) => [e.taskId, e.status])).toEqual([['task-1', 'ready'], ['task-2', 'idea']]);
+    expect(events(x.db, 'intake-sync').at(-1)).toMatchObject({ created: 2, createdReady: 1 });
+    expect(formatIntake(r)).toContain('2 imported (task-1, task-2), 1 as ready (task-1)');
+    expectReadOnly(x.gh.s.calls);
+  });
+
+  it('without readyLabels every issue is imported as idea (unchanged default)', async () => {
+    const x = env();
+    x.gh.set([{ number: 1, labels: ['minions', 'minions:ready'] }]);
+    const r = await x.run();
+    expect(r.createdReady).toEqual([]);
+    expect(byLink(await x.backlog.listTasks(), 1)).toMatchObject({ status: 'idea' });
+  });
+
+  it('a label added later does not promote an already imported idea (the import decides once)', async () => {
+    const x = env({ ...FILTER, readyLabels: ['minions:ready'] });
+    x.gh.set([{ number: 1, labels: ['minions'] }]);
+    await x.run();
+    x.gh.set([{ number: 1, labels: ['minions', 'minions:ready'] }]);
+    const r = await x.run();
+    expect(r).toMatchObject({ created: [], createdReady: [], existing: 1 });
+    expect(byLink(await x.backlog.listTasks(), 1)).toMatchObject({ status: 'idea' });
+  });
 });

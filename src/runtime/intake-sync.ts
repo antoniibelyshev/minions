@@ -65,6 +65,8 @@ export interface IntakeSyncReport {
    */
   matched: number | null;
   created: string[];
+  /** The subset of `created` imported as `ready` (the issue carried every `intake.github.readyLabels` label). */
+  createdReady: string[];
   existing: number;
   /** New issues not imported because intake is paused (`minions resume --intake`). */
   skippedIntakePaused: number;
@@ -105,7 +107,7 @@ function abortable(api: ApiGet, signal: AbortSignal | undefined): ApiGet {
 const segs = (s: string) => s.split('/').map(encodeURIComponent).join('/');
 const sameSet = (a: string[], b: string[]) => a.length === b.length && [...a].sort().join('\n') === [...b].sort().join('\n');
 const emptyReport = (enabled: boolean, repository: string | null): IntakeSyncReport =>
-  ({ enabled, repository, matched: enabled ? null : 0, created: [], existing: 0, skippedIntakePaused: 0, reconciliations: [], complete: false, warnings: [], errors: [] });
+  ({ enabled, repository, matched: enabled ? null : 0, created: [], createdReady: [], existing: 0, skippedIntakePaused: 0, reconciliations: [], complete: false, warnings: [], errors: [] });
 
 /** `owner/repo` of the workspace origin, or null when it is not a github.com repository. */
 export async function originRepository(repoDir: string, git: GitFn): Promise<string | null> {
@@ -232,6 +234,16 @@ function describeIssue(issue: GhIssue): string {
   return neutralizeComments([capped, `Imported from GitHub issue ${issue.html_url} by minions intake sync${facts ? ` (${facts})` : ''}.`].filter(Boolean).join('\n\n'));
 }
 
+/**
+ * Phase 5 (task-68.6): an issue carrying every label in `intake.github.readyLabels` (host-owned; GitHub label names
+ * compare case-insensitively) is imported `ready`, otherwise `idea`. An empty or unset list never imports ready.
+ */
+export function importStatus(issue: Pick<GhIssue, 'labels'>, readyLabels: readonly string[] | undefined): 'ready' | 'idea' {
+  if (!readyLabels?.length) return 'idea';
+  const has = new Set(issue.labels.map((l) => l.toLowerCase()));
+  return readyLabels.every((l) => has.has(l.toLowerCase())) ? 'ready' : 'idea';
+}
+
 const titleOf = (issue: GhIssue) => neutralizeComments(issue.title.replace(/\s+/g, ' ').trim()) || `GitHub issue #${issue.number}`;
 
 /**
@@ -250,7 +262,7 @@ export async function syncIntake(deps: IntakeSyncDeps): Promise<IntakeSyncReport
   const finish = () => {
     db.addEvent('intake-sync', null, {
       repository: repo, matched: report.matched, created: report.created.length, existing: report.existing,
-      skippedIntakePaused: report.skippedIntakePaused, reconciliations: report.reconciliations.length, complete: report.complete, errors: report.errors.length,
+      createdReady: report.createdReady.length, skippedIntakePaused: report.skippedIntakePaused, reconciliations: report.reconciliations.length, complete: report.complete, errors: report.errors.length,
     });
     return report;
   };
@@ -330,7 +342,7 @@ export async function syncIntake(deps: IntakeSyncDeps): Promise<IntakeSyncReport
     }
     const input = {
       title: titleOf(issue), description: describeIssue(issue), provenance: 'external-requirement' as const,
-      idempotencyKey: key, externalLinks: [issue.html_url],
+      idempotencyKey: key, externalLinks: [issue.html_url], status: importStatus(issue, f.readyLabels),
     };
     if (intakePaused && isIntakeCreation(input)) { report.skippedIntakePaused++; continue; }
     const mark = loadInflight(db)[key];
@@ -346,7 +358,8 @@ export async function syncIntake(deps: IntakeSyncDeps): Promise<IntakeSyncReport
       state.issues[key] = { taskId: r.task.id, url: issue.html_url, repository: repo, number: issue.number, assignees: issue.assignees, inFilter: true, lastSeenAt: now() };
       if (r.created) {
         report.created.push(r.task.id);
-        db.addEvent('intake-import', r.task.id, { key, url: issue.html_url });
+        if (input.status === 'ready') report.createdReady.push(r.task.id);
+        db.addEvent('intake-import', r.task.id, { key, url: issue.html_url, status: input.status });
       } else report.existing++;
     } catch (e) {
       report.errors.push(`${key}: import failed: ${redact((e as Error).message)}`);
@@ -393,7 +406,7 @@ export function formatIntake(r: IntakeSyncReport): string {
   if (r.matched === null) {
     return [`${from}: issue list not read, nothing imported`, ...r.warnings.map((w) => `  warning: ${w}`), ...r.errors.map((e) => `  error: ${e}`)].join('\n');
   }
-  const L = [`${from}: ${r.complete ? '' : 'at least '}${r.matched} matching issue(s), ${r.created.length} imported${r.created.length ? ` (${r.created.join(', ')})` : ''}, ${r.existing} already in the backlog` +
+  const L = [`${from}: ${r.complete ? '' : 'at least '}${r.matched} matching issue(s), ${r.created.length} imported${r.created.length ? ` (${r.created.join(', ')})` : ''}${r.createdReady.length ? `, ${r.createdReady.length} as ready (${r.createdReady.join(', ')})` : ''}, ${r.existing} already in the backlog` +
     (r.skippedIntakePaused ? `, ${r.skippedIntakePaused} skipped (intake is paused; \`minions resume --intake\`)` : '')];
   for (const c of r.reconciliations) L.push(`  ${c.taskId}: ${c.reason} -> ${c.action} (${c.detail})  ${c.url}`);
   for (const w of r.warnings) L.push(`  warning: ${w}`);

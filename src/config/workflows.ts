@@ -9,7 +9,7 @@ import type { TaskStatus } from '../backlog/types.js';
 import type { ConfigIssue } from '../core/errors.js';
 import { harnessModels } from './harnesses.js';
 import { COORDINATOR_ROLE, REVIEWER_ROLE, ROLE_NAME_PATTERN, TESTER_ROLE, modelsPath, workerRole, workerRoleNames, type RoleDef } from './roles.js';
-import type { MinionsConfig, RoleContract, WorkflowStageConfig } from './schema.js';
+import { STAGE_STATUSES, type MinionsConfig, type RoleContract, type WorkflowStageConfig } from './schema.js';
 
 export const DEFAULT_WORKFLOW = 'default';
 
@@ -113,6 +113,21 @@ export function claimableStatuses(cfg: WfCfg, stages: Stage[], position: number)
   const s = stages[position];
   if (!s) return [];
   return isRepairTarget(cfg, stages, position) ? [stageStatusOf(cfg, s), 'changes-requested'] : [stageStatusOf(cfg, s)];
+}
+
+/**
+ * Every status a stage can be claimed from or sits in, over all configured workflows and the default (D6), plus
+ * the statuses derivePosition maps onto a stage (ready, changes-requested and the built-in stage statuses, which
+ * get an inserted tester / appended reviewer). A task entering one of these can be started by a claim; the
+ * auto-promotion caps (src/runtime/auto-promote.ts) guard every move into this set.
+ */
+export function stageEntryStatuses(cfg: WfCfg): TaskStatus[] {
+  const out = new Set<TaskStatus>(['ready', 'changes-requested', ...STAGE_STATUSES]);
+  for (const name of workflowNames(cfg)) {
+    const stages = resolveWorkflow(cfg, name)?.stages ?? [];
+    stages.forEach((_s, i) => { for (const st of statusesAt(cfg, stages, i)) out.add(st); });
+  }
+  return [...out];
 }
 
 /** Statuses consistent with a task sitting at `position`: claimable, or the stage running. */

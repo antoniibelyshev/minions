@@ -292,8 +292,9 @@ describe('CLI wiring', () => {
     register(program);
     const coord = program.commands.find((c) => c.name() === 'coordinator')!;
     const flags = (name: string) => coord.commands.find((c) => c.name() === name)!.options.map((o) => o.long);
-    expect(flags('restart').sort()).toEqual(['--detach', '--force', '--recover']);
-    expect(flags('run')).toEqual(['--recover']);
+    // --wake (hidden): the routine pass's fresh wake (task-68.2).
+    expect(flags('restart').sort()).toEqual(['--detach', '--force', '--recover', '--wake']);
+    expect(flags('run')).toEqual(['--recover', '--wake']);
     expect(flags('sync').sort()).toEqual(['--force', '--start-detached']);
   });
 });

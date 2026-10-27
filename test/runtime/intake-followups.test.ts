@@ -141,7 +141,7 @@ describe('aborted list read report (item 4)', () => {
   });
 
   it('a complete read still reports the count; a truncated one says "at least"', () => {
-    const base = { enabled: true, repository: REPO, created: [], existing: 2, skippedIntakePaused: 0, reconciliations: [], warnings: [], errors: [] };
+    const base = { enabled: true, repository: REPO, created: [], createdReady: [], existing: 2, skippedIntakePaused: 0, reconciliations: [], warnings: [], errors: [] };
     expect(formatIntake({ ...base, matched: 2, complete: true })).toContain(': 2 matching issue(s), 0 imported, 2 already');
     expect(formatIntake({ ...base, matched: 1000, complete: false })).toContain(': at least 1000 matching issue(s)');
   });

@@ -1,7 +1,8 @@
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { Option, type Command } from 'commander';
-import { setIdempotencyStore, setIntakePausedContext, setProvenanceFallback, setReadyContext } from '../backlog/commands.js';
+import { setIdempotencyStore, setIntakePausedContext, setPromotionGuard, setProvenanceFallback, setReadyContext } from '../backlog/commands.js';
+import { checkPromotion } from './auto-promote.js';
 import { openBacklog, writeBacklogConfig } from '../backlog/factory.js';
 import type { BacklogAdapter, IdempotencyStore } from '../backlog/types.js';
 import { validateConfig } from '../config/resolve.js';
@@ -27,7 +28,15 @@ import type { PollerCheck } from '../telegram/isolation.js';
 import {
   buildClaudeCommand, buildCoordinatorCommand, telegramPollerStatus, claudePermissionModes, configuredPermissionMode, coordinatorWrapper, launchCoordinator, probeRuntime, readLaunchRecord, readMountedToken, RECOVERY_PROMPT,
   restartCoordinator, runtimeChannelFacts, scheduleDetachedRestart, syncCoordinator, coordinatorLaunchStatus, type LaunchStatus,
+  coordinatorPidAlive, procStartTime, readExitRecord, scheduleCrashStart, TELEGRAM_TOKEN_ENV, WAKE_PROMPT,
 } from './coordinator.js';
+import { pidAlive } from './db.js';
+import { run as runChild } from '../core/exec.js';
+import {
+  humanRoutine, humanRoutineReport, ROUTINE_TRIGGERS, routineLast, routineSettings, runRoutinePass, startRoutineClock, summarizeSync,
+  type CoordinatorView, type RoutineLast, type RoutineTrigger,
+} from './routine.js';
+import { currentBudget } from './spend.js';
 import { openDb, type DrainNotice, type DrainRequest, type Lease, type PauseChange, type RuntimeDb } from './db.js';
 import { clearDrain, requestDrain } from './drain.js';
 import { claimWithBrief, compactClaim, fetchBrief, recordSubmitted, requireWorkerRole, submitResult, sweepScratchOnStart, type CompactClaim } from './handoff.js';
@@ -45,6 +54,7 @@ import { exportWorkspace, importWorkspace, setupState } from './workspace.js';
 import { createStateBackup, releaseRestoredLeases, restoreStateBackup } from './state-backup.js';
 import { cancelWork, formatCancel } from './controls.js';
 import { ack, counts as outboxCounts, enqueue, fail, formatCounts, formatItems, pending, type OutboxCounts } from './outbox.js';
+import { digestStatus, holdFor, humanDigest, humanDigestStatus, prepareDigest, reholdExpired, type DigestStatus } from './digest.js';
 import { git, workspaceLayout } from './worktree.js';
 import { containerPaths } from '../core/paths.js';
 import { formatWorkProbe, workProbe } from './sandbox/probe.js';
@@ -175,6 +185,71 @@ async function restartWorkers(d: RuntimeDb): Promise<() => { id: string }[]> {
   return withOpenRuns(() => d.activeLeases(), runtimePaths().state); // contextResetCheck counts the same way
 }
 
+/** `minions sync`: intake (full sync only), then PR/CI observations with the auto-merge pass (the runtime's own gates). */
+async function fullSync(taskIds: string[] = []): Promise<{ report: SyncReport; intake: IntakeSyncReport | null }> {
+  const { db: d, backlog: b, config: cfg } = await context();
+  // Intake runs on a full sync only (`minions sync <taskIds>` refreshes just those PRs).
+  const intake = taskIds.length ? null : await runIntakeSync();
+  const sched = await scheduler();
+  return { report: await syncTasks({ db: d, backlog: b, config: cfg, merge: (id) => sched.autoMerge(id) }, { taskIds }), intake };
+}
+
+/** How the coordinator stands: a live lock holder, a dead one, the exit record and the last recorded restart. */
+export async function coordinatorView(d: RuntimeDb, paths = runtimePaths()): Promise<CoordinatorView> {
+  const lock = d.coordinatorLock();
+  const running = !!lock && coordinatorPidAlive(lock.pid, lock);
+  const exit = await readExitRecord(paths);
+  let lastRestartAt: string | null = null;
+  try { lastRestartAt = (JSON.parse(d.getMeta('coordinator_restart') ?? 'null') as { at?: string } | null)?.at ?? null; } catch { lastRestartAt = null; }
+  return { running, lockAcquiredAt: running ? lock!.acquiredAt : null, staleLock: !!lock && !running, exit: exit ? { at: exit.at, code: exit.code, ...(exit.error ? { error: exit.error } : {}) } : null, lastRestartAt };
+}
+
+/** An upgrade the host is applying right now (a confirmed upgrade change request), or null. */
+function upgradeInProgress(d: RuntimeDb): string | null {
+  try { const u = listChangeRequests(d).find((r) => r.kind === 'upgrade' && r.status === 'confirmed'); return u ? `change request ${u.id}` : null; } catch { return null; }
+}
+
+/** The routine pass with the runtime context: real gh, git, process table and detached restarts. */
+async function routineDeps(): Promise<Parameters<typeof runRoutinePass>[0]> {
+  const d = getDb();
+  const cfg = await getConfig();
+  const paths = runtimePaths();
+  const leases = () => withOpenRuns(() => d.activeLeases(), paths.state)().map((l) => l.id);
+  const log = join(paths.logs, 'routine.log');
+  return {
+    db: d, config: cfg, now: () => new Date(), procStart: procStartTime,
+    lockAlive: (l) => pidAlive(l.pid) && (!l.start || procStartTime(l.pid) === l.start),
+    sync: async () => { const r = await fullSync(); return summarizeSync(r.report, r.intake); },
+    next: async () => (await scheduler()).next(),
+    coordinator: () => coordinatorView(d, paths),
+    activeLeases: async () => leases(),
+    budgetExhausted: () => { try { return currentBudget({ db: d, config: cfg })?.exhausted ?? false; } catch { return false; } },
+    upgradeInProgress: () => upgradeInProgress(d),
+    digestDue: () => digestStatus(d, cfg).due,
+    holdBack: () => reholdExpired(d, cfg),
+    // Never with force: scheduleDetachedRestart refuses with an active lease or a drain (and the detached restart checks again).
+    wake: async () => scheduleDetachedRestart({ activeLeases: () => leases().map((id) => ({ id })), drain: () => d.drain(), log, cwd: paths.state }, { wake: true }).reason,
+    crashStart: async () => scheduleCrashStart({ drain: () => d.drain(), upgrade: () => upgradeInProgress(d), log, cwd: paths.state }).reason,
+  };
+}
+
+/** Bound of one clock pass (the child process is killed after it). */
+export const ROUTINE_PASS_TIMEOUT_MS = 5 * 60_000;
+
+/** The wrapper clock: each tick runs `minions sync --routine --trigger clock` as a bounded child (fresh config, own DB handle). */
+export function wrapperRoutineClock(log: (line: string) => void): () => void {
+  return startRoutineClock({
+    settings: async () => routineSettings(await loadRuntimeConfig()),
+    run: async () => {
+      const env = { ...process.env };
+      delete env[TELEGRAM_TOKEN_ENV]; // the pass never needs the bot token
+      const r = await runChild('minions', ['sync', '--routine', '--trigger', 'clock', '--json'], { allowFailure: true, timeoutMs: ROUTINE_PASS_TIMEOUT_MS, env, cwd: runtimePaths().state, maxOutputBytes: 1024 * 1024 });
+      if (r.timedOut) log(`minions: routine pass timed out after ${ROUTINE_PASS_TIMEOUT_MS / 60_000} min`);
+    },
+    log,
+  });
+}
+
 function logRecovery(r: RecoverySweep, log: (line: string) => void): void {
   for (const x of r.reaped) log(`minions: process run ${x.leaseId}: ${x.action}${x.note ? ` (${x.note})` : ''}`);
   for (const e of r.errors) log(`minions: could not reap the process run of ${e.leaseId}: ${e.error}`);
@@ -221,6 +296,10 @@ export interface StatusReport {
   spend?: SpendReport;
   /** Routine context resets (coordinator.contextReset; src/runtime/context-reset.ts): triggers and blockers for this session. */
   contextReset?: Omit<ContextResetCheck, 'steps'>;
+  /** The unattended routine (task-68.2): settings, the last pass and the next one (src/runtime/routine.ts). */
+  routine?: RoutineLast;
+  /** The owner digest (task-68.5): its times, the last one and whether it was sent, held items. */
+  digest?: DigestStatus;
   /** Open change requests (proposed, confirmed, failed) waiting for the host: the manager or `minions settings apply`. */
   changeRequests?: { open: number; items: { id: string; kind: string; status: string; summary: string; createdAt: string }[] };
   backlogError?: string;
@@ -269,6 +348,8 @@ export async function collectStatus(deps: { db: RuntimeDb; config: MinionsConfig
     report.changeRequests = { open: open.length, items: open.slice(0, CHANGE_REQUESTS_SHOWN).map((r) => ({ id: r.id, kind: r.kind, status: r.status, summary: r.summary, createdAt: r.createdAt })) };
   } catch { /* an older DB without change requests: omit */ }
   try { report.spend = spendReport({ db: d, config: cfg }); } catch { /* status never fails on the tally */ }
+  try { report.routine = routineLast(d, cfg); } catch { /* status never fails on the routine */ }
+  try { if (cfg.routine?.enabled) report.digest = digestStatus(d, cfg); } catch { /* status never fails on the digest */ }
   try { const { steps: _s, ...c } = contextResetCheck({ db: d, config: cfg, ...(deps.state !== undefined ? { state: deps.state } : {}) }); report.contextReset = c; } catch { /* status never fails on the reset check */ }
   try {
     const tasks = await (await deps.backlog()).listTasks();
@@ -303,6 +384,8 @@ export function humanStatus(s: StatusReport): string {
     ...(s.changeRequests?.open ? humanChangeRequests(s.changeRequests) : []),
     ...(s.spend ? humanSpend(s.spend).split('\n') : []),
     ...(s.contextReset?.enabled ? [humanContextReset(s.contextReset)] : []),
+    ...(s.routine ? [humanRoutine(s.routine)] : []),
+    ...(s.digest ? [humanDigestStatus(s.digest)] : []),
   ];
   if (s.backlogError) out.push(`backlog error: ${s.backlogError}`);
   out.push(s.activeLeases.length ? 'active leases:' : 'active leases: none', ...s.activeLeases.map((l) => `  ${l.id} ${l.task_id} ${l.role} #${l.attempt} ${l.branch ?? ''}`));
@@ -444,6 +527,11 @@ export function register(program: Command): void {
     });
     setIntakePausedContext(() => getDb().paused().intake);
     setProvenanceFallback(intakeProvenanceFallback(getDb));
+    // Auto-promotion caps (task-68.6): a budget read error refuses the change (fail closed).
+    setPromotionGuard(async (c, getTask) => {
+      const d = getDb(); const cfg = await getConfig();
+      return checkPromotion(c, { db: d, config: cfg, getTask, budgetPercent: () => currentBudget({ db: d, config: cfg })?.percent ?? null });
+    });
   }
 
   // work
@@ -611,14 +699,17 @@ export function register(program: Command): void {
   const notify = program.command('notify').description('Notification outbox: record owner notifications before sending, list pending ones, acknowledge or fail them (no LLM is woken to resend)');
   notify.command('enqueue').description('Record a notification (text on stdin) under a dedup key; an existing key is a no-op')
     .requiredOption('--key <key>', 'dedup key, e.g. delivered:<taskId>:<headSha>, goal-ack:<messageId>, blocker:<taskId>:<attempt>')
-    .requiredOption('--kind <kind>', 'goal-ack | delivered | feature | blocker | approval | question | status | other')
+    .requiredOption('--kind <kind>', 'goal-ack | delivered | feature | blocker | approval | question | status | digest | other')
     .option('--task <taskId>', 'related task')
     .option('--text-file <path>', 'read the text from a file ("-" = stdin, the default)')
-    .action(action(async (o: { key: string; kind: string; task?: string; textFile?: string }, cmd: Command) => {
+    .addOption(new Option('--hold <hold>', 'digest: hold it for the next owner digest; none: send now; default: per kind (delivered, feature and question are held while routine.enabled and the owner is not in the chat)'))
+    .action(action(async (o: { key: string; kind: string; task?: string; textFile?: string; hold?: string }, cmd: Command) => {
       if (runtimeMode() === 'host') return delegate(cmd);
       const text = await readInput(o.textFile, 'the notification text', 'Pipe the text in (never pass it as an argument) or use --text-file <path>.');
-      const r = enqueue(getDb(), { key: o.key, kind: o.kind, taskId: o.task ?? null, text });
-      emit(r, { json: globalOpts(cmd).json, human: (x: typeof r) => (x.created ? `queued ${x.item.key}` : `${x.item.key} already ${x.item.deliveredAt ? 'delivered' : 'queued'} (no-op)`) });
+      const d = getDb();
+      const holdUntil = holdFor(d, await getConfig(), o.kind, o.hold);
+      const r = { ...enqueue(d, { key: o.key, kind: o.kind, taskId: o.task ?? null, text, holdUntil }), heldUntil: holdUntil };
+      emit(r, { json: globalOpts(cmd).json, human: (x: typeof r) => (x.created ? `queued ${x.item.key}${x.item.nextAttemptAt && x.item.attempts === 0 ? ` (held for the digest at ${x.item.nextAttemptAt})` : ''}` : `${x.item.key} already ${x.item.deliveredAt ? 'delivered' : 'queued'} (no-op)`) });
     }));
   notify.command('pending').description('List undelivered notifications due now, oldest first (send each, then ack it)')
     .option('--all', 'include those waiting for a retry backoff')
@@ -626,8 +717,30 @@ export function register(program: Command): void {
     .action(action(async (o: { all?: boolean; limit?: number }, cmd: Command) => {
       if (runtimeMode() === 'host') return delegate(cmd);
       const d = getDb();
+      // The hold-back first: while the routine is on, a held item whose time came waits for the digest.
+      try { reholdExpired(d, await getConfig()); } catch { /* listing never fails on the hold-back */ }
       const r = { items: pending(d, { includeWaiting: !!o.all, limit: o.limit }), counts: outboxCounts(d) };
       emit(r, { json: globalOpts(cmd).json, human: (x: typeof r) => `${formatItems(x.items)}\n${formatCounts(x.counts)}` });
+    }));
+  notify.command('digest').description('Compose the owner digest (held updates, waiting approvals, blockers, spend, next up, questions as numbered polls) and store it under its key; send the text with one reply, then ack the returned keys')
+    .option('--status', 'only show whether a digest is due (times, the last one, held items)')
+    .action(action(async (o: { status?: boolean }, cmd: Command) => {
+      if (runtimeMode() === 'host') return delegate(cmd);
+      const d = getDb();
+      const cfg = await getConfig();
+      if (o.status) {
+        const st = digestStatus(d, cfg);
+        emit(st, { json: globalOpts(cmd).json, human: humanDigestStatus });
+        return;
+      }
+      let tasks: Awaited<ReturnType<BacklogAdapter['listTasks']>> | null = null;
+      try { tasks = await (await getBacklog()).listTasks(); } catch { tasks = null; }
+      let runnable: { taskId: string; role: string }[] = [];
+      try { runnable = (await (await scheduler()).next()).runnable.map((r) => ({ taskId: r.taskId, role: r.role })); } catch { runnable = []; }
+      let spend: SpendReport | null = null;
+      try { spend = spendReport({ db: d, config: cfg }); } catch { spend = null; }
+      const r = prepareDigest(d, cfg, { tasks, runnable, spend });
+      emit(r, { json: globalOpts(cmd).json, human: humanDigest });
     }));
   notify.command('ack <keys...>').description('Mark notifications delivered (after the send succeeded); repeating it is a no-op')
     .option('--via <transport>', 'the transport that delivered it', 'telegram')
@@ -687,11 +800,14 @@ export function register(program: Command): void {
     }));
   coord.command('run').description('Exec wrapper started by tmux: decides Telegram, then runs claude (container only)')
     .option('--recover', 'start claude with the recovery prompt (recover skill, then resume the queue)')
-    .action(action(async (o: { recover?: boolean }) => {
+    .addOption(new Option('--wake', 'start claude with the routine wake prompt (/minions:orchestrate wake)').hideHelp())
+    .action(action(async (o: { recover?: boolean; wake?: boolean }) => {
       requireMode('runtime');
+      if (o.recover && o.wake) throw new MinionsError('PRECONDITION', 'Use --recover or --wake, not both.');
       // A signal before claude starts (startup intake included): exit now rather than wait for work still in flight.
       process.exitCode = await coordinatorWrapper(getConfig, {
-        ...(o.recover ? { startupPrompt: RECOVERY_PROMPT } : {}),
+        ...(o.recover ? { startupPrompt: RECOVERY_PROMPT } : o.wake ? { startupPrompt: WAKE_PROMPT } : {}),
+        routineClock: wrapperRoutineClock,
         onStart: async (c, l, stop) => {
           // D3b: no process run of the previous session outlives it. Every record that is not done is reaped
           // (cancel or kill, escapee sweep, wip: checkpoint) before anything else touches its scratch dir.
@@ -727,7 +843,8 @@ export function register(program: Command): void {
     .option('--recover', 'start with the recovery prompt: reconcile leases, re-dispatch, resume the queue')
     .option('--force', 'restart even while worker leases are active (they stay recorded for recovery)')
     .option('--detach', 'advanced: run the restart in a detached process and return at once (the coordinator restarting itself; output in <state>/logs/context-reset.log)')
-    .action(action(async (o: { force?: boolean; recover?: boolean; detach?: boolean }, cmd: Command) => {
+    .addOption(new Option('--wake', 'start with the routine wake prompt (the routine pass; never with --force)').hideHelp())
+    .action(action(async (o: { force?: boolean; recover?: boolean; detach?: boolean; wake?: boolean }, cmd: Command) => {
       requireMode('runtime');
       const d = getDb();
       const workers = await restartWorkers(d);
@@ -875,15 +992,32 @@ export function register(program: Command): void {
   // sync: one-shot GitHub intake import (when intake.github is enabled) plus a refresh of PR state and
   // CI check results (no polling loop); host delegates.
   program.command('sync [taskIds...]').description('Import issues matching intake.github into the backlog (when enabled), refresh pull-request state and CI check results for tasks with a PR; reconcile merged/closed PRs; with delivery.merge auto-when-eligible, arm/disarm GitHub auto-merge for PRs that pass every gate')
-    .action(action(async (taskIds: string[], _o: unknown, cmd: Command) => {
+    // The unattended routine pass (docs/design/unattended-delivery.md; src/runtime/routine.ts): internal, so hidden.
+    .addOption(new Option('--routine', 'run the routine pass: sync, merge pass, wake decision, routine event (routine.enabled)').hideHelp())
+    .addOption(new Option('--last', 'with --routine: print the last recorded pass (the woken coordinator reads its reasons here)').hideHelp())
+    .addOption(new Option('--force', 'with --routine: run even within half an interval of the last pass').hideHelp())
+    .addOption(new Option('--trigger <who>', 'with --routine: clock, watchdog or manual (default manual)').hideHelp())
+    .action(action(async (taskIds: string[], o: { routine?: boolean; last?: boolean; force?: boolean; trigger?: string }, cmd: Command) => {
       if (runtimeMode() === 'host') return delegate(cmd);
-      const { db: d, backlog: b, config: cfg } = await context();
-      // Intake runs on a full sync only (`minions sync <taskIds>` refreshes just those PRs).
-      const intake = taskIds.length ? null : await runIntakeSync();
-      // Auto-merge (delivery.merge "auto-when-eligible") runs here, through the runtime's own gates.
-      const sched = await scheduler();
+      if (o.routine || o.last || o.force || o.trigger) {
+        if (!o.routine) throw new MinionsError('PRECONDITION', '--last, --force and --trigger go with --routine.');
+        if (taskIds.length) throw new MinionsError('PRECONDITION', 'The routine pass syncs every task; it takes no task ids.');
+        if (o.last) {
+          const r = routineLast(getDb(), await getConfig());
+          emit(r, { json: globalOpts(cmd).json, human: (x: RoutineLast) => [humanRoutine(x), ...(x.last?.reasons ?? []).map((w) => `  ${w.kind}: ${w.detail}`)].join('\n') });
+          return;
+        }
+        const trigger = (o.trigger ?? 'manual') as RoutineTrigger;
+        if (!ROUTINE_TRIGGERS.includes(trigger)) throw new MinionsError('PRECONDITION', `--trigger must be one of ${ROUTINE_TRIGGERS.join(', ')}.`);
+        const r = await runRoutinePass(await routineDeps(), { trigger, force: o.force });
+        emit(r, { json: globalOpts(cmd).json, human: humanRoutineReport });
+        if (r.syncError || (r.sync?.failed ?? 0) > 0) process.exitCode = 1;
+        return;
+      }
+      const d = getDb();
+      const { report: rep, intake } = await fullSync(taskIds);
       const r: SyncReport & { intake: IntakeSyncReport | null; notifications: OutboxCounts } = {
-        ...(await syncTasks({ db: d, backlog: b, config: cfg, merge: (id) => sched.autoMerge(id) }, { taskIds })), intake,
+        ...rep, intake,
         // Pending notifications are retried by whoever runs sync (the coordinator sends them; nothing is woken).
         notifications: outboxCounts(d),
       };
