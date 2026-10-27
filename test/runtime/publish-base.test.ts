@@ -10,7 +10,7 @@ import { publishTask, type GhFn } from '../../src/runtime/publish.js';
 import { git as realGit } from '../../src/runtime/worktree.js';
 import { gateGit as realGateGit } from '../../src/runtime/git-hardening.js';
 import { defaults } from '../helpers.js';
-import { approvalKeys, gitSync, tmp } from './fixtures.js';
+import { approvalKeys, ghBranchApi, gitSync, tmp } from './fixtures.js';
 
 const REMOTE = 'https://github.com/acme/demo.git';
 const TOKEN = 'ghp_' + 'c'.repeat(36);
@@ -41,22 +41,24 @@ function setup() {
   const tokenFile = join(tmp(), 'tok'); writeFileSync(tokenFile, TOKEN);
   const keys = approvalKeys();
   const calls: string[][] = [];
+  // The server is reached only at the explicit origin URL from an isolated git dir (task-71); the seam points
+  // it at the bare repository, or at nothing to make the server unreachable.
   let lsRemoteFails = false;
-  const git: GitFn = async (cwd, args, allow) => {
-    calls.push(args);
-    if (lsRemoteFails && args[0] === 'ls-remote') return { code: 128, stdout: '', stderr: 'fatal: unable to access: Could not resolve host' };
-    return realGit(cwd, args, allow);
-  };
+  let ghFails = false;
+  const serverUrl = () => (lsRemoteFails ? join(tmp(), 'unreachable.git') : bare);
+  const git: GitFn = async (cwd, args, allow) => { calls.push(args); return realGit(cwd, args, allow); };
   // The gate's history reads (rev-parse, merge-base, diff) go through the hardened gate git (task-71).
   const gateGit: GitFn = async (cwd, args, allow) => { calls.push(args); return realGateGit(cwd, args, allow); };
-  const gh: GhFn = async () => ({ code: 1, stdout: '', stderr: 'gh must not run in branch mode' });
+  // Only the verified base read (gh api .../branches/main) may call gh in branch mode.
+  const gh: GhFn = async (args) => (ghFails ? { code: 1, stdout: '', stderr: 'error connecting to api.github.com' } : ghBranchApi(bare, args))
+    ?? { code: 1, stdout: '', stderr: 'gh must not run in branch mode' };
   const run = (head: string, baseShas: (string | null)[], approved = false) => publishTask({
     config: cfg, task: { id: 'task-1', title: 'T', description: 'd', acceptanceCriteria: [] } as never,
-    repo, branch: 'agent/t', head, git, gateGit, gh, tokenFile, baseShas,
+    repo, branch: 'agent/t', head, git, gateGit, gh, tokenFile, baseShas, serverUrl,
     approvals: approved ? [keys.sign('task-1', head)] : [], approvalPublicKeyFile: keys.publicKeyFile,
   });
   const remoteHead = (ref: string) => { try { return gitSync(bare, 'rev-parse', '--verify', '--quiet', ref); } catch { return null; } };
-  return { repo, bare, cfg, claimBase, calls, run, remoteHead, setLsRemoteFails: (v: boolean) => { lsRemoteFails = v; } };
+  return { repo, bare, cfg, claimBase, calls, run, remoteHead, setLsRemoteFails: (v: boolean) => { lsRemoteFails = v; }, setGhFails: (v: boolean) => { ghFails = v; } };
 }
 
 describe('sensitive-path gate: bases the runtime cannot move', () => {
@@ -111,21 +113,24 @@ describe('sensitive-path gate: bases the runtime cannot move', () => {
       else gitSync(t.repo, 'mv', '--', '.github/workflows/ci.yml', 'moved-ci.yml');
       const head = commit(t.repo, op);
       for (const ref of ['refs/heads/main', 'refs/remotes/origin/main']) gitSync(t.repo, 'update-ref', ref, head);
-      t.setLsRemoteFails(true); // only the recorded base is trusted
+      // origin's verified base is the claim base here; every local ref sits on the head.
       const out = await t.run(head, [t.claimBase]);
       expect(out, op).toMatchObject({ state: 'awaiting-approval', sensitivePaths: ['.github/workflows/ci.yml'] });
     }
   });
 
-  it('ls-remote failure: falls back to the recorded base for the gate, then fails the publication without pushing', async () => {
+  it('an unreachable server or an unavailable GitHub API fails the publication closed (no gate on recorded bases alone, nothing pushed)', async () => {
     const t = setup();
     put(t.repo, 'a.txt', 'a');
     const head = commit(t.repo, 'plain');
     t.setLsRemoteFails(true);
-    expect(await t.run(head, [t.claimBase])).toMatchObject({ state: 'failed' });
-    expect(t.calls.some((a) => a[0] === 'push')).toBe(false);
-    // No recorded base and no remote: fail closed before any gate evaluation, even though refs/heads/main exists.
-    expect(await t.run(head, [])).toMatchObject({ state: 'failed', code: 'PRECONDITION', message: expect.stringMatching(/No trustworthy base/) });
+    expect(await t.run(head, [t.claimBase])).toMatchObject({ state: 'failed', retryable: true, message: expect.stringMatching(/could not be read from https:\/\/github\.com\/acme\/demo\.git/) });
+    t.setLsRemoteFails(false);
+    t.setGhFails(true);
+    expect(await t.run(head, [t.claimBase])).toMatchObject({ state: 'failed', code: 'NETWORK_RETRYABLE', message: expect.stringMatching(/cannot verify origin's main with the GitHub API/) });
+    expect(t.remoteHead('refs/heads/agent/t')).toBeNull();
+    t.setGhFails(false);
+    expect(await t.run(head, [t.claimBase])).toMatchObject({ state: 'published', push: 'pushed' });
   });
 
   it('a branch that merged main in after the claim: the gate still sees its own sensitive change (merging only adds paths)', async () => {

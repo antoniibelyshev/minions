@@ -131,3 +131,22 @@ export function approvalKeys() {
     sign: (taskId: string, head: string, o: { by?: string; now?: Date; ttlMs?: number } = {}) => signApproval(pair.privateKeyPem, { taskId, head, ...o }).token,
   };
 }
+
+/**
+ * The server side of the verified origin reads (task-71): `gh api ... /repos/<o>/<r>/branches/<b>` answered
+ * from a local bare repository that stands in for GitHub (git reaches it through the `serverUrl` seam,
+ * `() => bare`). Returns null for any other gh call, so a test's fake gh can delegate to it first.
+ */
+export function ghBranchApi(bare: string, args: string[]): { code: number; stdout: string; stderr: string } | null {
+  if (args[0] !== 'api') return null;
+  const path = args.find((a) => a.startsWith('/repos/')) ?? '';
+  const m = /^\/repos\/[^/]+\/[^/]+\/branches\/(.+)$/.exec(path);
+  if (!m) return null;
+  const branch = m[1]!.split('/').map(decodeURIComponent).join('/');
+  try {
+    const sha = execFileSync('git', ['-C', bare, 'rev-parse', '--verify', '--quiet', `refs/heads/${branch}`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+    return { code: 0, stdout: JSON.stringify({ name: branch, commit: { sha } }), stderr: '' };
+  } catch {
+    return { code: 1, stdout: '', stderr: 'gh: Branch not found (HTTP 404)' };
+  }
+}

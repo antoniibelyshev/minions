@@ -20,7 +20,8 @@ import type { BuiltinLeaseRole, Lease, LeaseRole, PublicationState, RuntimeDb } 
 import { removeLeaseFiles, type HandoffPaths } from './handoff.js';
 import { corruptRecordHint, hasOpenRun, readRunRecord, removeRunRecord } from './runner/record.js';
 import { missingApprovalKeyReason, runtimePaths } from './paths.js';
-import { publishTask, realGh, type GhFn, type PublishInput, type PublishOutcome } from './publish.js';
+import { ORIGIN_REPOSITORY_META, publishTask, realGh, serverOriginOf, type GhFn, type PublishInput, type PublishOutcome } from './publish.js';
+import type { ServerOrigin, ServerUrlFn } from './base-update.js';
 import { isCiCheck, resultContractText, validateResult, type WorkerResult } from './results.js';
 import { assertBudgetAllowsStart, billingOf, budgetNotice, latestLeaseUsage, recordLeaseUsage, tokensFromResultUsage, type Billing, type BudgetNotice, type SpendContext } from './spend.js';
 import { readRequiredChecks, type RequiredChecksReport } from './ci.js';
@@ -64,6 +65,11 @@ export interface SchedulerDeps {
   phase?: PhaseRules;
   /** Process-harness run records (agent-runtimes D3b). Omitted: no run records are consulted (tests of other paths). */
   runs?: RunControl;
+  /**
+   * Test seam: where git reaches the recorded origin URL for the verified base reads and the push
+   * (base-update.ts ServerUrlFn; default the URL itself). Only code sets it, never config or the environment.
+   */
+  serverUrl?: ServerUrlFn;
 }
 
 /**
@@ -319,14 +325,18 @@ export class Scheduler {
   private readonly gh: GhFn;
   private readonly now: () => Date;
   private readonly runs: RunControl | null;
+  private readonly serverUrl: ServerUrlFn | undefined;
 
   constructor(deps: SchedulerDeps) {
+    this.serverUrl = deps.serverUrl;
     this.runs = deps.runs ?? null;
     this.db = deps.db; this.backlog = deps.backlog; this.config = deps.config;
     this.layout = deps.layout ?? workspaceLayout();
     this.handoff = deps.handoff ?? null;
     this.publisher = deps.publisher ?? publishTask;
-    this.baseSync = deps.baseSync ?? ((repo, base) => syncBaseFromOrigin(repo, base));
+    this.baseSync = deps.baseSync ?? ((repo, base) => syncBaseFromOrigin(repo, base, {
+      gh: this.gh, ...this.originOpts(), ...(this.serverUrl ? { serverUrl: this.serverUrl } : {}),
+    }));
     this.approvalPublicKeyFile = deps.approvalPublicKeyFile ?? runtimePaths().approvalPublicKey;
     this.gh = deps.gh ?? realGh;
     this.now = deps.now ?? (() => new Date());
@@ -807,7 +817,9 @@ export class Scheduler {
         if (d.status !== 'done' && d.status !== 'delivered') throw new MinionsError('PRECONDITION', `Task ${task.id} depends on ${dep}, which is "${d.status}".`);
       }
     }
-    if (isGithubDelivery(cfg)) await this.syncBase(task.id, role);
+    // GitHub delivery: the base recorded for the lease is origin's base as the server reported it and the
+    // GitHub API confirmed (base-sync.ts), never the local base ref a worker can move (task-71).
+    const verifiedBase = isGithubDelivery(cfg) ? await this.syncBase(task.id, role) : null;
     const allTasks = await listing();
     // A QA sweep's lease is on the base branch itself; its worktree is detached at the base head.
     const sweepBase = sweep ? await resolveBaseBranch(this.layout.repo, cfg.git.baseBranch) : null;
@@ -857,11 +869,11 @@ export class Scheduler {
       // Worktree kind from the role (D4): review = detached at the exact head (read-only); branch = the task branch.
       if (def.worktree === 'review') {
         const b = await resolveBaseBranch(this.layout.repo, cfg.git.baseBranch);
-        baseBranch = b.branch; baseSha = b.sha; head = (await headOf(this.layout.repo, branch))!;
+        baseBranch = b.branch; baseSha = verifiedBase ?? b.sha; head = (await headOf(this.layout.repo, branch))!;
         worktree = (await ensureReviewWorktree(this.layout, slug, head)).worktree;
       } else {
         const wt = await ensureBranchWorktree(this.layout, slug, cfg.git.baseBranch);
-        baseBranch = wt.baseBranch; baseSha = wt.baseSha; head = wt.head; worktree = wt.worktree;
+        baseBranch = wt.baseBranch; baseSha = verifiedBase ?? wt.baseSha; head = wt.head; worktree = wt.worktree;
       }
       this.db.exec('UPDATE leases SET worktree = ?, base_sha = ?, head_sha = ? WHERE id = ?', worktree, baseSha, head, leaseId);
       // The task sits in the stage's status while it runs (D6): an engineer claimed from ready/changes-requested
@@ -888,11 +900,23 @@ export class Scheduler {
    * base before any lease exists; a fetch failure or a local base that origin does not contain blocks
    * the claim (the error propagates unchanged and is recorded as a `base-sync-blocked` event).
    */
-  private async syncBase(taskId: string, role: LeaseRole): Promise<void> {
+  /**
+   * The GitHub repository from minions' own record (publish.ts serverOriginOf): the task's PR URL, else the
+   * repository `minions workspace import --remote-url` recorded. `{}` when there is no record (the callee
+   * then falls back to the workspace's origin URL, still reached only at that explicit https URL).
+   */
+  private originOpts(task?: Pick<Task, 'prUrl'> | null): { origin?: ServerOrigin } {
+    const origin = serverOriginOf({ prUrls: [task?.prUrl], recorded: this.db.getMeta(ORIGIN_REPOSITORY_META) ?? null });
+    return origin ? { origin } : {};
+  }
+
+  /** Returns origin's verified base (the commit the lease records), or null for an injected sync without one. */
+  private async syncBase(taskId: string, role: LeaseRole): Promise<string | null> {
     const base = this.config.git.baseBranch;
     try {
       const r = await this.baseSync(this.layout.repo, base);
       if (r.action !== 'up-to-date') this.db.addEvent('base-sync', taskId, { role, ...r });
+      return /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(r.to) ? r.to : null;
     } catch (e) {
       const err = e as Partial<MinionsError>;
       this.db.addEvent('base-sync-blocked', taskId, { role, base, code: err.code ?? 'INTERNAL', message: err.message ?? String(e), details: err.details ?? null });
@@ -1466,6 +1490,9 @@ export class Scheduler {
       // Bases recorded at claim time: the sensitive-path gate must not depend on the movable local base ref.
       baseShas: this.db.leases({ taskId, all: true }).map((l) => l.base_sha),
       approvalPublicKeyFile: this.approvalPublicKeyFile,
+      // The server: minions' recorded repository (the task's PR URL, else the import record).
+      ...this.originOpts(task),
+      ...(this.serverUrl ? { serverUrl: this.serverUrl } : {}),
     });
 
     if (outcome.state === 'failed') return failWith(outcome.code, outcome.message, outcome.retryable);
@@ -1514,6 +1541,7 @@ export class Scheduler {
     return autoMergeTask({
       db: this.db, backlog: this.backlog, config: this.config, repo: this.layout.repo, gh: this.gh, git,
       ciGate: (id, head) => this.ciGate(id, head), approvalPublicKeyFile: this.approvalPublicKeyFile, now: this.now,
+      ...(this.serverUrl ? { serverUrl: this.serverUrl } : {}),
     }, taskId);
   }
 

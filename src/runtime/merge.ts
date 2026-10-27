@@ -32,7 +32,8 @@ import { formatCiGate } from './ci-gate.js';
 import type { EvidenceRow, RuntimeDb } from './db.js';
 import type { GitFn } from './github.js';
 import { missingApprovalKeyReason } from './paths.js';
-import { classifyFailure, gateChangedPaths, githubOrigin, type GhFn } from './publish.js';
+import { originOfPrUrl, type ServerUrlFn } from './base-update.js';
+import { classifyFailure, gateChangedPaths, verifiedGateBase, type GhFn } from './publish.js';
 
 export type MergeState =
   /** delivery.merge is not "auto-when-eligible" and minions armed nothing: no gh call was made. */
@@ -92,6 +93,8 @@ export interface MergeDeps {
   ciGate: (taskId: string, head: string) => Promise<CiGate>;
   approvalPublicKeyFile: string;
   now?: () => Date;
+  /** Test seam: where git reaches the recorded origin URL (base-update.ts ServerUrlFn; default the URL itself). */
+  serverUrl?: ServerUrlFn;
 }
 
 /** Last arm/disarm record: whether a PR's auto-merge was enabled by minions (and not disabled since). */
@@ -215,11 +218,18 @@ export async function autoMergeTask(d: MergeDeps, taskId: string): Promise<Merge
   // ---- gates (every one bound to the approved head)
   const reviewed = d.db.evidenceFor(taskId, head, 'reviewer', cfg.configRevision).some((e) => e.outcome === 'complete');
   const ci = await d.ciGate(taskId, head);
-  const origin = await githubOrigin(d.git, d.repo);
-  const paths = origin
-    ? await gateChangedPaths({ git: d.git, gateGit: d.gateGit, repo: d.repo, remote: origin.remote, base: cfg.git.baseBranch, head, branch: pub.branch,
+  // The server is the repository of the recorded PR URL, never the workspace's (agent-writable) origin remote
+  // or url.* config; its base is read from an isolated git dir and cross-checked with the GitHub API
+  // (publish.ts verifiedGateBase). Unverifiable (gh down, a mismatch, not fetchable): the gate fails closed.
+  const origin = originOfPrUrl(prUrl);
+  const base = cfg.git.baseBranch;
+  const vb = origin
+    ? await verifiedGateBase({ repo: d.repo, gh: d.gh, origin, base, haves: [head], ...(d.serverUrl ? { serverUrl: d.serverUrl } : {}) })
+    : { ok: false as const, message: `${prUrl} is not a github.com pull request` };
+  const paths: MergeGateInput['paths'] = vb.ok
+    ? await gateChangedPaths({ gateGit: d.gateGit, repo: d.repo, base, head, branch: pub.branch, serverBase: vb.sha,
       baseShas: d.db.leases({ taskId, all: true }).map((l) => l.base_sha), sensitivePaths: cfg.sensitivePaths })
-    : { ok: false as const, message: 'origin is not a github.com repository' };
+    : { ok: false as const, message: `origin's ${base} could not be verified: ${vb.message}` };
   const pem = await readFile(d.approvalPublicKeyFile, 'utf8').catch(() => null);
   const gate = evaluateMergeGate({
     config: cfg, approvedHead: head, pr, reviewed, ci, paths,

@@ -337,6 +337,7 @@ export function allowlistedGit(cwd: string, args: string[], allowFailure: boolea
   const runner = opts.run ?? ((c, a, o) => run(c, a, o));
   const base = opts.env ?? process.env;
   const env = allowlistedGitEnv(base, opts);
-  const lead = isHostRuntime(base) ? hardenedGitArgs({ network: isNetworkOp(args), credentialHelper: base.MINIONS_GIT_CREDENTIAL_HELPER || undefined }) : [];
+  // `network` is explicit: behind an isolated call's leading --git-dir / -c options isNetworkOp cannot see the subcommand.
+  const lead = isHostRuntime(base) ? hardenedGitArgs({ network: !!opts.network || isNetworkOp(args), credentialHelper: base.MINIONS_GIT_CREDENTIAL_HELPER || undefined }) : [];
   return runner('git', [...lead, ...args], { cwd, env, allowFailure, timeoutMs: opts.timeoutMs ?? 120_000, ...(opts.signal ? { signal: opts.signal } : {}) });
 }

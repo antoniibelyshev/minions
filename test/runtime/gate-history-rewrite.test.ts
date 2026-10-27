@@ -11,7 +11,7 @@ import { gateGit, gateGitArgs, gateGitEnv, GATE_HOME } from '../../src/runtime/g
 import { gateChangedPaths, publishTask, type GhFn } from '../../src/runtime/publish.js';
 import { git as realGit } from '../../src/runtime/worktree.js';
 import { defaults } from '../helpers.js';
-import { approvalKeys, commitFile, gitSync, makeDefaultEnv, tmp } from './fixtures.js';
+import { approvalKeys, commitFile, ghBranchApi, gitSync, makeDefaultEnv, tmp } from './fixtures.js';
 
 const REMOTE = 'https://github.com/acme/demo.git';
 const TOKEN = 'ghp_' + 'g'.repeat(36);
@@ -46,6 +46,8 @@ function setup() {
   const keys = approvalKeys();
   const ghCalls: string[][] = [];
   const gh: GhFn = async (args) => {
+    const api = ghBranchApi(bare, args); // the verified base read (task-71)
+    if (api) return api;
     ghCalls.push(args);
     if (args[1] === 'list') return { code: 0, stdout: '[]', stderr: '' };
     return { code: 0, stdout: 'https://github.com/acme/demo/pull/9\n', stderr: '' };
@@ -55,6 +57,7 @@ function setup() {
   const publish = () => publishTask({
     config: cfg, task: { id: 'task-1', title: 'T', description: 'd', acceptanceCriteria: [] } as never,
     repo, branch: 'agent/t', head, git, gh, tokenFile, baseShas: [base], approvals: [], approvalPublicKeyFile: keys.publicKeyFile,
+    serverUrl: () => bare,
   });
   const gate = () => gateChangedPaths({ git, repo, remote: 'origin', base: 'main', head, branch: 'agent/t', baseShas: [base], sensitivePaths: cfg.sensitivePaths });
   const remoteHead = (ref: string) => { try { return gitSync(bare, 'rev-parse', '--verify', '--quiet', ref); } catch { return null; } };

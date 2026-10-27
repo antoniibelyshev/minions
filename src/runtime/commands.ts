@@ -40,7 +40,7 @@ import { capacityOf, Scheduler, type NextReport, type NextStage, type RoleCapaci
 import { gitCredential } from './github.js';
 import { ciStatus, formatCiStatus, formatSync, syncTasks, type SyncReport } from './ci.js';
 import { formatIntake, intakeProvenanceFallback, originRepository, syncIntake, type IntakeSyncReport } from './intake-sync.js';
-import { ghWithTimeout, type GhFn } from './publish.js';
+import { ghWithTimeout, ORIGIN_REPOSITORY_META, originOfRemoteUrl, type GhFn } from './publish.js';
 import { exportWorkspace, importWorkspace, setupState } from './workspace.js';
 import { createStateBackup, releaseRestoredLeases, restoreStateBackup } from './state-backup.js';
 import { cancelWork, formatCancel } from './controls.js';
@@ -814,6 +814,10 @@ export function register(program: Command): void {
       requireMode('runtime');
       const config = await getConfig();
       const r = await importWorkspace(bundle, { base: o.base, remoteUrl: o.remoteUrl, config, baseFrom: isGithubDelivery(config) ? 'origin' : 'host' });
+      // minions' own record of the GitHub repository (publish.ts serverOriginOf): the verified base reads and
+      // the push go to it, never to whatever the agent-writable .git/config names (task-71).
+      const repository = originOfRemoteUrl(o.remoteUrl)?.repository;
+      if (repository) getDb().setMeta(ORIGIN_REPOSITORY_META, repository);
       emit(r, { json: globalOpts(cmd).json, human: (d: typeof r) => [`${d.imported ? 'Cloned' : 'Refreshed'} ${d.repo} at ${d.head} (base ${d.base})`,
         ...(d.origin ? [`origin ${d.origin.url}: ${d.origin.authenticated ? 'authenticated' : 'not authenticated'}, ${d.origin.fetched ? `fetched ${d.base}` : 'not fetched'}`] : []),
         ...(d.origin?.warnings ?? []).map((w) => `warning: ${w}`)].join('\n') });

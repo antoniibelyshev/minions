@@ -11,7 +11,7 @@ import { classifyFailure, publishTask, pullRequestText, type GhFn, type PublishI
 import { Scheduler } from '../../src/runtime/scheduler.js';
 import { git as realGit } from '../../src/runtime/worktree.js';
 import { defaults } from '../helpers.js';
-import { approvalKeys, commitFile, gitSync, makeEnv, result, tmp, type Env } from './fixtures.js';
+import { approvalKeys, commitFile, ghBranchApi, gitSync, makeEnv, result, tmp, type Env } from './fixtures.js';
 
 const REMOTE = 'https://github.com/acme/demo.git';
 const TOKEN = 'ghp_' + 'a'.repeat(36);
@@ -27,6 +27,9 @@ class FakeGh {
   failList: string | null = null;
   constructor(private bare: string) {}
   fn: GhFn = async (args, opts = {}) => {
+    // The verified base read (task-71): GitHub's view of origin's branches is the bare repository.
+    const api = ghBranchApi(this.bare, args);
+    if (api) return api;
     this.calls.push(args);
     this.inputs.push(opts.input);
     const ok = (stdout: string): RunResult => ({ code: 0, stdout, stderr: '' });
@@ -48,7 +51,7 @@ class FakeGh {
   };
 }
 
-interface PubEnv extends Env { bare: string; gh: FakeGh; tokenFile: string; sched: Scheduler; gitOverride: { fn?: GitFn }; keys: ReturnType<typeof approvalKeys> }
+interface PubEnv extends Env { bare: string; gh: FakeGh; tokenFile: string; sched: Scheduler; gitOverride: { fn?: GitFn }; keys: ReturnType<typeof approvalKeys>; serverUrl: () => string }
 
 /** Runtime env whose origin is https://github.com/acme/demo.git, rewritten (insteadOf) to a local bare repo. */
 function pubEnv(mutate?: (c: MinionsConfig) => void): PubEnv {
@@ -67,11 +70,14 @@ function pubEnv(mutate?: (c: MinionsConfig) => void): PubEnv {
   const gh = new FakeGh(bare);
   const gitOverride: { fn?: GitFn } = {};
   const keys = approvalKeys();
+  // git reaches the recorded https origin at the bare repository (the code-only seam; insteadOf is ignored).
+  const serverUrl = () => bare;
   const sched = new Scheduler({
     db: env.db, backlog: env.backlog, config: env.config, layout: env.layout, approvalPublicKeyFile: keys.publicKeyFile,
+    gh: (a, o) => gh.fn(a, o), serverUrl,
     publisher: (input: PublishInput) => publishTask({ ...input, gh: gh.fn, tokenFile, git: gitOverride.fn ?? realGit }),
   });
-  return { ...env, sched, bare, gh, tokenFile, gitOverride, keys };
+  return { ...env, sched, bare, gh, tokenFile, gitOverride, keys, serverUrl };
 }
 
 const remoteHead = (bare: string, branch: string) => {
@@ -150,7 +156,7 @@ describe('pull-request delivery', () => {
       }
       return orig(args, opts);
     };
-    const sched = new Scheduler({ db: env.db, backlog: env.backlog, config: env.config, layout: env.layout,
+    const sched = new Scheduler({ db: env.db, backlog: env.backlog, config: env.config, layout: env.layout, gh: (a, o) => env.gh.fn(a, o), serverUrl: env.serverUrl,
       publisher: (input) => publishTask({ ...input, gh: env.gh.fn, tokenFile: env.tokenFile }) });
     const { r } = await approveTask({ ...env, sched }, 'task-1');
     expect(r.publication).toMatchObject({ state: 'published', pr: 'existing', prUrl: 'https://github.com/acme/demo/pull/42' });
@@ -160,9 +166,9 @@ describe('pull-request delivery', () => {
   it('a failed push leaves the task blocked (not delivered), keeps the local branch, and is retryable', async () => {
     const env = pubEnv();
     env.backlog.add({ id: 'task-1', title: 'Flaky network' });
-    env.gitOverride.fn = async (cwd, args, allowFailure) => args[0] === 'push'
-      ? { code: 128, stdout: '', stderr: `remote: Invalid username or password.\nfatal: Authentication failed for '${REMOTE}/' token ${TOKEN}` }
-      : realGit(cwd, args, allowFailure);
+    // The push goes to the explicit origin URL from an isolated git dir (no GitFn), so the server refuses it.
+    const hook = join(env.bare, 'hooks', 'pre-receive');
+    writeFileSync(hook, `#!/bin/sh\necho "Invalid username or password. Authentication failed for '${REMOTE}/' token ${TOKEN}" >&2\nexit 1\n`, { mode: 0o755 });
     const { r, head, branch } = await approveTask(env, 'task-1');
     expect(r.publication).toMatchObject({ state: 'failed', status: 'blocked', errorCode: 'AUTH_REQUIRED', prUrl: null, merged: false });
     expect(r.publication!.message).not.toContain(TOKEN);
@@ -174,7 +180,7 @@ describe('pull-request delivery', () => {
     expect(env.gh.calls).toHaveLength(0);
     expect(env.backlog.notes.map((n) => n.text).join('\n')).not.toContain(TOKEN);
 
-    env.gitOverride.fn = undefined;
+    rmSync(hook);
     const p = await env.sched.publish('task-1');
     expect(p).toMatchObject({ state: 'published', status: 'delivered', push: 'pushed', pr: 'created' });
     expect(remoteHead(env.bare, branch)).toBe(head);
@@ -536,7 +542,7 @@ describe('publication helpers', () => {
     gitSync(env.layout.repo, 'remote', 'set-url', 'origin', 'https://gitlab.com/acme/demo.git');
     env.backlog.add({ id: 'task-1', title: 'Gitlab' });
     // The pre-claim base sync refuses a non-GitHub origin too; stub it to reach publication.
-    env.sched = new Scheduler({ db: env.db, backlog: env.backlog, config: env.config, layout: env.layout,
+    env.sched = new Scheduler({ db: env.db, backlog: env.backlog, config: env.config, layout: env.layout, gh: (a, o) => env.gh.fn(a, o), serverUrl: env.serverUrl,
       baseSync: async (_repo, base) => ({ base, originRef: `refs/remotes/origin/${base}`, from: null, to: 'x', action: 'up-to-date', method: null }),
       publisher: (input: PublishInput) => publishTask({ ...input, gh: env.gh.fn, tokenFile: env.tokenFile }) });
     const { r } = await approveTask(env, 'task-1');
