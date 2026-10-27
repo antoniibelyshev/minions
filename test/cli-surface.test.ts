@@ -133,7 +133,7 @@ describe('CLI surface (docs/design/cli-surface.md)', () => {
     for (const [args, expected] of [
       [['work', '--help'], ['claim', 'brief', 'submit', 'record', 'release', 'publish', 'approve', 'list', 'spend', 'run', 'probe']],
       [['backlog', '--help'], ['ready', 'list', 'show', 'create', 'update', 'note', 'export']],
-      [['hook', '--help'], ['stop', 'pre-agent', 'pre-telegram', 'pre-bash']],
+      [['hook', '--help'], ['stop', 'pre-agent', 'pre-telegram', 'pre-bash', 'pre-file']],
       [['coordinator', '--help'], ['run', 'sync', 'restart']],
       [['manager', '--help'], ['run']],
       [['workspace', '--help'], ['setup', 'import', 'export']],

@@ -1103,6 +1103,51 @@ Orphan recovery and launch guards, on top of the task-14.4 runner:
   minions failures all exit 2. Variables, aliases, functions and substitutions in command position are out of
   reach of any text check, and a name split by quotes or backslashes inside the word (`mi''nions`) passes the
   pre-filter, so the `work run` gate (L0) keeps its own checks.
+
+### Claude workers and the runtime state
+
+Task-72. Claude subagent workers (engineer, tester, reviewer and project roles) run as the coordinator's uid
+(`node` in the container), and the runtime state is owned by that uid: `minions.db` (0644), `backlog/`,
+`briefs/`, `results/` (0755). The OS therefore lets a worker write the DB, the root of trust of every gate
+(`pr_url`, `origin_repository`, reviewer evidence, approvals, lease bases), and the backlog files. Before
+task-72 nothing else stopped it: the agent definitions only drop the Agent tool, the only worker hook was the
+`work run|claim|release` check, and the container coordinator runs without a Claude Code sandbox. Process
+workers (Codex, Junie) run as a separate uid with the state denied (`containerProtectedPaths`,
+`src/runtime/sandbox/rules.ts`). The plugin now adds three layers for Claude subagents (`agent_id` set in the
+hook input; Claude Code sets it, a worker cannot remove it from its own calls):
+
+- **File tools (`minions hook pre-file`).** `Edit|MultiEdit|Write|NotebookEdit`: every subagent call reaches node,
+  which refuses a target inside the state dir (`src/runtime/state-guard.ts`), checked as written and through
+  symlinks (also a dangling one or a missing tail). `Read|Glob|Grep`: refused for the state dir too (Glob and
+  Grep also for a directory holding it, and an absolute Glob pattern by its fixed prefix); node starts only when
+  the input names `/state` or `MINIONS_STATE_DIR`, so a symlink hiding the path still reads (disclosure, not
+  forgery). Exempt: the scratch root and `<state>/cache` (the host runtime keeps the per-lease scratch dirs and
+  tool caches there). The coordinator is not affected (it writes `<state>/notes`).
+- **Bash (`minions hook pre-bash`).** A subagent command line that names the state dir as an absolute path
+  (configured or resolved, `//state`, `/tmp/../state`, `~/…`) or expands `MINIONS_STATE_DIR` is refused.
+  This is raw text, so a mention in a commit message or grep pattern is refused too (the deny reason says to pass
+  such text through a file: `git commit -F`, or to use the Grep/Write tools). A worker may run only these minions
+  commands: `work brief`, `work submit`, `status`, `backlog ready|list|show|export`, `ci status` and `help`
+  (`WORKER_MINIONS_COMMANDS`); every other registered command (`work record`, `backlog update`, `notify`, `sync`,
+  `workspace state-import`, `pause`, ...) is the coordinator's. A command that points minions at another state
+  dir (`MINIONS_STATE_DIR=<scratch>/state node dist/cli.js …`) is allowed, so a minions checkout can still be
+  exercised; `work run|claim|release` stay refused regardless.
+- **Coordinator settings (container).** `Edit` deny rules for `minions.db*`, `backlog`, `briefs`, `results`
+  and `run` under the state dir (`containerStateDenies`). Rules cannot be scoped per agent, so they bind the
+  coordinator too, which never edits those directly. Not in the host runtime, where an Edit deny is also a
+  sandbox write deny and the sandboxed minions CLI writes its DB.
+
+Residual risk. The file-tool layer is exact. The Bash layer is a text check: a path or command built at run time
+(`d=/sta; sqlite3 ${d}te/minions.db`, `cd /` then `state/…`, a script file or interpreter that computes the
+path, a git hook in the worktree, `mi''nions` past the pre-filter) is out of its reach, and so is the
+`work submit` of another active lease from that lease's worktree (submit checks the cwd against the lease
+worktree; a worker that learns another lease id can `cd` there). A determined worker can therefore still alter
+the DB through Bash. What closes it is OS separation, as for process workers: Claude workers under a uid without
+write access to the state dir (the state owned by a minions uid that only the CLI runs as, e.g. a setuid-free
+`sudo -u minions minions …` wrapper or a small state daemon), or a Claude Code sandbox for subagent Bash with
+`denyWrite` on the state dir. Claude Code applies one sandbox to the whole session, and the coordinator's own
+`minions` calls must write the state, so the latter needs those calls to run unsandboxed (an `excludedCommands`
+entry), which the container runtime does not set up today.
 - **Not here:** a distinct outcome when the lease branch moves during a run (task-14.12).
 
 ### Addendum: child task 4 implementation decisions (task-14.6)

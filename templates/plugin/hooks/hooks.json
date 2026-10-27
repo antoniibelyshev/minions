@@ -17,7 +17,19 @@
       {
         "matcher": "Bash",
         "hooks": [
-          { "type": "command", "command": "i=$(cat) || exit 2; case \"$i\" in *'\"agent_id\"'*) printf '%s' \"$i\" | grep -Eq 'minions[^:]|cli\\.[cm]?js'; m=$?; [ \"$m\" = 1 ] && exit 0; [ \"$m\" = 0 ] || exit 2; printf '%s' \"$i\" | timeout 20 minions hook pre-bash || exit 2;; esac", "timeout": 30 }
+          { "type": "command", "command": "i=$(cat) || exit 2; case \"$i\" in *'\"agent_id\"'*) printf '%s' \"$i\" | grep -Eq 'minions[^:]|cli\\.[cm]?js|/state|MINIONS_STATE_DIR'; m=$?; [ \"$m\" = 1 ] && exit 0; [ \"$m\" = 0 ] || exit 2; printf '%s' \"$i\" | timeout 20 minions hook pre-bash || exit 2;; esac", "timeout": 30 }
+        ]
+      },
+      {
+        "matcher": "Edit|MultiEdit|Write|NotebookEdit",
+        "hooks": [
+          { "type": "command", "command": "i=$(cat) || exit 2; case \"$i\" in *'\"agent_id\"'*) printf '%s' \"$i\" | timeout 20 minions hook pre-file || exit 2;; esac", "timeout": 30 }
+        ]
+      },
+      {
+        "matcher": "Read|Glob|Grep",
+        "hooks": [
+          { "type": "command", "command": "i=$(cat) || exit 2; case \"$i\" in *'\"agent_id\"'*) printf '%s' \"$i\" | grep -Eq '/state|MINIONS_STATE_DIR'; m=$?; [ \"$m\" = 1 ] && exit 0; [ \"$m\" = 0 ] || exit 2; printf '%s' \"$i\" | timeout 20 minions hook pre-file || exit 2;; esac", "timeout": 30 }
         ]
       },
       {
