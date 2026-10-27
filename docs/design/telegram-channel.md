@@ -1,6 +1,7 @@
 # Minions-owned Telegram channel: design
 
-Status: **proposed** (task-67, design only, nothing built). The owner has to agree before any build task starts.
+Status: **agreed** (task-67, design only, nothing built). The owner approved the direction on Telegram (msg 326,
+option 1: own server, start with the spike). Build tasks are filed as task-67.1 to 67.5 (67.1 is the spike).
 It replaces the shipping plan of [telegram-decisions.md](telegram-decisions.md) (task-35, patched fork) and keeps
 that design's UX choice (tap buttons, numbered text as fallback). Facts about the official plugin come from
 [telegram.md](telegram.md) and telegram-decisions.md (both read from `telegram@claude-plugins-official` 0.0.7).
@@ -38,7 +39,14 @@ next to its costs: Bun and npm at start, newest-wins polling, and a patch that h
 features. Re-implementing the gate is small, because minions supports one owner in a DM only. The manager bot
 (task-53.5) already has a reviewed owner-only gate and pairing that we can follow. The official plugin stays
 installed as the **fallback** (see [Launch swap and fallback](#launch-swap-and-fallback)). Upstreaming (task-35.7)
-is dropped. Our server does not depend on it.
+is dropped.
+
+**S3 reversal.** telegram-decisions.md rejected S3 (own plugin from scratch) for upkeep: two gate implementations,
+a new tool prefix, and a shared `bot.pid` protocol. Three things changed. The task-35 patch would have had to grow
+far past "small" to cover reply metadata, quotes, typing and the message map. The fork needs Bun and `bun install`
+at every start. The gate is small (one owner, DM only) and the manager bot already has a reviewed copy. The
+`bot.pid` problem is solved by not using that protocol (coordinator wins, below). The prefix change is one constant
+and is accepted. Our server does not depend on it.
 
 Rejected as well: a sidecar next to the official plugin (it cannot receive, since only one poller is allowed); the
 coordinator calling the Bot API through Bash (it would hold the token).
@@ -95,21 +103,35 @@ context-reset restarts.
   memory. The token travels only in the Bot API URL path. Errors, logs, tool results and notifications never
   contain it (`redact`, as in the manager client).
 - The coordinator model never reads the token. Tool results carry only ids. Residual risk, unchanged and stated as
-  in telegram.md: the read-only mount is still readable from the coordinator's Bash. This is an improvement over
-  today, where the token is in the env of every Bash command and every worker command.
+  in telegram.md: the read-only mount is still readable from the coordinator's Bash, so this is not a security
+  boundary against a coordinator that is determined to read it. It is an improvement over today, where the token is
+  in the env of every Bash command and every worker command.
+- Defence in depth: the generated `--settings` adds `permissions.deny` rules `Read(<token file>)`,
+  `Edit(<token file>)`, `Read(<state>/access.json)` and `Edit(<state>/access.json)` (and the `Write` forms). They
+  stop the model's file tools and a careless prompt. They **do not stop Bash** (`cat`, `sed -i`, `script`), so they
+  are a guard rail, not a boundary, and this doc claims no more.
 
 ### One poller per bot (task-17/51/52)
 
 - **Coordinator wins, strays lose** (the opposite of the official newest-wins rule). The server polls only when all
   of these hold:
-  1. `MINIONS_COORDINATOR_LAUNCH=<launch id>` in its env matches `/state/coordinator-launch.json`;
+  1. `MINIONS_COORDINATOR_LAUNCH=<launch id>` (a **new** env variable set by the wrapper in the generated MCP config;
+     it is an id, not a secret) in its env matches `/state/coordinator-launch.json`;
   2. its nearest `claude` ancestor is the wrapper's direct child (same rule as `checkTelegramPoller`);
   3. it holds `<state>/channel.lock` (`{pid, start}`, the reuse-safe rule of the coordinator lock).
   Otherwise it does not poll. Its tools then return `channel not active in this session`, and it logs why.
-- It never writes `bot.pid`, so a stray official plugin cannot SIGTERM it. On a persistent `409 Conflict` it reads
-  `bot.pid`. If that names a live official `server.ts` that is not under the coordinator claude (the task-51
-  class), it stops that process once and logs it. Otherwise it reports "another process polls this bot". The
-  host-side `bot-guard.ts` (one bot per project, the manager bot distinct) is unchanged.
+- It never writes `bot.pid`, so a stray official plugin cannot SIGTERM it. 409 handling:
+  - **Persistent** means three `409 Conflict` answers in a row to `getUpdates`, with backoff between them (1 s, 2 s,
+    4 s, capped at 30 s, jittered). A single 409 is a race with a dying poller and is only retried.
+  - Then it reads `bot.pid`. It may stop that process only if the pid is alive **and** its argv (from
+    `/proc/<pid>/cmdline`) and start time match an official `server.ts` that is not under the coordinator claude
+    (the task-51 class). The argv check guards against PID reuse: a pid whose command line is something else is
+    never signalled.
+  - **At most one kill per launch.** The count is kept in the server's memory and in the lock file, so a restarted
+    server of the same launch does not kill again. After the kill it waits for the next poll to succeed (same
+    backoff). If 409 continues, or the kill is not allowed, it stops polling and reports "another process polls this
+    bot" in its tool results, the log and `minions status`. It never loops on kills.
+  - The host-side `bot-guard.ts` (one bot per project, the manager bot distinct) is unchanged.
 - `isolation.ts`, `minions status` and doctor `telegram.poller` learn the new lock (`server: minions | official`).
   The recovery hint changes from "/mcp reconnect plugin:telegram:telegram" to "/mcp reconnect minions-telegram"
   when our server is active.
@@ -134,7 +156,9 @@ The trusted parts are the meta keys. The content stays untrusted owner text. `an
 
 ## Outbound tools
 
-All tools check the chat against `access.json` first (same rule as `assertAllowedChat`). `chat_id` is optional and
+All tools check the chat against `access.json` first (a new function, `assertAllowedChat`, in `src/telegram/channel/core.ts`; the name is borrowed from the official
+plugin, and nothing with that name exists in `src` today. It applies the same rule: the chat must be in
+`access.json` `allowFrom`). `chat_id` is optional and
 defaults to the single allowlisted owner DM. Text is plain (no `parse_mode`), cut at 4000 characters with a note.
 
 | Tool | Arguments | Notes |
@@ -160,13 +184,18 @@ before. Plain-language controls are unchanged.
   else is forwarded.
 - Approving a code becomes a **terminal CLI**, because the `/telegram:access` skill belongs to the official plugin:
   `minions telegram access pair <code> | policy allowlist | list | remove <id>` (host-delegated into the container).
-  It refuses without an interactive TTY and asks for a typed confirmation. The coordinator's Bash has no TTY, so a
-  channel message cannot get the model to pair anyone. This reverses telegram.md decision 1 ("minions never
+  It refuses without an interactive TTY and asks for a typed confirmation. That stops the ordinary path (a channel
+  message makes the model run the command without a terminal). It is **not a security boundary**: `script` exists in
+  the container, so the coordinator's Bash can fake a TTY, and `access.json` is writable under `/state` anyway, so
+  the model could edit it directly. Mitigations are the Read/Edit deny rules from
+  [Token isolation](#token-isolation) and the coordinator guidance (never pair, never edit `access.json`). The
+  residual risk is the same as for the token: a coordinator that deliberately works around its guardrails through
+  Bash can change access. This reverses telegram.md decision 1 ("minions never
   writes `access.json`"): minions now owns that file. The atomic 0600 write is the same as the plugin's.
 
 ## Launch swap and fallback
 
-- Config `communication.telegram.server: minions | official` (default `official` until phase 3 flips it).
+- Config `communication.telegram.server: minions | official` (default `official` until phase 4 flips it, after the live check).
   Restart-required, like every Telegram setting.
 - `minions` selected: the wrapper writes the MCP config and adds
   `--mcp-config /state/coordinator-mcp.json --dangerously-load-development-channels <spec>`. It drops
@@ -214,7 +243,7 @@ latest message") is replaced by rules 1 and 3 above. See that doc.
 | 35.1 spike: development channel in a detached coordinator | **Kept, retargeted** as phase 0 (a `--mcp-config` server instead of a fork) |
 | 35.2 fork packaging (`telegram@minions`) | **Superseded**, dropped |
 | 35.3 plugin patch (`ask`, `close_decision`, `decisions.json`, `dec:` callbacks, edit) | **Superseded** by phase 2 (same semantics, `tg_decisions` in the runtime DB instead of `decisions.json`) |
-| 35.4 launch and isolation for the fork | **Superseded** by phase 1 |
+| 35.4 launch and isolation for the fork | **Superseded** by phases 1 (lock, poller rules) and 3 (launch, isolation) |
 | 35.5 coordinator prompt and outbox | **Superseded** by phase 3 |
 | 35.6 opt-in live check | **Superseded** by phase 4 |
 | 35.7 upstream PR (S1) | **Dropped** (optional later, needs owner approval for `external.create`) |
@@ -245,7 +274,9 @@ latest message") is replaced by rules 1 and 3 above. See that doc.
 1. **Bot API client extraction and server core.** Criteria: `src/telegram/bot-api.ts` shared by the manager (its
    tests unchanged and passing); `minions telegram channel serve` with the JSON-RPC handshake, `reply` (with
    `reply_to`, `ref`), inbound text and media with the reply meta, gate and pairing code, `/start` `/help` `/status`,
-   lock and the coordinator-wins rules, token from file only; fake Bot API and fake MCP tests; typecheck and tests
+   lock and the coordinator-wins rules, token from file only; 409 handling (three in a row is persistent, backoff,
+   argv check, at most one kill per launch) with tests: no kill when argv does not match an official `server.ts`
+   (PID reuse), a second 409 run after one kill does not kill again, a single 409 only retries, backoff is bounded; fake Bot API and fake MCP tests; typecheck and tests
    pass. Depends: 0.
 2. **Interactive tools.** Criteria: `ask`, `close_decision`, `edit_message`, `react`, `typing`, files,
    `download_attachment`, permission relay; `tg_messages` and `tg_decisions` migrations; the test cases above.
