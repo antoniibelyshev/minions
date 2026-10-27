@@ -320,6 +320,14 @@ export const MinionsConfigSchema = z.object({
     baseBranch: branchName,
     identity: z.object({ name: nonEmpty, email: nonEmpty }).strict(),
   }).strict(),
+  /**
+   * Unattended delivery (docs/design/bootstrap.md, "Base update and derived approval"; task-68). Unset = the
+   * defaults. `maxBaseUpdatesPerTask`: verified base updates (a behind PR updated by code) per task in any
+   * 24 hours (default 4); 0 turns base updates off.
+   */
+  routine: z.object({
+    maxBaseUpdatesPerTask: z.number().int().min(0).optional(),
+  }).strict().optional(),
   /** Coordinator session settings (src/runtime/coordinator.ts). */
   coordinator: z.object({
     /**

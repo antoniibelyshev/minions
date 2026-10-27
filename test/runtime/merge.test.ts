@@ -409,7 +409,7 @@ describe('merge gate (pure)', () => {
     return c;
   };
   const input = (over: Partial<MergeGateInput> = {}): MergeGateInput => ({
-    config: cfg(), approvedHead: HEAD, reviewed: true, ci: pass,
+    config: cfg(), approvedHead: HEAD, reviewed: true, taskStatus: 'delivered', ci: pass,
     pr: { state: 'OPEN', isDraft: false, headRefOid: HEAD, baseRefName: 'main', isCrossRepository: false },
     paths: { ok: true, changedPaths: ['src/a.ts'], sensitivePaths: [] },
     approval: () => ({ ok: true }), ...over,
@@ -428,6 +428,10 @@ describe('merge gate (pure)', () => {
     waiting({ pr: { ...input().pr, baseRefName: 'dev' } }, /targets dev/);
     waiting({ pr: { ...input().pr, isCrossRepository: true } }, /another repository/);
     waiting({ reviewed: false }, /no reviewer approval/);
+    // The backlog status is required: unknown (the read failed) or not delivered fails closed.
+    waiting({ taskStatus: null }, /task status could not be read/);
+    waiting({ taskStatus: 'changes-requested' }, /the task is changes-requested, not delivered/);
+    for (const s of ['awaiting-ci', 'merging']) expect(evaluateMergeGate(input({ taskStatus: s })).state).toBe('eligible');
     waiting({ ci: { ...pass, state: 'missing', reasons: ['no CI observation'] } }, /CI gate missing/);
     waiting({ paths: { ok: false, message: 'No trustworthy base' } }, /sensitive-path gate: No trustworthy base/);
     const c = cfg(); c.verification.ciAuthority = 'none';
