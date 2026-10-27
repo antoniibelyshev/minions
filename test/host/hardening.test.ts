@@ -69,14 +69,18 @@ describe('host runtime claude launch (H1, M8)', () => {
   it('host: no user/project/local settings, no MCP servers, workspace+state as working dirs, permission mode forced to default', async () => {
     Object.assign(process.env, hostEnv(), { MINIONS_RUNTIME: 'host' });
     const cfg = { ...defaults(), permissionMode: 'acceptEdits' as const, coordinator: { permissionMode: 'auto' as const } };
-    const c = await C.buildClaudeCommand(cfg, runtimePaths(), { permissionModes: ['acceptEdits', 'auto'] });
+    // Claude Code 2.1.292 lists the default mode only as `manual`; older versions list `default`.
+    const c = await C.buildClaudeCommand(cfg, runtimePaths(), { permissionModes: ['acceptEdits', 'auto', 'bypassPermissions', 'manual', 'dontAsk', 'plan'] });
+    const old = await C.buildClaudeCommand(cfg, runtimePaths(), { permissionModes: ['acceptEdits', 'auto', 'default', 'plan'] });
+    expect(old.args[old.args.indexOf('--permission-mode') + 1]).toBe('default');
+    await expect(C.buildClaudeCommand(cfg, runtimePaths(), { permissionModes: ['acceptEdits', 'auto'] })).rejects.toMatchObject({ code: 'INCOMPATIBLE_RUNTIME' });
     expect(c.args).toContain('--setting-sources=');
     expect(c.args).toContain('--strict-mcp-config');
     expect(c.args).not.toContain('--mcp-config');
     const i = c.args.indexOf('--add-dir');
     expect(c.args.slice(i + 1, i + 3)).toEqual([join(env.root, 'ws'), join(env.root, 'state')]);
     expect(c.args[i + 3]!.startsWith('--')).toBe(true); // the variadic --add-dir ends before the next flag
-    expect(c.args[c.args.indexOf('--permission-mode') + 1]).toBe('default');
+    expect(c.args[c.args.indexOf('--permission-mode') + 1]).toBe('manual');
     expect(c.args[c.args.indexOf('--append-system-prompt') + 1]).toMatch(/CLAUDE\.md is not loaded automatically/);
   });
 

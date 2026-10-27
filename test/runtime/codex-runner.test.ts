@@ -160,6 +160,43 @@ describe('work run with the Codex adapter (gate pilot, fake codex)', () => {
     expect(readFileSync(submissionPath(r.paths, b.leaseId), 'utf8')).not.toContain(KEY);
   });
 
+  it('task-14.14: the final message is redacted before submit (key, token shapes), and stays a valid result', async () => {
+    const r = rig();
+    const b = await toGate(r);
+    const gh = 'ghp_abcdefghijklmnopqrstuvwxyz0123456789';
+    const out = await runLease(b.leaseId, r.deps({ result: { summary: `Reviewed with ${KEY}.`, findings: [`env had GH_TOKEN=${gh}`, 'Authorization: Bearer abcdefgh12345678'] } }));
+    expect(out).toMatchObject({ submitted: true, status: 'complete' });
+    const raw = readFileSync(submissionPath(r.paths, b.leaseId), 'utf8');
+    for (const s of [KEY, gh, 'abcdefgh12345678']) expect(raw).not.toContain(s);
+    const s = submitted(r, b);
+    expect(s.summary).toBe('Reviewed with sk-[REDACTED].');
+    expect(s.findings).toEqual(['env had GH_TOKEN=gh*_[REDACTED]', 'Authorization: Bearer [REDACTED]']);
+    expect(await recordSubmitted(r.sched, r.paths, b.leaseId)).toMatchObject({ valid: true, approved: true });
+  });
+
+  it('task-14.14: a spawn secret that matches no redact() shape is masked verbatim in the final message', async () => {
+    const odd = 'odd-shaped-secret-value-7f3a';
+    const r = rig(undefined, odd);
+    const b = await toGate(r);
+    const out = await runLease(b.leaseId, r.deps({ result: { findings: [`saw ${odd} in env`] } }));
+    expect(out).toMatchObject({ submitted: true, status: 'complete' });
+    expect(readFileSync(submissionPath(r.paths, b.leaseId), 'utf8')).not.toContain(odd);
+    expect(submitted(r, b).findings).toEqual(['saw [REDACTED] in env']);
+  });
+
+  it('task-14.14: the prompt words the result like the Claude workers and does not contradict itself', async () => {
+    const r = rig();
+    const b = await toGate(r);
+    const echo = join(r.root, 'echo.json');
+    await runLease(b.leaseId, r.deps({ echo }));
+    const { stdin } = JSON.parse(readFileSync(echo, 'utf8')) as { stdin: string };
+    expect(stdin).toMatch(/your WorkerResult as a single JSON object/);
+    expect(stdin).toMatch(/final message is your result/);
+    expect(stdin).toMatch(/Writing the same object to \$MINIONS_RESULT_FILE is\noptional/);
+    expect(stdin).toMatch(/A result file wins over your final message/);
+    expect(stdin).not.toMatch(/need not write the result file|write exactly one WorkerResult/);
+  });
+
   it('a Codex producer role is refused cleanly (gate plan only), nothing starts', async () => {
     const e = makeDefaultEnv((c) => set(c, {
       harnesses: { codex: CODEX },

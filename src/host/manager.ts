@@ -78,8 +78,8 @@ import { telegramTransport } from './manager-telegram.js';
 import { loadProjectJson, type ProjectJson } from './project.js';
 import { loadRegistry } from './registry.js';
 import { parseStatusEnvelope } from './restart-required.js';
-import { defaultSettingsRuntime, type SettingsRuntime } from './settings-cli.js';
-import { formatValue } from './settings.js';
+import { defaultSettingsRuntime, runtimePaused, type SettingsRuntime } from './settings-cli.js';
+import { formatValue, listSettings, loadSettingsContext, parseSettingValue, planSetting, settingDef, type SettingView } from './settings.js';
 
 export const POLL_INTERVAL_MS = 20_000;
 export const managerLockPath = () => join(managerDir(), 'lock');
@@ -139,6 +139,34 @@ export interface ManagerCommands {
    * runs from a minions source checkout and the project is minions. Elsewhere it is neither advertised nor accepted.
    */
   devRebuild?(projectId: string | null): Promise<boolean>;
+  /**
+   * /settings: every setting of the project (the picked one, or the only registered one) as `minions settings --list`
+   * sees it on the host. Read-only; secrets are only provisioned / missing.
+   */
+  settings?(projectId: string | null): Promise<{ projectId: string; name: string; settings: SettingView[] }>;
+}
+
+/**
+ * A reply to an owner command that is not a failure and needs no offer, for example a /set whose value is already in
+ * effect. Thrown by ManagerCommands.propose before anything is journaled; the transport sends its text as it is.
+ */
+export class ManagerNotice extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ManagerNotice';
+  }
+}
+
+/** The friendly no-op reply of a /set: the current value, its source and the other choices (enum and bool keys). */
+export function unchangedSettingText(view: SettingView): string {
+  const cur = formatValue(view.value);
+  const others = view.type === 'bool' ? [String(view.value !== true)]
+    : view.choices ? [...view.choices, ...(view.optional ? ['default'] : [])].filter((c) => c !== cur) : [];
+  return [
+    `${view.key} is already ${cur} (${view.source}); nothing to change.`,
+    ...(others.length ? [`Other choices: ${others.join(', ')}.`] : []),
+    `Send /settings ${view.key} for how a change takes effect.`,
+  ].join('\n');
 }
 
 /** An owner change command as the transport parsed it (the core validates everything again). */
@@ -768,7 +796,45 @@ export class HostManager {
       pending: (projectId) => this.pendingOffers(projectId),
       propose: (projectId, command) => this.propose(projectId, command),
       devRebuild: (projectId) => this.devRebuild(projectId),
+      settings: (projectId) => this.settingsOf(projectId),
     };
+  }
+
+  /** The project an owner command targets: the picked one, else the only registered one. */
+  private async targetProject(projectId: string | null): Promise<ProjectJson> {
+    if (projectId) return this.deps.loadProject(projectId);
+    const all = await this.deps.projects();
+    if (all.length !== 1) {
+      throw new MinionsError('PRECONDITION', all.length ? `${all.length} projects are registered: pick one with /project <name> first.` : 'No registered projects.');
+    }
+    return all[0]!;
+  }
+
+  /** /settings: the settings list of the target project (the pause flags from the runtime when it answers). */
+  async settingsOf(projectId: string | null): Promise<{ projectId: string; name: string; settings: SettingView[] }> {
+    const project = await this.targetProject(projectId);
+    const ctx = await loadSettingsContext(project, { pausedState: (p) => runtimePaused(p, this.runtime) });
+    return { projectId: project.projectId, name: basename(project.repoPath), settings: listSettings(ctx) };
+  }
+
+  /**
+   * A /set whose value is already in effect, told before any request is minted or journaled (decision: the manager
+   * path checks this itself, so the owner gets an explanation instead of a failed change request; buildPlan keeps
+   * its own check for a race and for container requests). Null when the change is real or the check cannot tell:
+   * every error is left to buildPlan, so its messages stay the same.
+   */
+  private async unchangedNotice(project: ProjectJson, c: Extract<OwnerCommand, { kind: 'config-set' }>): Promise<string | null> {
+    const def = settingDef(c.key);
+    if (!def || def.type === 'secret' || def.type === 'control') return null;
+    try {
+      const ctx = await loadSettingsContext(project);
+      const change = await planSetting(ctx, c.key, parseSettingValue(def, c.value), c.layer);
+      if (change.changed) return null;
+      const view = listSettings(ctx).find((v) => v.key === c.key);
+      return view ? unchangedSettingText(view) : null;
+    } catch {
+      return null;
+    }
   }
 
   /** Whether the dev-only rebuild-cli request exists for the project (or, with null, any registered project). */
@@ -782,14 +848,10 @@ export class HostManager {
    * Without a picked project it needs exactly one registered project.
    */
   async propose(projectId: string | null, c: OwnerCommand): Promise<ManagerOffer> {
-    let project: ProjectJson;
-    if (projectId) project = await this.deps.loadProject(projectId);
-    else {
-      const all = await this.deps.projects();
-      if (all.length !== 1) {
-        throw new MinionsError('PRECONDITION', all.length ? `${all.length} projects are registered: pick one with /project <name> first.` : 'No registered projects.');
-      }
-      project = all[0]!;
+    const project = await this.targetProject(projectId);
+    if (c.kind === 'config-set') {
+      const notice = await this.unchangedNotice(project, c);
+      if (notice) throw new ManagerNotice(notice);
     }
     // Not registered outside a minions source checkout: refused before anything is planned or journaled.
     if (c.kind === 'rebuild-cli' && !devRebuildAvailable(project, this.deps.cli)) throw notAvailable();

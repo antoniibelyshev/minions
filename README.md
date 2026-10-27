@@ -408,7 +408,7 @@ v0.1 supports `local`, `branch`, and `pull-request` delivery, plus opt-in CI-gat
 
 ### CI-gated auto-merge (opt-in)
 
-With `pull-request` delivery you can let minions arm GitHub's native auto-merge (`gh pr merge --auto --<method> --match-head-commit <sha>`) for delivered PRs. It is off by default; turn it on with *Enable auto-merge?* in `minions setup` or `delivery.merge: "auto-when-eligible"`. It also needs required status checks on the base branch, `delivery.requiredChecksConfigured: true`, `verification.ciAuthority: "github"`, and "Allow auto-merge" in the repository settings; `minions doctor` reports `merge.readiness` with the reasons when something is missing.
+With `pull-request` delivery you can let minions arm GitHub's native auto-merge (`gh pr merge --auto --<method> --match-head-commit <sha>`) for delivered PRs. It is off by default; turn it on with *Enable auto-merge?* in `minions setup` or `delivery.merge: "auto-when-eligible"`. It also needs required status checks on the base branch, `delivery.requiredChecksConfigured: true` (`minions settings set delivery.requiredChecksConfigured true` once `minions doctor` reports the checks), `verification.ciAuthority: "github"`, and "Allow auto-merge" in the repository settings; `minions doctor` reports `merge.readiness` with the reasons when something is missing.
 
 The gates run on every `minions sync` (and after `minions work publish`), all for the approved, reviewed head: the PR is open, not a draft, targets the base branch and its head **is** that commit; the reviewer approved it; every required check passed for it (the same fail-closed CI gate the tester/reviewer stages use); and `pr.merge` allows it. `pr.merge` is `ask` in every profile that can merge, so each PR also needs your approval of that exact commit **on the host**: `minions work approve <taskId> --head <sha> --merge` (signed with the host-held key, like publication approvals; an approval recorded inside the container is rejected, and a publication approval is not a merge approval). A sensitive-path change always needs it, even with `pr.merge: "allow"`. Only then is auto-merge armed, and GitHub itself still enforces branch protection when it merges. minions never passes `--admin`, never force-merges, and never merges with failing or missing required checks. If the PR head changes or a gate stops passing, the next sync disables the auto-merge it armed (`--disable-auto`). Task status stays `delivered` while auto-merge is armed and becomes `done` once the PR is merged. The merge runs only through minions' own commands; the coordinator still cannot run `gh pr merge` itself. See [CI-gated auto-merge](docs/design/bootstrap.md#ci-gated-auto-merge).
 
@@ -456,7 +456,7 @@ In the container, the coordinator Claude Code session runs in permission mode **
 { "coordinator": { "permissionMode": "acceptEdits" } }
 ```
 
-`minions coordinator --probe` (and `doctor`) report which mode the launch will use. If the installed Claude Code doesn't offer `--permission-mode auto`, the coordinator falls back to `acceptEdits`, prints why when it starts, and `doctor` shows a warning. A mode change takes effect when the coordinator restarts. The legacy top-level `permissionMode` key now matters only when it is `"default"` (stricter, still honoured). Its old default value `"acceptEdits"` doesn't opt out; use `coordinator.permissionMode` for that. Worker agents are unaffected. The host runtime always uses `default` (see [Running without Docker](#running-without-docker)).
+`minions coordinator --probe` (and `doctor`) report which mode the launch will use. If the installed Claude Code doesn't offer `--permission-mode auto`, the coordinator falls back to `acceptEdits`, prints why when it starts, and `doctor` shows a warning. A mode change takes effect when the coordinator restarts. The legacy top-level `permissionMode` key now matters only when it is `"default"` (stricter, still honoured). Its old default value `"acceptEdits"` doesn't opt out; use `coordinator.permissionMode` for that. Worker agents are unaffected. The host runtime always uses `default` (passed as `manual` where Claude Code lists only that name; it refuses to start when neither is offered; see [Running without Docker](#running-without-docker)).
 
 ### Coordinator startup context
 
@@ -683,7 +683,7 @@ It is never offered with `--yes`, `--config`, `--json`, `--dry-run`, or without 
 
 Guard rails:
 
-- Claude Code runs in permission mode `default`, with bypass mode disabled for the session. Only read-only commands run without asking: `minions doctor|status|auth show|config show|runtime show`, `git remote -v`, `git status`, `git log`, and file reads inside the repository (`Read(//<repo>/**)`, which also covers Glob/Grep there). Reads anywhere else prompt.
+- Claude Code runs in permission mode `default` (passed as `manual` on Claude Code versions that list only that newer name; the assistant does not start if neither is offered), with bypass mode disabled for the session. Only read-only commands run without asking: `minions doctor|status|auth show|config show|runtime show`, `git remote -v`, `git status`, `git log`, and file reads inside the repository (`Read(//<repo>/**)`, which also covers Glob/Grep there). Reads anywhere else prompt.
 - It never asks for a token or key. Credential, runtime and publishing commands (`minions auth ...`, `minions setup github`, `minions runtime set`, `minions start`, `git push`, `open`, `security`, `gh auth token`) are denied to the assistant. You run them yourself with `!` (or in another terminal), so secrets are typed only at minions' hidden prompts.
 - It can't read the minions secret and credential stores (of any project), `~/.ssh`, `~/.aws`, `~/.config/gh`, the Keychains and other host secret dirs, or `.env` files, and can't edit host-side minions files (`project.json`, `defaults.json`, secrets). Changes to the project configuration are shown as a diff first, need your yes, bump `configRevision`, and are validated with `minions config show --explain`.
 
@@ -733,7 +733,7 @@ first or pass `--base-url <url>`. The container reaches the local Central proxy 
 minions auth set helper --refresh-minutes 15 -- /usr/local/bin/print-anthropic-key --profile work
 minions auth set api-key --keychain-service anthropic --keychain-account "$USER"
 minions auth refresh            # re-run the helper / re-read the source now
-minions auth show [--json]      # method, source, masked env, key file status and last refresh; never the key
+minions auth show [--json]      # method, source, masked env, key file status, last refresh and the Codex key status; never a key
 ```
 
 **Global default:** `minions auth set <method> … --global` writes `<MINIONS_HOME>/defaults.json`

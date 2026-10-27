@@ -112,7 +112,7 @@ describe('CI setup plan (printed, never applied)', () => {
     expect(plan).toContain('npm run typecheck; npm test');
     expect(plan).toContain('https://github.com/acme/demo/settings/branches');
     expect(plan).toMatch(/Require status checks to pass/);
-    expect(plan).toMatch(/requiredChecksConfigured to true/);
+    expect(plan).toContain("run `minions settings set delivery.requiredChecksConfigured true`");
     expect(plan).toMatch(/usable for local work and pull-request delivery/);
   });
   it('skips the workflow step when workflows exist, and is empty when checks are required', () => {
@@ -157,7 +157,7 @@ describe('doctor ci.requiredChecks readiness', () => {
 
   it('maps observations to delivery.requiredChecksConfigured and never fails', () => {
     expect(requiredChecksReadiness(cfg(true), rc('configured', ['build']), { onGitHub: true })).toMatchObject({ status: 'ok', detail: expect.stringContaining('build') });
-    expect(requiredChecksReadiness(cfg(false), rc('configured', ['build']), { onGitHub: true })).toMatchObject({ status: 'ok', hint: expect.stringMatching(/to true/) });
+    expect(requiredChecksReadiness(cfg(false), rc('configured', ['build']), { onGitHub: true })).toMatchObject({ status: 'ok', hint: expect.stringContaining('`minions settings set delivery.requiredChecksConfigured true`') });
     const none = requiredChecksReadiness(cfg(false), rc('none', [], 0), { onGitHub: true });
     expect(none).toMatchObject({ status: 'unavailable', detail: expect.stringMatching(/no CI workflows.*usable for local work and pull-request delivery; automatic merge unavailable/) });
     expect(none.hint).toMatch(/Add a CI workflow yourself/);
