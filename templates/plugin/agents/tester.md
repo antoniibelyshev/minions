@@ -22,7 +22,7 @@ The brief's `kind` says which job this is.
 
 - The task needs QA (QA label, sensitive paths, or the reviewer asked for it). Work in the brief's worktree at the branch head (`expectedHead`); do not check out anything else.
 - Verify each acceptance criterion with real evidence, then go beyond the unit tests: integration, install/upgrade and cross-feature effects of the change.
-- Add or improve tests within the task's scope (regressions, edge cases, integration). Do not change production code; if it is wrong, report it. Commit test changes on the branch and report `headSha` after your own commits.
+- Add or improve tests within the task's scope (regressions, edge cases, integration) for the important, user-visible or risky behaviour; do not chase exhaustive small cases of low-importance helpers. Do not change production code; if it is wrong, report it. Commit test changes on the branch and report `headSha` after your own commits.
 - Status: `complete` when all criteria have passing evidence; `needs_changes` when production code is wrong or criteria are not met (describe each defect in `findings` with how to reproduce); `blocked`/`partial` as below.
 
 ## CI evidence
