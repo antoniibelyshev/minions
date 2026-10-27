@@ -48,6 +48,21 @@ describe('risk-based testing in the generated plugin', () => {
     expect(t).not.toMatch(/You run after the engineer and before review/);
   });
 
+  it('QA sweeps include an efficiency pass with severity-tagged findings, focused on what matters', async () => {
+    const t = await (await gen())('agents/tester.md');
+    const sweep = t.slice(t.indexOf('## QA sweep'), t.indexOf('## Task QA'));
+    expect(sweep).toMatch(/efficiency pass over the base: logical inefficiencies \(redundant work, needless I\/O or process spawns, slow paths, duplicated logic\)/);
+    expect(sweep).toMatch(/code-style problems \(dead code, inconsistent idioms, oversized functions\)/);
+    expect(sweep).toMatch(/Report each like other findings, adding `\| where: <file:line> \| severity: high\|medium\|low`/);
+    expect(sweep).toMatch(/do not file nits about low-importance code/);
+    expect(sweep).toMatch(/Do not commit/);
+
+    const coord = await (await gen())('coordinator.md');
+    expect(coord).toMatch(/Every sweep includes an efficiency pass \(logical inefficiencies, code style\) on the same cadence, with no separate role or command; its findings carry a severity/);
+    const orch = await (await gen())('skills/orchestrate/SKILL.md');
+    expect(orch).toMatch(/including the sweep's efficiency-pass findings \(same cadence, no extra role or command\); batch or skip `severity: low` nits/);
+  });
+
   it('coordinator explains the default pipeline, per-task QA opt-in, and when to schedule a QA sweep', async () => {
     const base = defaults();
     const coord = await (await gen())('coordinator.md');
