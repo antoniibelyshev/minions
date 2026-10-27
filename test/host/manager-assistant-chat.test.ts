@@ -262,6 +262,35 @@ describe('plain text goes to the assistant; slash commands never do', () => {
     expect(s.chat.exchanges().at(-1)).toMatchObject({ owner: 'switch to manual merges', proposal: 'set delivery.merge: disabled -> manual', outcome: 'applied' });
   });
 
+  it('an assistant plan that loosens nothing (one a typed command would apply at once, task-78) still waits for a Confirm tap', async () => {
+    const s = await stack({ reply: () => answer('Fewer engineers at once: check the plan below.', { kind: 'config-set', key: 'execution.maxEngineers', value: '1', layer: 'local' }) });
+    const { out, events } = await s.say('only one engineer at a time please');
+    expect(events).toEqual([]);
+    const offer = out[1]!;
+    expect(offer.text).toMatch(/^Proposed by the assistant from your message: request ow_/);
+    expect(offer.text).not.toContain('loosens policy');
+    expect(offerButtons(offer)).toEqual([expect.stringMatching(/^c:ow_/), expect.stringMatching(/^r:ow_/)]);
+    // Not applied, not confirmed, not journaled as typed or direct: only the offer.
+    expect(s.childRuns).toEqual([]);
+    const j = journal();
+    expect(j.map((e) => e.type)).toEqual(['offer']);
+    expect(j[0]).toMatchObject({ request: { via: 'assistant' }, plan: { via: 'assistant', loosens: null } });
+    expect(j[0].typed).toBeUndefined();
+    expect(j[0].direct).toBeUndefined();
+    // Defence in depth: the same plan without via would apply directly if typed; with via it never does.
+    expect(CR.appliesWithoutConfirm(j[0].plan, j[0].request)).toBe(false);
+    const { via: _v, ...plainReq } = j[0].request;
+    const { via: _w, ...plainPlan } = j[0].plan;
+    expect(CR.appliesWithoutConfirm(plainPlan, plainReq)).toBe(true);
+    // One tap (it loosens nothing) confirms it; only then does it apply.
+    const tapped = await s.say(s.tap(offerButtons(offer)[0]!));
+    expect(tapped.events).toEqual([{ type: 'confirm', requestId: j[0].requestId, nonce: expect.stringMatching(/^[0-9a-f]{32}$/) }]);
+    (s.m as unknown as { deps: ManagerDeps }).deps.transport = s.t;
+    await s.m.handle(tapped.events[0] as ManagerEvent);
+    expect(s.childRuns).toHaveLength(1);
+    expect(s.childRuns[0]!.join(' ')).toContain('execution.maxEngineers 1');
+  });
+
   it('an invalid proposal shows the reply and says nothing was planned; approve is refused; nothing is journaled', async () => {
     const s = await stack({ reply: () => answer('Approved!', { kind: 'approve', taskId: 'task-1', head: 'a'.repeat(40), merge: false }) });
     const { out } = await s.say('approve task-1');

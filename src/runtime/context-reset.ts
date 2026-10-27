@@ -22,7 +22,8 @@ import { withOpenRuns } from './runner/record.js';
  *   main-session usage in the transcript the Stop hook recorded), or `handoffs` worker records/releases
  *   happened (also the fallback when no transcript usage is readable). `work record|release` responses
  *   carry `contextReset` only when due; `coordinator handoff --check` and `status` show the full state.
- * - The runtime never restarts the coordinator by itself: the coordinator, told by the response, writes
+ * - The runtime never restarts the coordinator by itself for a reset (the opt-in routine wakes of
+ *   src/runtime/routine.ts are separate): the coordinator, told by the response, writes
  *   the handoff and runs `coordinator restart --recover`, which still refuses while leases are active.
  */
 

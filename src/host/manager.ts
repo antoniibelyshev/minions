@@ -22,8 +22,15 @@
 //   with the printed `settings apply --confirm` command, which uses the same journal).
 // - Owner change commands (task-53.5.3): /set, /sync, /upgrade, /restart and /undo reach the core through
 //   ManagerCommands.propose. The core mints an `ow_` request id, builds the same host plan (buildPlan), journals the
-//   offer and hands it back to the transport, which shows it with Confirm / Reject. Typing the command is never
-//   consent: only the tap (twice for a plan that loosens) applies it, through the same confirmOffer and apply path.
+//   offer and hands it back to the transport, which shows it with Confirm / Reject; the tap (twice for a plan that
+//   loosens) applies it through the same confirmOffer and apply path as a container request.
+//   Owner-typed safe commands (task-78): the Telegram transport sends what the owner typed in the paired private chat
+//   (not forwarded) through ManagerCommands.submit with the message key. When appliesWithoutConfirm holds (owner
+//   request, loosens null, a kind in DIRECT_KINDS, no queued restart mode, an upgrade without --rebuild-cli) the offer
+//   and its `confirmed` entry are journaled as one step under the journal lock (recordOffer, which also refuses a
+//   message key it has seen: a redelivered update is "already handled") and apply() runs at once: the same applying,
+//   outcome and follow-up messages, and a refused /restart still offers Restart when idle / Drain now. Everything else
+//   is offered as before. Container requests and the follow-up offers made here always need the tap.
 //   Owner requests have no runtime row, so nothing is marked for them; a refused one is re-offered from its journaled
 //   snapshot. Every config write the manager applies saves the layer file first (src/host/config-history.ts), so
 //   /undo <id> can restore it while the file is still what that change wrote.
@@ -45,6 +52,12 @@
 //   `minions status` run in fresh processes; when either fails and a backup exists (src/host/cli-backup.ts), a
 //   cli-rollback offer follows (one Confirm reinstalls it). The dev-only rebuild-cli request (src/host/cli-rebuild.ts)
 //   exists only when the host CLI runs from a minions source checkout and the project is minions.
+// - Routine watchdog (task-68.2, docs/design/unattended-delivery.md decision 2): every WATCHDOG_CHECK_MS per running
+//   project, `minions sync --routine --trigger watchdog --json` runs through the delegate in its own lane (5 minute
+//   timeout, never awaited by the poll, at most one per project), so offers are never delayed. The runtime decides:
+//   it runs the pass only when routine.enabled is on and the last pass is older than 2 intervals (the wrapper clock is
+//   not ticking: the coordinator is down or hangs). A coordinator that is not running is reported once ("coordinator
+//   not running since <t>"), with the pass's decision (a crash start, or why none).
 import { open, readFile, rm } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 import type { Command } from 'commander';
@@ -58,11 +71,11 @@ import { procStartTime } from '../runtime/coordinator.js';
 import { isChangeRequestId, type ChangeRequestView } from '../runtime/change-requests.js';
 import { pidAlive } from '../runtime/db.js';
 import {
-  findOfferByNonce, interruptedEntries, isOfferRequestId, isOwnerRequest, lastOutcome, managerDir, newOwnerRequestId, readJournal, recordOutcome, writer, writerAlive,
-  type JournalEntry, type OfferEntry, type OutcomeEntry, type RequestSnapshot,
+  findOfferByNonce, interruptedEntries, isOfferRequestId, isOwnerRequest, lastOutcome, managerDir, newOwnerRequestId, readJournal, recordOffer, recordOutcome,
+  TYPED_KEY_PATTERN, writer, writerAlive, type JournalEntry, type OfferEntry, type OutcomeEntry, type RequestSnapshot,
 } from './change-journal.js';
 import {
-  childUpgrade, confirmOffer, fetchRequests, formatPlan, fromContainerOf, hostCli, mark, offerRequest, planArgv,
+  appliesWithoutConfirm, buildPlan, childUpgrade, confirmOffer, fetchRequests, formatPlan, fromContainerOf, hostCli, mark, offerRequest, planArgv, planDigest,
   recordApplyResult, rejectRequest, RESTART_MODES, snapshotOf, undoDetail, type ChangePlan, type ChangeRequestDeps, type UpgradeRun,
 } from './change-requests.js';
 import { approveOnHost } from './approvals.js';
@@ -87,6 +100,11 @@ import { defaultSettingsRuntime, runtimePaused, type SettingsRuntime } from './s
 import { formatValue, listSettings, loadSettingsContext, parseSettingValue, planSetting, settingDef, type SettingView } from './settings.js';
 
 export const POLL_INTERVAL_MS = 20_000;
+/** How often the watchdog asks a project's runtime for a routine pass (the runtime refuses while the last one is fresh). */
+export const WATCHDOG_CHECK_MS = 5 * 60_000;
+/** Bound of one watchdog pass through the delegate. */
+export const WATCHDOG_TIMEOUT_MS = 5 * 60_000;
+export const WATCHDOG_ARGV = ['minions', 'sync', '--routine', '--trigger', 'watchdog', '--json'] as const;
 export const managerLockPath = () => join(managerDir(), 'lock');
 
 // ---------------------------------------------------------------- transport
@@ -148,6 +166,14 @@ export interface ManagerCommands {
    */
   assistantStatus?(projectId: string | null): Promise<AssistantStatus | null>;
   /**
+   * An owner change command the paired owner typed in the private chat (task-78; only the Telegram transport calls
+   * it, after its owner and forward checks). A plan that loosens nothing and builds or installs no CLI on the host is
+   * journaled as confirmed and applied right away (the outcome messages go through sendOutcome); anything else is
+   * journaled as an offer and returned to be shown with Confirm / Reject. A message key seen before (a redelivered
+   * update) is already handled: nothing runs again. Throws (nothing journaled) when the plan cannot be built.
+   */
+  submit(projectId: string | null, command: OwnerCommand, typed: TypedCommand): Promise<OwnerSubmit>;
+  /**
    * Whether the dev-only /rebuild_cli exists for projectId (or, with null, for any registered project): the host CLI
    * runs from a minions source checkout and the project is minions. Elsewhere it is neither advertised nor accepted.
    */
@@ -191,6 +217,14 @@ export type OwnerCommand =
   /** Dev-only: `minions upgrade --rebuild-cli` with the commit range in the plan (see ManagerCommands.devRebuild). */
   | { kind: 'rebuild-cli' };
 
+/** Where an owner-typed command came from: `telegram:<botId>:<chatId>:<messageId>` (TYPED_KEY_PATTERN), one use only. */
+export interface TypedCommand { key: string }
+
+/** What became of an owner-typed command: shown as an offer, applied right away, or already handled (redelivered). */
+export type OwnerSubmit =
+  | { status: 'offered'; offer: ManagerOffer }
+  | { status: 'applied' | 'already-handled'; requestId: string };
+
 // ---------------------------------------------------------------- deps
 
 export interface ManagerDeps {
@@ -223,6 +257,8 @@ export interface ManagerDeps {
   cliHealth?: (project: ProjectJson) => Promise<CliHealth>;
   /** npm for the CLI roll back (default: run). */
   npm?: Runner;
+  /** The watchdog's routine pass through the delegate (5 minute timeout; default delegateCapture). Unset in tests: no watchdog. */
+  routine?: (project: ProjectJson, argv: string[]) => Promise<RunResult>;
 }
 
 /** A restart confirmed with mode when-idle or drain, waiting in the manager for the first poll without active leases. */
@@ -355,6 +391,9 @@ export class HostManager {
   private readonly unsent = new Set<string>();
   /** Restarts waiting for an idle poll, by project (at most one per project). */
   private readonly queued = new Map<string, QueuedRestart>();
+  /** Watchdog lane: the pass in flight and the time of the last check, by project. */
+  private readonly watchdogRuns = new Map<string, Promise<void>>();
+  private readonly watchdogChecked = new Map<string, number>();
 
   constructor(private readonly deps: ManagerDeps) {
     this.runtime = boundedRuntime(deps);
@@ -423,6 +462,7 @@ export class HostManager {
   /** Reads the project's open requests and offers each one that has no pending offer. Returns the offers sent. */
   async pollProject(project: ProjectJson): Promise<ManagerOffer[]> {
     if (!(await this.deps.running(project))) return [];
+    this.watchdog(project);
     const rows = await fetchRequests(project, this.runtime, false);
     const entries = await readJournal();
     const sent: ManagerOffer[] = [];
@@ -438,6 +478,54 @@ export class HostManager {
       await this.reportOnce(`malformed:${project.projectId}`, { status: 'error', projectId: project.projectId, requestId: null, text: `project ${project.projectId}: ignored ${malformed} malformed change request row(s) in the runtime's answer.` });
     }
     return sent;
+  }
+
+  /**
+   * Starts the project's watchdog pass when its check is due and none is in flight. Never awaited by the poll (its own
+   * lane) and never throws: a failure is reported once.
+   */
+  watchdog(project: ProjectJson): void {
+    const routine = this.deps.routine;
+    if (!routine || this.watchdogRuns.has(project.projectId)) return;
+    const now = this.deps.now().getTime();
+    const last = this.watchdogChecked.get(project.projectId);
+    if (last !== undefined && now - last < WATCHDOG_CHECK_MS) return;
+    this.watchdogChecked.set(project.projectId, now);
+    const id = project.projectId;
+    const p = (async () => {
+      try {
+        const r = await routine(project, [...WATCHDOG_ARGV]);
+        if (r.timedOut) throw new Error(`the routine pass timed out after ${WATCHDOG_TIMEOUT_MS / 60_000} min`);
+        type Envelope = { ok?: boolean; data?: Record<string, unknown>; error?: { message?: unknown } } | null;
+        let env: Envelope = null;
+        try { env = JSON.parse(r.stdout) as Envelope; } catch { env = null; }
+        if (!env || typeof env !== 'object' || !env.data || typeof env.data !== 'object') {
+          throw new Error(`the routine pass gave no readable answer (exit ${r.code})${env?.error?.message ? `: ${displayText(String(env.error.message)).slice(0, 200)}` : ''}`);
+        }
+        this.reported.delete(`watchdog:${id}`);
+        const d = env.data;
+        if (d.ran === true) this.deps.log(`watchdog ${id}: routine pass ran (${displayText(String(d.why ?? '')).slice(0, 200)})`);
+        const c = d.coordinator as { running?: unknown; since?: unknown } | undefined;
+        if (d.skipped === 'disabled' || !c || typeof c.running !== 'boolean') return;
+        if (c.running) { this.reported.delete(`coordinator:${id}`); return; }
+        const since = typeof c.since === 'string' ? displayText(c.since).slice(0, 40) : 'unknown';
+        const decision = d.ran === true ? ` (${displayText(String(d.why ?? '')).slice(0, 300)})` : '';
+        // Keyed by the down-since time: one report per outage, not per pass.
+        if (!this.reported.has(`coordinator:${id}`) || !this.reported.get(`coordinator:${id}`)!.includes(`since ${since}`)) {
+          await this.reportOnce(`coordinator:${id}`, { status: 'error', projectId: id, requestId: null, text: `project ${id}: coordinator not running since ${since}${decision}` });
+        }
+      } catch (e) {
+        await this.reportOnce(`watchdog:${id}`, { status: 'error', projectId: id, requestId: null, text: `project ${id}: watchdog routine pass failed: ${(e as Error).message}` });
+      } finally {
+        this.watchdogRuns.delete(id);
+      }
+    })();
+    this.watchdogRuns.set(id, p);
+  }
+
+  /** Resolves when every watchdog pass in flight has finished (tests; the loop never waits). */
+  async watchdogSettled(): Promise<void> {
+    await Promise.all([...this.watchdogRuns.values()]);
   }
 
   /** No journal entry, or the last one is `failed` (offer again: retry), or an offer whose message was never sent. */
@@ -532,7 +620,7 @@ export class HostManager {
   }
 
   /** Runs the plan stored in the journal (never the container's row) as a host child command, then records the outcome. */
-  private async apply(project: ProjectJson, offer: OfferEntry): Promise<void> {
+  private async apply(project: ProjectJson, offer: OfferEntry, o: { direct?: boolean } = {}): Promise<void> {
     const plan = offer.plan as ChangePlan;
     const ids = { projectId: offer.projectId, requestId: offer.requestId };
     const warnings: string[] = [];
@@ -541,7 +629,12 @@ export class HostManager {
     if (plan.kind === 'restart' && plan.restart) { await this.enqueue(project, offer, plan, warnings); return; }
     const inManager = plan.kind === 'undo' || plan.kind === 'approve' || plan.kind === 'cli-rollback';
     const argv = inManager ? null : planArgv(plan, offer.request);
-    await this.notify({ status: 'applying', ...ids, text: `Applying change request ${offer.requestId} (project ${offer.projectId}): ${planSummary(plan)}…` });
+    await this.notify({
+      status: 'applying', ...ids,
+      text: o.direct
+        ? `Applying your request ${offer.requestId} (project ${offer.projectId}): ${planSummary(plan)}… (typed by you and it loosens nothing, so no Confirm is needed; digest ${offer.digest.slice(0, 12)})`
+        : `Applying change request ${offer.requestId} (project ${offer.projectId}): ${planSummary(plan)}…`,
+    });
     let result: { status: 'applied' | 'failed'; detail: string; refused?: boolean };
     /** Lines after the outcome, and owner offers sent after it (each still needs its own Confirm). */
     const after: string[] = [];
@@ -806,6 +899,7 @@ export class HostManager {
       pending: (projectId) => this.pendingOffers(projectId),
       propose: (projectId, command, opts) => this.propose(projectId, command, opts),
       assistantStatus: (projectId) => this.assistantStatusOf(projectId),
+      submit: (projectId, command, typed) => this.submit(projectId, command, typed),
       devRebuild: (projectId) => this.devRebuild(projectId),
       settings: (projectId) => this.settingsOf(projectId),
     };
@@ -862,6 +956,18 @@ export class HostManager {
     if (opts.via !== undefined && (opts.via !== 'assistant' || !(PROPOSAL_KINDS as readonly string[]).includes(c.kind))) {
       throw new MinionsError('PRECONDITION', `a ${displayText(c.kind)} request is never proposed by the assistant: type the command.`);
     }
+    const { project, req } = await this.ownerRequest(projectId, c, opts);
+    const built = await offerRequest(project, req, this.cr);
+    const o = offerOf(built);
+    this.deps.log(`owner request ${project.projectId} ${req.id}${req.via ? ' (proposed by the assistant)' : ''}: ${o.summary}`);
+    return o;
+  }
+
+  /**
+   * The project an owner command targets and its owner request snapshot (a fresh `ow_` id). A /set of a value already
+   * in effect throws a ManagerNotice instead (no request).
+   */
+  private async ownerRequest(projectId: string | null, c: OwnerCommand, opts: ProposeOptions = {}): Promise<{ project: ProjectJson; req: RequestSnapshot }> {
     const project = await this.targetProject(projectId);
     if (c.kind === 'config-set') {
       const notice = await this.unchangedNotice(project, c);
@@ -871,11 +977,44 @@ export class HostManager {
     if (c.kind === 'rebuild-cli' && !devRebuildAvailable(project, this.deps.cli)) throw notAvailable();
     const payload: Record<string, unknown> = c.kind === 'config-set' ? { key: c.key, value: c.value, layer: c.layer }
       : c.kind === 'undo' ? { target: c.target } : c.kind === 'approve' ? { taskId: c.taskId, head: c.head, merge: c.merge } : {};
-    const req: RequestSnapshot = { id: newOwnerRequestId(), kind: c.kind, payload, reason: null, origin: 'owner', ...(opts.via === 'assistant' ? { via: 'assistant' as const } : {}) };
-    const built = await offerRequest(project, req, this.cr);
-    const o = offerOf(built);
-    this.deps.log(`owner request ${project.projectId} ${req.id}${req.via ? ' (proposed by the assistant)' : ''}: ${o.summary}`);
-    return o;
+    return { project, req: { id: newOwnerRequestId(), kind: c.kind, payload, reason: null, origin: 'owner', ...(opts.via === 'assistant' ? { via: 'assistant' as const } : {}) } };
+  }
+
+  /**
+   * An owner command typed in the paired chat (task-78; the transport passes the chat message it came from). The plan
+   * is built as for propose. When appliesWithoutConfirm says so (an owner plan that loosens nothing and builds or
+   * installs no CLI on the host), its offer and `confirmed` entry are journaled as one locked step and it is applied
+   * here, through the same apply path and outcome messages as a tap; otherwise it is journaled as an offer and
+   * returned for the transport to show (Confirm / Reject, twice when it loosens). A message already journaled (a
+   * redelivered update) is reported as already handled: nothing is planned, offered or applied again.
+   */
+  async submit(projectId: string | null, c: OwnerCommand, typed: TypedCommand): Promise<OwnerSubmit> {
+    if (typeof typed?.key !== 'string' || !TYPED_KEY_PATTERN.test(typed.key)) throw new MinionsError('INTERNAL', 'an owner command without a well-formed chat message key; nothing done.');
+    // Advisory early check (no plan, no dry run for a redelivered message); recordOffer decides under the lock.
+    const seen = (await readJournal()).find((e): e is OfferEntry => e.type === 'offer' && e.typed === typed.key);
+    if (seen) return this.redelivered(seen.projectId, seen.requestId);
+    const { project, req } = await this.ownerRequest(projectId, c);
+    const { plan, notes } = await buildPlan(project, req, this.cr);
+    const digest = planDigest(plan);
+    const direct = appliesWithoutConfirm(plan, req);
+    let offer: OfferEntry;
+    try {
+      offer = await recordOffer({ projectId: project.projectId, request: req, plan, digest, configRevision: plan.configRevision, now: this.deps.now(), typed: typed.key, confirmed: direct });
+    } catch (e) {
+      if (refusalOf(e) !== 'redelivered') throw e;
+      const d = (e as MinionsError).details as { requestId?: string; projectId?: string };
+      return this.redelivered(d.projectId ?? project.projectId, d.requestId ?? req.id);
+    }
+    const o = offerOf({ offer, plan, digest, notes });
+    this.deps.log(`owner request ${project.projectId} ${req.id}${direct ? ' (typed, applied without a tap)' : ''}: ${o.summary}`);
+    if (!direct) return { status: 'offered', offer: o };
+    await this.apply(project, offer, { direct: true });
+    return { status: 'applied', requestId: offer.requestId };
+  }
+
+  private async redelivered(projectId: string, requestId: string): Promise<OwnerSubmit> {
+    await this.notify({ status: 'already-handled', projectId, requestId, text: `your message was already handled as ${requestId} (a redelivered update); nothing was done again.` });
+    return { status: 'already-handled', requestId };
   }
 
   /**
@@ -1094,8 +1233,8 @@ async function defaultCliHealth(project: ProjectJson): Promise<CliHealth> {
 /** After an applied config change: the command that applies what it still needs (each confirmed on its own). */
 function followUp(plan: ChangePlan): string[] {
   if ((plan.kind !== 'config-set' && plan.kind !== 'undo') || !plan.change) return [];
-  if (plan.change.takesEffect === 'restart') return ['next: send /restart here to restart the coordinator (shown as its own plan to confirm)'];
-  if (plan.change.takesEffect === 'upgrade') return ['next: send /upgrade here to recreate the container (shown as its own plan to confirm)'];
+  if (plan.change.takesEffect === 'restart') return ['next: send /restart here to restart the coordinator (graceful: refused while workers are active)'];
+  if (plan.change.takesEffect === 'upgrade') return ['next: send /upgrade here to recreate the container (it runs its dry run first)'];
   return [];
 }
 
@@ -1171,6 +1310,7 @@ export function defaultManagerDeps(transport: ManagerTransport, log: (line: stri
     loadProject: loadProjectJson,
     running: defaultSettingsRuntime.running,
     delegate: (p, argv) => delegateCapture(p, argv),
+    routine: (p, argv) => delegateCapture(p, argv, { timeoutMs: WATCHDOG_TIMEOUT_MS }),
     runChild: (p, argv) => {
       const h = hostCli();
       return run(h.cmd, [...h.args, '--json', ...argv], { cwd: p.repoPath, env: h.env, allowFailure: true, timeoutMs: CHILD_TIMEOUT_MS });
