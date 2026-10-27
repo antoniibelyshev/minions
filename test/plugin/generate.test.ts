@@ -5,7 +5,7 @@ import { join, relative } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 import { generatePlugin, LIVE_CLAUDE_RUN_GUIDANCE, renderPolicySummary, renderTemplate } from '../../src/plugin/generate.js';
 import { DRAIN_HOOK_COMMAND } from '../../src/runtime/drain.js';
-import { PRE_BASH_HOOK_COMMAND } from '../../src/runtime/hooks.js';
+import { PRE_BASH_HOOK_COMMAND, PRE_FILE_READ_HOOK_COMMAND, PRE_FILE_WRITE_HOOK_COMMAND } from '../../src/runtime/hooks.js';
 import type { MinionsConfig } from '../../src/config/schema.js';
 import { defaults, FAKE_MINIONS, runHookCommand } from '../helpers.js';
 
@@ -133,6 +133,9 @@ describe('generatePlugin', () => {
       { matcher: 'Agent', hooks: [{ type: 'command', command: 'timeout 20 minions hook pre-agent || exit 2', timeout: 30 }] },
       // Subagents cannot run minions work run|claim|release (task-14.5); node starts only for subagent calls naming minions.
       { matcher: 'Bash', hooks: [{ type: 'command', command: PRE_BASH_HOOK_COMMAND, timeout: 30 }] },
+      // Subagents cannot write (or read) the runtime state through the file tools (task-72).
+      { matcher: 'Edit|MultiEdit|Write|NotebookEdit', hooks: [{ type: 'command', command: PRE_FILE_WRITE_HOOK_COMMAND, timeout: 30 }] },
+      { matcher: 'Read|Glob|Grep', hooks: [{ type: 'command', command: PRE_FILE_READ_HOOK_COMMAND, timeout: 30 }] },
       // Every tool; gated by a shell test so node starts only while a drain is requested.
       { matcher: '*', hooks: [{ type: 'command', command: DRAIN_HOOK_COMMAND }] },
     ]);
@@ -668,7 +671,7 @@ describe('owner behaviour defaults (task-34)', () => {
 
   it('decisions are asked as numbered polls with the recommended option first and "Other" last', async () => {
     const coord = await (await gen()).read('coordinator.md');
-    expect(coord).toMatch(/Ask decisions as numbered polls: the recommended option first, marked "\(recommended\)", .* "Other" as the last option\. A reply that is only a number answers the latest poll/);
+    expect(coord).toMatch(/Ask decisions as numbered polls: the recommended option first, marked "\(recommended\)", .* "Other" as the last option\. A reply that is only a number answers the latest poll only when exactly one poll is open/);
   });
 
   it('answers on the channel the owner used and handles channel outages', async () => {
@@ -684,7 +687,7 @@ describe('owner behaviour defaults (task-34)', () => {
     const comm = coord.slice(coord.indexOf('## Communicating with the user'));
     expect(comm).toMatch(/\*\*Threads\.\*\* When you answer an owner Telegram message .*pass `reply_to` = that message's `message_id` to `reply`, even when it is the latest message/);
     expect(comm).toContain('End every Telegram message with `ref: #<id>`');
-    expect(comm).toContain('an owner message without a ref answers your latest message or poll');
+    expect(comm).toContain('an owner message with a ref belongs to that thread; one without a ref is a new request or thread; a bare number with no ref answers the latest poll only when exactly one poll is open, otherwise ask which poll it answers');
     expect(comm).toMatch(/Unsolicited notifications \(delivered, blocker\) stay unthreaded unless you know the owner message that requested the work/);
     expect(comm).toMatch(/On an outbox resend, take `reply_to` from the message id the key carries/);
     // The threading rule sits right before the outbox bullet.

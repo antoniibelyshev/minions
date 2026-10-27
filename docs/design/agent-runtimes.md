@@ -217,7 +217,10 @@ hardened helper (D3a), and everything it needs to clean up after a crash is pers
    - Wall-clock limit: `harnesses.<id>.timeoutMinutes`, default 60.
    - Step limit: passed to the harness when it has one (Junie `--max-steps`).
    - Cancel: the runner polls the lease every 5 s. A lease that is no longer active, or a cancel mark in the run
-     record (D3b), means SIGTERM to the wrapper, which stops the whole tree (SIGTERM, SIGKILL after 15 s).
+     record (D3b), means a stop of the process group: SIGINT first (Codex ends its turn gracefully on SIGINT only,
+     U-C4), SIGTERM after 5 s (never more than the kill grace), then SIGKILL after 15 s. The wrapper ignores the
+     SIGINT (the harness gets it directly as a group member) and stops the whole tree on the SIGTERM (SIGTERM,
+     SIGKILL after 15 s). Wall-clock timeout and drain stop the same way.
    - Drain: when the drain marker appears, the runner allows a fixed grace of 120 s (a new optional
      `harnesses.<id>.drainGraceSeconds` if owners need it) and then stops the process.
    - Usage: events are collected from stdout (D6).
@@ -410,7 +413,8 @@ are used when present.
      (started with `setsid`) keeps it. A process-group leader in another session cannot call `setsid` and is
      refused, rather than run in a shared session (see the task-14.3 round-4 addendum).
   2. Fork. The child closes descriptors, installs seccomp, calls `landlock_restrict_self` and execs the harness.
-  3. On SIGTERM (cancel, timeout, drain or runner death): `kill(-pgid, SIGTERM)`, then SIGKILL after 15 s. Then it
+  3. On SIGTERM or SIGHUP (cancel, timeout, drain or runner death): `kill(-pgid, SIGTERM)`, then SIGKILL after
+     15 s. SIGINT does not start this: it is the runner's graceful first step and already reaches the group. Then it
      SIGKILLs and reaps every child until `waitpid` returns `ECHILD`. As subreaper it inherits every orphaned
      descendant, including ones that left the process group with `setsid`, so the loop ends only when the whole tree
      is gone. Then it exits with the harness's status.
@@ -462,7 +466,8 @@ phase 1.
 - read any object in the shared object store by id, other branches included (Claude workers can read the whole
   repository today);
 - read its own harness credential (it is in its environment; mitigated by a scoped key and, for Codex, by
-  `shell_environment_policy` keeping it out of spawned commands; D5);
+  `shell_environment_policy` keeping it out of the environment of spawned commands, which can still read it from
+  `/proc/<harness pid>/environ`; D5);
 - write anything in its own clone, which L4 sanitizes and checks before a fast-forward of its own branch.
 
 ### D5. Credentials
@@ -481,6 +486,14 @@ phase 1.
 - For Codex the adapter sets `shell_environment_policy.inherit = "core"` and
   `shell_environment_policy.ignore_default_excludes = false`, so commands Codex spawns do not inherit `*KEY*`,
   `*SECRET*`, `*TOKEN*` variables [C-config].
+- **The key is readable via `/proc/<pid>/environ` inside the container.** `CODEX_API_KEY` sits in the environment of
+  the `codex` process for the whole run, and Linux exposes it in `/proc/<pid>/environ` to every process with ptrace
+  read access to it. Inside the container that is every process of the same user outside the worker's Landlock
+  domain (Claude workers, the coordinator, a `docker exec` shell), and the commands Codex itself spawns (same
+  domain): `shell_environment_policy` keeps the key out of their own environment, not out of their reach. Only
+  other process workers' domains are kept out (Landlock's ptrace scoping, D4). Accepted risk, the same class as the
+  secrets mount: use a dedicated OpenAI project key with a usage limit (`minions auth codex` says so), and rotate it
+  if a worker may have leaked it. The runner masks the key, and every `redact()` shape, in the result it submits.
 - **Not in phase 1:** login-based auth.
   - Codex "Sign in with ChatGPT" keeps refreshable tokens in `$CODEX_HOME/auth.json` and has to refresh them in
     place [C-auth], [C-noninteractive]. That needs a writable, persistent, per-project volume the worker can't read.
@@ -1103,6 +1116,68 @@ Orphan recovery and launch guards, on top of the task-14.4 runner:
   minions failures all exit 2. Variables, aliases, functions and substitutions in command position are out of
   reach of any text check, and a name split by quotes or backslashes inside the word (`mi''nions`) passes the
   pre-filter, so the `work run` gate (L0) keeps its own checks.
+
+### Claude workers and the runtime state
+
+Task-72. Claude subagent workers (engineer, tester, reviewer and project roles) run as the coordinator's uid
+(`node` in the container), and the runtime state is owned by that uid: `minions.db` (0644), `backlog/`,
+`briefs/`, `results/` (0755). The OS therefore lets a worker write the DB, the root of trust of every gate
+(`pr_url`, `origin_repository`, reviewer evidence, approvals, lease bases), and the backlog files. Before
+task-72 nothing else stopped it: the agent definitions only drop the Agent tool, the only worker hook was the
+`work run|claim|release` check, and the container coordinator runs without a Claude Code sandbox. Process
+workers (Codex, Junie) run as a separate uid with the state denied (`containerProtectedPaths`,
+`src/runtime/sandbox/rules.ts`). The plugin now adds three layers for Claude subagents (`agent_id` set in the
+hook input; Claude Code sets it, a worker cannot remove it from its own calls):
+
+- **File tools (`minions hook pre-file`).** `Edit|MultiEdit|Write|NotebookEdit`: every subagent call reaches node,
+  which refuses a target inside the state dir (`src/runtime/state-guard.ts`), checked as written and through
+  symlinks (also a dangling one or a missing tail). `Read|Glob|Grep`: refused for the state dir too (Glob and
+  Grep also for a directory holding it, and an absolute Glob pattern by its fixed prefix); node starts only when
+  the input names `/state` or `MINIONS_STATE_DIR`, so a symlink hiding the path still reads (disclosure, not
+  forgery). Exempt: the scratch root and, only when that root is inside the state dir (the host runtime keeps the
+  per-lease scratch dirs and tool caches under `<state>/cache`), `<state>/cache`. In the container the scratch
+  root is `/home/node/.cache/tmp`, so `/state/cache` is protected like the rest. An exempt path still counts as
+  state when its real path (symlinks) leads back into the state, and any write target that is a hardlink to a
+  state file (same device and inode; looked up only for a file with more than one link) is refused. The
+  coordinator is not affected (it writes `<state>/notes`).
+- **Bash (`minions hook pre-bash`).** A subagent command line that names the state dir as an absolute path
+  (configured or resolved, `//state`, `/tmp/../state`, `~/…`) or expands `MINIONS_STATE_DIR` is refused.
+  This is raw text, so a mention in a commit message or grep pattern is refused too (the deny reason says to pass
+  such text through a file: `git commit -F`, or to use the Grep/Write tools). The exception is the heredoc body
+  of `minions work submit` (a worker's result, data minions reads on stdin). The exemption is an allowlist and
+  fails closed (`withoutSubmitBodies`): the whole command must be exactly one simple command, `minions work
+  submit <args>` with `minions` bare or `/usr/local/bin/minions` and the args plain words (`[A-Za-z0-9_.:=/-]`,
+  single spaces), followed by one heredoc whose delimiter is a plain quoted word (`'RESULT'` or `"RESULT"`,
+  `[A-Za-z_][A-Za-z0-9_]*`; no backslash, empty, unquoted or `<<-` form), and the command must end at the first
+  line that is exactly the delimiter (one trailing newline allowed). Nothing may precede or follow it: no `;`,
+  `&&`, `|`, redirections, `cd`, function or alias definitions, `env`/`command`/`exec` prefixes, assignments,
+  launchers such as `node dist/cli.js`, subshells or groups. With a quoted delimiter the shell expands nothing and
+  joins no backslash-newlines, so the body runs nothing. The head line is still checked; any other form gets the
+  full check (false refusals are accepted; the deny reason names the accepted form and the
+  `minions work submit … < <scratch file>` route, which the check allows). A state-dir path into an exempt subtree is resolved like in the file tools. A worker may run only these minions
+  commands: `work brief`, `work submit`, `status`, `backlog ready|list|show|export`, `ci status` and `help`
+  (`WORKER_MINIONS_COMMANDS`); every other registered command (`work record`, `backlog update`, `notify`, `sync`,
+  `workspace state-import`, `pause`, ...) is the coordinator's. A command that points minions at another state
+  dir (`MINIONS_STATE_DIR=<scratch>/state node dist/cli.js …`) is allowed, so a minions checkout can still be
+  exercised; `work run|claim|release` stay refused regardless.
+- **Coordinator settings (container).** `Edit` deny rules for `minions.db*`, `backlog`, `briefs`, `results`
+  and `run` under the state dir (`containerStateDenies`). Rules cannot be scoped per agent, so they bind the
+  coordinator too, which never edits those directly. Not in the host runtime, where an Edit deny is also a
+  sandbox write deny and the sandboxed minions CLI writes its DB.
+
+Residual risk. The file-tool layer is exact. The Bash layer is a text check: a path or command built at run time
+(`d=/sta; sqlite3 ${d}te/minions.db`, `cd /` then `state/…`, a script file or interpreter that computes the
+path, a git hook in the worktree, a `minions` function or alias planted in a shell profile the Bash tool sources,
+`mi''nions` past the pre-filter, a path outside the state dir such as the
+container scratch dir that a link created that way makes point back into it) is out of its reach, and so is the
+`work submit` of another active lease from that lease's worktree (submit checks the cwd against the lease
+worktree; a worker that learns another lease id can `cd` there). A determined worker can therefore still alter
+the DB through Bash. What closes it is OS separation, as for process workers: Claude workers under a uid without
+write access to the state dir (the state owned by a minions uid that only the CLI runs as, e.g. a setuid-free
+`sudo -u minions minions …` wrapper or a small state daemon), or a Claude Code sandbox for subagent Bash with
+`denyWrite` on the state dir. Claude Code applies one sandbox to the whole session, and the coordinator's own
+`minions` calls must write the state, so the latter needs those calls to run unsandboxed (an `excludedCommands`
+entry), which the container runtime does not set up today.
 - **Not here:** a distinct outcome when the lease branch moves during a run (task-14.12).
 
 ### Addendum: child task 4 implementation decisions (task-14.6)
@@ -1124,9 +1199,9 @@ worker; needs `codex` on PATH and `CODEX_API_KEY`; model from `MINIONS_LIVE_CODE
   `strict: true`, so a completed turn's final message conforms. The runner judges the result, not the exit code: no
   object result means a synthesized `blocked` result with the redacted stderr tail.
 - U-C4: only SIGINT is handled (it interrupts the turn gracefully). SIGTERM kills at once: complete JSONL lines are
-  already out, but the `-o` file is not written. The runner still stops workers with SIGTERM, then SIGKILL; the
-  final message is taken from the JSONL `agent_message` event, so `-o` is only a debugging copy. Follow-up: send
-  SIGINT before SIGTERM for Codex.
+  already out, but the `-o` file is not written. Since task-14.14 the runner stops workers with SIGINT, then
+  SIGTERM after 5 s, then SIGKILL (D3.6); the final message is still taken from the JSONL `agent_message` event, so
+  `-o` is only a debugging copy.
 - U-C5: `exec` forces `approval_policy = never` and rejects approval and `request_user_input` requests; it never
   blocks. `codex exec` has no `--ask-for-approval` flag in 0.164 (clap would refuse it), so the adapter omits it;
   the generated config repeats `approval_policy = "never"`.
@@ -1158,11 +1233,17 @@ worker; needs `codex` on PATH and `CODEX_API_KEY`; model from `MINIONS_LIVE_CODE
 - **Role prompts.** The project prompt of a process role is part of the worker instructions: inline `promptText`,
   else the copy the host generates into the plugin's `harness-prompts/<role>.md` (`RunnerDeps.rolePromptDir`). A
   missing copy fails the run (a synthesized `blocked` result).
-- **SIGINT note.** See U-C4: the runner does not send SIGINT yet.
+- **Result wording.** The prompt calls the result "your WorkerResult as a single JSON object", as the Claude worker
+  definitions do. The runner's instructions ask for it in `$MINIONS_RESULT_FILE`; the Codex preamble makes the final
+  message the result and the file optional (a result file wins over the final message). Neither runs `minions work
+  submit`: the runner submits by proxy, after `redact()` and masking the spawn secrets verbatim (task-14.14).
+- **SIGINT.** See U-C4: SIGINT first, SIGTERM after 5 s, then SIGKILL (task-14.14).
 - **Credential.** `minions auth codex` stores an OpenAI API key (kind `codex`, file `codex-api-key`); the runner
-  reads it into `CODEX_API_KEY` at spawn, never into argv. `redact` masks `sk-...` keys. Risk: like the GitHub token,
-  the file in the secrets mount is readable by Claude workers in the container; only process workers are kept out
-  of it, by L1.
+  reads it into `CODEX_API_KEY` at spawn, never into argv. The key check refuses `sk-ant-` (Anthropic) keys, which
+  also match the `sk-` shape. `minions auth show` reports its status (`codex`: presence, format and file mode; never
+  the key). `redact` masks `sk-...` keys. Risk: like the GitHub token, the file in the secrets mount is readable by
+  Claude workers in the container; only process workers are kept out of it, by L1. While Codex runs, the key is
+  also readable from `/proc/<pid>/environ` (D5).
 
 **Pinned install: approved and done in task-14.15** (owner, 2026-10-26), exactly as proposed below. The Dockerfile was
 not changed by this task (infrastructure change). The proposal: add `ARG CODEX_VERSION=0.164.0` and install `"@openai/codex@${CODEX_VERSION}"` in the same `npm install -g`

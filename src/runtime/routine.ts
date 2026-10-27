@@ -253,9 +253,9 @@ export interface RoutinePassDeps {
   /** An upgrade the host is applying (it starts the coordinator itself): treated like a drain. */
   upgradeInProgress?: () => string | null;
   /** Phase 4: whether a digest is due (src/runtime/digest.ts digestStatus; the detail line), else null. Default: never. */
-  digestDue?: () => string | null;
+  digestDue?: (now: Date) => string | null;
   /** Phase 4: the outbox hold-back (reholdExpired): held items stay for the digest (routine off: released); returns the count. */
-  holdBack?: () => number;
+  holdBack?: (now: Date) => number;
   mtime?: (path: string) => number | null;
   /** The fresh wake: `coordinator restart --wake` detached, never with force (scheduleDetachedRestart). */
   wake: () => Promise<string>;
@@ -311,7 +311,7 @@ export async function runRoutinePass(deps: RoutinePassDeps, opts: { trigger: Rou
   if (!settings.enabled && opts.trigger !== 'manual') {
     // Routine off: no digest is coming, so items held for it are released here too (as in `notify pending`).
     let reheld: number | undefined;
-    if (deps.holdBack) { try { reheld = deps.holdBack(); } catch { /* never stops the pass */ } }
+    if (deps.holdBack) { try { reheld = deps.holdBack(now); } catch { /* never stops the pass */ } }
     return { ...base, ran: false, skipped: 'disabled', why: 'routine.enabled is off', ...(reheld ? { reheld } : {}) };
   }
   const age = minutesSince(now, lastAt);
@@ -330,7 +330,7 @@ export async function runRoutinePass(deps: RoutinePassDeps, opts: { trigger: Rou
     const report: RoutineReport = { ...base, ran: true, why: '' };
     try { report.sync = await deps.sync(); } catch (e) { report.syncError = msg(e); }
     // With the routine on it keeps held items for the digest; off (a manual pass), it releases them.
-    if (deps.holdBack) { try { report.reheld = deps.holdBack(); } catch { /* the hold-back never stops the pass */ } }
+    if (deps.holdBack) { try { report.reheld = deps.holdBack(now); } catch { /* the hold-back never stops the pass */ } }
     // The sync may have changed what the coordinator sees (merged, imported, CI): read the state after it.
     const c = await deps.coordinator();
     report.coordinator = coordinatorLine(c);
@@ -338,7 +338,7 @@ export async function runRoutinePass(deps: RoutinePassDeps, opts: { trigger: Rou
     let next: Pick<NextReport, 'runnable'> | null = null;
     try { next = await deps.next(); } catch { next = null; }
     const reasons = settings.enabled && c.running ? collectWakeReasons(deps.db, next, since) : [];
-    const digest = settings.enabled ? deps.digestDue?.() ?? null : null;
+    const digest = settings.enabled ? deps.digestDue?.(deps.now()) ?? null : null;
     if (digest) reasons.push({ kind: 'digest', detail: digest });
     const day = localDayStart(deps.now(), settings.timezone);
     const wakes = deps.db.eventsOfKindSince(WAKE_EVENT, day);

@@ -501,7 +501,11 @@ describe('minions setup and uninstall: host manager service', () => {
       return { code: 0, stdout: '', stderr: '' };
     };
     const home = join(env.root, 'userhome');
-    return { calls, home, managerService: { platform, home, runner, uid: 501, user: null, program: ['/usr/bin/env', 'node', '/opt/cli.js', 'manager', 'run'] } };
+    // The unit goes to $XDG_CONFIG_HOME/systemd/user when it is set (GitHub runners set it to ~/.config of the
+    // real user): the fake home only holds the unit with the installing shell's XDG_CONFIG_HOME unset.
+    const shellEnv: NodeJS.ProcessEnv = { ...process.env };
+    delete shellEnv.XDG_CONFIG_HOME;
+    return { calls, home, managerService: { platform, home, env: shellEnv, runner, uid: 501, user: null, program: ['/usr/bin/env', 'node', '/opt/cli.js', 'manager', 'run'] } };
   }
   const svcStep = (r: { steps: { id: string }[] }) => r.steps.find((s) => s.id === 'service');
 
@@ -691,7 +695,7 @@ describe('doctor manager.* checks', () => {
   it('runDoctor (doctor and status --check) includes the manager checks and they never change healthy', async () => {
     const opts = { cwd: env.root, probe: dockerUp, runner: recorder().runner, platform: 'darwin' as const };
     const before = await runDoctor(opts);
-    expect(before.checks.filter((x) => x.name.startsWith('manager.')).map((x) => x.name)).toEqual(['manager.token', 'manager.bot', 'manager.pairing', 'manager.service', 'manager.process']);
+    expect(before.checks.filter((x) => x.name.startsWith('manager.')).map((x) => x.name)).toEqual(['manager.token', 'manager.bot', 'manager.pairing', 'manager.assistant', 'manager.service', 'manager.process']);
     await M.provisionManagerToken({ token: MGR });
     writeFileSync(managerPaths().accessJson, 'garbage');
     const after = await runDoctor(opts);

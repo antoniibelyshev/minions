@@ -4,6 +4,8 @@ import { chmodSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'nod
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+// Secrets modes under the default (owner) access, whoever runs the suite: see pin-secrets-access.ts.
+vi.mock('../../src/host/secrets-access.js', async (orig) => (await import('./pin-secrets-access.js')).pinOwnerAccess(await orig()));
 vi.mock('../../src/plugin/generate.js', async () => {
   const { mkdir, writeFile } = await import('node:fs/promises');
   const { join: j } = await import('node:path');
@@ -173,6 +175,30 @@ describe('key sources', () => {
     expect(e.message).toMatch(/exited with code 3/);
     expect(JSON.stringify(e)).not.toContain(KEY);
     expect(e.message).not.toContain(KEY);
+  });
+});
+
+describe('auth show: Codex key status (task-14.14)', () => {
+  it('reports codexCredentialStatus for the project (missing, then ok), never the key; null for --global', async () => {
+    const prev = process.env.MINIONS_CREDENTIAL_STORE;
+    process.env.MINIONS_CREDENTIAL_STORE = 'file';
+    try {
+      const repo = makeRepo(env.root);
+      const id = (await init(repo)).plan.projectId;
+      const before = await runAuthShow({}, { cwd: repo });
+      expect(before.codex).toMatchObject({ state: 'missing' });
+      expect(formatAuthShow(before)).toMatch(/OpenAI API key \(Codex\): missing .*minions auth codex/);
+      const codexKey = 'sk-proj-AuthShowCodexKey0123456789abcdefABCDEF';
+      const { provisionCodexKey } = await import('../../src/host/credentials.js');
+      await provisionCodexKey({ projectId: id, token: codexKey, repoPath: repo });
+      const after = await runAuthShow({}, { cwd: repo });
+      expect(after.codex).toMatchObject({ state: 'ok', backend: 'file' });
+      expect(formatAuthShow(after)).toMatch(/OpenAI API key \(Codex\): ok — stored in/);
+      for (const text of [JSON.stringify(after), formatAuthShow(after)]) expect(text).not.toContain(codexKey);
+      expect((await runAuthShow({ global: true }, { cwd: repo })).codex).toBeNull();
+    } finally {
+      if (prev === undefined) delete process.env.MINIONS_CREDENTIAL_STORE; else process.env.MINIONS_CREDENTIAL_STORE = prev;
+    }
   });
 });
 

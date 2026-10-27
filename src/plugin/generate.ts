@@ -262,7 +262,7 @@ function decisionGuidance(): string {
   return [
     'Ask the user only about high-level decisions: product scope and goals, architecture direction, security/privacy trade-offs, anything outward-facing that the policy does not already allow, and every approval the policy requires. ' + ASK_GATED,
     'Make lower-level decisions yourself within the task\'s scope and policy: task splits, follow-up tasks, model and effort choice, test fixes, implementation approach, review nits, ordering and retries. Record each meaningful one as a backlog note (`minions backlog note <taskId>`) or a decision file (`/minions:maintain-context`) with a short reason; do not ask about it or report it separately.',
-    'Ask decisions as numbered polls: the recommended option first, marked "(recommended)", then the alternatives, and "Other" as the last option. A reply that is only a number answers the latest poll. Use a poll for every real choice you put to the user.',
+    'Ask decisions as numbered polls: the recommended option first, marked "(recommended)", then the alternatives, and "Other" as the last option. A reply that is only a number answers the latest poll only when exactly one poll is open and it carries no ref; otherwise ask which poll it answers. Use a poll for every real choice you put to the user.',
   ].join('\n\n');
 }
 
@@ -287,7 +287,7 @@ function spendGuidance(cfg: MinionsConfig): string {
 function permissionModeGuidance(cfg: MinionsConfig): string {
   const mode = configuredPermissionMode(cfg);
   if (mode === 'auto') {
-    return '**Permission mode.** The coordinator is launched in `auto` by default (`coordinator.permissionMode`); the host runtime always uses `default`, and older Claude Code falls back to `acceptEdits`. Outside `auto`, commands beyond the allow list ask. The deny and ask rules and this policy apply in every mode.';
+    return '**Permission mode.** The coordinator is launched in `auto` by default (`coordinator.permissionMode`); the host runtime always uses `default` (`manual` on Claude Code that lists only that name), and older Claude Code falls back to `acceptEdits`. Outside `auto`, commands beyond the allow list ask. The deny and ask rules and this policy apply in every mode.';
   }
   return `**Permission mode.** This project runs the coordinator in \`${mode}\` permission mode: commands outside the allow list ask for approval, so keep to the \`minions\` helpers and plain git.`;
 }
@@ -360,7 +360,7 @@ function telegramGuidance(cfg: MinionsConfig): string {
 function threadingGuidance(): string {
   return [
     '**Threads.** When you answer an owner Telegram message (acknowledgement, answer, requested status, control outcome), pass `reply_to` = that message\'s `message_id` to `reply`, even when it is the latest message.',
-    'End every Telegram message with `ref: #<id>` (the task id, or a short topic) so the owner can reply in-thread; an owner message without a ref answers your latest message or poll.',
+    'End every Telegram message with `ref: #<id>` (the task id, or a short topic) so the owner can reply in-thread; an owner message with a ref belongs to that thread; one without a ref is a new request or thread; a bare number with no ref answers the latest poll only when exactly one poll is open, otherwise ask which poll it answers.',
     'Unsolicited notifications (delivered, blocker) stay unthreaded unless you know the owner message that requested the work; then reply to that one.',
     'On an outbox resend, take `reply_to` from the message id the key carries (`goal-ack:<message_id>`, `status:<message_id>`).',
   ].join(' ');
@@ -479,7 +479,7 @@ function processRunGuidance(cfg: MinionsConfig): string {
     `1. Claim as above, then run \`launch.command\` with \`<leaseId>\` replaced by the claimed lease (${code(RUN_COMMAND_TEMPLATE)}) through Bash with \`run_in_background: true\`, from the repository (the runner refuses to start inside a lease worktree). No Agent call, model or prompt: model and effort come from the config (\`launch.model\`, \`launch.effort\`), and the worker gets only the brief and its role prompt. Put anything it must know into the task or a backlog note before the claim.`,
     '2. Do not poll or wait in a loop: the background task notification wakes you when the runner exits (at the latest after the harness wall clock, `harnesses.<id>.timeoutMinutes`, default 60). Meanwhile dispatch other work as usual. A lease runs at most once: never start `work run` again for the same lease.',
     '3. The runner prints one JSON line: `{leaseId, exit, submitted, status, violations, usage, wipCommit, head, error?}`.',
-    '   - `submitted: true`: record with `minions work record <leaseId> --submitted --json`, without `--usage` (the runner already recorded the usage; a coordinator figure would replace it), then follow the next step (step 6) as for any worker.',
+    '   - `submitted: true`: record with `minions work record <leaseId> --submitted --json`, without `--usage` (the runner already recorded the usage; a coordinator figure would replace it), then follow the next step (step 6) as for any worker. `minions work advance <leaseId> --json` (also without `--usage`) records the same way and claims the next stage in one call (step 5).',
     '   - `violations` not empty: the result is `blocked` with `harness-violation:` findings and nothing was fetched. Record it, tell the owner (a security event: the worker tried to leave its sandbox or break its branch rule) and do not run that role again until the owner has looked.',
     '   - An error envelope (`ok: false`: the launch gate refused, e.g. `PRECONDITION` for the host runtime, a failed sandbox self-test or a missing key, `POLICY_DENIED` for a drain, the budget or a second run) or `submitted: false` with `error`: nothing was submitted. Release the lease (`minions work release <leaseId> --reason "<error>" --json`) and report the reason. A `blocked` result whose findings name the exit status usually means the harness could not start (its CLI is not installed in the runtime image). The owner fixes these on the host (install the harness, `minions auth codex` for the key); do not retry until then.',
     '   - Invalid result (`valid: false`): there is no live worker to correct. Send no correction and do not run it again: release the lease with the errors as the reason and claim the stage again (a new attempt), or report it when it repeats.',

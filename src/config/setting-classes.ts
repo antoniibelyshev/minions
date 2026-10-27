@@ -44,6 +44,9 @@ export const KEY_CLASSES: readonly KeyClass[] = [
   ...entries(['routine.autoPromote'], 'live', true, 'caps on the coordinator promoting its own ideas, enforced by `backlog update|create`'),
   ...entries(['intake.github.readyLabels'], 'live', true, 'imported issues with these labels start ready without a model or the owner'),
   ...entries(['routine.enabled'], 'live', true, 'lets the runtime start coordinator sessions on its own (wakes, crash starts: model spend)'),
+  // ---- live, host-owned
+  ...entries(['delivery.requiredChecksConfigured'], 'live', true,
+    'the merge gate (autoMergeConfigReasons) reads it on each sync / publish; it gates what merges on GitHub'),
   // ---- restart
   ...entries(['execution.attemptMaxTurns'], 'restart', false, 'written into the agent definitions (plugin)'),
   ...entries(['budgets'], 'restart', false, 'prompt text only (not enforced in v0.1)'),

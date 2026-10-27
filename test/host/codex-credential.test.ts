@@ -1,6 +1,8 @@
 // task-14.6: the `codex` credential kind (an OpenAI API key for Codex process workers, agent-runtimes D5).
 import { chmodSync, readFileSync, statSync, writeFileSync } from 'node:fs';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+// Secrets modes under the default (owner) access, whoever runs the suite: see pin-secrets-access.ts.
+vi.mock('../../src/host/secrets-access.js', async (orig) => (await import('./pin-secrets-access.js')).pinOwnerAccess(await orig()));
 import * as C from '../../src/host/credentials.js';
 import { CONTAINER, projectPaths } from '../../src/core/paths.js';
 import { makeRepo, withHome } from './fixtures.js';
@@ -59,6 +61,23 @@ describe('codex credential kind', () => {
     await C.removeCodexKey(ID);
     expect((await C.codexCredentialStatus(ID)).state).toBe('missing');
     expect(JSON.stringify(s)).not.toMatch(/sk-proj/);
+  });
+
+  it('task-14.14: refuses an Anthropic (sk-ant-) key, which also matches the sk- shape, without echoing it', async () => {
+    const ant = 'sk-ant-api03-AbcdefghijklmnopqrstuvwxyzABCDEF0123456789';
+    let msg = '';
+    try { C.checkOpenAiKeyFormat(ant); } catch (e) { msg = `${(e as Error).message} ${(e as { hint?: string }).hint ?? ''}`; }
+    expect(msg).toMatch(/Anthropic API key/);
+    expect(msg).not.toContain(ant);
+    const repo = makeRepo(env.root);
+    await expect(C.provisionCodexKey({ projectId: ID, token: ant, repoPath: repo })).rejects.toMatchObject({ code: 'INVALID_CONFIG' });
+    expect((await C.loadCredentialRefs(ID)).codex).toBeUndefined();
+    // One stored by an older build is reported as invalid.
+    await C.provisionCodexKey({ projectId: ID, token: KEY, repoPath: repo });
+    writeFileSync(new C.FileStore(C.CODEX_CREDENTIAL).path(ID), ant + '\n');
+    const s = await C.codexCredentialStatus(ID);
+    expect(s).toMatchObject({ state: 'invalid', detail: expect.stringMatching(/not an OpenAI API key/) });
+    expect(JSON.stringify(s)).not.toContain(ant);
   });
 
   it('refuses a malformed key before storing anything', async () => {

@@ -7,6 +7,9 @@ Everything marked **verified** was observed on Claude Code 2.1.292 in a Linux co
 2026-10-19 or read from the sources below. Everything marked **unknown** is listed in
 [Unknowns and fallbacks](#unknowns-and-fallbacks) and is not assumed.
 
+Planned replacement: [telegram-channel.md](telegram-channel.md) (task-67, proposed) designs a minions-owned channel
+server (reply metadata, tap-button decisions, edits, files, typing) with this official plugin kept as the fallback.
+
 ## Sources consulted (2026-10-19)
 
 Official documentation:
@@ -283,7 +286,7 @@ Implemented in `src/runtime/outbox.ts` (transport-agnostic) with the `minions no
   undelivered item from the terminal), so nothing is lost if Telegram is never restored.
 - Semantics: at least once per key. A crash between `reply` and `ack` can repeat that one message; nothing else repeats.
 - Threading (task-58): answers to an owner message pass `reply_to` = its `message_id`; every message ends with
-  `ref: #<id>` (task id or topic), and an owner message without a ref answers the coordinator's latest message or poll.
+  `ref: #<id>` (task id or topic), and an owner message with a ref belongs to that thread, one without a ref is a new request or thread, and a bare number with no ref answers the latest poll only when exactly one poll is open (otherwise the coordinator asks which).
   Unsolicited notifications stay unthreaded unless the requesting message is known. The outbox stores no reply-to
   column: a resend takes it from the key (`goal-ack:<message_id>`, `status:<message_id>`), which avoids a schema change.
 

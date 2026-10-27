@@ -226,6 +226,31 @@ describe('settings set: what took effect now vs needs a restart or an upgrade (t
   });
 });
 
+describe('settings set delivery.requiredChecksConfigured (task-79)', () => {
+  it('is listed under Delivery as a live, host-owned bool; turning it on loosens (needs --yes) and takes effect now; off needs no confirmation', async () => {
+    const { repo, local } = await install();
+    const list = envelope((await cli(repo, ['settings', '--list', '--json'])).out).data as { settings: Record<string, unknown>[] };
+    expect(list.settings.find((s) => s.key === 'delivery.requiredChecksConfigured')).toMatchObject({ group: 'Delivery', type: 'bool', value: false,
+      apply: 'live', class: 'live', hostOwned: true, needsRestart: false, canLoosen: true });
+
+    const refused = await cli(repo, ['settings', 'set', 'delivery.requiredChecksConfigured', 'true', '--json']);
+    expect(refused.code).not.toBe(0);
+    expect(envelope(refused.out).error).toMatchObject({ code: 'POLICY_DENIED' });
+    expect(envelope(refused.out).error!.message).toMatch(/auto-merge may arm for pull requests once their required checks pass/);
+
+    const on = envelope((await cli(repo, ['settings', 'set', 'delivery.requiredChecksConfigured', 'true', '--yes', '--json'])).out);
+    expect(on.ok).toBe(true);
+    expect(on.data).toMatchObject({ key: 'delivery.requiredChecksConfigured', from: false, to: true, written: true, class: 'live', hostOwned: true,
+      takesEffect: 'now', needsRestart: false, loosens: expect.stringMatching(/auto-merge may arm/) });
+    expect(JSON.parse(readFileSync(local, 'utf8')).delivery).toEqual({ requiredChecksConfigured: true });
+
+    // Turning it off tightens: no confirmation needed.
+    const off = envelope((await cli(repo, ['settings', 'set', 'delivery.requiredChecksConfigured', 'false', '--json'])).out);
+    expect(off.data).toMatchObject({ from: true, to: false, written: true, loosens: null });
+    expect(JSON.parse(readFileSync(local, 'utf8')).delivery).toEqual({ requiredChecksConfigured: false });
+  });
+});
+
 describe('settings change requests on the host CLI (task-53.3)', () => {
   it('set --expect-revision: a stale revision is refused with CONFLICT (exit 4) and writes nothing; the current one writes', async () => {
     const { repo, local } = await install();
