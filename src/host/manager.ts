@@ -151,8 +151,8 @@ export interface ManagerCommands {
   projects(): Promise<{ projectId: string; name: string }[]>;
   /** Plain text: per project (or only projectId), runtime, coordinator, active leases, pending change requests. */
   status(projectId: string | null): Promise<string>;
-  /** The offers still waiting for the owner (newest journal entry is the offer), oldest first. */
-  pending(projectId: string | null): Promise<ManagerOffer[]>;
+  /** The offers still waiting for the owner (newest journal entry is the offer), oldest first. `entries`: a journal read the caller already made (one read per assistant message). */
+  pending(projectId: string | null, entries?: JournalEntry[]): Promise<ManagerOffer[]>;
   /**
    * An owner change command (/set, /sync, /upgrade, /restart, /undo): builds the host plan and journals an offer for
    * an owner request (`ow_` id). Nothing is applied: the returned offer still needs the owner's Confirm. Throws
@@ -259,6 +259,8 @@ export interface ManagerDeps {
   npm?: Runner;
   /** The watchdog's routine pass through the delegate (5 minute timeout; default delegateCapture). Unset in tests: no watchdog. */
   routine?: (project: ProjectJson, argv: string[]) => Promise<RunResult>;
+  /** Reads the host journal (default: readJournal of change-journal.ts); tests count the reads. */
+  readJournal?: () => Promise<JournalEntry[]>;
 }
 
 /** A restart confirmed with mode when-idle or drain, waiting in the manager for the first poll without active leases. */
@@ -399,6 +401,9 @@ export class HostManager {
     this.runtime = boundedRuntime(deps);
   }
 
+  /** One read of the host journal (deps.readJournal in tests). Callers pass the entries down instead of reading again. */
+  private journal(): Promise<JournalEntry[]> { return (this.deps.readJournal ?? readJournal)(); }
+
   private get cr(): ChangeRequestDeps {
     return { runtime: this.runtime, upgrade: this.deps.upgrade, now: this.deps.now, ...(this.deps.cli ? { cli: this.deps.cli } : {}) };
   }
@@ -425,7 +430,7 @@ export class HostManager {
    * unknown, and closed as failed (journal and runtime row). Nothing is resumed or re-run.
    */
   async startup(): Promise<OutcomeEntry[]> {
-    const found = interruptedEntries(await readJournal(), this.deps.writerAlive ?? ((e) => writerAlive(e)));
+    const found = interruptedEntries(await this.journal(), this.deps.writerAlive ?? ((e) => writerAlive(e)));
     for (const e of found) {
       const detail = `interrupted, state unknown: the apply was ${e.type} at ${e.at} by process ${e.pid ?? 'unknown'}, which stopped before it recorded an outcome. `
         + 'It is not resumed: check the project, then confirm the request again or reject it.'
@@ -449,9 +454,13 @@ export class HostManager {
       return;
     }
     await this.runQueued();
+    // One journal read per poll, made when the first running project needs it. A project's offers depend only on its
+    // own entries, so the offers journaled for an earlier project in this poll do not make the read stale.
+    let read: Promise<JournalEntry[]> | undefined;
+    const journal = () => (read ??= this.journal());
     for (const p of projects) {
       try {
-        await this.pollProject(p);
+        await this.pollProject(p, journal);
         this.reported.delete(`project:${p.projectId}`);
       } catch (e) {
         await this.reportOnce(`project:${p.projectId}`, { status: 'error', projectId: p.projectId, requestId: null, text: `project ${p.projectId}: ${(e as Error).message}` });
@@ -460,11 +469,11 @@ export class HostManager {
   }
 
   /** Reads the project's open requests and offers each one that has no pending offer. Returns the offers sent. */
-  async pollProject(project: ProjectJson): Promise<ManagerOffer[]> {
+  async pollProject(project: ProjectJson, journal: () => Promise<JournalEntry[]> = () => this.journal()): Promise<ManagerOffer[]> {
     if (!(await this.deps.running(project))) return [];
     this.watchdog(project);
     const rows = await fetchRequests(project, this.runtime, false);
-    const entries = await readJournal();
+    const entries = await journal();
     const sent: ManagerOffer[] = [];
     let malformed = 0;
     for (const row of rows as unknown[]) {
@@ -880,7 +889,7 @@ export class HostManager {
     if (!found) return;
     const { offer, project } = found;
     const ids = { projectId: offer.projectId, requestId: offer.requestId };
-    const last = lastOutcome(await readJournal(), offer.projectId, offer.requestId);
+    const last = lastOutcome(await this.journal(), offer.projectId, offer.requestId);
     if (found.spent || (last && last.type !== 'failed')) {
       await this.notify({ status: 'already-handled', ...ids, text: `change request ${offer.requestId}: already handled (${last?.type ?? 'confirmed'}); not rejected.` });
       return;
@@ -896,7 +905,7 @@ export class HostManager {
     return {
       projects: async () => (await this.deps.projects()).map((p) => ({ projectId: p.projectId, name: basename(p.repoPath) })),
       status: (projectId) => this.statusText(projectId),
-      pending: (projectId) => this.pendingOffers(projectId),
+      pending: (projectId, entries) => this.pendingOffers(projectId, entries),
       propose: (projectId, command, opts) => this.propose(projectId, command, opts),
       assistantStatus: (projectId) => this.assistantStatusOf(projectId),
       submit: (projectId, command, typed) => this.submit(projectId, command, typed),
@@ -991,10 +1000,12 @@ export class HostManager {
   async submit(projectId: string | null, c: OwnerCommand, typed: TypedCommand): Promise<OwnerSubmit> {
     if (typeof typed?.key !== 'string' || !TYPED_KEY_PATTERN.test(typed.key)) throw new MinionsError('INTERNAL', 'an owner command without a well-formed chat message key; nothing done.');
     // Advisory early check (no plan, no dry run for a redelivered message); recordOffer decides under the lock.
-    const seen = (await readJournal()).find((e): e is OfferEntry => e.type === 'offer' && e.typed === typed.key);
+    // That read is reused for the plan (an /undo's approval check); only recordOffer reads again, under the lock.
+    const entries = await this.journal();
+    const seen = entries.find((e): e is OfferEntry => e.type === 'offer' && e.typed === typed.key);
     if (seen) return this.redelivered(seen.projectId, seen.requestId);
     const { project, req } = await this.ownerRequest(projectId, c);
-    const { plan, notes } = await buildPlan(project, req, this.cr);
+    const { plan, notes } = await buildPlan(project, req, this.cr, { entries });
     const digest = planDigest(plan);
     const direct = appliesWithoutConfirm(plan, req);
     let offer: OfferEntry;
@@ -1019,11 +1030,11 @@ export class HostManager {
 
   /**
    * Offers still waiting for the owner: requests whose newest journal entry is an offer (expired ones included: a
-   * Confirm then brings a fresh offer). Built from the journal's own plan, never from the container.
+   * Confirm then brings a fresh offer). Built from the journal's own plan, never from the container. `entries`: the journal as the caller just read it (else it is read here).
    */
-  async pendingOffers(projectId: string | null): Promise<ManagerOffer[]> {
+  async pendingOffers(projectId: string | null, entries?: JournalEntry[]): Promise<ManagerOffer[]> {
     const last = new Map<string, JournalEntry>();
-    for (const e of await readJournal()) last.set(`${e.projectId}\0${e.requestId}`, e);
+    for (const e of entries ?? await this.journal()) last.set(`${e.projectId}\0${e.requestId}`, e);
     const out: ManagerOffer[] = [];
     for (const e of last.values()) {
       if (e.type !== 'offer' || (projectId && e.projectId !== projectId)) continue;

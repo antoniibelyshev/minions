@@ -79,7 +79,11 @@ async function stack(o: {
   let now = T0;
   const clock = { set: (ms: number) => { now = ms; }, add: (ms: number) => { now += ms; } };
   const childRuns: string[][] = [];
+  // Every journal read of the manager and the chat, counted (task-90: one read per message).
+  const reads = { n: 0 };
+  const readJournal = async () => { reads.n++; return J.readJournal(); };
   const deps: ManagerDeps = {
+    readJournal,
     transport: { sendOffer: async () => undefined, receive: async () => [], sendOutcome: async () => undefined },
     projects: async () => projects,
     loadProject: async (id) => { const p = projects.find((x) => x.projectId === id); if (!p) throw new Error(`no project ${id}`); return p; },
@@ -107,7 +111,7 @@ async function stack(o: {
     readCredential: async () => (o.credential === undefined ? { token: CLAUDE_TOKEN, kind: 'oauth-token' } : o.credential),
     probe: o.probe ?? (async () => ({ ok: true, caps: CAPS })),
   });
-  const chat = AC.createAssistantChat({ assistant, now: () => new Date(now), loadSystemPrompt: async () => SYSTEM, ...(o.deadlineMs ? { deadlineMs: o.deadlineMs } : {}) });
+  const chat = AC.createAssistantChat({ assistant, now: () => new Date(now), loadSystemPrompt: async () => SYSTEM, readJournal, ...(o.deadlineMs ? { deadlineMs: o.deadlineMs } : {}) });
 
   // Fake Bot API.
   const sent: { text: string; keyboard?: { text: string; callback_data: string }[][] }[] = [];
@@ -144,7 +148,7 @@ async function stack(o: {
     await t.assistantIdle();
     return { out: sent.slice(before), events };
   };
-  return { m, t, chat, calls, sent, methods, say, tap, clock, projects, childRuns, push: (u: TelegramUpdate[]) => queue.push(u), msg, reset: () => { queue = []; } };
+  return { m, t, chat, calls, sent, methods, reads, say, tap, clock, projects, childRuns, push: (u: TelegramUpdate[]) => queue.push(u), msg, reset: () => { queue = []; } };
 }
 
 const offerButtons = (s: { keyboard?: { text: string; callback_data: string }[][] }) => s.keyboard?.[0]?.map((b) => b.callback_data) ?? [];
@@ -170,6 +174,21 @@ describe('plain text goes to the assistant; slash commands never do', () => {
     expect(out.map((x) => x.text)).toEqual(['Assistant: Hello from the fake assistant.']);
     expect(out[0]!.keyboard).toBeUndefined();
     expect(s.methods).toContain('sendChatAction');
+  });
+
+  it('one message reads the journal once: the pending offers and the undo ids come from the same read (task-90)', async () => {
+    const s = await stack();
+    const cmds = s.m.commands();
+    const done = await cmds.propose(null, { kind: 'config-set', key: 'execution.maxActiveTasks', value: '4', layer: 'local' });
+    await J.recordOutcome({ type: 'applied', projectId: done.projectId, requestId: done.requestId, digest: done.digest });
+    const open = await cmds.propose(null, { kind: 'config-set', key: 'execution.maxActiveTasks', value: '5', layer: 'local' });
+    s.reads.n = 0;
+    await s.say('what is pending?');
+    expect(s.calls).toHaveLength(1);
+    expect(s.reads.n).toBe(1);
+    const ctx = s.calls[0]!.stdin.context;
+    expect(ctx.pendingOffers.map((o: { requestId: string }) => o.requestId)).toEqual([open.requestId]);
+    expect(ctx.undoIds.map((u: { id: string }) => u.id)).toEqual([done.requestId]);
   });
 
   it('slash commands (known, unknown, /help, /assistant) and empty text never reach the assistant', async () => {

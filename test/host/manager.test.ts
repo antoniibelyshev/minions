@@ -163,6 +163,24 @@ describe('host manager: polling and offers', () => {
     expect(s.d.calls[0]).toEqual(['minions', 'settings', 'requests', '--json']);
   });
 
+  it('one poll of every project reads the journal once (task-90)', async () => {
+    const a = await install('a');
+    const b = await install('b');
+    requestSet(a.project, 'execution.maxActiveTasks', '5');
+    const s = setup([a.project, b.project]);
+    let reads = 0;
+    s.deps.readJournal = async () => { reads++; return J.readJournal(); };
+    const m = new M.HostManager(s.deps);
+    await m.pollAll();
+    expect(reads).toBe(1);
+    // Both projects were offered the open row (the fake delegate answers every project from the same DB).
+    expect(new Set(s.t.offers.map((o) => o.projectId))).toEqual(new Set([a.project.projectId, b.project.projectId]));
+    const offered = s.t.offers.length;
+    await m.pollAll();
+    expect(reads).toBe(2);
+    expect(s.t.offers).toHaveLength(offered);
+  });
+
   it('a stopped runtime is skipped quietly; a failed send is offered again on the next poll', async () => {
     const { project } = await install();
     requestSet(project, 'execution.maxActiveTasks', '5');
