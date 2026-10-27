@@ -6,6 +6,7 @@ import { describe, expect, it } from 'vitest';
 import { validateConfig } from '../../src/config/resolve.js';
 import { classifyKey } from '../../src/config/setting-classes.js';
 import type { MinionsError } from '../../src/core/errors.js';
+import { stageEntryStatuses } from '../../src/config/workflows.js';
 import { settingDef } from '../../src/host/settings.js';
 import {
   AUTO_PROMOTE_DEFAULTS, AUTO_PROMOTE_EVENT, AUTO_PROMOTE_REFUSED_EVENT, autoPromoteSettings, capRefusals, checkPromotion,
@@ -63,18 +64,39 @@ describe('capRefusals: each cap under and over its limit', () => {
   });
 });
 
-describe('isCappedPromotion: only agent ideas entering ready for the first time', () => {
+describe('isCappedPromotion: agent ideas entering a claimable status for the first time', () => {
   const r = (over: Partial<PromotionRequest>): PromotionRequest => ({ taskId: 'task-9', provenance: 'agent-hypothesis', from: 'idea', to: 'ready', labels: [], parent: null, ownerApproved: false, ...over });
-  it('caps agent-hypothesis idea -> ready, also from blocked and on create', () => {
-    expect(isCappedPromotion(r({}), false)).toBe(true);
-    expect(isCappedPromotion(r({ from: 'blocked' }), false)).toBe(true);
-    expect(isCappedPromotion(r({ from: null, taskId: null }), false)).toBe(true);
+  const entry = stageEntryStatuses(defaults());
+  const fresh = { everLeased: false, promoted: false, entry };
+  const leased = { everLeased: true, promoted: false, entry };
+  const promoted = { everLeased: false, promoted: true, entry };
+  it('derives the claimable set from the workflow stage statuses', () => {
+    expect([...entry].sort()).toEqual(['changes-requested', 'implementing', 'ready', 'reviewing', 'testing']);
+    for (const st of ['idea', 'blocked', 'awaiting-human', 'awaiting-ci', 'merging', 'done', 'delivered', 'cancelled'] as const) expect(entry).not.toContain(st);
   });
-  it('does not cap owner requests, tickets, observed results, other targets, ready -> ready, or a task that has run', () => {
-    for (const provenance of ['user-decision', 'external-requirement', 'observed-result'] as const) expect(isCappedPromotion(r({ provenance }), false)).toBe(false);
-    expect(isCappedPromotion(r({ to: 'cancelled' }), false)).toBe(false);
-    expect(isCappedPromotion(r({ from: 'ready' }), false)).toBe(false);
-    expect(isCappedPromotion(r({ from: 'implementing' }), true)).toBe(false);
+  it('caps agent-hypothesis idea -> ready, also from blocked and on create', () => {
+    expect(isCappedPromotion(r({}), fresh)).toBe(true);
+    expect(isCappedPromotion(r({ from: 'blocked' }), fresh)).toBe(true);
+    expect(isCappedPromotion(r({ from: null, taskId: null }), fresh)).toBe(true);
+  });
+  it('caps every non-ready claimable target (changes-requested, implementing, testing, reviewing) for a never-leased task', () => {
+    for (const to of ['changes-requested', 'implementing', 'testing', 'reviewing'] as const) {
+      expect(isCappedPromotion(r({ to }), fresh)).toBe(true);
+      expect(isCappedPromotion(r({ to, from: null, taskId: null }), fresh)).toBe(true);
+      expect(isCappedPromotion(r({ to }), leased)).toBe(false);
+    }
+  });
+  it('caps a move inside the claimable set when the task never passed the guard (it got there around it)', () => {
+    expect(isCappedPromotion(r({ from: 'ready', to: 'changes-requested' }), fresh)).toBe(true);
+    expect(isCappedPromotion(r({ from: 'ready', to: 'ready' }), fresh)).toBe(true);
+    expect(isCappedPromotion(r({ from: 'ready', to: 'changes-requested' }), promoted)).toBe(false);
+    expect(isCappedPromotion(r({ from: 'idea', to: 'ready' }), promoted)).toBe(true); // demoted to idea: counts again
+  });
+  it('does not cap owner requests, tickets, observed results, other targets, a promoted ready -> ready, or a task that has run', () => {
+    for (const provenance of ['user-decision', 'external-requirement', 'observed-result'] as const) expect(isCappedPromotion(r({ provenance }), fresh)).toBe(false);
+    for (const to of ['cancelled', 'idea', 'blocked', 'awaiting-human', 'done'] as const) expect(isCappedPromotion(r({ to }), fresh)).toBe(false);
+    expect(isCappedPromotion(r({ from: 'ready' }), promoted)).toBe(false);
+    expect(isCappedPromotion(r({ from: 'implementing' }), leased)).toBe(false);
   });
 });
 
@@ -174,11 +196,28 @@ describe('checkPromotion: the runtime guard', () => {
   it('a task that already had a lease goes back to ready without a cap (recover, re-dispatch)', async () => {
     const env = makeDefaultEnv();
     env.backlog.add({ id: 'task-1', provenance: 'agent-hypothesis', status: 'ready' });
+    env.db.addEvent(AUTO_PROMOTE_EVENT, 'task-1', { from: 'idea' });
     await env.sched.claim('task-1');
     const deps: GuardDeps = { db: env.db, config: env.config, getTask: (id) => env.backlog.getTask(id), budgetPercent: () => 100, now: () => NOW };
     expect(await checkPromotion(idea('task-1', { from: 'implementing' }), deps)).toBeNull();
     // A never-leased task under the same conditions is capped.
     expect((await refusal(checkPromotion(idea('task-2'), deps))).code).toBe('POLICY_DENIED');
+  });
+
+  it('changes-requested as a target: over the cap refused, under it allowed and counted as an auto-promotion', async () => {
+    const t = setup((c) => { c.routine = { autoPromote: { perDay: 1 } }; });
+    const ticket = await checkPromotion(idea('task-1', { to: 'changes-requested' }), t.deps);
+    expect(ticket?.kind).toBe('auto');
+    ticket!.commit('task-1');
+    expect(promotionsToday(t.db, NOW, 'Europe/Berlin')).toBe(1);
+    const err = await refusal(checkPromotion(idea('task-2', { to: 'changes-requested' }), t.deps));
+    expect(err.code).toBe('POLICY_DENIED');
+    expect(err.message).toMatch(/task-2 \(agent-hypothesis\) stays idea: the daily cap is reached: 1 of 1/);
+    // Same for a stage status, and for a ready task that never passed the guard.
+    expect((await refusal(checkPromotion(idea('task-3', { to: 'implementing' }), t.deps))).code).toBe('POLICY_DENIED');
+    expect((await refusal(checkPromotion(idea('task-4', { from: 'ready', to: 'changes-requested' }), t.deps))).code).toBe('POLICY_DENIED');
+    // A promoted task moving within the claimable set is not a new promotion.
+    expect(await checkPromotion(idea('task-1', { from: 'changes-requested', to: 'ready' }), t.deps)).toBeNull();
   });
 
   it('--owner-approved: allowed after a recent owner message, recorded as owner-promote (not counted)', async () => {
@@ -247,5 +286,40 @@ describe('settings: routine.autoPromote and intake.github.readyLabels', () => {
     expect(labels.loosens!(['a', 'b'], ['a'])).toMatch(/imported ready/); // fewer labels match more issues
     expect(labels.loosens!(['a'], ['a', 'b'])).toBeNull();
     expect(labels.loosens!(['a'], [])).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------- claim-time check
+
+describe('claim: a never-promoted agent idea cannot start, whatever its status', () => {
+  it('refuses ready and changes-requested claims without a recorded promotion, and lists them as stuck', async () => {
+    const env = makeDefaultEnv();
+    env.backlog.add({ id: 'task-1', provenance: 'agent-hypothesis', status: 'changes-requested' });
+    env.backlog.add({ id: 'task-2', provenance: 'agent-hypothesis', status: 'ready' });
+    for (const id of ['task-1', 'task-2']) {
+      const err = await refusal(env.sched.claim(id));
+      expect(err.code, id).toBe('POLICY_DENIED');
+      expect(err.message).toMatch(new RegExp(`Task ${id} cannot be claimed: ${id} is an agent idea \\(agent-hypothesis\\) that was never promoted`));
+      expect(env.db.leases({ taskId: id, all: true })).toEqual([]);
+    }
+    expect(env.db.eventsOfKindSince(AUTO_PROMOTE_REFUSED_EVENT, '2000-01-01T00:00:00Z').map((e) => e.taskId)).toEqual(['task-1', 'task-2']);
+    const next = await env.sched.next();
+    expect(next.runnable.map((s) => s.taskId)).toEqual([]);
+    expect(next.stuck.map((s) => s.taskId).sort()).toEqual(['task-1', 'task-2']);
+    expect(next.stuck[0]!.reason).toMatch(/never promoted/);
+  });
+
+  it('allows the claim after an auto-promote or owner-promote event, and for other provenances', async () => {
+    const env = makeDefaultEnv();
+    env.backlog.add({ id: 'task-1', provenance: 'agent-hypothesis', status: 'changes-requested' });
+    env.backlog.add({ id: 'task-2', provenance: 'agent-hypothesis', status: 'ready' });
+    env.backlog.add({ id: 'task-3', provenance: 'user-decision', status: 'ready' });
+    env.db.addEvent(AUTO_PROMOTE_EVENT, 'task-1', { from: 'idea' });
+    env.db.addEvent(OWNER_PROMOTE_EVENT, 'task-2', { from: 'idea' });
+    const next = await env.sched.next();
+    expect(next.stuck).toEqual([]);
+    // None refused by the promotion check (some may wait on capacity: the default limit is two active tasks).
+    expect([...next.runnable, ...next.waiting].map((s) => s.taskId).sort()).toEqual(['task-1', 'task-2', 'task-3']);
+    for (const id of ['task-1', 'task-2']) expect((await env.sched.claim(id)).task.id).toBe(id);
   });
 });

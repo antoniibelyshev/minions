@@ -1,7 +1,7 @@
 import { readFile } from 'node:fs/promises';
 import type { Command } from 'commander';
 import { validateConfig } from '../config/resolve.js';
-import { workflowNames } from '../config/workflows.js';
+import { stageEntryStatuses, workflowNames } from '../config/workflows.js';
 import type { MinionsConfig } from '../config/schema.js';
 import { action, globalOpts, requireMode } from '../core/cli-helpers.js';
 import { MinionsError } from '../core/errors.js';
@@ -30,7 +30,7 @@ export function setIntakePausedContext(fn: () => boolean | Promise<boolean>): vo
 /** Runtime installs this at startup: intake-tracked tasks without a usable meta provenance read as external-requirement. */
 export function setProvenanceFallback(fn: ProvenanceFallback | undefined): void { provenanceFallback = fn; }
 
-/** A status change into `ready` the promotion guard checks (taskId null: `backlog create`). */
+/** A status change into a claimable status (stageEntryStatuses) the promotion guard checks (taskId null: `backlog create`). */
 export interface PromotionCheck {
   taskId: string | null; provenance: Provenance; from: TaskStatus | null; to: TaskStatus;
   labels: string[]; parent: string | null; ownerApproved: boolean;
@@ -203,9 +203,10 @@ export function register(program: Command): void {
       assertIntakeOpen(input, await intakePaused());
       const { cfg, backlog } = await open();
       const workflow = o.workflow !== undefined ? { workflow: checkWorkflowName(cfg, o.workflow) } : {};
-      // A new agent idea created ready is an auto-promotion (the caps apply); an existing key creates nothing.
-      const ticket = input.status === 'ready' && !idempotencyStore.get(o.key)
-        ? await promotionGuard({ taskId: null, provenance: input.provenance ?? 'user-decision', from: null, to: 'ready', labels: input.labels ?? [], parent: input.parent ?? null, ownerApproved: !!o.ownerApproved }, (tid) => backlog.getTask(tid))
+      // A new agent idea created in a claimable status (ready, changes-requested, a stage status) is an
+      // auto-promotion (the caps apply); an existing key creates nothing.
+      const ticket = input.status !== undefined && stageEntryStatuses(cfg).includes(input.status) && !idempotencyStore.get(o.key)
+        ? await promotionGuard({ taskId: null, provenance: input.provenance ?? 'user-decision', from: null, to: input.status, labels: input.labels ?? [], parent: input.parent ?? null, ownerApproved: !!o.ownerApproved }, (tid) => backlog.getTask(tid))
         : null;
       const r = await backlog.createTask({ ...input, ...workflow });
       if (ticket && r.created) ticket.commit(r.task.id);
@@ -244,10 +245,11 @@ export function register(program: Command): void {
         }
       }
       let ticket: Awaited<ReturnType<PromotionGuard>> = null;
-      if (status === 'ready') {
-        // An agent idea moved to ready is an auto-promotion: the runtime caps refuse it before anything is written.
+      if (status !== undefined && stageEntryStatuses(cfg).includes(status)) {
+        // An agent idea moved to a claimable status (ready, changes-requested, a stage status) is an auto-promotion:
+        // the runtime caps refuse it before anything is written.
         const cur = await backlog.getTask(id);
-        ticket = await promotionGuard({ taskId: cur.id, provenance: cur.provenance, from: cur.status, to: 'ready',
+        ticket = await promotionGuard({ taskId: cur.id, provenance: cur.provenance, from: cur.status, to: status,
           labels: [...new Set([...cur.labels, ...(o.label ?? [])])], parent: cur.parent, ownerApproved: !!o.ownerApproved }, (tid) => backlog.getTask(tid));
       }
       const t = await backlog.updateTask(id, o.expectedVersion, patch);

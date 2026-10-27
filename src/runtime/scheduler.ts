@@ -26,6 +26,7 @@ import { assertBudgetAllowsStart, billingOf, budgetNotice, latestLeaseUsage, rec
 import { readRequiredChecks, type RequiredChecksReport } from './ci.js';
 import { ciGateFromDb, formatCiGate, type CiGate } from './ci-gate.js';
 import { autoMergeTask, type MergeResult } from './merge.js';
+import { AUTO_PROMOTE_REFUSED_EVENT, unpromotedReason } from './auto-promote.js';
 import { BRANCH_PREFIX, branchFor, ensureBranchWorktree, ensureReviewWorktree, git, headOf, resolveBaseBranch, taskSlug, workspaceLayout, type WorkspaceLayout } from './worktree.js';
 
 export const LEASE_ROLES: readonly BuiltinLeaseRole[] = ['engineer', 'tester', 'reviewer'];
@@ -591,6 +592,8 @@ export class Scheduler {
     for (const task of tasks) {
       if (leased.has(task.id) || !STAGE_STATUSES.includes(task.status)) continue;
       if (task.status === 'ready' && notReadyReason(task, readyCtx) !== null) continue;
+      const unpromoted = unpromotedReason(this.db, task);
+      if (unpromoted) { stuck.push({ taskId: task.id, status: task.status, reason: unpromoted }); continue; }
       if (isQaSweep(task)) {
         // A QA sweep has no stage plan: a tester checks the base branch, claimed from ready only.
         if (task.status !== 'ready') { stuck.push({ taskId: task.id, status: task.status, reason: `QA sweep in "${task.status}" without a lease; a sweep is only claimed from ready` }); continue; }
@@ -789,6 +792,14 @@ export class Scheduler {
       throw new MinionsError('PRECONDITION', `Task ${task.id} is "${task.status}"; a QA sweep can only be claimed from ready.`);
     }
     if (!sweep) this.assertClaimableStage(task, role, plan);
+    // Auto-promotion caps (task-68.6): a never-leased agent idea starts only after it passed the guard, whatever its status.
+    const unpromoted = unpromotedReason(this.db, task);
+    if (unpromoted) {
+      this.db.addEvent(AUTO_PROMOTE_REFUSED_EVENT, task.id, { reasons: ['claim without a recorded promotion'], status: task.status });
+      throw new MinionsError('POLICY_DENIED', `Task ${task.id} cannot be claimed: ${unpromoted}.`,
+        'Leave it as idea and ask the owner in the digest unless the promotion is allowed (do not change its provenance or labels to get around this).',
+        { refusal: { taskId: task.id, reasons: ['never promoted'] } });
+    }
     // D8 `requires`: capabilities the stage cannot work without (deny refuses; ask needs the owner).
     this.assertStageRequires(task, def);
     // One backlog listing per claim (task-24.2): dependency status and capacity both come from it.

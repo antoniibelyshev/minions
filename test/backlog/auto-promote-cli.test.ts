@@ -109,6 +109,18 @@ describe.runIf(onPath)('backlog update|create --status ready on agent ideas (per
     expect(r.code, r.out).toBe(0);
   });
 
+  it('changes-requested (claimable, not ready) over the cap: update and create are refused, the task stays idea', async () => {
+    const id = await create('idea-cr-over');
+    const r = await cli(['backlog', 'update', id, '--expected-version', (await show(id)).version, '--status', 'changes-requested']);
+    expect(r.code, r.out).toBe(3);
+    expect(r.body.error?.code).toBe('POLICY_DENIED');
+    expect(r.body.error?.message).toMatch(/stays idea: the daily cap is reached: 2 of 2/);
+    expect((await show(id)).status).toBe('idea');
+    const c = await cli(['backlog', 'create', '--title', 'Direct repair', '--provenance', 'agent-hypothesis', '--status', 'changes-requested', '--key', 'idea-cr-direct']);
+    expect(c.body.error?.code).toBe('POLICY_DENIED');
+    expect(eventIds(AUTO_PROMOTE_EVENT)).toEqual(ids.slice(0, 2));
+  });
+
   it('--owner-approved needs a recent owner message: refused at 2 h, allowed at 5 min and recorded as owner-promote', async () => {
     expect((await toReady(ids[2]!, ['--owner-approved'])).body.error?.message).toMatch(/--owner-approved refused/);
     db.setMeta(LAST_OWNER_MESSAGE_META, new Date(Date.now() - 5 * 60_000).toISOString());
@@ -117,5 +129,17 @@ describe.runIf(onPath)('backlog update|create --status ready on agent ideas (per
     expect((await show(ids[2]!)).status).toBe('ready');
     expect(eventIds(OWNER_PROMOTE_EVENT)).toEqual([ids[2]]);
     expect(eventIds(AUTO_PROMOTE_EVENT)).toHaveLength(2);
+  });
+
+  it('changes-requested under the cap: update and create are allowed and counted as auto-promotions', async () => {
+    db.exec('DELETE FROM events WHERE kind = ?', AUTO_PROMOTE_EVENT); // a fresh day: 0 of 2
+    const id = await create('idea-cr-under');
+    const r = await cli(['backlog', 'update', id, '--expected-version', (await show(id)).version, '--status', 'changes-requested']);
+    expect(r.code, r.out).toBe(0);
+    expect((await show(id)).status).toBe('changes-requested');
+    const c = await cli(['backlog', 'create', '--title', 'Direct repair ok', '--provenance', 'agent-hypothesis', '--status', 'changes-requested', '--key', 'idea-cr-direct-ok']);
+    expect(c.code, c.out).toBe(0);
+    const created = (c.body.data as { task: { id: string } }).task.id;
+    expect(eventIds(AUTO_PROMOTE_EVENT)).toEqual([id, created]);
   });
 });
