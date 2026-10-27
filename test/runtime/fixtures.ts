@@ -1,6 +1,6 @@
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import type { BacklogAdapter, CreateTaskInput, ScopeFilter, Task, TaskStatus } from '../../src/backlog/types.js';
 import type { MinionsConfig } from '../../src/config/schema.js';
@@ -31,6 +31,7 @@ export function initRepo(dir: string, branch = 'main'): string {
 }
 
 export function commitFile(dir: string, file: string, content: string, msg = `edit ${file}`): string {
+  mkdirSync(dirname(join(dir, file)), { recursive: true });
   writeFileSync(join(dir, file), content);
   gitSync(dir, 'add', file);
   gitSync(dir, 'commit', '-q', '-m', msg);

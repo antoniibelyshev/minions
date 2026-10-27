@@ -26,7 +26,11 @@ import { assertBudgetAllowsStart, billingOf, budgetNotice, latestLeaseUsage, rec
 import { readRequiredChecks, type RequiredChecksReport } from './ci.js';
 import { ciGateFromDb, formatCiGate, type CiGate } from './ci-gate.js';
 import { autoMergeTask, type MergeResult } from './merge.js';
-import { BRANCH_PREFIX, branchFor, ensureBranchWorktree, ensureReviewWorktree, git, headOf, resolveBaseBranch, taskSlug, workspaceLayout, type WorkspaceLayout } from './worktree.js';
+import { runPrScan, type ConflictInfo, type ConflictOutcome, type ScanReport } from './pr-scan.js';
+import { latestRound, maxRebaseCyclesOf, NEEDS_REBASE_KIND, NEEDS_REBASE_LABEL, needsRebase as hasRebaseLabel, rebaseBrief, rebaseRounds, resolutionDiff, roundText, type RebaseBrief } from './needs-rebase.js';
+import { enqueue } from './outbox.js';
+import type { ServerUrlFn } from './base-update.js';
+import { abortableGit, BRANCH_PREFIX, branchFor, ensureBranchWorktree, ensureReviewWorktree, git, headOf, resolveBaseBranch, taskSlug, workspaceLayout, type WorkspaceLayout } from './worktree.js';
 
 export const LEASE_ROLES: readonly BuiltinLeaseRole[] = ['engineer', 'tester', 'reviewer'];
 
@@ -63,6 +67,11 @@ export interface SchedulerDeps {
   phase?: PhaseRules;
   /** Process-harness run records (agent-runtimes D3b). Omitted: no run records are consulted (tests of other paths). */
   runs?: RunControl;
+  /**
+   * Test seam of the merge gate and the PR scan: where git reaches the recorded origin URL (base-update.ts
+   * ServerUrlFn). Production never sets it: git contacts the https URL itself.
+   */
+  serverUrl?: ServerUrlFn;
 }
 
 /**
@@ -253,6 +262,12 @@ export interface TaskBrief {
    * for test runs and tools. Removed when the lease ends and on coordinator start; absent = use the inherited TMPDIR.
    */
   scratchDir?: string;
+  /**
+   * A needs-rebase round (task label minions:needs-rebase, src/runtime/needs-rebase.ts): the head that conflicted
+   * (previousHead), the base and the conflicting files, and how to resolve it (merge the base, never rebase or
+   * force-push). A gate (reviewer) brief also carries the resolution diff.
+   */
+  rebase?: RebaseBrief;
   /** The workflow stage this lease runs (absent for a QA sweep, which ignores workflows). */
   stage?: { workflow: string; position: number; count: number; role: string; model?: string };
   /**
@@ -318,9 +333,11 @@ export class Scheduler {
   private readonly gh: GhFn;
   private readonly now: () => Date;
   private readonly runs: RunControl | null;
+  private readonly serverUrl: ServerUrlFn | undefined;
 
   constructor(deps: SchedulerDeps) {
     this.runs = deps.runs ?? null;
+    this.serverUrl = deps.serverUrl;
     this.db = deps.db; this.backlog = deps.backlog; this.config = deps.config;
     this.layout = deps.layout ?? workspaceLayout();
     this.handoff = deps.handoff ?? null;
@@ -624,6 +641,7 @@ export class Scheduler {
       const at = `stage ${plan.position + 1}/${plan.stages.length} (${stage.role}) of workflow ${plan.workflow}`;
       const why = [
         task.status === 'changes-requested' ? `changes-requested: repair (cycle ${this.db.repairCycles(task.id)}) at ${at}` : `${task.status}: ${at}`,
+        hasRebaseLabel(task) ? `needs-rebase round ${rebaseRounds(this.db, task.id)}/${maxRebaseCyclesOf(cfg)}: merge ${cfg.git.baseBranch} into the branch (sorted first)` : null,
         stage.inserted === 'qa' ? 'tester inserted: QA required' : stage.inserted === 'legacy' ? 'stage added for a legacy status' : null,
         reset ? `workflow changed: the claim resets the position by evidence at the head${status !== task.status ? ` and moves the task to ${status}` : ''}` : null,
       ].filter(Boolean).join('; ');
@@ -637,7 +655,10 @@ export class Scheduler {
       candidates.push(entry);
     }
     const started = (t: NextStage) => (t.status === 'ready' ? 1 : 0);
-    const ordered = sortByPriority(candidates.map((c) => ({ ...c, id: c.taskId }))).sort((a, b) => started(a) - started(b)).map(({ id: _id, ...c }) => c);
+    // Needs-rebase rounds first (task-68.4): nearly done, and every hour behind the base makes the conflict bigger.
+    const rebasing = new Set(tasks.filter(hasRebaseLabel).map((t) => t.id));
+    const rebaseFirst = (t: NextStage) => (rebasing.has(t.taskId) ? 0 : 1);
+    const ordered = sortByPriority(candidates.map((c) => ({ ...c, id: c.taskId }))).sort((a, b) => rebaseFirst(a) - rebaseFirst(b) || started(a) - started(b)).map(({ id: _id, ...c }) => c);
     const cap = capacityOf(cfg, leases, tasks);
     let startsBlocked: NextReport['startsBlocked'] = null;
     try { this.assertStartsAllowed(); } catch (e) {
@@ -879,6 +900,12 @@ export class Scheduler {
 
     const brief = this.buildBrief(this.db.lease(leaseId)!, task, { attempt, branch, worktree, baseBranch, baseSha, head, startEffect, plan });
     if (def.contract !== 'producer' && cfg.verification.ciAuthority === 'github') brief.ci = await this.ciGate(task.id, head);
+    if (brief.rebase && def.contract === 'gate') {
+      const d = await resolutionDiff(this.layout.repo, { previousHead: brief.rebase.previousHead, base: brief.rebase.base, head });
+      brief.rebase = 'error' in d
+        ? { ...brief.rebase, resolutionDiff: null, resolutionDiffError: d.error }
+        : { ...brief.rebase, resolutionDiff: d.diff, ...(d.truncated ? { resolutionDiffTruncated: true } : {}) };
+    }
     return brief;
   }
 
@@ -912,6 +939,18 @@ export class Scheduler {
         const r = JSON.parse(l.result_json!) as WorkerResult;
         return { leaseId: l.id, role: l.role, status: r.status, findings: r.findings, nextAction: r.nextAction };
       });
+    // A CI failure the PR scan found after delivery (no lease produced it): the latest one since the last lease ended.
+    const lastEnd = this.db.leases({ taskId: task.id, all: true }).filter((l) => l.id !== lease.id).map((l) => l.ended_at ?? l.started_at).sort().at(-1) ?? '';
+    const ciRepair = this.db.evidenceOfKind(task.id, 'ci-repair').filter((e) => e.recorded_at >= lastEnd).at(-1);
+    if (ciRepair) {
+      const v = JSON.parse(ciRepair.details_json ?? '{}') as { findings?: unknown[]; nextAction?: string };
+      priorFindings.push({ leaseId: 'pr-scan', role: 'ci', status: 'needs_changes', findings: (v.findings ?? []).filter((f): f is string => typeof f === 'string'), nextAction: v.nextAction ?? '' });
+    }
+    // A needs-rebase round (task-68.4): its findings once, like a CI repair; the rebase field for every stage while labelled.
+    const round = !x.sweep && hasRebaseLabel(task) ? latestRound(this.db, task.id) : null;
+    if (round && round.row.recorded_at >= lastEnd) {
+      priorFindings.push({ leaseId: 'pr-scan', role: 'needs-rebase', status: 'needs_changes', findings: round.round.findings, nextAction: round.round.nextAction });
+    }
     const resume = this.drainResume(task.id, lease, x.branch);
     return {
       briefMarker: `minions-lease: ${lease.id}`,
@@ -949,6 +988,7 @@ export class Scheduler {
       deliveryMode: cfg.delivery.mode,
       priorFindings,
       ...(resume ? { resume } : {}),
+      ...(round ? { rebase: rebaseBrief(round.round, cfg) } : {}),
       ...(x.plan && stage ? { stage: { workflow: x.plan.workflow, position: x.plan.position, count: x.plan.stages.length, role: stage.role, ...(stage.model ? { model: stage.model } : {}) } } : {}),
       ...(def.builtin ? {} : { editScope: { edits: typeof def.edits === 'string' ? def.edits : { paths: [...def.edits.paths] }, commits: def.commits } }),
       // A QA sweep checks the base head and commits nothing: the verifier contract without commits.
@@ -997,6 +1037,31 @@ export class Scheduler {
 
   private async isAncestor(from: string, to: string): Promise<boolean> {
     return (await git(this.layout.repo, ['merge-base', '--is-ancestor', from, to], true)).code === 0;
+  }
+
+  /**
+   * A producer completing a needs-rebase round (task-68.4) must have merged the base into the branch: the head
+   * contains the conflicting head (no rebase: the PR is reused and pushes are fast-forward only) and the base.
+   */
+  private async rebaseErrors(taskId: string, head: string): Promise<string[]> {
+    const task = await this.backlog.getTask(taskId);
+    const r = hasRebaseLabel(task) ? latestRound(this.db, taskId)?.round : undefined;
+    if (!r) return [];
+    if (!(await this.isAncestor(r.head, head))) return [`needs-rebase: ${head} does not contain the previous PR head ${r.head}; merge ${r.baseBranch} into the branch instead of rebasing (the PR is reused and publication never force-pushes)`];
+    if (!(await this.isAncestor(r.base, head))) return [`needs-rebase: ${head} does not contain ${r.baseBranch} at ${r.base}; merge ${r.baseBranch} into the branch and resolve the conflicts (${r.files.slice(0, 10).join(', ')})`];
+    return [];
+  }
+
+  /** Delivered again: the needs-rebase label goes (task-68.4). Never fails the delivery. */
+  private async clearRebaseLabel(taskId: string): Promise<void> {
+    try {
+      const t = await this.backlog.getTask(taskId);
+      if (!hasRebaseLabel(t)) return;
+      await this.backlog.updateTask(taskId, t.version, { labels: t.labels.filter((l) => l !== NEEDS_REBASE_LABEL) });
+      this.db.addEvent(NEEDS_REBASE_KIND, taskId, { state: 'cleared', status: t.status });
+    } catch (e) {
+      this.db.addEvent('record-backlog-error', taskId, { error: `needs-rebase label not cleared: ${(e as Error).message}` });
+    }
   }
 
   private preClaimStatus(lease: Lease): TaskStatus | undefined {
@@ -1211,6 +1276,7 @@ export class Scheduler {
       }
       // Edit scope (D3): enforced on the stage diff, not just recorded in the brief.
       if (actualHead && !errors.length) errors.push(...await this.editScopeErrors(lease, def, actualHead));
+      if (actualHead && !errors.length && def.contract === 'producer' && result.status === 'complete') errors.push(...await this.rebaseErrors(lease.task_id, actualHead));
     }
 
     // CI evidence cited by a verifier/gate (tester, reviewer): decided by the runtime gate for the exact head, never by the claim itself.
@@ -1360,6 +1426,7 @@ export class Scheduler {
       else await this.backlog.updateTask(task.id, task.version, { ...(to !== from ? { status: to } : {}), ...(labels ? { labels } : {}) });
     }
     if (labels) this.db.addEvent('qa-required', task.id, { leaseId, role: lease.role, head, reasons: qa.reasons, label: labels.at(-1) });
+    if (to === 'delivered') await this.clearRebaseLabel(task.id);
 
     this.db.transaction(() => {
       // A stage blocked by the CI gate is not a complete stage (publication checks role evidence 'complete').
@@ -1484,6 +1551,7 @@ export class Scheduler {
       task = await this.backlog.updateTask(taskId, task.version, { ...(outcome.prUrl ? { prUrl: outcome.prUrl } : {}), branch: pub.branch });
     }
     if (task.status !== 'delivered') await this.backlog.closeTask(taskId, 'delivered');
+    await this.clearRebaseLabel(taskId);
     const what = outcome.prUrl ? `pull request ${outcome.prUrl} (${outcome.pr === 'created' ? 'opened' : 'existing'}, open, not merged)` : `branch ${pub.branch} on origin`;
     await this.note(taskId, `minions: delivered ${pub.branch} at ${head.slice(0, 12)} as ${what}.`);
     return this.withMerge(resp('published', 'delivered', `Delivered ${pub.branch} at ${head} as ${what}.${cfg.delivery.merge === 'auto-when-eligible' ? '' : ' minions does not merge.'}`,
@@ -1512,7 +1580,104 @@ export class Scheduler {
     return autoMergeTask({
       db: this.db, backlog: this.backlog, config: this.config, repo: this.layout.repo, gh: this.gh, git,
       ciGate: (id, head) => this.ciGate(id, head), approvalPublicKeyFile: this.approvalPublicKeyFile, now: this.now,
+      ...(this.serverUrl ? { serverUrl: this.serverUrl } : {}),
     }, taskId);
+  }
+
+  /**
+   * PR scan (src/runtime/pr-scan.ts, task-68.3): one `gh pr list`, then base updates for behind PRs, the
+   * needs-rebase stage for conflicting ones (`needsRebase`, task-68.4; `onConflict` replaces it) and CI repairs for delivered tasks without an active lease. `deadline` bounds new base updates.
+   */
+  async scanPullRequests(opts: { taskIds?: string[]; deadline?: number; signal?: AbortSignal; onConflict?: (c: ConflictInfo) => Promise<ConflictOutcome | void> } = {}): Promise<ScanReport> {
+    return runPrScan({
+      db: this.db, backlog: this.backlog, config: this.config, repo: this.layout.repo, gh: this.gh, git: opts.signal ? abortableGit(opts.signal) : git,
+      ...(opts.signal ? { signal: opts.signal } : {}),
+      ciGate: (id, head) => this.ciGate(id, head), ciRepair: (id, head, findings) => this.ciRepair(id, head, findings),
+      now: this.now, ...(opts.deadline !== undefined ? { deadline: opts.deadline } : {}), onConflict: opts.onConflict ?? ((c) => this.needsRebase(c)),
+      ...(this.serverUrl ? { serverUrl: this.serverUrl } : {}),
+    }, { taskIds: opts.taskIds });
+  }
+
+  /**
+   * Required checks fail at a delivered task's approved head (found by the PR scan): delivered ->
+   * changes-requested at the repair target of the final gate, counted as a repair cycle like a CI failure
+   * in `work record`; at execution.maxRepairCyclesBeforeReplan the task goes to awaiting-human (replan).
+   * The findings reach the next engineer brief as priorFindings (role `ci`).
+   */
+  async ciRepair(taskId: string, head: string, findings: string[]): Promise<{ to: TaskStatus; repairCycles: number; replan: boolean }> {
+    const cfg = this.config;
+    const task = await this.backlog.getTask(taskId);
+    if (task.status !== 'delivered') throw new MinionsError('PRECONDITION', `Task ${taskId} is ${task.status}, not delivered.`);
+    if (this.db.activeLeases().some((l) => l.task_id === taskId)) throw new MinionsError('CONFLICT', `Task ${taskId} has an active lease.`);
+    const wf = this.workflowOf(task);
+    const row = this.db.taskStage(taskId);
+    const stages = (row && row.workflow === wf.name ? parseStages(row.stages_json) : null) ?? wf.stages;
+    const gate = finalGateIndex(cfg, stages);
+    const position = repairTarget(cfg, stages, gate >= 0 ? gate : stages.length - 1);
+    const repairCycles = this.db.incrementRepairs(taskId);
+    const replan = repairCycles >= cfg.execution.maxRepairCyclesBeforeReplan;
+    const to: TaskStatus = replan ? 'awaiting-human' : 'changes-requested';
+    const nextAction = `Fix the failing required checks on top of ${head.slice(0, 12)} (merge, never rebase or force-push); the PR is reused.`;
+    await this.backlog.updateTask(taskId, task.version, { status: to });
+    this.db.transaction(() => {
+      this.db.setTaskStage(taskId, wf.name, stages, position);
+      this.db.addEvidence({ task_id: taskId, head_sha: head, kind: 'ci-repair', config_revision: cfg.configRevision, outcome: to,
+        details_json: JSON.stringify({ findings, nextAction, repairCycles }) });
+      this.db.addEvent('ci-repair', taskId, { head, to, repairCycles, replan });
+    });
+    await this.note(taskId, `minions: ${findings[0]}. Task delivered -> ${to} (repair cycle ${repairCycles}${replan ? `; the limit ${cfg.execution.maxRepairCyclesBeforeReplan} is reached: replan before more repairs` : ''}).${findings[1] ? ` ${findings[1]}.` : ''}`);
+    return { to, repairCycles, replan };
+  }
+
+  /**
+   * The needs-rebase stage (src/runtime/needs-rebase.ts, task-68.4): the PR scan confirmed that a delivered task's
+   * PR at its approved head conflicts with the base (and disarmed auto-merge). delivered -> changes-requested with
+   * the label minions:needs-rebase, the stage position at the repair target of the final gate (the first
+   * producer), and `needs-rebase` evidence the next briefs read. Not a repair cycle. Past
+   * execution.maxRebaseCycles rounds: awaiting-human with a question for the owner instead.
+   */
+  async needsRebase(c: ConflictInfo): Promise<ConflictOutcome> {
+    const cfg = this.config;
+    const task = await this.backlog.getTask(c.taskId);
+    if (task.status !== 'delivered') throw new MinionsError('PRECONDITION', `Task ${c.taskId} is ${task.status}, not delivered.`);
+    if (this.db.activeLeases().some((l) => l.task_id === c.taskId)) throw new MinionsError('CONFLICT', `Task ${c.taskId} has an active lease.`);
+    const pub = this.db.publication(c.taskId);
+    if (!pub || pub.head_sha !== c.head) throw new MinionsError('CONFLICT', `Task ${c.taskId}: the approved head is ${pub?.head_sha ?? '(none)'}, not ${c.head}.`);
+    const max = maxRebaseCyclesOf(cfg);
+    const done = rebaseRounds(this.db, c.taskId);
+    const files = c.files.slice(0, 10).join(', ') + (c.files.length > 10 ? ', …' : '');
+    const text = roundText({ head: c.head, base: c.base, baseBranch: c.baseBranch, files: c.files, prUrl: c.prUrl });
+    if (done >= max) {
+      await this.backlog.updateTask(task.id, task.version, { status: 'awaiting-human' });
+      const question = `${task.id}: ${c.prUrl} conflicts with ${c.baseBranch} again (${files}) after ${done} needs-rebase round(s) (execution.maxRebaseCycles ${max}). `
+        + `${c.baseBranch} keeps changing the same files: merge the other task first, split this one, or let me try again?`;
+      this.db.transaction(() => {
+        this.db.addEvidence({ task_id: task.id, head_sha: c.head, kind: NEEDS_REBASE_KIND, config_revision: cfg.configRevision, outcome: 'awaiting-human',
+          details_json: JSON.stringify({ head: c.head, base: c.base, baseBranch: c.baseBranch, files: c.files, prUrl: c.prUrl, round: done, limit: max }) });
+        this.db.addEvent(NEEDS_REBASE_KIND, task.id, { state: 'limit', head: c.head, base: c.base, files: c.files, rounds: done, max });
+      });
+      try { enqueue(this.db, { key: `needs-rebase-limit:${task.id}:${c.head}:${c.base}`, kind: 'question', taskId: task.id, text: question }); } catch (e) {
+        this.db.addEvent('needs-rebase-notify-error', task.id, { error: (e as Error).message });
+      }
+      await this.note(task.id, `minions: ${task.prUrl} conflicts with ${c.baseBranch} at ${c.base.slice(0, 12)} in ${files}; the needs-rebase limit (${max}) is reached: task delivered -> awaiting-human (the owner decides: merge the other task first, split, or try again).`);
+      return { to: 'awaiting-human', message: `needs-rebase limit reached (${done}/${max}): task delivered -> awaiting-human with a question` };
+    }
+    const wf = this.workflowOf(task);
+    const row = this.db.taskStage(task.id);
+    const stages = (row && row.workflow === wf.name ? parseStages(row.stages_json) : null) ?? wf.stages;
+    const gate = finalGateIndex(cfg, stages);
+    const position = repairTarget(cfg, stages, gate >= 0 ? gate : stages.length - 1);
+    const round = done + 1;
+    const labels = task.labels.includes(NEEDS_REBASE_LABEL) ? task.labels : [...task.labels, NEEDS_REBASE_LABEL];
+    await this.backlog.updateTask(task.id, task.version, { status: 'changes-requested', labels });
+    this.db.transaction(() => {
+      this.db.setTaskStage(task.id, wf.name, stages, position);
+      this.db.addEvidence({ task_id: task.id, head_sha: c.head, kind: NEEDS_REBASE_KIND, config_revision: cfg.configRevision, outcome: 'changes-requested',
+        details_json: JSON.stringify({ head: c.head, base: c.base, baseBranch: c.baseBranch, files: c.files, prUrl: c.prUrl, round, findings: text.findings, nextAction: text.nextAction }) });
+      this.db.addEvent(NEEDS_REBASE_KIND, task.id, { state: 'started', head: c.head, base: c.base, files: c.files, round, max });
+    });
+    await this.note(task.id, `minions: ${task.prUrl} ${text.findings[0]}. Task delivered -> changes-requested (label ${NEEDS_REBASE_LABEL}, round ${round}/${max}; not a repair cycle).`);
+    return { to: 'changes-requested', round, message: `task delivered -> changes-requested (${NEEDS_REBASE_LABEL}, round ${round}/${max})` };
   }
 
   /**

@@ -36,6 +36,8 @@ export const KEY_CLASSES: readonly KeyClass[] = [
   ...entries(['execution.maxActiveTasks', 'execution.maxEngineers', 'execution.maxByRole', 'execution.maxRepairCyclesBeforeReplan'], 'live', false,
     'enforced by `work claim` / the scheduler on each call'),
   ...entries(['coordinator.contextReset'], 'live', false, 'read by context-reset.ts on each check'),
+  ...entries(['routine.maxBaseUpdatesPerTask'], 'live', false, 'read by the PR scan on each pass'),
+  ...entries(['execution.maxRebaseCycles'], 'live', false, 'read by the PR scan when a conflict is confirmed'),
   ...entries(['verification.commands', 'verification.qaLabels', 'verification.ciPendingTimeoutMinutes'], 'live', false,
     'briefs and the CI gate read them per lease'),
   ...entries(['intake.github'], 'live', false, '`minions sync` and coordinator startup read them per run'),

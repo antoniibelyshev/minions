@@ -565,6 +565,14 @@ export class RuntimeDb {
       p.task_id, p.branch, p.head_sha, p.mode, p.config_revision, nowIso());
     return this.publication(p.task_id)!;
   }
+  /**
+   * Moves a published head forward after a verified base update (compare-and-swap on the old head):
+   * false when the row is not published at `from` any more (a concurrent change wins).
+   */
+  movePublicationHead(taskId: string, from: string, to: string): boolean {
+    return this.exec("UPDATE publications SET head_sha = ?, updated_at = ? WHERE task_id = ? AND head_sha = ? AND state = 'published'",
+      to, nowIso(), taskId, from).changes === 1;
+  }
   setPublicationState(taskId: string, state: PublicationState, x: { prUrl?: string | null; errorCode?: string | null; error?: string | null } = {}): PublicationRow {
     this.exec('UPDATE publications SET state = ?, pr_url = COALESCE(?, pr_url), error_code = ?, error = ?, updated_at = ? WHERE task_id = ?',
       state, x.prUrl ?? null, x.errorCode ?? null, x.error ?? null, nowIso(), taskId);

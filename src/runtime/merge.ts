@@ -19,7 +19,7 @@
 //   head, failing/missing CI, approval gone, policy or config changed).
 // - States are recorded as `merge` evidence bound to the approved head; a merged PR closes the task as
 //   `done` (merged), distinct from `delivered` (PR open).
-import { can } from '../config/capabilities.js';
+import { can, matchesAny } from '../config/capabilities.js';
 import { autoMergeConfigReasons } from '../config/delivery.js';
 import type { MinionsConfig } from '../config/schema.js';
 import type { BacklogAdapter, Task } from '../backlog/types.js';
@@ -28,11 +28,15 @@ import type { ErrorCode } from '../core/errors.js';
 import { redact } from '../core/output.js';
 import { readFile } from 'node:fs/promises';
 import type { CiGate } from './ci-gate.js';
+import {
+  BASE_UPDATE_KIND, commitExists, deriveApproval, derivedApprovalProblems, fetchBase, originOfPrUrl, verifiedServerBase, withIsolatedRepo,
+  type DerivedApproval, type ServerUrlFn,
+} from './base-update.js';
 import { formatCiGate } from './ci-gate.js';
 import type { EvidenceRow, RuntimeDb } from './db.js';
 import type { GitFn } from './github.js';
 import { missingApprovalKeyReason } from './paths.js';
-import { classifyFailure, gateChangedPaths, githubOrigin, type GhFn } from './publish.js';
+import { classifyFailure, gateChangedPaths, type GhFn } from './publish.js';
 
 export type MergeState =
   /** delivery.merge is not "auto-when-eligible" and minions armed nothing: no gh call was made. */
@@ -90,6 +94,8 @@ export interface MergeDeps {
   ciGate: (taskId: string, head: string) => Promise<CiGate>;
   approvalPublicKeyFile: string;
   now?: () => Date;
+  /** Test seam: where git reaches the recorded origin URL (base-update.ts ServerUrlFn; default the URL itself). */
+  serverUrl?: ServerUrlFn;
 }
 
 /** Last arm/disarm record: whether a PR's auto-merge was enabled by minions (and not disabled since). */
@@ -102,7 +108,18 @@ export interface MergeGateInput {
   config: MinionsConfig;
   approvedHead: string;
   pr: MergePrView;
+  /** Reviewer evidence for exactly the approved head at the current config revision. */
   reviewed: boolean;
+  /**
+   * Base-update derivation for the approved head (base-update.ts deriveApproval), verified from git objects
+   * by the caller. Reviewer evidence of the head the chain ends at counts when every link holds; CI never.
+   */
+  derived?: DerivedApproval;
+  /**
+   * Backlog status of the task: only a delivered task (PR open, no repair under way) merges. Null when
+   * it could not be read: the gate fails closed.
+   */
+  taskStatus: string | null;
   ci: CiGate;
   paths: { ok: true; changedPaths: string[]; sensitivePaths: string[] } | { ok: false; message: string };
   /** Verifies the recorded merge approvals (only called when pr.merge evaluates to "ask"). */
@@ -116,6 +133,8 @@ export interface MergeGate {
   approvalError?: string;
 }
 
+const MERGEABLE_STATUSES = ['delivered', 'awaiting-ci', 'merging'];
+
 /** Pure merge decision for the approved head. Anything short of every gate passing is not eligible. */
 export function evaluateMergeGate(i: MergeGateInput): MergeGate {
   const cfg = i.config;
@@ -125,7 +144,15 @@ export function evaluateMergeGate(i: MergeGateInput): MergeGate {
   if (pr.isCrossRepository) reasons.push('the pull request comes from another repository');
   if (pr.baseRefName !== cfg.git.baseBranch) reasons.push(`the pull request targets ${String(pr.baseRefName)}, not ${cfg.git.baseBranch}`);
   if (pr.headRefOid !== i.approvedHead) reasons.push(`PR head ${String(pr.headRefOid).slice(0, 12)} is not the approved head ${i.approvedHead.slice(0, 12)} (test and review the new head first)`);
-  if (!i.reviewed) reasons.push(`no reviewer approval for ${i.approvedHead.slice(0, 12)} at config revision ${cfg.configRevision}`);
+  if (i.taskStatus === null || i.taskStatus === undefined) reasons.push('the task status could not be read from the backlog');
+  else if (!MERGEABLE_STATUSES.includes(i.taskStatus)) reasons.push(`the task is ${i.taskStatus}, not delivered`);
+  if (!i.reviewed) {
+    // Derived approval (task-68.3): reviewer evidence of H counts for a verified base update H' of it.
+    const derived = i.derived ? derivedApprovalProblems(i.derived, i.approvedHead) : null;
+    if (!derived || derived.length) {
+      reasons.push(`no reviewer approval for ${i.approvedHead.slice(0, 12)} at config revision ${cfg.configRevision}${derived ? ` (derived approval refused: ${derived.slice(0, 3).join('; ')})` : ''}`);
+    }
+  }
   if (i.ci.state !== 'pass') reasons.push(formatCiGate(i.ci));
   let sensitivePaths: string[] = [];
   let denied = false;
@@ -198,10 +225,10 @@ export async function autoMergeTask(d: MergeDeps, taskId: string): Promise<Merge
   const leased = d.db.activeLeases().some((l) => l.task_id === taskId);
   const closeMerged = async (pr: MergePrView, how: 'auto-merge' | 'direct', action: MergeResult['action'] = 'none'): Promise<MergeResult> => {
     await record('merged', { mergedAt: pr.mergedAt ?? null, how }, `minions: pull request ${prUrl} merged${how === 'auto-merge' ? ' by GitHub auto-merge' : ''} at ${head.slice(0, 12)}; task done (merged).`);
-    let task: Task | null = null;
-    try { task = await d.backlog.getTask(taskId); } catch { task = null; }
-    if (task && !leased && task.status !== 'done' && task.status !== 'cancelled') await d.backlog.closeTask(taskId, 'done');
-    return res('merged', `Merged: ${prUrl} at ${head}${task && leased ? ` (task ${taskId} has an active lease; status left unchanged)` : '; task done'}.`, { action });
+    let t: Task | null = null;
+    try { t = await d.backlog.getTask(taskId); } catch { t = null; }
+    if (t && !leased && t.status !== 'done' && t.status !== 'cancelled') await d.backlog.closeTask(taskId, 'done');
+    return res('merged', `Merged: ${prUrl} at ${head}${t && leased ? ` (task ${taskId} has an active lease; status left unchanged)` : '; task done'}.`, { action });
   };
 
   const view = await viewPr(d.gh, prUrl);
@@ -211,16 +238,55 @@ export async function autoMergeTask(d: MergeDeps, taskId: string): Promise<Merge
   if (prState(pr) === 'CLOSED') return res('closed', `Pull request ${prUrl} is closed without merging; nothing to merge.`, { reasons: ['pull request closed'] });
 
   // ---- gates (every one bound to the approved head)
-  const reviewed = d.db.evidenceFor(taskId, head, 'reviewer', cfg.configRevision).some((e) => e.outcome === 'complete');
+  const isReviewed = (h: string) => d.db.evidenceFor(taskId, h, 'reviewer', cfg.configRevision).some((e) => e.outcome === 'complete');
+  const reviewed = isReviewed(head);
   const ci = await d.ciGate(taskId, head);
-  const origin = await githubOrigin(d.git, d.repo);
-  const paths = origin
-    ? await gateChangedPaths({ git: d.git, repo: d.repo, remote: origin.remote, base: cfg.git.baseBranch, head, branch: pub.branch,
+  // The server is the repository of the recorded PR URL, never the workspace's (agent-writable) origin remote
+  // or url.* config; its base is read from an isolated git dir and cross-checked with the GitHub API.
+  const origin = originOfPrUrl(prUrl);
+  const base = cfg.git.baseBranch;
+  const srv = d.serverUrl ? { serverUrl: d.serverUrl } : {};
+  const vb = origin ? await verifiedServerBase({ repo: d.repo, gh: d.gh, origin, base, ...srv }) : { error: `${prUrl} is not a github.com pull request` };
+  let serverBase = 'sha' in vb ? vb.sha : null;
+  let task: Task | null = null;
+  try { task = await d.backlog.getTask(taskId); } catch { task = null; }
+  // Base update (task-68.3): the record is a hint; every condition is recomputed from git objects here
+  // and the pure gate accepts the verified chain. Sensitive paths are those of the reviewed head plus
+  // what each base-update commit changes against its base, plus diff(verified server base, approved head)
+  // (a union: no base removes a path, and content that arrived through the base side shows up).
+  let derived: DerivedApproval | undefined;
+  if (!reviewed && origin && d.db.evidenceFor(taskId, head, BASE_UPDATE_KIND).length) {
+    // Every git call of the derivation (ls-remote and fetch included) uses the allowlisted environment, never d.git.
+    if (serverBase && !(await commitExists(d.repo, serverBase))) {
+      await fetchBase(d.repo, origin, base, { ...srv, haves: [head] });
+      if (!(await commitExists(d.repo, serverBase))) serverBase = null;
+    }
+    derived = await deriveApproval({ repo: d.repo, db: d.db, taskId, head, configRevision: cfg.configRevision, serverBase, isReviewed });
+    if (!serverBase && 'error' in vb) derived.problems.push(vb.error);
+  }
+  const pathsHead = derived && !derivedApprovalProblems(derived, head).length ? derived.reviewedHead! : head;
+  let paths: MergeGateInput['paths'] = origin
+    ? await gateChangedPaths({ git: d.git, repo: d.repo, remote: origin.https, base, head: pathsHead, branch: pub.branch, serverBase,
       baseShas: d.db.leases({ taskId, all: true }).map((l) => l.base_sha), sensitivePaths: cfg.sensitivePaths })
-    : { ok: false as const, message: 'origin is not a github.com repository' };
+    : { ok: false as const, message: `${prUrl} is not a github.com pull request` };
+  if (paths.ok && pathsHead !== head) {
+    const changed = new Set(paths.changedPaths);
+    // Isolated like the derivation itself (base-update.ts withIsolatedRepo): only git objects count. An
+    // accepted derivation always has a verified server base (the ancestry check needs it).
+    const failed = await withIsolatedRepo(d.repo, async (iso) => {
+      for (const [from, to] of [...derived!.links.map((l) => [l.base!, l.head] as const), [serverBase!, head] as const]) {
+        const r = await iso.git(iso.dir, ['diff', '--name-only', '--no-renames', '-z', from, to], true);
+        if (r.code !== 0) return `cannot diff the base update ${to.slice(0, 12)} against ${from.slice(0, 12)}`;
+        for (const f of r.stdout.split('\0')) if (f) changed.add(f);
+      }
+      return null;
+    }).catch((e: unknown) => `cannot diff the base updates: ${String((e as Error)?.message ?? e).slice(0, 300)}`);
+    if (failed) paths = { ok: false, message: failed };
+    if (paths.ok) { const all = [...changed]; paths = { ok: true, changedPaths: all, sensitivePaths: all.filter((p) => matchesAny(p, cfg.sensitivePaths)) }; }
+  }
   const pem = await readFile(d.approvalPublicKeyFile, 'utf8').catch(() => null);
   const gate = evaluateMergeGate({
-    config: cfg, approvedHead: head, pr, reviewed, ci, paths,
+    config: cfg, approvedHead: head, pr, reviewed, ...(derived ? { derived } : {}), taskStatus: task?.status ?? null, ci, paths,
     approval: () => pem
       ? verifyAnyApproval(d.db.approvals(taskId, 'merge', head).map((a) => a.signature), pem, { taskId, head, now: d.now?.(), scope: 'merge' })
       : { ok: false, reason: missingApprovalKeyReason(d.approvalPublicKeyFile) },

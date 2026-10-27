@@ -249,6 +249,11 @@ export const MinionsConfigSchema = z.object({
     maxByRole: z.record(z.string(), z.number().int().min(1)).optional(),
     oneActiveStagePerTask: z.literal(true),
     maxRepairCyclesBeforeReplan: z.number().int().min(1),
+    /**
+     * Needs-rebase rounds per task (a delivered PR that conflicts with its base goes back to the engineer to
+     * merge the base; task-68.4, src/runtime/needs-rebase.ts). Unset = 2; past it the task goes to awaiting-human.
+     */
+    maxRebaseCycles: z.number().int().min(0).optional(),
     attemptMaxTurns: z.number().int().min(1),
   }).strict(),
   models: z.object({
@@ -320,6 +325,14 @@ export const MinionsConfigSchema = z.object({
     baseBranch: branchName,
     identity: z.object({ name: nonEmpty, email: nonEmpty }).strict(),
   }).strict(),
+  /**
+   * Unattended delivery (docs/design/bootstrap.md, "Base update and derived approval"; task-68). Unset = the
+   * defaults. `maxBaseUpdatesPerTask`: verified base updates (a behind PR updated by code) per task in any
+   * 24 hours (default 4); 0 turns base updates off.
+   */
+  routine: z.object({
+    maxBaseUpdatesPerTask: z.number().int().min(0).optional(),
+  }).strict().optional(),
   /** Coordinator session settings (src/runtime/coordinator.ts). */
   coordinator: z.object({
     /**

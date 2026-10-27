@@ -61,7 +61,7 @@ describe('guard: every schema key has a class and a host-owned flag', () => {
   it('matches the design table for the classes and host-owned keys', () => {
     const cls = (k: string) => classifyKey(k)?.class;
     const owned = (k: string) => classifyKey(k)?.hostOwned;
-    for (const k of ['execution.maxActiveTasks', 'execution.maxEngineers', 'execution.maxByRole', 'execution.maxRepairCyclesBeforeReplan',
+    for (const k of ['execution.maxActiveTasks', 'execution.maxEngineers', 'execution.maxByRole', 'execution.maxRepairCyclesBeforeReplan', 'execution.maxRebaseCycles',
       'coordinator.contextReset.enabled', 'verification.commands', 'verification.qaLabels', 'verification.ciPendingTimeoutMinutes',
       'intake.github.labels', 'intake.scope.milestone', 'intake.sources']) expect(cls(k), k).toBe('live');
     for (const k of ['execution.attemptMaxTurns', 'budgets.taskUsd', 'communication.progress', 'models.default', 'models.allowed',

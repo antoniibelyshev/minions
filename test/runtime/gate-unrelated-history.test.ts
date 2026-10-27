@@ -82,7 +82,7 @@ describe('sensitive-path gate: unrelated base history (task-40 QA)', () => {
     const cfg = defaults();
     cfg.delivery.provider = 'github'; cfg.delivery.mode = 'pull-request';
     const gate = evaluateMergeGate({
-      config: cfg, approvedHead: head, reviewed: true, ci: { state: 'pass' } as never,
+      config: cfg, approvedHead: head, reviewed: true, taskStatus: 'delivered', ci: { state: 'pass' } as never,
       pr: { isDraft: false, isCrossRepository: false, baseRefName: 'main', headRefOid: head } as never,
       paths: paths as { ok: false; message: string }, approval: () => ({ ok: true }),
     });

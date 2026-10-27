@@ -19,9 +19,10 @@
 //
 // Residual: the filter list is read just before the command runs, so a concurrently running agent
 // could race a new driver in between (the sandbox already denies sandboxed writes to <repo>/.git/config
-// and minions denies Edit/Write there). In the container, only the process runner (runnerGit below) uses it.
+// and minions denies Edit/Write there). In the container, only the process runner (runnerGit below) and the
+// allowlisted git of the base update (allowlistedGit, at the end) use it.
 import { lstat } from 'node:fs/promises';
-import { join } from 'node:path';
+import { isAbsolute, join } from 'node:path';
 import { MinionsError } from '../core/errors.js';
 import { run, type RunResult } from '../core/exec.js';
 
@@ -88,18 +89,19 @@ export function filterOverrides(configList: string): string[] {
   return [...names].flatMap((n) => ['clean=', 'smudge=', 'process=', 'required=false'].flatMap((v) => ['-c', `filter.${n}.${v}`]));
 }
 
-export type RawRun = (cmd: string, args: string[], opts: { cwd: string; env: NodeJS.ProcessEnv; allowFailure: boolean; timeoutMs: number }) => Promise<RunResult>;
+export type RawRun = (cmd: string, args: string[], opts: { cwd: string; env: NodeJS.ProcessEnv; allowFailure: boolean; timeoutMs: number; signal?: AbortSignal }) => Promise<RunResult>;
 
 /**
  * Runs `git args` in `cwd` with the host-runtime hardening. Work-tree commands also get the filter
  * overrides (read from the repository right before) and GIT_WORK_TREE=cwd when cwd is a work tree.
  */
-export async function hardenedGit(cwd: string, args: string[], allowFailure: boolean, opts: { env?: NodeJS.ProcessEnv; run?: RawRun; timeoutMs?: number } = {}): Promise<RunResult> {
+export async function hardenedGit(cwd: string, args: string[], allowFailure: boolean, opts: { env?: NodeJS.ProcessEnv; run?: RawRun; timeoutMs?: number; signal?: AbortSignal } = {}): Promise<RunResult> {
   const runner = opts.run ?? ((c, a, o) => run(c, a, o));
   const base = opts.env ?? process.env;
   const helper = base.MINIONS_GIT_CREDENTIAL_HELPER || undefined;
   const lead = hardenedGitArgs({ network: isNetworkOp(args), credentialHelper: helper });
   const timeoutMs = opts.timeoutMs ?? 120_000;
+  const signal = opts.signal ? { signal: opts.signal } : {};
   const sub = subcommand(args);
   let extra: string[] = [];
   let workTree: string | undefined;
@@ -107,7 +109,7 @@ export async function hardenedGit(cwd: string, args: string[], allowFailure: boo
     const isWorkTree = await lstat(join(cwd, '.git')).then(() => true, () => false);
     if (isWorkTree) {
       workTree = cwd;
-      const list = await runner('git', [...lead, 'config', '--show-scope', '--name-only', '--get-regexp', '^filter\\.'], { cwd, env: hardenedGitEnv(base), allowFailure: true, timeoutMs: 30_000 });
+      const list = await runner('git', [...lead, 'config', '--show-scope', '--name-only', '--get-regexp', '^filter\\.'], { cwd, env: hardenedGitEnv(base), allowFailure: true, timeoutMs: 30_000, ...signal });
       // exit 1 = no filter keys; anything else means the config could not be read: fail closed.
       if (list.code !== 0 && list.code !== 1) {
         if (allowFailure) return list;
@@ -116,7 +118,7 @@ export async function hardenedGit(cwd: string, args: string[], allowFailure: boo
       extra = filterOverrides(list.stdout);
     }
   }
-  return runner('git', [...lead, ...extra, ...args], { cwd, env: hardenedGitEnv(base, workTree), allowFailure, timeoutMs });
+  return runner('git', [...lead, ...extra, ...args], { cwd, env: hardenedGitEnv(base, workTree), allowFailure, timeoutMs, ...signal });
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -217,4 +219,66 @@ export async function runnerGit(target: RunnerGitTarget | null, args: string[], 
     filters = filterOverrides(list.stdout);
   }
   return runner('git', runnerGitArgv(target, args, filters), { cwd, env, allowFailure, timeoutMs });
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Allowlisted git (task-68.3, docs/design/bootstrap.md "Base update and derived approval"). The git calls a
+// base update or a derived approval depends on (base-update.ts) run in both runtimes with an environment
+// built from an ALLOWLIST, never from the minions process environment: an agent invoking a minions command
+// chooses that environment (GIT_COMMON_DIR, GIT_GRAFT_FILE, GIT_CONFIG_PARAMETERS, HOME/.gitconfig,
+// XDG_CONFIG_HOME, ...). Only the locale, PATH, TZ and TMPDIR are kept (network calls also keep the proxy
+// variables and minions' own MINIONS_* variables, which the credential helper reads); HOME is an empty
+// directory the caller owns, no global or system config or attributes are read, and the only GIT_*
+// variables are the ones set here (hardenedGitEnv plus GIT_CONFIG_GLOBAL, GIT_NO_REPLACE_OBJECTS,
+// GIT_OPTIONAL_LOCKS). The host runtime adds the hardened `-c` options as for every host git call.
+
+/** Variables an allowlisted git call keeps from the caller's environment; everything else is dropped. */
+const ALLOWED_ENV = new Set(['PATH', 'LANG', 'LANGUAGE', 'TZ', 'TMPDIR']);
+const ALLOWED_ENV_PREFIXES = ['LC_'];
+/** Additionally kept for network calls (ls-remote, fetch): proxies and minions' own variables (credential helper). */
+const NETWORK_ENV = new Set(['HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy', 'ALL_PROXY', 'all_proxy', 'NO_PROXY', 'no_proxy']);
+const NETWORK_ENV_PREFIXES = ['MINIONS_'];
+
+export interface AllowlistedGitEnvOptions {
+  /** An empty directory owned by the caller: git's HOME (no ~/.gitconfig, ~/.config/git/*). */
+  home: string;
+  /** ls-remote / fetch: keep the proxy and MINIONS_* variables. */
+  network?: boolean;
+}
+
+/** Environment of an allowlisted git call (see above). `base` is only read for the allowlisted names. */
+export function allowlistedGitEnv(base: NodeJS.ProcessEnv, opts: AllowlistedGitEnvOptions): NodeJS.ProcessEnv {
+  if (!isAbsolute(opts.home)) throw new MinionsError('INTERNAL', `allowlisted git: HOME must be an absolute path: ${JSON.stringify(opts.home)}`);
+  const kept: NodeJS.ProcessEnv = {};
+  for (const [k, v] of Object.entries(base)) {
+    if (v === undefined) continue;
+    const allowed = ALLOWED_ENV.has(k) || ALLOWED_ENV_PREFIXES.some((p) => k.startsWith(p))
+      || (!!opts.network && (NETWORK_ENV.has(k) || NETWORK_ENV_PREFIXES.some((p) => k.startsWith(p))));
+    if (allowed) kept[k] = v;
+  }
+  kept.HOME = opts.home;
+  // hardenedGitEnv drops every GIT_* (none is kept above anyway) and adds GIT_CONFIG_NOSYSTEM, GIT_ATTR_NOSYSTEM,
+  // no prompts and no askpass.
+  const env = hardenedGitEnv(kept);
+  Object.assign(env, { GIT_CONFIG_GLOBAL: '/dev/null', GIT_NO_REPLACE_OBJECTS: '1', GIT_OPTIONAL_LOCKS: '0' });
+  // The container keeps git's default protocol policy (a local origin stays usable, as for every container
+  // git call); the host pins every protocol.*.allow on the command line instead.
+  if (!isHostRuntime(base)) delete env.GIT_PROTOCOL_FROM_USER;
+  return env;
+}
+
+export interface AllowlistedGitOptions extends AllowlistedGitEnvOptions {
+  /** Where the allowlisted names are read from (default process.env). */
+  env?: NodeJS.ProcessEnv;
+  run?: RawRun; timeoutMs?: number; signal?: AbortSignal;
+}
+
+/** Runs `git args` in `cwd` with the allowlisted environment (and, on the host, the hardened `-c` options). */
+export function allowlistedGit(cwd: string, args: string[], allowFailure: boolean, opts: AllowlistedGitOptions): Promise<RunResult> {
+  const runner = opts.run ?? ((c, a, o) => run(c, a, o));
+  const base = opts.env ?? process.env;
+  const env = allowlistedGitEnv(base, opts);
+  // `network` is explicit: behind an isolated call's leading --git-dir / -c options isNetworkOp cannot see the subcommand.
+  const lead = isHostRuntime(base) ? hardenedGitArgs({ network: !!opts.network || isNetworkOp(args), credentialHelper: base.MINIONS_GIT_CREDENTIAL_HELPER || undefined }) : [];
+  return runner('git', [...lead, ...args], { cwd, env, allowFailure, timeoutMs: opts.timeoutMs ?? 120_000, ...(opts.signal ? { signal: opts.signal } : {}) });
 }

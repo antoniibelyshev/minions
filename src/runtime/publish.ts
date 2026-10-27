@@ -26,12 +26,13 @@ import { isHostRuntime } from './git-hardening.js';
 import { missingApprovalKeyReason, runtimePaths } from './paths.js';
 import { git as realGit } from './worktree.js';
 
-export type GhFn = (args: string[], opts?: { input?: string; cwd?: string }) => Promise<RunResult>;
+/** `opts.signal` (optional) kills that call's gh on abort, like the timeout (injected fakes may ignore it). */
+export type GhFn = (args: string[], opts?: { input?: string; cwd?: string; signal?: AbortSignal }) => Promise<RunResult>;
 
 /** gh via the PATH wrapper (/usr/local/bin/gh injects the mounted token for that process only). */
 /** `signal` (optional) kills an in-flight gh on abort (SIGTERM, then SIGKILL), like the timeout. */
 export const ghWithTimeout = (timeoutMs: number, signal?: AbortSignal): GhFn => (args, opts = {}) =>
-  run('gh', args, { cwd: opts.cwd, input: opts.input, allowFailure: true, timeoutMs, signal, env: { ...process.env, GH_PROMPT_DISABLED: '1', GIT_TERMINAL_PROMPT: '0' } });
+  run('gh', args, { cwd: opts.cwd, input: opts.input, allowFailure: true, timeoutMs, signal: opts.signal ?? signal, env: { ...process.env, GH_PROMPT_DISABLED: '1', GIT_TERMINAL_PROMPT: '0' } });
 export const realGh: GhFn = ghWithTimeout(120_000);
 
 export interface PublishInput {
@@ -130,15 +131,21 @@ const FULL_SHA_RE = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
  * recorded SHAs come from the local base ref at each claim and, in the container, ls-remote resolves
  * through agent-writable git config, so no base is ever used to remove a path (decision task-40 in
  * docs/design/bootstrap.md, "Where the gate's bases come from").
+ * `serverBase` (the merge gate and the PR scan, task-68.3): origin's base as the caller already read and
+ * verified it (base-update.ts verifiedServerBase: an isolated ls-remote of the recorded URL, cross-checked
+ * with the GitHub API); then no ls-remote of its own runs, and null means "not available".
  */
-async function gateBases(git: GitFn, repo: string, remote: string, base: string, recorded: (string | null)[]): Promise<{ trusted: string[]; local: string[] }> {
+async function gateBases(git: GitFn, repo: string, remote: string, base: string, recorded: (string | null)[], serverBase?: string | null): Promise<{ trusted: string[]; local: string[] }> {
   const hasCommit = async (rev: string) => (await git(repo, ['rev-parse', '--verify', '--quiet', `${rev}^{commit}`], true)).code === 0;
   const trusted: string[] = [];
   for (const sha of new Set(recorded.filter((s): s is string => !!s && FULL_SHA_RE.test(s)))) {
     if (await hasCommit(sha)) trusted.push(sha);
   }
-  const ls = await git(repo, ['ls-remote', '--heads', remote, `refs/heads/${base}`], true);
-  const remoteBase = ls.code === 0 ? ls.stdout.trim().split(/\s+/)[0] ?? '' : '';
+  let remoteBase = serverBase ?? '';
+  if (serverBase === undefined) {
+    const ls = await git(repo, ['ls-remote', '--heads', remote, `refs/heads/${base}`], true);
+    remoteBase = ls.code === 0 ? ls.stdout.trim().split(/\s+/)[0] ?? '' : '';
+  }
   if (FULL_SHA_RE.test(remoteBase) && await hasCommit(remoteBase)) trusted.push(remoteBase);
   const local: string[] = [];
   for (const ref of [`refs/heads/${base}`, `refs/remotes/origin/${base}`, `refs/remotes/host/${base}`]) {
@@ -164,9 +171,9 @@ export async function githubOrigin(git: GitFn, repo: string): Promise<{ https: s
  * base the gate knows of (see gateBases). Fails closed without a trustworthy base. Shared by
  * publication and the merge gate (src/runtime/merge.ts).
  */
-export async function gateChangedPaths(o: { git: GitFn; repo: string; remote: string; base: string; head: string; branch: string; baseShas: (string | null)[]; sensitivePaths: string[] }):
+export async function gateChangedPaths(o: { git: GitFn; repo: string; remote: string; base: string; head: string; branch: string; baseShas: (string | null)[]; sensitivePaths: string[]; serverBase?: string | null }):
   Promise<{ ok: true; changedPaths: string[]; sensitivePaths: string[] } | { ok: false; code: ErrorCode; message: string }> {
-  const bases = await gateBases(o.git, o.repo, o.remote, o.base, o.baseShas);
+  const bases = await gateBases(o.git, o.repo, o.remote, o.base, o.baseShas, o.serverBase);
   if (!bases.trusted.length) {
     return { ok: false, code: 'PRECONDITION', message: `No trustworthy base for ${o.branch}: no base SHA recorded at claim time is present in the workspace and origin's ${o.base} is not available locally; refusing to evaluate the sensitive-path gate against a movable local ref.` };
   }
