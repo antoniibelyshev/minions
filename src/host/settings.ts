@@ -136,6 +136,9 @@ const DECLARED: readonly DeclaredSetting[] = [
   { key: 'delivery.merge', group: 'Delivery', label: 'Merge mode', type: 'enum', choices: ['disabled', 'manual', 'auto-when-eligible'], apply: 'prompt',
     description: 'whether minions merges pull requests: never, on request, or automatically when CI and approvals pass',
     loosens: (f, t) => (t === 'auto-when-eligible' ? 'pull requests that pass every gate are merged on GitHub without asking' : f === 'disabled' && t === 'manual' ? 'minions may merge pull requests on GitHub when asked' : null) },
+  { key: 'delivery.requiredChecksConfigured', group: 'Delivery', label: 'Required checks configured', type: 'bool', apply: 'live',
+    description: 'true records that required status checks on the base branch gate merging (auto-merge needs it; minions doctor reports ci.requiredChecks)',
+    loosens: turnsOn('auto-merge may arm for pull requests once their required checks pass (with delivery.merge auto-when-eligible)') },
   // ---- Verification
   { key: 'verification.testerRequired', group: 'Verification', label: 'Tester on every task', type: 'bool', apply: 'prompt',
     description: 'true: every task gets a tester stage; false: only tasks that need QA (labels, sensitive paths, reviewer request)',

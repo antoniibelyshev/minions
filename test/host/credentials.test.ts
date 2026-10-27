@@ -3,6 +3,8 @@ import { PassThrough } from 'node:stream';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+// Secrets modes under the default (owner) access, whoever runs the suite: see pin-secrets-access.ts.
+vi.mock('../../src/host/secrets-access.js', async (orig) => (await import('./pin-secrets-access.js')).pinOwnerAccess(await orig()));
 vi.mock('../../src/plugin/generate.js', async () => {
   const { mkdir, writeFile } = await import('node:fs/promises');
   const { join: j } = await import('node:path');
@@ -710,7 +712,8 @@ describe('doctor ci.requiredChecks (read-only, mocked GitHub API)', () => {
       '/repos/acme/demo/actions/workflows?per_page=1': [200, { total_count: 1 }],
     });
     const doc = await runDoctor({ cwd: repo, probe: dockerDown, runner: recorder().runner, fetch: ok.f });
-    expect(doc.checks.find((c) => c.name === 'ci.requiredChecks')).toMatchObject({ status: 'ok', detail: expect.stringMatching(/required checks on main: build; delivery.requiredChecksConfigured false/) });
+    expect(doc.checks.find((c) => c.name === 'ci.requiredChecks')).toMatchObject({ status: 'ok', detail: expect.stringMatching(/required checks on main: build; delivery.requiredChecksConfigured false/),
+      hint: expect.stringContaining('`minions settings set delivery.requiredChecksConfigured true`') });
     expect(ok.seen.every((s) => s.method === 'GET')).toBe(true);
     expect(ok.seen.map((s) => s.path)).toContain('/repos/acme/demo/branches/main');
     expect(JSON.stringify(doc) + formatDoctor(doc)).not.toContain(TOKEN);

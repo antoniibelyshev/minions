@@ -80,6 +80,10 @@ describe('guard: every schema key has a class and a host-owned flag', () => {
     // The most specific entry wins: git.identity (recreate) under git, effortByRole.coordinator (launch) next to the worker roles.
     expect(classifyKey('git.identity.name')?.key).toBe('git.identity');
     expect(classifyKey('models.effortByRole.coordinator')?.reason).toMatch(/--effort/);
+    // task-79: the merge gate reads delivery.requiredChecksConfigured per call (live); still host-owned like delivery.*.
+    expect(classifyKey('delivery.requiredChecksConfigured')).toMatchObject({ key: 'delivery.requiredChecksConfigured', class: 'live', hostOwned: true });
+    expect(classifyKey('delivery.method')).toMatchObject({ key: 'delivery', class: 'restart', hostOwned: true });
+    expect(SETTINGS.find((d) => d.key === 'delivery.requiredChecksConfigured')).toMatchObject({ group: 'Delivery', type: 'bool', apply: 'live', class: 'live', hostOwned: true });
   });
 });
 

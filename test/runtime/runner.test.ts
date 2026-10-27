@@ -223,7 +223,13 @@ describe('work run: supervise, cancel, timeout, drain', () => {
   it('cancel by release: the worker is stopped and nothing is submitted for the ended lease', async () => {
     const r = rig();
     const b = await claim(r);
-    const { p } = await running(r, b, [{ op: 'sleep', ms: 30_000 }]);
+    const workerPid = join(r.root, 'worker.pid');
+    const { p } = await running(r, b, [{ op: 'pidfile', path: workerPid }, { op: 'sleep', ms: 30_000 }]);
+    // 'running' is recorded at spawn, before node has loaded the harness. Releasing then removes the lease
+    // scratch dir (the worker's cwd) under a still-starting node, which can exit on its own before the
+    // runner's next poll (stopped: null). Release only once the harness is really in its sleep.
+    for (let i = 0; i < 100 && !existsSync(workerPid); i++) await sleep(50);
+    expect(existsSync(workerPid)).toBe(true);
     await r.sched.release(b.leaseId, 'owner cancel');
     const out = await p;
     expect(out).toMatchObject({ submitted: false, exit: { stopped: 'lease-ended' } });

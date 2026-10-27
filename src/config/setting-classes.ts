@@ -40,6 +40,9 @@ export const KEY_CLASSES: readonly KeyClass[] = [
     'briefs and the CI gate read them per lease'),
   ...entries(['intake.github'], 'live', false, '`minions sync` and coordinator startup read them per run'),
   ...entries(['intake.scope', 'intake.sources'], 'live', false, 'backlog readiness filter per call'),
+  // ---- live, host-owned
+  ...entries(['delivery.requiredChecksConfigured'], 'live', true,
+    'the merge gate (autoMergeConfigReasons) reads it on each sync / publish; it gates what merges on GitHub'),
   // ---- restart
   ...entries(['execution.attemptMaxTurns'], 'restart', false, 'written into the agent definitions (plugin)'),
   ...entries(['budgets'], 'restart', false, 'prompt text only (not enforced in v0.1)'),

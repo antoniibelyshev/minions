@@ -1,6 +1,8 @@
 // task-14.6: the `codex` credential kind (an OpenAI API key for Codex process workers, agent-runtimes D5).
 import { chmodSync, readFileSync, statSync, writeFileSync } from 'node:fs';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+// Secrets modes under the default (owner) access, whoever runs the suite: see pin-secrets-access.ts.
+vi.mock('../../src/host/secrets-access.js', async (orig) => (await import('./pin-secrets-access.js')).pinOwnerAccess(await orig()));
 import * as C from '../../src/host/credentials.js';
 import { CONTAINER, projectPaths } from '../../src/core/paths.js';
 import { makeRepo, withHome } from './fixtures.js';
