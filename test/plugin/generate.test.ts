@@ -5,7 +5,7 @@ import { join, relative } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 import { generatePlugin, LIVE_CLAUDE_RUN_GUIDANCE, renderPolicySummary, renderTemplate } from '../../src/plugin/generate.js';
 import { DRAIN_HOOK_COMMAND } from '../../src/runtime/drain.js';
-import { PRE_BASH_HOOK_COMMAND } from '../../src/runtime/hooks.js';
+import { PRE_BASH_HOOK_COMMAND, PRE_FILE_READ_HOOK_COMMAND, PRE_FILE_WRITE_HOOK_COMMAND } from '../../src/runtime/hooks.js';
 import type { MinionsConfig } from '../../src/config/schema.js';
 import { defaults, FAKE_MINIONS, runHookCommand } from '../helpers.js';
 
@@ -133,6 +133,9 @@ describe('generatePlugin', () => {
       { matcher: 'Agent', hooks: [{ type: 'command', command: 'timeout 20 minions hook pre-agent || exit 2', timeout: 30 }] },
       // Subagents cannot run minions work run|claim|release (task-14.5); node starts only for subagent calls naming minions.
       { matcher: 'Bash', hooks: [{ type: 'command', command: PRE_BASH_HOOK_COMMAND, timeout: 30 }] },
+      // Subagents cannot write (or read) the runtime state through the file tools (task-72).
+      { matcher: 'Edit|MultiEdit|Write|NotebookEdit', hooks: [{ type: 'command', command: PRE_FILE_WRITE_HOOK_COMMAND, timeout: 30 }] },
+      { matcher: 'Read|Glob|Grep', hooks: [{ type: 'command', command: PRE_FILE_READ_HOOK_COMMAND, timeout: 30 }] },
       // Every tool; gated by a shell test so node starts only while a drain is requested.
       { matcher: '*', hooks: [{ type: 'command', command: DRAIN_HOOK_COMMAND }] },
     ]);

@@ -445,8 +445,11 @@ describe('sensitive-path gate', () => {
   it('approve asks (not allow) even with program-level options before the subcommand', () => {
     const s = coordinatorSettings(defaults()) as { permissions: { allow: string[]; deny: string[]; ask: string[] } };
     // Claude Code wildcard semantics: `*` matches any run of characters, including spaces. Precedence deny > ask > allow.
+    // Only Bash rules decide a Bash command (the container settings also carry Edit denies for the runtime state).
     const glob = (rule: string, cmd: string) => {
-      const m = /^Bash\((.*)\)$/.exec(rule)![1]!;
+      const b = /^Bash\((.*)\)$/.exec(rule);
+      if (!b) return false;
+      const m = b[1]!;
       return new RegExp('^' + m.split('*').map((x) => x.replace(/[.+?^${}()|[\]\\]/g, (ch) => `\\${ch}`)).join('.*') + '$').test(cmd);
     };
     const decide = (cmd: string) => s.permissions.deny.some((r) => glob(r, cmd)) ? 'deny'

@@ -261,6 +261,18 @@ export function hostSettings(h: HostHardening): { sandbox: Record<string, unknow
 
 /** Shell metacharacters and globs a verification command may not contain in the host runtime. */
 const UNSAFE_COMMAND = /[*?;&|`$<>(){}\[\]\\!#~'"\n\r]/;
+/**
+ * Container runtime (task-72): Edit rules for the runtime state only minions itself writes: the DB (and its
+ * -wal/-shm/-journal files), backlog, briefs, submitted results and run records. Permission rules cannot be scoped
+ * per agent, so they bind the coordinator too, which never edits these directly (its notes under the state dir stay
+ * open); Claude subagents are refused the whole state dir by the plugin's pre-file hook. Not in the host runtime:
+ * there Edit denies also become sandbox write denies, and the sandboxed minions CLI must write its DB.
+ */
+export function containerStateDenies(state: string): string[] {
+  const s = ruleAbs(state);
+  return [`Edit(${s}/minions.db)`, `Edit(${s}/minions.db-*)`, ...['backlog', 'briefs', 'results', 'run'].flatMap((d) => [`Edit(${s}/${d})`, `Edit(${s}/${d}/**)`])];
+}
+
 /** Programs whose allow rule would allow anything (shells, wrappers, credential and network CLIs). */
 const UNSAFE_PROGRAMS = new Set(['sh', 'bash', 'zsh', 'fish', 'dash', 'env', 'sudo', 'su', 'xargs', 'eval', 'exec', 'nohup', 'time', 'command', 'nice',
   'osascript', 'security', 'open', 'curl', 'wget', 'ssh', 'scp', 'rsync', 'nc', 'git', 'gh', 'minions', 'claude', 'launchctl', 'crontab', 'defaults']);
@@ -304,7 +316,7 @@ export function coordinatorSettings(cfg: MinionsConfig, opts: { telegram?: boole
       // Publication runs only through `minions work publish` (gated, deterministic); the coordinator never
       // pushes or merges itself. Also cover global options before the subcommand (git -C x push).
       deny: ['Bash(git push *)', 'Bash(git push)', 'Bash(git * push *)', 'Bash(git * push)', 'Bash(gh pr merge *)', 'Bash(gh pr merge)', 'Bash(gh * pr merge *)', 'Bash(gh * pr merge)',
-        ...(hs?.deny ?? [])],
+        ...(hs ? hs.deny : containerStateDenies(runtimePaths().state))],
       // A publication approval must come from the user: Claude Code asks every time (ask beats allow).
       // Also cover program-level options before the subcommand (`minions --json work approve ...`), which would
       // otherwise fall to the `Bash(minions *)` allow.

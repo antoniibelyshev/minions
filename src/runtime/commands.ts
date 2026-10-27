@@ -655,8 +655,10 @@ export function register(program: Command): void {
     .action(async () => { await runHook('stop', hookLoader); exitHook(); });
   hook.command('pre-agent').description('PreToolUse(Agent) hook: minions workers need an active lease')
     .action(async () => { await runHook('pre-agent', hookLoader); exitHook(); });
-  hook.command('pre-bash').description('PreToolUse(Bash) hook: subagents cannot run minions work run|claim|release (coordinator-only)')
+  hook.command('pre-bash').description('PreToolUse(Bash) hook: subagents cannot run coordinator-only minions commands (work run|claim|release, state writes) or name the runtime state dir')
     .action(async () => { await runHook('pre-bash', async () => { throw new Error('pre-bash needs no runtime context'); }); exitHook(); });
+  hook.command('pre-file').description('PreToolUse(file tools) hook: subagents cannot write, read or search the runtime state dir (DB, backlog, briefs, results)')
+    .action(async () => { await runHook('pre-file', async () => { throw new Error('pre-file needs no runtime context'); }); exitHook(); });
   hook.command('pre-telegram').description('PreToolUse(Telegram tools) hook: only the coordinator itself may use them, never a subagent')
     .action(async () => { await runHook('pre-telegram', hookLoader); exitHook(); });
   // DB plus the config when it loads (role contracts for the notice; no backlog): it runs on every worker tool call while a drain is requested.
