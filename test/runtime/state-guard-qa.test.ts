@@ -60,3 +60,49 @@ describe('state guard QA: former gaps (fixed in attempt 2)', () => {
     expect(denied(preBashHook(bash(cmd), container))).toBe(false);
   });
 });
+
+describe('state guard QA: attempt-2 re-test (cache, links, submit heredocs)', () => {
+  it('container: /state/cache stays protected for hardlinks and reads too', () => {
+    for (const cmd of ['ln /state/minions.db /state/cache/db', 'ls /state/cache'])
+      expect(denied(preBashHook(bash(cmd), container)), cmd).toBe(true);
+  });
+
+  it('scratch dir: linking the DB in with a literal absolute path is refused', () => {
+    for (const cmd of ['ln -s /state/minions.db /home/node/.cache/tmp/leases/l/db', 'ln /state/minions.db /home/node/.cache/tmp/leases/l/db'])
+      expect(denied(preBashHook(bash(cmd), container)), cmd).toBe(true);
+  });
+
+  it('submit heredocs: quoted and plain bodies pass; bodies with substitutions, here-strings and the rest of the line are checked', () => {
+    const body = '{"findings":["/state/minions.db"]}';
+    for (const cmd of [
+      `minions work submit lease-1 --role tester --json <<"RESULT"\n${body}\nRESULT`,
+      `minions work submit lease-1 --role tester --json <<\\RESULT\n${body}\nRESULT`,
+      `minions work submit lease-1 --role tester --json <<RESULT\n${body}\nRESULT`,
+    ]) expect(denied(preBashHook(bash(cmd), container)), cmd).toBe(false);
+    for (const cmd of [
+      'minions work submit lease-1 --json <<RESULT\n${X:=/state/minions.db}\nRESULT',
+      'minions work submit lease-1 --json <<RESULT\n`sqlite3 /state/minions.db .tables`\nRESULT',
+      `minions work submit lease-1 --json <<< '${body}'`,
+      "minions work submit lease-1 --json <<'R' && sqlite3 /state/minions.db .tables\n{}\nR",
+      "minions work submit lease-1 --json <<'R' > /state/x\n{}\nR",
+      "minions work submit lease-1 --json <<'R'\n{}\nR\nsqlite3 /state/minions.db .tables",
+      "minions work submit lease-1 --json <<'R'; sh <<'S'\n{}\nR\nsqlite3 /state/minions.db .tables\nS",
+      "minions work submit lease-1 --json <<-R\n{}\n\tR\nsqlite3 /state/minions.db .tables\nR",
+    ]) expect(denied(preBashHook(bash(cmd), container)), cmd).toBe(true);
+  });
+});
+
+describe('state guard QA: known gaps in the submit-heredoc exemption (attempt 2)', () => {
+  // bash joins backslash-newline in an unquoted heredoc before it compares the delimiter, so `R\` + empty line ends
+  // the body there; the scanner reads on to the later `R`, and the sqlite3 line in between runs unchecked.
+  it.fails('an unquoted submit heredoc ended by `R\\` + newline does not hide the next command', () => {
+    const cmd = "minions work submit lease-1 --json <<R\n{}\nR\\\n\nsqlite3 /state/minions.db \"update tasks set pr_url='x'\"\nR";
+    expect(denied(preBashHook(bash(cmd), container))).toBe(true);
+  });
+
+  // `minions` is whatever the shell resolves: a function (or a PATH entry) turns the "data" body into a script.
+  it.fails('a submit heredoc is not exempt when the same line redefines minions as a function', () => {
+    const cmd = "minions(){ sh; }; minions work submit x --json <<'R'\nsqlite3 /state/minions.db .tables\nR";
+    expect(denied(preBashHook(bash(cmd), container))).toBe(true);
+  });
+});
