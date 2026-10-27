@@ -40,6 +40,8 @@ export const KEY_CLASSES: readonly KeyClass[] = [
     'briefs and the CI gate read them per lease'),
   ...entries(['intake.github'], 'live', false, '`minions sync` and coordinator startup read them per run'),
   ...entries(['intake.scope', 'intake.sources'], 'live', false, 'backlog readiness filter per call'),
+  ...entries(['routine'], 'live', false, 'read by each routine pass (`minions sync --routine`) and the wrapper clock'),
+  ...entries(['routine.enabled'], 'live', true, 'lets the runtime start coordinator sessions on its own (wakes, crash starts: model spend)'),
   // ---- restart
   ...entries(['execution.attemptMaxTurns'], 'restart', false, 'written into the agent definitions (plugin)'),
   ...entries(['budgets'], 'restart', false, 'prompt text only (not enforced in v0.1)'),

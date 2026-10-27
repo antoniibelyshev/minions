@@ -518,6 +518,23 @@ describe('file hand-offs and compact reads', () => {
     expect(recover).toMatch(/^1\. `minions coordinator handoff --read --json`/m);
   });
 
+  it('the digest (task-68.5): routine on -> the wake sends the composed digest first and the outbox rules name the holds; off -> no digest step', async () => {
+    const on = await gen({ ...defaults(), routine: { enabled: true, digestAt: ['08:00'], timezone: 'Europe/Berlin' } } as MinionsConfig);
+    const orch = await on.read('skills/orchestrate/SKILL.md');
+    expect(orch).toMatch(/\*\*Digest\*\* \(`digest` among the reasons; 08:00 Europe\/Berlin\): do it before anything else/);
+    expect(orch).toContain('Run `minions notify digest --json`');
+    expect(orch).toMatch(/Send `text` exactly as given with one `reply`.*then ack every key it returns: `minions notify ack <keys\.\.\.> --json`/);
+    expect(orch).toMatch(/At 100% budget the digest is the only reason a wake happens/);
+    const coord = await on.read('coordinator.md');
+    expect(coord).toMatch(/holds `delivered`, `feature` and `question` items for the digest by default/);
+    expect(coord).toMatch(/`goal-ack`, `status` \(owner-requested\), `approval` and `blocker` go out at once/);
+    expect(coord).toContain('`--hold digest`');
+    expect(coord).toMatch(/the recommended one first and marked "\(recommended\)"/);
+    const off = await gen();
+    expect(await off.read('skills/orchestrate/SKILL.md')).not.toContain('minions notify digest');
+    expect(await off.read('coordinator.md')).toMatch(/Nothing is held for a digest while the routine is off/);
+  });
+
   it('coordinator.contextReset.enabled: false keeps resets opt-in (owner request only)', async () => {
     const g = await gen({ ...defaults(), coordinator: { contextReset: { enabled: false } } } as MinionsConfig);
     const coord = await g.read('coordinator.md');

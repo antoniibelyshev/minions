@@ -8,7 +8,7 @@
 import type { RuntimeDb } from './db.js';
 import { MinionsError } from '../core/errors.js';
 
-export const NOTIFICATION_KINDS = ['goal-ack', 'delivered', 'feature', 'blocker', 'approval', 'question', 'status', 'other'] as const;
+export const NOTIFICATION_KINDS = ['goal-ack', 'delivered', 'feature', 'blocker', 'approval', 'question', 'status', 'digest', 'other'] as const;
 export type NotificationKind = (typeof NOTIFICATION_KINDS)[number];
 
 /** Telegram's message limit is 4096 characters; keep notifications short and below it. */
@@ -280,7 +280,14 @@ function requireItem(db: RuntimeDb, key: string): OutboxItem {
   return item;
 }
 
-export interface EnqueueInput { key: string; kind: string; taskId?: string | null; text: string }
+export interface EnqueueInput {
+  key: string; kind: string; taskId?: string | null; text: string;
+  /**
+   * Held for the digest (task-68.5, src/runtime/digest.ts): `next_attempt_at` is set to this instant, so
+   * pending() does not return the item before it. A held row is one with no attempt yet and a next_attempt_at.
+   */
+  holdUntil?: string | null;
+}
 export interface EnqueueResult { created: boolean; item: OutboxItem }
 
 /** Records a notification; an existing key (pending or delivered) is a no-op that returns the stored row. */
@@ -298,9 +305,9 @@ export function enqueue(db: RuntimeDb, input: EnqueueInput, clock: Clock = syste
   return db.transaction(() => {
     const existing = get(db, key);
     if (existing) return { created: false, item: existing };
-    db.exec('INSERT INTO outbox (dedup_key, kind, task_id, text, created_at, attempts) VALUES (?, ?, ?, ?, ?, 0)',
-      key, input.kind, input.taskId ?? null, text, clock().toISOString());
-    db.addEvent('notify-enqueue', input.taskId ?? null, { key, kind: input.kind });
+    db.exec('INSERT INTO outbox (dedup_key, kind, task_id, text, created_at, attempts, next_attempt_at) VALUES (?, ?, ?, ?, ?, 0, ?)',
+      key, input.kind, input.taskId ?? null, text, clock().toISOString(), input.holdUntil ?? null);
+    db.addEvent('notify-enqueue', input.taskId ?? null, { key, kind: input.kind, ...(input.holdUntil ? { holdUntil: input.holdUntil } : {}) });
     return { created: true, item: get(db, key)! };
   });
 }
@@ -317,6 +324,9 @@ export function pending(db: RuntimeDb, opts: { includeWaiting?: boolean; limit?:
   const items = rows.map(toItem);
   return opts.limit !== undefined ? items.slice(0, opts.limit) : items;
 }
+
+/** Held for the digest: undelivered, never attempted, with a next attempt time (a failed send has attempts > 0). */
+export const isHeld = (i: Pick<OutboxItem, 'attempts' | 'nextAttemptAt' | 'deliveredAt'>): boolean => !i.deliveredAt && i.attempts === 0 && i.nextAttemptAt !== null;
 
 /** Marks a notification delivered. Acknowledging an already delivered key is a no-op (it keeps the first delivery). */
 export function ack(db: RuntimeDb, key: string, via = 'unknown', clock: Clock = systemClock): { item: OutboxItem; alreadyDelivered: boolean } {

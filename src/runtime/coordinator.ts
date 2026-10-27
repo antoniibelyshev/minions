@@ -64,6 +64,13 @@ export const RECOVERY_PROMPT = '/minions:recover The coordinator was just restar
   + 'Reconcile the leases left by the previous session, release those without a live worker, re-dispatch interrupted tasks, '
   + 'then resume the queue with /minions:orchestrate. If starts are paused, report that instead of dispatching.';
 
+/**
+ * First user message of a coordinator woken by the routine pass (docs/design/unattended-delivery.md decision 3):
+ * `minions coordinator restart --wake`. Constant: never task or owner text. The session reads the wake reasons from
+ * `minions sync --routine --last --json` (the orchestrate skill's wake step).
+ */
+export const WAKE_PROMPT = '/minions:orchestrate wake';
+
 export interface CoordinatorCommand { cmd: string; args: string[]; cwd: string }
 export type Runner = (cmd: string, args: string[], opts?: RunOptions) => Promise<RunResult>;
 
@@ -428,13 +435,14 @@ async function readPrompt(paths: RuntimePaths): Promise<string> {
 /** `-L <socket>` for the host runtime's dedicated tmux server (never the user's default server). */
 export const tmuxBase = (paths: Pick<RuntimePaths, 'tmuxSocket'>) => (paths.tmuxSocket ? ['-L', paths.tmuxSocket] : []);
 
-export async function buildCoordinatorCommand(cfg: MinionsConfig, paths: RuntimePaths = runtimePaths(), opts: { detached?: boolean; recover?: boolean } = {}): Promise<CoordinatorCommand> {
+export async function buildCoordinatorCommand(cfg: MinionsConfig, paths: RuntimePaths = runtimePaths(), opts: { detached?: boolean; recover?: boolean; wake?: boolean } = {}): Promise<CoordinatorCommand> {
   assertNoBypass(cfg);
+  if (opts.recover && opts.wake) throw new MinionsError('PRECONDITION', 'Use --recover or --wake, not both.');
   await readPrompt(paths); // fail here (doctor --probe), not inside the tmux pane
   return {
     cmd: 'tmux',
     cwd: paths.repo,
-    args: [...tmuxBase(paths), '-u', 'new-session', opts.detached ? '-d' : '-A', '-s', TMUX_SESSION, '-c', paths.repo, '--', 'minions', 'coordinator', 'run', ...(opts.recover ? ['--recover'] : [])],
+    args: [...tmuxBase(paths), '-u', 'new-session', opts.detached ? '-d' : '-A', '-s', TMUX_SESSION, '-c', paths.repo, '--', 'minions', 'coordinator', 'run', ...(opts.recover ? ['--recover'] : []), ...(opts.wake ? ['--wake'] : [])],
   };
 }
 
@@ -1020,6 +1028,12 @@ export interface CoordinatorWrapperDeps extends RunCoordinatorDeps {
    * `stop` is aborted on a signal, and the wrapper does not wait for it after that.
    */
   onStart?: (cfg: MinionsConfig, log: (line: string) => void, stop: AbortSignal) => Promise<void>;
+  /**
+   * The routine clock (docs/design/unattended-delivery.md decision 2): started once the lock is held, right before
+   * claude is spawned, and stopped when the wrapper ends. Returns its stop function. It must never block claude:
+   * the CLI passes startRoutineClock (src/runtime/routine.ts), whose ticks run the pass as a bounded child process.
+   */
+  routineClock?: (log: (line: string) => void) => () => void;
 }
 
 /**
@@ -1035,6 +1049,7 @@ export async function coordinatorWrapper(loadConfig: () => Promise<MinionsConfig
   let db: RuntimeDb | undefined;
   let held: CoordinatorLock | undefined;
   let guard: PreSpawnGuard | undefined;
+  let stopClock: (() => void) | undefined;
   const store = (): CoordinatorLockStore => deps.lock ?? (db ??= openDb(paths.db));
   let code: number;
   try {
@@ -1063,6 +1078,9 @@ export async function coordinatorWrapper(loadConfig: () => Promise<MinionsConfig
       }
       // A signal during the startup step: the race below has already ended the wrapper; never spawn.
       if (g.signal) return exitCodeOf(null, g.signal);
+      if (deps.routineClock) {
+        try { stopClock = deps.routineClock(log); } catch (e) { log(`minions: the routine clock did not start: ${redact((e as Error).message).slice(0, 300)}`); }
+      }
       return runCoordinator(cfg, { ...deps, preSpawn: g });
     })();
     // Errors still reach us through the race; after a pre-spawn signal a late one no longer matters.
@@ -1073,6 +1091,7 @@ export async function coordinatorWrapper(loadConfig: () => Promise<MinionsConfig
     await write({ code: 1, error: redact((e as Error).message).slice(0, 1000) });
     throw e;
   } finally {
+    try { stopClock?.(); } catch { /* best effort */ }
     guard?.dispose();
     if (held) { try { store().releaseCoordinatorLock(held.session, held.pid); } catch { /* a dead holder is taken over next time */ } }
     db?.close();
@@ -1101,7 +1120,7 @@ export interface SyncDeps {
   paths?: RuntimePaths;
   runner?: Runner;
   activeLeases: () => { id: string }[];
-  recordRestart?: (info: { at: string; reason: string; leases: string[]; recover?: boolean }) => void;
+  recordRestart?: (info: { at: string; reason: string; leases: string[]; recover?: boolean; wake?: boolean }) => void;
   readText?: (p: string) => Promise<string>;
   /** How long a detached start waits before re-checking that the wrapper is still alive (default 2000ms). */
   settleMs?: number;
@@ -1163,7 +1182,8 @@ export async function telegramPollerStatus(deps: { paths?: RuntimePaths; proc?: 
  * the runtime DB for `recover`. `startDetached` then (re)starts the session without a terminal, so
  * Telegram works with nobody attached.
  */
-export async function syncCoordinator(cfg: MinionsConfig, deps: SyncDeps, opts: { force?: boolean; startDetached?: boolean; restart?: boolean; recover?: boolean } = {}): Promise<SyncResult> {
+export async function syncCoordinator(cfg: MinionsConfig, deps: SyncDeps, opts: { force?: boolean; startDetached?: boolean; restart?: boolean; recover?: boolean; wake?: boolean } = {}): Promise<SyncResult> {
+  const mode = { ...(opts.recover ? { recover: true } : {}), ...(opts.wake ? { wake: true } : {}) };
   const paths = deps.paths ?? runtimePaths();
   const runner = deps.runner ?? run;
   let running = await tmuxHas(runner, paths);
@@ -1180,7 +1200,7 @@ export async function syncCoordinator(cfg: MinionsConfig, deps: SyncDeps, opts: 
     if (leases.length && !opts.force) {
       return { action: 'restart-pending', running, reason: `${reason}; restart deferred: ${leases.length} active worker lease(s) (${leases.join(', ')}). Rerun with --force, or after they finish.`, telegram: rec?.telegram ?? null };
     }
-    deps.recordRestart?.({ at: new Date().toISOString(), reason, leases, ...(opts.recover ? { recover: true } : {}) });
+    deps.recordRestart?.({ at: new Date().toISOString(), reason, leases, ...mode });
     await runner('tmux', [...tmuxBase(paths), 'kill-session', '-t', TMUX_SESSION], { allowFailure: true, timeoutMs: 10_000 });
     // The old wrapper releases the lock once claude has exited; relaunching before that would race it.
     if (deps.lock && !(await waitForLockRelease(deps.lock, { alive: deps.lockAlive, waitMs: deps.lockReleaseWaitMs, sleep: deps.sleep }))) {
@@ -1199,8 +1219,8 @@ export async function syncCoordinator(cfg: MinionsConfig, deps: SyncDeps, opts: 
     reason = 'coordinator is running without a launch record (started by an older minions); restart it to apply Telegram settings';
   }
   if (!running && opts.startDetached) {
-    if (opts.restart && action === 'none') deps.recordRestart?.({ at: new Date().toISOString(), reason: 'restart requested; coordinator was not running', leases: deps.activeLeases().map((l) => l.id), ...(opts.recover ? { recover: true } : {}) });
-    const c = await buildCoordinatorCommand(cfg, paths, { detached: true, recover: opts.recover });
+    if (opts.restart && action === 'none') deps.recordRestart?.({ at: new Date().toISOString(), reason: 'restart requested; coordinator was not running', leases: deps.activeLeases().map((l) => l.id), ...mode });
+    const c = await buildCoordinatorCommand(cfg, paths, { detached: true, recover: opts.recover, wake: opts.wake });
     await rm(paths.coordinatorExit, { force: true }).catch(() => { /* a stale record only weakens the message */ });
     const prior = deps.lock?.coordinatorLock();
     const r = await runner(c.cmd, c.args, { cwd: c.cwd, allowFailure: true, timeoutMs: 30_000 });
@@ -1234,6 +1254,7 @@ export async function syncCoordinator(cfg: MinionsConfig, deps: SyncDeps, opts: 
     running = true;
     if (action === 'none') { action = 'started'; reason = 'coordinator started detached'; } else reason += '; coordinator relaunched detached';
     if (opts.recover) reason += ' with the recovery prompt';
+    if (opts.wake) reason += ' with the wake prompt';
     reason += lockNote;
   }
   return { action, running, reason, telegram: rec?.telegram ?? null };
@@ -1245,7 +1266,7 @@ export async function syncCoordinator(cfg: MinionsConfig, deps: SyncDeps, opts: 
  * runs the recover skill and resumes the queue. Refuses while worker leases are active in a running
  * session (their workers would die) unless `force`; the leases stay recorded for recovery either way.
  */
-export async function restartCoordinator(cfg: MinionsConfig, deps: SyncDeps, opts: { force?: boolean; recover?: boolean } = {}): Promise<SyncResult> {
+export async function restartCoordinator(cfg: MinionsConfig, deps: SyncDeps, opts: { force?: boolean; recover?: boolean; wake?: boolean } = {}): Promise<SyncResult> {
   const r = await syncCoordinator(cfg, deps, { ...opts, restart: true, startDetached: true });
   if (r.action === 'restart-pending') {
     throw new MinionsError('PRECONDITION', `Coordinator restart refused: ${r.reason}`,
@@ -1277,7 +1298,8 @@ export interface DetachedRestartDeps {
  * also refuses unless `force` (task-49): the upgrade behind it restarts the coordinator itself. Only this
  * self-restart checks the drain; plain `coordinator restart` (what the host upgrade runs) does not.
  */
-export function scheduleDetachedRestart(deps: DetachedRestartDeps, opts: { force?: boolean; recover?: boolean } = {}): { action: 'restart-scheduled'; log: string; pid: number | null; reason: string } {
+export function scheduleDetachedRestart(deps: DetachedRestartDeps, opts: { force?: boolean; recover?: boolean; wake?: boolean } = {}): { action: 'restart-scheduled'; log: string; pid: number | null; reason: string } {
+  if (opts.recover && opts.wake) throw new MinionsError('PRECONDITION', 'Use --recover or --wake, not both.');
   const leases = deps.activeLeases().map((l) => l.id);
   if (leases.length && !opts.force) {
     throw new MinionsError('PRECONDITION', `Coordinator restart refused: ${leases.length} active worker lease(s) (${leases.join(', ')}).`,
@@ -1292,12 +1314,36 @@ export function scheduleDetachedRestart(deps: DetachedRestartDeps, opts: { force
   const fd = open(deps.log);
   try {
     const spawn: DetachedSpawn = deps.spawn ?? ((c, a, o) => nodeSpawn(c, a, o));
-    const child = spawn('minions', ['coordinator', 'restart', ...(opts.recover ? ['--recover'] : []), ...(opts.force ? ['--force'] : [])],
+    const child = spawn('minions', ['coordinator', 'restart', ...(opts.recover ? ['--recover'] : []), ...(opts.wake ? ['--wake'] : []), ...(opts.force ? ['--force'] : [])],
       { cwd: deps.cwd, detached: true, stdio: ['ignore', fd, fd], env: deps.env ?? process.env });
     child.on('error', () => { /* the log shows nothing then; the caller's session keeps running and can retry */ });
     child.unref();
     return { action: 'restart-scheduled', log: deps.log, pid: child.pid ?? null,
-      reason: `coordinator restart${opts.recover ? ' --recover' : ''} runs detached; this session ends when it kills the tmux session (output: ${deps.log})` };
+      reason: `coordinator restart${opts.recover ? ' --recover' : ''}${opts.wake ? ' --wake' : ''} runs detached; this session ends when it kills the tmux session (output: ${deps.log})` };
+  } finally {
+    try { closeSync(fd); } catch { /* the child holds its own copy */ }
+  }
+}
+
+/**
+ * The routine pass's crash start (task-68.2): the coordinator is not running and its exit was a crash. Separate from
+ * the wake on purpose: nothing runs that a restart could kill, so the lease check does not apply, but a drain or an
+ * upgrade in progress refuses (that upgrade starts the coordinator itself). Spawns `minions coordinator restart
+ * --recover` detached (never --force: if a coordinator came up meanwhile, the restart's own lease check applies).
+ */
+export function scheduleCrashStart(deps: Omit<DetachedRestartDeps, 'activeLeases'> & { upgrade?: () => string | null }): { action: 'start-scheduled'; log: string; pid: number | null; reason: string } {
+  const drain = deps.drain();
+  if (drain) throw new MinionsError('PRECONDITION', `Coordinator start refused: a drain is in progress (${drain.reason}).`, 'The upgrade behind it starts the coordinator itself.');
+  const up = deps.upgrade?.() ?? null;
+  if (up) throw new MinionsError('PRECONDITION', `Coordinator start refused: an upgrade is in progress (${up}).`, 'The upgrade starts the coordinator itself.');
+  const open = deps.openLog ?? ((f: string) => { mkdirSync(dirname(f), { recursive: true }); return openSync(f, 'a', 0o600); });
+  const fd = open(deps.log);
+  try {
+    const spawn: DetachedSpawn = deps.spawn ?? ((c, a, o) => nodeSpawn(c, a, o));
+    const child = spawn('minions', ['coordinator', 'restart', '--recover'], { cwd: deps.cwd, detached: true, stdio: ['ignore', fd, fd], env: deps.env ?? process.env });
+    child.on('error', () => { /* the next pass sees it still down and counts the next try */ });
+    child.unref();
+    return { action: 'start-scheduled', log: deps.log, pid: child.pid ?? null, reason: `coordinator restart --recover runs detached (output: ${deps.log})` };
   } finally {
     try { closeSync(fd); } catch { /* the child holds its own copy */ }
   }
