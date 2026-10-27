@@ -680,8 +680,8 @@ Decision record for the PR scan (task-68.3, phase 2 of the unattended-delivery d
 - **The table.** `CLEAN`, `BLOCKED`, `UNSTABLE`, `HAS_HOOKS`: nothing (the merge pass decides).
   `UNKNOWN`: retry on the next pass. `BEHIND`: base update (below). `DIRTY` / `CONFLICTING`: a fresh fetch
   and a local merge-tree decide: clean → base update, conflict → `conflict` with the files, an event,
-  a status notification and the `onConflict` hook (the needs-rebase stage of task-68.4 builds on it; the
-  task stays `delivered` until then). Required checks `fail` at the approved head (`Scheduler.ciGate`):
+  auto-merge disarmed (a failed disarm skips the task until the next pass) and the `onConflict` hook: the
+  needs-rebase stage below (`Scheduler.needsRebase`, the scheduler's default). Required checks `fail` at the approved head (`Scheduler.ciGate`):
   disarm, then `ciRepair`: `delivered` → `changes-requested` at the final gate's repair target, counted
   as a repair cycle (the same rule as `ciBlock === 'fail'` in record; at
   `execution.maxRepairCyclesBeforeReplan` → `awaiting-human`). The findings (`ci-repair` evidence) reach
@@ -797,8 +797,40 @@ the scan above, `evaluateMergeGate` / `autoMergeTask` in `src/runtime/merge.ts`)
   workspace config, as before this task. A few short local git calls
   of the scan (`headOf`, `isDirty`, `listWorktrees`) and the CI gate's gh reads are not wired to the
   abort signal; their own timeouts bound them. Not built here: the
-  needs-rebase stage for real conflicts (task-68.4) and the routine pass that runs the scan on a clock
-  (task-68.2).
+  routine pass that runs the scan on a clock (task-68.2).
+
+## Needs-rebase stage
+
+Decision record for PRs with a real conflict against the base (task-68.4, design decision 6;
+`src/runtime/needs-rebase.ts`, `Scheduler.needsRebase`, the conflict row of the PR scan above).
+
+- **A label, not a status.** A conflict the scan confirmed (isolated merge-tree after a fresh fetch, PR at
+  the approved head, no lease) has auto-merge disarmed by the scan; then `delivered` → `changes-requested`
+  with the label `minions:needs-rebase`, the stage position at the final gate's repair target (the first
+  producer, as `ciRepair`), and `needs-rebase` evidence on the conflicting head `{head, base, baseBranch,
+  files, prUrl, round, findings, nextAction}`. **Not a repair cycle**: `repairs` is not incremented (a
+  reviewer asking for changes during the round still counts, as always). The task is no longer
+  `delivered`, so later scans leave it alone: one round per conflict.
+- **Priority.** `work next` sorts candidates of labelled tasks before every other candidate (then priority,
+  then started before ready); the entry's reason says `needs-rebase round n/max`.
+- **Briefs.** While the label is on, every stage's brief has `rebase` `{previousHead, base, baseBranch,
+  conflictFiles, prUrl, round, maxRounds, guidance}`; the guidance is to merge the base into the branch and
+  never rebase, amend or force-push (the PR is reused and publication pushes fast-forward only). The engineer
+  brief also gets the round's findings once in `priorFindings` (role `needs-rebase`). A gate (reviewer) brief
+  adds `resolutionDiff`: `git diff <merge-tree with conflict markers> <head>`, where the merge is the newest
+  merge commit on `previousHead..head` (its two parents re-merged; without one, `previousHead` and the
+  recorded base), cut at 64 KiB (`resolutionDiffTruncated`). It runs in the isolated, allowlisted git dir of
+  the base update; a failure gives `resolutionDiff: null` and `resolutionDiffError`, never a failed claim.
+- **Record check.** A producer reporting `complete` in a round must leave a head that contains
+  `previousHead` (no rebase) and the recorded base (the merge happened); otherwise the result is rejected
+  with the usual one correction.
+- **Limit.** `execution.maxRebaseCycles` (default 2, live, min 0) caps rounds per task. The next conflict
+  goes `delivered` → `awaiting-human` (no label) with an outbox `question` (`needs-rebase-limit:<task>:<head>:<base>`):
+  "main keeps changing the same files: merge the other task first, split this one, or let me try again?"
+  (task-68.5's digest holds questions; until then it is sent like any other notification).
+- **Delivery.** The reviewer's approval publishes the new head as a fast-forward of the PR branch;
+  `findPr` reuses the open PR (`pr: "existing"`). The label is removed when the task is delivered again
+  (`publish`, and a local-mode delivery in record).
 
 ## GitHub intake sync
 

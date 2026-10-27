@@ -77,7 +77,8 @@ const tail = (s: string) => redact(s.trim().split('\n').slice(-3).join(' | ')).s
 
 export type MergeTreeResult =
   | { state: 'clean'; tree: string }
-  | { state: 'conflict'; files: string[] }
+  /** `tree`: the merged tree with conflict markers (the needs-rebase resolution diff compares the resolved head with it). */
+  | { state: 'conflict'; files: string[]; tree: string }
   /** A custom or union merge driver applies, or git failed: never treated as clean. */
   | { state: 'refused' | 'error'; message: string };
 
@@ -205,7 +206,7 @@ async function isolatedMergeTree(iso: IsolatedRepo, ours: string, theirs: string
   const parts = r.stdout.split('\0');
   const tree = parts[0]?.trim() ?? '';
   if (r.code === 0 && FULL_SHA.test(tree)) return { state: 'clean', tree };
-  if (r.code === 1 && FULL_SHA.test(tree)) return { state: 'conflict', files: [...new Set(parts.slice(1).filter(Boolean))] };
+  if (r.code === 1 && FULL_SHA.test(tree)) return { state: 'conflict', files: [...new Set(parts.slice(1).filter(Boolean))], tree };
   return { state: 'error', message: `git merge-tree failed: ${tail(r.stderr || r.stdout) || `exit ${r.code}`}` };
 }
 

@@ -17,6 +17,8 @@ import { evaluateMergeGate } from '../../src/runtime/merge.js';
 import { boundedScan, runPrScan, type ScanReport } from '../../src/runtime/pr-scan.js';
 import { publishTask, type GhFn, type PublishInput } from '../../src/runtime/publish.js';
 import { Scheduler } from '../../src/runtime/scheduler.js';
+import { DEFAULT_MAX_REBASE_CYCLES, maxRebaseCyclesOf, NEEDS_REBASE_KIND, NEEDS_REBASE_LABEL } from '../../src/runtime/needs-rebase.js';
+import { pending } from '../../src/runtime/outbox.js';
 import { abortableGit, git as realGit } from '../../src/runtime/worktree.js';
 import { approvalKeys, commitFile, gitSync, makeDefaultEnv, result, tmp, type Env } from './fixtures.js';
 
@@ -38,6 +40,8 @@ class ScanGh {
   prs: Pr[] = [];
   calls: string[][] = [];
   apiBase: string | null | undefined = undefined;
+  /** gh pr merge --disable-auto fails (GitHub down). */
+  failDisarm = false;
   constructor(private bare: string) {}
   head(p: Pr) { return execFileSync('git', ['-C', this.bare, 'rev-parse', `refs/heads/${p.headRefName}`], { encoding: 'utf8' }).trim(); }
   lists() { return this.calls.filter((c) => c[0] === 'pr' && c[1] === 'list' && c.includes('--state') && c[c.indexOf('--state') + 1] === 'open' && !c.includes('--head')); }
@@ -75,7 +79,7 @@ class ScanGh {
         mergeStateStatus: p.mergeStateStatus, autoMergeRequest: p.autoMergeRequest, isCrossRepository: false, statusCheckRollup: p.rollup[head] ?? [] }));
     }
     if (args[0] === 'pr' && args[1] === 'merge' && p) {
-      if (args.includes('--disable-auto')) { p.autoMergeRequest = null; return ok(''); }
+      if (args.includes('--disable-auto')) { if (this.failDisarm) return bad('gh: HTTP 502'); p.autoMergeRequest = null; return ok(''); }
       if (flag('--match-head-commit') !== this.head(p)) return bad('GraphQL: Head branch was modified.');
       p.autoMergeRequest = { mergeMethod: 'SQUASH' };
       return ok('');
@@ -147,6 +151,8 @@ function landOnMain(env: SEnv, file: string, content: string): string {
 
 const sync = (env: SEnv) => syncTasks({ db: env.db, backlog: env.backlog, config: env.config, gh: env.gh.fn, merge: (id) => env.sched.autoMerge(id), scan: (ids) => env.sched.scanPullRequests({ taskIds: ids }) });
 const scan = (env: SEnv) => env.sched.scanPullRequests();
+/** A scan whose conflict hook only reports (the task stays delivered), so the same conflict can be scanned again. */
+const reportOnly = (env: SEnv) => env.sched.scanPullRequests({ onConflict: async () => {} });
 const action = (s: ScanReport, id: string) => s.tasks.find((t) => t.taskId === id);
 const bareHead = (env: SEnv, branch: string) => gitSync(env.bare, 'rev-parse', `refs/heads/${branch}`);
 /** Runs `fn` with `vars` set in process.env (what an agent can do by invoking a minions command), then restores. */
@@ -553,20 +559,20 @@ describe('merge attributes outside the commits\' trees never count (isolated mer
   it('regression: an untracked nested .gitattributes (and the index, info/attributes, merge.default) in the checkout does not make a conflict clean', async () => {
     const env = scanEnv();
     const { head: H, branch, B } = await conflicting(env);
-    expect(action(await scan(env), 'task-1')).toMatchObject({ action: 'conflict', conflictFiles: ['sub/s.txt'] });
+    expect(action(await reportOnly(env), 'task-1')).toMatchObject({ action: 'conflict', conflictFiles: ['sub/s.txt'] });
 
     mkdirSync(join(env.layout.repo, 'sub'), { recursive: true });
     plantUnion(env);
     // Plain git in the checkout follows it (the defect this guards against): the merge is "clean" there.
     expect(gitSync(env.layout.repo, 'merge-tree', '--write-tree', H, B)).toMatch(/^[0-9a-f]{40}$/);
-    let s = await scan(env);
+    let s = await reportOnly(env);
     expect(action(s, 'task-1')).toMatchObject({ action: 'conflict', conflictFiles: ['sub/s.txt'], base: B });
 
     // The same through the checkout's index, .git/info/attributes and the repository config.
     gitSync(env.layout.repo, 'add', '-f', 'sub/.gitattributes');
     writeFileSync(join(env.layout.repo, '.git', 'info', 'attributes'), 'sub/s.txt merge=union\n');
     gitSync(env.layout.repo, 'config', 'merge.default', 'union');
-    s = await scan(env);
+    s = await reportOnly(env);
     expect(action(s, 'task-1')).toMatchObject({ action: 'conflict', conflictFiles: ['sub/s.txt'] });
 
     // Nothing was updated, recorded or pushed.
@@ -1021,5 +1027,175 @@ describe('the server is the recorded origin URL: the workspace .git/config never
     expect(await tainted(taint, () => serverRefOf(env.layout.repo, origin, 'main', { serverUrl: env.serverUrl }))).toBe(real);
     expect(await serverRefOf(env.layout.repo, origin, 'nope', { serverUrl: env.serverUrl })).toBeNull();
     for (const bad of ['https://github.com/acme/demo/pulls', 'https://evil.example/acme/demo/pull/1', 'https://github.com/acme/../pull/1', null]) expect(originOfPrUrl(bad)).toBeNull();
+  });
+});
+
+describe('needs-rebase stage (task-68.4): a confirmed conflict goes back to the engineer', () => {
+  /** The PR and main each change sub/s.txt's last line: a real conflict. */
+  async function conflicting(env: SEnv, id = 'task-1') {
+    const d = await deliver(env, id, 'sub/s.txt', 'l1\nl2\nBRANCH\n');
+    const B = landOnMain(env, 'sub/s.txt', 'l1\nl2\nMAIN\n');
+    d.pr.mergeStateStatus = 'DIRTY';
+    d.pr.mergeable = 'CONFLICTING';
+    return { ...d, B };
+  }
+  /** In the engineer worktree: merge main (conflict), resolve to both lines, commit the merge. */
+  function mergeMain(worktree: string): string {
+    try { execFileSync('git', ['merge', '--no-edit', 'main'], { cwd: worktree, stdio: 'pipe' }); } catch { /* the conflict */ }
+    writeFileSync(join(worktree, 'sub', 's.txt'), 'l1\nl2\nBRANCH\nMAIN\n');
+    gitSync(worktree, 'add', 'sub/s.txt');
+    gitSync(worktree, 'commit', '-q', '--no-edit');
+    return gitSync(worktree, 'rev-parse', 'HEAD');
+  }
+  const task = (env: SEnv, id = 'task-1') => env.backlog.tasks.get(id)!;
+
+  it('disarms, labels minions:needs-rebase, changes-requested at the repair target; not a repair cycle; scanned once', async () => {
+    const env = scanEnv();
+    const { head: H, pr, B } = await conflicting(env);
+    pr.rollup[H] = passing;
+    pr.mergeStateStatus = 'BLOCKED'; pr.mergeable = 'MERGEABLE';
+    expect((await sync(env)).tasks[0]!.merge?.state).toBe('armed');
+    pr.mergeStateStatus = 'DIRTY'; pr.mergeable = 'CONFLICTING';
+
+    const s = await scan(env);
+    expect(action(s, 'task-1')).toMatchObject({ action: 'conflict', conflictFiles: ['sub/s.txt'], base: B, to: 'changes-requested' });
+    expect(env.gh.merges().at(-1)).toEqual(['pr', 'merge', pr.url, '--disable-auto']);
+    expect(env.db.evidenceOfKind('task-1', 'merge').at(-1)!.outcome).toBe('disarmed');
+    expect(env.backlog.status('task-1')).toBe('changes-requested');
+    expect(task(env).labels).toContain(NEEDS_REBASE_LABEL);
+    expect(env.db.taskStage('task-1')!.position).toBe(0); // the engineer (repair target)
+    expect(env.db.repairCycles('task-1')).toBe(0);
+    const ev = env.db.evidenceOfKind('task-1', NEEDS_REBASE_KIND);
+    expect(ev).toHaveLength(1);
+    expect(ev[0]).toMatchObject({ head_sha: H, outcome: 'changes-requested' });
+    expect(JSON.parse(ev[0]!.details_json!)).toMatchObject({ head: H, base: B, baseBranch: 'main', files: ['sub/s.txt'], prUrl: pr.url, round: 1 });
+    // Not delivered any more: the next scan leaves it alone (no second round for the same conflict).
+    const again = await scan(env);
+    expect(action(again, 'task-1')).toBeUndefined();
+    expect(env.db.evidenceOfKind('task-1', NEEDS_REBASE_KIND)).toHaveLength(1);
+  });
+
+  it('a failed disarm keeps the task delivered and retries on the next pass', async () => {
+    const env = scanEnv();
+    const { head: H, pr } = await conflicting(env);
+    pr.rollup[H] = passing;
+    pr.mergeStateStatus = 'BLOCKED'; pr.mergeable = 'MERGEABLE';
+    expect((await sync(env)).tasks[0]!.merge?.state).toBe('armed');
+    pr.mergeStateStatus = 'DIRTY'; pr.mergeable = 'CONFLICTING';
+    env.gh.failDisarm = true;
+    const s = await env.sched.scanPullRequests();
+    expect(action(s, 'task-1')).toMatchObject({ action: 'skipped' });
+    expect(action(s, 'task-1')!.message).toMatch(/auto-merge could not be disabled/);
+    expect(env.backlog.status('task-1')).toBe('delivered');
+    expect(task(env).labels).not.toContain(NEEDS_REBASE_LABEL);
+    env.gh.failDisarm = false;
+    expect(action(await scan(env), 'task-1')).toMatchObject({ action: 'conflict', to: 'changes-requested' });
+  });
+
+  it('work next sorts a needs-rebase task before every other candidate', async () => {
+    const env = scanEnv();
+    await conflicting(env, 'task-1');
+    // task-2: delivered, then sent to repair by failing CI, with a higher priority (and no label).
+    const t2 = await deliver(env, 'task-2', 'b.txt', 'two\n');
+    env.backlog.tasks.get('task-2')!.priority = 'high';
+    await env.sched.ciRepair('task-2', t2.head, ['required checks fail']);
+    expect((await env.sched.next()).runnable.map((r) => r.taskId)).toEqual(['task-2']);
+    await scan(env);
+    const next = await env.sched.next();
+    expect(next.runnable.map((r) => r.taskId)).toEqual(['task-1', 'task-2']);
+    expect(next.runnable[0]!.reason).toMatch(/needs-rebase round 1\/2/);
+    expect(next.runnable[0]!.role).toBe('engineer');
+  });
+
+  it('engineer brief: conflictFiles, previousHead and merge-not-rebase guidance; a rebase or a missing merge is refused at record', async () => {
+    const env = scanEnv();
+    const { head: H, B, branch } = await conflicting(env);
+    await scan(env);
+    const eng = await env.sched.claim('task-1', 'engineer');
+    expect(eng.rebase).toMatchObject({ previousHead: H, base: B, baseBranch: 'main', conflictFiles: ['sub/s.txt'], round: 1, maxRounds: 2 });
+    expect(eng.rebase!.guidance).toMatch(/git merge main/);
+    expect(eng.rebase!.guidance).toMatch(/Never rebase, amend or force-push/);
+    expect(eng.rebase!.resolutionDiff).toBeUndefined(); // reviewer only
+    const pf = eng.priorFindings.find((f) => f.role === 'needs-rebase')!;
+    expect(pf.findings.join(' ')).toMatch(/conflicts with main at .* in sub\/s\.txt; merge origin\/main into the branch, resolve, never rebase or force-push/);
+    expect(gitSync(env.layout.repo, 'rev-parse', 'refs/heads/main')).toBe(B); // the claim synced main from origin
+
+    // A fix on top of H without merging main.
+    const plain = commitFile(eng.worktree, 'other.txt', 'x\n');
+    let r = await env.sched.record(eng.leaseId, result({ branch, headSha: plain, modifiedPaths: ['other.txt'] }));
+    expect(r.valid).toBe(false);
+    expect(r.errors!.join(' ')).toMatch(/does not contain main at/);
+    // A rebase onto main (H is no longer contained).
+    gitSync(eng.worktree, 'reset', '-q', '--hard', B);
+    const rebased = commitFile(eng.worktree, 'sub/s.txt', 'l1\nl2\nBRANCH\nMAIN\n');
+    r = await env.sched.record(eng.leaseId, result({ branch, headSha: rebased, modifiedPaths: ['sub/s.txt'] }), { correction: true });
+    expect(r).toMatchObject({ valid: false, unvalidated: true });
+    expect(r.errors!.join(' ')).toMatch(/does not contain the previous PR head .*instead of rebasing/);
+  });
+
+  it('merge -> reviewer brief with the resolution diff -> published to the same PR (fast-forward), label cleared, no repair cycle', async () => {
+    const env = scanEnv();
+    const { head: H, B, branch, pr } = await conflicting(env);
+    await scan(env);
+    const eng = await env.sched.claim('task-1', 'engineer');
+    const H2 = mergeMain(eng.worktree);
+    expect(parents(env, H2)).toEqual([H, B]);
+    const e = await env.sched.record(eng.leaseId, result({ branch, headSha: H2, modifiedPaths: ['sub/s.txt'] }));
+    expect(e.valid).toBe(true);
+    if (e.to === 'testing') {
+      const t = await env.sched.claim('task-1', 'tester');
+      expect(t.rebase).toMatchObject({ previousHead: H });
+      await env.sched.record(t.leaseId, result({ branch, headSha: H2 }));
+    }
+    const rev = await env.sched.claim('task-1', 'reviewer');
+    expect(rev.rebase).toMatchObject({ previousHead: H, base: B, conflictFiles: ['sub/s.txt'] });
+    const diff = rev.rebase!.resolutionDiff!;
+    expect(diff).toMatch(/^diff --git a\/sub\/s\.txt b\/sub\/s\.txt/m);
+    expect(diff).toMatch(/^-<<<<<<< /m);
+    expect(diff).toMatch(/^-=======/m);
+    expect(diff).toMatch(/^->>>>>>> /m);
+    expect(diff).not.toMatch(/README/); // only the hand-resolved lines
+
+    const prs = env.gh.prs.length;
+    const r = await env.sched.record(rev.leaseId, result({ branch, headSha: H2, verdict: 'approve' }));
+    expect(r.publication).toMatchObject({ state: 'published', pr: 'existing', prUrl: pr.url, push: 'pushed' });
+    expect(env.gh.prs.length).toBe(prs); // the PR is reused
+    expect(bareHead(env, branch)).toBe(H2);
+    expect(env.backlog.status('task-1')).toBe('delivered');
+    expect(task(env).labels).not.toContain(NEEDS_REBASE_LABEL);
+    expect(task(env).prUrl).toBe(pr.url);
+    expect(env.db.repairCycles('task-1')).toBe(0);
+    expect(env.db.events('task-1', NEEDS_REBASE_KIND).map((x) => (x.data as { state: string }).state)).toEqual(['started', 'cleared']);
+    // The next scan sees H2 already contains main: nothing to do.
+    expect(action(await scan(env), 'task-1')!.action).toBe('none');
+  });
+
+  it('execution.maxRebaseCycles (default 2): past it -> awaiting-human with a question, no label', async () => {
+    expect(DEFAULT_MAX_REBASE_CYCLES).toBe(2);
+    const env = scanEnv();
+    expect(maxRebaseCyclesOf(env.config)).toBe(2);
+    const { head: H, pr } = await conflicting(env);
+    // Two earlier rounds already ran for this task.
+    for (const round of [1, 2]) {
+      env.db.addEvidence({ task_id: 'task-1', head_sha: `${round}`.repeat(40), kind: NEEDS_REBASE_KIND, config_revision: env.config.configRevision, outcome: 'changes-requested',
+        details_json: JSON.stringify({ head: `${round}`.repeat(40), base: 'b'.repeat(40), baseBranch: 'main', files: ['sub/s.txt'], prUrl: pr.url, round }) });
+    }
+    const s = await scan(env);
+    expect(action(s, 'task-1')).toMatchObject({ action: 'conflict', to: 'awaiting-human' });
+    expect(env.backlog.status('task-1')).toBe('awaiting-human');
+    expect(task(env).labels).not.toContain(NEEDS_REBASE_LABEL);
+    expect(env.db.repairCycles('task-1')).toBe(0);
+    const q = pending(env.db, { includeWaiting: true }).filter((i) => i.kind === 'question');
+    expect(q).toHaveLength(1);
+    expect(q[0]).toMatchObject({ taskId: 'task-1' });
+    expect(q[0]!.text).toMatch(/main keeps changing the same files: merge the other task first, split this one, or let me try again\?/);
+    expect(q[0]!.key).toContain(H);
+  });
+
+  it('execution.maxRebaseCycles 0: the first conflict already asks the owner', async () => {
+    const env = scanEnv((c) => { c.execution.maxRebaseCycles = 0; });
+    await conflicting(env);
+    expect(action(await scan(env), 'task-1')).toMatchObject({ action: 'conflict', to: 'awaiting-human' });
+    expect(pending(env.db, { includeWaiting: true }).map((i) => i.kind)).toContain('question');
   });
 });

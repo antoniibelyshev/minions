@@ -184,6 +184,9 @@ const DECLARED: readonly DeclaredSetting[] = [
   { key: 'execution.maxRepairCyclesBeforeReplan', group: 'Concurrency', label: 'Repair cycles before replan', type: 'int', min: 1, apply: 'live',
     description: 'failed fix cycles before the coordinator replans a task',
     loosens: more('more failed fix cycles may run before a task is replanned (higher spend)') },
+  { key: 'execution.maxRebaseCycles', group: 'Concurrency', label: 'Conflict rounds per task', type: 'int', min: 0, optional: true, apply: 'live',
+    description: 'times a delivered PR that conflicts with the base goes back to an engineer to merge it (default 2; then you decide)',
+    loosens: (f, t) => more('more conflict-resolution rounds may run before you are asked (higher spend)')(f ?? 2, t ?? 2) },
   // ---- Policy
   { key: 'intake.startReady', group: 'Policy', label: 'Start ready tasks', type: 'bool', apply: 'prompt',
     description: 'whether the coordinator starts ready tasks without asking you first',

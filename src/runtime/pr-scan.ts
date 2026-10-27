@@ -9,7 +9,8 @@
 // - Only tasks without an active lease, whose PR is at the approved publication head, are acted on:
 //   CLEAN / BLOCKED / UNSTABLE / HAS_HOOKS: nothing (the merge pass decides); UNKNOWN: retry next pass;
 //   BEHIND: verified base update (base-update.ts); DIRTY / CONFLICTING: confirmed by a local merge-tree after a
-//   fresh fetch: clean -> base update, conflict -> reported (and handed to the needs-rebase hook, task-68.4);
+//   fresh fetch: clean -> base update, conflict -> auto-merge disarmed and the needs-rebase hook (task-68.4:
+//   changes-requested with the label minions:needs-rebase, or awaiting-human past execution.maxRebaseCycles);
 //   required checks failing at the approved head: changes-requested as a repair cycle; timed out: a
 //   notification, the task stays delivered.
 // - At most one base update is in flight across all PRs (highest priority, longest-waiting first): a base
@@ -76,6 +77,9 @@ export interface ScanReport {
   message: string;
 }
 
+/** What the needs-rebase hook did: the task's new status and a message for the scan report. */
+export interface ConflictOutcome { to: TaskStatus; message: string; round?: number }
+
 export interface ConflictInfo { taskId: string; prUrl: string; head: string; base: string; baseBranch: string; files: string[] }
 
 export interface ScanDeps {
@@ -84,8 +88,11 @@ export interface ScanDeps {
   ciGate: (taskId: string, head: string) => Promise<CiGate>;
   /** Required checks failing at the approved head: delivered -> changes-requested as a repair cycle (`Scheduler.ciRepair`). */
   ciRepair: (taskId: string, head: string, findings: string[]) => Promise<{ to: TaskStatus; repairCycles: number; replan: boolean }>;
-  /** A confirmed conflict (task-68.4 builds the needs-rebase stage on this hook); default: event and notification only. */
-  onConflict?: (c: ConflictInfo) => Promise<void>;
+  /**
+   * A confirmed conflict, after auto-merge was disarmed: the needs-rebase stage (`Scheduler.needsRebase`, task-68.4;
+   * the scheduler always passes it). Absent: an event and a notification only.
+   */
+  onConflict?: (c: ConflictInfo) => Promise<ConflictOutcome | void>;
   now?: () => Date;
   /** Epoch ms after which no new base update starts (the 60 s budget after record/release). */
   deadline?: number;
@@ -324,8 +331,13 @@ async function baseUpdate(x: Ctx, task: Task, pub: PublicationRow, conflicting: 
     if (!d.db.events(task.id, 'pr-conflict').some((e) => { const v = e.data as { head?: string; base?: string } | null; return v?.head === H && v?.base === B; })) {
       d.db.addEvent('pr-conflict', task.id, { head: H, base: B, files: mt.files, prUrl: task.prUrl });
     }
-    if (d.onConflict) await d.onConflict(info);
-    else enqueueOnce(d.db, `pr-conflict:${task.id}:${H}`, 'status', task.id, `${task.id}: ${task.prUrl} conflicts with ${base} at ${B.slice(0, 12)} in ${mt.files.slice(0, 10).join(', ')}; it needs a merge of origin/${base} into the branch.`);
+    // A conflicting PR cannot merge; disarm what minions armed before anything else (retried when it fails).
+    const disarm = await disarmIfOurs(x, task, pub, 'conflicts with the base');
+    if (disarm) return res('skipped', `conflicts with ${base} at ${B.slice(0, 12)}, but ${disarm}; retried on the next pass`, { conflictFiles: mt.files, base: B });
+    if (d.onConflict) {
+      const o = await d.onConflict(info);
+      if (o) return res('conflict', `conflicts with ${base} at ${B.slice(0, 12)} in ${mt.files.slice(0, 10).join(', ')}; ${o.message}`, { conflictFiles: mt.files, base: B, to: o.to });
+    } else enqueueOnce(d.db, `pr-conflict:${task.id}:${H}`, 'status', task.id, `${task.id}: ${task.prUrl} conflicts with ${base} at ${B.slice(0, 12)} in ${mt.files.slice(0, 10).join(', ')}; it needs a merge of origin/${base} into the branch.`);
     return res('conflict', `conflicts with ${base} at ${B.slice(0, 12)} in ${mt.files.slice(0, 10).join(', ')}`, { conflictFiles: mt.files, base: B });
   }
   if (mt.state !== 'clean') return res('skipped', `no base update: ${mt.message}`);

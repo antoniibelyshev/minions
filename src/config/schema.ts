@@ -249,6 +249,11 @@ export const MinionsConfigSchema = z.object({
     maxByRole: z.record(z.string(), z.number().int().min(1)).optional(),
     oneActiveStagePerTask: z.literal(true),
     maxRepairCyclesBeforeReplan: z.number().int().min(1),
+    /**
+     * Needs-rebase rounds per task (a delivered PR that conflicts with its base goes back to the engineer to
+     * merge the base; task-68.4, src/runtime/needs-rebase.ts). Unset = 2; past it the task goes to awaiting-human.
+     */
+    maxRebaseCycles: z.number().int().min(0).optional(),
     attemptMaxTurns: z.number().int().min(1),
   }).strict(),
   models: z.object({
