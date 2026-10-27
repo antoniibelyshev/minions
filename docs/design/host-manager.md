@@ -2,7 +2,11 @@
 
 Status: **agreed** (task-53; phases 1 to 5 built, see [Phases](#phases)). Folds in task-44 (live settings). The owner answered the
 open questions on 2026-10-26 (see [Owner decisions](#owner-decisions)). The build tasks are listed under
-[Phases](#phases) and are filed as task-53.2 to task-53.8.
+[Phases](#phases) and are filed as task-53.2 to task-53.8. Task-65 proposes a natural-language front-end, which revises
+decision 1: see [host-manager-assistant.md](host-manager-assistant.md) (proposed, waiting for the owner).
+
+The manager is also the proposed watchdog of the routine pass in [unattended-delivery.md](unattended-delivery.md)
+(task-68.1). It runs `minions sync --routine` when the coordinator's own clock is stale.
 
 ## Goal
 
@@ -23,6 +27,9 @@ the owner confirms that change**. Nothing applies on its own.
    model. Every apply path it uses already exists and is tested. The manager adds only routing, confirmation and a
    journal. A child process also means that a CLI the manager just reinstalled runs in a fresh process (the
    "no self-continuation" rule in [bootstrap.md, Upgrade from the container](bootstrap.md#upgrade-from-the-container)).
+   *Revision proposed in task-65:* the apply path stays deterministic and model-free, but the chat front-end may
+   use Claude. Claude explains settings and turns plain text into one typed owner command, which takes the same
+   plan and Confirm path. See [host-manager-assistant.md](host-manager-assistant.md#revision-of-decision-1).
 2. **One manager per host, one manager bot per host.** It serves every registered project, and the owner picks the
    project with `/project <name>`, or by tapping a request that already names it. One bot per project would double
    the bots and the pairing work for no gain in isolation: all projects already share one host user and one
@@ -93,9 +100,15 @@ the existing delegate mechanism (`src/host/delegate.ts`). Each exec has a timeou
 anything over either is dropped and reported as a project error, since the output is untrusted. It gets no new mount and no host-visible file under
 `/state`. A file queue on a host bind mount was rejected: it would be the first host path the container can write.
 
+<<<<<<< HEAD
 **From the owner (manager chat).** The manager accepts a fixed set of commands. Without the optional assistant it
 answers everything else with the help text; with it, plain text (no leading `/`) goes to the assistant (see
 [Natural-language assistant](#natural-language-assistant-task-65)):
+=======
+**From the owner (manager chat).** The manager accepts a fixed set of commands and ignores everything else (it replies
+with the help text). Task-65 proposes sending non-command text to a Claude assistant instead, which falls back to
+the help text ([host-manager-assistant.md](host-manager-assistant.md)):
+>>>>>>> main
 
 | Command | Does |
 | - | - |

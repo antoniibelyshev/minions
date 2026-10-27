@@ -1,6 +1,6 @@
 ---
 name: orchestrate
-description: Dispatch loop for the minions coordinator - pick runnable stages (work next), claim, spawn workers, record results, follow next steps.
+description: Dispatch loop for the minions coordinator - pick runnable stages (work next), claim, spawn workers, record results and claim the next stage in one call (work advance), follow next steps.
 ---
 
 # Orchestrate minions work
@@ -55,20 +55,27 @@ Older CLI fallback: if `--compact`, `work brief` or `--submitted` is rejected as
 
 {{processRunGuidance}}Independent tasks may run in parallel up to the limits. A task never has two workers at once.
 
-## 5. Record
+## 5. Record and advance
 
-When a worker returns, it has submitted its result with `minions work submit` and ends with one line. Do not ask for or copy its JSON. Record it with the worker's token total from its task notification (`subagent_tokens`):
+When a worker returns, it has submitted its result with `minions work submit` and ends with one line. Do not ask for or copy its JSON. Record it and claim the next stage in one call, with the worker's token total from its task notification (`subagent_tokens`):
 
-`minions work record <leaseId> --submitted --usage <subagent_tokens> --json`
+`minions work advance <leaseId> --usage <subagent_tokens> --json`
 
-Always pass `--usage` for Agent workers (also on `--correction` records and `work release`): it is the durable spend tally. A process-harness run (`launch.kind: "run"`) records its own usage: record it without `--usage`. The figure is cumulative per agent, so after a correction pass the resumed agent's new total; the latest figure per lease counts and nothing is double-counted. If the notification came after you recorded, add it with `minions work spend --lease <leaseId> --tokens <n> --json`.
+It records exactly like `minions work record <leaseId> --submitted` (same validation, correction, spend, budget, publication and `contextReset`), then, only when nothing needs your judgement, claims the next stage exactly like `work claim --compact`: the same task's next stage first (finish what is started), else the first `runnable` stage in `work next` order. It never claims while paused, draining or over the budget, after an invalid result, or when a context reset is due. The response has `record` (the record response described below) and one of:
+
+- `next`: the claimed stage (`leaseId`, `briefMarker`, `taskId`, `title`, `role`, `attempt`, `branch`, `worktree`, `expectedHead`, `agentType`, `agentModel`, `reason`). Spawn it right away as in step 4 (`subagent_type` = `agentType`, `model` = `agentModel`, omitted when null; `next.launch` present = a process-harness stage, run its command instead). No `work next`, `work claim` or `work spend` call is needed. To dispatch a different stage instead (step 2 reasons), release this lease first.
+- `decision`: nothing was claimed; `kind` says why. `invalid`: correct it (below), then `minions work advance <leaseId> --correction --usage <subagent_tokens> --json`. `replan`, `needs-split`, `needs-changes`, `blocked`, `partial`, `awaiting-human`, `publication`, `ci-unverified`, `qa-findings`: handle that transition (step 6), then go back to step 1. `context-reset`: do the reset now. `paused`, `draining`, `budget`: start nothing; report it. `capacity`, `nothing-runnable`: stop dispatching until the next worker returns (`waiting` says what waits). `claim-failed`: the claim was refused (`code`, as in step 3); run `minions work next --json` again.
+
+Fallback (an older CLI rejects `work advance`, or you need a step on its own): record with `minions work record <leaseId> --submitted --usage <subagent_tokens> --json`, then steps 1 to 3.
+
+Always pass `--usage` for Agent workers (also on `--correction` records and `work release`): it is the durable spend tally. A process-harness run (`launch.kind: "run"`) records its own usage: advance or record it without `--usage`. The figure is cumulative per agent, so after a correction pass the resumed agent's new total; the latest figure per lease counts and nothing is double-counted. If the notification came after you recorded, add it with `minions work spend --lease <leaseId> --tokens <n> --json`.
 
 {{contextResetRule}}
 
 Then check the response's `budget` (present when the owner set one): `crossed` 50 or 80 → tell the owner the spend against the budget; `crossed` 100 or `exhausted` → new claims are refused: tell the owner why starts stopped and ask before spending more. Running workers are never stopped for the budget.
 
 - No submission (`NOT_FOUND`, hint names `minions work submit`): if the worker's final message contains the JSON instead, pipe that to `minions work record <leaseId> --json` on stdin; otherwise ask the worker to submit (once), or release the lease.
-- Invalid result (`valid: false`, `correctionAllowed: true`): send the worker only the listed `errors`, ask it to fix them and submit again, then `minions work record <leaseId> --submitted --correction --json`. If it is still invalid, it is stored unvalidated; decide yourself (usually re-dispatch or ask the user). Never treat it as approval. A `complete` tester or reviewer result with failing checks is rejected this way; for an engineer `complete` with failing checks, ask the same correction yourself. Either way, give one bounded correction: a concrete way to rerun the checks (exact command and environment, e.g. an exec-allowed `TMPDIR`), or a status that matches the failure.
+- Invalid result (`valid: false`, `correctionAllowed: true`): send the worker only the listed `errors`, ask it to fix them and submit again, then `minions work advance <leaseId> --correction --usage <subagent_tokens> --json` (or `minions work record <leaseId> --submitted --correction --json`). If it is still invalid, it is stored unvalidated; decide yourself (usually re-dispatch or ask the user). Never treat it as approval. A `complete` tester or reviewer result with failing checks is rejected this way; for an engineer `complete` with failing checks, ask the same correction yourself. Either way, give one bounded correction: a concrete way to rerun the checks (exact command and environment, e.g. an exec-allowed `TMPDIR`), or a status that matches the failure.
 - Worker ended with `brief unavailable: <error>` (no result): do not record it. Release the lease (`minions work release <leaseId> --reason "brief unavailable" --json`), claim again without `--compact`, and re-dispatch with the brief pasted in a ```json fence.
 - Stale head: the worker reported a SHA that is not the branch head; re-dispatch the same role.
 - If a worker died or will not finish, `minions work release <leaseId> --reason "<why>" --usage <subagent_tokens> --json`.
@@ -76,7 +83,7 @@ Then check the response's `budget` (present when the owner set one): `crossed` 5
 
 ## 6. Follow the next step
 
-The record response says what happened. Typical transitions:
+The record response (`record` in the advance response) says what happened. When `work advance` already claimed the next stage, only the owner-facing parts below remain (reports, approvals to request). Typical transitions:
 
 - engineer `complete` → reviewer (`reviewing`), or tester (`testing`) when the task needs QA (QA label, sensitive paths, or `testerRequired`). A reviewer `approve` with `needsQa` → tester (`testing`), then review again.
 - QA sweep `complete` → `done`: create one backlog task per finding (`minions backlog create`, idempotency key `qa:<sweepId>:<n>`). Scheduling a new sweep (`qa-sweep:` key) is intake: not while intake is paused.
@@ -89,7 +96,7 @@ The record response says what happened. Typical transitions:
 - `partial` → re-dispatch the same role with the remaining work in the prompt, or split. A `drain: true` partial (wound down for an upgrade) is not a failed attempt: while draining do nothing; afterwards re-dispatch the same role (no `engineer-deep` escalation). Its brief carries `resume` (remaining work and the `wip:` checkpoint), so the prompt only needs `Continue from the wip: commit.`
 - `needs_split` → decide the split yourself (no need to ask the user); create each proposed child with `minions backlog create --json` using an idempotency key `split:<parentId>:<n>`, the parent id, acceptance criteria and dependencies between children; note the split on the parent. The parent stays as the tracking task.
 
-Then go back to step 1, unless a record or release response carried `contextReset`: then do the context reset (handoff, then restart; Limits in your coordinator instructions) and stop. Stop when nothing is runnable.
+Then go back to step 1 (after a `work advance` that returned `next`, spawn that stage instead), unless a record or release response carried `contextReset`: then do the context reset (handoff, then restart; Limits in your coordinator instructions) and stop. Stop when nothing is runnable.
 
 ## Workflows, roles and models
 

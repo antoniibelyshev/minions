@@ -86,6 +86,11 @@ const OPENAI_KEY = /^sk-[A-Za-z0-9_-]{20,500}$/;
 export function checkOpenAiKeyFormat(raw: string): { token: string } {
   const token = raw.trim();
   if (!token) throw new MinionsError('INVALID_CONFIG', 'No key entered.', 'Paste the key at the prompt.');
+  // An Anthropic key (sk-ant-…) also matches the OpenAI shape; it would only fail at Codex's first request.
+  if (token.startsWith('sk-ant-')) {
+    throw new MinionsError('INVALID_CONFIG', 'That is an Anthropic API key (sk-ant-…), not an OpenAI API key.',
+      `Codex needs an OpenAI project API key from ${OPENAI_API_KEYS_URL}; Claude keys are set with \`minions auth set\`.`);
+  }
   if (!OPENAI_KEY.test(token)) throw new MinionsError('INVALID_CONFIG', 'That does not look like an OpenAI API key (expected sk-…).', `Create a project API key at ${OPENAI_API_KEYS_URL}.`);
   return { token };
 }

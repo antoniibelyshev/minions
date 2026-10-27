@@ -48,7 +48,11 @@ class MergeGh {
     if (args[0] === 'api') {
       expect(args.slice(1, 3)).toEqual(['--method', 'GET']);
       const path = args.at(-1)!;
-      if (path === `${R}/branches/main`) return okRun(JSON.stringify({ name: 'main', protected: true, protection: { required_status_checks: { enforcement_level: 'everyone', contexts: this.required } } }));
+      // The commit is the verified base read (task-71): GitHub's view of origin's main is the bare repository.
+      if (path === `${R}/branches/main`) {
+        const sha = execFileSync('git', ['-C', this.bare, 'rev-parse', 'refs/heads/main'], { encoding: 'utf8' }).trim();
+        return okRun(JSON.stringify({ name: 'main', commit: { sha }, protected: true, protection: { required_status_checks: { enforcement_level: 'everyone', contexts: this.required } } }));
+      }
       if (path === `${R}/rules/branches/main`) return okRun('[]');
       if (path.startsWith(`${R}/actions/workflows`)) return okRun(JSON.stringify({ total_count: 1 }));
       return bad('gh: Not Found (HTTP 404)');
@@ -112,6 +116,7 @@ function mergeEnv(mutate?: (c: MinionsConfig) => void): MEnv {
   const keys = approvalKeys();
   const sched = new Scheduler({
     db: env.db, backlog: env.backlog, config: env.config, layout: env.layout, approvalPublicKeyFile: keys.publicKeyFile, gh: gh.fn,
+    serverUrl: () => bare, // git reaches the recorded https origin at the bare repository (code-only seam)
     publisher: (input: PublishInput) => publishTask({ ...input, gh: gh.fn, tokenFile }),
   });
   return { ...env, sched, gh, keys, bare };
@@ -212,6 +217,48 @@ describe('CI-gated auto-merge (mocked gh)', () => {
     env.config.delivery.requiredChecksConfigured = true;
     expect((await sync(env)).tasks[0]!.merge).toMatchObject({ state: 'armed' });
     expect(env.gh.merges()).toHaveLength(1);
+  });
+
+  it('task-71: a forged origin (url.insteadOf) plus a recorded base moved past the head cannot hide a sensitive path from the merge gate', async () => {
+    const env = mergeEnv((c) => { c.capabilities['pr.merge'] = 'allow'; });
+    const { r, head } = await deliver(env, 'task-1', 'infra/main.tf');
+    expect(r.publication?.state).toBe('awaiting-approval');
+    env.sched.approvePublication('task-1', { head, signature: env.keys.sign('task-1', head) });
+    await env.sched.publish('task-1');
+    env.gh.pr().rollup = passing;
+    // The attack: a main lookalike F with the head's tree on top of the head, served by a forged repository
+    // that origin's URL now resolves to; local base refs and the recorded lease bases moved to F as well.
+    const repo = env.layout.repo;
+    const f = gitSync(repo, 'commit-tree', `${head}^{tree}`, '-p', head, '-m', 'main lookalike');
+    const forged = join(tmp('minions-forged-'), 'demo.git');
+    execFileSync('git', ['init', '-q', '--bare', forged]);
+    gitSync(repo, 'push', '-q', forged, `${f}:refs/heads/main`);
+    gitSync(repo, 'config', '--unset', `url.${env.bare}.insteadOf`);
+    gitSync(repo, 'config', `url.${forged}.insteadOf`, REMOTE);
+    for (const ref of ['refs/heads/main', 'refs/remotes/origin/main']) gitSync(repo, 'update-ref', ref, f);
+    env.db.exec('UPDATE leases SET base_sha = ? WHERE task_id = ?', f, 'task-1');
+    expect(gitSync(repo, 'ls-remote', '--heads', 'origin', 'refs/heads/main').split(/\s+/)[0]).toBe(f);
+    // The merge gate reads origin's base at the recorded PR URL (the seam: the real bare repository) and
+    // cross-checks it with the API: the sensitive path stays, so pr.merge is upgraded to ask.
+    const m = (await sync(env, ['task-1'])).tasks[0]!.merge!;
+    expect(m).toMatchObject({ state: 'awaiting-approval', reasons: [expect.stringMatching(/sensitive paths \(infra\/main\.tf\)/)] });
+    expect(env.gh.calls.some((c) => c[0] === 'pr' && c[1] === 'merge')).toBe(false);
+  });
+
+  it('task-71: the merge gate fails closed when origin\'s base cannot be verified (git and the API disagree)', async () => {
+    const env = mergeEnv((c) => { c.capabilities['pr.merge'] = 'allow'; });
+    await deliver(env, 'task-1');
+    env.gh.pr().rollup = passing;
+    // GitHub's API reports a main that git (the seam) does not see.
+    const stale = join(tmp('minions-stale-'), 'demo.git');
+    execFileSync('git', ['clone', '-q', '--bare', env.bare, stale]);
+    commitFile(env.layout.repo, 'later.txt', 'l');
+    gitSync(env.layout.repo, 'push', '-q', env.bare, 'HEAD:refs/heads/main');
+    env.sched = new Scheduler({ db: env.db, backlog: env.backlog, config: env.config, layout: env.layout, approvalPublicKeyFile: env.keys.publicKeyFile, gh: env.gh.fn, serverUrl: () => stale });
+    const m = (await sync(env, ['task-1'])).tasks[0]!.merge!;
+    expect(m.state).not.toBe('armed');
+    expect(m.reasons.join(' ')).toMatch(/could not be verified.*for git but .* for the GitHub API/);
+    expect(env.gh.merges()).toEqual([]);
   });
 
   it('pr.merge allow arms without approval; a sensitive-path change upgrades it to ask; deny never arms', async () => {
