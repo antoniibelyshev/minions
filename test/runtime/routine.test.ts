@@ -389,3 +389,22 @@ describe('startRoutineClock (fake clock)', () => {
     expect(ft.pending()).toHaveLength(1);
   });
 });
+
+describe('schema 9: the events(kind, at) index for the routine reads', () => {
+  it('a schema-8 database migrates to 9 with the index and keeps its events', async () => {
+    const { RuntimeDb, SCHEMA_VERSION } = await import('../../src/runtime/db.js');
+    expect(SCHEMA_VERSION).toBeGreaterThanOrEqual(9);
+    const file = join(tmp('minions-schema9-'), 'v8.db');
+    const v8 = new RuntimeDb(file);
+    v8.exec('DROP INDEX events_kind_at');
+    v8.setMeta('schema_version', '8');
+    v8.addEvent(ROUTINE_EVENT, null, { trigger: 'clock' }, ago(5));
+    v8.close();
+    const up = new RuntimeDb(file);
+    try {
+      expect(up.getMeta('schema_version')).toBe(String(SCHEMA_VERSION));
+      expect(up.all<{ name: string }>("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'events_kind_at'")).toHaveLength(1);
+      expect(up.lastEventOfKind(ROUTINE_EVENT)).toMatchObject({ at: ago(5), data: { trigger: 'clock' } });
+    } finally { up.close(); }
+  });
+});
