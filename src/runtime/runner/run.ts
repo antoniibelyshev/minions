@@ -212,26 +212,54 @@ export async function postExit(rec: RunRecord, deps: Pick<RunnerDeps, 'env' | 'p
   if (!snap) return { violations: [], head: rec.claimHead, fetched: false, wipCommit: null };
   // After the lease ended, its scratch dir (the clone) or its worktree may be gone legitimately (lease cleanup,
   // worktree removal): nothing can be fetched, and that is no harness violation (task-14.4 review).
-  if (opts.leaseEnded) {
-    const gone = !(await lstat(rec.checkout).catch(() => null)) ? 'the per-lease clone was removed when the lease ended'
-      : !(await lstat(join(rec.leaseWorktree, '.git')).catch(() => null)) ? 'the lease worktree was removed after the lease ended' : null;
-    if (gone) return { violations: [], head: rec.claimHead, fetched: false, wipCommit: null, note: `${gone}; nothing fetched` };
+  // A release marks the lease ended before it removes the scratch dir, so that removal can still be running while
+  // these checks run (a recursive rm drops the clone's `.git` before the checkout itself). The check is repeated
+  // whenever a later step fails, so a clone that vanishes mid-check is not reported as a violation either.
+  const removed = async (): Promise<PostExit | null> => {
+    if (!opts.leaseEnded) return null;
+    const gone = await leaseCleanupGone(rec);
+    return gone ? { violations: [], head: rec.claimHead, fetched: false, wipCommit: null, note: `${gone}; nothing fetched` } : null;
+  };
+  const early = await removed();
+  if (early) return early;
+  try {
+    const ctx = repoContext(rec, deps);
+    const violations: string[] = [];
+    const changed = await diffLeaseGit(snap);
+    if (changed.length) {
+      violations.push(`lease git files changed: ${changed.join(', ')}`);
+      await restoreLeaseGit(snap, changed);
+      const still = await diffLeaseGit(snap);
+      if (still.length) throw new MinionsError('INTERNAL', `could not restore the lease git files: ${still.join(', ')}`);
+    }
+    const cloneViolations = await sanitizeClone(ctx, snap.commonDir);
+    if (cloneViolations.length) {
+      const late = await removed();
+      // Only the clone vanished: the lease git files were checked (and restored) on their own, so keep those findings.
+      if (late) return late.note?.startsWith(CLONE_REMOVED) ? { ...late, violations } : late;
+      violations.push(...cloneViolations);
+    }
+    if (violations.length) return { violations, head: rec.claimHead, fetched: false, wipCommit: null };
+    const role = rec.role;
+    const wipHead = wip ? await wipCommit(ctx, role, wip) : null;
+    const fb = await branchRuleAndFetch(ctx, snap, role);
+    if (fb.violations.length) { const late = await removed(); if (late) return late; }
+    return { violations: fb.violations, head: fb.head, fetched: fb.fetched, wipCommit: fb.fetched ? wipHead : null };
+  } catch (e) {
+    const late = await removed();
+    if (late) return late;
+    throw e;
   }
-  const ctx = repoContext(rec, deps);
-  const violations: string[] = [];
-  const changed = await diffLeaseGit(snap);
-  if (changed.length) {
-    violations.push(`lease git files changed: ${changed.join(', ')}`);
-    await restoreLeaseGit(snap, changed);
-    const still = await diffLeaseGit(snap);
-    if (still.length) throw new MinionsError('INTERNAL', `could not restore the lease git files: ${still.join(', ')}`);
-  }
-  violations.push(...await sanitizeClone(ctx, snap.commonDir));
-  if (violations.length) return { violations, head: rec.claimHead, fetched: false, wipCommit: null };
-  const role = rec.role;
-  const wipHead = wip ? await wipCommit(ctx, role, wip) : null;
-  const fb = await branchRuleAndFetch(ctx, snap, role);
-  return { violations: fb.violations, head: fb.head, fetched: fb.fetched, wipCommit: fb.fetched ? wipHead : null };
+}
+
+const CLONE_REMOVED = 'the per-lease clone was removed when the lease ended';
+
+/** Why the clone or the worktree is gone (or being removed) after the lease ended; null while both are intact. */
+async function leaseCleanupGone(rec: RunRecord): Promise<string | null> {
+  const missing = async (p: string): Promise<boolean> => !(await lstat(p).catch(() => null));
+  if (await missing(rec.checkout) || await missing(join(rec.checkout, '.git'))) return CLONE_REMOVED;
+  if (await missing(join(rec.leaseWorktree, '.git'))) return 'the lease worktree was removed after the lease ended';
+  return null;
 }
 
 // -------------------------------------------------------------------------------------------------- runLease
