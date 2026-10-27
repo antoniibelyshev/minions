@@ -291,6 +291,20 @@ describe('plain text goes to the assistant; slash commands never do', () => {
     expect(s.childRuns[0]!.join(' ')).toContain('execution.maxEngineers 1');
   });
 
+  it('the trimmed bundle sent on stdin still carries what maps "one engineer at a time" to execution.maxEngineers', async () => {
+    const s = await stack({ reply: () => answer('Fewer engineers at once: check the plan below.', { kind: 'config-set', key: 'execution.maxEngineers', value: '1', layer: 'local' }) });
+    await s.say('only one engineer at a time please');
+    const c = s.calls[0]!;
+    expect(Buffer.byteLength(String(c.opts?.input))).toBeLessThan(MA.ASSISTANT_INPUT_CAP);
+    expect(typeof c.stdin.context.settingsLegend).toBe('string');
+    const concurrency = c.stdin.context.settings.Concurrency as Record<string, unknown>[];
+    const s1 = concurrency.find((x) => x.key === 'execution.maxEngineers')!;
+    expect(s1).toMatchObject({ type: 'int', min: 1, takesEffect: 'now', canLoosen: true });
+    expect(String(s1.description)).toMatch(/engineer workers at once/);
+    expect(typeof s1.value).toBe('string');
+    expect(c.stdin.context.changeWith).toContain('/set <key> <value>');
+  });
+
   it('with the assistant on, the same safe command typed by the owner still applies at once (task-78) and never reaches the assistant', async () => {
     const s = await stack({ reply: () => answer('Fewer engineers at once: check the plan below.', { kind: 'config-set', key: 'execution.maxEngineers', value: '1', layer: 'local' }) });
     // Assistant first: an offer only, nothing applied.
