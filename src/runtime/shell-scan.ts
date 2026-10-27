@@ -39,7 +39,15 @@ export interface ShellScan {
   stdin: Map<readonly string[], string[]>;
   /** A command (an entry of `commands`) to the command before it in a pipeline (`a | b`: b → a). */
   pipedFrom: Map<readonly string[], readonly string[]>;
+  /**
+   * Where each top-level heredoc body sits in the source (`start` to `end`, the delimiter line excluded), with its
+   * command and whether the delimiter was quoted (no substitutions run in the body). Heredocs inside a heredoc
+   * body's substitutions are not listed.
+   */
+  heredocs: HeredocBody[];
 }
+
+export interface HeredocBody { owner: readonly string[]; start: number; end: number; quoted: boolean }
 
 interface Heredoc { delim: string; strip: boolean; quoted: boolean; owner: string[] }
 
@@ -49,6 +57,7 @@ class Lexer {
   readonly scripts: string[] = [];
   readonly stdin = new Map<readonly string[], string[]>();
   readonly pipedFrom = new Map<readonly string[], readonly string[]>();
+  readonly heredocs: HeredocBody[] = [];
   private pending: Heredoc[] = [];
 
   constructor(private readonly s: string) {}
@@ -236,14 +245,18 @@ class Lexer {
     this.pending = [];
     for (const h of hs) {
       const lines: string[] = [];
+      const start = this.i;
+      let end = s.length;
       while (this.i < s.length) {
         const nl = s.indexOf('\n', this.i);
         const e = nl < 0 ? s.length : nl;
         const line = s.slice(this.i, e);
+        const at = this.i;
         this.i = nl < 0 ? s.length : nl + 1;
-        if ((h.strip ? line.replace(/^\t+/, '') : line) === h.delim) break;
+        if ((h.strip ? line.replace(/^\t+/, '') : line) === h.delim) { end = at; break; }
         lines.push(h.strip ? line.replace(/^\t+/, '') : line);
       }
+      this.heredocs.push({ owner: h.owner, start, end, quoted: h.quoted });
       this.feed(h.owner, lines.join('\n'));
       if (!h.quoted && lines.length) {
         const body = new Lexer(lines.join('\n'));
@@ -280,5 +293,5 @@ export function scanShell(src: string): ShellScan {
   lx.parse(false, 0);
   const kept = new Set<readonly string[]>(lx.commands);
   for (const k of lx.stdin.keys()) if (!kept.has(k)) lx.stdin.delete(k);
-  return { commands: lx.commands, scripts: lx.scripts, stdin: lx.stdin, pipedFrom: lx.pipedFrom };
+  return { commands: lx.commands, scripts: lx.scripts, stdin: lx.stdin, pipedFrom: lx.pipedFrom, heredocs: lx.heredocs.filter((h) => kept.has(h.owner)) };
 }

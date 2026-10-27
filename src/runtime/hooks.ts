@@ -406,6 +406,42 @@ function workerMinionsHit(g: StateGuard): EntryMatch {
   };
 }
 
+/** Words that may run the minions entry they precede (`node dist/cli.js`, `npx minions`). */
+const ENTRY_LAUNCHERS = new Set(['node', 'npx']);
+
+/** Whether a simple command is `[assignments] [node|npx] minions [options] work [options] submit …`. */
+function isWorkSubmit(words: readonly string[]): boolean {
+  let s = 0;
+  while (s < words.length && ASSIGNMENT.test(words[s]!)) s++;
+  if (s < words.length && ENTRY_LAUNCHERS.has(basename(words[s]!))) s++;
+  if (s >= words.length || !MINIONS_ENTRY.test(basename(words[s]!))) return false;
+  const [p0, p1] = words.slice(s + 1).filter((w) => !w.startsWith('-'));
+  return p0 === 'work' && p1 === 'submit';
+}
+
+/**
+ * The command line with the heredoc bodies of `minions work submit` blanked, for the runtime-state text check: a
+ * worker's result is data minions reads on stdin, and its findings often name state paths (task-72). Only a body
+ * that runs nothing is dropped: a quoted delimiter (`<<'RESULT'`), or an unquoted one without `$(`, `${` or a
+ * backtick. The rest of the line (redirections, other commands, assignments) is still checked. Unscannable input
+ * is returned unchanged.
+ */
+export function withoutSubmitBodies(command: string): string {
+  let scan: ShellScan;
+  try { scan = scanShell(command); } catch (e) {
+    if (e instanceof ShellParseError) return command;
+    throw e;
+  }
+  let out = command;
+  const bodies = scan.heredocs.filter((h) => isWorkSubmit(h.owner)).sort((a, b) => b.start - a.start);
+  for (const h of bodies) {
+    const body = command.slice(h.start, h.end);
+    if (!h.quoted && /\$[({]|`/.test(body)) continue;
+    out = out.slice(0, h.start) + out.slice(h.end);
+  }
+  return out;
+}
+
 /**
  * The first minions command a Claude subagent may not run in a Bash command line, or null: `work run|claim|release`
  * always (coordinatorOnlyWorkCommand), and any other registered command outside WORKER_MINIONS_COMMANDS unless the
@@ -432,7 +468,7 @@ export function preBashHook(input: unknown, g?: StateGuard): HookOutput {
   const hit = coordinatorOnlyWorkCommand(ti.command);
   if (hit) return deny(`\`${hit}\` is coordinator-only: a worker cannot start, claim or release workers. Finish your own task and return your result instead.`);
   const guard = g ?? stateGuard();
-  const state = bashStateReference(ti.command, guard);
+  const state = bashStateReference(withoutSubmitBodies(ti.command), guard);
   if (state) {
     return deny(`Workers may not touch the minions runtime state (${JSON.stringify(state.slice(0, 120))}): the runtime DB, backlog, briefs and results are the coordinator's. `
       + 'Use `minions work brief` / `minions work submit` for your lease. If you only mention the path as text, put that text in a file in your scratch dir '

@@ -1121,12 +1121,19 @@ hook input; Claude Code sets it, a worker cannot remove it from its own calls):
   symlinks (also a dangling one or a missing tail). `Read|Glob|Grep`: refused for the state dir too (Glob and
   Grep also for a directory holding it, and an absolute Glob pattern by its fixed prefix); node starts only when
   the input names `/state` or `MINIONS_STATE_DIR`, so a symlink hiding the path still reads (disclosure, not
-  forgery). Exempt: the scratch root and `<state>/cache` (the host runtime keeps the per-lease scratch dirs and
-  tool caches there). The coordinator is not affected (it writes `<state>/notes`).
+  forgery). Exempt: the scratch root and, only when that root is inside the state dir (the host runtime keeps the
+  per-lease scratch dirs and tool caches under `<state>/cache`), `<state>/cache`. In the container the scratch
+  root is `/home/node/.cache/tmp`, so `/state/cache` is protected like the rest. An exempt path still counts as
+  state when its real path (symlinks) leads back into the state, and any write target that is a hardlink to a
+  state file (same device and inode; looked up only for a file with more than one link) is refused. The
+  coordinator is not affected (it writes `<state>/notes`).
 - **Bash (`minions hook pre-bash`).** A subagent command line that names the state dir as an absolute path
   (configured or resolved, `//state`, `/tmp/../state`, `~/…`) or expands `MINIONS_STATE_DIR` is refused.
   This is raw text, so a mention in a commit message or grep pattern is refused too (the deny reason says to pass
-  such text through a file: `git commit -F`, or to use the Grep/Write tools). A worker may run only these minions
+  such text through a file: `git commit -F`, or to use the Grep/Write tools). The exception is the heredoc body
+  of `minions work submit` (a worker's result, data minions reads on stdin): it is left out of the check when it
+  runs nothing (a quoted delimiter, or an unquoted one without `$(`, `${` or a backtick); the rest of that
+  line is still checked. A state-dir path into an exempt subtree is resolved like in the file tools. A worker may run only these minions
   commands: `work brief`, `work submit`, `status`, `backlog ready|list|show|export`, `ci status` and `help`
   (`WORKER_MINIONS_COMMANDS`); every other registered command (`work record`, `backlog update`, `notify`, `sync`,
   `workspace state-import`, `pause`, ...) is the coordinator's. A command that points minions at another state
@@ -1139,7 +1146,8 @@ hook input; Claude Code sets it, a worker cannot remove it from its own calls):
 
 Residual risk. The file-tool layer is exact. The Bash layer is a text check: a path or command built at run time
 (`d=/sta; sqlite3 ${d}te/minions.db`, `cd /` then `state/…`, a script file or interpreter that computes the
-path, a git hook in the worktree, `mi''nions` past the pre-filter) is out of its reach, and so is the
+path, a git hook in the worktree, `mi''nions` past the pre-filter, a path outside the state dir such as the
+container scratch dir that a link created that way makes point back into it) is out of its reach, and so is the
 `work submit` of another active lease from that lease's worktree (submit checks the cwd against the lease
 worktree; a worker that learns another lease id can `cd` there). A determined worker can therefore still alter
 the DB through Bash. What closes it is OS separation, as for process workers: Claude workers under a uid without

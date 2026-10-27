@@ -2,15 +2,16 @@
 // (minions.db, backlog, briefs, results). The plugin hooks refuse it: pre-file for the file tools (exact, through
 // symlinks) and pre-bash for Bash (a best-effort text check, plus a worker allowlist of minions commands).
 // Nothing here touches the live /state: every real file lives in a temp copy.
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync, readFileSync } from 'node:fs';
+import { linkSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it, vi } from 'vitest';
 import { buildProgram } from '../../src/program.js';
 import {
   MINIONS_COMMANDS, PRE_BASH_HOOK_COMMAND, PRE_FILE_READ_HOOK_COMMAND, PRE_FILE_WRITE_HOOK_COMMAND, preBashHook, preFileHook, runHook,
-  workerMinionsCommand,
+  withoutSubmitBodies, workerMinionsCommand,
 } from '../../src/runtime/hooks.js';
+import { scanShell } from '../../src/runtime/shell-scan.js';
 import { bashStateReference, protectedStatePath, resolveReal, stateGuard } from '../../src/runtime/state-guard.js';
 import { containerStateDenies, coordinatorSettings } from '../../src/runtime/coordinator.js';
 import { runtimePaths } from '../../src/runtime/paths.js';
@@ -107,6 +108,77 @@ describe('bashStateReference', () => {
     expect(bashStateReference('cat ~/p/state/minions.db', stateGuard({ state: '/home/u/p/state', tmp: '/home/u/p/state/cache/tmp' }), '/home/u')).toBe('~/p/state/minions.db');
     expect(bashStateReference(`TMPDIR=${state}/cache/tmp/leases/lease-1 npm test`, host)).toBeNull();
     expect(bashStateReference(`npm_config_cache=${state}/cache/npm npm ci`, host)).toBeNull();
+  });
+});
+
+describe('exempt subtrees lead nowhere into the state (QA attempt 2)', () => {
+  it('<state>/cache is exempt only when the scratch root is inside the state dir', () => {
+    expect(host.exempt).toEqual(expect.arrayContaining([join(state, 'cache'), join(state, 'cache', 'tmp')]));
+    expect(container.exempt.some((e) => e === '/state' || e.startsWith('/state/'))).toBe(false);
+    expect(protectedStatePath('/state/cache/npm/x', '/', container)).toBe(true);
+    expect(bashStateReference('ls /state/cache', container)).toBe('/state/cache');
+  });
+
+  it('host: a symlink in the scratch dir or cache to the DB or a state dir is refused, in Bash and the file tools', () => {
+    symlinkSync(join(state, 'minions.db'), join(state, 'cache', 'tmp', 'db-sym'));
+    symlinkSync('../../backlog', join(state, 'cache', 'tmp', 'bl-sym'));
+    symlinkSync('../minions.db', join(state, 'cache', 'db-rel'));
+    for (const p of [join(state, 'cache', 'tmp', 'db-sym'), join(state, 'cache', 'tmp', 'bl-sym', 'backlog', 'task-1.md'), join(state, 'cache', 'db-rel')]) {
+      expect(bashStateReference(`sqlite3 ${p} .dump`, host), p).toBe(p);
+      expect(denied(preFileHook(file('Write', { file_path: p, content: 'x' }), host)), p).toBe(true);
+    }
+    // A link inside the exempt tree that stays there is fine.
+    writeFileSync(join(state, 'cache', 'tmp', 'plain'), '');
+    symlinkSync('plain', join(state, 'cache', 'tmp', 'plain-sym'));
+    expect(bashStateReference(`cat ${join(state, 'cache', 'tmp', 'plain-sym')}`, host)).toBeNull();
+  });
+
+  it('a hardlink to a state file is refused, in the scratch dir (Bash and file tools) and in the worktree (file tools)', () => {
+    linkSync(join(state, 'minions.db'), join(state, 'cache', 'tmp', 'db-hard'));
+    writeFileSync(join(state, 'backlog', 'backlog', 'task-1.md'), '# task-1');
+    linkSync(join(state, 'backlog', 'backlog', 'task-1.md'), join(worktree, 'task-hard.md'));
+    expect(bashStateReference(`sqlite3 ${join(state, 'cache', 'tmp', 'db-hard')}`, host)).not.toBeNull();
+    expect(denied(preFileHook(file('Write', { file_path: join(state, 'cache', 'tmp', 'db-hard'), content: 'x' }), host))).toBe(true);
+    expect(denied(preFileHook(file('Edit', { file_path: 'task-hard.md', old_string: 'a', new_string: 'b' }), host))).toBe(true);
+    // Two links to a file outside the state are no state file.
+    writeFileSync(join(worktree, 'own.txt'), '');
+    linkSync(join(worktree, 'own.txt'), join(worktree, 'own-hard.txt'));
+    expect(preFileHook(file('Write', { file_path: 'own-hard.txt', content: 'x' }), host).stdout).toBeUndefined();
+  });
+});
+
+describe('heredoc bodies of minions work submit are data (QA attempt 2)', () => {
+  const finding = '{"findings":["workers could write /state/minions.db and /state/briefs"]}';
+  it.each([
+    `minions work submit lease-1 --role tester --json <<'RESULT'\n${finding}\nRESULT`,
+    `cd ${worktree} && minions work submit lease-1 --role engineer --json <<"RESULT"\n${finding}\nRESULT`,
+    `node dist/cli.js --json work submit lease-1 --role tester <<-'R'\n\t${finding}\n\tR`,
+    `minions work submit lease-1 --role tester --json <<RESULT\n${finding} \$HOME\nRESULT`,
+  ])('allows %s', (cmd) => {
+    expect(withoutSubmitBodies(cmd)).not.toContain('/state');
+    expect(denied(preBashHook(bash(cmd, sub), container))).toBe(false);
+  });
+
+  it.each([
+    // An unquoted body runs its substitutions.
+    'minions work submit lease-1 --role tester --json <<RESULT\n$(sqlite3 /state/minions.db .dump)\nRESULT',
+    'minions work submit lease-1 --role tester --json <<RESULT\n`cat /state/briefs/x`\nRESULT',
+    // Outside the body, the line is still checked.
+    "minions work submit lease-1 --json <<'RESULT' > /state/results/x.json\n{}\nRESULT",
+    "minions work submit lease-1 --json <<'RESULT'\n{}\nRESULT\nsqlite3 /state/minions.db .dump",
+    "MINIONS_STATE_DIR=/state minions work submit lease-1 --json <<'RESULT'\n{}\nRESULT",
+    // Other commands' heredocs are not exempt.
+    "cat <<'E' > x.sql\n/state/minions.db\nE",
+    "bash <<'E'\nsqlite3 /state/minions.db .dump\nE",
+    "minions work brief lease-1 <<'E'\n/state/minions.db\nE",
+  ])('refuses %s', (cmd) => {
+    expect(denied(preBashHook(bash(cmd, sub), container))).toBe(true);
+  });
+
+  it('scanShell reports heredoc body positions and quoting', () => {
+    const src = "a <<'X' <<Y\nbody x\nX\nbody y\nY\nb";
+    const { heredocs, commands } = scanShell(src);
+    expect(heredocs.map((h) => [src.slice(h.start, h.end), h.quoted, h.owner])).toEqual([['body x\n', true, commands[0]], ['body y\n', false, commands[0]]]);
   });
 });
 
