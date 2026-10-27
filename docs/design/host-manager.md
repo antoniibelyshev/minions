@@ -4,6 +4,9 @@ Status: **agreed** (task-53; phases 1 to 5 built, see [Phases](#phases)). Folds 
 open questions on 2026-10-26 (see [Owner decisions](#owner-decisions)). The build tasks are listed under
 [Phases](#phases) and are filed as task-53.2 to task-53.8.
 
+The manager is also the proposed watchdog of the routine pass in [unattended-delivery.md](unattended-delivery.md)
+(task-68.1). It runs `minions sync --routine` when the coordinator's own clock is stale.
+
 ## Goal
 
 Owner request (Telegram msg 238, 2026-10-23): the coordinator should be able to change the setup while it runs,
