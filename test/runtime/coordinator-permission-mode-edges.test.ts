@@ -127,7 +127,7 @@ describe('launch wrapper: same decision on every path', () => {
     expect(modeOf(calls2[0]!)).toBe('auto');
   });
 
-  it('legacy permissionMode "default" launches in default without asking Claude Code', async () => {
+  it('legacy permissionMode "default" launches in default when the choices cannot be read', async () => {
     const paths = pluginPaths();
     const calls: string[][] = []; const logs: string[] = [];
     const cfg = terminal(validateConfig({ ...defaults(), permissionMode: 'default' }));

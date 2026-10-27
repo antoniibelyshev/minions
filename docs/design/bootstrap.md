@@ -134,8 +134,10 @@ deterministic init. `minions init` stays complete without it.
   `--allowedTools <read-only...> --disallowedTools <denied...> --plugin-dir <dir> --append-system-prompt
   <system-prompt.md> --settings '{"permissions":{"disableBypassPermissionsMode":"disable"}}' --name
   "minions setup" --permission-mode default "<kick-off prompt>"`. The variadic tool lists come first so
-  they never swallow the positional prompt. `default` is accepted by 2.1.292 (its help lists the same mode
-  as `manual`); never `bypassPermissions`, `acceptEdits`, `auto` or `dontAsk`.
+  they never swallow the positional prompt. The mode value follows the `--permission-mode` choices in
+  `claude --help` (src/runtime/permission-modes.ts): `default` when listed, else `manual` (its newer name,
+  the only one 2.1.292 lists), and no launch when neither is listed; never `bypassPermissions`,
+  `acceptEdits`, `auto` or `dontAsk`. The host-runtime coordinator maps its `default` the same way.
 - **Allowed without a prompt:** `Bash(minions doctor*)`, `Bash(minions status*)`, `Bash(minions auth show*)`,
   `Bash(minions config show*)`, `Bash(minions runtime show*)`, `Bash(git remote -v)`, `Bash(git status*)`,
   `Bash(git log*)`, and `Read(//<repo root>/**)` (Claude Code applies Read rules to Glob/Grep as well). Never a
