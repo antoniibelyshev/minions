@@ -1,7 +1,7 @@
 # Unattended delivery: daily routine, PR scan, autonomous intake: design
 
-Status: **proposed** (task-68.1, design only, nothing built). The owner must agree before any build task starts
-(see [Open questions](#open-questions-for-the-owner)). Epic: task-68. Related: [coordinator-sessions.md](coordinator-sessions.md)
+Status: **agreed** (task-68.1; the owner approved every recommended answer, Telegram msgs 320/321, and set the
+timezone, msg 322: see [Owner answers](#owner-answers)). Phase 1 (routine pass and clock) is built in task-68.2. Epic: task-68. Related: [coordinator-sessions.md](coordinator-sessions.md)
 (task-57: supervisor, token baseline), [host-manager.md](host-manager.md) (task-53: manager loop and its supervisor),
 [bootstrap.md, CI-gated auto-merge](bootstrap.md#ci-gated-auto-merge), [roles-and-workflows.md](roles-and-workflows.md)
 (stage machine).
@@ -369,7 +369,34 @@ Ordered by value. Each phase is one task. Nothing is built before the owner agre
 Owner action, not a task: the [prerequisites](#owner-host-prerequisites-checklist), and turning on
 `routine.enabled` after PR #1.
 
-## Open questions for the owner
+## Owner answers
+
+Agreed 2026-10-27 (Telegram poll msg 320, answer msg 321 "1": every recommended default, a to g; msg 322: timezone):
+
+1. Wake for newly runnable work during the day, within the caps.
+2. Digest at 08:00 only; `routine.timezone` **Europe/Berlin**.
+3. Wake = a fresh coordinator session started by the runtime (the README statement "the runtime never restarts the
+   coordinator on its own" now holds only while `routine.enabled` is off).
+4. Base updates without re-review when the merge is clean and CI passes again.
+5. Flaky CI goes straight to repair (no `ci.rerun` for now).
+6. Up to 3 auto-promoted ideas a day, listed in the digest.
+7. Run the dispatcher spike (phase 7) after phase 6 (the one deterministic launcher is the agreed exception to the
+   no-nested-claude rule).
+
+Review findings for phase 1 (task-68.1 review, built in task-68.2): a wake never passes force; the crash start is a
+separate path that refuses during a drain or an upgrade and starts only after a crash, never after an owner stop; the
+runtime records the last owner message time (the Stop hook) for the 30-minute window; at 100% budget only the digest
+wake is allowed (crash starts included); wake sessions are counted in the coordinator baseline (`wakes`, end
+trigger `wake`).
+
+Phase 1 as built (task-68.2): the pass runs as `minions sync --routine [--trigger clock|watchdog|manual] [--force]`
+and `--last`; the wrapper clock runs it as a bounded child process (5 minutes) so a pass never blocks claude and
+always reads the current config; the manager watchdog asks each running project every 5 minutes and the runtime runs
+the pass only when the last one is older than 2 intervals; the routine lock is the meta row `routine_lock`; events
+`routine`, `routine-wake` and `routine-crash-start` (schema 9 adds an `events(kind, at)` index); days are UTC
+days until phase 4 adds `routine.timezone`.
+
+## Open questions for the owner (answered above)
 
 1. Wake policy: wake for newly runnable work during the day, within the caps (recommended), or the digest only
    (work found by the routine pass waits for the next digest)?

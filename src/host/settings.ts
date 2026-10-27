@@ -196,6 +196,17 @@ const DECLARED: readonly DeclaredSetting[] = [
     loosens: (f, t) => ((f === 'acceptEdits') && (t === 'auto' || t === undefined) ? 'a classifier may approve coordinator actions outside the allow list without prompting' : null) },
   { key: 'coordinator.contextReset.enabled', group: 'Policy', label: 'Routine context resets', type: 'bool', apply: 'live',
     description: 'the coordinator hands off and restarts with a fresh context when idle' },
+  { key: 'routine.enabled', group: 'Policy', label: 'Unattended routine', type: 'bool', apply: 'live',
+    description: 'a routine pass every few minutes syncs, merges and wakes the coordinator (a fresh session) only when a model is needed',
+    loosens: turnsOn('the runtime starts coordinator sessions on its own (wakes for runnable work, crash starts): model spend without you') },
+  { key: 'routine.tickMinutes', group: 'Policy', label: 'Routine interval (minutes)', type: 'int', min: 1, optional: true, apply: 'live',
+    description: 'minutes between routine passes (default 15)' },
+  { key: 'routine.minWakeGapMinutes', group: 'Policy', label: 'Minimum minutes between wakes', type: 'int', min: 1, optional: true, apply: 'live',
+    description: 'the routine wakes the coordinator at most once per this many minutes (default 30)',
+    loosens: (f, t) => ((typeof t === 'number' ? t : 30) < (typeof f === 'number' ? f : 30) ? `the coordinator may be woken more often (every ${String(t)} min; higher spend)` : null) },
+  { key: 'routine.maxWakesPerDay', group: 'Policy', label: 'Coordinator wakes per day', type: 'int', min: 0, optional: true, apply: 'live',
+    description: 'routine wakes of the coordinator per UTC day (default 8; the digest wake always counts)',
+    loosens: (f, t) => ((typeof t === 'number' ? t : 8) > (typeof f === 'number' ? f : 8) ? `more coordinator wakes per day (${typeof f === 'number' ? f : 8} -> ${String(t)}; higher spend)` : null) },
   { key: 'coordinator.disallowedTools', group: 'Policy', label: 'Coordinator tool trim', type: 'list', optional: true, apply: 'launch',
     description: 'Claude Code tools removed from the coordinator session (default: the built-in trim; none: keep every tool; tools it needs cannot be listed)',
     loosens: (f, t) => {
@@ -364,6 +375,7 @@ export function currentValue(def: SettingDef, ctx: SettingsContext): Value {
   const v = getPath(ctx.config, def.key);
   if (def.key === 'coordinator.contextReset.enabled' && v === undefined) return true; // unset = on
   if (def.key === 'coordinator.toolSearch' && v === undefined) return true; // unset = on
+  if (def.key === 'routine.enabled' && v === undefined) return false; // unset = off
   if (def.key === 'coordinator.bundledSkills' && v === undefined) return false; // unset = off
   return v;
 }

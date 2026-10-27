@@ -57,7 +57,7 @@ const rows = () => { const db = openState(); try { return db.changeRequests({ al
 
 describe('change_requests migration', () => {
   it('schema 8 adds change_requests; a schema-7 database migrates and keeps its rows', () => {
-    expect(SCHEMA_VERSION).toBe(8);
+    expect(SCHEMA_VERSION).toBeGreaterThanOrEqual(8); // later migrations run on top
     const file = join(state, 'v7.db');
     const v7 = new RuntimeDb(file);
     v7.exec('DROP TABLE change_requests');

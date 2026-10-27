@@ -1278,7 +1278,8 @@ handoff, instead of one long session whose re-read context grows every turn. Imp
 - Surfacing: `work record|release` responses carry `contextReset` (`due`, `reason`, `steps`) only when due, to keep
   responses small; `coordinator handoff --check --json` shows the full check (triggers, blockers, session counts);
   `minions status` adds a `context reset:` line and `contextReset` in `--json`.
-- The runtime never restarts the coordinator by itself. The coordinator, told by a response, finishes the current
+- The runtime never restarts the coordinator by itself for a context reset (the unattended routine's wakes, opt-in with
+  `routine.enabled`, are the one exception: [unattended-delivery.md](unattended-delivery.md)). The coordinator, told by a response, finishes the current
   owner exchange, sends pending notifications, writes the handoff, then runs
   `minions coordinator restart --recover --detach --json`. `--detach` is needed because the restart kills the tmux
   session the caller runs in: it checks active leases in-band (refusing with `PRECONDITION`), then runs the real
