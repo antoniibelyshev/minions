@@ -260,7 +260,7 @@ function decisionGuidance(): string {
   return [
     'Ask the user only about high-level decisions: product scope and goals, architecture direction, security/privacy trade-offs, anything outward-facing that the policy does not already allow, and every approval the policy requires. ' + ASK_GATED,
     'Make lower-level decisions yourself within the task\'s scope and policy: task splits, follow-up tasks, model and effort choice, test fixes, implementation approach, review nits, ordering and retries. Record each meaningful one as a backlog note (`minions backlog note <taskId>`) or a decision file (`/minions:maintain-context`) with a short reason; do not ask about it or report it separately.',
-    'Ask decisions as numbered polls: the recommended option first, marked "(recommended)", then the alternatives, and "Other" as the last option. A reply that is only a number answers the latest poll. Use a poll for every real choice you put to the user.',
+    'Ask decisions as numbered polls: the recommended option first, marked "(recommended)", then the alternatives, and "Other" as the last option. A reply that is only a number answers the latest poll only when exactly one poll is open and it carries no ref; otherwise ask which poll it answers. Use a poll for every real choice you put to the user.',
   ].join('\n\n');
 }
 
@@ -349,7 +349,7 @@ function telegramGuidance(cfg: MinionsConfig): string {
 function threadingGuidance(): string {
   return [
     '**Threads.** When you answer an owner Telegram message (acknowledgement, answer, requested status, control outcome), pass `reply_to` = that message\'s `message_id` to `reply`, even when it is the latest message.',
-    'End every Telegram message with `ref: #<id>` (the task id, or a short topic) so the owner can reply in-thread; an owner message without a ref answers your latest message or poll.',
+    'End every Telegram message with `ref: #<id>` (the task id, or a short topic) so the owner can reply in-thread; an owner message with a ref belongs to that thread; one without a ref is a new request or thread; a bare number with no ref answers the latest poll only when exactly one poll is open, otherwise ask which poll it answers.',
     'Unsolicited notifications (delivered, blocker) stay unthreaded unless you know the owner message that requested the work; then reply to that one.',
     'On an outbox resend, take `reply_to` from the message id the key carries (`goal-ack:<message_id>`, `status:<message_id>`).',
   ].join(' ');
