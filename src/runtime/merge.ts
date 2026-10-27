@@ -28,7 +28,7 @@ import type { ErrorCode } from '../core/errors.js';
 import { redact } from '../core/output.js';
 import { readFile } from 'node:fs/promises';
 import type { CiGate } from './ci-gate.js';
-import { BASE_UPDATE_KIND, deriveApproval, derivedApprovalProblems, fetchBase, hasCommit, serverBaseOf, withIsolatedRepo, type DerivedApproval } from './base-update.js';
+import { BASE_UPDATE_KIND, commitExists, deriveApproval, derivedApprovalProblems, fetchBase, serverBaseOf, withIsolatedRepo, type DerivedApproval } from './base-update.js';
 import { formatCiGate } from './ci-gate.js';
 import type { EvidenceRow, RuntimeDb } from './db.js';
 import type { GitFn } from './github.js';
@@ -245,9 +245,10 @@ export async function autoMergeTask(d: MergeDeps, taskId: string): Promise<Merge
   let derived: DerivedApproval | undefined;
   if (!reviewed && origin && d.db.evidenceFor(taskId, head, BASE_UPDATE_KIND).length) {
     const base = cfg.git.baseBranch;
-    let serverBase = await serverBaseOf(d.git, d.repo, origin.remote, base);
-    if (serverBase && !(await hasCommit(d.git, d.repo, serverBase))) { await fetchBase(d.git, d.repo, origin.remote, base); serverBase = await serverBaseOf(d.git, d.repo, origin.remote, base); }
-    derived = await deriveApproval({ git: d.git, repo: d.repo, db: d.db, taskId, head, configRevision: cfg.configRevision, serverBase, isReviewed });
+    // Every git call of the derivation (ls-remote and fetch included) uses the allowlisted environment, never d.git.
+    let serverBase = await serverBaseOf(d.repo, origin.remote, base);
+    if (serverBase && !(await commitExists(d.repo, serverBase))) { await fetchBase(d.repo, origin.remote, base); serverBase = await serverBaseOf(d.repo, origin.remote, base); }
+    derived = await deriveApproval({ repo: d.repo, db: d.db, taskId, head, configRevision: cfg.configRevision, serverBase, isReviewed });
   }
   const pathsHead = derived && !derivedApprovalProblems(derived, head).length ? derived.reviewedHead! : head;
   let paths: MergeGateInput['paths'] = origin
@@ -257,7 +258,7 @@ export async function autoMergeTask(d: MergeDeps, taskId: string): Promise<Merge
   if (paths.ok && pathsHead !== head) {
     const changed = new Set(paths.changedPaths);
     // Isolated like the derivation itself (base-update.ts withIsolatedRepo): only git objects count.
-    const failed = await withIsolatedRepo(d.git, d.repo, async (iso) => {
+    const failed = await withIsolatedRepo(d.repo, async (iso) => {
       for (const l of derived!.links) {
         const r = await iso.git(iso.dir, ['diff', '--name-only', '--no-renames', '-z', l.base!, l.head], true);
         if (r.code !== 0) return `cannot diff the base update ${l.head.slice(0, 12)} against ${l.base!.slice(0, 12)}`;

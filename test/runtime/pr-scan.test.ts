@@ -6,11 +6,11 @@ import { describe, expect, it, vi } from 'vitest';
 import type { MinionsConfig } from '../../src/config/schema.js';
 import { run as runCmd, type RunResult } from '../../src/core/exec.js';
 import {
-  attributeEnvProblems, BASE_UPDATE_KIND, commitMerge, deriveApproval, derivedApprovalProblems, mergeTree, unsafeMergeAttributes, withIsolatedRepo, type DerivedApproval,
+  BASE_UPDATE_KIND, commitMerge, commitParents, deriveApproval, derivedApprovalProblems, mergeTree, unsafeMergeAttributes, verifyLink, withIsolatedRepo, type DerivedApproval,
 } from '../../src/runtime/base-update.js';
 import { syncTasks } from '../../src/runtime/ci.js';
 import type { CiGate } from '../../src/runtime/ci-gate.js';
-import { hardenedGit } from '../../src/runtime/git-hardening.js';
+import { allowlistedGitEnv } from '../../src/runtime/git-hardening.js';
 import type { GitFn } from '../../src/runtime/github.js';
 import { evaluateMergeGate } from '../../src/runtime/merge.js';
 import { boundedScan, runPrScan, type ScanReport } from '../../src/runtime/pr-scan.js';
@@ -137,6 +137,14 @@ const sync = (env: SEnv) => syncTasks({ db: env.db, backlog: env.backlog, config
 const scan = (env: SEnv) => env.sched.scanPullRequests();
 const action = (s: ScanReport, id: string) => s.tasks.find((t) => t.taskId === id);
 const bareHead = (env: SEnv, branch: string) => gitSync(env.bare, 'rev-parse', `refs/heads/${branch}`);
+/** Runs `fn` with `vars` set in process.env (what an agent can do by invoking a minions command), then restores. */
+async function tainted<T>(vars: Record<string, string>, fn: () => Promise<T>): Promise<T> {
+  const saved = Object.fromEntries(Object.keys(vars).map((k) => [k, process.env[k]]));
+  Object.assign(process.env, vars);
+  try { return await fn(); } finally {
+    for (const [k, v] of Object.entries(saved)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+  }
+}
 const parents = (env: SEnv, sha: string) => gitSync(env.layout.repo, 'rev-list', '--parents', '-n', '1', sha).split(' ').slice(1);
 
 describe('PR scan: BEHIND -> verified base update', () => {
@@ -270,10 +278,10 @@ describe('PR scan: BEHIND -> verified base update', () => {
     // The chain cap: a derivation limited to 1 link does not reach the reviewed head.
     const serverBase = gitSync(env.bare, 'rev-parse', 'refs/heads/main');
     const isReviewed = (h: string) => h === H;
-    const d1 = await deriveApproval({ git: realGit, repo: env.layout.repo, db: env.db, taskId: 'task-1', head: H2, configRevision: env.config.configRevision, serverBase, isReviewed, maxChain: 1 });
+    const d1 = await deriveApproval({ repo: env.layout.repo, db: env.db, taskId: 'task-1', head: H2, configRevision: env.config.configRevision, serverBase, isReviewed, maxChain: 1 });
     expect(d1.reviewedHead).toBeNull();
     expect(derivedApprovalProblems(d1, H2).join(' ')).toMatch(/more than 1 base updates|does not end at reviewer evidence/);
-    const d2 = await deriveApproval({ git: realGit, repo: env.layout.repo, db: env.db, taskId: 'task-1', head: H2, configRevision: env.config.configRevision, serverBase, isReviewed });
+    const d2 = await deriveApproval({ repo: env.layout.repo, db: env.db, taskId: 'task-1', head: H2, configRevision: env.config.configRevision, serverBase, isReviewed });
     expect(d2.reviewedHead).toBe(H);
     expect(derivedApprovalProblems(d2, H2)).toEqual([]);
   });
@@ -418,9 +426,9 @@ describe('crash window between the push and moving the publication head', () => 
     const { head: H, branch } = await deliver(env, 'task-1');
     const B = landOnMain(env, 'main.txt', 'x\n');
     gitSync(env.layout.repo, 'fetch', '-q', 'origin', '+refs/heads/main:refs/remotes/origin/main');
-    const mt = await mergeTree(realGit, env.layout.repo, H, B);
+    const mt = await mergeTree(env.layout.repo, H, B);
     if (mt.state !== 'clean') throw new Error('expected clean');
-    const made = await commitMerge(realGit, env.layout.repo, { tree: mt.tree, head: H, base: B, baseBranch: 'main', identity: env.config.git.identity });
+    const made = await commitMerge(env.layout.repo, { tree: mt.tree, head: H, base: B, baseBranch: 'main', identity: env.config.git.identity });
     if ('error' in made) throw new Error(made.error);
     env.db.addEvidence({ task_id: 'task-1', head_sha: made.sha, kind: BASE_UPDATE_KIND, config_revision: env.config.configRevision, outcome: 'prepared', details_json: JSON.stringify({ from: H, base: B, tree: mt.tree }) });
     gitSync(env.layout.repo, 'push', '-q', 'origin', `${made.sha}:refs/heads/${branch}`);
@@ -638,32 +646,193 @@ describe('withIsolatedRepo / mergeTree on fixture repos', () => {
     writeFileSync(join(repo, 'sub', '.gitattributes'), 'f.txt merge=union\n'); // untracked, in the checkout
     return { repo, ours, theirs };
   }
-  const hardened: GitFn = (cwd, args, allow) => hardenedGit(cwd, args, !!allow);
+  /** Runs `fn` once per runtime (the host adds the hardened -c options to every allowlisted call). */
+  async function perRuntime(fn: (runtime: string) => Promise<void>) {
+    const saved = process.env.MINIONS_RUNTIME;
+    try {
+      for (const runtime of ['container', 'host']) { process.env.MINIONS_RUNTIME = runtime; await fn(runtime); }
+    } finally { if (saved === undefined) delete process.env.MINIONS_RUNTIME; else process.env.MINIONS_RUNTIME = saved; }
+  }
 
   for (const format of ['sha1', 'sha256'] as const) {
     it(`${format}: clean merges write the tree into the repository's object store; checkout attributes are ignored (container and host git)`, async () => {
-      for (const g of [realGit, hardened]) {
+      await perRuntime(async () => {
         const c = repoWith(format, false);
-        const mt = await mergeTree(g, c.repo, c.ours, c.theirs);
+        const mt = await mergeTree(c.repo, c.ours, c.theirs);
         expect(mt.state).toBe('clean');
-        if (mt.state !== 'clean') continue;
+        if (mt.state !== 'clean') return;
         expect(gitSync(c.repo, 'cat-file', '-t', mt.tree)).toBe('tree'); // commit-tree in the repo can use it
         const x = repoWith(format, true);
-        expect(await mergeTree(g, x.repo, x.ours, x.theirs)).toMatchObject({ state: 'conflict', files: ['sub/f.txt'] });
-      }
+        expect(await mergeTree(x.repo, x.ours, x.theirs)).toMatchObject({ state: 'conflict', files: ['sub/f.txt'] });
+      });
     });
   }
 
-  it('leaves no temporary directory behind and refuses GIT_ATTR_SOURCE in the environment', async () => {
+  it('leaves no temporary directory behind (also when fn throws or the repository is missing)', async () => {
     const c = repoWith('sha1', false);
     let dir = '';
-    await withIsolatedRepo(realGit, c.repo, async (iso) => { dir = iso.dir; expect(existsSync(dir)).toBe(true); });
+    await withIsolatedRepo(c.repo, async (iso) => { dir = iso.dir; expect(existsSync(dir)).toBe(true); });
     expect(existsSync(dirname(dir))).toBe(false);
-    expect(attributeEnvProblems({ GIT_ATTR_SOURCE: 'HEAD' })).toEqual(['GIT_ATTR_SOURCE is set in the environment']);
-    expect(attributeEnvProblems({})).toEqual([]);
-    process.env.GIT_ATTR_SOURCE = 'HEAD';
-    try {
-      expect(await mergeTree(realGit, c.repo, c.ours, c.theirs)).toMatchObject({ state: 'refused', message: expect.stringMatching(/GIT_ATTR_SOURCE/) });
-    } finally { delete process.env.GIT_ATTR_SOURCE; }
+    await expect(withIsolatedRepo(c.repo, async (iso) => { dir = iso.dir; throw new Error('boom'); })).rejects.toThrow('boom');
+    expect(existsSync(dirname(dir))).toBe(false);
+    expect(await mergeTree(tmp('minions-none-'), 'a'.repeat(40), 'b'.repeat(40))).toMatchObject({ state: 'error' });
+  });
+
+  // Regressions (tester QA round 2): the container GitFn inherited process.env, so these reached the isolated calls.
+  it('GIT_COMMON_DIR, GIT_CONFIG_PARAMETERS / GIT_CONFIG_COUNT, HOME and XDG_CONFIG_HOME in the environment never make a conflict clean', async () => {
+    const attrs = join(tmp('minions-attrs-'), 'attributes');
+    writeFileSync(attrs, '*.txt merge=union\n');
+    const home = tmp('minions-home-taint-');
+    writeFileSync(join(home, '.gitconfig'), `[core]\n\tattributesFile = ${attrs}\n[merge]\n\tdefault = union\n`);
+    const xdg = tmp('minions-xdg-taint-');
+    mkdirSync(join(xdg, 'git'));
+    writeFileSync(join(xdg, 'git', 'attributes'), '*.txt merge=union\n');
+    await perRuntime(async (runtime) => {
+      const x = repoWith('sha1', true);
+      writeFileSync(join(x.repo, '.git', 'info', 'attributes'), '*.txt merge=union\n');
+      const cases: Record<string, string>[] = [
+        { GIT_COMMON_DIR: join(x.repo, '.git') },
+        { GIT_CONFIG_PARAMETERS: `'core.attributesfile'='${attrs}' 'merge.default'='union'` },
+        { GIT_CONFIG_COUNT: '2', GIT_CONFIG_KEY_0: 'core.attributesFile', GIT_CONFIG_VALUE_0: attrs, GIT_CONFIG_KEY_1: 'merge.default', GIT_CONFIG_VALUE_1: 'union' },
+        { HOME: home, XDG_CONFIG_HOME: xdg },
+        { GIT_DIR: join(x.repo, '.git'), GIT_WORK_TREE: x.repo, GIT_INDEX_FILE: join(x.repo, '.git', 'index'), GIT_ATTR_SOURCE: 'HEAD' },
+      ];
+      for (const vars of cases) {
+        // Plain git in the checkout with the same variables follows them (what the isolation guards against).
+        if (vars.GIT_COMMON_DIR) expect(await tainted(vars, async () => gitSync(x.repo, 'merge-tree', '--write-tree', x.ours, x.theirs))).toMatch(/^[0-9a-f]{40}$/);
+        const r = await tainted(vars, () => mergeTree(x.repo, x.ours, x.theirs));
+        expect(r, `${runtime} ${Object.keys(vars).join(',')}`).toMatchObject({ state: 'conflict', files: ['sub/f.txt'] });
+      }
+    });
+  });
+
+  it('GIT_GRAFT_FILE in the environment does not change the parents the isolated calls see', async () => {
+    await perRuntime(async (runtime) => {
+      const c = repoWith('sha1', false);
+      const grafts = join(tmp('minions-grafts-'), 'grafts');
+      writeFileSync(grafts, `${c.theirs} ${c.ours}\n`);
+      const real = gitSync(c.repo, 'rev-list', '--parents', '-n', '1', c.theirs).split(' ').slice(1);
+      expect(real).not.toEqual([c.ours]);
+      await tainted({ GIT_GRAFT_FILE: grafts }, async () => {
+        expect(gitSync(c.repo, 'rev-list', '--parents', '-n', '1', c.theirs).split(' ').slice(1)).toEqual([c.ours]); // plain git is fooled
+        expect(await withIsolatedRepo(c.repo, (iso) => commitParents(iso.git, iso.dir, c.theirs)), runtime).toEqual(real);
+        // verifyLink: theirs has one real parent, so the link fails on parents, not as the grafted (ours) merge.
+        const link = await verifyLink(c.repo, c.theirs, undefined, { serverBase: c.theirs, configRevision: 1 });
+        expect(link.from).toBe(real[0]);
+        expect(link.checks.parents).toBe(false);
+      });
+    });
+  });
+
+  it('allowlistedGitEnv keeps only the allowlisted names and sets its own GIT_* variables', () => {
+    const base = {
+      PATH: '/usr/bin:/bin', LANG: 'C.UTF-8', LC_ALL: 'C.UTF-8', TZ: 'UTC', TMPDIR: '/var/tmp', HOME: '/home/agent', XDG_CONFIG_HOME: '/x',
+      GIT_COMMON_DIR: '/r/.git', GIT_GRAFT_FILE: '/g', GIT_CONFIG_PARAMETERS: "'a.b'='c'", GIT_CONFIG_COUNT: '1', GIT_CONFIG_GLOBAL: '/evil', GIT_ATTR_SOURCE: 'HEAD',
+      GIT_DIR: '/r/.git', GIT_OBJECT_DIRECTORY: '/o', GIT_AUTHOR_NAME: 'x', EMAIL: 'e@x', SSL_CERT_FILE: '/ca', HTTPS_PROXY: 'http://p', MINIONS_SECRETS_DIR: '/s', MINIONS_RUNTIME: 'container',
+    };
+    const local = allowlistedGitEnv(base, { home: '/empty' });
+    expect(local).toEqual({
+      PATH: '/usr/bin:/bin', LANG: 'C.UTF-8', LC_ALL: 'C.UTF-8', TZ: 'UTC', TMPDIR: '/var/tmp', HOME: '/empty',
+      GIT_CONFIG_NOSYSTEM: '1', GIT_ATTR_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_NO_REPLACE_OBJECTS: '1', GIT_OPTIONAL_LOCKS: '0', GIT_TERMINAL_PROMPT: '0',
+      GIT_ASKPASS: '/usr/bin/false', SSH_ASKPASS: '/usr/bin/false',
+    });
+    const net = allowlistedGitEnv(base, { home: '/empty', network: true });
+    expect(net).toMatchObject({ HTTPS_PROXY: 'http://p', MINIONS_SECRETS_DIR: '/s', HOME: '/empty', GIT_CONFIG_GLOBAL: '/dev/null' });
+    expect(Object.keys(net).filter((k) => k.startsWith('GIT_')).sort()).toEqual(Object.keys(local).filter((k) => k.startsWith('GIT_')).sort());
+    expect(net.SSL_CERT_FILE).toBeUndefined();
+    expect(allowlistedGitEnv({ ...base, MINIONS_RUNTIME: 'host' }, { home: '/empty' }).GIT_PROTOCOL_FROM_USER).toBe('0');
+    expect(() => allowlistedGitEnv(base, { home: 'rel' })).toThrow(/absolute/);
+  });
+});
+
+describe('the minions process environment never reaches the base-update or derived-approval git calls (allowlisted env)', () => {
+  async function conflicting(env: SEnv) {
+    const d = await deliver(env, 'task-1', 'sub/s.txt', 'l1\nl2\nBRANCH\n');
+    const B = landOnMain(env, 'sub/s.txt', 'l1\nl2\nMAIN\n');
+    d.pr.mergeStateStatus = 'DIRTY';
+    d.pr.mergeable = 'CONFLICTING';
+    return { ...d, B };
+  }
+  /** Moves the publication and the PR to `sha` with a base-update record (as a crash window or a forged DB would). */
+  async function moveTo(env: SEnv, o: { H: string; branch: string; pr: Pr; sha: string; rec: Record<string, string> }) {
+    env.db.addEvidence({ task_id: 'task-1', head_sha: o.sha, kind: BASE_UPDATE_KIND, config_revision: env.config.configRevision, outcome: 'prepared', details_json: JSON.stringify(o.rec) });
+    gitSync(env.layout.repo, 'push', '-q', 'origin', `${o.sha}:refs/heads/${o.branch}`);
+    expect(env.db.movePublicationHead('task-1', o.H, o.sha)).toBe(true);
+    o.pr.mergeStateStatus = 'BLOCKED';
+    o.pr.mergeable = 'MERGEABLE';
+    o.pr.rollup[o.sha] = passing;
+    await syncTasks({ db: env.db, backlog: env.backlog, config: env.config, gh: env.gh.fn }); // CI evidence at the new head, no merge pass
+  }
+  const commit = (env: SEnv, t: string, ...ps: string[]) => gitSync(env.layout.repo, 'commit-tree', t, ...ps.flatMap((p) => ['-p', p]), '-m', 'forged');
+
+  it('GIT_COMMON_DIR plus a union in .git/info/attributes: the scan does not push a union merge and the gate refuses one', async () => {
+    const env = scanEnv();
+    const { head: H, branch, pr, B } = await conflicting(env);
+    writeFileSync(join(env.layout.repo, '.git', 'info', 'attributes'), 'sub/s.txt merge=union\n');
+    const taint = { GIT_COMMON_DIR: join(env.layout.repo, '.git') };
+    const s = await tainted(taint, () => scan(env));
+    expect(action(s, 'task-1')).toMatchObject({ action: 'conflict', conflictFiles: ['sub/s.txt'] });
+    expect(bareHead(env, branch)).toBe(H);
+    expect(env.db.evidenceOfKind('task-1', BASE_UPDATE_KIND)).toHaveLength(0);
+
+    // A union merge H' made in the checkout (git there honours the planted attributes) is never derived.
+    gitSync(env.layout.repo, 'fetch', '-q', 'origin', '+refs/heads/main:refs/remotes/origin/main');
+    const t = gitSync(env.layout.repo, 'merge-tree', '--write-tree', H, B);
+    const H2 = commit(env, t, H, B);
+    await moveTo(env, { H, branch, pr, sha: H2, rec: { from: H, base: B, tree: t } });
+    const m = await tainted(taint, () => env.sched.autoMerge('task-1'));
+    expect(m.state).toBe('waiting');
+    expect(m.reasons.join(' ')).toMatch(/derived approval refused: .*conflicts \(sub\/s\.txt\)/);
+    expect(env.gh.merges().filter((c) => c.includes('--auto'))).toHaveLength(0);
+  });
+
+  it('GIT_GRAFT_FILE cannot forge the ancestry of an agent-made second parent', async () => {
+    const env = scanEnv();
+    const { head: H, branch, pr } = await deliver(env, 'task-1');
+    const B = landOnMain(env, 'main.txt', 'x\n');
+    gitSync(env.layout.repo, 'fetch', '-q', 'origin', '+refs/heads/main:refs/remotes/origin/main');
+    // An agent-made "base" with unreviewed content, merged cleanly (never on origin's main).
+    const X = commitFile(env.layout.repo, 'evil.txt', 'unreviewed\n');
+    const t = gitSync(env.layout.repo, 'merge-tree', '--write-tree', H, X);
+    const H2 = commit(env, t, H, X);
+    await moveTo(env, { H, branch, pr, sha: H2, rec: { from: H, base: X, tree: t } });
+    // The grafts file makes X a parent of the server's base B, so `merge-base --is-ancestor X B` would hold.
+    const grafts = join(tmp('minions-grafts-'), 'grafts');
+    writeFileSync(grafts, `${B} ${gitSync(env.layout.repo, 'rev-parse', `${B}^`)} ${X}\n`);
+    const taint = { GIT_GRAFT_FILE: grafts };
+    expect(await tainted(taint, async () => gitSync(env.layout.repo, 'merge-base', '--is-ancestor', X, B))).toBe(''); // plain git is fooled
+    const m = await tainted(taint, () => env.sched.autoMerge('task-1'));
+    expect(m.state).toBe('waiting');
+    expect(m.reasons.join(' ')).toMatch(/derived approval refused: .*is not on the server's base/);
+    expect(env.gh.merges().filter((c) => c.includes('--auto'))).toHaveLength(0);
+  });
+
+  it('GIT_CONFIG_PARAMETERS cannot redirect the server base (ls-remote / fetch) to a forged origin', async () => {
+    const env = scanEnv();
+    // The fixture's origin redirect by prefix (as a real origin has none), so a longer -c insteadOf would win.
+    gitSync(env.layout.repo, 'config', '--unset-all', `url.${env.bare}.insteadOf`);
+    gitSync(env.layout.repo, 'config', `url.${dirname(env.bare)}/.insteadOf`, 'https://github.com/acme/');
+    const { head: H, branch, pr } = await deliver(env, 'task-1');
+    landOnMain(env, 'main.txt', 'x\n');
+    gitSync(env.layout.repo, 'fetch', '-q', 'origin', '+refs/heads/main:refs/remotes/origin/main');
+    const X = commitFile(env.layout.repo, 'evil.txt', 'unreviewed\n');
+    const t = gitSync(env.layout.repo, 'merge-tree', '--write-tree', H, X);
+    const H2 = commit(env, t, H, X);
+    await moveTo(env, { H, branch, pr, sha: H2, rec: { from: H, base: X, tree: t } });
+    // A forged "origin" whose main is X.
+    const fake = join(tmp('minions-fake-origin-'), 'demo.git');
+    execFileSync('git', ['init', '-q', '--bare', fake]);
+    gitSync(env.layout.repo, 'push', '-q', fake, `${X}:refs/heads/main`);
+    const taint = { GIT_CONFIG_PARAMETERS: `'url.${fake}.insteadof'='${REMOTE}'` };
+    expect(await tainted(taint, async () => gitSync(env.layout.repo, 'ls-remote', 'origin', 'refs/heads/main'))).toMatch(new RegExp(`^${X}`)); // plain git is fooled
+    const m = await tainted(taint, () => env.sched.autoMerge('task-1'));
+    expect(m.state).toBe('waiting');
+    expect(m.reasons.join(' ')).toMatch(/derived approval refused: .*is not on the server's base/);
+    expect(env.gh.merges().filter((c) => c.includes('--auto'))).toHaveLength(0);
+    // And the scan never takes the forged base as B.
+    landOnMain(env, 'm2.txt', 'y\n');
+    pr.mergeStateStatus = 'BEHIND';
+    const s = await tainted(taint, () => scan(env));
+    expect(action(s, 'task-1')?.base).not.toBe(X);
   });
 });

@@ -15,18 +15,25 @@
 // - Custom merge drivers, `merge=union` and a `merge.default` other than text change what a "clean" merge
 //   means, so any such attribute in either commit's tree refuses the update and the derivation.
 // - Every git call whose result the update or the derived approval depends on (merge-tree, parents, trees,
-//   ancestry, the per-link diff) runs in an isolated git dir (withIsolatedRepo): its own config, HEAD,
-//   refs, info and index, an empty work tree outside the checkout, and only the repository's object store
-//   (a symlink, so the merge-tree's tree object lands there for commit-tree). Nothing in the checkout's
-//   working tree, index, .git/config, .git/info/attributes, replace refs or grafts can change the
-//   result. On git >= 2.42 `attr.tree` is pinned to the empty tree; GIT_ATTR_SOURCE in the environment
-//   refuses (git 2.39, used here, knows neither and reads attributes only from the work tree and index).
+//   ancestry, the per-link diff, commit-tree) runs in an isolated git dir (withIsolatedRepo): its own
+//   config, HEAD, refs, info and index, an empty work tree outside the checkout, and only the repository's
+//   object store (a symlink, so the merge-tree's tree object lands there for commit-tree). Nothing in the
+//   checkout's working tree, index, .git/config, .git/info/attributes, replace refs or grafts can change
+//   the result. On git >= 2.42 `attr.tree` is pinned to the empty tree.
+// - None of these calls (nor the ls-remote / fetch of the server's base) sees the minions process
+//   environment: they run with an allowlisted one (git-hardening.ts allowlistedGit: locale, PATH, TZ,
+//   TMPDIR; an empty HOME; no global or system config or attributes; only the GIT_* variables set there).
+//   An agent invoking a minions command chooses that environment, so GIT_COMMON_DIR, GIT_GRAFT_FILE,
+//   GIT_CONFIG_PARAMETERS, GIT_ATTR_SOURCE, HOME/.gitconfig and the like must not count. These calls
+//   therefore never go through a caller's GitFn.
 import { mkdtemp, mkdir, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
 import type { MinionsConfig } from '../config/schema.js';
+import type { RunResult } from '../core/exec.js';
 import { redact } from '../core/output.js';
 import type { EvidenceRow, RuntimeDb } from './db.js';
+import { allowlistedGit } from './git-hardening.js';
 import type { GitFn } from './github.js';
 
 /** Longest chain of base updates a derived approval follows (H -> H' -> ... ); longer chains need a new review. */
@@ -89,18 +96,30 @@ async function blobText(git: GitFn, repo: string, rev: string, path: string): Pr
 /** An isolated view of a repository: run `git(dir, args)` (the GitFn below ignores its cwd argument). */
 export interface IsolatedRepo { git: GitFn; dir: string; objectFormat: string }
 
+/** Options of the allowlisted calls: an abort signal (the scan's budget) kills in-flight children. */
+export interface CleanGitOptions { signal?: AbortSignal }
+
+/** Runs `fn` with an empty directory as git's HOME (removed afterwards). */
+async function withEmptyHome<T>(fn: (home: string) => Promise<T>): Promise<T> {
+  const home = await mkdtemp(join(tmpdir(), 'minions-home-'));
+  try { return await fn(home); } finally { await rm(home, { recursive: true, force: true }).catch(() => {}); }
+}
+
 /**
- * Runs `fn` against an isolated git dir that shares only `repo`'s object store (see the header). The
- * temporary directory (under os.tmpdir(), never inside a checkout) is removed afterwards. Throws when the
- * repository's object store cannot be located.
+ * Runs `fn` against an isolated git dir that shares only `repo`'s object store (see the header). Every
+ * call, including locating the object store, uses the allowlisted environment (never the caller's
+ * GitFn). The temporary directory (under os.tmpdir(), never inside a checkout; it also holds the empty
+ * HOME) is removed afterwards. Throws when the repository's object store cannot be located.
  */
-export async function withIsolatedRepo<T>(git: GitFn, repo: string, fn: (iso: IsolatedRepo) => Promise<T>): Promise<T> {
-  const op = await git(repo, ['rev-parse', '--path-format=absolute', '--git-path', 'objects', '--show-object-format'], true);
-  const [objects = '', format = ''] = op.code === 0 ? op.stdout.trim().split('\n').map((l) => l.trim()) : [];
-  if (!objects || !isAbsolute(objects) || !EMPTY_TREE[format]) throw new Error(`cannot locate the object store of ${repo}: ${tail(op.stderr) || `git exit ${op.code}`}`);
+export async function withIsolatedRepo<T>(repo: string, fn: (iso: IsolatedRepo) => Promise<T>, opts: CleanGitOptions = {}): Promise<T> {
   const root = await mkdtemp(join(tmpdir(), 'minions-iso-'));
   try {
-    const gitDir = join(root, 'git'), work = join(root, 'wt');
+    const home = join(root, 'home'), gitDir = join(root, 'git'), work = join(root, 'wt');
+    await mkdir(home);
+    const clean = { home, ...(opts.signal ? { signal: opts.signal } : {}) };
+    const op = await allowlistedGit(repo, ['rev-parse', '--path-format=absolute', '--git-path', 'objects', '--show-object-format'], true, clean);
+    const [objects = '', format = ''] = op.code === 0 ? op.stdout.trim().split('\n').map((l) => l.trim()) : [];
+    if (!objects || !isAbsolute(objects) || !EMPTY_TREE[format]) throw new Error(`cannot locate the object store of ${repo}: ${tail(op.stderr) || `git exit ${op.code}`}`);
     await mkdir(join(gitDir, 'refs', 'heads'), { recursive: true });
     await mkdir(join(gitDir, 'info'), { recursive: true });
     await mkdir(work);
@@ -110,25 +129,35 @@ export async function withIsolatedRepo<T>(git: GitFn, repo: string, fn: (iso: Is
       : `[core]\n\trepositoryformatversion = 1\n\tbare = false\n[extensions]\n\tobjectformat = ${format}\n`);
     await symlink(objects, join(gitDir, 'objects'));
     const lead = [`--git-dir=${gitDir}`, `--work-tree=${work}`, ...cfgArgs([...ISOLATED_GIT_CONFIG, `attr.tree=${EMPTY_TREE[format]}`])];
-    const iso: GitFn = (_cwd, args, allowFailure) => git(work, [...lead, ...args], allowFailure);
+    const iso: GitFn = (_cwd, args, allowFailure) => allowlistedGit(work, [...lead, ...args], !!allowFailure, clean);
     return await fn({ git: iso, dir: work, objectFormat: format });
   } finally {
     await rm(root, { recursive: true, force: true }).catch(() => {});
   }
 }
 
-/** Environment variables that would make git read attributes from somewhere minions does not pin. */
-export function attributeEnvProblems(env: NodeJS.ProcessEnv = process.env): string[] {
-  return ['GIT_ATTR_SOURCE'].filter((k) => env[k] !== undefined).map((k) => `${k} is set in the environment`);
+/** One allowlisted git call in an isolated git dir; a setup failure is returned as exit 128. */
+export async function isolatedGit(repo: string, args: string[], opts: CleanGitOptions = {}): Promise<RunResult> {
+  try {
+    return await withIsolatedRepo(repo, (iso) => iso.git(iso.dir, args, true), opts);
+  } catch (e) {
+    return { code: 128, stdout: '', stderr: String((e as Error)?.message ?? e) };
+  }
+}
+
+/** Whether `sha` is a commit in `repo`'s object store (isolated). */
+export async function commitExists(repo: string, sha: string, opts: CleanGitOptions = {}): Promise<boolean> {
+  return (await isolatedGit(repo, ['rev-parse', '--verify', '--quiet', `${sha}^{commit}`], opts)).code === 0;
 }
 
 /**
  * Refuses merge drivers that make a textual merge "clean" by other rules: every .gitattributes in the
- * given commits' trees (the isolated merge reads no other attributes: see the header). Returns the
+ * given commits' trees (the isolated merge reads no other attributes, and the allowlisted environment
+ * has no GIT_ATTR_SOURCE: see the header). Returns the
  * offending lines (empty = only built-in drivers).
  */
 export async function mergeAttributeProblems(git: GitFn, repo: string, revs: string[]): Promise<string[]> {
-  const problems: string[] = [...attributeEnvProblems()];
+  const problems: string[] = [];
   for (const rev of new Set(revs)) {
     const ls = await git(repo, ['ls-tree', '-r', '-z', '--name-only', rev], true);
     if (ls.code !== 0) { problems.push(`cannot list ${rev.slice(0, 12)}: ${tail(ls.stderr)}`); continue; }
@@ -145,9 +174,9 @@ export async function mergeAttributeProblems(git: GitFn, repo: string, revs: str
  * `git merge-tree --write-tree` of two commits with fixed options and built-in drivers only, run in an
  * isolated git dir (withIsolatedRepo): the checkout's working tree, index and config never count.
  */
-export async function mergeTree(git: GitFn, repo: string, ours: string, theirs: string): Promise<MergeTreeResult> {
+export async function mergeTree(repo: string, ours: string, theirs: string, opts: CleanGitOptions = {}): Promise<MergeTreeResult> {
   try {
-    return await withIsolatedRepo(git, repo, (iso) => isolatedMergeTree(iso, ours, theirs));
+    return await withIsolatedRepo(repo, (iso) => isolatedMergeTree(iso, ours, theirs), opts);
   } catch (e) {
     return { state: 'error', message: `git merge-tree not run: ${tail(String((e as Error)?.message ?? e))}` };
   }
@@ -165,6 +194,7 @@ async function isolatedMergeTree(iso: IsolatedRepo, ours: string, theirs: string
   return { state: 'error', message: `git merge-tree failed: ${tail(r.stderr || r.stdout) || `exit ${r.code}`}` };
 }
 
+// The GitFn helpers here (commitParents, treeOf, hasCommit, mergeAttributeProblems) take an IsolatedRepo's git.
 export async function commitParents(git: GitFn, repo: string, sha: string): Promise<string[] | null> {
   const r = await git(repo, ['rev-list', '--parents', '-n', '1', sha, '--'], true);
   if (r.code !== 0) return null;
@@ -181,11 +211,14 @@ export async function hasCommit(git: GitFn, repo: string, sha: string): Promise<
   return (await git(repo, ['rev-parse', '--verify', '--quiet', `${sha}^{commit}`], true)).code === 0;
 }
 
-/** H' = commit-tree <tree> -p H -p B, with the runtime's git identity, unsigned. */
-export async function commitMerge(git: GitFn, repo: string, o: { tree: string; head: string; base: string; baseBranch: string; identity: MinionsConfig['git']['identity'] }): Promise<{ sha: string } | { error: string }> {
+/**
+ * H' = commit-tree <tree> -p H -p B, with the runtime's git identity, unsigned. Isolated (the commit object
+ * lands in the repository's object store), so no GIT_AUTHOR_* / GIT_COMMITTER_* or config of the caller counts.
+ */
+export async function commitMerge(repo: string, o: { tree: string; head: string; base: string; baseBranch: string; identity: MinionsConfig['git']['identity'] }, opts: CleanGitOptions = {}): Promise<{ sha: string } | { error: string }> {
   const msg = `Merge ${o.baseBranch} (${o.base.slice(0, 12)}) into the approved head ${o.head.slice(0, 12)}\n\nBase update by minions: a clean merge-tree of the approved head and origin/${o.baseBranch}; no other change.`;
-  const r = await git(repo, [...cfgArgs([`user.name=${o.identity.name}`, `user.email=${o.identity.email}`, 'commit.gpgSign=false']),
-    'commit-tree', o.tree, '-p', o.head, '-p', o.base, '-m', msg], true);
+  const r = await isolatedGit(repo, [...cfgArgs([`user.name=${o.identity.name}`, `user.email=${o.identity.email}`, 'commit.gpgSign=false']),
+    'commit-tree', o.tree, '-p', o.head, '-p', o.base, '-m', msg], opts);
   const sha = r.stdout.trim();
   return r.code === 0 && FULL_SHA.test(sha) ? { sha } : { error: `git commit-tree failed: ${tail(r.stderr) || `exit ${r.code}`}` };
 }
@@ -238,9 +271,9 @@ export function parseBaseUpdate(row: Pick<EvidenceRow, 'details_json'>): BaseUpd
  * Verifies one link from git objects. `record` is the candidate base-update evidence for `head` (a hint).
  * Every git call runs in an isolated git dir (withIsolatedRepo); a failure to set it up fails the link.
  */
-export async function verifyLink(git: GitFn, repo: string, head: string, record: Pick<EvidenceRow, 'details_json' | 'config_revision'> | undefined, o: { serverBase: string | null; configRevision: number }): Promise<BaseUpdateLink> {
+export async function verifyLink(repo: string, head: string, record: Pick<EvidenceRow, 'details_json' | 'config_revision'> | undefined, o: { serverBase: string | null; configRevision: number } & CleanGitOptions): Promise<BaseUpdateLink> {
   try {
-    return await withIsolatedRepo(git, repo, (iso) => verifyLinkIn(iso, head, record, o));
+    return await withIsolatedRepo(repo, (iso) => verifyLinkIn(iso, head, record, o), o.signal ? { signal: o.signal } : {});
   } catch (e) {
     return { head, from: null, base: null, checks: { record: false, parents: false, ancestry: false, tree: false, revision: false },
       problems: [`cannot verify ${head.slice(0, 12)}: ${tail(String((e as Error)?.message ?? e))}`] };
@@ -281,16 +314,20 @@ async function verifyLinkIn(iso: IsolatedRepo, head: string, record: Pick<Eviden
   return link;
 }
 
-/** origin's base as the server reports it (ls-remote), or null. */
-export async function serverBaseOf(git: GitFn, repo: string, remote: string, base: string): Promise<string | null> {
-  const ls = await git(repo, ['ls-remote', '--heads', remote, `refs/heads/${base}`], true);
+/** Network call in `repo` with the allowlisted environment (an empty HOME; the repository's own config only). */
+const networkGit = (repo: string, args: string[], opts: CleanGitOptions) =>
+  withEmptyHome((home) => allowlistedGit(repo, args, true, { home, network: true, ...(opts.signal ? { signal: opts.signal } : {}) }));
+
+/** origin's branch `base` as the server reports it (ls-remote, allowlisted environment), or null. */
+export async function serverBaseOf(repo: string, remote: string, base: string, opts: CleanGitOptions = {}): Promise<string | null> {
+  const ls = await networkGit(repo, ['ls-remote', '--heads', remote, `refs/heads/${base}`], opts);
   const sha = ls.code === 0 ? ls.stdout.trim().split(/\s+/)[0] ?? '' : '';
   return FULL_SHA.test(sha) ? sha : null;
 }
 
-/** Fetches origin's base into refs/remotes/origin/<base> (never moves the local base branch). */
-export async function fetchBase(git: GitFn, repo: string, remote: string, base: string): Promise<{ ok: true } | { ok: false; message: string }> {
-  const f = await git(repo, ['fetch', '--no-tags', remote, `+refs/heads/${base}:refs/remotes/origin/${base}`], true);
+/** Fetches origin's base into refs/remotes/origin/<base> (never moves the local base branch; allowlisted environment). */
+export async function fetchBase(repo: string, remote: string, base: string, opts: CleanGitOptions = {}): Promise<{ ok: true } | { ok: false; message: string }> {
+  const f = await networkGit(repo, ['fetch', '--no-tags', remote, `+refs/heads/${base}:refs/remotes/origin/${base}`], opts);
   return f.code === 0 ? { ok: true } : { ok: false, message: `fetching ${base} from origin failed: ${tail(f.stderr) || `git exit ${f.code}`}` };
 }
 
@@ -300,8 +337,8 @@ export async function fetchBase(git: GitFn, repo: string, remote: string, base: 
  * chain is contiguous, at most MAX_BASE_UPDATE_CHAIN long, every check holds and it ends at evidence.
  */
 export async function deriveApproval(o: {
-  git: GitFn; repo: string; db: RuntimeDb; taskId: string; head: string; configRevision: number;
-  serverBase: string | null; isReviewed: (head: string) => boolean; maxChain?: number;
+  repo: string; db: RuntimeDb; taskId: string; head: string; configRevision: number;
+  serverBase: string | null; isReviewed: (head: string) => boolean; maxChain?: number; signal?: AbortSignal;
 }): Promise<DerivedApproval> {
   const max = o.maxChain ?? MAX_BASE_UPDATE_CHAIN;
   const out: DerivedApproval = { head: o.head, reviewedHead: null, links: [], serverBase: o.serverBase, problems: [] };
@@ -311,7 +348,7 @@ export async function deriveApproval(o: {
     if (out.links.length >= max) { out.problems.push(`more than ${max} base updates since the last review`); break; }
     const record = o.db.evidenceFor(o.taskId, cur, BASE_UPDATE_KIND).at(-1);
     if (!record && !out.links.length) { out.problems.push(`no base-update record for ${cur.slice(0, 12)}`); break; }
-    const link = await verifyLink(o.git, o.repo, cur, record, { serverBase: o.serverBase, configRevision: o.configRevision });
+    const link = await verifyLink(o.repo, cur, record, { serverBase: o.serverBase, configRevision: o.configRevision, ...(o.signal ? { signal: o.signal } : {}) });
     out.links.push(link);
     if (link.problems.length || !link.from) { out.problems.push(...link.problems); break; }
     cur = link.from;

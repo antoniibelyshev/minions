@@ -717,15 +717,27 @@ the scan above, `evaluateMergeGate` / `autoMergeTask` in `src/runtime/merge.ts`)
   `binary`, also through a macro) in any `.gitattributes` of either commit refuses the update and the
   derivation: such a driver makes a conflicting merge "clean" by its own rules.
 - **Isolation.** Every git call the update or the derived approval depends on (merge-tree, parents,
-  trees, ancestry, the per-link diff) runs in an isolated git dir (`withIsolatedRepo`): a fresh
+  trees, ancestry, the per-link and push-policy diffs, commit-tree) runs in an isolated git dir (`withIsolatedRepo`): a fresh
   directory under the OS temp dir with its own config, HEAD, refs, info and no index, an empty work
   tree, and the repository's object store linked in (so the merge-tree's tree object is there for
   `commit-tree`). So nothing an agent can write in the checkout (nested or untracked `.gitattributes`,
   the index, `.git/info/attributes`, `.git/config` such as `merge.default` or `attr.tree`, replace
   refs, grafts) changes the result; commit-graph files and replace refs are off. On git ≥ 2.42
-  `attr.tree` is pinned to the empty tree, and `GIT_ATTR_SOURCE` in minions' environment refuses the
-  update. git 2.39 (the image's) knows neither and reads attributes only from the work tree and the
-  index, both empty here.
+  `attr.tree` is pinned to the empty tree. git 2.39 (the image's) has no `attr.tree` and reads
+  attributes only from the work tree and the index, both empty here.
+- **Allowlisted environment.** An agent can run a minions command (`work record`, `sync`, ...) with an
+  environment of its choice, so these calls, and the `ls-remote` / `fetch` of the server's base, never
+  inherit the minions process environment and never go through the caller's `GitFn`
+  (`git-hardening.ts` `allowlistedGit`, both runtimes). The environment is built from an allowlist:
+  `PATH`, `LANG`, `LANGUAGE`, `LC_*`, `TZ`, `TMPDIR` (network calls also keep the proxy variables
+  and `MINIONS_*`, which the credential helper reads). `HOME` is an empty directory minions creates,
+  `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM`, `GIT_ATTR_NOSYSTEM` (no `/etc/gitattributes`),
+  `GIT_NO_REPLACE_OBJECTS`, and the other `GIT_*` variables are only the ones `hardenedGitEnv` sets.
+  So `GIT_COMMON_DIR`, `GIT_DIR`, `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY`, `GIT_GRAFT_FILE`,
+  `GIT_CONFIG_PARAMETERS` / `GIT_CONFIG_COUNT`, `GIT_ATTR_SOURCE`, `GIT_AUTHOR_*`, `SSL_CERT_FILE`,
+  `~/.gitconfig` and `XDG_CONFIG_HOME` change nothing (dropped rather than refused). The host runtime
+  adds the hardened `-c` options as for its other git calls. The container keeps git's default
+  protocol policy (no `GIT_PROTOCOL_FROM_USER`), as its other git calls do.
 - **Derived approval.** The record is only a hint. On every merge pass the caller (`autoMergeTask`)
   recomputes each link `H' → H` from git objects (`deriveApproval` / `verifyLink`): exactly two
   parents, the record agrees with them and with the tree, parent 2 is an ancestor of (or equal to) the
@@ -747,9 +759,13 @@ the scan above, `evaluateMergeGate` / `autoMergeTask` in `src/runtime/merge.ts`)
   push (base updates then fail and are reported); `capabilities.pr.merge: "allow"` and `git.push`
   allowed for the branch's paths.
 - **Residuals.** The server base comes from `ls-remote`, which in the container resolves through
-  agent-writable git config (the same residual as the sensitive-path gate). Inherited `GIT_*`
-  variables of the minions process itself (other than `GIT_ATTR_SOURCE`) are trusted in the
-  container, as for every other git call (the host runtime drops them). A few short local git calls
+  the repository's own (agent-writable) git config, `remote.origin.url` and `url.*.insteadOf` (the
+  same residual as the sensitive-path gate). `PATH` is kept, so the `git` binary (and the credential
+  helper) is found through the caller's `PATH`, and `TMPDIR` picks where the isolated dir is
+  created. The object store is shared with agents and git does not re-hash objects on read. Calls
+  outside the derivation still use the caller's `GitFn` and environment in the container: the push,
+  moving the local branch, `headOf` / `isDirty` / `listWorktrees`, `githubOrigin`, and
+  `gateChangedPaths` (the reviewed head's sensitive paths, shared with publication). A few short local git calls
   of the scan (`headOf`, `isDirty`, `listWorktrees`) and the CI gate's gh reads are not wired to the
   abort signal; their own timeouts bound them. Not built here: the
   needs-rebase stage for real conflicts (task-68.4) and the routine pass that runs the scan on a clock
