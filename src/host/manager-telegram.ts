@@ -18,7 +18,11 @@
 //   is handled, so a restart does not replay old taps (and the journal's single-use nonce covers the rest).
 // - 409 is "another process polls the manager bot" (CONFLICT); 401/404 is a rejected token (AUTH_REQUIRED); 429 waits
 //   retry_after.
-// - A fixed command set: /status, /requests, /project [name], /help (and /start), and the owner change commands
+// - /settings [query] (task-65.1): read-only, the settings of the picked project with value, source, when a change takes
+//   effect and the host-owned mark; a group name or a key substring narrows it; cut to one message with a "N more" tail.
+//   Secrets show only set / unset. An unknown /set key gets the closest keys; a /set whose value is already in effect
+//   gets a plain explanation (ManagerNotice), not a "failed" line.
+// - A fixed command set: /status, /requests, /project [name], /settings [query], /help (and /start), and the owner change commands
 //   /set <key> <value> [shared], /sync, /upgrade, /restart, /undo <id> (task-53.5.3). Anything else gets the help text.
 // - The dev-only /rebuild_cli (task-53.7) is accepted and listed in the help text only when
 //   ManagerCommands.devRebuild says it exists; elsewhere it is an unknown command like any other.
@@ -38,7 +42,8 @@ import { findOfferByNonce, isOfferRequestId, isOwnerRequestId } from './change-j
 import { APPROVE_HEAD_PATTERN, APPROVE_TASK_ID_PATTERN } from './change-requests.js';
 import type { Fetch } from './credentials.js';
 import { isOwnerUpdate, type ManagerAccess, type TelegramUpdate } from './manager-bot.js';
-import type { ManagerCommands, ManagerEvent, ManagerOffer, ManagerOutcome, ManagerTransport, OwnerCommand } from './manager.js';
+import { ManagerNotice, type ManagerCommands, type ManagerEvent, type ManagerOffer, type ManagerOutcome, type ManagerTransport, type OwnerCommand } from './manager.js';
+import { closestSettingKeys, formatValue, SETTING_GROUPS, type SettingView } from './settings.js';
 
 /** Telegram's callback_data limit. */
 export const CALLBACK_DATA_MAX_BYTES = 64;
@@ -87,6 +92,7 @@ const HELP_LINES = [
   '/status - per project: runtime, coordinator, active leases, pending change requests',
   '/requests - pending change requests, each with Confirm / Reject buttons',
   '/project [name] - list the projects, or pick the one the other commands use',
+  '/settings [query] - the settings with value, source, when a change takes effect and the host-owned mark; query: a group (e.g. delivery) or part of a key',
   '/set <key> <value> [shared] - change a setting (like minions settings set; local layer unless "shared"); host-owned keys too',
   '/sync - fast-forward the host base branch (local delivery: from the container; GitHub delivery: from origin)',
   '/upgrade - minions upgrade; the dry-run plan is shown first',
@@ -103,7 +109,7 @@ export const HELP_TEXT = helpText(false);
 
 /** Usage line per change command (sent when the arguments do not parse). */
 const USAGE: Record<string, string> = {
-  set: 'Usage: /set <key> <value> [shared], e.g. /set execution.maxActiveTasks 3 (value "default" unsets an optional setting). Keys: minions settings --list on the host.',
+  set: 'Usage: /set <key> <value> [shared], e.g. /set execution.maxActiveTasks 3 (value "default" unsets an optional setting). Keys: /settings, or minions settings --list on the host.',
   undo: 'Usage: /undo <id>, the id of an applied config change (cr_... or ow_...).',
   approve: 'Usage: /approve <task> <sha> [merge], e.g. /approve task-12 <sha>. <sha> must be the full 40-character lowercase head SHA from the awaiting-approval message (short or non-hex SHAs are refused). Without "merge" it approves publishing that head; with "merge" it approves merging its delivered pull request.',
   sync: 'Usage: /sync (no arguments).', upgrade: 'Usage: /upgrade (no arguments).', restart: 'Usage: /restart (no arguments).',
@@ -135,6 +141,58 @@ export function parseOwnerCommand(cmd: string, arg: string): OwnerCommand | null
   if (cmd === 'sync' || cmd === 'upgrade' || cmd === 'restart') return words.length ? null : { kind: cmd };
   if (cmd === 'rebuild_cli') return words.length ? null : { kind: 'rebuild-cli' };
   return null;
+}
+
+/** When a change of a setting takes effect, in a word (secrets: the auth command that changes them). */
+function takesEffectWord(v: SettingView): string {
+  if (v.type === 'secret') return `minions auth ${v.key.slice('secrets.'.length)}`;
+  return v.needsUpgrade ? 'upgrade' : v.needsRestart ? 'restart' : 'now';
+}
+
+/** A setting's value for the chat: secrets only set / unset (the view never holds a secret anyway); one bounded line. */
+function settingValueText(v: SettingView): string {
+  if (v.type === 'secret') return v.value === 'provisioned' ? 'set' : 'unset';
+  return oneLine(formatValue(v.value), 120);
+}
+
+/** One line per setting: `key = value (source; takes effect) [host-owned]`. */
+export const settingLine = (v: SettingView) =>
+  `${v.key} = ${settingValueText(v)} (${v.source}; ${takesEffectWord(v)})${v.hostOwned ? ' [host-owned]' : ''}`;
+
+/**
+ * The /settings reply: settings filtered by a group name (case-insensitive) or else a key substring, grouped, cut
+ * below `max` characters with a "N more, narrow the query" tail. No match: the closest keys and the groups.
+ */
+export function formatSettingsList(project: { projectId: string; name: string }, all: SettingView[], query: string, max = MESSAGE_MAX_CHARS): string {
+  const q = query.trim().toLowerCase();
+  const group = SETTING_GROUPS.find((g) => g.toLowerCase() === q);
+  const hits = !q ? all : group ? all.filter((v) => v.group === group) : all.filter((v) => v.key.toLowerCase().includes(q));
+  const groups = `Groups: ${SETTING_GROUPS.map((g) => g.toLowerCase()).join(', ')}.`;
+  if (!hits.length) {
+    const near = closestSettingKeys(q, all.map((v) => v.key));
+    return [`No setting matches "${oneLine(query, 80)}".`, ...(near.length ? [`Closest keys: ${near.join(', ')}.`] : []), groups].join('\n');
+  }
+  const head = [
+    `Settings of ${displayText(project.name)} (${hits.length === all.length ? `all ${all.length}` : `${hits.length} of ${all.length}`}):`,
+    'key = value (source; takes effect: now, restart = coordinator restart, upgrade = minions upgrade) [host-owned: never changed from the container]',
+  ];
+  const foot = ['', 'Change one with /set <key> <value> [shared].'];
+  const tail = (n: number) => `… ${n} more, narrow the query: /settings <group or part of a key>. ${groups}`;
+  const lines = [...head];
+  let used = head.join('\n').length + foot.join('\n').length + tail(hits.length).length + 2;
+  let shown = 0;
+  let current: string | null = null;
+  for (const v of hits) {
+    const block = [...(v.group !== current ? ['', v.group] : []), `  ${settingLine(v)}`];
+    const size = block.join('\n').length + 1;
+    if (used + size > max) break;
+    lines.push(...block);
+    used += size;
+    current = v.group;
+    shown++;
+  }
+  const rest = hits.length - shown;
+  return [...lines, ...(rest ? ['', tail(rest)] : foot)].join('\n');
 }
 
 const OffsetSchema = z.object({ version: z.literal(1), botId: z.string(), offset: z.number().int().nonnegative() }).strict();
@@ -409,14 +467,16 @@ export class TelegramTransport implements ManagerTransport {
     const arg = (m?.[2] ?? '').trim();
     const dev = await this.devRebuild();
     const change = CHANGE_COMMANDS.includes(cmd) || (dev && DEV_COMMANDS.includes(cmd));
-    if (!['status', 'requests', 'project'].includes(cmd) && !change) { await this.send(helpText(dev)); return; }
+    if (!['status', 'requests', 'project', 'settings'].includes(cmd) && !change) { await this.send(helpText(dev)); return; }
     if (!this.commands) { await this.send('The host manager is starting; try again in a moment.'); return; }
     try {
       if (change) await this.change(cmd, arg);
       else if (cmd === 'status') await this.send(displayText(await this.commands.status(this.selected)));
       else if (cmd === 'requests') await this.requests();
+      else if (cmd === 'settings') await this.settings(arg);
       else await this.project(arg);
     } catch (e) {
+      if (e instanceof ManagerNotice) { await this.send(displayText(e.message)); return; }
       await this.send(`/${cmd} failed: ${displayText(redact((e as Error).message))}`);
     }
   }
@@ -433,6 +493,12 @@ export class TelegramTransport implements ManagerTransport {
   /** Whether the dev-only /rebuild_cli exists for the picked project (or any); false when it cannot be told. */
   private async devRebuild(): Promise<boolean> {
     try { return (await this.commands?.devRebuild?.(this.selected)) === true; } catch { return false; }
+  }
+
+  private async settings(arg: string): Promise<void> {
+    if (!this.commands!.settings) { await this.send('/settings is not available in this host manager.'); return; }
+    const r = await this.commands!.settings(this.selected);
+    await this.send(formatSettingsList(r, r.settings, arg));
   }
 
   private async requests(): Promise<void> {
