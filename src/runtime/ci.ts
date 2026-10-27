@@ -19,6 +19,7 @@ import { normalizeGithubRemote, type GitFn } from './github.js';
 import { realGh, type GhFn } from './publish.js';
 import { ciTimeoutOf, evaluateCiGate, formatCiGate, type CiGate } from './ci-gate.js';
 import type { MergeResult } from './merge.js';
+import type { ScanReport } from './pr-scan.js';
 
 // ---------------------------------------------------------------- read-only API access
 
@@ -283,12 +284,14 @@ export interface SyncTaskResult {
   warnings: string[];
   error?: string;
 }
-export interface SyncReport { tasks: SyncTaskResult[]; synced: number; failed: number }
+export interface SyncReport { tasks: SyncTaskResult[]; synced: number; failed: number; scan?: ScanReport }
 
 export interface SyncDeps {
   db: RuntimeDb; backlog: BacklogAdapter; config: MinionsConfig; gh?: GhFn;
   /** Auto-merge pass for an open PR after its observation is recorded (`Scheduler.autoMerge`); omitted: read-only sync. */
   merge?: (taskId: string) => Promise<MergeResult>;
+  /** PR scan after the observations (`Scheduler.scanPullRequests`, task-68.3); omitted: no scan. */
+  scan?: (taskIds?: string[]) => Promise<ScanReport>;
 }
 
 const PR_FIELDS = 'url,state,isDraft,headRefOid,baseRefName,mergedAt,closedAt,mergeStateStatus,statusCheckRollup';
@@ -330,7 +333,13 @@ export async function syncTasks(deps: SyncDeps, opts: { taskIds?: string[] } = {
       .catch((e: unknown): SyncTaskResult => ({ taskId: task.id, prUrl: task.prUrl!, changed: false, warnings: [], error: `sync failed: ${short(String((e as Error)?.message ?? e))}` })));
   }
   db.addEvent('sync', null, { tasks: out.length, failed: out.filter((t) => t.error).length });
-  return { tasks: out, synced: out.filter((t) => !t.error).length, failed: out.filter((t) => t.error).length };
+  let scan: ScanReport | undefined;
+  if (deps.scan) {
+    try { scan = await deps.scan(opts.taskIds?.length ? opts.taskIds : undefined); } catch (e) {
+      scan = { state: 'failed', prs: 0, tasks: [], message: `PR scan failed: ${short(String((e as Error)?.message ?? e))}` };
+    }
+  }
+  return { tasks: out, synced: out.filter((t) => !t.error).length, failed: out.filter((t) => t.error).length, ...(scan ? { scan } : {}) };
 }
 
 async function syncOne(task: Task, x: { db: RuntimeDb; backlog: BacklogAdapter; config: MinionsConfig; gh: GhFn; leased: Set<string>; requiredFor: (prUrl: string) => Promise<RequiredChecksReport | null>; merge?: SyncDeps['merge'] }): Promise<SyncTaskResult> {
@@ -428,6 +437,7 @@ export function formatSync(r: SyncReport): string {
     : `${t.taskId}: ${describeObservation({ prState: t.prState!, ci: t.ci!, headSha: t.headSha! })}${t.statusChange ? `; status ${t.statusChange.from} -> ${t.statusChange.to}` : ''}${t.changed ? '' : ' (unchanged)'}  ${t.prUrl}` +
       (t.gate ? `\n  ${formatCiGate(t.gate)}` : '') + (t.merge ? `\n  merge ${t.merge.state}: ${t.merge.message}` : '') + t.warnings.map((w) => `\n  warning: ${w}`).join(''));
   L.push(`synced ${r.synced}, failed ${r.failed}`);
+  if (r.scan && r.scan.state !== 'off') L.push(r.scan.message, ...r.scan.tasks.filter((t) => t.action !== 'none').map((t) => `  ${t.taskId}: ${t.action}: ${t.message}`));
   return L.join('\n');
 }
 

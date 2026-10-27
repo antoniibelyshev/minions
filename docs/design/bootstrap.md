@@ -659,6 +659,86 @@ Decision record for `delivery.merge: "auto-when-eligible"` (task-1.9; `src/runti
   app. Code that already runs in the container can still use the token directly (see "Host-signed
   publication approvals"); branch protection on GitHub stays the final control.
 
+## PR scan
+
+Decision record for the PR scan (task-68.3, phase 2 of the unattended-delivery design on branch
+`agent/task-68-1-design-unattended-delivery-daily-routine`, decision 4; `src/runtime/pr-scan.ts`,
+`Scheduler.scanPullRequests` / `ciRepair`).
+
+- **One read.** `gh pr list --repo <origin> --state open --json
+  number,url,headRefOid,headRefName,baseRefName,mergeable,mergeStateStatus,isDraft`, once per scan,
+  matched to `delivered` tasks by URL. A failed read changes nothing (the next pass retries).
+- **Where it runs.** At the end of `minions sync` (the `scan` field of the report, after the merge
+  pass), and after `minions work record` / `work release` once the lease has ended (`scan` field,
+  bounded to 60 s by `boundedScan`; it never changes the record or release outcome and never throws).
+  The routine pass of phase 1 (task-68.2) calls the same `runPrScan`. Off (no gh call) unless delivery
+  is pull-request on GitHub with `delivery.merge: "auto-when-eligible"`.
+- **Who is touched.** Only `delivered` tasks without an active lease whose publication is `published`
+  for that PR, whose PR targets `git.baseBranch` and whose PR head is the approved head.
+- **The table.** `CLEAN`, `BLOCKED`, `UNSTABLE`, `HAS_HOOKS`: nothing (the merge pass decides).
+  `UNKNOWN`: retry on the next pass. `BEHIND`: base update (below). `DIRTY` / `CONFLICTING`: a fresh fetch
+  and a local merge-tree decide: clean → base update, conflict → `conflict` with the files, an event,
+  a status notification and the `onConflict` hook (the needs-rebase stage of task-68.4 builds on it; the
+  task stays `delivered` until then). Required checks `fail` at the approved head (`Scheduler.ciGate`):
+  disarm, then `ciRepair`: `delivered` → `changes-requested` at the final gate's repair target, counted
+  as a repair cycle (the same rule as `ciBlock === 'fail'` in record; at
+  `execution.maxRepairCyclesBeforeReplan` → `awaiting-human`). The findings (`ci-repair` evidence) reach
+  the next engineer brief as `priorFindings` (role `ci`); at a base-update head they say the failure is
+  likely a semantic conflict with the base. Required checks `timeout`: a status notification, the task
+  stays `delivered`.
+- **Merge gate and repairs.** The merge gate also requires the task to be `delivered` (or
+  `awaiting-ci` / `merging`), so a task under repair is never armed even if CI later passes.
+
+## Base update and derived approval
+
+Decision record for updating a behind PR by code (task-68.3, design decision 5; `src/runtime/base-update.ts`,
+the scan above, `evaluateMergeGate` / `autoMergeTask` in `src/runtime/merge.ts`).
+
+- **The update.** `B` = origin's base read with `ls-remote` after a fetch into
+  `refs/remotes/origin/<base>` (the local base branch is not moved). `B` already in `H`: nothing to do.
+  Otherwise `git merge-tree --write-tree H B` with fixed options (`MERGE_TREE_CONFIG`: `merge.default=text`,
+  renames on, no renormalization, no user attributes file); a conflict goes to the conflict row above.
+  Then `git commit-tree <tree> -p H -p B` with `git.identity` (unsigned) gives `H'`; the push policy is
+  `can(git.push)` on the union of the reviewed paths and `diff(B, H')`, which must be `allow` (an `ask`
+  approval is per head, so the update is skipped). Minions' own auto-merge is disarmed first, the
+  `base-update` evidence `{from: H, base: B, tree}` is written on `H'`, then `git push <remote>
+  H':refs/heads/<branch>` (never force; a rejection means someone else pushed: skipped and recorded),
+  the local branch (and its clean worktree, `merge --ff-only`) moves to `H'` and `publications.head_sha`
+  moves `H` → `H'` (compare-and-swap). The local branch, its worktree and origin's branch must all be at
+  `H` first, and the worktree must be clean.
+- **Limits.** One update in flight across all PRs (highest priority, then the longest-waiting
+  publication): a pushed update whose CI at the new head is neither passing nor failing, and is within
+  `verification.ciPendingTimeoutMinutes`, defers the others. `routine.maxBaseUpdatesPerTask` (default 4,
+  live) caps pushed updates per task in any 24 hours; 0 turns base updates off.
+- **Merge drivers.** `merge=union` or any custom driver (any `merge=` value other than `text` /
+  `binary`, also through a macro) in any `.gitattributes` of either commit, in `.git/info/attributes` or
+  in the checkout's top-level `.gitattributes` refuses the update and the derivation: such a driver
+  makes a conflicting merge "clean" by its own rules.
+- **Derived approval.** The record is only a hint. On every merge pass the caller (`autoMergeTask`)
+  recomputes each link `H' → H` from git objects (`deriveApproval` / `verifyLink`): exactly two
+  parents, the record agrees with them and with the tree, parent 2 is an ancestor of (or equal to) the
+  server's base (`ls-remote`; fetched when missing), `tree(H')` equals a clean merge-tree of the
+  parents, and the record was written at the current config revision. Chains `H → H' → H''` are
+  followed, at most `MAX_BASE_UPDATE_CHAIN` (8) links, and must end at reviewer evidence `complete` at
+  the current config revision. The pure `evaluateMergeGate` accepts the passed-in result only when the
+  chain starts at the approved head, is contiguous, every check holds and it ends at the reviewed head
+  (`derivedApprovalProblems`). CI is never derived: required checks must pass at `H'`. Sensitive paths
+  of `H'` are `gateChangedPaths(H)` ∪ `diff(B, H')` per link (a union: no base removes a path).
+  `pr.merge: ask` stays per head, so `H'` needs a new merge approval (unattended delivery needs `allow`).
+- **Crash window.** A crash between the push and moving the publication head leaves the PR at `H'`
+  with the record written. The next scan adopts `H'` only when its link verifies from git and starts at
+  the approved head; any other PR head is a foreign push: one event and one status notification per
+  head, nothing adopted (the merge gate disarms and waits for a new review).
+- **Owner prerequisites (in addition to auto-merge's).** Branch protection "Require branches to be up
+  to date" (that is what makes `BEHIND` appear); no force pushes; **no "Require signed commits"** on the
+  base or the PR branches, because the runtime's merge commits are unsigned and GitHub would reject the
+  push (base updates then fail and are reported); `capabilities.pr.merge: "allow"` and `git.push`
+  allowed for the branch's paths.
+- **Residuals.** The server base comes from `ls-remote`, which in the container resolves through
+  agent-writable git config (the same residual as the sensitive-path gate). Not built here: the
+  needs-rebase stage for real conflicts (task-68.4) and the routine pass that runs the scan on a clock
+  (task-68.2).
+
 ## GitHub intake sync
 
 Decision record for GitHub-filtered intake (`src/runtime/intake-sync.ts`, config `intake.github`).

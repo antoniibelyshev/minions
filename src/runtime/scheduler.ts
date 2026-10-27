@@ -26,6 +26,7 @@ import { assertBudgetAllowsStart, billingOf, budgetNotice, latestLeaseUsage, rec
 import { readRequiredChecks, type RequiredChecksReport } from './ci.js';
 import { ciGateFromDb, formatCiGate, type CiGate } from './ci-gate.js';
 import { autoMergeTask, type MergeResult } from './merge.js';
+import { runPrScan, type ConflictInfo, type ScanReport } from './pr-scan.js';
 import { BRANCH_PREFIX, branchFor, ensureBranchWorktree, ensureReviewWorktree, git, headOf, resolveBaseBranch, taskSlug, workspaceLayout, type WorkspaceLayout } from './worktree.js';
 
 export const LEASE_ROLES: readonly BuiltinLeaseRole[] = ['engineer', 'tester', 'reviewer'];
@@ -912,6 +913,13 @@ export class Scheduler {
         const r = JSON.parse(l.result_json!) as WorkerResult;
         return { leaseId: l.id, role: l.role, status: r.status, findings: r.findings, nextAction: r.nextAction };
       });
+    // A CI failure the PR scan found after delivery (no lease produced it): the latest one since the last lease ended.
+    const lastEnd = this.db.leases({ taskId: task.id, all: true }).filter((l) => l.id !== lease.id).map((l) => l.ended_at ?? l.started_at).sort().at(-1) ?? '';
+    const ciRepair = this.db.evidenceOfKind(task.id, 'ci-repair').filter((e) => e.recorded_at >= lastEnd).at(-1);
+    if (ciRepair) {
+      const v = JSON.parse(ciRepair.details_json ?? '{}') as { findings?: unknown[]; nextAction?: string };
+      priorFindings.push({ leaseId: 'pr-scan', role: 'ci', status: 'needs_changes', findings: (v.findings ?? []).filter((f): f is string => typeof f === 'string'), nextAction: v.nextAction ?? '' });
+    }
     const resume = this.drainResume(task.id, lease, x.branch);
     return {
       briefMarker: `minions-lease: ${lease.id}`,
@@ -1513,6 +1521,49 @@ export class Scheduler {
       db: this.db, backlog: this.backlog, config: this.config, repo: this.layout.repo, gh: this.gh, git,
       ciGate: (id, head) => this.ciGate(id, head), approvalPublicKeyFile: this.approvalPublicKeyFile, now: this.now,
     }, taskId);
+  }
+
+  /**
+   * PR scan (src/runtime/pr-scan.ts, task-68.3): one `gh pr list`, then base updates for behind PRs, conflict
+   * reports and CI repairs for delivered tasks without an active lease. `deadline` bounds new base updates.
+   */
+  async scanPullRequests(opts: { taskIds?: string[]; deadline?: number; onConflict?: (c: ConflictInfo) => Promise<void> } = {}): Promise<ScanReport> {
+    return runPrScan({
+      db: this.db, backlog: this.backlog, config: this.config, repo: this.layout.repo, gh: this.gh, git,
+      ciGate: (id, head) => this.ciGate(id, head), ciRepair: (id, head, findings) => this.ciRepair(id, head, findings),
+      now: this.now, ...(opts.deadline !== undefined ? { deadline: opts.deadline } : {}), ...(opts.onConflict ? { onConflict: opts.onConflict } : {}),
+    }, { taskIds: opts.taskIds });
+  }
+
+  /**
+   * Required checks fail at a delivered task's approved head (found by the PR scan): delivered ->
+   * changes-requested at the repair target of the final gate, counted as a repair cycle like a CI failure
+   * in `work record`; at execution.maxRepairCyclesBeforeReplan the task goes to awaiting-human (replan).
+   * The findings reach the next engineer brief as priorFindings (role `ci`).
+   */
+  async ciRepair(taskId: string, head: string, findings: string[]): Promise<{ to: TaskStatus; repairCycles: number; replan: boolean }> {
+    const cfg = this.config;
+    const task = await this.backlog.getTask(taskId);
+    if (task.status !== 'delivered') throw new MinionsError('PRECONDITION', `Task ${taskId} is ${task.status}, not delivered.`);
+    if (this.db.activeLeases().some((l) => l.task_id === taskId)) throw new MinionsError('CONFLICT', `Task ${taskId} has an active lease.`);
+    const wf = this.workflowOf(task);
+    const row = this.db.taskStage(taskId);
+    const stages = (row && row.workflow === wf.name ? parseStages(row.stages_json) : null) ?? wf.stages;
+    const gate = finalGateIndex(cfg, stages);
+    const position = repairTarget(cfg, stages, gate >= 0 ? gate : stages.length - 1);
+    const repairCycles = this.db.incrementRepairs(taskId);
+    const replan = repairCycles >= cfg.execution.maxRepairCyclesBeforeReplan;
+    const to: TaskStatus = replan ? 'awaiting-human' : 'changes-requested';
+    const nextAction = `Fix the failing required checks on top of ${head.slice(0, 12)} (merge, never rebase or force-push); the PR is reused.`;
+    await this.backlog.updateTask(taskId, task.version, { status: to });
+    this.db.transaction(() => {
+      this.db.setTaskStage(taskId, wf.name, stages, position);
+      this.db.addEvidence({ task_id: taskId, head_sha: head, kind: 'ci-repair', config_revision: cfg.configRevision, outcome: to,
+        details_json: JSON.stringify({ findings, nextAction, repairCycles }) });
+      this.db.addEvent('ci-repair', taskId, { head, to, repairCycles, replan });
+    });
+    await this.note(taskId, `minions: ${findings[0]}. Task delivered -> ${to} (repair cycle ${repairCycles}${replan ? `; the limit ${cfg.execution.maxRepairCyclesBeforeReplan} is reached: replan before more repairs` : ''}).${findings[1] ? ` ${findings[1]}.` : ''}`);
+    return { to, repairCycles, replan };
   }
 
   /**

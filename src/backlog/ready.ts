@@ -51,7 +51,7 @@ export function filterReady(tasks: Task[], ctx: ReadyContext, limit = Infinity):
 }
 
 const PRIORITY_RANK: Record<string, number> = { high: 0, medium: 1, low: 2 };
-const rank = (p: Task['priority']) => (p === null ? 3 : PRIORITY_RANK[p] ?? 3);
+export const priorityRank = (p: Task['priority']) => (p === null ? 3 : PRIORITY_RANK[p] ?? 3);
 
 /** Compares ids like "task-2" < "task-10" < "task-10.1" by numeric segments. */
 export function compareIds(a: string, b: string): number {
@@ -68,7 +68,7 @@ export function compareIds(a: string, b: string): number {
 
 /** high > medium > low > null, then id numerically. Returns a new array. */
 export function sortByPriority<T extends Pick<Task, 'priority' | 'id'>>(tasks: T[]): T[] {
-  return [...tasks].sort((a, b) => rank(a.priority) - rank(b.priority) || compareIds(a.id, b.id));
+  return [...tasks].sort((a, b) => priorityRank(a.priority) - priorityRank(b.priority) || compareIds(a.id, b.id));
 }
 
 /**

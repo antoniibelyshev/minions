@@ -39,6 +39,7 @@ import { contextResetCheck, dueNotice, HANDOFF_MAX_BYTES, humanContextReset, rea
 import { capacityOf, Scheduler, type NextReport, type NextStage, type RoleCapacity, type UsageFlag } from './scheduler.js';
 import { gitCredential } from './github.js';
 import { ciStatus, formatCiStatus, formatSync, syncTasks, type SyncReport } from './ci.js';
+import { boundedScan, scanEnabled, type ScanField } from './pr-scan.js';
 import { formatIntake, intakeProvenanceFallback, originRepository, syncIntake, type IntakeSyncReport } from './intake-sync.js';
 import { ghWithTimeout, type GhFn } from './publish.js';
 import { exportWorkspace, importWorkspace, setupState } from './workspace.js';
@@ -422,6 +423,22 @@ export async function spendCommand(o: { budget?: string; by?: string; lease?: st
 // ---------------------------------------------------------------- context reset
 
 /** Adds `contextReset` to a record/release response when a reset is due (task-45). Never fails the record. */
+/**
+ * The PR scan once a slot freed up (after `work record` / `work release`, the lease has ended; task-68.3):
+ * bounded to 60 s, a `scan` field only, never a change to the record or release outcome. Off (no field)
+ * unless the scan is enabled (pull-request delivery with auto-merge).
+ */
+async function scanAfterSlot(): Promise<{ scan?: ScanField }> {
+  try {
+    const cfg = await getConfig();
+    if (scanEnabled(cfg)) return {};
+    const sched = await scheduler();
+    return { scan: await boundedScan((deadline) => sched.scanPullRequests({ deadline })) };
+  } catch (e) {
+    return { scan: { state: 'error', message: `PR scan not run: ${(e as Error).message}` } };
+  }
+}
+
 export function withContextReset<T extends object>(r: T, deps: { db: RuntimeDb; config: MinionsConfig; state?: string }): T & { contextReset?: ReturnType<typeof dueNotice> } {
   try {
     const notice = dueNotice(contextResetCheck({ db: deps.db, config: deps.config, ...(deps.state !== undefined ? { state: deps.state } : {}) }));
@@ -496,7 +513,7 @@ export function register(program: Command): void {
       const r = o.submitted
         ? await recordSubmitted(await scheduler(), runtimePaths(), leaseId, opts)
         : await (await scheduler()).record(leaseId, await readInput(o.resultFile), opts);
-      const out = withContextReset(r, { db: getDb(), config: await getConfig(), state: runtimePaths().state });
+      const out = { ...withContextReset(r, { db: getDb(), config: await getConfig(), state: runtimePaths().state }), ...(await scanAfterSlot()) };
       emit(out, { json: globalOpts(cmd).json, human: (d: typeof out) => [d.message, ...(d.errors ?? []).map((e: string) => `  - ${e}`), ...(d.budget ? [d.budget.message] : []), ...resetLine(d)].join('\n') });
     }));
   work.command('release <leaseId>').description('Release a lease without a result (worktree is kept)')
@@ -505,7 +522,8 @@ export function register(program: Command): void {
     .option('--model <name>', 'model the worker ran on (for the USD estimate with API-key billing)')
     .action(action(async (leaseId: string, o: { reason: string; usage?: string; model?: string }, cmd: Command) => {
       requireMode('runtime');
-      const r = withContextReset(await (await scheduler()).release(leaseId, o.reason, { usage: usageFlag(o) }), { db: getDb(), config: await getConfig(), state: runtimePaths().state });
+      const released = withContextReset(await (await scheduler()).release(leaseId, o.reason, { usage: usageFlag(o) }), { db: getDb(), config: await getConfig(), state: runtimePaths().state });
+      const r = { ...released, ...(await scanAfterSlot()) };
       emit(r, { json: globalOpts(cmd).json, human: (d: typeof r) => [`Released ${d.leaseId} (${d.taskId}); worktree kept at ${d.worktree ?? '-'}`, ...(d.run ? [`process run: ${d.run}`] : []), ...(d.budget ? [d.budget.message] : []), ...resetLine(d)].join('\n') });
     }));
   work.command('spend').description('Spend tally and owner budget: show it, set the budget in plain language, or record usage after the fact')
@@ -883,7 +901,7 @@ export function register(program: Command): void {
       // Auto-merge (delivery.merge "auto-when-eligible") runs here, through the runtime's own gates.
       const sched = await scheduler();
       const r: SyncReport & { intake: IntakeSyncReport | null; notifications: OutboxCounts } = {
-        ...(await syncTasks({ db: d, backlog: b, config: cfg, merge: (id) => sched.autoMerge(id) }, { taskIds })), intake,
+        ...(await syncTasks({ db: d, backlog: b, config: cfg, merge: (id) => sched.autoMerge(id), scan: (ids) => sched.scanPullRequests({ taskIds: ids }) }, { taskIds })), intake,
         // Pending notifications are retried by whoever runs sync (the coordinator sends them; nothing is woken).
         notifications: outboxCounts(d),
       };
