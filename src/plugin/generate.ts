@@ -418,7 +418,7 @@ function digestRule(cfg: MinionsConfig): string {
   return [
     `\n\n**Digest** (\`digest\` among the reasons; ${r.digestAt.join(', ')} ${r.timezone}): do it before anything else, including pending notifications.`,
     'Run `minions notify digest --json`: it composes the text deterministically (merged and delivered, held updates, waiting for you with the exact `/approve` lines for the manager chat, blockers, auto-promotions, spend, next up, questions as numbered polls) and stores it under `key`.',
-    'Send `text` exactly as given with one `reply` (no greeting, no rewording), then ack every key it returns: `minions notify ack <keys...> --json` (the digest key and the items it covered; items in `left` stay for the next digest). If `reply` fails, run `minions notify fail <key> --error "<reason>" --json` for the digest key only.',
+    'Send `text` exactly as given with one `reply` (no greeting, no rewording), then ack every key it returns: `minions notify ack <keys...> --json` (the digest key and the items it covered; items in `left` stay for the next digest; a closing "<n> more item(s): send /status" line is part of the text, send it as is). If `reply` fails, run `minions notify fail <key> --error "<reason>" --json` for the digest key only.',
     'Then handle the other reasons as below. At 100% budget the digest is the only reason a wake happens: send it and stop (claims are refused).',
   ].join(' ');
 }

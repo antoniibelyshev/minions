@@ -99,10 +99,24 @@ describe('holds', () => {
     expect(reholdExpired(env.db, env.config, later)).toBe(1);
     expect(pending(env.db, {}, () => later).map((i) => i.key)).toEqual(['blocker:task-2:1']);
     expect(pending(env.db, { includeWaiting: true }, () => later).find((i) => i.key === 'delivered:task-1:abc')!.nextAttemptAt).toBe('2026-10-29T07:00:00.000Z');
-    // Routine off: nothing is re-held, the item is due at its time like any other.
+  });
+
+  it('turning the routine off releases held items at once (notify pending), not at the stored digest time', () => {
+    const env = makeEnv((c) => { c.routine = { enabled: true }; });
+    const clock = () => now;
+    enqueue(env.db, { key: 'delivered:task-1:abc', kind: 'delivered', taskId: 'task-1', text: 'Delivered task-1', holdUntil: holdFor(env.db, env.config, 'delivered', undefined, now) }, clock);
+    enqueue(env.db, { key: 'status:x', kind: 'status', text: 'explicitly held', holdUntil: holdFor(env.db, env.config, 'status', 'digest', now) }, clock);
+    enqueue(env.db, { key: 'digest:2026-10-27T08:00', kind: 'digest', text: 'a digest' }, clock);
+    expect(pending(env.db, {}, clock).map((i) => i.key)).toEqual(['digest:2026-10-27T08:00']);
+    // A failed send (attempts > 0) keeps its retry backoff: only holds are released.
+    enqueue(env.db, { key: 'blocker:b', kind: 'blocker', text: 'b' }, clock);
+    env.db.exec("UPDATE outbox SET attempts = 1, next_attempt_at = '2026-10-27T11:00:00.000Z' WHERE dedup_key = 'blocker:b'");
     const off = { ...env.config, routine: { enabled: false } };
-    expect(reholdExpired(env.db, off, at('2026-10-29T07:05:00Z'))).toBe(0);
-    expect(pending(env.db, {}, () => at('2026-10-29T07:05:00Z')).map((i) => i.key)).toContain('delivered:task-1:abc');
+    const soon = at('2026-10-27T10:01:00Z');
+    expect(reholdExpired(env.db, off, soon)).toBe(2);
+    expect(pending(env.db, {}, () => soon).map((i) => i.key).sort()).toEqual(['delivered:task-1:abc', 'digest:2026-10-27T08:00', 'status:x']);
+    expect(digestStatus(env.db, off, soon).held).toBe(0);
+    expect(reholdExpired(env.db, off, soon)).toBe(0);
   });
 
   it('the owner message time (Stop hook meta) turns default holds off', () => {
@@ -210,6 +224,18 @@ describe('the digest wake in the routine pass (fake clock)', () => {
     expect(r.reheld).toBe(1);
     expect((t.env.db.lastEventOfKind('routine')!.data as { reheld: number }).reheld).toBe(1);
   });
+
+  it('routine off: the next pass (even a skipped clock pass) releases held items', async () => {
+    const off = { ...passEnv().env.config, routine: { enabled: false } };
+    const t = passEnv();
+    t.deps.config = off;
+    t.deps.holdBack = () => reholdExpired(t.env.db, off, at('2026-10-26T16:30:00Z'));
+    enqueue(t.env.db, { key: 'question:task-3:1', kind: 'question', text: 'Which?', holdUntil: '2026-10-27T07:00:00.000Z' });
+    t.setNow('2026-10-26T16:30:00Z');
+    expect(pending(t.env.db, {}, () => at('2026-10-26T16:30:00Z')).map((i) => i.key)).toEqual([]);
+    expect(await runRoutinePass(t.deps, { trigger: 'clock' })).toMatchObject({ ran: false, skipped: 'disabled', reheld: 1 });
+    expect(pending(t.env.db, {}, () => at('2026-10-26T16:30:00Z')).map((i) => i.key)).toEqual(['question:task-3:1']);
+  });
 });
 
 const item = (over: Partial<OutboxItem> & { key: string; kind: OutboxItem['kind'] }): OutboxItem => ({
@@ -248,6 +274,14 @@ describe('composeDigest (deterministic)', () => {
     expect(d.text).toBe([
       'Digest Tue 27 Oct 08:00 (Europe/Berlin)',
       '',
+      'Waiting for you:',
+      `- task-5 Settings page: merge approval, send in the manager chat: /approve task-5 ${'a'.repeat(40)} merge`,
+      '- task-6 Storage: needs your answer (Q1)',
+      '',
+      'Blockers:',
+      '- task-7 Flaky CI (blocked)',
+      '- task-7 is blocked: CI red three times',
+      '',
       'Merged:',
       '- task-3 https://github.com/o/r/pull/3',
       '',
@@ -256,14 +290,6 @@ describe('composeDigest (deterministic)', () => {
       '',
       'Updates:',
       '- Delivered task-4 Login form: https://github.com/o/r/pull/4',
-      '',
-      'Waiting for you:',
-      `- task-5 Settings page: merge approval, send in the manager chat: /approve task-5 ${'a'.repeat(40)} merge`,
-      '- task-6 Storage: needs your answer (Q1)',
-      '',
-      'Blockers:',
-      '- task-7 Flaky CI (blocked)',
-      '- task-7 is blocked: CI red three times',
       '',
       'Auto-promoted (reply "cancel <id>" or "hold <id>"):',
       '- task-10 Search',
@@ -288,8 +314,9 @@ describe('composeDigest (deterministic)', () => {
       '',
       'ref: #digest',
     ].join('\n'));
-    expect(d.keys).toEqual(['digest:2026-10-27T08:00', 'delivered:task-4:abc', 'blocker:task-7:2', 'question:task-6:1', 'question:task-9:1']);
+    expect(d.keys).toEqual(['digest:2026-10-27T08:00', 'blocker:task-7:2', 'delivered:task-4:abc', 'question:task-6:1', 'question:task-9:1']);
     expect(d.left).toEqual([]);
+    expect(d.omitted).toBe(0);
     expect(d.questions.map((q) => [q.n, q.key, q.options])).toEqual([[1, 'question:task-6:1', ['Postgres (recommended)', 'SQLite', 'Other']], [2, 'question:task-9:1', []]]);
   });
 
@@ -316,8 +343,52 @@ describe('composeDigest (deterministic)', () => {
     expect(d.text.length).toBeLessThanOrEqual(MAX_TEXT_LENGTH);
     expect(d.left.length).toBeGreaterThan(0);
     for (const k of d.left) expect(d.keys).not.toContain(k);
-    expect(d.text).toContain(`${d.left.length} more item(s) follow in the next digest.`);
+    expect(d.omitted).toBeGreaterThanOrEqual(d.left.length); // state lines left out (spend, next up) count too
+    expect(d.text).toContain(`\n\n${d.omitted} more item(s): send /status\n`);
     expect(d.keys.length + d.left.length).toBe(1 + 4 + 40);
+    // The actionable lines and the questions are kept ahead of the features.
+    expect(d.text).toContain('/approve task-5');
+    expect(d.text).toContain('- task-7 Flaky CI (blocked)');
+    expect(d.keys).toEqual(expect.arrayContaining(['blocker:task-7:2', 'question:task-6:1', 'question:task-9:1']));
+  });
+
+  it('never over MAX_TEXT_LENGTH and never drops an approval or a blocker silently (no questions, many state lines)', () => {
+    const features = Array.from({ length: 200 }, (_, n) => item({ key: `feature:f${n}:x`, kind: 'feature', createdAt: `2026-10-26T${String(10 + Math.floor(n / 60)).padStart(2, '0')}:${String(n % 60).padStart(2, '0')}:00.000Z`, text: `Feature ${n} ${'y'.repeat(120)}` }));
+    const blocked = Array.from({ length: 100 }, (_, n) => ({ id: `task-b${n}`, title: `Blocked thing ${n}`, status: 'blocked' as const, prUrl: null, priority: null }));
+    const approval = { taskId: 'task-5', head: 'c'.repeat(40), scope: 'merge' as const };
+    const d = composeDigest(input({ items: features, tasks: [...input().tasks!, ...blocked], approvals: [approval] }));
+    expect(d.text.length).toBeLessThanOrEqual(MAX_TEXT_LENGTH);
+    // The approval comes first and is always there; the blockers fill the room before any feature.
+    expect(d.text).toContain(`/approve task-5 ${'c'.repeat(40)} merge`);
+    expect(d.text.indexOf('Waiting for you:')).toBeLessThan(d.text.indexOf('Blockers:'));
+    expect(d.text).not.toContain('Feature 0 ');
+    // Every line left out (state lines too) is counted in the closing line.
+    const shownBlocked = blocked.filter((b) => d.text.includes(`- ${b.id} ${b.title} (blocked)`)).length;
+    expect(shownBlocked).toBeGreaterThan(0);
+    expect(shownBlocked).toBeLessThan(100);
+    expect(d.left.length).toBe(200);
+    expect(d.omitted).toBeGreaterThan(200 + (100 - shownBlocked) - 1);
+    expect(d.text).toMatch(new RegExp(`\n\n${d.omitted} more item\\(s\\): send /status\n\nref: #digest$`));
+    // Questions too: still within the cap with the poll footer.
+    const qs = Array.from({ length: 60 }, (_, n) => item({ key: `question:q${n}:1`, kind: 'question', createdAt: `2026-10-26T12:${String(n).padStart(2, '0')}:00.000Z`, text: `Question ${n} ${'z'.repeat(100)}?\n1. Yes\n2. No` }));
+    const q = composeDigest(input({ items: [...features, ...qs], tasks: [...input().tasks!, ...blocked], approvals: [approval] }));
+    expect(q.text.length).toBeLessThanOrEqual(MAX_TEXT_LENGTH);
+    expect(q.text).toContain('/approve task-5');
+    for (const len of [3990, 3999, 4000, 4001]) {
+      // Lengths around the cap: a single long line per feature, many features.
+      const pad = Array.from({ length: 30 }, (_, n) => item({ key: `feature:p${n}:x`, kind: 'feature', text: `P${n} ${'w'.repeat(len % 397)}` }));
+      expect(composeDigest(input({ items: pad })).text.length).toBeLessThanOrEqual(MAX_TEXT_LENGTH);
+    }
+  });
+
+  it('approvals that alone exceed the limit: as many as fit, the rest counted', () => {
+    const approvals = Array.from({ length: 80 }, (_, n) => ({ taskId: `task-a${n}`, head: 'd'.repeat(40), scope: 'publish' as const }));
+    const d = composeDigest(input({ items: [], approvals, merged: [], autoPromoted: [], spend: null }));
+    expect(d.text.length).toBeLessThanOrEqual(MAX_TEXT_LENGTH);
+    const shown = approvals.filter((a) => d.text.includes(`/approve ${a.taskId} `)).length;
+    expect(shown).toBeGreaterThan(10);
+    expect(d.text).toContain(`${d.omitted} more item(s): send /status`);
+    expect(d.omitted).toBeGreaterThanOrEqual(80 - shown);
   });
 
   it('parsePoll: options from numbered or bulleted lines; "Other" always last, never twice', () => {

@@ -254,7 +254,7 @@ export interface RoutinePassDeps {
   upgradeInProgress?: () => string | null;
   /** Phase 4: whether a digest is due (src/runtime/digest.ts digestStatus; the detail line), else null. Default: never. */
   digestDue?: () => string | null;
-  /** Phase 4: the outbox hold-back (reholdExpired): held items stay for the digest; returns how many were re-held. */
+  /** Phase 4: the outbox hold-back (reholdExpired): held items stay for the digest (routine off: released); returns the count. */
   holdBack?: () => number;
   mtime?: (path: string) => number | null;
   /** The fresh wake: `coordinator restart --wake` detached, never with force (scheduleDetachedRestart). */
@@ -308,7 +308,12 @@ export async function runRoutinePass(deps: RoutinePassDeps, opts: { trigger: Rou
   const nextAt = settings.enabled ? (lastAt ? plusMinutes(lastAt, settings.tickMinutes) : at) : null;
   const coordinator = await deps.coordinator();
   const base = { trigger: opts.trigger, at, lastAt, nextAt, coordinator: coordinatorLine(coordinator) };
-  if (!settings.enabled && opts.trigger !== 'manual') return { ...base, ran: false, skipped: 'disabled', why: 'routine.enabled is off' };
+  if (!settings.enabled && opts.trigger !== 'manual') {
+    // Routine off: no digest is coming, so items held for it are released here too (as in `notify pending`).
+    let reheld: number | undefined;
+    if (deps.holdBack) { try { reheld = deps.holdBack(); } catch { /* never stops the pass */ } }
+    return { ...base, ran: false, skipped: 'disabled', why: 'routine.enabled is off', ...(reheld ? { reheld } : {}) };
+  }
   const age = minutesSince(now, lastAt);
   if (opts.trigger === 'watchdog') {
     if (age < WATCHDOG_TICKS * settings.tickMinutes) return { ...base, ran: false, skipped: 'fresh', why: `the last pass ran ${Math.floor(age)} min ago (the watchdog runs it after ${WATCHDOG_TICKS * settings.tickMinutes} min)` };
@@ -324,7 +329,8 @@ export async function runRoutinePass(deps: RoutinePassDeps, opts: { trigger: Rou
   try {
     const report: RoutineReport = { ...base, ran: true, why: '' };
     try { report.sync = await deps.sync(); } catch (e) { report.syncError = msg(e); }
-    if (deps.holdBack && settings.enabled) { try { report.reheld = deps.holdBack(); } catch { /* the hold-back never stops the pass */ } }
+    // With the routine on it keeps held items for the digest; off (a manual pass), it releases them.
+    if (deps.holdBack) { try { report.reheld = deps.holdBack(); } catch { /* the hold-back never stops the pass */ } }
     // The sync may have changed what the coordinator sees (merged, imported, CI): read the state after it.
     const c = await deps.coordinator();
     report.coordinator = coordinatorLine(c);

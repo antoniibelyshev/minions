@@ -416,6 +416,9 @@ days until phase 4 adds `routine.timezone`.
   `--hold digest` always holds until the next digest time.
 - **Hold-back:** each routine pass and each `notify pending` move a held item whose time came on to the next digest
   time while the routine is on, so only the digest delivers it (a session awake at 08:05 does not send it alone).
+  With the routine off there is no digest wake, so the same step releases every held item (default and explicit
+  holds; a failed send keeps its retry backoff): turning `routine.enabled` off sends held items at the next
+  `notify pending` or routine pass, not at the stored digest time.
 - **Due and catch-up:** the latest digest time at or before now (`routine.digestAt` in `routine.timezone`, computed
   with `Intl` and no dependency, DST-safe) whose key `digest:<local YYYY-MM-DDTHH:MM>` is not delivered. A missed
   time is caught up at the first pass after it; only the latest time counts, so a host asleep for two days sends
@@ -425,11 +428,14 @@ days until phase 4 adds `routine.timezone`.
   budget (`spend.ts`) still counts UTC days.
 - **Composition:** `minions notify digest --json` reads the outbox (every undelivered item), the backlog, the
   events (merged since the last digest, `awaiting-approval` merges, `auto-promote` events of phase 5), publications
-  waiting for approval, the spend tally and `work next`. The text has fixed sections (merged; delivered, waiting
-  for CI or merge; updates; waiting for you, with the exact `/approve` lines; blockers; auto-promoted; spend today
+  waiting for approval, the spend tally and `work next`. The text has fixed sections (waiting for you, with the
+  exact `/approve` lines; blockers; merged; delivered, waiting for CI or merge; updates; auto-promoted; spend today
   with coordinator wakes and their tokens; next up; questions), sorted lines, and questions as polls: a question
-  item's option lines (`1. …`, `- …`) become numbered options with "Other" last, answered as `Q1 2`. Lines that
-  would exceed the Telegram limit are left out whole (`left`) and stay pending. The text is stored under the digest
+  item's option lines (`1. …`, `- …`) become numbered options with "Other" last, answered as `Q1 2`. The whole
+  text (header, footer and all) is at most `MAX_TEXT_LENGTH`. When it does not all fit, lines are taken in priority
+  order (approvals and blockers, then questions, then the rest), never cut in half, and every line left out is
+  counted in a closing "<n> more item(s): send /status" line: nothing is dropped silently. Outbox items left out
+  (`left`) stay pending for the next digest. The text is stored under the digest
   key (an undelivered row is replaced, a delivered one never touched); the coordinator sends it with one `reply`
   and acks `keys` (the digest key and every covered item), which marks the time done. `--status` shows the times,
   the last one and the held count; `minions status` shows the same line when the routine is on.

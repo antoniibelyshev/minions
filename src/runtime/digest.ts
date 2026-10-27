@@ -5,7 +5,8 @@
 //   flag the per-kind table DEFAULT_HOLDS applies, and only while routine.enabled is on (without the routine there
 //   is no digest wake, so a default hold would only delay) and the owner is not in a live conversation.
 // - The hold-back (reholdExpired, in each routine pass and before `notify pending`): while the routine is on, a held
-//   item whose time came is moved on to the next digest time, so only the digest delivers it.
+//   item whose time came is moved on to the next digest time, so only the digest delivers it; with the routine off,
+//   held items are released (no digest is coming).
 // - Due (digestStatus): the latest digest time (routine.digestAt in routine.timezone) at or before now whose digest
 //   key `digest:<local YYYY-MM-DDTHH:MM>` is not delivered. A missed time (host asleep, container down, the
 //   coordinator busy) is caught up at the first pass after it; only the latest time counts, so a long outage sends
@@ -107,11 +108,15 @@ export function holdFor(db: RuntimeDb, cfg: Pick<MinionsConfig, 'routine'>, kind
 /**
  * The hold-back: while the routine is on, held items whose time came move on to the next digest time, so only the
  * digest delivers them (a session awake at 08:05 does not send them one by one). Returns the count.
+ * With the routine off there is no digest wake: every held item (default or explicit hold) is released at once, so
+ * it goes out at the next `notify pending` instead of waiting for a digest time that sends nothing.
  */
 export function reholdExpired(db: RuntimeDb, cfg: Pick<MinionsConfig, 'routine'>, now: Date = new Date()): number {
   const s = routineSettings(cfg);
-  if (!s.enabled) return 0;
   const t = now.toISOString();
+  if (!s.enabled) {
+    return db.exec("UPDATE outbox SET next_attempt_at = NULL WHERE delivered_at IS NULL AND attempts = 0 AND next_attempt_at IS NOT NULL AND kind != 'digest'").changes;
+  }
   return db.exec("UPDATE outbox SET next_attempt_at = ? WHERE delivered_at IS NULL AND attempts = 0 AND next_attempt_at IS NOT NULL AND next_attempt_at <= ? AND kind != 'digest'",
     nextDigestAt(now, s), t).changes;
 }
@@ -188,6 +193,8 @@ export interface Digest {
   keys: string[];
   /** Outbox items left out (the text limit): they stay pending for the next digest. */
   left: string[];
+  /** Every line left out (outbox items and state lines such as approvals): the "<n> more item(s)" line counts them. */
+  omitted: number;
   questions: DigestQuestion[];
   sections: DigestSection[];
 }
@@ -211,10 +218,11 @@ export function parsePoll(text: string): { question: string; options: string[] }
 const kTok = (n: number) => (n >= 1_000_000 ? `${Math.round(n / 100_000) / 10}M` : n >= 10_000 ? `${Math.round(n / 1000)}k` : String(n));
 
 /**
- * The digest text, deterministic for the same input: sections in a fixed order (merged and delivered, updates,
- * waiting for you, blockers, auto-promoted, spend, next up, questions), lines sorted, empty sections left out,
- * questions numbered Q1.. as polls. Outbox-backed lines that would push the text over the Telegram limit are left
- * out (in `left`, still pending), never cut in half.
+ * The digest text, deterministic for the same input: sections in a fixed order (waiting for you, blockers, merged,
+ * delivered, updates, auto-promoted, spend, next up, questions), lines sorted, empty sections left out, questions
+ * numbered Q1.. as polls. The whole text is at most MAX_TEXT_LENGTH. When everything does not fit, approvals and
+ * blockers are kept first, then questions, then the rest; lines are never cut in half, and every line left out is
+ * counted in a closing "<n> more item(s): send /status" line (outbox items left out are in `left`, still pending).
  */
 export function composeDigest(i: DigestInput): Digest {
   const tasks = new Map((i.tasks ?? []).map((t) => [t.id, t]));
@@ -232,12 +240,9 @@ export function composeDigest(i: DigestInput): Digest {
   const all = [...tasks.values()].sort((a, b) => byId(a.id, b.id));
 
   const merged = [...new Map([...i.merged].sort((a, b) => (a.at < b.at ? -1 : 1)).map((m) => [m.taskId, m])).values()].sort((a, b) => byId(a.taskId, b.taskId));
-  add('Merged', merged.map((m) => ({ text: `- ${title(m.taskId)}${m.prUrl ? ` ${m.prUrl}` : ''}`, key: null })));
-  add('Delivered, waiting for CI or merge', all.filter((t) => ['delivered', 'awaiting-ci', 'merging'].includes(t.status) && !heldDelivered.has(t.id))
-    .map((t) => ({ text: `- ${title(t.id)}${t.status !== 'delivered' ? ` (${t.status})` : ''}${t.prUrl ? ` ${t.prUrl}` : ''}`, key: null })));
-  add('Updates', ofKind('delivered', 'feature', 'status', 'goal-ack', 'other').map((x) => ({ text: `- ${oneLine(x.text)}`, key: x.key })));
-
   const approvals = [...i.approvals].sort((a, b) => byId(a.taskId, b.taskId) || a.scope.localeCompare(b.scope));
+  // Display order: what the owner acts on first (approvals, blockers), then what they read; questions last, next to
+  // the answer hint.
   add('Waiting for you', [
     ...approvals.map((a) => ({ text: `- ${title(a.taskId)}: ${a.scope === 'merge' ? 'merge' : 'publish'} approval, send in the manager chat: /approve ${a.taskId} ${a.head}${a.scope === 'merge' ? ' merge' : ''}`, key: null })),
     ...all.filter((t) => t.status === 'awaiting-human').map((t) => ({ text: `- ${title(t.id)}: needs your answer${qOf.has(t.id) ? ` (Q${qOf.get(t.id)})` : ''}`, key: null })),
@@ -247,6 +252,10 @@ export function composeDigest(i: DigestInput): Digest {
     ...all.filter((t) => t.status === 'blocked').map((t) => ({ text: `- ${title(t.id)} (blocked)`, key: null })),
     ...ofKind('blocker').map((x) => ({ text: `- ${oneLine(x.text)}`, key: x.key })),
   ]);
+  add('Merged', merged.map((m) => ({ text: `- ${title(m.taskId)}${m.prUrl ? ` ${m.prUrl}` : ''}`, key: null })));
+  add('Delivered, waiting for CI or merge', all.filter((t) => ['delivered', 'awaiting-ci', 'merging'].includes(t.status) && !heldDelivered.has(t.id))
+    .map((t) => ({ text: `- ${title(t.id)}${t.status !== 'delivered' ? ` (${t.status})` : ''}${t.prUrl ? ` ${t.prUrl}` : ''}`, key: null })));
+  add('Updates', ofKind('delivered', 'feature', 'status', 'goal-ack', 'other').map((x) => ({ text: `- ${oneLine(x.text)}`, key: x.key })));
   add('Auto-promoted (reply "cancel <id>" or "hold <id>")', [...new Set(i.autoPromoted.map((a) => a.taskId))].sort(byId).map((id) => ({ text: `- ${title(id)}`, key: null })));
   if (i.spend) {
     const s = i.spend;
@@ -259,40 +268,55 @@ export function composeDigest(i: DigestInput): Digest {
     ? [...i.runnable].map((r) => `- ${title(r.taskId)} (${r.role})`)
     : all.filter((t) => t.status === 'ready').sort((a, b) => prio(a) - prio(b) || byId(a.id, b.id)).map((t) => `- ${title(t.id)}`);
   add('Next up', next.slice(0, 5).map((text) => ({ text, key: null })));
+  const qBlocks = questions.map((q) => ({ q, lines: [`Q${q.n}${q.taskId ? ` (${q.taskId})` : ''} ${q.question}`, ...(q.options.length ? q.options.map((o, k) => `  ${k + 1}. ${o}`) : ['  reply \`Q' + q.n + ' <answer>\`'])] }));
+
+  // Units: one per line (a question: its whole block), chosen in priority order (approvals and blockers, then the
+  // questions, then the rest in display order) while the FINAL text, with the header, the "more" line and the
+  // footer, stays within MAX_TEXT_LENGTH. Nothing is dropped silently: every unit left out is counted in the
+  // closing "<n> more item(s)" line, and its outbox key (if any) stays pending.
+  type Unit = { section: number; lines: string[]; key: string | null; q?: DigestQuestion };
+  const units: Unit[] = [];
+  sections.forEach((s, k) => { for (const l of s.lines) units.push({ section: k, lines: [l.text], key: l.key }); });
+  const QSECTION = sections.length;
+  for (const b of qBlocks) units.push({ section: QSECTION, lines: b.lines, key: b.q.key, q: b.q });
+  const actionable = new Set(['Waiting for you', 'Blockers']);
+  const rank = (u: Unit) => (u.section < QSECTION && actionable.has(sections[u.section]!.title) ? 0 : u.section === QSECTION ? 1 : 2);
+  const order = units.map((u, k) => k).sort((a, b) => rank(units[a]!) - rank(units[b]!) || a - b);
 
   const head = `Digest ${localLabel(i.now, i.timezone)} (${i.timezone})`;
-  const footerQ = questions.length ? ['Answer by number, e.g. `Q1 1`; for Other: `Q1 <n> <your answer>`.'] : [];
-  const footer = [...footerQ, '', 'ref: #digest'];
-  const budget = MAX_TEXT_LENGTH - footer.join('\n').length - 2;
-  const out: string[] = [head];
-  const covered: string[] = [];
-  const left: string[] = [];
-  const size = () => out.join('\n').length;
+  const footerQ = 'Answer by number, e.g. `Q1 1`; for Other: `Q1 <n> <your answer>`.';
+  const render = (chosen: Set<number>, dropped: number): string => {
+    const out: string[] = [head];
+    let last = -1;
+    units.forEach((u, k) => {
+      if (!chosen.has(k)) return;
+      if (u.section !== last) { out.push('', `${u.section === QSECTION ? 'Questions' : sections[u.section]!.title}:`); last = u.section; }
+      out.push(...u.lines);
+    });
+    if (out.length === 1) out.push('', dropped ? 'Too much to list here.' : 'Nothing new.');
+    if (dropped) out.push('', `${dropped} more item(s): send /status`);
+    if (units.some((u, k) => chosen.has(k) && u.q)) out.push('', footerQ);
+    out.push('', 'ref: #digest');
+    return out.join('\n');
+  };
+  // Greedy: a unit is taken when the text with it (and the rest counted as "more") fits. The text of the last unit
+  // taken is the final text (nothing after it is taken), so the final text always fits.
+  const chosen = new Set<number>();
+  let text = render(chosen, units.length);
+  for (const k of order) {
+    chosen.add(k);
+    const t = render(chosen, units.length - chosen.size);
+    if (t.length <= MAX_TEXT_LENGTH) text = t; else chosen.delete(k);
+  }
+  const omitted = units.length - chosen.size;
+  const shown = units.map((u, k) => ({ u, k })).filter((x) => chosen.has(x.k));
+  const covered = shown.map((x) => x.u.key).filter((k): k is string => !!k);
+  const left = units.filter((u, k) => !chosen.has(k) && u.key).map((u) => u.key!);
+  const shownQ = shown.map((x) => x.u.q).filter((q): q is DigestQuestion => !!q);
   const kept: DigestSection[] = [];
-  for (const s of sections) {
-    const lines: string[] = [];
-    for (const l of s.lines) {
-      const extra = (lines.length ? 0 : s.title.length + 3) + l.text.length + 1;
-      if (size() + extra > budget) { if (l.key) left.push(l.key); continue; }
-      if (!lines.length) out.push('', `${s.title}:`);
-      out.push(l.text); lines.push(l.text);
-      if (l.key) covered.push(l.key);
-    }
-    if (lines.length) kept.push({ title: s.title, lines });
-  }
-  const shownQ: DigestQuestion[] = [];
-  for (const q of questions) {
-    const block = [`Q${q.n}${q.taskId ? ` (${q.taskId})` : ''} ${q.question}`, ...(q.options.length ? q.options.map((o, k) => `  ${k + 1}. ${o}`) : ['  reply `Q' + q.n + ' <answer>`'])];
-    const extra = (shownQ.length ? 0 : 'Questions:'.length + 2) + block.join('\n').length + 1;
-    if (size() + extra > budget) { left.push(q.key); continue; }
-    if (!shownQ.length) out.push('', 'Questions:');
-    out.push(...block); shownQ.push(q); covered.push(q.key);
-  }
+  sections.forEach((s, n) => { const lines = shown.filter((x) => x.u.section === n).map((x) => x.u.lines[0]!); if (lines.length) kept.push({ title: s.title, lines }); });
   if (shownQ.length) kept.push({ title: 'Questions', lines: shownQ.map((q) => `Q${q.n} ${q.question}`) });
-  if (out.length === 1) out.push('', 'Nothing new.');
-  if (left.length) out.push('', `${left.length} more item(s) follow in the next digest.`);
-  const text = [...out, ...(shownQ.length ? ['', ...footerQ] : []), '', 'ref: #digest'].join('\n');
-  return { key: i.key, text, keys: [i.key, ...covered], left, questions: shownQ, sections: kept };
+  return { key: i.key, text, keys: [i.key, ...covered], left, omitted, questions: shownQ, sections: kept };
 }
 
 const prio = (t: DigestTask) => (t.priority === 'high' ? 0 : t.priority === 'medium' ? 1 : t.priority === 'low' ? 2 : 3);
@@ -378,7 +402,7 @@ export function prepareDigest(db: RuntimeDb, cfg: Pick<MinionsConfig, 'routine'>
 }
 
 export function humanDigest(d: Digest): string {
-  return `${d.text}\n\n(send with one reply, then: minions notify ack ${d.keys.join(' ')})${d.left.length ? `\n${d.left.length} item(s) left for the next digest` : ''}`;
+  return `${d.text}\n\n(send with one reply, then: minions notify ack ${d.keys.join(' ')})${d.omitted ? `\n${d.omitted} line(s) not shown (${d.left.length} pending item(s) left for the next digest)` : ''}`;
 }
 
 export function humanDigestStatus(s: DigestStatus): string {
