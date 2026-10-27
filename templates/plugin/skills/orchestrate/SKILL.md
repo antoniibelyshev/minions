@@ -9,7 +9,7 @@ Run this loop until nothing is runnable. Every durable step uses a `minions ... 
 
 ## 0. Woken by the routine (`/minions:orchestrate wake`)
 
-The runtime started this fresh session because its routine pass found work only a model can do (`routine.enabled`). Read why: `minions sync --routine --last --json` (`last.reasons`: `runnable` stages, `unvalidated` or `needs-split` results, tasks that reached `awaiting-human`). Handle exactly those: dispatch the runnable stages (steps 1 to 6), decide the unvalidated and split results, compose the owner question for an `awaiting-human` task. Then stop. Do not greet the owner or send a status message for the wake itself; report only what the reporting rule asks for. The handoff of the previous session is there when you need it (`minions coordinator handoff --read --json`). Never restart the coordinator from a wake session unless a context reset is due.
+The runtime started this fresh session because its routine pass found work only a model can do (`routine.enabled`). Read why: `minions sync --routine --last --json` (`last.reasons`: `digest`, `runnable` stages, `unvalidated` or `needs-split` results, tasks that reached `awaiting-human`). Handle exactly those: dispatch the runnable stages (steps 1 to 6), decide the unvalidated and split results, compose the owner question for an `awaiting-human` task (a `question` item: held for the digest unless it is urgent). Then stop. Do not greet the owner or send a status message for the wake itself; report only what the reporting rule asks for. The handoff of the previous session is there when you need it (`minions coordinator handoff --read --json`). Never restart the coordinator from a wake session unless a context reset is due.{{digestRule}}
 
 ## 1. Check state
 

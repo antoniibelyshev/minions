@@ -6,7 +6,7 @@ import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { KEY_CLASSES } from '../../src/config/setting-classes.js';
-import { currentValue, settingDef, viewSetting, type SettingsContext } from '../../src/host/settings.js';
+import { currentValue, parseSettingValue, settingDef, viewSetting, type SettingsContext } from '../../src/host/settings.js';
 import type { ProjectJson } from '../../src/host/project.js';
 import { collectStatus, humanStatus } from '../../src/runtime/commands.js';
 import { coordinatorWrapper, RECOVERY_PROMPT, WAKE_PROMPT, type SpawnLike } from '../../src/runtime/coordinator.js';
@@ -185,6 +185,21 @@ describe('routine.* settings', () => {
     expect(settingDef('routine.maxWakesPerDay')!.loosens!(8, 2)).toBeNull();
     expect(settingDef('routine.tickMinutes')!.loosens).toBeUndefined();
     expect(currentValue(settingDef('routine.tickMinutes')!, settingsCtx())).toBeUndefined(); // default 15 via routineSettings
+  });
+});
+
+describe('routine.digestAt and routine.timezone settings (task-68.5)', () => {
+  it('declared live and not host-owned; parsed as a list and a text; more digests loosen', () => {
+    const at = settingDef('routine.digestAt')!;
+    const tz = settingDef('routine.timezone')!;
+    expect(viewSetting(at, settingsCtx())).toMatchObject({ type: 'list', class: 'live', hostOwned: false, value: undefined });
+    expect(viewSetting(tz, settingsCtx())).toMatchObject({ type: 'text', class: 'live', hostOwned: false, value: undefined });
+    expect(parseSettingValue(at, '08:00, 18:00')).toEqual(['08:00', '18:00']);
+    expect(parseSettingValue(at, 'default')).toBeUndefined();
+    expect(parseSettingValue(tz, 'Europe/Berlin')).toBe('Europe/Berlin');
+    expect(parseSettingValue(tz, '  ')).toBeUndefined(); // optional: empty = default; an unknown zone fails the config schema
+    expect(at.loosens!(undefined, ['08:00', '18:00'])).toMatch(/more digests a day \(2/);
+    expect(at.loosens!(['08:00', '18:00'], ['09:00'])).toBeNull();
   });
 });
 
