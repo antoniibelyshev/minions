@@ -229,7 +229,7 @@ describe('/settings in the manager chat', () => {
   });
 
   it('a transport attached to commands without settings says it is not available', async () => {
-    const c = chat({ projects: async () => [], status: async () => '', pending: async () => [], propose: async () => { throw new Error('x'); } }, ['/settings']);
+    const c = chat({ projects: async () => [], status: async () => '', pending: async () => [], propose: async () => { throw new Error('x'); }, submit: async () => { throw new Error('x'); } }, ['/settings']);
     await c.run();
     expect(c.sent[0]).toBe('/settings is not available in this host manager.');
   });
