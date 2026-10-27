@@ -277,6 +277,8 @@ export interface RecordResponse {
   repairCycles?: number; headSha?: string; message: string;
   /** A partial result returned because of a drain (upgrade): not a failed attempt or a repair cycle. */
   drain?: boolean;
+  /** The CI gate kept the result from counting: `fail` = sent to repair, `unverified` = status unchanged (re-dispatch with local verification). */
+  ciBlocked?: 'fail' | 'unverified';
   /** Present when the approval started branch/PR publication. */
   publication?: PublishResponse;
   /** The token total stored for this lease (from --usage, else the result's usage block). */
@@ -1004,7 +1006,8 @@ export class Scheduler {
     return (ev?.data as { fromStatus?: TaskStatus } | undefined)?.fromStatus;
   }
 
-  private isSweepLease(lease: Lease): boolean {
+  /** Whether the lease is a QA sweep (a tester claimed against the base branch). */
+  isSweepLease(lease: Lease): boolean {
     if (lease.role !== 'tester') return false;
     const ev = this.db.events(lease.task_id, 'claim').find((e) => (e.data as { leaseId?: string })?.leaseId === lease.id);
     return (ev?.data as { kind?: string } | undefined)?.kind === 'qa-sweep';
@@ -1398,7 +1401,7 @@ export class Scheduler {
       }
       return { ...base, valid: true, from, to: publication.status, approved, replan, needsSplit, repairCycles, headSha: head, publication, message: publication.message };
     }
-    return { ...base, valid: true, from, to, approved, replan, needsSplit, repairCycles, headSha: head, ...(drained ? { drain: true } : {}),
+    return { ...base, valid: true, from, to, approved, replan, needsSplit, repairCycles, headSha: head, ...(drained ? { drain: true } : {}), ...(ciBlock ? { ciBlocked: ciBlock } : {}),
       message: message || `Recorded ${lease.role} ${r.status}; task ${from} → ${to}.` };
   }
 

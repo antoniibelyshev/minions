@@ -312,3 +312,11 @@ export function humanContextReset(c: ContextResetCheck): string {
   const ctx = s.contextTokens === null ? 'context unknown' : `context ${Math.round(s.contextTokens / 1000)}k${c.settings.contextTokens ? `/${Math.round(c.settings.contextTokens / 1000)}k` : ''}`;
   return `context reset: ${c.due ? 'due' : 'not due'} (${s.handoffs}${c.settings.handoffs ? `/${c.settings.handoffs}` : ''} hand-offs, ${ctx}${s.delivered.length ? `, delivered ${s.delivered.join(', ')}` : ''})${c.due ? '' : c.blockers.length ? `; ${c.blockers.join('; ')}` : ''}`;
 }
+
+/** Adds `contextReset` to a record/release response when a reset is due (task-45). Never fails the record. */
+export function withContextReset<T extends object>(r: T, deps: { db: RuntimeDb; config: MinionsConfig; state?: string }): T & { contextReset?: ReturnType<typeof dueNotice> } {
+  try {
+    const notice = dueNotice(contextResetCheck({ db: deps.db, config: deps.config, ...(deps.state !== undefined ? { state: deps.state } : {}) }));
+    return notice ? { ...r, contextReset: notice } : r;
+  } catch { return r; }
+}

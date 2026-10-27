@@ -1204,6 +1204,17 @@ Scheduler rules:
   When repairs ≥ `maxRepairCyclesBeforeReplan`, response includes `replan: true` and status →
   awaiting-human. Records evidence keyed by head SHA + config revision. Releases the lease.
 - `work release <leaseId> --reason` releases without a result (worktree kept).
+- `work advance <leaseId> [--usage <n>] [--correction]` (task-68.7, unattended-delivery Phases item 6):
+  one coordinator call per stage hand-off. It records the submitted file through `record --submitted`,
+  then claims through `claim --compact` (the same task's next runnable stage first, else the first
+  `work next` entry) and returns `{record, next}` with the Agent parameters (`agentType`, `agentModel`,
+  `launch` for a process harness), or `{record, decision}` when the coordinator must judge. `kind` is one of
+  invalid, draining, replan, needs-split, needs-changes, awaiting-human, publication, blocked, partial,
+  ci-unverified, qa-findings, context-reset, paused, budget, capacity, nothing-runnable or claim-failed.
+  Decisions: it adds no checks of its own. Pauses, drain, budget and capacity come from `work next`, the
+  claim checks run again inside `claim`, and a refused claim after a successful record is a decision, not
+  an error. Exceptions on the recorded task (and a due context reset) claim nothing, even when other work
+  is runnable, so the coordinator handles them first. Like `claim`, it is coordinator-only (pre-bash hook).
 - File hand-offs (coordinator context diet). `work claim` also stores the brief at
   `/state/briefs/<leaseId>.json`; `--compact` prints only leaseId, briefMarker, taskId, title, role,
   attempt, branch, worktree, expectedHead and the brief command. `work brief <leaseId> --role <role>`
