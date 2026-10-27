@@ -296,7 +296,8 @@ describe('restart paths (fake spawn)', () => {
     const spawn: DetachedSpawn = (_c, a) => { calls.push(a); return { pid: 99, unref() {}, on() { return this; } }; };
     return { calls, spawn };
   };
-  const base = { log: '/dev/null', cwd: '/', openLog: () => 0 };
+  // A real log file: the restart closes the fd it opened (fd 0 here would close the worker's stdin and abort node).
+  const base = { log: join(tmp('minions-restart-log-'), 'restart.log'), cwd: '/' };
 
   it('the wake is `coordinator restart --wake`, never --force, and refuses with an active lease or a drain', () => {
     const s = spawnRec();
