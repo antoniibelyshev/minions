@@ -651,7 +651,7 @@ describe('owner behaviour defaults (task-34)', () => {
 
   it('decisions are asked as numbered polls with the recommended option first and "Other" last', async () => {
     const coord = await (await gen()).read('coordinator.md');
-    expect(coord).toMatch(/Ask decisions as numbered polls: the recommended option first, marked "\(recommended\)", .* "Other" as the last option\. A reply that is only a number answers the latest poll/);
+    expect(coord).toMatch(/Ask decisions as numbered polls: the recommended option first, marked "\(recommended\)", .* "Other" as the last option\. A reply that is only a number answers the latest poll only when exactly one poll is open/);
   });
 
   it('answers on the channel the owner used and handles channel outages', async () => {
@@ -667,7 +667,7 @@ describe('owner behaviour defaults (task-34)', () => {
     const comm = coord.slice(coord.indexOf('## Communicating with the user'));
     expect(comm).toMatch(/\*\*Threads\.\*\* When you answer an owner Telegram message .*pass `reply_to` = that message's `message_id` to `reply`, even when it is the latest message/);
     expect(comm).toContain('End every Telegram message with `ref: #<id>`');
-    expect(comm).toContain('an owner message without a ref answers your latest message or poll');
+    expect(comm).toContain('an owner message with a ref belongs to that thread; one without a ref is a new request or thread; a bare number with no ref answers the latest poll only when exactly one poll is open, otherwise ask which poll it answers');
     expect(comm).toMatch(/Unsolicited notifications \(delivered, blocker\) stay unthreaded unless you know the owner message that requested the work/);
     expect(comm).toMatch(/On an outbox resend, take `reply_to` from the message id the key carries/);
     // The threading rule sits right before the outbox bullet.

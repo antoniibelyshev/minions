@@ -25,22 +25,24 @@ import { formatTelegramProbe, probeTelegram } from '../telegram/probe.js';
 import { resolveChannel } from '../telegram/channel.js';
 import type { PollerCheck } from '../telegram/isolation.js';
 import {
-  buildClaudeCommand, buildCoordinatorCommand, telegramPollerStatus, claudePermissionModes, configuredPermissionMode, coordinatorWrapper, launchCoordinator, probeRuntime, readLaunchRecord, readMountedToken, RECOVERY_PROMPT,
+  buildClaudeCommand, buildCoordinatorCommand, telegramPollerStatus, claudePermissionModes, coordinatorWrapper, launchCoordinator, permissionModesNeeded, probeRuntime, readLaunchRecord, readMountedToken, RECOVERY_PROMPT,
   restartCoordinator, runtimeChannelFacts, scheduleDetachedRestart, syncCoordinator, coordinatorLaunchStatus, type LaunchStatus,
 } from './coordinator.js';
 import { openDb, type DrainNotice, type DrainRequest, type Lease, type PauseChange, type RuntimeDb } from './db.js';
 import { clearDrain, requestDrain } from './drain.js';
 import { claimWithBrief, compactClaim, fetchBrief, recordSubmitted, requireWorkerRole, submitResult, sweepScratchOnStart, type CompactClaim } from './handoff.js';
+import { advanceLease, humanAdvance } from './advance.js';
 import { runHook } from './hooks.js';
 import { completeOpenSessions, noteResetRequest } from './coordinator-usage.js';
 import { budgetNotice, humanBaseline, humanSpend, parseTokens, recordLeaseUsage, recordSessionUsage, setBudget, spendReport, type SpendReport } from './spend.js';
 import { runtimePaths } from './paths.js';
-import { contextResetCheck, dueNotice, HANDOFF_MAX_BYTES, humanContextReset, readHandoff, TRANSCRIPT_META, writeHandoff, type ContextResetCheck } from './context-reset.js';
+import { contextResetCheck, HANDOFF_MAX_BYTES, humanContextReset, readHandoff, TRANSCRIPT_META, withContextReset, writeHandoff, type ContextResetCheck } from './context-reset.js';
+export { withContextReset } from './context-reset.js';
 import { capacityOf, Scheduler, type NextReport, type NextStage, type RoleCapacity, type UsageFlag } from './scheduler.js';
 import { gitCredential } from './github.js';
 import { ciStatus, formatCiStatus, formatSync, syncTasks, type SyncReport } from './ci.js';
 import { formatIntake, intakeProvenanceFallback, originRepository, syncIntake, type IntakeSyncReport } from './intake-sync.js';
-import { ghWithTimeout, type GhFn } from './publish.js';
+import { ghWithTimeout, ORIGIN_REPOSITORY_META, originOfRemoteUrl, type GhFn } from './publish.js';
 import { exportWorkspace, importWorkspace, setupState } from './workspace.js';
 import { createStateBackup, releaseRestoredLeases, restoreStateBackup } from './state-backup.js';
 import { cancelWork, formatCancel } from './controls.js';
@@ -421,14 +423,6 @@ export async function spendCommand(o: { budget?: string; by?: string; lease?: st
 
 // ---------------------------------------------------------------- context reset
 
-/** Adds `contextReset` to a record/release response when a reset is due (task-45). Never fails the record. */
-export function withContextReset<T extends object>(r: T, deps: { db: RuntimeDb; config: MinionsConfig; state?: string }): T & { contextReset?: ReturnType<typeof dueNotice> } {
-  try {
-    const notice = dueNotice(contextResetCheck({ db: deps.db, config: deps.config, ...(deps.state !== undefined ? { state: deps.state } : {}) }));
-    return notice ? { ...r, contextReset: notice } : r;
-  } catch { return r; }
-}
-
 const resetLine = (d: { contextReset?: { reason: string } }) => (d.contextReset ? [d.contextReset.reason] : []);
 
 // ---------------------------------------------------------------- register
@@ -498,6 +492,16 @@ export function register(program: Command): void {
         : await (await scheduler()).record(leaseId, await readInput(o.resultFile), opts);
       const out = withContextReset(r, { db: getDb(), config: await getConfig(), state: runtimePaths().state });
       emit(out, { json: globalOpts(cmd).json, human: (d: typeof out) => [d.message, ...(d.errors ?? []).map((e: string) => `  - ${e}`), ...(d.budget ? [d.budget.message] : []), ...resetLine(d)].join('\n') });
+    }));
+  work.command('advance <leaseId>').description('Coordinator: record the submitted result (as `record --submitted`), then claim the next runnable stage (as `claim --compact`: the same task first, else `work next` order) and return its Agent parameters, or a decision when you must judge (never claims while paused, draining, over budget or after an invalid result)')
+    .option('--correction', 'the single allowed correction after an invalid result')
+    .option('--usage <tokens>', USAGE_HELP)
+    .option('--model <name>', 'model the worker ran on (for the USD estimate with API-key billing)')
+    .action(action(async (leaseId: string, o: { correction?: boolean; usage?: string; model?: string }, cmd: Command) => {
+      requireMode('runtime');
+      const opts = { correction: !!o.correction, usage: usageFlag(o) };
+      const r = await advanceLease(await scheduler(), runtimePaths(), leaseId, opts, { db: getDb(), config: await getConfig(), state: runtimePaths().state });
+      emit(r, { json: globalOpts(cmd).json, human: humanAdvance });
     }));
   work.command('release <leaseId>').description('Release a lease without a result (worktree is kept)')
     .requiredOption('--reason <text>', 'why the lease is released')
@@ -655,7 +659,7 @@ export function register(program: Command): void {
     .action(async () => { await runHook('stop', hookLoader); exitHook(); });
   hook.command('pre-agent').description('PreToolUse(Agent) hook: minions workers need an active lease')
     .action(async () => { await runHook('pre-agent', hookLoader); exitHook(); });
-  hook.command('pre-bash').description('PreToolUse(Bash) hook: subagents cannot run minions work run|claim|release (coordinator-only)')
+  hook.command('pre-bash').description('PreToolUse(Bash) hook: subagents cannot run minions work run|claim|advance|release (coordinator-only)')
     .action(async () => { await runHook('pre-bash', async () => { throw new Error('pre-bash needs no runtime context'); }); exitHook(); });
   hook.command('pre-telegram').description('PreToolUse(Telegram tools) hook: only the coordinator itself may use them, never a subagent')
     .action(async () => { await runHook('pre-telegram', hookLoader); exitHook(); });
@@ -676,8 +680,8 @@ export function register(program: Command): void {
         return;
       }
       if (o.printCommand) {
-        // Same permission-mode check as the launch: auto only when this Claude Code offers it.
-        const permissionModes = configuredPermissionMode(cfg) === 'auto' && runtimeMode() !== 'host-runtime' ? await claudePermissionModes() : undefined;
+        // Same permission-mode check as the launch: auto only when this Claude Code offers it; default under the name it lists.
+        const permissionModes = permissionModesNeeded(cfg) ? await claudePermissionModes() : undefined;
         const r = { tmux: await buildCoordinatorCommand(cfg), claude: await buildClaudeCommand(cfg, runtimePaths(), { telegram: cfg.communication.channel !== 'terminal', permissionModes }) };
         emit(r, { json: globalOpts(cmd).json, human: (d: typeof r) => [JSON.stringify([d.tmux.cmd, ...d.tmux.args]), JSON.stringify([d.claude.cmd, ...d.claude.args])].join('\n') });
         return;
@@ -814,6 +818,10 @@ export function register(program: Command): void {
       requireMode('runtime');
       const config = await getConfig();
       const r = await importWorkspace(bundle, { base: o.base, remoteUrl: o.remoteUrl, config, baseFrom: isGithubDelivery(config) ? 'origin' : 'host' });
+      // minions' own record of the GitHub repository (publish.ts serverOriginOf): the verified base reads and
+      // the push go to it, never to whatever the agent-writable .git/config names (task-71).
+      const repository = originOfRemoteUrl(o.remoteUrl)?.repository;
+      if (repository) getDb().setMeta(ORIGIN_REPOSITORY_META, repository);
       emit(r, { json: globalOpts(cmd).json, human: (d: typeof r) => [`${d.imported ? 'Cloned' : 'Refreshed'} ${d.repo} at ${d.head} (base ${d.base})`,
         ...(d.origin ? [`origin ${d.origin.url}: ${d.origin.authenticated ? 'authenticated' : 'not authenticated'}, ${d.origin.fetched ? `fetched ${d.base}` : 'not fetched'}`] : []),
         ...(d.origin?.warnings ?? []).map((w) => `warning: ${w}`)].join('\n') });

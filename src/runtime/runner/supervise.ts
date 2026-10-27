@@ -1,6 +1,7 @@
 // Spawn and supervision of a process worker (docs/design/agent-runtimes.md D3.5, D3.6). The worker runs in its
 // own process group (the minions-sandbox wrapper calls setsid; without the wrapper, in tests, Node's `detached`
-// does). Stop = SIGTERM to the group, SIGKILL after the grace. After the leader exits the group is SIGKILLed again
+// does). Stop = SIGINT to the group (Codex handles only SIGINT gracefully: it interrupts the turn and flushes its
+// output, agent-runtimes U-C4), SIGTERM after a short interrupt grace, then SIGKILL after the kill grace. After the leader exits the group is SIGKILLed again
 // so no member is left behind before post-exit starts (the wrapper additionally reaps setsid escapees as a
 // subreaper; D4 "Process lifetime").
 import { spawn } from 'node:child_process';
@@ -14,9 +15,13 @@ export interface SuperviseTiming {
   pollMs: number;
   /** SIGTERM -> SIGKILL (D4: 15 s). */
   killGraceMs: number;
+  /** SIGINT -> SIGTERM (default INTERRUPT_GRACE_MS; never longer than killGraceMs). */
+  interruptGraceMs?: number;
   /** Drain grace before the worker is stopped (D3.6: 120 s). */
   drainGraceMs: number;
 }
+/** SIGINT -> SIGTERM: long enough for Codex to end its turn and write its last events. */
+export const INTERRUPT_GRACE_MS = 5_000;
 export const DEFAULT_TIMING: Omit<SuperviseTiming, 'timeoutMs'> = { pollMs: 5_000, killGraceMs: 15_000, drainGraceMs: 120_000 };
 
 export interface SpawnSpec { argv: string[]; cwd: string; env: Record<string, string>; stdin: string | null }
@@ -47,9 +52,11 @@ export function supervise(spec: SpawnSpec, timing: SuperviseTiming, hooks: Super
     let stopped: StopReason | null = null;
     let stderr = '';
     let buf = '';
+    let termTimer: NodeJS.Timeout | undefined;
     let killTimer: NodeJS.Timeout | undefined;
     let drainTimer: NodeJS.Timeout | undefined;
     let polling = false;
+    const interruptGraceMs = Math.min(timing.interruptGraceMs ?? INTERRUPT_GRACE_MS, timing.killGraceMs);
     const child = spawn(spec.argv[0]!, spec.argv.slice(1), {
       cwd: spec.cwd, env: spec.env, detached: true, shell: false, windowsHide: true,
       // Only stdin, stdout and stderr are passed (Node closes every other descriptor on exec).
@@ -59,8 +66,11 @@ export function supervise(spec: SpawnSpec, timing: SuperviseTiming, hooks: Super
     const stop = (why: StopReason) => {
       if (stopped || pid === undefined) return;
       stopped = why;
-      killGroup(pid, 'SIGTERM');
-      killTimer = setTimeout(() => killGroup(pid, 'SIGKILL'), timing.killGraceMs);
+      killGroup(pid, 'SIGINT');
+      termTimer = setTimeout(() => {
+        killGroup(pid, 'SIGTERM');
+        killTimer = setTimeout(() => killGroup(pid, 'SIGKILL'), timing.killGraceMs);
+      }, interruptGraceMs);
     };
     const deadline = setTimeout(() => stop('timeout'), timing.timeoutMs);
     const ticker = setInterval(() => {
@@ -83,7 +93,7 @@ export function supervise(spec: SpawnSpec, timing: SuperviseTiming, hooks: Super
     if (spec.stdin !== null) child.stdin.end(spec.stdin); else child.stdin.end();
     let spawnError: string | null = null;
     const finish = (code: number | null, signal: string | null) => {
-      clearTimeout(deadline); clearInterval(ticker); clearTimeout(killTimer); clearTimeout(drainTimer);
+      clearTimeout(deadline); clearInterval(ticker); clearTimeout(termTimer); clearTimeout(killTimer); clearTimeout(drainTimer);
       if (pid !== undefined) killGroup(pid, 'SIGKILL');
       if (buf) hooks.onLine(buf);
       resolveOutcome({ code, signal, stopped, stderrTail: stderr.slice(-STDERR_TAIL), spawnError });

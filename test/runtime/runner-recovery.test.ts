@@ -292,6 +292,26 @@ describe('lease ended before post-exit (task-14.4 review false positive)', () =>
     expect(headOf(r, b.branch)).toBe(b.expectedHead);
   });
 
+  it('a clone caught mid-removal after the lease ended (checkout left, .git already gone) is no harness violation', async () => {
+    // A release marks the lease ended, then removes the scratch dir recursively: the clone's .git goes before the
+    // checkout itself. Post-exit used to see the checkout, then report the missing .git (or checkout) as a violation.
+    const r = rig();
+    const b = await claim(r);
+    const p = runLease(b.leaseId, r.deps({ steps: [{ op: 'commit', file: 'a.txt' }, { op: 'sleep', ms: 60_000 }] }));
+    for (let i = 0; i < 100 && (await readRunRecord(r.paths.state, b.leaseId))?.phase !== 'running'; i++) await sleep(50);
+    const rec = await readRunRecord(r.paths.state, b.leaseId);
+    expect(rec?.phase).toBe('running');
+    await sleep(300);
+    rmSync(join(rec!.checkout, '.git'), { recursive: true, force: true });
+    expect(existsSync(rec!.checkout)).toBe(true);
+    r.db.exec("UPDATE leases SET status = 'released' WHERE id = ?", b.leaseId);
+    const out = await p;
+    expect(out).toMatchObject({ exit: { stopped: 'lease-ended' }, violations: [], submitted: false });
+    expect(r.db.events('task-1', 'harness-violation')).toEqual([]);
+    expect((await readRunRecord(r.paths.state, b.leaseId))?.outcome).toMatchObject({ violations: [], note: expect.stringMatching(/clone was removed when the lease ended; nothing fetched/) });
+    expect(headOf(r, b.branch)).toBe(b.expectedHead);
+  });
+
   it('a reap after the lease ended and the worktree was removed reports no violation either', async () => {
     const r = rig();
     const b = await claim(r);

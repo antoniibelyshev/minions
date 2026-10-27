@@ -178,7 +178,8 @@ function instructionsFor(brief: TaskBrief, rolePrompt: string | undefined): stri
   return [
     `You are the minions ${brief.role} for lease ${brief.leaseId}. Work only in ${brief.worktree} (your private clone of branch ${brief.branch}).`,
     'Your brief is in the file named by $MINIONS_BRIEF_FILE (also below). Do not run `minions work brief` or `minions work submit`:',
-    'write exactly one WorkerResult JSON object to the file named by $MINIONS_RESULT_FILE before you finish.',
+    'the runner submits your result for you. Your result is your WorkerResult as a single JSON object, as for every minions worker:',
+    'write it to the file named by $MINIONS_RESULT_FILE before you finish. A result file wins over your final message.',
     `Result contract: ${brief.resultContract}`,
     ...(rolePrompt ? ['', 'Role instructions (from the project):', '', rolePrompt] : []),
     '',
@@ -193,6 +194,19 @@ async function rolePromptOf(def: RoleDef, dir: string | undefined): Promise<stri
   const text = dir ? await readWorkerFile(join(dir, `${def.name}.md`), MAX_ROLE_PROMPT_BYTES) : null;
   if (!text?.trim()) throw new MinionsError('PRECONDITION', `The prompt of role ${def.name} (${def.prompt}) is not in the generated plugin.`, 'Regenerate it with `minions start` on the host.');
   return text.trimEnd();
+}
+
+/**
+ * A worker's result text with credential-shaped substrings masked (the CLI-wide redact()) and every value in
+ * `secrets` (the keys passed to this worker) replaced, raw or JSON-escaped. Masks keep JSON text valid JSON.
+ */
+export function redactSecrets(text: string, secrets: readonly string[]): string {
+  let out = redact(text);
+  for (const s of secrets) {
+    if (s.length < 4) continue;
+    for (const form of new Set([s, JSON.stringify(s).slice(1, -1)])) out = out.split(form).join('[REDACTED]');
+  }
+  return out;
 }
 
 const isObjectJson = (s: string): boolean => { try { const v = JSON.parse(s) as unknown; return !!v && typeof v === 'object' && !Array.isArray(v); } catch { return false; } };
@@ -212,26 +226,54 @@ export async function postExit(rec: RunRecord, deps: Pick<RunnerDeps, 'env' | 'p
   if (!snap) return { violations: [], head: rec.claimHead, fetched: false, wipCommit: null };
   // After the lease ended, its scratch dir (the clone) or its worktree may be gone legitimately (lease cleanup,
   // worktree removal): nothing can be fetched, and that is no harness violation (task-14.4 review).
-  if (opts.leaseEnded) {
-    const gone = !(await lstat(rec.checkout).catch(() => null)) ? 'the per-lease clone was removed when the lease ended'
-      : !(await lstat(join(rec.leaseWorktree, '.git')).catch(() => null)) ? 'the lease worktree was removed after the lease ended' : null;
-    if (gone) return { violations: [], head: rec.claimHead, fetched: false, wipCommit: null, note: `${gone}; nothing fetched` };
+  // A release marks the lease ended before it removes the scratch dir, so that removal can still be running while
+  // these checks run (a recursive rm drops the clone's `.git` before the checkout itself). The check is repeated
+  // whenever a later step fails, so a clone that vanishes mid-check is not reported as a violation either.
+  const removed = async (): Promise<PostExit | null> => {
+    if (!opts.leaseEnded) return null;
+    const gone = await leaseCleanupGone(rec);
+    return gone ? { violations: [], head: rec.claimHead, fetched: false, wipCommit: null, note: `${gone}; nothing fetched` } : null;
+  };
+  const early = await removed();
+  if (early) return early;
+  try {
+    const ctx = repoContext(rec, deps);
+    const violations: string[] = [];
+    const changed = await diffLeaseGit(snap);
+    if (changed.length) {
+      violations.push(`lease git files changed: ${changed.join(', ')}`);
+      await restoreLeaseGit(snap, changed);
+      const still = await diffLeaseGit(snap);
+      if (still.length) throw new MinionsError('INTERNAL', `could not restore the lease git files: ${still.join(', ')}`);
+    }
+    const cloneViolations = await sanitizeClone(ctx, snap.commonDir);
+    if (cloneViolations.length) {
+      const late = await removed();
+      // Only the clone vanished: the lease git files were checked (and restored) on their own, so keep those findings.
+      if (late) return late.note?.startsWith(CLONE_REMOVED) ? { ...late, violations } : late;
+      violations.push(...cloneViolations);
+    }
+    if (violations.length) return { violations, head: rec.claimHead, fetched: false, wipCommit: null };
+    const role = rec.role;
+    const wipHead = wip ? await wipCommit(ctx, role, wip) : null;
+    const fb = await branchRuleAndFetch(ctx, snap, role);
+    if (fb.violations.length) { const late = await removed(); if (late) return late; }
+    return { violations: fb.violations, head: fb.head, fetched: fb.fetched, wipCommit: fb.fetched ? wipHead : null };
+  } catch (e) {
+    const late = await removed();
+    if (late) return late;
+    throw e;
   }
-  const ctx = repoContext(rec, deps);
-  const violations: string[] = [];
-  const changed = await diffLeaseGit(snap);
-  if (changed.length) {
-    violations.push(`lease git files changed: ${changed.join(', ')}`);
-    await restoreLeaseGit(snap, changed);
-    const still = await diffLeaseGit(snap);
-    if (still.length) throw new MinionsError('INTERNAL', `could not restore the lease git files: ${still.join(', ')}`);
-  }
-  violations.push(...await sanitizeClone(ctx, snap.commonDir));
-  if (violations.length) return { violations, head: rec.claimHead, fetched: false, wipCommit: null };
-  const role = rec.role;
-  const wipHead = wip ? await wipCommit(ctx, role, wip) : null;
-  const fb = await branchRuleAndFetch(ctx, snap, role);
-  return { violations: fb.violations, head: fb.head, fetched: fb.fetched, wipCommit: fb.fetched ? wipHead : null };
+}
+
+const CLONE_REMOVED = 'the per-lease clone was removed when the lease ended';
+
+/** Why the clone or the worktree is gone (or being removed) after the lease ended; null while both are intact. */
+async function leaseCleanupGone(rec: RunRecord): Promise<string | null> {
+  const missing = async (p: string): Promise<boolean> => !(await lstat(p).catch(() => null));
+  if (await missing(rec.checkout) || await missing(join(rec.checkout, '.git'))) return CLONE_REMOVED;
+  if (await missing(join(rec.leaseWorktree, '.git'))) return 'the lease worktree was removed after the lease ended';
+  return null;
 }
 
 // -------------------------------------------------------------------------------------------------- runLease
@@ -373,7 +415,9 @@ export async function runLease(leaseId: string, deps: RunnerDeps): Promise<RunOu
     } else {
       const fromFile = await readWorkerFile(join(scratch, 'result.json'));
       const fm = finalMessage as string | null;
-      const norm = (t: string | null) => (t && adapter.normalizeResult ? adapter.normalizeResult(t) : t);
+      // Redacted before submit: the result is stored, shown to the coordinator and may quote the worker's env or
+      // output. The spawn secrets are masked verbatim too, in case one does not match a redact() pattern.
+      const norm = (t: string | null) => (t ? redactSecrets(adapter.normalizeResult ? adapter.normalizeResult(t) : t, secretValues) : t);
       const file = norm(fromFile);
       const final = norm(fm);
       raw = file && isObjectJson(file) ? file : final && isObjectJson(final) ? final : null;

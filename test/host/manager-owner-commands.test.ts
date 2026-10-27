@@ -177,6 +177,24 @@ describe('/set: an owner config change is a plan to confirm', () => {
     expect((await reason(CR.buildPlan(project, forged[0]!, { runtime: s.manager.runtime, upgrade: s.deps.upgrade }))).details).toMatchObject({ hostOwned: true });
   });
 
+  it('delivery.requiredChecksConfigured (task-79): /set true is offered with its loosening text and applied; a container request is refused', async () => {
+    const { project, local } = await install();
+    const s = setup([project]);
+    const o = await s.cmds.propose(null, { kind: 'config-set', key: 'delivery.requiredChecksConfigured', value: 'true', layer: 'local' });
+    expect(o.summary).toBe('set delivery.requiredChecksConfigured: false -> true');
+    expect(o.loosens).toMatch(/auto-merge may arm for pull requests once their required checks pass/);
+    expect(o.text).toContain('LOOSENS POLICY');
+    await s.confirm(o);
+    expect(s.outcomes.map((x) => x.status)).toEqual(['applying', 'applied']);
+    expect(readJson(local).delivery.requiredChecksConfigured).toBe(true);
+    const off = await s.cmds.propose(null, { kind: 'config-set', key: 'delivery.requiredChecksConfigured', value: 'false', layer: 'local' });
+    expect(off.loosens ?? null).toBeNull();
+    await s.confirm(off);
+    expect(readJson(local).delivery.requiredChecksConfigured).toBe(false);
+    const forged = { id: 'cr_0a1b2c3e', kind: 'config-set', payload: { key: 'delivery.requiredChecksConfigured', value: 'true', layer: 'local' }, reason: null };
+    expect((await reason(CR.buildPlan(project, forged, { runtime: s.manager.runtime, upgrade: s.deps.upgrade }))).details).toMatchObject({ hostOwned: true });
+  });
+
   it('with several projects the command needs /project first; with a picked project it targets that one', async () => {
     const a = await install('a');
     const b = await install('b');

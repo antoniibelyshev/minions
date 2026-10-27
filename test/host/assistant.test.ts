@@ -50,11 +50,14 @@ async function project(visibility: 'shared' | 'private' = 'private') {
  * PATH holds nothing else (node is called by absolute path), so a fake that cannot run (e.g. a noexec
  * TMPDIR) fails the launch instead of falling through to the real claude next to node.
  */
-function fakeClaude(): { log: string; bin: string } {
+function fakeClaude(help?: string): { log: string; bin: string } {
   const bin = join(env.root, 'bin');
   mkdirSync(bin, { recursive: true });
   const log = join(env.root, 'claude.json');
-  writeFileSync(join(bin, 'claude'), `#!/bin/sh\nexec "${process.execPath}" -e 'require("fs").writeFileSync(process.argv[1], JSON.stringify({ argv: process.argv.slice(2), cwd: process.cwd() }))' "${log}" "$@"\n`);
+  // With `help`: `claude --help` prints it (and records nothing), like the real CLI (node by absolute path: PATH holds only bin).
+  if (help !== undefined) writeFileSync(join(env.root, 'help.txt'), help);
+  const helpCase = help === undefined ? '' : `if [ "$1" = "--help" ]; then exec "${process.execPath}" -e 'process.stdout.write(require("fs").readFileSync(process.argv[1]))' "${join(env.root, 'help.txt')}"; fi\n`;
+  writeFileSync(join(bin, 'claude'), `#!/bin/sh\n${helpCase}exec "${process.execPath}" -e 'require("fs").writeFileSync(process.argv[1], JSON.stringify({ argv: process.argv.slice(2), cwd: process.cwd() }))' "${log}" "$@"\n`);
   chmodSync(join(bin, 'claude'), 0o755);
   process.env.PATH = bin;
   return { log, bin };
@@ -129,6 +132,18 @@ describe('assistant argv', () => {
     for (const t of [sp, skill]) expect(t).not.toMatch(/\{\{|\}\}/);
   });
 
+  it('task-70: maps the permission mode to the name the installed Claude Code lists; never a looser mode', async () => {
+    const { ctx } = await project();
+    const mode = async (modes: string[] | null) => { const { args } = await A.planAssistant(ctx, { permissionModes: modes }); return args[args.indexOf('--permission-mode') + 1]; };
+    expect(await mode(['acceptEdits', 'auto', 'bypassPermissions', 'manual', 'dontAsk', 'plan'])).toBe('manual');
+    expect(await mode(['acceptEdits', 'bypassPermissions', 'default', 'dontAsk', 'plan'])).toBe('default');
+    expect(await mode(['default', 'manual'])).toBe('default');
+    expect(await mode(null)).toBe('default');
+    await expect(A.planAssistant(ctx, { permissionModes: ['acceptEdits', 'auto', 'bypassPermissions', 'dontAsk', 'plan'] }))
+      .rejects.toMatchObject({ code: 'INCOMPATIBLE_RUNTIME' });
+    expect(() => A.assistantPermissionMode(['auto'])).toThrow(/runs only in permission mode default/);
+  });
+
   it('dry-run planning writes nothing', async () => {
     const { id, ctx } = await project();
     await A.planAssistant(ctx);
@@ -151,6 +166,27 @@ describe('launch (fake claude on PATH)', () => {
     expect(JSON.parse(readFileSync(join(dir, '.claude-plugin', 'plugin.json'), 'utf8'))).toMatchObject({ name: 'minions-setup' });
     expect(readFileSync(join(dir, 'skills', 'setup', 'SKILL.md'), 'utf8')).toMatch(/name: setup/);
     expect(info.join('\n')).toMatch(/permission prompts stay on/);
+  });
+
+  it('task-70: passes manual when claude --help lists only manual (2.1.292), default when it lists default', async () => {
+    const { ctx } = await project();
+    const help = (choices: string) => `Options:\n  --permission-mode <mode>  Permission mode to use for the session\n      (choices: ${choices})\n  --plugin-dir <path>  Load plugins\n`;
+    const { log } = fakeClaude(help('"acceptEdits", "auto",\n      "bypassPermissions", "manual",\n      "dontAsk", "plan"'));
+    expect(await A.launchAssistant(ctx)).toBe(0);
+    let argv = (JSON.parse(readFileSync(log, 'utf8')) as { argv: string[] }).argv;
+    expect(argv[argv.indexOf('--permission-mode') + 1]).toBe('manual');
+    fakeClaude(help('"acceptEdits", "default", "plan"'));
+    expect(await A.launchAssistant(ctx)).toBe(0);
+    argv = (JSON.parse(readFileSync(log, 'utf8')) as { argv: string[] }).argv;
+    expect(argv[argv.indexOf('--permission-mode') + 1]).toBe('default');
+  });
+
+  it('task-70: fails closed (nothing written, claude not started) when claude --help lists neither default nor manual', async () => {
+    const { id, ctx } = await project();
+    const { log } = fakeClaude('Options:\n  --permission-mode <mode>  Mode (choices: "acceptEdits", "auto", "bypassPermissions", "dontAsk", "plan")\n');
+    await expect(A.launchAssistant(ctx)).rejects.toMatchObject({ code: 'INCOMPATIBLE_RUNTIME', message: expect.stringMatching(/neither --permission-mode default nor manual/) });
+    expect(existsSync(log)).toBe(false);
+    expect(existsSync(A.assistantPluginDir(id))).toBe(false);
   });
 
   it('fails with a precondition when claude is not on PATH', async () => {
