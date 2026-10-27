@@ -18,14 +18,14 @@ import type { SyncReport } from './ci.js';
 import type { NextReport } from './scheduler.js';
 import { lastOwnerMessageAt } from './coordinator-usage.js';
 import { TRANSCRIPT_META } from './context-reset.js';
-import { utcDayStart } from './spend.js';
+import { localDayStart } from './zoned-time.js';
 
-export const ROUTINE_DEFAULTS = { tickMinutes: 15, minWakeGapMinutes: 30, maxWakesPerDay: 8 } as const;
+export const ROUTINE_DEFAULTS = { tickMinutes: 15, minWakeGapMinutes: 30, maxWakesPerDay: 8, digestAt: ['08:00'] as readonly string[], timezone: 'Europe/Berlin' } as const;
 /** The main transcript must be idle this long before a wake (the prompt cache has expired by then). */
 export const IDLE_MINUTES = 10;
 /** No wake within this many minutes of an owner message (the task-58 "latest message" window). */
 export const OWNER_ACTIVE_MINUTES = 30;
-/** Crash starts (coordinator not running after a crash) per UTC day; after that the manager bot reports it. */
+/** Crash starts (coordinator not running after a crash) per local day (routine.timezone); after that the manager bot reports it. */
 export const MAX_CRASH_STARTS_PER_DAY = 2;
 /** A recorded coordinator restart this recent means one is in progress: the pass starts nothing. */
 export const RESTART_SETTLE_MINUTES = 5;
@@ -36,7 +36,13 @@ export const ROUTINE_EVENT = 'routine';
 export const WAKE_EVENT = 'routine-wake';
 export const CRASH_START_EVENT = 'routine-crash-start';
 
-export interface RoutineSettings { enabled: boolean; tickMinutes: number; minWakeGapMinutes: number; maxWakesPerDay: number }
+export interface RoutineSettings {
+  enabled: boolean; tickMinutes: number; minWakeGapMinutes: number; maxWakesPerDay: number;
+  /** Local digest times "HH:MM" (phase 4), sorted, in `timezone`. */
+  digestAt: string[];
+  /** IANA zone of the digest times and of the routine's days (wakes and crash starts per day). */
+  timezone: string;
+}
 
 /** Effective routine settings: unset = off, every unset field its default. */
 export function routineSettings(cfg: Pick<MinionsConfig, 'routine'>): RoutineSettings {
@@ -46,6 +52,8 @@ export function routineSettings(cfg: Pick<MinionsConfig, 'routine'>): RoutineSet
     tickMinutes: r.tickMinutes ?? ROUTINE_DEFAULTS.tickMinutes,
     minWakeGapMinutes: r.minWakeGapMinutes ?? ROUTINE_DEFAULTS.minWakeGapMinutes,
     maxWakesPerDay: r.maxWakesPerDay ?? ROUTINE_DEFAULTS.maxWakesPerDay,
+    digestAt: [...new Set(r.digestAt?.length ? r.digestAt : ROUTINE_DEFAULTS.digestAt)].sort(),
+    timezone: r.timezone ?? ROUTINE_DEFAULTS.timezone,
   };
 }
 
@@ -244,8 +252,10 @@ export interface RoutinePassDeps {
   budgetExhausted: () => boolean;
   /** An upgrade the host is applying (it starts the coordinator itself): treated like a drain. */
   upgradeInProgress?: () => string | null;
-  /** Phase 4 (digest): whether a digest is due. Default: never. */
+  /** Phase 4: whether a digest is due (src/runtime/digest.ts digestStatus; the detail line), else null. Default: never. */
   digestDue?: () => string | null;
+  /** Phase 4: the outbox hold-back (reholdExpired): held items stay for the digest; returns how many were re-held. */
+  holdBack?: () => number;
   mtime?: (path: string) => number | null;
   /** The fresh wake: `coordinator restart --wake` detached, never with force (scheduleDetachedRestart). */
   wake: () => Promise<string>;
@@ -267,6 +277,8 @@ export interface RoutineReport {
   durationMs?: number;
   sync?: RoutineSyncSummary;
   syncError?: string;
+  /** Held notifications moved on to the next digest by the hold-back step. */
+  reheld?: number;
   reasons?: WakeReason[];
   decision?: WakeDecision;
   /** What the wake or crash start did (scheduled, or the refusal). */
@@ -312,6 +324,7 @@ export async function runRoutinePass(deps: RoutinePassDeps, opts: { trigger: Rou
   try {
     const report: RoutineReport = { ...base, ran: true, why: '' };
     try { report.sync = await deps.sync(); } catch (e) { report.syncError = msg(e); }
+    if (deps.holdBack && settings.enabled) { try { report.reheld = deps.holdBack(); } catch { /* the hold-back never stops the pass */ } }
     // The sync may have changed what the coordinator sees (merged, imported, CI): read the state after it.
     const c = await deps.coordinator();
     report.coordinator = coordinatorLine(c);
@@ -321,7 +334,7 @@ export async function runRoutinePass(deps: RoutinePassDeps, opts: { trigger: Rou
     const reasons = settings.enabled && c.running ? collectWakeReasons(deps.db, next, since) : [];
     const digest = settings.enabled ? deps.digestDue?.() ?? null : null;
     if (digest) reasons.push({ kind: 'digest', detail: digest });
-    const day = utcDayStart(deps.now());
+    const day = localDayStart(deps.now(), settings.timezone);
     const wakes = deps.db.eventsOfKindSince(WAKE_EVENT, day);
     const lastWake = deps.db.lastEventOfKind(WAKE_EVENT);
     const decision = decideWake({
@@ -348,7 +361,7 @@ export async function runRoutinePass(deps: RoutinePassDeps, opts: { trigger: Rou
     report.durationMs = deps.now().getTime() - now.getTime();
     report.nextAt = settings.enabled ? plusMinutes(at, settings.tickMinutes) : null;
     deps.db.addEvent(ROUTINE_EVENT, null, {
-      trigger: report.trigger, durationMs: report.durationMs, sync: report.sync ?? null, syncError: report.syncError ?? null,
+      trigger: report.trigger, durationMs: report.durationMs, sync: report.sync ?? null, syncError: report.syncError ?? null, reheld: report.reheld ?? 0,
       reasons: reasons.slice(0, 50), decision, outcome: report.outcome ?? null, coordinator: report.coordinator,
     }, at);
     return report;
@@ -375,7 +388,7 @@ export function routineLast(db: RuntimeDb, cfg: Pick<MinionsConfig, 'routine'>, 
     enabled: s.enabled, tickMinutes: s.tickMinutes,
     last: e ? { at: e.at, trigger: d.trigger ?? 'unknown', decision: d.decision ?? null, reasons: d.reasons ?? [], outcome: d.outcome ?? null, sync: d.sync ?? null, syncError: d.syncError ?? null } : null,
     nextAt: s.enabled ? (e ? plusMinutes(e.at, s.tickMinutes) : now.toISOString()) : null,
-    wakesToday: db.eventsOfKindSince(WAKE_EVENT, utcDayStart(now)).length,
+    wakesToday: db.eventsOfKindSince(WAKE_EVENT, localDayStart(now, s.timezone)).length,
     lastWakeAt: db.lastEventOfKind(WAKE_EVENT)?.at ?? null,
   };
 }

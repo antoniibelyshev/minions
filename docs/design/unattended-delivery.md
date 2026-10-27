@@ -1,7 +1,7 @@
 # Unattended delivery: daily routine, PR scan, autonomous intake: design
 
 Status: **agreed** (task-68.1; the owner approved every recommended answer, Telegram msgs 320/321, and set the
-timezone, msg 322: see [Owner answers](#owner-answers)). Phase 1 (routine pass and clock) is built in task-68.2. Epic: task-68. Related: [coordinator-sessions.md](coordinator-sessions.md)
+timezone, msg 322: see [Owner answers](#owner-answers)). Phase 1 (routine pass and clock) is built in task-68.2, phase 4 (digest and held questions) in task-68.5. Epic: task-68. Related: [coordinator-sessions.md](coordinator-sessions.md)
 (task-57: supervisor, token baseline), [host-manager.md](host-manager.md) (task-53: manager loop and its supervisor),
 [bootstrap.md, CI-gated auto-merge](bootstrap.md#ci-gated-auto-merge), [roles-and-workflows.md](roles-and-workflows.md)
 (stage machine).
@@ -174,9 +174,10 @@ Facts from the code (main @ 4999cb3):
    first, split, or let me try again?"). The label is removed when the task is delivered again.
 7. **One digest, with held questions.** Outbox items get a hold. `notify enqueue --hold digest` sets
    `next_attempt_at` to the next digest time, so `pending()` does not return them earlier (no schema change).
-   The kinds `delivered`, `feature`, `question` and `status` are held by default. The kinds `blocker`, `approval` and
+   The kinds `delivered`, `feature` and `question` are held by default (as built, `status` is not: see
+   [Phase 4 as built](#phase-4-as-built-task-685)). The kinds `blocker`, `approval` and
    budget-exhausted items are sent at the next wake that happens anyway (no wake of their own). `routine.digestAt`
-   (default `["08:00"]`, in `routine.timezone`, an IANA name, default the host's zone) makes the pass wake the
+   (default `["08:00"]`, in `routine.timezone`, an IANA name, default `Europe/Berlin` per the owner) makes the pass wake the
    coordinator for the digest. If a digest time was missed (host asleep, container down), the digest goes out at the
    first pass after it. `minions notify digest --json` composes the message deterministically:
    - merged, delivered, and waiting for CI;
@@ -395,6 +396,45 @@ always reads the current config; the manager watchdog asks each running project 
 the pass only when the last one is older than 2 intervals; the routine lock is the meta row `routine_lock`; events
 `routine`, `routine-wake` and `routine-crash-start` (schema 9 adds an `events(kind, at)` index); days are UTC
 days until phase 4 adds `routine.timezone`.
+
+### Phase 4 as built (task-68.5)
+
+- **Holds** (`src/runtime/digest.ts`): `notify enqueue --hold digest|none|default` sets `next_attempt_at` to the next
+  digest time (`digest`) or leaves it unset (`none`). A held row is one with `attempts = 0` and a `next_attempt_at`
+  (a failed send always has `attempts > 0`), so no schema change. Without the flag the per-kind table applies:
+
+  | Kind | Default | Why |
+  | - | - | - |
+  | `delivered`, `feature` | held | read, not acted on, today; the digest lists them with their links |
+  | `question` | held | batched into numbered polls, one reply for all of them |
+  | `goal-ack`, `status` | sent | the answer to an owner message: the owner is in the chat (a status the owner asked for is never held) |
+  | `approval` | sent | a held approval would delay a publish or merge by a day |
+  | `blocker`, `other` | sent | at the next wake that happens anyway, never a wake of its own |
+
+  Default holds apply only while `routine.enabled` is on (without it there is no digest wake, so a hold would only
+  delay) and not within 30 minutes of an owner message (the owner is in the conversation). An explicit
+  `--hold digest` always holds until the next digest time.
+- **Hold-back:** each routine pass and each `notify pending` move a held item whose time came on to the next digest
+  time while the routine is on, so only the digest delivers it (a session awake at 08:05 does not send it alone).
+- **Due and catch-up:** the latest digest time at or before now (`routine.digestAt` in `routine.timezone`, computed
+  with `Intl` and no dependency, DST-safe) whose key `digest:<local YYYY-MM-DDTHH:MM>` is not delivered. A missed
+  time is caught up at the first pass after it; only the latest time counts, so a host asleep for two days sends
+  one digest. A digest wake counts: the next one for the same time comes after 60 minutes at the earliest (the
+  woken session did not send it), at most 2 per time. The first pass after turning the routine on sends the latest
+  time's digest. The routine's days (`maxWakesPerDay`, crash starts) are local days in `routine.timezone`; a daily
+  budget (`spend.ts`) still counts UTC days.
+- **Composition:** `minions notify digest --json` reads the outbox (every undelivered item), the backlog, the
+  events (merged since the last digest, `awaiting-approval` merges, `auto-promote` events of phase 5), publications
+  waiting for approval, the spend tally and `work next`. The text has fixed sections (merged; delivered, waiting
+  for CI or merge; updates; waiting for you, with the exact `/approve` lines; blockers; auto-promoted; spend today
+  with coordinator wakes and their tokens; next up; questions), sorted lines, and questions as polls: a question
+  item's option lines (`1. …`, `- …`) become numbered options with "Other" last, answered as `Q1 2`. Lines that
+  would exceed the Telegram limit are left out whole (`left`) and stay pending. The text is stored under the digest
+  key (an undelivered row is replaced, a delivered one never touched); the coordinator sends it with one `reply`
+  and acks `keys` (the digest key and every covered item), which marks the time done. `--status` shows the times,
+  the last one and the held count; `minions status` shows the same line when the routine is on.
+- **Budget:** at 100% only the digest wakes the coordinator (crash starts are refused too); wake sessions are
+  measured coordinator sessions, so their tokens count in the spend tally and the budget.
 
 ## Open questions for the owner (answered above)
 

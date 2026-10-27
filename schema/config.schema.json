@@ -1100,6 +1100,18 @@
           "type": "integer",
           "minimum": 0,
           "maximum": 9007199254740991
+        },
+        "digestAt": {
+          "minItems": 1,
+          "maxItems": 4,
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/__schema20"
+          }
+        },
+        "timezone": {
+          "type": "string",
+          "minLength": 1
         }
       },
       "additionalProperties": false
@@ -1366,6 +1378,10 @@
         "models"
       ],
       "additionalProperties": false
+    },
+    "__schema20": {
+      "type": "string",
+      "pattern": "^(?:[01]\\d|2[0-3]):[0-5]\\d$"
     }
   }
 }

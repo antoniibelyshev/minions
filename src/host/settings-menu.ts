@@ -105,7 +105,7 @@ async function askValue(io: MenuIO, v: SettingView): Promise<string | null> {
     const i = await pick(io, `${v.label} (${v.key})`, choices, choices.indexOf(formatValue(v.value)));
     return i === null ? null : choices[i]!;
   }
-  const a = ((await io.line(`${v.label} (${v.key}) [${formatValue(v.value)}]${v.type === 'models' ? ' (comma-separated)' : v.type === 'list' ? ' (comma-separated; none = keep every tool; default = unset)' : ''}: `)) ?? '').trim();
+  const a = ((await io.line(`${v.label} (${v.key}) [${formatValue(v.value)}]${v.type === 'models' ? ' (comma-separated)' : v.type === 'list' ? (v.key === 'coordinator.disallowedTools' ? ' (comma-separated; none = keep every tool; default = unset)' : ' (comma-separated; default = unset)') : ''}: `)) ?? '').trim();
   return a || null;
 }
 

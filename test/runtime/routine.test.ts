@@ -21,7 +21,7 @@ import { makeEnv, tmp } from './fixtures.js';
 
 const T0 = new Date('2026-10-27T12:00:00.000Z');
 const ago = (min: number, from = T0) => new Date(from.getTime() - min * 60_000).toISOString();
-const ON: RoutineSettings = { enabled: true, tickMinutes: 15, minWakeGapMinutes: 30, maxWakesPerDay: 8 };
+const ON: RoutineSettings = { enabled: true, tickMinutes: 15, minWakeGapMinutes: 30, maxWakesPerDay: 8, digestAt: ['08:00'], timezone: 'Europe/Berlin' };
 const running = (over: Partial<CoordinatorView> = {}): CoordinatorView => ({ running: true, lockAcquiredAt: ago(120), staleLock: false, exit: null, lastRestartAt: null, ...over });
 const down = (over: Partial<CoordinatorView> = {}): CoordinatorView => ({ running: false, lockAcquiredAt: null, staleLock: false, exit: null, lastRestartAt: null, ...over });
 const runnable: WakeReason = { kind: 'runnable', taskId: 'task-1', role: 'engineer', detail: 'task-1 engineer runnable' };
@@ -34,8 +34,9 @@ const inputs = (over: Partial<WakeInputs> = {}): WakeInputs => ({
 
 describe('routine settings', () => {
   it('unset = off with the defaults; set fields win', () => {
-    expect(routineSettings({})).toEqual({ enabled: false, tickMinutes: 15, minWakeGapMinutes: 30, maxWakesPerDay: 8 });
-    expect(routineSettings({ routine: { enabled: true, tickMinutes: 5 } })).toEqual({ enabled: true, tickMinutes: 5, minWakeGapMinutes: 30, maxWakesPerDay: 8 });
+    expect(routineSettings({})).toEqual({ enabled: false, tickMinutes: 15, minWakeGapMinutes: 30, maxWakesPerDay: 8, digestAt: ['08:00'], timezone: 'Europe/Berlin' });
+    expect(routineSettings({ routine: { enabled: true, tickMinutes: 5 } })).toEqual({ enabled: true, tickMinutes: 5, minWakeGapMinutes: 30, maxWakesPerDay: 8, digestAt: ['08:00'], timezone: 'Europe/Berlin' });
+    expect(routineSettings({ routine: { digestAt: ['18:00', '08:00', '18:00'], timezone: 'America/New_York' } })).toMatchObject({ digestAt: ['08:00', '18:00'], timezone: 'America/New_York' });
   });
 });
 
