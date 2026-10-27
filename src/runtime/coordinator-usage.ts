@@ -28,7 +28,13 @@ export const MAX_READ_BYTES = 4 * 1024 * 1024;
 const RECENT_IDS = 500;
 
 export interface UsageComponents { input: number; cacheRead: number; cacheWrite: number; output: number }
-export type SessionEndTrigger = 'context-reset' | 'restart' | 'exit';
+/** wake: the routine pass restarted it with a fresh wake session (`coordinator restart --wake`, task-68.2). */
+export type SessionEndTrigger = 'context-reset' | 'restart' | 'wake' | 'exit';
+/**
+ * Meta key: when the Stop hook last counted a new owner (Telegram) message in the main session (ISO time). The
+ * routine pass never wakes the coordinator within 30 minutes of it (a live conversation is never cut).
+ */
+export const LAST_OWNER_MESSAGE_META = 'coordinator_last_owner_message';
 
 export interface CoordinatorSessionState {
   version: 1;
@@ -50,6 +56,8 @@ export interface CoordinatorSessionState {
   ownerMessages: number;
   /** Whether the session started with the recovery prompt (null until its first user message is read). */
   recovered: boolean | null;
+  /** Whether the session started with the routine wake prompt (task-68.2; absent in older states). */
+  woken?: boolean;
   /** Tokens a recovered session spent before its first claim or Telegram reply. */
   overhead: number;
   overheadDone: boolean;
@@ -72,6 +80,7 @@ const num = (u: Record<string, unknown>, k: string) => (typeof u[k] === 'number'
 
 const OWNER_TAG = /^\s*<channel\s+source="telegram"/;
 const RECOVER_PREFIX = /^\s*\/minions:recover\b/;
+const WAKE_PREFIX = /^\s*\/minions:orchestrate\s+wake\s*$/;
 /** A claim or a Telegram reply ends a recovered session's reset overhead. */
 const CLAIM_CMD = /\bminions\s+work\s+claim\b/;
 const isReplyTool = (name: string) => /telegram/i.test(name) && /__reply$/.test(name);
@@ -135,7 +144,7 @@ export function foldTranscriptLines(state: CoordinatorSessionState, text: string
   const seen = new Set(state.recentIds);
   for (const it of items) {
     if (it.kind === 'user') {
-      if (state.recovered === null) state.recovered = RECOVER_PREFIX.test(it.text);
+      if (state.recovered === null) { state.recovered = RECOVER_PREFIX.test(it.text); state.woken = WAKE_PREFIX.test(it.text); }
       if (OWNER_TAG.test(it.text)) state.ownerMessages++;
       continue;
     }
@@ -257,8 +266,10 @@ export function trackCoordinatorUsage(deps: TrackDeps, input: Record<string, unk
     }
     if (s.ended) delete s.ended; // resumed after it was completed
     const before = totalOf(s.components);
+    const ownerBefore = s.ownerMessages;
     const r = readIncrement(s, deps.limits);
     s.lastAt = now.toISOString();
+    if (s.ownerMessages > ownerBefore) { try { deps.db.setMeta(LAST_OWNER_MESSAGE_META, s.lastAt); } catch { /* best-effort */ } }
     persist(deps.db, s, totalOf(s.components) !== before);
     // A new session: the previous one ended; complete it now if the next start did not.
     if (fresh) completeOpenSessions({ ...deps, except: sessionId });
@@ -268,7 +279,7 @@ export function trackCoordinatorUsage(deps: TrackDeps, input: Record<string, unk
   }
 }
 
-interface RestartInfo { at?: string; reason?: string }
+interface RestartInfo { at?: string; reason?: string; wake?: boolean }
 const parse = <T>(v: string | undefined): T | null => { try { return v ? JSON.parse(v) as T : null; } catch { return null; } };
 
 /** Why a session ended: the self-reset request, else a recorded restart, else it just exited (crash, stop, quit). */
@@ -276,7 +287,7 @@ function endTrigger(db: UsageDb, s: CoordinatorSessionState): { trigger: Session
   const req = parse<{ at?: string; triggers?: string[] }>(db.getMeta(RESET_REQUEST_META));
   if (req?.at && req.at >= s.firstAt) return { trigger: 'context-reset', detail: req.triggers?.length ? req.triggers.join(',') : 'requested' };
   const restart = parse<RestartInfo>(db.getMeta('coordinator_restart'));
-  if (restart?.at && restart.at >= s.firstAt) return { trigger: 'restart', ...(restart.reason ? { detail: restart.reason.slice(0, 200) } : {}) };
+  if (restart?.at && restart.at >= s.firstAt) return { trigger: restart.wake ? 'wake' : 'restart', ...(restart.reason ? { detail: restart.reason.slice(0, 200) } : {}) };
   return { trigger: 'exit' };
 }
 
@@ -299,6 +310,11 @@ export function completeOpenSessions(deps: Omit<TrackDeps, 'env'> & { except?: s
     }
   } catch { /* best-effort */ }
   return { completed };
+}
+
+/** The last owner message the Stop hook counted (ISO time), or null. */
+export function lastOwnerMessageAt(db: Pick<RuntimeDb, 'getMeta'>): string | null {
+  try { const v = db.getMeta(LAST_OWNER_MESSAGE_META); return v && !Number.isNaN(Date.parse(v)) ? v : null; } catch { return null; }
 }
 
 /** `coordinator restart --detach` (the self-reset) records which triggers held, so the ended session says why. */

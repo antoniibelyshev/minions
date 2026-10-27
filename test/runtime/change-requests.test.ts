@@ -57,7 +57,7 @@ const rows = () => { const db = openState(); try { return db.changeRequests({ al
 
 describe('change_requests migration', () => {
   it('schema 8 adds change_requests; a schema-7 database migrates and keeps its rows', () => {
-    expect(SCHEMA_VERSION).toBe(8);
+    expect(SCHEMA_VERSION).toBeGreaterThanOrEqual(8); // later migrations run on top
     const file = join(state, 'v7.db');
     const v7 = new RuntimeDb(file);
     v7.exec('DROP TABLE change_requests');
@@ -66,7 +66,7 @@ describe('change_requests migration', () => {
     v7.close();
     const up = new RuntimeDb(file);
     try {
-      expect(up.getMeta('schema_version')).toBe('8');
+      expect(up.getMeta('schema_version')).toBe(String(SCHEMA_VERSION));
       expect(up.paused().starts).toBe(true);
       const cols = up.all<{ name: string }>('PRAGMA table_info(change_requests)').map((c) => c.name);
       expect(cols).toEqual(['id', 'kind', 'payload', 'reason', 'created_at', 'status', 'updated_at', 'detail']);

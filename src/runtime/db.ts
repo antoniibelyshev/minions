@@ -5,7 +5,7 @@ import type { IdempotencyStore } from '../backlog/types.js';
 import { MinionsError } from '../core/errors.js';
 import { runtimePaths } from './paths.js';
 
-export const SCHEMA_VERSION = 8;
+export const SCHEMA_VERSION = 9;
 
 /** The built-in worker roles (always registered). */
 export type BuiltinLeaseRole = 'engineer' | 'tester' | 'reviewer';
@@ -149,6 +149,11 @@ const MIGRATIONS: Record<number, string> = {
       status TEXT NOT NULL, updated_at TEXT NOT NULL, detail TEXT);
     CREATE INDEX IF NOT EXISTS change_requests_status ON change_requests(status, created_at);
   `,
+  // Routine pass (docs/design/unattended-delivery.md, task-68.2): every pass reads the last `routine` event and counts
+  // today's wakes and crash starts by kind and time. The index keeps those reads cheap on a long event log.
+  9: `
+    CREATE INDEX IF NOT EXISTS events_kind_at ON events(kind, at);
+  `,
 };
 
 let warningFilterInstalled = false;
@@ -195,6 +200,9 @@ export function pidAlive(pid: number): boolean {
  * could be read. With it a reused pid (a tmux client, `minions coordinator sync`) is never the holder.
  */
 export interface CoordinatorLock { pid: number; session: string; acquiredAt: string; start?: string }
+
+/** The routine pass lock: holder pid, its process start time (null when unreadable) and when it was taken. */
+export interface RoutineLock { pid: number; start: string | null; at: string }
 
 /** A durable drain request (`minions pause --starts --drain`): workers wind down to a checkpoint and return partial. */
 export interface DrainRequest { reason: string; requestedAt: string; eventId: number }
@@ -423,9 +431,23 @@ export class RuntimeDb {
     });
   }
 
-  addEvent(kind: string, taskId: string | null, data?: unknown): number {
+  /** `at`: the event time (default now; the routine pass passes its injected clock). */
+  addEvent(kind: string, taskId: string | null, data?: unknown, at?: string): number {
     return this.exec('INSERT INTO events (at, kind, task_id, data_json) VALUES (?, ?, ?, ?)',
-      nowIso(), kind, taskId, data === undefined ? null : JSON.stringify(data)).lastInsertRowid;
+      at ?? nowIso(), kind, taskId, data === undefined ? null : JSON.stringify(data)).lastInsertRowid;
+  }
+  /** The newest event of a kind (the routine pass reads its last run). */
+  lastEventOfKind(kind: string): { id: number; at: string; kind: string; data: unknown } | null {
+    const r = this.get<{ id: number; at: string; kind: string; data_json: string | null }>('SELECT * FROM events WHERE kind = ? ORDER BY id DESC LIMIT 1', kind);
+    if (!r) return null;
+    let data: unknown = null;
+    try { data = r.data_json ? JSON.parse(r.data_json) : null; } catch { data = null; }
+    return { id: r.id, at: r.at, kind: r.kind, data };
+  }
+  /** Events of a kind at or after `since` (ISO time), oldest first. */
+  eventsOfKindSince(kind: string, since: string): { id: number; at: string; taskId: string | null; data: unknown }[] {
+    return this.all<{ id: number; at: string; task_id: string | null; data_json: string | null }>('SELECT id, at, task_id, data_json FROM events WHERE kind = ? AND at >= ? ORDER BY id', kind, since)
+      .map((r) => { let data: unknown = null; try { data = r.data_json ? JSON.parse(r.data_json) : null; } catch { /* unreadable */ } return { id: r.id, at: r.at, taskId: r.task_id, data }; });
   }
   lastEventId(): number { return this.get<{ id: number | null }>('SELECT MAX(id) AS id FROM events')?.id ?? 0; }
   events(taskId: string, kind?: string): { id: number; at: string; kind: string; data: unknown }[] {
@@ -631,6 +653,35 @@ export class RuntimeDb {
       if (!reentrant) this.addEvent('coordinator-lock', null, { ...lock, replaced: cur ?? null });
       return lock;
     });
+  }
+  /**
+   * The routine pass lock (meta row `routine_lock`, {pid, start, at}): taken only when no live holder has it. A
+   * holder whose pid is gone, or whose recorded start time differs from the pid's current one (a reused pid), is
+   * taken over. Returns the lock taken, or null with the live holder left in place.
+   */
+  acquireRoutineLock(pid: number, start: string | null, alive: (l: RoutineLock) => boolean, now: Date = new Date()): RoutineLock | null {
+    return this.transaction(() => {
+      const raw = this.getMeta('routine_lock');
+      let cur: RoutineLock | null = null;
+      try { cur = raw ? JSON.parse(raw) as RoutineLock : null; } catch { cur = null; }
+      if (cur && !(cur.pid === pid && cur.start === start) && alive(cur)) return null;
+      const lock: RoutineLock = { pid, start, at: now.toISOString() };
+      this.setMeta('routine_lock', JSON.stringify(lock));
+      return lock;
+    });
+  }
+  releaseRoutineLock(lock: RoutineLock): boolean {
+    return this.transaction(() => {
+      const raw = this.getMeta('routine_lock');
+      let cur: RoutineLock | null = null;
+      try { cur = raw ? JSON.parse(raw) as RoutineLock : null; } catch { cur = null; }
+      if (!cur || cur.pid !== lock.pid || cur.at !== lock.at) return false;
+      this.deleteMeta('routine_lock');
+      return true;
+    });
+  }
+  routineLock(): RoutineLock | null {
+    try { const v = this.getMeta('routine_lock'); return v ? JSON.parse(v) as RoutineLock : null; } catch { return null; }
   }
   releaseCoordinatorLock(session: string, pid = process.pid): boolean {
     return this.transaction(() => {

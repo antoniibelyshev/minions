@@ -294,6 +294,8 @@ export interface CoordinatorBaseline {
   tokensPerOwnerMessage: number | null;
   /** Tokens recovered sessions spent before their first claim or Telegram reply. */
   resetOverhead: { recoveredSessions: number; tokens: number; perRecovery: number | null };
+  /** Sessions the routine pass started with the wake prompt (task-68.2) and their tokens (part of `tokens`). */
+  wakes: { sessions: number; tokens: number; perWake: number | null };
   /** Measured coordinator tokens / all tokens since `since` (0..1; null when nothing is counted). */
   share: number | null;
   /** API-key billing: USD with the components weighted (cache read 0.1x, cache write 1.25x, output 5x). */
@@ -323,10 +325,12 @@ export function coordinatorBaseline(ctx: { db: RuntimeDb; billing: Billing; fall
   const endedBy: Partial<Record<SessionEndTrigger, number>> = {};
   const resetTriggers: Record<string, number> = {};
   let turns = 0; let contextSum = 0; let maxContext = 0; let ownerMessages = 0; let recovered = 0; let overhead = 0; let usd = 0;
+  let woken = 0; let wakeTokens = 0;
   for (const s of states) {
     for (const k of COMPONENT_KEYS) components[k] += s.components[k];
     turns += s.turns; contextSum += s.contextSum; maxContext = Math.max(maxContext, s.maxContext); ownerMessages += s.ownerMessages;
     if (s.recovered) { recovered++; overhead += s.overhead; }
+    if (s.woken) { woken++; wakeTokens += totalOf(s.components); }
     if (s.ended) {
       endedBy[s.ended.trigger] = (endedBy[s.ended.trigger] ?? 0) + 1;
       if (s.ended.trigger === 'context-reset') for (const t of (s.ended.detail ?? 'requested').split(',')) resetTriggers[t] = (resetTriggers[t] ?? 0) + 1;
@@ -350,6 +354,7 @@ export function coordinatorBaseline(ctx: { db: RuntimeDb; billing: Billing; fall
     ownerMessages, deliveredTasks: delivered,
     tokensPerDeliveredTask: ratio(tokens, delivered), tokensPerOwnerMessage: ratio(tokens, ownerMessages),
     resetOverhead: { recoveredSessions: recovered, tokens: overhead, perRecovery: ratio(overhead, recovered) },
+    wakes: { sessions: woken, tokens: wakeTokens, perWake: ratio(wakeTokens, woken) },
     share,
     ...(ctx.billing === 'api-key' ? { estimatedUsd: Math.round(usd * 100) / 100, usdShare } : {}),
     model: [...states].reverse().find((s) => s.model)?.model ?? null,
@@ -500,6 +505,6 @@ export function humanBaseline(b: CoordinatorBaseline): string {
   return [
     `coordinator baseline since ${b.since}: ${b.sessions} session(s) (${b.open} open; ended: ${ended}${resets ? `; resets by trigger: ${resets}` : ''}), ${b.turns.total} turns (${b.turns.perSession ?? '-'}/session)`,
     `  context/turn mean ${k(b.contextPerTurn.mean)}, max ${k(b.contextPerTurn.max)}; tokens/delivered task ${k(b.tokensPerDeliveredTask)} (${b.deliveredTasks} delivered); tokens/owner message ${k(b.tokensPerOwnerMessage)} (${b.ownerMessages})`,
-    `  reset overhead ${k(b.resetOverhead.perRecovery)}/recovery (${b.resetOverhead.recoveredSessions} recovered); coordinator share ${pct(b.share)} of tokens${b.estimatedUsd !== undefined ? `, ~$${b.estimatedUsd.toFixed(2)} weighted est. (${pct(b.usdShare)} of USD)` : ''}`,
+    `  reset overhead ${k(b.resetOverhead.perRecovery)}/recovery (${b.resetOverhead.recoveredSessions} recovered); routine wakes ${b.wakes.sessions} (${k(b.wakes.perWake)}/wake); coordinator share ${pct(b.share)} of tokens${b.estimatedUsd !== undefined ? `, ~$${b.estimatedUsd.toFixed(2)} weighted est. (${pct(b.usdShare)} of USD)` : ''}`,
   ].join('\n');
 }
