@@ -179,7 +179,7 @@ export function ciSetupPlan(o: { hasWorkflows: boolean | null; requiredChecks: '
   }
   steps.push(`  ${n++}. Push it and open a pull request so the check reports at least once (its job name becomes the check name).`);
   steps.push(`  ${n++}. Mark the check required for ${o.baseBranch}: ${where} -> add a branch protection rule or ruleset with "Require status checks to pass" and select the check.`);
-  steps.push(`  ${n++}. Run \`minions doctor\`; when it reports the required checks, set delivery.requiredChecksConfigured to true.`);
+  steps.push(`  ${n++}. Run \`minions doctor\`; when it reports the required checks, run \`minions settings set delivery.requiredChecksConfigured true\`.`);
   steps.push('  Until then the project is usable for local work and pull-request delivery; automatic merge stays unavailable.');
   return steps;
 }

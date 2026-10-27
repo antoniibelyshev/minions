@@ -174,6 +174,7 @@ container is recreated, volumes kept). **fixed**: identity or derived; change it
 | `budgets.*` | restart | Prompt text only (not enforced in v0.1) |
 | `intake.github.*` | live | `minions sync` and coordinator startup read them per run |
 | `intake.scope.*`, `intake.sources` | live | Backlog readiness filter per call |
+| `delivery.requiredChecksConfigured` | live, **H** | The merge gate reads it on each `sync` / `publish` (not in the prompt); it gates what merges on GitHub (task-79). Most specific entry, so it overrides `delivery.*` below |
 | `communication.progress` | restart | Prompt text |
 | `models.default`, `allowed`, `selection`, `effortByRole` (workers) | restart | Agent definitions and prompt |
 | `models.coordinator`, `models.effort`, `effortByRole.coordinator` | restart | Coordinator `--model` / `--effort` |
