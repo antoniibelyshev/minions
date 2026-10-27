@@ -53,7 +53,7 @@ Call the Agent tool:
   <coordinator notes: context, the goal, where to look, pitfalls, what to preserve, how to verify (with exact environment workarounds), prior findings to focus on, parallel work to avoid>
   ```
 
-  Copy `briefMarker` exactly as the first line. The worker runs `minions work brief <leaseId> --role <role> --json` from its worktree (only the lease's own worker can). Keep notes focused: no full backlog, transcripts, or unrelated notes. Brief and staff as under Owner defaults.
+  Copy `briefMarker` exactly as the first line. The worker runs `minions work brief <leaseId> --role <role> --json` from its worktree (only the lease's own worker can). Keep notes focused: no full backlog, transcripts, or unrelated notes. Ask for tests of the important, user-visible or risky behaviour, not exhaustive small cases of low-importance helpers. Brief and staff as under Owner defaults.
 
 Older CLI fallback: if `--compact`, `work brief` or `--submitted` is rejected as an unknown option or command, claim without `--compact` and paste the brief in a ```json fence after the marker and worktree lines; in step 5, record by piping the worker's final JSON to `minions work record <leaseId> --json` on stdin.
 

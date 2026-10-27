@@ -21,6 +21,7 @@ describe('risk-based testing in the generated plugin', () => {
     const eng = await (await gen())('agents/engineer.md');
     expect(eng).toMatch(/Tests are your responsibility: add or update tests that prove each acceptance criterion/);
     expect(eng).toMatch(/edge cases/);
+    expect(eng).toMatch(/Focus on the important, user-visible or risky behaviour of the change; do not chase exhaustive small cases of low-importance helpers/);
     expect(eng).toMatch(/Run the verification commands/);
   });
 
@@ -29,6 +30,7 @@ describe('risk-based testing in the generated plugin', () => {
     expect(rev).toMatch(/You own test adequacy/);
     expect(rev).toMatch(/cover every acceptance criterion and the relevant edge cases/);
     expect(rev).toMatch(/Missing or weak tests are a reason to request changes/);
+    expect(rev).toMatch(/do not request changes only for missing tests of trivial or low-importance code/);
     expect(rev).toContain('"needsQa": true');
     expect(rev).toMatch(/moves to `testing` instead of being delivered/);
   });
@@ -42,6 +44,7 @@ describe('risk-based testing in the generated plugin', () => {
     expect(t).toMatch(/Do not commit/);
     expect(t).toMatch(/finding that can become a backlog task: `task: <title>/);
     expect(t).toContain('## Task QA (`kind: "task"`)');
+    expect(t).toMatch(/for the important, user-visible or risky behaviour; do not chase exhaustive small cases of low-importance helpers/);
     expect(t).not.toMatch(/You run after the engineer and before review/);
   });
 
@@ -51,6 +54,7 @@ describe('risk-based testing in the generated plugin', () => {
     expect(coord).toContain('## Testing');
     expect(coord).toMatch(/Stage order per task: engineer → tester \(only when QA is required, see Testing\) → reviewer → delivered/);
     expect(coord).toMatch(/by default a task goes engineer → reviewer/);
+    expect(coord).toMatch(/In worker briefs, ask for tests of the important, user-visible or risky behaviour of a change, not exhaustive small cases of low-importance helpers/);
     expect(coord).toMatch(/QA label \(`qa`\), its branch touches sensitive paths, or the reviewer sets `"needsQa": true`/);
     expect(coord).toMatch(/QA sweeps test `main` itself, not a ticket branch/);
     expect(coord).toMatch(/at a milestone, before a release, after about five merges since the last sweep, or when the user asks/);
@@ -61,6 +65,7 @@ describe('risk-based testing in the generated plugin', () => {
     const orch = await (await gen())('skills/orchestrate/SKILL.md');
     expect(orch).toMatch(/labelled `qa-sweep` → tester \(QA sweep against `main`/);
     expect(orch).toMatch(/engineer `complete` → reviewer \(`reviewing`\), or tester \(`testing`\) when the task needs QA/);
+    expect(orch).toMatch(/Ask for tests of the important, user-visible or risky behaviour, not exhaustive small cases of low-importance helpers/);
   });
 
   it('testerRequired: true and custom QA labels are reflected', async () => {
@@ -68,6 +73,7 @@ describe('risk-based testing in the generated plugin', () => {
     const coord = await (await gen({ ...base, verification: { ...base.verification, testerRequired: true, qaLabels: ['needs-qa'] } }))('coordinator.md');
     expect(coord).toMatch(/Stage order per task: engineer → tester → reviewer → delivered/);
     expect(coord).toMatch(/`verification.testerRequired` is on: every task gets a tester stage/);
+    expect(coord).toMatch(/In worker briefs, ask for tests of the important/);
     expect(coord).toContain('QA label (`needs-qa`)');
     expect(coord).toContain('`minions backlog update <taskId> --expected-version <v> --label needs-qa` (`<v>`: the `version` from `minions backlog show <taskId> --json`;');
   });
