@@ -52,7 +52,7 @@ describe('process-harness dispatch guidance', () => {
     expect(orch).toMatch(/Invalid result \(`valid: false`\): there is no live worker to correct/);
     expect(orch).toMatch(/never start `work run` again for the same lease/);
     expect(orch).toMatch(/Stop a running process worker only with `minions work release <leaseId>/);
-    expect(orch).toMatch(/A process-harness run \(`launch.kind: "run"`\) records its own usage: record it without `--usage`\./);
+    expect(orch).toMatch(/A process-harness run \(`launch.kind: "run"`\) records its own usage: advance or record it without `--usage`\./);
     expect(orch).toMatch(/record it as usual\.\n\nIndependent tasks may run in parallel/);
     // No Claude agent definition for the process role (unchanged from task-14.2).
     await expect(read('agents/codex-reviewer.md')).rejects.toThrow();
