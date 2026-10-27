@@ -242,6 +242,16 @@ Decision record for `delivery.mode` `branch` / `pull-request` (`src/runtime/publ
   only https for network operations), but repository-level `url.<x>.insteadOf` rewrites from one
   https URL to another still apply. Neither source is trusted to *remove* a path: each base can only
   add paths to the union, which is why the union stays safe when one of them is forged.
+- **Decision (task-71): gate reads ignore history rewrites.** The object database and git dir are
+  agent-writable too: `git replace <head> <commit with the base's tree>` (or a graft giving the base the
+  head as parent) made the sensitive-path diff empty. Every local git read whose answer decides a gate
+  (the `rev-parse`/`merge-base`/`diff` of `gateChangedPaths`, shared by publication and the merge gate;
+  the scheduler's QA-requirement and edit-scope diffs and its verifier ancestry check; the ref -> commit
+  reads of `resolveBaseBranch`/`headOf`) runs through `gateGit` (`src/runtime/git-hardening.ts`) in both
+  runtimes: `GIT_NO_REPLACE_OBJECTS=1`, `core.useReplaceRefs=false`, `GIT_GRAFT_FILE=/dev/null`,
+  `GIT_SHALLOW_FILE=/dev/null`, `core.commitGraph=false`, and the allowlisted environment of
+  `allowlistedGitEnv` (no inherited `GIT_*`, no global or system config, HOME that does not exist).
+  Network reads (`ls-remote`) keep the workspace git.
 - **Decision (task-40): main merged into a branch after the claim is still over-reported.** When main
   moves on after a task's first claim and the branch merges it, the diff against the earliest recorded
   base also lists main's own changes, so sensitive paths main changed ask for approval again. Fixing
