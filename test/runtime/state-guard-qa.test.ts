@@ -131,3 +131,36 @@ describe('state guard QA: submit-heredoc allowlist variants (attempt 3)', () => 
     ]) expect(denied(preBashHook(bash(cmd), container)), cmd).toBe(true);
   });
 });
+
+describe('state guard QA: submit-heredoc allowlist, more one-call variants (attempt 4)', () => {
+  const body = '{"findings":["/state/minions.db"]}';
+  const sql = 'sqlite3 /state/minions.db .tables';
+  const head = 'minions work submit lease-1 --role tester --json';
+
+  // A quoted delimiter ends the body only at a line exactly equal to it; bash keeps `RESULT\r`, `RESULT\v` and a
+  // trailing-space line in the body (checked with bash and a harmless `echo` payload), so these stay data.
+  it('lines that only resemble the terminator (CR, VT) stay body', () => {
+    for (const cmd of [
+      `${head} <<'RESULT'\n${body}\nRESULT\r\nnot a command /state\nRESULT`,
+      `${head} <<'RESULT'\n${body}\nRESULT\u000b\nnot a command /state\nRESULT`,
+    ]) expect(denied(preBashHook(bash(cmd), container)), JSON.stringify(cmd)).toBe(false);
+  });
+
+  it('CRLF, odd quoting and substitutions in the head get the full check', () => {
+    for (const cmd of [
+      `${head} <<'RESULT'\r\n${sql}\r\nRESULT\r\n`,
+      `${head} <<'RESULT"\n${body}\nRESULT`,
+      `${head} <<R'ESULT'\n${body}\nRESULT`,
+      "minions work submit `id` --json <<'RESULT'\n" + sql + '\nRESULT',
+      `minions work submit x;sh <<'RESULT'\n${sql}\nRESULT`,
+      `${head} <<'RESULT' && sh <<'X'\n${body}\nRESULT\n${sql}\nX`,
+    ]) expect(denied(preBashHook(bash(cmd), container)), JSON.stringify(cmd)).toBe(true);
+  });
+
+  it('the deny for `cd <worktree> && submit <<heredoc` names the scratch-file route, and that route is allowed', () => {
+    const out = preBashHook(bash(`cd ${cwd} && ${head} <<'RESULT'\n${body}\nRESULT`), container);
+    expect(denied(out)).toBe(true);
+    expect(JSON.parse(out.stdout!).hookSpecificOutput.permissionDecisionReason).toContain('--json < <file>');
+    expect(denied(preBashHook(bash(`cd ${cwd} && ${head} < /home/node/.cache/tmp/leases/l/result.json`), container))).toBe(false);
+  });
+});
