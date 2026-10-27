@@ -783,3 +783,29 @@ describe('owner behaviour defaults (task-34)', () => {
     expect(status).toContain('`spend.budget`');
   });
 });
+
+describe('own ideas rule (task-68.6): auto-promotion caps in the coordinator policy', () => {
+  it('states the caps from config, the refusal handling, the override and the digest veto', async () => {
+    const coord = await (await gen()).read('coordinator.md');
+    const policy = coord.slice(coord.indexOf('## Project policy'), coord.indexOf('## Owner defaults'));
+    expect(policy).toContain('**Own ideas.**');
+    expect(policy).toMatch(/beyond 3 a day, at 80% budget or more, when the owner has been silent for more than 3 days, or when its parent is labelled `needs-owner`/);
+    expect(policy).toMatch(/On a refusal leave the task as `idea` and put it to the owner as a digest question; never change its provenance or labels/);
+    expect(policy).toContain('`--owner-approved`');
+    expect(policy).toMatch(/"cancel <id>" set it `cancelled`, "hold <id>" set it back to `idea`/);
+    expect(coord).not.toContain('{{ownIdeasRule}}');
+  });
+
+  it('follows the configured caps, and says auto-promotion is off at perDay 0', async () => {
+    const c = defaults(); c.routine = { autoPromote: { perDay: 1, maxBudgetPercent: 50, ownerSilentDays: 7 } };
+    expect(await (await gen(c)).read('coordinator.md')).toMatch(/beyond 1 a day, at 50% budget or more, when the owner has been silent for more than 7 days/);
+    const off = defaults(); off.routine = { autoPromote: { perDay: 0 } };
+    expect(await (await gen(off)).read('coordinator.md')).toContain('Auto-promotion is off in this project');
+  });
+
+  it('the intake skill mentions the caps and readyLabels', async () => {
+    const intake = await (await gen()).read('skills/intake/SKILL.md');
+    expect(intake).toMatch(/moving one to `ready` is an auto-promotion that the runtime caps/);
+    expect(intake).toContain('`intake.github.readyLabels`');
+  });
+});

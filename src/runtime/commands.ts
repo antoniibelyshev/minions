@@ -1,7 +1,8 @@
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { Option, type Command } from 'commander';
-import { setIdempotencyStore, setIntakePausedContext, setProvenanceFallback, setReadyContext } from '../backlog/commands.js';
+import { setIdempotencyStore, setIntakePausedContext, setPromotionGuard, setProvenanceFallback, setReadyContext } from '../backlog/commands.js';
+import { checkPromotion } from './auto-promote.js';
 import { openBacklog, writeBacklogConfig } from '../backlog/factory.js';
 import type { BacklogAdapter, IdempotencyStore } from '../backlog/types.js';
 import { validateConfig } from '../config/resolve.js';
@@ -526,6 +527,11 @@ export function register(program: Command): void {
     });
     setIntakePausedContext(() => getDb().paused().intake);
     setProvenanceFallback(intakeProvenanceFallback(getDb));
+    // Auto-promotion caps (task-68.6): a budget read error refuses the change (fail closed).
+    setPromotionGuard(async (c, getTask) => {
+      const d = getDb(); const cfg = await getConfig();
+      return checkPromotion(c, { db: d, config: cfg, getTask, budgetPercent: () => currentBudget({ db: d, config: cfg })?.percent ?? null });
+    });
   }
 
   // work

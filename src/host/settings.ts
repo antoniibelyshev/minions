@@ -32,6 +32,7 @@ import { EFFORTS, type CapabilityRule, type MinionsConfig } from '../config/sche
 import { classifyKey, type SettingClass } from '../config/setting-classes.js';
 import { MinionsError } from '../core/errors.js';
 import { usdPerMTok } from '../runtime/spend.js';
+import { AUTO_PROMOTE_DEFAULTS } from '../runtime/auto-promote.js';
 import { atomicWrite, readJsonIfExists } from '../core/fsutil.js';
 import { projectPaths } from '../core/paths.js';
 import { editProjectConfig, revisionConflict } from './config-write.js';
@@ -86,6 +87,11 @@ const RESTART_WHY: Record<SettingApply, string> = {
 };
 
 const more = (what: string) => (from: Value, to: Value) => (typeof from === 'number' && typeof to === 'number' && to > from ? `${what} (${from} -> ${to})` : null);
+/** A number above its previous value (unset = `def`) loosens. */
+const moreThanDefault = (def: number, what: string) => (from: Value, to: Value) => {
+  const f = typeof from === 'number' ? from : def; const t = typeof to === 'number' ? to : def;
+  return t > f ? `${what} (${f} -> ${t})` : null;
+};
 const turnsOff = (what: string) => (from: Value, to: Value) => (from === true && to === false ? what : null);
 const turnsOn = (what: string) => (from: Value, to: Value) => (from !== true && to === true ? what : null);
 const price = (m: Value) => (typeof m === 'string' ? usdPerMTok(m) : null);
@@ -212,6 +218,23 @@ const DECLARED: readonly DeclaredSetting[] = [
     loosens: (f, t) => (Array.isArray(t) && t.length > (Array.isArray(f) ? f.length : 1) ? `more digests a day (${t.length}: one coordinator wake each)` : null) },
   { key: 'routine.timezone', group: 'Policy', label: 'Routine time zone', type: 'text', optional: true, apply: 'live',
     description: 'IANA time zone of the digest times and the routine\'s days (default Europe/Berlin)' },
+  // Phase 5 (task-68.6): caps on the coordinator promoting its own ideas, and GitHub labels that import ready. Host-owned.
+  { key: 'routine.autoPromote.perDay', group: 'Policy', label: 'Own ideas promoted per day', type: 'int', min: 0, optional: true, apply: 'live',
+    description: 'the coordinator may move at most this many of its own ideas (agent-hypothesis) to ready per day; each is listed in the digest (default 3; 0 = never)',
+    loosens: moreThanDefault(AUTO_PROMOTE_DEFAULTS.perDay, 'more of the coordinator\'s own ideas may start per day without you') },
+  { key: 'routine.autoPromote.maxBudgetPercent', group: 'Policy', label: 'Promotion budget limit (%)', type: 'int', min: 0, optional: true, apply: 'live',
+    description: 'no auto-promotion while the budget is at or above this percent (default 80; 0 to 100)',
+    loosens: moreThanDefault(AUTO_PROMOTE_DEFAULTS.maxBudgetPercent, 'the coordinator\'s own ideas may start closer to the budget limit') },
+  { key: 'routine.autoPromote.ownerSilentDays', group: 'Policy', label: 'Promotion stops after silent days', type: 'int', min: 1, optional: true, apply: 'live',
+    description: 'no auto-promotion when your last message is older than this many days (default 3)',
+    loosens: moreThanDefault(AUTO_PROMOTE_DEFAULTS.ownerSilentDays, 'the coordinator\'s own ideas keep starting longer while you are away') },
+  { key: 'intake.github.readyLabels', group: 'Policy', label: 'GitHub labels that import ready', type: 'list', optional: true, apply: 'live',
+    description: 'an imported issue carrying every one of these labels (comma-separated) is created ready instead of idea (needs intake.github; default none)',
+    loosens: (f, t) => {
+      const to = Array.isArray(t) ? (t as string[]) : [];
+      const from = Array.isArray(f) ? (f as string[]) : [];
+      return to.length && (!from.length || !from.every((l) => to.includes(l))) ? `GitHub issues labelled ${to.join(' + ')} are imported ready (they start without you)` : null;
+    } },
   { key: 'coordinator.disallowedTools', group: 'Policy', label: 'Coordinator tool trim', type: 'list', optional: true, apply: 'launch',
     description: 'Claude Code tools removed from the coordinator session (default: the built-in trim; none: keep every tool; tools it needs cannot be listed)',
     loosens: (f, t) => {

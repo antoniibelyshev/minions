@@ -30,6 +30,17 @@ export function setIntakePausedContext(fn: () => boolean | Promise<boolean>): vo
 /** Runtime installs this at startup: intake-tracked tasks without a usable meta provenance read as external-requirement. */
 export function setProvenanceFallback(fn: ProvenanceFallback | undefined): void { provenanceFallback = fn; }
 
+/** A status change into `ready` the promotion guard checks (taskId null: `backlog create`). */
+export interface PromotionCheck {
+  taskId: string | null; provenance: Provenance; from: TaskStatus | null; to: TaskStatus;
+  labels: string[]; parent: string | null; ownerApproved: boolean;
+}
+/** Throws to refuse; returns a ticket to commit once the change landed, or null when no cap applies. */
+export type PromotionGuard = (c: PromotionCheck, getTask: (id: string) => Promise<Task>) => Promise<{ commit: (taskId: string) => void } | null>;
+let promotionGuard: PromotionGuard = async () => null;
+/** Runtime installs this at startup: the auto-promotion caps (src/runtime/auto-promote.ts). */
+export function setPromotionGuard(fn: PromotionGuard): void { promotionGuard = fn; }
+
 // ---------------------------------------------------------------- config + adapter
 
 /** Reads the effective config: env MINIONS_CONFIG, default /opt/minions/config/config.json. */
@@ -63,6 +74,7 @@ function oneOf<T extends string>(name: string, v: string | undefined, allowed: r
 }
 
 const collect = (v: string, prev: string[] = []) => [...prev, v];
+const OWNER_APPROVED_HELP = 'the owner asked for this task just now: moving an agent-hypothesis task to ready skips the auto-promotion caps (needs an owner message in the last 30 minutes, or the terminal channel)';
 
 /**
  * --workflow: a named workflow from config (docs/design/roles-and-workflows.md D5). Only configured names
@@ -176,9 +188,10 @@ export function register(program: Command): void {
     .option('--status <status>', 'initial status (default idea)')
     .option('--provenance <p>', PROVENANCES.join(' | '))
     .option('--workflow <name>', 'named workflow from config (default: the default workflow)')
+    .option('--owner-approved', OWNER_APPROVED_HELP)
     .requiredOption('--key <idempotencyKey>', 'idempotency key; repeating it returns the existing task')
     .action(action(async (o: { title: string; description?: string; descriptionFile?: string; ac?: string[]; priority?: string;
-      dep?: string[]; parent?: string; label?: string[]; status?: string; provenance?: string; workflow?: string; key: string }, cmd: Command) => {
+      dep?: string[]; parent?: string; label?: string[]; status?: string; provenance?: string; workflow?: string; key: string; ownerApproved?: boolean }, cmd: Command) => {
       requireMode('runtime');
       if (o.description !== undefined && o.descriptionFile !== undefined) throw new MinionsError('PRECONDITION', 'Use --description or --description-file, not both');
       const description = o.descriptionFile !== undefined ? await readTextFile(o.descriptionFile) : o.description;
@@ -189,7 +202,13 @@ export function register(program: Command): void {
       };
       assertIntakeOpen(input, await intakePaused());
       const { cfg, backlog } = await open();
-      const r = await backlog.createTask({ ...input, ...(o.workflow !== undefined ? { workflow: checkWorkflowName(cfg, o.workflow) } : {}) });
+      const workflow = o.workflow !== undefined ? { workflow: checkWorkflowName(cfg, o.workflow) } : {};
+      // A new agent idea created ready is an auto-promotion (the caps apply); an existing key creates nothing.
+      const ticket = input.status === 'ready' && !idempotencyStore.get(o.key)
+        ? await promotionGuard({ taskId: null, provenance: input.provenance ?? 'user-decision', from: null, to: 'ready', labels: input.labels ?? [], parent: input.parent ?? null, ownerApproved: !!o.ownerApproved }, (tid) => backlog.getTask(tid))
+        : null;
+      const r = await backlog.createTask({ ...input, ...workflow });
+      if (ticket && r.created) ticket.commit(r.task.id);
       emit(r, { json: globalOpts(cmd).json, human: (d) => `${d.created ? 'Created' : 'Exists'} ${d.task.id}: ${d.task.title}` });
     }));
 
@@ -202,8 +221,9 @@ export function register(program: Command): void {
     .option('--description-file <file>', 'replace the description from a file ("-" = stdin)')
     .option('--branch <branch>', 'record the task branch')
     .option('--workflow <name>', 'assign a named workflow from config (only between stages)')
+    .option('--owner-approved', OWNER_APPROVED_HELP)
     .action(action(async (id: string, o: { expectedVersion: string; status?: string; title?: string; priority?: string;
-      label?: string[]; descriptionFile?: string; branch?: string; workflow?: string }, cmd: Command) => {
+      label?: string[]; descriptionFile?: string; branch?: string; workflow?: string; ownerApproved?: boolean }, cmd: Command) => {
       requireMode('runtime');
       const patch: Parameters<BacklogAdapter['updateTask']>[2] = {};
       const status = oneOf<TaskStatus>('status', o.status, TASK_STATUSES);
@@ -223,7 +243,15 @@ export function register(program: Command): void {
           throw new MinionsError('CONFLICT', `Task ${task.id} has an active stage; change its workflow between stages.`, 'Wait for the running stage to be recorded or released.');
         }
       }
+      let ticket: Awaited<ReturnType<PromotionGuard>> = null;
+      if (status === 'ready') {
+        // An agent idea moved to ready is an auto-promotion: the runtime caps refuse it before anything is written.
+        const cur = await backlog.getTask(id);
+        ticket = await promotionGuard({ taskId: cur.id, provenance: cur.provenance, from: cur.status, to: 'ready',
+          labels: [...new Set([...cur.labels, ...(o.label ?? [])])], parent: cur.parent, ownerApproved: !!o.ownerApproved }, (tid) => backlog.getTask(tid));
+      }
       const t = await backlog.updateTask(id, o.expectedVersion, patch);
+      ticket?.commit(t.id);
       emit(t, { json: globalOpts(cmd).json, human: (d) => `Updated ${d.id} (version ${d.version.slice(0, 12)})` });
     }));
 
