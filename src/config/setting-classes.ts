@@ -42,6 +42,9 @@ export const KEY_CLASSES: readonly KeyClass[] = [
   ...entries(['intake.scope', 'intake.sources'], 'live', false, 'backlog readiness filter per call'),
   ...entries(['routine'], 'live', false, 'read by each routine pass (`minions sync --routine`) and the wrapper clock'),
   ...entries(['routine.enabled'], 'live', true, 'lets the runtime start coordinator sessions on its own (wakes, crash starts: model spend)'),
+  // ---- live, host-owned
+  ...entries(['delivery.requiredChecksConfigured'], 'live', true,
+    'the merge gate (autoMergeConfigReasons) reads it on each sync / publish; it gates what merges on GitHub'),
   // ---- restart
   ...entries(['execution.attemptMaxTurns'], 'restart', false, 'written into the agent definitions (plugin)'),
   ...entries(['budgets'], 'restart', false, 'prompt text only (not enforced in v0.1)'),

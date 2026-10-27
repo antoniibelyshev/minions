@@ -218,7 +218,7 @@ export function preTelegramHook(input: unknown): HookOutput {
 export const PRE_BASH_HOOK_COMMAND = `i=$(cat) || exit 2; case "$i" in *'"agent_id"'*) printf '%s' "$i" | grep -Eq 'minions[^:]|cli\\.[cm]?js'; m=$?; [ "$m" = 1 ] && exit 0; [ "$m" = 0 ] || exit 2; printf '%s' "$i" | timeout 20 minions hook pre-bash || exit 2;; esac`;
 
 /** The verbs a Claude subagent must never run: they start, claim or end worker leases (coordinator-only). */
-export const COORDINATOR_ONLY_WORK_VERBS = ['run', 'claim', 'release'] as const;
+export const COORDINATOR_ONLY_WORK_VERBS = ['run', 'claim', 'advance', 'release'] as const;
 
 /** A program word that runs the minions CLI: `minions` (any path) or its entry script (`…/dist/cli.js`). */
 const MINIONS_ENTRY = /^(minions|cli\.[cm]?js)$/;
@@ -334,7 +334,7 @@ function scriptHit(script: string, depth: number): string | null {
 }
 
 /**
- * The first `minions work run|claim|release` a Bash command line would run, or null (task-14.5). The line is
+ * The first `minions work run|claim|advance|release` a Bash command line would run, or null (task-14.5). The line is
  * scanned into simple commands (src/runtime/shell-scan.ts: quotes, continuations, separators, redirections,
  * heredoc bodies, substitutions); a command matches when, after assignments, its command word runs minions
  * (`minions` by any path, or `…/cli.js`), or a wrapper (env, sudo, timeout, xargs, node, …) has such a word
@@ -352,7 +352,7 @@ export function coordinatorOnlyWorkCommand(command: string): string | null {
 
 /**
  * PreToolUse(Bash): a Claude subagent (`agent_id` set to anything but undefined/null, as for pre-telegram) may not
- * run `minions work run|claim|release`: only the coordinator starts, claims and releases workers. The coordinator's
+ * run `minions work run|claim|advance|release`: only the coordinator starts, claims and releases workers. The coordinator's
  * own calls (no agent_id) are allowed. Fails closed on input it cannot decide: non-object input, another tool or a
  * missing command are denied.
  */

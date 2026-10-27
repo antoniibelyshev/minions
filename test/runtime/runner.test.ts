@@ -210,6 +210,75 @@ describe('work run: supervise, cancel, timeout, drain', () => {
     expect(submitted(r, b)).toMatchObject({ status: 'partial', headSha: out.wipCommit });
   });
 
+  it('task-14.14: a stop sends SIGINT first, SIGTERM after the interrupt grace, then SIGKILL', async () => {
+    const r = rig();
+    const b = await claim(r);
+    const log = join(r.root, 'signals.log');
+    const out = await runLease(b.leaseId, r.deps({ steps: [{ op: 'logSignals', path: log }, { op: 'sleep', ms: 30_000 }] },
+      { timing: { timeoutMs: 300, pollMs: 50, killGraceMs: 300, interruptGraceMs: 250, drainGraceMs: 100 } }));
+    expect(out).toMatchObject({ status: 'partial', exit: { stopped: 'timeout', signal: 'SIGKILL' } });
+    const lines = readFileSync(log, 'utf8').trim().split('\n').map((l) => l.split(' '));
+    expect(lines.map(([sig]) => sig)).toEqual(['SIGINT', 'SIGTERM']);
+    expect(Number(lines[1]![1]) - Number(lines[0]![1])).toBeGreaterThanOrEqual(200);
+  });
+
+  it('task-14.14: a worker that stops on SIGINT gets nothing more; the interrupt grace never exceeds the kill grace', async () => {
+    const r = rig();
+    const b = await claim(r);
+    const started = Date.now();
+    const out = await runLease(b.leaseId, r.deps({ steps: [{ op: 'sleep', ms: 30_000 }] },
+      { timing: { timeoutMs: 300, pollMs: 50, killGraceMs: 300, interruptGraceMs: 60_000, drainGraceMs: 100 } }));
+    expect(out).toMatchObject({ status: 'partial', exit: { stopped: 'timeout', signal: 'SIGINT' } });
+    expect(Date.now() - started).toBeLessThan(20_000);
+
+    await r.sched.release(b.leaseId, 'next');
+    const b2 = await claim(r);
+    const log = join(r.root, 'signals2.log');
+    const out2 = await runLease(b2.leaseId, r.deps({ steps: [{ op: 'logSignals', path: log }, { op: 'sleep', ms: 30_000 }] },
+      { timing: { timeoutMs: 300, pollMs: 50, killGraceMs: 300, interruptGraceMs: 60_000, drainGraceMs: 100 } }));
+    expect(out2).toMatchObject({ exit: { stopped: 'timeout', signal: 'SIGKILL' } });
+    expect(readFileSync(log, 'utf8').trim().split('\n').map((l) => l.split(' ')[0])).toEqual(['SIGINT', 'SIGTERM']);
+  });
+
+  it('task-14.14 (QA): the SIGINT goes to the whole process group, so a member reached through a wrapper gets it first', async () => {
+    const r = rig();
+    const b = await claim(r);
+    const log = join(r.root, 'member-signals.log');
+    // The leader ignores both graceful signals (as minions-sandbox ignores SIGINT); only the group member logs them.
+    const out = await runLease(b.leaseId, r.deps({ steps: [{ op: 'groupChildLogSignals', path: log }, { op: 'ignoreTerm' }, { op: 'sleep', ms: 30_000 }] },
+      { timing: { timeoutMs: 400, pollMs: 50, killGraceMs: 300, interruptGraceMs: 200, drainGraceMs: 100 } }));
+    expect(out).toMatchObject({ status: 'partial', exit: { stopped: 'timeout', signal: 'SIGKILL' } });
+    expect(readFileSync(log, 'utf8').trim().split('\n')).toEqual(['SIGINT', 'SIGTERM']);
+  });
+
+  it('task-14.14 (QA): a cancel (lease released) stops the worker SIGINT-first too', async () => {
+    const r = rig();
+    const b = await claim(r);
+    const log = join(r.root, 'cancel-signals.log');
+    const { p } = await running(r, b, [{ op: 'logSignals', path: log }, { op: 'sleep', ms: 30_000 }]);
+    await r.sched.release(b.leaseId, 'owner cancel');
+    const out = await p;
+    expect(out).toMatchObject({ submitted: false, exit: { stopped: 'lease-ended', signal: 'SIGKILL' } });
+    expect(readFileSync(log, 'utf8').trim().split('\n').map((l) => l.split(' ')[0])).toEqual(['SIGINT', 'SIGTERM']);
+  });
+
+  it('task-14.14 (QA): a result file is redacted too, including a spawn secret that needs JSON escaping', async () => {
+    const r = rig();
+    const b = await claim(r);
+    mkdirSync(r.paths.secretsDir, { recursive: true });
+    const odd = 'odd"shaped\\secret-7f3a';
+    writeFileSync(join(r.paths.secretsDir, 'fake-key'), odd + '\n');
+    const gh = 'ghp_abcdefghijklmnopqrstuvwxyz0123456789';
+    const scenario = { steps: [{ op: 'result', result: { findings: [`env FAKE_API_KEY=${odd}`, `saw ${gh}`] } }] };
+    const out = await runLease(b.leaseId, r.deps(scenario, { adapters: { codex: fakeAdapter({ script: SCRIPT, scenario, secretEnv: { FAKE_API_KEY: 'fake-key' } }) } }));
+    expect(out).toMatchObject({ submitted: true, status: 'complete' });
+    const raw = readFileSync(submissionPath(r.paths, b.leaseId), 'utf8');
+    for (const s of [odd, JSON.stringify(odd).slice(1, -1), gh]) expect(raw).not.toContain(s);
+    const findings = submitted(r, b).findings;
+    expect(findings[0]).toBe('env FAKE_API_KEY=[REDACTED]');
+    expect(findings[1]).toMatch(/^saw /);
+  });
+
   it('drain: after the grace the worker is stopped with a wip: commit and a partial result', async () => {
     const r = rig();
     const b = await claim(r);

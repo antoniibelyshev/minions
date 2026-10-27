@@ -4,13 +4,14 @@ import { Option, type Command } from 'commander';
 import { action, globalOpts, requireMode } from '../core/cli-helpers.js';
 import { MinionsError } from '../core/errors.js';
 import { parseWith } from '../core/fsutil.js';
-import { emit } from '../core/output.js';
+import { emit, redact } from '../core/output.js';
 import { CONTAINER, defaultsPath, projectPaths } from '../core/paths.js';
 import {
   API_KEY_HELPER, ClaudeAuthSchema, PRESETS, PRESET_NAMES, authOf, checkUrl, ensureSecretsDir, isKeyAuth, loadAuthState,
   loadDefaults, parseEnvPairs, refreshKey, removeKeyFile, resolveOnPath, saveDefaults, secretStatus, summarize,
   type AuthState, type AuthSummary, type ClaudeAuth, type Runner, type SecretStatus,
 } from './auth.js';
+import { codexCredentialStatus, type CredentialStatus } from './credentials.js';
 import { projectJsonBytes, refreshDerived, writeGenerated } from './install.js';
 import { loadEffectiveConfig, loadProjectJson } from './project.js';
 import { projectForPath } from './registry.js';
@@ -187,12 +188,14 @@ export interface AuthShowResult {
   secret: SecretStatus | null;
   state: AuthState | null;
   globalDefault: AuthSummary | null;
+  /** The project's OpenAI API key for Codex process workers (presence, format, file mode; never the key). Null for --global. */
+  codex: CredentialStatus | null;
 }
 
 export async function runAuthShow(o: { global?: boolean }, deps: AuthDeps): Promise<AuthShowResult> {
   const defaults = await loadDefaults();
   if (o.global) {
-    return { scope: 'global', projectId: null, explicit: !!defaults.claudeAuth, auth: summarize(defaults.claudeAuth ?? { method: 'login' }), secret: null, state: null, globalDefault: null };
+    return { scope: 'global', projectId: null, explicit: !!defaults.claudeAuth, auth: summarize(defaults.claudeAuth ?? { method: 'login' }), secret: null, state: null, globalDefault: null, codex: null };
   }
   const { projectId } = await projectForPath(deps.cwd);
   const project = await loadProjectJson(projectId);
@@ -203,6 +206,8 @@ export async function runAuthShow(o: { global?: boolean }, deps: AuthDeps): Prom
     secret: isKeyAuth(a) ? await secretStatus(projectId) : null,
     state: isKeyAuth(a) ? await loadAuthState(projectId) : null,
     globalDefault: defaults.claudeAuth ? summarize(defaults.claudeAuth) : null,
+    codex: await codexCredentialStatus(projectId, { runner: deps.runner })
+      .catch((e): CredentialStatus => ({ state: 'invalid', detail: `could not check (${redact(String((e as Error).message ?? e)).split('\n')[0]})` })),
   };
 }
 
@@ -215,6 +220,7 @@ export function formatAuthShow(r: AuthShowResult): string {
   if (r.secret) L.push(`  secret file: ${r.secret.present ? `present (mode ${r.secret.mode}), last refreshed ${r.secret.updatedAt}` : 'missing — run `minions auth refresh` or `minions start`'}`);
   if (r.state?.lastError) L.push(`  last refresh error (${r.state.lastAttemptAt}): ${r.state.lastError}`);
   if (r.globalDefault) L.push(`  global default: ${r.globalDefault.method}${r.globalDefault.preset ? ` (${r.globalDefault.preset})` : ''}`);
+  if (r.codex) L.push(`OpenAI API key (Codex): ${r.codex.state} — ${r.codex.detail}${r.codex.state === 'ok' ? '' : ' (set it with `minions auth codex`)'}`);
   return L.join('\n');
 }
 

@@ -16,6 +16,7 @@ import { managerBotClash } from './bot-guard.js';
 import { loadManagerAccess } from './manager-bot.js';
 import { serviceHost } from './manager-service.js';
 import { managerOverview, managerServiceChecks } from './manager-status.js';
+import { assistantCheck, type CapabilityCheck } from './manager-assistant.js';
 import { clearStaleSecrets, managerCredentialStatus, secretCopiesExist, githubCredentialStatus, readGithubToken, githubRepoFromRemote, telegramCredentialStatus, type CredentialStatus, type Fetch, type TelegramCredentialStatus } from './credentials.js';
 import { dockerProbe, type DockerProbe, type DockerStatus } from './discovery.js';
 import { composeHint, daemonHint, linuxDockerChecks, linuxHostFacts, unknownLinuxFacts, type LinuxHostFacts } from './linux-host.js';
@@ -252,12 +253,12 @@ export function requiredChecksReadiness(
     const detail = `required checks on ${base}: ${rc.requiredChecks.join(', ')}; delivery.requiredChecksConfigured ${flag}`;
     return flag
       ? { name, status: 'ok', detail: `${detail}; automatic merge can use them (delivery.merge "auto-when-eligible", see merge.readiness)` }
-      : { name, status: 'ok', detail, hint: 'Set delivery.requiredChecksConfigured to true to record that these checks gate merging.' };
+      : { name, status: 'ok', detail, hint: 'Run `minions settings set delivery.requiredChecksConfigured true` to record that these checks gate merging.' };
   }
   const plan = ciSetupPlan({ hasWorkflows: workflows === null ? null : workflows > 0, requiredChecks: rc.state, verificationCommands: config.verification.commands, baseBranch: base, repository: rc.repository });
   const hint = plan.join('\n       ');
   const what = `no required status checks on ${base}${workflows === 0 ? ' and no CI workflows' : workflows ? ` (${workflows} workflow(s), none required)` : ''}`;
-  if (flag) return { name, status: 'warn', detail: `${what}, but delivery.requiredChecksConfigured is true (never treated as zero required checks); ${noMerge}`, hint: `Set delivery.requiredChecksConfigured to false, or configure required checks:\n       ${hint}` };
+  if (flag) return { name, status: 'warn', detail: `${what}, but delivery.requiredChecksConfigured is true (never treated as zero required checks); ${noMerge}`, hint: `Run \`minions settings set delivery.requiredChecksConfigured false\`, or configure required checks:\n       ${hint}` };
   return { name, status: 'unavailable', detail: `${what}: ${noMerge}`, hint };
 }
 
@@ -551,8 +552,20 @@ export async function managerSupervisorChecks(opts: { runner?: Runner; platform?
   }
 }
 
+/**
+ * manager.assistant: the manager's natural-language assistant (src/host/manager-assistant.ts). Never 'fail'; checks the
+ * claude CLI (`--version`, `--help`; never a model call) only when the assistant is switched on.
+ */
+export async function managerAssistantChecks(opts: { runner?: Runner; probe?: () => Promise<CapabilityCheck> } = {}): Promise<Check[]> {
+  try { return [await assistantCheck(opts)]; } catch (e) {
+    return [{ name: 'manager.assistant', status: 'warn', detail: `could not check (${short(String((e as Error).message ?? e))})` }];
+  }
+}
+
 export async function runDoctor(opts: {
   cwd: string; runner?: Runner; probe?: DockerProbe; fetch?: Fetch; fingerprint?: string | null; version?: string;
+  /** Claude CLI check of the manager assistant (tests); defaults to probeClaude through the runner. */
+  claudeProbe?: () => Promise<CapabilityCheck>;
   /** Host platform (tests); defaults to process.platform. */
   platform?: NodeJS.Platform;
   /** Linux fact probe (tests); defaults to linuxHostFacts through the runner. */
@@ -719,6 +732,7 @@ export async function runDoctor(opts: {
   checks.push(requiredChecksReadiness(effective, ci.rc, { onGitHub: github.onGitHub, unknownReason: ci.reason }));
   checks.push(ciAuthorityReadiness(effective, ci.rc, { onGitHub: github.onGitHub, unknownReason: ci.reason }));
   checks.push(...await managerChecks({ runner }));
+  checks.push(...await managerAssistantChecks({ runner, ...(opts.claudeProbe ? { probe: opts.claudeProbe } : {}) }));
   checks.push(...await managerSupervisorChecks({ runner, platform: opts.platform ?? process.platform }));
   add('features', 'unavailable', DEFERRED_FEATURES.join(', '));
   if (projectId) checks.push(restartCheck(restart));

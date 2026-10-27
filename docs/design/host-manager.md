@@ -2,7 +2,8 @@
 
 Status: **agreed** (task-53; phases 1 to 5 built, see [Phases](#phases)). Folds in task-44 (live settings). The owner answered the
 open questions on 2026-10-26 (see [Owner decisions](#owner-decisions)). The build tasks are listed under
-[Phases](#phases) and are filed as task-53.2 to task-53.8.
+[Phases](#phases) and are filed as task-53.2 to task-53.8. Task-65 proposes a natural-language front-end, which revises
+decision 1: see [host-manager-assistant.md](host-manager-assistant.md) (proposed, waiting for the owner).
 
 The manager is also the proposed watchdog of the routine pass in [unattended-delivery.md](unattended-delivery.md)
 (task-68.1). It runs `minions sync --routine` when the coordinator's own clock is stale.
@@ -26,6 +27,9 @@ the owner confirms that change**. Nothing applies on its own.
    model. Every apply path it uses already exists and is tested. The manager adds only routing, confirmation and a
    journal. A child process also means that a CLI the manager just reinstalled runs in a fresh process (the
    "no self-continuation" rule in [bootstrap.md, Upgrade from the container](bootstrap.md#upgrade-from-the-container)).
+   *Revision proposed in task-65:* the apply path stays deterministic and model-free, but the chat front-end may
+   use Claude. Claude explains settings and turns plain text into one typed owner command, which takes the same
+   plan and Confirm path. See [host-manager-assistant.md](host-manager-assistant.md#revision-of-decision-1).
 2. **One manager per host, one manager bot per host.** It serves every registered project, and the owner picks the
    project with `/project <name>`, or by tapping a request that already names it. One bot per project would double
    the bots and the pairing work for no gain in isolation: all projects already share one host user and one
@@ -97,22 +101,26 @@ anything over either is dropped and reported as a project error, since the outpu
 `/state`. A file queue on a host bind mount was rejected: it would be the first host path the container can write.
 
 **From the owner (manager chat).** The manager accepts a fixed set of commands and ignores everything else (it replies
-with the help text):
+with the help text). Task-65 proposes sending non-command text to a Claude assistant instead, which falls back to
+the help text ([host-manager-assistant.md](host-manager-assistant.md)):
 
 | Command | Does |
 | - | - |
 | `/status` | Per project: running, coordinator, active leases, restart-required (task-3.4), pending requests |
 | `/requests` | Pending requests, each with Confirm / Reject buttons |
-| `/set <key> <value>` | Same model as `minions settings set` (validation, layer, loosening text), then the confirmation |
+| `/settings [query]` | Read-only list (task-65.1): key, value, source, when a change takes effect, host-owned mark; a group name or key substring narrows it; secrets show set / unset |
+| `/set <key> <value>` | Same model as `minions settings set` (validation, layer, loosening text); applied at once unless it loosens, then the confirmation. An unknown key gets the closest keys; a value already in effect gets an explanation (value, source, other choices) and no request |
 | `/sync` | Outer repo sync (see [Change kinds](#change-kinds)) |
-| `/upgrade` | `minions upgrade` with a dry-run plan as the confirmation text |
+| `/upgrade` | `minions upgrade` after its dry run (never with `--rebuild-cli`, so it builds no CLI on the host): applied at once |
 | `/restart` | Graceful coordinator restart (refused while workers are active: then **Restart when idle** and **Drain now** are offered) |
-| `/undo <id>` | Proposes the inverse of an applied config change (confirmed like any change) |
+| `/undo <id>` | The inverse of an applied config change: applied at once unless it loosens, then the confirmation |
 | `/rebuild_cli` | Dev only (owner decision Q3): `minions upgrade --rebuild-cli` with the commit range, diffstat and sensitive paths in the plan; not registered on normal installs |
 | `/project <name>` | Picks the project for the commands above when several are registered |
 
-An owner command goes through the same confirmation as a coordinator proposal. Typing `/set` is not consent to the
-diff the manager computes from it.
+An owner command the owner types builds the same plan as a coordinator proposal. Since task-78, a typed command whose
+plan loosens nothing and builds or installs no CLI on the host applies at once (see
+[Owner-typed commands](#owner-typed-commands-task-78)); every other one goes through the same confirmation as a
+coordinator proposal, because typing `/set` is not consent to a loosening the manager computes from it.
 
 ## Confirmation model
 
@@ -139,8 +147,40 @@ restart does not replay old callbacks.
 the digest covers. It never re-reads the container's request row at apply time, since a forged or edited row could
 differ from what the owner saw. The container's row is only a trigger, and its status is updated afterwards.
 
-Nothing applies without step 3. That includes tightening changes, rejects of stale requests (they are only marked
-expired) and restarts. Read-only commands (`/status`, `/requests`) need no confirmation.
+Nothing from the container applies without step 3. That includes tightening changes, rejects of stale requests (they
+are only marked expired) and restarts. Read-only commands (`/status`, `/requests`) need no confirmation. The one
+exception is a safe command the owner types (next section).
+
+### Owner-typed commands (task-78)
+
+The owner asked not to confirm what they just typed ("I see no point in approving the restart when I just called
+/restart"). The rule: when the paired owner types a change command in the private chat, and its plan
+
+- loosens nothing (`loosens` is null),
+- is of a kind on the allow list (`DIRECT_KINDS` in `src/host/change-requests.ts`: `config-set`, `restart`, `sync`,
+  `undo`, `upgrade`), and is not a queued restart mode,
+- and builds or installs no CLI on the host (an upgrade only without `--from-container` and `--rebuild-cli`; without
+  that flag `minions upgrade` never builds the CLI),
+
+the manager applies it at once (`appliesWithoutConfirm`). That covers `/restart`, `/sync`, `/upgrade` and a
+tightening or neutral `/set` or `/undo`. `/approve` (it always loosens), a loosening `/set` or `/undo` and
+`/rebuild_cli` keep the offer and the double tap. Container requests always need Confirm, and so do the plans the
+manager offers on the owner's behalf (Restart when idle, Drain now, Roll back CLI): they were not typed.
+
+What stays the same:
+
+- Only a message that passes `isOwnerUpdate` (paired user, paired private chat, not a bot) and is not forwarded
+  counts. Taps and the container's rows never reach this path.
+- The plan is built, digested and journaled like any other. The offer carries `typed` (the key
+  `telegram:<botId>:<chatId>:<messageId>`) and `direct: true`, and its `confirmed` entry is written in the same
+  append, under the journal lock, in the one manager process. Its nonce is spent before anything could show it.
+  Then the usual `applying` and outcome entries follow, and the owner gets the usual "Applying…" and outcome
+  messages. A refused `/restart` still offers Restart when idle and Drain now.
+- **Replay.** The persisted `getUpdates` offset keeps a restart from replaying old messages. On top of that, the
+  journal holds at most one offer per message key: a redelivered update (same bot, chat and message id) is answered
+  "already handled" and nothing is planned or applied again. A crash after the `confirmed` entry is reported as
+  interrupted at the next start, like any confirmed apply, and never resumed.
+- Plain text only: no message uses markup.
 
 **Loosening and code-execution changes ask twice.** A plan that loosens policy (any non-null `loosens`), or that
 builds and installs a CLI on the host, gets a second message that names the risk in one line ("agents may push
@@ -177,6 +217,7 @@ container is recreated, volumes kept). **fixed**: identity or derived; change it
 | `budgets.*` | restart | Prompt text only (not enforced in v0.1) |
 | `intake.github.*` | live | `minions sync` and coordinator startup read them per run |
 | `intake.scope.*`, `intake.sources` | live | Backlog readiness filter per call |
+| `delivery.requiredChecksConfigured` | live, **H** | The merge gate reads it on each `sync` / `publish` (not in the prompt); it gates what merges on GitHub (task-79). Most specific entry, so it overrides `delivery.*` below |
 | `communication.progress` | restart | Prompt text |
 | `models.default`, `allowed`, `selection`, `effortByRole` (workers) | restart | Agent definitions and prompt |
 | `models.coordinator`, `models.effort`, `effortByRole.coordinator` | restart | Coordinator `--model` / `--effort` |
