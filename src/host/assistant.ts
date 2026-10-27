@@ -4,7 +4,8 @@
 // instructions (templates/assistant). It closes the remaining gaps through documented commands only.
 //
 // Safety: permission mode `default` (every non-allowlisted tool prompts; never bypass/acceptEdits/auto,
-// and bypass is disabled through --settings). Only read-only commands and reads inside the repository
+// and bypass is disabled through --settings). It is passed as `manual` when the installed Claude Code
+// lists only that newer name (2.1.292+), and the launch fails when it lists neither (never a looser mode). Only read-only commands and reads inside the repository
 // root (`Read(//<repo>/**)`; Claude Code applies Read rules to Glob/Grep too) are pre-allowed. Credential,
 // runtime-switch and publishing commands are denied: the user runs them (`! minions auth ...`) so
 // secrets are typed only at minions' hidden prompts, never into the chat. Host-side minions files
@@ -23,6 +24,7 @@ import { emit } from '../core/output.js';
 import { credentialStoreDir, defaultsPath, hostRoot, managerDir, projectPaths, registryPath } from '../core/paths.js';
 import { VERSION } from '../core/version.js';
 import { HOST_SECRET_DIRS } from '../runtime/coordinator.js';
+import { claudePermissionModes, strictPermissionModeArg, type StrictPermissionModeArg } from '../runtime/permission-modes.js';
 import { renderTemplate, templatesDir } from '../plugin/generate.js';
 import { resolveOnPath } from './auth.js';
 import { loadEffectiveConfig, loadProjectJson, projectConfigPath, type ProjectJson } from './project.js';
@@ -32,8 +34,25 @@ import type { WizardIO } from './wizard.js';
 
 export const ASSISTANT_PLUGIN = 'minions-setup';
 export const ASSISTANT_SKILL = `${ASSISTANT_PLUGIN}:setup`;
-/** Claude Code permission mode of the assistant session. Never bypassPermissions, acceptEdits or auto. */
+/**
+ * Claude Code permission mode of the assistant session. Never bypassPermissions, acceptEdits or auto.
+ * The argv value is `manual` (its newer name) where the installed Claude Code lists only that (assistantPermissionMode).
+ */
 export const ASSISTANT_PERMISSION_MODE = 'default';
+
+/**
+ * argv value of the assistant's permission mode for the installed Claude Code's --permission-mode
+ * choices (claudePermissionModes; null/undefined = not readable or not checked: `default`). Throws
+ * INCOMPATIBLE_RUNTIME when they list neither `default` nor `manual`: never a looser mode.
+ */
+export function assistantPermissionMode(modes: readonly string[] | null | undefined): StrictPermissionModeArg {
+  const r = strictPermissionModeArg(modes);
+  if (!r.ok) {
+    throw new MinionsError('INCOMPATIBLE_RUNTIME', `The setup assistant runs only in permission mode ${ASSISTANT_PERMISSION_MODE}, but ${r.reason}.`,
+      'Install a Claude Code version that offers --permission-mode default (or manual, its newer name), then run `minions setup assist`.');
+  }
+  return r.mode;
+}
 export const ASSISTANT_PROMPT = `Use the ${ASSISTANT_SKILL} skill to help me finish setting up minions in this repository. Start by gathering context (read-only), then show me the gaps you found.`;
 
 /** Read-only commands the assistant may run without a prompt. */
@@ -122,7 +141,7 @@ export function assistantVars(ctx: AssistantContext): Record<string, string> {
 }
 
 /** argv of the assistant's claude process. Never contains a secret; never a bypass/accept-edits mode. */
-export function assistantArgs(o: { repoRoot: string; pluginDir: string; systemPrompt: string; deniedPaths: string[]; prompt?: string }): string[] {
+export function assistantArgs(o: { repoRoot: string; pluginDir: string; systemPrompt: string; deniedPaths: string[]; prompt?: string; permissionMode?: StrictPermissionModeArg }): string[] {
   // Variadic tool lists come first and end at the next option, so the trailing positional prompt is
   // never swallowed by them.
   return [
@@ -132,13 +151,17 @@ export function assistantArgs(o: { repoRoot: string; pluginDir: string; systemPr
     '--append-system-prompt', o.systemPrompt,
     '--settings', JSON.stringify({ permissions: { disableBypassPermissionsMode: 'disable' } }),
     '--name', 'minions setup',
-    '--permission-mode', ASSISTANT_PERMISSION_MODE,
+    '--permission-mode', o.permissionMode ?? ASSISTANT_PERMISSION_MODE,
     o.prompt ?? ASSISTANT_PROMPT,
   ];
 }
 
-/** Renders the plugin and prompt in memory (nothing is written). */
-export async function planAssistant(ctx: AssistantContext): Promise<AssistantPlan> {
+/**
+ * Renders the plugin and prompt in memory (nothing is written). `permissionModes`: the installed Claude
+ * Code's --permission-mode choices (undefined/null: `default`); throws when they offer no default mode.
+ */
+export async function planAssistant(ctx: AssistantContext, opts: { permissionModes?: readonly string[] | null } = {}): Promise<AssistantPlan> {
+  const permissionMode = assistantPermissionMode(opts.permissionModes);
   const dir = assistantTemplatesDir();
   const vars = assistantVars(ctx);
   const render = async (f: string) => renderTemplate(await readFile(join(dir, f), 'utf8'), vars, {}, { name: `assistant/${f}` });
@@ -155,7 +178,7 @@ export async function planAssistant(ctx: AssistantContext): Promise<AssistantPla
       { path: join(pluginDir, '.claude-plugin', 'plugin.json'), content: manifest },
       { path: join(pluginDir, 'skills', 'setup', 'SKILL.md'), content: skill },
     ],
-    args: assistantArgs({ repoRoot: ctx.repoPath, pluginDir, systemPrompt, deniedPaths: assistantDeniedPaths(ctx.project.projectId) }),
+    args: assistantArgs({ repoRoot: ctx.repoPath, pluginDir, systemPrompt, deniedPaths: assistantDeniedPaths(ctx.project.projectId), permissionMode }),
   };
 }
 
@@ -186,10 +209,11 @@ export const CLAUDE_MISSING = new MinionsError('PRECONDITION', 'The setup assist
   'Install Claude Code on the host (`npm install -g @anthropic-ai/claude-code` or `brew install --cask claude-code`), then run `minions setup assist`.');
 
 /** Writes the host plugin and runs `claude` in the foreground with the inherited terminal. Resolves with its exit code. */
-export async function launchAssistant(ctx: AssistantContext, opts: { spawn?: Spawn; onInfo?: (line: string) => void } = {}): Promise<number> {
+export async function launchAssistant(ctx: AssistantContext, opts: { spawn?: Spawn; onInfo?: (line: string) => void; permissionModes?: () => Promise<string[] | null> } = {}): Promise<number> {
   if (!(await claudeOnPath())) throw CLAUDE_MISSING;
   if (!(await resolveOnPath('minions'))) opts.onInfo?.('warning: `minions` is not on PATH; the assistant runs `minions doctor` and friends and needs it there.');
-  const plan = await planAssistant(ctx);
+  // Before anything is written: a Claude Code without a default mode fails here, with nothing launched.
+  const plan = await planAssistant(ctx, { permissionModes: await (opts.permissionModes ?? (() => claudePermissionModes()))().catch(() => null) });
   await writeAssistantPlugin(plan);
   opts.onInfo?.(`Starting the setup assistant (Claude Code in ${plan.cwd}; permission prompts stay on). Type /exit to leave.`);
   return (opts.spawn ?? inheritSpawn)(plan.command, plan.args, { cwd: plan.cwd });
@@ -235,7 +259,7 @@ export function registerAssistant(setup: Command): void {
       const { json, dryRun } = globalOpts(cmd);
       const ctx = await loadAssistantContext(process.cwd());
       if (dryRun) {
-        const plan = await planAssistant(ctx);
+        const plan = await planAssistant(ctx, { permissionModes: await claudeOnPath() ? await claudePermissionModes() : null });
         emit({ dryRun: true, cwd: plan.cwd, command: plan.command, args: plan.args, pluginDir: plan.pluginDir, files: plan.files.map((f) => f.path), claudeOnPath: await claudeOnPath() },
           { json, human: () => [`Would write the setup assistant plugin to ${plan.pluginDir}`, `Would run in ${plan.cwd}:`, `  claude ${shortArgs(plan.args)}`].join('\n') });
         return;

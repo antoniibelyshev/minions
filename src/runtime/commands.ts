@@ -25,7 +25,7 @@ import { formatTelegramProbe, probeTelegram } from '../telegram/probe.js';
 import { resolveChannel } from '../telegram/channel.js';
 import type { PollerCheck } from '../telegram/isolation.js';
 import {
-  buildClaudeCommand, buildCoordinatorCommand, telegramPollerStatus, claudePermissionModes, configuredPermissionMode, coordinatorWrapper, launchCoordinator, probeRuntime, readLaunchRecord, readMountedToken, RECOVERY_PROMPT,
+  buildClaudeCommand, buildCoordinatorCommand, telegramPollerStatus, claudePermissionModes, coordinatorWrapper, launchCoordinator, permissionModesNeeded, probeRuntime, readLaunchRecord, readMountedToken, RECOVERY_PROMPT,
   restartCoordinator, runtimeChannelFacts, scheduleDetachedRestart, syncCoordinator, coordinatorLaunchStatus, type LaunchStatus,
 } from './coordinator.js';
 import { openDb, type DrainNotice, type DrainRequest, type Lease, type PauseChange, type RuntimeDb } from './db.js';
@@ -676,8 +676,8 @@ export function register(program: Command): void {
         return;
       }
       if (o.printCommand) {
-        // Same permission-mode check as the launch: auto only when this Claude Code offers it.
-        const permissionModes = configuredPermissionMode(cfg) === 'auto' && runtimeMode() !== 'host-runtime' ? await claudePermissionModes() : undefined;
+        // Same permission-mode check as the launch: auto only when this Claude Code offers it; default under the name it lists.
+        const permissionModes = permissionModesNeeded(cfg) ? await claudePermissionModes() : undefined;
         const r = { tmux: await buildCoordinatorCommand(cfg), claude: await buildClaudeCommand(cfg, runtimePaths(), { telegram: cfg.communication.channel !== 'terminal', permissionModes }) };
         emit(r, { json: globalOpts(cmd).json, human: (d: typeof r) => [JSON.stringify([d.tmux.cmd, ...d.tmux.args]), JSON.stringify([d.claude.cmd, ...d.claude.args])].join('\n') });
         return;

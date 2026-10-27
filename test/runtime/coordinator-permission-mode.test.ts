@@ -117,7 +117,10 @@ describe('coordinator permission mode: Claude Code support', () => {
     expect(decidePermissionMode(defaults(), { hostRuntime: false, modes: null })).toMatchObject({ mode: 'acceptEdits', fallback: true, reason: expect.stringMatching(/could not read/) });
     // An explicit acceptEdits opt-out is not a fallback.
     expect(decidePermissionMode(withCoord('acceptEdits'), { hostRuntime: false, modes: null })).toMatchObject({ mode: 'acceptEdits', fallback: false });
-    expect(decidePermissionMode(defaults(), { hostRuntime: true, modes: ['auto'] })).toMatchObject({ mode: 'default', fallback: false });
+    expect(decidePermissionMode(defaults(), { hostRuntime: true, modes: ['auto', 'default'] })).toMatchObject({ mode: 'default', fallback: false });
+    expect(decidePermissionMode(defaults(), { hostRuntime: true, modes: ['auto', 'manual'] })).toMatchObject({ mode: 'manual', fallback: false });
+    // Neither name listed: fail closed, never auto or acceptEdits.
+    expect(() => decidePermissionMode(defaults(), { hostRuntime: true, modes: ['auto'] })).toThrow(/neither --permission-mode default nor manual/);
   });
 
   it('--probe reports auto when supported and falls back to acceptEdits (not an error) when not', async () => {

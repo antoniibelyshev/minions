@@ -19,6 +19,7 @@ import { checkTelegramPoller, disableTelegramAtUserScope, type PollerCheck, type
 import { checkTelegramTokenFormat } from '../telegram/token.js';
 import { HOST_TELEGRAM_REASON, resolveChannel, type ChannelFacts } from '../telegram/channel.js';
 import { runtimePaths, type RuntimePaths } from './paths.js';
+import { claudePermissionModes, parsePermissionModes, strictPermissionModeArg } from './permission-modes.js';
 import { openDb, pidAlive, type CoordinatorLock, type RuntimeDb } from './db.js';
 
 export const TMUX_SESSION = 'coordinator';
@@ -332,6 +333,8 @@ export function coordinatorSettings(cfg: MinionsConfig, opts: { telegram?: boole
 
 /** Claude Code permission modes the coordinator may run in. Never bypassPermissions or dontAsk. */
 export type CoordinatorPermissionMode = 'auto' | 'acceptEdits' | 'default';
+/** Value passed to `claude --permission-mode`: the mode, with "default" under its newer name `manual` where the CLI lists only that. */
+export type PermissionModeArg = CoordinatorPermissionMode | 'manual';
 type PermCfg = Pick<MinionsConfig, 'permissionMode' | 'coordinator'>;
 
 /**
@@ -346,38 +349,40 @@ export function configuredPermissionMode(cfg: PermCfg): CoordinatorPermissionMod
 
 export interface PermissionModeDecision {
   configured: CoordinatorPermissionMode;
-  /** Value passed to `claude --permission-mode`. */
-  mode: CoordinatorPermissionMode;
+  /** Value passed to `claude --permission-mode` (`manual` = default on a Claude Code that lists only that name). */
+  mode: PermissionModeArg;
   /** Auto was configured but this Claude Code does not offer it (or its --help could not be read). */
   fallback: boolean;
   reason: string;
 }
 
+// The --help choice parser and the strict-mode mapping live in ./permission-modes.ts (shared with the
+// setup assistant); re-exported here for existing callers.
+export { claudePermissionModes, parsePermissionModes } from './permission-modes.js';
+
 /**
- * `--permission-mode` choices listed by `claude --help` (commander's `(choices: "a", "b")`), or null
- * when the flag or its choices are not listed. Never guesses: a mode counts only when listed.
+ * Whether the launch depends on the installed Claude Code's --permission-mode choices: auto (it may be
+ * missing) and the strict mode (host runtime, legacy "default": passed as `default` or `manual`,
+ * whichever this Claude Code lists). Only an explicit acceptEdits in the container needs no check.
  */
-export function parsePermissionModes(help: string): string[] | null {
-  const at = help.indexOf('--permission-mode');
-  if (at < 0) return null;
-  const rest = help.slice(at + '--permission-mode'.length);
-  const next = rest.search(/\n\s*-{1,2}[A-Za-z]/);
-  const m = /\(choices:\s*([^)]*)\)/.exec(next < 0 ? rest : rest.slice(0, next));
-  if (!m) return null;
-  const modes = [...m[1]!.matchAll(/"([^"]+)"/g)].map((x) => x[1]!);
-  return modes.length ? modes : null;
+export function permissionModesNeeded(cfg: PermCfg, hostRuntime = runtimeMode() === 'host-runtime'): boolean {
+  return hostRuntime || configuredPermissionMode(cfg) !== 'acceptEdits';
 }
 
-/** Reads the installed Claude Code's `--permission-mode` choices; null when `claude --help` fails or lists none. */
-export async function claudePermissionModes(runner: Runner = run): Promise<string[] | null> {
-  const help = await runner('claude', ['--help'], { allowFailure: true, timeoutMs: 30_000 }).catch(() => null);
-  if (!help || help.code !== 0) return null;
-  return parsePermissionModes(help.stdout + help.stderr);
+/** The strict mode's argv value for `modes`; fails closed (never another mode) when this Claude Code lists neither name. */
+function strictMode(modes: readonly string[] | null | undefined, where: string): { mode: PermissionModeArg; note: string } {
+  const r = strictPermissionModeArg(modes);
+  if (!r.ok) {
+    throw new MinionsError('INCOMPATIBLE_RUNTIME', `${where}: the coordinator must run in permission mode default, but ${r.reason}. It is not started in a looser mode.`,
+      'Install a Claude Code version that offers --permission-mode default (or manual, its newer name); see docs/compatibility.md.');
+  }
+  return { mode: r.mode, note: r.mode === 'manual' ? ' (passed as manual, the name this Claude Code lists for it)' : '' };
 }
 
 /**
  * The coordinator's launch permission mode. Host runtime: always `default` (the config may come from the
- * repository). Container: the configured mode; "auto" falls back to "acceptEdits" when `modes` (the
+ * repository). Default is passed as `manual` when `modes` lists only that name, and throws
+ * INCOMPATIBLE_RUNTIME when `modes` lists neither (fail closed). Container: the configured mode; "auto" falls back to "acceptEdits" when `modes` (the
  * installed Claude Code's choices) lacks it or is null. `modes` undefined = not checked: the configured mode.
  * Only the mode changes: coordinatorSettings emits the same allow/deny/ask rules in every mode.
  */
@@ -387,12 +392,17 @@ export function decidePermissionMode(cfg: PermCfg, opts: { hostRuntime?: boolean
   }
   const configured = configuredPermissionMode(cfg);
   if (opts.hostRuntime ?? runtimeMode() === 'host-runtime') {
-    return { configured, mode: 'default', fallback: false, reason: 'host runtime: the coordinator always runs in permission mode default' };
+    const s = strictMode(opts.modes, 'host runtime');
+    return { configured, mode: s.mode, fallback: false, reason: `host runtime: the coordinator always runs in permission mode default${s.note}` };
   }
   // Legacy top-level "acceptEdits" (the old default) no longer opts out; say so wherever the mode is reported.
   const legacy = cfg.permissionMode === 'acceptEdits' && !cfg.coordinator?.permissionMode
     ? '; legacy permissionMode "acceptEdits" is ignored; set coordinator.permissionMode "acceptEdits" to opt out'
     : '';
+  if (configured === 'default') {
+    const s = strictMode(opts.modes, 'permissionMode "default"');
+    return { configured, mode: s.mode, fallback: false, reason: `coordinator permission mode default${s.note}` };
+  }
   if (configured !== 'auto' || opts.modes === undefined || opts.modes?.includes('auto')) {
     return { configured, mode: configured, fallback: false, reason: `coordinator permission mode ${configured}${legacy}` };
   }
@@ -405,7 +415,7 @@ export function decidePermissionMode(cfg: PermCfg, opts: { hostRuntime?: boolean
   };
 }
 
-/** Host runtime: permission mode from the (repository-influenced) config is ignored; always `default`. */
+/** Host runtime: permission mode from the (repository-influenced) config is ignored; always `default` (argv `manual` where only that is listed). */
 export const effectivePermissionMode = (cfg: PermCfg, hostRuntime = runtimeMode() === 'host-runtime', modes?: readonly string[] | null) =>
   decidePermissionMode(cfg, { hostRuntime, modes }).mode;
 
@@ -600,7 +610,7 @@ export interface RunCoordinatorDeps {
   startupPrompt?: string;
   /** Timer for the signal escalation (injectable for tests); returns a cancel function. */
   timer?: (fn: () => void, ms: number) => () => void;
-  /** The installed Claude Code's --permission-mode choices (default: `claude --help`); asked only when auto is configured. */
+  /** The installed Claude Code's --permission-mode choices (default: `claude --help`); asked unless acceptEdits is configured in the container (permissionModesNeeded). */
   permissionModes?: () => Promise<string[] | null>;
   /** Pre-spawn signal guard of coordinatorWrapper: a signal before claude starts cancels the launch. */
   preSpawn?: PreSpawnGuard;
@@ -694,8 +704,9 @@ export async function runCoordinator(cfg: MinionsConfig, deps: RunCoordinatorDep
   if (decision.enabled) log(`minions: ${decision.reason}`);
   else if (intended) log(`minions: Telegram disabled for this session: ${decision.reason}. Terminal mode is active.`);
   else if (cfg.communication.channel === 'auto') log(`minions: terminal mode (${decision.reason}).`);
-  // Auto mode only where this Claude Code offers it; otherwise acceptEdits with a clear message.
-  const permissionModes = configuredPermissionMode(cfg) === 'auto' && runtimeMode() !== 'host-runtime'
+  // Auto mode only where this Claude Code offers it; otherwise acceptEdits with a clear message. The
+  // strict mode (host runtime, legacy "default") is passed under the name this Claude Code lists.
+  const permissionModes = permissionModesNeeded(cfg)
     ? await (deps.permissionModes ?? (() => claudePermissionModes()))().catch(() => null) : undefined;
   if (cancelled() !== null) return cancelled()!;
   const perm = decidePermissionMode(cfg, { modes: permissionModes });
@@ -1315,6 +1326,8 @@ export interface RuntimeProbe {
 /**
  * Verifies the installed Claude Code and tmux support what the launcher needs, and which permission
  * mode the launch will use (auto falls back to acceptEdits when this Claude Code lacks it; not an error).
+ * The strict mode (host runtime, legacy "default") maps to `manual` where only that is listed and is an
+ * INCOMPATIBLE_RUNTIME error when neither name is listed.
  */
 export async function probeRuntime(cfg?: Pick<MinionsConfig, 'models' | 'permissionMode' | 'coordinator'>, opts: { runner?: Runner } = {}): Promise<RuntimeProbe> {
   const exec = opts.runner ?? run;
