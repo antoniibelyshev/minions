@@ -1,9 +1,9 @@
 ## Result (output)
 
-Submit your WorkerResult as a single JSON object on stdin, from inside your worktree:
+Submit your WorkerResult as a single JSON object on stdin, from inside your worktree (your Bash cwd resets between calls, so start with `cd <worktree> && `):
 
 ```bash
-minions work submit <leaseId> --role {{workerRole}} --json <<'RESULT'
+cd <worktree> && minions work submit <leaseId> --role {{workerRole}} --json <<'RESULT'
 { ...WorkerResult JSON... }
 RESULT
 ```
