@@ -6,7 +6,8 @@ import { describe, expect, it, vi } from 'vitest';
 import type { MinionsConfig } from '../../src/config/schema.js';
 import { run as runCmd, type RunResult } from '../../src/core/exec.js';
 import {
-  BASE_UPDATE_KIND, commitMerge, commitParents, deriveApproval, derivedApprovalProblems, mergeTree, unsafeMergeAttributes, verifyLink, withIsolatedRepo, type DerivedApproval,
+  BASE_UPDATE_KIND, commitMerge, commitParents, deriveApproval, derivedApprovalProblems, mergeTree, originOfPrUrl, serverRefOf, unsafeMergeAttributes, verifyLink, withIsolatedRepo,
+  type DerivedApproval,
 } from '../../src/runtime/base-update.js';
 import { syncTasks } from '../../src/runtime/ci.js';
 import type { CiGate } from '../../src/runtime/ci-gate.js';
@@ -29,10 +30,14 @@ const failing = [{ __typename: 'CheckRun', name: 'test', status: 'COMPLETED', co
 
 interface Pr { url: string; headRefName: string; state: 'OPEN' | 'MERGED' | 'CLOSED'; mergeStateStatus: string; mergeable: string; autoMergeRequest: unknown; rollup: Record<string, unknown[]> }
 
-/** Fake GitHub: the PR head is read live from the bare origin, so pushes move it; CI rollups are per head. */
+/**
+ * Fake GitHub: the PR head and the base branch's commit are read live from the bare origin, so pushes move
+ * them; CI rollups are per head. `apiBase` replaces the API's view of main (a string: that SHA; null: gh fails).
+ */
 class ScanGh {
   prs: Pr[] = [];
   calls: string[][] = [];
+  apiBase: string | null | undefined = undefined;
   constructor(private bare: string) {}
   head(p: Pr) { return execFileSync('git', ['-C', this.bare, 'rev-parse', `refs/heads/${p.headRefName}`], { encoding: 'utf8' }).trim(); }
   lists() { return this.calls.filter((c) => c[0] === 'pr' && c[1] === 'list' && c.includes('--state') && c[c.indexOf('--state') + 1] === 'open' && !c.includes('--head')); }
@@ -42,7 +47,11 @@ class ScanGh {
     const flag = (f: string) => args[args.indexOf(f) + 1]!;
     if (args[0] === 'api') {
       const path = args.at(-1)!;
-      if (path === `${R}/branches/main`) return ok(JSON.stringify({ name: 'main', protected: true, protection: { required_status_checks: { enforcement_level: 'everyone', contexts: ['test'] } } }));
+      if (path === `${R}/branches/main`) {
+        if (this.apiBase === null) return bad('gh: HTTP 502 Bad Gateway');
+        const sha = this.apiBase ?? execFileSync('git', ['-C', this.bare, 'rev-parse', 'refs/heads/main'], { encoding: 'utf8' }).trim();
+        return ok(JSON.stringify({ name: 'main', commit: { sha }, protected: true, protection: { required_status_checks: { enforcement_level: 'everyone', contexts: ['test'] } } }));
+      }
       if (path === `${R}/rules/branches/main`) return ok('[]');
       if (path.startsWith(`${R}/actions/workflows`)) return ok(JSON.stringify({ total_count: 1 }));
       return bad('gh: Not Found (HTTP 404)');
@@ -75,7 +84,7 @@ class ScanGh {
   };
 }
 
-interface SEnv extends Env { gh: ScanGh; bare: string; other: string }
+interface SEnv extends Env { gh: ScanGh; bare: string; other: string; serverUrl: (u: string) => string }
 
 function scanEnv(mutate?: (c: MinionsConfig) => void): SEnv {
   const env = makeDefaultEnv((c) => {
@@ -99,11 +108,14 @@ function scanEnv(mutate?: (c: MinionsConfig) => void): SEnv {
   writeFileSync(tokenFile, TOKEN + '\n', { mode: 0o600 });
   const gh = new ScanGh(bare);
   const keys = approvalKeys();
+  // The recorded origin URL reaches the bare repo only through the code seam: the merge gate and the scan
+  // never read the workspace's url.* config (the insteadOf above only serves the fixture's own git calls).
+  const serverUrl = (u: string) => (u === REMOTE ? bare : u);
   const sched = new Scheduler({
     db: env.db, backlog: env.backlog, config: env.config, layout: env.layout, approvalPublicKeyFile: keys.publicKeyFile, gh: gh.fn,
-    publisher: (input: PublishInput) => publishTask({ ...input, gh: gh.fn, tokenFile }),
+    publisher: (input: PublishInput) => publishTask({ ...input, gh: gh.fn, tokenFile }), serverUrl,
   });
-  return { ...env, sched, gh, bare, other };
+  return { ...env, sched, gh, bare, other, serverUrl };
 }
 
 /** engineer commits `file` -> reviewer approves -> published as a PR (delivered). */
@@ -231,9 +243,12 @@ describe('PR scan: BEHIND -> verified base update', () => {
     const { head: H, branch } = await deliver(env, 'task-1');
     landOnMain(env, 'main.txt', 'x\n');
     env.gh.prs[0]!.mergeStateStatus = 'BEHIND';
-    // Someone pushes to the PR branch right before minions' push (after its ls-remote check).
+    // Someone pushes to the PR branch after minions' ls-remote check, before its push (which goes to the
+    // recorded URL from an isolated git dir; the race is staged in the sensitive-path read just before it).
+    let raced = false;
     const racing: GitFn = async (cwd, args, allow) => {
-      if (args[0] === 'push') {
+      if (args[0] === 'diff' && !raced) {
+        raced = true;
         gitSync(env.other, 'fetch', '-q', 'origin', branch);
         gitSync(env.other, 'checkout', '-q', '-B', 'side', 'FETCH_HEAD');
         writeFileSync(join(env.other, 'side.txt'), 'foreign\n');
@@ -335,7 +350,7 @@ describe('PR scan: BEHIND -> verified base update', () => {
 /** ScanDeps for runPrScan with injected git (the scheduler wires the same). */
 function scanDeps(env: SEnv, o: { git?: GitFn } = {}) {
   return {
-    db: env.db, backlog: env.backlog, config: env.config, repo: env.layout.repo, gh: env.gh.fn, git: o.git ?? realGit,
+    db: env.db, backlog: env.backlog, config: env.config, repo: env.layout.repo, gh: env.gh.fn, git: o.git ?? realGit, serverUrl: env.serverUrl,
     ciGate: (id: string, head: string) => env.sched.ciGate(id, head),
     ciRepair: (id: string, head: string, f: string[]) => env.sched.ciRepair(id, head, f),
   };
@@ -834,5 +849,177 @@ describe('the minions process environment never reaches the base-update or deriv
     pr.mergeStateStatus = 'BEHIND';
     const s = await tainted(taint, () => scan(env));
     expect(action(s, 'task-1')?.base).not.toBe(X);
+  });
+});
+
+describe('the server is the recorded origin URL: the workspace .git/config never steers the base, the fetch or the push', () => {
+  /** A forged "origin": a clone of the real one whose main has one more commit adding `file`, plus the PR branch. */
+  function forgedOrigin(env: SEnv, branch: string, file: string, content: string) {
+    const F = join(tmp('minions-forged-'), 'forged');
+    execFileSync('git', ['clone', '-q', '-b', 'main', env.bare, F]);
+    const X = commitFile(F, file, content, 'forged main');
+    gitSync(F, 'fetch', '-q', env.bare, `+refs/heads/${branch}:refs/heads/${branch}`);
+    return { F, X };
+  }
+  /** Repository config that sends origin's fetches to F and its pushes to the real origin (also for the seam's URL). */
+  function forgeOriginConfig(env: SEnv, F: string) {
+    const repo = env.layout.repo;
+    gitSync(repo, 'config', '--remove-section', `url.${env.bare}`);
+    gitSync(repo, 'config', '--add', `url.${F}.insteadOf`, REMOTE);
+    // If the repository config were read at all, this would also rewrite the URL the test seam hands to git.
+    gitSync(repo, 'config', '--add', `url.${F}.insteadOf`, env.bare);
+    gitSync(repo, 'config', `url.${env.bare}.pushInsteadOf`, REMOTE);
+  }
+  const commit = (env: SEnv, t: string, ...ps: string[]) => gitSync(env.layout.repo, 'commit-tree', t, ...ps.flatMap((p) => ['-p', p]), '-m', 'forged');
+
+  it('url.<forged>.insteadOf plus url.<real>.pushInsteadOf: the base update uses the real main, nothing forged reaches the PR, the gate arms only the genuine head', async () => {
+    const env = scanEnv();
+    const { head: H, branch, pr } = await deliver(env, 'task-1');
+    const B = landOnMain(env, 'main.txt', 'from main\n');
+    const { F, X } = forgedOrigin(env, branch, '.github/workflows/evil.yml', 'on: push\n');
+    forgeOriginConfig(env, F);
+    expect(gitSync(env.layout.repo, 'ls-remote', 'origin', 'refs/heads/main')).toMatch(new RegExp(`^${X}`)); // plain git is fooled
+    pr.mergeStateStatus = 'BEHIND';
+
+    const t = action(await scan(env), 'task-1')!;
+    expect(t).toMatchObject({ action: 'base-updated', base: B });
+    const H2 = bareHead(env, branch);
+    expect(t.newHead).toBe(H2);
+    expect(parents(env, H2)).toEqual([H, B]);
+    expect(gitSync(env.bare, 'ls-tree', '-r', '--name-only', H2).split('\n')).not.toContain('.github/workflows/evil.yml');
+    expect(env.db.publication('task-1')!.head_sha).toBe(H2);
+    expect(JSON.parse(env.db.evidenceFor('task-1', H2, BASE_UPDATE_KIND)[0]!.details_json!)).toMatchObject({ from: H, base: B });
+    // The fetch came from the real origin too (the remote-tracking ref points at its main, not at X).
+    expect(gitSync(env.layout.repo, 'rev-parse', 'refs/remotes/origin/main')).toBe(B);
+    // No gc can run in the isolated dir (it shares the object store but none of the refs).
+    for (const k of ['gc.auto', 'maintenance.auto']) {
+      const v = await withIsolatedRepo(env.layout.repo, (iso) => iso.git(iso.dir, ['config', '--get', k], true));
+      expect(v.stdout.trim()).toMatch(/^(0|false)$/);
+    }
+
+    pr.mergeStateStatus = 'BLOCKED';
+    pr.rollup[H2] = passing;
+    expect((await sync(env)).tasks[0]!.merge).toMatchObject({ state: 'armed', head: H2 });
+    expect(env.gh.merges().filter((c) => c.includes('--auto')).map((c) => c.at(-1))).toEqual([H2]);
+  });
+
+  it('the merge gate never derives an approval over a forged base the repository config points origin at', async () => {
+    const env = scanEnv();
+    const { head: H, branch, pr } = await deliver(env, 'task-1');
+    landOnMain(env, 'main.txt', 'from main\n');
+    const { F, X } = forgedOrigin(env, branch, '.github/workflows/evil.yml', 'on: push\n');
+    gitSync(env.layout.repo, 'fetch', '-q', F, `+refs/heads/main:refs/forged/main`);
+    // H' = (H, X): a clean merge with the forged main, pushed to the real PR branch with a matching record.
+    const tr = gitSync(env.layout.repo, 'merge-tree', '--write-tree', H, X);
+    const H2 = commit(env, tr, H, X);
+    env.db.addEvidence({ task_id: 'task-1', head_sha: H2, kind: BASE_UPDATE_KIND, config_revision: env.config.configRevision, outcome: 'prepared', details_json: JSON.stringify({ from: H, base: X, tree: tr }) });
+    gitSync(env.layout.repo, 'push', '-q', env.bare, `${H2}:refs/heads/${branch}`);
+    expect(env.db.movePublicationHead('task-1', H, H2)).toBe(true);
+    forgeOriginConfig(env, F);
+    pr.mergeStateStatus = 'BLOCKED';
+    pr.rollup[H2] = passing;
+    const m = (await sync(env)).tasks[0]!.merge!;
+    expect(m.state).toBe('waiting');
+    expect(m.reasons.join(' ')).toMatch(/derived approval refused: .*is not on the server's base/);
+    expect(env.gh.merges().filter((c) => c.includes('--auto'))).toHaveLength(0);
+  });
+
+  it('pushInsteadOf / pushurl in the repository config cannot redirect the base-update push (no publication desync)', async () => {
+    const env = scanEnv();
+    const { head: H, branch, pr } = await deliver(env, 'task-1');
+    landOnMain(env, 'main.txt', 'from main\n');
+    const F = join(tmp('minions-forged-'), 'f.git');
+    execFileSync('git', ['clone', '-q', '--bare', env.bare, F]);
+    gitSync(env.layout.repo, 'config', '--add', `url.${F}.pushInsteadOf`, REMOTE);
+    gitSync(env.layout.repo, 'config', '--add', `url.${F}.pushInsteadOf`, env.bare);
+    gitSync(env.layout.repo, 'config', 'remote.origin.pushurl', F);
+    pr.mergeStateStatus = 'BEHIND';
+    const t = action(await scan(env), 'task-1')!;
+    expect(t.action).toBe('base-updated');
+    expect(bareHead(env, branch)).toBe(t.newHead);
+    expect(env.db.publication('task-1')!.head_sha).toBe(t.newHead);
+    expect(gitSync(F, 'rev-parse', `refs/heads/${branch}`)).toBe(H); // nothing reached the forged repo
+  });
+
+  it('the base is cross-checked with the GitHub API: a mismatch or an unavailable gh skips the update (fail closed)', async () => {
+    const env = scanEnv();
+    const { head: H, branch, pr } = await deliver(env, 'task-1');
+    landOnMain(env, 'main.txt', 'from main\n');
+    pr.mergeStateStatus = 'BEHIND';
+    env.gh.apiBase = H; // GitHub's API disagrees with git
+    expect(action(await scan(env), 'task-1')).toMatchObject({ action: 'skipped', message: expect.stringMatching(/for git but .* for the GitHub API/) });
+    env.gh.apiBase = null; // gh unavailable
+    expect(action(await scan(env), 'task-1')).toMatchObject({ action: 'skipped', message: expect.stringMatching(/cannot verify origin's main with the GitHub API/) });
+    expect(bareHead(env, branch)).toBe(H);
+    expect(env.db.evidenceOfKind('task-1', BASE_UPDATE_KIND)).toHaveLength(0);
+
+    // A genuine update, then gh goes away: the derived approval is refused, and nothing is armed.
+    env.gh.apiBase = undefined;
+    const H2 = action(await scan(env), 'task-1')!.newHead!;
+    pr.mergeStateStatus = 'BLOCKED';
+    pr.rollup[H2] = passing;
+    env.gh.apiBase = null;
+    const m = await env.sched.autoMerge('task-1');
+    expect(m.state).toBe('waiting');
+    expect(m.reasons.join(' ')).toMatch(/derived approval refused: .*(server's base could not be read|GitHub API)/);
+    expect(env.gh.merges().filter((c) => c.includes('--auto'))).toHaveLength(0);
+    env.gh.apiBase = undefined;
+    expect((await sync(env)).tasks[0]!.merge).toMatchObject({ state: 'armed', head: H2 });
+  });
+
+  it('crash window: a base update that cannot be verified now is neither adopted nor reported as a foreign push', async () => {
+    const env = scanEnv();
+    const { head: H, branch } = await deliver(env, 'task-1');
+    const B = landOnMain(env, 'main.txt', 'x\n');
+    gitSync(env.layout.repo, 'fetch', '-q', 'origin', '+refs/heads/main:refs/remotes/origin/main');
+    const mt = await mergeTree(env.layout.repo, H, B);
+    if (mt.state !== 'clean') throw new Error('expected clean');
+    const made = await commitMerge(env.layout.repo, { tree: mt.tree, head: H, base: B, baseBranch: 'main', identity: env.config.git.identity });
+    if ('error' in made) throw new Error(made.error);
+    env.db.addEvidence({ task_id: 'task-1', head_sha: made.sha, kind: BASE_UPDATE_KIND, config_revision: env.config.configRevision, outcome: 'prepared', details_json: JSON.stringify({ from: H, base: B, tree: mt.tree }) });
+    gitSync(env.layout.repo, 'push', '-q', 'origin', `${made.sha}:refs/heads/${branch}`);
+    env.gh.apiBase = null;
+    expect(action(await scan(env), 'task-1')).toMatchObject({ action: 'skipped', message: expect.stringMatching(/may be a base update/) });
+    expect(env.db.events('task-1', 'foreign-push')).toHaveLength(0);
+    env.gh.apiBase = undefined;
+    expect(action(await scan(env), 'task-1')).toMatchObject({ action: 'adopted', newHead: made.sha });
+  });
+
+  it('the sensitive-path union includes diff(verified server base, H\'): a path where H\' differs from the real base counts', async () => {
+    const env = scanEnv();
+    const { branch, pr } = await deliver(env, 'task-1');
+    landOnMain(env, 'main.txt', 'x\n');
+    pr.mergeStateStatus = 'BEHIND';
+    const H2 = action(await scan(env), 'task-1')!.newHead!;
+    expect(bareHead(env, branch)).toBe(H2);
+    pr.mergeStateStatus = 'BLOCKED';
+    pr.rollup[H2] = passing;
+    // A sensitive path lands on the real main after the update: H' differs from the base there, which no
+    // link's diff(parent 2, H') shows. It counts (fail safe) until the next base update.
+    landOnMain(env, '.github/workflows/late.yml', 'on: push\n');
+    const m = (await sync(env)).tasks[0]!.merge!;
+    expect(m.state).toBe('awaiting-approval');
+    expect(m.reasons.join(' ')).toMatch(/\.github\/workflows\/late\.yml/);
+    expect(env.gh.merges().filter((c) => c.includes('--auto'))).toHaveLength(0);
+  });
+
+  it('serverRefOf: isolated ls-remote of the explicit URL; no url.* rewrite in the repository config or the environment applies', async () => {
+    const env = scanEnv();
+    const real = gitSync(env.bare, 'rev-parse', 'refs/heads/main');
+    const fake = join(tmp('minions-fake-origin-'), 'demo.git');
+    execFileSync('git', ['init', '-q', '--bare', fake]);
+    const X = commitFile(env.layout.repo, 'evil.txt', 'x\n');
+    gitSync(env.layout.repo, 'push', '-q', fake, `${X}:refs/heads/main`);
+    gitSync(env.layout.repo, 'config', '--add', `url.${fake}.insteadOf`, REMOTE);
+    gitSync(env.layout.repo, 'config', '--add', `url.${fake}.insteadOf`, env.bare);
+    // A tail-matching ref (refs/heads/x/refs/heads/main) is not origin's main.
+    gitSync(env.layout.repo, 'push', '-q', env.bare, `${X}:refs/heads/x/refs/heads/main`);
+    const origin = originOfPrUrl('https://github.com/acme/demo/pull/1')!;
+    expect(origin).toEqual({ https: REMOTE, repository: 'acme/demo' });
+    const taint = { GIT_CONFIG_PARAMETERS: `'url.${fake}.insteadof'='${env.bare}'`, HOME: tmp('minions-home-') };
+    writeFileSync(join(taint.HOME, '.gitconfig'), `[url "${fake}"]\n\tinsteadOf = ${env.bare}\n`);
+    expect(await tainted(taint, () => serverRefOf(env.layout.repo, origin, 'main', { serverUrl: env.serverUrl }))).toBe(real);
+    expect(await serverRefOf(env.layout.repo, origin, 'nope', { serverUrl: env.serverUrl })).toBeNull();
+    for (const bad of ['https://github.com/acme/demo/pulls', 'https://evil.example/acme/demo/pull/1', 'https://github.com/acme/../pull/1', null]) expect(originOfPrUrl(bad)).toBeNull();
   });
 });

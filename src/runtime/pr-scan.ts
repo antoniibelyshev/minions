@@ -18,13 +18,19 @@
 // - A PR head that is not the approved head is adopted only when it is a verified base update of it (the crash
 //   window between the push and moving publications.head_sha); anything else is a foreign push and is left
 //   alone (the merge gate disarms and waits).
+// - Where the server is: the repository of the task's recorded PR URL (publications.pr_url), never the
+//   repository's `origin` remote or url.* config (agent-writable). Every read of origin's base and of the PR
+//   branch, the fetch and the push go to that explicit https URL from an isolated git dir (base-update.ts
+//   serverRefOf / fetchBase / pushToServer); the base is also cross-checked with the GitHub API
+//   (verifiedServerBase) and a mismatch, or gh unavailable, skips the update.
 import { can } from '../config/capabilities.js';
 import type { MinionsConfig } from '../config/schema.js';
 import type { BacklogAdapter, Task, TaskStatus } from '../backlog/types.js';
 import { priorityRank } from '../backlog/ready.js';
 import { redact } from '../core/output.js';
 import {
-  BASE_UPDATE_KIND, commitExists, commitMerge, fetchBase, isolatedGit, mergeTree, parseBaseUpdate, serverBaseOf, verifyLink,
+  BASE_UPDATE_KIND, commitExists, commitMerge, fetchBase, isolatedGit, mergeTree, originOfPrUrl, parseBaseUpdate, pushToServer, serverRefOf,
+  verifiedServerBase, verifyLink, type ServerOrigin, type ServerOptions, type ServerUrlFn,
 } from './base-update.js';
 import { ciTimeoutOf, formatCiGate, type CiGate } from './ci-gate.js';
 import type { PublicationRow, RuntimeDb } from './db.js';
@@ -89,9 +95,13 @@ export interface ScanDeps {
    * get the signal directly).
    */
   signal?: AbortSignal;
+  /** Test seam: where git reaches the recorded origin URL (base-update.ts ServerUrlFn; default the URL itself). */
+  serverUrl?: ServerUrlFn;
 }
 
 const sig = (d: ScanDeps) => (d.signal ? { signal: d.signal } : {});
+/** Options of the calls that reach the server (the abort signal and the test seam). */
+const srv = (d: ScanDeps): ServerOptions => ({ ...sig(d), ...(d.serverUrl ? { serverUrl: d.serverUrl } : {}) });
 const short = (s: string) => redact(s.trim().split('\n').slice(-3).join(' | ')).slice(0, 400);
 const upper = (s: unknown) => String(s ?? '').toUpperCase();
 
@@ -185,8 +195,10 @@ async function scanOne(x: Ctx, task: Task, pub: PublicationRow | undefined, pr: 
   if (leased) return res('skipped', 'the task has an active lease; never touched while a worker holds it');
   if (pr.isDraft) return res('none', 'draft pull request');
   if (pr.baseRefName && pr.baseRefName !== cfg.git.baseBranch) return res('skipped', `the PR targets ${pr.baseRefName}, not ${cfg.git.baseBranch}`);
+  const server = originOfPrUrl(pub.pr_url);
+  if (!server) return res('skipped', `the recorded PR URL ${String(pub.pr_url)} is not a github.com pull request`);
   const head = pub.head_sha;
-  if (pr.headRefOid !== head) return adoptOrForeign(x, task, pub, pr, res);
+  if (pr.headRefOid !== head) return adoptOrForeign(x, task, pub, pr, server, res);
 
   // Required checks at the approved head: failing -> repair; timed out -> a notification.
   const ciRow = d.db.evidenceFor(task.id, head, 'ci');
@@ -204,7 +216,7 @@ async function scanOne(x: Ctx, task: Task, pub: PublicationRow | undefined, pr: 
   if (mss === 'UNKNOWN' || (!mss && upper(pr.mergeable) === 'UNKNOWN')) return res('retry', 'GitHub is still computing the merge state; retry on the next pass');
   const conflicting = mss === 'DIRTY' || upper(pr.mergeable) === 'CONFLICTING';
   if (mss !== 'BEHIND' && !conflicting) return res('none', `merge state ${mss ?? 'unknown'}: the merge pass decides`);
-  return baseUpdate(x, task, pub, conflicting, res);
+  return baseUpdate(x, task, pub, conflicting, server, res);
 }
 
 type Res = (action: ScanAction, message: string, extra?: Partial<ScanTaskResult>) => ScanTaskResult;
@@ -256,14 +268,16 @@ async function moveLocalBranch(d: ScanDeps, branch: string, from: string, to: st
 }
 
 /** The PR head moved off the approved head: adopt it only when it is a verified base update of it. */
-async function adoptOrForeign(x: Ctx, task: Task, pub: PublicationRow, pr: ScanPr, res: Res): Promise<ScanTaskResult> {
+async function adoptOrForeign(x: Ctx, task: Task, pub: PublicationRow, pr: ScanPr, server: ServerOrigin, res: Res): Promise<ScanTaskResult> {
   const { d, cfg } = x;
   const head = pub.head_sha, prHead = pr.headRefOid;
   const record = d.db.evidenceFor(task.id, prHead, BASE_UPDATE_KIND).at(-1);
   const rec = record ? parseBaseUpdate(record) : null;
   if (rec && rec.from === head && await commitExists(d.repo, prHead, sig(d))) {
-    const serverBase = await serverBaseOf(d.repo, x.origin.remote, cfg.git.baseBranch, sig(d));
-    const link = await verifyLink(d.repo, prHead, record, { serverBase, configRevision: cfg.configRevision, ...sig(d) });
+    const vb = await verifiedServerBase({ repo: d.repo, gh: d.gh, origin: server, base: cfg.git.baseBranch, ...srv(d) });
+    // Not verifiable now (gh down, a git/API mismatch): neither adopted nor reported as foreign; the next pass retries.
+    if ('error' in vb) return res('skipped', `the PR head ${prHead.slice(0, 12)} may be a base update of ${head.slice(0, 12)}, but ${vb.error}`);
+    const link = await verifyLink(d.repo, prHead, record, { serverBase: vb.sha, configRevision: cfg.configRevision, ...sig(d) });
     if (!link.problems.length && link.from === head) {
       const local = await headOf(d.repo, pub.branch);
       const moved = local === prHead ? null : local === head ? await moveLocalBranch(d, pub.branch, head, prHead) : `${pub.branch} is at ${String(local).slice(0, 12)}`;
@@ -286,16 +300,22 @@ async function note(d: ScanDeps, taskId: string, text: string): Promise<void> {
 }
 
 /** BEHIND (or DIRTY): fetch, merge-tree, and when clean commit-tree + disarm + fast-forward push. */
-async function baseUpdate(x: Ctx, task: Task, pub: PublicationRow, conflicting: boolean, res: Res): Promise<ScanTaskResult> {
-  const { d, cfg, origin } = x;
+async function baseUpdate(x: Ctx, task: Task, pub: PublicationRow, conflicting: boolean, server: ServerOrigin, res: Res): Promise<ScanTaskResult> {
+  const { d, cfg } = x;
   const base = cfg.git.baseBranch;
   const H = pub.head_sha;
-  // Every git call the update's result depends on runs with the allowlisted environment (base-update.ts
-  // header), never through d.git; d.git only pushes and moves the local branch.
-  const fetched = await fetchBase(d.repo, origin.remote, base, sig(d));
-  if (!fetched.ok) return res('skipped', fetched.message);
-  const B = await serverBaseOf(d.repo, origin.remote, base, sig(d));
-  if (!B || !(await commitExists(d.repo, B, sig(d)))) return res('skipped', `origin's ${base} could not be read or fetched`);
+  // Every git call the update's result depends on runs with the allowlisted environment in an isolated git
+  // dir (base-update.ts header), never through d.git; the server is the recorded origin URL, and its base is
+  // cross-checked with the GitHub API. d.git only moves the local branch (and reads the reviewed paths).
+  const vb = await verifiedServerBase({ repo: d.repo, gh: d.gh, origin: server, base, ...srv(d) });
+  if ('error' in vb) return res('skipped', `no base update: ${vb.error}`);
+  const B = vb.sha;
+  if (!(await commitExists(d.repo, B, sig(d)))) {
+    const haves = [H, ...d.db.leases({ taskId: task.id, all: true }).map((l) => l.base_sha ?? '')];
+    const fetched = await fetchBase(d.repo, server, base, { ...srv(d), haves });
+    if (!fetched.ok) return res('skipped', fetched.message);
+    if (!(await commitExists(d.repo, B, sig(d)))) return res('skipped', `origin's ${base} at ${B.slice(0, 12)} could not be fetched`);
+  }
   if ((await isolatedGit(d.repo, ['merge-base', '--is-ancestor', B, H], sig(d))).code === 0) return res('none', `${H.slice(0, 12)} already contains ${base} at ${B.slice(0, 12)} (GitHub's state is stale)`);
 
   const mt = await mergeTree(d.repo, H, B, sig(d));
@@ -322,14 +342,14 @@ async function baseUpdate(x: Ctx, task: Task, pub: PublicationRow, conflicting: 
   if (local !== H) return res('skipped', `${pub.branch} is at ${String(local).slice(0, 12)}, not the approved head`);
   const wt = (await listWorktrees(d.repo)).find((w) => w.branch === pub.branch);
   if (wt && await isDirty(wt.path)) return res('skipped', `the worktree ${wt.path} has uncommitted changes`);
-  const remoteHead = await serverBaseOf(d.repo, origin.remote, pub.branch, sig(d));
+  const remoteHead = await serverRefOf(d.repo, server, pub.branch, srv(d));
   if (remoteHead !== H) return res('skipped', `origin/${pub.branch} is at ${String(remoteHead).slice(0, 12)}, not the approved head`);
 
   const made = await commitMerge(d.repo, { tree: mt.tree, head: H, base: B, baseBranch: base, identity: cfg.git.identity }, sig(d));
   if ('error' in made) return res('base-update-failed', made.error);
   const H2 = made.sha;
-  // Policy for the push: the reviewed paths plus what the merge commit changes against the base (a union).
-  const gated = await gateChangedPaths({ git: d.git, repo: d.repo, remote: origin.remote, base, head: H, branch: pub.branch,
+  // Policy for the push: the reviewed paths plus what the merge commit changes against the verified base (a union).
+  const gated = await gateChangedPaths({ git: d.git, repo: d.repo, remote: server.https, base, head: H, branch: pub.branch, serverBase: B,
     baseShas: d.db.leases({ taskId: task.id, all: true }).map((l) => l.base_sha), sensitivePaths: cfg.sensitivePaths });
   if (!gated.ok) return res('skipped', `no base update: ${gated.message}`);
   const diff = await isolatedGit(d.repo, ['diff', '--name-only', '--no-renames', '-z', B, H2], sig(d));
@@ -344,7 +364,9 @@ async function baseUpdate(x: Ctx, task: Task, pub: PublicationRow, conflicting: 
   // is adopted on the next pass instead of looking like a foreign push.
   d.db.addEvidence({ task_id: task.id, head_sha: H2, kind: BASE_UPDATE_KIND, config_revision: cfg.configRevision, outcome: 'prepared',
     details_json: JSON.stringify({ from: H, base: B, tree: mt.tree }) });
-  const p = await d.git(d.repo, ['push', '--porcelain', origin.remote, `${H2}:refs/heads/${pub.branch}`], true);
+  // To the recorded URL from the isolated dir: no pushInsteadOf / pushurl can send it elsewhere while the
+  // publication head moves.
+  const p = await pushToServer(d.repo, server, H2, pub.branch, srv(d));
   if (p.code !== 0) {
     const err = short(p.stderr || p.stdout) || `git exit ${p.code}`;
     const raced = /non-fast-forward|fetch first|rejected|stale info/i.test(p.stderr + p.stdout);

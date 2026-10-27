@@ -28,12 +28,15 @@ import type { ErrorCode } from '../core/errors.js';
 import { redact } from '../core/output.js';
 import { readFile } from 'node:fs/promises';
 import type { CiGate } from './ci-gate.js';
-import { BASE_UPDATE_KIND, commitExists, deriveApproval, derivedApprovalProblems, fetchBase, serverBaseOf, withIsolatedRepo, type DerivedApproval } from './base-update.js';
+import {
+  BASE_UPDATE_KIND, commitExists, deriveApproval, derivedApprovalProblems, fetchBase, originOfPrUrl, verifiedServerBase, withIsolatedRepo,
+  type DerivedApproval, type ServerUrlFn,
+} from './base-update.js';
 import { formatCiGate } from './ci-gate.js';
 import type { EvidenceRow, RuntimeDb } from './db.js';
 import type { GitFn } from './github.js';
 import { missingApprovalKeyReason } from './paths.js';
-import { classifyFailure, gateChangedPaths, githubOrigin, type GhFn } from './publish.js';
+import { classifyFailure, gateChangedPaths, type GhFn } from './publish.js';
 
 export type MergeState =
   /** delivery.merge is not "auto-when-eligible" and minions armed nothing: no gh call was made. */
@@ -91,6 +94,8 @@ export interface MergeDeps {
   ciGate: (taskId: string, head: string) => Promise<CiGate>;
   approvalPublicKeyFile: string;
   now?: () => Date;
+  /** Test seam: where git reaches the recorded origin URL (base-update.ts ServerUrlFn; default the URL itself). */
+  serverUrl?: ServerUrlFn;
 }
 
 /** Last arm/disarm record: whether a PR's auto-merge was enabled by minions (and not disabled since). */
@@ -236,32 +241,42 @@ export async function autoMergeTask(d: MergeDeps, taskId: string): Promise<Merge
   const isReviewed = (h: string) => d.db.evidenceFor(taskId, h, 'reviewer', cfg.configRevision).some((e) => e.outcome === 'complete');
   const reviewed = isReviewed(head);
   const ci = await d.ciGate(taskId, head);
-  const origin = await githubOrigin(d.git, d.repo);
+  // The server is the repository of the recorded PR URL, never the workspace's (agent-writable) origin remote
+  // or url.* config; its base is read from an isolated git dir and cross-checked with the GitHub API.
+  const origin = originOfPrUrl(prUrl);
+  const base = cfg.git.baseBranch;
+  const srv = d.serverUrl ? { serverUrl: d.serverUrl } : {};
+  const vb = origin ? await verifiedServerBase({ repo: d.repo, gh: d.gh, origin, base, ...srv }) : { error: `${prUrl} is not a github.com pull request` };
+  let serverBase = 'sha' in vb ? vb.sha : null;
   let task: Task | null = null;
   try { task = await d.backlog.getTask(taskId); } catch { task = null; }
   // Base update (task-68.3): the record is a hint; every condition is recomputed from git objects here
   // and the pure gate accepts the verified chain. Sensitive paths are those of the reviewed head plus
-  // what each base-update commit changes against its base (a union: no base removes a path).
+  // what each base-update commit changes against its base, plus diff(verified server base, approved head)
+  // (a union: no base removes a path, and content that arrived through the base side shows up).
   let derived: DerivedApproval | undefined;
   if (!reviewed && origin && d.db.evidenceFor(taskId, head, BASE_UPDATE_KIND).length) {
-    const base = cfg.git.baseBranch;
     // Every git call of the derivation (ls-remote and fetch included) uses the allowlisted environment, never d.git.
-    let serverBase = await serverBaseOf(d.repo, origin.remote, base);
-    if (serverBase && !(await commitExists(d.repo, serverBase))) { await fetchBase(d.repo, origin.remote, base); serverBase = await serverBaseOf(d.repo, origin.remote, base); }
+    if (serverBase && !(await commitExists(d.repo, serverBase))) {
+      await fetchBase(d.repo, origin, base, { ...srv, haves: [head] });
+      if (!(await commitExists(d.repo, serverBase))) serverBase = null;
+    }
     derived = await deriveApproval({ repo: d.repo, db: d.db, taskId, head, configRevision: cfg.configRevision, serverBase, isReviewed });
+    if (!serverBase && 'error' in vb) derived.problems.push(vb.error);
   }
   const pathsHead = derived && !derivedApprovalProblems(derived, head).length ? derived.reviewedHead! : head;
   let paths: MergeGateInput['paths'] = origin
-    ? await gateChangedPaths({ git: d.git, repo: d.repo, remote: origin.remote, base: cfg.git.baseBranch, head: pathsHead, branch: pub.branch,
+    ? await gateChangedPaths({ git: d.git, repo: d.repo, remote: origin.https, base, head: pathsHead, branch: pub.branch, serverBase,
       baseShas: d.db.leases({ taskId, all: true }).map((l) => l.base_sha), sensitivePaths: cfg.sensitivePaths })
-    : { ok: false as const, message: 'origin is not a github.com repository' };
+    : { ok: false as const, message: `${prUrl} is not a github.com pull request` };
   if (paths.ok && pathsHead !== head) {
     const changed = new Set(paths.changedPaths);
-    // Isolated like the derivation itself (base-update.ts withIsolatedRepo): only git objects count.
+    // Isolated like the derivation itself (base-update.ts withIsolatedRepo): only git objects count. An
+    // accepted derivation always has a verified server base (the ancestry check needs it).
     const failed = await withIsolatedRepo(d.repo, async (iso) => {
-      for (const l of derived!.links) {
-        const r = await iso.git(iso.dir, ['diff', '--name-only', '--no-renames', '-z', l.base!, l.head], true);
-        if (r.code !== 0) return `cannot diff the base update ${l.head.slice(0, 12)} against ${l.base!.slice(0, 12)}`;
+      for (const [from, to] of [...derived!.links.map((l) => [l.base!, l.head] as const), [serverBase!, head] as const]) {
+        const r = await iso.git(iso.dir, ['diff', '--name-only', '--no-renames', '-z', from, to], true);
+        if (r.code !== 0) return `cannot diff the base update ${to.slice(0, 12)} against ${from.slice(0, 12)}`;
         for (const f of r.stdout.split('\0')) if (f) changed.add(f);
       }
       return null;

@@ -27,6 +27,7 @@ import { readRequiredChecks, type RequiredChecksReport } from './ci.js';
 import { ciGateFromDb, formatCiGate, type CiGate } from './ci-gate.js';
 import { autoMergeTask, type MergeResult } from './merge.js';
 import { runPrScan, type ConflictInfo, type ScanReport } from './pr-scan.js';
+import type { ServerUrlFn } from './base-update.js';
 import { abortableGit, BRANCH_PREFIX, branchFor, ensureBranchWorktree, ensureReviewWorktree, git, headOf, resolveBaseBranch, taskSlug, workspaceLayout, type WorkspaceLayout } from './worktree.js';
 
 export const LEASE_ROLES: readonly BuiltinLeaseRole[] = ['engineer', 'tester', 'reviewer'];
@@ -64,6 +65,11 @@ export interface SchedulerDeps {
   phase?: PhaseRules;
   /** Process-harness run records (agent-runtimes D3b). Omitted: no run records are consulted (tests of other paths). */
   runs?: RunControl;
+  /**
+   * Test seam of the merge gate and the PR scan: where git reaches the recorded origin URL (base-update.ts
+   * ServerUrlFn). Production never sets it: git contacts the https URL itself.
+   */
+  serverUrl?: ServerUrlFn;
 }
 
 /**
@@ -319,9 +325,11 @@ export class Scheduler {
   private readonly gh: GhFn;
   private readonly now: () => Date;
   private readonly runs: RunControl | null;
+  private readonly serverUrl: ServerUrlFn | undefined;
 
   constructor(deps: SchedulerDeps) {
     this.runs = deps.runs ?? null;
+    this.serverUrl = deps.serverUrl;
     this.db = deps.db; this.backlog = deps.backlog; this.config = deps.config;
     this.layout = deps.layout ?? workspaceLayout();
     this.handoff = deps.handoff ?? null;
@@ -1520,6 +1528,7 @@ export class Scheduler {
     return autoMergeTask({
       db: this.db, backlog: this.backlog, config: this.config, repo: this.layout.repo, gh: this.gh, git,
       ciGate: (id, head) => this.ciGate(id, head), approvalPublicKeyFile: this.approvalPublicKeyFile, now: this.now,
+      ...(this.serverUrl ? { serverUrl: this.serverUrl } : {}),
     }, taskId);
   }
 
@@ -1533,6 +1542,7 @@ export class Scheduler {
       ...(opts.signal ? { signal: opts.signal } : {}),
       ciGate: (id, head) => this.ciGate(id, head), ciRepair: (id, head, findings) => this.ciRepair(id, head, findings),
       now: this.now, ...(opts.deadline !== undefined ? { deadline: opts.deadline } : {}), ...(opts.onConflict ? { onConflict: opts.onConflict } : {}),
+      ...(this.serverUrl ? { serverUrl: this.serverUrl } : {}),
     }, { taskIds: opts.taskIds });
   }
 

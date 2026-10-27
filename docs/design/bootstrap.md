@@ -697,15 +697,17 @@ Decision record for the PR scan (task-68.3, phase 2 of the unattended-delivery d
 Decision record for updating a behind PR by code (task-68.3, design decision 5; `src/runtime/base-update.ts`,
 the scan above, `evaluateMergeGate` / `autoMergeTask` in `src/runtime/merge.ts`).
 
-- **The update.** `B` = origin's base read with `ls-remote` after a fetch into
-  `refs/remotes/origin/<base>` (the local base branch is not moved). `B` already in `H`: nothing to do.
+- **The update.** `B` = origin's base, verified (see "Where the server is" below) and fetched when it is
+  not in the object store (`refs/remotes/origin/<base>` then points at the fetched tip; the local base
+  branch is not moved). `B` already in `H`: nothing to do.
   Otherwise `git merge-tree --write-tree H B` with fixed options (`MERGE_TREE_CONFIG`: `merge.default=text`,
   renames on, no renormalization, no user attributes file); a conflict goes to the conflict row above.
   Then `git commit-tree <tree> -p H -p B` with `git.identity` (unsigned) gives `H'`; the push policy is
   `can(git.push)` on the union of the reviewed paths and `diff(B, H')`, which must be `allow` (an `ask`
   approval is per head, so the update is skipped). Minions' own auto-merge is disarmed first, the
-  `base-update` evidence `{from: H, base: B, tree}` is written on `H'`, then `git push <remote>
-  H':refs/heads/<branch>` (never force; a rejection means someone else pushed: skipped and recorded),
+  `base-update` evidence `{from: H, base: B, tree}` is written on `H'`, then `git push <recorded URL>
+  H':refs/heads/<branch>` from the isolated dir (never force; a rejection means someone else pushed:
+  skipped and recorded),
   the local branch (and its clean worktree, `merge --ff-only`) moves to `H'` and `publications.head_sha`
   moves `H` → `H'` (compare-and-swap). The local branch, its worktree and origin's branch must all be at
   `H` first, and the worktree must be clean.
@@ -725,6 +727,24 @@ the scan above, `evaluateMergeGate` / `autoMergeTask` in `src/runtime/merge.ts`)
   refs, grafts) changes the result; commit-graph files and replace refs are off. On git ≥ 2.42
   `attr.tree` is pinned to the empty tree. git 2.39 (the image's) has no `attr.tree` and reads
   attributes only from the work tree and the index, both empty here.
+- **Where the server is.** The server is the repository of the task's recorded PR URL
+  (`publications.pr_url`, `https://github.com/<o>/<r>/pull/<n>` → `https://github.com/<o>/<r>.git`),
+  never the workspace's `origin` remote. Every network call the update or the derivation depends on
+  (`ls-remote` of the base and of the PR branch, the fetch, the push) runs in the isolated git dir
+  against that explicit URL (`serverRefOf`, `fetchBase`, `pushToServer`): its config has no `url.*`,
+  `remote.*`, `http.*` or `credential.*` section, global and system config are off, and the credential
+  helper is passed on the command line (container: the literal `/usr/local/bin/minions git-credential`;
+  host: the hardened `-c` options with the runtime's shim). So `url.<x>.insteadOf`,
+  `url.<x>.pushInsteadOf`, `remote.origin.pushurl` / `uploadpack` or a proxy in the agent-writable
+  `.git/config` change nothing, and a push cannot go elsewhere while `publications.head_sha` moves.
+  The base SHA is also cross-checked with GitHub's API (`gh api --hostname github.com
+  /repos/<o>/<r>/branches/<base>` `.commit.sha`; gh reads no repository config): a mismatch, or gh
+  unavailable, skips the update and refuses the derived approval (fail closed; the API is asked first,
+  so nothing goes over the network when it fails). The same verified base is the merge gate's and the
+  scan's remote base for `gateChangedPaths` (no `ls-remote` of its own there). No automatic gc or
+  maintenance runs in the isolated dir (it has none of the repository's refs, so a gc there would
+  prune the shared store). Tests reach a local bare repository only through a code seam
+  (`serverUrl` in `SchedulerDeps` / `ScanDeps` / `MergeDeps`), never through config or the environment.
 - **Allowlisted environment.** An agent can run a minions command (`work record`, `sync`, ...) with an
   environment of its choice, so these calls, and the `ls-remote` / `fetch` of the server's base, never
   inherit the minions process environment and never go through the caller's `GitFn`
@@ -741,13 +761,16 @@ the scan above, `evaluateMergeGate` / `autoMergeTask` in `src/runtime/merge.ts`)
 - **Derived approval.** The record is only a hint. On every merge pass the caller (`autoMergeTask`)
   recomputes each link `H' → H` from git objects (`deriveApproval` / `verifyLink`): exactly two
   parents, the record agrees with them and with the tree, parent 2 is an ancestor of (or equal to) the
-  server's base (`ls-remote`; fetched when missing), `tree(H')` equals a clean merge-tree of the
+  verified server base (above; fetched when missing), `tree(H')` equals a clean merge-tree of the
   parents, and the record was written at the current config revision. Chains `H → H' → H''` are
   followed, at most `MAX_BASE_UPDATE_CHAIN` (8) links, and must end at reviewer evidence `complete` at
   the current config revision. The pure `evaluateMergeGate` accepts the passed-in result only when the
   chain starts at the approved head, is contiguous, every check holds and it ends at the reviewed head
   (`derivedApprovalProblems`). CI is never derived: required checks must pass at `H'`. Sensitive paths
-  of `H'` are `gateChangedPaths(H)` ∪ `diff(B, H')` per link (a union: no base removes a path).
+  of `H'` are `gateChangedPaths(H)` ∪ `diff(B, H')` per link ∪ `diff(verified server base, H')` (a
+  union: no base removes a path, and anything where `H'` differs from the real base counts, also
+  content that arrived through the base side; a sensitive path that lands on the base after the
+  update counts too until the next update, which fails safe).
   `pr.merge: ask` stays per head, so `H'` needs a new merge approval (unattended delivery needs `allow`).
 - **Crash window.** A crash between the push and moving the publication head leaves the PR at `H'`
   with the record written. The next scan adopts `H'` only when its link verifies from git and starts at
@@ -758,14 +781,20 @@ the scan above, `evaluateMergeGate` / `autoMergeTask` in `src/runtime/merge.ts`)
   base or the PR branches, because the runtime's merge commits are unsigned and GitHub would reject the
   push (base updates then fail and are reported); `capabilities.pr.merge: "allow"` and `git.push`
   allowed for the branch's paths.
-- **Residuals.** The server base comes from `ls-remote`, which in the container resolves through
-  the repository's own (agent-writable) git config, `remote.origin.url` and `url.*.insteadOf` (the
-  same residual as the sensitive-path gate). `PATH` is kept, so the `git` binary (and the credential
-  helper) is found through the caller's `PATH`, and `TMPDIR` picks where the isolated dir is
-  created. The object store is shared with agents and git does not re-hash objects on read. Calls
-  outside the derivation still use the caller's `GitFn` and environment in the container: the push,
-  moving the local branch, `headOf` / `isDirty` / `listWorktrees`, `githubOrigin`, and
-  `gateChangedPaths` (the reviewed head's sensitive paths, shared with publication). A few short local git calls
+- **Residuals.** `PATH` is kept, so the `git` binary, the credential helper and `gh` are found
+  through the caller's `PATH`; `gh` also runs with the caller's environment (`GH_CONFIG_DIR`,
+  `HOME`, proxies; `--hostname` pins the host), so the API cross-check is defence in depth on top of
+  the isolated, explicit-URL git read. `TMPDIR` picks where the isolated dir is created. Network calls
+  keep the proxy variables (TLS to github.com is still verified; no CA variable is kept) and
+  `MINIONS_*` (an agent-chosen token file only changes who authenticates, not where git goes). The
+  object store is shared with agents and git does not re-hash objects on read; locating it reads the
+  repository's `.git` (a gitfile could point elsewhere). Calls outside the derivation still use the
+  caller's `GitFn` and environment in the container: moving the local branch, `headOf` / `isDirty` /
+  `listWorktrees`, `githubOrigin` (only picks the repository the single `gh pr list` reads; PRs are
+  matched to the recorded URLs), and `gateChangedPaths`' local reads (the reviewed head's paths:
+  merge-base, diff, rev-parse; replace refs there are task-71). Publication itself (`publishTask`:
+  its `ls-remote`, push and `gateBases`' `ls-remote`) still goes through the `origin` remote of the
+  workspace config, as before this task. A few short local git calls
   of the scan (`headOf`, `isDirty`, `listWorktrees`) and the CI gate's gh reads are not wired to the
   abort signal; their own timeouts bound them. Not built here: the
   needs-rebase stage for real conflicts (task-68.4) and the routine pass that runs the scan on a clock

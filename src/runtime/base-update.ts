@@ -2,7 +2,7 @@
 // derived approval"; design: docs/design/unattended-delivery.md decision 5, task-68.3).
 //
 // - A delivered PR at its approved head H that GitHub reports BEHIND (or DIRTY, when a local merge-tree
-//   finds it clean) is updated by code, without a model: B = origin's base (ls-remote, fetched), the tree
+//   finds it clean) is updated by code, without a model: B = origin's base (verified, fetched), the tree
 //   of `git merge-tree --write-tree H B` (fixed options, built-in merge drivers only), `git commit-tree
 //   <tree> -p H -p B` with the runtime's git identity gives H'. H' is pushed as a fast-forward of the PR
 //   branch (never force; a rejection means someone else pushed), and `publications.head_sha` moves to H'.
@@ -26,6 +26,11 @@
 //   An agent invoking a minions command chooses that environment, so GIT_COMMON_DIR, GIT_GRAFT_FILE,
 //   GIT_CONFIG_PARAMETERS, GIT_ATTR_SOURCE, HOME/.gitconfig and the like must not count. These calls
 //   therefore never go through a caller's GitFn.
+// - The server is the repository of the recorded PR URL (originOfPrUrl), never the workspace's `origin`
+//   remote: ls-remote, fetch and push run in the isolated git dir against that explicit https URL (no
+//   url.* / remote.* / http.* / credential.* config of the repository; the credential helper is passed on
+//   the command line), and the base SHA is cross-checked with GitHub's API (verifiedServerBase; gh reads no
+//   repository config). A mismatch or an unavailable gh fails closed.
 import { mkdtemp, mkdir, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
@@ -33,8 +38,9 @@ import type { MinionsConfig } from '../config/schema.js';
 import type { RunResult } from '../core/exec.js';
 import { redact } from '../core/output.js';
 import type { EvidenceRow, RuntimeDb } from './db.js';
-import { allowlistedGit } from './git-hardening.js';
-import type { GitFn } from './github.js';
+import { allowlistedGit, isHostRuntime } from './git-hardening.js';
+import { GIT_CREDENTIAL_HELPER, GITHUB_CREDENTIAL_KEY, type GitFn } from './github.js';
+import type { GhFn } from './publish.js';
 
 /** Longest chain of base updates a derived approval follows (H -> H' -> ... ); longer chains need a new review. */
 export const MAX_BASE_UPDATE_CHAIN = 8;
@@ -51,9 +57,14 @@ export const MERGE_TREE_CONFIG = [
 ];
 /**
  * Fixed options of every isolated call: no commit-graph (a worker-writable file in the object store that
- * could lie about parents), no replace refs, no untracked cache.
+ * could lie about parents), no replace refs, no untracked cache, no hooks. No automatic gc or maintenance:
+ * the isolated dir shares the repository's object store but has none of its refs, so a gc there (after a
+ * fetch) would prune the repository's objects.
  */
-export const ISOLATED_GIT_CONFIG = ['core.commitGraph=false', 'core.useReplaceRefs=false', 'core.untrackedCache=false', 'core.hooksPath=/dev/null', 'core.fsmonitor=false'];
+export const ISOLATED_GIT_CONFIG = [
+  'core.commitGraph=false', 'core.useReplaceRefs=false', 'core.untrackedCache=false', 'core.hooksPath=/dev/null', 'core.fsmonitor=false',
+  'gc.auto=0', 'maintenance.auto=false', 'fetch.writeCommitGraph=false', 'submodule.recurse=false', 'fetch.recurseSubmodules=false',
+];
 /** The empty tree per object format: git >= 2.42 reads attributes from `attr.tree` when set (pinned to nothing). */
 const EMPTY_TREE: Record<string, string> = {
   sha1: '4b825dc642cb6eb9a060e54bf8d69288fbee4904',
@@ -98,6 +109,8 @@ export interface IsolatedRepo { git: GitFn; dir: string; objectFormat: string }
 
 /** Options of the allowlisted calls: an abort signal (the scan's budget) kills in-flight children. */
 export interface CleanGitOptions { signal?: AbortSignal }
+/** withIsolatedRepo: `network` keeps the proxy and MINIONS_* variables (git-hardening.ts allowlistedGitEnv) for ls-remote / fetch / push. */
+export interface IsolatedOptions extends CleanGitOptions { network?: boolean }
 
 /** Runs `fn` with an empty directory as git's HOME (removed afterwards). */
 async function withEmptyHome<T>(fn: (home: string) => Promise<T>): Promise<T> {
@@ -111,7 +124,7 @@ async function withEmptyHome<T>(fn: (home: string) => Promise<T>): Promise<T> {
  * GitFn). The temporary directory (under os.tmpdir(), never inside a checkout; it also holds the empty
  * HOME) is removed afterwards. Throws when the repository's object store cannot be located.
  */
-export async function withIsolatedRepo<T>(repo: string, fn: (iso: IsolatedRepo) => Promise<T>, opts: CleanGitOptions = {}): Promise<T> {
+export async function withIsolatedRepo<T>(repo: string, fn: (iso: IsolatedRepo) => Promise<T>, opts: IsolatedOptions = {}): Promise<T> {
   const root = await mkdtemp(join(tmpdir(), 'minions-iso-'));
   try {
     const home = join(root, 'home'), gitDir = join(root, 'git'), work = join(root, 'wt');
@@ -124,12 +137,14 @@ export async function withIsolatedRepo<T>(repo: string, fn: (iso: IsolatedRepo) 
     await mkdir(join(gitDir, 'info'), { recursive: true });
     await mkdir(work);
     await writeFile(join(gitDir, 'HEAD'), 'ref: refs/heads/minions-isolated\n');
-    await writeFile(join(gitDir, 'config'), format === 'sha1'
+    // gc / maintenance off in the file too (see ISOLATED_GIT_CONFIG): a gc here would prune the shared store.
+    await writeFile(join(gitDir, 'config'), (format === 'sha1'
       ? '[core]\n\trepositoryformatversion = 0\n\tbare = false\n'
-      : `[core]\n\trepositoryformatversion = 1\n\tbare = false\n[extensions]\n\tobjectformat = ${format}\n`);
+      : `[core]\n\trepositoryformatversion = 1\n\tbare = false\n[extensions]\n\tobjectformat = ${format}\n`) + '[gc]\n\tauto = 0\n[maintenance]\n\tauto = false\n');
     await symlink(objects, join(gitDir, 'objects'));
     const lead = [`--git-dir=${gitDir}`, `--work-tree=${work}`, ...cfgArgs([...ISOLATED_GIT_CONFIG, `attr.tree=${EMPTY_TREE[format]}`])];
-    const iso: GitFn = (_cwd, args, allowFailure) => allowlistedGit(work, [...lead, ...args], !!allowFailure, clean);
+    const run = { ...clean, ...(opts.network ? { network: true } : {}) };
+    const iso: GitFn = (_cwd, args, allowFailure) => allowlistedGit(work, [...lead, ...args], !!allowFailure, run);
     return await fn({ git: iso, dir: work, objectFormat: format });
   } finally {
     await rm(root, { recursive: true, force: true }).catch(() => {});
@@ -314,21 +329,132 @@ async function verifyLinkIn(iso: IsolatedRepo, head: string, record: Pick<Eviden
   return link;
 }
 
-/** Network call in `repo` with the allowlisted environment (an empty HOME; the repository's own config only). */
-const networkGit = (repo: string, args: string[], opts: CleanGitOptions) =>
-  withEmptyHome((home) => allowlistedGit(repo, args, true, { home, network: true, ...(opts.signal ? { signal: opts.signal } : {}) }));
+// ---------------------------------------------------------------- the server (origin on GitHub)
 
-/** origin's branch `base` as the server reports it (ls-remote, allowlisted environment), or null. */
-export async function serverBaseOf(repo: string, remote: string, base: string, opts: CleanGitOptions = {}): Promise<string | null> {
-  const ls = await networkGit(repo, ['ls-remote', '--heads', remote, `refs/heads/${base}`], opts);
-  const sha = ls.code === 0 ? ls.stdout.trim().split(/\s+/)[0] ?? '' : '';
-  return FULL_SHA.test(sha) ? sha : null;
+/** The GitHub repository a task was delivered to, from minions' own record (the publication's PR URL). */
+export interface ServerOrigin { https: string; repository: string }
+/**
+ * Test seam: the URL git contacts for a recorded https origin (default: the URL itself). Only code sets it
+ * (tests point it at a local bare repository); never config, the environment or the repository.
+ */
+export type ServerUrlFn = (https: string) => string;
+export interface ServerOptions extends CleanGitOptions { serverUrl?: ServerUrlFn }
+
+const PR_URL = /^https:\/\/github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/pull\/\d+$/;
+
+/** The origin of a recorded PR URL (`https://github.com/<o>/<r>/pull/<n>`), or null. */
+export function originOfPrUrl(prUrl: string | null | undefined): ServerOrigin | null {
+  const m = PR_URL.exec(String(prUrl ?? '').trim());
+  if (!m) return null;
+  const [, owner, repo] = m as unknown as [string, string, string];
+  if ([owner, repo].some((p) => p === '.' || p === '..' || p.startsWith('-') || p.endsWith('.git'))) return null;
+  return { https: `https://github.com/${owner}/${repo}.git`, repository: `${owner}/${repo}` };
 }
 
-/** Fetches origin's base into refs/remotes/origin/<base> (never moves the local base branch; allowlisted environment). */
-export async function fetchBase(repo: string, remote: string, base: string, opts: CleanGitOptions = {}): Promise<{ ok: true } | { ok: false; message: string }> {
-  const f = await networkGit(repo, ['fetch', '--no-tags', remote, `+refs/heads/${base}:refs/remotes/origin/${base}`], opts);
-  return f.code === 0 ? { ok: true } : { ok: false, message: `fetching ${base} from origin failed: ${tail(f.stderr) || `git exit ${f.code}`}` };
+/**
+ * Credential helper of a network call, given explicitly (the isolated config has none). The host runtime's
+ * hardened `-c` options (allowlistedGit) already reset the list and add its shim; the container names the
+ * literal helper path (never an environment variable an agent could set).
+ */
+const credentialArgs = () => (isHostRuntime() ? [] : cfgArgs(['credential.helper=', `${GITHUB_CREDENTIAL_KEY}=${GIT_CREDENTIAL_HELPER}`]));
+/** Fixed options of the isolated network calls (on top of ISOLATED_GIT_CONFIG). */
+const NETWORK_GIT_CONFIG = ['credential.interactive=false', 'http.followRedirects=initial', 'push.gpgSign=false'];
+
+/**
+ * One network call in an isolated git dir (withIsolatedRepo: its own config with no url.*, remote.*,
+ * http.* or credential sections; the allowlisted environment with an empty HOME and no global or system
+ * config) against the explicit URL of the recorded origin. Nothing in the repository's .git/config
+ * (insteadOf, pushInsteadOf, pushurl, a proxy, a helper) or the caller's environment changes where it goes.
+ */
+async function serverGit<T>(repo: string, fn: (run: (args: string[]) => Promise<RunResult>, iso: IsolatedRepo) => Promise<T>, opts: CleanGitOptions): Promise<T> {
+  return withIsolatedRepo(repo, (iso) => fn((args) => iso.git(iso.dir, [...credentialArgs(), ...cfgArgs(NETWORK_GIT_CONFIG), ...args], true), iso),
+    { ...(opts.signal ? { signal: opts.signal } : {}), network: true });
+}
+const urlOf = (origin: ServerOrigin, opts: ServerOptions) => (opts.serverUrl ?? ((u: string) => u))(origin.https);
+
+/** The SHA of exactly `refs/heads/<branch>` in `ls-remote` output (patterns match ref tails, so filter). */
+function refSha(stdout: string, branch: string): string | null {
+  for (const line of stdout.split('\n')) {
+    const [sha = '', ref = ''] = line.trim().split(/\s+/);
+    if (ref === `refs/heads/${branch}` && FULL_SHA.test(sha)) return sha;
+  }
+  return null;
+}
+
+/** origin's branch `branch` as the server reports it (isolated ls-remote against the recorded URL), or null. */
+export async function serverRefOf(repo: string, origin: ServerOrigin, branch: string, opts: ServerOptions = {}): Promise<string | null> {
+  try {
+    const ls = await serverGit(repo, (git) => git(['ls-remote', '--heads', urlOf(origin, opts), `refs/heads/${branch}`]), opts);
+    return ls.code === 0 ? refSha(ls.stdout, branch) : null;
+  } catch { return null; }
+}
+
+/**
+ * GitHub's own view of `branch` (`gh api repos/<o>/<r>/branches/<branch>`, pinned to github.com): gh reads
+ * no repository config, so a git-side redirect cannot also forge this. Null when gh fails or says nothing.
+ */
+export async function githubBranchSha(gh: GhFn, origin: ServerOrigin, branch: string, opts: CleanGitOptions = {}): Promise<{ sha: string } | { error: string }> {
+  const path = `/repos/${origin.repository}/branches/${branch.split('/').map(encodeURIComponent).join('/')}`;
+  const r = await gh(['api', '--method', 'GET', '-H', 'Accept: application/vnd.github+json', '--hostname', 'github.com', path], { cwd: '/', ...(opts.signal ? { signal: opts.signal } : {}) });
+  if (r.code !== 0) return { error: `gh api ${path} failed: ${tail(r.stderr || r.stdout) || `exit ${r.code}`}` };
+  try {
+    const sha = (JSON.parse(r.stdout) as { commit?: { sha?: unknown } } | null)?.commit?.sha;
+    if (typeof sha === 'string' && FULL_SHA.test(sha)) return { sha };
+  } catch { /* below */ }
+  return { error: `gh api ${path} returned no commit SHA` };
+}
+
+/**
+ * The server's `base`, cross-checked: the isolated ls-remote against the recorded URL and GitHub's API must
+ * name the same commit. A mismatch or an unavailable gh refuses (fail closed); the API is asked first, so
+ * nothing goes over the network when it already fails.
+ */
+export async function verifiedServerBase(o: { repo: string; gh: GhFn; origin: ServerOrigin; base: string } & ServerOptions): Promise<{ sha: string } | { error: string }> {
+  const api = await githubBranchSha(o.gh, o.origin, o.base, o);
+  if ('error' in api) return { error: `cannot verify origin's ${o.base} with the GitHub API (${api.error})` };
+  const git = await serverRefOf(o.repo, o.origin, o.base, o);
+  if (!git) return { error: `origin's ${o.base} could not be read from ${o.origin.https}` };
+  if (git !== api.sha) return { error: `origin's ${o.base} is ${git.slice(0, 12)} for git but ${api.sha.slice(0, 12)} for the GitHub API; refusing (retried on the next pass)` };
+  return { sha: git };
+}
+
+/**
+ * Fetches origin's `base` from the recorded URL into the shared object store (isolated; `haves` are commits
+ * the server is known to have, so only new objects come). Then points the repository's
+ * refs/remotes/origin/<base> at the fetched tip so the objects stay referenced (never the local base branch).
+ */
+export async function fetchBase(repo: string, origin: ServerOrigin, base: string, opts: ServerOptions & { haves?: string[] } = {}): Promise<{ ok: true } | { ok: false; message: string }> {
+  let tip = '';
+  try {
+    const f = await serverGit(repo, async (git, iso) => {
+      for (const [i, h] of [...new Set(opts.haves ?? [])].filter((x) => FULL_SHA.test(x)).entries()) {
+        await iso.git(iso.dir, ['update-ref', `refs/minions/have/${i}`, h], true); // only a negotiation hint; a missing commit is skipped
+      }
+      const r = await git(['fetch', '--no-tags', '--no-write-fetch-head', '--no-recurse-submodules', urlOf(origin, opts), `+refs/heads/${base}:refs/minions/fetched`]);
+      if (r.code === 0) tip = (await iso.git(iso.dir, ['rev-parse', '--verify', '--quiet', 'refs/minions/fetched^{commit}'], true)).stdout.trim();
+      return r;
+    }, opts);
+    if (f.code !== 0) return { ok: false, message: `fetching ${base} from origin failed: ${tail(f.stderr) || `git exit ${f.code}`}` };
+  } catch (e) {
+    return { ok: false, message: `fetching ${base} from origin failed: ${tail(String((e as Error)?.message ?? e))}` };
+  }
+  if (FULL_SHA.test(tip)) {
+    await withEmptyHome((home) => allowlistedGit(repo, ['-c', 'core.hooksPath=/dev/null', 'update-ref', '-m', 'minions: fetch', `refs/remotes/origin/${base}`, tip], true,
+      { home, ...(opts.signal ? { signal: opts.signal } : {}) })).catch(() => undefined);
+  }
+  return { ok: true };
+}
+
+/**
+ * Pushes `sha` to `refs/heads/<branch>` of the recorded origin URL (isolated: no pushInsteadOf, pushurl or
+ * hook of the repository; never forced, so the server refuses anything but a fast-forward).
+ */
+export async function pushToServer(repo: string, origin: ServerOrigin, sha: string, branch: string, opts: ServerOptions = {}): Promise<RunResult> {
+  try {
+    return await serverGit(repo, (git) => git(['push', '--porcelain', '--no-verify', '--no-recurse-submodules', urlOf(origin, opts), `${sha}:refs/heads/${branch}`]), opts);
+  } catch (e) {
+    return { code: 128, stdout: '', stderr: String((e as Error)?.message ?? e) };
+  }
 }
 
 /**
