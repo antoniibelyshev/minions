@@ -5,6 +5,9 @@ open questions on 2026-10-26 (see [Owner decisions](#owner-decisions)). The buil
 [Phases](#phases) and are filed as task-53.2 to task-53.8. Task-65 proposes a natural-language front-end, which revises
 decision 1: see [host-manager-assistant.md](host-manager-assistant.md) (proposed, waiting for the owner).
 
+The manager is also the proposed watchdog of the routine pass in [unattended-delivery.md](unattended-delivery.md)
+(task-68.1). It runs `minions sync --routine` when the coordinator's own clock is stale.
+
 ## Goal
 
 Owner request (Telegram msg 238, 2026-10-23): the coordinator should be able to change the setup while it runs,

@@ -658,6 +658,10 @@ Decision record for `delivery.merge: "auto-when-eligible"` (task-1.9; `src/runti
   anyone who can post a status with that name (see "CI as verification authority"); pin them to their
   app. Code that already runs in the container can still use the token directly (see "Host-signed
   publication approvals"); branch protection on GitHub stays the final control.
+- **Unattended delivery (proposed, task-68.1).** [unattended-delivery.md](unattended-delivery.md) adds three things.
+  A deterministic routine pass runs this merge pass on a clock. A PR scan handles behind or conflicting PRs: a
+  verified base update without re-review, and `needs-rebase` for real conflicts. A derived-approval rule covers the
+  updated heads.
 
 ## GitHub intake sync
 

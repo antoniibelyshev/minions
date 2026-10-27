@@ -5,6 +5,10 @@ Status: **proposed** (task-57, design only, nothing built). The owner must agree
 decides whether steps 3 to 7 are worth building. Scheduled after the current agent-runtimes (task-14.x) and host
 manager (task-53.x) work.
 
+See also [unattended-delivery.md](unattended-delivery.md) (task-68.1). It recommends that this supervisor launch
+worker stages itself (a deterministic dispatcher), with task sessions used only for exceptions, and it adds routine
+wakes as fresh sessions.
+
 ## Summary (for Telegram)
 
 - Today one coordinator session handles everything: every owner message, every worker result and every task share one
