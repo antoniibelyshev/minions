@@ -54,7 +54,7 @@ export const applyClass = (apply: SettingApply): Exclude<SettingClass, 'fixed'> 
 export type TakesEffect = 'now' | 'restart' | 'upgrade';
 export const takesEffectOf = (cls: SettingClass): TakesEffect | null =>
   cls === 'live' ? 'now' : cls === 'restart' ? 'restart' : cls === 'recreate' ? 'upgrade' : null;
-export type SettingType = 'enum' | 'int' | 'number' | 'bool' | 'model' | 'models' | 'list' | 'secret' | 'control';
+export type SettingType = 'enum' | 'int' | 'number' | 'bool' | 'model' | 'models' | 'list' | 'text' | 'secret' | 'control';
 export type SettingLayer = 'local' | 'shared';
 
 type Value = unknown;
@@ -196,6 +196,22 @@ const DECLARED: readonly DeclaredSetting[] = [
     loosens: (f, t) => ((f === 'acceptEdits') && (t === 'auto' || t === undefined) ? 'a classifier may approve coordinator actions outside the allow list without prompting' : null) },
   { key: 'coordinator.contextReset.enabled', group: 'Policy', label: 'Routine context resets', type: 'bool', apply: 'live',
     description: 'the coordinator hands off and restarts with a fresh context when idle' },
+  { key: 'routine.enabled', group: 'Policy', label: 'Unattended routine', type: 'bool', apply: 'live',
+    description: 'a routine pass every few minutes syncs, merges and wakes the coordinator (a fresh session) only when a model is needed',
+    loosens: turnsOn('the runtime starts coordinator sessions on its own (wakes for runnable work, crash starts): model spend without you') },
+  { key: 'routine.tickMinutes', group: 'Policy', label: 'Routine interval (minutes)', type: 'int', min: 1, optional: true, apply: 'live',
+    description: 'minutes between routine passes (default 15)' },
+  { key: 'routine.minWakeGapMinutes', group: 'Policy', label: 'Minimum minutes between wakes', type: 'int', min: 1, optional: true, apply: 'live',
+    description: 'the routine wakes the coordinator at most once per this many minutes (default 30)',
+    loosens: (f, t) => ((typeof t === 'number' ? t : 30) < (typeof f === 'number' ? f : 30) ? `the coordinator may be woken more often (every ${String(t)} min; higher spend)` : null) },
+  { key: 'routine.maxWakesPerDay', group: 'Policy', label: 'Coordinator wakes per day', type: 'int', min: 0, optional: true, apply: 'live',
+    description: 'routine wakes of the coordinator per day in routine.timezone (default 8; the digest wake always counts)',
+    loosens: (f, t) => ((typeof t === 'number' ? t : 8) > (typeof f === 'number' ? f : 8) ? `more coordinator wakes per day (${typeof f === 'number' ? f : 8} -> ${String(t)}; higher spend)` : null) },
+  { key: 'routine.digestAt', group: 'Policy', label: 'Digest times', type: 'list', optional: true, apply: 'live',
+    description: 'local times (HH:MM, comma-separated, in routine.timezone) of the owner digest that batches held updates and questions (default 08:00)',
+    loosens: (f, t) => (Array.isArray(t) && t.length > (Array.isArray(f) ? f.length : 1) ? `more digests a day (${t.length}: one coordinator wake each)` : null) },
+  { key: 'routine.timezone', group: 'Policy', label: 'Routine time zone', type: 'text', optional: true, apply: 'live',
+    description: 'IANA time zone of the digest times and the routine\'s days (default Europe/Berlin)' },
   { key: 'coordinator.disallowedTools', group: 'Policy', label: 'Coordinator tool trim', type: 'list', optional: true, apply: 'launch',
     description: 'Claude Code tools removed from the coordinator session (default: the built-in trim; none: keep every tool; tools it needs cannot be listed)',
     loosens: (f, t) => {
@@ -364,6 +380,7 @@ export function currentValue(def: SettingDef, ctx: SettingsContext): Value {
   const v = getPath(ctx.config, def.key);
   if (def.key === 'coordinator.contextReset.enabled' && v === undefined) return true; // unset = on
   if (def.key === 'coordinator.toolSearch' && v === undefined) return true; // unset = on
+  if (def.key === 'routine.enabled' && v === undefined) return false; // unset = off
   if (def.key === 'coordinator.bundledSkills' && v === undefined) return false; // unset = off
   return v;
 }
@@ -428,6 +445,7 @@ export function parseSettingValue(def: SettingDef, input: string): Value {
       if (!def.choices!.includes(s)) throw bad('not one of the choices');
       return s;
     case 'model':
+    case 'text':
       if (!s) throw bad('must not be empty');
       return s;
     case 'list': {

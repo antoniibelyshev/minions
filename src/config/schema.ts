@@ -57,6 +57,12 @@ const modelId = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:@\[\]-]*$/, 'must be 
 /** Git branch name; also passed to git argv, so it may not start with '-' or contain '..'. */
 const branchName = z.string().regex(/^(?!-)(?!.*\.\.)[A-Za-z0-9._/-]+$/, 'must be a plain git branch name');
 const port = z.number().int().min(1).max(65535);
+/** A local clock time "HH:MM" (routine.digestAt). */
+export const DIGEST_TIME = /^(?:[01]\d|2[0-3]):[0-5]\d$/;
+/** Whether Intl knows this IANA time zone (no dependency: the runtime's ICU data). */
+export function isTimeZone(tz: string): boolean {
+  try { new Intl.DateTimeFormat('en-US', { timeZone: tz }); return true; } catch { return false; }
+}
 /** Claude Code reasoning effort levels (`--effort`, agent frontmatter `effort`; Claude Code 2.1.292). */
 export const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'] as const;
 export type Effort = (typeof EFFORTS)[number];
@@ -360,6 +366,29 @@ export const MinionsConfigSchema = z.object({
       /** Reset after this many worker hand-offs (records and releases) in this session (default 10). */
       handoffs: z.number().int().min(1).nullable().optional(),
     }).strict().optional(),
+  }).strict().optional(),
+  /**
+   * Unattended routine (docs/design/unattended-delivery.md, phase 1; src/runtime/routine.ts): a deterministic pass
+   * (`minions sync --routine`: intake, PR and CI sync, merge pass, wake decision) every `tickMinutes`, run by the
+   * coordinator wrapper's clock (the host manager is the watchdog). It wakes the coordinator with a fresh session only
+   * when a model is needed. Unset = off; every unset field takes its default.
+   */
+  routine: z.object({
+    /** Default false: no clock, no watchdog pass, no wake or crash start. */
+    enabled: z.boolean().optional(),
+    /** Minutes between routine passes (default 15). */
+    tickMinutes: z.number().int().min(1).max(1440).optional(),
+    /** Minimum minutes between two coordinator wakes (default 30). */
+    minWakeGapMinutes: z.number().int().min(1).optional(),
+    /** Coordinator wakes per day in `timezone` (default 8; the digest wake always counts and is always allowed). */
+    maxWakesPerDay: z.number().int().min(0).optional(),
+    /**
+     * Local digest times, "HH:MM" in `timezone` (default ["08:00"], phase 4): the routine wakes the coordinator to
+     * send one digest with the held notifications and questions; a missed time is caught up at the next pass.
+     */
+    digestAt: z.array(z.string().regex(DIGEST_TIME, 'must be HH:MM (00:00 to 23:59)')).min(1).max(4).optional(),
+    /** IANA time zone of digestAt and of the routine's days (default Europe/Berlin). */
+    timezone: z.string().min(1).refine(isTimeZone, 'must be an IANA time zone such as Europe/Berlin').optional(),
   }).strict().optional(),
   /**
    * Legacy coordinator permission mode. Only "default" is still honoured (as a stricter choice) when

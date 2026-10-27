@@ -658,6 +658,10 @@ Decision record for `delivery.merge: "auto-when-eligible"` (task-1.9; `src/runti
   anyone who can post a status with that name (see "CI as verification authority"); pin them to their
   app. Code that already runs in the container can still use the token directly (see "Host-signed
   publication approvals"); branch protection on GitHub stays the final control.
+- **Unattended delivery (proposed, task-68.1).** [unattended-delivery.md](unattended-delivery.md) adds three things.
+  A deterministic routine pass runs this merge pass on a clock. A PR scan handles behind or conflicting PRs: a
+  verified base update without re-review, and `needs-rebase` for real conflicts. A derived-approval rule covers the
+  updated heads.
 
 ## GitHub intake sync
 
@@ -1274,7 +1278,8 @@ handoff, instead of one long session whose re-read context grows every turn. Imp
 - Surfacing: `work record|release` responses carry `contextReset` (`due`, `reason`, `steps`) only when due, to keep
   responses small; `coordinator handoff --check --json` shows the full check (triggers, blockers, session counts);
   `minions status` adds a `context reset:` line and `contextReset` in `--json`.
-- The runtime never restarts the coordinator by itself. The coordinator, told by a response, finishes the current
+- The runtime never restarts the coordinator by itself for a context reset (the unattended routine's wakes, opt-in with
+  `routine.enabled`, are the one exception: [unattended-delivery.md](unattended-delivery.md)). The coordinator, told by a response, finishes the current
   owner exchange, sends pending notifications, writes the handoff, then runs
   `minions coordinator restart --recover --detach --json`. `--detach` is needed because the restart kills the tmux
   session the caller runs in: it checks active leases in-band (refusing with `PRECONDITION`), then runs the real
