@@ -5,7 +5,7 @@ import { join, relative } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 import { generatePlugin, LIVE_CLAUDE_RUN_GUIDANCE, renderPolicySummary, renderTemplate } from '../../src/plugin/generate.js';
 import { DRAIN_HOOK_COMMAND } from '../../src/runtime/drain.js';
-import { PRE_BASH_HOOK_COMMAND } from '../../src/runtime/hooks.js';
+import { PRE_BASH_HOOK_COMMAND, PRE_FILE_READ_HOOK_COMMAND, PRE_FILE_WRITE_HOOK_COMMAND } from '../../src/runtime/hooks.js';
 import type { MinionsConfig } from '../../src/config/schema.js';
 import { defaults, FAKE_MINIONS, runHookCommand } from '../helpers.js';
 
@@ -133,6 +133,9 @@ describe('generatePlugin', () => {
       { matcher: 'Agent', hooks: [{ type: 'command', command: 'timeout 20 minions hook pre-agent || exit 2', timeout: 30 }] },
       // Subagents cannot run minions work run|claim|release (task-14.5); node starts only for subagent calls naming minions.
       { matcher: 'Bash', hooks: [{ type: 'command', command: PRE_BASH_HOOK_COMMAND, timeout: 30 }] },
+      // Subagents cannot write (or read) the runtime state through the file tools (task-72).
+      { matcher: 'Edit|MultiEdit|Write|NotebookEdit', hooks: [{ type: 'command', command: PRE_FILE_WRITE_HOOK_COMMAND, timeout: 30 }] },
+      { matcher: 'Read|Glob|Grep', hooks: [{ type: 'command', command: PRE_FILE_READ_HOOK_COMMAND, timeout: 30 }] },
       // Every tool; gated by a shell test so node starts only while a drain is requested.
       { matcher: '*', hooks: [{ type: 'command', command: DRAIN_HOOK_COMMAND }] },
     ]);
@@ -518,6 +521,23 @@ describe('file hand-offs and compact reads', () => {
     expect(recover).toMatch(/^1\. `minions coordinator handoff --read --json`/m);
   });
 
+  it('the digest (task-68.5): routine on -> the wake sends the composed digest first and the outbox rules name the holds; off -> no digest step', async () => {
+    const on = await gen({ ...defaults(), routine: { enabled: true, digestAt: ['08:00'], timezone: 'Europe/Berlin' } } as MinionsConfig);
+    const orch = await on.read('skills/orchestrate/SKILL.md');
+    expect(orch).toMatch(/\*\*Digest\*\* \(`digest` among the reasons; 08:00 Europe\/Berlin\): do it before anything else/);
+    expect(orch).toContain('Run `minions notify digest --json`');
+    expect(orch).toMatch(/Send `text` exactly as given with one `reply`.*then ack every key it returns: `minions notify ack <keys\.\.\.> --json`/);
+    expect(orch).toMatch(/At 100% budget the digest is the only reason a wake happens/);
+    const coord = await on.read('coordinator.md');
+    expect(coord).toMatch(/holds `delivered`, `feature` and `question` items for the digest by default/);
+    expect(coord).toMatch(/`goal-ack`, `status` \(owner-requested\), `approval` and `blocker` go out at once/);
+    expect(coord).toContain('`--hold digest`');
+    expect(coord).toMatch(/the recommended one first and marked "\(recommended\)"/);
+    const off = await gen();
+    expect(await off.read('skills/orchestrate/SKILL.md')).not.toContain('minions notify digest');
+    expect(await off.read('coordinator.md')).toMatch(/Nothing is held for a digest while the routine is off/);
+  });
+
   it('coordinator.contextReset.enabled: false keeps resets opt-in (owner request only)', async () => {
     const g = await gen({ ...defaults(), coordinator: { contextReset: { enabled: false } } } as MinionsConfig);
     const coord = await g.read('coordinator.md');
@@ -764,5 +784,31 @@ describe('owner behaviour defaults (task-34)', () => {
     const status = await g.read('skills/status/SKILL.md');
     expect(status).toMatch(/Spend so far .*USD cost with API-key billing .*tokens only on a subscription plan/);
     expect(status).toContain('`spend.budget`');
+  });
+});
+
+describe('own ideas rule (task-68.6): auto-promotion caps in the coordinator policy', () => {
+  it('states the caps from config, the refusal handling, the override and the digest veto', async () => {
+    const coord = await (await gen()).read('coordinator.md');
+    const policy = coord.slice(coord.indexOf('## Project policy'), coord.indexOf('## Owner defaults'));
+    expect(policy).toContain('**Own ideas.**');
+    expect(policy).toMatch(/beyond 3 a day, at 80% budget or more, when the owner has been silent for more than 3 days, or when its parent is labelled `needs-owner`/);
+    expect(policy).toMatch(/On a refusal leave the task as `idea` and put it to the owner as a digest question; never change its provenance or labels/);
+    expect(policy).toContain('`--owner-approved`');
+    expect(policy).toMatch(/"cancel <id>" set it `cancelled`, "hold <id>" set it back to `idea`/);
+    expect(coord).not.toContain('{{ownIdeasRule}}');
+  });
+
+  it('follows the configured caps, and says auto-promotion is off at perDay 0', async () => {
+    const c = defaults(); c.routine = { autoPromote: { perDay: 1, maxBudgetPercent: 50, ownerSilentDays: 7 } };
+    expect(await (await gen(c)).read('coordinator.md')).toMatch(/beyond 1 a day, at 50% budget or more, when the owner has been silent for more than 7 days/);
+    const off = defaults(); off.routine = { autoPromote: { perDay: 0 } };
+    expect(await (await gen(off)).read('coordinator.md')).toContain('Auto-promotion is off in this project');
+  });
+
+  it('the intake skill mentions the caps and readyLabels', async () => {
+    const intake = await (await gen()).read('skills/intake/SKILL.md');
+    expect(intake).toMatch(/moving one to `ready` is an auto-promotion that the runtime caps/);
+    expect(intake).toContain('`intake.github.readyLabels`');
   });
 });

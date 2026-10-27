@@ -1,7 +1,8 @@
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { Option, type Command } from 'commander';
-import { setIdempotencyStore, setIntakePausedContext, setProvenanceFallback, setReadyContext } from '../backlog/commands.js';
+import { setIdempotencyStore, setIntakePausedContext, setPromotionGuard, setProvenanceFallback, setReadyContext } from '../backlog/commands.js';
+import { checkPromotion } from './auto-promote.js';
 import { openBacklog, writeBacklogConfig } from '../backlog/factory.js';
 import type { BacklogAdapter, IdempotencyStore } from '../backlog/types.js';
 import { validateConfig } from '../config/resolve.js';
@@ -55,6 +56,7 @@ import { exportWorkspace, importWorkspace, setupState } from './workspace.js';
 import { createStateBackup, releaseRestoredLeases, restoreStateBackup } from './state-backup.js';
 import { cancelWork, formatCancel } from './controls.js';
 import { ack, counts as outboxCounts, enqueue, fail, formatCounts, formatItems, pending, type OutboxCounts } from './outbox.js';
+import { digestStatus, holdFor, humanDigest, humanDigestStatus, prepareDigest, reholdExpired, type DigestStatus } from './digest.js';
 import { git, workspaceLayout } from './worktree.js';
 import { containerPaths } from '../core/paths.js';
 import { formatWorkProbe, workProbe } from './sandbox/probe.js';
@@ -225,6 +227,8 @@ async function routineDeps(): Promise<Parameters<typeof runRoutinePass>[0]> {
     activeLeases: async () => leases(),
     budgetExhausted: () => { try { return currentBudget({ db: d, config: cfg })?.exhausted ?? false; } catch { return false; } },
     upgradeInProgress: () => upgradeInProgress(d),
+    digestDue: (now) => digestStatus(d, cfg, now).due,
+    holdBack: (now) => reholdExpired(d, cfg, now),
     // Never with force: scheduleDetachedRestart refuses with an active lease or a drain (and the detached restart checks again).
     wake: async () => scheduleDetachedRestart({ activeLeases: () => leases().map((id) => ({ id })), drain: () => d.drain(), log, cwd: paths.state }, { wake: true }).reason,
     crashStart: async () => scheduleCrashStart({ drain: () => d.drain(), upgrade: () => upgradeInProgress(d), log, cwd: paths.state }).reason,
@@ -296,6 +300,8 @@ export interface StatusReport {
   contextReset?: Omit<ContextResetCheck, 'steps'>;
   /** The unattended routine (task-68.2): settings, the last pass and the next one (src/runtime/routine.ts). */
   routine?: RoutineLast;
+  /** The owner digest (task-68.5): its times, the last one and whether it was sent, held items. */
+  digest?: DigestStatus;
   /** Open change requests (proposed, confirmed, failed) waiting for the host: the manager or `minions settings apply`. */
   changeRequests?: { open: number; items: { id: string; kind: string; status: string; summary: string; createdAt: string }[] };
   backlogError?: string;
@@ -345,6 +351,7 @@ export async function collectStatus(deps: { db: RuntimeDb; config: MinionsConfig
   } catch { /* an older DB without change requests: omit */ }
   try { report.spend = spendReport({ db: d, config: cfg }); } catch { /* status never fails on the tally */ }
   try { report.routine = routineLast(d, cfg); } catch { /* status never fails on the routine */ }
+  try { if (cfg.routine?.enabled) report.digest = digestStatus(d, cfg); } catch { /* status never fails on the digest */ }
   try { const { steps: _s, ...c } = contextResetCheck({ db: d, config: cfg, ...(deps.state !== undefined ? { state: deps.state } : {}) }); report.contextReset = c; } catch { /* status never fails on the reset check */ }
   try {
     const tasks = await (await deps.backlog()).listTasks();
@@ -380,6 +387,7 @@ export function humanStatus(s: StatusReport): string {
     ...(s.spend ? humanSpend(s.spend).split('\n') : []),
     ...(s.contextReset?.enabled ? [humanContextReset(s.contextReset)] : []),
     ...(s.routine ? [humanRoutine(s.routine)] : []),
+    ...(s.digest ? [humanDigestStatus(s.digest)] : []),
   ];
   if (s.backlogError) out.push(`backlog error: ${s.backlogError}`);
   out.push(s.activeLeases.length ? 'active leases:' : 'active leases: none', ...s.activeLeases.map((l) => `  ${l.id} ${l.task_id} ${l.role} #${l.attempt} ${l.branch ?? ''}`));
@@ -513,6 +521,11 @@ export function register(program: Command): void {
     });
     setIntakePausedContext(() => getDb().paused().intake);
     setProvenanceFallback(intakeProvenanceFallback(getDb));
+    // Auto-promotion caps (task-68.6): a budget read error refuses the change (fail closed).
+    setPromotionGuard(async (c, getTask) => {
+      const d = getDb(); const cfg = await getConfig();
+      return checkPromotion(c, { db: d, config: cfg, getTask, budgetPercent: () => currentBudget({ db: d, config: cfg })?.percent ?? null });
+    });
   }
 
   // work
@@ -690,14 +703,17 @@ export function register(program: Command): void {
   const notify = program.command('notify').description('Notification outbox: record owner notifications before sending, list pending ones, acknowledge or fail them (no LLM is woken to resend)');
   notify.command('enqueue').description('Record a notification (text on stdin) under a dedup key; an existing key is a no-op')
     .requiredOption('--key <key>', 'dedup key, e.g. delivered:<taskId>:<headSha>, goal-ack:<messageId>, blocker:<taskId>:<attempt>')
-    .requiredOption('--kind <kind>', 'goal-ack | delivered | feature | blocker | approval | question | status | other')
+    .requiredOption('--kind <kind>', 'goal-ack | delivered | feature | blocker | approval | question | status | digest | other')
     .option('--task <taskId>', 'related task')
     .option('--text-file <path>', 'read the text from a file ("-" = stdin, the default)')
-    .action(action(async (o: { key: string; kind: string; task?: string; textFile?: string }, cmd: Command) => {
+    .addOption(new Option('--hold <hold>', 'digest: hold it for the next owner digest; none: send now; default: per kind (delivered, feature and question are held while routine.enabled and the owner is not in the chat)'))
+    .action(action(async (o: { key: string; kind: string; task?: string; textFile?: string; hold?: string }, cmd: Command) => {
       if (runtimeMode() === 'host') return delegate(cmd);
       const text = await readInput(o.textFile, 'the notification text', 'Pipe the text in (never pass it as an argument) or use --text-file <path>.');
-      const r = enqueue(getDb(), { key: o.key, kind: o.kind, taskId: o.task ?? null, text });
-      emit(r, { json: globalOpts(cmd).json, human: (x: typeof r) => (x.created ? `queued ${x.item.key}` : `${x.item.key} already ${x.item.deliveredAt ? 'delivered' : 'queued'} (no-op)`) });
+      const d = getDb();
+      const holdUntil = holdFor(d, await getConfig(), o.kind, o.hold);
+      const r = { ...enqueue(d, { key: o.key, kind: o.kind, taskId: o.task ?? null, text, holdUntil }), heldUntil: holdUntil };
+      emit(r, { json: globalOpts(cmd).json, human: (x: typeof r) => (x.created ? `queued ${x.item.key}${x.item.nextAttemptAt && x.item.attempts === 0 ? ` (held for the digest at ${x.item.nextAttemptAt})` : ''}` : `${x.item.key} already ${x.item.deliveredAt ? 'delivered' : 'queued'} (no-op)`) });
     }));
   notify.command('pending').description('List undelivered notifications due now, oldest first (send each, then ack it)')
     .option('--all', 'include those waiting for a retry backoff')
@@ -705,8 +721,30 @@ export function register(program: Command): void {
     .action(action(async (o: { all?: boolean; limit?: number }, cmd: Command) => {
       if (runtimeMode() === 'host') return delegate(cmd);
       const d = getDb();
+      // The hold-back first: while the routine is on, a held item whose time came waits for the digest.
+      try { reholdExpired(d, await getConfig()); } catch { /* listing never fails on the hold-back */ }
       const r = { items: pending(d, { includeWaiting: !!o.all, limit: o.limit }), counts: outboxCounts(d) };
       emit(r, { json: globalOpts(cmd).json, human: (x: typeof r) => `${formatItems(x.items)}\n${formatCounts(x.counts)}` });
+    }));
+  notify.command('digest').description('Compose the owner digest (held updates, waiting approvals, blockers, spend, next up, questions as numbered polls) and store it under its key; send the text with one reply, then ack the returned keys')
+    .option('--status', 'only show whether a digest is due (times, the last one, held items)')
+    .action(action(async (o: { status?: boolean }, cmd: Command) => {
+      if (runtimeMode() === 'host') return delegate(cmd);
+      const d = getDb();
+      const cfg = await getConfig();
+      if (o.status) {
+        const st = digestStatus(d, cfg);
+        emit(st, { json: globalOpts(cmd).json, human: humanDigestStatus });
+        return;
+      }
+      let tasks: Awaited<ReturnType<BacklogAdapter['listTasks']>> | null = null;
+      try { tasks = await (await getBacklog()).listTasks(); } catch { tasks = null; }
+      let runnable: { taskId: string; role: string }[] = [];
+      try { runnable = (await (await scheduler()).next()).runnable.map((r) => ({ taskId: r.taskId, role: r.role })); } catch { runnable = []; }
+      let spend: SpendReport | null = null;
+      try { spend = spendReport({ db: d, config: cfg }); } catch { spend = null; }
+      const r = prepareDigest(d, cfg, { tasks, runnable, spend });
+      emit(r, { json: globalOpts(cmd).json, human: humanDigest });
     }));
   notify.command('ack <keys...>').description('Mark notifications delivered (after the send succeeded); repeating it is a no-op')
     .option('--via <transport>', 'the transport that delivered it', 'telegram')
@@ -734,8 +772,10 @@ export function register(program: Command): void {
     .action(async () => { await runHook('stop', hookLoader); exitHook(); });
   hook.command('pre-agent').description('PreToolUse(Agent) hook: minions workers need an active lease')
     .action(async () => { await runHook('pre-agent', hookLoader); exitHook(); });
-  hook.command('pre-bash').description('PreToolUse(Bash) hook: subagents cannot run minions work run|claim|advance|release (coordinator-only)')
+  hook.command('pre-bash').description('PreToolUse(Bash) hook: subagents cannot run coordinator-only minions commands (work run|claim|advance|release, state writes) or name the runtime state dir')
     .action(async () => { await runHook('pre-bash', async () => { throw new Error('pre-bash needs no runtime context'); }); exitHook(); });
+  hook.command('pre-file').description('PreToolUse(file tools) hook: subagents cannot write, read or search the runtime state dir (DB, backlog, briefs, results)')
+    .action(async () => { await runHook('pre-file', async () => { throw new Error('pre-file needs no runtime context'); }); exitHook(); });
   hook.command('pre-telegram').description('PreToolUse(Telegram tools) hook: only the coordinator itself may use them, never a subagent')
     .action(async () => { await runHook('pre-telegram', hookLoader); exitHook(); });
   // DB plus the config when it loads (role contracts for the notice; no backlog): it runs on every worker tool call while a drain is requested.

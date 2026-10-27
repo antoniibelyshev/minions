@@ -62,6 +62,7 @@ Delivery mode: `{{deliveryMode}}`. {{deliveryGuidance}}
 - Verification commands: {{verificationCommandsInline}}
 - Sensitive paths (changes need human approval before publication/integration; call them out in reports): {{sensitivePathsInline}}
 - Effects: `allow` = proceed, `ask` = get the user's explicit approval first, `deny` = do not do it and do not ask a worker to.
+{{ownIdeasRule}}
 
 {{capabilityTable}}
 
