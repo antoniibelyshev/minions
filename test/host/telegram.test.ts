@@ -4,6 +4,8 @@ import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+// Secrets modes under the default (owner) access, whoever runs the suite: see pin-secrets-access.ts.
+vi.mock('../../src/host/secrets-access.js', async (orig) => (await import('./pin-secrets-access.js')).pinOwnerAccess(await orig()));
 vi.mock('../../src/plugin/generate.js', async () => {
   const { mkdir, writeFile } = await import('node:fs/promises');
   const { join: j } = await import('node:path');
