@@ -1,6 +1,8 @@
 # Interactive Telegram decisions: design
 
-Status: **proposed** (task-35, design only, nothing built). The owner has to agree with the recommendation before
+Status: **shipping plan superseded** by [telegram-channel.md](telegram-channel.md) (task-67): a minions-owned channel
+server replaces the patched fork (S2). The UX choice below (option A, tap buttons with numbered text in the body) and
+the `ask`/`close_decision` semantics carry over unchanged. Original status: **proposed** (task-35, design only, nothing built). The owner has to agree with the recommendation before
 any build task starts. Everything marked **verified** was read from the installed official plugin
 (`telegram@claude-plugins-official` 0.0.7, install commit `ea10b213686c90bb1984b2016937310e05336cf3`,
 `~/.claude/plugins/cache/claude-plugins-official/telegram/0.0.7/server.ts`, read only) on 2026-10-23, or comes from
