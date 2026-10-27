@@ -21,8 +21,8 @@ import { sessionStates, totalOf, lastOwnerMessageAt } from './coordinator-usage.
 import type { RuntimeDb } from './db.js';
 import { isHeld, MAX_TEXT_LENGTH, NOTIFICATION_KINDS, pending, type NotificationKind, type OutboxItem } from './outbox.js';
 import { OWNER_ACTIVE_MINUTES, routineSettings, WAKE_EVENT, type RoutineSettings } from './routine.js';
-import type { SpendReport } from './spend.js';
-import { localDate, localDayStart, localLabel, localStamp, zonedTimeToUtc } from './zoned-time.js';
+import { spendSince, type SpendReport } from './spend.js';
+import { localDate, localLabel, localStamp, zonedTimeToUtc } from './zoned-time.js';
 
 /** Digest wakes per digest time: the first, and one retry when the woken session did not send it. */
 export const MAX_DIGEST_WAKES_PER_SLOT = 2;
@@ -169,7 +169,7 @@ export interface DigestInput {
   timezone: string;
   /** The digest key this text is stored under (`digest:<local time>`). */
   key: string;
-  /** Start of the window for "merged" and "auto-promoted": the previous digest's delivery, else a day ago. */
+  /** Start of the window for "merged", "auto-promoted" and spend: the previous digest's delivery (at most a week back), else a day ago. */
   since: string;
   /** Undelivered outbox items (digest rows excluded). */
   items: OutboxItem[];
@@ -179,9 +179,17 @@ export interface DigestInput {
   /** Publications and merges waiting for a host-signed approval (the manager chat's /approve). */
   approvals: { taskId: string; head: string; scope: 'publish' | 'merge' }[];
   autoPromoted: { taskId: string; at: string }[];
-  spend: { todayTokens: number; todayUsd?: number; budget: { percent: number; text: string; exhausted: boolean } | null; wakesToday: number; wakeTokensToday: number } | null;
+  /**
+   * Spend over one window, `since` (tokens, USD, wakes and wake tokens alike); `window` names it in the title
+   * (since the previous digest; the last 7 days when that is older; the last 24h without a previous digest).
+   * The budget keeps the budget's own window.
+   */
+  spend: { window: SpendWindow; tokens: number; usd?: number; budget: { percent: number; text: string; exhausted: boolean } | null; wakes: number; wakeTokens: number } | null;
   runnable: { taskId: string; role: string }[];
 }
+
+export type SpendWindow = 'last-digest' | 'week' | 'day';
+const SPEND_TITLE: Record<SpendWindow, string> = { 'last-digest': 'Spend since last digest', week: 'Spend, last 7 days', day: 'Spend, last 24h' };
 
 export interface DigestQuestion { n: number; key: string; taskId: string | null; question: string; options: string[] }
 export interface DigestSection { title: string; lines: string[] }
@@ -259,8 +267,8 @@ export function composeDigest(i: DigestInput): Digest {
   add('Auto-promoted (reply "cancel <id>" or "hold <id>")', [...new Set(i.autoPromoted.map((a) => a.taskId))].sort(byId).map((id) => ({ text: `- ${title(id)}`, key: null })));
   if (i.spend) {
     const s = i.spend;
-    add('Spend today', [
-      { text: `- ${kTok(s.todayTokens)} tokens${s.todayUsd !== undefined ? ` (~$${s.todayUsd.toFixed(2)} est.)` : ''}; coordinator wakes ${s.wakesToday} (${kTok(s.wakeTokensToday)} tokens)`, key: null },
+    add(SPEND_TITLE[s.window], [
+      { text: `- ${kTok(s.tokens)} tokens${s.usd !== undefined ? ` (~${s.usd.toFixed(2)} est.)` : ''}; coordinator wakes ${s.wakes} (${kTok(s.wakeTokens)} tokens)`, key: null },
       ...(s.budget ? [{ text: `- budget ${s.budget.percent}% of "${s.budget.text}"${s.budget.exhausted ? ': used up, new starts are refused until you raise it' : ''}`, key: null }] : []),
     ]);
   }
@@ -323,6 +331,9 @@ const prio = (t: DigestTask) => (t.priority === 'high' ? 0 : t.priority === 'med
 
 // ---------------------------------------------------------------- inputs from the runtime state
 
+/** The routine settings, and the models (the fallback model of the spend USD estimate) when known. */
+export type DigestConfig = Pick<MinionsConfig, 'routine'> & Partial<Pick<MinionsConfig, 'models'>>;
+
 export interface DigestSources {
   tasks: DigestTask[] | null;
   runnable: { taskId: string; role: string }[];
@@ -339,7 +350,7 @@ function currentKey(db: RuntimeDb, st: DigestStatus, now: Date): string {
   return key;
 }
 
-export function digestInput(db: RuntimeDb, cfg: Pick<MinionsConfig, 'routine'>, src: DigestSources, now: Date = new Date()): DigestInput {
+export function digestInput(db: RuntimeDb, cfg: DigestConfig, src: DigestSources, now: Date = new Date()): DigestInput {
   const s = routineSettings(cfg);
   const st = digestStatus(db, cfg, now);
   const prev = db.get<{ at: string | null }>("SELECT MAX(delivered_at) AS at FROM outbox WHERE kind = 'digest' AND delivered_at IS NOT NULL")?.at ?? null;
@@ -371,14 +382,19 @@ export function digestInput(db: RuntimeDb, cfg: Pick<MinionsConfig, 'routine'>, 
   }
 
   const autoPromoted = db.eventsOfKindSince(AUTO_PROMOTE_EVENT, since).filter((e) => e.taskId).map((e) => ({ taskId: e.taskId!, at: e.at }));
-  const day = localDayStart(now, s.timezone);
-  const wakesToday = db.eventsOfKindSince(WAKE_EVENT, day).length;
-  const wakeTokensToday = sessionStates(db).filter((x) => x.woken && x.firstAt >= day).reduce((a, x) => a + totalOf(x.components), 0);
-  const spend = src.spend ? {
-    todayTokens: src.spend.today.tokens, ...(src.spend.today.estimatedUsd !== undefined ? { todayUsd: src.spend.today.estimatedUsd } : {}),
-    budget: src.spend.budget ? { percent: src.spend.budget.percent, text: src.spend.budget.text, exhausted: src.spend.budget.exhausted } : null,
-    wakesToday, wakeTokensToday,
-  } : null;
+  // One window for every spend figure: `since` (as merged and auto-promoted), not the UTC or the local day.
+  let spend: DigestInput['spend'] = null;
+  if (src.spend) {
+    const f = spendSince({ db, billing: src.spend.billing, ...(cfg.models ? { config: { models: cfg.models } } : {}) }, since);
+    const wakes = db.eventsOfKindSince(WAKE_EVENT, since).length;
+    const wakeTokens = sessionStates(db).filter((x) => x.woken && x.firstAt >= since).reduce((a, x) => a + totalOf(x.components), 0);
+    spend = {
+      window: since === prev ? 'last-digest' : prev ? 'week' : 'day',
+      tokens: f.tokens, ...(f.estimatedUsd !== undefined ? { usd: f.estimatedUsd } : {}),
+      budget: src.spend.budget ? { percent: src.spend.budget.percent, text: src.spend.budget.text, exhausted: src.spend.budget.exhausted } : null,
+      wakes, wakeTokens,
+    };
+  }
   return { now, timezone: s.timezone, key: currentKey(db, st, now), since, items, tasks: src.tasks, merged, approvals, autoPromoted, spend, runnable: src.runnable };
 }
 
@@ -386,7 +402,7 @@ export function digestInput(db: RuntimeDb, cfg: Pick<MinionsConfig, 'routine'>, 
  * `minions notify digest`: composes the digest and stores it under its key (an undelivered row is replaced with
  * the new text, a delivered one is never touched), so `notify ack <keys...>` marks the digest time done.
  */
-export function prepareDigest(db: RuntimeDb, cfg: Pick<MinionsConfig, 'routine'>, src: DigestSources, now: Date = new Date()): Digest & { status: DigestStatus } {
+export function prepareDigest(db: RuntimeDb, cfg: DigestConfig, src: DigestSources, now: Date = new Date()): Digest & { status: DigestStatus } {
   const input = digestInput(db, cfg, src, now);
   const d = composeDigest(input);
   db.transaction(() => {
