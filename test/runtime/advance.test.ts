@@ -3,7 +3,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { MinionsError } from '../../src/core/errors.js';
-import { advanceLease, humanAdvance } from '../../src/runtime/advance.js';
+import { advanceLease, humanAdvance, recordDecision, type AdvanceRecord } from '../../src/runtime/advance.js';
 import { requestDrain } from '../../src/runtime/drain.js';
 import { claimWithBrief, submissionPath, submitResult, type HandoffPaths } from '../../src/runtime/handoff.js';
 import { coordinatorOnlyWorkCommand, preBashHook } from '../../src/runtime/hooks.js';
@@ -224,12 +224,64 @@ describe('work advance: record + next claim', () => {
     expect(r.decision).toMatchObject({ kind: 'claim-failed', code: 'CONFLICT', taskId: 'task-1' });
   });
 
+  it('a plain Error in the claim or next step is a claim-failed decision with the record kept, exit-safe', async () => {
+    const env = makeEnv();
+    env.backlog.add({ id: 'task-1' });
+    const e = await stage(env, 'task-1');
+    env.sched.claim = async () => { throw new Error('disk full'); };
+    const r = await advanceLease(env.sched, paths(env), e.leaseId, {}, deps(env));
+    expect(r.record).toMatchObject({ valid: true, to: 'testing' });
+    expect(r.decision).toMatchObject({ kind: 'claim-failed', code: 'INTERNAL', message: 'disk full', taskId: 'task-1' });
+    expect(r.next).toBeUndefined();
+
+    const env2 = makeEnv();
+    env2.backlog.add({ id: 'task-1' });
+    const e2 = await stage(env2, 'task-1');
+    env2.sched.next = async () => { throw new Error('db locked'); };
+    const r2 = await advanceLease(env2.sched, paths(env2), e2.leaseId, {}, deps(env2));
+    expect(r2.record.valid).toBe(true);
+    expect(r2.decision).toMatchObject({ kind: 'claim-failed', code: 'INTERNAL', message: 'db locked' });
+  });
+
+  it('a claim refused with CAPACITY is a capacity decision', async () => {
+    const env = makeEnv();
+    env.backlog.add({ id: 'task-1' });
+    const e = await stage(env, 'task-1');
+    env.sched.claim = async () => { throw new MinionsError('CAPACITY', 'role full'); };
+    const r = await advanceLease(env.sched, paths(env), e.leaseId, {}, deps(env));
+    expect(r.decision).toMatchObject({ kind: 'capacity', code: 'CAPACITY' });
+  });
+
   it('a missing submission fails like record --submitted and claims nothing', async () => {
     const env = makeEnv();
     env.backlog.add({ id: 'task-1' });
     const e = await claimWithBrief(env.sched, paths(env), 'task-1', 'engineer');
     await expect(advanceLease(env.sched, paths(env), e.leaseId, {}, deps(env))).rejects.toMatchObject({ code: 'NOT_FOUND' });
     expect(env.db.lease(e.leaseId)!.status).toBe('active');
+  });
+});
+
+describe('recordDecision on synthetic records', () => {
+  const env = makeEnv();
+  const rec = (over: Record<string, unknown>) => ({ valid: true, taskId: 'task-1', leaseId: 'none', message: 'm', ...over }) as unknown as AdvanceRecord;
+  const kindOf = (over: Record<string, unknown>, worker = {}) => recordDecision(env.sched, rec(over), worker)?.kind ?? null;
+  it.each([
+    ['awaiting-human', { publication: { state: 'awaiting-approval' } }],
+    ['publication', { publication: { state: 'failed' } }],
+    ['publication', { publication: { state: 'pending' } }],
+    ['awaiting-human', { publication: { state: 'published', merge: { state: 'awaiting-approval', reasons: ['needs owner'] } } }],
+    ['publication', { publication: { state: 'published', merge: { state: 'failed', reasons: [] } } }],
+    ['publication', { publication: { state: 'published', merge: { state: 'denied', reasons: ['no'] } } }],
+    ['awaiting-human', { to: 'awaiting-human' }],
+    ['ci-unverified', { ciBlocked: 'unverified' }],
+    [null, { ciBlocked: 'fail', to: 'changes-requested' }],
+    [null, { publication: { state: 'published', merge: { state: 'waiting', reasons: [] } } }],
+    [null, { publication: { state: 'published', merge: { state: 'armed', reasons: [] } } }],
+    [null, { publication: { state: 'published', merge: { state: 'off', reasons: [] } } }],
+  ] as const)('%s for %j', (kind, over) => { expect(kindOf(over as Record<string, unknown>)).toBe(kind); });
+  it('uses merge reasons as the message', () => {
+    const d = recordDecision(env.sched, rec({ publication: { state: 'published', merge: { state: 'awaiting-approval', reasons: ['needs owner'] } } }), {});
+    expect(d?.message).toBe('needs owner');
   });
 });
 

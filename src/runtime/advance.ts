@@ -150,21 +150,23 @@ export async function advanceLease(sched: Scheduler, p: HandoffPaths, leaseId: s
   const stop = (decision: AdvanceDecision): AdvanceResponse => ({ record, decision, message: `${record.message} Decide: ${decision.kind}.` });
   const early = recordDecision(sched, record, worker);
   if (early) return stop(early);
-  const report = await sched.next();
-  const blocked = nextDecision(deps.db, report);
-  if (blocked) return stop(blocked);
-  const stage = pickStage(report, record.taskId)!;
-  let claimed: CompactClaim;
+  let stage: NextStage | undefined;
   try {
-    claimed = compactClaim(await claimWithBrief(sched, p, stage.taskId, stage.role));
+    const report = await sched.next();
+    const blocked = nextDecision(deps.db, report);
+    if (blocked) return stop(blocked);
+    stage = pickStage(report, record.taskId)!;
+    const next = advanceNext(compactClaim(await claimWithBrief(sched, p, stage.taskId, stage.role)), stage);
+    return { record, next, message: `${record.message} Next: ${next.taskId} ${next.role} (${next.leaseId}).` };
   } catch (e) {
-    if (!(e instanceof MinionsError)) throw e;
-    // The record already happened: never fail the whole call because the follow-up claim was refused.
-    const kind: AdvanceDecisionKind = e.code === 'CAPACITY' ? 'capacity' : 'claim-failed';
-    return stop({ kind, taskId: stage.taskId, message: e.message, code: e.code, ...(e.hint ? { hint: e.hint } : {}) });
+    // The record already happened: never fail the whole call (and hide the recorded outcome) because the
+    // follow-up step failed, whatever the error.
+    const err = e as { code?: unknown; message?: unknown; hint?: unknown };
+    const code = typeof err.code === 'string' ? err.code : 'INTERNAL';
+    const message = typeof err.message === 'string' ? err.message : String(e);
+    const kind: AdvanceDecisionKind = code === 'CAPACITY' ? 'capacity' : 'claim-failed';
+    return stop({ kind, taskId: stage?.taskId ?? record.taskId, message, code, ...(e instanceof MinionsError && e.hint ? { hint: e.hint } : {}) });
   }
-  const next = advanceNext(claimed, stage);
-  return { record, next, message: `${record.message} Next: ${next.taskId} ${next.role} (${next.leaseId}).` };
 }
 
 /** Human output of `work advance`. */
