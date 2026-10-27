@@ -1,6 +1,6 @@
 // Task-72 QA: negative cases for the worker state guard beyond the engineer's unit tests (path spellings,
 // wrappers, redirected state dirs), plus known gaps pinned with it.fails so a fix shows up as a failing test
-// (then turn the it.fails into a plain it; both former gaps are fixed now). Nothing here touches the live /state.
+// (then turn the it.fails into a plain it; all former gaps are fixed now). Nothing here touches the live /state.
 import { describe, expect, it } from 'vitest';
 import { preBashHook, preFileHook } from '../../src/runtime/hooks.js';
 import { stateGuard } from '../../src/runtime/state-guard.js';
@@ -72,14 +72,15 @@ describe('state guard QA: attempt-2 re-test (cache, links, submit heredocs)', ()
       expect(denied(preBashHook(bash(cmd), container)), cmd).toBe(true);
   });
 
-  it('submit heredocs: quoted and plain bodies pass; bodies with substitutions, here-strings and the rest of the line are checked', () => {
+  it('submit heredocs: quoted bodies pass; unquoted ones, substitutions, here-strings and the rest of the line are checked', () => {
     const body = '{"findings":["/state/minions.db"]}';
     for (const cmd of [
       `minions work submit lease-1 --role tester --json <<"RESULT"\n${body}\nRESULT`,
-      `minions work submit lease-1 --role tester --json <<\\RESULT\n${body}\nRESULT`,
-      `minions work submit lease-1 --role tester --json <<RESULT\n${body}\nRESULT`,
     ]) expect(denied(preBashHook(bash(cmd), container)), cmd).toBe(false);
     for (const cmd of [
+      // Attempt 3: only a plain quoted delimiter exempts the body.
+      `minions work submit lease-1 --role tester --json <<\\RESULT\n${body}\nRESULT`,
+      `minions work submit lease-1 --role tester --json <<RESULT\n${body}\nRESULT`,
       'minions work submit lease-1 --json <<RESULT\n${X:=/state/minions.db}\nRESULT',
       'minions work submit lease-1 --json <<RESULT\n`sqlite3 /state/minions.db .tables`\nRESULT',
       `minions work submit lease-1 --json <<< '${body}'`,
@@ -92,17 +93,41 @@ describe('state guard QA: attempt-2 re-test (cache, links, submit heredocs)', ()
   });
 });
 
-describe('state guard QA: known gaps in the submit-heredoc exemption (attempt 2)', () => {
+describe('state guard QA: former gaps in the submit-heredoc exemption (fixed in attempt 3)', () => {
   // bash joins backslash-newline in an unquoted heredoc before it compares the delimiter, so `R\` + empty line ends
   // the body there; the scanner reads on to the later `R`, and the sqlite3 line in between runs unchecked.
-  it.fails('an unquoted submit heredoc ended by `R\\` + newline does not hide the next command', () => {
+  it('an unquoted submit heredoc ended by `R\\` + newline does not hide the next command', () => {
     const cmd = "minions work submit lease-1 --json <<R\n{}\nR\\\n\nsqlite3 /state/minions.db \"update tasks set pr_url='x'\"\nR";
     expect(denied(preBashHook(bash(cmd), container))).toBe(true);
   });
 
   // `minions` is whatever the shell resolves: a function (or a PATH entry) turns the "data" body into a script.
-  it.fails('a submit heredoc is not exempt when the same line redefines minions as a function', () => {
+  it('a submit heredoc is not exempt when the same line redefines minions as a function', () => {
     const cmd = "minions(){ sh; }; minions work submit x --json <<'R'\nsqlite3 /state/minions.db .tables\nR";
     expect(denied(preBashHook(bash(cmd), container))).toBe(true);
+  });
+});
+
+describe('state guard QA: submit-heredoc allowlist variants (attempt 3)', () => {
+  const body = '{"findings":["/state/minions.db"]}';
+  // With a quoted delimiter bash joins no backslash-newlines, so `R\` + empty line stays body (verified with bash).
+  it('a quoted delimiter keeps `R\\` + empty line inside the body', () => {
+    const cmd = `minions work submit lease-1 --json <<'R'\n${body}\nR\\\n\nnot a command /state\nR`;
+    expect(denied(preBashHook(bash(cmd), container))).toBe(false);
+  });
+
+  it('a `minions` the shell may not resolve to the installed CLI gets the full check', () => {
+    for (const cmd of [
+      `PATH=/home/node/.cache/tmp/bin:$PATH minions work submit x --json <<'R'\n${body}\nR`,
+      `node /home/node/.cache/tmp/cli.js work submit x --json <<'R'\n${body}\nR`,
+      `/home/node/.cache/tmp/minions work submit x --json <<'R'\n${body}\nR`,
+      `function minions { sh; }; minions work submit x --json <<'R'\nsqlite3 /state/minions.db .tables\nR`,
+      `alias minions=sh\nminions work submit x --json <<'R'\nsqlite3 /state/minions.db .tables\nR`,
+      `env minions work submit x --json <<'R'\n${body}\nR`,
+      `command minions work submit x --json <<'R'\n${body}\nR`,
+      `{ minions work submit x --json; } <<'R'\n${body}\nR`,
+      `minions work submit x --json <<R\n${body}\nR\\\n\nsqlite3 /state/minions.db .tables\nR`,
+      `minions work submit x --json <<''\n${body}\n`,
+    ]) expect(denied(preBashHook(bash(cmd), container)), cmd).toBe(true);
   });
 });

@@ -147,32 +147,93 @@ describe('exempt subtrees lead nowhere into the state (QA attempt 2)', () => {
   });
 });
 
-describe('heredoc bodies of minions work submit are data (QA attempt 2)', () => {
+describe('heredoc bodies of minions work submit are data (allowlist, fails closed)', () => {
   const finding = '{"findings":["workers could write /state/minions.db and /state/briefs"]}';
   it.each([
     `minions work submit lease-1 --role tester --json <<'RESULT'\n${finding}\nRESULT`,
-    `cd ${worktree} && minions work submit lease-1 --role engineer --json <<"RESULT"\n${finding}\nRESULT`,
-    `node dist/cli.js --json work submit lease-1 --role tester <<-'R'\n\t${finding}\n\tR`,
-    `minions work submit lease-1 --role tester --json <<RESULT\n${finding} \$HOME\nRESULT`,
+    `minions work submit lease-1 --role engineer --json <<"RESULT"\n${finding}\nRESULT\n`,
+    `/usr/local/bin/minions work submit lease-1 --role reviewer --json <<'R_2'\n${finding}\nR_2`,
+    // Body lines that only resemble the delimiter do not end it.
+    `minions work submit lease-1 --json <<'RESULT'\n${finding}\n RESULT\nRESULT \nRESULT\\\nRESULT`,
   ])('allows %s', (cmd) => {
     expect(withoutSubmitBodies(cmd)).not.toContain('/state');
     expect(denied(preBashHook(bash(cmd, sub), container))).toBe(false);
   });
 
   it.each([
+    // Unquoted, backslash-quoted, empty or non-identifier delimiters, `<<-` and here-strings: no exemption.
+    `minions work submit lease-1 --role tester --json <<RESULT\n${finding}\nRESULT`,
+    `minions work submit lease-1 --role tester --json <<\\RESULT\n${finding}\nRESULT`,
+    `minions work submit lease-1 --json <<''\n${finding}\n`,
+    `minions work submit lease-1 --json <<""\n${finding}\n`,
+    `minions work submit lease-1 --json <<'R\\'\n${finding}\nR\\`,
+    `minions work submit lease-1 --json <<'R-1'\n${finding}\nR-1`,
+    `minions work submit lease-1 --json <<'1R'\n${finding}\n1R`,
+    `minions work submit lease-1 --json <<'R'"S"\n${finding}\nRS`,
+    `minions work submit lease-1 --json <<-'R'\n\t${finding}\n\tR`,
+    `minions work submit lease-1 --json <<< '${finding}'`,
     // An unquoted body runs its substitutions.
     'minions work submit lease-1 --role tester --json <<RESULT\n$(sqlite3 /state/minions.db .dump)\nRESULT',
     'minions work submit lease-1 --role tester --json <<RESULT\n`cat /state/briefs/x`\nRESULT',
-    // Outside the body, the line is still checked.
-    "minions work submit lease-1 --json <<'RESULT' > /state/results/x.json\n{}\nRESULT",
-    "minions work submit lease-1 --json <<'RESULT'\n{}\nRESULT\nsqlite3 /state/minions.db .dump",
-    "MINIONS_STATE_DIR=/state minions work submit lease-1 --json <<'RESULT'\n{}\nRESULT",
+    // Anything before the command: cd, assignments, env/command/exec/builtin prefixes, launchers, functions, aliases, subshells.
+    `cd ${worktree} && minions work submit lease-1 --json <<'RESULT'\n${finding}\nRESULT`,
+    `MINIONS_STATE_DIR=/state minions work submit lease-1 --json <<'RESULT'\n{}\nRESULT`,
+    `PATH=/home/node/.cache/tmp/bin:$PATH minions work submit lease-1 --json <<'RESULT'\n${finding}\nRESULT`,
+    `env minions work submit lease-1 --json <<'RESULT'\n${finding}\nRESULT`,
+    `command minions work submit lease-1 --json <<'RESULT'\n${finding}\nRESULT`,
+    `exec minions work submit lease-1 --json <<'RESULT'\n${finding}\nRESULT`,
+    `node dist/cli.js work submit lease-1 --json <<'RESULT'\n${finding}\nRESULT`,
+    `node /home/node/.cache/tmp/cli.js work submit lease-1 --json <<'RESULT'\n${finding}\nRESULT`,
+    `/home/node/.cache/tmp/bin/minions work submit lease-1 --json <<'RESULT'\n${finding}\nRESULT`,
+    `./minions work submit lease-1 --json <<'RESULT'\n${finding}\nRESULT`,
+    `minions(){ sh; }; minions work submit lease-1 --json <<'RESULT'\nsqlite3 /state/minions.db .tables\nRESULT`,
+    `function minions { sh; }\nminions work submit lease-1 --json <<'RESULT'\nsqlite3 /state/minions.db .tables\nRESULT`,
+    `alias minions=sh; minions work submit lease-1 --json <<'RESULT'\nsqlite3 /state/minions.db .tables\nRESULT`,
+    `(minions work submit lease-1 --json <<'RESULT'\n${finding}\nRESULT\n)`,
+    ` minions work submit lease-1 --json <<'RESULT'\n${finding}\nRESULT`,
+    // Anything after the heredoc operator or the terminator.
+    `minions work submit lease-1 --json <<'RESULT' > /state/results/x.json\n{}\nRESULT`,
+    `minions work submit lease-1 --json <<'RESULT' | sh\nsqlite3 /state/minions.db .tables\nRESULT`,
+    `minions work submit lease-1 --json <<'RESULT'; sqlite3 /state/minions.db .tables\n{}\nRESULT`,
+    `minions work submit lease-1 --json <<'RESULT' && sqlite3 /state/minions.db .tables\n{}\nRESULT`,
+    `minions work submit lease-1 --json <<'RESULT' <<'S'\n{}\nRESULT\nsqlite3 /state/minions.db .tables\nS`,
+    `minions work submit lease-1 --json <<'RESULT'\n{}\nRESULT\nsqlite3 /state/minions.db .dump`,
+    `minions work submit lease-1 --json <<'RESULT'\n${finding}\nRESULT\n\n`,
+    `minions work submit lease-1 --json <<'RESULT'\n{}\nRESULT\nsqlite3 /state/minions.db .dump\nRESULT`,
+    // No terminator, or a terminator that differs.
+    `minions work submit lease-1 --json <<'RESULT'\n${finding}`,
+    `minions work submit lease-1 --json <<'RESULT'\n${finding}\nRESULT `,
+    `minions work submit lease-1 --json <<'RESULT'\n${finding}\nresult`,
+    // Words that are not plain: quotes, expansions, globs, double spaces, tabs.
+    `minions work submit "$(sqlite3 /state/minions.db .dump)" --json <<'RESULT'\n${finding}\nRESULT`,
+    `minions work submit lease-1  --json <<'RESULT'\n${finding}\nRESULT`,
+    `minions work submit lease-1\t--json <<'RESULT'\n${finding}\nRESULT`,
+    `minions work submit lease-* --json <<'RESULT'\n${finding}\nRESULT`,
     // Other commands' heredocs are not exempt.
     "cat <<'E' > x.sql\n/state/minions.db\nE",
     "bash <<'E'\nsqlite3 /state/minions.db .dump\nE",
     "minions work brief lease-1 <<'E'\n/state/minions.db\nE",
   ])('refuses %s', (cmd) => {
+    expect(withoutSubmitBodies(cmd)).toBe(cmd);
     expect(denied(preBashHook(bash(cmd, sub), container))).toBe(true);
+  });
+
+  it('keeps checking the head line of an exempt submit', () => {
+    const cmd = `minions work submit /state/minions.db --json <<'RESULT'\n{}\nRESULT`;
+    expect(withoutSubmitBodies(cmd)).toBe('minions work submit /state/minions.db --json <<\'RESULT\'');
+    expect(denied(preBashHook(bash(cmd, sub), container))).toBe(true);
+  });
+
+  it('the coordinator is not affected', () => {
+    const cmd = `cd /x && minions work submit lease-1 --json <<RESULT\n${'{"findings":["/state/minions.db"]}'}\nRESULT`;
+    expect(denied(preBashHook(bash(cmd), container))).toBe(false);
+  });
+
+  it('the deny reason names the accepted submit forms', () => {
+    const out = preBashHook(bash(`cd /x && minions work submit lease-1 --json <<'RESULT'\n{"f":"/state/minions.db"}\nRESULT`, sub), container);
+    const reason = JSON.parse(out.stdout!).hookSpecificOutput.permissionDecisionReason as string;
+    expect(reason).toContain("<<'RESULT'");
+    expect(reason).toContain('< <file>');
   });
 
   it('scanShell reports heredoc body positions and quoting', () => {

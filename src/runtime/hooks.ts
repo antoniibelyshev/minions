@@ -406,40 +406,37 @@ function workerMinionsHit(g: StateGuard): EntryMatch {
   };
 }
 
-/** Words that may run the minions entry they precede (`node dist/cli.js`, `npx minions`). */
-const ENTRY_LAUNCHERS = new Set(['node', 'npx']);
-
-/** Whether a simple command is `[assignments] [node|npx] minions [options] work [options] submit …`. */
-function isWorkSubmit(words: readonly string[]): boolean {
-  let s = 0;
-  while (s < words.length && ASSIGNMENT.test(words[s]!)) s++;
-  if (s < words.length && ENTRY_LAUNCHERS.has(basename(words[s]!))) s++;
-  if (s >= words.length || !MINIONS_ENTRY.test(basename(words[s]!))) return false;
-  const [p0, p1] = words.slice(s + 1).filter((w) => !w.startsWith('-'));
-  return p0 === 'work' && p1 === 'submit';
-}
+/** The installed minions binary in the container (also the git credential helper's path). */
+const MINIONS_BIN = '/usr/local/bin/minions';
 
 /**
- * The command line with the heredoc bodies of `minions work submit` blanked, for the runtime-state text check: a
- * worker's result is data minions reads on stdin, and its findings often name state paths (task-72). Only a body
- * that runs nothing is dropped: a quoted delimiter (`<<'RESULT'`), or an unquoted one without `$(`, `${` or a
- * backtick. The rest of the line (redirections, other commands, assignments) is still checked. Unscannable input
- * is returned unchanged.
+ * The only submit-heredoc head line whose body is exempt: `minions work submit <args> <<'DELIM'` (or `<<"DELIM"`),
+ * with `minions` bare or the installed binary path, args plain words, single spaces, nothing before or after.
+ */
+const SUBMIT_HEAD = new RegExp(
+  `^(?:minions|${MINIONS_BIN.replace(/[./]/g, '\\$&')}) work submit(?: [A-Za-z0-9_.:=/-]+)* <<(['"])([A-Za-z_][A-Za-z0-9_]*)\\1$`,
+);
+
+/**
+ * The command line with the heredoc body of `minions work submit` left out, for the runtime-state text check: a
+ * worker's result is data minions reads on stdin, and its findings often name state paths (task-72). Allowlist,
+ * fails closed: the body is left out only when the whole command is one simple command matching SUBMIT_HEAD
+ * (no `;`, `&&`, `|`, `cd`, function or alias definitions, `env`/`command` prefixes, assignments, subshells,
+ * redirections or launchers such as `node`), the delimiter is a plain quoted word (`'RESULT'` or `"RESULT"`: the
+ * shell expands nothing and joins no backslash-newlines in the body), and the command ends at the first line that
+ * is exactly the delimiter (plus at most one newline). The head line itself is still checked. Any other input,
+ * including unquoted delimiters, `<<-` and here-strings, is returned unchanged and gets the full check.
  */
 export function withoutSubmitBodies(command: string): string {
-  let scan: ShellScan;
-  try { scan = scanShell(command); } catch (e) {
-    if (e instanceof ShellParseError) return command;
-    throw e;
-  }
-  let out = command;
-  const bodies = scan.heredocs.filter((h) => isWorkSubmit(h.owner)).sort((a, b) => b.start - a.start);
-  for (const h of bodies) {
-    const body = command.slice(h.start, h.end);
-    if (!h.quoted && /\$[({]|`/.test(body)) continue;
-    out = out.slice(0, h.start) + out.slice(h.end);
-  }
-  return out;
+  const nl = command.indexOf('\n');
+  if (nl < 0) return command;
+  const head = command.slice(0, nl);
+  const delim = SUBMIT_HEAD.exec(head)?.[2];
+  if (!delim) return command;
+  const lines = command.slice(nl + 1).split('\n');
+  if (lines.at(-1) === '') lines.pop();
+  // The shell ends the body at the first line equal to the delimiter; it must be the last line.
+  return lines.length > 0 && lines.indexOf(delim) === lines.length - 1 ? head : command;
 }
 
 /**
@@ -472,7 +469,10 @@ export function preBashHook(input: unknown, g?: StateGuard): HookOutput {
   if (state) {
     return deny(`Workers may not touch the minions runtime state (${JSON.stringify(state.slice(0, 120))}): the runtime DB, backlog, briefs and results are the coordinator's. `
       + 'Use `minions work brief` / `minions work submit` for your lease. If you only mention the path as text, put that text in a file in your scratch dir '
-      + '(`git commit -F <file>`) or use the Grep / Write tools.');
+      + '(`git commit -F <file>`) or use the Grep / Write tools. A result that names such a path is accepted only as exactly '
+      + "`minions work submit <lease> --role <role> --json <<'RESULT'` with nothing before or after it "
+      + '(no `cd … &&` before it, so it only works when your cwd is already the worktree); otherwise write the result to a file in your scratch dir and run '
+      + '`cd <worktree> && minions work submit <lease> --role <role> --json < <file>`.');
   }
   const cli = workerMinionsCommand(ti.command, guard);
   if (cli) {

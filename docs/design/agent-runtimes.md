@@ -1131,9 +1131,17 @@ hook input; Claude Code sets it, a worker cannot remove it from its own calls):
   (configured or resolved, `//state`, `/tmp/../state`, `~/…`) or expands `MINIONS_STATE_DIR` is refused.
   This is raw text, so a mention in a commit message or grep pattern is refused too (the deny reason says to pass
   such text through a file: `git commit -F`, or to use the Grep/Write tools). The exception is the heredoc body
-  of `minions work submit` (a worker's result, data minions reads on stdin): it is left out of the check when it
-  runs nothing (a quoted delimiter, or an unquoted one without `$(`, `${` or a backtick); the rest of that
-  line is still checked. A state-dir path into an exempt subtree is resolved like in the file tools. A worker may run only these minions
+  of `minions work submit` (a worker's result, data minions reads on stdin). The exemption is an allowlist and
+  fails closed (`withoutSubmitBodies`): the whole command must be exactly one simple command, `minions work
+  submit <args>` with `minions` bare or `/usr/local/bin/minions` and the args plain words (`[A-Za-z0-9_.:=/-]`,
+  single spaces), followed by one heredoc whose delimiter is a plain quoted word (`'RESULT'` or `"RESULT"`,
+  `[A-Za-z_][A-Za-z0-9_]*`; no backslash, empty, unquoted or `<<-` form), and the command must end at the first
+  line that is exactly the delimiter (one trailing newline allowed). Nothing may precede or follow it: no `;`,
+  `&&`, `|`, redirections, `cd`, function or alias definitions, `env`/`command`/`exec` prefixes, assignments,
+  launchers such as `node dist/cli.js`, subshells or groups. With a quoted delimiter the shell expands nothing and
+  joins no backslash-newlines, so the body runs nothing. The head line is still checked; any other form gets the
+  full check (false refusals are accepted; the deny reason names the accepted form and the
+  `minions work submit … < <scratch file>` route, which the check allows). A state-dir path into an exempt subtree is resolved like in the file tools. A worker may run only these minions
   commands: `work brief`, `work submit`, `status`, `backlog ready|list|show|export`, `ci status` and `help`
   (`WORKER_MINIONS_COMMANDS`); every other registered command (`work record`, `backlog update`, `notify`, `sync`,
   `workspace state-import`, `pause`, ...) is the coordinator's. A command that points minions at another state
@@ -1146,7 +1154,8 @@ hook input; Claude Code sets it, a worker cannot remove it from its own calls):
 
 Residual risk. The file-tool layer is exact. The Bash layer is a text check: a path or command built at run time
 (`d=/sta; sqlite3 ${d}te/minions.db`, `cd /` then `state/…`, a script file or interpreter that computes the
-path, a git hook in the worktree, `mi''nions` past the pre-filter, a path outside the state dir such as the
+path, a git hook in the worktree, a `minions` function or alias planted in a shell profile the Bash tool sources,
+`mi''nions` past the pre-filter, a path outside the state dir such as the
 container scratch dir that a link created that way makes point back into it) is out of its reach, and so is the
 `work submit` of another active lease from that lease's worktree (submit checks the cwd against the lease
 worktree; a worker that learns another lease id can `cd` there). A determined worker can therefore still alter
