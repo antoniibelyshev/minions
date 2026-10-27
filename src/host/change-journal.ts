@@ -37,7 +37,14 @@ const lockPath = () => join(managerDir(), 'journal.lock');
  * `origin: 'owner'`: typed by the owner in the manager chat (an `ow_` id that only the host mints); absent for a
  * container request.
  */
-export interface RequestSnapshot { id: string; kind: string; payload: Record<string, unknown>; reason: string | null; origin?: 'owner' }
+export interface RequestSnapshot {
+  id: string; kind: string; payload: Record<string, unknown>; reason: string | null; origin?: 'owner';
+  /**
+   * 'assistant': an owner request the manager's assistant proposed from the owner's plain-language message (task-65.4).
+   * Only on an owner request; absent for typed commands and container requests, so their digests stay unchanged.
+   */
+  via?: 'assistant';
+}
 
 /** Ids of owner-initiated requests: minted by the host manager, never by the container (whose ids are `cr_`). */
 export const OWNER_REQUEST_ID_PATTERN = /^ow_[0-9a-f]{8}$/;

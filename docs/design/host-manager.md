@@ -93,8 +93,9 @@ the existing delegate mechanism (`src/host/delegate.ts`). Each exec has a timeou
 anything over either is dropped and reported as a project error, since the output is untrusted. It gets no new mount and no host-visible file under
 `/state`. A file queue on a host bind mount was rejected: it would be the first host path the container can write.
 
-**From the owner (manager chat).** The manager accepts a fixed set of commands and ignores everything else (it replies
-with the help text):
+**From the owner (manager chat).** The manager accepts a fixed set of commands. Without the optional assistant it
+answers everything else with the help text; with it, plain text (no leading `/`) goes to the assistant (see
+[Natural-language assistant](#natural-language-assistant-task-65)):
 
 | Command | Does |
 | - | - |
@@ -107,10 +108,40 @@ with the help text):
 | `/restart` | Graceful coordinator restart (refused while workers are active: then **Restart when idle** and **Drain now** are offered) |
 | `/undo <id>` | Proposes the inverse of an applied config change (confirmed like any change) |
 | `/rebuild_cli` | Dev only (owner decision Q3): `minions upgrade --rebuild-cli` with the commit range, diffstat and sensitive paths in the plan; not registered on normal installs |
-| `/project <name>` | Picks the project for the commands above when several are registered |
+| `/project <name>` | Picks the project for the commands above when several are registered (also clears the assistant's history) |
+| `/assistant [on\|off\|status]` | The natural-language assistant (task-65.4): switch it on or off (writes `assistant.json`), or show it: model, calls today and the daily limit, the last error. Never calls the model |
 
 An owner command goes through the same confirmation as a coordinator proposal. Typing `/set` is not consent to the
 diff the manager computes from it.
+
+### Natural-language assistant (task-65)
+
+Decision 1 is revised for the chat front-end only (task-65 design, owner poll #task-53-claude): the apply path stays
+deterministic and model-free. Built in task-65.1 to task-65.4 (`src/host/manager-assistant*.ts`):
+
+- **Routing.** Only plain text from the paired owner goes to the assistant; a message that starts with `/` is parsed
+  as a command and never reaches it. Forwarded messages and other senders are dropped as before.
+- **One call per message, off the poll loop.** `claude -p` with no tools, an empty MCP config, permission mode
+  default, bypass disabled, a fresh `CLAUDE_CONFIG_DIR` and an empty cwd under `<MINIONS_HOME>/manager/assistant/`
+  (removed after the call), the input on stdin, a 60 s timeout that kills the whole process group, a 64 KiB output cap,
+  and `--restricted` (or `--setting-sources user` where the CLI lacks it). The transport does not wait for it: taps,
+  polls and commands go on, and one message is answered at a time (another one meanwhile gets the fallback).
+- **Order and trust.** The reply comes first, always labelled `Assistant:`, plain text, cut to 1,500 characters. A
+  valid proposal (`config-set`, `restart`, `upgrade`, `sync` or `undo`; never `approve` or `rebuild-cli`) then
+  goes through `ManagerCommands.propose` with `via: 'assistant'`: the host builds and journals the plan like a typed
+  command, and the offer message says "Proposed by the assistant from your message". `via` is in the plan (so it is
+  digested) and in the journaled request; typed commands and container requests have no `via`, so their digests are
+  unchanged. Confirm, the double tap for loosening plans, expiry, revision and digest checks are unchanged.
+- **Conversation state** is in memory only: the last 6 exchanges and at most 8 KiB, cleared after 30 minutes without a
+  message, on `/project`, on `/assistant off` and on a manager restart.
+- **Limits.** `assistant.json` holds `enabled`, `model` and `dailyLimit` (50 by default).
+  `assistant-usage.json` (0600, manager only) holds the calls of the UTC day and the last error; `minions status`,
+  doctor (`manager.assistant`), the chat `/status` and `/assistant status` show them. Over the limit the reason is
+  given once a day and later messages get the command list.
+- **Failure and fallback.** Switched off, not set up, no token, no or an unsuitable `claude`, the daily limit, a
+  timeout, a non-zero exit, output over the cap, output that is not the expected JSON, or an auth error: one reply
+  `Assistant unavailable (<reason>). Commands:` and the help text. Nothing is retried. An invalid proposal next to a
+  valid reply shows the reply and "the assistant's proposal was invalid; nothing was planned".
 
 ## Confirmation model
 

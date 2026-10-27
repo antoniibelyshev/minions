@@ -150,14 +150,24 @@ export interface BundleSetting {
   /** The current effective value as text ("default" when unset, "unknown" when not readable). */
   value: string;
   source: string;
-  /** now / restart / upgrade, or null (a secret or a runtime control). */
+  /** now / restart / upgrade (explained once in ContextBundle.takesEffectMeaning), or null (a secret or a runtime control). */
   takesEffect: string | null;
-  effect: string;
   hostOwned: boolean;
   canLoosen: boolean;
-  /** How the owner changes it: `/set`, a typed command, or a host terminal command. */
-  changeWith: string;
+  /** Only where it is not `/set <key> <value> [shared]` (ContextBundle.changeWith): a host terminal command. */
+  changeWith?: string;
 }
+
+/**
+ * What each takesEffect value means, once for the whole catalog (task-65.4 trimmed the bundle: the per-setting
+ * "effect" sentence repeated one of these for every key).
+ */
+export const TAKES_EFFECT_MEANING = {
+  now: 'takes effect on the next runtime command (the coordinator prompt catches up on its next restart)',
+  restart: 'needs a coordinator restart afterwards (/restart, its own plan to confirm)',
+  upgrade: 'needs `minions upgrade` afterwards (/upgrade: the container is recreated, volumes kept)',
+} as const;
+export const CHANGE_WITH_SET = '/set <key> <value> [shared] (local layer unless "shared"), unless the setting names another changeWith';
 
 export interface BundlePendingOffer { requestId: string; kind: string; from: 'owner' | 'container'; summary: string; expiresAt: string | null; loosens: boolean }
 
@@ -168,6 +178,8 @@ export interface ContextBundle {
   /** The project the settings and the status belong to; null when none is picked. */
   project: string | null;
   status: AssistantStatus | null;
+  takesEffectMeaning: typeof TAKES_EFFECT_MEANING;
+  changeWith: string;
   settings: BundleSetting[];
   commands: string[];
   proposalKinds: string[];
@@ -196,12 +208,12 @@ function bundleSetting(v: SettingView): BundleSetting {
   const min = settingDef(v.key)?.min;
   const changeWith = v.type === 'secret' ? `\`minions auth ${v.key.slice('secrets.'.length)}\` on the host (never in the chat)`
     : v.type === 'control' ? `\`minions settings set ${v.key} paused|running\` on the host (a runtime control, not a chat proposal)`
-    : `/set ${v.key} <value> [shared]`;
+    : null;
   return {
     key: v.key, group: v.group, label: oneLine(v.label, 120), description: oneLine(v.description, 600), type: v.type,
     ...(v.choices ? { choices: [...v.choices] } : {}), ...(typeof min === 'number' ? { min } : {}), ...(v.optional ? { optional: true as const } : {}),
     value: oneLine(formatValue(v.value), 300), source: v.source, takesEffect: v.type === 'secret' || v.type === 'control' ? null : takesEffectOf(v.class),
-    effect: oneLine(v.effect, 300), hostOwned: v.hostOwned, canLoosen: v.canLoosen, changeWith,
+    hostOwned: v.hostOwned, canLoosen: v.canLoosen, ...(changeWith ? { changeWith } : {}),
   };
 }
 
@@ -217,6 +229,8 @@ export function buildContextBundle(i: BundleInput): ContextBundle {
     projects,
     project: selected,
     status: i.status ? { ...i.status, ...(i.status.paused ? { paused: { intake: i.status.paused.intake === true, starts: i.status.paused.starts === true } } : {}) } : null,
+    takesEffectMeaning: TAKES_EFFECT_MEANING,
+    changeWith: CHANGE_WITH_SET,
     settings: i.settings.map(bundleSetting),
     commands: i.help.map((l) => oneLine(l, 400)).filter(Boolean),
     proposalKinds: [...PROPOSAL_KINDS],

@@ -30,6 +30,12 @@
 //   Reject: typing it is never consent, and the tap goes through the same confirmation as a container request.
 // - /approve <task> <sha> [merge] (task-53.5.4): only a full 40-character lowercase head SHA parses (a short or
 //   non-hex one gets the usage line). Its plan always loosens, so it always needs the double tap.
+// - Plain text (task-65.4): with an assistant chat attached (TelegramTransportOptions.assistant), a message that does
+//   not start with "/" goes to it; a slash command never does (an unknown one still gets the help text). The call runs
+//   off the poll loop: receive() returns at once, one message is answered at a time (another one meanwhile gets the
+//   fallback), "typing" is shown while it runs, and the slot is freed after ASSISTANT_SLOT_MS whatever the call does.
+//   An offer the assistant proposed says so in its first line. /assistant [on|off|status] is deterministic; /project
+//   clears the assistant's history; /status ends with the assistant line.
 import { chmod } from 'node:fs/promises';
 import { join } from 'node:path';
 import { z } from 'zod';
@@ -42,7 +48,9 @@ import { findOfferByNonce, isOfferRequestId, isOwnerRequestId } from './change-j
 import { APPROVE_HEAD_PATTERN, APPROVE_TASK_ID_PATTERN } from './change-requests.js';
 import type { Fetch } from './credentials.js';
 import { isOwnerUpdate, type ManagerAccess, type TelegramUpdate } from './manager-bot.js';
-import { ManagerNotice, type ManagerCommands, type ManagerEvent, type ManagerOffer, type ManagerOutcome, type ManagerTransport, type OwnerCommand } from './manager.js';
+import type { ManagerCommands, ManagerEvent, ManagerOffer, ManagerOutcome, ManagerTransport, OwnerCommand } from './manager.js';
+import type { AssistantChatPort } from './manager-assistant-chat.js';
+import { ManagerNotice } from './manager-notice.js';
 import { closestSettingKeys, formatValue, SETTING_GROUPS, type SettingView } from './settings.js';
 
 /** Telegram's callback_data limit. */
@@ -52,6 +60,13 @@ export const DOUBLE_TAP_MS = 2 * 60_000;
 /** Telegram allows 4096 characters per message; longer text is cut with a note. */
 export const MESSAGE_MAX_CHARS = 4000;
 export const telegramOffsetPath = () => join(managerDir(), 'telegram-offset.json');
+/**
+ * The longest an assistant message holds the one assistant slot (the call itself is bounded by its 60 s timeout; this
+ * also covers the bundle, a slow Bot API and an upgrade dry run of a proposal). The poll loop never waits for it.
+ */
+export const ASSISTANT_SLOT_MS = 5 * 60_000;
+/** Telegram shows "typing" for about 5 s; it is sent again at this interval while the assistant works. */
+const TYPING_EVERY_MS = 4_500;
 
 const NONCE_PATTERN = /^[0-9a-f]{32}$/;
 
@@ -99,6 +114,7 @@ const HELP_LINES = [
   '/restart - graceful coordinator restart (refused while workers are active; then "Restart when idle" and "Drain now" are offered)',
   '/undo <id> - restore the config file as it was before change <id> (only while nothing changed it since)',
   '/approve <task> <sha> [merge] - sign an approval to publish (or with "merge": to merge) <task> at that full head SHA (always asks twice)',
+  '/assistant [on|off|status] - the plain-language assistant: switch it on or off, or show it (calls today, limit, last error). When it is on, a message without "/" goes to it; it only explains and proposes a plan',
   '/help - this text',
   REBUILD_HELP_MARK,
   'Change requests from the coordinators arrive here by themselves. A command you type only shows a plan: nothing is applied until you tap Confirm (twice when it loosens policy).',
@@ -106,6 +122,14 @@ const HELP_LINES = [
 /** The help text; the /rebuild_cli line only when the dev-only request exists. */
 export const helpText = (devRebuild = false) => HELP_LINES.flatMap((l) => (l === REBUILD_HELP_MARK ? (devRebuild ? [REBUILD_HELP_LINE] : []) : [l])).join('\n');
 export const HELP_TEXT = helpText(false);
+
+/**
+ * The assistant's fallback reply (task-65.4): `Assistant unavailable (<reason>). Commands:` and the command list (the
+ * help text without its first line). Every failure of the assistant path answers with it.
+ */
+export function fallbackText(reason: string, devRebuild = false): string {
+  return [`Assistant unavailable (${oneLine(reason, 300)}). Commands:`, ...helpText(devRebuild).split('\n').slice(1)].join('\n');
+}
 
 /** Usage line per change command (sent when the arguments do not parse). */
 const USAGE: Record<string, string> = {
@@ -212,6 +236,10 @@ export interface TelegramTransportOptions {
   log?: (line: string) => void;
   /** The offer behind a nonce (default: the journal), for a tap on an offer this process did not send. */
   lookupOffer?: (nonce: string) => Promise<{ requestId: string; summary: string; loosens: string | null } | null>;
+  /** The natural-language assistant (task-65.4). Absent: plain text gets the help text, as before. */
+  assistant?: AssistantChatPort;
+  /** How long one assistant message may hold the slot (default ASSISTANT_SLOT_MS; tests). */
+  assistantSlotMs?: number;
 }
 
 const defaultSleep = (ms: number, signal?: AbortSignal) => new Promise<void>((resolve) => {
@@ -244,6 +272,8 @@ export class TelegramTransport implements ManagerTransport {
   private readonly armed = new Map<string, { requestId: string; until: number; messageId: number | null }>();
   /** The project /status and /requests show (null: all). */
   private selected: string | null = null;
+  /** The assistant message being answered (off the poll loop), or null. */
+  private inflight: Promise<void> | null = null;
 
   constructor(private readonly opts: TelegramTransportOptions) {
     this.f = opts.fetch ?? fetch;
@@ -348,8 +378,10 @@ export class TelegramTransport implements ManagerTransport {
       { text: 'Reject', callback_data: callbackData('r', o.requestId, o.nonce) },
     ]];
     const expired = Date.parse(o.expiresAt) <= this.now();
+    const who = o.via === 'assistant' && isOwnerRequestId(o.requestId) ? 'Proposed by the assistant from your message: request'
+      : isOwnerRequestId(o.requestId) ? 'Your request' : 'Change request';
     const text = [
-      `${isOwnerRequestId(o.requestId) ? 'Your request' : 'Change request'} ${o.requestId} (project ${o.projectId}): ${oneLine(o.summary)}`,
+      `${who} ${o.requestId} (project ${o.projectId}): ${oneLine(o.summary)}`,
       '',
       displayText(o.text),
       '',
@@ -361,6 +393,7 @@ export class TelegramTransport implements ManagerTransport {
   }
 
   async sendOutcome(o: ManagerOutcome): Promise<void> {
+    this.opts.assistant?.noteOutcome(o.requestId, o.status);
     const text = displayText(o.text);
     const msg = o.requestId ? this.tapped.get(o.requestId) : undefined;
     if (o.status === 'applying' && msg !== undefined && (await this.edit(msg, text))) return;
@@ -462,16 +495,23 @@ export class TelegramTransport implements ManagerTransport {
   // ------------------------------------------------------------ commands
 
   private async onMessage(text: string): Promise<void> {
-    const m = /^\/([a-z][a-z_]*)(?:@[A-Za-z0-9_]+)?(?:\s+([\s\S]*))?$/.exec(text.trim());
+    const trimmed = text.trim();
+    // Plain text goes to the assistant; anything that starts with "/" is a command and never does.
+    if (this.opts.assistant && trimmed && !trimmed.startsWith('/')) { await this.toAssistant(trimmed); return; }
+    const m = /^\/([a-z][a-z_]*)(?:@[A-Za-z0-9_]+)?(?:\s+([\s\S]*))?$/.exec(trimmed);
     const cmd = m?.[1] ?? '';
     const arg = (m?.[2] ?? '').trim();
     const dev = await this.devRebuild();
     const change = CHANGE_COMMANDS.includes(cmd) || (dev && DEV_COMMANDS.includes(cmd));
-    if (!['status', 'requests', 'project', 'settings'].includes(cmd) && !change) { await this.send(helpText(dev)); return; }
+    if (!['status', 'requests', 'project', 'settings', 'assistant'].includes(cmd) && !change) { await this.send(helpText(dev)); return; }
+    if (cmd === 'assistant') {
+      await this.send(this.opts.assistant ? displayText(await this.opts.assistant.command(arg)) : 'The assistant is not available in this host manager.');
+      return;
+    }
     if (!this.commands) { await this.send('The host manager is starting; try again in a moment.'); return; }
     try {
       if (change) await this.change(cmd, arg);
-      else if (cmd === 'status') await this.send(displayText(await this.commands.status(this.selected)));
+      else if (cmd === 'status') await this.send(displayText([await this.commands.status(this.selected), ...(this.opts.assistant ? ['', await this.opts.assistant.statusLine()] : [])].join('\n')));
       else if (cmd === 'requests') await this.requests();
       else if (cmd === 'settings') await this.settings(arg);
       else await this.project(arg);
@@ -479,6 +519,43 @@ export class TelegramTransport implements ManagerTransport {
       if (e instanceof ManagerNotice) { await this.send(displayText(e.message)); return; }
       await this.send(`/${cmd} failed: ${displayText(redact((e as Error).message))}`);
     }
+  }
+
+  /** Resolves once the assistant message being answered (if any) is done or its slot timed out (tests, shutdown). */
+  assistantIdle(): Promise<void> { return this.inflight ?? Promise.resolve(); }
+
+  private async typing(): Promise<void> {
+    await this.call('sendChatAction', { chat_id: this.opts.access.chatId, action: 'typing' }).catch(() => undefined);
+  }
+
+  /**
+   * Hands plain text to the assistant without waiting for it: receive() returns and the poll loop goes on (taps,
+   * polls, other commands). One message at a time; the slot is freed after the call or ASSISTANT_SLOT_MS at most.
+   */
+  private async toAssistant(text: string): Promise<void> {
+    const dev = await this.devRebuild();
+    if (!this.commands) { await this.send('The host manager is starting; try again in a moment.'); return; }
+    if (this.inflight) { await this.send(fallbackText('it is still answering your previous message', dev)); return; }
+    const chat = this.opts.assistant!;
+    const io = {
+      send: async (t: string) => { await this.send(t); },
+      sendOffer: (o: ManagerOffer) => this.sendOffer(o),
+      commands: this.commands, selected: this.selected, devRebuild: dev,
+    };
+    void this.typing();
+    const typing = setInterval(() => { void this.typing(); }, TYPING_EVERY_MS);
+    typing.unref?.();
+    let slot: NodeJS.Timeout | undefined;
+    const job = chat.handle(text, io).catch((e) => this.log(`telegram: the assistant failed: ${(e as Error).message}`));
+    const bound = new Promise<void>((resolve) => {
+      slot = setTimeout(() => { this.log('telegram: an assistant message held the slot too long; freed'); resolve(); }, this.opts.assistantSlotMs ?? ASSISTANT_SLOT_MS);
+      slot.unref?.();
+    });
+    this.inflight = Promise.race([job, bound]).finally(() => {
+      clearInterval(typing);
+      clearTimeout(slot);
+      this.inflight = null;
+    });
   }
 
   /** An owner change command: the core builds and journals the plan; it is shown as an offer. Nothing applies here. */
@@ -516,7 +593,12 @@ export class TelegramTransport implements ManagerTransport {
         this.selected ? 'Send /project all to show every project again.' : 'Showing every project. Send /project <name> to pick one.'].join('\n'));
       return;
     }
-    if (arg === 'all') { this.selected = null; await this.send('Showing every project.'); return; }
+    if (arg === 'all') {
+      if (this.selected !== null) this.opts.assistant?.clearHistory();
+      this.selected = null;
+      await this.send('Showing every project.');
+      return;
+    }
     const want = arg.toLowerCase();
     let hits = projects.filter((p) => p.projectId === want || p.name.toLowerCase() === want);
     if (!hits.length && want.length >= 4) hits = projects.filter((p) => p.projectId.startsWith(want));
@@ -524,6 +606,8 @@ export class TelegramTransport implements ManagerTransport {
       await this.send(`${hits.length ? 'Several projects match' : 'No project matches'} "${oneLine(arg, 80)}". Send /project to list them.`);
       return;
     }
+    // Another project's context: the assistant's history is cleared (also when the same project is picked again).
+    this.opts.assistant?.clearHistory();
     this.selected = hits[0]!.projectId;
     await this.send(`Project picked: ${displayText(hits[0]!.name)} (${hits[0]!.projectId}). /status and /requests show only this project.`);
   }

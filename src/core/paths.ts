@@ -36,6 +36,8 @@ export function managerPaths() {
     claudeCredentialJson: join(dir, 'claude-credential.json'),
     /** The natural-language assistant settings ({version, enabled, model, dailyLimit}), 0600 (manager-assistant.ts). */
     assistantJson: join(dir, 'assistant.json'),
+    /** The assistant's calls today and its last error ({version, day, calls, limitNoticeDay, lastError}), 0600; written by the manager. */
+    assistantUsageJson: join(dir, 'assistant-usage.json'),
     /** Parent (0700) of the per-call run dirs of the assistant (fresh CLAUDE_CONFIG_DIR, empty cwd), removed after each call. */
     assistantRunsDir: join(dir, 'assistant'),
     /** The installed supervisor service (kind, unit file path, its sha256), 0600. Written by setup. */

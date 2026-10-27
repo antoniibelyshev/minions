@@ -81,6 +81,20 @@ describe('exec', () => {
     expect(r).toEqual({ code: 0, stdout: '', stderr: '' });
   });
 
+  it.skipIf(process.platform === 'win32')('killGroup: a timeout kills the grandchildren too, so one holding the output pipe cannot hang the call (task-65.4)', async () => {
+    // The child starts a grandchild that ignores SIGTERM and keeps stdout open, prints its pid, and waits.
+    const script = 'const c=require("child_process").spawn(process.execPath,["-e","process.on(\'SIGTERM\',()=>{});setInterval(()=>{},1000)"],{stdio:["ignore","inherit","inherit"]});console.log(c.pid);setInterval(()=>{},1000)';
+    const t = Date.now();
+    const r = await run('node', ['-e', script], { timeoutMs: 400, allowFailure: true, killGroup: true });
+    expect(r.timedOut).toBe(true);
+    expect(Date.now() - t).toBeLessThan(6000);
+    const pid = Number.parseInt(r.stdout.trim(), 10);
+    expect(pid).toBeGreaterThan(0);
+    await new Promise((res) => setTimeout(res, 200));
+    const alive = (() => { try { process.kill(pid, 0); return true; } catch { return false; } })();
+    expect(alive).toBe(false);
+  });
+
   it('reports missing commands as NOT_FOUND', async () => {
     await expect(run('definitely-not-a-command-xyz', [])).rejects.toMatchObject({ code: 'NOT_FOUND' });
   });
