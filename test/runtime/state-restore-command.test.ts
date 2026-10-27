@@ -24,11 +24,15 @@ beforeAll(() => {
   mkdirSync(join(root, 'state'), { recursive: true });
   mkdirSync(join(root, 'secrets'), { recursive: true });
   writeFileSync(join(root, 'config.json'), JSON.stringify(defaults('project-owner')));
+  // The restart renders the coordinator prompt: a plugin dir of its own, never the container's /opt/minions/plugin.
+  mkdirSync(join(root, 'plugin'), { recursive: true });
+  writeFileSync(join(root, 'plugin', 'coordinator.md'), 'coordinator prompt\n');
   process.env.MINIONS_RUNTIME = 'container';
   process.env.MINIONS_STATE_DIR = join(root, 'state');
   process.env.MINIONS_SECRETS_DIR = join(root, 'secrets');
   process.env.MINIONS_CONFIG = join(root, 'config.json');
   process.env.MINIONS_WORKSPACE = join(root, 'workspace');
+  process.env.MINIONS_PLUGIN_DIR = join(root, 'plugin');
 });
 afterEach(() => { process.exitCode = undefined; vi.restoreAllMocks(); });
 afterAll(() => { wrapper?.kill('SIGKILL'); });
