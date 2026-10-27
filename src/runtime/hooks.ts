@@ -383,17 +383,19 @@ export const WORKER_MINIONS_COMMANDS: Readonly<Record<string, true | readonly st
 /**
  * A minions run with its own state dir (`MINIONS_STATE_DIR=<dir> node dist/cli.js …`, assignment or `env`
  * argument before the entry word) that is not the protected one: how an engineer or tester exercises a minions
- * checkout against a scratch state. Best effort, like the rest of the Bash check.
+ * checkout against a scratch state. A relative value resolves against `cwd` and through symlinks (a link in the
+ * worktree to the state dir is no redirect); a `cd` earlier in the line is not followed. Best effort, like the
+ * rest of the Bash check.
  */
-function redirectedState(before: readonly string[], g: StateGuard): boolean {
+function redirectedState(before: readonly string[], g: StateGuard, cwd: string): boolean {
   return before.some((w) => {
     const m = /^MINIONS_STATE_DIR=(.+)$/.exec(w);
-    return !!m && !bashStateReference(m[1]!, g) && !protectedStatePath(m[1]!, '/', g);
+    return !!m && !bashStateReference(m[1]!, g) && !protectedStatePath(m[1]!, cwd, g);
   });
 }
 
 /** The first minions command a worker may not run in `words` (entry at `entry`), or null. */
-function workerMinionsHit(g: StateGuard): EntryMatch {
+function workerMinionsHit(g: StateGuard, cwd: string): EntryMatch {
   return (words, entry) => {
     const verb = coordinatorVerb(words, entry);
     if (verb) return verb;
@@ -401,7 +403,7 @@ function workerMinionsHit(g: StateGuard): EntryMatch {
     if (!p0 || !MINIONS_COMMANDS.includes(p0)) return null;
     const allowed = WORKER_MINIONS_COMMANDS[p0];
     if (allowed === true || (allowed && (p1 === undefined || allowed.includes(p1)))) return null;
-    if (redirectedState(words.slice(0, entry), g)) return null;
+    if (redirectedState(words.slice(0, entry), g, cwd)) return null;
     return `minions ${p0}${p1 === undefined ? '' : ` ${p1}`}`;
   };
 }
@@ -444,8 +446,8 @@ export function withoutSubmitBodies(command: string): string {
  * always (coordinatorOnlyWorkCommand), and any other registered command outside WORKER_MINIONS_COMMANDS unless the
  * same simple command points minions at another state dir. Same scanner and limits as coordinatorOnlyWorkCommand.
  */
-export function workerMinionsCommand(command: string, g: StateGuard = stateGuard()): string | null {
-  return scriptHit(command, 0, workerMinionsHit(g));
+export function workerMinionsCommand(command: string, g: StateGuard = stateGuard(), cwd: string = process.cwd()): string | null {
+  return scriptHit(command, 0, workerMinionsHit(g, cwd));
 }
 
 /**
@@ -474,7 +476,8 @@ export function preBashHook(input: unknown, g?: StateGuard): HookOutput {
       + '(no `cd … &&` before it, so it only works when your cwd is already the worktree); otherwise write the result to a file in your scratch dir and run '
       + '`cd <worktree> && minions work submit <lease> --role <role> --json < <file>`.');
   }
-  const cli = workerMinionsCommand(ti.command, guard);
+  const cwd = typeof input.cwd === 'string' && input.cwd.startsWith('/') ? input.cwd : process.cwd();
+  const cli = workerMinionsCommand(ti.command, guard, cwd);
   if (cli) {
     return deny(`\`${cli}\` is coordinator-only: workers may run only \`minions work brief\`, \`minions work submit\` and read-only queries (status, backlog ready|list|show|export, ci status, help). `
       + 'To exercise a minions checkout, give it a scratch state: `MINIONS_STATE_DIR=<scratch dir>/state node dist/cli.js …`.');
