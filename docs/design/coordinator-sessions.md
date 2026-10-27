@@ -82,12 +82,15 @@ Inbound owner message (router turn):
 
 1. The router runs `minions coordinator route --json` with the channel meta and the text on stdin. The deterministic
    resolver returns the target, using the first rule that matches:
-   1. a session named explicitly: `task-57`, `/s <session>`, or a ref `#<message id>` (the task-58 `ref: #<id>`
+   1. the owner replied to a bot message: the session of `reply_to_message_id` in the message map (only with the
+      minions channel server, [telegram-channel.md](telegram-channel.md); a decision tap carries its message id too);
+   2. a session named explicitly: `task-57`, `/s <session>`, or a ref `#<message id>` (the task-58 `ref: #<id>`
       convention) found in the message map;
-   2. exactly one open question waiting for the owner (outbox `question` items carry their session);
-   3. the session that sent the owner's latest bot message, when it came less than 30 minutes ago (task-58 rule:
-      "no ref = latest message");
-   4. otherwise `ambiguous`, with the candidate sessions.
+   3. a bare number while exactly one open question waits for the owner (outbox `question` items carry their
+      session);
+   4. otherwise a new topic (task-66: an owner message without a reply or a ref starts a new thread), or
+      `ambiguous` with the candidate sessions when it is a bare number and several questions are open. The old
+      task-58 rule "no ref = latest message" is dropped.
 2. When the target is known, the router runs `minions coordinator send <session>`: the message goes into a
    `session_inbox` row, and the supervisor wakes the session. The router reacts with an emoji as the ack. It does
    not answer the content. If the session is busy, the message waits for its next turn. The task orchestrate loop
@@ -103,14 +106,15 @@ affected sessions. Change requests (task-53) are recorded by whichever session n
 
 Outbound: every session records its notifications with `minions notify enqueue` (keys unchanged, plus a `session`
 column). The router sends due items with `reply` and records `notify ack <key> --message-id <N>`, which fills a
-`tg_messages(message_id, session, key)` map that routing rule 1 and rule 3 read. To wake the router for outbound
+`tg_messages(message_id, session, key)` map that routing rules 1 and 2 read. To wake the router for outbound
 items, it keeps one `minions coordinator wait --json` in the background (Bash `run_in_background`). The command
 exits when an item is due, and the task notification wakes the router. This is the one place where an LLM is woken
 on purpose: only the cheap router, and only when there is something to send.
 
-Reply-thread metadata: with plugin 0.0.7, routing relies on refs and rules 2 and 3. If the S2 fork from
-telegram-decisions (task-35) ships, a one-line patch adds `reply_to_message_id` to the meta, and the resolver uses it
-first.
+Reply-thread metadata: with plugin 0.0.7, routing relies on refs and rules 2 to 4. The minions channel server
+(task-67, [telegram-channel.md](telegram-channel.md), which replaces the task-35 fork plan) adds
+`reply_to_message_id`, `reply_to_text` and `reply_to_ref` to the meta and keeps the `tg_messages` map itself, so
+rule 1 needs no extra bookkeeping by the router.
 
 ## Session lifecycle
 
