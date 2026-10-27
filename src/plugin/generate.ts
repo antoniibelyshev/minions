@@ -292,11 +292,6 @@ function permissionModeGuidance(cfg: MinionsConfig): string {
   return `**Permission mode.** This project runs the coordinator in \`${mode}\` permission mode: commands outside the allow list ask for approval, so keep to the \`minions\` helpers and plain git.`;
 }
 
-/**
- * Owner behaviour defaults every project's coordinator follows (task-34). Kept as one compact list;
- * reporting, polls, testing, merging and the channel rule live in their own sections, and the
- * orchestrate skill points here instead of repeating them.
- */
 /** Own ideas (task-68.6, unattended-delivery decision 8): runtime-capped promotion of agent-hypothesis tasks. */
 function ownIdeasRule(cfg: MinionsConfig): string {
   const a = autoPromoteSettings(cfg);
@@ -306,6 +301,11 @@ function ownIdeasRule(cfg: MinionsConfig): string {
   return `- **Own ideas.** Label a design task \`${NEEDS_OWNER_LABEL}\` until the owner agrees to it, and remove the label only on their yes. Tasks from your own guesses (QA findings, follow-ups, split children: provenance \`agent-hypothesis\`) start as \`idea\`. ${caps} On a refusal leave the task as \`idea\` and put it to the owner as a digest question; never change its provenance or labels to get around the caps. Pass \`--owner-approved\` only right after the owner asked for that very task (it needs an owner message in the last 30 minutes). Every auto-promotion is listed in the digest; when the owner replies "cancel <id>" set it \`cancelled\`, "hold <id>" set it back to \`idea\`. Owner requests and imported issues are not capped.`;
 }
 
+/**
+ * Owner behaviour defaults every project's coordinator follows (task-34). Kept as one compact list;
+ * reporting, polls, testing, merging and the channel rule live in their own sections, and the
+ * orchestrate skill points here instead of repeating them.
+ */
 function ownerDefaults(cfg: MinionsConfig): string {
   const level = (e: string | undefined) => (e ? `\`${e}\`` : 'default');
   const efforts = WORKER_ROLES.map((r) => `${r} ${level(roleEffort(cfg, r))}`).join(', ');
@@ -420,7 +420,6 @@ function contextResetGuidance(cfg: MinionsConfig): string {
   ].join('\n');
 }
 
-/** Orchestrate step 1 item: send pending notifications while the coordinator is awake anyway (Telegram only). */
 /** Orchestrate step 0: the digest wake (task-68.5). */
 function digestRule(cfg: MinionsConfig): string {
   const r = routineSettings(cfg);
@@ -433,6 +432,7 @@ function digestRule(cfg: MinionsConfig): string {
   ].join(' ');
 }
 
+/** Orchestrate step 1 item: send pending notifications while the coordinator is awake anyway (Telegram only). */
 function outboxCheck(cfg: MinionsConfig): string {
   if (cfg.communication.channel === 'terminal') return '';
   return 'First, even when paused or draining, when this session has the Telegram channel: send what `minions notify pending --json` lists with `reply` and ack each (`minions notify ack <key> --json`); on a failure run `minions notify fail <key> --error "<reason>" --json` and stop sending until the next wake. Never wait or loop for the channel to come back.';
