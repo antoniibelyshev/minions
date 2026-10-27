@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import { MinionsError } from '../core/errors.js';
 import { run } from '../core/exec.js';
 import { ensureDir, exists } from '../core/fsutil.js';
-import { hardenedGit, isHostRuntime } from './git-hardening.js';
+import { gateGit, hardenedGit, isHostRuntime } from './git-hardening.js';
 import { runtimePaths } from './paths.js';
 
 export interface WorkspaceLayout { root: string; repo: string; worktrees: string; review: string }
@@ -33,8 +33,9 @@ export const git = (cwd: string, args: string[], allowFailure = false) =>
     ? hardenedGit(cwd, args, allowFailure)
     : run('git', args, { cwd, allowFailure, timeoutMs: 120_000, env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } });
 
+/** Ref -> commit. Read with the gate git: the heads and bases the gates bind to ignore replace objects (task-71). */
 async function revParse(repo: string, ref: string): Promise<string | null> {
-  const r = await git(repo, ['rev-parse', '--verify', '--quiet', `${ref}^{commit}`], true);
+  const r = await gateGit(repo, ['rev-parse', '--verify', '--quiet', `${ref}^{commit}`], true);
   return r.code === 0 ? r.stdout.trim() : null;
 }
 

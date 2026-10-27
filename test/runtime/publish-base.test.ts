@@ -8,6 +8,7 @@ import { describe, expect, it } from 'vitest';
 import type { GitFn } from '../../src/runtime/github.js';
 import { publishTask, type GhFn } from '../../src/runtime/publish.js';
 import { git as realGit } from '../../src/runtime/worktree.js';
+import { gateGit as realGateGit } from '../../src/runtime/git-hardening.js';
 import { defaults } from '../helpers.js';
 import { approvalKeys, gitSync, tmp } from './fixtures.js';
 
@@ -46,10 +47,12 @@ function setup() {
     if (lsRemoteFails && args[0] === 'ls-remote') return { code: 128, stdout: '', stderr: 'fatal: unable to access: Could not resolve host' };
     return realGit(cwd, args, allow);
   };
+  // The gate's history reads (rev-parse, merge-base, diff) go through the hardened gate git (task-71).
+  const gateGit: GitFn = async (cwd, args, allow) => { calls.push(args); return realGateGit(cwd, args, allow); };
   const gh: GhFn = async () => ({ code: 1, stdout: '', stderr: 'gh must not run in branch mode' });
   const run = (head: string, baseShas: (string | null)[], approved = false) => publishTask({
     config: cfg, task: { id: 'task-1', title: 'T', description: 'd', acceptanceCriteria: [] } as never,
-    repo, branch: 'agent/t', head, git, gh, tokenFile, baseShas,
+    repo, branch: 'agent/t', head, git, gateGit, gh, tokenFile, baseShas,
     approvals: approved ? [keys.sign('task-1', head)] : [], approvalPublicKeyFile: keys.publicKeyFile,
   });
   const remoteHead = (ref: string) => { try { return gitSync(bare, 'rev-parse', '--verify', '--quiet', ref); } catch { return null; } };

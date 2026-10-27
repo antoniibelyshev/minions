@@ -22,7 +22,7 @@ import { run, type RunResult } from '../core/exec.js';
 import { redact } from '../core/output.js';
 import { verifyAnyApproval } from '../core/approval.js';
 import { normalizeGithubRemote, readGithubToken, type GitFn } from './github.js';
-import { isHostRuntime } from './git-hardening.js';
+import { gateGit as realGateGit, isHostRuntime } from './git-hardening.js';
 import { missingApprovalKeyReason, runtimePaths } from './paths.js';
 import { git as realGit } from './worktree.js';
 
@@ -54,6 +54,11 @@ export interface PublishInput {
   /** Clock for approval expiry (tests). */
   now?: Date;
   git?: GitFn;
+  /**
+   * History reader of the sensitive-path gate (rev-parse, merge-base, diff); default the hardened gateGit
+   * (src/runtime/git-hardening.ts: no replace objects, grafts, shallow file or commit graph, allowlisted env).
+   */
+  gateGit?: GitFn;
   gh?: GhFn;
   tokenFile?: string;
 }
@@ -131,8 +136,8 @@ const FULL_SHA_RE = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
  * through agent-writable git config, so no base is ever used to remove a path (decision task-40 in
  * docs/design/bootstrap.md, "Where the gate's bases come from").
  */
-async function gateBases(git: GitFn, repo: string, remote: string, base: string, recorded: (string | null)[]): Promise<{ trusted: string[]; local: string[] }> {
-  const hasCommit = async (rev: string) => (await git(repo, ['rev-parse', '--verify', '--quiet', `${rev}^{commit}`], true)).code === 0;
+async function gateBases(git: GitFn, history: GitFn, repo: string, remote: string, base: string, recorded: (string | null)[]): Promise<{ trusted: string[]; local: string[] }> {
+  const hasCommit = async (rev: string) => (await history(repo, ['rev-parse', '--verify', '--quiet', `${rev}^{commit}`], true)).code === 0;
   const trusted: string[] = [];
   for (const sha of new Set(recorded.filter((s): s is string => !!s && FULL_SHA_RE.test(s)))) {
     if (await hasCommit(sha)) trusted.push(sha);
@@ -162,11 +167,14 @@ export async function githubOrigin(git: GitFn, repo: string): Promise<{ https: s
 /**
  * The sensitive-path gate's input: paths `head` changes relative to the base, as the union over every
  * base the gate knows of (see gateBases). Fails closed without a trustworthy base. Shared by
- * publication and the merge gate (src/runtime/merge.ts).
+ * publication and the merge gate (src/runtime/merge.ts). Every local history read goes through
+ * `gateGit` (default the hardened reader: replace refs, grafts and the like cannot hide a path, task-71);
+ * `git` only runs the ls-remote.
  */
-export async function gateChangedPaths(o: { git: GitFn; repo: string; remote: string; base: string; head: string; branch: string; baseShas: (string | null)[]; sensitivePaths: string[] }):
+export async function gateChangedPaths(o: { git: GitFn; gateGit?: GitFn; repo: string; remote: string; base: string; head: string; branch: string; baseShas: (string | null)[]; sensitivePaths: string[] }):
   Promise<{ ok: true; changedPaths: string[]; sensitivePaths: string[] } | { ok: false; code: ErrorCode; message: string }> {
-  const bases = await gateBases(o.git, o.repo, o.remote, o.base, o.baseShas);
+  const history = o.gateGit ?? realGateGit;
+  const bases = await gateBases(o.git, history, o.repo, o.remote, o.base, o.baseShas);
   if (!bases.trusted.length) {
     return { ok: false, code: 'PRECONDITION', message: `No trustworthy base for ${o.branch}: no base SHA recorded at claim time is present in the workspace and origin's ${o.base} is not available locally; refusing to evaluate the sensitive-path gate against a movable local ref.` };
   }
@@ -174,12 +182,12 @@ export async function gateChangedPaths(o: { git: GitFn; repo: string; remote: st
   for (const b of new Set([...bases.trusted, ...bases.local])) {
     // Unrelated history (no merge base) is a state problem, not a transient one: a retry fails the same
     // way. Fail closed and non-retryable; the base is never skipped, so no path can drop out (task-40).
-    const mb = await o.git(o.repo, ['merge-base', b, o.head], true);
+    const mb = await history(o.repo, ['merge-base', b, o.head], true);
     if (mb.code === 1 && !mb.stdout.trim()) {
       return { ok: false, code: 'PRECONDITION', message: `Cannot evaluate the sensitive-path gate for ${o.branch}: no merge base between ${o.base} (${b}) and ${o.head} (unrelated history). Rebuild the branch on ${o.base} or check whether the base ref was rewritten; a retry fails the same way.` };
     }
     if (mb.code !== 0) return { ok: false, code: 'INTERNAL', message: `Cannot find the merge base of ${o.branch} and ${o.base} (${b}): ${lastLines(mb.stderr)}` };
-    const d = await o.git(o.repo, ['diff', '--name-only', '--no-renames', '-z', `${b}...${o.head}`], true);
+    const d = await history(o.repo, ['diff', '--name-only', '--no-renames', '--no-ext-diff', '--ignore-submodules=none', '-z', `${b}...${o.head}`], true);
     if (d.code !== 0) return { ok: false, code: 'INTERNAL', message: `Cannot diff ${o.branch} against ${o.base} (${b}): ${lastLines(d.stderr)}` };
     for (const f of d.stdout.split('\0')) if (f) changed.add(f);
   }
@@ -210,7 +218,7 @@ export async function publishTask(input: PublishInput): Promise<PublishOutcome> 
   // recorded at claim time, or the remote's current base. Local refs (refs/heads/<base>, the
   // remote-tracking refs) are movable by in-runtime code, so they can only add paths, never hide any.
   const base = cfg.git.baseBranch;
-  const gated = await gateChangedPaths({ git, repo, remote, base, head, branch, baseShas: input.baseShas ?? [], sensitivePaths: cfg.sensitivePaths });
+  const gated = await gateChangedPaths({ git, gateGit: input.gateGit, repo, remote, base, head, branch, baseShas: input.baseShas ?? [], sensitivePaths: cfg.sensitivePaths });
   if (!gated.ok) return fail(gated.code, gated.message);
   const { changedPaths, sensitivePaths } = gated;
 

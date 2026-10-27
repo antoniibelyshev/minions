@@ -26,6 +26,7 @@ import { assertBudgetAllowsStart, billingOf, budgetNotice, latestLeaseUsage, rec
 import { readRequiredChecks, type RequiredChecksReport } from './ci.js';
 import { ciGateFromDb, formatCiGate, type CiGate } from './ci-gate.js';
 import { autoMergeTask, type MergeResult } from './merge.js';
+import { gateGit } from './git-hardening.js';
 import { BRANCH_PREFIX, branchFor, ensureBranchWorktree, ensureReviewWorktree, git, headOf, resolveBaseBranch, taskSlug, workspaceLayout, type WorkspaceLayout } from './worktree.js';
 
 export const LEASE_ROLES: readonly BuiltinLeaseRole[] = ['engineer', 'tester', 'reviewer'];
@@ -996,7 +997,8 @@ export class Scheduler {
   }
 
   private async isAncestor(from: string, to: string): Promise<boolean> {
-    return (await git(this.layout.repo, ['merge-base', '--is-ancestor', from, to], true)).code === 0;
+    // Gate read (task-71): replace objects or grafts cannot make a rewritten head look like a descendant.
+    return (await gateGit(this.layout.repo, ['merge-base', '--is-ancestor', from, to], true)).code === 0;
   }
 
   private preClaimStatus(lease: Lease): TaskStatus | undefined {
@@ -1010,11 +1012,11 @@ export class Scheduler {
     return (ev?.data as { kind?: string } | undefined)?.kind === 'qa-sweep';
   }
 
-  /** Paths the branch changes against the base (null when the diff cannot be computed). */
+  /** Paths the branch changes against the base (null when the diff cannot be computed). A gate read (gateGit, task-71). */
   private async changedPaths(head: string): Promise<string[] | null> {
     try {
       const base = await resolveBaseBranch(this.layout.repo, this.config.git.baseBranch);
-      const d = await git(this.layout.repo, ['diff', '--name-only', '--no-renames', '-z', `${base.ref}...${head}`], true);
+      const d = await gateGit(this.layout.repo, ['diff', '--name-only', '--no-renames', '--no-ext-diff', '--ignore-submodules=none', '-z', `${base.ref}...${head}`], true);
       return d.code === 0 ? d.stdout.split('\0').filter(Boolean) : null;
     } catch { return null; }
   }
@@ -1042,10 +1044,10 @@ export class Scheduler {
     return { reasons, record };
   }
 
-  /** Paths changed between two commits (the stage diff of an edit-scope check); null when it cannot be computed. */
+  /** Paths changed between two commits (the stage diff of an edit-scope check); null when it cannot be computed. A gate read (gateGit, task-71). */
   private async diffPaths(from: string, to: string): Promise<string[] | null> {
     try {
-      const d = await git(this.layout.repo, ['diff', '--name-only', '--no-renames', '-z', from, to], true);
+      const d = await gateGit(this.layout.repo, ['diff', '--name-only', '--no-renames', '--no-ext-diff', '--ignore-submodules=none', '-z', from, to], true);
       return d.code === 0 ? d.stdout.split('\0').filter(Boolean) : null;
     } catch { return null; }
   }

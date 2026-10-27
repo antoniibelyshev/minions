@@ -86,6 +86,8 @@ export interface MergeDeps {
   repo: string;
   gh: GhFn;
   git: GitFn;
+  /** History reader of the sensitive-path gate (default the hardened gateGit, see publish.ts gateChangedPaths). */
+  gateGit?: GitFn;
   /** The CI evidence gate for (taskId, head): `Scheduler.ciGate`. */
   ciGate: (taskId: string, head: string) => Promise<CiGate>;
   approvalPublicKeyFile: string;
@@ -215,7 +217,7 @@ export async function autoMergeTask(d: MergeDeps, taskId: string): Promise<Merge
   const ci = await d.ciGate(taskId, head);
   const origin = await githubOrigin(d.git, d.repo);
   const paths = origin
-    ? await gateChangedPaths({ git: d.git, repo: d.repo, remote: origin.remote, base: cfg.git.baseBranch, head, branch: pub.branch,
+    ? await gateChangedPaths({ git: d.git, gateGit: d.gateGit, repo: d.repo, remote: origin.remote, base: cfg.git.baseBranch, head, branch: pub.branch,
       baseShas: d.db.leases({ taskId, all: true }).map((l) => l.base_sha), sensitivePaths: cfg.sensitivePaths })
     : { ok: false as const, message: 'origin is not a github.com repository' };
   const pem = await readFile(d.approvalPublicKeyFile, 'utf8').catch(() => null);

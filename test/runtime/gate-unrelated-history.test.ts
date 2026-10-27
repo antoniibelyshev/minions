@@ -9,6 +9,7 @@ import type { GitFn } from '../../src/runtime/github.js';
 import { evaluateMergeGate } from '../../src/runtime/merge.js';
 import { gateChangedPaths } from '../../src/runtime/publish.js';
 import { git as realGit } from '../../src/runtime/worktree.js';
+import { gateGit as realGateGit } from '../../src/runtime/git-hardening.js';
 import { defaults } from '../helpers.js';
 import { gitSync, tmp } from './fixtures.js';
 
@@ -36,8 +37,9 @@ function setup() {
   gitSync(repo, 'checkout', '-q', '-b', 'agent/t');
   const calls: string[][] = [];
   const git: GitFn = async (cwd, args, allow) => { calls.push(args); return realGit(cwd, args, allow); };
+  const gateGit: GitFn = async (cwd, args, allow) => { calls.push(args); return realGateGit(cwd, args, allow); };
   const gate = (head: string, baseShas: (string | null)[]) => gateChangedPaths({
-    git, repo, remote: 'origin', base: 'main', head, branch: 'agent/t', baseShas, sensitivePaths: defaults().sensitivePaths,
+    git, gateGit, repo, remote: 'origin', base: 'main', head, branch: 'agent/t', baseShas, sensitivePaths: defaults().sensitivePaths,
   });
   return { repo, bare, claimBase, calls, gate };
 }

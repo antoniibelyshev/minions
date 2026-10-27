@@ -121,7 +121,7 @@ describe('sensitive path detection and publication argv safety (fake git/gh)', (
     const keys = approvalKeys();
     const run = (humanApproved = false, title = 'T', baseShas: (string | null)[] = [baseSha]) => publishTask({
       config: cfg, task: { id: 'task-1', title, description: 'd', acceptanceCriteria: [] } as never,
-      repo, branch: 'agent/t', head, git, gh, tokenFile, baseShas,
+      repo, branch: 'agent/t', head, git, gateGit: git, gh, tokenFile, baseShas,
       approvals: humanApproved ? [keys.sign('task-1', head)] : [], approvalPublicKeyFile: keys.publicKeyFile,
     });
     return { run, calls, ghCalls };
