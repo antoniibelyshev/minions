@@ -4,15 +4,21 @@
 // - Publication is a deterministic helper run by the runtime, never by a model: `minions work record`
 //   calls it when a reviewer approval is accepted, `minions work publish <taskId>` retries it.
 // - Gates: git.push (and pr.create in pull-request mode) are evaluated against the paths the branch
-//   changes relative to the base: the union of diffs against the base SHAs recorded at claim time,
-//   origin's base (ls-remote) and the local base refs; a movable local ref alone never suffices. `deny` fails; `ask` (including the sensitive-path upgrade
+//   changes relative to the base: the union of diffs against origin's base as the server reports it
+//   (verifiedGateBase: an isolated ls-remote of minions' recorded https URL, cross-checked with the GitHub
+//   API; a mismatch or an unavailable gh fails closed), the base SHAs recorded at claim time and the local
+//   base refs; a movable local ref alone never suffices. `deny` fails; `ask` (including the sensitive-path upgrade
 //   allow -> ask) requires a host-signed human approval for exactly the approved head SHA, verified
 //   here against the runtime's read-only public key right before anything is pushed (src/core/approval.ts).
 //   Approval rows in the runtime DB are only carriers of tokens: an unsigned or forged row fails closed.
 // - Idempotent: the remote branch and open PRs are inspected first; an up-to-date remote branch is
 //   not pushed again and an existing PR for the head branch is reused, never duplicated.
-// - Never merges (opt-in auto-merge is a separate pass: src/runtime/merge.ts), never force-pushes, never passes the token anywhere (git uses the repository
-//   credential helper, gh the wrapper; see src/runtime/github.ts).
+// - Every network git call (the branch ls-remote and the push) runs in an isolated git dir against the
+//   same explicit https URL (base-update.ts serverRefOf / pushToServer): no url.*insteadOf, pushInsteadOf,
+//   pushurl, remote.* or credential.* config of the agent-writable workspace changes where it goes, so the
+//   server that was read is the server that receives the push (task-71).
+// - Never merges (opt-in auto-merge is a separate pass: src/runtime/merge.ts), never force-pushes, never passes the token anywhere (git gets the
+//   minions credential helper on its command line, gh the wrapper; see src/runtime/github.ts).
 import { readFile } from 'node:fs/promises';
 import { can, matchesAny } from '../config/capabilities.js';
 import type { Capability, MinionsConfig } from '../config/schema.js';
@@ -21,17 +27,19 @@ import type { ErrorCode } from '../core/errors.js';
 import { run, type RunResult } from '../core/exec.js';
 import { redact } from '../core/output.js';
 import { verifyAnyApproval } from '../core/approval.js';
+import { commitExists, fetchBase, originOfPrUrl, pushToServer, serverRefOf, verifiedServerBase, type ServerOrigin, type ServerUrlFn } from './base-update.js';
 import { normalizeGithubRemote, readGithubToken, type GitFn } from './github.js';
-import { isHostRuntime } from './git-hardening.js';
+import { gateGit as realGateGit, isHostRuntime } from './git-hardening.js';
 import { missingApprovalKeyReason, runtimePaths } from './paths.js';
 import { git as realGit } from './worktree.js';
 
-export type GhFn = (args: string[], opts?: { input?: string; cwd?: string }) => Promise<RunResult>;
+/** `opts.signal` (optional) kills that call's gh on abort, like the timeout (injected fakes may ignore it). */
+export type GhFn = (args: string[], opts?: { input?: string; cwd?: string; signal?: AbortSignal }) => Promise<RunResult>;
 
 /** gh via the PATH wrapper (/usr/local/bin/gh injects the mounted token for that process only). */
 /** `signal` (optional) kills an in-flight gh on abort (SIGTERM, then SIGKILL), like the timeout. */
 export const ghWithTimeout = (timeoutMs: number, signal?: AbortSignal): GhFn => (args, opts = {}) =>
-  run('gh', args, { cwd: opts.cwd, input: opts.input, allowFailure: true, timeoutMs, signal, env: { ...process.env, GH_PROMPT_DISABLED: '1', GIT_TERMINAL_PROMPT: '0' } });
+  run('gh', args, { cwd: opts.cwd, input: opts.input, allowFailure: true, timeoutMs, signal: opts.signal ?? signal, env: { ...process.env, GH_PROMPT_DISABLED: '1', GIT_TERMINAL_PROMPT: '0' } });
 export const realGh: GhFn = ghWithTimeout(120_000);
 
 export interface PublishInput {
@@ -54,8 +62,21 @@ export interface PublishInput {
   /** Clock for approval expiry (tests). */
   now?: Date;
   git?: GitFn;
+  /**
+   * History reader of the sensitive-path gate (rev-parse, merge-base, diff); default the hardened gateGit
+   * (src/runtime/git-hardening.ts: no replace objects, grafts, shallow file or commit graph, allowlisted env).
+   */
+  gateGit?: GitFn;
   gh?: GhFn;
   tokenFile?: string;
+  /**
+   * The GitHub repository from minions' own record (serverOriginOf: the task's PR URL, else the origin
+   * recorded at import). Absent: the workspace's origin URL, normalized (legacy callers and installs that
+   * were imported before the record existed); every network call still goes to that explicit https URL.
+   */
+  origin?: ServerOrigin | null;
+  /** Test seam: where git reaches the origin URL (base-update.ts ServerUrlFn; default the URL itself). */
+  serverUrl?: ServerUrlFn;
 }
 
 export type PublishOutcome =
@@ -124,22 +145,19 @@ const FULL_SHA_RE = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 
 /**
  * Bases for the sensitive-path diff. `trusted`: base SHAs recorded in the runtime DB at claim time
- * and origin's current base (read with ls-remote, i.e. from the server), each only when the commit is
- * present locally. `local`: the workspace's base refs, which in-runtime code can move; they are
- * diffed too (they can only add paths) but never suffice on their own. "Trusted" is relative: the
- * recorded SHAs come from the local base ref at each claim and, in the container, ls-remote resolves
- * through agent-writable git config, so no base is ever used to remove a path (decision task-40 in
- * docs/design/bootstrap.md, "Where the gate's bases come from").
+ * and `serverBase`, origin's base as the caller read and verified it (verifiedGateBase), each only when
+ * the commit is present locally. `local`: the workspace's base refs, which in-runtime code can move; they
+ * are diffed too (they can only add paths) but never suffice on their own. No base is ever used to
+ * remove a path (decision task-40 in docs/design/bootstrap.md, "Where the gate's bases come from").
+ * No ls-remote of its own runs here (task-71): the workspace's url.*insteadOf config resolves "origin"
+ * to whatever repository a worker chose, so a server base read through it would be forgeable.
  */
-async function gateBases(git: GitFn, repo: string, remote: string, base: string, recorded: (string | null)[]): Promise<{ trusted: string[]; local: string[] }> {
-  const hasCommit = async (rev: string) => (await git(repo, ['rev-parse', '--verify', '--quiet', `${rev}^{commit}`], true)).code === 0;
+async function gateBases(history: GitFn, repo: string, base: string, recorded: (string | null)[], serverBase?: string | null): Promise<{ trusted: string[]; local: string[] }> {
+  const hasCommit = async (rev: string) => (await history(repo, ['rev-parse', '--verify', '--quiet', `${rev}^{commit}`], true)).code === 0;
   const trusted: string[] = [];
-  for (const sha of new Set(recorded.filter((s): s is string => !!s && FULL_SHA_RE.test(s)))) {
+  for (const sha of new Set([...recorded, serverBase].filter((s): s is string => !!s && FULL_SHA_RE.test(s)))) {
     if (await hasCommit(sha)) trusted.push(sha);
   }
-  const ls = await git(repo, ['ls-remote', '--heads', remote, `refs/heads/${base}`], true);
-  const remoteBase = ls.code === 0 ? ls.stdout.trim().split(/\s+/)[0] ?? '' : '';
-  if (FULL_SHA_RE.test(remoteBase) && await hasCommit(remoteBase)) trusted.push(remoteBase);
   const local: string[] = [];
   for (const ref of [`refs/heads/${base}`, `refs/remotes/origin/${base}`, `refs/remotes/host/${base}`]) {
     if (await hasCommit(ref)) local.push(ref);
@@ -159,27 +177,79 @@ export async function githubOrigin(git: GitFn, repo: string): Promise<{ https: s
   return { https, repository: https.replace(/^https:\/\/github\.com\//, '').replace(/\.git$/, ''), remote: isHostRuntime() ? https : 'origin' };
 }
 
+/** Runtime DB meta key of the GitHub repository (`owner/repo`) recorded by `minions workspace import --remote-url`. */
+export const ORIGIN_REPOSITORY_META = 'origin_repository';
+
+/** The server origin of an `owner/repo` name (same validation as base-update.ts originOfPrUrl), or null. */
+export function originOfRepository(repository: string | null | undefined): ServerOrigin | null {
+  const r = String(repository ?? '').trim();
+  return /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(r) ? originOfPrUrl(`https://github.com/${r}/pull/1`) : null;
+}
+
+/** The server origin of a git remote URL on github.com (any form normalizeGithubRemote accepts), or null. */
+export function originOfRemoteUrl(url: string | null | undefined): ServerOrigin | null {
+  const https = normalizeGithubRemote(url);
+  return https ? originOfRepository(https.replace(/^https:\/\/github\.com\//, '').replace(/\.git$/, '')) : null;
+}
+
+/**
+ * The GitHub repository a task is delivered to, from minions' own record only (never .git/config): the
+ * first recorded PR URL (the backlog's or the publication's), else the repository recorded at import.
+ */
+export function serverOriginOf(o: { prUrls?: (string | null | undefined)[]; recorded?: string | null }): ServerOrigin | null {
+  for (const u of o.prUrls ?? []) { const s = originOfPrUrl(u); if (s) return s; }
+  return originOfRepository(o.recorded);
+}
+
+/**
+ * origin's `base` for a gate: base-update.ts verifiedServerBase (an isolated ls-remote of the explicit
+ * https URL, cross-checked with `gh api --hostname github.com /repos/<o>/<r>/branches/<base>`), then made
+ * present locally (an isolated fetch from the same URL when missing). Any failure, a mismatch between
+ * git and the API, or a commit that cannot be fetched refuses: the caller fails closed.
+ */
+export async function verifiedGateBase(o: { repo: string; gh: GhFn; origin: ServerOrigin; base: string; serverUrl?: ServerUrlFn; haves?: string[] }):
+  Promise<{ ok: true; sha: string } | { ok: false; code: ErrorCode; message: string }> {
+  const srv = o.serverUrl ? { serverUrl: o.serverUrl } : {};
+  const vb = await verifiedServerBase({ repo: o.repo, gh: o.gh, origin: o.origin, base: o.base, ...srv });
+  if ('error' in vb) {
+    // A disagreement between git and the API is not transient noise: block (CONFLICT) instead of retrying.
+    const code = / for git but /.test(vb.error) ? 'CONFLICT' : classifyFailure(vb.error);
+    return { ok: false, code: code === 'INTERNAL' ? 'NETWORK_RETRYABLE' : code, message: vb.error };
+  }
+  if (!(await commitExists(o.repo, vb.sha))) {
+    const f = await fetchBase(o.repo, o.origin, o.base, { ...srv, haves: o.haves ?? [] });
+    if (!(await commitExists(o.repo, vb.sha))) {
+      return { ok: false, code: 'NETWORK_RETRYABLE', message: `origin's ${o.base} ${vb.sha.slice(0, 12)} is not in the workspace and could not be fetched from ${o.origin.https}${f.ok ? '' : ` (${f.message})`}` };
+    }
+  }
+  return { ok: true, sha: vb.sha };
+}
+
 /**
  * The sensitive-path gate's input: paths `head` changes relative to the base, as the union over every
  * base the gate knows of (see gateBases). Fails closed without a trustworthy base. Shared by
- * publication and the merge gate (src/runtime/merge.ts).
+ * publication and the merge gate (src/runtime/merge.ts). Every local history read goes through
+ * `gateGit` (default the hardened reader: replace refs, grafts and the like cannot hide a path, task-71).
+ * `serverBase` is origin's verified base (verifiedGateBase); `git` and `remote` are not read any more
+ * (the gate runs no ls-remote of its own) and stay only for callers' convenience.
  */
-export async function gateChangedPaths(o: { git: GitFn; repo: string; remote: string; base: string; head: string; branch: string; baseShas: (string | null)[]; sensitivePaths: string[] }):
+export async function gateChangedPaths(o: { git?: GitFn; gateGit?: GitFn; repo: string; remote?: string; base: string; head: string; branch: string; baseShas: (string | null)[]; sensitivePaths: string[]; serverBase?: string | null }):
   Promise<{ ok: true; changedPaths: string[]; sensitivePaths: string[] } | { ok: false; code: ErrorCode; message: string }> {
-  const bases = await gateBases(o.git, o.repo, o.remote, o.base, o.baseShas);
+  const history = o.gateGit ?? realGateGit;
+  const bases = await gateBases(history, o.repo, o.base, o.baseShas, o.serverBase);
   if (!bases.trusted.length) {
-    return { ok: false, code: 'PRECONDITION', message: `No trustworthy base for ${o.branch}: no base SHA recorded at claim time is present in the workspace and origin's ${o.base} is not available locally; refusing to evaluate the sensitive-path gate against a movable local ref.` };
+    return { ok: false, code: 'PRECONDITION', message: `No trustworthy base for ${o.branch}: no base SHA recorded at claim time and no verified origin ${o.base} is present in the workspace; refusing to evaluate the sensitive-path gate against a movable local ref.` };
   }
   const changed = new Set<string>();
   for (const b of new Set([...bases.trusted, ...bases.local])) {
     // Unrelated history (no merge base) is a state problem, not a transient one: a retry fails the same
     // way. Fail closed and non-retryable; the base is never skipped, so no path can drop out (task-40).
-    const mb = await o.git(o.repo, ['merge-base', b, o.head], true);
+    const mb = await history(o.repo, ['merge-base', b, o.head], true);
     if (mb.code === 1 && !mb.stdout.trim()) {
       return { ok: false, code: 'PRECONDITION', message: `Cannot evaluate the sensitive-path gate for ${o.branch}: no merge base between ${o.base} (${b}) and ${o.head} (unrelated history). Rebuild the branch on ${o.base} or check whether the base ref was rewritten; a retry fails the same way.` };
     }
     if (mb.code !== 0) return { ok: false, code: 'INTERNAL', message: `Cannot find the merge base of ${o.branch} and ${o.base} (${b}): ${lastLines(mb.stderr)}` };
-    const d = await o.git(o.repo, ['diff', '--name-only', '--no-renames', '-z', `${b}...${o.head}`], true);
+    const d = await history(o.repo, ['diff', '--name-only', '--no-renames', '--no-ext-diff', '--ignore-submodules=none', '-z', `${b}...${o.head}`], true);
     if (d.code !== 0) return { ok: false, code: 'INTERNAL', message: `Cannot diff ${o.branch} against ${o.base} (${b}): ${lastLines(d.stderr)}` };
     for (const f of d.stdout.split('\0')) if (f) changed.add(f);
   }
@@ -196,21 +266,27 @@ export async function publishTask(input: PublishInput): Promise<PublishOutcome> 
   if (mode === 'local') return fail('PRECONDITION', 'delivery.mode is "local": nothing is published.');
   if (cfg.delivery.provider !== 'github') return fail('INVALID_CONFIG', `delivery.mode "${mode}" needs delivery.provider "github".`);
 
-  // 1. Origin and credential.
-  const origin = await githubOrigin(git, repo);
+  // 1. Origin and credential. The server is minions' recorded repository (input.origin); only legacy
+  // callers fall back to the workspace's origin URL. Either way every network call below goes to this
+  // explicit https URL from an isolated git dir, never through the workspace's remote or url.* config.
+  const origin: ServerOrigin | null = input.origin !== undefined ? input.origin : await githubOrigin(git, repo);
   if (!origin) return fail('PRECONDITION', 'origin is not a github.com repository; branch/PR delivery needs a GitHub remote (minions start records it from the host repository).');
-  const { repository, remote } = origin;
+  const { repository } = origin;
+  const srv = input.serverUrl ? { serverUrl: input.serverUrl } : {};
   const token = await readGithubToken(input.tokenFile);
   if (token.state !== 'ok') {
     return fail('AUTH_REQUIRED', token.state === 'absent' ? 'No GitHub token is provisioned; run `minions auth github` on the host, then `minions work publish`.' : token.message);
   }
 
   // 2. Changed paths vs the base (renames split so moving a file out of a sensitive path still counts),
-  // as the union over every base the gate knows of. At least one must be trustworthy: a base SHA
-  // recorded at claim time, or the remote's current base. Local refs (refs/heads/<base>, the
-  // remote-tracking refs) are movable by in-runtime code, so they can only add paths, never hide any.
+  // as the union over every base the gate knows of. origin's base must be verified (git and the GitHub
+  // API agree; otherwise nothing is published): it is the base the PR is opened against, so the diff
+  // against it is what the PR shows. The base SHAs recorded at claim time and the local refs
+  // (refs/heads/<base>, the remote-tracking refs, movable by in-runtime code) can only add paths.
   const base = cfg.git.baseBranch;
-  const gated = await gateChangedPaths({ git, repo, remote, base, head, branch, baseShas: input.baseShas ?? [], sensitivePaths: cfg.sensitivePaths });
+  const vb = await verifiedGateBase({ repo, gh, origin, base, haves: [head], ...srv });
+  if (!vb.ok) return fail(vb.code, `Cannot evaluate the sensitive-path gate for ${branch}: ${vb.message}; nothing was published.`);
+  const gated = await gateChangedPaths({ gateGit: input.gateGit, repo, base, head, branch, baseShas: input.baseShas ?? [], serverBase: vb.sha, sensitivePaths: cfg.sensitivePaths });
   if (!gated.ok) return fail(gated.code, gated.message);
   const { changedPaths, sensitivePaths } = gated;
 
@@ -235,19 +311,25 @@ export async function publishTask(input: PublishInput): Promise<PublishOutcome> 
     if (!check.ok) return { state: 'awaiting-approval', reasons, changedPaths, sensitivePaths, approvalError: check.reason };
   }
 
-  // 4. Remote branch: reconcile, fast-forward only, never force.
+  // 4. Remote branch: reconcile, fast-forward only, never force. The ls-remote and the push both run
+  // isolated against the explicit URL of step 1 (base-update.ts serverRefOf / pushToServer), so a
+  // pushInsteadOf, pushurl or hook of the workspace cannot send the push anywhere else. serverRefOf
+  // returns null both for "no such branch" and for a failed read; the push is never forced, so the
+  // server itself refuses anything but a fast-forward or a new branch.
   const ghCwd = isHostRuntime() ? '/' : repo; // gh gets --repo; outside the workspace it never runs git there
-  const ls = await git(repo, ['ls-remote', '--heads', remote, `refs/heads/${branch}`], true);
-  if (ls.code !== 0) return fail(classifyFailure(ls.stderr), `Cannot read origin: ${lastLines(ls.stderr) || `git exit ${ls.code}`}`);
-  const remoteSha = ls.stdout.trim().split(/\s+/)[0] || null;
+  const remoteSha = await serverRefOf(repo, origin, branch, srv);
   let push: 'pushed' | 'already-current' = 'already-current';
   if (remoteSha !== head) {
-    if (remoteSha && (await git(repo, ['merge-base', '--is-ancestor', remoteSha, head], true)).code !== 0) {
+    if (remoteSha && (await (input.gateGit ?? realGateGit)(repo, ['merge-base', '--is-ancestor', remoteSha, head], true)).code !== 0) {
       return fail('CONFLICT', `origin/${branch} is at ${remoteSha}, which is not an ancestor of the approved head ${head}; refusing to overwrite it (no force push).`);
     }
-    const p = await git(repo, ['push', '--porcelain', remote, `${head}:refs/heads/${branch}`], true);
-    if (p.code !== 0) return fail(classifyFailure(p.stderr), `git push to origin failed: ${lastLines(p.stderr) || `git exit ${p.code}`}`);
-    push = 'pushed';
+    const p = await pushToServer(repo, origin, head, branch, srv);
+    if (p.code !== 0) {
+      const rejected = /\[rejected\]|non-fast-forward|fetch first/i.test(p.stdout + p.stderr);
+      return fail(rejected ? 'CONFLICT' : classifyFailure(p.stderr), `git push to origin failed: ${lastLines(p.stderr || p.stdout) || `git exit ${p.code}`}`);
+    }
+    // Porcelain "=" marks a ref that was already up to date (the branch ls-remote failed but the server has the head).
+    push = /^=\t/m.test(p.stdout) ? 'already-current' : 'pushed';
   }
   if (mode === 'branch') return { state: 'published', mode, push, pr: null, prUrl: null, repository, changedPaths, sensitivePaths };
 

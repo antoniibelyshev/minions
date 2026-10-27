@@ -1,20 +1,25 @@
 // Pre-claim base sync for GitHub delivery (decision record: docs/design/bootstrap.md,
 // "origin/<base> as the single source of truth").
 //
-// - Before every claim the workspace fetches <base> from origin into refs/remotes/origin/<base>, then
-//   moves the local <base> forward to it: `merge --ff-only` where <base> is checked out, else
+// - Before every claim origin's <base> is read from the server and verified (publish.ts verifiedGateBase:
+//   an isolated ls-remote of minions' recorded https URL, cross-checked with the GitHub API, then an
+//   isolated fetch of that commit when it is missing), refs/remotes/origin/<base> is pointed at it, and the
+//   local <base> moves forward to it: `merge --ff-only` where <base> is checked out, else
 //   `update-ref <ref> <new> <old>`. Never a merge commit, rebase, reset or force.
 // - A local <base> that is ahead of or diverged from origin/<base> (something was committed or merged
 //   into it locally) blocks the claim with CONFLICT; a failed fetch blocks it with the classified
 //   error. The claim never starts on a base that origin does not have.
-// - The host runtime fetches from the normalized https URL (never through agent-writable remote
-//   settings), as configureOrigin and publishTask do.
+// - Both runtimes reach the server only at that explicit URL from an isolated git dir: no url.*insteadOf,
+//   remote.* or credential.* config of the agent-writable workspace changes what is read (task-71). The
+//   verified commit (`to`) is the base the scheduler records for the lease (leases.base_sha), never the
+//   local <base> ref, which a worker can move. gh down or a disagreement between git and the API blocks
+//   the claim.
 // Local delivery never calls this.
 import { MinionsError } from '../core/errors.js';
 import { redact } from '../core/output.js';
-import { isHostRuntime } from './git-hardening.js';
-import { normalizeGithubRemote, type GitFn } from './github.js';
-import { classifyFailure } from './publish.js';
+import type { ServerOrigin, ServerUrlFn } from './base-update.js';
+import type { GitFn } from './github.js';
+import { originOfRemoteUrl, realGh, verifiedGateBase, type GhFn } from './publish.js';
 import { git as realGit, listWorktrees } from './worktree.js';
 
 export interface BaseSyncResult {
@@ -30,33 +35,52 @@ export interface BaseSyncResult {
 const short = (sha: string | null) => sha?.slice(0, 12) ?? '(none)';
 const tail = (s: string) => redact(s.trim()).split('\n').slice(-3).join(' ').slice(0, 500);
 
-export async function syncBaseFromOrigin(repo: string, base: string, opts: { git?: GitFn } = {}): Promise<BaseSyncResult> {
+export interface BaseSyncOptions {
+  git?: GitFn;
+  /** gh for the GitHub API cross-check (default the PATH wrapper). */
+  gh?: GhFn;
+  /**
+   * The repository from minions' own record (publish.ts serverOriginOf). Absent: the workspace's origin
+   * URL, normalized (installs imported before the record existed); the reads still go to that explicit URL.
+   */
+  origin?: ServerOrigin | null;
+  /** Test seam: where git reaches the origin URL (base-update.ts ServerUrlFn). */
+  serverUrl?: ServerUrlFn;
+}
+
+export async function syncBaseFromOrigin(repo: string, base: string, opts: BaseSyncOptions = {}): Promise<BaseSyncResult> {
   const git = opts.git ?? realGit;
   const originRef = `refs/remotes/origin/${base}`;
   const blocked = 'The claim was blocked; nothing was merged.';
 
-  const url = await git(repo, ['config', '--get', 'remote.origin.url'], true);
-  const remoteUrl = url.code === 0 ? url.stdout.trim() : '';
-  const https = normalizeGithubRemote(remoteUrl);
-  if (!https) {
+  let origin = opts.origin;
+  let remoteUrl = '';
+  if (origin === undefined) {
+    const url = await git(repo, ['config', '--get', 'remote.origin.url'], true);
+    remoteUrl = url.code === 0 ? url.stdout.trim() : '';
+    origin = originOfRemoteUrl(remoteUrl);
+  }
+  if (!origin) {
     throw new MinionsError('PRECONDITION', `Cannot sync ${base} before the claim: the workspace has no github.com origin remote${remoteUrl ? ' (origin is not a github.com repository)' : ''}. ${blocked}`,
       'GitHub delivery takes the base from origin: run `minions start` on the host (it records origin from the host repository) and check `minions auth github`.',
       { base, reason: 'no-origin' });
-  }
-  const f = await git(repo, ['fetch', '--no-tags', isHostRuntime() ? https : 'origin', `+refs/heads/${base}:${originRef}`], true);
-  if (f.code !== 0) {
-    const code = classifyFailure(f.stderr);
-    throw new MinionsError(code === 'INTERNAL' ? 'NETWORK_RETRYABLE' : code,
-      `Cannot sync ${base} before the claim: fetching ${base} from origin failed: ${tail(f.stderr) || `git exit ${f.code}`}. ${blocked}`,
-      'Fix the network or GitHub credential (`minions auth github` on the host), then claim again.', { base, reason: 'fetch-failed' });
   }
   const sha = async (ref: string) => {
     const r = await git(repo, ['rev-parse', '--verify', '--quiet', `${ref}^{commit}`], true);
     return r.code === 0 ? r.stdout.trim() : null;
   };
-  const to = await sha(originRef);
-  if (!to) throw new MinionsError('INTERNAL', `Fetched ${base} from origin but ${originRef} does not resolve. ${blocked}`);
-  const from = await sha(`refs/heads/${base}`);
+  const local = await sha(`refs/heads/${base}`);
+  const vb = await verifiedGateBase({ repo, gh: opts.gh ?? realGh, origin, base, haves: local ? [local] : [], ...(opts.serverUrl ? { serverUrl: opts.serverUrl } : {}) });
+  if (!vb.ok) {
+    throw new MinionsError(vb.code === 'CONFLICT' ? 'CONFLICT' : vb.code === 'AUTH_REQUIRED' || vb.code === 'POLICY_DENIED' ? vb.code : 'NETWORK_RETRYABLE',
+      `Cannot sync ${base} before the claim: origin's ${base} could not be read and verified (${vb.message}). ${blocked}`,
+      'Fix the network or GitHub credential (`minions auth github` on the host), then claim again. A disagreement between git and the GitHub API means the workspace git config may be tampered with: inspect url.* / remote.* in the workspace .git/config.',
+      { base, reason: 'fetch-failed' });
+  }
+  const to = vb.sha;
+  // The remote-tracking ref follows the verified commit (only a hint for tools; nothing trusts it).
+  await git(repo, ['update-ref', '-m', 'minions: verified base from origin', originRef, to], true);
+  const from = local;
   if (from === to) return { base, originRef, from, to, action: 'up-to-date', method: null };
   if (!from) {
     const c = await git(repo, ['update-ref', '-m', 'minions: create base from origin', `refs/heads/${base}`, to, ''], true);

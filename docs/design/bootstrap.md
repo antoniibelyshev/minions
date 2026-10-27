@@ -242,6 +242,34 @@ Decision record for `delivery.mode` `branch` / `pull-request` (`src/runtime/publ
   only https for network operations), but repository-level `url.<x>.insteadOf` rewrites from one
   https URL to another still apply. Neither source is trusted to *remove* a path: each base can only
   add paths to the union, which is why the union stays safe when one of them is forged.
+- **Decision (task-71): gate reads ignore history rewrites.** The object database and git dir are
+  agent-writable too: `git replace <head> <commit with the base's tree>` (or a graft giving the base the
+  head as parent) made the sensitive-path diff empty. Every local git read whose answer decides a gate
+  (the `rev-parse`/`merge-base`/`diff` of `gateChangedPaths`, shared by publication and the merge gate;
+  the scheduler's QA-requirement and edit-scope diffs and its verifier ancestry check; the ref -> commit
+  reads of `resolveBaseBranch`/`headOf`) runs through `gateGit` (`src/runtime/git-hardening.ts`) in both
+  runtimes: `GIT_NO_REPLACE_OBJECTS=1`, `core.useReplaceRefs=false`, `GIT_GRAFT_FILE=/dev/null`,
+  `GIT_SHALLOW_FILE=/dev/null`, `core.commitGraph=false`, and the allowlisted environment of
+  `allowlistedGitEnv` (no inherited `GIT_*`, no global or system config, HOME that does not exist).
+  Network reads do not use the workspace git either (next decision).
+- **Decision (task-71 repair): the gate base comes from the server, read at minions' recorded URL.** A worker
+  could set `url.<forged>.insteadOf` (reads) and `url.<real>.pushInsteadOf` (pushes) and move the local base,
+  so the next claim recorded a poisoned base F and a forged `ls-remote` confirmed it; the sensitive change in F
+  then reached the real origin without approval (QA case D). Now: (1) the server is minions' own record of the
+  repository (the task's PR URL, else the `owner/repo` that `minions workspace import --remote-url` stores in the
+  runtime DB meta `origin_repository`; installs imported before that fall back to the normalized
+  `remote.origin.url`); (2) origin's base is read with task-68.3's helpers (`base-update.ts`
+  `verifiedServerBase`: an isolated `ls-remote` of that explicit https URL with the credential helper on the
+  command line and none of the repository's url/remote/http/credential config, cross-checked with
+  `gh api --hostname github.com /repos/<o>/<r>/branches/<base>`), then fetched isolated when missing
+  (`publish.ts verifiedGateBase`); a mismatch, gh down or an unfetchable commit fails closed (publication
+  fails, the merge gate is not eligible, the claim is blocked); (3) the claim records that verified commit as
+  `leases.base_sha` and fast-forwards the local base to it (a local base ahead of it blocks the claim);
+  (4) `gateChangedPaths` runs no `ls-remote` of its own: callers pass the verified `serverBase`, and without it
+  only recorded bases count (none: PRECONDITION); (5) publication's branch `ls-remote` and push go to the
+  same explicit URL (`serverRefOf` / `pushToServer`), so the server that was read is the one that is pushed
+  to. Residual: a worker able to run `minions workspace import --remote-url` could repoint the record, but
+  reads, the API cross-check, the push and `gh pr create --repo` then all target that other repository.
 - **Decision (task-40): main merged into a branch after the claim is still over-reported.** When main
   moves on after a task's first claim and the branch merges it, the diff against the earliest recorded
   base also lists main's own changes, so sensitive paths main changed ask for approval again. Fixing

@@ -4,11 +4,11 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { RuntimeDb, SCHEMA_VERSION } from '../../src/runtime/db.js';
 import { git as realGit, taskSlug, branchFor } from '../../src/runtime/worktree.js';
-import { publishTask, type GhFn } from '../../src/runtime/publish.js';
+import { gateChangedPaths, publishTask, type GhFn } from '../../src/runtime/publish.js';
 import { verifyAnyApproval } from '../../src/core/approval.js';
 import type { GitFn } from '../../src/runtime/github.js';
 import { defaults } from '../helpers.js';
-import { approvalKeys, commitFile, gitSync, tmp } from './fixtures.js';
+import { approvalKeys, commitFile, ghBranchApi, gitSync, tmp } from './fixtures.js';
 
 const TOKEN = 'ghp_' + 'b'.repeat(36);
 
@@ -99,6 +99,10 @@ describe('sensitive path detection and publication argv safety (fake git/gh)', (
     const baseSha = commitFile(repo, 'base.txt', 'base');
     gitSync(repo, 'checkout', '-q', '-b', 'agent/t');
     const head = commitFile(repo, 'x.txt', 'x');
+    // The server: a bare repository with main at the base, reached only through the serverUrl seam (task-71).
+    const bare = join(tmp(), 'demo.git');
+    execFileSync('git', ['init', '-q', '--bare', bare]);
+    gitSync(repo, 'push', '-q', bare, `${baseSha}:refs/heads/main`);
     const cfg = defaults();
     cfg.delivery.provider = 'github'; cfg.delivery.mode = 'pull-request';
     mutate?.(cfg);
@@ -108,12 +112,12 @@ describe('sensitive path detection and publication argv safety (fake git/gh)', (
       calls.push(args);
       if (args[0] === 'config' && args[1] === '--get') return { code: 0, stdout: 'https://github.com/acme/demo.git\n', stderr: '' };
       if (args[0] === 'diff') return { code: 0, stdout: diffPaths.join('\0') + '\0', stderr: '' };
-      if (args[0] === 'ls-remote') return { code: 0, stdout: '', stderr: '' };
-      if (args[0] === 'push') return { code: 0, stdout: '', stderr: '' };
       return realGit(cwd, args, allow);
     };
     const ghCalls: { args: string[]; input?: string; cwd?: string }[] = [];
     const gh: GhFn = async (args, opts) => {
+      const api = ghBranchApi(bare, args);
+      if (api) return api;
       ghCalls.push({ args, input: opts?.input, cwd: opts?.cwd });
       if (args[1] === 'list') return { code: 0, stdout: '[]', stderr: '' };
       return { code: 0, stdout: 'https://github.com/acme/demo/pull/9\n', stderr: '' };
@@ -121,10 +125,11 @@ describe('sensitive path detection and publication argv safety (fake git/gh)', (
     const keys = approvalKeys();
     const run = (humanApproved = false, title = 'T', baseShas: (string | null)[] = [baseSha]) => publishTask({
       config: cfg, task: { id: 'task-1', title, description: 'd', acceptanceCriteria: [] } as never,
-      repo, branch: 'agent/t', head, git, gh, tokenFile, baseShas,
+      repo, branch: 'agent/t', head, git, gateGit: git, gh, tokenFile, baseShas, serverUrl: () => bare,
       approvals: humanApproved ? [keys.sign('task-1', head)] : [], approvalPublicKeyFile: keys.publicKeyFile,
     });
-    return { run, calls, ghCalls };
+    const remoteHead = (ref: string) => { try { return gitSync(bare, 'rev-parse', '--verify', '--quiet', ref); } catch { return null; } };
+    return { run, calls, ghCalls, repo, bare, head, git, cfg, remoteHead };
   }
 
   const sensitive: [string, string[]][] = [
@@ -143,7 +148,7 @@ describe('sensitive path detection and publication argv safety (fake git/gh)', (
       const t = setup(paths);
       const out = await t.run(false);
       expect(out.state).toBe('awaiting-approval');
-      expect(t.calls.some((a) => a[0] === 'push')).toBe(false);
+      expect(t.remoteHead('refs/heads/agent/t')).toBeNull();
       expect(t.ghCalls).toHaveLength(0);
       expect((await t.run(true)).state).toBe('published');
     });
@@ -168,9 +173,9 @@ describe('sensitive path detection and publication argv safety (fake git/gh)', (
     const t = setup(['a.ts']);
     const out = await t.run(false, '--web --force-evil');
     expect(out.state).toBe('published');
-    const push = t.calls.find((a) => a[0] === 'push')!;
-    expect(push.join(' ')).not.toMatch(/--force|-f\b|\+/);
-    expect(push[push.length - 1]).toMatch(/^[0-9a-f]{40}:refs\/heads\/agent\/t$/);
+    // The push (isolated, explicit URL) lands exactly the approved head; the workspace git never pushes.
+    expect(t.remoteHead('refs/heads/agent/t')).toBe(t.head);
+    expect(t.calls.some((a) => a[0] === 'push' || a[0] === 'ls-remote')).toBe(false);
     const create = t.ghCalls.find((c) => c.args[1] === 'create')!;
     const i = create.args.indexOf('--title');
     expect(create.args[i + 1]).toBe('--web --force-evil'); // a separate argv value after --title, never parsed as its own option
@@ -180,29 +185,30 @@ describe('sensitive path detection and publication argv safety (fake git/gh)', (
     expect(t.ghCalls.some((c) => c.args.includes('merge'))).toBe(false);
   });
 
-  it('host runtime: ls-remote/push name the normalized https URL (never the agent-writable origin remote); gh runs outside the workspace', async () => {
+  it('host runtime: no ls-remote or push through the workspace git; the server reads deny the file transport (fail closed)', async () => {
     const prev = process.env.MINIONS_RUNTIME;
     process.env.MINIONS_RUNTIME = 'host';
     try {
       const t = setup(['a.ts']);
-      expect((await t.run(false)).state).toBe('published');
-      for (const op of ['ls-remote', 'push']) {
-        const c = t.calls.find((a) => a[0] === op)!;
-        expect(c).toContain('https://github.com/acme/demo.git');
-        expect(c).not.toContain('origin');
-      }
-      expect(t.ghCalls.every((g) => g.cwd === '/')).toBe(true);
+      // The seam points at a local bare repository, which the host's network hardening refuses: nothing is published.
+      expect(await t.run(false)).toMatchObject({ state: 'failed', message: expect.stringMatching(/could not be read from https:\/\/github\.com\/acme\/demo\.git/) });
+      expect(t.calls.some((a) => a[0] === 'push' || a[0] === 'ls-remote')).toBe(false);
+      expect(t.remoteHead('refs/heads/agent/t')).toBeNull();
+      expect(t.ghCalls).toHaveLength(0);
     } finally { if (prev === undefined) delete process.env.MINIONS_RUNTIME; else process.env.MINIONS_RUNTIME = prev; }
   });
 
-  it('fails closed without a trustworthy base: no usable recorded base SHA and no remote base (local refs alone never suffice)', async () => {
-    const t = setup(['a.ts']); // refs/heads/main exists, but ls-remote reports no base
-    for (const baseShas of [[], [null], ['f'.repeat(40)], ['main'], ['HEAD~1']]) {
-      const out = await t.run(false, 'T', baseShas);
-      expect(out, JSON.stringify(baseShas)).toMatchObject({ state: 'failed', code: 'PRECONDITION', message: expect.stringMatching(/No trustworthy base/) });
-    }
-    expect(t.calls.some((a) => a[0] === 'push')).toBe(false);
+  it('fails closed without a verified server base: gh reports no base branch, or the gate gets no server base and no usable recorded base', async () => {
+    const t = setup(['a.ts']);
+    gitSync(t.bare, 'update-ref', '-d', 'refs/heads/main'); // origin has no main (GitHub says 404)
+    expect(await t.run(false)).toMatchObject({ state: 'failed', message: expect.stringMatching(/cannot verify origin's main with the GitHub API/) });
+    expect(t.remoteHead('refs/heads/agent/t')).toBeNull();
     expect(t.ghCalls).toHaveLength(0);
+    // The gate itself (also the merge gate's): refs/heads/main exists, but local refs alone never suffice.
+    for (const baseShas of [[], [null], ['f'.repeat(40)], ['main'], ['HEAD~1']]) {
+      const g = await gateChangedPaths({ gateGit: t.git, repo: t.repo, base: 'main', head: t.head, branch: 'agent/t', baseShas, sensitivePaths: t.cfg.sensitivePaths });
+      expect(g, JSON.stringify(baseShas)).toMatchObject({ ok: false, code: 'PRECONDITION', message: expect.stringMatching(/No trustworthy base/) });
+    }
   });
 
   it('hostile task id/title produce a safe branch slug', () => {
