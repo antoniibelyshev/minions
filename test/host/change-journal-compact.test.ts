@@ -70,6 +70,24 @@ describe('compactEntries', () => {
     expect(undoCandidates(kept, P, 2).map((c) => c.id)).toEqual([h.undo, h.sets[2]]);
   });
 
+  it('a dropped applied or rejected container request leaves a tombstone; a failed one does not; stable on repeat', () => {
+    const cr = (n: number) => `cr_${n.toString(16).padStart(8, '0')}`;
+    const e: JournalEntry[] = [];
+    const types = ['applied', 'rejected', 'failed'] as const;
+    types.forEach((t, n) => e.push({ ...offer(cr(n), 'sync', {}, 2 * n), request: { id: cr(n), kind: 'sync', payload: {}, reason: null } } as JournalEntry,
+      { type: t, at: at(2 * n + 1), projectId: P, requestId: cr(n), digest: 'd'.repeat(64), detail: 'done' }));
+    const newer = id();
+    e.push(offer(newer, 'sync', {}, 10), outcome(newer, 'rejected', 11));
+    const kept = J.compactEntries(e, { keepClosed: 1, keepUndo: 0 });
+    expect(kept).toEqual([
+      { type: 'applied', at: at(1), projectId: P, requestId: cr(0) },
+      { type: 'rejected', at: at(3), projectId: P, requestId: cr(1) },
+      ...e.slice(-2),
+    ]);
+    expect(J.lastOutcome(kept, P, cr(0))?.type).toBe('applied');
+    expect(J.compactEntries(kept, { keepClosed: 1, keepUndo: 0 })).toBe(kept);
+  });
+
   it('returns the same array when nothing is dropped', () => {
     const h = history();
     expect(J.compactEntries(h.e)).toBe(h.e);

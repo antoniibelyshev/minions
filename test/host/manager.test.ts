@@ -345,6 +345,43 @@ describe('host manager: confirm, apply, replay', () => {
     expect(s.c.runs).toHaveLength(0);
   });
 
+  it('compaction: an applied container request whose row still reads proposed is never offered or applied again (task-90)', async () => {
+    const { project } = await install();
+    const id = requestSet(project, 'execution.maxActiveTasks', '5');
+    const s = setup([project]);
+    await s.manager.pollAll();
+    const o = s.t.offers[0]!;
+    await s.manager.handle({ type: 'confirm', requestId: id, nonce: o.nonce });
+    expect(s.c.runs).toHaveLength(1);
+    const offered = (await J.readJournal()).find((e): e is import('../../src/host/change-journal.js').OfferEntry => e.type === 'offer' && e.requestId === id)!;
+    // The runtime mark never landed: the row still says proposed.
+    db.exec(`UPDATE change_requests SET status = 'proposed' WHERE id = ?`, id);
+    // Past COMPACT_AT_BYTES with more newer applied config changes than the undo and closed-tail limits keep.
+    const pad = 'x'.repeat(Math.ceil(J.COMPACT_AT_BYTES / 100));
+    const filler: string[] = [];
+    for (let k = 0; k < J.KEEP_UNDO_PER_PROJECT + J.KEEP_CLOSED_REQUESTS + 5; k++) {
+      const r = `ow_${k.toString(16).padStart(8, '0')}`;
+      const at = new Date(Date.UTC(2026, 9, 26, 11) + k * 1000).toISOString();
+      filler.push(JSON.stringify({ type: 'offer', at, projectId: project.projectId, requestId: r, digest: 'd'.repeat(64), configRevision: 1, nonce: r.padEnd(32, '0'), expiresAt: at,
+        request: { id: r, kind: 'config-set', payload: {}, reason: null, origin: 'owner' }, plan: { kind: 'config-set', pad } }));
+      filler.push(JSON.stringify({ type: 'applied', at, projectId: project.projectId, requestId: r }));
+    }
+    writeFileSync(J.journalPath(), readFileSync(J.journalPath(), 'utf8') + filler.join('\n') + '\n');
+    await J.recordOutcome({ type: 'rejected', projectId: project.projectId, requestId: 'ow_ffffffff' });
+    // The request's offer and plan are gone; one tombstone line with its final outcome stays.
+    expect(journal().filter((e) => e.requestId === id)).toEqual([{ type: 'applied', at: expect.any(String), projectId: project.projectId, requestId: id }]);
+    expect(journal().some((e) => e.requestId === 'ow_00000000')).toBe(false);
+
+    await s.manager.pollAll();
+    await new M.HostManager(s.deps).pollAll();
+    expect(s.t.offers).toHaveLength(1);
+    // A tap on the old offer applies nothing; a confirmation that reaches the journal check is refused as handled.
+    await s.manager.handle({ type: 'confirm', requestId: id, nonce: o.nonce });
+    expect(s.c.runs).toHaveLength(1);
+    await expect(J.consumeOffer(offered)).rejects.toMatchObject({ details: { refusal: 'handled' } });
+    expect(journal().filter((e) => e.requestId === id && e.type === 'confirmed')).toHaveLength(0);
+  });
+
   it('reject marks the request rejected; a later confirm of that offer is "already handled"', async () => {
     const { project } = await install();
     const id = requestSet(project, 'execution.maxActiveTasks', '5');

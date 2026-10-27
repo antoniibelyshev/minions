@@ -124,8 +124,18 @@ const CLOSED_TYPES: ReadonlySet<string> = new Set(['applied', 'failed', 'rejecte
  * is kept or dropped whole. Kept: every request whose newest entry is not applied / failed / rejected (an open offer,
  * a confirmed or applying one: in flight or interrupted; anything unknown too); per project the newest `keepUndo`
  * applied config-set / undo requests (a suffix in applied order, so an undo is never dropped while the change it
- * reverted is kept); and the newest `keepClosed` other closed requests. Older closed requests are dropped: a container
- * row still open for one is offered again, as after a failure. Returns `entries` itself when nothing is dropped.
+ * reverted is kept); and the newest `keepClosed` other closed requests. Older closed requests are dropped.
+ *
+ * Tombstones (task-90 repair; chosen over "keep until the runtime row is closed" and "treat missing-and-old as
+ * handled"): a dropped container request (`cr_`) whose outcome is applied or rejected keeps one line, its final
+ * outcome without the details (`{type, at, projectId, requestId}`). The runtime row is marked after the journal entry
+ * and that mark is best effort, so the row can still read `proposed`; the manager's poll (needsOffer) and every
+ * confirmation (assertOfferOpen, via lastOutcome) then still see "already handled", so the request is never offered
+ * or applied again. Compaction cannot ask the runtime (it runs under the journal lock in append, with no container
+ * access), and a horizon rule would need a timestamp the poll can trust for every row. A dropped failed request needs
+ * no tombstone (a failed request may be offered and confirmed again anyway); an owner request (`ow_`) has no runtime
+ * row. Tombstones cost about 100 bytes each and are kept. Returns `entries` itself when nothing changes (an existing
+ * tombstone stays as it is).
  */
 export function compactEntries(entries: JournalEntry[], o: { keepClosed?: number; keepUndo?: number } = {}): JournalEntry[] {
   const keepClosed = o.keepClosed ?? KEEP_CLOSED_REQUESTS;
@@ -133,25 +143,45 @@ export function compactEntries(entries: JournalEntry[], o: { keepClosed?: number
   const keyOf = (e: JournalEntry) => `${e.projectId}\0${e.requestId}`;
   const last = new Map<string, { at: number; e: JournalEntry }>();
   const kinds = new Map<string, unknown>();
+  const count = new Map<string, number>();
   entries.forEach((e, at) => {
     last.set(keyOf(e), { at, e });
+    count.set(keyOf(e), (count.get(keyOf(e)) ?? 0) + 1);
     if (e.type === 'offer') kinds.set(keyOf(e), (e.request as Partial<RequestSnapshot> | undefined)?.kind);
   });
   const closed = [...last].filter(([, v]) => CLOSED_TYPES.has(v.e.type)).sort((a, b) => b[1].at - a[1].at);
   const undoKept = new Map<string, number>();
   const drop = new Set<string>();
+  /** Dropped requests that leave a tombstone: key -> the index (in `entries`) of the final outcome it replaces. */
+  const tombs = new Map<string, number>();
   let tail = 0;
-  for (const [key, { e }] of closed) {
+  for (const [key, { at, e }] of closed) {
     const kind = kinds.get(key);
     if (e.type === 'applied' && (kind === 'config-set' || kind === 'undo')) {
       const n = undoKept.get(e.projectId) ?? 0;
       if (n < keepUndo) { undoKept.set(e.projectId, n + 1); continue; }
     }
     if (tail < keepClosed) { tail++; continue; }
+    if (needsTombstone(e)) {
+      if (count.get(key) === 1 && isTombstone(e)) continue; // already a tombstone: unchanged
+      tombs.set(key, at);
+    }
     drop.add(key);
   }
-  return drop.size ? entries.filter((e) => !drop.has(keyOf(e))) : entries;
+  if (!drop.size) return entries;
+  const out: JournalEntry[] = [];
+  entries.forEach((e, at) => {
+    const key = keyOf(e);
+    if (!drop.has(key)) out.push(e);
+    else if (tombs.get(key) === at) out.push(tombstoneOf(e as OutcomeEntry));
+  });
+  return out;
 }
+
+/** A closed container request whose outcome must outlive compaction (see compactEntries). */
+const needsTombstone = (e: JournalEntry) => (e.type === 'applied' || e.type === 'rejected') && isChangeRequestId(e.requestId);
+const tombstoneOf = (e: OutcomeEntry): OutcomeEntry => ({ type: e.type, at: e.at, projectId: e.projectId, requestId: e.requestId });
+const isTombstone = (e: JournalEntry) => Object.keys(e).length === 4;
 
 /** Under the journal lock: from COMPACT_AT_BYTES on, rewrites the journal (temp file, rename) without what compactEntries drops. */
 async function compactIfLarge(): Promise<void> {
