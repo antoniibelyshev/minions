@@ -230,11 +230,14 @@ describe('work run: supervise, cancel, timeout, drain', { timeout: 30_000 }, () 
     const b = await claim(r);
     const log = join(r.root, 'signals.log');
     const out = await runLease(b.leaseId, r.deps({ steps: [{ op: 'logSignals', path: log }, { op: 'sleep', ms: 30_000 }] },
-      { timing: { timeoutMs: HANDLERS_TIMEOUT_MS, pollMs: 50, killGraceMs: 300, interruptGraceMs: 250, drainGraceMs: 100 } }));
+      { timing: { timeoutMs: HANDLERS_TIMEOUT_MS, pollMs: 50, killGraceMs: 1_000, interruptGraceMs: 1_000, drainGraceMs: 100 } }));
     expect(out).toMatchObject({ status: 'partial', exit: { stopped: 'timeout', signal: 'SIGKILL' } });
     const lines = readFileSync(log, 'utf8').trim().split('\n').map((l) => l.split(' '));
     expect(lines.map(([sig]) => sig)).toEqual(['SIGINT', 'SIGTERM']);
-    expect(Number(lines[1]![1]) - Number(lines[0]![1])).toBeGreaterThanOrEqual(200);
+    // The times are when the harness handled each signal, so a starved harness handling the SIGINT late
+    // shrinks the gap below the grace (194 ms for a 250 ms grace under load, task-93). A 1 s grace with a
+    // 500 ms floor still tells a real grace from none (~0 ms) and leaves room for that lag.
+    expect(Number(lines[1]![1]) - Number(lines[0]![1])).toBeGreaterThanOrEqual(500);
   });
 
   it('task-14.14: a worker that stops on SIGINT gets nothing more; the interrupt grace never exceeds the kill grace', async () => {
