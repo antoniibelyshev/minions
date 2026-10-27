@@ -83,6 +83,12 @@ export interface ChangePlan {
   /** 'owner': typed by the owner in the manager chat (absent for a container request, so older digests stay valid). */
   origin?: 'owner';
   /**
+   * 'assistant': an owner request proposed by the manager's assistant from the owner's message (task-65.4). Digested,
+   * so a confirmation cannot move it between typed and assistant-proposed; absent for typed commands and container
+   * requests, so their digests stay unchanged.
+   */
+  via?: 'assistant';
+  /**
    * undo: the change it reverts, the sha256 of the file text that change wrote (the compare-and-swap value) and of the
    * text it restores, and every setting the restore changes in that file (`change` is the first, the entry's own key).
    */
@@ -224,10 +230,17 @@ async function assertUpgradeDelivery(project: ProjectJson, req: RequestSnapshot,
  */
 export async function buildPlan(project: ProjectJson, req: RequestSnapshot, deps: ChangeRequestDeps, pre: { dry?: UpgradeRun } = {}): Promise<{ plan: ChangePlan; notes: string[] }> {
   const owner = isOwnerRequest(req);
-  if (!owner && (OWNER_ONLY_KINDS.includes(req.kind) || req.origin !== undefined || isOwnerRequestId(req.id))) {
+  if (!owner && (OWNER_ONLY_KINDS.includes(req.kind) || req.origin !== undefined || req.via !== undefined || isOwnerRequestId(req.id))) {
     throw new MinionsError('PRECONDITION', `Change request ${displayText(req.id)}: kind "${displayText(String(req.kind))}" comes only from the owner in the manager chat; nothing to apply.`);
   }
-  const base = { requestId: req.id, projectId: project.projectId, reason: quotedReason(req.reason), change: null, loosens: null, upgradeSteps: null, ...(owner ? { origin: 'owner' as const } : {}) };
+  if (req.via !== undefined && req.via !== 'assistant') throw new MinionsError('PRECONDITION', `Change request ${displayText(req.id)}: unknown origin "${displayText(String(req.via))}"; nothing to apply.`);
+  if (req.via === 'assistant' && (req.kind === 'approve' || req.kind === 'rebuild-cli' || req.kind === 'cli-rollback')) {
+    throw new MinionsError('PRECONDITION', `Change request ${displayText(req.id)}: a ${displayText(req.kind)} request is never proposed by the assistant; type the command.`);
+  }
+  const base = {
+    requestId: req.id, projectId: project.projectId, reason: quotedReason(req.reason), change: null, loosens: null, upgradeSteps: null,
+    ...(owner ? { origin: 'owner' as const } : {}), ...(owner && req.via === 'assistant' ? { via: 'assistant' as const } : {}),
+  };
   if (req.kind === 'config-set') {
     const { key, value, layer } = req.payload as { key?: unknown; value?: unknown; layer?: unknown };
     if (typeof key !== 'string' || typeof value !== 'string' || (layer !== 'local' && layer !== 'shared')) {
@@ -413,7 +426,8 @@ export function formatPlan(plan: ChangePlan, digest: string, notes: string[]): s
   const owner = plan.origin === 'owner';
   return displayText([
     `${owner ? 'owner request' : 'change request'} ${plan.requestId} (${plan.kind}) for project ${plan.projectId}, configRevision ${plan.configRevision}`,
-    owner ? 'requested by you in the manager chat (this plan waits for your Confirm: check it)' : `reason (from the container, untrusted): ${plan.reason}`,
+    owner && plan.via === 'assistant' ? 'proposed by the assistant from your message in the manager chat (you did not type this command: confirm this exact plan only if it is what you want)'
+      : owner ? 'requested by you in the manager chat (this plan waits for your Confirm: check it)' : `reason (from the container, untrusted): ${plan.reason}`,
     ...(plan.undo ? [`undoes: ${plan.undo.target}`] : []),
     ...(plan.approval ? [`approves: ${plan.approval.taskId} at head ${plan.approval.head}`, `scope: ${approvalScopeText(plan.approval.scope)}`] : []),
     ...(plan.restart ? [`restart: ${plan.restart.mode === 'drain' ? 'drain now, then restart when idle' : 'restart when idle (queued)'}`] : []),
@@ -522,9 +536,11 @@ export const DIRECT_KINDS: readonly string[] = ['config-set', 'restart', 'sync',
  * origin, in the request and the plan), a kind in DIRECT_KINDS, `loosens` exactly null, not a queued restart mode
  * (those are follow-up offers), and an upgrade only without --from-container and without --rebuild-cli (without that
  * flag `minions upgrade` never builds or installs a CLI on the host). Everything else keeps its offer and tap (two
- * when it loosens). Container requests never get here: they are never owner requests.
+ * when it loosens). Container requests never get here: they are never owner requests. A plan the assistant proposed
+ * (`via: 'assistant'`, task-65.4) never applies directly either: the owner did not type it.
  */
 export function appliesWithoutConfirm(plan: ChangePlan, req: RequestSnapshot): boolean {
+  if (req.via !== undefined || plan.via !== undefined) return false;
   if (!isOwnerRequest(req) || plan.origin !== 'owner' || plan.requestId !== req.id || plan.kind !== req.kind) return false;
   if (plan.loosens !== null || !DIRECT_KINDS.includes(plan.kind) || plan.restart !== undefined) return false;
   if (plan.kind === 'upgrade' && (fromContainerOf(req.payload) !== null || planArgv(plan, req).includes('--rebuild-cli'))) return false;

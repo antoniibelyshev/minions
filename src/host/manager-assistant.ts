@@ -12,7 +12,7 @@
 //   ~/.claude (plugins, the Telegram channel, logins, transcripts) is never loaded.
 // - env: an allowlist (PASS_ENV of the host runtime without CLAUDE_CONFIG_DIR, LC_*, absolute PATH entries), the run
 //   dir, and the manager Claude token as CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY. Nothing else passes through.
-// - Bounds: a 60 s timeout (the child is killed), a 64 KiB output cap, a 64 KiB input cap.
+// - Bounds: a 60 s timeout (the child's whole process group is killed), a 64 KiB output cap, a 64 KiB input cap.
 // - Fail closed: `claude --version` and `claude --help` are checked once (probeClaude) against a minimum version and
 //   the safety flags above; if one is missing the assistant is unavailable with that reason and never runs.
 // assistant.json and the token are read per call, so `minions setup` changes need no manager restart.
@@ -81,6 +81,44 @@ export function managerAssistantGuidance(): string[] {
 
 export async function removeAssistantConfig(): Promise<void> {
   await rm(managerPaths().assistantJson, { force: true });
+  await rm(managerPaths().assistantUsageJson, { force: true });
+}
+
+// ---------------------------------------------------------------- usage (calls today, last error)
+
+/**
+ * <MINIONS_HOME>/manager/assistant-usage.json (0600): the calls of the current UTC day, the day the over-limit notice
+ * was last sent, and the last error of a call. Written by the manager only (one call at a time); read by
+ * `minions status` and doctor. Holds no owner text, no answer and no secret: an error reason is the host's own text.
+ */
+export const AssistantUsageSchema = z.object({
+  version: z.literal(1),
+  /** UTC day (YYYY-MM-DD) the count belongs to. */
+  day: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+  calls: z.number().int().min(0),
+  /** The day the "daily limit reached" reason was last shown (once a day; later messages get the command list only). */
+  limitNoticeDay: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).nullable(),
+  lastError: z.object({ at: z.string(), failure: z.string().max(40), reason: z.string().max(400) }).strict().nullable(),
+}).strict();
+export type AssistantUsage = z.infer<typeof AssistantUsageSchema>;
+
+/** The UTC day of a date (the daily limit resets at 00:00 UTC). */
+export const usageDay = (now: Date) => now.toISOString().slice(0, 10);
+
+/** The usage of now's day: a count of another day reads as 0 (the last error and the notice day stay). Never throws. */
+export async function loadAssistantUsage(now: Date = new Date()): Promise<AssistantUsage> {
+  const day = usageDay(now);
+  let u: AssistantUsage | null = null;
+  try { u = (await readJsonIfExists(managerPaths().assistantUsageJson, AssistantUsageSchema)) ?? null; } catch { u = null; }
+  if (!u) return { version: 1, day, calls: 0, limitNoticeDay: null, lastError: null };
+  return u.day === day ? u : { ...u, day, calls: 0 };
+}
+
+export async function saveAssistantUsage(u: AssistantUsage): Promise<void> {
+  const v = AssistantUsageSchema.parse(u);
+  await ensureRealDir(managerDir(), 0o700);
+  await chmod(managerDir(), 0o700);
+  await writeJson(managerPaths().assistantUsageJson, v, { mode: 0o600 });
 }
 
 // ---------------------------------------------------------------- bounds
@@ -112,6 +150,7 @@ export const REQUIRED_FLAGS = [
 /** Extra bounds used when the installed CLI has them (the safety does not depend on them). */
 export const OPTIONAL_FLAGS = [
   '--json-schema', '--no-session-persistence', '--max-budget-usd', '--max-turns', '--permission-prompts', '--disable-slash-commands', '--restricted',
+  '--setting-sources',
 ] as const;
 
 /**
@@ -124,7 +163,12 @@ export const BUILTIN_TOOLS = [
   'ListMcpResourcesTool', 'ReadMcpResourceTool', 'SendUserMessage',
 ] as const;
 
-/** Permission modes that may be passed: `default`, or `manual`, which newer CLIs list instead (it maps to default). */
+/**
+ * Permission modes that may be passed: `default`, or `manual`, which newer CLIs list instead (it maps to default).
+ * TODO(task-70): once task-70 merges, use the shared strictPermissionModeArg of src/runtime/permission-modes.ts in
+ * checkCapabilities. Its logic is the same as here: `default` when listed, else `manual`, `default` when the choices are
+ * not listed, and fail closed when they list neither.
+ */
 const DEFAULT_MODE_NAMES = ['default', 'manual'] as const;
 export type AssistantPermissionMode = typeof DEFAULT_MODE_NAMES[number];
 
@@ -193,6 +237,11 @@ export interface ClaudeCapabilities {
   disableSlashCommands: boolean;
   /** `--restricted`: no code-running tools, user/project/local settings files ignored, bypass refused. */
   restricted: boolean;
+  /**
+   * `--setting-sources`: without --restricted the call passes `--setting-sources user`, so no project or local settings
+   * file loads (the user source is the fresh, empty CLAUDE_CONFIG_DIR of the call).
+   */
+  settingSources: boolean;
 }
 export type CapabilityCheck = { ok: true; caps: ClaudeCapabilities } | { ok: false; reason: string };
 
@@ -219,6 +268,7 @@ export function checkCapabilities(claudePath: string, versionOut: string, helpOu
       permissionPromptsNone: help.flags.has('--permission-prompts') && (!prompts || prompts.includes('none')),
       disableSlashCommands: help.flags.has('--disable-slash-commands'),
       restricted: help.flags.has('--restricted'),
+      settingSources: help.flags.has('--setting-sources'),
     },
   };
 }
@@ -375,7 +425,7 @@ export function buildAssistantInvocation(i: InvocationInput): Invocation {
     ...(c.permissionPromptsNone ? ['--permission-prompts', 'none'] : []),
     ...(c.noSessionPersistence ? ['--no-session-persistence'] : []),
     ...(c.disableSlashCommands ? ['--disable-slash-commands'] : []),
-    ...(c.restricted ? ['--restricted'] : []),
+    ...(c.restricted ? ['--restricted'] : c.settingSources ? ['--setting-sources', 'user'] : []),
     ...(c.maxTurns ? ['--max-turns', '1'] : []),
     ...(c.maxBudget ? ['--max-budget-usd', ASSISTANT_MAX_BUDGET_USD] : []),
     ...(i.jsonSchema && c.jsonSchema ? ['--json-schema', JSON.stringify(i.jsonSchema)] : []),
@@ -433,7 +483,7 @@ export interface CallOptions {
   input: string;
   jsonSchema?: object;
   credential: { token: string; kind: ClaudeTokenKind };
-  /** Spawns the child (tests: a fake). Defaults to src/core/exec.ts `run` (no shell; SIGTERM, then SIGKILL). */
+  /** Spawns the child (tests: a fake). Defaults to src/core/exec.ts `run` (no shell; SIGTERM, then SIGKILL, to the whole process group). */
   runner?: Runner;
   /** The manager's environment (only the allowlist passes). */
   env?: NodeJS.ProcessEnv;
@@ -460,7 +510,7 @@ export async function runAssistantCall(o: CallOptions): Promise<AssistantOutcome
       runDir: dir, credential: o.credential, baseEnv: assistantBaseEnv(o.env ?? process.env),
     });
     const r = await (o.runner ?? run)(inv.command, inv.args, {
-      cwd: inv.cwd, env: inv.env, input: o.input, timeoutMs, maxOutputBytes: outputCap, allowFailure: true, ...(o.signal ? { signal: o.signal } : {}),
+      cwd: inv.cwd, env: inv.env, input: o.input, timeoutMs, maxOutputBytes: outputCap, allowFailure: true, killGroup: true, ...(o.signal ? { signal: o.signal } : {}),
     });
     return interpretOutput(r, { timeoutMs, outputCap });
   } catch (e) {
@@ -543,6 +593,10 @@ export interface AssistantOverview {
   /** From the reference file only (`doctor` reads the store itself): ok = a token is recorded. */
   credential: 'ok' | 'missing' | 'invalid';
   credentialKind: ClaudeTokenKind | null;
+  /** Calls of the current UTC day (assistant-usage.json). */
+  callsToday: number;
+  /** The last failed call (host text, no owner text, no secret), or null. */
+  lastError: { at: string; reason: string } | null;
   errors: string[];
 }
 
@@ -550,7 +604,7 @@ export interface AssistantOverview {
  * Read-only: assistant.json and the token's reference file. No claude run, no network, and no secret store access (so
  * `minions status` never triggers a Keychain prompt); never the token.
  */
-export async function assistantOverview(): Promise<AssistantOverview> {
+export async function assistantOverview(now: Date = new Date()): Promise<AssistantOverview> {
   const errors: string[] = [];
   const config = await loadAssistantConfig().catch((e) => { errors.push(`assistant.json: ${short(e, 160)}`); return null; });
   let credential: AssistantOverview['credential'] = 'missing';
@@ -559,9 +613,11 @@ export async function assistantOverview(): Promise<AssistantOverview> {
     credential = 'invalid';
     errors.push(`manager Claude credential reference: ${short(e, 160)}`);
   }
+  const usage = await loadAssistantUsage(now);
   return {
     setUp: !!config || credential !== 'missing', enabled: config?.enabled ?? false, model: config?.model ?? null, dailyLimit: config?.dailyLimit ?? null,
-    credential, credentialKind: ref?.kind ?? null, errors,
+    credential, credentialKind: ref?.kind ?? null, callsToday: usage.calls,
+    lastError: usage.lastError ? { at: usage.lastError.at, reason: usage.lastError.reason } : null, errors,
   };
 }
 
@@ -569,7 +625,8 @@ export async function assistantOverview(): Promise<AssistantOverview> {
 export function formatAssistantLine(a: AssistantOverview): string {
   if (!a.setUp) return 'assistant: not set up (optional: `minions setup`, host manager step)';
   const token = a.credential === 'ok' ? 'token stored' : a.credential === 'missing' ? 'no token' : 'token invalid';
-  return `assistant: ${a.enabled ? 'on' : 'off'}${a.model ? `, ${a.model}` : ''}${a.dailyLimit ? `, limit ${a.dailyLimit} calls/day` : ''}, ${token}`;
+  const calls = a.dailyLimit ? `, ${a.callsToday} of ${a.dailyLimit} calls today` : a.callsToday ? `, ${a.callsToday} calls today` : '';
+  return `assistant: ${a.enabled ? 'on' : 'off'}${a.model ? `, ${a.model}` : ''}${calls}, ${token}${a.lastError ? `; last error ${a.lastError.at}: ${short(a.lastError.reason, 300)}` : ''}`;
 }
 
 export interface AssistantCheck { name: 'manager.assistant'; status: 'ok' | 'warn' | 'unavailable'; detail: string; hint?: string }
@@ -592,9 +649,11 @@ export async function assistantCheck(o: { runner?: Runner; probe?: () => Promise
       ? { name, status: 'warn', detail: `off; the stored Claude token is invalid: ${cred.detail}`, hint: setup }
       : { name, status: 'ok', detail: `off${cred.state === 'ok' ? ' (Claude token stored)' : ''}` };
   }
-  const on = `on (${config.model}, limit ${config.dailyLimit} calls/day)`;
+  const usage = await loadAssistantUsage();
+  const on = `on (${config.model}, limit ${config.dailyLimit} calls/day${usage.calls ? `, ${usage.calls} today` : ''})`;
+  const lastError = usage.lastError ? `; last error ${usage.lastError.at}: ${short(usage.lastError.reason, 300)}` : '';
   if (cred.state !== 'ok') return { name, status: 'warn', detail: `${on}, but ${cred.state === 'missing' ? 'no Claude token is stored' : `the Claude token is invalid: ${cred.detail}`}: the manager answers with the command list`, hint: setup };
   const check = await (o.probe ?? (() => probeClaude(o.runner ? { runner: o.runner } : {})))().catch((e): CapabilityCheck => ({ ok: false, reason: short(e) }));
   if (!check.ok) return { name, status: 'warn', detail: `${on}, but unavailable: ${check.reason}`, hint: 'Install or update Claude Code on this host (`claude update`); the manager answers with the command list until then.' };
-  return { name, status: 'ok', detail: `${on}; ${cred.detail}; Claude Code ${check.caps.version}` };
+  return { name, status: 'ok', detail: `${on}; ${cred.detail}; Claude Code ${check.caps.version}${lastError}` };
 }

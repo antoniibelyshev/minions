@@ -14,6 +14,12 @@ export interface RunOptions {
    * stays (cut at the cap) and the result has `outputLimited: true` (code 125 unless it timed out or was aborted).
    */
   maxOutputBytes?: number;
+  /**
+   * POSIX: the child leads its own process group, and the timeout, abort and output cap signal the whole group
+   * (SIGTERM, SIGKILL after the grace), so grandchildren that keep the output pipes open cannot hold the call. Without
+   * it only the direct child is signalled. Ignored on Windows.
+   */
+  killGroup?: boolean;
 }
 export interface RunResult { code: number; stdout: string; stderr: string; timedOut?: boolean; aborted?: boolean; outputLimited?: boolean }
 
@@ -29,10 +35,18 @@ export function run(cmd: string, args: string[], opts: RunOptions = {}): Promise
       if (opts.allowFailure) return resolve({ code: 130, stdout: '', stderr: '', aborted: true });
       return reject(new MinionsError('INTERNAL', `${cmd} was aborted before it started`, undefined, { cmd, args: args.map(redact), aborted: true }));
     }
+    const group = opts.killGroup === true && process.platform !== 'win32';
     const child = spawn(cmd, args, {
       cwd: opts.cwd, env: opts.env ?? process.env, shell: false,
-      stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true,
+      stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true, ...(group ? { detached: true } : {}),
     });
+    /** Signals the child, or its whole process group (a group already gone falls back to the child, then to nothing). */
+    const signal = (sig: NodeJS.Signals) => {
+      if (group && child.pid !== undefined) {
+        try { process.kill(-child.pid, sig); return; } catch { /* the group is gone */ }
+      }
+      try { child.kill(sig); } catch { /* gone */ }
+    };
     let stdout = '', stderr = '', timedOut = false, aborted = false, settled = false, outputLimited = false, bytes = 0;
     let killTimer: NodeJS.Timeout | undefined;
     const take = (d: string): string => {
@@ -50,8 +64,8 @@ export function run(cmd: string, args: string[], opts: RunOptions = {}): Promise
     child.stderr.setEncoding('utf8').on('data', (d: string) => (stderr += take(d)));
     const terminate = () => {
       if (killTimer || settled) return;
-      child.kill('SIGTERM');
-      killTimer = setTimeout(() => child.kill('SIGKILL'), KILL_GRACE_MS);
+      signal('SIGTERM');
+      killTimer = setTimeout(() => signal('SIGKILL'), KILL_GRACE_MS);
     };
     const timer = opts.timeoutMs ? setTimeout(() => { if (!aborted) timedOut = true; terminate(); }, opts.timeoutMs) : undefined;
     const onAbort = () => { if (!timedOut) aborted = true; terminate(); };
@@ -59,7 +73,11 @@ export function run(cmd: string, args: string[], opts: RunOptions = {}): Promise
     const finish = (fn: () => void) => {
       if (settled) return;
       settled = true;
-      clearTimeout(timer); clearTimeout(killTimer);
+      clearTimeout(timer);
+      // Killed as a group: what is left of the group (a grandchild that ignored SIGTERM and let go of the pipes) gets
+      // its SIGKILL now, while the group id still names this call's processes.
+      if (killTimer && group && child.pid !== undefined) { try { process.kill(-child.pid, 'SIGKILL'); } catch { /* gone */ } }
+      clearTimeout(killTimer);
       opts.signal?.removeEventListener('abort', onAbort);
       fn();
     };

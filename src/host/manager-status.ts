@@ -22,7 +22,7 @@ export interface ManagerOverview {
   setUp: boolean;
   botId: string | null;
   paired: boolean;
-  /** The natural-language assistant: assistant.json and whether a Claude token is stored (no claude run). */
+  /** The natural-language assistant: assistant.json, whether a Claude token is stored, calls today and the last error (no claude run). */
   assistant: AssistantOverview;
   service: ServiceState;
   process: ProcessState;
@@ -56,8 +56,8 @@ export async function managerOverview(o: { host?: ServiceHost; now?: Date; alive
   const errors: string[] = [];
   const ref = await loadManagerCredentialRef().catch((e) => { errors.push(`manager credential reference: ${(e as Error).message.split('\n')[0]}`); return null; });
   const access = await loadManagerAccess().catch((e) => { errors.push(`access.json: ${(e as Error).message.split('\n')[0]}`); return null; });
-  const assistant = await assistantOverview().catch((e): AssistantOverview => ({
-    setUp: false, enabled: false, model: null, dailyLimit: null, credential: 'invalid', credentialKind: null, errors: [`assistant: ${String((e as Error).message ?? e).split('\n')[0]}`],
+  const assistant = await assistantOverview(now).catch((e): AssistantOverview => ({
+    setUp: false, enabled: false, model: null, dailyLimit: null, credential: 'invalid', credentialKind: null, callsToday: 0, lastError: null, errors: [`assistant: ${String((e as Error).message ?? e).split('\n')[0]}`],
   }));
   errors.push(...assistant.errors);
   const service = await serviceState(host);
@@ -106,7 +106,8 @@ export function formatManagerOverview(m: ManagerOverview, now: Date = new Date()
 export function managerOverviewJson(m: ManagerOverview) {
   return {
     setUp: m.setUp, botId: m.botId, paired: m.paired,
-    assistant: { setUp: m.assistant.setUp, enabled: m.assistant.enabled, model: m.assistant.model, dailyLimit: m.assistant.dailyLimit, credential: m.assistant.credential, credentialKind: m.assistant.credentialKind },
+    assistant: { setUp: m.assistant.setUp, enabled: m.assistant.enabled, model: m.assistant.model, dailyLimit: m.assistant.dailyLimit, credential: m.assistant.credential, credentialKind: m.assistant.credentialKind,
+      callsToday: m.assistant.callsToday, lastError: m.assistant.lastError },
     service: { kind: m.service.kind, installed: m.service.installed, active: m.service.active, detail: m.service.detail, path: m.service.path },
     running: m.process.running, pid: m.process.pid, since: m.process.since, transport: m.process.transport, lastPollAt: m.process.lastPollAt,
     pending: m.pending, ...(m.errors.length ? { errors: m.errors } : {}),

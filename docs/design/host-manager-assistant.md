@@ -147,8 +147,10 @@ The host builds the bundle for each call as JSON data. The system prompt says th
 instructions. The bundle holds:
 
 - **The settings catalog**, from `listSettings` (the source of `minions settings --list`) for the selected project.
-  For each key: label, description, type, choices or minimum, current value, source layer, how a change takes effect
-  (`takesEffect` and its one-line reason) and whether it is host-owned. This is what lets the model map "manual
+  Listed by group; for each key: description, type, choices or minimum, current value, source layer, how a change
+  takes effect (`takesEffect`, its meaning stated once for the catalog), whether it is host-owned and whether it may
+  loosen policy. To keep headroom under the input cap, no label is sent, and the usual source (`project config`) and
+  false flags are left out; `settingsLegend` says so once. This is what lets the model map "manual
   merges" to `delivery.merge manual`, and say "delivery.mode is already pull-request" before it proposes a no-op.
 - **The command catalog:** the help lines, including what only typed commands do (`/approve`, and `/rebuild_cli`
   when it exists), so the model can tell the owner what to type.

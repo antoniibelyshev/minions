@@ -612,7 +612,7 @@ async function assistantStep(o: { io: WizardIO | null; token?: string; runner?: 
   else if (cred) {
     action = cfg?.enabled
       ? await choose(o.io, `The manager assistant is ${state(cfg)}. Keep it, change the model or token, turn it off, or remove it?`, 'keep', ['keep', 'change', 'off', 'remove'] as const)
-      : await choose(o.io, 'The manager assistant is off (a Claude token is stored). Keep it off, turn it on, change the model or token, or remove it?', 'keep', ['keep', 'on', 'change', 'remove'] as const);
+      : await choose(o.io, 'The manager assistant is off (a Claude token is stored). Keep it off, turn it on, change the model or token (this also turns it on), or remove it?', 'keep', ['keep', 'on', 'change', 'remove'] as const);
   } else {
     action = await yesNo(o.io, 'Set up the natural-language assistant in the manager chat (plain-language requests; each message is one Claude call billed to the token you enter)?', false) ? 'setup' : 'skip';
   }
