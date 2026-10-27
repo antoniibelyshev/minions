@@ -66,6 +66,8 @@ const runtimeStatus = {
 };
 
 /** Every string leaf of a value. */
+/** The bundle's settings in catalog order (they are listed by group). */
+const flatSettings = (b: { settings: Record<string, import('../../src/host/manager-assistant-context.js').BundleSetting[]> }) => Object.values(b.settings).flat();
 const strings = (v: unknown): string[] => (typeof v === 'string' ? [v] : Array.isArray(v) ? v.flatMap(strings) : v && typeof v === 'object' ? Object.values(v).flatMap(strings) : []);
 
 describe('context bundle', () => {
@@ -79,16 +81,30 @@ describe('context bundle', () => {
       pending: [offer(), offer({ requestId: 'ow_0a1b2c3d', kind: 'restart', summary: 'restart the coordinator', loosens: null })],
       undo: [{ id: 'ow_deadbeef', summary: 'set delivery.merge: disabled -> manual', appliedAt: '2026-10-27T11:00:00.000Z' }],
     });
-    expect(Object.keys(bundle).sort()).toEqual(['changeWith', 'commands', 'note', 'outOfReach', 'pendingOffers', 'project', 'projects', 'proposalKinds', 'settings', 'status', 'takesEffectMeaning', 'typedOnly', 'undoIds', 'version']);
-    expect(bundle.settings.map((s) => s.key)).toEqual(settings.map((s) => s.key));
-    expect(bundle.settings.find((s) => s.key === 'delivery.merge')).toMatchObject({ type: 'enum', choices: expect.arrayContaining(['disabled', 'manual']), hostOwned: true });
-    // Trimmed (task-65.4): no per-setting "effect" sentence, and /set is named once at the top level.
-    expect(bundle.settings.every((s) => !('effect' in s))).toBe(true);
-    expect(bundle.settings.find((s) => s.key === 'delivery.merge')!.changeWith).toBeUndefined();
+    expect(Object.keys(bundle).sort()).toEqual(['changeWith', 'commands', 'note', 'outOfReach', 'pendingOffers', 'project', 'projects', 'proposalKinds', 'settings', 'settingsLegend', 'status', 'takesEffectMeaning', 'typedOnly', 'undoIds', 'version']);
+    const flat = flatSettings(bundle);
+    expect(flat.map((s) => s.key).sort()).toEqual(settings.map((s) => s.key).sort());
+    // Grouped by the listSettings group: every setting sits under its own group name.
+    for (const v of settings) expect(bundle.settings[v.group]!.map((s) => s.key)).toContain(v.key);
+    const find = (key: string) => flat.find((s) => s.key === key);
+    expect(find('delivery.merge')).toMatchObject({ type: 'enum', choices: expect.arrayContaining(['disabled', 'manual']), hostOwned: true });
+    // Trimmed (task-65.4): no per-setting "effect" sentence, group or label, and /set is named once at the top level.
+    expect(flat.every((s) => !('effect' in s) && !('group' in s) && !('label' in s))).toBe(true);
+    expect(find('delivery.merge')!.changeWith).toBeUndefined();
     expect(bundle.changeWith).toContain('/set <key> <value> [shared]');
     expect(Object.keys(bundle.takesEffectMeaning).sort()).toEqual(['now', 'restart', 'upgrade']);
-    expect(bundle.settings.find((s) => s.key === 'execution.maxActiveTasks')).toMatchObject({ value: '2', source: 'project config', takesEffect: 'now', min: 1 });
-    expect(bundle.settings.find((s) => s.key === 'secrets.telegram')).toMatchObject({ value: 'provisioned', takesEffect: null, changeWith: expect.stringContaining('minions auth telegram') });
+    // The common source and false flags are left out, and the legend says how to read their absence.
+    expect(find('execution.maxActiveTasks')).toMatchObject({ value: '2', takesEffect: 'now', min: 1 });
+    for (const v of settings) {
+      const s = find(v.key)!;
+      expect(s.source ?? X.SOURCE_WHEN_ABSENT).toBe(v.source);
+      expect(s.hostOwned === true).toBe(v.hostOwned);
+      expect(s.canLoosen === true).toBe(v.canLoosen);
+      expect(Object.values(s)).not.toContain(false);
+    }
+    expect(flat.some((s) => s.source === undefined) && flat.some((s) => s.source !== undefined)).toBe(true);
+    expect(bundle.settingsLegend).toContain(`"${X.SOURCE_WHEN_ABSENT}"`);
+    expect(find('secrets.telegram')).toMatchObject({ value: 'provisioned', takesEffect: null, changeWith: expect.stringContaining('minions auth telegram') });
     expect(bundle.commands).toEqual(helpText(false).split('\n'));
     expect(bundle.project).toBe('repo');
     expect(bundle.status).toEqual({ runtime: 'running', coordinator: 'restart-required', activeLeases: 2, paused: { intake: false, starts: true }, queuedRestart: null, pollProblem: false });
@@ -197,9 +213,15 @@ describe('stdin', () => {
       undo: Array.from({ length: 5 }, (_, i) => ({ id: `ow_0000000${i}`, summary: 'set a: b -> c', appliedAt: '2026-10-27T11:00:00.000Z' })),
     });
     const size = Buffer.byteLength(JSON.stringify(b));
-    expect(size).toBeLessThan(MA.ASSISTANT_INPUT_CAP - X.HISTORY_MAX_BYTES - 4 * X.OWNER_TEXT_MAX - 4096);
-    // Trimmed in task-65.4 (it was about 35 KB with the repeated per-setting "effect" text and /set line).
+    const limit = MA.ASSISTANT_INPUT_CAP - X.HISTORY_MAX_BYTES - 4 * X.OWNER_TEXT_MAX - 4096;
+    expect(size).toBeLessThan(limit);
+    // Trimmed in task-65.4 (it was about 35 KB with the repeated per-setting "effect" text and /set line, and about
+    // 30 KB with a group, label, source and both flags on every setting).
     expect(size).toBeLessThan(28 * 1024);
+    // Headroom: ten more settings of the catalog's average size still fit under the trimmed size.
+    const flat = flatSettings(b);
+    const perSetting = Buffer.byteLength(JSON.stringify(flat)) / flat.length;
+    expect(size + 10 * perSetting).toBeLessThan(28 * 1024);
     expect(() => X.formatAssistantInput({ bundle: b, history: [], message: 'switch to manual merges' })).not.toThrow();
   });
 });

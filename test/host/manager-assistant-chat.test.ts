@@ -162,7 +162,7 @@ describe('plain text goes to the assistant; slash commands never do', () => {
     expect(c.stdin.message).toBe('what can I change?');
     expect(c.stdin.history).toEqual([]);
     expect(c.stdin.context.project).toBe('repo');
-    expect(c.stdin.context.settings.length).toBeGreaterThan(10);
+    expect(Object.values(c.stdin.context.settings).flat().length).toBeGreaterThan(10);
     expect(c.args.join('\n')).not.toContain('what can I change');
     expect(c.args.join('\n')).not.toContain(CLAUDE_TOKEN);
     expect(c.opts?.killGroup).toBe(true);

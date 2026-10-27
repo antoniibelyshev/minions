@@ -137,10 +137,13 @@ export function undoCandidates(entries: JournalEntry[], projectId: string, limit
 
 // ---------------------------------------------------------------- the bundle
 
+/**
+ * One setting in the bundle. Trimmed in task-65.4 so a real catalog keeps headroom under the input cap: the group is
+ * the name the setting is listed under in ContextBundle.settings, there is no label (the key and the description say
+ * what it is), and the common values are left out (explained once in SETTINGS_LEGEND).
+ */
 export interface BundleSetting {
   key: string;
-  group: string;
-  label: string;
   description: string;
   type: string;
   choices?: string[];
@@ -149,11 +152,14 @@ export interface BundleSetting {
   optional?: true;
   /** The current effective value as text ("default" when unset, "unknown" when not readable). */
   value: string;
-  source: string;
+  /** Left out when it is SOURCE_WHEN_ABSENT. */
+  source?: string;
   /** now / restart / upgrade (explained once in ContextBundle.takesEffectMeaning), or null (a secret or a runtime control). */
   takesEffect: string | null;
-  hostOwned: boolean;
-  canLoosen: boolean;
+  /** Present (true) only when the setting is host-owned. */
+  hostOwned?: true;
+  /** Present (true) only when a change may loosen policy (the host then asks twice). */
+  canLoosen?: true;
   /** Only where it is not `/set <key> <value> [shared]` (ContextBundle.changeWith): a host terminal command. */
   changeWith?: string;
 }
@@ -167,6 +173,10 @@ export const TAKES_EFFECT_MEANING = {
   restart: 'needs a coordinator restart afterwards (/restart, its own plan to confirm)',
   upgrade: 'needs `minions upgrade` afterwards (/upgrade: the container is recreated, volumes kept)',
 } as const;
+/** The source layer most settings have; a bundle setting without `source` has this one. */
+export const SOURCE_WHEN_ABSENT = 'project config';
+/** How to read ContextBundle.settings, once for the whole catalog. */
+export const SETTINGS_LEGEND = `settings are listed under their group name; a setting without "source" has source "${SOURCE_WHEN_ABSENT}"; "hostOwned" and "canLoosen" appear only when true`;
 export const CHANGE_WITH_SET = '/set <key> <value> [shared] (local layer unless "shared"), unless the setting names another changeWith';
 
 export interface BundlePendingOffer { requestId: string; kind: string; from: 'owner' | 'container'; summary: string; expiresAt: string | null; loosens: boolean }
@@ -180,7 +190,9 @@ export interface ContextBundle {
   status: AssistantStatus | null;
   takesEffectMeaning: typeof TAKES_EFFECT_MEANING;
   changeWith: string;
-  settings: BundleSetting[];
+  settingsLegend: typeof SETTINGS_LEGEND;
+  /** The catalog by group name (groups in order of first appearance, listSettings order inside each). */
+  settings: Record<string, BundleSetting[]>;
   commands: string[];
   proposalKinds: string[];
   typedOnly: string[];
@@ -210,11 +222,19 @@ function bundleSetting(v: SettingView): BundleSetting {
     : v.type === 'control' ? `\`minions settings set ${v.key} paused|running\` on the host (a runtime control, not a chat proposal)`
     : null;
   return {
-    key: v.key, group: v.group, label: oneLine(v.label, 120), description: oneLine(v.description, 600), type: v.type,
+    key: v.key, description: oneLine(v.description, 600), type: v.type,
     ...(v.choices ? { choices: [...v.choices] } : {}), ...(typeof min === 'number' ? { min } : {}), ...(v.optional ? { optional: true as const } : {}),
-    value: oneLine(formatValue(v.value), 300), source: v.source, takesEffect: v.type === 'secret' || v.type === 'control' ? null : takesEffectOf(v.class),
-    hostOwned: v.hostOwned, canLoosen: v.canLoosen, ...(changeWith ? { changeWith } : {}),
+    value: oneLine(formatValue(v.value), 300), ...(v.source === SOURCE_WHEN_ABSENT ? {} : { source: v.source }),
+    takesEffect: v.type === 'secret' || v.type === 'control' ? null : takesEffectOf(v.class),
+    ...(v.hostOwned ? { hostOwned: true as const } : {}), ...(v.canLoosen ? { canLoosen: true as const } : {}), ...(changeWith ? { changeWith } : {}),
   };
+}
+
+/** The catalog by group name (groups in order of first appearance, settings in listSettings order inside each). */
+function groupedSettings(views: SettingView[]): Record<string, BundleSetting[]> {
+  const out: Record<string, BundleSetting[]> = {};
+  for (const v of views) (out[oneLine(v.group, 60)] ??= []).push(bundleSetting(v));
+  return out;
 }
 
 const ISO = /^\d{4}-\d{2}-\d{2}T[\d:.]+Z$/;
@@ -231,7 +251,8 @@ export function buildContextBundle(i: BundleInput): ContextBundle {
     status: i.status ? { ...i.status, ...(i.status.paused ? { paused: { intake: i.status.paused.intake === true, starts: i.status.paused.starts === true } } : {}) } : null,
     takesEffectMeaning: TAKES_EFFECT_MEANING,
     changeWith: CHANGE_WITH_SET,
-    settings: i.settings.map(bundleSetting),
+    settingsLegend: SETTINGS_LEGEND,
+    settings: groupedSettings(i.settings),
     commands: i.help.map((l) => oneLine(l, 400)).filter(Boolean),
     proposalKinds: [...PROPOSAL_KINDS],
     typedOnly: [...TYPED_ONLY],
