@@ -7,6 +7,9 @@ Everything marked **verified** was observed on Claude Code 2.1.292 in a Linux co
 2026-10-19 or read from the sources below. Everything marked **unknown** is listed in
 [Unknowns and fallbacks](#unknowns-and-fallbacks) and is not assumed.
 
+Planned replacement: [telegram-channel.md](telegram-channel.md) (task-67, proposed) designs a minions-owned channel
+server (reply metadata, tap-button decisions, edits, files, typing) with this official plugin kept as the fallback.
+
 ## Sources consulted (2026-10-19)
 
 Official documentation:
