@@ -63,21 +63,32 @@ export const ASSISTANT_DENIED_COMMANDS = [
 ] as const;
 
 
-/** Read/Edit deny rules for host-side minions data and common secret stores. */
-export function assistantDeniedPaths(projectId: string): string[] {
-  const pp = projectPaths(projectId);
+/**
+ * Read/Edit deny rules for host-side minions data and common secret stores. Without a project id (the host manager's
+ * assistant, which is host-wide) only the host-wide rules: the credential store, every project's secret copies and
+ * credential references, the host secret dirs, .env files, and the host files (defaults, registry, manager state).
+ */
+export function assistantDeniedPaths(projectId?: string): string[] {
+  const pp = projectId === undefined ? null : projectPaths(projectId);
   const projects = join(hostRoot(), 'projects');
-  const read = [credentialStoreDir() + '/**', pp.secretsDir + '/**', pp.credentialsJson,
+  const read = [credentialStoreDir() + '/**', ...(pp ? [pp.secretsDir + '/**', pp.credentialsJson] : []),
     // Every other project's secret copies and credential references too.
     join(projects, '*', 'secrets') + '/**', join(projects, '*', 'credentials.json')].map((p) => `Read(${abs(p)})`)
     .concat(HOST_SECRET_DIRS.flatMap((d) => [`Read(~/${d})`, `Read(~/${d}/**)`]), ['Read(**/.env)', 'Read(**/.env.*)']);
-  const edit = [defaultsPath(), registryPath(), credentialStoreDir() + '/**', pp.projectJson, pp.credentialsJson, pp.secretsDir + '/**',
-    pp.manifestJson, pp.journalJson, pp.composeYaml, pp.pluginDir + '/**', pp.runtimeDir + '/**', pp.hostDir + '/**', assistantPluginDir(projectId) + '/**',
+  const edit = [defaultsPath(), registryPath(), credentialStoreDir() + '/**',
+    ...(pp ? [pp.projectJson, pp.credentialsJson, pp.secretsDir + '/**', pp.manifestJson, pp.journalJson, pp.composeYaml,
+      pp.pluginDir + '/**', pp.runtimeDir + '/**', pp.hostDir + '/**', assistantPluginDir(projectId!) + '/**'] : []),
     // Host manager state: the owner pairing (re-pairing is a terminal action only), the token reference and the journal.
     managerDir() + '/**']
     .map((p) => `Edit(${abs(p)})`);
   return [...read, ...edit];
 }
+
+/**
+ * The --settings value of every assistant session: bypass mode disabled, so no prompt or setting can switch it on.
+ * Shared by the setup assistant and the host manager's assistant (manager-assistant.ts).
+ */
+export const ASSISTANT_SETTINGS = { permissions: { disableBypassPermissionsMode: 'disable' } } as const;
 
 export const assistantPluginDir = (projectId: string) => projectPaths(projectId).assistantPluginDir;
 
@@ -130,7 +141,7 @@ export function assistantArgs(o: { repoRoot: string; pluginDir: string; systemPr
     '--disallowedTools', ...ASSISTANT_DENIED_COMMANDS, ...o.deniedPaths,
     '--plugin-dir', o.pluginDir,
     '--append-system-prompt', o.systemPrompt,
-    '--settings', JSON.stringify({ permissions: { disableBypassPermissionsMode: 'disable' } }),
+    '--settings', JSON.stringify(ASSISTANT_SETTINGS),
     '--name', 'minions setup',
     '--permission-mode', ASSISTANT_PERMISSION_MODE,
     o.prompt ?? ASSISTANT_PROMPT,

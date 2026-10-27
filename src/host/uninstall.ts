@@ -14,7 +14,7 @@ import { readJsonIfExists } from '../core/fsutil.js';
 import { ProjectJsonSchema } from './project.js';
 import { HostRuntime, runtimeOf } from './runtime.js';
 import { managerPaths } from '../core/paths.js';
-import { loadManagerCredentialRef } from './credentials.js';
+import { loadManagerClaudeCredentialRef, loadManagerCredentialRef } from './credentials.js';
 import { loadServiceRecord, removeManagerService, serviceHost, type ServiceHost } from './manager-service.js';
 
 export interface UninstallOptions {
@@ -158,6 +158,9 @@ async function uninstallManagerService(opts: UninstallOptions, remaining: number
   }
   if (await loadManagerCredentialRef().catch(() => null)) {
     kept.push({ path: mp.credentialJson, reason: 'host manager bot token kept; run `minions setup` (manager step: remove) to delete it' });
+  }
+  if (await loadManagerClaudeCredentialRef().catch(() => null)) {
+    kept.push({ path: mp.claudeCredentialJson, reason: 'host manager assistant Claude token kept; run `minions setup` (assistant step: remove) to delete it' });
   }
   return out;
 }
