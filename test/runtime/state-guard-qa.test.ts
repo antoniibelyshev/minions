@@ -2,7 +2,8 @@
 // wrappers, redirected state dirs), plus known gaps pinned with it.fails so a fix shows up as a failing test
 // (then turn the it.fails into a plain it; all former gaps are fixed now). Nothing here touches the live /state.
 import { describe, expect, it } from 'vitest';
-import { preBashHook, preFileHook } from '../../src/runtime/hooks.js';
+import { COORDINATOR_ONLY_WORK_VERBS, preBashHook, preFileHook } from '../../src/runtime/hooks.js';
+import { buildProgram } from '../../src/program.js';
 import { stateGuard } from '../../src/runtime/state-guard.js';
 
 const container = stateGuard({ state: '/state', tmp: '/home/node/.cache/tmp' });
@@ -162,5 +163,32 @@ describe('state guard QA: submit-heredoc allowlist, more one-call variants (atte
     expect(denied(out)).toBe(true);
     expect(JSON.parse(out.stdout!).hookSpecificOutput.permissionDecisionReason).toContain('--json < <file>');
     expect(denied(preBashHook(bash(`cd ${cwd} && ${head} < /home/node/.cache/tmp/leases/l/result.json`), container))).toBe(false);
+  });
+});
+
+// Merge regression (main f7a29ca added the coordinator-only `work advance`): the worker allowlist must cover every
+// `work` subcommand the program has, so a new one is refused to workers by default.
+describe("state guard QA: every work subcommand but brief and submit is the coordinator's", () => {
+  const work = buildProgram().commands.find((c) => c.name() === 'work')!;
+  const subs = work.commands.flatMap((c) => [c.name(), ...c.aliases()]);
+
+  it('the program has work advance and every coordinator-only verb', () => {
+    expect(COORDINATOR_ONLY_WORK_VERBS).toContain('advance');
+    for (const v of COORDINATOR_ONLY_WORK_VERBS) expect(subs).toContain(v);
+  });
+
+  it('a subagent is refused each of them (bare, by full path with a leading option, after cd); the coordinator is not', () => {
+    for (const s of subs.filter((n) => n !== 'brief' && n !== 'submit')) {
+      for (const cmd of [`minions work ${s} lease-1`, `/usr/local/bin/minions --json work ${s} lease-1`, `cd ${cwd} && minions work ${s}`]) {
+        expect(denied(preBashHook(bash(cmd), container)), cmd).toBe(true);
+        expect(denied(preBashHook({ tool_name: 'Bash', tool_input: { command: cmd }, cwd }, container)), `coordinator: ${cmd}`).toBe(false);
+      }
+    }
+  });
+
+  it('brief and submit stay allowed to a subagent', () => {
+    for (const cmd of ['minions work brief lease-1 --role tester --json', `cd ${cwd} && minions work submit lease-1 --role tester --json < /home/node/.cache/tmp/leases/l/r.json`]) {
+      expect(denied(preBashHook(bash(cmd), container)), cmd).toBe(false);
+    }
   });
 });
