@@ -691,7 +691,7 @@ describe('doctor manager.* checks', () => {
   it('runDoctor (doctor and status --check) includes the manager checks and they never change healthy', async () => {
     const opts = { cwd: env.root, probe: dockerUp, runner: recorder().runner, platform: 'darwin' as const };
     const before = await runDoctor(opts);
-    expect(before.checks.filter((x) => x.name.startsWith('manager.')).map((x) => x.name)).toEqual(['manager.token', 'manager.bot', 'manager.pairing', 'manager.service', 'manager.process']);
+    expect(before.checks.filter((x) => x.name.startsWith('manager.')).map((x) => x.name)).toEqual(['manager.token', 'manager.bot', 'manager.pairing', 'manager.assistant', 'manager.service', 'manager.process']);
     await M.provisionManagerToken({ token: MGR });
     writeFileSync(managerPaths().accessJson, 'garbage');
     const after = await runDoctor(opts);

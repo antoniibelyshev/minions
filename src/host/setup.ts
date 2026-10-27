@@ -31,7 +31,13 @@ import { ciSetupPlan, fetchApi, requiredChecksStatus, type RequiredChecksReport 
 import {
   backendLabel, githubRepoFromRemote, provisionCodexKey, githubTokenGuidance, loadCredentialRefs, provisionGithubToken, provisionTelegramToken, readGithubToken,
   removeGithubToken, telegramBotGuidance, loadManagerCredentialRef, readManagerToken, removeManagerToken, type CredentialsJson, type Fetch,
+  loadManagerClaudeCredentialRef, removeManagerClaudeToken, storeManagerClaudeToken,
 } from './credentials.js';
+import {
+  ASSISTANT_MODELS, DEFAULT_ASSISTANT_MODEL, defaultAssistantConfig, loadAssistantConfig, managerAssistantGuidance, removeAssistantConfig, saveAssistantConfig,
+  type AssistantConfig, type AssistantModel,
+} from './manager-assistant.js';
+import { resolveOnPath } from './auth.js';
 import { checkTelegramTokenFormat } from '../telegram/token.js';
 import { clearManagerAccess, loadManagerAccess, managerBotGuidance, pairManagerBot, provisionManagerToken, type PairingOptions } from './manager-bot.js';
 import { installManagerService, loadServiceRecord, removeManagerService, serviceHost, serviceKind, type ServiceHost } from './manager-service.js';
@@ -88,7 +94,7 @@ export interface SetupOptions {
   /** --delivery: explicit delivery mode (non-interactive). */
   delivery?: DeliveryMode;
   /** Tokens read from stdin by the CLI (never from argv). */
-  tokens?: { github?: string; telegram?: string; manager?: string };
+  tokens?: { github?: string; telegram?: string; manager?: string; managerClaude?: string };
   /** Manager bot pairing clock, code and TTL (tests); fetch is `fetch` above. */
   managerPairing?: Pick<PairingOptions, 'now' | 'sleep' | 'ttlMs' | 'pollSeconds' | 'code'>;
   /** The manager service host (tests: platform, home, runner for launchctl / systemctl, program). */
@@ -104,7 +110,7 @@ export interface SetupOptions {
   platform?: NodeJS.Platform;
 }
 
-export type StepId = 'init' | 'github' | 'delivery' | 'ci' | 'intake' | 'autoMerge' | 'telegram' | 'harness' | 'manager' | 'service' | 'container' | 'import' | 'coordinator';
+export type StepId = 'init' | 'github' | 'delivery' | 'ci' | 'intake' | 'autoMerge' | 'telegram' | 'harness' | 'manager' | 'assistant' | 'service' | 'container' | 'import' | 'coordinator';
 export type StepStatus = 'done' | 'kept' | 'changed' | 'skipped' | 'failed' | 'deferred' | 'planned';
 export interface SetupStep { id: StepId; status: StepStatus; detail: string; later?: string; lines?: string[] }
 
@@ -198,13 +204,13 @@ export async function runSetup(opts: SetupOptions): Promise<SetupResult> {
   }
   // A piped token that is empty is an error, not "no integration": fail before anything is written.
   // The message never includes the input.
-  const pipedNames = (['github', 'telegram', 'manager'] as const).filter((n) => opts.tokens?.[n] !== undefined);
-  for (const [name, label] of [['github', 'GitHub'], ['telegram', 'Telegram'], ['manager', 'manager bot']] as const) {
+  const pipedNames = (['github', 'telegram', 'manager', 'managerClaude'] as const).filter((n) => opts.tokens?.[n] !== undefined);
+  for (const [name, flag, label] of [['github', 'github', 'GitHub'], ['telegram', 'telegram', 'Telegram'], ['manager', 'manager', 'manager bot'], ['managerClaude', 'manager-claude', 'manager Claude']] as const) {
     const t = opts.tokens?.[name];
     if (t !== undefined && t.trim() === '') {
-      const line = ['first', 'second', 'third'][pipedNames.indexOf(name)];
-      throw new MinionsError('PRECONDITION', `--${name}-token-stdin: no ${label} token was read from stdin (empty input); nothing was changed.`,
-        `Pipe the token as the ${line} line of stdin, or omit --${name}-token-stdin.`);
+      const line = ['first', 'second', 'third', 'fourth'][pipedNames.indexOf(name)];
+      throw new MinionsError('PRECONDITION', `--${flag}-token-stdin: no ${label} token was read from stdin (empty input); nothing was changed.`,
+        `Pipe the token as the ${line} line of stdin, or omit --${flag}-token-stdin.`);
     }
   }
   const io = opts.io;
@@ -426,6 +432,8 @@ export async function runSetup(opts: SetupOptions): Promise<SetupResult> {
   if (interactive) say('\n== Host manager bot ==');
   const mgr = await managerStep({ io: interactive ? io! : null, token: opts.tokens?.manager, runner: opts.runner, fetch: opts.fetch, pairing: opts.managerPairing, setupCmd: cmds.setup });
   step(mgr);
+  const ast = await assistantStep({ io: interactive ? io! : null, token: opts.tokens?.managerClaude, runner: opts.runner, setupCmd: cmds.setup });
+  if (ast) step(ast);
   const svc = await serviceStep({ io: interactive ? io! : null, manager: mgr, host: opts.managerService, platform: opts.platform, setupCmd: cmds.setup });
   if (svc) step(svc);
 
@@ -574,6 +582,87 @@ async function managerStep(o: { io: WizardIO | null; token?: string; runner?: Ru
     if (action === 'pair') return { id: 'manager', status: 'failed', detail: `${errMsg(e, 'pairing failed')}; the previous pairing is unchanged`, later };
     return { id: 'manager', status: done, detail: `${stored}; not paired`, lines: [...lines, `warning: pairing failed: ${errMsg(e, 'unexpected error')}`, `not paired: ${later}`] };
   }
+}
+
+/**
+ * The manager's natural-language assistant (optional, host-wide, rerunnable; docs/design/host-manager-assistant.md).
+ * Offered only with a manager bot (or when already set up). Token: hidden prompt or --manager-claude-token-stdin, format
+ * check, stored like the manager bot token. Only an interactive "yes" (or "on") switches it on: --yes and a piped token
+ * never do (a piped token is stored and the on/off state stays as it was). Null when there is nothing to report (no
+ * manager bot, no assistant state, no piped token).
+ */
+async function assistantStep(o: { io: WizardIO | null; token?: string; runner?: Runner; setupCmd: string }): Promise<SetupStep | null> {
+  const later = `Run ${o.setupCmd} again in a terminal to set up or switch on the manager assistant.`;
+  let cfg: AssistantConfig | null;
+  let cred: Awaited<ReturnType<typeof loadManagerClaudeCredentialRef>>;
+  try {
+    cfg = await loadAssistantConfig();
+    cred = await loadManagerClaudeCredentialRef();
+  } catch (e) {
+    return { id: 'assistant', status: 'failed', detail: `${errMsg(e, 'the assistant settings are unreadable')}${o.token !== undefined ? '; the piped Claude token was not stored' : ''}`, later };
+  }
+  const bot = !!(await loadManagerCredentialRef().catch(() => null));
+  if (!bot && !cfg && !cred && o.token === undefined) return null;
+  const state = (c: AssistantConfig | null) => (c?.enabled ? `on (${c.model}, limit ${c.dailyLimit} calls/day)` : 'off');
+  const kindLabel = (k: 'oauth-token' | 'api-key') => (k === 'oauth-token' ? 'Claude OAuth token' : 'Anthropic API key');
+  type Action = 'keep' | 'on' | 'off' | 'change' | 'remove' | 'setup' | 'token' | 'skip';
+  let action: Action;
+  if (o.token !== undefined) action = 'token';
+  else if (!o.io) action = cfg || cred ? 'keep' : 'skip';
+  else if (cred) {
+    action = cfg?.enabled
+      ? await choose(o.io, `The manager assistant is ${state(cfg)}. Keep it, change the model or token, turn it off, or remove it?`, 'keep', ['keep', 'change', 'off', 'remove'] as const)
+      : await choose(o.io, 'The manager assistant is off (a Claude token is stored). Keep it off, turn it on, change the model or token (this also turns it on), or remove it?', 'keep', ['keep', 'on', 'change', 'remove'] as const);
+  } else {
+    action = await yesNo(o.io, 'Set up the natural-language assistant in the manager chat (plain-language requests; each message is one Claude call billed to the token you enter)?', false) ? 'setup' : 'skip';
+  }
+
+  if (action === 'skip') return { id: 'assistant', status: 'skipped', detail: `manager assistant not set up (optional${o.io ? '' : '; only an interactive setup switches it on'})`, later };
+  if (action === 'keep') return { id: 'assistant', status: 'kept', detail: `manager assistant ${state(cfg)}; ${cred ? 'Claude token stored' : 'no Claude token stored'}` };
+  if (action === 'remove') {
+    const r = await removeManagerClaudeToken(o.runner);
+    await removeAssistantConfig();
+    return { id: 'assistant', status: 'changed', detail: `manager assistant removed (Claude token deleted${r.backend ? ` from ${r.backend}` : ''})` };
+  }
+  if (action === 'on' || action === 'off') {
+    const next: AssistantConfig = { ...(cfg ?? defaultAssistantConfig()), enabled: action === 'on' };
+    await saveAssistantConfig(next);
+    return { id: 'assistant', status: 'changed', detail: `manager assistant ${state(next)}` };
+  }
+  if (action === 'token') {
+    let stored: string;
+    try {
+      const ref = await storeManagerClaudeToken(o.token!, { runner: o.runner });
+      stored = `${kindLabel(ref.kind)} stored in ${backendLabel(ref.backend)}`;
+    } catch (e) {
+      return { id: 'assistant', status: 'failed', detail: `${errMsg(e, 'could not store the Claude token')}; nothing was stored`, later };
+    }
+    const now = cfg ?? defaultAssistantConfig();
+    if (!cfg) await saveAssistantConfig(now);
+    return { id: 'assistant', status: cred ? 'changed' : 'done', detail: `${stored}; manager assistant ${state(now)}`,
+      ...(now.enabled ? {} : { lines: ['not switched on: a piped token never switches the assistant on', `later: ${later}`] }) };
+  }
+
+  // setup / change: interactive only.
+  const io = o.io!;
+  for (const l of managerAssistantGuidance()) io.info(`  ${l}`);
+  const model = await choose<AssistantModel>(io, 'Assistant model (sonnet: balanced; haiku: cheaper; opus: strongest)', cfg?.model ?? DEFAULT_ASSISTANT_MODEL, ASSISTANT_MODELS);
+  let stored = '';
+  try {
+    const keep = action === 'change' && !!cred;
+    const raw = io.secret ? await io.secret(`Claude token (claude setup-token or an Anthropic API key; input hidden${keep ? '; empty keeps the stored token' : ''}): `)
+      : (() => { throw new MinionsError('PRECONDITION', 'no terminal for a non-echoing prompt; pipe it with --manager-claude-token-stdin'); })();
+    if (raw.trim() || !keep) {
+      const ref = await storeManagerClaudeToken(raw, { runner: o.runner });
+      stored = `${kindLabel(ref.kind)} stored in ${backendLabel(ref.backend)}; `;
+    }
+  } catch (e) {
+    return { id: 'assistant', status: 'failed', detail: `${errMsg(e, 'could not store the Claude token')}; nothing was stored`, later };
+  }
+  const next: AssistantConfig = { ...(cfg ?? defaultAssistantConfig()), model, enabled: true };
+  await saveAssistantConfig(next);
+  const lines = (await resolveOnPath('claude')) ? [] : ['warning: Claude Code (`claude`) is not on PATH: the manager answers with the command list until it is installed'];
+  return { id: 'assistant', status: action === 'setup' ? 'done' : 'changed', detail: `${stored}manager assistant ${state(next)}`, ...(lines.length ? { lines } : {}) };
 }
 
 /**
@@ -807,6 +896,7 @@ function dryRunResult(opts: SetupOptions, init: InitResult, steps: SetupStep[], 
   would('telegram', refs.telegram ? `bot ${refs.telegram.botId} stored: would offer keep/change/disable` : 'would ask "Set up Telegram?" (default no); bot token entered without echo');
   would('harness', 'would ask "Which agent should do the work?" (default Claude Code; OpenAI Codex: OpenAI API key without echo, model, and in this version the read-only codex-reviewer stage after the Claude reviewer)');
   would('manager', 'would ask "Set up the host manager bot?" (default no; host-wide): its own bot token entered without echo, then a one-time pairing code sent to the bot within 10 minutes');
+  would('assistant', `with a manager bot: would ask "Set up the natural-language assistant?" (default no; --yes never switches it on): model (${ASSISTANT_MODELS.join('/')}) and a Claude token (claude setup-token or an Anthropic API key) entered without echo`);
   would('service', 'with a manager bot token: would ask to install the host manager as a launchd agent (macOS) or systemd --user unit (Linux), default no; an installed one is kept up to date');
   would('container', 'would build the image if needed and start the container (idempotent)');
   would('import', 'would import committed history of the base branch unless already imported, and configure origin');

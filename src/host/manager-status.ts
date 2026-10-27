@@ -8,6 +8,7 @@ import { readJournal, type JournalEntry } from './change-journal.js';
 import type { ChangePlan } from './change-requests.js';
 import { loadManagerCredentialRef } from './credentials.js';
 import { loadManagerAccess } from './manager-bot.js';
+import { assistantOverview, formatAssistantLine, type AssistantOverview } from './manager-assistant.js';
 import { managerProcessState, serviceHost, serviceKind, serviceState, type ProcessState, type ServiceHost, type ServiceState } from './manager-service.js';
 import { planSummary } from './manager.js';
 import { loadRegistry } from './registry.js';
@@ -21,6 +22,8 @@ export interface ManagerOverview {
   setUp: boolean;
   botId: string | null;
   paired: boolean;
+  /** The natural-language assistant: assistant.json, whether a Claude token is stored, calls today and the last error (no claude run). */
+  assistant: AssistantOverview;
   service: ServiceState;
   process: ProcessState;
   /** Requests whose newest journal entry is an offer (waiting for Confirm / Reject), per project. */
@@ -53,6 +56,10 @@ export async function managerOverview(o: { host?: ServiceHost; now?: Date; alive
   const errors: string[] = [];
   const ref = await loadManagerCredentialRef().catch((e) => { errors.push(`manager credential reference: ${(e as Error).message.split('\n')[0]}`); return null; });
   const access = await loadManagerAccess().catch((e) => { errors.push(`access.json: ${(e as Error).message.split('\n')[0]}`); return null; });
+  const assistant = await assistantOverview(now).catch((e): AssistantOverview => ({
+    setUp: false, enabled: false, model: null, dailyLimit: null, credential: 'invalid', credentialKind: null, callsToday: 0, lastError: null, errors: [`assistant: ${String((e as Error).message ?? e).split('\n')[0]}`],
+  }));
+  errors.push(...assistant.errors);
   const service = await serviceState(host);
   const proc = await managerProcessState({ ...(o.alive ? { alive: o.alive } : {}), ...(o.startOf ? { startOf: o.startOf } : {}) });
   const pending: ManagerOverview['pending'] = [];
@@ -64,7 +71,7 @@ export async function managerOverview(o: { host?: ServiceHost; now?: Date; alive
       pending.push({ projectId, name: repo ? basename(repo) : null, requests });
     }
   } catch (e) { errors.push(`journal: ${(e as Error).message.split('\n')[0]}`); }
-  return { setUp: !!ref, botId: ref?.botId ?? null, paired: !!ref && access?.botId === ref.botId, service, process: proc, pending, errors };
+  return { setUp: !!ref, botId: ref?.botId ?? null, paired: !!ref && access?.botId === ref.botId, assistant, service, process: proc, pending, errors };
 }
 
 const ago = (iso: string, now: Date) => {
@@ -80,6 +87,7 @@ export function formatManagerOverview(m: ManagerOverview, now: Date = new Date()
     : m.service.path ? `not installed (${m.service.detail})` : 'not installed';
   out.push(`  service: ${svc}`);
   out.push(`  bot: ${m.setUp ? `${m.botId}, ${m.paired ? 'paired' : 'not paired'}` : 'not set up (optional: `minions setup`)'}`);
+  if (m.setUp || m.assistant.setUp) out.push(`  ${formatAssistantLine(m.assistant)}`);
   if (m.process.running) {
     const poll = m.process.lastPollAt ? `last poll ${ago(m.process.lastPollAt, now)}` : 'no poll yet';
     out.push(`  process: running (pid ${m.process.pid}${m.process.since ? `, since ${m.process.since}` : ''}${m.process.transport ? `, ${m.process.transport === 'telegram' ? 'Telegram' : 'log only'}` : ''}), ${poll}`);
@@ -98,6 +106,8 @@ export function formatManagerOverview(m: ManagerOverview, now: Date = new Date()
 export function managerOverviewJson(m: ManagerOverview) {
   return {
     setUp: m.setUp, botId: m.botId, paired: m.paired,
+    assistant: { setUp: m.assistant.setUp, enabled: m.assistant.enabled, model: m.assistant.model, dailyLimit: m.assistant.dailyLimit, credential: m.assistant.credential, credentialKind: m.assistant.credentialKind,
+      callsToday: m.assistant.callsToday, lastError: m.assistant.lastError },
     service: { kind: m.service.kind, installed: m.service.installed, active: m.service.active, detail: m.service.detail, path: m.service.path },
     running: m.process.running, pid: m.process.pid, since: m.process.since, transport: m.process.transport, lastPollAt: m.process.lastPollAt,
     pending: m.pending, ...(m.errors.length ? { errors: m.errors } : {}),

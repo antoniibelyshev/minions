@@ -100,6 +100,33 @@ export function codexKeyGuidance(): string[] {
   ];
 }
 
+// ---------------------------------------------------------------- Claude token (host manager assistant)
+
+export const ANTHROPIC_API_KEYS_URL = 'https://console.anthropic.com/settings/keys';
+/** `claude setup-token` OAuth tokens (sk-ant-oat01-…) and Anthropic API keys (sk-ant-api03-…). */
+const CLAUDE_TOKEN = /^sk-ant-(oat|api)\d{2}-[A-Za-z0-9_-]{20,500}$/;
+export type ClaudeTokenKind = 'oauth-token' | 'api-key';
+
+/**
+ * Validates a Claude credential's shape (no whitespace or quotes, so it is safe on a `security -i` line) and tells a
+ * long-lived OAuth token (`claude setup-token`, passed as CLAUDE_CODE_OAUTH_TOKEN) from an Anthropic API key (passed
+ * as ANTHROPIC_API_KEY). The message never includes the input.
+ */
+export function checkClaudeTokenFormat(raw: string): { token: string; kind: ClaudeTokenKind } {
+  const token = raw.trim();
+  if (!token) throw new MinionsError('INVALID_CONFIG', 'No token entered.', 'Paste the token at the prompt.');
+  const m = CLAUDE_TOKEN.exec(token);
+  if (!m) {
+    throw new MinionsError('INVALID_CONFIG', 'That does not look like a Claude token (expected sk-ant-oat01-… from `claude setup-token`, or an Anthropic API key sk-ant-api03-…).',
+      `Run \`claude setup-token\` (Claude subscription) or create an API key at ${ANTHROPIC_API_KEYS_URL}.`);
+  }
+  return { token, kind: m[1] === 'oat' ? 'oauth-token' : 'api-key' };
+}
+
+/** The environment variable a stored Claude credential reaches the assistant's claude process through (never argv). */
+export const claudeTokenEnvName = (kind: ClaudeTokenKind): 'CLAUDE_CODE_OAUTH_TOKEN' | 'ANTHROPIC_API_KEY' =>
+  (kind === 'oauth-token' ? 'CLAUDE_CODE_OAUTH_TOKEN' : 'ANTHROPIC_API_KEY');
+
 // ---------------------------------------------------------------- Telegram bot token
 
 /** Bot creation, pairing and allowlisting steps (docs/design/telegram.md, "Wizard flow"). Contains no secret. */
@@ -191,6 +218,19 @@ export const MANAGER_ACCOUNT = 'manager';
 export const MANAGER_CREDENTIAL: StoreKind & { readonly name: 'manager-bot-token'; readonly account: typeof MANAGER_ACCOUNT } = {
   name: 'manager-bot-token', label: 'manager bot token', keychainService: 'minions.manager', keychainLabel: 'minions-manager-bot-token',
   fileName: 'manager-bot-token', check: (raw) => checkTelegramTokenFormat(raw).token, command: 'minions setup', account: MANAGER_ACCOUNT,
+};
+
+/**
+ * The host manager assistant's Claude credential (docs/design/host-manager-assistant.md, "Authentication"): a
+ * `claude setup-token` OAuth token or an Anthropic API key. Same rules as MANAGER_CREDENTIAL: host-wide, fixed account
+ * `manager`, Keychain service `minions.manager-claude` / Secret Service `service=minions.manager-claude account=manager`
+ * / `<MINIONS_HOME>/credentials/manager/manager-claude-token` (0600). Not a CredentialKind and not in CREDENTIAL_KINDS:
+ * never materialized into a project's secrets directory, never in a project's credentials.json; only the manager
+ * process reads it, per call, and passes it to its claude child in the environment.
+ */
+export const MANAGER_CLAUDE_CREDENTIAL: StoreKind & { readonly name: 'manager-claude-token'; readonly account: typeof MANAGER_ACCOUNT } = {
+  name: 'manager-claude-token', label: 'manager Claude token', keychainService: 'minions.manager-claude', keychainLabel: 'minions-manager-claude-token',
+  fileName: 'manager-claude-token', check: (raw) => checkClaudeTokenFormat(raw).token, command: 'minions setup', account: MANAGER_ACCOUNT,
 };
 
 // ---------------------------------------------------------------- storage backends
@@ -379,8 +419,8 @@ export async function selectStore(opts: StoreOptions = {}): Promise<SecretStore>
 export const storeFor = (backend: Backend, runner: Runner, kind: StoreKind = GITHUB_CREDENTIAL): SecretStore =>
   (backend === 'keychain' ? new KeychainStore(runner, kind) : backend === 'secret-service' ? new SecretServiceStore(runner, kind) : new FileStore(kind));
 
-/** A moved token: a project's (projectId set) or the host-wide manager bot token (projectId null). */
-export type MovedToken = { projectId: string; kind: CredentialKind['name'] } | { projectId: null; kind: typeof MANAGER_CREDENTIAL.name };
+/** A moved token: a project's (projectId set) or a host-wide manager token (projectId null). */
+export type MovedToken = { projectId: string; kind: CredentialKind['name'] } | { projectId: null; kind: typeof MANAGER_CREDENTIAL.name | typeof MANAGER_CLAUDE_CREDENTIAL.name };
 
 /**
  * Host runtime: moves every registered project's tokens, and the host-wide manager bot token, from the macOS Keychain
@@ -432,6 +472,27 @@ export async function moveKeychainTokensToFileStore(runner: Runner = run): Promi
       }
     } catch (e) {
       warnings.push(`The host manager bot token is still in ${backendLabel(mgr.backend)} (${redact((e as Error).message).split('\n')[0]}); agents of a host-runtime project could read it with ${mgr.backend === 'keychain' ? '/usr/bin/security' : 'secret-tool'}. Store it again with \`${MANAGER_CREDENTIAL.command}\`.`);
+    }
+  }
+  // The manager's Claude token (assistant): its reference is <MINIONS_HOME>/manager/claude-credential.json.
+  const cl = await loadManagerClaudeCredentialRef().catch(() => null);
+  if (cl && cl.backend !== 'file') {
+    try {
+      const keychain = storeFor(cl.backend, runner, MANAGER_CLAUDE_CREDENTIAL);
+      const token = await keychain.get(MANAGER_ACCOUNT);
+      if (token) {
+        const file = new FileStore(MANAGER_CLAUDE_CREDENTIAL);
+        await file.set(MANAGER_ACCOUNT, token);
+        const cur = await loadManagerClaudeCredentialRef();
+        if (cur) {
+          const ref: ManagerClaudeCredentialRef = { ...cur, backend: 'file', ref: file.ref(MANAGER_ACCOUNT), updatedAt: new Date().toISOString() };
+          await writeJson(managerPaths().claudeCredentialJson, ref, { mode: 0o600 });
+        }
+        await keychain.delete(MANAGER_ACCOUNT);
+        moved.push({ projectId: null, kind: MANAGER_CLAUDE_CREDENTIAL.name });
+      }
+    } catch (e) {
+      warnings.push(`The host manager Claude token is still in ${backendLabel(cl.backend)} (${redact((e as Error).message).split('\n')[0]}); agents of a host-runtime project could read it with ${cl.backend === 'keychain' ? '/usr/bin/security' : 'secret-tool'}. Store it again with \`${MANAGER_CLAUDE_CREDENTIAL.command}\`.`);
     }
   }
   return { moved, warnings };
@@ -777,6 +838,95 @@ export async function managerCredentialStatus(opts: { runner?: Runner } = {}): P
   }
   const where = modeProblem ? "host file" : shortWhere(ref.backend);
   return { state: problems.length ? 'invalid' : 'ok', backend: ref.backend, botId: ref.botId, detail: [`bot ${ref.botId}; stored in ${where}`, ...problems].join('; ') };
+}
+
+// ---------------------------------------------------------------- manager Claude token (host-wide)
+//
+// One token per host (MANAGER_CLAUDE_CREDENTIAL, store account "manager") for the manager's natural-language
+// assistant (docs/design/host-manager-assistant.md). Its non-secret reference is
+// <MINIONS_HOME>/manager/claude-credential.json (0600: backend, locator, token kind), never a project's
+// credentials.json, so materializeSecrets / clearSecrets never see it. Entry: the manager step of `minions setup`
+// (hidden prompt or --manager-claude-token-stdin). Use: src/host/manager-assistant.ts, per call, in the child env.
+
+export const ManagerClaudeCredentialRefSchema = z.object({
+  version: z.literal(1),
+  backend: z.enum(BACKENDS),
+  ref: z.string().min(1),
+  /** Non-secret: which environment variable the token reaches claude through. */
+  kind: z.enum(['oauth-token', 'api-key']),
+  updatedAt: z.string(),
+}).strict();
+export type ManagerClaudeCredentialRef = z.infer<typeof ManagerClaudeCredentialRefSchema>;
+
+/** The manager Claude token's reference, or null when none is stored. An unreadable file is an error (INVALID_CONFIG). */
+export async function loadManagerClaudeCredentialRef(): Promise<ManagerClaudeCredentialRef | null> {
+  return (await readJsonIfExists(managerPaths().claudeCredentialJson, ManagerClaudeCredentialRefSchema)) ?? null;
+}
+
+/** Stores the manager Claude token (format-checked), deletes a copy left in a previous backend, records the reference. */
+export async function storeManagerClaudeToken(raw: string, opts: StoreOptions & { store?: SecretStore } = {}): Promise<ManagerClaudeCredentialRef> {
+  const runner = opts.runner ?? run;
+  const { token, kind } = checkClaudeTokenFormat(raw);
+  const store = opts.store ?? await selectStore({ ...opts, runner, kind: MANAGER_CLAUDE_CREDENTIAL });
+  const prev = await loadManagerClaudeCredentialRef().catch(() => null);
+  await store.set(MANAGER_ACCOUNT, token);
+  if (prev && prev.backend !== store.backend) await storeFor(prev.backend, runner, MANAGER_CLAUDE_CREDENTIAL).delete(MANAGER_ACCOUNT);
+  const ref: ManagerClaudeCredentialRef = { version: 1, backend: store.backend, ref: store.ref(MANAGER_ACCOUNT), kind, updatedAt: new Date().toISOString() };
+  await privateDir(managerDir());
+  await writeJson(managerPaths().claudeCredentialJson, ref, { mode: 0o600 });
+  return ref;
+}
+
+/**
+ * Reads the manager Claude token (the manager process only, once per call). Null when none is stored. A stored value
+ * whose kind differs from the reference is refused (it would reach claude through the wrong variable).
+ */
+export async function readManagerClaudeToken(runner: Runner = run): Promise<{ token: string; kind: ClaudeTokenKind } | null> {
+  const ref = await loadManagerClaudeCredentialRef();
+  if (!ref) return null;
+  const raw = await storeFor(ref.backend, runner, MANAGER_CLAUDE_CREDENTIAL).get(MANAGER_ACCOUNT);
+  if (!raw) return null;
+  let parsed: { token: string; kind: ClaudeTokenKind } | null = null;
+  try { parsed = checkClaudeTokenFormat(raw); } catch { /* reported below */ }
+  if (!parsed || parsed.kind !== ref.kind) {
+    throw new MinionsError('INVALID_CONFIG', 'The stored manager Claude token does not match its recorded kind.', 'Store the manager Claude token again with `minions setup` (host manager step).');
+  }
+  return parsed;
+}
+
+/** Deletes the manager Claude token and its reference. */
+export async function removeManagerClaudeToken(runner: Runner = run): Promise<{ removed: boolean; backend: Backend | null }> {
+  const ref = await loadManagerClaudeCredentialRef().catch(() => null);
+  if (ref) await storeFor(ref.backend, runner, MANAGER_CLAUDE_CREDENTIAL).delete(MANAGER_ACCOUNT);
+  await rm(managerPaths().claudeCredentialJson, { force: true });
+  return { removed: !!ref, backend: ref?.backend ?? null };
+}
+
+export interface ManagerClaudeCredentialStatus extends CredentialStatus { kind?: ClaudeTokenKind }
+
+/** Manager Claude token: presence, format, kind and file mode. No network call; never includes the token. */
+export async function managerClaudeCredentialStatus(opts: { runner?: Runner } = {}): Promise<ManagerClaudeCredentialStatus> {
+  const runner = opts.runner ?? run;
+  let ref: ManagerClaudeCredentialRef | null;
+  try { ref = await loadManagerClaudeCredentialRef(); } catch (e) {
+    return { state: 'invalid', detail: `manager Claude credential reference is invalid: ${redact((e as Error).message).split('\n')[0]}` };
+  }
+  if (!ref) return { state: 'missing', detail: 'no manager Claude token stored' };
+  let token: string | null;
+  try { token = await storeFor(ref.backend, runner, MANAGER_CLAUDE_CREDENTIAL).get(MANAGER_ACCOUNT); } catch (e) {
+    return { state: 'invalid', backend: ref.backend, kind: ref.kind, detail: redact((e as Error).message) };
+  }
+  if (!token) return { state: 'missing', backend: ref.backend, kind: ref.kind, detail: `reference ${ref.ref} exists but the token is gone` };
+  const problems: string[] = [];
+  try {
+    if (checkClaudeTokenFormat(token).kind !== ref.kind) problems.push('stored token does not match the recorded kind');
+  } catch { problems.push('stored value is not a Claude token'); }
+  if (ref.backend === 'file') {
+    const p = await fileModeProblem(MANAGER_CLAUDE_CREDENTIAL, MANAGER_ACCOUNT);
+    if (p) problems.push(p);
+  }
+  const what = ref.kind === 'oauth-token' ? 'OAuth token (claude setup-token)' : 'Anthropic API key';
+  return { state: problems.length ? 'invalid' : 'ok', backend: ref.backend, kind: ref.kind, detail: [`${what}; stored in ${shortWhere(ref.backend)}`, ...problems].join('; ') };
 }
 
 // ---------------------------------------------------------------- Codex (OpenAI API key) provisioning

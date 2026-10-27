@@ -272,8 +272,50 @@ export const settingDef = (key: string): SettingDef | undefined => {
 
 export function requireSetting(key: string): SettingDef {
   const d = settingDef(key);
-  if (!d) throw new MinionsError('INVALID_CONFIG', `Unknown setting: ${key}`, 'Run `minions settings --list` for the settings that can be changed.', { path: key });
+  if (!d) {
+    const suggestions = closestSettingKeys(key);
+    throw new MinionsError('INVALID_CONFIG', `Unknown setting: ${key}${suggestions.length ? `. Did you mean: ${suggestions.join(', ')}?` : ''}`,
+      'Run `minions settings --list` for the settings that can be changed.', { path: key, suggestions });
+  }
   return d;
+}
+
+/** Levenshtein distance (small strings: setting keys). */
+function editDistance(a: string, b: string): number {
+  let prev = Array.from({ length: b.length + 1 }, (_, j) => j);
+  for (let i = 1; i <= a.length; i++) {
+    const cur = [i];
+    for (let j = 1; j <= b.length; j++) cur[j] = Math.min(prev[j]! + 1, cur[j - 1]! + 1, prev[j - 1]! + (a[i - 1] === b[j - 1] ? 0 : 1));
+    prev = cur;
+  }
+  return prev[b.length]!;
+}
+
+/**
+ * The keys closest to an unknown one, best first (at most `max`): first keys that contain it (`pr.merge` ->
+ * `capabilities.pr.merge`), then keys whose last segment contains its last segment (or the reverse), then keys within a
+ * small edit distance of it (whole key or last segment: typos). Case-insensitive. `keys`: the catalog by default.
+ */
+export function closestSettingKeys(input: string, keys: readonly string[] = SETTINGS.map((s) => s.key), max = 3): string[] {
+  const q = input.trim().toLowerCase();
+  if (!q) return [];
+  const last = (k: string) => k.slice(k.lastIndexOf('.') + 1);
+  const qLast = last(q);
+  const scored: { key: string; tier: number; score: number }[] = [];
+  for (const key of keys) {
+    const k = key.toLowerCase();
+    const kLast = last(k);
+    let tier: number; let score: number;
+    if (k.includes(q)) { tier = 0; score = k.length - q.length; }
+    else if (qLast.length >= 3 && (kLast.includes(qLast) || (kLast.length >= 3 && qLast.includes(kLast)))) { tier = 1; score = Math.abs(kLast.length - qLast.length); }
+    else {
+      const d = q.includes('.') ? editDistance(q, k) : Math.min(editDistance(q, k), editDistance(q, kLast));
+      if (d > Math.max(2, Math.floor(q.length / 4))) continue;
+      tier = 2; score = d;
+    }
+    scored.push({ key, tier, score });
+  }
+  return scored.sort((a, b) => a.tier - b.tier || a.score - b.score || a.key.localeCompare(b.key)).slice(0, max).map((x) => x.key);
 }
 
 // ---------------------------------------------------------------- reading

@@ -73,13 +73,18 @@ import { applyUndo, beginHistory, completeHistory } from './config-history.js';
 import { readManagerToken } from './credentials.js';
 import { DELEGATE_MAX_OUTPUT_BYTES, DELEGATE_TIMEOUT_MS, delegateCapture } from './delegate.js';
 import { loadManagerAccess, type ManagerAccess } from './manager-bot.js';
+import { createManagerAssistant } from './manager-assistant.js';
+import { createAssistantChat, type AssistantChatPort } from './manager-assistant-chat.js';
+import { assistantStatus, type AssistantStatus } from './manager-assistant-context.js';
+import { PROPOSAL_KINDS } from './manager-assistant-proposal.js';
+import { ManagerNotice } from './manager-notice.js';
 import { MANAGER_RESTART_EXIT_CODE, cliChangeWatcher, managerHeartbeat } from './manager-service.js';
 import { telegramTransport } from './manager-telegram.js';
 import { loadProjectJson, type ProjectJson } from './project.js';
 import { loadRegistry } from './registry.js';
 import { parseStatusEnvelope } from './restart-required.js';
-import { defaultSettingsRuntime, type SettingsRuntime } from './settings-cli.js';
-import { formatValue } from './settings.js';
+import { defaultSettingsRuntime, runtimePaused, type SettingsRuntime } from './settings-cli.js';
+import { formatValue, listSettings, loadSettingsContext, parseSettingValue, planSetting, settingDef, type SettingView } from './settings.js';
 
 export const POLL_INTERVAL_MS = 20_000;
 export const managerLockPath = () => join(managerDir(), 'lock');
@@ -101,6 +106,8 @@ export interface ManagerOffer {
   text: string;
   /** Non-null: the plan loosens policy, and the transport asks twice before it sends the confirm event. */
   loosens: string | null;
+  /** 'assistant': proposed by the manager's assistant from the owner's message (the plan's `via`); absent otherwise. */
+  via?: 'assistant';
 }
 
 /** What the owner did with an offer. The transport authenticates the sender (phase 4: the paired owner only). */
@@ -133,12 +140,43 @@ export interface ManagerCommands {
    * an owner request (`ow_` id). Nothing is applied: the returned offer still needs the owner's Confirm. Throws
    * (nothing journaled) when the plan cannot be built, for example an invalid value or a refused sync.
    */
-  propose(projectId: string | null, command: OwnerCommand): Promise<ManagerOffer>;
+  propose(projectId: string | null, command: OwnerCommand, opts?: ProposeOptions): Promise<ManagerOffer>;
+  /**
+   * The typed status of the project (the picked one, or the only registered one) for the assistant's context bundle:
+   * enums and counts only (assistantStatus of manager-assistant-context.ts), no text of the runtime. Null when no
+   * single project is targeted.
+   */
+  assistantStatus?(projectId: string | null): Promise<AssistantStatus | null>;
   /**
    * Whether the dev-only /rebuild_cli exists for projectId (or, with null, for any registered project): the host CLI
    * runs from a minions source checkout and the project is minions. Elsewhere it is neither advertised nor accepted.
    */
   devRebuild?(projectId: string | null): Promise<boolean>;
+  /**
+   * /settings: every setting of the project (the picked one, or the only registered one) as `minions settings --list`
+   * sees it on the host. Read-only; secrets are only provisioned / missing.
+   */
+  settings?(projectId: string | null): Promise<{ projectId: string; name: string; settings: SettingView[] }>;
+}
+
+export { ManagerNotice } from './manager-notice.js';
+
+/** The friendly no-op reply of a /set: the current value, its source and the other choices (enum and bool keys). */
+export function unchangedSettingText(view: SettingView): string {
+  const cur = formatValue(view.value);
+  const others = view.type === 'bool' ? [String(view.value !== true)]
+    : view.choices ? [...view.choices, ...(view.optional ? ['default'] : [])].filter((c) => c !== cur) : [];
+  return [
+    `${view.key} is already ${cur} (${view.source}); nothing to change.`,
+    ...(others.length ? [`Other choices: ${others.join(', ')}.`] : []),
+    `Send /settings ${view.key} for how a change takes effect.`,
+  ].join('\n');
+}
+
+/** How an owner change command reached the core: typed (no options), or proposed by the assistant (task-65.4). */
+export interface ProposeOptions {
+  /** 'assistant': the plan and the journal carry `via: 'assistant'`; only config-set, restart, upgrade, sync and undo. */
+  via?: 'assistant';
 }
 
 /** An owner change command as the transport parsed it (the core validates everything again). */
@@ -286,7 +324,7 @@ export function planSummary(plan: ChangePlan): string {
 /** The transport's view of a journaled offer. */
 const offerOf = (b: Awaited<ReturnType<typeof offerRequest>>): ManagerOffer => ({
   projectId: b.offer.projectId, requestId: b.offer.requestId, kind: b.plan.kind, nonce: b.offer.nonce, digest: b.digest, expiresAt: b.offer.expiresAt,
-  summary: planSummary(b.plan), text: formatPlan(b.plan, b.digest, b.notes), loosens: b.plan.loosens,
+  summary: planSummary(b.plan), text: formatPlan(b.plan, b.digest, b.notes), loosens: b.plan.loosens, ...(b.plan.via === 'assistant' ? { via: 'assistant' as const } : {}),
 });
 
 /** Reads the host CLI child's `--json` answer into an outcome. */
@@ -766,9 +804,48 @@ export class HostManager {
       projects: async () => (await this.deps.projects()).map((p) => ({ projectId: p.projectId, name: basename(p.repoPath) })),
       status: (projectId) => this.statusText(projectId),
       pending: (projectId) => this.pendingOffers(projectId),
-      propose: (projectId, command) => this.propose(projectId, command),
+      propose: (projectId, command, opts) => this.propose(projectId, command, opts),
+      assistantStatus: (projectId) => this.assistantStatusOf(projectId),
       devRebuild: (projectId) => this.devRebuild(projectId),
+      settings: (projectId) => this.settingsOf(projectId),
     };
+  }
+
+  /** The project an owner command targets: the picked one, else the only registered one. */
+  private async targetProject(projectId: string | null): Promise<ProjectJson> {
+    if (projectId) return this.deps.loadProject(projectId);
+    const all = await this.deps.projects();
+    if (all.length !== 1) {
+      throw new MinionsError('PRECONDITION', all.length ? `${all.length} projects are registered: pick one with /project <name> first.` : 'No registered projects.');
+    }
+    return all[0]!;
+  }
+
+  /** /settings: the settings list of the target project (the pause flags from the runtime when it answers). */
+  async settingsOf(projectId: string | null): Promise<{ projectId: string; name: string; settings: SettingView[] }> {
+    const project = await this.targetProject(projectId);
+    const ctx = await loadSettingsContext(project, { pausedState: (p) => runtimePaused(p, this.runtime) });
+    return { projectId: project.projectId, name: basename(project.repoPath), settings: listSettings(ctx) };
+  }
+
+  /**
+   * A /set whose value is already in effect, told before any request is minted or journaled (decision: the manager
+   * path checks this itself, so the owner gets an explanation instead of a failed change request; buildPlan keeps
+   * its own check for a race and for container requests). Null when the change is real or the check cannot tell:
+   * every error is left to buildPlan, so its messages stay the same.
+   */
+  private async unchangedNotice(project: ProjectJson, c: Extract<OwnerCommand, { kind: 'config-set' }>): Promise<string | null> {
+    const def = settingDef(c.key);
+    if (!def || def.type === 'secret' || def.type === 'control') return null;
+    try {
+      const ctx = await loadSettingsContext(project);
+      const change = await planSetting(ctx, c.key, parseSettingValue(def, c.value), c.layer);
+      if (change.changed) return null;
+      const view = listSettings(ctx).find((v) => v.key === c.key);
+      return view ? unchangedSettingText(view) : null;
+    } catch {
+      return null;
+    }
   }
 
   /** Whether the dev-only rebuild-cli request exists for the project (or, with null, any registered project). */
@@ -781,24 +858,23 @@ export class HostManager {
    * An owner change command: the plan of an owner request (`ow_` id), journaled as an offer. Nothing is applied here.
    * Without a picked project it needs exactly one registered project.
    */
-  async propose(projectId: string | null, c: OwnerCommand): Promise<ManagerOffer> {
-    let project: ProjectJson;
-    if (projectId) project = await this.deps.loadProject(projectId);
-    else {
-      const all = await this.deps.projects();
-      if (all.length !== 1) {
-        throw new MinionsError('PRECONDITION', all.length ? `${all.length} projects are registered: pick one with /project <name> first.` : 'No registered projects.');
-      }
-      project = all[0]!;
+  async propose(projectId: string | null, c: OwnerCommand, opts: ProposeOptions = {}): Promise<ManagerOffer> {
+    if (opts.via !== undefined && (opts.via !== 'assistant' || !(PROPOSAL_KINDS as readonly string[]).includes(c.kind))) {
+      throw new MinionsError('PRECONDITION', `a ${displayText(c.kind)} request is never proposed by the assistant: type the command.`);
+    }
+    const project = await this.targetProject(projectId);
+    if (c.kind === 'config-set') {
+      const notice = await this.unchangedNotice(project, c);
+      if (notice) throw new ManagerNotice(notice);
     }
     // Not registered outside a minions source checkout: refused before anything is planned or journaled.
     if (c.kind === 'rebuild-cli' && !devRebuildAvailable(project, this.deps.cli)) throw notAvailable();
     const payload: Record<string, unknown> = c.kind === 'config-set' ? { key: c.key, value: c.value, layer: c.layer }
       : c.kind === 'undo' ? { target: c.target } : c.kind === 'approve' ? { taskId: c.taskId, head: c.head, merge: c.merge } : {};
-    const req: RequestSnapshot = { id: newOwnerRequestId(), kind: c.kind, payload, reason: null, origin: 'owner' };
+    const req: RequestSnapshot = { id: newOwnerRequestId(), kind: c.kind, payload, reason: null, origin: 'owner', ...(opts.via === 'assistant' ? { via: 'assistant' as const } : {}) };
     const built = await offerRequest(project, req, this.cr);
     const o = offerOf(built);
-    this.deps.log(`owner request ${project.projectId} ${req.id}: ${o.summary}`);
+    this.deps.log(`owner request ${project.projectId} ${req.id}${req.via ? ' (proposed by the assistant)' : ''}: ${o.summary}`);
     return o;
   }
 
@@ -816,11 +892,31 @@ export class HostManager {
         const plan = e.plan as ChangePlan;
         out.push({
           projectId: e.projectId, requestId: e.requestId, kind: plan.kind, nonce: e.nonce, digest: e.digest, expiresAt: e.expiresAt,
-          summary: planSummary(plan), text: formatPlan(plan, e.digest, []), loosens: plan.loosens ?? null,
+          summary: planSummary(plan), text: formatPlan(plan, e.digest, []), loosens: plan.loosens ?? null, ...(plan.via === 'assistant' ? { via: 'assistant' as const } : {}),
         });
       } catch (err) { this.deps.log(`journal: the offer of ${e.requestId} cannot be shown: ${(err as Error).message}`); }
     }
     return out;
+  }
+
+  /**
+   * The typed status of the targeted project for the assistant (null: no single project targeted). Read like /status,
+   * then reduced to enums and counts: no string of the runtime's answer is passed on.
+   */
+  async assistantStatusOf(projectId: string | null): Promise<AssistantStatus | null> {
+    let project: ProjectJson;
+    try { project = await this.targetProject(projectId); } catch { return null; }
+    let running: boolean | null;
+    try { running = await this.deps.running(project); } catch { running = null; }
+    let runtimeStatus: Record<string, unknown> | null = null;
+    if (running) {
+      try { runtimeStatus = parseStatusEnvelope((await this.runtime.exec(project, ['minions', 'status', '--json'])).stdout) ?? null; } catch { runtimeStatus = null; }
+    }
+    const q = this.queued.get(project.projectId);
+    return assistantStatus({
+      running, runtimeStatus, queuedRestart: q ? (q.plan.restart?.mode === 'drain' ? 'drain' : 'when-idle') : null,
+      pollProblem: this.reported.has(`project:${project.projectId}`),
+    });
   }
 
   /** /status: per project the runtime, the coordinator and active leases (from the runtime's status), pending requests. */
@@ -1097,6 +1193,8 @@ export async function chooseTransport(o: {
   write: (line: string) => void; log: (line: string) => void;
   loadAccess?: () => Promise<ManagerAccess | null>; readToken?: () => Promise<string | null>;
   fetch?: typeof fetch;
+  /** The assistant chat of the Telegram transport (default: the real one; null: none). */
+  assistant?: AssistantChatPort | null;
 }): Promise<TransportChoice> {
   const access = await (o.loadAccess ?? loadManagerAccess)();
   const token = access ? await (o.readToken ?? (() => readManagerToken()))() : null;
@@ -1106,7 +1204,10 @@ export async function chooseTransport(o: {
   if (!token.startsWith(`${access.botId}:`)) return fallback('the pairing belongs to another manager bot (pair again with `minions setup`): offers are printed as JSON lines');
   return {
     kind: 'telegram', botId: access.botId, detail: `talking to the paired owner through manager bot ${access.botId}`,
-    transport: telegramTransport({ token, access, log: o.log, ...(o.fetch ? { fetch: o.fetch } : {}) }),
+    transport: telegramTransport({
+      token, access, log: o.log, ...(o.fetch ? { fetch: o.fetch } : {}),
+      ...(o.assistant === null ? {} : { assistant: o.assistant ?? createAssistantChat({ assistant: createManagerAssistant(), log: o.log }) }),
+    }),
   };
 }
 
