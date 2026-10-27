@@ -179,8 +179,8 @@ describe('the digest wake in the routine pass (fake clock)', () => {
       sync: async () => ({ intakeCreated: 0, synced: 0, failed: 0, statusChanges: 0, merged: 0, armed: 0, errors: [] }),
       next: async () => ({ runnable: [] }), coordinator: async () => coordinator, activeLeases: async () => [],
       budgetExhausted: () => false,
-      digestDue: () => digestStatus(env.db, env.config, now).due,
-      holdBack: () => reholdExpired(env.db, env.config, now),
+      digestDue: (n) => digestStatus(env.db, env.config, n).due,
+      holdBack: (n) => reholdExpired(env.db, env.config, n),
       wake: async () => { wakes.push(now.toISOString()); return 'wake scheduled'; },
       crashStart: async () => 'no',
       ...over,
@@ -229,7 +229,7 @@ describe('the digest wake in the routine pass (fake clock)', () => {
     const off = { ...passEnv().env.config, routine: { enabled: false } };
     const t = passEnv();
     t.deps.config = off;
-    t.deps.holdBack = () => reholdExpired(t.env.db, off, at('2026-10-26T16:30:00Z'));
+    t.deps.holdBack = (n) => reholdExpired(t.env.db, off, n);
     enqueue(t.env.db, { key: 'question:task-3:1', kind: 'question', text: 'Which?', holdUntil: '2026-10-27T07:00:00.000Z' });
     t.setNow('2026-10-26T16:30:00Z');
     expect(pending(t.env.db, {}, () => at('2026-10-26T16:30:00Z')).map((i) => i.key)).toEqual([]);

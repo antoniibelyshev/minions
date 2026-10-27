@@ -226,8 +226,8 @@ async function routineDeps(): Promise<Parameters<typeof runRoutinePass>[0]> {
     activeLeases: async () => leases(),
     budgetExhausted: () => { try { return currentBudget({ db: d, config: cfg })?.exhausted ?? false; } catch { return false; } },
     upgradeInProgress: () => upgradeInProgress(d),
-    digestDue: () => digestStatus(d, cfg).due,
-    holdBack: () => reholdExpired(d, cfg),
+    digestDue: (now) => digestStatus(d, cfg, now).due,
+    holdBack: (now) => reholdExpired(d, cfg, now),
     // Never with force: scheduleDetachedRestart refuses with an active lease or a drain (and the detached restart checks again).
     wake: async () => scheduleDetachedRestart({ activeLeases: () => leases().map((id) => ({ id })), drain: () => d.drain(), log, cwd: paths.state }, { wake: true }).reason,
     crashStart: async () => scheduleCrashStart({ drain: () => d.drain(), upgrade: () => upgradeInProgress(d), log, cwd: paths.state }).reason,
