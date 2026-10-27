@@ -362,6 +362,22 @@ export const MinionsConfigSchema = z.object({
     }).strict().optional(),
   }).strict().optional(),
   /**
+   * Unattended routine (docs/design/unattended-delivery.md, phase 1; src/runtime/routine.ts): a deterministic pass
+   * (`minions sync --routine`: intake, PR and CI sync, merge pass, wake decision) every `tickMinutes`, run by the
+   * coordinator wrapper's clock (the host manager is the watchdog). It wakes the coordinator with a fresh session only
+   * when a model is needed. Unset = off; every unset field takes its default.
+   */
+  routine: z.object({
+    /** Default false: no clock, no watchdog pass, no wake or crash start. */
+    enabled: z.boolean().optional(),
+    /** Minutes between routine passes (default 15). */
+    tickMinutes: z.number().int().min(1).max(1440).optional(),
+    /** Minimum minutes between two coordinator wakes (default 30). */
+    minWakeGapMinutes: z.number().int().min(1).optional(),
+    /** Coordinator wakes per UTC day (default 8; the digest wake always counts and is always allowed). */
+    maxWakesPerDay: z.number().int().min(0).optional(),
+  }).strict().optional(),
+  /**
    * Legacy coordinator permission mode. Only "default" is still honoured (as a stricter choice) when
    * coordinator.permissionMode is unset; "acceptEdits" and "auto" mean the default (auto).
    */
