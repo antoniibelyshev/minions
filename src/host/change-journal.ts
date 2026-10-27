@@ -14,6 +14,11 @@
 // - Owner-initiated requests (task-53.5.3: /set, /sync, /upgrade, /restart, /undo in the manager chat) have no
 //   container row. Their id is host-generated (`ow_` + 8 hex, never the container's `cr_`), their snapshot says
 //   `origin: 'owner'`, and they live only in this journal: nothing marks a runtime row for them.
+// - An owner command typed in the paired manager chat (task-78) carries `typed`, the Telegram message it came from
+//   (`telegram:<botId>:<chatId>:<messageId>`); there is at most one offer per message, so a redelivered update is
+//   "already handled", never planned or applied twice. A typed plan that loosens nothing and runs no container-built
+//   code on the host is applied without a tap: its offer (`direct`) and its `confirmed` entry are appended together,
+//   as one step under the journal lock. Its nonce is minted and spent in that step, so no tap can ever use it.
 // The manager (task-53.4, src/host/manager.ts) adds its own process lock and the offer messages on top of this file.
 import { randomBytes } from 'node:crypto';
 import { appendFile, chmod, open, readFile, rm } from 'node:fs/promises';
@@ -52,6 +57,10 @@ export interface OfferEntry {
   type: 'offer'; at: string; projectId: string; requestId: string;
   digest: string; configRevision: number; nonce: string; expiresAt: string;
   request: RequestSnapshot; plan: unknown;
+  /** Owner-typed (task-78): the chat message the command came from (TYPED_KEY_PATTERN); one offer per message. */
+  typed?: string;
+  /** Confirmed in the same step it was recorded: an owner-typed plan applied without a tap (task-78). */
+  direct?: true;
 }
 export interface OutcomeEntry {
   type: 'confirmed' | 'applying' | 'applied' | 'failed' | 'rejected'; at: string; projectId: string; requestId: string;
@@ -75,9 +84,11 @@ export async function readJournal(): Promise<JournalEntry[]> {
   return out;
 }
 
-async function append(entry: JournalEntry): Promise<void> {
+async function append(...entries: JournalEntry[]): Promise<void> {
   await ensureDir(managerDir(), 0o700);
-  await appendFile(journalPath(), JSON.stringify(entry) + '\n', { mode: 0o600 });
+  // One write for all the lines (a torn last line is skipped when read: at worst a direct offer stays unconfirmed,
+  // which only a Confirm tap could then apply).
+  await appendFile(journalPath(), entries.map((e) => JSON.stringify(e) + '\n').join(''), { mode: 0o600 });
   await chmod(journalPath(), 0o600).catch(() => undefined);
 }
 
@@ -104,14 +115,42 @@ export async function withJournalLock<T>(fn: () => Promise<T>, timeoutMs = 10_00
 
 const nowIso = (now: Date) => now.toISOString();
 
-/** Records an offer for a plan; returns it (nonce and expiry included). */
-export async function recordOffer(o: { projectId: string; request: RequestSnapshot; plan: unknown; digest: string; configRevision: number; now?: Date }): Promise<OfferEntry> {
+/** The chat message an owner-typed command came from: `telegram:<botId>:<chatId>:<messageId>`. */
+export const TYPED_KEY_PATTERN = /^telegram:\d{1,20}:-?\d{1,20}:\d{1,20}$/;
+
+/**
+ * Records an offer for a plan; returns it (nonce and expiry included).
+ *
+ * `typed` (an owner-typed command, task-78): refused with CONFLICT (`details.refusal` redelivered, `details.requestId`
+ * the earlier request) when an offer for the same chat message is already journaled, so a redelivered update is never
+ * handled twice. `confirmed` (only with `typed`, only for an owner request): the `confirmed` entry is appended in the
+ * same locked step, so the nonce is spent before anything could show it; the caller applies the plan next.
+ */
+export async function recordOffer(o: {
+  projectId: string; request: RequestSnapshot; plan: unknown; digest: string; configRevision: number; now?: Date; typed?: string; confirmed?: boolean;
+}): Promise<OfferEntry> {
   const now = o.now ?? new Date();
+  if (o.typed !== undefined && !TYPED_KEY_PATTERN.test(o.typed)) throw new MinionsError('INTERNAL', 'malformed owner message key; nothing recorded.');
+  if (o.confirmed && (o.typed === undefined || !isOwnerRequest(o.request))) {
+    throw new MinionsError('INTERNAL', `request ${o.request.id}: only an owner-typed request is confirmed when it is recorded; nothing recorded.`);
+  }
   const entry: OfferEntry = {
     type: 'offer', at: nowIso(now), projectId: o.projectId, requestId: o.request.id, digest: o.digest, configRevision: o.configRevision,
     nonce: randomBytes(16).toString('hex'), expiresAt: new Date(now.getTime() + CONFIRM_TTL_MS).toISOString(), request: o.request, plan: o.plan,
+    ...(o.typed !== undefined ? { typed: o.typed } : {}), ...(o.confirmed ? { direct: true as const } : {}),
   };
-  await withJournalLock(() => append(entry));
+  await withJournalLock(async () => {
+    if (o.typed !== undefined) {
+      const earlier = (await readJournal()).find((e): e is OfferEntry => e.type === 'offer' && e.typed === o.typed);
+      if (earlier) {
+        throw new MinionsError('CONFLICT', `this message was already handled as ${earlier.requestId} (a redelivered update); nothing was done again.`, undefined,
+          { refusal: 'redelivered', requestId: earlier.requestId, projectId: earlier.projectId });
+      }
+    }
+    await append(entry, ...(o.confirmed ? [{
+      type: 'confirmed' as const, at: nowIso(now), projectId: entry.projectId, requestId: entry.requestId, nonce: entry.nonce, digest: entry.digest, detail: 'typed by the owner', ...writer(),
+    }] : []));
+  });
   return entry;
 }
 

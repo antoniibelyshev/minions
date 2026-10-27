@@ -89,6 +89,7 @@ const fakeCommands = (o: Partial<ManagerCommands> = {}): ManagerCommands => ({
   status: async (id) => `status for ${id ?? 'all'}`,
   pending: async () => [],
   propose: async () => { throw new Error('propose not faked'); },
+  submit: async () => { throw new Error('submit not faked'); },
   ...o,
 });
 

@@ -458,7 +458,7 @@ function fakeChat(cmds: import('../../src/host/manager.js').ManagerCommands) {
     return res({ ok: true, result: true });
   }) as typeof fetch;
   const t = T.telegramTransport({ token: '555666777:MMHmanagermanagermanagermanager_-9876', access, fetch: f, now: () => Date.parse('2026-10-26T10:00:00Z'), sleep: async () => undefined, lookupOffer: async () => null });
-  t.attach({ ...cmds, propose: async (p, c) => { const o = await cmds.propose(p, c); offers.push(o); return o; } });
+  t.attach({ ...cmds, submit: async (p, c, k) => { const r = await cmds.submit(p, c, k); if (r.status === 'offered') offers.push(r.offer); return r; } });
   return {
     sent, offers,
     say: async (text: string) => {
