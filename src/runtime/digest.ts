@@ -268,7 +268,7 @@ export function composeDigest(i: DigestInput): Digest {
   if (i.spend) {
     const s = i.spend;
     add(SPEND_TITLE[s.window], [
-      { text: `- ${kTok(s.tokens)} tokens${s.usd !== undefined ? ` (~${s.usd.toFixed(2)} est.)` : ''}; coordinator wakes ${s.wakes} (${kTok(s.wakeTokens)} tokens)`, key: null },
+      { text: `- ${kTok(s.tokens)} tokens${s.usd !== undefined ? ` (~$${s.usd.toFixed(2)} est.)` : ''}; coordinator wakes ${s.wakes} (${kTok(s.wakeTokens)} tokens)`, key: null },
       ...(s.budget ? [{ text: `- budget ${s.budget.percent}% of "${s.budget.text}"${s.budget.exhausted ? ': used up, new starts are refused until you raise it' : ''}`, key: null }] : []),
     ]);
   }

@@ -338,6 +338,11 @@ describe('composeDigest (deterministic)', () => {
     expect(used.text).toContain('budget 100% of "5M tokens": used up, new starts are refused until you raise it');
   });
 
+  it("shows the USD estimate with a dollar sign", () => {
+    const d = composeDigest(input({ spend: { window: "last-digest", tokens: 1_000_000, usd: 1.5, budget: null, wakes: 1, wakeTokens: 0 } }));
+    expect(d.text).toContain("(~$1.50 est.)");
+  });
+
   it('stays under the Telegram limit: whole items are left for the next digest, never cut, and not acked', () => {
     const many = Array.from({ length: 40 }, (_, n) => item({ key: `feature:f${n}:x`, kind: 'feature', createdAt: `2026-10-26T10:${String(n).padStart(2, '0')}:00.000Z`, text: `Feature ${n} ${'x'.repeat(150)}` }));
     const d = composeDigest(input({ items: [...input().items, ...many] }));
