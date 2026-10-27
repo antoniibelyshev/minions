@@ -100,7 +100,8 @@ with the help text):
 | - | - |
 | `/status` | Per project: running, coordinator, active leases, restart-required (task-3.4), pending requests |
 | `/requests` | Pending requests, each with Confirm / Reject buttons |
-| `/set <key> <value>` | Same model as `minions settings set` (validation, layer, loosening text), then the confirmation |
+| `/settings [query]` | Read-only list (task-65.1): key, value, source, when a change takes effect, host-owned mark; a group name or key substring narrows it; secrets show set / unset |
+| `/set <key> <value>` | Same model as `minions settings set` (validation, layer, loosening text), then the confirmation. An unknown key gets the closest keys; a value already in effect gets an explanation (value, source, other choices) and no request |
 | `/sync` | Outer repo sync (see [Change kinds](#change-kinds)) |
 | `/upgrade` | `minions upgrade` with a dry-run plan as the confirmation text |
 | `/restart` | Graceful coordinator restart (refused while workers are active: then **Restart when idle** and **Drain now** are offered) |
