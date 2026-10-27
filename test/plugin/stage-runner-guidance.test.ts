@@ -30,7 +30,7 @@ describe('coordinator.md and orchestrate dispatch from work next', () => {
   it('the dispatch flow lists work next, claims without --role and spawns agentType with agentModel', async () => {
     const read = await gen();
     const coord = await read('coordinator.md');
-    expect(coord).toContain('`minions work next|claim|record|release|list|spend ... --json`');
+    expect(coord).toContain('`minions work next|claim|advance|record|release|list|spend ... --json`');
     expect(coord).toMatch(/1\. Pick a stage: `minions work next --json` lists the runnable stages .*`taskId`, `role`, `agentType`, `position`, `workflow`, `suggestedModel`, `agentModel`, `reason`/);
     expect(coord).toMatch(/Never derive the role from the task status yourself/);
     expect(coord).toMatch(/2\. Claim it: `minions work claim <taskId> --compact --json` \(the stage machine picks the role; `--role <role>` is optional and refused unless it is the current stage's\)/);
@@ -44,6 +44,24 @@ describe('coordinator.md and orchestrate dispatch from work next', () => {
     expect(orch).toContain('`minions work claim <taskId> --compact --json` (the CLI picks the stage\'s role');
     expect(orch).toMatch(/`subagent_type`: the stage's `agentType` from `work next`/);
     expect(orch).toMatch(/`model`: the stage's `agentModel`; omit it when null/);
+  });
+
+  it('after a worker returns, the coordinator advances in one call (task-68.7); record and claim stay as fallbacks', async () => {
+    const read = await gen();
+    const coord = await read('coordinator.md');
+    expect(coord).toContain('Record it and claim the next stage in one call: `minions work advance <leaseId> --usage <subagent_tokens> --json`');
+    expect(coord).toMatch(/either `next` .*spawn it as in step 3, no `work next` or `work claim` needed.* or `decision`/);
+    expect(coord).toContain('Fallback: `minions work record <leaseId> --submitted --usage <subagent_tokens> --json`');
+    const orch = await read('skills/orchestrate/SKILL.md');
+    expect(orch).toContain('## 5. Record and advance');
+    expect(orch).toContain('`minions work advance <leaseId> --usage <subagent_tokens> --json`');
+    expect(orch).toMatch(/It never claims while paused, draining or over the budget, after an invalid result, or when a context reset is due/);
+    expect(orch).toMatch(/- `next`: the claimed stage .*Spawn it right away as in step 4/);
+    for (const kind of ['invalid', 'replan', 'needs-split', 'needs-changes', 'blocked', 'partial', 'awaiting-human', 'publication', 'ci-unverified', 'qa-findings', 'context-reset', 'paused', 'draining', 'budget', 'capacity', 'nothing-runnable', 'claim-failed']) {
+      expect(orch).toContain(`\`${kind}\``);
+    }
+    expect(orch).toContain('`minions work advance <leaseId> --correction --usage <subagent_tokens> --json`');
+    expect(orch).toMatch(/Fallback \(an older CLI rejects `work advance`.*`minions work record <leaseId> --submitted --usage <subagent_tokens> --json`, then steps 1 to 3/);
   });
 
   it('orchestrate covers assigning a workflow, proposing a role and cheap stages', async () => {
