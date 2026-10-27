@@ -632,9 +632,11 @@ describe('the manager chat: owner change commands', () => {
     expect(texts[3]).toMatch(/^Project picked/);
     expect(texts[4]).toMatch(/^\/set failed: .*whole number/);
     expect(texts[5]).toMatch(/^\/undo failed: No config history for cr_00000000/);
-    expect(texts[6]).toMatch(/^Your request ow_[0-9a-f]{8} \(project [^)]+\): restart the coordinator/);
-    expect(texts[6]).toContain(a.project.projectId);
-    expect(texts).toHaveLength(7);
+    // A typed /restart loosens nothing: applied at once in the picked project (no offer; the outcomes go to the core's transport).
+    expect(texts).toHaveLength(6);
+    expect(s.offers).toEqual([]);
+    expect(s.runs).toEqual([['settings', 'restart']]);
+    expect(s.outcomes.map((o) => [o.status, o.projectId])).toEqual([['applying', a.project.projectId], ['applied', a.project.projectId]]);
   });
 });
 

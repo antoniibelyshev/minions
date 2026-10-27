@@ -17,7 +17,9 @@
 //   plan, digest, offer and confirmation. Their snapshot has `origin: 'owner'` and an `ow_` id minted by the host,
 //   so they may set host-owned keys (owner decision Q2; a container request never may), there is no runtime row to
 //   mark, and two kinds exist only for them: `sync` (`minions upgrade --sync-only`) and `undo` (restore a config
-//   file from the config history, src/host/config-history.ts).
+//   file from the config history, src/host/config-history.ts). When the owner typed the command in the paired chat
+//   and appliesWithoutConfirm holds (it loosens nothing and builds or installs no CLI on the host), the host manager
+//   confirms it as it records the offer and applies it without a tap (task-78).
 // - `approve` (task-53.5.4: /approve <task> <sha> [merge] in the manager chat) is owner-only too: a signed publication
 //   (or, with merge, merge) approval for exactly (task, full head SHA). Its plan always loosens (so the chat asks
 //   twice), the host manager applies it in-process through approveOnHost (src/host/approvals.ts: the host key signs,
@@ -411,7 +413,7 @@ export function formatPlan(plan: ChangePlan, digest: string, notes: string[]): s
   const owner = plan.origin === 'owner';
   return displayText([
     `${owner ? 'owner request' : 'change request'} ${plan.requestId} (${plan.kind}) for project ${plan.projectId}, configRevision ${plan.configRevision}`,
-    owner ? 'requested by you in the manager chat (typing the command is not consent: confirm this exact plan)' : `reason (from the container, untrusted): ${plan.reason}`,
+    owner ? 'requested by you in the manager chat (this plan waits for your Confirm: check it)' : `reason (from the container, untrusted): ${plan.reason}`,
     ...(plan.undo ? [`undoes: ${plan.undo.target}`] : []),
     ...(plan.approval ? [`approves: ${plan.approval.taskId} at head ${plan.approval.head}`, `scope: ${approvalScopeText(plan.approval.scope)}`] : []),
     ...(plan.restart ? [`restart: ${plan.restart.mode === 'drain' ? 'drain now, then restart when idle' : 'restart when idle (queued)'}`] : []),
@@ -507,6 +509,27 @@ const outcomeBase = (offer: { plan: ChangePlan; digest: string; notes: string[] 
   requestId: offer.plan.requestId, kind: offer.plan.kind, plan: offer.plan, digest: offer.digest, notes: offer.notes,
   marked: false, warnings: [] as string[], nextSteps: [] as string[],
 });
+
+/**
+ * Owner request kinds that may apply without a Confirm tap (task-78), when the owner typed the command in the paired
+ * chat and the plan loosens nothing. Not here: approve (always loosens), rebuild-cli and cli-rollback (they build or
+ * install a CLI on the host), and anything a later task adds until it is reviewed for this list.
+ */
+export const DIRECT_KINDS: readonly string[] = ['config-set', 'restart', 'sync', 'undo', 'upgrade'];
+
+/**
+ * Whether an owner-typed command's plan applies right away (task-78): an owner request (host-minted `ow_` id and owner
+ * origin, in the request and the plan), a kind in DIRECT_KINDS, `loosens` exactly null, not a queued restart mode
+ * (those are follow-up offers), and an upgrade only without --from-container and without --rebuild-cli (without that
+ * flag `minions upgrade` never builds or installs a CLI on the host). Everything else keeps its offer and tap (two
+ * when it loosens). Container requests never get here: they are never owner requests.
+ */
+export function appliesWithoutConfirm(plan: ChangePlan, req: RequestSnapshot): boolean {
+  if (!isOwnerRequest(req) || plan.origin !== 'owner' || plan.requestId !== req.id || plan.kind !== req.kind) return false;
+  if (plan.loosens !== null || !DIRECT_KINDS.includes(plan.kind) || plan.restart !== undefined) return false;
+  if (plan.kind === 'upgrade' && (fromContainerOf(req.payload) !== null || planArgv(plan, req).includes('--rebuild-cli'))) return false;
+  return true;
+}
 
 /** Builds the plan and records an offer (30 minutes) in the host journal. Nothing is applied. */
 export async function offerRequest(project: ProjectJson, req: RequestSnapshot, deps: ChangeRequestDeps): Promise<{ offer: OfferEntry; plan: ChangePlan; digest: string; notes: string[] }> {

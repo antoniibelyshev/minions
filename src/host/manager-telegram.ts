@@ -22,8 +22,15 @@
 //   /set <key> <value> [shared], /sync, /upgrade, /restart, /undo <id> (task-53.5.3). Anything else gets the help text.
 // - The dev-only /rebuild_cli (task-53.7) is accepted and listed in the help text only when
 //   ManagerCommands.devRebuild says it exists; elsewhere it is an unknown command like any other.
-//   A change command only asks the core for a plan (ManagerCommands.propose) and shows it as an offer with Confirm /
-//   Reject: typing it is never consent, and the tap goes through the same confirmation as a container request.
+// - A change command the owner typed (task-78) goes to the core with the key of its message
+//   (ManagerCommands.submit, key `telegram:<botId>:<chatId>:<messageId>`), and the core decides: a plan that loosens
+//   nothing and builds or installs no CLI on the host (/restart, /sync, a tightening or neutral /set or /undo, /upgrade)
+//   is applied right away, journaled as typed by the owner, and its outcome arrives as usual. Anything else (/approve,
+//   a loosening /set or /undo, /rebuild_cli) is shown as an offer with Confirm / Reject and goes through the same
+//   confirmation as a container request, double tap included. Only an owner message that is not forwarded gets here,
+//   and the core journals one offer per message key, so a redelivered update is "already handled", never applied twice.
+//   Container requests, and the follow-up plans the manager offers (Restart when idle, Drain now, Roll back CLI),
+//   always need a tap.
 // - /approve <task> <sha> [merge] (task-53.5.4): only a full 40-character lowercase head SHA parses (a short or
 //   non-hex one gets the usage line). Its plan always loosens, so it always needs the double tap.
 import { chmod } from 'node:fs/promises';
@@ -34,7 +41,7 @@ import { MinionsError } from '../core/errors.js';
 import { ensureDir, readJsonIfExists, writeJson } from '../core/fsutil.js';
 import { redact } from '../core/output.js';
 import { managerDir } from '../core/paths.js';
-import { findOfferByNonce, isOfferRequestId, isOwnerRequestId } from './change-journal.js';
+import { findOfferByNonce, isOfferRequestId, isOwnerRequestId, TYPED_KEY_PATTERN } from './change-journal.js';
 import { APPROVE_HEAD_PATTERN, APPROVE_TASK_ID_PATTERN } from './change-requests.js';
 import type { Fetch } from './credentials.js';
 import { isOwnerUpdate, type ManagerAccess, type TelegramUpdate } from './manager-bot.js';
@@ -89,13 +96,14 @@ const HELP_LINES = [
   '/project [name] - list the projects, or pick the one the other commands use',
   '/set <key> <value> [shared] - change a setting (like minions settings set; local layer unless "shared"); host-owned keys too',
   '/sync - fast-forward the host base branch (local delivery: from the container; GitHub delivery: from origin)',
-  '/upgrade - minions upgrade; the dry-run plan is shown first',
+  '/upgrade - minions upgrade (a dry run first; a failing one stops it); it never builds the host CLI',
   '/restart - graceful coordinator restart (refused while workers are active; then "Restart when idle" and "Drain now" are offered)',
   '/undo <id> - restore the config file as it was before change <id> (only while nothing changed it since)',
   '/approve <task> <sha> [merge] - sign an approval to publish (or with "merge": to merge) <task> at that full head SHA (always asks twice)',
   '/help - this text',
   REBUILD_HELP_MARK,
-  'Change requests from the coordinators arrive here by themselves. A command you type only shows a plan: nothing is applied until you tap Confirm (twice when it loosens policy).',
+  'A command you type applies right away when its plan loosens nothing and builds no CLI on the host (/restart, /sync, /upgrade, a tightening /set or /undo). One that loosens policy (/approve, a loosening /set or /undo) or builds the CLI shows its plan first: tap Confirm (twice when it loosens policy).',
+  'Change requests from the coordinators arrive here by themselves and always wait for your Confirm.',
 ];
 /** The help text; the /rebuild_cli line only when the dev-only request exists. */
 export const helpText = (devRebuild = false) => HELP_LINES.flatMap((l) => (l === REBUILD_HELP_MARK ? (devRebuild ? [REBUILD_HELP_LINE] : []) : [l])).join('\n');
@@ -343,7 +351,7 @@ export class TelegramTransport implements ManagerTransport {
           if (ev) events.push(ev);
         } else if (u.message) {
           if (isForwarded(u.message)) continue; // ignored silently: a forward is not the owner's own command
-          await this.onMessage(typeof u.message.text === 'string' ? u.message.text : '');
+          await this.onMessage(typeof u.message.text === 'string' ? u.message.text : '', this.messageKey(u.message));
         }
       } catch (e) {
         this.log(`telegram: handling update ${u.update_id} failed: ${(e as Error).message}`);
@@ -403,7 +411,18 @@ export class TelegramTransport implements ManagerTransport {
 
   // ------------------------------------------------------------ commands
 
-  private async onMessage(text: string): Promise<void> {
+  /**
+   * The key of an owner message (isOwnerUpdate and the forward check already passed): bot, chat and message id, so a
+   * redelivered update has the same key. Null when Telegram sent no usable message id: the command is then only offered.
+   */
+  private messageKey(m: NonNullable<TelegramUpdate['message']>): string | null {
+    const id = m.message_id;
+    if (typeof id !== 'number' || !Number.isSafeInteger(id) || id < 0 || typeof m.chat?.id !== 'number') return null;
+    const key = `telegram:${this.opts.access.botId}:${m.chat.id}:${id}`;
+    return TYPED_KEY_PATTERN.test(key) ? key : null;
+  }
+
+  private async onMessage(text: string, key: string | null): Promise<void> {
     const m = /^\/([a-z][a-z_]*)(?:@[A-Za-z0-9_]+)?(?:\s+([\s\S]*))?$/.exec(text.trim());
     const cmd = m?.[1] ?? '';
     const arg = (m?.[2] ?? '').trim();
@@ -412,7 +431,7 @@ export class TelegramTransport implements ManagerTransport {
     if (!['status', 'requests', 'project'].includes(cmd) && !change) { await this.send(helpText(dev)); return; }
     if (!this.commands) { await this.send('The host manager is starting; try again in a moment.'); return; }
     try {
-      if (change) await this.change(cmd, arg);
+      if (change) await this.change(cmd, arg, key);
       else if (cmd === 'status') await this.send(displayText(await this.commands.status(this.selected)));
       else if (cmd === 'requests') await this.requests();
       else await this.project(arg);
@@ -421,13 +440,18 @@ export class TelegramTransport implements ManagerTransport {
     }
   }
 
-  /** An owner change command: the core builds and journals the plan; it is shown as an offer. Nothing applies here. */
-  private async change(cmd: string, arg: string): Promise<void> {
+  /**
+   * An owner change command. The core decides (ManagerCommands.submit): a plan that loosens nothing and builds no CLI
+   * on the host is applied right away (its outcome messages arrive through sendOutcome); anything else comes back as
+   * an offer, shown here with Confirm / Reject. Without a message key only an offer is possible (propose).
+   */
+  private async change(cmd: string, arg: string, key: string | null): Promise<void> {
     const c = parseOwnerCommand(cmd, arg);
     if (!c) { await this.send(USAGE[cmd]!); return; }
     if (c.kind === 'upgrade' || c.kind === 'sync' || c.kind === 'rebuild-cli') await this.send(`Planning /${cmd} (a dry run on the host)…`);
-    const offer = await this.commands!.propose(this.selected, c);
-    await this.sendOffer(offer);
+    if (key === null) { await this.sendOffer(await this.commands!.propose(this.selected, c)); return; }
+    const r = await this.commands!.submit(this.selected, c, { key });
+    if (r.status === 'offered') await this.sendOffer(r.offer);
   }
 
   /** Whether the dev-only /rebuild_cli exists for the picked project (or any); false when it cannot be told. */

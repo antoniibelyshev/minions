@@ -22,8 +22,15 @@
 //   with the printed `settings apply --confirm` command, which uses the same journal).
 // - Owner change commands (task-53.5.3): /set, /sync, /upgrade, /restart and /undo reach the core through
 //   ManagerCommands.propose. The core mints an `ow_` request id, builds the same host plan (buildPlan), journals the
-//   offer and hands it back to the transport, which shows it with Confirm / Reject. Typing the command is never
-//   consent: only the tap (twice for a plan that loosens) applies it, through the same confirmOffer and apply path.
+//   offer and hands it back to the transport, which shows it with Confirm / Reject; the tap (twice for a plan that
+//   loosens) applies it through the same confirmOffer and apply path as a container request.
+//   Owner-typed safe commands (task-78): the Telegram transport sends what the owner typed in the paired private chat
+//   (not forwarded) through ManagerCommands.submit with the message key. When appliesWithoutConfirm holds (owner
+//   request, loosens null, a kind in DIRECT_KINDS, no queued restart mode, an upgrade without --rebuild-cli) the offer
+//   and its `confirmed` entry are journaled as one step under the journal lock (recordOffer, which also refuses a
+//   message key it has seen: a redelivered update is "already handled") and apply() runs at once: the same applying,
+//   outcome and follow-up messages, and a refused /restart still offers Restart when idle / Drain now. Everything else
+//   is offered as before. Container requests and the follow-up offers made here always need the tap.
 //   Owner requests have no runtime row, so nothing is marked for them; a refused one is re-offered from its journaled
 //   snapshot. Every config write the manager applies saves the layer file first (src/host/config-history.ts), so
 //   /undo <id> can restore it while the file is still what that change wrote.
@@ -58,11 +65,11 @@ import { procStartTime } from '../runtime/coordinator.js';
 import { isChangeRequestId, type ChangeRequestView } from '../runtime/change-requests.js';
 import { pidAlive } from '../runtime/db.js';
 import {
-  findOfferByNonce, interruptedEntries, isOfferRequestId, isOwnerRequest, lastOutcome, managerDir, newOwnerRequestId, readJournal, recordOutcome, writer, writerAlive,
-  type JournalEntry, type OfferEntry, type OutcomeEntry, type RequestSnapshot,
+  findOfferByNonce, interruptedEntries, isOfferRequestId, isOwnerRequest, lastOutcome, managerDir, newOwnerRequestId, readJournal, recordOffer, recordOutcome,
+  TYPED_KEY_PATTERN, writer, writerAlive, type JournalEntry, type OfferEntry, type OutcomeEntry, type RequestSnapshot,
 } from './change-journal.js';
 import {
-  childUpgrade, confirmOffer, fetchRequests, formatPlan, fromContainerOf, hostCli, mark, offerRequest, planArgv,
+  appliesWithoutConfirm, buildPlan, childUpgrade, confirmOffer, fetchRequests, formatPlan, fromContainerOf, hostCli, mark, offerRequest, planArgv, planDigest,
   recordApplyResult, rejectRequest, RESTART_MODES, snapshotOf, undoDetail, type ChangePlan, type ChangeRequestDeps, type UpgradeRun,
 } from './change-requests.js';
 import { approveOnHost } from './approvals.js';
@@ -135,6 +142,14 @@ export interface ManagerCommands {
    */
   propose(projectId: string | null, command: OwnerCommand): Promise<ManagerOffer>;
   /**
+   * An owner change command the paired owner typed in the private chat (task-78; only the Telegram transport calls
+   * it, after its owner and forward checks). A plan that loosens nothing and builds or installs no CLI on the host is
+   * journaled as confirmed and applied right away (the outcome messages go through sendOutcome); anything else is
+   * journaled as an offer and returned to be shown with Confirm / Reject. A message key seen before (a redelivered
+   * update) is already handled: nothing runs again. Throws (nothing journaled) when the plan cannot be built.
+   */
+  submit(projectId: string | null, command: OwnerCommand, typed: TypedCommand): Promise<OwnerSubmit>;
+  /**
    * Whether the dev-only /rebuild_cli exists for projectId (or, with null, for any registered project): the host CLI
    * runs from a minions source checkout and the project is minions. Elsewhere it is neither advertised nor accepted.
    */
@@ -152,6 +167,14 @@ export type OwnerCommand =
   | { kind: 'approve'; taskId: string; head: string; merge: boolean }
   /** Dev-only: `minions upgrade --rebuild-cli` with the commit range in the plan (see ManagerCommands.devRebuild). */
   | { kind: 'rebuild-cli' };
+
+/** Where an owner-typed command came from: `telegram:<botId>:<chatId>:<messageId>` (TYPED_KEY_PATTERN), one use only. */
+export interface TypedCommand { key: string }
+
+/** What became of an owner-typed command: shown as an offer, applied right away, or already handled (redelivered). */
+export type OwnerSubmit =
+  | { status: 'offered'; offer: ManagerOffer }
+  | { status: 'applied' | 'already-handled'; requestId: string };
 
 // ---------------------------------------------------------------- deps
 
@@ -494,7 +517,7 @@ export class HostManager {
   }
 
   /** Runs the plan stored in the journal (never the container's row) as a host child command, then records the outcome. */
-  private async apply(project: ProjectJson, offer: OfferEntry): Promise<void> {
+  private async apply(project: ProjectJson, offer: OfferEntry, o: { direct?: boolean } = {}): Promise<void> {
     const plan = offer.plan as ChangePlan;
     const ids = { projectId: offer.projectId, requestId: offer.requestId };
     const warnings: string[] = [];
@@ -503,7 +526,12 @@ export class HostManager {
     if (plan.kind === 'restart' && plan.restart) { await this.enqueue(project, offer, plan, warnings); return; }
     const inManager = plan.kind === 'undo' || plan.kind === 'approve' || plan.kind === 'cli-rollback';
     const argv = inManager ? null : planArgv(plan, offer.request);
-    await this.notify({ status: 'applying', ...ids, text: `Applying change request ${offer.requestId} (project ${offer.projectId}): ${planSummary(plan)}…` });
+    await this.notify({
+      status: 'applying', ...ids,
+      text: o.direct
+        ? `Applying your request ${offer.requestId} (project ${offer.projectId}): ${planSummary(plan)}… (typed by you and it loosens nothing, so no Confirm is needed; digest ${offer.digest.slice(0, 12)})`
+        : `Applying change request ${offer.requestId} (project ${offer.projectId}): ${planSummary(plan)}…`,
+    });
     let result: { status: 'applied' | 'failed'; detail: string; refused?: boolean };
     /** Lines after the outcome, and owner offers sent after it (each still needs its own Confirm). */
     const after: string[] = [];
@@ -767,6 +795,7 @@ export class HostManager {
       status: (projectId) => this.statusText(projectId),
       pending: (projectId) => this.pendingOffers(projectId),
       propose: (projectId, command) => this.propose(projectId, command),
+      submit: (projectId, command, typed) => this.submit(projectId, command, typed),
       devRebuild: (projectId) => this.devRebuild(projectId),
     };
   }
@@ -782,6 +811,15 @@ export class HostManager {
    * Without a picked project it needs exactly one registered project.
    */
   async propose(projectId: string | null, c: OwnerCommand): Promise<ManagerOffer> {
+    const { project, req } = await this.ownerRequest(projectId, c);
+    const built = await offerRequest(project, req, this.cr);
+    const o = offerOf(built);
+    this.deps.log(`owner request ${project.projectId} ${req.id}: ${o.summary}`);
+    return o;
+  }
+
+  /** The project an owner command targets and its owner request snapshot (a fresh `ow_` id). */
+  private async ownerRequest(projectId: string | null, c: OwnerCommand): Promise<{ project: ProjectJson; req: RequestSnapshot }> {
     let project: ProjectJson;
     if (projectId) project = await this.deps.loadProject(projectId);
     else {
@@ -795,11 +833,44 @@ export class HostManager {
     if (c.kind === 'rebuild-cli' && !devRebuildAvailable(project, this.deps.cli)) throw notAvailable();
     const payload: Record<string, unknown> = c.kind === 'config-set' ? { key: c.key, value: c.value, layer: c.layer }
       : c.kind === 'undo' ? { target: c.target } : c.kind === 'approve' ? { taskId: c.taskId, head: c.head, merge: c.merge } : {};
-    const req: RequestSnapshot = { id: newOwnerRequestId(), kind: c.kind, payload, reason: null, origin: 'owner' };
-    const built = await offerRequest(project, req, this.cr);
-    const o = offerOf(built);
-    this.deps.log(`owner request ${project.projectId} ${req.id}: ${o.summary}`);
-    return o;
+    return { project, req: { id: newOwnerRequestId(), kind: c.kind, payload, reason: null, origin: 'owner' } };
+  }
+
+  /**
+   * An owner command typed in the paired chat (task-78; the transport passes the chat message it came from). The plan
+   * is built as for propose. When appliesWithoutConfirm says so (an owner plan that loosens nothing and builds or
+   * installs no CLI on the host), its offer and `confirmed` entry are journaled as one locked step and it is applied
+   * here, through the same apply path and outcome messages as a tap; otherwise it is journaled as an offer and
+   * returned for the transport to show (Confirm / Reject, twice when it loosens). A message already journaled (a
+   * redelivered update) is reported as already handled: nothing is planned, offered or applied again.
+   */
+  async submit(projectId: string | null, c: OwnerCommand, typed: TypedCommand): Promise<OwnerSubmit> {
+    if (typeof typed?.key !== 'string' || !TYPED_KEY_PATTERN.test(typed.key)) throw new MinionsError('INTERNAL', 'an owner command without a well-formed chat message key; nothing done.');
+    // Advisory early check (no plan, no dry run for a redelivered message); recordOffer decides under the lock.
+    const seen = (await readJournal()).find((e): e is OfferEntry => e.type === 'offer' && e.typed === typed.key);
+    if (seen) return this.redelivered(seen.projectId, seen.requestId);
+    const { project, req } = await this.ownerRequest(projectId, c);
+    const { plan, notes } = await buildPlan(project, req, this.cr);
+    const digest = planDigest(plan);
+    const direct = appliesWithoutConfirm(plan, req);
+    let offer: OfferEntry;
+    try {
+      offer = await recordOffer({ projectId: project.projectId, request: req, plan, digest, configRevision: plan.configRevision, now: this.deps.now(), typed: typed.key, confirmed: direct });
+    } catch (e) {
+      if (refusalOf(e) !== 'redelivered') throw e;
+      const d = (e as MinionsError).details as { requestId?: string; projectId?: string };
+      return this.redelivered(d.projectId ?? project.projectId, d.requestId ?? req.id);
+    }
+    const o = offerOf({ offer, plan, digest, notes });
+    this.deps.log(`owner request ${project.projectId} ${req.id}${direct ? ' (typed, applied without a tap)' : ''}: ${o.summary}`);
+    if (!direct) return { status: 'offered', offer: o };
+    await this.apply(project, offer, { direct: true });
+    return { status: 'applied', requestId: offer.requestId };
+  }
+
+  private async redelivered(projectId: string, requestId: string): Promise<OwnerSubmit> {
+    await this.notify({ status: 'already-handled', projectId, requestId, text: `your message was already handled as ${requestId} (a redelivered update); nothing was done again.` });
+    return { status: 'already-handled', requestId };
   }
 
   /**
@@ -998,8 +1069,8 @@ async function defaultCliHealth(project: ProjectJson): Promise<CliHealth> {
 /** After an applied config change: the command that applies what it still needs (each confirmed on its own). */
 function followUp(plan: ChangePlan): string[] {
   if ((plan.kind !== 'config-set' && plan.kind !== 'undo') || !plan.change) return [];
-  if (plan.change.takesEffect === 'restart') return ['next: send /restart here to restart the coordinator (shown as its own plan to confirm)'];
-  if (plan.change.takesEffect === 'upgrade') return ['next: send /upgrade here to recreate the container (shown as its own plan to confirm)'];
+  if (plan.change.takesEffect === 'restart') return ['next: send /restart here to restart the coordinator (graceful: refused while workers are active)'];
+  if (plan.change.takesEffect === 'upgrade') return ['next: send /upgrade here to recreate the container (it runs its dry run first)'];
   return [];
 }
 
