@@ -415,6 +415,7 @@ describe('minions setup', () => {
     expect(a.info.join('\n')).toContain(inRepo('minions sync'));
     expect(a.info.join('\n')).toContain(inRepo('minions work approve <taskId> --head <sha> --merge'));
     expect(a.info.join('\n')).toContain(inRepo('minions doctor'));
+    expect(a.info.join('\n')).toContain(inRepo('minions settings set delivery.requiredChecksConfigured true'));
     expect(step(r, 'intake').detail).toContain(inRepo('minions sync'));
     expect(step(r, 'autoMerge').detail).toContain(inRepo('minions doctor'));
     // declining auto-merge on a project that has it on
@@ -504,7 +505,8 @@ describe('minions setup', () => {
       io: scripted({ 'Installation visibility': 'private', 'Set up GitHub integration': 'y', 'Use CI?': 'y' }, [GH_TOKEN]).io });
     expect(step(r, 'ci').detail).toContain('required checks configured');
     expect(step(r, 'ci').lines!.join('\n')).toContain('setup changes neither');
-    expect(step(r, 'ci').lines!.join('\n')).toContain('verification.ciAuthority to "github"');
+    expect(step(r, 'ci').lines!.join('\n')).toContain('minions settings set verification.ciAuthority github');
+    expect(step(r, 'ci').lines!.join('\n')).toMatch(/Run `cd .* && minions settings set delivery.requiredChecksConfigured true` to record that these checks gate merging/);
     expect(api.seen.every((s) => s.method === 'GET')).toBe(true);
     expect((await loadEffectiveConfig(await loadProjectJson(r.projectId))).config.delivery.requiredChecksConfigured).toBe(false);
 

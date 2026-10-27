@@ -712,7 +712,8 @@ describe('doctor ci.requiredChecks (read-only, mocked GitHub API)', () => {
       '/repos/acme/demo/actions/workflows?per_page=1': [200, { total_count: 1 }],
     });
     const doc = await runDoctor({ cwd: repo, probe: dockerDown, runner: recorder().runner, fetch: ok.f });
-    expect(doc.checks.find((c) => c.name === 'ci.requiredChecks')).toMatchObject({ status: 'ok', detail: expect.stringMatching(/required checks on main: build; delivery.requiredChecksConfigured false/) });
+    expect(doc.checks.find((c) => c.name === 'ci.requiredChecks')).toMatchObject({ status: 'ok', detail: expect.stringMatching(/required checks on main: build; delivery.requiredChecksConfigured false/),
+      hint: expect.stringContaining('`minions settings set delivery.requiredChecksConfigured true`') });
     expect(ok.seen.every((s) => s.method === 'GET')).toBe(true);
     expect(ok.seen.map((s) => s.path)).toContain('/repos/acme/demo/branches/main');
     expect(JSON.stringify(doc) + formatDoctor(doc)).not.toContain(TOKEN);

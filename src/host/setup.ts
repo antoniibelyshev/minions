@@ -789,8 +789,9 @@ async function ciStep(opts: SetupOptions, config: MinionsConfig, remoteUrl: stri
   ];
   const plan = ciSetupPlan({ hasWorkflows, requiredChecks: state, verificationCommands: config.verification.commands, baseBranch: base, repository });
   if (plan.length && state === 'unknown') lines.push(`Required checks could not be read; follow the steps below if they are missing (rerun ${inRepo('minions doctor')} to check).`);
-  lines.push(...plan.map((l) => l.split('`minions doctor`').join(inRepo('minions doctor'))));
-  if (!plan.length) lines.push(`CI is in place. Set delivery.requiredChecksConfigured to true to record that these checks gate merging, and verification.ciAuthority to "github" to let tester/reviewer stages rely on them (setup changes neither; ${inRepo('minions doctor')} reports ci.authority).`);
+  const markRequired = 'minions settings set delivery.requiredChecksConfigured true';
+  lines.push(...plan.map((l) => l.split('`minions doctor`').join(inRepo('minions doctor')).split(`\`${markRequired}\``).join(inRepo(markRequired))));
+  if (!plan.length) lines.push(`CI is in place. Run ${inRepo('minions settings set delivery.requiredChecksConfigured true')} to record that these checks gate merging, and ${inRepo('minions settings set verification.ciAuthority github')} to let tester/reviewer stages rely on them (setup changes neither; ${inRepo('minions doctor')} reports ci.authority).`);
   for (const l of lines) opts.io?.info(`  ${l}`);
   return { id: 'ci', status: 'done', detail: `${workflows.length} workflow file(s); required checks ${state}; nothing was changed`, lines };
 }
