@@ -13,9 +13,16 @@
 //   the parents (H, B), B is an ancestor of (or equal to) the server's base, tree(H') equals a clean
 //   merge-tree(H, B), and the link was recorded at the current config revision. CI is never derived.
 // - Custom merge drivers, `merge=union` and a `merge.default` other than text change what a "clean" merge
-//   means, so any such attribute (in either tree, .git/info/attributes or the checkout) refuses the update
-//   and the derivation.
-import { readFile } from 'node:fs/promises';
+//   means, so any such attribute in either commit's tree refuses the update and the derivation.
+// - Every git call whose result the update or the derived approval depends on (merge-tree, parents, trees,
+//   ancestry, the per-link diff) runs in an isolated git dir (withIsolatedRepo): its own config, HEAD,
+//   refs, info and index, an empty work tree outside the checkout, and only the repository's object store
+//   (a symlink, so the merge-tree's tree object lands there for commit-tree). Nothing in the checkout's
+//   working tree, index, .git/config, .git/info/attributes, replace refs or grafts can change the
+//   result. On git >= 2.42 `attr.tree` is pinned to the empty tree; GIT_ATTR_SOURCE in the environment
+//   refuses (git 2.39, used here, knows neither and reads attributes only from the work tree and index).
+import { mkdtemp, mkdir, rm, symlink, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
 import type { MinionsConfig } from '../config/schema.js';
 import { redact } from '../core/output.js';
@@ -35,6 +42,16 @@ export const MERGE_TREE_CONFIG = [
   'merge.default=text', 'merge.renames=true', 'merge.directoryRenames=conflict', 'merge.renormalize=false',
   'merge.conflictStyle=merge', 'merge.renameLimit=7000', 'diff.renames=true', 'core.attributesFile=/dev/null',
 ];
+/**
+ * Fixed options of every isolated call: no commit-graph (a worker-writable file in the object store that
+ * could lie about parents), no replace refs, no untracked cache.
+ */
+export const ISOLATED_GIT_CONFIG = ['core.commitGraph=false', 'core.useReplaceRefs=false', 'core.untrackedCache=false', 'core.hooksPath=/dev/null', 'core.fsmonitor=false'];
+/** The empty tree per object format: git >= 2.42 reads attributes from `attr.tree` when set (pinned to nothing). */
+const EMPTY_TREE: Record<string, string> = {
+  sha1: '4b825dc642cb6eb9a060e54bf8d69288fbee4904',
+  sha256: '6ef19b41225c5369f1c104d45d8d85efa9b057b53b14b4b9b939dd74decc5321',
+};
 const cfgArgs = (kv: string[]) => kv.flatMap((v) => ['-c', v]);
 
 const FULL_SHA = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
@@ -69,13 +86,49 @@ async function blobText(git: GitFn, repo: string, rev: string, path: string): Pr
   return r.code === 0 ? r.stdout : null;
 }
 
+/** An isolated view of a repository: run `git(dir, args)` (the GitFn below ignores its cwd argument). */
+export interface IsolatedRepo { git: GitFn; dir: string; objectFormat: string }
+
+/**
+ * Runs `fn` against an isolated git dir that shares only `repo`'s object store (see the header). The
+ * temporary directory (under os.tmpdir(), never inside a checkout) is removed afterwards. Throws when the
+ * repository's object store cannot be located.
+ */
+export async function withIsolatedRepo<T>(git: GitFn, repo: string, fn: (iso: IsolatedRepo) => Promise<T>): Promise<T> {
+  const op = await git(repo, ['rev-parse', '--path-format=absolute', '--git-path', 'objects', '--show-object-format'], true);
+  const [objects = '', format = ''] = op.code === 0 ? op.stdout.trim().split('\n').map((l) => l.trim()) : [];
+  if (!objects || !isAbsolute(objects) || !EMPTY_TREE[format]) throw new Error(`cannot locate the object store of ${repo}: ${tail(op.stderr) || `git exit ${op.code}`}`);
+  const root = await mkdtemp(join(tmpdir(), 'minions-iso-'));
+  try {
+    const gitDir = join(root, 'git'), work = join(root, 'wt');
+    await mkdir(join(gitDir, 'refs', 'heads'), { recursive: true });
+    await mkdir(join(gitDir, 'info'), { recursive: true });
+    await mkdir(work);
+    await writeFile(join(gitDir, 'HEAD'), 'ref: refs/heads/minions-isolated\n');
+    await writeFile(join(gitDir, 'config'), format === 'sha1'
+      ? '[core]\n\trepositoryformatversion = 0\n\tbare = false\n'
+      : `[core]\n\trepositoryformatversion = 1\n\tbare = false\n[extensions]\n\tobjectformat = ${format}\n`);
+    await symlink(objects, join(gitDir, 'objects'));
+    const lead = [`--git-dir=${gitDir}`, `--work-tree=${work}`, ...cfgArgs([...ISOLATED_GIT_CONFIG, `attr.tree=${EMPTY_TREE[format]}`])];
+    const iso: GitFn = (_cwd, args, allowFailure) => git(work, [...lead, ...args], allowFailure);
+    return await fn({ git: iso, dir: work, objectFormat: format });
+  } finally {
+    await rm(root, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+/** Environment variables that would make git read attributes from somewhere minions does not pin. */
+export function attributeEnvProblems(env: NodeJS.ProcessEnv = process.env): string[] {
+  return ['GIT_ATTR_SOURCE'].filter((k) => env[k] !== undefined).map((k) => `${k} is set in the environment`);
+}
+
 /**
  * Refuses merge drivers that make a textual merge "clean" by other rules: every .gitattributes in the
- * given commits' trees, .git/info/attributes and the checkout's top-level .gitattributes. Returns the
+ * given commits' trees (the isolated merge reads no other attributes: see the header). Returns the
  * offending lines (empty = only built-in drivers).
  */
 export async function mergeAttributeProblems(git: GitFn, repo: string, revs: string[]): Promise<string[]> {
-  const problems: string[] = [];
+  const problems: string[] = [...attributeEnvProblems()];
   for (const rev of new Set(revs)) {
     const ls = await git(repo, ['ls-tree', '-r', '-z', '--name-only', rev], true);
     if (ls.code !== 0) { problems.push(`cannot list ${rev.slice(0, 12)}: ${tail(ls.stderr)}`); continue; }
@@ -85,18 +138,23 @@ export async function mergeAttributeProblems(git: GitFn, repo: string, revs: str
       for (const l of unsafeMergeAttributes(text)) problems.push(`${p} at ${rev.slice(0, 12)}: ${l}`);
     }
   }
-  const gp = await git(repo, ['rev-parse', '--git-path', 'info/attributes'], true);
-  const local: string[] = [join(repo, '.gitattributes')];
-  if (gp.code === 0 && gp.stdout.trim()) { const p = gp.stdout.trim(); local.push(isAbsolute(p) ? p : join(repo, p)); }
-  for (const f of local) {
-    const text = await readFile(f, 'utf8').catch(() => null);
-    if (text !== null) for (const l of unsafeMergeAttributes(text)) problems.push(`${f}: ${l}`);
-  }
   return problems;
 }
 
-/** `git merge-tree --write-tree` of two commits with fixed options and built-in drivers only. */
+/**
+ * `git merge-tree --write-tree` of two commits with fixed options and built-in drivers only, run in an
+ * isolated git dir (withIsolatedRepo): the checkout's working tree, index and config never count.
+ */
 export async function mergeTree(git: GitFn, repo: string, ours: string, theirs: string): Promise<MergeTreeResult> {
+  try {
+    return await withIsolatedRepo(git, repo, (iso) => isolatedMergeTree(iso, ours, theirs));
+  } catch (e) {
+    return { state: 'error', message: `git merge-tree not run: ${tail(String((e as Error)?.message ?? e))}` };
+  }
+}
+
+async function isolatedMergeTree(iso: IsolatedRepo, ours: string, theirs: string): Promise<MergeTreeResult> {
+  const { git, dir: repo } = iso;
   const attrs = await mergeAttributeProblems(git, repo, [ours, theirs]);
   if (attrs.length) return { state: 'refused', message: `custom or union merge drivers are configured (${attrs.slice(0, 5).join('; ')}); a base update needs built-in merges` };
   const r = await git(repo, [...cfgArgs(MERGE_TREE_CONFIG), 'merge-tree', '--write-tree', '--no-messages', '--name-only', '-z', ours, theirs], true);
@@ -176,8 +234,21 @@ export function parseBaseUpdate(row: Pick<EvidenceRow, 'details_json'>): BaseUpd
   return null;
 }
 
-/** Verifies one link from git objects. `record` is the candidate base-update evidence for `head` (a hint). */
+/**
+ * Verifies one link from git objects. `record` is the candidate base-update evidence for `head` (a hint).
+ * Every git call runs in an isolated git dir (withIsolatedRepo); a failure to set it up fails the link.
+ */
 export async function verifyLink(git: GitFn, repo: string, head: string, record: Pick<EvidenceRow, 'details_json' | 'config_revision'> | undefined, o: { serverBase: string | null; configRevision: number }): Promise<BaseUpdateLink> {
+  try {
+    return await withIsolatedRepo(git, repo, (iso) => verifyLinkIn(iso, head, record, o));
+  } catch (e) {
+    return { head, from: null, base: null, checks: { record: false, parents: false, ancestry: false, tree: false, revision: false },
+      problems: [`cannot verify ${head.slice(0, 12)}: ${tail(String((e as Error)?.message ?? e))}`] };
+  }
+}
+
+async function verifyLinkIn(iso: IsolatedRepo, head: string, record: Pick<EvidenceRow, 'details_json' | 'config_revision'> | undefined, o: { serverBase: string | null; configRevision: number }): Promise<BaseUpdateLink> {
+  const { git, dir: repo } = iso;
   const problems: string[] = [];
   const checks = { record: false, parents: false, ancestry: false, tree: false, revision: false };
   const parents = await commitParents(git, repo, head);
@@ -201,7 +272,7 @@ export async function verifyLink(git: GitFn, repo: string, head: string, record:
     checks.ancestry = (await git(repo, ['merge-base', '--is-ancestor', base!, o.serverBase], true)).code === 0;
     if (!checks.ancestry) problems.push(`parent 2 ${base!.slice(0, 12)} of ${head.slice(0, 12)} is not on the server's base ${o.serverBase.slice(0, 12)}`);
   }
-  const mt = await mergeTree(git, repo, from!, base!);
+  const mt = await isolatedMergeTree(iso, from!, base!);
   if (mt.state !== 'clean') problems.push(mt.state === 'conflict' ? `merge-tree of ${from!.slice(0, 12)} and ${base!.slice(0, 12)} conflicts (${mt.files.slice(0, 5).join(', ')})` : mt.message);
   else {
     checks.tree = mt.tree === tree;

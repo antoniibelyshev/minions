@@ -28,7 +28,7 @@ import type { ErrorCode } from '../core/errors.js';
 import { redact } from '../core/output.js';
 import { readFile } from 'node:fs/promises';
 import type { CiGate } from './ci-gate.js';
-import { BASE_UPDATE_KIND, deriveApproval, derivedApprovalProblems, fetchBase, hasCommit, serverBaseOf, type DerivedApproval } from './base-update.js';
+import { BASE_UPDATE_KIND, deriveApproval, derivedApprovalProblems, fetchBase, hasCommit, serverBaseOf, withIsolatedRepo, type DerivedApproval } from './base-update.js';
 import { formatCiGate } from './ci-gate.js';
 import type { EvidenceRow, RuntimeDb } from './db.js';
 import type { GitFn } from './github.js';
@@ -110,8 +110,11 @@ export interface MergeGateInput {
    * by the caller. Reviewer evidence of the head the chain ends at counts when every link holds; CI never.
    */
   derived?: DerivedApproval;
-  /** Backlog status of the task: only a delivered task (PR open, no repair under way) merges. */
-  taskStatus?: string;
+  /**
+   * Backlog status of the task: only a delivered task (PR open, no repair under way) merges. Null when
+   * it could not be read: the gate fails closed.
+   */
+  taskStatus: string | null;
   ci: CiGate;
   paths: { ok: true; changedPaths: string[]; sensitivePaths: string[] } | { ok: false; message: string };
   /** Verifies the recorded merge approvals (only called when pr.merge evaluates to "ask"). */
@@ -136,7 +139,8 @@ export function evaluateMergeGate(i: MergeGateInput): MergeGate {
   if (pr.isCrossRepository) reasons.push('the pull request comes from another repository');
   if (pr.baseRefName !== cfg.git.baseBranch) reasons.push(`the pull request targets ${String(pr.baseRefName)}, not ${cfg.git.baseBranch}`);
   if (pr.headRefOid !== i.approvedHead) reasons.push(`PR head ${String(pr.headRefOid).slice(0, 12)} is not the approved head ${i.approvedHead.slice(0, 12)} (test and review the new head first)`);
-  if (i.taskStatus !== undefined && !MERGEABLE_STATUSES.includes(i.taskStatus)) reasons.push(`the task is ${i.taskStatus}, not delivered`);
+  if (i.taskStatus === null || i.taskStatus === undefined) reasons.push('the task status could not be read from the backlog');
+  else if (!MERGEABLE_STATUSES.includes(i.taskStatus)) reasons.push(`the task is ${i.taskStatus}, not delivered`);
   if (!i.reviewed) {
     // Derived approval (task-68.3): reviewer evidence of H counts for a verified base update H' of it.
     const derived = i.derived ? derivedApprovalProblems(i.derived, i.approvedHead) : null;
@@ -252,16 +256,21 @@ export async function autoMergeTask(d: MergeDeps, taskId: string): Promise<Merge
     : { ok: false as const, message: 'origin is not a github.com repository' };
   if (paths.ok && pathsHead !== head) {
     const changed = new Set(paths.changedPaths);
-    for (const l of derived!.links) {
-      const r = await d.git(d.repo, ['diff', '--name-only', '--no-renames', '-z', l.base!, l.head], true);
-      if (r.code !== 0) { paths = { ok: false, message: `cannot diff the base update ${l.head.slice(0, 12)} against ${l.base!.slice(0, 12)}` }; break; }
-      for (const f of r.stdout.split('\0')) if (f) changed.add(f);
-    }
+    // Isolated like the derivation itself (base-update.ts withIsolatedRepo): only git objects count.
+    const failed = await withIsolatedRepo(d.git, d.repo, async (iso) => {
+      for (const l of derived!.links) {
+        const r = await iso.git(iso.dir, ['diff', '--name-only', '--no-renames', '-z', l.base!, l.head], true);
+        if (r.code !== 0) return `cannot diff the base update ${l.head.slice(0, 12)} against ${l.base!.slice(0, 12)}`;
+        for (const f of r.stdout.split('\0')) if (f) changed.add(f);
+      }
+      return null;
+    }).catch((e: unknown) => `cannot diff the base updates: ${String((e as Error)?.message ?? e).slice(0, 300)}`);
+    if (failed) paths = { ok: false, message: failed };
     if (paths.ok) { const all = [...changed]; paths = { ok: true, changedPaths: all, sensitivePaths: all.filter((p) => matchesAny(p, cfg.sensitivePaths)) }; }
   }
   const pem = await readFile(d.approvalPublicKeyFile, 'utf8').catch(() => null);
   const gate = evaluateMergeGate({
-    config: cfg, approvedHead: head, pr, reviewed, ...(derived ? { derived } : {}), ...(task ? { taskStatus: task.status } : {}), ci, paths,
+    config: cfg, approvedHead: head, pr, reviewed, ...(derived ? { derived } : {}), taskStatus: task?.status ?? null, ci, paths,
     approval: () => pem
       ? verifyAnyApproval(d.db.approvals(taskId, 'merge', head).map((a) => a.signature), pem, { taskId, head, now: d.now?.(), scope: 'merge' })
       : { ok: false, reason: missingApprovalKeyReason(d.approvalPublicKeyFile) },

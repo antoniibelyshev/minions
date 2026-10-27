@@ -27,7 +27,7 @@ import { readRequiredChecks, type RequiredChecksReport } from './ci.js';
 import { ciGateFromDb, formatCiGate, type CiGate } from './ci-gate.js';
 import { autoMergeTask, type MergeResult } from './merge.js';
 import { runPrScan, type ConflictInfo, type ScanReport } from './pr-scan.js';
-import { BRANCH_PREFIX, branchFor, ensureBranchWorktree, ensureReviewWorktree, git, headOf, resolveBaseBranch, taskSlug, workspaceLayout, type WorkspaceLayout } from './worktree.js';
+import { abortableGit, BRANCH_PREFIX, branchFor, ensureBranchWorktree, ensureReviewWorktree, git, headOf, resolveBaseBranch, taskSlug, workspaceLayout, type WorkspaceLayout } from './worktree.js';
 
 export const LEASE_ROLES: readonly BuiltinLeaseRole[] = ['engineer', 'tester', 'reviewer'];
 
@@ -1527,9 +1527,10 @@ export class Scheduler {
    * PR scan (src/runtime/pr-scan.ts, task-68.3): one `gh pr list`, then base updates for behind PRs, conflict
    * reports and CI repairs for delivered tasks without an active lease. `deadline` bounds new base updates.
    */
-  async scanPullRequests(opts: { taskIds?: string[]; deadline?: number; onConflict?: (c: ConflictInfo) => Promise<void> } = {}): Promise<ScanReport> {
+  async scanPullRequests(opts: { taskIds?: string[]; deadline?: number; signal?: AbortSignal; onConflict?: (c: ConflictInfo) => Promise<void> } = {}): Promise<ScanReport> {
     return runPrScan({
-      db: this.db, backlog: this.backlog, config: this.config, repo: this.layout.repo, gh: this.gh, git,
+      db: this.db, backlog: this.backlog, config: this.config, repo: this.layout.repo, gh: this.gh, git: opts.signal ? abortableGit(opts.signal) : git,
+      ...(opts.signal ? { signal: opts.signal } : {}),
       ciGate: (id, head) => this.ciGate(id, head), ciRepair: (id, head, findings) => this.ciRepair(id, head, findings),
       now: this.now, ...(opts.deadline !== undefined ? { deadline: opts.deadline } : {}), ...(opts.onConflict ? { onConflict: opts.onConflict } : {}),
     }, { taskIds: opts.taskIds });

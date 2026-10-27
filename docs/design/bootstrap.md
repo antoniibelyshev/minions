@@ -670,7 +670,9 @@ Decision record for the PR scan (task-68.3, phase 2 of the unattended-delivery d
   matched to `delivered` tasks by URL. A failed read changes nothing (the next pass retries).
 - **Where it runs.** At the end of `minions sync` (the `scan` field of the report, after the merge
   pass), and after `minions work record` / `work release` once the lease has ended (`scan` field,
-  bounded to 60 s by `boundedScan`; it never changes the record or release outcome and never throws).
+  bounded to 60 s by `boundedScan`: no base update starts with less than 15 s left, and at 60 s an
+  AbortSignal kills the scan's in-flight git and gh children and stops it before the next task; it
+  never changes the record or release outcome and never throws).
   The routine pass of phase 1 (task-68.2) calls the same `runPrScan`. Off (no gh call) unless delivery
   is pull-request on GitHub with `delivery.merge: "auto-when-eligible"`.
 - **Who is touched.** Only `delivered` tasks without an active lease whose publication is `published`
@@ -687,7 +689,8 @@ Decision record for the PR scan (task-68.3, phase 2 of the unattended-delivery d
   likely a semantic conflict with the base. Required checks `timeout`: a status notification, the task
   stays `delivered`.
 - **Merge gate and repairs.** The merge gate also requires the task to be `delivered` (or
-  `awaiting-ci` / `merging`), so a task under repair is never armed even if CI later passes.
+  `awaiting-ci` / `merging`), so a task under repair is never armed even if CI later passes. A status
+  that cannot be read (the backlog read fails) refuses too (`taskStatus: null`, fail closed).
 
 ## Base update and derived approval
 
@@ -711,9 +714,18 @@ the scan above, `evaluateMergeGate` / `autoMergeTask` in `src/runtime/merge.ts`)
   `verification.ciPendingTimeoutMinutes`, defers the others. `routine.maxBaseUpdatesPerTask` (default 4,
   live) caps pushed updates per task in any 24 hours; 0 turns base updates off.
 - **Merge drivers.** `merge=union` or any custom driver (any `merge=` value other than `text` /
-  `binary`, also through a macro) in any `.gitattributes` of either commit, in `.git/info/attributes` or
-  in the checkout's top-level `.gitattributes` refuses the update and the derivation: such a driver
-  makes a conflicting merge "clean" by its own rules.
+  `binary`, also through a macro) in any `.gitattributes` of either commit refuses the update and the
+  derivation: such a driver makes a conflicting merge "clean" by its own rules.
+- **Isolation.** Every git call the update or the derived approval depends on (merge-tree, parents,
+  trees, ancestry, the per-link diff) runs in an isolated git dir (`withIsolatedRepo`): a fresh
+  directory under the OS temp dir with its own config, HEAD, refs, info and no index, an empty work
+  tree, and the repository's object store linked in (so the merge-tree's tree object is there for
+  `commit-tree`). So nothing an agent can write in the checkout (nested or untracked `.gitattributes`,
+  the index, `.git/info/attributes`, `.git/config` such as `merge.default` or `attr.tree`, replace
+  refs, grafts) changes the result; commit-graph files and replace refs are off. On git ≥ 2.42
+  `attr.tree` is pinned to the empty tree, and `GIT_ATTR_SOURCE` in minions' environment refuses the
+  update. git 2.39 (the image's) knows neither and reads attributes only from the work tree and the
+  index, both empty here.
 - **Derived approval.** The record is only a hint. On every merge pass the caller (`autoMergeTask`)
   recomputes each link `H' → H` from git objects (`deriveApproval` / `verifyLink`): exactly two
   parents, the record agrees with them and with the tree, parent 2 is an ancestor of (or equal to) the
@@ -735,7 +747,11 @@ the scan above, `evaluateMergeGate` / `autoMergeTask` in `src/runtime/merge.ts`)
   push (base updates then fail and are reported); `capabilities.pr.merge: "allow"` and `git.push`
   allowed for the branch's paths.
 - **Residuals.** The server base comes from `ls-remote`, which in the container resolves through
-  agent-writable git config (the same residual as the sensitive-path gate). Not built here: the
+  agent-writable git config (the same residual as the sensitive-path gate). Inherited `GIT_*`
+  variables of the minions process itself (other than `GIT_ATTR_SOURCE`) are trusted in the
+  container, as for every other git call (the host runtime drops them). A few short local git calls
+  of the scan (`headOf`, `isDirty`, `listWorktrees`) and the CI gate's gh reads are not wired to the
+  abort signal; their own timeouts bound them. Not built here: the
   needs-rebase stage for real conflicts (task-68.4) and the routine pass that runs the scan on a clock
   (task-68.2).
 

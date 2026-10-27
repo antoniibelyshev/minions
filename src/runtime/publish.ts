@@ -26,12 +26,13 @@ import { isHostRuntime } from './git-hardening.js';
 import { missingApprovalKeyReason, runtimePaths } from './paths.js';
 import { git as realGit } from './worktree.js';
 
-export type GhFn = (args: string[], opts?: { input?: string; cwd?: string }) => Promise<RunResult>;
+/** `opts.signal` (optional) kills that call's gh on abort, like the timeout (injected fakes may ignore it). */
+export type GhFn = (args: string[], opts?: { input?: string; cwd?: string; signal?: AbortSignal }) => Promise<RunResult>;
 
 /** gh via the PATH wrapper (/usr/local/bin/gh injects the mounted token for that process only). */
 /** `signal` (optional) kills an in-flight gh on abort (SIGTERM, then SIGKILL), like the timeout. */
 export const ghWithTimeout = (timeoutMs: number, signal?: AbortSignal): GhFn => (args, opts = {}) =>
-  run('gh', args, { cwd: opts.cwd, input: opts.input, allowFailure: true, timeoutMs, signal, env: { ...process.env, GH_PROMPT_DISABLED: '1', GIT_TERMINAL_PROMPT: '0' } });
+  run('gh', args, { cwd: opts.cwd, input: opts.input, allowFailure: true, timeoutMs, signal: opts.signal ?? signal, env: { ...process.env, GH_PROMPT_DISABLED: '1', GIT_TERMINAL_PROMPT: '0' } });
 export const realGh: GhFn = ghWithTimeout(120_000);
 
 export interface PublishInput {

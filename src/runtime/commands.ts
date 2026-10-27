@@ -422,7 +422,6 @@ export async function spendCommand(o: { budget?: string; by?: string; lease?: st
 
 // ---------------------------------------------------------------- context reset
 
-/** Adds `contextReset` to a record/release response when a reset is due (task-45). Never fails the record. */
 /**
  * The PR scan once a slot freed up (after `work record` / `work release`, the lease has ended; task-68.3):
  * bounded to 60 s, a `scan` field only, never a change to the record or release outcome. Off (no field)
@@ -433,12 +432,13 @@ async function scanAfterSlot(): Promise<{ scan?: ScanField }> {
     const cfg = await getConfig();
     if (scanEnabled(cfg)) return {};
     const sched = await scheduler();
-    return { scan: await boundedScan((deadline) => sched.scanPullRequests({ deadline })) };
+    return { scan: await boundedScan((deadline, signal) => sched.scanPullRequests({ deadline, signal })) };
   } catch (e) {
     return { scan: { state: 'error', message: `PR scan not run: ${(e as Error).message}` } };
   }
 }
 
+/** Adds `contextReset` to a record/release response when a reset is due (task-45). Never fails the record. */
 export function withContextReset<T extends object>(r: T, deps: { db: RuntimeDb; config: MinionsConfig; state?: string }): T & { contextReset?: ReturnType<typeof dueNotice> } {
   try {
     const notice = dueNotice(contextResetCheck({ db: deps.db, config: deps.config, ...(deps.state !== undefined ? { state: deps.state } : {}) }));

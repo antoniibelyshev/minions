@@ -88,18 +88,19 @@ export function filterOverrides(configList: string): string[] {
   return [...names].flatMap((n) => ['clean=', 'smudge=', 'process=', 'required=false'].flatMap((v) => ['-c', `filter.${n}.${v}`]));
 }
 
-export type RawRun = (cmd: string, args: string[], opts: { cwd: string; env: NodeJS.ProcessEnv; allowFailure: boolean; timeoutMs: number }) => Promise<RunResult>;
+export type RawRun = (cmd: string, args: string[], opts: { cwd: string; env: NodeJS.ProcessEnv; allowFailure: boolean; timeoutMs: number; signal?: AbortSignal }) => Promise<RunResult>;
 
 /**
  * Runs `git args` in `cwd` with the host-runtime hardening. Work-tree commands also get the filter
  * overrides (read from the repository right before) and GIT_WORK_TREE=cwd when cwd is a work tree.
  */
-export async function hardenedGit(cwd: string, args: string[], allowFailure: boolean, opts: { env?: NodeJS.ProcessEnv; run?: RawRun; timeoutMs?: number } = {}): Promise<RunResult> {
+export async function hardenedGit(cwd: string, args: string[], allowFailure: boolean, opts: { env?: NodeJS.ProcessEnv; run?: RawRun; timeoutMs?: number; signal?: AbortSignal } = {}): Promise<RunResult> {
   const runner = opts.run ?? ((c, a, o) => run(c, a, o));
   const base = opts.env ?? process.env;
   const helper = base.MINIONS_GIT_CREDENTIAL_HELPER || undefined;
   const lead = hardenedGitArgs({ network: isNetworkOp(args), credentialHelper: helper });
   const timeoutMs = opts.timeoutMs ?? 120_000;
+  const signal = opts.signal ? { signal: opts.signal } : {};
   const sub = subcommand(args);
   let extra: string[] = [];
   let workTree: string | undefined;
@@ -107,7 +108,7 @@ export async function hardenedGit(cwd: string, args: string[], allowFailure: boo
     const isWorkTree = await lstat(join(cwd, '.git')).then(() => true, () => false);
     if (isWorkTree) {
       workTree = cwd;
-      const list = await runner('git', [...lead, 'config', '--show-scope', '--name-only', '--get-regexp', '^filter\\.'], { cwd, env: hardenedGitEnv(base), allowFailure: true, timeoutMs: 30_000 });
+      const list = await runner('git', [...lead, 'config', '--show-scope', '--name-only', '--get-regexp', '^filter\\.'], { cwd, env: hardenedGitEnv(base), allowFailure: true, timeoutMs: 30_000, ...signal });
       // exit 1 = no filter keys; anything else means the config could not be read: fail closed.
       if (list.code !== 0 && list.code !== 1) {
         if (allowFailure) return list;
@@ -116,7 +117,7 @@ export async function hardenedGit(cwd: string, args: string[], allowFailure: boo
       extra = filterOverrides(list.stdout);
     }
   }
-  return runner('git', [...lead, ...extra, ...args], { cwd, env: hardenedGitEnv(base, workTree), allowFailure, timeoutMs });
+  return runner('git', [...lead, ...extra, ...args], { cwd, env: hardenedGitEnv(base, workTree), allowFailure, timeoutMs, ...signal });
 }
 
 // ---------------------------------------------------------------------------------------------------------

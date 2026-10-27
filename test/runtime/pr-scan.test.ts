@@ -1,21 +1,22 @@
 // PR scan and verified base update (task-68.3): git fixture repos (a bare "GitHub" origin), a fake gh; no network.
 import { execFileSync } from 'node:child_process';
-import { writeFileSync } from 'node:fs';
-import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { describe, expect, it, vi } from 'vitest';
 import type { MinionsConfig } from '../../src/config/schema.js';
-import type { RunResult } from '../../src/core/exec.js';
+import { run as runCmd, type RunResult } from '../../src/core/exec.js';
 import {
-  BASE_UPDATE_KIND, commitMerge, deriveApproval, derivedApprovalProblems, mergeTree, unsafeMergeAttributes, type DerivedApproval,
+  attributeEnvProblems, BASE_UPDATE_KIND, commitMerge, deriveApproval, derivedApprovalProblems, mergeTree, unsafeMergeAttributes, withIsolatedRepo, type DerivedApproval,
 } from '../../src/runtime/base-update.js';
 import { syncTasks } from '../../src/runtime/ci.js';
 import type { CiGate } from '../../src/runtime/ci-gate.js';
+import { hardenedGit } from '../../src/runtime/git-hardening.js';
 import type { GitFn } from '../../src/runtime/github.js';
 import { evaluateMergeGate } from '../../src/runtime/merge.js';
 import { boundedScan, runPrScan, type ScanReport } from '../../src/runtime/pr-scan.js';
 import { publishTask, type GhFn, type PublishInput } from '../../src/runtime/publish.js';
 import { Scheduler } from '../../src/runtime/scheduler.js';
-import { git as realGit } from '../../src/runtime/worktree.js';
+import { abortableGit, git as realGit } from '../../src/runtime/worktree.js';
 import { approvalKeys, commitFile, gitSync, makeDefaultEnv, result, tmp, type Env } from './fixtures.js';
 
 const REMOTE = 'https://github.com/acme/demo.git';
@@ -124,6 +125,7 @@ async function deliver(env: SEnv, id: string, file = 'a.txt', content = `work ${
 /** Lands a commit on origin's main from the other clone; returns the new base. */
 function landOnMain(env: SEnv, file: string, content: string): string {
   gitSync(env.other, 'pull', '-q', '--ff-only', 'origin', 'main');
+  mkdirSync(dirname(join(env.other, file)), { recursive: true });
   writeFileSync(join(env.other, file), content);
   gitSync(env.other, 'add', file);
   gitSync(env.other, 'commit', '-q', '-m', `main: ${file}`);
@@ -486,7 +488,7 @@ describe('merge gate: derived approval is checked structurally (pure)', () => {
   const link = (head: string, from: string, over: Partial<DerivedApproval['links'][0]['checks']> = {}) =>
     ({ head, from, base: sha('b'), checks: { record: true, parents: true, ancestry: true, tree: true, revision: true, ...over }, problems: [] });
   const gate = (derived: DerivedApproval | undefined, reviewed = false) => evaluateMergeGate({
-    config: scanEnv().config, approvedHead: sha('2'), reviewed, ...(derived ? { derived } : {}), ci: { ...ci, head: sha('2') },
+    config: scanEnv().config, approvedHead: sha('2'), reviewed, taskStatus: 'delivered', ...(derived ? { derived } : {}), ci: { ...ci, head: sha('2') },
     pr: { headRefOid: sha('2'), baseRefName: 'main', isDraft: false }, paths: { ok: true, changedPaths: ['a.txt'], sensitivePaths: [] }, approval: () => ({ ok: true }),
   });
   it('accepts a contiguous verified chain ending at reviewer evidence and refuses anything else', () => {
@@ -510,5 +512,158 @@ describe('boundedScan (after work record / release)', () => {
     const r = await boundedScan(async (deadline) => { seen = deadline; return { state: 'ran', prs: 0, tasks: [], message: 'ok' }; }, 60_000, () => 1000);
     expect(r).toMatchObject({ state: 'ran', message: 'ok' });
     expect(seen).toBe(61_000);
+  });
+});
+
+describe('merge attributes outside the commits\' trees never count (isolated merge-tree)', () => {
+  /** The PR and main each add sub/s.txt with a different last line: a real conflict. */
+  async function conflicting(env: SEnv) {
+    const d = await deliver(env, 'task-1', 'sub/s.txt', 'l1\nl2\nBRANCH\n');
+    const B = landOnMain(env, 'sub/s.txt', 'l1\nl2\nMAIN\n');
+    d.pr.mergeStateStatus = 'DIRTY';
+    d.pr.mergeable = 'CONFLICTING';
+    return { ...d, B };
+  }
+  /** What an agent can write in the runtime checkout: an untracked, nested .gitattributes with merge=union. */
+  const plantUnion = (env: SEnv) => writeFileSync(join(env.layout.repo, 'sub', '.gitattributes'), 's.txt merge=union\n');
+
+  it('regression: an untracked nested .gitattributes (and the index, info/attributes, merge.default) in the checkout does not make a conflict clean', async () => {
+    const env = scanEnv();
+    const { head: H, branch, B } = await conflicting(env);
+    expect(action(await scan(env), 'task-1')).toMatchObject({ action: 'conflict', conflictFiles: ['sub/s.txt'] });
+
+    mkdirSync(join(env.layout.repo, 'sub'), { recursive: true });
+    plantUnion(env);
+    // Plain git in the checkout follows it (the defect this guards against): the merge is "clean" there.
+    expect(gitSync(env.layout.repo, 'merge-tree', '--write-tree', H, B)).toMatch(/^[0-9a-f]{40}$/);
+    let s = await scan(env);
+    expect(action(s, 'task-1')).toMatchObject({ action: 'conflict', conflictFiles: ['sub/s.txt'], base: B });
+
+    // The same through the checkout's index, .git/info/attributes and the repository config.
+    gitSync(env.layout.repo, 'add', '-f', 'sub/.gitattributes');
+    writeFileSync(join(env.layout.repo, '.git', 'info', 'attributes'), 'sub/s.txt merge=union\n');
+    gitSync(env.layout.repo, 'config', 'merge.default', 'union');
+    s = await scan(env);
+    expect(action(s, 'task-1')).toMatchObject({ action: 'conflict', conflictFiles: ['sub/s.txt'] });
+
+    // Nothing was updated, recorded or pushed.
+    expect(bareHead(env, branch)).toBe(H);
+    expect(env.db.publication('task-1')!.head_sha).toBe(H);
+    expect(env.db.evidenceOfKind('task-1', BASE_UPDATE_KIND)).toHaveLength(0);
+    expect(env.db.events('task-1', 'base-update')).toHaveLength(0);
+  });
+
+  it('a union-merged H\' made by git in the checkout never gets the derived approval (merge gate re-check is isolated too)', async () => {
+    const env = scanEnv();
+    const { head: H, branch, pr, B } = await conflicting(env);
+    gitSync(env.layout.repo, 'fetch', '-q', 'origin', '+refs/heads/main:refs/remotes/origin/main');
+    mkdirSync(join(env.layout.repo, 'sub'), { recursive: true });
+    plantUnion(env);
+    const t = gitSync(env.layout.repo, 'merge-tree', '--write-tree', H, B);
+    const H2 = gitSync(env.layout.repo, 'commit-tree', t, '-p', H, '-p', B, '-m', 'union merge');
+    env.db.addEvidence({ task_id: 'task-1', head_sha: H2, kind: BASE_UPDATE_KIND, config_revision: env.config.configRevision, outcome: 'prepared', details_json: JSON.stringify({ from: H, base: B, tree: t }) });
+    gitSync(env.layout.repo, 'push', '-q', 'origin', `${H2}:refs/heads/${branch}`);
+    expect(env.db.movePublicationHead('task-1', H, H2)).toBe(true);
+    pr.mergeStateStatus = 'BLOCKED';
+    pr.mergeable = 'MERGEABLE';
+    pr.rollup[H2] = passing;
+    const r = await sync(env);
+    expect(r.tasks[0]!.merge?.state).toBe('waiting');
+    const m = await env.sched.autoMerge('task-1');
+    expect(m.state).toBe('waiting');
+    expect(m.reasons.join(' ')).toMatch(/derived approval refused: .*conflicts \(sub\/s\.txt\)/);
+    expect(env.gh.merges().filter((c) => c.includes('--auto'))).toHaveLength(0);
+  });
+});
+
+describe('merge gate: the task status must be readable', () => {
+  it('refuses to arm when the backlog read fails (fail closed), arms once it is readable', async () => {
+    const env = scanEnv();
+    const { head: H, pr } = await deliver(env, 'task-1');
+    pr.rollup[H] = passing;
+    const spy = vi.spyOn(env.backlog, 'getTask').mockRejectedValue(new Error('backlog unavailable'));
+    const m = (await sync(env)).tasks[0]!.merge!;
+    spy.mockRestore();
+    expect(m.state).toBe('waiting');
+    expect(m.reasons).toEqual(['the task status could not be read from the backlog']); // CI and review pass
+    expect(env.gh.merges()).toHaveLength(0);
+    expect((await sync(env)).tasks[0]!.merge?.state).toBe('armed');
+  });
+});
+
+describe('boundedScan cancels the scan at the budget', () => {
+  it('aborts the signal: an in-flight child is killed, not just abandoned', async () => {
+    let sig: AbortSignal | undefined;
+    let child: Promise<RunResult> | undefined;
+    const t0 = Date.now();
+    const r = await boundedScan((_deadline, signal) => {
+      sig = signal;
+      child = runCmd('sleep', ['30'], { signal, allowFailure: true });
+      return child.then((): ScanReport => ({ state: 'ran', prs: 0, tasks: [], message: 'late' }));
+    }, 50);
+    expect(r.state).toBe('budget');
+    expect(sig!.aborted).toBe(true);
+    const c = await child!;
+    expect(c).toMatchObject({ aborted: true, code: 130 });
+    expect(Date.now() - t0).toBeLessThan(10_000);
+    // abortableGit spawns nothing once aborted.
+    expect(await abortableGit(sig!)(process.cwd(), ['--version'], true)).toMatchObject({ aborted: true, code: 130 });
+  });
+
+  it('an aborted scan stops before the next task: no base update is started', async () => {
+    const env = scanEnv();
+    const { head: H, branch } = await deliver(env, 'task-1');
+    landOnMain(env, 'main.txt', 'x\n');
+    env.gh.prs[0]!.mergeStateStatus = 'BEHIND';
+    const ctl = new AbortController();
+    ctl.abort();
+    const s = await runPrScan({ ...scanDeps(env), signal: ctl.signal });
+    expect(s.state).toBe('budget');
+    expect(action(s, 'task-1')).toMatchObject({ action: 'deferred', message: expect.stringMatching(/aborted/) });
+    expect(bareHead(env, branch)).toBe(H);
+    expect(env.db.publication('task-1')!.head_sha).toBe(H);
+  });
+});
+
+describe('withIsolatedRepo / mergeTree on fixture repos', () => {
+  /** base -> (ours, theirs) each changing f.txt's last line (conflict) or different files (clean). */
+  function repoWith(format: 'sha1' | 'sha256', conflict: boolean) {
+    const repo = join(tmp('minions-iso-repo-'), 'r');
+    execFileSync('git', ['init', '-q', '-b', 'main', `--object-format=${format}`, repo]);
+    commitFile(repo, 'sub/f.txt', 'l1\nl2\n');
+    gitSync(repo, 'checkout', '-q', '-b', 'ours');
+    const ours = commitFile(repo, conflict ? 'sub/f.txt' : 'o.txt', 'l1\nl2\nOURS\n');
+    gitSync(repo, 'checkout', '-q', 'main');
+    const theirs = commitFile(repo, conflict ? 'sub/f.txt' : 't.txt', 'l1\nl2\nTHEIRS\n');
+    writeFileSync(join(repo, 'sub', '.gitattributes'), 'f.txt merge=union\n'); // untracked, in the checkout
+    return { repo, ours, theirs };
+  }
+  const hardened: GitFn = (cwd, args, allow) => hardenedGit(cwd, args, !!allow);
+
+  for (const format of ['sha1', 'sha256'] as const) {
+    it(`${format}: clean merges write the tree into the repository's object store; checkout attributes are ignored (container and host git)`, async () => {
+      for (const g of [realGit, hardened]) {
+        const c = repoWith(format, false);
+        const mt = await mergeTree(g, c.repo, c.ours, c.theirs);
+        expect(mt.state).toBe('clean');
+        if (mt.state !== 'clean') continue;
+        expect(gitSync(c.repo, 'cat-file', '-t', mt.tree)).toBe('tree'); // commit-tree in the repo can use it
+        const x = repoWith(format, true);
+        expect(await mergeTree(g, x.repo, x.ours, x.theirs)).toMatchObject({ state: 'conflict', files: ['sub/f.txt'] });
+      }
+    });
+  }
+
+  it('leaves no temporary directory behind and refuses GIT_ATTR_SOURCE in the environment', async () => {
+    const c = repoWith('sha1', false);
+    let dir = '';
+    await withIsolatedRepo(realGit, c.repo, async (iso) => { dir = iso.dir; expect(existsSync(dir)).toBe(true); });
+    expect(existsSync(dirname(dir))).toBe(false);
+    expect(attributeEnvProblems({ GIT_ATTR_SOURCE: 'HEAD' })).toEqual(['GIT_ATTR_SOURCE is set in the environment']);
+    expect(attributeEnvProblems({})).toEqual([]);
+    process.env.GIT_ATTR_SOURCE = 'HEAD';
+    try {
+      expect(await mergeTree(realGit, c.repo, c.ours, c.theirs)).toMatchObject({ state: 'refused', message: expect.stringMatching(/GIT_ATTR_SOURCE/) });
+    } finally { delete process.env.GIT_ATTR_SOURCE; }
   });
 });

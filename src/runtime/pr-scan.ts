@@ -2,7 +2,8 @@
 // decision 4, task-68.3).
 //
 // - One `gh pr list --state open` read per scan, matched to `delivered` tasks by URL. Runs in `minions sync`,
-//   after `work record` / `work release` (bounded, a `scan` field that never changes the record outcome) and,
+//   after `work record` / `work release` (bounded: 60 s, then an abort kills in-flight git/gh; a `scan` field
+//   that never changes the record outcome) and,
 //   once it exists, in the routine pass (task-68.2 calls runPrScan). Only with pull-request delivery on
 //   GitHub and delivery.merge "auto-when-eligible"; otherwise it is off and reads nothing.
 // - Only tasks without an active lease, whose PR is at the approved publication head, are acted on:
@@ -82,8 +83,14 @@ export interface ScanDeps {
   now?: () => Date;
   /** Epoch ms after which no new base update starts (the 60 s budget after record/release). */
   deadline?: number;
+  /**
+   * Aborted when the budget is over (boundedScan): no further task is scanned and gh calls get it (the
+   * caller passes a `git` that is killed by it too, worktree.ts abortableGit).
+   */
+  signal?: AbortSignal;
 }
 
+const sig = (d: ScanDeps) => (d.signal ? { signal: d.signal } : {});
 const short = (s: string) => redact(s.trim().split('\n').slice(-3).join(' | ')).slice(0, 400);
 const upper = (s: unknown) => String(s ?? '').toUpperCase();
 
@@ -109,7 +116,7 @@ export async function runPrScan(d: ScanDeps, opts: { taskIds?: string[] } = {}):
   const origin = await githubOrigin(d.git, d.repo);
   if (!origin) return { state: 'off', prs: 0, tasks: [], message: 'PR scan off: origin is not a github.com repository.' };
 
-  const r = await d.gh(['pr', 'list', '--repo', origin.repository, '--state', 'open', '--limit', '200', '--json', PR_SCAN_FIELDS], { cwd: GH_CWD });
+  const r = await d.gh(['pr', 'list', '--repo', origin.repository, '--state', 'open', '--limit', '200', '--json', PR_SCAN_FIELDS], { cwd: GH_CWD, ...sig(d) });
   if (r.code !== 0) {
     const message = `gh pr list failed: ${short(r.stderr || r.stdout) || `exit ${r.code}`}`;
     d.db.addEvent('pr-scan', null, { state: 'failed', error: message, code: classifyFailure(r.stderr) });
@@ -133,6 +140,7 @@ export async function runPrScan(d: ScanDeps, opts: { taskIds?: string[] } = {}):
   let budgetHit = false;
   for (const { t, pub } of order) {
     if (want && !want.has(t.id)) continue;
+    if (d.signal?.aborted) { budgetHit = true; out.push({ taskId: t.id, prUrl: t.prUrl!, head: pub?.head_sha ?? null, mergeStateStatus: byUrl.get(t.prUrl!)!.mergeStateStatus ?? null, action: 'deferred', message: 'scan budget exhausted (aborted); the next pass continues' }); continue; }
     const pr = byUrl.get(t.prUrl!)!;
     const res = await scanOne(ctx, t, pub, pr, leased.has(t.id))
       .catch((e: unknown): ScanTaskResult => ({ taskId: t.id, prUrl: t.prUrl!, head: pub?.head_sha ?? null, mergeStateStatus: pr.mergeStateStatus ?? null, action: 'skipped', message: `scan failed: ${short(String((e as Error)?.message ?? e))}` }));
@@ -225,7 +233,7 @@ async function disarmIfOurs(x: Ctx, task: Task, pub: PublicationRow, why: string
   const { d } = x;
   const history = d.db.evidenceOfKind(task.id, 'merge');
   if (!armedByMinions(history)) return null;
-  const r = await d.gh(['pr', 'merge', task.prUrl!, '--disable-auto'], { cwd: GH_CWD });
+  const r = await d.gh(['pr', 'merge', task.prUrl!, '--disable-auto'], { cwd: GH_CWD, ...sig(d) });
   if (r.code !== 0) {
     const err = `gh pr merge --disable-auto failed: ${short(r.stderr || r.stdout) || `exit ${r.code}`}`;
     d.db.addEvent('merge', task.id, { state: 'failed', head: pub.head_sha, prUrl: task.prUrl, error: err });
@@ -352,15 +360,21 @@ export interface ScanField { state: ScanReport['state'] | 'error'; message: stri
 
 /**
  * The scan after `work record` / `work release`: bounded (default 60 s), never throws, never changes the
- * record outcome. The deadline stops new base updates; the timer only bounds what the caller waits for.
+ * record outcome. The deadline stops new base updates; at the budget the signal aborts, which kills the
+ * scan's in-flight git and gh children (SIGTERM, then SIGKILL after 2 s) and stops it before the next
+ * task, and the caller stops waiting. A push killed mid-way is the crash window the next scan adopts.
  */
-export async function boundedScan(run: (deadline: number) => Promise<ScanReport>, budgetMs = SCAN_AFTER_SLOT_BUDGET_MS, now: () => number = Date.now): Promise<ScanField> {
+export async function boundedScan(run: (deadline: number, signal: AbortSignal) => Promise<ScanReport>, budgetMs = SCAN_AFTER_SLOT_BUDGET_MS, now: () => number = Date.now): Promise<ScanField> {
   const deadline = now() + budgetMs;
+  const ctl = new AbortController();
   let timer: NodeJS.Timeout | undefined;
-  const timeout = new Promise<ScanField>((resolve) => { timer = setTimeout(() => resolve({ state: 'budget', message: `PR scan stopped waiting after ${Math.round(budgetMs / 1000)} s; the next pass continues.` }), budgetMs); timer.unref?.(); });
+  const timeout = new Promise<ScanField>((resolve) => {
+    timer = setTimeout(() => { ctl.abort(); resolve({ state: 'budget', message: `PR scan stopped after ${Math.round(budgetMs / 1000)} s (in-flight git/gh calls cancelled); the next pass continues.` }); }, budgetMs);
+    timer.unref?.();
+  });
   try {
     return await Promise.race([
-      run(deadline).then((r): ScanField => ({ state: r.state, message: r.message, report: r }), (e: unknown): ScanField => ({ state: 'error', message: `PR scan failed: ${short(String((e as Error)?.message ?? e))}` })),
+      Promise.resolve().then(() => run(deadline, ctl.signal)).then((r): ScanField => ({ state: r.state, message: r.message, report: r }), (e: unknown): ScanField => ({ state: 'error', message: `PR scan failed: ${short(String((e as Error)?.message ?? e))}` })),
       timeout,
     ]);
   } finally { if (timer) clearTimeout(timer); }

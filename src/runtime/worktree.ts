@@ -33,6 +33,12 @@ export const git = (cwd: string, args: string[], allowFailure = false) =>
     ? hardenedGit(cwd, args, allowFailure)
     : run('git', args, { cwd, allowFailure, timeoutMs: 120_000, env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } });
 
+/** `git` whose children are killed when `signal` aborts (SIGTERM, then SIGKILL); after the abort nothing is spawned. */
+export const abortableGit = (signal: AbortSignal) => (cwd: string, args: string[], allowFailure = false) =>
+  isHostRuntime()
+    ? hardenedGit(cwd, args, allowFailure, { signal })
+    : run('git', args, { cwd, allowFailure, timeoutMs: 120_000, signal, env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } });
+
 async function revParse(repo: string, ref: string): Promise<string | null> {
   const r = await git(repo, ['rev-parse', '--verify', '--quiet', `${ref}^{commit}`], true);
   return r.code === 0 ? r.stdout.trim() : null;
