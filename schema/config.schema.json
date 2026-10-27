@@ -170,6 +170,13 @@
                 "closed",
                 "all"
               ]
+            },
+            "readyLabels": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "^[^,\\r\\n]+$"
+              }
             }
           },
           "required": [
@@ -1112,6 +1119,27 @@
         "timezone": {
           "type": "string",
           "minLength": 1
+        },
+        "autoPromote": {
+          "type": "object",
+          "properties": {
+            "perDay": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "maxBudgetPercent": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 100
+            },
+            "ownerSilentDays": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            }
+          },
+          "additionalProperties": false
         }
       },
       "additionalProperties": false

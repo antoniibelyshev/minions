@@ -18,6 +18,7 @@ import { configuredPermissionMode } from '../runtime/coordinator.js';
 import { controlsTable } from '../runtime/controls.js';
 import { NOTIFICATION_KINDS } from '../runtime/outbox.js';
 import { routineSettings } from '../runtime/routine.js';
+import { autoPromoteSettings, NEEDS_OWNER_LABEL } from '../runtime/auto-promote.js';
 import { POLLER_RECOVERY_HINT } from '../telegram/isolation.js';
 import { contextResetSettings, HANDOFF_MAX_BYTES, RESET_RESTART_COMMAND } from '../runtime/context-reset.js';
 
@@ -296,6 +297,15 @@ function permissionModeGuidance(cfg: MinionsConfig): string {
  * reporting, polls, testing, merging and the channel rule live in their own sections, and the
  * orchestrate skill points here instead of repeating them.
  */
+/** Own ideas (task-68.6, unattended-delivery decision 8): runtime-capped promotion of agent-hypothesis tasks. */
+function ownIdeasRule(cfg: MinionsConfig): string {
+  const a = autoPromoteSettings(cfg);
+  const caps = a.perDay === 0
+    ? 'Auto-promotion is off in this project (`routine.autoPromote.perDay` 0): they stay `idea` until the owner says go.'
+    : `The runtime refuses \`--status ready\` on one (\`POLICY_DENIED\`, "Auto-promotion refused") beyond ${a.perDay} a day, at ${a.maxBudgetPercent}% budget or more, when the owner has been silent for more than ${a.ownerSilentDays} days, or when its parent is labelled \`${NEEDS_OWNER_LABEL}\`.`;
+  return `- **Own ideas.** Label a design task \`${NEEDS_OWNER_LABEL}\` until the owner agrees to it, and remove the label only on their yes. Tasks from your own guesses (QA findings, follow-ups, split children: provenance \`agent-hypothesis\`) start as \`idea\`. ${caps} On a refusal leave the task as \`idea\` and put it to the owner as a digest question; never change its provenance or labels to get around the caps. Pass \`--owner-approved\` only right after the owner asked for that very task (it needs an owner message in the last 30 minutes). Every auto-promotion is listed in the digest; when the owner replies "cancel <id>" set it \`cancelled\`, "hold <id>" set it back to \`idea\`. Owner requests and imported issues are not capped.`;
+}
+
 function ownerDefaults(cfg: MinionsConfig): string {
   const level = (e: string | undefined) => (e ? `\`${e}\`` : 'default');
   const efforts = WORKER_ROLES.map((r) => `${r} ${level(roleEffort(cfg, r))}`).join(', ');
@@ -499,6 +509,7 @@ function baseVars(cfg: MinionsConfig): Record<string, string> {
     reportingGuidance: reportingGuidance(cfg),
     decisionGuidance: decisionGuidance(),
     ownerDefaults: ownerDefaults(cfg),
+    ownIdeasRule: ownIdeasRule(cfg),
     integrationRule: integrationRule(cfg),
     reportingRule: reportingRule(cfg),
     packageVersion: cfg.packageVersion,

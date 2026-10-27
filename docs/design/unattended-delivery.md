@@ -1,7 +1,7 @@
 # Unattended delivery: daily routine, PR scan, autonomous intake: design
 
 Status: **agreed** (task-68.1; the owner approved every recommended answer, Telegram msgs 320/321, and set the
-timezone, msg 322: see [Owner answers](#owner-answers)). Phase 1 (routine pass and clock) is built in task-68.2, phase 4 (digest and held questions) in task-68.5. Epic: task-68. Related: [coordinator-sessions.md](coordinator-sessions.md)
+timezone, msg 322: see [Owner answers](#owner-answers)). Phase 1 (routine pass and clock) is built in task-68.2, phase 4 (digest and held questions) in task-68.5, phase 5 (autonomous intake limits) in task-68.6. Epic: task-68. Related: [coordinator-sessions.md](coordinator-sessions.md)
 (task-57: supervisor, token baseline), [host-manager.md](host-manager.md) (task-53: manager loop and its supervisor),
 [bootstrap.md, CI-gated auto-merge](bootstrap.md#ci-gated-auto-merge), [roles-and-workflows.md](roles-and-workflows.md)
 (stage machine).
@@ -441,6 +441,34 @@ days until phase 4 adds `routine.timezone`.
   the last one and the held count; `minions status` shows the same line when the routine is on.
 - **Budget:** at 100% only the digest wakes the coordinator (crash starts are refused too); wake sessions are
   measured coordinator sessions, so their tokens count in the spend tally and the budget.
+
+### Phase 5 as built (task-68.6)
+
+- **Ready labels** (`src/runtime/intake-sync.ts`, `importStatus`): `intake.github.readyLabels` (host-owned, live,
+  default unset = `[]`). A new issue that carries every label in the list (compared case-insensitively, as GitHub
+  does) is created `ready`, otherwise `idea`. The import decides once: a label added after the import does not
+  promote the task. The sync report has `createdReady`, and the `intake-import` event records the status.
+- **Caps** (`src/runtime/auto-promote.ts`): `routine.autoPromote.{perDay, maxBudgetPercent, ownerSilentDays}`
+  (host-owned, live, defaults 3 / 80 / 3). They apply whether or not `routine.enabled` is on. The runtime installs a
+  guard in `backlog update` and `backlog create`. A change is capped when the task is `agent-hypothesis`, the target
+  is `ready`, the task is not already `ready`, and it has never had a lease. So `idea → ready`,
+  `blocked → ready` on an idea that never ran, and `create --status ready` are all capped. A task that goes back to
+  `ready` after a stage (recover) is not. The guard refuses (`POLICY_DENIED`, "Auto-promotion refused: …", with every
+  reason in `details.refusal.reasons`) when:
+  - the day's `auto-promote` events (local day in `routine.timezone`) reach `perDay` (0 = never);
+  - the budget percent is at or above `maxBudgetPercent`;
+  - the last owner message (Stop-hook meta, Telegram only) is more than `ownerSilentDays` old, **or unknown**
+    (fail closed);
+  - the parent, or the task itself, carries `needs-owner`.
+
+  A refusal records `auto-promote-refused`. An allowed promotion records `auto-promote` after the status change
+  lands, and the digest lists it. A budget read error fails the command (closed).
+- **Owner override:** `--owner-approved` on `backlog update|create` skips the caps. It is allowed only when an owner
+  message arrived in the last 30 minutes, or on the `terminal` channel. It records `owner-promote`, which is not
+  counted and not listed as an auto-promotion.
+- **Prompt:** the coordinator's Project policy carries the "Own ideas" rule with the configured numbers: on a
+  refusal, leave the task `idea` and ask in the digest; never relabel or change provenance; answer "cancel/hold
+  <id>"; label a design `needs-owner` until the owner agrees. The intake skill mentions the caps and the ready labels.
 
 ## Open questions for the owner (answered above)
 
