@@ -157,8 +157,9 @@ export function codexPrompt(input: LaunchInput): string {
     `Your checkout: ${input.checkout}. Brief: ${input.briefFile}. Result file: ${input.resultFile}.`,
     'Nobody answers questions or approves actions during this run. Do not use the network except for the model.',
     ...(guide ? [guide] : []),
-    'On Codex your final message is your result: make it exactly one WorkerResult JSON object (it is checked against',
-    'a JSON schema; use null for optional fields that do not apply). The runner stores it; you need not write the result file.',
+    'On Codex your final message is your result: make it your WorkerResult as a single JSON object (it is checked against',
+    'a JSON schema; use null for optional fields that do not apply). Writing the same object to $MINIONS_RESULT_FILE is',
+    'optional; a result file wins over the final message, so write it only with the complete result.',
     '',
     input.instructions,
   ].join('\n');

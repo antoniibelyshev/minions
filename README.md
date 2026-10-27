@@ -733,7 +733,7 @@ first or pass `--base-url <url>`. The container reaches the local Central proxy 
 minions auth set helper --refresh-minutes 15 -- /usr/local/bin/print-anthropic-key --profile work
 minions auth set api-key --keychain-service anthropic --keychain-account "$USER"
 minions auth refresh            # re-run the helper / re-read the source now
-minions auth show [--json]      # method, source, masked env, key file status and last refresh; never the key
+minions auth show [--json]      # method, source, masked env, key file status, last refresh and the Codex key status; never a key
 ```
 
 **Global default:** `minions auth set <method> … --global` writes `<MINIONS_HOME>/defaults.json`

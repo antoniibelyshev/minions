@@ -1042,7 +1042,10 @@ static int supervise(pid_t child, const sigset_t *waitset, int listener) {
       struct signalfd_siginfo ssi;
       while (read(sfd, &ssi, sizeof ssi) == (ssize_t)sizeof ssi) {
         int sig = (int)ssi.ssi_signo;
-        if ((sig == SIGTERM || sig == SIGINT || sig == SIGHUP) && !terminating) {
+        /* SIGINT is the runner's graceful stop: it signals the whole group, so the harness already has it (Codex
+         * ends its turn on SIGINT, agent-runtimes U-C4). The wrapper waits for the SIGTERM that follows. */
+        if (sig == SIGINT) continue;
+        if ((sig == SIGTERM || sig == SIGHUP) && !terminating) {
           terminating = 1;
           deadline = now_ms() + GRACE_SECONDS * 1000LL;
           signal_tree(SIGTERM);
