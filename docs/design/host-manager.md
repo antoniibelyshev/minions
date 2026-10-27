@@ -100,15 +100,10 @@ the existing delegate mechanism (`src/host/delegate.ts`). Each exec has a timeou
 anything over either is dropped and reported as a project error, since the output is untrusted. It gets no new mount and no host-visible file under
 `/state`. A file queue on a host bind mount was rejected: it would be the first host path the container can write.
 
-<<<<<<< HEAD
 **From the owner (manager chat).** The manager accepts a fixed set of commands. Without the optional assistant it
 answers everything else with the help text; with it, plain text (no leading `/`) goes to the assistant (see
-[Natural-language assistant](#natural-language-assistant-task-65)):
-=======
-**From the owner (manager chat).** The manager accepts a fixed set of commands and ignores everything else (it replies
-with the help text). Task-65 proposes sending non-command text to a Claude assistant instead, which falls back to
-the help text ([host-manager-assistant.md](host-manager-assistant.md)):
->>>>>>> main
+[Natural-language assistant](#natural-language-assistant-task-65) and the full design in
+[host-manager-assistant.md](host-manager-assistant.md)), which falls back to the help text:
 
 | Command | Does |
 | - | - |
