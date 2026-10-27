@@ -63,8 +63,10 @@ describe('exec', () => {
 
   it('an abort escalates to SIGKILL after the grace when the child ignores SIGTERM', async () => {
     const ctl = new AbortController();
-    const p = run('node', ['-e', 'process.on("SIGTERM",()=>{}); console.log("up"); setInterval(()=>{}, 1000)'], { allowFailure: true, signal: ctl.signal, timeoutMs: 60_000 });
-    await new Promise((res) => setTimeout(res, 300)); // let node install the handler
+    // The child marks a file once its handler is installed: a fixed wait races a slow node start on a busy host.
+    const ready = join(await mkdtemp(join(tmpdir(), 'minions-exec-')), 'ready');
+    const p = run('node', ['-e', 'process.on("SIGTERM",()=>{}); require("fs").writeFileSync(process.argv[1], ""); setInterval(()=>{}, 1000)', ready], { allowFailure: true, signal: ctl.signal, timeoutMs: 60_000 });
+    for (let i = 0; i < 200 && !(await stat(ready).then(() => true, () => false)); i++) await new Promise((res) => setTimeout(res, 25));
     const t = Date.now();
     ctl.abort();
     const r = await p;
