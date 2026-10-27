@@ -49,10 +49,24 @@ const checkoutOf = (r: Rig, b: TaskBrief) => join(r.paths.scratch, b.leaseId, 'w
 const submitted = (r: Rig, b: TaskBrief) => JSON.parse(readFileSync(submissionPath(r.paths, b.leaseId), 'utf8')) as Record<string, unknown> & { status: string; findings: string[]; headSha: string };
 const headOf = (r: Rig, branch: string) => gitSync(r.layout.repo, 'rev-parse', `refs/heads/${branch}`);
 
+/**
+ * Wall-clock limit for the timeout tests whose harness must install signal handlers (or write a file) before
+ * the stop. The limit runs from spawn, so with 300-400 ms a node start slowed by a loaded machine got the
+ * SIGINT before its handlers and died of it (task-93). Generous on purpose; the stop sequence after it is
+ * what the tests assert.
+ */
+const HANDLERS_TIMEOUT_MS = 2_500;
+
+/** Polls until the file exists, up to a deadline; false if it never appears. */
+async function waitForFile(path: string, deadlineMs = 20_000): Promise<boolean> {
+  for (const until = Date.now() + deadlineMs; Date.now() < until;) { if (existsSync(path)) return true; await sleep(25); }
+  return existsSync(path);
+}
+
 /** Starts a run and waits until the worker is spawned. */
 async function running(r: Rig, b: TaskBrief, steps: unknown[]) {
   const p = runLease(b.leaseId, r.deps({ steps }));
-  for (let i = 0; i < 100; i++) {
+  for (const until = Date.now() + 20_000; Date.now() < until;) {
     const rec = await readRunRecord(r.paths.state, b.leaseId);
     if (rec?.phase === 'running') return { p, rec };
     await sleep(50);
@@ -198,11 +212,12 @@ describe('work run: launch gate', () => {
   });
 });
 
-describe('work run: supervise, cancel, timeout, drain', () => {
+// Real subprocesses (git, the node fake harness, its children) with second-scale timings: a limit above the default 5 s.
+describe('work run: supervise, cancel, timeout, drain', { timeout: 30_000 }, () => {
   it('timeout: the worker (ignoring SIGTERM) is killed, the runner commits wip: and submits partial', async () => {
     const r = rig();
     const b = await claim(r);
-    const out = await runLease(b.leaseId, r.deps({ steps: [{ op: 'ignoreTerm' }, { op: 'write', path: 'wip.txt', content: 'half\n' }, { op: 'sleep', ms: 30_000 }] }, { timing: { timeoutMs: 400, pollMs: 50, killGraceMs: 300, drainGraceMs: 100 } }));
+    const out = await runLease(b.leaseId, r.deps({ steps: [{ op: 'ignoreTerm' }, { op: 'write', path: 'wip.txt', content: 'half\n' }, { op: 'sleep', ms: 30_000 }] }, { timing: { timeoutMs: HANDLERS_TIMEOUT_MS, pollMs: 50, killGraceMs: 300, drainGraceMs: 100 } }));
     expect(out).toMatchObject({ submitted: true, status: 'partial', exit: { stopped: 'timeout' } });
     expect(out.wipCommit).toBe(headOf(r, b.branch));
     expect(gitSync(r.layout.repo, 'log', '-1', '--format=%an %s', out.wipCommit!)).toBe('minions-runner wip: runner checkpoint (timeout)');
@@ -215,7 +230,7 @@ describe('work run: supervise, cancel, timeout, drain', () => {
     const b = await claim(r);
     const log = join(r.root, 'signals.log');
     const out = await runLease(b.leaseId, r.deps({ steps: [{ op: 'logSignals', path: log }, { op: 'sleep', ms: 30_000 }] },
-      { timing: { timeoutMs: 300, pollMs: 50, killGraceMs: 300, interruptGraceMs: 250, drainGraceMs: 100 } }));
+      { timing: { timeoutMs: HANDLERS_TIMEOUT_MS, pollMs: 50, killGraceMs: 300, interruptGraceMs: 250, drainGraceMs: 100 } }));
     expect(out).toMatchObject({ status: 'partial', exit: { stopped: 'timeout', signal: 'SIGKILL' } });
     const lines = readFileSync(log, 'utf8').trim().split('\n').map((l) => l.split(' '));
     expect(lines.map(([sig]) => sig)).toEqual(['SIGINT', 'SIGTERM']);
@@ -235,7 +250,7 @@ describe('work run: supervise, cancel, timeout, drain', () => {
     const b2 = await claim(r);
     const log = join(r.root, 'signals2.log');
     const out2 = await runLease(b2.leaseId, r.deps({ steps: [{ op: 'logSignals', path: log }, { op: 'sleep', ms: 30_000 }] },
-      { timing: { timeoutMs: 300, pollMs: 50, killGraceMs: 300, interruptGraceMs: 60_000, drainGraceMs: 100 } }));
+      { timing: { timeoutMs: HANDLERS_TIMEOUT_MS, pollMs: 50, killGraceMs: 300, interruptGraceMs: 60_000, drainGraceMs: 100 } }));
     expect(out2).toMatchObject({ exit: { stopped: 'timeout', signal: 'SIGKILL' } });
     expect(readFileSync(log, 'utf8').trim().split('\n').map((l) => l.split(' ')[0])).toEqual(['SIGINT', 'SIGTERM']);
   });
@@ -246,7 +261,7 @@ describe('work run: supervise, cancel, timeout, drain', () => {
     const log = join(r.root, 'member-signals.log');
     // The leader ignores both graceful signals (as minions-sandbox ignores SIGINT); only the group member logs them.
     const out = await runLease(b.leaseId, r.deps({ steps: [{ op: 'groupChildLogSignals', path: log }, { op: 'ignoreTerm' }, { op: 'sleep', ms: 30_000 }] },
-      { timing: { timeoutMs: 400, pollMs: 50, killGraceMs: 300, interruptGraceMs: 200, drainGraceMs: 100 } }));
+      { timing: { timeoutMs: HANDLERS_TIMEOUT_MS, pollMs: 50, killGraceMs: 300, interruptGraceMs: 200, drainGraceMs: 100 } }));
     expect(out).toMatchObject({ status: 'partial', exit: { stopped: 'timeout', signal: 'SIGKILL' } });
     expect(readFileSync(log, 'utf8').trim().split('\n')).toEqual(['SIGINT', 'SIGTERM']);
   });
@@ -255,7 +270,11 @@ describe('work run: supervise, cancel, timeout, drain', () => {
     const r = rig();
     const b = await claim(r);
     const log = join(r.root, 'cancel-signals.log');
-    const { p } = await running(r, b, [{ op: 'logSignals', path: log }, { op: 'sleep', ms: 30_000 }]);
+    const ready = join(r.root, 'cancel-ready.pid');
+    const { p } = await running(r, b, [{ op: 'logSignals', path: log }, { op: 'pidfile', path: ready }, { op: 'sleep', ms: 30_000 }]);
+    // 'running' is recorded at spawn: releasing then can SIGINT a node that has not installed its handlers yet
+    // (it dies of the SIGINT, no log). Cancel once the handlers are in (task-93).
+    expect(await waitForFile(ready)).toBe(true);
     await r.sched.release(b.leaseId, 'owner cancel');
     const out = await p;
     expect(out).toMatchObject({ submitted: false, exit: { stopped: 'lease-ended', signal: 'SIGKILL' } });
@@ -282,7 +301,11 @@ describe('work run: supervise, cancel, timeout, drain', () => {
   it('drain: after the grace the worker is stopped with a wip: commit and a partial result', async () => {
     const r = rig();
     const b = await claim(r);
-    const { p } = await running(r, b, [{ op: 'write', path: 'd.txt', content: 'd\n' }, { op: 'sleep', ms: 30_000 }]);
+    const ready = join(r.root, 'drain-ready.pid');
+    const { p } = await running(r, b, [{ op: 'write', path: 'd.txt', content: 'd\n' }, { op: 'pidfile', path: ready }, { op: 'sleep', ms: 30_000 }]);
+    // The drain grace (200 ms) runs from the first poll after the request: drain once the harness wrote d.txt,
+    // so a slow node start cannot leave nothing to checkpoint (task-93).
+    expect(await waitForFile(ready)).toBe(true);
     requestDrain(r.db, r.paths, 'upgrade');
     const out = await p;
     expect(out).toMatchObject({ status: 'partial', exit: { stopped: 'drain' } });
@@ -297,8 +320,7 @@ describe('work run: supervise, cancel, timeout, drain', () => {
     // 'running' is recorded at spawn, before node has loaded the harness. Releasing then removes the lease
     // scratch dir (the worker's cwd) under a still-starting node, which can exit on its own before the
     // runner's next poll (stopped: null). Release only once the harness is really in its sleep.
-    for (let i = 0; i < 100 && !existsSync(workerPid); i++) await sleep(50);
-    expect(existsSync(workerPid)).toBe(true);
+    expect(await waitForFile(workerPid)).toBe(true);
     await r.sched.release(b.leaseId, 'owner cancel');
     const out = await p;
     expect(out).toMatchObject({ submitted: false, exit: { stopped: 'lease-ended' } });
@@ -312,9 +334,10 @@ describe('work run: supervise, cancel, timeout, drain', () => {
     const pidFile = join(r.root, 'grandchild.pid');
     await runLease(b.leaseId, r.deps({ steps: [{ op: 'grandchild', pidFile }, { op: 'result' }] }));
     const pid = Number(readFileSync(pidFile, 'utf8'));
-    await sleep(100);
-    const alive = (() => { try { process.kill(pid, 0); return !/\) Z /.test(readFileSync(`/proc/${pid}/stat`, 'utf8')); } catch { return false; } })();
-    expect(alive).toBe(false);
+    const alive = () => { try { process.kill(pid, 0); return !/\) Z /.test(readFileSync(`/proc/${pid}/stat`, 'utf8')); } catch { return false; } };
+    // The grandchild never exits by itself; poll with a deadline instead of a fixed 100 ms (task-93).
+    for (const until = Date.now() + 10_000; alive() && Date.now() < until;) await sleep(25);
+    expect(alive()).toBe(false);
   });
 });
 
@@ -465,7 +488,7 @@ describe('work run: concurrent writers', () => {
   });
 });
 
-describe('reapRun: orphans and recovery', () => {
+describe('reapRun: orphans and recovery', { timeout: 30_000 }, () => {
   /** Simulates a runner that died (SIGKILL): the record names a process that is gone. */
   function forgeDeadRunner(r: Rig, rec: RunRecord, patch: Partial<RunRecord> = {}) {
     const dead = spawnSync(process.execPath, ['-e', 'console.log(process.pid)'], { encoding: 'utf8' });
@@ -479,8 +502,9 @@ describe('reapRun: orphans and recovery', () => {
   it('runner lost: the wrapper group is killed, post-exit runs with a wip: commit on the branch, the record is done', async () => {
     const r = rig();
     const b = await claim(r);
-    const { p, rec } = await running(r, b, [{ op: 'write', path: 'w.txt', content: 'w\n' }, { op: 'sleep', ms: 60_000 }]);
-    await sleep(200);
+    const ready = join(r.root, 'w-ready.pid');
+    const { p, rec } = await running(r, b, [{ op: 'write', path: 'w.txt', content: 'w\n' }, { op: 'pidfile', path: ready }, { op: 'sleep', ms: 60_000 }]);
+    expect(await waitForFile(ready)).toBe(true); // w.txt is written: there is work in progress to recover (task-93)
     forgeDeadRunner(r, rec);
     const reaped = await reapRun(b.leaseId, { db: r.db, paths: r.paths, env: process.env, escapees: null });
     expect(reaped.action).toBe('recovered');
@@ -495,8 +519,9 @@ describe('reapRun: orphans and recovery', () => {
   it('a record from another boot goes straight to post-exit (no kill attempted)', async () => {
     const r = rig();
     const b = await claim(r);
-    const { p, rec } = await running(r, b, [{ op: 'write', path: 'w.txt', content: 'w\n' }, { op: 'sleep', ms: 60_000 }]);
-    await sleep(200);
+    const ready = join(r.root, 'w-ready.pid');
+    const { p, rec } = await running(r, b, [{ op: 'write', path: 'w.txt', content: 'w\n' }, { op: 'pidfile', path: ready }, { op: 'sleep', ms: 60_000 }]);
+    expect(await waitForFile(ready)).toBe(true); // w.txt is written: there is work in progress to recover (task-93)
     forgeDeadRunner(r, rec, { host: { bootId: 'another-boot', containerStart: '1' } });
     const reaped = await reapRun(b.leaseId, { db: r.db, paths: r.paths, env: process.env, escapees: null });
     expect(reaped).toMatchObject({ action: 'recovered', killed: [] });

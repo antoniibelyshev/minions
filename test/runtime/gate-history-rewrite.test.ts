@@ -21,7 +21,15 @@ function put(repo: string, file: string, content: string) {
   writeFileSync(join(repo, file), content);
   gitSync(repo, 'add', '--', file);
 }
-const commit = (repo: string, msg: string) => { gitSync(repo, 'commit', '-q', '-m', msg); return gitSync(repo, 'rev-parse', 'HEAD'); };
+// Every commit gets the same fixed date. The graft test makes base and head each other's parent (a cycle);
+// git's merge-base walk over that cycle depends on commit dates: with both commits in the same second the
+// plain `base...head` diff is empty (the attack works), a second apart it fails with "no merge base". Real
+// clocks made that a full-suite flake whenever load pushed the two commits into different seconds (task-93).
+const FIXED_DATE = '2026-01-01T00:00:00Z';
+const commit = (repo: string, msg: string) => {
+  execFileSync('git', ['commit', '-q', '-m', msg], { cwd: repo, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, GIT_AUTHOR_DATE: FIXED_DATE, GIT_COMMITTER_DATE: FIXED_DATE } });
+  return gitSync(repo, 'rev-parse', 'HEAD');
+};
 const plainDiff = (repo: string, range: string) => gitSync(repo, 'diff', '--name-only', range);
 
 /** Workspace + bare origin; the branch agent/t changes a workflow on top of the claim base. */
