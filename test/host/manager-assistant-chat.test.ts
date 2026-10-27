@@ -291,6 +291,30 @@ describe('plain text goes to the assistant; slash commands never do', () => {
     expect(s.childRuns[0]!.join(' ')).toContain('execution.maxEngineers 1');
   });
 
+  it('with the assistant on, the same safe command typed by the owner still applies at once (task-78) and never reaches the assistant', async () => {
+    const s = await stack({ reply: () => answer('Fewer engineers at once: check the plan below.', { kind: 'config-set', key: 'execution.maxEngineers', value: '1', layer: 'local' }) });
+    // Assistant first: an offer only, nothing applied.
+    await s.say('only one engineer at a time please');
+    expect(s.calls).toHaveLength(1);
+    expect(s.childRuns).toEqual([]);
+    // Then typed: the submit path, applied without a tap, no second assistant call.
+    (s.m as unknown as { deps: ManagerDeps }).deps.transport = s.t;
+    const { out } = await s.say('/set execution.maxEngineers 1');
+    expect(s.calls).toHaveLength(1);
+    expect(out.every((x) => offerButtons(x).length === 0)).toBe(true);
+    expect(out[0]!.text).toMatch(/^Applying your request ow_[0-9a-f]{8} .*typed by you and it loosens nothing, so no Confirm is needed/);
+    expect(s.childRuns).toHaveLength(1);
+    expect(s.childRuns[0]!.join(' ')).toContain('execution.maxEngineers 1');
+    const offers = journal().filter((e) => e.type === 'offer');
+    expect(offers).toHaveLength(2);
+    expect(offers[0]).toMatchObject({ request: { via: 'assistant' }, plan: { via: 'assistant' } });
+    expect(offers[0].direct).toBeUndefined();
+    expect(offers[1].direct).toBe(true);
+    expect(offers[1].typed).toMatch(J.TYPED_KEY_PATTERN);
+    expect('via' in offers[1].request).toBe(false);
+    expect('via' in offers[1].plan).toBe(false);
+  });
+
   it('an invalid proposal shows the reply and says nothing was planned; approve is refused; nothing is journaled', async () => {
     const s = await stack({ reply: () => answer('Approved!', { kind: 'approve', taskId: 'task-1', head: 'a'.repeat(40), merge: false }) });
     const { out } = await s.say('approve task-1');
