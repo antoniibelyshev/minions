@@ -15,6 +15,7 @@ import { RECOVERY_PROMPT } from '../../src/runtime/coordinator.js';
 import { humanBaseline, humanSpend, spendReport } from '../../src/runtime/spend.js';
 import { defaults } from '../helpers.js';
 import { makeEnv, tmp, type Env } from './fixtures.js';
+import { assistantLine, jsonl, ownerLine, skillBodyLine, slashCommandLine } from './transcript-shapes.js';
 
 const cfg = defaults();
 
@@ -90,6 +91,43 @@ describe('transcript folding', () => {
       { content: [{ type: 'tool_use', name: 'Bash', input: { command: 'minions work claim task-1 --role engineer --json' } }] })]));
     expect(t.recovered).toBe(false);
     expect(t.overhead).toBe(0);
+  });
+
+  it('counts real plugin owner messages (source="plugin:telegram:telegram") and the task-67 form; not text that only mentions a tag', () => {
+    const s = newSessionState('s1', '/x.jsonl', new Date());
+    foldTranscriptLines(s, jsonl([
+      slashCommandLine('minions:orchestrate', ''),
+      assistantLine('m1'),
+      ownerLine("how's it going?"),
+      assistantLine('m2'),
+      ownerLine('ship it', { source: 'telegram' }),
+      user('the owner wrote <channel source="plugin:telegram:telegram" chat_id="1">hi</channel> earlier'),
+      user('<channel source="plugin:slack:slack" chat_id="1">not telegram</channel>'),
+      assistantLine('m3'),
+    ]));
+    expect(s.ownerMessages).toBe(2);
+    expect(s.recovered).toBe(false);
+    expect(s.woken).toBe(false);
+  });
+
+  it('detects recovery and wakes in the expanded slash-command form (any tag order) as well as the raw form', () => {
+    const first = (line: unknown, ...more: unknown[]) => {
+      const s = newSessionState('s', '/x.jsonl', new Date());
+      foldTranscriptLines(s, jsonl([line, ...more, assistantLine('a1')]));
+      return { recovered: s.recovered, woken: s.woken };
+    };
+    const recoverArgs = 'The coordinator was just restarted (minions coordinator restart --recover). First read the previous session\'s handoff.';
+    expect(first(slashCommandLine('minions:recover', recoverArgs), skillBodyLine('# Recover\n...'))).toEqual({ recovered: true, woken: false });
+    expect(first(slashCommandLine('minions:recover', recoverArgs, { order: ['args', 'name', 'message'] }))).toEqual({ recovered: true, woken: false });
+    expect(first(user(RECOVERY_PROMPT))).toEqual({ recovered: true, woken: false });
+    expect(first(slashCommandLine('minions:orchestrate', 'wake'), skillBodyLine('# Orchestrate'))).toEqual({ recovered: false, woken: true });
+    expect(first(slashCommandLine('minions:orchestrate', ' wake\n', { order: ['name', 'args', 'message'] }))).toEqual({ recovered: false, woken: true });
+    expect(first(user('/minions:orchestrate wake'))).toEqual({ recovered: false, woken: true });
+    // Not a wake: other args, no args, another command; not a recovery: a mention inside other text.
+    expect(first(slashCommandLine('minions:orchestrate', 'wake the queue'))).toEqual({ recovered: false, woken: false });
+    expect(first(slashCommandLine('minions:orchestrate', ''))).toEqual({ recovered: false, woken: false });
+    expect(first(slashCommandLine('minions:status', 'wake'))).toEqual({ recovered: false, woken: false });
+    expect(first(user('please run <command-name>/minions:recover</command-name>'))).toEqual({ recovered: false, woken: false });
   });
 
   it('ignores malformed lines and zero-usage (synthetic) messages', () => {

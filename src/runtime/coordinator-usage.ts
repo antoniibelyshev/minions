@@ -52,7 +52,10 @@ export interface CoordinatorSessionState {
   /** Sum and max of the prompt size per turn (input + cache read + cache write). */
   contextSum: number;
   maxContext: number;
-  /** Main-session user turns that start with a `<channel source="telegram"` tag. */
+  /**
+   * Main-session user turns that start with a Telegram channel tag: `<channel source="plugin:telegram:telegram"`
+   * (the plugin) or `<channel source="telegram"` (the task-67 server).
+   */
   ownerMessages: number;
   /** Whether the session started with the recovery prompt (null until its first user message is read). */
   recovered: boolean | null;
@@ -78,9 +81,35 @@ export function newSessionState(sessionId: string, path: string, now: Date, mode
 const isObj = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
 const num = (u: Record<string, unknown>, k: string) => (typeof u[k] === 'number' && Number.isFinite(u[k]) && (u[k] as number) > 0 ? Math.round(u[k] as number) : 0);
 
-const OWNER_TAG = /^\s*<channel\s+source="telegram"/;
+/** Anchored at the start of the turn, so text that merely mentions a channel tag is not an owner message. */
+const OWNER_TAG = /^\s*<channel\s+source="(?:plugin:telegram:)?telegram"/;
 const RECOVER_PREFIX = /^\s*\/minions:recover\b/;
 const WAKE_PREFIX = /^\s*\/minions:orchestrate\s+wake\s*$/;
+/**
+ * Claude Code writes a typed slash command expanded: `<command-message>minions:recover</command-message>`,
+ * `<command-name>/minions:recover</command-name>` and `<command-args>...</command-args>`, in any order. The turn
+ * must start with one of these tags (anchored, like the raw form); the tag values are read wherever they are.
+ */
+const COMMAND_START = /^\s*<command-(?:message|name|args)>/;
+const COMMAND_NAME = /<command-name>([\s\S]*?)<\/command-name>/;
+const COMMAND_ARGS = /<command-args>([\s\S]*?)<\/command-args>/;
+function expandedCommand(text: string): { name: string; args: string } | null {
+  if (!COMMAND_START.test(text)) return null;
+  const name = COMMAND_NAME.exec(text);
+  return name ? { name: (name[1] ?? '').trim(), args: (COMMAND_ARGS.exec(text)?.[1] ?? '').trim() } : null;
+}
+/** The session's first user turn is the recovery prompt: `/minions:recover ...`, raw or expanded. */
+export function isRecoverTurn(text: string): boolean {
+  return RECOVER_PREFIX.test(text) || expandedCommand(text)?.name === '/minions:recover';
+}
+/** The session's first user turn is the routine wake prompt: exactly `/minions:orchestrate wake`, raw or expanded. */
+export function isWakeTurn(text: string): boolean {
+  if (WAKE_PREFIX.test(text)) return true;
+  const c = expandedCommand(text);
+  return c !== null && c.name === '/minions:orchestrate' && c.args === 'wake';
+}
+/** A Telegram owner message: `<channel source="plugin:telegram:telegram"` (the plugin) or `source="telegram"` (task-67). */
+export const isOwnerTurn = (text: string): boolean => OWNER_TAG.test(text);
 /** A claim or a Telegram reply ends a recovered session's reset overhead. */
 const CLAIM_CMD = /\bminions\s+work\s+claim\b/;
 const isReplyTool = (name: string) => /telegram/i.test(name) && /__reply$/.test(name);
@@ -144,8 +173,8 @@ export function foldTranscriptLines(state: CoordinatorSessionState, text: string
   const seen = new Set(state.recentIds);
   for (const it of items) {
     if (it.kind === 'user') {
-      if (state.recovered === null) { state.recovered = RECOVER_PREFIX.test(it.text); state.woken = WAKE_PREFIX.test(it.text); }
-      if (OWNER_TAG.test(it.text)) state.ownerMessages++;
+      if (state.recovered === null) { state.recovered = isRecoverTurn(it.text); state.woken = isWakeTurn(it.text); }
+      if (isOwnerTurn(it.text)) state.ownerMessages++;
       continue;
     }
     if (it.id && seen.has(it.id)) continue;

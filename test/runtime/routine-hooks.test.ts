@@ -19,6 +19,7 @@ import { ROUTINE_EVENT } from '../../src/runtime/routine.js';
 import { humanBaseline, spendReport } from '../../src/runtime/spend.js';
 import { defaults } from '../helpers.js';
 import { makeEnv, tmp } from './fixtures.js';
+import { assistantLine, jsonl, recordOwnerMessageViaStop, skillBodyLine, slashCommandLine } from './transcript-shapes.js';
 
 // ---------------------------------------------------------------- the wrapper clock hook
 
@@ -156,6 +157,23 @@ describe('coordinator usage: wakes and owner messages', () => {
     expect(lastOwnerMessageAt(db)).toBe('2026-10-27T09:05:00.000Z');
     db.setMeta(LAST_OWNER_MESSAGE_META, 'garbage');
     expect(lastOwnerMessageAt(db)).toBeNull();
+  });
+
+  it('real transcript shapes: plugin owner messages set the owner time; expanded /minions:recover and wake count in the baseline', () => {
+    const db = freshDb();
+    const at = new Date('2026-10-27T09:00:00Z');
+    expect(recordOwnerMessageViaStop(db, at)).toMatchObject({ recorded: true });
+    expect(lastOwnerMessageAt(db)).toBe(at.toISOString());
+    expect(readSessionState(db, 'sess-owner')!.ownerMessages).toBe(1);
+    const recoverArgs = 'The coordinator was just restarted (minions coordinator restart --recover). First read the previous session\'s handoff.';
+    track(db, 'sess-r', transcript(jsonl([slashCommandLine('minions:recover', recoverArgs, { sessionId: 'sess-r' }), skillBodyLine('# Recover', 'sess-r'),
+      assistantLine('r1', 5000, undefined, 'sess-r'),
+      assistantLine('r2', 6000, [{ type: 'tool_use', name: 'Bash', input: { command: 'minions work claim task-1 --role engineer --json' } }], 'sess-r')]), 'r.jsonl'), new Date('2026-10-27T09:10:00Z'));
+    track(db, 'sess-w', transcript(jsonl([slashCommandLine('minions:orchestrate', 'wake', { sessionId: 'sess-w' }), assistantLine('w1', 1000, undefined, 'sess-w')]), 'w.jsonl'), new Date('2026-10-27T09:20:00Z'));
+    expect(readSessionState(db, 'sess-r')).toMatchObject({ recovered: true, woken: false, overhead: 5015, overheadDone: true });
+    expect(readSessionState(db, 'sess-w')).toMatchObject({ recovered: false, woken: true });
+    const bl = spendReport({ db, config: cfg, billing: 'subscription', now: new Date('2026-10-27T10:00:00Z') }).coordinator.baseline;
+    expect(bl).toMatchObject({ ownerMessages: 1, resetOverhead: { recoveredSessions: 1, tokens: 5015 }, wakes: { sessions: 1, tokens: 1015 } });
   });
 });
 
