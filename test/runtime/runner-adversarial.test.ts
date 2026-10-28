@@ -46,6 +46,8 @@ async function claim(r: Rig, id = 'task-1'): Promise<TaskBrief> {
 const headOf = (r: Rig, branch: string) => gitSync(r.layout.repo, 'rev-parse', `refs/heads/${branch}`);
 const submitted = (r: Rig, b: TaskBrief) => JSON.parse(readFileSync(submissionPath(r.paths, b.leaseId), 'utf8')) as { status: string; findings: string[]; headSha: string };
 const alive = (pid: number) => { try { process.kill(pid, 0); return !/\) Z /.test(readFileSync(`/proc/${pid}/stat`, 'utf8')); } catch { return false; } };
+/** Alive after a deadline: the processes under test never exit by themselves, so polling only removes a fixed-sleep race (task-93). */
+const aliveAfterKill = async (pid: number) => { for (const until = Date.now() + 10_000; alive(pid) && Date.now() < until;) await sleep(25); return alive(pid); };
 
 /** Every file below `dir` (no symlink following). */
 function filesUnder(dir: string): string[] {
@@ -169,18 +171,19 @@ describe('tester: no secrets in argv', () => {
   });
 });
 
-describe('tester: stopping leaves no process behind', () => {
+describe('tester: stopping leaves no process behind', { timeout: 30_000 }, () => {
   it('timeout: a worker ignoring SIGTERM and its (same-group) grandchild are both gone', async () => {
     const r = rig();
     const b = await claim(r);
     const workerPid = join(r.root, 'worker.pid');
     const gcPid = join(r.root, 'gc.pid');
     const steps = [{ op: 'ignoreTerm' }, { op: 'pidfile', path: workerPid }, { op: 'grandchild', pidFile: gcPid }, { op: 'sleep', ms: 30_000 }];
-    const out = await runLease(b.leaseId, r.deps({ steps }, { timing: { timeoutMs: 700, pollMs: 50, killGraceMs: 300, drainGraceMs: 100 } }));
+    // The limit runs from spawn; the harness must install ignoreTerm and start the grandchild before it, so it
+    // is generous enough for a node start on a loaded machine (task-93).
+    const out = await runLease(b.leaseId, r.deps({ steps }, { timing: { timeoutMs: 2_500, pollMs: 50, killGraceMs: 300, drainGraceMs: 100 } }));
     expect(out).toMatchObject({ status: 'partial', exit: { stopped: 'timeout' } });
-    await sleep(100);
-    expect(alive(Number(readFileSync(workerPid, 'utf8')))).toBe(false);
-    expect(alive(Number(readFileSync(gcPid, 'utf8')))).toBe(false);
+    expect(await aliveAfterKill(Number(readFileSync(workerPid, 'utf8')))).toBe(false);
+    expect(await aliveAfterKill(Number(readFileSync(gcPid, 'utf8')))).toBe(false);
   });
 
   it('cancel by release: the worker and its grandchild are gone and the record is done', async () => {
@@ -193,9 +196,8 @@ describe('tester: stopping leaves no process behind', () => {
     await r.sched.release(b.leaseId, 'owner cancel');
     const out = await p;
     expect(out).toMatchObject({ submitted: false, exit: { stopped: 'lease-ended' } });
-    await sleep(100);
-    expect(alive(Number(readFileSync(workerPid, 'utf8')))).toBe(false);
-    expect(alive(Number(readFileSync(gcPid, 'utf8')))).toBe(false);
+    expect(await aliveAfterKill(Number(readFileSync(workerPid, 'utf8')))).toBe(false);
+    expect(await aliveAfterKill(Number(readFileSync(gcPid, 'utf8')))).toBe(false);
     expect((await readRunRecord(r.paths.state, b.leaseId))?.phase).toBe('done');
   });
 

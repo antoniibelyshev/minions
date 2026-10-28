@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { BacklogMdAdapter } from '../../src/backlog/backlogmd.js';
 import { writeBacklogConfig } from '../../src/backlog/factory.js';
 import type { CreateTaskInput, Task } from '../../src/backlog/types.js';
@@ -326,7 +326,9 @@ describe('intake sync: reconciliation', () => {
     expect(x.backlog.status('task-1')).toBe('idea');
   });
 
-  it('a truncated query (more than the page cap) imports what it read but evaluates no departures', async () => {
+  // Inherently heavy: INTAKE_MAX_PAGES * 100 imports, each a few runtime-DB writes. ~0.5 s idle, past the
+  // default 5 s while other suites load the disk (task-93), so it gets a generous limit of its own.
+  it('a truncated query (more than the page cap) imports what it read but evaluates no departures', { timeout: 60_000 }, async () => {
     const x = env();
     x.gh.set([{ number: 1 }]);
     await x.run();
@@ -349,6 +351,8 @@ describe('intake sync: reconciliation', () => {
 });
 
 describe('intake sync: config and startup', () => {
+  afterEach(() => { vi.useRealTimers(); });
+
   it('existing configs without intake.github stay valid; the filter is strictly validated', () => {
     const base = defaults();
     expect(validateConfig(base).intake.github).toBeUndefined();
@@ -375,10 +379,19 @@ describe('intake sync: config and startup', () => {
     const logs: string[] = [];
     let signal: AbortSignal | undefined;
     const hung = (o: { signal: AbortSignal }) => { signal = o.signal; return new Promise<never>(() => { /* never settles */ }); };
-    const t0 = Date.now();
-    await intakeOnStart(on, (l) => logs.push(l), hung, 50);
-    expect(Date.now() - t0).toBeLessThan(4_000); // budget + grace, not the 120 s gh timeout
-    expect(signal?.aborted).toBe(true);
+    // Fake timers: the budget and grace are measured on the fake clock, so a loaded machine cannot stretch
+    // them past the test timeout (task-93). Only the timer functions are faked; the pass itself is all promises.
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    let settled = false;
+    const start = intakeOnStart(on, (l) => logs.push(l), hung, 50).then(() => { settled = true; });
+    await vi.advanceTimersByTimeAsync(49);
+    expect(signal?.aborted).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(signal?.aborted).toBe(true); // the budget aborts the pass
+    expect(settled).toBe(false); // the grace for an aborted pass to settle is still running
+    await vi.advanceTimersByTimeAsync(4_000 - 50);
+    expect(settled).toBe(true); // budget + grace, not the 120 s gh timeout
+    await start;
     expect(logs.join('\n')).toMatch(/intake sync did not finish within .*starting the coordinator without it/);
   });
 
