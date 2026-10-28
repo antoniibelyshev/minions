@@ -3,12 +3,13 @@
 // the routine pass with catch-up, and the deterministic composition with numbered polls. Fake clock throughout.
 import { describe, expect, it } from 'vitest';
 import { MinionsConfigSchema } from '../../src/config/schema.js';
-import { LAST_OWNER_MESSAGE_META } from '../../src/runtime/coordinator-usage.js';
+import { LAST_OWNER_MESSAGE_META, USAGE_META_PREFIX } from '../../src/runtime/coordinator-usage.js';
 import {
-  composeDigest, DEFAULT_HOLDS, digestStatus, holdFor, holdUntil, lastDigestSlot, nextDigestAt, parsePoll, prepareDigest, reholdExpired,
+  composeDigest, DEFAULT_HOLDS, digestInput, digestStatus, holdFor, holdUntil, lastDigestSlot, nextDigestAt, parsePoll, prepareDigest, reholdExpired,
   AUTO_PROMOTE_EVENT, MAX_DIGEST_WAKES_PER_SLOT, type DigestInput,
 } from '../../src/runtime/digest.js';
 import { ack, enqueue, isHeld, MAX_TEXT_LENGTH, NOTIFICATION_KINDS, pending, type OutboxItem } from '../../src/runtime/outbox.js';
+import { spendReport } from '../../src/runtime/spend.js';
 import { routineSettings, runRoutinePass, WAKE_EVENT, type CoordinatorView, type RoutinePassDeps, type RoutineSettings } from '../../src/runtime/routine.js';
 import { localDayStart, localStamp, zonedParts, zonedTimeToUtc } from '../../src/runtime/zoned-time.js';
 import { makeEnv } from './fixtures.js';
@@ -262,7 +263,7 @@ function input(over: Partial<DigestInput> = {}): DigestInput {
     merged: [{ taskId: 'task-3', prUrl: 'https://github.com/o/r/pull/3', at: '2026-10-26T20:00:00.000Z' }],
     approvals: [{ taskId: 'task-5', head: 'a'.repeat(40), scope: 'merge' }],
     autoPromoted: [{ taskId: 'task-10', at: '2026-10-26T21:00:00.000Z' }],
-    spend: { todayTokens: 1_234_567, budget: { percent: 45, text: '5M tokens', exhausted: false }, wakesToday: 2, wakeTokensToday: 310_000 },
+    spend: { window: 'last-digest', tokens: 1_234_567, budget: { percent: 45, text: '5M tokens', exhausted: false }, wakes: 2, wakeTokens: 310_000 },
     runnable: [],
     ...over,
   };
@@ -294,7 +295,7 @@ describe('composeDigest (deterministic)', () => {
       'Auto-promoted (reply "cancel <id>" or "hold <id>"):',
       '- task-10 Search',
       '',
-      'Spend today:',
+      'Spend since last digest:',
       '- 1.2M tokens; coordinator wakes 2 (310k tokens)',
       '- budget 45% of "5M tokens"',
       '',
@@ -333,8 +334,13 @@ describe('composeDigest (deterministic)', () => {
     const empty = composeDigest(input({ items: [], tasks: [], merged: [], approvals: [], autoPromoted: [], spend: null }));
     expect(empty.text).toBe('Digest Tue 27 Oct 08:00 (Europe/Berlin)\n\nNothing new.\n\nref: #digest');
     expect(empty.keys).toEqual(['digest:2026-10-27T08:00']);
-    const used = composeDigest(input({ spend: { todayTokens: 5_000_000, budget: { percent: 100, text: '5M tokens', exhausted: true }, wakesToday: 1, wakeTokensToday: 0 } }));
+    const used = composeDigest(input({ spend: { window: 'day', tokens: 5_000_000, budget: { percent: 100, text: '5M tokens', exhausted: true }, wakes: 1, wakeTokens: 0 } }));
     expect(used.text).toContain('budget 100% of "5M tokens": used up, new starts are refused until you raise it');
+  });
+
+  it("shows the USD estimate with a dollar sign", () => {
+    const d = composeDigest(input({ spend: { window: "last-digest", tokens: 1_000_000, usd: 1.5, budget: null, wakes: 1, wakeTokens: 0 } }));
+    expect(d.text).toContain("(~$1.50 est.)");
   });
 
   it('stays under the Telegram limit: whole items are left for the next digest, never cut, and not acked', () => {
@@ -427,5 +433,54 @@ describe('prepareDigest: stored under its key; acking the keys marks the time do
     const extra = prepareDigest(env.db, env.config, { tasks, runnable: [], spend: null }, at('2026-10-27T09:00:00Z'));
     expect(extra.key).toBe('digest:2026-10-27T10:00');
     expect(extra.text).not.toContain('task-3'); // merged before the previous digest
+  });
+});
+
+describe('digest spend: one window since the previous digest (task-89)', () => {
+  const sessionState = (id: string, firstAt: string, tokens: number, woken: boolean) => JSON.stringify({
+    version: 1, sessionId: id, path: '', offset: 0, firstAt, lastAt: firstAt, role: 'coordinator', model: null,
+    components: { input: tokens, cacheRead: 0, cacheWrite: 0, output: 0 }, turns: 1, contextSum: 0, maxContext: 0, ownerMessages: 0,
+    recovered: false, woken, overhead: 0, overheadDone: true, recentIds: [],
+  });
+  const usage = (env: ReturnType<typeof makeEnv>, tokens: number, at: string) =>
+    env.db.addEvent('usage', null, { key: 'session:s1', scope: 'session', session: 's1', tokens, model: null, source: 'manual' }, at);
+  const spend = (env: ReturnType<typeof makeEnv>, now: Date) => spendReport({ db: env.db, config: env.config, billing: 'subscription', now });
+
+  it('tokens, wakes and wake tokens all count from the previous digest, across UTC and local midnight', () => {
+    const env = makeEnv((c) => { c.routine = { enabled: true }; });
+    // The previous digest (08:00 Berlin = 07:00Z) was delivered at 07:02Z on 26 Oct.
+    const prevAt = at('2026-10-26T07:02:00Z');
+    enqueue(env.db, { key: 'digest:2026-10-26T08:00', kind: 'digest', text: 'yesterday' }, () => prevAt);
+    ack(env.db, 'digest:2026-10-26T08:00', 'telegram', () => prevAt);
+    // Cumulative session figures: 1000 before the boundary, then +4000 (afternoon), +4000 (before UTC midnight), +1000 (after).
+    usage(env, 1000, '2026-10-26T06:00:00.000Z');
+    usage(env, 5000, '2026-10-26T12:00:00.000Z');
+    usage(env, 9000, '2026-10-26T23:30:00.000Z');
+    usage(env, 10_000, '2026-10-27T01:00:00.000Z');
+    // Wakes: one before the boundary; one at 23:30 Berlin (26 Oct, before local midnight); one after UTC midnight.
+    for (const t of ['2026-10-26T06:30:00.000Z', '2026-10-26T22:30:00.000Z', '2026-10-27T00:30:00.000Z']) env.db.addEvent(WAKE_EVENT, null, { digest: false }, t);
+    env.db.setMeta(`${USAGE_META_PREFIX}a`, sessionState('a', '2026-10-26T06:30:00.000Z', 3000, true));
+    env.db.setMeta(`${USAGE_META_PREFIX}b`, sessionState('b', '2026-10-26T22:30:00.000Z', 2000, true));
+    env.db.setMeta(`${USAGE_META_PREFIX}c`, sessionState('c', '2026-10-27T00:30:00.000Z', 1500, true));
+
+    const now = at('2026-10-27T07:05:00Z');
+    const s = spend(env, now);
+    expect(s.today.tokens).toBe(1000); // `minions status` keeps the UTC day
+    const input = digestInput(env.db, env.config, { tasks: [], runnable: [], spend: s }, now);
+    expect(input.since).toBe(prevAt.toISOString());
+    expect(input.spend).toMatchObject({ window: 'last-digest', tokens: 9000, wakes: 2, wakeTokens: 3500 });
+    const d = prepareDigest(env.db, env.config, { tasks: [], runnable: [], spend: s }, now);
+    expect(d.text).toContain('Spend since last digest:\n- 9000 tokens; coordinator wakes 2 (3500 tokens)');
+  });
+
+  it('without a previous digest the window is the last 24h, for tokens and wakes alike', () => {
+    const env = makeEnv((c) => { c.routine = { enabled: true }; });
+    usage(env, 1000, '2026-10-26T06:00:00.000Z'); // more than 24h before now
+    usage(env, 3000, '2026-10-26T20:00:00.000Z');
+    env.db.addEvent(WAKE_EVENT, null, {}, '2026-10-26T06:30:00.000Z');
+    env.db.addEvent(WAKE_EVENT, null, {}, '2026-10-26T20:30:00.000Z');
+    const now = at('2026-10-27T07:05:00Z');
+    const d = prepareDigest(env.db, env.config, { tasks: [], runnable: [], spend: spend(env, now) }, now);
+    expect(d.text).toContain('Spend, last 24h:\n- 2000 tokens; coordinator wakes 1 (0 tokens)');
   });
 });

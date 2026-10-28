@@ -391,6 +391,14 @@ export function currentBudget(ctx: SpendContext): BudgetStatus | null {
   return b ? budgetStatus(ctx, b, usageRows(ctx.db)) : null;
 }
 
+/**
+ * Spend since an instant (any window, not the UTC day): tokens (and the USD estimate under API-key billing) and
+ * attempts started since `since`. The morning digest uses it for the window since the previous digest.
+ */
+export function spendSince(ctx: SpendContext, since: string): SpendFigures {
+  return figures(tally(usageRows(ctx.db), since), attemptsSince(ctx.db, since), ctx.billing ?? billingOf(), ctx.config?.models.default ?? null);
+}
+
 /** The spend block of `minions status --json` (and `minions work spend`). */
 export function spendReport(ctx: SpendContext): SpendReport {
   const now = ctx.now ?? new Date();

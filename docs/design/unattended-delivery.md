@@ -184,7 +184,7 @@ Facts from the code (main @ 4999cb3):
    - waiting for you, with the exact `/approve <task> <sha> merge` lines for the manager chat;
    - blockers;
    - auto-promoted tasks (decision 8);
-   - spend today against the budget, and coordinator wakes and tokens;
+   - spend since the previous digest (the last 24h without one): tokens, coordinator wakes and their tokens over that one window, and the budget;
    - next up;
    - the questions as numbered polls ("Q1 … reply `Q1 2`", options with the recommended one first and "Other").
 
@@ -429,7 +429,7 @@ days until phase 4 adds `routine.timezone`.
 - **Composition:** `minions notify digest --json` reads the outbox (every undelivered item), the backlog, the
   events (merged since the last digest, `awaiting-approval` merges, `auto-promote` events of phase 5), publications
   waiting for approval, the spend tally and `work next`. The text has fixed sections (waiting for you, with the
-  exact `/approve` lines; blockers; merged; delivered, waiting for CI or merge; updates; auto-promoted; spend today
+  exact `/approve` lines; blockers; merged; delivered, waiting for CI or merge; updates; auto-promoted; spend since the last digest
   with coordinator wakes and their tokens; next up; questions), sorted lines, and questions as polls: a question
   item's option lines (`1. …`, `- …`) become numbered options with "Other" last, answered as `Q1 2`. The whole
   text (header, footer and all) is at most `MAX_TEXT_LENGTH`. When it does not all fit, lines are taken in priority
