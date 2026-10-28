@@ -192,25 +192,77 @@ async function compactIfLarge(): Promise<void> {
   await atomicWrite(journalPath(), lines(kept), { mode: 0o600 });
 }
 
-/** Runs fn holding <manager>/journal.lock (O_EXCL file with the holder pid; a lock of a dead pid is taken over). */
+/**
+ * A lock file is created empty (O_EXCL) and its holder is written right after. A file without a readable holder that
+ * is younger than this is in that window: held, not stale. Only an older one (its writer died between the two steps)
+ * is taken over.
+ */
+export const LOCK_WRITE_GRACE_MS = 2_000;
+
+/**
+ * The state of a lock file another writer created: `gone` (removed meanwhile: try again now), `stale` (its holder is
+ * dead, or it stayed without a holder past LOCK_WRITE_GRACE_MS: take it over) or `held` (pid null: not written yet).
+ *
+ * task-80: a lock read in the create-then-write window used to count as dead and was taken over, so two
+ * confirmations of one offer could both pass the spent check under "the" lock and both apply.
+ */
+export async function lockFileState(
+  path: string, holderOf: (text: string) => number | null, alive: (pid: number) => boolean = pidAlive,
+): Promise<{ state: 'gone' } | { state: 'stale' } | { state: 'held'; pid: number | null }> {
+  const gone = (e: unknown) => { if ((e as NodeJS.ErrnoException).code === 'ENOENT') return { state: 'gone' as const }; throw e; };
+  let text: string;
+  try { text = await readFile(path, 'utf8'); } catch (e) { return gone(e); }
+  const pid = holderOf(text);
+  if (pid !== null) return alive(pid) ? { state: 'held', pid } : { state: 'stale' };
+  let mtime: number;
+  try { mtime = (await stat(path)).mtimeMs; } catch (e) { return gone(e); }
+  return Date.now() - mtime > LOCK_WRITE_GRACE_MS ? { state: 'stale' } : { state: 'held', pid: null };
+}
+
+/** The journal lock's holder pid: the file reads `<pid> <token>` (older writers wrote only `<pid>`). */
+const journalHolder = (text: string): number | null => {
+  const pid = Number.parseInt(text, 10);
+  return Number.isInteger(pid) && pid > 0 ? pid : null;
+};
+
+/**
+ * Runs fn holding <manager>/journal.lock (O_EXCL file with the holder pid and a token). A lock of a dead pid is taken
+ * over; one still being written is not (lockFileState). The release removes the file only while it carries this
+ * holder's token.
+ */
 export async function withJournalLock<T>(fn: () => Promise<T>, timeoutMs = 10_000): Promise<T> {
   await ensureDir(managerDir(), 0o700);
   const deadline = Date.now() + timeoutMs;
+  const token = `${process.pid} ${randomBytes(8).toString('hex')}`;
   for (;;) {
+    let h: Awaited<ReturnType<typeof open>>;
     try {
-      const h = await open(lockPath(), 'wx', 0o600);
-      await h.writeFile(String(process.pid));
-      await h.close();
-      break;
+      h = await open(lockPath(), 'wx', 0o600);
     } catch (e) {
       if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e;
-      const holder = Number.parseInt(await readFile(lockPath(), 'utf8').catch(() => ''), 10);
-      if (!pidAlive(holder)) { await rm(lockPath(), { force: true }); continue; }
-      if (Date.now() >= deadline) throw new MinionsError('CONFLICT', `The change-request journal is locked by process ${holder}.`, 'Wait for the other `minions settings apply` (or the manager) to finish, then retry.');
+      const s = await lockFileState(lockPath(), journalHolder);
+      if (s.state === 'gone') continue;
+      if (s.state === 'stale') { await rm(lockPath(), { force: true }); continue; }
+      if (Date.now() >= deadline) {
+        throw new MinionsError('CONFLICT', `The change-request journal is locked by ${s.pid === null ? 'another process' : `process ${s.pid}`}.`,
+          'Wait for the other `minions settings apply` (or the manager) to finish, then retry.');
+      }
       await new Promise((r) => setTimeout(r, 50));
+      continue;
     }
+    try {
+      await h.writeFile(token);
+      await h.close();
+    } catch (e) {
+      await h.close().catch(() => undefined);
+      await rm(lockPath(), { force: true });
+      throw e;
+    }
+    break;
   }
-  try { return await fn(); } finally { await rm(lockPath(), { force: true }); }
+  try { return await fn(); } finally {
+    if (await readFile(lockPath(), 'utf8').catch(() => '') === token) await rm(lockPath(), { force: true });
+  }
 }
 
 const nowIso = (now: Date) => now.toISOString();

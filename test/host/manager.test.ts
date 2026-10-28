@@ -275,7 +275,20 @@ describe('host manager: confirm, apply, replay', () => {
     const s = setup([project]);
     await s.manager.pollAll();
     const ev = { type: 'confirm' as const, requestId: id, nonce: s.t.offers[0]!.nonce };
-    await Promise.all([s.manager.handle(ev), s.manager.handle(ev)]);
+    // The concurrent pair both get past the advisory nonce read (findOffer: unspent) before either may take the
+    // journal lock, so only the check under the lock can stop the second one (task-80: it once applied twice).
+    let past = 0;
+    let bothPast!: () => void;
+    const gate = new Promise<void>((r) => { bothPast = r; });
+    const m = new M.HostManager({ ...s.deps, loadProject: async (pid) => { const p = await s.deps.loadProject(pid); if (++past === 2) bothPast(); return p; } });
+    let pair!: Promise<unknown>;
+    await J.withJournalLock(async () => {
+      pair = Promise.all([m.handle(ev), m.handle(ev)]);
+      await gate;
+    });
+    await pair;
+    expect(s.c.runs).toHaveLength(1);
+    expect(s.t.outcomes.filter((x) => x.status === 'already-handled')).toHaveLength(1);
     await s.manager.handle(ev);
     expect(s.c.runs).toHaveLength(1);
     expect(journal().filter((e) => e.type === 'confirmed')).toHaveLength(1);
@@ -466,6 +479,22 @@ describe('host manager: startup, lock, loop', () => {
     const again = await M.acquireManagerLock();
     await again.release();
     expect(() => readFileSync(M.managerLockPath())).toThrow();
+  });
+
+  it('task-80: a manager lock still being written (created, no holder yet) is not taken over; one left empty past the grace is', async () => {
+    const { mkdirSync, utimesSync } = await import('node:fs');
+    mkdirSync(J.managerDir(), { recursive: true });
+    writeFileSync(M.managerLockPath(), '');
+    const second = M.acquireManagerLock();
+    await new Promise((r) => setTimeout(r, 150)); // the contender reads the empty lock meanwhile and waits
+    writeFileSync(M.managerLockPath(), JSON.stringify({ pid: process.pid, start: null, at: 'now' }) + '\n'); // the holder is written
+    await expect(second).rejects.toMatchObject({ code: 'CONFLICT', message: expect.stringMatching(/Another host manager runs/) });
+    writeFileSync(M.managerLockPath(), '');
+    const old = new Date(Date.now() - J.LOCK_WRITE_GRACE_MS - 1_000);
+    utimesSync(M.managerLockPath(), old, old);
+    const taken = await M.acquireManagerLock();
+    expect(JSON.parse(readFileSync(M.managerLockPath(), 'utf8'))).toMatchObject({ pid: process.pid });
+    await taken.release();
   });
 
   it('run(): startup, a poll every 20 s, owner events between polls; stops on abort and releases the lock', async () => {
