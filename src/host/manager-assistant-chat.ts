@@ -176,10 +176,12 @@ export class AssistantChat implements AssistantChatPort {
     }
     const status = target && io.commands.assistantStatus ? await io.commands.assistantStatus(target).catch(() => null) : null;
     // The host's own offer summaries (planSummary of the journaled plan); nonce, digest, plan text and reason stay out.
-    const pending = target ? (await io.commands.pending(target).catch((): ManagerOffer[] => [])).map((o) => ({
+    // One journal read per message, for both the pending offers and the undo ids.
+    const entries = target ? await (this.deps.readJournal ?? defaultReadJournal)().catch((): JournalEntry[] => []) : [];
+    const pending = target ? (await io.commands.pending(target, entries).catch((): ManagerOffer[] => [])).map((o) => ({
       requestId: o.requestId, kind: o.kind, summary: o.summary, expiresAt: o.expiresAt, loosens: o.loosens,
     })) : [];
-    const undo = target ? undoCandidates(await (this.deps.readJournal ?? defaultReadJournal)().catch((): JournalEntry[] => []), target) : [];
+    const undo = target ? undoCandidates(entries, target) : [];
     return buildContextBundle({
       settings, help: assistantHelpLines(io.devRebuild), status, pending, undo,
       projects: projects.map((p) => ({ name: p.name, selected: p.projectId === target })),

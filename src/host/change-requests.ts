@@ -43,7 +43,7 @@ import {
 } from '../runtime/change-requests.js';
 import { inMinionsContainer } from '../runtime/paths.js';
 import {
-  assertOfferOpen, consumeOffer, findOffer, isOwnerRequest, isOwnerRequestId, readJournal, recordOffer, recordOutcome, type OfferEntry, type RequestSnapshot,
+  assertOfferOpen, consumeOffer, findOffer, isOwnerRequest, isOwnerRequestId, readJournal, recordOffer, recordOutcome, type JournalEntry, type OfferEntry, type RequestSnapshot,
 } from './change-journal.js';
 import { findCliBackup } from './cli-backup.js';
 import { rebuildRange, type CliDevDeps } from './cli-rebuild.js';
@@ -226,9 +226,10 @@ async function assertUpgradeDelivery(project: ProjectJson, req: RequestSnapshot,
 /**
  * Builds the host plan of a request: validated against the host's config, never trusting the row's own view.
  * Throws CONFLICT for host-owned keys, PRECONDITION for anything that cannot be applied. `pre.dry`: an upgrade dry
- * run already made for this request (upgradeDryRun); everything else is still read now.
+ * run already made for this request (upgradeDryRun); `pre.entries`: the host journal as the caller just read it (the
+ * approval check of an undo); everything else is still read now.
  */
-export async function buildPlan(project: ProjectJson, req: RequestSnapshot, deps: ChangeRequestDeps, pre: { dry?: UpgradeRun } = {}): Promise<{ plan: ChangePlan; notes: string[] }> {
+export async function buildPlan(project: ProjectJson, req: RequestSnapshot, deps: ChangeRequestDeps, pre: { dry?: UpgradeRun; entries?: JournalEntry[] } = {}): Promise<{ plan: ChangePlan; notes: string[] }> {
   const owner = isOwnerRequest(req);
   if (!owner && (OWNER_ONLY_KINDS.includes(req.kind) || req.origin !== undefined || req.via !== undefined || isOwnerRequestId(req.id))) {
     throw new MinionsError('PRECONDITION', `Change request ${displayText(req.id)}: kind "${displayText(String(req.kind))}" comes only from the owner in the manager chat; nothing to apply.`);
@@ -302,7 +303,7 @@ export async function buildPlan(project: ProjectJson, req: RequestSnapshot, deps
       notes: dry.steps.map((s) => `${s.id}: ${s.detail}`),
     };
   }
-  if (req.kind === 'undo') return planUndo(project, req, base, configRevision);
+  if (req.kind === 'undo') return planUndo(project, req, base, configRevision, pre.entries);
   if (req.kind === 'cli-rollback') return planRollback(req, base, configRevision);
   if (req.kind === 'rebuild-cli') {
     const range = await rebuildRange(project, deps.cli);
@@ -395,10 +396,10 @@ async function planRollback(req: RequestSnapshot, base: Omit<ChangePlan, 'kind' 
  * history entry is not trusted: the file comes from the project and the entry's layer, and the plan lists every
  * setting the restore changes (the loosening check runs over all of them); anything else changing refuses.
  */
-async function planUndo(project: ProjectJson, req: RequestSnapshot, base: Omit<ChangePlan, 'kind' | 'configRevision' | 'interrupts' | 'steps'>, configRevision: number): Promise<{ plan: ChangePlan; notes: string[] }> {
+async function planUndo(project: ProjectJson, req: RequestSnapshot, base: Omit<ChangePlan, 'kind' | 'configRevision' | 'interrupts' | 'steps'>, configRevision: number, entries?: JournalEntry[]): Promise<{ plan: ChangePlan; notes: string[] }> {
   const target = req.payload.target;
   if (typeof target !== 'string') throw new MinionsError('PRECONDITION', `Request ${req.id}: malformed undo payload; nothing to apply.`);
-  if ((await readJournal()).some((e) => e.type === 'offer' && e.projectId === project.projectId && e.requestId === target && e.request.kind === 'approve')) {
+  if ((entries ?? await readJournal()).some((e) => e.type === 'offer' && e.projectId === project.projectId && e.requestId === target && e.request.kind === 'approve')) {
     throw new MinionsError('PRECONDITION', `${target} is an approval: approvals cannot be undone. Nothing was changed.`,
       'An unused approval expires by itself, and a new commit needs a new approval anyway.', { refusal: 'approval' });
   }

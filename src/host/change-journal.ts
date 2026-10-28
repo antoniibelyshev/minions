@@ -1,5 +1,5 @@
 // The host journal of change-request confirmations (docs/design/host-manager.md, "Confirmation model"):
-// <MINIONS_HOME>/manager/journal.jsonl (0600, append-only JSON lines). The container never reads or writes it.
+// <MINIONS_HOME>/manager/journal.jsonl (0600, append-only JSON lines; compacted once large, see below). The container never reads or writes it.
 //
 // - `offer`: the plan the owner was shown, its digest, the configRevision it was computed against, a 128-bit
 //   single-use nonce and the expiry (30 minutes). It also keeps the request as it was read then (kind, payload,
@@ -19,13 +19,15 @@
 //   "already handled", never planned or applied twice. A typed plan that loosens nothing and runs no container-built
 //   code on the host is applied without a tap: its offer (`direct`) and its `confirmed` entry are appended together,
 //   as one step under the journal lock. Its nonce is minted and spent in that step, so no tap can ever use it.
+// - Compaction (task-90): once the file reaches COMPACT_AT_BYTES, the append that finds it there rewrites the file
+//   (under the same journal lock, atomically) without the oldest closed requests; compactEntries says what is kept.
 // The manager (task-53.4, src/host/manager.ts) adds its own process lock and the offer messages on top of this file.
 import { randomBytes } from 'node:crypto';
-import { appendFile, chmod, open, readFile, rm } from 'node:fs/promises';
+import { appendFile, chmod, open, readFile, rm, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { isChangeRequestId } from '../runtime/change-requests.js';
 import { MinionsError } from '../core/errors.js';
-import { ensureDir } from '../core/fsutil.js';
+import { atomicWrite, ensureDir } from '../core/fsutil.js';
 import { managerDir } from '../core/paths.js';
 import { procStartTime } from '../runtime/coordinator.js';
 import { pidAlive } from '../runtime/db.js';
@@ -91,12 +93,103 @@ export async function readJournal(): Promise<JournalEntry[]> {
   return out;
 }
 
+const lines = (entries: JournalEntry[]) => entries.map((e) => JSON.stringify(e) + '\n').join('');
+
+/** Only under the journal lock (every writer holds it), so a compaction never loses an entry another writer appends. */
 async function append(...entries: JournalEntry[]): Promise<void> {
   await ensureDir(managerDir(), 0o700);
   // One write for all the lines (a torn last line is skipped when read: at worst a direct offer stays unconfirmed,
   // which only a Confirm tap could then apply).
-  await appendFile(journalPath(), entries.map((e) => JSON.stringify(e) + '\n').join(''), { mode: 0o600 });
+  await appendFile(journalPath(), lines(entries), { mode: 0o600 });
   await chmod(journalPath(), 0o600).catch(() => undefined);
+  // The entries are written: a failed compaction only leaves the file longer, it never fails the append.
+  await compactIfLarge().catch(() => undefined);
+}
+
+/** The journal size from which an append compacts it (a stat per append; the file is read only past this size). */
+export const COMPACT_AT_BYTES = 1024 * 1024;
+/** Closed requests a compaction keeps (newest first): history, redelivery checks and the owner's views. */
+export const KEEP_CLOSED_REQUESTS = 100;
+/**
+ * Applied config changes (config-set, undo) a compaction keeps per project, newest first, whatever the other closed
+ * requests: the /undo candidates come from them. As many as the config history keeps (CONFIG_HISTORY_KEEP of
+ * config-history.ts): an older change cannot be undone anyway.
+ */
+export const KEEP_UNDO_PER_PROJECT = 20;
+
+const CLOSED_TYPES: ReadonlySet<string> = new Set(['applied', 'failed', 'rejected']);
+
+/**
+ * The entries a compaction keeps, in their order. Entries are grouped by request (project and request id); a request
+ * is kept or dropped whole. Kept: every request whose newest entry is not applied / failed / rejected (an open offer,
+ * a confirmed or applying one: in flight or interrupted; anything unknown too); per project the newest `keepUndo`
+ * applied config-set / undo requests (a suffix in applied order, so an undo is never dropped while the change it
+ * reverted is kept); and the newest `keepClosed` other closed requests. Older closed requests are dropped.
+ *
+ * Tombstones (task-90 repair; chosen over "keep until the runtime row is closed" and "treat missing-and-old as
+ * handled"): a dropped container request (`cr_`) whose outcome is applied or rejected keeps one line, its final
+ * outcome without the details (`{type, at, projectId, requestId}`). The runtime row is marked after the journal entry
+ * and that mark is best effort, so the row can still read `proposed`; the manager's poll (needsOffer) and every
+ * confirmation (assertOfferOpen, via lastOutcome) then still see "already handled", so the request is never offered
+ * or applied again. Compaction cannot ask the runtime (it runs under the journal lock in append, with no container
+ * access), and a horizon rule would need a timestamp the poll can trust for every row. A dropped failed request needs
+ * no tombstone (a failed request may be offered and confirmed again anyway); an owner request (`ow_`) has no runtime
+ * row. Tombstones cost about 100 bytes each and are kept. Returns `entries` itself when nothing changes (an existing
+ * tombstone stays as it is).
+ */
+export function compactEntries(entries: JournalEntry[], o: { keepClosed?: number; keepUndo?: number } = {}): JournalEntry[] {
+  const keepClosed = o.keepClosed ?? KEEP_CLOSED_REQUESTS;
+  const keepUndo = o.keepUndo ?? KEEP_UNDO_PER_PROJECT;
+  const keyOf = (e: JournalEntry) => `${e.projectId}\0${e.requestId}`;
+  const last = new Map<string, { at: number; e: JournalEntry }>();
+  const kinds = new Map<string, unknown>();
+  const count = new Map<string, number>();
+  entries.forEach((e, at) => {
+    last.set(keyOf(e), { at, e });
+    count.set(keyOf(e), (count.get(keyOf(e)) ?? 0) + 1);
+    if (e.type === 'offer') kinds.set(keyOf(e), (e.request as Partial<RequestSnapshot> | undefined)?.kind);
+  });
+  const closed = [...last].filter(([, v]) => CLOSED_TYPES.has(v.e.type)).sort((a, b) => b[1].at - a[1].at);
+  const undoKept = new Map<string, number>();
+  const drop = new Set<string>();
+  /** Dropped requests that leave a tombstone: key -> the index (in `entries`) of the final outcome it replaces. */
+  const tombs = new Map<string, number>();
+  let tail = 0;
+  for (const [key, { at, e }] of closed) {
+    const kind = kinds.get(key);
+    if (e.type === 'applied' && (kind === 'config-set' || kind === 'undo')) {
+      const n = undoKept.get(e.projectId) ?? 0;
+      if (n < keepUndo) { undoKept.set(e.projectId, n + 1); continue; }
+    }
+    if (tail < keepClosed) { tail++; continue; }
+    if (needsTombstone(e)) {
+      if (count.get(key) === 1 && isTombstone(e)) continue; // already a tombstone: unchanged
+      tombs.set(key, at);
+    }
+    drop.add(key);
+  }
+  if (!drop.size) return entries;
+  const out: JournalEntry[] = [];
+  entries.forEach((e, at) => {
+    const key = keyOf(e);
+    if (!drop.has(key)) out.push(e);
+    else if (tombs.get(key) === at) out.push(tombstoneOf(e as OutcomeEntry));
+  });
+  return out;
+}
+
+/** A closed container request whose outcome must outlive compaction (see compactEntries). */
+const needsTombstone = (e: JournalEntry) => (e.type === 'applied' || e.type === 'rejected') && isChangeRequestId(e.requestId);
+const tombstoneOf = (e: OutcomeEntry): OutcomeEntry => ({ type: e.type, at: e.at, projectId: e.projectId, requestId: e.requestId });
+const isTombstone = (e: JournalEntry) => Object.keys(e).length === 4;
+
+/** Under the journal lock: from COMPACT_AT_BYTES on, rewrites the journal (temp file, rename) without what compactEntries drops. */
+async function compactIfLarge(): Promise<void> {
+  if ((await stat(journalPath())).size < COMPACT_AT_BYTES) return;
+  const entries = await readJournal();
+  const kept = compactEntries(entries);
+  if (kept === entries) return;
+  await atomicWrite(journalPath(), lines(kept), { mode: 0o600 });
 }
 
 /** Runs fn holding <manager>/journal.lock (O_EXCL file with the holder pid; a lock of a dead pid is taken over). */

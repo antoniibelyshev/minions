@@ -159,7 +159,8 @@ deterministic and model-free. Built in task-65.1 to task-65.4 (`src/host/manager
    [Settings classification](#settings-classification-task-44)), what it loosens, what will be interrupted (a coordinator
    restart; active-lease counts are shown to the owner but kept out of the digest, as they change every poll), and the steps for an upgrade (`upgrade --dry-run --json`).
 2. `digest = sha256(canonical plan JSON)`. The manager stores `{requestId, digest, configRevision, nonce, expiresAt}`
-   in its host journal (`<MINIONS_HOME>/manager/journal.jsonl`, 0600) and sends the plan with inline buttons
+   in its host journal (`<MINIONS_HOME>/manager/journal.jsonl`, 0600; from 1 MiB on, a write compacts it: open and in-flight requests and the
+   applied config changes /undo can name stay, only the closed requests past the newest 100 go; an applied or rejected container request leaves a one-line tombstone, so a runtime row still marked proposed is never offered again, task-90) and sends the plan with inline buttons
    `Confirm` / `Reject`. The `callback_data` is `c:<requestId>:<nonce>` (a 128-bit random nonce, within the
    64-byte limit).
 3. On a tap, the manager checks every point and refuses if any fails: the sender is the paired owner id, in the
