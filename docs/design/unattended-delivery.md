@@ -223,12 +223,15 @@ Facts from the code (main @ 4999cb3):
    2. **Fresh wakes** (decision 3) instead of resuming large contexts after idle.
    3. **Deterministic dispatcher (target).** The task-57 supervisor launches worker stages itself as headless
       `claude -p --agent minions:<role>` runs, with the worker's settings, Telegram disabled, and no `--channels`
-      (the isolation rules of coordinator-sessions D4). It records the result with `work record` (usage comes from
+      (the isolation rules of coordinator-sessions decisions 5 and 7). It records the result with `work record` (usage comes from
       the stream-json result, which is more exact than the notification totals). It handles the one allowed
       correction by resuming the worker with the validation errors. It wakes the coordinator only for exceptions:
       `blocked`, `needs_split`, a producer's `needs_changes`, a replan, an unvalidated result, intake, owner messages.
       On the happy path no LLM coordinator turn happens at all. This revises task-57: the supervisor drives stages
-      directly, and the planned task sessions are only for exceptions. It amends agent-runtimes D11.3 and the
+      directly, and the planned task sessions are only for exceptions. (Reconciled in task-57.4: task sessions come
+      first and drive the stages; the dispatcher becomes a later launch kind on the same supervisor, phase 10 of
+      coordinator-sessions.md, and its spike is folded into that design's phase 3. See its "Fit with unattended
+      delivery" section.) It amends agent-runtimes D11.3 and the
       no-nested-claude rule (task-51) **only** for this one deterministic launcher. It needs the coordinator-run spike
       for task-57 U1 to U3 first; workers cannot test it. Go or no-go uses the task-57 rule: the saving must be at
       least 25% of coordinator spend, measured by tokens per delivered task.
