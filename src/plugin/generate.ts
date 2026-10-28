@@ -417,6 +417,7 @@ function contextResetGuidance(cfg: MinionsConfig): string {
     `- Context resets (on, \`coordinator.contextReset\`): keep this session small by restarting it routinely with a fresh context. The runtime decides when: a \`minions work record|release\` response carries \`contextReset\` (\`due: true\`, with steps) only when no worker lease is active, no drain runs, and ${triggers.length ? triggers.join(', or ') : 'a trigger holds (all triggers are off)'}. \`minions coordinator handoff --check --json\` shows the same check. When it is due, reset before dispatching more work, without asking or announcing it:`,
     `  finish the current owner exchange (never restart mid-answer; an unanswered owner question goes into the handoff), send pending notifications (your own session tokens are measured from the transcript; do not record them by hand). ${handoff}`,
     '  Never restart while a worker lease is active (the restart refuses; never use --force for a reset) or during a drain.',
+    ...(s.barrierTokens !== null ? [`  Barrier: once the context reaches ${Math.round(s.barrierTokens / 1000)}k tokens while workers run, \`work claim|advance|next\` start nothing new (\`context-reset-pending\`): record the running workers as they return (the last record carries \`contextReset\`), then reset; you may stop while you wait.`] : []),
   ].join('\n');
 }
 

@@ -1300,10 +1300,16 @@ handoff, instead of one long session whose re-read context grows every turn. Imp
   conversation knows: open owner questions with the recommended answers, pending decisions, what the session waits
   on, the spend tally, chat context. A fresh coordinator reads it first (`handoff --read --json`, named in the
   recovery prompt and step 1 of the recover skill), together with `minions status`.
-- Settings: `coordinator.contextReset` `{ enabled, afterDelivery?, contextTokens?, handoffs? }`. Unset means on with
+- Settings: `coordinator.contextReset` `{ enabled, afterDelivery?, contextTokens?, handoffs?, barrierTokens? }`. Unset means on with
   the defaults (existing projects get resets without a config edit); `enabled: false` is the opt-out, which leaves
   resets to an explicit owner request. Unset trigger fields take the defaults (after delivery on, 60000 context
-  tokens, 10 hand-offs); `null` turns one trigger off.
+  tokens, 10 hand-offs, a 120000-token barrier); `null` turns one trigger off.
+- Reset barrier (task-57.6, [coordinator-sessions.md](coordinator-sessions.md) decision 2): once the context reaches
+  `barrierTokens` and only running workers (active leases, open runs) block the reset, `work claim` refuses
+  (PRECONDITION, detail `decision: context-reset-pending`), `work next` lists every stage as waiting with
+  `waitingOn: context-reset`, `work advance` returns the decision `context-reset-pending`, and the Stop guard allows the
+  stop. Records and releases go on; the last one makes the reset due (reaching the barrier is a `context` trigger).
+  Not during a drain, not with resets off, and not when the context is unknown (null). `status` shows the barrier.
 - Triggers are evaluated on demand from DB events, never by a timer. The session is scoped to the current lock by
   event id: events after the latest `coordinator-lock` event naming the current holder (pid and session). That
   event is written by `acquireCoordinatorLock`, the only writer of the lock, on every holder change; a re-entrant

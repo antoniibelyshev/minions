@@ -1077,6 +1077,18 @@
                   "type": "null"
                 }
               ]
+            },
+            "barrierTokens": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 1000,
+                  "maximum": 9007199254740991
+                },
+                {
+                  "type": "null"
+                }
+              ]
             }
           },
           "required": [

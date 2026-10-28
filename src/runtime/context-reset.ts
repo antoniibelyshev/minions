@@ -22,6 +22,9 @@ import { withOpenRuns } from './runner/record.js';
  *   main-session usage in the transcript the Stop hook recorded), or `handoffs` worker records/releases
  *   happened (also the fallback when no transcript usage is readable). `work record|release` responses
  *   carry `contextReset` only when due; `coordinator handoff --check` and `status` show the full state.
+ * - Barrier (task-57.6): at `barrierTokens` (default 120k) with running workers as the only blocker, new starts
+ *   are held (`work claim`, `work advance`, `work next`: `context-reset-pending`; the Stop guard allows a stop),
+ *   so the reset becomes due when the last worker is recorded or released. Records and releases keep working.
  * - The runtime never restarts the coordinator by itself for a reset (the opt-in routine wakes of
  *   src/runtime/routine.ts are separate): the coordinator, told by the response, writes
  *   the handoff and runs `coordinator restart --recover`, which still refuses while leases are active.
@@ -30,12 +33,16 @@ import { withOpenRuns } from './runner/record.js';
 export const HANDOFF_MAX_BYTES = 4096;
 export const DEFAULT_CONTEXT_TOKENS = 60_000;
 export const DEFAULT_HANDOFFS = 10;
+/** Context ceiling (task-57.6): at or above it, only running workers block the reset, so new starts are held until they return. */
+export const DEFAULT_BARRIER_TOKENS = 120_000;
+/** Decision / error detail of a held start (work claim, work advance, work next). */
+export const RESET_PENDING = 'context-reset-pending';
 /** Transcript bytes read from the end when looking for the latest usage. */
 export const TRANSCRIPT_TAIL_BYTES = 512 * 1024;
 /** Meta key: the main-session transcript the Stop hook last saw. */
 export const TRANSCRIPT_META = 'coordinator_transcript';
 
-export interface ContextResetSettings { enabled: boolean; afterDelivery: boolean; contextTokens: number | null; handoffs: number | null }
+export interface ContextResetSettings { enabled: boolean; afterDelivery: boolean; contextTokens: number | null; handoffs: number | null; barrierTokens: number | null }
 
 /**
  * Effective settings: unset config = on with the defaults (existing projects get resets without a config
@@ -48,6 +55,7 @@ export function contextResetSettings(cfg: Pick<MinionsConfig, 'coordinator'>): C
     afterDelivery: c?.afterDelivery ?? true,
     contextTokens: c?.contextTokens === undefined ? DEFAULT_CONTEXT_TOKENS : c.contextTokens,
     handoffs: c?.handoffs === undefined ? DEFAULT_HANDOFFS : c.handoffs,
+    barrierTokens: c?.barrierTokens === undefined ? DEFAULT_BARRIER_TOKENS : c.barrierTokens,
   };
 }
 
@@ -203,6 +211,12 @@ export interface ContextResetCheck {
     handoffWritten: boolean;
   };
   settings: ContextResetSettings;
+  /**
+   * The reset barrier (task-57.6): `reached` = this session's context is at or above `barrierTokens`; `pending` =
+   * reached and only running workers (active leases, open runs) block the reset: new starts are held until they
+   * return, and the reset is due once the last one is recorded or released.
+   */
+  barrier: { tokens: number | null; reached: boolean; pending: boolean };
   /** Present when due: what to run, in order. */
   steps?: string[];
 }
@@ -246,7 +260,8 @@ export function contextResetCheck(deps: ContextResetDeps): ContextResetCheck {
   // The workers a restart would count (the restart refuses while any exist): active leases, plus unfinished runs.
   const leases = deps.state !== undefined ? withOpenRuns(() => db.activeLeases(), deps.state)() : db.activeLeases();
   if (leases.length) blockers.push(`${leases.length} active worker lease(s) (${leases.map((l) => l.id).join(', ')})`);
-  if (db.drain()) blockers.push('a drain is in progress (the upgrade restarts the coordinator itself)');
+  const draining = !!db.drain();
+  if (draining) blockers.push('a drain is in progress (the upgrade restarts the coordinator itself)');
   if (!since) blockers.push('no coordinator session holds the project lock');
 
   // Scope by event id, not timestamp: events from the same millisecond as the lock would otherwise leak in.
@@ -282,24 +297,53 @@ export function contextResetCheck(deps: ContextResetDeps): ContextResetCheck {
 
   const triggers: ResetTrigger[] = [];
   if (settings.afterDelivery && delivered.length) triggers.push('delivered');
-  if (settings.contextTokens !== null && contextTokens !== null && contextTokens >= settings.contextTokens) triggers.push('context');
+  const atThreshold = settings.contextTokens !== null && contextTokens !== null && contextTokens >= settings.contextTokens;
+  // The barrier is a context ceiling: reaching it is a context trigger too (also with `contextTokens` off). Null context = no barrier.
+  const reached = settings.barrierTokens !== null && contextTokens !== null && contextTokens >= settings.barrierTokens;
+  if (atThreshold || reached) triggers.push('context');
   if (settings.handoffs !== null && handoffs >= settings.handoffs) triggers.push('handoffs');
 
   const due = settings.enabled && blockers.length === 0 && triggers.length > 0;
+  // Starts are held only when running workers are the sole blocker: never while resets are off, during a drain
+  // (the upgrade restarts the coordinator itself) or without a coordinator session.
+  const pending = reached && settings.enabled && !draining && !!since && leases.length > 0;
+  const limit = atThreshold ? `${settings.contextTokens} tokens` : `the barrier ${settings.barrierTokens} tokens`;
   const what = triggers.map((t) => t === 'delivered' ? `delivered ${[...new Set(delivered)].join(', ')}`
-    : t === 'context' ? `context ${contextTokens} >= ${settings.contextTokens} tokens` : `${handoffs} hand-offs >= ${settings.handoffs}`).join('; ');
+    : t === 'context' ? `context ${contextTokens} >= ${limit}` : `${handoffs} hand-offs >= ${settings.handoffs}`).join('; ');
   const reason = due ? `context reset due: ${what}`
-    : blockers.length ? `no context reset: ${blockers.join('; ')}` : 'no context reset: no trigger holds yet';
+    : pending ? `context reset pending: context ${contextTokens} >= the barrier ${settings.barrierTokens} tokens; new stages wait until ${leases.length} running worker(s) return (${leases.map((l) => l.id).join(', ')})`
+      : blockers.length ? `no context reset: ${blockers.join('; ')}` : 'no context reset: no trigger holds yet';
   return {
     enabled: settings.enabled, due, triggers, blockers, reason,
     session: { since, handoffs, delivered: [...new Set(delivered)], contextTokens, contextSource: contextTokens === null ? 'unavailable' : 'transcript', handoffWritten },
     settings,
+    barrier: { tokens: settings.barrierTokens, reached, pending },
     ...(due ? { steps: [
       'Finish the current owner exchange (never restart mid-answer); send pending notifications (`minions notify pending --json`).',
       'Write the handoff: `minions coordinator handoff --json` with the note on stdin (quoted heredoc, at most 4 KB, no secrets): open owner questions with your recommended answers, pending decisions, what you wait on, spend, chat context the durable state does not hold.',
       `Restart: \`${RESET_RESTART_COMMAND}\``,
     ] } : {}),
   };
+}
+
+/** The hint on a held start (claim error, advance and next decisions). */
+export const RESET_PENDING_HINT = 'Start nothing new: record or release the running workers as they return (`work advance|record|release`); the last one carries `contextReset`, then hand off and restart. You may stop until a worker returns (the Stop guard allows it).';
+
+/**
+ * The barrier check for starts (claim, `work next`, the Stop guard): the check when the barrier holds new starts,
+ * else null. Never throws: an unreadable state means no barrier.
+ */
+export function resetBarrier(deps: ContextResetDeps): ContextResetCheck | null {
+  try {
+    const c = contextResetCheck(deps);
+    return c.barrier.pending ? c : null;
+  } catch { return null; }
+}
+
+/** The error a held `work claim` returns (PRECONDITION, detail `decision: context-reset-pending`). */
+export function resetPendingError(c: ContextResetCheck): MinionsError {
+  return new MinionsError('PRECONDITION', `Not claimed: ${c.reason}.`, RESET_PENDING_HINT,
+    { decision: RESET_PENDING, contextTokens: c.session.contextTokens, barrierTokens: c.barrier.tokens });
 }
 
 /** The compact form put on `work record|release` responses (only when due, to keep the coordinator's context small). */
@@ -311,7 +355,8 @@ export function dueNotice(c: ContextResetCheck): { due: true; reason: string; st
 export function humanContextReset(c: ContextResetCheck): string {
   const s = c.session;
   const ctx = s.contextTokens === null ? 'context unknown' : `context ${Math.round(s.contextTokens / 1000)}k${c.settings.contextTokens ? `/${Math.round(c.settings.contextTokens / 1000)}k` : ''}`;
-  return `context reset: ${c.due ? 'due' : 'not due'} (${s.handoffs}${c.settings.handoffs ? `/${c.settings.handoffs}` : ''} hand-offs, ${ctx}${s.delivered.length ? `, delivered ${s.delivered.join(', ')}` : ''})${c.due ? '' : c.blockers.length ? `; ${c.blockers.join('; ')}` : ''}`;
+  const barrier = c.barrier.tokens === null ? 'barrier off' : `barrier ${Math.round(c.barrier.tokens / 1000)}k${c.barrier.pending ? ' reached: new starts held' : c.barrier.reached ? ' reached' : ''}`;
+  return `context reset: ${c.due ? 'due' : c.barrier.pending ? 'pending' : 'not due'} (${s.handoffs}${c.settings.handoffs ? `/${c.settings.handoffs}` : ''} hand-offs, ${ctx}, ${barrier}${s.delivered.length ? `, delivered ${s.delivered.join(', ')}` : ''})${c.due ? '' : c.blockers.length ? `; ${c.blockers.join('; ')}` : ''}`;
 }
 
 /** Adds `contextReset` to a record/release response when a reset is due (task-45). Never fails the record. */

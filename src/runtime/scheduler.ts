@@ -19,6 +19,7 @@ import { syncBaseFromOrigin, type BaseSyncResult } from './base-sync.js';
 import type { BuiltinLeaseRole, Lease, LeaseRole, PublicationState, RuntimeDb } from './db.js';
 import { removeLeaseFiles, type HandoffPaths } from './handoff.js';
 import { corruptRecordHint, hasOpenRun, readRunRecord, removeRunRecord } from './runner/record.js';
+import { RESET_PENDING_HINT, resetBarrier, resetPendingError, type ContextResetCheck } from './context-reset.js';
 import { missingApprovalKeyReason, runtimePaths } from './paths.js';
 import { ORIGIN_REPOSITORY_META, publishTask, realGh, serverOriginOf, type GhFn, type PublishInput, type PublishOutcome } from './publish.js';
 import type { ServerOrigin, ServerUrlFn } from './base-update.js';
@@ -164,9 +165,10 @@ export interface NextStage {
 export interface WaitingStage extends NextStage {
   /**
    * starts: paused, draining or the owner budget; capacity: active task limit; role-capacity: execution.maxByRole;
-   * harness-capacity: the phase cap on process-harness producers (agent-runtimes D9); requires: a stage capability not allowed.
+   * harness-capacity: the phase cap on process-harness producers (agent-runtimes D9); requires: a stage capability not allowed;
+   * context-reset: the reset barrier holds new starts until the running workers return (task-57.6).
    */
-  waitingOn: 'starts' | 'capacity' | 'role-capacity' | 'harness-capacity' | 'requires';
+  waitingOn: 'starts' | 'capacity' | 'role-capacity' | 'harness-capacity' | 'requires' | 'context-reset';
   why: string;
 }
 
@@ -179,6 +181,8 @@ export interface NextReport {
   stuck: StuckTask[];
   /** Why nothing may start (the error a claim would return), or null. */
   startsBlocked: { code: string; message: string; hint?: string } | null;
+  /** The reset barrier holds new starts (task-57.6): every stage waits with `waitingOn: 'context-reset'`. Absent otherwise. */
+  resetPending?: { decision: 'context-reset-pending'; message: string; hint: string };
   capacity: Capacity;
   message: string;
   /**
@@ -660,12 +664,14 @@ export class Scheduler {
       const err = e as MinionsError;
       startsBlocked = { code: err.code, message: err.message, ...(err.hint ? { hint: err.hint } : {}) };
     }
+    const held = startsBlocked ? null : this.resetHeld();
     const runnable: NextStage[] = [];
     const active = new Set(cap.activeTaskIds);
     const roleActive = new Map(Object.entries(cap.byRole).map(([r, c]) => [r, c.active]));
     let processProducers = this.processProducerLeases(leases);
     for (const c of ordered) {
       if (startsBlocked) { waiting.push({ ...c, waitingOn: 'starts', why: startsBlocked.message }); continue; }
+      if (held) { waiting.push({ ...c, waitingOn: 'context-reset', why: held.reason }); continue; }
       if (!active.has(c.taskId) && active.size >= cfg.execution.maxActiveTasks) {
         waiting.push({ ...c, waitingOn: 'capacity', why: `active task limit (${active.size}/${cfg.execution.maxActiveTasks})` }); continue;
       }
@@ -685,11 +691,13 @@ export class Scheduler {
     const message = runnable.length
       ? `${runnable.length} runnable stage(s): ${runnable.slice(0, 5).map((r) => `${r.taskId} ${r.role}`).join(', ')}${runnable.length > 5 ? ', …' : ''}`
       : startsBlocked ? `Nothing runnable: ${startsBlocked.message}`
+        : held ? `Nothing runnable: ${held.reason}.`
         : waiting.length ? `Nothing runnable: ${waiting.length} stage(s) waiting (${[...new Set(waiting.map((w) => w.waitingOn))].join(', ')}).`
           : 'Nothing runnable: no ready task and no task waiting for its next stage.';
     const warnings = defaultMovedGates(cfg, this.phase).map(({ role, harness }) =>
       `harnesses.default moves the gate role ${role} onto ${HARNESSES[harness].label} (harness ${harness}); set roles.${role}.harness to claude on the host to keep it on Claude Code, or to ${harness} to make it explicit`);
-    return { runnable, waiting, stuck, startsBlocked, capacity: cap, message, ...(warnings.length ? { warnings } : {}) };
+    return { runnable, waiting, stuck, startsBlocked, ...(held ? { resetPending: { decision: 'context-reset-pending' as const, message: held.reason, hint: RESET_PENDING_HINT } } : {}),
+      capacity: cap, message, ...(warnings.length ? { warnings } : {}) };
   }
 
   private nextEntry(task: Task, def: RoleDef, m: ModelSuggestion, at: Pick<NextStage, 'kind' | 'position' | 'count' | 'workflow'>, reason: string): NextStage {
@@ -752,6 +760,14 @@ export class Scheduler {
     }
   }
 
+  /**
+   * The reset barrier (task-57.6): the context-reset check when this coordinator session's context is at the barrier
+   * and only running workers block the reset, else null. Read on each claim and `work next`; never throws.
+   */
+  private resetHeld(): ContextResetCheck | null {
+    return resetBarrier({ db: this.db, config: this.config, ...(this.runs ? { state: this.runs.state } : {}) });
+  }
+
   /** Refuses new starts while paused, draining or over the owner budget (claim; `work next` reports the same). */
   private assertStartsAllowed(): void {
     if (this.db.paused().starts) {
@@ -778,6 +794,9 @@ export class Scheduler {
       if (!known) throw new MinionsError('INVALID_CONFIG', `Unknown role "${String(role).slice(0, 40)}" (${workerRoleNames(cfg).join('|')}).`);
     }
     this.assertStartsAllowed();
+    // The reset barrier holds new starts only; records and releases of running workers go on (task-57.6).
+    const barrier = this.resetHeld();
+    if (barrier) throw resetPendingError(barrier);
     role ??= await this.stageRole(taskId);
     const def = exactWorkerRole(cfg, role);
     if (!def) throw new MinionsError('INVALID_CONFIG', `Unknown role "${String(role).slice(0, 40)}" (${workerRoleNames(cfg).join('|')}).`);

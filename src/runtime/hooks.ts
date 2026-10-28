@@ -13,7 +13,7 @@ import { TELEGRAM_TOOL_PREFIX } from './coordinator.js';
 import { runtimePaths } from './paths.js';
 import { capacityOf, scopeOf } from './scheduler.js';
 import { currentBudget } from './spend.js';
-import { noteTranscript } from './context-reset.js';
+import { noteTranscript, resetBarrier } from './context-reset.js';
 import { trackCoordinatorUsage } from './coordinator-usage.js';
 import { scanShell, ShellParseError, type ShellScan } from './shell-scan.js';
 import { bashStateReference, protectedStatePath, stateGuard, type StateGuard } from './state-guard.js';
@@ -85,6 +85,9 @@ export async function stopHook(input: unknown, load: HookLoader): Promise<HookOu
   try {
     if (db.paused().starts) return allow('paused');
     if (currentBudget({ db, config })?.exhausted) return allow('budget', 'the owner budget is used up (new claims are refused)');
+    // The reset barrier (task-57.6): new starts are held until the running workers return, so nothing is left to dispatch.
+    const barrier = resetBarrier({ db, config });
+    if (barrier) return allow('context-reset-pending', barrier.reason);
     if (backgroundRunning(inp)) return allow('background-running', 'a background subagent is still running');
     const leases = db.activeLeases();
     const leased = new Set(leases.map((l) => l.task_id));
