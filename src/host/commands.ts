@@ -322,7 +322,20 @@ async function importStateCommand(file: string, o: { force: boolean; json: boole
 }
 
 export function register(program: Command): void {
-  const auth = registerAuth(program, async (plan) => { process.stderr.write(plan + '\n'); return confirm('Apply? (y/n)'); });
+  const auth = registerAuth(program, async (plan) => { process.stderr.write(plan + '\n'); return confirm('Apply? (y/n)'); }, {
+    // `auth set login --headless-token` (task-96): the token is read only here, from the host terminal (no echo) or a pipe; never from argv.
+    readHeadlessToken: async ({ stdin }) => stdin ? readStdinSecret()
+      : process.stdin.isTTY ? readSecret('Headless Claude token from `claude setup-token` (input hidden): ')
+        : (() => { throw new MinionsError('PRECONDITION', 'No terminal to prompt for the headless token.', 'Run in a terminal, or pipe it: `minions auth set login --headless-token --stdin --yes < token-file`.'); })(),
+    // A copy into a running container's secrets mount applies at once (live runs read the file at each start).
+    applySecrets: async (projectId) => {
+      const project = await loadProjectJson(projectId);
+      if (runtimeOf(project) === 'host') return 'not-running'; // live runs are Docker-runtime only
+      const vis = await new Compose(projectId).secretsVisibility();
+      if (vis === 'mounted') await materialize(true, projectId);
+      return vis;
+    },
+  });
   program.command('init [path]')
     .description('Inspect a Git repository, propose an install plan, apply it, and verify the runtime')
     .addOption(new Option('--profile <profile>', 'starting profile').choices([...PROFILES]))
