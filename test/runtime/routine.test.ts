@@ -18,6 +18,7 @@ import {
   type CoordinatorView, type RoutinePassDeps, type RoutineSettings, type WakeInputs, type WakeReason,
 } from '../../src/runtime/routine.js';
 import { makeEnv, tmp } from './fixtures.js';
+import { recordOwnerMessageViaStop } from './transcript-shapes.js';
 
 const T0 = new Date('2026-10-27T12:00:00.000Z');
 const ago = (min: number, from = T0) => new Date(from.getTime() - min * 60_000).toISOString();
@@ -213,6 +214,12 @@ describe('runRoutinePass', () => {
     expect((await runRoutinePass(t.deps, { trigger: 'manual', force: true })).decision!.why).toMatch(/owner wrote 12 min ago/);
     t.env.db.setMeta(LAST_OWNER_MESSAGE_META, ago(45));
     expect((await runRoutinePass(t.deps, { trigger: 'manual', force: true })).decision!.action).toBe('wake');
+  });
+
+  it('a real plugin owner message (source="plugin:telegram:telegram") counted by the Stop hook blocks the wake', async () => {
+    const t = passEnv({ next: runnableNext, mtime: () => Date.parse(ago(40)) });
+    expect(recordOwnerMessageViaStop(t.env.db, new Date(ago(10)))).toMatchObject({ recorded: true });
+    expect((await runRoutinePass(t.deps, { trigger: 'clock' })).decision).toMatchObject({ action: 'none', why: expect.stringMatching(/owner wrote 10 min ago/) });
   });
 
   it('crash start: separate path, recorded, at most 2 a day', async () => {

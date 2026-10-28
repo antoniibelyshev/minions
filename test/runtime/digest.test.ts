@@ -13,6 +13,7 @@ import { spendReport } from '../../src/runtime/spend.js';
 import { routineSettings, runRoutinePass, WAKE_EVENT, type CoordinatorView, type RoutinePassDeps, type RoutineSettings } from '../../src/runtime/routine.js';
 import { localDayStart, localStamp, zonedParts, zonedTimeToUtc } from '../../src/runtime/zoned-time.js';
 import { makeEnv } from './fixtures.js';
+import { recordOwnerMessageViaStop } from './transcript-shapes.js';
 
 const BERLIN: RoutineSettings = routineSettings({ routine: { enabled: true } });
 const at = (iso: string) => new Date(iso);
@@ -123,6 +124,13 @@ describe('holds', () => {
   it('the owner message time (Stop hook meta) turns default holds off', () => {
     const env = makeEnv((c) => { c.routine = { enabled: true }; });
     env.db.setMeta(LAST_OWNER_MESSAGE_META, '2026-10-27T09:50:00.000Z');
+    expect(holdFor(env.db, env.config, 'question', undefined, now)).toBeNull();
+  });
+
+  it('a real plugin owner message (source="plugin:telegram:telegram") counted by the Stop hook turns default holds off', () => {
+    const env = makeEnv((c) => { c.routine = { enabled: true }; });
+    expect(holdFor(env.db, env.config, 'question', undefined, now)).not.toBeNull();
+    expect(recordOwnerMessageViaStop(env.db, at('2026-10-27T09:50:00Z'))).toMatchObject({ recorded: true });
     expect(holdFor(env.db, env.config, 'question', undefined, now)).toBeNull();
   });
 });

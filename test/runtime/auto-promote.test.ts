@@ -17,6 +17,7 @@ import { RuntimeDb } from '../../src/runtime/db.js';
 import { prepareDigest } from '../../src/runtime/digest.js';
 import { defaults } from '../helpers.js';
 import { FakeBacklog, makeDefaultEnv, tmp } from './fixtures.js';
+import { recordOwnerMessageViaStop } from './transcript-shapes.js';
 
 const NOW = new Date('2026-10-27T10:00:00.000Z'); // 11:00 in Berlin
 const hoursAgo = (h: number) => new Date(NOW.getTime() - h * 3_600_000).toISOString();
@@ -228,6 +229,16 @@ describe('checkPromotion: the runtime guard', () => {
     ticket!.commit('task-1');
     expect(t.db.eventsOfKindSince(OWNER_PROMOTE_EVENT, '2000-01-01T00:00:00Z').map((e) => e.taskId)).toEqual(['task-1']);
     expect(promotionsToday(t.db, NOW, 'Europe/Berlin')).toBe(0);
+  });
+
+  it('a real plugin owner message (source="plugin:telegram:telegram") counted by the Stop hook satisfies --owner-approved and the silence cap', async () => {
+    const t = setup((c) => { c.communication.channel = 'telegram'; });
+    t.db.deleteMeta(LAST_OWNER_MESSAGE_META);
+    expect((await refusal(checkPromotion(idea('task-1', { ownerApproved: true }), t.deps))).message).toMatch(/no owner message in the last 30 minutes/);
+    expect((await refusal(checkPromotion(idea('task-2'), t.deps))).message).toMatch(/no owner message is on record/);
+    expect(recordOwnerMessageViaStop(t.db, new Date(NOW.getTime() - 5 * 60_000))).toMatchObject({ recorded: true });
+    expect((await checkPromotion(idea('task-1', { ownerApproved: true }), t.deps))?.kind).toBe('owner');
+    expect((await checkPromotion(idea('task-2'), t.deps))?.kind).toBe('auto');
   });
 
   it('--owner-approved: refused without an owner message in the last 30 minutes; the terminal channel allows it', async () => {
