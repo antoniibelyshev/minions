@@ -413,18 +413,21 @@ const MINIONS_BIN = '/usr/local/bin/minions';
 
 /**
  * The only submit-heredoc head line whose body is exempt: `minions work submit <args> <<'DELIM'` (or `<<"DELIM"`),
- * with `minions` bare or the installed binary path, args plain words, single spaces, nothing before or after.
+ * with `minions` bare or the installed binary path, args plain words, single spaces, nothing after. At most one
+ * `cd /<plain absolute path> && ` may come first (task-88: a subagent's Bash cwd resets to the primary checkout,
+ * and submit only works from inside the worktree); that path is checked with the rest of the head line.
  */
 const SUBMIT_HEAD = new RegExp(
-  `^(?:minions|${MINIONS_BIN.replace(/[./]/g, '\\$&')}) work submit(?: [A-Za-z0-9_.:=/-]+)* <<(['"])([A-Za-z_][A-Za-z0-9_]*)\\1$`,
+  `^(?:cd /[A-Za-z0-9_./-]* && )?(?:minions|${MINIONS_BIN.replace(/[./]/g, '\\$&')}) work submit(?: [A-Za-z0-9_.:=/-]+)* <<(['"])([A-Za-z_][A-Za-z0-9_]*)\\1$`,
 );
 
 /**
  * The command line with the heredoc body of `minions work submit` left out, for the runtime-state text check: a
  * worker's result is data minions reads on stdin, and its findings often name state paths (task-72). Allowlist,
  * fails closed: the body is left out only when the whole command is one simple command matching SUBMIT_HEAD
- * (no `;`, `&&`, `|`, `cd`, function or alias definitions, `env`/`command` prefixes, assignments, subshells,
- * redirections or launchers such as `node`), the delimiter is a plain quoted word (`'RESULT'` or `"RESULT"`: the
+ * (no `;`, `||`, `|`, function or alias definitions, `env`/`command` prefixes, assignments, subshells,
+ * redirections or launchers such as `node`; the only `&&` allowed is the one after a single leading
+ * `cd /<plain absolute path>`, with no options, quotes, expansions or second `cd`), the delimiter is a plain quoted word (`'RESULT'` or `"RESULT"`: the
  * shell expands nothing and joins no backslash-newlines in the body), and the command ends at the first line that
  * is exactly the delimiter (plus at most one newline). The head line itself is still checked. Any other input,
  * including unquoted delimiters, `<<-` and here-strings, is returned unchanged and gets the full check.
@@ -472,8 +475,8 @@ export function preBashHook(input: unknown, g?: StateGuard): HookOutput {
     return deny(`Workers may not touch the minions runtime state (${JSON.stringify(state.slice(0, 120))}): the runtime DB, backlog, briefs and results are the coordinator's. `
       + 'Use `minions work brief` / `minions work submit` for your lease. If you only mention the path as text, put that text in a file in your scratch dir '
       + '(`git commit -F <file>`) or use the Grep / Write tools. A result that names such a path is accepted only as exactly '
-      + "`minions work submit <lease> --role <role> --json <<'RESULT'` with nothing before or after it "
-      + '(no `cd … &&` before it, so it only works when your cwd is already the worktree); otherwise write the result to a file in your scratch dir and run '
+      + "`cd <worktree> && minions work submit <lease> --role <role> --json <<'RESULT'` (or without the `cd`), with an unquoted absolute "
+      + 'worktree path and nothing else before or after it; otherwise write the result to a file in your scratch dir and run '
       + '`cd <worktree> && minions work submit <lease> --role <role> --json < <file>`.');
   }
   const cwd = typeof input.cwd === 'string' && input.cwd.startsWith('/') ? input.cwd : process.cwd();

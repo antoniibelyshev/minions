@@ -252,8 +252,8 @@ describe('drain hook gate and phases (tester additions)', () => {
   it('drainSafeBash: the real worker finish and commit forms pass (templates and Claude Code)', () => {
     // The finish command exactly as templates/plugin/_partials/result-contract.md renders it.
     const template = readFileSync(new URL('../../templates/plugin/_partials/result-contract.md', import.meta.url), 'utf8');
-    const submit = /```bash\n([\s\S]*?)\n```/.exec(template)![1]!.replace('<leaseId>', 'lease-1').replace('{{workerRole}}', 'engineer').replace('{ ...WorkerResult JSON... }', longResult);
-    expect(submit.startsWith("minions work submit lease-1 --role engineer --json <<'RESULT'\n")).toBe(true);
+    const submit = /```bash\n([\s\S]*?)\n```/.exec(template)![1]!.replace('<worktree>', '/w').replace('<leaseId>', 'lease-1').replace('{{workerRole}}', 'engineer').replace('{ ...WorkerResult JSON... }', longResult);
+    expect(submit.startsWith("cd /w && minions work submit lease-1 --role engineer --json <<'RESULT'\n")).toBe(true);
     // The brief command from worker-common.md.
     const common = readFileSync(new URL('../../templates/plugin/_partials/worker-common.md', import.meta.url), 'utf8');
     const brief = /^cd <worktree> && minions work brief .*$/m.exec(common)![0].replace('<worktree>', '/w').replace('<leaseId>', 'lease-1').replace('{{workerRole}}', 'tester');

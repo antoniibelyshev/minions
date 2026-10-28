@@ -153,6 +153,8 @@ describe('heredoc bodies of minions work submit are data (allowlist, fails close
     `minions work submit lease-1 --role tester --json <<'RESULT'\n${finding}\nRESULT`,
     `minions work submit lease-1 --role engineer --json <<"RESULT"\n${finding}\nRESULT\n`,
     `/usr/local/bin/minions work submit lease-1 --role reviewer --json <<'R_2'\n${finding}\nR_2`,
+    // One leading `cd /<plain absolute path> && ` (task-88: a subagent's cwd resets to the primary checkout).
+    `cd /workspace/worktrees/task-88_x.y && minions work submit lease-1 --role tester --json <<'RESULT'\n${finding}\nRESULT`,
     // Body lines that only resemble the delimiter do not end it.
     `minions work submit lease-1 --json <<'RESULT'\n${finding}\n RESULT\nRESULT \nRESULT\\\nRESULT`,
   ])('allows %s', (cmd) => {
@@ -176,7 +178,18 @@ describe('heredoc bodies of minions work submit are data (allowlist, fails close
     'minions work submit lease-1 --role tester --json <<RESULT\n$(sqlite3 /state/minions.db .dump)\nRESULT',
     'minions work submit lease-1 --role tester --json <<RESULT\n`cat /state/briefs/x`\nRESULT',
     // Anything before the command: cd, assignments, env/command/exec/builtin prefixes, launchers, functions, aliases, subshells.
-    `cd ${worktree} && minions work submit lease-1 --json <<'RESULT'\n${finding}\nRESULT`,
+    // Only one plain `cd /<absolute path> && `: no relative, quoted, expanded or globbed target, options, `;`, `||` or second cd.
+    `cd worktrees/task-1 && minions work submit lease-1 --json <<'RESULT'\n${finding}\nRESULT`,
+    `cd ~/w && minions work submit lease-1 --json <<'RESULT'\n${finding}\nRESULT`,
+    `cd "/w" && minions work submit lease-1 --json <<'RESULT'\n${finding}\nRESULT`,
+    `cd $HOME && minions work submit lease-1 --json <<'RESULT'\n${finding}\nRESULT`,
+    `cd /w* && minions work submit lease-1 --json <<'RESULT'\n${finding}\nRESULT`,
+    `cd -P /w && minions work submit lease-1 --json <<'RESULT'\n${finding}\nRESULT`,
+    `cd /w; minions work submit lease-1 --json <<'RESULT'\n${finding}\nRESULT`,
+    `cd /w || minions work submit lease-1 --json <<'RESULT'\n${finding}\nRESULT`,
+    `cd /w && cd /x && minions work submit lease-1 --json <<'RESULT'\n${finding}\nRESULT`,
+    `cd /w && env minions work submit lease-1 --json <<'RESULT'\n${finding}\nRESULT`,
+    `cd /w  && minions work submit lease-1 --json <<'RESULT'\n${finding}\nRESULT`,
     `MINIONS_STATE_DIR=/state minions work submit lease-1 --json <<'RESULT'\n{}\nRESULT`,
     `PATH=/home/node/.cache/tmp/bin:$PATH minions work submit lease-1 --json <<'RESULT'\n${finding}\nRESULT`,
     `env minions work submit lease-1 --json <<'RESULT'\n${finding}\nRESULT`,
@@ -218,6 +231,14 @@ describe('heredoc bodies of minions work submit are data (allowlist, fails close
     expect(denied(preBashHook(bash(cmd, sub), container))).toBe(true);
   });
 
+  it('keeps checking the cd target of an exempt submit', () => {
+    for (const dir of ['/state', '/state/results', '/workspace/../state']) {
+      const cmd = `cd ${dir} && minions work submit lease-1 --json <<'RESULT'\n{}\nRESULT`;
+      expect(withoutSubmitBodies(cmd)).toBe(`cd ${dir} && minions work submit lease-1 --json <<'RESULT'`);
+      expect(denied(preBashHook(bash(cmd, sub), container))).toBe(true);
+    }
+  });
+
   it('keeps checking the head line of an exempt submit', () => {
     const cmd = `minions work submit /state/minions.db --json <<'RESULT'\n{}\nRESULT`;
     expect(withoutSubmitBodies(cmd)).toBe('minions work submit /state/minions.db --json <<\'RESULT\'');
@@ -230,7 +251,7 @@ describe('heredoc bodies of minions work submit are data (allowlist, fails close
   });
 
   it('the deny reason names the accepted submit forms', () => {
-    const out = preBashHook(bash(`cd /x && minions work submit lease-1 --json <<'RESULT'\n{"f":"/state/minions.db"}\nRESULT`, sub), container);
+    const out = preBashHook(bash(`cd "/x" && minions work submit lease-1 --json <<'RESULT'\n{"f":"/state/minions.db"}\nRESULT`, sub), container);
     const reason = JSON.parse(out.stdout!).hookSpecificOutput.permissionDecisionReason as string;
     expect(reason).toContain("<<'RESULT'");
     expect(reason).toContain('< <file>');

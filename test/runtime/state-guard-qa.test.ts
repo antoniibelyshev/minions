@@ -158,8 +158,8 @@ describe('state guard QA: submit-heredoc allowlist, more one-call variants (atte
     ]) expect(denied(preBashHook(bash(cmd), container)), JSON.stringify(cmd)).toBe(true);
   });
 
-  it('the deny for `cd <worktree> && submit <<heredoc` names the scratch-file route, and that route is allowed', () => {
-    const out = preBashHook(bash(`cd ${cwd} && ${head} <<'RESULT'\n${body}\nRESULT`), container);
+  it('the deny for a quoted `cd "<worktree>" && submit <<heredoc` names the scratch-file route, and that route is allowed', () => {
+    const out = preBashHook(bash(`cd "${cwd}" && ${head} <<'RESULT'\n${body}\nRESULT`), container);
     expect(denied(out)).toBe(true);
     expect(JSON.parse(out.stdout!).hookSpecificOutput.permissionDecisionReason).toContain('--json < <file>');
     expect(denied(preBashHook(bash(`cd ${cwd} && ${head} < /home/node/.cache/tmp/leases/l/result.json`), container))).toBe(false);
