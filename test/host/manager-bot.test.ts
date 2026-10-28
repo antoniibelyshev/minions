@@ -204,7 +204,7 @@ describe('manager-bot-token credential', () => {
     expect(r.steps.find((s) => s.id === 'manager')).toMatchObject({ status: 'done', detail: expect.stringMatching(/^bot 555666777 stored in a 0600 host file; not paired/) });
     const id = r.projectId;
     const secretsBefore = await C.materializeSecrets(id);
-    expect(secretsBefore).toEqual({ github: false, telegram: true, codex: false });
+    expect(secretsBefore).toEqual({ github: false, telegram: true, codex: false, claude: false });
     const p = projectPaths(id);
     expect(readdirSync(p.secretsDir).sort()).toEqual(['telegram-bot-token']);
     expect(readFileSync(p.telegramTokenFile, 'utf8')).toBe(COORD + '\n');

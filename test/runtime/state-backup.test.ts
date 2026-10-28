@@ -270,7 +270,7 @@ describe('state backup: minions secret file names (task-20.1)', () => {
     const rp = runtimePaths();
     const real = [pp.apiKeyFile, pp.githubTokenFile, pp.telegramTokenFile, rp.apiKeyFile, rp.githubTokenFile, rp.telegramTokenFile].map((f) => basename(f));
     for (const n of [...real, GITHUB_CREDENTIAL.fileName, TELEGRAM_CREDENTIAL.fileName, APPROVAL_SIGNING_KEY_NAME]) expect(MINIONS_SECRET_FILE_NAMES).toContain(n);
-    expect([...MINIONS_SECRET_FILE_NAMES].sort()).toEqual(['anthropic-api-key', 'approval-signing-key', 'github-token', 'telegram-bot-token']);
+    expect([...MINIONS_SECRET_FILE_NAMES].sort()).toEqual(['anthropic-api-key', 'approval-signing-key', 'claude-headless-token', 'github-token', 'telegram-bot-token']);
   });
 
   it('never archives a copy of a minions secret file inside an archived dir', async () => {

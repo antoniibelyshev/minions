@@ -2,7 +2,8 @@
 // `minions work run|claim|release` when agent_id is set; the coordinator is allowed; the hook fails closed.
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
-import { coordinatorOnlyWorkCommand, preBashHook, PRE_BASH_HOOK_COMMAND, runHook } from '../../src/runtime/hooks.js';
+import { coordinatorOnlyWorkCommand, preBashHook, preFileHook, PRE_BASH_HOOK_COMMAND, PRE_FILE_READ_HOOK_COMMAND, runHook } from '../../src/runtime/hooks.js';
+import { stateGuard } from '../../src/runtime/state-guard.js';
 import { FAKE_MINIONS, runHookCommand } from '../helpers.js';
 import { scanShell } from '../../src/runtime/shell-scan.js';
 
@@ -385,5 +386,31 @@ describe('coordinatorOnlyWorkCommand: arithmetic, heredocs and pipes (task-14.13
     'echo $(( 1 < 2 )) ; cat <<EOF\nok\nEOF',
   ])('allows %j', (cmd) => {
     expect(coordinatorOnlyWorkCommand(cmd)).toBeNull();
+  });
+});
+
+// Task-96: the live Claude run carries the runtime's Claude credential, so it is coordinator-only, and the mounted
+// secrets dir is protected from worker tool calls like the state dir.
+describe('coordinator live-run and the secrets dir (task-96)', () => {
+  const guard = stateGuard({ state: '/state', tmp: '/home/node/.cache/tmp', secretsDir: '/opt/minions/secrets' });
+  const read = (file_path: string) => ({ hook_event_name: 'PreToolUse', tool_name: 'Read', tool_input: { file_path }, cwd: '/workspace/worktrees/t', ...sub });
+
+  it.each(['minions coordinator live-run -- -p', 'minions --json coordinator live-run --dry-run', 'cd /x && minions coordinator --keep-dir live-run'])('denies %j to a worker', (cmd) => {
+    expect(coordinatorOnlyWorkCommand(cmd)).toBe('minions coordinator live-run');
+    expect(decision(preBashHook(bash(cmd, sub), guard))?.permissionDecision).toBe('deny');
+  });
+
+  it('allows the coordinator and other coordinator subcommands', () => {
+    expect(preBashHook(bash('minions coordinator live-run -- -p', {}), guard)).toEqual({ reason: 'allow: Bash from the coordinator' });
+    expect(coordinatorOnlyWorkCommand('minions coordinator status')).toBeNull();
+  });
+
+  it('denies a worker reading the headless token, by Bash or the Read tool; the hook filters forward such calls', () => {
+    expect(decision(preBashHook(bash('cat /opt/minions/secrets/claude-headless-token', sub), guard))?.permissionDecision).toBe('deny');
+    expect(decision(preFileHook(read('/opt/minions/secrets/claude-headless-token'), guard))?.permissionDecision).toBe('deny');
+    expect(decision(preFileHook(read('/workspace/worktrees/t/src/a.ts'), guard))).toBeNull();
+    expect(PRE_BASH_HOOK_COMMAND).toContain('/secrets');
+    expect(PRE_FILE_READ_HOOK_COMMAND).toContain('/secrets');
+    expect(stateGuard().roots.some((r) => r.endsWith('/secrets'))).toBe(true); // the default guard (runtimePaths) protects it
   });
 });

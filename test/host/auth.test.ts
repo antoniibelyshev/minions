@@ -340,3 +340,54 @@ describe('defaults.json and init', () => {
     expect(jb.claudeAuth).toMatchObject({ method: 'helper', preset: 'jbcentral', env: { ANTHROPIC_BASE_URL: CENTRAL_URL } });
   });
 });
+
+describe('auth set login --headless-token (task-96)', () => {
+  const OAUTH = `sk-ant-oat01-${'H'.repeat(80)}`;
+
+  it('stores the setup-token token without argv, materializes it, reports it in show, never echoes it; removal clears it', async () => {
+    const prev = process.env.MINIONS_CREDENTIAL_STORE;
+    process.env.MINIONS_CREDENTIAL_STORE = 'file';
+    try {
+      const repo = makeRepo(env.root);
+      const id = (await init(repo)).plan.projectId;
+      const p = projectPaths(id);
+      const before = await runAuthShow({}, { cwd: repo });
+      expect(formatAuthShow(before)).toMatch(/headless token .*missing.*claude setup-token.*minions auth set login --headless-token/);
+
+      // The token comes only from the injected reader (hidden prompt / piped stdin in the CLI), never from argv.
+      const reads: { stdin: boolean }[] = [];
+      const r = await runAuthSet('login', [], { yes: true, headlessToken: true, stdin: true }, {
+        cwd: repo, readHeadlessToken: async (o) => { reads.push(o); return `${OAUTH}\n`; }, applySecrets: async () => 'not-running',
+      });
+      expect(reads).toEqual([{ stdin: true }]);
+      expect(r.headless).toMatchObject({ stored: true, kind: 'oauth-token', envName: 'CLAUDE_CODE_OAUTH_TOKEN', backend: 'file', appliedToRunningContainer: false });
+      expect(r.plan.headlessToken).toMatchObject({ action: 'store', containerPath: '/opt/minions/secrets/claude-headless-token' });
+      const { materializeSecrets } = await import('../../src/host/credentials.js');
+      expect((await materializeSecrets(id)).claude).toBe(true);
+      expect(readFileSync(p.claudeHeadlessTokenFile, 'utf8').trim()).toBe(OAUTH);
+      expect(statSync(p.claudeHeadlessTokenFile).mode & 0o777).toBe(0o600);
+
+      const show = await runAuthShow({}, { cwd: repo });
+      expect(show.headless).toMatchObject({ state: 'ok', kind: 'oauth-token' });
+      for (const text of [JSON.stringify(r), formatAuthPlan(r.plan), JSON.stringify(show), formatAuthShow(show), readFileSync(p.projectJson, 'utf8'), readFileSync(p.composeYaml, 'utf8'), readFileSync(p.credentialsJson, 'utf8')]) {
+        expect(text).not.toContain(OAUTH);
+      }
+
+      const rm = await runAuthSet('login', [], { yes: true, removeHeadlessToken: true }, { cwd: repo });
+      expect(rm.headless).toMatchObject({ removed: true });
+      expect((await runAuthShow({}, { cwd: repo })).headless).toMatchObject({ state: 'missing' });
+    } finally {
+      if (prev === undefined) delete process.env.MINIONS_CREDENTIAL_STORE; else process.env.MINIONS_CREDENTIAL_STORE = prev;
+    }
+  });
+
+  it('rejects a malformed token before changing anything, and the flag on key methods (they reuse the provisioned key)', async () => {
+    const repo = makeRepo(env.root);
+    await init(repo);
+    const bad = await failure(runAuthSet('login', [], { yes: true, headlessToken: true }, { cwd: repo, readHeadlessToken: async () => 'not-a-token' }));
+    expect(bad.message).not.toContain('not-a-token');
+    expect((await runAuthShow({}, { cwd: repo })).headless).toMatchObject({ state: 'missing' });
+    expect((await failure(runAuthSet('api-key', [], { envVar: 'X', yes: true, headlessToken: true }, { cwd: repo }))).code).toBe('INVALID_CONFIG');
+    expect((await failure(runAuthSet('login', [], { headlessToken: true, stdin: true }, { cwd: repo, readHeadlessToken: async () => OAUTH }))).code).toBe('PRECONDITION');
+  });
+});
