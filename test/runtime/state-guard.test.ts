@@ -293,6 +293,17 @@ describe('workerMinionsCommand (worker allowlist of minions commands)', () => {
   });
 });
 
+describe('preBashHook: a relative MINIONS_STATE_DIR resolves against the input cwd (task-92)', () => {
+  it('a relative link in the worktree to the state dir is no redirect; an absolute scratch dir still is', () => {
+    symlinkSync(state, join(worktree, 'state-link'));
+    const run = (dir: string) => preBashHook(bash(`MINIONS_STATE_DIR=${dir} minions backlog update task-1 --pr-url x`, { ...sub, cwd: worktree }), host);
+    expect(denied(run('./state-link'))).toBe(true);
+    expect(denied(run('state-link/'))).toBe(true);
+    expect(denied(run(join(tmp, 'scratch', 'state')))).toBe(false);
+    expect(denied(run('./scratch-state'))).toBe(false);
+  });
+});
+
 describe('preBashHook (task-72 additions)', () => {
   it('refuses a subagent naming the state dir or running a state-writing minions command; the coordinator keeps both', () => {
     for (const cmd of ['sqlite3 /state/minions.db .tables', 'minions backlog update task-1 --pr-url x', 'minions work record lease-1']) {
