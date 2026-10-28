@@ -42,22 +42,28 @@ function run(child: ChildProcess): Promise<string> {
   });
 }
 
-/** A separate process that opens path in rollback-journal mode and holds a read (SHARED) lock for holdMs. */
-async function holdSharedLock(path: string, holdMs: number): Promise<{ done: Promise<void> }> {
+/**
+ * A separate process that opens path in rollback-journal mode and holds a read (SHARED) lock: for holdMs, or
+ * (holdMs omitted) until release() closes its stdin, so a test never races a fixed hold time against load.
+ */
+async function holdSharedLock(path: string, holdMs?: number): Promise<{ done: Promise<void>; release: () => void; exited: () => boolean }> {
   const child = spawn(process.execPath, ['-e', `
     const { DatabaseSync } = require('node:sqlite');
     const db = new DatabaseSync(process.argv[1]);
     db.exec('CREATE TABLE IF NOT EXISTS pin (x)');
     db.exec('BEGIN'); db.prepare('SELECT count(*) FROM pin').get();
     process.stdout.write('locked\\n');
-    setTimeout(() => { db.exec('COMMIT'); db.close(); process.exit(0); }, ${holdMs});
-  `, path], { stdio: ['ignore', 'pipe', 'ignore'] });
+    const end = () => { db.exec('COMMIT'); db.close(); process.exit(0); };
+    if (${holdMs ?? -1} >= 0) setTimeout(end, ${holdMs ?? -1}); else { process.stdin.resume(); process.stdin.once('end', end); }
+  `, path], { stdio: ['pipe', 'pipe', 'ignore'] });
+  let exited = false;
+  const done = new Promise<void>((res) => child.once('exit', () => { exited = true; res(); }));
   await new Promise<void>((res, rej) => {
     child.stdout!.once('data', () => res());
     child.once('error', rej);
     child.once('exit', (code) => rej(new Error(`lock holder exited early (code ${code})`)));
   });
-  return { done: new Promise((res) => child.once('exit', () => res())) };
+  return { done, release: () => child.stdin!.end(), exited: () => exited };
 }
 
 describe('runtime DB: concurrent first opens of a fresh database', () => {
@@ -90,17 +96,27 @@ describe('runtime DB: concurrent first opens of a fresh database', () => {
     try {
       expect(Date.now() - started).toBeGreaterThanOrEqual(300); // it waited for the holder instead of failing
       expect(d.get('PRAGMA journal_mode')).toEqual({ journal_mode: 'wal' });
+      expect(d.get('PRAGMA busy_timeout')).toEqual({ timeout: 5000 }); // the WAL switch restored the normal busy_timeout
       expect(d.getMeta('schema_version')).toBe(String(SCHEMA_VERSION));
     } finally { d.close(); }
     await holder.done;
   }, 30_000);
 
   it('fails loudly when the DB cannot be switched to WAL within the retry budget', async () => {
+    // The holder keeps its lock until the test releases it, and the budget is injected: the assertion is that
+    // openDb gives up after its budget while the lock is still held, not a wall-clock race between a fixed
+    // 8 s hold and the 5 s production budget (which load stretched to 7.7 s, task-95).
     const db = join(tmp('minions-fresh-stuck-'), 'runtime.db');
-    const holder = await holdSharedLock(db, 8000);
-    const started = Date.now();
-    expect(() => openDb(db)).toThrow(expect.objectContaining({ code: 'INTERNAL', message: expect.stringContaining('WAL mode') }));
-    expect(Date.now() - started).toBeLessThan(7000); // bounded by the 5 s budget
+    const holder = await holdSharedLock(db);
+    try {
+      const budget = 300;
+      const started = Date.now();
+      expect(() => openDb(db, { walRetryBudgetMs: budget })).toThrow(expect.objectContaining({ code: 'INTERNAL', message: expect.stringContaining('WAL mode') }));
+      const took = Date.now() - started;
+      expect(took).toBeGreaterThanOrEqual(budget); // it kept retrying for the whole budget
+      expect(took).toBeLessThan(3_000); // and stopped near the injected budget: no attempt waits past it
+      expect(holder.exited()).toBe(false); // it failed while the lock was really held
+    } finally { holder.release(); }
     await holder.done;
   }, 30_000);
 });

@@ -223,12 +223,18 @@ const drainNoticeOf = (r: EventRow): DrainNotice[] => {
   return [{ id: r.id, at: r.at, taskId: r.task_id, leaseId: d.leaseId, eventId: d.eventId, agentId: String(d.agentId ?? ''), agentType: String(d.agentType ?? ''), tool: String(d.tool ?? ''), via }];
 };
 
+/** Options for opening a RuntimeDb. Production callers pass none; tests shorten the WAL retry budget. */
+export interface RuntimeDbOptions {
+  /** How long to retry the switch to WAL before failing (default BUSY_TIMEOUT_MS). */
+  walRetryBudgetMs?: number;
+}
+
 export class RuntimeDb {
   readonly path: string;
   readonly sql: DatabaseSync;
   private depth = 0;
 
-  constructor(path = runtimePaths().db) {
+  constructor(path = runtimePaths().db, opts: RuntimeDbOptions = {}) {
     this.path = path;
     const { DatabaseSync } = loadSqlite();
     if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true });
@@ -238,7 +244,7 @@ export class RuntimeDb {
       throw new MinionsError('INTERNAL', `Cannot open runtime database ${path}: ${(e as Error).message}`);
     }
     this.sql.exec(`PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS}`);
-    if (path !== ':memory:') this.enableWal();
+    if (path !== ':memory:') this.enableWal(opts.walRetryBudgetMs ?? BUSY_TIMEOUT_MS);
     this.sql.exec('PRAGMA foreign_keys = ON');
     this.migrate();
   }
@@ -248,15 +254,21 @@ export class RuntimeDb {
    * at once, without calling the busy handler, so concurrent first opens of a fresh database failed with
    * "database is locked" (task-20.3). Retry with a short bounded backoff, then require WAL or fail loudly.
    * On a database already in WAL the pragma is a no-op that takes no write lock.
+   *
+   * When another connection holds a plain read lock, SQLite does call the busy handler, so a single attempt
+   * could wait the whole busy_timeout after the budget was nearly spent: the budget really allowed about
+   * budget + busy_timeout (5.4 s for a 300 ms budget, 7.7 s for the default under load; task-95). Each
+   * attempt therefore waits at most what is left of the budget; busy_timeout is restored afterwards.
    */
-  private enableWal(): void {
-    const deadline = Date.now() + BUSY_TIMEOUT_MS;
+  private enableWal(budgetMs: number): void {
+    const deadline = Date.now() + budgetMs;
     let delay = 5;
     let last = '';
     for (;;) {
       try {
+        this.sql.exec(`PRAGMA busy_timeout = ${Math.max(0, deadline - Date.now())}`);
         const mode = (this.sql.prepare('PRAGMA journal_mode = WAL').get() as { journal_mode?: unknown } | undefined)?.journal_mode;
-        if (String(mode).toLowerCase() === 'wal') return;
+        if (String(mode).toLowerCase() === 'wal') { this.sql.exec(`PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS}`); return; }
         last = `journal_mode is ${String(mode)}`;
       } catch (e) {
         if (!isBusy(e)) { this.sql.close(); throw e; }
@@ -693,4 +705,4 @@ export class RuntimeDb {
   }
 }
 
-export const openDb = (path?: string) => new RuntimeDb(path);
+export const openDb = (path?: string, opts?: RuntimeDbOptions) => new RuntimeDb(path, opts);

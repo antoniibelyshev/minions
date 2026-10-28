@@ -261,25 +261,32 @@ describe('CI-gated auto-merge (mocked gh)', () => {
     expect(env.gh.merges()).toEqual([]);
   });
 
-  it('pr.merge allow arms without approval; a sensitive-path change upgrades it to ask; deny never arms', async () => {
+  // One case per test: each builds its own repository, origin and full delivery, and the three together ran
+  // past the 5 s default timeout under parallel worker load (task-94).
+  it('pr.merge allow arms without approval', async () => {
     const env = mergeEnv((c) => { c.capabilities['pr.merge'] = 'allow'; });
     await deliver(env, 'task-1');
     env.gh.pr().rollup = passing;
     expect((await sync(env, ['task-1'])).tasks[0]!.merge).toMatchObject({ state: 'armed' });
+  });
 
+  it('pr.merge allow: a sensitive-path change upgrades it to ask, and a publish approval does not authorize the merge', async () => {
+    const env = mergeEnv((c) => { c.capabilities['pr.merge'] = 'allow'; });
     // Sensitive path: publication needs a host-signed publish approval, the merge a separate merge approval.
     const { r, head } = await deliver(env, 'task-2', 'infra/main.tf');
     expect(r.publication?.state).toBe('awaiting-approval');
     env.sched.approvePublication('task-2', { head, signature: env.keys.sign('task-2', head) });
     expect((await env.sched.publish('task-2')).merge).toMatchObject({ state: 'waiting' });
-    env.gh.pr(1).rollup = passing;
+    env.gh.pr().rollup = passing;
     const m = (await sync(env, ['task-2'])).tasks[0]!.merge!;
     expect(m).toMatchObject({ state: 'awaiting-approval', reasons: [expect.stringMatching(/sensitive paths \(infra\/main\.tf\)/)] });
     // The publish approval for the same head does not authorize the merge (it is a publish-scope row).
     expect(m.approvalError).toBe('no host-signed approval is recorded');
     env.sched.approveMerge('task-2', { head, signature: mergeToken(env, 'task-2', head) });
     expect((await sync(env, ['task-2'])).tasks[0]!.merge).toMatchObject({ state: 'armed' });
+  });
 
+  it('pr.merge deny never arms, even with a host-signed merge approval', async () => {
     const denied = mergeEnv((c) => { c.capabilities['pr.merge'] = 'deny'; });
     const d = await deliver(denied, 'task-1');
     denied.gh.pr().rollup = passing;

@@ -179,6 +179,30 @@ Host runtime: upgrades are `minions down && minions start` after installing the 
 is damaged after an upgrade, restore the backup you took before it (`minions import --state <file>`),
 then `minions settings restart`.
 
+## The verification gate fails under load
+
+With `local` delivery the coordinator verifies each merge on the merged tree (`git merge --no-ff
+--no-commit`, then the verification commands) while engineers and testers run their own suites in the
+same container. Two kinds of failure come from that load, not from the change:
+
+- **Timeouts.** A test that passes alone fails on its time limit. Raise the test runner's default
+  timeout moderately and make tests that assert wall-clock bounds deterministic (inject the clock or
+  the budget, wait on events instead of fixed sleeps). Do not add blanket retries: they hide real
+  failures.
+- **The process limit.** The container's `pids_limit` (`container.pidsLimit`, default 512) counts
+  threads, not just processes. When it is reached the suite crashes rather than fails: `failed to
+  create new OS thread ... errno=11`, `spawn ... EAGAIN`, `cannot fork()`, a test runner `EPIPE`.
+  Check with `cat /sys/fs/cgroup/pids.current /sys/fs/cgroup/pids.max` inside the container. Bound the
+  suite's own concurrency so that the gate and two worker suites fit together, or raise the limit on
+  the host with `minions settings set container.pidsLimit <n>` (applied when the container is
+  recreated).
+
+This repository's own `vitest.config.ts` does both: a 20 s default test timeout, at most 4 test
+workers (`MINIONS_TEST_MAX_WORKERS` overrides it), and fewer threads per spawned process
+(`--v8-pool-size=1` in `NODE_OPTIONS`, `UV_THREADPOOL_SIZE=2`, and `BUN_JSC_useConcurrentJIT=0` for the
+Bun-built `backlog` CLI). One full `npm test` peaks near 120 threads that way, down from about 190 with
+vitest's per-core default, so three suites fit next to the coordinator and its workers.
+
 ## Still stuck
 
 - `minions status --check --json` and `minions status --json` give the full picture for a bug report

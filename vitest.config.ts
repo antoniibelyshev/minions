@@ -4,11 +4,36 @@ import { readFileSync } from 'node:fs';
 const pkg = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8')) as { version: string };
 const docker = process.env.MINIONS_DOCKER_TESTS === '1';
 
+/**
+ * Bounded concurrency (task-81). The container caps tasks at pids.max = 512, and that limit counts threads,
+ * not processes: with vitest's default (one worker per core but one) a single suite peaked near 190 threads,
+ * so the integration gate and two worker suites running at once hit the cap ("failed to create new OS
+ * thread", spawn EAGAIN, a vitest EPIPE). Four workers are as fast here (the suite is subprocess-bound), and
+ * MINIONS_TEST_MAX_WORKERS overrides the cap (e.g. 1 on a tiny machine, more on an idle host).
+ */
+const maxWorkers = Number(process.env.MINIONS_TEST_MAX_WORKERS) || 4;
+// Fewer threads per child process, inherited by the workers and everything the tests spawn (set before any
+// worker starts; an explicit value wins). Each `backlog` CLI call (a Bun binary) starts concurrent-JIT
+// threads per core, 8-30 per call under load instead of 3; every node process starts 4 V8 platform threads
+// (7 threads idle, 4 with a pool of 1) and a libuv pool of 4 on first fs use. Code under test that scrubs
+// NODE_OPTIONS from a child env still does; this only trims threads where the variable is inherited.
+process.env.BUN_JSC_useConcurrentJIT ??= '0';
+process.env.UV_THREADPOOL_SIZE ??= '2';
+if (!/--v8-pool-size/.test(process.env.NODE_OPTIONS ?? '')) process.env.NODE_OPTIONS = `${process.env.NODE_OPTIONS ?? ''} --v8-pool-size=1`.trim();
+
 export default defineConfig({
   define: { __MINIONS_VERSION__: JSON.stringify(pkg.version) },
   test: {
     include: ['test/**/*.test.ts'],
     exclude: ['node_modules/**', 'dist/**', ...(docker ? [] : ['test/docker/**'])],
+    // Headroom for the local integration gate (task-81): `npm test` runs on the merged tree while other
+    // workers run their own suites, and many tests here do real git and subprocess work that takes ~1 s idle
+    // but ran past the 5 s default under that load. A higher default only gives slow-but-correct tests time;
+    // a failing assertion still fails at once, and there are no retries. Tests asserting wall-clock bounds
+    // must not depend on this: they inject their clock or budget instead (task-93, task-95).
+    testTimeout: 20_000,
+    hookTimeout: 30_000,
+    maxWorkers,
     // Claude Code never runs against the user's real ~/.claude (its plugins, e.g. the Telegram channel).
     globalSetup: ['test/setup/global.ts'],
     setupFiles: ['test/setup/claude-guard.ts', 'test/setup/tmpdir.ts'],
