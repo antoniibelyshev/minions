@@ -13,7 +13,7 @@ import type { NextReport, NextStage, RecordResponse, Scheduler, UsageFlag } from
  * next runnable stage exactly as `work claim --compact` (claimWithBrief), picked from `work next` (Scheduler.next):
  * the same task's next stage first, else the first runnable stage overall. All checks stay in those functions;
  * this module only decides whether to claim, and never claims while paused, draining, over budget, after an
- * invalid result, or when a context reset is due.
+ * invalid result, when a context reset is due, or while the reset barrier holds new starts (task-57.6).
  */
 
 /** Why advance claimed nothing: the coordinator decides (see the orchestrate skill, step 6). */
@@ -42,6 +42,8 @@ export type AdvanceDecisionKind =
   | 'qa-findings'
   /** A context reset is due: hand off and restart before dispatching more. */
   | 'context-reset'
+  /** The reset barrier (task-57.6): the context is at the barrier and workers still run; start nothing new, record them as they return. */
+  | 'context-reset-pending'
   /** Starts are paused (paused_starts). */
   | 'paused'
   /** The owner budget is used up: new claims are refused. */
@@ -126,6 +128,10 @@ export function nextDecision(db: RuntimeDb, n: NextReport): AdvanceDecision | nu
   if (n.startsBlocked) {
     const kind: AdvanceDecisionKind = db.drain() ? 'draining' : db.paused().starts ? 'paused' : 'budget';
     return { kind, message: n.startsBlocked.message, code: n.startsBlocked.code, ...(n.startsBlocked.hint ? { hint: n.startsBlocked.hint } : {}), ...extra };
+  }
+  if (n.resetPending) {
+    const waiting = n.waiting.map((w) => ({ taskId: w.taskId, role: w.role, waitingOn: w.waitingOn, why: w.why }));
+    return { kind: 'context-reset-pending', message: n.resetPending.message, hint: n.resetPending.hint, ...(waiting.length ? { waiting } : {}), ...extra };
   }
   if (n.runnable.length) return null;
   const capped = n.waiting.filter((w) => w.waitingOn !== 'starts' && w.waitingOn !== 'requires');

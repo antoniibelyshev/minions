@@ -370,6 +370,12 @@ export const MinionsConfigSchema = z.object({
       contextTokens: z.number().int().min(1000).nullable().optional(),
       /** Reset after this many worker hand-offs (records and releases) in this session (default 10). */
       handoffs: z.number().int().min(1).nullable().optional(),
+      /**
+       * Reset barrier (default 120000): once the session's context reaches this many tokens and only running workers
+       * block the reset, new stages are held (`work claim`/`work advance`/`work next`: `context-reset-pending`) and
+       * the reset is due when the last worker is recorded. `null` = no barrier.
+       */
+      barrierTokens: z.number().int().min(1000).nullable().optional(),
     }).strict().optional(),
   }).strict().optional(),
   /**

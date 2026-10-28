@@ -515,7 +515,9 @@ describe('file hand-offs and compact reads', () => {
     expect(coord).toContain('`minions coordinator restart --recover --detach --json`');
     expect(coord).toMatch(/Never restart while a worker lease is active \(the restart refuses; never use --force for a reset\)/);
     expect(coord).not.toMatch(/setsid|Idle context reset \(opt-in\)/);
+    expect(coord).toMatch(/Barrier: once the context reaches 120k tokens while workers run, `work claim\|advance\|next` start nothing new \(`context-reset-pending`\)/);
     const orch = await g.read('skills/orchestrate/SKILL.md');
+    expect(orch).toMatch(/`context-reset-pending`: the context is at the reset barrier; start nothing new/);
     expect(orch).toMatch(/If the response carries `contextReset` \(`due: true`\), do the context reset now/);
     expect(orch).toMatch(/unless a record or release response carried `contextReset`/);
     const recover = await g.read('skills/recover/SKILL.md');
