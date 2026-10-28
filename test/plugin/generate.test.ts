@@ -380,6 +380,7 @@ describe('Telegram tools are coordinator-only', () => {
       expect(coord).toContain(LIVE_CLAUDE_RUN_GUIDANCE);
       expect(coord).toMatch(/Only you run it, at a controlled moment: no worker lease is active/);
       expect(coord).toMatch(/separate, fresh `CLAUDE_CONFIG_DIR`/);
+      expect(coord).toMatch(/`minions coordinator live-run -- <claude args>`.*refuses while a worker lease is active/);
       expect(coord).toMatch(/workers never launch claude sessions/);
       expect(coord).not.toMatch(/Never launch nested claude sessions \(`claude -p` and the like\) yourself/);
       for (const [role] of WORKER_AGENTS) {

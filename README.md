@@ -746,6 +746,29 @@ minions auth refresh            # re-run the helper / re-read the source now
 minions auth show [--json]      # method, source, masked env, key file status, last refresh and the Codex key status; never a key
 ```
 
+**Headless runs (live checks in a fresh config dir):** when a task needs a live Claude Code run, the
+coordinator starts it with `minions coordinator live-run -- <claude args>` (prompt on stdin). The run
+gets a fresh, empty `CLAUDE_CONFIG_DIR`, so it loads none of the coordinator's plugins (above all not the
+Telegram channel) and cannot take the bot. It is refused while any worker lease is active, and the
+worker hooks refuse it to every subagent. `--dry-run` shows the credential path, argv and settings
+without a secret.
+
+- `api-key`, `helper`, `jbcentral`: nothing to do. The run's settings get the same apiKeyHelper
+  (`cat /opt/minions/secrets/anthropic-api-key`); the key is never copied.
+- `login`: a fresh config dir has no `/login`, so store a long-lived token once, on the host:
+
+  ```sh
+  claude setup-token                          # prints a token (sk-ant-oat01-…); it is valid for about a year
+  minions auth set login --headless-token     # paste it at the hidden prompt (or: --headless-token --stdin --yes < file)
+  minions auth show                           # "headless token …: ok — oauth-token stored in …"
+  ```
+
+  The token is kept in the Keychain (Secret Service on Linux, or a 0600 host file) and copied to the
+  mounted `secrets` directory (0600); a running container sees it at once. Only `live-run` reads it and
+  passes it to its `claude` as `CLAUDE_CODE_OAUTH_TOKEN` (an Anthropic API key stored this way goes in as
+  `ANTHROPIC_API_KEY`), never in argv, the coordinator's config, logs or `status`. The worker hooks refuse
+  tool calls that name the secrets dir. `minions auth set login --remove-headless-token` deletes it.
+
 **Global default:** `minions auth set <method> … --global` writes `<MINIONS_HOME>/defaults.json`
 (`{ "claudeAuth": … }`), which `minions init` uses for new projects. A project's own setting always
 wins. The `init` wizard asks the same question (JetBrains Central is offered only when `central` is

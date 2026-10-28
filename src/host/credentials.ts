@@ -20,7 +20,7 @@ import { run } from '../core/exec.js';
 import { atomicWrite, ensureDir, readJsonIfExists, writeJson } from '../core/fsutil.js';
 import { prepareSecretsDir, probeSecretsAccess, secretFileMode, secretGid, type SecretsAccess } from './secrets-access.js';
 import { redact } from '../core/output.js';
-import { credentialStoreDir, credentialStoreFile, defaultsPath, managerDir, managerPaths, projectPaths } from '../core/paths.js';
+import { CLAUDE_HEADLESS_TOKEN_FILE, credentialStoreDir, credentialStoreFile, defaultsPath, managerDir, managerPaths, projectPaths } from '../core/paths.js';
 import { BOTFATHER_URL, checkTelegramTokenFormat } from '../telegram/token.js';
 import { loadRegistry } from './registry.js';
 
@@ -193,7 +193,7 @@ export interface StoreKind {
 
 /** One per-project secret type. Every kind shares the stores, the project reference file and the secrets mount. */
 export interface CredentialKind extends StoreKind {
-  readonly name: 'github' | 'telegram' | 'codex';
+  readonly name: 'github' | 'telegram' | 'codex' | 'claude';
 }
 
 export const GITHUB_CREDENTIAL: CredentialKind = {
@@ -209,7 +209,18 @@ export const CODEX_CREDENTIAL: CredentialKind = {
   name: 'codex', label: 'OpenAI API key (Codex)', keychainService: 'minions.codex', keychainLabel: 'minions-codex-api-key',
   fileName: 'codex-api-key', check: (raw) => checkOpenAiKeyFormat(raw).token, command: 'minions auth codex',
 };
-export const CREDENTIAL_KINDS = [GITHUB_CREDENTIAL, TELEGRAM_CREDENTIAL, CODEX_CREDENTIAL] as const;
+/**
+ * Headless Claude token of the `login` method (task-96): a `claude setup-token` OAuth token (or an Anthropic API key) for
+ * minions-launched headless runs in a fresh CLAUDE_CONFIG_DIR (`minions coordinator live-run`), which cannot use the
+ * coordinator's interactive /login. Only that command reads the materialized copy and passes it to its claude child in
+ * the environment (CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY, by its prefix). The key methods need none: headless runs
+ * reuse the provisioned key through an apiKeyHelper.
+ */
+export const CLAUDE_HEADLESS_CREDENTIAL: CredentialKind = {
+  name: 'claude', label: 'headless Claude token', keychainService: 'minions.claude-headless', keychainLabel: 'minions-claude-headless-token',
+  fileName: CLAUDE_HEADLESS_TOKEN_FILE, check: (raw) => checkClaudeTokenFormat(raw).token, command: 'minions auth set login --headless-token',
+};
+export const CREDENTIAL_KINDS = [GITHUB_CREDENTIAL, TELEGRAM_CREDENTIAL, CODEX_CREDENTIAL, CLAUDE_HEADLESS_CREDENTIAL] as const;
 
 /** Store account of the host-wide manager bot token (never a project UUID, so it cannot collide with one). */
 export const MANAGER_ACCOUNT = 'manager';
@@ -525,6 +536,13 @@ export const CredentialsJsonSchema = z.object({
     ref: z.string().min(1),
     updatedAt: z.string(),
   }).strict().optional(),
+  claude: z.object({
+    backend: z.enum(BACKENDS),
+    ref: z.string().min(1),
+    /** oauth-token (`claude setup-token`, CLAUDE_CODE_OAUTH_TOKEN) or api-key (ANTHROPIC_API_KEY); non-secret. */
+    kind: z.enum(['oauth-token', 'api-key']),
+    updatedAt: z.string(),
+  }).strict().optional(),
 }).strict();
 export type CredentialsJson = z.infer<typeof CredentialsJsonSchema>;
 export type GithubCredentialRef = NonNullable<CredentialsJson['github']>;
@@ -633,7 +651,7 @@ export async function provisionGithubToken(opts: ProvisionOptions): Promise<Prov
 }
 
 /** Stores the token in the selected backend and deletes a copy left in a previous backend. */
-async function storeToken(opts: ProvisionOptions | TelegramProvisionOptions | CodexProvisionOptions, kind: CredentialKind, token: string, runner: Runner): Promise<{ backend: Backend; ref: string }> {
+async function storeToken(opts: ProvisionOptions | TelegramProvisionOptions | CodexProvisionOptions | ClaudeHeadlessProvisionOptions, kind: CredentialKind, token: string, runner: Runner): Promise<{ backend: Backend; ref: string }> {
   const store = opts.store ?? await selectStore({ ...opts, runner, kind });
   const prev = (await loadCredentialRefs(opts.projectId))[kind.name];
   await store.set(opts.projectId, token);
@@ -982,6 +1000,54 @@ export async function codexCredentialStatus(projectId: string, opts: { runner?: 
   return { state: problems.length ? 'invalid' : 'ok', backend: ref.backend, detail: [`stored in ${where}`, ...problems].join('; ') };
 }
 
+// ---------------------------------------------------------------- headless Claude token (login method, task-96)
+
+export interface ClaudeHeadlessProvisionOptions extends StoreOptions {
+  projectId: string;
+  token: string;
+  repoPath: string;
+  store?: SecretStore;
+}
+export interface ClaudeHeadlessProvisionResult { projectId: string; backend: Backend; ref: string; kind: ClaudeTokenKind; envName: 'CLAUDE_CODE_OAUTH_TOKEN' | 'ANTHROPIC_API_KEY' }
+
+/** Validates the token shape, stores it and records the (non-secret) reference with its kind. No network call. */
+export async function provisionClaudeHeadlessToken(opts: ClaudeHeadlessProvisionOptions): Promise<ClaudeHeadlessProvisionResult> {
+  const runner = opts.runner ?? run;
+  const { token, kind } = checkClaudeTokenFormat(opts.token);
+  assertOutsideRepo(opts.projectId, opts.repoPath);
+  const { backend, ref } = await storeToken(opts, CLAUDE_HEADLESS_CREDENTIAL, token, runner);
+  const refs = await loadCredentialRefs(opts.projectId);
+  await saveCredentialRefs(opts.projectId, { ...refs, claude: { backend, ref, kind, updatedAt: new Date().toISOString() } });
+  return { projectId: opts.projectId, backend, ref, kind, envName: claudeTokenEnvName(kind) };
+}
+
+export const removeClaudeHeadlessToken = (projectId: string, runner: Runner = run) => removeToken(projectId, CLAUDE_HEADLESS_CREDENTIAL, runner);
+
+export interface ClaudeHeadlessCredentialStatus extends CredentialStatus { kind?: ClaudeTokenKind }
+
+/** Headless Claude token: presence, kind, format and file mode. No network call; never includes the token. */
+export async function claudeHeadlessCredentialStatus(projectId: string, opts: { runner?: Runner } = {}): Promise<ClaudeHeadlessCredentialStatus> {
+  const runner = opts.runner ?? run;
+  let refs: CredentialsJson;
+  try { refs = await loadCredentialRefs(projectId); } catch (e) {
+    return { state: 'invalid', detail: `credential reference file is invalid: ${redact((e as Error).message).split('\n')[0]}` };
+  }
+  const ref = refs.claude;
+  if (!ref) return { state: 'missing', detail: 'no headless Claude token stored' };
+  let token: string | null;
+  try { token = await storeFor(ref.backend, runner, CLAUDE_HEADLESS_CREDENTIAL).get(projectId); } catch (e) {
+    return { state: 'invalid', backend: ref.backend, kind: ref.kind, detail: redact((e as Error).message) };
+  }
+  if (!token) return { state: 'missing', backend: ref.backend, kind: ref.kind, detail: `reference ${ref.ref} exists but the token is gone` };
+  const problems: string[] = [];
+  try { if (checkClaudeTokenFormat(token).kind !== ref.kind) problems.push('stored token does not match the recorded kind'); } catch { problems.push('stored value is not a Claude token'); }
+  if (ref.backend === 'file') {
+    const p = await fileModeProblem(CLAUDE_HEADLESS_CREDENTIAL, projectId);
+    if (p) problems.push(p);
+  }
+  return { state: problems.length ? 'invalid' : 'ok', backend: ref.backend, kind: ref.kind, detail: [`${ref.kind} stored in ${shortWhere(ref.backend)}`, ...problems].join('; ') };
+}
+
 // ---------------------------------------------------------------- container secrets dir
 
 /** Host path of a kind's materialized copy inside the mounted secrets directory. */
@@ -997,7 +1063,7 @@ export type Materialized = Record<CredentialKind['name'], boolean>;
  */
 export async function materializeSecrets(projectId: string, runner: Runner = run, access: SecretsAccess = probeSecretsAccess()): Promise<Materialized> {
   await prepareSecretsDir(projectPaths(projectId).secretsDir, access);
-  const out = { github: false, telegram: false, codex: false } as Materialized;
+  const out = { github: false, telegram: false, codex: false, claude: false } as Materialized;
   let failure: unknown;
   for (const kind of CREDENTIAL_KINDS) {
     const file = secretFile(projectId, kind);

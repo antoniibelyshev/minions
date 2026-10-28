@@ -114,7 +114,7 @@ describe('provisioning through the shared credential mechanism', () => {
     for (const p of allFiles(repo)) expect(readFileSync(p, 'utf8')).not.toContain(TOKEN);
 
     // Materialized next to the GitHub token in the read-only mounted dir.
-    expect(await C.materializeSecrets(ID)).toEqual({ github: true, telegram: true, codex: false });
+    expect(await C.materializeSecrets(ID)).toEqual({ github: true, telegram: true, codex: false, claude: false });
     expect(readFileSync(projectPaths(ID).telegramTokenFile, 'utf8')).toBe(TOKEN + '\n');
     expect(mode(projectPaths(ID).telegramTokenFile)).toBe(0o600);
     expect(CONTAINER.telegramTokenFile).toBe('/opt/minions/secrets/telegram-bot-token');
@@ -125,7 +125,7 @@ describe('provisioning through the shared credential mechanism', () => {
     expect(existsSync(projectPaths(ID).telegramTokenFile)).toBe(false);
     expect(existsSync(projectPaths(ID).githubTokenFile)).toBe(true);
     expect(await C.readGithubToken(ID)).toBe(GH);
-    expect(await C.materializeSecrets(ID)).toEqual({ github: true, telegram: false, codex: false });
+    expect(await C.materializeSecrets(ID)).toEqual({ github: true, telegram: false, codex: false, claude: false });
     await C.clearSecrets(ID);
     expect(existsSync(projectPaths(ID).githubTokenFile)).toBe(false);
   });

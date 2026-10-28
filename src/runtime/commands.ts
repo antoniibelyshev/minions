@@ -28,7 +28,7 @@ import type { PollerCheck } from '../telegram/isolation.js';
 import {
   buildClaudeCommand, buildCoordinatorCommand, telegramPollerStatus, claudePermissionModes, coordinatorWrapper, launchCoordinator, permissionModesNeeded, probeRuntime, readLaunchRecord, readMountedToken, RECOVERY_PROMPT,
   restartCoordinator, runtimeChannelFacts, scheduleDetachedRestart, syncCoordinator, coordinatorLaunchStatus, type LaunchStatus,
-  coordinatorPidAlive, procStartTime, readExitRecord, scheduleCrashStart, TELEGRAM_TOKEN_ENV, WAKE_PROMPT,
+  coordinatorPidAlive, procStartTime, readExitRecord, runtimeAuthMethod, scheduleCrashStart, TELEGRAM_TOKEN_ENV, WAKE_PROMPT,
 } from './coordinator.js';
 import { pidAlive } from './db.js';
 import { run as runChild } from '../core/exec.js';
@@ -67,6 +67,7 @@ import { HARNESS_PROMPTS_DIR } from '../plugin/generate.js';
 import { PROCESS_ADAPTERS } from './runner/adapters.js';
 import { reapRun, recoverRuns, runLease, type ReapDeps, type RecoverySweep, type RunOutput } from './runner/run.js';
 import { hasOpenRun, openRunsSync, withOpenRuns } from './runner/record.js';
+import { liveRun, liveRunExitCode, type LiveRunReport } from './headless.js';
 
 /** Human output of `minions work next`. */
 export function humanNext(r: NextReport): string {
@@ -891,6 +892,36 @@ export function register(program: Command): void {
       const raw = await readInput(undefined, 'the handoff text', 'Pipe the note in with a quoted heredoc; --read prints the stored one, --check reports whether a reset is due.');
       const r = await writeHandoff({ db: getDb(), path: paths.coordinatorHandoff }, raw);
       emit(r, { json, human: (d: typeof r) => `handoff stored (${d.bytes}/${d.maxBytes} bytes${d.redactions ? `, ${d.redactions} secret(s) redacted` : ''}${d.replaced ? ', replaced the previous one' : ''})` });
+    }));
+
+  // Task-96: the coordinator's controlled live Claude run. Coordinator-only (the pre-bash hook refuses it to every
+  // subagent, like `work run|claim|release`), refused while any worker lease is active, fresh CLAUDE_CONFIG_DIR.
+  coord.command('live-run').description('Coordinator only: run one headless claude for a controlled live check in a fresh CLAUDE_CONFIG_DIR with the runtime\'s Claude credential (claude args after --, prompt on stdin); refused while any worker lease is active (container only)')
+    .argument('[claudeArgs...]', 'arguments for claude, after --')
+    .option('--cwd <dir>', 'absolute working directory of the run (default: the current one)')
+    .option('--keep-dir', 'keep the run dir (the fresh config dir with its transcripts) instead of removing it')
+    .option('--dry-run', 'show what would run (credential path, argv, settings; never a secret) without running it')
+    .action(action(async (claudeArgs: string[], o: { cwd?: string; keepDir?: boolean }, cmd: Command) => {
+      requireMode('runtime');
+      if (runtimeMode() === 'host-runtime') {
+        throw new MinionsError('PRECONDITION', 'Live Claude runs are not available in the host runtime: its Bash commands are sandboxed (no secrets dir, no Anthropic API network), and it has no Telegram channel to protect.',
+          'Run the check from your own terminal on the host, or use the Docker runtime.');
+      }
+      const { json, dryRun } = globalOpts(cmd);
+      const d = getDb();
+      const workers = dryRun ? withOpenRuns(() => d.activeLeases(), runtimePaths().state) : await restartWorkers(d);
+      const r = await liveRun(claudeArgs, { cwd: o.cwd, keepDir: o.keepDir, dryRun }, {
+        activeLeases: workers, method: runtimeAuthMethod(), paths: runtimePaths(), log: (line) => process.stderr.write(line + '\n'),
+      });
+      if (dryRun) {
+        emit(r, { json, human: (x: LiveRunReport) => [`live run (dry run): ${x.method} method; credential: ${x.credential}`, `  argv: ${JSON.stringify([x.command, ...x.args])}`,
+          `  cwd: ${x.cwd}`, `  fresh config dir settings: ${JSON.stringify(x.settings)}`, `  env set by minions: ${x.setEnv.join(', ')}`,
+          ...(x.refused ? [`  refused now: ${x.refused}`] : [])].join('\n') });
+        return;
+      }
+      // stdout belongs to claude: minions' own lines go to stderr.
+      process.stderr.write(`live run: claude ${r.signal ? `ended by ${r.signal}` : `exited with code ${r.exitCode}`}; ${r.keptDir ? `run dir kept at ${r.configDir}` : 'run dir removed'}\n`);
+      process.exitCode = liveRunExitCode(r);
     }));
 
   // telegram: credential-free capability probe. Host mode delegates to the container, where Claude Code runs.

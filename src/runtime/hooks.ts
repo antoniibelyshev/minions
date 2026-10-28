@@ -213,12 +213,13 @@ export function preTelegramHook(input: unknown): HookOutput {
  * input has an `"agent_id"` key) whose input has `minions` followed by anything but `:` (so a worker's own
  * `"agent_type":"minions:<role>"` alone does not count) or names the entry script (`cli.js`); the coordinator's
  * own calls never reach it. Task-72 adds `/state` (the container state dir, and the last segment of the host
- * runtime's) and `MINIONS_STATE_DIR`, for the runtime-state check. These are speed filters only: any plain command
+ * runtime's) and `MINIONS_STATE_DIR`, for the runtime-state check; task-96 adds `/secrets` (the mounted secrets dir,
+ * protected the same way: stateGuard's secretsDir). These are speed filters only: any plain command
  * that runs minions or names the state dir contains such a match (a name split by quotes or backslashes does not;
  * like variables, that is out of reach of a text check). Reading stdin, a grep error and every failure of minions
  * itself block (exit 2).
  */
-export const PRE_BASH_HOOK_COMMAND = `i=$(cat) || exit 2; case "$i" in *'"agent_id"'*) printf '%s' "$i" | grep -Eq 'minions[^:]|cli\\.[cm]?js|/state|MINIONS_STATE_DIR'; m=$?; [ "$m" = 1 ] && exit 0; [ "$m" = 0 ] || exit 2; printf '%s' "$i" | timeout 20 minions hook pre-bash || exit 2;; esac`;
+export const PRE_BASH_HOOK_COMMAND = `i=$(cat) || exit 2; case "$i" in *'"agent_id"'*) printf '%s' "$i" | grep -Eq 'minions[^:]|cli\\.[cm]?js|/state|/secrets|MINIONS_STATE_DIR'; m=$?; [ "$m" = 1 ] && exit 0; [ "$m" = 0 ] || exit 2; printf '%s' "$i" | timeout 20 minions hook pre-bash || exit 2;; esac`;
 
 /** The verbs a Claude subagent must never run: they start, claim or end worker leases (coordinator-only). */
 export const COORDINATOR_ONLY_WORK_VERBS = ['run', 'claim', 'advance', 'release'] as const;
@@ -245,12 +246,23 @@ const ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*(\[[^\]]*\])?\+?=/;
 /** Decides one minions invocation: `words[entry]` runs minions; returns the refused command or null. */
 type EntryMatch = (words: readonly string[], entry: number) => string | null;
 
-/** `work` after the entry word, then a coordinator-only verb as the next non-option word. */
-function coordinatorVerb(words: readonly string[], entry: number): string | null {
-  const w = words.indexOf('work', entry + 1);
+/**
+ * `coordinator` subcommands a Claude subagent must never run, whatever state dir it names (task-96): `live-run` starts
+ * a headless claude with the runtime's Claude credential, which only the coordinator may do, at a controlled moment.
+ */
+export const COORDINATOR_ONLY_COORDINATOR_VERBS = ['live-run'] as const;
+
+/** `group` after the entry word, then one of `verbs` as the next non-option word. */
+function groupVerb(words: readonly string[], entry: number, group: string, verbs: readonly string[]): string | null {
+  const w = words.indexOf(group, entry + 1);
   if (w < 0) return null;
   const verb = words.slice(w + 1).find((x) => !x.startsWith('-'));
-  return verb && (COORDINATOR_ONLY_WORK_VERBS as readonly string[]).includes(verb) ? `minions work ${verb}` : null;
+  return verb && verbs.includes(verb) ? `minions ${group} ${verb}` : null;
+}
+
+/** `work` then a coordinator-only work verb, or `coordinator live-run`, after the entry word. */
+function coordinatorVerb(words: readonly string[], entry: number): string | null {
+  return groupVerb(words, entry, 'work', COORDINATOR_ONLY_WORK_VERBS) ?? groupVerb(words, entry, 'coordinator', COORDINATOR_ONLY_COORDINATOR_VERBS);
 }
 
 /** Commands whose arguments are printed as text (so piping them into a shell runs that text). */
@@ -468,11 +480,11 @@ export function preBashHook(input: unknown, g?: StateGuard): HookOutput {
   if (!ti || typeof ti.command !== 'string') return deny('minions pre-bash hook got no Bash command; refusing the call.');
   if (input.agent_id === undefined || input.agent_id === null) return { reason: 'allow: Bash from the coordinator' };
   const hit = coordinatorOnlyWorkCommand(ti.command);
-  if (hit) return deny(`\`${hit}\` is coordinator-only: a worker cannot start, claim or release workers. Finish your own task and return your result instead.`);
+  if (hit) return deny(`\`${hit}\` is coordinator-only: a worker cannot start, claim or release workers, or launch a live Claude run (name the check in your findings instead). Finish your own task and return your result instead.`);
   const guard = g ?? stateGuard();
   const state = bashStateReference(withoutSubmitBodies(ti.command), guard);
   if (state) {
-    return deny(`Workers may not touch the minions runtime state (${JSON.stringify(state.slice(0, 120))}): the runtime DB, backlog, briefs and results are the coordinator's. `
+    return deny(`Workers may not touch the minions runtime state (${JSON.stringify(state.slice(0, 120))}): the runtime DB, backlog, briefs and results are the coordinator's, and the mounted secrets are read only by minions itself. `
       + 'Use `minions work brief` / `minions work submit` for your lease. If you only mention the path as text, put that text in a file in your scratch dir '
       + '(`git commit -F <file>`) or use the Grep / Write tools. A result that names such a path is accepted only as exactly '
       + "`cd <worktree> && minions work submit <lease> --role <role> --json <<'RESULT'` (or without the `cd`), with an unquoted absolute "
@@ -502,10 +514,11 @@ const READ_TOOLS: Readonly<Record<string, readonly string[]>> = { Read: ['file_p
 export const PRE_FILE_WRITE_HOOK_COMMAND = `i=$(cat) || exit 2; case "$i" in *'"agent_id"'*) printf '%s' "$i" | timeout 20 minions hook pre-file || exit 2;; esac`;
 /**
  * Plugin PreToolUse entry for the read tools: node starts only for a subagent call whose input names a state dir
- * (`/state`: the container path, and the last segment of the host runtime's) or MINIONS_STATE_DIR. A symlink
+ * (`/state`: the container path, and the last segment of the host runtime's), the secrets dir (`/secrets`, task-96) or
+ * MINIONS_STATE_DIR. A symlink
  * that hides the path is not caught for reads (disclosure, not forgery: writes are always checked).
  */
-export const PRE_FILE_READ_HOOK_COMMAND = `i=$(cat) || exit 2; case "$i" in *'"agent_id"'*) printf '%s' "$i" | grep -Eq '/state|MINIONS_STATE_DIR'; m=$?; [ "$m" = 1 ] && exit 0; [ "$m" = 0 ] || exit 2; printf '%s' "$i" | timeout 20 minions hook pre-file || exit 2;; esac`;
+export const PRE_FILE_READ_HOOK_COMMAND = `i=$(cat) || exit 2; case "$i" in *'"agent_id"'*) printf '%s' "$i" | grep -Eq '/state|/secrets|MINIONS_STATE_DIR'; m=$?; [ "$m" = 1 ] && exit 0; [ "$m" = 0 ] || exit 2; printf '%s' "$i" | timeout 20 minions hook pre-file || exit 2;; esac`;
 
 /**
  * PreToolUse(Edit|MultiEdit|Write|NotebookEdit|Read|Glob|Grep), task-72: a Claude subagent may not write, read or
@@ -545,7 +558,7 @@ export function preFileHook(input: unknown, g?: StateGuard): HookOutput {
   const guard = g ?? stateGuard();
   const hit = targets.find((t) => protectedStatePath(t, cwd, guard, { ancestor: search }));
   if (hit !== undefined) {
-    return deny(`Workers may not ${writes ? 'write' : 'read or search'} the minions runtime state (${JSON.stringify(hit.slice(0, 160))}): the runtime DB, backlog, briefs and results are the coordinator's. `
+    return deny(`Workers may not ${writes ? 'write' : 'read or search'} the minions runtime state (${JSON.stringify(hit.slice(0, 160))}): the runtime DB, backlog, briefs and results are the coordinator's, and the mounted secrets are read only by minions itself. `
       + 'Use `minions work brief` / `minions work submit` for your lease; keep temporary files in your scratch dir.');
   }
   return { reason: `allow: ${tool} from a subagent (outside the runtime state)` };
