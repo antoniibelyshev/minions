@@ -61,7 +61,7 @@ afterEach(() => rmSync(root, { recursive: true, force: true }));
 const deps = (method: LiveRunDeps['method'], extra: Partial<LiveRunDeps> = {}): LiveRunDeps => ({
   activeLeases: () => [], method, paths, env, log: (l) => logs.push(l), signals: { on: () => process, off: () => process }, ...extra,
 });
-const recorded = () => Object.fromEntries(readFileSync(out, 'utf8').trim().split('\n').map((l) => [l.slice(0, l.indexOf('=')), l.slice(l.indexOf('=') + 1)]));
+const recorded = (): Record<string, string> => Object.fromEntries(readFileSync(out, 'utf8').trim().split('\n').map((l) => [l.slice(0, l.indexOf('=')), l.slice(l.indexOf('=') + 1)]));
 const run = (method: LiveRunDeps['method'], extra: Partial<LiveRunDeps> = {}) => liveRun(['-p', '--output-format', 'json'], { cwd: root }, deps(method, extra));
 
 async function failure(p: Promise<unknown>): Promise<MinionsError> {
@@ -81,11 +81,11 @@ describe('live run credentials per claudeAuth method', () => {
     expect(got.helper).toBe('');
     expect(got.argv).toBe('-p --output-format json');
     expect(got.config).not.toBe(env.CLAUDE_CONFIG_DIR);
-    expect(got.config.startsWith(join(paths.tmp, 'headless'))).toBe(true);
-    expect(got.files.trim()).toBe('settings.json'); // fresh: no plugins, no channels, no login state
+    expect(got.config?.startsWith(join(paths.tmp, 'headless'))).toBe(true);
+    expect(got.files?.trim()).toBe('settings.json'); // fresh: no plugins, no channels, no login state
     expect(r).toMatchObject({ method: 'login', exitCode: 3, keptDir: false });
     expect(liveRunExitCode(r)).toBe(3);
-    expect(existsSync(got.config)).toBe(false); // removed afterwards
+    expect(existsSync(got.config!)).toBe(false); // removed afterwards
     for (const text of [JSON.stringify(r), ...logs]) expect(text).not.toContain(OAUTH);
     expect(existsSync(env.CLAUDE_CONFIG_DIR!)).toBe(false); // the coordinator's config is never written
   });
