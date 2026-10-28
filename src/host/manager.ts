@@ -71,8 +71,8 @@ import { procStartTime } from '../runtime/coordinator.js';
 import { isChangeRequestId, type ChangeRequestView } from '../runtime/change-requests.js';
 import { pidAlive } from '../runtime/db.js';
 import {
-  findOfferByNonce, interruptedEntries, isOfferRequestId, isOwnerRequest, lastOutcome, managerDir, newOwnerRequestId, readJournal, recordOffer, recordOutcome,
-  TYPED_KEY_PATTERN, writer, writerAlive, type JournalEntry, type OfferEntry, type OutcomeEntry, type RequestSnapshot,
+  findOfferByNonce, interruptedEntries, isOfferRequestId, isOwnerRequest, lastOutcome, LOCK_WRITE_GRACE_MS, lockFileState, managerDir, newOwnerRequestId, readJournal,
+  recordOffer, recordOutcome, TYPED_KEY_PATTERN, writer, writerAlive, type JournalEntry, type OfferEntry, type OutcomeEntry, type RequestSnapshot,
 } from './change-journal.js';
 import {
   appliesWithoutConfirm, buildPlan, childUpgrade, confirmOffer, fetchRequests, formatPlan, fromContainerOf, hostCli, mark, offerRequest, planArgv, planDigest,
@@ -297,6 +297,8 @@ export async function acquireManagerLock(o: { alive?: (e: { pid?: number; start?
   await ensureDir(managerDir(), 0o700);
   const alive = o.alive ?? ((e) => writerAlive(e, pidAlive, procStartTime));
   const mine: LockRecord = { ...writer(), at: (o.now ?? new Date()).toISOString() };
+  // Waiting for a lock still being written (created, holder not yet written) ends by this; it is stale after the grace anyway.
+  const writtenBy = Date.now() + LOCK_WRITE_GRACE_MS + 1_000;
   for (let attempt = 0; attempt < 5; attempt++) {
     try {
       const h = await open(managerLockPath(), 'wx', 0o600);
@@ -314,6 +316,13 @@ export async function acquireManagerLock(o: { alive?: (e: { pid?: number; start?
       if (holder && alive(holder)) {
         throw new MinionsError('CONFLICT', `Another host manager runs (pid ${holder.pid}, since ${holder.at}).`,
           'Only one manager may run per host. Stop the other one first (or let its supervisor keep it).', { pid: holder.pid });
+      }
+      // No holder yet (task-80): another manager is between creating the file and writing itself into it. Taking it
+      // over there would let both run; wait until it is written (then the check above decides) or turns stale.
+      if (!holder && Date.now() < writtenBy && (await lockFileState(managerLockPath(), () => null)).state === 'held') {
+        await new Promise((r) => setTimeout(r, 50));
+        attempt--;
+        continue;
       }
       await rm(managerLockPath(), { force: true });
     }
