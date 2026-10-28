@@ -49,6 +49,12 @@ export function managerPaths() {
   };
 }
 
+/**
+ * File name of the headless Claude token in the secrets dir: a `claude setup-token` OAuth token (or an Anthropic API
+ * key) the owner stores with `minions auth set login --headless-token`, for headless runs in a fresh CLAUDE_CONFIG_DIR.
+ */
+export const CLAUDE_HEADLESS_TOKEN_FILE = 'claude-headless-token';
+
 export function projectPaths(projectId: string) {
   const dir = projectDir(projectId);
   return {
@@ -78,6 +84,8 @@ export function projectPaths(projectId: string) {
     githubTokenFile: join(dir, 'secrets', 'github-token'),
     telegramTokenFile: join(dir, 'secrets', 'telegram-bot-token'),
     codexKeyFile: join(dir, 'secrets', 'codex-api-key'),
+    /** Headless Claude token (`claude setup-token`, login method) for `minions coordinator live-run`; materialized like the others. */
+    claudeHeadlessTokenFile: join(dir, 'secrets', CLAUDE_HEADLESS_TOKEN_FILE),
     /** Non-secret record of the last key refresh (time, redacted error). */
     authStateJson: join(dir, 'auth-state.json'),
     logsDir: join(dir, 'logs'),
@@ -145,6 +153,8 @@ export function containerPaths(root = process.env.MINIONS_CONTAINER_ROOT ?? '') 
     codexKeyFile: p('/opt/minions/secrets/codex-api-key'),
     /** Host-provisioned Claude key (api-key/helper methods), read by the in-container apiKeyHelper. */
     apiKeyFile: p('/opt/minions/secrets/anthropic-api-key'),
+    /** Headless Claude token (login method), read only by `minions coordinator live-run`, passed to its claude in env. */
+    claudeHeadlessTokenFile: p(`/opt/minions/secrets/${CLAUDE_HEADLESS_TOKEN_FILE}`),
     configJson: p('/opt/minions/config/config.json'),
     /** Public key that verifies host-signed publication approvals (the private key never enters the container). */
     approvalPublicKey: p('/opt/minions/config/approval-public-key.pem'),

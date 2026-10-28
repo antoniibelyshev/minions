@@ -13,7 +13,7 @@ import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, sep } from 'node:path';
 import { runtimeMode } from '../core/cli-helpers.js';
 import { redact } from '../core/output.js';
-import { CONTAINER, credentialStoreDir } from '../core/paths.js';
+import { CLAUDE_HEADLESS_TOKEN_FILE, CONTAINER, credentialStoreDir } from '../core/paths.js';
 import { probeTelegram, TELEGRAM_CHANNEL_SPEC, TELEGRAM_PLUGIN_ID, type TelegramProbeReport } from '../telegram/probe.js';
 import { checkTelegramPoller, disableTelegramAtUserScope, type PollerCheck, type UserScopeResult } from '../telegram/isolation.js';
 import { checkTelegramTokenFormat } from '../telegram/token.js';
@@ -216,7 +216,7 @@ export function hostSettings(h: HostHardening): { sandbox: Record<string, unknow
   readEdit(ruleAbs(h.credentialsDir));
   for (const o of h.otherProjects ?? []) readEdit(ruleAbs(o));
   const secretsAbs = ruleAbs(h.secretsDir);
-  for (const f of ['anthropic-api-key', 'telegram-bot-token']) deny.push(`Read(${secretsAbs}/${f})`);
+  for (const f of ['anthropic-api-key', 'telegram-bot-token', CLAUDE_HEADLESS_TOKEN_FILE]) deny.push(`Read(${secretsAbs}/${f})`);
   // File globs only (`*.json`): a directory-matching wildcard would also become a sandbox write deny of its contents.
   if (root) deny.push(`Read(${ruleAbs(root)}/*.json)`, `Edit(${ruleAbs(root)}/*.json)`);
   // Host manager state (owner pairing, token reference, journal): the directory rule is also a sandbox write deny.
@@ -251,7 +251,7 @@ export function hostSettings(h: HostHardening): { sandbox: Record<string, unknow
         denyWrite: [join(h.workspace, 'repo', '.git', 'config'), join(h.workspace, 'repo', '.git', 'hooks'), ...tmuxDirs],
         // The whole data root is unreadable; the agent's own dirs, the shim, its config/plugin and the
         // GitHub token (read by the git credential helper / gh wrapper inside the sandbox) are re-opened.
-        denyRead: [...secretHome, ...(root ? [root] : []), h.credentialsDir, join(h.secretsDir, 'anthropic-api-key'), join(h.secretsDir, 'telegram-bot-token'),
+        denyRead: [...secretHome, ...(root ? [root] : []), h.credentialsDir, join(h.secretsDir, 'anthropic-api-key'), join(h.secretsDir, 'telegram-bot-token'), join(h.secretsDir, CLAUDE_HEADLESS_TOKEN_FILE),
           ...tmuxDirs],
         allowRead: [...new Set([h.workspace, h.state, join(h.projectDir, 'host', 'bin'), join(h.projectDir, 'runtime'), pluginDir,
           join(h.secretsDir, 'github-token'), ...(h.readable ?? [])])],

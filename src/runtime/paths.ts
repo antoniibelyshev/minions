@@ -2,7 +2,7 @@ import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { APPROVAL_PUBLIC_KEY_NAME } from '../core/approval.js';
-import { containerPaths } from '../core/paths.js';
+import { CLAUDE_HEADLESS_TOKEN_FILE, containerPaths } from '../core/paths.js';
 
 /**
  * Literal container paths for the approval verifier. Deliberately not derived from containerPaths()
@@ -94,6 +94,8 @@ export function runtimePaths(env: NodeJS.ProcessEnv = process.env, opts: { inCon
     telegramTokenFile: join(secretsDir, 'telegram-bot-token'),
     githubTokenFile: join(secretsDir, 'github-token'),
     apiKeyFile: join(secretsDir, 'anthropic-api-key'),
+    /** Headless Claude token (login method) for `minions coordinator live-run` (src/runtime/headless.ts). */
+    claudeHeadlessTokenFile: join(secretsDir, CLAUDE_HEADLESS_TOKEN_FILE),
     tmuxSocket: env.MINIONS_TMUX_SOCKET || null,
     /** The official plugin's state dir (same resolution as the plugin: TELEGRAM_STATE_DIR, else CLAUDE_CONFIG_DIR/channels/telegram). */
     /**

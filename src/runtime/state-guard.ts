@@ -39,9 +39,14 @@ export function resolveReal(p: string, hops = 0): string {
   return parent === abs ? abs : posix.join(resolveReal(parent, hops + 1), posix.basename(abs));
 }
 
-export function stateGuard(paths: Pick<RuntimePaths, 'state' | 'tmp'> = runtimePaths()): StateGuard {
+/**
+ * `secretsDir` (task-96), when given, is protected like the state: the host-provisioned secrets (Claude key, headless
+ * Claude token, GitHub and Telegram tokens) are read by minions itself, Claude Code's apiKeyHelper and the git
+ * credential helper, never by a worker's tool call. runtimePaths() always has it, so the hooks protect it.
+ */
+export function stateGuard(paths: Pick<RuntimePaths, 'state' | 'tmp'> & Partial<Pick<RuntimePaths, 'secretsDir'>> = runtimePaths()): StateGuard {
   const both = (p: string) => [...new Set([strip(posix.normalize(p)), strip(resolveReal(p))])];
-  const roots = both(paths.state);
+  const roots = [...new Set([...both(paths.state), ...(paths.secretsDir ? both(paths.secretsDir) : [])])];
   const tmp = both(paths.tmp);
   const tmpInState = tmp.some((t) => roots.some((r) => within(t, r)));
   return { roots, exempt: [...new Set([...tmp, ...(tmpInState ? both(posix.join(paths.state, 'cache')) : [])])] };

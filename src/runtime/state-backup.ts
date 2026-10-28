@@ -33,7 +33,7 @@ export const STATE_BACKUP_MAX_BYTES = 1024 * 1024 * 1024;
  * `telegramTokenFile`; src/host/credentials.ts `fileName`) and the host's approval signing key
  * (src/host/approvals.ts). A copy of one of them inside an archived dir is never archived.
  */
-export const MINIONS_SECRET_FILE_NAMES = ['anthropic-api-key', 'github-token', 'telegram-bot-token', 'approval-signing-key'] as const;
+export const MINIONS_SECRET_FILE_NAMES = ['anthropic-api-key', 'github-token', 'telegram-bot-token', 'claude-headless-token', 'approval-signing-key'] as const;
 
 /** File names that commonly hold secrets; never archived even inside an allowed dir. */
 export const SECRET_NAME_PATTERNS = [
