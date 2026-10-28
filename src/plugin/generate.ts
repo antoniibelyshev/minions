@@ -756,10 +756,12 @@ export async function generatePlugin(cfg: MinionsConfig, outDir: string, opts: G
 /**
  * Task-52: the one exception to "no nested claude". Workers never start claude (worker-common.md says
  * so and hands live runs to the coordinator); the coordinator may, but only with no worker lease active
- * and with its own CLAUDE_CONFIG_DIR, so the run cannot load the Telegram plugin and take the bot.
+ * and with its own CLAUDE_CONFIG_DIR, so the run cannot load the Telegram plugin and take the bot. Task-96: the entry
+ * point is `minions coordinator live-run` (src/runtime/headless.ts), which also supplies the credential.
  */
 export const LIVE_CLAUDE_RUN_GUIDANCE = 'Live Claude Code runs: workers never launch claude sessions (`claude -p`, `claude` in tmux, the Agent SDK) and you never ask one to; a worker that needs a live run says so in `findings`. '
-  + 'Only you run it, at a controlled moment: no worker lease is active (`minions status` shows none running; wait or let the queue drain first), and the command runs with a separate, fresh `CLAUDE_CONFIG_DIR` (for example `CLAUDE_CONFIG_DIR="$(mktemp -d)" claude -p …`), never `~/.claude` or your own config dir, so it loads no Telegram plugin and cannot take the bot. '
+  + 'Only you run it, at a controlled moment: no worker lease is active (`minions status` shows none running; wait or let the queue drain first), and the command runs with a separate, fresh `CLAUDE_CONFIG_DIR`, never `~/.claude` or your own config dir, so it loads no Telegram plugin and cannot take the bot. '
+  + 'Start it with `minions coordinator live-run -- <claude args>` (prompt on stdin; `--dry-run` first to see the plan): it creates the fresh config dir, passes the Claude credential for this project\'s auth method only in the environment or an apiKeyHelper, and refuses while a worker lease is active. If it reports AUTH_REQUIRED for the login method, ask the owner to run `claude setup-token` on the host and store it with `minions auth set login --headless-token`. '
   + 'Never launch any other nested claude session. `claude --version` and `claude --help` are always fine. Afterwards check `minions status` for a `telegram poller` problem.';
 
 /** Coordinator guidance for risk-based testing: when a task gets a tester, and when to run a QA sweep on the base. */

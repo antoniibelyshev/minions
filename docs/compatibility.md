@@ -181,7 +181,8 @@ Design for the open ownership cases (not implemented; needs live validation):
   `minions coordinator restart --recover` when no worker runs. Do not enable the plugin in a config dir that other sessions
   share with the coordinator. Start nested or ad-hoc `claude` runs with a separate
   `CLAUDE_CONFIG_DIR`. Workers never start `claude`; when a task needs a live run, the coordinator
-  runs it only while no worker lease is active, with a fresh `CLAUDE_CONFIG_DIR` (task-52). If
+  runs it only while no worker lease is active, with a fresh `CLAUDE_CONFIG_DIR` (task-52), through
+  `minions coordinator live-run` (task-96: credentials per auth method, see the README's Claude authorization). If
   Claude Code ever stops applying the flag `enabledPlugins`, the coordinator starts without the
   plugin: `minions doctor` then warns on `telegram.plugin` (off at user scope and no live poller).
   **Rollback**: a build from before task-51 does not enable the plugin in its coordinator launch, so
