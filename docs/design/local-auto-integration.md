@@ -72,6 +72,13 @@ Related: [coordinator-self-update.md](coordinator-self-update.md) (task-99: host
 
 - **On switch:** `delivery.merge: auto-when-eligible` now also applies to local mode (Decision 1). With `disabled`,
   local mode keeps today's behaviour during rollout: `delivered`, and the coordinator merges by hand.
+- **Today that value is GitHub-only**, so reuse is not free. `autoMergeConfigReasons` (src/config/delivery.ts:17-29)
+  always reports local mode unusable (needs pull-request + github, `requiredChecksConfigured`, `ciAuthority: github`,
+  `pr.merge` not deny). Its result feeds `listUnavailable` (src/config/resolve.ts:34, "automatic merge is
+  unavailable"), doctor `merge.readiness` (src/host/doctor.ts:189) and setup's autoMerge step (src/host/setup.ts:831-835,
+  "delivery is local: not usable"). The descriptions in src/host/settings.ts:142-147 and src/config/setting-classes.ts:50
+  say "pull requests" and "GitHub". All of these become **mode-aware**: in local mode the reasons are integration
+  readiness (`base.merge` not deny, `verification.commands` non-empty); in PR mode they stay unchanged.
 - **Policy:** a new capability **`base.merge`**: project-owner `allow`, personal-work `ask`, supervised `deny`. It is
   added to `PUBLICATION_CAPABILITIES`, so a sensitive path upgrades `allow` to `ask`. `deny` ends the task as
   `delivered` (the user integrates, as supervised does today).
@@ -89,6 +96,9 @@ Related: [coordinator-self-update.md](coordinator-self-update.md) (task-99: host
 3. **Order:** oldest approval first, but a task waits while any of its dependencies is not `done`. `merging` and
    `delivered` no longer satisfy a dependency in local mode with the switch on, so dependents branch from a `main`
    that contains their dependency. A `merging` task does not count against `maxActiveTasks` (no worker runs for it).
+   With `base.merge: deny` (supervised) the integrator never runs and tasks end `delivered`, so there the rule stays
+   today's (`done` or `delivered` satisfies a dependency); otherwise dependents would never start. The user owns
+   the integration order in that profile, as today.
 4. The integrator handles the queue until it is empty, then exits. There is no resident daemon.
 
 ### Serialization and crash safety
@@ -101,7 +111,9 @@ Related: [coordinator-self-update.md](coordinator-self-update.md) (task-99: host
   `conflict | red | refused | awaiting-approval | transient | stopped`.
 - **Recovery** (at integrator start, when the lock is stale): stop the recorded verify process group only while its
   leader still matches the record (task-100 rule), reset `/workspace/integration`, then:
-  - `main == C`: the crash came after the swap. Finish as `landed`.
+  - `main` contains C (`merge-base --is-ancestor C main`): the crash came after the swap, and the coordinator or
+    owner may have committed on top since. Finish as `landed` with `integration_base = C`; later commits are adopted
+    as in "Where the merge runs" step 1.
   - otherwise: re-queue without counting an attempt. `main` was never touched.
 
 ### Where the merge runs
@@ -151,6 +163,8 @@ Related: [coordinator-self-update.md](coordinator-self-update.md) (task-99: host
    local changes or untracked files would be overwritten, so the coordinator's own edits are never lost. When the
    fast-forward is refused, the base is unchanged, the queue pauses with a notice ("checkout not clean"), and the
    tick retries. If `main` is not checked out anywhere: `git update-ref refs/heads/main C B` (compare-and-swap).
+   A crash **during** `--ff-only` can leave the working tree partly updated while `main` still points at B.
+   Recovery does not touch `/workspace/repo`; the doctor reports it (see below).
 3. Record `integration_base = C`, phase `landed`. The task becomes `done` with the note "merged into main at C".
 
 ### Failure and the repair brief
@@ -189,7 +203,9 @@ re-test". Re-review then runs as for any new head.
 
 - `minions status`: an `integration` block with the lock holder, the current task, phase and elapsed time, the
   queue (with waiting reasons: dependency, approval, pause), the last result and `integration_base`.
-- `doctor`: a stale lock, a halted queue, and `/workspace/repo` not clean.
+- `doctor`: a stale lock, a halted queue, and `/workspace/repo` not clean. The not-clean check names the case of a
+  crash during `git merge --ff-only` (the `integrations` row is still in `landing` and the tree differs from `main`)
+  and the fix: save any own edits, then `git checkout --force main` there.
 - Digest: `merging` tasks and the last failures.
 - Outbox notices: `awaiting-approval`, `halted`, `blocked`, and `red`/`conflict` (one line each, with the task).
   Landings appear in the digest and the coordinator's normal milestone report, not as their own messages.
@@ -213,8 +229,12 @@ host. Pushing from the container is out of scope (Decision 5).
 ## Decisions for the owner
 
 1. **Switch:** reuse `delivery.merge: auto-when-eligible` for local mode, plus the new capability `base.merge`
-   (owner allow / personal ask / supervised deny) (**recommended**: no new setting, and the profile rules become
-   enforced policy). Alternative: a separate `delivery.localIntegration` setting.
+   (owner allow / personal ask / supervised deny) (**recommended**: one merge switch for both modes, the smallest
+   user-facing surface, and the profile rules become enforced policy). Cost: `autoMergeConfigReasons`,
+   `listUnavailable`, doctor `merge.readiness`, setup's autoMerge step and two setting descriptions become
+   mode-aware (see [Switch and policy](#switch-and-policy)); tests pin PR-mode behaviour as unchanged. Alternative: a
+   separate `delivery.localIntegration` setting. It leaves the PR code untouched, but adds a setting, and two
+   overlapping switches (`delivery.merge` would still say "not usable" in local mode).
 2. **Flaky tests:** rerun a failed command once. A pass on the rerun lands, sends a `flaky` notice, and the
    coordinator files a follow-up (**recommended**: a flake does not cost a full repair cycle). Alternative: any red
    goes to changes-requested.
@@ -234,9 +254,9 @@ Ordered. Each phase is one task with a normal engineer, tester and reviewer pipe
 an owner decision or approval first.
 
 1. **child: Integration engine (library)** | criteria: `integrationCandidate(B, H)` in the isolated git dir (`MERGE_TREE_CONFIG`, driver refusal from base-update.ts) returns C or the conflicted paths; the sensitive diff `B..C`; the revert-of-revert check; `land(C, B)`: `--ff-only` in a checkout on `main`, else `update-ref` compare-and-swap, a dirty checkout refused with base unchanged; the merge subject and trailers; tests on temp repos (clean, conflict, custom driver, revert-of-revert, dirty checkout, moved base); nothing wired | depends: none (worker)
-2. **child: Queue, lock, verify runner and recovery** | criteria: the `integrations` table (inline schema migration) and the `integration_lock` meta row with the supervisor's liveness rule; hidden `minions work integrate` (drains the queue, exits when empty); `verification.setupCommands` and `delivery.integrationTimeoutMinutes` registered with setting classes; the verify runner in the persistent `/workspace/integration` (reset and cleaned to exactly C, `verification.setupCommands` when the lockfile hash changes, process group, per-command timeout, allowlisted env, `MINIONS_TEST_MAX_WORKERS=2`, log tail); fail vs transient (one retry); pause and drain stop and re-queue; crash recovery (`main == C` → landed, else re-queue; group swept only while its leader matches); tests with fake verification commands for crash, drain, timeout and red | depends: 1 (worker)
-3. **child: Wire approval, policy and repair** | criteria: local approval with `delivery.merge: auto-when-eligible` → `merging` plus a `publications` row with `mode: local`, then a detached integrator start; the `base.merge` capability with profile defaults and the sensitive upgrade; `awaiting-approval` → `awaiting-human`; `work approve --merge` accepted for local; `work publish` in local mode re-queues; landed → `done`; failure → `changes-requested`, a repair cycle and a `priorFindings` entry with `role: integrator`; in local mode with the switch on, dependencies need `done`, and `merging` does not count against `maxActiveTasks`; with the switch off nothing changes; tests | depends: 2 (worker; **owner**: Decision 1)
-4. **child: Surface, prompt and docs** | criteria: the `status` integration block, `doctor` checks, digest lines and outbox notices as above; the routine-tick and `--recover` backstops; deliveryGuidance and integrationRule without manual merge steps (the coordinator never merges into, commits on or resets the base); the Decision 2 flaky rule; README, cli.md and bootstrap.md updated; prompt snapshot tests | depends: 3 (worker; **owner**: Decisions 2 and 3)
+2. **child: Queue, lock, verify runner and recovery** | criteria: the `integrations` table (inline schema migration) and the `integration_lock` meta row with the supervisor's liveness rule; hidden `minions work integrate` (drains the queue, exits when empty); `verification.setupCommands` and `delivery.integrationTimeoutMinutes` registered with setting classes; the verify runner in the persistent `/workspace/integration` (reset and cleaned to exactly C, `verification.setupCommands` when the lockfile hash changes, process group, per-command timeout, allowlisted env, `MINIONS_TEST_MAX_WORKERS=2`, log tail); fail vs transient (one retry); pause and drain stop and re-queue; crash recovery (`main` contains C → landed, else re-queue; group swept only while its leader matches); tests with fake verification commands for crash, drain, timeout and red | depends: 1 (worker)
+3. **child: Wire approval, policy and repair** | criteria: local approval with `delivery.merge: auto-when-eligible` → `merging` plus a `publications` row with `mode: local`, then a detached integrator start; the `base.merge` capability with profile defaults and the sensitive upgrade; `awaiting-approval` → `awaiting-human`; `work approve --merge` accepted for local; `work publish` in local mode re-queues; landed → `done`; failure → `changes-requested`, a repair cycle and a `priorFindings` entry with `role: integrator`; in local mode with the switch on and `base.merge` not deny, dependencies need `done` in both places that check them (`COMPLETED_STATUSES` in src/backlog/ready.ts and the `Scheduler` claim check at src/runtime/scheduler.ts:876), and `merging` does not count against `maxActiveTasks`; with `base.merge: deny` or the switch off nothing changes; `autoMergeConfigReasons` mode-aware (local: integration readiness reasons; PR: unchanged, pinned by tests), so `listUnavailable` no longer reports local auto-merge as unavailable; the `delivery.merge` descriptions in settings.ts and setting-classes.ts cover local mode; tests | depends: 2 (worker; **owner**: Decision 1)
+4. **child: Surface, prompt and docs** | criteria: the `status` integration block, `doctor` checks (`merge.readiness` mode-aware, the crash-during-`--ff-only` case), setup's autoMerge step offered in local mode, digest lines and outbox notices as above; the routine-tick and `--recover` backstops; deliveryGuidance and integrationRule without manual merge steps (the coordinator never merges into, commits on or resets the base); the Decision 2 flaky rule; README, cli.md and bootstrap.md updated; prompt snapshot tests | depends: 3 (worker; **owner**: Decisions 2 and 3)
 5. **child: Self-update link** | criteria: the self-update script's idle check treats a held `integration_lock` as busy (test with a fake `minions`); the task-99 phase 4 instruction reworded to the `integrated` notice (Decision 4; `CLAUDE.md`/`.minions/**` are sensitive and need owner approval) | depends: 4 (worker; **owner**)
 6. **child: Live rollout on this project** | criteria: the switch is turned on here (a `.minions/**` change, owner approval); at least 3 landings, including one forced conflict and one forced red on scratch tasks, each with `main` unchanged and a repair brief; one drain during a verification re-queues the task; report the timings to the owner; then a poll on making it the default for project-owner local | depends: 5 (live run by the coordinator; **owner**)
 
