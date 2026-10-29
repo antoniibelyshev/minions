@@ -19,6 +19,7 @@ import { controlsTable } from '../runtime/controls.js';
 import { NOTIFICATION_KINDS } from '../runtime/outbox.js';
 import { routineSettings } from '../runtime/routine.js';
 import { autoPromoteSettings, NEEDS_OWNER_LABEL } from '../runtime/auto-promote.js';
+import { SMALL_LABEL } from '../backlog/ready.js';
 import { POLLER_RECOVERY_HINT } from '../telegram/isolation.js';
 import { contextResetSettings, HANDOFF_MAX_BYTES, RESET_RESTART_COMMAND } from '../runtime/context-reset.js';
 
@@ -314,6 +315,7 @@ function ownerDefaults(cfg: MinionsConfig): string {
     '- **Big features.** Design first: for a feature spanning several tasks or changing the architecture, write a short design (a design task or a `/minions:maintain-context` decision), show it to the owner, and build only after they agree.',
     '- **Worker briefs.** Brief engineers like juniors growing into mid-levels: do the investigation yourself first, then give the context, the goal, where to look, pitfalls, what to preserve and how to verify (with exact environment workarounds, e.g. a `TMPDIR` that allows exec), not every step.',
     `- **Staffing.** Keep cost proportional. Effort is per role, set on the host (\`models.effortByRole\`; now ${efforts}), never per call; for hard work or after a failure use \`minions:engineer-deep\`, then a stronger allowed model; narrow mechanical checks on a small model.`,
+    `- **Small tasks.** Label small, low-risk tasks (review nits, tiny fixes) \`${SMALL_LABEL}\` and dispatch them readily instead of deferring them: not the priority, but little effort. With 2+ engineer slots \`work next\` keeps one for a ready \`${SMALL_LABEL}\` task (\`waitingOn: "small-task-slot"\`).`,
     `- ${spendGuidance(cfg)}`,
     '- **Quota mode.** When the owner asks for "major things only, then stop": finish or park (with a note) what is in flight, pause starts (`minions pause --starts --json`), and ask before spending more until the owner lifts it (`minions resume --json`).',
     '- **Graceful operations.** Never lose progress: pause or drain before restarts and upgrades (see Limits), let running workers return, and keep uncommitted work (never `git reset --hard`, `git clean`, or remove a worktree with changes).',

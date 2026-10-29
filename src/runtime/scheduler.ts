@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import type { BacklogAdapter, ScopeFilter, Task, TaskStatus } from '../backlog/types.js';
 import { can, matchesAny } from '../config/capabilities.js';
 import { isGithubDelivery } from '../config/delivery.js';
-import { notReadyReason, sortByPriority } from '../backlog/ready.js';
+import { isSmall, notReadyReason, sortByPriority } from '../backlog/ready.js';
 import { CURRENT_PHASE, HARNESSES, harnessModels, isHarnessId, isProcessHarness, phaseAllows, type HarnessId, type PhaseRules } from '../config/harnesses.js';
 import { launchFor, type Launch } from '../config/launch.js';
 import { suggestModel, type ModelSuggestion } from '../config/models.js';
@@ -166,9 +166,10 @@ export interface WaitingStage extends NextStage {
   /**
    * starts: paused, draining or the owner budget; capacity: active task limit; role-capacity: execution.maxByRole;
    * harness-capacity: the phase cap on process-harness producers (agent-runtimes D9); requires: a stage capability not allowed;
-   * context-reset: the reset barrier holds new starts until the running workers return (task-57.6).
+   * context-reset: the reset barrier holds new starts until the running workers return (task-57.6);
+   * small-task-slot: the last engineer slot is kept for a runnable `small` task (task-97).
    */
-  waitingOn: 'starts' | 'capacity' | 'role-capacity' | 'harness-capacity' | 'requires' | 'context-reset';
+  waitingOn: 'starts' | 'capacity' | 'role-capacity' | 'harness-capacity' | 'requires' | 'context-reset' | 'small-task-slot';
   why: string;
 }
 
@@ -669,6 +670,14 @@ export class Scheduler {
     const active = new Set(cap.activeTaskIds);
     const roleActive = new Map(Object.entries(cap.byRole).map(([r, c]) => [r, c.active]));
     let processProducers = this.processProducerLeases(leases);
+    // Small-task lane (task-97): engineer stages of non-small tasks (running ones included) are capped at
+    // maxEngineers-1 while an engineer stage of a `small` task is runnable; no small one = no change.
+    const isEngineer = (role: string) => baseRoleName(cfg, role) === ENGINEER_ROLE;
+    const smallTask = (id: string) => { const t = byId.get(id); return t ? isSmall(t) : false; };
+    const engMax = cap.byRole[ENGINEER_ROLE]?.max ?? 0;
+    const smallReady = ordered.filter((c) => isEngineer(c.role) && smallTask(c.taskId)).map((c) => c.taskId);
+    const laneCap = engMax >= 2 && smallReady.length ? engMax - 1 : null;
+    let bigEngineers = leases.filter((l) => isEngineer(l.role) && !smallTask(l.task_id)).length;
     for (const c of ordered) {
       if (startsBlocked) { waiting.push({ ...c, waitingOn: 'starts', why: startsBlocked.message }); continue; }
       if (held) { waiting.push({ ...c, waitingOn: 'context-reset', why: held.reason }); continue; }
@@ -678,12 +687,20 @@ export class Scheduler {
       const slots = Object.hasOwn(cap.byRole, c.role) ? cap.byRole[c.role]! : undefined;
       const used = roleActive.get(c.role) ?? 0;
       if (slots?.limited && used >= slots.max) { waiting.push({ ...c, waitingOn: 'role-capacity', why: `${c.role} limit (${used}/${slots.max})` }); continue; }
+      const bigEngineer = laneCap !== null && isEngineer(c.role) && !smallTask(c.taskId);
+      // Hold only while a small task could take the slot under the task limit (it already holds a task slot,
+      // or one is free); otherwise the engineer slot would sit idle, so the big stage runs.
+      const smallCanStart = () => smallReady.some((id) => active.has(id)) || active.size < cfg.execution.maxActiveTasks;
+      if (bigEngineer && bigEngineers >= laneCap && smallCanStart()) {
+        waiting.push({ ...c, waitingOn: 'small-task-slot', why: `last engineer slot kept for small task(s) ${smallReady.join(', ')} (non-small engineers ${bigEngineers}/${laneCap})` }); continue;
+      }
       const processProducer = this.isProcessProducer(c.role, c.harness);
       const producerCap = this.phase.processProducerCap;
       if (processProducer && producerCap !== null && processProducers >= producerCap) {
         waiting.push({ ...c, waitingOn: 'harness-capacity', why: `process-harness producer cap (${processProducers}/${producerCap}, ${this.phase.summary})` }); continue;
       }
       if (processProducer) processProducers++;
+      if (bigEngineer) bigEngineers++;
       active.add(c.taskId);
       roleActive.set(c.role, used + 1);
       runnable.push(c);

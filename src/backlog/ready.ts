@@ -5,6 +5,14 @@ export const COMPLETED_STATUSES: ReadonlySet<Task['status']> = new Set(['done', 
 
 export const AUTHORIZED_LABEL = 'minions:authorized';
 
+/**
+ * Small-task lane (task-97): with engineer capacity 2 or more and a runnable engineer stage of a task labelled
+ * `small`, `work next` lists at most maxEngineers-1 engineer stages of other tasks (running ones included), so a
+ * small follow-up always gets the last engineer slot. Small tasks themselves are not capped by the lane.
+ */
+export const SMALL_LABEL = 'small';
+export const isSmall = (task: Pick<Task, 'labels'>): boolean => task.labels.includes(SMALL_LABEL);
+
 export interface ReadyContext {
   /** Task ids holding an active lease. */
   leased: Set<string>;
