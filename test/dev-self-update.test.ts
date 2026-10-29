@@ -6,7 +6,7 @@
 // MINIONS_HOME. The fake docker keeps its images as files ($FAKE/img/<tag> holds the image ID) and the container's
 // image in $FAKE/container-image; the fake host `minions --json status` is healthy unless a test says otherwise.
 import { spawn, spawnSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -770,6 +770,52 @@ describe('self-update health check and rollback (phase 3)', () => {
     expect(marks()[1]).toMatch(detail);
     expect(marks()[1]).toMatch(/is not recorded as bad/);
     expect(readState()).toMatchObject({ current: null, badShas: [] });
+  });
+
+  /** Wraps the fake `minions`: `pre` is a shell snippet run first (it may exit), then the fake runs as before. */
+  const wrapMinions = (pre: string) => {
+    renameSync(join(fx.bin, 'minions'), join(fx.bin, 'minions-fake'));
+    sh(join(fx.bin, 'minions'), `${pre}\nexec "${join(fx.bin, 'minions-fake')}" "$@"`);
+  };
+
+  it('an old CLI without `manager notify`: the failure is logged and printed, the request is still marked failed', () => {
+    newImage('sha256:newimage');
+    writeFileSync(join(fx.fake, 'broken-image'), 'sha256:newimage\n');
+    writeFileSync(join(fx.fake, 'npm-install-fail'), '');
+    wrapMinions(`[ "$*" = "--json manager notify" ] && { echo "$*" >> "$FAKE/minions.log"; echo "error: unknown command 'notify'" >&2; exit 1; }`);
+    setRequests([request('cr_aaaaaaaa')]);
+    const r = runScript('--once');
+    expect(r.code, r.err).toBe(0);
+    expect(existsSync(join(fx.fake, 'manager-notice.txt'))).toBe(false);
+    expect(events().find((e) => e.event === 'manager-notice')).toMatchObject({ request: 'cr_aaaaaaaa', ok: false, message: expect.stringMatching(/unknown command 'notify'/) });
+    expect(r.out).toMatch(/could not tell the owner through the manager bot: .*unknown command 'notify'/);
+    expect(statuses()).toEqual(['confirmed', 'failed']);
+    expect(marks()[1]).toMatch(/no healthy coordinator even after the rollback .*; the manager bot could not tell the owner \(.*unknown command 'notify'.*\); .* is recorded as bad/);
+    // The coordinator outbox notice is still enqueued (it goes out if the coordinator comes back).
+    expect(readFileSync(join(fx.fake, 'notice.txt'), 'utf8')).toMatch(/no healthy coordinator even after the rollback/);
+  });
+
+  it('-prev is gone at rollback time: no re-tag, but down and start still run on the old CLI and any rebuilt image is accepted', () => {
+    newImage('sha256:newimage');
+    writeFileSync(join(fx.fake, 'broken-image'), 'sha256:newimage\n');
+    // The upgrade loses -prev (pruned by hand); the old CLI's `start` then rebuilds the image from the old code.
+    wrapMinions([
+      `case "$*" in *"upgrade --rebuild-cli"*) rm -f "$FAKE/img/minions-runtime:0.1.0-prev" ;; esac`,
+      `[ "$*" = "--json start --no-attach" ] && echo sha256:rebuiltold > "$FAKE/img/minions-runtime:0.1.0"`,
+    ].join('\n'));
+    setRequests([request('cr_aaaaaaaa')]);
+    const r = runScript('--once');
+    expect(r.code, r.err).toBe(0);
+    expect(dockerLog()).not.toContain('tag minions-runtime:0.1.0-prev minions-runtime:0.1.0');
+    expect(npmLog()).toMatch(/^install -g --no-audit --no-fund .*cli-backup\/minions-0\.1\.0-/m);
+    expect(minionsLog()).toMatch(/--json down\n--json start --no-attach\n/);
+    expect(containerImg()).toBe('sha256:rebuiltold');
+    const apply = events().find((e) => e.event === 'apply');
+    expect(steps(apply)).toEqual(expect.arrayContaining(['rollback-cli:done', 'rollback-image:failed', 'rollback-down:done', 'rollback-start:done', 'rollback-coordinator:done', 'health-after-rollback:done']));
+    expect(apply).toMatchObject({ outcome: 'failed', rollback: { ok: false, healthy: true } });
+    expect(marks()[1]).toMatch(/rolled back with failures \(image re-tag; see the log\); the coordinator is healthy again on the previous build; .* is recorded as bad/);
+    expect(existsSync(join(fx.fake, 'manager-notice.txt'))).toBe(false);
+    expect((readState() as unknown as { prevPin: unknown }).prevPin).toBeNull();
   });
 });
 
