@@ -61,6 +61,7 @@
 import { randomBytes } from 'node:crypto';
 import { link, readFile, rm, writeFile } from 'node:fs/promises';
 import { basename, join } from 'node:path';
+import { StringDecoder } from 'node:string_decoder';
 import type { Command } from 'commander';
 import { action, globalOpts, requireMode } from '../core/cli-helpers.js';
 import { APPROVAL_TOKEN_PREFIX } from '../core/approval.js';
@@ -1410,8 +1411,11 @@ export async function sendManagerNotice(text: string, o: { loadAccess?: () => Pr
 
 async function readStdinText(max: number): Promise<string> {
   if (process.stdin.isTTY) throw new MinionsError('PRECONDITION', 'Expected the notice text on stdin.', 'Pipe the text in: `echo text | minions manager notify`.');
+  // A StringDecoder keeps a multi-byte character that is split across two chunks whole.
+  const decoder = new StringDecoder('utf8');
   let data = '';
-  for await (const chunk of process.stdin) { data += String(chunk); if (data.length > max) break; }
+  for await (const chunk of process.stdin) { data += typeof chunk === 'string' ? chunk : decoder.write(chunk as Buffer); if (data.length > max) break; }
+  data += decoder.end();
   return data.slice(0, max);
 }
 

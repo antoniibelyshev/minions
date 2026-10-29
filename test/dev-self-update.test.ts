@@ -725,6 +725,8 @@ describe('self-update health check and rollback (phase 3)', () => {
     expect(bot).toContain('the CLI backup could not be reinstalled');
     expect(bot).toContain(`Log: ${join(stateDir(), 'log.jsonl')}`);
     expect(events().find((e) => e.event === 'manager-notice')).toMatchObject({ request: 'cr_aaaaaaaa', ok: true });
+    // The rollback restarted nothing, so the check after it does not wait out the window: 2 probes, then the notice.
+    expect(events().find((e) => e.event === 'apply')).toMatchObject({ rollback: { healthy: false, health: expect.stringMatching(/^not healthy in 2 probe\(s\): the coordinator is not running/) } });
     expect(marks()[1]).toMatch(/no healthy coordinator even after the rollback .*; the owner was told through the manager bot; .* is recorded as bad/);
     expect(readFileSync(join(fx.fake, 'notice.txt'), 'utf8')).toMatch(/NO HEALTHY COORDINATOR|no healthy coordinator/);
   });
@@ -793,6 +795,35 @@ describe('self-update health check and rollback (phase 3)', () => {
     expect(marks()[1]).toMatch(/no healthy coordinator even after the rollback .*; the manager bot could not tell the owner \(.*unknown command 'notify'.*\); .* is recorded as bad/);
     // The coordinator outbox notice is still enqueued (it goes out if the coordinator comes back).
     expect(readFileSync(join(fx.fake, 'notice.txt'), 'utf8')).toMatch(/no healthy coordinator even after the rollback/);
+  });
+
+  it('a failed upgrade that replaced neither the CLI nor the image: no rollback, no down and start, marked failed', () => {
+    // The upgrade fails before its CLI step (no backup) and before any image build.
+    wrapMinions(`case "$*" in *"upgrade --rebuild-cli"*) echo "$*" >> "$FAKE/minions.log"; echo '{"ok":true,"data":{"ok":false,"steps":[{"id":"preflight","status":"failed","detail":"disk full"}],"stopped":null}}'; exit 1 ;; esac`);
+    setRequests([request('cr_aaaaaaaa')]);
+    const r = runScript('--once');
+    expect(r.code, r.err).toBe(0);
+    expect(npmLog()).not.toMatch(/^install -g/m);
+    expect(minionsLog()).not.toMatch(/--json (down|start)/);
+    expect(dockerLog()).not.toContain('tag minions-runtime:0.1.0-prev minions-runtime:0.1.0');
+    expect(readLog('coordinator.log')).toBe('');
+    const apply = events().find((e) => e.event === 'apply');
+    expect(steps(apply).slice(-2)).toEqual(['upgrade:failed', 'health-unchanged:done']);
+    expect(apply).toMatchObject({ outcome: 'failed', rollback: { skipped: true, healthy: true } });
+    expect(statuses()).toEqual(['confirmed', 'failed']);
+    expect(marks()[1]).toMatch(/minions upgrade --rebuild-cli failed \(.*disk full.*\); it replaced neither the CLI nor the image and the coordinator is healthy on the current build, so nothing was rolled back or restarted; .* is not recorded as bad/);
+    expect(readState()).toMatchObject({ current: null, badShas: [] });
+  });
+
+  it('a failed upgrade that replaced nothing but left no healthy coordinator still rolls back', () => {
+    wrapMinions(`case "$*" in *"upgrade --rebuild-cli"*) echo "$*" >> "$FAKE/minions.log"; rm -f "$FAKE/running"; cat "$FAKE/container-image" > "$FAKE/broken-image"; echo '{"ok":true,"data":{"ok":false,"steps":[{"id":"drain","status":"failed","detail":"timeout"}],"stopped":null}}'; exit 1 ;; "--json start --no-attach") rm -f "$FAKE/broken-image" ;; esac`);
+    setRequests([request('cr_aaaaaaaa')]);
+    const r = runScript('--once');
+    expect(r.code, r.err).toBe(0);
+    expect(minionsLog()).toMatch(/--json down\n--json start --no-attach\n/);
+    const apply = events().find((e) => e.event === 'apply');
+    expect(steps(apply)).toEqual(expect.arrayContaining(['upgrade:failed', 'health-unchanged:failed', 'rollback-cli:done', 'rollback-start:done', 'health-after-rollback:done']));
+    expect(marks()[1]).toMatch(/the coordinator is healthy again on the previous build; .* is not recorded as bad/);
   });
 
   it('-prev is gone at rollback time: no re-tag, but down and start still run on the old CLI and any rebuilt image is accepted', () => {

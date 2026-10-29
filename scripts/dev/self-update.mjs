@@ -522,8 +522,10 @@ async function pause(ctx, ms) {
  * The health check: probes until healthy or the window ends. Healthy: HEALTH_SETTLE passing probes in a row with the
  * same coordinator lock holder (a restart in between starts the count again). More than one coordinator restart in
  * the window (a third lock holder) is unhealthy at once. A stop ends it with Stopped (no rollback after a stop).
+ * `o.maxPolls` ends it sooner, after that many probes: for a state the window cannot change (a rollback that stopped
+ * at the CLI reinstall) or that must already be healthy (a failed upgrade that replaced nothing).
  */
-async function healthCheck(ctx, expectImage) {
+async function healthCheck(ctx, expectImage, o = {}) {
   const windowMs = ctx.healthWindowMs ?? HEALTH_WINDOW_MS;
   const t0 = Date.now();
   const holders = new Set();
@@ -540,6 +542,7 @@ async function healthCheck(ctx, expectImage) {
     streak = !r.ok ? 0 : r.lock === lastLock ? streak + 1 : 1;
     lastLock = r.lock;
     if (streak >= HEALTH_SETTLE) return out(true, r.detail);
+    if (o.maxPolls && polls >= o.maxPolls) return out(false, `not healthy in ${polls} probe(s): ${r.ok ? 'the coordinator was not stable' : r.detail}`);
     if (Date.now() - t0 >= windowMs) {
       return out(false, `not healthy within ${Math.round(windowMs / 1000)} s: ${r.ok ? `the coordinator was not stable (${holders.size - 1} restart(s))` : r.detail}`);
     }
@@ -604,7 +607,7 @@ async function rollback(ctx, apply, step, backupsBefore) {
   const p = ctx.facts.project;
   const repo = ctx.facts.repo;
   const cli = await step('rollback-cli', () => restoreCli(ctx.facts.home, backupsBefore));
-  if (!cli.ok) return { ok: false, imageRestored: false, detail: `the CLI backup could not be reinstalled (${cli.detail}); the rollback stopped there` };
+  if (!cli.ok) return { ok: false, imageRestored: false, stoppedAtCli: true, detail: `the CLI backup could not be reinstalled (${cli.detail}); the rollback stopped there` };
   const prev = apply.previousImage;
   const img = await step('rollback-image', async () => {
     const id = await imageIdOf(prev.tag);
@@ -774,6 +777,7 @@ async function applyRequest(ctx, req) {
   // 4. Upgrade: a second run, so building the synced commits is allowed (drain, rebuild, recreate, restart --recover).
   // The CLI backups before it tell which backup the upgrade made (the CLI to reinstall on a rollback).
   const backupsBefore = new Set(cliBackups(facts.home).map((b) => b.name));
+  const imageBefore = await imageIdOf(p.imageTag);
   const up = await step('upgrade', () => minionsUpgrade(repo, ['--rebuild-cli'], TIMEOUTS.upgrade));
 
   // 5. Health: the container must run the image the tag names now (rebuilt or, with an unchanged fingerprint, the same).
@@ -791,11 +795,24 @@ async function applyRequest(ctx, req) {
   // (docker build, registry, drain) can be transient, so a new request tries that SHA again.
   const bad = up.ok;
   const why = up.ok ? `not healthy after the upgrade to ${short(to)} (${apply.health.detail})` : `minions upgrade --rebuild-cli failed (${up.detail})`;
+  const verdictOf = () => (bad ? `${short(to)} is recorded as bad` : `${short(to)} is not recorded as bad (the upgrade itself failed, which can be transient; a new request tries it again)`);
+  // A failed upgrade that replaced neither the CLI (no new backup: applyCli backs up before every reinstall) nor the
+  // image needs no rollback when the coordinator is healthy on the build it had: no down and start then.
+  if (!up.ok && imageBefore && !cliBackups(facts.home).some((b) => !backupsBefore.has(b.name)) && (await imageIdOf(p.imageTag)) === imageBefore) {
+    const same = await step('health-unchanged', () => healthCheck(ctx, imageBefore, { maxPolls: HEALTH_SETTLE }));
+    if (same.healthy) {
+      apply.rollback = { ok: true, skipped: true, detail: 'nothing to roll back', healthy: true, health: clean(same.detail, 600) };
+      writeState(files.state, { ...readState(files.state), prevPin: null });
+      return finishApply(ctx, apply, 'failed', `self-update: ${why}; it replaced neither the CLI nor the image and the coordinator is healthy on the current build, so nothing was rolled back or restarted; ${verdictOf()}`);
+    }
+  }
   const rb = await rollback(ctx, apply, step, backupsBefore);
-  const after = await step('health-after-rollback', () => healthCheck(ctx, rb.imageRestored ? apply.previousImage.id : null));
+  // A rollback that stopped at the CLI reinstall restarted nothing, so waiting out the window cannot help: the owner
+  // hears it after HEALTH_SETTLE probes.
+  const after = await step('health-after-rollback', () => healthCheck(ctx, rb.imageRestored ? apply.previousImage.id : null, rb.stoppedAtCli ? { maxPolls: HEALTH_SETTLE } : {}));
   apply.rollback = { ok: rb.ok, detail: rb.detail, healthy: after.healthy, health: clean(after.detail, 600) };
   if (after.healthy) writeState(files.state, { ...readState(files.state), prevPin: null });
-  const verdict = bad ? `${short(to)} is recorded as bad` : `${short(to)} is not recorded as bad (the upgrade itself failed, which can be transient; a new request tries it again)`;
+  const verdict = verdictOf();
   let tail2 = after.healthy ? 'the coordinator is healthy again on the previous build' : `no healthy coordinator even after the rollback (${clean(after.detail, 300)})`;
   if (!after.healthy) {
     const text = noticeText({ ...apply, outcome: 'failed', detail: `NO HEALTHY COORDINATOR even after the rollback. ${why}; ${rb.detail}; after the rollback: ${after.detail}; ${verdict}` }, files);
