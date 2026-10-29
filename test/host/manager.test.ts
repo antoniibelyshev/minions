@@ -481,6 +481,18 @@ describe('host manager: startup, lock, loop', () => {
     expect(() => readFileSync(M.managerLockPath())).toThrow();
   });
 
+  it('task-53.12: the lock is written via a temp file and link: never left empty, no temp file left after a won or contended acquire', async () => {
+    const { readdirSync, statSync } = await import('node:fs');
+    const first = await M.acquireManagerLock();
+    expect(JSON.parse(readFileSync(M.managerLockPath(), 'utf8'))).toMatchObject({ pid: process.pid });
+    expect(statSync(M.managerLockPath()).mode & 0o777).toBe(0o600);
+    expect(statSync(M.managerLockPath()).nlink).toBe(1); // the temp link is gone
+    await expect(M.acquireManagerLock()).rejects.toMatchObject({ code: 'CONFLICT', message: expect.stringMatching(/Another host manager runs/) });
+    expect(readdirSync(J.managerDir()).filter((n) => n.endsWith('.tmp'))).toEqual([]);
+    await first.release();
+    expect(readdirSync(J.managerDir()).filter((n) => n.startsWith('lock'))).toEqual([]);
+  });
+
   it('task-80: a manager lock still being written (created, no holder yet) is not taken over; one left empty past the grace is', async () => {
     const { mkdirSync, utimesSync } = await import('node:fs');
     mkdirSync(J.managerDir(), { recursive: true });
