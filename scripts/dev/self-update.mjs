@@ -4,15 +4,21 @@
 // the image copies only dist/ and templates/), and nothing installs or starts it. The owner starts it on the host;
 // stopping it is the kill switch.
 //
-// Phase 1 (this file): start refusals, the lock, the log and state files, polling for `upgrade --from-container`
-// change requests, taking one (`settings requests mark <id> --status confirmed`, through this script's own
-// `docker exec` into the runtime container), idle detection and --dry-run. Nothing is applied yet: sync, gate,
-// build, health check and rollback are phases 2 and 3, so a taken request is marked failed with that reason.
+// Phase 1: start refusals, the lock, the log and state files, polling for `upgrade --from-container` change
+// requests, taking one (`settings requests mark <id> --status confirmed`, through this script's own `docker exec`
+// into the runtime container), idle detection and --dry-run.
+// Phase 2: the apply. Sync (`minions upgrade --sync-only`), the host gate (`npm ci`, `npm run typecheck`, `npm test`)
+// on the exact synced commit in a throwaway worktree, the previous-image tag (`<imageTag>-prev`), the upgrade
+// (`minions upgrade --rebuild-cli`, a second run, so building the synced commits is allowed), outcome marking and
+// the owner notice (`notify enqueue`, own docker exec). A SHA that failed the gate is recorded as bad and is never
+// tried again.
+// Phase 3 (not built): the health check and rollback. healthCheck() and the comment after the upgrade step are the
+// seams.
 //
 // Plain Node ESM with no imports from src/: it runs against the installed `minions` CLI and `docker`. It never puts
 // a token or secret in argv or the log, and it treats every request field from the container as untrusted text.
 //
-// Usage: node scripts/dev/self-update.mjs [--repo <path>] [--dry-run] [--once] [--interval <seconds>]
+// Usage: node scripts/dev/self-update.mjs [--repo <path>] [--dry-run] [--once] [--interval <seconds>] [--gate-dir <path>]
 import { execFile, spawnSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { appendFileSync, chmodSync, existsSync, linkSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
@@ -24,8 +30,11 @@ const SERVICE = 'app';
 const DEFAULT_INTERVAL_S = 30;
 const GIT_SPEC = /^(git\+|git:|github:|gitlab:|bitbucket:|gist:)|\.git(#|$)/;
 const CONFIRM_DETAIL = 'taken by the host self-update script (scripts/dev/self-update.mjs)';
-const PHASE1_DETAIL = 'self-update: apply is not built yet (phase 1 of docs/design/coordinator-self-update.md); nothing was applied';
 const INTERRUPTED_DETAIL = 'self-update: the script stopped while handling this request; it is not run again';
+const MIN = 60_000;
+/** Step timeouts (ms). The gate's `npm test` is the slow step (the design's target: under 10 minutes in total). */
+const TIMEOUTS = { sync: 10 * MIN, worktree: 2 * MIN, ci: 20 * MIN, typecheck: 15 * MIN, test: 60 * MIN, docker: 2 * MIN, upgrade: 60 * MIN };
+const SHA = /^[0-9a-f]{40}$/;
 
 // ---------------------------------------------------------------- small helpers
 
@@ -38,15 +47,31 @@ const clean = (s, max = 200) => {
 const readJson = (p) => { try { return JSON.parse(readFileSync(p, 'utf8')); } catch { return null; } };
 const real = (p) => { try { return realpathSync(p); } catch { return null; } };
 
-/** Runs a command without a shell; never throws (spawn errors become code 127). */
+/** Running children, so a SIGINT/SIGTERM to the script reaches them (the child `minions upgrade` has its own handling). */
+const children = new Set();
+
+/**
+ * Runs a command without a shell; never throws (spawn errors become code 127). opts: cwd, env (default
+ * process.env), input (stdin text), timeoutMs.
+ */
 function run(cmd, args, opts = {}) {
   return new Promise((res) => {
-    execFile(cmd, args, { cwd: opts.cwd, env: process.env, timeout: opts.timeoutMs ?? 120_000, maxBuffer: 32 * 1024 * 1024, encoding: 'utf8' }, (err, stdout, stderr) => {
+    const child = execFile(cmd, args, { cwd: opts.cwd, env: opts.env ?? process.env, timeout: opts.timeoutMs ?? 120_000, maxBuffer: 64 * 1024 * 1024, encoding: 'utf8' }, (err, stdout, stderr) => {
+      children.delete(child);
       const code = err ? (typeof err.code === 'number' ? err.code : 127) : 0;
-      res({ code, stdout: stdout ?? '', stderr: stderr || (err && typeof err.code !== 'number' ? String(err.message) : '') });
+      res({ code, timedOut: Boolean(err?.killed), stdout: stdout ?? '', stderr: stderr || (err && typeof err.code !== 'number' ? String(err.message) : '') });
     });
+    children.add(child);
+    child.stdin?.on('error', () => { /* the child may exit before reading */ });
+    if (opts.input !== undefined) child.stdin?.end(opts.input); else child.stdin?.end();
   });
 }
+
+/** The last lines of a command's output, for a failure detail. */
+const tail = (r, max = 400) => {
+  const t = clean(`${r.stderr}\n${r.stdout}`.trim().split('\n').slice(-8).join(' '), 4000);
+  return t.length > max ? `…${t.slice(-max)}` : t;
+};
 
 /** The last JSON line of a `--json` command (the minions envelope), or null. */
 function envelope(stdout) {
@@ -122,7 +147,11 @@ async function gatherFacts(repoArg) {
   let delivery = null;
   const cfg = await run('minions', ['--json', 'config', 'show'], { cwd: repo, timeoutMs: 60_000 });
   const env = envelope(cfg.stdout);
-  if (env?.ok) delivery = env.data?.delivery?.mode ?? null;
+  let sensitivePaths = [];
+  if (env?.ok) {
+    delivery = env.data?.delivery?.mode ?? null;
+    sensitivePaths = Array.isArray(env.data?.sensitivePaths) ? env.data.sensitivePaths.filter((g) => typeof g === 'string') : [];
+  }
   if (delivery !== 'local') refusals.push(delivery ? `delivery mode is "${clean(delivery, 40)}", not local` : `could not read the delivery mode (\`minions --json config show\`: ${clean(env?.error?.message ?? cfg.stderr, 160) || `exit ${cfg.code}`})`);
   if (project) {
     const branch = await git(repo, ['symbolic-ref', '--short', '-q', 'HEAD']);
@@ -131,7 +160,7 @@ async function gatherFacts(repoArg) {
   const status = await git(repo, ['status', '--porcelain']);
   if (status === null) refusals.push('`git status` failed in the checkout');
   else if (status) refusals.push(`the checkout has uncommitted or untracked changes (${status.split('\n').length} path(s)); commit or remove them first`);
-  return { repo, home, cli, project, delivery, refusals };
+  return { repo, home, cli, project, delivery, sensitivePaths, refusals };
 }
 
 // ---------------------------------------------------------------- runtime access (own docker exec)
@@ -147,9 +176,9 @@ async function runtimeRunning(p) {
  * A runtime verb through `docker compose exec` (as runtimeJson in src/host/change-requests.ts). A stopped runtime is
  * `{ state: 'not-running' }`, which callers treat as "retry later", never as a failure of the request.
  */
-async function runtimeVerb(p, args) {
+async function runtimeVerb(p, args, input) {
   if (!(await runtimeRunning(p))) return { state: 'not-running' };
-  const r = await run('docker', composeArgv(p, 'exec', '-T', SERVICE, 'minions', ...args, '--json'), { timeoutMs: 120_000 });
+  const r = await run('docker', composeArgv(p, 'exec', '-T', SERVICE, 'minions', ...args, '--json'), { timeoutMs: 120_000, input });
   const env = envelope(r.stdout);
   if (!env) return { state: 'error', message: `unexpected output from the runtime (exit ${r.code}): ${clean(r.stderr || r.stdout, 200)}` };
   if (!env.ok) return env.error?.code === 'PRECONDITION' && /not running/i.test(env.error?.message ?? '') ? { state: 'not-running' } : { state: 'error', message: clean(env.error?.message ?? 'failed in the runtime', 300) };
@@ -157,6 +186,11 @@ async function runtimeVerb(p, args) {
 }
 
 const markRequest = (p, id, status, detail) => runtimeVerb(p, ['settings', 'requests', 'mark', id, '--status', status, '--detail', detail.slice(0, 900)]);
+/**
+ * The owner notice through the runtime outbox (text on stdin, never in argv); the coordinator sends it. Kind
+ * `status`: the outbox accepts only its fixed kinds (src/runtime/outbox.ts), and `status` is not held for the digest.
+ */
+const enqueueNotice = (p, key, text) => runtimeVerb(p, ['notify', 'enqueue', '--key', key, '--kind', 'status'], text);
 
 /** Open requests through the host verb `minions --json settings requests` (it reaches the runtime itself). */
 async function listRequests(repo) {
@@ -244,18 +278,305 @@ function writeState(file, state) {
   renameSync(tmp, file);
 }
 
+// ---------------------------------------------------------------- the apply (phase 2)
+
+/** Thrown out of the apply when the script is stopped: the request stays confirmed (marked failed at next start). */
+class Stopped extends Error {}
+
+const short = (sha) => (typeof sha === 'string' ? sha.slice(0, 12) : '?');
+
+/** `<imageTag>-prev` (an image name without a tag gets `:latest-prev`). */
+export function prevImageTag(tag) {
+  return tag.slice(tag.lastIndexOf('/') + 1).includes(':') ? `${tag}-prev` : `${tag}:latest-prev`;
+}
+
+/** Minimal glob, the same rules as globToRegExp() in src/config/capabilities.ts. */
+export function globToRegExp(glob) {
+  let src = '';
+  for (let i = 0; i < glob.length; i++) {
+    const c = glob[i];
+    if (c === '*' && glob[i + 1] === '*') {
+      i++;
+      if (glob[i + 1] === '/') { i++; src += '(?:.*/)?'; } else src += '.*';
+    } else if (c === '*') src += '[^/]*';
+    else if (c === '?') src += '[^/]';
+    else src += c.replace(/[.+^${}()|[\]\\]/g, '\\$&');
+  }
+  return new RegExp(`^${src}$`);
+}
+export const matchesAny = (path, globs) => globs.some((g) => globToRegExp(g).test(path.replace(/\\/g, '/').replace(/^\.\//, '').replace(/^\/+/, '')));
+
+/** The gate's environment: a scratch MINIONS_HOME, so the project's tests never see the owner's real install. */
+function gateEnv(home) {
+  const env = { ...process.env, MINIONS_TEST_MAX_WORKERS: '2', MINIONS_HOME: home };
+  delete env.MINIONS_RUNTIME;
+  delete env.MINIONS_UPGRADE_HANDOFF;
+  return env;
+}
+
+/**
+ * The plan of the apply, as printed by --dry-run (argv only; nothing runs). The gate dir name is decided at run time.
+ */
+function planLines(ctx, reqId) {
+  const p = ctx.facts.project;
+  const gate = join(ctx.gateDir, '<sha>-<random>');
+  return [
+    `docker ${composeArgv(p, 'exec', '-T', SERVICE, 'minions', 'settings', 'requests', 'mark', reqId, '--status', 'confirmed', '--detail', '<detail>', '--json').join(' ')}`,
+    `minions --json upgrade --sync-only   (in ${ctx.facts.repo}; the target is the new ${p.baseBranch})`,
+    `git worktree add --detach ${gate} <target>   (a target recorded as bad is not tried again)`,
+    `npm ci && npm run typecheck && npm test   (in ${gate}, MINIONS_TEST_MAX_WORKERS=2, scratch MINIONS_HOME; then the worktree is removed)`,
+    `docker tag ${p.imageTag || '<imageTag>'} ${p.imageTag ? prevImageTag(p.imageTag) : '<imageTag>-prev'}`,
+    'minions --json upgrade --rebuild-cli',
+    'health check and rollback: phase 3, not built yet',
+    `mark the request applied or failed, and enqueue the owner notice (notify enqueue --key self-update:${reqId} --kind status)`,
+  ].map((l) => `  ${l}`);
+}
+
+/** Records one step (with its duration) in the apply, prints it, and stops the apply when the script is stopping. */
+function stepper(ctx, apply) {
+  return async (id, fn) => {
+    const t0 = Date.now();
+    const r = await fn();
+    apply.steps.push({ id, status: r.ok ? 'done' : 'failed', ms: Date.now() - t0, detail: clean(r.detail, 600) });
+    ctx.say(`${apply.request} ${id}: ${r.ok ? 'done' : 'failed'} - ${clean(r.detail, 300)}`);
+    if (ctx.isStopping?.()) throw new Stopped(`stopped during ${id}`);
+    return r;
+  };
+}
+
+/** `minions --json upgrade ...` as a child in the checkout; ok as childUpgrade() in src/host/change-requests.ts decides it. */
+async function minionsUpgrade(repo, flags, timeoutMs) {
+  const r = await run('minions', ['--json', 'upgrade', ...flags], { cwd: repo, timeoutMs });
+  const env = envelope(r.stdout);
+  if (!env) return { ok: false, detail: `no result (exit ${r.code}): ${tail(r)}` };
+  if (!env.ok) return { ok: false, detail: clean(env.error?.message ?? 'failed', 400) };
+  const steps = Array.isArray(env.data?.steps) ? env.data.steps : [];
+  const failed = steps.filter((s) => s?.status === 'failed');
+  if (env.data?.stopped) return { ok: false, detail: `stopped: ${clean(env.data.stopped.reason, 300)}` };
+  if (!env.data?.ok || r.code !== 0 || failed.length) {
+    return { ok: false, detail: failed.length ? `failed: ${failed.map((s) => `${clean(s.id, 30)} (${clean(s.detail, 200)})`).join(', ')}` : `not ok (exit ${r.code})` };
+  }
+  return { ok: true, detail: 'complete', data: env.data };
+}
+
+/** Host gate on the exact commit, in a throwaway detached worktree outside the checkout; always removed after. */
+async function runGate(ctx, sha, step) {
+  const repo = ctx.facts.repo;
+  mkdirSync(ctx.gateDir, { recursive: true, mode: 0o700 });
+  const dir = join(ctx.gateDir, `${sha.slice(0, 12)}-${randomBytes(4).toString('hex')}`);
+  const home = `${dir}.home`;
+  try {
+    const add = await step('gate-worktree', async () => {
+      const r = await run('git', ['worktree', 'add', '--detach', dir, sha], { cwd: repo, timeoutMs: TIMEOUTS.worktree });
+      if (r.code !== 0) return { ok: false, detail: `git worktree add failed: ${tail(r)}` };
+      const head = await git(dir, ['rev-parse', 'HEAD']);
+      return head === sha ? { ok: true, detail: `${dir} at ${short(sha)}` } : { ok: false, detail: `the worktree is at ${short(head)}, not ${short(sha)}` };
+    });
+    if (!add.ok) return add;
+    mkdirSync(home, { recursive: true, mode: 0o700 });
+    const env = gateEnv(home);
+    // Only a typecheck or test failure (not a timeout) says the commit is bad. A failed `git worktree add` or
+    // `npm ci` (network, registry) or a timeout can be transient: the request fails, and a new request tries again.
+    for (const [id, args, timeoutMs, judges] of [['gate-ci', ['ci'], TIMEOUTS.ci, false], ['gate-typecheck', ['run', 'typecheck'], TIMEOUTS.typecheck, true], ['gate-test', ['test'], TIMEOUTS.test, true]]) {
+      const r = await step(id, async () => {
+        const x = await run('npm', args, { cwd: dir, env, timeoutMs });
+        if (x.code === 0) return { ok: true, detail: `npm ${args.join(' ')} passed` };
+        if (x.timedOut) return { ok: false, detail: `npm ${args.join(' ')} timed out after ${Math.round(timeoutMs / MIN)} min: ${tail(x)}` };
+        return { ok: false, bad: judges, detail: `npm ${args.join(' ')} failed (exit ${x.code}): ${tail(x)}` };
+      });
+      if (!r.ok) return r;
+    }
+    return { ok: true, detail: `npm ci, typecheck and test passed at ${short(sha)}` };
+  } finally {
+    await run('git', ['worktree', 'remove', '--force', dir], { cwd: repo, timeoutMs: TIMEOUTS.worktree });
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(home, { recursive: true, force: true });
+    await run('git', ['worktree', 'prune'], { cwd: repo, timeoutMs: TIMEOUTS.worktree });
+  }
+}
+
+/** Keeps the running image as `<imageTag>-prev` for the phase 3 rollback (the CLI backup is made by applyCli itself). */
+async function tagPrevious(p) {
+  if (!p.imageTag) return { ok: false, detail: 'the project has no imageTag' };
+  const id = await run('docker', ['image', 'inspect', '--format', '{{.Id}}', p.imageTag], { timeoutMs: TIMEOUTS.docker });
+  const imageId = id.code === 0 ? id.stdout.trim() : '';
+  if (!imageId) return { ok: false, detail: `docker image inspect ${p.imageTag} failed: ${tail(id)}` };
+  const prev = prevImageTag(p.imageTag);
+  const t = await run('docker', ['tag', p.imageTag, prev], { timeoutMs: TIMEOUTS.docker });
+  return t.code === 0 ? { ok: true, detail: `${p.imageTag} (${clean(imageId, 80)}) kept as ${prev}`, prev, imageId } : { ok: false, detail: `docker tag ${p.imageTag} ${prev} failed: ${tail(t)}` };
+}
+
+/**
+ * Phase 3 seam: the health definition of the design (fresh-process CLI checks, new image ID in the container,
+ * coordinator running with restartRequired current, Telegram checks, at most one restart, polled for 5 minutes).
+ * Not built: phase 2 trusts the upgrade's own result.
+ */
+// eslint-disable-next-line no-unused-vars
+async function healthCheck(_ctx, _apply) {
+  return { checked: false, healthy: true, detail: 'not checked (the health check and rollback are phase 3)' };
+}
+
+/** The outbox rejects longer texts (MAX_TEXT_LENGTH 4000 in src/runtime/outbox.ts); the notice stays below it. */
+export const NOTICE_MAX = 3500;
+const SENSITIVE_IN_NOTICE = 20;
+
+/**
+ * The owner notice, at most NOTICE_MAX characters: the commit list is cut to fit ("N more, see the log"), the
+ * sensitive list is capped, and as a last resort the whole text is cut.
+ */
+export function noticeText(apply, files) {
+  const head = [apply.outcome === 'applied'
+    ? `Self-update applied: ${apply.base} ${short(apply.from)}..${short(apply.to)} (request ${apply.request}).`
+    : `Self-update failed (request ${apply.request}): ${clean(apply.detail, 600)}`];
+  const foot = [];
+  if (apply.to) {
+    const shown = apply.sensitive.slice(0, SENSITIVE_IN_NOTICE).map((s) => clean(s, 120));
+    const more = apply.sensitive.length - shown.length;
+    foot.push(`Sensitive paths touched: ${shown.length ? `${shown.join(', ')}${more > 0 ? ` and ${more} more` : ''}` : 'none'}.`);
+  }
+  if (apply.scriptChanged) foot.push('The self-update script changed (scripts/dev/); restart it to use the new version.');
+  foot.push(`Log: ${files.log}`);
+  const commits = apply.range.map((l) => `  ${clean(l, 120)}`);
+  const plus = apply.rangeTruncated ? '+' : '';
+  const build = (n) => {
+    if (!commits.length) return [...head, ...foot].join('\n') + '\n';
+    const rest = commits.length - n;
+    const more = rest > 0 ? [`  ... ${rest}${plus} more, see the log`] : apply.rangeTruncated ? ['  ... and more, see the log'] : [];
+    return [...head, `Commits (${commits.length}${plus}):`, ...commits.slice(0, n), ...more, ...foot].join('\n') + '\n';
+  };
+  let n = commits.length;
+  let text = build(n);
+  while (n > 0 && text.length > NOTICE_MAX) text = build(--n);
+  return text.length > NOTICE_MAX ? `${text.slice(0, NOTICE_MAX - 30)}\n... (cut, see the log)\n` : text;
+}
+
+/**
+ * Records the outcome of an apply: the log line, the state (bad SHA, last applied) and the pending outcome, then
+ * marks the request and enqueues the notice. A stopped runtime leaves the outcome pending for the next poll.
+ */
+async function finishApply(ctx, apply, status, detail, o = {}) {
+  apply.outcome = status;
+  apply.detail = detail;
+  logEvent(ctx.files.log, { event: 'apply', ...apply });
+  const st = readState(ctx.files.state);
+  const badShas = o.bad && apply.to && !st.badShas.includes(apply.to) ? [...st.badShas, apply.to] : st.badShas;
+  const outcome = { status, detail, marked: false, notice: o.notice === false ? null : { key: `self-update:${apply.request}`, text: noticeText(apply, ctx.files) } };
+  writeState(ctx.files.state, { ...st, badShas, lastApplied: status === 'applied' && apply.to ? apply.to : st.lastApplied, current: { ...st.current, outcome } });
+  ctx.say(`request ${apply.request}: ${status}: ${clean(detail, 300)}`);
+  return flushOutcome(ctx);
+}
+
+/** How many polls try to mark an outcome the runtime refuses (an error other than "not running") before giving up. */
+const MARK_ATTEMPTS = 3;
+
+/**
+ * Marks and notifies a pending outcome. 'not-running': retried on the next poll. 'retry': the runtime refused the
+ * mark; the outcome stays pending and the next poll tries again, MARK_ATTEMPTS times in all. Then it is logged as
+ * not marked (the request stays confirmed: mark it by hand) and the notice still goes out.
+ */
+async function flushOutcome(ctx) {
+  const p = ctx.facts.project;
+  const st = readState(ctx.files.state);
+  const cur = st.current;
+  if (!cur?.outcome) return 'none';
+  if (!cur.outcome.marked) {
+    const m = await markRequest(p, cur.id, cur.outcome.status, cur.outcome.detail);
+    if (m.state === 'not-running') { ctx.say(`request ${cur.id}: runtime not running: it is marked ${cur.outcome.status} on a later poll`); return 'not-running'; }
+    if (m.state === 'error') {
+      const attempts = (cur.outcome.markAttempts ?? 0) + 1;
+      if (attempts < MARK_ATTEMPTS) {
+        ctx.say(`request ${cur.id}: could not be marked ${cur.outcome.status} (attempt ${attempts} of ${MARK_ATTEMPTS}): ${m.message}; retried on the next poll`);
+        writeState(ctx.files.state, { ...st, current: { ...cur, outcome: { ...cur.outcome, markAttempts: attempts } } });
+        logEvent(ctx.files.log, { event: 'mark-failed', request: cur.id, status: cur.outcome.status, attempt: attempts, message: m.message });
+        return 'retry';
+      }
+      ctx.say(`request ${cur.id}: NOT marked ${cur.outcome.status} after ${attempts} attempts (${m.message}); it stays confirmed in the runtime: mark it by hand (minions settings requests mark ${cur.id} --status ${cur.outcome.status})`);
+    }
+    writeState(ctx.files.state, { ...st, current: { ...cur, outcome: { ...cur.outcome, marked: true } } });
+    logEvent(ctx.files.log, { event: 'marked', request: cur.id, status: cur.outcome.status, ok: m.state === 'ok', ...(m.state === 'ok' ? {} : { gaveUp: true, message: m.message }) });
+  }
+  if (cur.outcome.notice) {
+    const n = await enqueueNotice(p, cur.outcome.notice.key, cur.outcome.notice.text);
+    if (n.state === 'not-running') { ctx.say(`request ${cur.id}: runtime not running: the owner notice is enqueued on a later poll`); return 'not-running'; }
+    if (n.state === 'error') ctx.say(`request ${cur.id}: could not enqueue the owner notice: ${n.message}`);
+    logEvent(ctx.files.log, { event: 'notice', request: cur.id, key: cur.outcome.notice.key, ok: n.state === 'ok' });
+  }
+  writeState(ctx.files.state, { ...readState(ctx.files.state), current: null });
+  return 'done';
+}
+
+/** The apply of a taken (confirmed) request: sync, gate, previous-image tag, upgrade, outcome. */
+async function applyRequest(ctx, req) {
+  const { facts, files } = ctx;
+  const p = facts.project;
+  const repo = facts.repo;
+  const base = p.baseBranch;
+  const apply = { request: req.id, base, from: null, to: null, range: [], rangeTruncated: false, sensitive: [], scriptChanged: false, steps: [], previousImage: null, health: null, rollback: null };
+  const step = stepper(ctx, apply);
+  apply.from = await git(repo, ['rev-parse', '--verify', '-q', `refs/heads/${base}`]);
+
+  // 1. Sync: export the container branches and strictly fast-forward host main (never forced).
+  const sync = await step('sync', () => minionsUpgrade(repo, ['--sync-only'], TIMEOUTS.sync));
+  if (!sync.ok) return finishApply(ctx, apply, 'failed', `self-update: the sync was refused (${sync.detail}); nothing was built`);
+  const to = await git(repo, ['rev-parse', '--verify', '-q', `refs/heads/${base}`]);
+  if (!to || !SHA.test(to)) return finishApply(ctx, apply, 'failed', `self-update: could not read ${base} after the sync; nothing was built`);
+  apply.to = to;
+  if (apply.from && apply.from !== to) {
+    const log = await git(repo, ['log', '--oneline', '--no-decorate', '-n', '51', `${apply.from}..${to}`]);
+    const all = log ? log.split('\n').filter(Boolean) : [];
+    apply.rangeTruncated = all.length > 50;
+    apply.range = all.slice(0, 50).map((l) => clean(l, 160));
+    const names = (await git(repo, ['diff', '--name-only', `${apply.from}..${to}`]))?.split('\n').filter(Boolean) ?? [];
+    apply.sensitive = names.filter((n) => matchesAny(n, facts.sensitivePaths ?? [])).slice(0, 100);
+    apply.scriptChanged = names.some((n) => n.startsWith('scripts/dev/'));
+  }
+  const st = readState(files.state);
+  if (st.badShas.includes(to)) {
+    return finishApply(ctx, apply, 'failed', `self-update: ${short(to)} failed before and is recorded as bad; it is not tried again (a newer commit on ${base} is tried normally); nothing was built`);
+  }
+  if (st.lastApplied === to) return finishApply(ctx, apply, 'applied', `self-update: already at ${short(to)}; nothing to do`, { notice: false });
+
+  // 2. Host gate on the exact synced commit (container evidence is not trusted for this).
+  const gate = await runGate(ctx, to, step);
+  if (!gate.ok) {
+    const verdict = gate.bad ? `${short(to)} is recorded as bad` : `${short(to)} is not recorded as bad (not a typecheck or test failure; a new request tries it again)`;
+    return finishApply(ctx, apply, 'failed', `self-update: the host gate failed at ${short(to)} (${gate.detail}); nothing was built; ${verdict}`, { bad: gate.bad === true });
+  }
+
+  // 3. Keep the previous image for the rollback.
+  const tag = await step('previous-image', () => tagPrevious(p));
+  if (!tag.ok) return finishApply(ctx, apply, 'failed', `self-update: the previous image could not be kept (${tag.detail}); nothing was built`);
+  apply.previousImage = { tag: tag.prev, id: tag.imageId };
+
+  // 4. Upgrade: a second run, so building the synced commits is allowed (drain, rebuild, recreate, restart --recover).
+  const up = await step('upgrade', () => minionsUpgrade(repo, ['--rebuild-cli'], TIMEOUTS.upgrade));
+  // Phase 3: a failed upgrade rolls back here (CLI backup reinstall, `<imageTag>-prev` re-tag, down && start).
+  if (!up.ok) return finishApply(ctx, apply, 'failed', `self-update: minions upgrade --rebuild-cli failed (${up.detail}); not rolled back (rollback is phase 3); previous image kept as ${tag.prev}`);
+
+  // 5. Health (phase 3 seam).
+  apply.health = await healthCheck(ctx, apply);
+  if (!apply.health.healthy) return finishApply(ctx, apply, 'failed', `self-update: not healthy after the upgrade (${apply.health.detail})`, { bad: true });
+
+  return finishApply(ctx, apply, 'applied', `self-update ${short(apply.from)}..${short(to)}`);
+}
+
 // ---------------------------------------------------------------- one poll
 
 /**
- * One poll. Returns a short outcome for the terminal. ctx: { facts, files, runId, dryRun, say }.
- * Dry run: reads only; marks, writes and logs nothing.
+ * One poll. Returns a short outcome for the terminal. ctx: { facts, files, runId, dryRun, gateDir, say, isStopping }.
+ * Dry run: reads only; marks, writes, logs and runs nothing.
  */
 async function pollOnce(ctx) {
   const { facts, files, dryRun, say } = ctx;
   const p = facts.project;
   if (!dryRun) {
     const st = readState(files.state);
-    if (st.current && st.current.runId !== ctx.runId) {
+    if (st.current?.outcome) {
+      // An outcome that could not be marked or notified yet (the runtime was down): finish it first.
+      const f = await flushOutcome(ctx);
+      if (f === 'not-running') return 'not-running';
+      if (f === 'retry') return 'error';
+    } else if (st.current && st.current.runId !== ctx.runId) {
       const m = await markRequest(p, st.current.id, 'failed', INTERRUPTED_DETAIL);
       if (m.state === 'not-running') { say('runtime not running: retry later (an interrupted request is still to be marked failed)'); return 'not-running'; }
       if (m.state === 'error') say(`could not mark interrupted request ${st.current.id} failed: ${m.message}`);
@@ -274,10 +595,10 @@ async function pollOnce(ctx) {
   if (idle.state === 'error') { say(`request ${what}: cannot tell whether the runtime is idle (${idle.message}); not taken, retry later`); return 'error'; }
   if (idle.state === 'busy') { say(`request ${what}: waiting for idle: ${idle.reason}; not taken`); return 'busy'; }
   if (dryRun) {
-    say(`would take request ${what}`);
-    say(`  docker ${composeArgv(p, 'exec', '-T', SERVICE, 'minions', 'settings', 'requests', 'mark', req.id, '--status', 'confirmed', '--detail', '<detail>', '--json').join(' ')}`);
-    say('  then apply (phase 2/3, not built yet): upgrade --sync-only, host gate, upgrade --rebuild-cli, health check, rollback');
-    say(`  phase 1 marks the request failed: "${PHASE1_DETAIL}"`);
+    const st = readState(files.state);
+    say(`would take request ${what} and apply it:`);
+    for (const l of planLines(ctx, req.id)) say(l);
+    say(`  state: last applied ${st.lastApplied ? short(st.lastApplied) : 'none'}, ${st.badShas.length} bad SHA(s)`);
     return 'would-take';
   }
   const m = await markRequest(p, req.id, 'confirmed', CONFIRM_DETAIL);
@@ -287,36 +608,48 @@ async function pollOnce(ctx) {
   writeState(files.state, { ...st, current: { id: req.id, takenAt: new Date().toISOString(), runId: ctx.runId } });
   logEvent(files.log, { event: 'taken', request: req.id, fromContainer: req.payload.fromContainer === true ? true : clean(req.payload.fromContainer, 60) });
   say(`took request ${what}`);
-  // Phase 1 stops here: report honestly that nothing was applied and release the request.
-  const f = await markRequest(p, req.id, 'failed', PHASE1_DETAIL);
-  logEvent(files.log, { event: 'not-applied', request: req.id, reason: 'phase 1: apply not built', marked: f.state === 'ok' });
-  if (f.state === 'ok') writeState(files.state, { ...readState(files.state), current: null });
-  say(`request ${req.id}: ${f.state === 'ok' ? 'marked failed' : `could not be marked failed yet (${f.state}); it is marked when the script next starts`}: apply is not built yet (phase 1)`);
+  try {
+    await applyRequest(ctx, req);
+  } catch (e) {
+    if (!(e instanceof Stopped)) {
+      const cur = readState(files.state).current;
+      if (cur?.id === req.id && !cur.outcome) {
+        await finishApply(ctx, { request: req.id, base: p.baseBranch, from: null, to: null, range: [], sensitive: [], steps: [] }, 'failed', `self-update: the apply failed unexpectedly: ${clean(e?.message ?? e, 300)}`);
+      }
+      throw e;
+    }
+    // Stopped: no rollback, the request stays confirmed; the next start reports it as interrupted and marks it failed.
+    logEvent(files.log, { event: 'apply-stopped', request: req.id, reason: e.message });
+    say(`request ${req.id}: ${e.message}; it stays confirmed and is marked failed when the script next starts`);
+    return 'stopped';
+  }
   return 'taken';
 }
 
 // ---------------------------------------------------------------- main
 
 function parseArgs(argv) {
-  const o = { repo: process.cwd(), dryRun: false, once: false, intervalS: DEFAULT_INTERVAL_S };
+  const o = { repo: process.cwd(), dryRun: false, once: false, intervalS: DEFAULT_INTERVAL_S, gateDir: null };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--dry-run') o.dryRun = true;
     else if (a === '--once') o.once = true;
     else if (a === '--repo') o.repo = resolve(argv[++i] ?? '');
     else if (a === '--interval') { o.intervalS = Number(argv[++i]); if (!(o.intervalS > 0)) throw new Error('--interval needs a positive number of seconds'); }
+    else if (a === '--gate-dir') { const v = argv[++i]; if (!v) throw new Error('--gate-dir needs a path'); o.gateDir = resolve(v); }
     else if (a === '-h' || a === '--help') o.help = true;
     else throw new Error(`unknown argument: ${clean(a, 60)}`);
   }
   return o;
 }
 
-const USAGE = `usage: node scripts/dev/self-update.mjs [--repo <path>] [--dry-run] [--once] [--interval <seconds>]
+const USAGE = `usage: node scripts/dev/self-update.mjs [--repo <path>] [--dry-run] [--once] [--interval <seconds>] [--gate-dir <path>]
   Host-only dev tool for the minions project developing itself (docs/design/coordinator-self-update.md).
   --repo      the minions checkout of the project (default: the current directory)
-  --dry-run   check the refusals and print the plan for one poll; mark, write and log nothing
+  --dry-run   check the refusals and print the plan for one poll; mark, write, log and run nothing
   --once      one poll, then exit
-  --interval  seconds between polls (default ${DEFAULT_INTERVAL_S})`;
+  --interval  seconds between polls (default ${DEFAULT_INTERVAL_S})
+  --gate-dir  where the throwaway gate worktrees go, outside the checkout (default <MINIONS_HOME>/dev-self-update/gate)`;
 
 async function main(argv) {
   let o;
@@ -339,10 +672,11 @@ async function main(argv) {
     return 2;
   }
   const files = paths(facts.home);
+  const gateDir = o.gateDir ?? join(files.dir, 'gate');
   if (o.dryRun) {
     const h = readJson(files.lock);
     if (h && typeof h.pid === 'number' && holderAlive(h)) say(`note: another self-update script holds the lock (pid ${h.pid})`);
-    await pollOnce({ facts, files, runId: 'dry-run', dryRun: true, say });
+    await pollOnce({ facts, files, runId: 'dry-run', dryRun: true, gateDir, say });
     return 0;
   }
   mkdirSync(files.dir, { recursive: true, mode: 0o700 });
@@ -355,14 +689,19 @@ async function main(argv) {
   let stopping = false;
   let wake = null;
   let timer = null;
-  const stop = (sig) => { stopping = true; say(`${sig}: stopping`); if (timer) clearTimeout(timer); wake?.(); };
+  // A stop during an apply reaches the running child (the child `minions upgrade` resumes its pause, and its
+  // upgrade.json marker lets a rerun finish); the apply then ends without a rollback.
+  const stop = (sig) => {
+    stopping = true; say(`${sig}: stopping`); if (timer) clearTimeout(timer); wake?.();
+    for (const c of children) { try { c.kill(sig); } catch { /* already gone */ } }
+  };
   process.on('SIGINT', () => stop('SIGINT'));
   process.on('SIGTERM', () => stop('SIGTERM'));
   try {
     logEvent(files.log, { event: 'started', pid: process.pid, repo: facts.repo, projectId: facts.project.projectId });
     say(`started (pid ${process.pid}, project ${facts.project.projectId}, polling every ${o.intervalS}s; stop with Ctrl-C)`);
     while (!stopping) {
-      try { await pollOnce({ facts, files, runId, dryRun: false, say }); } catch (e) { say(`poll failed: ${clean(e?.message ?? e, 300)}; retry later`); }
+      try { await pollOnce({ facts, files, runId, dryRun: false, gateDir, say, isStopping: () => stopping }); } catch (e) { say(`poll failed: ${clean(e?.message ?? e, 300)}; retry later`); }
       if (o.once || stopping) break;
       await new Promise((r) => { wake = r; timer = setTimeout(r, o.intervalS * 1000); });
       wake = null; timer = null;

@@ -111,7 +111,7 @@ instructions (see phase 4), not in the shipped coordinator template.
 3. **Gate on the host, for this exact SHA.** Create a throwaway `git worktree add --detach` under the script's
    scratch dir, outside the checkout. Run `npm ci`, `npm run typecheck` and `npm test` there
    (`MINIONS_TEST_MAX_WORKERS=2`), then remove the worktree. Container evidence is not trusted for this. If the gate
-   fails, the request is marked `failed`, nothing is built, and the SHA is recorded as bad. Host main stays advanced to that SHA (the sync already moved it, and host branches only
+   fails, the request is marked `failed` and nothing is built. Only a typecheck or test failure records the SHA as bad; a failed `git worktree add` or `npm ci`, or a timeout, can be transient, so a new request tries that SHA again. Host main stays advanced to that SHA (the sync already moved it, and host branches only
    move forward), so the next request syncs and gates from that HEAD. A fix on main is therefore picked up normally.
 4. **Keep the previous build.** Tag the current image as `<imageTag>-prev` (`docker tag`). The CLI backup is made by
    `applyCli` itself.
@@ -128,7 +128,7 @@ instructions (see phase 4), not in the shipped coordinator template.
    - the coordinator does not restart more than once in the window.
 7. **Outcome.**
    - Healthy: mark the request `applied` with detail `self-update <old>..<new>`, and enqueue the owner notice
-     (`minions notify enqueue --key self-update:<sha> --kind self-update`; the new coordinator sends it). Both verbs run by the script's own docker exec.
+     (`minions notify enqueue --key self-update:<requestId> --kind status`; the new coordinator sends it). Both verbs run by the script's own docker exec. The kind is `status` because the outbox accepts only its fixed kinds and `status` is not held for the digest. The key is per request because a refused sync has no SHA and one SHA can get several requests. The text stays under the outbox limit (4000 characters): a long commit list is cut with "N more, see the log". If the runtime refuses the mark (an error other than "not running"), the outcome stays pending and later polls retry it, three times in all; after that it is logged as not marked.
    - Not healthy: **roll back**. Reinstall the newest CLI backup with `installCliBackup`, re-tag `<imageTag>-prev`
      as `<imageTag>`, then run `minions down && minions start --no-attach` on the old CLI. The image's `minions.build` label
      is the fingerprint of the files the old CLI built it from (`buildFingerprint`, `src/host/docker.ts`), so
