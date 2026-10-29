@@ -794,6 +794,13 @@ export function register(program: Command): void {
           const pem = await readFile(paths.approvalPublicKey, 'utf8').catch(() => null);
           return !!pem && verifyAnyApproval(d.approvals(row.task_id, 'merge', row.head_sha).map((a) => a.signature), pem, { taskId: row.task_id, head: row.head_sha, scope: 'merge' }).ok;
         },
+        // Task-82.3: a terminal row moves its task (landed -> done, failure -> changes-requested, ...), with the
+        // config as it is now (the integrator may run for a long time).
+        onSettled: async (row) => {
+          const s = new Scheduler({ config: await loadRuntimeConfig(), db: d, backlog: b, layout: workspaceLayout(), handoff: paths });
+          const out = await s.settleIntegration(row);
+          process.stderr.write(`${new Date().toISOString()} minions integrator: ${out.taskId}: ${out.message}\n`);
+        },
         log: (line) => process.stderr.write(`${new Date().toISOString()} ${line}\n`),
       });
       emit(r, { json: globalOpts(cmd).json, human: (x: IntegratorReport) => x.exit === 'conflict'
