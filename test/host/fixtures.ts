@@ -3,6 +3,7 @@ import { mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { DockerProbe } from '../../src/host/discovery.js';
+import { fromTemplate } from '../repo-template.js';
 
 export const git = (cwd: string, ...args: string[]) =>
   execFileSync('git', args, { cwd, encoding: 'utf8', env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' } }).trim();
@@ -14,6 +15,11 @@ export function tempDir(prefix: string): string {
 /** Temp git repo with one commit on main and a configured identity. */
 export function makeRepo(root: string, name = 'repo'): string {
   const repo = join(root, name);
+  fromTemplate('host-make-repo', repo, (d) => { buildRepo(d); return ''; });
+  return repo;
+}
+
+function buildRepo(repo: string): void {
   execFileSync('mkdir', ['-p', repo]);
   git(repo, 'init', '-q', '-b', 'main');
   git(repo, 'config', 'user.name', 'Ada Lovelace');
@@ -24,7 +30,6 @@ export function makeRepo(root: string, name = 'repo'): string {
   writeFileSync(join(repo, '.gitignore'), '.env\n');
   git(repo, 'add', '.');
   git(repo, 'commit', '-q', '-m', 'init');
-  return repo;
 }
 
 export const dockerUp: DockerProbe = async () => ({ daemon: true, serverVersion: '29.8.2', compose: true, composeVersion: '5.5.1' });
