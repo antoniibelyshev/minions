@@ -349,7 +349,7 @@ export async function applyCli(c: CliCheck, opts: { runner?: Runner; log?: (m: s
     const tgz = join(dir, `minions-${c.checkoutVersion}.tgz`);
     if (!existsSync(tgz)) throw new MinionsError('INTERNAL', `npm pack did not produce ${tgz}.`);
     if (c.installed.realPath) {
-      try { await (opts.backup ?? backupInstalledCli)(c.installed.realPath, c.installed.version, { runner, env, log: opts.log }); } catch (e) {
+      try { await (opts.backup ?? backupInstalledCli)(c.installed.realPath, c.installed.version, { log: opts.log }); } catch (e) {
         throw new MinionsError('INTERNAL', `backing up the current CLI failed, so nothing was installed: ${(e as Error).message}`);
       }
     }

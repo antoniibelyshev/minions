@@ -61,13 +61,15 @@
 import { randomBytes } from 'node:crypto';
 import { link, readFile, rm, writeFile } from 'node:fs/promises';
 import { basename, join } from 'node:path';
+import { StringDecoder } from 'node:string_decoder';
 import type { Command } from 'commander';
-import { action, requireMode } from '../core/cli-helpers.js';
+import { action, globalOpts, requireMode } from '../core/cli-helpers.js';
 import { APPROVAL_TOKEN_PREFIX } from '../core/approval.js';
 import { displayText, truncateCodePoints } from '../core/control-chars.js';
 import { MinionsError, isMinionsError } from '../core/errors.js';
 import { run, type RunResult } from '../core/exec.js';
 import { ensureDir } from '../core/fsutil.js';
+import { emit } from '../core/output.js';
 import { procStartTime } from '../runtime/coordinator.js';
 import { isChangeRequestId, type ChangeRequestView } from '../runtime/change-requests.js';
 import { pidAlive } from '../runtime/db.js';
@@ -1387,6 +1389,36 @@ export async function chooseTransport(o: {
   };
 }
 
+/** Longest text `minions manager notify` reads from stdin (the transport cuts what goes out at MESSAGE_MAX_CHARS). */
+const NOTICE_INPUT_MAX = 16_384;
+
+/**
+ * Sends one plain-text notice to the paired owner through the manager bot (`minions manager notify`). Refused with
+ * PRECONDITION when the bot is not paired, no token is stored, or the pairing belongs to another bot: there is no log
+ * fallback here, the caller (the dev self-update script) logs the refusal itself. The token never leaves the request.
+ */
+export async function sendManagerNotice(text: string, o: { loadAccess?: () => Promise<ManagerAccess | null>; readToken?: () => Promise<string | null>; fetch?: typeof fetch } = {}): Promise<{ sent: true; botId: string }> {
+  const body = text.trim();
+  if (!body) throw new MinionsError('PRECONDITION', 'No notice text on stdin.', 'Pipe the text in: `echo text | minions manager notify`.');
+  const access = await (o.loadAccess ?? loadManagerAccess)();
+  if (!access) throw new MinionsError('PRECONDITION', 'The manager bot is not paired; nothing was sent.', 'Pair it with `minions setup`.');
+  const token = await (o.readToken ?? (() => readManagerToken()))();
+  if (!token) throw new MinionsError('PRECONDITION', 'No manager bot token is stored; nothing was sent.', 'Store it with `minions setup`.');
+  if (!token.startsWith(`${access.botId}:`)) throw new MinionsError('PRECONDITION', 'The pairing belongs to another manager bot; nothing was sent.', 'Pair again with `minions setup`.');
+  await telegramTransport({ token, access, ...(o.fetch ? { fetch: o.fetch } : {}) }).notice(body);
+  return { sent: true, botId: access.botId };
+}
+
+async function readStdinText(max: number): Promise<string> {
+  if (process.stdin.isTTY) throw new MinionsError('PRECONDITION', 'Expected the notice text on stdin.', 'Pipe the text in: `echo text | minions manager notify`.');
+  // A StringDecoder keeps a multi-byte character that is split across two chunks whole.
+  const decoder = new StringDecoder('utf8');
+  let data = '';
+  for await (const chunk of process.stdin) { data += typeof chunk === 'string' ? chunk : decoder.write(chunk as Buffer); if (data.length > max) break; }
+  data += decoder.end();
+  return data.slice(0, max);
+}
+
 /** `minions manager run` (internal tier; started by its launchd / systemd --user service, src/host/manager-service.ts). */
 export function registerManager(program: Command): void {
   const manager = program.command('manager')
@@ -1417,5 +1449,14 @@ export function registerManager(program: Command): void {
         process.off('SIGINT', stop);
         process.off('SIGTERM', stop);
       }
+    }));
+  // Hidden: only the dev self-update script (scripts/dev/self-update.mjs) uses it, when no coordinator comes up even
+  // after a rollback, so the owner still hears about it (docs/design/coordinator-self-update.md, Decision 3).
+  manager.command('notify', { hidden: true })
+    .description('Internal: send the text on stdin to the paired owner through the manager bot (host only)')
+    .action(action(async (_o: unknown, cmd: Command) => {
+      requireMode('host');
+      const r = await sendManagerNotice(await readStdinText(NOTICE_INPUT_MAX));
+      emit(r, { json: globalOpts(cmd).json, human: (x) => `Sent through manager bot ${x.botId}.` });
     }));
 }
