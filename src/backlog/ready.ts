@@ -1,6 +1,6 @@
 import type { ScopeFilter, Task } from './types.js';
 
-/** Statuses that satisfy a dependency. */
+/** Statuses that satisfy a dependency by default (local integration narrows this to `done`: config/delivery.ts dependencyDoneStatuses). */
 export const COMPLETED_STATUSES: ReadonlySet<Task['status']> = new Set(['done', 'delivered']);
 
 export const AUTHORIZED_LABEL = 'minions:authorized';
@@ -25,6 +25,8 @@ export interface ReadyContext {
    * such a dependency excludes the task.
    */
   lookup: (id: string) => Task | undefined;
+  /** Statuses that satisfy a dependency (default COMPLETED_STATUSES; config/delivery.ts dependencyDoneStatuses). */
+  completed?: ReadonlySet<Task['status']>;
 }
 
 export type ExclusionReason = 'paused' | 'status' | 'unauthorized' | 'scope' | 'leased' | 'dependency';
@@ -38,7 +40,7 @@ export function notReadyReason(task: Task, ctx: ReadyContext): ExclusionReason |
   if (ctx.leased.has(task.id)) return 'leased';
   for (const dep of task.dependencies) {
     const d = ctx.lookup(dep);
-    if (!d || !COMPLETED_STATUSES.has(d.status)) return 'dependency';
+    if (!d || !(ctx.completed ?? COMPLETED_STATUSES).has(d.status)) return 'dependency';
   }
   return null;
 }

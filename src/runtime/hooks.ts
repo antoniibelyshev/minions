@@ -2,6 +2,7 @@ import { closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readSy
 import { basename, dirname, join } from 'node:path';
 import { filterReady } from '../backlog/ready.js';
 import type { BacklogAdapter, Task } from '../backlog/types.js';
+import { dependencyDoneStatuses } from '../config/delivery.js';
 import { AGENT_MODEL_ALIASES, isAgentModelAlias } from '../config/models.js';
 import { HARNESSES, isProcessHarness } from '../config/harnesses.js';
 import { agentTypeRole, DEEP_SUFFIX, workerRoleNames } from '../config/roles.js';
@@ -108,7 +109,7 @@ export async function stopHook(input: unknown, load: HookLoader, env: NodeJS.Pro
       return allow('backlog-error', `backlog query failed (${(e as Error).message})`);
     }
     const byId = new Map(tasks.map((t) => [t.id, t]));
-    const ready = filterReady(tasks, { leased, scope: scopeOf(config), lookup: (id) => byId.get(id) }, 50);
+    const ready = filterReady(tasks, { leased, scope: scopeOf(config), lookup: (id) => byId.get(id), completed: dependencyDoneStatuses(config) }, 50);
     const cap = capacityOf(config, leases, tasks);
     const canStart = cap.freeTaskSlots > 0 && cap.freeEngineerSlots > 0;
     const startable = canStart ? ready.filter((t) => !leased.has(t.id)) : [];
@@ -233,8 +234,8 @@ export function preTelegramHook(input: unknown): HookOutput {
  */
 export const PRE_BASH_HOOK_COMMAND = `i=$(cat) || exit 2; case "$i" in *'"agent_id"'*) printf '%s' "$i" | grep -Eq 'minions[^:]|cli\\.[cm]?js|/state|/secrets|MINIONS_STATE_DIR'; m=$?; [ "$m" = 1 ] && exit 0; [ "$m" = 0 ] || exit 2; printf '%s' "$i" | timeout 20 minions hook pre-bash || exit 2;; esac`;
 
-/** The verbs a Claude subagent must never run: they start, claim or end worker leases (coordinator-only). */
-export const COORDINATOR_ONLY_WORK_VERBS = ['run', 'claim', 'advance', 'release'] as const;
+/** The verbs a Claude subagent must never run: they start, claim or end worker leases, or run the local integrator (coordinator-only). */
+export const COORDINATOR_ONLY_WORK_VERBS = ['run', 'claim', 'advance', 'release', 'integrate'] as const;
 
 /** A program word that runs the minions CLI: `minions` (any path) or its entry script (`…/dist/cli.js`). */
 const MINIONS_ENTRY = /^(minions|cli\.[cm]?js)$/;

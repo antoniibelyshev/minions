@@ -107,9 +107,9 @@ describe('closest keys for an unknown setting', () => {
     let err: (Error & { code?: string; hint?: string; details?: any }) | undefined;
     try { S.requireSetting('pr.merge'); } catch (e) { err = e as typeof err; }
     expect(err?.code).toBe('INVALID_CONFIG');
-    expect(err?.message).toBe('Unknown setting: pr.merge. Did you mean: capabilities.pr.merge, delivery.merge?');
+    expect(err?.message).toBe('Unknown setting: pr.merge. Did you mean: capabilities.pr.merge, capabilities.base.merge, delivery.merge?');
     expect(err?.hint).toContain('minions settings --list');
-    expect(err?.details).toEqual({ path: 'pr.merge', suggestions: ['capabilities.pr.merge', 'delivery.merge'] });
+    expect(err?.details).toEqual({ path: 'pr.merge', suggestions: ['capabilities.pr.merge', 'capabilities.base.merge', 'delivery.merge'] });
     expect(() => S.requireSetting('zzz')).toThrow(/^Unknown setting: zzz$/);
   });
 });

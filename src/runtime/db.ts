@@ -5,7 +5,7 @@ import type { IdempotencyStore } from '../backlog/types.js';
 import { MinionsError } from '../core/errors.js';
 import { runtimePaths } from './paths.js';
 
-export const SCHEMA_VERSION = 11;
+export const SCHEMA_VERSION = 12;
 
 /** The built-in worker roles (always registered). */
 export type BuiltinLeaseRole = 'engineer' | 'tester' | 'reviewer';
@@ -36,8 +36,12 @@ export interface EvidenceRow {
  * approved head. pending: approved, not yet published (or interrupted); awaiting-approval: needs a
  * recorded human approval (sensitive paths or an "ask" capability); failed: retryable with
  * `minions work publish`; published: pushed (and PR opened in pull-request mode).
+ * Local delivery with local integration on (mode `local`, docs/design/local-auto-integration.md): queued: the
+ * approved head waits for or runs in the local integrator; awaiting-approval: the landing needs a host-signed
+ * merge approval; failed: the integration failed (repair, or a blocked transient failure); published: landed on
+ * the base.
  */
-export type PublicationState = 'pending' | 'awaiting-approval' | 'failed' | 'published';
+export type PublicationState = 'pending' | 'queued' | 'awaiting-approval' | 'failed' | 'published';
 export interface PublicationRow {
   task_id: string; branch: string; head_sha: string; mode: string; state: PublicationState;
   pr_url: string | null; error_code: string | null; error: string | null;
@@ -204,6 +208,20 @@ const MIGRATIONS: Record<number, Migration> = {
       CREATE INDEX IF NOT EXISTS tg_messages_ref ON tg_messages(ref);
     `);
   },
+  // Local integration (docs/design/local-auto-integration.md phase 2, task-82.2, src/runtime/integrator.ts; version 12
+  // because task-57.12 took 11): one row per queued integration of an approved head. phase is its state (queued, merging, verifying, landing, or a terminal one);
+  // the verify_* columns identify the running verification process group for crash recovery. At most one open row
+  // per task.
+  12: `
+    CREATE TABLE IF NOT EXISTS integrations (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, branch TEXT NOT NULL, head_sha TEXT NOT NULL,
+      base_sha TEXT, candidate_sha TEXT, phase TEXT NOT NULL, attempt INTEGER NOT NULL DEFAULT 0,
+      verify_pid INTEGER, verify_start TEXT, verify_boot TEXT,
+      queued_at TEXT NOT NULL, started_at TEXT, ended_at TEXT, outcome TEXT, detail TEXT, log_path TEXT);
+    CREATE INDEX IF NOT EXISTS integrations_task ON integrations(task_id, id);
+    CREATE UNIQUE INDEX IF NOT EXISTS integrations_one_open_per_task ON integrations(task_id)
+      WHERE phase IN ('queued', 'merging', 'verifying', 'landing');
+  `,
 };
 
 let warningFilterInstalled = false;

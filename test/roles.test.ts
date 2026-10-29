@@ -141,7 +141,7 @@ describe('policy columns', () => {
 
   it('gives project roles the base effect, D8 default denies and edits/commits-derived columns', () => {
     const cfg = withRoles({ researcher, judge: { description: 'j', promptText: 'x', contract: 'gate' } });
-    expect(CUSTOM_ROLE_DENY_BY_DEFAULT).toEqual(['external.read', 'external.comment', 'external.changeStatus', 'external.create', 'pr.merge', 'ci.edit', 'infrastructure.edit', 'deploy.execute']);
+    expect(CUSTOM_ROLE_DENY_BY_DEFAULT).toEqual(['external.read', 'external.comment', 'external.changeStatus', 'external.create', 'pr.merge', 'base.merge', 'ci.edit', 'infrastructure.edit', 'deploy.execute']);
     for (const c of CUSTOM_ROLE_DENY_BY_DEFAULT) expect(can(cfg, c, { role: 'researcher' }), c).toBe('deny');
     expect(can(cfg, 'task.read', { role: 'researcher' })).toBe('allow');
     expect(can(cfg, 'network.use', { role: 'researcher' })).toBe('allow');

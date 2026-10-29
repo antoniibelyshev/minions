@@ -8,6 +8,8 @@ export const CAPABILITIES = [
   'code.edit', 'dependencies.edit', 'architecture.change', 'migrations.edit',
   'git.commit', 'git.push',
   'pr.create', 'pr.review', 'pr.merge',
+  // Local integration (docs/design/local-auto-integration.md): the runtime merging an approved head into the local base.
+  'base.merge',
   'ci.edit', 'infrastructure.edit',
   'network.use',
   'deploy.execute',
@@ -40,8 +42,15 @@ export const CapabilityRuleSchema = z.union([
 ]);
 export type CapabilityRule = z.infer<typeof CapabilityRuleSchema>;
 
+/**
+ * Capabilities added after configs were first written default when an effective config lacks them, fail closed:
+ * an effective config generated before base.merge existed (task-82.3) keeps local integration off (deny: approvals
+ * end delivered, as before) until the host regenerates it from the profile defaults.
+ */
+const LATER_CAPABILITY_DEFAULTS: Partial<Record<Capability, 'deny'>> = { 'base.merge': 'deny' };
+
 export const CapabilitiesSchema = z.object(
-  Object.fromEntries(CAPABILITIES.map((c) => [c, CapabilityRuleSchema])) as Record<Capability, typeof CapabilityRuleSchema>,
+  Object.fromEntries(CAPABILITIES.map((c) => [c, LATER_CAPABILITY_DEFAULTS[c] ? CapabilityRuleSchema.default(LATER_CAPABILITY_DEFAULTS[c]) : CapabilityRuleSchema])) as Record<Capability, typeof CapabilityRuleSchema>,
 ).strict();
 
 export const PROFILES = ['project-owner', 'personal-work', 'supervised'] as const;
@@ -296,9 +305,21 @@ export const MinionsConfigSchema = z.object({
     identityMode: z.enum(['git-identity', 'user-token', 'github-apps']),
     requireIndependentApproval: z.boolean(),
     requiredChecksConfigured: z.boolean(),
+    /**
+     * Local integration (docs/design/local-auto-integration.md, src/runtime/integrator.ts): the wall-clock limit of
+     * each setup and verification command of the integration gate, in minutes. A timeout is transient (one retry).
+     * Default 30.
+     */
+    integrationTimeoutMinutes: z.number().int().min(1).optional(),
   }).strict(),
   verification: z.object({
     commands: z.array(nonEmpty),
+    /**
+     * Local integration: commands that install dependencies in the integration worktree before
+     * verification.commands (for example `npm ci`). Run only when they or the lockfile changed since the last
+     * successful setup; a failure is transient. Default [].
+     */
+    setupCommands: z.array(nonEmpty).optional(),
     /** true: every task gets a tester stage (the old flow). false: only tasks that need QA (qaLabels, sensitive paths, reviewer needsQa). */
     testerRequired: z.boolean(),
     reviewerRequired: z.boolean(),

@@ -470,6 +470,11 @@
         },
         "requiredChecksConfigured": {
           "type": "boolean"
+        },
+        "integrationTimeoutMinutes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
         }
       },
       "required": [
@@ -488,6 +493,12 @@
       "type": "object",
       "properties": {
         "commands": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/__schema0"
+          }
+        },
+        "setupCommands": {
           "type": "array",
           "items": {
             "$ref": "#/$defs/__schema0"
@@ -639,6 +650,10 @@
         "pr.merge": {
           "$ref": "#/$defs/__schema4"
         },
+        "base.merge": {
+          "default": "deny",
+          "$ref": "#/$defs/__schema4"
+        },
         "ci.edit": {
           "$ref": "#/$defs/__schema4"
         },
@@ -670,6 +685,7 @@
         "pr.create",
         "pr.review",
         "pr.merge",
+        "base.merge",
         "ci.edit",
         "infrastructure.edit",
         "network.use",
@@ -847,6 +863,7 @@
                 "pr.create",
                 "pr.review",
                 "pr.merge",
+                "base.merge",
                 "ci.edit",
                 "infrastructure.edit",
                 "network.use",
@@ -906,6 +923,9 @@
                 "$ref": "#/$defs/__schema5"
               },
               "pr.merge": {
+                "$ref": "#/$defs/__schema5"
+              },
+              "base.merge": {
                 "$ref": "#/$defs/__schema5"
               },
               "ci.edit": {

@@ -39,7 +39,8 @@ export interface ScopeFilter { milestone: string | null; requiredLabels: string[
 export interface BacklogAdapter {
   capabilities(): Promise<{ backend: string; version: string; supports: string[] }>;
   listTasks(): Promise<Task[]>;
-  listReady(limit: number, leasedIds: Set<string>, scope: ScopeFilter): Promise<Task[]>;
+  /** `completed`: statuses that satisfy a dependency (default done + delivered; see backlog/ready.ts). */
+  listReady(limit: number, leasedIds: Set<string>, scope: ScopeFilter, completed?: ReadonlySet<TaskStatus>): Promise<Task[]>;
   getTask(id: string): Promise<Task>;
   createTask(input: CreateTaskInput): Promise<{ task: Task; created: boolean }>; // idempotent by key
   updateTask(id: string, expectedVersion: string, patch: Partial<Pick<Task, 'status' | 'title' | 'description' | 'priority' | 'labels' | 'branch' | 'prUrl'>> & { workflow?: string | null }): Promise<Task>; // CONFLICT on version mismatch

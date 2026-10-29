@@ -120,7 +120,8 @@ describe('validation', () => {
   });
 
   it('reports auto-merge without required checks as unavailable, not as zero checks', () => {
-    const c = { ...defaults(), delivery: { ...defaults().delivery, merge: 'auto-when-eligible' as const } };
+    // Pull-request delivery (local delivery reports integration readiness instead: test/runtime/local-integration.test.ts).
+    const c = { ...defaults(), delivery: { ...defaults().delivery, mode: 'pull-request' as const, provider: 'github' as const, merge: 'auto-when-eligible' as const } };
     validateConfig(c);
     const u = listUnavailable(c).find((x) => x.path === 'delivery.merge');
     expect(u?.reason).toContain('requiredChecksConfigured is false');

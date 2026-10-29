@@ -180,13 +180,29 @@ const REF_CONFIG = ['core.hooksPath=/dev/null', 'core.useReplaceRefs=false', 'co
  * config), the hardened `-c` options, an explicit work tree and every filter driver of the repository
  * config emptied (read right before, as hardenedGit does).
  */
-async function checkoutGit(path: string, args: string[], home: string): Promise<RunResult> {
+export async function checkoutGit(path: string, args: string[], home: string): Promise<RunResult> {
   const lead = [...hardenedGitArgs().slice(0, -1), ...cfgArgs(CHECKOUT_CONFIG), `--work-tree=${path}`, '--no-pager'];
   const list = await allowlistedGit(path, [...lead, 'config', '--show-scope', '--name-only', '--get-regexp', '^filter\\.'], true, { home });
   if (list.code !== 0 && list.code !== 1) return list;
   let filters: string[];
   try { filters = filterOverrides(list.stdout); } catch (e) { return { code: 128, stdout: '', stderr: String((e as Error)?.message ?? e) }; }
   return allowlistedGit(path, [...lead.slice(0, -1), ...filters, '--no-pager', ...args], true, { home });
+}
+
+/**
+ * The paths of `git status --porcelain=v1 -z`: `XY path` entries, where a rename or copy (X or Y is R or C) is
+ * followed by its source path as a separate entry, which is a whole path (no status prefix).
+ */
+export function porcelainPaths(stdout: string): string[] {
+  const parts = stdout.split('\0');
+  const out: string[] = [];
+  for (let i = 0; i < parts.length; i++) {
+    const e = parts[i]!;
+    if (e.length < 4) continue;
+    out.push(e.slice(3));
+    if (/[RC]/.test(e.slice(0, 2)) && parts[i + 1]) out.push(parts[++i]!);
+  }
+  return out;
 }
 
 async function refSha(repo: string, ref: string): Promise<string | null> {
@@ -219,7 +235,7 @@ export async function land(repo: string, o: { candidate: string; base: string; b
       }
       const st = await checkoutGit(wt.path, ['status', '--porcelain=v1', '-z', '--untracked-files=no', '--ignore-submodules=none'], home);
       if (st.code !== 0) return { state: 'error', message: `git status in ${wt.path} failed: ${tail(st.stderr) || `exit ${st.code}`}`, baseUnchanged: true };
-      const paths = st.stdout.split('\0').filter(Boolean).map((l) => l.slice(3));
+      const paths = porcelainPaths(st.stdout);
       if (paths.length) return { state: 'dirty', checkout: wt.path, paths };
       // Re-read right before the fast-forward (the window is one git call).
       if ((await refSha(repo, ref)) !== o.base) return { state: 'moved', expected: o.base, current: await refSha(repo, ref) };

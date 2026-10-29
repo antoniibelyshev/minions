@@ -10,6 +10,7 @@
 // Any failure allows the stop, like the single coordinator's guard.
 import { filterReady } from '../backlog/ready.js';
 import type { Task } from '../backlog/types.js';
+import { dependencyDoneStatuses } from '../config/delivery.js';
 import { sha256 } from '../core/fsutil.js';
 import { resetBarrier } from './context-reset.js';
 import type { HookDeps, HookOutput } from './hooks.js';
@@ -57,7 +58,7 @@ export async function sessionStopGuard(deps: HookDeps, scope: SessionScope, back
     const leased = new Set(leases.map((l) => l.task_id));
     const byId = new Map(tasks.map((t) => [t.id, t]));
     const cap = capacityOf(config, leases, tasks);
-    const ready = filterReady(tasks, { leased, scope: scopeOf(config), lookup: (id) => byId.get(id) }, 50).some((t) => t.id === taskId);
+    const ready = filterReady(tasks, { leased, scope: scopeOf(config), lookup: (id) => byId.get(id), completed: dependencyDoneStatuses(config) }, 50).some((t) => t.id === taskId);
     const startable = ready && cap.freeTaskSlots > 0 && cap.freeEngineerSlots > 0;
     const continuing = task.status === 'testing' || task.status === 'reviewing' || (task.status === 'changes-requested' && cap.freeEngineerSlots > 0);
     if (!startable && !continuing) return ready ? allow('no-capacity', `${taskId} is ready but no capacity`) : allow('no-ready', `${taskId} has no stage to dispatch now (${task.status})`);

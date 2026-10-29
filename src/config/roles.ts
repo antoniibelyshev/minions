@@ -57,7 +57,7 @@ export const BUILTIN_TOOLS: Record<BuiltinWorkerRole, readonly string[]> = {
 
 /** Capabilities a project role is denied unless its column says otherwise (D8): workers never need them. */
 export const CUSTOM_ROLE_DENY_BY_DEFAULT: readonly Capability[] = CAPABILITIES.filter((c) =>
-  c === 'pr.merge' || c.startsWith('external.') || c === 'ci.edit' || c === 'infrastructure.edit' || c === 'deploy.execute');
+  c === 'pr.merge' || c === 'base.merge' || c.startsWith('external.') || c === 'ci.edit' || c === 'infrastructure.edit' || c === 'deploy.execute');
 
 export type RoleEdits = 'none' | 'any' | { paths: string[] };
 

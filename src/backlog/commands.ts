@@ -1,5 +1,6 @@
 import { readFile } from 'node:fs/promises';
 import type { Command } from 'commander';
+import { dependencyDoneStatuses } from '../config/delivery.js';
 import { validateConfig } from '../config/resolve.js';
 import { stageEntryStatuses, workflowNames } from '../config/workflows.js';
 import type { MinionsConfig } from '../config/schema.js';
@@ -155,7 +156,7 @@ export function register(program: Command): void {
       const fields = selectFields(opts);
       const { cfg, backlog } = await open();
       const ctx = await readyContext();
-      const tasks = ctx.paused ? [] : await backlog.listReady(limit, ctx.leased, scopeOf(cfg));
+      const tasks = ctx.paused ? [] : await backlog.listReady(limit, ctx.leased, scopeOf(cfg), dependencyDoneStatuses(cfg));
       emit({ paused: ctx.paused, tasks: projectTasks(tasks, fields) }, { json: globalOpts(cmd).json, human: (d) => (d.paused ? 'Starts are paused.\n' : '') + lines(tasks) });
     }));
 

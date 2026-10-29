@@ -38,6 +38,8 @@ export const KEY_CLASSES: readonly KeyClass[] = [
   ...entries(['coordinator.contextReset'], 'live', false, 'read by context-reset.ts on each check'),
   ...entries(['verification.commands', 'verification.qaLabels', 'verification.ciPendingTimeoutMinutes'], 'live', false,
     'briefs and the CI gate read them per lease'),
+  ...entries(['verification.setupCommands', 'delivery.integrationTimeoutMinutes'], 'live', false,
+    'the local integrator (`work integrate`) reads them per integration'),
   ...entries(['intake.github'], 'live', false, '`minions sync` and coordinator startup read them per run'),
   ...entries(['intake.scope', 'intake.sources'], 'live', false, 'backlog readiness filter per call'),
   ...entries(['routine'], 'live', false, 'read by each routine pass (`minions sync --routine`) and the wrapper clock'),
@@ -47,7 +49,7 @@ export const KEY_CLASSES: readonly KeyClass[] = [
   ...entries(['coordinator.sessions.max'], 'live', false, 'cap read by the session supervisor before it opens a session'),
   // ---- live, host-owned
   ...entries(['delivery.requiredChecksConfigured'], 'live', true,
-    'the merge gate (autoMergeConfigReasons) reads it on each sync / publish; it gates what merges on GitHub'),
+    'the merge gate (autoMergeConfigReasons) reads it on each sync / publish; it gates what merges on GitHub (local delivery ignores it: the local integrator gates merges into the base)'),
   // ---- restart
   ...entries(['execution.attemptMaxTurns'], 'restart', false, 'written into the agent definitions (plugin)'),
   ...entries(['budgets'], 'restart', false, 'prompt text only (not enforced in v0.1)'),
@@ -62,7 +64,7 @@ export const KEY_CLASSES: readonly KeyClass[] = [
   ...entries(['capabilities', 'sensitivePaths', 'architecture', 'intake.startReady'], 'restart', true,
     'policy and approvals (prompt plus runtime gates)'),
   ...entries(['delivery', 'verification.testerRequired', 'verification.reviewerRequired', 'verification.ciAuthority'], 'restart', true,
-    'what reaches GitHub, and with which checks'),
+    'what reaches GitHub (or, in local delivery, the base branch through the local integrator), and with which checks'),
   ...entries(['coordinator.permissionMode', 'coordinator.disallowedTools', 'coordinator.bundledSkills', 'permissionMode'], 'restart', true,
     'coordinator permissions'),
   ...entries(['coordinator.sessions.enabled'], 'restart', true, 'the wrapper starts the session supervisor, which starts headless coordinator sessions on its own (model spend)'),

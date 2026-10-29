@@ -1,8 +1,9 @@
 import { randomBytes } from 'node:crypto';
 import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import type { BacklogAdapter, ScopeFilter, Task, TaskStatus } from '../backlog/types.js';
 import { can, matchesAny } from '../config/capabilities.js';
-import { isGithubDelivery } from '../config/delivery.js';
+import { dependencyDoneStatuses, isGithubDelivery, localIntegrationEnabled } from '../config/delivery.js';
 import { isSmall, notReadyReason, sortByPriority } from '../backlog/ready.js';
 import { CURRENT_PHASE, HARNESSES, harnessModels, isHarnessId, isProcessHarness, phaseAllows, type HarnessId, type PhaseRules } from '../config/harnesses.js';
 import { launchFor, type Launch } from '../config/launch.js';
@@ -31,6 +32,7 @@ import { ciGateFromDb, formatCiGate, type CiGate } from './ci-gate.js';
 import { autoMergeTask, type MergeResult } from './merge.js';
 import { AUTO_PROMOTE_REFUSED_EVENT, unpromotedReason } from './auto-promote.js';
 import { gateGit } from './git-hardening.js';
+import { enqueueIntegration, integrationRows, openIntegration, startIntegratorDetached, type IntegrationRow } from './integrator.js';
 import { BRANCH_PREFIX, branchFor, ensureBranchWorktree, ensureReviewWorktree, git, headOf, resolveBaseBranch, taskSlug, workspaceLayout, type WorkspaceLayout } from './worktree.js';
 
 export const LEASE_ROLES: readonly BuiltinLeaseRole[] = ['engineer', 'tester', 'reviewer'];
@@ -42,8 +44,11 @@ export const ROLE_STATUSES: Record<BuiltinLeaseRole, TaskStatus[]> = {
   reviewer: ['reviewing'],
 };
 
-/** Statuses that occupy active-task capacity even between worker stages. Blocked/human-waiting tasks do not. */
-export const IN_FLIGHT: TaskStatus[] = ['implementing', 'testing', 'reviewing', 'changes-requested', 'awaiting-ci', 'merging'];
+/**
+ * Statuses that occupy active-task capacity even between worker stages. Blocked/human-waiting tasks do not, nor
+ * does `merging` (the local integrator runs it; no worker does: docs/design/local-auto-integration.md).
+ */
+export const IN_FLIGHT: TaskStatus[] = ['implementing', 'testing', 'reviewing', 'changes-requested', 'awaiting-ci'];
 
 export interface SchedulerDeps {
   db: RuntimeDb;
@@ -73,6 +78,11 @@ export interface SchedulerDeps {
    * (base-update.ts ServerUrlFn; default the URL itself). Only code sets it, never config or the environment.
    */
   serverUrl?: ServerUrlFn;
+  /**
+   * Starts the local integrator (`minions work integrate`) detached after an integration was queued (local
+   * integration on). Default: integrator.ts startIntegratorDetached. Tests inject one.
+   */
+  startIntegrator?: () => void;
 }
 
 /**
@@ -337,9 +347,11 @@ export class Scheduler {
   private readonly now: () => Date;
   private readonly runs: RunControl | null;
   private readonly serverUrl: ServerUrlFn | undefined;
+  private readonly startIntegratorFn: () => void;
 
   constructor(deps: SchedulerDeps) {
     this.serverUrl = deps.serverUrl;
+    this.startIntegratorFn = deps.startIntegrator ?? (() => { startIntegratorDetached({ log: join(runtimePaths().logs, 'integration', 'integrator.log'), cwd: this.layout.repo }); });
     this.runs = deps.runs ?? null;
     this.db = deps.db; this.backlog = deps.backlog; this.config = deps.config;
     this.layout = deps.layout ?? workspaceLayout();
@@ -605,7 +617,7 @@ export class Scheduler {
     const leases = this.db.activeLeases();
     const leased = new Set(leases.map((l) => l.task_id));
     const byId = new Map(tasks.map((t) => [t.id, t]));
-    const readyCtx = { leased, scope: scopeOf(cfg), lookup: (id: string) => byId.get(id) };
+    const readyCtx = { leased, scope: scopeOf(cfg), lookup: (id: string) => byId.get(id), completed: dependencyDoneStatuses(cfg) };
     const candidates: NextStage[] = [];
     const stuck: StuckTask[] = [];
     const waiting: WaitingStage[] = [];
@@ -876,7 +888,8 @@ export class Scheduler {
         try { d = byId.get(dep) ?? await this.backlog.getTask(dep); } catch (e) {
           throw new MinionsError('PRECONDITION', `Task ${task.id}: dependency ${dep} cannot be read (${(e as Error).message}).`);
         }
-        if (d.status !== 'done' && d.status !== 'delivered') throw new MinionsError('PRECONDITION', `Task ${task.id} depends on ${dep}, which is "${d.status}".`);
+        // Local integration on: only `done` (on the base) satisfies a dependency (config/delivery.ts dependencyDoneStatuses).
+        if (!dependencyDoneStatuses(cfg).has(d.status)) throw new MinionsError('PRECONDITION', `Task ${task.id} depends on ${dep}, which is "${d.status}".`);
       }
     }
     // GitHub delivery: the base recorded for the lease is origin's base as the server reported it and the
@@ -993,13 +1006,15 @@ export class Scheduler {
     const def = workerRole(cfg, role);
     if (!def) throw new MinionsError('INVALID_CONFIG', `Lease ${lease.id} has role "${role}", which is not a registered worker role.`);
     const stage = x.plan ? x.plan.stages[x.plan.position] : undefined;
-    const priorFindings = this.db.leases({ taskId: task.id, all: true })
+    const priorFindings: TaskBrief['priorFindings'] = this.db.leases({ taskId: task.id, all: true })
       .filter((l) => l.id !== lease.id && l.result_valid === 1 && l.result_json)
       .slice(-3)
       .map((l) => {
         const r = JSON.parse(l.result_json!) as WorkerResult;
         return { leaseId: l.id, role: l.role, status: r.status, findings: r.findings, nextAction: r.nextAction };
       });
+    const integ = this.integratorFinding(task.id);
+    if (integ) priorFindings.push(integ);
     const resume = this.drainResume(task.id, lease, x.branch);
     return {
       briefMarker: `minions-lease: ${lease.id}`,
@@ -1339,7 +1354,7 @@ export class Scheduler {
     const from = task.status;
     let to: TaskStatus = from;
     let approved = false, replan = false, needsSplit = false, repairCycles: number | undefined;
-    let publish = false;
+    let publish = false, integrate = false;
     let message = '';
     // The stage this lease ran (D6) and its result-contract variant (D4); a QA sweep ignores workflows.
     const plan = sweep ? null : this.leaseStage(task, lease);
@@ -1427,6 +1442,10 @@ export class Scheduler {
         else if (cfg.delivery.mode !== 'local') {
           // Publication (below) decides the final status; the task is never delivered before it succeeds.
           approved = true; publish = true;
+        } else if (localIntegrationEnabled(cfg)) {
+          // Local integration (docs/design/local-auto-integration.md): the runtime merges, verifies and lands the head.
+          to = 'merging'; approved = true; integrate = true;
+          message = `Approved at ${head}; queued for local integration into ${cfg.git.baseBranch} (the runtime merges, verifies and lands it; the task becomes done when it lands).`;
         } else { to = 'delivered'; approved = true; message = `Approved at ${head}; delivered locally (export with minions export).`; }
         break;
       }
@@ -1467,7 +1486,8 @@ export class Scheduler {
       this.db.exec('UPDATE leases SET head_sha = ? WHERE id = ?', head, leaseId);
       if (plan) this.db.setTaskStage(task.id, plan.workflow, nextStages, nextPos);
       if (publish) this.db.upsertPublication({ task_id: task.id, branch: lease.branch!, head_sha: head, mode: cfg.delivery.mode, config_revision: cfg.configRevision });
-      this.endLease(leaseId, 'completed', { from, to, approved, replan, needsSplit, publish, ...(drained ? { drain: true, reason: 'drain' } : {}) }, { json: JSON.stringify(r), valid: 1 });
+      if (integrate) this.queueIntegration(task.id, lease.branch!, head);
+      this.endLease(leaseId, 'completed', { from, to, approved, replan, needsSplit, publish, ...(integrate ? { integrate } : {}), ...(drained ? { drain: true, reason: 'drain' } : {}) }, { json: JSON.stringify(r), valid: 1 });
     });
     await this.cleanupLeaseFiles(leaseId);
     try {
@@ -1475,6 +1495,11 @@ export class Scheduler {
       await this.backlog.addNote(task.id, `minions: ${lease.role} ${r.status}${drained ? ' (drain)' : ''}${r.verdict ? ` (${r.verdict})` : ''} at ${head.slice(0, 12)}: ${r.summary}${to === 'testing' && qa.reasons.length ? ` (QA required: ${qaWhy})` : ''}${ciNote}`);
     } catch (e) {
       this.db.addEvent('record-backlog-error', task.id, { leaseId, error: (e as Error).message });
+    }
+    if (integrate) {
+      this.kickIntegrator(task.id);
+      const publication: PublishResponse = { taskId: task.id, branch: lease.branch!, headSha: head, mode: 'local', state: 'queued', status: 'merging', prUrl: null, merged: false, message };
+      return { ...base, valid: true, from, to, approved, replan, needsSplit, repairCycles, headSha: head, publication, message };
     }
     if (publish) {
       let publication: PublishResponse;
@@ -1514,9 +1539,10 @@ export class Scheduler {
     const pub = this.db.publication(taskId);
     if (!pub) {
       throw new MinionsError('PRECONDITION', `Task ${taskId} has no approved publication.`,
-        'Publication starts when a reviewer approval is recorded with delivery.mode branch or pull-request.');
+        'Publication starts when a reviewer approval is recorded with delivery.mode branch or pull-request (or local with delivery.merge "auto-when-eligible": a local integration).');
     }
     if (cfg.delivery.mode === 'local') {
+      if (pub.mode === 'local' && localIntegrationEnabled(cfg)) return this.requeueIntegration(taskId);
       throw new MinionsError('PRECONDITION', 'delivery.mode is "local": nothing is published.', 'Export branches with `minions export` on the host.');
     }
     const held = this.db.activeLeases().find((l) => l.task_id === taskId);
@@ -1610,6 +1636,153 @@ export class Scheduler {
     }, taskId);
   }
 
+  // ---------------------------------------------------------------- local integration (task-82.3)
+
+  /** Queues the integration of an approved head: publication row (mode local, queued) and integration row. */
+  private queueIntegration(taskId: string, branch: string, head: string): void {
+    this.db.transaction(() => {
+      const pub = this.db.publication(taskId);
+      if (!pub || pub.head_sha !== head || pub.branch !== branch || pub.mode !== 'local') {
+        this.db.upsertPublication({ task_id: taskId, branch, head_sha: head, mode: 'local', config_revision: this.config.configRevision });
+      }
+      this.db.setPublicationState(taskId, 'queued');
+      enqueueIntegration(this.db, { taskId, branch, head }, this.now());
+    });
+  }
+
+  /** Starts the detached integrator; a failure is an event (the routine tick and `work publish` start it again). */
+  private kickIntegrator(taskId: string): void {
+    try { this.startIntegratorFn(); } catch (e) { this.db.addEvent('integrator-start-error', taskId, { error: (e as Error).message }); }
+  }
+
+  /**
+   * `minions work publish <task>` in local mode with local integration on: queues the approved head again (after a
+   * merge approval, a transient failure, or a lost start) and starts the integrator. The head must still be the
+   * branch head and carry gate approval for it.
+   */
+  private async requeueIntegration(taskId: string): Promise<PublishResponse> {
+    const cfg = this.config;
+    const pub = this.db.publication(taskId)!;
+    const held = this.db.activeLeases().find((l) => l.task_id === taskId);
+    if (held) throw new MinionsError('CONFLICT', `Task ${taskId} has an active ${held.role} lease (${held.id}); queue the integration after it ends.`);
+    const task = await this.backlog.getTask(taskId);
+    const resp = (state: PublicationState, status: TaskStatus, message: string): PublishResponse =>
+      ({ taskId, branch: pub.branch, headSha: pub.head_sha, mode: 'local', state, status, prUrl: null, merged: state === 'published', message });
+    if (pub.state === 'published' || task.status === 'done') return resp('published', task.status, `Already integrated: ${pub.branch} at ${pub.head_sha} is in ${cfg.git.baseBranch}.`);
+    if (!['merging', 'awaiting-human', 'blocked'].includes(task.status)) {
+      throw new MinionsError('PRECONDITION', `Task ${taskId} is "${task.status}"; only an approved task waiting for its integration (merging, awaiting-human, blocked) can be queued again.`);
+    }
+    const head = await headOf(this.layout.repo, pub.branch);
+    if (head !== pub.head_sha) {
+      throw new MinionsError('PRECONDITION', `${pub.branch} is at ${head ?? '(missing)'}, not the approved head ${pub.head_sha}; test and review the new head first.`);
+    }
+    if (!this.passedAt(taskId, head, 'gate')) {
+      throw new MinionsError('PRECONDITION', `no reviewer approval for ${head} at config revision ${cfg.configRevision}; run the stage again.`);
+    }
+    const open = openIntegration(this.db, taskId);
+    if (open && open.phase !== 'queued') {
+      this.kickIntegrator(taskId);
+      return resp('queued', 'merging', `The integration of ${pub.branch} at ${head} is already running (${open.phase}).`);
+    }
+    this.queueIntegration(taskId, pub.branch, head);
+    this.db.addEvent('integration-requeued-by-publish', taskId, { head });
+    await this.setStatus(taskId, 'merging');
+    this.kickIntegrator(taskId);
+    return resp('queued', 'merging', `Queued the integration of ${pub.branch} at ${head} into ${cfg.git.baseBranch}; the runtime merges, verifies and lands it.`);
+  }
+
+  /** The integrator finding of a task's latest integration when it failed (conflict, red, refused): repair brief input. */
+  private integratorFinding(taskId: string): TaskBrief['priorFindings'][number] | null {
+    const last = integrationRows(this.db, taskId).at(-1);
+    if (!last || !['conflict', 'red', 'refused'].includes(last.phase)) return null;
+    return {
+      leaseId: `integration-${last.id}`, role: 'integrator', status: 'needs_changes',
+      findings: [
+        `integration ${last.phase}: ${last.detail ?? '(no detail)'}`,
+        `base ${this.config.git.baseBranch} at ${last.base_sha ?? '(unknown)'}; approved head ${last.head_sha}`,
+      ],
+      nextAction: last.phase === 'refused'
+        ? 'Follow the refusal (for example revert the named revert on the branch), re-test, and record the new head.'
+        : `Merge ${this.config.git.baseBranch} into the branch, fix the ${last.phase === 'conflict' ? 'conflicts' : 'failing verification'}, re-test, and record the new head.`,
+    };
+  }
+
+  /**
+   * The integrator's onSettled hook (`work integrate`): moves the task for a terminal integration row.
+   * landed -> done; conflict | red | refused -> changes-requested with a counted repair cycle (the limit sends it to
+   * awaiting-human for a replan) and an integrator finding in the next brief; awaiting-approval -> awaiting-human
+   * (base.merge denied: delivered, the user integrates); transient -> blocked (retry with `work publish`).
+   * A row for a head that is no longer the task's publication head is ignored.
+   */
+  async settleIntegration(row: IntegrationRow): Promise<{ taskId: string; status: TaskStatus | null; message: string }> {
+    const cfg = this.config;
+    const taskId = row.task_id;
+    const pub = this.db.publication(taskId);
+    if (!pub || pub.mode !== 'local' || pub.head_sha !== row.head_sha) {
+      this.db.addEvent('integration-stale', taskId, { id: row.id, head: row.head_sha, publication: pub?.head_sha ?? null });
+      return { taskId, status: null, message: `integration ${row.id} of ${row.head_sha} is not the current approved head; nothing changed` };
+    }
+    const base = cfg.git.baseBranch;
+    const short = row.head_sha.slice(0, 12);
+    const evidence = () => this.db.addEvidence({ task_id: taskId, head_sha: row.head_sha, kind: 'integration', config_revision: cfg.configRevision,
+      outcome: row.phase, details_json: JSON.stringify({ id: row.id, base: row.base_sha, candidate: row.candidate_sha, detail: row.detail?.slice(-1000) ?? null }) });
+    let status: TaskStatus;
+    let message: string;
+    switch (row.phase) {
+      case 'landed': {
+        this.db.transaction(() => { this.db.setPublicationState(taskId, 'published'); evidence(); });
+        await this.backlog.closeTask(taskId, 'done');
+        status = 'done';
+        message = `merged into ${base} at ${row.candidate_sha ?? '(already contained)'}`;
+        break;
+      }
+      case 'conflict': case 'red': case 'refused': {
+        const task = await this.backlog.getTask(taskId);
+        let cycles = 0;
+        this.db.transaction(() => {
+          this.db.setPublicationState(taskId, 'failed', { errorCode: row.phase, error: row.detail?.slice(-1000) ?? null });
+          evidence();
+          cycles = this.db.incrementRepairs(taskId);
+          // The workflow goes back to its repair target (the engineer by default), as after a reviewer's request-changes.
+          const st = this.db.taskStage(taskId);
+          const stages = st ? parseStages(st.stages_json) : null;
+          if (st && stages) this.db.setTaskStage(taskId, st.workflow, stages, repairTarget(cfg, stages, Math.max(0, finalGateIndex(cfg, stages))));
+        });
+        const replan = cycles >= cfg.execution.maxRepairCyclesBeforeReplan;
+        status = replan ? 'awaiting-human' : 'changes-requested';
+        if (task.status !== status) await this.backlog.updateTask(taskId, task.version, { status });
+        message = `integration ${row.phase} for ${short}; task → ${status} (repair cycle ${cycles}${replan ? `, the limit ${cfg.execution.maxRepairCyclesBeforeReplan}: replan before more repairs` : ''}): ${(row.detail ?? '').split('\n')[0]}`;
+        break;
+      }
+      case 'awaiting-approval': {
+        if (can(cfg, 'base.merge') === 'deny') {
+          this.db.transaction(() => { this.db.setPublicationState(taskId, 'failed', { errorCode: 'POLICY_DENIED', error: 'base.merge is denied by policy' }); evidence(); });
+          await this.backlog.closeTask(taskId, 'delivered');
+          status = 'delivered';
+          message = `base.merge is denied by policy: ${pub.branch} at ${short} is delivered; the user integrates it`;
+          break;
+        }
+        this.db.transaction(() => { this.db.setPublicationState(taskId, 'awaiting-approval', { error: row.detail ?? null }); evidence(); });
+        await this.setStatus(taskId, 'awaiting-human');
+        status = 'awaiting-human';
+        message = `the integration of ${pub.branch} waits for human approval (${row.detail ?? 'merge approval needed'}); the user runs \`minions work approve ${taskId} --head ${row.head_sha} --merge\` on the host, then \`minions work publish ${taskId}\``;
+        break;
+      }
+      case 'transient': {
+        this.db.transaction(() => { this.db.setPublicationState(taskId, 'failed', { errorCode: 'TRANSIENT', error: row.detail?.slice(-1000) ?? null }); evidence(); });
+        await this.setStatus(taskId, 'blocked');
+        status = 'blocked';
+        message = `the integration of ${short} failed twice for a transient reason (${(row.detail ?? '').split('\n')[0]}); retry with \`minions work publish ${taskId}\``;
+        break;
+      }
+      default:
+        return { taskId, status: null, message: `integration ${row.id} is ${row.phase}; nothing to settle` };
+    }
+    this.db.addEvent('integration-settled', taskId, { id: row.id, phase: row.phase, status });
+    await this.note(taskId, `minions: ${message}.`);
+    return { taskId, status, message };
+  }
+
   /**
    * Records a host-signed approval (scope "merge") to merge the delivered PR at its approved head, which
    * pr.merge "ask" requires (the default, and any sensitive-path change). Verified now and again by
@@ -1617,8 +1790,11 @@ export class Scheduler {
    */
   approveMerge(taskId: string, opts: { head?: string; by?: string; note?: string; signature?: string; now?: Date } = {}): { taskId: string; headSha: string; approvalId: number; expiresAt: string; message: string } {
     const pub = this.db.publication(taskId);
-    if (!pub || pub.state !== 'published' || !pub.pr_url) {
-      throw new MinionsError('PRECONDITION', `Task ${taskId} has no delivered pull request to approve for merging.`, 'Merge approval applies after pull-request delivery.');
+    // Local integration: the approval lets the integrator land the head (sensitive paths, base.merge "ask").
+    const local = !!pub && pub.mode === 'local';
+    if (local && pub.state === 'published') throw new MinionsError('PRECONDITION', `Task ${taskId} is already integrated at ${pub.head_sha}.`);
+    if (!pub || (!local && (pub.state !== 'published' || !pub.pr_url))) {
+      throw new MinionsError('PRECONDITION', `Task ${taskId} has no delivered pull request (or queued local integration) to approve for merging.`, 'Merge approval applies after pull-request delivery, or to a local integration.');
     }
     if (opts.head && opts.head !== pub.head_sha) {
       throw new MinionsError('CONFLICT', `--head ${opts.head} is not the approved, delivered head (${pub.head_sha}).`, 'Approve the exact head that was reviewed and delivered.');
@@ -1639,6 +1815,10 @@ export class Scheduler {
     const by = check.payload.by ?? opts.by ?? null;
     const a = this.db.addApproval({ task_id: taskId, scope: 'merge', head_sha: pub.head_sha, approved_by: by, note: opts.note ?? null, signature: opts.signature });
     this.db.addEvent('approval', taskId, { scope: 'merge', head: pub.head_sha, by, approvalId: a.id, kid: check.payload.kid, expiresAt: check.payload.expiresAt });
+    if (local) {
+      return { taskId, headSha: pub.head_sha, approvalId: a.id, expiresAt: check.payload.expiresAt,
+        message: `Recorded host-signed approval to integrate ${pub.branch} at ${pub.head_sha} into ${this.config.git.baseBranch} (valid until ${check.payload.expiresAt}). Run \`minions work publish ${taskId}\` to queue the integration again.` };
+    }
     return { taskId, headSha: pub.head_sha, approvalId: a.id, expiresAt: check.payload.expiresAt,
       message: `Recorded host-signed approval to merge ${pub.pr_url} at ${pub.head_sha} (valid until ${check.payload.expiresAt}). Run \`minions sync ${taskId}\`; auto-merge is armed once every other gate passes.` };
   }
