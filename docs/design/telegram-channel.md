@@ -278,6 +278,11 @@ latest message") is replaced by rules 1 and 3 above. See that doc.
    argv check, at most one kill per launch) with tests: no kill when argv does not match an official `server.ts`
    (PID reuse), a second 409 run after one kill does not kill again, a single 409 only retries, backoff is bounded; fake Bot API and fake MCP tests; typecheck and tests
    pass. Depends: 0.
+   *Built (task-67.2):* `src/telegram/bot-api.ts`, `src/telegram/channel/core.ts`, `src/telegram/channel/server.ts`,
+   `minions telegram channel serve` (not in any launch path yet). Interim choices: the message map is a bounded JSON
+   file (`<state dir>/channel-messages.json`, 500 entries, 0600) until phase 2 moves it to `tg_messages`; the offset
+   is `<state dir>/channel-offset.json`; the launch record gets an optional `launchId` that phase 3 writes (until then
+   the server never activates); `access.json` unreadable or corrupt means "drop everything" and is never rewritten.
 2. **Interactive tools.** Criteria: `ask`, `close_decision`, `edit_message`, `react`, `typing`, files,
    `download_attachment`, permission relay; `tg_messages` and `tg_decisions` migrations; the test cases above.
    Depends: 1.

@@ -578,6 +578,8 @@ export interface LaunchRecord {
   fingerprint: string;
   channel: MinionsConfig['communication']['channel'];
   telegram: TelegramDecision;
+  /** The launch id the wrapper also passes to the minions channel server (MINIONS_COORDINATOR_LAUNCH); not a secret. Written once the launch swap (task-67.4) lands. */
+  launchId?: string;
 }
 
 export async function readLaunchRecord(paths: RuntimePaths = runtimePaths()): Promise<LaunchRecord | null> {
