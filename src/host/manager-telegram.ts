@@ -3,7 +3,8 @@
 // is paired (a stored manager-bot-token and <MINIONS_HOME>/manager/access.json).
 //
 // - fetch only (getUpdates long poll, sendMessage with an inline keyboard, answerCallbackQuery, editMessageText). The
-//   token travels only in the request URL path; errors are redacted and never include it.
+//   token travels only in the request URL path; errors are redacted and never include it. The Bot API client itself
+//   (call, callRetry, error mapping, redaction, the offset file) is shared with the channel server: src/telegram/bot-api.ts.
 // - Owner only: an update that isOwnerUpdate rejects (another user, a group, a bot) is dropped without any reply, not
 //   even answerCallbackQuery. A forwarded message (forward_origin, forward_from, forward_from_chat or forward_date) is
 //   ignored the same way, even from the owner: only what the owner types counts. This transport never pairs or re-pairs.
@@ -43,14 +44,12 @@
 //   fallback), "typing" is shown while it runs, and the slot is freed after ASSISTANT_SLOT_MS whatever the call does.
 //   An offer the assistant proposed says so in its first line. /assistant [on|off|status] is deterministic; /project
 //   clears the assistant's history; /status ends with the assistant line.
-import { chmod } from 'node:fs/promises';
 import { join } from 'node:path';
-import { z } from 'zod';
-import { displayText, truncateCodePoints } from '../core/control-chars.js';
+import { displayText } from '../core/control-chars.js';
 import { MinionsError } from '../core/errors.js';
-import { ensureDir, readJsonIfExists, writeJson } from '../core/fsutil.js';
 import { redact } from '../core/output.js';
 import { managerDir } from '../core/paths.js';
+import { BotApi, defaultSleep, isForwarded, MESSAGE_MAX_CHARS, nextOffset, OffsetFile, oneLine, retryAfterMs, type InlineKeyboard } from '../telegram/bot-api.js';
 import { findOfferByNonce, isOfferRequestId, isOwnerRequestId, TYPED_KEY_PATTERN } from './change-journal.js';
 import { APPROVE_HEAD_PATTERN, APPROVE_TASK_ID_PATTERN } from './change-requests.js';
 import type { Fetch } from './credentials.js';
@@ -64,8 +63,7 @@ import { closestSettingKeys, formatValue, SETTING_GROUPS, type SettingView } fro
 export const CALLBACK_DATA_MAX_BYTES = 64;
 /** The second tap for a plan with `loosens` must come within this time of the first. */
 export const DOUBLE_TAP_MS = 2 * 60_000;
-/** Telegram allows 4096 characters per message; longer text is cut with a note. */
-export const MESSAGE_MAX_CHARS = 4000;
+export { isForwarded, MESSAGE_MAX_CHARS };
 export const telegramOffsetPath = () => join(managerDir(), 'telegram-offset.json');
 /**
  * The longest an assistant message holds the one assistant slot (the call itself is bounded by its 60 s timeout; this
@@ -94,17 +92,6 @@ export function parseCallbackData(data: unknown): { action: CallbackAction; requ
   return { action: m[1] as CallbackAction, requestId: m[2]!, nonce: m[3]! };
 }
 
-/** True for a forwarded message, in the current (forward_origin) or the older (forward_from, forward_date, ...) shape. */
-export function isForwarded(m: NonNullable<TelegramUpdate['message']>): boolean {
-  return m.forward_origin != null || m.forward_from != null || m.forward_from_chat != null || m.forward_date != null;
-}
-
-/** One line, plain, bounded: for the risk line of the double tap. */
-const oneLine = (s: string, max = 300) => {
-  const t = displayText(s).replace(/\s+/g, ' ').trim();
-  return t.length > max ? `${truncateCodePoints(t, max - 1)}…` : t;
-};
-const clip = (s: string) => (s.length > MESSAGE_MAX_CHARS ? `${truncateCodePoints(s, MESSAGE_MAX_CHARS - 40)}\n… (cut: the message was too long)` : s);
 
 const REBUILD_HELP_MARK = '\u0000rebuild';
 /** Shown only where the dev-only request exists (host CLI from a minions source checkout, project minions). */
@@ -227,9 +214,12 @@ export function formatSettingsList(project: { projectId: string; name: string },
   return [...lines, ...(rest ? ['', tail(rest)] : foot)].join('\n');
 }
 
-const OffsetSchema = z.object({ version: z.literal(1), botId: z.string(), offset: z.number().int().nonnegative() }).strict();
-
-interface BotApiBody { ok?: boolean; result?: unknown; description?: string; parameters?: { retry_after?: number } }
+/** The manager's wording of the two Bot API errors a human acts on. */
+const MANAGER_BOT_ERRORS = {
+  auth: { message: 'The manager bot token was rejected by Telegram (revoked or mistyped).', hint: 'Store the token again with `minions setup`, then restart the host manager.' },
+  conflict: { message: 'Another process polls the manager bot (Telegram getUpdates 409 Conflict), or a webhook is set.',
+    hint: 'Stop the other poller (another host manager, or a coordinator wrongly given this token), or remove the webhook.' },
+};
 interface KnownOffer { requestId: string; summary: string; loosens: string | null; messageId: number | null }
 
 export interface TelegramTransportOptions {
@@ -250,12 +240,6 @@ export interface TelegramTransportOptions {
   assistantSlotMs?: number;
 }
 
-const defaultSleep = (ms: number, signal?: AbortSignal) => new Promise<void>((resolve) => {
-  if (signal?.aborted) return resolve();
-  const t = setTimeout(done, ms);
-  function done() { clearTimeout(t); signal?.removeEventListener('abort', done); resolve(); }
-  signal?.addEventListener('abort', done, { once: true });
-});
 
 async function journalOffer(nonce: string): Promise<{ requestId: string; summary: string; loosens: string | null } | null> {
   const found = await findOfferByNonce(nonce);
@@ -265,7 +249,8 @@ async function journalOffer(nonce: string): Promise<{ requestId: string; summary
 }
 
 export class TelegramTransport implements ManagerTransport {
-  private readonly f: Fetch;
+  private readonly api: BotApi;
+  private readonly offsetFile: OffsetFile;
   private readonly now: () => number;
   private readonly sleep: (ms: number, signal?: AbortSignal) => Promise<void>;
   private readonly log: (line: string) => void;
@@ -284,9 +269,10 @@ export class TelegramTransport implements ManagerTransport {
   private inflight: Promise<void> | null = null;
 
   constructor(private readonly opts: TelegramTransportOptions) {
-    this.f = opts.fetch ?? fetch;
     this.now = opts.now ?? Date.now;
     this.sleep = opts.sleep ?? defaultSleep;
+    this.api = new BotApi({ token: opts.token, fetch: opts.fetch, errors: MANAGER_BOT_ERRORS, sleep: this.sleep });
+    this.offsetFile = new OffsetFile(telegramOffsetPath(), opts.access.botId);
     this.log = opts.log ?? (() => undefined);
   }
 
@@ -294,51 +280,8 @@ export class TelegramTransport implements ManagerTransport {
 
   // ------------------------------------------------------------ Bot API
 
-  /** One Bot API call. Errors are MinionsErrors without the token; `details.retryAfterMs` on 429. */
-  private async call(method: string, body: Record<string, unknown>, timeoutMs = 15_000, signal?: AbortSignal): Promise<unknown> {
-    const timeout = AbortSignal.timeout(timeoutMs);
-    let res: Response;
-    try {
-      res = await this.f(`https://api.telegram.org/bot${this.opts.token}/${method}`, {
-        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
-        signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
-      });
-    } catch (e) {
-      throw new MinionsError('NETWORK_RETRYABLE', `could not reach the Telegram Bot API (${method}): ${truncateCodePoints(redact(String((e as Error)?.message ?? e)), 200)}`);
-    }
-    if (res.status === 401 || res.status === 404) {
-      throw new MinionsError('AUTH_REQUIRED', 'The manager bot token was rejected by Telegram (revoked or mistyped).',
-        'Store the token again with `minions setup`, then restart the host manager.');
-    }
-    if (res.status === 409) {
-      throw new MinionsError('CONFLICT', 'Another process polls the manager bot (Telegram getUpdates 409 Conflict), or a webhook is set.',
-        'Stop the other poller (another host manager, or a coordinator wrongly given this token), or remove the webhook.');
-    }
-    const parsed = await res.json().catch((): BotApiBody => ({})) as BotApiBody;
-    if (!res.ok || parsed.ok !== true) {
-      const retry = typeof parsed.parameters?.retry_after === 'number' ? parsed.parameters.retry_after * 1000 : undefined;
-      const why = typeof parsed.description === 'string' ? `: ${oneLine(redact(parsed.description), 200)}` : '';
-      throw new MinionsError('NETWORK_RETRYABLE', `Telegram Bot API ${method} returned ${res.status}${why}`, undefined, retry !== undefined ? { retryAfterMs: retry } : undefined);
-    }
-    return parsed.result;
-  }
-
-  /** A call that waits out one 429 (at most 30 s) and tries once more. */
-  private async callRetry(method: string, body: Record<string, unknown>): Promise<unknown> {
-    try { return await this.call(method, body); } catch (e) {
-      const retry = (e as MinionsError).details && ((e as MinionsError).details as { retryAfterMs?: number }).retryAfterMs;
-      if (typeof retry !== 'number' || retry > 30_000) throw e;
-      await this.sleep(Math.max(retry, 1000));
-      return this.call(method, body);
-    }
-  }
-
-  private async send(text: string, keyboard?: { text: string; callback_data: string }[][]): Promise<number | null> {
-    const r = await this.callRetry('sendMessage', {
-      chat_id: this.opts.access.chatId, text: clip(text), disable_web_page_preview: true,
-      ...(keyboard ? { reply_markup: { inline_keyboard: keyboard } } : {}),
-    }) as { message_id?: unknown } | null;
-    return typeof r?.message_id === 'number' ? r.message_id : null;
+  private send(text: string, keyboard?: InlineKeyboard): Promise<number | null> {
+    return this.api.sendMessage(this.opts.access.chatId, text, { keyboard });
   }
 
   /**
@@ -353,7 +296,7 @@ export class TelegramTransport implements ManagerTransport {
   /** Edits a message's text and drops its buttons. False when Telegram refused (the caller then sends a new message). */
   private async edit(messageId: number, text: string): Promise<boolean> {
     try {
-      await this.callRetry('editMessageText', { chat_id: this.opts.access.chatId, message_id: messageId, text: clip(text) });
+      await this.api.editMessageText(this.opts.access.chatId, messageId, text);
       return true;
     } catch (e) {
       this.log(`telegram: editing message ${messageId} failed: ${(e as Error).message}`);
@@ -363,7 +306,7 @@ export class TelegramTransport implements ManagerTransport {
 
   private async answer(callbackId: string | undefined, text: string): Promise<void> {
     if (!callbackId) return;
-    await this.call('answerCallbackQuery', { callback_query_id: callbackId, text: truncateCodePoints(text, 190) })
+    await this.api.answerCallbackQuery(callbackId, text)
       .catch((e) => this.log(`telegram: answerCallbackQuery failed: ${(e as Error).message}`));
   }
 
@@ -373,8 +316,7 @@ export class TelegramTransport implements ManagerTransport {
     if (this.offsetLoaded) return;
     this.offsetLoaded = true;
     try {
-      const v = await readJsonIfExists(telegramOffsetPath(), OffsetSchema);
-      if (v && v.botId === this.opts.access.botId) this.offset = v.offset;
+      this.offset = await this.offsetFile.load();
     } catch (e) {
       this.log(`telegram: ignoring an unreadable getUpdates offset file: ${(e as Error).message}`);
     }
@@ -382,9 +324,7 @@ export class TelegramTransport implements ManagerTransport {
 
   private async saveOffset(): Promise<void> {
     if (this.offset === undefined) return;
-    await ensureDir(managerDir(), 0o700);
-    await chmod(managerDir(), 0o700);
-    await writeJson(telegramOffsetPath(), { version: 1, botId: this.opts.access.botId, offset: this.offset }, { mode: 0o600 });
+    await this.offsetFile.save(this.offset);
   }
 
   // ------------------------------------------------------------ ManagerTransport
@@ -425,22 +365,18 @@ export class TelegramTransport implements ManagerTransport {
   async receive(waitMs: number, signal?: AbortSignal): Promise<ManagerEvent[]> {
     await this.loadOffset();
     const secs = Math.max(0, Math.min(this.opts.pollSeconds ?? 25, Math.floor(waitMs / 1000)));
-    let updates: unknown;
+    let batch: TelegramUpdate[];
     try {
-      updates = await this.call('getUpdates', {
-        ...(this.offset !== undefined ? { offset: this.offset } : {}), timeout: secs, allowed_updates: ['message', 'callback_query'],
-      }, (secs + 15) * 1000, signal);
+      batch = await this.api.getUpdates({ offset: this.offset, timeoutSecs: secs, allowed: ['message', 'callback_query'], signal });
     } catch (e) {
       if (signal?.aborted) return [];
-      const retry = ((e as MinionsError).details as { retryAfterMs?: number } | undefined)?.retryAfterMs;
+      const retry = retryAfterMs(e);
       if (typeof retry === 'number') { await this.sleep(Math.min(Math.max(retry, 1000), Math.max(waitMs, 0)), signal); return []; }
       throw e;
     }
-    if (!Array.isArray(updates)) return [];
-    const batch = (updates as TelegramUpdate[]).filter((u) => typeof u?.update_id === 'number' && Number.isSafeInteger(u.update_id));
     if (!batch.length) return [];
     // Acknowledge first (at most once): a crash while handling never replays these taps after a restart.
-    this.offset = Math.max(this.offset ?? 0, ...batch.map((u) => u.update_id + 1));
+    this.offset = nextOffset(this.offset, batch);
     await this.saveOffset().catch((e) => this.log(`telegram: saving the getUpdates offset failed: ${(e as Error).message}`));
     const events: ManagerEvent[] = [];
     for (const u of batch) {
@@ -553,7 +489,7 @@ export class TelegramTransport implements ManagerTransport {
   assistantIdle(): Promise<void> { return this.inflight ?? Promise.resolve(); }
 
   private async typing(): Promise<void> {
-    await this.call('sendChatAction', { chat_id: this.opts.access.chatId, action: 'typing' }).catch(() => undefined);
+    await this.api.sendChatAction(this.opts.access.chatId, 'typing').catch(() => undefined);
   }
 
   /**

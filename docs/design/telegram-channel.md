@@ -128,8 +128,18 @@ context-reset restarts.
     (the task-51 class). The argv check guards against PID reuse: a pid whose command line is something else is
     never signalled.
   - **At most one kill per launch.** The count is kept in the server's memory and in the lock file, so a restarted
-    server of the same launch does not kill again. After the kill it waits for the next poll to succeed (same
-    backoff). If 409 continues, or the kill is not allowed, it stops polling and reports "another process polls this
+    server of the same launch does not kill again. A clean exit does not delete the lock file: it rewrites it as a
+    released record (`released: true`, launchId and kill count kept), so a restart after `/mcp reconnect` still has no
+    kill left; a new launchId starts at zero. Because every clean restart takes over a released record, the
+    takeover has exactly one winner across processes (decision, task-67.2 retest): the lock is published with
+    `link()` of a complete temp file (so nobody reads it half-written; `wx` create only where hard links are
+    missing), and taking over a stale or released record first creates the same way a guard file
+    `channel.lock.take-<hash of that record>-<k>`, then re-reads the lock and replaces it only when it is still that
+    record. Losers see the guard's taker (or the new holder) as live. A guard whose taker died mid-takeover is skipped
+    with the next `k`, never deleted by others. Each lock carries a random nonce, so a record never repeats and a late
+    `close()` of a replaced holder leaves the new lock alone; `close()` also stops polling. A separate launch-scoped
+    count file was rejected: a crashed holder's stale lock needs the same atomic takeover anyway. After the kill it
+    waits for the next poll to succeed (same backoff). If 409 continues, or the kill is not allowed, it stops polling and reports "another process polls this
     bot" in its tool results, the log and `minions status`. It never loops on kills.
   - The host-side `bot-guard.ts` (one bot per project, the manager bot distinct) is unchanged.
 - `isolation.ts`, `minions status` and doctor `telegram.poller` learn the new lock (`server: minions | official`).
@@ -278,6 +288,11 @@ latest message") is replaced by rules 1 and 3 above. See that doc.
    argv check, at most one kill per launch) with tests: no kill when argv does not match an official `server.ts`
    (PID reuse), a second 409 run after one kill does not kill again, a single 409 only retries, backoff is bounded; fake Bot API and fake MCP tests; typecheck and tests
    pass. Depends: 0.
+   *Built (task-67.2):* `src/telegram/bot-api.ts`, `src/telegram/channel/core.ts`, `src/telegram/channel/server.ts`,
+   `minions telegram channel serve` (not in any launch path yet). Interim choices: the message map is a bounded JSON
+   file (`<state dir>/channel-messages.json`, 500 entries, 0600) until phase 2 moves it to `tg_messages`; the offset
+   is `<state dir>/channel-offset.json`; the launch record gets an optional `launchId` that phase 3 writes (until then
+   the server never activates); `access.json` unreadable or corrupt means "drop everything" and is never rewritten.
 2. **Interactive tools.** Criteria: `ask`, `close_decision`, `edit_message`, `react`, `typing`, files,
    `download_attachment`, permission relay; `tg_messages` and `tg_decisions` migrations; the test cases above.
    Depends: 1.

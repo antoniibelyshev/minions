@@ -130,28 +130,35 @@ export async function checkTelegramPoller(input: {
   if (!proc.alive(pid)) return { state: 'dead', pid, detail: `Telegram poller pid ${pid} (bot.pid) has exited, so the coordinator's channel is not receiving messages`, hint: POLLER_RECOVERY_HINT };
   const cmd = proc.cmdline(pid);
   if (cmd !== null && !SERVER_CMDLINE.test(cmd)) return { state: 'dead', pid, detail: `bot.pid names pid ${pid}, which is not a Telegram plugin server (stale pid file); no poller is running`, hint: POLLER_RECOVERY_HINT };
-  // Ownership: the nearest claude ancestor of the poller must be the coordinator claude, the wrapper's
-  // direct child. Every claude session started from inside the coordinator (a worker's Bash running
-  // `claude -p`) also descends from the wrapper, so plain ancestry is not enough. An ancestor whose
-  // cmdline is unreadable cannot be told apart from a claude, so the walk fails toward foreign.
+  const owner = claudeOwner(pid, input.coordinatorPid, proc);
+  if (owner === 'unknown') return { state: 'unknown', pid, detail: `cannot tell which session owns Telegram poller pid ${pid} (no process table)` };
+  if (owner === 'coordinator') return { state: 'ok', pid, detail: `Telegram poller pid ${pid} belongs to the coordinator` };
+  return { state: 'foreign', pid, detail: `Telegram poller pid ${pid} (bot.pid) is not the coordinator's: another claude session took the bot, and the coordinator no longer receives messages`, hint: POLLER_RECOVERY_HINT };
+}
+
+/** Whether a /proc cmdline is the official plugin's server (`bun server.ts`). */
+export const isOfficialServerCmdline = (cmd: string) => SERVER_CMDLINE.test(cmd);
+
+/**
+ * Who owns a process: `coordinator` when its nearest claude ancestor is the coordinator claude (the direct child of
+ * the wrapper `coordinatorPid`), `other` otherwise, `unknown` without a process table. Every claude session started
+ * from inside the coordinator (a worker's Bash running `claude -p`) also descends from the wrapper, so plain ancestry
+ * is not enough. An ancestor whose cmdline is unreadable cannot be told apart from a claude, so the walk fails toward
+ * `other`.
+ */
+export function claudeOwner(pid: number, coordinatorPid: number, proc: Pick<PollerProc, 'cmdline' | 'parentOf'>): 'coordinator' | 'other' | 'unknown' {
   const seen = new Set<number>([pid]);
   let cur = pid;
   for (let i = 0; i < MAX_DEPTH; i++) {
     const parent = proc.parentOf(cur);
-    if (parent === null) {
-      if (i === 0) return { state: 'unknown', pid, detail: `cannot tell which session owns Telegram poller pid ${pid} (no process table)` };
-      break;
-    }
+    if (parent === null) return i === 0 ? 'unknown' : 'other';
     // Reached init, the wrapper itself, or a cycle without passing a claude: not the coordinator's.
-    if (parent <= 1 || parent === input.coordinatorPid || seen.has(parent)) break;
+    if (parent <= 1 || parent === coordinatorPid || seen.has(parent)) return 'other';
     seen.add(parent);
     const pcmd = proc.cmdline(parent);
-    if (pcmd === null) break;
-    if (isClaudeCmdline(pcmd)) {
-      if (proc.parentOf(parent) === input.coordinatorPid) return { state: 'ok', pid, detail: `Telegram poller pid ${pid} belongs to the coordinator` };
-      break;
-    }
+    if (pcmd === null) return 'other';
+    if (isClaudeCmdline(pcmd)) return proc.parentOf(parent) === coordinatorPid ? 'coordinator' : 'other';
     cur = parent;
   }
-  return { state: 'foreign', pid, detail: `Telegram poller pid ${pid} (bot.pid) is not the coordinator's: another claude session took the bot, and the coordinator no longer receives messages`, hint: POLLER_RECOVERY_HINT };
+  return 'other';
 }

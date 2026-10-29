@@ -24,11 +24,12 @@ import { readTelegramAccess } from '../telegram/access.js';
 import { installTelegramPlugin } from '../telegram/install.js';
 import { formatTelegramProbe, probeTelegram } from '../telegram/probe.js';
 import { resolveChannel } from '../telegram/channel.js';
+import { runChannelServer } from '../telegram/channel/server.js';
 import type { PollerCheck } from '../telegram/isolation.js';
 import {
   buildClaudeCommand, buildCoordinatorCommand, telegramPollerStatus, claudePermissionModes, coordinatorWrapper, launchCoordinator, permissionModesNeeded, probeRuntime, readLaunchRecord, readMountedToken, RECOVERY_PROMPT,
   restartCoordinator, runtimeChannelFacts, scheduleDetachedRestart, syncCoordinator, coordinatorLaunchStatus, type LaunchStatus,
-  coordinatorPidAlive, procStartTime, readExitRecord, runtimeAuthMethod, scheduleCrashStart, TELEGRAM_TOKEN_ENV, WAKE_PROMPT,
+  coordinatorPidAlive, procStartTime, readExitRecord, runtimeAuthMethod, systemProcessControl, scheduleCrashStart, TELEGRAM_TOKEN_ENV, WAKE_PROMPT,
 } from './coordinator.js';
 import { pidAlive } from './db.js';
 import { run as runChild } from '../core/exec.js';
@@ -1079,6 +1080,17 @@ export function register(program: Command): void {
       }
       const r = await installTelegramPlugin();
       emit(r, { json: globalOpts(cmd).json, human: (d: typeof r) => [`marketplace ${d.marketplace}; plugin ${d.plugin} (version ${d.version ?? 'unknown'})`, ...d.warnings.map((w) => `warning: ${w}`)].join('\n') });
+    }));
+  // The minions-owned channel server (task-67.2, docs/design/telegram-channel.md). Not wired into any launch yet.
+  const tgChannel = tg.command('channel').description('The minions-owned Telegram channel server (MCP over stdio; started by the coordinator launch only)');
+  tgChannel.command('serve').description('Serve the Telegram channel on stdin/stdout (JSON-RPC); reads the bot token only from $MINIONS_TELEGRAM_TOKEN_FILE')
+    .action(action(async () => {
+      requireMode('runtime');
+      const paths = runtimePaths();
+      await runChannelServer({
+        env: process.env, stateDir: paths.telegramStateDir, logFile: join(paths.logs, 'telegram-channel.log'), proc: systemProcessControl,
+        readLaunch: () => readLaunchRecord(paths), input: process.stdin, output: process.stdout,
+      });
     }));
   tg.command('status').description('Pairing/allowlist policy and whether the running coordinator has Telegram (no codes, ids or tokens)')
     .action(action(async (_o: unknown, cmd: Command) => {
