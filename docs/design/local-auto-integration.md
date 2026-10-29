@@ -189,7 +189,8 @@ re-test". Re-review then runs as for any new head.
 
 ### Self-update (task-99)
 
-- **Trigger:** a landing writes an `integrated` event and notice with the changed paths. For the minions project
+- **Trigger:** a landing writes an `integrated` event and one `integrated:<task>:<merge sha>` notice (kind `other`)
+  with the changed paths (the first 20, then a count); a flaky landing also gets its flaky follow-up notice. For the minions project
   only, the coordinator instruction from task-99 phase 4 changes from "after you merge" to "after an `integrated`
   notice that touches runtime, CLI or plugin code, request `upgrade --from-container`, unless one is already open"
   (Decision 4).

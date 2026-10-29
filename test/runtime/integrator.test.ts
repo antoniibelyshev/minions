@@ -11,6 +11,7 @@ import {
   adoptIntegrationBase, enqueueIntegration, INTEGRATION_BASE_META, INTEGRATION_LOCK_META, integrationHalt, integrationLock,
   integrationRows, integratorAlive, runIntegrator, type IntegratorDeps,
 } from '../../src/runtime/integrator.js';
+import { pending } from '../../src/runtime/outbox.js';
 import { isAlive, procIdentity } from '../../src/runtime/runner/record.js';
 import { defaults } from '../helpers.js';
 import { gitSync, initRepo, tmp } from './fixtures.js';
@@ -85,6 +86,23 @@ describe('runIntegrator: landing and the verify runner', () => {
     expect(env).toContain(`TMPDIR=${join(s.deps.runDir, 'tmp')}`);
     expect(env).not.toMatch(/TELEGRAM|ANTHROPIC|secret/);
     expect(integrationLock(s.db)).toBeNull();
+  });
+
+  it('every landing queues one integrated notice with the task, merge SHA and changed paths (capped with a count)', async () => {
+    const s = setup();
+    s.queue('task-1');
+    const many: Record<string, string> = {};
+    for (let i = 0; i < 25; i++) many[`src/f${String(i).padStart(2, '0')}.ts`] = `${i}\n`;
+    s.queue('task-2', many);
+    await runIntegrator(s.deps);
+    const C1 = rowOf(s.db, 'task-1').candidate_sha!;
+    const C2 = rowOf(s.db, 'task-2').candidate_sha!;
+    const notes = pending(s.db, { includeWaiting: true }).filter((n) => n.key.startsWith('integrated:'));
+    expect(notes.map((n) => [n.key, n.kind, n.taskId])).toEqual([[`integrated:task-1:${C1}`, 'other', 'task-1'], [`integrated:task-2:${C2}`, 'other', 'task-2']]);
+    expect(notes[0]!.text).toBe(`task-1 merged into main at ${C1}; 1 changed path: task-1.txt. ref: #task-1`);
+    expect(notes[1]!.text).toContain(`task-2 merged into main at ${C2}; 25 changed paths: src/f00.ts, `);
+    expect(notes[1]!.text).toContain('src/f19.ts, … +5 more. ref: #task-2');
+    expect(notes[1]!.text).not.toContain('src/f20.ts');
   });
 
   it('a failing command is red: main stays at B and the log tail is the detail', async () => {
@@ -320,6 +338,9 @@ describe('runIntegrator: crash recovery', () => {
     expect(rowOf(s.db, 'task-1')).toMatchObject({ phase: 'landed', candidate_sha: c.candidate });
     expect(s.db.getMeta(INTEGRATION_BASE_META)).toBe(c.candidate);
     expect(mainOf(s.repo)).toBe(c.candidate);
+    // The crash may have come before the landing notice: recovery queues it (keyed by C).
+    expect(pending(s.db, { includeWaiting: true }).filter((n) => n.key.startsWith('integrated:')).map((n) => [n.key, n.text]))
+      .toEqual([[`integrated:task-1:${c.candidate}`, `task-1 merged into main at ${c.candidate}; 1 changed path: task-1.txt. ref: #task-1`]]);
     expect(r.exit).toBe('empty');
   });
 

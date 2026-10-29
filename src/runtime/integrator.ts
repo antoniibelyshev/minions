@@ -181,6 +181,24 @@ export interface VerifyTiming {
   killGraceMs?: number;
 }
 
+/** Changed paths named in an `integrated` notice; the rest is a count (the coordinator's self-update check reads them). */
+export const INTEGRATED_NOTICE_MAX_PATHS = 20;
+
+/**
+ * The text of the `integrated` notice every landing queues (docs/design/local-auto-integration.md, Self-update):
+ * the task, the merge SHA and the changed paths, capped at INTEGRATED_NOTICE_MAX_PATHS with a count of the rest.
+ * `changed` is null when the paths could not be read (a recovered landing).
+ */
+export function integratedNoticeText(n: { taskId: string; baseBranch: string; candidate: string; changed: string[] | null; flaky?: boolean }): string {
+  const shown = n.changed?.slice(0, INTEGRATED_NOTICE_MAX_PATHS) ?? [];
+  const more = n.changed ? n.changed.length - shown.length : 0;
+  const paths = n.changed === null
+    ? `the changed paths could not be read (git diff --name-only ${n.candidate}^1 ${n.candidate})`
+    : `${n.changed.length} changed path${n.changed.length === 1 ? '' : 's'}${shown.length ? `: ${shown.join(', ')}${more ? `, … +${more} more` : ''}` : ''}`;
+  const flaky = n.flaky ? ' A verification command passed only on its rerun (see the integration-flaky notice).' : '';
+  return `${n.taskId} merged into ${n.baseBranch} at ${n.candidate}; ${paths}.${flaky} ref: #${n.taskId}`;
+}
+
 /** A verification command that failed once and passed on its one rerun (Decision 2: a flaky notice, no repair cycle). */
 export interface FlakyCommand { command: string; detail: string }
 
@@ -495,6 +513,13 @@ export async function runIntegrator(d: IntegratorDeps): Promise<IntegratorReport
     try { enqueue(d.db, { ...n, text: n.text.slice(0, 3_900) }, now); } catch (e) { log(`minions integrator: could not queue the notice ${n.key}: ${(e as Error).message}`); }
   };
 
+  /**
+   * The one `integrated` notice of a landing (the scheduler's settle hook adds only the flaky follow-up). Keyed by
+   * the merge SHA, so a recovery of the same landing never queues a second one.
+   */
+  const integratedNotice = (taskId: string, branch: string, candidate: string, changed: string[] | null, flaky: boolean) =>
+    notice({ key: `integrated:${taskId}:${candidate}`, kind: 'other', taskId, text: integratedNoticeText({ taskId, baseBranch: branch, candidate, changed, flaky }) });
+
   try {
     const cfg0 = await d.config();
     // ---- recovery: every running row belongs to a dead holder (we hold the lock now)
@@ -504,6 +529,9 @@ export async function runIntegrator(d: IntegratorDeps): Promise<IntegratorReport
       if (row.candidate_sha && main && await isAncestor(d.repo, row.candidate_sha, main)) {
         d.db.setMeta(INTEGRATION_BASE_META, row.candidate_sha);
         await settle(row, 'landed', `recovered: ${cfg0.git.baseBranch} already contains ${row.candidate_sha}`);
+        // The crash may have come before the landing's notice: queue it now (a no-op when it was queued).
+        const changed = row.base_sha ? await integrationChangedPaths(d.repo, row.base_sha, row.candidate_sha, [], d.signal ? { signal: d.signal } : {}) : null;
+        integratedNotice(row.task_id, cfg0.git.baseBranch, row.candidate_sha, changed?.ok ? changed.changed : null, false);
         report.recovered.push({ id: row.id, taskId: row.task_id, outcome: 'landed', killed });
       } else {
         requeue(row, 'recovered', `the integrator holding the lock stopped during ${row.phase}`, true);
@@ -639,6 +667,7 @@ export async function runIntegrator(d: IntegratorDeps): Promise<IntegratorReport
       const flakyNote = flaky.length ? `; flaky: ${flaky.map((f) => `\`${f.command}\``).join(', ')} failed once and passed on the rerun` : '';
       await settle(row, 'landed', `merged into ${branch} at ${C} (${l.method})${flakyNote}`, flaky.length ? { outcome: FLAKY_OUTCOME } : {});
       d.db.addEvent('integrated', row.task_id, { id: row.id, candidate: C, base: B, head: row.head_sha, paths: paths.changed.slice(0, 200), changedCount: paths.changed.length });
+      integratedNotice(row.task_id, branch, C, paths.changed, flaky.length > 0);
       return null;
     }
     if (l.state === 'moved') { requeue(row, 'base-moved', `${branch} moved from ${B} to ${l.current ?? '(none)'} before the landing`, true); return null; }
