@@ -1,7 +1,7 @@
 # Coordinator self-update from main (dev installs): design
 
-Status: **proposed** (task-99 design against main @ c64b721, 2026-10-29). Nothing is built. The build phases are in
-[Phases](#phases), and [Open questions](#open-questions-for-the-owner) has three questions.
+Status: **approved (owner, 2026-10-29, TG 465)** (task-99 design against main @ c64b721, 2026-10-29). Nothing is
+built. The build phases are in [Phases](#phases), and the former open questions are now [Decisions](#decisions).
 
 Owner decisions so far:
 
@@ -31,8 +31,12 @@ Related: [host-manager.md](host-manager.md) (change requests, journal, Q3 `/rebu
 
 - **The request exists.** In the container, `minions upgrade --from-container [branch] --reason <text>` records an
   `upgrade` change request (`src/runtime/change-requests.ts`, payload `{ fromContainer }`). The host reads it with
-  `minions --json settings requests`. The hidden runtime verb `settings requests mark <id> --status <s>` is what the
-  host uses to report an outcome (`recordApplyResult`, `src/host/change-requests.ts`).
+  `minions --json settings requests` (a host verb that reaches the runtime through docker exec, `runtimeJson`,
+  `src/host/change-requests.ts` ~462). `settings requests mark <id> --status <s>` is hidden and a **runtime verb**
+  (`requireMode('runtime')`, ~833), and `notify enqueue` is also a runtime verb (`src/runtime/commands.ts` ~705). The
+  host CLI cannot call either directly. It reaches them only by exec into the container (`recordApplyResult` does
+  this). So a standalone script must run `docker exec` itself, and must handle the runtime not running (a
+  PRECONDITION) as "wait and retry", never as a failure of the request.
 - **The apply steps exist.** `minions upgrade --sync-only` exports the container branches and fast-forwards host
   main to `minions/main` (strict fast-forward, clean trees, local delivery only). `minions upgrade --rebuild-cli`
   runs `cli` → pause → drain → files → image (rebuilt only when the build fingerprint changed) → recreate →
@@ -44,8 +48,11 @@ Related: [host-manager.md](host-manager.md) (change requests, journal, Q3 `/rebu
   sha256, and `checkCliHealth` runs `minions --version` and `minions --json status` in fresh processes. A **linked**
   install is rebuilt in place, with no backup. `ensureImage` rebuilds the same tag, so the old image becomes
   dangling and nothing keeps it.
-- **Dev detection exists.** `devRebuildAvailable` is true only when the host CLI runs from a minions source checkout
-  and the project repo is minions. `/rebuild_cli` additionally needs local delivery and a clean checkout.
+- **Dev detection has two different checks.** `upgrade --rebuild-cli` tests the **project repo**
+  (`isMinionsCheckout(repoPath)`), and the install kind decides the action in `checkCli`
+  (`src/host/upgrade-source.ts` ~322): kind `packed` gives `reinstall`, a linked checkout gives `rebuild`. The
+  manager's `/rebuild_cli` gate uses `devRebuildAvailable`, which tests `packageRoot()` of the *running* CLI, so it is
+  false for a packed global install (it runs from `node_modules`). The script must not reuse it.
 - **Packaging.** `package.json` `files` lists `dist templates docker schema install.sh README.md docs LICENSE`.
   `scripts/` is not in the list, so the npm package does not contain `scripts/dev/`. The image copies only
   `package.json`, `dist/` and `templates/` (`docker/Dockerfile`, `Dockerfile.dockerignore`). `scripts/` is part of
@@ -60,6 +67,11 @@ The script **is** the opt-in. It is a plain Node script in the minions repo. The
 terminal or as a user service (`node scripts/dev/self-update.mjs --project minions`), and nothing installs or starts
 it. The container cannot start it either: it cannot run host processes, and it cannot write `<MINIONS_HOME>`.
 
+The script reaches the two runtime verbs (`settings requests mark`, `notify enqueue`) with its own `docker exec` into
+the container, the same way the host CLI does. That exec is the host's own existing access. It gives the container no
+new capability: the container still cannot call anything on the host, and the script takes no input from it other
+than the request list it already reads.
+
 Rules that stay the same, and must be stated as such in host-manager.md and bootstrap.md:
 
 - For every install, the container can only *propose*. It cannot mint a host confirmation, and it never sees the
@@ -73,16 +85,18 @@ Rules that stay the same, and must be stated as such in host-manager.md and boot
   "self-update script changed; restart it to use the new version". This keeps the kill switch and the loop's rules
   in the owner's hands.
 
-**Refusals at start.** The script refuses to start unless all of these hold: the CLI is a minions checkout and the
-project is minions (same rule as `devRebuildAvailable`), delivery is `local`, the runtime is Docker, the install is
-**packed** (so a backup is possible, see Q1), and the host checkout is on the base branch with a clean tree. Only one
+**Refusals at start.** The script refuses to start unless all of these hold: the project repo is a minions checkout
+(`isMinionsCheckout(repoPath)`) **and** the installed CLI kind is `packed` (the `reinstall` action in `checkCli`; not
+`devRebuildAvailable`, which is false for a packed install and is what `/rebuild_cli` uses), delivery is `local`, the runtime is Docker, the install is
+**packed** (so a backup is possible, see Decision 1), and the host checkout is on the base branch with a clean tree. Only one
 instance runs at a time, held by the lock `<MINIONS_HOME>/dev-self-update/lock`.
 
 ### Trigger
 
 Every 30 s the script reads `minions --json settings requests` and takes the oldest open `upgrade` request whose
 `fromContainer` is `true` or the base branch. It ignores every other kind and leaves it to the manager or the
-terminal. Taking a request means marking it `confirmed` with `settings requests mark`. The manager only offers
+terminal. Taking a request means marking it `confirmed` with `settings requests mark`, run through the script's own docker exec.
+If the runtime is not running, the script waits and polls again. The manager only offers
 `proposed` and `failed` requests, so it stops offering this one. The coordinator itself decides when to ask, for
 example after a merge to main. For this project only, it does that through a line in the minions repo's own
 instructions (see phase 4), not in the shipped coordinator template.
@@ -97,7 +111,8 @@ instructions (see phase 4), not in the shipped coordinator template.
 3. **Gate on the host, for this exact SHA.** Create a throwaway `git worktree add --detach` under the script's
    scratch dir, outside the checkout. Run `npm ci`, `npm run typecheck` and `npm test` there
    (`MINIONS_TEST_MAX_WORKERS=2`), then remove the worktree. Container evidence is not trusted for this. If the gate
-   fails, the request is marked `failed`, nothing is built, and the SHA is recorded as bad.
+   fails, the request is marked `failed`, nothing is built, and the SHA is recorded as bad. Host main stays advanced to that SHA (the sync already moved it, and host branches only
+   move forward), so the next request syncs and gates from that HEAD. A fix on main is therefore picked up normally.
 4. **Keep the previous build.** Tag the current image as `<imageTag>-prev` (`docker tag`). The CLI backup is made by
    `applyCli` itself.
 5. **Upgrade:** `minions upgrade --rebuild-cli` (a second run, so building the synced commits is allowed). This step
@@ -105,17 +120,21 @@ instructions (see phase 4), not in the shipped coordinator template.
 6. **Health check**, polled for up to 5 minutes. "Healthy" means all of the following:
    - `checkCliHealth` passes (fresh processes for `--version` and `status`);
    - the container runs the new image ID;
-   - `minions --json status` reports the coordinator running, with the new build stamp in the runtime;
-   - when Telegram is configured, the `telegram.*` checks of `minions --json status --check` are not `fail`, and
-     the coordinator holds the bot poller;
+   - `minions --json status` reports the coordinator running and `restartRequired.state` is `current`
+     (`src/host/restart-required.ts`: image label vs the installed build fingerprint, CLI version, coordinator launch
+     fingerprint). This replaces a separate "build stamp" check. Phase 3 confirms the exact `status` fields;
+   - when Telegram is configured, the `telegram.plugin` and `telegram.poller` checks (`src/host/doctor.ts`; phase 3
+     confirms which command surfaces them, `status --check` or `doctor`) are not `fail`;
    - the coordinator does not restart more than once in the window.
 7. **Outcome.**
    - Healthy: mark the request `applied` with detail `self-update <old>..<new>`, and enqueue the owner notice
-     (`minions notify enqueue --key self-update:<sha> --kind self-update`; the new coordinator sends it).
+     (`minions notify enqueue --key self-update:<sha> --kind self-update`; the new coordinator sends it). Both verbs run by the script's own docker exec.
    - Not healthy: **roll back**. Reinstall the newest CLI backup with `installCliBackup`, re-tag `<imageTag>-prev`
-     as `<imageTag>`, then run `minions down && minions start --no-attach` on the old CLI. The image label matches
-     the old CLI, so nothing is rebuilt. Then mark the request `failed`, record the SHA as bad, and send the notice
-     through the restored coordinator. Host main is not moved back, because host branches only move forward.
+     as `<imageTag>`, then run `minions down && minions start --no-attach` on the old CLI. The image's `minions.build` label
+     is the fingerprint of the files the old CLI built it from (`buildFingerprint`, `src/host/docker.ts`), so
+     `ensureImage` should not rebuild once the old CLI is back. This is an assumption that phase 3 verifies. Then mark the request `failed`, record the SHA as bad, and send the notice
+     through the restored coordinator. Host main is not moved back, because host branches only move forward, so a failed gate or rollback leaves host
+     main on the new HEAD, and the next request builds from it.
    - A bad SHA is not tried again. A later request whose `HEAD` is a different, newer commit is tried normally (a
      fix on main).
 
@@ -143,28 +162,35 @@ the loop fast:
 
 Target: under 10 minutes from request to healthy coordinator, most of it `npm test`.
 
-## Open questions for the owner
+## Decisions
 
-1. **Packed install only** (recommended): the script refuses a linked (`npm link`) install, because a rebuild in
-   place leaves nothing to roll back to. The alternative is to teach the script to pack a linked install before
-   building. That is more code, and it depends on running `npm pack` on a checkout that has already moved forward.
-2. **Trigger:** request only (recommended: the coordinator chooses the moment, and you can see it in
-   `settings requests`). The alternative is to also self-update whenever `minions/main` moves after a sync.
-3. **Owner notice if no coordinator comes up at all**, even after a rollback: the log only (recommended for the
-   first version), or also the manager bot when it is paired (needs a small hook into the manager transport).
+Answered by the owner in TG 465 (2026-10-29):
+
+1. **Packed installs only.** The script refuses a linked (`npm link`) install, because a rebuild in place leaves
+   nothing to roll back to.
+2. **Trigger: the coordinator's request only.** The coordinator is also **proactive**: after a merge to main that
+   brings a *meaningful* change, it requests an update itself, without waiting to be asked. "Meaningful" means a change
+   to runtime, CLI or plugin behaviour. Docs-only and tests-only changes are not meaningful. This goes into the
+   phase 4 instruction.
+3. **No coordinator even after rollback:** the log, and **also the manager bot** when it is paired, notifies the owner.
+   This needs a small hook from the script into the manager transport (phase 3).
 
 ## Phases
 
 1. **Script skeleton and refusals.** Add `scripts/dev/self-update.mjs` with the start refusals, the lock, the log
    and state files, polling and taking requests (`mark confirmed`), idle detection, and `--dry-run` (print the plan
-   only). Test with a fake `minions` binary on `PATH`. Add a test that `npm pack --dry-run` contains no
+   only). The script runs `docker exec` itself for the runtime verbs and treats a stopped runtime as "retry". Test with a fake
+   `minions` binary and a fake `docker` on `PATH` (including the runtime-not-running case). Add a test that `npm pack --dry-run` contains no
    `scripts/dev/`.
 2. **Apply and gate.** Add the sync run, the host gate in a throwaway worktree, the previous-image tag,
    `upgrade --rebuild-cli`, outcome marking and the notice. Tests cover a gate failure (nothing built), a refused
    sync, and a bad SHA that is skipped.
 3. **Health check and rollback.** Add the health definition above, the CLI backup reinstall, the image re-tag, and
-   `down && start` on the old CLI. Test it with fakes, then do one live check by the coordinator, with an
+   `down && start` on the old CLI. When no coordinator comes up even after the rollback, notify the owner through the
+   manager bot too (Decision 3). Test it with fakes, then do one live check by the coordinator, with an
    intentionally broken commit on a scratch branch.
-4. **Wire the trigger.** Add the coordinator instruction for the minions repo (it touches `CLAUDE.md` or
+4. **Wire the trigger.** Add the coordinator instruction for the minions repo: request an update proactively after a
+   merge to main with meaningful changes (runtime, CLI or plugin behaviour; not docs-only or tests-only), without
+   waiting to be asked (Decision 2) (it touches `CLAUDE.md` or
    `.minions/**`, which are sensitive paths and need owner approval). Add a short note in host-manager.md and
    bootstrap.md that says the Q3 and no-self-continuation rules for installed minions are unchanged.
