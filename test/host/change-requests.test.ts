@@ -475,6 +475,40 @@ describe('settings apply (host): restart and upgrade requests', () => {
     mode = 'ok';
     await expect(CR.confirmRequest(project, uid, offered.digest, d)).resolves.toMatchObject({ status: 'applied' });
   });
+
+  it('upgrade: a dry run that would stop names the stopping step and the exact dry-run command (task-102)', async () => {
+    const { project } = await install();
+    const uid = RT.recordUpgradeRequest({ db, config: runtimeConfig(project) }, { fromContainer: true, reason: 'sync' }).request!.id;
+    const runs: unknown[] = [];
+    // The owner's case: nothing failed, but the CLI step is planned as a stop, so the run is not ok and the summary
+    // only counted the steps.
+    const upgrade = async (_p: ProjectJson, x: { fromContainer: string | true | null; dryRun: boolean }): Promise<UpgradeRun> => {
+      runs.push(x);
+      return { ok: false, summary: '13 steps planned', steps: [
+        { id: 'sync', status: 'planned', detail: 'export, then fast-forward main aaa -> bbb' },
+        { id: 'cli', status: 'planned', detail: 'would stop: the installed CLI differs; review the checkout, then rerun with --rebuild-cli\u001b[31m' },
+        { id: 'preflight', status: 'done', detail: 'container running; image current' },
+        { id: 'recreate', status: 'planned', detail: 'docker compose up --force-recreate (named volumes kept)' },
+      ] };
+    };
+    const e = await CR.applyRequest(project, uid, { yes: true }, deps(fakeRuntime().runtime, { upgrade }), io([]).io).then(() => { throw new Error('applied'); }, (x: unknown) => x as Error & { code?: string; hint?: string });
+    expect(e).toMatchObject({ code: 'PRECONDITION' });
+    expect(e.message).toContain('`minions upgrade --from-container --dry-run` reports that the upgrade would fail: planned: cli (would stop: the installed CLI differs');
+    expect(e.message).not.toMatch(/13 steps planned|recreate|\u001b/);
+    expect(e.hint).toContain('run `minions upgrade --from-container --dry-run` on the host');
+    expect(runs).toEqual([{ fromContainer: true, dryRun: true }]);
+    expect(db.changeRequest(uid)!.status).toBe('proposed');
+  });
+
+  it('dryRunFailure lists failed steps, falls back to the summary; dryRunCommand mirrors the child flags', () => {
+    const steps = [{ id: 'preflight', status: 'failed', detail: 'docker down' }, { id: 'image', status: 'failed', detail: 'no dist' }, { id: 'files', status: 'planned', detail: 'regenerate' }];
+    expect(CR.dryRunFailure({ ok: false, steps, summary: 'x' })).toBe('failed: preflight (docker down); failed: image (no dist)');
+    expect(CR.dryRunFailure({ ok: false, steps: [], summary: 'no result (exit 1)' })).toBe('no result (exit 1)');
+    expect(CR.dryRunCommand({ fromContainer: null, dryRun: true })).toBe('minions upgrade --dry-run');
+    expect(CR.dryRunCommand({ fromContainer: 'agent/x', dryRun: true })).toBe('minions upgrade --from-container agent/x --dry-run');
+    expect(CR.dryRunCommand({ fromContainer: null, dryRun: true, syncOnly: true })).toBe('minions upgrade --sync-only --dry-run');
+    expect(CR.dryRunCommand({ fromContainer: null, dryRun: true, rebuildCli: true })).toBe('minions upgrade --rebuild-cli --dry-run');
+  });
 });
 
 describe('settings reject and requests (host)', () => {
