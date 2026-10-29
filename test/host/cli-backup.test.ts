@@ -47,8 +47,10 @@ describe('backupInstalledCli and installCliBackup (real npm)', () => {
     writeFileSync(join(install, 'node_modules', 'x', 'index.js'), '');
     symlinkSync('/etc/passwd', join(install, 'link'));
 
-    // npm pack of the directory runs prepare even with --ignore-scripts, which is why the backup does not use it.
-    const pack = await run('npm', ['pack', install, '--ignore-scripts', '--dry-run'], { cwd: tempDir('minions-pack-'), allowFailure: true, timeoutMs: 120_000 });
+    // npm pack of the directory runs its prepare script, which fails here: that is why the backup does not use it.
+    // npm 10 runs it even with --ignore-scripts; other npm releases (the macOS host gate, task-105) may not, so the
+    // precondition is checked without the flag. The backup below must succeed either way.
+    const pack = await run('npm', ['pack', install, '--dry-run'], { cwd: tempDir('minions-pack-'), allowFailure: true, timeoutMs: 120_000 });
     expect(pack.code).not.toBe(0);
 
     const logs: string[] = [];
