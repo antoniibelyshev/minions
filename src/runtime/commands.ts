@@ -191,7 +191,7 @@ async function restartWorkers(d: RuntimeDb, o: { exceptSessions?: boolean } = {}
   const r = await recoverRuns(reapDeps(), 'orphans');
   logRecovery(r, (line) => process.stderr.write(line + '\n'));
   const all = withOpenRuns(() => d.activeLeases(), runtimePaths().state); // contextResetCheck counts the same way
-  return o.exceptSessions ? routerBlockers(d, all) : all;
+  return leaseBlockers(d, all, o);
 }
 
 /** `notify enqueue --session`, else MINIONS_SESSION (a task or the general session; the router and none record null). */
@@ -209,7 +209,8 @@ function notifySession(explicit: string | undefined): string | null {
  * With coordinator sessions on (task-57 phase 8) the coordinator is the router: leases held by a headless session run
  * under the supervisor, so they never block a router restart, reset or digest wake. Live runs still count every lease.
  */
-function routerBlockers<T extends { id: string }>(d: RuntimeDb, leases: () => T[]): () => T[] {
+export function leaseBlockers<T extends { id: string }>(d: Pick<RuntimeDb, 'lease'>, leases: () => T[], o: { exceptSessions?: boolean } = {}): () => T[] {
+  if (!o.exceptSessions) return leases;
   return () => leases().filter((l) => !heldBySession(d.lease(l.id.split(' ')[0]!)?.holder));
 }
 
@@ -243,7 +244,7 @@ async function routineDeps(): Promise<Parameters<typeof runRoutinePass>[0]> {
   const cfg = await getConfig();
   const paths = runtimePaths();
   const all = withOpenRuns(() => d.activeLeases(), paths.state);
-  const leases = () => (sessionsSettings(cfg).enabled ? routerBlockers(d, all) : all)().map((l) => l.id);
+  const leases = () => leaseBlockers(d, all, { exceptSessions: sessionsSettings(cfg).enabled })().map((l) => l.id);
   const log = join(paths.logs, 'routine.log');
   return {
     db: d, config: cfg, now: () => new Date(), procStart: procStartTime,
