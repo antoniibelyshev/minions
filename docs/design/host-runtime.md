@@ -33,8 +33,9 @@ straight from the checkout stays rejected, and the host dev loop runs the same p
   switches the copy and restarts only the coordinator, inside its own tmux server. Rollback switches back.
 - **Self-update** stays a dev-only script (TG 461). It gets a host mode, with the same gate, health check and
   rollback, but with no image steps.
-- **Local auto-integration** (task-82) works on the host too. The coordinator wrapper always starts the integrator,
-  and the gate's `npm test` runs under a minions-generated macOS sandbox profile. Upgrades and self-update wait
+- **Local auto-integration** (task-82) works on the host too. Commands run from the coordinator's sandbox only queue
+  integrations. Only host-side processes outside the sandbox start the integrator: the coordinator wrapper, and the
+  upgrade. The gate's `npm test` runs under a minions-generated macOS sandbox profile. Upgrades and self-update wait
   while an integration holds its lock.
 - **Migration** is a drain, then a state export, the switch, and a state import. The Docker volumes are kept, so
   rollback is the same steps in reverse.
@@ -84,11 +85,27 @@ What is missing (the gaps this design closes):
 7. **Unpinned tools.** Claude Code, Backlog.md and gh are the owner's global installs and may auto-update.
 8. **Never run live.** `e2e-host.sh` uses a fake `claude` and a fake `tmux`
    ([compatibility.md](../compatibility.md#host-runtime-no-docker)). Linux hosts were never reviewed.
-9. **The integration gate's sandbox depends on who starts it.** `Scheduler.record` runs inside `minions work record`,
-   which the coordinator calls from Bash, so on the host its detached `minions work integrate` (and the `npm test`
-   it runs) inherits the coordinator's Seatbelt profile. The wrapper's `integrationWatch` backstop runs outside the
-   sandbox, so an integrator it starts runs the gate unsandboxed, as the owner. The same queue gets two different
-   safety levels. In Docker both run in the container.
+9. **The integration gate's sandbox depends on who starts it.** Every path that spawns `minions work integrate`
+   (`startIntegratorDetached` in `src/runtime/integrator.ts`) today:
+   - `Scheduler.kickIntegrator` (`src/runtime/scheduler.ts`), called from `Scheduler.record` (`work record`, also
+     with `--submitted`, and `work advance`, which records through `recordSubmitted`) and from
+     `Scheduler.requeueIntegration` (`work publish` in local mode, and `Scheduler.publish` called inside `record`);
+   - `kickIntegratorIfNeeded` (`src/runtime/integration-status.ts`) in `coordinator restart --recover`
+     (`src/runtime/commands.ts`). That command runs directly, through the detached self-restart
+     (`coordinator restart --recover --detach`, `RESET_RESTART_COMMAND`, `scheduleDetachedRestart`), through the
+     routine pass's crash start (`scheduleCrashStart`, reached from the host manager's watchdog), and as D7 step 5
+     of the host upgrade;
+   - the wrapper's `integrationWatch` backstop (`startIntegrationWatch`, `wrapperIntegrationWatch`);
+   - a direct `minions work integrate` (hidden; the pre-bash hook already refuses it for subagents,
+     `COORDINATOR_ONLY_WORK_VERBS`, and the coordinator prompt says never to run it).
+
+   The coordinator and the headless task sessions call `work record`, `work advance`, `work publish` and the
+   self-restart from Bash. On the host that Bash runs under Seatbelt, and a detached child stays in the profile, so
+   the integrator, and the `npm test` it runs, inherit the coordinator's profile. Seatbelt cannot nest, so the D11
+   per-command profile then fails to apply, and that failure would look like a transient or red outcome, not a
+   clear refusal. The wrapper's watch, the host upgrade and the watchdog run outside the sandbox, so an integrator
+   they start runs the gate unsandboxed, as the owner. The same queue gets different safety levels depending on the
+   starter. In Docker every starter runs in the container.
 
 ## Decisions
 
@@ -128,18 +145,33 @@ What is missing (the gaps this design closes):
   auto-update.
 - **D10. macOS first.** The host runtime's sandbox profile targets Seatbelt. A Linux host runtime (bubblewrap) is a
   separate task (Q1).
-- **D11. Local integration on the host: one starter, a sandboxed gate.** The integration worktree stays where the
-  layout puts it, `<project>/host/workspace/integration` (under the space-containing macOS data root, like the
-  workspace). On the host, `Scheduler.record` does not spawn the integrator from the sandboxed `work record` call: it
-  only queues, and the coordinator wrapper (outside the sandbox) starts `minions work integrate`. The wrapper's
-  `integrationWatch` already does this every minute; on the host it also wakes on a queue-touch file, so the delay
-  stays a few seconds. The integrator then runs its own steps (git merge and landing with hardened git, DB writes)
-  as the owner, and runs each verification command (`verification.setupCommands`, `npm test`, …) under
-  `sandbox-exec` with a minions-generated Seatbelt profile: writes only to the integration worktree and
-  `<state>/run/integration` and the integration logs, the same `denyRead` list as `hostSettings`, network GitHub and
-  npm only. Running the gate inside the coordinator's inherited profile was rejected: Seatbelt cannot nest, so the
-  integrator could not tighten it, and its scope then depends on which starter won. Running the gate unsandboxed was
-  rejected: the gate executes agent-written code (tests, install scripts) as the owner.
+- **D11. Local integration on the host: unsandboxed starters only, a sandboxed gate.** The integration worktree
+  stays where the layout puts it, `<project>/host/workspace/integration` (under the space-containing macOS data
+  root, like the workspace). On the host, every entry point that can run from a sandboxed Bash only queues: it
+  writes the queue row and touches a wake file, and never spawns `minions work integrate`. These are all the
+  callers in gap 9: `work record` (with or without `--submitted`), `work advance` (also in a task session),
+  `work publish`, and `coordinator restart --recover` when it runs from the coordinator's Bash (directly or through
+  `--detach`). Only unsandboxed host-side starters start the integrator:
+  - the wrapper's `integrationWatch`. It already checks every minute; on the host it also wakes on the wake file,
+    so the delay stays a few seconds. The wrapper runs under the project's tmux server, outside the sandbox, also
+    after a self-restart (the restart starts the new wrapper through tmux);
+  - the host upgrade's `coordinator restart --recover` (D7 step 5), which runs outside the sandbox;
+  - the same `--recover` spawned by the routine crash start when the host manager's watchdog runs it host-side.
+    It is redundant with the new wrapper's watch, but harmless: a second integrator exits at once on the held lock.
+
+  `--recover` does not decide from its caller. It starts the integrator only when the sandbox probe below passes,
+  and otherwise only touches the wake file. **Fail closed:** on the host, `minions work integrate` first runs that
+  probe: it applies a trivial `sandbox-exec` profile, which fails inside an existing Seatbelt profile. If the probe
+  fails, it refuses before it takes the `integration_lock` and before it touches any row. It records an
+  `integrator-sandboxed` event, prints a clear error, touches the wake file and exits non-zero. The rows stay
+  `queued` and no attempt is counted, so the wrapper's watch picks them up. The integrator then runs its own steps
+  (git merge and landing with hardened git, DB writes) as the owner, and runs each verification command
+  (`verification.setupCommands`, `npm test`, …) under `sandbox-exec` with a minions-generated Seatbelt profile:
+  writes only to the integration worktree, `<state>/run/integration` and the integration logs, the same `denyRead`
+  list as `hostSettings`, network GitHub and npm only. Running the gate inside the coordinator's inherited profile
+  was rejected: Seatbelt cannot nest, so the integrator could not tighten it, and its scope would then depend on
+  which starter won. Running the gate unsandboxed was rejected: the gate executes agent-written code (tests,
+  install scripts) as the owner.
 
 ## Docker vs host: what the host loses, and the mitigations
 
@@ -150,7 +182,7 @@ What is missing (the gaps this design closes):
 | **Credentials** | Only this project's GitHub token, the bot token (read-only mount, also in the coordinator env) and the Claude login/key. | The owner's user. The sandbox `denyRead` covers the data root and secret dirs. File store, env allowlist. | Same, and the bot token is read only by the server process, which runs outside the sandbox. It is not in the `claude` env, and `denyRead` hides the file from Bash. The channel state sits outside `allowWrite`. | The Keychain is still reachable over `mach-lookup` from sandboxed commands. `security` is denied by pattern only, so the pre-bash fence covers wrappers (`sh -c`, `env`, `xargs`). The GitHub token is readable by agents, as in Docker. |
 | **Nested claude** | It loads the container's config dir, where the plugin is off. | A worker's `claude` uses the owner's `~/.claude` (their plugins, MCP servers, login). It is held back only by the sandbox network list (no `api.anthropic.com`). | The per-project config dir (D3) has no plugin at user scope, and the channel server is never at user scope. `Bash(claude*)` is denied, and the pre-bash fence refuses `claude` in any position. | None beyond Docker's. |
 | **Worktree / state** | Volumes at `/workspace/{repo,worktrees}`, `/state`. | `<MINIONS_HOME>/projects/<id>/host/{workspace,state}`. On macOS the path contains a space (`Application Support`). | Same, plus `host/claude` and `host/cli/<fp>` (host-owned, not agent-writable, Edit-denied). The prompt note already maps `/workspace` and `/state` (`hostPromptNote`). | The dev suite must pass with a space in cwd and without loopback binding or Unix sockets (`allowLocalBinding: false`). Phase 0 checks this. |
-| **Integration gate** (task-82) | The integrator and its `npm test` run in the container, in `/workspace/integration`, with an allowlisted env and a fresh `HOME`. | Inherits Seatbelt when `work record` spawns it, unsandboxed when the wrapper backstop does (gap 9). | Always started by the wrapper; each verification command runs under a minions-generated Seatbelt profile (D11). The allowlisted env and fresh `HOME` stay. | The integrator's own git and DB steps run unsandboxed as the owner (as minions' own git calls do today, with `git-hardening.ts`). `sandbox-exec` is deprecated by Apple but is the mechanism Claude Code's sandbox itself uses. The suite must pass under that profile (phase 0). |
+| **Integration gate** (task-82) | The integrator and its `npm test` run in the container, in `/workspace/integration`, with an allowlisted env and a fresh `HOME`. | Inherits Seatbelt when a call from the coordinator's Bash spawns it (`work record`, `work advance`, `work publish`, `coordinator restart --recover`), unsandboxed when the wrapper backstop, the host upgrade or the watchdog does (gap 9). | Started only by unsandboxed host-side starters (the wrapper's watch, the host upgrade's `--recover`); sandboxed entry points only queue, and `work integrate` refuses when it is already sandboxed. Each verification command runs under a minions-generated Seatbelt profile (D11). The allowlisted env and fresh `HOME` stay. | The integrator's own git and DB steps run unsandboxed as the owner (as minions' own git calls do today, with `git-hardening.ts`). `sandbox-exec` is deprecated by Apple but is the mechanism Claude Code's sandbox itself uses. The suite must pass under that profile (phase 0). |
 | **Network** | `outbound-internet`, no filter. | Bash: GitHub and npm only. | Unchanged. Telegram traffic comes from the server, outside the sandbox. | Stricter than Docker for Bash, which is fine for this project. |
 | **Tool versions** | The image pins Claude Code, Backlog.md and the plugin. | The owner's global installs. | The shim sets `DISABLE_AUTOUPDATER=1`. `doctor` warns on untested versions (exists), and `status` shows them. | The owner updates Claude Code deliberately and reruns `doctor`. |
 
@@ -297,7 +329,9 @@ The Docker volumes are deleted only after the owner says so (Q6).
    hand with `ps -o pid=,ppid=,command=`); otherwise this item fails by default and says nothing about the channel.
    Also: one local integration round (local delivery, `delivery.merge: auto-when-eligible`, one approved head merged,
    verified and landed in `<project>/host/workspace/integration`), with the gate's `npm test` run once under a
-   hand-written `sandbox-exec` profile as in D11; the per-project `CLAUDE_CONFIG_DIR` login and the auto-memory
+   hand-written `sandbox-exec` profile as in D11. Two more D11 checks: the trivial-profile probe fails from the
+   coordinator's sandboxed Bash and passes outside it; and a `coordinator restart --recover --detach` from that Bash
+   starts the new wrapper outside the sandbox, through the tmux server. Also the per-project `CLAUDE_CONFIG_DIR` login and the auto-memory
    location. Go/no-go per item. Depends: none.
 1. **macOS process facts and a runtime-aware bot guard.** Criteria: a `ps`-based `ProcessControl` on darwin
    (cmdline, parent, start time) used by the coordinator lock, `checkTelegramPoller`, `signalDescendants` and the
@@ -318,11 +352,19 @@ The Docker volumes are deleted only after the owner says so (Q6).
 4. **Auto mode and the integration gate on the host.** Criteria: the host-layer-only loosening rule (a repository
    value can only tighten), with tests; the new deny rules; the host pre-bash fence and pre-file path fence, which
    fail closed, with tests for wrappers, substitutions, symlinks and `..`; `status` and `doctor` show the mode and
-   source; the default becomes `auto` only if phase 0 passed. D11: on the host `Scheduler.record` only queues and
-   touches the wake file, and the wrapper starts the integrator; each verification command runs under the generated
-   Seatbelt profile (writes limited to the integration worktree, `<state>/run/integration` and its logs; the
-   `hostSettings` `denyRead` list; GitHub and npm only); tests for the argv and the profile with a fake
-   `sandbox-exec`, and that no host path spawns the integrator from `work record`. Depends: 0, 1, 2.
+   source; the default becomes `auto` only if phase 0 passed. D11: on the host, `Scheduler.kickIntegrator` never
+   spawns and only touches the wake file, so `work record` (also with `--submitted`), `work advance` and
+   `work publish` only queue. `coordinator restart --recover` starts the integrator only when the sandbox probe
+   passes, and otherwise touches the wake file. The wrapper's `integrationWatch` wakes on that file. `work
+   integrate` runs the probe first: when it is already sandboxed, it refuses before it takes the lock (the
+   `integrator-sandboxed` event, an exit code other than 0, the rows stay `queued`, no attempt counted). Each
+   verification command runs under the generated Seatbelt profile (writes limited to the integration worktree,
+   `<state>/run/integration` and its logs; the `hostSettings` `denyRead` list; GitHub and npm only). Tests use a fake
+   `sandbox-exec` and a fake spawner and cover: the argv and the profile; that `work record`, `work record
+   --submitted`, `work advance`, `work publish` and a sandboxed `coordinator restart --recover` (also with
+   `--detach`) spawn nothing on the host; that the wrapper's watch and an unsandboxed `--recover` do spawn; and
+   the refusal leaves the queue and attempt count unchanged. Docker behaviour stays unchanged. Phase 0 confirms
+   that the probe fails inside the coordinator's sandbox. Depends: 0, 1, 2.
 5. **`minions upgrade` on the host.** Criteria: the D7 steps with `--dry-run`, `--now` and `--rebuild-cli`; the
    drain waits while the `integration_lock` is held (a verification is re-queued, a landing finishes); the
    `restart-required` host branch; an interrupted upgrade resumes (`upgrade.json`); tests with a fake tmux and
