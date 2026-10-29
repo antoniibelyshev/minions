@@ -377,6 +377,111 @@ describe('self-update apply (phase 2)', () => {
   });
 });
 
+describe('self-update apply: failure paths and isolation', () => {
+  const marks = () => dockerLog().split('\n').filter((l) => l.includes('requests mark cr_aaaaaaaa'));
+  const statuses = () => marks().map((l) => / --status (\w+)/.exec(l)?.[1]);
+  const gateWorktreesGone = () => {
+    expect(gitIn(fx.repo, 'worktree', 'list', '--porcelain').split('\n').filter((l) => l.startsWith('worktree '))).toHaveLength(1);
+    const gate = join(stateDir(), 'gate');
+    expect(existsSync(gate) ? readdirSync(gate) : []).toEqual([]);
+  };
+
+  it('a missing previous image fails the request before anything is built, without recording the SHA as bad', () => {
+    const p = join(fx.home, 'projects', PROJECT_ID, 'project.json');
+    json(p, { ...JSON.parse(readFileSync(p, 'utf8')), imageTag: 'minions-runtime:gone' });
+    setRequests([request('cr_aaaaaaaa')]);
+    const r = runScript('--once');
+    expect(r.code, r.err).toBe(0);
+    expect(dockerLog()).toContain('image inspect --format {{.Id}} minions-runtime:gone');
+    expect(dockerLog()).not.toMatch(/^tag /m);
+    expect(minionsLog()).not.toMatch(/--rebuild-cli/);
+    expect(statuses()).toEqual(['confirmed', 'failed']);
+    expect(marks()[1]).toMatch(/the previous image could not be kept .*nothing was built/);
+    expect(readState()).toMatchObject({ current: null, lastApplied: null, badShas: [] });
+    gateWorktreesGone();
+  });
+
+  it('the gate runs with a scratch MINIONS_HOME (removed after) and without the runtime or handoff variables', () => {
+    const registry = readFileSync(join(fx.home, 'registry.json'), 'utf8');
+    sh(join(fx.bin, 'npm'), [
+      '[ "$1 $2" = "root -g" ] && { echo "$FAKE/global"; exit 0; }',
+      'echo "$* | home=$MINIONS_HOME | runtime=${MINIONS_RUNTIME-unset} | handoff=${MINIONS_UPGRADE_HANDOFF-unset}" >> "$FAKE/npm.log"',
+      // What a careless test in the project would do: write into its MINIONS_HOME.
+      'echo x > "$MINIONS_HOME/registry.json"',
+      'exit 0',
+    ].join('\n'));
+    setRequests([request('cr_aaaaaaaa')]);
+    const r = spawnSync(process.execPath, [SCRIPT, '--repo', fx.repo, '--once'], { encoding: 'utf8', timeout: 60_000,
+      env: { ...env(), MINIONS_RUNTIME: 'container', MINIONS_UPGRADE_HANDOFF: '1' } });
+    expect(r.status, r.stderr).toBe(0);
+    const to = gitIn(fx.repo, 'rev-parse', 'HEAD');
+    const lines = npmLog().trim().split('\n');
+    expect(lines.map((l) => l.split(' |')[0])).toEqual(['ci', 'run typecheck', 'test']);
+    const homes = [...new Set(lines.map((l) => / home=(\S+)/.exec(l)?.[1]))];
+    expect(homes).toHaveLength(1);
+    expect(homes[0]).toMatch(new RegExp(`^${join(stateDir(), 'gate')}/${to.slice(0, 12)}-[0-9a-f]{8}\\.home$`));
+    expect(existsSync(homes[0]!)).toBe(false);
+    for (const l of lines) expect(l).toContain('runtime=unset | handoff=unset');
+    expect(readFileSync(join(fx.home, 'registry.json'), 'utf8')).toBe(registry);
+    gateWorktreesGone();
+  });
+
+  it('a stop during the gate builds nothing, keeps the request confirmed, cleans up, and the next start marks it interrupted', async () => {
+    sh(join(fx.bin, 'npm'), [
+      '[ "$1 $2" = "root -g" ] && { echo "$FAKE/global"; exit 0; }',
+      'echo "$*" >> "$FAKE/npm.log"',
+      '[ "$*" = test ] && { touch "$FAKE/gate-running"; exec sleep 30; }',
+      'exit 0',
+    ].join('\n'));
+    setRequests([request('cr_aaaaaaaa')]);
+    const child = spawn(process.execPath, [SCRIPT, '--repo', fx.repo, '--interval', '60'], { env: env(), stdio: ['ignore', 'pipe', 'pipe'] });
+    let out = '';
+    child.stdout.on('data', (b: Buffer) => { out += b.toString(); });
+    const exited = new Promise<number | null>((res) => child.on('exit', (c) => res(c)));
+    const t0 = Date.now();
+    while (!existsSync(join(fx.fake, 'gate-running'))) {
+      if (Date.now() - t0 > 30_000) { child.kill('SIGKILL'); throw new Error(`the gate did not start: ${out}`); }
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    child.kill('SIGTERM');
+    expect(await exited).toBe(0);
+    expect(Date.now() - t0).toBeLessThan(25_000);
+    expect(out).toMatch(/stopped during gate-test/);
+    expect(minionsLog()).not.toMatch(/--rebuild-cli/);
+    expect(dockerLog()).not.toMatch(/^tag |notify enqueue/m);
+    expect(statuses()).toEqual(['confirmed']);
+    const st = readState() as unknown as { current: { id: string; outcome?: unknown }; badShas: string[] };
+    expect(st.current.id).toBe('cr_aaaaaaaa');
+    expect(st.current.outcome).toBeUndefined();
+    expect(st.badShas).toEqual([]);
+    expect(events().map((e) => e.event)).toContain('apply-stopped');
+    expect(existsSync(join(stateDir(), 'lock'))).toBe(false);
+    gateWorktreesGone();
+
+    setRequests([]);
+    const r = runScript('--once');
+    expect(r.code, r.err).toBe(0);
+    expect(statuses()).toEqual(['confirmed', 'failed']);
+    expect(marks()[1]).toMatch(/the script stopped while handling this request/);
+    expect(readState().current).toBeNull();
+    expect(minionsLog().match(/upgrade --sync-only/g)).toHaveLength(1);
+  });
+
+  it('--dry-run leaves a pending outcome untouched (nothing is marked or notified)', () => {
+    mkdirSync(stateDir(), { recursive: true });
+    const pending = { version: 1, lastApplied: null, badShas: [], current: { id: 'cr_bbbbbbbb', takenAt: '2026-10-29T09:00:00.000Z', runId: 'old',
+      outcome: { status: 'applied', detail: 'self-update a..b', marked: false, notice: { key: 'self-update:cr_bbbbbbbb', text: 'x\n' } } } };
+    json(join(stateDir(), 'state.json'), pending);
+    setRequests([request('cr_aaaaaaaa')]);
+    const r = runScript('--dry-run');
+    expect(r.code, r.err).toBe(0);
+    expect(dockerLog()).not.toMatch(/requests mark|notify enqueue|^tag /m);
+    expect(minionsLog()).not.toMatch(/upgrade/);
+    expect(JSON.parse(readFileSync(join(stateDir(), 'state.json'), 'utf8'))).toEqual(pending);
+    expect(existsSync(join(stateDir(), 'log.jsonl'))).toBe(false);
+  });
+});
+
 describe('self-update packaging', () => {
   it('npm pack --dry-run lists nothing under scripts/dev/', () => {
     const cleanEnv = Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^npm_/i.test(k)));
