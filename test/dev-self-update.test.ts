@@ -1,8 +1,10 @@
-// scripts/dev/self-update.mjs, phase 1 (docs/design/coordinator-self-update.md): start refusals, the lock, polling and
-// taking upgrade requests through the script's own docker exec, idle detection and --dry-run. The script runs as a
-// subprocess against a fake `minions`, `docker` and `npm` on PATH (shell scripts) and a scratch MINIONS_HOME.
+// scripts/dev/self-update.mjs (docs/design/coordinator-self-update.md). Phase 1: start refusals, the lock, polling and
+// taking upgrade requests through the script's own docker exec, idle detection and --dry-run. Phase 2: the apply
+// (sync, host gate in a throwaway worktree, previous-image tag, upgrade --rebuild-cli, outcome and notice). The
+// script runs as a subprocess against a fake `minions`, `docker` and `npm` on PATH (shell scripts), a real Git
+// checkout and a scratch MINIONS_HOME.
 import { spawn, spawnSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -18,7 +20,7 @@ let fx: Fx;
 const sh = (p: string, body: string) => { writeFileSync(p, `#!/bin/sh\n${body}\n`); chmodSync(p, 0o755); };
 const json = (p: string, v: unknown) => writeFileSync(p, JSON.stringify(v));
 const gitIn = (cwd: string, ...args: string[]) => {
-  const r = spawnSync('git', args, { cwd, encoding: 'utf8', env: { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' } });
+  const r = spawnSync('git', args, { cwd, encoding: 'utf8', env: { ...process.env, ...GIT_ENV } });
   if (r.status !== 0) throw new Error(`git ${args.join(' ')}: ${r.stderr}`);
   return r.stdout.trim();
 };
@@ -30,7 +32,15 @@ const request = (id: string, over: Record<string, unknown> = {}) => ({
 const setRequests = (requests: unknown[]) => json(join(fx.fake, 'requests.json'), { ok: true, data: { projectId: PROJECT_ID, requests } });
 const setStatus = (data: Record<string, unknown>) => json(join(fx.fake, 'status.json'), { ok: true, data: { activeLeases: [], draining: null, ...data } });
 const setRunning = (on: boolean) => { const p = join(fx.fake, 'running'); if (on) writeFileSync(p, ''); else rmSync(p, { force: true }); };
-const dockerLog = () => { try { return readFileSync(join(fx.fake, 'docker.log'), 'utf8'); } catch { return ''; } };
+const readLog = (name: string) => { try { return readFileSync(join(fx.fake, name), 'utf8'); } catch { return ''; } };
+const dockerLog = () => readLog('docker.log');
+const minionsLog = () => readLog('minions.log');
+const npmLog = () => readLog('npm.log');
+const GIT_ENV = { GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' };
+/** What the fake `minions upgrade --sync-only` does in the checkout (a shell snippet; default: one new commit). */
+const setSync = (body: string) => writeFileSync(join(fx.fake, 'sync-action'), body);
+const readState = () => JSON.parse(readFileSync(join(stateDir(), 'state.json'), 'utf8')) as { current: unknown; badShas: string[]; lastApplied: string | null };
+const events = () => readFileSync(join(stateDir(), 'log.jsonl'), 'utf8').trim().split('\n').map((l) => JSON.parse(l) as Record<string, unknown> & { event: string });
 const stateDir = () => join(fx.home, 'dev-self-update');
 
 function setup(): Fx {
@@ -46,13 +56,28 @@ function setup(): Fx {
   json(join(home, 'projects', PROJECT_ID, 'project.json'), { version: 1, projectId: PROJECT_ID, repoPath: repo, baseBranch: 'main', imageTag: 'minions-runtime:0.1.0' });
   json(join(fake, 'global', 'minions', 'package.json'), { name: 'minions', version: '0.1.0' });
   json(join(fake, 'global', 'minions', 'dist', 'build.json'), { kind: 'packed', source: 'abc' });
-  json(join(fake, 'config.json'), { ok: true, data: { delivery: { mode: 'local' } } });
-  sh(join(bin, 'npm'), 'echo "$*" >> "$FAKE/npm.log"\n[ "$1 $2" = "root -g" ] && { echo "$FAKE/global"; exit 0; }\nexit 1');
+  json(join(fake, 'config.json'), { ok: true, data: { delivery: { mode: 'local' }, sensitivePaths: ['.github/workflows/**', 'CLAUDE.md'] } });
+  // npm: `root -g`; the gate steps log their argv, cwd, commit and env, and fail when $FAKE/gate-fail names them.
+  sh(join(bin, 'npm'), [
+    '[ "$1 $2" = "root -g" ] && { echo "root -g" >> "$FAKE/npm.log"; echo "$FAKE/global"; exit 0; }',
+    'echo "$* | cwd=$PWD | head=$(git rev-parse HEAD) | home=$MINIONS_HOME | workers=$MINIONS_TEST_MAX_WORKERS" >> "$FAKE/npm.log"',
+    'case "$*" in ci|"run typecheck"|test) ;; *) exit 1 ;; esac',
+    '[ -f "$FAKE/gate-fail" ] && [ "$(cat "$FAKE/gate-fail")" = "$*" ] && { echo "FAIL test/example.test.ts > it breaks"; exit 1; }',
+    'exit 0',
+  ].join('\n'));
   sh(join(bin, 'minions'), [
     'echo "$*" >> "$FAKE/minions.log"',
     'case "$*" in',
     '  *"config show"*) cat "$FAKE/config.json" ;;',
     '  *"settings requests"*) cat "$FAKE/requests.json" ;;',
+    '  *"upgrade --sync-only"*)',
+    '    if [ -f "$FAKE/sync-refuse" ]; then echo \'{"ok":false,"error":{"code":"PRECONDITION","message":"main has diverged from minions/main; nothing is forced"}}\'; exit 1; fi',
+    '    sh "$FAKE/sync-action" || exit 1',
+    '    echo \'{"ok":true,"data":{"ok":true,"steps":[{"id":"sync","status":"done","detail":"fast-forward"}],"sync":{"action":"fast-forward"},"stopped":null}}\' ;;',
+    '  *"upgrade --rebuild-cli"*)',
+    '    [ -f "$FAKE/upgrade-stops-runtime" ] && rm -f "$FAKE/running"',
+    '    if [ -f "$FAKE/upgrade-fail" ]; then echo \'{"ok":true,"data":{"ok":false,"steps":[{"id":"image","status":"failed","detail":"docker build failed"}],"stopped":null}}\'; exit 1; fi',
+    '    echo \'{"ok":true,"data":{"ok":true,"steps":[{"id":"cli","status":"done","detail":"reinstalled"}],"stopped":null}}\' ;;',
     '  *) echo \'{"ok":false,"error":{"code":"INTERNAL","message":"unexpected fake call"}}\'; exit 1 ;;',
     'esac',
   ].join('\n'));
@@ -62,13 +87,17 @@ function setup(): Fx {
     '  *" ps --status running -q app"*) [ -f "$FAKE/running" ] && echo c0ffee; exit 0 ;;',
     '  *"exec -T app minions status --json"*) cat "$FAKE/status.json" ;;',
     '  *"exec -T app minions settings requests mark"*) echo \'{"ok":true,"data":{}}\' ;;',
+    '  *"exec -T app minions notify enqueue"*) cat > "$FAKE/notice.txt"; echo \'{"ok":true,"data":{"created":true}}\' ;;',
+    '  "image inspect --format {{.Id}} minions-runtime:0.1.0") echo sha256:0ldimage ;;',
+    '  "tag minions-runtime:0.1.0 minions-runtime:0.1.0-prev") ;;',
     '  *) echo "unexpected fake docker call" >&2; exit 1 ;;',
     'esac',
   ].join('\n'));
+  writeFileSync(join(fake, 'sync-action'), 'mkdir -p .github/workflows && echo x >> .github/workflows/ci.yml && git add -A && git commit -qm "change the CI workflow"');
   return { base, repo, home, fake, bin };
 }
 
-const env = () => ({ ...process.env, PATH: `${fx.bin}:${process.env.PATH ?? ''}`, MINIONS_HOME: fx.home, FAKE: fx.fake });
+const env = () => ({ ...process.env, ...GIT_ENV, PATH: `${fx.bin}:${process.env.PATH ?? ''}`, MINIONS_HOME: fx.home, FAKE: fx.fake });
 const runScript = (...args: string[]) => {
   const r = spawnSync(process.execPath, [SCRIPT, '--repo', fx.repo, ...args], { encoding: 'utf8', env: env(), timeout: 60_000 });
   return { code: r.status, out: r.stdout, err: r.stderr };
@@ -123,16 +152,13 @@ describe('self-update polling', () => {
     expect(r.code, r.err).toBe(0);
     const log = dockerLog();
     expect(log).toContain(`compose -p ${COMPOSE} -f ${join(fx.home, 'projects', PROJECT_ID, 'compose.yaml')} exec -T app minions settings requests mark cr_aaaaaaaa --status confirmed`);
-    // Phase 1 applies nothing: the taken request is then released as failed with that reason.
-    expect(log).toMatch(/requests mark cr_aaaaaaaa --status failed --detail self-update: apply is not built yet/);
+    expect(log).not.toMatch(/apply is not built yet/);
     expect(log).not.toMatch(/mark cr_(cccccccc|00000000|11111111|22222222)/);
     expect(log.indexOf('minions status --json')).toBeLessThan(log.indexOf('--status confirmed'));
     expect(r.out).toContain('took request cr_aaaaaaaa');
 
-    const state = JSON.parse(readFileSync(join(stateDir(), 'state.json'), 'utf8')) as { current: unknown; badShas: unknown[] };
-    expect(state.current).toBeNull();
-    const events = readFileSync(join(stateDir(), 'log.jsonl'), 'utf8').trim().split('\n').map((l) => (JSON.parse(l) as { event: string }).event);
-    expect(events).toEqual(['started', 'taken', 'not-applied', 'stopped']);
+    expect(readState().current).toBeNull();
+    expect(events().map((e) => e.event)).toEqual(['started', 'taken', 'apply', 'marked', 'notice', 'stopped']);
     expect(statSync(join(stateDir(), 'log.jsonl')).mode & 0o777).toBe(0o600);
     expect(statSync(join(stateDir(), 'state.json')).mode & 0o777).toBe(0o600);
     expect(existsSync(join(stateDir(), 'lock'))).toBe(false);
@@ -182,7 +208,14 @@ describe('self-update polling', () => {
     expect(r.out).toContain('delivery: local');
     expect(r.out).toContain('would take request cr_aaaaaaaa');
     expect(r.out).toContain(`docker compose -p ${COMPOSE}`);
-    expect(dockerLog()).not.toMatch(/requests mark/);
+    expect(r.out).toContain('minions --json upgrade --sync-only');
+    expect(r.out).toContain('npm ci && npm run typecheck && npm test');
+    expect(r.out).toContain('docker tag minions-runtime:0.1.0 minions-runtime:0.1.0-prev');
+    expect(r.out).toContain('minions --json upgrade --rebuild-cli');
+    expect(dockerLog()).not.toMatch(/requests mark|notify|tag /);
+    expect(minionsLog()).not.toMatch(/upgrade/);
+    expect(npmLog()).not.toMatch(/^(ci|test|run typecheck)/m);
+    expect(gitIn(fx.repo, 'rev-list', '--count', 'HEAD')).toBe('1');
     expect(existsSync(stateDir())).toBe(false);
   });
 
@@ -224,6 +257,123 @@ describe('self-update lock', () => {
     expect(r.code, r.err).toBe(0);
     expect(r.out).toContain('started');
     expect(existsSync(join(stateDir(), 'lock'))).toBe(false);
+  });
+});
+
+describe('self-update apply (phase 2)', () => {
+  const marks = () => dockerLog().split('\n').filter((l) => l.includes('requests mark cr_aaaaaaaa'));
+  const gateWorktreesGone = () => {
+    expect(gitIn(fx.repo, 'worktree', 'list', '--porcelain').split('\n').filter((l) => l.startsWith('worktree '))).toHaveLength(1);
+    const gate = join(stateDir(), 'gate');
+    expect(existsSync(gate) ? readdirSync(gate) : []).toEqual([]);
+  };
+
+  it('gate passes: syncs, gates the exact synced commit, keeps the previous image, upgrades, marks applied and notifies', () => {
+    const from = gitIn(fx.repo, 'rev-parse', 'HEAD');
+    setRequests([request('cr_aaaaaaaa')]);
+    const r = runScript('--once');
+    expect(r.code, r.err).toBe(0);
+    const to = gitIn(fx.repo, 'rev-parse', 'HEAD');
+    expect(to).not.toBe(from);
+
+    // Order: sync, then the gate, then the image tag, then the rebuild.
+    expect(minionsLog()).toMatch(/--json upgrade --sync-only\n(.|\n)*--json upgrade --rebuild-cli/);
+    const gate = npmLog().split('\n').filter((l) => /^(ci|run typecheck|test) \|/.test(l));
+    expect(gate.map((l) => l.split(' |')[0])).toEqual(['ci', 'run typecheck', 'test']);
+    for (const l of gate) {
+      expect(l).toContain(`head=${to}`);
+      expect(l).toContain('workers=2');
+      expect(l).toContain(`cwd=${join(stateDir(), 'gate')}/${to.slice(0, 12)}-`);
+      expect(l).not.toContain(`home=${fx.home} `);
+    }
+    gateWorktreesGone();
+    expect(dockerLog()).toContain('tag minions-runtime:0.1.0 minions-runtime:0.1.0-prev');
+
+    expect(marks().map((l) => / --status (\w+)/.exec(l)?.[1])).toEqual(['confirmed', 'applied']);
+    expect(marks()[1]).toContain(`--detail self-update ${from.slice(0, 12)}..${to.slice(0, 12)}`);
+    expect(dockerLog()).toContain('exec -T app minions notify enqueue --key self-update:cr_aaaaaaaa --kind status --json');
+    const notice = readFileSync(join(fx.fake, 'notice.txt'), 'utf8');
+    expect(notice).toContain('Self-update applied');
+    expect(notice).toContain('change the CI workflow');
+    expect(notice).toContain('Sensitive paths touched: .github/workflows/ci.yml.');
+    expect(notice).toContain(join(stateDir(), 'log.jsonl'));
+
+    const st = readState();
+    expect(st).toMatchObject({ current: null, lastApplied: to, badShas: [] });
+    const apply = events().find((e) => e.event === 'apply')!;
+    expect(apply).toMatchObject({ request: 'cr_aaaaaaaa', from, to, outcome: 'applied', sensitive: ['.github/workflows/ci.yml'], previousImage: { tag: 'minions-runtime:0.1.0-prev', id: 'sha256:0ldimage' } });
+    expect((apply.steps as { id: string; status: string; ms: number }[]).map((s) => `${s.id}:${s.status}`))
+      .toEqual(['sync:done', 'gate-worktree:done', 'gate-ci:done', 'gate-typecheck:done', 'gate-test:done', 'previous-image:done', 'upgrade:done']);
+  });
+
+  it('gate fails: builds nothing, marks the request failed with the reason and records the SHA as bad', () => {
+    setRequests([request('cr_aaaaaaaa')]);
+    writeFileSync(join(fx.fake, 'gate-fail'), 'test');
+    const r = runScript('--once');
+    expect(r.code, r.err).toBe(0);
+    const to = gitIn(fx.repo, 'rev-parse', 'HEAD');
+    expect(minionsLog()).not.toMatch(/--rebuild-cli/);
+    expect(dockerLog()).not.toMatch(/ tag |image inspect/);
+    gateWorktreesGone();
+    expect(marks().map((l) => / --status (\w+)/.exec(l)?.[1])).toEqual(['confirmed', 'failed']);
+    expect(marks()[1]).toMatch(new RegExp(`the host gate failed at ${to.slice(0, 12)} \\(npm test failed \\(exit 1\\): FAIL test/example.test.ts`));
+    expect(marks()[1]).toMatch(/nothing was built/);
+    expect(readFileSync(join(fx.fake, 'notice.txt'), 'utf8')).toMatch(/^Self-update failed \(request cr_aaaaaaaa\): .*host gate failed/);
+    expect(readState()).toMatchObject({ current: null, lastApplied: null, badShas: [to] });
+  });
+
+  it('refused sync: builds and gates nothing and marks the request failed with the reason', () => {
+    setRequests([request('cr_aaaaaaaa')]);
+    writeFileSync(join(fx.fake, 'sync-refuse'), '');
+    const r = runScript('--once');
+    expect(r.code, r.err).toBe(0);
+    expect(npmLog()).not.toMatch(/^(ci|test|run typecheck)/m);
+    expect(minionsLog()).not.toMatch(/--rebuild-cli/);
+    expect(marks()[1]).toMatch(/--status failed --detail self-update: the sync was refused \(main has diverged from minions\/main; nothing is forced\); nothing was built/);
+    expect(readFileSync(join(fx.fake, 'notice.txt'), 'utf8')).toContain('the sync was refused');
+    expect(readState()).toMatchObject({ current: null, badShas: [] });
+  });
+
+  it('skips a SHA recorded as bad: no gate, no build, the request is marked failed', () => {
+    setSync('true'); // up to date: the target is the current HEAD
+    const head = gitIn(fx.repo, 'rev-parse', 'HEAD');
+    mkdirSync(stateDir(), { recursive: true });
+    json(join(stateDir(), 'state.json'), { version: 1, lastApplied: null, badShas: [head], current: null });
+    setRequests([request('cr_aaaaaaaa')]);
+    const r = runScript('--once');
+    expect(r.code, r.err).toBe(0);
+    expect(npmLog()).not.toMatch(/^(ci|test|run typecheck)/m);
+    expect(minionsLog()).not.toMatch(/--rebuild-cli/);
+    expect(marks()[1]).toMatch(new RegExp(`--status failed --detail self-update: ${head.slice(0, 12)} failed before and is recorded as bad; it is not tried again`));
+    expect(readState().badShas).toEqual([head]);
+  });
+
+  it('a failed upgrade is marked failed (rollback is phase 3) and the SHA is not recorded as bad', () => {
+    setRequests([request('cr_aaaaaaaa')]);
+    writeFileSync(join(fx.fake, 'upgrade-fail'), '');
+    const r = runScript('--once');
+    expect(r.code, r.err).toBe(0);
+    expect(dockerLog()).toContain('tag minions-runtime:0.1.0 minions-runtime:0.1.0-prev');
+    expect(marks()[1]).toMatch(/--status failed --detail self-update: minions upgrade --rebuild-cli failed \(failed: image \(docker build failed\)\)/);
+    expect(readState()).toMatchObject({ current: null, lastApplied: null, badShas: [] });
+  });
+
+  it('a runtime that is down after the upgrade keeps the outcome pending and marks and notifies on a later poll', () => {
+    setRequests([request('cr_aaaaaaaa')]);
+    writeFileSync(join(fx.fake, 'upgrade-stops-runtime'), '');
+    let r = runScript('--once');
+    expect(r.code, r.err).toBe(0);
+    expect(marks().map((l) => / --status (\w+)/.exec(l)?.[1])).toEqual(['confirmed']);
+    expect((readState().current as { outcome: { status: string } }).outcome.status).toBe('applied');
+    setRunning(true);
+    setRequests([]);
+    r = runScript('--once');
+    expect(r.code, r.err).toBe(0);
+    expect(marks().map((l) => / --status (\w+)/.exec(l)?.[1])).toEqual(['confirmed', 'applied']);
+    expect(dockerLog()).not.toMatch(/the script stopped/);
+    expect(readFileSync(join(fx.fake, 'notice.txt'), 'utf8')).toContain('Self-update applied');
+    expect(readState().current).toBeNull();
+    expect(minionsLog().match(/--rebuild-cli/g)).toHaveLength(1);
   });
 });
 
