@@ -43,7 +43,6 @@ export const KEY_CLASSES: readonly KeyClass[] = [
   ...entries(['intake.github'], 'live', false, '`minions sync` and coordinator startup read them per run'),
   ...entries(['intake.scope', 'intake.sources'], 'live', false, 'backlog readiness filter per call'),
   ...entries(['routine'], 'live', false, 'read by each routine pass (`minions sync --routine`) and the wrapper clock'),
-  ...entries(['routine.autoPromote'], 'live', true, 'caps on the coordinator promoting its own ideas, enforced by `backlog update|create`'),
   ...entries(['intake.github.readyLabels'], 'live', true, 'imported issues with these labels start ready without a model or the owner'),
   ...entries(['routine.enabled'], 'live', true, 'lets the runtime start coordinator sessions on its own (wakes, crash starts: model spend)'),
   ...entries(['coordinator.sessions.max'], 'live', false, 'cap read by the session supervisor before it opens a session'),

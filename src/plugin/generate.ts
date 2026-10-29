@@ -18,7 +18,6 @@ import { configuredPermissionMode } from '../runtime/coordinator.js';
 import { controlsTable } from '../runtime/controls.js';
 import { NOTIFICATION_KINDS } from '../runtime/outbox.js';
 import { routineSettings } from '../runtime/routine.js';
-import { autoPromoteSettings, NEEDS_OWNER_LABEL } from '../runtime/auto-promote.js';
 import { SMALL_LABEL } from '../backlog/ready.js';
 import { POLLER_RECOVERY_HINT } from '../telegram/isolation.js';
 import { contextResetSettings, HANDOFF_MAX_BYTES, RESET_RESTART_COMMAND } from '../runtime/context-reset.js';
@@ -293,13 +292,9 @@ function permissionModeGuidance(cfg: MinionsConfig): string {
   return `**Permission mode.** This project runs the coordinator in \`${mode}\` permission mode: commands outside the allow list ask for approval, so keep to the \`minions\` helpers and plain git.`;
 }
 
-/** Own ideas (task-68.6, unattended-delivery decision 8): runtime-capped promotion of agent-hypothesis tasks. */
-function ownIdeasRule(cfg: MinionsConfig): string {
-  const a = autoPromoteSettings(cfg);
-  const caps = a.perDay === 0
-    ? 'Auto-promotion is off in this project (`routine.autoPromote.perDay` 0): they stay `idea` until the owner says go.'
-    : `The runtime refuses \`--status ready\` on one (\`POLICY_DENIED\`, "Auto-promotion refused") beyond ${a.perDay} a day, at ${a.maxBudgetPercent}% budget or more, when the owner has been silent for more than ${a.ownerSilentDays} days, or when its parent is labelled \`${NEEDS_OWNER_LABEL}\`.`;
-  return `- **Own ideas.** Label a design task \`${NEEDS_OWNER_LABEL}\` until the owner agrees to it, and remove the label only on their yes. Tasks from your own guesses (QA findings, follow-ups, split children: provenance \`agent-hypothesis\`) start as \`idea\`. ${caps} On a refusal leave the task as \`idea\` and put it to the owner as a digest question; never change its provenance or labels to get around the caps. Pass \`--owner-approved\` only right after the owner asked for that very task (it needs an owner message in the last 30 minutes). Every auto-promotion is listed in the digest; when the owner replies "cancel <id>" set it \`cancelled\`, "hold <id>" set it back to \`idea\`. Owner requests and imported issues are not capped.`;
+/** Own ideas (task-130): the coordinator promotes its own agent-hypothesis tasks itself; no runtime caps. */
+function ownIdeasRule(): string {
+  return '- **Own ideas.** Tasks from your own guesses (QA findings, follow-ups, split children: provenance `agent-hypothesis`) start as `idea`. Move one to `ready` yourself when it is worth doing (no owner permission needed) and mention it in your normal updates.';
 }
 
 /**
@@ -429,7 +424,7 @@ function digestRule(cfg: MinionsConfig): string {
   if (!r.enabled) return '';
   return [
     `\n\n**Digest** (\`digest\` among the reasons; ${r.digestAt.join(', ')} ${r.timezone}): do it before anything else, including pending notifications.`,
-    'Run `minions notify digest --json`: it composes the text deterministically (merged and delivered, held updates, waiting for you with the exact `/approve` lines for the manager chat, blockers, auto-promotions, spend, next up, questions as numbered polls) and stores it under `key`.',
+    'Run `minions notify digest --json`: it composes the text deterministically (merged and delivered, held updates, waiting for you with the exact `/approve` lines for the manager chat, blockers, spend, next up, questions as numbered polls) and stores it under `key`.',
     'Send `text` exactly as given with one `reply` (no greeting, no rewording), then ack every key it returns: `minions notify ack <keys...> --json` (the digest key and the items it covered; items in `left` stay for the next digest; a closing "<n> more item(s): send /status" line is part of the text, send it as is). If `reply` fails, run `minions notify fail <key> --error "<reason>" --json` for the digest key only.',
     'Then handle the other reasons as below. At 100% budget the digest is the only reason a wake happens: send it and stop (claims are refused).',
   ].join(' ');
@@ -512,7 +507,7 @@ function baseVars(cfg: MinionsConfig): Record<string, string> {
     reportingGuidance: reportingGuidance(cfg),
     decisionGuidance: decisionGuidance(),
     ownerDefaults: ownerDefaults(cfg),
-    ownIdeasRule: ownIdeasRule(cfg),
+    ownIdeasRule: ownIdeasRule(),
     integrationRule: integrationRule(cfg),
     reportingRule: reportingRule(cfg),
     packageVersion: cfg.packageVersion,
