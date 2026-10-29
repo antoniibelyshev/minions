@@ -341,6 +341,15 @@ export class TelegramTransport implements ManagerTransport {
     return typeof r?.message_id === 'number' ? r.message_id : null;
   }
 
+  /**
+   * A one-off plain-text message to the owner chat, outside the poll loop (`minions manager notify`: the dev
+   * self-update script, when no coordinator comes up even after a rollback). sendMessage does not compete with the
+   * manager's getUpdates poll, so this is safe while the manager runs.
+   */
+  async notice(text: string): Promise<void> {
+    await this.send(displayText(text));
+  }
+
   /** Edits a message's text and drops its buttons. False when Telegram refused (the caller then sends a new message). */
   private async edit(messageId: number, text: string): Promise<boolean> {
     try {
