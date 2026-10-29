@@ -251,9 +251,7 @@ describe('a restart refused while workers run: Restart when idle and Drain now',
 async function makeBackup(version = '0.1.0') {
   const src = tempDir('minions-install-');
   writeFileSync(join(src, 'package.json'), JSON.stringify({ name: 'minions', version }));
-  return B.backupInstalledCli(src, version, {
-    runner: async (_c, args) => { writeFileSync(join(args[args.indexOf('--pack-destination') + 1]!, `minions-${version}.tgz`), `tgz ${version}`); return { code: 0, stdout: '', stderr: '' }; },
-  });
+  return B.backupInstalledCli(src, version);
 }
 const reinstalled: UpgradeRun = { ok: true, steps: [{ id: 'cli', status: 'done', detail: 'installed 0.1.0 != checkout 0.2.0; reinstalled (npm ...)' }, { id: 'recreate', status: 'done', detail: 'recreate' }], summary: 'complete' };
 

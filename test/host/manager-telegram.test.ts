@@ -695,3 +695,32 @@ describe('truncation never splits a surrogate pair', () => {
     expect(lines.join('\n')).toContain(EMOJI);
   });
 });
+
+// ---------------------------------------------------------------- manager notify (task-99.3)
+
+describe('sendManagerNotice (`minions manager notify`, the dev self-update script)', () => {
+  it('sends the text as one plain message to the paired owner chat', async () => {
+    const api = botApi();
+    const r = await M.sendManagerNotice('Self-update failed: no healthy coordinator\n\u001b[31mafter the rollback\n', { loadAccess: async () => ACCESS, readToken: async () => TOKEN, fetch: api.f });
+    expect(r).toEqual({ sent: true, botId: ACCESS.botId });
+    const sent = api.of('sendMessage');
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.token).toBe(TOKEN);
+    expect(sent[0]!.body).toMatchObject({ chat_id: OWNER });
+    expect(sent[0]!.body.text).toContain('Self-update failed: no healthy coordinator\n');
+    expect(sent[0]!.body.text).not.toContain('\u001b');
+    expect(sent[0]!.body.reply_markup).toBeUndefined();
+  });
+
+  it('refuses (PRECONDITION, nothing sent) when the bot is not paired, has no token, or the token is of another bot', async () => {
+    const api = botApi();
+    const cases = [
+      { loadAccess: async () => null, readToken: async () => TOKEN },
+      { loadAccess: async () => ACCESS, readToken: async () => null },
+      { loadAccess: async () => ({ ...ACCESS, botId: '111222333' }), readToken: async () => TOKEN },
+    ];
+    for (const c of cases) await expect(M.sendManagerNotice('x', { ...c, fetch: api.f })).rejects.toMatchObject({ code: 'PRECONDITION' });
+    await expect(M.sendManagerNotice('  \n', { loadAccess: async () => ACCESS, readToken: async () => TOKEN, fetch: api.f })).rejects.toMatchObject({ code: 'PRECONDITION' });
+    expect(api.calls).toHaveLength(0);
+  });
+});

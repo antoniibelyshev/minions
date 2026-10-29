@@ -360,9 +360,7 @@ describe('QA: CLI roll back names only real backups', () => {
   it('installCliBackup refuses a sha256 mismatch and a vanished backup without running npm', async () => {
     const src = tempDir('minions-install-');
     writeFileSync(join(src, 'package.json'), JSON.stringify({ name: 'minions', version: '0.1.0' }));
-    const b = await B.backupInstalledCli(src, '0.1.0', {
-      runner: async (_c, args) => { writeFileSync(join(args[args.indexOf('--pack-destination') + 1]!, 'minions-0.1.0.tgz'), 'tgz'); return { code: 0, stdout: '', stderr: '' }; },
-    });
+    const b = await B.backupInstalledCli(src, '0.1.0');
     const npm: string[][] = [];
     const runner = async (c: string, a: string[]) => { npm.push([c, ...a]); return { code: 0, stdout: '', stderr: '' }; };
     const e = await reason(B.installCliBackup(b.name, '0'.repeat(64), { runner }));
@@ -375,9 +373,8 @@ describe('QA: CLI roll back names only real backups', () => {
 
   it('a version that is not a safe name is stored as "unknown"', async () => {
     const src = tempDir('minions-install-');
-    const b = await B.backupInstalledCli(src, '../../x', {
-      runner: async (_c, args) => { writeFileSync(join(args[args.indexOf('--pack-destination') + 1]!, 'x.tgz'), 'tgz'); return { code: 0, stdout: '', stderr: '' }; },
-    });
+    writeFileSync(join(src, 'package.json'), JSON.stringify({ name: 'minions', version: '0.1.0' }));
+    const b = await B.backupInstalledCli(src, '../../x');
     expect(b.version).toBe('unknown');
     expect(b.file.startsWith(B.cliBackupDir())).toBe(true);
   });
