@@ -119,32 +119,127 @@ export function protectedStatePath(path: string, cwd: string, g: StateGuard, opt
 
 /** Where a path written in a command line starts or ends. */
 const PATH_END = /[\s'"`;|&<>(){}$\\,=:]/;
+/** The same inside one shell word (quotes and escapes already removed): a space there is part of the path. */
+const WORD_END = /[\n'"`;|&<>(){}$\\,=:]/;
+/** How deep quoted words are unquoted again (`bash -c '… "a b" …'`). */
+const MAX_UNQUOTE = 4;
 
 /**
- * The first reference to the protected state in a Bash command line, or null: a word holding the state dir
- * (configured or resolved) that names an absolute path (`/state`, `//state`, `/tmp/../state`, `~/…` expanded) inside
- * it but not inside an exempt subtree (the host runtime's scratch dir and caches, unless a symlink or hardlink there
- * leads back into the state), or an expansion of MINIONS_STATE_DIR. Raw text, deliberately: a quoted path is still
- * a path to `sqlite3` or `node -e`. A mention as plain text (a commit message, a grep pattern, a heredoc) matches
- * too; workers pass such text through a file (`git commit -F`) or use the Grep/Write tools instead. The pre-bash
- * hook drops the heredoc bodies of `minions work submit` before this check (data for minions, not a command).
+ * The words of a command line as the shell would see them, roughly: unquoted whitespace splits, `'…'` and `"…"`
+ * (with `\` before `$`, `` ` ``, `"`, `\` and a newline) and backslash escapes are removed, everything else stays
+ * literal (operators, expansions, a quote left open runs to the end). No parser: just enough that a path with a
+ * space in it, quoted (`"/a b/state"`), partly quoted (`"/a b"/state`) or escaped (`/a\ b/state`), is one word.
  */
-export function bashStateReference(command: string, g: StateGuard, home: string = homedir()): string | null {
-  if (/\$\{?MINIONS_STATE_DIR\b/.test(command)) return '$MINIONS_STATE_DIR';
+function shellWords(command: string): string[] {
+  const words: string[] = [];
+  let word = '';
+  let inWord = false;
+  for (let i = 0; i < command.length; i++) {
+    const c = command[i]!;
+    if (c === '\\') { inWord = true; if (command[i + 1] !== '\n') word += command[i + 1] ?? ''; i++; continue; }
+    if (c === "'") {
+      inWord = true;
+      const close = command.indexOf("'", i + 1);
+      word += command.slice(i + 1, close < 0 ? undefined : close);
+      i = close < 0 ? command.length : close;
+      continue;
+    }
+    if (c === '"') {
+      inWord = true;
+      for (i++; i < command.length && command[i] !== '"'; i++) {
+        const d = command[i]!;
+        const n = command[i + 1];
+        if (d === '\\' && n === '\n') i++;
+        else if (d === '\\' && n !== undefined && '$`"\\'.includes(n)) word += command[++i]!;
+        else word += d;
+      }
+      continue;
+    }
+    if (/\s/.test(c)) { if (inWord) words.push(word); word = ''; inWord = false; continue; }
+    word += c;
+    inWord = true;
+  }
+  if (inWord) words.push(word);
+  return words;
+}
+
+/** `$HOME` and `${HOME}` expanded. */
+const expandHome = (text: string, home: string) => text.replace(/\$\{HOME\}|\$HOME(?![A-Za-z0-9_])/g, home);
+
+/**
+ * The first reference to the protected state in `text` (the command line, or one of its words with `end` = WORD_END),
+ * or null. Two scans, both through protectedLexical (exempt subtrees, links back into the state):
+ * - every path-like stretch around the last segment of a root (`/state`), as written: catches `//state`,
+ *   `/tmp/../state` and `~/…`;
+ * - every occurrence of a whole root, as written and with its spaces backslash-escaped, extended to the end of the
+ *   path: catches a root with a space in it (`…/Application Support/…/state`), which the first scan cuts apart.
+ */
+function referenceIn(text: string, g: StateGuard, home: string, end: RegExp): string | null {
+  const pathEnd = (from: number) => {
+    let stop = from;
+    while (stop < text.length && !end.test(text[stop]!)) stop++;
+    return stop;
+  };
   for (const root of g.roots) {
-    if (root === '/') return '/';
-    // The root as written, and its last segment (`~/x/state`, `/tmp/../state` hold no full root).
     const needle = `/${posix.basename(root)}`;
-    for (let at = command.indexOf(needle); at >= 0; at = command.indexOf(needle, at + 1)) {
+    for (let at = text.indexOf(needle); at >= 0; at = text.indexOf(needle, at + 1)) {
       let start = at;
-      while (start > 0 && !PATH_END.test(command[start - 1]!)) start--;
-      let end = at + needle.length;
-      while (end < command.length && !PATH_END.test(command[end]!)) end++;
-      let written = command.slice(start, end);
+      while (start > 0 && !end.test(text[start - 1]!)) start--;
+      const stop = pathEnd(at + needle.length);
+      let written = text.slice(start, stop);
       if (written === '~' || written.startsWith('~/')) written = home + written.slice(1);
       if (!written.startsWith('/')) continue;
-      if (protectedLexical(strip(posix.normalize(written)), g)) return command.slice(start, end);
+      if (protectedLexical(strip(posix.normalize(written)), g)) return text.slice(start, stop);
     }
+  }
+  for (const root of g.roots) {
+    for (const spelled of new Set([root, root.replace(/(\s)/g, '\\$1')])) {
+      for (let at = text.indexOf(spelled); at >= 0; at = text.indexOf(spelled, at + 1)) {
+        const before = text[at - 1];
+        // Inside another path (`/x/<root>`) it names another dir; after `/` (`//<root>`) it is still the root.
+        if (before !== undefined && before !== '/' && !end.test(before) && !/\s/.test(before)) continue;
+        const after = text[at + spelled.length];
+        if (after !== undefined && after !== '/' && !end.test(after) && !/\s/.test(after)) continue;
+        const stop = pathEnd(at + spelled.length);
+        if (protectedLexical(strip(posix.normalize(root + text.slice(at + spelled.length, stop))), g)) return text.slice(at, stop);
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * The first reference to the protected state in a Bash command line, or null: a path holding the state dir
+ * (configured or resolved) that names an absolute path (`/state`, `//state`, `/tmp/../state`, `~/…` or `$HOME/…`
+ * expanded) inside it but not inside an exempt subtree (the host runtime's scratch dir and caches, unless a symlink
+ * or hardlink there leads back into the state), or an expansion of MINIONS_STATE_DIR or MINIONS_SECRETS_DIR. The
+ * path counts as written in the raw text and in every shell word (shellWords, again inside quoted words), so a state
+ * dir with a space in it (task-114: `~/Library/Application Support/…` on every macOS host) is caught quoted, partly
+ * quoted or backslash-escaped. Raw text, deliberately: a quoted path is still a path to `sqlite3` or `node -e`. A
+ * mention as plain text (a commit message, a grep pattern, a heredoc) matches too; workers pass such text through a
+ * file (`git commit -F`) or use the Grep/Write tools instead. The pre-bash hook drops the heredoc bodies of
+ * `minions work submit` before this check (data for minions, not a command).
+ */
+export function bashStateReference(command: string, g: StateGuard, home: string = homedir()): string | null {
+  const env = /\$\{?(MINIONS_STATE_DIR|MINIONS_SECRETS_DIR)\b/.exec(command);
+  if (env) return `$${env[1]}`;
+  if (g.roots.includes('/')) return '/';
+  const hit = referenceIn(expandHome(command, home), g, home, PATH_END);
+  if (hit) return hit;
+  const seen = new Set<string>();
+  let level = [command];
+  for (let depth = 0; depth < MAX_UNQUOTE && level.length > 0; depth++) {
+    const next: string[] = [];
+    for (const text of level) {
+      for (const w of shellWords(text)) {
+        if (seen.has(w)) continue;
+        seen.add(w);
+        const found = referenceIn(expandHome(w, home), g, home, WORD_END);
+        if (found) return found;
+        if (/['"\\]/.test(w)) next.push(w);
+      }
+    }
+    level = next;
   }
   return null;
 }

@@ -228,12 +228,12 @@ export function preTelegramHook(input: unknown): HookOutput {
  * `"agent_type":"minions:<role>"` alone does not count) or names the entry script (`cli.js`); the coordinator's
  * own calls never reach it. Task-72 adds `/state` (the container state dir, and the last segment of the host
  * runtime's) and `MINIONS_STATE_DIR`, for the runtime-state check; task-96 adds `/secrets` (the mounted secrets dir,
- * protected the same way: stateGuard's secretsDir). These are speed filters only: any plain command
+ * protected the same way: stateGuard's secretsDir), task-114 `MINIONS_SECRETS_DIR`. These are speed filters only: any plain command
  * that runs minions or names the state dir contains such a match (a name split by quotes or backslashes does not;
  * like variables, that is out of reach of a text check). Reading stdin, a grep error and every failure of minions
  * itself block (exit 2).
  */
-export const PRE_BASH_HOOK_COMMAND = `i=$(cat) || exit 2; case "$i" in *'"agent_id"'*) printf '%s' "$i" | grep -Eq 'minions[^:]|cli\\.[cm]?js|/state|/secrets|MINIONS_STATE_DIR'; m=$?; [ "$m" = 1 ] && exit 0; [ "$m" = 0 ] || exit 2; printf '%s' "$i" | ${hangGuarded('minions hook pre-bash')} || exit 2;; esac`;
+export const PRE_BASH_HOOK_COMMAND = `i=$(cat) || exit 2; case "$i" in *'"agent_id"'*) printf '%s' "$i" | grep -Eq 'minions[^:]|cli\\.[cm]?js|/state|/secrets|MINIONS_STATE_DIR|MINIONS_SECRETS_DIR'; m=$?; [ "$m" = 1 ] && exit 0; [ "$m" = 0 ] || exit 2; printf '%s' "$i" | ${hangGuarded('minions hook pre-bash')} || exit 2;; esac`;
 
 /** The verbs a Claude subagent must never run: they start, claim or end worker leases, or run the local integrator (coordinator-only). */
 export const COORDINATOR_ONLY_WORK_VERBS = ['run', 'claim', 'advance', 'release', 'integrate'] as const;
