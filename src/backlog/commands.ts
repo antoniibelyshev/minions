@@ -106,6 +106,7 @@ function detail(t: Task): string {
     `branch: ${t.branch ?? '-'}  provenance: ${t.provenance}  workflow: ${t.workflow ?? 'default'}`, `version: ${t.version}`];
   if (t.description) out.push('', t.description);
   if (t.acceptanceCriteria.length) out.push('', ...t.acceptanceCriteria.map((a, i) => `[${a.done ? 'x' : ' '}] #${i + 1} ${a.text}`));
+  if (t.notes) out.push('', 'notes:', t.notes);
   return out.join('\n');
 }
 
@@ -169,7 +170,7 @@ export function register(program: Command): void {
       emit({ tasks: projectTasks(tasks, fields) }, { json: globalOpts(cmd).json, human: () => lines(tasks) });
     }));
 
-  bl.command('show <id>').description('Show one task')
+  bl.command('show <id>').description('Show one task, with its notes (the most recent ~8 KB)')
     .action(action(async (id: string, _opts: unknown, cmd: Command) => {
       requireMode('runtime');
       const { backlog } = await open();

@@ -163,7 +163,25 @@ function mapPriority(p: string | null | undefined): Task['priority'] {
   return v === 'high' || v === 'medium' || v === 'low' ? v : null;
 }
 
-export function toTask(raw: RawTask, opts: { startReady?: boolean; provenanceFallback?: ProvenanceFallback } = {}): Task {
+/** Upper bound (characters) of `Task.notes`; older notes beyond it are cut with a marker. */
+export const NOTES_MAX_CHARS = 8000;
+
+/**
+ * Keeps the most recent `max` characters of the notes (Backlog.md appends each note at the end, separated by a
+ * blank line, so the tail is the newest). The cut moves forward to a line start when one is close, and a
+ * marker line says how much was left out. Empty or missing notes are null.
+ */
+export function boundNotes(text: unknown, max = NOTES_MAX_CHARS): string | null {
+  if (typeof text !== 'string' || !text.trim()) return null;
+  const t = text.trim();
+  if (t.length <= max) return t;
+  let start = t.length - max;
+  const nl = t.indexOf('\n', start);
+  if (nl !== -1 && nl - start < 200) start = nl + 1;
+  return `[... ${start} earlier characters of notes omitted ...]\n${t.slice(start)}`;
+}
+
+export function toTask(raw: RawTask, opts: { startReady?: boolean; provenanceFallback?: ProvenanceFallback; notes?: boolean } = {}): Task {
   const { user, meta } = parseDescription(raw.description);
   const id = normalizeId(raw.id);
   let provenance: Provenance;
@@ -199,6 +217,7 @@ export function toTask(raw: RawTask, opts: { startReady?: boolean; provenanceFal
     version: taskVersion(raw),
     milestone: raw.milestone ?? null,
     ...(typeof meta.workflow === 'string' && meta.workflow ? { workflow: meta.workflow } : {}),
+    ...(opts.notes ? { notes: boundNotes(raw.implementationNotes) } : {}),
   };
 }
 
@@ -322,7 +341,7 @@ export class BacklogMdAdapter implements BacklogAdapter {
     return out;
   }
 
-  private task(raw: RawTask): Task { return toTask(raw, { startReady: this.startReady, provenanceFallback: this.provenanceFallback }); }
+  private task(raw: RawTask, notes = false): Task { return toTask(raw, { startReady: this.startReady, provenanceFallback: this.provenanceFallback, notes }); }
 
   /** Views ids with bounded concurrency; failed lookups are undefined when tolerant. */
   private async viewMany(ids: string[], tolerant: boolean): Promise<(RawTask | undefined)[]> {
@@ -360,8 +379,9 @@ export class BacklogMdAdapter implements BacklogAdapter {
     return filterReady(viewed, { leased: new Set([...leasedIds].map(normalizeId)), scope, lookup: (id) => summary.get(id) }, limit);
   }
 
+  /** One task, with its bounded notes (listings leave notes out). */
   async getTask(id: string): Promise<Task> {
-    return this.task(await this.viewRaw(id));
+    return this.task(await this.viewRaw(id), true);
   }
 
   async createTask(input: CreateTaskInput): Promise<{ task: Task; created: boolean }> {

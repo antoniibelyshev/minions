@@ -73,7 +73,8 @@ describe.skipIf(!hasCli)('plain-scalar allowlist vs task view (real CLI)', { tim
     // Fallback tasks were already viewed by the fast listing; only the accepted ones need a task view to compare.
     const slow = new BacklogMdAdapter({ root, idempotency: new MemoryIdempotencyStore(), readFiles: false });
     const listedIds = new Set(fastTasks.map((t) => t.id));
-    for (const c of cases) if (c.fast && listedIds.has(c.id)) slowTasks.push(await slow.getTask(c.id));
+    // getTask also carries the notes (task-98); listings never do, so compare without them.
+    for (const c of cases) if (c.fast && listedIds.has(c.id)) { const { notes: _n, ...t } = await slow.getTask(c.id); slowTasks.push(t); }
   }, 180_000);
   afterAll(() => rmSync(root, { recursive: true, force: true }));
 

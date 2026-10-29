@@ -16,6 +16,12 @@ export interface Task {
   milestone?: string | null; // backend milestone, used by intake.scope.milestone
   /** Named workflow (config `workflows`) from the minions meta block; absent = the default workflow. */
   workflow?: string;
+  /**
+   * The task's implementation notes (`backlog note`, appended in order, oldest first), bounded to the most
+   * recent NOTES_MAX_CHARS with a truncation marker; null when there are none. Only single-task reads
+   * (`getTask`, so `backlog show` and the work brief) load it; listings and exports leave it out to stay small.
+   */
+  notes?: string | null;
 }
 
 export interface CreateTaskInput {

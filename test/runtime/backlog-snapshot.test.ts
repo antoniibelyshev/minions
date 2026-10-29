@@ -83,6 +83,14 @@ describe('work claim backlog reads', () => {
     expect(s.getTask.mock.calls.map((c) => c[0])).not.toContain('task-2');
   });
 
+  it('puts the task notes into the brief (task-98), and leaves the field out without notes', async () => {
+    const env = makeEnv((c) => { c.execution.maxActiveTasks = 5; });
+    env.backlog.add({ id: 'task-1', notes: 'spike: use the fast path' });
+    env.backlog.add({ id: 'task-2', notes: null });
+    expect((await env.sched.claim('task-1', 'engineer')).task.notes).toBe('spike: use the fast path');
+    expect('notes' in (await env.sched.claim('task-2', 'engineer')).task).toBe(false);
+  });
+
   it('lists once for a task without dependencies', async () => {
     const env = makeEnv();
     env.backlog.add({ id: 'task-1' });
