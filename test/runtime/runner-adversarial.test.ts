@@ -14,6 +14,7 @@ import { readRunRecord } from '../../src/runtime/runner/record.js';
 import { runLease, type RunnerDeps } from '../../src/runtime/runner/run.js';
 import { Scheduler, type TaskBrief } from '../../src/runtime/scheduler.js';
 import { commitFile, gitSync, makeDefaultEnv, type Env } from './fixtures.js';
+import { HAS_PROCFS } from '../helpers.js';
 
 const SCRIPT = resolve(__dirname, '..', 'fixtures', 'fake-harness.mjs');
 const CODEX = { models: { default: 'gpt-6.1-sol', allowed: ['gpt-6.1-sol'] }, timeoutMinutes: 5 };
@@ -80,7 +81,7 @@ function nothingFetched(x: Awaited<ReturnType<typeof attacked>>, pattern: RegExp
   expect(gitSync(x.b.worktree, 'rev-parse', 'HEAD')).toBe(x.b.expectedHead);
 }
 
-describe('tester: the whole .git tree is checked, not only hooks', () => {
+describe.skipIf(!HAS_PROCFS)('tester: the whole .git tree is checked, not only hooks', () => {
   it('a symlinked objects fan-out directory into a "state" dir', async () => {
     const x = await attacked(({ stateDir }) => `echo a > a.txt && git add a.txt && git commit -qm a && ln -s ${stateDir} .git/objects/zz`);
     nothingFetched(x, /symlink in the git dir: .*objects\/zz/);
@@ -99,7 +100,7 @@ describe('tester: the whole .git tree is checked, not only hooks', () => {
   });
 });
 
-describe('tester: forged history never fetches', () => {
+describe.skipIf(!HAS_PROCFS)('tester: forged history never fetches', () => {
   it('a replace ref (git replace --graft) faking the claim head as parent of an orphan commit', async () => {
     const x = await attacked('T=$(git write-tree) && C=$(git commit-tree $T -m orphan) && git replace --graft $C $CLAIM && git update-ref refs/heads/$BRANCH $C');
     nothingFetched(x, /not a fast-forward/);
@@ -128,7 +129,7 @@ describe('tester: forged history never fetches', () => {
   });
 });
 
-describe('tester: no secrets in argv', () => {
+describe.skipIf(!HAS_PROCFS)('tester: no secrets in argv', () => {
   it('neither the worker nor any runner git call carries the secret in argv; it lands in no state, scratch or git file', async () => {
     const r = rig();
     const b = await claim(r);
@@ -171,7 +172,7 @@ describe('tester: no secrets in argv', () => {
   });
 });
 
-describe('tester: stopping leaves no process behind', { timeout: 30_000 }, () => {
+describe.skipIf(!HAS_PROCFS)('tester: stopping leaves no process behind', { timeout: 30_000 }, () => {
   it('timeout: a worker ignoring SIGTERM and its (same-group) grandchild are both gone', async () => {
     const r = rig();
     const b = await claim(r);
@@ -214,7 +215,7 @@ describe('tester: stopping leaves no process behind', { timeout: 30_000 }, () =>
   });
 });
 
-describe('tester: the shared side', () => {
+describe.skipIf(!HAS_PROCFS)('tester: the shared side', () => {
   it('the lease branch moved in the shared repository during the run: nothing is fetched and the other commit stays', async () => {
     const r = rig();
     const b = await claim(r);
@@ -264,7 +265,7 @@ describe('tester: the shared side', () => {
   });
 });
 
-describe('tester: hard links in the git dirs the runner rewrites', () => {
+describe.skipIf(!HAS_PROCFS)('tester: hard links in the git dirs the runner rewrites', () => {
   // Regression (task-14.4 QA): a hard link passes lstat as a regular file. The runner refuses nlink > 1 in the clone
   // .git walk and on the lease git files, and writeNoFollow (repo.ts) replaces files by rename, so it never writes
   // through a link even if a check is missed. Under L1 the link into /state is also denied (Landlock REFER).
@@ -293,7 +294,7 @@ describe('tester: hard links in the git dirs the runner rewrites', () => {
   });
 });
 
-describe('engineer: hard-link refusal and link-safe rewrites (task-14.4 repair)', () => {
+describe.skipIf(!HAS_PROCFS)('engineer: hard-link refusal and link-safe rewrites (task-14.4 repair)', () => {
   it('reports a hard link anywhere in the clone .git tree as a violation and fetches nothing', async () => {
     const r = rig();
     const b = await claim(r);
