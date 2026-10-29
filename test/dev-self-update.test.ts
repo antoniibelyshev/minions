@@ -925,6 +925,7 @@ describe('self-update trigger (phase 4)', () => {
   it('CLAUDE.md asks the coordinator for an upgrade --from-container request after meaningful merges only', () => {
     expect(claudeMd).toMatch(/minions upgrade --from-container --reason "[^"]+" --json/);
     expect(claudeMd).toMatch(/After an `integrated` notice/); // task-82.5: the trigger is the local integrator's landing
+    expect(claudeMd).toMatch(/git diff --name-only <main before>\.\.main/); // task-82.5: the check for meaningful changes
     expect(claudeMd).toMatch(/without waiting to be asked/);
     for (const p of ['src/**', 'templates/**', 'docker/**', 'package.json']) expect(claudeMd).toContain(`\`${p}\``);
     expect(claudeMd).toMatch(/Not meaningful on its own: `docs\/\*\*`, `test\/\*\*`/);

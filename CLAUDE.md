@@ -6,9 +6,8 @@ For the coordinator of the minions project only (workers ignore this section). D
 [docs/design/coordinator-self-update.md](docs/design/coordinator-self-update.md), Decision 2 (owner, TG 465), and
 [docs/design/local-auto-integration.md](docs/design/local-auto-integration.md), Decision 4.
 
-After an `integrated` notice (the local integrator landed a task on `main`; the task is `done` and the event lists
-the changed `paths`), decide whether the landed range is **meaningful**: it touches runtime, CLI or plugin code.
-Check the event's paths or `git diff --name-only <main before>..main`. While local integration is off here and you
+After an `integrated` notice (the local integrator landed a task on `main` and the task is `done`), decide whether the landed range is **meaningful**: it touches runtime, CLI or plugin code.
+Check with `git diff --name-only <main before>..main`. While local integration is off here and you
 merge by hand, apply the same rule after your merge.
 
 - Meaningful: `src/**`, `templates/**` (plugin, coordinator and assistant prompts), `docker/**`, `schema/**`,
