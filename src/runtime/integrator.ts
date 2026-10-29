@@ -239,7 +239,7 @@ async function isWorktreeOf(repo: string, dir: string): Promise<boolean> {
 }
 
 /** (Re)creates the detached integration worktree when needed, then resets it to exactly `candidate`. */
-export async function prepareIntegrationWorktree(repo: string, dir: string, candidate: string): Promise<{ ok: true } | { ok: false; message: string }> {
+export async function prepareIntegrationWorktree(repo: string, dir: string, candidate: string): Promise<{ ok: true; recreated: boolean } | { ok: false; message: string }> {
   return withEmptyHome(async (home) => {
     const reset = async (): Promise<string | null> => {
       const co = await checkoutGit(dir, ['checkout', '--detach', '--force', '--quiet', candidate], home);
@@ -251,14 +251,14 @@ export async function prepareIntegrationWorktree(repo: string, dir: string, cand
     };
     let problem: string | null = 'missing';
     if (await isWorktreeOf(repo, dir)) problem = await reset();
-    if (!problem) return { ok: true };
+    if (!problem) return { ok: true, recreated: false };
     // Missing or broken: recreate it once.
     await rm(dir, { recursive: true, force: true });
     await allowlistedGit(repo, ['worktree', 'prune'], true, { home });
     const add = await allowlistedGit(repo, [...ADD_CONFIG, 'worktree', 'add', '--detach', '--no-checkout', '--force', dir, candidate], true, { home });
     if (add.code !== 0) return { ok: false, message: `git worktree add ${dir} failed: ${add.stderr.trim().slice(-400) || `exit ${add.code}`}` };
     const again = await reset();
-    return again ? { ok: false, message: again } : { ok: true };
+    return again ? { ok: false, message: again } : { ok: true, recreated: true };
   });
 }
 
@@ -294,6 +294,9 @@ export async function runVerification(i: VerifyInput): Promise<VerifyResult> {
     log.write(`# ${new Date().toISOString()} integration of ${i.candidate}\n`);
     const prep = await prepareIntegrationWorktree(i.repo, i.dir, i.candidate);
     if (!prep.ok) return { state: 'transient', detail: `the integration worktree could not be prepared: ${prep.message}` };
+    // The setup marker describes the worktree it was made in: a recreated worktree (node_modules gone) runs setup again.
+    const hashFile = join(i.runDir, 'setup-hash');
+    if (prep.recreated) await rm(hashFile, { force: true });
     for (const sub of ['home', 'minions-home', 'tmp']) {
       await rm(join(i.runDir, sub), { recursive: true, force: true });
       await mkdir(join(i.runDir, sub), { recursive: true });
@@ -301,7 +304,6 @@ export async function runVerification(i: VerifyInput): Promise<VerifyResult> {
     const tail: string[] = [];
     const minutes = `${Math.round(i.timeoutMs / 60_000 * 10) / 10} min`;
     if (i.setupCommands.length) {
-      const hashFile = join(i.runDir, 'setup-hash');
       const hash = setupHash(i.dir, i.setupCommands);
       const done = await readFile(hashFile, 'utf8').then((s) => s.trim(), () => '');
       if (done !== hash) {
@@ -529,8 +531,15 @@ export async function runIntegrator(d: IntegratorDeps): Promise<IntegratorReport
       B, now().toISOString(), logPath, queued.id);
     let row = getRow(d.db, queued.id);
     event('integration-started', row, { base: B, attempt: row.attempt });
+    /** A stop (signal, drain, lost lock) in any phase: back to queued without an attempt; main is untouched. */
+    const stopped = (where: string): IntegratorExit => {
+      requeue(row, 'stopped', `stopped ${where}`, true);
+      return d.signal?.aborted ? 'stopped' : d.db.drain() ? 'draining' : 'lock-lost';
+    };
 
     const cand = await integrationCandidate(d.repo, { base: B, head: row.head_sha, branch: row.branch, taskId: row.task_id, identity: cfg.git.identity }, d.signal ? { signal: d.signal } : {});
+    // An abort kills the merge's git children, so a non-clean result then says nothing about the task.
+    if (cand.state !== 'clean' && stopRequested()) return stopped('during the merge');
     if (cand.state === 'already-merged') { await settle(row, 'landed', `${row.head_sha} is already contained in ${branch} (${B})`); return null; }
     if (cand.state === 'conflict') { await settle(row, 'conflict', `merging ${row.head_sha} into ${branch} (${B}) conflicts in: ${cand.files.join(', ')}`); return null; }
     if (cand.state === 'refused') { await settle(row, 'refused', cand.message); return null; }
@@ -539,7 +548,8 @@ export async function runIntegrator(d: IntegratorDeps): Promise<IntegratorReport
     d.db.exec('UPDATE integrations SET candidate_sha = ? WHERE id = ?', C, row.id);
     row = getRow(d.db, row.id);
 
-    const paths = await integrationChangedPaths(d.repo, B, C, cfg.sensitivePaths);
+    const paths = await integrationChangedPaths(d.repo, B, C, cfg.sensitivePaths, d.signal ? { signal: d.signal } : {});
+    if (!paths.ok && stopRequested()) return stopped('during the changed-paths check');
     if (!paths.ok) { await transient(row, paths.message); return null; }
     if (paths.sensitive.length && !(await (d.approved?.(row, paths.sensitive) ?? false))) {
       await settle(row, 'awaiting-approval', `sensitive paths need a signed merge approval of ${row.head_sha}: ${paths.sensitive.join(', ')}`);
@@ -547,10 +557,11 @@ export async function runIntegrator(d: IntegratorDeps): Promise<IntegratorReport
     }
     const landedBefore = d.db.all<{ candidate_sha: string }>("SELECT candidate_sha FROM integrations WHERE task_id = ? AND phase = 'landed' AND candidate_sha IS NOT NULL AND id <> ?", row.task_id, row.id).map((x) => x.candidate_sha);
     const rev = await revertOfRevertCheck(d.repo, { base: B, head: row.head_sha, landed: landedBefore });
+    if (rev.state !== 'ok' && stopRequested()) return stopped('during the revert check');
     if (rev.state === 'refused') { await settle(row, 'refused', rev.message); return null; }
     if (rev.state === 'error') { await transient(row, rev.message); return null; }
 
-    if (stopRequested()) { requeue(row, 'stopped', 'stopped before the verification', true); return d.signal?.aborted ? 'stopped' : d.db.drain() ? 'draining' : 'lock-lost'; }
+    if (stopRequested()) return stopped('before the verification');
     d.db.exec("UPDATE integrations SET phase = 'verifying' WHERE id = ?", row.id);
     row = getRow(d.db, row.id);
     const timeoutMs = d.timing?.commandTimeoutMs ?? (cfg.delivery.integrationTimeoutMinutes ?? DEFAULT_INTEGRATION_TIMEOUT_MINUTES) * 60_000;
@@ -565,10 +576,9 @@ export async function runIntegrator(d: IntegratorDeps): Promise<IntegratorReport
       },
     });
     d.db.exec('UPDATE integrations SET verify_pid = NULL, verify_start = NULL, verify_boot = NULL WHERE id = ?', row.id);
-    if (v.state === 'stopped') {
-      requeue(row, 'stopped', 'the verification was stopped (drain or stop)', true);
-      return d.signal?.aborted ? 'stopped' : d.db.drain() ? 'draining' : 'lock-lost';
-    }
+    if (v.state === 'stopped') return stopped('during the setup or verification');
+    // A command killed by the stop may exit before the poll notices it: never count that as red or transient.
+    if (v.state !== 'passed' && stopRequested()) return stopped('during the setup or verification');
     if (v.state === 'red') { await settle(row, 'red', v.detail); return null; }
     if (v.state === 'transient') { await transient(row, v.detail); return null; }
 

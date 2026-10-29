@@ -1,7 +1,7 @@
 // Local integrator (task-82.2, docs/design/local-auto-integration.md phase 2): queue, lock, verify runner and
 // recovery, on temp repositories with fake verification commands (never the workspace checkout, never npm test).
 import { spawn } from 'node:child_process';
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import type { MinionsConfig } from '../../src/config/schema.js';
@@ -136,6 +136,19 @@ describe('runIntegrator: landing and the verify runner', () => {
     expect(rowOf(s.db, 'task-4').detail).toMatch(/setup command `exit 1` failed/);
   });
 
+  it('a recreated integration worktree runs setupCommands again (the setup marker belongs to the worktree)', async () => {
+    const counter = join(tmp('minions-integrator-count-'), 'count');
+    const s = setup({ setupCommands: [`mkdir -p node_modules && touch node_modules/installed && echo x >> ${counter}`], commands: ['test -f node_modules/installed'] });
+    s.queue('task-1');
+    await runIntegrator(s.deps);
+    expect(rowOf(s.db, 'task-1').phase).toBe('landed');
+    rmSync(s.deps.integrationDir, { recursive: true, force: true });
+    s.queue('task-2');
+    await runIntegrator(s.deps);
+    expect(rowOf(s.db, 'task-2').phase).toBe('landed');
+    expect(readFileSync(counter, 'utf8')).toBe('x\nx\n');
+  });
+
   it('sensitive paths wait for a signed approval; with one they land', async () => {
     const s = setup();
     const H = s.queue('task-1', { '.minions/config.json': '{}\n' });
@@ -226,6 +239,52 @@ describe('runIntegrator: lock, pause, drain and halt', () => {
     expect(await isAlive({ pid: pid!, startTime: start! })).toBe(false);
     expect(mainOf(s.repo)).toBe(s.B);
     expect(integrationLock(s.db)).toBeNull();
+  });
+
+  const stopCases = [
+    { phase: 'merge', commands: ['true'], setupCommands: [] as string[] },
+    { phase: 'setup', commands: ['true'], setupCommands: ['sleep 30 & sleep 30; wait'] },
+    { phase: 'verification', commands: ['sleep 30 & sleep 30; wait'], setupCommands: [] as string[] },
+  ];
+  for (const c of stopCases) {
+    it(`a stop signal (SIGTERM) during the ${c.phase} re-queues without an attempt and leaves main untouched`, async () => {
+      const s = setup({ commands: c.commands, setupCommands: c.setupCommands });
+      s.queue('task-1');
+      const ac = new AbortController();
+      s.deps.signal = ac.signal;
+      // The merge step: abort right after the loop picked the row, so the candidate's git runs see an aborted signal.
+      if (c.phase === 'merge') s.deps.unmetDependencies = () => { ac.abort(); return []; };
+      const run = runIntegrator(s.deps);
+      if (c.phase !== 'merge') {
+        await waitFor(() => !!rowOf(s.db, 'task-1').verify_pid);
+        ac.abort();
+      }
+      const r = await run;
+      expect(r.exit).toBe('stopped');
+      expect(r.settled).toEqual([]);
+      expect(rowOf(s.db, 'task-1')).toMatchObject({ phase: 'queued', attempt: 0, outcome: 'stopped', verify_pid: null, candidate_sha: null });
+      expect(s.db.events('task-1', 'integration-requeued').map((e) => e.data)).toEqual([expect.objectContaining({ outcome: 'stopped', counted: false })]);
+      expect(mainOf(s.repo)).toBe(s.B);
+      expect(integrationLock(s.db)).toBeNull();
+    });
+  }
+
+  it('adopts a fast-forward of main made outside the integrator', async () => {
+    const s = setup();
+    s.queue('task-1');
+    await runIntegrator(s.deps);
+    const C1 = mainOf(s.repo);
+    expect(s.db.getMeta(INTEGRATION_BASE_META)).toBe(C1);
+    const outside = commit(s.repo, 'outside.txt', 'by hand\n', 'a commit on main outside the integrator');
+    s.queue('task-2');
+    const r = await runIntegrator(s.deps);
+    expect(r.exit).toBe('empty');
+    expect(integrationHalt(s.db)).toBeNull();
+    expect(s.db.eventsOfKindSince('integration-base-adopted', '').map((e) => e.data)).toContainEqual({ from: C1, to: outside });
+    expect(rowOf(s.db, 'task-2')).toMatchObject({ phase: 'landed', base_sha: outside });
+    const C2 = mainOf(s.repo);
+    expect(gitSync(s.repo, 'rev-list', '--parents', '-n', '1', C2).split(' ')[1]).toBe(outside);
+    expect(s.db.getMeta(INTEGRATION_BASE_META)).toBe(C2);
   });
 
   it('halts when main no longer descends from the integration base, until --adopt-base', async () => {
