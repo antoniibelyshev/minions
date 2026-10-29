@@ -703,6 +703,13 @@ Answered by the owner on 2026-10-26 (Telegram msg 250). They replace the open qu
 3. **CLI rebuild from container commits.** A dev-only feature. It is available only when the host CLI runs from a
    minions source checkout and the managed project is minions. Normal installs do not register, advertise or accept
    the request. Where it exists, it keeps the plan (commit range, diffstat, sensitive paths) and the double tap.
+   *Unchanged by the dev self-update (task-99):* [coordinator-self-update.md](coordinator-self-update.md) adds a
+   host-side script, `scripts/dev/self-update.mjs`, that applies the coordinator's `upgrade --from-container`
+   requests without a tap. It does so only for the minions project developing itself, and only while the owner runs
+   it on the host. It is not shipped (`scripts/` is not in the npm package). For installed minions nothing changes:
+   the container only proposes, `/rebuild_cli` exists only on dev installs and still asks twice, `--rebuild-cli`
+   stays an explicit flag, and the "no self-continuation" rule holds. The script confirms nothing through the journal
+   and takes no token or nonce from the container.
 4. **How the manager runs.** A user service (launchd or systemd --user) installed by `setup`.
 5. **Approvals from the manager chat.** `/approve <task> <sha>` is part of phase 4. It is bound to the head SHA,
    needs the double tap, and the signing key stays on the host (the manager runs the host's `work approve`). Landed in
