@@ -1,7 +1,8 @@
 // QA regressions for the minions-owned channel server (task-67.2): error and retry handling of the shared Bot API
 // client as the server sees it, access.json failure modes, and the one-kill-per-launch rule across a clean restart.
 // Fake Bot API (an injected fetch behind the real BotApi) and a fake process table only: no network, no real token.
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -244,19 +245,58 @@ describe('one kill per launch', () => {
     expect(await acquireChannelLock(path, { pid: 602, start: 's', launchId: 'launch-b' }, alive)).toMatchObject({ ok: true, lock: { kills: 0 } });
   });
 
-  // Known defect (QA, task-67.2 retest): the takeover of a released (or stale) lock is write-then-read-back, not a
-  // mutex. Two servers racing interleave as write A, read A, write B, read B and both return ok, so two pollers run.
-  // About one race in six loses in-process, more than half across processes. Flip to it() once the takeover is atomic.
-  it.fails('two servers taking over the same released lock at once: at most one wins', async () => {
+  // Regression (QA, task-67.2 retest): the takeover of a released (or stale) lock used to be write-then-read-back, not
+  // a mutex. Two servers racing interleaved as write A, read A, write B, read B and both returned ok, so two pollers
+  // ran. The takeover now goes through a guard file created with link() and a compare step.
+  const racers = (path: string, record: object, proc: Pick<ChannelProc, 'alive' | 'startTime'> = { alive: () => true, startTime: () => 's' }) => async () => {
+    writeFileSync(path, JSON.stringify(record));
+    return Promise.all([601, 602, 603].map((pid) => acquireChannelLock(path, { pid, start: 's', launchId: 'launch-a' }, proc)));
+  };
+
+  it('two servers taking over the same released lock at once: exactly one wins and keeps the kill count', async () => {
     const path = join(dir, 'channel.lock');
-    const alive = { alive: () => true, startTime: () => 's' };
+    const race = racers(path, { version: 1, pid: 600, start: 's', launchId: 'launch-a', kills: 1, released: true });
     for (let i = 0; i < 200; i++) {
-      writeFileSync(path, JSON.stringify({ version: 1, pid: 600, start: 's', launchId: 'launch-a', kills: 1, released: true }));
-      const got = await Promise.all([
-        acquireChannelLock(path, { pid: 601, start: 's', launchId: 'launch-a' }, alive),
-        acquireChannelLock(path, { pid: 602, start: 's', launchId: 'launch-a' }, alive),
-      ]);
-      expect(got.filter((g) => g.ok).length, `round ${i}`).toBeLessThanOrEqual(1);
+      const got = await race();
+      const won = got.filter((g) => g.ok);
+      expect(won.length, `round ${i}`).toBe(1);
+      expect(won[0]).toMatchObject({ lock: { kills: 1 } });
+      expect(JSON.parse(readFileSync(path, 'utf8')).pid, `round ${i}`).toBe((won[0] as { lock: { pid: number } }).lock.pid);
     }
+    expect(readdirSync(dir)).toEqual(['channel.lock']); // no guard or temp file left behind
+  });
+
+  it('two servers taking over the same stale lock (dead holder) at once: exactly one wins', async () => {
+    const path = join(dir, 'channel.lock');
+    const proc = { alive: (pid: number) => pid !== 600, startTime: () => 's' };
+    const race = racers(path, { version: 1, pid: 600, start: 's', launchId: 'launch-a', kills: 0 }, proc);
+    for (let i = 0; i < 100; i++) expect((await race()).filter((g) => g.ok).length, `round ${i}`).toBe(1);
+  });
+
+  it('a takeover guard left by a server that died mid-takeover does not block the lock for good', async () => {
+    const path = join(dir, 'channel.lock');
+    const record = JSON.stringify({ version: 1, pid: 600, start: 's', launchId: 'launch-a', kills: 1, released: true });
+    writeFileSync(path, record);
+    const guard = `${path}.take-${createHash('sha256').update(record).digest('hex').slice(0, 16)}-0`;
+    writeFileSync(guard, JSON.stringify({ pid: 650, start: 'dead' }));
+    const alive = (pid: number) => pid !== 650;
+    // While the guard's taker lives, it is the one taking over.
+    expect(await acquireChannelLock(path, { pid: 601, start: 's', launchId: 'launch-a' }, { alive: () => true, startTime: (pid) => (pid === 650 ? 'dead' : 's') })).toEqual({ ok: false, holder: 650 });
+    expect(await acquireChannelLock(path, { pid: 601, start: 's', launchId: 'launch-a' }, { alive, startTime: () => 's' })).toMatchObject({ ok: true, lock: { pid: 601, kills: 1 } });
+    expect(readdirSync(dir)).toEqual(['channel.lock']);
+  });
+
+  it('a lock taken over by a new server is not released by the old holder closing late', async () => {
+    ownerAccess();
+    const proc = fakeProc();
+    const first = server(fakeBot(), { proc });
+    await first.s.activate();
+    // The lock is taken from under the first server (e.g. it was judged stale); its close() must leave the new lock alone.
+    const path = join(dir, 'channel.lock');
+    writeFileSync(path, JSON.stringify({ ...JSON.parse(readFileSync(path, 'utf8')), released: true }));
+    expect(await acquireChannelLock(path, { pid: SELF, start: 's', launchId: LAUNCH }, proc.proc)).toMatchObject({ ok: true });
+    await first.s.close();
+    expect(JSON.parse(readFileSync(path, 'utf8')).released).toBeUndefined();
+    expect(first.s.status.active).toBe(false);
   });
 });

@@ -14,17 +14,18 @@
 // - 409: three in a row (with 1 s, 2 s, 4 s ... backoff, capped at 30 s, jittered) is persistent. Then it may SIGTERM
 //   the process bot.pid names, only when that pid is alive, its argv is an official `server.ts`, its start time is the
 //   same just before the signal (PID reuse), and it is not under the coordinator claude. At most one kill per launch
-//   (kept in memory and in the lock file, which a clean close keeps as a released record). Otherwise, or when 409
-//   goes on after the kill, it stops polling and says "another process polls this bot".
+//   (kept in memory and in the lock file, which a clean close keeps as a released record; taking a lock over has
+//   exactly one winner, see acquireChannelLock). Otherwise, or when 409 goes on after the kill, it stops polling and
+//   says "another process polls this bot".
 // - The getUpdates offset is saved before a batch is handled, so a restart never replays it.
-import { appendFile, chmod, readFile, writeFile } from 'node:fs/promises';
+import { appendFile, chmod, link, readFile, rm, writeFile } from 'node:fs/promises';
 import { randomBytes } from 'node:crypto';
 import { join } from 'node:path';
 import type { Readable, Writable } from 'node:stream';
 import { createInterface } from 'node:readline';
 import { truncateCodePoints } from '../../core/control-chars.js';
 import { MinionsError } from '../../core/errors.js';
-import { atomicWrite, ensureDir } from '../../core/fsutil.js';
+import { atomicWrite, ensureDir, sha256 } from '../../core/fsutil.js';
 import { redact } from '../../core/output.js';
 import { checkTelegramTokenFormat } from '../token.js';
 import { claudeOwner, isOfficialServerCmdline } from '../isolation.js';
@@ -78,38 +79,115 @@ export async function readChannelToken(env: NodeJS.ProcessEnv, readText: (p: str
 
 // ---------------------------------------------------------------- lock
 
-/** `released`: the holder closed cleanly; the record stays so the launch's kill count survives a restart. */
-export interface ChannelLock { version: 1; pid: number; start: string | null; launchId: string; kills: number; released?: boolean }
+/**
+ * `released`: the holder closed cleanly; the record stays so the launch's kill count survives a restart. `nonce` makes
+ * every taken lock a distinct record, so the takeover's compare step never mistakes a new lock for the one it replaces.
+ */
+export interface ChannelLock { version: 1; pid: number; start: string | null; launchId: string; kills: number; released?: boolean; nonce?: string }
+
+type LockProc = Pick<ChannelProc, 'alive' | 'startTime'>;
+const LOCK_MODE = 0o600;
 
 /**
- * Takes <state dir>/channel.lock for this process. A live holder (same pid start time, so a reused pid is stale) keeps
- * it; a stale or released lock is replaced. The kill count carries over from a stale or released lock of the same
- * launch, so a restarted server of that launch never kills again (also after a clean close, e.g. /mcp reconnect).
+ * Takes <state dir>/channel.lock for this process, with exactly one winner across processes. A live holder (same pid
+ * start time, so a reused pid is stale) keeps it; a stale or released lock is taken over. The kill count carries over
+ * from a stale or released lock of the same launch, so a restarted server of that launch never kills again (also after
+ * a clean close, e.g. /mcp reconnect); a new launch starts at zero.
+ *
+ * Every step that decides the winner is atomic: the lock is created with link() of a complete temp file (fails with
+ * EEXIST, so nobody reads a half-written lock), and a takeover first creates the same way a guard file named after the
+ * hash of the exact record it replaces, then re-reads the lock and replaces it only when it is still that record.
  */
-export async function acquireChannelLock(path: string, self: { pid: number; start: string | null; launchId: string }, proc: Pick<ChannelProc, 'alive' | 'startTime'>):
+export async function acquireChannelLock(path: string, self: { pid: number; start: string | null; launchId: string }, proc: LockProc):
 Promise<{ ok: true; lock: ChannelLock } | { ok: false; holder: number }> {
-  const fresh: ChannelLock = { version: 1, ...self, kills: 0 };
-  try {
-    await writeFile(path, JSON.stringify(fresh) + '\n', { flag: 'wx', mode: 0o600 });
-    return { ok: true, lock: fresh };
-  } catch (e) {
-    if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e;
+  for (let round = 0; round < 5; round++) {
+    const fresh: ChannelLock = { version: 1, ...self, kills: 0, nonce: randomBytes(8).toString('hex') };
+    if (await createExclusive(path, JSON.stringify(fresh) + '\n')) return { ok: true, lock: fresh };
+    const raw = await readText(path);
+    if (raw === null) continue; // removed meanwhile: create again
+    const held = parseLock(raw);
+    if (held && !held.released && held.pid !== self.pid && isLive(held, proc)) return { ok: false, holder: held.pid };
+    const lock: ChannelLock = { ...fresh, kills: held && held.launchId === self.launchId ? held.kills : 0 };
+    const took = await takeOver(path, raw, lock, self, proc);
+    if (took === 'won') return { ok: true, lock };
+    if (took !== 'retry') return { ok: false, holder: took };
   }
-  const held = await readLock(path);
-  if (held && !held.released && held.pid !== self.pid && proc.alive(held.pid) && (!held.start || proc.startTime(held.pid) === held.start)) return { ok: false, holder: held.pid };
-  const lock: ChannelLock = { ...fresh, kills: held && held.launchId === self.launchId ? held.kills : 0 };
-  await atomicWrite(path, JSON.stringify(lock) + '\n', { mode: 0o600 });
-  // Two strays replacing the same stale lock: the last writer wins, the other one sees it here.
-  const now = await readLock(path);
-  return now?.pid === self.pid ? { ok: true, lock } : { ok: false, holder: now?.pid ?? -1 };
+  return { ok: false, holder: parseLock((await readText(path)) ?? '')?.pid ?? -1 };
+}
+
+/**
+ * Replaces the stale or released record `raw` with `lock`, or says who does. One guard per record: the creator of
+ * `<lock>.take-<hash>-<k>` is the only one that may replace it. A guard whose taker died mid-takeover is skipped by
+ * using the next k (never deleted by others, so two takers never hold the same guard).
+ */
+async function takeOver(path: string, raw: string, lock: ChannelLock, self: { pid: number; start: string | null }, proc: LockProc): Promise<'won' | 'retry' | number> {
+  const base = `${path}.take-${sha256(raw).slice(0, 16)}`;
+  for (let k = 0; k < 8; k++) {
+    const guard = `${base}-${k}`;
+    if (await createExclusive(guard, JSON.stringify({ pid: self.pid, start: self.start }) + '\n')) {
+      try {
+        // Compare: another taker may have finished between our read and our guard (it then deleted its guard).
+        if ((await readText(path)) !== raw) return 'retry';
+        await atomicWrite(path, JSON.stringify(lock) + '\n', { mode: LOCK_MODE });
+        return 'won';
+      } finally {
+        // Safe: the lock no longer holds `raw` (or we failed), so a late taker of these guards fails the compare.
+        for (let j = 0; j <= k; j++) await rm(`${base}-${j}`, { force: true }).catch(() => undefined);
+      }
+    }
+    const g = await readText(guard);
+    if (g === null) return 'retry'; // the taker just finished: see what the lock holds now
+    let taker: { pid?: unknown; start?: unknown } | null;
+    try { taker = JSON.parse(g) as { pid?: unknown; start?: unknown } | null; } catch { taker = null; /* unreadable guard: its taker counts as live */ }
+    const pid = typeof taker?.pid === 'number' ? taker.pid : -1;
+    if (pid === -1 || isLive({ pid, start: typeof taker?.start === 'string' ? taker.start : null }, proc)) return pid;
+  }
+  return -1;
+}
+
+const isLive = (h: { pid: number; start: string | null }, proc: LockProc) => proc.alive(h.pid) && (!h.start || proc.startTime(h.pid) === h.start);
+
+/** Creates `path` with the full `data` or returns false when it exists. link() publishes a complete file atomically. */
+async function createExclusive(path: string, data: string): Promise<boolean> {
+  const tmp = `${path}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;
+  await writeFile(tmp, data, { mode: LOCK_MODE, flag: 'wx' });
+  try {
+    await link(tmp, path);
+    return true;
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    if (code === 'EEXIST') return false;
+    if (code !== 'EPERM' && code !== 'ENOTSUP' && code !== 'ENOSYS' && code !== 'EOPNOTSUPP') throw e;
+    // No hard links on this file system: O_EXCL create (a reader may briefly see it half-written).
+    try { await writeFile(path, data, { flag: 'wx', mode: LOCK_MODE }); return true; } catch (e2) {
+      if ((e2 as NodeJS.ErrnoException).code === 'EEXIST') return false;
+      throw e2;
+    }
+  } finally {
+    await rm(tmp, { force: true }).catch(() => undefined);
+  }
+}
+
+async function readText(path: string): Promise<string | null> {
+  try { return await readFile(path, 'utf8'); } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw e;
+  }
+}
+
+function parseLock(raw: string): ChannelLock | null {
+  try {
+    const v = JSON.parse(raw) as Partial<ChannelLock>;
+    if (typeof v?.pid !== 'number') return null;
+    return {
+      version: 1, pid: v.pid, start: typeof v.start === 'string' ? v.start : null, launchId: typeof v.launchId === 'string' ? v.launchId : '',
+      kills: typeof v.kills === 'number' ? v.kills : 0, ...(v.released === true ? { released: true } : {}), ...(typeof v.nonce === 'string' ? { nonce: v.nonce } : {}),
+    };
+  } catch { return null; }
 }
 
 async function readLock(path: string): Promise<ChannelLock | null> {
-  try {
-    const v = JSON.parse(await readFile(path, 'utf8')) as Partial<ChannelLock>;
-    if (typeof v?.pid !== 'number') return null;
-    return { version: 1, pid: v.pid, start: typeof v.start === 'string' ? v.start : null, launchId: typeof v.launchId === 'string' ? v.launchId : '', kills: typeof v.kills === 'number' ? v.kills : 0, ...(v.released === true ? { released: true } : {}) };
-  } catch { return null; }
+  try { return parseLock((await readText(path)) ?? ''); } catch { return null; }
 }
 
 // ---------------------------------------------------------------- JSON-RPC
@@ -217,11 +295,13 @@ export class ChannelServer {
   /**
    * Releases the lock when this process holds it. The file is not deleted but rewritten as a released record that keeps
    * launchId and the kill count, so a server restarted in the same launch (e.g. /mcp reconnect) has no kill left.
+   * Polling stops too: a closed server never polls or kills without the lock.
    */
   async close(): Promise<void> {
+    if (this.state.active) this.state = { active: false, reason: 'the channel server has closed' };
     if (!this.lock) return;
     const held = await readLock(this.paths.lock);
-    if (held?.pid === this.selfPid && !held.released) {
+    if (held?.pid === this.selfPid && held.nonce === this.lock.nonce && !held.released) {
       await atomicWrite(this.paths.lock, JSON.stringify({ ...this.lock, released: true }) + '\n', { mode: 0o600 }).catch(() => undefined);
     }
     this.lock = null;
@@ -288,12 +368,14 @@ export class ChannelServer {
   private async onConflict(signal?: AbortSignal): Promise<boolean> {
     const step = this.conflicts.onConflict();
     if (step.action === 'retry') { await this.sleep(step.delayMs, signal); return true; }
-    if ((this.lock?.kills ?? 0) >= 1) { this.deactivate(`${OTHER_POLLER} (409 Conflict goes on after stopping one stray poller)`); return false; }
+    if (!this.lock || !this.state.active) return false; // closed meanwhile
+    if (this.lock.kills >= 1) { this.deactivate(`${OTHER_POLLER} (409 Conflict goes on after stopping one stray poller)`); return false; }
     const target = await this.strayPoller();
     if (!target.ok) { this.deactivate(`${OTHER_POLLER} (409 Conflict; ${target.why})`); return false; }
     // Same process still (start time unchanged): the pid was not reused since the check.
     if (this.opts.proc.startTime(target.pid) !== target.start) { this.deactivate(`${OTHER_POLLER} (409 Conflict; bot.pid changed while checking)`); return false; }
-    this.lock!.kills += 1;
+    if (!this.lock || !this.state.active) return false; // closed while checking
+    this.lock.kills += 1;
     await atomicWrite(this.paths.lock, JSON.stringify(this.lock) + '\n', { mode: 0o600 }).catch(() => undefined);
     try { this.opts.proc.kill(target.pid, 'SIGTERM'); } catch (e) { this.log(`telegram channel: signalling pid ${target.pid} failed: ${(e as Error).message}`); }
     this.log(`telegram channel: stopped the stray official plugin poller pid ${target.pid} (the one kill of this launch)`);
