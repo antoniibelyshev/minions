@@ -10,7 +10,7 @@ import { isGithubDelivery } from '../config/delivery.js';
 import type { MinionsConfig } from '../config/schema.js';
 import { action, globalOpts, requireMode, runtimeMode } from '../core/cli-helpers.js';
 import { displayText, stripControlChars, truncateCodePoints } from '../core/control-chars.js';
-import { writeSync } from 'node:fs';
+import { existsSync, writeSync } from 'node:fs';
 import { EXIT_CODES, MinionsError, type ErrorCode } from '../core/errors.js';
 import { readJson } from '../core/fsutil.js';
 import { emit, reportError } from '../core/output.js';
@@ -39,7 +39,7 @@ import {
 import { currentBudget } from './spend.js';
 import { openDb, type DrainNotice, type DrainRequest, type Lease, type PauseChange, type RuntimeDb } from './db.js';
 import { clearDrain, requestDrain } from './drain.js';
-import { claimWithBrief, compactClaim, fetchBrief, recordSubmitted, requireWorkerRole, submitResult, sweepScratchOnStart, type CompactClaim } from './handoff.js';
+import { claimWithBrief, compactClaim, fetchBrief, recordSubmitted, requireWorkerRole, submissionPath, submitResult, sweepScratchOnStart, type CompactClaim } from './handoff.js';
 import { advanceLease, humanAdvance } from './advance.js';
 import { runHook } from './hooks.js';
 import { completeOpenSessions, noteResetRequest } from './coordinator-usage.js';
@@ -70,7 +70,8 @@ import { reapRun, recoverRuns, runLease, type ReapDeps, type RecoverySweep, type
 import { hasOpenRun, openRunsSync, withOpenRuns } from './runner/record.js';
 import { liveRun, liveRunExitCode, type LiveRunReport } from './headless.js';
 import { buildSessionCommand } from './sessions.js';
-import { runSupervisor, startSupervisorWatch, supervisorLockState, type SupervisorReport } from './supervisor.js';
+import { runSupervisor, startSupervisorWatch, supervisorLockState, type SupervisorReport, type SupervisorTaskDeps } from './supervisor.js';
+import { recoverTaskSession, taskSessionPass, type TaskSessionDeps } from './task-sessions.js';
 
 /** Human output of `minions work next`. */
 export function humanNext(r: NextReport): string {
@@ -236,6 +237,37 @@ async function routineDeps(): Promise<Parameters<typeof runRoutinePass>[0]> {
     // Never with force: scheduleDetachedRestart refuses with an active lease or a drain (and the detached restart checks again).
     wake: async () => scheduleDetachedRestart({ activeLeases: () => leases().map((id) => ({ id })), drain: () => d.drain(), log, cwd: paths.state }, { wake: true }).reason,
     crashStart: async () => scheduleCrashStart({ drain: () => d.drain(), upgrade: () => upgradeInProgress(d), log, cwd: paths.state }).reason,
+    // Sessions on (task-57 phase 7): runnable stages open task sessions, under the same limits as the supervisor's pass.
+    openTaskSessions: () => taskSessionPass(taskSessionDeps(cfg)),
+  };
+}
+
+/**
+ * The task session pass (task-57 phase 7) with the runtime context and the given config: `work next` and the backlog
+ * through a scheduler built on that config (the supervisor re-reads it), the owner budget and an upgrade in progress.
+ */
+function taskSessionDeps(cfg: MinionsConfig): TaskSessionDeps {
+  const d = getDb();
+  const paths = runtimePaths();
+  const b = openBacklog(cfg, { idempotency: lazyIdempotency, root: paths.backlog, provenanceFallback: intakeProvenanceFallback(getDb) });
+  const sched = new Scheduler({ config: cfg, db: d, backlog: b, layout: workspaceLayout(), handoff: paths, runs: { state: paths.state, reap: (leaseId) => reapRun(leaseId, reapDeps()) } });
+  return {
+    db: d, config: cfg, state: paths.state,
+    runnable: async () => { try { return (await sched.next()).runnable.map((st) => ({ taskId: st.taskId, role: st.role })); } catch { return null; } },
+    tasks: async () => { try { return await b.listTasks(); } catch { return null; } },
+    budgetExhausted: () => { try { return currentBudget({ db: d, config: cfg })?.exhausted ?? false; } catch { return false; } },
+    upgradeInProgress: () => upgradeInProgress(d),
+  };
+}
+
+/** The supervisor's task session deps: the pass, and per-task recovery (submission files, Scheduler.release). */
+export function supervisorTaskDeps(): SupervisorTaskDeps {
+  return {
+    pass: (cfg) => taskSessionPass(taskSessionDeps(cfg)),
+    recover: async (key) => recoverTaskSession(getDb(), key, {
+      hasSubmission: async (leaseId) => existsSync(submissionPath(runtimePaths(), leaseId)),
+      release: async (leaseId, reason) => (await scheduler()).release(leaseId, reason),
+    }),
   };
 }
 
@@ -928,10 +960,11 @@ export function register(program: Command): void {
           permissionModes: permissionModesNeeded(c) ? await (modes ??= claudePermissionModes().catch(() => null)) : undefined,
         }),
         log: (line) => process.stderr.write(`${new Date().toISOString()} ${line}\n`),
+        tasks: supervisorTaskDeps(),
       });
       emit(r, { json: globalOpts(cmd).json, human: (x: SupervisorReport) => x.exit === 'conflict'
         ? `session supervisor: already running (pid ${x.holder?.pid ?? '?'})`
-        : `session supervisor: ${x.exit} (${x.starts} session start(s), ${x.reaped.length} orphan record(s) reaped)` });
+        : `session supervisor: ${x.exit} (${x.starts} session start(s), ${x.opened} task session(s) opened, ${x.closed} closed, ${x.reaped.length} orphan record(s) reaped)` });
     }));
 
   // Task-96: the coordinator's controlled live Claude run. Coordinator-only (the pre-bash hook refuses it to every

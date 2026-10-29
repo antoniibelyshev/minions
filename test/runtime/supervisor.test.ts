@@ -5,7 +5,7 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'n
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { MinionsConfig } from '../../src/config/schema.js';
-import { coordinatorWrapper, type SpawnLike } from '../../src/runtime/coordinator.js';
+import { coordinatorWrapper, SESSIONS_COORDINATOR_NOTE, type SpawnLike } from '../../src/runtime/coordinator.js';
 import { RuntimeDb, type SupervisorLock } from '../../src/runtime/db.js';
 import { clearDrain, requestDrain } from '../../src/runtime/drain.js';
 import { coordinatorOnlyWorkCommand } from '../../src/runtime/hooks.js';
@@ -505,7 +505,12 @@ describe('the wrapper starts the supervisor', () => {
     const sp2 = spawnStub();
     const r = await wrap(on, (cfg) => startSupervisorWatch(cfg, base({ state: () => ({ state: 'none', lock: null }), spawn: sp2.fn, timer: () => () => {} })));
     expect(r.code).toBe(0);
-    expect(r.calls).toEqual(without.calls);
+    // Phase 7: the same launch, except that the prompt says this coordinator does not dispatch.
+    const prompt = (argv: string[]) => argv[argv.indexOf('--append-system-prompt') + 1]!;
+    const mask = (calls: string[][]) => calls.map((argv) => argv.map((x, i) => (argv[i - 1] === '--append-system-prompt' ? '<prompt>' : x)));
+    expect(mask(r.calls as string[][])).toEqual(mask(without.calls as string[][]));
+    expect(prompt(r.calls[0] as string[])).toBe(prompt(without.calls[0] as string[]) + SESSIONS_COORDINATOR_NOTE);
+    expect(prompt(without.calls[0] as string[])).not.toContain('Coordinator sessions are on');
     expect(sp2.calls.map((c) => c.args)).toEqual([['coordinator', 'supervise']]);
   });
 });

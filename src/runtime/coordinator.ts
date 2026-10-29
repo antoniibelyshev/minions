@@ -479,6 +479,22 @@ Repository and user Claude Code settings, hooks and MCP servers are not loaded i
 `;
 
 /**
+ * Appended to the interactive coordinator's prompt with coordinator.sessions.enabled (docs/design/coordinator-sessions.md,
+ * phase 7): per-task headless sessions dispatch, so this session does not. It overrides the dispatch flow, the
+ * orchestrate loop and the recover skill's re-dispatch. With sessions off the prompt is unchanged.
+ */
+export const SESSIONS_COORDINATOR_NOTE = `
+
+## Coordinator sessions are on: you do not dispatch
+
+\`coordinator.sessions.enabled\` is on. Each task's stages are driven by its own headless **task session** (\`task:<id>\`), which the runtime's session supervisor opens when the task has a runnable stage and closes at delivery. This overrides the Dispatch flow above, \`/minions:orchestrate\` steps 1 to 6 and the re-dispatch in \`/minions:recover\`:
+
+- Never claim, advance, record or release task stages (\`minions work claim|advance|record|release\`), and never spawn workers. Leases whose \`holder\` is \`task:<id>\` (\`minions work list --json\`) belong to that session, also after a restart or a crash: the supervisor recovers them.
+- You still talk with the owner: answer, file and update tasks (\`minions backlog ...\`; the supervisor opens the sessions of runnable ones), send due notifications (\`minions notify pending\`, then \`notify ack\`), and relay approvals the owner must give on the host. Task sessions put their summaries and questions into the outbox; you send them.
+- \`minions status --json\` and \`minions work list --json\` show what the sessions are doing. When nothing needs you, stop.
+`;
+
+/**
  * Host runtime claude flags. `--setting-sources=` (empty list: no user, project or local settings) is
  * what the Agent SDK passes for `settingSources: []`; `--strict-mcp-config` without `--mcp-config`
  * loads no MCP server. Login credentials are not settings (macOS Keychain / ~/.claude), so `login` works.
@@ -497,7 +513,7 @@ export function coordinatorDisallowedTools(cfg: Pick<MinionsConfig, 'coordinator
 export async function buildClaudeCommand(cfg: MinionsConfig, paths: RuntimePaths = runtimePaths(), opts: { telegram?: boolean; startupPrompt?: string; permissionModes?: readonly string[] | null } = {}): Promise<CoordinatorCommand> {
   assertNoBypass(cfg);
   const onHost = runtimeMode() === 'host-runtime';
-  const prompt = await readPrompt(paths) + (onHost ? hostPromptNote(paths) : '');
+  const prompt = await readPrompt(paths) + (onHost ? hostPromptNote(paths) : '') + (cfg.coordinator?.sessions?.enabled === true ? SESSIONS_COORDINATOR_NOTE : '');
   const disallowed = coordinatorDisallowedTools(cfg);
   return {
     cmd: 'claude',

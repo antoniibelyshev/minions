@@ -2,8 +2,8 @@
 
 Status: **agreed direction, build phases proposed** (task-57.4 design check against main @ 18486ec, 2026-10-28).
 Step 1 (token tracking, task-57.1) is built. The owner decided to build the router and per-task sessions (TG 427,
-2026-10-28) after this design check. Phases 3 (spike), 4 (schema and launch builder) and 5 (supervisor) are built;
-nothing opens a session yet (phase 7). The build phases are in [Phases](#phases). Three
+2026-10-28) after this design check. Phases 3 (spike), 4 (schema and launch builder), 5 (supervisor), 6 (session-scoped
+hooks) and 7 (task sessions) are built; the router and the general session (phase 8) are next. The build phases are in [Phases](#phases). Three
 [open questions](#open-questions-for-the-owner) remain.
 
 Owner decisions so far:
@@ -455,6 +455,24 @@ need an owner decision first.
    detached and restarts it when its lock is stale (checked every minute); with sessions off it starts nothing.
 6. **child: Session-scoped hooks and state** | criteria: with `MINIONS_SESSION` set, the Stop guard is scoped to the session's task (task) or off (general and router); `noteTranscript` uses `coordinator_transcript:<key>`; usage states carry the role and only complete sessions of the same key; the baseline shows tokens per role; `contextResetCheck` and handoffs are per session; lease `holder` = session key; `work advance --task <id>`; tests with two sessions' hook inputs on one DB; with the variable unset nothing changes | depends: 4 (worker; can run in parallel with 5)
 7. **child: Task sessions** | criteria: the supervisor opens `task:<id>` for a runnable stage within `sessions.max`, budget, pauses and the routine's caps; the `/minions:task <id>` skill (claim, spawn, `work advance --task`, inbox check between stages, final summary to the outbox, a handoff at `awaiting-human`); close and reopen rules per decision 4; per-task recover after a session crash; with sessions on, the routine pass opens task sessions instead of waking the coordinator, and the coordinator prompt no longer dispatches; tests with the fake binary | depends: 5, 6 (worker)
+   Result (task-57.11, src/runtime/task-sessions.ts, the `/minions:task` skill): one deterministic pass, run by the
+   supervisor every `timing.openMs` (30 s) and by the routine pass instead of a coordinator wake (sessions on: the
+   routine wakes the coordinator only for the digest), opens `task:<id>` for each `work next` runnable stage (so
+   capacity, pauses, drain and budget apply) within `sessions.max`; a session is a row plus a `/minions:task <id>`
+   kickoff in its inbox. The routine's gap and daily cap apply to opens only with `routine.enabled`; each open is a
+   `routine-wake` event with `data.session`, so opens and coordinator wakes share the caps. Close at `delivered`,
+   `done`, `cancelled` or `blocked` (never while a worker of the task runs), and at `awaiting-human` only after a
+   `session-handoff` event of the key after the task's last record. A closed session is reopened (same claude
+   session id) when the task is runnable again; a `failed` one is never reopened automatically (the owner does). An
+   idle open session of a runnable task gets a supervisor nudge at most once per `timing.nudgeMs` (5 min). Before a
+   task session's process is resumed, its leases are recovered: unsubmitted ones are released (the stage is runnable
+   again), submitted ones are left for the session to record with `work advance`, and the outcome goes to its inbox.
+   With sessions on, unvalidated, needs-split and awaiting-human results are handled by the task session itself (no
+   inbox forward; the table's "inbox message" variant is not built), the coordinator prompt and its Stop guard no
+   longer dispatch, and the single coordinator's reset barrier does not hold `work next`. Left for phase 8: digest
+   wakes still wait while task sessions hold leases, and task-session outbox items wait for the interactive
+   coordinator's next turn. A context reset inside a task session is interim (handoff, keep the key). Live check for
+   phase 9: a stream-json user message `/minions:task <id>` expands the plugin skill in a headless session.
 8. **child: Router, general session and outbound** | criteria: `coordinator route --json` resolver (rules 2 to 4 of the routing model, `ambiguous`), table tests; `coordinator send <key>` and `coordinator wait --json`; `notify enqueue --session`, `notify ack --message-id` and a `tg_messages` table with task-67.3's columns plus `session`; question items keep their session, and `Q1 2` answers route back; router prompt and skill on `models.router`, no Agent tool, resets allowed with active leases; the `general` session; the digest is sent by the router; poller and isolation checks unchanged and tested | depends: 7 (worker; may split into resolver/outbound and router/general if large)
 9. **child: Sessions live check, docs and rollout** | criteria: sessions in `minions status` and `doctor`; README, cli.md, bootstrap.md and telegram.md updated; the coordinator enables sessions on this project for at least 3 deliveries and reports tokens and USD per delivered task per role against this cost model, misroutes and the poller state; owner poll on keeping them on and on making them the default | depends: 8 (**live run** by the coordinator; **owner**)
 10. **child: Deterministic dispatcher on the supervisor (task-68.8 build part)** | criteria: launch kind `stage` (`claude -p --agent minions:<role>`, worker settings, no Telegram); a worker-guard rework so headless workers are guarded without `agent_id` (required: the spike found no `agent_id` in `--agent` hook inputs, U7; `MINIONS_ROLE`-style marking, tests for pre-bash, pre-file and drain); hook commands not exec'd from a `noexec` `/tmp` (U1); record with usage from stream-json; one correction resume; exceptions wake the task session; launch argv, env and settings test | depends: 9 (**owner** yes after the phase 9 numbers)
