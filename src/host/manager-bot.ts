@@ -17,6 +17,7 @@ import { MinionsError } from '../core/errors.js';
 import { ensureDir, readJsonIfExists, writeJson } from '../core/fsutil.js';
 import { redact } from '../core/output.js';
 import { managerDir, managerPaths } from '../core/paths.js';
+import type { TelegramUpdate } from '../telegram/bot-api.js';
 import { BOTFATHER_URL, checkTelegramTokenFormat } from '../telegram/token.js';
 import { assertManagerBotDistinct, type BotGuardDeps } from './bot-guard.js';
 import {
@@ -114,19 +115,8 @@ export async function clearManagerAccess(): Promise<void> {
   await rm(managerPaths().accessJson, { force: true });
 }
 
-/** The parts of a Bot API update the owner check reads. */
-export interface TelegramUpdate {
-  update_id: number;
-  message?: {
-    message_id?: number; text?: string; from?: { id: number; is_bot?: boolean }; chat?: { id: number; type?: string };
-    /** Set on a forwarded message (forward_origin in Bot API 7+, forward_from / forward_from_chat / forward_date before). */
-    forward_origin?: unknown; forward_from?: unknown; forward_from_chat?: unknown; forward_date?: unknown;
-  };
-  callback_query?: {
-    id?: string; data?: string; from?: { id: number; is_bot?: boolean };
-    message?: { message_id?: number; chat?: { id: number; type?: string } };
-  };
-}
+/** The parts of a Bot API update the owner check reads (shared with the channel server: src/telegram/bot-api.ts). */
+export type { TelegramUpdate };
 
 /**
  * True only for an update from the paired owner in the paired private chat (a message or a button tap). Everything
