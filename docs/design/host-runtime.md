@@ -55,7 +55,7 @@ What exists:
 | Hardening | `src/runtime/coordinator.ts` (`hostSettings`, `HOST_CLAUDE_FLAGS`, `hostPromptNote`) | Claude sandbox (Seatbelt) for Bash, `allowUnsandboxedCommands: false`, `denyRead` on the data root and secret dirs, Edit/Read denies, a git subcommand allowlist, `--setting-sources= --strict-mcp-config`. |
 | Git outside the sandbox | `src/runtime/git-hardening.ts` | Neutralizes the clone's config for git calls minions itself makes. |
 | Credentials | `src/host/credentials.ts` (`selectStore`, `moveKeychainTokensToFileStore`) | Uses the 0600 file store while any project runs on the host. Keychain items are moved there. |
-| Permission mode | `decidePermissionMode` in `src/runtime/coordinator.ts` | Always `default` on the host: the config may come from the repository. |
+| Permission mode | `decidePermissionMode` in `src/runtime/coordinator.ts` | Built (owner decision 2026-10-29, see [Auto permission mode on the host](#auto-permission-mode-on-the-host)): the configured mode, as in the container. |
 | Telegram | `resolveChannel` in `src/telegram/channel.ts` (`HOST_TELEGRAM_REASON`), `HOST_CHANNEL_WARNING` in `src/host/channel-cli.ts` | Always terminal on the host. `telegram install` refuses. |
 | Change requests | `src/host/settings-cli.ts` (the `SettingsRuntime` host branch) | `settings requests`/`apply` already reach the host runtime through the shim. |
 | Sync | `upgradeSyncOnly` in `src/host/commands.ts` | `upgrade --sync-only` already exports from the host workspace. |
@@ -262,6 +262,13 @@ What is missing (the gaps this design closes):
   runtimes.
 
 ## Auto permission mode on the host
+
+> **Built, simplified (owner decision 2026-10-29: "cleanup unnecessary guardrails", "fully autonomous on the host").**
+> The host runtime uses `coordinator.permissionMode` like the container (default `auto`), and the owner may choose
+> `bypassPermissions` and `coordinator.sandbox false` for fully unattended work. Those two are accepted only from
+> `config.local.json` (`src/config/resolve.ts` refuses them in the project layer). Sandboxed commands run without a
+> prompt (`autoAllowBashIfSandboxed: true`), and recording a publication approval is denied instead of asked. The
+> extra fences below (points 3 to 5) are not built; the list stays as the hardening backlog.
 
 Auto mode lets a classifier approve actions outside the allow list. On the host those actions run as the owner, so
 the safety must not depend on the classifier:

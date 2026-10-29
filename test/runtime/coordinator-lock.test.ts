@@ -736,9 +736,10 @@ describe('lock holder identity (start time)', () => {
     expect(coordinatorPidAlive(OTHER_PID, { start: '100' }, pcOf(null, null))).toBe(true);
   });
 
-  it('reads the real start time from /proc where it exists', () => {
+  it('reads the real start time (from /proc, or ps off Linux)', () => {
     const start = procStartTime(process.pid);
-    if (!existsSync('/proc/self/stat')) { expect(start).toBeNull(); return; }
+    // Off Linux the start time comes from ps (task-103.2), or null where that is unavailable.
+    if (!existsSync('/proc/self/stat') && start === null) return;
     expect(start).toMatch(/^\d+$/);
     expect(procStartTime(process.pid)).toBe(start); // stable for the process lifetime
     const pc = { alive: pidAlive, cmdline: () => WRAPPER_CMD, startTime: procStartTime };
