@@ -104,8 +104,9 @@ instructions (see phase 4), not in the shipped coordinator template.
 
 ### Apply path
 
-1. **Wait for idle.** Apply only when `minions --json status` shows no active lease, no drain and no open process
-   run. Otherwise wait and check again on every poll. The upgrade's own pause and drain still cover a lease that
+1. **Wait for idle.** Apply only when `minions --json status` shows no active lease, no drain, no open process
+   run and no live holder of the local integrator's `integration_lock` (the `integration.lock.state` of the status;
+   a stale lock or an absent block, as on older runtimes, is not busy; task-82.5). Otherwise wait and check again on every poll. The upgrade's own pause and drain still cover a lease that
    starts in between: that worker commits `wip:`, and recovery dispatches it again.
 2. **Sync:** `minions upgrade --sync-only`. The target is the new `HEAD`. If the sync is refused (divergence, dirty
    tree), the request is marked `failed` with the reason, and the script notifies the owner.
