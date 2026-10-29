@@ -7,7 +7,7 @@ import { describe, expect, it } from 'vitest';
 import { filterReady } from '../../src/backlog/ready.js';
 import { can } from '../../src/config/capabilities.js';
 import { autoMergeConfigReasons, dependencyDoneStatuses, localIntegrationEnabled } from '../../src/config/delivery.js';
-import { listUnavailable } from '../../src/config/resolve.js';
+import { listUnavailable, validateConfig } from '../../src/config/resolve.js';
 import type { MinionsConfig } from '../../src/config/schema.js';
 import { signApproval, verifyAnyApproval } from '../../src/core/approval.js';
 import { integrationRows, runIntegrator, type IntegratorDeps } from '../../src/runtime/integrator.js';
@@ -213,6 +213,15 @@ describe('base.merge capability and mode-aware auto-merge reasons', () => {
     expect(can(defaults('supervised'), 'base.merge')).toBe('deny');
     expect(can(defaults('project-owner'), 'base.merge', { paths: ['.github/workflows/ci.yml'] })).toBe('ask');
     expect(can(defaults('project-owner'), 'base.merge', { paths: ['src/a.ts'] })).toBe('allow');
+  });
+
+  it('an effective config written before base.merge existed still validates, with local integration off (fail closed)', () => {
+    const old = structuredClone(local()) as unknown as { capabilities: Record<string, unknown> };
+    delete old.capabilities['base.merge'];
+    const cfg = validateConfig(old);
+    expect(cfg.capabilities['base.merge']).toBe('deny');
+    expect(localIntegrationEnabled(cfg)).toBe(false);
+    expect(dependencyDoneStatuses(cfg)).toEqual(new Set(['done', 'delivered']));
   });
 
   const local = (mutate?: (c: MinionsConfig) => void) => {

@@ -42,8 +42,15 @@ export const CapabilityRuleSchema = z.union([
 ]);
 export type CapabilityRule = z.infer<typeof CapabilityRuleSchema>;
 
+/**
+ * Capabilities added after configs were first written default when an effective config lacks them, fail closed:
+ * an effective config generated before base.merge existed (task-82.3) keeps local integration off (deny: approvals
+ * end delivered, as before) until the host regenerates it from the profile defaults.
+ */
+const LATER_CAPABILITY_DEFAULTS: Partial<Record<Capability, 'deny'>> = { 'base.merge': 'deny' };
+
 export const CapabilitiesSchema = z.object(
-  Object.fromEntries(CAPABILITIES.map((c) => [c, CapabilityRuleSchema])) as Record<Capability, typeof CapabilityRuleSchema>,
+  Object.fromEntries(CAPABILITIES.map((c) => [c, LATER_CAPABILITY_DEFAULTS[c] ? CapabilityRuleSchema.default(LATER_CAPABILITY_DEFAULTS[c]) : CapabilityRuleSchema])) as Record<Capability, typeof CapabilityRuleSchema>,
 ).strict();
 
 export const PROFILES = ['project-owner', 'personal-work', 'supervised'] as const;
