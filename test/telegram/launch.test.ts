@@ -10,6 +10,7 @@ import {
   coordinatorSettings, coordinatorWrapper, exitCodeOf, readExitRecord, TELEGRAM_ALL_TOOLS, TELEGRAM_HOOK_COMMAND,
   TELEGRAM_TOKEN_ENV, TELEGRAM_TOOLS, type SignalTarget, type SpawnLike,
 } from '../../src/runtime/coordinator.js';
+import { hangGuarded } from '../../src/runtime/hook-guard.js';
 import { runtimePaths } from '../../src/runtime/paths.js';
 import { evaluateTelegram, TELEGRAM_CHANNEL_SPEC, TELEGRAM_PLUGIN_ID, type TelegramProbeReport } from '../../src/telegram/probe.js';
 import { defaults, FAKE_MINIONS, runHookCommand } from '../helpers.js';
@@ -475,7 +476,7 @@ describe('Telegram tools are coordinator-only', () => {
     const on = await buildClaudeCommand(telegramCfg(), paths, { telegram: true });
     const settings = JSON.parse(on.args[on.args.indexOf('--settings') + 1]!);
     const command = settings.hooks.PreToolUse[0].hooks[0].command as string;
-    expect(command).toBe('timeout 20 minions hook pre-telegram || exit 2');
+    expect(command).toBe(`${hangGuarded('minions hook pre-telegram')} || exit 2`);
     const stdin = JSON.stringify({ hook_event_name: 'PreToolUse', tool_name: 'mcp__plugin_telegram_telegram__reply', tool_input: { chat_id: '1', text: 'hi' } });
     // Exit 2 is the only blocking PreToolUse exit; 127 (not found), 1 (crash) or 137 (killed) would allow the call.
     expect(runHookCommand(command, null, stdin).status).toBe(2);

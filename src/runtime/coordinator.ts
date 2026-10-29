@@ -8,6 +8,7 @@ import { COORDINATOR_DISALLOWED_TOOLS } from '../config/coordinator-tools.js';
 import { MinionsError } from '../core/errors.js';
 import { run, type RunOptions, type RunResult } from '../core/exec.js';
 import { atomicWrite } from '../core/fsutil.js';
+import { hangGuarded, HOOK_SETTINGS_TIMEOUT_S } from './hook-guard.js';
 import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, sep } from 'node:path';
@@ -41,20 +42,14 @@ export const TELEGRAM_ALL_TOOLS = [...TELEGRAM_TOOLS, `${TELEGRAM_TOOL_PREFIX}do
  * rules cannot be scoped per agent, so the allow above would otherwise extend to subagents.
  */
 export const TELEGRAM_HOOK_MATCHER = `${TELEGRAM_TOOL_PREFIX}.*`;
-/**
- * Hang guard for the gating hooks: coreutils `timeout` kills a stuck `minions hook` after this many
- * seconds (exit 124, mapped to 2 by `|| exit 2`). Claude Code's own hook `timeout` (the settings value
- * below) must be larger, otherwise it fires first and a timed-out hook is a non-blocking error that lets
- * the call through.
- */
-export const HOOK_WRAPPER_TIMEOUT_S = 20;
-export const HOOK_SETTINGS_TIMEOUT_S = 30;
+// Hang guard constants live in hook-guard.ts (shared with the plugin hook commands in hooks.ts).
+export { HOOK_SETTINGS_TIMEOUT_S, HOOK_WRAPPER_TIMEOUT_S } from './hook-guard.js';
 /**
  * Fails closed: Claude Code treats any PreToolUse exit other than 2 as a non-blocking error and lets the
  * call through, so a missing binary (127) or a crash (1) becomes exit 2 (block). `minions hook` itself
  * always exits 0 and denies through its JSON output, so healthy coordinator calls are unaffected.
  */
-export const TELEGRAM_HOOK_COMMAND = `timeout ${HOOK_WRAPPER_TIMEOUT_S} minions hook pre-telegram || exit 2`;
+export const TELEGRAM_HOOK_COMMAND = `${hangGuarded('minions hook pre-telegram')} || exit 2`;
 
 /**
  * First user message of a coordinator started by `minions coordinator restart --recover`: run the recover
