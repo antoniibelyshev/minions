@@ -832,6 +832,8 @@ async function autoMergeStep(io: WizardIO | null, config: MinionsConfig, mode: D
   const lines = () => missing().map((r) => `still needed: ${r}`);
   if (mode !== 'pull-request') {
     io?.info(`  Auto-merge needs pull-request delivery (delivery is ${mode}); not asked.`);
+    // Local delivery: the switch turns on the local integrator (task-82.3); offering it here is phase 4.
+    if (on && mode === 'local') return { id: 'autoMerge', status: 'kept', detail: 'delivery.merge auto-when-eligible: the local integrator merges approved heads into the base', ...(missing().length ? { lines: lines() } : {}) };
     return on ? { id: 'autoMerge', status: 'kept', detail: `delivery.merge auto-when-eligible, but delivery is ${mode}: not usable`, later }
       : { id: 'autoMerge', status: 'skipped', detail: `auto-merge needs pull-request delivery (delivery is ${mode})`, later };
   }
