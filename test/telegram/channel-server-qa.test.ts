@@ -243,4 +243,20 @@ describe('one kill per launch', () => {
     writeFileSync(path, JSON.stringify({ version: 1, pid: 600, start: 's', launchId: 'launch-a', kills: 1, released: true }));
     expect(await acquireChannelLock(path, { pid: 602, start: 's', launchId: 'launch-b' }, alive)).toMatchObject({ ok: true, lock: { kills: 0 } });
   });
+
+  // Known defect (QA, task-67.2 retest): the takeover of a released (or stale) lock is write-then-read-back, not a
+  // mutex. Two servers racing interleave as write A, read A, write B, read B and both return ok, so two pollers run.
+  // About one race in six loses in-process, more than half across processes. Flip to it() once the takeover is atomic.
+  it.fails('two servers taking over the same released lock at once: at most one wins', async () => {
+    const path = join(dir, 'channel.lock');
+    const alive = { alive: () => true, startTime: () => 's' };
+    for (let i = 0; i < 200; i++) {
+      writeFileSync(path, JSON.stringify({ version: 1, pid: 600, start: 's', launchId: 'launch-a', kills: 1, released: true }));
+      const got = await Promise.all([
+        acquireChannelLock(path, { pid: 601, start: 's', launchId: 'launch-a' }, alive),
+        acquireChannelLock(path, { pid: 602, start: 's', launchId: 'launch-a' }, alive),
+      ]);
+      expect(got.filter((g) => g.ok).length, `round ${i}`).toBeLessThanOrEqual(1);
+    }
+  });
 });
