@@ -624,8 +624,9 @@ task-53.5.3 and are reused unchanged. Decisions made here:
   starts already, the owner's pause stays: only the drain is cleared, with `minions resume --drain` right after
   the restart ran (whatever it answered). A runtime that is stopped at the idle poll cannot be resumed: the
   request closes as failed and the outcome names the pause left in place and the command that clears it.
-- **CLI backup** (`src/host/cli-backup.ts`). `applyCli` packs the packed global install with
-  `npm pack <install dir> --ignore-scripts` (none of its scripts run) right before `npm install -g`, into
+- **CLI backup** (`src/host/cli-backup.ts`). `applyCli` archives the packed global install directory
+  as it is (a gzipped tar under `package/`; no npm, none of its scripts run: `npm pack <dir>` would run `prepare`
+  even with `--ignore-scripts`) right before `npm install -g`, into
   `<MINIONS_HOME>/manager/cli-backup/minions-<version>-<UTC stamp>.tgz` (0600, directory 0700, last 2). A backup
   that fails stops the reinstall, nothing installed. A linked checkout is rebuilt in place and has no backup. The
   backup is made by `minions upgrade` itself, so a terminal upgrade keeps one too.

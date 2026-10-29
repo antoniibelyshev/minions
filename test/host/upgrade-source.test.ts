@@ -2,6 +2,7 @@
 // installed-CLI check/reinstall with a fake npm (nothing is installed into any real global prefix).
 import { existsSync, mkdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { gunzipSync } from 'node:zlib';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { sourceFingerprint } from '../../scripts/source-fingerprint.mjs';
 import { run, type RunOptions, type RunResult } from '../../src/core/exec.js';
@@ -192,7 +193,7 @@ describe('--from-container sync', () => {
 
 // ---------------------------------------------------------------- cli
 
-interface NpmWorld { globalRoot: string; checkout: string; calls: string[]; fail?: 'install' | 'build' | 'backup'; lsResolved?: string }
+interface NpmWorld { globalRoot: string; checkout: string; calls: string[]; fail?: 'install' | 'build'; lsResolved?: string }
 
 /** Minions checkout with sources and (optionally) build deps. */
 function checkout(version = '0.2.0', deps = true): string {
@@ -232,14 +233,6 @@ function fakeNpm(w: NpmWorld) {
       expect(o?.cwd).toBe(w.checkout);
       stampDist(w.checkout, version, sourceFingerprint(w.checkout), kind);
       return { code: 0, stdout: '', stderr: '' };
-    }
-    if (args[0] === 'pack' && args.includes('--ignore-scripts')) {
-      // The backup of the current install (src/host/cli-backup.ts): packed from the global install, scripts off.
-      expect(args[1]).toBe(join(w.globalRoot, 'minions'));
-      if (w.fail === 'backup') return { code: 1, stdout: '', stderr: 'ENOSPC' };
-      const v = (JSON.parse(readFileSync(join(args[1]!, 'package.json'), 'utf8')) as { version: string }).version;
-      writeFileSync(join(args[args.indexOf('--pack-destination') + 1]!, `minions-${v}.tgz`), `installed ${v}`);
-      return { code: 0, stdout: `minions-${v}.tgz\n`, stderr: '' };
     }
     if (args[0] === 'pack') {
       expect(o?.cwd).toBe(w.checkout);
@@ -309,12 +302,13 @@ describe('installed CLI check', () => {
       spawnCli: async () => ({ code: 0, stdout: JSON.stringify({ ok: true, data: childResult() }), stderr: '' }),
     }));
     expect(p.cli).toMatchObject({ action: 'reinstall', reason: 'installed 0.1.0 != checkout 0.2.0' });
-    expect(mutatingNpm(w.calls).map((l) => l.split(' ').slice(0, 2).join(' '))).toEqual(['npm ci', 'npm pack', 'npm pack', 'npm install']);
+    expect(mutatingNpm(w.calls).map((l) => l.split(' ').slice(0, 2).join(' '))).toEqual(['npm ci', 'npm pack', 'npm install']);
     expect(p.cli!.installed.version).toBe('0.2.0');
     // The install it replaced was kept first (task-53.7).
     const backups = await listCliBackups();
     expect(backups.map((b) => b.version)).toEqual(['0.1.0']);
-    expect(readFileSync(backups[0]!.file, 'utf8')).toBe('installed 0.1.0');
+    // The backup is the install directory itself, archived under package/ (no npm pack: src/host/cli-backup.ts).
+    expect(gunzipSync(readFileSync(backups[0]!.file)).toString('latin1')).toContain('"version":"0.1.0"');
     expect(statSync(backups[0]!.file).mode & 0o777).toBe(0o600);
     expect(backups[0]!.file.startsWith(join(home.home, 'manager', 'cli-backup'))).toBe(true);
     expect(p.steps).toEqual([expect.objectContaining({ id: 'cli', status: 'done' })]);
@@ -443,9 +437,11 @@ describe('installed CLI check', () => {
   it('a backup that cannot be made stops the reinstall: npm install -g never runs', async () => {
     const c = checkout('0.2.0', false);
     realInstall(g, '0.1.0', 'old0000000000000', 'packed');
-    const w: NpmWorld = { globalRoot: g, checkout: c, calls: [], fail: 'backup' };
+    const w: NpmWorld = { globalRoot: g, checkout: c, calls: [] };
+    mkdirSync(join(home.home, 'manager'), { recursive: true });
+    writeFileSync(join(home.home, 'manager', 'cli-backup'), 'not a directory'); // the backup cannot be written
     const p = await runSourcePhase(phaseBase({ checkout: c, runner: fakeNpm(w), rebuildCli: true, spawnCli: async () => { throw new Error('must not spawn'); } }));
-    expect(p.stop?.reason).toMatch(/backing up the current CLI failed, so nothing was installed: npm pack of the current CLI failed: ENOSPC/);
+    expect(p.stop?.reason).toMatch(/backing up the current CLI failed, so nothing was installed: /);
     expect(w.calls.some((l) => l.startsWith('npm install'))).toBe(false);
     expect(await listCliBackups()).toEqual([]);
   });
@@ -677,7 +673,7 @@ describe('GitHub delivery: the CLI comes from the reviewed origin/<base> commit'
     expect(p.sync).toMatchObject({ source: 'origin', action: 'fast-forward', method: 'merge --ff-only', applied: true, from: o.base, to: merged, target: 'refs/remotes/origin/main' });
     expect(head(o.c)).toBe(merged);
     expect(readFileSync(join(o.c, 'src', 'feature.ts'), 'utf8')).toContain('feature.ts');
-    expect(mutatingNpm(w.calls).map((l) => l.split(' ').slice(0, 2).join(' '))).toEqual(['npm pack', 'npm pack', 'npm install']);
+    expect(mutatingNpm(w.calls).map((l) => l.split(' ').slice(0, 2).join(' '))).toEqual(['npm pack', 'npm install']);
     expect(p.stop).toBeNull();
     expect(p.steps.map((s) => s.id)).toEqual(['sync', 'cli']);
   });

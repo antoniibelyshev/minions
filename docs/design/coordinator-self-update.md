@@ -146,6 +146,10 @@ instructions (see phase 4), not in the shipped coordinator template.
      (`npm install -g --no-audit --no-fund <backup>` from the backup directory, a regular file only, its sha256
      logged). No new backup means the upgrade did not replace the CLI, so there is nothing to reinstall. If the
      reinstall fails, the rollback stops there: a `start` on the new CLI would rebuild the image from the new code.
+     The health check after such a stopped rollback runs only its two probes, not the whole window (nothing was
+     restarted, so waiting cannot help), and the owner hears it sooner. A failed upgrade that made no new backup and
+     left `<imageTag>` on the image it had replaced nothing: when two probes find the coordinator healthy on that
+     image, nothing is rolled back or restarted (no `down` and `start`); otherwise the rollback runs as below.
      Then re-tag `<imageTag>-prev` as `<imageTag>` (after checking it still holds the kept image ID), run
      `minions down` and `minions start --no-attach` on the old CLI, and restart the coordinator with
      `coordinator restart --recover` through the script's own docker exec, as the upgrade itself ends:
@@ -162,12 +166,16 @@ instructions (see phase 4), not in the shipped coordinator template.
    - **Verified in phase 3: the old image needs no rebuild.** `minions start` runs `ensureImage`, which rebuilds only
      when the image's `minions.build` label differs from `buildFingerprint(packageRoot())` of the running CLI: the
      sha256 of `dist/cli.js`, `docker/Dockerfile`, `docker/gh-wrapper.sh`,
-     `docker/minions-sandbox/minions-sandbox.c` and `package.json` (`src/host/docker.ts`). The backup is
-     `npm pack <install dir> --ignore-scripts` of the old install, and `npm pack` → `npm install -g` → `npm pack` →
-     `npm install -g` keeps those five files byte for byte (checked with npm 10.9), so the reinstalled CLI has the
-     fingerprint the old image was labelled with. If a future npm changed one of them, `start` would rebuild the image
-     from the old CLI: slower, but still the old code. `start` also regenerates the derived files (`compose.yaml`)
-     on the old CLI (`refreshDerived` in `openProject`).
+     `docker/minions-sandbox/minions-sandbox.c` and `package.json` (`src/host/docker.ts`). The backup is a
+     gzipped tar of the old install directory as it is (every entry under `package/`; `backupInstalledCli`), so it
+     holds those five files byte for byte, and `npm install -g <backup>` writes them back unchanged (npm 10.9.9,
+     tested in `test/host/cli-backup.test.ts`), so the reinstalled CLI has the fingerprint the old image was
+     labelled with. If a future npm changed one of them, `start` would rebuild the image from the old CLI: slower,
+     but still the old code. **Corrected in phase 3:** the backup was first `npm pack <install dir> --ignore-scripts`,
+     which never worked on npm 10.9: npm runs the `prepare` script of a directory it packs even with
+     `--ignore-scripts` (pacote's directory fetcher), and the installed package does not ship
+     `scripts/prepare.mjs`, so every backup, and with it every reinstall, failed. `start` also regenerates the
+     derived files (`compose.yaml`) on the old CLI (`refreshDerived` in `openProject`).
    - A bad SHA is not tried again. A later request whose `HEAD` is a different, newer commit is tried normally (a
      fix on main).
 
