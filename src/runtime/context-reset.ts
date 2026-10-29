@@ -267,6 +267,9 @@ export function sessionStartEventId(db: RuntimeDb, lock: { pid: number; session:
 /** The restart the coordinator runs on itself: detached, because the restart ends the calling session; refused with active leases. */
 export const RESET_RESTART_COMMAND = 'minions coordinator restart --recover --detach --json';
 
+/** The router's context reset threshold (decision 3): at most this, below coordinator.contextReset.contextTokens. */
+export const ROUTER_CONTEXT_TOKENS = 25_000;
+
 /** The event kind of a session's handoff (phase 6): separate from `coordinator-handoff`, which only the single coordinator counts. */
 export const SESSION_HANDOFF_EVENT = 'session-handoff';
 
@@ -287,7 +290,9 @@ export function sessionTranscript(db: Pick<RuntimeDb, 'getMeta'>, scope: Session
  */
 function sessionResetCheck(deps: ContextResetDeps, scope: SessionScope): ContextResetCheck {
   const { db } = deps;
-  const settings = contextResetSettings(deps.config);
+  const base = contextResetSettings(deps.config);
+  // The router (phase 8) resets early: it only routes, so its context never needs to be large (decision 3).
+  const settings = scope.kind === 'router' && base.contextTokens !== null ? { ...base, contextTokens: Math.min(base.contextTokens, ROUTER_CONTEXT_TOKENS) } : base;
   const rec = sessionTranscript(db, scope);
   const since = rec?.firstSeen ?? null;
   const blockers: string[] = [];

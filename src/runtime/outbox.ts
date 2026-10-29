@@ -24,16 +24,22 @@ export interface OutboxItem {
   key: string; kind: NotificationKind; taskId: string | null; text: string; createdAt: string;
   attempts: number; lastError: string | null; nextAttemptAt: string | null;
   deliveredAt: string | null; deliveredVia: string | null;
+  /** The coordinator session that enqueued it (`general`, `task:<id>`; null: the single coordinator or the router). */
+  session: string | null;
+  /** A question the owner answered (the router routed the answer back to its session). */
+  answeredAt: string | null;
 }
 
 interface OutboxRow {
   dedup_key: string; kind: string; task_id: string | null; text: string; created_at: string;
   attempts: number; last_error: string | null; next_attempt_at: string | null; delivered_at: string | null; delivered_via: string | null;
+  session: string | null; answered_at: string | null;
 }
 
 const toItem = (r: OutboxRow): OutboxItem => ({
   key: r.dedup_key, kind: r.kind as NotificationKind, taskId: r.task_id, text: r.text, createdAt: r.created_at,
   attempts: r.attempts, lastError: r.last_error, nextAttemptAt: r.next_attempt_at, deliveredAt: r.delivered_at, deliveredVia: r.delivered_via,
+  session: r.session ?? null, answeredAt: r.answered_at ?? null,
 });
 
 /** A channel that can deliver one notification; it throws when the send fails. */
@@ -287,6 +293,8 @@ export interface EnqueueInput {
    * pending() does not return the item before it. A held row is one with no attempt yet and a next_attempt_at.
    */
   holdUntil?: string | null;
+  /** The enqueuing coordinator session (task-57 phase 8): an answer to its question routes back to it. */
+  session?: string | null;
 }
 export interface EnqueueResult { created: boolean; item: OutboxItem }
 
@@ -305,9 +313,9 @@ export function enqueue(db: RuntimeDb, input: EnqueueInput, clock: Clock = syste
   return db.transaction(() => {
     const existing = get(db, key);
     if (existing) return { created: false, item: existing };
-    db.exec('INSERT INTO outbox (dedup_key, kind, task_id, text, created_at, attempts, next_attempt_at) VALUES (?, ?, ?, ?, ?, 0, ?)',
-      key, input.kind, input.taskId ?? null, text, clock().toISOString(), input.holdUntil ?? null);
-    db.addEvent('notify-enqueue', input.taskId ?? null, { key, kind: input.kind, ...(input.holdUntil ? { holdUntil: input.holdUntil } : {}) });
+    db.exec('INSERT INTO outbox (dedup_key, kind, task_id, text, created_at, attempts, next_attempt_at, session) VALUES (?, ?, ?, ?, ?, 0, ?, ?)',
+      key, input.kind, input.taskId ?? null, text, clock().toISOString(), input.holdUntil ?? null, input.session ?? null);
+    db.addEvent('notify-enqueue', input.taskId ?? null, { key, kind: input.kind, ...(input.holdUntil ? { holdUntil: input.holdUntil } : {}), ...(input.session ? { session: input.session } : {}) });
     return { created: true, item: get(db, key)! };
   });
 }

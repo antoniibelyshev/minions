@@ -474,6 +474,22 @@ need an owner decision first.
    coordinator's next turn. A context reset inside a task session is interim (handoff, keep the key). Live check for
    phase 9: a stream-json user message `/minions:task <id>` expands the plugin skill in a headless session.
 8. **child: Router, general session and outbound** | criteria: `coordinator route --json` resolver (rules 2 to 4 of the routing model, `ambiguous`), table tests; `coordinator send <key>` and `coordinator wait --json`; `notify enqueue --session`, `notify ack --message-id` and a `tg_messages` table with task-67.3's columns plus `session`; question items keep their session, and `Q1 2` answers route back; router prompt and skill on `models.router`, no Agent tool, resets allowed with active leases; the `general` session; the digest is sent by the router; poller and isolation checks unchanged and tested | depends: 7 (worker; may split into resolver/outbound and router/general if large)
+   Result (task-57.12, src/runtime/router.ts, src/runtime/router-prompt.ts, the `/minions:route` skill): with sessions
+   on, the interactive coordinator is the router: `models.router` (haiku), no Agent tool, `MINIONS_SESSION=router`,
+   and its system prompt is `ROUTER_PROMPT`, not coordinator.md (about 24k tokens). It always starts with
+   `/minions:route start`, also on recover and wake; `SESSIONS_COORDINATOR_NOTE` is gone, replaced by this launch.
+   `tg_messages` (schema 11) has one row per outbox key; the key column is `outbox_key` (not `key`), plus `session`.
+   An open question is a delivered `question` item without `answered_at` from the last 7 days; a null session means
+   `general`. `coordinator send` reopens a closed or failed session for an owner message; `general` itself is opened
+   by the supervisor on its first inbox message. A send to a task that never had a session opens it with the
+   `/minions:task` kickoff before the owner text. The task-session pass never closes a session while an owner message
+   waits in its inbox (it closes on a later pass, after that turn). `Q<n>` falls back to the only open question when
+   no digest numbered it. Leases held by `task:` or `general` no longer block a router restart or `sync`
+   (`leaseBlockers` in commands.ts); `live-run` still counts every lease. With the router running, the routine pass
+   does not restart it for the digest (its background `coordinator wait` returns `digest`); a crash start stays. The
+   router resets at min(`contextTokens`, 25k), checked with `coordinator handoff --check` as the last step of every
+   turn; that Reset step is the only time it restarts itself. Live checks for phase 9: the router keeps `coordinator wait` in the background
+   and wakes on its completion; an owner message reaches the general session; the poller stays `ok`.
 9. **child: Sessions live check, docs and rollout** | criteria: sessions in `minions status` and `doctor`; README, cli.md, bootstrap.md and telegram.md updated; the coordinator enables sessions on this project for at least 3 deliveries and reports tokens and USD per delivered task per role against this cost model, misroutes and the poller state; owner poll on keeping them on and on making them the default | depends: 8 (**live run** by the coordinator; **owner**)
 10. **child: Deterministic dispatcher on the supervisor (task-68.8 build part)** | criteria: launch kind `stage` (`claude -p --agent minions:<role>`, worker settings, no Telegram); a worker-guard rework so headless workers are guarded without `agent_id` (required: the spike found no `agent_id` in `--agent` hook inputs, U7; `MINIONS_ROLE`-style marking, tests for pre-bash, pre-file and drain); hook commands not exec'd from a `noexec` `/tmp` (U1); record with usage from stream-json; one correction resume; exceptions wake the task session; launch argv, env and settings test | depends: 9 (**owner** yes after the phase 9 numbers)
 
