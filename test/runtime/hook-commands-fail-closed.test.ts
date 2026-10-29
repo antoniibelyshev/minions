@@ -1,7 +1,8 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
-import { HOOK_SETTINGS_TIMEOUT_S, TELEGRAM_HOOK_COMMAND } from '../../src/runtime/coordinator.js';
-import { FAKE_MINIONS, runHookCommand } from '../helpers.js';
+import { HOOK_SETTINGS_TIMEOUT_S, HOOK_WRAPPER_TIMEOUT_S, TELEGRAM_HOOK_COMMAND } from '../../src/runtime/coordinator.js';
+import { hangGuarded } from '../../src/runtime/hook-guard.js';
+import { FAKE_MINIONS, HAS_COREUTILS_TIMEOUT, runHookCommand, withHangGuard } from '../helpers.js';
 
 // Tester (task-2.5): adversarial probes of the shell wrappers around the fail-closed PreToolUse hooks.
 // Claude Code blocks a PreToolUse call only on exit 2 (stdout JSON is ignored then); any other non-zero
@@ -17,7 +18,15 @@ const cases = [
   { name: 'pre-agent', command: PRE_AGENT_COMMAND, stdin: JSON.stringify({ hook_event_name: 'PreToolUse', tool_name: 'Agent', tool_input: { subagent_type: 'minions:engineer', prompt: 'x' } }) },
 ];
 
-describe.each(cases)('tester: $name hook command fails closed', ({ command, stdin }) => {
+// task-4: every probe runs under both hang guards; coreutils only where runHookCommand's PATH has `timeout`.
+const guards = [
+  { guard: 'perl' as const, skip: false },
+  { guard: 'coreutils' as const, skip: !HAS_COREUTILS_TIMEOUT },
+];
+const guarded = guards.flatMap((g) => cases.map((c) => ({ ...c, guard: g.guard, skip: g.skip, command: withHangGuard(c.command, { guard: g.guard }) })));
+
+describe.each(guarded)('tester: $name hook command fails closed ($guard guard)', ({ command, stdin, skip }) => {
+  if (skip) { it.skip('coreutils timeout not on PATH', () => {}); return; }
   it('blocks (exit 2) when the binary is missing, and the shell error is what was seen', () => {
     const r = runHookCommand(command, null, stdin);
     expect(r.status).toBe(2);
@@ -55,36 +64,47 @@ describe.each(cases)('tester: $name hook command fails closed', ({ command, stdi
   });
 });
 
-// task-2.7: a hang must deny too. coreutils `timeout` kills a stuck hook (124) and `|| exit 2` blocks.
-describe.each(cases)('$name hook command fails closed on a hang', ({ command, stdin }) => {
-  it('a hung minions is killed by the wrapper and blocks with exit 2 (timeout shortened for the test)', () => {
-    expect(command).toMatch(/^timeout 20 minions hook /);
-    const fast = command.replace(/^timeout 20 /, 'timeout 1 ');
+// task-2.7: a hang must deny too. The guard (coreutils `timeout`, or the perl watchdog on stock macOS, task-4) kills
+// a stuck hook (124) and `|| exit 2` blocks.
+describe.each(guarded)('$name hook command fails closed on a hang ($guard guard)', ({ command, stdin, skip }) => {
+  it.skipIf(skip)('a hung minions is killed by the wrapper and blocks with exit 2 (timeout shortened for the test)', () => {
+    const fast = withHangGuard(command, { seconds: 1 });
     const t0 = Date.now();
     const r = runHookCommand(fast, '#!/bin/sh\nsleep 30\n', stdin);
     expect(r.status).toBe(2);
     expect(Date.now() - t0).toBeLessThan(15000);
   });
+
+  it.skipIf(skip)('a hook that ends in time keeps its stdin and exit 0', () => {
+    const r = runHookCommand(withHangGuard(command, { seconds: 5 }), '#!/bin/sh\ncat\n', stdin);
+    expect(r).toMatchObject({ status: 0, stdout: stdin });
+  });
+});
+
+describe('task-4: the perl fallback without perl', () => {
+  it('blocks (exit 2) when neither timeout nor perl is on PATH', () => {
+    const command = withHangGuard(TELEGRAM_HOOK_COMMAND, { guard: 'perl' }).replace('perl -e', '/nonexistent/perl -e');
+    expect(runHookCommand(command, FAKE_MINIONS.allow, '{}').status).toBe(2);
+  });
 });
 
 describe('hook entries carry a timeout larger than the wrapper', () => {
-  const wrapper = (c: string) => Number(/^timeout (\d+) /.exec(c)![1]);
   it('plugin pre-agent entry', () => {
     const h = template.hooks.PreToolUse.find((e) => e.matcher === 'Agent')!.hooks[0] as { command: string; timeout?: number };
-    expect(h.timeout).toBeGreaterThan(wrapper(h.command));
+    expect(h.command).toContain(`timeout ${HOOK_WRAPPER_TIMEOUT_S} minions hook pre-agent`);
+    expect(h.timeout).toBeGreaterThan(HOOK_WRAPPER_TIMEOUT_S);
   });
   it('coordinator pre-telegram entry', () => {
-    expect(HOOK_SETTINGS_TIMEOUT_S).toBeGreaterThan(wrapper(TELEGRAM_HOOK_COMMAND));
+    expect(HOOK_SETTINGS_TIMEOUT_S).toBeGreaterThan(HOOK_WRAPPER_TIMEOUT_S);
   });
 });
 
 describe('task-2.7: wrapper shape and shell safety', () => {
-  const shape = /^timeout (\d+) minions hook (pre-agent|pre-telegram) \|\| exit 2$/;
   it('both gating hooks use the same wrapper, with plain shell-safe words only', () => {
     const agent = (template.hooks.PreToolUse.find((e) => e.matcher === 'Agent')!.hooks[0] as { command: string; timeout?: number });
-    expect(agent.command).toMatch(shape);
-    expect(TELEGRAM_HOOK_COMMAND).toMatch(shape);
-    expect(agent.command.replace('pre-agent', 'X')).toBe(TELEGRAM_HOOK_COMMAND.replace('pre-telegram', 'X'));
+    expect(agent.command).toBe(`${hangGuarded('minions hook pre-agent')} || exit 2`);
+    expect(TELEGRAM_HOOK_COMMAND).toBe(`${hangGuarded('minions hook pre-telegram')} || exit 2`);
+    expect(agent.command.replaceAll('pre-agent', 'X')).toBe(TELEGRAM_HOOK_COMMAND.replaceAll('pre-telegram', 'X'));
     expect(agent.timeout).toBe(HOOK_SETTINGS_TIMEOUT_S);
   });
 });
