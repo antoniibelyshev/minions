@@ -233,6 +233,8 @@ export interface TaskBrief {
     id: string; locator: string; title: string; description: string; objective: string;
     acceptanceCriteria: { text: string; done: boolean }[];
     nonGoals: string[]; dependencies: string[]; labels: string[]; parent: string | null; externalLinks: string[];
+    /** The task's backlog notes at claim time (oldest first, the most recent ~8 KB); absent when there are none. */
+    notes?: string;
   };
   relevantDecisions: string[];
   relevantFiles: string[];
@@ -997,6 +999,7 @@ export class Scheduler {
         id: task.id, locator: task.locator, title: task.title, description: task.description, objective: task.description,
         acceptanceCriteria: task.acceptanceCriteria, nonGoals: [], dependencies: task.dependencies,
         labels: task.labels, parent: task.parent, externalLinks: task.externalLinks,
+        ...(task.notes ? { notes: task.notes } : {}),
       },
       relevantDecisions: [],
       relevantFiles: [],
