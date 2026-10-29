@@ -4,6 +4,9 @@ Status: **proposed** (task-82 design against main @ 35dd23b, 2026-10-29). Nothin
 before the build starts. The build phases are in [Phases](#phases), and the open points are
 [Decisions for the owner](#decisions-for-the-owner).
 
+Build: phases 1-4 are implemented (task-82.1 to 82.4); the surface decisions are recorded in
+[bootstrap.md](bootstrap.md#automatic-local-integration-surface).
+
 Owner request (TG 392/395, 2026-10-27): use `delivery.mode: local` instead of GitHub PRs, but merging an approved
 branch must be **deterministic and done by the runtime**, with no coordinator steps.
 
