@@ -4,6 +4,7 @@ import { MinionsError } from '../core/errors.js';
 import { withContextReset } from './context-reset.js';
 import type { RuntimeDb } from './db.js';
 import { claimWithBrief, compactClaim, recordSubmitted, type CompactClaim, type HandoffPaths } from './handoff.js';
+import { sessionScope, type SessionScope } from './session-scope.js';
 import type { NextReport, NextStage, RecordResponse, Scheduler, UsageFlag } from './scheduler.js';
 
 /**
@@ -14,6 +15,10 @@ import type { NextReport, NextStage, RecordResponse, Scheduler, UsageFlag } from
  * the same task's next stage first, else the first runnable stage overall. All checks stay in those functions;
  * this module only decides whether to claim, and never claims while paused, draining, over budget, after an
  * invalid result, when a context reset is due, or while the reset barrier holds new starts (task-57.6).
+ *
+ * `--task <id>` (phase 6 of docs/design/coordinator-sessions.md; the default in a `task:<id>` session): the lease
+ * must be a stage of that task (else nothing is recorded), and only that task's next stage is claimed, never another
+ * task's; when it has none, the decision says why.
  */
 
 /** Why advance claimed nothing: the coordinator decides (see the orchestrate skill, step 6). */
@@ -87,7 +92,11 @@ export interface AdvanceResponse {
   message: string;
 }
 
-export interface AdvanceDeps { db: RuntimeDb; config: MinionsConfig; state?: string }
+export interface AdvanceDeps {
+  db: RuntimeDb; config: MinionsConfig; state?: string;
+  /** The coordinator session (undefined: read from MINIONS_SESSION; a malformed value is refused). */
+  session?: SessionScope | null;
+}
 
 /** The worker result fields advance reads back after a valid record. */
 interface StoredResult { status?: string; findings?: unknown[] }
@@ -143,13 +152,31 @@ export function nextDecision(db: RuntimeDb, n: NextReport): AdvanceDecision | nu
 export const pickStage = (n: NextReport, taskId: string): NextStage | undefined =>
   n.runnable.find((s) => s.taskId === taskId) ?? n.runnable[0];
 
+const STARTS_HELD = new Set<AdvanceDecisionKind>(['draining', 'paused', 'budget', 'context-reset-pending']);
+
+/** `--task`: why the task has no runnable stage now, or null when it has one (other tasks' stages never count). */
+export function taskDecision(n: NextReport, taskId: string): AdvanceDecision | null {
+  if (n.runnable.some((s) => s.taskId === taskId)) return null;
+  const waiting = n.waiting.filter((w) => w.taskId === taskId).map((w) => ({ taskId: w.taskId, role: w.role, waitingOn: w.waitingOn, why: w.why }));
+  const capped = waiting.filter((w) => w.waitingOn !== 'starts' && w.waitingOn !== 'requires');
+  const message = waiting.length ? `${taskId} waits: ${waiting.map((w) => w.why).join('; ')}` : `${taskId} has no runnable stage now.`;
+  return { kind: capped.length ? 'capacity' : 'nothing-runnable', taskId, message, ...(waiting.length ? { waiting } : {}) };
+}
+
 const advanceNext = (c: CompactClaim, s: NextStage): AdvanceNext => ({
   ...c, agentType: s.agentType, agentModel: s.agentModel, suggestedModel: s.suggestedModel,
   ...(s.launch.kind === 'run' ? { launch: s.launch } : {}), reason: s.reason,
 });
 
 /** `minions work advance`: record the submitted result, then claim the next stage or return a decision. */
-export async function advanceLease(sched: Scheduler, p: HandoffPaths, leaseId: string, opts: { correction?: boolean; usage?: UsageFlag }, deps: AdvanceDeps): Promise<AdvanceResponse> {
+export async function advanceLease(sched: Scheduler, p: HandoffPaths, leaseId: string, opts: { correction?: boolean; usage?: UsageFlag; task?: string }, deps: AdvanceDeps): Promise<AdvanceResponse> {
+  const only = advanceTask(deps, opts.task);
+  if (only !== null) {
+    const lease = deps.db.lease(leaseId);
+    if (lease && lease.task_id !== only) {
+      throw new MinionsError('PRECONDITION', `Lease ${leaseId} is a stage of ${lease.task_id}, not ${only}; nothing was recorded.`, `Advance only ${only}'s leases here.`, { leaseId, taskId: lease.task_id, task: only });
+    }
+  }
   const recorded = await recordSubmitted(sched, p, leaseId, opts);
   const record: AdvanceRecord = withContextReset(recorded, deps);
   const worker = record.valid ? storedResult(deps.db, leaseId) : {};
@@ -160,8 +187,13 @@ export async function advanceLease(sched: Scheduler, p: HandoffPaths, leaseId: s
   try {
     const report = await sched.next();
     const blocked = nextDecision(deps.db, report);
-    if (blocked) return stop(blocked);
-    stage = pickStage(report, record.taskId)!;
+    // With --task, only the start-wide holds come from `work next`; capacity and runnability are the task's own.
+    if (blocked && (only === null || STARTS_HELD.has(blocked.kind))) return stop(blocked);
+    if (only !== null) {
+      const none = taskDecision(report, only);
+      if (none) return stop(none);
+      stage = report.runnable.find((s) => s.taskId === only)!;
+    } else stage = pickStage(report, record.taskId)!;
     const next = advanceNext(compactClaim(await claimWithBrief(sched, p, stage.taskId, stage.role)), stage);
     return { record, next, message: `${record.message} Next: ${next.taskId} ${next.role} (${next.leaseId}).` };
   } catch (e) {
@@ -173,6 +205,20 @@ export async function advanceLease(sched: Scheduler, p: HandoffPaths, leaseId: s
     const kind: AdvanceDecisionKind = code === 'CAPACITY' ? 'capacity' : 'claim-failed';
     return stop({ kind, taskId: stage?.taskId ?? record.taskId, message, code, ...(e instanceof MinionsError && e.hint ? { hint: e.hint } : {}) });
   }
+}
+
+/**
+ * The task `work advance` is limited to: `--task`, else the task of a `task:<id>` session, else null (any task). In
+ * a task session `--task` must name its own task; the router and the general session never claim.
+ */
+function advanceTask(deps: AdvanceDeps, task: string | undefined): string | null {
+  const scope = deps.session === undefined ? sessionScope() : deps.session;
+  if (scope && scope.kind !== 'task') throw new MinionsError('POLICY_DENIED', `The ${scope.key} session never records or claims stages.`, 'Task stages are advanced by their task session (`task:<id>`).');
+  if (task !== undefined && (task === '' || task.length > 100)) throw new MinionsError('PRECONDITION', 'Invalid --task value.', 'Name a task id, e.g. --task task-57.');
+  if (scope?.taskId && task !== undefined && task !== scope.taskId) {
+    throw new MinionsError('POLICY_DENIED', `Session ${scope.key} cannot advance ${task}: a task session advances only its own task.`, `Use --task ${scope.taskId} (or omit it).`);
+  }
+  return task ?? scope?.taskId ?? null;
 }
 
 /** Human output of `work advance`. */

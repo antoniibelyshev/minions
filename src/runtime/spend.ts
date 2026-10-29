@@ -1,7 +1,7 @@
 import type { MinionsConfig } from '../config/schema.js';
 import { MinionsError } from '../core/errors.js';
 import type { RuntimeDb } from './db.js';
-import { sessionStates, totalOf, weightedMTok, type CoordinatorSessionState, type SessionEndTrigger, type UsageComponents } from './coordinator-usage.js';
+import { sessionStates, totalOf, weightedMTok, type CoordinatorRole, type CoordinatorSessionState, type SessionEndTrigger, type UsageComponents } from './coordinator-usage.js';
 
 /**
  * Spend monitoring (task-32): a durable usage tally and an owner budget, kept in the runtime DB without a
@@ -303,7 +303,14 @@ export interface CoordinatorBaseline {
   /** API-key billing: the coordinator's share of the estimated USD since `since`. */
   usdShare?: number | null;
   model: string | null;
+  /**
+   * Tokens per role (phase 6 of the design): the single coordinator, the router, task and general sessions. Present
+   * only once a session state carries a role other than `coordinator` (without sessions the baseline is unchanged).
+   */
+  perRole?: Partial<Record<CoordinatorRole, RoleBaseline>>;
 }
+
+export interface RoleBaseline { sessions: number; open: number; tokens: number; turns: number; estimatedUsd?: number }
 
 const ratio = (a: number, b: number) => (b > 0 ? Math.round(a / b) : null);
 
@@ -326,7 +333,12 @@ export function coordinatorBaseline(ctx: { db: RuntimeDb; billing: Billing; fall
   const resetTriggers: Record<string, number> = {};
   let turns = 0; let contextSum = 0; let maxContext = 0; let ownerMessages = 0; let recovered = 0; let overhead = 0; let usd = 0;
   let woken = 0; let wakeTokens = 0;
+  const perRole: Partial<Record<CoordinatorRole, RoleBaseline & { usd: number }>> = {};
   for (const s of states) {
+    const role = (perRole[s.role] ??= { sessions: 0, open: 0, tokens: 0, turns: 0, usd: 0 });
+    role.sessions++; if (!s.ended) role.open++;
+    role.tokens += totalOf(s.components); role.turns += s.turns;
+    role.usd += weightedMTok(s.components) * (usdPerMTok(s.model) ?? usdPerMTok(ctx.fallbackModel) ?? 0);
     for (const k of COMPONENT_KEYS) components[k] += s.components[k];
     turns += s.turns; contextSum += s.contextSum; maxContext = Math.max(maxContext, s.maxContext); ownerMessages += s.ownerMessages;
     if (s.recovered) { recovered++; overhead += s.overhead; }
@@ -358,6 +370,8 @@ export function coordinatorBaseline(ctx: { db: RuntimeDb; billing: Billing; fall
     share,
     ...(ctx.billing === 'api-key' ? { estimatedUsd: Math.round(usd * 100) / 100, usdShare } : {}),
     model: [...states].reverse().find((s) => s.model)?.model ?? null,
+    ...(states.some((s) => s.role !== 'coordinator') ? { perRole: Object.fromEntries(Object.entries(perRole).map(([r, { usd, ...v }]) =>
+      [r, { ...v, ...(ctx.billing === 'api-key' ? { estimatedUsd: Math.round(usd * 100) / 100 } : {}) }])) } : {}),
   };
 }
 
@@ -513,6 +527,7 @@ export function humanBaseline(b: CoordinatorBaseline): string {
   return [
     `coordinator baseline since ${b.since}: ${b.sessions} session(s) (${b.open} open; ended: ${ended}${resets ? `; resets by trigger: ${resets}` : ''}), ${b.turns.total} turns (${b.turns.perSession ?? '-'}/session)`,
     `  context/turn mean ${k(b.contextPerTurn.mean)}, max ${k(b.contextPerTurn.max)}; tokens/delivered task ${k(b.tokensPerDeliveredTask)} (${b.deliveredTasks} delivered); tokens/owner message ${k(b.tokensPerOwnerMessage)} (${b.ownerMessages})`,
+    ...(b.perRole ? [`  per role: ${Object.entries(b.perRole).map(([r, v]) => `${r} ${k(v.tokens)} tokens (${v.sessions} session(s), ${v.turns} turns${v.estimatedUsd !== undefined ? `, ~$${v.estimatedUsd.toFixed(2)}` : ''})`).join('; ')}`] : []),
     `  reset overhead ${k(b.resetOverhead.perRecovery)}/recovery (${b.resetOverhead.recoveredSessions} recovered); routine wakes ${b.wakes.sessions} (${k(b.wakes.perWake)}/wake); coordinator share ${pct(b.share)} of tokens${b.estimatedUsd !== undefined ? `, ~$${b.estimatedUsd.toFixed(2)} weighted est. (${pct(b.usdShare)} of USD)` : ''}`,
   ].join('\n');
 }

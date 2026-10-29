@@ -20,6 +20,9 @@ const maxWorkers = Number(process.env.MINIONS_TEST_MAX_WORKERS) || 4;
 process.env.BUN_JSC_useConcurrentJIT ??= '0';
 process.env.UV_THREADPOOL_SIZE ??= '2';
 if (!/--v8-pool-size/.test(process.env.NODE_OPTIONS ?? '')) process.env.NODE_OPTIONS = `${process.env.NODE_OPTIONS ?? ''} --v8-pool-size=1`.trim();
+// A worker of a coordinator session inherits MINIONS_SESSION (task-57 phase 6), which scopes claims, context
+// resets and hooks to that session; the suite runs as the single coordinator unless a test sets it itself.
+delete process.env.MINIONS_SESSION;
 
 export default defineConfig({
   define: { __MINIONS_VERSION__: JSON.stringify(pkg.version) },

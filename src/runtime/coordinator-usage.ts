@@ -1,6 +1,7 @@
 import { closeSync, fstatSync, openSync, readSync } from 'node:fs';
 import type { MinionsConfig } from '../config/schema.js';
 import type { RuntimeDb } from './db.js';
+import { hookScope, scopedMetaKey, type SessionScope, type SessionScopeKind } from './session-scope.js';
 
 /**
  * Coordinator token tracking (task-57.1, step 1 of docs/design/coordinator-sessions.md).
@@ -17,6 +18,10 @@ import type { RuntimeDb } from './db.js';
  *
  * Best-effort throughout: nothing here throws to the caller, the read is bounded in bytes and time, and
  * the Stop decision never depends on it. No schema change: meta rows and `usage` events only.
+ *
+ * Sessions (MINIONS_SESSION, phase 6 of the design): a session's states carry its role (`router`, `task`,
+ * `general`) and key; a new claude session of a key completes only the open states of that key, never another
+ * session's (or the single coordinator's). Without the variable the role is `coordinator` and no key is stored.
  */
 
 export const USAGE_META_PREFIX = 'coordinator_usage:';
@@ -30,6 +35,8 @@ const RECENT_IDS = 500;
 export interface UsageComponents { input: number; cacheRead: number; cacheWrite: number; output: number }
 /** wake: the routine pass restarted it with a fresh wake session (`coordinator restart --wake`, task-68.2). */
 export type SessionEndTrigger = 'context-reset' | 'restart' | 'wake' | 'exit';
+/** `coordinator`: the single coordinator (MINIONS_SESSION unset); else the session kind. */
+export type CoordinatorRole = 'coordinator' | SessionScopeKind;
 /**
  * Meta key: when the Stop hook last counted a new owner (Telegram) message in the main session (ISO time). The
  * routine pass never wakes the coordinator within 30 minutes of it (a live conversation is never cut).
@@ -44,7 +51,9 @@ export interface CoordinatorSessionState {
   offset: number;
   firstAt: string;
   lastAt: string;
-  role: 'coordinator';
+  role: CoordinatorRole;
+  /** The MINIONS_SESSION key (absent for the single coordinator). */
+  sessionKey?: string;
   model: string | null;
   components: UsageComponents;
   /** Main-session assistant messages (API calls) counted. */
@@ -71,9 +80,9 @@ export interface CoordinatorSessionState {
 export const totalOf = (c: UsageComponents) => c.input + c.cacheRead + c.cacheWrite + c.output;
 const zero = (): UsageComponents => ({ input: 0, cacheRead: 0, cacheWrite: 0, output: 0 });
 
-export function newSessionState(sessionId: string, path: string, now: Date, model: string | null = null): CoordinatorSessionState {
+export function newSessionState(sessionId: string, path: string, now: Date, model: string | null = null, scope: SessionScope | null = null): CoordinatorSessionState {
   const at = now.toISOString();
-  return { version: 1, sessionId, path, offset: 0, firstAt: at, lastAt: at, role: 'coordinator', model, components: zero(), turns: 0, contextSum: 0, maxContext: 0, ownerMessages: 0, recovered: null, overhead: 0, overheadDone: false, recentIds: [] };
+  return { version: 1, sessionId, path, offset: 0, firstAt: at, lastAt: at, role: scope ? scope.kind : 'coordinator', ...(scope ? { sessionKey: scope.key } : {}), model, components: zero(), turns: 0, contextSum: 0, maxContext: 0, ownerMessages: 0, recovered: null, overhead: 0, overheadDone: false, recentIds: [] };
 }
 
 // ---------------------------------------------------------------- parsing
@@ -258,7 +267,7 @@ function persist(db: UsageDb, s: CoordinatorSessionState, changed: boolean): voi
   db.setMeta(USAGE_META_PREFIX + s.sessionId, JSON.stringify(s));
   if (!changed) return;
   db.addEvent('usage', null, {
-    key: `session:${s.sessionId}`, scope: 'session', session: s.sessionId, role: s.role,
+    key: `session:${s.sessionId}`, scope: 'session', session: s.sessionId, role: s.role, ...(s.sessionKey ? { sessionKey: s.sessionKey } : {}),
     tokens: totalOf(s.components), model: s.model, source: 'transcript',
     components: { ...s.components }, turns: s.turns, maxContext: s.maxContext, ownerMessages: s.ownerMessages,
   });
@@ -274,7 +283,8 @@ export interface TrackDeps {
 
 /**
  * The Stop hook's step: only for the main coordinator session (no `agent_id`/`agent_type`, not a process
- * worker, a coordinator lock held). Never throws.
+ * worker, a coordinator lock held), or for a headless session's main thread (a valid MINIONS_SESSION: the lock is
+ * the router's, so it is not required; a malformed value records nothing). Never throws.
  */
 export function trackCoordinatorUsage(deps: TrackDeps, input: Record<string, unknown>): { recorded: boolean; reason: string } {
   try {
@@ -282,16 +292,18 @@ export function trackCoordinatorUsage(deps: TrackDeps, input: Record<string, unk
     if (input.agent_id !== undefined && input.agent_id !== null) return { recorded: false, reason: 'subagent' };
     if (input.agent_type !== undefined && input.agent_type !== null) return { recorded: false, reason: 'subagent' };
     if (env.MINIONS_ROLE) return { recorded: false, reason: 'worker process' };
+    const { scope, invalid } = hookScope(env);
+    if (invalid) return { recorded: false, reason: 'invalid MINIONS_SESSION' };
     const path = input.transcript_path;
     const sessionId = input.session_id;
     if (typeof path !== 'string' || !path.endsWith('.jsonl') || typeof sessionId !== 'string' || !/^[A-Za-z0-9_.-]{1,128}$/.test(sessionId)) return { recorded: false, reason: 'no transcript' };
-    if (!deps.db.coordinatorLock()) return { recorded: false, reason: 'no coordinator lock' };
+    if (!scope && !deps.db.coordinatorLock()) return { recorded: false, reason: 'no coordinator lock' };
     const now = deps.now ?? new Date();
     let s = readSessionState(deps.db, sessionId);
     const fresh = !s;
     if (!s || s.path !== path) {
       // A new session (or the same id on another file: start that file from the beginning, keep the totals).
-      s = s ? { ...s, path, offset: 0 } : newSessionState(sessionId, path, now, deps.config?.models.coordinator ?? null);
+      s = s ? { ...s, path, offset: 0 } : newSessionState(sessionId, path, now, deps.config?.models.coordinator ?? null, scope);
     }
     if (s.ended) delete s.ended; // resumed after it was completed
     const before = totalOf(s.components);
@@ -301,7 +313,7 @@ export function trackCoordinatorUsage(deps: TrackDeps, input: Record<string, unk
     if (s.ownerMessages > ownerBefore) { try { deps.db.setMeta(LAST_OWNER_MESSAGE_META, s.lastAt); } catch { /* best-effort */ } }
     persist(deps.db, s, totalOf(s.components) !== before);
     // A new session: the previous one ended; complete it now if the next start did not.
-    if (fresh) completeOpenSessions({ ...deps, except: sessionId });
+    if (fresh) completeOpenSessions({ ...deps, except: sessionId, session: s.sessionKey ?? null });
     return { recorded: true, reason: r.missing ? 'transcript missing' : `turns ${s.turns}, ${totalOf(s.components)} tokens${r.more ? ' (more to read)' : ''}` };
   } catch (e) {
     return { recorded: false, reason: `error: ${(e as Error).message}` };
@@ -311,25 +323,32 @@ export function trackCoordinatorUsage(deps: TrackDeps, input: Record<string, unk
 interface RestartInfo { at?: string; reason?: string; wake?: boolean }
 const parse = <T>(v: string | undefined): T | null => { try { return v ? JSON.parse(v) as T : null; } catch { return null; } };
 
-/** Why a session ended: the self-reset request, else a recorded restart, else it just exited (crash, stop, quit). */
+/**
+ * Why a session ended: the self-reset request, else a recorded restart, else it just exited (crash, stop, quit). A
+ * keyed session reads only its own reset request (`coordinator_reset_request:<key>`); coordinator restarts are the
+ * router's and never end it.
+ */
 function endTrigger(db: UsageDb, s: CoordinatorSessionState): { trigger: SessionEndTrigger; detail?: string } {
-  const req = parse<{ at?: string; triggers?: string[] }>(db.getMeta(RESET_REQUEST_META));
+  const req = parse<{ at?: string; triggers?: string[] }>(db.getMeta(s.sessionKey ? `${RESET_REQUEST_META}:${s.sessionKey}` : RESET_REQUEST_META));
   if (req?.at && req.at >= s.firstAt) return { trigger: 'context-reset', detail: req.triggers?.length ? req.triggers.join(',') : 'requested' };
+  if (s.sessionKey) return { trigger: 'exit' };
   const restart = parse<RestartInfo>(db.getMeta('coordinator_restart'));
   if (restart?.at && restart.at >= s.firstAt) return { trigger: restart.wake ? 'wake' : 'restart', ...(restart.reason ? { detail: restart.reason.slice(0, 200) } : {}) };
   return { trigger: 'exit' };
 }
 
 /**
- * Completes every session not marked ended (except `except`): reads what is left of its transcript and
- * marks it ended with its trigger. Runs at coordinator start and when a Stop hook sees a new session.
+ * Completes every session not marked ended (except `except`) of the same key: reads what is left of its transcript
+ * and marks it ended with its trigger. Runs at coordinator start and when a Stop hook sees a new session. `session`
+ * (default null, the single coordinator) is the key: only states of that key are completed, so a session never
+ * ends another one's states.
  */
-export function completeOpenSessions(deps: Omit<TrackDeps, 'env'> & { except?: string }): { completed: string[] } {
+export function completeOpenSessions(deps: Omit<TrackDeps, 'env'> & { except?: string; session?: string | null }): { completed: string[] } {
   const completed: string[] = [];
   try {
     const now = deps.now ?? new Date();
     for (const s of sessionStates(deps.db)) {
-      if (s.ended || s.sessionId === deps.except) continue;
+      if (s.ended || s.sessionId === deps.except || (s.sessionKey ?? null) !== (deps.session ?? null)) continue;
       const before = totalOf(s.components);
       // Up to a few chunks: the remainder of one session is small.
       for (let i = 0; i < 8; i++) { const r = readIncrement(s, deps.limits); if (!r.more || !r.advanced) break; }
@@ -346,9 +365,12 @@ export function lastOwnerMessageAt(db: Pick<RuntimeDb, 'getMeta'>): string | nul
   try { const v = db.getMeta(LAST_OWNER_MESSAGE_META); return v && !Number.isNaN(Date.parse(v)) ? v : null; } catch { return null; }
 }
 
-/** `coordinator restart --detach` (the self-reset) records which triggers held, so the ended session says why. */
-export function noteResetRequest(db: Pick<RuntimeDb, 'setMeta'>, triggers: string[], now: Date = new Date()): void {
-  try { db.setMeta(RESET_REQUEST_META, JSON.stringify({ at: now.toISOString(), triggers })); } catch { /* best-effort */ }
+/**
+ * `coordinator restart --detach` (the self-reset) records which triggers held, so the ended session says why. A
+ * session's reset (phase 7) records it under its key.
+ */
+export function noteResetRequest(db: Pick<RuntimeDb, 'setMeta'>, triggers: string[], now: Date = new Date(), scope: SessionScope | null = null): void {
+  try { db.setMeta(scopedMetaKey(RESET_REQUEST_META, scope), JSON.stringify({ at: now.toISOString(), triggers })); } catch { /* best-effort */ }
 }
 
 // ---------------------------------------------------------------- weighting

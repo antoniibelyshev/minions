@@ -5,6 +5,7 @@ import { atomicWrite } from '../core/fsutil.js';
 import { redact } from '../core/output.js';
 import type { RuntimeDb } from './db.js';
 import { withOpenRuns } from './runner/record.js';
+import { scopedMetaKey, sessionScope, type SessionScope } from './session-scope.js';
 
 /**
  * Routine coordinator context resets (task-45). The coordinator session's context grows with every turn;
@@ -94,7 +95,11 @@ export function redactHandoff(text: string): { text: string; redactions: number 
   return { text: out, redactions: Math.max(0, marks(out) - marks(text)) };
 }
 
-export interface StoredHandoff { version: 1; writtenAt: string; session: string | null; bytes: number; redactions: number; text: string }
+export interface StoredHandoff {
+  version: 1; writtenAt: string; session: string | null; bytes: number; redactions: number; text: string;
+  /** The MINIONS_SESSION key that wrote it (phase 6); absent for the single coordinator. */
+  sessionKey?: string;
+}
 
 export interface HandoffWriteResult { path: string; writtenAt: string; bytes: number; maxBytes: number; redactions: number; replaced: boolean }
 
@@ -109,7 +114,7 @@ function readStored(path: string): StoredHandoff | null {
  * `minions coordinator handoff` (stdin): redacts, enforces the cap, replaces the stored handoff. Over the cap
  * it is refused (PRECONDITION) and the previous handoff is kept: nothing is silently cut off.
  */
-export async function writeHandoff(deps: { db: RuntimeDb; path: string; now?: Date }, raw: string): Promise<HandoffWriteResult> {
+export async function writeHandoff(deps: { db: RuntimeDb; path: string; now?: Date; scope?: SessionScope | null }, raw: string): Promise<HandoffWriteResult> {
   const trimmed = raw.replace(/\r\n/g, '\n').trim();
   if (!trimmed) throw new MinionsError('PRECONDITION', 'The handoff is empty.', 'Pipe a short note on stdin (a quoted heredoc): open owner questions with your recommended answers, pending decisions, what you are waiting on, spend, chat context the durable state does not hold.');
   const { text, redactions } = redactHandoff(trimmed);
@@ -120,11 +125,14 @@ export async function writeHandoff(deps: { db: RuntimeDb; path: string; now?: Da
   }
   const replaced = readStored(deps.path) !== null;
   const writtenAt = (deps.now ?? new Date()).toISOString();
+  const scope = deps.scope ?? null;
   const session = deps.db.coordinatorLock()?.session ?? null;
-  const stored: StoredHandoff = { version: 1, writtenAt, session, bytes, redactions, text };
+  const stored: StoredHandoff = { version: 1, writtenAt, session, bytes, redactions, text, ...(scope ? { sessionKey: scope.key } : {}) };
   await atomicWrite(deps.path, JSON.stringify(stored, null, 2) + '\n', { mode: 0o600 });
-  // The event carries no text: the DB and logs never hold the handoff body.
-  deps.db.addEvent('coordinator-handoff', null, { bytes, redactions, replaced });
+  // The event carries no text: the DB and logs never hold the handoff body. A session's handoff is its own event
+  // kind naming the key, so only that session's contextResetCheck counts it (never the single coordinator's).
+  if (scope) deps.db.addEvent(SESSION_HANDOFF_EVENT, scope.taskId, { bytes, redactions, replaced, session: scope.key });
+  else deps.db.addEvent('coordinator-handoff', null, { bytes, redactions, replaced });
   return { path: deps.path, writtenAt, bytes, maxBytes: HANDOFF_MAX_BYTES, redactions, replaced };
 }
 
@@ -142,15 +150,19 @@ export function readHandoff(path: string, now: Date = new Date()): HandoffReadRe
 
 // ---------------------------------------------------------------- transcript usage
 
-/** The Stop hook's input names the main session's transcript; remember it (meta only: no event, so the stop guard's fingerprint is unchanged). */
-export function noteTranscript(db: Pick<RuntimeDb, 'setMeta' | 'getMeta'>, input: Record<string, unknown>, now: Date = new Date()): void {
+/**
+ * The Stop hook's input names the main session's transcript; remember it (meta only: no event, so the stop guard's
+ * fingerprint is unchanged). In a session (MINIONS_SESSION, phase 6) the record is `coordinator_transcript:<key>`.
+ */
+export function noteTranscript(db: Pick<RuntimeDb, 'setMeta' | 'getMeta'>, input: Record<string, unknown>, now: Date = new Date(), scope: SessionScope | null = null): void {
   const path = input.transcript_path;
   if (typeof path !== 'string' || !path.endsWith('.jsonl')) return;
   const sessionId = typeof input.session_id === 'string' ? input.session_id : null;
-  const prev = db.getMeta(TRANSCRIPT_META);
+  const key = scopedMetaKey(TRANSCRIPT_META, scope);
+  const prev = db.getMeta(key);
   let firstSeen = now.toISOString();
   try { const p = prev ? JSON.parse(prev) as { path?: string; firstSeen?: string } : null; if (p?.path === path && p.firstSeen) firstSeen = p.firstSeen; } catch { /* replace a corrupt value */ }
-  db.setMeta(TRANSCRIPT_META, JSON.stringify({ path, sessionId, firstSeen, at: now.toISOString() }));
+  db.setMeta(key, JSON.stringify({ path, sessionId, firstSeen, at: now.toISOString() }));
 }
 
 function readTail(path: string, maxBytes = TRANSCRIPT_TAIL_BYTES): string | null {
@@ -231,6 +243,11 @@ export interface ContextResetDeps {
   state?: string;
   /** Transcript tail reader (tests inject it). */
   readTranscript?: (path: string) => string | null;
+  /**
+   * The session to check (phase 6): only its own leases (holder = key), events and transcript count. Undefined:
+   * read from MINIONS_SESSION (a malformed value throws); null: the single coordinator.
+   */
+  session?: SessionScope | null;
 }
 
 interface EventRow { kind: string; task_id: string | null; data_json: string | null }
@@ -250,7 +267,69 @@ export function sessionStartEventId(db: RuntimeDb, lock: { pid: number; session:
 /** The restart the coordinator runs on itself: detached, because the restart ends the calling session; refused with active leases. */
 export const RESET_RESTART_COMMAND = 'minions coordinator restart --recover --detach --json';
 
+/** The event kind of a session's handoff (phase 6): separate from `coordinator-handoff`, which only the single coordinator counts. */
+export const SESSION_HANDOFF_EVENT = 'session-handoff';
+
+/** The session's transcript record (`coordinator_transcript:<key>`), or null. */
+export function sessionTranscript(db: Pick<RuntimeDb, 'getMeta'>, scope: SessionScope): { path: string; firstSeen: string; at: string } | null {
+  try {
+    const v = db.getMeta(scopedMetaKey(TRANSCRIPT_META, scope));
+    const r = v ? JSON.parse(v) as { path?: unknown; firstSeen?: unknown; at?: unknown } : null;
+    return r && typeof r.path === 'string' && typeof r.firstSeen === 'string' && typeof r.at === 'string' ? { path: r.path, firstSeen: r.firstSeen, at: r.at } : null;
+  } catch { return null; }
+}
+
+/**
+ * contextResetCheck for a session (decision 9). The session (its current claude session) starts when the Stop hook
+ * first saw its current transcript; a reset gives it a new one. Only its own leases (holder = key, with their
+ * unfinished process runs) block, and only its own events count: records and releases of those leases, and its
+ * own handoffs. The coordinator lock plays no part (the router holds it).
+ */
+function sessionResetCheck(deps: ContextResetDeps, scope: SessionScope): ContextResetCheck {
+  const { db } = deps;
+  const settings = contextResetSettings(deps.config);
+  const rec = sessionTranscript(db, scope);
+  const since = rec?.firstSeen ?? null;
+  const blockers: string[] = [];
+  if (!settings.enabled) blockers.push('context resets are off (coordinator.contextReset.enabled)');
+  const own = () => db.activeLeases().filter((l) => l.holder === scope.key);
+  const runId = (id: string) => id.split(' ')[0]!;
+  const leases = deps.state !== undefined
+    ? withOpenRuns(own, deps.state)().filter((l) => db.lease(runId(l.id))?.holder === scope.key)
+    : own();
+  if (leases.length) blockers.push(`${leases.length} active worker lease(s) of session ${scope.key} (${leases.map((l) => l.id).join(', ')})`);
+  const draining = !!db.drain();
+  if (draining) blockers.push('a drain is in progress (the upgrade restarts the coordinator itself)');
+  if (!since) blockers.push(`session ${scope.key} has no transcript recorded yet`);
+
+  let handoffs = 0;
+  let handoffWritten = false;
+  const delivered: string[] = [];
+  if (since) {
+    const rows = db.all<EventRow>(`SELECT kind, task_id, data_json FROM events WHERE at >= ? AND kind IN ('record', 'release', '${SESSION_HANDOFF_EVENT}') ORDER BY id`, since);
+    const holders = new Map<string, string | null>();
+    const mine = (leaseId: string | undefined): boolean => {
+      if (!leaseId) return false;
+      if (!holders.has(leaseId)) holders.set(leaseId, db.lease(leaseId)?.holder ?? null);
+      return holders.get(leaseId) === scope.key;
+    };
+    for (const r of rows) {
+      let d: { to?: string; leaseId?: string; session?: string } = {};
+      try { d = r.data_json ? JSON.parse(r.data_json) as typeof d : {}; } catch { continue; }
+      if (r.kind === SESSION_HANDOFF_EVENT) { if (d.session === scope.key) handoffWritten = true; continue; }
+      if (!mine(d.leaseId)) continue;
+      handoffs++;
+      if (r.kind === 'record' && (d.to === 'delivered' || d.to === 'done')) delivered.push(r.task_id ?? d.leaseId ?? '?');
+    }
+  }
+  let contextTokens: number | null = null;
+  try { if (rec) contextTokens = contextTokensFromTranscript((deps.readTranscript ?? readTail)(rec.path)); } catch { contextTokens = null; }
+  return resetVerdict({ settings, since, blockers, leases, draining, handoffs, handoffWritten, delivered, contextTokens });
+}
+
 export function contextResetCheck(deps: ContextResetDeps): ContextResetCheck {
+  const scope = deps.session === undefined ? sessionScope() : deps.session;
+  if (scope) return sessionResetCheck(deps, scope);
   const { db } = deps;
   const settings = contextResetSettings(deps.config);
   const lock = db.coordinatorLock();
@@ -294,7 +373,17 @@ export function contextResetCheck(deps: ContextResetDeps): ContextResetCheck {
     // Only this session's transcript: the Stop hook saw it after the current lock was taken.
     if (rec?.path && since && rec.at && rec.at >= since) contextTokens = contextTokensFromTranscript((deps.readTranscript ?? readTail)(rec.path));
   } catch { contextTokens = null; }
+  return resetVerdict({ settings, since, blockers, leases, draining, handoffs, handoffWritten, delivered, contextTokens });
+}
 
+interface VerdictInput {
+  settings: ContextResetSettings; since: string | null; blockers: string[]; leases: { id: string }[]; draining: boolean;
+  handoffs: number; handoffWritten: boolean; delivered: string[]; contextTokens: number | null;
+}
+
+/** Triggers, barrier and verdict from the counted inputs (shared by the single coordinator and the sessions). */
+function resetVerdict(v: VerdictInput): ContextResetCheck {
+  const { settings, since, blockers, leases, draining, handoffs, handoffWritten, delivered, contextTokens } = v;
   const triggers: ResetTrigger[] = [];
   if (settings.afterDelivery && delivered.length) triggers.push('delivered');
   const atThreshold = settings.contextTokens !== null && contextTokens !== null && contextTokens >= settings.contextTokens;

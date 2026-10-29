@@ -173,6 +173,14 @@ Re-checked for this revision. Changes against the first version (main @ a062a51)
    - `work advance --task <id>` claims only that task's next stage.
 
    Without the variable, everything behaves as today.
+
+   Built in phase 6 (task-57.10; `src/runtime/session-scope.ts`, `session-stop.ts`): the keys are `router`, `general`
+   and `task:<id>` (parsed with `parseSessionKey`; an empty value is unset). A malformed value records nothing in the
+   hooks (the stop is allowed) and is refused by commands. A session's Stop guard keeps its no-progress fingerprint in
+   meta `stop_guard:<key>`. Its reset check starts at the first Stop of its current transcript, counts only leases
+   it holds and their records and releases, and its handoff events are `session-handoff`. In a task session,
+   `work claim` and `work advance` refuse other tasks, and the router and general sessions never claim. The baseline
+   gets `perRole` once a session state exists.
 10. **Durable state is the only channel between sessions.** No session reads another's transcript. A session note (at
     most 4 KB, redacted like `writeHandoff`) can travel from the general session to a new task session.
 11. **Sessions before the dispatcher.** See [Fit with unattended delivery](#fit-with-unattended-delivery).
