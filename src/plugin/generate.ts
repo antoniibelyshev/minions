@@ -218,9 +218,20 @@ function localIntegrationGuidance(cfg: MinionsConfig): string {
 
 /** Drain rule of the coordinator prompt: what an upgrade must not interrupt. */
 function drainIntegrationRule(cfg: MinionsConfig): string {
-  if (cfg.delivery.mode !== 'local' || cfg.profile === 'supervised') return 'and merge nothing.';
   if (localIntegrationEnabled(cfg)) return 'and merge nothing (the runtime\'s integrator stops a running verification by itself and queues it again).';
   return 'and start no local integration merge (an upgrade could interrupt a `--no-commit` merge and leave the repo mid-merge).';
+}
+
+/** Orchestrate skill: the `merging` note after a reviewer approve, only when the runtime integrates. */
+function mergingApproveNote(cfg: MinionsConfig): string {
+  return localIntegrationEnabled(cfg) ? '; `merging` with local integration on: the runtime integrates it, no worker runs for it' : '';
+}
+
+/** Recover skill: the bullet about tasks in `merging` (own line, leading newline), only when the runtime integrates. */
+function recoverMergingRule(cfg: MinionsConfig): string {
+  return localIntegrationEnabled(cfg)
+    ? '\n   - Tasks in `merging` have no lease and no worker: the runtime\'s integrator owns them, and a restart with `--recover` (and the coordinator\'s minute check) starts it again for a lost or crashed run. Never re-dispatch or merge them yourself; `minions status` shows the integration block.'
+    : '';
 }
 
 /** Tester/reviewer: when the brief's CI gate lets them rely on CI instead of re-running the full verification. */
@@ -545,6 +556,8 @@ function baseVars(cfg: MinionsConfig): Record<string, string> {
     ownIdeasRule: ownIdeasRule(cfg),
     integrationRule: integrationRule(cfg),
     drainIntegrationRule: drainIntegrationRule(cfg),
+    mergingApproveNote: mergingApproveNote(cfg),
+    recoverMergingRule: recoverMergingRule(cfg),
     reportingRule: reportingRule(cfg),
     packageVersion: cfg.packageVersion,
     profile: cfg.profile,

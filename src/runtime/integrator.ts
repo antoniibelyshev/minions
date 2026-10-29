@@ -627,7 +627,6 @@ export async function runIntegrator(d: IntegratorDeps): Promise<IntegratorReport
     if (v.state === 'red') { await settle(row, 'red', v.detail); return null; }
     if (v.state === 'transient') { await transient(row, v.detail); return null; }
     const flaky = v.flaky ?? [];
-    if (flaky.length) event('integration-flaky', row, { candidate: C, commands: flaky.map((f) => f.command), detail: flaky.map((f) => f.detail.slice(0, 500)) });
 
     // Landing: only a fast-forward of exactly B.
     d.db.exec("UPDATE integrations SET phase = 'landing' WHERE id = ?", row.id);
@@ -635,6 +634,8 @@ export async function runIntegrator(d: IntegratorDeps): Promise<IntegratorReport
     const l = await land(d.repo, { candidate: C, base: B, baseBranch: branch });
     if (l.state === 'landed') {
       d.db.setMeta(INTEGRATION_BASE_META, C);
+      // Only a landed candidate is "merged, but flaky": a requeue or transient failure must not report it.
+      if (flaky.length) event('integration-flaky', row, { candidate: C, commands: flaky.map((f) => f.command), detail: flaky.map((f) => f.detail.slice(0, 500)) });
       const flakyNote = flaky.length ? `; flaky: ${flaky.map((f) => `\`${f.command}\``).join(', ')} failed once and passed on the rerun` : '';
       await settle(row, 'landed', `merged into ${branch} at ${C} (${l.method})${flakyNote}`, flaky.length ? { outcome: FLAKY_OUTCOME } : {});
       d.db.addEvent('integrated', row.task_id, { id: row.id, candidate: C, base: B, head: row.head_sha, paths: paths.changed.slice(0, 200), changedCount: paths.changed.length });

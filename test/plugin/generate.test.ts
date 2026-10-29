@@ -862,4 +862,18 @@ describe('local integration prompts (task-82.4)', () => {
     expect(sup).toMatch(/Never merge into the local `main`: the user integrates/);
     expect(sup).not.toMatch(/The runtime integrates approved tasks/);
   });
+
+  it('the `merging` lines of the drain rule, orchestrate and recover skills appear only with local integration on', async () => {
+    const pr = defaults();
+    Object.assign(pr.delivery, { mode: 'pull-request', provider: 'github', merge: 'auto-when-eligible' });
+    for (const cfg of [pr, local('project-owner', 'disabled')]) {
+      const g = await gen(cfg);
+      expect(await g.read('coordinator.md')).toContain('re-dispatch nothing, and start no local integration merge (an upgrade could interrupt a `--no-commit` merge and leave the repo mid-merge). A hook');
+      expect(await g.read('skills/orchestrate/SKILL.md')).toContain('- reviewer `approve` → `delivered` (local delivery). In branch');
+      expect(await g.read('skills/recover/SKILL.md')).not.toContain('Tasks in `merging`');
+    }
+    const on = await gen(local('project-owner', 'auto-when-eligible'));
+    expect(await on.read('skills/orchestrate/SKILL.md')).toContain('(local delivery; `merging` with local integration on: the runtime integrates it, no worker runs for it). In branch');
+    expect(await on.read('skills/recover/SKILL.md')).toMatch(/This is not a failed attempt\.\n {3}- Tasks in `merging` have no lease and no worker: the runtime's integrator owns them/);
+  });
 });
