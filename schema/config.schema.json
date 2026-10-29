@@ -685,7 +685,6 @@
         "pr.create",
         "pr.review",
         "pr.merge",
-        "base.merge",
         "ci.edit",
         "infrastructure.edit",
         "network.use",

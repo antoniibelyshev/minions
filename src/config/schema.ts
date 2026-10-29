@@ -459,8 +459,10 @@ export const MinionsConfigSchema = z.object({
 export type MinionsConfig = z.infer<typeof MinionsConfigSchema>;
 
 export function configJsonSchema(): Record<string, unknown> {
-  return {
-    title: 'Minions configuration',
-    ...z.toJSONSchema(MinionsConfigSchema, { target: 'draft-2020-12', reused: 'ref' }),
-  };
+  const schema = z.toJSONSchema(MinionsConfigSchema, { target: 'draft-2020-12', reused: 'ref' }) as Record<string, unknown>;
+  // A capability added later (LATER_CAPABILITY_DEFAULTS) has a default, so a config may leave it out: the output
+  // schema marks defaulted keys required, which would reject such a config in an editor (task-82.4).
+  const caps = (schema.properties as Record<string, { required?: string[] }> | undefined)?.capabilities;
+  if (caps?.required) caps.required = caps.required.filter((k) => !(k in LATER_CAPABILITY_DEFAULTS));
+  return { title: 'Minions configuration', ...schema };
 }

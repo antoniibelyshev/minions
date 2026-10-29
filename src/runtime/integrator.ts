@@ -44,6 +44,7 @@ import { redact } from '../core/output.js';
 import { FULL_SHA, withEmptyHome } from './base-update.js';
 import type { RuntimeDb, SupervisorLock } from './db.js';
 import { allowlistedGit, gateGit } from './git-hardening.js';
+import { enqueue } from './outbox.js';
 import { checkoutGit, integrationCandidate, integrationChangedPaths, land, revertOfRevertCheck } from './integration.js';
 import { groupMembers, hostIdentity, isAlive, procIdentity } from './runner/record.js';
 import { supervise, type StopReason } from './runner/supervise.js';
@@ -55,6 +56,8 @@ export const INTEGRATION_HALT_META = 'integration_halted';
 /** Counted runs of one queued integration: the first plus one automatic retry of a transient failure. */
 export const MAX_INTEGRATION_ATTEMPTS = 2;
 export const DEFAULT_INTEGRATION_TIMEOUT_MINUTES = 30;
+/** `outcome` of a landed row whose verification passed only on a rerun of a failed command (Decision 2). */
+export const FLAKY_OUTCOME = 'landed-flaky';
 /** Test workers of the gate's verification (design: fixed configuration). */
 export const INTEGRATION_TEST_WORKERS = '2';
 /** Lockfiles whose content decides whether verification.setupCommands run again. */
@@ -178,8 +181,11 @@ export interface VerifyTiming {
   killGraceMs?: number;
 }
 
+/** A verification command that failed once and passed on its one rerun (Decision 2: a flaky notice, no repair cycle). */
+export interface FlakyCommand { command: string; detail: string }
+
 export type VerifyResult =
-  | { state: 'passed' }
+  | { state: 'passed'; flaky?: FlakyCommand[] }
   | { state: 'red'; command: string; detail: string }
   | { state: 'transient'; detail: string }
   | { state: 'stopped' };
@@ -202,6 +208,8 @@ export interface VerifyInput {
   shouldStop: () => boolean | Promise<boolean>;
   /** The command's process group leader exists (pid = pgid). */
   onSpawn?: (pid: number) => void | Promise<void>;
+  /** Rerun a failed verification command once before it counts as red (Decision 2; default true). */
+  rerunFailed?: boolean;
 }
 
 /** The allowlisted env of a verification command (see the header). */
@@ -322,6 +330,7 @@ export async function runVerification(i: VerifyInput): Promise<VerifyResult> {
         await writeFile(hashFile, hash + '\n');
       }
     }
+    const flaky: FlakyCommand[] = [];
     for (const cmd of i.commands) {
       tail.length = 0;
       const r = await runOne(cmd, i, log, tail);
@@ -329,9 +338,19 @@ export async function runVerification(i: VerifyInput): Promise<VerifyResult> {
       if (r.state === 'stopped') return r;
       if (r.state === 'timeout') return { state: 'transient', detail: clip(`\`${cmd}\` timed out after ${minutes}\n${tail.join('\n')}`) };
       if (r.state === 'spawn-error') return { state: 'transient', detail: clip(`\`${cmd}\` could not start: ${r.message}`) };
-      return { state: 'red', command: cmd, detail: clip(`\`${cmd}\` failed (${r.signal ?? `exit ${r.code}`})\n${tail.join('\n')}`) };
+      const first = clip(`\`${cmd}\` failed (${r.signal ?? `exit ${r.code}`})\n${tail.join('\n')}`);
+      // Decision 2: a failed command is rerun once, in place (same tree, nothing reset). A pass on the rerun
+      // continues (the landing carries a flaky notice); a second failure (or a rerun that does not finish) is red.
+      if (i.rerunFailed === false) return { state: 'red', command: cmd, detail: first };
+      log.write(`\n# ${cmd} failed; rerunning it once (flaky check)\n`);
+      tail.length = 0;
+      const again = await runOne(cmd, i, log, tail);
+      if (again.state === 'stopped') return again;
+      if (again.state === 'passed') { flaky.push({ command: cmd, detail: first }); continue; }
+      const why = again.state === 'failed' ? `failed again on its rerun (${again.signal ?? `exit ${again.code}`})` : again.state === 'timeout' ? `timed out on its rerun after ${minutes}` : `could not start on its rerun: ${again.message}`;
+      return { state: 'red', command: cmd, detail: clip(`\`${cmd}\` failed twice: ${why}\n${tail.join('\n')}`) };
     }
-    return { state: 'passed' };
+    return flaky.length ? { state: 'passed', flaky } : { state: 'passed' };
   } catch (e) {
     return { state: 'transient', detail: clip(`the verification did not run: ${(e as Error)?.message ?? e}`) };
   } finally {
@@ -444,7 +463,7 @@ export async function runIntegrator(d: IntegratorDeps): Promise<IntegratorReport
   const settle = async (row: IntegrationRow, phase: (typeof TERMINAL_PHASES)[number], detail: string | null, extra: Partial<IntegrationRow> = {}): Promise<void> => {
     d.db.transaction(() => {
       d.db.exec('UPDATE integrations SET phase = ?, outcome = ?, detail = ?, ended_at = ?, candidate_sha = COALESCE(?, candidate_sha), verify_pid = NULL, verify_start = NULL, verify_boot = NULL WHERE id = ?',
-        phase, phase, detail === null ? null : clip(detail), now().toISOString(), extra.candidate_sha ?? null, row.id);
+        phase, extra.outcome ?? phase, detail === null ? null : clip(detail), now().toISOString(), extra.candidate_sha ?? null, row.id);
       event(`integration-${phase}`, row, { base: row.base_sha, candidate: extra.candidate_sha ?? row.candidate_sha, detail: detail?.slice(0, 500) ?? null });
     });
     const done = getRow(d.db, row.id);
@@ -468,7 +487,12 @@ export async function runIntegrator(d: IntegratorDeps): Promise<IntegratorReport
   const halt = (reason: string, base: string | null, expected: string | null) => {
     const h: IntegrationHalt = { reason, at: now().toISOString(), base, expected };
     d.db.transaction(() => { d.db.setMeta(INTEGRATION_HALT_META, JSON.stringify(h)); d.db.addEvent('integration-halted', null, h); });
+    notice({ key: `integration-halted:${h.at}`, kind: 'blocker', text: `Integration queue halted: ${reason}. Nothing lands until the owner checks it; \`minions work integrate --adopt-base\` takes the current base after that (see \`minions doctor\`).` });
     log(`minions integrator: halted: ${reason}`);
+  };
+  /** An owner notice (src/runtime/outbox.ts); a failure to queue it never stops the integrator. */
+  const notice = (n: { key: string; kind: 'blocker' | 'other'; taskId?: string; text: string }) => {
+    try { enqueue(d.db, { ...n, text: n.text.slice(0, 3_900) }, now); } catch (e) { log(`minions integrator: could not queue the notice ${n.key}: ${(e as Error).message}`); }
   };
 
   try {
@@ -602,6 +626,8 @@ export async function runIntegrator(d: IntegratorDeps): Promise<IntegratorReport
     if (v.state !== 'passed' && stopRequested()) return stopped('during the setup or verification');
     if (v.state === 'red') { await settle(row, 'red', v.detail); return null; }
     if (v.state === 'transient') { await transient(row, v.detail); return null; }
+    const flaky = v.flaky ?? [];
+    if (flaky.length) event('integration-flaky', row, { candidate: C, commands: flaky.map((f) => f.command), detail: flaky.map((f) => f.detail.slice(0, 500)) });
 
     // Landing: only a fast-forward of exactly B.
     d.db.exec("UPDATE integrations SET phase = 'landing' WHERE id = ?", row.id);
@@ -609,7 +635,8 @@ export async function runIntegrator(d: IntegratorDeps): Promise<IntegratorReport
     const l = await land(d.repo, { candidate: C, base: B, baseBranch: branch });
     if (l.state === 'landed') {
       d.db.setMeta(INTEGRATION_BASE_META, C);
-      await settle(row, 'landed', `merged into ${branch} at ${C} (${l.method})`);
+      const flakyNote = flaky.length ? `; flaky: ${flaky.map((f) => `\`${f.command}\``).join(', ')} failed once and passed on the rerun` : '';
+      await settle(row, 'landed', `merged into ${branch} at ${C} (${l.method})${flakyNote}`, flaky.length ? { outcome: FLAKY_OUTCOME } : {});
       d.db.addEvent('integrated', row.task_id, { id: row.id, candidate: C, base: B, head: row.head_sha, paths: paths.changed.slice(0, 200), changedCount: paths.changed.length });
       return null;
     }
@@ -617,6 +644,7 @@ export async function runIntegrator(d: IntegratorDeps): Promise<IntegratorReport
     if (l.state === 'dirty' || l.state === 'refused') {
       const why = l.state === 'dirty' ? `checkout not clean: ${l.checkout} has changes to ${l.paths.slice(0, 10).join(', ')}` : l.message;
       requeue(row, 'checkout-dirty', why, true);
+      notice({ key: `integration-checkout-dirty:${row.id}:${B}`, kind: 'blocker', taskId: row.task_id, text: `Integration of ${row.task_id} paused: ${why}. ${branch} is unchanged; it lands once the checkout is clean (the integrator retries on its next start).` });
       return 'checkout-dirty';
     }
     if (l.baseUnchanged) { await transient(row, l.message); return null; }

@@ -214,6 +214,23 @@ describe('minions setup', () => {
     expect((await loadEffectiveConfig(await loadProjectJson(r.projectId))).config.delivery.merge).toBe('disabled');
   });
 
+  it('local delivery offers automatic local integration (default no); yes records delivery.merge auto-when-eligible', async () => {
+    const repo = makeRepo(env.root);
+    const declined = scripted({ 'Installation visibility': 'private' });
+    const r0 = await runSetup({ path: repo, yes: false, io: declined.io, runtime: fakeRuntime().runtime, dockerProbe: dockerUp, fetch: githubApi().f });
+    expect(declined.asked).toContain('Integrate approved tasks automatically? (y/n)');
+    expect(declined.asked.some((q) => q.startsWith('Enable auto-merge?'))).toBe(false);
+    expect(step(r0, 'autoMerge')).toMatchObject({ status: 'skipped', detail: 'automatic local integration not enabled' });
+
+    const a = scripted({ 'Installation visibility': 'private', 'Integrate approved tasks automatically?': 'y' });
+    const r = await runSetup({ path: repo, yes: false, io: a.io, runtime: fakeRuntime().runtime, dockerProbe: dockerUp, fetch: githubApi().f });
+    expect(a.info.some((l) => /runs the verification commands/.test(l))).toBe(true);
+    expect(step(r, 'autoMerge')).toMatchObject({ status: 'done', detail: expect.stringMatching(/the runtime integrates approved tasks into the local main/) });
+    expect(JSON.parse(readFileSync(projectPaths(r.projectId).configLocalJson, 'utf8')).delivery.merge).toBe('auto-when-eligible');
+    const eff = (await loadEffectiveConfig(await loadProjectJson(r.projectId))).config;
+    expect(eff.delivery).toMatchObject({ mode: 'local', merge: 'auto-when-eligible' });
+  });
+
   it('asks each optional integration with default no; declining skips cleanly with a note on enabling later', async () => {
     const repo = githubRepo();
     const a = scripted({ 'Installation visibility': 'private' });
