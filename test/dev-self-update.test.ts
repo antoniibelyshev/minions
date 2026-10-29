@@ -499,6 +499,34 @@ describe('self-update apply: failure paths and isolation', () => {
     gateWorktreesGone();
   });
 
+  it('a typecheck failure in the gate records the SHA as bad and skips the tests', () => {
+    setRequests([request('cr_aaaaaaaa')]);
+    writeFileSync(join(fx.fake, 'gate-fail'), 'run typecheck');
+    const r = runScript('--once');
+    expect(r.code, r.err).toBe(0);
+    const to = gitIn(fx.repo, 'rev-parse', 'HEAD');
+    expect(npmLog()).not.toMatch(/^test \|/m);
+    expect(minionsLog()).not.toMatch(/--rebuild-cli/);
+    expect(statuses()).toEqual(['confirmed', 'failed']);
+    expect(marks()[1]).toMatch(new RegExp(`npm run typecheck failed \\(exit 1\\).*${to.slice(0, 12)} is recorded as bad`));
+    expect(readState()).toMatchObject({ current: null, badShas: [to] });
+    gateWorktreesGone();
+  });
+
+  it('a failed `git worktree add` fails the request, runs no npm step and does not record the SHA as bad', () => {
+    // A failing post-checkout hook makes `git worktree add` exit non-zero (after it created the worktree).
+    setSync('git commit -q --allow-empty -m next && printf "#!/bin/sh\\nexit 1\\n" > .git/hooks/post-checkout && chmod +x .git/hooks/post-checkout');
+    setRequests([request('cr_aaaaaaaa')]);
+    const r = runScript('--once');
+    expect(r.code, r.err).toBe(0);
+    expect(npmLog()).not.toMatch(/^(ci|run typecheck|test) \|/m);
+    expect(minionsLog()).not.toMatch(/--rebuild-cli/);
+    expect(statuses()).toEqual(['confirmed', 'failed']);
+    expect(marks()[1]).toMatch(/git worktree add failed.*is not recorded as bad/);
+    expect(readState()).toMatchObject({ current: null, badShas: [] });
+    gateWorktreesGone();
+  });
+
   it('a mark the runtime refuses stays pending and is retried on later polls, taking no new request meanwhile', () => {
     setRequests([request('cr_aaaaaaaa')]);
     writeFileSync(join(fx.fake, 'mark-fail'), '');
