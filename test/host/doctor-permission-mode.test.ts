@@ -60,6 +60,16 @@ describe('doctor claude.capabilities: coordinator permission mode', () => {
     expect(await cap(probeOut({ configured: 'acceptEdits', mode: 'acceptEdits', fallback: false, reason: 'coordinator permission mode acceptEdits' })))
       .toMatchObject({ status: 'ok', detail: expect.stringMatching(/permission mode acceptEdits$/) });
 
+    // Task-8: the probe names the layer that chose the mode; doctor reports it.
+    expect(await cap(probeOut({ configured: 'auto', mode: 'auto', fallback: false, reason: 'x', source: 'host-local', sourceFile: '/p/config.local.json' })))
+      .toMatchObject({ status: 'ok', detail: expect.stringMatching(/permission mode auto, chosen by host-only config\.local\.json \(\/p\/config\.local\.json\)$/) });
+    expect(await cap(probeOut({ configured: 'default', mode: 'manual', fallback: false, reason: 'x', source: 'host-default' })))
+      .toMatchObject({ status: 'ok', detail: expect.stringMatching(/permission mode manual, chosen by host runtime default$/) });
+    expect(await cap(probeOut({ configured: 'auto', mode: 'auto', fallback: false, reason: 'x', source: 'config' })))
+      .toMatchObject({ detail: expect.stringMatching(/chosen by project configuration$/) });
+    // An unknown source is not echoed.
+    expect((await cap(probeOut({ configured: 'auto', mode: 'auto', fallback: false, reason: 'x', source: 'evil' })))?.detail).not.toMatch(/chosen by/);
+
     // An older image whose probe has no permission field, or non-JSON output: still ok, no mode claimed.
     for (const p of [probeOut(), { code: 0, stdout: 'Claude Code 2.1.292: launch flags supported\n', stderr: '' }]) {
       const c = await cap(p);

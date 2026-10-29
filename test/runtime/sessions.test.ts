@@ -171,6 +171,17 @@ describe('buildSessionCommand', () => {
     expect(existsSync(join(root, 'claude-ran'))).toBe(false); // nothing was started
   });
 
+  it('host runtime (task-8): the session mode follows the host-only opt-in; the repo value alone stays default; settings unchanged', async () => {
+    writeFileSync(paths.claudeHeadlessTokenFile, `${OAUTH}\n`, { mode: 0o600 });
+    const cfg = { ...defaults(), coordinator: { permissionMode: 'auto' as const } };
+    const modes = ['acceptEdits', 'auto', 'manual', 'plan'];
+    const repoOnly = await buildSessionCommand(cfg, 'general', deps('login', { hostRuntime: true, permissionModes: modes, hostLocal: null }));
+    const optedIn = await buildSessionCommand(cfg, 'general', deps('login', { hostRuntime: true, permissionModes: modes, hostLocal: { mode: 'auto', source: '/o/config.local.json' } }));
+    expect(valueOf(repoOnly.args, '--permission-mode')).toBe('manual');
+    expect(valueOf(optedIn.args, '--permission-mode')).toBe('auto');
+    expect(optedIn.flagSettings).toEqual(repoOnly.flagSettings);
+  });
+
   it('key methods: the apiKeyHelper reads the key file; the key itself is nowhere', async () => {
     writeFileSync(paths.apiKeyFile, PROVISIONED_KEY, { mode: 0o600 });
     const l = await buildSessionCommand(defaults(), 'general', deps('api-key'));

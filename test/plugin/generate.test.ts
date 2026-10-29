@@ -663,7 +663,7 @@ describe('owner behaviour defaults (task-34)', () => {
     const base = defaults();
     const none = ownerSection(await (await gen(base)).read('coordinator.md'));
     expect(none).not.toContain('budgets');
-    expect(none).toContain('The coordinator is launched in `auto` by default (`coordinator.permissionMode`); the host runtime always uses `default`');
+    expect(none).toContain('The coordinator is launched in `auto` by default (`coordinator.permissionMode`); the host runtime uses `default`');
 
     const capped = ownerSection(await (await gen({ ...base, budgets: { taskUsd: 5, dailyUsd: 40 } })).read('coordinator.md'));
     expect(capped).toContain("The config's `budgets` ($40 per day, $5 per task; not enforced in v0.1) counts as a budget until the owner gives one");

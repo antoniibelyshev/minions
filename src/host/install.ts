@@ -12,6 +12,7 @@ import { GITHUB_TOKEN_CONTAINER_PATH, TELEGRAM_TOKEN_CONTAINER_PATH, imageTag, p
 import { VERSION } from '../core/version.js';
 import { generatePlugin } from '../plugin/generate.js';
 import { ciSetupPlan } from '../runtime/ci.js';
+import { HOST_PERMISSION_FILE, hostPermissionRecord } from '../runtime/host-permission.js';
 import { discover, dockerProbe, type Discovery, type DockerProbe, type DockerStatus } from './discovery.js';
 import { authOf, ensureSecretsDir, isKeyAuth, loadDefaults, resolveOnPath, summarize, type AuthSummary, type ClaudeAuth } from './auth.js';
 import {
@@ -350,6 +351,7 @@ async function prepare(opts: InitOptions, docker?: DockerStatus): Promise<Prepar
   add(paths.composeYaml, composeYaml(project));
   add(join(paths.runtimeDir, 'config.json'), json(effective));
   add(join(paths.runtimeDir, 'project.json'), json(runtimeProjectInfo(project)));
+  add(join(paths.runtimeDir, HOST_PERMISSION_FILE), json(hostPermissionRecord(local, paths.configLocalJson)));
 
   const staging = await mkdtemp(join(tmpdir(), 'minions-plugin-'));
   const cleanup = () => rm(staging, { recursive: true, force: true });
@@ -571,6 +573,8 @@ export async function refreshDerived(project: ProjectJson, effective: MinionsCon
     [paths.composeYaml, Buffer.from(composeYaml(project))],
     [join(paths.runtimeDir, 'config.json'), json(effective)],
     [join(paths.runtimeDir, 'project.json'), json(runtimeProjectInfo(project))],
+    // Task-8: the host-only layer's coordinator.permissionMode, the only value the host runtime honours for it.
+    [join(paths.runtimeDir, HOST_PERMISSION_FILE), json(hostPermissionRecord(await readJsonIfExists(paths.configLocalJson).catch(() => undefined), paths.configLocalJson))],
     ...plugin,
   ];
   let changed = false;

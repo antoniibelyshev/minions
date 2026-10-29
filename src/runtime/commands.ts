@@ -30,6 +30,7 @@ import {
   buildClaudeCommand, buildCoordinatorCommand, telegramPollerStatus, claudePermissionModes, coordinatorWrapper, launchCoordinator, permissionModesNeeded, probeRuntime, readLaunchRecord, readMountedToken, RECOVERY_PROMPT,
   restartCoordinator, runtimeChannelFacts, scheduleDetachedRestart, syncCoordinator, coordinatorLaunchStatus, type LaunchStatus,
   coordinatorPidAlive, procStartTime, readExitRecord, runtimeAuthMethod, systemProcessControl, scheduleCrashStart, TELEGRAM_TOKEN_ENV, WAKE_PROMPT,
+  decidePermissionMode, launchPermission, permissionSourceLabel, type LaunchPermission,
 } from './coordinator.js';
 import { pidAlive } from './db.js';
 import { run as runChild } from '../core/exec.js';
@@ -45,7 +46,7 @@ import { advanceLease, humanAdvance } from './advance.js';
 import { runHook } from './hooks.js';
 import { completeOpenSessions, noteResetRequest } from './coordinator-usage.js';
 import { budgetNotice, humanBaseline, humanSpend, parseTokens, recordLeaseUsage, recordSessionUsage, setBudget, spendReport, type SpendReport } from './spend.js';
-import { runtimePaths } from './paths.js';
+import { runtimePaths, type RuntimePaths } from './paths.js';
 import { contextResetCheck, HANDOFF_MAX_BYTES, humanContextReset, readHandoff, TRANSCRIPT_META, withContextReset, writeHandoff, type ContextResetCheck } from './context-reset.js';
 import { handoffPathFor, sessionScope } from './session-scope.js';
 export { withContextReset } from './context-reset.js';
@@ -361,6 +362,8 @@ export interface StatusReport {
   channel?: ChannelStatus;
   /** Running coordinator vs the current launch fingerprint (stale: restart required; the host reports `minions upgrade`). */
   coordinatorLaunch?: LaunchStatus;
+  /** The coordinator's permission mode and the layer that chose it (task-8): the last launch's, else predicted. */
+  permission?: PermissionStatus;
   /** Task-51: whether the Telegram poller (bot.pid) is the running coordinator's; another claude session can take the bot. */
   telegramPoller?: PollerCheck;
   /** Notification outbox: undelivered items wait here until the coordinator sends them (`minions notify pending`). */
@@ -388,6 +391,36 @@ export interface ChannelStatus {
   restartRequired?: boolean;
 }
 
+export interface PermissionStatus extends LaunchPermission {
+  /** launch: what the last coordinator launch used; predicted: no launch recorded (the next launch checks `claude --help`). */
+  from: 'launch' | 'predicted';
+  /** The configuration now selects another mode or layer than the last launch: needs a coordinator restart. */
+  restartRequired?: boolean;
+}
+
+/**
+ * Permission mode inside the runtime: the launch record's decision when the coordinator ran, else the decision the
+ * current configuration predicts (host runtime: from the host-only opt-in record, see ./host-permission.ts).
+ */
+export async function runtimePermissionStatus(cfg: MinionsConfig, deps: { paths?: RuntimePaths; decide?: () => LaunchPermission } = {}): Promise<PermissionStatus> {
+  const paths = deps.paths ?? runtimePaths();
+  const decide = deps.decide ?? (() => launchPermission(decidePermissionMode(cfg)));
+  let predicted: LaunchPermission | null = null;
+  try { predicted = decide(); } catch { predicted = null; }
+  const rec = (await readLaunchRecord(paths))?.permission;
+  if (rec) {
+    const differs = !!predicted && (predicted.configured !== rec.configured || predicted.source !== rec.source);
+    return { ...rec, from: 'launch', ...(differs ? { restartRequired: true } : {}) };
+  }
+  if (!predicted) throw new MinionsError('INCOMPATIBLE_RUNTIME', 'permission mode could not be decided');
+  return { ...predicted, from: 'predicted' };
+}
+
+/** Human line of the permission status. */
+export const humanPermission = (p: PermissionStatus): string =>
+  `permission mode: ${p.mode}${p.fallback ? ' (fallback)' : ''}, chosen by ${permissionSourceLabel(p)} (${p.from === 'launch' ? 'running coordinator' : 'predicted'})`
+  + `${p.restartRequired ? '; the configuration now selects another mode: restart the coordinator' : ''}`;
+
 /** Channel status inside the runtime: the launch record when the coordinator ran, else a prediction from the mounted token. */
 export async function runtimeChannelStatus(cfg: MinionsConfig, paths = runtimePaths()): Promise<ChannelStatus> {
   const rec = await readLaunchRecord(paths);
@@ -401,7 +434,7 @@ export async function runtimeChannelStatus(cfg: MinionsConfig, paths = runtimePa
   return { configured: r.configured, effective: r.effective, reason: r.reason, source: 'predicted' };
 }
 
-export async function collectStatus(deps: { db: RuntimeDb; config: MinionsConfig; state?: string; backlog: () => Promise<BacklogAdapter>; channel?: () => Promise<ChannelStatus>; launch?: () => Promise<LaunchStatus>; poller?: () => Promise<PollerCheck> }): Promise<StatusReport> {
+export async function collectStatus(deps: { db: RuntimeDb; config: MinionsConfig; state?: string; backlog: () => Promise<BacklogAdapter>; channel?: () => Promise<ChannelStatus>; launch?: () => Promise<LaunchStatus>; poller?: () => Promise<PollerCheck>; permission?: () => Promise<PermissionStatus> }): Promise<StatusReport> {
   const { db: d, config: cfg } = deps;
   const leases = d.activeLeases();
   const report: StatusReport = {
@@ -415,6 +448,7 @@ export async function collectStatus(deps: { db: RuntimeDb; config: MinionsConfig
   if (deps.channel) report.channel = await deps.channel().catch(() => undefined);
   if (deps.launch) report.coordinatorLaunch = await deps.launch().catch(() => undefined);
   if (deps.poller) report.telegramPoller = await deps.poller().catch(() => undefined);
+  if (deps.permission) report.permission = await deps.permission().catch(() => undefined);
   try { report.notifications = outboxCounts(d); } catch { /* an older DB without the outbox: omit */ }
   try {
     const open = listChangeRequests(d);
@@ -450,6 +484,7 @@ export function humanStatus(s: StatusReport): string {
     ...(s.lastDrainNotice ? [`last drain notice: ${s.lastDrainNotice.at} to ${s.lastDrainNotice.agentType} ${s.lastDrainNotice.agentId} (lease ${s.lastDrainNotice.leaseId}, ${s.lastDrainNotice.taskId ?? '-'}, drain event ${s.lastDrainNotice.eventId}, via ${s.lastDrainNotice.via})`] : []),
     ...(s.channel ? [`channel: configured ${s.channel.configured}, effective ${s.channel.effective} (${s.channel.source === 'launch' ? 'running coordinator' : 'predicted'}: ${s.channel.reason})${s.channel.restartRequired ? '; restart required: `minions upgrade`' : ''}`] : []),
     ...(s.telegramPoller && s.telegramPoller.state !== 'not-applicable' ? [humanPoller(s.telegramPoller)] : []),
+    ...(s.permission ? [humanPermission(s.permission)] : []),
     s.capacity ? `capacity: ${s.capacity.activeTasks}/${s.capacity.maxActiveTasks} tasks, ${roleCapacityLine(s.capacity)}` : 'capacity: unknown',
     `queue: ${Object.entries(s.queue).map(([k, v]) => `${k}=${v}`).join(' ') || '(empty)'}`,
     `stop guard: ${s.guard.lastReason ?? '-'}`,
@@ -912,7 +947,8 @@ export function register(program: Command): void {
       if (o.probe) {
         const r = { ...(await probeRuntime(cfg)), command: await buildCoordinatorCommand(cfg) };
         emit(r, { json: globalOpts(cmd).json, human: (d: typeof r) => `Claude Code ${d.claudeVersion}, ${d.tmuxVersion}: launch flags supported\n` +
-          (d.permission.fallback ? `permission mode: acceptEdits (fallback) - ${d.permission.reason}` : `permission mode: ${d.permission.mode} (${d.permission.reason})`) });
+          (d.permission.fallback ? `permission mode: acceptEdits (fallback) - ${d.permission.reason}` : `permission mode: ${d.permission.mode} (${d.permission.reason})`)
+          + `\nchosen by: ${permissionSourceLabel(d.permission)}` });
         return;
       }
       if (o.printCommand) {
@@ -1307,7 +1343,7 @@ export function register(program: Command): void {
         return;
       }
       const cfg = await getConfig();
-      const r = await collectStatus({ db: getDb(), config: cfg, state: runtimePaths().state, backlog: getBacklog, channel: () => runtimeChannelStatus(cfg), launch: () => coordinatorLaunchStatus(cfg), poller: () => telegramPollerStatus() });
+      const r = await collectStatus({ db: getDb(), config: cfg, state: runtimePaths().state, backlog: getBacklog, channel: () => runtimeChannelStatus(cfg), launch: () => coordinatorLaunchStatus(cfg), poller: () => telegramPollerStatus(), permission: () => runtimePermissionStatus(cfg) });
       emit(r, { json: globalOpts(cmd).json, human: humanStatus });
     }));
   const pauseLike = (name: 'pause' | 'resume') => {
