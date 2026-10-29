@@ -74,7 +74,10 @@ describe.skipIf(!hasCli)('plain-scalar allowlist vs task view (real CLI)', { tim
     const slow = new BacklogMdAdapter({ root, idempotency: new MemoryIdempotencyStore(), readFiles: false });
     const listedIds = new Set(fastTasks.map((t) => t.id));
     // getTask also carries the notes (task-98); listings never do, so compare without them.
-    for (const c of cases) if (c.fast && listedIds.has(c.id)) { const { notes: _n, ...t } = await slow.getTask(c.id); slowTasks.push(t); }
+    // ~300 task views: a few at a time (each is a Backlog.md process), not one after another (task-104).
+    const pending = cases.filter((c) => c.fast && listedIds.has(c.id));
+    const views = async () => { for (let c; (c = pending.shift());) { const { notes: _n, ...t } = await slow.getTask(c.id); slowTasks.push(t); } };
+    await Promise.all(Array.from({ length: 6 }, views));
   }, 180_000);
   afterAll(() => rmSync(root, { recursive: true, force: true }));
 

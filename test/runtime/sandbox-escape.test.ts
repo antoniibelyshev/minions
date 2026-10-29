@@ -198,8 +198,8 @@ for my $a (['127.0.0.1', AF_INET], ['::1', AF_INET6], ['::ffff:127.0.0.1', AF_IN
 { my $sym = "$c->{scratch}/race-$$"; my $w = "$c->{scratch}/race-target-$$";
   my $h; open($h, '>', $w) and close($h);
   my $kid = fork;
-  if (defined $kid && !$kid) { for (1 .. 40000) { unlink $sym; symlink($file, $sym); unlink $sym; symlink($w, $sym); } POSIX::_exit(0); }
-  my $hits = 0; for (1 .. 40000) { $hits++ if chmod(0777, $sym); }
+  if (defined $kid && !$kid) { for (1 .. $c->{raceRounds}) { unlink $sym; symlink($file, $sym); unlink $sym; symlink($w, $sym); } POSIX::_exit(0); }
+  my $hits = 0; for (1 .. $c->{raceRounds}) { $hits++ if chmod(0777, $sym); }
   waitpid($kid, 0) if $kid; unlink $sym, $w;
   r('chmod:toctou-race', 1, "chmods=$hits"); }
 print "end\n";
@@ -282,6 +282,9 @@ describe.skipIf(!REAL || !SYS || !PERL)('minions-sandbox escape attempts (real h
     await writeFile(rulesFile, serializeRules(rules), { mode: 0o600 });
     const protectedFile = d('secrets', 'github-token');
     const plan = {
+      // The chmod TOCTOU race goes through the same notify handler for every role: the full 40000 rounds run once
+      // (engineer); the gate repeats it shorter (task-104: the race was most of this file's ~16 s).
+      raceRounds: role.contract === 'producer' ? 40_000 : 5_000,
       nr: SYS, scratch: d('scratch'), protectedFile, outsidePid: outside.pid, outsideGroup: outsideGroup.pid, port, oAsync: 0o20000, oPath: 0o10000000, // O_ASYNC and O_PATH on x86_64 and aarch64
       read: [d('state', 'minions.db'), d('state'), protectedFile, d('secrets'), d('common', 'config'), d('common', 'refs'), d('worktrees', 'other', 'README'), d('lease'), d('other-lease', 'scratch'), root],
       write: [d('state'), d('secrets'), d('common', 'objects'), d('common', 'refs', 'heads'), d('worktrees', 'other'), d('lease'), d('other-lease', 'scratch'), root],

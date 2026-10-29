@@ -12,8 +12,9 @@ import type { MinionsConfig } from '../../src/config/schema.js';
 import type { RunResult } from '../../src/core/exec.js';
 import { RuntimeDb } from '../../src/runtime/db.js';
 import {
-  formatIntake, importStatus, INTAKE_MAX_PAGES, INTAKE_STATE_META, intakeKey, issuesPath, originRepository, syncIntake, type GithubIntakeConfig,
+  formatIntake, importStatus, INTAKE_MAX_PAGES, INTAKE_STATE_META, intakeKey, issuesPath, originRepository, queryIssues, syncIntake, type GithubIntakeConfig,
 } from '../../src/runtime/intake-sync.js';
+import { ghApi } from '../../src/runtime/ci.js';
 import { intakeOnStart } from '../../src/runtime/commands.js';
 import type { GhFn } from '../../src/runtime/publish.js';
 import { defaults } from '../helpers.js';
@@ -326,18 +327,22 @@ describe('intake sync: reconciliation', () => {
     expect(x.backlog.status('task-1')).toBe('idea');
   });
 
-  // Inherently heavy: INTAKE_MAX_PAGES * 100 imports, each a few runtime-DB writes. ~0.5 s idle, past the
-  // default 5 s while other suites load the disk (task-93), so it gets a generous limit of its own.
-  it('a truncated query (more than the page cap) imports what it read but evaluates no departures', { timeout: 60_000 }, async () => {
+  // The page cap is a seam (maxPages): two full pages stand in for INTAKE_MAX_PAGES (1000 imports took up to
+  // 18 s under load, task-104). The default cap itself is checked on the query alone, without imports.
+  it('a truncated query (more than the page cap) imports what it read but evaluates no departures', async () => {
     const x = env();
     x.gh.set([{ number: 1 }]);
     await x.run();
     const page = (p: number) => Array.from({ length: 100 }, (_, i) => raw({ number: 1000 + p * 100 + i }));
     for (let p = 1; p <= INTAKE_MAX_PAGES; p++) x.gh.s.routes[issuesPath(REPO, FILTER, null, p)] = ok(page(p));
-    const r = await x.run();
+    const q = await queryIssues(ghApi(x.gh.fn), REPO, FILTER);
+    expect(q).toMatchObject({ complete: false });
+    expect(q.issues).toHaveLength(INTAKE_MAX_PAGES * 100);
+    const r = await syncIntake({ db: x.db, backlog: x.backlog, config: x.config, gh: x.gh.fn, maxPages: 2 });
     expect(r.complete).toBe(false);
+    expect(r.warnings.join()).toContain('more than 200 matching issues');
     expect(r.warnings.join()).toContain('departures were not evaluated');
-    expect(r.created).toHaveLength(INTAKE_MAX_PAGES * 100);
+    expect(r.created).toHaveLength(200);
     expect(x.backlog.status('task-1')).toBe('idea');
   });
 
