@@ -49,6 +49,7 @@ import { atomicWrite } from '../core/fsutil.js';
 import { redact } from '../core/output.js';
 import { pidAlive, type RuntimeDb, type SessionRow, type SupervisorLock } from './db.js';
 import { HEADLESS_DROP_ENV } from './headless.js';
+import { systemProcessFacts, type ProcessFacts } from './process-facts.js';
 import { enqueue } from './outbox.js';
 import { ancestorsOf, hasEnvEntry } from './runner/escapees.js';
 import { groupMembers, hostIdentity, isAlive, procIdentity, procStat, sameHost, type HostIdentity, type ProcIdentity } from './runner/record.js';
@@ -106,7 +107,7 @@ export interface LockProcessView {
 }
 
 const readProcText = (p: string): string | null => { try { return readFileSync(p, 'utf8'); } catch { return null; } };
-export const systemLockView: LockProcessView = {
+const procfsLockView: LockProcessView = {
   alive: pidAlive,
   startTime: (pid) => {
     const stat = readProcText(`/proc/${pid}/stat`);
@@ -118,9 +119,25 @@ export const systemLockView: LockProcessView = {
 };
 
 /**
+ * The lock view for a platform: `ps` and `sysctl` on darwin (or `facts` when given), /proc elsewhere. Its start time
+ * and boot id are the ones runner/record.ts procIdentity/hostIdentity record in the lock on the same platform.
+ */
+export function lockViewFor(platform: NodeJS.Platform = process.platform, facts?: ProcessFacts): LockProcessView {
+  const ps = facts ?? systemProcessFacts(platform);
+  if (!ps) return procfsLockView;
+  return {
+    alive: pidAlive,
+    startTime: (pid) => ps.process(pid)?.startTime ?? null,
+    cmdline: (pid) => ps.process(pid)?.cmdline ?? null,
+    bootId: () => ps.bootId(),
+  };
+}
+export const systemLockView: LockProcessView = lockViewFor();
+
+/**
  * Whether a supervisor lock holder still runs: the pid exists, in the boot it was taken in, with the recorded start
- * time, and its command line is `minions coordinator supervise`. Without /proc (macOS host runtime) a live pid counts
- * as the holder (a second supervisor is refused, nothing is signalled).
+ * time, and its command line is `minions coordinator supervise` (/proc, or `ps` on macOS). When none of these can be
+ * read a live pid counts as the holder (a second supervisor is refused, nothing is signalled).
  */
 export function supervisorAlive(l: SupervisorLock, pc: LockProcessView = systemLockView): boolean {
   if (!pc.alive(l.pid)) return false;

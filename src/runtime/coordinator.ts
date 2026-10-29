@@ -21,6 +21,7 @@ import { HOST_TELEGRAM_REASON, resolveChannel, type ChannelFacts } from '../tele
 import { runtimePaths, type RuntimePaths } from './paths.js';
 import { claudePermissionModes, parsePermissionModes, strictPermissionModeArg } from './permission-modes.js';
 import { openDb, pidAlive, type CoordinatorLock, type RuntimeDb } from './db.js';
+import { systemProcessFacts, type ProcessFacts } from './process-facts.js';
 import { ROUTER_PROMPT, ROUTER_START_PROMPT } from './router-prompt.js';
 
 export const TMUX_SESSION = 'coordinator';
@@ -715,9 +716,9 @@ export function installPreSpawnGuard(signals: SignalTarget = process): PreSpawnG
  *
  * MCP children (task-38): claude stops its MCP servers (the Telegram poller) itself on SIGHUP/SIGTERM.
  * SIGKILL gives it no chance, so right before the SIGKILL the wrapper SIGKILLs claude's descendants,
- * deepest first, each re-verified through its /proc parent while claude has not exited (so none was
+ * deepest first, each re-verified through its parent (/proc, or `ps` on macOS) while claude has not exited (so none was
  * reparented or reused). The pane's process group is not signalled: claude shares it with the pane's
- * foreground job, and task-17 keeps Ctrl-C there. Without /proc no descendant is found; those servers
+ * foreground job, and task-17 keeps Ctrl-C there. Without a process table no descendant is found; those servers
  * then rely on the stdin EOF they get when claude dies.
  */
 export const ESCALATE_TERM_MS = 4000;
@@ -857,9 +858,10 @@ export type LockAlive = (pid: number, lock?: Pick<CoordinatorLock, 'start'>) => 
 
 /**
  * Lock holder liveness (task-38): the pid exists, its start time matches the one recorded in the lock
- * (when both are known), and (where /proc exists) it still runs a coordinator wrapper. The start time
- * is what tells a reused pid apart: a tmux client's argv also contains `coordinator run`. Without /proc
- * (macOS host runtime) a live pid counts as the holder: a second coordinator is refused, never signalled.
+ * (when both are known), and (where its command line is readable: /proc, or `ps` on macOS) it still runs a
+ * coordinator wrapper. The start time is what tells a reused pid apart: a tmux client's argv also contains
+ * `coordinator run`. When neither can be read a live pid counts as the holder: a second coordinator is refused,
+ * never signalled.
  */
 export function coordinatorPidAlive(pid: number, lock?: Pick<CoordinatorLock, 'start'>, pc: Pick<ProcessControl, 'alive' | 'cmdline' | 'startTime'> = systemProcessControl): boolean {
   if (!pc.alive(pid)) return false;
@@ -876,8 +878,13 @@ function procCmdline(pid: number): string | null {
   try { return readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0').join(' ').trim(); } catch { return null; }
 }
 
-/** /proc/<pid>/stat field 22 (starttime, clock ticks since boot); null without /proc. */
+/**
+ * /proc/<pid>/stat field 22 (starttime, clock ticks since boot); on darwin the `ps` start time (epoch seconds, see
+ * src/runtime/process-facts.ts); null when unreadable.
+ */
 export function procStartTime(pid: number): string | null {
+  const ps = systemProcessFacts();
+  if (ps) return ps.process(pid)?.startTime ?? null;
   try {
     const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
     const v = stat.slice(stat.lastIndexOf(')') + 2).split(' ')[19];
@@ -948,18 +955,20 @@ export async function waitForLockRelease(store: Pick<CoordinatorLockStore, 'coor
 // again. A pid is signalled only when, re-checked right before that signal: it is still the pid this
 // project's runtime DB lock names with the recorded start time (or a descendant of it, verified through
 // the /proc parent chain), it is alive, and its /proc cmdline is a coordinator wrapper (`coordinator
-// run`) or claude. Without /proc (macOS host runtime) nothing can be verified, so nothing is signalled
+// run`) or claude (macOS: the same facts from `ps`). When they cannot be read nothing can be verified, so nothing is signalled
 // and the restart fails with a clear error instead of relaunching onto a held lock.
 
 /** Process inspection and signalling (injectable for tests). */
 export interface ProcessControl {
   alive: (pid: number) => boolean;
-  /** argv joined by spaces; null when unreadable (no /proc). */
+  /** argv joined by spaces; null when unreadable. */
   cmdline: (pid: number) => string | null;
   parentOf: (pid: number) => number | null;
-  /** Process start time (see procStartTime); null when unreadable (no /proc). */
+  /** Process start time (see procStartTime); null when unreadable. */
   startTime: (pid: number) => string | null;
   pids: () => number[];
+  /** Every pid with its parent from one snapshot, when the backend has that cheaper than pids() + parentOf() (ps). */
+  table?: () => { pid: number; parent: number | null }[];
   kill: (pid: number, signal: NodeJS.Signals) => void;
 }
 
@@ -975,18 +984,39 @@ function procPids(): number[] {
   try { return readdirSync('/proc').filter((n) => /^\d+$/.test(n)).map(Number); } catch { return []; }
 }
 
-export const systemProcessControl: ProcessControl = {
+const procfsProcessControl: ProcessControl = {
   alive: pidAlive, cmdline: procCmdline, parentOf: procParent, startTime: procStartTime, pids: procPids, kill: (pid, s) => { process.kill(pid, s); },
 };
+
+/** ProcessControl from `ps` (macOS, no /proc). Every fact is read fresh, so a re-check right before a signal is current. */
+export function psProcessControl(facts: ProcessFacts): ProcessControl {
+  return {
+    alive: pidAlive,
+    cmdline: (pid) => facts.process(pid)?.cmdline ?? null,
+    parentOf: (pid) => facts.process(pid)?.ppid ?? null,
+    startTime: (pid) => facts.process(pid)?.startTime ?? null,
+    pids: () => facts.list().map((p) => p.pid),
+    table: () => facts.list().map((p) => ({ pid: p.pid, parent: p.ppid })),
+    kill: (pid, s) => { process.kill(pid, s); },
+  };
+}
+
+/** The process view for a platform: `ps` on darwin (or `facts` when given), /proc elsewhere. */
+export function processControlFor(platform: NodeJS.Platform = process.platform, facts?: ProcessFacts): ProcessControl {
+  const ps = facts ?? systemProcessFacts(platform);
+  return ps ? psProcessControl(ps) : procfsProcessControl;
+}
+
+export const systemProcessControl: ProcessControl = processControlFor();
 
 /**
  * Descendants of `root` from one /proc snapshot, deepest first, each with the parent it was found under.
  * Killing in this order keeps every parent alive (and unreaped) while its children are re-verified.
  */
-export function descendantsOf(pc: Pick<ProcessControl, 'pids' | 'parentOf'>, root: number): { pid: number; parent: number }[] {
+export function descendantsOf(pc: Pick<ProcessControl, 'pids' | 'parentOf' | 'table'>, root: number): { pid: number; parent: number }[] {
   const children = new Map<number, number[]>();
-  for (const p of pc.pids()) {
-    const pp = pc.parentOf(p);
+  const rows = pc.table ? pc.table() : pc.pids().map((pid) => ({ pid, parent: pc.parentOf(pid) }));
+  for (const { pid: p, parent: pp } of rows) {
     if (pp !== null && pp !== p) (children.get(pp) ?? children.set(pp, []).get(pp)!).push(p);
   }
   const out: { pid: number; parent: number }[] = [];
