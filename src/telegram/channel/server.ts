@@ -14,10 +14,10 @@
 // - 409: three in a row (with 1 s, 2 s, 4 s ... backoff, capped at 30 s, jittered) is persistent. Then it may SIGTERM
 //   the process bot.pid names, only when that pid is alive, its argv is an official `server.ts`, its start time is the
 //   same just before the signal (PID reuse), and it is not under the coordinator claude. At most one kill per launch
-//   (kept in memory and in the lock file). Otherwise, or when 409 goes on after the kill, it stops polling and says
-//   "another process polls this bot".
+//   (kept in memory and in the lock file, which a clean close keeps as a released record). Otherwise, or when 409
+//   goes on after the kill, it stops polling and says "another process polls this bot".
 // - The getUpdates offset is saved before a batch is handled, so a restart never replays it.
-import { appendFile, chmod, readFile, rm, writeFile } from 'node:fs/promises';
+import { appendFile, chmod, readFile, writeFile } from 'node:fs/promises';
 import { randomBytes } from 'node:crypto';
 import { join } from 'node:path';
 import type { Readable, Writable } from 'node:stream';
@@ -78,12 +78,13 @@ export async function readChannelToken(env: NodeJS.ProcessEnv, readText: (p: str
 
 // ---------------------------------------------------------------- lock
 
-export interface ChannelLock { version: 1; pid: number; start: string | null; launchId: string; kills: number }
+/** `released`: the holder closed cleanly; the record stays so the launch's kill count survives a restart. */
+export interface ChannelLock { version: 1; pid: number; start: string | null; launchId: string; kills: number; released?: boolean }
 
 /**
  * Takes <state dir>/channel.lock for this process. A live holder (same pid start time, so a reused pid is stale) keeps
- * it; a stale lock is replaced. The kill count carries over from a stale lock of the same launch, so a restarted server
- * of that launch never kills again.
+ * it; a stale or released lock is replaced. The kill count carries over from a stale or released lock of the same
+ * launch, so a restarted server of that launch never kills again (also after a clean close, e.g. /mcp reconnect).
  */
 export async function acquireChannelLock(path: string, self: { pid: number; start: string | null; launchId: string }, proc: Pick<ChannelProc, 'alive' | 'startTime'>):
 Promise<{ ok: true; lock: ChannelLock } | { ok: false; holder: number }> {
@@ -95,7 +96,7 @@ Promise<{ ok: true; lock: ChannelLock } | { ok: false; holder: number }> {
     if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e;
   }
   const held = await readLock(path);
-  if (held && held.pid !== self.pid && proc.alive(held.pid) && (!held.start || proc.startTime(held.pid) === held.start)) return { ok: false, holder: held.pid };
+  if (held && !held.released && held.pid !== self.pid && proc.alive(held.pid) && (!held.start || proc.startTime(held.pid) === held.start)) return { ok: false, holder: held.pid };
   const lock: ChannelLock = { ...fresh, kills: held && held.launchId === self.launchId ? held.kills : 0 };
   await atomicWrite(path, JSON.stringify(lock) + '\n', { mode: 0o600 });
   // Two strays replacing the same stale lock: the last writer wins, the other one sees it here.
@@ -107,7 +108,7 @@ async function readLock(path: string): Promise<ChannelLock | null> {
   try {
     const v = JSON.parse(await readFile(path, 'utf8')) as Partial<ChannelLock>;
     if (typeof v?.pid !== 'number') return null;
-    return { version: 1, pid: v.pid, start: typeof v.start === 'string' ? v.start : null, launchId: typeof v.launchId === 'string' ? v.launchId : '', kills: typeof v.kills === 'number' ? v.kills : 0 };
+    return { version: 1, pid: v.pid, start: typeof v.start === 'string' ? v.start : null, launchId: typeof v.launchId === 'string' ? v.launchId : '', kills: typeof v.kills === 'number' ? v.kills : 0, ...(v.released === true ? { released: true } : {}) };
   } catch { return null; }
 }
 
@@ -213,11 +214,16 @@ export class ChannelServer {
     return this.state;
   }
 
-  /** Releases the lock when this process holds it. */
+  /**
+   * Releases the lock when this process holds it. The file is not deleted but rewritten as a released record that keeps
+   * launchId and the kill count, so a server restarted in the same launch (e.g. /mcp reconnect) has no kill left.
+   */
   async close(): Promise<void> {
     if (!this.lock) return;
     const held = await readLock(this.paths.lock);
-    if (held?.pid === this.selfPid) await rm(this.paths.lock, { force: true }).catch(() => undefined);
+    if (held?.pid === this.selfPid && !held.released) {
+      await atomicWrite(this.paths.lock, JSON.stringify({ ...this.lock, released: true }) + '\n', { mode: 0o600 }).catch(() => undefined);
+    }
     this.lock = null;
   }
 
@@ -358,7 +364,7 @@ export class ChannelServer {
       const id = await this.opts.api.sendMessage(chatId, body, { replyTo });
       if (id === null) return fail('Telegram did not return a message id');
       const map = await this.messageMap();
-      map.record({ messageId: id, chatId, ref, textHead: textHead(body), sentAt: new Date(this.now()).toISOString() });
+      map.record({ messageId: id, chatId, ref, textHead: textHead(text), sentAt: new Date(this.now()).toISOString() });
       await atomicWrite(this.paths.messages, JSON.stringify(map.toJSON()) + '\n', { mode: 0o600 }).catch((e) => this.log(`telegram channel: saving the message map failed: ${(e as Error).message}`));
       return { content: [{ type: 'text', text: `sent (id: ${id})` }] };
     } catch (e) {
@@ -407,16 +413,17 @@ export async function serveStdio(server: ChannelServer, input: Readable, output:
   const write = (v: unknown) => { output.write(JSON.stringify(v) + '\n'); };
   server.onNotification((n) => write({ jsonrpc: '2.0', method: 'notifications/claude/channel', params: n }));
   const rl = createInterface({ input, crlfDelay: Infinity });
-  const pending: Promise<void>[] = [];
+  const pending = new Set<Promise<void>>(); // in-flight only: settled requests drop out
   for await (const line of rl) {
     if (!line.trim()) continue;
     let msg: RpcRequest;
     try { msg = JSON.parse(line) as RpcRequest; } catch { write({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'parse error' } }); continue; }
-    pending.push(server.handleRpc(msg).then((r) => { if (r) write(r); }, (e) => {
+    const p: Promise<void> = server.handleRpc(msg).then((r) => { if (r) write(r); }, (e) => {
       if (msg.id !== undefined && msg.id !== null) write({ jsonrpc: '2.0', id: msg.id, error: { code: -32603, message: redact(String((e as Error).message)) } });
-    }));
+    }).finally(() => { pending.delete(p); });
+    pending.add(p);
   }
-  await Promise.all(pending);
+  await Promise.all([...pending]);
 }
 
 /** A redacted append-only log file (0600); never stdout, which belongs to JSON-RPC. */

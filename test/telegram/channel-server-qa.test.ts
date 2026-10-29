@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { BotApi, type TelegramUpdate } from '../../src/telegram/bot-api.js';
-import { CHANNEL_BOT_ERRORS, ChannelServer, type ChannelProc } from '../../src/telegram/channel/server.js';
+import { acquireChannelLock, CHANNEL_BOT_ERRORS, ChannelServer, type ChannelProc } from '../../src/telegram/channel/server.js';
 
 const TOKEN = '123456789:AAHfaketokenfaketokenfaketoken_-1234';
 const BOT_ID = '123456789';
@@ -211,11 +211,10 @@ describe('access.json failure modes and edits', () => {
 });
 
 describe('one kill per launch', () => {
-  // Defect (QA, task-67.2): close() deletes channel.lock and with it the kill count, so a server of the same launch
-  // started after a clean exit (claude restarting the MCP server, `/mcp reconnect minions-telegram`) may SIGTERM a
-  // stray poller again. docs/design/telegram-channel.md: "a restarted server of the same launch does not kill again".
-  // `it.fails` passes while the defect exists; flip it to `it` once fixed.
-  it.fails('a server restarted after a clean exit in the same launch does not kill a second time', async () => {
+  // Regression (QA, task-67.2): close() used to delete channel.lock and with it the kill count, so a server of the same
+  // launch started after a clean exit (claude restarting the MCP server, `/mcp reconnect minions-telegram`) could
+  // SIGTERM a stray poller again. close() now leaves a released record that keeps launchId and kills.
+  it('a server restarted after a clean exit in the same launch does not kill a second time', async () => {
     ownerAccess();
     writeFileSync(join(dir, 'bot.pid'), '900\n');
     const proc = fakeProc();
@@ -224,11 +223,24 @@ describe('one kill per launch', () => {
     for (let i = 0; i < 3; i++) await first.s.pollOnce();
     expect(proc.killed).toEqual([[900, 'SIGTERM']]);
     await first.s.close();
+    expect(JSON.parse(readFileSync(join(dir, 'channel.lock'), 'utf8'))).toMatchObject({ released: true, kills: 1 });
 
     const second = server(fakeBot({ updates: [{ status: 409 }, { status: 409 }, { status: 409 }] }), { proc, selfPid: 600 });
     await second.s.activate();
     expect(second.s.kills).toBe(1);
     for (let i = 0; i < 3; i++) await second.s.pollOnce();
     expect(proc.killed).toHaveLength(1);
+  });
+
+  it('a released lock is taken over even while its pid lives; a new launch starts with a fresh kill budget', async () => {
+    const path = join(dir, 'channel.lock');
+    const alive = { alive: () => true, startTime: () => 's' };
+    writeFileSync(path, JSON.stringify({ version: 1, pid: 600, start: 's', launchId: 'launch-a', kills: 1, released: true }));
+    const same = await acquireChannelLock(path, { pid: 601, start: 's', launchId: 'launch-a' }, alive);
+    expect(same).toMatchObject({ ok: true, lock: { pid: 601, kills: 1 } });
+    expect(JSON.parse(readFileSync(path, 'utf8')).released).toBeUndefined();
+
+    writeFileSync(path, JSON.stringify({ version: 1, pid: 600, start: 's', launchId: 'launch-a', kills: 1, released: true }));
+    expect(await acquireChannelLock(path, { pid: 602, start: 's', launchId: 'launch-b' }, alive)).toMatchObject({ ok: true, lock: { kills: 0 } });
   });
 });

@@ -138,6 +138,8 @@ describe('main message flow', () => {
     const sent = bot.sends().at(-1)!.body;
     expect(sent).toMatchObject({ chat_id: String(OWNER), text: 'Deployed.\n\nref: #58', reply_parameters: { message_id: 1001 } });
     expect(statSync(join(dir, 'channel-messages.json')).mode & 0o777).toBe(0o600);
+    // The map keeps the text without the ref footer, for replies where Telegram omits reply_to_message.text.
+    expect(JSON.parse(readFileSync(join(dir, 'channel-messages.json'), 'utf8')).messages).toMatchObject([{ messageId: 100, ref: '58', textHead: 'Deployed.' }]);
 
     // Telegram sends the replied message back; the quoted part and the ref come from the message map.
     bot.queue.push([dm(2, 'and staging?', { reply: { message_id: 100, text: 'Deployed.\n\nref: #58', from: { id: Number(BOT_ID), is_bot: true } }, quote: 'Deployed.' })]);

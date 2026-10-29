@@ -128,7 +128,9 @@ context-reset restarts.
     (the task-51 class). The argv check guards against PID reuse: a pid whose command line is something else is
     never signalled.
   - **At most one kill per launch.** The count is kept in the server's memory and in the lock file, so a restarted
-    server of the same launch does not kill again. After the kill it waits for the next poll to succeed (same
+    server of the same launch does not kill again. A clean exit does not delete the lock file: it rewrites it as a
+    released record (`released: true`, launchId and kill count kept), so a restart after `/mcp reconnect` still has no
+    kill left; a new launchId starts at zero. After the kill it waits for the next poll to succeed (same
     backoff). If 409 continues, or the kill is not allowed, it stops polling and reports "another process polls this
     bot" in its tool results, the log and `minions status`. It never loops on kills.
   - The host-side `bot-guard.ts` (one bot per project, the manager bot distinct) is unchanged.
