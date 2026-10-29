@@ -785,6 +785,9 @@ export class Scheduler {
    * and only running workers block the reset, else null. Read on each claim and `work next`; never throws.
    */
   private resetHeld(): ContextResetCheck | null {
+    // Sessions on (phase 7): the single coordinator does not dispatch, so its barrier never holds the supervisor's
+    // `work next` (a task session's own barrier still holds its claims).
+    try { if (this.config.coordinator?.sessions?.enabled === true && sessionScope() === null) return null; } catch { /* a malformed key: the claim refuses it */ }
     return resetBarrier({ db: this.db, config: this.config, ...(this.runs ? { state: this.runs.state } : {}) });
   }
 

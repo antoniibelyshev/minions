@@ -90,6 +90,8 @@ export async function stopHook(input: unknown, load: HookLoader, env: NodeJS.Pro
     return { reason: `allow: ${detail}` };
   };
   try {
+    // Coordinator sessions on (phase 7): task sessions dispatch, so the single coordinator is never kept running for it.
+    if (config.coordinator?.sessions?.enabled === true) return allow('sessions-on', 'coordinator sessions are on: task sessions dispatch');
     if (db.paused().starts) return allow('paused');
     if (currentBudget({ db, config })?.exhausted) return allow('budget', 'the owner budget is used up (new claims are refused)');
     // The reset barrier (task-57.6): new starts are held until the running workers return, so nothing is left to dispatch.

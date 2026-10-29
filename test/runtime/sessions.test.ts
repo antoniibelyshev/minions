@@ -13,7 +13,7 @@ import { TELEGRAM_PLUGIN_ID } from '../../src/telegram/probe.js';
 import { RuntimeDb, SCHEMA_VERSION } from '../../src/runtime/db.js';
 import { runtimePaths, type RuntimePaths } from '../../src/runtime/paths.js';
 import {
-  buildSessionCommand, checkHookCommands, DEFAULT_ROUTER_MODEL, hookCommands, parseSessionKey, routerModel, sessionConfigDir, sessionsSettings,
+  buildSessionCommand, checkHookCommands, DEFAULT_ROUTER_MODEL, hookCommands, parseSessionKey, routerModel, sessionConfigDir, sessionsSettings, taskSessionPromptNote,
   type SessionCommandDeps,
 } from '../../src/runtime/sessions.js';
 import { defaults } from '../helpers.js';
@@ -137,7 +137,9 @@ describe('buildSessionCommand', () => {
     // argv: resident stream-json, the minions plugin, strict MCP, no channel, nothing secret.
     expect(l.args.slice(0, 6)).toEqual(['-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose']);
     expect(valueOf(l.args, '--plugin-dir')).toBe(paths.pluginDir);
-    expect(valueOf(l.args, '--append-system-prompt')).toBe('session prompt\n');
+    // A task session gets the coordinator prompt plus its task note (phase 7): only this task, the /minions:task skill, no channel.
+    expect(valueOf(l.args, '--append-system-prompt')).toBe('session prompt\n' + taskSessionPromptNote('task-57.8'));
+    expect(taskSessionPromptNote('task-57.8')).toMatch(/Follow `\/minions:task task-57\.8`.*no chat channel/s);
     expect(l.args).toContain('--strict-mcp-config');
     expect(l.args).toContain('--permission-mode');
     for (const f of ['--channels', '--dangerously-load-development-channels', '--dangerously-skip-permissions', '--mcp-config']) expect(l.args).not.toContain(f);
@@ -174,6 +176,7 @@ describe('buildSessionCommand', () => {
     expect(l.flagSettings.apiKeyHelper).toContain(paths.apiKeyFile);
     expect(l.userSettings.apiKeyHelper).toContain(paths.apiKeyFile);
     expect(l.env).toMatchObject({ CLAUDE_CODE_API_KEY_HELPER_TTL_MS: '300000', MINIONS_SESSION: 'general' });
+    expect(valueOf(l.args, '--append-system-prompt')).toBe('session prompt\n'); // no task note for the general session
     expect(l.env.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
     expect(JSON.stringify([l.args, l.env, l.flagSettings, l.userSettings])).not.toContain(PROVISIONED_KEY);
   });

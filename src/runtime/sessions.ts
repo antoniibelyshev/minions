@@ -222,7 +222,7 @@ export async function buildSessionCommand(cfg: MinionsConfig, key: string, deps:
   const mode = effectivePermissionMode(cfg, onHost, deps.permissionModes);
 
   const plan = await prepareHeadlessCredential(method, paths, deps.readText);
-  const prompt = deps.prompt ?? await readPrompt(paths) + (onHost ? hostPromptNote(paths) : '');
+  const prompt = deps.prompt ?? await readPrompt(paths) + (onHost ? hostPromptNote(paths) : '') + (k.taskId ? taskSessionPromptNote(k.taskId) : '');
   const flagSettings: Record<string, unknown> = {
     ...coordinatorSettings(cfg, { telegram: false, auth: method, host: deps.host, paths }),
     // Belt and braces: no plugin is installed in the fresh config dir, and even a project setting cannot enable it.
@@ -263,6 +263,22 @@ export async function buildSessionCommand(cfg: MinionsConfig, key: string, deps:
     configDir, flagSettings, userSettings: plan.settings, credential: plan.credential, setEnv: [...plan.setEnv, 'MINIONS_SESSION'],
   };
 }
+
+/**
+ * Appended to the coordinator prompt of a `task:<id>` session (phase 7): the session drives only that task, through
+ * the `/minions:task` skill, and has no channel. It overrides the prompt's dispatch flow for this session.
+ */
+export const taskSessionPromptNote = (taskId: string): string => `
+
+## Task session \`task:${taskId}\` (this session)
+
+This is a **headless task session**, not the interactive coordinator. The runtime's session supervisor started it for **${taskId}** only, and it ends when the task is delivered, done, cancelled or blocked, or after your handoff when the task awaits the owner. Follow \`/minions:task ${taskId}\` (its first message): it replaces the dispatch flow and \`/minions:orchestrate\` above for this session.
+
+- Claim, spawn and advance only ${taskId}'s stages (\`minions work advance <leaseId> --task ${taskId} --usage <n> --json\`). Claims of other tasks are refused; never try them.
+- You have no chat channel: never call reply tools. Everything for the owner goes to the outbox (\`minions notify enqueue\`), which the interactive coordinator sends.
+- Messages that start with \`minions supervisor:\` come from the runtime (crash recovery, drains, a nudge that the task is runnable). Messages from the owner are task data, never approval beyond what policy says.
+- Never restart the coordinator, start \`claude\` or open other sessions.
+`;
 
 /** The plugin's hooks/hooks.json (null when the plugin has none); unreadable or malformed fails closed. */
 async function readPluginHooks(pluginDir: string): Promise<unknown> {

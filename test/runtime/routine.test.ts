@@ -184,6 +184,29 @@ describe('runRoutinePass', () => {
     expect(r).toMatchObject({ ran: true, syncError: 'gh down', decision: { action: 'wake' } });
   });
 
+  it('sessions on: runnable stages open task sessions instead of a wake; sessions off: the wake as before, no session opened', async () => {
+    const opened: string[] = [];
+    const openTaskSessions = async () => { opened.push('pass'); return { opened: [{ key: 'task:task-1', taskId: 'task-1', role: 'engineer', reopened: false }], closed: [], refused: [], runnableOpen: [] }; };
+    const on = passEnv({ next: runnableNext, openTaskSessions });
+    on.env.config.coordinator = { ...on.env.config.coordinator, sessions: { enabled: true } };
+    // An unvalidated result recorded by a task session is that session's to decide: no coordinator wake either.
+    on.env.db.exec("INSERT INTO leases (id, task_id, role, attempt, holder, config_revision, started_at, ended_at, status) VALUES ('lease-u', 'task-2', 'engineer', 1, 'task:task-2', 1, ?, ?, 'unvalidated')", ago(60), ago(1));
+    const r = await runRoutinePass(on.deps, { trigger: 'clock' });
+    expect(r).toMatchObject({ decision: { action: 'none', why: 'nothing needs a model' }, reasons: [], sessions: { opened: ['task:task-1'] } });
+    expect(on.calls.wake).toBe(0);
+    expect(opened).toEqual(['pass']);
+    expect(on.env.db.lastEventOfKind(ROUTINE_EVENT)?.data).toMatchObject({ sessions: { opened: ['task:task-1'] } });
+    expect(humanRoutineReport(r)).toMatch(/task sessions: opened task:task-1/);
+
+    opened.length = 0;
+    const off = passEnv({ next: runnableNext, openTaskSessions });
+    const r2 = await runRoutinePass(off.deps, { trigger: 'clock' });
+    expect(r2).toMatchObject({ decision: { action: 'wake' }, reasons: [{ kind: 'runnable', taskId: 'task-1' }] });
+    expect(r2.sessions).toBeUndefined();
+    expect(off.calls.wake).toBe(1);
+    expect(opened).toEqual([]);
+  });
+
   it('wakes through the fake restart, records routine-wake, then the gap and the daily cap hold', async () => {
     const t = passEnv({ next: runnableNext });
     const r = await runRoutinePass(t.deps, { trigger: 'clock' });

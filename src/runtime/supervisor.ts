@@ -17,7 +17,11 @@
 // - When a process runs: an `open` session with undelivered inbox messages gets one (within coordinator.sessions.max,
 //   never during a drain, and while starts are paused only for an owner message). It stays resident until the session
 //   is no longer open (stdin closed), a drain (drain notice, stdin closed), the supervisor stops, or a crash. The
-//   `general` session is opened on its first message; task sessions are opened by phase 7.
+//   `general` session is opened on its first message; task sessions are opened, closed and reopened by the task
+//   session pass (./task-sessions.ts, phase 7), run every timing.openMs.
+// - Task sessions (phase 7): an open task session whose task is runnable while its process is idle (its last turn
+//   ended, nothing pending) gets a nudge, at most once per timing.nudgeMs. Before a task session is resumed (a crash,
+//   a drain, a supervisor restart), its leases are recovered (recoverTaskSession) and the outcome is in its inbox.
 // - Resumes: a process that ends without being asked to is a crash. The session is resumed (`--resume <claude session
 //   id>`, prompted by a supervisor notice in its inbox) at most MAX_SESSION_RESUMES times in a row; a completed turn
 //   (a stream-json `result`) resets the count. One more crash marks it `failed` and queues an outbox `blocker`.
@@ -51,6 +55,7 @@ import { groupMembers, hostIdentity, isAlive, procIdentity, procStat, sameHost, 
 import { supervise, type StopReason, type SuperviseOutcome } from './runner/supervise.js';
 import { enqueueInbox, getSession, keysWithPendingInbox, markInboxDelivered, openSession, pendingInbox, updateSession } from './session-store.js';
 import { NOEXEC_ROOTS, parseSessionKey, sessionConfigDir, sessionDir, sessionsSettings } from './sessions.js';
+import { recoverNotice, TASK_SESSION_SOURCE, type RecoverOutcome, type TaskSessionPass } from './task-sessions.js';
 
 /** Resumes in a row (without a completed turn) before a session is marked failed. */
 export const MAX_SESSION_RESUMES = 2;
@@ -80,10 +85,14 @@ export interface SupervisorTiming {
   drainGraceMs: number;
   /** Orphan stop: SIGTERM -> SIGKILL. */
   reapGraceMs: number;
+  /** Task session pass: open, close and reopen (phase 7). */
+  openMs: number;
+  /** At most one nudge per idle task session in this time. */
+  nudgeMs: number;
 }
 export const DEFAULT_SUPERVISOR_TIMING: SupervisorTiming = {
   tickMs: 2_000, pollMs: 1_000, configMs: 15_000, timeoutMs: 24 * 3_600_000, interruptGraceMs: 5_000, killGraceMs: 15_000,
-  drainGraceMs: 10 * 60_000, reapGraceMs: 5_000,
+  drainGraceMs: 10 * 60_000, reapGraceMs: 5_000, openMs: 30_000, nudgeMs: 5 * 60_000,
 };
 
 // ---------------------------------------------------------------- lock
@@ -308,10 +317,19 @@ export interface SupervisorDeps {
   signal?: AbortSignal;
   now?: () => Date;
   reap?: Omit<ReapOptions, 'proc'>;
+  /** Task sessions (phase 7); without it the supervisor opens no task session (as in phase 5). */
+  tasks?: SupervisorTaskDeps;
+}
+
+export interface SupervisorTaskDeps {
+  /** taskSessionPass with the runtime context (work next, the backlog, the budget). */
+  pass: (cfg: MinionsConfig) => Promise<TaskSessionPass>;
+  /** recoverTaskSession with the runtime context (submission files, Scheduler.release). */
+  recover: (key: string) => Promise<RecoverOutcome>;
 }
 
 export type SupervisorExit = 'disabled' | 'conflict' | 'stopped' | 'lock-lost';
-export interface SupervisorReport { exit: SupervisorExit; holder: SupervisorLock | null; reaped: ReapResult[]; reapErrors: { key: string; error: string }[]; starts: number }
+export interface SupervisorReport { exit: SupervisorExit; holder: SupervisorLock | null; reaped: ReapResult[]; reapErrors: { key: string; error: string }[]; starts: number; opened: number; closed: number }
 
 type EndReason = 'close' | 'drain' | 'disabled' | 'shutdown';
 
@@ -323,6 +341,8 @@ interface Live {
   ending: EndReason | null;
   /** Stop at once (the supervisor ends). */
   stopNow: boolean;
+  /** A turn is in progress: a message was written and its `result` has not come yet. */
+  busy: boolean;
   record: SessionRunRecord;
   done: Promise<void>;
 }
@@ -347,7 +367,7 @@ export async function runSupervisor(d: SupervisorDeps): Promise<SupervisorReport
   const proc = d.proc ?? '/proc';
   const now = d.now ?? (() => new Date());
   const db = d.db;
-  const report: SupervisorReport = { exit: 'stopped', holder: null, reaped: [], reapErrors: [], starts: 0 };
+  const report: SupervisorReport = { exit: 'stopped', holder: null, reaped: [], reapErrors: [], starts: 0, opened: 0, closed: 0 };
   let cfg = await d.config();
   if (!sessionsSettings(cfg).enabled) return { ...report, exit: 'disabled' };
 
@@ -371,6 +391,7 @@ export async function runSupervisor(d: SupervisorDeps): Promise<SupervisorReport
       const s = l.stdin;
       if (!s || s.writableEnded || s.destroyed) return;
       s.write(userMessageLine(m.text));
+      l.busy = true;
       markInboxDelivered(db, m.id, now());
     }
   };
@@ -408,6 +429,7 @@ export async function runSupervisor(d: SupervisorDeps): Promise<SupervisorReport
     const row = getSession(db, l.key);
     if (!row) return;
     if (typeof ev.session_id === 'string' && SESSION_ID.test(ev.session_id) && ev.session_id !== row.claude_session_id) updateSession(db, l.key, { claude_session_id: ev.session_id });
+    if (ev.type === 'result') l.busy = false;
     if (ev.type === 'result' && row.resumes > 0) updateSession(db, l.key, { resumes: 0, failure: null });
   };
 
@@ -458,7 +480,19 @@ export async function runSupervisor(d: SupervisorDeps): Promise<SupervisorReport
       try { report.reaped.push(await reapSessionRecord(d.state, key, { ...d.reap, proc })); } catch (r) { report.reapErrors.push({ key, error: (r as Error).message }); }
       return;
     }
-    const l: Live = { key, taskId: parseSessionKey(key).taskId, stdin: null, ending: null, stopNow: false, record, done: Promise.resolve() };
+    if (row.kind === 'task' && d.tasks) {
+      // Per-task recovery (phase 7): the record is ours, so no process of the session runs; the leases it held are
+      // reconciled before the session resumes.
+      try {
+        const r = await d.tasks.recover(key);
+        const text = recoverNotice(parseSessionKey(key).taskId!, r);
+        if (text) {
+          enqueueInbox(db, key, SUPERVISOR_SOURCE, text, { now: now() });
+          log(`minions supervisor: ${key}: recovered (released ${r.released.length}, submitted ${r.submitted.length}${r.errors.length ? `, errors ${r.errors.length}` : ''})`);
+        }
+      } catch (e) { log(`minions supervisor: ${key}: recovery failed: ${(e as Error).message}`); }
+    }
+    const l: Live = { key, taskId: parseSessionKey(key).taskId, stdin: null, ending: null, stopNow: false, busy: false, record, done: Promise.resolve() };
     live.set(key, l);
     updateSession(db, key, { last_wake_at: at });
     db.addEvent('session-start', l.taskId, { key, resume: resume ?? null });
@@ -501,6 +535,27 @@ export async function runSupervisor(d: SupervisorDeps): Promise<SupervisorReport
     }
   };
 
+  // Task sessions (phase 7): the open/close/reopen pass, then nudges for runnable tasks whose session idles.
+  const nudged = new Map<string, number>();
+  const taskPass = async () => {
+    if (!d.tasks || stopping) return;
+    const r = await d.tasks.pass(cfg);
+    report.opened += r.opened.length;
+    report.closed += r.closed.length;
+    for (const o of r.opened) log(`minions supervisor: ${o.key} ${o.reopened ? 'reopened' : 'opened'} (${o.role} runnable)`);
+    for (const c of r.closed) log(`minions supervisor: ${c.key} closed (${c.reason})`);
+    if (r.refused.length) log(`minions supervisor: no session for ${r.refused.slice(0, 3).map((x) => `${x.taskId} (${x.why})`).join(', ')}${r.refused.length > 3 ? ', …' : ''}`);
+    for (const taskId of r.runnableOpen) {
+      const key = `task:${taskId}`;
+      const l = live.get(key);
+      // A live process mid-turn or ending is left alone; an open session without a process gets one through the nudge.
+      if ((l && (l.busy || l.ending)) || pendingInbox(db, key).length) continue;
+      if (Date.now() - (nudged.get(key) ?? -Infinity) < t.nudgeMs) continue;
+      nudged.set(key, Date.now());
+      enqueueInbox(db, key, TASK_SESSION_SOURCE, `minions supervisor: ${taskId} has a runnable stage now. Continue with /minions:task ${taskId} (claim it).`, { now: now() });
+    }
+  };
+
   const abortable = (ms: number) => new Promise<void>((res) => {
     const done = () => { clearTimeout(timer); d.signal?.removeEventListener('abort', done); res(); };
     const timer = setTimeout(done, ms);
@@ -523,6 +578,7 @@ export async function runSupervisor(d: SupervisorDeps): Promise<SupervisorReport
       }
     }
     let configAt = Date.now();
+    let passAt = -Infinity;
     while (!d.signal?.aborted && !stopping) {
       const cur = db.supervisorLock();
       if (!cur || cur.pid !== lock.pid || cur.at !== lock.at) { exit = 'lock-lost'; stopping = 'shutdown'; log('minions supervisor: the lock was taken over; stopping'); break; }
@@ -530,6 +586,10 @@ export async function runSupervisor(d: SupervisorDeps): Promise<SupervisorReport
         configAt = Date.now();
         try { cfg = await d.config(); } catch (e) { log(`minions supervisor: config unreadable, keeping the last one (${(e as Error).message})`); }
         if (!sessionsSettings(cfg).enabled) { exit = 'disabled'; stopping = 'disabled'; log('minions supervisor: coordinator.sessions.enabled is off; ending the sessions'); break; }
+      }
+      if (Date.now() - passAt >= t.openMs) {
+        passAt = Date.now();
+        try { await taskPass(); } catch (e) { log(`minions supervisor: task session pass: ${(e as Error).message}`); }
       }
       try { await startDue(); } catch (e) { log(`minions supervisor: ${(e as Error).message}`); }
       await abortable(t.tickMs);

@@ -36,7 +36,7 @@ const EXPECTED = [
   'coordinator.md',
   'hooks/hooks.json',
   'skills/intake/SKILL.md', 'skills/maintain-context/SKILL.md', 'skills/orchestrate/SKILL.md',
-  'skills/recover/SKILL.md', 'skills/status/SKILL.md',
+  'skills/recover/SKILL.md', 'skills/status/SKILL.md', 'skills/task/SKILL.md',
 ];
 /** Generated worker definitions and the lease role each runs under. */
 const WORKER_AGENTS = [['engineer', 'engineer'], ['engineer-deep', 'engineer'], ['tester', 'tester'], ['reviewer', 'reviewer']] as const;
@@ -113,7 +113,7 @@ describe('generatePlugin', () => {
 
   it('skill frontmatter has name and description only', async () => {
     const { read } = await gen();
-    for (const s of ['orchestrate', 'status', 'intake', 'recover', 'maintain-context']) {
+    for (const s of ['orchestrate', 'status', 'intake', 'recover', 'maintain-context', 'task']) {
       const fm = frontmatter(await read(`skills/${s}/SKILL.md`));
       expect(Object.keys(fm).sort()).toEqual(['description', 'name']);
       expect(fm.name).toBe(s);

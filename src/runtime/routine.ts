@@ -8,6 +8,10 @@
 //   3. the wake decision (decideWake, a pure function) and its action: a fresh coordinator session through the
 //      detached restart with the constant wake prompt (never with force), or the separate crash start (recover);
 //   4. a `routine` event with the counts, the decision and the reasons (`--last` reads it back).
+// With coordinator.sessions.enabled (docs/design/coordinator-sessions.md phase 7) step 3 changes: the pass opens task
+// sessions for runnable stages (openTaskSessions, the supervisor's task session pass with the same limits) instead of
+// waking the coordinator; only the digest still wakes it. Task sessions record and decide their own results, so the
+// unvalidated, needs-split and awaiting-human reasons are not wake reasons either.
 // Every external effect (gh, git, restart, clock, process table, files) is an injected dependency, so tests run it
 // with a fake gh, a fake clock and a fake restart.
 import { statSync } from 'node:fs';
@@ -19,6 +23,7 @@ import type { NextReport } from './scheduler.js';
 import { lastOwnerMessageAt } from './coordinator-usage.js';
 import { TRANSCRIPT_META } from './context-reset.js';
 import { localDayStart } from './zoned-time.js';
+import type { TaskSessionPass } from './task-sessions.js';
 
 export const ROUTINE_DEFAULTS = { tickMinutes: 15, minWakeGapMinutes: 30, maxWakesPerDay: 8, digestAt: ['08:00'] as readonly string[], timezone: 'Europe/Berlin' } as const;
 /** The main transcript must be idle this long before a wake (the prompt cache has expired by then). */
@@ -261,6 +266,8 @@ export interface RoutinePassDeps {
   wake: () => Promise<string>;
   /** The crash start: `coordinator restart --recover` detached, after its own drain check. */
   crashStart: () => Promise<string>;
+  /** Sessions on (phase 7): the task session pass (taskSessionPass), run instead of a wake for runnable stages. */
+  openTaskSessions?: () => Promise<TaskSessionPass>;
 }
 
 export type RoutineSkip = 'disabled' | 'locked' | 'interval' | 'fresh';
@@ -283,6 +290,8 @@ export interface RoutineReport {
   decision?: WakeDecision;
   /** What the wake or crash start did (scheduled, or the refusal). */
   outcome?: { ok: boolean; detail: string };
+  /** Sessions on: what the task session pass opened, closed and refused (or why it failed). */
+  sessions?: { opened: string[]; closed: string[]; refused: { taskId: string; why: string }[] } | { error: string };
   coordinator: { running: boolean; since: string | null };
 }
 
@@ -337,7 +346,15 @@ export async function runRoutinePass(deps: RoutinePassDeps, opts: { trigger: Rou
     const since = c.running ? coordinatorIdleSince(deps.db, c, deps.mtime) : null;
     let next: Pick<NextReport, 'runnable'> | null = null;
     try { next = await deps.next(); } catch { next = null; }
-    const reasons = settings.enabled && c.running ? collectWakeReasons(deps.db, next, since) : [];
+    // Sessions on: runnable stages open task sessions; nothing but the digest wakes the coordinator.
+    const sessionsOn = deps.config.coordinator?.sessions?.enabled === true;
+    if (sessionsOn && deps.openTaskSessions) {
+      try {
+        const p = await deps.openTaskSessions();
+        report.sessions = { opened: p.opened.map((o) => o.key), closed: p.closed.map((x) => x.key), refused: p.refused.slice(0, 20) };
+      } catch (e) { report.sessions = { error: msg(e) }; }
+    }
+    const reasons = settings.enabled && c.running && !sessionsOn ? collectWakeReasons(deps.db, next, since) : [];
     const digest = settings.enabled ? deps.digestDue?.(deps.now()) ?? null : null;
     if (digest) reasons.push({ kind: 'digest', detail: digest });
     const day = localDayStart(deps.now(), settings.timezone);
@@ -369,6 +386,7 @@ export async function runRoutinePass(deps: RoutinePassDeps, opts: { trigger: Rou
     deps.db.addEvent(ROUTINE_EVENT, null, {
       trigger: report.trigger, durationMs: report.durationMs, sync: report.sync ?? null, syncError: report.syncError ?? null, reheld: report.reheld ?? 0,
       reasons: reasons.slice(0, 50), decision, outcome: report.outcome ?? null, coordinator: report.coordinator,
+      ...(report.sessions ? { sessions: report.sessions } : {}),
     }, at);
     return report;
   } finally {
@@ -412,6 +430,7 @@ export function humanRoutineReport(r: RoutineReport): string {
   return [
     `routine pass (${r.trigger}) at ${r.at}: ${s ? `synced ${s.synced}, failed ${s.failed}, ${s.statusChanges} status change(s), ${s.merged} merged, ${s.armed} armed, ${s.intakeCreated} imported` : `sync failed: ${r.syncError ?? 'unknown'}`}`,
     `decision: ${r.decision?.action ?? 'none'} - ${r.why}${r.outcome ? ` (${r.outcome.ok ? 'scheduled' : 'refused'}: ${r.outcome.detail})` : ''}`,
+    ...(r.sessions ? ['error' in r.sessions ? `task sessions: pass failed: ${r.sessions.error}` : `task sessions: opened ${r.sessions.opened.join(', ') || 'none'}; closed ${r.sessions.closed.join(', ') || 'none'}${r.sessions.refused.length ? `; not opened: ${r.sessions.refused.slice(0, 3).map((x) => `${x.taskId} (${x.why})`).join(', ')}` : ''}`] : []),
     ...(r.reasons?.length ? ['reasons:', ...r.reasons.map((x) => `  ${x.kind}: ${x.detail}`)] : []),
     `next pass ${r.nextAt ?? '-'}`,
   ].join('\n');
