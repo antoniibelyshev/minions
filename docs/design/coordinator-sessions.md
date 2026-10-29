@@ -2,7 +2,8 @@
 
 Status: **agreed direction, build phases proposed** (task-57.4 design check against main @ 18486ec, 2026-10-28).
 Step 1 (token tracking, task-57.1) is built. The owner decided to build the router and per-task sessions (TG 427,
-2026-10-28) after this design check. Nothing else is built. The build phases are in [Phases](#phases). Three
+2026-10-28) after this design check. Phases 3 (spike), 4 (schema and launch builder) and 5 (supervisor) are built;
+nothing opens a session yet (phase 7). The build phases are in [Phases](#phases). Three
 [open questions](#open-questions-for-the-owner) remain.
 
 Owner decisions so far:
@@ -433,6 +434,17 @@ need an owner decision first.
    spike part is answered here; its build part is retargeted to phase 10 (task-57.14).
 4. **child: Session schema, settings and launch builder** | criteria: `sessions` (key, kind, claude session id, status, model, config dir, opened, last wake, closed, resumes, failure) and `session_inbox` tables (inline migration, schema 10); `coordinator.sessions.enabled` (default off), `coordinator.sessions.max`, `models.router` registered with setting classes; `buildSessionCommand` on the task-96 builder: persistent fresh config dir 0700, flags per decision 5, env allowlist with `MINIONS_SESSION`; hook commands in the session settings are never exec'd from a `noexec` `/tmp` (run via `sh` or from the plugin dir, U1), with a test; a test asserts that the argv, env and settings carry no Telegram token, plugin, channel or tools and no secret in argv; no process is started yet | depends: 3 (worker)
 5. **child: Supervisor** | criteria: hidden `minions coordinator supervise` with a reuse-safe lock; run record per session (O_EXCL); spawn and stop through `supervise.ts` (process group, timeout, drain); the process model from phase 3; orphans adopted or reaped at start from identities in the records; inbox delivery; 2 resumes, then `failed` and an outbox `blocker`; the wrapper starts it detached when sessions are on and restarts it when its lock is stale; tests with a fake `claude` binary (spawn, crash, resume, drain, orphan) | depends: 4 (worker)
+
+   Result (task-57.9, src/runtime/supervisor.ts): the lock is the meta row `supervisor_lock` {pid, start, bootId, at},
+   taken in one transaction; a holder is live only with its pid, start time, boot and a `coordinator supervise`
+   command line. A process runs for an `open` session with undelivered inbox messages (the `general` session is
+   opened on its first one) and stays resident until the session is closed, a drain (drain notice, then stdin closed,
+   the drain grace as the hard limit), the supervisor stops, or a crash. A resident process cannot be adopted in
+   place (its stdin and stdout were the dead supervisor's pipes), so "adopt" means: the orphan is stopped by its
+   recorded identity (process group, then processes with `MINIONS_SESSION=<key>` started after it) and the session
+   is resumed with `--resume`, which does not count as a failed resume. A completed turn resets the resume count;
+   the third crash in a row marks the session `failed` with an outbox `blocker`. The wrapper starts the supervisor
+   detached and restarts it when its lock is stale (checked every minute); with sessions off it starts nothing.
 6. **child: Session-scoped hooks and state** | criteria: with `MINIONS_SESSION` set, the Stop guard is scoped to the session's task (task) or off (general and router); `noteTranscript` uses `coordinator_transcript:<key>`; usage states carry the role and only complete sessions of the same key; the baseline shows tokens per role; `contextResetCheck` and handoffs are per session; lease `holder` = session key; `work advance --task <id>`; tests with two sessions' hook inputs on one DB; with the variable unset nothing changes | depends: 4 (worker; can run in parallel with 5)
 7. **child: Task sessions** | criteria: the supervisor opens `task:<id>` for a runnable stage within `sessions.max`, budget, pauses and the routine's caps; the `/minions:task <id>` skill (claim, spawn, `work advance --task`, inbox check between stages, final summary to the outbox, a handoff at `awaiting-human`); close and reopen rules per decision 4; per-task recover after a session crash; with sessions on, the routine pass opens task sessions instead of waking the coordinator, and the coordinator prompt no longer dispatches; tests with the fake binary | depends: 5, 6 (worker)
 8. **child: Router, general session and outbound** | criteria: `coordinator route --json` resolver (rules 2 to 4 of the routing model, `ambiguous`), table tests; `coordinator send <key>` and `coordinator wait --json`; `notify enqueue --session`, `notify ack --message-id` and a `tg_messages` table with task-67.3's columns plus `session`; question items keep their session, and `Q1 2` answers route back; router prompt and skill on `models.router`, no Agent tool, resets allowed with active leases; the `general` session; the digest is sent by the router; poller and isolation checks unchanged and tested | depends: 7 (worker; may split into resolver/outbound and router/general if large)

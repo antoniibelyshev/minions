@@ -68,6 +68,8 @@ import { PROCESS_ADAPTERS } from './runner/adapters.js';
 import { reapRun, recoverRuns, runLease, type ReapDeps, type RecoverySweep, type RunOutput } from './runner/run.js';
 import { hasOpenRun, openRunsSync, withOpenRuns } from './runner/record.js';
 import { liveRun, liveRunExitCode, type LiveRunReport } from './headless.js';
+import { buildSessionCommand } from './sessions.js';
+import { runSupervisor, startSupervisorWatch, supervisorLockState, type SupervisorReport } from './supervisor.js';
 
 /** Human output of `minions work next`. */
 export function humanNext(r: NextReport): string {
@@ -251,6 +253,15 @@ export function wrapperRoutineClock(log: (line: string) => void): () => void {
     },
     log,
   });
+}
+
+/**
+ * The wrapper's session supervisor watch (task-57 phase 5): with coordinator.sessions.enabled it starts
+ * `minions coordinator supervise` detached and again whenever its lock is stale; with sessions off it does nothing.
+ */
+export function wrapperSupervisorWatch(cfg: MinionsConfig, log: (line: string) => void): () => void {
+  const paths = runtimePaths();
+  return startSupervisorWatch(cfg, { state: paths.state, log: join(paths.logs, 'supervisor.log'), tmp: paths.tmp, lockState: () => supervisorLockState(getDb()), say: log });
 }
 
 function logRecovery(r: RecoverySweep, log: (line: string) => void): void {
@@ -815,6 +826,7 @@ export function register(program: Command): void {
       process.exitCode = await coordinatorWrapper(getConfig, {
         ...(o.recover ? { startupPrompt: RECOVERY_PROMPT } : o.wake ? { startupPrompt: WAKE_PROMPT } : {}),
         routineClock: wrapperRoutineClock,
+        supervisorWatch: wrapperSupervisorWatch,
         onStart: async (c, l, stop) => {
           // D3b: no process run of the previous session outlives it. Every record that is not done is reaped
           // (cancel or kill, escapee sweep, wip: checkpoint) before anything else touches its scratch dir.
@@ -892,6 +904,29 @@ export function register(program: Command): void {
       const raw = await readInput(undefined, 'the handoff text', 'Pipe the note in with a quoted heredoc; --read prints the stored one, --check reports whether a reset is due.');
       const r = await writeHandoff({ db: getDb(), path: paths.coordinatorHandoff }, raw);
       emit(r, { json, human: (d: typeof r) => `handoff stored (${d.bytes}/${d.maxBytes} bytes${d.redactions ? `, ${d.redactions} secret(s) redacted` : ''}${d.replaced ? ', replaced the previous one' : ''})` });
+    }));
+
+  // Task-57 phase 5: the session supervisor (src/runtime/supervisor.ts). Hidden: the wrapper starts it detached when
+  // coordinator.sessions.enabled is on; the worker hooks refuse it to subagents like live-run.
+  coord.command('supervise', { hidden: true }).description('Internal: the session supervisor the wrapper starts detached with coordinator.sessions.enabled; starts and stops the headless coordinator sessions (container only)')
+    .action(action(async (_o: unknown, cmd: Command) => {
+      requireMode('runtime');
+      const paths = runtimePaths();
+      const stop = new AbortController();
+      for (const s of ['SIGTERM', 'SIGINT', 'SIGHUP'] as const) process.on(s, () => stop.abort());
+      // Asked once, like the coordinator launch: auto only where this Claude Code offers it.
+      let modes: Promise<readonly string[] | null> | undefined;
+      const r = await runSupervisor({
+        db: getDb(), state: paths.state, config: () => loadRuntimeConfig(), signal: stop.signal,
+        launch: async (c, key, o) => buildSessionCommand(c, key, {
+          ...(o.resume ? { resume: o.resume } : {}),
+          permissionModes: permissionModesNeeded(c) ? await (modes ??= claudePermissionModes().catch(() => null)) : undefined,
+        }),
+        log: (line) => process.stderr.write(`${new Date().toISOString()} ${line}\n`),
+      });
+      emit(r, { json: globalOpts(cmd).json, human: (x: SupervisorReport) => x.exit === 'conflict'
+        ? `session supervisor: already running (pid ${x.holder?.pid ?? '?'})`
+        : `session supervisor: ${x.exit} (${x.starts} session start(s), ${x.reaped.length} orphan record(s) reaped)` });
     }));
 
   // Task-96: the coordinator's controlled live Claude run. Coordinator-only (the pre-bash hook refuses it to every

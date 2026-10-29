@@ -230,6 +230,12 @@ export function pidAlive(pid: number): boolean {
  */
 export interface CoordinatorLock { pid: number; session: string; acquiredAt: string; start?: string }
 
+/**
+ * The session supervisor lock (meta `supervisor_lock`, docs/design/coordinator-sessions.md decision 7): holder pid,
+ * its process start time (null when unreadable), the boot it ran in, and when it was taken.
+ */
+export interface SupervisorLock { pid: number; start: string | null; bootId: string | null; at: string }
+
 /** The routine pass lock: holder pid, its process start time (null when unreadable) and when it was taken. */
 export interface RoutineLock { pid: number; start: string | null; at: string }
 
@@ -723,6 +729,38 @@ export class RuntimeDb {
   }
   routineLock(): RoutineLock | null {
     try { const v = this.getMeta('routine_lock'); return v ? JSON.parse(v) as RoutineLock : null; } catch { return null; }
+  }
+  /**
+   * The session supervisor lock (meta row `supervisor_lock`; src/runtime/supervisor.ts). Taken in one IMMEDIATE
+   * transaction, so it is never seen half-written, and only when no live holder has it: `alive` decides (pid, start
+   * time, boot and command line), so a reused pid never keeps a stale lock. Returns the lock taken, or null with the
+   * live holder left in place. An unreadable row counts as no lock.
+   */
+  acquireSupervisorLock(me: Omit<SupervisorLock, 'at'>, alive: (l: SupervisorLock) => boolean, now: Date = new Date()): SupervisorLock | null {
+    return this.transaction(() => {
+      const cur = this.supervisorLock();
+      if (cur && !(cur.pid === me.pid && cur.start === me.start && cur.bootId === me.bootId) && alive(cur)) return null;
+      const lock: SupervisorLock = { pid: me.pid, start: me.start, bootId: me.bootId, at: now.toISOString() };
+      this.setMeta('supervisor_lock', JSON.stringify(lock));
+      if (!cur || cur.pid !== lock.pid || cur.start !== lock.start) this.addEvent('supervisor-lock', null, { ...lock, replaced: cur });
+      return lock;
+    });
+  }
+  /** Drops the lock only when `lock` still is the holder (same pid and time taken). */
+  releaseSupervisorLock(lock: Pick<SupervisorLock, 'pid' | 'at'>): boolean {
+    return this.transaction(() => {
+      const cur = this.supervisorLock();
+      if (!cur || cur.pid !== lock.pid || cur.at !== lock.at) return false;
+      this.deleteMeta('supervisor_lock');
+      return true;
+    });
+  }
+  supervisorLock(): SupervisorLock | null {
+    try {
+      const v = this.getMeta('supervisor_lock');
+      const l = v ? JSON.parse(v) as SupervisorLock : null;
+      return l && typeof l.pid === 'number' ? { pid: l.pid, start: l.start ?? null, bootId: l.bootId ?? null, at: String(l.at) } : null;
+    } catch { return null; }
   }
   releaseCoordinatorLock(session: string, pid = process.pid): boolean {
     return this.transaction(() => {
