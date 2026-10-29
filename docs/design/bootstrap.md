@@ -950,6 +950,14 @@ The source phase (`src/host/upgrade-source.ts`) adds two steps, `sync` and `cli`
   the host CLI runs from a minions source checkout and the project is minions, with local delivery and a clean
   checkout; its plan shows `git log --oneline <build commit>..HEAD`, the diffstat and the sensitive paths the
   range touches, and it always asks twice. Details: [host-manager.md](host-manager.md#phases).
+- **Dev self-update (task-99): installed minions unchanged.** For the minions project developing itself, the owner
+  can run the host-side `scripts/dev/self-update.mjs` ([coordinator-self-update.md](coordinator-self-update.md)). It
+  applies the coordinator's `upgrade --from-container` requests: `--sync-only`, a gate on the host, then
+  `upgrade --rebuild-cli` as a second run, each one a child `minions` process. It is not in the npm package and
+  never starts by itself. For installed minions the rules above stay as they are: no self-continuation (a freshly
+  built CLI always runs in a new process), `--rebuild-cli` only as an explicit flag, commits from
+  `--from-container` never built in the same run, and the manager's `/rebuild_cli` (owner decision Q3 in
+  [host-manager.md](host-manager.md#owner-decisions)) dev-only and asking twice.
 
 ### origin/<base> as the single source of truth
 

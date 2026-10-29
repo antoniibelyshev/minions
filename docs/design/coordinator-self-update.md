@@ -1,7 +1,7 @@
 # Coordinator self-update from main (dev installs): design
 
 Status: **approved (owner, 2026-10-29, TG 465)** (task-99 design against main @ c64b721, 2026-10-29). Phases 1 to 3
-are built (`scripts/dev/self-update.mjs`; phase 3 in task-99.3); the live check of phase 3 and phase 4 are open. The
+are built (`scripts/dev/self-update.mjs`; phase 3 in task-99.3), and phase 4 is the coordinator instruction in the repo's `CLAUDE.md` (task-99.4); the live check of phase 3 is open. The
 build phases are in [Phases](#phases), and the former open questions are now [Decisions](#decisions).
 
 Owner decisions so far:
@@ -234,5 +234,5 @@ Answered by the owner in TG 465 (2026-10-29):
 4. **Wire the trigger.** Add the coordinator instruction for the minions repo: request an update proactively after a
    merge to main with meaningful changes (runtime, CLI or plugin behaviour; not docs-only or tests-only), without
    waiting to be asked (Decision 2) (it touches `CLAUDE.md` or
-   `.minions/**`, which are sensitive paths and need owner approval). Add a short note in host-manager.md and
+   `.minions/**`, which are sensitive paths and need owner approval; built in task-99.4 as a section of the root `CLAUDE.md`). Add a short note in host-manager.md and
    bootstrap.md that says the Q3 and no-self-continuation rules for installed minions are unchanged.

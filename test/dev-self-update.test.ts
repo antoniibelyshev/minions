@@ -878,6 +878,29 @@ describe('self-update packaging', () => {
     const files = (JSON.parse(r.stdout) as { files: { path: string }[] }[])[0]!.files.map((f) => f.path);
     expect(files.length).toBeGreaterThan(0);
     expect(files.filter((f) => f.startsWith('scripts/dev/'))).toEqual([]);
+    expect(files).not.toContain('CLAUDE.md'); // the proactive trigger (phase 4) is the minions repo's own instruction
     expect(existsSync(SCRIPT)).toBe(true);
+  });
+});
+
+describe('self-update trigger (phase 4)', () => {
+  // The trigger is an instruction for this repository's coordinator, not shipped behaviour: CLAUDE.md asks for the
+  // same request the script takes (upgrade --from-container on the base branch), and the shipped templates do not.
+  const claudeMd = readFileSync(join(root, 'CLAUDE.md'), 'utf8');
+
+  it('CLAUDE.md asks the coordinator for an upgrade --from-container request after meaningful merges only', () => {
+    expect(claudeMd).toMatch(/minions upgrade --from-container --reason "[^"]+" --json/);
+    expect(claudeMd).toMatch(/without waiting to be asked/);
+    for (const p of ['src/**', 'templates/**', 'docker/**', 'package.json']) expect(claudeMd).toContain(`\`${p}\``);
+    expect(claudeMd).toMatch(/Not meaningful on its own: `docs\/\*\*`, `test\/\*\*`/);
+    expect(claudeMd).toMatch(/`proposed` `upgrade` already\s+covers these commits/);
+    expect(claudeMd).toMatch(/draining/);
+  });
+
+  it('no shipped template carries the self-update trigger', () => {
+    const walk = (d: string): string[] => readdirSync(d, { withFileTypes: true })
+      .flatMap((e) => e.isDirectory() ? walk(join(d, e.name)) : [join(d, e.name)]);
+    const hits = walk(join(root, 'templates')).filter((f) => /self-update|scripts\/dev/.test(readFileSync(f, 'utf8')));
+    expect(hits).toEqual([]);
   });
 });
