@@ -693,6 +693,34 @@ Decision record for `delivery.merge: "auto-when-eligible"` (task-1.9; `src/runti
   verified base update without re-review, and `needs-rebase` for real conflicts. A derived-approval rule covers the
   updated heads.
 
+## Automatic local integration (surface)
+
+Decision record for the user-facing part of local integration (task-82.4, phase 4 of
+[local-auto-integration.md](local-auto-integration.md); engine, queue and wiring are phases 1-3).
+
+- **Same switch as PR auto-merge.** `delivery.merge: "auto-when-eligible"` in local delivery turns on local
+  integration; `autoMergeConfigReasons`, doctor `merge.readiness` and setup's autoMerge step are mode-aware. In
+  local delivery setup asks *Integrate approved tasks automatically?* (default: the current value; not asked when
+  `base.merge` is denied, as in `supervised`). `base.merge` is optional in the JSON schema (a missing one is deny).
+- **Status and doctor read one model** (`src/runtime/integration-status.ts`): the `integration` block of
+  `minions status`; the host doctor maps its `problems` from the container's `minions status --json` to
+  `integration.lock`, `integration.queue` and `integration.checkout` checks (no new command). A crash during
+  `git merge --ff-only` (a `landing` row, no live holder, tracked changes in the base checkout) is a FAIL with the
+  fix: save own edits, then `git checkout --force <base>`; recovery itself never touches `/workspace/repo`.
+- **Flaky rule (Decision 2).** A failed verification command is rerun once in place; a pass lands (row outcome
+  `landed-flaky`, event `integration-flaky`, an owner notice asking for a follow-up), a second failure is red.
+- **Notices.** One line each in the outbox: `approval` (awaiting a merge approval), `blocker` (blocked after two
+  transient failures, a halted queue, a dirty checkout, the repair limit), `other` (red, conflict, refused, flaky).
+  Landings go to the digest's *Merged* section; failures and flaky landings to its *Integration* section; a local
+  publication awaiting approval is listed as a **merge** approval (`/approve <task> <sha> merge`).
+- **Backstops.** The coordinator wrapper runs an integration watch (now and every minute) and
+  `coordinator restart --recover` checks once: start the integrator when local integration is on, entries are
+  queued (or a dead holder left a running row), no live holder, and no halt, drain or start pause.
+- **Merge approval after a failure.** `work approve --merge` refuses a local integration that failed (conflict,
+  red, refused, policy denied); only a transient failure can be approved and retried at the same head.
+- **Workers keep running (Decision 3)** during an integration; the coordinator prompt has no manual merge steps
+  when the switch is on and says the coordinator never merges into, commits on or resets the base.
+
 ## GitHub intake sync
 
 Decision record for GitHub-filtered intake (`src/runtime/intake-sync.ts`, config `intake.github`).

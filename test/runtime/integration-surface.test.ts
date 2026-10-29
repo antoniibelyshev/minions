@@ -280,7 +280,7 @@ describe('digest and merge approval', () => {
     const { head } = await approveTask(env, 'task-1');
     await integrate(env);
     expect(env.db.publication('task-1')).toMatchObject({ state: 'failed', error_code: 'red' });
-    const sig = signApproval(env.keys.privateKeyFile, { taskId: 'task-1', head, scope: 'merge' });
+    const sig = signApproval(env.keys.privateKeyPem, { taskId: 'task-1', head, scope: 'merge' }).token;
     expect(() => env.sched.approveMerge('task-1', { head, signature: sig })).toThrow(/integration of task-1 at [0-9a-f]{40} failed \(red\): a merge approval cannot land it/);
   });
 });
