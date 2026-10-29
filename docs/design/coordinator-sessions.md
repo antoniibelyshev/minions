@@ -160,9 +160,9 @@ Re-checked for this revision. Changes against the first version (main @ a062a51)
    It does not use the worker Landlock sandbox: a session needs the coordinator's rights. This amends agent-runtimes
    D11.3 only for this launch kind. Leases and workers never start claude.
 8. **Workers stay subagents, now of their task session.** `preAgentHook`, briefs, `work submit`, record-time checks
-   and the worker guards are unchanged (they key on `agent_id`, which subagents of a headless session still carry:
-   checked in the spike). A lease's `holder` is the session key. A task never has two workers at once, so a task
-   session resets only between stages, and never waits long for it.
+   and the worker guards are unchanged (they key on `agent_id`, which subagents of a headless session still carry,
+   with `agent_type`: confirmed by the spike, U5). A lease's `holder` is the session key. A task never has two
+   workers at once, so a task session resets only between stages, and never waits long for it.
 9. **Hooks and state scoped by `MINIONS_SESSION`.** With the variable set:
    - the Stop guard looks only at the session's task (task) or is off (general);
    - `noteTranscript` uses `coordinator_transcript:<key>`;
@@ -359,7 +359,8 @@ Reading the table:
   `CLAUDE_CODE_OAUTH_TOKEN` in its env, or the key file behind `apiKeyHelper`), its workers' Bash can reach it,
   exactly as with today's coordinator credentials. Task-96's "workers cannot read it" holds for its live runs (no
   workers), not for sessions. The design does not widen today's exposure, but it does not close it either (open
-  question 3).
+  question 3). The spike (U5) found no credential or `TELEGRAM_*` var in the env of a session or its subagent with
+  the `apiKeyHelper` method; the readable key file, guarded only by the secrets patterns, is the residual.
 - **R4: Telegram takeover.** Covered by four independent layers plus a launch test and the `foreign` detection.
   Residual: a Claude Code change that loads plugins from `--plugin-dir` differently. The spike checks the poller after
   every run.
@@ -374,24 +375,45 @@ Reading the table:
 
 ## Unknowns (answered by the phase 3 spike, a coordinator-run live check; U8 stays open)
 
+Spike setup: coordinator live runs on 2026-10-29, claude 2.1.292, haiku, the `apiKeyHelper` credential, a probe
+plugin whose hooks log their input (not the real minions hooks).
+
 - U1: under `claude -p` with the fresh config, `--plugin-dir` and `--settings`, the plugin hooks (Stop, PreToolUse
-  Agent/Bash/file, drain) and the plugin agents load, also after `--resume <id>`. Caveat found: a hook command
-  exec'd from a `noexec` `/tmp` fails; run it via `sh` or from the plugin dir (phase 4).
+  Agent/Bash/file, drain) and the plugin agents load, also after `--resume <id>`. Answer: yes. With `--plugin-dir`
+  and a fresh `CLAUDE_CONFIG_DIR`, the plugin agent (`minions:probe`) and hooks (Stop, SubagentStop, PreToolUse
+  Agent and Bash) load under `-p`, and again after `-p --resume <id>` (transcript copied into the new config dir; the
+  session id is kept). Caveat: `/tmp` is mounted `noexec`, so a hook command exec'd from it fails; run it via
+  `sh <script>` or from outside `/tmp` (phase 4).
 - U2: the Stop hook input in `-p` mode carries `transcript_path` and `session_id`, and the path is under the session's
-  config dir.
+  config dir. Answer: yes. `transcript_path` is
+  `<CLAUDE_CONFIG_DIR>/projects/<cwd-slug>/<session_id>.jsonl`.
 - U3: when a `-p` turn spawns a worker, does the process wait for the asynchronous hand-back, and does the hand-back
   start a new turn? Checked for single-shot `-p` and for resident `--input-format stream-json`. Answer: a per-wake
   `-p` process cannot take inbox messages while its worker runs; the resident stream-json process takes them and
-  the hand-back as new turns. Decision 6: resident.
+  the hand-back as new turns. Detail: single-shot `-p` does wait: its first turn ends (a `result` event), the
+  process stays alive, and the hand-back starts a second turn before exit. Resident stream-json: each stdin user
+  message is a turn, hand-backs arrive as new turns, and the process exits after stdin EOF once background tasks
+  finish. It emits `system` events `task_started`, `task_notification` and `background_tasks_changed`, which the
+  supervisor can use. Decision 6: resident.
 - U4: the cache TTL seen by headless runs (5 minutes or 1 hour), and whether two sessions with an identical prefix
   share the cache (compare `cache_creation_input_tokens` on the second session's first turn). Answer: TTL
-  5 minutes.
+  5 minutes (`usage.cache_creation.ephemeral_5m_input_tokens`; the 1-hour count is 0). Sessions share the cache: a
+  brand-new session's first turn read about 21k cached tokens (the identical system and tools prefix) and created
+  about 21k. So the fixed prefix `F` is warm for a new session while any session with the same prefix ran in the
+  last 5 minutes.
 - U5: subagents of a headless session carry `agent_id` in hook input (the worker guards depend on it), and whether the
-  session's credential env reaches their Bash (R3).
-- U6: memory of a resident idle session, and the start-up time of a `--resume` wake. Answer: about 250 MB per idle
-  session.
+  session's credential env reaches their Bash (R3). Answer: yes. Subagent PreToolUse and SubagentStop inputs carry
+  `agent_id` and `agent_type`, so decision 8 holds. Neither the main session nor its subagent has
+  `ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN` or any `TELEGRAM_*` var in its env (`apiKeyHelper` method).
+  R3 residual: the helper's key file (`/opt/minions/secrets/anthropic-api-key`) is readable, guarded only by the
+  `pre-bash`/`pre-file` secrets patterns, as today.
+- U6: memory of a resident idle session, and the start-up time of a `--resume` wake. Answer: about 230 to 270 MB
+  RSS per idle session (haiku, small context). A `-p --resume` wake takes about 1.1 s from launch to its result for a
+  trivial turn (init in about 0.3 s), so crash resumes are cheap in time.
 - U7 (for task-68.8): `claude -p --agent minions:<role>` gets the role's agent definition, model and tool limits.
-  Found: its hook inputs carry no `agent_id`, so the worker guards do not fire; phase 10's guard rework is required.
+  Answer: yes. It uses the agent definition's model and tool limits (`tools: [Bash]` only, even with `Write` in
+  `--allowedTools`). Its hook inputs carry no `agent_id` or `agent_type`, so the worker guards do not fire; phase
+  10's guard rework is required.
 - U8: subscription rate limits with several sessions at once (observed over phase 9; `sessions.max` caps it).
 
 ## Phases
@@ -403,7 +425,12 @@ need an owner decision first.
 0. **child: Coordinator baseline detection fixes** | criteria: `OWNER_TAG` matches `<channel source="plugin:telegram:telegram"` (and plain `telegram` for the task-67 server), so `ownerMessages` counts and `coordinator_last_owner_message` is written; recovery and wake detection match the expanded slash-command form (`<command-name>/minions:recover</command-name>`, `/minions:orchestrate` with args `wake`) as well as the raw form; fixtures copied from real transcript shapes; the task-57.3 review items folded in; tests show that the routine owner-active window, digest holds and auto-promotion caps see a recent owner message; `npm run typecheck` and `npm test` pass | depends: none (worker; urgent, independent)
 1. **child: Reset barrier for the single coordinator** | criteria: `coordinator.contextReset.barrierTokens` (default 120k, null = off, registered with a setting class); when the context is at or above it and only leases or open runs block the reset, `work claim` and `work advance` start nothing new (decision `context-reset-pending`, with a clear hint), `work next` shows `waitingOn: context-reset`, the Stop guard allows the stop, and the reset becomes due when the last lease is recorded; `status` shows it; nothing changes below the barrier; tests | depends: none (worker; owner question 1)
 2. **child: task-96 (headless credentials and live-run entry point)** | criteria: as filed; additionally its credential and env builder is a function the supervisor can call, without the live-run lease check, and it is tested on its own | depends: none (worker, in progress; add this note to its review)
-3. **child: Spike: headless coordinator sessions** | criteria: through the task-96 entry point, with no lease active, the coordinator answers U1 to U7 with a throwaway task in a scratch repository; it checks `minions status` for the poller after each run; it records the answers and the chosen process model (resident or per-wake) in this doc; it absorbs the spike part of task-68.8 (unblock and retarget 68.8) | depends: 2 (**live run** by the coordinator)
+3. **(done, task-57.7) child: Spike: headless coordinator sessions** | criteria: through the task-96 entry point, with no lease active, the coordinator answers U1 to U7 with a throwaway task in a scratch repository; it checks `minions status` for the poller after each run; it records the answers and the chosen process model (resident or per-wake) in this doc; it absorbs the spike part of task-68.8 (unblock and retarget 68.8) | depends: 2 (**live run** by the coordinator)
+
+   Result: U1 to U7 answered in
+   [Unknowns](#unknowns-answered-by-the-phase-3-spike-a-coordinator-run-live-check-u8-stays-open); process model
+   resident (decision 6). `minions status` showed the Telegram poller `ok` after each run. Task-68.8's
+   spike part is answered here; its build part is retargeted to phase 10 (task-57.14).
 4. **child: Session schema, settings and launch builder** | criteria: `sessions` (key, kind, claude session id, status, model, config dir, opened, last wake, closed, resumes, failure) and `session_inbox` tables (inline migration, schema 10); `coordinator.sessions.enabled` (default off), `coordinator.sessions.max`, `models.router` registered with setting classes; `buildSessionCommand` on the task-96 builder: persistent fresh config dir 0700, flags per decision 5, env allowlist with `MINIONS_SESSION`; hook commands in the session settings are never exec'd from a `noexec` `/tmp` (run via `sh` or from the plugin dir, U1), with a test; a test asserts that the argv, env and settings carry no Telegram token, plugin, channel or tools and no secret in argv; no process is started yet | depends: 3 (worker)
 5. **child: Supervisor** | criteria: hidden `minions coordinator supervise` with a reuse-safe lock; run record per session (O_EXCL); spawn and stop through `supervise.ts` (process group, timeout, drain); the process model from phase 3; orphans adopted or reaped at start from identities in the records; inbox delivery; 2 resumes, then `failed` and an outbox `blocker`; the wrapper starts it detached when sessions are on and restarts it when its lock is stale; tests with a fake `claude` binary (spawn, crash, resume, drain, orphan) | depends: 4 (worker)
 6. **child: Session-scoped hooks and state** | criteria: with `MINIONS_SESSION` set, the Stop guard is scoped to the session's task (task) or off (general and router); `noteTranscript` uses `coordinator_transcript:<key>`; usage states carry the role and only complete sessions of the same key; the baseline shows tokens per role; `contextResetCheck` and handoffs are per session; lease `holder` = session key; `work advance --task <id>`; tests with two sessions' hook inputs on one DB; with the variable unset nothing changes | depends: 4 (worker; can run in parallel with 5)
