@@ -624,7 +624,7 @@ describe('owner behaviour defaults (task-34)', () => {
     const coord = await (await gen()).read('coordinator.md');
     expect(coord.indexOf('## Owner defaults')).toBeGreaterThan(coord.indexOf('## Project policy'));
     const owner = ownerSection(coord);
-    for (const heading of ['Intake', 'Big features', 'Worker briefs', 'Staffing', 'Spend', 'Quota mode', 'Graceful operations', 'Small user-facing surface', 'Permission mode']) {
+    for (const heading of ['Intake', 'Big features', 'Worker briefs', 'Staffing', 'Small tasks', 'Spend', 'Quota mode', 'Graceful operations', 'Small user-facing surface', 'Permission mode']) {
       expect(owner, heading).toContain(`**${heading}.**`);
     }
     expect(owner).toMatch(/Turn owner requests into backlog tasks yourself .* without asking first/);
@@ -638,6 +638,8 @@ describe('owner behaviour defaults (task-34)', () => {
     expect(owner).toMatch(/plan usage or rate limit, pause starts \(`minions pause --starts --json`\)/);
     expect(owner).toContain('"major things only, then stop"');
     expect(owner).toMatch(/pause or drain before restarts and upgrades .* keep uncommitted work/);
+    expect(owner).toMatch(/Label small, low-risk tasks .* `small` and dispatch them readily instead of deferring them/);
+    expect(owner).toContain('keeps one for a ready `small` task (`waitingOn: "small-task-slot"`)');
     expect(owner).toMatch(/Fold new features into existing commands \(for minions itself: setup, upgrade, status\)/);
     // Kept short: the prompt is read every session.
     expect(owner.length).toBeLessThan(4000);

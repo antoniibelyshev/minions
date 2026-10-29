@@ -233,6 +233,7 @@ Every project's coordinator follows these defaults unless you tell it otherwise.
 - **Design first** for big features, shown to you before the build.
 - **Graceful operations:** pauses or drains before restarts and upgrades, and keeps uncommitted work.
 - **Channel:** answers on the channel you used. After an outage, it says so and asks you to resend anything important.
+- **Small tasks:** labels small, low-risk tasks `small` and dispatches them readily. With 2 or more engineer slots, `minions work next` keeps the last engineer slot for a ready `small` task while bigger tasks hold the others (`waitingOn: "small-task-slot"`); with no small task ready, nothing changes.
 - **Small CLI surface:** folds new features into existing commands rather than adding new ones.
 - **Permission mode:** `auto` by default in the container; the host runtime uses `default` (see [Coordinator permission mode](#coordinator-permission-mode)).
 
