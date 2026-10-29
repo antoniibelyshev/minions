@@ -356,7 +356,8 @@ export async function runRoutinePass(deps: RoutinePassDeps, opts: { trigger: Rou
     }
     const reasons = settings.enabled && c.running && !sessionsOn ? collectWakeReasons(deps.db, next, since) : [];
     const digest = settings.enabled ? deps.digestDue?.(deps.now()) ?? null : null;
-    if (digest) reasons.push({ kind: 'digest', detail: digest });
+    // Sessions on and the router running: its background `coordinator wait` returns for the digest, so no restart.
+    if (digest && !(sessionsOn && c.running)) reasons.push({ kind: 'digest', detail: digest });
     const day = localDayStart(deps.now(), settings.timezone);
     const wakes = deps.db.eventsOfKindSince(WAKE_EVENT, day);
     const lastWake = deps.db.lastEventOfKind(WAKE_EVENT);

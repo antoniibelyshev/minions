@@ -1,7 +1,8 @@
 # Coordinator self-update from main (dev installs): design
 
-Status: **approved (owner, 2026-10-29, TG 465)** (task-99 design against main @ c64b721, 2026-10-29). Nothing is
-built. The build phases are in [Phases](#phases), and the former open questions are now [Decisions](#decisions).
+Status: **approved (owner, 2026-10-29, TG 465)** (task-99 design against main @ c64b721, 2026-10-29). Phases 1 to 3
+are built (`scripts/dev/self-update.mjs`; phase 3 in task-99.3); the live check of phase 3 and phase 4 are open. The
+build phases are in [Phases](#phases), and the former open questions are now [Decisions](#decisions).
 
 Owner decisions so far:
 
@@ -111,37 +112,77 @@ instructions (see phase 4), not in the shipped coordinator template.
 3. **Gate on the host, for this exact SHA.** Create a throwaway `git worktree add --detach` under the script's
    scratch dir, outside the checkout. Run `npm ci`, `npm run typecheck` and `npm test` there
    (`MINIONS_TEST_MAX_WORKERS=2`), then remove the worktree. Container evidence is not trusted for this. If the gate
-   fails, the request is marked `failed` and nothing is built. Only a typecheck or test failure records the SHA as bad; a failed `git worktree add` or `npm ci`, or a timeout, can be transient, so a new request tries that SHA again. Host main stays advanced to that SHA (the sync already moved it, and host branches only
+   fails, the request is marked `failed` and nothing is built. Only a typecheck or test failure (the step's own exit code) records the SHA as bad; a failed `git worktree add` or `npm ci`, a timeout, or a step that ends without an exit code of its own (a SIGKILL from outside, output over the script's 64 MB buffer, a spawn error) can be transient, so a new request tries that SHA again. Host main stays advanced to that SHA (the sync already moved it, and host branches only
    move forward), so the next request syncs and gates from that HEAD. A fix on main is therefore picked up normally.
 4. **Keep the previous build.** Tag the current image as `<imageTag>-prev` (`docker tag`). The CLI backup is made by
-   `applyCli` itself.
+   `applyCli` itself. A retry never replaces a known-good `-prev` with a bad image: `state.json` keeps the image the
+   last `-prev` tag protects (`prevPin`) until a health check passes. While it is set, an apply whose current image is
+   another one (a rollback that failed, a stop during the upgrade) leaves `-prev` as it is.
 5. **Upgrade:** `minions upgrade --rebuild-cli` (a second run, so building the synced commits is allowed). This step
    drains, rebuilds the image, recreates the container and restarts the coordinator with `--recover`.
-6. **Health check**, polled for up to 5 minutes. "Healthy" means all of the following:
-   - `checkCliHealth` passes (fresh processes for `--version` and `status`);
-   - the container runs the new image ID;
-   - `minions --json status` reports the coordinator running and `restartRequired.state` is `current`
-     (`src/host/restart-required.ts`: image label vs the installed build fingerprint, CLI version, coordinator launch
-     fingerprint). This replaces a separate "build stamp" check. Phase 3 confirms the exact `status` fields;
-   - when Telegram is configured, the `telegram.plugin` and `telegram.poller` checks (`src/host/doctor.ts`; phase 3
-     confirms which command surfaces them, `status --check` or `doctor`) are not `fail`;
-   - the coordinator does not restart more than once in the window.
+6. **Health check**, polled for up to 5 minutes (`--health-window`; a probe every 10 s). "Healthy" means all of the
+   following, on two probes in a row with the same coordinator lock holder:
+   - `checkCliHealth`'s checks pass, as the script's own fresh child processes: `minions --version` prints a version
+     line and `minions --json status` an ok envelope;
+   - the container (`docker compose ps -q app`, `docker inspect --format {{.Image}}`) runs the image ID that
+     `<imageTag>` names after the upgrade (the new image, or the same one when the build fingerprint did not change);
+   - in that host `status` envelope (verified in phase 3: `src/runtime/commands.ts`, the host branch of `status`),
+     `data.restartRequired.state` is `current` (`src/host/restart-required.ts`: image label vs the installed build
+     fingerprint, CLI version, credential mounts, coordinator launch fingerprint) and `data.coordinatorLaunch.state` is
+     `current` (the tmux session runs, with the current launch fingerprint). `restartRequired` alone is not enough: a
+     stopped coordinator gives no reason. This replaces a separate "build stamp" check;
+   - when the coordinator has Telegram (`data.channel.effective` is `telegram`): `data.telegramPoller.state` is not
+     `missing`, `dead` or `foreign`, and `minions --json doctor` has no `fail` for `telegram.plugin` or
+     `telegram.poller`. Verified in phase 3: `status --check` and `doctor` are the same report (`runDoctor`); doctor
+     only ever reports `telegram.poller` as `ok` or `warn`, so "not `fail`" alone would never catch a dead poller,
+     which is why the script reads the poller state from `status` directly. Doctor runs only once the rest passes;
+   - the coordinator does not restart more than once in the window: a third holder of the coordinator lock
+     (`data.coordinatorLock`, pid and `acquiredAt`) is unhealthy at once, and a restart resets the two-probe count.
 7. **Outcome.**
    - Healthy: mark the request `applied` with detail `self-update <old>..<new>`, and enqueue the owner notice
-     (`minions notify enqueue --key self-update:<requestId> --kind status`; the new coordinator sends it). Both verbs run by the script's own docker exec. The kind is `status` because the outbox accepts only its fixed kinds and `status` is not held for the digest. The key is per request because a refused sync has no SHA and one SHA can get several requests. The text stays under the outbox limit (4000 characters): a long commit list is cut with "N more, see the log". If the runtime refuses the mark (an error other than "not running"), the outcome stays pending and later polls retry it, three times in all; after that it is logged as not marked.
-   - Not healthy: **roll back**. Reinstall the newest CLI backup with `installCliBackup`, re-tag `<imageTag>-prev`
-     as `<imageTag>`, then run `minions down && minions start --no-attach` on the old CLI. The image's `minions.build` label
-     is the fingerprint of the files the old CLI built it from (`buildFingerprint`, `src/host/docker.ts`), so
-     `ensureImage` should not rebuild once the old CLI is back. This is an assumption that phase 3 verifies. Then mark the request `failed`, record the SHA as bad, and send the notice
-     through the restored coordinator. Host main is not moved back, because host branches only move forward, so a failed gate or rollback leaves host
-     main on the new HEAD, and the next request builds from it.
+     (`minions notify enqueue --key self-update:<requestId> --kind status`; the new coordinator sends it). Both verbs run by the script's own docker exec. The kind is `status` because the outbox accepts only its fixed kinds and `status` is not held for the digest. The key is per request because a refused sync has no SHA and one SHA can get several requests. The text stays under the outbox limit (4000 characters): a long commit list is cut with "N more, see the log". If the runtime refuses the mark (an error other than "not running"), the outcome stays pending and later polls retry it, three times in all; after that it is logged as not marked (the request stays `confirmed`; mark it by hand), and the owner notice still goes out.
+   - Not healthy, or `upgrade --rebuild-cli` failed: **roll back**. Reinstall the newest CLI backup the upgrade made
+     (one that was not in `<MINIONS_HOME>/manager/cli-backup/` before it), as `installCliBackup` does
+     (`npm install -g --no-audit --no-fund <backup>` from the backup directory, a regular file only, its sha256
+     logged). No new backup means the upgrade did not replace the CLI, so there is nothing to reinstall. If the
+     reinstall fails, the rollback stops there: a `start` on the new CLI would rebuild the image from the new code.
+     The health check after such a stopped rollback runs only its two probes, not the whole window (nothing was
+     restarted, so waiting cannot help), and the owner hears it sooner. A failed upgrade that made no new backup and
+     left `<imageTag>` on the image it had replaced nothing: when two probes find the coordinator healthy on that
+     image, nothing is rolled back or restarted (no `down` and `start`); otherwise the rollback runs as below.
+     Then re-tag `<imageTag>-prev` as `<imageTag>` (after checking it still holds the kept image ID), run
+     `minions down` and `minions start --no-attach` on the old CLI, and restart the coordinator with
+     `coordinator restart --recover` through the script's own docker exec, as the upgrade itself ends:
+     `start --no-attach` starts the coordinator only when it has Telegram. Then the health check runs again, on the
+     kept image ID. Mark the request `failed` and send the notice through the restored coordinator. Only "not
+     healthy" after a complete upgrade records the SHA as bad; a failed upgrade step (docker build, registry, drain)
+     can be transient, so a new request tries that SHA again. Host main is not moved back, because host branches only
+     move forward, so a failed gate or rollback leaves host main on the new HEAD, and the next request builds from it.
+   - **No coordinator even after the rollback** (the second health check fails, Decision 3): the request is marked
+     `failed` as above, and the owner is also told through the host manager bot: the script runs
+     `minions --json manager notify` (hidden, host only) with the notice text on stdin, and the CLI reads the manager
+     token itself (the script never sees it). An unpaired manager bot, or an old CLI without the verb, is logged
+     (`manager-notice` in the log) and printed; nothing else happens.
+   - **Verified in phase 3: the old image needs no rebuild.** `minions start` runs `ensureImage`, which rebuilds only
+     when the image's `minions.build` label differs from `buildFingerprint(packageRoot())` of the running CLI: the
+     sha256 of `dist/cli.js`, `docker/Dockerfile`, `docker/gh-wrapper.sh`,
+     `docker/minions-sandbox/minions-sandbox.c` and `package.json` (`src/host/docker.ts`). The backup is a
+     gzipped tar of the old install directory as it is (every entry under `package/`; `backupInstalledCli`), so it
+     holds those five files byte for byte, and `npm install -g <backup>` writes them back unchanged (npm 10.9.9,
+     tested in `test/host/cli-backup.test.ts`), so the reinstalled CLI has the fingerprint the old image was
+     labelled with. If a future npm changed one of them, `start` would rebuild the image from the old CLI: slower,
+     but still the old code. **Corrected in phase 3:** the backup was first `npm pack <install dir> --ignore-scripts`,
+     which never worked on npm 10.9: npm runs the `prepare` script of a directory it packs even with
+     `--ignore-scripts` (pacote's directory fetcher), and the installed package does not ship
+     `scripts/prepare.mjs`, so every backup, and with it every reinstall, failed. `start` also regenerates the
+     derived files (`compose.yaml`) on the old CLI (`refreshDerived` in `openProject`).
    - A bad SHA is not tried again. A later request whose `HEAD` is a different, newer commit is tried normally (a
      fix on main).
 
 **Log and state.** `<MINIONS_HOME>/dev-self-update/log.jsonl` (mode 0600) gets one line per apply: request, from and
 to SHAs, the `git log --oneline` range, the **sensitive paths touched** (`git diff --name-only` matched against the
 project's `sensitivePaths`), each step with its duration, the health result and any rollback. `state.json` holds the
-last applied SHA and the bad SHAs. The owner notice gives the range, the sensitive paths, the outcome and the log
+last applied SHA, the bad SHAs and the pinned `-prev` image. The owner notice gives the range, the sensitive paths, the outcome and the log
 path. Sensitive paths are reported, not gated (TG 461).
 
 **Stopping.** Stopping between applies is clean. When stopped during an apply, the script forwards SIGINT/SIGTERM to
@@ -188,7 +229,8 @@ Answered by the owner in TG 465 (2026-10-29):
 3. **Health check and rollback.** Add the health definition above, the CLI backup reinstall, the image re-tag, and
    `down && start` on the old CLI. When no coordinator comes up even after the rollback, notify the owner through the
    manager bot too (Decision 3). Test it with fakes, then do one live check by the coordinator, with an
-   intentionally broken commit on a scratch branch.
+   intentionally broken commit on a scratch branch. Built in task-99.3 (all but the live check), with the hidden
+   `minions manager notify` as the hook into the manager transport.
 4. **Wire the trigger.** Add the coordinator instruction for the minions repo: request an update proactively after a
    merge to main with meaningful changes (runtime, CLI or plugin behaviour; not docs-only or tests-only), without
    waiting to be asked (Decision 2) (it touches `CLAUDE.md` or

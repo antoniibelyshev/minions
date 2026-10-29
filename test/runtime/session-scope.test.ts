@@ -152,6 +152,19 @@ describe('two sessions on one DB', () => {
   });
 });
 
+describe('the router (phase 8)', () => {
+  it('resets at 25k, below contextTokens, and a task session\'s active lease does not block it', async () => {
+    const env = scopeEnv();
+    await inSession('task:task-1', () => claimWithBrief(env.sched, paths(env), 'task-1', 'engineer'));
+    const r1 = transcript('router-a', 30_000);
+    await stopHook(stopInput('claude-r1', r1), loader(env), sessionEnv('router'));
+    expect(contextResetCheck({ db: env.db, config: env.config, session: parseScope('router') })).toMatchObject({ due: true, triggers: ['context'], blockers: [] });
+    // The general session at the same context is below its threshold (contextTokens, default 60k).
+    await stopHook(stopInput('claude-g1', transcript('general-a', 30_000)), loader(env), sessionEnv('general'));
+    expect(contextResetCheck({ db: env.db, config: env.config, session: parseScope('general') })).toMatchObject({ due: false, triggers: [] });
+  });
+});
+
 describe('MINIONS_SESSION unset: nothing changes', () => {
   it('the Stop hook, usage states, reset check, handoff path, holder and baseline are the single coordinator\'s', async () => {
     const env = scopeEnv();

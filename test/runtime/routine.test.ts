@@ -207,6 +207,21 @@ describe('runRoutinePass', () => {
     expect(opened).toEqual([]);
   });
 
+  it('sessions on and the router running: a due digest does not restart it (its coordinator wait sends it); sessions off: it wakes', async () => {
+    const digestDue = () => 'digest 08:00 due';
+    const on = passEnv({ digestDue });
+    on.env.config.coordinator = { ...on.env.config.coordinator, sessions: { enabled: true } };
+    const r = await runRoutinePass(on.deps, { trigger: 'clock' });
+    expect(r.reasons).toEqual([]);
+    expect(r.decision!.action).toBe('none');
+    expect(on.calls.wake).toBe(0);
+
+    const off = passEnv({ digestDue });
+    const r2 = await runRoutinePass(off.deps, { trigger: 'clock' });
+    expect(r2).toMatchObject({ decision: { action: 'wake', digest: true }, reasons: [{ kind: 'digest' }] });
+    expect(off.calls.wake).toBe(1);
+  });
+
   it('wakes through the fake restart, records routine-wake, then the gap and the daily cap hold', async () => {
     const t = passEnv({ next: runnableNext });
     const r = await runRoutinePass(t.deps, { trigger: 'clock' });

@@ -262,10 +262,11 @@ type EntryMatch = (words: readonly string[], entry: number) => string | null;
 /**
  * `coordinator` subcommands a Claude subagent must never run, whatever state dir it names (task-96): `live-run` starts
  * a headless claude with the runtime's Claude credential, which only the coordinator may do, at a controlled moment.
+ * `route`, `send` and `wait` (phase 8) are the router's: a worker never hands messages to sessions.
  * `supervise` (task-57 phase 5) is the session supervisor, which starts headless coordinator sessions: only the
  * wrapper starts it.
  */
-export const COORDINATOR_ONLY_COORDINATOR_VERBS = ['live-run', 'supervise'] as const;
+export const COORDINATOR_ONLY_COORDINATOR_VERBS = ['live-run', 'supervise', 'route', 'send', 'wait'] as const;
 
 /** `group` after the entry word, then one of `verbs` as the next non-option word. */
 function groupVerb(words: readonly string[], entry: number, group: string, verbs: readonly string[]): string | null {

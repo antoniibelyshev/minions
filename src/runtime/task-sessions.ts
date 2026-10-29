@@ -26,7 +26,7 @@ import type { MinionsConfig } from '../config/schema.js';
 import { SESSION_HANDOFF_EVENT } from './context-reset.js';
 import type { Lease, RuntimeDb } from './db.js';
 import { routineSettings, WAKE_EVENT } from './routine.js';
-import { enqueueInbox, getSession, openSession, sessionsByStatus, updateSession } from './session-store.js';
+import { enqueueInbox, getSession, openSession, OWNER_INBOX_SOURCE, pendingInbox, sessionsByStatus, updateSession } from './session-store.js';
 import { parseSessionKey, sessionConfigDir, sessionsSettings } from './sessions.js';
 import { localDayStart } from './zoned-time.js';
 
@@ -126,6 +126,8 @@ export async function taskSessionPass(d: TaskSessionDeps): Promise<TaskSessionPa
         const taskId = parseSessionKey(s.key).taskId!;
         // A worker of the task still runs: the session records it first.
         if (db.activeLeases().some((l) => l.task_id === taskId)) continue;
+        // An owner message waits for this session (send reopened it): it closes on a later pass, after that turn.
+        if (pendingInbox(db, s.key, { sources: [OWNER_INBOX_SOURCE] }).length) continue;
         const why = closeReason(db, s.key, byId.get(taskId));
         if (why && closeSession(db, s.key, why, now)) out.closed.push({ key: s.key, taskId, reason: why });
       }

@@ -237,3 +237,53 @@ describe('Telegram poller detection', () => {
     expect(telegramPollerCheck({ code: 1, stdout: '' })).toBeNull();
   });
 });
+
+// Task-57 phase 8: with coordinator sessions on, the coordinator launch is the router. It stays the single bot holder
+// (same wrapper, --channels, plugin on through its flag settings, token only in its env); only its prompt, model and
+// tools change, and it carries MINIONS_SESSION=router. Headless sessions never get any of it (sessions.test.ts).
+describe('router launch (coordinator.sessions.enabled)', () => {
+  const routerCfg = (): MinionsConfig => { const c = telegramCfg(); c.coordinator = { ...c.coordinator, sessions: { enabled: true } }; return c; };
+
+  it('keeps the one bot holder: channel, plugin and token as today, plus the router prompt, haiku, no Agent tool and MINIONS_SESSION=router', async () => {
+    const { paths } = layout();
+    const off = fakeSpawn();
+    await runCoordinator(telegramCfg(), { paths, spawn: off.spawn, env: {}, permissionModes: autoModes, probe: async () => available(), log: () => {} });
+    const on = fakeSpawn();
+    await runCoordinator(routerCfg(), { paths, spawn: on.spawn, env: { MINIONS_SESSION: 'general' }, permissionModes: autoModes, probe: async () => available(), log: () => {} });
+    const r = on.calls[0]!;
+    const arg = (a: string[], f: string) => a[a.indexOf(f) + 1];
+    // Telegram ownership unchanged.
+    expect(r.args).toContain('--channels');
+    expect(arg(r.args, '--channels')).toBe(arg(off.calls[0]!.args, '--channels'));
+    expect(flagSettings(r.args)?.enabledPlugins).toEqual({ [TELEGRAM_PLUGIN_ID]: true });
+    expect(flagSettings(r.args)).toEqual(flagSettings(off.calls[0]!.args));
+    expect(r.env.TELEGRAM_BOT_TOKEN).toBe(TOKEN);
+    // The router's own launch.
+    expect(r.env.MINIONS_SESSION).toBe('router');
+    expect(off.calls[0]!.env.MINIONS_SESSION).toBeUndefined();
+    expect(arg(r.args, '--model')).toBe('haiku');
+    expect(arg(r.args, '--disallowedTools')!.split(',')).toEqual(expect.arrayContaining(['Agent', 'Task']));
+    expect(arg(off.calls[0]!.args, '--disallowedTools')?.split(',') ?? []).not.toContain('Agent');
+    const prompt = arg(r.args, '--append-system-prompt')!;
+    expect(prompt).toContain('# minions router');
+    expect(prompt).not.toContain('You are the coordinator.');
+    expect(r.args.slice(-2)).toEqual(['--', '/minions:route start']);
+    expect(arg(off.calls[0]!.args, '--append-system-prompt')).toContain('You are the coordinator.');
+
+    // models.router overrides haiku.
+    const cfg = routerCfg();
+    cfg.models.router = 'sonnet';
+    const s = fakeSpawn();
+    await runCoordinator(cfg, { paths, spawn: s.spawn, env: {}, permissionModes: autoModes, probe: async () => available(), log: () => {} });
+    expect(arg(s.calls[0]!.args, '--model')).toBe('sonnet');
+  });
+
+  it('the poller check is unchanged: the router is the coordinator claude, so its bot.pid is ok', async () => {
+    const { paths } = layout();
+    const { spawn } = fakeSpawn();
+    await runCoordinator(routerCfg(), { paths, spawn, env: {}, permissionModes: autoModes, probe: async () => available(), log: () => {} });
+    const launch = JSON.parse(readFileSync(paths.coordinatorLaunch, 'utf8')) as { pid: number; telegram: { enabled: boolean } };
+    expect(launch.telegram.enabled).toBe(true);
+    expect(launch.pid).toBe(process.pid);
+  });
+});

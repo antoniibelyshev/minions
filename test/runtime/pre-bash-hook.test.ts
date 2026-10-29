@@ -401,6 +401,19 @@ describe('coordinator live-run and the secrets dir (task-96)', () => {
     expect(decision(preBashHook(bash(cmd, sub), guard))?.permissionDecision).toBe('deny');
   });
 
+  // Task-57.12: the router's verbs (route, send, wait) are coordinator-only too.
+  it.each([
+    ['minions coordinator route --json', 'route'],
+    ['minions --json coordinator route', 'route'],
+    ['minions coordinator send general --json', 'send'],
+    ["cd /x && minions coordinator send task:task-1 <<'MSG'\nhi\nMSG", 'send'],
+    ['minions coordinator wait --json', 'wait'],
+  ])('denies %j to a worker', (cmd, verb) => {
+    expect(coordinatorOnlyWorkCommand(cmd)).toBe(`minions coordinator ${verb}`);
+    expect(decision(preBashHook(bash(cmd, sub), guard))?.permissionDecision).toBe('deny');
+    expect(preBashHook(bash(cmd, {}), guard)).toEqual({ reason: 'allow: Bash from the coordinator' });
+  });
+
   it('allows the coordinator and other coordinator subcommands', () => {
     expect(preBashHook(bash('minions coordinator live-run -- -p', {}), guard)).toEqual({ reason: 'allow: Bash from the coordinator' });
     expect(coordinatorOnlyWorkCommand('minions coordinator status')).toBeNull();

@@ -398,6 +398,9 @@ export function digestInput(db: RuntimeDb, cfg: DigestConfig, src: DigestSources
   return { now, timezone: s.timezone, key: currentKey(db, st, now), since, items, tasks: src.tasks, merged, approvals, autoPromoted, spend, runnable: src.runnable };
 }
 
+/** Meta prefix of a digest's question numbers (`digest_questions:<digest key>` = [{n, key}]). */
+export const DIGEST_QUESTIONS_META = 'digest_questions:';
+
 /**
  * `minions notify digest`: composes the digest and stores it under its key (an undelivered row is replaced with
  * the new text, a delivered one is never touched), so `notify ack <keys...>` marks the digest time done.
@@ -413,6 +416,8 @@ export function prepareDigest(db: RuntimeDb, cfg: DigestConfig, src: DigestSourc
     } else if (!row.delivered_at) {
       db.exec('UPDATE outbox SET text = ? WHERE dedup_key = ?', d.text, d.key);
     }
+    // Which question key each `Q<n>` of this digest stands for: the router routes `Q1 2` back to the asking session.
+    if (!row?.delivered_at) db.setMeta(`${DIGEST_QUESTIONS_META}${d.key}`, JSON.stringify(d.questions.map((q) => ({ n: q.n, key: q.key }))));
   });
   return { ...d, status: digestStatus(db, cfg, now) };
 }

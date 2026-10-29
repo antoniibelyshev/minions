@@ -9,7 +9,8 @@ import { noteTranscript, SESSION_HANDOFF_EVENT } from '../../src/runtime/context
 import { stopHook } from '../../src/runtime/hooks.js';
 import { clearDrain, requestDrain } from '../../src/runtime/drain.js';
 import { routineLast, WAKE_EVENT } from '../../src/runtime/routine.js';
-import { enqueueInbox, getSession, pendingInbox, updateSession } from '../../src/runtime/session-store.js';
+import { ROUTER_INBOX_SOURCE, sendToSession } from '../../src/runtime/router.js';
+import { enqueueInbox, getSession, markInboxDelivered, pendingInbox, updateSession } from '../../src/runtime/session-store.js';
 import { runSupervisor, type SessionLauncher, type SupervisorTiming } from '../../src/runtime/supervisor.js';
 import {
   closeReason, openRefusal, recoverTaskSession, SESSION_CLOSE_EVENT, taskSessionPass, type RunnableStage, type TaskSessionDeps,
@@ -128,6 +129,45 @@ describe('taskSessionPass: close and reopen (decision 4)', () => {
     expect(r.opened).toEqual([{ key: 'task:task-1', taskId: 'task-1', role: 'engineer', reopened: true }]);
     expect(getSession(e.db, 'task:task-1')).toMatchObject({ status: 'open', claude_session_id: 'sess-1', closed_at: null });
     expect(pendingInbox(e.db, 'task:task-1')[0]!.text).toMatch(/^\/minions:task task-1\n.*reopened.*Read your handoff first/s);
+  });
+
+  // Review of task-57.12: `coordinator send` reopens a closed session for an owner message; the next pass must not
+  // close it again before the supervisor delivers that message (it would stay in a closed session's inbox for good).
+  const deliverAll = (e: Env, key: string) => { for (const m of pendingInbox(e.db, key)) markInboxDelivered(e.db, m.id, T0); };
+
+  it('a delivered task: a session reopened by send stays open while the owner message is pending, then closes', async () => {
+    const e = env();
+    e.backlog.add({ id: 'task-1' });
+    await taskSessionPass(deps(e));
+    deliverAll(e, 'task:task-1');
+    setStatus(e, 'task-1', 'delivered');
+    expect((await taskSessionPass(deps(e, { stages: () => [] }))).closed.map((c) => c.key)).toEqual(['task:task-1']);
+    const sent = sendToSession(e.db, e.config, { key: 'task:task-1', text: 'thanks, looks good', state: e.state, now: T0 });
+    expect(sent.reopened).toBe(true);
+    // The pass runs before the supervisor delivers: the session stays open with the owner message pending.
+    expect((await taskSessionPass(deps(e, { stages: () => [] }))).closed).toEqual([]);
+    expect(getSession(e.db, 'task:task-1')?.status).toBe('open');
+    expect(pendingInbox(e.db, 'task:task-1', { sources: [ROUTER_INBOX_SOURCE] }).map((m) => m.text)).toEqual(['thanks, looks good']);
+    // Delivered: the next pass closes it.
+    deliverAll(e, 'task:task-1');
+    expect((await taskSessionPass(deps(e, { stages: () => [] }))).closed).toEqual([{ key: 'task:task-1', taskId: 'task-1', reason: 'the task is delivered' }]);
+  });
+
+  it('awaiting-human with a handoff: a session reopened by send stays open while the owner answer is pending, then closes', async () => {
+    const e = env();
+    e.backlog.add({ id: 'task-1' });
+    await taskSessionPass(deps(e));
+    deliverAll(e, 'task:task-1');
+    setStatus(e, 'task-1', 'awaiting-human');
+    e.db.addEvent('record', 'task-1', { leaseId: 'lease-1', to: 'awaiting-human' });
+    e.db.addEvent(SESSION_HANDOFF_EVENT, 'task-1', { session: 'task:task-1' });
+    expect((await taskSessionPass(deps(e, { stages: () => [] }))).closed.map((c) => c.key)).toEqual(['task:task-1']);
+    sendToSession(e.db, e.config, { key: 'task:task-1', text: '1', state: e.state, now: T0 });
+    expect((await taskSessionPass(deps(e, { stages: () => [] }))).closed).toEqual([]);
+    expect(getSession(e.db, 'task:task-1')?.status).toBe('open');
+    expect(pendingInbox(e.db, 'task:task-1').map((m) => m.text)).toEqual(['1']);
+    deliverAll(e, 'task:task-1');
+    expect((await taskSessionPass(deps(e, { stages: () => [] }))).closed.map((c) => c.key)).toEqual(['task:task-1']);
   });
 
   it('never reopens a failed session (the owner does)', async () => {

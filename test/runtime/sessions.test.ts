@@ -16,6 +16,7 @@ import {
   buildSessionCommand, checkHookCommands, DEFAULT_ROUTER_MODEL, hookCommands, parseSessionKey, routerModel, sessionConfigDir, sessionsSettings, taskSessionPromptNote,
   type SessionCommandDeps,
 } from '../../src/runtime/sessions.js';
+import { GENERAL_SESSION_NOTE } from '../../src/runtime/router-prompt.js';
 import { defaults } from '../helpers.js';
 
 const OAUTH = `sk-ant-oat01-${'A'.repeat(80)}`;
@@ -72,7 +73,7 @@ describe('schema 10: sessions and session_inbox', () => {
     expect(SCHEMA_VERSION).toBeGreaterThanOrEqual(10);
     const file = join(root, 'v9.db');
     const v9 = new RuntimeDb(file);
-    v9.sql.exec('DROP TABLE sessions; DROP TABLE session_inbox;');
+    v9.sql.exec('DROP TABLE sessions; DROP TABLE session_inbox; DROP TABLE tg_messages; ALTER TABLE outbox DROP COLUMN session; ALTER TABLE outbox DROP COLUMN answered_at;');
     v9.setMeta('schema_version', '9');
     v9.setControl('paused_starts', '1');
     v9.addEvent('routine', null, { trigger: 'clock' });
@@ -176,7 +177,11 @@ describe('buildSessionCommand', () => {
     expect(l.flagSettings.apiKeyHelper).toContain(paths.apiKeyFile);
     expect(l.userSettings.apiKeyHelper).toContain(paths.apiKeyFile);
     expect(l.env).toMatchObject({ CLAUDE_CODE_API_KEY_HELPER_TTL_MS: '300000', MINIONS_SESSION: 'general' });
-    expect(valueOf(l.args, '--append-system-prompt')).toBe('session prompt\n'); // no task note for the general session
+    // The general session's note (phase 8), never the task note; no channel.
+    expect(valueOf(l.args, '--append-system-prompt')).toBe('session prompt\n' + GENERAL_SESSION_NOTE);
+    expect(l.args).not.toContain('--channels');
+    expect(l.flagSettings.enabledPlugins).toEqual({ [TELEGRAM_PLUGIN_ID]: false });
+    expect(Object.keys(l.env).filter((k) => k.startsWith('TELEGRAM_'))).toEqual([]);
     expect(l.env.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
     expect(JSON.stringify([l.args, l.env, l.flagSettings, l.userSettings])).not.toContain(PROVISIONED_KEY);
   });

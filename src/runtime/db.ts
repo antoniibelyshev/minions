@@ -5,7 +5,7 @@ import type { IdempotencyStore } from '../backlog/types.js';
 import { MinionsError } from '../core/errors.js';
 import { runtimePaths } from './paths.js';
 
-export const SCHEMA_VERSION = 11;
+export const SCHEMA_VERSION = 12;
 
 /** The built-in worker roles (always registered). */
 export type BuiltinLeaseRole = 'engineer' | 'tester' | 'reviewer';
@@ -96,7 +96,14 @@ export interface GuardRow { fingerprint: string | null; count: number; last_reas
 /** The last `controls` event that set one pause flag: its event id, time and the value it set. */
 export interface PauseChange { id: number; at: string; value: boolean }
 
-const MIGRATIONS: Record<number, string> = {
+/** A migration: SQL, or a step that inspects the schema first (ADD COLUMN has no IF NOT EXISTS). */
+type Migration = string | ((sql: DatabaseSync) => void);
+const addColumn = (sql: DatabaseSync, table: string, column: string, type: string) => {
+  const cols = (sql.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[]).map((c) => c.name);
+  if (!cols.includes(column)) sql.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+};
+
+const MIGRATIONS: Record<number, Migration> = {
   1: `
     CREATE TABLE IF NOT EXISTS controls (key TEXT PRIMARY KEY, value TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS leases (
@@ -187,11 +194,25 @@ const MIGRATIONS: Record<number, string> = {
       meta_json TEXT, created_at TEXT NOT NULL, delivered_at TEXT);
     CREATE INDEX IF NOT EXISTS session_inbox_pending ON session_inbox(session_key, delivered_at, id);
   `,
-  // Local integration (docs/design/local-auto-integration.md phase 2, src/runtime/integrator.ts): one row per queued
-  // integration of an approved head. phase is its state (queued, merging, verifying, landing, or a terminal one);
+  // Router and outbound (docs/design/coordinator-sessions.md phase 8, task-57.12): the session that enqueued an outbox
+  // item (an answer to its question routes back to it) and when a question was answered, plus the sent-message map
+  // with task-67.3's columns (message id, ref, outbox key, text head, sent at) and the session. Task-67.3 reuses it.
+  11: (sql) => {
+    addColumn(sql, 'outbox', 'session', 'TEXT');
+    addColumn(sql, 'outbox', 'answered_at', 'TEXT');
+    sql.exec(`
+      CREATE TABLE IF NOT EXISTS tg_messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, message_id INTEGER NOT NULL, ref TEXT, outbox_key TEXT, text_head TEXT,
+        session TEXT, sent_at TEXT NOT NULL);
+      CREATE INDEX IF NOT EXISTS tg_messages_message ON tg_messages(message_id);
+      CREATE INDEX IF NOT EXISTS tg_messages_ref ON tg_messages(ref);
+    `);
+  },
+  // Local integration (docs/design/local-auto-integration.md phase 2, task-82.2, src/runtime/integrator.ts; version 12
+  // because task-57.12 took 11): one row per queued integration of an approved head. phase is its state (queued, merging, verifying, landing, or a terminal one);
   // the verify_* columns identify the running verification process group for crash recovery. At most one open row
   // per task.
-  11: `
+  12: `
     CREATE TABLE IF NOT EXISTS integrations (
       id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, branch TEXT NOT NULL, head_sha TEXT NOT NULL,
       base_sha TEXT, candidate_sha TEXT, phase TEXT NOT NULL, attempt INTEGER NOT NULL DEFAULT 0,
@@ -353,7 +374,8 @@ export class RuntimeDb {
       const current = Number(this.getMeta('schema_version') ?? 0);
       if (current > SCHEMA_VERSION) throw tooNew(current);
       for (let v = current + 1; v <= SCHEMA_VERSION; v++) {
-        this.sql.exec(MIGRATIONS[v]!);
+        const m = MIGRATIONS[v]!;
+        if (typeof m === 'string') this.sql.exec(m); else m(this.sql);
         this.setMeta('schema_version', String(v));
       }
       this.sql.prepare('INSERT OR IGNORE INTO guard (id, count) VALUES (1, 0)').run();

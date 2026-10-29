@@ -370,19 +370,37 @@ describe('queue and helpers', () => {
   });
 });
 
-describe('schema 11: integrations', () => {
-  it('a schema-10 database gains the integrations table with one open row per task', () => {
+describe('schema 12: integrations (after 57.12 schema 11)', () => {
+  it('a schema-11 database (the 57.12 router schema) migrates to 12: integrations is added, the 11 data is kept', () => {
+    expect(SCHEMA_VERSION).toBe(12);
+    const file = join(tmp('minions-integrator-db-'), 'v11.db');
+    const v11 = new RuntimeDb(file);
+    v11.sql.exec('DROP TABLE integrations;');
+    v11.sql.exec("INSERT INTO tg_messages (message_id, ref, outbox_key, text_head, session, sent_at) VALUES (7, '#1', 'k', 'hi', 'general', 'now')");
+    v11.setMeta('schema_version', '11');
+    v11.close();
+    const up = new RuntimeDb(file);
+    try {
+      expect(up.getMeta('schema_version')).toBe('12');
+      expect(up.all('SELECT message_id, session FROM tg_messages')).toEqual([{ message_id: 7, session: 'general' }]);
+      enqueueIntegration(up, { taskId: 'task-1', branch: 'agent/task-1', head: 'a'.repeat(40) });
+      expect(() => up.exec("INSERT INTO integrations (task_id, branch, head_sha, phase, queued_at) VALUES ('task-1', 'b', 'c', 'verifying', 'now')")).toThrow(/UNIQUE/);
+      up.exec("INSERT INTO integrations (task_id, branch, head_sha, phase, queued_at) VALUES ('task-1', 'b', 'c', 'landed', 'now')");
+    } finally { up.close(); }
+  });
+
+  it('a schema-10 database applies 11 and 12 in order', () => {
     const file = join(tmp('minions-integrator-db-'), 'v10.db');
     const v10 = new RuntimeDb(file);
-    v10.sql.exec('DROP TABLE integrations;');
+    v10.sql.exec('DROP TABLE integrations; DROP TABLE tg_messages; ALTER TABLE outbox DROP COLUMN session; ALTER TABLE outbox DROP COLUMN answered_at;');
     v10.setMeta('schema_version', '10');
     v10.close();
     const up = new RuntimeDb(file);
     try {
-      expect(up.getMeta('schema_version')).toBe(String(SCHEMA_VERSION));
-      enqueueIntegration(up, { taskId: 'task-1', branch: 'agent/task-1', head: 'a'.repeat(40) });
-      expect(() => up.exec("INSERT INTO integrations (task_id, branch, head_sha, phase, queued_at) VALUES ('task-1', 'b', 'c', 'verifying', 'now')")).toThrow(/UNIQUE/);
-      up.exec("INSERT INTO integrations (task_id, branch, head_sha, phase, queued_at) VALUES ('task-1', 'b', 'c', 'landed', 'now')");
+      expect(up.getMeta('schema_version')).toBe('12');
+      const cols = up.all<{ name: string }>('PRAGMA table_info(outbox)').map((c) => c.name);
+      expect(cols).toEqual(expect.arrayContaining(['session', 'answered_at']));
+      expect(up.all("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('tg_messages', 'integrations') ORDER BY name")).toEqual([{ name: 'integrations' }, { name: 'tg_messages' }]);
     } finally { up.close(); }
   });
 });
