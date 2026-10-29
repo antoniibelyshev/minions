@@ -21,6 +21,7 @@ import { HOST_TELEGRAM_REASON, resolveChannel, type ChannelFacts } from '../tele
 import { runtimePaths, type RuntimePaths } from './paths.js';
 import { claudePermissionModes, parsePermissionModes, strictPermissionModeArg } from './permission-modes.js';
 import { openDb, pidAlive, type CoordinatorLock, type RuntimeDb } from './db.js';
+import { ROUTER_PROMPT, ROUTER_START_PROMPT } from './router-prompt.js';
 
 export const TMUX_SESSION = 'coordinator';
 /** Environment variable the official Telegram plugin reads its bot token from. */
@@ -479,20 +480,19 @@ Repository and user Claude Code settings, hooks and MCP servers are not loaded i
 `;
 
 /**
- * Appended to the interactive coordinator's prompt with coordinator.sessions.enabled (docs/design/coordinator-sessions.md,
- * phase 7): per-task headless sessions dispatch, so this session does not. It overrides the dispatch flow, the
- * orchestrate loop and the recover skill's re-dispatch. With sessions off the prompt is unchanged.
+ * With coordinator.sessions.enabled the interactive coordinator is the **router** (docs/design/coordinator-sessions.md
+ * decision 3, task-57 phase 8): the same wrapper, lock, tmux session, channel and poller check, but its own small
+ * prompt (ROUTER_PROMPT and the `/minions:route` skill, not the coordinator prompt), models.router (default haiku),
+ * no Agent tool, MINIONS_SESSION=router (Stop guard off, its own transcript, usage and reset scope) and the route skill
+ * as its first message. With sessions off nothing changes.
  */
-export const SESSIONS_COORDINATOR_NOTE = `
-
-## Coordinator sessions are on: you do not dispatch
-
-\`coordinator.sessions.enabled\` is on. Each task's stages are driven by its own headless **task session** (\`task:<id>\`), which the runtime's session supervisor opens when the task has a runnable stage and closes at delivery. This overrides the Dispatch flow above, \`/minions:orchestrate\` steps 1 to 6 and the re-dispatch in \`/minions:recover\`:
-
-- Never claim, advance, record or release task stages (\`minions work claim|advance|record|release\`), and never spawn workers. Leases whose \`holder\` is \`task:<id>\` (\`minions work list --json\`) belong to that session, also after a restart or a crash: the supervisor recovers them.
-- You still talk with the owner: answer, file and update tasks (\`minions backlog ...\`; the supervisor opens the sessions of runnable ones), send due notifications (\`minions notify pending\`, then \`notify ack\`), and relay approvals the owner must give on the host. Task sessions put their summaries and questions into the outbox; you send them.
-- \`minions status --json\` and \`minions work list --json\` show what the sessions are doing. When nothing needs you, stop.
-`;
+export const isRouterLaunch = (cfg: Pick<MinionsConfig, 'coordinator'>): boolean => cfg.coordinator?.sessions?.enabled === true;
+/** The router's model: models.router, else haiku (sessions.ts DEFAULT_ROUTER_MODEL). */
+export const routerLaunchModel = (cfg: Pick<MinionsConfig, 'models'>): string => cfg.models.router ?? 'haiku';
+/** Tools the router never has on top of the coordinator's trim: it routes, it never spawns workers. */
+export const ROUTER_DISALLOWED_TOOLS = ['Agent', 'Task'] as const;
+/** The env marker of the router launch (session-scope.ts SESSION_ENV / ROUTER_SESSION). */
+export const ROUTER_SESSION_ENV = { MINIONS_SESSION: 'router' } as const;
 
 /**
  * Host runtime claude flags. `--setting-sources=` (empty list: no user, project or local settings) is
@@ -513,8 +513,13 @@ export function coordinatorDisallowedTools(cfg: Pick<MinionsConfig, 'coordinator
 export async function buildClaudeCommand(cfg: MinionsConfig, paths: RuntimePaths = runtimePaths(), opts: { telegram?: boolean; startupPrompt?: string; permissionModes?: readonly string[] | null } = {}): Promise<CoordinatorCommand> {
   assertNoBypass(cfg);
   const onHost = runtimeMode() === 'host-runtime';
-  const prompt = await readPrompt(paths) + (onHost ? hostPromptNote(paths) : '') + (cfg.coordinator?.sessions?.enabled === true ? SESSIONS_COORDINATOR_NOTE : '');
-  const disallowed = coordinatorDisallowedTools(cfg);
+  const router = isRouterLaunch(cfg);
+  const prompt = (router ? ROUTER_PROMPT : await readPrompt(paths)) + (onHost ? hostPromptNote(paths) : '');
+  const disallowed = router ? [...new Set([...coordinatorDisallowedTools(cfg), ...ROUTER_DISALLOWED_TOOLS])] : coordinatorDisallowedTools(cfg);
+  const model = router ? routerLaunchModel(cfg) : cfg.models.coordinator;
+  const effort = router ? undefined : roleEffort(cfg, 'coordinator');
+  // The router's recover and wake both start with the route skill (flush the outbox, start the wait).
+  const startupPrompt = router ? ROUTER_START_PROMPT : opts.startupPrompt;
   return {
     cmd: 'claude',
     cwd: paths.repo,
@@ -528,14 +533,14 @@ export async function buildClaudeCommand(cfg: MinionsConfig, paths: RuntimePaths
       // state are the extra working dirs (needed with blockReadsOutsideWorkingDirectories).
       ...(onHost ? HOST_CLAUDE_FLAGS : []),
       ...(onHost ? ['--add-dir', paths.workspace, paths.state] : []),
-      ...(cfg.models.coordinator ? ['--model', cfg.models.coordinator] : []),
-      ...(roleEffort(cfg, 'coordinator') ? ['--effort', roleEffort(cfg, 'coordinator')!] : []),
+      ...(model ? ['--model', model] : []),
+      ...(effort ? ['--effort', effort] : []),
       // Startup context trim (task-48). One comma-separated value: the option is variadic.
       ...(disallowed.length ? ['--disallowedTools', disallowed.join(',')] : []),
       '--settings', JSON.stringify(coordinatorSettings(cfg, { ...opts, paths })),
       ...(opts.telegram ? ['--channels', TELEGRAM_CHANNEL_SPEC] : []),
       // After `--` so a variadic option (--channels) cannot swallow the prompt.
-      ...(opts.startupPrompt ? ['--', opts.startupPrompt] : []),
+      ...(startupPrompt ? ['--', startupPrompt] : []),
     ],
   };
 }
@@ -762,6 +767,7 @@ export async function runCoordinator(cfg: MinionsConfig, deps: RunCoordinatorDep
   const env: NodeJS.ProcessEnv = { ...(deps.env ?? process.env) };
   delete env[TELEGRAM_TOKEN_ENV];
   if (decision.enabled && token.state === 'ok') env[TELEGRAM_TOKEN_ENV] = token.token;
+  if (isRouterLaunch(cfg)) Object.assign(env, ROUTER_SESSION_ENV);
   const record: LaunchRecord = { version: 1, pid: process.pid, startedAt: new Date().toISOString(), fingerprint: launchFingerprint(cfg, token), channel: cfg.communication.channel, telegram: decision };
   await atomicWrite(paths.coordinatorLaunch, JSON.stringify(record, null, 2) + '\n').catch(() => { /* state not writable: restart detection degrades */ });
   const spawn = deps.spawn ?? (nodeSpawn as unknown as SpawnLike);
@@ -1427,7 +1433,7 @@ export async function probeRuntime(cfg?: Pick<MinionsConfig, 'models' | 'permiss
   const text = help.stdout + help.stderr;
   const flags = ['--plugin-dir', '--append-system-prompt', '--permission-mode', '--settings',
     ...(onHost ? ['--setting-sources', '--strict-mcp-config', '--add-dir'] : []),
-    ...(cfg?.models.coordinator ? ['--model'] : []), ...(cfg && roleEffort(cfg, 'coordinator') ? ['--effort'] : [])];
+    ...(cfg?.models.coordinator || (cfg && isRouterLaunch(cfg)) ? ['--model'] : []), ...(cfg && roleEffort(cfg, 'coordinator') ? ['--effort'] : [])];
   const missing = flags.filter((f) => !text.includes(f));
   if (help.code !== 0 || missing.length) {
     throw new MinionsError('INCOMPATIBLE_RUNTIME',

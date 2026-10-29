@@ -69,7 +69,8 @@ import { PROCESS_ADAPTERS } from './runner/adapters.js';
 import { reapRun, recoverRuns, runLease, type ReapDeps, type RecoverySweep, type RunOutput } from './runner/run.js';
 import { hasOpenRun, openRunsSync, withOpenRuns } from './runner/record.js';
 import { liveRun, liveRunExitCode, type LiveRunReport } from './headless.js';
-import { buildSessionCommand } from './sessions.js';
+import { buildSessionCommand, sessionsSettings } from './sessions.js';
+import { heldBySession, recordSent, resolveRoute, sendToSession, sessionKeyOf, waitForOutbound, type RouteResult, type WaitResult } from './router.js';
 import { runSupervisor, startSupervisorWatch, supervisorLockState, type SupervisorReport, type SupervisorTaskDeps } from './supervisor.js';
 import { recoverTaskSession, taskSessionPass, type TaskSessionDeps } from './task-sessions.js';
 
@@ -186,10 +187,30 @@ const scheduler = async () => new Scheduler({
  * Restarts count process runs that are not `done` as running workers (D3b). Records whose lease already ended
  * are reaped first (the result is logged to stderr); what is left counts.
  */
-async function restartWorkers(d: RuntimeDb): Promise<() => { id: string }[]> {
+async function restartWorkers(d: RuntimeDb, o: { exceptSessions?: boolean } = {}): Promise<() => { id: string }[]> {
   const r = await recoverRuns(reapDeps(), 'orphans');
   logRecovery(r, (line) => process.stderr.write(line + '\n'));
-  return withOpenRuns(() => d.activeLeases(), runtimePaths().state); // contextResetCheck counts the same way
+  const all = withOpenRuns(() => d.activeLeases(), runtimePaths().state); // contextResetCheck counts the same way
+  return o.exceptSessions ? routerBlockers(d, all) : all;
+}
+
+/** `notify enqueue --session`, else MINIONS_SESSION (a task or the general session; the router and none record null). */
+function notifySession(explicit: string | undefined): string | null {
+  if (explicit !== undefined) {
+    const k = sessionKeyOf(explicit);
+    if (!k) throw new MinionsError('PRECONDITION', `Not a session key: ${JSON.stringify(explicit.slice(0, 120))}.`, 'Use general or task:<task id>.');
+    return k;
+  }
+  const scope = sessionScope();
+  return scope && scope.kind !== 'router' ? scope.key : null;
+}
+
+/**
+ * With coordinator sessions on (task-57 phase 8) the coordinator is the router: leases held by a headless session run
+ * under the supervisor, so they never block a router restart, reset or digest wake. Live runs still count every lease.
+ */
+function routerBlockers<T extends { id: string }>(d: RuntimeDb, leases: () => T[]): () => T[] {
+  return () => leases().filter((l) => !heldBySession(d.lease(l.id.split(' ')[0]!)?.holder));
 }
 
 /** `minions sync`: intake (full sync only), then PR/CI observations with the auto-merge pass (the runtime's own gates). */
@@ -221,7 +242,8 @@ async function routineDeps(): Promise<Parameters<typeof runRoutinePass>[0]> {
   const d = getDb();
   const cfg = await getConfig();
   const paths = runtimePaths();
-  const leases = () => withOpenRuns(() => d.activeLeases(), paths.state)().map((l) => l.id);
+  const all = withOpenRuns(() => d.activeLeases(), paths.state);
+  const leases = () => (sessionsSettings(cfg).enabled ? routerBlockers(d, all) : all)().map((l) => l.id);
   const log = join(paths.logs, 'routine.log');
   return {
     db: d, config: cfg, now: () => new Date(), procStart: procStartTime,
@@ -753,12 +775,14 @@ export function register(program: Command): void {
     .option('--task <taskId>', 'related task')
     .option('--text-file <path>', 'read the text from a file ("-" = stdin, the default)')
     .addOption(new Option('--hold <hold>', 'digest: hold it for the next owner digest; none: send now; default: per kind (delivered, feature and question are held while routine.enabled and the owner is not in the chat)'))
-    .action(action(async (o: { key: string; kind: string; task?: string; textFile?: string; hold?: string }, cmd: Command) => {
+    .option('--session <key>', 'the coordinator session it comes from (general | task:<id>; default: MINIONS_SESSION): an answer to a question routes back to it')
+    .action(action(async (o: { key: string; kind: string; task?: string; textFile?: string; hold?: string; session?: string }, cmd: Command) => {
       if (runtimeMode() === 'host') return delegate(cmd);
+      const session = notifySession(o.session);
       const text = await readInput(o.textFile, 'the notification text', 'Pipe the text in (never pass it as an argument) or use --text-file <path>.');
       const d = getDb();
       const holdUntil = holdFor(d, await getConfig(), o.kind, o.hold);
-      const r = { ...enqueue(d, { key: o.key, kind: o.kind, taskId: o.task ?? null, text, holdUntil }), heldUntil: holdUntil };
+      const r = { ...enqueue(d, { key: o.key, kind: o.kind, taskId: o.task ?? null, text, holdUntil, session }), heldUntil: holdUntil };
       emit(r, { json: globalOpts(cmd).json, human: (x: typeof r) => (x.created ? `queued ${x.item.key}${x.item.nextAttemptAt && x.item.attempts === 0 ? ` (held for the digest at ${x.item.nextAttemptAt})` : ''}` : `${x.item.key} already ${x.item.deliveredAt ? 'delivered' : 'queued'} (no-op)`) });
     }));
   notify.command('pending').description('List undelivered notifications due now, oldest first (send each, then ack it)')
@@ -794,10 +818,12 @@ export function register(program: Command): void {
     }));
   notify.command('ack <keys...>').description('Mark notifications delivered (after the send succeeded); repeating it is a no-op')
     .option('--via <transport>', 'the transport that delivered it', 'telegram')
-    .action(action(async (keys: string[], o: { via: string }, cmd: Command) => {
+    .option('--message-id <id>', 'the Telegram message id the reply returned (sent (id: N)): recorded in tg_messages, so a reply or #ref to it routes back to the session', (v) => Number(v))
+    .option('--ref <ref>', 'the ref footer sent with it (default: none)')
+    .action(action(async (keys: string[], o: { via: string; messageId?: number; ref?: string }, cmd: Command) => {
       if (runtimeMode() === 'host') return delegate(cmd);
       const d = getDb();
-      const r = { acked: keys.map((k) => { const a = ack(d, k, o.via); return { key: k, alreadyDelivered: a.alreadyDelivered }; }) };
+      const r = { acked: keys.map((k) => { const a = ack(d, k, o.via); return { key: k, alreadyDelivered: a.alreadyDelivered }; }), ...(o.messageId !== undefined ? { recorded: recordSent(d, { messageId: o.messageId, keys, ref: o.ref ?? null }) } : {}) };
       emit(r, { json: globalOpts(cmd).json, human: (x: typeof r) => x.acked.map((a) => `${a.key}: ${a.alreadyDelivered ? 'already delivered' : 'delivered'}`).join('\n') });
     }));
   notify.command('fail <key>').description('Record a failed send; the notification stays pending and is retried after a backoff')
@@ -884,7 +910,7 @@ export function register(program: Command): void {
     .action(action(async (o: { force?: boolean; startDetached?: boolean }, cmd: Command) => {
       requireMode('runtime');
       const d = getDb();
-      const workers = await restartWorkers(d);
+      const workers = await restartWorkers(d, { exceptSessions: sessionsSettings(await getConfig()).enabled });
       const r = await syncCoordinator(await getConfig(), {
         activeLeases: workers,
         recordRestart: (info) => d.setMeta('coordinator_restart', JSON.stringify(info)),
@@ -900,7 +926,7 @@ export function register(program: Command): void {
     .action(action(async (o: { force?: boolean; recover?: boolean; detach?: boolean; wake?: boolean }, cmd: Command) => {
       requireMode('runtime');
       const d = getDb();
-      const workers = await restartWorkers(d);
+      const workers = await restartWorkers(d, { exceptSessions: sessionsSettings(await getConfig()).enabled });
       if (o.detach) {
         const paths = runtimePaths();
         const s = scheduleDetachedRestart({ activeLeases: workers, drain: () => d.drain(), log: join(paths.logs, 'context-reset.log'), cwd: paths.state }, o);
@@ -965,6 +991,45 @@ export function register(program: Command): void {
       emit(r, { json: globalOpts(cmd).json, human: (x: SupervisorReport) => x.exit === 'conflict'
         ? `session supervisor: already running (pid ${x.holder?.pid ?? '?'})`
         : `session supervisor: ${x.exit} (${x.starts} session start(s), ${x.opened} task session(s) opened, ${x.closed} closed, ${x.reaped.length} orphan record(s) reaped)` });
+    }));
+
+  // Task-57 phase 8: the router's deterministic helpers (src/runtime/router.ts). Coordinator-only like supervise.
+  coord.command('route').description('Router: resolve which coordinator session an owner message (stdin) goes to: a reply, /s <key>, a #ref, a task id, an open question, else general; or ambiguous with candidates (container only)')
+    .option('--reply-to <messageId>', 'the bot message it replies to (channel meta reply_to_message_id)', (v) => Number(v))
+    .action(action(async (o: { replyTo?: number }, cmd: Command) => {
+      requireMode('runtime');
+      const text = await readInput(undefined, 'the owner message', 'Pipe the message in with a quoted heredoc.');
+      let knownTasks: string[] | null = null;
+      try { knownTasks = (await (await getBacklog()).listTasks()).map((t) => t.id); } catch { knownTasks = null; }
+      const r = resolveRoute(getDb(), { text, replyToMessageId: o.replyTo ?? null }, { knownTasks });
+      emit(r, { json: globalOpts(cmd).json, human: (x: RouteResult) => x.target ? `${x.target} (${x.rule}: ${x.why})` : `ambiguous (${x.why}): ${x.candidates.map((c, i) => `${i + 1}. ${c.key}`).join(' ')}` });
+    }));
+  coord.command('send <key>').description('Router: hand an owner message (stdin) to a coordinator session (general | task:<id>); the supervisor delivers it and reopens a closed session (container only)')
+    .option('--answers <questionKey>', 'the open question it answers (from coordinator route): marked answered')
+    .option('--message-id <id>', 'the owner message id (kept with the inbox message)', (v) => Number(v))
+    .action(action(async (key: string, o: { answers?: string; messageId?: number }, cmd: Command) => {
+      requireMode('runtime');
+      const text = await readInput(undefined, 'the owner message', 'Pipe the message in with a quoted heredoc.');
+      const r = sendToSession(getDb(), await getConfig(), { key, text, state: runtimePaths().state, answers: o.answers ?? null, ...(o.messageId !== undefined ? { meta: { messageId: o.messageId } } : {}) });
+      emit(r, { json: globalOpts(cmd).json, human: (x: typeof r) => `queued for ${x.key}${x.reopened ? ' (reopened)' : ''}${x.answered ? `; ${x.answered} answered` : ''}` });
+    }));
+  coord.command('wait').description('Router: wait until an outbox item or the digest is due (or the timeout), then exit; run it in the background (container only)')
+    .option('--timeout <minutes>', 'give up after this many minutes', (v) => Number(v), 30)
+    .option('--poll <seconds>', 'check interval', (v) => Number(v), 5)
+    .action(action(async (o: { timeout: number; poll: number }, cmd: Command) => {
+      requireMode('runtime');
+      if (!(o.timeout > 0) || !(o.poll > 0)) throw new MinionsError('PRECONDITION', '--timeout and --poll must be positive numbers.');
+      const d = getDb();
+      const cfg = await getConfig();
+      const stop = new AbortController();
+      for (const sig of ['SIGTERM', 'SIGINT', 'SIGHUP'] as const) process.on(sig, () => stop.abort());
+      const r = await waitForOutbound({
+        db: d, timeoutMs: o.timeout * 60_000, pollMs: o.poll * 1000, signal: stop.signal,
+        // As the routine pass: no digest is due while the routine is off.
+        digestDue: (now) => (routineSettings(cfg).enabled ? digestStatus(d, cfg, now).due : null), holdBack: (now) => { reholdExpired(d, cfg, now); },
+        sleep: (ms) => new Promise<void>((res) => { const t = setTimeout(res, ms); stop.signal.addEventListener('abort', () => { clearTimeout(t); res(); }, { once: true }); }),
+      });
+      emit(r, { json: globalOpts(cmd).json, human: (x: WaitResult) => x.reason === 'due' ? `due: ${x.items.map((i) => i.key).join(', ')}` : x.reason === 'digest' ? `digest due: ${x.digest}` : x.reason });
     }));
 
   // Task-96: the coordinator's controlled live Claude run. Coordinator-only (the pre-bash hook refuses it to every

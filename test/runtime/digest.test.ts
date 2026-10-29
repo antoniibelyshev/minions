@@ -248,7 +248,7 @@ describe('the digest wake in the routine pass (fake clock)', () => {
 });
 
 const item = (over: Partial<OutboxItem> & { key: string; kind: OutboxItem['kind'] }): OutboxItem => ({
-  taskId: null, text: 'text', createdAt: '2026-10-26T10:00:00.000Z', attempts: 0, lastError: null, nextAttemptAt: '2026-10-27T07:00:00.000Z', deliveredAt: null, deliveredVia: null, ...over,
+  taskId: null, text: 'text', createdAt: '2026-10-26T10:00:00.000Z', attempts: 0, lastError: null, nextAttemptAt: '2026-10-27T07:00:00.000Z', deliveredAt: null, deliveredVia: null, session: null, answeredAt: null, ...over,
 });
 
 function input(over: Partial<DigestInput> = {}): DigestInput {
