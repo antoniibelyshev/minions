@@ -211,6 +211,40 @@ describe('self-update polling', () => {
     expect(dockerLog()).not.toMatch(/requests mark/);
   });
 
+  it('waits while the local integrator holds the integration lock, and proceeds on a free or stale lock (task-82.5)', () => {
+    setRequests([request('cr_aaaaaaaa')]);
+    const integration = (state: string, pid: number | null) => ({
+      enabled: true, lock: { state, pid, at: pid ? '2026-10-29T10:00:00.000Z' : null },
+      current: state === 'live' ? { taskId: 'task-7', phase: 'verifying' } : null, queue: [], problems: [],
+    });
+    setStatus({ integration: integration('live', 4242) });
+    let r = runScript('--once');
+    expect(r.code, r.err).toBe(0);
+    expect(r.out).toMatch(/waiting for idle: the integrator holds the integration lock \(pid 4242, task-7 verifying\); not taken/);
+    expect(dockerLog()).not.toMatch(/requests mark/);
+    // A present block with an unreadable lock is not idle either.
+    setStatus({ integration: { enabled: true } });
+    r = runScript('--once');
+    expect(r.out).toMatch(/cannot tell whether the runtime is idle \(the runtime status has an integration block without a readable lock state\)/);
+    expect(dockerLog()).not.toMatch(/requests mark/);
+    // A free lock proceeds and the request is taken.
+    setStatus({ integration: integration('none', null) });
+    r = runScript('--once');
+    expect(r.code, r.err).toBe(0);
+    expect(r.out).not.toMatch(/waiting for idle/);
+    expect(dockerLog()).toMatch(/requests mark cr_aaaaaaaa --status confirmed/);
+  });
+
+  it('a stale integration lock (dead holder) or a runtime without the integration block is idle (task-82.5)', () => {
+    setRequests([request('cr_aaaaaaaa')]);
+    setStatus({ integration: { enabled: true, lock: { state: 'stale', pid: 4242, at: '2026-10-29T10:00:00.000Z' }, current: null, queue: [], problems: [] } });
+    const r = runScript('--once');
+    expect(r.code, r.err).toBe(0);
+    expect(r.out).not.toMatch(/waiting for idle|cannot tell/);
+    expect(dockerLog()).toMatch(/requests mark cr_aaaaaaaa --status confirmed/);
+    // setStatus without an integration block (older runtimes, non-local delivery) is what every other test uses.
+  });
+
   it('treats a stopped runtime as retry later, not as a failure', () => {
     setRunning(false);
     json(join(fx.fake, 'requests.json'), { ok: false, error: { code: 'PRECONDITION', message: 'The runtime is not running, so change requests cannot be reached.' } });
@@ -890,10 +924,12 @@ describe('self-update trigger (phase 4)', () => {
 
   it('CLAUDE.md asks the coordinator for an upgrade --from-container request after meaningful merges only', () => {
     expect(claudeMd).toMatch(/minions upgrade --from-container --reason "[^"]+" --json/);
+    expect(claudeMd).toMatch(/After an `integrated` notice/); // task-82.5: the trigger is the local integrator's landing
+    expect(claudeMd).toMatch(/git diff --name-only <main before>\.\.main/); // task-82.5: the check for meaningful changes
     expect(claudeMd).toMatch(/without waiting to be asked/);
     for (const p of ['src/**', 'templates/**', 'docker/**', 'package.json']) expect(claudeMd).toContain(`\`${p}\``);
     expect(claudeMd).toMatch(/Not meaningful on its own: `docs\/\*\*`, `test\/\*\*`/);
-    expect(claudeMd).toMatch(/`proposed` `upgrade` already\s+covers these commits/);
+    expect(claudeMd).toMatch(/`proposed` `upgrade`\s+already\s+covers these commits/);
     expect(claudeMd).toMatch(/draining/);
   });
 

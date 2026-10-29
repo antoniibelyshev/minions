@@ -90,6 +90,8 @@ export interface IntakeSyncDeps {
    * ones start, the import stops and departures are not evaluated. What was imported so far is kept.
    */
   signal?: AbortSignal;
+  /** Page cap of the issue query (default INTAKE_MAX_PAGES); a seam so tests can truncate cheaply. */
+  maxPages?: number;
 }
 
 export const INTAKE_ABORTED = 'intake sync stopped: time budget exhausted';
@@ -149,11 +151,11 @@ export function issuesPath(repo: string, f: GithubIntakeConfig, milestone: strin
 }
 
 /** Runs the scoped, read-only issue query. */
-export async function queryIssues(api: ApiGet, repo: string, f: GithubIntakeConfig): Promise<{ issues: GhIssue[]; complete: boolean; error?: string }> {
+export async function queryIssues(api: ApiGet, repo: string, f: GithubIntakeConfig, maxPages = INTAKE_MAX_PAGES): Promise<{ issues: GhIssue[]; complete: boolean; error?: string }> {
   const ms = await resolveMilestone(api, repo, f.milestone);
   if (ms.error) return { issues: [], complete: false, error: ms.error };
   const issues: GhIssue[] = [];
-  for (let page = 1; page <= INTAKE_MAX_PAGES; page++) {
+  for (let page = 1; page <= maxPages; page++) {
     const r = await api(issuesPath(repo, f, ms.value, page));
     if (r.status !== 200 || !Array.isArray(r.body)) {
       return { issues, complete: false, error: `issues of ${repo} unreadable: ${r.error ?? `HTTP ${r.status}`}` };
@@ -270,12 +272,12 @@ export async function syncIntake(deps: IntakeSyncDeps): Promise<IntakeSyncReport
 
   const api = abortable(deps.api ?? ghApi(deps.gh), deps.signal);
   const aborted = () => deps.signal?.aborted === true;
-  const q = await queryIssues(api, repo, f);
+  const q = await queryIssues(api, repo, f, deps.maxPages);
   report.complete = q.complete;
   // A failed or aborted list read leaves `matched` null: the pages read so far say nothing about the total.
   if (q.error) { report.errors.push(redact(q.error)); return finish(); }
   report.matched = q.issues.length;
-  if (!q.complete) report.warnings.push(`more than ${INTAKE_MAX_PAGES * PER_PAGE} matching issues: imported the first ${q.issues.length}; departures were not evaluated (narrow the filter)`);
+  if (!q.complete) report.warnings.push(`more than ${(deps.maxPages ?? INTAKE_MAX_PAGES) * PER_PAGE} matching issues: imported the first ${q.issues.length}; departures were not evaluated (narrow the filter)`);
 
   const state = loadState(db);
   const intakePaused = db.paused().intake;

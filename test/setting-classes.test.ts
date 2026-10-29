@@ -161,10 +161,12 @@ describe('classes match the code that applies the key', () => {
     const prompt = SETTINGS.filter((d) => d.apply === 'prompt');
     expect(prompt.length).toBeGreaterThan(20);
     const unchanged: string[] = [];
+    // Most keys compare against the same base plugin: render it once (task-104).
+    const shared = await pluginText(validateConfig(structuredClone(base), 'test'));
     for (const d of prompt) {
       const from = structuredClone(base);
       probes[d.key]?.base(from);
-      const before = await pluginText(validateConfig(from, 'test'));
+      const before = probes[d.key] ? await pluginText(validateConfig(from, 'test')) : shared;
       const next = setPath(structuredClone(from) as unknown as Record<string, unknown>, d.key, probes[d.key] ? probes[d.key]!.to : otherValue(d, from));
       const after = await pluginText(validateConfig(next, 'test'));
       if ([...after].every(([k, v]) => before.get(k) === v)) unchanged.push(d.key);
