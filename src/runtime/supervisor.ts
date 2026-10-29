@@ -477,7 +477,7 @@ export async function runSupervisor(d: SupervisorDeps): Promise<SupervisorReport
     try { await createSessionRecord(d.state, record); } catch (e) {
       // Not ours (no live entry): left by a process whose exit was not handled. Reap it; the next tick starts.
       log(`minions supervisor: ${key}: ${(e as Error).message} Reaping it.`);
-      try { report.reaped.push(await reapSessionRecord(d.state, key, { ...d.reap, proc })); } catch (r) { report.reapErrors.push({ key, error: (r as Error).message }); }
+      try { report.reaped.push(await reapSessionRecord(d.state, key, { graceMs: t.reapGraceMs, ...d.reap, proc })); } catch (r) { report.reapErrors.push({ key, error: (r as Error).message }); }
       return;
     }
     if (row.kind === 'task' && d.tasks) {
@@ -566,7 +566,7 @@ export async function runSupervisor(d: SupervisorDeps): Promise<SupervisorReport
     // Orphans first (decision 7): nothing of a previous supervisor's sessions keeps running unobserved.
     for (const key of await listSessionRecords(d.state)) {
       try {
-        const r = await reapSessionRecord(d.state, key, { ...d.reap, proc });
+        const r = await reapSessionRecord(d.state, key, { graceMs: t.reapGraceMs, ...d.reap, proc });
         report.reaped.push(r);
         log(`minions supervisor: ${key}: orphan record ${r.action}${r.killed.length ? ` (killed ${r.killed.join(', ')})` : ''}${r.note ? ` (${r.note})` : ''}`);
         if (getSession(db, key)?.status === 'open') {

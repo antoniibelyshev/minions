@@ -48,6 +48,8 @@ const submitted = (r: Rig, b: TaskBrief) => JSON.parse(readFileSync(submissionPa
 const alive = (pid: number) => { try { process.kill(pid, 0); return !/\) Z /.test(readFileSync(`/proc/${pid}/stat`, 'utf8')); } catch { return false; } };
 /** Alive after a deadline: the processes under test never exit by themselves, so polling only removes a fixed-sleep race (task-93). */
 const aliveAfterKill = async (pid: number) => { for (const until = Date.now() + 10_000; alive(pid) && Date.now() < until;) await sleep(25); return alive(pid); };
+/** Resolves once the file exists (or after a 20 s deadline). */
+const waitForFile = async (path: string) => { for (const until = Date.now() + 20_000; !existsSync(path) && Date.now() < until;) await sleep(25); };
 
 /** Every file below `dir` (no symlink following). */
 function filesUnder(dir: string): string[] {
@@ -178,9 +180,10 @@ describe('tester: stopping leaves no process behind', { timeout: 30_000 }, () =>
     const workerPid = join(r.root, 'worker.pid');
     const gcPid = join(r.root, 'gc.pid');
     const steps = [{ op: 'ignoreTerm' }, { op: 'pidfile', path: workerPid }, { op: 'grandchild', pidFile: gcPid }, { op: 'sleep', ms: 30_000 }];
-    // The limit runs from spawn; the harness must install ignoreTerm and start the grandchild before it, so it
-    // is generous enough for a node start on a loaded machine (task-93).
-    const out = await runLease(b.leaseId, r.deps({ steps }, { timing: { timeoutMs: 2_500, pollMs: 50, killGraceMs: 300, drainGraceMs: 100 } }));
+    // The harness must install ignoreTerm and start the grandchild before the stop: from spawn, a short limit
+    // lost that race to a node start on a loaded machine (task-93), so the limit starts once the grandchild
+    // wrote its pid file (the timeoutStart seam).
+    const out = await runLease(b.leaseId, r.deps({ steps }, { timing: { timeoutMs: 300, timeoutStart: waitForFile(gcPid), pollMs: 50, killGraceMs: 300, drainGraceMs: 100 } }));
     expect(out).toMatchObject({ status: 'partial', exit: { stopped: 'timeout' } });
     expect(await aliveAfterKill(Number(readFileSync(workerPid, 'utf8')))).toBe(false);
     expect(await aliveAfterKill(Number(readFileSync(gcPid, 'utf8')))).toBe(false);

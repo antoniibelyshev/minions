@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { z } from 'zod';
 import { MinionsError } from '../src/core/errors.js';
-import { run } from '../src/core/exec.js';
+import { KILL_GRACE_MS, run } from '../src/core/exec.js';
 import { atomicWrite, readJson, sha256, sha256File } from '../src/core/fsutil.js';
 import { redact } from '../src/core/output.js';
 import { composeProjectName, projectPaths, volumeNames } from '../src/core/paths.js';
@@ -65,14 +65,16 @@ describe('exec', () => {
     const ctl = new AbortController();
     // The child marks a file once its handler is installed: a fixed wait races a slow node start on a busy host.
     const ready = join(await mkdtemp(join(tmpdir(), 'minions-exec-')), 'ready');
-    const p = run('node', ['-e', 'process.on("SIGTERM",()=>{}); require("fs").writeFileSync(process.argv[1], ""); setInterval(()=>{}, 1000)', ready], { allowFailure: true, signal: ctl.signal, timeoutMs: 60_000 });
+    const p = run('node', ['-e', 'process.on("SIGTERM",()=>{}); require("fs").writeFileSync(process.argv[1], ""); setInterval(()=>{}, 1000)', ready], { allowFailure: true, signal: ctl.signal, timeoutMs: 60_000, killGraceMs: 600 });
     for (let i = 0; i < 200 && !(await stat(ready).then(() => true, () => false)); i++) await new Promise((res) => setTimeout(res, 25));
     const t = Date.now();
     ctl.abort();
     const r = await p;
     expect(r.aborted).toBe(true);
-    expect(Date.now() - t).toBeGreaterThanOrEqual(1900);
+    // An injected 600 ms grace (production: KILL_GRACE_MS, 2 s): the SIGKILL comes after it, not at once.
+    expect(Date.now() - t).toBeGreaterThanOrEqual(550);
     expect(Date.now() - t).toBeLessThan(4000);
+    expect(KILL_GRACE_MS).toBe(2000);
   });
 
   it('an already aborted signal spawns nothing; no signal keeps the old behaviour', async () => {
@@ -87,7 +89,7 @@ describe('exec', () => {
     // The child starts a grandchild that ignores SIGTERM and keeps stdout open, prints its pid, and waits.
     const script = 'const c=require("child_process").spawn(process.execPath,["-e","process.on(\'SIGTERM\',()=>{});setInterval(()=>{},1000)"],{stdio:["ignore","inherit","inherit"]});console.log(c.pid);setInterval(()=>{},1000)';
     const t = Date.now();
-    const r = await run('node', ['-e', script], { timeoutMs: 400, allowFailure: true, killGroup: true });
+    const r = await run('node', ['-e', script], { timeoutMs: 400, allowFailure: true, killGroup: true, killGraceMs: 300 });
     expect(r.timedOut).toBe(true);
     expect(Date.now() - t).toBeLessThan(6000);
     const pid = Number.parseInt(r.stdout.trim(), 10);
