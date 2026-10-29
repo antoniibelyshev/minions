@@ -1,6 +1,6 @@
 # First-class host runtime (Telegram, auto mode, self-update): design
 
-Status: **proposed** (task-103, design only, against main @ f094ebe, 2026-10-29). Nothing here is built. The owner
+Status: **proposed** (task-103, design only, against main @ 072a1b4, 2026-10-29). Nothing here is built. The owner
 approves before any build task starts.
 
 Owner context: TG 506/508, option 3. Design a first-class host runtime first, then move the dev minions project to
@@ -10,7 +10,15 @@ and `status`. A new top-level command needs the owner's approval first.
 Related: [bootstrap.md, Host runtime](bootstrap.md#host-runtime) (today's decision record),
 [coordinator-self-update.md](coordinator-self-update.md), [telegram-channel.md](telegram-channel.md) (task-67),
 [host-manager.md](host-manager.md), [coordinator-sessions.md](coordinator-sessions.md),
-[cli-surface.md](cli-surface.md), README [Running without Docker](../../README.md#running-without-docker).
+[cli-surface.md](cli-surface.md), [local-auto-integration.md](local-auto-integration.md) (task-82),
+README [Running without Docker](../../README.md#running-without-docker).
+
+**Supersedes.** This design supersedes one sentence in
+[coordinator-self-update.md, Relation to the dropped host-runtime "dev mode"](coordinator-self-update.md#relation-to-the-dropped-host-runtime-dev-mode):
+"dev installs stay on Docker, so the dev loop tests the same path users run". The owner chose to move the dev project
+to the host runtime (TG 506/508, option 3). The rest of that section still holds: running the dev coordinator
+straight from the checkout stays rejected, and the host dev loop runs the same packed install users run on the host
+(D6, D9). Phase 7 rewords that section.
 
 ## Summary (for Telegram)
 
@@ -25,10 +33,13 @@ Related: [bootstrap.md, Host runtime](bootstrap.md#host-runtime) (today's decisi
   switches the copy and restarts only the coordinator, inside its own tmux server. Rollback switches back.
 - **Self-update** stays a dev-only script (TG 461). It gets a host mode, with the same gate, health check and
   rollback, but with no image steps.
+- **Local auto-integration** (task-82) works on the host too. The coordinator wrapper always starts the integrator,
+  and the gate's `npm test` runs under a minions-generated macOS sandbox profile. Upgrades and self-update wait
+  while an integration holds its lock.
 - **Migration** is a drain, then a state export, the switch, and a state import. The Docker volumes are kept, so
   rollback is the same steps in reverse.
 
-## Today (main @ f094ebe)
+## Today (main @ 072a1b4)
 
 What exists:
 
@@ -46,6 +57,7 @@ What exists:
 | Change requests | `src/host/settings-cli.ts` (the `SettingsRuntime` host branch) | `settings requests`/`apply` already reach the host runtime through the shim. |
 | Sync | `upgradeSyncOnly` in `src/host/commands.ts` | `upgrade --sync-only` already exports from the host workspace. |
 | State move | `src/runtime/state-backup.ts`, `export --state` / `import --state` | Copies the DB snapshot, backlog, notes, briefs and results. Works for both runtimes. |
+| Local integration | `src/runtime/integrator.ts`, `Scheduler.record` (`startIntegratorDetached`), the wrapper's `integrationWatch` backstop (`src/runtime/integration-status.ts`) | Task-82: an approved head is merged, verified (`npm test` etc.) in the persistent worktree `<workspace>/integration` and landed on `main`, under the `integration_lock` meta row. The layout derives the path from the workspace (`src/runtime/paths.ts`), so on the host it is `<project>/host/workspace/integration`. |
 
 What is missing (the gaps this design closes):
 
@@ -54,7 +66,14 @@ What is missing (the gaps this design closes):
 2. **Process checks need `/proc`.** `procCmdline`/`procStartTime` (`src/runtime/coordinator.ts`) and
    `claudeOwner` (`src/telegram/isolation.ts`) read `/proc`. On macOS they return null, so `checkTelegramPoller`
    reports `unknown`, and the task-67 server deactivates itself ("cannot tell which claude session started this
-   server", `src/telegram/channel/server.ts`).
+   server", `src/telegram/channel/server.ts`). The same holds for the lock liveness rule shared by the supervisor
+   lock and the task-82 `integration_lock` (`systemLockView` in `src/runtime/supervisor.ts`, used by
+   `integratorAlive`): start time from `/proc/<pid>/stat`, the `work integrate` command line from
+   `/proc/<pid>/cmdline`, and the boot id from `/proc/sys/kernel/random/boot_id`. On macOS all three are null, so any
+   live pid counts as the holder: after a reboot or PID reuse a stale `integration_lock` looks live, and the queue
+   stalls until someone clears it. The integrator's recovery (stop the recorded verify group only while its leader
+   matches pid, start time and boot) cannot confirm a match either. `HostIdentity` in `src/runtime/runner/record.ts`
+   also reads the boot id from `/proc`.
 3. **Mode is fixed to `default`.** There is no host-side way to choose `auto`.
 4. **No `upgrade` path.** `minions upgrade` refuses on the host runtime (`commands.ts`, "supports the Docker runtime
    only"). `restart-required.ts` returns `not-applicable`. The shim runs the global CLI in place, so `npm install -g`
@@ -65,6 +84,11 @@ What is missing (the gaps this design closes):
 7. **Unpinned tools.** Claude Code, Backlog.md and gh are the owner's global installs and may auto-update.
 8. **Never run live.** `e2e-host.sh` uses a fake `claude` and a fake `tmux`
    ([compatibility.md](../compatibility.md#host-runtime-no-docker)). Linux hosts were never reviewed.
+9. **The integration gate's sandbox depends on who starts it.** `Scheduler.record` runs inside `minions work record`,
+   which the coordinator calls from Bash, so on the host its detached `minions work integrate` (and the `npm test`
+   it runs) inherits the coordinator's Seatbelt profile. The wrapper's `integrationWatch` backstop runs outside the
+   sandbox, so an integrator it starts runs the gate unsandboxed, as the owner. The same queue gets two different
+   safety levels. In Docker both run in the container.
 
 ## Decisions
 
@@ -90,14 +114,32 @@ What is missing (the gaps this design closes):
   running coordinator. The last 2 copies are kept, for rollback.
 - **D7. The host has its own `upgrade` path:** cli → pause → drain → snapshot → files → workspace → resume →
   `coordinator restart --recover`. There is no image and no container. The tmux server stays, and only the
-  coordinator process restarts.
-- **D8. `runtime set <kind>` moves the state.** It refuses while leases are active. Otherwise it exports the state and
-  the branches from the old runtime, switches, starts the new runtime detached, and imports the state. It also copies
-  the memory and `access.json` (D3), keeps the old runtime's data, and supports `--dry-run`.
+  coordinator process restarts. Like the Docker upgrade (local-auto-integration.md, "Drain, pause and upgrade"), the
+  drain step also waits while the `integration_lock` is held: a running verification is stopped and re-queued by the
+  drain, and only the landing (two git calls) may finish first.
+- **D8. `runtime set <kind>` moves the state.** It refuses while leases are active or the `integration_lock` is held.
+  Today it refuses while the old runtime runs, but the export needs the old runtime running, so the move does the
+  steps in this order itself: (1) export the state and the branches from the **running** old runtime (plus the memory
+  and `access.json`, D3); (2) stop the old runtime (`down`); (3) switch `runtime` in `project.json`; (4) start the new
+  runtime detached; (5) import the state. Any failure before step 3 leaves the old runtime selected (restart it with
+  `start`); a failure after step 3 prints the export path and the manual steps. It keeps the old runtime's data and
+  supports `--dry-run`.
 - **D9. Self-update stays dev-only** (TG 461), with a host mode in the same script. There is no product
   auto-update.
 - **D10. macOS first.** The host runtime's sandbox profile targets Seatbelt. A Linux host runtime (bubblewrap) is a
   separate task (Q1).
+- **D11. Local integration on the host: one starter, a sandboxed gate.** The integration worktree stays where the
+  layout puts it, `<project>/host/workspace/integration` (under the space-containing macOS data root, like the
+  workspace). On the host, `Scheduler.record` does not spawn the integrator from the sandboxed `work record` call: it
+  only queues, and the coordinator wrapper (outside the sandbox) starts `minions work integrate`. The wrapper's
+  `integrationWatch` already does this every minute; on the host it also wakes on a queue-touch file, so the delay
+  stays a few seconds. The integrator then runs its own steps (git merge and landing with hardened git, DB writes)
+  as the owner, and runs each verification command (`verification.setupCommands`, `npm test`, …) under
+  `sandbox-exec` with a minions-generated Seatbelt profile: writes only to the integration worktree and
+  `<state>/run/integration` and the integration logs, the same `denyRead` list as `hostSettings`, network GitHub and
+  npm only. Running the gate inside the coordinator's inherited profile was rejected: Seatbelt cannot nest, so the
+  integrator could not tighten it, and its scope then depends on which starter won. Running the gate unsandboxed was
+  rejected: the gate executes agent-written code (tests, install scripts) as the owner.
 
 ## Docker vs host: what the host loses, and the mitigations
 
@@ -108,6 +150,7 @@ What is missing (the gaps this design closes):
 | **Credentials** | Only this project's GitHub token, the bot token (read-only mount, also in the coordinator env) and the Claude login/key. | The owner's user. The sandbox `denyRead` covers the data root and secret dirs. File store, env allowlist. | Same, and the bot token is read only by the server process, which runs outside the sandbox. It is not in the `claude` env, and `denyRead` hides the file from Bash. The channel state sits outside `allowWrite`. | The Keychain is still reachable over `mach-lookup` from sandboxed commands. `security` is denied by pattern only, so the pre-bash fence covers wrappers (`sh -c`, `env`, `xargs`). The GitHub token is readable by agents, as in Docker. |
 | **Nested claude** | It loads the container's config dir, where the plugin is off. | A worker's `claude` uses the owner's `~/.claude` (their plugins, MCP servers, login). It is held back only by the sandbox network list (no `api.anthropic.com`). | The per-project config dir (D3) has no plugin at user scope, and the channel server is never at user scope. `Bash(claude*)` is denied, and the pre-bash fence refuses `claude` in any position. | None beyond Docker's. |
 | **Worktree / state** | Volumes at `/workspace/{repo,worktrees}`, `/state`. | `<MINIONS_HOME>/projects/<id>/host/{workspace,state}`. On macOS the path contains a space (`Application Support`). | Same, plus `host/claude` and `host/cli/<fp>` (host-owned, not agent-writable, Edit-denied). The prompt note already maps `/workspace` and `/state` (`hostPromptNote`). | The dev suite must pass with a space in cwd and without loopback binding or Unix sockets (`allowLocalBinding: false`). Phase 0 checks this. |
+| **Integration gate** (task-82) | The integrator and its `npm test` run in the container, in `/workspace/integration`, with an allowlisted env and a fresh `HOME`. | Inherits Seatbelt when `work record` spawns it, unsandboxed when the wrapper backstop does (gap 9). | Always started by the wrapper; each verification command runs under a minions-generated Seatbelt profile (D11). The allowlisted env and fresh `HOME` stay. | The integrator's own git and DB steps run unsandboxed as the owner (as minions' own git calls do today, with `git-hardening.ts`). `sandbox-exec` is deprecated by Apple but is the mechanism Claude Code's sandbox itself uses. The suite must pass under that profile (phase 0). |
 | **Network** | `outbound-internet`, no filter. | Bash: GitHub and npm only. | Unchanged. Telegram traffic comes from the server, outside the sandbox. | Stricter than Docker for Bash, which is fine for this project. |
 | **Tool versions** | The image pins Claude Code, Backlog.md and the plugin. | The owner's global installs. | The shim sets `DISABLE_AUTOUPDATER=1`. `doctor` warns on untested versions (exists), and `status` shows them. | The owner updates Claude Code deliberately and reruns `doctor`. |
 
@@ -158,7 +201,8 @@ the safety must not depend on the classifier:
 **`minions upgrade` on the host (D7).** The source phase is the same (`--from-container` export, the `--rebuild-cli`
 packed reinstall with its CLI backup, `src/host/upgrade-source.ts`). Then:
 
-1. pause starts, request a drain, and wait (or `--now`), exactly as in Docker;
+1. pause starts, request a drain, and wait (or `--now`), exactly as in Docker, including the wait for a held
+   `integration_lock` (the drain stops and re-queues a running verification; a landing finishes);
 2. snapshot the newly installed CLI into `host/cli/<fp>` (D6);
 3. regenerate the derived files (plugin, runtime config, shims pointing at the new snapshot);
 4. `workspace setup` (DB migrations) through the new shim;
@@ -174,6 +218,9 @@ runtime; the root `CLAUDE.md` section needs no change). In host mode:
 - **Refusals:** it also accepts runtime `host`. It still requires a packed install, `local` delivery, a minions
   checkout and a clean base branch.
 - **Runtime verbs** (`settings requests mark`, `notify enqueue`) go through `<project>/host/bin/minions` instead of
+  `docker exec`.
+- **Idle check:** as in the container flow after task-82.5, a held `integration_lock` counts as busy, so the script
+  does not apply while an integration runs. In host mode it reads the lock through the shim (`status --json`), not
   `docker exec`.
 - **Apply:** sync → host gate (unchanged) → `upgrade --rebuild-cli` (the host path above).
 - **Health:** the same fresh-process CLI checks, `restartRequired` and `coordinatorLaunch` `current`, the shim on the
@@ -201,26 +248,40 @@ The coordinator prepares each step and the owner runs the host-side ones. The wh
 phases 0 to 6 are delivered.
 
 1. **Gate.** Phase 0 passed on the owner's Mac. `doctor` is green for `host.*`. A separate disposable host project
-   with a test bot has had one full lease cycle and one self-update round.
-2. **Quiesce.** `minions pause --starts`, wait until `status` shows no active lease and no drain, then stop the
-   self-update script.
-3. **Switch.** Run `minions runtime set host` (D8). It exports the branches and the state (`export --state`) from the
-   container and copies `~/.claude/projects/-workspace-repo/memory/` and `channels/telegram/access.json` out of the
-   claude volume. Then it switches and starts the host runtime detached. It imports the state, places the memory
-   under the host repo path's project key, and places `access.json` in `host/claude/channels/telegram/`. Docker
-   volumes are not touched.
+   with a test bot has had one full lease cycle, one local integration round (an approved head merged, verified
+   under the D11 profile and landed on its `main`), and one self-update round.
+2. **Quiesce.** `minions pause --starts`, wait until `status` shows no active lease, no drain, an empty integration
+   queue and a free `integration_lock`, then stop the self-update script. The container keeps running: the export
+   in step 3 needs it.
+3. **Switch.** Run `minions runtime set host` (D8), which does, in this order:
+   1. **export from the running container:** the branches and the state (`export --state`), plus
+      `~/.claude/projects/-workspace-repo/memory/` and `channels/telegram/access.json` out of the claude volume;
+   2. **stop** the container (`down`; the volumes stay);
+   3. **switch** `runtime` to `host` in `project.json`;
+   4. **start** the host runtime detached;
+   5. **import** the state, place the memory under the host repo path's project key, and place `access.json` in
+      `host/claude/channels/telegram/`.
+
+   Docker volumes are not touched. If phase 6 is not delivered, the same steps by hand are: `minions export
+   --state`, `minions down`, `minions runtime set host` (it now passes the "old runtime runs" check),
+   `minions start`, `minions import --state <file>`, then copy the memory and `access.json`.
 4. **Log in and check.** Attach once (`minions start`), run `/login`, then `minions status` and `doctor`. Send a
    Telegram round trip. `resume --starts`.
 5. **Self-update.** Restart `scripts/dev/self-update.mjs`, which detects host mode. Watch the first real request.
 
 **Rollback** (any time, including mid-migration):
 
-1. `minions pause --starts`, then wait for idle (or accept `wip:` re-dispatch).
-2. `minions runtime set docker`. This is the same move in reverse: branches and state from the host back into the
-   container volumes, which were kept from step 3. Host data stays in `host/` until `uninstall --delete-data`.
+1. `minions pause --starts`, then wait for idle, including a free `integration_lock` (or accept `wip:`
+   re-dispatch).
+2. `minions runtime set docker`. This is the same move in reverse and in the same order: export from the running
+   host runtime, stop it, switch, start the container, import into the container volumes, which were kept from
+   step 3. Host data stays in `host/` until `uninstall --delete-data`.
 3. `minions start`, then restart the self-update script, which detects Docker mode.
-4. If `runtime set` itself fails: `minions down`, set `"runtime": "docker"` back in `project.json` by hand, then
-   `minions start`. The container still holds the state from before the migration.
+4. If `runtime set` itself fails: first **export the host branches and state** while the host runtime is still
+   readable (`minions export --state` and `minions export` for the branches; the host workspace and state under
+   `host/` also stay on disk). Then `minions down`, set `"runtime": "docker"` back in `project.json` by hand,
+   `minions start`, and `minions import --state <file>`. Without that export the container comes back with the state
+   from before the migration, and any work done on the host since then is only in `host/`.
 
 The Docker volumes are deleted only after the owner says so (Q6).
 
@@ -231,12 +292,21 @@ The Docker volumes are deleted only after the owner says so (Q6).
    following: sandbox start (`failIfUnavailable`); the Read/Edit/Bash denies hold; `npm ci && npm run typecheck &&
    npm test` of this repo inside the sandbox (space in path, no loopback, no Unix sockets); the auto-mode questions
    in step 6 above; a `--strict-mcp-config --mcp-config` channel server receiving notifications (shared with the
-   task-67.1 spike); the per-project `CLAUDE_CONFIG_DIR` login and the auto-memory location. Go/no-go per item.
-   Depends: none.
+   task-67.1 spike). Today that server deactivates itself on macOS (gap 2: `claudeOwner` returns unknown without
+   `/proc`), so the spike runs it with a local, spike-only bypass of the ancestor check (or checks the ancestry by
+   hand with `ps -o pid=,ppid=,command=`); otherwise this item fails by default and says nothing about the channel.
+   Also: one local integration round (local delivery, `delivery.merge: auto-when-eligible`, one approved head merged,
+   verified and landed in `<project>/host/workspace/integration`), with the gate's `npm test` run once under a
+   hand-written `sandbox-exec` profile as in D11; the per-project `CLAUDE_CONFIG_DIR` login and the auto-memory
+   location. Go/no-go per item. Depends: none.
 1. **macOS process facts and a runtime-aware bot guard.** Criteria: a `ps`-based `ProcessControl` on darwin
    (cmdline, parent, start time) used by the coordinator lock, `checkTelegramPoller`, `signalDescendants` and the
-   channel server; `findBotConflict`/`startBotCheck` count host coordinators; unit tests with a fake `ps`, including
-   PID reuse; existing `/proc` tests unchanged. Depends: none.
+   channel server; the same view backs `systemLockView` (`src/runtime/supervisor.ts`), so the supervisor lock and the
+   `integration_lock` (`integratorAlive`, and the integrator's recovery match of the verify group leader) check pid,
+   start time and the `work integrate` command line on macOS; a macOS boot id (`sysctl -n kern.boottime`, or
+   `kern.bootsessionuuid`) for those locks and for `HostIdentity` (`src/runtime/runner/record.ts`), so a lock from
+   before a reboot is stale; `findBotConflict`/`startBotCheck` count host coordinators; unit tests with a fake `ps`
+   and a fake `sysctl`, including PID reuse and a reboot; existing `/proc` tests unchanged. Depends: none.
 2. **Per-project Claude config dir and versioned runtime CLI.** Criteria: the shim sets
    `CLAUDE_CONFIG_DIR=<project>/host/claude` and `DISABLE_AUTOUPDATER=1`; `start` snapshots the CLI into
    `host/cli/<fp>` (keeps 2) and the shim execs it; the sandbox `allowRead`/Edit denies cover both dirs; `setup` and
@@ -245,20 +315,28 @@ The Docker volumes are deleted only after the owner says so (Q6).
    server env path; the channel state in `host/claude`, sandbox- and Edit-denied; `resolveChannel` without the
    host-runtime cause; the wizard offers Telegram on the host; doctor and status checks; tests for argv, env (no
    token) and settings. Depends: 1, 2, task-67.3.
-4. **Auto mode on the host.** Criteria: the host-layer-only loosening rule (a repository value can only tighten),
-   with tests; the new deny rules; the host pre-bash fence and pre-file path fence, which fail closed, with tests for
-   wrappers, substitutions, symlinks and `..`; `status` and `doctor` show the mode and source; the default becomes
-   `auto` only if phase 0 passed. Depends: 0, 2.
+4. **Auto mode and the integration gate on the host.** Criteria: the host-layer-only loosening rule (a repository
+   value can only tighten), with tests; the new deny rules; the host pre-bash fence and pre-file path fence, which
+   fail closed, with tests for wrappers, substitutions, symlinks and `..`; `status` and `doctor` show the mode and
+   source; the default becomes `auto` only if phase 0 passed. D11: on the host `Scheduler.record` only queues and
+   touches the wake file, and the wrapper starts the integrator; each verification command runs under the generated
+   Seatbelt profile (writes limited to the integration worktree, `<state>/run/integration` and its logs; the
+   `hostSettings` `denyRead` list; GitHub and npm only); tests for the argv and the profile with a fake
+   `sandbox-exec`, and that no host path spawns the integrator from `work record`. Depends: 0, 1, 2.
 5. **`minions upgrade` on the host.** Criteria: the D7 steps with `--dry-run`, `--now` and `--rebuild-cli`; the
+   drain waits while the `integration_lock` is held (a verification is re-queued, a landing finishes); the
    `restart-required` host branch; an interrupted upgrade resumes (`upgrade.json`); tests with a fake tmux and
-   claude. Depends: 2.
+   claude, including a held lock. Depends: 2.
 6. **Runtime move and self-update host mode.** Criteria: `runtime set` moves the state, branches, memory and
-   `access.json` (D8), refuses with active leases, and supports `--dry-run`; `self-update.mjs` host mode (refusals,
-   verbs through the shim, health without image checks, rollback = backup reinstall + snapshot flip + restart),
-   tested with fakes. Depends: 3, 5.
-7. **Migrate the dev project (coordinator + owner).** Criteria: the migration steps above run; one self-update
-   round passes on the host; the rollback rehearsed once on the disposable project; README, bootstrap.md and
-   compatibility.md updated. Depends: 4, 6.
+   `access.json` in the D8 order (export from the running old runtime, stop it, switch, start the new one detached,
+   import), refuses with active leases or a held `integration_lock`, and supports `--dry-run`; `self-update.mjs`
+   host mode (refusals, verbs through the shim, the task-82.5 idle check that treats a held `integration_lock` as
+   busy, read through the shim, health without image checks, rollback = backup reinstall + snapshot flip +
+   restart), tested with fakes. Depends: 3, 5, task-82.5.
+7. **Migrate the dev project (coordinator + owner).** Criteria: the migration steps above run; one local integration
+   round and one self-update round pass on the host; the rollback rehearsed once on the disposable project; README,
+   bootstrap.md, compatibility.md and coordinator-self-update.md updated (its "Relation to the dropped host-runtime
+   dev mode" section no longer says dev installs stay on Docker, and its host-mode notes point here). Depends: 4, 6.
 
 Sensitive paths: none expected. Phase 7 may touch the root `CLAUDE.md` only if the owner wants the coordinator
 section reworded. It works unchanged.
