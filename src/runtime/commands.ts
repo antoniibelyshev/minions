@@ -694,16 +694,16 @@ export function register(program: Command): void {
       emit(r, { json: globalOpts(cmd).json, human: formatCancel });
       if (r.failed.length || r.blockFailed.length) process.exitCode = 1;
     }));
-  work.command('publish <taskId>').description('Publish an approved task (branch / pull-request delivery); idempotent, retryable')
+  work.command('publish <taskId>').description('Publish an approved task (branch / pull-request delivery), or in local delivery with local integration on queue its integration again; idempotent, retryable')
     .action(action(async (taskId: string, _o: unknown, cmd: Command) => {
       if (runtimeMode() === 'host') return delegate(cmd);
       const r = await (await scheduler()).publish(taskId);
       emit(r, { json: globalOpts(cmd).json, human: (d) => d.message });
       if (r.state === 'failed') process.exitCode = 1;
     }));
-  work.command('approve <taskId>').description('Approve publishing the approved head (sensitive paths / "ask" publication), or with --merge merging its delivered PR (pr.merge "ask"); run on the host, which signs the approval')
+  work.command('approve <taskId>').description('Approve publishing the approved head (sensitive paths / "ask" publication), or with --merge merging its delivered PR (pr.merge "ask") or landing its local integration (base.merge "ask", sensitive paths); run on the host, which signs the approval')
     .requiredOption('--head <sha>', 'the full approved head SHA being authorized (binds the approval to that commit)')
-    .option('--merge', 'approve merging the delivered pull request at that head (CI-gated auto-merge) instead of publishing it')
+    .option('--merge', 'approve merging the delivered pull request at that head (CI-gated auto-merge), or the local integration of that head, instead of publishing it')
     .option('--by <name>', 'who approved (default: the host user)')
     .option('--note <text>', 'why')
     .addOption(new Option('--signature <token>', 'host-signed approval token (set by the host CLI when it delegates; never needed by hand)').hideHelp())
