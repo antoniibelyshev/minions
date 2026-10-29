@@ -1,8 +1,10 @@
 // scripts/dev/self-update.mjs (docs/design/coordinator-self-update.md). Phase 1: start refusals, the lock, polling and
 // taking upgrade requests through the script's own docker exec, idle detection and --dry-run. Phase 2: the apply
-// (sync, host gate in a throwaway worktree, previous-image tag, upgrade --rebuild-cli, outcome and notice). The
-// script runs as a subprocess against a fake `minions`, `docker` and `npm` on PATH (shell scripts), a real Git
-// checkout and a scratch MINIONS_HOME.
+// (sync, host gate in a throwaway worktree, previous-image tag, upgrade --rebuild-cli, outcome and notice). Phase 3:
+// the health check and the rollback (CLI backup, image re-tag, down and start, manager bot notice). The script runs as
+// a subprocess against a fake `minions`, `docker` and `npm` on PATH (shell scripts), a real Git checkout and a scratch
+// MINIONS_HOME. The fake docker keeps its images as files ($FAKE/img/<tag> holds the image ID) and the container's
+// image in $FAKE/container-image; the fake host `minions --json status` is healthy unless a test says otherwise.
 import { spawn, spawnSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -46,7 +48,9 @@ const stateDir = () => join(fx.home, 'dev-self-update');
 function setup(): Fx {
   const base = realpathSync(mkdtempSync(join(tmpdir(), 'minions-self-update-')));
   const repo = join(base, 'repo'), home = join(base, 'home'), fake = join(base, 'fake'), bin = join(base, 'bin');
-  for (const d of [repo, join(repo, 'src'), join(home, 'projects', PROJECT_ID), fake, bin, join(fake, 'global', 'minions', 'dist')]) mkdirSync(d, { recursive: true });
+  for (const d of [repo, join(repo, 'src'), join(home, 'projects', PROJECT_ID), fake, bin, join(fake, 'global', 'minions', 'dist'), join(fake, 'img')]) mkdirSync(d, { recursive: true });
+  writeFileSync(join(fake, 'img', 'minions-runtime:0.1.0'), 'sha256:0ldimage\n');
+  writeFileSync(join(fake, 'container-image'), 'sha256:0ldimage\n');
   gitIn(repo, 'init', '-q', '-b', 'main');
   json(join(repo, 'package.json'), { name: 'minions', version: '0.1.0' });
   writeFileSync(join(repo, 'src', 'cli.ts'), '');
@@ -60,9 +64,13 @@ function setup(): Fx {
   // npm: `root -g`; the gate steps log their argv, cwd, commit and env, and fail when $FAKE/gate-fail names them.
   sh(join(bin, 'npm'), [
     '[ "$1 $2" = "root -g" ] && { echo "root -g" >> "$FAKE/npm.log"; echo "$FAKE/global"; exit 0; }',
+    // The rollback's CLI reinstall; $FAKE/npm-install-fail makes it fail.
+    '[ "$1 $2" = "install -g" ] && { echo "$* | cwd=$PWD" >> "$FAKE/npm.log"; [ -f "$FAKE/npm-install-fail" ] && { echo "npm ERR! EACCES" >&2; exit 1; }; exit 0; }',
     'echo "$* | cwd=$PWD | head=$(git rev-parse HEAD) | home=$MINIONS_HOME | workers=$MINIONS_TEST_MAX_WORKERS" >> "$FAKE/npm.log"',
     'case "$*" in ci|"run typecheck"|test) ;; *) exit 1 ;; esac',
     '[ -f "$FAKE/gate-fail" ] && [ "$(cat "$FAKE/gate-fail")" = "$*" ] && { echo "FAIL test/example.test.ts > it breaks"; exit 1; }',
+    // $FAKE/gate-run: a shell snippet the `npm test` step runs in this process (e.g. a SIGKILL of itself).
+    '[ -f "$FAKE/gate-run" ] && [ "$*" = test ] && . "$FAKE/gate-run"',
     'exit 0',
   ].join('\n'));
   sh(join(bin, 'minions'), [
@@ -75,23 +83,48 @@ function setup(): Fx {
     '    sh "$FAKE/sync-action" || exit 1',
     '    echo \'{"ok":true,"data":{"ok":true,"steps":[{"id":"sync","status":"done","detail":"fast-forward"}],"sync":{"action":"fast-forward"},"stopped":null}}\' ;;',
     '  *"upgrade --rebuild-cli"*)',
+    // As applyCli: back up the installed CLI before replacing it; then the image ($FAKE/new-image) and the recreate.
+    '    mkdir -p "$MINIONS_HOME/manager/cli-backup" && echo old-cli > "$MINIONS_HOME/manager/cli-backup/minions-0.1.0-$(date -u +%Y%m%dT%H%M%S%3NZ).tgz"',
+    '    [ -f "$FAKE/new-image" ] && cp "$FAKE/new-image" "$FAKE/img/minions-runtime:0.1.0"',
+    '    cp "$FAKE/img/minions-runtime:0.1.0" "$FAKE/container-image"',
     '    [ -f "$FAKE/upgrade-stops-runtime" ] && rm -f "$FAKE/running"',
     '    if [ -f "$FAKE/upgrade-fail" ]; then echo \'{"ok":true,"data":{"ok":false,"steps":[{"id":"image","status":"failed","detail":"docker build failed"}],"stopped":null}}\'; exit 1; fi',
     '    echo \'{"ok":true,"data":{"ok":true,"steps":[{"id":"cli","status":"done","detail":"reinstalled"}],"stopped":null}}\' ;;',
+    '  "--version") echo 0.1.0 ;;',
+    '  "--json status") sh "$FAKE/host-status.sh" ;;',
+    // $FAKE/doctor-fail-image: on that image doctor reports telegram.plugin as fail.
+    '  "--json doctor") echo doctor >> "$FAKE/doctor.log"; st=ok; [ -f "$FAKE/doctor-fail-image" ] && [ "$(cat "$FAKE/container-image")" = "$(cat "$FAKE/doctor-fail-image")" ] && st=fail',
+    '    echo "{\\"ok\\":true,\\"data\\":{\\"healthy\\":false,\\"checks\\":[{\\"name\\":\\"telegram.plugin\\",\\"status\\":\\"$st\\",\\"detail\\":\\"plugin $st\\"}]}}" ;;',
+    '  "--json down") rm -f "$FAKE/container-image" "$FAKE/running"; echo \'{"ok":true,"data":{}}\' ;;',
+    '  "--json start --no-attach") cp "$FAKE/img/minions-runtime:0.1.0" "$FAKE/container-image"; touch "$FAKE/running"; echo \'{"ok":true,"data":{"running":true}}\' ;;',
+    '  "--json manager notify") cat > "$FAKE/manager-notice.txt"; echo \'{"ok":true,"data":{"sent":true,"botId":"555"}}\' ;;',
     '  *) echo \'{"ok":false,"error":{"code":"INTERNAL","message":"unexpected fake call"}}\'; exit 1 ;;',
     'esac',
+  ].join('\n'));
+  // The host status the health check reads. $FAKE/broken-image: a container on that image has no coordinator.
+  // $FAKE/flap-image: on that image the coordinator lock changes hands on every call (a restart loop).
+  // $FAKE/telegram: the coordinator has Telegram, and the file holds the poller state.
+  writeFileSync(join(fake, 'host-status.sh'), [
+    'img=$(cat "$FAKE/container-image" 2>/dev/null)',
+    'launch=current; [ -f "$FAKE/broken-image" ] && [ "$img" = "$(cat "$FAKE/broken-image")" ] && launch=not-running',
+    'pid=100; if [ -f "$FAKE/flap-image" ] && [ "$img" = "$(cat "$FAKE/flap-image")" ]; then n=$(cat "$FAKE/flaps" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "$FAKE/flaps"; pid=$((200+n)); fi',
+    'channel=terminal; poller=not-applicable; [ -f "$FAKE/telegram" ] && { channel=telegram; poller=$(cat "$FAKE/telegram"); }',
+    'printf \'{"ok":true,"data":{"activeLeases":[],"draining":null,"restartRequired":{"state":"current","required":false,"reasons":[]},"coordinatorLaunch":{"state":"%s","reason":"x"},"coordinatorLock":{"pid":%s,"session":"coordinator","acquiredAt":"2026-10-29T10:00:00.000Z"},"channel":{"effective":"%s"},"telegramPoller":{"state":"%s"}}}\\n\' "$launch" "$pid" "$channel" "$poller"',
   ].join('\n'));
   sh(join(bin, 'docker'), [
     'echo "$*" >> "$FAKE/docker.log"',
     'case "$*" in',
     '  *" ps --status running -q app"*) [ -f "$FAKE/running" ] && echo c0ffee; exit 0 ;;',
+    '  *" ps -q app") [ -f "$FAKE/container-image" ] && echo c0ffee; exit 0 ;;',
+    '  "inspect --format {{.Image}} c0ffee") cat "$FAKE/container-image" ;;',
+    '  *"exec -T app minions coordinator restart --recover --json") echo restart >> "$FAKE/coordinator.log"; echo \'{"ok":true,"data":{"action":"restarted"}}\' ;;',
     '  *"exec -T app minions status --json"*) cat "$FAKE/status.json" ;;',
     // $FAKE/mark-fail: the runtime refuses every mark except --status confirmed (an error that is not "not running").
     '  *"exec -T app minions settings requests mark"*" --status confirmed "*) echo \'{"ok":true,"data":{}}\' ;;',
     '  *"exec -T app minions settings requests mark"*) [ -f "$FAKE/mark-fail" ] && { echo \'{"ok":false,"error":{"code":"INTERNAL","message":"state store is locked"}}\'; exit 1; }; echo \'{"ok":true,"data":{}}\' ;;',
     '  *"exec -T app minions notify enqueue"*) cat > "$FAKE/notice.txt"; echo \'{"ok":true,"data":{"created":true}}\' ;;',
-    '  "image inspect --format {{.Id}} minions-runtime:0.1.0") echo sha256:0ldimage ;;',
-    '  "tag minions-runtime:0.1.0 minions-runtime:0.1.0-prev") ;;',
+    '  "image inspect --format {{.Id}} "*) [ -f "$FAKE/img/$5" ] && cat "$FAKE/img/$5" || { echo "Error: No such image: $5" >&2; exit 1; } ;;',
+    '  "tag "*) [ -f "$FAKE/img/$2" ] && cp "$FAKE/img/$2" "$FAKE/img/$3" || { echo "Error: No such image: $2" >&2; exit 1; } ;;',
     '  *) echo "unexpected fake docker call" >&2; exit 1 ;;',
     'esac',
   ].join('\n'));
@@ -101,7 +134,7 @@ function setup(): Fx {
 
 const env = () => ({ ...process.env, ...GIT_ENV, PATH: `${fx.bin}:${process.env.PATH ?? ''}`, MINIONS_HOME: fx.home, FAKE: fx.fake });
 const runScript = (...args: string[]) => {
-  const r = spawnSync(process.execPath, [SCRIPT, '--repo', fx.repo, ...args], { encoding: 'utf8', env: env(), timeout: 60_000 });
+  const r = spawnSync(process.execPath, [SCRIPT, '--repo', fx.repo, '--health-window', '2', ...args], { encoding: 'utf8', env: env(), timeout: 60_000 });
   return { code: r.status, out: r.stdout, err: r.stderr };
 };
 
@@ -305,7 +338,7 @@ describe('self-update apply (phase 2)', () => {
     const apply = events().find((e) => e.event === 'apply')!;
     expect(apply).toMatchObject({ request: 'cr_aaaaaaaa', from, to, outcome: 'applied', sensitive: ['.github/workflows/ci.yml'], previousImage: { tag: 'minions-runtime:0.1.0-prev', id: 'sha256:0ldimage' } });
     expect((apply.steps as { id: string; status: string; ms: number }[]).map((s) => `${s.id}:${s.status}`))
-      .toEqual(['sync:done', 'gate-worktree:done', 'gate-ci:done', 'gate-typecheck:done', 'gate-test:done', 'previous-image:done', 'upgrade:done']);
+      .toEqual(['sync:done', 'gate-worktree:done', 'gate-ci:done', 'gate-typecheck:done', 'gate-test:done', 'previous-image:done', 'upgrade:done', 'health:done']);
   });
 
   it('gate fails: builds nothing, marks the request failed with the reason and records the SHA as bad', () => {
@@ -350,13 +383,17 @@ describe('self-update apply (phase 2)', () => {
     expect(readState().badShas).toEqual([head]);
   });
 
-  it('a failed upgrade is marked failed (rollback is phase 3) and the SHA is not recorded as bad', () => {
+  it('a failed upgrade rolls back, is marked failed, and the SHA is not recorded as bad (it can be transient)', () => {
     setRequests([request('cr_aaaaaaaa')]);
     writeFileSync(join(fx.fake, 'upgrade-fail'), '');
     const r = runScript('--once');
     expect(r.code, r.err).toBe(0);
     expect(dockerLog()).toContain('tag minions-runtime:0.1.0 minions-runtime:0.1.0-prev');
-    expect(marks()[1]).toMatch(/--status failed --detail self-update: minions upgrade --rebuild-cli failed \(failed: image \(docker build failed\)\)/);
+    expect(dockerLog()).toContain('tag minions-runtime:0.1.0-prev minions-runtime:0.1.0');
+    expect(npmLog()).toMatch(/^install -g --no-audit --no-fund .*cli-backup\/minions-0\.1\.0-\d{8}T\d{9}Z\.tgz/m);
+    expect(minionsLog()).toMatch(/--json down\n--json start --no-attach/);
+    expect(marks()[1]).toMatch(/--status failed --detail self-update: minions upgrade --rebuild-cli failed \(failed: image \(docker build failed\)\); rolled back to the previous CLI and image/);
+    expect(marks()[1]).toMatch(/is not recorded as bad \(the upgrade itself failed/);
     expect(readState()).toMatchObject({ current: null, lastApplied: null, badShas: [] });
   });
 
@@ -582,6 +619,157 @@ describe('self-update apply: failure paths and isolation', () => {
     expect(minionsLog()).not.toMatch(/upgrade/);
     expect(JSON.parse(readFileSync(join(stateDir(), 'state.json'), 'utf8'))).toEqual(pending);
     expect(existsSync(join(stateDir(), 'log.jsonl'))).toBe(false);
+  });
+});
+
+describe('self-update health check and rollback (phase 3)', () => {
+  const marks = () => dockerLog().split('\n').filter((l) => l.includes('requests mark cr_'));
+  const statuses = () => marks().map((l) => / --status (\w+)/.exec(l)?.[1]);
+  const img = (tag: string) => readFileSync(join(fx.fake, 'img', tag), 'utf8').trim();
+  const containerImg = () => readFileSync(join(fx.fake, 'container-image'), 'utf8').trim();
+  const steps = (e: Record<string, unknown> | undefined) => (e?.steps as { id: string; status: string }[]).map((s) => `${s.id}:${s.status}`);
+  const newImage = (id: string) => writeFileSync(join(fx.fake, 'new-image'), `${id}\n`);
+
+  it('a healthy update keeps the new image and CLI: no rollback, marked applied', () => {
+    newImage('sha256:newimage');
+    setRequests([request('cr_aaaaaaaa')]);
+    const r = runScript('--once');
+    expect(r.code, r.err).toBe(0);
+    expect(containerImg()).toBe('sha256:newimage');
+    expect(img('minions-runtime:0.1.0')).toBe('sha256:newimage');
+    expect(img('minions-runtime:0.1.0-prev')).toBe('sha256:0ldimage');
+    expect(npmLog()).not.toMatch(/^install -g/m);
+    expect(minionsLog()).not.toMatch(/--json (down|start)/);
+    expect(statuses()).toEqual(['confirmed', 'applied']);
+    // The health probes: fresh `--version` and `--json status`, and the container's image.
+    expect(minionsLog()).toMatch(/--rebuild-cli\n(.|\n)*--version\n--json status/);
+    expect(dockerLog()).toContain('inspect --format {{.Image}} c0ffee');
+    const apply = events().find((e) => e.event === 'apply');
+    expect(apply).toMatchObject({ outcome: 'applied', health: { healthy: true } });
+    expect(steps(apply).slice(-2)).toEqual(['upgrade:done', 'health:done']);
+    expect((readState() as unknown as { prevPin: unknown }).prevPin).toBeNull();
+  });
+
+  it('not healthy after the upgrade: reinstalls the CLI backup, tags -prev back, down and start on the old CLI, records the SHA as bad', () => {
+    newImage('sha256:newimage');
+    writeFileSync(join(fx.fake, 'broken-image'), 'sha256:newimage\n');
+    setRequests([request('cr_aaaaaaaa')]);
+    const r = runScript('--once');
+    expect(r.code, r.err).toBe(0);
+    const to = gitIn(fx.repo, 'rev-parse', 'HEAD');
+
+    // The old build runs again: -prev is the image tag again and the container was recreated from it.
+    expect(img('minions-runtime:0.1.0')).toBe('sha256:0ldimage');
+    expect(containerImg()).toBe('sha256:0ldimage');
+    const backups = readdirSync(join(fx.home, 'manager', 'cli-backup'));
+    expect(backups).toHaveLength(1);
+    expect(npmLog()).toContain(`install -g --no-audit --no-fund ${join(fx.home, 'manager', 'cli-backup', backups[0]!)} | cwd=${join(fx.home, 'manager', 'cli-backup')}`);
+    expect(minionsLog()).toMatch(/--rebuild-cli\n(.|\n)*--json down\n--json start --no-attach\n/);
+    expect(readLog('coordinator.log')).toBe('restart\n');
+    const apply = events().find((e) => e.event === 'apply');
+    expect(steps(apply).slice(6)).toEqual(['upgrade:done', 'health:failed', 'rollback-cli:done', 'rollback-image:done', 'rollback-down:done',
+      'rollback-start:done', 'rollback-coordinator:done', 'health-after-rollback:done']);
+    expect(apply).toMatchObject({ outcome: 'failed', health: { healthy: false }, rollback: { ok: true, healthy: true } });
+
+    // Reported: marked failed with the reason, the SHA is bad, the owner notice says so; no manager bot needed.
+    expect(statuses()).toEqual(['confirmed', 'failed']);
+    expect(marks()[1]).toMatch(new RegExp(`not healthy after the upgrade to ${to.slice(0, 12)} \\(not healthy within 2 s: the coordinator is not running\\); rolled back to the previous CLI and image \\(minions-runtime:0.1.0-prev\\); the coordinator is healthy again on the previous build; ${to.slice(0, 12)} is recorded as bad`));
+    expect(readFileSync(join(fx.fake, 'notice.txt'), 'utf8')).toMatch(/^Self-update failed .*rolled back to the previous CLI and image/);
+    expect(existsSync(join(fx.fake, 'manager-notice.txt'))).toBe(false);
+    expect(readState()).toMatchObject({ current: null, lastApplied: null, badShas: [to] });
+  });
+
+  it('more than one coordinator restart in the window is not healthy', () => {
+    newImage('sha256:newimage');
+    writeFileSync(join(fx.fake, 'flap-image'), 'sha256:newimage\n');
+    setRequests([request('cr_aaaaaaaa')]);
+    const r = runScript('--once');
+    expect(r.code, r.err).toBe(0);
+    expect(marks()[1]).toMatch(/not healthy after the upgrade .*\(the coordinator restarted 2 times within the health window\); rolled back/);
+    expect(containerImg()).toBe('sha256:0ldimage');
+  });
+
+  it('a Telegram coordinator without a live poller is not healthy', () => {
+    newImage('sha256:newimage');
+    writeFileSync(join(fx.fake, 'telegram'), 'dead');
+    setRequests([request('cr_aaaaaaaa')]);
+    runScript('--once');
+    expect(marks()[1]).toMatch(/not healthy after the upgrade .*the Telegram poller is dead/);
+    // Never healthy here, also after the rollback, so `doctor` (it runs only when the rest passes) never ran.
+    expect(minionsLog()).not.toMatch(/--json doctor/);
+    rmSync(join(fx.fake, 'telegram'));
+  });
+
+  it('a Telegram coordinator is not healthy when doctor reports telegram.plugin as fail', () => {
+    newImage('sha256:newimage');
+    writeFileSync(join(fx.fake, 'telegram'), 'ok');
+    writeFileSync(join(fx.fake, 'doctor-fail-image'), 'sha256:newimage\n');
+    setRequests([request('cr_aaaaaaaa')]);
+    const r = runScript('--once');
+    expect(r.code, r.err).toBe(0);
+    expect(marks()[1]).toMatch(/not healthy after the upgrade .*telegram\.plugin: plugin fail\); rolled back.*healthy again on the previous build/);
+    expect(readLog('doctor.log').length).toBeGreaterThan(0);
+    expect(containerImg()).toBe('sha256:0ldimage');
+  });
+
+  it('no healthy coordinator even after the rollback: the owner is told through the manager bot too', () => {
+    newImage('sha256:newimage');
+    writeFileSync(join(fx.fake, 'broken-image'), 'sha256:newimage\n');
+    writeFileSync(join(fx.fake, 'npm-install-fail'), ''); // the CLI cannot be reinstalled: the rollback stops there
+    setRequests([request('cr_aaaaaaaa')]);
+    const r = runScript('--once');
+    expect(r.code, r.err).toBe(0);
+    expect(minionsLog()).not.toMatch(/--json (down|start)/); // never `start` on the new CLI (it would rebuild the image)
+    const bot = readFileSync(join(fx.fake, 'manager-notice.txt'), 'utf8');
+    expect(bot).toMatch(/^Self-update failed \(request cr_aaaaaaaa\): NO HEALTHY COORDINATOR even after the rollback/);
+    expect(bot).toContain('the CLI backup could not be reinstalled');
+    expect(bot).toContain(`Log: ${join(stateDir(), 'log.jsonl')}`);
+    expect(events().find((e) => e.event === 'manager-notice')).toMatchObject({ request: 'cr_aaaaaaaa', ok: true });
+    expect(marks()[1]).toMatch(/no healthy coordinator even after the rollback .*; the owner was told through the manager bot; .* is recorded as bad/);
+    expect(readFileSync(join(fx.fake, 'notice.txt'), 'utf8')).toMatch(/NO HEALTHY COORDINATOR|no healthy coordinator/);
+  });
+
+  it('a retry never replaces a known-good -prev with the image of an update that was not confirmed healthy', () => {
+    // 1st request: the update is broken and the rollback fails, so the broken image stays on the tag.
+    newImage('sha256:badimage');
+    writeFileSync(join(fx.fake, 'broken-image'), 'sha256:badimage\n');
+    writeFileSync(join(fx.fake, 'npm-install-fail'), '');
+    setRequests([request('cr_aaaaaaaa')]);
+    expect(runScript('--once').code).toBe(0);
+    expect(img('minions-runtime:0.1.0')).toBe('sha256:badimage');
+    expect(img('minions-runtime:0.1.0-prev')).toBe('sha256:0ldimage');
+    expect((readState() as unknown as { prevPin: string }).prevPin).toBe('sha256:0ldimage');
+
+    // 2nd request (a fix on main): -prev keeps the known-good image instead of taking the broken one.
+    rmSync(join(fx.fake, 'npm-install-fail'));
+    newImage('sha256:fixedimage');
+    rmSync(join(fx.fake, 'docker.log'));
+    setRequests([request('cr_bbbbbbbb', { createdAt: '2026-10-29T11:00:00.000Z' })]);
+    const r = runScript('--once');
+    expect(r.code, r.err).toBe(0);
+    expect(dockerLog()).not.toContain('tag minions-runtime:0.1.0 minions-runtime:0.1.0-prev');
+    expect(img('minions-runtime:0.1.0-prev')).toBe('sha256:0ldimage');
+    const apply = events().filter((e) => e.event === 'apply').at(-1)!;
+    expect(apply).toMatchObject({ request: 'cr_bbbbbbbb', outcome: 'applied', previousImage: { tag: 'minions-runtime:0.1.0-prev', id: 'sha256:0ldimage', kept: true } });
+    expect((apply.steps as { id: string; detail: string }[]).find((s) => s.id === 'previous-image')!.detail).toMatch(/kept: the last update was not confirmed healthy/);
+    // Confirmed healthy now: the pin is cleared, so the next update keeps this image as -prev.
+    expect(containerImg()).toBe('sha256:fixedimage');
+    expect((readState() as unknown as { prevPin: unknown }).prevPin).toBeNull();
+  });
+
+  it.each([
+    ['an outside SIGKILL', 'kill -9 $$', /npm test did not finish \(ended by SIGKILL\)/],
+    ['output over the 64 MB maxBuffer', 'head -c 70000000 /dev/zero', /npm test did not finish \(ERR_CHILD_PROCESS_STDIO_MAXBUFFER\)/],
+  ])('a gate step ended by %s is transient: the SHA is not recorded as bad', (_name, snippet, detail) => {
+    writeFileSync(join(fx.fake, 'gate-run'), snippet);
+    setRequests([request('cr_aaaaaaaa')]);
+    const r = runScript('--once');
+    expect(r.code, r.err).toBe(0);
+    expect(minionsLog()).not.toMatch(/--rebuild-cli/);
+    expect(statuses()).toEqual(['confirmed', 'failed']);
+    expect(marks()[1]).toMatch(detail);
+    expect(marks()[1]).toMatch(/is not recorded as bad/);
+    expect(readState()).toMatchObject({ current: null, badShas: [] });
   });
 });
 

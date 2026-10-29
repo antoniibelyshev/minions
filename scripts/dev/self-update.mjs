@@ -12,16 +12,19 @@
 // (`minions upgrade --rebuild-cli`, a second run, so building the synced commits is allowed), outcome marking and
 // the owner notice (`notify enqueue`, own docker exec). A SHA that failed the gate is recorded as bad and is never
 // tried again.
-// Phase 3 (not built): the health check and rollback. healthCheck() and the comment after the upgrade step are the
-// seams.
+// Phase 3: the health check (fresh-process CLI checks, restartRequired and the coordinator launch current, the
+// container on the expected image, Telegram poller and doctor checks, at most one coordinator restart; polled for up to
+// 5 minutes) and the rollback (CLI backup reinstall, `<imageTag>-prev` tagged back, `down` and `start --no-attach` on
+// the old CLI, coordinator restart --recover). Not healthy records the SHA as bad. When no coordinator comes up even
+// after the rollback, the owner is told through the host manager bot too (`minions manager notify`).
 //
 // Plain Node ESM with no imports from src/: it runs against the installed `minions` CLI and `docker`. It never puts
 // a token or secret in argv or the log, and it treats every request field from the container as untrusted text.
 //
-// Usage: node scripts/dev/self-update.mjs [--repo <path>] [--dry-run] [--once] [--interval <seconds>] [--gate-dir <path>]
+// Usage: node scripts/dev/self-update.mjs [--repo <path>] [--dry-run] [--once] [--interval <seconds>] [--gate-dir <path>] [--health-window <seconds>]
 import { execFile, spawnSync } from 'node:child_process';
-import { randomBytes } from 'node:crypto';
-import { appendFileSync, chmodSync, existsSync, linkSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { createHash, randomBytes } from 'node:crypto';
+import { appendFileSync, chmodSync, existsSync, linkSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -33,7 +36,7 @@ const CONFIRM_DETAIL = 'taken by the host self-update script (scripts/dev/self-u
 const INTERRUPTED_DETAIL = 'self-update: the script stopped while handling this request; it is not run again';
 const MIN = 60_000;
 /** Step timeouts (ms). The gate's `npm test` is the slow step (the design's target: under 10 minutes in total). */
-const TIMEOUTS = { sync: 10 * MIN, worktree: 2 * MIN, ci: 20 * MIN, typecheck: 15 * MIN, test: 60 * MIN, docker: 2 * MIN, upgrade: 60 * MIN };
+const TIMEOUTS = { sync: 10 * MIN, worktree: 2 * MIN, ci: 20 * MIN, typecheck: 15 * MIN, test: 60 * MIN, docker: 2 * MIN, upgrade: 60 * MIN, npmInstall: 30 * MIN, down: 10 * MIN, start: 30 * MIN };
 const SHA = /^[0-9a-f]{40}$/;
 
 // ---------------------------------------------------------------- small helpers
@@ -52,14 +55,18 @@ const children = new Set();
 
 /**
  * Runs a command without a shell; never throws (spawn errors become code 127). opts: cwd, env (default
- * process.env), input (stdin text), timeoutMs.
+ * process.env), input (stdin text), timeoutMs. `abnormal`: the command did not end with an exit code of its own (our
+ * timeout, a signal from outside such as SIGKILL, the 64 MB maxBuffer overflow, a spawn error). Such an end says
+ * nothing about the commit, so the gate treats it as transient, like a timeout.
  */
 function run(cmd, args, opts = {}) {
   return new Promise((res) => {
     const child = execFile(cmd, args, { cwd: opts.cwd, env: opts.env ?? process.env, timeout: opts.timeoutMs ?? 120_000, maxBuffer: 64 * 1024 * 1024, encoding: 'utf8' }, (err, stdout, stderr) => {
       children.delete(child);
       const code = err ? (typeof err.code === 'number' ? err.code : 127) : 0;
-      res({ code, timedOut: Boolean(err?.killed), stdout: stdout ?? '', stderr: stderr || (err && typeof err.code !== 'number' ? String(err.message) : '') });
+      const abnormal = Boolean(err) && (Boolean(err.killed) || typeof err.code !== 'number' || Boolean(err.signal));
+      const why = !abnormal ? '' : err.signal ? `ended by ${err.signal}` : typeof err.code === 'string' ? clean(err.code, 60) : 'no exit code';
+      res({ code, timedOut: Boolean(err?.killed), abnormal, why, stdout: stdout ?? '', stderr: stderr || (err && typeof err.code !== 'number' ? String(err.message) : '') });
     });
     children.add(child);
     child.stdin?.on('error', () => { /* the child may exit before reading */ });
@@ -67,9 +74,14 @@ function run(cmd, args, opts = {}) {
   });
 }
 
-/** The last lines of a command's output, for a failure detail. */
+/**
+ * The last lines of a command's output, for a failure detail. Only the end of each stream is looked at: a whole
+ * 64 MB output (the maxBuffer limit) through the clean() regexes exhausts the heap.
+ */
+const TAIL_SCAN = 16_384;
 const tail = (r, max = 400) => {
-  const t = clean(`${r.stderr}\n${r.stdout}`.trim().split('\n').slice(-8).join(' '), 4000);
+  const end = (s) => String(s ?? '').slice(-TAIL_SCAN);
+  const t = clean(`${end(r.stderr)}\n${end(r.stdout)}`.trim().split('\n').slice(-8).join(' '), 4000);
   return t.length > max ? `…${t.slice(-max)}` : t;
 };
 
@@ -267,7 +279,7 @@ function logEvent(file, event) {
   try { chmodSync(file, 0o600); } catch { /* best effort */ }
 }
 
-const EMPTY_STATE = { version: 1, lastApplied: null, badShas: [], current: null };
+const EMPTY_STATE = { version: 1, lastApplied: null, badShas: [], current: null, prevPin: null };
 function readState(file) {
   const s = readJson(file);
   return s && s.version === 1 ? { ...EMPTY_STATE, ...s, badShas: Array.isArray(s.badShas) ? s.badShas : [] } : { ...EMPTY_STATE };
@@ -327,7 +339,8 @@ function planLines(ctx, reqId) {
     `npm ci && npm run typecheck && npm test   (in ${gate}, MINIONS_TEST_MAX_WORKERS=2, scratch MINIONS_HOME; then the worktree is removed)`,
     `docker tag ${p.imageTag || '<imageTag>'} ${p.imageTag ? prevImageTag(p.imageTag) : '<imageTag>-prev'}`,
     'minions --json upgrade --rebuild-cli',
-    'health check and rollback: phase 3, not built yet',
+    `health check for up to ${Math.round((ctx.healthWindowMs ?? HEALTH_WINDOW_MS) / 1000)} s: minions --version, minions --json status (restartRequired and coordinatorLaunch current), the container on the new image, Telegram poller and doctor checks, at most one coordinator restart`,
+    `not healthy: npm install -g <the CLI backup the upgrade made>, docker tag ${p.imageTag ? `${prevImageTag(p.imageTag)} ${p.imageTag}` : '<imageTag>-prev <imageTag>'}, minions --json down, minions --json start --no-attach, coordinator restart --recover; health check again; no healthy coordinator then: minions --json manager notify`,
     `mark the request applied or failed, and enqueue the owner notice (notify enqueue --key self-update:${reqId} --kind status)`,
   ].map((l) => `  ${l}`);
 }
@@ -375,13 +388,15 @@ async function runGate(ctx, sha, step) {
     if (!add.ok) return add;
     mkdirSync(home, { recursive: true, mode: 0o700 });
     const env = gateEnv(home);
-    // Only a typecheck or test failure (not a timeout) says the commit is bad. A failed `git worktree add` or
-    // `npm ci` (network, registry) or a timeout can be transient: the request fails, and a new request tries again.
+    // Only a typecheck or test failure (an exit code of its own, not a timeout) says the commit is bad. A failed
+    // `git worktree add` or `npm ci` (network, registry), a timeout, or an end without an exit code (an outside
+    // SIGKILL, the maxBuffer overflow) can be transient: the request fails, and a new request tries again.
     for (const [id, args, timeoutMs, judges] of [['gate-ci', ['ci'], TIMEOUTS.ci, false], ['gate-typecheck', ['run', 'typecheck'], TIMEOUTS.typecheck, true], ['gate-test', ['test'], TIMEOUTS.test, true]]) {
       const r = await step(id, async () => {
         const x = await run('npm', args, { cwd: dir, env, timeoutMs });
         if (x.code === 0) return { ok: true, detail: `npm ${args.join(' ')} passed` };
         if (x.timedOut) return { ok: false, detail: `npm ${args.join(' ')} timed out after ${Math.round(timeoutMs / MIN)} min: ${tail(x)}` };
+        if (x.abnormal) return { ok: false, detail: `npm ${args.join(' ')} did not finish (${x.why}): ${tail(x)}` };
         return { ok: false, bad: judges, detail: `npm ${args.join(' ')} failed (exit ${x.code}): ${tail(x)}` };
       });
       if (!r.ok) return r;
@@ -395,25 +410,233 @@ async function runGate(ctx, sha, step) {
   }
 }
 
-/** Keeps the running image as `<imageTag>-prev` for the phase 3 rollback (the CLI backup is made by applyCli itself). */
-async function tagPrevious(p) {
+/** Image ID (sha256:...) of a tag, or null (missing image, docker failed). */
+async function imageIdOf(tag) {
+  const r = await run('docker', ['image', 'inspect', '--format', '{{.Id}}', tag], { timeoutMs: TIMEOUTS.docker });
+  const v = r.code === 0 ? r.stdout.trim() : '';
+  return v || null;
+}
+const shortImg = (id) => (typeof id === 'string' ? clean(id.replace(/^sha256:/, ''), 80).slice(0, 12) : '?');
+
+/**
+ * Keeps the running image as `<imageTag>-prev` for the rollback (the CLI backup is made by applyCli itself).
+ *
+ * A retry must never replace a known-good `-prev` with a bad image. state.prevPin is the image the last `-prev` tag
+ * protects; it is cleared only when a health check passes (after the upgrade or after a rollback). While it is set, an
+ * apply whose current image is another one (a rollback that failed, a stop during the upgrade) keeps `-prev` as it is.
+ */
+async function tagPrevious(ctx, p) {
   if (!p.imageTag) return { ok: false, detail: 'the project has no imageTag' };
   const id = await run('docker', ['image', 'inspect', '--format', '{{.Id}}', p.imageTag], { timeoutMs: TIMEOUTS.docker });
   const imageId = id.code === 0 ? id.stdout.trim() : '';
   if (!imageId) return { ok: false, detail: `docker image inspect ${p.imageTag} failed: ${tail(id)}` };
   const prev = prevImageTag(p.imageTag);
+  const pin = readState(ctx.files.state).prevPin;
+  if (pin && pin !== imageId) {
+    const prevId = await imageIdOf(prev);
+    if (prevId === pin) {
+      return { ok: true, kept: true, prev, imageId: prevId,
+        detail: `${prev} (${shortImg(prevId)}) kept: the last update was not confirmed healthy, so ${p.imageTag} (${shortImg(imageId)}) does not replace it` };
+    }
+  }
   const t = await run('docker', ['tag', p.imageTag, prev], { timeoutMs: TIMEOUTS.docker });
-  return t.code === 0 ? { ok: true, detail: `${p.imageTag} (${clean(imageId, 80)}) kept as ${prev}`, prev, imageId } : { ok: false, detail: `docker tag ${p.imageTag} ${prev} failed: ${tail(t)}` };
+  if (t.code !== 0) return { ok: false, detail: `docker tag ${p.imageTag} ${prev} failed: ${tail(t)}` };
+  writeState(ctx.files.state, { ...readState(ctx.files.state), prevPin: imageId });
+  return { ok: true, detail: `${p.imageTag} (${clean(imageId, 80)}) kept as ${prev}`, prev, imageId };
+}
+
+/** The image ID the project container runs, or null when no container runs (or docker failed). */
+async function containerImage(p) {
+  const ps = await run('docker', composeArgv(p, 'ps', '-q', SERVICE), { timeoutMs: TIMEOUTS.docker });
+  const cid = ps.code === 0 ? ps.stdout.trim().split('\n')[0]?.trim() ?? '' : '';
+  if (!/^[0-9a-f]{1,64}$/.test(cid)) return null;
+  const r = await run('docker', ['inspect', '--format', '{{.Image}}', cid], { timeoutMs: TIMEOUTS.docker });
+  const v = r.code === 0 ? r.stdout.trim() : '';
+  return v || null;
+}
+
+/** Telegram poller states that mean the owner cannot reach the coordinator (src/telegram/isolation.ts PollerState). */
+const POLLER_DOWN = ['missing', 'dead', 'foreign'];
+
+/**
+ * One health probe (docs/design/coordinator-self-update.md, Apply path step 6), all in fresh child processes:
+ * - `minions --version` answers with a version line and `minions --json status` with an ok envelope (as
+ *   checkCliHealth in src/host/cli-backup.ts);
+ * - that status reports `restartRequired.state` `current` (image label, CLI version, credential mounts, coordinator
+ *   launch fingerprint: src/host/restart-required.ts) and `coordinatorLaunch.state` `current` (the coordinator runs,
+ *   with the current launch fingerprint);
+ * - the project container runs `expectImage` (null: any image);
+ * - when the coordinator has Telegram (`channel.effective`), the status's `telegramPoller` is not missing, dead or
+ *   foreign, and `minions --json doctor` (the same report as `status --check`) has no `fail` for telegram.plugin or
+ *   telegram.poller. Doctor runs only when everything else passed: it is the slow probe.
+ * `lock` is the coordinator lock holder (pid and acquiredAt), to count restarts.
+ */
+async function healthProbe(ctx, expectImage) {
+  const repo = ctx.facts.repo;
+  const problems = [];
+  const v = await run('minions', ['--version'], { cwd: repo, timeoutMs: 60_000 });
+  const version = v.stdout.trim().split('\n').at(-1)?.trim() ?? '';
+  if (v.code !== 0 || !/^\d+\.\d+\.\d+/.test(version)) problems.push(`\`minions --version\` failed (exit ${v.code}): ${tail(v, 200)}`);
+  const s = await run('minions', ['--json', 'status'], { cwd: repo, timeoutMs: 120_000 });
+  const env = envelope(s.stdout);
+  let lock = null;
+  let telegram = false;
+  if (!env?.ok) problems.push(`\`minions status\` failed (exit ${s.code}): ${clean(env?.error?.message ?? tail(s, 200), 200)}`);
+  else {
+    const d = env.data ?? {};
+    const rr = d.restartRequired;
+    if (rr?.state !== 'current') problems.push(`restart required is ${clean(rr?.state ?? 'missing', 40)}, not current${rr?.detail ? ` (${clean(rr.detail, 200)})` : ''}`);
+    const launch = d.coordinatorLaunch?.state;
+    if (launch !== 'current') problems.push(launch === 'not-running' ? 'the coordinator is not running' : `the coordinator launch is ${clean(launch ?? 'unknown', 40)}, not current`);
+    if (d.coordinatorLock && typeof d.coordinatorLock.pid === 'number') lock = `${d.coordinatorLock.pid}@${clean(d.coordinatorLock.acquiredAt, 40)}`;
+    if (d.channel?.effective === 'telegram') {
+      telegram = true;
+      const poller = d.telegramPoller?.state;
+      if (POLLER_DOWN.includes(poller)) problems.push(`the Telegram poller is ${poller}`);
+    }
+  }
+  const img = await containerImage(ctx.facts.project);
+  if (!img) problems.push('no project container runs');
+  else if (expectImage && img !== expectImage) problems.push(`the container runs image ${shortImg(img)}, not ${shortImg(expectImage)}`);
+  if (!problems.length && telegram) {
+    const doc = envelope((await run('minions', ['--json', 'doctor'], { cwd: repo, timeoutMs: 5 * MIN })).stdout);
+    const checks = Array.isArray(doc?.data?.checks) ? doc.data.checks : null;
+    if (!checks) problems.push('`minions doctor` gave no report');
+    else for (const c of checks.filter((x) => (x?.name === 'telegram.plugin' || x?.name === 'telegram.poller') && x.status === 'fail')) problems.push(`${c.name}: ${clean(c.detail, 200)}`);
+  }
+  return { ok: !problems.length, lock, detail: problems.length ? problems.join('; ') : `minions ${clean(version, 40)}, coordinator running, container on image ${shortImg(img)}` };
+}
+
+/** The design's window: 5 minutes. Healthy needs HEALTH_SETTLE passing probes in a row (one at the end of the window). */
+const HEALTH_WINDOW_MS = 5 * MIN;
+const HEALTH_SETTLE = 2;
+const healthPollMs = (windowMs) => Math.min(10_000, Math.max(100, Math.round(windowMs / 30)));
+
+/** Sleeps, waking early when the script is stopping. */
+async function pause(ctx, ms) {
+  const end = Date.now() + ms;
+  while (Date.now() < end && !ctx.isStopping?.()) await new Promise((r) => setTimeout(r, Math.min(200, end - Date.now())));
 }
 
 /**
- * Phase 3 seam: the health definition of the design (fresh-process CLI checks, new image ID in the container,
- * coordinator running with restartRequired current, Telegram checks, at most one restart, polled for 5 minutes).
- * Not built: phase 2 trusts the upgrade's own result.
+ * The health check: probes until healthy or the window ends. Healthy: HEALTH_SETTLE passing probes in a row with the
+ * same coordinator lock holder (a restart in between starts the count again). More than one coordinator restart in
+ * the window (a third lock holder) is unhealthy at once. A stop ends it with Stopped (no rollback after a stop).
  */
-// eslint-disable-next-line no-unused-vars
-async function healthCheck(_ctx, _apply) {
-  return { checked: false, healthy: true, detail: 'not checked (the health check and rollback are phase 3)' };
+async function healthCheck(ctx, expectImage) {
+  const windowMs = ctx.healthWindowMs ?? HEALTH_WINDOW_MS;
+  const t0 = Date.now();
+  const holders = new Set();
+  let streak = 0;
+  let polls = 0;
+  let lastLock = null;
+  for (;;) {
+    if (ctx.isStopping?.()) throw new Stopped('stopped during the health check');
+    const r = await healthProbe(ctx, expectImage);
+    polls++;
+    if (r.lock) holders.add(r.lock);
+    const out = (healthy, detail) => ({ ok: healthy, healthy, polls, restarts: Math.max(0, holders.size - 1), detail });
+    if (holders.size > 2) return out(false, `the coordinator restarted ${holders.size - 1} times within the health window`);
+    streak = !r.ok ? 0 : r.lock === lastLock ? streak + 1 : 1;
+    lastLock = r.lock;
+    if (streak >= HEALTH_SETTLE) return out(true, r.detail);
+    if (Date.now() - t0 >= windowMs) {
+      return out(false, `not healthy within ${Math.round(windowMs / 1000)} s: ${r.ok ? `the coordinator was not stable (${holders.size - 1} restart(s))` : r.detail}`);
+    }
+    await pause(ctx, healthPollMs(windowMs));
+  }
+}
+
+// ---------------------------------------------------------------- rollback (phase 3)
+
+/** <MINIONS_HOME>/manager/cli-backup/minions-<version>-<UTC stamp>.tgz, as CLI_BACKUP_NAME in src/host/cli-backup.ts. */
+const CLI_BACKUP_NAME = /^minions-([0-9A-Za-z][0-9A-Za-z.+-]{0,63})-(\d{8}T\d{9}Z)\.tgz$/;
+const cliBackupDir = (home) => join(home, 'manager', 'cli-backup');
+
+/** The CLI backups, oldest first (by the stamp in the name), as listCliBackups in src/host/cli-backup.ts. */
+export function cliBackups(home) {
+  let names = [];
+  try { names = readdirSync(cliBackupDir(home)); } catch { /* no backups yet */ }
+  return names.map((name) => ({ name, m: CLI_BACKUP_NAME.exec(name) })).filter((x) => x.m)
+    .map(({ name, m }) => ({ name, file: join(cliBackupDir(home), name), version: m[1], stamp: m[2] }))
+    .sort((a, b) => (a.stamp < b.stamp ? -1 : a.stamp > b.stamp ? 1 : a.name.localeCompare(b.name)));
+}
+
+/**
+ * Reinstalls the CLI the upgrade replaced: the newest backup the upgrade made (one not there before it), as
+ * installCliBackup in src/host/cli-backup.ts does (`npm install -g --no-audit --no-fund <backup>` from the backup
+ * directory, a regular file only, its sha256 logged). No new backup means the upgrade did not replace the CLI
+ * (applyCli backs up before every reinstall and installs nothing when the backup fails): nothing to reinstall.
+ */
+async function restoreCli(home, before) {
+  const made = cliBackups(home).filter((b) => !before.has(b.name));
+  const b = made.at(-1);
+  if (!b) return { ok: true, detail: 'the upgrade made no CLI backup, so it did not replace the CLI; nothing to reinstall' };
+  let sha;
+  try {
+    if (!lstatSync(b.file).isFile()) return { ok: false, detail: `${b.file} is not a regular file; nothing was installed` };
+    sha = createHash('sha256').update(readFileSync(b.file)).digest('hex');
+  } catch (e) { return { ok: false, detail: `cannot read ${b.file} (${clean(e?.code ?? e?.message, 60)}); nothing was installed` }; }
+  const env = { ...process.env };
+  delete env.MINIONS_BUILD_KIND;
+  const r = await run('npm', ['install', '-g', '--no-audit', '--no-fund', b.file], { cwd: cliBackupDir(home), env, timeoutMs: TIMEOUTS.npmInstall });
+  return r.code === 0 && !r.abnormal ? { ok: true, detail: `reinstalled minions ${b.version} from ${b.file} (sha256 ${sha.slice(0, 12)})`, backup: b.name, sha256: sha }
+    : { ok: false, detail: `npm install -g ${b.file} failed (${r.abnormal ? r.why : `exit ${r.code}`}): ${tail(r)}` };
+}
+
+/** `minions --json <args>` as a child in the checkout: ok when it prints an ok envelope and exits 0. */
+async function minionsJson(repo, args, timeoutMs) {
+  const r = await run('minions', ['--json', ...args], { cwd: repo, timeoutMs });
+  const env = envelope(r.stdout);
+  if (env?.ok && r.code === 0) return { ok: true, detail: `minions ${args.join(' ')}: done`, data: env.data };
+  return { ok: false, detail: `minions ${args.join(' ')} failed (exit ${r.code}): ${clean(env?.error?.message ?? tail(r), 300)}` };
+}
+
+/**
+ * Rolls back to the previous build: the CLI backup is reinstalled, `<imageTag>-prev` is tagged as `<imageTag>` again,
+ * then `minions down` and `minions start --no-attach` run on the old CLI, and the coordinator is restarted with
+ * `--recover` through the script's own docker exec (`start --no-attach` starts it only when it has Telegram; the
+ * upgrade ends the same way). The old image carries the old CLI's build fingerprint as its `minions.build` label, so
+ * the old CLI's ensureImage does not rebuild it. If the CLI cannot be reinstalled the rollback stops there: a
+ * `start` on the new CLI would rebuild the image from the new code.
+ */
+async function rollback(ctx, apply, step, backupsBefore) {
+  const p = ctx.facts.project;
+  const repo = ctx.facts.repo;
+  const cli = await step('rollback-cli', () => restoreCli(ctx.facts.home, backupsBefore));
+  if (!cli.ok) return { ok: false, imageRestored: false, detail: `the CLI backup could not be reinstalled (${cli.detail}); the rollback stopped there` };
+  const prev = apply.previousImage;
+  const img = await step('rollback-image', async () => {
+    const id = await imageIdOf(prev.tag);
+    if (id !== prev.id) return { ok: false, detail: `${prev.tag} is ${id ? `image ${shortImg(id)}` : 'missing'}, not the kept ${shortImg(prev.id)}; \`minions start\` rebuilds the image from the old CLI instead` };
+    const t = await run('docker', ['tag', prev.tag, p.imageTag], { timeoutMs: TIMEOUTS.docker });
+    return t.code === 0 ? { ok: true, detail: `${prev.tag} (${shortImg(prev.id)}) tagged as ${p.imageTag} again` } : { ok: false, detail: `docker tag ${prev.tag} ${p.imageTag} failed: ${tail(t)}` };
+  });
+  const down = await step('rollback-down', () => minionsJson(repo, ['down'], TIMEOUTS.down));
+  const start = await step('rollback-start', () => minionsJson(repo, ['start', '--no-attach'], TIMEOUTS.start));
+  const coord = await step('rollback-coordinator', async () => {
+    const r = await runtimeVerb(p, ['coordinator', 'restart', '--recover']);
+    if (r.state === 'ok') return { ok: true, detail: `coordinator restart --recover: ${clean(r.data?.action ?? 'done', 40)}` };
+    return { ok: false, detail: r.state === 'not-running' ? 'the runtime is not running' : `coordinator restart --recover failed: ${r.message}` };
+  });
+  const failed = [['image re-tag', img], ['down', down], ['start', start], ['coordinator restart', coord]].filter(([, r]) => !r.ok).map(([n]) => n);
+  return { ok: !failed.length, imageRestored: img.ok,
+    detail: failed.length ? `rolled back with failures (${failed.join(', ')}; see the log)` : `rolled back to the previous CLI and image (${prev.tag})` };
+}
+
+/**
+ * Decision 3: when no coordinator comes up even after the rollback, the owner hears it through the host manager bot
+ * too (`minions --json manager notify`, text on stdin; the CLI reads the manager token itself, the script never sees
+ * it). An unpaired bot, or an old CLI without the verb, is logged and printed; nothing else happens.
+ */
+async function managerNotice(ctx, request, text) {
+  const r = await run('minions', ['--json', 'manager', 'notify'], { cwd: ctx.facts.repo, input: text, timeoutMs: 60_000 });
+  const env = envelope(r.stdout);
+  const ok = env?.ok === true && r.code === 0;
+  const message = ok ? 'sent' : clean(env?.error?.message ?? (tail(r) || `exit ${r.code}`), 300);
+  logEvent(ctx.files.log, { event: 'manager-notice', request, ok, ...(ok ? {} : { message }) });
+  ctx.say(`request ${request}: ${ok ? 'the owner was told through the manager bot' : `could not tell the owner through the manager bot: ${message}`}`);
+  return { ok, message };
 }
 
 /** The outbox rejects longer texts (MAX_TEXT_LENGTH 4000 in src/runtime/outbox.ts); the notice stays below it. */
@@ -544,20 +767,43 @@ async function applyRequest(ctx, req) {
   }
 
   // 3. Keep the previous image for the rollback.
-  const tag = await step('previous-image', () => tagPrevious(p));
+  const tag = await step('previous-image', () => tagPrevious(ctx, p));
   if (!tag.ok) return finishApply(ctx, apply, 'failed', `self-update: the previous image could not be kept (${tag.detail}); nothing was built`);
-  apply.previousImage = { tag: tag.prev, id: tag.imageId };
+  apply.previousImage = { tag: tag.prev, id: tag.imageId, ...(tag.kept ? { kept: true } : {}) };
 
   // 4. Upgrade: a second run, so building the synced commits is allowed (drain, rebuild, recreate, restart --recover).
+  // The CLI backups before it tell which backup the upgrade made (the CLI to reinstall on a rollback).
+  const backupsBefore = new Set(cliBackups(facts.home).map((b) => b.name));
   const up = await step('upgrade', () => minionsUpgrade(repo, ['--rebuild-cli'], TIMEOUTS.upgrade));
-  // Phase 3: a failed upgrade rolls back here (CLI backup reinstall, `<imageTag>-prev` re-tag, down && start).
-  if (!up.ok) return finishApply(ctx, apply, 'failed', `self-update: minions upgrade --rebuild-cli failed (${up.detail}); not rolled back (rollback is phase 3); previous image kept as ${tag.prev}`);
 
-  // 5. Health (phase 3 seam).
-  apply.health = await healthCheck(ctx, apply);
-  if (!apply.health.healthy) return finishApply(ctx, apply, 'failed', `self-update: not healthy after the upgrade (${apply.health.detail})`, { bad: true });
+  // 5. Health: the container must run the image the tag names now (rebuilt or, with an unchanged fingerprint, the same).
+  if (up.ok) {
+    const want = await imageIdOf(p.imageTag);
+    const h = await step('health', () => healthCheck(ctx, want));
+    apply.health = { healthy: h.healthy, detail: clean(h.detail, 600), polls: h.polls, restarts: h.restarts };
+    if (h.healthy) {
+      writeState(files.state, { ...readState(files.state), prevPin: null });
+      return finishApply(ctx, apply, 'applied', `self-update ${short(apply.from)}..${short(to)}`);
+    }
+  }
 
-  return finishApply(ctx, apply, 'applied', `self-update ${short(apply.from)}..${short(to)}`);
+  // 6. Roll back. Only an unhealthy result after a complete upgrade records the SHA as bad: a failed upgrade step
+  // (docker build, registry, drain) can be transient, so a new request tries that SHA again.
+  const bad = up.ok;
+  const why = up.ok ? `not healthy after the upgrade to ${short(to)} (${apply.health.detail})` : `minions upgrade --rebuild-cli failed (${up.detail})`;
+  const rb = await rollback(ctx, apply, step, backupsBefore);
+  const after = await step('health-after-rollback', () => healthCheck(ctx, rb.imageRestored ? apply.previousImage.id : null));
+  apply.rollback = { ok: rb.ok, detail: rb.detail, healthy: after.healthy, health: clean(after.detail, 600) };
+  if (after.healthy) writeState(files.state, { ...readState(files.state), prevPin: null });
+  const verdict = bad ? `${short(to)} is recorded as bad` : `${short(to)} is not recorded as bad (the upgrade itself failed, which can be transient; a new request tries it again)`;
+  let tail2 = after.healthy ? 'the coordinator is healthy again on the previous build' : `no healthy coordinator even after the rollback (${clean(after.detail, 300)})`;
+  if (!after.healthy) {
+    const text = noticeText({ ...apply, outcome: 'failed', detail: `NO HEALTHY COORDINATOR even after the rollback. ${why}; ${rb.detail}; after the rollback: ${after.detail}; ${verdict}` }, files);
+    const m = await managerNotice(ctx, apply.request, text);
+    apply.managerNotice = m;
+    tail2 += m.ok ? '; the owner was told through the manager bot' : `; the manager bot could not tell the owner (${m.message})`;
+  }
+  return finishApply(ctx, apply, 'failed', `self-update: ${why}; ${rb.detail}; ${tail2}; ${verdict}`, { bad });
 }
 
 // ---------------------------------------------------------------- one poll
@@ -629,7 +875,7 @@ async function pollOnce(ctx) {
 // ---------------------------------------------------------------- main
 
 function parseArgs(argv) {
-  const o = { repo: process.cwd(), dryRun: false, once: false, intervalS: DEFAULT_INTERVAL_S, gateDir: null };
+  const o = { repo: process.cwd(), dryRun: false, once: false, intervalS: DEFAULT_INTERVAL_S, gateDir: null, healthWindowS: HEALTH_WINDOW_MS / 1000 };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--dry-run') o.dryRun = true;
@@ -637,19 +883,21 @@ function parseArgs(argv) {
     else if (a === '--repo') o.repo = resolve(argv[++i] ?? '');
     else if (a === '--interval') { o.intervalS = Number(argv[++i]); if (!(o.intervalS > 0)) throw new Error('--interval needs a positive number of seconds'); }
     else if (a === '--gate-dir') { const v = argv[++i]; if (!v) throw new Error('--gate-dir needs a path'); o.gateDir = resolve(v); }
+    else if (a === '--health-window') { o.healthWindowS = Number(argv[++i]); if (!(o.healthWindowS > 0)) throw new Error('--health-window needs a positive number of seconds'); }
     else if (a === '-h' || a === '--help') o.help = true;
     else throw new Error(`unknown argument: ${clean(a, 60)}`);
   }
   return o;
 }
 
-const USAGE = `usage: node scripts/dev/self-update.mjs [--repo <path>] [--dry-run] [--once] [--interval <seconds>] [--gate-dir <path>]
+const USAGE = `usage: node scripts/dev/self-update.mjs [--repo <path>] [--dry-run] [--once] [--interval <seconds>] [--gate-dir <path>] [--health-window <seconds>]
   Host-only dev tool for the minions project developing itself (docs/design/coordinator-self-update.md).
   --repo      the minions checkout of the project (default: the current directory)
   --dry-run   check the refusals and print the plan for one poll; mark, write, log and run nothing
   --once      one poll, then exit
   --interval  seconds between polls (default ${DEFAULT_INTERVAL_S})
-  --gate-dir  where the throwaway gate worktrees go, outside the checkout (default <MINIONS_HOME>/dev-self-update/gate)`;
+  --gate-dir  where the throwaway gate worktrees go, outside the checkout (default <MINIONS_HOME>/dev-self-update/gate)
+  --health-window  how long the health check after an upgrade (and after a rollback) may take (default ${HEALTH_WINDOW_MS / 1000})`;
 
 async function main(argv) {
   let o;
@@ -676,7 +924,7 @@ async function main(argv) {
   if (o.dryRun) {
     const h = readJson(files.lock);
     if (h && typeof h.pid === 'number' && holderAlive(h)) say(`note: another self-update script holds the lock (pid ${h.pid})`);
-    await pollOnce({ facts, files, runId: 'dry-run', dryRun: true, gateDir, say });
+    await pollOnce({ facts, files, runId: 'dry-run', dryRun: true, gateDir, healthWindowMs: o.healthWindowS * 1000, say });
     return 0;
   }
   mkdirSync(files.dir, { recursive: true, mode: 0o700 });
@@ -701,7 +949,7 @@ async function main(argv) {
     logEvent(files.log, { event: 'started', pid: process.pid, repo: facts.repo, projectId: facts.project.projectId });
     say(`started (pid ${process.pid}, project ${facts.project.projectId}, polling every ${o.intervalS}s; stop with Ctrl-C)`);
     while (!stopping) {
-      try { await pollOnce({ facts, files, runId, dryRun: false, gateDir, say, isStopping: () => stopping }); } catch (e) { say(`poll failed: ${clean(e?.message ?? e, 300)}; retry later`); }
+      try { await pollOnce({ facts, files, runId, dryRun: false, gateDir, healthWindowMs: o.healthWindowS * 1000, say, isStopping: () => stopping }); } catch (e) { say(`poll failed: ${clean(e?.message ?? e, 300)}; retry later`); }
       if (o.once || stopping) break;
       await new Promise((r) => { wake = r; timer = setTimeout(r, o.intervalS * 1000); });
       wake = null; timer = null;
