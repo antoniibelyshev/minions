@@ -529,7 +529,8 @@ export async function runIntegrator(d: IntegratorDeps): Promise<IntegratorReport
       if (row.candidate_sha && main && await isAncestor(d.repo, row.candidate_sha, main)) {
         d.db.setMeta(INTEGRATION_BASE_META, row.candidate_sha);
         await settle(row, 'landed', `recovered: ${cfg0.git.baseBranch} already contains ${row.candidate_sha}`);
-        // The crash may have come before the landing's notice: queue it now (a no-op when it was queued).
+        // A landing queues its notice right after the fast-forward, before settle(); this covers a crash between the
+        // fast-forward and that notice (the dedup key makes it a no-op when the notice was already queued).
         const changed = row.base_sha ? await integrationChangedPaths(d.repo, row.base_sha, row.candidate_sha, [], d.signal ? { signal: d.signal } : {}) : null;
         integratedNotice(row.task_id, cfg0.git.baseBranch, row.candidate_sha, changed?.ok ? changed.changed : null, false);
         report.recovered.push({ id: row.id, taskId: row.task_id, outcome: 'landed', killed });
@@ -665,9 +666,11 @@ export async function runIntegrator(d: IntegratorDeps): Promise<IntegratorReport
       // Only a landed candidate is "merged, but flaky": a requeue or transient failure must not report it.
       if (flaky.length) event('integration-flaky', row, { candidate: C, commands: flaky.map((f) => f.command), detail: flaky.map((f) => f.detail.slice(0, 500)) });
       const flakyNote = flaky.length ? `; flaky: ${flaky.map((f) => `\`${f.command}\``).join(', ')} failed once and passed on the rerun` : '';
-      await settle(row, 'landed', `merged into ${branch} at ${C} (${l.method})${flakyNote}`, flaky.length ? { outcome: FLAKY_OUTCOME } : {});
+      // Event and notice before settle(): settle commits the row as `landed` and then runs the onSettled hook, and
+      // recovery skips landed rows, so a crash after settle() would lose a notice queued later.
       d.db.addEvent('integrated', row.task_id, { id: row.id, candidate: C, base: B, head: row.head_sha, paths: paths.changed.slice(0, 200), changedCount: paths.changed.length });
       integratedNotice(row.task_id, branch, C, paths.changed, flaky.length > 0);
+      await settle(row, 'landed', `merged into ${branch} at ${C} (${l.method})${flakyNote}`, flaky.length ? { outcome: FLAKY_OUTCOME } : {});
       return null;
     }
     if (l.state === 'moved') { requeue(row, 'base-moved', `${branch} moved from ${B} to ${l.current ?? '(none)'} before the landing`, true); return null; }

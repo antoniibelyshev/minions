@@ -85,7 +85,8 @@ describe('Decision 2: a failed verification command is rerun once', () => {
     // A repeated settle of the same row queues neither twice.
     await env.sched.settleIntegration(row);
     const keys = pending(env.db, { includeWaiting: true }).map((n) => n.key).filter((k) => /^(integrated|integration-flaky):/.test(k));
-    expect(keys).toEqual([`integration-flaky:task-1:${row.id}`, `integrated:task-1:${row.candidate_sha}`]);
+    // The integrated notice is queued before settle() (crash safety), so it comes before the settle hook's follow-up.
+    expect(keys).toEqual([`integrated:task-1:${row.candidate_sha}`, `integration-flaky:task-1:${row.id}`]);
     expect(notes.find((n) => n.key === `integrated:task-1:${row.candidate_sha}`)?.text)
       .toBe(`task-1 merged into main at ${row.candidate_sha}; 1 changed path: task-1.txt. A verification command passed only on its rerun (see the integration-flaky notice). ref: #task-1`);
   });

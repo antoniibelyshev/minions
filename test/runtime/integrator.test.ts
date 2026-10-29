@@ -105,6 +105,21 @@ describe('runIntegrator: landing and the verify runner', () => {
     expect(notes[1]!.text).not.toContain('src/f20.ts');
   });
 
+  it('the integrated notice and event are queued before the settle hook runs (a crash in the hook cannot lose them)', async () => {
+    const s = setup();
+    s.queue('task-1');
+    const seen: { phase: string; notice: boolean; events: number }[] = [];
+    s.deps.onSettled = (row) => {
+      seen.push({
+        phase: row.phase,
+        notice: pending(s.db, { includeWaiting: true }).some((n) => n.key === `integrated:task-1:${row.candidate_sha}`),
+        events: s.db.events('task-1', 'integrated').length,
+      });
+    };
+    await runIntegrator(s.deps);
+    expect(seen).toEqual([{ phase: 'landed', notice: true, events: 1 }]);
+  });
+
   it('a failing command is red: main stays at B and the log tail is the detail', async () => {
     const s = setup({ commands: ['true', 'echo boom-from-tests; exit 3'] });
     s.queue('task-1');
