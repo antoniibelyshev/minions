@@ -182,6 +182,25 @@ const stepText = (argv: string[]) => `minions ${argv.map(q).join(' ')}`;
 export const snapshotOf = (v: Pick<ChangeRequestView, 'id' | 'kind' | 'payload' | 'reason'>): RequestSnapshot =>
   ({ id: v.id, kind: v.kind, payload: v.payload, reason: v.reason });
 
+type UpgradeOpts = Parameters<ChangeRequestDeps['upgrade']>[1];
+
+/** The `minions upgrade ... --dry-run` command line a dry run with these options runs (the flags childUpgrade passes). */
+export const dryRunCommand = (o: UpgradeOpts): string => stepText(['upgrade',
+  ...(o.fromContainer === true ? ['--from-container'] : o.fromContainer ? ['--from-container', o.fromContainer] : []),
+  ...(o.syncOnly ? ['--sync-only'] : []), ...(o.rebuildCli ? ['--rebuild-cli'] : []), '--dry-run']);
+
+/**
+ * Why a dry run is not ok: the steps that would fail or stop the real run, with their (sanitised) detail. A failed
+ * step counts, and so does a planned step the real run would stop at (`would stop: ...`, `would refuse: ...`, or a
+ * CLI install it must not replace: `stop and print ...`), which the dry run reports as planned. Falls back to the
+ * run's summary when no step explains it (no result, an error envelope).
+ */
+export function dryRunFailure(dry: UpgradeRun): string {
+  const blocking = dry.steps.filter((s) => s.status === 'failed' || (s.status === 'planned' && /^would (stop|refuse)\b|\bstop and print\b/.test(s.detail)));
+  if (!blocking.length) return dry.summary;
+  return blocking.map((s) => `${displayText(s.status)}: ${displayText(s.id)} (${displayText(s.detail)})`).join('; ');
+}
+
 /**
  * The slow part of an upgrade plan: `minions upgrade --dry-run` as a child process (after the cheap delivery check).
  * Throws PRECONDITION when the dry run reports that the upgrade would fail. confirmOffer runs it before taking the
@@ -189,10 +208,11 @@ export const snapshotOf = (v: Pick<ChangeRequestView, 'id' | 'kind' | 'payload' 
  */
 export async function upgradeDryRun(project: ProjectJson, req: RequestSnapshot, deps: Pick<ChangeRequestDeps, 'upgrade'>): Promise<UpgradeRun> {
   if (req.kind === 'rebuild-cli') {
-    const dry = await deps.upgrade(project, { fromContainer: null, dryRun: true, rebuildCli: true });
+    const opts: UpgradeOpts = { fromContainer: null, dryRun: true, rebuildCli: true };
+    const dry = await deps.upgrade(project, opts);
     if (!dry.ok) {
-      throw new MinionsError('PRECONDITION', `Request ${req.id}: \`minions upgrade --rebuild-cli --dry-run\` reports that the upgrade would fail: ${dry.summary}`,
-        'Fix that first (run `minions upgrade --rebuild-cli --dry-run` for the details), then send /rebuild_cli again.');
+      throw new MinionsError('PRECONDITION', `Request ${req.id}: \`${dryRunCommand(opts)}\` reports that the upgrade would fail: ${dryRunFailure(dry)}`,
+        `Fix that first (run \`${dryRunCommand(opts)}\` on the host for the details), then send /rebuild_cli again.`);
     }
     const cli = dry.steps.find((x) => x.id === 'cli');
     if (!cli || cli.status !== 'planned') {
@@ -201,18 +221,21 @@ export async function upgradeDryRun(project: ProjectJson, req: RequestSnapshot, 
     return dry;
   }
   if (req.kind === 'sync') {
-    const dry = await deps.upgrade(project, { fromContainer: null, dryRun: true, syncOnly: true });
+    const opts: UpgradeOpts = { fromContainer: null, dryRun: true, syncOnly: true };
+    const dry = await deps.upgrade(project, opts);
     if (!dry.ok) {
-      throw new MinionsError('PRECONDITION', `Request ${req.id}: \`minions upgrade --sync-only --dry-run\` reports that the sync would be refused (nothing is ever forced, reset or stashed): ${dry.summary}`,
-        'Fix that on the host first (commit or stash yourself, or merge a divergence), then send /sync again.');
+      throw new MinionsError('PRECONDITION', `Request ${req.id}: \`${dryRunCommand(opts)}\` reports that the sync would be refused (nothing is ever forced, reset or stashed): ${dryRunFailure(dry)}`,
+        `Fix that on the host first (commit or stash yourself, or merge a divergence; \`${dryRunCommand(opts)}\` shows the details), then send /sync again.`);
     }
     return dry;
   }
   const fromContainer = fromContainerOf(req.payload);
   await assertUpgradeDelivery(project, req, fromContainer);
-  const dry = await deps.upgrade(project, { fromContainer, dryRun: true });
+  const opts: UpgradeOpts = { fromContainer, dryRun: true };
+  const dry = await deps.upgrade(project, opts);
   if (!dry.ok) {
-    throw new MinionsError('PRECONDITION', `Change request ${req.id}: \`minions upgrade --dry-run\` reports that the upgrade would fail: ${dry.summary}`, 'Fix that first (run `minions upgrade --dry-run` for the details), then apply again.');
+    throw new MinionsError('PRECONDITION', `Change request ${req.id}: \`${dryRunCommand(opts)}\` reports that the upgrade would fail: ${dryRunFailure(dry)}`,
+      `Fix that first (run \`${dryRunCommand(opts)}\` on the host for the details), then apply again.`);
   }
   return dry;
 }
