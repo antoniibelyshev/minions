@@ -1057,6 +1057,12 @@ export interface CoordinatorWrapperDeps extends RunCoordinatorDeps {
    * the CLI passes startRoutineClock (src/runtime/routine.ts), whose ticks run the pass as a bounded child process.
    */
   routineClock?: (log: (line: string) => void) => () => void;
+  /**
+   * The session supervisor watch (docs/design/coordinator-sessions.md decision 7): started next to the routine clock
+   * and stopped when the wrapper ends (the supervisor itself keeps running: it is detached). The CLI passes
+   * startSupervisorWatch (src/runtime/supervisor.ts), which does nothing at all with coordinator.sessions.enabled off.
+   */
+  supervisorWatch?: (cfg: MinionsConfig, log: (line: string) => void) => () => void;
 }
 
 /**
@@ -1073,6 +1079,7 @@ export async function coordinatorWrapper(loadConfig: () => Promise<MinionsConfig
   let held: CoordinatorLock | undefined;
   let guard: PreSpawnGuard | undefined;
   let stopClock: (() => void) | undefined;
+  let stopWatch: (() => void) | undefined;
   const store = (): CoordinatorLockStore => deps.lock ?? (db ??= openDb(paths.db));
   let code: number;
   try {
@@ -1104,6 +1111,9 @@ export async function coordinatorWrapper(loadConfig: () => Promise<MinionsConfig
       if (deps.routineClock) {
         try { stopClock = deps.routineClock(log); } catch (e) { log(`minions: the routine clock did not start: ${redact((e as Error).message).slice(0, 300)}`); }
       }
+      if (deps.supervisorWatch) {
+        try { stopWatch = deps.supervisorWatch(cfg, log); } catch (e) { log(`minions: the session supervisor watch did not start: ${redact((e as Error).message).slice(0, 300)}`); }
+      }
       return runCoordinator(cfg, { ...deps, preSpawn: g });
     })();
     // Errors still reach us through the race; after a pre-spawn signal a late one no longer matters.
@@ -1115,6 +1125,7 @@ export async function coordinatorWrapper(loadConfig: () => Promise<MinionsConfig
     throw e;
   } finally {
     try { stopClock?.(); } catch { /* best effort */ }
+    try { stopWatch?.(); } catch { /* best effort */ }
     guard?.dispose();
     if (held) { try { store().releaseCoordinatorLock(held.session, held.pid); } catch { /* a dead holder is taken over next time */ } }
     db?.close();

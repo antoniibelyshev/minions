@@ -5,6 +5,7 @@
 // so no member is left behind before post-exit starts (the wrapper additionally reaps setsid escapees as a
 // subreaper; D4 "Process lifetime").
 import { spawn } from 'node:child_process';
+import type { Writable } from 'node:stream';
 
 export type StopReason = 'timeout' | 'cancel' | 'drain' | 'lease-ended';
 
@@ -24,11 +25,16 @@ export interface SuperviseTiming {
 export const INTERRUPT_GRACE_MS = 5_000;
 export const DEFAULT_TIMING: Omit<SuperviseTiming, 'timeoutMs'> = { pollMs: 5_000, killGraceMs: 15_000, drainGraceMs: 120_000 };
 
-export interface SpawnSpec { argv: string[]; cwd: string; env: Record<string, string>; stdin: string | null }
+/**
+ * stdin: a string is written and stdin closed; null closes it at once; 'open' keeps it open for the caller (a resident
+ * coordinator session takes its inbox messages there, docs/design/coordinator-sessions.md decision 6), which gets the
+ * stream in onSpawn and ends it itself.
+ */
+export interface SpawnSpec { argv: string[]; cwd: string; env: Record<string, string>; stdin: string | null | 'open' }
 
 export interface SuperviseHooks {
-  /** Called once the process exists (pid = pgid). */
-  onSpawn(pid: number): Promise<void> | void;
+  /** Called once the process exists (pid = pgid); `stdin` is the open stream with SpawnSpec.stdin 'open', else null. */
+  onSpawn(pid: number, stdin: Writable | null): Promise<void> | void;
   /** One stdout line. */
   onLine(line: string): void;
   /** Polled: why the worker must stop now, or 'drain' to start the grace; null = keep running. */
@@ -90,7 +96,8 @@ export function supervise(spec: SpawnSpec, timing: SuperviseTiming, hooks: Super
     });
     child.stderr.setEncoding('utf8').on('data', (d: string) => { stderr = (stderr + d).slice(-STDERR_TAIL * 2); });
     child.stdin.on('error', () => undefined);
-    if (spec.stdin !== null) child.stdin.end(spec.stdin); else child.stdin.end();
+    // 'open': the caller writes and ends it (onSpawn).
+    if (spec.stdin !== 'open') { if (spec.stdin !== null) child.stdin.end(spec.stdin); else child.stdin.end(); }
     let spawnError: string | null = null;
     const finish = (code: number | null, signal: string | null) => {
       clearTimeout(deadline); clearInterval(ticker); clearTimeout(termTimer); clearTimeout(killTimer); clearTimeout(drainTimer);
@@ -108,6 +115,6 @@ export function supervise(spec: SpawnSpec, timing: SuperviseTiming, hooks: Super
       closeTimer = setTimeout(() => { child.stdout.destroy(); child.stderr.destroy(); once(code, signal); }, timing.killGraceMs);
     });
     child.on('close', (code, signal) => once(code, signal));
-    if (pid !== undefined) Promise.resolve(hooks.onSpawn(pid)).catch(() => stop('cancel'));
+    if (pid !== undefined) Promise.resolve(hooks.onSpawn(pid, spec.stdin === 'open' ? child.stdin : null)).catch(() => stop('cancel'));
   });
 }

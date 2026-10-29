@@ -150,7 +150,7 @@ describe('CLI surface (docs/design/cli-surface.md)', () => {
 
   it('hidden commands reach their action handlers (not commander\'s unknown-command error)', async () => {
     // Runtime-only commands run on the host fail closed inside their action with INCOMPATIBLE_RUNTIME.
-    for (const args of [['workspace', 'setup'], ['work', 'list'], ['work', 'run', 'lease-x'], ['backlog', 'ready']]) {
+    for (const args of [['workspace', 'setup'], ['work', 'list'], ['work', 'run', 'lease-x'], ['backlog', 'ready'], ['coordinator', 'supervise']]) {
       const { out, code } = await run([...args, '--json']);
       expect(code, args.join(' ')).toBe(6);
       expect(JSON.parse(out).error.code).toBe('INCOMPATIBLE_RUNTIME');
