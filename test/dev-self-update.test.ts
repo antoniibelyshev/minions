@@ -86,7 +86,9 @@ function setup(): Fx {
     'case "$*" in',
     '  *" ps --status running -q app"*) [ -f "$FAKE/running" ] && echo c0ffee; exit 0 ;;',
     '  *"exec -T app minions status --json"*) cat "$FAKE/status.json" ;;',
-    '  *"exec -T app minions settings requests mark"*) echo \'{"ok":true,"data":{}}\' ;;',
+    // $FAKE/mark-fail: the runtime refuses every mark except --status confirmed (an error that is not "not running").
+    '  *"exec -T app minions settings requests mark"*" --status confirmed "*) echo \'{"ok":true,"data":{}}\' ;;',
+    '  *"exec -T app minions settings requests mark"*) [ -f "$FAKE/mark-fail" ] && { echo \'{"ok":false,"error":{"code":"INTERNAL","message":"state store is locked"}}\'; exit 1; }; echo \'{"ok":true,"data":{}}\' ;;',
     '  *"exec -T app minions notify enqueue"*) cat > "$FAKE/notice.txt"; echo \'{"ok":true,"data":{"created":true}}\' ;;',
     '  "image inspect --format {{.Id}} minions-runtime:0.1.0") echo sha256:0ldimage ;;',
     '  "tag minions-runtime:0.1.0 minions-runtime:0.1.0-prev") ;;',
@@ -465,6 +467,79 @@ describe('self-update apply: failure paths and isolation', () => {
     expect(marks()[1]).toMatch(/the script stopped while handling this request/);
     expect(readState().current).toBeNull();
     expect(minionsLog().match(/upgrade --sync-only/g)).toHaveLength(1);
+  });
+
+  it('a long commit range keeps the owner notice under the outbox limit (4000) and points to the log', () => {
+    // 60 commits with long subjects, each touching a sensitive path: uncapped, this is well over 4000 characters.
+    setSync('i=0; while [ $i -lt 60 ]; do i=$((i+1)); mkdir -p .github/workflows; echo $i > .github/workflows/w$i-with-a-rather-long-workflow-file-name.yml; git add -A; git commit -qm "merge branch agent/task-$i-a-fairly-long-task-title-that-fills-the-subject-line"; done');
+    setRequests([request('cr_aaaaaaaa')]);
+    const r = runScript('--once');
+    expect(r.code, r.err).toBe(0);
+    expect(statuses()).toEqual(['confirmed', 'applied']);
+    const notice = readFileSync(join(fx.fake, 'notice.txt'), 'utf8');
+    expect(notice.length).toBeLessThanOrEqual(4000);
+    expect(notice).toMatch(/^Self-update applied/);
+    expect(notice).toMatch(/Commits \(50\+\):/);
+    expect(notice).toMatch(/\.\.\. \d+\+ more, see the log/);
+    expect(notice).toMatch(/Sensitive paths touched: .* and \d+ more\./);
+    expect(notice).toContain(`Log: ${join(stateDir(), 'log.jsonl')}`);
+    expect(events().find((e) => e.event === 'notice')).toMatchObject({ ok: true });
+  });
+
+  it('an npm ci failure in the gate fails the request but does not record the SHA as bad', () => {
+    setRequests([request('cr_aaaaaaaa')]);
+    writeFileSync(join(fx.fake, 'gate-fail'), 'ci');
+    const r = runScript('--once');
+    expect(r.code, r.err).toBe(0);
+    expect(npmLog()).not.toMatch(/^(run typecheck|test) \|/m);
+    expect(minionsLog()).not.toMatch(/--rebuild-cli/);
+    expect(statuses()).toEqual(['confirmed', 'failed']);
+    expect(marks()[1]).toMatch(/npm ci failed .*is not recorded as bad/);
+    expect(readState()).toMatchObject({ current: null, badShas: [] });
+    gateWorktreesGone();
+  });
+
+  it('a mark the runtime refuses stays pending and is retried on later polls, taking no new request meanwhile', () => {
+    setRequests([request('cr_aaaaaaaa')]);
+    writeFileSync(join(fx.fake, 'mark-fail'), '');
+    let r = runScript('--once');
+    expect(r.code, r.err).toBe(0);
+    type Pending = { id: string; outcome: { status: string; marked: boolean; markAttempts: number } };
+    expect((readState().current as Pending).outcome).toMatchObject({ status: 'applied', marked: false, markAttempts: 1 });
+    expect(dockerLog()).not.toMatch(/notify enqueue/);
+
+    setRequests([request('cr_bbbbbbbb', { createdAt: '2026-10-29T11:00:00.000Z' })]);
+    r = runScript('--once');
+    expect(r.code, r.err).toBe(0);
+    expect((readState().current as Pending).outcome.markAttempts).toBe(2);
+    expect(dockerLog()).not.toMatch(/requests mark cr_bbbbbbbb/);
+    expect(minionsLog().match(/upgrade --sync-only/g)).toHaveLength(1);
+
+    // The runtime recovers: the next poll marks it and sends the notice.
+    rmSync(join(fx.fake, 'mark-fail'));
+    setRequests([]);
+    r = runScript('--once');
+    expect(r.code, r.err).toBe(0);
+    expect(statuses()).toEqual(['confirmed', 'applied', 'applied', 'applied']);
+    expect(events().find((e) => e.event === 'marked')).toMatchObject({ ok: true });
+    expect(readFileSync(join(fx.fake, 'notice.txt'), 'utf8')).toContain('Self-update applied');
+    expect(readState().current).toBeNull();
+  });
+
+  it('a mark refused 3 times is given up with a clear log line, and the notice still goes out', () => {
+    setRequests([request('cr_aaaaaaaa')]);
+    writeFileSync(join(fx.fake, 'mark-fail'), '');
+    runScript('--once');
+    setRequests([]);
+    runScript('--once');
+    const r = runScript('--once');
+    expect(r.code, r.err).toBe(0);
+    expect(r.out).toMatch(/NOT marked applied after 3 attempts .*mark it by hand/);
+    expect(statuses()).toEqual(['confirmed', 'applied', 'applied', 'applied']);
+    expect(events().filter((e) => e.event === 'mark-failed')).toHaveLength(2);
+    expect(events().find((e) => e.event === 'marked')).toMatchObject({ ok: false, gaveUp: true, message: 'state store is locked' });
+    expect(readFileSync(join(fx.fake, 'notice.txt'), 'utf8')).toContain('Self-update applied');
+    expect(readState().current).toBeNull();
   });
 
   it('--dry-run leaves a pending outcome untouched (nothing is marked or notified)', () => {

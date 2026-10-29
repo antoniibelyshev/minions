@@ -59,7 +59,7 @@ function run(cmd, args, opts = {}) {
     const child = execFile(cmd, args, { cwd: opts.cwd, env: opts.env ?? process.env, timeout: opts.timeoutMs ?? 120_000, maxBuffer: 64 * 1024 * 1024, encoding: 'utf8' }, (err, stdout, stderr) => {
       children.delete(child);
       const code = err ? (typeof err.code === 'number' ? err.code : 127) : 0;
-      res({ code, stdout: stdout ?? '', stderr: stderr || (err && typeof err.code !== 'number' ? String(err.message) : '') });
+      res({ code, timedOut: Boolean(err?.killed), stdout: stdout ?? '', stderr: stderr || (err && typeof err.code !== 'number' ? String(err.message) : '') });
     });
     children.add(child);
     child.stdin?.on('error', () => { /* the child may exit before reading */ });
@@ -375,10 +375,14 @@ async function runGate(ctx, sha, step) {
     if (!add.ok) return add;
     mkdirSync(home, { recursive: true, mode: 0o700 });
     const env = gateEnv(home);
-    for (const [id, args, timeoutMs] of [['gate-ci', ['ci'], TIMEOUTS.ci], ['gate-typecheck', ['run', 'typecheck'], TIMEOUTS.typecheck], ['gate-test', ['test'], TIMEOUTS.test]]) {
+    // Only a typecheck or test failure (not a timeout) says the commit is bad. A failed `git worktree add` or
+    // `npm ci` (network, registry) or a timeout can be transient: the request fails, and a new request tries again.
+    for (const [id, args, timeoutMs, judges] of [['gate-ci', ['ci'], TIMEOUTS.ci, false], ['gate-typecheck', ['run', 'typecheck'], TIMEOUTS.typecheck, true], ['gate-test', ['test'], TIMEOUTS.test, true]]) {
       const r = await step(id, async () => {
         const x = await run('npm', args, { cwd: dir, env, timeoutMs });
-        return x.code === 0 ? { ok: true, detail: `npm ${args.join(' ')} passed` } : { ok: false, detail: `npm ${args.join(' ')} failed (exit ${x.code}): ${tail(x)}` };
+        if (x.code === 0) return { ok: true, detail: `npm ${args.join(' ')} passed` };
+        if (x.timedOut) return { ok: false, detail: `npm ${args.join(' ')} timed out after ${Math.round(timeoutMs / MIN)} min: ${tail(x)}` };
+        return { ok: false, bad: judges, detail: `npm ${args.join(' ')} failed (exit ${x.code}): ${tail(x)}` };
       });
       if (!r.ok) return r;
     }
@@ -412,15 +416,38 @@ async function healthCheck(_ctx, _apply) {
   return { checked: false, healthy: true, detail: 'not checked (the health check and rollback are phase 3)' };
 }
 
-function noticeText(apply, files) {
-  const lines = [apply.outcome === 'applied'
+/** The outbox rejects longer texts (MAX_TEXT_LENGTH 4000 in src/runtime/outbox.ts); the notice stays below it. */
+export const NOTICE_MAX = 3500;
+const SENSITIVE_IN_NOTICE = 20;
+
+/**
+ * The owner notice, at most NOTICE_MAX characters: the commit list is cut to fit ("N more, see the log"), the
+ * sensitive list is capped, and as a last resort the whole text is cut.
+ */
+export function noticeText(apply, files) {
+  const head = [apply.outcome === 'applied'
     ? `Self-update applied: ${apply.base} ${short(apply.from)}..${short(apply.to)} (request ${apply.request}).`
     : `Self-update failed (request ${apply.request}): ${clean(apply.detail, 600)}`];
-  if (apply.range.length) lines.push(`Commits (${apply.range.length}${apply.rangeTruncated ? '+' : ''}):`, ...apply.range.map((l) => `  ${clean(l, 120)}`));
-  if (apply.to) lines.push(`Sensitive paths touched: ${apply.sensitive.length ? apply.sensitive.map((s) => clean(s, 120)).join(', ') : 'none'}.`);
-  if (apply.scriptChanged) lines.push('The self-update script changed (scripts/dev/); restart it to use the new version.');
-  lines.push(`Log: ${files.log}`);
-  return lines.join('\n') + '\n';
+  const foot = [];
+  if (apply.to) {
+    const shown = apply.sensitive.slice(0, SENSITIVE_IN_NOTICE).map((s) => clean(s, 120));
+    const more = apply.sensitive.length - shown.length;
+    foot.push(`Sensitive paths touched: ${shown.length ? `${shown.join(', ')}${more > 0 ? ` and ${more} more` : ''}` : 'none'}.`);
+  }
+  if (apply.scriptChanged) foot.push('The self-update script changed (scripts/dev/); restart it to use the new version.');
+  foot.push(`Log: ${files.log}`);
+  const commits = apply.range.map((l) => `  ${clean(l, 120)}`);
+  const plus = apply.rangeTruncated ? '+' : '';
+  const build = (n) => {
+    if (!commits.length) return [...head, ...foot].join('\n') + '\n';
+    const rest = commits.length - n;
+    const more = rest > 0 ? [`  ... ${rest}${plus} more, see the log`] : apply.rangeTruncated ? ['  ... and more, see the log'] : [];
+    return [...head, `Commits (${commits.length}${plus}):`, ...commits.slice(0, n), ...more, ...foot].join('\n') + '\n';
+  };
+  let n = commits.length;
+  let text = build(n);
+  while (n > 0 && text.length > NOTICE_MAX) text = build(--n);
+  return text.length > NOTICE_MAX ? `${text.slice(0, NOTICE_MAX - 30)}\n... (cut, see the log)\n` : text;
 }
 
 /**
@@ -439,7 +466,14 @@ async function finishApply(ctx, apply, status, detail, o = {}) {
   return flushOutcome(ctx);
 }
 
-/** Marks and notifies a pending outcome. 'not-running': retried on the next poll. */
+/** How many polls try to mark an outcome the runtime refuses (an error other than "not running") before giving up. */
+const MARK_ATTEMPTS = 3;
+
+/**
+ * Marks and notifies a pending outcome. 'not-running': retried on the next poll. 'retry': the runtime refused the
+ * mark; the outcome stays pending and the next poll tries again, MARK_ATTEMPTS times in all. Then it is logged as
+ * not marked (the request stays confirmed: mark it by hand) and the notice still goes out.
+ */
 async function flushOutcome(ctx) {
   const p = ctx.facts.project;
   const st = readState(ctx.files.state);
@@ -448,9 +482,18 @@ async function flushOutcome(ctx) {
   if (!cur.outcome.marked) {
     const m = await markRequest(p, cur.id, cur.outcome.status, cur.outcome.detail);
     if (m.state === 'not-running') { ctx.say(`request ${cur.id}: runtime not running: it is marked ${cur.outcome.status} on a later poll`); return 'not-running'; }
-    if (m.state === 'error') ctx.say(`request ${cur.id}: could not be marked ${cur.outcome.status}: ${m.message}`);
+    if (m.state === 'error') {
+      const attempts = (cur.outcome.markAttempts ?? 0) + 1;
+      if (attempts < MARK_ATTEMPTS) {
+        ctx.say(`request ${cur.id}: could not be marked ${cur.outcome.status} (attempt ${attempts} of ${MARK_ATTEMPTS}): ${m.message}; retried on the next poll`);
+        writeState(ctx.files.state, { ...st, current: { ...cur, outcome: { ...cur.outcome, markAttempts: attempts } } });
+        logEvent(ctx.files.log, { event: 'mark-failed', request: cur.id, status: cur.outcome.status, attempt: attempts, message: m.message });
+        return 'retry';
+      }
+      ctx.say(`request ${cur.id}: NOT marked ${cur.outcome.status} after ${attempts} attempts (${m.message}); it stays confirmed in the runtime: mark it by hand (minions settings requests mark ${cur.id} --status ${cur.outcome.status})`);
+    }
     writeState(ctx.files.state, { ...st, current: { ...cur, outcome: { ...cur.outcome, marked: true } } });
-    logEvent(ctx.files.log, { event: 'marked', request: cur.id, status: cur.outcome.status, ok: m.state === 'ok' });
+    logEvent(ctx.files.log, { event: 'marked', request: cur.id, status: cur.outcome.status, ok: m.state === 'ok', ...(m.state === 'ok' ? {} : { gaveUp: true, message: m.message }) });
   }
   if (cur.outcome.notice) {
     const n = await enqueueNotice(p, cur.outcome.notice.key, cur.outcome.notice.text);
@@ -495,7 +538,10 @@ async function applyRequest(ctx, req) {
 
   // 2. Host gate on the exact synced commit (container evidence is not trusted for this).
   const gate = await runGate(ctx, to, step);
-  if (!gate.ok) return finishApply(ctx, apply, 'failed', `self-update: the host gate failed at ${short(to)} (${gate.detail}); nothing was built; ${short(to)} is recorded as bad`, { bad: true });
+  if (!gate.ok) {
+    const verdict = gate.bad ? `${short(to)} is recorded as bad` : `${short(to)} is not recorded as bad (not a typecheck or test failure; a new request tries it again)`;
+    return finishApply(ctx, apply, 'failed', `self-update: the host gate failed at ${short(to)} (${gate.detail}); nothing was built; ${verdict}`, { bad: gate.bad === true });
+  }
 
   // 3. Keep the previous image for the rollback.
   const tag = await step('previous-image', () => tagPrevious(p));
@@ -529,6 +575,7 @@ async function pollOnce(ctx) {
       // An outcome that could not be marked or notified yet (the runtime was down): finish it first.
       const f = await flushOutcome(ctx);
       if (f === 'not-running') return 'not-running';
+      if (f === 'retry') return 'error';
     } else if (st.current && st.current.runId !== ctx.runId) {
       const m = await markRequest(p, st.current.id, 'failed', INTERRUPTED_DETAIL);
       if (m.state === 'not-running') { say('runtime not running: retry later (an interrupted request is still to be marked failed)'); return 'not-running'; }
