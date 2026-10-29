@@ -20,6 +20,7 @@ import type { BuiltinLeaseRole, Lease, LeaseRole, PublicationState, RuntimeDb } 
 import { removeLeaseFiles, type HandoffPaths } from './handoff.js';
 import { corruptRecordHint, hasOpenRun, readRunRecord, removeRunRecord } from './runner/record.js';
 import { RESET_PENDING_HINT, resetBarrier, resetPendingError, type ContextResetCheck } from './context-reset.js';
+import { sessionScope } from './session-scope.js';
 import { missingApprovalKeyReason, runtimePaths } from './paths.js';
 import { ORIGIN_REPOSITORY_META, publishTask, realGh, serverOriginOf, type GhFn, type PublishInput, type PublishOutcome } from './publish.js';
 import type { ServerOrigin, ServerUrlFn } from './base-update.js';
@@ -812,6 +813,10 @@ export class Scheduler {
       const known = typeof role === 'string' ? exactWorkerRole(cfg, role) : undefined;
       if (!known) throw new MinionsError('INVALID_CONFIG', `Unknown role "${String(role).slice(0, 40)}" (${workerRoleNames(cfg).join('|')}).`);
     }
+    // A coordinator session (MINIONS_SESSION, phase 6; a malformed value is refused here) claims only its own
+    // task's stages; the router and the general session never claim (decisions 3 and 4).
+    const scope = sessionScope();
+    if (scope && scope.kind !== 'task') throw new MinionsError('POLICY_DENIED', `The ${scope.key} session never claims stages.`, 'Task stages are claimed by their task session (`task:<id>`).');
     this.assertStartsAllowed();
     // The reset barrier holds new starts only; records and releases of running workers go on (task-57.6).
     const barrier = this.resetHeld();
@@ -823,6 +828,9 @@ export class Scheduler {
     if (startEffect === 'deny') throw new MinionsError('POLICY_DENIED', `task.start is denied for role ${role} by configuration.`);
 
     const current = await this.backlog.getTask(taskId);
+    if (scope && current.id !== scope.taskId) {
+      throw new MinionsError('POLICY_DENIED', `Session ${scope.key} cannot claim ${current.id}: a task session claims only its own task's stages.`, `Claim ${scope.taskId} only; other tasks have their own sessions.`);
+    }
     // An active lease is a CONFLICT regardless of status (the claim itself moved the status on);
     // re-checked inside the transaction below.
     const held = this.db.activeLeases().find((l) => l.task_id === current.id);
@@ -876,7 +884,8 @@ export class Scheduler {
     const sweepBase = sweep ? await resolveBaseBranch(this.layout.repo, cfg.git.baseBranch) : null;
     const { branch, slug } = sweepBase ? { branch: sweepBase.branch, slug: `qa-${taskSlug(task.id, task.title)}` } : this.branchForTask(task);
     const leaseId = newLeaseId();
-    const holder = opts.holder ?? `pid:${process.pid}`;
+    // In a coordinator session (MINIONS_SESSION, phase 6) the lease belongs to the session: its key is the holder.
+    const holder = opts.holder ?? scope?.key ?? `pid:${process.pid}`;
 
     const attempt = this.db.transaction(() => {
       const active = this.db.activeLeases();

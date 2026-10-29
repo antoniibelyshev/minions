@@ -15,6 +15,8 @@ import { capacityOf, scopeOf } from './scheduler.js';
 import { currentBudget } from './spend.js';
 import { noteTranscript, resetBarrier } from './context-reset.js';
 import { trackCoordinatorUsage } from './coordinator-usage.js';
+import { hookScope } from './session-scope.js';
+import { sessionStopGuard } from './session-stop.js';
 import { scanShell, ShellParseError, type ShellScan } from './shell-scan.js';
 import { bashStateReference, protectedStatePath, stateGuard, type StateGuard } from './state-guard.js';
 
@@ -67,17 +69,22 @@ const block = (reason: string): HookOutput => ({ stdout: JSON.stringify({ decisi
 
 /**
  * Stop guard: blocks only when authorized runnable work and capacity exist and state has progressed;
- * otherwise allows stopping. Any internal failure allows stopping.
+ * otherwise allows stopping. Any internal failure allows stopping. In a coordinator session (MINIONS_SESSION, phase 6)
+ * the transcript and usage are recorded for that session and the decision is sessionStopGuard's; a malformed value
+ * allows the stop and records nothing.
  */
-export async function stopHook(input: unknown, load: HookLoader): Promise<HookOutput> {
+export async function stopHook(input: unknown, load: HookLoader, env: NodeJS.ProcessEnv = process.env): Promise<HookOutput> {
   const inp = isObj(input) ? input : {};
+  const session = hookScope(env);
+  if (session.invalid) return { reason: 'allow: MINIONS_SESSION is not a session key (nothing recorded)' };
   let deps: HookDeps;
   try { deps = await load(); } catch (e) { return { reason: `allow: state unavailable (${(e as Error).message})` }; }
   const { db, backlog, config } = deps;
   // Context-reset trigger input (task-45): the main session's transcript, for its latest usage. Never affects the decision.
-  try { noteTranscript(db, inp); } catch { /* best-effort */ }
+  try { noteTranscript(db, inp, new Date(), session.scope); } catch { /* best-effort */ }
   // Coordinator token tracking (task-57.1): this turn's main-session usage from the transcript. Bounded, never throws, never affects the decision.
-  try { trackCoordinatorUsage({ db, config }, inp); } catch { /* best-effort */ }
+  try { trackCoordinatorUsage({ db, config, env }, inp); } catch { /* best-effort */ }
+  if (session.scope) return sessionStopGuard(deps, session.scope, backgroundRunning(inp));
   const allow = (reason: string, detail = reason): HookOutput => {
     try { db.setGuard({ fingerprint: null, count: 0, last_reason: reason }); } catch { /* ignore */ }
     return { reason: `allow: ${detail}` };
@@ -86,7 +93,7 @@ export async function stopHook(input: unknown, load: HookLoader): Promise<HookOu
     if (db.paused().starts) return allow('paused');
     if (currentBudget({ db, config })?.exhausted) return allow('budget', 'the owner budget is used up (new claims are refused)');
     // The reset barrier (task-57.6): new starts are held until the running workers return, so nothing is left to dispatch.
-    const barrier = resetBarrier({ db, config });
+    const barrier = resetBarrier({ db, config, session: null });
     if (barrier) return allow('context-reset-pending', barrier.reason);
     if (backgroundRunning(inp)) return allow('background-running', 'a background subagent is still running');
     const leases = db.activeLeases();

@@ -46,6 +46,7 @@ import { completeOpenSessions, noteResetRequest } from './coordinator-usage.js';
 import { budgetNotice, humanBaseline, humanSpend, parseTokens, recordLeaseUsage, recordSessionUsage, setBudget, spendReport, type SpendReport } from './spend.js';
 import { runtimePaths } from './paths.js';
 import { contextResetCheck, HANDOFF_MAX_BYTES, humanContextReset, readHandoff, TRANSCRIPT_META, withContextReset, writeHandoff, type ContextResetCheck } from './context-reset.js';
+import { handoffPathFor, sessionScope } from './session-scope.js';
 export { withContextReset } from './context-reset.js';
 import { capacityOf, Scheduler, type NextReport, type NextStage, type RoleCapacity, type UsageFlag } from './scheduler.js';
 import { gitCredential } from './github.js';
@@ -586,9 +587,10 @@ export function register(program: Command): void {
     .option('--correction', 'the single allowed correction after an invalid result')
     .option('--usage <tokens>', USAGE_HELP)
     .option('--model <name>', 'model the worker ran on (for the USD estimate with API-key billing)')
-    .action(action(async (leaseId: string, o: { correction?: boolean; usage?: string; model?: string }, cmd: Command) => {
+    .option('--task <id>', 'only this task: the lease must be one of its stages, and only its next stage is claimed (the default in a task session)')
+    .action(action(async (leaseId: string, o: { correction?: boolean; usage?: string; model?: string; task?: string }, cmd: Command) => {
       requireMode('runtime');
-      const opts = { correction: !!o.correction, usage: usageFlag(o) };
+      const opts = { correction: !!o.correction, usage: usageFlag(o), ...(o.task !== undefined ? { task: o.task } : {}) };
       const r = await advanceLease(await scheduler(), runtimePaths(), leaseId, opts, { db: getDb(), config: await getConfig(), state: runtimePaths().state });
       emit(r, { json: globalOpts(cmd).json, human: humanAdvance });
     }));
@@ -879,8 +881,11 @@ export function register(program: Command): void {
       if (o.read && o.check) throw new MinionsError('PRECONDITION', 'Use --read or --check, not both.');
       const paths = runtimePaths();
       const json = globalOpts(cmd).json;
+      // A coordinator session (MINIONS_SESSION; a malformed value is refused) keeps its own handoff (phase 6).
+      const scope = sessionScope();
+      const handoffPath = handoffPathFor(paths.state, scope, paths.coordinatorHandoff);
       if (o.read) {
-        const h = readHandoff(paths.coordinatorHandoff);
+        const h = readHandoff(handoffPath);
         emit(h, { json, human: (d: typeof h) => (d.present ? `handoff written ${d.writtenAt} (${d.ageMinutes} min ago, ${d.bytes} bytes):\n${d.text}` : 'no handoff stored') });
         return;
       }
@@ -890,7 +895,7 @@ export function register(program: Command): void {
         return;
       }
       const raw = await readInput(undefined, 'the handoff text', 'Pipe the note in with a quoted heredoc; --read prints the stored one, --check reports whether a reset is due.');
-      const r = await writeHandoff({ db: getDb(), path: paths.coordinatorHandoff }, raw);
+      const r = await writeHandoff({ db: getDb(), path: handoffPath, scope }, raw);
       emit(r, { json, human: (d: typeof r) => `handoff stored (${d.bytes}/${d.maxBytes} bytes${d.redactions ? `, ${d.redactions} secret(s) redacted` : ''}${d.replaced ? ', replaced the previous one' : ''})` });
     }));
 
