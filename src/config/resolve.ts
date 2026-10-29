@@ -51,6 +51,7 @@ function crossFieldIssues(c: MinionsConfig): ConfigIssue[] {
   if (c.delivery.mode !== 'local' && c.delivery.provider !== 'github') issues.push({ path: 'delivery.provider', message: `delivery.mode "${c.delivery.mode}" publishes to GitHub and needs delivery.provider "github" (got "${c.delivery.provider}")` });
   if (!c.models.allowed.includes(c.models.default)) issues.push({ path: 'models.default', message: `"${c.models.default}" is not in models.allowed [${c.models.allowed.join(', ')}]` });
   if (c.models.coordinator !== undefined && !c.models.allowed.includes(c.models.coordinator)) issues.push({ path: 'models.coordinator', message: `"${c.models.coordinator}" is not in models.allowed [${c.models.allowed.join(', ')}]` });
+  if (c.models.router !== undefined && !c.models.allowed.includes(c.models.router)) issues.push({ path: 'models.router', message: `"${c.models.router}" is not in models.allowed [${c.models.allowed.join(', ')}]` });
   if (c.container.mountDockerSocket) issues.push({ path: 'container.mountDockerSocket', message: 'must be false: the Docker socket grants host control' });
   if (c.container.mountHostRepository) issues.push({ path: 'container.mountHostRepository', message: 'must be false: the workspace lives in a named volume' });
   // roles, role references in capability sub-rules, execution.maxByRole / maxEngineers (incl. <= maxActiveTasks).
