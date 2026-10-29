@@ -16,6 +16,7 @@ import { reapRun, runLease, type RunnerDeps } from '../../src/runtime/runner/run
 import type { SuperviseTiming } from '../../src/runtime/runner/supervise.js';
 import { Scheduler, type TaskBrief } from '../../src/runtime/scheduler.js';
 import { commitFile, gitSync, makeDefaultEnv, result, type Env } from './fixtures.js';
+import { HAS_PROCFS } from '../helpers.js';
 
 const SCRIPT = resolve(__dirname, '..', 'fixtures', 'fake-harness.mjs');
 const CODEX = { models: { default: 'gpt-6.1-sol', allowed: ['gpt-6.1-sol'] }, timeoutMinutes: 5 };
@@ -77,7 +78,7 @@ async function running(r: Rig, b: TaskBrief, steps: unknown[]) {
   throw new Error('the run never started');
 }
 
-describe('work run: producer happy path', () => {
+describe.skipIf(!HAS_PROCFS)('work run: producer happy path', () => {
   it('runs the fake harness in a private clone, fast-forwards the lease branch, submits by proxy and records usage', async () => {
     const r = rig();
     const b = await claim(r);
@@ -139,7 +140,7 @@ describe('work run: producer happy path', () => {
 });
 
 describe('work run: launch gate', () => {
-  it('refuses a worker caller, a Claude lease, a missing adapter, a second run and a sandbox that is not ok', async () => {
+  it.skipIf(!HAS_PROCFS)('refuses a worker caller, a Claude lease, a missing adapter, a second run and a sandbox that is not ok', async () => {
     const r = rig();
     const b = await claim(r);
     expect((await err(runLease(b.leaseId, r.deps({}, { callerEnv: { MINIONS_WORKER_LEASE: 'lease-x' } })))).code).toBe('POLICY_DENIED');
@@ -170,7 +171,7 @@ describe('work run: launch gate', () => {
     expect((await err(runLease(b.leaseId, r.deps({ steps: [] })))).message).toMatch(/runs on Claude Code/);
   });
 
-  it('capacity excludes the lease itself: a full role still runs its own lease; a lowered limit refuses it', async () => {
+  it.skipIf(!HAS_PROCFS)('capacity excludes the lease itself: a full role still runs its own lease; a lowered limit refuses it', async () => {
     const r = rig((c) => { c.execution.maxByRole = { engineer: 1 }; c.execution.maxActiveTasks = 1; });
     const b = await claim(r);
     const own = await runLease(b.leaseId, r.deps({ steps: [{ op: 'result' }] }));
@@ -187,7 +188,7 @@ describe('work run: launch gate', () => {
     expect(e.message).toMatch(/limit reached without this lease \(1\/1\)/);
   });
 
-  it('the phase 1 producer cap counts only the other leases', async () => {
+  it.skipIf(!HAS_PROCFS)('the phase 1 producer cap counts only the other leases', async () => {
     const r = rig();
     const b = await claim(r);
     expect(await runLease(b.leaseId, r.deps({ steps: [{ op: 'result' }] }))).toMatchObject({ submitted: true });
@@ -216,7 +217,7 @@ describe('work run: launch gate', () => {
 });
 
 // Real subprocesses (git, the node fake harness, its children) with second-scale timings: a limit above the default 5 s.
-describe('work run: supervise, cancel, timeout, drain', { timeout: 30_000 }, () => {
+describe.skipIf(!HAS_PROCFS)('work run: supervise, cancel, timeout, drain', { timeout: 30_000 }, () => {
   it('timeout: the worker (ignoring SIGTERM) is killed, the runner commits wip: and submits partial', async () => {
     const r = rig();
     const b = await claim(r);
@@ -352,7 +353,7 @@ describe('work run: supervise, cancel, timeout, drain', { timeout: 30_000 }, () 
   });
 });
 
-describe('work run: git-metadata and branch attacks end with nothing fetched', () => {
+describe.skipIf(!HAS_PROCFS)('work run: git-metadata and branch attacks end with nothing fetched', () => {
   type Steps = unknown[] | ((c: { b: TaskBrief; r: Rig; stateFile: string }) => unknown[]);
   const attacked = async (steps: Steps) => {
     const r = rig();
@@ -450,7 +451,7 @@ describe('work run: git-metadata and branch attacks end with nothing fetched', (
   });
 });
 
-describe('work run: a gate (phase 1 b pilot)', () => {
+describe.skipIf(!HAS_PROCFS)('work run: a gate (phase 1 b pilot)', () => {
   const pilot = () => rig((c) => set(c, { roles: { 'codex-reviewer': { description: 'Codex review.', promptText: 'Review.', contract: 'gate', harness: 'codex' } }, workflows: { pilot: ['engineer', 'codex-reviewer'] } }), PHASE_RULES['1b']);
   async function toGate(r: Rig) {
     r.backlog.add({ id: 'task-1', workflow: 'pilot' });
@@ -480,7 +481,7 @@ describe('work run: a gate (phase 1 b pilot)', () => {
   });
 });
 
-describe('work run: concurrent writers', () => {
+describe.skipIf(!HAS_PROCFS)('work run: concurrent writers', () => {
   it('commits on another branch and a merge into main during the run cause no false violation and no rollback', async () => {
     const r = rig();
     const b = await claim(r);
@@ -499,7 +500,7 @@ describe('work run: concurrent writers', () => {
   });
 });
 
-describe('reapRun: orphans and recovery', { timeout: 30_000 }, () => {
+describe.skipIf(!HAS_PROCFS)('reapRun: orphans and recovery', { timeout: 30_000 }, () => {
   /** Simulates a runner that died (SIGKILL): the record names a process that is gone. */
   function forgeDeadRunner(r: Rig, rec: RunRecord, patch: Partial<RunRecord> = {}) {
     const dead = spawnSync(process.execPath, ['-e', 'console.log(process.pid)'], { encoding: 'utf8' });

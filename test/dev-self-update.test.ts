@@ -84,7 +84,8 @@ function setup(): Fx {
     '    echo \'{"ok":true,"data":{"ok":true,"steps":[{"id":"sync","status":"done","detail":"fast-forward"}],"sync":{"action":"fast-forward"},"stopped":null}}\' ;;',
     '  *"upgrade --rebuild-cli"*)',
     // As applyCli: back up the installed CLI before replacing it; then the image ($FAKE/new-image) and the recreate.
-    '    mkdir -p "$MINIONS_HOME/manager/cli-backup" && echo old-cli > "$MINIONS_HOME/manager/cli-backup/minions-0.1.0-$(date -u +%Y%m%dT%H%M%S%3NZ).tgz"',
+    // The stamp's milliseconds are a running count: BSD date (macOS) has no `%3N` (task-105).
+    '    d="$MINIONS_HOME/manager/cli-backup"; mkdir -p "$d" && n=$(ls "$d" | wc -l | tr -d " ") && echo old-cli > "$d/minions-0.1.0-$(date -u +%Y%m%dT%H%M%S)$(printf %03d "$n")Z.tgz"',
     '    [ -f "$FAKE/new-image" ] && cp "$FAKE/new-image" "$FAKE/img/minions-runtime:0.1.0"',
     '    cp "$FAKE/img/minions-runtime:0.1.0" "$FAKE/container-image"',
     '    [ -f "$FAKE/upgrade-stops-runtime" ] && rm -f "$FAKE/running"',

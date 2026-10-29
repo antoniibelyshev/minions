@@ -11,6 +11,7 @@ import { codexAdapter } from '../../src/runtime/runner/codex.js';
 import { runLease, type RunnerDeps } from '../../src/runtime/runner/run.js';
 import { Scheduler, type TaskBrief } from '../../src/runtime/scheduler.js';
 import { commitFile, gitSync, makeDefaultEnv, result, type Env } from './fixtures.js';
+import { HAS_PROCFS } from '../helpers.js';
 
 const FAKE = resolve(__dirname, '..', 'fixtures', 'fake-codex.mjs');
 const CODEX = { models: { default: 'gpt-6.1-sol', allowed: ['gpt-6.1-sol'] }, timeoutMinutes: 5 };
@@ -57,7 +58,7 @@ async function toGate(r: Rig): Promise<TaskBrief> {
 const submitted = (r: Rig, b: TaskBrief) => JSON.parse(readFileSync(submissionPath(r.paths, b.leaseId), 'utf8')) as Record<string, unknown> & { status: string; findings: string[]; checks: Record<string, unknown>[] };
 
 describe('work run with the Codex adapter (gate pilot, fake codex)', () => {
-  it('runs codex exec, submits the normalized final message as an approving gate result and records the last usage total', async () => {
+  it.skipIf(!HAS_PROCFS)('runs codex exec, submits the normalized final message as an approving gate result and records the last usage total', async () => {
     const r = rig();
     const b = await toGate(r);
     const echo = join(r.root, 'echo.json');
@@ -91,7 +92,7 @@ describe('work run with the Codex adapter (gate pilot, fake codex)', () => {
     expect(seen.schema.properties).toHaveProperty('verdict');
   });
 
-  it('a request-changes verdict is submitted as needs_changes', async () => {
+  it.skipIf(!HAS_PROCFS)('a request-changes verdict is submitted as needs_changes', async () => {
     const r = rig();
     const b = await toGate(r);
     const out = await runLease(b.leaseId, r.deps({ result: { status: 'needs_changes', verdict: 'request-changes', findings: ['a.txt: missing test'] } }));
@@ -99,7 +100,7 @@ describe('work run with the Codex adapter (gate pilot, fake codex)', () => {
     expect(await recordSubmitted(r.sched, r.paths, b.leaseId)).toMatchObject({ valid: true, approved: false });
   });
 
-  it('a final message that is not a result becomes a synthesized blocked result with the redacted stderr tail', async () => {
+  it.skipIf(!HAS_PROCFS)('a final message that is not a result becomes a synthesized blocked result with the redacted stderr tail', async () => {
     const r = rig();
     const b = await toGate(r);
     const out = await runLease(b.leaseId, r.deps({ message: 'I could not finish.', stderr: `error: auth failed for ${KEY}\n`, exitCode: 1 }));
@@ -109,7 +110,7 @@ describe('work run with the Codex adapter (gate pilot, fake codex)', () => {
     expect(JSON.stringify(s)).not.toContain(KEY);
   });
 
-  it('without the codex key nothing starts: a blocked result names the missing credential', async () => {
+  it.skipIf(!HAS_PROCFS)('without the codex key nothing starts: a blocked result names the missing credential', async () => {
     const r = rig(undefined, null);
     const b = await toGate(r);
     const echo = join(r.root, 'echo.json');
@@ -120,7 +121,7 @@ describe('work run with the Codex adapter (gate pilot, fake codex)', () => {
     expect(existsSync(echo)).toBe(false);
   });
 
-  it('a file prompt is read from the generated plugin dir; a missing copy refuses the run', async () => {
+  it.skipIf(!HAS_PROCFS)('a file prompt is read from the generated plugin dir; a missing copy refuses the run', async () => {
     const r = rig({ prompt: 'prompts/codex-reviewer.md' });
     const b = await toGate(r);
     const missing = await runLease(b.leaseId, r.deps({}, { rolePromptDir: join(r.root, 'plugin', 'harness-prompts') }));
@@ -137,7 +138,7 @@ describe('work run with the Codex adapter (gate pilot, fake codex)', () => {
     expect(out).toMatchObject({ submitted: true, status: 'complete' });
     expect((JSON.parse(readFileSync(echo, 'utf8')) as { stdin: string }).stdin).toContain('Generated reviewer prompt from the host.');
   });
-  it('malformed JSONL noise and no final message (exit 0) yield a blocked result with a cause, never a crash', async () => {
+  it.skipIf(!HAS_PROCFS)('malformed JSONL noise and no final message (exit 0) yield a blocked result with a cause, never a crash', async () => {
     const r = rig();
     const b = await toGate(r);
     const out = await runLease(b.leaseId, r.deps({ junk: '{"type":"turn.completed","usage":\nnot json at all\n{"type":\n', noFinal: true, usage: [] }));
@@ -145,14 +146,14 @@ describe('work run with the Codex adapter (gate pilot, fake codex)', () => {
     expect(submitted(r, b).findings.join('\n')).toMatch(/no WorkerResult/);
   });
 
-  it('malformed usage events do not fail a valid review', async () => {
+  it.skipIf(!HAS_PROCFS)('malformed usage events do not fail a valid review', async () => {
     const r = rig();
     const b = await toGate(r);
     const out = await runLease(b.leaseId, r.deps({ junk: '{"type":"turn.completed","usage":{"input_tokens":"x"}}\n[1,2]\nnull\n' }));
     expect(out).toMatchObject({ submitted: true, status: 'complete' });
   });
 
-  it('a key echoed on stderr never reaches the submission or the run events', async () => {
+  it.skipIf(!HAS_PROCFS)('a key echoed on stderr never reaches the submission or the run events', async () => {
     const r = rig();
     const b = await toGate(r);
     await runLease(b.leaseId, r.deps({ stderr: `debug ${KEY}\n`, exitCode: 1, message: 'no result' }));
@@ -160,7 +161,7 @@ describe('work run with the Codex adapter (gate pilot, fake codex)', () => {
     expect(readFileSync(submissionPath(r.paths, b.leaseId), 'utf8')).not.toContain(KEY);
   });
 
-  it('task-14.14: the final message is redacted before submit (key, token shapes), and stays a valid result', async () => {
+  it.skipIf(!HAS_PROCFS)('task-14.14: the final message is redacted before submit (key, token shapes), and stays a valid result', async () => {
     const r = rig();
     const b = await toGate(r);
     const gh = 'ghp_abcdefghijklmnopqrstuvwxyz0123456789';
@@ -174,7 +175,7 @@ describe('work run with the Codex adapter (gate pilot, fake codex)', () => {
     expect(await recordSubmitted(r.sched, r.paths, b.leaseId)).toMatchObject({ valid: true, approved: true });
   });
 
-  it('task-14.14: a spawn secret that matches no redact() shape is masked verbatim in the final message', async () => {
+  it.skipIf(!HAS_PROCFS)('task-14.14: a spawn secret that matches no redact() shape is masked verbatim in the final message', async () => {
     const odd = 'odd-shaped-secret-value-7f3a';
     const r = rig(undefined, odd);
     const b = await toGate(r);
@@ -184,7 +185,7 @@ describe('work run with the Codex adapter (gate pilot, fake codex)', () => {
     expect(submitted(r, b).findings).toEqual(['saw [REDACTED] in env']);
   });
 
-  it('task-14.14: the prompt words the result like the Claude workers and does not contradict itself', async () => {
+  it.skipIf(!HAS_PROCFS)('task-14.14: the prompt words the result like the Claude workers and does not contradict itself', async () => {
     const r = rig();
     const b = await toGate(r);
     const echo = join(r.root, 'echo.json');

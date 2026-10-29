@@ -13,7 +13,7 @@ import {
 } from '../../src/runtime/integrator.js';
 import { pending } from '../../src/runtime/outbox.js';
 import { isAlive, procIdentity } from '../../src/runtime/runner/record.js';
-import { defaults } from '../helpers.js';
+import { defaults, HAS_PROCFS } from '../helpers.js';
 import { gitSync, initRepo, tmp } from './fixtures.js';
 
 const branchOf = (task: string) => `agent/${task}-thing`;
@@ -359,7 +359,7 @@ describe('runIntegrator: crash recovery', () => {
     expect(r.exit).toBe('empty');
   });
 
-  it('otherwise the recorded verify group is stopped (leader matched) and the row is re-queued and integrated', async () => {
+  it.skipIf(!HAS_PROCFS)('otherwise the recorded verify group is stopped (leader matched) and the row is re-queued and integrated', async () => {
     const s = setup();
     s.queue('task-1');
     const child = spawn('sh', ['-c', 'sleep 60 & sleep 60; wait'], { detached: true, stdio: 'ignore' });
