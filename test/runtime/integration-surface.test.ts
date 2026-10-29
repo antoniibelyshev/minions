@@ -1,7 +1,7 @@
 // The local integrator's user-facing surface (task-82.4, docs/design/local-auto-integration.md phase 4): the flaky
 // rerun (Decision 2), the status block and the doctor problems (incl. a crash during `git merge --ff-only`), owner
 // notices, the digest lines, the backstops, and the merge-approval refusal after a failed integration.
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import type { MinionsConfig } from '../../src/config/schema.js';
@@ -83,6 +83,42 @@ describe('Decision 2: a failed verification command is rerun once', () => {
     expect(humanIntegration((await status(env))!).join('\n')).toMatch(/last: task-1 landed \(flaky\)/);
   });
 
+  it('a flaky pass whose landing does not happen (dirty checkout) is not reported as merged', async () => {
+    const flag = join(makeEnv().root, 'flaky-flag');
+    const env = localEnv((c) => { c.verification.commands = [`if [ -f '${flag}' ]; then exit 0; fi; touch '${flag}'; exit 1`]; });
+    env.backlog.add({ id: 'task-1', title: 'Flaky' });
+    await approveTask(env, 'task-1');
+    const before = mainOf(env);
+    const tracked = gitSync(env.layout.repo, 'ls-files').split('\n')[0]!;
+    writeFileSync(join(env.layout.repo, tracked), 'an edit of the owner\n');
+    expect((await integrate(env)).exit).toBe('checkout-dirty');
+    expect(mainOf(env)).toBe(before);
+    expect(integrationRows(env.db, 'task-1').at(-1)!.phase).toBe('queued');
+    expect(env.db.eventsOfKindSince('integration-flaky', '1970-01-01')).toEqual([]);
+    const d = composeDigest(digestInput(env.db, { routine: {} }, { tasks: [...env.backlog.tasks.values()], runnable: [], spend: null }, new Date()));
+    expect(d.text).not.toMatch(/merged, but a test passed only on its rerun/);
+    // Once the checkout is clean the head lands; this run passed at once, so it is a plain merge.
+    gitSync(env.layout.repo, 'checkout', '--', tracked);
+    await integrate(env);
+    expect(integrationRows(env.db, 'task-1').at(-1)!).toMatchObject({ phase: 'landed', outcome: 'landed' });
+    const after = composeDigest(digestInput(env.db, { routine: {} }, { tasks: [...env.backlog.tasks.values()], runnable: [], spend: null }, new Date()));
+    expect(after.text).toMatch(/Merged:\n- task-1 Flaky/);
+    expect(after.text).not.toMatch(/passed only on its rerun/);
+  });
+
+  it('reruns a failing command exactly once, then stops before the later commands', async () => {
+    const root = makeEnv().root;
+    const runs = join(root, 'runs'); const later = join(root, 'later');
+    const env = localEnv((c) => { c.verification.commands = [`echo x >> '${runs}'; exit 1`, `touch '${later}'`]; });
+    env.backlog.add({ id: 'task-1', title: 'Red' });
+    await approveTask(env, 'task-1');
+    await integrate(env);
+    expect(integrationRows(env.db, 'task-1').at(-1)!.phase).toBe('red');
+    expect(readFileSync(runs, 'utf8').trim().split('\n')).toHaveLength(2);
+    expect(existsSync(later)).toBe(false);
+    expect(env.db.eventsOfKindSince('integration-flaky', '1970-01-01')).toEqual([]);
+  });
+
   it('two failures are red: main unchanged, changes-requested, and a one-line notice', async () => {
     const env = localEnv((c) => { c.verification.commands = ['echo always-red; exit 2']; });
     env.backlog.add({ id: 'task-1', title: 'Red' });
@@ -97,6 +133,10 @@ describe('Decision 2: a failed verification command is rerun once', () => {
     const n = pending(env.db, { includeWaiting: true }).find((x) => x.key.startsWith('integration-red:task-1:'));
     expect(n).toMatchObject({ kind: 'other', taskId: 'task-1' });
     expect(n!.text).toMatch(/integration red .* main is unchanged, task → changes-requested for a repair/);
+    expect(humanIntegration((await status(env))!).join('\n')).toMatch(/last: task-1 red at \S+: `echo always-red; exit 2` failed twice/);
+    const d = composeDigest(digestInput(env.db, { routine: {} }, { tasks: [...env.backlog.tasks.values()], runnable: [], spend: null }, new Date()));
+    expect(d.text).toMatch(/Integration:\n- task-1 Red: integration red, sent back for a repair/);
+    expect(d.text).not.toMatch(/Merged:|flaky/);
   });
 });
 
@@ -161,7 +201,17 @@ describe('status integration block', () => {
     // The partly updated working tree: a tracked file differs from main while main still points at B.
     const tracked = gitSync(env.layout.repo, 'ls-files').split('\n')[0]!;
     writeFileSync(join(env.layout.repo, tracked), 'half-updated by an interrupted fast-forward\n');
+    // The check is read-only: the checkout, its index, the refs and the runtime rows are untouched.
+    const snapshot = () => ({
+      main: mainOf(env), file: readFileSync(join(env.layout.repo, tracked), 'utf8'),
+      index: (() => { const st = statSync(join(env.layout.repo, '.git', 'index')); return [st.mtimeMs, st.size]; })(),
+      row: integrationRows(env.db, 'task-1').at(-1), lock: env.db.getMeta(INTEGRATION_LOCK_META),
+      events: env.db.eventsOfKindSince('integration-started', '1970-01-01').length + env.db.eventsOfKindSince('integration-recovered', '1970-01-01').length,
+    });
+    const before = snapshot();
     const s = (await status(env))!;
+    await status(env);
+    expect(snapshot()).toEqual(before);
     expect(s.checkout).toMatchObject({ state: 'dirty', paths: [tracked] });
     const crash = s.problems.find((p) => p.name === 'integration.checkout')!;
     expect(crash).toMatchObject({ status: 'fail', detail: expect.stringMatching(new RegExp(`stopped during \`git merge --ff-only\` of task-1 .* while main still points at ${B}`)) });
@@ -282,5 +332,17 @@ describe('digest and merge approval', () => {
     expect(env.db.publication('task-1')).toMatchObject({ state: 'failed', error_code: 'red' });
     const sig = signApproval(env.keys.privateKeyPem, { taskId: 'task-1', head, scope: 'merge' }).token;
     expect(() => env.sched.approveMerge('task-1', { head, signature: sig })).toThrow(/integration of task-1 at [0-9a-f]{40} failed \(red\): a merge approval cannot land it/);
+    // A local integration waiting for approval (sensitive path) accepts the signed approval, and it then lands.
+    const ask = localEnv((c) => { c.sensitivePaths = ['secret/**']; });
+    ask.backlog.add({ id: 'task-2', title: 'Sensitive' });
+    const s2 = await approveTask(ask, 'task-2', 'secret/a.txt');
+    await integrate(ask);
+    expect(ask.db.publication('task-2')).toMatchObject({ state: 'awaiting-approval' });
+    const sig2 = signApproval(ask.keys.privateKeyPem, { taskId: 'task-2', head: s2.head, scope: 'merge' }).token;
+    expect(ask.sched.approveMerge('task-2', { head: s2.head, signature: sig2 })).toMatchObject({ taskId: 'task-2', headSha: s2.head, message: expect.stringMatching(/Recorded host-signed approval to integrate/) });
+    await ask.sched.publish('task-2');
+    await integrate(ask);
+    expect(integrationRows(ask.db, 'task-2').at(-1)!.phase).toBe('landed');
+    gitSync(ask.layout.repo, 'merge-base', '--is-ancestor', s2.head, 'main');
   });
 });
