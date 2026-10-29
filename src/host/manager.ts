@@ -58,7 +58,8 @@
 //   it runs the pass only when routine.enabled is on and the last pass is older than 2 intervals (the wrapper clock is
 //   not ticking: the coordinator is down or hangs). A coordinator that is not running is reported once ("coordinator
 //   not running since <t>"), with the pass's decision (a crash start, or why none).
-import { open, readFile, rm } from 'node:fs/promises';
+import { randomBytes } from 'node:crypto';
+import { link, readFile, rm, writeFile } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 import type { Command } from 'commander';
 import { action, requireMode } from '../core/cli-helpers.js';
@@ -290,7 +291,7 @@ export function boundedRuntime(deps: Pick<ManagerDeps, 'running' | 'delegate'>):
 interface LockRecord { pid: number; start: string | null; at: string }
 
 /**
- * Takes <MINIONS_HOME>/manager/lock (O_EXCL, {pid, start}). A holder that still runs (same pid and start time) means
+ * Takes <MINIONS_HOME>/manager/lock (created atomically by link, {pid, start}). A holder that still runs (same pid and start time) means
  * another manager: CONFLICT. A lock of a dead or reused pid is taken over.
  */
 export async function acquireManagerLock(o: { alive?: (e: { pid?: number; start?: string | null }) => boolean; now?: Date } = {}): Promise<{ release: () => Promise<void> }> {
@@ -301,9 +302,7 @@ export async function acquireManagerLock(o: { alive?: (e: { pid?: number; start?
   const writtenBy = Date.now() + LOCK_WRITE_GRACE_MS + 1_000;
   for (let attempt = 0; attempt < 5; attempt++) {
     try {
-      const h = await open(managerLockPath(), 'wx', 0o600);
-      await h.writeFile(JSON.stringify(mine) + '\n');
-      await h.close();
+      await writeLockAtomically(mine);
       return {
         release: async () => {
           const cur = await readLock();
@@ -319,6 +318,8 @@ export async function acquireManagerLock(o: { alive?: (e: { pid?: number; start?
       }
       // No holder yet (task-80): another manager is between creating the file and writing itself into it. Taking it
       // over there would let both run; wait until it is written (then the check above decides) or turns stale.
+      // This manager never leaves the lock empty (task-53.12), but an older one mid-upgrade still creates it first
+      // and writes it after, so the wait stays.
       if (!holder && Date.now() < writtenBy && (await lockFileState(managerLockPath(), () => null)).state === 'held') {
         await new Promise((r) => setTimeout(r, 50));
         attempt--;
@@ -328,6 +329,21 @@ export async function acquireManagerLock(o: { alive?: (e: { pid?: number; start?
     }
   }
   throw new MinionsError('CONFLICT', 'Could not take the host manager lock (it keeps changing).', 'Retry in a moment.');
+}
+
+/**
+ * Creates the lock with the record already in it (task-53.12): the record goes to a unique temp file in the same
+ * directory, which is then hard-linked to the lock path (EEXIST when held, as with O_EXCL), so a new manager's lock
+ * is never seen empty. The temp file is always removed; one left by a crash is harmless.
+ */
+async function writeLockAtomically(rec: LockRecord): Promise<void> {
+  const tmp = join(managerDir(), `lock.${process.pid}.${randomBytes(6).toString('hex')}.tmp`);
+  try {
+    await writeFile(tmp, JSON.stringify(rec) + '\n', { mode: 0o600, flag: 'wx' });
+    await link(tmp, managerLockPath());
+  } finally {
+    await rm(tmp, { force: true });
+  }
 }
 
 async function readLock(): Promise<LockRecord | null> {
