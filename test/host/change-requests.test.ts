@@ -20,7 +20,6 @@ vi.mock('../../src/plugin/generate.js', async () => {
   };
 });
 
-const { runInit } = await import('../../src/host/install.js');
 const { projectPaths } = await import('../../src/core/paths.js');
 const { loadProjectJson, projectConfigPath } = await import('../../src/host/project.js');
 const { validateConfig } = await import('../../src/config/resolve.js');
@@ -31,7 +30,7 @@ const J = await import('../../src/host/change-journal.js');
 const S = await import('../../src/host/settings.js');
 const SC = await import('../../src/host/settings-cli.js');
 const { editProjectConfig } = await import('../../src/host/config-write.js');
-const { makeRepo, withHome, dockerUp } = await import('./fixtures.js');
+const { initFromTemplate, withHome } = await import('./fixtures.js');
 type ProjectJson = import('../../src/host/project.js').ProjectJson;
 type SettingsRuntime = import('../../src/host/settings-cli.js').SettingsRuntime;
 type UpgradeRun = import('../../src/host/change-requests.js').UpgradeRun;
@@ -46,9 +45,8 @@ const readLocal = (f: string) => (existsSync(f) ? readJson(f) : {});
 const runtimeConfig = (p: ProjectJson) => validateConfig(readJson(join(projectPaths(p.projectId).runtimeDir, 'config.json')));
 
 async function install(visibility: 'shared' | 'private' = 'private') {
-  const repo = makeRepo(env.root);
-  const r = await runInit({ path: repo, yes: true, visibility, dockerProbe: dockerUp });
-  const project = await loadProjectJson(r.plan.projectId);
+  const { repo, projectId } = await initFromTemplate(env.root, { visibility });
+  const project = await loadProjectJson(projectId);
   return { repo, project, file: projectConfigPath(project), local: projectPaths(project.projectId).configLocalJson };
 }
 

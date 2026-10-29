@@ -20,7 +20,6 @@ vi.mock('../../src/plugin/generate.js', async () => {
   };
 });
 
-const { runInit } = await import('../../src/host/install.js');
 const { projectPaths } = await import('../../src/core/paths.js');
 const { loadProjectJson, loadEffectiveConfig } = await import('../../src/host/project.js');
 const CR = await import('../../src/host/change-requests.js');
@@ -29,7 +28,7 @@ const M = await import('../../src/host/manager.js');
 const T = await import('../../src/host/manager-telegram.js');
 const S = await import('../../src/host/settings.js');
 const SC = await import('../../src/host/settings-cli.js');
-const { makeRepo, withHome, dockerUp } = await import('./fixtures.js');
+const { initFromTemplate, withHome } = await import('./fixtures.js');
 type ProjectJson = import('../../src/host/project.js').ProjectJson;
 type RunResult = import('../../src/core/exec.js').RunResult;
 type ManagerOutcome = import('../../src/host/manager.js').ManagerOutcome;
@@ -60,9 +59,8 @@ const msg = (update_id: number, text: string, o: { messageId?: number | null; fo
 const tap = (update_id: number, data: string): TelegramUpdate => ({ update_id, callback_query: { id: `cb${update_id}`, data, from: { id: OWNER }, message: { message_id: 50, chat: { id: OWNER, type: 'private' } } } });
 
 async function install(name = 'repo') {
-  const repo = makeRepo(env.root, name);
-  const r = await runInit({ path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
-  const project = await loadProjectJson(r.plan.projectId);
+  const { repo, projectId } = await initFromTemplate(env.root, { visibility: 'private', name });
+  const project = await loadProjectJson(projectId);
   return { project, repo, local: projectPaths(project.projectId).configLocalJson };
 }
 

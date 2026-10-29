@@ -19,7 +19,6 @@ vi.mock('../../src/plugin/generate.js', async () => {
   };
 });
 
-const { runInit } = await import('../../src/host/install.js');
 const { projectPaths } = await import('../../src/core/paths.js');
 const { loadProjectJson, loadEffectiveConfig, projectConfigPath } = await import('../../src/host/project.js');
 const C = await import('../../src/host/credentials.js');
@@ -28,7 +27,7 @@ const SC = await import('../../src/host/settings-cli.js');
 const M = await import('../../src/host/settings-menu.js');
 type MenuKey = import('../../src/host/settings-menu.js').MenuKey;
 type MenuIO = import('../../src/host/settings-menu.js').MenuIO;
-const { makeRepo, withHome, dockerUp } = await import('./fixtures.js');
+const { initFromTemplate, withHome } = await import('./fixtures.js');
 
 const TOKEN = '123456789:AAHfakefakefakefakefakefakefake_-0123';
 
@@ -41,9 +40,8 @@ afterEach(() => {
 });
 
 async function install(visibility: 'shared' | 'private' = 'private') {
-  const repo = makeRepo(env.root);
-  const r = await runInit({ path: repo, yes: true, visibility, dockerProbe: dockerUp });
-  const project = await loadProjectJson(r.plan.projectId);
+  const { repo, projectId } = await initFromTemplate(env.root, { visibility });
+  const project = await loadProjectJson(projectId);
   return { repo, project, file: projectConfigPath(project), local: projectPaths(project.projectId).configLocalJson };
 }
 

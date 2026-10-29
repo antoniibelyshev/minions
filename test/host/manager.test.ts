@@ -18,7 +18,6 @@ vi.mock('../../src/plugin/generate.js', async () => {
   };
 });
 
-const { runInit } = await import('../../src/host/install.js');
 const { projectPaths } = await import('../../src/core/paths.js');
 const { loadProjectJson } = await import('../../src/host/project.js');
 const { validateConfig } = await import('../../src/config/resolve.js');
@@ -31,7 +30,7 @@ const S = await import('../../src/host/settings.js');
 const SC = await import('../../src/host/settings-cli.js');
 const { editProjectConfig } = await import('../../src/host/config-write.js');
 const { run } = await import('../../src/core/exec.js');
-const { makeRepo, withHome, dockerUp } = await import('./fixtures.js');
+const { initFromTemplate, withHome } = await import('./fixtures.js');
 type ProjectJson = import('../../src/host/project.js').ProjectJson;
 type RunResult = import('../../src/core/exec.js').RunResult;
 type ManagerOffer = import('../../src/host/manager.js').ManagerOffer;
@@ -49,9 +48,8 @@ const runtimeConfig = (p: ProjectJson) => validateConfig(readJson(join(projectPa
 const journal = () => readFileSync(J.journalPath(), 'utf8').trim().split('\n').map((l) => JSON.parse(l) as Record<string, any>);
 
 async function install(name = 'repo') {
-  const repo = makeRepo(env.root, name);
-  const r = await runInit({ path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
-  const project = await loadProjectJson(r.plan.projectId);
+  const { projectId } = await initFromTemplate(env.root, { visibility: 'private', name });
+  const project = await loadProjectJson(projectId);
   return { project, local: projectPaths(project.projectId).configLocalJson };
 }
 const requestSet = (p: ProjectJson, key: string, value: string) =>
