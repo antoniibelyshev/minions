@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { profileDefaults } from '../src/config/profiles.js';
 import type { Profile } from '../src/config/schema.js';
+import { HANG_GUARD_TIMEOUT_TEST, HOOK_WRAPPER_TIMEOUT_S } from '../src/runtime/hook-guard.js';
 
 export const ctx = {
   hasGitHub: true,
@@ -48,6 +49,21 @@ export function runHookCommand(command: string, minions: string | null, stdin = 
   const r = spawnSync('sh', ['-c', command], { input: stdin, env: { PATH: `${bin}:/usr/bin:/bin` }, encoding: 'utf8' });
   rmSync(dir, { recursive: true, force: true });
   return { status: r.status, stdout: r.stdout, stderr: r.stderr };
+}
+
+/** True when runHookCommand's PATH has coreutils `timeout` (Linux; not stock macOS). */
+export const HAS_COREUTILS_TIMEOUT = spawnSync('sh', ['-c', 'command -v timeout'], { env: { PATH: '/usr/bin:/bin' } }).status === 0;
+
+/**
+ * A hook command with its hang guard (src/runtime/hook-guard.ts) forced to one branch (`coreutils` or the `perl`
+ * fallback) and/or a shorter deadline. Throws when the command has no guard, so a test cannot silently test nothing.
+ */
+export function withHangGuard(command: string, o: { guard?: 'coreutils' | 'perl'; seconds?: number }): string {
+  if (!/; then timeout \d+ minions hook /.test(command)) throw new Error(`no hang guard in: ${command}`);
+  let c = command;
+  if (o.guard) c = c.replaceAll(HANG_GUARD_TIMEOUT_TEST, o.guard === 'coreutils' ? 'true' : 'false');
+  if (o.seconds !== undefined) c = c.replaceAll(` ${HOOK_WRAPPER_TIMEOUT_S} minions hook `, ` ${o.seconds} minions hook `);
+  return c;
 }
 
 /** Fake `minions` binaries for runHookCommand. */

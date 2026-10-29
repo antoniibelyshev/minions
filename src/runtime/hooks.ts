@@ -8,6 +8,7 @@ import { HARNESSES, isProcessHarness } from '../config/harnesses.js';
 import { agentTypeRole, DEEP_SUFFIX, workerRoleNames } from '../config/roles.js';
 import type { MinionsConfig, RoleContract } from '../config/schema.js';
 import { sha256 } from '../core/fsutil.js';
+import { hangGuarded } from './hook-guard.js';
 import { redact } from '../core/output.js';
 import type { BuiltinLeaseRole, DrainNoticeVia, LeaseRole, RuntimeDb } from './db.js';
 import { TELEGRAM_TOOL_PREFIX } from './coordinator.js';
@@ -232,7 +233,7 @@ export function preTelegramHook(input: unknown): HookOutput {
  * like variables, that is out of reach of a text check). Reading stdin, a grep error and every failure of minions
  * itself block (exit 2).
  */
-export const PRE_BASH_HOOK_COMMAND = `i=$(cat) || exit 2; case "$i" in *'"agent_id"'*) printf '%s' "$i" | grep -Eq 'minions[^:]|cli\\.[cm]?js|/state|/secrets|MINIONS_STATE_DIR'; m=$?; [ "$m" = 1 ] && exit 0; [ "$m" = 0 ] || exit 2; printf '%s' "$i" | timeout 20 minions hook pre-bash || exit 2;; esac`;
+export const PRE_BASH_HOOK_COMMAND = `i=$(cat) || exit 2; case "$i" in *'"agent_id"'*) printf '%s' "$i" | grep -Eq 'minions[^:]|cli\\.[cm]?js|/state|/secrets|MINIONS_STATE_DIR'; m=$?; [ "$m" = 1 ] && exit 0; [ "$m" = 0 ] || exit 2; printf '%s' "$i" | ${hangGuarded('minions hook pre-bash')} || exit 2;; esac`;
 
 /** The verbs a Claude subagent must never run: they start, claim or end worker leases, or run the local integrator (coordinator-only). */
 export const COORDINATOR_ONLY_WORK_VERBS = ['run', 'claim', 'advance', 'release', 'integrate'] as const;
@@ -527,14 +528,14 @@ const READ_TOOLS: Readonly<Record<string, readonly string[]>> = { Read: ['file_p
  * Plugin PreToolUse entry for the write tools: every subagent call reaches node (a symlink in the worktree can
  * point anywhere, so no text pre-filter could decide). The coordinator's own calls never start node.
  */
-export const PRE_FILE_WRITE_HOOK_COMMAND = `i=$(cat) || exit 2; case "$i" in *'"agent_id"'*) printf '%s' "$i" | timeout 20 minions hook pre-file || exit 2;; esac`;
+export const PRE_FILE_WRITE_HOOK_COMMAND = `i=$(cat) || exit 2; case "$i" in *'"agent_id"'*) printf '%s' "$i" | ${hangGuarded('minions hook pre-file')} || exit 2;; esac`;
 /**
  * Plugin PreToolUse entry for the read tools: node starts only for a subagent call whose input names a state dir
  * (`/state`: the container path, and the last segment of the host runtime's), the secrets dir (`/secrets`, task-96) or
  * MINIONS_STATE_DIR. A symlink
  * that hides the path is not caught for reads (disclosure, not forgery: writes are always checked).
  */
-export const PRE_FILE_READ_HOOK_COMMAND = `i=$(cat) || exit 2; case "$i" in *'"agent_id"'*) printf '%s' "$i" | grep -Eq '/state|/secrets|MINIONS_STATE_DIR'; m=$?; [ "$m" = 1 ] && exit 0; [ "$m" = 0 ] || exit 2; printf '%s' "$i" | timeout 20 minions hook pre-file || exit 2;; esac`;
+export const PRE_FILE_READ_HOOK_COMMAND = `i=$(cat) || exit 2; case "$i" in *'"agent_id"'*) printf '%s' "$i" | grep -Eq '/state|/secrets|MINIONS_STATE_DIR'; m=$?; [ "$m" = 1 ] && exit 0; [ "$m" = 0 ] || exit 2; printf '%s' "$i" | ${hangGuarded('minions hook pre-file')} || exit 2;; esac`;
 
 /**
  * PreToolUse(Edit|MultiEdit|Write|NotebookEdit|Read|Glob|Grep), task-72: a Claude subagent may not write, read or
