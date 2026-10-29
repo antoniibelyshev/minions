@@ -400,6 +400,31 @@ describe('work next: small-task lane', () => {
     expect(n.waiting).toEqual([expect.objectContaining({ taskId: 'task-2', waitingOn: 'role-capacity', why: 'engineer limit (1/1)' })]);
   });
 
+  it('2/2 with a free task slot: a new big task is held for the small one', async () => {
+    const e = env((c) => { c.execution.maxActiveTasks = 2; c.execution.maxEngineers = 2; });
+    e.backlog.add({ id: 'task-1', priority: 'high' });
+    e.backlog.add({ id: 'task-2', priority: 'high' });
+    e.backlog.add({ id: 'task-3', priority: 'low', labels: ['small'] });
+    await e.sched.claim('task-1', 'engineer'); // a running big engineer
+    const n = await e.sched.next();
+    expect(ids(n.runnable)).toEqual(['task-3']);
+    expect(n.waiting).toEqual([expect.objectContaining({ taskId: 'task-2', waitingOn: 'small-task-slot' })]);
+  });
+
+  it('2/2 with both task slots held by big tasks: the big repair runs instead of idling the engineer slot', async () => {
+    const e = env((c) => { c.execution.maxActiveTasks = 2; c.execution.maxEngineers = 2; });
+    e.backlog.add({ id: 'task-1', priority: 'high' });
+    e.backlog.add({ id: 'task-2', priority: 'high' });
+    await stageIn(e, 'task-2', 'engineer');
+    await stageIn(e, 'task-2', 'reviewer', [], { status: 'needs_changes', verdict: 'request-changes', modifiedPaths: [] });
+    expect(e.backlog.status('task-2')).toBe('changes-requested');
+    await e.sched.claim('task-1', 'engineer'); // a running big engineer
+    e.backlog.add({ id: 'task-3', priority: 'low', labels: ['small'] });
+    const n = await e.sched.next();
+    expect(n.runnable.map((x) => `${x.taskId}:${x.role}`)).toEqual(['task-2:engineer']);
+    expect(n.waiting).toEqual([expect.objectContaining({ taskId: 'task-3', waitingOn: 'capacity', why: 'active task limit (2/2)' })]);
+  });
+
   it('the active task limit still applies to the small task', async () => {
     const e = env((c) => { c.execution.maxActiveTasks = 1; c.execution.maxEngineers = 2; });
     e.backlog.add({ id: 'task-1', priority: 'high' });

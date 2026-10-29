@@ -688,7 +688,10 @@ export class Scheduler {
       const used = roleActive.get(c.role) ?? 0;
       if (slots?.limited && used >= slots.max) { waiting.push({ ...c, waitingOn: 'role-capacity', why: `${c.role} limit (${used}/${slots.max})` }); continue; }
       const bigEngineer = laneCap !== null && isEngineer(c.role) && !smallTask(c.taskId);
-      if (bigEngineer && bigEngineers >= laneCap) {
+      // Hold only while a small task could take the slot under the task limit (it already holds a task slot,
+      // or one is free); otherwise the engineer slot would sit idle, so the big stage runs.
+      const smallCanStart = () => smallReady.some((id) => active.has(id)) || active.size < cfg.execution.maxActiveTasks;
+      if (bigEngineer && bigEngineers >= laneCap && smallCanStart()) {
         waiting.push({ ...c, waitingOn: 'small-task-slot', why: `last engineer slot kept for small task(s) ${smallReady.join(', ')} (non-small engineers ${bigEngineers}/${laneCap})` }); continue;
       }
       const processProducer = this.isProcessProducer(c.role, c.harness);
