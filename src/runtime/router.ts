@@ -21,8 +21,9 @@ import { MinionsError } from '../core/errors.js';
 import type { RuntimeDb } from './db.js';
 import { DIGEST_QUESTIONS_META } from './digest.js';
 import { pending, type OutboxItem } from './outbox.js';
-import { enqueueInbox, getSession, openSession } from './session-store.js';
+import { enqueueInbox, getSession, openSession, OWNER_INBOX_SOURCE } from './session-store.js';
 import { parseSessionKey, sessionConfigDir, sessionsSettings } from './sessions.js';
+import { taskKickoff } from './task-sessions.js';
 
 export type RouteRule = 'reply' | 'session' | 'ref' | 'task' | 'question' | 'general' | 'ambiguous';
 export interface RouteInput {
@@ -48,7 +49,7 @@ export interface OpenQuestion { key: string; session: string; taskId: string | n
 /** How long a delivered question stays answerable by a bare number or `Q<n>`. */
 export const QUESTION_OPEN_DAYS = 7;
 /** Inbox source of routed owner messages (the supervisor delivers them also while starts are paused). */
-export const ROUTER_INBOX_SOURCE = 'owner';
+export const ROUTER_INBOX_SOURCE = OWNER_INBOX_SOURCE;
 export const MAX_ROUTED_TEXT = 16_000;
 
 const TASK_MENTION = /\b(task-\d+(?:\.\d+)*)\b/gi;
@@ -136,6 +137,8 @@ export function resolveRoute(db: RuntimeDb, input: RouteInput, o: { knownTasks?:
       const n = Number(qa[1]);
       const match = open.filter((q) => q.n === n);
       if (match.length === 1) return result(match[0]!.session, 'question', `answers Q${n} (${match[0]!.key})`, text, match[0]!.key);
+      // No digest numbered it (e.g. sent with --hold none): the only open question, when it has no number.
+      if (!match.length && open.length === 1 && open[0]!.n === null) return result(open[0]!.session, 'question', `Q${n} while one unnumbered question is open (${open[0]!.key})`, text, open[0]!.key);
     } else if (open.length === 1) {
       return result(open[0]!.session, 'question', `a bare number while one question is open (${open[0]!.key})`, text, open[0]!.key);
     } else if (open.length > 1) {
@@ -167,8 +170,11 @@ export function sendToSession(db: RuntimeDb, cfg: Pick<MinionsConfig, 'coordinat
   return db.transaction(() => {
     const row = getSession(db, key);
     const reopened = !!row && row.status !== 'open';
-    if (reopened) openSession(db, key, { configDir: sessionConfigDir({ state: o.state }, key), model: cfg.models.coordinator ?? null, now });
-    else if (!row && parseSessionKey(key).kind === 'task') openSession(db, key, { configDir: sessionConfigDir({ state: o.state }, key), model: cfg.models.coordinator ?? null, now });
+    const taskId = parseSessionKey(key).taskId;
+    const fresh = !row && taskId !== null;
+    if (reopened || fresh) openSession(db, key, { configDir: sessionConfigDir({ state: o.state }, key), model: cfg.models.coordinator ?? null, now });
+    // A task session that never ran starts with its kickoff, so it loads /minions:task before the owner's text.
+    if (fresh) enqueueInbox(db, key, OWNER_INBOX_SOURCE, taskKickoff(taskId, 'the owner wrote to this task; their message follows.'), { now });
     const inboxId = enqueueInbox(db, key, ROUTER_INBOX_SOURCE, text, { meta: o.meta, now });
     let answered: string | null = null;
     if (o.answers && db.exec("UPDATE outbox SET answered_at = ? WHERE dedup_key = ? AND kind = 'question' AND answered_at IS NULL", now.toISOString(), o.answers).changes > 0) answered = o.answers;

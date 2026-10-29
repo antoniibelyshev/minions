@@ -42,6 +42,9 @@ export function updateSession(db: RuntimeDb, key: string, patch: SessionPatch): 
   db.exec(`UPDATE sessions SET ${cols.map((c) => `${c} = ?`).join(', ')} WHERE key = ?`, ...cols.map((c) => patch[c] as string | number | null), key);
 }
 
+/** Inbox source of owner messages routed by `coordinator send` (re-exported as ROUTER_INBOX_SOURCE). */
+export const OWNER_INBOX_SOURCE = 'owner';
+
 /** Queues a message for a session (it need not be open yet). Returns the inbox id. */
 export function enqueueInbox(db: RuntimeDb, key: string, source: string, text: string, o: { meta?: unknown; now?: Date } = {}): number {
   const k = parseSessionKey(key);

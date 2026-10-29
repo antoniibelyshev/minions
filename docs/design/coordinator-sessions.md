@@ -481,9 +481,14 @@ need an owner decision first.
    `tg_messages` (schema 11) has one row per outbox key; the key column is `outbox_key` (not `key`), plus `session`.
    An open question is a delivered `question` item without `answered_at` from the last 7 days; a null session means
    `general`. `coordinator send` reopens a closed or failed session for an owner message; `general` itself is opened
-   by the supervisor on its first inbox message. Leases held by `task:` or `general` no longer block a router restart,
-   `sync` or the routine digest wake (`leaseBlockers` in commands.ts); `live-run` still counts every lease. The router
-   resets at min(`contextTokens`, 25k). Live checks for phase 9: the router keeps `coordinator wait` in the background
+   by the supervisor on its first inbox message. A send to a task that never had a session opens it with the
+   `/minions:task` kickoff before the owner text. The task-session pass never closes a session while an owner message
+   waits in its inbox (it closes on a later pass, after that turn). `Q<n>` falls back to the only open question when
+   no digest numbered it. Leases held by `task:` or `general` no longer block a router restart or `sync`
+   (`leaseBlockers` in commands.ts); `live-run` still counts every lease. With the router running, the routine pass
+   does not restart it for the digest (its background `coordinator wait` returns `digest`); a crash start stays. The
+   router resets at min(`contextTokens`, 25k), checked with `coordinator handoff --check` as the last step of every
+   turn; that Reset step is the only time it restarts itself. Live checks for phase 9: the router keeps `coordinator wait` in the background
    and wakes on its completion; an owner message reaches the general session; the poller stays `ok`.
 9. **child: Sessions live check, docs and rollout** | criteria: sessions in `minions status` and `doctor`; README, cli.md, bootstrap.md and telegram.md updated; the coordinator enables sessions on this project for at least 3 deliveries and reports tokens and USD per delivered task per role against this cost model, misroutes and the poller state; owner poll on keeping them on and on making them the default | depends: 8 (**live run** by the coordinator; **owner**)
 10. **child: Deterministic dispatcher on the supervisor (task-68.8 build part)** | criteria: launch kind `stage` (`claude -p --agent minions:<role>`, worker settings, no Telegram); a worker-guard rework so headless workers are guarded without `agent_id` (required: the spike found no `agent_id` in `--agent` hook inputs, U7; `MINIONS_ROLE`-style marking, tests for pre-bash, pre-file and drain); hook commands not exec'd from a `noexec` `/tmp` (U1); record with usage from stream-json; one correction resume; exceptions wake the task session; launch argv, env and settings test | depends: 9 (**owner** yes after the phase 9 numbers)
