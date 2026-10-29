@@ -81,6 +81,28 @@ describe('Decision 2: a failed verification command is rerun once', () => {
     const notes = pending(env.db, { includeWaiting: true });
     expect(notes.find((n) => n.key.startsWith('integration-flaky:task-1:'))?.text).toMatch(/passed only on its rerun \(flaky\).*File a follow-up task/);
     expect(humanIntegration((await status(env))!).join('\n')).toMatch(/last: task-1 landed \(flaky\)/);
+    // The landing info comes in the one integrated notice (task, merge SHA, paths), next to the flaky follow-up.
+    // A repeated settle of the same row queues neither twice.
+    await env.sched.settleIntegration(row);
+    const keys = pending(env.db, { includeWaiting: true }).map((n) => n.key).filter((k) => /^(integrated|integration-flaky):/.test(k));
+    // The integrated notice is queued before settle() (crash safety), so it comes before the settle hook's follow-up.
+    expect(keys).toEqual([`integrated:task-1:${row.candidate_sha}`, `integration-flaky:task-1:${row.id}`]);
+    expect(notes.find((n) => n.key === `integrated:task-1:${row.candidate_sha}`)?.text)
+      .toBe(`task-1 merged into main at ${row.candidate_sha}; 1 changed path: task-1.txt. A verification command passed only on its rerun (see the integration-flaky notice). ref: #task-1`);
+  });
+
+  it('a clean landing queues exactly one integrated notice with the merge SHA and the paths, and no flaky notice', async () => {
+    const env = localEnv();
+    env.backlog.add({ id: 'task-1', title: 'Clean' });
+    await approveTask(env, 'task-1', 'src/a.ts');
+    await integrate(env);
+    const row = integrationRows(env.db, 'task-1').at(-1)!;
+    expect(row.phase).toBe('landed');
+    expect(mainOf(env)).toBe(row.candidate_sha);
+    await env.sched.settleIntegration(row);
+    await integrate(env);
+    const notes = pending(env.db, { includeWaiting: true }).filter((n) => /^(integrated|integration-flaky):/.test(n.key));
+    expect(notes.map((n) => [n.key, n.text])).toEqual([[`integrated:task-1:${row.candidate_sha}`, `task-1 merged into main at ${row.candidate_sha}; 1 changed path: src/a.ts. ref: #task-1`]]);
   });
 
   it('a flaky pass whose landing does not happen (dirty checkout) is not reported as merged', async () => {
