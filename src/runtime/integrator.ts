@@ -7,7 +7,7 @@
 //
 // Architecture decisions (task-82.2):
 // - Lock: meta row `integration_lock` {pid, start, bootId, at}, taken in one IMMEDIATE transaction, with the
-//   supervisor's liveness rule (pid, start time, boot, and a `work integrate` command line where /proc shows one).
+//   supervisor's liveness rule (pid, start time, boot, and a `work integrate` command line where /proc, or `ps` on macOS, shows one).
 //   Whoever holds the lock is the only integrator, so at start every row in a running phase (merging, verifying,
 //   landing) belongs to a dead holder and is recovered.
 // - Record: one `integrations` row per queued (task, head). `phase` is its state: queued -> merging -> verifying ->
@@ -46,7 +46,7 @@ import type { RuntimeDb, SupervisorLock } from './db.js';
 import { allowlistedGit, gateGit } from './git-hardening.js';
 import { enqueue } from './outbox.js';
 import { checkoutGit, integrationCandidate, integrationChangedPaths, land, revertOfRevertCheck } from './integration.js';
-import { groupMembers, hostIdentity, isAlive, procIdentity } from './runner/record.js';
+import { groupMembers, hostIdentity, isAlive, procIdentity, type ProcSource } from './runner/record.js';
 import { supervise, type StopReason } from './runner/supervise.js';
 import { systemLockView, type LockProcessView } from './supervisor.js';
 
@@ -360,7 +360,7 @@ export async function runVerification(i: VerifyInput): Promise<VerifyResult> {
 
 // ---------------------------------------------------------------- recovery
 
-export interface ReapVerifyOptions { proc?: string; kill?: (pid: number, sig: NodeJS.Signals) => void; graceMs?: number; sleep?: (ms: number) => Promise<void> }
+export interface ReapVerifyOptions { proc?: ProcSource; kill?: (pid: number, sig: NodeJS.Signals) => void; graceMs?: number; sleep?: (ms: number) => Promise<void> }
 const defaultKill = (pid: number, sig: NodeJS.Signals) => { try { process.kill(pid, sig); } catch { /* gone */ } };
 const sleepMs = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
@@ -416,7 +416,7 @@ export interface IntegratorDeps {
   env?: NodeJS.ProcessEnv;
   timing?: VerifyTiming & { reapGraceMs?: number };
   lockAlive?: (l: IntegrationLock) => boolean;
-  proc?: string;
+  proc?: ProcSource;
   now?: () => Date;
   log?: (line: string) => void;
 }

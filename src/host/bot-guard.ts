@@ -15,7 +15,7 @@ import { assertNotManagerBot, loadCredentialRefs, loadManagerCredentialRef, proj
 export { assertNotManagerBot };
 import { Compose, type Runner } from './docker.js';
 import { loadProjectJson, type ProjectJson } from './project.js';
-import { runtimeOf } from './runtime.js';
+import { HostRuntime, runtimeOf } from './runtime.js';
 import { hostChannel } from './channel-cli.js';
 
 export interface BotGuardDeps {
@@ -35,10 +35,19 @@ export interface BotConflict { botId: string; projects: string[] }
 const botIdFromRefs = async (projectId: string) =>
   (await loadCredentialRefs(projectId).catch((): CredentialsJson => ({ version: 1 }))).telegram?.botId ?? null;
 
+/** `minions telegram status --json` of a running session: whether it was launched with Telegram (unreadable: true, fail safe). */
+function launchedWithTelegram(st: { stdout: string } | null): boolean {
+  try {
+    const env = JSON.parse(st?.stdout ?? '') as { ok?: boolean; data?: { coordinator?: { telegram?: { enabled?: boolean } } | null } };
+    const enabled = env.ok ? env.data?.coordinator?.telegram?.enabled : undefined;
+    return typeof enabled === 'boolean' ? enabled : true;
+  } catch { return true; }
+}
+
 /**
- * Whether a registered project's coordinator is running with Telegram: Docker runtime (the host runtime
- * has no Telegram), container running, tmux session `coordinator` present, and its launch record says
- * Telegram is enabled. A running session whose launch record is unreadable counts as polling (fail safe).
+ * Whether a registered Docker-runtime project's coordinator is running with Telegram: container running, tmux
+ * session `coordinator` present, and its launch record says Telegram is enabled. A running session whose launch
+ * record is unreadable counts as polling (fail safe). Host-runtime projects: hostCoordinatorPollsBot.
  */
 export async function dockerCoordinatorPollsBot(projectId: string, runner?: Runner): Promise<boolean> {
   let project: ProjectJson;
@@ -48,20 +57,33 @@ export async function dockerCoordinatorPollsBot(projectId: string, runner?: Runn
   if (!(await compose.isRunning().catch(() => false))) return false;
   const has = await compose.exec(['tmux', 'has-session', '-t', 'coordinator'], { allowFailure: true, timeoutMs: 15_000 }).catch(() => null);
   if (!has || has.code !== 0) return false;
-  const st = await compose.exec(['minions', 'telegram', 'status', '--json'], { allowFailure: true, timeoutMs: 30_000 }).catch(() => null);
-  try {
-    const env = JSON.parse(st?.stdout ?? '') as { ok?: boolean; data?: { coordinator?: { telegram?: { enabled?: boolean } } | null } };
-    const enabled = env.ok ? env.data?.coordinator?.telegram?.enabled : undefined;
-    return typeof enabled === 'boolean' ? enabled : true;
-  } catch { return true; }
+  return launchedWithTelegram(await compose.exec(['minions', 'telegram', 'status', '--json'], { allowFailure: true, timeoutMs: 30_000 }).catch(() => null));
 }
 
-/** Other projects whose running coordinator polls the same bot as `projectId`'s stored token; null when none. */
+/**
+ * The same for a host-runtime project (docs/design/host-runtime.md, "Bot guard"): the `coordinator` session on the
+ * project's dedicated tmux server, and `minions telegram status --json` through the project's shim. A running
+ * session whose launch record is unreadable counts as polling (fail safe).
+ */
+export async function hostCoordinatorPollsBot(project: ProjectJson, runner?: Runner): Promise<boolean> {
+  const host = new HostRuntime(project, runner);
+  if (!(await host.isRunning().catch(() => false))) return false;
+  return launchedWithTelegram(await host.exec(['minions', 'telegram', 'status', '--json'], { allowFailure: true, timeoutMs: 30_000 }).catch(() => null));
+}
+
+/** Whether a registered project's coordinator (either runtime) is running with Telegram; unknown projects: false. */
+export async function coordinatorPollsBot(projectId: string, runner?: Runner): Promise<boolean> {
+  let project: ProjectJson;
+  try { project = await loadProjectJson(projectId); } catch { return false; }
+  return runtimeOf(project) === 'host' ? hostCoordinatorPollsBot(project, runner) : dockerCoordinatorPollsBot(projectId, runner);
+}
+
+/** Other projects whose running coordinator (Docker or host runtime) polls the same bot as `projectId`'s stored token; null when none. */
 export async function findBotConflict(projectId: string, deps: BotGuardDeps = {}): Promise<BotConflict | null> {
   const botId = await (deps.botIdOf ?? botIdFromRefs)(projectId);
   if (!botId) return null;
   const others = await (deps.projectsUsingBot ?? projectsUsingBot)(botId, projectId);
-  const polls = deps.coordinatorPollsBot ?? ((id: string) => dockerCoordinatorPollsBot(id, deps.runner));
+  const polls = deps.coordinatorPollsBot ?? ((id: string) => coordinatorPollsBot(id, deps.runner));
   const projects: string[] = [];
   for (const id of others) if (await polls(id).catch(() => false)) projects.push(id);
   return projects.length ? { botId, projects } : null;
@@ -90,8 +112,14 @@ export async function assertBotFree(project: ProjectJson, config: Pick<MinionsCo
   if (conflict) throw botConflictError(conflict);
 }
 
-/** Whether `projectId`'s own coordinator session is running (Docker runtime: container up, tmux session present). */
-export async function ownCoordinatorRunning(projectId: string, runner?: Runner): Promise<boolean> {
+/**
+ * Whether `projectId`'s own coordinator session is running. Docker runtime: container up, tmux session present. Host
+ * runtime: the `coordinator` session on the project's dedicated tmux server. `project` saves reading project.json;
+ * without either the Docker check runs.
+ */
+export async function ownCoordinatorRunning(projectId: string, runner?: Runner, project?: ProjectJson): Promise<boolean> {
+  const p = project ?? await loadProjectJson(projectId).catch(() => null);
+  if (p && runtimeOf(p) === 'host') return new HostRuntime(p, runner).isRunning();
   const compose = new Compose(projectId, runner);
   if (!(await compose.isRunning().catch(() => false))) return false;
   const has = await compose.exec(['tmux', 'has-session', '-t', 'coordinator'], { allowFailure: true, timeoutMs: 15_000 }).catch(() => null);
@@ -112,7 +140,7 @@ export async function startBotCheck(project: ProjectJson, config: Pick<MinionsCo
     return { action: 'launch' };
   } catch (e) {
     if (!(e instanceof MinionsError && e.code === 'CONFLICT')) throw e;
-    const own = await (deps.ownRunning ?? ((id: string) => ownCoordinatorRunning(id, deps.runner)))(project.projectId).catch(() => false);
+    const own = await (deps.ownRunning ?? ((id: string) => ownCoordinatorRunning(id, deps.runner, project)))(project.projectId).catch(() => false);
     if (!own) throw e;
     const c = e.details as BotConflict;
     return { action: 'attach-existing', warning: `warning: Telegram bot ${c.botId} is also polled by the running coordinator of project(s) ${c.projects.join(', ')}. `
