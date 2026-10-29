@@ -111,6 +111,35 @@ describe('reset barrier (task-57.6)', () => {
     expect(contextResetCheck(deps(env)).barrier).toEqual({ tokens: 120_000, reached: true, pending: false });
   });
 
+  it('contextReset.enabled: false at the barrier with workers running: claim, next and advance are not held (task-57.16)', async () => {
+    const env = barrierEnv({ enabled: false });
+    const e1 = await submitEngineer(env, 'task-1');
+    await claimWithBrief(env.sched, paths(env), 'task-2', 'engineer');
+    setContext(env, 130_000);
+
+    // The context is past the barrier, but resets are off: nothing is pending or due.
+    const c = contextResetCheck(deps(env));
+    expect(c).toMatchObject({ enabled: false, due: false, barrier: { tokens: 120_000, reached: true, pending: false } });
+    expect(c.reason).not.toMatch(/pending/);
+
+    // work next: task-3 is runnable, no reset decision.
+    const next = await env.sched.next();
+    expect(next.resetPending).toBeUndefined();
+    expect(next.runnable.map((s) => s.taskId)).toContain('task-3');
+    expect(next.waiting.filter((w) => w.waitingOn === 'context-reset')).toEqual([]);
+    expect(nextDecision(env.db, next)?.kind).not.toBe('context-reset-pending');
+
+    // work advance: the record happens and the decision is not a reset hold.
+    const adv = await advanceLease(env.sched, paths(env), e1.leaseId, {}, deps(env));
+    expect(adv.record).toMatchObject({ valid: true, to: 'reviewing' });
+    expect(adv.record.contextReset).toBeUndefined();
+    expect(adv.decision?.kind).not.toBe('context-reset-pending');
+    expect((adv.decision?.waiting ?? []).filter((w) => w.waitingOn === 'context-reset')).toEqual([]);
+
+    // work claim: goes through.
+    await expect(env.sched.claim('task-3', 'engineer')).resolves.toMatchObject({ task: { id: 'task-3' } });
+  });
+
   it('nothing changes below the barrier, with an unknown context, with the barrier off, or during a drain', async () => {
     // Below the barrier: claims go on.
     let env = barrierEnv();
