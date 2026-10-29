@@ -13,6 +13,7 @@ import { recordSubmitted, submissionPath } from '../../src/runtime/handoff.js';
 import { fakeAdapter } from '../../src/runtime/runner/adapter.js';
 import { createRunRecord, ownerLockPath, readOwner, readRunRecord, runRecordPath, type RunRecord } from '../../src/runtime/runner/record.js';
 import { reapRun, runLease, type RunnerDeps } from '../../src/runtime/runner/run.js';
+import type { SuperviseTiming } from '../../src/runtime/runner/supervise.js';
 import { Scheduler, type TaskBrief } from '../../src/runtime/scheduler.js';
 import { commitFile, gitSync, makeDefaultEnv, result, type Env } from './fixtures.js';
 
@@ -50,12 +51,14 @@ const submitted = (r: Rig, b: TaskBrief) => JSON.parse(readFileSync(submissionPa
 const headOf = (r: Rig, branch: string) => gitSync(r.layout.repo, 'rev-parse', `refs/heads/${branch}`);
 
 /**
- * Wall-clock limit for the timeout tests whose harness must install signal handlers (or write a file) before
- * the stop. The limit runs from spawn, so with 300-400 ms a node start slowed by a loaded machine got the
- * SIGINT before its handlers and died of it (task-93). Generous on purpose; the stop sequence after it is
- * what the tests assert.
+ * Timing for the timeout tests whose harness must install signal handlers (or write a file) before the stop.
+ * From spawn, a 300-400 ms limit let a node start slowed by a loaded machine get the SIGINT before its handlers
+ * (it died of it, task-93), and a fixed 2.5 s limit cost every such test 2.5 s. The limit here starts once the
+ * harness wrote `ready` (the timeoutStart seam), so a short one is safe; the stop sequence after it is what the
+ * tests assert.
  */
-const HANDLERS_TIMEOUT_MS = 2_500;
+const afterReady = (ready: string, timing: Omit<SuperviseTiming, 'timeoutMs' | 'timeoutStart'>): SuperviseTiming =>
+  ({ timeoutMs: 300, timeoutStart: waitForFile(ready), ...timing });
 
 /** Polls until the file exists, up to a deadline; false if it never appears. */
 async function waitForFile(path: string, deadlineMs = 20_000): Promise<boolean> {
@@ -217,7 +220,9 @@ describe('work run: supervise, cancel, timeout, drain', { timeout: 30_000 }, () 
   it('timeout: the worker (ignoring SIGTERM) is killed, the runner commits wip: and submits partial', async () => {
     const r = rig();
     const b = await claim(r);
-    const out = await runLease(b.leaseId, r.deps({ steps: [{ op: 'ignoreTerm' }, { op: 'write', path: 'wip.txt', content: 'half\n' }, { op: 'sleep', ms: 30_000 }] }, { timing: { timeoutMs: HANDLERS_TIMEOUT_MS, pollMs: 50, killGraceMs: 300, drainGraceMs: 100 } }));
+    const ready = join(r.root, 'ready.pid');
+    const out = await runLease(b.leaseId, r.deps({ steps: [{ op: 'ignoreTerm' }, { op: 'write', path: 'wip.txt', content: 'half\n' }, { op: 'pidfile', path: ready }, { op: 'sleep', ms: 30_000 }] },
+      { timing: afterReady(ready, { pollMs: 50, killGraceMs: 300, drainGraceMs: 100 }) }));
     expect(out).toMatchObject({ submitted: true, status: 'partial', exit: { stopped: 'timeout' } });
     expect(out.wipCommit).toBe(headOf(r, b.branch));
     expect(gitSync(r.layout.repo, 'log', '-1', '--format=%an %s', out.wipCommit!)).toBe('minions-runner wip: runner checkpoint (timeout)');
@@ -229,8 +234,9 @@ describe('work run: supervise, cancel, timeout, drain', { timeout: 30_000 }, () 
     const r = rig();
     const b = await claim(r);
     const log = join(r.root, 'signals.log');
-    const out = await runLease(b.leaseId, r.deps({ steps: [{ op: 'logSignals', path: log }, { op: 'sleep', ms: 30_000 }] },
-      { timing: { timeoutMs: HANDLERS_TIMEOUT_MS, pollMs: 50, killGraceMs: 1_000, interruptGraceMs: 1_000, drainGraceMs: 100 } }));
+    const ready = join(r.root, 'ready.pid');
+    const out = await runLease(b.leaseId, r.deps({ steps: [{ op: 'logSignals', path: log }, { op: 'pidfile', path: ready }, { op: 'sleep', ms: 30_000 }] },
+      { timing: afterReady(ready, { pollMs: 50, killGraceMs: 1_000, interruptGraceMs: 1_000, drainGraceMs: 100 }) }));
     expect(out).toMatchObject({ status: 'partial', exit: { stopped: 'timeout', signal: 'SIGKILL' } });
     const lines = readFileSync(log, 'utf8').trim().split('\n').map((l) => l.split(' '));
     expect(lines.map(([sig]) => sig)).toEqual(['SIGINT', 'SIGTERM']);
@@ -252,8 +258,9 @@ describe('work run: supervise, cancel, timeout, drain', { timeout: 30_000 }, () 
     await r.sched.release(b.leaseId, 'next');
     const b2 = await claim(r);
     const log = join(r.root, 'signals2.log');
-    const out2 = await runLease(b2.leaseId, r.deps({ steps: [{ op: 'logSignals', path: log }, { op: 'sleep', ms: 30_000 }] },
-      { timing: { timeoutMs: HANDLERS_TIMEOUT_MS, pollMs: 50, killGraceMs: 300, interruptGraceMs: 60_000, drainGraceMs: 100 } }));
+    const ready = join(r.root, 'ready2.pid');
+    const out2 = await runLease(b2.leaseId, r.deps({ steps: [{ op: 'logSignals', path: log }, { op: 'pidfile', path: ready }, { op: 'sleep', ms: 30_000 }] },
+      { timing: afterReady(ready, { pollMs: 50, killGraceMs: 300, interruptGraceMs: 60_000, drainGraceMs: 100 }) }));
     expect(out2).toMatchObject({ exit: { stopped: 'timeout', signal: 'SIGKILL' } });
     expect(readFileSync(log, 'utf8').trim().split('\n').map((l) => l.split(' ')[0])).toEqual(['SIGINT', 'SIGTERM']);
   });
@@ -263,8 +270,9 @@ describe('work run: supervise, cancel, timeout, drain', { timeout: 30_000 }, () 
     const b = await claim(r);
     const log = join(r.root, 'member-signals.log');
     // The leader ignores both graceful signals (as minions-sandbox ignores SIGINT); only the group member logs them.
-    const out = await runLease(b.leaseId, r.deps({ steps: [{ op: 'groupChildLogSignals', path: log }, { op: 'ignoreTerm' }, { op: 'sleep', ms: 30_000 }] },
-      { timing: { timeoutMs: HANDLERS_TIMEOUT_MS, pollMs: 50, killGraceMs: 300, interruptGraceMs: 200, drainGraceMs: 100 } }));
+    const ready = join(r.root, 'ready.pid');
+    const out = await runLease(b.leaseId, r.deps({ steps: [{ op: 'groupChildLogSignals', path: log }, { op: 'ignoreTerm' }, { op: 'pidfile', path: ready }, { op: 'sleep', ms: 30_000 }] },
+      { timing: afterReady(ready, { pollMs: 50, killGraceMs: 300, interruptGraceMs: 200, drainGraceMs: 100 }) }));
     expect(out).toMatchObject({ status: 'partial', exit: { stopped: 'timeout', signal: 'SIGKILL' } });
     expect(readFileSync(log, 'utf8').trim().split('\n')).toEqual(['SIGINT', 'SIGTERM']);
   });

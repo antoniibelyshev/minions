@@ -20,6 +20,11 @@ export interface SuperviseTiming {
   interruptGraceMs?: number;
   /** Drain grace before the worker is stopped (D3.6: 120 s). */
   drainGraceMs: number;
+  /**
+   * Test seam: the wall-clock limit starts once this settles instead of at spawn, so a test can wait until its
+   * fake harness installed its signal handlers and still use a short limit. Unset in production.
+   */
+  timeoutStart?: Promise<unknown>;
 }
 /** SIGINT -> SIGTERM: long enough for Codex to end its turn and write its last events. */
 export const INTERRUPT_GRACE_MS = 5_000;
@@ -78,7 +83,10 @@ export function supervise(spec: SpawnSpec, timing: SuperviseTiming, hooks: Super
         killTimer = setTimeout(() => killGroup(pid, 'SIGKILL'), timing.killGraceMs);
       }, interruptGraceMs);
     };
-    const deadline = setTimeout(() => stop('timeout'), timing.timeoutMs);
+    let deadline: NodeJS.Timeout | undefined;
+    let finished = false;
+    const armDeadline = () => { if (!finished) deadline = setTimeout(() => stop('timeout'), timing.timeoutMs); };
+    if (timing.timeoutStart) timing.timeoutStart.then(armDeadline, armDeadline); else armDeadline();
     const ticker = setInterval(() => {
       if (polling || stopped) return;
       polling = true;
@@ -100,6 +108,7 @@ export function supervise(spec: SpawnSpec, timing: SuperviseTiming, hooks: Super
     if (spec.stdin !== 'open') { if (spec.stdin !== null) child.stdin.end(spec.stdin); else child.stdin.end(); }
     let spawnError: string | null = null;
     const finish = (code: number | null, signal: string | null) => {
+      finished = true;
       clearTimeout(deadline); clearInterval(ticker); clearTimeout(termTimer); clearTimeout(killTimer); clearTimeout(drainTimer);
       if (pid !== undefined) killGroup(pid, 'SIGKILL');
       if (buf) hooks.onLine(buf);
