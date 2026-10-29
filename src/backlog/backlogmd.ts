@@ -369,14 +369,14 @@ export class BacklogMdAdapter implements BacklogAdapter {
     return raws.map((r) => this.task(r!));
   }
 
-  async listReady(limit: number, leasedIds: Set<string>, scope: ScopeFilter): Promise<Task[]> {
+  async listReady(limit: number, leasedIds: Set<string>, scope: ScopeFilter, completed?: ReadonlySet<TaskStatus>): Promise<Task[]> {
     if (limit <= 0) return [];
     const list = await this.listRaw();
     const summary = new Map(list.map((t) => [normalizeId(t.id), this.task(t)]));
     // Only candidates need full details (dependencies); dependency status comes from the list.
     const candidates = list.filter((t) => mapStatus(t.status) === 'ready');
     const viewed = (await this.details(candidates, true)).filter((r): r is RawTask => !!r).map((r) => this.task(r));
-    return filterReady(viewed, { leased: new Set([...leasedIds].map(normalizeId)), scope, lookup: (id) => summary.get(id) }, limit);
+    return filterReady(viewed, { leased: new Set([...leasedIds].map(normalizeId)), scope, lookup: (id) => summary.get(id), ...(completed ? { completed } : {}) }, limit);
   }
 
   /** One task, with its bounded notes (listings leave notes out). */

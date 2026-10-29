@@ -16,8 +16,8 @@ export const DEFAULT_SENSITIVE_PATHS = [
   '**/migrations/**',
 ];
 
-/** Capabilities whose effect is upgraded allow→ask when a sensitive path is touched. */
-export const PUBLICATION_CAPABILITIES: Capability[] = ['git.push', 'pr.create', 'pr.merge'];
+/** Capabilities whose effect is upgraded allow→ask when a sensitive path is touched (base.merge: the local integrator). */
+export const PUBLICATION_CAPABILITIES: Capability[] = ['git.push', 'pr.create', 'pr.merge', 'base.merge'];
 
 const globCache = new Map<string, RegExp>();
 /** Minimal glob: `**` any depth (incl. zero dirs), `*` within a segment, `?` one char. */
@@ -84,6 +84,8 @@ const PROJECT_OWNER: Table = {
   'code.edit': noEditFor('allow', ['reviewer']), 'dependencies.edit': 'allow', 'architecture.change': 'allow', 'migrations.edit': 'allow',
   'git.commit': 'allow', 'git.push': 'allow',
   'pr.create': 'allow', 'pr.review': 'allow', 'pr.merge': 'ask',
+  // The local integrator lands approved heads on the base itself (owner allow / personal ask / supervised deny).
+  'base.merge': 'allow',
   'ci.edit': 'ask', 'infrastructure.edit': 'ask',
   'network.use': 'allow',
   'deploy.execute': 'deny',
@@ -93,14 +95,14 @@ const PERSONAL_WORK: Table = {
   ...PROJECT_OWNER,
   'external.comment': 'deny', 'external.changeStatus': 'deny', 'external.create': 'deny',
   'dependencies.edit': 'ask', 'architecture.change': 'ask', 'migrations.edit': 'ask',
-  'git.push': 'ask', 'pr.create': 'ask', 'pr.review': 'ask', 'pr.merge': 'deny',
+  'git.push': 'ask', 'pr.create': 'ask', 'pr.review': 'ask', 'pr.merge': 'deny', 'base.merge': 'ask',
   'ci.edit': 'deny',
 };
 
 const SUPERVISED: Table = {
   ...PROJECT_OWNER,
   'dependencies.edit': 'ask', 'architecture.change': 'ask', 'migrations.edit': 'ask',
-  'git.push': 'deny', 'pr.create': 'deny', 'pr.review': 'ask', 'pr.merge': 'deny',
+  'git.push': 'deny', 'pr.create': 'deny', 'pr.review': 'ask', 'pr.merge': 'deny', 'base.merge': 'deny',
 };
 
 export const DEFAULT_CAPABILITIES: Record<Profile, Table> = {

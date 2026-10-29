@@ -8,6 +8,8 @@ export const CAPABILITIES = [
   'code.edit', 'dependencies.edit', 'architecture.change', 'migrations.edit',
   'git.commit', 'git.push',
   'pr.create', 'pr.review', 'pr.merge',
+  // Local integration (docs/design/local-auto-integration.md): the runtime merging an approved head into the local base.
+  'base.merge',
   'ci.edit', 'infrastructure.edit',
   'network.use',
   'deploy.execute',

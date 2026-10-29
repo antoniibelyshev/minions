@@ -1,8 +1,9 @@
 // The local integrator (docs/design/local-auto-integration.md phase 2, task-82.2): the integration queue, its lock,
 // the verify runner in the persistent integration worktree, and crash recovery. It drives the phase 1 engine
-// (./integration.ts) and is run by the hidden `minions work integrate`. Phase 3 wires it to `work record`, the
-// task statuses and the repair flow; until then nothing enqueues automatically and an outcome changes only the
-// `integrations` row (plus events and the optional onSettled hook).
+// (./integration.ts) and is run by the hidden `minions work integrate`. Phase 3 (task-82.3) wires it up: a local
+// approval with local integration on queues the head and starts the integrator detached (Scheduler.record,
+// startIntegratorDetached), and onSettled moves the task (Scheduler.settleIntegration: landed -> done, a failure
+// -> changes-requested with an integrator finding, awaiting-approval -> awaiting-human).
 //
 // Architecture decisions (task-82.2):
 // - Lock: meta row `integration_lock` {pid, start, bootId, at}, taken in one IMMEDIATE transaction, with the
@@ -31,10 +32,12 @@
 // - Recovery: the recorded verify group is stopped only while its leader still matches the record (pid, start
 //   time, boot); then, when the base contains the recorded candidate C, the row is `landed` (the crash came after
 //   the swap) and integration_base = C; otherwise it is re-queued. /workspace/repo is never touched.
+import { spawn as nodeSpawn, type SpawnOptions } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { createWriteStream, existsSync, readFileSync, type WriteStream } from 'node:fs';
+import { closeSync, createWriteStream, existsSync, mkdirSync, openSync, readFileSync, type WriteStream } from 'node:fs';
 import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { can } from '../config/capabilities.js';
 import type { MinionsConfig } from '../config/schema.js';
 import { MinionsError } from '../core/errors.js';
 import { redact } from '../core/output.js';
@@ -384,7 +387,7 @@ export interface IntegratorDeps {
   config: () => MinionsConfig | Promise<MinionsConfig>;
   /** Dependencies of the task that are not integrated yet (the task waits). Default: none. */
   unmetDependencies?: (taskId: string) => string[] | Promise<string[]>;
-  /** Whether a change of `sensitive` paths may land for (task, head). Default: never (fail closed). */
+  /** Whether a signed merge approval covers (task, head); asked when base.merge is "ask" for the change (always for sensitive paths). Default: never (fail closed). */
   approved?: (row: IntegrationRow, sensitive: string[]) => boolean | Promise<boolean>;
   /** Called when a row reaches a terminal phase (phase 3 moves the task). Errors are logged, not fatal. */
   onSettled?: (row: IntegrationRow) => void | Promise<void>;
@@ -503,7 +506,19 @@ export async function runIntegrator(d: IntegratorDeps): Promise<IntegratorReport
       }
       if (!row) { report.exit = 'waiting'; break; }
       report.waiting = [];
-      const r = await integrateOne(row);
+      let r: IntegratorExit | null;
+      try { r = await integrateOne(row); } catch (e) {
+        // An unexpected throw must not leave the row running (the next pass would recover and retry it forever):
+        // count it as a transient failure, so it is retried once and then ends `transient`.
+        const cur = getRow(d.db, row.id);
+        const msg = `the integrator failed during ${cur.phase}: ${(e as Error)?.message ?? e}`;
+        log(`minions integrator: ${row.task_id}: ${msg}`);
+        if ((RUNNING_PHASES as readonly string[]).includes(cur.phase)) {
+          d.db.exec('UPDATE integrations SET verify_pid = NULL, verify_start = NULL, verify_boot = NULL WHERE id = ?', cur.id);
+          await transient(getRow(d.db, cur.id), msg);
+        }
+        r = null;
+      }
       if (r) { report.exit = r; break; }
     }
   } finally {
@@ -551,8 +566,14 @@ export async function runIntegrator(d: IntegratorDeps): Promise<IntegratorReport
     const paths = await integrationChangedPaths(d.repo, B, C, cfg.sensitivePaths, d.signal ? { signal: d.signal } : {});
     if (!paths.ok && stopRequested()) return stopped('during the changed-paths check');
     if (!paths.ok) { await transient(row, paths.message); return null; }
-    if (paths.sensitive.length && !(await (d.approved?.(row, paths.sensitive) ?? false))) {
-      await settle(row, 'awaiting-approval', `sensitive paths need a signed merge approval of ${row.head_sha}: ${paths.sensitive.join(', ')}`);
+    // Policy (task-82.3): base.merge for the changed paths (a sensitive path upgrades allow to ask). deny ends the
+    // row awaiting-approval with the reason (the task is then left to the user); ask needs a signed merge approval.
+    const effect = can(cfg, 'base.merge', { paths: paths.changed });
+    if (effect === 'deny') { await settle(row, 'awaiting-approval', 'base.merge is denied by policy: the user integrates this branch'); return null; }
+    if (effect === 'ask' && !(await (d.approved?.(row, paths.sensitive) ?? false))) {
+      await settle(row, 'awaiting-approval', paths.sensitive.length
+        ? `sensitive paths need a signed merge approval of ${row.head_sha}: ${paths.sensitive.join(', ')}`
+        : `base.merge is "ask": the landing needs a signed merge approval of ${row.head_sha}`);
       return null;
     }
     const landedBefore = d.db.all<{ candidate_sha: string }>("SELECT candidate_sha FROM integrations WHERE task_id = ? AND phase = 'landed' AND candidate_sha IS NOT NULL AND id <> ?", row.task_id, row.id).map((x) => x.candidate_sha);
@@ -609,7 +630,10 @@ export async function runIntegrator(d: IntegratorDeps): Promise<IntegratorReport
  * `work integrate --adopt-base`: clears a halt and takes the current base as the integration base (the owner
  * checked that the reset or rewrite is intended).
  */
-export async function adoptIntegrationBase(db: RuntimeDb, repo: string, baseBranch: string): Promise<{ base: string; clearedHalt: IntegrationHalt | null }> {
+export async function adoptIntegrationBase(db: RuntimeDb, repo: string, baseBranch: string, pc: LockProcessView = systemLockView): Promise<{ base: string; clearedHalt: IntegrationHalt | null }> {
+  // A running integrator owns the base record: never move it under a live holder.
+  const held = integrationLockState(db, pc);
+  if (held.state === 'live') throw new MinionsError('CONFLICT', `the integrator is running (pid ${held.lock.pid}); adopt the base after it exits`);
   const base = await baseSha(repo, baseBranch);
   if (!base) throw new MinionsError('PRECONDITION', `refs/heads/${baseBranch} cannot be read in ${repo}`);
   return db.transaction(() => {
@@ -622,3 +646,30 @@ export async function adoptIntegrationBase(db: RuntimeDb, repo: string, baseBran
   });
 }
 
+
+export interface DetachedIntegratorDeps {
+  /** Output of the detached integrator (appended). */
+  log: string;
+  cwd: string;
+  env?: NodeJS.ProcessEnv;
+  spawn?: (cmd: string, args: string[], opts: SpawnOptions) => { pid?: number | undefined; on(ev: 'error', fn: (e: Error) => void): unknown; unref(): void };
+}
+
+/**
+ * Starts the hidden integrator command detached (its own session; the caller's tool call does not own it), as
+ * coordinator.ts scheduleDetachedRestart does. A second integrator exits at once on the held lock, so starting
+ * one per queued integration is safe. Returns the pid (null when the spawn failed early).
+ */
+export function startIntegratorDetached(d: DetachedIntegratorDeps): number | null {
+  mkdirSync(dirname(d.log), { recursive: true });
+  const fd = openSync(d.log, 'a', 0o600);
+  try {
+    const spawn = d.spawn ?? ((c: string, a: string[], o: SpawnOptions) => nodeSpawn(c, a, o));
+    const child = spawn('minions', ['work', 'integrate'], { cwd: d.cwd, detached: true, stdio: ['ignore', fd, fd], env: d.env ?? process.env });
+    child.on('error', () => { /* nothing to report to; the routine tick and `work publish` start it again */ });
+    child.unref();
+    return child.pid ?? null;
+  } finally {
+    try { closeSync(fd); } catch { /* the child holds its own copy */ }
+  }
+}

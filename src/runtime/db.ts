@@ -36,8 +36,12 @@ export interface EvidenceRow {
  * approved head. pending: approved, not yet published (or interrupted); awaiting-approval: needs a
  * recorded human approval (sensitive paths or an "ask" capability); failed: retryable with
  * `minions work publish`; published: pushed (and PR opened in pull-request mode).
+ * Local delivery with local integration on (mode `local`, docs/design/local-auto-integration.md): queued: the
+ * approved head waits for or runs in the local integrator; awaiting-approval: the landing needs a host-signed
+ * merge approval; failed: the integration failed (repair, or a blocked transient failure); published: landed on
+ * the base.
  */
-export type PublicationState = 'pending' | 'awaiting-approval' | 'failed' | 'published';
+export type PublicationState = 'pending' | 'queued' | 'awaiting-approval' | 'failed' | 'published';
 export interface PublicationRow {
   task_id: string; branch: string; head_sha: string; mode: string; state: PublicationState;
   pr_url: string | null; error_code: string | null; error: string | null;

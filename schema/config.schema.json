@@ -650,6 +650,9 @@
         "pr.merge": {
           "$ref": "#/$defs/__schema4"
         },
+        "base.merge": {
+          "$ref": "#/$defs/__schema4"
+        },
         "ci.edit": {
           "$ref": "#/$defs/__schema4"
         },
@@ -681,6 +684,7 @@
         "pr.create",
         "pr.review",
         "pr.merge",
+        "base.merge",
         "ci.edit",
         "infrastructure.edit",
         "network.use",
@@ -858,6 +862,7 @@
                 "pr.create",
                 "pr.review",
                 "pr.merge",
+                "base.merge",
                 "ci.edit",
                 "infrastructure.edit",
                 "network.use",
@@ -917,6 +922,9 @@
                 "$ref": "#/$defs/__schema5"
               },
               "pr.merge": {
+                "$ref": "#/$defs/__schema5"
+              },
+              "base.merge": {
                 "$ref": "#/$defs/__schema5"
               },
               "ci.edit": {

@@ -2,6 +2,7 @@ import { closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readSy
 import { basename, dirname, join } from 'node:path';
 import { filterReady } from '../backlog/ready.js';
 import type { BacklogAdapter, Task } from '../backlog/types.js';
+import { dependencyDoneStatuses } from '../config/delivery.js';
 import { AGENT_MODEL_ALIASES, isAgentModelAlias } from '../config/models.js';
 import { HARNESSES, isProcessHarness } from '../config/harnesses.js';
 import { agentTypeRole, DEEP_SUFFIX, workerRoleNames } from '../config/roles.js';
@@ -108,7 +109,7 @@ export async function stopHook(input: unknown, load: HookLoader, env: NodeJS.Pro
       return allow('backlog-error', `backlog query failed (${(e as Error).message})`);
     }
     const byId = new Map(tasks.map((t) => [t.id, t]));
-    const ready = filterReady(tasks, { leased, scope: scopeOf(config), lookup: (id) => byId.get(id) }, 50);
+    const ready = filterReady(tasks, { leased, scope: scopeOf(config), lookup: (id) => byId.get(id), completed: dependencyDoneStatuses(config) }, 50);
     const cap = capacityOf(config, leases, tasks);
     const canStart = cap.freeTaskSlots > 0 && cap.freeEngineerSlots > 0;
     const startable = canStart ? ready.filter((t) => !leased.has(t.id)) : [];

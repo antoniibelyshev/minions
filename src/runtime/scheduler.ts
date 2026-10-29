@@ -1,8 +1,9 @@
 import { randomBytes } from 'node:crypto';
 import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import type { BacklogAdapter, ScopeFilter, Task, TaskStatus } from '../backlog/types.js';
 import { can, matchesAny } from '../config/capabilities.js';
-import { isGithubDelivery } from '../config/delivery.js';
+import { dependencyDoneStatuses, isGithubDelivery, localIntegrationEnabled } from '../config/delivery.js';
 import { isSmall, notReadyReason, sortByPriority } from '../backlog/ready.js';
 import { CURRENT_PHASE, HARNESSES, harnessModels, isHarnessId, isProcessHarness, phaseAllows, type HarnessId, type PhaseRules } from '../config/harnesses.js';
 import { launchFor, type Launch } from '../config/launch.js';
@@ -31,6 +32,7 @@ import { ciGateFromDb, formatCiGate, type CiGate } from './ci-gate.js';
 import { autoMergeTask, type MergeResult } from './merge.js';
 import { AUTO_PROMOTE_REFUSED_EVENT, unpromotedReason } from './auto-promote.js';
 import { gateGit } from './git-hardening.js';
+import { enqueueIntegration, integrationRows, openIntegration, startIntegratorDetached, type IntegrationRow } from './integrator.js';
 import { BRANCH_PREFIX, branchFor, ensureBranchWorktree, ensureReviewWorktree, git, headOf, resolveBaseBranch, taskSlug, workspaceLayout, type WorkspaceLayout } from './worktree.js';
 
 export const LEASE_ROLES: readonly BuiltinLeaseRole[] = ['engineer', 'tester', 'reviewer'];
@@ -42,8 +44,11 @@ export const ROLE_STATUSES: Record<BuiltinLeaseRole, TaskStatus[]> = {
   reviewer: ['reviewing'],
 };
 
-/** Statuses that occupy active-task capacity even between worker stages. Blocked/human-waiting tasks do not. */
-export const IN_FLIGHT: TaskStatus[] = ['implementing', 'testing', 'reviewing', 'changes-requested', 'awaiting-ci', 'merging'];
+/**
+ * Statuses that occupy active-task capacity even between worker stages. Blocked/human-waiting tasks do not, nor
+ * does `merging` (the local integrator runs it; no worker does: docs/design/local-auto-integration.md).
+ */
+export const IN_FLIGHT: TaskStatus[] = ['implementing', 'testing', 'reviewing', 'changes-requested', 'awaiting-ci'];
 
 export interface SchedulerDeps {
   db: RuntimeDb;
@@ -73,6 +78,11 @@ export interface SchedulerDeps {
    * (base-update.ts ServerUrlFn; default the URL itself). Only code sets it, never config or the environment.
    */
   serverUrl?: ServerUrlFn;
+  /**
+   * Starts the local integrator (`minions work integrate`) detached after an integration was queued (local
+   * integration on). Default: integrator.ts startIntegratorDetached. Tests inject one.
+   */
+  startIntegrator?: () => void;
 }
 
 /**
@@ -337,9 +347,11 @@ export class Scheduler {
   private readonly now: () => Date;
   private readonly runs: RunControl | null;
   private readonly serverUrl: ServerUrlFn | undefined;
+  private readonly startIntegratorFn: () => void;
 
   constructor(deps: SchedulerDeps) {
     this.serverUrl = deps.serverUrl;
+    this.startIntegratorFn = deps.startIntegrator ?? (() => { startIntegratorDetached({ log: join(runtimePaths().logs, 'integration', 'integrator.log'), cwd: this.layout.repo }); });
     this.runs = deps.runs ?? null;
     this.db = deps.db; this.backlog = deps.backlog; this.config = deps.config;
     this.layout = deps.layout ?? workspaceLayout();
@@ -605,7 +617,7 @@ export class Scheduler {
     const leases = this.db.activeLeases();
     const leased = new Set(leases.map((l) => l.task_id));
     const byId = new Map(tasks.map((t) => [t.id, t]));
-    const readyCtx = { leased, scope: scopeOf(cfg), lookup: (id: string) => byId.get(id) };
+    const readyCtx = { leased, scope: scopeOf(cfg), lookup: (id: string) => byId.get(id), completed: dependencyDoneStatuses(cfg) };
     const candidates: NextStage[] = [];
     const stuck: StuckTask[] = [];
     const waiting: WaitingStage[] = [];
@@ -876,7 +888,8 @@ export class Scheduler {
         try { d = byId.get(dep) ?? await this.backlog.getTask(dep); } catch (e) {
           throw new MinionsError('PRECONDITION', `Task ${task.id}: dependency ${dep} cannot be read (${(e as Error).message}).`);
         }
-        if (d.status !== 'done' && d.status !== 'delivered') throw new MinionsError('PRECONDITION', `Task ${task.id} depends on ${dep}, which is "${d.status}".`);
+        // Local integration on: only `done` (on the base) satisfies a dependency (config/delivery.ts dependencyDoneStatuses).
+        if (!dependencyDoneStatuses(cfg).has(d.status)) throw new MinionsError('PRECONDITION', `Task ${task.id} depends on ${dep}, which is "${d.status}".`);
       }
     }
     // GitHub delivery: the base recorded for the lease is origin's base as the server reported it and the
