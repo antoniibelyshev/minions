@@ -344,6 +344,9 @@ describe('Telegram tools are coordinator-only', () => {
     const { read } = await gen(telegram());
     const coord = await read('coordinator.md');
     expect(coord).toContain('Communication channel: Telegram');
+    // task-57.15: owner messages arrive under either source form (plugin or standalone server).
+    expect(coord).toContain('`<channel source="plugin:telegram:telegram" chat_id=… …>`');
+    expect(coord).toContain('`<channel source="telegram" chat_id=… …>`');
     expect(coord).toContain('the plugin drops unpaired senders');
     expect(coord).toMatch(/Never give them to workers/);
     expect(coord).toMatch(/Pairing and access changes .* happen only in the terminal/);
