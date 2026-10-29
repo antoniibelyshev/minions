@@ -489,6 +489,16 @@ function outcomeNote(rec: RunRecord): string | null {
   return parts.join('; ');
 }
 
+/**
+ * True when `leader` is still the recorded process (same pid and start time; a zombie still holds its pid) and leads
+ * process group `pgid`. False after pid reuse, when the record has no wrapper or group, or when /proc cannot tell.
+ */
+async function leadsGroup(leader: ProcIdentity | null, pgid: number | null, proc: string): Promise<boolean> {
+  if (!leader || !pgid || leader.pid !== pgid) return false;
+  const s = await procStat(pgid, proc);
+  return !!s && s.startTime === leader.startTime && s.pgrp === pgid;
+}
+
 /** Waits up to `ms` for the record to be `done`; returns it then, else null. */
 async function waitDone(state: string, leaseId: string, ms: number, poll: number): Promise<RunRecord | null> {
   const until = Date.now() + ms;
@@ -507,7 +517,7 @@ async function waitDone(state: string, leaseId: string, ms: number, poll: number
  * 1. No record or `done`: nothing to do (the note repeats a finished run's outcome).
  * 2. The runner (or another reaper) is alive: mark cancel and wait `waitMs` (60 s) for `done`.
  * 3. Otherwise, or on timeout: SIGKILL the recorded runner, wrapper and process group (each checked against its
- *    recorded start time), then sweep for sandboxed escapees whose ancestry reaches no live wrapper. A record from
+ *    recorded start time; the group only while the recorded wrapper still leads it), then sweep for sandboxed escapees whose ancestry reaches no live wrapper. A record from
  *    another boot or container start skips this step: its processes are gone.
  * 4. Take the owner lock, run post-exit with a drain-style `wip:` commit, mark the record `done`.
  * A live reaper that still holds the lock after the wait is a CONFLICT (the caller retries; the lease stays).
@@ -543,11 +553,15 @@ export async function reapRun(leaseId: string, deps: ReapDeps): Promise<ReapOutc
   const killed: number[] = [];
   let escapees: EscapeeSweep | null = null;
   if (live) {
+    // Checked before anything is killed: the wrapper must still be the recorded process and lead the recorded group.
+    const groupOk = await leadsGroup(rec.wrapper, rec.pgid, proc);
     const targets: (ProcIdentity | null)[] = [rec.runner, rec.wrapper, holder?.role === 'runner' && sameHost(holder.host, host) ? holder : null];
     for (const p of targets) {
       if (p && p.pid !== process.pid && !killed.includes(p.pid) && await isAlive(p, proc)) { try { process.kill(p.pid, 'SIGKILL'); killed.push(p.pid); } catch { /* gone */ } }
     }
-    if (rec.pgid && rec.wrapper) {
+    // A dead wrapper's pid may now lead an unrelated, newer group (any detached spawn), which the start-time filter
+    // alone does not exclude: the group is swept only when the wrapper matched; the marker-based sweep runs anyway.
+    if (groupOk && rec.pgid && rec.wrapper) {
       for (const pid of await groupMembers(rec.pgid, rec.wrapper.startTime, proc)) {
         if (pid === process.pid || killed.includes(pid)) continue;
         try { process.kill(pid, 'SIGKILL'); killed.push(pid); } catch { /* gone */ }

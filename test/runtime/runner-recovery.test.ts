@@ -15,7 +15,7 @@ import { claimWithBrief } from '../../src/runtime/handoff.js';
 import { fakeAdapter } from '../../src/runtime/runner/adapter.js';
 import { hasRunMarker, sweepEscapees } from '../../src/runtime/runner/escapees.js';
 import {
-  acquireOwner, createRunRecord, hostIdentity, openRunsSync, ownerLockPath, ownerToken, procIdentity, readOwner, readRunRecord, runDir, runRecordPath,
+  acquireOwner, createRunRecord, hostIdentity, isAlive, openRunsSync, ownerLockPath, ownerToken, procIdentity, readOwner, readRunRecord, runDir, runRecordPath,
   withOpenRuns, type RunRecord,
 } from '../../src/runtime/runner/record.js';
 import { reapRun, recoverRuns, runLease, type ReapDeps, type RunnerDeps } from '../../src/runtime/runner/run.js';
@@ -400,6 +400,54 @@ describe('escapee sweep (Seccomp_filters above the container baseline, injectabl
     expect(reaped.killed).toEqual(expect.arrayContaining([rec.pgid, 777]));
     expect(r.db.events('task-1', 'run-recovered').map((e) => e.data)).toContainEqual(expect.objectContaining({ escapees: [777] }));
     await p;
+  });
+});
+
+// ------------------------------------------------------------------- group sweep only under the recorded leader (task-100)
+
+/** A detached process (it leads its own group) with one child in that group; both are this test's to clean up. */
+async function detachedGroup() {
+  const code = "const c = require('node:child_process').spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' }); console.log(c.pid); setInterval(() => {}, 1000);";
+  const leader = spawn(process.execPath, ['-e', code], { detached: true, stdio: ['ignore', 'pipe', 'ignore'], env: { PATH: process.env.PATH } });
+  const memberPid = await new Promise<number>((res, rej) => {
+    let out = '';
+    leader.stdout!.on('data', (d: Buffer) => { out += String(d); if (out.includes('\n')) res(Number(out.trim())); });
+    leader.once('exit', () => rej(new Error('the decoy exited early')));
+  });
+  const ids = await Promise.all([procIdentity(leader.pid!), procIdentity(memberPid)]);
+  if (!ids[0] || !ids[1]) throw new Error('the decoy group never started');
+  return { leader, leaderId: ids[0], memberId: ids[1], cleanup: () => { try { process.kill(-leader.pid!, 'SIGKILL'); } catch { /* gone */ } } };
+}
+
+describe('reapRun sweeps the recorded group only while the recorded wrapper still leads it', () => {
+  it('a stale record whose pgid is now a live detached decoy (other start time) leaves the decoy and its group alive', async () => {
+    const r = rig();
+    const b = await claim(r);
+    const g = await detachedGroup();
+    try {
+      // The recorded wrapper died and its pid now leads the decoy's group: the start-time filter alone would match it.
+      await strayRecord(r, b.leaseId, 'task-1', { host: await hostIdentity(), wrapper: { pid: g.leaderId.pid, startTime: '1' }, pgid: g.leaderId.pid } as Partial<RunRecord>);
+      const reaped = await reapRun(b.leaseId, r.reapDeps());
+      expect(reaped).toMatchObject({ action: 'recovered', killed: [] });
+      expect((await readRunRecord(r.paths.state, b.leaseId))?.phase).toBe('done');
+      await sleep(200);
+      expect(await isAlive(g.leaderId)).toBe(true);
+      expect(await isAlive(g.memberId)).toBe(true);
+    } finally { g.cleanup(); }
+  });
+
+  it('a wrapper that still matches the record is killed with the rest of its group', async () => {
+    const r = rig();
+    const b = await claim(r);
+    const g = await detachedGroup();
+    try {
+      await strayRecord(r, b.leaseId, 'task-1', { host: await hostIdentity(), wrapper: g.leaderId, pgid: g.leaderId.pid } as Partial<RunRecord>);
+      const reaped = await reapRun(b.leaseId, r.reapDeps());
+      expect(reaped.action).toBe('recovered');
+      expect(reaped.killed).toEqual(expect.arrayContaining([g.leaderId.pid, g.memberId.pid]));
+      expect(await isAlive(g.leaderId)).toBe(false);
+      expect(await isAlive(g.memberId)).toBe(false);
+    } finally { g.cleanup(); }
   });
 });
 
