@@ -32,7 +32,7 @@ import { githubHints, inspectGithub } from './github-setup.js';
 import { harnessChecks, harnessSkipChecks, parseWorkProbe } from './harness-checks.js';
 import { harnessView } from '../runtime/sandbox/probe.js';
 import { HANG_GUARD_TIMEOUT_TEST, hangGuarded } from '../runtime/hook-guard.js';
-import { HOST_RUNTIME_SHORT, HostRuntime, hostTools, prepareHostRuntime, runtimeOf } from './runtime.js';
+import { HOST_RUNTIME_SHORT, HostRuntime, ensureHostWorktreesDir, hostTools, hostWorktreesDirState, prepareHostRuntime, runtimeOf, type WorktreesDirState } from './runtime.js';
 import type { ProjectJson } from './project.js';
 import { projectPaths } from '../core/paths.js';
 import { access } from 'node:fs/promises';
@@ -414,6 +414,23 @@ function probePermission(stdout: string): { mode: string; fallback: boolean; rea
   } catch { return undefined; }
 }
 
+/**
+ * workspace.worktrees (task-3): the coordinator sandbox cannot create <repo>/.git/worktrees, so `minions work claim`
+ * fails without it. A missing directory is created here, outside the sandbox, and reported.
+ */
+export async function worktreesDirCheck(repo: string, add: Add): Promise<WorktreesDirState> {
+  const dir = `${repo}/.git/worktrees`;
+  const before = await hostWorktreesDirState(repo);
+  const after = before === 'missing' ? await ensureHostWorktreesDir(repo).catch((): WorktreesDirState => 'missing') : before;
+  const start = 'Run `minions start --no-attach` (it creates the directory outside the sandbox).';
+  if (after === 'no-repo') add('workspace.worktrees', 'warn', 'skipped: the host workspace has no repository yet', start);
+  else if (after === 'invalid') add('workspace.worktrees', 'fail', `${dir} (or .git) is a symlink or not a directory; worker worktrees cannot be created`, `Remove it, then ${start[0]!.toLowerCase()}${start.slice(1)}`);
+  else if (after === 'missing') add('workspace.worktrees', 'fail', `${dir} is missing and could not be created; \`minions work claim\` fails in the sandbox`, `Create it on the host: mkdir '${dir}'`);
+  else if (before === 'missing') add('workspace.worktrees', 'warn', `${dir} was missing (sandboxed \`git worktree add\` cannot create it); created it`);
+  else add('workspace.worktrees', 'ok', `${dir} exists; worker worktrees can be created from the sandbox`);
+  return after;
+}
+
 /** Host runtime: coordinator session, Claude auth on the host, launch probe, Telegram plugin (via the runtime shim). */
 async function hostRuntimeChecks(project: ProjectJson, auth: ClaudeAuth, baseUrl: string | undefined, wantsTelegram: boolean,
   runner: Runner, add: Add, checks: Check[]): Promise<Check | undefined> {
@@ -443,6 +460,7 @@ async function hostRuntimeChecks(project: ProjectJson, auth: ClaudeAuth, baseUrl
   add('hooks.hangGuard', guard.code === 0 ? 'ok' : 'fail',
     guard.code === 0 ? `hook hang guard works (${via === 'timeout' ? 'coreutils timeout' : 'perl watchdog'})` : `hook hang guard failed (exit ${guard.code}): neither coreutils timeout nor perl works, so every worker hook blocks`,
     guard.code === 0 ? undefined : 'Install perl or coreutils (`brew install coreutils` provides gtimeout; link it as `timeout` on PATH).');
+  await worktreesDirCheck(host.paths.repo, add);
   if (!(await host.prepared())) {
     for (const n of ['claude.capabilities', 'telegram.plugin']) add(n, 'warn', 'skipped: host runtime not prepared yet', 'Run `minions start --no-attach`.');
     return undefined;
