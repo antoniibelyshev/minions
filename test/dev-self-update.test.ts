@@ -815,6 +815,26 @@ describe('self-update health check and rollback (phase 3)', () => {
     expect(readState()).toMatchObject({ current: null, badShas: [] });
   });
 
+  it('a failed upgrade that rebuilt the image without a CLI backup still rolls back, even with a healthy coordinator', () => {
+    // No CLI backup (the CLI step did not reinstall), but the image tag moved and the container runs the new image,
+    // with a healthy coordinator: the health-unchanged shortcut must not apply, the old image comes back.
+    wrapMinions(`case "$*" in *"upgrade --rebuild-cli"*) echo "$*" >> "$FAKE/minions.log"; echo sha256:newimage > "$FAKE/img/minions-runtime:0.1.0"; cp "$FAKE/img/minions-runtime:0.1.0" "$FAKE/container-image"; echo '{"ok":true,"data":{"ok":false,"steps":[{"id":"origin","status":"failed","detail":"no network"}],"stopped":null}}'; exit 1 ;; esac`);
+    setRequests([request('cr_aaaaaaaa')]);
+    const r = runScript('--once');
+    expect(r.code, r.err).toBe(0);
+    const apply = events().find((e) => e.event === 'apply');
+    expect(steps(apply)).not.toContain('health-unchanged:done');
+    expect(steps(apply)).not.toContain('health-unchanged:failed');
+    expect(steps(apply)).toEqual(expect.arrayContaining(['upgrade:failed', 'rollback-cli:done', 'rollback-image:done', 'rollback-start:done', 'health-after-rollback:done']));
+    expect(npmLog()).not.toMatch(/^install -g/m);
+    expect(dockerLog()).toContain('tag minions-runtime:0.1.0-prev minions-runtime:0.1.0');
+    expect(minionsLog()).toMatch(/--json down\n--json start --no-attach\n/);
+    expect(containerImg()).toBe('sha256:0ldimage');
+    expect(apply).toMatchObject({ outcome: 'failed', rollback: { healthy: true } });
+    expect(apply?.rollback).not.toHaveProperty('skipped');
+    expect(marks()[1]).toMatch(/the coordinator is healthy again on the previous build; .* is not recorded as bad/);
+  });
+
   it('a failed upgrade that replaced nothing but left no healthy coordinator still rolls back', () => {
     wrapMinions(`case "$*" in *"upgrade --rebuild-cli"*) echo "$*" >> "$FAKE/minions.log"; rm -f "$FAKE/running"; cat "$FAKE/container-image" > "$FAKE/broken-image"; echo '{"ok":true,"data":{"ok":false,"steps":[{"id":"drain","status":"failed","detail":"timeout"}],"stopped":null}}'; exit 1 ;; "--json start --no-attach") rm -f "$FAKE/broken-image" ;; esac`);
     setRequests([request('cr_aaaaaaaa')]);
