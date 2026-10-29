@@ -39,6 +39,7 @@ import { editProjectConfig, revisionConflict } from './config-write.js';
 import { loadCredentialRefs, type CredentialsJson } from './credentials.js';
 import { refreshDerived } from './install.js';
 import { loadEffectiveConfig, projectConfigPath, resolveEffective, type ProjectJson } from './project.js';
+import { runtimeOf } from './runtime-kind.js';
 
 export const SETTING_GROUPS = ['Delivery', 'Verification', 'Reporting', 'Models', 'Concurrency', 'Policy', 'Permissions', 'Integrations', 'Pause', 'Agents', 'Container'] as const;
 export type SettingGroup = (typeof SETTING_GROUPS)[number];
@@ -201,7 +202,7 @@ const DECLARED: readonly DeclaredSetting[] = [
     description: 'decide: agents make and record architecture decisions within a task; propose: they ask first',
     loosens: (f, t) => (f === 'propose' && t === 'decide' ? 'agents make architecture decisions without asking' : null) },
   { key: 'coordinator.permissionMode', group: 'Policy', label: 'Coordinator permission mode', type: 'enum', choices: ['auto', 'acceptEdits'], optional: true, apply: 'launch',
-    description: 'auto: a classifier may approve actions outside the allow list; acceptEdits: prompt for every other Bash call',
+    description: 'auto: a classifier may approve actions outside the allow list; acceptEdits: prompt for every other Bash call. Host runtime: honoured only from config.local.json (otherwise default)',
     loosens: (f, t) => ((f === 'acceptEdits') && (t === 'auto' || t === undefined) ? 'a classifier may approve coordinator actions outside the allow list without prompting' : null) },
   { key: 'coordinator.contextReset.enabled', group: 'Policy', label: 'Routine context resets', type: 'bool', apply: 'live',
     description: 'the coordinator hands off and restarts with a fresh context when idle' },
@@ -594,7 +595,7 @@ export async function planSetting(ctx: SettingsContext, key: string, to: Value, 
   if (localRaw !== undefined && (typeof localRaw !== 'object' || localRaw === null || Array.isArray(localRaw))) {
     throw new MinionsError('INVALID_CONFIG', `${localFile}: must be a JSON object; not changed.`, 'Fix the file by hand, then rerun.');
   }
-  const from = currentValue(def, ctx);
+  let from = currentValue(def, ctx);
   const revision = resolveEffective(project, projectRaw, localRaw, { project: projectFile, local: localFile }).config.configRevision;
   const nextProject = layer === 'shared' ? setPath(structuredClone(projectRaw), key, to) : projectRaw;
   const nextLocal = layer === 'local' ? setPath(structuredClone(localRaw ?? {}), key, to) : localRaw;
@@ -604,11 +605,47 @@ export async function planSetting(ctx: SettingsContext, key: string, to: Value, 
   if (layer === 'shared' && localRaw !== undefined && getPath(localRaw, key) !== undefined && !same(now, to)) {
     warnings.push(`${key} is overridden in ${localFile}; the local value still wins on this host.`);
   }
-  const changed = !same(from, now);
+  let changed = !same(from, now);
+  let loosens = changed && def.loosens ? def.loosens(from, now) : null;
+  const host = hostPermissionChange(project, key, localRaw, nextLocal, layer);
+  if (host) {
+    // The host runtime's mode moves with the local layer only (the merged value may not change at all).
+    changed ||= host.was !== host.will;
+    loosens = host.loosens;
+    from = host.was === 'default' ? undefined : host.was; // what the host runtime uses now (unset = default)
+    if (host.warning) warnings.push(host.warning);
+  }
   return {
-    key, from, to, layer, file, changed, loosens: changed && def.loosens ? def.loosens(from, now) : null,
+    key, from, to, layer, file, changed, loosens,
     needsRestart: changed && def.class === 'restart', needsUpgrade: changed && def.class === 'recreate',
     apply: def.apply, class: def.class, hostOwned: def.hostOwned, effective, revision, warnings,
+  };
+}
+
+type HostMode = 'default' | 'acceptEdits' | 'auto';
+const HOST_MODE_RANK: Record<HostMode, number> = { default: 0, acceptEdits: 1, auto: 2 };
+const hostModeOf = (local: unknown): HostMode => {
+  const v = getPath(local, 'coordinator.permissionMode');
+  return v === 'auto' || v === 'acceptEdits' ? v : 'default';
+};
+
+/**
+ * Task-8: coordinator.permissionMode on a host-runtime project. The host runtime honours it only from the host-only
+ * config.local.json (src/runtime/host-permission.ts), so the host mode before and after the change comes from that
+ * layer, and a move above `default` (or from acceptEdits to auto) loosens policy and needs a confirmation. A shared
+ * write does not change the host mode; it gets a warning. null for other keys and the container runtime.
+ */
+export function hostPermissionChange(project: Pick<ProjectJson, 'runtime'>, key: string, localRaw: unknown, nextLocal: unknown, layer: SettingLayer):
+  { was: HostMode; will: HostMode; loosens: string | null; warning?: string } | null {
+  if (key !== 'coordinator.permissionMode' || runtimeOf(project) !== 'host') return null;
+  const was = hostModeOf(localRaw); const will = hostModeOf(nextLocal);
+  const what = will === 'auto'
+    ? 'a classifier may approve coordinator actions outside the allow list without prompting'
+    : 'the coordinator\'s file edits are accepted without prompting (Bash outside the allow list still asks)';
+  return {
+    was, will,
+    loosens: HOST_MODE_RANK[will] > HOST_MODE_RANK[was] ? `the host-runtime coordinator runs in permission mode ${will} instead of ${was}: ${what}` : null,
+    ...(layer === 'shared' ? { warning: `${key} in the shared configuration is ignored by the host runtime (it stays ${was}); only the host-only config.local.json counts there: omit --shared.` } : {}),
   };
 }
 

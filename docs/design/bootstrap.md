@@ -451,7 +451,11 @@ Decision record for running agents without Docker (`src/host/runtime.ts`, `src/h
   servers, plugins, statusLine, permission rules, `sandbox.excludedCommands`, repo `CLAUDE.md`
   auto-loading. Still applied: managed settings, user `sandbox.credentials` deny entries (documented),
   the minions plugin and its hooks. Login credentials are not settings, so `login` keeps working.
-  `--permission-mode` is forced to `default` (the config value may come from the repository). The
+  `--permission-mode` is `default` (the merged config value may come from the repository), unless the
+  owner sets `coordinator.permissionMode` (`auto` / `acceptEdits`) in the host-only `config.local.json`
+  (task-8): the host CLI writes only that layer's value to `runtime/host-permission.json` (agent-readable,
+  not agent-writable), and the runtime honours it only on the host, from that file, while it matches the
+  merged config; everything else fails closed to `default`. Allow/deny/ask rules are identical in every mode. The
   doctor/coordinator probe also requires these flags in `claude --help`.
 - **Hardening (coordinator `--settings`).** Keys verified in the Claude Code 2.1.292 docs
   (code.claude.com/docs/en/sandboxing, settings-reference, cli-reference): `sandbox.enabled`,

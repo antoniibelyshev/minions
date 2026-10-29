@@ -27,9 +27,10 @@ import { CONTAINER } from '../core/paths.js';
 import { resolveOnPath } from '../host/auth.js';
 import { TELEGRAM_PLUGIN_ID } from '../telegram/probe.js';
 import {
-  coordinatorDisallowedTools, coordinatorSettings, effectivePermissionMode, hostPromptNote, readPrompt, runtimeAuthMethod,
+  coordinatorDisallowedTools, coordinatorSettings, effectivePermissionMode, hostPermissionFromEnv, hostPromptNote, readPrompt, runtimeAuthMethod,
   type HostHardening, type RuntimeAuthMethod,
 } from './coordinator.js';
+import type { HostPermissionLayer } from './host-permission.js';
 import { checkHeadlessArgs, credentialEnv, HEADLESS_DROP_ENV, prepareHeadlessCredential, type HeadlessCredential, type HeadlessLaunch, type ReadText } from './headless.js';
 import type { SessionKind } from './db.js';
 import { GENERAL_SESSION_NOTE } from './router-prompt.js';
@@ -180,6 +181,8 @@ export interface SessionCommandDeps {
   hostRuntime?: boolean;
   /** The installed Claude Code's --permission-mode choices (claudePermissionModes); undefined = not checked. */
   permissionModes?: readonly string[] | null;
+  /** Host runtime: the owner's opt-in from config.local.json (default: hostPermissionFromEnv(env); task-8). */
+  hostLocal?: HostPermissionLayer | null;
   /** The session prompt (default: the coordinator prompt; the task skill replaces it in phase 7). */
   prompt?: string;
   /** Claude session id to continue (`--resume`). */
@@ -220,7 +223,9 @@ export async function buildSessionCommand(cfg: MinionsConfig, key: string, deps:
   const onHost = deps.hostRuntime ?? runtimeMode(env) === 'host-runtime';
   if (deps.resume !== undefined && !SESSION_ID.test(deps.resume)) throw new MinionsError('INVALID_CONFIG', 'Not a Claude session id for --resume.');
   // Throws for bypassPermissions (never allowed) and when the strict mode is unavailable.
-  const mode = effectivePermissionMode(cfg, onHost, deps.permissionModes);
+  // Host runtime: default unless the owner opted in through the host-only config.local.json (task-8).
+  const hostLocal = deps.hostLocal !== undefined ? deps.hostLocal : onHost ? hostPermissionFromEnv(env).layer : null;
+  const mode = effectivePermissionMode(cfg, onHost, deps.permissionModes, hostLocal);
 
   const plan = await prepareHeadlessCredential(method, paths, deps.readText);
   const prompt = deps.prompt ?? await readPrompt(paths) + (onHost ? hostPromptNote(paths) : '') + (k.taskId ? taskSessionPromptNote(k.taskId) : GENERAL_SESSION_NOTE);

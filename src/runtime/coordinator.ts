@@ -20,6 +20,7 @@ import { checkTelegramPoller, disableTelegramAtUserScope, type PollerCheck, type
 import { checkTelegramTokenFormat } from '../telegram/token.js';
 import { HOST_TELEGRAM_REASON, resolveChannel, type ChannelFacts } from '../telegram/channel.js';
 import { runtimePaths, type RuntimePaths } from './paths.js';
+import { FORBIDDEN_PERMISSION_MODES, HOST_OPT_IN_MODES, hostPermissionPath, permissionSourceLabel, readHostPermission, type HostOptInMode, type HostPermissionLayer, type HostPermissionRead, type PermissionModeSource } from './host-permission.js';
 import { claudePermissionModes, parsePermissionModes, strictPermissionModeArg } from './permission-modes.js';
 import { openDb, pidAlive, type CoordinatorLock, type RuntimeDb } from './db.js';
 import { ROUTER_PROMPT, ROUTER_START_PROMPT } from './router-prompt.js';
@@ -362,6 +363,9 @@ export function configuredPermissionMode(cfg: PermCfg): CoordinatorPermissionMod
   return cfg.permissionMode === 'default' ? 'default' : 'auto';
 }
 
+export type { PermissionModeSource } from './host-permission.js';
+export { permissionSourceLabel } from './host-permission.js';
+
 export interface PermissionModeDecision {
   configured: CoordinatorPermissionMode;
   /** Value passed to `claude --permission-mode` (`manual` = default on a Claude Code that lists only that name). */
@@ -369,6 +373,10 @@ export interface PermissionModeDecision {
   /** Auto was configured but this Claude Code does not offer it (or its --help could not be read). */
   fallback: boolean;
   reason: string;
+  /** The layer that chose the mode. */
+  source: PermissionModeSource;
+  /** host-local: the config.local.json the opt-in came from. */
+  sourceFile?: string;
 }
 
 // The --help choice parser and the strict-mode mapping live in ./permission-modes.ts (shared with the
@@ -394,45 +402,90 @@ function strictMode(modes: readonly string[] | null | undefined, where: string):
   return { mode: r.mode, note: r.mode === 'manual' ? ' (passed as manual, the name this Claude Code lists for it)' : '' };
 }
 
+/** Throws POLICY_DENIED for a mode the coordinator may never use (bypassPermissions, dontAsk), from any layer. */
+function refuseForbidden(value: unknown, where: string): void {
+  if (typeof value === 'string' && (FORBIDDEN_PERMISSION_MODES as readonly string[]).includes(value)) {
+    throw new MinionsError('POLICY_DENIED', `permissionMode ${value} is never allowed for the coordinator (${where}).`);
+  }
+}
+
 /**
- * The coordinator's launch permission mode. Host runtime: always `default` (the config may come from the
- * repository). Default is passed as `manual` when `modes` lists only that name, and throws
- * INCOMPATIBLE_RUNTIME when `modes` lists neither (fail closed). Container: the configured mode; "auto" falls back to "acceptEdits" when `modes` (the
- * installed Claude Code's choices) lacks it or is null. `modes` undefined = not checked: the configured mode.
+ * The host runtime's opt-in as read from <project>/runtime/host-permission.json (see ./host-permission.ts):
+ * the host-only config.local.json value, never the merged config. Fails closed (no opt-in) on any doubt.
+ */
+export function hostPermissionFromEnv(env: NodeJS.ProcessEnv = process.env): HostPermissionRead {
+  const paths = runtimePaths(env);
+  return readHostPermission(hostPermissionPath(env), [paths.workspace, paths.state]);
+}
+
+/**
+ * The coordinator's launch permission mode.
+ * Host runtime: `default`, unless the owner opted in through the host-only config.local.json layer (`hostLocal`;
+ * undefined = read <project>/runtime/host-permission.json, which the host writes from that layer only). The
+ * repository's / shared .minions/config.json value is ignored there, and the opt-in counts only when the merged
+ * config carries the same value (the local layer wins the merge; a mismatch is a stale record: fail closed).
+ * Default is passed as `manual` when `modes` lists only that name, and throws INCOMPATIBLE_RUNTIME when `modes`
+ * lists neither (fail closed).
+ * Container: the configured mode.
+ * In both, "auto" falls back to "acceptEdits" when `modes` (the installed Claude Code's choices) lacks it or is
+ * null; `modes` undefined = not checked: the configured mode. bypassPermissions and dontAsk are always refused.
  * Only the mode changes: coordinatorSettings emits the same allow/deny/ask rules in every mode.
  */
-export function decidePermissionMode(cfg: PermCfg, opts: { hostRuntime?: boolean; modes?: readonly string[] | null } = {}): PermissionModeDecision {
-  if ((cfg.permissionMode as string) === 'bypassPermissions' || (cfg.coordinator?.permissionMode as string) === 'bypassPermissions') {
-    throw new MinionsError('POLICY_DENIED', 'permissionMode bypassPermissions is never allowed for the coordinator.');
+export function decidePermissionMode(cfg: PermCfg, opts: { hostRuntime?: boolean; modes?: readonly string[] | null; hostLocal?: HostPermissionLayer | null } = {}): PermissionModeDecision {
+  refuseForbidden(cfg.permissionMode, 'permissionMode');
+  refuseForbidden(cfg.coordinator?.permissionMode, 'coordinator.permissionMode');
+  if (opts.hostRuntime ?? runtimeMode() === 'host-runtime') {
+    let note = '';
+    let local: HostPermissionLayer | null;
+    if (opts.hostLocal !== undefined) local = opts.hostLocal;
+    else { const r = hostPermissionFromEnv(); local = r.layer; if (r.note) note = `; ${r.note}`; }
+    refuseForbidden(local?.mode, 'config.local.json');
+    if (local && !(HOST_OPT_IN_MODES as readonly string[]).includes(local.mode)) local = null;
+    if (local && cfg.coordinator?.permissionMode !== local.mode) {
+      note += `; the host-only opt-in (${local.mode}) does not match the runtime config (${cfg.coordinator?.permissionMode ?? 'unset'}), so it is ignored: run \`minions start\` to regenerate the runtime files`;
+      local = null;
+    }
+    if (!local) {
+      const s = strictMode(opts.modes, 'host runtime');
+      const ignored = cfg.coordinator?.permissionMode
+        ? `; coordinator.permissionMode "${cfg.coordinator.permissionMode}" from the project configuration is ignored on the host runtime (only config.local.json counts: \`minions settings set coordinator.permissionMode ${cfg.coordinator.permissionMode}\` on the host)`
+        : '';
+      return { configured: 'default', mode: s.mode, fallback: false, source: 'host-default',
+        reason: `host runtime: the coordinator runs in permission mode default${s.note}${ignored}${note}` };
+    }
+    const where = `host runtime, coordinator.permissionMode from the host-only config.local.json`;
+    return { ...modeFor(local.mode, opts.modes, where, ''), source: 'host-local', sourceFile: local.source };
   }
   const configured = configuredPermissionMode(cfg);
-  if (opts.hostRuntime ?? runtimeMode() === 'host-runtime') {
-    const s = strictMode(opts.modes, 'host runtime');
-    return { configured, mode: s.mode, fallback: false, reason: `host runtime: the coordinator always runs in permission mode default${s.note}` };
-  }
+  const source: PermissionModeSource = cfg.coordinator?.permissionMode || cfg.permissionMode === 'default' ? 'config' : 'default';
   // Legacy top-level "acceptEdits" (the old default) no longer opts out; say so wherever the mode is reported.
   const legacy = cfg.permissionMode === 'acceptEdits' && !cfg.coordinator?.permissionMode
     ? '; legacy permissionMode "acceptEdits" is ignored; set coordinator.permissionMode "acceptEdits" to opt out'
     : '';
   if (configured === 'default') {
     const s = strictMode(opts.modes, 'permissionMode "default"');
-    return { configured, mode: s.mode, fallback: false, reason: `coordinator permission mode default${s.note}` };
+    return { configured, mode: s.mode, fallback: false, source, reason: `coordinator permission mode default${s.note}` };
   }
-  if (configured !== 'auto' || opts.modes === undefined || opts.modes?.includes('auto')) {
-    return { configured, mode: configured, fallback: false, reason: `coordinator permission mode ${configured}${legacy}` };
+  return { ...modeFor(configured, opts.modes, 'coordinator', legacy), source };
+}
+
+/** auto / acceptEdits for `modes`: auto falls back to acceptEdits where this Claude Code does not offer it. */
+function modeFor(configured: HostOptInMode, modes: readonly string[] | null | undefined, where: string, legacy: string): Omit<PermissionModeDecision, 'source'> {
+  if (configured !== 'auto' || modes === undefined || modes?.includes('auto')) {
+    return { configured, mode: configured, fallback: false, reason: `${where} permission mode ${configured}${legacy}` };
   }
-  const why = opts.modes === null
+  const why = modes === null
     ? 'could not read the --permission-mode choices from `claude --help`'
-    : `the installed Claude Code does not offer --permission-mode auto (choices: ${opts.modes.join(', ')})`;
+    : `the installed Claude Code does not offer --permission-mode auto (choices: ${modes.join(', ')})`;
   return {
     configured, mode: 'acceptEdits', fallback: true,
     reason: `${why}; falling back to permission mode acceptEdits (Bash outside the allow list asks). Update Claude Code to get auto, or set coordinator.permissionMode "acceptEdits".${legacy}`,
   };
 }
 
-/** Host runtime: permission mode from the (repository-influenced) config is ignored; always `default` (argv `manual` where only that is listed). */
-export const effectivePermissionMode = (cfg: PermCfg, hostRuntime = runtimeMode() === 'host-runtime', modes?: readonly string[] | null) =>
-  decidePermissionMode(cfg, { hostRuntime, modes }).mode;
+/** The `--permission-mode` value (see decidePermissionMode; host runtime: default unless opted in through config.local.json). */
+export const effectivePermissionMode = (cfg: PermCfg, hostRuntime = runtimeMode() === 'host-runtime', modes?: readonly string[] | null, hostLocal?: HostPermissionLayer | null) =>
+  decidePermissionMode(cfg, { hostRuntime, modes, ...(hostLocal !== undefined ? { hostLocal } : {}) }).mode;
 
 function assertNoBypass(cfg: MinionsConfig): void {
   decidePermissionMode(cfg, { hostRuntime: false });
@@ -505,7 +558,7 @@ export function coordinatorDisallowedTools(cfg: Pick<MinionsConfig, 'coordinator
  * argv of the coordinator's claude process. Never contains a secret. `startupPrompt` becomes the first user message.
  * `permissionModes`: the installed Claude Code's --permission-mode choices (claudePermissionModes); undefined = not checked.
  */
-export async function buildClaudeCommand(cfg: MinionsConfig, paths: RuntimePaths = runtimePaths(), opts: { telegram?: boolean; startupPrompt?: string; permissionModes?: readonly string[] | null } = {}): Promise<CoordinatorCommand> {
+export async function buildClaudeCommand(cfg: MinionsConfig, paths: RuntimePaths = runtimePaths(), opts: { telegram?: boolean; startupPrompt?: string; permissionModes?: readonly string[] | null; hostLocal?: HostPermissionLayer | null } = {}): Promise<CoordinatorCommand> {
   assertNoBypass(cfg);
   const onHost = runtimeMode() === 'host-runtime';
   const router = isRouterLaunch(cfg);
@@ -521,7 +574,7 @@ export async function buildClaudeCommand(cfg: MinionsConfig, paths: RuntimePaths
     args: [
       '--plugin-dir', paths.pluginDir,
       '--append-system-prompt', prompt,
-      '--permission-mode', effectivePermissionMode(cfg, onHost, opts.permissionModes),
+      '--permission-mode', effectivePermissionMode(cfg, onHost, opts.permissionModes, opts.hostLocal),
       // Host runtime: no user/project/local settings (their hooks, MCP servers, plugins, permission
       // rules and sandbox exclusions would apply outside the sandbox) and no MCP servers at all;
       // only --settings below, managed settings and the minions plugin apply. The agents' clone and
@@ -532,7 +585,7 @@ export async function buildClaudeCommand(cfg: MinionsConfig, paths: RuntimePaths
       ...(effort ? ['--effort', effort] : []),
       // Startup context trim (task-48). One comma-separated value: the option is variadic.
       ...(disallowed.length ? ['--disallowedTools', disallowed.join(',')] : []),
-      '--settings', JSON.stringify(coordinatorSettings(cfg, { ...opts, paths })),
+      '--settings', JSON.stringify(coordinatorSettings(cfg, { telegram: opts.telegram, paths })),
       ...(opts.telegram ? ['--channels', TELEGRAM_CHANNEL_SPEC] : []),
       // After `--` so a variadic option (--channels) cannot swallow the prompt.
       ...(startupPrompt ? ['--', startupPrompt] : []),
@@ -596,7 +649,23 @@ export interface LaunchRecord {
   telegram: TelegramDecision;
   /** The launch id the wrapper also passes to the minions channel server (MINIONS_COORDINATOR_LAUNCH); not a secret. Written once the launch swap (task-67.4) lands. */
   launchId?: string;
+  /** The permission mode the coordinator was launched in and the layer that chose it (task-8; absent: older launch). */
+  permission?: LaunchPermission;
 }
+
+/** A launch's permission decision as recorded (and shown by `minions status`). */
+export interface LaunchPermission {
+  mode: PermissionModeArg;
+  configured: CoordinatorPermissionMode;
+  source: PermissionModeSource;
+  sourceFile?: string;
+  fallback: boolean;
+  reason: string;
+}
+
+export const launchPermission = (d: PermissionModeDecision): LaunchPermission => ({
+  mode: d.mode, configured: d.configured, source: d.source, ...(d.sourceFile ? { sourceFile: d.sourceFile } : {}), fallback: d.fallback, reason: d.reason,
+});
 
 export async function readLaunchRecord(paths: RuntimePaths = runtimePaths()): Promise<LaunchRecord | null> {
   try {
@@ -650,6 +719,8 @@ export interface RunCoordinatorDeps {
   timer?: (fn: () => void, ms: number) => () => void;
   /** The installed Claude Code's --permission-mode choices (default: `claude --help`); asked unless acceptEdits is configured in the container (permissionModesNeeded). */
   permissionModes?: () => Promise<string[] | null>;
+  /** Host runtime: the owner's opt-in from config.local.json (default: hostPermissionFromEnv, <project>/runtime/host-permission.json). */
+  hostPermission?: () => HostPermissionRead;
   /** Pre-spawn signal guard of coordinatorWrapper: a signal before claude starts cancels the launch. */
   preSpawn?: PreSpawnGuard;
   /** Process table for stopping claude's MCP children on SIGKILL (default: /proc). */
@@ -747,9 +818,15 @@ export async function runCoordinator(cfg: MinionsConfig, deps: RunCoordinatorDep
   const permissionModes = permissionModesNeeded(cfg)
     ? await (deps.permissionModes ?? (() => claudePermissionModes()))().catch(() => null) : undefined;
   if (cancelled() !== null) return cancelled()!;
-  const perm = decidePermissionMode(cfg, { modes: permissionModes });
+  // Host runtime: the owner's opt-in from config.local.json (task-8), read once so the decision, the argv and
+  // the launch record agree.
+  const onHost = runtimeMode() === 'host-runtime';
+  const hostRead = onHost ? (deps.hostPermission ?? hostPermissionFromEnv)() : { layer: null };
+  const perm = decidePermissionMode(cfg, { hostRuntime: onHost, modes: permissionModes, hostLocal: hostRead.layer });
   if (perm.fallback) log(`minions: ${perm.reason}`);
-  const c = await buildClaudeCommand(cfg, paths, { telegram: decision.enabled, startupPrompt: deps.startupPrompt, permissionModes });
+  if (hostRead.note) log(`minions: ${hostRead.note}`);
+  if (onHost && perm.source === 'host-local') log(`minions: permission mode ${perm.mode} (${permissionSourceLabel(perm)}).`);
+  const c = await buildClaudeCommand(cfg, paths, { telegram: decision.enabled, startupPrompt: deps.startupPrompt, permissionModes, hostLocal: hostRead.layer });
   if (cancelled() !== null) return cancelled()!;
   // Task-51: the plugin stays off at user scope, so only this launch (its --settings enabledPlugins)
   // loads it. Re-applied on every launch: existing setups get it on the next start, restart or upgrade.
@@ -765,7 +842,8 @@ export async function runCoordinator(cfg: MinionsConfig, deps: RunCoordinatorDep
   delete env[TELEGRAM_TOKEN_ENV];
   if (decision.enabled && token.state === 'ok') env[TELEGRAM_TOKEN_ENV] = token.token;
   if (isRouterLaunch(cfg)) Object.assign(env, ROUTER_SESSION_ENV);
-  const record: LaunchRecord = { version: 1, pid: process.pid, startedAt: new Date().toISOString(), fingerprint: launchFingerprint(cfg, token), channel: cfg.communication.channel, telegram: decision };
+  const record: LaunchRecord = { version: 1, pid: process.pid, startedAt: new Date().toISOString(), fingerprint: launchFingerprint(cfg, token), channel: cfg.communication.channel, telegram: decision,
+    permission: launchPermission(perm) };
   await atomicWrite(paths.coordinatorLaunch, JSON.stringify(record, null, 2) + '\n').catch(() => { /* state not writable: restart detection degrades */ });
   const spawn = deps.spawn ?? (nodeSpawn as unknown as SpawnLike);
   const signals = deps.signals ?? process;

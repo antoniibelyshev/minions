@@ -63,7 +63,9 @@ describe('host runtime claude launch (H1, M8)', () => {
     const dir = env.root;
     mkdirSync(join(dir, 'plugin'), { recursive: true });
     writeFileSync(join(dir, 'plugin', 'coordinator.md'), 'coordinator prompt\n');
-    return { MINIONS_PLUGIN_DIR: join(dir, 'plugin'), MINIONS_STATE_DIR: join(dir, 'state'), MINIONS_WORKSPACE: join(dir, 'ws'), MINIONS_SECRETS_DIR: join(dir, 'secrets') };
+    // MINIONS_CONFIG points at an empty runtime dir: no host opt-in record (never the real project's).
+    return { MINIONS_PLUGIN_DIR: join(dir, 'plugin'), MINIONS_STATE_DIR: join(dir, 'state'), MINIONS_WORKSPACE: join(dir, 'ws'), MINIONS_SECRETS_DIR: join(dir, 'secrets'),
+      MINIONS_CONFIG: join(dir, 'runtime', 'config.json') };
   }
 
   it('host: no user/project/local settings, no MCP servers, workspace+state as working dirs, permission mode forced to default', async () => {

@@ -8,6 +8,7 @@ import { run } from '../core/exec.js';
 import { redact } from '../core/output.js';
 import { CONTAINER } from '../core/paths.js';
 import { VERSION } from '../core/version.js';
+import { permissionSourceLabel, type PermissionModeSource } from '../runtime/host-permission.js';
 import { DEFAULT_REFRESH_MINUTES, authOf, containerEnv, describeSource, expandHome, isKeyAuth, maskValue, resolveOnPath, secretStatus, type ClaudeAuth } from './auth.js';
 import type { MinionsConfig } from '../config/schema.js';
 import { ciSetupPlan, fetchApi, requiredChecksStatus, type RequiredChecksReport } from '../runtime/ci.js';
@@ -406,13 +407,24 @@ export function telegramReadiness(res: ChannelResolution, tgPlugin: Check | unde
   }
 }
 
+interface ProbedPermission { mode: string; fallback: boolean; reason: string; source?: PermissionModeSource; sourceFile?: string }
+
 /** Launch permission mode reported by `minions coordinator --probe --json` (undefined: older output). */
-function probePermission(stdout: string): { mode: string; fallback: boolean; reason: string } | undefined {
+function probePermission(stdout: string): ProbedPermission | undefined {
   try {
-    const p = (JSON.parse(stdout) as { data?: { permission?: { mode?: unknown; fallback?: unknown; reason?: unknown } } }).data?.permission;
-    return p && typeof p.mode === 'string' ? { mode: p.mode, fallback: p.fallback === true, reason: String(p.reason ?? '') } : undefined;
+    const p = (JSON.parse(stdout) as { data?: { permission?: { mode?: unknown; fallback?: unknown; reason?: unknown; source?: unknown; sourceFile?: unknown } } }).data?.permission;
+    if (!p || typeof p.mode !== 'string') return undefined;
+    const source = typeof p.source === 'string' && ['host-local', 'host-default', 'config', 'default'].includes(p.source) ? p.source as PermissionModeSource : undefined;
+    return { mode: p.mode, fallback: p.fallback === true, reason: String(p.reason ?? ''), ...(source ? { source } : {}), ...(typeof p.sourceFile === 'string' ? { sourceFile: p.sourceFile } : {}) };
   } catch { return undefined; }
 }
+
+/** `; permission mode X (chosen by <layer>)` for the claude.capabilities detail (task-8); the reason on a fallback. */
+const permissionDetail = (perm: ProbedPermission | undefined): string => {
+  if (!perm) return '';
+  const by = perm.source ? `, chosen by ${permissionSourceLabel({ source: perm.source, ...(perm.sourceFile ? { sourceFile: perm.sourceFile } : {}) })}` : '';
+  return `; permission mode ${perm.mode}${perm.fallback ? ` (${perm.reason})` : ''}${by}`;
+};
 
 /** Host runtime: coordinator session, Claude auth on the host, launch probe, Telegram plugin (via the runtime shim). */
 async function hostRuntimeChecks(project: ProjectJson, auth: ClaudeAuth, baseUrl: string | undefined, wantsTelegram: boolean,
@@ -450,7 +462,11 @@ async function hostRuntimeChecks(project: ProjectJson, auth: ClaudeAuth, baseUrl
   await prepareHostRuntime(project).catch(() => undefined);
   const ex = (args: string[]) => host.exec(args, { allowFailure: true, timeoutMs: 60_000 });
   const probe = await ex(['minions', 'coordinator', '--probe', '--json']);
-  add('claude.capabilities', probe.code === 0 ? 'ok' : 'fail', probe.code === 0 ? 'Claude Code supports the coordinator launch flags; launch command resolves; sandbox settings applied' : `coordinator probe failed (exit ${probe.code}): ${short(probe.stderr || probe.stdout)}`);
+  // Task-8: the host runtime's mode is default unless the owner opted in through config.local.json; say which layer chose it.
+  const perm = probe.code === 0 ? probePermission(probe.stdout) : undefined;
+  add('claude.capabilities', probe.code !== 0 ? 'fail' : perm?.fallback ? 'warn' : 'ok', probe.code === 0
+    ? `Claude Code supports the coordinator launch flags; launch command resolves; sandbox settings applied${permissionDetail(perm)}`
+    : `coordinator probe failed (exit ${probe.code}): ${short(probe.stderr || probe.stdout)}`);
   return telegramRuntimeChecks(ex, wantsTelegram, checks);
 }
 
@@ -701,7 +717,7 @@ export async function runDoctor(opts: {
         const probe = await ex(['minions', 'coordinator', '--probe', '--json']);
         const perm = probe.code === 0 ? probePermission(probe.stdout) : undefined;
         add('claude.capabilities', probe.code !== 0 ? 'fail' : perm?.fallback ? 'warn' : 'ok', probe.code === 0
-          ? `Claude Code supports the coordinator launch flags; launch command resolves${perm ? `; permission mode ${perm.mode}${perm.fallback ? ` (${perm.reason})` : ''}` : ''}`
+          ? `Claude Code supports the coordinator launch flags; launch command resolves${permissionDetail(perm)}`
           : `coordinator probe failed (exit ${probe.code}): ${short(probe.stderr || probe.stdout)}`);
         // Credential-free; never 'fail' because terminal mode must stay usable without Telegram.
         tgPlugin = await telegramRuntimeChecks(ex, wantsTelegram, checks);

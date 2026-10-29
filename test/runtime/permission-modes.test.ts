@@ -88,9 +88,9 @@ describe('strictPermissionModeArg: both --help formats', () => {
 
 describe('coordinator: strict mode under the listed name', () => {
   it('host runtime passes manual on 2.1.292, default on older CLIs, and throws when neither is listed', async () => {
-    const host = (help: string) => decidePermissionMode(defaults(), { hostRuntime: true, modes: parsePermissionModes(help) });
-    expect(host(HELP_MANUAL)).toMatchObject({ configured: 'auto', mode: 'manual', fallback: false, reason: expect.stringMatching(/permission mode default \(passed as manual/) });
-    expect(host(HELP_DEFAULT)).toMatchObject({ mode: 'default', reason: 'host runtime: the coordinator always runs in permission mode default' });
+    const host = (help: string) => decidePermissionMode(defaults(), { hostRuntime: true, modes: parsePermissionModes(help), hostLocal: null });
+    expect(host(HELP_MANUAL)).toMatchObject({ configured: 'default', source: 'host-default', mode: 'manual', fallback: false, reason: expect.stringMatching(/permission mode default \(passed as manual/) });
+    expect(host(HELP_DEFAULT)).toMatchObject({ mode: 'default', reason: 'host runtime: the coordinator runs in permission mode default' });
     expect(() => host(HELP_NEITHER)).toThrow(expect.objectContaining({ code: 'INCOMPATIBLE_RUNTIME', message: expect.stringMatching(/not started in a looser mode/) }));
   });
 
@@ -113,6 +113,7 @@ describe('coordinator: strict mode under the listed name', () => {
 
   it('buildClaudeCommand and probeRuntime on the host runtime', async () => {
     process.env.MINIONS_RUNTIME = 'host';
+    delete process.env.MINIONS_CONFIG; // no host opt-in record: never the real project's
     const paths = pluginPaths();
     expect(modeOf((await buildClaudeCommand(defaults(), paths, { permissionModes: parsePermissionModes(HELP_MANUAL) })).args)).toBe('manual');
     expect(modeOf((await buildClaudeCommand(defaults(), paths, { permissionModes: parsePermissionModes(HELP_DEFAULT) })).args)).toBe('default');
