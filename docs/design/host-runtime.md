@@ -34,9 +34,11 @@ straight from the checkout stays rejected, and the host dev loop runs the same p
 - **Self-update** stays a dev-only script (TG 461). It gets a host mode, with the same gate, health check and
   rollback, but with no image steps.
 - **Local auto-integration** (task-82) works on the host too. Commands run from the coordinator's sandbox only queue
-  integrations. Only host-side processes outside the sandbox start the integrator: the coordinator wrapper, and the
-  upgrade. The gate's `npm test` runs under a minions-generated macOS sandbox profile. Upgrades and self-update wait
-  while an integration holds its lock.
+  integrations. Only host-side processes outside the sandbox start the integrator: the coordinator wrapper, the
+  upgrade, and the watchdog's crash start (`--recover`). The gate's `npm test` runs under a minions-generated macOS
+  sandbox profile. Upgrades and self-update wait while an integration holds its lock.
+- **Self-restart on the host.** The sandbox cannot reach tmux, and must not. A context reset or self-restart from the
+  coordinator only writes a restart request. The coordinator wrapper, outside the sandbox, carries it out.
 - **Migration** is a drain, then a state export, the switch, and a state import. The Docker volumes are kept, so
   rollback is the same steps in reverse.
 
@@ -106,6 +108,20 @@ What is missing (the gaps this design closes):
    clear refusal. The wrapper's watch, the host upgrade and the watchdog run outside the sandbox, so an integrator
    they start runs the gate unsandboxed, as the owner. The same queue gets different safety levels depending on the
    starter. In Docker every starter runs in the container.
+10. **A sandboxed self-restart cannot reach tmux, and must not.** `hostSettings` puts the tmux socket dir
+    (`/private/tmp/tmux-<uid>`, from `hostHardeningFromEnv`) in both `denyWrite` and `denyRead`. It also blocks every
+    Unix socket (`allowUnixSockets: []`, `allowAllUnixSockets: false`, `src/runtime/coordinator.ts`). The
+    coordinator restarts itself from Bash: the context reset (`RESET_RESTART_COMMAND`, the route skill), the idle
+    self-restart, and any `coordinator restart --detach`. `scheduleDetachedRestart` spawns `minions coordinator
+    restart` as a detached child, and that child stays in the coordinator's Seatbelt profile. Its tmux calls cannot
+    reach the `-L minions-<id8>` server. `has-session` and `kill-session` run with `allowFailure`, so they fail
+    silently. A relaunch could at most try to start a second tmux server inside the sandbox, and the denied socket
+    dir blocks that too. The old session keeps running with no reset, and the only trace is
+    `logs/context-reset.log`. Context reset and self-restart are therefore already broken on the host. The same
+    applies to the routine pass's wake and crash start when `sync --routine` runs from a sandboxed Bash. The wrapper
+    clock and the watchdog run that pass outside the sandbox. Opening the socket to the sandbox is not a fix. Any
+    process that can talk to the tmux server can run any command outside Seatbelt (`send-keys`, `new-window`,
+    `run-shell`), so the deny stays (D12).
 
 ## Decisions
 
@@ -151,10 +167,12 @@ What is missing (the gaps this design closes):
   writes the queue row and touches a wake file, and never spawns `minions work integrate`. These are all the
   callers in gap 9: `work record` (with or without `--submitted`), `work advance` (also in a task session),
   `work publish`, and `coordinator restart --recover` when it runs from the coordinator's Bash (directly or through
-  `--detach`). Only unsandboxed host-side starters start the integrator:
+  `--detach`; under D12 it only writes a restart request). Only unsandboxed host-side starters start the integrator:
   - the wrapper's `integrationWatch`. It already checks every minute; on the host it also wakes on the wake file,
-    so the delay stays a few seconds. The wrapper runs under the project's tmux server, outside the sandbox, also
-    after a self-restart (the restart starts the new wrapper through tmux);
+    so the delay stays a few seconds. The wrapper runs under the project's tmux server, outside the sandbox. This
+    also holds after a self-restart: under D12 a sandboxed restart only writes a request, and the wrapper hands it
+    to a detached restart outside the sandbox. That restart starts the new wrapper through tmux, and its own
+    `--recover` passes the probe;
   - the host upgrade's `coordinator restart --recover` (D7 step 5), which runs outside the sandbox;
   - the same `--recover` spawned by the routine crash start when the host manager's watchdog runs it host-side.
     It is redundant with the new wrapper's watch, but harmless: a second integrator exits at once on the held lock.
@@ -164,14 +182,52 @@ What is missing (the gaps this design closes):
   probe: it applies a trivial `sandbox-exec` profile, which fails inside an existing Seatbelt profile. If the probe
   fails, it refuses before it takes the `integration_lock` and before it touches any row. It records an
   `integrator-sandboxed` event, prints a clear error, touches the wake file and exits non-zero. The rows stay
-  `queued` and no attempt is counted, so the wrapper's watch picks them up. The integrator then runs its own steps
-  (git merge and landing with hardened git, DB writes) as the owner, and runs each verification command
+  `queued` and no attempt is counted, so the wrapper's watch picks them up. An unsandboxed starter (the wrapper's
+  watch, the host upgrade, the watchdog's crash start) runs the same probe before it spawns. A failure there cannot
+  be nesting. It means the mechanism is gone: `sandbox-exec` is missing, or a newer macOS changed it. The starter
+  then records `integration-sandbox-unavailable`, and `status` and `doctor` show it as red until a probe passes. That
+  way the queue does not stall silently. When the probe passes, the integrator runs its own steps (git merge and
+  landing with hardened git, DB writes) as the owner, and runs each verification command
   (`verification.setupCommands`, `npm test`, …) under `sandbox-exec` with a minions-generated Seatbelt profile:
   writes only to the integration worktree, `<state>/run/integration` and the integration logs, the same `denyRead`
   list as `hostSettings`, network GitHub and npm only. Running the gate inside the coordinator's inherited profile
   was rejected: Seatbelt cannot nest, so the integrator could not tighten it, and its scope would then depend on
   which starter won. Running the gate unsandboxed was rejected: the gate executes agent-written code (tests,
   install scripts) as the owner.
+- **D12. Self-restart on the host: a sandboxed restart only writes a request, and the wrapper carries it out.** This
+  mirrors D11. On the host, the following never call tmux when the D11 sandbox probe fails:
+  - `coordinator restart`, with or without `--detach`. This covers `RESET_RESTART_COMMAND` and the idle
+    self-restart;
+  - the routine pass's wake, when `sync --routine` runs from a sandboxed Bash.
+
+  Each of them first runs today's in-band checks: active leases and the drain, unless `--force`, as
+  `scheduleDetachedRestart` does. It then writes one `restart_request` meta row in the runtime DB
+  (`{mode: recover | wake | none, force, requestedAt, reason}`; a newer request replaces an older one), touches the
+  D11 wake file, and returns `restart-requested`. A sandboxed crash start has no wrapper to carry a request out, so
+  it refuses with a clear error, and the watchdog's host-side pass starts the coordinator.
+
+  The coordinator wrapper carries out the request. On the wake file, or on its minute tick, it reads and clears the
+  row in one transaction. It builds the argv from the enumerated fields only, never from free text, and spawns
+  `minions coordinator restart [--recover | --wake] [--force]` detached in its own session. That is the spawn
+  `scheduleDetachedRestart` uses today. The child runs outside the sandbox and outside the tmux session, so it
+  survives the `kill-session`. It checks leases and the drain again, and starts the new wrapper through
+  `tmux -L minions-<id8>`. A starting wrapper drops any request older than its own lock, since that request was
+  written for the session it replaces. If a request is still pending after 2 minutes, `status` and `doctor` show it
+  as red (`restart-request-stuck`). The tmux socket stays denied to the sandbox.
+
+  Why the wrapper:
+  - It is the one host-side process that always runs while a coordinator does, so a request never waits on
+    anything else.
+  - It already has the minute tick and the D11 wake file, and it is not sandboxed.
+  - It cannot kill its own session and survive. So it does not restart itself: it hands the restart to a detached
+    child, as the self-restart does today.
+
+  The alternatives were rejected:
+  - The watchdog runs only with `routine.enabled` and the host manager, every few minutes, so a context reset would
+    wait minutes or never happen.
+  - The host manager is optional and serves every project.
+  - A new small supervisor would be one more long-lived process to start, upgrade and watch, and the wrapper already
+    plays that role.
 
 ## Docker vs host: what the host loses, and the mitigations
 
@@ -182,7 +238,7 @@ What is missing (the gaps this design closes):
 | **Credentials** | Only this project's GitHub token, the bot token (read-only mount, also in the coordinator env) and the Claude login/key. | The owner's user. The sandbox `denyRead` covers the data root and secret dirs. File store, env allowlist. | Same, and the bot token is read only by the server process, which runs outside the sandbox. It is not in the `claude` env, and `denyRead` hides the file from Bash. The channel state sits outside `allowWrite`. | The Keychain is still reachable over `mach-lookup` from sandboxed commands. `security` is denied by pattern only, so the pre-bash fence covers wrappers (`sh -c`, `env`, `xargs`). The GitHub token is readable by agents, as in Docker. |
 | **Nested claude** | It loads the container's config dir, where the plugin is off. | A worker's `claude` uses the owner's `~/.claude` (their plugins, MCP servers, login). It is held back only by the sandbox network list (no `api.anthropic.com`). | The per-project config dir (D3) has no plugin at user scope, and the channel server is never at user scope. `Bash(claude*)` is denied, and the pre-bash fence refuses `claude` in any position. | None beyond Docker's. |
 | **Worktree / state** | Volumes at `/workspace/{repo,worktrees}`, `/state`. | `<MINIONS_HOME>/projects/<id>/host/{workspace,state}`. On macOS the path contains a space (`Application Support`). | Same, plus `host/claude` and `host/cli/<fp>` (host-owned, not agent-writable, Edit-denied). The prompt note already maps `/workspace` and `/state` (`hostPromptNote`). | The dev suite must pass with a space in cwd and without loopback binding or Unix sockets (`allowLocalBinding: false`). Phase 0 checks this. |
-| **Integration gate** (task-82) | The integrator and its `npm test` run in the container, in `/workspace/integration`, with an allowlisted env and a fresh `HOME`. | Inherits Seatbelt when a call from the coordinator's Bash spawns it (`work record`, `work advance`, `work publish`, `coordinator restart --recover`), unsandboxed when the wrapper backstop, the host upgrade or the watchdog does (gap 9). | Started only by unsandboxed host-side starters (the wrapper's watch, the host upgrade's `--recover`); sandboxed entry points only queue, and `work integrate` refuses when it is already sandboxed. Each verification command runs under a minions-generated Seatbelt profile (D11). The allowlisted env and fresh `HOME` stay. | The integrator's own git and DB steps run unsandboxed as the owner (as minions' own git calls do today, with `git-hardening.ts`). `sandbox-exec` is deprecated by Apple but is the mechanism Claude Code's sandbox itself uses. The suite must pass under that profile (phase 0). |
+| **Integration gate** (task-82) | The integrator and its `npm test` run in the container, in `/workspace/integration`, with an allowlisted env and a fresh `HOME`. | Inherits Seatbelt when a call from the coordinator's Bash spawns it (`work record`, `work advance`, `work publish`, `coordinator restart --recover`), unsandboxed when the wrapper backstop, the host upgrade or the watchdog does (gap 9). | Started only by unsandboxed host-side starters (the wrapper's watch, the host upgrade's `--recover`, the watchdog crash start's `--recover`, and a D12 restart the wrapper carries out); sandboxed entry points only queue, and `work integrate` refuses when it is already sandboxed. Each verification command runs under a minions-generated Seatbelt profile (D11). The allowlisted env and fresh `HOME` stay. | The integrator's own git and DB steps run unsandboxed as the owner (as minions' own git calls do today, with `git-hardening.ts`). `sandbox-exec` is deprecated by Apple but is the mechanism Claude Code's sandbox itself uses. The suite must pass under that profile (phase 0). If `sandbox-exec` is missing, or the probe keeps refusing from an unsandboxed starter, `status` and `doctor` show it as red (D11). |
 | **Network** | `outbound-internet`, no filter. | Bash: GitHub and npm only. | Unchanged. Telegram traffic comes from the server, outside the sandbox. | Stricter than Docker for Bash, which is fine for this project. |
 | **Tool versions** | The image pins Claude Code, Backlog.md and the plugin. | The owner's global installs. | The shim sets `DISABLE_AUTOUPDATER=1`. `doctor` warns on untested versions (exists), and `status` shows them. | The owner updates Claude Code deliberately and reruns `doctor`. |
 
@@ -329,10 +385,17 @@ The Docker volumes are deleted only after the owner says so (Q6).
    hand with `ps -o pid=,ppid=,command=`); otherwise this item fails by default and says nothing about the channel.
    Also: one local integration round (local delivery, `delivery.merge: auto-when-eligible`, one approved head merged,
    verified and landed in `<project>/host/workspace/integration`), with the gate's `npm test` run once under a
-   hand-written `sandbox-exec` profile as in D11. Two more D11 checks: the trivial-profile probe fails from the
-   coordinator's sandboxed Bash and passes outside it; and a `coordinator restart --recover --detach` from that Bash
-   starts the new wrapper outside the sandbox, through the tmux server. Also the per-project `CLAUDE_CONFIG_DIR`
-   login and the auto-memory location. Go/no-go per item. Depends: none.
+   hand-written `sandbox-exec` profile as in D11. Also the D11 and D12 checks:
+   - the trivial-profile probe fails from the coordinator's sandboxed Bash and passes outside it;
+   - the sandboxed Bash cannot reach the tmux socket. `tmux -L minions-<id8> has-session` fails, and today's
+     `coordinator restart --recover --detach` leaves the old session running (gap 10);
+   - a live run of the D12 request path, with a spike stand-in for the wrapper. The sandboxed Bash writes the request
+     and touches the wake file. A host-side stand-in outside the sandbox spawns the detached
+     `coordinator restart --recover`. The doc records whether the old session is gone, whether the new wrapper holds
+     the lock (and whether the macOS handover needs phase 1: without `/proc` a stuck old wrapper is never
+     signalled), and whether the probe passes in a child of the new wrapper.
+
+   Also the per-project `CLAUDE_CONFIG_DIR` login and the auto-memory location. Go/no-go per item. Depends: none.
 1. **macOS process facts and a runtime-aware bot guard.** Criteria: a `ps`-based `ProcessControl` on darwin
    (cmdline, parent, start time) used by the coordinator lock, `checkTelegramPoller`, `signalDescendants` and the
    channel server; the same view backs `systemLockView` (`src/runtime/supervisor.ts`), so the supervisor lock and the
@@ -349,8 +412,8 @@ The Docker volumes are deleted only after the owner says so (Q6).
    server env path; the channel state in `host/claude`, sandbox- and Edit-denied; `resolveChannel` without the
    host-runtime cause; the wizard offers Telegram on the host; doctor and status checks; tests for argv, env (no
    token) and settings. Depends: 1, 2, task-67.3.
-4. **Auto mode and the integration gate on the host.** Criteria: the host-layer-only loosening rule (a repository
-   value can only tighten), with tests; the new deny rules; the host pre-bash fence and pre-file path fence, which
+4. **Auto mode, the integration gate and the self-restart on the host.** Criteria: the host-layer-only loosening
+   rule (a repository value can only tighten), with tests; the new deny rules; the host pre-bash fence and pre-file path fence, which
    fail closed, with tests for wrappers, substitutions, symlinks and `..`; `status` and `doctor` show the mode and
    source; the default becomes `auto` only if phase 0 passed. D11: on the host, `Scheduler.kickIntegrator` never
    spawns and only touches the wake file, so `work record` (also with `--submitted`), `work advance` and
@@ -363,8 +426,22 @@ The Docker volumes are deleted only after the owner says so (Q6).
    `sandbox-exec` and a fake spawner and cover: the argv and the profile; that `work record`, `work record
    --submitted`, `work advance`, `work publish` and a sandboxed `coordinator restart --recover` (also with
    `--detach`) spawn nothing on the host; that the wrapper's watch and an unsandboxed `--recover` do spawn; and
-   the refusal leaves the queue and attempt count unchanged. Docker behaviour stays unchanged. Phase 0 confirms
-   that the probe fails inside the coordinator's sandbox. Depends: 0, 1, 2.
+   the refusal leaves the queue and attempt count unchanged. An unsandboxed starter whose probe fails records
+   `integration-sandbox-unavailable`, and `status` and `doctor` show it as red (tested).
+
+   D12 criteria:
+   - On the host, a sandboxed `coordinator restart` (also with `--detach`, `--recover`, `--wake` or `--force`) and a
+     sandboxed routine wake never run tmux. They keep the in-band lease and drain refusals, write the
+     `restart_request` row, touch the wake file and return `restart-requested`. A sandboxed crash start refuses.
+   - The wrapper consumes each request once and spawns the detached restart from the enumerated fields. A new
+     wrapper drops an older request. A request pending for more than 2 minutes is red in `status` and `doctor`.
+   - Tests use a fake probe, a fake tmux runner and a fake spawner. They cover: no tmux call and no spawn from any
+     sandboxed path; the in-band refusals; exactly one spawn per request, with the right argv (`--force` only when
+     asked); a crafted row with unknown fields or extra text, which never reaches the argv; a dropped stale request;
+     and the red status.
+
+   Docker behaviour stays unchanged. Phase 0 confirms that the probe fails inside the coordinator's sandbox and that
+   the tmux socket is unreachable from it. Depends: 0, 1, 2.
 5. **`minions upgrade` on the host.** Criteria: the D7 steps with `--dry-run`, `--now` and `--rebuild-cli`; the
    drain waits while the `integration_lock` is held (a verification is re-queued, a landing finishes); the
    `restart-required` host branch; an interrupted upgrade resumes (`upgrade.json`); tests with a fake tmux and
