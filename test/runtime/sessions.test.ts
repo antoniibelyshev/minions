@@ -224,7 +224,7 @@ describe('hook commands never exec from a noexec /tmp (U1)', () => {
 
   it('refuses a script exec\'d from /tmp, allows it through sh or from a plugin dir outside /tmp', () => {
     const check = (c: string, pluginDir = '/opt/minions/plugin') => () => checkHookCommands([c], { pluginDir });
-    for (const bad of ['/tmp/probe/hook.sh', 'timeout 20 /tmp/x/hook || exit 2', 'i=$(cat); printf %s "$i" | /var/tmp/h', '/dev/shm/h']) expect(check(bad), bad).toThrow(/noexec/);
+    for (const bad of ['/tmp/probe/hook.sh', 'timeout 20 /tmp/x/hook || exit 2', 'i=$(cat); printf %s "$i" | /var/tmp/h', '/dev/shm/h', '/usr/bin/env /tmp/x/hook.sh', 'env /tmp/x/hook.sh']) expect(check(bad), bad).toThrow(/noexec/);
     expect(check('${CLAUDE_PLUGIN_ROOT}/hooks/guard.sh', '/tmp/plugin')).toThrow(/noexec/);
     for (const ok of ['sh /tmp/probe/hook.sh', 'bash /tmp/probe/hook.sh || exit 2', 'minions hook stop', '${CLAUDE_PLUGIN_ROOT}/hooks/guard.sh']) expect(check(ok), ok).not.toThrow();
     expect(check('sh ${CLAUDE_PLUGIN_ROOT}/hooks/guard.sh', '/tmp/plugin')).not.toThrow();

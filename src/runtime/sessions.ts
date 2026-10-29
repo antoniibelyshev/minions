@@ -123,8 +123,8 @@ export function sessionEnv(base: NodeJS.ProcessEnv, configDir: string, cred: Hea
 
 // ---------------------------------------------------------------- hook commands (U1)
 
-/** Programs that read a script instead of exec'ing it, so a script on a noexec mount still runs. */
-const INTERPRETERS = new Set(['sh', 'bash', 'dash', 'zsh', 'node', '.', 'source', '/bin/sh', '/bin/bash', '/bin/dash', '/usr/bin/env']);
+/** Programs that read a script instead of exec'ing it, so a script on a noexec mount still runs. Not `env`: it execs its argument. */
+const INTERPRETERS = new Set(['sh', 'bash', 'dash', 'zsh', 'node', '.', 'source', '/bin/sh', '/bin/bash', '/bin/dash']);
 
 /** Every `command` of a settings or hooks.json object (`hooks.<Event>[].hooks[].command`). */
 export function hookCommands(settings: unknown): string[] {
