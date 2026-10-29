@@ -13,11 +13,24 @@ const dirs: string[] = [];
 const tmp = async () => { const d = await mkdtemp(join(tmpdir(), 'minions-plugin-')); dirs.push(d); return d; };
 afterAll(async () => { await Promise.all(dirs.map((d) => rm(d, { recursive: true, force: true }))); });
 
-async function gen(cfg: MinionsConfig = defaults()) {
-  const out = await tmp();
-  const files = await generatePlugin(cfg, out);
-  const read = (rel: string) => readFile(join(out, rel), 'utf8');
-  return { out, files, rel: files.map((f) => relative(out, f.path).split('\\').join('/')), read };
+type Generated = { out: string; files: Awaited<ReturnType<typeof generatePlugin>>; rel: string[]; read: (rel: string) => Promise<string> };
+/**
+ * Plugin output per distinct config, generated once per file (task-104.3): most tests generate the defaults
+ * and only read the files, so they share one output dir. Nothing here writes into it; `fresh` generates anew.
+ */
+const generated = new Map<string, Promise<Generated>>();
+function gen(cfg: MinionsConfig = defaults(), o: { fresh?: boolean } = {}): Promise<Generated> {
+  const key = JSON.stringify(cfg);
+  const hit = o.fresh ? undefined : generated.get(key);
+  if (hit) return hit;
+  const p = (async () => {
+    const out = await tmp();
+    const files = await generatePlugin(cfg, out);
+    const read = (rel: string) => readFile(join(out, rel), 'utf8');
+    return { out, files, rel: files.map((f) => relative(out, f.path).split('\\').join('/')), read };
+  })();
+  if (!o.fresh) generated.set(key, p);
+  return p;
 }
 
 function frontmatter(md: string): Record<string, string> {
@@ -172,8 +185,8 @@ describe('generatePlugin', () => {
   });
 
   it('is deterministic for the same config', async () => {
-    const a = await gen();
-    const b = await gen();
+    const a = await gen(defaults(), { fresh: true });
+    const b = await gen(defaults(), { fresh: true });
     expect(a.files.map((f) => f.sha256)).toEqual(b.files.map((f) => f.sha256));
   });
 

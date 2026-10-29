@@ -31,7 +31,7 @@ const T = await import('../../src/host/manager-telegram.js');
 const S = await import('../../src/host/settings.js');
 const SC = await import('../../src/host/settings-cli.js');
 const US = await import('../../src/host/upgrade-source.js');
-const { makeRepo, withHome, dockerUp, git } = await import('./fixtures.js');
+const { initFromTemplate, makeRepo, withHome, dockerUp, git } = await import('./fixtures.js');
 type ProjectJson = import('../../src/host/project.js').ProjectJson;
 type RunResult = import('../../src/core/exec.js').RunResult;
 type ManagerOffer = import('../../src/host/manager.js').ManagerOffer;
@@ -52,9 +52,8 @@ const editProjectConfigBump = async (p: ProjectJson) => (await import('../../src
 const reason = async (p: Promise<unknown>) => { try { await p; } catch (e) { return e as Error & { code?: string; details?: any }; } throw new Error('expected a refusal'); };
 
 async function install(name = 'repo') {
-  const repo = makeRepo(env.root, name);
-  const r = await runInit({ path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
-  const project = await loadProjectJson(r.plan.projectId);
+  const { repo, projectId } = await initFromTemplate(env.root, { visibility: 'private', name });
+  const project = await loadProjectJson(projectId);
   return { project, repo, local: projectPaths(project.projectId).configLocalJson };
 }
 
