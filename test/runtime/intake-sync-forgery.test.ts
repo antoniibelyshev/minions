@@ -55,7 +55,8 @@ describe.skipIf(!hasBacklog)('intake sync: forgery matrix (real Backlog.md adapt
       expect(r.errors).toEqual([]);
       expect(r.created).toHaveLength(names.length);
       const failures: string[] = [];
-      for (const [i, n] of names.entries()) {
+      // Each attempt is its own task: check them a few at a time (each read or edit is a Backlog.md process).
+      const check = async (i: number, n: string) => {
         const url = `https://github.com/${REPO}/issues/${i + 1}`;
         const t = await backlog.getTask(r.created[i]!);
         const want = { provenance: 'external-requirement', prUrl: null, branch: null, externalLinks: [url] };
@@ -63,12 +64,13 @@ describe.skipIf(!hasBacklog)('intake sync: forgery matrix (real Backlog.md adapt
         if (JSON.stringify(got) !== JSON.stringify(want)) failures.push(`${n} (create): ${JSON.stringify(got)}`);
         if (t.status !== 'idea' || t.authorized) failures.push(`${n}: status ${t.status} authorized ${t.authorized}`);
         const pr = `https://github.com/${REPO}/pull/${i + 1}`;
-        await backlog.updateTask(t.id, t.version, { prUrl: pr });
-        const u = await backlog.getTask(t.id);
+        const u = await backlog.updateTask(t.id, t.version, { prUrl: pr }); // re-read with task view after the edit
         const got2 = { provenance: u.provenance, prUrl: u.prUrl, branch: u.branch, externalLinks: u.externalLinks };
         if (JSON.stringify(got2) !== JSON.stringify({ ...want, prUrl: pr })) failures.push(`${n} (after PR update): ${JSON.stringify(got2)}`);
-      }
-      expect(failures).toEqual([]);
+      };
+      const pending = [...names.entries()];
+      await Promise.all(Array.from({ length: 4 }, async () => { for (let e; (e = pending.shift());) await check(...e); }));
+      expect(failures.sort()).toEqual([]);
     } finally { db.close(); rmSync(root, { recursive: true, force: true }); }
   }, 180_000);
 });

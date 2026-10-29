@@ -485,7 +485,8 @@ describe('self-update apply: failure paths and isolation', () => {
       'exit 0',
     ].join('\n'));
     setRequests([request('cr_aaaaaaaa')]);
-    const r = spawnSync(process.execPath, [SCRIPT, '--repo', fx.repo, '--once'], { encoding: 'utf8', timeout: 60_000,
+    // The short health window runScript uses: the 5-minute default polls every 10 s, which only slows this test.
+    const r = spawnSync(process.execPath, [SCRIPT, '--repo', fx.repo, '--once', '--health-window', '2'], { encoding: 'utf8', timeout: 60_000,
       env: { ...env(), MINIONS_RUNTIME: 'container', MINIONS_UPGRADE_HANDOFF: '1' } });
     expect(r.status, r.stderr).toBe(0);
     const to = gitIn(fx.repo, 'rev-parse', 'HEAD');
