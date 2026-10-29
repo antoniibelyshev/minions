@@ -95,7 +95,7 @@ describe('runIntegrator: landing and the verify runner', () => {
     expect(mainOf(s.repo)).toBe(s.B);
     const row = rowOf(s.db, 'task-1');
     expect(row.phase).toBe('red');
-    expect(row.detail).toMatch(/echo boom-from-tests; exit 3` failed \(exit 3\)\nboom-from-tests/);
+    expect(row.detail).toMatch(/echo boom-from-tests; exit 3` failed twice: failed again on its rerun \(exit 3\)\nboom-from-tests/);
     expect(readFileSync(row.log_path!, 'utf8')).toContain('boom-from-tests');
     expect(s.db.getMeta(INTEGRATION_BASE_META)).toBe(s.B);
   });

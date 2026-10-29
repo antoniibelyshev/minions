@@ -1087,6 +1087,12 @@ export interface CoordinatorWrapperDeps extends RunCoordinatorDeps {
    * startSupervisorWatch (src/runtime/supervisor.ts), which does nothing at all with coordinator.sessions.enabled off.
    */
   supervisorWatch?: (cfg: MinionsConfig, log: (line: string) => void) => () => void;
+  /**
+   * The local integration backstop (docs/design/local-auto-integration.md, task-82.4): started next to the routine
+   * clock, it starts `minions work integrate` when queued integrations have no live integrator (a lost detached
+   * start, a dead holder). The CLI passes wrapperIntegrationWatch (src/runtime/commands.ts). Returns its stop function.
+   */
+  integrationWatch?: (cfg: MinionsConfig, log: (line: string) => void) => () => void;
 }
 
 /**
@@ -1104,6 +1110,7 @@ export async function coordinatorWrapper(loadConfig: () => Promise<MinionsConfig
   let guard: PreSpawnGuard | undefined;
   let stopClock: (() => void) | undefined;
   let stopWatch: (() => void) | undefined;
+  let stopIntegration: (() => void) | undefined;
   const store = (): CoordinatorLockStore => deps.lock ?? (db ??= openDb(paths.db));
   let code: number;
   try {
@@ -1138,6 +1145,9 @@ export async function coordinatorWrapper(loadConfig: () => Promise<MinionsConfig
       if (deps.supervisorWatch) {
         try { stopWatch = deps.supervisorWatch(cfg, log); } catch (e) { log(`minions: the session supervisor watch did not start: ${redact((e as Error).message).slice(0, 300)}`); }
       }
+      if (deps.integrationWatch) {
+        try { stopIntegration = deps.integrationWatch(cfg, log); } catch (e) { log(`minions: the integration watch did not start: ${redact((e as Error).message).slice(0, 300)}`); }
+      }
       return runCoordinator(cfg, { ...deps, preSpawn: g });
     })();
     // Errors still reach us through the race; after a pre-spawn signal a late one no longer matters.
@@ -1150,6 +1160,7 @@ export async function coordinatorWrapper(loadConfig: () => Promise<MinionsConfig
   } finally {
     try { stopClock?.(); } catch { /* best effort */ }
     try { stopWatch?.(); } catch { /* best effort */ }
+    try { stopIntegration?.(); } catch { /* best effort */ }
     guard?.dispose();
     if (held) { try { store().releaseCoordinatorLock(held.session, held.pid); } catch { /* a dead holder is taken over next time */ } }
     db?.close();

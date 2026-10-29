@@ -558,10 +558,11 @@ describe('publication helpers', () => {
     const ok = { onGitHub: true, credential: 'ok' as const };
     expect(mergeReadiness(cfg('pull-request'), ok)).toEqual(['ok', expect.stringMatching(/pull-request delivery available.*auto-merge off \(opt-in/)]);
     expect(mergeReadiness(cfg('branch'), ok)[1]).toMatch(/branch delivery available/);
-    expect(mergeReadiness(cfg('local'), ok)).toEqual(['unavailable', expect.stringMatching(/pull-request delivery is available.*auto-merge off/)]);
+    expect(mergeReadiness(cfg('local'), ok)).toEqual(['unavailable', expect.stringMatching(/pull-request delivery is available.*local integration off/)]);
     expect(mergeReadiness(cfg('local'), { onGitHub: false, credential: null })[1]).toMatch(/needs a GitHub remote and token/);
     expect(mergeReadiness(cfg('pull-request'), { onGitHub: true, credential: 'missing' })[0]).toBe('warn');
     expect(mergeReadiness(cfg('pull-request'), { onGitHub: false, credential: null })[0]).toBe('fail');
-    for (const m of ['local', 'branch', 'pull-request'] as const) expect(mergeReadiness(cfg(m), ok)[1]).toMatch(/auto-merge off \(opt-in: delivery\.merge "auto-when-eligible"/);
+    for (const m of ['branch', 'pull-request'] as const) expect(mergeReadiness(cfg(m), ok)[1]).toMatch(/auto-merge off \(opt-in: delivery\.merge "auto-when-eligible"/);
+    expect(mergeReadiness(cfg('local'), ok)[1]).toMatch(/local integration off: .*opt-in: delivery\.merge "auto-when-eligible"/);
   });
 });

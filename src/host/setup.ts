@@ -182,7 +182,7 @@ export function setupCommands(repoPath: string) {
       github: `Run ${setup} again (or ${inRepo('minions auth github')}) to store a GitHub token and choose branch or pull-request delivery.`,
       intake: `Run ${setup} again to import GitHub issues into the backlog (intake.github; read-only).`,
       ci: `Run ${setup} again, ${inRepo('minions doctor')} (ci.requiredChecks), or ${inRepo('minions ci status')} to see the CI setup plan.`,
-      autoMerge: `Run ${setup} again to enable CI-gated auto-merge (needs pull-request delivery; default no).`,
+      autoMerge: `Run ${setup} again to enable automatic merging (pull-request delivery: CI-gated auto-merge; local delivery: automatic local integration; default no).`,
       telegram: `Run ${setup} again (or ${inRepo('minions auth telegram')}) to connect a Telegram bot.`,
       container: `Run ${setup} again or ${inRepo('minions start')} to start the container and attach the coordinator.`,
     },
@@ -830,10 +830,9 @@ async function autoMergeStep(io: WizardIO | null, config: MinionsConfig, mode: D
   const on = config.delivery.merge === 'auto-when-eligible';
   const missing = () => autoMergeConfigReasons({ ...config, delivery: { ...config.delivery, mode, provider: mode === 'local' ? 'none' : 'github', merge: 'auto-when-eligible' } });
   const lines = () => missing().map((r) => `still needed: ${r}`);
+  if (mode === 'local') return localIntegrationStep(io, config, on, setLocal, later, inRepo, missing);
   if (mode !== 'pull-request') {
     io?.info(`  Auto-merge needs pull-request delivery (delivery is ${mode}); not asked.`);
-    // Local delivery: the switch turns on the local integrator (task-82.3); offering it here is phase 4.
-    if (on && mode === 'local') return { id: 'autoMerge', status: 'kept', detail: 'delivery.merge auto-when-eligible: the local integrator merges approved heads into the base', ...(missing().length ? { lines: lines() } : {}) };
     return on ? { id: 'autoMerge', status: 'kept', detail: `delivery.merge auto-when-eligible, but delivery is ${mode}: not usable`, later }
       : { id: 'autoMerge', status: 'skipped', detail: `auto-merge needs pull-request delivery (delivery is ${mode})`, later };
   }
@@ -854,6 +853,35 @@ async function autoMergeStep(io: WizardIO | null, config: MinionsConfig, mode: D
   const l = lines();
   for (const x of l) io.info(`  ${x}`);
   return { id: 'autoMerge', status: 'done', detail: `delivery.merge auto-when-eligible${l.length ? ` (not usable yet; see below and ${inRepo('minions doctor')} merge.readiness)` : ''}`, ...(l.length ? { lines: l } : {}) };
+}
+
+/**
+ * The autoMerge step in local delivery (task-82.4): asks "Integrate approved tasks automatically?" (default: the
+ * current setting). Yes records delivery.merge "auto-when-eligible": the runtime merges each approved head, runs the
+ * verification commands on the merged tree, and lands it on the local base (docs/design/local-auto-integration.md).
+ * Not asked in the supervised profile (base.merge is denied there: the user integrates).
+ */
+async function localIntegrationStep(io: WizardIO | null, config: MinionsConfig, on: boolean, setLocal: (k: string, v: unknown) => void, later: string, inRepo: (c: string) => string,
+  missing: () => string[]): Promise<SetupStep> {
+  const base = config.git.baseBranch;
+  const lines = () => missing().map((r) => `still needed: ${r}`);
+  const kept = (): SetupStep => ({ id: 'autoMerge', status: 'kept', detail: `delivery.merge auto-when-eligible: the runtime integrates approved tasks into the local ${base}`, ...(missing().length ? { lines: lines() } : {}) });
+  const denied = missing().some((r) => r.startsWith('base.merge is denied'));
+  if (denied && !on) {
+    io?.info(`  Automatic local integration is off in this profile (base.merge is denied: you integrate approved branches); not asked.`);
+    return { id: 'autoMerge', status: 'skipped', detail: 'local integration not offered: base.merge is denied by policy', later };
+  }
+  if (!io) return on ? kept() : { id: 'autoMerge', status: 'skipped', detail: 'automatic local integration not enabled (default no)', later };
+  io.info(`  minions can integrate approved tasks into the local ${base} itself: it merges the approved head, runs the verification commands`);
+  io.info(`  (${config.verification.commands.join(', ') || 'none configured'}) on the merged tree, and moves ${base} only when they pass. A conflict or a failure`);
+  io.info(`  sends the task back for a repair. Sensitive paths need your approval (${inRepo('minions work approve <taskId> --head <sha> --merge')}).`);
+  const yes = await yesNo(io, 'Integrate approved tasks automatically?', on);
+  if (yes === on) return on ? kept() : { id: 'autoMerge', status: 'skipped', detail: 'automatic local integration not enabled', later };
+  setLocal('delivery.merge', yes ? 'auto-when-eligible' : 'disabled');
+  if (!yes) return { id: 'autoMerge', status: 'changed', detail: `delivery.merge disabled (approved tasks end delivered; the coordinator merges them into the local ${base})` };
+  const l = lines();
+  for (const x of l) io.info(`  ${x}`);
+  return { id: 'autoMerge', status: 'done', detail: `delivery.merge auto-when-eligible: the runtime integrates approved tasks into the local ${base}${l.length ? ` (not usable yet; see below and ${inRepo('minions doctor')} merge.readiness)` : ''}`, ...(l.length ? { lines: l } : {}) };
 }
 
 /** CI step: local workflow files plus (with a token) required checks read with GET only; prints the plan. */
