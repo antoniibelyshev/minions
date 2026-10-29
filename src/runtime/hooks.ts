@@ -233,8 +233,8 @@ export function preTelegramHook(input: unknown): HookOutput {
  */
 export const PRE_BASH_HOOK_COMMAND = `i=$(cat) || exit 2; case "$i" in *'"agent_id"'*) printf '%s' "$i" | grep -Eq 'minions[^:]|cli\\.[cm]?js|/state|/secrets|MINIONS_STATE_DIR'; m=$?; [ "$m" = 1 ] && exit 0; [ "$m" = 0 ] || exit 2; printf '%s' "$i" | timeout 20 minions hook pre-bash || exit 2;; esac`;
 
-/** The verbs a Claude subagent must never run: they start, claim or end worker leases (coordinator-only). */
-export const COORDINATOR_ONLY_WORK_VERBS = ['run', 'claim', 'advance', 'release'] as const;
+/** The verbs a Claude subagent must never run: they start, claim or end worker leases, or run the local integrator (coordinator-only). */
+export const COORDINATOR_ONLY_WORK_VERBS = ['run', 'claim', 'advance', 'release', 'integrate'] as const;
 
 /** A program word that runs the minions CLI: `minions` (any path) or its entry script (`…/dist/cli.js`). */
 const MINIONS_ENTRY = /^(minions|cli\.[cm]?js)$/;

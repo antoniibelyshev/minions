@@ -38,6 +38,8 @@ export const KEY_CLASSES: readonly KeyClass[] = [
   ...entries(['coordinator.contextReset'], 'live', false, 'read by context-reset.ts on each check'),
   ...entries(['verification.commands', 'verification.qaLabels', 'verification.ciPendingTimeoutMinutes'], 'live', false,
     'briefs and the CI gate read them per lease'),
+  ...entries(['verification.setupCommands', 'delivery.integrationTimeoutMinutes'], 'live', false,
+    'the local integrator (`work integrate`) reads them per integration'),
   ...entries(['intake.github'], 'live', false, '`minions sync` and coordinator startup read them per run'),
   ...entries(['intake.scope', 'intake.sources'], 'live', false, 'backlog readiness filter per call'),
   ...entries(['routine'], 'live', false, 'read by each routine pass (`minions sync --routine`) and the wrapper clock'),

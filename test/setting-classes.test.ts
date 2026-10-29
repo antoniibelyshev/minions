@@ -63,7 +63,7 @@ describe('guard: every schema key has a class and a host-owned flag', () => {
     const owned = (k: string) => classifyKey(k)?.hostOwned;
     for (const k of ['execution.maxActiveTasks', 'execution.maxEngineers', 'execution.maxByRole', 'execution.maxRepairCyclesBeforeReplan',
       'coordinator.contextReset.enabled', 'verification.commands', 'verification.qaLabels', 'verification.ciPendingTimeoutMinutes',
-      'intake.github.labels', 'intake.scope.milestone', 'intake.sources']) expect(cls(k), k).toBe('live');
+      'verification.setupCommands', 'delivery.integrationTimeoutMinutes', 'intake.github.labels', 'intake.scope.milestone', 'intake.sources']) expect(cls(k), k).toBe('live');
     for (const k of ['execution.attemptMaxTurns', 'budgets.taskUsd', 'communication.progress', 'models.default', 'models.allowed',
       'models.selection', 'models.effortByRole.engineer', 'models.coordinator', 'models.effort', 'models.effortByRole.coordinator',
       'coordinator.toolSearch']) expect([cls(k), owned(k)], k).toEqual(['restart', false]);

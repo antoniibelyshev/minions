@@ -86,6 +86,8 @@ export function runtimePaths(env: NodeJS.ProcessEnv = process.env, opts: { inCon
     repo: join(workspace, 'repo'),
     worktrees: join(workspace, 'worktrees'),
     review: join(workspace, 'review'),
+    /** The local integrator's persistent detached worktree (never /workspace/repo; src/runtime/integrator.ts). */
+    integration: join(workspace, 'integration'),
     configJson: env.MINIONS_CONFIG || c.configJson,
     /** Public key verifying host-signed publication approvals (see approvalPublicKeyPath; never env-redirectable in the container). */
     approvalPublicKey: approvalPublicKeyPath(env, opts.inContainer ?? inMinionsContainer()),
