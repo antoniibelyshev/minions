@@ -28,7 +28,7 @@ import { COORDINATOR_DISALLOWED_TOOLS } from '../config/coordinator-tools.js';
 import type { Source } from '../config/resolve.js';
 import { HARNESS_IDS, HARNESSES, isHarnessId, isProcessHarness } from '../config/harnesses.js';
 import { COORDINATOR_ROLE, ROLE_NAME_PATTERN, workerRole, workerRoleNames } from '../config/roles.js';
-import { EFFORTS, type CapabilityRule, type MinionsConfig } from '../config/schema.js';
+import { COORDINATOR_PERMISSION_MODES, EFFORTS, type CapabilityRule, type MinionsConfig } from '../config/schema.js';
 import { classifyKey, type SettingClass } from '../config/setting-classes.js';
 import { MinionsError } from '../core/errors.js';
 import { usdPerMTok } from '../runtime/spend.js';
@@ -200,9 +200,17 @@ const DECLARED: readonly DeclaredSetting[] = [
   { key: 'architecture', group: 'Policy', label: 'Architecture decisions', type: 'enum', choices: ['decide', 'propose'], apply: 'prompt',
     description: 'decide: agents make and record architecture decisions within a task; propose: they ask first',
     loosens: (f, t) => (f === 'propose' && t === 'decide' ? 'agents make architecture decisions without asking' : null) },
-  { key: 'coordinator.permissionMode', group: 'Policy', label: 'Coordinator permission mode', type: 'enum', choices: ['auto', 'acceptEdits'], optional: true, apply: 'launch',
-    description: 'auto: a classifier may approve actions outside the allow list; acceptEdits: prompt for every other Bash call',
-    loosens: (f, t) => ((f === 'acceptEdits') && (t === 'auto' || t === undefined) ? 'a classifier may approve coordinator actions outside the allow list without prompting' : null) },
+  { key: 'coordinator.permissionMode', group: 'Policy', label: 'Coordinator permission mode', type: 'enum', choices: [...COORDINATOR_PERMISSION_MODES], optional: true, apply: 'launch',
+    description: 'auto: a classifier may approve actions outside the allow list; acceptEdits: prompt for every other Bash call; bypassPermissions: never prompt (fully unattended, local config only)',
+    loosens: (f, t) => {
+      const rank = (m: unknown) => (m === 'bypassPermissions' ? 2 : m === 'acceptEdits' ? 0 : 1);
+      if (rank(t) <= rank(f)) return null;
+      return t === 'bypassPermissions' ? 'the coordinator and its workers run every tool call without asking (only the deny rules and, in the host runtime, the sandbox remain)'
+        : 'a classifier may approve coordinator actions outside the allow list without prompting';
+    } },
+  { key: 'coordinator.sandbox', group: 'Policy', label: 'Host runtime sandbox', type: 'bool', optional: true, apply: 'launch',
+    description: 'host runtime: Bash runs in the Claude Code sandbox (writes limited to the workspace and state, network to GitHub and npm); false: unsandboxed, as your user (local config only)',
+    loosens: (f, t) => (f !== false && t === false ? 'agent commands run on your host without the sandbox, with your full user access' : null) },
   { key: 'coordinator.contextReset.enabled', group: 'Policy', label: 'Routine context resets', type: 'bool', apply: 'live',
     description: 'the coordinator hands off and restarts with a fresh context when idle' },
   { key: 'routine.enabled', group: 'Policy', label: 'Unattended routine', type: 'bool', apply: 'live',

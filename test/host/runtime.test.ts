@@ -189,11 +189,11 @@ describe('runtime selection is host-controlled', () => {
 describe('host runtime coordinator settings', () => {
   const h = { home: '/Users/u', workspace: '/m/host/workspace', state: '/m/host/state', secretsDir: '/m/My Proj/secrets', credentialsDir: '/m/credentials', projectDir: '/m/proj' };
 
-  it('adds the sandbox and credential denies, never bypass; container settings are unchanged', () => {
+  it('adds the sandbox (sandboxed commands run without a prompt) and credential denies; bypass off by default; container settings are unchanged', () => {
     const s = coordinatorSettings(defaults(), { auth: 'api-key', host: h, paths: { apiKeyFile: '/m/My Proj/secrets/anthropic-api-key' } }) as {
       permissions: { deny: string[]; disableBypassPermissionsMode: string }; sandbox: Record<string, unknown>; apiKeyHelper: string };
     expect(s.permissions.disableBypassPermissionsMode).toBe('disable');
-    expect(s.sandbox).toMatchObject({ enabled: true, autoAllowBashIfSandboxed: false, allowUnsandboxedCommands: false, failIfUnavailable: true });
+    expect(s.sandbox).toMatchObject({ enabled: true, autoAllowBashIfSandboxed: true, allowUnsandboxedCommands: false, failIfUnavailable: true });
     expect((s.sandbox.filesystem as { allowWrite: string[] }).allowWrite).toEqual([h.workspace, h.state]);
     expect((s.sandbox.filesystem as { denyRead: string[] }).denyRead).toEqual(expect.arrayContaining(['~/.ssh', '~/.aws', '~/Library/Keychains', h.credentialsDir]));
     expect((s.sandbox.network as { allowedDomains: string[] }).allowedDomains).toContain('github.com');
@@ -207,6 +207,16 @@ describe('host runtime coordinator settings', () => {
     expect(c).not.toHaveProperty('sandbox');
     expect(c.apiKeyHelper).toBe('cat /opt/minions/secrets/anthropic-api-key');
     expect(hostSettings(h).deny.some((d) => d.includes('bypass'))).toBe(false);
+  });
+
+  it('the owner\'s local choices: bypassPermissions keeps the deny rules; sandbox false drops only the sandbox', () => {
+    type S = { permissions: { deny: string[]; disableBypassPermissionsMode?: string; blockReadsOutsideWorkingDirectories?: boolean }; sandbox?: unknown };
+    const cfg = { ...defaults(), coordinator: { permissionMode: 'bypassPermissions' as const, sandbox: false } };
+    const s = coordinatorSettings(cfg, { auth: 'login', host: h }) as S;
+    expect(s.permissions).not.toHaveProperty('disableBypassPermissionsMode');
+    expect(s).not.toHaveProperty('sandbox');
+    expect(s.permissions).not.toHaveProperty('blockReadsOutsideWorkingDirectories');
+    expect(s.permissions.deny).toEqual(expect.arrayContaining(['Bash(git push *)', 'Read(~/.ssh/**)', 'Bash(minions work approve *)']));
   });
 
   it('host runtime launch: dedicated tmux socket, sandbox in --settings, host prompt note', async () => {

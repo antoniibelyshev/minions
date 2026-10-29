@@ -10,7 +10,8 @@
 //   from the `minions` shim in <project>/host/bin, which pins MINIONS_RUNTIME=host and the paths.
 // - The coordinator runs in a dedicated tmux server (`tmux -L minions-<id>`), never the user's default one.
 // - Claude Code's sandbox and credential deny rules are added to the coordinator settings
-//   (src/runtime/coordinator.ts `hostSettings`); bypassPermissions stays disabled.
+//   (src/runtime/coordinator.ts `hostSettings`) unless the owner turns the sandbox off (coordinator.sandbox false,
+//   config.local.json only); bypassPermissions likewise only from config.local.json.
 import { spawn } from 'node:child_process';
 import { chmod, readFile, rm } from 'node:fs/promises';
 import { isAbsolute, join } from 'node:path';

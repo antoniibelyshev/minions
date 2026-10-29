@@ -242,8 +242,8 @@ export function hostSettings(h: HostHardening): { sandbox: Record<string, unknow
     blockReadsOutsideWorkingDirectories: true,
     sandbox: {
       enabled: true,
-      // Keep the allowlist: sandboxed commands outside it still prompt.
-      autoAllowBashIfSandboxed: false,
+      // The sandbox is the boundary: commands that stay inside it run without a prompt.
+      autoAllowBashIfSandboxed: true,
       // No `dangerouslyDisableSandbox` escape hatch, and no silent unsandboxed fallback.
       allowUnsandboxedCommands: false,
       failIfUnavailable: true,
@@ -303,6 +303,10 @@ export function safeVerificationCommand(c: string): boolean {
   return !(/^(node|python[0-9.]*|ruby|perl|php|deno|bun)$/.test(prog) && words[1]!.startsWith('-'));
 }
 
+/** `minions work approve` / `minions approve`, with or without program options before the subcommand. */
+export const APPROVE_RULES = ['Bash(minions work approve *)', 'Bash(minions work approve)', 'Bash(minions * work approve *)', 'Bash(minions * work approve)',
+  'Bash(minions approve *)', 'Bash(minions approve)', 'Bash(minions * approve *)', 'Bash(minions * approve)'];
+
 /**
  * Claude Code settings passed with --settings: an allowlist for deterministic CLIs; bypass mode disabled.
  * Key methods (api-key/helper) add apiKeyHelper; the login method relies on /login state instead.
@@ -312,6 +316,8 @@ export function coordinatorSettings(cfg: MinionsConfig, opts: { telegram?: boole
   const auth = opts.auth ?? runtimeAuthMethod();
   const host = opts.host === undefined ? (runtimeMode() === 'host-runtime' ? hostHardeningFromEnv() : null) : opts.host;
   const hs = host ? hostSettings(host) : null;
+  const sandboxed = !!hs && cfg.coordinator?.sandbox !== false;
+  const bypass = configuredPermissionMode(cfg) === 'bypassPermissions';
   // Host runtime: specific git subcommands only (no `git config`, `-c`, remotes or push), and only
   // verification commands that cannot widen into arbitrary programs. The container keeps `git *`.
   const allow = hs
@@ -326,17 +332,17 @@ export function coordinatorSettings(cfg: MinionsConfig, opts: { telegram?: boole
       // Publication runs only through `minions work publish` (gated, deterministic); the coordinator never
       // pushes or merges itself. Also cover global options before the subcommand (git -C x push).
       deny: ['Bash(git push *)', 'Bash(git push)', 'Bash(git * push *)', 'Bash(git * push)', 'Bash(gh pr merge *)', 'Bash(gh pr merge)', 'Bash(gh * pr merge *)', 'Bash(gh * pr merge)',
+        // A publication approval is signed by the owner on the host (`/approve` in the manager chat, or the host
+        // terminal); one an agent records is rejected anyway, so it is denied instead of blocking on a prompt. Also
+        // covers program-level options before the subcommand (`minions --json work approve ...`).
+        ...APPROVE_RULES,
         ...(hs ? hs.deny : containerStateDenies(runtimePaths().state))],
-      // A publication approval must come from the user: Claude Code asks every time (ask beats allow).
-      // Also cover program-level options before the subcommand (`minions --json work approve ...`), which would
-      // otherwise fall to the `Bash(minions *)` allow.
-      ask: ['Bash(minions work approve *)', 'Bash(minions work approve)', 'Bash(minions * work approve *)', 'Bash(minions * work approve)',
-        'Bash(minions approve *)', 'Bash(minions approve)', 'Bash(minions * approve *)', 'Bash(minions * approve)'],
-      disableBypassPermissionsMode: 'disable',
-      ...(hs ? { blockReadsOutsideWorkingDirectories: true } : {}),
+      // bypassPermissions is the owner's explicit choice (config.local.json only); otherwise it stays off.
+      ...(bypass ? {} : { disableBypassPermissionsMode: 'disable' }),
+      ...(sandboxed ? { blockReadsOutsideWorkingDirectories: true } : {}),
     },
     ...(auth === 'login' ? {} : { apiKeyHelper: opts.paths ? apiKeyHelperFor(opts.paths) : host ? apiKeyHelperFor(runtimePaths()) : API_KEY_HELPER }),
-    ...(hs ? { sandbox: hs.sandbox } : {}),
+    ...(sandboxed && hs ? { sandbox: hs.sandbox } : {}),
     // Startup context trim (task-48, src/config/coordinator-tools.ts): tool search on (rarely used tool
     // definitions are deferred, not sent in full every turn) and no bundled skills; plugin skills stay.
     ...(cfg.coordinator?.toolSearch === false ? {} : { env: { ENABLE_TOOL_SEARCH: 'true' } }),
@@ -352,8 +358,8 @@ export function coordinatorSettings(cfg: MinionsConfig, opts: { telegram?: boole
 
 // ---------------------------------------------------------------- permission mode
 
-/** Claude Code permission modes the coordinator may run in. Never bypassPermissions or dontAsk. */
-export type CoordinatorPermissionMode = 'auto' | 'acceptEdits' | 'default';
+/** Claude Code permission modes the coordinator may run in (bypassPermissions only from config.local.json). Never dontAsk. */
+export type CoordinatorPermissionMode = 'auto' | 'acceptEdits' | 'bypassPermissions' | 'default';
 /** Value passed to `claude --permission-mode`: the mode, with "default" under its newer name `manual` where the CLI lists only that. */
 export type PermissionModeArg = CoordinatorPermissionMode | 'manual';
 type PermCfg = Pick<MinionsConfig, 'permissionMode' | 'coordinator'>;
@@ -383,11 +389,12 @@ export { claudePermissionModes, parsePermissionModes } from './permission-modes.
 
 /**
  * Whether the launch depends on the installed Claude Code's --permission-mode choices: auto (it may be
- * missing) and the strict mode (host runtime, legacy "default": passed as `default` or `manual`,
- * whichever this Claude Code lists). Only an explicit acceptEdits in the container needs no check.
+ * missing) and the strict mode (legacy "default": passed as `default` or `manual`, whichever this Claude
+ * Code lists). acceptEdits and bypassPermissions need no check.
  */
-export function permissionModesNeeded(cfg: PermCfg, hostRuntime = runtimeMode() === 'host-runtime'): boolean {
-  return hostRuntime || configuredPermissionMode(cfg) !== 'acceptEdits';
+export function permissionModesNeeded(cfg: PermCfg): boolean {
+  const m = configuredPermissionMode(cfg);
+  return m === 'auto' || m === 'default';
 }
 
 /** The strict mode's argv value for `modes`; fails closed (never another mode) when this Claude Code lists neither name. */
@@ -401,21 +408,14 @@ function strictMode(modes: readonly string[] | null | undefined, where: string):
 }
 
 /**
- * The coordinator's launch permission mode. Host runtime: always `default` (the config may come from the
- * repository). Default is passed as `manual` when `modes` lists only that name, and throws
- * INCOMPATIBLE_RUNTIME when `modes` lists neither (fail closed). Container: the configured mode; "auto" falls back to "acceptEdits" when `modes` (the
- * installed Claude Code's choices) lacks it or is null. `modes` undefined = not checked: the configured mode.
- * Only the mode changes: coordinatorSettings emits the same allow/deny/ask rules in every mode.
+ * The coordinator's launch permission mode, the same in both runtimes: the configured mode (bypassPermissions only
+ * reaches here from config.local.json, src/config/resolve.ts). The legacy "default" is passed as `manual` when `modes`
+ * lists only that name, and throws INCOMPATIBLE_RUNTIME when `modes` lists neither (fail closed). "auto" falls back to
+ * "acceptEdits" when `modes` (the installed Claude Code's choices) lacks it or is null. `modes` undefined = not
+ * checked: the configured mode. Only the mode changes: coordinatorSettings emits the same deny rules in every mode.
  */
-export function decidePermissionMode(cfg: PermCfg, opts: { hostRuntime?: boolean; modes?: readonly string[] | null } = {}): PermissionModeDecision {
-  if ((cfg.permissionMode as string) === 'bypassPermissions' || (cfg.coordinator?.permissionMode as string) === 'bypassPermissions') {
-    throw new MinionsError('POLICY_DENIED', 'permissionMode bypassPermissions is never allowed for the coordinator.');
-  }
+export function decidePermissionMode(cfg: PermCfg, opts: { modes?: readonly string[] | null } = {}): PermissionModeDecision {
   const configured = configuredPermissionMode(cfg);
-  if (opts.hostRuntime ?? runtimeMode() === 'host-runtime') {
-    const s = strictMode(opts.modes, 'host runtime');
-    return { configured, mode: s.mode, fallback: false, reason: `host runtime: the coordinator always runs in permission mode default${s.note}` };
-  }
   // Legacy top-level "acceptEdits" (the old default) no longer opts out; say so wherever the mode is reported.
   const legacy = cfg.permissionMode === 'acceptEdits' && !cfg.coordinator?.permissionMode
     ? '; legacy permissionMode "acceptEdits" is ignored; set coordinator.permissionMode "acceptEdits" to opt out'
@@ -436,13 +436,9 @@ export function decidePermissionMode(cfg: PermCfg, opts: { hostRuntime?: boolean
   };
 }
 
-/** Host runtime: permission mode from the (repository-influenced) config is ignored; always `default` (argv `manual` where only that is listed). */
-export const effectivePermissionMode = (cfg: PermCfg, hostRuntime = runtimeMode() === 'host-runtime', modes?: readonly string[] | null) =>
-  decidePermissionMode(cfg, { hostRuntime, modes }).mode;
-
-function assertNoBypass(cfg: MinionsConfig): void {
-  decidePermissionMode(cfg, { hostRuntime: false });
-}
+/** The `--permission-mode` argv value (argv `manual` for the legacy "default" where only that is listed). */
+export const effectivePermissionMode = (cfg: PermCfg, modes?: readonly string[] | null) =>
+  decidePermissionMode(cfg, { modes }).mode;
 
 export async function readPrompt(paths: Pick<RuntimePaths, 'coordinatorPrompt'>): Promise<string> {
   try { return await readFile(paths.coordinatorPrompt, 'utf8'); } catch (e) {
@@ -460,7 +456,6 @@ export async function readPrompt(paths: Pick<RuntimePaths, 'coordinatorPrompt'>)
 export const tmuxBase = (paths: Pick<RuntimePaths, 'tmuxSocket'>) => (paths.tmuxSocket ? ['-L', paths.tmuxSocket] : []);
 
 export async function buildCoordinatorCommand(cfg: MinionsConfig, paths: RuntimePaths = runtimePaths(), opts: { detached?: boolean; recover?: boolean; wake?: boolean } = {}): Promise<CoordinatorCommand> {
-  assertNoBypass(cfg);
   if (opts.recover && opts.wake) throw new MinionsError('PRECONDITION', 'Use --recover or --wake, not both.');
   await readPrompt(paths); // fail here (doctor --probe), not inside the tmux pane
   return {
@@ -512,7 +507,6 @@ export function coordinatorDisallowedTools(cfg: Pick<MinionsConfig, 'coordinator
  * `permissionModes`: the installed Claude Code's --permission-mode choices (claudePermissionModes); undefined = not checked.
  */
 export async function buildClaudeCommand(cfg: MinionsConfig, paths: RuntimePaths = runtimePaths(), opts: { telegram?: boolean; startupPrompt?: string; permissionModes?: readonly string[] | null } = {}): Promise<CoordinatorCommand> {
-  assertNoBypass(cfg);
   const onHost = runtimeMode() === 'host-runtime';
   const router = isRouterLaunch(cfg);
   const prompt = (router ? ROUTER_PROMPT : await readPrompt(paths)) + (onHost ? hostPromptNote(paths) : '');
@@ -527,7 +521,7 @@ export async function buildClaudeCommand(cfg: MinionsConfig, paths: RuntimePaths
     args: [
       '--plugin-dir', paths.pluginDir,
       '--append-system-prompt', prompt,
-      '--permission-mode', effectivePermissionMode(cfg, onHost, opts.permissionModes),
+      '--permission-mode', effectivePermissionMode(cfg, opts.permissionModes),
       // Host runtime: no user/project/local settings (their hooks, MCP servers, plugins, permission
       // rules and sandbox exclusions would apply outside the sandbox) and no MCP servers at all;
       // only --settings below, managed settings and the minions plugin apply. The agents' clone and
@@ -1488,7 +1482,7 @@ export async function probeRuntime(cfg?: Pick<MinionsConfig, 'models' | 'permiss
     throw new MinionsError('INCOMPATIBLE_RUNTIME', `tmux is not available ${onHost ? 'on the host' : 'in the container'}.`, onHost ? 'Install it: `brew install tmux`.' : 'Rebuild the minions image.');
   }
   const permissionModes = parsePermissionModes(text);
-  const permission = decidePermissionMode(cfg ?? {}, { hostRuntime: onHost, modes: permissionModes });
+  const permission = decidePermissionMode(cfg ?? {}, { modes: permissionModes });
   return { claudeVersion: ver.stdout.trim(), tmuxVersion: tmux.stdout.trim(), permissionModes, permission };
 }
 

@@ -425,7 +425,7 @@ async function prepare(opts: InitOptions, docker?: DockerStatus): Promise<Prepar
         isKeyAuth(authOf(project))
           ? `Claude key from ${summarize(authOf(project)).source} is provisioned by the host on every \`minions start\` (0600 file read by apiKeyHelper).`
           : 'Claude Code uses your existing host login (run `claude` once and /login if you are not logged in).',
-        'The coordinator gets the Claude Code sandbox (Bash writes limited to the workspace/state, credential directories unreadable) and never bypassPermissions.',
+        'The coordinator gets the Claude Code sandbox (Bash writes limited to the workspace/state, credential directories unreadable); sandboxed commands run without prompts. For fully unattended work set `coordinator.permissionMode bypassPermissions` (and optionally `coordinator.sandbox false`) in your local config.',
       ] : [
         process.platform === 'linux' ? 'Docker Engine running and reachable by your user (compose v2+ plugin).' : 'Docker Desktop running (compose v2+).',
         `Runtime image ${project.imageTag} is built from the installed package on first \`minions start\`.`,

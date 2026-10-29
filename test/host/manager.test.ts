@@ -232,14 +232,15 @@ describe('host manager: polling and offers', () => {
     expect(s.t.offers).toHaveLength(1);
   });
 
-  it('a forged host-owned request is never offered; the refusal is reported once', async () => {
+  it('a host-owned container request is offered once with its loosening text (the owner taps to confirm)', async () => {
     const { project } = await install();
-    db.addChangeRequest({ id: 'cr_0000beef', kind: 'config-set', payload: { key: 'capabilities.git.push', value: 'allow', layer: 'local' }, reason: 'trust me' });
+    db.addChangeRequest({ id: 'cr_0000beef', kind: 'config-set', payload: { key: 'verification.reviewerRequired', value: 'false', layer: 'local' }, reason: 'tiny repo' });
     const s = setup([project]);
     await s.manager.pollAll();
     await s.manager.pollAll();
-    expect(s.t.offers).toHaveLength(0);
-    expect(s.t.outcomes).toEqual([expect.objectContaining({ status: 'error', requestId: 'cr_0000beef', text: expect.stringMatching(/host-owned/) })]);
+    expect(s.t.offers).toHaveLength(1);
+    expect(s.t.offers[0]).toMatchObject({ requestId: 'cr_0000beef', loosens: expect.stringMatching(/without a reviewer/) });
+    expect(s.c.runs).toEqual([]);
   });
 });
 

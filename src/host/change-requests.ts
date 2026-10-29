@@ -4,8 +4,9 @@
 //
 // - A request row is a claim, never an authorization. The host reads it through the runtime, re-validates it
 //   against the host's own config (planSetting -> resolveEffective), and computes the plan itself: the exact diff,
-//   the layer and file, the class, what it loosens, what it interrupts and the commands it runs. Host-owned keys are
-//   refused again here, whatever the row says.
+//   the layer and file, the class, what it loosens, what it interrupts and the commands it runs. Host-owned keys
+//   (policy, permissions, isolation) may be requested too: like every container request they apply only after the
+//   owner confirms this plan (twice when it loosens policy), never on their own.
 // - digest = sha256(canonical plan JSON). The offer (digest, configRevision, single-use nonce, 30 minute expiry,
 //   and the request as read) goes to the host journal (src/host/change-journal.ts). A confirmation names the
 //   digest; the host then rebuilds the plan from the journaled request (not from the container's row), and applies
@@ -15,7 +16,7 @@
 //   row then becomes applied / failed (best effort: a runtime that cannot be reached leaves a warning).
 // - Owner-initiated requests (task-53.5.3: /set, /sync, /upgrade, /restart, /undo in the manager chat) take the same
 //   plan, digest, offer and confirmation. Their snapshot has `origin: 'owner'` and an `ow_` id minted by the host,
-//   so they may set host-owned keys (owner decision Q2; a container request never may), there is no runtime row to
+//   there is no runtime row to
 //   mark, and two kinds exist only for them: `sync` (`minions upgrade --sync-only`) and `undo` (restore a config
 //   file from the config history, src/host/config-history.ts). When the owner typed the command in the paired chat
 //   and appliesWithoutConfirm holds (it loosens nothing and builds or installs no CLI on the host), the host manager
@@ -271,10 +272,6 @@ export async function buildPlan(project: ProjectJson, req: RequestSnapshot, deps
       throw new MinionsError('PRECONDITION', `Change request ${req.id}: malformed config-set payload; nothing to apply.`, `Reject it: \`minions settings reject ${req.id}\`.`);
     }
     const def = requireSetting(key);
-    if (def.hostOwned && !owner) {
-      throw new MinionsError('CONFLICT', `Change request ${req.id}: ${key} is host-owned; a request from the container is never applied.`,
-        `If you want this change, make it yourself: \`minions settings set ${key} ${q(value)}\`. Then \`minions settings reject ${req.id}\`.`, { path: key, hostOwned: true });
-    }
     if (def.type === 'secret' || def.type === 'control') throw new MinionsError('PRECONDITION', `Change request ${req.id}: ${key} is not a configuration setting.`);
     const ctx = await loadSettingsContext(project);
     const change = await planSetting(ctx, key, parseSettingValue(def, value), layer);
