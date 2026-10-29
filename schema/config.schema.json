@@ -470,6 +470,11 @@
         },
         "requiredChecksConfigured": {
           "type": "boolean"
+        },
+        "integrationTimeoutMinutes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
         }
       },
       "required": [
@@ -488,6 +493,12 @@
       "type": "object",
       "properties": {
         "commands": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/__schema0"
+          }
+        },
+        "setupCommands": {
           "type": "array",
           "items": {
             "$ref": "#/$defs/__schema0"

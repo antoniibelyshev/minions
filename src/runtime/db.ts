@@ -5,7 +5,7 @@ import type { IdempotencyStore } from '../backlog/types.js';
 import { MinionsError } from '../core/errors.js';
 import { runtimePaths } from './paths.js';
 
-export const SCHEMA_VERSION = 10;
+export const SCHEMA_VERSION = 11;
 
 /** The built-in worker roles (always registered). */
 export type BuiltinLeaseRole = 'engineer' | 'tester' | 'reviewer';
@@ -182,6 +182,20 @@ const MIGRATIONS: Record<number, string> = {
       id INTEGER PRIMARY KEY AUTOINCREMENT, session_key TEXT NOT NULL, source TEXT NOT NULL, text TEXT NOT NULL,
       meta_json TEXT, created_at TEXT NOT NULL, delivered_at TEXT);
     CREATE INDEX IF NOT EXISTS session_inbox_pending ON session_inbox(session_key, delivered_at, id);
+  `,
+  // Local integration (docs/design/local-auto-integration.md phase 2, src/runtime/integrator.ts): one row per queued
+  // integration of an approved head. phase is its state (queued, merging, verifying, landing, or a terminal one);
+  // the verify_* columns identify the running verification process group for crash recovery. At most one open row
+  // per task.
+  11: `
+    CREATE TABLE IF NOT EXISTS integrations (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, branch TEXT NOT NULL, head_sha TEXT NOT NULL,
+      base_sha TEXT, candidate_sha TEXT, phase TEXT NOT NULL, attempt INTEGER NOT NULL DEFAULT 0,
+      verify_pid INTEGER, verify_start TEXT, verify_boot TEXT,
+      queued_at TEXT NOT NULL, started_at TEXT, ended_at TEXT, outcome TEXT, detail TEXT, log_path TEXT);
+    CREATE INDEX IF NOT EXISTS integrations_task ON integrations(task_id, id);
+    CREATE UNIQUE INDEX IF NOT EXISTS integrations_one_open_per_task ON integrations(task_id)
+      WHERE phase IN ('queued', 'merging', 'verifying', 'landing');
   `,
 };
 

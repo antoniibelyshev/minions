@@ -69,7 +69,7 @@ async function failure(p: Promise<unknown>): Promise<MinionsError> {
 
 describe('schema 10: sessions and session_inbox', () => {
   it('an existing schema-9 database opens cleanly, gains both tables and keeps its data', () => {
-    expect(SCHEMA_VERSION).toBe(10);
+    expect(SCHEMA_VERSION).toBeGreaterThanOrEqual(10);
     const file = join(root, 'v9.db');
     const v9 = new RuntimeDb(file);
     v9.sql.exec('DROP TABLE sessions; DROP TABLE session_inbox;');
@@ -80,7 +80,7 @@ describe('schema 10: sessions and session_inbox', () => {
 
     const up = new RuntimeDb(file);
     try {
-      expect(up.getMeta('schema_version')).toBe('10');
+      expect(up.getMeta('schema_version')).toBe(String(SCHEMA_VERSION));
       expect(up.paused().starts).toBe(true);
       expect(up.all("SELECT 1 FROM events WHERE kind = 'routine'")).toHaveLength(1);
       const cols = (t: string) => up.all<{ name: string }>(`PRAGMA table_info(${t})`).map((c) => c.name);

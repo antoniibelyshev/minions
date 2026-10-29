@@ -71,6 +71,8 @@ import { hasOpenRun, openRunsSync, withOpenRuns } from './runner/record.js';
 import { liveRun, liveRunExitCode, type LiveRunReport } from './headless.js';
 import { buildSessionCommand } from './sessions.js';
 import { runSupervisor, startSupervisorWatch, supervisorLockState, type SupervisorReport, type SupervisorTaskDeps } from './supervisor.js';
+import { adoptIntegrationBase, runIntegrator, type IntegratorReport } from './integrator.js';
+import { verifyAnyApproval } from '../core/approval.js';
 import { recoverTaskSession, taskSessionPass, type TaskSessionDeps } from './task-sessions.js';
 
 /** Human output of `minions work next`. */
@@ -736,6 +738,44 @@ export function register(program: Command): void {
       });
       emit(r, { json: globalOpts(cmd).json, human: (d: RunOutput) => JSON.stringify(d) });
       if (r.error) process.exitCode = 1;
+    }));
+  // Task-82.2: the local integrator (src/runtime/integrator.ts). Hidden: phase 3 starts it detached after a local
+  // approval; the worker hooks refuse it to subagents like `work run`.
+  work.command('integrate', { hidden: true }).description('Internal: the local integrator; takes the integration lock, recovers a crashed run, then merges, verifies and lands the queued approved heads one at a time until the queue is empty (container only)')
+    .option('--adopt-base', 'clear a halted queue and take the current base branch as the integration base (after checking the reset or rewrite is intended)')
+    .action(action(async (o: { adoptBase?: boolean }, cmd: Command) => {
+      requireMode('runtime');
+      const paths = runtimePaths();
+      const { config: cfg, db: d, backlog: b } = await context();
+      if (o.adoptBase) {
+        const r = await adoptIntegrationBase(d, paths.repo, cfg.git.baseBranch);
+        emit(r, { json: globalOpts(cmd).json, human: (x: typeof r) => `integration base: ${x.base}${x.clearedHalt ? ` (halt cleared: ${x.clearedHalt.reason})` : ''}` });
+        return;
+      }
+      const stop = new AbortController();
+      for (const s of ['SIGTERM', 'SIGINT', 'SIGHUP'] as const) process.on(s, () => stop.abort());
+      const r = await runIntegrator({
+        db: d, repo: paths.repo, integrationDir: paths.integration,
+        runDir: join(paths.state, 'run', 'integration'), logDir: join(paths.logs, 'integration'),
+        config: () => loadRuntimeConfig(), signal: stop.signal,
+        unmetDependencies: async (taskId) => {
+          const t = await b.getTask(taskId);
+          const out: string[] = [];
+          for (const dep of t.dependencies) {
+            const s = await b.getTask(dep).then((x) => x.status, () => null);
+            if (s !== 'done') out.push(dep);
+          }
+          return out;
+        },
+        approved: async (row) => {
+          const pem = await readFile(paths.approvalPublicKey, 'utf8').catch(() => null);
+          return !!pem && verifyAnyApproval(d.approvals(row.task_id, 'merge', row.head_sha).map((a) => a.signature), pem, { taskId: row.task_id, head: row.head_sha, scope: 'merge' }).ok;
+        },
+        log: (line) => process.stderr.write(`${new Date().toISOString()} ${line}\n`),
+      });
+      emit(r, { json: globalOpts(cmd).json, human: (x: IntegratorReport) => x.exit === 'conflict'
+        ? `integrator: already running (pid ${x.holder?.pid ?? '?'})`
+        : `integrator: ${x.exit} (${x.settled.map((s) => `${s.taskId} ${s.phase}`).join(', ') || 'nothing settled'}${x.recovered.length ? `; ${x.recovered.length} recovered` : ''}${x.waiting.length ? `; waiting: ${x.waiting.map((w) => `${w.taskId} on ${w.on.join(', ')}`).join('; ')}` : ''})` });
     }));
   work.command('list').description('List active leases')
     .option('--all', 'include ended leases')

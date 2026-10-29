@@ -296,9 +296,21 @@ export const MinionsConfigSchema = z.object({
     identityMode: z.enum(['git-identity', 'user-token', 'github-apps']),
     requireIndependentApproval: z.boolean(),
     requiredChecksConfigured: z.boolean(),
+    /**
+     * Local integration (docs/design/local-auto-integration.md, src/runtime/integrator.ts): the wall-clock limit of
+     * each setup and verification command of the integration gate, in minutes. A timeout is transient (one retry).
+     * Default 30.
+     */
+    integrationTimeoutMinutes: z.number().int().min(1).optional(),
   }).strict(),
   verification: z.object({
     commands: z.array(nonEmpty),
+    /**
+     * Local integration: commands that install dependencies in the integration worktree before
+     * verification.commands (for example `npm ci`). Run only when they or the lockfile changed since the last
+     * successful setup; a failure is transient. Default [].
+     */
+    setupCommands: z.array(nonEmpty).optional(),
     /** true: every task gets a tester stage (the old flow). false: only tasks that need QA (qaLabels, sensitive paths, reviewer needsQa). */
     testerRequired: z.boolean(),
     reviewerRequired: z.boolean(),

@@ -19,6 +19,7 @@ describe('coordinatorOnlyWorkCommand', () => {
     'minions work run lease-1',
     'minions work claim task-1 --json',
     'minions work release lease-1 --reason x',
+    'minions work integrate --json',
     'cd /x && minions --json work claim task-1',
     '/usr/local/bin/minions work run lease-1',
     'ls; minions work release lease-1',
@@ -29,7 +30,7 @@ describe('coordinatorOnlyWorkCommand', () => {
     'MINIONS_X=1 minions work run x',
     'true || minions work run x &',
   ])('matches %s', (cmd) => {
-    expect(coordinatorOnlyWorkCommand(cmd)).toMatch(/^minions work (run|claim|release)$/);
+    expect(coordinatorOnlyWorkCommand(cmd)).toMatch(/^minions work (run|claim|release|integrate)$/);
   });
 
   it.each([
