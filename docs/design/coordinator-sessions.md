@@ -68,17 +68,19 @@ Re-checked for this revision. Changes against the first version (main @ a062a51)
   exists anywhere. It also runs `noteTranscript` (one meta slot, `coordinator_transcript`) and
   `trackCoordinatorUsage`. A per-task session would be told to dispatch other tasks, and its transcript would replace
   the router's in that one slot.
-- **Token tracking is built (task-57.1), with two detection bugs** (*new*, found in this check):
-  - `OWNER_TAG` (`src/runtime/coordinator-usage.ts`) expects `<channel source="telegram"`. Plugin 0.0.7 writes
-    `<channel source="plugin:telegram:telegram" …>`. The baseline therefore shows `ownerMessages: 0`, and meta
-    `coordinator_last_owner_message` is never written. Every user of `lastOwnerMessageAt` acts as if the owner never
-    wrote: the routine's 30-minute "owner active" window (a wake can cut a live conversation), the digest's
+- **Token tracking is built (task-57.1), with two detection bugs** (*new*, found in this check; both fixed in
+  phase 0, task-57.5):
+  - `OWNER_TAG` (`src/runtime/coordinator-usage.ts`) expected only `<channel source="telegram"`. Plugin 0.0.7 writes
+    `<channel source="plugin:telegram:telegram" …>`; the tag now matches both. Before the fix the baseline showed
+    `ownerMessages: 0`, and meta `coordinator_last_owner_message` was never written. Every user of
+    `lastOwnerMessageAt` acted as if the owner never wrote: the routine's 30-minute "owner active" window (a wake can cut a live conversation), the digest's
     30-minute hold exception, `routine.autoPromote.ownerSilentDays` (fails closed, so it always refuses) and the
     `--owner-approved` window (always refused on Telegram).
-  - `RECOVER_PREFIX` and `WAKE_PREFIX` expect the raw `/minions:recover` and `/minions:orchestrate wake`. The
+  - `RECOVER_PREFIX` and `WAKE_PREFIX` expected only the raw `/minions:recover` and `/minions:orchestrate wake`. The
     transcript stores the expanded form
-    (`<command-message>minions:recover</command-message>\n<command-name>/minions:recover</command-name>…`). The
-    baseline therefore shows `resetOverhead.recoveredSessions: 0`, and routine wakes are not counted as wakes.
+    (`<command-message>minions:recover</command-message>\n<command-name>/minions:recover</command-name>…`), which
+    detection now also matches. Before the fix the baseline showed `resetOverhead.recoveredSessions: 0`, and routine
+    wakes were not counted as wakes.
   - *Also:* when a Stop first sees a new session id, all other open sessions are completed. That assumes one main
     session at a time.
 - **Restarts and wakes** (*new*, task-68.2). The routine pass wakes the coordinator as a **fresh session**
@@ -143,12 +145,13 @@ Re-checked for this revision. Changes against the first version (main @ a062a51)
 
    The task-96 live-run rule "refuse while a lease is active" applies to ad-hoc live runs only, not to the
    supervisor. Both share the builder, and the policy check stays in the entry point.
-6. **Process model: decided by the spike** (phase 3). Because workers hand back asynchronously, a single-shot
-   `claude -p` may end its turn before a worker returns. Preferred: **one resident process per open session**
-   (`-p --input-format stream-json --output-format stream-json`). The supervisor writes inbox messages to its stdin,
-   hand-backs arrive as new turns, and the process exits at close. Alternative, if the spike shows that `-p` waits
-   for the hand-back: **one `-p --resume <id>` process per wake**, with nothing resident. Either way a crash is
-   resumed with `--resume <id>`. Memory: at most `coordinator.sessions.max` processes (default `maxActiveTasks + 1`).
+6. **Process model: one resident process per open session** (decided by the phase 3 spike). The session runs
+   `-p --input-format stream-json --output-format stream-json`. The supervisor writes inbox messages to its stdin,
+   hand-backs arrive as new turns, and the process exits at close. A crash is resumed with `-p --resume <id>`.
+   Rejected: one `-p --resume <id>` process per wake. A per-wake process cannot take inbox messages while one of its
+   workers runs, so owner and supervisor messages would wait for the hand-back. Memory: about 250 MB per idle
+   session, at most `coordinator.sessions.max` processes (default `maxActiveTasks + 1`). The prompt cache TTL is
+   5 minutes, so a wake after a longer idle gap pays a cold cache write either way (see the cost model).
 7. **A deterministic supervisor starts sessions, never a model.** The hidden `minions coordinator supervise` is a
    node process with a reuse-safe lock (meta row, `{pid, start}`, like `routine_lock`). The wrapper starts it
    detached (its own session), so router resets and restarts do not touch it. It keeps a run record per session
@@ -347,8 +350,8 @@ Reading the table:
 ## Risks
 
 - **R1: async hand-back under `-p`** (U3). If a single-shot `-p` exits before the worker returns, the per-wake model
-  fails. The resident stream-json model (decision 6) avoids it, at the cost of memory (estimated 0.3 to 0.5 GB per
-  open session; the container has 7 GB). The spike decides.
+  fails. The resident stream-json model (decision 6) avoids it, at the cost of memory (measured about 250 MB per
+  idle session; the container has 7 GB). Decided by the spike: resident.
 - **R2: cold-cache wakes** reduce the USD saving (see the cost model). Mitigation: keep task-session prompts and
   context small (task-scoped skill, compact briefs, `work advance`), reset between stages above `contextTokens`,
   then the dispatcher.
@@ -369,20 +372,26 @@ Reading the table:
 - **R7: complexity and two modes.** Sessions stay behind `coordinator.sessions.enabled` until phase 9, and every
   phase tests that nothing changes with it off.
 
-## Unknowns (answered by the phase 3 spike, a coordinator-run live check)
+## Unknowns (answered by the phase 3 spike, a coordinator-run live check; U8 stays open)
 
 - U1: under `claude -p` with the fresh config, `--plugin-dir` and `--settings`, the plugin hooks (Stop, PreToolUse
-  Agent/Bash/file, drain) and the plugin agents load, also after `--resume <id>`.
+  Agent/Bash/file, drain) and the plugin agents load, also after `--resume <id>`. Caveat found: a hook command
+  exec'd from a `noexec` `/tmp` fails; run it via `sh` or from the plugin dir (phase 4).
 - U2: the Stop hook input in `-p` mode carries `transcript_path` and `session_id`, and the path is under the session's
   config dir.
 - U3: when a `-p` turn spawns a worker, does the process wait for the asynchronous hand-back, and does the hand-back
-  start a new turn? Checked for single-shot `-p` and for resident `--input-format stream-json`.
+  start a new turn? Checked for single-shot `-p` and for resident `--input-format stream-json`. Answer: a per-wake
+  `-p` process cannot take inbox messages while its worker runs; the resident stream-json process takes them and
+  the hand-back as new turns. Decision 6: resident.
 - U4: the cache TTL seen by headless runs (5 minutes or 1 hour), and whether two sessions with an identical prefix
-  share the cache (compare `cache_creation_input_tokens` on the second session's first turn).
+  share the cache (compare `cache_creation_input_tokens` on the second session's first turn). Answer: TTL
+  5 minutes.
 - U5: subagents of a headless session carry `agent_id` in hook input (the worker guards depend on it), and whether the
   session's credential env reaches their Bash (R3).
-- U6: memory of a resident idle session, and the start-up time of a `--resume` wake.
+- U6: memory of a resident idle session, and the start-up time of a `--resume` wake. Answer: about 250 MB per idle
+  session.
 - U7 (for task-68.8): `claude -p --agent minions:<role>` gets the role's agent definition, model and tool limits.
+  Found: its hook inputs carry no `agent_id`, so the worker guards do not fire; phase 10's guard rework is required.
 - U8: subscription rate limits with several sessions at once (observed over phase 9; `sessions.max` caps it).
 
 ## Phases
@@ -395,13 +404,13 @@ need an owner decision first.
 1. **child: Reset barrier for the single coordinator** | criteria: `coordinator.contextReset.barrierTokens` (default 120k, null = off, registered with a setting class); when the context is at or above it and only leases or open runs block the reset, `work claim` and `work advance` start nothing new (decision `context-reset-pending`, with a clear hint), `work next` shows `waitingOn: context-reset`, the Stop guard allows the stop, and the reset becomes due when the last lease is recorded; `status` shows it; nothing changes below the barrier; tests | depends: none (worker; owner question 1)
 2. **child: task-96 (headless credentials and live-run entry point)** | criteria: as filed; additionally its credential and env builder is a function the supervisor can call, without the live-run lease check, and it is tested on its own | depends: none (worker, in progress; add this note to its review)
 3. **child: Spike: headless coordinator sessions** | criteria: through the task-96 entry point, with no lease active, the coordinator answers U1 to U7 with a throwaway task in a scratch repository; it checks `minions status` for the poller after each run; it records the answers and the chosen process model (resident or per-wake) in this doc; it absorbs the spike part of task-68.8 (unblock and retarget 68.8) | depends: 2 (**live run** by the coordinator)
-4. **child: Session schema, settings and launch builder** | criteria: `sessions` (key, kind, claude session id, status, model, config dir, opened, last wake, closed, resumes, failure) and `session_inbox` tables (inline migration, schema 10); `coordinator.sessions.enabled` (default off), `coordinator.sessions.max`, `models.router` registered with setting classes; `buildSessionCommand` on the task-96 builder: persistent fresh config dir 0700, flags per decision 5, env allowlist with `MINIONS_SESSION`; a test asserts that the argv, env and settings carry no Telegram token, plugin, channel or tools and no secret in argv; no process is started yet | depends: 3 (worker)
+4. **child: Session schema, settings and launch builder** | criteria: `sessions` (key, kind, claude session id, status, model, config dir, opened, last wake, closed, resumes, failure) and `session_inbox` tables (inline migration, schema 10); `coordinator.sessions.enabled` (default off), `coordinator.sessions.max`, `models.router` registered with setting classes; `buildSessionCommand` on the task-96 builder: persistent fresh config dir 0700, flags per decision 5, env allowlist with `MINIONS_SESSION`; hook commands in the session settings are never exec'd from a `noexec` `/tmp` (run via `sh` or from the plugin dir, U1), with a test; a test asserts that the argv, env and settings carry no Telegram token, plugin, channel or tools and no secret in argv; no process is started yet | depends: 3 (worker)
 5. **child: Supervisor** | criteria: hidden `minions coordinator supervise` with a reuse-safe lock; run record per session (O_EXCL); spawn and stop through `supervise.ts` (process group, timeout, drain); the process model from phase 3; orphans adopted or reaped at start from identities in the records; inbox delivery; 2 resumes, then `failed` and an outbox `blocker`; the wrapper starts it detached when sessions are on and restarts it when its lock is stale; tests with a fake `claude` binary (spawn, crash, resume, drain, orphan) | depends: 4 (worker)
 6. **child: Session-scoped hooks and state** | criteria: with `MINIONS_SESSION` set, the Stop guard is scoped to the session's task (task) or off (general and router); `noteTranscript` uses `coordinator_transcript:<key>`; usage states carry the role and only complete sessions of the same key; the baseline shows tokens per role; `contextResetCheck` and handoffs are per session; lease `holder` = session key; `work advance --task <id>`; tests with two sessions' hook inputs on one DB; with the variable unset nothing changes | depends: 4 (worker; can run in parallel with 5)
 7. **child: Task sessions** | criteria: the supervisor opens `task:<id>` for a runnable stage within `sessions.max`, budget, pauses and the routine's caps; the `/minions:task <id>` skill (claim, spawn, `work advance --task`, inbox check between stages, final summary to the outbox, a handoff at `awaiting-human`); close and reopen rules per decision 4; per-task recover after a session crash; with sessions on, the routine pass opens task sessions instead of waking the coordinator, and the coordinator prompt no longer dispatches; tests with the fake binary | depends: 5, 6 (worker)
 8. **child: Router, general session and outbound** | criteria: `coordinator route --json` resolver (rules 2 to 4 of the routing model, `ambiguous`), table tests; `coordinator send <key>` and `coordinator wait --json`; `notify enqueue --session`, `notify ack --message-id` and a `tg_messages` table with task-67.3's columns plus `session`; question items keep their session, and `Q1 2` answers route back; router prompt and skill on `models.router`, no Agent tool, resets allowed with active leases; the `general` session; the digest is sent by the router; poller and isolation checks unchanged and tested | depends: 7 (worker; may split into resolver/outbound and router/general if large)
 9. **child: Sessions live check, docs and rollout** | criteria: sessions in `minions status` and `doctor`; README, cli.md, bootstrap.md and telegram.md updated; the coordinator enables sessions on this project for at least 3 deliveries and reports tokens and USD per delivered task per role against this cost model, misroutes and the poller state; owner poll on keeping them on and on making them the default | depends: 8 (**live run** by the coordinator; **owner**)
-10. **child: Deterministic dispatcher on the supervisor (task-68.8 build part)** | criteria: launch kind `stage` (`claude -p --agent minions:<role>`, worker settings, no Telegram); a worker-guard rework so headless workers are guarded without `agent_id` (`MINIONS_ROLE`-style marking, tests for pre-bash, pre-file and drain); record with usage from stream-json; one correction resume; exceptions wake the task session; launch argv, env and settings test | depends: 9 (**owner** yes after the phase 9 numbers)
+10. **child: Deterministic dispatcher on the supervisor (task-68.8 build part)** | criteria: launch kind `stage` (`claude -p --agent minions:<role>`, worker settings, no Telegram); a worker-guard rework so headless workers are guarded without `agent_id` (required: the spike found no `agent_id` in `--agent` hook inputs, U7; `MINIONS_ROLE`-style marking, tests for pre-bash, pre-file and drain); hook commands not exec'd from a `noexec` `/tmp` (U1); record with usage from stream-json; one correction resume; exceptions wake the task session; launch argv, env and settings test | depends: 9 (**owner** yes after the phase 9 numbers)
 
 New commands fold under the internal `coordinator` command (`supervise`, `route`, `send`, `wait`) and existing ones
 (`notify`, `work advance`). There is no new top-level command (cli-surface.md).
