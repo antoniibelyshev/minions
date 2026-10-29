@@ -176,16 +176,16 @@ export async function removeHeadlessRunDir(d: Pick<HeadlessRunDir, 'root'>): Pro
 const REFUSED_FLAGS = ['--dangerously-skip-permissions', '--allow-dangerously-skip-permissions', '--channels', '--dangerously-load-development-channels'];
 
 /**
- * Refuses claude arguments that would defeat the isolation: bypass mode, channels, any path into the coordinator's
+ * Refuses claude arguments that would defeat the isolation: bypass mode (unless the owner configured it: `allowBypass`), channels, any path into the coordinator's
  * own config dir (its plugins, settings or login), and the secret itself. Returns the arguments unchanged.
  */
-export function checkHeadlessArgs(args: readonly string[], o: { coordinatorConfigDir: string; secret?: string }): string[] {
+export function checkHeadlessArgs(args: readonly string[], o: { coordinatorConfigDir: string; secret?: string; allowBypass?: boolean }): string[] {
   const home = o.coordinatorConfigDir.replace(/\/+$/, '');
   for (const [i, a] of args.entries()) {
     const flag = a.split('=')[0]!;
     if (REFUSED_FLAGS.includes(flag)) throw new MinionsError('POLICY_DENIED', `\`${flag}\` is not allowed in a live Claude run.`, 'Live runs keep the permission checks and load no channel.');
     const mode = a === '--permission-mode' ? args[i + 1] : flag === '--permission-mode' ? a.slice(a.indexOf('=') + 1) : undefined;
-    if (mode === 'bypassPermissions') throw new MinionsError('POLICY_DENIED', 'A live Claude run never uses the bypassPermissions mode.');
+    if (mode === 'bypassPermissions' && !o.allowBypass) throw new MinionsError('POLICY_DENIED', 'A live Claude run never uses the bypassPermissions mode.');
     if (home && (a === home || a.includes(`${home}/`) || a.endsWith(home))) {
       throw new MinionsError('POLICY_DENIED', `A live Claude run may not use the coordinator's config dir (${home}).`, 'Pass plugin dirs and settings from outside it (for example /opt/minions/plugin).');
     }

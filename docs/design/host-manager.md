@@ -39,9 +39,12 @@ the owner confirms that change**. Nothing applies on its own.
    where it runs ([bootstrap.md, Host-signed publication approvals](bootstrap.md#host-signed-publication-approvals))
    and like `config roles propose` ([roles-and-workflows.md](roles-and-workflows.md) D2). No new container command
    is needed.
-4. **Security-relevant settings are host-owned.** A container request for one of them is refused when it is
-   recorded, and refused again by the manager. Only the owner changes them, from the host (see
-   [Host-owned settings](#host-owned-settings)).
+4. **Security-relevant settings are host-owned.** The container may request them like any other setting (owner
+   decision, 2026-10-29: the coordinator must be able to propose permissions, profiles and resources itself), but the
+   plan marks them, a loosening one is confirmed twice, and they are never applied without the owner's confirmation
+   (see [Host-owned settings](#host-owned-settings)). Secrets are never requested.
+   `coordinator.permissionMode bypassPermissions` and `coordinator.sandbox false` are accepted only in
+   `config.local.json`, never in the committable project config.
 5. **Every change is confirmed and bound to its exact content.** A confirmation covers one request digest, the config
    revision it was computed against, and an expiry. If anything changed in between, the owner is asked again.
 6. **The terminal stays the baseline.** Everything the manager does stays available as the same host command. When
@@ -238,7 +241,7 @@ coordinator's prompt text catches up at its next restart, which the manager ment
 **restart**: baked into the generated prompt, the plugin or the coordinator launch arguments, so the graceful
 coordinator restart applies it. **recreate**: compose, the image or mounts, so `minions upgrade` applies it (the
 container is recreated, volumes kept). **fixed**: identity or derived; change it with `minions setup`, not here.
-**H** marks host-owned keys: the container can never propose them.
+**H** marks host-owned keys: the container may request them, and only the owner's confirmation applies them.
 
 | Key | Class | Reason |
 | - | - | - |
@@ -258,7 +261,7 @@ container is recreated, volumes kept). **fixed**: identity or derived; change it
 | `communication.channel` | restart, **H** | Coordinator `--channels`. It decides who can steer the coordinator |
 | `capabilities.*`, `sensitivePaths`, `architecture`, `intake.startReady` | restart, **H** | Policy and approvals (prompt plus runtime gates) |
 | `delivery.*`, `verification.testerRequired`, `reviewerRequired`, `ciAuthority` | restart, **H** | What reaches GitHub, and with which checks |
-| `coordinator.permissionMode`, `disallowedTools`, `bundledSkills`, legacy `permissionMode` | restart, **H** | Coordinator permissions |
+| `coordinator.permissionMode`, `sandbox`, `disallowedTools`, `bundledSkills`, legacy `permissionMode` | restart, **H** | Coordinator permissions (bypassPermissions and sandbox false: local config only) |
 | `roles`, `workflows`, `harnesses` | restart, **H** | Tools, edit scopes and process harnesses. Roles keep their own propose/apply path (`config roles`) |
 | `container.cpus`, `memoryMiB`, `pidsLimit`, `tmpSizeMiB` | recreate | Compose resource limits |
 | `container.network`, `publishPorts`, `mountHostRepository`, `mountDockerSocket` | recreate, **H** | Isolation of the container |

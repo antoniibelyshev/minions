@@ -119,16 +119,16 @@ describe('settings set in the runtime records a request', () => {
     expect(JSON.parse((await import('node:fs')).readFileSync(configFile, 'utf8')).execution.maxActiveTasks).toBe(defaults().execution.maxActiveTasks);
   });
 
-  it('refuses host-owned keys with CONFLICT (ask the owner instead) and records nothing', async () => {
-    for (const [key, value] of [['delivery.mode', 'pull-request'], ['capabilities.git.push', 'allow'], ['communication.channel', 'terminal'], ['verification.reviewerRequired', 'false'], ['secrets.github', 'x']]) {
-      const { code, env } = await cli(['settings', 'set', key!, value!, '--reason', 'faster']);
-      expect(env.ok, key).toBe(false);
-      expect(env.error!.code, key).toBe('CONFLICT');
-      expect(env.error!.message).toMatch(/host-owned/);
-      expect(env.error!.hint).toMatch(/Ask the owner/);
-      expect(code).toBe(4);
+  it('records host-owned keys too (the owner confirms them on the host); only secrets are refused', async () => {
+    for (const [key, value] of [['architecture', 'propose'], ['capabilities.pr.merge', 'allow'], ['verification.reviewerRequired', 'false']]) {
+      const { env } = await cli(['settings', 'set', key!, value!, '--reason', 'faster']);
+      expect(env.ok, key).toBe(true);
+      expect((env.data as { recorded: boolean; applied: boolean })).toMatchObject({ recorded: true, applied: false });
     }
-    expect(rows()).toHaveLength(0);
+    const secret = await cli(['settings', 'set', 'secrets.github', 'x', '--reason', 'r']);
+    expect(secret.env.error!.code).toBe('CONFLICT');
+    expect(secret.env.error!.message).toMatch(/secret/);
+    expect(rows()).toHaveLength(3);
   });
 
   it('validates before recording: invalid values, unknown keys, a missing reason, controls, shared on a private install', async () => {
@@ -251,10 +251,10 @@ describe('settings requests (runtime)', () => {
 });
 
 describe('recordSettingRequest (unit)', () => {
-  it('refuses host-owned keys before parsing the value', () => {
+  it('validates a host-owned value like any other before recording', () => {
     const db = new RuntimeDb(':memory:');
     try {
-      expect(() => recordSettingRequest({ db, config: defaults() }, 'architecture', 'not-a-choice', { reason: 'r' })).toThrow(/host-owned/);
+      expect(() => recordSettingRequest({ db, config: defaults() }, 'architecture', 'not-a-choice', { reason: 'r' })).toThrow();
       expect(db.changeRequests({ all: true })).toEqual([]);
     } finally { db.close(); }
   });

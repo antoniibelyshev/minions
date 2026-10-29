@@ -148,6 +148,13 @@ describe('validation', () => {
 });
 
 describe('layering and provenance', () => {
+  it('bypassPermissions and sandbox false come only from config.local.json, never the (committable) project layer', () => {
+    for (const coordinator of [{ permissionMode: 'bypassPermissions' }, { sandbox: false }]) {
+      expect(fail(() => resolve({ defaults: defaults(), project: { coordinator } })).code).toBe('POLICY_DENIED');
+      expect(resolve({ defaults: defaults(), local: { coordinator } }).config.coordinator).toMatchObject(coordinator);
+    }
+  });
+
   it('records the source of every field', () => {
     const { config, provenance } = resolve({
       defaults: defaults(),

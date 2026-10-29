@@ -213,10 +213,14 @@ describe('buildSessionCommand', () => {
     expect(valueOf(l.args, '--model')).toBe(cfg.models.allowed[0]);
   });
 
-  it('refuses a bypassPermissions config and a missing credential', async () => {
-    const bypass = { ...defaults(), permissionMode: 'bypassPermissions' } as unknown as MinionsConfig;
+  it('passes the owner\'s bypassPermissions through; refuses a missing credential', async () => {
+    const bypass: MinionsConfig = { ...defaults(), coordinator: { permissionMode: 'bypassPermissions' } };
     writeFileSync(paths.claudeHeadlessTokenFile, OAUTH, { mode: 0o600 });
-    expect((await failure(buildSessionCommand(bypass, 'general', deps('login')))).code).toBe('POLICY_DENIED');
+    const l = await buildSessionCommand(bypass, 'general', deps('login'));
+    expect(valueOf(l.args, '--permission-mode')).toBe('bypassPermissions');
+    expect(l.userSettings).toMatchObject({ permissions: {} });
+    expect(l.flagSettings.permissions).not.toHaveProperty('disableBypassPermissionsMode');
+    rmSync(join(paths.state, 'run', 'sessions'), { recursive: true, force: true });
     rmSync(paths.claudeHeadlessTokenFile);
     expect((await failure(buildSessionCommand(defaults(), 'general', deps('login')))).code).toBe('AUTH_REQUIRED');
     expect(existsSync(join(paths.state, 'run', 'sessions'))).toBe(false);

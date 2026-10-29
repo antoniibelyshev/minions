@@ -31,6 +31,7 @@ import { projectForPath } from './registry.js';
 import { githubHints, inspectGithub } from './github-setup.js';
 import { harnessChecks, harnessSkipChecks, parseWorkProbe } from './harness-checks.js';
 import { harnessView } from '../runtime/sandbox/probe.js';
+import { HANG_GUARD_TIMEOUT_TEST, hangGuarded } from '../runtime/hook-guard.js';
 import { HOST_RUNTIME_SHORT, HostRuntime, hostTools, prepareHostRuntime, runtimeOf } from './runtime.js';
 import type { ProjectJson } from './project.js';
 import { projectPaths } from '../core/paths.js';
@@ -447,6 +448,12 @@ async function hostRuntimeChecks(project: ProjectJson, auth: ClaudeAuth, baseUrl
     add('claude.baseUrl', ok ? 'ok' : 'fail', ok ? `${maskValue(baseUrl)} reachable from the host (${ok})` : `${maskValue(baseUrl)} not reachable from the host`,
       ok ? undefined : 'Check the URL and that the service is running.');
   }
+  // The fail-closed hooks need their hang guard (coreutils `timeout`, else perl): without both every hook blocks.
+  const guard = await runner('sh', ['-c', `${HANG_GUARD_TIMEOUT_TEST} && echo timeout || echo perl; ${hangGuarded('true', 5)}`], { allowFailure: true, timeoutMs: 15_000 });
+  const via = guard.stdout.trim().split('\n')[0];
+  add('hooks.hangGuard', guard.code === 0 ? 'ok' : 'fail',
+    guard.code === 0 ? `hook hang guard works (${via === 'timeout' ? 'coreutils timeout' : 'perl watchdog'})` : `hook hang guard failed (exit ${guard.code}): neither coreutils timeout nor perl works, so every worker hook blocks`,
+    guard.code === 0 ? undefined : 'Install perl or coreutils (`brew install coreutils` provides gtimeout; link it as `timeout` on PATH).');
   if (!(await host.prepared())) {
     for (const n of ['claude.capabilities', 'telegram.plugin']) add(n, 'warn', 'skipped: host runtime not prepared yet', 'Run `minions start --no-attach`.');
     return undefined;

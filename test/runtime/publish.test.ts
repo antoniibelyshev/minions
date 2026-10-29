@@ -442,14 +442,15 @@ describe('sensitive-path gate', () => {
     expect(env.gh.prs).toHaveLength(0);
   });
 
-  it('coordinator settings deny direct push/merge and always ask before recording an approval', () => {
+  it('coordinator settings deny direct push/merge and recording an approval (the owner signs it on the host)', () => {
     const s = coordinatorSettings(defaults()) as { permissions: { deny: string[]; ask: string[] } };
     expect(s.permissions.deny).toEqual(expect.arrayContaining(['Bash(git push *)', 'Bash(gh pr merge *)']));
-    expect(s.permissions.ask).toEqual(expect.arrayContaining(['Bash(minions work approve *)']));
+    expect(s.permissions.deny).toEqual(expect.arrayContaining(['Bash(minions work approve *)']));
+    expect(s.permissions).not.toHaveProperty('ask');
   });
 
-  it('approve asks (not allow) even with program-level options before the subcommand', () => {
-    const s = coordinatorSettings(defaults()) as { permissions: { allow: string[]; deny: string[]; ask: string[] } };
+  it('approve is denied (never allowed, never a blocking prompt) even with program-level options before the subcommand', () => {
+    const s = coordinatorSettings(defaults()) as { permissions: { allow: string[]; deny: string[]; ask?: string[] } };
     // Claude Code wildcard semantics: `*` matches any run of characters, including spaces. Precedence deny > ask > allow.
     // Only Bash rules decide a Bash command (the container settings also carry Edit denies for the runtime state).
     const glob = (rule: string, cmd: string) => {
@@ -459,11 +460,11 @@ describe('sensitive-path gate', () => {
       return new RegExp('^' + m.split('*').map((x) => x.replace(/[.+?^${}()|[\]\\]/g, (ch) => `\\${ch}`)).join('.*') + '$').test(cmd);
     };
     const decide = (cmd: string) => s.permissions.deny.some((r) => glob(r, cmd)) ? 'deny'
-      : s.permissions.ask.some((r) => glob(r, cmd)) ? 'ask' : s.permissions.allow.some((r) => glob(r, cmd)) ? 'allow' : 'none';
+      : (s.permissions.ask ?? []).some((r) => glob(r, cmd)) ? 'ask' : s.permissions.allow.some((r) => glob(r, cmd)) ? 'allow' : 'none';
     for (const cmd of [
       'minions work approve task-1 --head abc', 'minions --json work approve task-1 --head abc', 'minions --json --project x work approve task-1',
       'minions --json work approve', 'minions approve task-1', 'minions --json approve task-1 --head abc',
-    ]) expect(decide(cmd), cmd).toBe('ask');
+    ]) expect(decide(cmd), cmd).toBe('deny');
     expect(decide('minions work list')).toBe('allow');
     expect(decide('minions --json status')).toBe('allow');
     expect(decide('git -C x push origin HEAD')).toBe('deny');

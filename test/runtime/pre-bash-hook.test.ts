@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { coordinatorOnlyWorkCommand, preBashHook, preFileHook, PRE_BASH_HOOK_COMMAND, PRE_FILE_READ_HOOK_COMMAND, runHook } from '../../src/runtime/hooks.js';
 import { stateGuard } from '../../src/runtime/state-guard.js';
-import { FAKE_MINIONS, runHookCommand } from '../helpers.js';
+import { FAKE_MINIONS, runHookCommand, withHangGuard } from '../helpers.js';
 import { scanShell } from '../../src/runtime/shell-scan.js';
 
 const template = JSON.parse(readFileSync(new URL('../../templates/plugin/hooks/hooks.json', import.meta.url), 'utf8')) as {
@@ -101,8 +101,8 @@ describe('the plugin hooks.json Bash entry', () => {
   });
 
   it('a hang is killed by the wrapper and blocks', () => {
-    const fast = command.replace('timeout 20 ', 'timeout 1 ');
-    expect(fast).not.toBe(command);
+    // The perl fallback (stock macOS, task-4); the coreutils branch is covered in hook-commands-fail-closed.test.ts.
+    const fast = withHangGuard(command, { guard: 'perl', seconds: 1 });
     expect(runHookCommand(fast, '#!/bin/sh\nsleep 30\n', subCall).status).toBe(2);
   });
 

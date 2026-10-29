@@ -5,6 +5,7 @@ import { join, relative } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 import { generatePlugin, LIVE_CLAUDE_RUN_GUIDANCE, renderPolicySummary, renderTemplate } from '../../src/plugin/generate.js';
 import { DRAIN_HOOK_COMMAND } from '../../src/runtime/drain.js';
+import { hangGuarded } from '../../src/runtime/hook-guard.js';
 import { PRE_BASH_HOOK_COMMAND, PRE_FILE_READ_HOOK_COMMAND, PRE_FILE_WRITE_HOOK_COMMAND } from '../../src/runtime/hooks.js';
 import type { MinionsConfig } from '../../src/config/schema.js';
 import { defaults, FAKE_MINIONS, runHookCommand } from '../helpers.js';
@@ -144,7 +145,7 @@ describe('generatePlugin', () => {
     expect(Object.keys(hooks)).toEqual(['hooks']);
     expect(hooks.hooks.Stop).toEqual([{ hooks: [{ type: 'command', command: 'minions hook stop' }] }]);
     expect(hooks.hooks.PreToolUse).toEqual([
-      { matcher: 'Agent', hooks: [{ type: 'command', command: 'timeout 20 minions hook pre-agent || exit 2', timeout: 30 }] },
+      { matcher: 'Agent', hooks: [{ type: 'command', command: `${hangGuarded('minions hook pre-agent')} || exit 2`, timeout: 30 }] },
       // Subagents cannot run minions work run|claim|release (task-14.5); node starts only for subagent calls naming minions.
       { matcher: 'Bash', hooks: [{ type: 'command', command: PRE_BASH_HOOK_COMMAND, timeout: 30 }] },
       // Subagents cannot write (or read) the runtime state through the file tools (task-72).
@@ -675,7 +676,8 @@ describe('owner behaviour defaults (task-34)', () => {
     const base = defaults();
     const none = ownerSection(await (await gen(base)).read('coordinator.md'));
     expect(none).not.toContain('budgets');
-    expect(none).toContain('The coordinator is launched in `auto` by default (`coordinator.permissionMode`); the host runtime always uses `default`');
+    expect(none).toContain('The coordinator is launched in `auto` by default (`coordinator.permissionMode`)');
+    expect(ownerSection(await (await gen({ ...base, coordinator: { permissionMode: 'bypassPermissions' } })).read('coordinator.md'))).toContain('fully unattended (`bypassPermissions`)');
 
     const capped = ownerSection(await (await gen({ ...base, budgets: { taskUsd: 5, dailyUsd: 40 } })).read('coordinator.md'));
     expect(capped).toContain("The config's `budgets` ($40 per day, $5 per task; not enforced in v0.1) counts as a budget until the owner gives one");

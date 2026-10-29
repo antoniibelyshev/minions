@@ -329,7 +329,10 @@ function spendGuidance(cfg: MinionsConfig): string {
 function permissionModeGuidance(cfg: MinionsConfig): string {
   const mode = configuredPermissionMode(cfg);
   if (mode === 'auto') {
-    return '**Permission mode.** The coordinator is launched in `auto` by default (`coordinator.permissionMode`); the host runtime always uses `default` (`manual` on Claude Code that lists only that name), and older Claude Code falls back to `acceptEdits`. Outside `auto`, commands beyond the allow list ask. The deny and ask rules and this policy apply in every mode.';
+    return '**Permission mode.** The coordinator is launched in `auto` by default (`coordinator.permissionMode`); older Claude Code falls back to `acceptEdits`. The deny rules and this policy apply in every mode.';
+  }
+  if (mode === 'bypassPermissions') {
+    return '**Permission mode.** The owner runs this project fully unattended (`bypassPermissions`): nothing prompts, so you and the workers are the judgment. The deny rules and this policy still apply; stay inside the workspace and the minions helpers, and never touch credentials or the owner\'s own configuration.';
   }
   return `**Permission mode.** This project runs the coordinator in \`${mode}\` permission mode: commands outside the allow list ask for approval, so keep to the \`minions\` helpers and plain git.`;
 }
