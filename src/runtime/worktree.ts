@@ -61,9 +61,14 @@ const real = (p: string) => { try { return realpathSync(p); } catch { return p; 
 
 export async function listWorktrees(repo: string): Promise<WorktreeEntry[]> {
   const r = await git(repo, ['worktree', 'list', '--porcelain']);
+  return parseWorktreeList(r.stdout);
+}
+
+/** Parses `git worktree list --porcelain` output. */
+export function parseWorktreeList(stdout: string): WorktreeEntry[] {
   const out: WorktreeEntry[] = [];
   let cur: WorktreeEntry | null = null;
-  for (const line of r.stdout.split('\n')) {
+  for (const line of stdout.split('\n')) {
     if (line.startsWith('worktree ')) { cur = { path: line.slice(9), head: null, branch: null, detached: false }; out.push(cur); }
     else if (!cur) continue;
     else if (line.startsWith('HEAD ')) cur.head = line.slice(5);

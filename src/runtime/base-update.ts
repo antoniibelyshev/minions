@@ -70,10 +70,13 @@ const EMPTY_TREE: Record<string, string> = {
   sha1: '4b825dc642cb6eb9a060e54bf8d69288fbee4904',
   sha256: '6ef19b41225c5369f1c104d45d8d85efa9b057b53b14b4b9b939dd74decc5321',
 };
-const cfgArgs = (kv: string[]) => kv.flatMap((v) => ['-c', v]);
+/** `-c k=v` pairs for a list of `k=v` options. */
+export const cfgArgs = (kv: string[]) => kv.flatMap((v) => ['-c', v]);
 
-const FULL_SHA = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
-const tail = (s: string) => redact(s.trim().split('\n').slice(-3).join(' | ')).slice(0, 400);
+/** A full object name (sha1 or sha256). */
+export const FULL_SHA = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+/** The last lines of git output, redacted and bounded (for messages). */
+export const tail = (s: string) => redact(s.trim().split('\n').slice(-3).join(' | ')).slice(0, 400);
 
 export type MergeTreeResult =
   | { state: 'clean'; tree: string }
@@ -113,7 +116,7 @@ export interface CleanGitOptions { signal?: AbortSignal }
 export interface IsolatedOptions extends CleanGitOptions { network?: boolean }
 
 /** Runs `fn` with an empty directory as git's HOME (removed afterwards). */
-async function withEmptyHome<T>(fn: (home: string) => Promise<T>): Promise<T> {
+export async function withEmptyHome<T>(fn: (home: string) => Promise<T>): Promise<T> {
   const home = await mkdtemp(join(tmpdir(), 'minions-home-'));
   try { return await fn(home); } finally { await rm(home, { recursive: true, force: true }).catch(() => {}); }
 }
@@ -197,10 +200,14 @@ export async function mergeTree(repo: string, ours: string, theirs: string, opts
   }
 }
 
-async function isolatedMergeTree(iso: IsolatedRepo, ours: string, theirs: string): Promise<MergeTreeResult> {
+/**
+ * The merge-tree of `ours` and `theirs` inside an already isolated git dir (shared by the base update and the
+ * local integration, integration.ts). `purpose` names the operation in the refusal.
+ */
+export async function isolatedMergeTree(iso: IsolatedRepo, ours: string, theirs: string, purpose = 'a base update'): Promise<MergeTreeResult> {
   const { git, dir: repo } = iso;
   const attrs = await mergeAttributeProblems(git, repo, [ours, theirs]);
-  if (attrs.length) return { state: 'refused', message: `custom or union merge drivers are configured (${attrs.slice(0, 5).join('; ')}); a base update needs built-in merges` };
+  if (attrs.length) return { state: 'refused', message: `custom or union merge drivers are configured (${attrs.slice(0, 5).join('; ')}); ${purpose} needs built-in merges` };
   const r = await git(repo, [...cfgArgs(MERGE_TREE_CONFIG), 'merge-tree', '--write-tree', '--no-messages', '--name-only', '-z', ours, theirs], true);
   const parts = r.stdout.split('\0');
   const tree = parts[0]?.trim() ?? '';
@@ -232,8 +239,20 @@ export async function hasCommit(git: GitFn, repo: string, sha: string): Promise<
  */
 export async function commitMerge(repo: string, o: { tree: string; head: string; base: string; baseBranch: string; identity: MinionsConfig['git']['identity'] }, opts: CleanGitOptions = {}): Promise<{ sha: string } | { error: string }> {
   const msg = `Merge ${o.baseBranch} (${o.base.slice(0, 12)}) into the approved head ${o.head.slice(0, 12)}\n\nBase update by minions: a clean merge-tree of the approved head and origin/${o.baseBranch}; no other change.`;
-  const r = await isolatedGit(repo, [...cfgArgs([`user.name=${o.identity.name}`, `user.email=${o.identity.email}`, 'commit.gpgSign=false']),
-    'commit-tree', o.tree, '-p', o.head, '-p', o.base, '-m', msg], opts);
+  try {
+    return await withIsolatedRepo(repo, (iso) => isolatedCommitTree(iso, { tree: o.tree, parents: [o.head, o.base], message: msg, identity: o.identity }), opts);
+  } catch (e) {
+    return { error: `git commit-tree failed: ${tail(String((e as Error)?.message ?? e))}` };
+  }
+}
+
+/**
+ * `commit-tree <tree> -p <parent>... -m <message>` inside an isolated git dir with `identity` as author and
+ * committer, unsigned: the caller's GIT_AUTHOR_* / GIT_COMMITTER_* and config never count.
+ */
+export async function isolatedCommitTree(iso: IsolatedRepo, o: { tree: string; parents: string[]; message: string; identity: MinionsConfig['git']['identity'] }): Promise<{ sha: string } | { error: string }> {
+  const r = await iso.git(iso.dir, [...cfgArgs([`user.name=${o.identity.name}`, `user.email=${o.identity.email}`, 'commit.gpgSign=false']),
+    'commit-tree', o.tree, ...o.parents.flatMap((p) => ['-p', p]), '-m', o.message], true);
   const sha = r.stdout.trim();
   return r.code === 0 && FULL_SHA.test(sha) ? { sha } : { error: `git commit-tree failed: ${tail(r.stderr) || `exit ${r.code}`}` };
 }
