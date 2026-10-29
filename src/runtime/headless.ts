@@ -88,18 +88,55 @@ export const HEADLESS_DROP_ENV = [
   'CLAUDECODE', 'CLAUDE_CODE_ENTRYPOINT', 'CLAUDE_CODE_SSE_PORT',
 ] as const;
 
-/** The child's environment (pure): the caller's minus HEADLESS_DROP_ENV, the fresh config dir, and the one credential. */
-export function headlessEnv(base: NodeJS.ProcessEnv, configDir: string, cred: HeadlessCredential): Record<string, string> {
+/**
+ * The variables minions itself sets for a headless child (pure): the fresh config dir, no auto-update, and the one
+ * credential (the login token, or the helper TTL for the key methods). Shared by the live run and the task-57 sessions.
+ */
+export function credentialEnv(configDir: string, cred: HeadlessCredential): Record<string, string> {
   if (!isAbsolute(configDir)) throw new MinionsError('INTERNAL', 'the headless config dir must be an absolute path');
-  const drop = new Set<string>(HEADLESS_DROP_ENV);
-  const env: Record<string, string> = {};
-  for (const [k, v] of Object.entries(base)) if (v !== undefined && !drop.has(k)) env[k] = v;
-  env.CLAUDE_CONFIG_DIR = configDir;
   // A controlled run never updates the CLI in place.
-  env.DISABLE_AUTOUPDATER = '1';
+  const env: Record<string, string> = { CLAUDE_CONFIG_DIR: configDir, DISABLE_AUTOUPDATER: '1' };
   if (cred.method === 'login') env[cred.envName] = cred.token;
   else env.CLAUDE_CODE_API_KEY_HELPER_TTL_MS = String(KEY_HELPER_TTL_MS);
   return env;
+}
+
+/** The child's environment (pure): the caller's minus HEADLESS_DROP_ENV, the fresh config dir, and the one credential. */
+export function headlessEnv(base: NodeJS.ProcessEnv, configDir: string, cred: HeadlessCredential): Record<string, string> {
+  const set = credentialEnv(configDir, cred);
+  const drop = new Set<string>(HEADLESS_DROP_ENV);
+  const env: Record<string, string> = {};
+  for (const [k, v] of Object.entries(base)) if (v !== undefined && !drop.has(k)) env[k] = v;
+  return Object.assign(env, set);
+}
+
+/**
+ * The credential part of a headless launch, without any policy check (task-57 phase 4): the credential for the auth
+ * method, the fresh config dir's user settings, how the credential reaches the child and the names of the variables
+ * minions sets. Each entry point applies its own policy before calling it: `liveRun` refuses while a worker lease is
+ * active; the session supervisor does not (its sessions own leases).
+ */
+export interface HeadlessCredentialPlan {
+  cred: HeadlessCredential;
+  /** User settings of the fresh config dir (headlessSettings). */
+  settings: Record<string, unknown>;
+  /** How the credential reaches the child (never the value). */
+  credential: string;
+  /** Variables minions sets for the child (names only). */
+  setEnv: string[];
+  /** The value argv must never carry (login method), for checkHeadlessArgs. */
+  secret: string | undefined;
+}
+
+export async function prepareHeadlessCredential(method: RuntimeAuthMethod, paths: Pick<RuntimePaths, 'claudeHeadlessTokenFile' | 'apiKeyFile'>, readText?: ReadText): Promise<HeadlessCredentialPlan> {
+  const cred = await resolveHeadlessCredential(method, paths, readText);
+  return {
+    cred,
+    settings: headlessSettings(cred),
+    credential: cred.method === 'login' ? `${cred.envName} in the child's environment (from ${cred.source}; value not shown)` : `apiKeyHelper reading ${cred.source} (fresh config dir settings)`,
+    setEnv: ['CLAUDE_CONFIG_DIR', 'DISABLE_AUTOUPDATER', cred.method === 'login' ? cred.envName : 'CLAUDE_CODE_API_KEY_HELPER_TTL_MS'],
+    secret: cred.method === 'login' ? cred.token : undefined,
+  };
 }
 
 // ---------------------------------------------------------------- run dir
@@ -235,15 +272,14 @@ export async function liveRun(claudeArgs: readonly string[], o: LiveRunOptions, 
   const leases = deps.activeLeases();
   const refused = refusal(leases);
   if (refused && !o.dryRun) throw refused;
-  const cred = await resolveHeadlessCredential(deps.method, deps.paths, deps.readText);
-  const args = checkHeadlessArgs(claudeArgs, { coordinatorConfigDir: env.CLAUDE_CONFIG_DIR || CONTAINER.claudeHome, secret: cred.method === 'login' ? cred.token : undefined });
+  // The credential part is shared with the session builder (src/runtime/sessions.ts); the lease refusal above is
+  // this entry point's own policy.
+  const { cred, settings, credential, setEnv, secret } = await prepareHeadlessCredential(deps.method, deps.paths, deps.readText);
+  const args = checkHeadlessArgs(claudeArgs, { coordinatorConfigDir: env.CLAUDE_CONFIG_DIR || CONTAINER.claudeHome, secret });
   const command = await resolveOnPath('claude', env.PATH);
   if (!command) throw new MinionsError('PRECONDITION', 'Claude Code (`claude`) is not on PATH.');
   const cwd = o.cwd ?? process.cwd();
   if (!isAbsolute(cwd)) throw new MinionsError('INVALID_CONFIG', '--cwd must be an absolute path.');
-  const settings = headlessSettings(cred);
-  const credential = cred.method === 'login' ? `${cred.envName} in the child's environment (from ${cred.source}; value not shown)` : `apiKeyHelper reading ${cred.source} (fresh config dir settings)`;
-  const setEnv = ['CLAUDE_CONFIG_DIR', 'DISABLE_AUTOUPDATER', cred.method === 'login' ? cred.envName : 'CLAUDE_CODE_API_KEY_HELPER_TTL_MS'];
   const report: LiveRunReport = { dryRun: !!o.dryRun, method: deps.method, credential, command, args, cwd, configDir: null, keptDir: false, settings, setEnv, refused: refused?.message ?? null, exitCode: null, signal: null };
   if (o.dryRun) return report;
 

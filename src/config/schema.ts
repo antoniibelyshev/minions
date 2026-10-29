@@ -281,6 +281,11 @@ export const MinionsConfigSchema = z.object({
     }).strict().optional(),
     /** Model of the coordinator session (`--model`); unset = Claude Code default. Must be in `allowed`. */
     coordinator: modelId.optional(),
+    /**
+     * Model of the router session (docs/design/coordinator-sessions.md decision 3; used only with
+     * coordinator.sessions.enabled). Unset = `haiku` (DEFAULT_ROUTER_MODEL). When set, it must be in `allowed`.
+     */
+    router: modelId.optional(),
   }).strict(),
   delivery: z.object({
     provider: z.enum(['none', 'github']),
@@ -376,6 +381,16 @@ export const MinionsConfigSchema = z.object({
        * the reset is due when the last worker is recorded. `null` = no barrier.
        */
       barrierTokens: z.number().int().min(1000).nullable().optional(),
+    }).strict().optional(),
+    /**
+     * Router plus per-task coordinator sessions (docs/design/coordinator-sessions.md; src/runtime/sessions.ts). Unset =
+     * off: the single coordinator, as before. Built in phases; until phase 9 it stays off.
+     */
+    sessions: z.object({
+      /** Default false. */
+      enabled: z.boolean().optional(),
+      /** Headless session processes at once (default execution.maxActiveTasks + 1). */
+      max: z.number().int().min(1).optional(),
     }).strict().optional(),
   }).strict().optional(),
   /**

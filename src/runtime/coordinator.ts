@@ -442,7 +442,7 @@ function assertNoBypass(cfg: MinionsConfig): void {
   decidePermissionMode(cfg, { hostRuntime: false });
 }
 
-async function readPrompt(paths: RuntimePaths): Promise<string> {
+export async function readPrompt(paths: Pick<RuntimePaths, 'coordinatorPrompt'>): Promise<string> {
   try { return await readFile(paths.coordinatorPrompt, 'utf8'); } catch (e) {
     throw new MinionsError('NOT_FOUND', `Coordinator prompt not found at ${paths.coordinatorPrompt} (${(e as Error).message}).`,
       'Regenerate the plugin on the host (minions start re-renders it).');

@@ -5,7 +5,7 @@ import type { IdempotencyStore } from '../backlog/types.js';
 import { MinionsError } from '../core/errors.js';
 import { runtimePaths } from './paths.js';
 
-export const SCHEMA_VERSION = 9;
+export const SCHEMA_VERSION = 10;
 
 /** The built-in worker roles (always registered). */
 export type BuiltinLeaseRole = 'engineer' | 'tester' | 'reviewer';
@@ -72,6 +72,21 @@ export interface ChangeRequestRow {
 
 /** A task's workflow position (D6); `stages_json` holds the stage list including runtime insertions. */
 export interface TaskStageRow { task_id: string; workflow: string; stages_json: string; position: number; updated_at: string }
+
+/**
+ * A headless coordinator session (docs/design/coordinator-sessions.md decision 4; schema 10). key: `general` or
+ * `task:<id>`; claude_session_id: the id `--resume` continues (null before the first turn); status: `open` while a
+ * process may serve it, `closed` (task delivered, done, cancelled, blocked, or awaiting the owner after a handoff),
+ * `failed` (resumes exhausted). config_dir: its persistent CLAUDE_CONFIG_DIR (src/runtime/sessions.ts).
+ */
+export type SessionKind = 'task' | 'general';
+export type SessionStatus = 'open' | 'closed' | 'failed';
+export interface SessionRow {
+  key: string; kind: SessionKind; claude_session_id: string | null; status: SessionStatus; model: string | null;
+  config_dir: string; opened_at: string; last_wake_at: string | null; closed_at: string | null; resumes: number; failure: string | null;
+}
+/** A message waiting for a session (router `coordinator send`, supervisor notices); delivered_at is set once handed over. */
+export interface SessionInboxRow { id: number; session_key: string; source: string; text: string; meta_json: string | null; created_at: string; delivered_at: string | null }
 
 export interface GuardRow { fingerprint: string | null; count: number; last_reason: string | null; updated_at: string | null }
 /** The last `controls` event that set one pause flag: its event id, time and the value it set. */
@@ -153,6 +168,20 @@ const MIGRATIONS: Record<number, string> = {
   // today's wakes and crash starts by kind and time. The index keeps those reads cheap on a long event log.
   9: `
     CREATE INDEX IF NOT EXISTS events_kind_at ON events(kind, at);
+  `,
+  // Coordinator sessions (docs/design/coordinator-sessions.md, task-57 phase 4): one row per headless session (`general`
+  // or `task:<id>`) and the messages waiting for it. Phase 4 adds only the tables; the supervisor (phase 5) writes them.
+  // No foreign key: the router may queue a message for a session that is not open yet (the supervisor opens it).
+  10: `
+    CREATE TABLE IF NOT EXISTS sessions (
+      key TEXT PRIMARY KEY, kind TEXT NOT NULL, claude_session_id TEXT, status TEXT NOT NULL, model TEXT,
+      config_dir TEXT NOT NULL, opened_at TEXT NOT NULL, last_wake_at TEXT, closed_at TEXT,
+      resumes INTEGER NOT NULL DEFAULT 0, failure TEXT);
+    CREATE INDEX IF NOT EXISTS sessions_status ON sessions(status, key);
+    CREATE TABLE IF NOT EXISTS session_inbox (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, session_key TEXT NOT NULL, source TEXT NOT NULL, text TEXT NOT NULL,
+      meta_json TEXT, created_at TEXT NOT NULL, delivered_at TEXT);
+    CREATE INDEX IF NOT EXISTS session_inbox_pending ON session_inbox(session_key, delivered_at, id);
   `,
 };
 

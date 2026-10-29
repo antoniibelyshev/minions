@@ -44,6 +44,7 @@ export const KEY_CLASSES: readonly KeyClass[] = [
   ...entries(['routine.autoPromote'], 'live', true, 'caps on the coordinator promoting its own ideas, enforced by `backlog update|create`'),
   ...entries(['intake.github.readyLabels'], 'live', true, 'imported issues with these labels start ready without a model or the owner'),
   ...entries(['routine.enabled'], 'live', true, 'lets the runtime start coordinator sessions on its own (wakes, crash starts: model spend)'),
+  ...entries(['coordinator.sessions.max'], 'live', false, 'cap read by the session supervisor before it opens a session'),
   // ---- live, host-owned
   ...entries(['delivery.requiredChecksConfigured'], 'live', true,
     'the merge gate (autoMergeConfigReasons) reads it on each sync / publish; it gates what merges on GitHub'),
@@ -55,6 +56,7 @@ export const KEY_CLASSES: readonly KeyClass[] = [
     'models.effortByRole.tester', 'models.effortByRole.reviewer'], 'restart', false, 'agent definitions and prompt'),
   ...entries(['models.coordinator', 'models.effort', 'models.effortByRole.coordinator'], 'restart', false, 'coordinator --model / --effort'),
   ...entries(['coordinator.toolSearch'], 'restart', false, 'coordinator --settings env'),
+  ...entries(['models.router'], 'restart', false, 'router --model (sessions on)'),
   // ---- restart, host-owned
   ...entries(['communication.channel'], 'restart', true, 'coordinator --channels: decides who can steer the coordinator'),
   ...entries(['capabilities', 'sensitivePaths', 'architecture', 'intake.startReady'], 'restart', true,
@@ -63,6 +65,7 @@ export const KEY_CLASSES: readonly KeyClass[] = [
     'what reaches GitHub, and with which checks'),
   ...entries(['coordinator.permissionMode', 'coordinator.disallowedTools', 'coordinator.bundledSkills', 'permissionMode'], 'restart', true,
     'coordinator permissions'),
+  ...entries(['coordinator.sessions.enabled'], 'restart', true, 'the wrapper starts the session supervisor, which starts headless coordinator sessions on its own (model spend)'),
   ...entries(['roles', 'workflows', 'harnesses'], 'restart', true, 'tools, edit scopes and process harnesses'),
   // ---- recreate
   ...entries(['git.identity'], 'recreate', false, 'applied only by workspace setup (install, upgrade or start)'),

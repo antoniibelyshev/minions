@@ -408,6 +408,9 @@
         },
         "coordinator": {
           "$ref": "#/$defs/__schema3"
+        },
+        "router": {
+          "$ref": "#/$defs/__schema3"
         }
       },
       "required": [
@@ -1094,6 +1097,20 @@
           "required": [
             "enabled"
           ],
+          "additionalProperties": false
+        },
+        "sessions": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "max": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            }
+          },
           "additionalProperties": false
         }
       },
