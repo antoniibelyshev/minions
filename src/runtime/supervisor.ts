@@ -230,8 +230,9 @@ const sleepMs = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 /**
  * Stops whatever is left of a session's process from its run record and removes the record. Signals only processes
- * identified by the record: the group leader with its recorded start time, members of its group started no earlier,
- * and processes carrying MINIONS_SESSION=<key> started no earlier (the reaper and its ancestors are spared).
+ * identified by the record: the group leader with its recorded start time, members of its group started no earlier
+ * (only while that leader still matched the record), and processes carrying MINIONS_SESSION=<key> started no earlier
+ * (the reaper and its ancestors are spared).
  */
 export async function reapSessionRecord(state: string, key: string, o: ReapOptions = {}): Promise<ReapResult> {
   const proc = o.proc ?? '/proc';
@@ -258,7 +259,9 @@ export async function reapSessionRecord(state: string, key: string, o: ReapOptio
   }
   if (notBefore !== null) {
     const spared = new Set([1, ...await ancestorsOf(o.self ?? process.pid, proc)]);
-    const members = leader ? await groupMembers(leader.pid, notBefore, proc) : [];
+    // The group is swept only when its leader matched the record: a dead leader's pid may now lead an unrelated,
+    // newer group (any detached spawn), which the start-time filter alone does not exclude.
+    const members = leader && stopped ? await groupMembers(leader.pid, notBefore, proc) : [];
     for (const pid of members) if (!spared.has(pid)) { kill(pid, 'SIGKILL'); killed.push(pid); }
     for (const pid of await markedProcesses(key, notBefore, proc)) {
       if (spared.has(pid) || killed.includes(pid)) continue;

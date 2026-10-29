@@ -15,7 +15,7 @@ import { hostIdentity, procIdentity, procStat } from '../../src/runtime/runner/r
 import { enqueueInbox, getSession, openSession, pendingInbox, updateSession } from '../../src/runtime/session-store.js';
 import { buildSessionCommand, sessionConfigDir } from '../../src/runtime/sessions.js';
 import {
-  createSessionRecord, MAX_SESSION_RESUMES, readSessionRecord, runSupervisor, sessionRunRecordPath, startSupervisorWatch, supervisorAlive,
+  createSessionRecord, MAX_SESSION_RESUMES, readSessionRecord, reapSessionRecord, runSupervisor, sessionRunRecordPath, startSupervisorWatch, supervisorAlive,
   supervisorEnv, supervisorLockState, type LockProcessView, type SessionLauncher, type SupervisorDeps, type SupervisorSpawn, type SupervisorTiming,
 } from '../../src/runtime/supervisor.js';
 import { defaults } from '../helpers.js';
@@ -346,6 +346,22 @@ describe('orphans from run records (supervisor restart)', { timeout: 30_000 }, (
     expect(getSession(s.db, key)?.resumes).toBe(0);
     await until('resume notice delivered', () => events(s.log).some((e) => /supervisor was restarted/.test(e.text ?? '')));
     await sup.stop();
+  });
+
+  it('a stale record whose pid now leads an unrelated detached group leaves that group alone', async () => {
+    const s = setup();
+    const key = uniq('reused');
+    // Detached, so the decoy leads its own group: a group sweep on the stale pid would match it by start time.
+    const decoy = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { detached: true, stdio: 'ignore', env: { PATH: process.env.PATH } });
+    children.push(decoy);
+    await until('decoy up', async () => !(await dead(decoy.pid!)));
+    const at = new Date().toISOString();
+    await createSessionRecord(s.state, { version: 1, key, host: await hostIdentity(), supervisor: null, process: { pid: decoy.pid!, startTime: '1' }, resume: null, createdAt: at, updatedAt: at });
+    const r = await reapSessionRecord(s.state, key, { graceMs: 100 });
+    expect(r).toMatchObject({ key, action: 'removed', killed: [] });
+    expect(existsSync(sessionRunRecordPath(s.state, key))).toBe(false);
+    await new Promise((res) => setTimeout(res, 200));
+    expect(await dead(decoy.pid!)).toBe(false);
   });
 
   it('a record from another boot or container is removed without signalling anything', async () => {
