@@ -331,8 +331,8 @@ The Docker volumes are deleted only after the owner says so (Q6).
    verified and landed in `<project>/host/workspace/integration`), with the gate's `npm test` run once under a
    hand-written `sandbox-exec` profile as in D11. Two more D11 checks: the trivial-profile probe fails from the
    coordinator's sandboxed Bash and passes outside it; and a `coordinator restart --recover --detach` from that Bash
-   starts the new wrapper outside the sandbox, through the tmux server. Also the per-project `CLAUDE_CONFIG_DIR` login and the auto-memory
-   location. Go/no-go per item. Depends: none.
+   starts the new wrapper outside the sandbox, through the tmux server. Also the per-project `CLAUDE_CONFIG_DIR`
+   login and the auto-memory location. Go/no-go per item. Depends: none.
 1. **macOS process facts and a runtime-aware bot guard.** Criteria: a `ps`-based `ProcessControl` on darwin
    (cmdline, parent, start time) used by the coordinator lock, `checkTelegramPoller`, `signalDescendants` and the
    channel server; the same view backs `systemLockView` (`src/runtime/supervisor.ts`), so the supervisor lock and the
