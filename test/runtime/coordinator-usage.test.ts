@@ -3,7 +3,7 @@
 // `work spend`. Fixture transcripts only (temp files); no live Claude run.
 import { appendFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { collectStatus, currentSessionKey, humanStatus, spendCommand } from '../../src/runtime/commands.js';
 import { noteTranscript } from '../../src/runtime/context-reset.js';
 import {
@@ -16,6 +16,8 @@ import { humanBaseline, humanSpend, spendReport } from '../../src/runtime/spend.
 import { defaults } from '../helpers.js';
 import { makeEnv, tmp, type Env } from './fixtures.js';
 import { assistantLine, jsonl, ownerLine, skillBodyLine, slashCommandLine } from './transcript-shapes.js';
+// Unit tier: git runs on the in-memory fake (./fake-git.ts).
+vi.mock('../../src/core/exec.js', async (orig) => (await import('./fake-git.js')).mockExec(await orig()));
 
 const cfg = defaults();
 
