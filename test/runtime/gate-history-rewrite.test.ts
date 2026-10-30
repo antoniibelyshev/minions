@@ -2,13 +2,8 @@
 // so the git reads that decide a gate must not see history rewrites. QA showed that
 // `git replace <head> <commit with head^'s tree>` emptied the sensitive-path diff and turned an
 // awaiting-approval PR into a published one. Real git throughout (temp workspace + temp bare origin).
-import { execFileSync } from 'node:child_process';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { GitFn } from '../../src/runtime/github.js';
 import { gateGit, gateGitArgs, gateGitEnv, GATE_HOME } from '../../src/runtime/git-hardening.js';
-import { git as realGit } from '../../src/runtime/worktree.js';
-import { defaults } from '../helpers.js';
-import { gitSync } from './fixtures.js';
 
 
 afterEach(() => { vi.unstubAllEnvs(); });

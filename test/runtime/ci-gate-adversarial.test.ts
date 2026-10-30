@@ -1,13 +1,9 @@
 // Adversarial tests for the CI evidence gate (task-1.11, tester). Everything runs on a temp runtime DB and a
 // mocked gh; nothing touches the live state.
 import { describe, expect, it } from 'vitest';
-import type { RunResult } from '../../src/core/exec.js';
 import { requiredChecksStatus, summarizeChecks, type ApiGet, type RequiredChecksReport } from '../../src/runtime/ci.js';
 import { evaluateCiGate, type CiGateInput } from '../../src/runtime/ci-gate.js';
-import type { GhFn } from '../../src/runtime/publish.js';
 import { validateResult } from '../../src/runtime/results.js';
-import { Scheduler } from '../../src/runtime/scheduler.js';
-import { type Env } from './fixtures.js';
 
 const HEAD = 'a'.repeat(40);
 const T0 = '2026-10-20T10:00:00.000Z';
@@ -154,11 +150,8 @@ describe('check identity (name collisions, other apps)', () => {
   });
 });
 
-// ---------------------------------------------------------------- scheduler + mocked gh
+// ---------------------------------------------------------------- result contract by ciAuthority
 
-interface MockState { head: string; rollup: unknown[]; api: (path: string) => RunResult | null; prView: () => RunResult | null }
-
-interface CiEnv extends Env { st: MockState; calls: string[][]; gh: GhFn; head: string }
 const ciOnly = { checks: [{ command: 'test', outcome: 'pass', source: 'ci' }] };
 
 describe('ciAuthority none: unchanged behaviour', () => {

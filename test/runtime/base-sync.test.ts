@@ -8,11 +8,9 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { MinionsConfig } from '../../src/config/schema.js';
 import { MinionsError } from '../../src/core/errors.js';
 import { syncBaseFromOrigin } from '../../src/runtime/base-sync.js';
-import { importWorkspace } from '../../src/runtime/workspace.js';
 import type { GitFn } from '../../src/runtime/github.js';
 import { Scheduler } from '../../src/runtime/scheduler.js';
 import { git as realGit } from '../../src/runtime/worktree.js';
-import { defaults } from '../helpers.js';
 import type { GhFn } from '../../src/runtime/publish.js';
 import { commitFile, ghBranchApi, gitSync, makeEnv, tmp, type Env } from './fixtures.js';
 

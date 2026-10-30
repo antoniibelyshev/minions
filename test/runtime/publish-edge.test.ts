@@ -1,12 +1,8 @@
-import { execFileSync } from 'node:child_process';
-import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { RuntimeDb, SCHEMA_VERSION } from '../../src/runtime/db.js';
 import { taskSlug, branchFor } from '../../src/runtime/worktree.js';
 import { verifyAnyApproval } from '../../src/core/approval.js';
-import type { GitFn } from '../../src/runtime/github.js';
-import { defaults } from '../helpers.js';
 import { approvalKeys, tmp } from './fixtures.js';
 
 function openRaw(path: string) {

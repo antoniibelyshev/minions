@@ -1,14 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import type { RunResult } from '../../src/core/exec.js';
 import { ciAuthorityReadiness } from '../../src/host/doctor.js';
 import type { RequiredChecksReport } from '../../src/runtime/ci.js';
 import { summarizeChecks } from '../../src/runtime/ci.js';
 import { evaluateCiGate, type CiGateInput } from '../../src/runtime/ci-gate.js';
-import type { GhFn } from '../../src/runtime/publish.js';
 import { validateResult } from '../../src/runtime/results.js';
 import { localVerificationComplete } from '../../src/runtime/scheduler.js';
 import { defaults } from '../helpers.js';
-import { type Env } from './fixtures.js';
 
 const HEAD = 'a'.repeat(40);
 const OTHER = 'b'.repeat(40);
@@ -122,34 +119,6 @@ describe('result contract: CI evidence entries', () => {
     expect(errs({ ...base, checks: [{ command: 'npm test', outcome: 'pass' }] }, 'engineer')).toEqual([]);
   });
 });
-
-// ---------------------------------------------------------------- scheduler + mocked gh
-
-const ok = (stdout: string): RunResult => ({ code: 0, stdout, stderr: '' });
-const R = '/repos/acme/demo';
-
-/** Mocked gh: read-only `gh api` GETs for required checks, `gh pr view` for the PR. Every call is recorded. */
-function mockGh(o: { required?: string[] | 'forbidden'; pr?: () => unknown }) {
-  const calls: string[][] = [];
-  const fn: GhFn = async (args) => {
-    calls.push(args);
-    if (args[0] === 'api') {
-      expect(args.slice(1, 3)).toEqual(['--method', 'GET']);
-      const path = args.at(-1)!;
-      if (o.required === 'forbidden') return { code: 1, stdout: '{"message":"Forbidden"}', stderr: 'gh: Forbidden (HTTP 403)' };
-      if (path === `${R}/branches/main`) return ok(JSON.stringify({ name: 'main', protected: true, protection: { required_status_checks: { enforcement_level: 'everyone', contexts: o.required ?? [] } } }));
-      if (path === `${R}/rules/branches/main`) return ok('[]');
-      if (path.startsWith(`${R}/actions/workflows`)) return ok(JSON.stringify({ total_count: 1 }));
-      return { code: 1, stdout: '', stderr: 'gh: Not Found (HTTP 404)' };
-    }
-    if (args[0] === 'pr' && args[1] === 'view' && o.pr) return ok(JSON.stringify(o.pr()));
-    return { code: 1, stdout: '', stderr: `unexpected gh call: ${args.join(' ')}` };
-  };
-  return { fn, calls };
-}
-
-interface CiEnv extends Env { gh: ReturnType<typeof mockGh>; clock: { now: Date }; head: string; setRollup(r: unknown[]): void }
-
 
 describe('doctor ci.authority readiness', () => {
   const cfg = (ci: 'none' | 'github', mode: 'local' | 'pull-request' = 'pull-request') => {

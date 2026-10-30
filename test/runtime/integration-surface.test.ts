@@ -1,18 +1,9 @@
-// The local integrator's user-facing surface (task-82.4, docs/design/local-auto-integration.md phase 4): the flaky
-// rerun (Decision 2), the status block and the doctor problems (incl. a crash during `git merge --ff-only`), owner
-// notices, the digest lines, the backstops, and the merge-approval refusal after a failed integration.
+// The local integrator's user-facing surface (task-82.4, docs/design/local-auto-integration.md phase 4), unit tier:
+// the doctor problems for the status integration block and the backstop kick decision / watch. The end-to-end
+// integrator runs live in integrator.test.ts and local-integration.test.ts.
 import { describe, expect, it } from 'vitest';
-import type { MinionsConfig } from '../../src/config/schema.js';
-import { verifyAnyApproval } from '../../src/core/approval.js';
 import { integrationDoctorChecks } from '../../src/host/doctor.js';
-import {
-} from '../../src/runtime/integration-status.js';
-import { pending } from '../../src/runtime/outbox.js';
-import { Scheduler } from '../../src/runtime/scheduler.js';
-import { approvalKeys, type Env } from './fixtures.js';
-
-interface LocalEnv extends Env { keys: ReturnType<typeof approvalKeys>; starts: number }
-
+import { integratorKickDecision, startIntegrationWatch, type KickInputs } from '../../src/runtime/integration-status.js';
 
 describe('status integration block', () => {
 

@@ -2,7 +2,6 @@
 // diff, revert-of-revert check and landing, on real temp repositories (never the workspace checkout).
 import { describe, expect, it } from 'vitest';
 import { integrationMessage } from '../../src/runtime/integration.js';
-import { gitSync } from './fixtures.js';
 
 
 describe('integrationCandidate', () => {

@@ -1,6 +1,5 @@
 // Local integrator (task-82.2, docs/design/local-auto-integration.md phase 2): queue, lock, verify runner and
 // recovery, on temp repositories with fake verification commands (never the workspace checkout, never npm test).
-import { spawn } from 'node:child_process';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -8,6 +7,7 @@ import type { MinionsConfig } from '../../src/config/schema.js';
 import { RuntimeDb, SCHEMA_VERSION } from '../../src/runtime/db.js';
 import { porcelainPaths } from '../../src/runtime/integration.js';
 import {
+  adoptIntegrationBase, enqueueIntegration, INTEGRATION_BASE_META, integrationHalt, integrationLock,
   integrationRows, integratorAlive, runIntegrator, type IntegratorDeps,
 } from '../../src/runtime/integrator.js';
 import { pending } from '../../src/runtime/outbox.js';
