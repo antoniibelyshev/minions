@@ -11,6 +11,7 @@ import { Compose } from '../../src/host/docker.js';
 import type { ExportResult } from '../../src/host/transfer.js';
 import { formatUpgrade, runUpgrade, type UpgradeResult } from '../../src/host/upgrade.js';
 import { backupInstalledCli, listCliBackups } from '../../src/host/cli-backup.js';
+import { shellQuote } from '../../src/host/setup.js';
 import { applyCli, checkCli, isMinionsCheckout, runSourcePhase, syncFromContainer, syncFromOrigin, upgradeSourceMode, type SourcePhaseOptions } from '../../src/host/upgrade-source.js';
 import { git, makeRepo, tempDir, withHome } from './fixtures.js';
 
@@ -324,7 +325,7 @@ describe('installed CLI check', () => {
     expect(p.cli!.installed.kind).toBe('git');
     expect(p.stop).toEqual({
       reason: 'installed 0.1.0 != checkout 0.2.0',
-      command: `cd ${c} && npm ci && MINIONS_BUILD_KIND=packed npm pack && npm uninstall -g minions && npm install -g ./minions-0.2.0.tgz`,
+      command: `cd ${shellQuote(c)} && npm ci && MINIONS_BUILD_KIND=packed npm pack && npm uninstall -g minions && npm install -g ./minions-0.2.0.tgz`,
       rerun: 'minions upgrade --timeout 60',
     });
     expect(p.steps[0]).toMatchObject({ id: 'cli', status: 'failed' });
@@ -348,7 +349,7 @@ describe('installed CLI check', () => {
     const w: NpmWorld = { globalRoot: g, checkout: c, calls: [] };
     const p = await runSourcePhase(phaseBase({ checkout: c, runner: fakeNpm(w), spawnCli: async () => { throw new Error('must not spawn'); } }));
     expect(p.cli!.installed.kind).toBe('unknown');
-    expect(p.stop?.command).toBe(`cd ${c} && npm ci && MINIONS_BUILD_KIND=packed npm pack && npm uninstall -g minions && npm install -g ./minions-0.2.0.tgz`);
+    expect(p.stop?.command).toBe(`cd ${shellQuote(c)} && npm ci && MINIONS_BUILD_KIND=packed npm pack && npm uninstall -g minions && npm install -g ./minions-0.2.0.tgz`);
     expect(mutatingNpm(w.calls)).toEqual([]);
   });
 

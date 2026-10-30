@@ -17,7 +17,7 @@ import {
   type SessionCommandDeps,
 } from '../../src/runtime/sessions.js';
 import { GENERAL_SESSION_NOTE } from '../../src/runtime/router-prompt.js';
-import { defaults } from '../helpers.js';
+import { defaults, shq } from '../helpers.js';
 
 const OAUTH = `sk-ant-oat01-${'A'.repeat(80)}`;
 const PROVISIONED_KEY = 'provisioned-key-0123456789abcdef';
@@ -246,7 +246,7 @@ describe('hook commands never exec from a noexec /tmp (U1)', () => {
     const script = join(root, 'hook.sh');
     writeFileSync(script, 'echo ran\n', { mode: 0o644 }); // not executable: exec fails like on a noexec mount
     expect(spawnSync(script, [], { encoding: 'utf8' }).error).toBeDefined();
-    expect(spawnSync('sh', ['-c', `sh ${script}`], { encoding: 'utf8' }).stdout).toBe('ran\n');
+    expect(spawnSync('sh', ['-c', `sh ${shq(script)}`], { encoding: 'utf8' }).stdout).toBe('ran\n');
   });
 
   it('buildSessionCommand refuses a plugin whose hooks exec from /tmp, and moves a /tmp TMPDIR to the scratch root', async () => {
