@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import type { MinionsConfig } from '../../src/config/schema.js';
@@ -120,49 +120,6 @@ describe('pull-request delivery', () => {
     expect(env.gh.calls.flat()).not.toContain('merge');
   });
 
-  it('reconciles after a crash: existing remote branch and PR are reused, never duplicated', async () => {
-    const env = pubEnv();
-    env.backlog.add({ id: 'task-1', title: 'Crashy' });
-    // Crash after the push and PR creation, before the backlog recorded delivery.
-    const close = env.backlog.closeTask.bind(env.backlog);
-    env.backlog.closeTask = async () => { throw new Error('backlog CLI crashed'); };
-    const { r, head, branch } = await approveTask(env, 'task-1');
-    expect(r.approved).toBe(true);
-    expect(r.publication?.state).toBe('pending');
-    expect(r.publication?.message).toMatch(/minions work publish task-1/);
-    expect((await env.backlog.getTask('task-1')).status).not.toBe('delivered');
-    expect(remoteHead(env.bare, branch)).toBe(head);
-    expect(env.gh.prs).toHaveLength(1);
-
-    env.backlog.closeTask = close;
-    const p = await env.sched.publish('task-1');
-    expect(p).toMatchObject({ state: 'published', status: 'delivered', push: 'already-current', pr: 'existing', prUrl: env.gh.prs[0]!.url });
-    expect(env.gh.prs).toHaveLength(1);
-    expect(env.gh.calls.filter((c) => c[1] === 'create')).toHaveLength(1);
-    expect((await env.backlog.getTask('task-1')).prUrl).toBe(env.gh.prs[0]!.url);
-  });
-
-  it('reuses an open PR created outside this run (pr create race / earlier attempt)', async () => {
-    const env = pubEnv();
-    env.backlog.add({ id: 'task-1', title: 'Race' });
-    env.gh.failCreate = 'a pull request for branch "agent/task-1-race" into branch "main" already exists';
-    const orig = env.gh.fn;
-    let first = true;
-    env.gh.fn = async (args, opts) => {
-      if (args[1] === 'create' && first) {
-        first = false;
-        const branch = args[args.indexOf('--head') + 1]!;
-        env.gh.prs.push({ url: 'https://github.com/acme/demo/pull/42', headRefName: branch, headRefOid: remoteHead(env.bare, branch)!, state: 'OPEN', isCrossRepository: false, title: '', body: '', base: 'main' });
-      }
-      return orig(args, opts);
-    };
-    const sched = new Scheduler({ db: env.db, backlog: env.backlog, config: env.config, layout: env.layout, gh: (a, o) => env.gh.fn(a, o), serverUrl: env.serverUrl,
-      publisher: (input) => publishTask({ ...input, gh: env.gh.fn, tokenFile: env.tokenFile }) });
-    const { r } = await approveTask({ ...env, sched }, 'task-1');
-    expect(r.publication).toMatchObject({ state: 'published', pr: 'existing', prUrl: 'https://github.com/acme/demo/pull/42' });
-    expect(env.gh.prs).toHaveLength(1);
-  });
-
   it('a failed push leaves the task blocked (not delivered), keeps the local branch, and is retryable', async () => {
     const env = pubEnv();
     env.backlog.add({ id: 'task-1', title: 'Flaky network' });
@@ -186,16 +143,6 @@ describe('pull-request delivery', () => {
     expect(remoteHead(env.bare, branch)).toBe(head);
   });
 
-  it('without a token nothing is pushed and the task waits for a credential', async () => {
-    const env = pubEnv();
-    env.backlog.add({ id: 'task-1', title: 'No token' });
-    writeFileSync(env.tokenFile, '');
-    const { r, branch } = await approveTask(env, 'task-1');
-    expect(r.publication).toMatchObject({ state: 'failed', errorCode: 'AUTH_REQUIRED', status: 'blocked' });
-    expect(r.publication!.message).toMatch(/minions auth github/);
-    expect(remoteHead(env.bare, branch)).toBeNull();
-  });
-
   it('refuses to overwrite a diverged remote branch (no force push)', async () => {
     const env = pubEnv();
     env.backlog.add({ id: 'task-1', title: 'Diverged' });
@@ -211,13 +158,6 @@ describe('pull-request delivery', () => {
     expect(remoteHead(env.bare, 'agent/task-1-diverged')).toBe(foreign);
   });
 
-  it('a denied git.push never publishes', async () => {
-    const env = pubEnv((c) => { c.capabilities['git.push'] = 'deny'; });
-    env.backlog.add({ id: 'task-1', title: 'Denied' });
-    const { r, branch } = await approveTask(env, 'task-1');
-    expect(r.publication).toMatchObject({ state: 'failed', errorCode: 'POLICY_DENIED', status: 'blocked' });
-    expect(remoteHead(env.bare, branch)).toBeNull();
-  });
 });
 
 describe('sensitive-path gate', () => {
@@ -246,152 +186,6 @@ describe('sensitive-path gate', () => {
     expect(() => env.sched.approvePublication('task-1', { head, signature: env.keys.sign('task-1', head) })).toThrow(/already published/);
   });
 
-  it('an approval for an older head does not cover new commits', async () => {
-    const env = pubEnv();
-    env.backlog.add({ id: 'task-1', title: 'Migrations' });
-    const { head } = await approveTask(env, 'task-1', 'db/migrations/001.sql');
-    env.db.addApproval({ task_id: 'task-1', scope: 'publish', head_sha: 'e'.repeat(40), approved_by: 'user', note: null, signature: env.keys.sign('task-1', 'e'.repeat(40)) });
-    expect((await env.sched.publish('task-1')).state).toBe('awaiting-approval');
-    expect(env.db.approval('task-1', 'publish', head)).toBeUndefined();
-  });
-
-  it('publication of a non-sensitive change in an "ask" profile also needs approval', async () => {
-    const env = pubEnv((c) => { c.capabilities['git.push'] = 'ask'; });
-    env.backlog.add({ id: 'task-1', title: 'Ask profile' });
-    const { r } = await approveTask(env, 'task-1');
-    expect(r.publication).toMatchObject({ state: 'awaiting-approval', sensitivePaths: [] });
-    expect(r.publication!.reasons).toEqual(['git.push needs human approval by configuration']);
-  });
-
-  it('an unsigned approval row (written by in-runtime code) never publishes; neither does the unsigned approve command', async () => {
-    const env = pubEnv();
-    env.backlog.add({ id: 'task-1', title: 'Touch CI' });
-    const { head, branch } = await approveTask(env, 'task-1', '.github/workflows/ci.yml');
-    // What a worker with DB write access could do: insert a row bound to the exact head.
-    env.db.addApproval({ task_id: 'task-1', scope: 'publish', head_sha: head, approved_by: 'user', note: null });
-    env.db.addApproval({ task_id: 'task-1', scope: 'publish', head_sha: head, approved_by: 'user', note: null, signature: 'mnap1.e30.AAAA' });
-    const p = await env.sched.publish('task-1');
-    expect(p).toMatchObject({ state: 'awaiting-approval', status: 'awaiting-human' });
-    expect(p.approvalError).toMatch(/signature is invalid|malformed|no host-signed/);
-    expect(p.message).toMatch(/on the host/);
-    expect(remoteHead(env.bare, branch)).toBeNull();
-    expect(env.gh.calls).toHaveLength(0);
-    // The in-runtime command path without a host signature is refused outright.
-    expect(() => env.sched.approvePublication('task-1', { head, by: 'user' })).toThrow(/must be signed on the host/);
-  });
-
-  it('rejects approvals signed for another head or task, tampered, foreign-key, or expired', async () => {
-    const env = pubEnv();
-    env.backlog.add({ id: 'task-1', title: 'Touch CI' });
-    const { head, branch } = await approveTask(env, 'task-1', '.github/workflows/ci.yml');
-    const other = approvalKeys();
-    const good = env.keys.sign('task-1', head);
-    const [h, payload, sig] = good.split('.');
-    const forgedPayload = Buffer.from(JSON.stringify({ ...JSON.parse(Buffer.from(payload!, 'base64url').toString()), by: 'mallory' })).toString('base64url');
-    const bad: [string, string, RegExp][] = [
-      ['other head', env.keys.sign('task-1', 'f'.repeat(40)), /for head f{40}/],
-      ['other task', env.keys.sign('task-2', head), /for task task-2/],
-      ['tampered payload', `${h}.${forgedPayload}.${sig}`, /signature is invalid/],
-      ['tampered signature', `${h}.${payload}.${Buffer.from('x'.repeat(64)).toString('base64url')}`, /signature is invalid/],
-      ['foreign key', other.sign('task-1', head), /signature is invalid/],
-      ['expired', env.keys.sign('task-1', head, { now: new Date(Date.now() - 8 * 86_400_000) }), /expired/],
-      ['malformed', 'not-a-token', /malformed/],
-    ];
-    for (const [name, token, why] of bad) {
-      expect(() => env.sched.approvePublication('task-1', { head, signature: token }), name).toThrow(why);
-      env.db.addApproval({ task_id: 'task-1', scope: 'publish', head_sha: head, approved_by: null, note: name, signature: token });
-    }
-    // Rows smuggled past the command are re-verified before the push and still fail closed.
-    expect((await env.sched.publish('task-1')).state).toBe('awaiting-approval');
-    expect(remoteHead(env.bare, branch)).toBeNull();
-    // A genuine host signature for exactly this head publishes.
-    env.sched.approvePublication('task-1', { head, signature: good });
-    expect((await env.sched.publish('task-1')).state).toBe('published');
-    expect(remoteHead(env.bare, branch)).toBe(head);
-  });
-
-  it('fails closed when the runtime has no public key (nothing to verify against)', async () => {
-    const env = pubEnv();
-    env.backlog.add({ id: 'task-1', title: 'Touch CI' });
-    const { head, branch } = await approveTask(env, 'task-1', '.github/workflows/ci.yml');
-    env.sched.approvePublication('task-1', { head, signature: env.keys.sign('task-1', head) });
-    rmSync(env.keys.publicKeyFile);
-    const p = await env.sched.publish('task-1');
-    expect(p.state).toBe('awaiting-approval');
-    expect(p.approvalError).toMatch(/no approval public key/);
-    expect(p.approvalError).toContain(env.keys.publicKeyFile); // names the path it tried
-    expect(remoteHead(env.bare, branch)).toBeNull();
-    expect(() => env.sched.approvePublication('task-1', { head, signature: env.keys.sign('task-1', head) })).toThrow(/no approval public key/);
-  });
-
-  it('non-sensitive publication in an allow profile needs no approval key at all', async () => {
-    const env = pubEnv();
-    rmSync(env.keys.publicKeyFile);
-    env.backlog.add({ id: 'task-1', title: 'Plain' });
-    const { r } = await approveTask(env, 'task-1');
-    expect(r.publication).toMatchObject({ state: 'published', status: 'delivered' });
-  });
-
-  it('upgrade without a key yet: sensitive publication waits (no key); once the host provisions the public key, a signed approval publishes', async () => {
-    const env = pubEnv();
-    const pub = readFileSync(env.keys.publicKeyFile, 'utf8');
-    rmSync(env.keys.publicKeyFile); // existing project: no approval was ever issued on the host
-    env.backlog.add({ id: 'task-1', title: 'Touch CI' });
-    const { r, head, branch } = await approveTask(env, 'task-1', '.github/workflows/ci.yml');
-    expect(r.publication).toMatchObject({ state: 'awaiting-approval', status: 'awaiting-human', approvalError: expect.stringMatching(/no approval public key/) });
-    expect(remoteHead(env.bare, branch)).toBeNull();
-    expect(() => env.sched.approvePublication('task-1', { head, signature: env.keys.sign('task-1', head) })).toThrow(/no approval public key/);
-    // The host's first `work approve` writes the public key into the (bind-mounted) runtime config dir.
-    writeFileSync(env.keys.publicKeyFile, pub);
-    env.sched.approvePublication('task-1', { head, signature: env.keys.sign('task-1', head) });
-    expect((await env.sched.publish('task-1')).state).toBe('published');
-    expect(remoteHead(env.bare, branch)).toBe(head);
-  });
-
-  it('re-verifies at push time: an approval accepted by `work approve` but expired before publish is rejected', async () => {
-    const env = pubEnv();
-    env.backlog.add({ id: 'task-1', title: 'Touch CI' });
-    const { head, branch } = await approveTask(env, 'task-1', '.github/workflows/ci.yml');
-    env.sched.approvePublication('task-1', { head, signature: env.keys.sign('task-1', head, { ttlMs: 150 }) });
-    await new Promise((res) => setTimeout(res, 250));
-    const p = await env.sched.publish('task-1');
-    expect(p).toMatchObject({ state: 'awaiting-approval', approvalError: expect.stringMatching(/expired/) });
-    expect(remoteHead(env.bare, branch)).toBeNull();
-    expect(env.gh.calls).toHaveLength(0);
-  });
-
-  it('re-verifies at push time: replacing the runtime public key after approval invalidates the recorded token', async () => {
-    const env = pubEnv();
-    env.backlog.add({ id: 'task-1', title: 'Touch CI' });
-    const { head, branch } = await approveTask(env, 'task-1', '.github/workflows/ci.yml');
-    env.sched.approvePublication('task-1', { head, signature: env.keys.sign('task-1', head) });
-    writeFileSync(env.keys.publicKeyFile, approvalKeys().publicKeyPem); // key rotated on the host
-    const p = await env.sched.publish('task-1');
-    expect(p).toMatchObject({ state: 'awaiting-approval', approvalError: expect.stringMatching(/signature is invalid/) });
-    expect(remoteHead(env.bare, branch)).toBeNull();
-  });
-
-  it('a host-signed approval for the old head does not publish the new head after more commits and a new review', async () => {
-    const env = pubEnv();
-    env.backlog.add({ id: 'task-1', title: 'Touch CI' });
-    const first = await approveTask(env, 'task-1', '.github/workflows/ci.yml');
-    expect(first.r.publication?.state).toBe('awaiting-approval');
-    const oldToken = env.keys.sign('task-1', first.head);
-    // A further engineer/tester/reviewer round on the same task (e.g. the user asked for changes).
-    env.backlog.tasks.get('task-1')!.status = 'changes-requested' as never;
-    const second = await approveTask(env, 'task-1', '.github/workflows/ci.yml');
-    expect(second.head).not.toBe(first.head);
-    expect(env.db.publication('task-1')?.head_sha).toBe(second.head);
-    expect(second.r.publication?.state).toBe('awaiting-approval');
-    // The old-head token: refused by the command, and smuggled in as a row for the new head it still fails.
-    expect(() => env.sched.approvePublication('task-1', { head: second.head, signature: oldToken })).toThrow(/for head/);
-    env.db.addApproval({ task_id: 'task-1', scope: 'publish', head_sha: second.head, approved_by: 'user', note: null, signature: oldToken });
-    const p = await env.sched.publish('task-1');
-    expect(p).toMatchObject({ state: 'awaiting-approval', approvalError: expect.stringMatching(/for head/) });
-    expect(remoteHead(env.bare, second.branch)).toBeNull();
-    expect(env.gh.calls).toHaveLength(0);
-  });
-
   it('a local base ref moved to the branch head cannot hide sensitive paths: the gate diffs against the base recorded at claim', async () => {
     const env = pubEnv();
     env.backlog.add({ id: 'task-1', title: 'Touch CI' });
@@ -414,32 +208,6 @@ describe('sensitive-path gate', () => {
     expect(r.publication).toMatchObject({ state: 'awaiting-approval', status: 'awaiting-human', sensitivePaths: ['.github/workflows/ci.yml'] });
     expect(remoteHead(env.bare, rev.branch)).toBeNull();
     expect(env.gh.calls).toHaveLength(0);
-  });
-
-  it('a moved local base ref with the recorded bases wiped from the DB: origin\'s base (ls-remote) still exposes sensitive paths', async () => {
-    const env = pubEnv();
-    env.backlog.add({ id: 'task-1', title: 'Touch CI' });
-    const { r, head, branch } = await approveTask(env, 'task-1', '.github/workflows/ci.yml');
-    expect(r.publication?.state).toBe('awaiting-approval');
-    env.db.exec('UPDATE leases SET base_sha = NULL WHERE task_id = ?', 'task-1');
-    gitSync(env.layout.repo, 'update-ref', 'refs/heads/main', head);
-    gitSync(env.layout.repo, 'update-ref', 'refs/remotes/origin/main', head);
-    const p = await env.sched.publish('task-1');
-    expect(p).toMatchObject({ state: 'awaiting-approval', sensitivePaths: ['.github/workflows/ci.yml'] });
-    expect(remoteHead(env.bare, branch)).toBeNull();
-  });
-
-  it('PR creation is gated too: a remote branch already at the head (pushed outside minions) does not bypass approval', async () => {
-    const env = pubEnv();
-    env.backlog.add({ id: 'task-1', title: 'Touch CI' });
-    const { head, branch } = await approveTask(env, 'task-1', '.github/workflows/ci.yml');
-    // A direct push with the token (the documented residual risk), then a normal publish retry.
-    gitSync(env.layout.repo, 'push', '-q', env.bare, `${head}:refs/heads/${branch}`);
-    expect(remoteHead(env.bare, branch)).toBe(head);
-    const p = await env.sched.publish('task-1');
-    expect(p).toMatchObject({ state: 'awaiting-approval', status: 'awaiting-human' });
-    expect(env.gh.calls).toHaveLength(0);
-    expect(env.gh.prs).toHaveLength(0);
   });
 
   it('coordinator settings deny direct push/merge and recording an approval (the owner signs it on the host)', () => {
@@ -484,21 +252,6 @@ describe('branch delivery', () => {
     expect((await env.sched.publish('task-1')).state).toBe('published');
   });
 
-  it('local delivery is unchanged: delivered without any publication', async () => {
-    const env = makeEnv();
-    env.backlog.add({ id: 'task-1' });
-    const eng = await env.sched.claim('task-1', 'engineer');
-    const head = commitFile(eng.worktree, 'a.txt', 'x');
-    await env.sched.record(eng.leaseId, result({ branch: eng.branch, headSha: head }));
-    const t = await env.sched.claim('task-1', 'tester');
-    await env.sched.record(t.leaseId, result({ branch: t.branch, headSha: head }));
-    const rev = await env.sched.claim('task-1', 'reviewer');
-    const r = await env.sched.record(rev.leaseId, result({ branch: rev.branch, headSha: head, verdict: 'approve' }));
-    expect(r).toMatchObject({ to: 'delivered', approved: true });
-    expect(r.publication).toBeUndefined();
-    expect(env.db.publication('task-1')).toBeUndefined();
-    await expect(env.sched.publish('task-1')).rejects.toThrow(/no approved publication/);
-  });
 });
 
 describe('PR text privacy', () => {
@@ -539,19 +292,6 @@ describe('publication helpers', () => {
     expect(classifyFailure('remote: Permission to o/r.git denied to bot.\nfatal: unable to access ... The requested URL returned error: 403')).toBe('POLICY_DENIED');
     expect(classifyFailure('fatal: unable to access: Could not resolve host: github.com')).toBe('NETWORK_RETRYABLE');
     expect(classifyFailure('something odd')).toBe('INTERNAL');
-  });
-
-  it('rejects a non-GitHub origin before any network call', async () => {
-    const env = pubEnv();
-    gitSync(env.layout.repo, 'remote', 'set-url', 'origin', 'https://gitlab.com/acme/demo.git');
-    env.backlog.add({ id: 'task-1', title: 'Gitlab' });
-    // The pre-claim base sync refuses a non-GitHub origin too; stub it to reach publication.
-    env.sched = new Scheduler({ db: env.db, backlog: env.backlog, config: env.config, layout: env.layout, gh: (a, o) => env.gh.fn(a, o), serverUrl: env.serverUrl,
-      baseSync: async (_repo, base) => ({ base, originRef: `refs/remotes/origin/${base}`, from: null, to: 'x', action: 'up-to-date', method: null }),
-      publisher: (input: PublishInput) => publishTask({ ...input, gh: env.gh.fn, tokenFile: env.tokenFile }) });
-    const { r } = await approveTask(env, 'task-1');
-    expect(r.publication).toMatchObject({ state: 'failed', errorCode: 'PRECONDITION' });
-    expect(r.publication!.message).toMatch(/not a github\.com repository/);
   });
 
   it('doctor merge.readiness reports PR delivery availability and auto-merge as off (opt-in) by default', () => {

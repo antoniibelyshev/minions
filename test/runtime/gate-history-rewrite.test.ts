@@ -1,13 +1,13 @@
 // Security (task-71): workers can write the shared .git (refs/replace, info/grafts, shallow, objects/info),
 // so the git reads that decide a gate must not see history rewrites. QA showed that
 // `git replace <head> <commit with head^'s tree>` emptied the sensitive-path diff and turned an
-// awaiting-approval PR into a published one. Real git throughout (temp workspace + temp bare origin).
+// awaiting-approval PR into a published one. Real git throughout (temp workspace + temp bare origin); the
+// gateGit args/env are unit-tested in git-hardening-gate.test.ts.
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { GitFn } from '../../src/runtime/github.js';
-import { gateGit, gateGitArgs, gateGitEnv, GATE_HOME } from '../../src/runtime/git-hardening.js';
 import { gateChangedPaths, publishTask, type GhFn } from '../../src/runtime/publish.js';
 import { git as realGit } from '../../src/runtime/worktree.js';
 import { defaults } from '../helpers.js';
@@ -173,36 +173,5 @@ describe('scheduler gate reads ignore history rewrites (task-71)', () => {
     expect(plainDiff(b.worktree, `${head}^...${head}`)).toBe('');
     const req = await env.sched.qaRequirement(env.backlog.tasks.get('task-1')!, head);
     expect(req.reasons.join()).toMatch(/sensitive paths \(\.github\/workflows\/ci\.yml\)/);
-  });
-});
-
-describe('gateGit (task-71)', () => {
-  it('runs with replace objects, grafts, shallow and commit graph off and only allowlisted variables', async () => {
-    const seen: { args: string[]; env: NodeJS.ProcessEnv }[] = [];
-    await gateGit('/repo', ['diff', '--name-only', 'a...b'], true, {
-      env: { PATH: '/usr/bin', HOME: '/home/agent', XDG_CONFIG_HOME: '/x', GIT_DIR: '/evil', GIT_GRAFT_FILE: '/evil/g', GIT_CONFIG_PARAMETERS: "'a'='b'", GIT_NO_REPLACE_OBJECTS: '' },
-      run: async (_c, args, o) => { seen.push({ args, env: o.env }); return { code: 0, stdout: '', stderr: '' }; },
-    });
-    const { args, env } = seen[0]!;
-    expect(args.slice(-3)).toEqual(['diff', '--name-only', 'a...b']);
-    for (const c of ['core.useReplaceRefs=false', 'core.commitGraph=false', 'core.hooksPath=/dev/null', 'core.attributesFile=/dev/null', 'diff.external=']) {
-      expect(args[args.indexOf(c) - 1]).toBe('-c');
-    }
-    expect(env).toMatchObject({
-      GIT_NO_REPLACE_OBJECTS: '1', GIT_GRAFT_FILE: '/dev/null', GIT_SHALLOW_FILE: '/dev/null', GIT_CONFIG_GLOBAL: '/dev/null',
-      GIT_CONFIG_NOSYSTEM: '1', HOME: GATE_HOME, PATH: '/usr/bin',
-    });
-    expect(env.GIT_DIR).toBeUndefined();
-    expect(env.GIT_CONFIG_PARAMETERS).toBeUndefined();
-    expect(env.XDG_CONFIG_HOME).toBeUndefined();
-  });
-
-  it('gateGitArgs ends with --no-pager and gateGitEnv keeps no inherited GIT_* variable', () => {
-    expect(gateGitArgs().at(-1)).toBe('--no-pager');
-    const env = gateGitEnv({ PATH: '/bin', GIT_WORK_TREE: '/w', GIT_COMMON_DIR: '/c', GIT_ALTERNATE_OBJECT_DIRECTORIES: '/a' });
-    expect(Object.keys(env).filter((k) => k.startsWith('GIT_')).sort()).toEqual([
-      'GIT_ASKPASS', 'GIT_ATTR_NOSYSTEM', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_NOSYSTEM', 'GIT_GRAFT_FILE', 'GIT_NO_REPLACE_OBJECTS',
-      'GIT_OPTIONAL_LOCKS', 'GIT_SHALLOW_FILE', 'GIT_TERMINAL_PROMPT',
-    ]);
   });
 });

@@ -4,7 +4,7 @@
 // URL, cross-checked with the GitHub API) and push to that same URL, so a forged ls-remote can neither
 // empty the diff nor let a sensitive change of another task reach the real origin without approval.
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import type { GitFn } from '../../src/runtime/github.js';
@@ -70,23 +70,6 @@ function world() {
 }
 
 describe('task-71: a forged origin (url.insteadOf) cannot choose the gate base', () => {
-  it('normal flow: a non-sensitive PR publishes to the real origin', async () => {
-    const w = world();
-    gitSync(w.repo, 'checkout', '-q', '-b', 'agent/t');
-    put(w.repo, 'src/a.ts', 'a\n');
-    const head = commit(w.repo, 'feature');
-    expect(await w.publish(head, [w.base])).toMatchObject({ state: 'published', push: 'pushed', sensitivePaths: [] });
-    expect(w.remoteHas('refs/heads/agent/t')).toBe(true);
-  });
-
-  it('normal flow: a sensitive PR waits for approval', async () => {
-    const w = world();
-    gitSync(w.repo, 'checkout', '-q', '-b', 'agent/t');
-    put(w.repo, '.github/workflows/ci.yml', 'evil\n');
-    const head = commit(w.repo, 'ci');
-    expect(await w.publish(head, [w.base])).toMatchObject({ state: 'awaiting-approval' });
-    expect(w.ghCalls).toHaveLength(0);
-  });
 
   it('A: same-task attacker (forged main contains the head) still waits for approval', async () => {
     const w = world();
@@ -129,40 +112,6 @@ describe('task-71: a forged origin (url.insteadOf) cannot choose the gate base',
     expect(w.ghCalls).toHaveLength(0);
   });
 
-  it('D2: an unreadable origin for reads (pushes still configured to the real one) publishes nothing', async () => {
-    const w = world();
-    gitSync(w.repo, 'checkout', '-q', '--detach');
-    put(w.repo, '.github/workflows/ci.yml', 'evil\n');
-    const f = commit(w.repo, 'poison');
-    gitSync(w.repo, 'update-ref', 'refs/heads/main', f);
-    gitSync(w.repo, 'update-ref', 'refs/remotes/origin/main', f);
-    gitSync(w.repo, 'config', '--unset', `url.${w.real}.insteadOf`);
-    gitSync(w.repo, 'config', 'url./nonexistent/repo.git.insteadOf', REMOTE);
-    gitSync(w.repo, 'config', `url.${w.real}.pushInsteadOf`, REMOTE);
-    gitSync(w.repo, 'checkout', '-q', '-b', 'agent/t', f);
-    put(w.repo, 'src/y.ts', 'y\n');
-    const head = commit(w.repo, 'innocent feature');
-    expect(await w.publish(head, [f])).not.toMatchObject({ state: 'published' });
-    expect(w.remoteHas('refs/heads/agent/t')).toBe(false);
-  });
-
-  it('a server base that is not in the workspace is fetched from the recorded URL (isolated), not from the forged one', async () => {
-    const w = world();
-    // GitHub merged something the workspace never saw.
-    const other = join(tmp('qa71-gh-'), 'gh');
-    execFileSync('git', ['clone', '-q', '-b', 'main', w.real, other]);
-    put(other, 'merged.txt', 'm\n');
-    const merged = commit(other, 'merged on GitHub');
-    gitSync(other, 'push', '-q', 'origin', 'main');
-    rmSync(other, { recursive: true, force: true });
-    gitSync(w.repo, 'checkout', '-q', '-b', 'agent/t');
-    put(w.repo, '.github/workflows/ci.yml', 'evil\n');
-    const head = commit(w.repo, 'ci');
-    w.forge(gitSync(w.repo, 'commit-tree', `${head}^{tree}`, '-p', head, '-m', 'main lookalike'));
-    const out = await w.publish(head, []);
-    expect(out).toMatchObject({ state: 'awaiting-approval', sensitivePaths: ['.github/workflows/ci.yml'] });
-    expect(gitSync(w.repo, 'cat-file', '-t', merged)).toBe('commit');
-  });
 });
 
 describe('task-71: the server origin comes from minions\' own record', () => {

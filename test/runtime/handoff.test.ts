@@ -6,7 +6,7 @@ import { COMPACT_FIELDS, projectTasks, register as registerBacklog, selectFields
 import type { MinionsError } from '../../src/core/errors.js';
 import { register as registerRuntime } from '../../src/runtime/commands.js';
 import {
-  claimWithBrief, compactClaim, fetchBrief, recordSubmitted, rejectedPath, submissionPath, submitResult, type HandoffPaths,
+  briefPath, claimWithBrief, compactClaim, fetchBrief, recordSubmitted, rejectedPath, submissionPath, submitResult, type HandoffPaths,
 } from '../../src/runtime/handoff.js';
 import { preAgentHook } from '../../src/runtime/hooks.js';
 import { commitFile, makeEnv, result, type Env } from './fixtures.js';
@@ -106,6 +106,7 @@ describe('file-based result hand-off', () => {
     expect(r).toMatchObject({ valid: true, from: 'implementing', to: 'testing' });
     expect(env.backlog.status('task-1')).toBe('testing');
     expect(existsSync(s.path)).toBe(false); // the DB holds the recorded result
+    expect(existsSync(briefPath(paths(env), brief.leaseId))).toBe(false); // an ended lease leaves no hand-off files (task-9)
     expect(JSON.parse(env.db.lease(brief.leaseId)!.result_json!).headSha).toBe(head);
     expect(env.db.events('task-1', 'submit')).toHaveLength(1);
   });

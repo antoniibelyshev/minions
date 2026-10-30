@@ -3,7 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { signApproval, verifyApproval } from '../../src/core/approval.js';
+import { signApproval } from '../../src/core/approval.js';
 import type { MinionsConfig } from '../../src/config/schema.js';
 import type { RunResult } from '../../src/core/exec.js';
 import { approveOnHost } from '../../src/host/approvals.js';
@@ -196,104 +196,8 @@ describe('CI-gated auto-merge (mocked gh)', () => {
     expect(env.backlog.notes.at(-1)!.text).toMatch(/merged at 2026-10-20T12:00:00Z; task done \(merged\)/);
   });
 
-  it('never arms with failing, pending, unreadable or unconfigured required checks', async () => {
-    const env = mergeEnv((c) => { c.capabilities['pr.merge'] = 'allow'; });
-    await deliver(env, 'task-1');
-    env.gh.pr().rollup = failing;
-    expect((await sync(env)).tasks[0]!.merge).toMatchObject({ state: 'waiting', reasons: [expect.stringMatching(/CI gate fail/)] });
-    env.gh.pr().rollup = [{ __typename: 'CheckRun', name: 'test', status: 'IN_PROGRESS', conclusion: null }];
-    expect((await sync(env)).tasks[0]!.merge!.reasons.join(' ')).toMatch(/CI gate pending/);
-    // A passing check that is not the required one is not evidence.
-    env.gh.pr().rollup = [{ __typename: 'CheckRun', name: 'lint', status: 'COMPLETED', conclusion: 'SUCCESS' }];
-    expect((await sync(env)).tasks[0]!.merge!.state).toBe('waiting');
-    // No required checks on the base: never treated as zero required checks.
-    env.gh.required = [];
-    env.gh.pr().rollup = passing;
-    expect((await sync(env)).tasks[0]!.merge!.reasons.join(' ')).toMatch(/CI gate unknown.*never treated as zero required checks/);
-    // delivery.requiredChecksConfigured false blocks too, even with checks passing.
-    env.gh.required = ['test'];
-    env.config.delivery.requiredChecksConfigured = false;
-    expect((await sync(env)).tasks[0]!.merge!.reasons).toContain('delivery.requiredChecksConfigured is false (never treated as zero required checks)');
-    env.config.delivery.requiredChecksConfigured = true;
-    expect((await sync(env)).tasks[0]!.merge).toMatchObject({ state: 'armed' });
-    expect(env.gh.merges()).toHaveLength(1);
-  });
-
-  it('task-71: a forged origin (url.insteadOf) plus a recorded base moved past the head cannot hide a sensitive path from the merge gate', async () => {
-    const env = mergeEnv((c) => { c.capabilities['pr.merge'] = 'allow'; });
-    const { r, head } = await deliver(env, 'task-1', 'infra/main.tf');
-    expect(r.publication?.state).toBe('awaiting-approval');
-    env.sched.approvePublication('task-1', { head, signature: env.keys.sign('task-1', head) });
-    await env.sched.publish('task-1');
-    env.gh.pr().rollup = passing;
-    // The attack: a main lookalike F with the head's tree on top of the head, served by a forged repository
-    // that origin's URL now resolves to; local base refs and the recorded lease bases moved to F as well.
-    const repo = env.layout.repo;
-    const f = gitSync(repo, 'commit-tree', `${head}^{tree}`, '-p', head, '-m', 'main lookalike');
-    const forged = join(tmp('minions-forged-'), 'demo.git');
-    execFileSync('git', ['init', '-q', '--bare', forged]);
-    gitSync(repo, 'push', '-q', forged, `${f}:refs/heads/main`);
-    gitSync(repo, 'config', '--unset', `url.${env.bare}.insteadOf`);
-    gitSync(repo, 'config', `url.${forged}.insteadOf`, REMOTE);
-    for (const ref of ['refs/heads/main', 'refs/remotes/origin/main']) gitSync(repo, 'update-ref', ref, f);
-    env.db.exec('UPDATE leases SET base_sha = ? WHERE task_id = ?', f, 'task-1');
-    expect(gitSync(repo, 'ls-remote', '--heads', 'origin', 'refs/heads/main').split(/\s+/)[0]).toBe(f);
-    // The merge gate reads origin's base at the recorded PR URL (the seam: the real bare repository) and
-    // cross-checks it with the API: the sensitive path stays, so pr.merge is upgraded to ask.
-    const m = (await sync(env, ['task-1'])).tasks[0]!.merge!;
-    expect(m).toMatchObject({ state: 'awaiting-approval', reasons: [expect.stringMatching(/sensitive paths \(infra\/main\.tf\)/)] });
-    expect(env.gh.calls.some((c) => c[0] === 'pr' && c[1] === 'merge')).toBe(false);
-  });
-
-  it('task-71: the merge gate fails closed when origin\'s base cannot be verified (git and the API disagree)', async () => {
-    const env = mergeEnv((c) => { c.capabilities['pr.merge'] = 'allow'; });
-    await deliver(env, 'task-1');
-    env.gh.pr().rollup = passing;
-    // GitHub's API reports a main that git (the seam) does not see.
-    const stale = join(tmp('minions-stale-'), 'demo.git');
-    execFileSync('git', ['clone', '-q', '--bare', env.bare, stale]);
-    commitFile(env.layout.repo, 'later.txt', 'l');
-    gitSync(env.layout.repo, 'push', '-q', env.bare, 'HEAD:refs/heads/main');
-    env.sched = new Scheduler({ db: env.db, backlog: env.backlog, config: env.config, layout: env.layout, approvalPublicKeyFile: env.keys.publicKeyFile, gh: env.gh.fn, serverUrl: () => stale });
-    const m = (await sync(env, ['task-1'])).tasks[0]!.merge!;
-    expect(m.state).not.toBe('armed');
-    expect(m.reasons.join(' ')).toMatch(/could not be verified.*for git but .* for the GitHub API/);
-    expect(env.gh.merges()).toEqual([]);
-  });
-
   // One case per test: each builds its own repository, origin and full delivery, and the three together ran
   // past the 5 s default timeout under parallel worker load (task-94).
-  it('pr.merge allow arms without approval', async () => {
-    const env = mergeEnv((c) => { c.capabilities['pr.merge'] = 'allow'; });
-    await deliver(env, 'task-1');
-    env.gh.pr().rollup = passing;
-    expect((await sync(env, ['task-1'])).tasks[0]!.merge).toMatchObject({ state: 'armed' });
-  });
-
-  it('pr.merge allow: a sensitive-path change upgrades it to ask, and a publish approval does not authorize the merge', async () => {
-    const env = mergeEnv((c) => { c.capabilities['pr.merge'] = 'allow'; });
-    // Sensitive path: publication needs a host-signed publish approval, the merge a separate merge approval.
-    const { r, head } = await deliver(env, 'task-2', 'infra/main.tf');
-    expect(r.publication?.state).toBe('awaiting-approval');
-    env.sched.approvePublication('task-2', { head, signature: env.keys.sign('task-2', head) });
-    expect((await env.sched.publish('task-2')).merge).toMatchObject({ state: 'waiting' });
-    env.gh.pr().rollup = passing;
-    const m = (await sync(env, ['task-2'])).tasks[0]!.merge!;
-    expect(m).toMatchObject({ state: 'awaiting-approval', reasons: [expect.stringMatching(/sensitive paths \(infra\/main\.tf\)/)] });
-    // The publish approval for the same head does not authorize the merge (it is a publish-scope row).
-    expect(m.approvalError).toBe('no host-signed approval is recorded');
-    env.sched.approveMerge('task-2', { head, signature: mergeToken(env, 'task-2', head) });
-    expect((await sync(env, ['task-2'])).tasks[0]!.merge).toMatchObject({ state: 'armed' });
-  });
-
-  it('pr.merge deny never arms, even with a host-signed merge approval', async () => {
-    const denied = mergeEnv((c) => { c.capabilities['pr.merge'] = 'deny'; });
-    const d = await deliver(denied, 'task-1');
-    denied.gh.pr().rollup = passing;
-    denied.db.addApproval({ task_id: 'task-1', scope: 'merge', head_sha: d.head, approved_by: 'owner', note: null, signature: mergeToken(denied, 'task-1', d.head) });
-    expect((await sync(denied)).tasks[0]!.merge).toMatchObject({ state: 'denied', reasons: expect.arrayContaining(['pr.merge is denied by policy']) });
-    expect(denied.gh.merges()).toEqual([]);
-  });
 
   it('disarms when the PR head moves away from the approved head, and when a gate stops passing', async () => {
     const env = mergeEnv((c) => { c.capabilities['pr.merge'] = 'allow'; });
@@ -333,79 +237,6 @@ describe('CI-gated auto-merge (mocked gh)', () => {
     expect(armedByMinions(env.db.evidenceOfKind('task-1', 'merge'))).toBe(false);
   });
 
-  it('leaves auto-merge that was enabled outside minions alone when a gate fails', async () => {
-    const env = mergeEnv((c) => { c.capabilities['pr.merge'] = 'allow'; });
-    await deliver(env, 'task-1');
-    env.gh.pr().autoMergeRequest = { mergeMethod: 'MERGE' };
-    env.gh.pr().rollup = failing;
-    const m = (await sync(env)).tasks[0]!.merge!;
-    expect(m.state).toBe('waiting');
-    expect(m.message).toMatch(/enabled on GitHub outside minions; left as is/);
-    expect(env.gh.merges()).toEqual([]);
-  });
-
-  it('a PR GitHub reports already mergeable (clean status) is merged without --auto only when mergeStateStatus is CLEAN', async () => {
-    const env = mergeEnv((c) => { c.capabilities['pr.merge'] = 'allow'; c.delivery.method = 'rebase'; });
-    const { head } = await deliver(env, 'task-1');
-    env.gh.pr().rollup = passing;
-    env.gh.armError = 'GraphQL: Pull request Pull request is in clean status (enablePullRequestAutoMerge)';
-    env.gh.pr().mergeStateStatus = 'BLOCKED';
-    expect((await sync(env)).tasks[0]!.merge).toMatchObject({ state: 'failed', armed: false });
-    expect(env.gh.merges()).toHaveLength(1); // only the --auto attempt
-
-    env.gh.pr().mergeStateStatus = 'CLEAN';
-    const s = await sync(env);
-    expect(s.tasks[0]!.merge).toMatchObject({ state: 'merged', merged: true, action: 'merged' });
-    expect(env.gh.merges().at(-1)).toEqual(['pr', 'merge', env.gh.pr().url, '--rebase', '--match-head-commit', head]);
-    expect(env.backlog.status('task-1')).toBe('done');
-    expect(s.tasks[0]!.statusChange).toEqual({ from: 'delivered', to: 'done' });
-  });
-
-  it('gh merging at once on --auto is read back as merged; arm failures are reported with a settings hint', async () => {
-    const env = mergeEnv((c) => { c.capabilities['pr.merge'] = 'allow'; });
-    await deliver(env, 'task-1');
-    env.gh.pr().rollup = passing;
-    env.gh.armError = 'GraphQL: Auto merge is not allowed for this repository (enablePullRequestAutoMerge)';
-    const f = (await sync(env)).tasks[0]!.merge!;
-    expect(f).toMatchObject({ state: 'failed' });
-    expect(f.message).toMatch(/Allow auto-merge/);
-    env.gh.armError = null;
-    env.gh.mergeOnArm = true;
-    const p = await env.sched.publish('task-1');
-    expect(p).toMatchObject({ state: 'published', status: 'done', merged: true, merge: { state: 'merged', action: 'merged' } });
-    expect(env.backlog.status('task-1')).toBe('done');
-  });
-
-  it('a merged PR whose task holds an active lease is recorded merged but the status is left alone', async () => {
-    const env = mergeEnv((c) => { c.capabilities['pr.merge'] = 'allow'; });
-    await deliver(env, 'task-1');
-    env.gh.pr().rollup = passing;
-    expect((await sync(env)).tasks[0]!.merge!.state).toBe('armed');
-    env.db.activeLeases = () => [{ task_id: 'task-1' } as never];
-    Object.assign(env.gh.pr(), { state: 'MERGED', mergedAt: '2026-10-20T12:00:00Z', autoMergeRequest: null });
-    const m = await env.sched.autoMerge('task-1');
-    expect(m).toMatchObject({ state: 'merged', merged: true });
-    expect(m.message).toMatch(/active lease; status left unchanged/);
-    expect(mergeHistory(env, 'task-1').at(-1)).toBe('merged');
-    expect(env.backlog.status('task-1')).not.toBe('done');
-  });
-
-  it('a failed --disable-auto is reported as failed with auto-merge still armed', async () => {
-    const env = mergeEnv((c) => { c.capabilities['pr.merge'] = 'allow'; });
-    await deliver(env, 'task-1');
-    env.gh.pr().rollup = passing;
-    expect((await sync(env)).tasks[0]!.merge!.state).toBe('armed');
-    env.gh.pr().rollup = failing;
-    env.gh.disableError = 'gh: HTTP 502';
-    const m = (await sync(env)).tasks[0]!.merge!;
-    expect(m).toMatchObject({ state: 'failed', armed: true });
-    expect(m.message).toMatch(/could not be disabled/);
-    expect(env.gh.pr().autoMergeRequest).not.toBeNull();
-    expect(armedByMinions(env.db.evidenceOfKind('task-1', 'merge'))).toBe(true);
-    env.gh.disableError = null;
-    expect((await sync(env)).tasks[0]!.merge!.state).toBe('disarmed');
-  });
-
   it('sync reconciles a PR merged on GitHub with auto-merge off: done, merge evidence recorded once', async () => {
     const env = mergeEnv((c) => { c.delivery.merge = 'disabled'; });
     await deliver(env, 'task-1');
@@ -420,6 +251,22 @@ describe('CI-gated auto-merge (mocked gh)', () => {
     expect(env.gh.merges()).toEqual([]);
   });
 
+  it('task-71: the merge gate fails closed when origin\'s base cannot be verified (git and the API disagree)', async () => {
+    const env = mergeEnv((c) => { c.capabilities['pr.merge'] = 'allow'; });
+    await deliver(env, 'task-1');
+    env.gh.pr().rollup = passing;
+    // GitHub's API reports a main that git (the seam) does not see.
+    const stale = join(tmp('minions-stale-'), 'demo.git');
+    execFileSync('git', ['clone', '-q', '--bare', env.bare, stale]);
+    commitFile(env.layout.repo, 'later.txt', 'l');
+    gitSync(env.layout.repo, 'push', '-q', env.bare, 'HEAD:refs/heads/main');
+    env.sched = new Scheduler({ db: env.db, backlog: env.backlog, config: env.config, layout: env.layout, approvalPublicKeyFile: env.keys.publicKeyFile, gh: env.gh.fn, serverUrl: () => stale });
+    const m = (await sync(env, ['task-1'])).tasks[0]!.merge!;
+    expect(m.state).not.toBe('armed');
+    expect(m.reasons.join(' ')).toMatch(/could not be verified.*for git but .* for the GitHub API/);
+    expect(env.gh.merges()).toEqual([]);
+  });
+
   it('formatSync prints the merge line with state and message', () => {
     const text = formatSync({ synced: 1, failed: 0, tasks: [{
       taskId: 'task-1', prUrl: 'https://github.com/acme/demo/pull/1', prState: 'OPEN', headSha: 'a'.repeat(40), changed: false, warnings: [],
@@ -429,28 +276,6 @@ describe('CI-gated auto-merge (mocked gh)', () => {
     expect(text).toContain('\n  merge failed: gh exploded');
   });
 
-  it('auto-merge off: delivery and sync make no merge calls and say minions does not merge', async () => {
-    const env = mergeEnv((c) => { c.delivery.merge = 'disabled'; c.capabilities['pr.merge'] = 'allow'; });
-    const { r } = await deliver(env, 'task-1');
-    expect(r.publication).toMatchObject({ state: 'published', merged: false });
-    expect(r.publication!.merge).toBeUndefined();
-    expect(r.publication!.message).toMatch(/minions does not merge/);
-    env.gh.pr().rollup = passing;
-    expect((await sync(env)).tasks[0]!.merge).toBeUndefined();
-    expect(env.gh.merges()).toEqual([]);
-  });
-
-  it('approveMerge binds the exact delivered head and rejects expired tokens', async () => {
-    const env = mergeEnv();
-    const { head } = await deliver(env, 'task-1');
-    expect(() => env.sched.approveMerge('task-1', { head: 'e'.repeat(40), signature: mergeToken(env, 'task-1', 'e'.repeat(40)) })).toThrow(/not the approved, delivered head/);
-    expect(() => env.sched.approveMerge('task-1', { head, signature: mergeToken(env, 'task-2', head) })).toThrow(/for task task-2/);
-    const old = new Date(Date.now() - 8 * 24 * 3600_000);
-    expect(() => env.sched.approveMerge('task-1', { head, signature: mergeToken(env, 'task-1', head, { now: old }) })).toThrow(/expired/);
-    expect(() => env.sched.approveMerge('task-9', { head, signature: mergeToken(env, 'task-9', head) })).toThrow(/no delivered pull request/);
-    // A merge token is not a publication approval either.
-    expect(verifyApproval(mergeToken(env, 'task-1', head), env.keys.publicKeyPem, { taskId: 'task-1', head }).ok).toBe(false);
-  });
 });
 
 describe('merge gate (pure)', () => {

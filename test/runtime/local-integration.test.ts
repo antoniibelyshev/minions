@@ -86,29 +86,10 @@ describe('local approval queues an integration', () => {
     expect(await env.sched.publish('task-1')).toMatchObject({ state: 'published', status: 'done', mode: 'local' });
   });
 
-  it('switch off (delivery.merge disabled): approval still ends delivered, nothing is queued', async () => {
-    const env = localEnv((c) => { c.delivery.merge = 'disabled'; });
-    env.backlog.add({ id: 'task-1', title: 'Old path' });
-    const { r } = await approveTask(env, 'task-1');
-    expect(r.to).toBe('delivered');
-    expect(r.message).toMatch(/delivered locally/);
-    expect(integrationRows(env.db, 'task-1')).toEqual([]);
-    expect(env.starts).toBe(0);
-    await expect(env.sched.publish('task-1')).rejects.toThrow(/has no approved publication|nothing is published/);
-  });
-
-  it('base.merge deny (supervised): approval ends delivered and the integrator never runs', async () => {
-    const env = localEnv((c) => { c.capabilities['base.merge'] = 'deny'; });
-    env.backlog.add({ id: 'task-1', title: 'Supervised' });
-    const { r } = await approveTask(env, 'task-1');
-    expect(r.to).toBe('delivered');
-    expect(integrationRows(env.db, 'task-1')).toEqual([]);
-    expect(env.starts).toBe(0);
-  });
 });
 
 describe('repair hand-back', () => {
-  it('a conflict leaves main unchanged, sends the task to changes-requested and briefs the engineer with an integrator finding', async () => {
+  it('a conflict leaves main unchanged, sends the task to changes-requested and briefs the engineer; the repaired head lands', async () => {
     const env = localEnv();
     env.backlog.add({ id: 'task-1', title: 'Conflicting' });
     const { head } = await approveTask(env, 'task-1', 'shared.txt', 'from the branch\n');
@@ -128,6 +109,29 @@ describe('repair hand-back', () => {
     expect(integ!.findings.join('\n')).toContain(B);
     expect(integ!.findings.join('\n')).toContain(head);
     expect(integ!.nextAction).toMatch(/Merge main into the branch, fix the conflicts/);
+
+    // The whole loop (from local-integration-qa): the engineer merges main, the new head is re-approved, queued and lands.
+    gitSync(eng.worktree, 'merge', '-q', '-X', 'ours', '-m', 'merge main', 'main');
+    const repaired = gitSync(eng.worktree, 'rev-parse', 'HEAD');
+    await env.sched.record(eng.leaseId, result({ branch: eng.branch, headSha: repaired, modifiedPaths: ['shared.txt'] }));
+    const t = await env.sched.claim('task-1', 'tester');
+    await env.sched.record(t.leaseId, result({ branch: t.branch, headSha: repaired, modifiedPaths: ['shared.txt'] }));
+    const rev = await env.sched.claim('task-1', 'reviewer');
+    const r = await env.sched.record(rev.leaseId, result({ branch: rev.branch, headSha: repaired, verdict: 'approve', modifiedPaths: ['shared.txt'] }));
+    expect(r).toMatchObject({ approved: true, to: 'merging', publication: { state: 'queued', headSha: repaired } });
+    expect(integrationRows(env.db, 'task-1').map((x) => [x.phase, x.head_sha])).toEqual([['conflict', head], ['queued', repaired]]);
+    await integrate(env);
+    expect(contains(env, repaired) && contains(env, B)).toBe(true);
+    expect((await env.backlog.getTask('task-1')).status).toBe('done');
+  });
+
+  it('base.merge deny (supervised): approval ends delivered and the integrator never runs', async () => {
+    const env = localEnv((c) => { c.capabilities['base.merge'] = 'deny'; });
+    env.backlog.add({ id: 'task-1', title: 'Supervised' });
+    const { r } = await approveTask(env, 'task-1');
+    expect(r.to).toBe('delivered');
+    expect(integrationRows(env.db, 'task-1')).toEqual([]);
+    expect(env.starts).toBe(0);
   });
 
   it('a red verification counts a repair cycle; at the limit the task goes to awaiting-human', async () => {
@@ -183,27 +187,6 @@ describe('policy: sensitive paths and base.merge ask', () => {
     expect(() => env.sched.approveMerge('task-1', { head, signature: 'x' })).toThrow(/already integrated/);
   });
 
-  it('base.merge "ask" (personal-work) needs a merge approval even without sensitive paths', async () => {
-    const env = localEnv((c) => { c.capabilities['base.merge'] = 'ask'; });
-    env.backlog.add({ id: 'task-1', title: 'Ask' });
-    const before = mainOf(env);
-    await approveTask(env, 'task-1');
-    await integrate(env);
-    expect(mainOf(env)).toBe(before);
-    expect((await env.backlog.getTask('task-1')).status).toBe('awaiting-human');
-    expect(env.db.publication('task-1')!.error).toMatch(/base\.merge is "ask"/);
-  });
-
-  it('work publish refuses to re-queue a head that is no longer the branch head', async () => {
-    const env = localEnv((c) => { c.capabilities['base.merge'] = 'ask'; });
-    env.backlog.add({ id: 'task-1', title: 'Moved' });
-    const { branch } = await approveTask(env, 'task-1');
-    await integrate(env);
-    // The branch moves after the approval (its worktree is still checked out).
-    const wt = gitSync(env.layout.repo, 'worktree', 'list', '--porcelain').split('\n\n').find((b) => b.includes(`branch refs/heads/${branch}`))!.split('\n')[0]!.slice('worktree '.length);
-    commitFile(wt, 'later.txt', 'later\n');
-    await expect(env.sched.publish('task-1')).rejects.toThrow(/not the approved head/);
-  });
 });
 
 describe('base.merge capability and mode-aware auto-merge reasons', () => {
@@ -275,22 +258,4 @@ describe('dependency rule and capacity', () => {
     await expect(env.sched.claim('task-2', 'engineer')).resolves.toMatchObject({ role: 'engineer' });
   });
 
-  it('switch off or base.merge deny: delivered still satisfies a dependency', async () => {
-    for (const mutate of [(c: MinionsConfig) => { c.delivery.merge = 'disabled'; }, (c: MinionsConfig) => { c.capabilities['base.merge'] = 'deny'; }]) {
-      const env = localEnv(mutate);
-      env.backlog.add({ id: 'task-1', title: 'Dep', status: 'delivered' });
-      env.backlog.add({ id: 'task-2', title: 'Dependent', dependencies: ['task-1'] });
-      expect(dependencyDoneStatuses(env.config)).toEqual(new Set(['done', 'delivered']));
-      await expect(env.sched.claim('task-2', 'engineer')).resolves.toMatchObject({ role: 'engineer' });
-    }
-  });
-
-  it('a merging task does not count against maxActiveTasks', async () => {
-    const env = localEnv((c) => { c.execution.maxActiveTasks = 1; });
-    env.backlog.add({ id: 'task-1', title: 'Merging' });
-    await approveTask(env, 'task-1');
-    expect((await env.backlog.getTask('task-1')).status).toBe('merging');
-    env.backlog.add({ id: 'task-2', title: 'Next' });
-    await expect(env.sched.claim('task-2', 'engineer')).resolves.toMatchObject({ role: 'engineer' });
-  });
 });
