@@ -798,7 +798,7 @@ describe('owner behaviour defaults (task-34)', () => {
     expect(orch).not.toContain('juniors');
     expect(orch).toContain('Do not loop waiting for work. Start nothing new while the budget is used up (`spend.budget.exhausted` in the status) or quota mode is on');
     expect(orch).not.toContain('Do not poll');
-    expect(orch).toMatch(/A `complete` tester or reviewer result with failing checks is rejected this way; for an engineer `complete` with failing checks, ask the same correction yourself/);
+    expect(orch).toMatch(/A `complete` tester or reviewer result with failing checks is rejected this way, and so is a `complete` engineer result with a failing check, a skipped verification command or no passing test run/);
     expect(orch).toContain('Include the spend so far');
     expect(orch).toContain('`minions work record <leaseId> --submitted --usage <subagent_tokens> --json`');
     expect(orch).toMatch(/Always pass `--usage` for Agent workers \(also on `--correction` records and `work release`\)/);

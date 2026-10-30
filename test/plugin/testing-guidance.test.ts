@@ -22,13 +22,42 @@ describe('risk-based testing in the generated plugin', () => {
     expect(eng).toMatch(/Tests are your responsibility: add or update tests that prove each acceptance criterion/);
     expect(eng).toMatch(/edge cases/);
     expect(eng).toMatch(/Focus on the important, user-visible or risky behaviour of the change; do not chase exhaustive small cases of low-importance helpers/);
-    expect(eng).toMatch(/Run the verification commands/);
+    expect(eng).toMatch(/Testing rule: from the brief's verification commands/);
+  });
+
+  it('testing rule (task-137.3): engineers run typecheck + unit tier, reviewers no tests, nobody the integration tier or baselines', async () => {
+    const cfg = defaults();
+    cfg.verification.commands = ['npm run typecheck', 'npm test'];
+    const read = await gen(cfg);
+    const eng = await read('agents/engineer.md');
+    expect(eng).toMatch(/run the typecheck \(or build\) and the unit tests only/);
+    expect(eng).toMatch(/targeted test files while iterating, then the unit tier once before you submit \(for example `npm run test:unit`/);
+    expect(eng).toMatch(/Do not run the full suite or the integration tier, and never rerun tests on the base branch for a baseline comparison/);
+    expect(eng).toMatch(/`TMPDIR` set to the scratch dir, whose path may contain spaces/);
+    expect(eng).toMatch(/On host-runtime projects this is the host environment, so no separate tester run is needed/);
+    expect(eng).toMatch(/The CLI refuses a `complete` engineer result with a failing check, a skipped verification command, or no passing test run/);
+    expect(eng).not.toMatch(/TMPDIR=<scratchDir> npm test/);
+
+    const rev = await read('agents/reviewer.md');
+    expect(rev).toMatch(/Run no tests, test suites or baseline reruns\. Rely on the engineer's recorded checks/);
+    expect(rev).toMatch(/The integration gate runs the full verification \(`npm run typecheck`, `npm test`\) before the base branch moves/);
+    expect(rev).not.toMatch(/verification commands \([^)]*\) to confirm claims/);
+    expect(rev).toMatch(/"needsQa": true` in your result only when .*install\/upgrade paths, cross-feature changes, or behaviour the engineer's evidence cannot show/);
+
+    const t = await read('agents/tester.md');
+    const taskQa = t.slice(t.indexOf('## Task QA'));
+    expect(taskQa).toMatch(/Run targeted checks only.*Do not rerun the full suite, the unit tier the engineer already ran, or the integration tier, and never rerun tests on the base branch/);
+    const sweep = t.slice(t.indexOf('## QA sweep'), t.indexOf('## Task QA'));
+    expect(sweep).toMatch(/a sweep may run the integration tier/);
+
+    const coord = await read('coordinator.md');
+    expect(coord).toMatch(/Testing rule: engineers run the typecheck and unit tests only .*Reviewers run no tests.*only in the integration gate \(and in QA sweeps\)\. Nobody reruns tests on the base branch/);
   });
 
   it('reviewer owns test adequacy and can flag a task for QA', async () => {
     const rev = await (await gen())('agents/reviewer.md');
     expect(rev).toMatch(/You own test adequacy/);
-    expect(rev).toMatch(/cover every acceptance criterion and the relevant edge cases/);
+    expect(rev).toMatch(/cover every acceptance criterion and the relevant edge cases, and that the engineer's recorded checks show them passing/);
     expect(rev).toMatch(/Missing or weak tests are a reason to request changes/);
     expect(rev).toMatch(/do not request changes only for missing tests of trivial or low-importance code/);
     expect(rev).toContain('"needsQa": true');
