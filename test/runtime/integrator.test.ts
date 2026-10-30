@@ -209,10 +209,6 @@ describe('runIntegrator: lock, pause, drain and halt', () => {
   });
 });
 
-describe('runIntegrator: crash recovery', () => {
-
-});
-
 describe('queue and helpers', () => {
   it('enqueue is idempotent for the same head and refuses a new head while one runs', () => {
     const s = setup();

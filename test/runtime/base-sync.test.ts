@@ -171,9 +171,6 @@ describe('local delivery is unchanged', () => {
   });
 });
 
-describe('workspace import under GitHub delivery', () => {
-});
-
 describe('pre-claim base sync: edge cases', () => {
   afterEach(() => { vi.unstubAllEnvs(); });
 
