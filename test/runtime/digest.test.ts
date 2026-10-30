@@ -12,7 +12,7 @@ import { ack, enqueue, isHeld, MAX_TEXT_LENGTH, NOTIFICATION_KINDS, pending, typ
 import { spendReport } from '../../src/runtime/spend.js';
 import { routineSettings, runRoutinePass, WAKE_EVENT, type CoordinatorView, type RoutinePassDeps, type RoutineSettings } from '../../src/runtime/routine.js';
 import { localDayStart, localStamp, zonedParts, zonedTimeToUtc } from '../../src/runtime/zoned-time.js';
-import { makeEnv } from './fixtures.js';
+import { makeUnitEnv } from './fixtures.js';
 import { recordOwnerMessageViaStop } from './transcript-shapes.js';
 
 const BERLIN: RoutineSettings = routineSettings({ routine: { enabled: true } });
@@ -88,7 +88,7 @@ describe('holds', () => {
   });
 
   it('a held item is not pending before its time; the hold-back keeps it for the digest while the routine is on', () => {
-    const env = makeEnv((c) => { c.routine = { enabled: true }; });
+    const env = makeUnitEnv((c) => { c.routine = { enabled: true }; });
     const clock = () => now;
     enqueue(env.db, { key: 'delivered:task-1:abc', kind: 'delivered', taskId: 'task-1', text: 'Delivered task-1', holdUntil: holdFor(env.db, env.config, 'delivered', undefined, now) }, clock);
     enqueue(env.db, { key: 'blocker:task-2:1', kind: 'blocker', taskId: 'task-2', text: 'task-2 is blocked', holdUntil: holdFor(env.db, env.config, 'blocker', undefined, now) }, clock);
@@ -104,7 +104,7 @@ describe('holds', () => {
   });
 
   it('turning the routine off releases held items at once (notify pending), not at the stored digest time', () => {
-    const env = makeEnv((c) => { c.routine = { enabled: true }; });
+    const env = makeUnitEnv((c) => { c.routine = { enabled: true }; });
     const clock = () => now;
     enqueue(env.db, { key: 'delivered:task-1:abc', kind: 'delivered', taskId: 'task-1', text: 'Delivered task-1', holdUntil: holdFor(env.db, env.config, 'delivered', undefined, now) }, clock);
     enqueue(env.db, { key: 'status:x', kind: 'status', text: 'explicitly held', holdUntil: holdFor(env.db, env.config, 'status', 'digest', now) }, clock);
@@ -122,13 +122,13 @@ describe('holds', () => {
   });
 
   it('the owner message time (Stop hook meta) turns default holds off', () => {
-    const env = makeEnv((c) => { c.routine = { enabled: true }; });
+    const env = makeUnitEnv((c) => { c.routine = { enabled: true }; });
     env.db.setMeta(LAST_OWNER_MESSAGE_META, '2026-10-27T09:50:00.000Z');
     expect(holdFor(env.db, env.config, 'question', undefined, now)).toBeNull();
   });
 
   it('a real plugin owner message (source="plugin:telegram:telegram") counted by the Stop hook turns default holds off', () => {
-    const env = makeEnv((c) => { c.routine = { enabled: true }; });
+    const env = makeUnitEnv((c) => { c.routine = { enabled: true }; });
     expect(holdFor(env.db, env.config, 'question', undefined, now)).not.toBeNull();
     expect(recordOwnerMessageViaStop(env.db, at('2026-10-27T09:50:00Z'))).toMatchObject({ recorded: true });
     expect(holdFor(env.db, env.config, 'question', undefined, now)).toBeNull();
@@ -139,7 +139,7 @@ describe('digest due (with catch-up)', () => {
   const cfg = { routine: { enabled: true } };
 
   it('due at its time, not before; once delivered it is done until the next time', () => {
-    const env = makeEnv((c) => { c.routine = { enabled: true }; });
+    const env = makeUnitEnv((c) => { c.routine = { enabled: true }; });
     // 07:50 Berlin: the last time is yesterday's 08:00 (never sent: due as a catch-up).
     const before = digestStatus(env.db, cfg, at('2026-10-27T06:50:00Z'));
     expect(before.slot.local).toBe('2026-10-26T08:00');
@@ -152,7 +152,7 @@ describe('digest due (with catch-up)', () => {
   });
 
   it('a missed time (host asleep) is caught up at the first pass after it; a missed day sends one digest, not two', () => {
-    const env = makeEnv();
+    const env = makeUnitEnv();
     // Asleep from Sunday evening to Tuesday 14:00 Berlin: only Tuesday 08:00 counts.
     const s = digestStatus(env.db, cfg, at('2026-10-27T13:00:00Z'));
     expect(s.slot.local).toBe('2026-10-27T08:00');
@@ -161,7 +161,7 @@ describe('digest due (with catch-up)', () => {
   });
 
   it('a digest wake counts: no second wake for the same time until the retry, at most two', () => {
-    const env = makeEnv();
+    const env = makeUnitEnv();
     env.db.addEvent(WAKE_EVENT, null, { digest: true }, '2026-10-27T07:01:00.000Z');
     expect(digestStatus(env.db, cfg, at('2026-10-27T07:30:00Z')).due).toBeNull();
     expect(digestStatus(env.db, cfg, at('2026-10-27T08:05:00Z')).due).toMatch(/retry/);
@@ -169,7 +169,7 @@ describe('digest due (with catch-up)', () => {
     expect(MAX_DIGEST_WAKES_PER_SLOT).toBe(2);
     expect(digestStatus(env.db, cfg, at('2026-10-27T12:00:00Z')).due).toBeNull();
     // A wake for runnable work is not a digest wake.
-    const env2 = makeEnv();
+    const env2 = makeUnitEnv();
     env2.db.addEvent(WAKE_EVENT, null, { digest: false }, '2026-10-27T07:01:00.000Z');
     expect(digestStatus(env2.db, cfg, at('2026-10-27T07:30:00Z')).due).not.toBeNull();
   });
@@ -177,7 +177,7 @@ describe('digest due (with catch-up)', () => {
 
 describe('the digest wake in the routine pass (fake clock)', () => {
   function passEnv(over: Partial<RoutinePassDeps> = {}) {
-    const env = makeEnv((c) => { c.routine = { enabled: true }; });
+    const env = makeUnitEnv((c) => { c.routine = { enabled: true }; });
     let now = at('2026-10-26T15:00:00Z');
     const wakes: string[] = [];
     const coordinator: CoordinatorView = { running: true, lockAcquiredAt: '2026-10-20T00:00:00.000Z', staleLock: false, exit: null, lastRestartAt: null };
@@ -410,7 +410,7 @@ describe('composeDigest (deterministic)', () => {
 
 describe('prepareDigest: stored under its key; acking the keys marks the time done', () => {
   it('compose -> ack -> not due; held items are covered and delivered; a later call composes an extra digest', () => {
-    const env = makeEnv((c) => { c.routine = { enabled: true }; });
+    const env = makeUnitEnv((c) => { c.routine = { enabled: true }; });
     const t0 = at('2026-10-27T07:05:00Z');
     enqueue(env.db, { key: 'question:task-6:1', kind: 'question', taskId: 'task-6', text: 'Which?\n1. A (recommended)\n2. B', holdUntil: '2026-10-28T07:00:00.000Z' }, () => t0);
     env.db.addEvent('ci-observation', 'task-3', { prUrl: 'https://github.com/o/r/pull/3', statusChange: { from: 'delivered', to: 'done' } }, '2026-10-27T01:00:00.000Z');
@@ -446,12 +446,12 @@ describe('digest spend: one window since the previous digest (task-89)', () => {
     components: { input: tokens, cacheRead: 0, cacheWrite: 0, output: 0 }, turns: 1, contextSum: 0, maxContext: 0, ownerMessages: 0,
     recovered: false, woken, overhead: 0, overheadDone: true, recentIds: [],
   });
-  const usage = (env: ReturnType<typeof makeEnv>, tokens: number, at: string) =>
+  const usage = (env: ReturnType<typeof makeUnitEnv>, tokens: number, at: string) =>
     env.db.addEvent('usage', null, { key: 'session:s1', scope: 'session', session: 's1', tokens, model: null, source: 'manual' }, at);
-  const spend = (env: ReturnType<typeof makeEnv>, now: Date) => spendReport({ db: env.db, config: env.config, billing: 'subscription', now });
+  const spend = (env: ReturnType<typeof makeUnitEnv>, now: Date) => spendReport({ db: env.db, config: env.config, billing: 'subscription', now });
 
   it('tokens, wakes and wake tokens all count from the previous digest, across UTC and local midnight', () => {
-    const env = makeEnv((c) => { c.routine = { enabled: true }; });
+    const env = makeUnitEnv((c) => { c.routine = { enabled: true }; });
     // The previous digest (08:00 Berlin = 07:00Z) was delivered at 07:02Z on 26 Oct.
     const prevAt = at('2026-10-26T07:02:00Z');
     enqueue(env.db, { key: 'digest:2026-10-26T08:00', kind: 'digest', text: 'yesterday' }, () => prevAt);
@@ -478,7 +478,7 @@ describe('digest spend: one window since the previous digest (task-89)', () => {
   });
 
   it('without a previous digest the window is the last 24h, for tokens and wakes alike', () => {
-    const env = makeEnv((c) => { c.routine = { enabled: true }; });
+    const env = makeUnitEnv((c) => { c.routine = { enabled: true }; });
     usage(env, 1000, '2026-10-26T06:00:00.000Z'); // more than 24h before now
     usage(env, 3000, '2026-10-26T20:00:00.000Z');
     env.db.addEvent(WAKE_EVENT, null, {}, '2026-10-26T06:30:00.000Z');

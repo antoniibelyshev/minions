@@ -15,7 +15,7 @@ import { scanShell } from '../../src/runtime/shell-scan.js';
 import { bashStateReference, protectedStatePath, resolveReal, stateGuard } from '../../src/runtime/state-guard.js';
 import { containerStateDenies, coordinatorSettings } from '../../src/runtime/coordinator.js';
 import { runtimePaths } from '../../src/runtime/paths.js';
-import { defaults, FAKE_MINIONS, runHookCommand, shq } from '../helpers.js';
+import { defaults, shq } from '../helpers.js';
 
 const tmp = mkdtempSync(join(tmpdir(), 'minions-state-guard-'));
 afterAll(() => rmSync(tmp, { recursive: true, force: true }));
@@ -415,25 +415,6 @@ describe('the plugin hooks.json file-tool and Bash entries', () => {
     expect(entry('Read|Glob|Grep').command).toBe(PRE_FILE_READ_HOOK_COMMAND);
     expect(entry('Bash').command).toBe(PRE_BASH_HOOK_COMMAND);
     for (const m of ['Edit|MultiEdit|Write|NotebookEdit', 'Read|Glob|Grep']) expect(entry(m).timeout).toBeGreaterThan(20);
-  });
-
-  it('write tools: every subagent call reaches minions and fails closed; the coordinator never starts node', () => {
-    const subWrite = JSON.stringify(file('Write', { file_path: join(worktree, 'a.ts'), content: '' }));
-    for (const fake of [null, FAKE_MINIONS.crash, FAKE_MINIONS.killed, FAKE_MINIONS.noNode, FAKE_MINIONS.allowThenFail]) {
-      expect(runHookCommand(PRE_FILE_WRITE_HOOK_COMMAND, fake, subWrite).status).toBe(2);
-    }
-    expect(JSON.parse(runHookCommand(PRE_FILE_WRITE_HOOK_COMMAND, FAKE_MINIONS.deny, subWrite).stdout).hookSpecificOutput.permissionDecision).toBe('deny');
-    expect(runHookCommand(PRE_FILE_WRITE_HOOK_COMMAND, null, JSON.stringify(file('Write', { file_path: '/state/minions.db' }, {})))).toMatchObject({ status: 0, stdout: '' });
-  });
-
-  it('read tools and Bash: node starts for a subagent call naming the state dir, and fails closed then', () => {
-    const subRead = JSON.stringify(file('Read', { file_path: '/state/briefs/lease-1.json' }));
-    expect(runHookCommand(PRE_FILE_READ_HOOK_COMMAND, null, subRead).status).toBe(2);
-    // A fixed path and cwd: the temp worktree can sit under a dir named state (the host scratch dir is <state>/cache/tmp).
-    expect(runHookCommand(PRE_FILE_READ_HOOK_COMMAND, null, JSON.stringify(file('Read', { file_path: '/workspace/worktrees/t/a.ts' }, { ...sub, cwd: '/workspace/worktrees/t' })))).toMatchObject({ status: 0, stdout: '' });
-    expect(runHookCommand(PRE_BASH_HOOK_COMMAND, null, JSON.stringify(bash('sqlite3 /state/minions.db .dump', sub))).status).toBe(2);
-    expect(runHookCommand(PRE_BASH_HOOK_COMMAND, null, JSON.stringify(bash('ls "$MINIONS_STATE_DIR"', sub))).status).toBe(2);
-    expect(runHookCommand(PRE_BASH_HOOK_COMMAND, null, JSON.stringify(bash('sqlite3 /state/minions.db .dump')))).toMatchObject({ status: 0, stdout: '' });
   });
 });
 

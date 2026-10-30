@@ -1,11 +1,6 @@
 // GitHub-filtered intake sync: mocked gh (read-only GETs only), temp state dirs, never the live /state.
-import { mkdtempSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { execFileSync } from 'node:child_process';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { BacklogMdAdapter } from '../../src/backlog/backlogmd.js';
-import { writeBacklogConfig } from '../../src/backlog/factory.js';
 import type { CreateTaskInput, Task } from '../../src/backlog/types.js';
 import { validateConfig } from '../../src/config/resolve.js';
 import type { MinionsConfig } from '../../src/config/schema.js';
@@ -16,9 +11,10 @@ import {
 } from '../../src/runtime/intake-sync.js';
 import { ghApi } from '../../src/runtime/ci.js';
 import { intakeOnStart } from '../../src/runtime/commands.js';
+import type { GitFn } from '../../src/runtime/github.js';
 import type { GhFn } from '../../src/runtime/publish.js';
 import { defaults } from '../helpers.js';
-import { FakeBacklog, initRepo, makeDefaultEnv, tmp, type Env } from './fixtures.js';
+import { FakeBacklog, makeUnitDefaultEnv, tmp, type Env } from './fixtures.js';
 
 const REPO = 'acme/demo';
 const FILTER: GithubIntakeConfig = { enabled: true, repository: REPO, labels: ['minions'], assignee: null, milestone: null, state: 'open' };
@@ -74,7 +70,7 @@ class RecordingBacklog extends FakeBacklog {
 }
 
 function env(filter: GithubIntakeConfig | null = FILTER) {
-  const e: Env = makeDefaultEnv((c) => { if (filter) c.intake.github = { ...filter }; });
+  const e: Env = makeUnitDefaultEnv((c) => { if (filter) c.intake.github = { ...filter }; });
   const backlog = new RecordingBacklog();
   const gh = fakeGh(filter ?? FILTER);
   const run = () => syncIntake({ db: e.db, backlog, config: e.config, gh: gh.fn });
@@ -177,10 +173,11 @@ describe('intake sync: import', () => {
 
   it('uses the workspace origin when intake.github.repository is null', async () => {
     const root = tmp('minions-intake-origin-');
-    initRepo(root);
-    execFileSync('git', ['remote', 'add', 'origin', 'git@github.com:acme/demo.git'], { cwd: root });
-    const { git } = await import('../../src/runtime/worktree.js');
+    // The origin URL as `git config --get remote.origin.url` prints it (a fake git: the unit tier spawns nothing).
+    const git: GitFn = async (cwd, args) => (cwd === root && args.join(' ') === 'config --get remote.origin.url'
+      ? { code: 0, stdout: 'git@github.com:acme/demo.git\n', stderr: '' } : { code: 1, stdout: '', stderr: '' });
     expect(await originRepository(root, git)).toBe(REPO);
+    expect(await originRepository(join(root, 'elsewhere'), git)).toBeNull();
     const x = env({ ...FILTER, repository: null });
     x.gh.set([{ number: 1 }]);
     const r = await syncIntake({ db: x.db, backlog: x.backlog, config: x.config, gh: x.gh.fn, originRepository: () => originRepository(root, git) });
@@ -448,26 +445,8 @@ describe('intake sync: config and startup', () => {
   });
 });
 
-describe.skipIf(!process.env.MINIONS_BACKLOG_BIN && !(() => { try { execFileSync('backlog', ['--version'], { stdio: 'ignore' }); return true; } catch { return false; } })())('intake sync with the real Backlog.md adapter', () => {
-  it('imports an issue with its link and provenance; a rerun creates no duplicate', async () => {
-    const root = mkdtempSync(join(tmpdir(), 'minions-intake-bl-'));
-    const db = new RuntimeDb(join(root, 'minions.db'));
-    try {
-      await writeBacklogConfig(root);
-      const backlog = new BacklogMdAdapter({ root, idempotency: db.idempotency });
-      const config = defaults(); config.intake.github = { ...FILTER };
-      const gh = fakeGh();
-      gh.set([{ number: 12, title: 'Real adapter issue', body: 'Body <!-- with a comment -->' }]);
-      const r = await syncIntake({ db, backlog, config, gh: gh.fn });
-      expect(r.created).toHaveLength(1);
-      const t = await backlog.getTask(r.created[0]!);
-      expect(t).toMatchObject({ title: 'Real adapter issue', provenance: 'external-requirement', externalLinks: [`https://github.com/${REPO}/issues/12`] });
-      expect(db.idempotency.get(intakeKey(REPO, 12))).toBe(t.id);
-      expect(await syncIntake({ db, backlog, config, gh: gh.fn })).toMatchObject({ created: [], existing: 1 });
-      expect(await backlog.listTasks()).toHaveLength(1);
-    } finally { db.close(); rmSync(root, { recursive: true, force: true }); }
-  }, 60_000);
-});
+// The real Backlog.md adapter under intake (import with link and provenance, no duplicate on rerun, forgery) is
+// covered end to end in intake-sync-forgery.test.ts and intake-sync-gaps.test.ts (integration).
 
 // task-68.6 (unattended delivery phase 5): intake.github.readyLabels, host-owned.
 describe('intake sync: readyLabels import ready', () => {

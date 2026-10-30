@@ -4,7 +4,6 @@ import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { coordinatorOnlyWorkCommand, preBashHook, preFileHook, PRE_BASH_HOOK_COMMAND, PRE_FILE_READ_HOOK_COMMAND, runHook } from '../../src/runtime/hooks.js';
 import { stateGuard } from '../../src/runtime/state-guard.js';
-import { FAKE_MINIONS, runHookCommand, withHangGuard } from '../helpers.js';
 import { scanShell } from '../../src/runtime/shell-scan.js';
 
 const template = JSON.parse(readFileSync(new URL('../../templates/plugin/hooks/hooks.json', import.meta.url), 'utf8')) as {
@@ -82,53 +81,10 @@ describe('preBashHook', () => {
 describe('the plugin hooks.json Bash entry', () => {
   const entry = template.hooks.PreToolUse.find((h) => h.matcher === 'Bash')!;
   const command = entry.hooks[0]!.command;
-  const subCall = JSON.stringify(bash('minions work claim task-1', sub));
 
   it('is the documented command, with an entry timeout above the wrapper timeout', () => {
     expect(command).toBe(PRE_BASH_HOOK_COMMAND);
     expect(entry.hooks[0]!.timeout).toBeGreaterThan(20);
-  });
-
-  it('a subagent call naming minions blocks (exit 2) when minions is missing, crashes, is killed or fails after an allow', () => {
-    expect(runHookCommand(command, null, subCall).status).toBe(2);
-    expect(runHookCommand(command, FAKE_MINIONS.crash, subCall).status).toBe(2);
-    expect(runHookCommand(command, FAKE_MINIONS.killed, subCall).status).toBe(2);
-    expect(runHookCommand(command, FAKE_MINIONS.noNode, subCall).status).toBe(2);
-    expect(runHookCommand(command, FAKE_MINIONS.allowThenFail, subCall).status).toBe(2);
-    const denied = runHookCommand(command, FAKE_MINIONS.deny, subCall);
-    expect(denied.status).toBe(0);
-    expect(JSON.parse(denied.stdout).hookSpecificOutput.permissionDecision).toBe('deny');
-  });
-
-  it('a hang is killed by the wrapper and blocks', () => {
-    // The perl fallback (stock macOS, task-4); the coreutils branch is covered in hook-commands-fail-closed.test.ts.
-    const fast = withHangGuard(command, { guard: 'perl', seconds: 1 });
-    expect(runHookCommand(fast, '#!/bin/sh\nsleep 30\n', subCall).status).toBe(2);
-  });
-
-  it('node never starts for the coordinator\'s calls or for subagent calls that do not mention minions', () => {
-    // A missing binary would exit 2 if the wrapper ran it.
-    expect(runHookCommand(command, null, JSON.stringify(bash('minions work claim task-1')))).toMatchObject({ status: 0, stdout: '' });
-    expect(runHookCommand(command, null, JSON.stringify(bash('npm test', sub)))).toMatchObject({ status: 0, stdout: '' });
-    // The worker's own agent_type (minions:<role>) and a "minions:" label alone do not start it either.
-    expect(runHookCommand(command, null, JSON.stringify(bash('gh issue list --label minions:authorized', sub)))).toMatchObject({ status: 0, stdout: '' });
-  });
-
-  it('a subagent call naming the entry script (cli.js) reaches minions too', () => {
-    const direct = JSON.stringify(bash('node ./dist/cli.js work release lease-1', sub));
-    expect(runHookCommand(command, null, direct).status).toBe(2);
-    expect(JSON.parse(runHookCommand(command, FAKE_MINIONS.deny, direct).stdout).hookSpecificOutput.permissionDecision).toBe('deny');
-    expect(runHookCommand(command, null, JSON.stringify(bash('node ./dist/clixjs', sub)))).toMatchObject({ status: 0, stdout: '' });
-  });
-
-  it('a grep failure (missing or broken) blocks rather than skipping the check', () => {
-    const noGrep = command.replace("grep -Eq", '/nonexistent/grep -Eq');
-    expect(runHookCommand(noGrep, FAKE_MINIONS.allow, JSON.stringify(bash('npm test', sub))).status).toBe(2);
-  });
-
-  it('passes the hook input to minions unchanged', () => {
-    const echo = '#!/bin/sh\ncat >&2\nexit 0\n';
-    expect(runHookCommand(command, echo, subCall).stderr).toBe(subCall);
   });
 });
 

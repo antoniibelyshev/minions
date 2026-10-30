@@ -3,7 +3,7 @@
 import { describe, expect, it } from 'vitest';
 import type { ApiResponse } from '../../src/runtime/ci.js';
 import { INTAKE_INFLIGHT_META, intakeKey, syncIntake, type GithubIntakeConfig } from '../../src/runtime/intake-sync.js';
-import { FakeBacklog, makeDefaultEnv } from './fixtures.js';
+import { FakeBacklog, makeUnitDefaultEnv } from './fixtures.js';
 
 const REPO = 'acme/demo';
 const FILTER: GithubIntakeConfig = { enabled: true, repository: REPO, labels: [], assignee: null, milestone: null, state: 'open' };
@@ -15,7 +15,7 @@ const marks = (db: { getMeta(k: string): string | undefined }) => JSON.parse(db.
 
 describe('intake in-flight mark (task-40 QA)', () => {
   it('a fresh mark blocks only its own issue; other issues import and the mark is kept until the task links', async () => {
-    const e = makeDefaultEnv((c) => { c.intake.github = { ...FILTER }; });
+    const e = makeUnitDefaultEnv((c) => { c.intake.github = { ...FILTER }; });
     const backlog = new FakeBacklog();
     const now = new Date('2026-10-23T12:00:00Z');
     const at = new Date(now.getTime() - 60_000).toISOString();
@@ -34,7 +34,7 @@ describe('intake in-flight mark (task-40 QA)', () => {
   });
 
   it('a corrupt mark row does not block imports and is replaced', async () => {
-    const e = makeDefaultEnv((c) => { c.intake.github = { ...FILTER }; });
+    const e = makeUnitDefaultEnv((c) => { c.intake.github = { ...FILTER }; });
     const backlog = new FakeBacklog();
     e.db.setMeta(INTAKE_INFLIGHT_META, 'not json');
     const r = await syncIntake({ db: e.db, backlog, config: e.config, api: api([1]) });

@@ -103,7 +103,7 @@ describe('bashStateReference: a state or secrets dir with a space in its path (t
     for (const cmd of ['cat "$MINIONS_SECRETS_DIR/github-token"', 'ls ${MINIONS_SECRETS_DIR}', 'sqlite3 "$MINIONS_STATE_DIR/minions.db"']) {
       expect(bashStateReference(cmd, host), cmd).not.toBeNull();
     }
-    // The hook's shell filter forwarding such a call spawns a shell: see state-guard-spaces-hook.test.ts (integration).
+    // The hook's shell filter forwarding such a call spawns a shell: see hook-commands-fail-closed.test.ts (integration).
   });
 
   it('paths without spaces are refused and allowed as before', () => {
