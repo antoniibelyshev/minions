@@ -157,6 +157,7 @@ export const INTEGRATION_TESTS: readonly string[] = [
   'test/runtime/sessions.test.ts',
   'test/runtime/spend.test.ts',
   'test/runtime/state-backup-qa.test.ts',
+  'test/runtime/state-guard-spaces-hook.test.ts',
   'test/runtime/state-guard.test.ts',
   'test/runtime/state-restore-command.test.ts',
   'test/runtime/state-restore-qa.test.ts',
