@@ -4,7 +4,7 @@
 // read-only GitHub, temp state only. The "subprocess" is a create that never settles.
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type { CreateTaskInput } from '../../src/backlog/types.js';
 import type { ApiResponse } from '../../src/runtime/ci.js';
 import { intakeOnStart } from '../../src/runtime/commands.js';
@@ -14,6 +14,9 @@ import {
 } from '../../src/runtime/intake-sync.js';
 import { runtimePaths } from '../../src/runtime/paths.js';
 import { FakeBacklog, makeDefaultEnv, tmp } from './fixtures.js';
+// Unit tier: git and (on macOS) process liveness run on fakes (./fake-git.ts, ./fake-process-facts.ts).
+vi.mock('../../src/core/exec.js', async (orig) => (await import('./fake-git.js')).mockExec(await orig()));
+vi.mock('../../src/runtime/process-facts.js', async (orig) => (await import('./fake-process-facts.js')).mockProcessFacts(await orig()));
 
 const REPO = 'acme/demo';
 const FILTER: GithubIntakeConfig = { enabled: true, repository: REPO, labels: [], assignee: null, milestone: null, state: 'open' };

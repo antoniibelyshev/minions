@@ -8,6 +8,14 @@ import { Command } from 'commander';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { defaults } from '../helpers.js';
 import { tmp } from './fixtures.js';
+// Unit tier: process liveness (on macOS) runs on a fake (./fake-process-facts.ts), and the coordinator status probe
+// `tmux has-session` reads as "no session" (the coordinator is not running in these tests).
+vi.mock('../../src/core/exec.js', async (orig) => {
+  const real = await orig<typeof import('../../src/core/exec.js')>();
+  return { ...real, run: (cmd: string, args: string[], opts?: import('../../src/core/exec.js').RunOptions) =>
+    cmd === 'tmux' ? Promise.resolve({ code: 1, stdout: '', stderr: 'no server running' }) : real.run(cmd, args, opts) };
+});
+vi.mock('../../src/runtime/process-facts.js', async (orig) => (await import('./fake-process-facts.js')).mockProcessFacts(await orig()));
 
 const h = vi.hoisted(() => ({
   failed: 0,
