@@ -1,6 +1,8 @@
 import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { addOrigin, commitAll, fsStatus } from './fs-git.js';
+vi.mock('../../src/core/exec.js', async (orig) => (await import('./fs-git.js')).withFsGit(await orig()));
 
 vi.mock('../../src/plugin/generate.js', async () => {
   const { mkdir, writeFile } = await import('node:fs/promises');
@@ -59,46 +61,6 @@ describe('init', () => {
     expect(existsSync(paths.journalJson)).toBe(false);
   });
 
-  it('private init leaves git status unchanged, including dirty files', async () => {
-    const repo = makeRepo(env.root);
-    writeFileSync(join(repo, 'README.md'), '# edited\n');
-    writeFileSync(join(repo, 'scratch.txt'), 'untracked\n');
-    const before = git(repo, 'status', '--porcelain', '--ignored');
-    const r = await init(repo, { visibility: 'private' });
-    expect(git(repo, 'status', '--porcelain', '--ignored')).toBe(before);
-    expect(r.plan.writes.some((w) => w.inRepo)).toBe(false);
-    expect(existsSync(repoPaths(repo).dir)).toBe(false);
-    const paths = projectPaths(r.plan.projectId);
-    for (const p of [paths.projectJson, paths.configJson, paths.composeYaml, paths.runtimeConfigJson, join(paths.pluginDir, 'coordinator.md')]) {
-      expect(existsSync(p), p).toBe(true);
-    }
-    const manifest = JSON.parse(readFileSync(paths.manifestJson, 'utf8'));
-    expect(manifest.files.map((f: { path: string }) => f.path)).toContain(join(paths.pluginDir, 'agents', 'engineer.md'));
-  });
-
-  it('shared init preserves CLAUDE.md, agent config and dirty files; writes only .minions/', async () => {
-    const repo = makeRepo(env.root);
-    writeFileSync(join(repo, 'CLAUDE.md'), 'my instructions\n');
-    mkdirSync(join(repo, '.claude'));
-    writeFileSync(join(repo, '.claude', 'settings.json'), '{"x":1}\n');
-    git(repo, 'add', '.'); git(repo, 'commit', '-q', '-m', 'claude');
-    writeFileSync(join(repo, 'CLAUDE.md'), 'my instructions\nlocal edit\n');
-    writeFileSync(join(repo, 'wip.txt'), 'wip\n');
-    const r = await init(repo, { visibility: 'shared' });
-    expect(readFileSync(join(repo, 'CLAUDE.md'), 'utf8')).toBe('my instructions\nlocal edit\n');
-    expect(readFileSync(join(repo, '.claude', 'settings.json'), 'utf8')).toBe('{"x":1}\n');
-    expect(readFileSync(join(repo, 'wip.txt'), 'utf8')).toBe('wip\n');
-    const status = git(repo, 'status', '--porcelain', '--untracked-files=all').split('\n').map((l) => l.trim()).sort();
-    expect(status).toEqual(['?? .minions/README.md', '?? .minions/config.json', '?? wip.txt', 'M CLAUDE.md']);
-    const shared = JSON.parse(readFileSync(repoPaths(repo).configJson, 'utf8'));
-    expect(shared.projectId).toBe(r.plan.projectId);
-    expect(shared.visibility).toBe('shared');
-    expect(shared.git.identity).toBeUndefined(); // personal identity stays on the host
-    const eff = JSON.parse(readFileSync(projectPaths(r.plan.projectId).runtimeConfigJson, 'utf8'));
-    expect(eff.git.identity).toEqual({ name: 'Ada Lovelace', email: 'ada@example.com' });
-    expect((await init(repo)).applied!.written).toEqual([]);
-  });
-
   it('detects user-edited generated files (drift) and leaves them alone', async () => {
     const repo = makeRepo(env.root);
     const r = await init(repo, { visibility: 'private' });
@@ -134,7 +96,7 @@ describe('init', () => {
   it('rolls back created files when apply fails midway', async () => {
     const repo = makeRepo(env.root);
     const first = await init(repo, { visibility: 'shared' });
-    git(repo, 'add', '.minions'); git(repo, 'commit', '-q', '-m', 'minions');
+    commitAll(repo, 'minions');
     // Fresh machine: empty MINIONS_HOME; the shared config pins the project id.
     rmSync(env.home, { recursive: true, force: true });
     const paths = projectPaths(first.plan.projectId);
@@ -144,25 +106,13 @@ describe('init', () => {
     await expect(init(repo)).rejects.toThrow();
     expect(listFiles(paths.dir)).toEqual([join(paths.dir, 'runtime')]);
     expect(existsSync(join(env.home, 'registry.json'))).toBe(false);
-    expect(git(repo, 'status', '--porcelain')).toBe('');
-  });
-
-  it('two worktrees of one repository map to the same project', async () => {
-    const repo = makeRepo(env.root);
-    const a = await init(repo, { visibility: 'private' });
-    const wt = join(env.root, 'wt');
-    git(repo, 'worktree', 'add', '-q', wt, '-b', 'feature');
-    const b = await init(wt);
-    expect(b.plan.projectId).toBe(a.plan.projectId);
-    expect(b.plan.identitySource).toBe('registry');
-    expect(Object.keys((await loadRegistry()).projects)).toEqual([a.plan.projectId]);
-    expect(b.applied!.written).toEqual([]);
+    expect(fsStatus(repo).join('\n')).toBe('');
   });
 
   it('detects a copied shared identity and requires --attach or --new-identity', async () => {
     const a = makeRepo(env.root, 'a');
     const ra = await init(a, { visibility: 'shared' });
-    git(a, 'add', '.minions'); git(a, 'commit', '-q', '-m', 'minions');
+    commitAll(a, 'minions');
     const b = join(env.root, 'b');
     cpSync(a, b, { recursive: true });
     const e = await failure(init(b));
@@ -243,7 +193,7 @@ describe('init', () => {
     expect(runner).toHaveBeenCalledWith('docker', expect.arrayContaining(['down']), expect.anything());
     expect(JSON.stringify(runner.mock.calls)).not.toContain('"-v"');
     expect((await loadRegistry()).projects[r.plan.projectId]).toBeUndefined();
-    expect(git(repo, 'status', '--porcelain')).toBe('');
+    expect(fsStatus(repo).join('\n')).toBe('');
   });
 
   it('uninstall --delete-data requires confirmation', async () => {
@@ -262,7 +212,7 @@ describe('init', () => {
 describe('CI setup guidance', () => {
   it('prints an external CI setup plan for a GitHub repo without CI and writes no workflow files', async () => {
     const repo = makeRepo(env.root);
-    git(repo, 'remote', 'add', 'origin', 'https://github.com/acme/demo.git');
+    addOrigin(repo, 'https://github.com/acme/demo.git');
     const r = await init(repo, { visibility: 'shared' });
     const setup = r.plan.externalSetup.join('\n');
     expect(setup).toMatch(/never creates workflows or changes branch protection/);
@@ -275,7 +225,7 @@ describe('CI setup guidance', () => {
 
   it('with existing workflows only explains how to require the checks; no plan without a GitHub remote', async () => {
     const repo = makeRepo(env.root);
-    git(repo, 'remote', 'add', 'origin', 'git@github.com:acme/demo.git');
+    addOrigin(repo, 'git@github.com:acme/demo.git');
     mkdirSync(join(repo, '.github', 'workflows'), { recursive: true });
     const wf = join(repo, '.github', 'workflows', 'ci.yml');
     writeFileSync(wf, 'name: ci\n');

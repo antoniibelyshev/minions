@@ -2,6 +2,8 @@
 // confirmation for remote changes, pushes and the browser, token via the hidden prompt, delivery mode.
 import { readFileSync, writeFileSync } from 'node:fs';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { addOrigin, originUrl } from './fs-git.js';
+vi.mock('../../src/core/exec.js', async (orig) => (await import('./fs-git.js')).withFsGit(await orig()));
 import { run, type RunOptions, type RunResult } from '../../src/core/exec.js';
 
 vi.mock('../../src/plugin/generate.js', async () => {
@@ -98,7 +100,7 @@ describe('non-interactive (--yes)', () => {
     expect(r.nextSteps.join('\n')).toMatch(/No GitHub remote: add one .*minions setup github/);
     expect(g.calls.some((c) => c[0] === 'open' || c.includes('push') || c.includes('remote') && c.includes('add'))).toBe(false);
 
-    git(repo, 'remote', 'add', 'origin', REMOTE);
+    addOrigin(repo, REMOTE);
     const s = await S.runGithubSetup({ projectId: r.plan.projectId, repoPath: repo, yes: true, runner: g.runner });
     expect(s.nextSteps.join('\n')).toContain('git push -u origin main');
     expect(s.nextSteps.join('\n')).toContain('personal-access-tokens/new?');
@@ -113,7 +115,7 @@ describe('interactive guided flow', () => {
     const opened: string[] = [];
     const a = scripted({ 'GitHub repository': 'acme/demo' }, [TOKEN]);
     const r = await runInit({ path: repo, io: a.io, visibility: 'private', dockerProbe: dockerUp, runner: g.runner, fetch: okFetch, openUrl: async (u) => { opened.push(u); } });
-    expect(git(repo, 'remote', 'get-url', 'origin')).toBe(REMOTE);
+    expect(originUrl(repo)).toBe(REMOTE);
     expect((await loadProjectJson(r.plan.projectId)).remoteUrl).toBe(REMOTE);
     expect(r.githubSetup).toMatchObject({ remote: { status: 'added' }, base: { onRemote: false, pushed: false, command: 'git push -u origin main' } });
     expect(a.info.join('\n')).toContain('Command: git push -u origin main');
@@ -130,7 +132,7 @@ describe('interactive guided flow', () => {
 
   it('push and browser only after an explicit yes', async () => {
     const repo = makeRepo(env.root);
-    git(repo, 'remote', 'add', 'origin', REMOTE);
+    addOrigin(repo, REMOTE);
     const init = await runInit({ path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
     const g = guardedRunner();
     const opened: string[] = [];
@@ -151,12 +153,12 @@ describe('interactive guided flow', () => {
     const a = scripted({ 'Set up GitHub': 'n' });
     const r = await runInit({ path: repo, io: a.io, visibility: 'private', dockerProbe: dockerUp, runner: g.runner });
     expect(r.githubSetup?.nextSteps.join(' ')).toMatch(/skipped; run `minions setup github`/);
-    expect(git(repo, 'remote')).toBe('');
+    expect(originUrl(repo)).toBe('');
   });
 
   it('an edited project config is not rewritten; instructions instead', async () => {
     const repo = makeRepo(env.root);
-    git(repo, 'remote', 'add', 'origin', REMOTE);
+    addOrigin(repo, REMOTE);
     const r = await runInit({ path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
     const file = projectPaths(r.plan.projectId).configJson;
     writeFileSync(file, readFileSync(file, 'utf8').replace('"configRevision": 1', '"configRevision": 7'));
@@ -171,14 +173,14 @@ describe('doctor and start hints', () => {
     await runInit({ path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
     const doc1 = await runDoctor({ cwd: repo, probe: dockerDown, runner: guardedRunner().runner, fetch: okFetch });
     expect(doc1.checks.find((c) => c.name === 'github.setup')).toMatchObject({ status: 'ok', detail: expect.stringMatching(/no GitHub remote/), hint: expect.stringMatching(/minions setup github/) });
-    git(repo, 'remote', 'add', 'origin', REMOTE);
+    addOrigin(repo, REMOTE);
     const doc2 = await runDoctor({ cwd: repo, probe: dockerDown, runner: guardedRunner().runner, fetch: okFetch });
     expect(doc2.checks.find((c) => c.name === 'github.setup')).toMatchObject({ status: 'warn', hint: expect.stringMatching(/minions setup github/) });
   });
 
   it('start prints one hint line only when a GitHub remote exists without a token', async () => {
     const repo = makeRepo(env.root);
-    git(repo, 'remote', 'add', 'origin', REMOTE);
+    addOrigin(repo, REMOTE);
     const r = await runInit({ path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
     const p = await loadProjectJson(r.plan.projectId);
     expect(await S.githubStartHint(p)).toMatch(/^hint: .*minions setup github/);

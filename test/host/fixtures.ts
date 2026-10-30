@@ -1,11 +1,11 @@
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
-import { deflateSync } from 'node:zlib';
+import { join } from 'node:path';
 import type { DockerProbe } from '../../src/host/discovery.js';
 import { fromTemplate } from '../repo-template.js';
+import { writeGitRepo } from './fs-git.js';
 
 export const git = (cwd: string, ...args: string[]) =>
   execFileSync('git', args, { cwd, encoding: 'utf8', env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' } }).trim();
@@ -27,64 +27,6 @@ function buildRepo(repo: string): void {
     'package.json': JSON.stringify({ name: 'demo', scripts: { test: 'vitest run', lint: 'eslint .' } }, null, 2),
     '.gitignore': '.env\n',
   });
-}
-
-/**
- * Writes `files` and commits them as one commit ("init", by Ada Lovelace) on `main`, without starting git
- * (task-137.2.6): the loose objects, the ref and the index are written directly, so a unit-tier test can make
- * a repository. The result is the repository `git init -b main` + config + `git add .` + `git commit -m init`
- * makes: `git status` is clean, `git log` shows the one commit. Flat paths only (no subdirectories).
- */
-export function writeGitRepo(repo: string, files: Record<string, string>): string {
-  const gitDir = join(repo, '.git');
-  for (const d of ['objects/info', 'objects/pack', 'refs/heads', 'refs/tags', 'info']) mkdirSync(join(gitDir, d), { recursive: true });
-  const object = (type: string, body: Buffer): Buffer => {
-    const raw = Buffer.concat([Buffer.from(`${type} ${body.length}\0`), body]);
-    const id = createHash('sha1').update(raw).digest();
-    const hex = id.toString('hex');
-    const path = join(gitDir, 'objects', hex.slice(0, 2), hex.slice(2));
-    if (!existsSync(path)) { mkdirSync(dirname(path), { recursive: true }); writeFileSync(path, deflateSync(raw)); }
-    return id;
-  };
-  const names = Object.keys(files).sort();
-  const blobs = new Map<string, Buffer>();
-  for (const name of names) {
-    if (name.includes('/')) throw new Error(`writeGitRepo: flat paths only (${name})`);
-    writeFileSync(join(repo, name), files[name]!);
-    blobs.set(name, object('blob', Buffer.from(files[name]!)));
-  }
-  const tree = object('tree', Buffer.concat(names.flatMap((n) => [Buffer.from(`100644 ${n}\0`), blobs.get(n)!])));
-  const author = `${process.env.GIT_AUTHOR_NAME ?? 'Ada Lovelace'} <${process.env.GIT_AUTHOR_EMAIL ?? 'ada@example.com'}>`;
-  const committer = `${process.env.GIT_COMMITTER_NAME ?? 'Ada Lovelace'} <${process.env.GIT_COMMITTER_EMAIL ?? 'ada@example.com'}>`;
-  const when = `${Math.floor(Date.now() / 1000)} +0000`;
-  const commit = object('commit', Buffer.from(`tree ${tree.toString('hex')}\nauthor ${author} ${when}\ncommitter ${committer} ${when}\n\ninit\n`)).toString('hex');
-  writeFileSync(join(gitDir, 'HEAD'), 'ref: refs/heads/main\n');
-  writeFileSync(join(gitDir, 'refs', 'heads', 'main'), `${commit}\n`);
-  writeFileSync(join(gitDir, 'description'), "Unnamed repository; edit this file 'description' to name the repository.\n");
-  writeFileSync(join(gitDir, 'config'), [
-    '[core]', '\trepositoryformatversion = 0', '\tfilemode = true', '\tbare = false', '\tlogallrefupdates = true',
-    ...(process.platform === 'darwin' ? ['\tignorecase = true', '\tprecomposeunicode = true'] : []),
-    '[user]', '\tname = Ada Lovelace', '\temail = ada@example.com', '[commit]', '\tgpgsign = false', '',
-  ].join('\n'));
-  // Index v2: one entry per file with its real stat data, so git sees the work tree as clean without re-hashing.
-  const u32 = (b: Buffer, off: number, v: bigint) => b.writeUInt32BE(Number(v & 0xffffffffn), off);
-  const entries = names.map((n) => {
-    const st = statSync(join(repo, n), { bigint: true });
-    const len = 62 + n.length;
-    const e = Buffer.alloc(Math.ceil((len + 1) / 8) * 8);
-    u32(e, 0, st.ctimeNs / 1_000_000_000n); u32(e, 4, st.ctimeNs % 1_000_000_000n);
-    u32(e, 8, st.mtimeNs / 1_000_000_000n); u32(e, 12, st.mtimeNs % 1_000_000_000n);
-    u32(e, 16, st.dev); u32(e, 20, st.ino); u32(e, 24, 0o100644n); u32(e, 28, st.uid); u32(e, 32, st.gid); u32(e, 36, st.size);
-    blobs.get(n)!.copy(e, 40);
-    e.writeUInt16BE(Math.min(n.length, 0xfff), 60);
-    e.write(n, 62);
-    return e;
-  });
-  const header = Buffer.alloc(12);
-  header.write('DIRC', 0); header.writeUInt32BE(2, 4); header.writeUInt32BE(names.length, 8);
-  const index = Buffer.concat([header, ...entries]);
-  writeFileSync(join(gitDir, 'index'), Buffer.concat([index, createHash('sha1').update(index).digest()]));
-  return commit;
 }
 
 export const dockerUp: DockerProbe = async () => ({ daemon: true, serverVersion: '29.8.2', compose: true, composeVersion: '5.5.1' });
