@@ -1,11 +1,13 @@
 import { join } from 'node:path';
-import { beforeAll, describe, expect, it } from 'vitest';
+import { beforeAll, describe, expect, it, vi } from 'vitest';
 import type { MinionsConfig } from '../../src/config/schema.js';
 import { MinionsError } from '../../src/core/errors.js';
 import { requestDrain } from '../../src/runtime/drain.js';
 import { fetchBrief, requireWorkerRole, submitResult } from '../../src/runtime/handoff.js';
 import { drainHook, drainNotice, preAgentHook } from '../../src/runtime/hooks.js';
 import { makeEnv, tmp, type Env } from './fixtures.js';
+// Unit tier: git runs on the in-memory fake (./fake-git.ts).
+vi.mock('../../src/core/exec.js', async (orig) => (await import('./fake-git.js')).mockExec(await orig()));
 
 beforeAll(() => { process.env.MINIONS_STATE_DIR = tmp('minions-roles-state-'); });
 

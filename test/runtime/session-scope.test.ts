@@ -4,7 +4,7 @@
 // temp transcripts and a fake backlog only (no claude run).
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { advanceLease } from '../../src/runtime/advance.js';
 import { contextResetCheck, readHandoff, TRANSCRIPT_META, writeHandoff } from '../../src/runtime/context-reset.js';
 import { readSessionState, sessionStates } from '../../src/runtime/coordinator-usage.js';
@@ -14,6 +14,8 @@ import { handoffPathFor, hookScope, parseScope, sessionScope } from '../../src/r
 import { humanBaseline, spendReport } from '../../src/runtime/spend.js';
 import type { TaskBrief } from '../../src/runtime/scheduler.js';
 import { commitFile, makeDefaultEnv, result, tmp, type Env } from './fixtures.js';
+// Unit tier: git runs on the in-memory fake (./fake-git.ts).
+vi.mock('../../src/core/exec.js', async (orig) => (await import('./fake-git.js')).mockExec(await orig()));
 
 afterEach(() => { delete process.env.MINIONS_SESSION; });
 
