@@ -51,6 +51,7 @@ import { checkoutGit, integrationCandidate, integrationChangedPaths, land, rever
 import { groupMembers, hostIdentity, isAlive, procIdentity, type ProcSource } from './runner/record.js';
 import { supervise, type StopReason } from './runner/supervise.js';
 import { systemLockView, type LockProcessView } from './supervisor.js';
+import { ensureGitWorktreesDir } from './worktree.js';
 
 export const INTEGRATION_LOCK_META = 'integration_lock';
 export const INTEGRATION_BASE_META = 'integration_base';
@@ -286,6 +287,9 @@ export async function prepareIntegrationWorktree(repo: string, dir: string, cand
     // Missing or broken: recreate it once.
     await rm(dir, { recursive: true, force: true });
     await allowlistedGit(repo, ['worktree', 'prune'], true, { home });
+    // prune drops an empty .git/worktrees, which the host sandbox cannot recreate (task-3).
+    const missing = await ensureGitWorktreesDir(repo).then(() => null, (e: unknown) => (e instanceof Error ? e.message : String(e)));
+    if (missing) return { ok: false, message: missing };
     const add = await allowlistedGit(repo, [...ADD_CONFIG, 'worktree', 'add', '--detach', '--no-checkout', '--force', dir, candidate], true, { home });
     if (add.code !== 0) return { ok: false, message: `git worktree add ${dir} failed: ${add.stderr.trim().slice(-400) || `exit ${add.code}`}` };
     const again = await reset();

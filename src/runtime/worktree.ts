@@ -1,4 +1,5 @@
 import { realpathSync } from 'node:fs';
+import { mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { MinionsError } from '../core/errors.js';
 import { run } from '../core/exec.js';
@@ -91,6 +92,23 @@ export async function isDirty(path: string): Promise<boolean> {
 
 export interface BranchWorktree { slug: string; branch: string; worktree: string; baseBranch: string; baseSha: string; head: string; created: boolean }
 
+/**
+ * Makes sure `<repo>/.git/worktrees` exists before `git worktree add` (task-3). In the host runtime the sandbox
+ * cannot create it (the Edit deny of `.git/worktrees/<name>/config.worktree` becomes a write deny of its missing
+ * ancestors), and git removes it when the last worktree goes: fail with a clear hint instead of git's
+ * "could not create leading directories". The host CLI creates it outside the sandbox (prepareHostRuntime).
+ */
+export async function ensureGitWorktreesDir(repo: string): Promise<void> {
+  try { await mkdir(join(repo, '.git', 'worktrees')); } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    if (isHostRuntime() && (code === 'EPERM' || code === 'EACCES')) {
+      throw new MinionsError('PRECONDITION', `${join(repo, '.git', 'worktrees')} is missing and cannot be created from the sandbox.`,
+        'Run `minions start --no-attach` (or `minions doctor`) on the host: it creates the directory outside the sandbox. Then claim again.');
+    }
+    // EEXIST, a `.git` file (ENOTDIR) or no repo: git reports anything that is really wrong.
+  }
+}
+
 /** Creates or reuses branch agent/<slug> (from the base) and its worktree under worktrees/<slug>. */
 export async function ensureBranchWorktree(layout: WorkspaceLayout, slug: string, baseBranch: string): Promise<BranchWorktree> {
   const { repo } = layout;
@@ -117,6 +135,7 @@ export async function ensureBranchWorktree(layout: WorkspaceLayout, slug: string
       throw new MinionsError('PRECONDITION', `Branch ${branch} is already checked out at ${elsewhere.path}.`, 'Only one worktree may write a task branch.');
     }
     await ensureDir(layout.worktrees);
+    await ensureGitWorktreesDir(repo);
     await git(repo, ['worktree', 'add', worktree, branch]);
     created = true;
   }
@@ -146,6 +165,7 @@ export async function ensureReviewWorktree(layout: WorkspaceLayout, slug: string
     throw new MinionsError('PRECONDITION', `${worktree} exists but is not a registered git worktree.`, 'Move it aside manually; minions will not delete it.');
   }
   await ensureDir(layout.review);
+  await ensureGitWorktreesDir(repo);
   await git(repo, ['worktree', 'add', '--detach', worktree, commit]);
   return { worktree, sha: commit, recreated };
 }

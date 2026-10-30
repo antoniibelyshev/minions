@@ -9,6 +9,7 @@ import { clearDrain, DRAIN_HOOK_COMMAND, requestDrain } from '../../src/runtime/
 import { DRAIN_GRACE_CALLS, drainHook, drainSafeBash, runHook } from '../../src/runtime/hooks.js';
 import { MinionsError } from '../../src/core/errors.js';
 import { commitFile, makeEnv, result, tmp, type Env } from './fixtures.js';
+import { shq } from '../helpers.js';
 
 beforeAll(() => { process.env.MINIONS_STATE_DIR = tmp('minions-drain-state-'); });
 
@@ -169,7 +170,7 @@ describe('drain hook (PreToolUse, every tool)', () => {
     const bin = join(dir, 'bin');
     const state = join(dir, 'state');
     mkdirSync(bin); mkdirSync(join(state, 'run'), { recursive: true });
-    writeFileSync(join(bin, 'minions'), `#!/bin/sh\necho "called $*" >> ${join(dir, 'calls')}\n`);
+    writeFileSync(join(bin, 'minions'), `#!/bin/sh\necho "called $*" >> ${shq(join(dir, 'calls'))}\n`);
     chmodSync(join(bin, 'minions'), 0o755);
     const run = () => execFileSync('sh', ['-c', DRAIN_HOOK_COMMAND], { env: { PATH: `${bin}:/usr/bin:/bin`, MINIONS_STATE_DIR: state }, encoding: 'utf8' });
     run();

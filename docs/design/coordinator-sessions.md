@@ -75,8 +75,7 @@ Re-checked for this revision. Changes against the first version (main @ a062a51)
     `<channel source="plugin:telegram:telegram" …>`; the tag now matches both. Before the fix the baseline showed
     `ownerMessages: 0`, and meta `coordinator_last_owner_message` was never written. Every user of
     `lastOwnerMessageAt` acted as if the owner never wrote: the routine's 30-minute "owner active" window (a wake can cut a live conversation), the digest's
-    30-minute hold exception, `routine.autoPromote.ownerSilentDays` (fails closed, so it always refuses) and the
-    `--owner-approved` window (always refused on Telegram).
+    30-minute hold exception, and the auto-promotion owner checks of that time (removed since, task-130).
   - `RECOVER_PREFIX` and `WAKE_PREFIX` expected only the raw `/minions:recover` and `/minions:orchestrate wake`. The
     transcript stores the expanded form
     (`<command-message>minions:recover</command-message>\n<command-name>/minions:recover</command-name>…`), which
@@ -113,8 +112,8 @@ Re-checked for this revision. Changes against the first version (main @ a062a51)
 ## Decisions
 
 1. **Fix the baseline before building on it** (phase 0). Owner-message and recovery detection must match the real
-   transcript shapes. The per-role numbers of later phases depend on it, and so do the routine, digest and
-   auto-promotion checks that read `lastOwnerMessageAt`.
+   transcript shapes. The per-role numbers of later phases depend on it, and so do the routine and digest
+   checks that read `lastOwnerMessageAt`.
 2. **Reset barrier for the single coordinator** (phase 1, recommended, small). A context ceiling
    (`coordinator.contextReset.barrierTokens`, default 120k) above the reset threshold. Once it is passed and only
    active leases block the reset, `work claim` and `work advance` stop starting new stages

@@ -5,6 +5,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, wr
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { shQuote } from '../../src/runtime/coordinator.js';
 import { checkHeadlessArgs, headlessEnv, liveRun, liveRunExitCode, type LiveRunDeps } from '../../src/runtime/headless.js';
 import { MinionsError } from '../../src/core/errors.js';
 
@@ -103,7 +104,7 @@ describe('live run credentials per claudeAuth method', () => {
     expect(got.helperkey).toBe(PROVISIONED_KEY);
     expect(got.helper).toContain(paths.apiKeyFile);
     expect(got).toMatchObject({ oauth: '', apikey: '', authtoken: '', telegram: '', ttl: '300000' });
-    expect(r.settings).toEqual({ permissions: { disableBypassPermissionsMode: 'disable' }, apiKeyHelper: `cat ${paths.apiKeyFile}` });
+    expect(r.settings).toEqual({ permissions: { disableBypassPermissionsMode: 'disable' }, apiKeyHelper: `cat ${shQuote(paths.apiKeyFile)}` });
     for (const text of [JSON.stringify(r), ...logs]) expect(text).not.toContain(PROVISIONED_KEY);
   });
 

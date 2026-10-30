@@ -445,18 +445,8 @@ export const MinionsConfigSchema = z.object({
     digestAt: z.array(z.string().regex(DIGEST_TIME, 'must be HH:MM (00:00 to 23:59)')).min(1).max(4).optional(),
     /** IANA time zone of digestAt and of the routine's days (default Europe/Berlin). */
     timezone: z.string().min(1).refine(isTimeZone, 'must be an IANA time zone such as Europe/Berlin').optional(),
-    /**
-     * Host-owned caps on the coordinator promoting its own ideas (agent-hypothesis, idea -> ready; phase 5,
-     * src/runtime/auto-promote.ts). Enforced whether or not the routine is enabled; unset fields take their defaults.
-     */
-    autoPromote: z.object({
-      /** Auto-promotions per day in `timezone` (default 3; 0 = never). */
-      perDay: z.number().int().min(0).optional(),
-      /** No auto-promotion while the budget is at or above this percent (default 80). */
-      maxBudgetPercent: z.number().int().min(0).max(100).optional(),
-      /** No auto-promotion when the last owner message is older than this many days (default 3). */
-      ownerSilentDays: z.number().int().min(1).optional(),
-    }).strict().optional(),
+    /** Legacy: the removed auto-promotion caps (task-130). Accepted so old configs still load, and ignored. */
+    autoPromote: z.record(z.string(), z.unknown()).optional(),
   }).strict().optional(),
   /**
    * Legacy coordinator permission mode. Only "default" is still honoured (as a stricter choice) when
