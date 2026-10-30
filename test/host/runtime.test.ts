@@ -31,7 +31,7 @@ const {
 } = await import('../../src/host/runtime.js');
 const { runRuntimeSet, runRuntimeShow } = await import('../../src/host/runtime-cli.js');
 const { delegateToRuntime } = await import('../../src/host/delegate.js');
-const { coordinatorSettings, buildClaudeCommand, buildCoordinatorCommand, hostSettings } = await import('../../src/runtime/coordinator.js');
+const { coordinatorSettings, buildClaudeCommand, buildCoordinatorCommand, hostSettings, shQuote } = await import('../../src/runtime/coordinator.js');
 const { runDoctor } = await import('../../src/host/doctor.js');
 const { runUninstall } = await import('../../src/host/uninstall.js');
 const { defaults } = await import('../helpers.js');
@@ -267,8 +267,8 @@ describe('host runtime processes', () => {
     writeFileSync(join(bin, 'gh'), '#!/bin/sh\necho real\n'); chmodSync(join(bin, 'gh'), 0o755);
     await prepareHostRuntime(project, { target: { node: process.execPath, cli: '/x' }, pathEnv: `${hostRuntimePaths(id).bin}:${bin}` });
     const sh = readFileSync(hostRuntimePaths(id).ghShim, 'utf8');
-    expect(sh).toContain(`REAL_GH=${join(bin, 'gh')}`);
-    expect(sh).toContain(`TOKEN_FILE=${projectPaths(id).githubTokenFile.includes(' ') ? `'${projectPaths(id).githubTokenFile}'` : projectPaths(id).githubTokenFile}`);
+    expect(sh).toContain(`REAL_GH=${shQuote(join(bin, 'gh'))}`);
+    expect(sh).toContain(`TOKEN_FILE=${shQuote(projectPaths(id).githubTokenFile)}`);
   });
 
   it('delegation: host runtime runs the shim directly; docker runtime needs a running container', async () => {

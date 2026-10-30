@@ -133,6 +133,16 @@ export function bashStateReference(command: string, g: StateGuard, home: string 
   if (/\$\{?MINIONS_STATE_DIR\b/.test(command)) return '$MINIONS_STATE_DIR';
   for (const root of g.roots) {
     if (root === '/') return '/';
+    // A root holding a word break (the macOS host state dir is under ~/Library/Application Support): the scan below
+    // only sees the part after the break, so each full occurrence of the root counts as a path start too.
+    if (PATH_END.test(root)) {
+      for (let at = command.indexOf(root); at >= 0; at = command.indexOf(root, at + 1)) {
+        if (at > 0 && !PATH_END.test(command[at - 1]!) && command[at - 1] !== '/') continue;
+        let end = at + root.length;
+        while (end < command.length && !PATH_END.test(command[end]!)) end++;
+        if (protectedLexical(strip(posix.normalize(command.slice(at, end))), g)) return command.slice(at, end);
+      }
+    }
     // The root as written, and its last segment (`~/x/state`, `/tmp/../state` hold no full root).
     const needle = `/${posix.basename(root)}`;
     for (let at = command.indexOf(needle); at >= 0; at = command.indexOf(needle, at + 1)) {

@@ -32,7 +32,11 @@ export const HAS_PROCFS = process.platform === 'linux';
 const TIMEOUT_SHIM = (process.env.MINIONS_TEST_TIMEOUT_SHIM === '1'
   || spawnSync('sh', ['-c', 'command -v timeout'], { env: { PATH: '/usr/bin:/bin' }, stdio: 'ignore' }).status !== 0)
   ? join(import.meta.dirname, 'fixtures', 'timeout-shim.mjs') : null;
-const shq = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
+/**
+ * Single-quotes a value for a POSIX shell. Fixture scripts and git config commands that embed a temp path use it: the
+ * host runtime's scratch dir sits under ~/Library/Application Support, so TMPDIR has a space there (task-5).
+ */
+export const shq = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
 
 /**
  * Runs a PreToolUse hook command string the way Claude Code does (through a shell, hook JSON on stdin)
