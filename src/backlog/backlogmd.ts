@@ -1,7 +1,7 @@
 import { readdir, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { MinionsError } from '../core/errors.js';
-import { run } from '../core/exec.js';
+import { run, type RunOptions, type RunResult } from '../core/exec.js';
 import { exists, sha256 } from '../core/fsutil.js';
 import { redact } from '../core/output.js';
 import { AUTHORIZED_LABEL, cycleIfAdded, filterReady } from './ready.js';
@@ -33,7 +33,15 @@ export interface BacklogMdOptions {
   cliVersion?: string | null;
   /** Provenance of a task whose meta block is missing, malformed or has no valid provenance (see toTask). */
   provenanceFallback?: ProvenanceFallback;
+  /**
+   * Runs one Backlog.md CLI call (default: core/exec `run`, a real subprocess). Unit tests inject an in-process
+   * fake CLI so the adapter's argument mapping, error mapping and listing paths run without spawning (task-137.2.3).
+   */
+  exec?: BacklogExec;
 }
+
+/** Same contract as core/exec `run` with `allowFailure: true`: resolves with the exit code, never rejects on failure. */
+export type BacklogExec = (cmd: string, args: string[], opts: RunOptions) => Promise<RunResult>;
 
 /**
  * Provenance for a task without a usable meta provenance; undefined keeps DEFAULT_PROVENANCE. The runtime
@@ -234,6 +242,7 @@ export class BacklogMdAdapter implements BacklogAdapter {
   private readonly concurrency: number;
   private readonly provenanceFallback?: ProvenanceFallback;
   private readonly readFiles: boolean;
+  private readonly exec: BacklogExec;
   private initialized = false;
   /** Cached `backlog --version` (trimmed; null when the probe failed), asked at most once per instance. */
   private version?: Promise<string | null>;
@@ -249,6 +258,7 @@ export class BacklogMdAdapter implements BacklogAdapter {
     this.concurrency = Math.max(1, opts.concurrency ?? 4);
     this.provenanceFallback = opts.provenanceFallback;
     this.readFiles = opts.readFiles ?? true;
+    this.exec = opts.exec ?? run;
     if (opts.cliVersion !== undefined) this.version = Promise.resolve(opts.cliVersion);
   }
 
@@ -272,7 +282,7 @@ export class BacklogMdAdapter implements BacklogAdapter {
       this.initialized = true;
     }
     this.spawnCount++;
-    const r = await run(this.bin, args, {
+    const r = await this.exec(this.bin, args, {
       cwd: this.root, allowFailure: true, timeoutMs: this.timeoutMs,
       env: { ...process.env, BACKLOG_CWD: this.root, NO_COLOR: '1', FORCE_COLOR: '0' },
     });

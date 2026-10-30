@@ -11,6 +11,7 @@ import { Scheduler } from '../../src/runtime/scheduler.js';
 import { workspaceLayout, type WorkspaceLayout } from '../../src/runtime/worktree.js';
 import { defaults } from '../helpers.js';
 import { fromTemplate } from '../repo-template.js';
+import { fakeGitActive, fakeGitSync, fakeInitRepo } from './fake-git.js';
 
 Object.assign(process.env, {
   GIT_AUTHOR_NAME: 'Test', GIT_AUTHOR_EMAIL: 'test@example.com',
@@ -20,11 +21,13 @@ Object.assign(process.env, {
 
 export const tmp = (prefix = 'minions-rt-') => mkdtempSync(join(tmpdir(), prefix));
 
-export const gitSync = (cwd: string, ...args: string[]) =>
+/** git in `cwd`; on the in-memory fake when the test file installed it (./fake-git.ts). */
+export const gitSync = (cwd: string, ...args: string[]) => fakeGitActive() ? fakeGitSync(cwd, ...args) :
   execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
 
 /** A repository with one commit (README.md) on `branch`; returns its SHA. Copied from a per-file template (task-104). */
 export function initRepo(dir: string, branch = 'main'): string {
+  if (fakeGitActive()) return fakeInitRepo(dir, branch);
   return fromTemplate(`runtime-init:${branch}`, dir, (d) => {
     execFileSync('git', ['init', '-q', '-b', branch, d]);
     writeFileSync(join(d, 'README.md'), '# test\n');

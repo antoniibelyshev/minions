@@ -3,13 +3,15 @@
 // `requires` checked at claim, and end-to-end scheduler runs of project-role workflows.
 import { mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { validateConfig } from '../../src/config/resolve.js';
 import { roleNameProblem } from '../../src/config/roles.js';
 import type { MinionsConfig } from '../../src/config/schema.js';
 import type { MinionsError } from '../../src/core/errors.js';
 import { resultContractText, validateResult } from '../../src/runtime/results.js';
 import { commitFile, gitSync, makeDefaultEnv, result, type Env } from './fixtures.js';
+// Unit tier: git runs on the in-memory fake (./fake-git.ts).
+vi.mock('../../src/core/exec.js', async (orig) => (await import('./fake-git.js')).mockExec(await orig()));
 
 const err = async (p: Promise<unknown>) => {
   try { await p; } catch (e) { return e as MinionsError; }

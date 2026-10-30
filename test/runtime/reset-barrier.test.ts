@@ -5,7 +5,7 @@
 // changes. Temp state dirs, a fake backlog and a written transcript only.
 import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type { MinionsConfig } from '../../src/config/schema.js';
 import { validateConfig } from '../../src/config/resolve.js';
 import { MinionsError } from '../../src/core/errors.js';
@@ -16,6 +16,8 @@ import { claimWithBrief, submitResult, type HandoffPaths } from '../../src/runti
 import { stopHook } from '../../src/runtime/hooks.js';
 import { defaults } from '../helpers.js';
 import { commitFile, makeDefaultEnv, result, tmp, type Env } from './fixtures.js';
+// Unit tier: git runs on the in-memory fake (./fake-git.ts).
+vi.mock('../../src/core/exec.js', async (orig) => (await import('./fake-git.js')).mockExec(await orig()));
 
 type ResetCfg = NonNullable<NonNullable<MinionsConfig['coordinator']>['contextReset']>;
 

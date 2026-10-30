@@ -1,10 +1,12 @@
 // Deny paths of the D10 role enforcement (task-33.2): preAgentHook and the drain hook.
 import { join } from 'node:path';
-import { beforeAll, describe, expect, it } from 'vitest';
+import { beforeAll, describe, expect, it, vi } from 'vitest';
 import type { MinionsConfig } from '../../src/config/schema.js';
 import { requestDrain } from '../../src/runtime/drain.js';
 import { drainHook, preAgentHook } from '../../src/runtime/hooks.js';
 import { makeEnv, tmp, type Env } from './fixtures.js';
+// Unit tier: git runs on the in-memory fake (./fake-git.ts).
+vi.mock('../../src/core/exec.js', async (orig) => (await import('./fake-git.js')).mockExec(await orig()));
 
 beforeAll(() => { process.env.MINIONS_STATE_DIR = tmp('minions-roles-sec-state-'); });
 

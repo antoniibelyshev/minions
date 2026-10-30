@@ -1,9 +1,11 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type { MinionsError } from '../../src/core/errors.js';
 import { validateResult } from '../../src/runtime/results.js';
 import { PROFILES } from '../../src/config/schema.js';
 import { defaults } from '../helpers.js';
 import { commitFile, gitSync, makeDefaultEnv, result, type Env } from './fixtures.js';
+// Unit tier: git runs on the in-memory fake (./fake-git.ts).
+vi.mock('../../src/core/exec.js', async (orig) => (await import('./fake-git.js')).mockExec(await orig()));
 
 const code = async (p: Promise<unknown>) => {
   try { await p; } catch (e) { return (e as MinionsError).code; }
