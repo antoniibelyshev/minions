@@ -23,6 +23,10 @@ if (!/--v8-pool-size/.test(process.env.NODE_OPTIONS ?? '')) process.env.NODE_OPT
 // A worker of a coordinator session inherits MINIONS_SESSION (task-57 phase 6), which scopes claims, context
 // resets and hooks to that session; the suite runs as the single coordinator unless a test sets it itself.
 delete process.env.MINIONS_SESSION;
+// Tokens go to the 0600 file store under the test's MINIONS_HOME, never the user's login Keychain or keyring: the
+// host-wide items (minions.manager, ...) have a fixed account, so a macOS run of setup overwrote the real manager
+// token, and an isolated HOME (the integration gate) made the write fail. Tests of the other stores set it themselves.
+process.env.MINIONS_CREDENTIAL_STORE = 'file';
 
 export default defineConfig({
   define: { __MINIONS_VERSION__: JSON.stringify(pkg.version) },
