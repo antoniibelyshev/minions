@@ -156,10 +156,10 @@ describe('self-update start refusals', () => {
     }, /not a packed install \(link/],
     ['the installed CLI has no packed build stamp', () => { rmSync(join(fx.fake, 'global', 'minions', 'dist', 'build.json')); }, /not a packed install \(unknown/],
     ['delivery is not local', () => { json(join(fx.fake, 'config.json'), { ok: true, data: { delivery: { mode: 'pull-request' } } }); }, /delivery mode is "pull-request", not local/],
-    ['the runtime is not Docker', () => {
+    ['the runtime is neither Docker nor host', () => {
       const p = join(fx.home, 'projects', PROJECT_ID, 'project.json');
-      json(p, { ...JSON.parse(readFileSync(p, 'utf8')), runtime: 'host' });
-    }, /runtime is "host", not docker/],
+      json(p, { ...JSON.parse(readFileSync(p, 'utf8')), runtime: 'k8s' });
+    }, /runtime is "k8s", not docker or host/],
     ['the checkout is dirty', () => { writeFileSync(join(fx.repo, 'stray.txt'), 'x'); }, /uncommitted or untracked changes/],
     ['the checkout is not on the base branch', () => { gitIn(fx.repo, 'checkout', '-q', '-b', 'feature'); }, /on branch feature, not the base branch main/],
   ];
@@ -904,6 +904,91 @@ describe('self-update health check and rollback (phase 3)', () => {
     expect(marks()[1]).toMatch(/rolled back with failures \(image re-tag; see the log\); the coordinator is healthy again on the previous build; .* is recorded as bad/);
     expect(existsSync(join(fx.fake, 'manager-notice.txt'))).toBe(false);
     expect((readState() as unknown as { prevPin: unknown }).prevPin).toBeNull();
+  });
+});
+
+describe('self-update on the host runtime (task-7)', () => {
+  const hostDir = () => join(fx.home, 'projects', PROJECT_ID, 'host');
+  const shimLog = () => readLog('shim.log');
+  const marks = () => shimLog().split('\n').filter((l) => l.includes('requests mark cr_'));
+  const statuses = () => marks().map((l) => / --status (\w+)/.exec(l)?.[1]);
+  const steps = (e: Record<string, unknown> | undefined) => (e?.steps as { id: string; status: string }[]).map((s) => `${s.id}:${s.status}`);
+  beforeEach(() => {
+    const p = join(fx.home, 'projects', PROJECT_ID, 'project.json');
+    json(p, { ...JSON.parse(readFileSync(p, 'utf8')), runtime: 'host' });
+    mkdirSync(join(hostDir(), 'bin'), { recursive: true });
+    mkdirSync(join(hostDir(), 'workspace'), { recursive: true });
+    // The project's minions shim: runtime verbs of the script (no docker exec). A coordinator restart brings a
+    // broken coordinator back ($FAKE/host-broken), as the rollback's restart on the old CLI would.
+    sh(join(hostDir(), 'bin', 'minions'), [
+      'echo "$* | cwd=$PWD" >> "$FAKE/shim.log"',
+      'case "$*" in',
+      '  "status --json") cat "$FAKE/status.json" ;;',
+      '  "settings requests mark"*) echo \'{"ok":true,"data":{}}\' ;;',
+      '  "notify enqueue"*) cat > "$FAKE/notice.txt"; echo \'{"ok":true,"data":{"created":true}}\' ;;',
+      '  "coordinator restart --recover --json") rm -f "$FAKE/host-broken"; echo \'{"ok":true,"data":{"action":"restarted"}}\' ;;',
+      '  *) echo \'{"ok":false,"error":{"code":"INTERNAL","message":"unexpected shim call"}}\'; exit 1 ;;',
+      'esac',
+    ].join('\n'));
+    // The host-runtime status: restartRequired is not-applicable there; the coordinator is down while $FAKE/host-broken exists.
+    writeFileSync(join(fx.fake, 'host-status.sh'), [
+      'launch=current; [ -f "$FAKE/host-broken" ] && launch=not-running',
+      'printf \'{"ok":true,"data":{"activeLeases":[],"draining":null,"restartRequired":{"state":"not-applicable"},"coordinatorLaunch":{"state":"%s","reason":"x"},"coordinatorLock":{"pid":100,"session":"coordinator","acquiredAt":"2026-10-29T10:00:00.000Z"},"channel":{"effective":"terminal"},"telegramPoller":{"state":"not-applicable"}}}\\n\' "$launch"',
+    ].join('\n'));
+  });
+
+  it('takes the request through the shim, syncs, gates, upgrades and marks applied without any docker call', () => {
+    const from = gitIn(fx.repo, 'rev-parse', 'HEAD');
+    setRequests([request('cr_aaaaaaaa')]);
+    const r = runScript('--once');
+    expect(r.code, r.err).toBe(0);
+    const to = gitIn(fx.repo, 'rev-parse', 'HEAD');
+    expect(dockerLog()).toBe('');
+    expect(statuses()).toEqual(['confirmed', 'applied']);
+    expect(marks()[0]).toContain(`| cwd=${realpathSync(join(hostDir(), 'workspace'))}`);
+    expect(marks()[1]).toContain(`--detail self-update ${from.slice(0, 12)}..${to.slice(0, 12)}`);
+    expect(shimLog()).toContain('notify enqueue --key self-update:cr_aaaaaaaa --kind status --json');
+    expect(minionsLog()).toMatch(/--json upgrade --sync-only\n(.|\n)*--json upgrade --rebuild-cli/);
+    const apply = events().find((e) => e.event === 'apply');
+    expect(apply).toMatchObject({ outcome: 'applied', previousImage: null, health: { healthy: true } });
+    expect(steps(apply)).toEqual(['sync:done', 'gate-worktree:done', 'gate-ci:done', 'gate-typecheck:done', 'gate-test:done', 'upgrade:done', 'health:done']);
+  });
+
+  it('not healthy after the upgrade: reinstalls the CLI backup, down and start on the old CLI, restart --recover through the shim; no image steps', () => {
+    writeFileSync(join(fx.fake, 'host-broken'), '');
+    setRequests([request('cr_aaaaaaaa')]);
+    const r = runScript('--once');
+    expect(r.code, r.err).toBe(0);
+    expect(dockerLog()).toBe('');
+    const backups = readdirSync(join(fx.home, 'manager', 'cli-backup'));
+    expect(npmLog()).toContain(`install -g --no-audit --no-fund ${join(fx.home, 'manager', 'cli-backup', backups[0]!)}`);
+    expect(minionsLog()).toMatch(/--rebuild-cli\n(.|\n)*--json down\n--json start --no-attach\n/);
+    expect(shimLog()).toContain('coordinator restart --recover --json');
+    const apply = events().find((e) => e.event === 'apply');
+    expect(steps(apply).slice(5)).toEqual(['upgrade:done', 'health:failed', 'rollback-cli:done', 'rollback-down:done', 'rollback-start:done', 'rollback-coordinator:done', 'health-after-rollback:done']);
+    expect(apply).toMatchObject({ outcome: 'failed', rollback: { ok: true, healthy: true } });
+    expect(statuses()).toEqual(['confirmed', 'failed']);
+    expect(marks()[1]).toMatch(/rolled back to the previous CLI \(host runtime/);
+  });
+
+  it('a host runtime that was never started is retry later (no shim), nothing is taken', () => {
+    rmSync(join(hostDir(), 'bin', 'minions'));
+    setRequests([request('cr_aaaaaaaa')]);
+    const r = runScript('--once');
+    expect(r.code, r.err).toBe(0);
+    expect(r.out).toMatch(/runtime not running: retry later/);
+    expect(shimLog()).toBe('');
+    expect(minionsLog()).not.toMatch(/upgrade/);
+  });
+
+  it('--dry-run prints the host plan: the shim, no docker tag', () => {
+    setRequests([request('cr_aaaaaaaa')]);
+    const r = runScript('--once', '--dry-run');
+    expect(r.code, r.err).toBe(0);
+    expect(r.out).toContain(`${join(hostDir(), 'bin', 'minions')} settings requests mark cr_aaaaaaaa --status confirmed`);
+    expect(r.out).toContain('host runtime: no image, so no previous-image tag');
+    expect(r.out).not.toMatch(/docker tag/);
+    expect(dockerLog()).toBe('');
   });
 });
 

@@ -276,6 +276,24 @@ describe('installed CLI check', () => {
     expect(mutatingNpm(w.calls)).toEqual([]);
   });
 
+  it('host runtime: a linked install into an agent-writable dir is never rebuilt in place (manual packed reinstall, nothing runs)', async () => {
+    const c = checkout();
+    stampDist(c, '0.2.0', 'old0000000000000', 'source');
+    symlinkSync(c, join(g, 'minions'));
+    const w: NpmWorld = { globalRoot: g, checkout: c, calls: [], lsResolved: `file:${c}` };
+    const spawned: string[] = [];
+    const p = await runSourcePhase<UpgradeResult>(phaseBase({
+      checkout: c, runner: fakeNpm(w), rebuildCli: true, agentWritable: [c],
+      spawnCli: async (cli) => { spawned.push(cli); return { code: 1, stdout: '', stderr: '' }; },
+    }));
+    expect(p.cli).toMatchObject({ action: 'manual', differs: true });
+    expect(p.cli!.reason).toMatch(/inside the agent-writable/);
+    expect(p.cli!.command).toMatch(/npm pack && npm uninstall -g minions && npm install -g/);
+    expect(p.stop).not.toBeNull();
+    expect(mutatingNpm(w.calls)).toEqual([]);
+    expect(spawned).toEqual([]);
+  });
+
   it('rebuilds a linked install of the checkout, then continues the upgrade on the new CLI', async () => {
     const c = checkout();
     stampDist(c, '0.2.0', 'old0000000000000', 'source');

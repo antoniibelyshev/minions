@@ -920,10 +920,20 @@ date is the source phase. It runs before everything else (see "Upgrade from the 
   attempted and failures are reported (`ok: false`, exit code 1).
 - **Volumes.** The upgrade never runs `down -v` or volume commands. `--dry-run` only reads (compose
   ps, image inspect, `minions status`) and lists every step.
-- **Host runtime.** Not supported: `minions upgrade` refuses with `PRECONDITION` for a project on the
-  host runtime (there is no image or container to move). Install the new CLI, let workers finish
-  (`minions status`, or `minions pause --starts`), then `minions down && minions start`, which
-  regenerates the plugin, shim and sandbox settings and restarts the coordinator.
+- **Host runtime** (task-7, `src/host/upgrade-host.ts`). The same command, the same source phase
+  (`--from-container` strict fast-forward of the owner's checkout, `--rebuild-cli` packed reinstall with
+  the CLI backup, hand-off to the new CLI) and the same pause, drain, resume and recovery steps, run
+  through the project's minions shim instead of `docker compose exec`. Steps: preflight, pause, drain,
+  files (runtime config and plugin), secrets, `shim` (regenerates the minions and gh shims for the
+  installed CLI; the point of no return, as the recreate is for Docker), workspace, resume,
+  coordinator (`coordinator restart --recover`, no `--force`: refused while a worker lease is active,
+  so it runs only after the drain). No image, container or origin step: the workspace is kept as is.
+  The preflight needs a prepared host runtime (`minions start` ran once) and refuses a CLI inside, or
+  linked into, the agent-writable dirs (`<project>/host/workspace`, `<project>/host/state`): the
+  shims run it outside the sandbox. For the same reason the CLI check never rebuilds a linked install
+  whose target, or a checkout, lies in those dirs; it prints the packed reinstall and stops. The CLI is
+  never built from the agent workspace itself: commits reach the owner's checkout only through the
+  `--from-container` fast-forward (exported bundles), and are built in a later run.
 
 ### Upgrade from the container
 

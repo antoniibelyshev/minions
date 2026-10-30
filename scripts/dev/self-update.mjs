@@ -18,6 +18,11 @@
 // the old CLI, coordinator restart --recover). Not healthy records the SHA as bad. When no coordinator comes up even
 // after the rollback, the owner is told through the host manager bot too (`minions manager notify`).
 // Task-82.5: the idle check also waits while the local integrator holds a live `integration_lock`.
+// Task-7: the host runtime too. Runtime verbs then go through the project's minions shim
+// (<project dir>/host/bin/minions, run in <project dir>/host/workspace) instead of `docker compose exec`; there is no
+// image, so no previous-image tag, no image check in the health probe and no image re-tag in the rollback (the CLI
+// backup reinstall, `down`, `start --no-attach` and `coordinator restart --recover` stay). `minions upgrade` itself
+// regenerates the plugin and the shims for the new CLI and restarts the coordinator after the drain.
 //
 // Plain Node ESM with no imports from src/: it runs against the installed `minions` CLI and `docker`. It never puts
 // a token or secret in argv or the log, and it treats every request field from the container as untrusted text.
@@ -139,6 +144,8 @@ function findProject(home, commonDir) {
   return {
     projectId, dir, runtime: pj.runtime ?? 'docker', baseBranch: String(pj.baseBranch ?? 'main'), imageTag: String(pj.imageTag ?? ''),
     composeName: `minions-${projectId.slice(0, 8).toLowerCase()}`, composeFile: join(dir, 'compose.yaml'),
+    // Host runtime (hostRuntimePaths in src/core/paths.ts): the minions shim and the workspace it runs in.
+    hostShim: join(dir, 'host', 'bin', 'minions'), hostWorkspace: join(dir, 'host', 'workspace'),
   };
 }
 
@@ -156,7 +163,7 @@ async function gatherFacts(repoArg) {
   const commonDir = commonDirRaw ? real(commonDirRaw) ?? commonDirRaw : null;
   const project = commonDir ? findProject(home, commonDir) : null;
   if (!project) refusals.push(`no minions project is registered for ${repo} under ${home}`);
-  else if (project.runtime !== 'docker') refusals.push(`the project runtime is "${clean(project.runtime, 40)}", not docker`);
+  else if (project.runtime !== 'docker' && project.runtime !== 'host') refusals.push(`the project runtime is "${clean(project.runtime, 40)}", not docker or host`);
   let delivery = null;
   const cfg = await run('minions', ['--json', 'config', 'show'], { cwd: repo, timeoutMs: 60_000 });
   const env = envelope(cfg.stdout);
@@ -176,14 +183,20 @@ async function gatherFacts(repoArg) {
   return { repo, home, cli, project, delivery, sensitivePaths, refusals };
 }
 
-// ---------------------------------------------------------------- runtime access (own docker exec)
+// ---------------------------------------------------------------- runtime access (own docker exec, or the host shim)
 
 const composeArgv = (p, ...args) => ['compose', '-p', p.composeName, '-f', p.composeFile, ...args];
+const isHost = (p) => p?.runtime === 'host';
 
+/** Docker: the project container runs. Host runtime: `minions start` prepared it (its shim is a regular file). */
 async function runtimeRunning(p) {
+  if (isHost(p)) { try { return lstatSync(p.hostShim).isFile(); } catch { return false; } }
   const r = await run('docker', composeArgv(p, 'ps', '--status', 'running', '-q', SERVICE), { timeoutMs: 30_000 });
   return r.code === 0 && r.stdout.trim().length > 0;
 }
+
+/** The argv of a runtime verb: `docker compose exec` into the container, or the host runtime's minions shim. */
+const runtimeArgv = (p, args) => (isHost(p) ? [p.hostShim, [...args, '--json'], p.hostWorkspace] : ['docker', composeArgv(p, 'exec', '-T', SERVICE, 'minions', ...args, '--json'), undefined]);
 
 /**
  * A runtime verb through `docker compose exec` (as runtimeJson in src/host/change-requests.ts). A stopped runtime is
@@ -191,7 +204,8 @@ async function runtimeRunning(p) {
  */
 async function runtimeVerb(p, args, input) {
   if (!(await runtimeRunning(p))) return { state: 'not-running' };
-  const r = await run('docker', composeArgv(p, 'exec', '-T', SERVICE, 'minions', ...args, '--json'), { timeoutMs: 120_000, input });
+  const [cmd, argv, cwd] = runtimeArgv(p, args);
+  const r = await run(cmd, argv, { timeoutMs: 120_000, input, ...(cwd ? { cwd } : {}) });
   const env = envelope(r.stdout);
   if (!env) return { state: 'error', message: `unexpected output from the runtime (exit ${r.code}): ${clean(r.stderr || r.stdout, 200)}` };
   if (!env.ok) return env.error?.code === 'PRECONDITION' && /not running/i.test(env.error?.message ?? '') ? { state: 'not-running' } : { state: 'error', message: clean(env.error?.message ?? 'failed in the runtime', 300) };
@@ -348,8 +362,22 @@ function gateEnv(home) {
 function planLines(ctx, reqId) {
   const p = ctx.facts.project;
   const gate = join(ctx.gateDir, '<sha>-<random>');
+  const [cmd, mark] = runtimeArgv(p, ['settings', 'requests', 'mark', reqId, '--status', 'confirmed', '--detail', '<detail>']);
+  if (isHost(p)) {
+    return [
+      `${cmd} ${mark.join(' ')}   (in ${p.hostWorkspace})`,
+      `minions --json upgrade --sync-only   (in ${ctx.facts.repo}; the target is the new ${p.baseBranch})`,
+      `git worktree add --detach ${gate} <target>   (a target recorded as bad is not tried again)`,
+      `npm ci && npm run typecheck && npm test   (in ${gate}, MINIONS_TEST_MAX_WORKERS=2, scratch MINIONS_HOME; then the worktree is removed)`,
+      'host runtime: no image, so no previous-image tag',
+      'minions --json upgrade --rebuild-cli   (packed reinstall with the CLI backup; drain, plugin and shims regenerated, coordinator restart --recover)',
+      `health check for up to ${Math.round((ctx.healthWindowMs ?? HEALTH_WINDOW_MS) / 1000)} s: minions --version, minions --json status (coordinatorLaunch current), Telegram poller and doctor checks, at most one coordinator restart`,
+      'not healthy: npm install -g <the CLI backup the upgrade made>, minions --json down, minions --json start --no-attach, coordinator restart --recover (through the shim); health check again; no healthy coordinator then: minions --json manager notify',
+      `mark the request applied or failed, and enqueue the owner notice (notify enqueue --key self-update:${reqId} --kind status)`,
+    ].map((l) => `  ${l}`);
+  }
   return [
-    `docker ${composeArgv(p, 'exec', '-T', SERVICE, 'minions', 'settings', 'requests', 'mark', reqId, '--status', 'confirmed', '--detail', '<detail>', '--json').join(' ')}`,
+    `${cmd} ${mark.join(' ')}`,
     `minions --json upgrade --sync-only   (in ${ctx.facts.repo}; the target is the new ${p.baseBranch})`,
     `git worktree add --detach ${gate} <target>   (a target recorded as bad is not tried again)`,
     `npm ci && npm run typecheck && npm test   (in ${gate}, MINIONS_TEST_MAX_WORKERS=2, scratch MINIONS_HOME; then the worktree is removed)`,
@@ -501,7 +529,8 @@ async function healthProbe(ctx, expectImage) {
   else {
     const d = env.data ?? {};
     const rr = d.restartRequired;
-    if (rr?.state !== 'current') problems.push(`restart required is ${clean(rr?.state ?? 'missing', 40)}, not current${rr?.detail ? ` (${clean(rr.detail, 200)})` : ''}`);
+    // Host runtime: no container to compare (restartRequired is not-applicable there; the status is the runtime's own).
+    if (!isHost(ctx.facts.project) && rr?.state !== 'current') problems.push(`restart required is ${clean(rr?.state ?? 'missing', 40)}, not current${rr?.detail ? ` (${clean(rr.detail, 200)})` : ''}`);
     const launch = d.coordinatorLaunch?.state;
     if (launch !== 'current') problems.push(launch === 'not-running' ? 'the coordinator is not running' : `the coordinator launch is ${clean(launch ?? 'unknown', 40)}, not current`);
     if (d.coordinatorLock && typeof d.coordinatorLock.pid === 'number') lock = `${d.coordinatorLock.pid}@${clean(d.coordinatorLock.acquiredAt, 40)}`;
@@ -511,8 +540,10 @@ async function healthProbe(ctx, expectImage) {
       if (POLLER_DOWN.includes(poller)) problems.push(`the Telegram poller is ${poller}`);
     }
   }
-  const img = await containerImage(ctx.facts.project);
-  if (!img) problems.push('no project container runs');
+  const host = isHost(ctx.facts.project);
+  const img = host ? null : await containerImage(ctx.facts.project);
+  if (host) { /* no container: the coordinator launch above is the runtime check */ }
+  else if (!img) problems.push('no project container runs');
   else if (expectImage && img !== expectImage) problems.push(`the container runs image ${shortImg(img)}, not ${shortImg(expectImage)}`);
   if (!problems.length && telegram) {
     const doc = envelope((await run('minions', ['--json', 'doctor'], { cwd: repo, timeoutMs: 5 * MIN })).stdout);
@@ -520,7 +551,7 @@ async function healthProbe(ctx, expectImage) {
     if (!checks) problems.push('`minions doctor` gave no report');
     else for (const c of checks.filter((x) => (x?.name === 'telegram.plugin' || x?.name === 'telegram.poller') && x.status === 'fail')) problems.push(`${c.name}: ${clean(c.detail, 200)}`);
   }
-  return { ok: !problems.length, lock, detail: problems.length ? problems.join('; ') : `minions ${clean(version, 40)}, coordinator running, container on image ${shortImg(img)}` };
+  return { ok: !problems.length, lock, detail: problems.length ? problems.join('; ') : `minions ${clean(version, 40)}, coordinator running, ${host ? 'host runtime' : `container on image ${shortImg(img)}`}` };
 }
 
 /** The design's window: 5 minutes. Healthy needs HEALTH_SETTLE passing probes in a row (one at the end of the window). */
@@ -625,7 +656,7 @@ async function rollback(ctx, apply, step, backupsBefore) {
   const cli = await step('rollback-cli', () => restoreCli(ctx.facts.home, backupsBefore));
   if (!cli.ok) return { ok: false, imageRestored: false, stoppedAtCli: true, detail: `the CLI backup could not be reinstalled (${cli.detail}); the rollback stopped there` };
   const prev = apply.previousImage;
-  const img = await step('rollback-image', async () => {
+  const img = !prev ? { ok: true, detail: 'host runtime: no image to re-tag' } : await step('rollback-image', async () => {
     const id = await imageIdOf(prev.tag);
     if (id !== prev.id) return { ok: false, detail: `${prev.tag} is ${id ? `image ${shortImg(id)}` : 'missing'}, not the kept ${shortImg(prev.id)}; \`minions start\` rebuilds the image from the old CLI instead` };
     const t = await run('docker', ['tag', prev.tag, p.imageTag], { timeoutMs: TIMEOUTS.docker });
@@ -640,7 +671,7 @@ async function rollback(ctx, apply, step, backupsBefore) {
   });
   const failed = [['image re-tag', img], ['down', down], ['start', start], ['coordinator restart', coord]].filter(([, r]) => !r.ok).map(([n]) => n);
   return { ok: !failed.length, imageRestored: img.ok,
-    detail: failed.length ? `rolled back with failures (${failed.join(', ')}; see the log)` : `rolled back to the previous CLI and image (${prev.tag})` };
+    detail: failed.length ? `rolled back with failures (${failed.join(', ')}; see the log)` : prev ? `rolled back to the previous CLI and image (${prev.tag})` : 'rolled back to the previous CLI (host runtime: plugin and shims regenerated by the old CLI)' };
 }
 
 /**
@@ -785,20 +816,23 @@ async function applyRequest(ctx, req) {
     return finishApply(ctx, apply, 'failed', `self-update: the host gate failed at ${short(to)} (${gate.detail}); nothing was built; ${verdict}`, { bad: gate.bad === true });
   }
 
-  // 3. Keep the previous image for the rollback.
-  const tag = await step('previous-image', () => tagPrevious(ctx, p));
-  if (!tag.ok) return finishApply(ctx, apply, 'failed', `self-update: the previous image could not be kept (${tag.detail}); nothing was built`);
-  apply.previousImage = { tag: tag.prev, id: tag.imageId, ...(tag.kept ? { kept: true } : {}) };
+  // 3. Keep the previous image for the rollback (Docker only: the host runtime has no image).
+  const host = isHost(p);
+  if (!host) {
+    const tag = await step('previous-image', () => tagPrevious(ctx, p));
+    if (!tag.ok) return finishApply(ctx, apply, 'failed', `self-update: the previous image could not be kept (${tag.detail}); nothing was built`);
+    apply.previousImage = { tag: tag.prev, id: tag.imageId, ...(tag.kept ? { kept: true } : {}) };
+  }
 
   // 4. Upgrade: a second run, so building the synced commits is allowed (drain, rebuild, recreate, restart --recover).
   // The CLI backups before it tell which backup the upgrade made (the CLI to reinstall on a rollback).
   const backupsBefore = new Set(cliBackups(facts.home).map((b) => b.name));
-  const imageBefore = await imageIdOf(p.imageTag);
+  const imageBefore = host ? null : await imageIdOf(p.imageTag);
   const up = await step('upgrade', () => minionsUpgrade(repo, ['--rebuild-cli'], TIMEOUTS.upgrade));
 
   // 5. Health: the container must run the image the tag names now (rebuilt or, with an unchanged fingerprint, the same).
   if (up.ok) {
-    const want = await imageIdOf(p.imageTag);
+    const want = host ? null : await imageIdOf(p.imageTag);
     const h = await step('health', () => healthCheck(ctx, want));
     apply.health = { healthy: h.healthy, detail: clean(h.detail, 600), polls: h.polls, restarts: h.restarts };
     if (h.healthy) {
@@ -814,7 +848,7 @@ async function applyRequest(ctx, req) {
   const verdictOf = () => (bad ? `${short(to)} is recorded as bad` : `${short(to)} is not recorded as bad (the upgrade itself failed, which can be transient; a new request tries it again)`);
   // A failed upgrade that replaced neither the CLI (no new backup: applyCli backs up before every reinstall) nor the
   // image needs no rollback when the coordinator is healthy on the build it had: no down and start then.
-  if (!up.ok && imageBefore && !cliBackups(facts.home).some((b) => !backupsBefore.has(b.name)) && (await imageIdOf(p.imageTag)) === imageBefore) {
+  if (!up.ok && (host || imageBefore) && !cliBackups(facts.home).some((b) => !backupsBefore.has(b.name)) && (host || (await imageIdOf(p.imageTag)) === imageBefore)) {
     const same = await step('health-unchanged', () => healthCheck(ctx, imageBefore, { maxPolls: HEALTH_SETTLE }));
     if (same.healthy) {
       apply.rollback = { ok: true, skipped: true, detail: 'nothing to roll back', healthy: true, health: clean(same.detail, 600) };
@@ -825,7 +859,7 @@ async function applyRequest(ctx, req) {
   const rb = await rollback(ctx, apply, step, backupsBefore);
   // A rollback that stopped at the CLI reinstall restarted nothing, so waiting out the window cannot help: the owner
   // hears it after HEALTH_SETTLE probes.
-  const after = await step('health-after-rollback', () => healthCheck(ctx, rb.imageRestored ? apply.previousImage.id : null, rb.stoppedAtCli ? { maxPolls: HEALTH_SETTLE } : {}));
+  const after = await step('health-after-rollback', () => healthCheck(ctx, rb.imageRestored && apply.previousImage ? apply.previousImage.id : null, rb.stoppedAtCli ? { maxPolls: HEALTH_SETTLE } : {}));
   apply.rollback = { ok: rb.ok, detail: rb.detail, healthy: after.healthy, health: clean(after.detail, 600) };
   if (after.healthy) writeState(files.state, { ...readState(files.state), prevPin: null });
   const verdict = verdictOf();
@@ -943,7 +977,7 @@ async function main(argv) {
       'self-update plan (dry run: nothing is marked, written or logged)',
       `  checkout: ${facts.repo ?? o.repo}`,
       `  installed CLI: ${facts.cli ? `${facts.cli.kind} (${facts.cli.detail})` : 'unknown'}`,
-      `  project: ${facts.project ? `${facts.project.projectId} (runtime ${facts.project.runtime}, base ${facts.project.baseBranch}, compose ${facts.project.composeName})` : 'not found'}`,
+      `  project: ${facts.project ? `${facts.project.projectId} (runtime ${facts.project.runtime}, base ${facts.project.baseBranch}, ${facts.project.runtime === 'host' ? `shim ${facts.project.hostShim}` : `compose ${facts.project.composeName}`})` : 'not found'}`,
       `  delivery: ${facts.delivery ?? 'unknown'}`,
       ...(facts.home ? [`  state: ${paths(facts.home).dir}`] : []),
     ].join('\n') + '\n');

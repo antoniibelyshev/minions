@@ -362,7 +362,7 @@ describe('host runtime processes', () => {
 });
 
 describe('minions upgrade on the host runtime', () => {
-  it('refuses with PRECONDITION before any source or container step, also with --dry-run, --from-container and --rebuild-cli', async () => {
+  it('runs the host path (no Docker refusal): an unprepared host runtime fails the preflight, nothing changes', async () => {
     const { Command } = await import('commander');
     const { register } = await import('../../src/host/commands.js');
     const { repo } = await hostProject();
@@ -373,18 +373,20 @@ describe('minions upgrade on the host runtime', () => {
     const cwd = process.cwd();
     process.chdir(repo);
     try {
-      for (const args of [['upgrade'], ['upgrade', '--dry-run'], ['upgrade', '--from-container', '--rebuild-cli', '--now']]) {
-        err.mockClear();
+      for (const args of [['upgrade', '--dry-run'], ['upgrade']]) {
+        err.mockClear(); out.mockClear();
+        process.exitCode = 0;
         const program = new Command();
         register(program);
-        await expect(program.parseAsync(args, { from: 'user' })).rejects.toThrow(/^exit [1-9]/);
-        const text = err.mock.calls.map((c) => String(c[0])).join('');
-        expect(text).toContain('supports the Docker runtime only');
-        expect(text).toContain('minions down && minions start');
+        await program.parseAsync(args, { from: 'user' }).catch((e: Error) => { if (!/^exit [1-9]/.test(e.message)) throw e; });
+        const text = [...err.mock.calls, ...out.mock.calls].map((c) => String(c[0])).join('');
+        expect(text).not.toContain('supports the Docker runtime only');
+        expect(text).toContain('the host runtime has not been started');
       }
       expect(git(repo, 'status', '--porcelain')).toBe('');
     } finally {
       process.chdir(cwd);
+      process.exitCode = 0;
       exit.mockRestore(); err.mockRestore(); out.mockRestore();
       vi.unstubAllEnvs();
     }
