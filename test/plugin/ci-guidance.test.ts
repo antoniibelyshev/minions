@@ -27,7 +27,8 @@ describe('CI evidence guidance in the generated plugin', () => {
       expect(t, f).toContain('## CI evidence');
       expect(t, f).toMatch(/`ci\.state` `pass`: you may rely on CI instead of re-running the full verification/);
       expect(t, f).toContain('"source": "ci"');
-      expect(t, f).toMatch(/Any other state .* CI is not evidence\. Run the verification commands \(`npm run typecheck`, `npm test`\) locally/);
+      expect(t, f).toMatch(/Any other state .* CI is not evidence, so do not cite it\. Report only the local checks your testing rule above asks for \(a reviewer runs none; the integration gate runs the full verification, `npm run typecheck`, `npm test`\)/);
+      expect(t, f).not.toMatch(/Run the verification commands \([^)]*\) locally/);
       expect(t, f).toMatch(/missing, failing, pending or unreadable CI never approves/);
       expect(t, f).not.toContain('{{');
     }
@@ -43,7 +44,8 @@ describe('CI evidence guidance in the generated plugin', () => {
 
   it('ciAuthority none: workers verify locally and must not cite CI', async () => {
     const read = await gen();
-    expect(await read('agents/reviewer.md')).toMatch(/CI is not a verification authority for this project/);
+    expect(await read('agents/reviewer.md')).toMatch(/CI is not a verification authority for this project .*: report only the checks you ran locally under your testing rule above \(a reviewer runs none\)/);
+    expect(await read('agents/reviewer.md')).not.toMatch(/run the verification commands yourself/);
     expect(await read('agents/tester.md')).toMatch(/Never report a check with `"source": "ci"`/);
     expect(await read('skills/orchestrate/SKILL.md')).toMatch(/testers and reviewers verify locally/);
   });

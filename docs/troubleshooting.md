@@ -204,7 +204,11 @@ Bun-built `backlog` CLI). One full `npm test` peaks near 120 threads that way, d
 vitest's per-core default, so three suites fit next to the coordinator and its workers.
 `npm test` runs two vitest projects: `npm run test:unit` (no subprocesses; any spawn fails the run) and
 `npm run test:integration` (the files listed in `test/tiers.ts`, which run git, the CLI, `backlog`, and
-other children). For a quick check while working, run the unit tier alone.
+other children). Workers follow one testing rule: engineers run the typecheck and the unit tier (targeted
+files while iterating), reviewers run no tests, task testers run targeted checks, and only the local
+integration gate (and QA sweeps) run the integration tier or the full suite. Nobody reruns tests on the
+base branch for a baseline. `minions work record` refuses a `complete` engineer result that reports a
+failing check, a skipped verification command, or no passing test run.
 
 ## Still stuck
 

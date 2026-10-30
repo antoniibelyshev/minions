@@ -20,7 +20,7 @@ The WorkerResult:
   "headSha": "<full 40-char SHA from `git rev-parse HEAD` in your worktree>",
   "modifiedPaths": ["src/example.ts"],
   "checks": [
-    { "command": "npm test", "outcome": "pass", "details": "42 tests" }
+    { "command": "npm run test:unit", "outcome": "pass", "details": "42 tests" }
   ],
   "acceptanceEvidence": [
     { "criterion": "<acceptance criterion text as given>", "evidence": "<what shows it is met: test name, file:line, command output>" }

@@ -25,7 +25,7 @@ import { sessionScope } from './session-scope.js';
 import { missingApprovalKeyReason, runtimePaths } from './paths.js';
 import { ORIGIN_REPOSITORY_META, publishTask, realGh, serverOriginOf, type GhFn, type PublishInput, type PublishOutcome } from './publish.js';
 import type { ServerOrigin, ServerUrlFn } from './base-update.js';
-import { isCiCheck, resultContractText, validateResult, type WorkerResult } from './results.js';
+import { isCiCheck, normalizeCheckCommand, resultContractText, validateResult, type WorkerResult } from './results.js';
 import { assertBudgetAllowsStart, billingOf, budgetNotice, latestLeaseUsage, recordLeaseUsage, tokensFromResultUsage, type Billing, type BudgetNotice, type SpendContext } from './spend.js';
 import { readRequiredChecks, type RequiredChecksReport } from './ci.js';
 import { ciGateFromDb, formatCiGate, type CiGate } from './ci-gate.js';
@@ -317,14 +317,7 @@ export interface RecordResponse {
 const newLeaseId = () => `lease-${randomBytes(6).toString('hex')}`;
 const nowIso = () => new Date().toISOString();
 
-/**
- * Command text reduced to what ran: the last `&&`/`;` segment with leading `VAR=value` assignments removed,
- * so `mkdir -p x && TMPDIR=x npm test` matches the configured `npm test`. Still an exact match otherwise.
- */
-export function normalizeCheckCommand(command: string): string {
-  const last = command.split(/&&|;/).map((p) => p.trim()).filter(Boolean).pop() ?? '';
-  return last.replace(/^(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)+/, '').trim();
-}
+export { normalizeCheckCommand };
 
 /** The full configured verification passed locally (source not ci); with no commands configured, any passing local check. */
 export function localVerificationComplete(checks: { command: string; outcome: string; source?: 'local' | 'ci' }[], configured: string[]): boolean {
@@ -1282,7 +1275,7 @@ export class Scheduler {
       throw new MinionsError('INVALID_CONFIG', `Lease ${leaseId} has role "${lease.role}", which is not a registered worker role in this configuration.`,
         `Release it (minions work release ${leaseId}) or ask the owner to restore the role on the host.`);
     }
-    const v = validateResult(raw, def.contract, { ciAuthority: this.config.verification.ciAuthority });
+    const v = validateResult(raw, def.contract, { ciAuthority: this.config.verification.ciAuthority, verificationCommands: baseRoleName(this.config, lease.role) === ENGINEER_ROLE ? this.config.verification.commands : undefined });
     let errors: string[] = v.ok ? [] : v.errors;
     const result = v.ok ? v.result : undefined;
     let actualHead: string | null = null;
