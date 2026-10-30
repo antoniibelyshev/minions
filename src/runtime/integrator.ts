@@ -25,7 +25,9 @@
 //   delivery.integrationTimeoutMinutes and an allowlisted env: PATH, LANG, TZ, CI=1, MINIONS_TEST_MAX_WORKERS=2,
 //   a fresh HOME, MINIONS_HOME and TMPDIR under <state>/run/integration (no coordinator or Telegram secrets).
 //   Output goes to <state>/logs/integration/<task>-<row>.log; the tail goes into the row's detail.
-//   A failing command is `red`; a timeout, a spawn error or a setup failure is transient.
+//   A failing command is `red`; a timeout, a spawn error, a setup failure or exit 127 (command not found: the
+//   worktree lacks its tools, e.g. no node_modules because verification.setupCommands is empty) is transient,
+//   so the task goes blocked for a setup fix instead of a repair cycle (task-136).
 // - Pause and drain: while starts are paused or a drain is active no new integration starts. A drain (or SIGTERM)
 //   stops a running verification at once (its group is killed) and re-queues the row without an attempt; only the
 //   landing (two git calls) is allowed to finish.
@@ -317,6 +319,14 @@ async function runOne(cmd: string, i: VerifyInput, log: WriteStream, tail: strin
   return out.code === 0 ? { state: 'passed' } : { state: 'failed', code: out.code, signal: out.signal };
 }
 
+/** `sh` exits 127 when the command (or a tool it calls) is not found: a setup problem, not a code failure. */
+export const COMMAND_NOT_FOUND_EXIT = 127;
+const isCommandNotFound = (r: CommandOutcome) => r.state === 'failed' && r.code === COMMAND_NOT_FOUND_EXIT && !r.signal;
+const commandNotFound = (cmd: string, setup: string[], tail: string[]) =>
+  `\`${cmd}\` failed (exit ${COMMAND_NOT_FOUND_EXIT}: command not found): a setup problem, not a code failure; ${setup.length
+    ? `check that verification.setupCommands (${setup.join('; ')}) install the tools it needs`
+    : 'verification.setupCommands is empty, so dependencies are not installed in the integration worktree (for example set it to `npm ci`)'}\n${tail.join('\n')}`;
+
 /** Runs the gate on `candidate` (see the header). Never throws. */
 export async function runVerification(i: VerifyInput): Promise<VerifyResult> {
   let log: WriteStream | null = null;
@@ -360,6 +370,7 @@ export async function runVerification(i: VerifyInput): Promise<VerifyResult> {
       if (r.state === 'stopped') return r;
       if (r.state === 'timeout') return { state: 'transient', detail: clip(`\`${cmd}\` timed out after ${minutes}\n${tail.join('\n')}`) };
       if (r.state === 'spawn-error') return { state: 'transient', detail: clip(`\`${cmd}\` could not start: ${r.message}`) };
+      if (isCommandNotFound(r)) return { state: 'transient', detail: clip(commandNotFound(cmd, i.setupCommands, tail)) };
       const first = clip(`\`${cmd}\` failed (${r.signal ?? `exit ${r.code}`})\n${tail.join('\n')}`);
       // Decision 2: a failed command is rerun once, in place (same tree, nothing reset). A pass on the rerun
       // continues (the landing carries a flaky notice); a second failure (or a rerun that does not finish) is red.
@@ -369,6 +380,7 @@ export async function runVerification(i: VerifyInput): Promise<VerifyResult> {
       const again = await runOne(cmd, i, log, tail);
       if (again.state === 'stopped') return again;
       if (again.state === 'passed') { flaky.push({ command: cmd, detail: first }); continue; }
+      if (isCommandNotFound(again)) return { state: 'transient', detail: clip(commandNotFound(cmd, i.setupCommands, tail)) };
       const why = again.state === 'failed' ? `failed again on its rerun (${again.signal ?? `exit ${again.code}`})` : again.state === 'timeout' ? `timed out on its rerun after ${minutes}` : `could not start on its rerun: ${again.message}`;
       return { state: 'red', command: cmd, detail: clip(`\`${cmd}\` failed twice: ${why}\n${tail.join('\n')}`) };
     }

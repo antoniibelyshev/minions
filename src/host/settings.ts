@@ -69,6 +69,8 @@ export interface SettingDef {
   min?: number;
   /** May be unset (value `default` removes it from the layer). */
   optional?: boolean;
+  /** List entries are separated by this (default ','); shell commands use ';' since they may contain commas. */
+  separator?: ';';
   apply: SettingApply;
   /** How a change takes effect (from apply; the guard test checks it against the schema classification). */
   class: SettingClass;
@@ -140,6 +142,21 @@ const DECLARED: readonly DeclaredSetting[] = [
     description: 'true records that required status checks on the base branch gate merging (auto-merge needs it; minions doctor reports ci.requiredChecks)',
     loosens: turnsOn('auto-merge may arm for pull requests once their required checks pass (with delivery.merge auto-when-eligible)') },
   // ---- Verification
+  // Shell commands may contain commas: entries are separated with ';' (task-136: the runtime can request them).
+  { key: 'verification.commands', group: 'Verification', label: 'Verification commands', type: 'list', separator: ';', apply: 'live',
+    description: 'commands that verify a change (stages, local integration); \';\'-separated',
+    loosens: (f, t) => {
+      const to = Array.isArray(t) ? (t as string[]) : [];
+      const dropped = (Array.isArray(f) ? (f as string[]) : []).filter((c) => !to.includes(c));
+      return dropped.length ? `changes are verified without ${dropped.map((c) => `\`${c}\``).join(', ')}` : null;
+    } },
+  { key: 'verification.setupCommands', group: 'Verification', label: 'Integration setup commands', type: 'list', separator: ';', optional: true, apply: 'live',
+    description: 'local integration: dependency install before verifying, e.g. npm ci; \';\'-separated',
+    loosens: (f, t) => {
+      const from = Array.isArray(f) ? (f as string[]) : [];
+      const added = (Array.isArray(t) ? (t as string[]) : []).filter((c) => !from.includes(c));
+      return added.length ? `the local integrator runs ${added.map((c) => `\`${c}\``).join(', ')} in the integration worktree` : null;
+    } },
   { key: 'verification.testerRequired', group: 'Verification', label: 'Tester on every task', type: 'bool', apply: 'prompt',
     description: 'true: every task gets a tester stage; false: only tasks that need QA (labels, sensitive paths, reviewer request)',
     loosens: turnsOff('tasks without a QA need are delivered without a tester stage') },
@@ -366,6 +383,8 @@ export interface SettingView {
   choices?: readonly string[];
   /** May be unset (`default`). */
   optional?: boolean;
+  /** List separator when it is not ','. */
+  separator?: ';';
   /** Current effective value; secrets: "provisioned" / "missing"; controls: "paused" / "running" / null (runtime not reachable). */
   value: Value;
   source: SourceLabel;
@@ -450,7 +469,7 @@ export function viewSetting(def: SettingDef, ctx: SettingsContext): SettingView 
   const isConfig = def.type !== 'secret' && def.type !== 'control';
   return {
     key: def.key, group: def.group, label: def.label, description: def.description, type: def.type,
-    ...(def.choices ? { choices: def.choices } : {}), ...(def.optional ? { optional: true } : {}),
+    ...(def.choices ? { choices: def.choices } : {}), ...(def.optional ? { optional: true } : {}), ...(def.separator ? { separator: def.separator } : {}),
     value: currentValue(def, ctx), source: sourceOf(def, ctx), apply: def.apply, class: def.class, hostOwned: def.hostOwned,
     needsRegenerate: isConfig, needsRestart: isConfig && def.class === 'restart', needsUpgrade: isConfig && def.class === 'recreate',
     effect: isConfig ? RESTART_WHY[def.apply] : def.type === 'secret' ? `run \`minions auth ${def.key.slice('secrets.'.length)}\` to change it` : 'applied to the running runtime at once',
@@ -511,7 +530,7 @@ export function parseSettingValue(def: SettingDef, input: string): Value {
       return s;
     case 'list': {
       if (s === 'none') return [];
-      const list = s.split(',').map((x) => x.trim()).filter(Boolean);
+      const list = s.split(def.separator ?? ',').map((x) => x.trim()).filter(Boolean);
       if (!list.length) throw bad('must list at least one entry, or none');
       return list;
     }

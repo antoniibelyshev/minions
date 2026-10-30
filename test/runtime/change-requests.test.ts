@@ -259,3 +259,28 @@ describe('recordSettingRequest (unit)', () => {
     } finally { db.close(); }
   });
 });
+
+describe('recordSettingRequest: verification commands (task-136)', () => {
+  it('records verification.setupCommands and verification.commands (";"-separated, commas kept) instead of "Unknown setting"', () => {
+    const db = new RuntimeDb(':memory:');
+    try {
+      const setup = recordSettingRequest({ db, config: defaults() }, 'verification.setupCommands', 'npm ci', { reason: 'integration has no node_modules' });
+      expect(setup.recorded).toBe(true);
+      expect(setup.change).toMatchObject({ key: 'verification.setupCommands', from: undefined, to: ['npm ci'], takesEffect: 'now' });
+      expect(setup.change!.loosens).toMatch(/runs `npm ci` in the integration worktree/);
+      const cmds = recordSettingRequest({ db, config: defaults() }, 'verification.commands', 'npm run typecheck; node -e "console.log(1,2)"', { reason: 'add a check' });
+      expect(cmds.change).toMatchObject({ to: ['npm run typecheck', 'node -e "console.log(1,2)"'] });
+      expect(db.changeRequests({ all: true }).map((r) => JSON.parse(r.payload).key).sort()).toEqual(['verification.commands', 'verification.setupCommands']);
+    } finally { db.close(); }
+  });
+
+  it('dropping a verification command is reported as loosening', () => {
+    const db = new RuntimeDb(':memory:');
+    try {
+      const cfg = defaults();
+      cfg.verification.commands = ['npm run typecheck', 'npm test'];
+      const r = recordSettingRequest({ db, config: cfg }, 'verification.commands', 'npm test', { reason: 'r', dryRun: true });
+      expect(r.change!.loosens).toMatch(/verified without `npm run typecheck`/);
+    } finally { db.close(); }
+  });
+});

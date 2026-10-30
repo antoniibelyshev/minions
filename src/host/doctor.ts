@@ -1,5 +1,6 @@
 // `minions doctor`: host, Docker, container, and configuration readiness. Never prints secrets.
 import { stat } from 'node:fs/promises';
+import { join } from 'node:path';
 import { DEFERRED_FEATURES, listUnavailable } from '../config/resolve.js';
 import { can } from '../config/capabilities.js';
 import { autoMergeConfigReasons } from '../config/delivery.js';
@@ -388,13 +389,19 @@ async function telegramRuntimeChecks(ex: (args: string[]) => Promise<{ code: num
 }
 
 /**
- * setup: obvious configuration gaps left after init (no verification commands, GitHub remote without a
+ * setup: obvious configuration gaps left after init (no verification commands, no setup commands for the local
+ * integration of a Node project, GitHub remote without a
  * working token, Telegram selected without a bot token), with a pointer to the setup assistant.
  */
-export function setupGapsCheck(config: Pick<MinionsConfig, 'verification' | 'communication'>,
-  s: { onGitHub: boolean; githubCredential: CredentialStatus['state'] | null; telegramToken: TelegramCredentialStatus['state'] }): Check {
+export function setupGapsCheck(config: Pick<MinionsConfig, 'verification' | 'communication'> & Partial<Pick<MinionsConfig, 'delivery'>>,
+  s: { onGitHub: boolean; githubCredential: CredentialStatus['state'] | null; telegramToken: TelegramCredentialStatus['state']; nodeProject?: boolean }): Check {
   const gaps: string[] = [];
   if (!config.verification.commands.length) gaps.push('no verification commands (verification.commands is empty)');
+  // Local integration verifies in its own worktree, which has no node_modules unless setup installs them (task-136).
+  const localIntegration = config.delivery?.mode === 'local' && config.delivery.merge === 'auto-when-eligible';
+  if (s.nodeProject && localIntegration && !config.verification.setupCommands?.length) {
+    gaps.push('local integration is on for a Node project but verification.setupCommands is empty: the integration worktree has no node_modules, so verification fails with "command not found" (set it to e.g. `npm ci`, `pnpm i --frozen-lockfile` or `yarn --immutable`)');
+  }
   if (s.onGitHub && s.githubCredential === 'missing') gaps.push('GitHub remote without a stored token');
   if (config.communication.channel === 'telegram' && s.telegramToken !== 'ok') gaps.push('Telegram selected without a valid bot token');
   if (config.communication.channel === 'auto' && s.telegramToken === 'invalid') gaps.push('the stored Telegram bot token is invalid (communication.channel auto)');
@@ -783,7 +790,10 @@ export async function runDoctor(opts: {
       add('communication.channel', 'ok', `configured ${res.configured}, effective ${res.effective}${res.cause === 'unchecked' ? ' (predicted)' : ''}: ${res.reason}`);
       checks.push(telegramReadiness(res, tgPlugin, tgCred.state, facts.runtime));
     }
-    if (config) checks.push(setupGapsCheck(config, { onGitHub: github.onGitHub, githubCredential: github.credential, telegramToken: tgCred.state }));
+    if (config) {
+      const nodeProject = await stat(join(ref.repoPath, 'package.json')).then((x) => x.isFile(), () => false);
+      checks.push(setupGapsCheck(config, { onGitHub: github.onGitHub, githubCredential: github.credential, telegramToken: tgCred.state, nodeProject }));
+    }
   } catch (e) {
     add('project', 'warn', isMinionsError(e) ? e.message : String(e), 'Run `minions init` in this repository.');
   }

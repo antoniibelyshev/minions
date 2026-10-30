@@ -7,6 +7,7 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { defaults } from '../helpers.js';
 
 vi.mock('../../src/plugin/generate.js', async (importOriginal) => {
   const orig = await importOriginal<typeof import('../../src/plugin/generate.js')>();
@@ -261,5 +262,22 @@ describe('doctor setup check', () => {
     expect(setupGapsCheck(cfg(['npm test']), { ...none, onGitHub: true, githubCredential: 'missing' }).detail).toMatch(/GitHub remote without a stored token/);
     expect(setupGapsCheck(cfg(['npm test'], 'telegram'), none).detail).toMatch(/Telegram/);
     expect(setupGapsCheck(cfg(['npm test']), none)).toMatchObject({ status: 'ok' });
+  });
+
+  it('flags a Node project with local integration on and no verification.setupCommands (task-136)', async () => {
+    const { setupGapsCheck } = await import('../../src/host/doctor.js');
+    const none = { onGitHub: false, githubCredential: null, telegramToken: 'missing' as const };
+    const cfg = (setupCommands: string[] | undefined, merge: 'auto-when-eligible' | 'disabled' = 'auto-when-eligible') => ({
+      verification: { commands: ['npm test'], ...(setupCommands ? { setupCommands } : {}), testerRequired: true, reviewerRequired: true, ciAuthority: 'none' as const },
+      communication: { channel: 'terminal' as const, progress: 'milestones' as const },
+      delivery: { ...defaults().delivery, mode: 'local' as const, merge },
+    });
+    const gap = setupGapsCheck(cfg(undefined), { ...none, nodeProject: true });
+    expect(gap.status).toBe('warn');
+    expect(gap.detail).toMatch(/verification\.setupCommands is empty/);
+    expect(setupGapsCheck(cfg([]), { ...none, nodeProject: true }).status).toBe('warn');
+    expect(setupGapsCheck(cfg(['npm ci']), { ...none, nodeProject: true }).status).toBe('ok');
+    expect(setupGapsCheck(cfg(undefined), { ...none, nodeProject: false }).status).toBe('ok');
+    expect(setupGapsCheck(cfg(undefined, 'disabled'), { ...none, nodeProject: true }).status).toBe('ok');
   });
 });

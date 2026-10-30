@@ -154,6 +154,25 @@ describe('runIntegrator: landing and the verify runner', () => {
     expect(mainOf(s.repo)).toBe(s.B);
   });
 
+  it('a command not found (exit 127) is transient, not red: no flaky rerun, and the detail points at verification.setupCommands', async () => {
+    const s = setup({ commands: ['true', 'minions-no-such-tool-136 --check'] });
+    s.queue('task-1');
+    const r = await runIntegrator(s.deps);
+    expect(r.settled.map((x) => x.phase)).toEqual(['transient']);
+    const row = rowOf(s.db, 'task-1');
+    expect(row).toMatchObject({ phase: 'transient', attempt: 2 });
+    expect(row.detail).toMatch(/`minions-no-such-tool-136 --check` failed \(exit 127: command not found\): a setup problem, not a code failure/);
+    expect(row.detail).toMatch(/verification\.setupCommands is empty/);
+    expect(readFileSync(row.log_path!, 'utf8')).not.toContain('rerunning it once');
+    expect(mainOf(s.repo)).toBe(s.B);
+    // With setup commands configured the hint names them instead.
+    s.cfg.verification.setupCommands = ['true'];
+    s.queue('task-2');
+    await runIntegrator(s.deps);
+    expect(rowOf(s.db, 'task-2')).toMatchObject({ phase: 'transient' });
+    expect(rowOf(s.db, 'task-2').detail).toMatch(/check that verification\.setupCommands \(true\) install the tools it needs/);
+  });
+
   it('runs setupCommands only when the lockfile changes, and a setup failure is transient', async () => {
     const s = setup({ setupCommands: ['mkdir -p node_modules && echo x >> node_modules/setup-count'], commands: ['test -d node_modules'] });
     s.queue('task-1');

@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { profileDefaults } from '../../src/config/profiles.js';
 import { MinionsError } from '../../src/core/errors.js';
 import { projectPaths, volumeNames } from '../../src/core/paths.js';
-import { composeMajor, discover, proposeVerification, sanitizeRemoteUrl } from '../../src/host/discovery.js';
+import { composeMajor, discover, proposeSetup, proposeVerification, sanitizeRemoteUrl } from '../../src/host/discovery.js';
 import { CONTAINER } from '../../src/core/paths.js';
 import { DEFAULT_TMP_SIZE_MIB, Compose, buildFingerprint, composeYaml, ensureImage, packageRoot } from '../../src/host/docker.js';
 import { ProjectJsonSchema } from '../../src/host/project.js';
@@ -240,6 +240,18 @@ describe('discovery', () => {
     expect(proposeVerification({ test: 'jest', typecheck: 'tsc' }, 'pnpm')).toEqual(['pnpm run typecheck', 'pnpm test']);
   });
 
+  it('proposes setupCommands from the lockfile (none without one)', async () => {
+    expect(proposeSetup(new Set(['package.json', 'package-lock.json']))).toEqual(['npm ci']);
+    expect(proposeSetup(new Set(['package.json', 'npm-shrinkwrap.json']))).toEqual(['npm ci']);
+    expect(proposeSetup(new Set(['package.json', 'pnpm-lock.yaml']))).toEqual(['pnpm i --frozen-lockfile']);
+    expect(proposeSetup(new Set(['package.json', 'yarn.lock']))).toEqual(['yarn --immutable']);
+    expect(proposeSetup(new Set(['package.json']))).toEqual([]);
+    const repo = makeRepo(env.root);
+    expect((await discover(repo)).setupCommands).toEqual([]);
+    writeFileSync(join(repo, 'package-lock.json'), '{"lockfileVersion": 3}\n');
+    expect((await discover(repo)).setupCommands).toEqual(['npm ci']);
+  });
+
   it('strips credentials embedded in the remote URL', () => {
     expect(sanitizeRemoteUrl('https://x-access-token:ghp_secret@github.com/o/r.git')).toBe('https://github.com/o/r.git');
     expect(sanitizeRemoteUrl('https://ghp_secret@github.com/o/r.git')).toBe('https://github.com/o/r.git');
@@ -289,6 +301,23 @@ describe('wizard', () => {
     expect(questions.some((q) => q.startsWith('Delivery mode'))).toBe(false);
     expect(r.config.delivery.mode).toBe('local');
     for (const q of questions) expect(q).not.toMatch(/token|password|secret|api key/i);
+  });
+
+  it('defaults verification.setupCommands from the lockfile, asks for them interactively, and keeps none unset', async () => {
+    const repo = makeRepo(env.root);
+    writeFileSync(join(repo, 'pnpm-lock.yaml'), 'lockfileVersion: 9\n');
+    const discovery = await discover(repo);
+    expect((await runWizard({ discovery, projectId: ID, yes: true })).config.verification.setupCommands).toEqual(['pnpm i --frozen-lockfile']);
+    const questions: string[] = [];
+    const io = (answer?: string): WizardIO => ({
+      ask: async (q, def) => { questions.push(q); return answer !== undefined && q.startsWith('Setup commands') ? answer : def; }, info: () => undefined,
+    });
+    expect((await runWizard({ discovery, projectId: ID, yes: false, io: io() })).config.verification.setupCommands).toEqual(['pnpm i --frozen-lockfile']);
+    expect(questions.some((q) => q.startsWith('Setup commands'))).toBe(true);
+    expect((await runWizard({ discovery, projectId: ID, yes: false, io: io('none') })).config.verification.setupCommands).toBeUndefined();
+    expect((await runWizard({ discovery, projectId: ID, yes: false, io: io('pnpm i; pnpm build') })).config.verification.setupCommands).toEqual(['pnpm i', 'pnpm build']);
+    const bare = await discover(makeRepo(env.root, 'bare'));
+    expect((await runWizard({ discovery: bare, projectId: ID, yes: true })).config.verification.setupCommands).toBeUndefined();
   });
 
   it('offers branch/pull-request delivery only with a GitHub remote and a stored token', async () => {
