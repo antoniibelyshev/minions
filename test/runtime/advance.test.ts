@@ -1,7 +1,7 @@
 // `minions work advance` (task-68.7): record the submitted result, then claim the next stage or return a decision.
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { MinionsError } from '../../src/core/errors.js';
 import { advanceLease, humanAdvance, recordDecision, type AdvanceRecord } from '../../src/runtime/advance.js';
 import { requestDrain } from '../../src/runtime/drain.js';
@@ -10,6 +10,8 @@ import { coordinatorOnlyWorkCommand, preBashHook } from '../../src/runtime/hooks
 import { latestLeaseUsage, setBudget } from '../../src/runtime/spend.js';
 import type { TaskBrief } from '../../src/runtime/scheduler.js';
 import { commitFile, makeDefaultEnv, makeEnv, result, type Env } from './fixtures.js';
+// Unit tier: git runs on the in-memory fake (./fake-git.ts).
+vi.mock('../../src/core/exec.js', async (orig) => (await import('./fake-git.js')).mockExec(await orig()));
 
 const paths = (env: Env): HandoffPaths => ({ briefs: join(env.root, 'state', 'briefs'), results: join(env.root, 'state', 'results') });
 const deps = (env: Env) => ({ db: env.db, config: env.config });
