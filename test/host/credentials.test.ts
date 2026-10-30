@@ -2,6 +2,8 @@ import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { PassThrough } from 'node:stream';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { addOrigin } from './fs-git.js';
+vi.mock('../../src/core/exec.js', async (orig) => (await import('./fs-git.js')).withFsGit(await orig()));
 
 // Secrets modes under the default (owner) access, whoever runs the suite: see pin-secrets-access.ts.
 vi.mock('../../src/host/secrets-access.js', async (orig) => (await import('./pin-secrets-access.js')).pinOwnerAccess(await orig()));
@@ -524,7 +526,7 @@ describe('init and doctor integration', () => {
 
   it('interactive init on a GitHub repo prints guidance and stores the token via the secret prompt', async () => {
     const repo = makeRepo(env.root);
-    git(repo, 'remote', 'add', 'origin', REMOTE);
+    addOrigin(repo, REMOTE);
     const a = answering([TOKEN]);
     const r = await runInit({ path: repo, yes: false, visibility: 'private', io: a.io, dockerProbe: dockerUp, fetch: okRepo().f });
     expect(r.github).toMatchObject({ status: 'stored', provisioned: { backend: 'file' } });
@@ -571,7 +573,7 @@ describe('init and doctor integration', () => {
 
   it('declining the offer stores nothing; doctor reports missing', async () => {
     const repo = makeRepo(env.root);
-    git(repo, 'remote', 'add', 'origin', REMOTE);
+    addOrigin(repo, REMOTE);
     const a = answering([], 'n');
     const r = await runInit({ path: repo, yes: false, visibility: 'private', io: a.io, dockerProbe: dockerUp, fetch: okRepo().f });
     expect(r.github?.status).toBe('skipped');
@@ -704,7 +706,7 @@ describe('doctor ci.requiredChecks (read-only, mocked GitHub API)', () => {
 
   it('host fallback reports required checks, only issues GETs, and never prints the token', async () => {
     const repo = makeRepo(env.root);
-    git(repo, 'remote', 'add', 'origin', REMOTE);
+    addOrigin(repo, REMOTE);
     await runInit({ path: repo, yes: false, visibility: 'private', io, dockerProbe: dockerUp, fetch: okRepo().f });
     const ok = api({
       '/repos/acme/demo/branches/main': [200, { protected: true, protection: { required_status_checks: { enforcement_level: 'everyone', contexts: ['build'] } } }],
@@ -729,7 +731,7 @@ describe('doctor ci.requiredChecks (read-only, mocked GitHub API)', () => {
 
   it('uses `minions ci status --json` in a running container', async () => {
     const repo = makeRepo(env.root);
-    git(repo, 'remote', 'add', 'origin', REMOTE);
+    addOrigin(repo, REMOTE);
     await runInit({ path: repo, yes: false, visibility: 'private', io, dockerProbe: dockerUp, fetch: okRepo().f });
     const rc = { repository: 'acme/demo', baseBranch: 'main', state: 'configured', requiredChecks: ['ci/test'], protection: null, rulesets: { contexts: ['ci/test'] }, workflows: 3, errors: [] };
     const rec = recorder((c) => {

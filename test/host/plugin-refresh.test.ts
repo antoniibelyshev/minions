@@ -4,7 +4,8 @@
 // Templates are switched with MINIONS_TEMPLATES to stand for an old and a new installed package.
 import { appendFileSync, cpSync, existsSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+vi.mock('../../src/core/exec.js', async (orig) => (await import('./fs-git.js')).withFsGit(await orig()));
 import { projectPaths } from '../../src/core/paths.js';
 import { pluginDoctorCheck } from '../../src/host/doctor.js';
 import { checkPlugin, pluginMismatch, refreshDerived, runInit } from '../../src/host/install.js';

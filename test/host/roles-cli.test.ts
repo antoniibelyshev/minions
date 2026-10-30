@@ -6,7 +6,9 @@
 // Temp MINIONS_HOME; the fake runtime answers from a real runtime DB and the regenerated runtime config.
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { headSha, fsStatus } from './fs-git.js';
+vi.mock('../../src/core/exec.js', async (orig) => (await import('./fs-git.js')).withFsGit(await orig()));
 import { validateConfig } from '../../src/config/resolve.js';
 import { projectPaths, repoPaths } from '../../src/core/paths.js';
 import { runInit } from '../../src/host/install.js';
@@ -88,7 +90,7 @@ describe('config roles apply (host)', () => {
     const id = await propose(project);
     const { runtime, calls } = fakeRuntime(project);
     const before = readJson(file);
-    const head = git(repo, 'rev-parse', 'HEAD');
+    const head = headSha(repo);
     const { d, asked, shown } = deps(runtime, true);
     const r = await applyRoleProposal(project, id, {}, d);
 
@@ -121,20 +123,20 @@ describe('config roles apply (host)', () => {
     // Restart required but never performed; nothing committed.
     expect(r.nextSteps.join('\n')).toMatch(/Restart required.*minions settings restart/);
     expect(calls.some((c) => c.includes('restart'))).toBe(false);
-    expect(git(repo, 'rev-parse', 'HEAD')).toBe(head);
+    expect(headSha(repo)).toBe(head);
   });
 
   it('shared install: writes .minions/agents/<name>.md and reminds to commit, without committing', async () => {
     const { repo, project, file } = await install('shared');
     const id = await propose(project, { ...RESEARCHER, workflows: undefined });
-    const head = git(repo, 'rev-parse', 'HEAD');
+    const head = headSha(repo);
     const r = await applyRoleProposal(project, id, { yes: true }, deps(fakeRuntime(project).runtime, null).d);
     expect(file).toBe(repoPaths(repo).configJson);
     expect(r.promptFile).toBe(join(repo, '.minions', 'agents', 'researcher.md'));
     expect(existsSync(r.promptFile)).toBe(true);
     expect(r.nextSteps[0]).toBe(`Commit ${file} and ${r.promptFile} so the role reaches everyone using this repository.`);
-    expect(git(repo, 'rev-parse', 'HEAD')).toBe(head);
-    expect(git(repo, 'status', '--porcelain')).toContain('.minions/');
+    expect(headSha(repo)).toBe(head);
+    expect(fsStatus(repo).join('\n')).toContain('.minions/');
   });
 
   it('declined, unconfirmable (--json without --yes) and --dry-run write nothing', async () => {

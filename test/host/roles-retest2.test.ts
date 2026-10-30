@@ -1,7 +1,8 @@
 // task-33.6 scoped retest 3: format-character boundaries, 240/241 cap in every single-line field, stored-state rendering.
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+vi.mock('../../src/core/exec.js', async (orig) => (await import('./fs-git.js')).withFsGit(await orig()));
 import { validateConfig } from '../../src/config/resolve.js';
 import { projectPaths } from '../../src/core/paths.js';
 import { loadProjectJson } from '../../src/host/project.js';

@@ -2,6 +2,7 @@
 // container memory limit; doctor warns when it fills up, when the container predates the size cap, and
 // when the disk-backed TMPDIR is missing or nearly full. All fakes: no Docker.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+vi.mock('../../src/core/exec.js', async (orig) => (await import('./fs-git.js')).withFsGit(await orig()));
 import type { RunOptions, RunResult } from '../../src/core/exec.js';
 
 vi.mock('../../src/plugin/generate.js', async () => {

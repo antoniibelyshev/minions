@@ -1,6 +1,7 @@
 // task-14.3: `harness.*` checks in `minions status --check` / `doctor` (docs/design/agent-runtimes.md D7):
 // helper absent, present but failing, and passing, plus the runDoctor wiring. All fakes: no Docker.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+vi.mock('../../src/core/exec.js', async (orig) => (await import('./fs-git.js')).withFsGit(await orig()));
 import type { RunOptions, RunResult } from '../../src/core/exec.js';
 import type { WorkProbeReport } from '../../src/runtime/sandbox/probe.js';
 import type { SelfTestReport } from '../../src/runtime/sandbox/selftest.js';

@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { DockerProbe } from '../../src/host/discovery.js';
 import { fromTemplate } from '../repo-template.js';
+import { writeGitRepo } from './fs-git.js';
 
 export const git = (cwd: string, ...args: string[]) =>
   execFileSync('git', args, { cwd, encoding: 'utf8', env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' } }).trim();
@@ -21,16 +22,11 @@ export function makeRepo(root: string, name = 'repo'): string {
 }
 
 function buildRepo(repo: string): void {
-  execFileSync('mkdir', ['-p', repo]);
-  git(repo, 'init', '-q', '-b', 'main');
-  git(repo, 'config', 'user.name', 'Ada Lovelace');
-  git(repo, 'config', 'user.email', 'ada@example.com');
-  git(repo, 'config', 'commit.gpgsign', 'false');
-  writeFileSync(join(repo, 'README.md'), '# demo\n');
-  writeFileSync(join(repo, 'package.json'), JSON.stringify({ name: 'demo', scripts: { test: 'vitest run', lint: 'eslint .' } }, null, 2));
-  writeFileSync(join(repo, '.gitignore'), '.env\n');
-  git(repo, 'add', '.');
-  git(repo, 'commit', '-q', '-m', 'init');
+  writeGitRepo(repo, {
+    'README.md': '# demo\n',
+    'package.json': JSON.stringify({ name: 'demo', scripts: { test: 'vitest run', lint: 'eslint .' } }, null, 2),
+    '.gitignore': '.env\n',
+  });
 }
 
 export const dockerUp: DockerProbe = async () => ({ daemon: true, serverVersion: '29.8.2', compose: true, composeVersion: '5.5.1' });

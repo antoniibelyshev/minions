@@ -1,4 +1,6 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { addOrigin } from './fs-git.js';
+vi.mock('../../src/core/exec.js', async (orig) => (await import('./fs-git.js')).withFsGit(await orig()));
 import { existsSync, mkdirSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { profileDefaults } from '../../src/config/profiles.js';
@@ -322,8 +324,7 @@ describe('wizard', () => {
 
   it('offers branch/pull-request delivery only with a GitHub remote and a stored token', async () => {
     const repo = makeRepo(env.root);
-    const { execFileSync } = await import('node:child_process');
-    execFileSync('git', ['-C', repo, 'remote', 'add', 'origin', 'git@github.com:acme/demo.git']);
+    addOrigin(repo, 'git@github.com:acme/demo.git');
     const discovery = await discover(repo);
     const run = async (githubCredential: boolean, mode = 'pull-request') => {
       const questions: string[] = [], info: string[] = [];
@@ -355,8 +356,7 @@ describe('wizard', () => {
 
   it('does not offer branch/pull-request under a profile that denies git.push (supervised)', async () => {
     const repo = makeRepo(env.root);
-    const { execFileSync } = await import('node:child_process');
-    execFileSync('git', ['-C', repo, 'remote', 'add', 'origin', 'git@github.com:acme/demo.git']);
+    addOrigin(repo, 'git@github.com:acme/demo.git');
     const discovery = await discover(repo);
     const questions: string[] = [], info: string[] = [];
     const io: WizardIO = { ask: async (q, def) => { questions.push(q); return def; }, info: (l) => info.push(l) };

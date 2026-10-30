@@ -5,6 +5,8 @@ import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { Command } from 'commander';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { addOrigin, commitAll, fsStatus } from './fs-git.js';
+vi.mock('../../src/core/exec.js', async (orig) => (await import('./fs-git.js')).withFsGit(await orig()));
 
 vi.mock('../../src/plugin/generate.js', async () => {
   const { mkdir, writeFile } = await import('node:fs/promises');
@@ -82,7 +84,7 @@ function fakeRuntime(state = { running: false, imported: false, coordinator: fal
 
 function githubRepo(name = 'repo'): string {
   const repo = makeRepo(env.root, name);
-  git(repo, 'remote', 'add', 'origin', REMOTE);
+  addOrigin(repo, REMOTE);
   return repo;
 }
 
@@ -179,7 +181,7 @@ describe('minions setup: declined integrations leave nothing behind', () => {
     expect(existsSync(join(paths.dir, 'credentials.json'))).toBe(false);
     expect(allFiles(paths.secretsDir)).toEqual([]);
     expect(existsSync(paths.configLocalJson)).toBe(false);
-    expect(git(repo, 'status', '--porcelain')).toBe('');
+    expect(fsStatus(repo).join('\n')).toBe('');
     const eff = JSON.parse(readFileSync(paths.runtimeConfigJson, 'utf8'));
     expect(eff.communication.channel).toBe('auto'); // the default; terminal while no bot token is stored
     expect(eff.delivery.mode).toBe('local');
@@ -360,7 +362,7 @@ describe('minions setup: init options (--config, --attach, --new-identity)', () 
     const { cpSync } = await import('node:fs');
     const a = githubRepo('a');
     const ra = await runSetup({ path: a, yes: true, visibility: 'shared', runtime: fakeRuntime().runtime, dockerProbe: dockerUp });
-    git(a, 'add', '.minions'); git(a, 'commit', '-q', '-m', 'minions');
+    commitAll(a, 'minions');
     const b = join(env.root, 'b');
     cpSync(a, b, { recursive: true });
     await expect(runSetup({ path: b, yes: true, runtime: fakeRuntime().runtime, dockerProbe: dockerUp })).rejects.toMatchObject({ code: 'CONFLICT' });

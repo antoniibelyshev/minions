@@ -1,6 +1,8 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { addOrigin, originUrl, commitAll } from './fs-git.js';
+vi.mock('../../src/core/exec.js', async (orig) => (await import('./fs-git.js')).withFsGit(await orig()));
 
 vi.mock('../../src/plugin/generate.js', async () => {
   const { mkdir, writeFile } = await import('node:fs/promises');
@@ -93,7 +95,7 @@ function githubApi(opts: { requiredChecks?: string[]; rules?: number } = {}) {
 
 function githubRepo(name?: string): string {
   const repo = makeRepo(env.root, name);
-  git(repo, 'remote', 'add', 'origin', REMOTE);
+  addOrigin(repo, REMOTE);
   return repo;
 }
 
@@ -515,7 +517,7 @@ describe('minions setup', () => {
     const repo = githubRepo();
     mkdirSync(join(repo, '.github', 'workflows'), { recursive: true });
     writeFileSync(join(repo, '.github', 'workflows', 'ci.yml'), 'on: pull_request\n');
-    git(repo, 'add', '.'); git(repo, 'commit', '-q', '-m', 'ci');
+    commitAll(repo, 'ci');
     const rt = fakeRuntime();
     const api = githubApi({ requiredChecks: ['test'] });
     const r = await runSetup({ path: repo, yes: false, runtime: rt.runtime, dockerProbe: dockerUp, fetch: api.f,
@@ -529,7 +531,7 @@ describe('minions setup', () => {
 
     // Without a token the required checks are unknown: the plan is shown as conditional, never as "none".
     const repo2 = makeRepo(env.root, 'other');
-    git(repo2, 'remote', 'add', 'origin', 'https://github.com/acme/other.git');
+    addOrigin(repo2, 'https://github.com/acme/other.git');
     const r2 = await runSetup({ path: repo2, yes: false, runtime: fakeRuntime().runtime, dockerProbe: dockerUp,
       io: scripted({ 'Installation visibility': 'private', 'Use CI?': 'y' }).io });
     const lines = step(r2, 'ci').lines!.join('\n');
@@ -581,7 +583,7 @@ describe('minions setup', () => {
     }, [GH_TOKEN]);
     const r = await runSetup({ path: repo, yes: false, io: a.io, runtime: fakeRuntime().runtime, dockerProbe: dockerUp, fetch: githubApi().f,
       platform: 'darwin', openUrl: async (u) => { opened.push(u); } });
-    expect(git(repo, 'remote', 'get-url', 'origin')).toBe('https://github.com/acme/demo.git');
+    expect(originUrl(repo)).toBe('https://github.com/acme/demo.git');
     expect(step(r, 'github')).toMatchObject({ status: 'done', lines: expect.arrayContaining(['origin added: https://github.com/acme/demo.git']) });
     expect(step(r, 'delivery')).toMatchObject({ status: 'changed', detail: expect.stringContaining('local -> pull-request') });
     expect(opened).toEqual([]);

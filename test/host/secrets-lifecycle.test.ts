@@ -1,7 +1,8 @@
 // Lifecycle of the plaintext container copies of the credentials: failed up, stale copies, mount check.
 import { existsSync } from 'node:fs';
 import { mkdir, writeFile } from 'node:fs/promises';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+vi.mock('../../src/core/exec.js', async (orig) => (await import('./fs-git.js')).withFsGit(await orig()));
 import { CONTAINER, projectPaths } from '../../src/core/paths.js';
 import { Compose } from '../../src/host/docker.js';
 import * as C from '../../src/host/credentials.js';
