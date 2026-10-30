@@ -56,7 +56,7 @@ What exists:
 | Git outside the sandbox | `src/runtime/git-hardening.ts` | Neutralizes the clone's config for git calls minions itself makes. |
 | Credentials | `src/host/credentials.ts` (`selectStore`, `moveKeychainTokensToFileStore`) | Uses the 0600 file store while any project runs on the host. Keychain items are moved there. |
 | Permission mode | `decidePermissionMode` in `src/runtime/coordinator.ts` | Built (owner decision 2026-10-29, see [Auto permission mode on the host](#auto-permission-mode-on-the-host)): the configured mode, as in the container. |
-| Telegram | `resolveChannel` in `src/telegram/channel.ts` (`HOST_TELEGRAM_REASON`), `HOST_CHANNEL_WARNING` in `src/host/channel-cli.ts` | Always terminal on the host. `telegram install` refuses. |
+| Telegram | `src/telegram/channel/launch.ts`, `decideTelegram`/`runCoordinator` in `src/runtime/coordinator.ts`, `HOST_CHANNEL_NOTE` in `src/host/channel-cli.ts` | Built (task-6, phase 1: text DMs and `reply`): the minions channel server via an inline `--mcp-config` plus `--dangerously-load-development-channels server:minions-telegram`; terminal with a precise reason when Claude Code is older than 2.1.292, the shim or the token is missing. Pairing: `minions telegram access` (TTY only). `telegram install` refuses. |
 | Change requests | `src/host/settings-cli.ts` (the `SettingsRuntime` host branch) | `settings requests`/`apply` already reach the host runtime through the shim. |
 | Sync | `upgradeSyncOnly` in `src/host/commands.ts` | `upgrade --sync-only` already exports from the host workspace. |
 | State move | `src/runtime/state-backup.ts`, `export --state` / `import --state` | Copies the DB snapshot, backlog, notes, briefs and results. Works for both runtimes. |
@@ -244,7 +244,10 @@ What is missing (the gaps this design closes):
 
 ## Telegram on the host
 
-- **Launch.** In host mode, `buildClaudeCommand` adds `--mcp-config <state>/coordinator-mcp.json` (server
+- **Built (task-6).** The MCP config is passed inline in argv (paths and the launch id only), not as a file: the state
+  dir is agent-writable on the host, so a file there could be swapped for another command. Claude Code asks to confirm
+  the development channel at every start, so a detached start needs the owner to attach once.
+- **Launch.** In host mode, `buildClaudeCommand` adds `--mcp-config <inline JSON>` (server
   `minions-telegram`, command = the shim, `telegram channel serve`) next to `HOST_CLAUDE_FLAGS`, plus the channel
   flag. Task-67.3 builds this launch swap for Docker. The host phase only reuses it.
 - **Token.** `MINIONS_TELEGRAM_TOKEN_FILE=<project>/secrets/telegram-bot-token` goes into the MCP config `env`. That

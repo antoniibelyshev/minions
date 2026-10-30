@@ -492,9 +492,10 @@ describe('self-update apply: failure paths and isolation', () => {
     const to = gitIn(fx.repo, 'rev-parse', 'HEAD');
     const lines = npmLog().trim().split('\n');
     expect(lines.map((l) => l.split(' |')[0])).toEqual(['ci', 'run typecheck', 'test']);
-    const homes = [...new Set(lines.map((l) => / home=(\S+)/.exec(l)?.[1]))];
+    // The home may hold a space (a host TMPDIR under ~/Library/Application Support): match up to the next field.
+    const homes = [...new Set(lines.map((l) => / home=(.+?) \| runtime=/.exec(l)?.[1]))];
     expect(homes).toHaveLength(1);
-    expect(homes[0]).toMatch(new RegExp(`^${join(stateDir(), 'gate')}/${to.slice(0, 12)}-[0-9a-f]{8}\\.home$`));
+    expect(homes[0]).toMatch(new RegExp(`^${join(stateDir(), 'gate').replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/${to.slice(0, 12)}-[0-9a-f]{8}\\.home$`));
     expect(existsSync(homes[0]!)).toBe(false);
     for (const l of lines) expect(l).toContain('runtime=unset | handoff=unset');
     expect(readFileSync(join(fx.home, 'registry.json'), 'utf8')).toBe(registry);

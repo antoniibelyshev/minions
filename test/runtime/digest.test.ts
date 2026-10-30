@@ -6,7 +6,7 @@ import { MinionsConfigSchema } from '../../src/config/schema.js';
 import { LAST_OWNER_MESSAGE_META, USAGE_META_PREFIX } from '../../src/runtime/coordinator-usage.js';
 import {
   composeDigest, DEFAULT_HOLDS, digestInput, digestStatus, holdFor, holdUntil, lastDigestSlot, nextDigestAt, parsePoll, prepareDigest, reholdExpired,
-  AUTO_PROMOTE_EVENT, MAX_DIGEST_WAKES_PER_SLOT, type DigestInput,
+  MAX_DIGEST_WAKES_PER_SLOT, type DigestInput,
 } from '../../src/runtime/digest.js';
 import { ack, enqueue, isHeld, MAX_TEXT_LENGTH, NOTIFICATION_KINDS, pending, type OutboxItem } from '../../src/runtime/outbox.js';
 import { spendReport } from '../../src/runtime/spend.js';
@@ -270,7 +270,6 @@ function input(over: Partial<DigestInput> = {}): DigestInput {
     ],
     merged: [{ taskId: 'task-3', prUrl: 'https://github.com/o/r/pull/3', at: '2026-10-26T20:00:00.000Z' }],
     approvals: [{ taskId: 'task-5', head: 'a'.repeat(40), scope: 'merge' }],
-    autoPromoted: [{ taskId: 'task-10', at: '2026-10-26T21:00:00.000Z' }],
     spend: { window: 'last-digest', tokens: 1_234_567, budget: { percent: 45, text: '5M tokens', exhausted: false }, wakes: 2, wakeTokens: 310_000 },
     runnable: [],
     ...over,
@@ -299,9 +298,6 @@ describe('composeDigest (deterministic)', () => {
       '',
       'Updates:',
       '- Delivered task-4 Login form: https://github.com/o/r/pull/4',
-      '',
-      'Auto-promoted (reply "cancel <id>" or "hold <id>"):',
-      '- task-10 Search',
       '',
       'Spend since last digest:',
       '- 1.2M tokens; coordinator wakes 2 (310k tokens)',
@@ -339,7 +335,7 @@ describe('composeDigest (deterministic)', () => {
 
   it('runnable stages are "next up" when there are any; an empty state still says something', () => {
     expect(composeDigest(input({ runnable: [{ taskId: 'task-8', role: 'engineer' }] })).text).toContain('Next up:\n- task-8 Export (engineer)\n');
-    const empty = composeDigest(input({ items: [], tasks: [], merged: [], approvals: [], autoPromoted: [], spend: null }));
+    const empty = composeDigest(input({ items: [], tasks: [], merged: [], approvals: [], spend: null }));
     expect(empty.text).toBe('Digest Tue 27 Oct 08:00 (Europe/Berlin)\n\nNothing new.\n\nref: #digest');
     expect(empty.keys).toEqual(['digest:2026-10-27T08:00']);
     const used = composeDigest(input({ spend: { window: 'day', tokens: 5_000_000, budget: { percent: 100, text: '5M tokens', exhausted: true }, wakes: 1, wakeTokens: 0 } }));
@@ -397,7 +393,7 @@ describe('composeDigest (deterministic)', () => {
 
   it('approvals that alone exceed the limit: as many as fit, the rest counted', () => {
     const approvals = Array.from({ length: 80 }, (_, n) => ({ taskId: `task-a${n}`, head: 'd'.repeat(40), scope: 'publish' as const }));
-    const d = composeDigest(input({ items: [], approvals, merged: [], autoPromoted: [], spend: null }));
+    const d = composeDigest(input({ items: [], approvals, merged: [], spend: null }));
     expect(d.text.length).toBeLessThanOrEqual(MAX_TEXT_LENGTH);
     const shown = approvals.filter((a) => d.text.includes(`/approve ${a.taskId} `)).length;
     expect(shown).toBeGreaterThan(10);
@@ -419,13 +415,13 @@ describe('prepareDigest: stored under its key; acking the keys marks the time do
     enqueue(env.db, { key: 'question:task-6:1', kind: 'question', taskId: 'task-6', text: 'Which?\n1. A (recommended)\n2. B', holdUntil: '2026-10-28T07:00:00.000Z' }, () => t0);
     env.db.addEvent('ci-observation', 'task-3', { prUrl: 'https://github.com/o/r/pull/3', statusChange: { from: 'delivered', to: 'done' } }, '2026-10-27T01:00:00.000Z');
     env.db.addEvent('merge', 'task-5', { state: 'awaiting-approval', head: 'b'.repeat(40), prUrl: 'u' }, '2026-10-27T02:00:00.000Z');
-    env.db.addEvent(AUTO_PROMOTE_EVENT, 'task-11', {}, '2026-10-27T03:00:00.000Z');
+    env.db.addEvent('auto-promote', 'task-11', {}, '2026-10-27T03:00:00.000Z'); // left over from the removed caps (task-130): ignored
     const tasks = [{ id: 'task-5', title: 'Five', status: 'delivered' as const, prUrl: 'u', priority: null }];
     const d = prepareDigest(env.db, env.config, { tasks, runnable: [], spend: null }, t0);
     expect(d.key).toBe('digest:2026-10-27T08:00');
     expect(d.text).toContain('- task-3 https://github.com/o/r/pull/3');
     expect(d.text).toContain(`/approve task-5 ${'b'.repeat(40)} merge`);
-    expect(d.text).toContain('Auto-promoted');
+    expect(d.text).not.toMatch(/Auto-promoted|task-11/);
     expect(d.text).toContain('Q1 (task-6) Which?');
     expect(d.keys).toEqual(['digest:2026-10-27T08:00', 'question:task-6:1']);
     // Composing again before the send replaces the stored text (same key), it does not add a row.

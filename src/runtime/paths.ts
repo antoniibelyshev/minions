@@ -1,6 +1,6 @@
 import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, isAbsolute, join } from 'node:path';
 import { APPROVAL_PUBLIC_KEY_NAME } from '../core/approval.js';
 import { CLAUDE_HEADLESS_TOKEN_FILE, containerPaths } from '../core/paths.js';
 
@@ -57,6 +57,8 @@ export function runtimePaths(env: NodeJS.ProcessEnv = process.env, opts: { inCon
   const workspace = env.MINIONS_WORKSPACE || c.workspace;
   const secretsDir = env.MINIONS_SECRETS_DIR || c.secretsDir;
   const pluginDir = env.MINIONS_PLUGIN_DIR || c.pluginDir;
+  // Host runtime: <MINIONS_HOME>/projects/<id> (the channel server's state dir and shim live under it).
+  const hostProjectDir = env.MINIONS_RUNTIME === 'host' && env.MINIONS_PROJECT_DIR && isAbsolute(env.MINIONS_PROJECT_DIR) ? env.MINIONS_PROJECT_DIR : null;
   // Scratch root: the container's TMPDIR on the cache volume. A redirected state dir (host runtime,
   // tests) keeps it inside that state dir (<state>/cache/tmp), never in the container path.
   const tmp = env.MINIONS_SCRATCH_DIR || (env.MINIONS_STATE_DIR ? join(state, 'cache', 'tmp') : c.scratch);
@@ -107,7 +109,15 @@ export function runtimePaths(env: NodeJS.ProcessEnv = process.env, opts: { inCon
      * that state dir, so a test never edits the real ~/.claude/settings.json.
      */
     claudeUserSettings: join(env.CLAUDE_CONFIG_DIR || (env.MINIONS_STATE_DIR ? join(state, 'claude') : env.MINIONS_RUNTIME === 'host' ? join(homedir(), '.claude') : c.claudeHome), 'settings.json'),
-    telegramStateDir: env.TELEGRAM_STATE_DIR || join(env.CLAUDE_CONFIG_DIR || (env.MINIONS_RUNTIME === 'host' ? join(homedir(), '.claude') : c.claudeHome), 'channels', 'telegram'),
+    /**
+     * Host runtime (task-6): the minions channel server's own per-project dir, <project>/host/claude/channels/telegram,
+     * never the owner's ~/.claude (their own plugin's access.json and bot.pid). It is under the minions data root, so
+     * sandboxed commands can neither read nor write it (hostSettings).
+     */
+    telegramStateDir: env.TELEGRAM_STATE_DIR || (hostProjectDir ? join(hostProjectDir, 'host', 'claude', 'channels', 'telegram')
+      : join(env.CLAUDE_CONFIG_DIR || (env.MINIONS_RUNTIME === 'host' ? join(homedir(), '.claude') : c.claudeHome), 'channels', 'telegram')),
+    /** Host runtime: the `minions` shim that starts the channel server (null elsewhere). */
+    minionsShim: hostProjectDir ? join(hostProjectDir, 'host', 'bin', 'minions') : null,
     /** Written by `minions coordinator run`: what the running coordinator was launched with (no secrets). */
     coordinatorLaunch: join(state, 'coordinator-launch.json'),
     /** Written by `minions coordinator run` when it exits (code, signal, error; no secrets). Read by a detached start. */

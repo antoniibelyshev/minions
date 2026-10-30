@@ -11,7 +11,7 @@ import { sha256 } from '../core/fsutil.js';
 import { hangGuarded } from './hook-guard.js';
 import { redact } from '../core/output.js';
 import type { BuiltinLeaseRole, DrainNoticeVia, LeaseRole, RuntimeDb } from './db.js';
-import { TELEGRAM_TOOL_PREFIX } from './coordinator.js';
+import { TELEGRAM_TOOL_PREFIXES } from './coordinator.js';
 import { runtimePaths } from './paths.js';
 import { capacityOf, scopeOf } from './scheduler.js';
 import { currentBudget } from './spend.js';
@@ -208,7 +208,8 @@ export async function preAgentHook(input: unknown, load: HookLoader): Promise<Ho
 export function preTelegramHook(input: unknown): HookOutput {
   if (!isObj(input)) return deny('minions could not read the Telegram hook input (not a JSON object); refusing the call.');
   const tool = input.tool_name;
-  if (typeof tool !== 'string' || !tool.startsWith(TELEGRAM_TOOL_PREFIX) || tool.length === TELEGRAM_TOOL_PREFIX.length) {
+  // The official plugin's tools (Docker) or the minions channel server's (host runtime, task-6).
+  if (typeof tool !== 'string' || !TELEGRAM_TOOL_PREFIXES.some((p) => tool.startsWith(p) && tool.length > p.length)) {
     const what = typeof tool === 'string' ? `a non-Telegram tool_name (${JSON.stringify(tool.slice(0, 80))})` : 'no tool_name';
     return deny(`minions pre-telegram hook got ${what}; refusing the call.`);
   }

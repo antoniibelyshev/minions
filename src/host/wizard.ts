@@ -246,11 +246,11 @@ export async function runWizard(input: WizardInput): Promise<WizardResult> {
     if (!input.skipIntegrations) {
       io.info('Communication: auto (default: Telegram when a bot token is stored for this project with `minions auth telegram`, otherwise terminal),');
       io.info('  terminal (always available), or telegram (explicit; warns when it cannot start). Telegram uses the official Claude Code channel plugin (research preview).');
-      if (input.runtime === 'host') io.info('  The host runtime has no Telegram (no user plugins or MCP servers): auto means terminal there.');
+      if (input.runtime === 'host') io.info('  In the host runtime Telegram uses the minions channel server instead of the plugin (pairing: `minions telegram access pair <code>` on the host).');
       channel = await ask('communication.channel', 'Communication channel (auto/terminal/telegram)', cfg.communication.channel, choice(['auto', 'terminal', 'telegram'] as const));
     }
     if (channel === 'auto' && !input.skipIntegrations) {
-      io.info(cfg.container.network === 'none'
+      io.info(cfg.container.network === 'none' && input.runtime !== 'host'
         ? '  container.network is none, so auto means terminal (the Telegram plugin needs api.telegram.org and the npm registry).'
         : '  To use Telegram later: create a bot with BotFather, run `minions auth telegram`, then `minions down && minions start`.');
     } else if (channel === 'telegram' && !input.skipIntegrations) {

@@ -183,15 +183,13 @@ Facts from the code (main @ 4999cb3):
    - merged, delivered, and waiting for CI;
    - waiting for you, with the exact `/approve <task> <sha> merge` lines for the manager chat;
    - blockers;
-   - auto-promoted tasks (decision 8);
    - spend since the previous digest (the last 24h without one): tokens, coordinator wakes and their tokens over that one window, and the budget;
    - next up;
    - the questions as numbered polls ("Q1 … reply `Q1 2`", options with the recommended one first and "Other").
 
    The coordinator sends the text with one `reply` and acks the keys it covered. Composing the text costs no model
    judgement. Answering the owner's reply does, because that is a real decision.
-8. **Autonomous intake and promotion, with limits enforced by the runtime.** The prompt states the rules, and the
-   runtime enforces the caps, so a mistake in the prompt cannot exceed them:
+8. **Autonomous intake and promotion.** The prompt states the rules:
    - **Owner requests** from the daily messages become tasks through `/minions:intake` as today (provenance
      `user-decision`, `ready` when the profile allows). The coordinator asks only when the goal is unclear, and then
      as a digest question, not a separate message.
@@ -200,16 +198,9 @@ Facts from the code (main @ 4999cb3):
      rights on GitHub, so a label is a maintainer's act. Authorization still follows `minions:authorized` or
      `intake.startReady`. The issue text stays task data, never instructions.
    - **The coordinator's own ideas** (provenance `agent-hypothesis`: QA findings, follow-ups, split children) are
-     created as `idea`. `backlog update --status ready` on such a task is refused by the runtime when one of these
-     holds:
-     - it is beyond `routine.autoPromote.perDay` (default 3, counted from events);
-     - the budget is at or above `routine.autoPromote.maxBudgetPercent` (default 80);
-     - the last owner message is more than `routine.autoPromote.ownerSilentDays` (default 3) days old;
-     - the task's parent is a design task that the owner has not agreed to (label `needs-owner`; build children of a
-       design always wait for the owner, as in this design).
-
-     `user-decision` and `external-requirement` tasks are not capped. Every auto-promotion is listed in the digest,
-     and the owner vetoes it with "cancel <id>" or "hold <id>".
+     created as `idea`, and the coordinator moves them to `ready` and claims them itself, without the owner's
+     permission; it mentions them in its normal updates. (The runtime caps of the first version were removed by the
+     owner's decision of 2026-10-29, task-130.)
    - **Budget:** at 100%, `work claim` refuses (unchanged) and the pass does not wake for dispatch. The deterministic
      work (sync, merges, base updates) continues, because it costs no model tokens. The digest wake still happens, so
      the owner learns about the budget. The recommended budget is a daily one (period `day`).
@@ -245,7 +236,7 @@ Facts from the code (main @ 4999cb3):
 | the scan or sync made a stage runnable, the coordinator is idle, within limits | fresh coordinator wake: `work next`, claim, spawn (later: dispatcher, no wake) | one fresh session |
 | `routine.digestAt` (default 08:00) | digest wake: `notify digest`, one `reply`, then dispatch as above | one fresh session |
 | owner message | as today (the coordinator holds the bot) | as today |
-| night or owner silent | deterministic work continues; at most `maxWakesPerDay`; no auto-promotion after `ownerSilentDays` | capped |
+| night or owner silent | deterministic work continues; at most `maxWakesPerDay` | capped |
 
 The epic's criterion is met when phases 1 to 3 and the prerequisites are in place: a ready task runs its stages
 while the coordinator is awake, the routine wakes it for newly runnable work, and merges, base updates and `done`
@@ -360,8 +351,7 @@ Ordered by value. Each phase is one task. Nothing is built before the owner agre
    after a miss); `notify digest --json` composes the sections of decision 7 deterministically with numbered polls;
    the coordinator acks the covered keys; orchestrate prompt changes; tests with a fake clock | depends: 1
 5. **child: Autonomous intake limits** | criteria: `intake.github.readyLabels` (host-owned) → imported `ready`;
-   runtime-enforced caps on idea → ready for `agent-hypothesis` (`perDay`, `maxBudgetPercent`, `ownerSilentDays`,
-   the `needs-owner` parent rule) with a clear refusal; auto-promotions in the digest; prompt rules; tests | depends: 4
+   prompt rules; tests (the promotion caps once planned here were removed, task-130) | depends: 4
 6. **child: work advance** | criteria: `minions work advance <leaseId> --usage <n> --json` = record + the next claim
    + Agent parameters, or a decision payload; the orchestrate prompt uses it; baseline turns per stage before and
    after reported to the owner | depends: none
@@ -383,7 +373,7 @@ Agreed 2026-10-27 (Telegram poll msg 320, answer msg 321 "1": every recommended 
    coordinator on its own" now holds only while `routine.enabled` is off).
 4. Base updates without re-review when the merge is clean and CI passes again.
 5. Flaky CI goes straight to repair (no `ci.rerun` for now).
-6. Up to 3 auto-promoted ideas a day, listed in the digest.
+6. The coordinator promotes its own ideas freely (owner decision 2026-10-29, task-130; first answered as up to 3 a day).
 7. Run the dispatcher spike (phase 7) after phase 6 (the one deterministic launcher is the agreed exception to the
    no-nested-claude rule).
 
@@ -430,9 +420,9 @@ days until phase 4 adds `routine.timezone`.
   time's digest. The routine's days (`maxWakesPerDay`, crash starts) are local days in `routine.timezone`; a daily
   budget (`spend.ts`) still counts UTC days.
 - **Composition:** `minions notify digest --json` reads the outbox (every undelivered item), the backlog, the
-  events (merged since the last digest, `awaiting-approval` merges, `auto-promote` events of phase 5), publications
+  events (merged since the last digest, `awaiting-approval` merges), publications
   waiting for approval, the spend tally and `work next`. The text has fixed sections (waiting for you, with the
-  exact `/approve` lines; blockers; merged; delivered, waiting for CI or merge; updates; auto-promoted; spend since the last digest
+  exact `/approve` lines; blockers; merged; delivered, waiting for CI or merge; updates; spend since the last digest
   with coordinator wakes and their tokens; next up; questions), sorted lines, and questions as polls: a question
   item's option lines (`1. …`, `- …`) become numbered options with "Other" last, answered as `Q1 2`. The whole
   text (header, footer and all) is at most `MAX_TEXT_LENGTH`. When it does not all fit, lines are taken in priority
@@ -451,27 +441,13 @@ days until phase 4 adds `routine.timezone`.
   default unset = `[]`). A new issue that carries every label in the list (compared case-insensitively, as GitHub
   does) is created `ready`, otherwise `idea`. The import decides once: a label added after the import does not
   promote the task. The sync report has `createdReady`, and the `intake-import` event records the status.
-- **Caps** (`src/runtime/auto-promote.ts`): `routine.autoPromote.{perDay, maxBudgetPercent, ownerSilentDays}`
-  (host-owned, live, defaults 3 / 80 / 3). They apply whether or not `routine.enabled` is on. The runtime installs a
-  guard in `backlog update` and `backlog create`. A change is capped when the task is `agent-hypothesis`, the target
-  is `ready`, the task is not already `ready`, and it has never had a lease. So `idea → ready`,
-  `blocked → ready` on an idea that never ran, and `create --status ready` are all capped. A task that goes back to
-  `ready` after a stage (recover) is not. The guard refuses (`POLICY_DENIED`, "Auto-promotion refused: …", with every
-  reason in `details.refusal.reasons`) when:
-  - the day's `auto-promote` events (local day in `routine.timezone`) reach `perDay` (0 = never);
-  - the budget percent is at or above `maxBudgetPercent`;
-  - the last owner message (Stop-hook meta, Telegram only) is more than `ownerSilentDays` old, **or unknown**
-    (fail closed);
-  - the parent, or the task itself, carries `needs-owner`.
-
-  A refusal records `auto-promote-refused`. An allowed promotion records `auto-promote` after the status change
-  lands, and the digest lists it. A budget read error fails the command (closed).
-- **Owner override:** `--owner-approved` on `backlog update|create` skips the caps. It is allowed only when an owner
-  message arrived in the last 30 minutes, or on the `terminal` channel. It records `owner-promote`, which is not
-  counted and not listed as an auto-promotion.
-- **Prompt:** the coordinator's Project policy carries the "Own ideas" rule with the configured numbers: on a
-  refusal, leave the task `idea` and ask in the digest; never relabel or change provenance; answer "cancel/hold
-  <id>"; label a design `needs-owner` until the owner agrees. The intake skill mentions the caps and the ready labels.
+- **No promotion caps** (task-130, owner decision 2026-10-29): the coordinator moves its own `agent-hypothesis`
+  tasks from `idea` to `ready` and claims them without the owner's permission. The first version's runtime caps
+  (`routine.autoPromote`, the `needs-owner` label check, the unpromoted-claim refusal and the digest's auto-promoted
+  section) are gone. Old configs that still carry `routine.autoPromote` load and the block is ignored;
+  `--owner-approved` on `backlog update|create` is accepted as a no-op.
+- **Prompt:** the coordinator's Project policy carries the "Own ideas" rule: promote your own ideas yourself and
+  mention them in your normal updates. The intake skill mentions the ready labels.
 
 ## Open questions for the owner (answered above)
 

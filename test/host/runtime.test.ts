@@ -31,7 +31,7 @@ const {
 } = await import('../../src/host/runtime.js');
 const { runRuntimeSet, runRuntimeShow } = await import('../../src/host/runtime-cli.js');
 const { delegateToRuntime } = await import('../../src/host/delegate.js');
-const { coordinatorSettings, buildClaudeCommand, buildCoordinatorCommand, hostSettings } = await import('../../src/runtime/coordinator.js');
+const { coordinatorSettings, buildClaudeCommand, buildCoordinatorCommand, hostSettings, shQuote } = await import('../../src/runtime/coordinator.js');
 const { runDoctor } = await import('../../src/host/doctor.js');
 const { runUninstall } = await import('../../src/host/uninstall.js');
 const { defaults } = await import('../helpers.js');
@@ -267,8 +267,8 @@ describe('host runtime processes', () => {
     writeFileSync(join(bin, 'gh'), '#!/bin/sh\necho real\n'); chmodSync(join(bin, 'gh'), 0o755);
     await prepareHostRuntime(project, { target: { node: process.execPath, cli: '/x' }, pathEnv: `${hostRuntimePaths(id).bin}:${bin}` });
     const sh = readFileSync(hostRuntimePaths(id).ghShim, 'utf8');
-    expect(sh).toContain(`REAL_GH=${join(bin, 'gh')}`);
-    expect(sh).toContain(`TOKEN_FILE=${projectPaths(id).githubTokenFile.includes(' ') ? `'${projectPaths(id).githubTokenFile}'` : projectPaths(id).githubTokenFile}`);
+    expect(sh).toContain(`REAL_GH=${shQuote(join(bin, 'gh'))}`);
+    expect(sh).toContain(`TOKEN_FILE=${shQuote(projectPaths(id).githubTokenFile)}`);
   });
 
   it('delegation: host runtime runs the shim directly; docker runtime needs a running container', async () => {
@@ -319,7 +319,27 @@ describe('host runtime processes', () => {
     expect(by('host.backlog')).toMatchObject({ status: 'fail', hint: expect.stringMatching(/backlog.md/) });
     expect(by('docker.daemon')).toBeUndefined();
     expect(by('coordinator')!.status).toBe('warn');
+    expect(by('workspace.worktrees')).toMatchObject({ status: 'warn', detail: expect.stringMatching(/no repository yet/) });
     expect(calls).not.toContain('docker');
+  });
+
+  it('doctor in host mode reports .git/worktrees: missing is created outside the sandbox, then ok (task-3)', async () => {
+    const { repo, id } = await hostProject();
+    const wsRepo = hostRuntimePaths(id).repo;
+    mkdirSync(wsRepo, { recursive: true });
+    git(wsRepo, 'init', '-q');
+    expect(existsSync(join(wsRepo, '.git', 'worktrees'))).toBe(false);
+    const runner = async () => no;
+    const by = async (n: string) => (await runDoctor({ cwd: repo, runner, probe: async () => { throw new Error('no docker'); } })).checks.find((c) => c.name === n);
+    expect(await by('workspace.worktrees')).toMatchObject({ status: 'warn', detail: expect.stringMatching(/was missing .*created it/) });
+    expect(existsSync(join(wsRepo, '.git', 'worktrees'))).toBe(true);
+    expect(await by('workspace.worktrees')).toMatchObject({ status: 'ok', detail: expect.stringMatching(/\.git\/worktrees exists/) });
+    // A planted symlink is reported, never followed or replaced.
+    const elsewhere = join(env.root, 'elsewhere');
+    mkdirSync(elsewhere);
+    execFileSync('rm', ['-rf', join(wsRepo, '.git', 'worktrees')]);
+    symlinkSync(elsewhere, join(wsRepo, '.git', 'worktrees'));
+    expect(await by('workspace.worktrees')).toMatchObject({ status: 'fail', detail: expect.stringMatching(/symlink or not a directory/) });
   });
 
   it('uninstall --delete-data removes the host workspace; without it the data is kept', async () => {

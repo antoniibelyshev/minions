@@ -811,28 +811,24 @@ describe('owner behaviour defaults (task-34)', () => {
   });
 });
 
-describe('own ideas rule (task-68.6): auto-promotion caps in the coordinator policy', () => {
-  it('states the caps from config, the refusal handling, the override and the digest veto', async () => {
+describe('own ideas rule (task-130): the coordinator promotes its own ideas freely', () => {
+  it('says to promote own ideas without the owner and names no caps, override or digest veto', async () => {
     const coord = await (await gen()).read('coordinator.md');
     const policy = coord.slice(coord.indexOf('## Project policy'), coord.indexOf('## Owner defaults'));
     expect(policy).toContain('**Own ideas.**');
-    expect(policy).toMatch(/beyond 3 a day, at 80% budget or more, when the owner has been silent for more than 3 days, or when its parent is labelled `needs-owner`/);
-    expect(policy).toMatch(/On a refusal leave the task as `idea` and put it to the owner as a digest question; never change its provenance or labels/);
-    expect(policy).toContain('`--owner-approved`');
-    expect(policy).toMatch(/"cancel <id>" set it `cancelled`, "hold <id>" set it back to `idea`/);
+    expect(policy).toMatch(/Move one to `ready` yourself when it is worth doing \(no owner permission needed\) and mention it in your normal updates/);
+    expect(coord).not.toMatch(/Auto-promotion refused|--owner-approved|needs-owner|"cancel <id>"|"hold <id>"|auto-promot/i);
     expect(coord).not.toContain('{{ownIdeasRule}}');
   });
 
-  it('follows the configured caps, and says auto-promotion is off at perDay 0', async () => {
-    const c = defaults(); c.routine = { autoPromote: { perDay: 1, maxBudgetPercent: 50, ownerSilentDays: 7 } };
-    expect(await (await gen(c)).read('coordinator.md')).toMatch(/beyond 1 a day, at 50% budget or more, when the owner has been silent for more than 7 days/);
-    const off = defaults(); off.routine = { autoPromote: { perDay: 0 } };
-    expect(await (await gen(off)).read('coordinator.md')).toContain('Auto-promotion is off in this project');
+  it('an old config that still carries routine.autoPromote generates the same rule', async () => {
+    const c = defaults(); c.routine = { autoPromote: { perDay: 0 } };
+    expect(await (await gen(c)).read('coordinator.md')).toMatch(/Move one to `ready` yourself/);
   });
 
-  it('the intake skill mentions the caps and readyLabels', async () => {
+  it('the intake skill names no caps and mentions readyLabels', async () => {
     const intake = await (await gen()).read('skills/intake/SKILL.md');
-    expect(intake).toMatch(/moving one to `ready` is an auto-promotion that the runtime caps/);
+    expect(intake).not.toMatch(/auto-promotion|runtime caps/);
     expect(intake).toContain('`intake.github.readyLabels`');
   });
 });

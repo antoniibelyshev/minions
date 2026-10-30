@@ -13,7 +13,7 @@ import {
 } from '../../src/runtime/integrator.js';
 import { pending } from '../../src/runtime/outbox.js';
 import { isAlive, procIdentity } from '../../src/runtime/runner/record.js';
-import { defaults, HAS_PROCFS } from '../helpers.js';
+import { defaults, HAS_PROCFS, shq } from '../helpers.js';
 import { gitSync, initRepo, tmp } from './fixtures.js';
 
 const branchOf = (task: string) => `agent/${task}-thing`;
@@ -171,7 +171,7 @@ describe('runIntegrator: landing and the verify runner', () => {
 
   it('a recreated integration worktree runs setupCommands again (the setup marker belongs to the worktree)', async () => {
     const counter = join(tmp('minions-integrator-count-'), 'count');
-    const s = setup({ setupCommands: [`mkdir -p node_modules && touch node_modules/installed && echo x >> ${counter}`], commands: ['test -f node_modules/installed'] });
+    const s = setup({ setupCommands: [`mkdir -p node_modules && touch node_modules/installed && echo x >> ${shq(counter)}`], commands: ['test -f node_modules/installed'] });
     s.queue('task-1');
     await runIntegrator(s.deps);
     expect(rowOf(s.db, 'task-1').phase).toBe('landed');

@@ -12,7 +12,7 @@ import {
 } from '../../src/runtime/github.js';
 import { importWorkspace } from '../../src/runtime/workspace.js';
 import { git as realGit, workspaceLayout } from '../../src/runtime/worktree.js';
-import { defaults } from '../helpers.js';
+import { defaults, shq } from '../helpers.js';
 import { gitSync, initRepo, tmp } from './fixtures.js';
 
 const TOKEN = 'github_pat_' + 'A1b2C3d4E5f6G7h8I9j0'.repeat(3);
@@ -248,7 +248,7 @@ describe('gh wrapper (docker/gh-wrapper.sh)', () => {
     expect(src).toContain('REAL_GH=/opt/gh/bin/gh\n');
     expect(src).toContain(`TOKEN_FILE=${GITHUB_TOKEN_CONTAINER_PATH}\n`);
     const w = join(dir, 'gh.sh');
-    writeFileSync(w, src.replace('REAL_GH=/opt/gh/bin/gh', `REAL_GH=${process.execPath}`).replace(`TOKEN_FILE=${GITHUB_TOKEN_CONTAINER_PATH}`, `TOKEN_FILE=${tokenPath}`));
+    writeFileSync(w, src.replace('REAL_GH=/opt/gh/bin/gh', `REAL_GH=${shq(process.execPath)}`).replace(`TOKEN_FILE=${GITHUB_TOKEN_CONTAINER_PATH}`, `TOKEN_FILE=${shq(tokenPath)}`));
     return (...args: string[]) => {
       const env = { ...process.env };
       delete env.GH_TOKEN;

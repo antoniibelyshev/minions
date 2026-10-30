@@ -33,7 +33,7 @@ const { hookLog } = await import('../../src/runtime/hooks.js');
 const { copyRegularFileNoFollow, ensureRealDir } = await import('../../src/core/fsutil.js');
 const Cred = await import('../../src/host/credentials.js');
 const { ClaudeAuthSchema } = await import('../../src/host/auth.js');
-const { defaults } = await import('../helpers.js');
+const { defaults, shq } = await import('../helpers.js');
 const { dockerDown, makeRepo, withHome } = await import('./fixtures.js');
 
 let env: ReturnType<typeof withHome>;
@@ -191,11 +191,11 @@ describe('host-runtime git hardening (H2)', () => {
     mkdirSync(join(repo, 'hooks'));
     for (const hk of ['post-merge', 'post-checkout', 'pre-push', 'reference-transaction']) { writeFileSync(join(repo, 'hooks', hk), `#!/bin/sh\ntouch '${marker}'-hook-${hk}\n`); chmodSync(join(repo, 'hooks', hk), 0o755); }
     rawGit(repo, 'config', 'core.hooksPath', join(repo, 'hooks'));
-    rawGit(repo, 'config', 'core.fsmonitor', `${evil} fsmonitor`);
-    rawGit(repo, 'config', 'filter.evil.smudge', `${evil} smudge`);
-    rawGit(repo, 'config', 'filter.evil.clean', `${evil} clean`);
-    rawGit(repo, 'config', 'credential.helper', `!${evil} cred`);
-    rawGit(repo, 'config', 'core.sshCommand', `${evil} ssh`);
+    rawGit(repo, 'config', 'core.fsmonitor', `${shq(evil)} fsmonitor`);
+    rawGit(repo, 'config', 'filter.evil.smudge', `${shq(evil)} smudge`);
+    rawGit(repo, 'config', 'filter.evil.clean', `${shq(evil)} clean`);
+    rawGit(repo, 'config', 'credential.helper', `!${shq(evil)} cred`);
+    rawGit(repo, 'config', 'core.sshCommand', `${shq(evil)} ssh`);
     writeFileSync(join(repo, '.gitattributes'), '* filter=evil\n');
     return { repo, marker };
   }
@@ -421,10 +421,10 @@ describe('Keychain avoidance (H3)', () => {
 // ---------------------------------------------------------------- L5 / Telegram
 
 describe('Telegram in the host runtime', () => {
-  it('is disabled with a precise reason (user plugins are not loaded)', () => {
+  it('uses the minions channel server (task-6), not the official plugin', () => {
     const cfg = { ...defaults(), communication: { ...defaults().communication, channel: 'telegram' as const } };
     const d = C.decideTelegram(cfg, { state: 'ok', token: 'x', botId: '1' }, { available: true, summary: '', items: [] } as never, true);
-    expect(d).toEqual({ enabled: false, reason: C.HOST_TELEGRAM_REASON });
+    expect(d).toMatchObject({ enabled: true, server: 'minions' });
     expect(C.decideTelegram(cfg, { state: 'ok', token: 'x', botId: '1' }, { available: true, summary: '', items: [] } as never, false).enabled).toBe(true);
   });
 });

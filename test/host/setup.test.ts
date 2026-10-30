@@ -15,7 +15,7 @@ vi.mock('../../src/plugin/generate.js', async () => {
   };
 });
 
-const { runSetup, formatSetup, openIntakeFilterWarning } = await import('../../src/host/setup.js');
+const { runSetup, formatSetup, openIntakeFilterWarning, shellQuote } = await import('../../src/host/setup.js');
 const { loadCredentialRefs, readGithubToken, readTelegramToken, removeGithubToken } = await import('../../src/host/credentials.js');
 const { loadEffectiveConfig, loadProjectJson } = await import('../../src/host/project.js');
 const { loadRegistry } = await import('../../src/host/registry.js');
@@ -253,7 +253,7 @@ describe('minions setup', () => {
     expect(step(r, 'autoMerge')).toMatchObject({ status: 'skipped', later: expect.stringMatching(/minions setup/) });
     expect(r.localConfig.changed).toEqual([]);
     expect(existsSync(projectPaths(r.projectId).configLocalJson)).toBe(false);
-    const rp = r.init.plan.repoPath;
+    const rp = shellQuote(r.init.plan.repoPath); // quoted when the temp path has a space (host TMPDIR)
     expect(formatSetup(r)).toContain(`later: Run \`minions setup ${rp}\` again (or \`cd ${rp} && minions auth github\`)`);
     // Core steps default to yes.
     expect(rt.calls).toContain('start');
@@ -339,7 +339,7 @@ describe('minions setup', () => {
   it('declining the container step says how to start later from any directory', async () => {
     const repo = makeRepo(env.root);
     const r = await runSetup({ path: repo, yes: false, io: scripted({ 'Installation visibility': 'private', 'Build and start the container': 'n' }).io, runtime: fakeRuntime().runtime, dockerProbe: dockerUp });
-    const rp = r.init.plan.repoPath;
+    const rp = shellQuote(r.init.plan.repoPath); // quoted when the temp path has a space (host TMPDIR)
     expect(step(r, 'container').later).toBe(`Run \`minions setup ${rp}\` again or \`cd ${rp} && minions start\` to start the container and attach the coordinator.`);
     expect(r.nextSteps[0]).toBe(`Run \`cd ${rp} && minions start\` to start the container and attach the coordinator.`);
   });
