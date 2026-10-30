@@ -5,7 +5,7 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type { RunResult } from '../../src/core/exec.js';
 import type { MinionsConfig } from '../../src/config/schema.js';
 import { validateConfig } from '../../src/config/resolve.js';
@@ -23,6 +23,8 @@ import { runtimePaths } from '../../src/runtime/paths.js';
 import { runDir, runRecordPath, withOpenRuns } from '../../src/runtime/runner/record.js';
 import { defaults } from '../helpers.js';
 import { commitFile, makeDefaultEnv, result, tmp, type Env } from './fixtures.js';
+// Unit tier: git runs on the in-memory fake (./fake-git.ts).
+vi.mock('../../src/core/exec.js', async (orig) => (await import('./fake-git.js')).mockExec(await orig()));
 
 /** The installed official Telegram plugin's server source (any cached version), or null when it is not installed. */
 const TELEGRAM_SERVER = ((): string | null => {

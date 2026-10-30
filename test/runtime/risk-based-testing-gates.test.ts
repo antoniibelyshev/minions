@@ -1,11 +1,13 @@
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type { MinionsConfig } from '../../src/config/schema.js';
 import type { BaseSyncResult } from '../../src/runtime/base-sync.js';
 import type { PublishInput, PublishOutcome } from '../../src/runtime/publish.js';
 import { Scheduler } from '../../src/runtime/scheduler.js';
 import { commitFile, gitSync, makeDefaultEnv, result, type Env } from './fixtures.js';
+// Unit tier: git runs on the in-memory fake (./fake-git.ts).
+vi.mock('../../src/core/exec.js', async (orig) => (await import('./fake-git.js')).mockExec(await orig()));
 
 /** Commits a file at `rel` (creating parent directories) in `dir`. */
 function commitAt(dir: string, rel: string, content: string): string {
