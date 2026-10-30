@@ -6,8 +6,9 @@
 //   host runtime dirs (<project>/host/workspace and <project>/host/state), and also when the global install is a
 //   link (`npm link`) into them. With --from-container the check runs before the export, so a refused upgrade
 //   leaves the shim as it was; prepareHostRuntime itself also refuses any shim target inside those dirs.
-//   A new CLI only ever arrives as a packed tarball (`npm pack` + `npm install -g`, src/host/upgrade-source.ts applyCli, with the CLI backup first), built from the owner's checkout after the strict
-//   fast-forward of `--from-container`; never from the agent workspace itself.
+//   A new CLI only ever arrives as a packed tarball (`npm pack` + `npm install -g`, src/host/upgrade-source.ts
+//   applyCli, with the CLI backup first), built from the owner's checkout after the strict fast-forward of
+//   `--from-container`; never from the agent workspace itself.
 // - The shim step regenerates the minions and gh shims (prepareHostRuntime) for the CLI that runs the step: after a
 //   reinstall that is the newly installed CLI (the upgrade is handed off to it), so agents run the new CLI next.
 import { dirname, join } from 'node:path';
