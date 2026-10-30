@@ -1,18 +1,150 @@
-// Tester QA for task-24.1: the in-process task-file reader must give exactly the Task (and version) that
-// `backlog task view` gives, or fall back. Covers unusual markdown, unicode, CRLF, hand edits and the
-// show -> update -> note -> update round trip through the fast path, against the real Backlog.md CLI.
-import { execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { delimiter, join } from 'node:path';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { BacklogMdAdapter } from '../../src/backlog/backlogmd.js';
-import { MemoryIdempotencyStore, writeBacklogConfig } from '../../src/backlog/factory.js';
-import { parseTaskFile } from '../../src/backlog/taskfile.js';
+// Unit tests for the in-process task-file reader (task-24.1): the strict layout it accepts maps every field the way
+// `backlog task view --json` reports it, and anything outside it (unusual YAML, hand edits, CRLF) returns null so
+// the adapter falls back to `task view`. The comparison against the real Backlog.md CLI (files it writes, the
+// plain-scalar allowlist as js-yaml reads it) is the end-to-end check in taskfile.test.ts.
+import { describe, expect, it } from 'vitest';
+import { matchesSummary, parseFrontmatter, parseTaskFile } from '../../src/backlog/taskfile.js';
 
-const onPath = (process.env.PATH ?? '').split(delimiter).some((d) => d && existsSync(join(d, 'backlog')));
-const hasCli = !!process.env.MINIONS_BACKLOG_BIN || onPath;
-const bin = process.env.MINIONS_BACKLOG_BIN || 'backlog';
+const FULL = `---
+id: TASK-1
+title: 'Parent: task with "quotes" and it''s'
+status: ready
+assignee:
+  - '@alice'
+created_date: '2026-10-23 17:20'
+updated_date: '2026-10-23 17:20'
+due_date: '2026-11-01'
+labels:
+  - 'minions:authorized'
+  - x y
+dependencies:
+  - TASK-2
+references:
+  - 'https://x.y/z'
+documentation:
+  - docs/c.md
+modified_files:
+  - src/b.ts
+parent_task_id: TASK-9
+priority: high
+type: bug
+ordinal: 5
+---
+
+## Description
+
+<!-- SECTION:DESCRIPTION:BEGIN -->
+Line one
+
+## Fake heading in desc
+
+<!-- minions:meta {"provenance":"agent-hypothesis"} -->
+<!-- SECTION:DESCRIPTION:END -->
+
+## Acceptance Criteria
+<!-- AC:BEGIN -->
+- [ ] #1 first ac
+- [x] #2 second, with comma
+<!-- AC:END -->
+
+## Definition of Done
+<!-- DOD:BEGIN -->
+- [ ] #1 dod item
+<!-- DOD:END -->
+
+## Implementation Plan
+
+<!-- SECTION:PLAN:BEGIN -->
+step 1
+step 2
+<!-- SECTION:PLAN:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+note 1
+
+note 2
+<!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+summary here
+<!-- SECTION:FINAL_SUMMARY:END -->
+`;
+
+describe('task file parser', () => {
+  it('maps every field the way `backlog task view --json` reports it', () => {
+    expect(parseTaskFile(FULL)).toEqual({
+      id: 'TASK-1', title: 'Parent: task with "quotes" and it\'s', status: 'ready', archived: false, type: 'bug', priority: 'high',
+      project: null, assignees: ['@alice'], reporter: null, labels: ['minions:authorized', 'x y'], milestone: null,
+      parentTaskId: 'TASK-9', references: ['https://x.y/z'], modifiedFiles: ['src/b.ts'], ordinal: 5, dueDate: '2026-11-01',
+      description: 'Line one\n\n## Fake heading in desc\n\n<!-- minions:meta {"provenance":"agent-hypothesis"} -->',
+      dependencies: ['TASK-2'], documentation: ['docs/c.md'],
+      acceptanceCriteria: [{ index: 1, text: 'first ac', checked: false }, { index: 2, text: 'second, with comma', checked: true }],
+      definitionOfDone: [{ index: 1, text: 'dod item', checked: false }],
+      implementationPlan: 'step 1\nstep 2', implementationNotes: 'note 1\n\nnote 2', comments: [], finalSummary: 'summary here',
+    });
+  });
+
+  it('defaults absent keys and sections like Backlog.md (empty lists, nulls)', () => {
+    const t = parseTaskFile('---\nid: TASK-3\ntitle: C\nstatus: idea\nassignee: []\nlabels: []\ndependencies: []\n---\n\n\n');
+    expect(t).toMatchObject({ assignees: [], labels: [], dependencies: [], references: [], documentation: [], modifiedFiles: [],
+      priority: null, ordinal: null, parentTaskId: null, milestone: null, description: null, acceptanceCriteria: [],
+      definitionOfDone: [], implementationPlan: null, implementationNotes: null, finalSummary: null });
+    // An empty marked section is null, as in the view.
+    const empty = parseTaskFile('---\nid: TASK-3\ntitle: C\nstatus: idea\n---\n\n## Implementation Notes\n\n<!-- SECTION:NOTES:BEGIN -->\n<!-- SECTION:NOTES:END -->\n');
+    expect(empty?.implementationNotes).toBeNull();
+  });
+
+  it('reads the folded long titles js-yaml writes', () => {
+    const fm = parseFrontmatter(['title: >-', '  Backlog listing spawns one Backlog.md process per task (status/next/claim take', '  3-7 s at 100 tasks)']);
+    expect(fm?.get('title')).toBe('Backlog listing spawns one Backlog.md process per task (status/next/claim take 3-7 s at 100 tasks)');
+  });
+
+  it.each([
+    ['CRLF line endings', FULL.replace(/\n/g, '\r\n')],
+    ['an unknown frontmatter key', FULL.replace('ordinal: 5', 'ordinal: 5\nestimate: 3')],
+    ['a flow list', FULL.replace('labels:\n  - \'minions:authorized\'\n  - x y', 'labels: [a, b]')],
+    ['a lowercase id', FULL.replace('id: TASK-1', 'id: task-1')],
+    ['a numeric dependency', FULL.replace('  - TASK-2', '  - 2')],
+    ['a comments section', `${FULL}\n## Comments\n\n<!-- COMMENTS:BEGIN -->\nauthor: bob\n\n---\n\nhi\n\n---\n<!-- COMMENTS:END -->\n`],
+    ['a legacy section without markers', FULL.replace('<!-- SECTION:PLAN:BEGIN -->\nstep 1\nstep 2\n<!-- SECTION:PLAN:END -->', 'step 1')],
+    ['loose text outside sections', `${FULL}\nloose text\n`],
+    ['an uppercase [X] checkbox', FULL.replace('- [x] #2', '- [X] #2')],
+    ['an AC without an index', FULL.replace('- [x] #2 second', '- [x] second')],
+    ['AC indexes with a gap', FULL.replace('- [x] #2', '- [x] #3')],
+    ['a duplicated marker', FULL.replace('step 2', 'step 2\n<!-- SECTION:PLAN:END -->')],
+    ['a folded scalar with extra indentation', FULL.replace("title: 'Parent: task with \"quotes\" and it''s'", 'title: >-\n  a\n    b')],
+    ['no frontmatter', '# Title\n'],
+    ['an unterminated frontmatter', '---\nid: TASK-1\ntitle: A\nstatus: idea\n'],
+    ['an ambiguous plain scalar', FULL.replace('type: bug', 'type: yes')],
+  ])('returns null (fall back to task view) for %s', (_name, text) => {
+    expect(parseTaskFile(text)).toBeNull();
+  });
+
+  it('handles hand edits: a BOM falls back; reordered sections and a missing final newline read the same', () => {
+    expect(parseTaskFile(`\ufeff${FULL}`)).toBeNull();
+    const want = parseTaskFile(FULL);
+    expect(parseTaskFile(FULL.replace(/\n+$/, ''))).toEqual(want);
+    const fs = /\n## Final Summary\n\n<!-- SECTION:FINAL_SUMMARY:BEGIN -->[\s\S]*?<!-- SECTION:FINAL_SUMMARY:END -->\n/.exec(FULL)![0];
+    expect(parseTaskFile(FULL.replace(fs, '').replace('## Description', `${fs.trimStart()}\n## Description`))).toEqual(want);
+  });
+
+  it('cross-checks every field the list summary carries', () => {
+    const t = parseTaskFile(FULL)!;
+    const summary = { id: t.id, title: t.title, status: t.status, archived: false, type: t.type, priority: t.priority, project: null,
+      assignees: t.assignees, reporter: null, labels: t.labels, milestone: null, parentTaskId: t.parentTaskId, references: t.references,
+      modifiedFiles: t.modifiedFiles, ordinal: t.ordinal, dueDate: t.dueDate, acceptanceCriteriaCount: 2, acceptanceCriteriaCompleted: 1 };
+    expect(matchesSummary(t, summary)).toBe(true);
+    expect(matchesSummary(t, { ...summary, status: 'Ready' })).toBe(false);
+    expect(matchesSummary(t, { ...summary, milestone: 'm-1' })).toBe(false);
+    expect(matchesSummary(t, { ...summary, labels: ['x y'] })).toBe(false);
+    expect(matchesSummary(t, { ...summary, acceptanceCriteriaCount: 3 })).toBe(false);
+    expect(matchesSummary(t, { ...summary, acceptanceCriteriaCompleted: 0 })).toBe(false);
+  });
+});
 
 const doc = (item: string) => `---
 id: TASK-1
@@ -78,101 +210,5 @@ describe('task file parser: plain scalars outside the summary cross-check', () =
 
   it('returns null for a dependency followed by a tab comment', () => {
     expect(parseTaskFile(doc('ok').replace('  - TASK-2', '  - TASK-2\t# blocked on auth'))).toBeNull();
-  });
-});
-
-describe.skipIf(!hasCli)('fast listing edge cases vs task view (real CLI)', { timeout: 60_000 }, () => {
-  let root: string;
-  const scope = { milestone: null, requiredLabels: [], allowedPaths: ['**'] };
-  const fresh = (readFiles = true) => new BacklogMdAdapter({ root, idempotency: new MemoryIdempotencyStore(), readFiles });
-  const cli = (...args: string[]) => execFileSync(bin, args, { cwd: root, env: { ...process.env, BACKLOG_CWD: root, NO_COLOR: '1' }, encoding: 'utf8' });
-  const tasksDir = () => join(root, 'backlog', 'tasks');
-  const file = (id: string) => join(tasksDir(), readdirSync(tasksDir()).find((n) => n.startsWith(`${id} - `))!);
-  const edit = (id: string, fn: (t: string) => string) => writeFileSync(file(id), fn(readFileSync(file(id), 'utf8')));
-  const compare = async () => {
-    const fast = fresh(), slow = fresh(false);
-    await fast.capabilities(); // asks `backlog --version` once (task-24.9); the listings below reuse the cached answer
-    const base = fast.spawnCount;
-    const ft = await fast.listTasks();
-    expect(ft).toEqual(await slow.listTasks());
-    const spawns = fast.spawnCount - base;
-    expect(await fast.listReady(50, new Set(), scope)).toEqual(await slow.listReady(50, new Set(), scope));
-    return { tasks: ft, spawns };
-  };
-
-  beforeAll(async () => {
-    root = mkdtempSync(join(tmpdir(), 'minions-blfast-edge-'));
-    await writeBacklogConfig(root);
-    const desc = 'Intro\n\n---\n\nAfter a rule\n\n```md\n---\nid: TASK-99\n---\n## Acceptance Criteria\n- [ ] #1 fake\n```\n\n'
-      + '## Implementation Notes\n\n### Sub\n\n# H1\n\n<!-- minions:meta {"provenance":"agent-hypothesis"} -->';
-    cli('task', 'create', 'Markdown torture', '-d', desc, '--ac', 'plain', '--ac', 'has ## hash and `code`', '--plan', 'step 1\n\n---\n\n```\ncode\n```',
-      '--notes', '## Fake heading\n---\nnote', '-l', 'a', '--status', 'ready'); // TASK-1
-    cli('task', 'create', 'Ünïcödé 🚀 emoji — “quotes”', '-d', '日本語 🎉', '-l', 'ラベル', '-l', 'emoji🔥'); // TASK-2 (js-yaml \U escape)
-    cli('task', 'create', '123', '-d', 'numeric title'); // TASK-3
-    cli('task', 'create', '2026-10-23', '-d', 'date-like title'); // TASK-4
-    cli('task', 'create', 'Many', '-l', 'a', '-l', 'b', '-l', 'c', '-l', 'd', '-l', 'with space', '-l', 'minions:authorized',
-      '--dep', 'TASK-1', '--dep', 'TASK-2', '--dep', 'TASK-3', '--dep', 'TASK-4', '--status', 'ready'); // TASK-5
-    cli('task', 'create', 'Empty'); // TASK-6
-    cli('task', 'create', 'Child', '-p', 'TASK-1', '--ac', 'a1', '--ac', 'a2', '--ac', 'a3', '--dod', 'd1', '--dod', 'd2',
-      '--final-summary', 'fs\n\n## heading\n---', '--status', 'ready'); // TASK-1.1
-    cli('task', 'edit', 'TASK-1.1', '--check-ac', '1', '--check-ac', '3', '--check-dod', '2');
-    cli('task', 'edit', 'TASK-1.1', '--append-notes', 'appended note');
-    cli('task', 'create', 'Tab\tin title', '-d', 'tab\there'); // TASK-7 (double-quoted "\t")
-  }, 60_000);
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
-
-  it('matches task view for Backlog.md-written edge cases, without any task view', async () => {
-    const { tasks, spawns } = await compare();
-    expect(tasks.find((t) => t.id === 'task-1.1')?.acceptanceCriteria.map((a) => a.done)).toEqual([true, false, true]);
-    expect(tasks.find((t) => t.id === 'task-5')?.dependencies).toEqual(['task-1', 'task-2', 'task-3', 'task-4']);
-    // TASK-2 (emoji written as "\U0001F680") and TASK-7 ("\t") are both decoded in-process: only the list call spawns.
-    expect(readFileSync(file('task-2'), 'utf8')).toContain('\\U0001F680');
-    expect(spawns).toBe(1);
-  });
-
-  it('stays equivalent after hand edits (CRLF, BOM, no trailing newline, reordered sections, whitespace)', async () => {
-    edit('task-3', (t) => t.replace(/\n/g, '\r\n'));
-    edit('task-4', (t) => `\ufeff${t}`);
-    edit('task-6', (t) => t.replace(/\n+$/, ''));
-    edit('task-1.1', (t) => {
-      const m = /\n## Final Summary\n\n<!-- SECTION:FINAL_SUMMARY:BEGIN -->[\s\S]*?<!-- SECTION:FINAL_SUMMARY:END -->\n/.exec(t)!;
-      return t.replace(m[0], '').replace('## Description', `${m[0].trimStart()}\n## Description`);
-    });
-    edit('task-1', (t) => t.replace('<!-- SECTION:DESCRIPTION:BEGIN -->\n', '<!-- SECTION:DESCRIPTION:BEGIN -->\n\n  \n')
-      .replace('\n<!-- SECTION:DESCRIPTION:END -->', '   \n\n<!-- SECTION:DESCRIPTION:END -->'));
-    edit('task-5', (t) => t.replace("title: Many", "title: 'Many  hand   edited'"));
-    await compare();
-  });
-
-  it('round-trips show -> update -> note -> update with fast-path versions and no CONFLICT', async () => {
-    const a = fresh();
-    // Three layouts (task-104.2): the markdown torture task (meta block, fake headings and rules), the hand-reordered
-    // child (checked ACs, DoD, notes, final summary) and the empty task whose first note adds the notes section.
-    // task-5 (labels and dependencies only: frontmatter, no sections) is still compared at the end.
-    for (const id of ['task-1', 'task-1.1', 'task-6']) {
-      const listed = (await fresh().listTasks()).find((t) => t.id === id)!;
-      expect(listed.version).toBe((await a.getTask(id)).version);
-      const u = await a.updateTask(id, listed.version, { branch: `agent/${id}` });
-      expect((await fresh().listTasks()).find((t) => t.id === id)!.version).toBe(u.version);
-      await a.addNote(id, 'qa note with `code`, ---\n## heading');
-      const after = (await fresh().listTasks()).find((t) => t.id === id)!;
-      expect(after.version).toBe((await a.getTask(id)).version);
-      expect(after.version).not.toBe(u.version);
-      await expect(a.updateTask(id, after.version, { priority: 'low' })).resolves.toMatchObject({ priority: 'low' });
-      await expect(a.updateTask(id, u.version, { priority: 'high' })).rejects.toMatchObject({ code: 'CONFLICT' });
-    }
-    await compare();
-  });
-
-  it('falls back for hand-edited YAML-ambiguous dependencies and documentation, so updates do not CONFLICT', async () => {
-    edit('task-5', (t) => t.replace(/\n {2}- TASK-1\n/, '\n  - TASK-1\t# blocked on auth\n')
-      .replace(/\ndocumentation: \[\]\n|\n(?=---\n\n)/, '\ndocumentation:\n  - 1:20\n  - TASK-9:\n'));
-    expect(readFileSync(file('task-5'), 'utf8')).toContain('TASK-1\t# blocked on auth');
-    expect(parseTaskFile(readFileSync(file('task-5'), 'utf8'))).toBeNull();
-    const { tasks } = await compare();
-    const t5 = tasks.find((t) => t.id === 'task-5')!;
-    expect(t5.dependencies).toContain('task-1');
-    const a = fresh();
-    await expect(a.updateTask('task-5', t5.version, { priority: 'low' })).resolves.toMatchObject({ priority: 'low' });
   });
 });
