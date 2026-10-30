@@ -87,40 +87,40 @@ describe('strictPermissionModeArg: both --help formats', () => {
 });
 
 describe('coordinator: strict mode under the listed name', () => {
-  it('host runtime passes manual on 2.1.292, default on older CLIs, and throws when neither is listed', async () => {
-    const host = (help: string) => decidePermissionMode(defaults(), { hostRuntime: true, modes: parsePermissionModes(help) });
-    expect(host(HELP_MANUAL)).toMatchObject({ configured: 'auto', mode: 'manual', fallback: false, reason: expect.stringMatching(/permission mode default \(passed as manual/) });
-    expect(host(HELP_DEFAULT)).toMatchObject({ mode: 'default', reason: 'host runtime: the coordinator always runs in permission mode default' });
-    expect(() => host(HELP_NEITHER)).toThrow(expect.objectContaining({ code: 'INCOMPATIBLE_RUNTIME', message: expect.stringMatching(/not started in a looser mode/) }));
+  it('the host runtime uses the configured mode like the container (no forced strict mode)', () => {
+    const host = (help: string) => decidePermissionMode(defaults(), { modes: parsePermissionModes(help) });
+    expect(host(HELP_MANUAL)).toMatchObject({ configured: 'auto', mode: 'auto', fallback: false });
+    expect(decidePermissionMode({ ...defaults(), coordinator: { permissionMode: 'bypassPermissions' } }, { modes: parsePermissionModes(HELP_MANUAL) }))
+      .toMatchObject({ configured: 'bypassPermissions', mode: 'bypassPermissions', fallback: false });
   });
 
   it('legacy container permissionMode "default" maps the same way', () => {
-    const c = (help: string) => decidePermissionMode(legacyDefault(), { hostRuntime: false, modes: parsePermissionModes(help) });
+    const c = (help: string) => decidePermissionMode(legacyDefault(), { modes: parsePermissionModes(help) });
     expect(c(HELP_MANUAL)).toMatchObject({ configured: 'default', mode: 'manual', fallback: false });
     expect(c(HELP_DEFAULT)).toMatchObject({ configured: 'default', mode: 'default' });
     expect(() => c(HELP_NEITHER)).toThrow(/permissionMode "default".*neither --permission-mode default nor manual/);
     // Auto and acceptEdits are untouched by the mapping.
-    expect(decidePermissionMode(defaults(), { hostRuntime: false, modes: parsePermissionModes(HELP_MANUAL) })).toMatchObject({ mode: 'auto' });
-    expect(decidePermissionMode(defaults(), { hostRuntime: false, modes: parsePermissionModes(HELP_NEITHER) })).toMatchObject({ mode: 'auto' });
+    expect(decidePermissionMode(defaults(), { modes: parsePermissionModes(HELP_MANUAL) })).toMatchObject({ mode: 'auto' });
+    expect(decidePermissionMode(defaults(), { modes: parsePermissionModes(HELP_NEITHER) })).toMatchObject({ mode: 'auto' });
   });
 
-  it('asks Claude Code for its choices unless acceptEdits is configured in the container', () => {
-    expect(permissionModesNeeded(defaults(), false)).toBe(true);
-    expect(permissionModesNeeded(legacyDefault(), false)).toBe(true);
-    expect(permissionModesNeeded({ ...defaults(), coordinator: { permissionMode: 'acceptEdits' } }, false)).toBe(false);
-    expect(permissionModesNeeded({ ...defaults(), coordinator: { permissionMode: 'acceptEdits' } }, true)).toBe(true);
+  it('asks Claude Code for its choices only for auto and the legacy default', () => {
+    expect(permissionModesNeeded(defaults())).toBe(true);
+    expect(permissionModesNeeded(legacyDefault())).toBe(true);
+    expect(permissionModesNeeded({ ...defaults(), coordinator: { permissionMode: 'acceptEdits' } })).toBe(false);
+    expect(permissionModesNeeded({ ...defaults(), coordinator: { permissionMode: 'bypassPermissions' } })).toBe(false);
   });
 
   it('buildClaudeCommand and probeRuntime on the host runtime', async () => {
     process.env.MINIONS_RUNTIME = 'host';
     const paths = pluginPaths();
-    expect(modeOf((await buildClaudeCommand(defaults(), paths, { permissionModes: parsePermissionModes(HELP_MANUAL) })).args)).toBe('manual');
-    expect(modeOf((await buildClaudeCommand(defaults(), paths, { permissionModes: parsePermissionModes(HELP_DEFAULT) })).args)).toBe('default');
-    expect(modeOf((await buildClaudeCommand(defaults(), paths)).args)).toBe('default');
-    await expect(buildClaudeCommand(defaults(), paths, { permissionModes: parsePermissionModes(HELP_NEITHER) })).rejects.toMatchObject({ code: 'INCOMPATIBLE_RUNTIME' });
-    expect((await probeRuntime(defaults(), { runner: stubRunner(HELP_MANUAL) })).permission).toMatchObject({ mode: 'manual', fallback: false });
-    expect((await probeRuntime(defaults(), { runner: stubRunner(HELP_DEFAULT) })).permission).toMatchObject({ mode: 'default' });
-    await expect(probeRuntime(defaults(), { runner: stubRunner(HELP_NEITHER) })).rejects.toMatchObject({ code: 'INCOMPATIBLE_RUNTIME' });
+    expect(modeOf((await buildClaudeCommand(defaults(), paths, { permissionModes: parsePermissionModes(HELP_MANUAL) })).args)).toBe('auto');
+    expect(modeOf((await buildClaudeCommand(legacyDefault(), paths, { permissionModes: parsePermissionModes(HELP_MANUAL) })).args)).toBe('manual');
+    expect(modeOf((await buildClaudeCommand({ ...defaults(), coordinator: { permissionMode: 'bypassPermissions' } }, paths)).args)).toBe('bypassPermissions');
+    await expect(buildClaudeCommand(legacyDefault(), paths, { permissionModes: parsePermissionModes(HELP_NEITHER) })).rejects.toMatchObject({ code: 'INCOMPATIBLE_RUNTIME' });
+    expect((await probeRuntime(defaults(), { runner: stubRunner(HELP_MANUAL) })).permission).toMatchObject({ mode: 'auto', fallback: false });
+    expect((await probeRuntime(legacyDefault(), { runner: stubRunner(HELP_DEFAULT) })).permission).toMatchObject({ mode: 'default' });
+    await expect(probeRuntime(legacyDefault(), { runner: stubRunner(HELP_NEITHER) })).rejects.toMatchObject({ code: 'INCOMPATIBLE_RUNTIME' });
   });
 
   it('runCoordinator (legacy default) launches with manual on 2.1.292 and does not start claude when neither is listed', async () => {

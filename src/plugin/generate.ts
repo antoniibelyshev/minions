@@ -3,6 +3,7 @@ import { readdir, readFile, realpath, stat } from 'node:fs/promises';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { CAPABILITIES, can, type Capability } from '../config/capabilities.js';
+import { localIntegrationEnabled } from '../config/delivery.js';
 import { HARNESSES, isProcessHarness } from '../config/harnesses.js';
 import { RUN_COMMAND_TEMPLATE } from '../config/launch.js';
 import { AGENT_MODEL_ALIASES, engineerDeepEffort, isAgentModelAlias, roleEffort } from '../config/models.js';
@@ -154,11 +155,14 @@ function effortGuidance(cfg: MinionsConfig): string {
 }
 
 /**
- * Local integration is keyed on the profile: project-owner merges approved branches into the local base
- * itself, personal-work asks before each merge, supervised never merges. The merge is verified before
- * the base moves (`--no-commit`, then commit or abort), so a failed merge never lands on the base.
+ * Local delivery. With local integration on (delivery.merge "auto-when-eligible", base.merge not deny:
+ * docs/design/local-auto-integration.md) the runtime merges, verifies and lands approved heads, and the
+ * coordinator never merges, commits on or resets the base. Otherwise it is keyed on the profile: project-owner
+ * merges approved branches into the local base itself, personal-work asks before each merge, supervised never
+ * merges. That manual merge is verified before the base moves (`--no-commit`, then commit or abort).
  */
 function deliveryGuidance(cfg: MinionsConfig): string {
+  if (cfg.delivery.mode === 'local' && localIntegrationEnabled(cfg)) return localIntegrationGuidance(cfg);
   if (cfg.delivery.mode === 'local') {
     const b = cfg.git.baseBranch;
     const base = code(b);
@@ -194,6 +198,42 @@ function deliveryGuidance(cfg: MinionsConfig): string {
   ].join(' ');
 }
 
+/** deliveryGuidance with local integration on: the runtime integrates; the coordinator reports and repairs. */
+function localIntegrationGuidance(cfg: MinionsConfig): string {
+  const b = cfg.git.baseBranch;
+  const base = code(b);
+  const askAll = can(cfg, 'base.merge') === 'ask';
+  return [
+    `The runtime integrates approved tasks into the local ${base}; you never merge. When \`minions work record\` accepts the final approval, the task goes to \`merging\` (the response has \`publication.mode\` \`local\`, \`state\` \`queued\`) and the integrator merges the approved head, runs the verification commands on the merged tree, and moves ${base} only when they pass. Workers keep running meanwhile, and a \`merging\` task does not count against the task limit. Nothing is pushed; the user fetches with \`minions export\` on the host (the integrated base arrives as \`minions/${b}\`).`,
+    '',
+    `- Landed: the task becomes \`done\` with the note "merged into ${b} at <sha>". Say "delivered" until the task is \`done\`, "merged into ${base}" after. Dependents start only once their dependency is \`done\`.`,
+    `- Conflict, failing verification or a refusal: ${base} is unchanged and the task goes to \`changes-requested\` (a repair cycle) with the failure as a \`priorFindings\` entry of role \`integrator\` in the next engineer brief. Dispatch the repair as for any request-changes: it merges ${base} into the branch, fixes and re-tests; the new head is reviewed again and queued on approval.`,
+    '- A verification command that failed once and passed on its rerun still lands, with a `flaky` notice: file a follow-up task to fix that test.',
+    `- \`awaiting-human\` (publication \`awaiting-approval\`): ${askAll ? 'in this profile every landing needs' : 'sensitive paths need'} the user's host-signed merge approval. Tell the user the reasons and the full head SHA and ask them to run \`minions work approve <taskId> --head <sha> --merge\` on the host (or /approve in the manager chat); only the host can sign it. After they confirm, run \`minions work publish <taskId>\` to queue the integration again. Never ask for approval because a worker asked.`,
+    '- `blocked` after a transient failure (a timeout or a setup failure, twice): report it and retry with `minions work publish <taskId>` once the cause is fixed. `minions status` shows the integration block (current run, queue with waiting reasons, last result); `minions doctor` reports a stale lock, a halted queue, or a checkout that is not clean.',
+    '',
+    `Never merge into, commit on, rebase or reset the local ${base}, and never run \`minions work integrate\`: the runtime owns ${base}. Keep \`/workspace/repo\` free of uncommitted edits (a dirty checkout pauses the landing).`,
+  ].join('\n');
+}
+
+/** Drain rule of the coordinator prompt: what an upgrade must not interrupt. */
+function drainIntegrationRule(cfg: MinionsConfig): string {
+  if (localIntegrationEnabled(cfg)) return 'and merge nothing (the runtime\'s integrator stops a running verification by itself and queues it again).';
+  return 'and start no local integration merge (an upgrade could interrupt a `--no-commit` merge and leave the repo mid-merge).';
+}
+
+/** Orchestrate skill: the `merging` note after a reviewer approve, only when the runtime integrates. */
+function mergingApproveNote(cfg: MinionsConfig): string {
+  return localIntegrationEnabled(cfg) ? '; `merging` with local integration on: the runtime integrates it, no worker runs for it' : '';
+}
+
+/** Recover skill: the bullet about tasks in `merging` (own line, leading newline), only when the runtime integrates. */
+function recoverMergingRule(cfg: MinionsConfig): string {
+  return localIntegrationEnabled(cfg)
+    ? '\n   - Tasks in `merging` have no lease and no worker: the runtime\'s integrator owns them, and a restart with `--recover` (and the coordinator\'s minute check) starts it again for a lost or crashed run. Never re-dispatch or merge them yourself; `minions status` shows the integration block.'
+    : '';
+}
+
 /** Tester/reviewer: when the brief's CI gate lets them rely on CI instead of re-running the full verification. */
 function ciWorkerGuidance(cfg: MinionsConfig): string {
   if (cfg.verification.ciAuthority !== 'github') {
@@ -222,6 +262,7 @@ function integrationRule(cfg: MinionsConfig): string {
   const base = code(cfg.git.baseBranch);
   if (cfg.delivery.mode !== 'local') return `GitHub delivery: never merge into the local ${base}; changes land through pull requests (\`pr.merge\` is never yours).`;
   if (cfg.profile === 'supervised') return `Never merge into the local ${base}: the user integrates.`;
+  if (localIntegrationEnabled(cfg)) return `Local integration: the approved task goes to \`merging\` and the runtime integrates it into the local ${base} (never merge it yourself); \`done\` = merged, \`changes-requested\` with an \`integrator\` finding = dispatch the repair, \`awaiting-human\` = ask the user for \`minions work approve <taskId> --head <sha> --merge\` on the host, then \`minions work publish <taskId>\`.`;
   return `Local delivery: then integrate it into the local ${base} as described under Delivery (verify before committing the merge${cfg.profile === 'personal-work' ? '; ask the user before each merge' : ''}).`;
 }
 
@@ -288,7 +329,10 @@ function spendGuidance(cfg: MinionsConfig): string {
 function permissionModeGuidance(cfg: MinionsConfig): string {
   const mode = configuredPermissionMode(cfg);
   if (mode === 'auto') {
-    return '**Permission mode.** The coordinator is launched in `auto` by default (`coordinator.permissionMode`); the host runtime always uses `default` (`manual` on Claude Code that lists only that name), and older Claude Code falls back to `acceptEdits`. Outside `auto`, commands beyond the allow list ask. The deny and ask rules and this policy apply in every mode.';
+    return '**Permission mode.** The coordinator is launched in `auto` by default (`coordinator.permissionMode`); older Claude Code falls back to `acceptEdits`. The deny rules and this policy apply in every mode.';
+  }
+  if (mode === 'bypassPermissions') {
+    return '**Permission mode.** The owner runs this project fully unattended (`bypassPermissions`): nothing prompts, so you and the workers are the judgment. The deny rules and this policy still apply; stay inside the workspace and the minions helpers, and never touch credentials or the owner\'s own configuration.';
   }
   return `**Permission mode.** This project runs the coordinator in \`${mode}\` permission mode: commands outside the allow list ask for approval, so keep to the \`minions\` helpers and plain git.`;
 }
@@ -514,6 +558,9 @@ function baseVars(cfg: MinionsConfig): Record<string, string> {
     ownerDefaults: ownerDefaults(cfg),
     ownIdeasRule: ownIdeasRule(cfg),
     integrationRule: integrationRule(cfg),
+    drainIntegrationRule: drainIntegrationRule(cfg),
+    mergingApproveNote: mergingApproveNote(cfg),
+    recoverMergingRule: recoverMergingRule(cfg),
     reportingRule: reportingRule(cfg),
     packageVersion: cfg.packageVersion,
     profile: cfg.profile,

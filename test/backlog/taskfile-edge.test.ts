@@ -146,7 +146,10 @@ describe.skipIf(!hasCli)('fast listing edge cases vs task view (real CLI)', { ti
 
   it('round-trips show -> update -> note -> update with fast-path versions and no CONFLICT', async () => {
     const a = fresh();
-    for (const id of ['task-1', 'task-1.1', 'task-5', 'task-6']) {
+    // Three layouts (task-104.2): the markdown torture task (meta block, fake headings and rules), the hand-reordered
+    // child (checked ACs, DoD, notes, final summary) and the empty task whose first note adds the notes section.
+    // task-5 (labels and dependencies only: frontmatter, no sections) is still compared at the end.
+    for (const id of ['task-1', 'task-1.1', 'task-6']) {
       const listed = (await fresh().listTasks()).find((t) => t.id === id)!;
       expect(listed.version).toBe((await a.getTask(id)).version);
       const u = await a.updateTask(id, listed.version, { branch: `agent/${id}` });

@@ -10,6 +10,7 @@ import { RuntimeDb } from '../../src/runtime/db.js';
 import { Scheduler } from '../../src/runtime/scheduler.js';
 import { workspaceLayout, type WorkspaceLayout } from '../../src/runtime/worktree.js';
 import { defaults } from '../helpers.js';
+import { fromTemplate } from '../repo-template.js';
 
 Object.assign(process.env, {
   GIT_AUTHOR_NAME: 'Test', GIT_AUTHOR_EMAIL: 'test@example.com',
@@ -22,12 +23,15 @@ export const tmp = (prefix = 'minions-rt-') => mkdtempSync(join(tmpdir(), prefix
 export const gitSync = (cwd: string, ...args: string[]) =>
   execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
 
+/** A repository with one commit (README.md) on `branch`; returns its SHA. Copied from a per-file template (task-104). */
 export function initRepo(dir: string, branch = 'main'): string {
-  execFileSync('git', ['init', '-q', '-b', branch, dir]);
-  writeFileSync(join(dir, 'README.md'), '# test\n');
-  gitSync(dir, 'add', '.');
-  gitSync(dir, 'commit', '-q', '-m', 'init');
-  return gitSync(dir, 'rev-parse', 'HEAD');
+  return fromTemplate(`runtime-init:${branch}`, dir, (d) => {
+    execFileSync('git', ['init', '-q', '-b', branch, d]);
+    writeFileSync(join(d, 'README.md'), '# test\n');
+    gitSync(d, 'add', '.');
+    gitSync(d, 'commit', '-q', '-m', 'init');
+    return gitSync(d, 'rev-parse', 'HEAD');
+  });
 }
 
 export function commitFile(dir: string, file: string, content: string, msg = `edit ${file}`): string {

@@ -32,7 +32,8 @@ import { ciGateFromDb, formatCiGate, type CiGate } from './ci-gate.js';
 import { autoMergeTask, type MergeResult } from './merge.js';
 import { AUTO_PROMOTE_REFUSED_EVENT, unpromotedReason } from './auto-promote.js';
 import { gateGit } from './git-hardening.js';
-import { enqueueIntegration, integrationRows, openIntegration, startIntegratorDetached, type IntegrationRow } from './integrator.js';
+import { enqueueIntegration, FLAKY_OUTCOME, integrationRows, openIntegration, startIntegratorDetached, type IntegrationRow } from './integrator.js';
+import { enqueue as enqueueNotice } from './outbox.js';
 import { BRANCH_PREFIX, branchFor, ensureBranchWorktree, ensureReviewWorktree, git, headOf, resolveBaseBranch, taskSlug, workspaceLayout, type WorkspaceLayout } from './worktree.js';
 
 export const LEASE_ROLES: readonly BuiltinLeaseRole[] = ['engineer', 'tester', 'reviewer'];
@@ -1707,6 +1708,11 @@ export class Scheduler {
     };
   }
 
+  /** An owner notice of the integration (outbox; one line each). A failure to queue it is an event, never fatal. */
+  private integrationNotice(n: { key: string; kind: 'approval' | 'blocker' | 'other'; taskId: string; text: string }): void {
+    try { enqueueNotice(this.db, { ...n, text: n.text.slice(0, 3_900) }, () => this.now()); } catch (e) { this.db.addEvent('integration-notice-error', n.taskId, { key: n.key, error: (e as Error).message }); }
+  }
+
   /**
    * The integrator's onSettled hook (`work integrate`): moves the task for a terminal integration row.
    * landed -> done; conflict | red | refused -> changes-requested with a counted repair cycle (the limit sends it to
@@ -1734,6 +1740,12 @@ export class Scheduler {
         await this.backlog.closeTask(taskId, 'done');
         status = 'done';
         message = `merged into ${base} at ${row.candidate_sha ?? '(already contained)'}`;
+        if (row.outcome === FLAKY_OUTCOME) {
+          // Decision 2: the landing stands; the coordinator files a follow-up for the flaky command.
+          message += ` (${(row.detail ?? '').split('; flaky: ')[1] ?? 'a verification command passed only on its rerun'}: flaky)`;
+          this.integrationNotice({ key: `integration-flaky:${taskId}:${row.id}`, kind: 'other', taskId,
+            text: `${taskId} merged into ${base}, but a verification command passed only on its rerun (flaky): ${(row.detail ?? '').split('; flaky: ')[1] ?? '(see the integration log)'}. File a follow-up task to fix the flaky test. ref: #${taskId}` });
+        }
         break;
       }
       case 'conflict': case 'red': case 'refused': {
@@ -1752,6 +1764,8 @@ export class Scheduler {
         status = replan ? 'awaiting-human' : 'changes-requested';
         if (task.status !== status) await this.backlog.updateTask(taskId, task.version, { status });
         message = `integration ${row.phase} for ${short}; task → ${status} (repair cycle ${cycles}${replan ? `, the limit ${cfg.execution.maxRepairCyclesBeforeReplan}: replan before more repairs` : ''}): ${(row.detail ?? '').split('\n')[0]}`;
+        this.integrationNotice({ key: `integration-${row.phase}:${taskId}:${row.id}`, kind: replan ? 'blocker' : 'other', taskId,
+          text: `${taskId}: integration ${row.phase} (${(row.detail ?? '').split('\n')[0]!.slice(0, 300)}); ${base} is unchanged, task → ${status}${replan ? ' (repair limit reached: replan)' : ' for a repair'}.` });
         break;
       }
       case 'awaiting-approval': {
@@ -1766,6 +1780,8 @@ export class Scheduler {
         await this.setStatus(taskId, 'awaiting-human');
         status = 'awaiting-human';
         message = `the integration of ${pub.branch} waits for human approval (${row.detail ?? 'merge approval needed'}); the user runs \`minions work approve ${taskId} --head ${row.head_sha} --merge\` on the host, then \`minions work publish ${taskId}\``;
+        this.integrationNotice({ key: `integration-approval:${taskId}:${row.head_sha}`, kind: 'approval', taskId,
+          text: `${taskId} waits for your merge approval before it lands on ${base} (${(row.detail ?? 'merge approval needed').slice(0, 400)}). On the host: \`minions work approve ${taskId} --head ${row.head_sha} --merge\` (or /approve ${taskId} ${row.head_sha} merge in the manager chat).` });
         break;
       }
       case 'transient': {
@@ -1773,6 +1789,8 @@ export class Scheduler {
         await this.setStatus(taskId, 'blocked');
         status = 'blocked';
         message = `the integration of ${short} failed twice for a transient reason (${(row.detail ?? '').split('\n')[0]}); retry with \`minions work publish ${taskId}\``;
+        this.integrationNotice({ key: `integration-blocked:${taskId}:${row.id}`, kind: 'blocker', taskId,
+          text: `${taskId}: the integration failed twice for a transient reason (${(row.detail ?? '').split('\n')[0]!.slice(0, 300)}); ${base} is unchanged, task → blocked. Retry with \`minions work publish ${taskId}\` once the cause is fixed.` });
         break;
       }
       default:
@@ -1793,6 +1811,15 @@ export class Scheduler {
     // Local integration: the approval lets the integrator land the head (sensitive paths, base.merge "ask").
     const local = !!pub && pub.mode === 'local';
     if (local && pub.state === 'published') throw new MinionsError('PRECONDITION', `Task ${taskId} is already integrated at ${pub.head_sha}.`);
+    // A failed integration (conflict, red, refused, or base.merge denied) is not landable at this head: an approval
+    // would change nothing. Only a transient failure (blocked) can be retried at the same head.
+    if (local && pub.state === 'failed' && pub.error_code !== 'TRANSIENT') {
+      throw new MinionsError('PRECONDITION',
+        pub.error_code === 'POLICY_DENIED'
+          ? `Task ${taskId} is delivered: base.merge is denied by policy, so the runtime never lands it; the user integrates it.`
+          : `The integration of ${taskId} at ${pub.head_sha} failed (${pub.error_code ?? 'failed'}): a merge approval cannot land it. The task goes back for a repair; approve the new head after it is re-reviewed.`,
+        'Merge approval applies to an integration waiting for approval (publication state awaiting-approval).');
+    }
     if (!pub || (!local && (pub.state !== 'published' || !pub.pr_url))) {
       throw new MinionsError('PRECONDITION', `Task ${taskId} has no delivered pull request (or queued local integration) to approve for merging.`, 'Merge approval applies after pull-request delivery, or to a local integration.');
     }

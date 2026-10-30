@@ -20,7 +20,6 @@ vi.mock('../../src/plugin/generate.js', async () => {
   };
 });
 
-const { runInit } = await import('../../src/host/install.js');
 const { projectPaths } = await import('../../src/core/paths.js');
 const { loadProjectJson, projectConfigPath } = await import('../../src/host/project.js');
 const { validateConfig } = await import('../../src/config/resolve.js');
@@ -31,7 +30,7 @@ const J = await import('../../src/host/change-journal.js');
 const S = await import('../../src/host/settings.js');
 const SC = await import('../../src/host/settings-cli.js');
 const { editProjectConfig } = await import('../../src/host/config-write.js');
-const { makeRepo, withHome, dockerUp } = await import('./fixtures.js');
+const { initFromTemplate, withHome } = await import('./fixtures.js');
 type ProjectJson = import('../../src/host/project.js').ProjectJson;
 type SettingsRuntime = import('../../src/host/settings-cli.js').SettingsRuntime;
 type UpgradeRun = import('../../src/host/change-requests.js').UpgradeRun;
@@ -46,9 +45,8 @@ const readLocal = (f: string) => (existsSync(f) ? readJson(f) : {});
 const runtimeConfig = (p: ProjectJson) => validateConfig(readJson(join(projectPaths(p.projectId).runtimeDir, 'config.json')));
 
 async function install(visibility: 'shared' | 'private' = 'private') {
-  const repo = makeRepo(env.root);
-  const r = await runInit({ path: repo, yes: true, visibility, dockerProbe: dockerUp });
-  const project = await loadProjectJson(r.plan.projectId);
+  const { repo, projectId } = await initFromTemplate(env.root, { visibility });
+  const project = await loadProjectJson(projectId);
   return { repo, project, file: projectConfigPath(project), local: projectPaths(project.projectId).configLocalJson };
 }
 
@@ -235,13 +233,15 @@ describe('settings apply (host): plan, digest, confirmation', () => {
     expect(readJson(file).execution?.maxActiveTasks).not.toBe(6);
   });
 
-  it('refuses a forged request for a host-owned key, and requests that are not open', async () => {
+  it('applies a host-owned request only on the owner\'s confirmation; refuses requests that are not open', async () => {
     const { project, local } = await install();
-    db.addChangeRequest({ id: 'cr_0000beef', kind: 'config-set', payload: { key: 'capabilities.git.push', value: 'allow', layer: 'local' }, reason: 'trust me' });
+    db.addChangeRequest({ id: 'cr_0000beef', kind: 'config-set', payload: { key: 'architecture', value: 'propose', layer: 'local' }, reason: 'more owner control' });
     const { runtime } = fakeRuntime();
-    await expect(CR.applyRequest(project, 'cr_0000beef', { yes: true }, deps(runtime), io([]).io))
-      .rejects.toMatchObject({ code: 'CONFLICT', message: expect.stringMatching(/host-owned; a request from the container is never applied/) });
-    expect(readLocal(local).capabilities).toBeUndefined();
+    // Without --yes or --confirm nothing is applied: the plan is only offered.
+    expect((await CR.applyRequest(project, 'cr_0000beef', {}, deps(runtime), io([null]).io)).status).not.toBe('applied');
+    expect(readLocal(local).architecture).toBeUndefined();
+    expect((await CR.applyRequest(project, 'cr_0000beef', { yes: true }, deps(runtime), io([]).io)).status).toBe('applied');
+    expect(readLocal(local).architecture).toBe('propose');
     await expect(CR.applyRequest(project, 'cr_00000000', { yes: true }, deps(runtime), io([]).io)).rejects.toMatchObject({ code: 'NOT_FOUND' });
     // An invalid value forged into the row is refused by the host's own validation.
     db.addChangeRequest({ id: 'cr_0000cafe', kind: 'config-set', payload: { key: 'execution.maxEngineers', value: '50', layer: 'local' }, reason: null });
@@ -285,15 +285,15 @@ describe('settings apply (host): plan, digest, confirmation', () => {
     expect(journal().filter((e) => e.type === 'confirmed')).toHaveLength(0);
   });
 
-  it('Agents keys are all host-owned: refused when recorded by the container and by the host plan, never applied', async () => {
+  it('secrets are never requested from the container; host-owned Agents keys are planned for the owner to confirm', async () => {
     const { project } = await install();
     const { runtime } = fakeRuntime();
-    for (const [key, value] of [['secrets.codex', 'sk-test'], ['harnesses.default', 'codex'], ['roles.engineer.harness', 'codex']] as const) {
-      expect(() => requestSet(project, key, value)).toThrow(/host-owned/);
-      const id = requestSet(project, 'execution.maxActiveTasks', '5');
-      await expect(CR.buildPlan(project, { id, kind: 'config-set', reason: 'x', payload: { key, value, layer: 'local' } }, deps(runtime)))
-        .rejects.toMatchObject({ code: 'CONFLICT' });
-    }
+    expect(() => requestSet(project, 'secrets.codex', 'sk-test')).toThrow(/secret/);
+    const id = requestSet(project, 'execution.maxActiveTasks', '5');
+    await expect(CR.buildPlan(project, { id, kind: 'config-set', reason: 'x', payload: { key: 'secrets.codex', value: 'sk-test', layer: 'local' } }, deps(runtime)))
+      .rejects.toMatchObject({ code: 'PRECONDITION' });
+    const plan = await CR.buildPlan(project, { id, kind: 'config-set', reason: 'x', payload: { key: 'architecture', value: 'propose', layer: 'local' } }, deps(runtime));
+    expect(plan.plan.change).toMatchObject({ key: 'architecture', to: 'propose' });
   });
 
   it('the digest is stable for the same plan and covers its content', async () => {

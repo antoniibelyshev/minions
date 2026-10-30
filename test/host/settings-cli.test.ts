@@ -24,10 +24,9 @@ vi.mock('../../src/host/docker.js', async (orig) => {
 vi.mock('../../src/runtime/paths.js', async (orig) => ({ ...await orig<typeof import('../../src/runtime/paths.js')>(), inMinionsContainer: () => false }));
 
 const { buildProgram } = await import('../../src/program.js');
-const { runInit } = await import('../../src/host/install.js');
 const { projectPaths } = await import('../../src/core/paths.js');
 const C = await import('../../src/host/credentials.js');
-const { makeRepo, withHome, dockerUp } = await import('./fixtures.js');
+const { initFromTemplate, withHome } = await import('./fixtures.js');
 
 const TOKEN = '123456789:AAHfakefakefakefakefakefakefake_-0123';
 let env: ReturnType<typeof withHome>;
@@ -67,9 +66,8 @@ async function cli(cwd: string, args: string[]): Promise<{ out: string; code: nu
 const envelope = (out: string) => JSON.parse(out.trim().split('\n').at(-1)!) as { ok: boolean; data?: any; error?: { code: string; message: string } };
 
 async function install() {
-  const repo = makeRepo(env.root);
-  const r = await runInit({ path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
-  return { repo, projectId: r.plan.projectId, local: projectPaths(r.plan.projectId).configLocalJson };
+  const { repo, projectId } = await initFromTemplate(env.root, { visibility: 'private' });
+  return { repo, projectId: projectId, local: projectPaths(projectId).configLocalJson };
 }
 
 describe('minions settings (CLI)', () => {

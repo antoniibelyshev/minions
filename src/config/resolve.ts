@@ -230,6 +230,21 @@ function applySession(base: MinionsConfig, session: unknown, prov: Record<string
   return validateConfig(out, 'session overrides');
 }
 
+/**
+ * The two choices that drop the agents' last local boundary (no permission prompts at all, no host sandbox) are the
+ * owner's alone: the project layer may be committed to the repository, so only config.local.json may make them.
+ */
+function checkHostOnlyChoices(project: MinionsConfig, label: string): void {
+  if (project.coordinator?.permissionMode === 'bypassPermissions') {
+    throw new MinionsError('POLICY_DENIED', `coordinator.permissionMode: ${label} cannot select bypassPermissions.`,
+      'Set it in the host-only config.local.json: `minions settings set coordinator.permissionMode bypassPermissions`.', { path: 'coordinator.permissionMode' });
+  }
+  if (project.coordinator?.sandbox === false) {
+    throw new MinionsError('POLICY_DENIED', `coordinator.sandbox: ${label} cannot turn the host sandbox off.`,
+      'Set it in the host-only config.local.json: `minions settings set coordinator.sandbox false`.', { path: 'coordinator.sandbox' });
+  }
+}
+
 /** defaults < project < local < session. Returns the validated config with per-leaf provenance. */
 export function resolve(input: ResolveInput): EffectiveConfig {
   const label = (s: Source) => input.sources?.[s] ?? `${s} configuration`;
@@ -237,6 +252,7 @@ export function resolve(input: ResolveInput): EffectiveConfig {
   walk(input.defaults, [], (p) => (prov[p.join('.')] = 'default'));
   let merged = overlay(input.defaults as unknown as Obj, input.project, 'project', prov, label('project'));
   const project = validateConfig(merged, label('project'));
+  checkHostOnlyChoices(project, label('project'));
   merged = overlay(merged, input.local, 'local', prov, label('local'));
   let config = validateConfig(merged, input.local === undefined ? label('project') : label('local'));
   if (input.local !== undefined) checkDenyPreserved(project, config, label('local'));

@@ -18,7 +18,6 @@ vi.mock('../../src/plugin/generate.js', async (orig) => {
   };
 });
 
-const { runInit } = await import('../../src/host/install.js');
 const { loadProjectJson } = await import('../../src/host/project.js');
 const C = await import('../../src/host/credentials.js');
 const S = await import('../../src/host/settings.js');
@@ -26,7 +25,7 @@ const X = await import('../../src/host/manager-assistant-context.js');
 const MA = await import('../../src/host/manager-assistant.js');
 const P = await import('../../src/host/manager-assistant-proposal.js');
 const { helpText, REBUILD_HELP_LINE } = await import('../../src/host/manager-telegram.js');
-const { makeRepo, withHome, dockerUp } = await import('./fixtures.js');
+const { initFromTemplate, withHome } = await import('./fixtures.js');
 type JournalEntry = import('../../src/host/change-journal.js').JournalEntry;
 type ManagerOffer = import('../../src/host/manager.js').ManagerOffer;
 
@@ -45,9 +44,8 @@ afterEach(() => {
 });
 
 async function setup() {
-  const repo = makeRepo(env.root);
-  const r = await runInit({ path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
-  const project = await loadProjectJson(r.plan.projectId);
+  const { repo, projectId } = await initFromTemplate(env.root, { visibility: 'private' });
+  const project = await loadProjectJson(projectId);
   await C.provisionTelegramToken({ projectId: project.projectId, token: TOKEN, repoPath: repo, verify: false });
   const ctx = await S.loadSettingsContext(project);
   return { repo, project, ctx };

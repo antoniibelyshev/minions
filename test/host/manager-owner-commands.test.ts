@@ -31,7 +31,7 @@ const T = await import('../../src/host/manager-telegram.js');
 const S = await import('../../src/host/settings.js');
 const SC = await import('../../src/host/settings-cli.js');
 const US = await import('../../src/host/upgrade-source.js');
-const { makeRepo, withHome, dockerUp, git } = await import('./fixtures.js');
+const { initFromTemplate, makeRepo, withHome, dockerUp, git } = await import('./fixtures.js');
 type ProjectJson = import('../../src/host/project.js').ProjectJson;
 type RunResult = import('../../src/core/exec.js').RunResult;
 type ManagerOffer = import('../../src/host/manager.js').ManagerOffer;
@@ -52,9 +52,8 @@ const editProjectConfigBump = async (p: ProjectJson) => (await import('../../src
 const reason = async (p: Promise<unknown>) => { try { await p; } catch (e) { return e as Error & { code?: string; details?: any }; } throw new Error('expected a refusal'); };
 
 async function install(name = 'repo') {
-  const repo = makeRepo(env.root, name);
-  const r = await runInit({ path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
-  const project = await loadProjectJson(r.plan.projectId);
+  const { repo, projectId } = await initFromTemplate(env.root, { visibility: 'private', name });
+  const project = await loadProjectJson(projectId);
   return { project, repo, local: projectPaths(project.projectId).configLocalJson };
 }
 
@@ -148,7 +147,7 @@ describe('/set: an owner config change is a plan to confirm', () => {
     expect(journal()).toEqual([]);
   });
 
-  it('a host-owned key is allowed for the owner, with its loosening text (the transport asks twice); a container request for it is still refused', async () => {
+  it('a host-owned key is allowed for the owner, with its loosening text (the transport asks twice); a container request for it is only planned', async () => {
     const { project, local } = await install();
     const s = setup([project]);
     await S.loadSettingsContext(project);
@@ -161,10 +160,13 @@ describe('/set: an owner config change is a plan to confirm', () => {
     await s.confirm(o);
     expect(readJson(local).verification.reviewerRequired).toBe(false);
 
-    // The same change as a container request (forged snapshot) is refused by the host, whatever the snapshot claims.
+    // The same key as a container request is planned for the owner to confirm (never applied by itself)...
     const crId = 'cr_0a1b2c3d';
+    const container = { id: crId, kind: 'config-set', payload: { key: 'verification.reviewerRequired', value: 'true', layer: 'local' }, reason: null };
+    expect((await CR.buildPlan(project, container, { runtime: s.manager.runtime, upgrade: s.deps.upgrade })).plan).toMatchObject({ change: { key: 'verification.reviewerRequired', to: true } });
+    expect(readJson(local).verification.reviewerRequired).toBe(false);
+    // ...but a snapshot claiming the owner's origin or an owner-only kind is refused, whatever it claims.
     const forged = [
-      { id: crId, kind: 'config-set', payload: { key: 'verification.reviewerRequired', value: 'true', layer: 'local' }, reason: null },
       { id: crId, kind: 'config-set', payload: { key: 'verification.reviewerRequired', value: 'true', layer: 'local' }, reason: null, origin: 'owner' as const },
       { id: 'ow_0a1b2c3d', kind: 'config-set', payload: { key: 'verification.reviewerRequired', value: 'true', layer: 'local' }, reason: null },
       { id: crId, kind: 'sync', payload: {}, reason: null },
@@ -174,10 +176,9 @@ describe('/set: an owner config change is a plan to confirm', () => {
       const e = await reason(CR.buildPlan(project, f, { runtime: s.manager.runtime, upgrade: s.deps.upgrade }));
       expect(['CONFLICT', 'PRECONDITION']).toContain(e.code);
     }
-    expect((await reason(CR.buildPlan(project, forged[0]!, { runtime: s.manager.runtime, upgrade: s.deps.upgrade }))).details).toMatchObject({ hostOwned: true });
   });
 
-  it('delivery.requiredChecksConfigured (task-79): /set true is offered with its loosening text and applied; a container request is refused', async () => {
+  it('delivery.requiredChecksConfigured (task-79): /set true is offered with its loosening text and applied; a container request is planned with it too', async () => {
     const { project, local } = await install();
     const s = setup([project]);
     const o = await s.cmds.propose(null, { kind: 'config-set', key: 'delivery.requiredChecksConfigured', value: 'true', layer: 'local' });
@@ -192,7 +193,7 @@ describe('/set: an owner config change is a plan to confirm', () => {
     await s.confirm(off);
     expect(readJson(local).delivery.requiredChecksConfigured).toBe(false);
     const forged = { id: 'cr_0a1b2c3e', kind: 'config-set', payload: { key: 'delivery.requiredChecksConfigured', value: 'true', layer: 'local' }, reason: null };
-    expect((await reason(CR.buildPlan(project, forged, { runtime: s.manager.runtime, upgrade: s.deps.upgrade }))).details).toMatchObject({ hostOwned: true });
+    expect((await CR.buildPlan(project, forged, { runtime: s.manager.runtime, upgrade: s.deps.upgrade })).plan.loosens).toMatch(/auto-merge may arm/);
   });
 
   it('with several projects the command needs /project first; with a picked project it targets that one', async () => {
@@ -663,7 +664,7 @@ describe('the manager chat: owner change commands', () => {
 describe('QA: owner command security edges', () => {
   const rows = (list: unknown[]) => async (_p: ProjectJson, argv: string[]) => (argv[1] === 'settings' && argv[2] === 'requests' && !argv.includes('mark') ? ok({ requests: list }) : ok({}));
 
-  it('container rows through the poll: an ow_ id is dropped as malformed; a cr_ row claiming the owner origin or an owner-only kind is never offered', async () => {
+  it('container rows through the poll: an ow_ id is dropped as malformed; a cr_ row claiming the owner origin is offered as a container request; an owner-only kind is never offered', async () => {
     const { project, local } = await install();
     const s = setup([project]);
     const before = existsSync(local) ? readFileSync(local, 'utf8') : null;
@@ -674,12 +675,10 @@ describe('QA: owner command security edges', () => {
       { ...base, id: 'cr_0a1b2c3e', kind: 'sync', payload: {} },
       { ...base, id: 'cr_0a1b2c3f', kind: 'undo', payload: { target: 'cr_00000000' } },
     ]) });
-    expect(await m.pollProject(project)).toEqual([]);
-    expect(s.offers).toEqual([]);
-    expect(journal().filter((e) => e.type === 'offer')).toEqual([]);
+    await m.pollProject(project);
+    expect(s.offers).toEqual([expect.objectContaining({ requestId: 'cr_0a1b2c3d', text: expect.stringContaining('from the container, untrusted') })]);
     const texts = s.outcomes.map((o) => o.text).join('\n');
     expect(texts).toMatch(/ignored 1 malformed change request row/);
-    expect(texts).toMatch(/cr_0a1b2c3d .*cannot be offered: .*host-owned/);
     expect(texts).toMatch(/cr_0a1b2c3e .*cannot be offered: .*only from the owner/);
     expect(texts).toMatch(/cr_0a1b2c3f .*cannot be offered: .*only from the owner/);
     expect(existsSync(local) ? readFileSync(local, 'utf8') : null).toBe(before);

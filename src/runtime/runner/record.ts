@@ -9,6 +9,7 @@ import { link, mkdir, open, readFile, readdir, rename, rm, stat, writeFile } fro
 import { join } from 'node:path';
 import { MinionsError } from '../../core/errors.js';
 import { atomicWrite } from '../../core/fsutil.js';
+import { systemProcessFacts, type ProcessFacts } from '../process-facts.js';
 
 export type RunPhase = 'prepared' | 'running' | 'post-exit' | 'done';
 
@@ -201,7 +202,7 @@ export async function readOwner(state: string, leaseId: string): Promise<OwnerTo
 }
 
 /** Whether the holder still runs: same boot and container start, and the same live process. */
-export async function ownerAlive(t: OwnerToken, proc = '/proc'): Promise<boolean> {
+export async function ownerAlive(t: OwnerToken, proc: ProcSource = '/proc'): Promise<boolean> {
   return sameHost(t.host, await hostIdentity(proc)) && isAlive(t, proc);
 }
 
@@ -215,7 +216,7 @@ async function createOwner(path: string, t: OwnerToken): Promise<boolean> {
 }
 
 /** Takes the owner lock, or reports the live holder. A dead holder's lock is moved aside and taken. */
-export async function acquireOwner(state: string, leaseId: string, t: OwnerToken, proc = '/proc'): Promise<{ ok: true } | { ok: false; holder: OwnerToken }> {
+export async function acquireOwner(state: string, leaseId: string, t: OwnerToken, proc: ProcSource = '/proc'): Promise<{ ok: true } | { ok: false; holder: OwnerToken }> {
   const path = ownerLockPath(state, leaseId);
   for (let i = 0; i < 5; i++) {
     if (await createOwner(path, t)) return { ok: true };
@@ -245,8 +246,25 @@ export async function releaseOwner(state: string, leaseId: string, t: OwnerToken
 
 // ------------------------------------------------------------------------------------------------ identities
 
-/** Field 22 (start time) and field 5 (pgrp) of /proc/<pid>/stat; null when the process is gone. */
-export async function procStat(pid: number, proc = '/proc'): Promise<{ startTime: string; pgrp: number; state: string } | null> {
+/**
+ * Where process facts come from: a /proc root (Linux, or a fake tree in tests), or a ProcessFacts view (`ps` and
+ * `sysctl`, src/runtime/process-facts.ts). The default `/proc` resolves to the `ps` view on darwin, which has no /proc.
+ */
+export type ProcSource = string | ProcessFacts;
+const psSource = (proc: ProcSource): ProcessFacts | null =>
+  typeof proc !== 'string' ? proc : proc === '/proc' ? systemProcessFacts() : null;
+
+/**
+ * Field 22 (start time) and field 5 (pgrp) of /proc/<pid>/stat; null when the process is gone. From `ps` the start
+ * time is in epoch seconds and the state is the first `stat` letter (`Z` = zombie, as in /proc).
+ */
+export async function procStat(pid: number, proc: ProcSource = '/proc'): Promise<{ startTime: string; pgrp: number; state: string } | null> {
+  const ps = psSource(proc);
+  if (ps) {
+    const p = ps.process(pid);
+    return p ? { startTime: p.startTime, pgrp: p.pgid, state: p.state } : null;
+  }
+  if (typeof proc !== 'string') return null;
   try {
     const text = await readFile(join(proc, String(pid), 'stat'), 'utf8');
     const f = text.slice(text.lastIndexOf(')') + 2).split(' ');
@@ -257,19 +275,27 @@ export async function procStat(pid: number, proc = '/proc'): Promise<{ startTime
   } catch { return null; }
 }
 
-export async function procIdentity(pid: number, proc = '/proc'): Promise<ProcIdentity | null> {
+export async function procIdentity(pid: number, proc: ProcSource = '/proc'): Promise<ProcIdentity | null> {
   const s = await procStat(pid, proc);
   return s ? { pid, startTime: s.startTime } : null;
 }
 
 /** Alive and the same process (not a reused pid); a zombie counts as gone. */
-export async function isAlive(p: ProcIdentity | null, proc = '/proc'): Promise<boolean> {
+export async function isAlive(p: ProcIdentity | null, proc: ProcSource = '/proc'): Promise<boolean> {
   if (!p) return false;
   const s = await procStat(p.pid, proc);
   return !!s && s.startTime === p.startTime && s.state !== 'Z';
 }
 
-export async function hostIdentity(proc = '/proc'): Promise<HostIdentity | null> {
+/** The boot id and the start time of pid 1 (the container's init; launchd on macOS, where the boot id is from sysctl). */
+export async function hostIdentity(proc: ProcSource = '/proc'): Promise<HostIdentity | null> {
+  const ps = psSource(proc);
+  if (ps) {
+    const bootId = ps.bootId();
+    const init = ps.process(1);
+    return bootId && init ? { bootId, containerStart: init.startTime } : null;
+  }
+  if (typeof proc !== 'string') return null;
   try {
     const bootId = (await readFile(join(proc, 'sys', 'kernel', 'random', 'boot_id'), 'utf8')).trim();
     const init = await procStat(1, proc);
@@ -282,8 +308,11 @@ export const sameHost = (a: HostIdentity | null, b: HostIdentity | null): boolea
   !!a && !!b && a.bootId === b.bootId && a.containerStart === b.containerStart;
 
 /** Live members of process group `pgid` started no earlier than `notBefore` (guards against a reused pgid). */
-export async function groupMembers(pgid: number, notBefore: string, proc = '/proc'): Promise<number[]> {
+export async function groupMembers(pgid: number, notBefore: string, proc: ProcSource = '/proc'): Promise<number[]> {
   const out: number[] = [];
+  const ps = psSource(proc);
+  if (ps) return ps.list().filter((s) => s.pgid === pgid && s.state !== 'Z' && BigInt(s.startTime) >= BigInt(notBefore)).map((s) => s.pid);
+  if (typeof proc !== 'string') return out;
   let names: string[];
   try { names = await readdir(proc); } catch { return out; }
   for (const n of names) {

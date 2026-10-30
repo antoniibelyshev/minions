@@ -41,8 +41,8 @@ describe('run(): signal listeners and abort/timeout interplay', () => {
 
   it('abort first, then timeout: reported as aborted (130), not timed out', async () => {
     const ctl = new AbortController();
-    // Ignores SIGTERM so the timeout fires during the SIGKILL grace.
-    const p = run('node', ['-e', 'process.on("SIGTERM",()=>{}); setInterval(()=>{}, 1000)'], { signal: ctl.signal, timeoutMs: 600, allowFailure: true });
+    // Ignores SIGTERM so the timeout fires during the SIGKILL grace (injected 800 ms: abort at 300, timeout at 600).
+    const p = run('node', ['-e', 'process.on("SIGTERM",()=>{}); setInterval(()=>{}, 1000)'], { signal: ctl.signal, timeoutMs: 600, allowFailure: true, killGraceMs: 800 });
     await new Promise((res) => setTimeout(res, 300));
     ctl.abort();
     const r = await p;
