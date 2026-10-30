@@ -84,21 +84,6 @@ describe('startup intake budget with a real hung gh process', () => {
     expect(later.reconciliations).toMatchObject([{ taskId: 'task-2', reason: 'not-visible', action: 'paused' }]);
   }, 20_000);
 
-  it('a gh list call that hangs past the budget makes startup give up on time and imports nothing', async () => {
-    const e = makeDefaultEnv((c) => { c.intake.github = { ...FILTER }; });
-    const d = mkdtempSync(join(tmpdir(), 'minions-gh-hung-'));
-    dirs.push(d);
-    writeFileSync(join(d, 'gh'), ['#!/bin/sh', `echo $$ > '${d}/hung.pid'`, 'exec sleep 120'].join('\n'));
-    chmodSync(join(d, 'gh'), 0o755);
-    process.env.PATH = `${d}:${oldPath}`;
-    const logs: string[] = [];
-    const t0 = Date.now();
-    await intakeOnStart(e.config, (l) => logs.push(l), (o) => syncIntake({ db: e.db, backlog: e.backlog, config: e.config, ...o }), BUDGET);
-    expect(Date.now() - t0).toBeLessThan(BUDGET + GRACE + 500);
-    expect(await e.backlog.listTasks()).toEqual([]);
-    const pid = Number(readFileSync(join(d, 'hung.pid'), 'utf8'));
-    let gone = false;
-    for (let i = 0; i < 40 && !gone; i++) { gone = !alive(pid); if (!gone) await sleep(100); }
-    expect(gone).toBe(true);
-  }, 20_000);
+  // A gh list call that hangs past the budget (startup gives up, the child is killed) is "the budget abort kills the
+  // gh child too" in intake-followups.test.ts.
 });

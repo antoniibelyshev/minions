@@ -1,64 +1,76 @@
-// task-39 tester: gaps around run() signal handling and the provenance fallback hook. No live /state.
-import { getEventListeners } from 'node:events';
+// task-39 tester and follow-ups: the in-process parts of the GitHub intake follow-ups (the provenance fallback hook,
+// its cost, and the aborted list read report). No live /state. The parts with real processes (a hung gh, run()'s
+// signal handling, the real Backlog.md CLI) are in intake-followups.test.ts.
 import { describe, expect, it } from 'vitest';
 import { toTask } from '../../src/backlog/backlogmd.js';
-import { run } from '../../src/core/exec.js';
-import { INTAKE_STATE_META, intakeKey, intakeProvenanceFallback } from '../../src/runtime/intake-sync.js';
-import { makeDefaultEnv } from './fixtures.js';
+import type { ApiGet } from '../../src/runtime/ci.js';
+import {
+  formatIntake, INTAKE_ABORTED, INTAKE_STATE_META, intakeKey, intakeProvenanceFallback, intakeTrackedTaskIds, syncIntake, type GithubIntakeConfig,
+} from '../../src/runtime/intake-sync.js';
+import { makeUnitDefaultEnv } from './fixtures.js';
 
-const HANG = ['-e', 'setTimeout(()=>{}, 10000)'];
+const REPO = 'acme/demo';
+const FILTER: GithubIntakeConfig = { enabled: true, repository: REPO, labels: ['minions'], assignee: null, milestone: null, state: 'open' };
+const issue = (n: number) => ({ number: n, title: `Issue ${n}`, body: '', state: 'open', html_url: `https://github.com/${REPO}/issues/${n}`, assignees: [], labels: [{ name: 'minions' }], milestone: null });
 
-describe('run(): signal listeners and abort/timeout interplay', () => {
-  it('removes its abort listener when the child exits normally, fails, or times out', async () => {
-    const ctl = new AbortController();
-    await run('node', ['-e', 'process.exit(0)'], { signal: ctl.signal });
-    await run('node', ['-e', 'process.exit(3)'], { signal: ctl.signal, allowFailure: true });
-    await expect(run('node', ['-e', 'process.exit(3)'], { signal: ctl.signal })).rejects.toThrow(/exited with code 3/);
-    await run('node', HANG, { signal: ctl.signal, timeoutMs: 150, allowFailure: true });
-    await run('definitely-not-a-command-xyz', [], { signal: ctl.signal }).catch(() => {});
-    expect(getEventListeners(ctl.signal, 'abort')).toHaveLength(0);
-    // Aborting after all runs settled is harmless.
-    ctl.abort();
+describe('provenance fallback for intake-tracked tasks (item 2)', () => {
+  const rawNoMeta = { id: 'TASK-7', title: 'Imported', description: 'An issue body without a meta block' };
+  const rawBadMeta = { id: 'TASK-7', title: 'Imported', description: 'Body\n\n<!-- minions:meta {not json} -->' };
+  const rawMetaNoProv = { id: 'TASK-7', title: 'Imported', description: 'Body\n\n<!-- minions:meta {"branch":null} -->' };
+
+  it('tracked tasks fall back to external-requirement; other tasks keep user-decision; a valid meta provenance wins', () => {
+    const e = makeUnitDefaultEnv();
+    const fallback = intakeProvenanceFallback(() => e.db);
+    expect(fallback('task-7')).toBeUndefined(); // no sync record yet
+    e.db.setMeta(INTAKE_STATE_META, JSON.stringify({ version: 1, issues: {
+      [intakeKey(REPO, 3)]: { taskId: 'task-7', url: `https://github.com/${REPO}/issues/3`, repository: REPO, number: 3, assignees: [], inFilter: true, lastSeenAt: 'x' },
+    } }));
+    expect([...intakeTrackedTaskIds(e.db)]).toEqual(['task-7']);
+    for (const raw of [rawNoMeta, rawBadMeta, rawMetaNoProv]) {
+      expect(toTask(raw, { provenanceFallback: fallback }).provenance).toBe('external-requirement');
+      expect(toTask(raw).provenance).toBe('user-decision'); // the adapter default is unchanged without the hook
+      expect(toTask({ ...raw, id: 'TASK-8' }, { provenanceFallback: fallback }).provenance).toBe('user-decision');
+    }
+    const withMeta = { id: 'TASK-7', description: 'Body\n\n<!-- minions:meta {"provenance":"agent-hypothesis"} -->' };
+    expect(toTask(withMeta, { provenanceFallback: fallback }).provenance).toBe('agent-hypothesis');
   });
 
-  it('many sequential runs sharing one signal do not accumulate listeners', async () => {
+  it('a malformed sync record never throws and tracks nothing', () => {
+    const e = makeUnitDefaultEnv();
+    e.db.setMeta(INTAKE_STATE_META, '{broken');
+    expect(intakeProvenanceFallback(() => e.db)('task-1')).toBeUndefined();
+  });
+});
+
+describe('aborted list read report (item 4)', () => {
+  it('an aborted or failed list read reports no matched count, not the pages read so far', async () => {
+    const e = makeUnitDefaultEnv((c) => { c.intake.github = { ...FILTER }; });
     const ctl = new AbortController();
-    for (let i = 0; i < 15; i++) await run('node', ['-e', '0'], { signal: ctl.signal });
-    expect(getEventListeners(ctl.signal, 'abort')).toHaveLength(0);
+    const page1 = Array.from({ length: 100 }, (_, i) => issue(i + 1));
+    const api: ApiGet = (path) => {
+      if (/[?&]page=1(&|$)/.test(path)) return Promise.resolve({ status: 200, body: page1 });
+      ctl.abort(); // the budget runs out while page 2 is in flight
+      return new Promise(() => { /* never answers */ });
+    };
+    const r = await syncIntake({ db: e.db, backlog: e.backlog, config: e.config, api, signal: ctl.signal });
+    expect(r.matched).toBeNull();
+    expect(r.created).toEqual([]);
+    expect(r.errors.join('\n')).toContain(INTAKE_ABORTED);
+    const text = formatIntake(r);
+    expect(text).not.toMatch(/100 matching/);
+    expect(text).toContain('issue list not read, nothing imported');
+    const ev = e.db.all<{ data_json: string }>('SELECT data_json FROM events WHERE kind = ?', 'intake-sync');
+    expect(JSON.parse(ev.at(-1)!.data_json)).toMatchObject({ matched: null, created: 0 });
+
+    const failed = await syncIntake({ db: e.db, backlog: e.backlog, config: e.config, api: async () => ({ status: 401, body: null, error: 'Bad credentials' }) });
+    expect(failed.matched).toBeNull();
+    expect(formatIntake(failed)).toContain('issue list not read');
   });
 
-  it('timeout first, then abort: reported as timed out (124), not aborted, and not killed twice', async () => {
-    const ctl = new AbortController();
-    const t = Date.now();
-    const p = run('node', HANG, { signal: ctl.signal, timeoutMs: 150, allowFailure: true });
-    setTimeout(() => ctl.abort(), 160);
-    const r = await p;
-    expect(r.timedOut).toBe(true);
-    expect(r.aborted).toBeUndefined();
-    expect(r.code).toBe(124);
-    expect(Date.now() - t).toBeLessThan(2000);
-  });
-
-  it('abort first, then timeout: reported as aborted (130), not timed out', async () => {
-    const ctl = new AbortController();
-    // Ignores SIGTERM so the timeout fires during the SIGKILL grace (injected 800 ms: abort at 300, timeout at 600).
-    const p = run('node', ['-e', 'process.on("SIGTERM",()=>{}); setInterval(()=>{}, 1000)'], { signal: ctl.signal, timeoutMs: 600, allowFailure: true, killGraceMs: 800 });
-    await new Promise((res) => setTimeout(res, 300));
-    ctl.abort();
-    const r = await p;
-    expect(r.aborted).toBe(true);
-    expect(r.timedOut).toBeUndefined();
-    expect(r.code).toBe(130);
-    expect(getEventListeners(ctl.signal, 'abort')).toHaveLength(0);
-  }, 10_000);
-
-  it('without a signal the timeout path is unchanged (rejects with timed out, code 124 with allowFailure)', async () => {
-    await expect(run('node', HANG, { timeoutMs: 150 })).rejects.toMatchObject({ details: expect.objectContaining({ timedOut: true, code: 124 }) });
-    const r = await run('node', HANG, { timeoutMs: 150, allowFailure: true });
-    expect(r).toMatchObject({ timedOut: true, code: 124 });
-    expect('aborted' in r).toBe(false);
-    const f = await run('node', ['-e', 'process.stderr.write("e"); process.exit(2)'], { allowFailure: true });
-    expect(f).toEqual({ code: 2, stdout: '', stderr: 'e' });
+  it('a complete read still reports the count; a truncated one says "at least"', () => {
+    const base = { enabled: true, repository: REPO, created: [], createdReady: [], existing: 2, skippedIntakePaused: 0, reconciliations: [], warnings: [], errors: [] };
+    expect(formatIntake({ ...base, matched: 2, complete: true })).toContain(': 2 matching issue(s), 0 imported, 2 already');
+    expect(formatIntake({ ...base, matched: 1000, complete: false })).toContain(': at least 1000 matching issue(s)');
   });
 });
 
@@ -74,7 +86,7 @@ describe('provenance fallback hook: cost', () => {
   });
 
   it('stays cheap with a large sync record and many meta-less tasks', () => {
-    const e = makeDefaultEnv();
+    const e = makeUnitDefaultEnv();
     const issues: Record<string, unknown> = {};
     for (let n = 1; n <= 1000; n++) {
       issues[intakeKey('acme/demo', n)] = { taskId: `task-${n}`, url: `https://github.com/acme/demo/issues/${n}`, repository: 'acme/demo', number: n, assignees: [], inFilter: true, lastSeenAt: 'x' };

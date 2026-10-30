@@ -104,7 +104,6 @@ export const INTEGRATION_TESTS: readonly string[] = [
   'test/runtime/harness-upgrade-qa.test.ts',
   'test/runtime/headless.test.ts',
   'test/runtime/hook-commands-fail-closed.test.ts',
-  'test/runtime/intake-followups-tester.test.ts',
   'test/runtime/intake-followups.test.ts',
   'test/runtime/intake-startup-budget.test.ts',
   'test/runtime/intake-sync-forgery.test.ts',
