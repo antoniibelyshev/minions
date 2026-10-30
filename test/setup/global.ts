@@ -7,6 +7,12 @@ import { homedir, tmpdir, userInfo } from 'node:os';
 import { join, resolve } from 'node:path';
 
 export default function setup(): () => void {
+  // Each vitest project (unit, integration: task-137.1) runs its globalSetup in this one process. The first
+  // call isolates; a later one must not count the first temp dir as "real", so it keeps the same setup.
+  const done = Symbol.for('minions.test.globalSetup');
+  const g = globalThis as Record<symbol, unknown>;
+  if (g[done]) return () => {};
+  g[done] = true;
   // Every config dir a nested claude must never use: the inherited CLAUDE_CONFIG_DIR, ~/.claude for
   // $HOME and for the passwd home (claude falls back to it when HOME is unset).
   const real = new Set<string>();
@@ -18,5 +24,5 @@ export default function setup(): () => void {
   process.env.MINIONS_TEST_REAL_CLAUDE_DIRS = JSON.stringify([...real]);
   process.env.MINIONS_TEST_CLAUDE_CONFIG_DIR = dir;
   process.env.CLAUDE_CONFIG_DIR = dir;
-  return () => rmSync(dir, { recursive: true, force: true });
+  return () => { delete g[done]; rmSync(dir, { recursive: true, force: true }); };
 }

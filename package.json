@@ -31,6 +31,8 @@
     "schema": "node esbuild.config.mjs --schema-only",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
+    "test:unit": "vitest run --project unit",
+    "test:integration": "vitest run --project integration",
     "coverage": "vitest run --coverage",
     "qa:perf": "npm run build && node scripts/qa-perf.mjs",
     "pack": "npm run build && npm pack",
