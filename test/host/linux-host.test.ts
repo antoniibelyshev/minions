@@ -1,6 +1,7 @@
 // Linux host support (task-25): host data root, Docker Engine diagnostics and their doctor wiring.
 // All fakes: no Docker, no SELinux, no real distro. Every Linux branch is paired with the unchanged macOS behaviour.
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+vi.mock('../../src/core/exec.js', async (orig) => (await import('./fs-git.js')).withFsGit(await orig()));
 import type { RunOptions, RunResult } from '../../src/core/exec.js';
 import { hostRoot } from '../../src/core/paths.js';
 import type { DockerStatus } from '../../src/host/discovery.js';

@@ -3,6 +3,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import type { Command } from 'commander';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+vi.mock('../../src/core/exec.js', async (orig) => (await import('./fs-git.js')).withFsGit(await orig()));
 
 vi.mock('../../src/plugin/generate.js', async () => {
   const { mkdir, writeFile } = await import('node:fs/promises');

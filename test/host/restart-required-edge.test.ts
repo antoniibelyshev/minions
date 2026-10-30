@@ -4,6 +4,7 @@
 import { mkdirSync, symlinkSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+vi.mock('../../src/core/exec.js', async (orig) => (await import('./fs-git.js')).withFsGit(await orig()));
 import type { RunOptions, RunResult } from '../../src/core/exec.js';
 import { CONTAINER, projectPaths } from '../../src/core/paths.js';
 import { Compose } from '../../src/host/docker.js';

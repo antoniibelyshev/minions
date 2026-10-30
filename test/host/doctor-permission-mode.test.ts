@@ -2,6 +2,7 @@
 // `minions coordinator --probe --json` (task-36): ok with auto, warn on the acceptEdits fallback,
 // ok for older probe output without the permission field. All fakes: no Docker.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+vi.mock('../../src/core/exec.js', async (orig) => (await import('./fs-git.js')).withFsGit(await orig()));
 import type { RunOptions, RunResult } from '../../src/core/exec.js';
 
 vi.mock('../../src/plugin/generate.js', async () => {

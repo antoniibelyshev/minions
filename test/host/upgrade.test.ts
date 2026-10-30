@@ -2,7 +2,8 @@
 // drain (wait / timeout / --now), fingerprint-gated rebuild, volume and backlog preservation, failure paths.
 import { appendFileSync, cpSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+vi.mock('../../src/core/exec.js', async (orig) => (await import('./fs-git.js')).withFsGit(await orig()));
 import type { RunOptions, RunResult } from '../../src/core/exec.js';
 import { projectPaths } from '../../src/core/paths.js';
 import { Compose, buildFingerprint } from '../../src/host/docker.js';

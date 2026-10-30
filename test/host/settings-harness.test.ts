@@ -4,6 +4,7 @@
 // so refused values fail before anything is written. Temp MINIONS_HOME, file credential store; no Docker.
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+vi.mock('../../src/core/exec.js', async (orig) => (await import('./fs-git.js')).withFsGit(await orig()));
 
 vi.mock('../../src/plugin/generate.js', async () => {
   const { mkdir, writeFile } = await import('node:fs/promises');

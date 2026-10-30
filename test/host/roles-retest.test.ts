@@ -5,7 +5,8 @@
 // - LOOSENS: project overrides count as the base; a base deny is never lifted and never listed.
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+vi.mock('../../src/core/exec.js', async (orig) => (await import('./fs-git.js')).withFsGit(await orig()));
 import { validateConfig } from '../../src/config/resolve.js';
 import { PROFILES } from '../../src/config/schema.js';
 import { projectPaths } from '../../src/core/paths.js';
