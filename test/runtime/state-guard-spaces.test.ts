@@ -5,9 +5,8 @@ import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it, vi } from 'vitest';
-import { PRE_BASH_HOOK_COMMAND, preBashHook, preFileHook, runHook } from '../../src/runtime/hooks.js';
+import { preBashHook, preFileHook, runHook } from '../../src/runtime/hooks.js';
 import { bashStateReference, stateGuard } from '../../src/runtime/state-guard.js';
-import { runHookCommand } from '../helpers.js';
 
 const tmp = mkdtempSync(join(tmpdir(), 'minions-state-spaces-'));
 afterAll(() => rmSync(tmp, { recursive: true, force: true }));
@@ -104,8 +103,7 @@ describe('bashStateReference: a state or secrets dir with a space in its path (t
     for (const cmd of ['cat "$MINIONS_SECRETS_DIR/github-token"', 'ls ${MINIONS_SECRETS_DIR}', 'sqlite3 "$MINIONS_STATE_DIR/minions.db"']) {
       expect(bashStateReference(cmd, host), cmd).not.toBeNull();
     }
-    // The hook's shell filter forwards such a call to minions (here none is installed: exit 2, fails closed).
-    expect(runHookCommand(PRE_BASH_HOOK_COMMAND, null, JSON.stringify(bash('cat "$MINIONS_SECRETS_DIR/github-token"'))).status).toBe(2);
+    // The hook's shell filter forwarding such a call spawns a shell: see state-guard-spaces-hook.test.ts (integration).
   });
 
   it('paths without spaces are refused and allowed as before', () => {
