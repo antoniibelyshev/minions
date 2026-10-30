@@ -1,16 +1,9 @@
 // Tester additions for the GitHub intake sync (task-19): gaps not covered by intake-sync.test.ts.
 // Temp dirs only (never the live /state); GitHub is a mocked read-only ApiGet.
-import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { BacklogMdAdapter } from '../../src/backlog/backlogmd.js';
-import { writeBacklogConfig } from '../../src/backlog/factory.js';
 import type { ApiResponse } from '../../src/runtime/ci.js';
 import { RuntimeDb } from '../../src/runtime/db.js';
 import { INTAKE_STATE_META, intakeKey, syncIntake, type GithubIntakeConfig } from '../../src/runtime/intake-sync.js';
-import { defaults } from '../helpers.js';
 import { FakeBacklog, makeUnitDefaultEnv } from './fixtures.js';
 
 const REPO = 'acme/demo';
@@ -88,35 +81,6 @@ describe('intake sync: gaps (fake backlog)', () => {
   });
 });
 
-const hasBacklog = !!process.env.MINIONS_BACKLOG_BIN || (() => { try { execFileSync('backlog', ['--version'], { stdio: 'ignore' }); return true; } catch { return false; } })();
-
-describe.skipIf(!hasBacklog)('intake sync: gaps (real Backlog.md adapter)', () => {
-  const withReal = async (fn: (x: { db: RuntimeDb; backlog: BacklogMdAdapter; gh: ReturnType<typeof fakeApi>; run: () => ReturnType<typeof syncIntake> }) => Promise<void>) => {
-    const root = mkdtempSync(join(tmpdir(), 'minions-intake-gaps-'));
-    const db = new RuntimeDb(join(root, 'minions.db'));
-    try {
-      await writeBacklogConfig(root);
-      const backlog = new BacklogMdAdapter({ root, idempotency: db.idempotency });
-      const config = defaults(); config.intake.github = { ...FILTER };
-      const gh = fakeApi();
-      await fn({ db, backlog, gh, run: () => syncIntake({ db, backlog, config, api: gh.api }) });
-    } finally { db.close(); rmSync(root, { recursive: true, force: true }); }
-  };
-
-  it('an issue leaving the filter pauses the real task (blocked + note), keeps it, and a rerun neither duplicates nor re-pauses', async () => {
-    await withReal(async ({ db, backlog, gh, run }) => {
-      gh.set([{ number: 3, title: 'Real reconcile', body: 'Body' }]);
-      const [id] = (await run()).created;
-      gh.s.all.set(3, { number: 3, state: 'closed' });
-      gh.s.list = [];
-      const r = await run();
-      expect(r.reconciliations).toMatchObject([{ taskId: id, reason: 'closed', action: 'paused' }]);
-      const t = await backlog.getTask(id!);
-      expect(t).toMatchObject({ status: 'blocked', title: 'Real reconcile', provenance: 'external-requirement', externalLinks: [`https://github.com/${REPO}/issues/3`] });
-      expect(await backlog.listTasks()).toHaveLength(1);
-      expect((await run()).reconciliations).toEqual([]);
-      expect(events(db, 'intake-reconcile')).toHaveLength(1);
-    });
-  }, 60_000);
-  // Body and title forgery of the meta block (task-19) is the forgery matrix in intake-sync-forgery.test.ts.
-});
+// The real Backlog.md side of the intake sync (create, PR update, forged meta blocks) is the forgery matrix in
+// intake-sync-forgery.test.ts; pausing a departed issue is adapter-independent (the first test above) and the
+// adapter's status and note writes are covered by test/backlog/backlogmd.test.ts.

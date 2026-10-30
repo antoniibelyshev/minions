@@ -108,7 +108,6 @@ export const INTEGRATION_TESTS: readonly string[] = [
   'test/runtime/intake-followups.test.ts',
   'test/runtime/intake-startup-budget.test.ts',
   'test/runtime/intake-sync-forgery.test.ts',
-  'test/runtime/intake-sync-gaps.test.ts',
   'test/runtime/integration-surface.test.ts',
   'test/runtime/integration.test.ts',
   'test/runtime/integrator.test.ts',
