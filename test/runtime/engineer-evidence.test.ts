@@ -44,6 +44,16 @@ describe('engineer complete needs passing verification evidence', () => {
       .toEqual([expect.stringMatching(/cannot skip configured verification \(npm run typecheck\)/)]);
   });
 
+  it('accepts the configured full suite reported skipped next to a passing unit tier; a skipped typecheck is still refused', () => {
+    const skippedSuite = { command: 'npm test', outcome: 'skipped' as const, details: 'integration gate runs it' };
+    expect(errorsOf(res([pass('npm run typecheck'), pass('npm run test:unit'), skippedSuite]))).toEqual([]);
+    // Without a passing test run the skipped suite is not enough.
+    expect(errorsOf(res([pass('npm run typecheck'), skippedSuite]))).toEqual([expect.stringMatching(/needs a passing test run \(the unit tier/)]);
+    const errs = errorsOf(res([{ command: 'npm run typecheck', outcome: 'skipped' }, pass('npm run test:unit'), skippedSuite]));
+    expect(errs).toEqual([expect.stringMatching(/cannot skip configured verification \(npm run typecheck\); run it along with the unit tier/)]);
+    expect(errs[0]).not.toMatch(/npm test/);
+  });
+
   it('blocked, partial and needs_split stay allowed with failing or missing runs', () => {
     for (const status of ['blocked', 'partial', 'needs_split']) {
       expect(errorsOf(res([{ command: 'npm run test:unit', outcome: 'fail' }], status)), status).toEqual([]);

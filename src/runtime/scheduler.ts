@@ -1384,7 +1384,7 @@ export class Scheduler {
       if (limit) message += ` ${limit}`;
     } else if (ciBlock === 'unverified') {
       to = from;
-      message = `Not approved: the ${lease.role} relied on CI, but ${formatCiGate(ciGate!)}. Task stays ${from}: ${ciGate!.state === 'pending' ? 'run \`minions sync\` after CI finishes and re-dispatch, or ' : ''}re-dispatch the ${lease.role} with local verification (run the verification commands).`;
+      message = `Not approved: the ${lease.role} relied on CI, but ${formatCiGate(ciGate!)}. Task stays ${from}: ${ciGate!.state === 'pending' ? 'run \`minions sync\` after CI finishes and re-dispatch, or ' : ''}re-dispatch the ${lease.role} with local verification and without citing CI (engineers: typecheck + unit tier; reviewers run no tests).`;
     } else switch (r.status) {
       case 'complete': {
         const pos = plan!.position;

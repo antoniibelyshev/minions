@@ -80,7 +80,7 @@ export interface ValidateOptions {
   /**
    * verification.commands, passed for the built-in engineer (task-137.3; custom producer roles keep their own
    * rules). Then a complete producer result may not report a failing check, and with commands configured it
-   * must carry passing local evidence: no configured command reported skipped, at least one passing check, and
+   * must carry passing local evidence: no configured non-test command (the typecheck) reported skipped, at least one passing check, and
    * a passing test run when a configured command runs tests. The test run may be the unit tier or targeted
    * files: the full suite and the integration tier run in the merge gate.
    */
@@ -97,8 +97,10 @@ function producerEvidenceErrors(checks: WorkerResult['checks'], configured: stri
   const failed = local.filter((c) => c.outcome === 'fail').map((c) => c.command);
   if (failed.length) errors.push(`checks: a complete engineer (producer) result cannot report failing checks (${failed.join(', ')}); fix them, or use partial or blocked`);
   if (!configured.length) return errors;
-  const skipped = configured.filter((cmd) => local.some((c) => c.outcome === 'skipped' && normalizeCheckCommand(c.command) === normalizeCheckCommand(cmd)));
-  if (skipped.length) errors.push(`checks: a complete engineer (producer) result cannot skip configured verification (${skipped.join(', ')}); run it, or use partial or blocked`);
+  // Configured test runs (the full suite, the integration tier) may be skipped: the engineer runs the unit tier
+  // instead, and the merge gate runs the rest. Other configured commands (the typecheck) may not.
+  const skipped = configured.filter((cmd) => !isTestRun(cmd) && local.some((c) => c.outcome === 'skipped' && normalizeCheckCommand(c.command) === normalizeCheckCommand(cmd)));
+  if (skipped.length) errors.push(`checks: a complete engineer (producer) result cannot skip configured verification (${skipped.join(', ')}); run it along with the unit tier (e.g. \`npm run test:unit\`), or use partial or blocked`);
   const passed = local.filter((c) => c.outcome === 'pass');
   if (!passed.length) errors.push(`checks: a complete engineer (producer) result needs passing verification evidence (the typecheck and the unit tests you ran; configured: ${configured.join(', ')}); use partial or blocked if you could not run it`);
   else if (configured.some(isTestRun) && !passed.some((c) => isTestRun(c.command))) errors.push('checks: a complete engineer (producer) result needs a passing test run (the unit tier, e.g. `npm run test:unit`); use partial or blocked if you could not run it');
