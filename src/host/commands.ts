@@ -536,6 +536,7 @@ export function register(program: Command): void {
       const project = await loadProjectJson(ref.projectId);
       // Host runtime (task-7): no image or container; the same phases run through the shim (src/host/upgrade-host.ts).
       const hostRt = runtimeOf(project) === 'host' ? new HostRuntime(project) : null;
+      const hostTarget = hostRt ? hostUpgradeTarget(project, hostRt) : null;
       if (!dryRun && !hostRt) await requireDocker();
       const compose = hostRt ? null : new Compose(project.projectId);
       // The rest of the upgrade, as run again by the new CLI after a reinstall (or by the user after a stop).
@@ -555,7 +556,10 @@ export function register(program: Command): void {
             exportRepo: async () => {
               if (hostRt) {
                 if (!(await hostRt.prepared())) throw new MinionsError('PRECONDITION', '--from-container needs the host runtime started (it exports from it).', 'Run `minions start --no-attach`, or upgrade without --from-container.');
-                await prepareHostRuntime(project);
+                // Refuse before touching anything (the shim included): the preflight in runUpgrade only runs after this
+                // source phase. The shim is left as it is here; the transfer target creates its own dirs.
+                const problem = await hostTarget!.cliProblem();
+                if (problem) throw new MinionsError('PRECONDITION', `Upgrade not started: ${problem}.`);
                 return exportRepo(project, { repoPath: ref.repoPath, target: hostRt.transferTarget() });
               }
               if (!(await compose!.isRunning())) throw new MinionsError('PRECONDITION', '--from-container needs the project container running (it exports from it).', 'Run `minions start --no-attach`, or upgrade without --from-container.');
@@ -567,7 +571,7 @@ export function register(program: Command): void {
           rerun: ['minions', 'upgrade', ...flags].join(' '),
         }),
         projectId: project.projectId, imageTag: project.imageTag, timeoutSec, now: o.now, dryRun,
-        ...(hostRt ? { host: hostUpgradeTarget(project, hostRt) } : { compose: compose!, importRepo: () => importRepo(project, { repoPath: ref.repoPath }) }),
+        ...(hostTarget ? { host: hostTarget } : { compose: compose!, importRepo: () => importRepo(project, { repoPath: ref.repoPath }) }),
         refresh: () => refreshForUpgrade(project),
         checkPlugin: async () => pluginMismatch(await checkPlugin(project, (await loadEffectiveConfig(project)).config)),
         materialize: () => materializeSecrets(project.projectId),

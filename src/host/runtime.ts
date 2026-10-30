@@ -13,8 +13,9 @@
 //   (src/runtime/coordinator.ts `hostSettings`) unless the owner turns the sandbox off (coordinator.sandbox false,
 //   config.local.json only); bypassPermissions likewise only from config.local.json.
 import { spawn } from 'node:child_process';
+import { realpathSync } from 'node:fs';
 import { chmod, readFile, rm } from 'node:fs/promises';
-import { isAbsolute, join } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative } from 'node:path';
 import { MinionsError } from '../core/errors.js';
 import { run, type RunOptions, type RunResult } from '../core/exec.js';
 import { atomicWrite, copyRegularFileNoFollow, ensureDir, ensureRealDir, exists } from '../core/fsutil.js';
@@ -158,6 +159,44 @@ export async function ghShim(realGh: string, tokenFile: string, root: string = p
   return out;
 }
 
+/** realpath of the deepest existing ancestor, with the rest appended (a missing file still resolves its links). */
+export function realPathOf(p: string): string {
+  try { return realpathSync(p); } catch {
+    const up = dirname(p);
+    return up === p ? p : join(realPathOf(up), basename(p));
+  }
+}
+/** Whether p is dir or below it (lexically). */
+export const isInside = (p: string, dir: string): boolean => { const r = relative(dir, p); return r === '' || (!!r && !r.startsWith('..') && !isAbsolute(r)); };
+
+/** The dirs of the host runtime agents may write (the sandbox allows the workspace and the state dir only). */
+export function agentWritableDirs(projectId: string): string[] {
+  const hp = hostRuntimePaths(projectId);
+  return [hp.workspace, hp.state];
+}
+
+/** The agent-writable dir one of these paths is in (as given or after resolving symlinks), or null. */
+export function agentWritableHit(paths: string[], agentWritable: string[]): { path: string; dir: string } | null {
+  const dirs = agentWritable.map((d) => ({ d, r: realPathOf(d) }));
+  for (const p of paths) {
+    const hit = dirs.find(({ d, r }) => isInside(p, d) || isInside(realPathOf(p), r));
+    if (hit) return { path: realPathOf(p), dir: hit.d };
+  }
+  return null;
+}
+
+/**
+ * Refuses a shim target inside the agent-writable host dirs (task-7): the shim runs outside the Claude Code
+ * sandbox, so pointing it at a CLI an agent can write would let agents run unsandboxed code. Throws before any write.
+ */
+export function assertShimTargetSafe(projectId: string, target: ShimTarget): void {
+  const hit = agentWritableHit([target.cli, dirname(dirname(target.cli))], agentWritableDirs(projectId));
+  if (hit) {
+    throw new MinionsError('PRECONDITION', `Refusing to point the host runtime shim at ${hit.path}: it is inside the agent-writable ${hit.dir}.`,
+      'Run minions from an install outside the host runtime dirs (npm pack in your checkout, then npm install -g <tarball>).');
+  }
+}
+
 /**
  * Writes the shims (0755 in a 0700 dir) and creates the 0700 host runtime dirs. The gh shim exists
  * only when gh is installed on the host (needed for pull-request delivery). Tokens still in the macOS
@@ -165,11 +204,13 @@ export async function ghShim(realGh: string, tokenFile: string, root: string = p
  * commands can run /usr/bin/security, which every minions Keychain item trusts).
  */
 export async function prepareHostRuntime(project: ProjectJson, opts: { target?: ShimTarget; pathEnv?: string; runner?: Runner } = {}): Promise<{ gh: string | null; movedToFileStore: MovedToken[]; keychainWarnings: string[] }> {
+  const target = opts.target ?? defaultShimTarget();
+  assertShimTargetSafe(project.projectId, target); // before any write: a refused target leaves the shim as it was
   const hp = hostRuntimePaths(project.projectId);
   for (const d of [hp.root, hp.bin, hp.workspace, hp.state, hp.cache, hp.logs, hp.transfer, hp.import, hp.exports]) { await ensureRealDir(d, 0o700); await chmod(d, 0o700); }
   await ensureDir(projectPaths(project.projectId).secretsDir, 0o700);
   const moved = await moveKeychainTokensToFileStore(opts.runner ?? run);
-  await atomicWrite(hp.minionsShim, minionsShim(project, opts.target ?? defaultShimTarget()), { mode: 0o755 });
+  await atomicWrite(hp.minionsShim, minionsShim(project, target), { mode: 0o755 });
   const pathEnv = (opts.pathEnv ?? process.env.PATH ?? '').split(':').filter((d) => d && d !== hp.bin && isAbsolute(d)).join(':');
   const gh = await resolveOnPath('gh', pathEnv);
   if (gh) await atomicWrite(hp.ghShim, await ghShim(gh, projectPaths(project.projectId).githubTokenFile), { mode: 0o755 });
