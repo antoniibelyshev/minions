@@ -421,10 +421,10 @@ describe('Keychain avoidance (H3)', () => {
 // ---------------------------------------------------------------- L5 / Telegram
 
 describe('Telegram in the host runtime', () => {
-  it('is disabled with a precise reason (user plugins are not loaded)', () => {
+  it('uses the minions channel server (task-6), not the official plugin', () => {
     const cfg = { ...defaults(), communication: { ...defaults().communication, channel: 'telegram' as const } };
     const d = C.decideTelegram(cfg, { state: 'ok', token: 'x', botId: '1' }, { available: true, summary: '', items: [] } as never, true);
-    expect(d).toEqual({ enabled: false, reason: C.HOST_TELEGRAM_REASON });
+    expect(d).toMatchObject({ enabled: true, server: 'minions' });
     expect(C.decideTelegram(cfg, { state: 'ok', token: 'x', botId: '1' }, { available: true, summary: '', items: [] } as never, false).enabled).toBe(true);
   });
 });

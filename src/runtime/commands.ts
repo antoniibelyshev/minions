@@ -29,7 +29,7 @@ import { formatAccessResult, runAccessCommand, type AccessAction } from '../tele
 import { createInterface } from 'node:readline/promises';
 import type { PollerCheck } from '../telegram/isolation.js';
 import {
-  buildClaudeCommand, buildCoordinatorCommand, hostChannelReport, telegramPollerStatus, claudePermissionModes, coordinatorWrapper, launchCoordinator, permissionModesNeeded, probeRuntime, readLaunchRecord, readMountedToken, RECOVERY_PROMPT,
+  buildClaudeCommand, buildCoordinatorCommand, hostChannelReport, printChannelServer, telegramPollerStatus, claudePermissionModes, coordinatorWrapper, launchCoordinator, permissionModesNeeded, probeRuntime, readLaunchRecord, readMountedToken, RECOVERY_PROMPT,
   restartCoordinator, runtimeChannelFacts, scheduleDetachedRestart, syncCoordinator, coordinatorLaunchStatus, type LaunchStatus,
   coordinatorPidAlive, procStartTime, readExitRecord, runtimeAuthMethod, systemProcessControl, scheduleCrashStart, TELEGRAM_TOKEN_ENV, WAKE_PROMPT,
 } from './coordinator.js';
@@ -945,7 +945,11 @@ export function register(program: Command): void {
       if (o.printCommand) {
         // Same permission-mode check as the launch: auto only when this Claude Code offers it; default under the name it lists.
         const permissionModes = permissionModesNeeded(cfg) ? await claudePermissionModes() : undefined;
-        const r = { tmux: await buildCoordinatorCommand(cfg), claude: await buildClaudeCommand(cfg, runtimePaths(), { telegram: cfg.communication.channel !== 'terminal', permissionModes }) };
+        const paths = runtimePaths();
+        const telegram = cfg.communication.channel !== 'terminal';
+        // Host runtime: the launch id is made per launch, so the printed argv shows a placeholder for it.
+        const channelServer = telegram && runtimeMode() === 'host-runtime' ? printChannelServer(paths) : undefined;
+        const r = { tmux: await buildCoordinatorCommand(cfg), claude: await buildClaudeCommand(cfg, paths, { telegram, permissionModes, ...(channelServer ? { channelServer } : {}) }) };
         emit(r, { json: globalOpts(cmd).json, human: (d: typeof r) => [JSON.stringify([d.tmux.cmd, ...d.tmux.args]), JSON.stringify([d.claude.cmd, ...d.claude.args])].join('\n') });
         return;
       }

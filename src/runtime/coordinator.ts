@@ -693,6 +693,19 @@ export interface RunCoordinatorDeps {
   newLaunchId?: () => string;
 }
 
+/** Placeholder for the launch id in `minions coordinator --print-command` (each launch makes its own). */
+export const PRINT_LAUNCH_ID = '<launch-id>';
+
+/** The channel server parameters of a launch from the runtime paths (launchId: this launch's id). */
+export function channelServerLaunch(paths: Pick<RuntimePaths, 'minionsShim' | 'telegramTokenFile' | 'telegramStateDir'>, launchId: string): ChannelServerLaunch | undefined {
+  return paths.minionsShim ? { command: paths.minionsShim, launchId, tokenFile: paths.telegramTokenFile, stateDir: paths.telegramStateDir } : undefined;
+}
+
+/** `--print-command` on the host: the argv with a placeholder launch id (shim missing: the plain `minions` command). */
+export function printChannelServer(paths: Pick<RuntimePaths, 'minionsShim' | 'telegramTokenFile' | 'telegramStateDir'>): ChannelServerLaunch {
+  return channelServerLaunch(paths, PRINT_LAUNCH_ID) ?? { command: 'minions', launchId: PRINT_LAUNCH_ID, tokenFile: paths.telegramTokenFile, stateDir: paths.telegramStateDir };
+}
+
 /** `claude --version`, or null when it fails. */
 export async function claudeVersionText(runner: Runner = run): Promise<string | null> {
   const r = await runner('claude', ['--version'], { allowFailure: true, timeoutMs: 30_000 }).catch(() => null);
@@ -813,8 +826,7 @@ export async function runCoordinator(cfg: MinionsConfig, deps: RunCoordinatorDep
   // Host runtime: the launch id ties our channel server to this launch (it activates only when the record matches).
   const ownServer = decision.enabled && decision.server === 'minions';
   const launchId = ownServer ? (deps.newLaunchId ?? randomUUID)() : undefined;
-  const channelServer: ChannelServerLaunch | undefined = ownServer && launchId && paths.minionsShim
-    ? { command: paths.minionsShim, launchId, tokenFile: paths.telegramTokenFile, stateDir: paths.telegramStateDir } : undefined;
+  const channelServer = ownServer && launchId ? channelServerLaunch(paths, launchId) : undefined;
   if (ownServer) log(`minions: ${DEV_CHANNELS_DIALOG_NOTE}.`);
   const c = await buildClaudeCommand(cfg, paths, { telegram: decision.enabled, startupPrompt: deps.startupPrompt, permissionModes, ...(channelServer ? { channelServer } : {}) });
   if (cancelled() !== null) return cancelled()!;

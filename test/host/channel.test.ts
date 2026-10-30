@@ -136,13 +136,14 @@ describe('minions channel set', () => {
     expect(entry.sha256).not.toBe(edited);
   });
 
-  it('host runtime: warns Telegram is unavailable there; config.local.json override is reported', async () => {
+  it('host runtime: telegram uses the minions channel server (pairing note); config.local.json override is reported', async () => {
     const { project } = await install('private');
     const host = { ...project, runtime: 'host' as const };
     const r = await CH.setChannel(host, 'telegram', { yes: true }, { isRunning: notRunning });
-    expect(r.warnings.join('\n')).toMatch(/Telegram is unavailable in the host runtime/);
-    expect(r.nextSteps.join('\n')).not.toMatch(/minions auth telegram/);
-    expect(r.effective).toMatchObject({ effective: 'terminal', cause: 'host-runtime' });
+    expect(r.warnings).toEqual([]);
+    expect(r.nextSteps.join('\n')).toMatch(/minions auth telegram/);
+    expect(r.nextSteps).toContain(CH.HOST_CHANNEL_NOTE);
+    expect(r.effective).toMatchObject({ effective: 'terminal', cause: 'no-token' });
     const back = await CH.setChannel(host, 'terminal', { yes: true }, { isRunning: notRunning });
     expect(back.warnings).toEqual([]);
 
