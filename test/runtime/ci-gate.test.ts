@@ -2,13 +2,13 @@ import { describe, expect, it } from 'vitest';
 import type { RunResult } from '../../src/core/exec.js';
 import { ciAuthorityReadiness } from '../../src/host/doctor.js';
 import type { RequiredChecksReport } from '../../src/runtime/ci.js';
-import { formatSync, summarizeChecks, syncTasks } from '../../src/runtime/ci.js';
+import { summarizeChecks } from '../../src/runtime/ci.js';
 import { evaluateCiGate, type CiGateInput } from '../../src/runtime/ci-gate.js';
 import type { GhFn } from '../../src/runtime/publish.js';
 import { validateResult } from '../../src/runtime/results.js';
-import { localVerificationComplete, Scheduler } from '../../src/runtime/scheduler.js';
+import { localVerificationComplete } from '../../src/runtime/scheduler.js';
 import { defaults } from '../helpers.js';
-import { commitFile, gitSync, makeDefaultEnv, result, type Env } from './fixtures.js';
+import { type Env } from './fixtures.js';
 
 const HEAD = 'a'.repeat(40);
 const OTHER = 'b'.repeat(40);
@@ -127,7 +127,6 @@ describe('result contract: CI evidence entries', () => {
 
 const ok = (stdout: string): RunResult => ({ code: 0, stdout, stderr: '' });
 const R = '/repos/acme/demo';
-const PR = 'https://github.com/acme/demo/pull/7';
 
 /** Mocked gh: read-only `gh api` GETs for required checks, `gh pr view` for the PR. Every call is recorded. */
 function mockGh(o: { required?: string[] | 'forbidden'; pr?: () => unknown }) {
@@ -151,159 +150,6 @@ function mockGh(o: { required?: string[] | 'forbidden'; pr?: () => unknown }) {
 
 interface CiEnv extends Env { gh: ReturnType<typeof mockGh>; clock: { now: Date }; head: string; setRollup(r: unknown[]): void }
 
-/** Default env with ciAuthority github, a github.com origin, and task-1 implemented and in `reviewing` with an open PR. */
-async function ciEnv(o: { required?: string[] | 'forbidden'; mutate?: Parameters<typeof makeDefaultEnv>[0] } = {}): Promise<CiEnv> {
-  const env = makeDefaultEnv((c) => { c.verification.ciAuthority = 'github'; c.verification.ciPendingTimeoutMinutes = 30; o.mutate?.(c); });
-  gitSync(env.layout.repo, 'remote', 'add', 'origin', 'https://github.com/acme/demo.git');
-  let rollup: unknown[] = [];
-  const state = { head: '' };
-  const gh = mockGh({ required: o.required ?? ['test'], pr: () => ({ url: PR, state: 'OPEN', isDraft: false, headRefOid: state.head, baseRefName: 'main', mergedAt: null, closedAt: null, mergeStateStatus: 'BLOCKED', statusCheckRollup: rollup }) });
-  const clock = { now: new Date() }; // sync records observations at wall-clock time
-  const sched = new Scheduler({ db: env.db, backlog: env.backlog, config: env.config, layout: env.layout, gh: gh.fn, now: () => clock.now });
-  env.backlog.add({ id: 'task-1' });
-  const b = await sched.claim('task-1', 'engineer');
-  const head = commitFile(b.worktree, 'a.txt', 'a');
-  expect(await sched.record(b.leaseId, result({ branch: b.branch, headSha: head }))).toMatchObject({ to: 'reviewing' });
-  state.head = head;
-  const t = env.backlog.tasks.get('task-1')!;
-  t.prUrl = PR; // the PR at this head (e.g. a re-review of a published branch)
-  return { ...env, sched, gh, clock, head, setRollup: (r) => { rollup = r; } };
-}
-const run = (name: string, conclusion: string | null) => ({ __typename: 'CheckRun', name, status: conclusion ? 'COMPLETED' : 'IN_PROGRESS', conclusion });
-const sync = (env: CiEnv) => syncTasks({ db: env.db, backlog: env.backlog, config: env.config, gh: env.gh.fn });
-const ciOnly = { checks: [{ command: 'test', outcome: 'pass', source: 'ci' }] };
-
-async function review(env: CiEnv, over: Record<string, unknown> = ciOnly) {
-  const brief = await env.sched.claim('task-1', 'reviewer');
-  const rec = await env.sched.record(brief.leaseId, result({ branch: brief.branch, headSha: brief.expectedHead, verdict: 'approve', ...over }));
-  return { brief, rec };
-}
-const reviewerOutcomes = (env: CiEnv) => env.db.evidenceFor('task-1', env.head, 'reviewer').map((e) => e.outcome);
-
-describe('CI authority in the reviewer stage (mocked gh)', () => {
-  it('passing required checks bound to the reviewed head satisfy the stage', async () => {
-    const env = await ciEnv();
-    env.setRollup([run('test', 'SUCCESS'), run('docs', 'FAILURE')]); // docs is not required
-    const s = await sync(env);
-    expect(s.tasks[0]!.gate).toMatchObject({ state: 'pass', head: env.head });
-    expect(formatSync(s)).toMatch(/CI gate pass at .*required test/);
-    const { brief, rec } = await review(env);
-    expect(brief.ci).toMatchObject({ state: 'pass', requiredChecks: ['test'] });
-    expect(rec).toMatchObject({ valid: true, approved: true, to: 'delivered' });
-    expect(reviewerOutcomes(env)).toEqual(['complete']);
-    expect(env.db.evidenceFor('task-1', env.head, 'ci-gate')[0]).toMatchObject({ outcome: 'pass' });
-    expect(env.db.evidenceFor('task-1', env.head, 'check').map((e) => JSON.parse(e.details_json!).source)).toEqual(['local', 'ci']); // engineer's, reviewer's
-    // Only read-only calls were made.
-    expect(env.gh.calls.every((c) => (c[0] === 'api' && c[2] === 'GET') || (c[0] === 'pr' && c[1] === 'view'))).toBe(true);
-  });
-
-  it('failing required CI never approves: task → changes-requested', async () => {
-    const env = await ciEnv();
-    env.setRollup([run('test', 'FAILURE')]);
-    await sync(env);
-    const { brief, rec } = await review(env, { checks: [...ciOnly.checks, { command: 'npm test', outcome: 'pass' }] });
-    expect(brief.ci?.state).toBe('fail');
-    expect(rec).toMatchObject({ valid: true, approved: false, to: 'changes-requested' });
-    expect(rec.message).toMatch(/required checks failing.*test/);
-    expect(reviewerOutcomes(env)).toEqual(['ci-fail']);
-  });
-
-  it('missing CI never approves; the task stays in review for a local-verification re-run', async () => {
-    const env = await ciEnv();
-    const { rec } = await review(env);
-    expect(rec).toMatchObject({ valid: true, approved: false, to: 'reviewing' });
-    expect(rec.message).toMatch(/CI gate missing.*local verification/);
-    expect(reviewerOutcomes(env)).toEqual(['ci-missing']);
-    expect(env.backlog.notes.at(-1)!.text).toMatch(/not approved: CI gate missing/);
-  });
-
-  it('pending CI never approves; past the timeout it falls back to the full local verification', async () => {
-    const env = await ciEnv({ mutate: (c) => { c.verification.commands = ['npm run typecheck', 'npm test']; } });
-    env.setRollup([run('test', null)]);
-    await sync(env);
-    const first = await review(env);
-    expect(first.rec).toMatchObject({ approved: false, to: 'reviewing' });
-    expect(first.rec.message).toMatch(/CI gate pending.*minions sync/);
-
-    env.clock.now = new Date(Date.now() + 31 * 60_000);
-    const second = await review(env);
-    expect(second.brief.ci?.state).toBe('timeout');
-    expect(second.rec).toMatchObject({ approved: false, to: 'reviewing' });
-    expect(second.rec.message).toMatch(/CI gate timeout/);
-
-    // Local verification (the fallback) is accepted; CI is not what approved it.
-    // A subset of the configured commands (or a CI-sourced entry) is not the full verification.
-    const subset = await review(env, { checks: [...ciOnly.checks, { command: 'npm test', outcome: 'pass', source: 'local' }] });
-    expect(subset.rec).toMatchObject({ approved: false, to: 'reviewing' });
-    // Env-prefixed / chained forms of the configured commands match; the full set approves.
-    const third = await review(env, { checks: [...ciOnly.checks, { command: 'npm run typecheck', outcome: 'pass', source: 'local' }, { command: 'mkdir -p /x && TMPDIR=/x npm test', outcome: 'pass', source: 'local' }] });
-    expect(third.rec).toMatchObject({ approved: true, to: 'delivered' });
-    expect(JSON.parse(env.db.evidenceFor('task-1', env.head, 'ci-gate').at(-1)!.details_json!)).toMatchObject({ usedAs: 'local-fallback' });
-    expect(reviewerOutcomes(env)).toEqual(['ci-pending', 'ci-timeout', 'ci-timeout', 'complete']);
-  });
-
-  it('a configured command reporting fail never approves (rejected as invalid, not approved)', async () => {
-    const env = await ciEnv({ mutate: (c) => { c.verification.commands = ['npm test']; } });
-    const { rec } = await review(env, { checks: [...ciOnly.checks, { command: 'npm test', outcome: 'fail', source: 'local' }] });
-    expect(rec).toMatchObject({ valid: false, correctionAllowed: true });
-    expect(rec.approved).toBeFalsy();
-    expect(rec.errors!.join(' ')).toMatch(/cannot report failing checks/);
-    expect(env.backlog.tasks.get('task-1')!.status).toBe('reviewing');
-    expect(reviewerOutcomes(env)).not.toContain('complete');
-  });
-
-  it('unreadable required checks are not evidence (never treated as zero required checks)', async () => {
-    const env = await ciEnv({ required: 'forbidden' });
-    env.setRollup([run('test', 'SUCCESS')]);
-    await sync(env);
-    const { brief, rec } = await review(env);
-    expect(brief.ci?.state).toBe('unknown');
-    expect(rec).toMatchObject({ approved: false, to: 'reviewing' });
-  });
-
-  it('a CI entry naming a check that is not a passing required check is rejected (correctable)', async () => {
-    const env = await ciEnv();
-    env.setRollup([run('test', 'SUCCESS'), run('docs', 'SUCCESS')]);
-    await sync(env);
-    const { rec } = await review(env, { checks: [{ command: 'docs', outcome: 'pass', source: 'ci' }] });
-    expect(rec).toMatchObject({ valid: false, correctionAllowed: true });
-    expect(rec.errors!.join(' ')).toMatch(/must name required checks that passed/);
-  });
-
-  it('a new head needs its own observation: CI of an earlier head never carries over', async () => {
-    const env = await ciEnv();
-    env.setRollup([run('test', 'SUCCESS')]);
-    await sync(env); // observed at the engineer's head
-    env.backlog.tasks.get('task-1')!.status = 'changes-requested';
-    const b = await env.sched.claim('task-1', 'engineer');
-    const h2 = commitFile(b.worktree, 'b.txt', 'b');
-    await env.sched.record(b.leaseId, result({ branch: b.branch, headSha: h2 }));
-    const { brief, rec } = await review(env);
-    expect(brief.expectedHead).toBe(h2);
-    expect(brief.ci?.state).toBe('missing');
-    expect(rec).toMatchObject({ approved: false, to: 'reviewing' });
-  });
-
-  it('testers can rely on CI too; without ciAuthority the brief carries no CI gate', async () => {
-    const env = await ciEnv({ mutate: (c) => { c.verification.qaLabels = ['qa']; } });
-    env.setRollup([run('test', 'SUCCESS')]);
-    await sync(env);
-    env.backlog.tasks.get('task-1')!.status = 'testing';
-    const tb = await env.sched.claim('task-1', 'tester');
-    expect(tb.ci?.state).toBe('pass');
-    expect(await env.sched.record(tb.leaseId, result({ branch: tb.branch, headSha: tb.expectedHead, ...ciOnly }))).toMatchObject({ valid: true, to: 'reviewing' });
-
-    const plain = makeDefaultEnv();
-    plain.backlog.add({ id: 'task-1' });
-    const b = await plain.sched.claim('task-1', 'engineer');
-    await plain.sched.record(b.leaseId, result({ branch: b.branch, headSha: commitFile(b.worktree, 'a.txt', 'a') }));
-    const rb = await plain.sched.claim('task-1', 'reviewer');
-    expect(rb.ci).toBeUndefined();
-    const rec = await plain.sched.record(rb.leaseId, result({ branch: rb.branch, headSha: rb.expectedHead, verdict: 'approve', ...ciOnly }));
-    expect(rec).toMatchObject({ valid: false });
-    expect(rec.errors!.join(' ')).toMatch(/ciAuthority "github"/);
-  });
-});
 
 describe('doctor ci.authority readiness', () => {
   const cfg = (ci: 'none' | 'github', mode: 'local' | 'pull-request' = 'pull-request') => {

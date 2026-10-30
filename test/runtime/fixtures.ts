@@ -102,10 +102,19 @@ export function makeEnv(mutate?: (c: MinionsConfig) => void): Env {
   return makeDefaultEnv((c) => { c.verification.testerRequired = true; mutate?.(c); });
 }
 
-export function makeDefaultEnv(mutate?: (c: MinionsConfig) => void): Env {
+/**
+ * A runtime env with no git repository (the unit tier, task-137.2.2): the DB, fake backlog, config and
+ * scheduler for code that never reaches the workspace git (sync over a fake gh, gates over recorded rows).
+ * baseSha is a placeholder.
+ */
+export function makeDbEnv(mutate?: (c: MinionsConfig) => void): Env {
+  return makeDefaultEnv((c) => { c.verification.testerRequired = true; mutate?.(c); }, { git: false });
+}
+
+export function makeDefaultEnv(mutate?: (c: MinionsConfig) => void, o: { git?: boolean } = {}): Env {
   const root = tmp();
   const layout = workspaceLayout(join(root, 'workspace'));
-  const baseSha = initRepo(layout.repo);
+  const baseSha = o.git === false ? '0'.repeat(40) : initRepo(layout.repo);
   const db = new RuntimeDb(join(root, 'state', 'minions.db'));
   const backlog = new FakeBacklog();
   const config = defaults('project-owner');

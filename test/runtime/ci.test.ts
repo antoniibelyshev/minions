@@ -1,11 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import type { RunResult } from '../../src/core/exec.js';
 import { requiredChecksReadiness } from '../../src/host/doctor.js';
-import { ciSetupPlan, ciStatus, fetchApi, formatCiStatus, ghApi, requiredChecksStatus, summarizeChecks, syncTasks, formatSync, type ApiGet } from '../../src/runtime/ci.js';
+import { ciSetupPlan, ciStatus, fetchApi, formatCiStatus, ghApi, requiredChecksStatus, summarizeChecks, syncTasks, formatSync } from '../../src/runtime/ci.js';
 import type { GitFn } from '../../src/runtime/github.js';
 import type { GhFn } from '../../src/runtime/publish.js';
 import { defaults } from '../helpers.js';
-import { makeEnv } from './fixtures.js';
+import { makeDbEnv } from './fixtures.js';
 
 const ok = (stdout: string): RunResult => ({ code: 0, stdout, stderr: '' });
 const httpErr = (status: number, msg = 'Not Found'): RunResult => ({ code: 1, stdout: JSON.stringify({ message: msg }), stderr: `gh: ${msg} (HTTP ${status})` });
@@ -190,7 +190,7 @@ describe('minions sync', () => {
   const run = (name: string, conclusion: string | null) => ({ __typename: 'CheckRun', name, status: conclusion ? 'COMPLETED' : 'IN_PROGRESS', conclusion });
 
   it('records PR state and CI results as head-bound evidence, notes only on change, never writes to GitHub', async () => {
-    const env = makeEnv();
+    const env = makeDbEnv();
     env.backlog.add({ id: 'task-1', status: 'delivered', prUrl: url(1) });
     env.backlog.add({ id: 'task-2', status: 'delivered', prUrl: url(2) });
     env.backlog.add({ id: 'task-3', status: 'ready' }); // no PR: not synced
@@ -218,7 +218,7 @@ describe('minions sync', () => {
   });
 
   it('reconciles merged PRs to done and closed PRs to blocked; leased tasks are left alone', async () => {
-    const env = makeEnv();
+    const env = makeDbEnv();
     env.backlog.add({ id: 'task-1', status: 'delivered', prUrl: url(1) });
     env.backlog.add({ id: 'task-2', status: 'delivered', prUrl: url(2) });
     env.backlog.add({ id: 'task-3', status: 'delivered', prUrl: url(3) });
@@ -237,7 +237,7 @@ describe('minions sync', () => {
   });
 
   it('reports per-task gh failures and head mismatches without throwing; can sync selected tasks', async () => {
-    const env = makeEnv();
+    const env = makeDbEnv();
     env.backlog.add({ id: 'task-1', status: 'delivered', prUrl: url(1) });
     env.backlog.add({ id: 'task-2', status: 'delivered', prUrl: url(2) });
     env.db.upsertPublication({ task_id: 'task-2', branch: 'agent/x', head_sha: 'b'.repeat(40), mode: 'pull-request', config_revision: 1 });
@@ -251,7 +251,7 @@ describe('minions sync', () => {
   });
 
   it('a backlog error on one task (version conflict) is reported on that task; the other tasks still sync', async () => {
-    const env = makeEnv();
+    const env = makeDbEnv();
     env.backlog.add({ id: 'task-1', status: 'delivered', prUrl: url(1) });
     env.backlog.add({ id: 'task-2', status: 'delivered', prUrl: url(2) });
     env.backlog.add({ id: 'task-3', status: 'delivered', prUrl: url(3) });
@@ -328,7 +328,7 @@ describe('CI awareness edge cases (tester)', () => {
   });
 
   it('sync is idempotent: unchanged outcome adds no notes and no duplicate evidence; new head is a new observation', async () => {
-    const env = makeEnv();
+    const env = makeDbEnv();
     env.backlog.add({ id: 'task-1', status: 'delivered', prUrl: url(1) });
     const prs: Record<string, unknown> = { [url(1)]: pr('OPEN', [passRun]) };
     const gh = fakeGh({}, prs);
@@ -352,7 +352,7 @@ describe('CI awareness edge cases (tester)', () => {
   });
 
   it('ignores tasks without a prUrl even when named explicitly, and reports nothing to sync', async () => {
-    const env = makeEnv();
+    const env = makeDbEnv();
     env.backlog.add({ id: 'task-1', status: 'delivered' });
     const gh = fakeGh({}, {});
     const r = await syncTasks({ db: env.db, backlog: env.backlog, config: env.config, gh: gh.fn }, { taskIds: ['task-1'] });
@@ -362,7 +362,7 @@ describe('CI awareness edge cases (tester)', () => {
   });
 
   it('a closed PR does not block tasks outside delivery statuses; invalid gh output is a per-task error', async () => {
-    const env = makeEnv();
+    const env = makeDbEnv();
     env.backlog.add({ id: 'task-1', status: 'reviewing', prUrl: url(1) });
     env.backlog.add({ id: 'task-2', status: 'delivered', prUrl: url(2) });
     const gh: GhFn = async (args) => args[2] === url(1) ? ok(JSON.stringify(pr('CLOSED'))) : ok('not json');

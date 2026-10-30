@@ -1,19 +1,17 @@
 // Local integrator (task-82.2, docs/design/local-auto-integration.md phase 2): queue, lock, verify runner and
 // recovery, on temp repositories with fake verification commands (never the workspace checkout, never npm test).
 import { spawn } from 'node:child_process';
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import type { MinionsConfig } from '../../src/config/schema.js';
 import { RuntimeDb, SCHEMA_VERSION } from '../../src/runtime/db.js';
-import { integrationCandidate, porcelainPaths } from '../../src/runtime/integration.js';
+import { porcelainPaths } from '../../src/runtime/integration.js';
 import {
-  adoptIntegrationBase, enqueueIntegration, INTEGRATION_BASE_META, INTEGRATION_LOCK_META, integrationHalt, integrationLock,
   integrationRows, integratorAlive, runIntegrator, type IntegratorDeps,
 } from '../../src/runtime/integrator.js';
 import { pending } from '../../src/runtime/outbox.js';
-import { isAlive, procIdentity } from '../../src/runtime/runner/record.js';
-import { defaults, HAS_PROCFS, shq } from '../helpers.js';
+import { defaults } from '../helpers.js';
 import { gitSync, initRepo, tmp } from './fixtures.js';
 
 const branchOf = (task: string) => `agent/${task}-thing`;
@@ -105,21 +103,6 @@ describe('runIntegrator: landing and the verify runner', () => {
     expect(notes[1]!.text).not.toContain('src/f20.ts');
   });
 
-  it('the integrated notice and event are queued before the settle hook runs (a crash in the hook cannot lose them)', async () => {
-    const s = setup();
-    s.queue('task-1');
-    const seen: { phase: string; notice: boolean; events: number }[] = [];
-    s.deps.onSettled = (row) => {
-      seen.push({
-        phase: row.phase,
-        notice: pending(s.db, { includeWaiting: true }).some((n) => n.key === `integrated:task-1:${row.candidate_sha}`),
-        events: s.db.events('task-1', 'integrated').length,
-      });
-    };
-    await runIntegrator(s.deps);
-    expect(seen).toEqual([{ phase: 'landed', notice: true, events: 1 }]);
-  });
-
   it('a failing command is red: main stays at B and the log tail is the detail', async () => {
     const s = setup({ commands: ['true', 'echo boom-from-tests; exit 3'] });
     s.queue('task-1');
@@ -142,65 +125,6 @@ describe('runIntegrator: landing and the verify runner', () => {
     expect(mainOf(s.repo)).toBe(s.B);
   });
 
-  it('a timeout is transient: retried once, then the row ends transient with main unchanged', async () => {
-    const s = setup({ commands: ['sleep 5'] });
-    s.deps.timing = { ...s.deps.timing, commandTimeoutMs: 300 };
-    s.queue('task-1');
-    const r = await runIntegrator(s.deps);
-    expect(r.settled.map((x) => x.phase)).toEqual(['transient']);
-    expect(rowOf(s.db, 'task-1')).toMatchObject({ phase: 'transient', attempt: 2 });
-    expect(rowOf(s.db, 'task-1').detail).toMatch(/`sleep 5` timed out/);
-    expect(s.db.events('task-1', 'integration-requeued').map((e) => (e.data as { outcome: string }).outcome)).toEqual(['transient']);
-    expect(mainOf(s.repo)).toBe(s.B);
-  });
-
-  it('a command not found (exit 127) is transient, not red: no flaky rerun, and the detail points at verification.setupCommands', async () => {
-    const s = setup({ commands: ['true', 'minions-no-such-tool-136 --check'] });
-    s.queue('task-1');
-    const r = await runIntegrator(s.deps);
-    expect(r.settled.map((x) => x.phase)).toEqual(['transient']);
-    const row = rowOf(s.db, 'task-1');
-    expect(row).toMatchObject({ phase: 'transient', attempt: 2 });
-    expect(row.detail).toMatch(/`minions-no-such-tool-136 --check` failed \(exit 127: command not found\): a setup problem, not a code failure/);
-    expect(row.detail).toMatch(/verification\.setupCommands is empty/);
-    expect(readFileSync(row.log_path!, 'utf8')).not.toContain('rerunning it once');
-    expect(mainOf(s.repo)).toBe(s.B);
-    // With setup commands configured the hint names them instead.
-    s.cfg.verification.setupCommands = ['true'];
-    s.queue('task-2');
-    await runIntegrator(s.deps);
-    expect(rowOf(s.db, 'task-2')).toMatchObject({ phase: 'transient' });
-    expect(rowOf(s.db, 'task-2').detail).toMatch(/check that verification\.setupCommands \(true\) install the tools it needs/);
-  });
-
-  it('runs setupCommands only when the lockfile changes, and a setup failure is transient', async () => {
-    const s = setup({ setupCommands: ['mkdir -p node_modules && echo x >> node_modules/setup-count'], commands: ['test -d node_modules'] });
-    s.queue('task-1');
-    s.queue('task-2');
-    s.queue('task-3', { 'package-lock.json': '{"lockfileVersion": 3}\n' });
-    const r = await runIntegrator(s.deps);
-    expect(r.settled.map((x) => `${x.taskId} ${x.phase}`)).toEqual(['task-1 landed', 'task-2 landed', 'task-3 landed']);
-    expect(readFileSync(join(s.deps.integrationDir, 'node_modules', 'setup-count'), 'utf8')).toBe('x\nx\n');
-    s.cfg.verification.setupCommands = ['exit 1'];
-    s.queue('task-4');
-    await runIntegrator(s.deps);
-    expect(rowOf(s.db, 'task-4')).toMatchObject({ phase: 'transient', attempt: 2 });
-    expect(rowOf(s.db, 'task-4').detail).toMatch(/setup command `exit 1` failed/);
-  });
-
-  it('a recreated integration worktree runs setupCommands again (the setup marker belongs to the worktree)', async () => {
-    const counter = join(tmp('minions-integrator-count-'), 'count');
-    const s = setup({ setupCommands: [`mkdir -p node_modules && touch node_modules/installed && echo x >> ${shq(counter)}`], commands: ['test -f node_modules/installed'] });
-    s.queue('task-1');
-    await runIntegrator(s.deps);
-    expect(rowOf(s.db, 'task-1').phase).toBe('landed');
-    rmSync(s.deps.integrationDir, { recursive: true, force: true });
-    s.queue('task-2');
-    await runIntegrator(s.deps);
-    expect(rowOf(s.db, 'task-2').phase).toBe('landed');
-    expect(readFileSync(counter, 'utf8')).toBe('x\nx\n');
-  });
-
   it('sensitive paths wait for a signed approval; with one they land', async () => {
     const s = setup();
     const H = s.queue('task-1', { '.minions/config.json': '{}\n' });
@@ -215,43 +139,9 @@ describe('runIntegrator: landing and the verify runner', () => {
     expect(rowOf(s.db, 'task-1').phase).toBe('landed');
   });
 
-  it('a dependency that is not integrated yet makes the task wait; order is otherwise oldest first', async () => {
-    const s = setup();
-    s.queue('task-2');
-    s.queue('task-1');
-    s.deps.unmetDependencies = (t) => (t === 'task-2' ? ['task-1'] : []);
-    const r = await runIntegrator(s.deps);
-    expect(r.settled.map((x) => x.taskId)).toEqual(['task-1', 'task-2']);
-  });
-
-  it('a dirty checkout of main re-queues without an attempt and stops the queue', async () => {
-    const s = setup();
-    s.queue('task-1');
-    writeFileSync(join(s.repo, 'base.txt'), 'local edit\n');
-    const r = await runIntegrator(s.deps);
-    expect(r.exit).toBe('checkout-dirty');
-    expect(rowOf(s.db, 'task-1')).toMatchObject({ phase: 'queued', attempt: 0, outcome: 'checkout-dirty' });
-    expect(mainOf(s.repo)).toBe(s.B);
-    expect(readFileSync(join(s.repo, 'base.txt'), 'utf8')).toBe('local edit\n');
-  });
 });
 
 describe('runIntegrator: lock, pause, drain and halt', () => {
-  it('a live holder keeps the lock: the second integrator exits with conflict and touches nothing', async () => {
-    const s = setup();
-    s.queue('task-1');
-    const foreign = { pid: 999_999, start: '1', bootId: null, at: '2026-10-29T00:00:00.000Z' };
-    s.db.setMeta(INTEGRATION_LOCK_META, JSON.stringify(foreign));
-    const r = await runIntegrator({ ...s.deps, lockAlive: () => true });
-    expect(r.exit).toBe('conflict');
-    expect(r.holder).toEqual(foreign);
-    expect(integrationLock(s.db)).toEqual(foreign);
-    expect(rowOf(s.db, 'task-1').phase).toBe('queued');
-    // A stale holder is replaced.
-    const r2 = await runIntegrator({ ...s.deps, lockAlive: () => false });
-    expect(r2.exit).toBe('empty');
-    expect(rowOf(s.db, 'task-1').phase).toBe('landed');
-  });
 
   it('integratorAlive: pid, start time, boot and the `work integrate` command line', () => {
     const l = { pid: 42, start: '100', bootId: 'boot-a', at: 'x' };
@@ -276,26 +166,7 @@ describe('runIntegrator: lock, pause, drain and halt', () => {
     expect(rowOf(s.db, 'task-1')).toMatchObject({ phase: 'queued', attempt: 0 });
   });
 
-  it('a drain stops a running verification at once (group killed) and re-queues it without an attempt', async () => {
-    const s = setup({ commands: ['sleep 30 & sleep 30; wait'] });
-    s.queue('task-1');
-    const started = Date.now();
-    const run = runIntegrator(s.deps);
-    await waitFor(() => !!rowOf(s.db, 'task-1').verify_pid);
-    const { verify_pid: pid, verify_start: start } = rowOf(s.db, 'task-1');
-    s.db.setDrain('upgrade');
-    const r = await run;
-    expect(Date.now() - started).toBeLessThan(10_000);
-    expect(r.exit).toBe('draining');
-    expect(rowOf(s.db, 'task-1')).toMatchObject({ phase: 'queued', attempt: 0, outcome: 'stopped', verify_pid: null, candidate_sha: null });
-    expect(await isAlive({ pid: pid!, startTime: start! })).toBe(false);
-    expect(mainOf(s.repo)).toBe(s.B);
-    expect(integrationLock(s.db)).toBeNull();
-  });
-
   const stopCases = [
-    { phase: 'merge', commands: ['true'], setupCommands: [] as string[] },
-    { phase: 'setup', commands: ['true'], setupCommands: ['sleep 30 & sleep 30; wait'] },
     { phase: 'verification', commands: ['sleep 30 & sleep 30; wait'], setupCommands: [] as string[] },
   ];
   for (const c of stopCases) {
@@ -321,24 +192,6 @@ describe('runIntegrator: lock, pause, drain and halt', () => {
     });
   }
 
-  it('adopts a fast-forward of main made outside the integrator', async () => {
-    const s = setup();
-    s.queue('task-1');
-    await runIntegrator(s.deps);
-    const C1 = mainOf(s.repo);
-    expect(s.db.getMeta(INTEGRATION_BASE_META)).toBe(C1);
-    const outside = commit(s.repo, 'outside.txt', 'by hand\n', 'a commit on main outside the integrator');
-    s.queue('task-2');
-    const r = await runIntegrator(s.deps);
-    expect(r.exit).toBe('empty');
-    expect(integrationHalt(s.db)).toBeNull();
-    expect(s.db.eventsOfKindSince('integration-base-adopted', '').map((e) => e.data)).toContainEqual({ from: C1, to: outside });
-    expect(rowOf(s.db, 'task-2')).toMatchObject({ phase: 'landed', base_sha: outside });
-    const C2 = mainOf(s.repo);
-    expect(gitSync(s.repo, 'rev-list', '--parents', '-n', '1', C2).split(' ')[1]).toBe(outside);
-    expect(s.db.getMeta(INTEGRATION_BASE_META)).toBe(C2);
-  });
-
   it('halts when main no longer descends from the integration base, until --adopt-base', async () => {
     const s = setup();
     s.queue('task-1');
@@ -357,55 +210,7 @@ describe('runIntegrator: lock, pause, drain and halt', () => {
 });
 
 describe('runIntegrator: crash recovery', () => {
-  const staleLock = (db: RuntimeDb) => db.setMeta(INTEGRATION_LOCK_META, JSON.stringify({ pid: 999_999, start: '1', bootId: null, at: '2026-10-29T00:00:00.000Z' }));
 
-  it('main already contains C (crash after the swap): the row is landed and integration_base = C', async () => {
-    const s = setup();
-    const H = s.queue('task-1');
-    const c = await integrationCandidate(s.repo, { base: s.B, head: H, branch: branchOf('task-1'), taskId: 'task-1', identity: s.cfg.git.identity });
-    if (c.state !== 'clean') throw new Error(JSON.stringify(c));
-    gitSync(s.repo, 'merge', '-q', '--ff-only', c.candidate);
-    s.db.exec("UPDATE integrations SET phase = 'landing', attempt = 1, base_sha = ?, candidate_sha = ? WHERE task_id = 'task-1'", s.B, c.candidate);
-    staleLock(s.db);
-    const r = await runIntegrator({ ...s.deps, lockAlive: () => false });
-    expect(r.recovered).toEqual([{ id: 1, taskId: 'task-1', outcome: 'landed', killed: [] }]);
-    expect(rowOf(s.db, 'task-1')).toMatchObject({ phase: 'landed', candidate_sha: c.candidate });
-    expect(s.db.getMeta(INTEGRATION_BASE_META)).toBe(c.candidate);
-    expect(mainOf(s.repo)).toBe(c.candidate);
-    // The crash may have come before the landing notice: recovery queues it (keyed by C).
-    expect(pending(s.db, { includeWaiting: true }).filter((n) => n.key.startsWith('integrated:')).map((n) => [n.key, n.text]))
-      .toEqual([[`integrated:task-1:${c.candidate}`, `task-1 merged into main at ${c.candidate}; 1 changed path: task-1.txt. ref: #task-1`]]);
-    expect(r.exit).toBe('empty');
-  });
-
-  it.skipIf(!HAS_PROCFS)('otherwise the recorded verify group is stopped (leader matched) and the row is re-queued and integrated', async () => {
-    const s = setup();
-    s.queue('task-1');
-    const child = spawn('sh', ['-c', 'sleep 60 & sleep 60; wait'], { detached: true, stdio: 'ignore' });
-    child.unref();
-    await waitFor(() => !!child.pid);
-    const id = (await procIdentity(child.pid!))!;
-    s.db.exec("UPDATE integrations SET phase = 'verifying', attempt = 1, base_sha = ?, candidate_sha = ?, verify_pid = ?, verify_start = ? WHERE task_id = 'task-1'",
-      s.B, 'f'.repeat(40), id.pid, id.startTime);
-    staleLock(s.db);
-    const r = await runIntegrator({ ...s.deps, lockAlive: () => false });
-    expect(r.recovered).toHaveLength(1);
-    expect(r.recovered[0]).toMatchObject({ outcome: 'requeued' });
-    expect(r.recovered[0]!.killed).toContain(id.pid);
-    expect(await isAlive(id)).toBe(false);
-    expect(s.db.events('task-1', 'integration-requeued').map((e) => (e.data as { outcome: string; counted: boolean }))).toEqual([expect.objectContaining({ outcome: 'recovered', counted: false })]);
-    expect(rowOf(s.db, 'task-1')).toMatchObject({ phase: 'landed', attempt: 1 });
-  });
-
-  it('a recorded pid whose start time does not match is never signalled', async () => {
-    const s = setup();
-    s.queue('task-1');
-    s.db.exec("UPDATE integrations SET phase = 'verifying', attempt = 1, base_sha = ?, verify_pid = ?, verify_start = '1' WHERE task_id = 'task-1'", s.B, process.pid);
-    staleLock(s.db);
-    const r = await runIntegrator({ ...s.deps, lockAlive: () => false });
-    expect(r.recovered[0]).toMatchObject({ outcome: 'requeued', killed: [] });
-    expect(rowOf(s.db, 'task-1').phase).toBe('landed');
-  });
 });
 
 describe('queue and helpers', () => {

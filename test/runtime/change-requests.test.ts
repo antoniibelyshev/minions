@@ -6,7 +6,13 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Command } from 'commander';
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+
+// `status` probes the coordinator's tmux session; the unit tier runs no subprocess, so the probe answers "no session".
+vi.mock('../../src/core/exec.js', async (orig) => ({
+  ...(await orig<typeof import('../../src/core/exec.js')>()),
+  run: async () => ({ code: 1, stdout: '', stderr: 'no server running' }),
+}));
 import { buildProgram } from '../../src/program.js';
 import { RuntimeDb, SCHEMA_VERSION } from '../../src/runtime/db.js';
 import { isChangeRequestId, quotedReason, recordSettingRequest, REASON_MAX } from '../../src/runtime/change-requests.js';
