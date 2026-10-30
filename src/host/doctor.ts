@@ -32,7 +32,7 @@ import { githubHints, inspectGithub } from './github-setup.js';
 import { harnessChecks, harnessSkipChecks, parseWorkProbe } from './harness-checks.js';
 import { harnessView } from '../runtime/sandbox/probe.js';
 import { HANG_GUARD_TIMEOUT_TEST, hangGuarded } from '../runtime/hook-guard.js';
-import { HOST_RUNTIME_SHORT, HostRuntime, hostTools, prepareHostRuntime, runtimeOf } from './runtime.js';
+import { HOST_RUNTIME_SHORT, HostRuntime, ensureHostWorktreesDir, hostTools, hostWorktreesDirState, prepareHostRuntime, runtimeOf, type WorktreesDirState } from './runtime.js';
 import type { ProjectJson } from './project.js';
 import { projectPaths } from '../core/paths.js';
 import { access } from 'node:fs/promises';
@@ -188,6 +188,15 @@ export function autoMergeReadiness(
   rc?: RequiredChecksReport | null,
 ): { ready: boolean; enabled: boolean; detail: string; reasons: string[] } {
   const enabled = config.delivery.merge === 'auto-when-eligible';
+  if (config.delivery.mode === 'local') {
+    // Local delivery (docs/design/local-auto-integration.md): the switch is local integration; no GitHub involved.
+    if (!enabled) return { ready: false, enabled, reasons: [], detail: `local integration off: approved tasks end delivered and the coordinator merges them (opt-in: delivery.merge "auto-when-eligible" or \`minions setup\`; currently "${config.delivery.merge}")` };
+    const reasons = autoMergeConfigReasons(config);
+    if (reasons.length) return { ready: false, enabled, reasons, detail: `local integration enabled but not usable: ${reasons.join('; ')}` };
+    const ask = config.capabilities && config.sensitivePaths ? can({ capabilities: config.capabilities, sensitivePaths: config.sensitivePaths }, 'base.merge') === 'ask' : false;
+    const cmds = config.verification?.commands ?? [];
+    return { ready: true, enabled, reasons: [], detail: `local integration ready: the runtime merges each approved head, runs the verification (${cmds.join(', ')}) on the merged tree and lands it on the base when it passes${ask ? '; base.merge "ask": each landing needs \`minions work approve <taskId> --head <sha> --merge\` on the host' : '; sensitive paths need \`minions work approve <taskId> --head <sha> --merge\` on the host'}` };
+  }
   if (!enabled) {
     return { ready: false, enabled, reasons: [], detail: `auto-merge off (opt-in: delivery.merge "auto-when-eligible" or \`minions setup\`; currently "${config.delivery.merge}")` };
   }
@@ -217,6 +226,8 @@ export function mergeReadiness(
   const ready = github.onGitHub && github.credential === 'ok';
   const mode = config.delivery.mode;
   if (mode === 'local') {
+    if (am.enabled && am.ready) return ['ok', `local delivery (nothing is pushed); ${deferred}`];
+    if (am.enabled) return ['warn', `local delivery (nothing is pushed); ${deferred}`, 'Fix the reasons above, or set delivery.merge "disabled" (the coordinator then merges approved branches).'];
     return ['unavailable', ready
       ? `local delivery (nothing is pushed); pull-request delivery is available: set delivery.mode "pull-request"; ${deferred}`
       : `local delivery only: branch/pull-request delivery needs ${github.onGitHub ? 'a valid GitHub token' : 'a GitHub remote and token'}; ${deferred}`];
@@ -365,12 +376,15 @@ export function telegramPluginCheck(tg: ReturnType<typeof telegramDoctorCheck>, 
  * telegram.plugin, telegram.access and telegram.poller from the runtime. Returns the probe-only plugin
  * check: channel readiness follows the probe, not the task-52 load warning.
  */
-async function telegramRuntimeChecks(ex: (args: string[]) => Promise<{ code: number; stdout: string; stderr: string }>, wantsTelegram: boolean, checks: Check[]): Promise<Check> {
+async function telegramRuntimeChecks(ex: (args: string[]) => Promise<{ code: number; stdout: string; stderr: string }>, wantsTelegram: boolean, checks: Check[], opts: { host?: boolean } = {}): Promise<Check> {
   const tg = telegramDoctorCheck(await ex(['minions', 'telegram', 'probe', '--json']));
   const status = wantsTelegram ? await ex(['minions', 'telegram', 'status', '--json']) : null;
-  checks.push(telegramPluginCheck(tg, status));
+  // Host runtime (task-6): the probe checks the minions channel server, so the check is telegram.server and the
+  // task-52 plugin load warning does not apply.
+  const name = opts.host ? 'telegram.server' : 'telegram.plugin';
+  checks.push(opts.host ? { name, status: tg.status, detail: tg.detail, ...(tg.hint ? { hint: tg.hint } : {}) } : telegramPluginCheck(tg, status));
   if (status) { checks.push(telegramAccessCheck(status)); const pc = telegramPollerCheck(status); if (pc) checks.push(pc); }
-  return { name: 'telegram.plugin', status: tg.status, detail: tg.detail, ...(tg.hint ? { hint: tg.hint } : {}) };
+  return { name, status: tg.status, detail: tg.detail, ...(tg.hint ? { hint: tg.hint } : {}) };
 }
 
 /**
@@ -390,19 +404,19 @@ export function setupGapsCheck(config: Pick<MinionsConfig, 'verification' | 'com
 }
 
 /** Overall Telegram readiness from the channel resolution. Never 'fail': terminal is the baseline. */
-export function telegramReadiness(res: ChannelResolution, tgPlugin: Check | undefined, token: TelegramCredentialStatus['state']): Check {
+export function telegramReadiness(res: ChannelResolution, tgPlugin: Check | undefined, token: TelegramCredentialStatus['state'], runtime: 'docker' | 'host' = 'docker'): Check {
   const name = 'telegram';
+  const host = runtime === 'host';
   if (res.configured === 'terminal') return { name, status: 'ok', detail: 'terminal mode (Telegram not selected)' };
   if (!res.wantsTelegram) return { name, status: 'ok', detail: `auto: terminal mode (${res.reason})` };
   switch (res.cause) {
-    case 'host-runtime': return { name, status: 'unavailable', detail: `unavailable: ${res.reason}; the coordinator runs terminal-only`, hint: 'Switch with `minions runtime set docker`, or `minions channel set terminal`.' };
     case 'network-none': return { name, status: 'unavailable', detail: 'unavailable: container.network is none; the coordinator runs terminal-only' };
     case 'no-token': case 'invalid-token':
       return { name, status: 'warn', detail: `${token === 'missing' ? 'missing' : 'invalid'}: bot token ${token}; the coordinator runs terminal-only`, hint: 'Run `minions auth telegram`.' };
-    case 'unchecked': return { name, status: 'warn', detail: 'unknown: bot token stored; plugin availability not checked (container not running)', hint: 'Run `minions start`, then rerun doctor.' };
+    case 'unchecked': return { name, status: 'warn', detail: host ? 'unknown: bot token stored; the minions channel server was not checked (host runtime not prepared)' : 'unknown: bot token stored; plugin availability not checked (container not running)', hint: 'Run `minions start`, then rerun doctor.' };
     case 'plugin-unavailable': case 'probe-not-run':
       return { name, status: 'unavailable', detail: `unavailable: ${tgPlugin?.detail ?? res.reason}; the coordinator runs terminal-only`, ...(tgPlugin?.hint ? { hint: tgPlugin.hint } : {}) };
-    default: return { name, status: 'ok', detail: `ok: bot token stored and the official plugin is available${res.configured === 'auto' ? ' (communication.channel auto)' : ''} (see telegram.access for pairing)` };
+    default: return { name, status: 'ok', detail: `ok: bot token stored and ${host ? 'the minions channel server is available (host runtime)' : 'the official plugin is available'}${res.configured === 'auto' ? ' (communication.channel auto)' : ''} (see telegram.access for pairing)` };
   }
 }
 
@@ -414,9 +428,26 @@ function probePermission(stdout: string): { mode: string; fallback: boolean; rea
   } catch { return undefined; }
 }
 
+/**
+ * workspace.worktrees (task-3): the coordinator sandbox cannot create <repo>/.git/worktrees, so `minions work claim`
+ * fails without it. A missing directory is created here, outside the sandbox, and reported.
+ */
+export async function worktreesDirCheck(repo: string, add: Add): Promise<WorktreesDirState> {
+  const dir = `${repo}/.git/worktrees`;
+  const before = await hostWorktreesDirState(repo);
+  const after = before === 'missing' ? await ensureHostWorktreesDir(repo).catch((): WorktreesDirState => 'missing') : before;
+  const start = 'Run `minions start --no-attach` (it creates the directory outside the sandbox).';
+  if (after === 'no-repo') add('workspace.worktrees', 'warn', 'skipped: the host workspace has no repository yet', start);
+  else if (after === 'invalid') add('workspace.worktrees', 'fail', `${dir} (or .git) is a symlink or not a directory; worker worktrees cannot be created`, `Remove it, then ${start[0]!.toLowerCase()}${start.slice(1)}`);
+  else if (after === 'missing') add('workspace.worktrees', 'fail', `${dir} is missing and could not be created; \`minions work claim\` fails in the sandbox`, `Create it on the host: mkdir '${dir}'`);
+  else if (before === 'missing') add('workspace.worktrees', 'warn', `${dir} was missing (sandboxed \`git worktree add\` cannot create it); created it`);
+  else add('workspace.worktrees', 'ok', `${dir} exists; worker worktrees can be created from the sandbox`);
+  return after;
+}
+
 /** Host runtime: coordinator session, Claude auth on the host, launch probe, Telegram plugin (via the runtime shim). */
 async function hostRuntimeChecks(project: ProjectJson, auth: ClaudeAuth, baseUrl: string | undefined, wantsTelegram: boolean,
-  runner: Runner, add: Add, checks: Check[]): Promise<Check | undefined> {
+  runner: Runner, add: Add, checks: Check[], wantsIntegration = false): Promise<Check | undefined> {
   const host = new HostRuntime(project, runner);
   const running = await host.isRunning();
   add('coordinator', running ? 'ok' : 'warn', running ? `tmux server ${host.paths.tmuxSocket} has the coordinator session` : `not running (tmux server ${host.paths.tmuxSocket})`,
@@ -443,15 +474,36 @@ async function hostRuntimeChecks(project: ProjectJson, auth: ClaudeAuth, baseUrl
   add('hooks.hangGuard', guard.code === 0 ? 'ok' : 'fail',
     guard.code === 0 ? `hook hang guard works (${via === 'timeout' ? 'coreutils timeout' : 'perl watchdog'})` : `hook hang guard failed (exit ${guard.code}): neither coreutils timeout nor perl works, so every worker hook blocks`,
     guard.code === 0 ? undefined : 'Install perl or coreutils (`brew install coreutils` provides gtimeout; link it as `timeout` on PATH).');
+  await worktreesDirCheck(host.paths.repo, add);
   if (!(await host.prepared())) {
-    for (const n of ['claude.capabilities', 'telegram.plugin']) add(n, 'warn', 'skipped: host runtime not prepared yet', 'Run `minions start --no-attach`.');
+    for (const n of ['claude.capabilities', 'telegram.server']) add(n, 'warn', 'skipped: host runtime not prepared yet', 'Run `minions start --no-attach`.');
     return undefined;
   }
   await prepareHostRuntime(project).catch(() => undefined);
   const ex = (args: string[]) => host.exec(args, { allowFailure: true, timeoutMs: 60_000 });
   const probe = await ex(['minions', 'coordinator', '--probe', '--json']);
+  if (wantsIntegration) checks.push(...integrationDoctorChecks(await ex(['minions', 'status', '--json'])));
   add('claude.capabilities', probe.code === 0 ? 'ok' : 'fail', probe.code === 0 ? 'Claude Code supports the coordinator launch flags; launch command resolves; sandbox settings applied' : `coordinator probe failed (exit ${probe.code}): ${short(probe.stderr || probe.stdout)}`);
-  return telegramRuntimeChecks(ex, wantsTelegram, checks);
+  return telegramRuntimeChecks(ex, wantsTelegram, checks, { host: true });
+}
+
+/**
+ * integration.* checks (local integration, task-82.4) from the runtime's `minions status --json`: its integration
+ * block carries the problems the runtime derived (stale lock, halted queue, a dirty checkout, a crash during
+ * `git merge --ff-only`). No block (not local delivery, an older image): no checks. One ok line when all is well.
+ */
+export function integrationDoctorChecks(r: { code: number; stdout: string }): Check[] {
+  if (r.code !== 0) return [];
+  try {
+    const env = JSON.parse(r.stdout) as { ok?: boolean; data?: { integration?: { enabled?: boolean; problems?: unknown; queue?: unknown[]; lock?: { state?: string } } } };
+    const i = env.ok ? env.data?.integration : undefined;
+    if (!i || typeof i !== 'object') return [];
+    const problems = Array.isArray(i.problems) ? i.problems.filter((p): p is Check & { status: 'warn' | 'fail' } =>
+      !!p && typeof (p as Check).name === 'string' && ((p as Check).status === 'warn' || (p as Check).status === 'fail') && typeof (p as Check).detail === 'string') : [];
+    if (problems.length) return problems.map((p) => ({ name: p.name, status: p.status, detail: redact(p.detail).slice(0, 600), ...(typeof p.hint === 'string' ? { hint: redact(p.hint).slice(0, 600) } : {}) }));
+    const queued = Array.isArray(i.queue) ? i.queue.length : 0;
+    return [{ name: 'integration', status: 'ok', detail: `local integration ${i.enabled ? 'on' : 'off'}; ${i.lock?.state === 'live' ? 'integrator running' : 'integrator idle'}; ${queued} queued` }];
+  } catch { return []; }
 }
 
 /** `minions ci status --json` output from the container (gh api); null when unavailable (e.g. an older image). */
@@ -656,7 +708,7 @@ export async function runDoctor(opts: {
     const harnesses = harnessView(config);
     if (hostMode) {
       restart = notApplicable('host runtime: no container to restart');
-      tgPlugin = await hostRuntimeChecks(project, auth, baseUrl, wantsTelegram, runner, add, checks);
+      tgPlugin = await hostRuntimeChecks(project, auth, baseUrl, wantsTelegram, runner, add, checks, config?.delivery.mode === 'local');
       checks.push(...harnessSkipChecks(harnesses, 'host-runtime'));
     } else if (docker.daemon && docker.compose) {
       const label = await imageBuildLabel(project.imageTag, runner);
@@ -698,6 +750,7 @@ export async function runDoctor(opts: {
         }
         checks.push(...tmpUsageChecks(await ex(['df', '-Pk', '/tmp', CONTAINER.scratch]), { capMiB: tmpSizeMiB(project.container), scratch: CONTAINER.scratch }));
         checks.push(backlogCliCheck(await ex(['backlog', '--version'])));
+        if (config?.delivery.mode === 'local') checks.push(...integrationDoctorChecks(await ex(['minions', 'status', '--json'])));
         const probe = await ex(['minions', 'coordinator', '--probe', '--json']);
         const perm = probe.code === 0 ? probePermission(probe.stdout) : undefined;
         add('claude.capabilities', probe.code !== 0 ? 'fail' : perm?.fallback ? 'warn' : 'ok', probe.code === 0
@@ -728,7 +781,7 @@ export async function runDoctor(opts: {
       const probe = tgPlugin ? { available: tgPlugin.status === 'ok', summary: tgPlugin.detail, items: [] } : undefined;
       const res = resolveChannel(channel, { ...facts, probe });
       add('communication.channel', 'ok', `configured ${res.configured}, effective ${res.effective}${res.cause === 'unchecked' ? ' (predicted)' : ''}: ${res.reason}`);
-      checks.push(telegramReadiness(res, tgPlugin, tgCred.state));
+      checks.push(telegramReadiness(res, tgPlugin, tgCred.state, facts.runtime));
     }
     if (config) checks.push(setupGapsCheck(config, { onGitHub: github.onGitHub, githubCredential: github.credential, telegramToken: tgCred.state }));
   } catch (e) {

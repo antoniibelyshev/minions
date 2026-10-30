@@ -18,7 +18,7 @@ vi.mock('../../src/plugin/generate.js', async () => {
   };
 });
 
-const { runInit, loadManifest } = await import('../../src/host/install.js');
+const { loadManifest } = await import('../../src/host/install.js');
 const { projectPaths } = await import('../../src/core/paths.js');
 const { loadProjectJson, loadEffectiveConfig, projectConfigPath } = await import('../../src/host/project.js');
 const CH = await import('../../src/host/channel-cli.js');
@@ -26,7 +26,7 @@ const C = await import('../../src/host/credentials.js');
 const { sha256 } = await import('../../src/core/fsutil.js');
 const { runtimeChannelStatus } = await import('../../src/runtime/commands.js');
 const { runtimePaths } = await import('../../src/runtime/paths.js');
-const { dockerUp, git, makeRepo, withHome } = await import('./fixtures.js');
+const { initFromTemplate, git, withHome } = await import('./fixtures.js');
 
 const TOKEN = '123456789:AAHfakefakefakefakefakefakefake_-0123';
 const notRunning = async () => false;
@@ -41,9 +41,8 @@ afterEach(() => {
 });
 
 async function install(visibility: 'shared' | 'private') {
-  const repo = makeRepo(env.root);
-  const r = await runInit({ path: repo, yes: true, visibility, dockerProbe: dockerUp });
-  const project = await loadProjectJson(r.plan.projectId);
+  const { repo, projectId } = await initFromTemplate(env.root, { visibility });
+  const project = await loadProjectJson(projectId);
   return { repo, project, file: projectConfigPath(project) };
 }
 const readCfg = (f: string) => JSON.parse(readFileSync(f, 'utf8')) as { configRevision: number; communication: { channel: string } };
@@ -137,13 +136,14 @@ describe('minions channel set', () => {
     expect(entry.sha256).not.toBe(edited);
   });
 
-  it('host runtime: warns Telegram is unavailable there; config.local.json override is reported', async () => {
+  it('host runtime: telegram uses the minions channel server (pairing note); config.local.json override is reported', async () => {
     const { project } = await install('private');
     const host = { ...project, runtime: 'host' as const };
     const r = await CH.setChannel(host, 'telegram', { yes: true }, { isRunning: notRunning });
-    expect(r.warnings.join('\n')).toMatch(/Telegram is unavailable in the host runtime/);
-    expect(r.nextSteps.join('\n')).not.toMatch(/minions auth telegram/);
-    expect(r.effective).toMatchObject({ effective: 'terminal', cause: 'host-runtime' });
+    expect(r.warnings).toEqual([]);
+    expect(r.nextSteps.join('\n')).toMatch(/minions auth telegram/);
+    expect(r.nextSteps).toContain(CH.HOST_CHANNEL_NOTE);
+    expect(r.effective).toMatchObject({ effective: 'terminal', cause: 'no-token' });
     const back = await CH.setChannel(host, 'terminal', { yes: true }, { isRunning: notRunning });
     expect(back.warnings).toEqual([]);
 

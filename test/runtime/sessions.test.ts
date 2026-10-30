@@ -17,7 +17,7 @@ import {
   type SessionCommandDeps,
 } from '../../src/runtime/sessions.js';
 import { GENERAL_SESSION_NOTE } from '../../src/runtime/router-prompt.js';
-import { defaults } from '../helpers.js';
+import { defaults, shq } from '../helpers.js';
 
 const OAUTH = `sk-ant-oat01-${'A'.repeat(80)}`;
 const PROVISIONED_KEY = 'provisioned-key-0123456789abcdef';
@@ -213,10 +213,14 @@ describe('buildSessionCommand', () => {
     expect(valueOf(l.args, '--model')).toBe(cfg.models.allowed[0]);
   });
 
-  it('refuses a bypassPermissions config and a missing credential', async () => {
-    const bypass = { ...defaults(), permissionMode: 'bypassPermissions' } as unknown as MinionsConfig;
+  it('passes the owner\'s bypassPermissions through; refuses a missing credential', async () => {
+    const bypass: MinionsConfig = { ...defaults(), coordinator: { permissionMode: 'bypassPermissions' } };
     writeFileSync(paths.claudeHeadlessTokenFile, OAUTH, { mode: 0o600 });
-    expect((await failure(buildSessionCommand(bypass, 'general', deps('login')))).code).toBe('POLICY_DENIED');
+    const l = await buildSessionCommand(bypass, 'general', deps('login'));
+    expect(valueOf(l.args, '--permission-mode')).toBe('bypassPermissions');
+    expect(l.userSettings).toMatchObject({ permissions: {} });
+    expect(l.flagSettings.permissions).not.toHaveProperty('disableBypassPermissionsMode');
+    rmSync(join(paths.state, 'run', 'sessions'), { recursive: true, force: true });
     rmSync(paths.claudeHeadlessTokenFile);
     expect((await failure(buildSessionCommand(defaults(), 'general', deps('login')))).code).toBe('AUTH_REQUIRED');
     expect(existsSync(join(paths.state, 'run', 'sessions'))).toBe(false);
@@ -242,7 +246,7 @@ describe('hook commands never exec from a noexec /tmp (U1)', () => {
     const script = join(root, 'hook.sh');
     writeFileSync(script, 'echo ran\n', { mode: 0o644 }); // not executable: exec fails like on a noexec mount
     expect(spawnSync(script, [], { encoding: 'utf8' }).error).toBeDefined();
-    expect(spawnSync('sh', ['-c', `sh ${script}`], { encoding: 'utf8' }).stdout).toBe('ran\n');
+    expect(spawnSync('sh', ['-c', `sh ${shq(script)}`], { encoding: 'utf8' }).stdout).toBe('ran\n');
   });
 
   it('buildSessionCommand refuses a plugin whose hooks exec from /tmp, and moves a /tmp TMPDIR to the scratch root', async () => {

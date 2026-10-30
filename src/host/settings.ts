@@ -28,11 +28,10 @@ import { COORDINATOR_DISALLOWED_TOOLS } from '../config/coordinator-tools.js';
 import type { Source } from '../config/resolve.js';
 import { HARNESS_IDS, HARNESSES, isHarnessId, isProcessHarness } from '../config/harnesses.js';
 import { COORDINATOR_ROLE, ROLE_NAME_PATTERN, workerRole, workerRoleNames } from '../config/roles.js';
-import { EFFORTS, type CapabilityRule, type MinionsConfig } from '../config/schema.js';
+import { COORDINATOR_PERMISSION_MODES, EFFORTS, type CapabilityRule, type MinionsConfig } from '../config/schema.js';
 import { classifyKey, type SettingClass } from '../config/setting-classes.js';
 import { MinionsError } from '../core/errors.js';
 import { usdPerMTok } from '../runtime/spend.js';
-import { AUTO_PROMOTE_DEFAULTS } from '../runtime/auto-promote.js';
 import { atomicWrite, readJsonIfExists } from '../core/fsutil.js';
 import { projectPaths } from '../core/paths.js';
 import { editProjectConfig, revisionConflict } from './config-write.js';
@@ -87,11 +86,6 @@ const RESTART_WHY: Record<SettingApply, string> = {
 };
 
 const more = (what: string) => (from: Value, to: Value) => (typeof from === 'number' && typeof to === 'number' && to > from ? `${what} (${from} -> ${to})` : null);
-/** A number above its previous value (unset = `def`) loosens. */
-const moreThanDefault = (def: number, what: string) => (from: Value, to: Value) => {
-  const f = typeof from === 'number' ? from : def; const t = typeof to === 'number' ? to : def;
-  return t > f ? `${what} (${f} -> ${t})` : null;
-};
 const turnsOff = (what: string) => (from: Value, to: Value) => (from === true && to === false ? what : null);
 const turnsOn = (what: string) => (from: Value, to: Value) => (from !== true && to === true ? what : null);
 const price = (m: Value) => (typeof m === 'string' ? usdPerMTok(m) : null);
@@ -200,9 +194,17 @@ const DECLARED: readonly DeclaredSetting[] = [
   { key: 'architecture', group: 'Policy', label: 'Architecture decisions', type: 'enum', choices: ['decide', 'propose'], apply: 'prompt',
     description: 'decide: agents make and record architecture decisions within a task; propose: they ask first',
     loosens: (f, t) => (f === 'propose' && t === 'decide' ? 'agents make architecture decisions without asking' : null) },
-  { key: 'coordinator.permissionMode', group: 'Policy', label: 'Coordinator permission mode', type: 'enum', choices: ['auto', 'acceptEdits'], optional: true, apply: 'launch',
-    description: 'auto: a classifier may approve actions outside the allow list; acceptEdits: prompt for every other Bash call',
-    loosens: (f, t) => ((f === 'acceptEdits') && (t === 'auto' || t === undefined) ? 'a classifier may approve coordinator actions outside the allow list without prompting' : null) },
+  { key: 'coordinator.permissionMode', group: 'Policy', label: 'Coordinator permission mode', type: 'enum', choices: [...COORDINATOR_PERMISSION_MODES], optional: true, apply: 'launch',
+    description: 'auto: a classifier may approve actions outside the allow list; acceptEdits: prompt for every other Bash call; bypassPermissions: never prompt (fully unattended, local config only)',
+    loosens: (f, t) => {
+      const rank = (m: unknown) => (m === 'bypassPermissions' ? 2 : m === 'acceptEdits' ? 0 : 1);
+      if (rank(t) <= rank(f)) return null;
+      return t === 'bypassPermissions' ? 'the coordinator and its workers run every tool call without asking (only the deny rules and, in the host runtime, the sandbox remain)'
+        : 'a classifier may approve coordinator actions outside the allow list without prompting';
+    } },
+  { key: 'coordinator.sandbox', group: 'Policy', label: 'Host runtime sandbox', type: 'bool', optional: true, apply: 'launch',
+    description: 'host runtime: Bash runs in the Claude Code sandbox (writes limited to the workspace and state, network to GitHub and npm); false: unsandboxed, as your user (local config only)',
+    loosens: (f, t) => (f !== false && t === false ? 'agent commands run on your host without the sandbox, with your full user access' : null) },
   { key: 'coordinator.contextReset.enabled', group: 'Policy', label: 'Routine context resets', type: 'bool', apply: 'live',
     description: 'the coordinator hands off and restarts with a fresh context when idle' },
   { key: 'routine.enabled', group: 'Policy', label: 'Unattended routine', type: 'bool', apply: 'live',
@@ -221,16 +223,7 @@ const DECLARED: readonly DeclaredSetting[] = [
     loosens: (f, t) => (Array.isArray(t) && t.length > (Array.isArray(f) ? f.length : 1) ? `more digests a day (${t.length}: one coordinator wake each)` : null) },
   { key: 'routine.timezone', group: 'Policy', label: 'Routine time zone', type: 'text', optional: true, apply: 'live',
     description: 'IANA time zone of the digest times and the routine\'s days (default Europe/Berlin)' },
-  // Phase 5 (task-68.6): caps on the coordinator promoting its own ideas, and GitHub labels that import ready. Host-owned.
-  { key: 'routine.autoPromote.perDay', group: 'Policy', label: 'Own ideas promoted per day', type: 'int', min: 0, optional: true, apply: 'live',
-    description: 'the coordinator may move at most this many of its own ideas (agent-hypothesis) to ready per day; each is listed in the digest (default 3; 0 = never)',
-    loosens: moreThanDefault(AUTO_PROMOTE_DEFAULTS.perDay, 'more of the coordinator\'s own ideas may start per day without you') },
-  { key: 'routine.autoPromote.maxBudgetPercent', group: 'Policy', label: 'Promotion budget limit (%)', type: 'int', min: 0, optional: true, apply: 'live',
-    description: 'no auto-promotion while the budget is at or above this percent (default 80; 0 to 100)',
-    loosens: moreThanDefault(AUTO_PROMOTE_DEFAULTS.maxBudgetPercent, 'the coordinator\'s own ideas may start closer to the budget limit') },
-  { key: 'routine.autoPromote.ownerSilentDays', group: 'Policy', label: 'Promotion stops after silent days', type: 'int', min: 1, optional: true, apply: 'live',
-    description: 'no auto-promotion when your last message is older than this many days (default 3)',
-    loosens: moreThanDefault(AUTO_PROMOTE_DEFAULTS.ownerSilentDays, 'the coordinator\'s own ideas keep starting longer while you are away') },
+  // Phase 5 (task-68.6): GitHub labels that import ready. Host-owned.
   { key: 'intake.github.readyLabels', group: 'Policy', label: 'GitHub labels that import ready', type: 'list', optional: true, apply: 'live',
     description: 'an imported issue carrying every one of these labels (comma-separated) is created ready instead of idea (needs intake.github; default none)',
     loosens: (f, t) => {

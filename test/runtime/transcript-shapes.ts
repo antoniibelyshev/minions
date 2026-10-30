@@ -1,7 +1,7 @@
 // Coordinator transcript lines in the shapes Claude Code 2.1 really writes (copied from live coordinator
 // transcripts, ids and text shortened): Telegram owner messages from the official plugin, the expanded form of
 // typed slash commands, and assistant turns. Shared by the coordinator-usage tests and the tests of the
-// consumers of the last owner message time (routine, digest, auto-promote).
+// consumers of the last owner message time (routine, digest).
 import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { trackCoordinatorUsage } from '../../src/runtime/coordinator-usage.js';

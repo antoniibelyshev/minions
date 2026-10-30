@@ -1,10 +1,9 @@
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { Option, type Command } from 'commander';
-import { setIdempotencyStore, setIntakePausedContext, setPromotionGuard, setProvenanceFallback, setReadyContext } from '../backlog/commands.js';
-import { checkPromotion } from './auto-promote.js';
+import { setIdempotencyStore, setIntakePausedContext, setProvenanceFallback, setReadyContext } from '../backlog/commands.js';
 import { openBacklog, writeBacklogConfig } from '../backlog/factory.js';
-import type { BacklogAdapter, IdempotencyStore } from '../backlog/types.js';
+import type { BacklogAdapter, IdempotencyStore, Task } from '../backlog/types.js';
 import { validateConfig } from '../config/resolve.js';
 import { isGithubDelivery } from '../config/delivery.js';
 import type { MinionsConfig } from '../config/schema.js';
@@ -25,9 +24,11 @@ import { installTelegramPlugin } from '../telegram/install.js';
 import { formatTelegramProbe, probeTelegram } from '../telegram/probe.js';
 import { resolveChannel } from '../telegram/channel.js';
 import { runChannelServer } from '../telegram/channel/server.js';
+import { formatAccessResult, runAccessCommand, type AccessAction } from '../telegram/channel/access-cli.js';
+import { createInterface } from 'node:readline/promises';
 import type { PollerCheck } from '../telegram/isolation.js';
 import {
-  buildClaudeCommand, buildCoordinatorCommand, telegramPollerStatus, claudePermissionModes, coordinatorWrapper, launchCoordinator, permissionModesNeeded, probeRuntime, readLaunchRecord, readMountedToken, RECOVERY_PROMPT,
+  buildClaudeCommand, buildCoordinatorCommand, hostChannelReport, printChannelServer, telegramPollerStatus, claudePermissionModes, coordinatorWrapper, launchCoordinator, permissionModesNeeded, probeRuntime, readLaunchRecord, readMountedToken, RECOVERY_PROMPT,
   restartCoordinator, runtimeChannelFacts, scheduleDetachedRestart, syncCoordinator, coordinatorLaunchStatus, type LaunchStatus,
   coordinatorPidAlive, procStartTime, readExitRecord, runtimeAuthMethod, systemProcessControl, scheduleCrashStart, TELEGRAM_TOKEN_ENV, WAKE_PROMPT,
 } from './coordinator.js';
@@ -73,7 +74,8 @@ import { liveRun, liveRunExitCode, type LiveRunReport } from './headless.js';
 import { buildSessionCommand, sessionsSettings } from './sessions.js';
 import { heldBySession, recordSent, resolveRoute, sendToSession, sessionKeyOf, waitForOutbound, type RouteResult, type WaitResult } from './router.js';
 import { runSupervisor, startSupervisorWatch, supervisorLockState, type SupervisorReport, type SupervisorTaskDeps } from './supervisor.js';
-import { adoptIntegrationBase, runIntegrator, type IntegratorReport } from './integrator.js';
+import { adoptIntegrationBase, runIntegrator, startIntegratorDetached, type IntegratorReport } from './integrator.js';
+import { collectIntegrationStatus, humanIntegration, kickInputs, kickIntegratorIfNeeded, startIntegrationWatch, type IntegrationStatus } from './integration-status.js';
 import { verifyAnyApproval } from '../core/approval.js';
 import { recoverTaskSession, taskSessionPass, type TaskSessionDeps } from './task-sessions.js';
 
@@ -314,6 +316,21 @@ export function wrapperRoutineClock(log: (line: string) => void): () => void {
   });
 }
 
+/** Starts `minions work integrate` detached (output in <logs>/integration/integrator.log), as Scheduler.record does. */
+function startIntegrator(): number | null {
+  const paths = runtimePaths();
+  return startIntegratorDetached({ log: join(paths.logs, 'integration', 'integrator.log'), cwd: paths.repo });
+}
+
+/**
+ * The wrapper's integration backstop (task-82.4): every minute (and at the start, which covers
+ * `coordinator restart --recover`), starts the local integrator when queued integrations have no live holder.
+ * The config is re-read each check (delivery.merge and base.merge are live settings).
+ */
+export function wrapperIntegrationWatch(_cfg: MinionsConfig, log: (line: string) => void): () => void {
+  return startIntegrationWatch({ decide: async () => kickInputs(getDb(), await loadRuntimeConfig()), start: startIntegrator, say: log });
+}
+
 /**
  * The wrapper's session supervisor watch (task-57 phase 5): with coordinator.sessions.enabled it starts
  * `minions coordinator supervise` detached and again whenever its lock is stale; with sessions off it does nothing.
@@ -375,6 +392,8 @@ export interface StatusReport {
   digest?: DigestStatus;
   /** Open change requests (proposed, confirmed, failed) waiting for the host: the manager or `minions settings apply`. */
   changeRequests?: { open: number; items: { id: string; kind: string; status: string; summary: string; createdAt: string }[] };
+  /** The local integrator (local delivery; docs/design/local-auto-integration.md): lock, current run, queue, last result, problems. */
+  integration?: IntegrationStatus;
   backlogError?: string;
 }
 
@@ -401,7 +420,9 @@ export async function runtimeChannelStatus(cfg: MinionsConfig, paths = runtimePa
   return { configured: r.configured, effective: r.effective, reason: r.reason, source: 'predicted' };
 }
 
-export async function collectStatus(deps: { db: RuntimeDb; config: MinionsConfig; state?: string; backlog: () => Promise<BacklogAdapter>; channel?: () => Promise<ChannelStatus>; launch?: () => Promise<LaunchStatus>; poller?: () => Promise<PollerCheck> }): Promise<StatusReport> {
+export async function collectStatus(deps: { db: RuntimeDb; config: MinionsConfig; state?: string; backlog: () => Promise<BacklogAdapter>; channel?: () => Promise<ChannelStatus>; launch?: () => Promise<LaunchStatus>; poller?: () => Promise<PollerCheck>;
+  /** The local integrator's block (the CLI passes collectIntegrationStatus for /workspace/repo); omitted: no block. */
+  integration?: (tasks: Task[] | null) => Promise<IntegrationStatus | null> }): Promise<StatusReport> {
   const { db: d, config: cfg } = deps;
   const leases = d.activeLeases();
   const report: StatusReport = {
@@ -424,13 +445,17 @@ export async function collectStatus(deps: { db: RuntimeDb; config: MinionsConfig
   try { report.routine = routineLast(d, cfg); } catch { /* status never fails on the routine */ }
   try { if (cfg.routine?.enabled) report.digest = digestStatus(d, cfg); } catch { /* status never fails on the digest */ }
   try { const { steps: _s, ...c } = contextResetCheck({ db: d, config: cfg, ...(deps.state !== undefined ? { state: deps.state } : {}) }); report.contextReset = c; } catch { /* status never fails on the reset check */ }
+  let tasks: Task[] | null = null;
   try {
-    const tasks = await (await deps.backlog()).listTasks();
+    tasks = await (await deps.backlog()).listTasks();
     for (const t of tasks) report.queue[t.status] = (report.queue[t.status] ?? 0) + 1;
     const cap = capacityOf(cfg, leases, tasks);
     report.capacity = { activeTasks: cap.activeTaskIds.length, maxActiveTasks: cap.maxActiveTasks, activeEngineers: cap.activeEngineers, maxEngineers: cap.maxEngineers, byRole: cap.byRole };
   } catch (e) {
     report.backlogError = (e as Error).message;
+  }
+  if (deps.integration) {
+    try { const i = await deps.integration(tasks); if (i) report.integration = i; } catch { /* status never fails on the integration block */ }
   }
   return report;
 }
@@ -459,6 +484,7 @@ export function humanStatus(s: StatusReport): string {
     ...(s.contextReset?.enabled ? [humanContextReset(s.contextReset)] : []),
     ...(s.routine ? [humanRoutine(s.routine)] : []),
     ...(s.digest ? [humanDigestStatus(s.digest)] : []),
+    ...(s.integration ? humanIntegration(s.integration) : []),
   ];
   if (s.backlogError) out.push(`backlog error: ${s.backlogError}`);
   out.push(s.activeLeases.length ? 'active leases:' : 'active leases: none', ...s.activeLeases.map((l) => `  ${l.id} ${l.task_id} ${l.role} #${l.attempt} ${l.branch ?? ''}`));
@@ -592,11 +618,6 @@ export function register(program: Command): void {
     });
     setIntakePausedContext(() => getDb().paused().intake);
     setProvenanceFallback(intakeProvenanceFallback(getDb));
-    // Auto-promotion caps (task-68.6): a budget read error refuses the change (fail closed).
-    setPromotionGuard(async (c, getTask) => {
-      const d = getDb(); const cfg = await getConfig();
-      return checkPromotion(c, { db: d, config: cfg, getTask, budgetPercent: () => currentBudget({ db: d, config: cfg })?.percent ?? null });
-    });
   }
 
   // work
@@ -918,7 +939,11 @@ export function register(program: Command): void {
       if (o.printCommand) {
         // Same permission-mode check as the launch: auto only when this Claude Code offers it; default under the name it lists.
         const permissionModes = permissionModesNeeded(cfg) ? await claudePermissionModes() : undefined;
-        const r = { tmux: await buildCoordinatorCommand(cfg), claude: await buildClaudeCommand(cfg, runtimePaths(), { telegram: cfg.communication.channel !== 'terminal', permissionModes }) };
+        const paths = runtimePaths();
+        const telegram = cfg.communication.channel !== 'terminal';
+        // Host runtime: the launch id is made per launch, so the printed argv shows a placeholder for it.
+        const channelServer = telegram && runtimeMode() === 'host-runtime' ? printChannelServer(paths) : undefined;
+        const r = { tmux: await buildCoordinatorCommand(cfg), claude: await buildClaudeCommand(cfg, paths, { telegram, permissionModes, ...(channelServer ? { channelServer } : {}) }) };
         emit(r, { json: globalOpts(cmd).json, human: (d: typeof r) => [JSON.stringify([d.tmux.cmd, ...d.tmux.args]), JSON.stringify([d.claude.cmd, ...d.claude.args])].join('\n') });
         return;
       }
@@ -936,6 +961,7 @@ export function register(program: Command): void {
         ...(o.recover ? { startupPrompt: RECOVERY_PROMPT } : o.wake ? { startupPrompt: WAKE_PROMPT } : {}),
         routineClock: wrapperRoutineClock,
         supervisorWatch: wrapperSupervisorWatch,
+        integrationWatch: wrapperIntegrationWatch,
         onStart: async (c, l, stop) => {
           // D3b: no process run of the previous session outlives it. Every record that is not done is reaped
           // (cancel or kill, escapee sweep, wip: checkpoint) before anything else touches its scratch dir.
@@ -989,6 +1015,8 @@ export function register(program: Command): void {
         recordRestart: coordinatorRestartRecorder(d),
         lock: d,
       }, o);
+      // --recover backstop (task-82.4): a queued integration whose detached start was lost starts again here.
+      if (o.recover) await kickIntegratorIfNeeded({ decide: async () => kickInputs(d, await getConfig()), start: startIntegrator, say: (l) => process.stderr.write(l + '\n') });
       emit(r, { json: globalOpts(cmd).json, human: (x: typeof r) => `coordinator: ${x.action} (${x.reason})` });
     }));
 
@@ -1112,23 +1140,30 @@ export function register(program: Command): void {
     }));
 
   // telegram: credential-free capability probe. Host mode delegates to the container, where Claude Code runs.
-  const tg = program.command('telegram').description('Telegram channel plugin support (docs/design/telegram.md)');
-  tg.command('probe').description('Report whether the official Telegram channel plugin is usable (needs no credentials)')
+  const tg = program.command('telegram').description('Telegram channel support (docs/design/telegram.md, docs/design/telegram-channel.md)');
+  tg.command('probe').description('Report whether the Telegram channel is usable: the official plugin (Docker) or the minions channel server (host runtime); needs no credentials')
     .action(action(async (_o: unknown, cmd: Command) => {
       if (runtimeMode() === 'host') return delegate(cmd);
+      if (runtimeMode() === 'host-runtime') {
+        // Task-6: the host runtime runs the minions channel server, not the plugin. The token file is only checked for
+        // format here; its content never leaves this process.
+        const paths = runtimePaths();
+        emit(await hostChannelReport(await readMountedToken(paths.telegramTokenFile), paths), { json: globalOpts(cmd).json, human: formatTelegramProbe });
+        return;
+      }
       emit(await probeTelegram(), { json: globalOpts(cmd).json, human: formatTelegramProbe });
     }));
   tg.command('install').description('Install the official Telegram channel plugin at user scope in the claude volume (needs network, no login)')
     .action(action(async (_o: unknown, cmd: Command) => {
       if (runtimeMode() === 'host') return delegate(cmd);
       if (runtimeMode() === 'host-runtime') {
-        throw new MinionsError('PRECONDITION', 'The Telegram channel is not available in the host runtime: it would install a plugin into your own Claude Code setup, and the host runtime starts Claude Code without user settings, plugins or MCP servers.',
-          'Use the Docker runtime for Telegram (`minions runtime set docker`), or keep the terminal channel.');
+        throw new MinionsError('PRECONDITION', 'The official Telegram plugin is not used in the host runtime: it would install a plugin into your own Claude Code setup. The host runtime uses the minions channel server instead (nothing to install).',
+          'Store a bot token with `minions auth telegram`, then `minions start`; `minions telegram probe` checks the server.');
       }
       const r = await installTelegramPlugin();
       emit(r, { json: globalOpts(cmd).json, human: (d: typeof r) => [`marketplace ${d.marketplace}; plugin ${d.plugin} (version ${d.version ?? 'unknown'})`, ...d.warnings.map((w) => `warning: ${w}`)].join('\n') });
     }));
-  // The minions-owned channel server (task-67.2, docs/design/telegram-channel.md). Not wired into any launch yet.
+  // The minions-owned channel server (task-67.2, docs/design/telegram-channel.md). The host runtime launch loads it (task-6).
   const tgChannel = tg.command('channel').description('The minions-owned Telegram channel server (MCP over stdio; started by the coordinator launch only)');
   tgChannel.command('serve').description('Serve the Telegram channel on stdin/stdout (JSON-RPC); reads the bot token only from $MINIONS_TELEGRAM_TOKEN_FILE')
     .action(action(async () => {
@@ -1143,13 +1178,41 @@ export function register(program: Command): void {
     .action(action(async (_o: unknown, cmd: Command) => {
       if (runtimeMode() === 'host') return delegate(cmd);
       const paths = runtimePaths();
-      const r = { access: await readTelegramAccess(paths.telegramStateDir), coordinator: await readLaunchRecord(paths), poller: await telegramPollerStatus({ paths }) };
+      const r = { access: await readTelegramAccess(paths.telegramStateDir, undefined, { host: runtimeMode() === 'host-runtime' }), coordinator: await readLaunchRecord(paths), poller: await telegramPollerStatus({ paths }) };
       emit(r, { json: globalOpts(cmd).json, human: (d: typeof r) => [
         `access: ${d.access.state} - ${d.access.detail}${d.access.hint ? `\n  hint: ${d.access.hint}` : ''}`,
         `coordinator: ${d.coordinator ? (d.coordinator.telegram.enabled ? 'Telegram enabled' : `terminal only (${d.coordinator.telegram.reason})`) : 'no launch recorded'}`,
         ...(d.poller.state !== 'not-applicable' ? [humanPoller(d.poller)] : []),
       ].join('\n') });
     }));
+
+  // Pairing for the minions channel server (task-6): a terminal command, never a skill the model can run.
+  const tgAccess = tg.command('access').description('Pair and manage who may use the Telegram channel (host runtime; interactive terminal only, with a typed confirmation)');
+  const accessAction = (make: (...a: string[]) => AccessAction) => action(async (...args: unknown[]) => {
+    const cmd = args[args.length - 1] as Command;
+    if (runtimeMode() === 'host') return delegate(cmd);
+    requireMode('runtime');
+    if (runtimeMode() !== 'host-runtime') {
+      throw new MinionsError('PRECONDITION', 'In the Docker runtime the official Telegram plugin owns pairing.',
+        'Pair in the coordinator terminal: /telegram:access pair <code>, then /telegram:access policy allowlist.');
+    }
+    const isTty = !!process.stdin.isTTY && !!process.stdout.isTTY;
+    const ask = async (q: string) => {
+      if (!isTty) return null;
+      const rl = createInterface({ input: process.stdin, output: process.stderr });
+      try { return await rl.question(`${q} `); } finally { rl.close(); }
+    };
+    const r = await runAccessCommand(runtimePaths().telegramStateDir, make(...(args.slice(0, -2) as string[])), { isTty, ask });
+    emit(r, { json: globalOpts(cmd).json, human: formatAccessResult });
+  });
+  tgAccess.command('pair <code>').description('Approve the pairing code the bot sent you in a DM')
+    .action(accessAction((code) => ({ kind: 'pair', code: code! })));
+  tgAccess.command('policy <policy>').description('Set the DM policy: allowlist (recommended once paired), pairing, or disabled')
+    .action(accessAction((policy) => ({ kind: 'policy', policy: policy! })));
+  tgAccess.command('remove <senderId>').description('Remove a sender from the allowlist')
+    .action(accessAction((senderId) => ({ kind: 'remove', senderId: senderId! })));
+  tgAccess.command('list').description('Show the DM policy, the allowlisted senders and the number of pending codes')
+    .action(accessAction(() => ({ kind: 'list' })));
 
   // workspace
   const ws = program.command('workspace').description('Container workspace and state setup (container only)');
@@ -1307,7 +1370,8 @@ export function register(program: Command): void {
         return;
       }
       const cfg = await getConfig();
-      const r = await collectStatus({ db: getDb(), config: cfg, state: runtimePaths().state, backlog: getBacklog, channel: () => runtimeChannelStatus(cfg), launch: () => coordinatorLaunchStatus(cfg), poller: () => telegramPollerStatus() });
+      const r = await collectStatus({ db: getDb(), config: cfg, state: runtimePaths().state, backlog: getBacklog, channel: () => runtimeChannelStatus(cfg), launch: () => coordinatorLaunchStatus(cfg), poller: () => telegramPollerStatus(),
+        integration: (tasks) => collectIntegrationStatus({ db: getDb(), config: cfg, repo: runtimePaths().repo, tasks }) });
       emit(r, { json: globalOpts(cmd).json, human: humanStatus });
     }));
   const pauseLike = (name: 'pause' | 'resume') => {

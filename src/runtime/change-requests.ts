@@ -3,8 +3,8 @@
  *
  * In the agent runtime, `minions settings set <key> <value> --reason <text>`, `minions settings restart` and
  * `minions upgrade [--from-container]` do not fail with "host only": they record a request in the runtime DB
- * (change_requests). Recording validates the request against the runtime config and refuses host-owned keys
- * (CONFLICT: the coordinator asks the owner instead). A recorded request changes nothing: the host re-reads it,
+ * (change_requests). Recording validates the request against the runtime config (any setting but secrets and runtime
+ * controls; host-owned policy keys included). A recorded request changes nothing: the host re-reads it,
  * re-validates it against its own config, builds the plan and applies it only after the owner confirms that
  * plan (src/host/change-requests.ts). The output therefore always says "recorded, not applied".
  */
@@ -140,9 +140,9 @@ export function recordSettingRequest(ctx: RecordContext, key: string, input: str
     throw new MinionsError('PRECONDITION', `${key} is a runtime control, not a configuration setting: no change request is needed.`,
       `Run \`minions ${key === 'pause.intake' ? 'pause --intake' : 'pause --starts'}\` or \`minions resume\` in the runtime.`, { path: key });
   }
-  if (def.hostOwned) {
-    throw new MinionsError('CONFLICT', `${key} is host-owned (policy, permissions, secrets or isolation): the container cannot request a change to it; nothing recorded.`,
-      `Ask the owner instead: post the reason and the exact command in your chat (\`minions settings set ${key} <value>\` in the host terminal). Never record it as a change request.`, { path: key, hostOwned: true });
+  if (def.type === 'secret') {
+    throw new MinionsError('CONFLICT', `${key} is a secret: only the owner provisions it on the host; nothing recorded.`,
+      'Ask the owner to run the matching `minions auth` command on the host.', { path: key, hostOwned: true });
   }
   const reason = cleanReason(o.reason, true);
   const layer = o.layer ?? 'local';

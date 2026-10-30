@@ -11,8 +11,9 @@ import {
   adoptIntegrationBase, enqueueIntegration, INTEGRATION_BASE_META, INTEGRATION_LOCK_META, integrationHalt, integrationLock,
   integrationRows, integratorAlive, runIntegrator, type IntegratorDeps,
 } from '../../src/runtime/integrator.js';
+import { pending } from '../../src/runtime/outbox.js';
 import { isAlive, procIdentity } from '../../src/runtime/runner/record.js';
-import { defaults } from '../helpers.js';
+import { defaults, HAS_PROCFS, shq } from '../helpers.js';
 import { gitSync, initRepo, tmp } from './fixtures.js';
 
 const branchOf = (task: string) => `agent/${task}-thing`;
@@ -87,6 +88,38 @@ describe('runIntegrator: landing and the verify runner', () => {
     expect(integrationLock(s.db)).toBeNull();
   });
 
+  it('every landing queues one integrated notice with the task, merge SHA and changed paths (capped with a count)', async () => {
+    const s = setup();
+    s.queue('task-1');
+    const many: Record<string, string> = {};
+    for (let i = 0; i < 25; i++) many[`src/f${String(i).padStart(2, '0')}.ts`] = `${i}\n`;
+    s.queue('task-2', many);
+    await runIntegrator(s.deps);
+    const C1 = rowOf(s.db, 'task-1').candidate_sha!;
+    const C2 = rowOf(s.db, 'task-2').candidate_sha!;
+    const notes = pending(s.db, { includeWaiting: true }).filter((n) => n.key.startsWith('integrated:'));
+    expect(notes.map((n) => [n.key, n.kind, n.taskId])).toEqual([[`integrated:task-1:${C1}`, 'other', 'task-1'], [`integrated:task-2:${C2}`, 'other', 'task-2']]);
+    expect(notes[0]!.text).toBe(`task-1 merged into main at ${C1}; 1 changed path: task-1.txt. ref: #task-1`);
+    expect(notes[1]!.text).toContain(`task-2 merged into main at ${C2}; 25 changed paths: src/f00.ts, `);
+    expect(notes[1]!.text).toContain('src/f19.ts, … +5 more. ref: #task-2');
+    expect(notes[1]!.text).not.toContain('src/f20.ts');
+  });
+
+  it('the integrated notice and event are queued before the settle hook runs (a crash in the hook cannot lose them)', async () => {
+    const s = setup();
+    s.queue('task-1');
+    const seen: { phase: string; notice: boolean; events: number }[] = [];
+    s.deps.onSettled = (row) => {
+      seen.push({
+        phase: row.phase,
+        notice: pending(s.db, { includeWaiting: true }).some((n) => n.key === `integrated:task-1:${row.candidate_sha}`),
+        events: s.db.events('task-1', 'integrated').length,
+      });
+    };
+    await runIntegrator(s.deps);
+    expect(seen).toEqual([{ phase: 'landed', notice: true, events: 1 }]);
+  });
+
   it('a failing command is red: main stays at B and the log tail is the detail', async () => {
     const s = setup({ commands: ['true', 'echo boom-from-tests; exit 3'] });
     s.queue('task-1');
@@ -95,7 +128,7 @@ describe('runIntegrator: landing and the verify runner', () => {
     expect(mainOf(s.repo)).toBe(s.B);
     const row = rowOf(s.db, 'task-1');
     expect(row.phase).toBe('red');
-    expect(row.detail).toMatch(/echo boom-from-tests; exit 3` failed \(exit 3\)\nboom-from-tests/);
+    expect(row.detail).toMatch(/echo boom-from-tests; exit 3` failed twice: failed again on its rerun \(exit 3\)\nboom-from-tests/);
     expect(readFileSync(row.log_path!, 'utf8')).toContain('boom-from-tests');
     expect(s.db.getMeta(INTEGRATION_BASE_META)).toBe(s.B);
   });
@@ -138,7 +171,7 @@ describe('runIntegrator: landing and the verify runner', () => {
 
   it('a recreated integration worktree runs setupCommands again (the setup marker belongs to the worktree)', async () => {
     const counter = join(tmp('minions-integrator-count-'), 'count');
-    const s = setup({ setupCommands: [`mkdir -p node_modules && touch node_modules/installed && echo x >> ${counter}`], commands: ['test -f node_modules/installed'] });
+    const s = setup({ setupCommands: [`mkdir -p node_modules && touch node_modules/installed && echo x >> ${shq(counter)}`], commands: ['test -f node_modules/installed'] });
     s.queue('task-1');
     await runIntegrator(s.deps);
     expect(rowOf(s.db, 'task-1').phase).toBe('landed');
@@ -320,10 +353,13 @@ describe('runIntegrator: crash recovery', () => {
     expect(rowOf(s.db, 'task-1')).toMatchObject({ phase: 'landed', candidate_sha: c.candidate });
     expect(s.db.getMeta(INTEGRATION_BASE_META)).toBe(c.candidate);
     expect(mainOf(s.repo)).toBe(c.candidate);
+    // The crash may have come before the landing notice: recovery queues it (keyed by C).
+    expect(pending(s.db, { includeWaiting: true }).filter((n) => n.key.startsWith('integrated:')).map((n) => [n.key, n.text]))
+      .toEqual([[`integrated:task-1:${c.candidate}`, `task-1 merged into main at ${c.candidate}; 1 changed path: task-1.txt. ref: #task-1`]]);
     expect(r.exit).toBe('empty');
   });
 
-  it('otherwise the recorded verify group is stopped (leader matched) and the row is re-queued and integrated', async () => {
+  it.skipIf(!HAS_PROCFS)('otherwise the recorded verify group is stopped (leader matched) and the row is re-queued and integrated', async () => {
     const s = setup();
     s.queue('task-1');
     const child = spawn('sh', ['-c', 'sleep 60 & sleep 60; wait'], { detached: true, stdio: 'ignore' });

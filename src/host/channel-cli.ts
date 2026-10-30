@@ -18,7 +18,11 @@ import { projectForPath } from './registry.js';
 import { HostRuntime, runtimeOf } from './runtime.js';
 
 export const RESTART_HINT = 'communication.channel is restart-required: run `minions down && minions start` to apply it.';
-export const HOST_CHANNEL_WARNING = 'Telegram is unavailable in the host runtime (the coordinator starts without user plugins or MCP servers), so it stays terminal-only. Use the Docker runtime for Telegram (`minions runtime set docker`).';
+/**
+ * Host runtime with Telegram (task-6): the coordinator loads the minions channel server through the development channel
+ * flag, which Claude Code confirms at every start, and pairing is a host terminal command.
+ */
+export const HOST_CHANNEL_NOTE = 'Telegram in the host runtime uses the minions channel server: Claude Code asks to confirm "Loading development channels" at every coordinator start (attach and choose "I am using this for local development"). Pair with `minions telegram access pair <code>` in a terminal on the host, then `minions telegram access policy allowlist`.';
 const TOKEN_HINT = `No Telegram bot token is stored for this project: create a bot with BotFather (${BOTFATHER_URL}, /newbot), then run \`minions auth telegram\`.`;
 
 /** Whether a Telegram bot token reference is stored for the project (no secret store access, no network). */
@@ -109,9 +113,9 @@ export interface ChannelSetDeps extends ChannelDeps {
 export function channelNextSteps(s: { to: ChannelSetting; runtime: 'docker' | 'host'; tokenStored: boolean; shared: boolean; running: boolean; changed: boolean; localOverride: ChannelSetting | null; localPath: string }): { warnings: string[]; nextSteps: string[] } {
   const warnings: string[] = [];
   const nextSteps: string[] = [];
-  if (s.to !== 'terminal' && s.runtime === 'host') warnings.push(HOST_CHANNEL_WARNING);
   if (s.localOverride !== null && s.localOverride !== s.to) warnings.push(`${s.localPath} sets communication.channel "${s.localOverride}", which overrides the project file; edit or remove it there.`);
-  if (s.to !== 'terminal' && s.runtime === 'docker' && !s.tokenStored) nextSteps.push(TOKEN_HINT);
+  if (s.to !== 'terminal' && !s.tokenStored) nextSteps.push(TOKEN_HINT);
+  if (s.to !== 'terminal' && s.runtime === 'host') nextSteps.push(HOST_CHANNEL_NOTE);
   if (s.changed && s.shared) nextSteps.push('Commit .minions/config.json to share the change (minions does not commit): `git add .minions/config.json && git commit -m "minions: communication.channel"`.');
   if (s.changed && s.running) nextSteps.push(RESTART_HINT);
   else if (s.changed) nextSteps.push('Applies on the next `minions start`.');

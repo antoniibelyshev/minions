@@ -56,7 +56,7 @@ describe('parsePermissionModes: unexpected --help output never yields an unliste
   it('"auto" only counts as an exact choice, not as a substring of another one', () => {
     const modes = parsePermissionModes(choices('"acceptEdits", "autoEdits", "plan"'));
     expect(modes).toEqual(['acceptEdits', 'autoEdits', 'plan']);
-    expect(decidePermissionMode(defaults(), { hostRuntime: false, modes })).toMatchObject({ mode: 'acceptEdits', fallback: true });
+    expect(decidePermissionMode(defaults(), { modes })).toMatchObject({ mode: 'acceptEdits', fallback: true });
   });
 
   it.skipIf(!(() => { try { execFileSync('claude', ['--version'], { stdio: 'ignore', timeout: 30_000 }); return true; } catch { return false; } })())(

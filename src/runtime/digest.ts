@@ -31,8 +31,6 @@ export const DIGEST_RETRY_MINUTES = 60;
 /** A digest time this many minutes old when first due was missed (caught up). */
 const MISSED_AFTER_MINUTES = 30;
 export const DIGEST_KEY_PREFIX = 'digest:';
-/** Events that phase 5 records for each auto-promotion (listed in the digest). */
-export const AUTO_PROMOTE_EVENT = 'auto-promote';
 
 export type Hold = 'digest' | 'none';
 export const HOLD_CHOICES = ['digest', 'none', 'default'] as const;
@@ -169,7 +167,7 @@ export interface DigestInput {
   timezone: string;
   /** The digest key this text is stored under (`digest:<local time>`). */
   key: string;
-  /** Start of the window for "merged", "auto-promoted" and spend: the previous digest's delivery (at most a week back), else a day ago. */
+  /** Start of the window for "merged" and spend: the previous digest's delivery (at most a week back), else a day ago. */
   since: string;
   /** Undelivered outbox items (digest rows excluded). */
   items: OutboxItem[];
@@ -178,7 +176,11 @@ export interface DigestInput {
   merged: { taskId: string; prUrl: string | null; at: string }[];
   /** Publications and merges waiting for a host-signed approval (the manager chat's /approve). */
   approvals: { taskId: string; head: string; scope: 'publish' | 'merge' }[];
-  autoPromoted: { taskId: string; at: string }[];
+  /**
+   * Local integration (task-82.4) since `since`: failed integrations (conflict, red, refused: sent back for a repair;
+   * transient: blocked) and landings whose verification passed only on a rerun (flaky). Absent: none.
+   */
+  integration?: { taskId: string; outcome: 'conflict' | 'red' | 'refused' | 'transient' | 'flaky'; detail: string | null; at: string }[];
   /**
    * Spend over one window, `since` (tokens, USD, wakes and wake tokens alike); `window` names it in the title
    * (since the previous digest; the last 7 days when that is older; the last 24h without a previous digest).
@@ -227,7 +229,7 @@ const kTok = (n: number) => (n >= 1_000_000 ? `${Math.round(n / 100_000) / 10}M`
 
 /**
  * The digest text, deterministic for the same input: sections in a fixed order (waiting for you, blockers, merged,
- * delivered, updates, auto-promoted, spend, next up, questions), lines sorted, empty sections left out, questions
+ * delivered, updates, spend, next up, questions), lines sorted, empty sections left out, questions
  * numbered Q1.. as polls. The whole text is at most MAX_TEXT_LENGTH. When everything does not fit, approvals and
  * blockers are kept first, then questions, then the rest; lines are never cut in half, and every line left out is
  * counted in a closing "<n> more item(s): send /status" line (outbox items left out are in `left`, still pending).
@@ -263,8 +265,10 @@ export function composeDigest(i: DigestInput): Digest {
   add('Merged', merged.map((m) => ({ text: `- ${title(m.taskId)}${m.prUrl ? ` ${m.prUrl}` : ''}`, key: null })));
   add('Delivered, waiting for CI or merge', all.filter((t) => ['delivered', 'awaiting-ci', 'merging'].includes(t.status) && !heldDelivered.has(t.id))
     .map((t) => ({ text: `- ${title(t.id)}${t.status !== 'delivered' ? ` (${t.status})` : ''}${t.prUrl ? ` ${t.prUrl}` : ''}`, key: null })));
+  const integ = [...new Map([...(i.integration ?? [])].sort((a, b) => (a.at < b.at ? -1 : 1)).map((x) => [`${x.taskId}:${x.outcome === 'flaky' ? 'flaky' : 'fail'}`, x])).values()]
+    .sort((a, b) => byId(a.taskId, b.taskId) || a.outcome.localeCompare(b.outcome));
+  add('Integration', integ.map((x) => ({ text: `- ${title(x.taskId)}: ${x.outcome === 'flaky' ? 'merged, but a test passed only on its rerun (flaky; follow-up)' : x.outcome === 'transient' ? 'integration failed twice (transient), blocked' : `integration ${x.outcome}, sent back for a repair`}${x.detail ? ` - ${oneLine(x.detail, 160)}` : ''}`, key: null })));
   add('Updates', ofKind('delivered', 'feature', 'status', 'goal-ack', 'other').map((x) => ({ text: `- ${oneLine(x.text)}`, key: x.key })));
-  add('Auto-promoted (reply "cancel <id>" or "hold <id>")', [...new Set(i.autoPromoted.map((a) => a.taskId))].sort(byId).map((id) => ({ text: `- ${title(id)}`, key: null })));
   if (i.spend) {
     const s = i.spend;
     add(SPEND_TITLE[s.window], [
@@ -368,11 +372,25 @@ export function digestInput(db: RuntimeDb, cfg: DigestConfig, src: DigestSources
     const d = e.data as { state?: string; prUrl?: string } | null;
     if (e.taskId && d?.state === 'merged') merged.push({ taskId: e.taskId, prUrl: d.prUrl ?? null, at: e.at });
   }
+  // Local integration (task-82.4): a landing on the local base is a merge; failures and flaky landings get a line.
+  for (const e of db.eventsOfKindSince('integrated', since)) if (e.taskId) merged.push({ taskId: e.taskId, prUrl: null, at: e.at });
+  const integration: NonNullable<DigestInput['integration']> = [];
+  for (const outcome of ['conflict', 'red', 'refused', 'transient'] as const) {
+    for (const e of db.eventsOfKindSince(`integration-${outcome}`, since)) {
+      const d = e.data as { detail?: string | null } | null;
+      if (e.taskId) integration.push({ taskId: e.taskId, outcome, detail: d?.detail ? d.detail.split('\n')[0]! : null, at: e.at });
+    }
+  }
+  for (const e of db.eventsOfKindSince('integration-flaky', since)) {
+    const d = e.data as { commands?: string[] } | null;
+    if (e.taskId) integration.push({ taskId: e.taskId, outcome: 'flaky', detail: d?.commands?.length ? d.commands.join(', ') : null, at: e.at });
+  }
 
   const statusOf = new Map((src.tasks ?? []).map((t) => [t.id, t.status]));
   const approvals: DigestInput['approvals'] = [];
-  for (const p of db.all<{ task_id: string; head_sha: string }>("SELECT task_id, head_sha FROM publications WHERE state = 'awaiting-approval'")) {
-    approvals.push({ taskId: p.task_id, head: p.head_sha, scope: 'publish' });
+  // A local publication waiting for approval is a local integration: it needs a merge approval (task-82.4).
+  for (const p of db.all<{ task_id: string; head_sha: string; mode: string }>("SELECT task_id, head_sha, mode FROM publications WHERE state = 'awaiting-approval'")) {
+    approvals.push({ taskId: p.task_id, head: p.head_sha, scope: p.mode === 'local' ? 'merge' : 'publish' });
   }
   const lastMerge = new Map<string, { state?: string; head?: string }>();
   for (const e of db.eventsOfKindSince('merge', weekAgo)) if (e.taskId) lastMerge.set(e.taskId, e.data as { state?: string; head?: string });
@@ -381,8 +399,7 @@ export function digestInput(db: RuntimeDb, cfg: DigestConfig, src: DigestSources
     if (d?.state === 'awaiting-approval' && d.head && (!src.tasks || status === 'delivered' || status === 'awaiting-ci' || status === 'merging')) approvals.push({ taskId, head: d.head, scope: 'merge' });
   }
 
-  const autoPromoted = db.eventsOfKindSince(AUTO_PROMOTE_EVENT, since).filter((e) => e.taskId).map((e) => ({ taskId: e.taskId!, at: e.at }));
-  // One window for every spend figure: `since` (as merged and auto-promoted), not the UTC or the local day.
+  // One window for every spend figure: `since` (as merged), not the UTC or the local day.
   let spend: DigestInput['spend'] = null;
   if (src.spend) {
     const f = spendSince({ db, billing: src.spend.billing, ...(cfg.models ? { config: { models: cfg.models } } : {}) }, since);
@@ -395,7 +412,7 @@ export function digestInput(db: RuntimeDb, cfg: DigestConfig, src: DigestSources
       wakes, wakeTokens,
     };
   }
-  return { now, timezone: s.timezone, key: currentKey(db, st, now), since, items, tasks: src.tasks, merged, approvals, autoPromoted, spend, runnable: src.runnable };
+  return { now, timezone: s.timezone, key: currentKey(db, st, now), since, items, tasks: src.tasks, merged, approvals, spend, runnable: src.runnable, ...(integration.length ? { integration } : {}) };
 }
 
 /** Meta prefix of a digest's question numbers (`digest_questions:<digest key>` = [{n, key}]). */

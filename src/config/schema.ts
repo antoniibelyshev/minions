@@ -2,6 +2,9 @@ import { z } from 'zod';
 import { isRequiredCoordinatorTool } from './coordinator-tools.js';
 import { HARNESS_IDS, PROCESS_HARNESS_IDS } from './harnesses.js';
 
+/** Permission modes the coordinator (and its workers) may run in. */
+export const COORDINATOR_PERMISSION_MODES = ['auto', 'acceptEdits', 'bypassPermissions'] as const;
+
 export const CAPABILITIES = [
   'task.read', 'task.create', 'task.update', 'task.start',
   'external.read', 'external.comment', 'external.changeStatus', 'external.create',
@@ -360,11 +363,17 @@ export const MinionsConfigSchema = z.object({
   /** Coordinator session settings (src/runtime/coordinator.ts). */
   coordinator: z.object({
     /**
-     * Claude Code permission mode of the coordinator session (container runtime). Unset = "auto": a
-     * classifier may approve actions outside the allow list; the deny and ask rules still apply.
-     * "acceptEdits" opts back into prompting for every non-allowlisted Bash call. Never bypassPermissions.
+     * Claude Code permission mode of the coordinator session and its workers. Unset = "auto": a classifier
+     * may approve actions outside the allow list; the deny rules still apply. "acceptEdits" opts back into
+     * prompting for every non-allowlisted Bash call. "bypassPermissions" never prompts (fully unattended;
+     * deny rules still apply); only the host-only config.local.json may select it (src/config/resolve.ts).
      */
-    permissionMode: z.enum(['auto', 'acceptEdits']).optional(),
+    permissionMode: z.enum(COORDINATOR_PERMISSION_MODES).optional(),
+    /**
+     * Host runtime only: the Claude Code sandbox around Bash (src/runtime/coordinator.ts hostSettings). Unset = on;
+     * false runs commands unsandboxed as the owner's user. Only config.local.json may turn it off.
+     */
+    sandbox: z.boolean().optional(),
     /**
      * Claude Code tools removed from the coordinator session (`--disallowedTools`). Unset = the default
      * trim (COORDINATOR_DISALLOWED_TOOLS, src/config/coordinator-tools.ts); a list replaces it; [] keeps
@@ -436,18 +445,8 @@ export const MinionsConfigSchema = z.object({
     digestAt: z.array(z.string().regex(DIGEST_TIME, 'must be HH:MM (00:00 to 23:59)')).min(1).max(4).optional(),
     /** IANA time zone of digestAt and of the routine's days (default Europe/Berlin). */
     timezone: z.string().min(1).refine(isTimeZone, 'must be an IANA time zone such as Europe/Berlin').optional(),
-    /**
-     * Host-owned caps on the coordinator promoting its own ideas (agent-hypothesis, idea -> ready; phase 5,
-     * src/runtime/auto-promote.ts). Enforced whether or not the routine is enabled; unset fields take their defaults.
-     */
-    autoPromote: z.object({
-      /** Auto-promotions per day in `timezone` (default 3; 0 = never). */
-      perDay: z.number().int().min(0).optional(),
-      /** No auto-promotion while the budget is at or above this percent (default 80). */
-      maxBudgetPercent: z.number().int().min(0).max(100).optional(),
-      /** No auto-promotion when the last owner message is older than this many days (default 3). */
-      ownerSilentDays: z.number().int().min(1).optional(),
-    }).strict().optional(),
+    /** Legacy: the removed auto-promotion caps (task-130). Accepted so old configs still load, and ignored. */
+    autoPromote: z.record(z.string(), z.unknown()).optional(),
   }).strict().optional(),
   /**
    * Legacy coordinator permission mode. Only "default" is still honoured (as a stricter choice) when
@@ -459,8 +458,10 @@ export const MinionsConfigSchema = z.object({
 export type MinionsConfig = z.infer<typeof MinionsConfigSchema>;
 
 export function configJsonSchema(): Record<string, unknown> {
-  return {
-    title: 'Minions configuration',
-    ...z.toJSONSchema(MinionsConfigSchema, { target: 'draft-2020-12', reused: 'ref' }),
-  };
+  const schema = z.toJSONSchema(MinionsConfigSchema, { target: 'draft-2020-12', reused: 'ref' }) as Record<string, unknown>;
+  // A capability added later (LATER_CAPABILITY_DEFAULTS) has a default, so a config may leave it out: the output
+  // schema marks defaulted keys required, which would reject such a config in an editor (task-82.4).
+  const caps = (schema.properties as Record<string, { required?: string[] }> | undefined)?.capabilities;
+  if (caps?.required) caps.required = caps.required.filter((k) => !(k in LATER_CAPABILITY_DEFAULTS));
+  return { title: 'Minions configuration', ...schema };
 }

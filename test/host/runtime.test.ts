@@ -31,7 +31,7 @@ const {
 } = await import('../../src/host/runtime.js');
 const { runRuntimeSet, runRuntimeShow } = await import('../../src/host/runtime-cli.js');
 const { delegateToRuntime } = await import('../../src/host/delegate.js');
-const { coordinatorSettings, buildClaudeCommand, buildCoordinatorCommand, hostSettings } = await import('../../src/runtime/coordinator.js');
+const { coordinatorSettings, buildClaudeCommand, buildCoordinatorCommand, hostSettings, shQuote } = await import('../../src/runtime/coordinator.js');
 const { runDoctor } = await import('../../src/host/doctor.js');
 const { runUninstall } = await import('../../src/host/uninstall.js');
 const { defaults } = await import('../helpers.js');
@@ -189,11 +189,11 @@ describe('runtime selection is host-controlled', () => {
 describe('host runtime coordinator settings', () => {
   const h = { home: '/Users/u', workspace: '/m/host/workspace', state: '/m/host/state', secretsDir: '/m/My Proj/secrets', credentialsDir: '/m/credentials', projectDir: '/m/proj' };
 
-  it('adds the sandbox and credential denies, never bypass; container settings are unchanged', () => {
+  it('adds the sandbox (sandboxed commands run without a prompt) and credential denies; bypass off by default; container settings are unchanged', () => {
     const s = coordinatorSettings(defaults(), { auth: 'api-key', host: h, paths: { apiKeyFile: '/m/My Proj/secrets/anthropic-api-key' } }) as {
       permissions: { deny: string[]; disableBypassPermissionsMode: string }; sandbox: Record<string, unknown>; apiKeyHelper: string };
     expect(s.permissions.disableBypassPermissionsMode).toBe('disable');
-    expect(s.sandbox).toMatchObject({ enabled: true, autoAllowBashIfSandboxed: false, allowUnsandboxedCommands: false, failIfUnavailable: true });
+    expect(s.sandbox).toMatchObject({ enabled: true, autoAllowBashIfSandboxed: true, allowUnsandboxedCommands: false, failIfUnavailable: true });
     expect((s.sandbox.filesystem as { allowWrite: string[] }).allowWrite).toEqual([h.workspace, h.state]);
     expect((s.sandbox.filesystem as { denyRead: string[] }).denyRead).toEqual(expect.arrayContaining(['~/.ssh', '~/.aws', '~/Library/Keychains', h.credentialsDir]));
     expect((s.sandbox.network as { allowedDomains: string[] }).allowedDomains).toContain('github.com');
@@ -207,6 +207,16 @@ describe('host runtime coordinator settings', () => {
     expect(c).not.toHaveProperty('sandbox');
     expect(c.apiKeyHelper).toBe('cat /opt/minions/secrets/anthropic-api-key');
     expect(hostSettings(h).deny.some((d) => d.includes('bypass'))).toBe(false);
+  });
+
+  it('the owner\'s local choices: bypassPermissions keeps the deny rules; sandbox false drops only the sandbox', () => {
+    type S = { permissions: { deny: string[]; disableBypassPermissionsMode?: string; blockReadsOutsideWorkingDirectories?: boolean }; sandbox?: unknown };
+    const cfg = { ...defaults(), coordinator: { permissionMode: 'bypassPermissions' as const, sandbox: false } };
+    const s = coordinatorSettings(cfg, { auth: 'login', host: h }) as S;
+    expect(s.permissions).not.toHaveProperty('disableBypassPermissionsMode');
+    expect(s).not.toHaveProperty('sandbox');
+    expect(s.permissions).not.toHaveProperty('blockReadsOutsideWorkingDirectories');
+    expect(s.permissions.deny).toEqual(expect.arrayContaining(['Bash(git push *)', 'Read(~/.ssh/**)', 'Bash(minions work approve *)']));
   });
 
   it('host runtime launch: dedicated tmux socket, sandbox in --settings, host prompt note', async () => {
@@ -257,8 +267,8 @@ describe('host runtime processes', () => {
     writeFileSync(join(bin, 'gh'), '#!/bin/sh\necho real\n'); chmodSync(join(bin, 'gh'), 0o755);
     await prepareHostRuntime(project, { target: { node: process.execPath, cli: '/x' }, pathEnv: `${hostRuntimePaths(id).bin}:${bin}` });
     const sh = readFileSync(hostRuntimePaths(id).ghShim, 'utf8');
-    expect(sh).toContain(`REAL_GH=${join(bin, 'gh')}`);
-    expect(sh).toContain(`TOKEN_FILE=${projectPaths(id).githubTokenFile.includes(' ') ? `'${projectPaths(id).githubTokenFile}'` : projectPaths(id).githubTokenFile}`);
+    expect(sh).toContain(`REAL_GH=${shQuote(join(bin, 'gh'))}`);
+    expect(sh).toContain(`TOKEN_FILE=${shQuote(projectPaths(id).githubTokenFile)}`);
   });
 
   it('delegation: host runtime runs the shim directly; docker runtime needs a running container', async () => {
@@ -309,7 +319,27 @@ describe('host runtime processes', () => {
     expect(by('host.backlog')).toMatchObject({ status: 'fail', hint: expect.stringMatching(/backlog.md/) });
     expect(by('docker.daemon')).toBeUndefined();
     expect(by('coordinator')!.status).toBe('warn');
+    expect(by('workspace.worktrees')).toMatchObject({ status: 'warn', detail: expect.stringMatching(/no repository yet/) });
     expect(calls).not.toContain('docker');
+  });
+
+  it('doctor in host mode reports .git/worktrees: missing is created outside the sandbox, then ok (task-3)', async () => {
+    const { repo, id } = await hostProject();
+    const wsRepo = hostRuntimePaths(id).repo;
+    mkdirSync(wsRepo, { recursive: true });
+    git(wsRepo, 'init', '-q');
+    expect(existsSync(join(wsRepo, '.git', 'worktrees'))).toBe(false);
+    const runner = async () => no;
+    const by = async (n: string) => (await runDoctor({ cwd: repo, runner, probe: async () => { throw new Error('no docker'); } })).checks.find((c) => c.name === n);
+    expect(await by('workspace.worktrees')).toMatchObject({ status: 'warn', detail: expect.stringMatching(/was missing .*created it/) });
+    expect(existsSync(join(wsRepo, '.git', 'worktrees'))).toBe(true);
+    expect(await by('workspace.worktrees')).toMatchObject({ status: 'ok', detail: expect.stringMatching(/\.git\/worktrees exists/) });
+    // A planted symlink is reported, never followed or replaced.
+    const elsewhere = join(env.root, 'elsewhere');
+    mkdirSync(elsewhere);
+    execFileSync('rm', ['-rf', join(wsRepo, '.git', 'worktrees')]);
+    symlinkSync(elsewhere, join(wsRepo, '.git', 'worktrees'));
+    expect(await by('workspace.worktrees')).toMatchObject({ status: 'fail', detail: expect.stringMatching(/symlink or not a directory/) });
   });
 
   it('uninstall --delete-data removes the host workspace; without it the data is kept', async () => {

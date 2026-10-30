@@ -33,7 +33,7 @@ const { hookLog } = await import('../../src/runtime/hooks.js');
 const { copyRegularFileNoFollow, ensureRealDir } = await import('../../src/core/fsutil.js');
 const Cred = await import('../../src/host/credentials.js');
 const { ClaudeAuthSchema } = await import('../../src/host/auth.js');
-const { defaults } = await import('../helpers.js');
+const { defaults, shq } = await import('../helpers.js');
 const { dockerDown, makeRepo, withHome } = await import('./fixtures.js');
 
 let env: ReturnType<typeof withHome>;
@@ -66,21 +66,18 @@ describe('host runtime claude launch (H1, M8)', () => {
     return { MINIONS_PLUGIN_DIR: join(dir, 'plugin'), MINIONS_STATE_DIR: join(dir, 'state'), MINIONS_WORKSPACE: join(dir, 'ws'), MINIONS_SECRETS_DIR: join(dir, 'secrets') };
   }
 
-  it('host: no user/project/local settings, no MCP servers, workspace+state as working dirs, permission mode forced to default', async () => {
+  it('host: no user/project/local settings, no MCP servers, workspace+state as working dirs, permission mode as configured', async () => {
     Object.assign(process.env, hostEnv(), { MINIONS_RUNTIME: 'host' });
     const cfg = { ...defaults(), permissionMode: 'acceptEdits' as const, coordinator: { permissionMode: 'auto' as const } };
     // Claude Code 2.1.292 lists the default mode only as `manual`; older versions list `default`.
     const c = await C.buildClaudeCommand(cfg, runtimePaths(), { permissionModes: ['acceptEdits', 'auto', 'bypassPermissions', 'manual', 'dontAsk', 'plan'] });
-    const old = await C.buildClaudeCommand(cfg, runtimePaths(), { permissionModes: ['acceptEdits', 'auto', 'default', 'plan'] });
-    expect(old.args[old.args.indexOf('--permission-mode') + 1]).toBe('default');
-    await expect(C.buildClaudeCommand(cfg, runtimePaths(), { permissionModes: ['acceptEdits', 'auto'] })).rejects.toMatchObject({ code: 'INCOMPATIBLE_RUNTIME' });
+    expect(c.args[c.args.indexOf('--permission-mode') + 1]).toBe('auto');
     expect(c.args).toContain('--setting-sources=');
     expect(c.args).toContain('--strict-mcp-config');
     expect(c.args).not.toContain('--mcp-config');
     const i = c.args.indexOf('--add-dir');
     expect(c.args.slice(i + 1, i + 3)).toEqual([join(env.root, 'ws'), join(env.root, 'state')]);
     expect(c.args[i + 3]!.startsWith('--')).toBe(true); // the variadic --add-dir ends before the next flag
-    expect(c.args[c.args.indexOf('--permission-mode') + 1]).toBe('manual');
     expect(c.args[c.args.indexOf('--append-system-prompt') + 1]).toMatch(/CLAUDE\.md is not loaded automatically/);
   });
 
@@ -194,11 +191,11 @@ describe('host-runtime git hardening (H2)', () => {
     mkdirSync(join(repo, 'hooks'));
     for (const hk of ['post-merge', 'post-checkout', 'pre-push', 'reference-transaction']) { writeFileSync(join(repo, 'hooks', hk), `#!/bin/sh\ntouch '${marker}'-hook-${hk}\n`); chmodSync(join(repo, 'hooks', hk), 0o755); }
     rawGit(repo, 'config', 'core.hooksPath', join(repo, 'hooks'));
-    rawGit(repo, 'config', 'core.fsmonitor', `${evil} fsmonitor`);
-    rawGit(repo, 'config', 'filter.evil.smudge', `${evil} smudge`);
-    rawGit(repo, 'config', 'filter.evil.clean', `${evil} clean`);
-    rawGit(repo, 'config', 'credential.helper', `!${evil} cred`);
-    rawGit(repo, 'config', 'core.sshCommand', `${evil} ssh`);
+    rawGit(repo, 'config', 'core.fsmonitor', `${shq(evil)} fsmonitor`);
+    rawGit(repo, 'config', 'filter.evil.smudge', `${shq(evil)} smudge`);
+    rawGit(repo, 'config', 'filter.evil.clean', `${shq(evil)} clean`);
+    rawGit(repo, 'config', 'credential.helper', `!${shq(evil)} cred`);
+    rawGit(repo, 'config', 'core.sshCommand', `${shq(evil)} ssh`);
     writeFileSync(join(repo, '.gitattributes'), '* filter=evil\n');
     return { repo, marker };
   }
@@ -424,10 +421,10 @@ describe('Keychain avoidance (H3)', () => {
 // ---------------------------------------------------------------- L5 / Telegram
 
 describe('Telegram in the host runtime', () => {
-  it('is disabled with a precise reason (user plugins are not loaded)', () => {
+  it('uses the minions channel server (task-6), not the official plugin', () => {
     const cfg = { ...defaults(), communication: { ...defaults().communication, channel: 'telegram' as const } };
     const d = C.decideTelegram(cfg, { state: 'ok', token: 'x', botId: '1' }, { available: true, summary: '', items: [] } as never, true);
-    expect(d).toEqual({ enabled: false, reason: C.HOST_TELEGRAM_REASON });
+    expect(d).toMatchObject({ enabled: true, server: 'minions' });
     expect(C.decideTelegram(cfg, { state: 'ok', token: 'x', botId: '1' }, { available: true, summary: '', items: [] } as never, false).enabled).toBe(true);
   });
 });

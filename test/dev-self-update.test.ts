@@ -84,7 +84,8 @@ function setup(): Fx {
     '    echo \'{"ok":true,"data":{"ok":true,"steps":[{"id":"sync","status":"done","detail":"fast-forward"}],"sync":{"action":"fast-forward"},"stopped":null}}\' ;;',
     '  *"upgrade --rebuild-cli"*)',
     // As applyCli: back up the installed CLI before replacing it; then the image ($FAKE/new-image) and the recreate.
-    '    mkdir -p "$MINIONS_HOME/manager/cli-backup" && echo old-cli > "$MINIONS_HOME/manager/cli-backup/minions-0.1.0-$(date -u +%Y%m%dT%H%M%S%3NZ).tgz"',
+    // The stamp's milliseconds are a running count: BSD date (macOS) has no `%3N` (task-105).
+    '    d="$MINIONS_HOME/manager/cli-backup"; mkdir -p "$d" && n=$(ls "$d" | wc -l | tr -d " ") && echo old-cli > "$d/minions-0.1.0-$(date -u +%Y%m%dT%H%M%S)$(printf %03d "$n")Z.tgz"',
     '    [ -f "$FAKE/new-image" ] && cp "$FAKE/new-image" "$FAKE/img/minions-runtime:0.1.0"',
     '    cp "$FAKE/img/minions-runtime:0.1.0" "$FAKE/container-image"',
     '    [ -f "$FAKE/upgrade-stops-runtime" ] && rm -f "$FAKE/running"',
@@ -209,6 +210,40 @@ describe('self-update polling', () => {
     r = runScript('--once');
     expect(r.out).toMatch(/waiting for idle: a drain is in progress; not taken/);
     expect(dockerLog()).not.toMatch(/requests mark/);
+  });
+
+  it('waits while the local integrator holds the integration lock, and proceeds on a free or stale lock (task-82.5)', () => {
+    setRequests([request('cr_aaaaaaaa')]);
+    const integration = (state: string, pid: number | null) => ({
+      enabled: true, lock: { state, pid, at: pid ? '2026-10-29T10:00:00.000Z' : null },
+      current: state === 'live' ? { taskId: 'task-7', phase: 'verifying' } : null, queue: [], problems: [],
+    });
+    setStatus({ integration: integration('live', 4242) });
+    let r = runScript('--once');
+    expect(r.code, r.err).toBe(0);
+    expect(r.out).toMatch(/waiting for idle: the integrator holds the integration lock \(pid 4242, task-7 verifying\); not taken/);
+    expect(dockerLog()).not.toMatch(/requests mark/);
+    // A present block with an unreadable lock is not idle either.
+    setStatus({ integration: { enabled: true } });
+    r = runScript('--once');
+    expect(r.out).toMatch(/cannot tell whether the runtime is idle \(the runtime status has an integration block without a readable lock state\)/);
+    expect(dockerLog()).not.toMatch(/requests mark/);
+    // A free lock proceeds and the request is taken.
+    setStatus({ integration: integration('none', null) });
+    r = runScript('--once');
+    expect(r.code, r.err).toBe(0);
+    expect(r.out).not.toMatch(/waiting for idle/);
+    expect(dockerLog()).toMatch(/requests mark cr_aaaaaaaa --status confirmed/);
+  });
+
+  it('a stale integration lock (dead holder) or a runtime without the integration block is idle (task-82.5)', () => {
+    setRequests([request('cr_aaaaaaaa')]);
+    setStatus({ integration: { enabled: true, lock: { state: 'stale', pid: 4242, at: '2026-10-29T10:00:00.000Z' }, current: null, queue: [], problems: [] } });
+    const r = runScript('--once');
+    expect(r.code, r.err).toBe(0);
+    expect(r.out).not.toMatch(/waiting for idle|cannot tell/);
+    expect(dockerLog()).toMatch(/requests mark cr_aaaaaaaa --status confirmed/);
+    // setStatus without an integration block (older runtimes, non-local delivery) is what every other test uses.
   });
 
   it('treats a stopped runtime as retry later, not as a failure', () => {
@@ -450,15 +485,17 @@ describe('self-update apply: failure paths and isolation', () => {
       'exit 0',
     ].join('\n'));
     setRequests([request('cr_aaaaaaaa')]);
-    const r = spawnSync(process.execPath, [SCRIPT, '--repo', fx.repo, '--once'], { encoding: 'utf8', timeout: 60_000,
+    // The short health window runScript uses: the 5-minute default polls every 10 s, which only slows this test.
+    const r = spawnSync(process.execPath, [SCRIPT, '--repo', fx.repo, '--once', '--health-window', '2'], { encoding: 'utf8', timeout: 60_000,
       env: { ...env(), MINIONS_RUNTIME: 'container', MINIONS_UPGRADE_HANDOFF: '1' } });
     expect(r.status, r.stderr).toBe(0);
     const to = gitIn(fx.repo, 'rev-parse', 'HEAD');
     const lines = npmLog().trim().split('\n');
     expect(lines.map((l) => l.split(' |')[0])).toEqual(['ci', 'run typecheck', 'test']);
-    const homes = [...new Set(lines.map((l) => / home=(\S+)/.exec(l)?.[1]))];
+    // The home may hold a space (a host TMPDIR under ~/Library/Application Support): match up to the next field.
+    const homes = [...new Set(lines.map((l) => / home=(.+?) \| runtime=/.exec(l)?.[1]))];
     expect(homes).toHaveLength(1);
-    expect(homes[0]).toMatch(new RegExp(`^${join(stateDir(), 'gate')}/${to.slice(0, 12)}-[0-9a-f]{8}\\.home$`));
+    expect(homes[0]).toMatch(new RegExp(`^${join(stateDir(), 'gate').replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/${to.slice(0, 12)}-[0-9a-f]{8}\\.home$`));
     expect(existsSync(homes[0]!)).toBe(false);
     for (const l of lines) expect(l).toContain('runtime=unset | handoff=unset');
     expect(readFileSync(join(fx.home, 'registry.json'), 'utf8')).toBe(registry);
@@ -890,10 +927,12 @@ describe('self-update trigger (phase 4)', () => {
 
   it('CLAUDE.md asks the coordinator for an upgrade --from-container request after meaningful merges only', () => {
     expect(claudeMd).toMatch(/minions upgrade --from-container --reason "[^"]+" --json/);
+    expect(claudeMd).toMatch(/After an `integrated` notice/); // task-82.5: the trigger is the local integrator's landing
+    expect(claudeMd).toMatch(/git diff --name-only <main before>\.\.main/); // task-82.5: the check for meaningful changes
     expect(claudeMd).toMatch(/without waiting to be asked/);
     for (const p of ['src/**', 'templates/**', 'docker/**', 'package.json']) expect(claudeMd).toContain(`\`${p}\``);
     expect(claudeMd).toMatch(/Not meaningful on its own: `docs\/\*\*`, `test\/\*\*`/);
-    expect(claudeMd).toMatch(/`proposed` `upgrade` already\s+covers these commits/);
+    expect(claudeMd).toMatch(/`proposed` `upgrade`\s+already\s+covers these commits/);
     expect(claudeMd).toMatch(/draining/);
   });
 

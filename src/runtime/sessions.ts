@@ -219,10 +219,12 @@ export async function buildSessionCommand(cfg: MinionsConfig, key: string, deps:
   const method = deps.method ?? runtimeAuthMethod(env);
   const onHost = deps.hostRuntime ?? runtimeMode(env) === 'host-runtime';
   if (deps.resume !== undefined && !SESSION_ID.test(deps.resume)) throw new MinionsError('INVALID_CONFIG', 'Not a Claude session id for --resume.');
-  // Throws for bypassPermissions (never allowed) and when the strict mode is unavailable.
-  const mode = effectivePermissionMode(cfg, onHost, deps.permissionModes);
+  // Throws when the legacy strict mode is unavailable.
+  const mode = effectivePermissionMode(cfg, deps.permissionModes);
 
   const plan = await prepareHeadlessCredential(method, paths, deps.readText);
+  // The owner's bypassPermissions: the session's own config dir must not disable it (coordinatorSettings below does otherwise).
+  if (mode === 'bypassPermissions') plan.settings = { ...plan.settings, permissions: {} };
   const prompt = deps.prompt ?? await readPrompt(paths) + (onHost ? hostPromptNote(paths) : '') + (k.taskId ? taskSessionPromptNote(k.taskId) : GENERAL_SESSION_NOTE);
   const flagSettings: Record<string, unknown> = {
     ...coordinatorSettings(cfg, { telegram: false, auth: method, host: deps.host, paths }),
@@ -252,8 +254,9 @@ export async function buildSessionCommand(cfg: MinionsConfig, key: string, deps:
   // The prompt and the settings may name the coordinator's config dir as text (deny rules, instructions), so only the
   // other arguments are checked for it; flags, bypass and the secret are checked on everything.
   const masked = args.map((a, i) => (i > 0 && (args[i - 1] === '--append-system-prompt' || args[i - 1] === '--settings') ? '<text>' : a));
-  checkHeadlessArgs(masked, { coordinatorConfigDir: env.CLAUDE_CONFIG_DIR || CONTAINER.claudeHome, secret: plan.secret });
-  checkHeadlessArgs(args, { coordinatorConfigDir: '', secret: plan.secret });
+  const allowBypass = mode === 'bypassPermissions';
+  checkHeadlessArgs(masked, { coordinatorConfigDir: env.CLAUDE_CONFIG_DIR || CONTAINER.claudeHome, secret: plan.secret, allowBypass });
+  checkHeadlessArgs(args, { coordinatorConfigDir: '', secret: plan.secret, allowBypass });
 
   const command = await resolveOnPath('claude', env.PATH);
   if (!command) throw new MinionsError('PRECONDITION', 'Claude Code (`claude`) is not on PATH.');

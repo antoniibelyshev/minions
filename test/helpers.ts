@@ -16,6 +16,29 @@ export const ctx = {
 export const defaults = (p: Profile = 'project-owner', c = ctx) => profileDefaults(p, c).config;
 
 /**
+ * Whether this host has the Linux /proc the runtime's process code reads. Container-only code (the process runner and
+ * its recovery, the session supervisor, the integrator's verify group) identifies processes and the host by /proc
+ * (boot id, start times) and fails closed without it; the runtime always runs in the Linux container. Tests of those
+ * paths skip on the macOS host gate (task-105) until the host runtime has a ps-based view (docs/design/host-runtime.md).
+ */
+export const HAS_PROCFS = process.platform === 'linux';
+
+/**
+ * The hook commands wrap `minions` in coreutils `timeout` (`timeout 20 minions hook ... || exit 2`); they run in the
+ * Linux runtime image, which has it. A host without one (macOS) gets test/fixtures/timeout-shim.mjs, which keeps the
+ * exit codes the wrapper relies on, so the tests still run the real command strings there (task-105).
+ * MINIONS_TEST_TIMEOUT_SHIM=1 uses the shim on Linux too.
+ */
+const TIMEOUT_SHIM = (process.env.MINIONS_TEST_TIMEOUT_SHIM === '1'
+  || spawnSync('sh', ['-c', 'command -v timeout'], { env: { PATH: '/usr/bin:/bin' }, stdio: 'ignore' }).status !== 0)
+  ? join(import.meta.dirname, 'fixtures', 'timeout-shim.mjs') : null;
+/**
+ * Single-quotes a value for a POSIX shell. Fixture scripts and git config commands that embed a temp path use it: the
+ * host runtime's scratch dir sits under ~/Library/Application Support, so TMPDIR has a space there (task-5).
+ */
+export const shq = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
+
+/**
  * Runs a PreToolUse hook command string the way Claude Code does (through a shell, hook JSON on stdin)
  * with a controlled PATH. `minions` is the fake binary's script, or null for no binary on PATH.
  * Returns the exit status (2 is the only blocking one), stdout and stderr (stderr lets a test prove the
@@ -26,6 +49,7 @@ export function runHookCommand(command: string, minions: string | null, stdin = 
   const bin = join(dir, 'bin');
   mkdirSync(bin);
   if (minions !== null) { writeFileSync(join(bin, 'minions'), minions); chmodSync(join(bin, 'minions'), 0o755); }
+  if (TIMEOUT_SHIM) { writeFileSync(join(bin, 'timeout'), `#!/bin/sh\nexec ${shq(process.execPath)} ${shq(TIMEOUT_SHIM)} "$@"\n`); chmodSync(join(bin, 'timeout'), 0o755); }
   const r = spawnSync('sh', ['-c', command], { input: stdin, env: { PATH: `${bin}:/usr/bin:/bin` }, encoding: 'utf8' });
   rmSync(dir, { recursive: true, force: true });
   return { status: r.status, stdout: r.stdout, stderr: r.stderr };
