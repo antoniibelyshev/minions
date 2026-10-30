@@ -87,7 +87,6 @@ export const INTEGRATION_TESTS: readonly string[] = [
   'test/runtime/codex-live.test.ts',
   'test/runtime/codex-runner.test.ts',
   'test/runtime/commands-routine.test.ts',
-  'test/runtime/controls.test.ts',
   'test/runtime/coordinator-lock-edges.test.ts',
   'test/runtime/coordinator-lock.test.ts',
   'test/runtime/coordinator-permission-mode-edges.test.ts',

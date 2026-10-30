@@ -134,6 +134,8 @@ export function fakeGit(cwd0: string, args0: string[]): RunResult {
   switch (sub) {
     case 'rev-parse': {
       if (flags.includes('--is-inside-work-tree')) return ok('true\n');
+      if (flags.includes('--show-toplevel')) return ok(`${real(wt.path)}\n`);
+      if (flags.includes('--git-common-dir')) return ok(`${join(real(repo.path), '.git')}\n`);
       if (flags.includes('--abbrev-ref')) return ok(`${wt.branch ?? 'HEAD'}\n`);
       const sha = resolveRef(repo, wt, pos[0] ?? 'HEAD');
       return sha ? ok(`${sha}\n`) : fail(flags.includes('--quiet') ? '' : `fatal: bad revision '${pos[0]}'`, flags.includes('--quiet') ? 1 : 128);

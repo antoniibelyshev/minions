@@ -4,13 +4,15 @@ import { existsSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Command } from 'commander';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { buildProgram } from '../../src/program.js';
 import { cancelWork, CONTROLS, controlsTable, formatCancel, matchControl } from '../../src/runtime/controls.js';
 import { generatePlugin } from '../../src/plugin/generate.js';
 import { git } from '../../src/runtime/worktree.js';
 import { defaults } from '../helpers.js';
 import { commitFile, initRepo, makeDefaultEnv, makeEnv, result, type Env } from './fixtures.js';
+// Unit tier: git runs on the in-memory fake (./fake-git.ts).
+vi.mock('../../src/core/exec.js', async (orig) => (await import('./fake-git.js')).mockExec(await orig()));
 
 describe('control mapping', () => {
   it.each([
