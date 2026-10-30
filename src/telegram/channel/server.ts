@@ -1,5 +1,6 @@
 // The minions-owned Telegram channel server (docs/design/telegram-channel.md, "Server shape" layer 3; task-67.2,
-// phase 1): `minions telegram channel serve`. Not wired into any launch yet (the launch swap is task-67.4).
+// phase 1): `minions telegram channel serve`. The host runtime coordinator launch loads it (task-6,
+// src/telegram/channel/launch.ts); the Docker runtime still uses the official plugin.
 //
 // - MCP over stdio: newline-delimited JSON-RPC 2.0, hand-written (no SDK). initialize declares
 //   `experimental: { "claude/channel": {} }`; tools/list and tools/call serve `reply`. Inbound owner messages go out as
@@ -189,6 +190,9 @@ function parseLock(raw: string): ChannelLock | null {
 async function readLock(path: string): Promise<ChannelLock | null> {
   try { return parseLock((await readText(path)) ?? ''); } catch { return null; }
 }
+
+/** channel.lock as recorded (null: absent or unreadable); for `minions status` and doctor. */
+export const readChannelLock = (path: string): Promise<ChannelLock | null> => readLock(path);
 
 // ---------------------------------------------------------------- JSON-RPC
 

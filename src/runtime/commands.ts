@@ -25,9 +25,11 @@ import { installTelegramPlugin } from '../telegram/install.js';
 import { formatTelegramProbe, probeTelegram } from '../telegram/probe.js';
 import { resolveChannel } from '../telegram/channel.js';
 import { runChannelServer } from '../telegram/channel/server.js';
+import { formatAccessResult, runAccessCommand, type AccessAction } from '../telegram/channel/access-cli.js';
+import { createInterface } from 'node:readline/promises';
 import type { PollerCheck } from '../telegram/isolation.js';
 import {
-  buildClaudeCommand, buildCoordinatorCommand, telegramPollerStatus, claudePermissionModes, coordinatorWrapper, launchCoordinator, permissionModesNeeded, probeRuntime, readLaunchRecord, readMountedToken, RECOVERY_PROMPT,
+  buildClaudeCommand, buildCoordinatorCommand, hostChannelReport, telegramPollerStatus, claudePermissionModes, coordinatorWrapper, launchCoordinator, permissionModesNeeded, probeRuntime, readLaunchRecord, readMountedToken, RECOVERY_PROMPT,
   restartCoordinator, runtimeChannelFacts, scheduleDetachedRestart, syncCoordinator, coordinatorLaunchStatus, type LaunchStatus,
   coordinatorPidAlive, procStartTime, readExitRecord, runtimeAuthMethod, systemProcessControl, scheduleCrashStart, TELEGRAM_TOKEN_ENV, WAKE_PROMPT,
 } from './coordinator.js';
@@ -1140,23 +1142,30 @@ export function register(program: Command): void {
     }));
 
   // telegram: credential-free capability probe. Host mode delegates to the container, where Claude Code runs.
-  const tg = program.command('telegram').description('Telegram channel plugin support (docs/design/telegram.md)');
-  tg.command('probe').description('Report whether the official Telegram channel plugin is usable (needs no credentials)')
+  const tg = program.command('telegram').description('Telegram channel support (docs/design/telegram.md, docs/design/telegram-channel.md)');
+  tg.command('probe').description('Report whether the Telegram channel is usable: the official plugin (Docker) or the minions channel server (host runtime); needs no credentials')
     .action(action(async (_o: unknown, cmd: Command) => {
       if (runtimeMode() === 'host') return delegate(cmd);
+      if (runtimeMode() === 'host-runtime') {
+        // Task-6: the host runtime runs the minions channel server, not the plugin. The token file is only checked for
+        // format here; its content never leaves this process.
+        const paths = runtimePaths();
+        emit(await hostChannelReport(await readMountedToken(paths.telegramTokenFile), paths), { json: globalOpts(cmd).json, human: formatTelegramProbe });
+        return;
+      }
       emit(await probeTelegram(), { json: globalOpts(cmd).json, human: formatTelegramProbe });
     }));
   tg.command('install').description('Install the official Telegram channel plugin at user scope in the claude volume (needs network, no login)')
     .action(action(async (_o: unknown, cmd: Command) => {
       if (runtimeMode() === 'host') return delegate(cmd);
       if (runtimeMode() === 'host-runtime') {
-        throw new MinionsError('PRECONDITION', 'The Telegram channel is not available in the host runtime: it would install a plugin into your own Claude Code setup, and the host runtime starts Claude Code without user settings, plugins or MCP servers.',
-          'Use the Docker runtime for Telegram (`minions runtime set docker`), or keep the terminal channel.');
+        throw new MinionsError('PRECONDITION', 'The official Telegram plugin is not used in the host runtime: it would install a plugin into your own Claude Code setup. The host runtime uses the minions channel server instead (nothing to install).',
+          'Store a bot token with `minions auth telegram`, then `minions start`; `minions telegram probe` checks the server.');
       }
       const r = await installTelegramPlugin();
       emit(r, { json: globalOpts(cmd).json, human: (d: typeof r) => [`marketplace ${d.marketplace}; plugin ${d.plugin} (version ${d.version ?? 'unknown'})`, ...d.warnings.map((w) => `warning: ${w}`)].join('\n') });
     }));
-  // The minions-owned channel server (task-67.2, docs/design/telegram-channel.md). Not wired into any launch yet.
+  // The minions-owned channel server (task-67.2, docs/design/telegram-channel.md). The host runtime launch loads it (task-6).
   const tgChannel = tg.command('channel').description('The minions-owned Telegram channel server (MCP over stdio; started by the coordinator launch only)');
   tgChannel.command('serve').description('Serve the Telegram channel on stdin/stdout (JSON-RPC); reads the bot token only from $MINIONS_TELEGRAM_TOKEN_FILE')
     .action(action(async () => {
@@ -1171,13 +1180,41 @@ export function register(program: Command): void {
     .action(action(async (_o: unknown, cmd: Command) => {
       if (runtimeMode() === 'host') return delegate(cmd);
       const paths = runtimePaths();
-      const r = { access: await readTelegramAccess(paths.telegramStateDir), coordinator: await readLaunchRecord(paths), poller: await telegramPollerStatus({ paths }) };
+      const r = { access: await readTelegramAccess(paths.telegramStateDir, undefined, { host: runtimeMode() === 'host-runtime' }), coordinator: await readLaunchRecord(paths), poller: await telegramPollerStatus({ paths }) };
       emit(r, { json: globalOpts(cmd).json, human: (d: typeof r) => [
         `access: ${d.access.state} - ${d.access.detail}${d.access.hint ? `\n  hint: ${d.access.hint}` : ''}`,
         `coordinator: ${d.coordinator ? (d.coordinator.telegram.enabled ? 'Telegram enabled' : `terminal only (${d.coordinator.telegram.reason})`) : 'no launch recorded'}`,
         ...(d.poller.state !== 'not-applicable' ? [humanPoller(d.poller)] : []),
       ].join('\n') });
     }));
+
+  // Pairing for the minions channel server (task-6): a terminal command, never a skill the model can run.
+  const tgAccess = tg.command('access').description('Pair and manage who may use the Telegram channel (host runtime; interactive terminal only, with a typed confirmation)');
+  const accessAction = (make: (...a: string[]) => AccessAction) => action(async (...args: unknown[]) => {
+    const cmd = args[args.length - 1] as Command;
+    if (runtimeMode() === 'host') return delegate(cmd);
+    requireMode('runtime');
+    if (runtimeMode() !== 'host-runtime') {
+      throw new MinionsError('PRECONDITION', 'In the Docker runtime the official Telegram plugin owns pairing.',
+        'Pair in the coordinator terminal: /telegram:access pair <code>, then /telegram:access policy allowlist.');
+    }
+    const isTty = !!process.stdin.isTTY && !!process.stdout.isTTY;
+    const ask = async (q: string) => {
+      if (!isTty) return null;
+      const rl = createInterface({ input: process.stdin, output: process.stderr });
+      try { return await rl.question(`${q} `); } finally { rl.close(); }
+    };
+    const r = await runAccessCommand(runtimePaths().telegramStateDir, make(...(args.slice(0, -2) as string[])), { isTty, ask });
+    emit(r, { json: globalOpts(cmd).json, human: formatAccessResult });
+  });
+  tgAccess.command('pair <code>').description('Approve the pairing code the bot sent you in a DM')
+    .action(accessAction((code) => ({ kind: 'pair', code: code! })));
+  tgAccess.command('policy <policy>').description('Set the DM policy: allowlist (recommended once paired), pairing, or disabled')
+    .action(accessAction((policy) => ({ kind: 'policy', policy: policy! })));
+  tgAccess.command('remove <senderId>').description('Remove a sender from the allowlist')
+    .action(accessAction((senderId) => ({ kind: 'remove', senderId: senderId! })));
+  tgAccess.command('list').description('Show the DM policy, the allowlisted senders and the number of pending codes')
+    .action(accessAction(() => ({ kind: 'list' })));
 
   // workspace
   const ws = program.command('workspace').description('Container workspace and state setup (container only)');
