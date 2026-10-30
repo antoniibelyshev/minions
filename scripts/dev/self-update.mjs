@@ -65,7 +65,7 @@ const children = new Set();
  * timeout, a signal from outside such as SIGKILL, the 64 MB maxBuffer overflow, a spawn error). Such an end says
  * nothing about the commit, so the gate treats it as transient, like a timeout.
  */
-function run(cmd, args, opts = {}) {
+function execRun(cmd, args, opts = {}) {
   return new Promise((res) => {
     const child = execFile(cmd, args, { cwd: opts.cwd, env: opts.env ?? process.env, timeout: opts.timeoutMs ?? 120_000, maxBuffer: 64 * 1024 * 1024, encoding: 'utf8' }, (err, stdout, stderr) => {
       children.delete(child);
@@ -78,6 +78,25 @@ function run(cmd, args, opts = {}) {
     child.stdin?.on('error', () => { /* the child may exit before reading */ });
     if (opts.input !== undefined) child.stdin?.end(opts.input); else child.stdin?.end();
   });
+}
+
+/** `ps -o lstart=` for procStart() where there is no procfs. */
+const psStart = (pid) => {
+  const r = spawnSync('ps', ['-o', 'lstart=', '-p', String(pid)], { encoding: 'utf8', timeout: 10_000 });
+  return r.status === 0 ? r.stdout.trim() : '';
+};
+
+/**
+ * The seams the unit tests replace (test/dev-self-update-unit.test.ts): every command the script starts goes through
+ * `run` (same contract as execRun), and procStart's `ps` fallback through `psStart`. The script itself never sets them.
+ */
+const seams = { run: execRun, psStart };
+const run = (cmd, args, opts) => seams.run(cmd, args, opts);
+/** Replaces seams for a test; returns a function that restores the previous ones. */
+export function setSeams(over) {
+  const prev = { ...seams };
+  Object.assign(seams, over);
+  return () => { Object.assign(seams, prev); };
 }
 
 /**
@@ -271,9 +290,7 @@ export function procStart(pid) {
     const v = stat.slice(stat.lastIndexOf(')') + 2).split(' ')[19];
     if (v && /^\d+$/.test(v)) return v;
   } catch { /* no procfs */ }
-  const r = spawnSync('ps', ['-o', 'lstart=', '-p', String(pid)], { encoding: 'utf8', timeout: 10_000 });
-  const t = r.status === 0 ? r.stdout.trim() : '';
-  return t || null;
+  return seams.psStart(pid) || null;
 }
 const pidAlive = (pid) => { if (!Number.isInteger(pid) || pid <= 0) return false; try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; } };
 /** Alive and the same process: a reused pid (different start time) is a stale lock. */
@@ -966,14 +983,21 @@ const USAGE = `usage: node scripts/dev/self-update.mjs [--repo <path>] [--dry-ru
   --gate-dir  where the throwaway gate worktrees go, outside the checkout (default <MINIONS_HOME>/dev-self-update/gate)
   --health-window  how long the health check after an upgrade (and after a rollback) may take (default ${HEALTH_WINDOW_MS / 1000})`;
 
-async function main(argv) {
+/**
+ * The script. io (for the unit tests; the defaults are the real ones): out/err write a string to stdout/stderr, and
+ * onStop(stop) wires the stop (`stop(signal)`) to SIGINT and SIGTERM.
+ */
+export async function main(argv, io = {}) {
+  const stdout = io.out ?? ((t) => process.stdout.write(t));
+  const stderr = io.err ?? ((t) => process.stderr.write(t));
+  const onStop = io.onStop ?? ((stop) => { process.on('SIGINT', () => stop('SIGINT')); process.on('SIGTERM', () => stop('SIGTERM')); });
   let o;
-  try { o = parseArgs(argv); } catch (e) { process.stderr.write(`self-update: ${e.message}\n${USAGE}\n`); return 64; }
-  if (o.help) { process.stdout.write(`${USAGE}\n`); return 0; }
-  const say = (m) => process.stdout.write(`${new Date().toISOString()} self-update: ${m}\n`);
+  try { o = parseArgs(argv); } catch (e) { stderr(`self-update: ${e.message}\n${USAGE}\n`); return 64; }
+  if (o.help) { stdout(`${USAGE}\n`); return 0; }
+  const say = (m) => stdout(`${new Date().toISOString()} self-update: ${m}\n`);
   const facts = await gatherFacts(o.repo);
   if (o.dryRun) {
-    process.stdout.write([
+    stdout([
       'self-update plan (dry run: nothing is marked, written or logged)',
       `  checkout: ${facts.repo ?? o.repo}`,
       `  installed CLI: ${facts.cli ? `${facts.cli.kind} (${facts.cli.detail})` : 'unknown'}`,
@@ -983,7 +1007,7 @@ async function main(argv) {
     ].join('\n') + '\n');
   }
   if (facts.refusals.length) {
-    process.stderr.write(`self-update: refusing to start:\n${facts.refusals.map((r) => `  - ${r}`).join('\n')}\n`);
+    stderr(`self-update: refusing to start:\n${facts.refusals.map((r) => `  - ${r}`).join('\n')}\n`);
     return 2;
   }
   const files = paths(facts.home);
@@ -997,7 +1021,7 @@ async function main(argv) {
   mkdirSync(files.dir, { recursive: true, mode: 0o700 });
   const lock = acquireLock(files.lock, files.dir);
   if (!lock.ok) {
-    process.stderr.write(`self-update: refusing to start: another self-update script runs${lock.holder ? ` (pid ${lock.holder.pid}, since ${lock.holder.at})` : ''} (lock ${files.lock})\n`);
+    stderr(`self-update: refusing to start: another self-update script runs${lock.holder ? ` (pid ${lock.holder.pid}, since ${lock.holder.at})` : ''} (lock ${files.lock})\n`);
     return 2;
   }
   const runId = randomBytes(8).toString('hex');
@@ -1010,8 +1034,7 @@ async function main(argv) {
     stopping = true; say(`${sig}: stopping`); if (timer) clearTimeout(timer); wake?.();
     for (const c of children) { try { c.kill(sig); } catch { /* already gone */ } }
   };
-  process.on('SIGINT', () => stop('SIGINT'));
-  process.on('SIGTERM', () => stop('SIGTERM'));
+  onStop(stop);
   try {
     logEvent(files.log, { event: 'started', pid: process.pid, repo: facts.repo, projectId: facts.project.projectId });
     say(`started (pid ${process.pid}, project ${facts.project.projectId}, polling every ${o.intervalS}s; stop with Ctrl-C)`);
