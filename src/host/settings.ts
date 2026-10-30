@@ -144,14 +144,14 @@ const DECLARED: readonly DeclaredSetting[] = [
   // ---- Verification
   // Shell commands may contain commas: entries are separated with ';' (task-136: the runtime can request them).
   { key: 'verification.commands', group: 'Verification', label: 'Verification commands', type: 'list', separator: ';', apply: 'live',
-    description: 'commands every stage and the local integration run to verify a change (separate with \';\'; none for none)',
+    description: 'commands that verify a change (stages, local integration); \';\'-separated',
     loosens: (f, t) => {
       const to = Array.isArray(t) ? (t as string[]) : [];
       const dropped = (Array.isArray(f) ? (f as string[]) : []).filter((c) => !to.includes(c));
       return dropped.length ? `changes are verified without ${dropped.map((c) => `\`${c}\``).join(', ')}` : null;
     } },
   { key: 'verification.setupCommands', group: 'Verification', label: 'Integration setup commands', type: 'list', separator: ';', optional: true, apply: 'live',
-    description: 'local integration: commands that install dependencies in the integration worktree before verification, e.g. npm ci (separate with \';\'; run when they or the lockfile change; default none)',
+    description: 'local integration: dependency install before verifying, e.g. npm ci; \';\'-separated',
     loosens: (f, t) => {
       const from = Array.isArray(f) ? (f as string[]) : [];
       const added = (Array.isArray(t) ? (t as string[]) : []).filter((c) => !from.includes(c));
