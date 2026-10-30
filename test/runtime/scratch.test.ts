@@ -1,12 +1,14 @@
 import { chmodSync, lutimesSync, utimesSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   briefPath, claimWithBrief, compactClaim, ensureScratchDir, removeLeaseFiles, scratchDirOf, sweepScratch, sweepScratchOnStart, sweepTmpRoot, type HandoffPaths,
 } from '../../src/runtime/handoff.js';
 import { runtimePaths } from '../../src/runtime/paths.js';
 import { Scheduler } from '../../src/runtime/scheduler.js';
 import { commitFile, makeEnv, result, type Env } from './fixtures.js';
+// Unit tier: git runs on the in-memory fake (./fake-git.ts).
+vi.mock('../../src/core/exec.js', async (orig) => (await import('./fake-git.js')).mockExec(await orig()));
 
 // Per-lease scratch dirs under the disk-backed TMPDIR (task-27): created at claim, removed when the lease
 // ends and on coordinator start. Only a lease's own dir is ever removed.

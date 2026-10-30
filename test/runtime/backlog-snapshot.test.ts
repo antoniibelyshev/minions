@@ -3,6 +3,8 @@ import type { BacklogAdapter } from '../../src/backlog/types.js';
 import { MinionsError } from '../../src/core/errors.js';
 import { stopHook } from '../../src/runtime/hooks.js';
 import { makeEnv, tmp, type Env } from './fixtures.js';
+// Unit tier: git runs on the in-memory fake (./fake-git.ts).
+vi.mock('../../src/core/exec.js', async (orig) => (await import('./fake-git.js')).mockExec(await orig()));
 
 // task-24.2: one backlog listing per Stop hook run and per work claim.
 let stateDir: string;

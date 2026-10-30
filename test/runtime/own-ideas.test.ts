@@ -1,12 +1,14 @@
 // task-130: the auto-promotion caps are gone. A never-promoted agent idea is claimed like any other task, with no
 // owner message on record; an old config that still carries routine.autoPromote loads and the block is ignored.
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { validateConfig } from '../../src/config/resolve.js';
 import { classifyKey } from '../../src/config/setting-classes.js';
 import { settingDef } from '../../src/host/settings.js';
 import { lastOwnerMessageAt } from '../../src/runtime/coordinator-usage.js';
 import { defaults } from '../helpers.js';
 import { makeDefaultEnv } from './fixtures.js';
+// Unit tier: git runs on the in-memory fake (./fake-git.ts).
+vi.mock('../../src/core/exec.js', async (orig) => (await import('./fake-git.js')).mockExec(await orig()));
 
 describe('claim: an agent idea set ready starts without a recorded promotion or an owner message', () => {
   it('lists ready and changes-requested agent ideas as claimable, not stuck, and claims them', async () => {
