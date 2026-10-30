@@ -202,6 +202,9 @@ workers (`MINIONS_TEST_MAX_WORKERS` overrides it), and fewer threads per spawned
 (`--v8-pool-size=1` in `NODE_OPTIONS`, `UV_THREADPOOL_SIZE=2`, and `BUN_JSC_useConcurrentJIT=0` for the
 Bun-built `backlog` CLI). One full `npm test` peaks near 120 threads that way, down from about 190 with
 vitest's per-core default, so three suites fit next to the coordinator and its workers.
+`npm test` runs two vitest projects: `npm run test:unit` (no subprocesses; any spawn fails the run) and
+`npm run test:integration` (the files listed in `test/tiers.ts`, which run git, the CLI, `backlog`, and
+other children). For a quick check while working, run the unit tier alone.
 
 ## Still stuck
 
