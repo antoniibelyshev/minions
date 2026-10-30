@@ -355,11 +355,11 @@ export async function runUpgrade(opts: UpgradeOptions): Promise<UpgradeResult> {
     interrupted = sig;
     handled = (async () => {
       if (recreating) {
-        hooks.notice(`minions upgrade interrupted (${sig}) after the container recreate started; volumes are kept. Rerun \`minions upgrade\` to finish (it resumes the starts it paused).`);
+        hooks.notice(`minions upgrade interrupted (${sig}) after the ${host ? 'shim regeneration' : 'container recreate'} started; ${host ? 'the workspace is' : 'volumes are'} kept. Rerun \`minions upgrade\` to finish (it resumes the starts it paused).`);
         return;
       }
       await pausing?.catch(() => undefined); // an in-flight pause must not land after the resume
-      let state = 'the container was not recreated';
+      let state = host ? 'the shims were not regenerated' : 'the container was not recreated';
       if ((ownPause || drainRequested) && running) {
         const which = ownPause ? '--starts' : '--drain';
         try { const done = await undo(); if (done) state += done === 'starts resumed' ? ' and starts were resumed' : ` and the ${done}`; }
