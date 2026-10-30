@@ -73,6 +73,7 @@ export const INTEGRATION_TESTS: readonly string[] = [
   'test/host/setup.test.ts',
   'test/host/telegram.test.ts',
   'test/host/units.test.ts',
+  'test/host/upgrade-host-cli.test.ts',
   'test/host/upgrade-source.test.ts',
   'test/host/upgrade.test.ts',
   'test/host/worktrees-dir.test.ts',
