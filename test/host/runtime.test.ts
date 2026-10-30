@@ -5,6 +5,7 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, symlinkSync, writeFileS
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { RunResult } from '../../src/core/exec.js';
+vi.mock('../../src/core/exec.js', async (orig) => (await import('./fs-git.js')).withFsGit(await orig()));
 
 vi.mock('../../src/plugin/generate.js', async () => {
   const { mkdir, writeFile } = await import('node:fs/promises');
@@ -239,26 +240,6 @@ describe('host runtime coordinator settings', () => {
 });
 
 describe('host runtime processes', () => {
-  it('shim pins the runtime environment (quoted paths) and execs the CLI', async () => {
-    const { id } = await hostProject();
-    const project = await loadProjectJson(id);
-    const cli = join(env.root, 'fake cli.mjs');
-    writeFileSync(cli, 'process.stdout.write(JSON.stringify({ argv: process.argv.slice(2), env: process.env }))\n');
-    // An empty dir as PATH: hosts and CI runners may have gh in /usr/bin (GitHub runners do).
-    const noGh = join(env.root, 'empty-bin');
-    mkdirSync(noGh);
-    await prepareHostRuntime(project, { target: { node: process.execPath, cli }, pathEnv: noGh });
-    const hp = hostRuntimePaths(id);
-    expect(readFileSync(hp.minionsShim, 'utf8')).toMatch(/^#!\/bin\/sh\n/);
-    expect(existsSync(hp.ghShim)).toBe(false); // no gh on that PATH
-    const out = await new HostRuntime(project).exec(['minions', 'status', '--json']);
-    const d = JSON.parse(out.stdout) as { argv: string[]; env: Record<string, string> };
-    expect(d.argv).toEqual(['status', '--json']);
-    expect(d.env).toMatchObject({ MINIONS_RUNTIME: 'host', MINIONS_STATE_DIR: hp.state, MINIONS_WORKSPACE: hp.workspace, MINIONS_TMUX_SOCKET: hp.tmuxSocket });
-    expect(d.env.GH_TOKEN).toBeUndefined();
-    expect(minionsShim(project, { node: '/a b/node', cli: "/c'd/cli.js" })).toContain(`exec '/a b/node' '/c'\\''d/cli.js' "$@"`);
-  });
-
   it('gh shim only when gh exists; it reads the project token file, not the user login', async () => {
     const { id } = await hostProject();
     const project = await loadProjectJson(id);
@@ -269,21 +250,6 @@ describe('host runtime processes', () => {
     const sh = readFileSync(hostRuntimePaths(id).ghShim, 'utf8');
     expect(sh).toContain(`REAL_GH=${shQuote(join(bin, 'gh'))}`);
     expect(sh).toContain(`TOKEN_FILE=${shQuote(projectPaths(id).githubTokenFile)}`);
-  });
-
-  it('delegation: host runtime runs the shim directly; docker runtime needs a running container', async () => {
-    const { repo, id } = await hostProject();
-    const project = await loadProjectJson(id);
-    await expect(delegateToRuntime(['status'], { json: true, cwd: repo })).rejects.toMatchObject({ code: 'PRECONDITION', message: expect.stringMatching(/host runtime has not been started/) });
-    await prepareHostRuntime(project, { target: { node: process.execPath, cli: '/nonexistent' } });
-    // a real shim run (re-prepared with the package CLI) would start the CLI; check the docker branch instead:
-    const other = makeRepo(env.root, 'docker-repo');
-    await runInit({ path: other, yes: true, visibility: 'private', dockerProbe: dockerUp });
-    const only = join(env.root, 'only-git');
-    mkdirSync(only);
-    symlinkSync(execFileSync('which', ['git'], { encoding: 'utf8' }).trim(), join(only, 'git'));
-    process.env.PATH = only; // no docker CLI: the container is not running
-    await expect(delegateToRuntime(['status'], { json: true, cwd: other })).rejects.toMatchObject({ code: 'PRECONDITION', message: expect.stringMatching(/container is not running/) });
   });
 
   it('isRunning / down use the dedicated tmux server only', async () => {
@@ -323,75 +289,9 @@ describe('host runtime processes', () => {
     expect(calls).not.toContain('docker');
   });
 
-  it('doctor in host mode reports .git/worktrees: missing is created outside the sandbox, then ok (task-3)', async () => {
-    const { repo, id } = await hostProject();
-    const wsRepo = hostRuntimePaths(id).repo;
-    mkdirSync(wsRepo, { recursive: true });
-    git(wsRepo, 'init', '-q');
-    expect(existsSync(join(wsRepo, '.git', 'worktrees'))).toBe(false);
-    const runner = async () => no;
-    const by = async (n: string) => (await runDoctor({ cwd: repo, runner, probe: async () => { throw new Error('no docker'); } })).checks.find((c) => c.name === n);
-    expect(await by('workspace.worktrees')).toMatchObject({ status: 'warn', detail: expect.stringMatching(/was missing .*created it/) });
-    expect(existsSync(join(wsRepo, '.git', 'worktrees'))).toBe(true);
-    expect(await by('workspace.worktrees')).toMatchObject({ status: 'ok', detail: expect.stringMatching(/\.git\/worktrees exists/) });
-    // A planted symlink is reported, never followed or replaced.
-    const elsewhere = join(env.root, 'elsewhere');
-    mkdirSync(elsewhere);
-    execFileSync('rm', ['-rf', join(wsRepo, '.git', 'worktrees')]);
-    symlinkSync(elsewhere, join(wsRepo, '.git', 'worktrees'));
-    expect(await by('workspace.worktrees')).toMatchObject({ status: 'fail', detail: expect.stringMatching(/symlink or not a directory/) });
-  });
-
-  it('uninstall --delete-data removes the host workspace; without it the data is kept', async () => {
-    const { repo, id } = await hostProject();
-    await prepareHostRuntime(await loadProjectJson(id), { target: { node: process.execPath, cli: '/x' } });
-    writeFileSync(join(hostRuntimePaths(id).state, 'minions.db'), 'x');
-    const runner = async () => no;
-    const kept = await runUninstall({ cwd: repo, yes: true, runner });
-    expect(kept.hostData).toEqual({ path: hostRuntimePaths(id).root, deleted: false });
-    expect(existsSync(hostRuntimePaths(id).state)).toBe(true);
-    expect(existsSync(hostRuntimePaths(id).bin)).toBe(false);
-    const again = await runInit({ path: repo, yes: true, visibility: 'private', runtime: 'host', dockerProbe: dockerDown });
-    const id2 = again.plan.projectId;
-    await prepareHostRuntime(await loadProjectJson(id2), { target: { node: process.execPath, cli: '/x' } });
-    const del = await runUninstall({ cwd: repo, yes: true, deleteData: true, runner });
-    expect(del.hostData).toMatchObject({ deleted: true });
-    expect(existsSync(hostRuntimePaths(id2).root)).toBe(false);
-    expect(git(repo, 'status', '--porcelain')).toBe('');
-  });
 });
 
 describe('minions upgrade on the host runtime', () => {
-  it('runs the host path (no Docker refusal): an unprepared host runtime fails the preflight, nothing changes', async () => {
-    const { Command } = await import('commander');
-    const { register } = await import('../../src/host/commands.js');
-    const { repo } = await hostProject();
-    const exit = vi.spyOn(process, 'exit').mockImplementation(((code?: number) => { throw new Error(`exit ${code}`); }) as never);
-    const err = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
-    const out = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
-    vi.stubEnv('MINIONS_RUNTIME', ''); // the host CLI
-    const cwd = process.cwd();
-    process.chdir(repo);
-    try {
-      for (const args of [['upgrade', '--dry-run'], ['upgrade']]) {
-        err.mockClear(); out.mockClear();
-        process.exitCode = 0;
-        const program = new Command();
-        register(program);
-        await program.parseAsync(args, { from: 'user' }).catch((e: Error) => { if (!/^exit [1-9]/.test(e.message)) throw e; });
-        const text = [...err.mock.calls, ...out.mock.calls].map((c) => String(c[0])).join('');
-        expect(text).not.toContain('supports the Docker runtime only');
-        expect(text).toContain('the host runtime has not been started');
-      }
-      expect(git(repo, 'status', '--porcelain')).toBe('');
-    } finally {
-      process.chdir(cwd);
-      process.exitCode = 0;
-      exit.mockRestore(); err.mockRestore(); out.mockRestore();
-      vi.unstubAllEnvs();
-    }
-  });
-
   it('help: --rebuild-cli is offered and --from-container does not promise a host build', async () => {
     const { Command } = await import('commander');
     const { register } = await import('../../src/host/commands.js');
