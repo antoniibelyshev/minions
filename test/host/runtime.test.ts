@@ -319,7 +319,27 @@ describe('host runtime processes', () => {
     expect(by('host.backlog')).toMatchObject({ status: 'fail', hint: expect.stringMatching(/backlog.md/) });
     expect(by('docker.daemon')).toBeUndefined();
     expect(by('coordinator')!.status).toBe('warn');
+    expect(by('workspace.worktrees')).toMatchObject({ status: 'warn', detail: expect.stringMatching(/no repository yet/) });
     expect(calls).not.toContain('docker');
+  });
+
+  it('doctor in host mode reports .git/worktrees: missing is created outside the sandbox, then ok (task-3)', async () => {
+    const { repo, id } = await hostProject();
+    const wsRepo = hostRuntimePaths(id).repo;
+    mkdirSync(wsRepo, { recursive: true });
+    git(wsRepo, 'init', '-q');
+    expect(existsSync(join(wsRepo, '.git', 'worktrees'))).toBe(false);
+    const runner = async () => no;
+    const by = async (n: string) => (await runDoctor({ cwd: repo, runner, probe: async () => { throw new Error('no docker'); } })).checks.find((c) => c.name === n);
+    expect(await by('workspace.worktrees')).toMatchObject({ status: 'warn', detail: expect.stringMatching(/was missing .*created it/) });
+    expect(existsSync(join(wsRepo, '.git', 'worktrees'))).toBe(true);
+    expect(await by('workspace.worktrees')).toMatchObject({ status: 'ok', detail: expect.stringMatching(/\.git\/worktrees exists/) });
+    // A planted symlink is reported, never followed or replaced.
+    const elsewhere = join(env.root, 'elsewhere');
+    mkdirSync(elsewhere);
+    execFileSync('rm', ['-rf', join(wsRepo, '.git', 'worktrees')]);
+    symlinkSync(elsewhere, join(wsRepo, '.git', 'worktrees'));
+    expect(await by('workspace.worktrees')).toMatchObject({ status: 'fail', detail: expect.stringMatching(/symlink or not a directory/) });
   });
 
   it('uninstall --delete-data removes the host workspace; without it the data is kept', async () => {

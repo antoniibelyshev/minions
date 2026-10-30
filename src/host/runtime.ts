@@ -13,7 +13,7 @@
 //   (src/runtime/coordinator.ts `hostSettings`) unless the owner turns the sandbox off (coordinator.sandbox false,
 //   config.local.json only); bypassPermissions likewise only from config.local.json.
 import { spawn } from 'node:child_process';
-import { chmod, readFile, rm } from 'node:fs/promises';
+import { chmod, lstat, mkdir, readFile, rm } from 'node:fs/promises';
 import { isAbsolute, join } from 'node:path';
 import { MinionsError } from '../core/errors.js';
 import { run, type RunOptions, type RunResult } from '../core/exec.js';
@@ -174,7 +174,39 @@ export async function prepareHostRuntime(project: ProjectJson, opts: { target?: 
   const gh = await resolveOnPath('gh', pathEnv);
   if (gh) await atomicWrite(hp.ghShim, await ghShim(gh, projectPaths(project.projectId).githubTokenFile), { mode: 0o755 });
   else await rm(hp.ghShim, { force: true });
+  await ensureHostWorktreesDir(hp.repo);
   return { gh, movedToFileStore: moved.moved, keychainWarnings: moved.warnings };
+}
+
+/**
+ * State of `<repo>/.git/worktrees` in the host workspace: `ok` (a real directory), `missing`, `no-repo` (no
+ * `.git` directory yet, e.g. before the first import) or `invalid` (`.git` or `.git/worktrees` is a symlink or
+ * not a directory).
+ */
+export type WorktreesDirState = 'ok' | 'missing' | 'no-repo' | 'invalid';
+
+export async function hostWorktreesDirState(repo: string): Promise<WorktreesDirState> {
+  const gitDir = await lstat(join(repo, '.git')).catch(() => null);
+  if (!gitDir) return 'no-repo';
+  if (!gitDir.isDirectory()) return 'invalid';
+  const wt = await lstat(join(repo, '.git', 'worktrees')).catch(() => null);
+  if (!wt) return 'missing';
+  return wt.isDirectory() ? 'ok' : 'invalid';
+}
+
+/**
+ * Creates `<repo>/.git/worktrees` outside the sandbox (task-3). The coordinator settings deny Edit of
+ * `.git/worktrees/<name>/config.worktree` (hostSettings); on macOS Claude Code turns that into a sandbox write
+ * deny that also refuses creating the missing ancestors of the denied path, so a sandboxed `git worktree add`
+ * could never create `.git/worktrees` itself. Once the directory exists, `.git/worktrees/<name>/` can be created
+ * (the glob only matches the `config.worktree` file). Never follows a symlinked `.git`; an invalid layout is
+ * left alone and reported (doctor `workspace.worktrees`).
+ */
+export async function ensureHostWorktreesDir(repo: string): Promise<WorktreesDirState> {
+  const state = await hostWorktreesDirState(repo);
+  if (state !== 'missing') return state;
+  await mkdir(join(repo, '.git', 'worktrees'), { mode: 0o755 }).catch((e: NodeJS.ErrnoException) => { if (e.code !== 'EEXIST') throw e; });
+  return hostWorktreesDirState(repo);
 }
 
 // ---------------------------------------------------------------- lifecycle
@@ -241,7 +273,8 @@ export class HostRuntime {
     return {
       dirs: { import: hp.import, exports: hp.exports },
       hostFs: true,
-      exec: async (args: string[], opts?: RunOptions) => { await dirs(hp.exports); return this.exec(args, opts); },
+      // After every transfer command (e.g. the first `workspace import` clones the repo): .git/worktrees, see ensureHostWorktreesDir.
+      exec: async (args: string[], opts?: RunOptions) => { await dirs(hp.exports); try { return await this.exec(args, opts); } finally { await ensureHostWorktreesDir(hp.repo).catch(() => undefined); } },
       putFile: async (local: string, remote: string) => { await dirs(hp.import); await rm(remote, { force: true }); await copyRegularFileNoFollow(local, remote); },
       getFile: async (remote: string, local: string) => { await copyRegularFileNoFollow(remote, local); },
       removeFile: async (remote: string) => { await rm(remote, { force: true }); },
