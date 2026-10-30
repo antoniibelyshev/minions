@@ -1,16 +1,15 @@
 // task-98: workers read a task's notes through `minions backlog show <id> --json` (and the work brief);
 // listings and exports stay without notes, and long notes keep only the most recent part.
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { delimiter, join } from 'node:path';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import type { Command } from 'commander';
+import { join } from 'node:path';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { NOTES_MAX_CHARS, boundNotes, toTask } from '../../src/backlog/backlogmd.js';
-import { writeBacklogConfig } from '../../src/backlog/factory.js';
-import { buildProgram } from '../../src/program.js';
 import { defaults } from '../helpers.js';
+import { runCli } from './harness.js';
 
-const onPath = (process.env.PATH ?? '').split(delimiter).some((d) => d && existsSync(join(d, 'backlog')));
+// The CLI runs in-process against an in-memory backlog (no Backlog.md subprocess); see harness.ts.
+vi.mock('../../src/backlog/factory.js', async (orig) => (await import('./harness.js')).mockFactory(await orig()));
 
 describe('boundNotes / toTask notes', () => {
   it('keeps short notes as is and maps empty notes to null', () => {
@@ -47,12 +46,11 @@ let state: string;
 const saved: Record<string, string | undefined> = {};
 const ENV = ['MINIONS_RUNTIME', 'MINIONS_STATE_DIR', 'MINIONS_CONFIG'] as const;
 
-beforeAll(async () => {
+beforeAll(() => {
   state = mkdtempSync(join(tmpdir(), 'minions-notescli-'));
   for (const k of ENV) saved[k] = process.env[k];
   const config = join(state, 'config.json');
   writeFileSync(config, JSON.stringify(defaults()));
-  await writeBacklogConfig(join(state, 'backlog'));
   Object.assign(process.env, { MINIONS_RUNTIME: 'container', MINIONS_STATE_DIR: state, MINIONS_CONFIG: config });
 });
 afterAll(() => {
@@ -60,39 +58,10 @@ afterAll(() => {
   rmSync(state, { recursive: true, force: true });
 });
 
-async function cli(args: string[]): Promise<{ out: string; code: number }> {
-  const program = buildProgram();
-  let out = '';
-  const capture = (cmd: Command) => {
-    cmd.exitOverride().configureOutput({ writeOut: (s) => { out += s; }, writeErr: (s) => { out += s; } });
-    cmd.commands.forEach(capture);
-  };
-  capture(program);
-  const write = process.stdout.write.bind(process.stdout);
-  const writeErr = process.stderr.write.bind(process.stderr);
-  const sink = ((s: string | Uint8Array) => { out += String(s); return true; }) as typeof process.stdout.write;
-  process.stdout.write = sink;
-  process.stderr.write = sink;
-  const exit = process.exit.bind(process);
-  process.exit = ((c?: number) => { throw Object.assign(new Error('exit'), { exitCode: c ?? 0 }); }) as typeof process.exit;
-  const before = process.exitCode;
-  let code = 0;
-  try {
-    await program.parseAsync(['node', 'minions', ...args, '--json']);
-    code = process.exitCode === before ? 0 : Number(process.exitCode);
-  } catch (err) {
-    code = (err as { exitCode?: number }).exitCode ?? 1;
-  } finally {
-    process.stdout.write = write;
-    process.stderr.write = writeErr;
-    process.exit = exit;
-    process.exitCode = before;
-  }
-  return { out, code };
-}
+const cli = runCli;
 const data = <T>(out: string) => (JSON.parse(out) as { data: T }).data;
 
-describe.runIf(onPath)('backlog show --json returns notes (real CLI)', () => {
+describe('backlog show --json returns notes (in-memory backlog)', () => {
   it('shows notes appended with backlog note; list and export leave them out', async () => {
     const c = await cli(['backlog', 'create', '--title', 'Noted task', '--key', 'notes-1']);
     expect(c.code, c.out).toBe(0);
