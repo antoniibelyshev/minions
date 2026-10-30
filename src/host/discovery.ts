@@ -30,6 +30,8 @@ export interface Discovery {
   instructions: { claudeMd: boolean; agentsMd: boolean; claudeDir: boolean; contributing: string | null };
   packageJson: { present: boolean; scripts: Record<string, string>; packageManager: 'npm' | 'pnpm' | 'yarn' | 'bun' };
   verificationCommands: string[];
+  /** Proposed verification.setupCommands from the lockfile (empty without one). */
+  setupCommands: string[];
   ciWorkflows: string[];
   dockerfile: boolean;
   host: { cpus: number; memoryMiB: number; platform: string; arch: string };
@@ -89,6 +91,17 @@ function lockfileManager(files: Set<string>): Discovery['packageJson']['packageM
   return 'npm';
 }
 
+/**
+ * Proposed verification.setupCommands from the top-level lockfile (data only; nothing is run): the local
+ * integrator's worktree has no node_modules, so without them every `tsc`/`vitest` exits 127 (task-136).
+ */
+export function proposeSetup(files: Set<string>): string[] {
+  if (files.has('pnpm-lock.yaml')) return ['pnpm i --frozen-lockfile'];
+  if (files.has('yarn.lock')) return ['yarn --immutable'];
+  if (files.has('package-lock.json') || files.has('npm-shrinkwrap.json')) return ['npm ci'];
+  return [];
+}
+
 /** Proposed verification commands from package.json script names (data only; nothing is run). */
 export function proposeVerification(scripts: Record<string, string>, pm: Discovery['packageJson']['packageManager']): string[] {
   const out: string[] = [];
@@ -143,6 +156,7 @@ export async function discover(repoPath: string, runner: Runner = run): Promise<
     },
     packageJson: { present: pkgPresent, scripts, packageManager },
     verificationCommands: proposeVerification(scripts, packageManager),
+    setupCommands: proposeSetup(top),
     ciWorkflows,
     dockerfile: top.has('Dockerfile') || top.has('Containerfile'),
     host: { cpus: cpus().length, memoryMiB: Math.floor(totalmem() / 1048576), platform: process.platform, arch: process.arch },

@@ -163,6 +163,7 @@ function baseConfig(input: WizardInput, profile: Profile): { config: MinionsConf
     projectId: input.projectId, packageVersion: VERSION,
   });
   r.config.verification.commands = [...d.verificationCommands];
+  if (d.setupCommands.length) r.config.verification.setupCommands = [...d.setupCommands];
   return r;
 }
 
@@ -286,6 +287,12 @@ export async function runWizard(input: WizardInput): Promise<WizardResult> {
     const v = await ask('verification.commands', `Verification commands run by the agents ${input.runtime === 'host' ? 'in their workspace clone' : 'inside the container'} (separate with ';', 'none' for none)`,
       cfg.verification.commands.join('; ') || 'none', (s) => (s.trim() === 'none' ? [] : s.split(';').map((x) => x.trim()).filter(Boolean)));
     cfg.verification.commands = v;
+    // Setup commands of the local integration worktree (detected from the lockfile, never executed on the host).
+    const setupDefault = cfg.verification.setupCommands ?? d.setupCommands;
+    const setup = await ask('verification.setupCommands', 'Setup commands that install dependencies before local integration verifies a merge (separate with \';\', \'none\' for none)',
+      setupDefault.join('; ') || 'none', (s) => (s.trim() === 'none' ? [] : s.split(';').map((x) => x.trim()).filter(Boolean)));
+    if (setup.length) cfg.verification.setupCommands = setup;
+    else delete cfg.verification.setupCommands;
     // 8. Container resources and preview ports (docker runtime only).
     if (input.runtime === 'host') io.info('Container resources and preview ports: not applicable (host runtime has no container limits).');
     else {
