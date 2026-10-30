@@ -1,7 +1,7 @@
 // Tester QA for task-24.1 (retest of the plain-scalar allowlist in src/backlog/taskfile.ts): every unquoted
-// value the fast path accepts must give exactly the Task and version `backlog task view` gives. Each case is
-// a hand-written task file with the value as a dependency, a documentation item or the title; the fast
-// listing is compared field by field with the view-per-task listing from the real Backlog.md CLI.
+// value the fast path accepts must give exactly the Task and version `backlog task view` gives. The values
+// go into hand-written task files as dependencies, documentation items or titles; the fast listing is
+// compared with `task view` from the real Backlog.md CLI.
 import { execFileSync } from 'node:child_process';
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -32,14 +32,19 @@ const VALUES = [
   '^a', '$a', '(a)', '/a', '_a', ';a', 'é', '🚀 rocket', 'a 🚀', '👍', 'a\u3000b', 'a\u00a0b', 'ﬁ', 'Ⅻ', '٣',
 ];
 
-const FIELDS = ['dependencies', 'documentation', 'title'] as const; // documentation is only in the version hash
-type Field = (typeof FIELDS)[number];
 
-describe.skipIf(!hasCli)('plain-scalar allowlist vs task view (real CLI)', { timeout: 180_000 }, () => {
+// Only the values the parser accepts are probed against the CLI: the rejected ones (null) are unit-tested in
+// taskfile-edge.test.ts, and the fallback to `task view` for such a file in taskfile.test.ts. The list-item
+// values share one task file per field, so the oracle costs two task views instead of one per value
+// (task-104.2). Titles are single-valued (one file each) and part of the list summary the adapter
+// cross-checks: a title the parser read differently from Backlog.md would fall back and add a spawn.
+describe.skipIf(!hasCli)('plain-scalar allowlist vs task view (real CLI)', { timeout: 60_000 }, () => {
   let root: string;
-  const cases: { id: string; field: Field; value: string; fast: boolean }[] = [];
+  const titles: string[] = [];
+  let deps: string[] = [];
+  let docs: string[] = [];
   let fastTasks: Task[] = [];
-  let slowTasks: Task[] = [];
+  const viewed = new Map<string, Task>();
   let fastSpawns = 0;
 
   beforeAll(async () => {
@@ -51,47 +56,43 @@ describe.skipIf(!hasCli)('plain-scalar allowlist vs task view (real CLI)', { tim
     const dir = join(root, 'backlog', 'tasks');
     const tmpl = readFileSync(join(dir, readdirSync(dir).find((n) => n.startsWith('task-2 '))!), 'utf8');
     expect(tmpl).toMatch(/\ndependencies:\n {2}- TASK-1\n/);
-    let n = 100;
-    for (const field of FIELDS) {
-      // documentation goes through the same list-item path as dependencies: probe it with the accepted values only.
-      for (const value of field === 'documentation' ? VALUES.filter((v) => parseTaskFile(tmpl.replace(/\ndependencies:\n {2}- TASK-1\n/, `\ndependencies:\n  - ${v}\n`))) : VALUES) {
-        const id = `TASK-${n++}`;
-        let t = tmpl.replace(/^id: TASK-2$/m, `id: ${id}`);
-        if (field === 'title') t = t.replace(/^title: Template$/m, `title: ${value}`);
-        else if (field === 'dependencies') t = t.replace(/\ndependencies:\n {2}- TASK-1\n/, `\ndependencies:\n  - ${value}\n`);
-        else t = t.replace(/\ndependencies:\n/, `\ndocumentation:\n  - ${value}\ndependencies:\n`);
-        expect(t).not.toBe(tmpl);
-        writeFileSync(join(dir, `${id.toLowerCase()} - Case.md`), t);
-        cases.push({ id: id.toLowerCase(), field, value, fast: parseTaskFile(t) !== null });
-      }
+    const withId = (id: string) => tmpl.replace(/^id: TASK-2$/m, `id: ${id}`);
+    const items = (vs: string[]) => vs.map((v) => `  - ${v}\n`).join('');
+    const depFile = (vs: string[]) => withId('TASK-100').replace(/\ndependencies:\n {2}- TASK-1\n/, `\ndependencies:\n${items(vs)}`);
+    const docFile = (vs: string[]) => withId('TASK-101').replace(/\ndependencies:\n/, `\ndocumentation:\n${items(vs)}dependencies:\n`);
+    // A value is probed when the parser accepts a file carrying it alone.
+    deps = VALUES.filter((v) => parseTaskFile(depFile([v])));
+    docs = VALUES.filter((v) => parseTaskFile(docFile([v])));
+    const files: [string, string][] = [['task-100 - Deps.md', depFile(deps)], ['task-101 - Docs.md', docFile(docs)]];
+    let n = 200;
+    for (const value of VALUES) {
+      const t = withId(`TASK-${n++}`).replace(/^title: Template$/m, `title: ${value}`);
+      if (parseTaskFile(t)) { files.push([`task-${n - 1} - Case.md`, t]); titles.push(value); }
     }
+    for (const [name, t] of files) { expect(parseTaskFile(t), name).not.toBeNull(); writeFileSync(join(dir, name), t); }
     const fast = new BacklogMdAdapter({ root, idempotency: new MemoryIdempotencyStore() });
     await fast.capabilities(); // asks `backlog --version` once (task-24.9); the listing below reuses the cached answer
     const base = fast.spawnCount;
     fastTasks = await fast.listTasks();
     fastSpawns = fast.spawnCount - base;
-    // Fallback tasks were already viewed by the fast listing; only the accepted ones need a task view to compare.
     const slow = new BacklogMdAdapter({ root, idempotency: new MemoryIdempotencyStore(), readFiles: false });
-    const listedIds = new Set(fastTasks.map((t) => t.id));
     // getTask also carries the notes (task-98); listings never do, so compare without them.
-    for (const c of cases) if (c.fast && listedIds.has(c.id)) { const { notes: _n, ...t } = await slow.getTask(c.id); slowTasks.push(t); }
-  }, 180_000);
+    for (const id of ['task-100', 'task-101']) { const { notes: _n, ...t } = await slow.getTask(id); viewed.set(id, t); }
+  }, 60_000);
   afterAll(() => rmSync(root, { recursive: true, force: true }));
 
-  it('gives the same Task and version as task view for every value the fast path accepts', () => {
-    const diff = cases.flatMap((c) => {
-      const f = fastTasks.find((t) => t.id === c.id), s = slowTasks.find((t) => t.id === c.id);
-      if (!c.fast || (!f && !s)) return [];
-      return JSON.stringify(f) === JSON.stringify(s) ? [] : [`${c.field} ${JSON.stringify(c.value)} fast=${c.fast}: ${JSON.stringify(f)} vs view ${JSON.stringify(s)}`];
-    });
-    expect(diff).toEqual([]);
+  it('gives the same Task and version as task view for every list item value the fast path accepts', () => {
+    expect(deps.length).toBeGreaterThan(50);
+    expect(docs.length).toBeGreaterThan(50);
+    for (const id of ['task-100', 'task-101']) expect(fastTasks.find((t) => t.id === id)).toEqual(viewed.get(id));
+    // Backlog.md keeps every item as its own entry: none merged, dropped or split (documentation is only in the version).
+    expect(viewed.get('task-100')!.dependencies).toHaveLength(deps.length);
   });
 
-  it('keeps the fast path for allowlisted values: one list call plus one view per fallback only', () => {
-    const listed = cases.filter((c) => fastTasks.some((t) => t.id === c.id));
-    expect(listed.filter((c) => c.fast)).toEqual(cases.filter((c) => c.fast)); // Backlog.md lists every accepted file
-    expect(listed.filter((c) => c.fast).length).toBeGreaterThan(100);
-    // TASK-1 and TASK-2 (CLI-written) are read in-process too.
-    expect(fastSpawns).toBe(1 + listed.filter((c) => !c.fast).length);
+  it('keeps the fast path for allowlisted values: one list call and no task view, titles included', () => {
+    expect(titles.length).toBeGreaterThan(50);
+    expect(fastTasks).toHaveLength(2 + 2 + titles.length); // Backlog.md lists every accepted file
+    // Every file (TASK-1 and TASK-2, written by the CLI, too) is read in-process and agrees with the list summary.
+    expect(fastSpawns).toBe(1);
   });
 });

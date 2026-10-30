@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import { Option, type Command } from 'commander';
 import { setIdempotencyStore, setIntakePausedContext, setProvenanceFallback, setReadyContext } from '../backlog/commands.js';
 import { openBacklog, writeBacklogConfig } from '../backlog/factory.js';
-import type { BacklogAdapter, IdempotencyStore } from '../backlog/types.js';
+import type { BacklogAdapter, IdempotencyStore, Task } from '../backlog/types.js';
 import { validateConfig } from '../config/resolve.js';
 import { isGithubDelivery } from '../config/delivery.js';
 import type { MinionsConfig } from '../config/schema.js';
@@ -72,7 +72,8 @@ import { liveRun, liveRunExitCode, type LiveRunReport } from './headless.js';
 import { buildSessionCommand, sessionsSettings } from './sessions.js';
 import { heldBySession, recordSent, resolveRoute, sendToSession, sessionKeyOf, waitForOutbound, type RouteResult, type WaitResult } from './router.js';
 import { runSupervisor, startSupervisorWatch, supervisorLockState, type SupervisorReport, type SupervisorTaskDeps } from './supervisor.js';
-import { adoptIntegrationBase, runIntegrator, type IntegratorReport } from './integrator.js';
+import { adoptIntegrationBase, runIntegrator, startIntegratorDetached, type IntegratorReport } from './integrator.js';
+import { collectIntegrationStatus, humanIntegration, kickInputs, kickIntegratorIfNeeded, startIntegrationWatch, type IntegrationStatus } from './integration-status.js';
 import { verifyAnyApproval } from '../core/approval.js';
 import { recoverTaskSession, taskSessionPass, type TaskSessionDeps } from './task-sessions.js';
 
@@ -313,6 +314,21 @@ export function wrapperRoutineClock(log: (line: string) => void): () => void {
   });
 }
 
+/** Starts `minions work integrate` detached (output in <logs>/integration/integrator.log), as Scheduler.record does. */
+function startIntegrator(): number | null {
+  const paths = runtimePaths();
+  return startIntegratorDetached({ log: join(paths.logs, 'integration', 'integrator.log'), cwd: paths.repo });
+}
+
+/**
+ * The wrapper's integration backstop (task-82.4): every minute (and at the start, which covers
+ * `coordinator restart --recover`), starts the local integrator when queued integrations have no live holder.
+ * The config is re-read each check (delivery.merge and base.merge are live settings).
+ */
+export function wrapperIntegrationWatch(_cfg: MinionsConfig, log: (line: string) => void): () => void {
+  return startIntegrationWatch({ decide: async () => kickInputs(getDb(), await loadRuntimeConfig()), start: startIntegrator, say: log });
+}
+
 /**
  * The wrapper's session supervisor watch (task-57 phase 5): with coordinator.sessions.enabled it starts
  * `minions coordinator supervise` detached and again whenever its lock is stale; with sessions off it does nothing.
@@ -374,6 +390,8 @@ export interface StatusReport {
   digest?: DigestStatus;
   /** Open change requests (proposed, confirmed, failed) waiting for the host: the manager or `minions settings apply`. */
   changeRequests?: { open: number; items: { id: string; kind: string; status: string; summary: string; createdAt: string }[] };
+  /** The local integrator (local delivery; docs/design/local-auto-integration.md): lock, current run, queue, last result, problems. */
+  integration?: IntegrationStatus;
   backlogError?: string;
 }
 
@@ -400,7 +418,9 @@ export async function runtimeChannelStatus(cfg: MinionsConfig, paths = runtimePa
   return { configured: r.configured, effective: r.effective, reason: r.reason, source: 'predicted' };
 }
 
-export async function collectStatus(deps: { db: RuntimeDb; config: MinionsConfig; state?: string; backlog: () => Promise<BacklogAdapter>; channel?: () => Promise<ChannelStatus>; launch?: () => Promise<LaunchStatus>; poller?: () => Promise<PollerCheck> }): Promise<StatusReport> {
+export async function collectStatus(deps: { db: RuntimeDb; config: MinionsConfig; state?: string; backlog: () => Promise<BacklogAdapter>; channel?: () => Promise<ChannelStatus>; launch?: () => Promise<LaunchStatus>; poller?: () => Promise<PollerCheck>;
+  /** The local integrator's block (the CLI passes collectIntegrationStatus for /workspace/repo); omitted: no block. */
+  integration?: (tasks: Task[] | null) => Promise<IntegrationStatus | null> }): Promise<StatusReport> {
   const { db: d, config: cfg } = deps;
   const leases = d.activeLeases();
   const report: StatusReport = {
@@ -423,13 +443,17 @@ export async function collectStatus(deps: { db: RuntimeDb; config: MinionsConfig
   try { report.routine = routineLast(d, cfg); } catch { /* status never fails on the routine */ }
   try { if (cfg.routine?.enabled) report.digest = digestStatus(d, cfg); } catch { /* status never fails on the digest */ }
   try { const { steps: _s, ...c } = contextResetCheck({ db: d, config: cfg, ...(deps.state !== undefined ? { state: deps.state } : {}) }); report.contextReset = c; } catch { /* status never fails on the reset check */ }
+  let tasks: Task[] | null = null;
   try {
-    const tasks = await (await deps.backlog()).listTasks();
+    tasks = await (await deps.backlog()).listTasks();
     for (const t of tasks) report.queue[t.status] = (report.queue[t.status] ?? 0) + 1;
     const cap = capacityOf(cfg, leases, tasks);
     report.capacity = { activeTasks: cap.activeTaskIds.length, maxActiveTasks: cap.maxActiveTasks, activeEngineers: cap.activeEngineers, maxEngineers: cap.maxEngineers, byRole: cap.byRole };
   } catch (e) {
     report.backlogError = (e as Error).message;
+  }
+  if (deps.integration) {
+    try { const i = await deps.integration(tasks); if (i) report.integration = i; } catch { /* status never fails on the integration block */ }
   }
   return report;
 }
@@ -458,6 +482,7 @@ export function humanStatus(s: StatusReport): string {
     ...(s.contextReset?.enabled ? [humanContextReset(s.contextReset)] : []),
     ...(s.routine ? [humanRoutine(s.routine)] : []),
     ...(s.digest ? [humanDigestStatus(s.digest)] : []),
+    ...(s.integration ? humanIntegration(s.integration) : []),
   ];
   if (s.backlogError) out.push(`backlog error: ${s.backlogError}`);
   out.push(s.activeLeases.length ? 'active leases:' : 'active leases: none', ...s.activeLeases.map((l) => `  ${l.id} ${l.task_id} ${l.role} #${l.attempt} ${l.branch ?? ''}`));
@@ -930,6 +955,7 @@ export function register(program: Command): void {
         ...(o.recover ? { startupPrompt: RECOVERY_PROMPT } : o.wake ? { startupPrompt: WAKE_PROMPT } : {}),
         routineClock: wrapperRoutineClock,
         supervisorWatch: wrapperSupervisorWatch,
+        integrationWatch: wrapperIntegrationWatch,
         onStart: async (c, l, stop) => {
           // D3b: no process run of the previous session outlives it. Every record that is not done is reaped
           // (cancel or kill, escapee sweep, wip: checkpoint) before anything else touches its scratch dir.
@@ -983,6 +1009,8 @@ export function register(program: Command): void {
         recordRestart: coordinatorRestartRecorder(d),
         lock: d,
       }, o);
+      // --recover backstop (task-82.4): a queued integration whose detached start was lost starts again here.
+      if (o.recover) await kickIntegratorIfNeeded({ decide: async () => kickInputs(d, await getConfig()), start: startIntegrator, say: (l) => process.stderr.write(l + '\n') });
       emit(r, { json: globalOpts(cmd).json, human: (x: typeof r) => `coordinator: ${x.action} (${x.reason})` });
     }));
 
@@ -1301,7 +1329,8 @@ export function register(program: Command): void {
         return;
       }
       const cfg = await getConfig();
-      const r = await collectStatus({ db: getDb(), config: cfg, state: runtimePaths().state, backlog: getBacklog, channel: () => runtimeChannelStatus(cfg), launch: () => coordinatorLaunchStatus(cfg), poller: () => telegramPollerStatus() });
+      const r = await collectStatus({ db: getDb(), config: cfg, state: runtimePaths().state, backlog: getBacklog, channel: () => runtimeChannelStatus(cfg), launch: () => coordinatorLaunchStatus(cfg), poller: () => telegramPollerStatus(),
+        integration: (tasks) => collectIntegrationStatus({ db: getDb(), config: cfg, repo: runtimePaths().repo, tasks }) });
       emit(r, { json: globalOpts(cmd).json, human: humanStatus });
     }));
   const pauseLike = (name: 'pause' | 'resume') => {

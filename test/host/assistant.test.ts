@@ -24,10 +24,9 @@ vi.mock('../../src/plugin/generate.js', async (importOriginal) => {
 });
 
 const A = await import('../../src/host/assistant.js');
-const { runInit } = await import('../../src/host/install.js');
 const { projectPaths, credentialStoreDir } = await import('../../src/core/paths.js');
 const { resolveOnPath } = await import('../../src/host/auth.js');
-const { dockerUp, makeRepo, withHome } = await import('./fixtures.js');
+const { initFromTemplate, withHome } = await import('./fixtures.js');
 
 // Resolved before any test changes PATH; used only for `claude plugin validate` (no session, no API),
 // always with a temp HOME and CLAUDE_CONFIG_DIR so the user's enabled plugins (e.g. Telegram) never load.
@@ -39,10 +38,9 @@ beforeEach(() => { env = withHome(); prevPath = process.env.PATH; });
 afterEach(() => { process.env.PATH = prevPath; env.cleanup(); });
 
 async function project(visibility: 'shared' | 'private' = 'private') {
-  const repo = makeRepo(env.root);
-  const r = await runInit({ path: repo, yes: true, visibility, dockerProbe: dockerUp });
+  const { repo, projectId } = await initFromTemplate(env.root, { visibility });
   const ctx = await A.loadAssistantContext(repo);
-  return { repo, id: r.plan.projectId, ctx };
+  return { repo, id: projectId, ctx };
 }
 
 /**

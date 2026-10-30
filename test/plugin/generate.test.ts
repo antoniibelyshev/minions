@@ -14,11 +14,24 @@ const dirs: string[] = [];
 const tmp = async () => { const d = await mkdtemp(join(tmpdir(), 'minions-plugin-')); dirs.push(d); return d; };
 afterAll(async () => { await Promise.all(dirs.map((d) => rm(d, { recursive: true, force: true }))); });
 
-async function gen(cfg: MinionsConfig = defaults()) {
-  const out = await tmp();
-  const files = await generatePlugin(cfg, out);
-  const read = (rel: string) => readFile(join(out, rel), 'utf8');
-  return { out, files, rel: files.map((f) => relative(out, f.path).split('\\').join('/')), read };
+type Generated = { out: string; files: Awaited<ReturnType<typeof generatePlugin>>; rel: string[]; read: (rel: string) => Promise<string> };
+/**
+ * Plugin output per distinct config, generated once per file (task-104.3): most tests generate the defaults
+ * and only read the files, so they share one output dir. Nothing here writes into it; `fresh` generates anew.
+ */
+const generated = new Map<string, Promise<Generated>>();
+function gen(cfg: MinionsConfig = defaults(), o: { fresh?: boolean } = {}): Promise<Generated> {
+  const key = JSON.stringify(cfg);
+  const hit = o.fresh ? undefined : generated.get(key);
+  if (hit) return hit;
+  const p = (async () => {
+    const out = await tmp();
+    const files = await generatePlugin(cfg, out);
+    const read = (rel: string) => readFile(join(out, rel), 'utf8');
+    return { out, files, rel: files.map((f) => relative(out, f.path).split('\\').join('/')), read };
+  })();
+  if (!o.fresh) generated.set(key, p);
+  return p;
 }
 
 function frontmatter(md: string): Record<string, string> {
@@ -173,8 +186,8 @@ describe('generatePlugin', () => {
   });
 
   it('is deterministic for the same config', async () => {
-    const a = await gen();
-    const b = await gen();
+    const a = await gen(defaults(), { fresh: true });
+    const b = await gen(defaults(), { fresh: true });
     expect(a.files.map((f) => f.sha256)).toEqual(b.files.map((f) => f.sha256));
   });
 
@@ -663,7 +676,8 @@ describe('owner behaviour defaults (task-34)', () => {
     const base = defaults();
     const none = ownerSection(await (await gen(base)).read('coordinator.md'));
     expect(none).not.toContain('budgets');
-    expect(none).toContain('The coordinator is launched in `auto` by default (`coordinator.permissionMode`); the host runtime always uses `default`');
+    expect(none).toContain('The coordinator is launched in `auto` by default (`coordinator.permissionMode`)');
+    expect(ownerSection(await (await gen({ ...base, coordinator: { permissionMode: 'bypassPermissions' } })).read('coordinator.md'))).toContain('fully unattended (`bypassPermissions`)');
 
     const capped = ownerSection(await (await gen({ ...base, budgets: { taskUsd: 5, dailyUsd: 40 } })).read('coordinator.md'));
     expect(capped).toContain("The config's `budgets` ($40 per day, $5 per task; not enforced in v0.1) counts as a budget until the owner gives one");
@@ -816,5 +830,61 @@ describe('own ideas rule (task-130): the coordinator promotes its own ideas free
     const intake = await (await gen()).read('skills/intake/SKILL.md');
     expect(intake).not.toMatch(/auto-promotion|runtime caps/);
     expect(intake).toContain('`intake.github.readyLabels`');
+  });
+});
+
+describe('local integration prompts (task-82.4)', () => {
+  const local = (profile: 'project-owner' | 'personal-work' | 'supervised', merge: 'disabled' | 'auto-when-eligible') => {
+    const c = defaults(profile);
+    c.delivery = { ...c.delivery, mode: 'local', provider: 'none', merge };
+    c.verification.commands = ['npm run typecheck', 'npm test'];
+    return c;
+  };
+  const deliverySection = (md: string) => md.slice(md.indexOf('Delivery mode: `local`.'), md.indexOf('\n\n', md.indexOf('Never merge into, commit on')) + 1 || undefined);
+
+  it('with local integration on, the coordinator gets no manual merge steps and never merges, commits on or resets the base', async () => {
+    const g = await gen(local('project-owner', 'auto-when-eligible'));
+    const coord = await g.read('coordinator.md');
+    expect(coord).not.toMatch(/git merge --no-ff|--no-commit|git commit --no-edit|git merge --abort/);
+    expect(coord).toContain('The runtime integrates approved tasks into the local `main`; you never merge.');
+    expect(coord).toContain('Never merge into, commit on, rebase or reset the local `main`, and never run `minions work integrate`');
+    expect(coord).toMatch(/failed once and passed on its rerun still lands, with a `flaky` notice: file a follow-up task/);
+    expect(coord).toMatch(/Workers keep running meanwhile/);
+    expect(coord).toContain('re-dispatch nothing, and merge nothing (the runtime\'s integrator stops a running verification by itself and queues it again).');
+    expect(coord).toMatch(/sensitive paths need the user's host-signed merge approval/);
+    const orch = await g.read('skills/orchestrate/SKILL.md');
+    expect(orch).toMatch(/Local integration: the approved task goes to `merging` and the runtime integrates it into the local `main` \(never merge it yourself\)/);
+    expect(orch).not.toMatch(/as described under Delivery \(verify before committing the merge/);
+    expect(deliverySection(coord)).toMatchSnapshot();
+  });
+
+  it('personal-work with base.merge "ask": every landing needs the signed approval', async () => {
+    const coord = await (await gen(local('personal-work', 'auto-when-eligible'))).read('coordinator.md');
+    expect(coord).toMatch(/in this profile every landing needs the user's host-signed merge approval/);
+    expect(coord).not.toMatch(/--no-commit/);
+    expect(deliverySection(coord)).toMatchSnapshot();
+  });
+
+  it('with the switch off (rollout) or base.merge denied, the existing local guidance stays', async () => {
+    const off = await (await gen(local('project-owner', 'disabled'))).read('coordinator.md');
+    expect(off).toMatch(/`git merge --no-ff --no-commit agent\/<slug>`/);
+    expect(off).toContain('start no local integration merge (an upgrade could interrupt a `--no-commit` merge');
+    const sup = await (await gen(local('supervised', 'auto-when-eligible'))).read('coordinator.md');
+    expect(sup).toMatch(/Never merge into the local `main`: the user integrates/);
+    expect(sup).not.toMatch(/The runtime integrates approved tasks/);
+  });
+
+  it('the `merging` lines of the drain rule, orchestrate and recover skills appear only with local integration on', async () => {
+    const pr = defaults();
+    Object.assign(pr.delivery, { mode: 'pull-request', provider: 'github', merge: 'auto-when-eligible' });
+    for (const cfg of [pr, local('project-owner', 'disabled')]) {
+      const g = await gen(cfg);
+      expect(await g.read('coordinator.md')).toContain('re-dispatch nothing, and start no local integration merge (an upgrade could interrupt a `--no-commit` merge and leave the repo mid-merge). A hook');
+      expect(await g.read('skills/orchestrate/SKILL.md')).toContain('- reviewer `approve` → `delivered` (local delivery). In branch');
+      expect(await g.read('skills/recover/SKILL.md')).not.toContain('Tasks in `merging`');
+    }
+    const on = await gen(local('project-owner', 'auto-when-eligible'));
+    expect(await on.read('skills/orchestrate/SKILL.md')).toContain('(local delivery; `merging` with local integration on: the runtime integrates it, no worker runs for it). In branch');
+    expect(await on.read('skills/recover/SKILL.md')).toMatch(/This is not a failed attempt\.\n {3}- Tasks in `merging` have no lease and no worker: the runtime's integrator owns them/);
   });
 });

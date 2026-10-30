@@ -18,7 +18,6 @@ vi.mock('../../src/plugin/generate.js', async () => {
   };
 });
 
-const { runInit } = await import('../../src/host/install.js');
 const { loadProjectJson } = await import('../../src/host/project.js');
 const A = await import('../../src/host/approvals.js');
 const AP = await import('../../src/core/approval.js');
@@ -26,7 +25,7 @@ const CR = await import('../../src/host/change-requests.js');
 const J = await import('../../src/host/change-journal.js');
 const M = await import('../../src/host/manager.js');
 const T = await import('../../src/host/manager-telegram.js');
-const { makeRepo, withHome, dockerUp } = await import('./fixtures.js');
+const { initFromTemplate, withHome } = await import('./fixtures.js');
 type ProjectJson = import('../../src/host/project.js').ProjectJson;
 type RunResult = import('../../src/core/exec.js').RunResult;
 type ManagerOffer = import('../../src/host/manager.js').ManagerOffer;
@@ -46,9 +45,8 @@ const refused = (code: string, message: string): RunResult => ({ code: 1, stdout
 const reason = async (p: Promise<unknown>) => { try { await p; } catch (e) { return e as Error & { code?: string; details?: any }; } throw new Error('expected a refusal'); };
 
 async function install(name = 'repo') {
-  const repo = makeRepo(env.root, name);
-  const r = await runInit({ path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
-  return { project: await loadProjectJson(r.plan.projectId), repo };
+  const { repo, projectId } = await initFromTemplate(env.root, { visibility: 'private', name });
+  return { project: await loadProjectJson(projectId), repo };
 }
 
 /**

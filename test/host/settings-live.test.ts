@@ -17,7 +17,6 @@ vi.mock('../../src/plugin/generate.js', async () => {
   };
 });
 
-const { runInit } = await import('../../src/host/install.js');
 const { projectPaths } = await import('../../src/core/paths.js');
 const { loadProjectJson } = await import('../../src/host/project.js');
 const { editProjectConfig } = await import('../../src/host/config-write.js');
@@ -28,7 +27,7 @@ const { RuntimeDb } = await import('../../src/runtime/db.js');
 const { Scheduler } = await import('../../src/runtime/scheduler.js');
 const { workspaceLayout } = await import('../../src/runtime/worktree.js');
 const { FakeBacklog, initRepo, tmp } = await import('../runtime/fixtures.js');
-const { makeRepo, withHome, dockerUp } = await import('./fixtures.js');
+const { initFromTemplate, withHome } = await import('./fixtures.js');
 type ProjectJson = import('../../src/host/project.js').ProjectJson;
 type MinionsError = import('../../src/core/errors.js').MinionsError;
 
@@ -41,8 +40,7 @@ afterEach(() => {
 });
 
 async function install(): Promise<ProjectJson> {
-  const r = await runInit({ path: makeRepo(env.root), yes: true, visibility: 'private', dockerProbe: dockerUp });
-  return loadProjectJson(r.plan.projectId);
+  return loadProjectJson((await initFromTemplate(env.root)).projectId);
 }
 
 /** A running runtime that records every exec: a live change must not cause a coordinator restart. */

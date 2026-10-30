@@ -177,6 +177,11 @@ export interface DigestInput {
   /** Publications and merges waiting for a host-signed approval (the manager chat's /approve). */
   approvals: { taskId: string; head: string; scope: 'publish' | 'merge' }[];
   /**
+   * Local integration (task-82.4) since `since`: failed integrations (conflict, red, refused: sent back for a repair;
+   * transient: blocked) and landings whose verification passed only on a rerun (flaky). Absent: none.
+   */
+  integration?: { taskId: string; outcome: 'conflict' | 'red' | 'refused' | 'transient' | 'flaky'; detail: string | null; at: string }[];
+  /**
    * Spend over one window, `since` (tokens, USD, wakes and wake tokens alike); `window` names it in the title
    * (since the previous digest; the last 7 days when that is older; the last 24h without a previous digest).
    * The budget keeps the budget's own window.
@@ -260,6 +265,9 @@ export function composeDigest(i: DigestInput): Digest {
   add('Merged', merged.map((m) => ({ text: `- ${title(m.taskId)}${m.prUrl ? ` ${m.prUrl}` : ''}`, key: null })));
   add('Delivered, waiting for CI or merge', all.filter((t) => ['delivered', 'awaiting-ci', 'merging'].includes(t.status) && !heldDelivered.has(t.id))
     .map((t) => ({ text: `- ${title(t.id)}${t.status !== 'delivered' ? ` (${t.status})` : ''}${t.prUrl ? ` ${t.prUrl}` : ''}`, key: null })));
+  const integ = [...new Map([...(i.integration ?? [])].sort((a, b) => (a.at < b.at ? -1 : 1)).map((x) => [`${x.taskId}:${x.outcome === 'flaky' ? 'flaky' : 'fail'}`, x])).values()]
+    .sort((a, b) => byId(a.taskId, b.taskId) || a.outcome.localeCompare(b.outcome));
+  add('Integration', integ.map((x) => ({ text: `- ${title(x.taskId)}: ${x.outcome === 'flaky' ? 'merged, but a test passed only on its rerun (flaky; follow-up)' : x.outcome === 'transient' ? 'integration failed twice (transient), blocked' : `integration ${x.outcome}, sent back for a repair`}${x.detail ? ` - ${oneLine(x.detail, 160)}` : ''}`, key: null })));
   add('Updates', ofKind('delivered', 'feature', 'status', 'goal-ack', 'other').map((x) => ({ text: `- ${oneLine(x.text)}`, key: x.key })));
   if (i.spend) {
     const s = i.spend;
@@ -364,11 +372,25 @@ export function digestInput(db: RuntimeDb, cfg: DigestConfig, src: DigestSources
     const d = e.data as { state?: string; prUrl?: string } | null;
     if (e.taskId && d?.state === 'merged') merged.push({ taskId: e.taskId, prUrl: d.prUrl ?? null, at: e.at });
   }
+  // Local integration (task-82.4): a landing on the local base is a merge; failures and flaky landings get a line.
+  for (const e of db.eventsOfKindSince('integrated', since)) if (e.taskId) merged.push({ taskId: e.taskId, prUrl: null, at: e.at });
+  const integration: NonNullable<DigestInput['integration']> = [];
+  for (const outcome of ['conflict', 'red', 'refused', 'transient'] as const) {
+    for (const e of db.eventsOfKindSince(`integration-${outcome}`, since)) {
+      const d = e.data as { detail?: string | null } | null;
+      if (e.taskId) integration.push({ taskId: e.taskId, outcome, detail: d?.detail ? d.detail.split('\n')[0]! : null, at: e.at });
+    }
+  }
+  for (const e of db.eventsOfKindSince('integration-flaky', since)) {
+    const d = e.data as { commands?: string[] } | null;
+    if (e.taskId) integration.push({ taskId: e.taskId, outcome: 'flaky', detail: d?.commands?.length ? d.commands.join(', ') : null, at: e.at });
+  }
 
   const statusOf = new Map((src.tasks ?? []).map((t) => [t.id, t.status]));
   const approvals: DigestInput['approvals'] = [];
-  for (const p of db.all<{ task_id: string; head_sha: string }>("SELECT task_id, head_sha FROM publications WHERE state = 'awaiting-approval'")) {
-    approvals.push({ taskId: p.task_id, head: p.head_sha, scope: 'publish' });
+  // A local publication waiting for approval is a local integration: it needs a merge approval (task-82.4).
+  for (const p of db.all<{ task_id: string; head_sha: string; mode: string }>("SELECT task_id, head_sha, mode FROM publications WHERE state = 'awaiting-approval'")) {
+    approvals.push({ taskId: p.task_id, head: p.head_sha, scope: p.mode === 'local' ? 'merge' : 'publish' });
   }
   const lastMerge = new Map<string, { state?: string; head?: string }>();
   for (const e of db.eventsOfKindSince('merge', weekAgo)) if (e.taskId) lastMerge.set(e.taskId, e.data as { state?: string; head?: string });
@@ -390,7 +412,7 @@ export function digestInput(db: RuntimeDb, cfg: DigestConfig, src: DigestSources
       wakes, wakeTokens,
     };
   }
-  return { now, timezone: s.timezone, key: currentKey(db, st, now), since, items, tasks: src.tasks, merged, approvals, spend, runnable: src.runnable };
+  return { now, timezone: s.timezone, key: currentKey(db, st, now), since, items, tasks: src.tasks, merged, approvals, spend, runnable: src.runnable, ...(integration.length ? { integration } : {}) };
 }
 
 /** Meta prefix of a digest's question numbers (`digest_questions:<digest key>` = [{n, key}]). */

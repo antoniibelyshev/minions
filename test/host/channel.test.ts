@@ -18,7 +18,7 @@ vi.mock('../../src/plugin/generate.js', async () => {
   };
 });
 
-const { runInit, loadManifest } = await import('../../src/host/install.js');
+const { loadManifest } = await import('../../src/host/install.js');
 const { projectPaths } = await import('../../src/core/paths.js');
 const { loadProjectJson, loadEffectiveConfig, projectConfigPath } = await import('../../src/host/project.js');
 const CH = await import('../../src/host/channel-cli.js');
@@ -26,7 +26,7 @@ const C = await import('../../src/host/credentials.js');
 const { sha256 } = await import('../../src/core/fsutil.js');
 const { runtimeChannelStatus } = await import('../../src/runtime/commands.js');
 const { runtimePaths } = await import('../../src/runtime/paths.js');
-const { dockerUp, git, makeRepo, withHome } = await import('./fixtures.js');
+const { initFromTemplate, git, withHome } = await import('./fixtures.js');
 
 const TOKEN = '123456789:AAHfakefakefakefakefakefakefake_-0123';
 const notRunning = async () => false;
@@ -41,9 +41,8 @@ afterEach(() => {
 });
 
 async function install(visibility: 'shared' | 'private') {
-  const repo = makeRepo(env.root);
-  const r = await runInit({ path: repo, yes: true, visibility, dockerProbe: dockerUp });
-  const project = await loadProjectJson(r.plan.projectId);
+  const { repo, projectId } = await initFromTemplate(env.root, { visibility });
+  const project = await loadProjectJson(projectId);
   return { repo, project, file: projectConfigPath(project) };
 }
 const readCfg = (f: string) => JSON.parse(readFileSync(f, 'utf8')) as { configRevision: number; communication: { channel: string } };

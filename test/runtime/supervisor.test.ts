@@ -19,7 +19,7 @@ import {
   createSessionRecord, MAX_SESSION_RESUMES, readSessionRecord, reapSessionRecord, runSupervisor, sessionRunRecordPath, startSupervisorWatch, supervisorAlive,
   supervisorEnv, supervisorLockState, type LockProcessView, type SessionLauncher, type SupervisorDeps, type SupervisorSpawn, type SupervisorTiming,
 } from '../../src/runtime/supervisor.js';
-import { defaults } from '../helpers.js';
+import { defaults, HAS_PROCFS } from '../helpers.js';
 import { tmp } from './fixtures.js';
 
 const FAKE = join(import.meta.dirname, '..', 'fixtures', 'fake-claude-session.mjs');
@@ -109,7 +109,7 @@ describe('supervisor lock: reuse-safe', () => {
     expect(db.supervisorLock()).toBeNull();
   });
 
-  it('with the real /proc: a live process that is not a supervisor never holds the lock', async () => {
+  it.skipIf(!HAS_PROCFS)('with the real /proc: a live process that is not a supervisor never holds the lock', async () => {
     const c = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
     children.push(c);
     const id = (await procIdentity(c.pid!))!;
@@ -138,7 +138,7 @@ describe('supervisor lock: reuse-safe', () => {
 // ---------------------------------------------------------------- processes
 
 describe('session processes (fake claude)', { timeout: 30_000 }, () => {
-  it('spawns one resident process per session, records it, delivers the inbox to its stdin and keeps the claude session id', async () => {
+  it.skipIf(!HAS_PROCFS)('spawns one resident process per session, records it, delivers the inbox to its stdin and keeps the claude session id', async () => {
     const s = setup();
     const key = uniq('spawn');
     s.open(key);
@@ -304,7 +304,7 @@ describe('session processes (fake claude)', { timeout: 30_000 }, () => {
 
 // ---------------------------------------------------------------- orphans
 
-describe('orphans from run records (supervisor restart)', { timeout: 30_000 }, () => {
+describe.skipIf(!HAS_PROCFS)('orphans from run records (supervisor restart)', { timeout: 30_000 }, () => {
   // A leader in its own group with a group member, plus a marked process that left the group (setsid escapee).
   const ORPHAN = `
     const { spawn } = require('node:child_process');

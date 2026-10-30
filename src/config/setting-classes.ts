@@ -64,7 +64,7 @@ export const KEY_CLASSES: readonly KeyClass[] = [
     'policy and approvals (prompt plus runtime gates)'),
   ...entries(['delivery', 'verification.testerRequired', 'verification.reviewerRequired', 'verification.ciAuthority'], 'restart', true,
     'what reaches GitHub (or, in local delivery, the base branch through the local integrator), and with which checks'),
-  ...entries(['coordinator.permissionMode', 'coordinator.disallowedTools', 'coordinator.bundledSkills', 'permissionMode'], 'restart', true,
+  ...entries(['coordinator.permissionMode', 'coordinator.sandbox', 'coordinator.disallowedTools', 'coordinator.bundledSkills', 'permissionMode'], 'restart', true,
     'coordinator permissions'),
   ...entries(['coordinator.sessions.enabled'], 'restart', true, 'the wrapper starts the session supervisor, which starts headless coordinator sessions on its own (model spend)'),
   ...entries(['roles', 'workflows', 'harnesses'], 'restart', true, 'tools, edit scopes and process harnesses'),

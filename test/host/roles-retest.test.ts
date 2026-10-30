@@ -18,7 +18,7 @@ import { RuntimeDb } from '../../src/runtime/db.js';
 import { checkProposal, formatSummary, markApplied, MAX_PROPOSAL_LINE, proposeRole, showProposal } from '../../src/runtime/role-proposals.js';
 import { displayText, escapeFormatChars } from '../../src/core/control-chars.js';
 import { defaults } from '../helpers.js';
-import { dockerUp, makeRepo, withHome } from './fixtures.js';
+import { initFromTemplate, dockerUp, withHome } from './fixtures.js';
 
 let env: ReturnType<typeof withHome>;
 let db: RuntimeDb;
@@ -52,8 +52,8 @@ async function propose(project: ProjectJson, p: unknown) {
   return proposeRole({ db, config: runtimeConfig(project) }, f);
 }
 async function initProject(visibility: 'private' | 'shared' = 'private') {
-  const repo = makeRepo(env.root);
-  const project = await loadProjectJson((await runInit({ path: repo, yes: true, visibility, dockerProbe: dockerUp })).plan.projectId);
+  const { repo, projectId } = await initFromTemplate(env.root, { visibility });
+  const project = await loadProjectJson(projectId);
   return { repo, project };
 }
 

@@ -17,6 +17,7 @@
 // 5 minutes) and the rollback (CLI backup reinstall, `<imageTag>-prev` tagged back, `down` and `start --no-attach` on
 // the old CLI, coordinator restart --recover). Not healthy records the SHA as bad. When no coordinator comes up even
 // after the rollback, the owner is told through the host manager bot too (`minions manager notify`).
+// Task-82.5: the idle check also waits while the local integrator holds a live `integration_lock`.
 //
 // Plain Node ESM with no imports from src/: it runs against the installed `minions` CLI and `docker`. It never puts
 // a token or secret in argv or the log, and it treats every request field from the container as untrusted text.
@@ -220,7 +221,13 @@ export function pickRequest(requests, baseBranch) {
   return ok.sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt)))[0] ?? null;
 }
 
-/** Idle: no active worker lease and no drain (process runs belong to leases). Unreadable status is not idle. */
+/**
+ * Idle: no active worker lease, no drain (process runs belong to leases) and no live holder of the local
+ * integrator's `integration_lock` (docs/design/local-auto-integration.md, task-82.5). Unreadable status is not idle.
+ * The lock comes from the status `integration` block (`lock.state`: none, live or stale). The block is absent on
+ * runtimes without local delivery and on older runtimes that predate it: absent counts as not held. A stale lock
+ * (its holder died) is not busy. A block that is present but whose lock state is unreadable is not idle.
+ */
 async function idleState(p) {
   const r = await runtimeVerb(p, ['status']);
   if (r.state !== 'ok') return r;
@@ -229,6 +236,15 @@ async function idleState(p) {
   const busy = [];
   if (leases.length) busy.push(`${leases.length} active worker lease(s) (${leases.map((l) => clean(l?.id, 40)).join(', ')})`);
   if (r.data?.draining) busy.push('a drain is in progress');
+  const integration = r.data?.integration;
+  if (integration !== undefined && integration !== null) {
+    const lock = integration?.lock;
+    if (!lock || !['none', 'live', 'stale'].includes(lock.state)) return { state: 'error', message: 'the runtime status has an integration block without a readable lock state' };
+    if (lock.state === 'live') {
+      const task = integration.current?.taskId ? `, ${clean(integration.current.taskId, 40)} ${clean(integration.current.phase, 20)}` : '';
+      busy.push(`the integrator holds the integration lock (pid ${clean(String(lock.pid), 12)}${task})`);
+    }
+  }
   return busy.length ? { state: 'busy', reason: busy.join('; ') } : { state: 'idle' };
 }
 

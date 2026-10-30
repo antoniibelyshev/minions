@@ -20,11 +20,13 @@ export interface RunOptions {
    * it only the direct child is signalled. Ignored on Windows.
    */
   killGroup?: boolean;
+  /** SIGTERM -> SIGKILL grace for the timeout, abort and output cap (default KILL_GRACE_MS); tests inject a short one. */
+  killGraceMs?: number;
 }
 export interface RunResult { code: number; stdout: string; stderr: string; timedOut?: boolean; aborted?: boolean; outputLimited?: boolean }
 
 /** Grace between SIGTERM and SIGKILL (timeout and abort). */
-const KILL_GRACE_MS = 2000;
+export const KILL_GRACE_MS = 2000;
 
 const tail = (s: string, n = 2000) => (s.length > n ? '…' + s.slice(-n) : s);
 
@@ -65,7 +67,7 @@ export function run(cmd: string, args: string[], opts: RunOptions = {}): Promise
     const terminate = () => {
       if (killTimer || settled) return;
       signal('SIGTERM');
-      killTimer = setTimeout(() => signal('SIGKILL'), KILL_GRACE_MS);
+      killTimer = setTimeout(() => signal('SIGKILL'), opts.killGraceMs ?? KILL_GRACE_MS);
     };
     const timer = opts.timeoutMs ? setTimeout(() => { if (!aborted) timedOut = true; terminate(); }, opts.timeoutMs) : undefined;
     const onAbort = () => { if (!timedOut) aborted = true; terminate(); };

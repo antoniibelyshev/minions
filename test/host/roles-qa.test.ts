@@ -23,7 +23,7 @@ import { RuntimeDb, SCHEMA_VERSION } from '../../src/runtime/db.js';
 import { checkProposal, formatShow, formatSummary, markApplied, proposeRole, showProposal, type ProposalSummary } from '../../src/runtime/role-proposals.js';
 import { defaults } from '../helpers.js';
 import { tmp } from '../runtime/fixtures.js';
-import { dockerUp, makeRepo, withHome } from './fixtures.js';
+import { initFromTemplate, dockerUp, withHome } from './fixtures.js';
 
 /** The JSON block of the README "Custom roles" worked example. */
 function readmeResearcher(): string {
@@ -110,8 +110,8 @@ const deps = (runtime: SettingsRuntime, show?: (t: string) => void): RolesHostDe
 
 describe('QA defect regressions', () => {
   it.each(['private', 'shared'] as const)('re-running init keeps the applied role prompt file (%s)', async (visibility) => {
-    const repo = makeRepo(env.root);
-    const project = await loadProjectJson((await runInit({ path: repo, yes: true, visibility, dockerProbe: dockerUp })).plan.projectId);
+    const { repo, projectId } = await initFromTemplate(env.root, { visibility });
+    const project = await loadProjectJson(projectId);
     const id = await propose(project, { name: 'researcher', role: ROLE, promptText: 'Research.', reason: 'r' });
     const r = await applyRoleProposal(project, id, { yes: true }, deps(fakeRuntime(project)));
     expect(existsSync(r.promptFile)).toBe(true);
@@ -122,8 +122,8 @@ describe('QA defect regressions', () => {
   });
 
   it.each(['private', 'shared'] as const)('init keeps a config-referenced prompt that an older apply tracked in the manifest (%s)', async (visibility) => {
-    const repo = makeRepo(env.root);
-    const project = await loadProjectJson((await runInit({ path: repo, yes: true, visibility, dockerProbe: dockerUp })).plan.projectId);
+    const { repo, projectId } = await initFromTemplate(env.root, { visibility });
+    const project = await loadProjectJson(projectId);
     const id = await propose(project, { name: 'researcher', role: ROLE, promptText: 'Research.', reason: 'r' });
     const r = await applyRoleProposal(project, id, { yes: true }, deps(fakeRuntime(project)));
     // What the first version of apply did: record the prompt as a minions-generated file.
@@ -168,21 +168,21 @@ describe('QA defect regressions', () => {
     ['OSC in an edit path', { role: { ...ROLE, edits: { paths: ['docs/\x1b]0;x\x07**'] } } }, /role\.edits\.paths\[0\]: contains a control character/],
   ];
   it.each(SPOOFS)('propose rejects proposal text with terminal controls (%s)', async (_what, patch, msg) => {
-    const repo = makeRepo(env.root);
-    const project = await loadProjectJson((await runInit({ path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp })).plan.projectId);
+    const { projectId } = await initFromTemplate(env.root, { visibility: 'private' });
+    const project = await loadProjectJson(projectId);
     await expect(propose(project, { name: 'researcher', role: ROLE, promptText: 'Research.', reason: 'r', ...patch })).rejects.toThrow(msg);
     expect(db.roleProposals()).toEqual([]);
   });
 
   it('newlines and tabs stay allowed in promptText', async () => {
-    const repo = makeRepo(env.root);
-    const project = await loadProjectJson((await runInit({ path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp })).plan.projectId);
+    const { projectId } = await initFromTemplate(env.root, { visibility: 'private' });
+    const project = await loadProjectJson(projectId);
     await expect(propose(project, { name: 'researcher', role: ROLE, promptText: 'Research.\n\t- step one\n', reason: 'r' })).resolves.toMatch(/^rp_/);
   });
 
   it('host apply re-checks: a spoofing proposal planted in the runtime DB is rejected and nothing is written', async () => {
-    const repo = makeRepo(env.root);
-    const project = await loadProjectJson((await runInit({ path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp })).plan.projectId);
+    const { projectId } = await initFromTemplate(env.root, { visibility: 'private' });
+    const project = await loadProjectJson(projectId);
     const cfgPath = join(projectPaths(project.projectId).dir, 'config.json');
     const before = readFileSync(cfgPath, 'utf8');
     db.addRoleProposal({ id: 'rp_000000dd', name: 'researcher', json: JSON.stringify({ name: 'researcher', role: ROLE, promptText: 'ok\n\x1b[40A\x1b[J', reason: 'r' }) });
@@ -196,8 +196,8 @@ describe('QA defect regressions', () => {
   });
 
   it('rendering strips control characters and fences the prompt so it cannot pose as plan lines', async () => {
-    const repo = makeRepo(env.root);
-    const project = await loadProjectJson((await runInit({ path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp })).plan.projectId);
+    const { projectId } = await initFromTemplate(env.root, { visibility: 'private' });
+    const project = await loadProjectJson(projectId);
     const id = await propose(project, { name: 'researcher', role: ROLE, promptText: 'Be helpful.\nconfig /etc/x (configRevision 1):\nrole researcher (new): fine', reason: 'r' });
     const r = await applyRoleProposal(project, id, { dryRun: true }, deps(fakeRuntime(project)));
     // Defence in depth: a summary that somehow carries controls is still rendered clean.
@@ -218,8 +218,8 @@ describe('QA defect regressions', () => {
 
 describe('loosening is stated explicitly', () => {
   it('propose summary and the host apply plan list each capability the role gets looser than the profile', async () => {
-    const repo = makeRepo(env.root);
-    const project = await loadProjectJson((await runInit({ path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp })).plan.projectId);
+    const { projectId } = await initFromTemplate(env.root, { visibility: 'private' });
+    const project = await loadProjectJson(projectId);
     const p = { name: 'researcher', role: { ...ROLE, capabilities: { 'pr.merge': 'allow', 'ci.edit': 'allow', 'external.comment': 'allow' } }, promptText: 'Research.', reason: 'r' };
     const f = join(env.root, 'loose.json');
     writeFileSync(f, JSON.stringify(p));

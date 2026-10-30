@@ -188,6 +188,15 @@ export function autoMergeReadiness(
   rc?: RequiredChecksReport | null,
 ): { ready: boolean; enabled: boolean; detail: string; reasons: string[] } {
   const enabled = config.delivery.merge === 'auto-when-eligible';
+  if (config.delivery.mode === 'local') {
+    // Local delivery (docs/design/local-auto-integration.md): the switch is local integration; no GitHub involved.
+    if (!enabled) return { ready: false, enabled, reasons: [], detail: `local integration off: approved tasks end delivered and the coordinator merges them (opt-in: delivery.merge "auto-when-eligible" or \`minions setup\`; currently "${config.delivery.merge}")` };
+    const reasons = autoMergeConfigReasons(config);
+    if (reasons.length) return { ready: false, enabled, reasons, detail: `local integration enabled but not usable: ${reasons.join('; ')}` };
+    const ask = config.capabilities && config.sensitivePaths ? can({ capabilities: config.capabilities, sensitivePaths: config.sensitivePaths }, 'base.merge') === 'ask' : false;
+    const cmds = config.verification?.commands ?? [];
+    return { ready: true, enabled, reasons: [], detail: `local integration ready: the runtime merges each approved head, runs the verification (${cmds.join(', ')}) on the merged tree and lands it on the base when it passes${ask ? '; base.merge "ask": each landing needs \`minions work approve <taskId> --head <sha> --merge\` on the host' : '; sensitive paths need \`minions work approve <taskId> --head <sha> --merge\` on the host'}` };
+  }
   if (!enabled) {
     return { ready: false, enabled, reasons: [], detail: `auto-merge off (opt-in: delivery.merge "auto-when-eligible" or \`minions setup\`; currently "${config.delivery.merge}")` };
   }
@@ -217,6 +226,8 @@ export function mergeReadiness(
   const ready = github.onGitHub && github.credential === 'ok';
   const mode = config.delivery.mode;
   if (mode === 'local') {
+    if (am.enabled && am.ready) return ['ok', `local delivery (nothing is pushed); ${deferred}`];
+    if (am.enabled) return ['warn', `local delivery (nothing is pushed); ${deferred}`, 'Fix the reasons above, or set delivery.merge "disabled" (the coordinator then merges approved branches).'];
     return ['unavailable', ready
       ? `local delivery (nothing is pushed); pull-request delivery is available: set delivery.mode "pull-request"; ${deferred}`
       : `local delivery only: branch/pull-request delivery needs ${github.onGitHub ? 'a valid GitHub token' : 'a GitHub remote and token'}; ${deferred}`];
@@ -416,7 +427,7 @@ function probePermission(stdout: string): { mode: string; fallback: boolean; rea
 
 /** Host runtime: coordinator session, Claude auth on the host, launch probe, Telegram plugin (via the runtime shim). */
 async function hostRuntimeChecks(project: ProjectJson, auth: ClaudeAuth, baseUrl: string | undefined, wantsTelegram: boolean,
-  runner: Runner, add: Add, checks: Check[]): Promise<Check | undefined> {
+  runner: Runner, add: Add, checks: Check[], wantsIntegration = false): Promise<Check | undefined> {
   const host = new HostRuntime(project, runner);
   const running = await host.isRunning();
   add('coordinator', running ? 'ok' : 'warn', running ? `tmux server ${host.paths.tmuxSocket} has the coordinator session` : `not running (tmux server ${host.paths.tmuxSocket})`,
@@ -450,8 +461,28 @@ async function hostRuntimeChecks(project: ProjectJson, auth: ClaudeAuth, baseUrl
   await prepareHostRuntime(project).catch(() => undefined);
   const ex = (args: string[]) => host.exec(args, { allowFailure: true, timeoutMs: 60_000 });
   const probe = await ex(['minions', 'coordinator', '--probe', '--json']);
+  if (wantsIntegration) checks.push(...integrationDoctorChecks(await ex(['minions', 'status', '--json'])));
   add('claude.capabilities', probe.code === 0 ? 'ok' : 'fail', probe.code === 0 ? 'Claude Code supports the coordinator launch flags; launch command resolves; sandbox settings applied' : `coordinator probe failed (exit ${probe.code}): ${short(probe.stderr || probe.stdout)}`);
   return telegramRuntimeChecks(ex, wantsTelegram, checks);
+}
+
+/**
+ * integration.* checks (local integration, task-82.4) from the runtime's `minions status --json`: its integration
+ * block carries the problems the runtime derived (stale lock, halted queue, a dirty checkout, a crash during
+ * `git merge --ff-only`). No block (not local delivery, an older image): no checks. One ok line when all is well.
+ */
+export function integrationDoctorChecks(r: { code: number; stdout: string }): Check[] {
+  if (r.code !== 0) return [];
+  try {
+    const env = JSON.parse(r.stdout) as { ok?: boolean; data?: { integration?: { enabled?: boolean; problems?: unknown; queue?: unknown[]; lock?: { state?: string } } } };
+    const i = env.ok ? env.data?.integration : undefined;
+    if (!i || typeof i !== 'object') return [];
+    const problems = Array.isArray(i.problems) ? i.problems.filter((p): p is Check & { status: 'warn' | 'fail' } =>
+      !!p && typeof (p as Check).name === 'string' && ((p as Check).status === 'warn' || (p as Check).status === 'fail') && typeof (p as Check).detail === 'string') : [];
+    if (problems.length) return problems.map((p) => ({ name: p.name, status: p.status, detail: redact(p.detail).slice(0, 600), ...(typeof p.hint === 'string' ? { hint: redact(p.hint).slice(0, 600) } : {}) }));
+    const queued = Array.isArray(i.queue) ? i.queue.length : 0;
+    return [{ name: 'integration', status: 'ok', detail: `local integration ${i.enabled ? 'on' : 'off'}; ${i.lock?.state === 'live' ? 'integrator running' : 'integrator idle'}; ${queued} queued` }];
+  } catch { return []; }
 }
 
 /** `minions ci status --json` output from the container (gh api); null when unavailable (e.g. an older image). */
@@ -656,7 +687,7 @@ export async function runDoctor(opts: {
     const harnesses = harnessView(config);
     if (hostMode) {
       restart = notApplicable('host runtime: no container to restart');
-      tgPlugin = await hostRuntimeChecks(project, auth, baseUrl, wantsTelegram, runner, add, checks);
+      tgPlugin = await hostRuntimeChecks(project, auth, baseUrl, wantsTelegram, runner, add, checks, config?.delivery.mode === 'local');
       checks.push(...harnessSkipChecks(harnesses, 'host-runtime'));
     } else if (docker.daemon && docker.compose) {
       const label = await imageBuildLabel(project.imageTag, runner);
@@ -698,6 +729,7 @@ export async function runDoctor(opts: {
         }
         checks.push(...tmpUsageChecks(await ex(['df', '-Pk', '/tmp', CONTAINER.scratch]), { capMiB: tmpSizeMiB(project.container), scratch: CONTAINER.scratch }));
         checks.push(backlogCliCheck(await ex(['backlog', '--version'])));
+        if (config?.delivery.mode === 'local') checks.push(...integrationDoctorChecks(await ex(['minions', 'status', '--json'])));
         const probe = await ex(['minions', 'coordinator', '--probe', '--json']);
         const perm = probe.code === 0 ? probePermission(probe.stdout) : undefined;
         add('claude.capabilities', probe.code !== 0 ? 'fail' : perm?.fallback ? 'warn' : 'ok', probe.code === 0

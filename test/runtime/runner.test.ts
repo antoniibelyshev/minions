@@ -13,8 +13,10 @@ import { recordSubmitted, submissionPath } from '../../src/runtime/handoff.js';
 import { fakeAdapter } from '../../src/runtime/runner/adapter.js';
 import { createRunRecord, ownerLockPath, readOwner, readRunRecord, runRecordPath, type RunRecord } from '../../src/runtime/runner/record.js';
 import { reapRun, runLease, type RunnerDeps } from '../../src/runtime/runner/run.js';
+import type { SuperviseTiming } from '../../src/runtime/runner/supervise.js';
 import { Scheduler, type TaskBrief } from '../../src/runtime/scheduler.js';
 import { commitFile, gitSync, makeDefaultEnv, result, type Env } from './fixtures.js';
+import { HAS_PROCFS } from '../helpers.js';
 
 const SCRIPT = resolve(__dirname, '..', 'fixtures', 'fake-harness.mjs');
 const CODEX = { models: { default: 'gpt-6.1-sol', allowed: ['gpt-6.1-sol'] }, timeoutMinutes: 5 };
@@ -50,12 +52,14 @@ const submitted = (r: Rig, b: TaskBrief) => JSON.parse(readFileSync(submissionPa
 const headOf = (r: Rig, branch: string) => gitSync(r.layout.repo, 'rev-parse', `refs/heads/${branch}`);
 
 /**
- * Wall-clock limit for the timeout tests whose harness must install signal handlers (or write a file) before
- * the stop. The limit runs from spawn, so with 300-400 ms a node start slowed by a loaded machine got the
- * SIGINT before its handlers and died of it (task-93). Generous on purpose; the stop sequence after it is
- * what the tests assert.
+ * Timing for the timeout tests whose harness must install signal handlers (or write a file) before the stop.
+ * From spawn, a 300-400 ms limit let a node start slowed by a loaded machine get the SIGINT before its handlers
+ * (it died of it, task-93), and a fixed 2.5 s limit cost every such test 2.5 s. The limit here starts once the
+ * harness wrote `ready` (the timeoutStart seam), so a short one is safe; the stop sequence after it is what the
+ * tests assert.
  */
-const HANDLERS_TIMEOUT_MS = 2_500;
+const afterReady = (ready: string, timing: Omit<SuperviseTiming, 'timeoutMs' | 'timeoutStart'>): SuperviseTiming =>
+  ({ timeoutMs: 300, timeoutStart: waitForFile(ready), ...timing });
 
 /** Polls until the file exists, up to a deadline; false if it never appears. */
 async function waitForFile(path: string, deadlineMs = 20_000): Promise<boolean> {
@@ -74,7 +78,7 @@ async function running(r: Rig, b: TaskBrief, steps: unknown[]) {
   throw new Error('the run never started');
 }
 
-describe('work run: producer happy path', () => {
+describe.skipIf(!HAS_PROCFS)('work run: producer happy path', () => {
   it('runs the fake harness in a private clone, fast-forwards the lease branch, submits by proxy and records usage', async () => {
     const r = rig();
     const b = await claim(r);
@@ -136,7 +140,7 @@ describe('work run: producer happy path', () => {
 });
 
 describe('work run: launch gate', () => {
-  it('refuses a worker caller, a Claude lease, a missing adapter, a second run and a sandbox that is not ok', async () => {
+  it.skipIf(!HAS_PROCFS)('refuses a worker caller, a Claude lease, a missing adapter, a second run and a sandbox that is not ok', async () => {
     const r = rig();
     const b = await claim(r);
     expect((await err(runLease(b.leaseId, r.deps({}, { callerEnv: { MINIONS_WORKER_LEASE: 'lease-x' } })))).code).toBe('POLICY_DENIED');
@@ -167,7 +171,7 @@ describe('work run: launch gate', () => {
     expect((await err(runLease(b.leaseId, r.deps({ steps: [] })))).message).toMatch(/runs on Claude Code/);
   });
 
-  it('capacity excludes the lease itself: a full role still runs its own lease; a lowered limit refuses it', async () => {
+  it.skipIf(!HAS_PROCFS)('capacity excludes the lease itself: a full role still runs its own lease; a lowered limit refuses it', async () => {
     const r = rig((c) => { c.execution.maxByRole = { engineer: 1 }; c.execution.maxActiveTasks = 1; });
     const b = await claim(r);
     const own = await runLease(b.leaseId, r.deps({ steps: [{ op: 'result' }] }));
@@ -184,7 +188,7 @@ describe('work run: launch gate', () => {
     expect(e.message).toMatch(/limit reached without this lease \(1\/1\)/);
   });
 
-  it('the phase 1 producer cap counts only the other leases', async () => {
+  it.skipIf(!HAS_PROCFS)('the phase 1 producer cap counts only the other leases', async () => {
     const r = rig();
     const b = await claim(r);
     expect(await runLease(b.leaseId, r.deps({ steps: [{ op: 'result' }] }))).toMatchObject({ submitted: true });
@@ -213,11 +217,13 @@ describe('work run: launch gate', () => {
 });
 
 // Real subprocesses (git, the node fake harness, its children) with second-scale timings: a limit above the default 5 s.
-describe('work run: supervise, cancel, timeout, drain', { timeout: 30_000 }, () => {
+describe.skipIf(!HAS_PROCFS)('work run: supervise, cancel, timeout, drain', { timeout: 30_000 }, () => {
   it('timeout: the worker (ignoring SIGTERM) is killed, the runner commits wip: and submits partial', async () => {
     const r = rig();
     const b = await claim(r);
-    const out = await runLease(b.leaseId, r.deps({ steps: [{ op: 'ignoreTerm' }, { op: 'write', path: 'wip.txt', content: 'half\n' }, { op: 'sleep', ms: 30_000 }] }, { timing: { timeoutMs: HANDLERS_TIMEOUT_MS, pollMs: 50, killGraceMs: 300, drainGraceMs: 100 } }));
+    const ready = join(r.root, 'ready.pid');
+    const out = await runLease(b.leaseId, r.deps({ steps: [{ op: 'ignoreTerm' }, { op: 'write', path: 'wip.txt', content: 'half\n' }, { op: 'pidfile', path: ready }, { op: 'sleep', ms: 30_000 }] },
+      { timing: afterReady(ready, { pollMs: 50, killGraceMs: 300, drainGraceMs: 100 }) }));
     expect(out).toMatchObject({ submitted: true, status: 'partial', exit: { stopped: 'timeout' } });
     expect(out.wipCommit).toBe(headOf(r, b.branch));
     expect(gitSync(r.layout.repo, 'log', '-1', '--format=%an %s', out.wipCommit!)).toBe('minions-runner wip: runner checkpoint (timeout)');
@@ -229,8 +235,9 @@ describe('work run: supervise, cancel, timeout, drain', { timeout: 30_000 }, () 
     const r = rig();
     const b = await claim(r);
     const log = join(r.root, 'signals.log');
-    const out = await runLease(b.leaseId, r.deps({ steps: [{ op: 'logSignals', path: log }, { op: 'sleep', ms: 30_000 }] },
-      { timing: { timeoutMs: HANDLERS_TIMEOUT_MS, pollMs: 50, killGraceMs: 1_000, interruptGraceMs: 1_000, drainGraceMs: 100 } }));
+    const ready = join(r.root, 'ready.pid');
+    const out = await runLease(b.leaseId, r.deps({ steps: [{ op: 'logSignals', path: log }, { op: 'pidfile', path: ready }, { op: 'sleep', ms: 30_000 }] },
+      { timing: afterReady(ready, { pollMs: 50, killGraceMs: 1_000, interruptGraceMs: 1_000, drainGraceMs: 100 }) }));
     expect(out).toMatchObject({ status: 'partial', exit: { stopped: 'timeout', signal: 'SIGKILL' } });
     const lines = readFileSync(log, 'utf8').trim().split('\n').map((l) => l.split(' '));
     expect(lines.map(([sig]) => sig)).toEqual(['SIGINT', 'SIGTERM']);
@@ -252,8 +259,9 @@ describe('work run: supervise, cancel, timeout, drain', { timeout: 30_000 }, () 
     await r.sched.release(b.leaseId, 'next');
     const b2 = await claim(r);
     const log = join(r.root, 'signals2.log');
-    const out2 = await runLease(b2.leaseId, r.deps({ steps: [{ op: 'logSignals', path: log }, { op: 'sleep', ms: 30_000 }] },
-      { timing: { timeoutMs: HANDLERS_TIMEOUT_MS, pollMs: 50, killGraceMs: 300, interruptGraceMs: 60_000, drainGraceMs: 100 } }));
+    const ready = join(r.root, 'ready2.pid');
+    const out2 = await runLease(b2.leaseId, r.deps({ steps: [{ op: 'logSignals', path: log }, { op: 'pidfile', path: ready }, { op: 'sleep', ms: 30_000 }] },
+      { timing: afterReady(ready, { pollMs: 50, killGraceMs: 300, interruptGraceMs: 60_000, drainGraceMs: 100 }) }));
     expect(out2).toMatchObject({ exit: { stopped: 'timeout', signal: 'SIGKILL' } });
     expect(readFileSync(log, 'utf8').trim().split('\n').map((l) => l.split(' ')[0])).toEqual(['SIGINT', 'SIGTERM']);
   });
@@ -263,8 +271,9 @@ describe('work run: supervise, cancel, timeout, drain', { timeout: 30_000 }, () 
     const b = await claim(r);
     const log = join(r.root, 'member-signals.log');
     // The leader ignores both graceful signals (as minions-sandbox ignores SIGINT); only the group member logs them.
-    const out = await runLease(b.leaseId, r.deps({ steps: [{ op: 'groupChildLogSignals', path: log }, { op: 'ignoreTerm' }, { op: 'sleep', ms: 30_000 }] },
-      { timing: { timeoutMs: HANDLERS_TIMEOUT_MS, pollMs: 50, killGraceMs: 300, interruptGraceMs: 200, drainGraceMs: 100 } }));
+    const ready = join(r.root, 'ready.pid');
+    const out = await runLease(b.leaseId, r.deps({ steps: [{ op: 'groupChildLogSignals', path: log }, { op: 'ignoreTerm' }, { op: 'pidfile', path: ready }, { op: 'sleep', ms: 30_000 }] },
+      { timing: afterReady(ready, { pollMs: 50, killGraceMs: 300, interruptGraceMs: 200, drainGraceMs: 100 }) }));
     expect(out).toMatchObject({ status: 'partial', exit: { stopped: 'timeout', signal: 'SIGKILL' } });
     expect(readFileSync(log, 'utf8').trim().split('\n')).toEqual(['SIGINT', 'SIGTERM']);
   });
@@ -344,7 +353,7 @@ describe('work run: supervise, cancel, timeout, drain', { timeout: 30_000 }, () 
   });
 });
 
-describe('work run: git-metadata and branch attacks end with nothing fetched', () => {
+describe.skipIf(!HAS_PROCFS)('work run: git-metadata and branch attacks end with nothing fetched', () => {
   type Steps = unknown[] | ((c: { b: TaskBrief; r: Rig; stateFile: string }) => unknown[]);
   const attacked = async (steps: Steps) => {
     const r = rig();
@@ -442,7 +451,7 @@ describe('work run: git-metadata and branch attacks end with nothing fetched', (
   });
 });
 
-describe('work run: a gate (phase 1 b pilot)', () => {
+describe.skipIf(!HAS_PROCFS)('work run: a gate (phase 1 b pilot)', () => {
   const pilot = () => rig((c) => set(c, { roles: { 'codex-reviewer': { description: 'Codex review.', promptText: 'Review.', contract: 'gate', harness: 'codex' } }, workflows: { pilot: ['engineer', 'codex-reviewer'] } }), PHASE_RULES['1b']);
   async function toGate(r: Rig) {
     r.backlog.add({ id: 'task-1', workflow: 'pilot' });
@@ -472,7 +481,7 @@ describe('work run: a gate (phase 1 b pilot)', () => {
   });
 });
 
-describe('work run: concurrent writers', () => {
+describe.skipIf(!HAS_PROCFS)('work run: concurrent writers', () => {
   it('commits on another branch and a merge into main during the run cause no false violation and no rollback', async () => {
     const r = rig();
     const b = await claim(r);
@@ -491,7 +500,7 @@ describe('work run: concurrent writers', () => {
   });
 });
 
-describe('reapRun: orphans and recovery', { timeout: 30_000 }, () => {
+describe.skipIf(!HAS_PROCFS)('reapRun: orphans and recovery', { timeout: 30_000 }, () => {
   /** Simulates a runner that died (SIGKILL): the record names a process that is gone. */
   function forgeDeadRunner(r: Rig, rec: RunRecord, patch: Partial<RunRecord> = {}) {
     const dead = spawnSync(process.execPath, ['-e', 'console.log(process.pid)'], { encoding: 'utf8' });

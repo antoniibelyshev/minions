@@ -442,14 +442,15 @@ describe('sensitive-path gate', () => {
     expect(env.gh.prs).toHaveLength(0);
   });
 
-  it('coordinator settings deny direct push/merge and always ask before recording an approval', () => {
+  it('coordinator settings deny direct push/merge and recording an approval (the owner signs it on the host)', () => {
     const s = coordinatorSettings(defaults()) as { permissions: { deny: string[]; ask: string[] } };
     expect(s.permissions.deny).toEqual(expect.arrayContaining(['Bash(git push *)', 'Bash(gh pr merge *)']));
-    expect(s.permissions.ask).toEqual(expect.arrayContaining(['Bash(minions work approve *)']));
+    expect(s.permissions.deny).toEqual(expect.arrayContaining(['Bash(minions work approve *)']));
+    expect(s.permissions).not.toHaveProperty('ask');
   });
 
-  it('approve asks (not allow) even with program-level options before the subcommand', () => {
-    const s = coordinatorSettings(defaults()) as { permissions: { allow: string[]; deny: string[]; ask: string[] } };
+  it('approve is denied (never allowed, never a blocking prompt) even with program-level options before the subcommand', () => {
+    const s = coordinatorSettings(defaults()) as { permissions: { allow: string[]; deny: string[]; ask?: string[] } };
     // Claude Code wildcard semantics: `*` matches any run of characters, including spaces. Precedence deny > ask > allow.
     // Only Bash rules decide a Bash command (the container settings also carry Edit denies for the runtime state).
     const glob = (rule: string, cmd: string) => {
@@ -459,11 +460,11 @@ describe('sensitive-path gate', () => {
       return new RegExp('^' + m.split('*').map((x) => x.replace(/[.+?^${}()|[\]\\]/g, (ch) => `\\${ch}`)).join('.*') + '$').test(cmd);
     };
     const decide = (cmd: string) => s.permissions.deny.some((r) => glob(r, cmd)) ? 'deny'
-      : s.permissions.ask.some((r) => glob(r, cmd)) ? 'ask' : s.permissions.allow.some((r) => glob(r, cmd)) ? 'allow' : 'none';
+      : (s.permissions.ask ?? []).some((r) => glob(r, cmd)) ? 'ask' : s.permissions.allow.some((r) => glob(r, cmd)) ? 'allow' : 'none';
     for (const cmd of [
       'minions work approve task-1 --head abc', 'minions --json work approve task-1 --head abc', 'minions --json --project x work approve task-1',
       'minions --json work approve', 'minions approve task-1', 'minions --json approve task-1 --head abc',
-    ]) expect(decide(cmd), cmd).toBe('ask');
+    ]) expect(decide(cmd), cmd).toBe('deny');
     expect(decide('minions work list')).toBe('allow');
     expect(decide('minions --json status')).toBe('allow');
     expect(decide('git -C x push origin HEAD')).toBe('deny');
@@ -558,10 +559,11 @@ describe('publication helpers', () => {
     const ok = { onGitHub: true, credential: 'ok' as const };
     expect(mergeReadiness(cfg('pull-request'), ok)).toEqual(['ok', expect.stringMatching(/pull-request delivery available.*auto-merge off \(opt-in/)]);
     expect(mergeReadiness(cfg('branch'), ok)[1]).toMatch(/branch delivery available/);
-    expect(mergeReadiness(cfg('local'), ok)).toEqual(['unavailable', expect.stringMatching(/pull-request delivery is available.*auto-merge off/)]);
+    expect(mergeReadiness(cfg('local'), ok)).toEqual(['unavailable', expect.stringMatching(/pull-request delivery is available.*local integration off/)]);
     expect(mergeReadiness(cfg('local'), { onGitHub: false, credential: null })[1]).toMatch(/needs a GitHub remote and token/);
     expect(mergeReadiness(cfg('pull-request'), { onGitHub: true, credential: 'missing' })[0]).toBe('warn');
     expect(mergeReadiness(cfg('pull-request'), { onGitHub: false, credential: null })[0]).toBe('fail');
-    for (const m of ['local', 'branch', 'pull-request'] as const) expect(mergeReadiness(cfg(m), ok)[1]).toMatch(/auto-merge off \(opt-in: delivery\.merge "auto-when-eligible"/);
+    for (const m of ['branch', 'pull-request'] as const) expect(mergeReadiness(cfg(m), ok)[1]).toMatch(/auto-merge off \(opt-in: delivery\.merge "auto-when-eligible"/);
+    expect(mergeReadiness(cfg('local'), ok)[1]).toMatch(/local integration off: .*opt-in: delivery\.merge "auto-when-eligible"/);
   });
 });
