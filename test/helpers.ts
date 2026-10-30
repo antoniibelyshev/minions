@@ -29,8 +29,8 @@ export const HAS_PROCFS = process.platform === 'linux';
  * exit codes the wrapper relies on, so the tests still run the real command strings there (task-105).
  * MINIONS_TEST_TIMEOUT_SHIM=1 uses the shim on Linux too.
  */
-const TIMEOUT_SHIM = (process.env.MINIONS_TEST_TIMEOUT_SHIM === '1'
-  || spawnSync('sh', ['-c', 'command -v timeout'], { env: { PATH: '/usr/bin:/bin' }, stdio: 'ignore' }).status !== 0)
+// Probed on first use, not at import: the unit tier refuses subprocesses and imports this file (task-137.1).
+const timeoutShim = (): string | null => (process.env.MINIONS_TEST_TIMEOUT_SHIM === '1' || !hasCoreutilsTimeout())
   ? join(import.meta.dirname, 'fixtures', 'timeout-shim.mjs') : null;
 /**
  * Single-quotes a value for a POSIX shell. Fixture scripts and git config commands that embed a temp path use it: the
@@ -49,14 +49,17 @@ export function runHookCommand(command: string, minions: string | null, stdin = 
   const bin = join(dir, 'bin');
   mkdirSync(bin);
   if (minions !== null) { writeFileSync(join(bin, 'minions'), minions); chmodSync(join(bin, 'minions'), 0o755); }
-  if (TIMEOUT_SHIM) { writeFileSync(join(bin, 'timeout'), `#!/bin/sh\nexec ${shq(process.execPath)} ${shq(TIMEOUT_SHIM)} "$@"\n`); chmodSync(join(bin, 'timeout'), 0o755); }
+  const shim = timeoutShim();
+  if (shim) { writeFileSync(join(bin, 'timeout'), `#!/bin/sh\nexec ${shq(process.execPath)} ${shq(shim)} "$@"\n`); chmodSync(join(bin, 'timeout'), 0o755); }
   const r = spawnSync('sh', ['-c', command], { input: stdin, env: { PATH: `${bin}:/usr/bin:/bin` }, encoding: 'utf8' });
   rmSync(dir, { recursive: true, force: true });
   return { status: r.status, stdout: r.stdout, stderr: r.stderr };
 }
 
-/** True when runHookCommand's PATH has coreutils `timeout` (Linux; not stock macOS). */
-export const HAS_COREUTILS_TIMEOUT = spawnSync('sh', ['-c', 'command -v timeout'], { env: { PATH: '/usr/bin:/bin' } }).status === 0;
+let coreutilsTimeout: boolean | undefined;
+/** True when runHookCommand's PATH has coreutils `timeout` (Linux; not stock macOS). Probed once, on first call. */
+export const hasCoreutilsTimeout = (): boolean =>
+  (coreutilsTimeout ??= spawnSync('sh', ['-c', 'command -v timeout'], { env: { PATH: '/usr/bin:/bin' }, stdio: 'ignore' }).status === 0);
 
 /**
  * A hook command with its hang guard (src/runtime/hook-guard.ts) forced to one branch (`coreutils` or the `perl`
