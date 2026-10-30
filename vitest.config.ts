@@ -1,5 +1,6 @@
 import { defineConfig } from 'vitest/config';
 import { readFileSync } from 'node:fs';
+import { INTEGRATION_TESTS } from './test/tiers.js';
 
 const pkg = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8')) as { version: string };
 const docker = process.env.MINIONS_DOCKER_TESTS === '1';
@@ -24,22 +25,46 @@ if (!/--v8-pool-size/.test(process.env.NODE_OPTIONS ?? '')) process.env.NODE_OPT
 // resets and hooks to that session; the suite runs as the single coordinator unless a test sets it itself.
 delete process.env.MINIONS_SESSION;
 
-export default defineConfig({
+/**
+ * Two tiers (task-137.1), as vitest projects: `unit` (no subprocesses, git repos or network; enforced by
+ * test/setup/no-subprocess.ts) and `integration` (the files listed in test/tiers.ts). `npm test` runs both;
+ * `npm run test:unit` / `npm run test:integration` select one with --project.
+ */
+const shared = {
   define: { __MINIONS_VERSION__: JSON.stringify(pkg.version) },
+} as const;
+const sharedTest = {
+  exclude: ['node_modules/**', 'dist/**', ...(docker ? [] : ['test/docker/**'])],
+  // Headroom for the local integration gate (task-81): `npm test` runs on the merged tree while other
+  // workers run their own suites, and many tests here do real git and subprocess work that takes ~1 s idle
+  // but ran past the 5 s default under that load. A higher default only gives slow-but-correct tests time;
+  // a failing assertion still fails at once, and there are no retries. Tests asserting wall-clock bounds
+  // must not depend on this: they inject their clock or budget instead (task-93, task-95).
+  testTimeout: 20_000,
+  hookTimeout: 30_000,
+  // Claude Code never runs against the user's real ~/.claude (its plugins, e.g. the Telegram channel).
+  globalSetup: ['test/setup/global.ts'],
+  setupFiles: ['test/setup/claude-guard.ts', 'test/setup/tmpdir.ts'],
+};
+
+export default defineConfig({
+  ...shared,
   test: {
-    include: ['test/**/*.test.ts'],
-    exclude: ['node_modules/**', 'dist/**', ...(docker ? [] : ['test/docker/**'])],
-    // Headroom for the local integration gate (task-81): `npm test` runs on the merged tree while other
-    // workers run their own suites, and many tests here do real git and subprocess work that takes ~1 s idle
-    // but ran past the 5 s default under that load. A higher default only gives slow-but-correct tests time;
-    // a failing assertion still fails at once, and there are no retries. Tests asserting wall-clock bounds
-    // must not depend on this: they inject their clock or budget instead (task-93, task-95).
-    testTimeout: 20_000,
-    hookTimeout: 30_000,
     maxWorkers,
-    // Claude Code never runs against the user's real ~/.claude (its plugins, e.g. the Telegram channel).
-    globalSetup: ['test/setup/global.ts'],
-    setupFiles: ['test/setup/claude-guard.ts', 'test/setup/tmpdir.ts'],
+    projects: [
+      {
+        ...shared,
+        test: {
+          ...sharedTest,
+          name: 'unit',
+          include: ['test/**/*.test.ts'],
+          exclude: [...sharedTest.exclude, ...INTEGRATION_TESTS],
+          globalSetup: [...sharedTest.globalSetup, 'test/setup/no-subprocess-report.ts'],
+          setupFiles: [...sharedTest.setupFiles, 'test/setup/no-subprocess.ts'],
+        },
+      },
+      { ...shared, test: { ...sharedTest, name: 'integration', include: [...INTEGRATION_TESTS] } },
+    ],
     // Only active with --coverage (`npm run coverage`); `npm test` does not instrument.
     coverage: {
       provider: 'v8',

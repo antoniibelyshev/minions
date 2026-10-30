@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { HOOK_SETTINGS_TIMEOUT_S, HOOK_WRAPPER_TIMEOUT_S, TELEGRAM_HOOK_COMMAND } from '../../src/runtime/coordinator.js';
 import { hangGuarded } from '../../src/runtime/hook-guard.js';
-import { FAKE_MINIONS, HAS_COREUTILS_TIMEOUT, runHookCommand, withHangGuard } from '../helpers.js';
+import { FAKE_MINIONS, hasCoreutilsTimeout, runHookCommand, withHangGuard } from '../helpers.js';
 
 // Tester (task-2.5): adversarial probes of the shell wrappers around the fail-closed PreToolUse hooks.
 // Claude Code blocks a PreToolUse call only on exit 2 (stdout JSON is ignored then); any other non-zero
@@ -21,7 +21,7 @@ const cases = [
 // task-4: every probe runs under both hang guards; coreutils only where runHookCommand's PATH has `timeout`.
 const guards = [
   { guard: 'perl' as const, skip: false },
-  { guard: 'coreutils' as const, skip: !HAS_COREUTILS_TIMEOUT },
+  { guard: 'coreutils' as const, skip: !hasCoreutilsTimeout() },
 ];
 const guarded = guards.flatMap((g) => cases.map((c) => ({ ...c, guard: g.guard, skip: g.skip, command: withHangGuard(c.command, { guard: g.guard }) })));
 
