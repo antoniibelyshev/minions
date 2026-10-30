@@ -376,12 +376,15 @@ export function telegramPluginCheck(tg: ReturnType<typeof telegramDoctorCheck>, 
  * telegram.plugin, telegram.access and telegram.poller from the runtime. Returns the probe-only plugin
  * check: channel readiness follows the probe, not the task-52 load warning.
  */
-async function telegramRuntimeChecks(ex: (args: string[]) => Promise<{ code: number; stdout: string; stderr: string }>, wantsTelegram: boolean, checks: Check[]): Promise<Check> {
+async function telegramRuntimeChecks(ex: (args: string[]) => Promise<{ code: number; stdout: string; stderr: string }>, wantsTelegram: boolean, checks: Check[], opts: { host?: boolean } = {}): Promise<Check> {
   const tg = telegramDoctorCheck(await ex(['minions', 'telegram', 'probe', '--json']));
   const status = wantsTelegram ? await ex(['minions', 'telegram', 'status', '--json']) : null;
-  checks.push(telegramPluginCheck(tg, status));
+  // Host runtime (task-6): the probe checks the minions channel server, so the check is telegram.server and the
+  // task-52 plugin load warning does not apply.
+  const name = opts.host ? 'telegram.server' : 'telegram.plugin';
+  checks.push(opts.host ? { name, status: tg.status, detail: tg.detail, ...(tg.hint ? { hint: tg.hint } : {}) } : telegramPluginCheck(tg, status));
   if (status) { checks.push(telegramAccessCheck(status)); const pc = telegramPollerCheck(status); if (pc) checks.push(pc); }
-  return { name: 'telegram.plugin', status: tg.status, detail: tg.detail, ...(tg.hint ? { hint: tg.hint } : {}) };
+  return { name, status: tg.status, detail: tg.detail, ...(tg.hint ? { hint: tg.hint } : {}) };
 }
 
 /**
@@ -401,19 +404,19 @@ export function setupGapsCheck(config: Pick<MinionsConfig, 'verification' | 'com
 }
 
 /** Overall Telegram readiness from the channel resolution. Never 'fail': terminal is the baseline. */
-export function telegramReadiness(res: ChannelResolution, tgPlugin: Check | undefined, token: TelegramCredentialStatus['state']): Check {
+export function telegramReadiness(res: ChannelResolution, tgPlugin: Check | undefined, token: TelegramCredentialStatus['state'], runtime: 'docker' | 'host' = 'docker'): Check {
   const name = 'telegram';
+  const host = runtime === 'host';
   if (res.configured === 'terminal') return { name, status: 'ok', detail: 'terminal mode (Telegram not selected)' };
   if (!res.wantsTelegram) return { name, status: 'ok', detail: `auto: terminal mode (${res.reason})` };
   switch (res.cause) {
-    case 'host-runtime': return { name, status: 'unavailable', detail: `unavailable: ${res.reason}; the coordinator runs terminal-only`, hint: 'Switch with `minions runtime set docker`, or `minions channel set terminal`.' };
     case 'network-none': return { name, status: 'unavailable', detail: 'unavailable: container.network is none; the coordinator runs terminal-only' };
     case 'no-token': case 'invalid-token':
       return { name, status: 'warn', detail: `${token === 'missing' ? 'missing' : 'invalid'}: bot token ${token}; the coordinator runs terminal-only`, hint: 'Run `minions auth telegram`.' };
-    case 'unchecked': return { name, status: 'warn', detail: 'unknown: bot token stored; plugin availability not checked (container not running)', hint: 'Run `minions start`, then rerun doctor.' };
+    case 'unchecked': return { name, status: 'warn', detail: host ? 'unknown: bot token stored; the minions channel server was not checked (host runtime not prepared)' : 'unknown: bot token stored; plugin availability not checked (container not running)', hint: 'Run `minions start`, then rerun doctor.' };
     case 'plugin-unavailable': case 'probe-not-run':
       return { name, status: 'unavailable', detail: `unavailable: ${tgPlugin?.detail ?? res.reason}; the coordinator runs terminal-only`, ...(tgPlugin?.hint ? { hint: tgPlugin.hint } : {}) };
-    default: return { name, status: 'ok', detail: `ok: bot token stored and the official plugin is available${res.configured === 'auto' ? ' (communication.channel auto)' : ''} (see telegram.access for pairing)` };
+    default: return { name, status: 'ok', detail: `ok: bot token stored and ${host ? 'the minions channel server is available (host runtime)' : 'the official plugin is available'}${res.configured === 'auto' ? ' (communication.channel auto)' : ''} (see telegram.access for pairing)` };
   }
 }
 
@@ -473,7 +476,7 @@ async function hostRuntimeChecks(project: ProjectJson, auth: ClaudeAuth, baseUrl
     guard.code === 0 ? undefined : 'Install perl or coreutils (`brew install coreutils` provides gtimeout; link it as `timeout` on PATH).');
   await worktreesDirCheck(host.paths.repo, add);
   if (!(await host.prepared())) {
-    for (const n of ['claude.capabilities', 'telegram.plugin']) add(n, 'warn', 'skipped: host runtime not prepared yet', 'Run `minions start --no-attach`.');
+    for (const n of ['claude.capabilities', 'telegram.server']) add(n, 'warn', 'skipped: host runtime not prepared yet', 'Run `minions start --no-attach`.');
     return undefined;
   }
   await prepareHostRuntime(project).catch(() => undefined);
@@ -481,7 +484,7 @@ async function hostRuntimeChecks(project: ProjectJson, auth: ClaudeAuth, baseUrl
   const probe = await ex(['minions', 'coordinator', '--probe', '--json']);
   if (wantsIntegration) checks.push(...integrationDoctorChecks(await ex(['minions', 'status', '--json'])));
   add('claude.capabilities', probe.code === 0 ? 'ok' : 'fail', probe.code === 0 ? 'Claude Code supports the coordinator launch flags; launch command resolves; sandbox settings applied' : `coordinator probe failed (exit ${probe.code}): ${short(probe.stderr || probe.stdout)}`);
-  return telegramRuntimeChecks(ex, wantsTelegram, checks);
+  return telegramRuntimeChecks(ex, wantsTelegram, checks, { host: true });
 }
 
 /**
@@ -778,7 +781,7 @@ export async function runDoctor(opts: {
       const probe = tgPlugin ? { available: tgPlugin.status === 'ok', summary: tgPlugin.detail, items: [] } : undefined;
       const res = resolveChannel(channel, { ...facts, probe });
       add('communication.channel', 'ok', `configured ${res.configured}, effective ${res.effective}${res.cause === 'unchecked' ? ' (predicted)' : ''}: ${res.reason}`);
-      checks.push(telegramReadiness(res, tgPlugin, tgCred.state));
+      checks.push(telegramReadiness(res, tgPlugin, tgCred.state, facts.runtime));
     }
     if (config) checks.push(setupGapsCheck(config, { onGitHub: github.onGitHub, githubCredential: github.credential, telegramToken: tgCred.state }));
   } catch (e) {
