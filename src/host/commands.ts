@@ -29,7 +29,7 @@ import { projectForPath } from './registry.js';
 import { composeTarget, exportRepo, exportState, importRepo, importState, inspectStateBackup, type TransferTarget } from './transfer.js';
 import { HOST_RUNTIME_WARNING, HostRuntime, RUNTIMES, prepareHostRuntime, requireHostTools, runtimeOf, type RuntimeKind } from './runtime.js';
 import { registerRuntime } from './runtime-cli.js';
-import { HOST_CHANNEL_WARNING, formatChannelSet, hostChannel, offerAutoChannel, registerChannel } from './channel-cli.js';
+import { HOST_CHANNEL_NOTE, formatChannelSet, hostChannel, offerAutoChannel, registerChannel } from './channel-cli.js';
 import { formatChannel } from '../telegram/channel.js';
 import { githubStartHint, registerGithubSetup } from './github-setup.js';
 import { formatUninstall, runUninstall } from './uninstall.js';
@@ -205,9 +205,9 @@ async function startHost(json: boolean, o: { attach: boolean }): Promise<void> {
   }
   const hint = await githubStartHint(project, config);
   if (hint) say(json, hint);
-  // Telegram intended (telegram, or auto with a stored token) but the host runtime cannot run it.
+  // Telegram intended (telegram, or auto with a stored token): the minions channel server (task-6).
   const channel = await hostChannel(project, config);
-  if (channel.wantsTelegram) say(json, `warning: ${HOST_CHANNEL_WARNING}`);
+  if (channel.wantsTelegram) say(json, `note: ${HOST_CHANNEL_NOTE}`);
   const attach = o.attach && !json && !!process.stdin.isTTY && !!process.stdout.isTTY;
   const sync = await host.exec(['minions', 'coordinator', 'sync', '--json', ...(!attach && channel.wantsTelegram ? ['--start-detached'] : [])], { allowFailure: true, timeoutMs: 60_000 });
   let coordinator: unknown = null;
@@ -779,13 +779,17 @@ export function register(program: Command): void {
         ...r.warnings.map((w) => `warning: ${w}`),
         applied ? 'Applied to the running container (controlled coordinator restart when needed).'
           : needsRestart ? 'The running container has no secrets mount (created before this feature); run `minions start` to recreate it so the token becomes visible.'
-            : `It is mounted read-only at ${CONTAINER.telegramTokenFile} on the next \`minions start\`.`,
+            : runtimeOf(project) === 'host'
+              ? 'The host runtime copies it for the minions channel server (only that process reads it) on the next `minions start` (`minions down && minions start` when running).'
+              : `It is mounted read-only at ${CONTAINER.telegramTokenFile} on the next \`minions start\`.`,
         ...(channel.result ? [formatChannelSet(channel.result)] : []),
         resolved ? `communication.channel: ${formatChannel(resolved)}` : '',
         ...(channel.hint ? [`hint: ${channel.hint}`] : []),
         ...(resolved?.effective === 'telegram' ? [
           ...(channel.result ? [] : ['Start (or restart) with Telegram: `minions down && minions start` (installs the plugin and relaunches the coordinator).']),
-          'Then pair in the coordinator terminal: DM your bot, type /telegram:access pair <code>, then /telegram:access policy allowlist.',
+          runtimeOf(project) === 'host'
+            ? 'Then pair in a terminal on the host: DM your bot, run `minions telegram access pair <code>`, then `minions telegram access policy allowlist`.'
+            : 'Then pair in the coordinator terminal: DM your bot, type /telegram:access pair <code>, then /telegram:access policy allowlist.',
         ] : []),
       ].filter(Boolean).join('\n') });
     }));

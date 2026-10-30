@@ -21,9 +21,24 @@ const maxWorkers = Number(process.env.MINIONS_TEST_MAX_WORKERS) || 4;
 process.env.BUN_JSC_useConcurrentJIT ??= '0';
 process.env.UV_THREADPOOL_SIZE ??= '2';
 if (!/--v8-pool-size/.test(process.env.NODE_OPTIONS ?? '')) process.env.NODE_OPTIONS = `${process.env.NODE_OPTIONS ?? ''} --v8-pool-size=1`.trim();
-// A worker of a coordinator session inherits MINIONS_SESSION (task-57 phase 6), which scopes claims, context
-// resets and hooks to that session; the suite runs as the single coordinator unless a test sets it itself.
-delete process.env.MINIONS_SESSION;
+// Hermetic MINIONS_* environment (task-5). A worker or coordinator runs `npm test` with its runtime's
+// MINIONS_* set: MINIONS_SESSION (task-57 phase 6) scopes claims, context resets and hooks to that session;
+// MINIONS_RUNTIME=host flips the runtime the code under test detects; MINIONS_HOME, MINIONS_STATE_DIR,
+// MINIONS_CONFIG, MINIONS_WORKSPACE and friends point at the live install. Every test that needs one sets it
+// itself, so the suite starts with none of them. Kept: the switches that only steer the suite (MINIONS_TEST_*,
+// MINIONS_DOCKER_TESTS, MINIONS_SANDBOX_TEST_BIN, MINIONS_DEBUG, and MINIONS_LIVE_* outside a worker lease,
+// whose live runs only the coordinator starts).
+const KEEP_ENV = /^MINIONS_(TEST_.+|DOCKER_TESTS|SANDBOX_TEST_BIN|DEBUG)$/;
+const inWorker = !!process.env.MINIONS_WORKER_LEASE;
+for (const name of Object.keys(process.env)) {
+  if (!name.startsWith('MINIONS_') || KEEP_ENV.test(name)) continue;
+  if (!inWorker && /^MINIONS_LIVE_/.test(name)) continue;
+  delete process.env[name];
+}
+// Tokens go to the 0600 file store under the test's MINIONS_HOME, never the user's login Keychain or keyring: the
+// host-wide items (minions.manager, ...) have a fixed account, so a macOS run of setup overwrote the real manager
+// token, and an isolated HOME (the integration gate) made the write fail. Tests of the other stores set it themselves.
+process.env.MINIONS_CREDENTIAL_STORE = 'file';
 
 /**
  * Two tiers (task-137.1), as vitest projects: `unit` (no subprocesses, git repos or network; enforced by

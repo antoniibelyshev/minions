@@ -15,7 +15,7 @@ import { scanShell } from '../../src/runtime/shell-scan.js';
 import { bashStateReference, protectedStatePath, resolveReal, stateGuard } from '../../src/runtime/state-guard.js';
 import { containerStateDenies, coordinatorSettings } from '../../src/runtime/coordinator.js';
 import { runtimePaths } from '../../src/runtime/paths.js';
-import { defaults, FAKE_MINIONS, runHookCommand } from '../helpers.js';
+import { defaults, FAKE_MINIONS, runHookCommand, shq } from '../helpers.js';
 
 const tmp = mkdtempSync(join(tmpdir(), 'minions-state-guard-'));
 afterAll(() => rmSync(tmp, { recursive: true, force: true }));
@@ -103,11 +103,22 @@ describe('bashStateReference', () => {
   });
 
   it('host layout: the state dir by full path or ~, but not its scratch dir or caches', () => {
-    expect(bashStateReference(`sqlite3 ${state}/minions.db`, host)).toBe(`${state}/minions.db`);
+    expect(bashStateReference(`sqlite3 ${shq(`${state}/minions.db`)}`, host)).toBe(`${state}/minions.db`);
     expect(bashStateReference(`cat '${state}/briefs/lease-1.json'`, host)).not.toBeNull();
     expect(bashStateReference('cat ~/p/state/minions.db', stateGuard({ state: '/home/u/p/state', tmp: '/home/u/p/state/cache/tmp' }), '/home/u')).toBe('~/p/state/minions.db');
-    expect(bashStateReference(`TMPDIR=${state}/cache/tmp/leases/lease-1 npm test`, host)).toBeNull();
-    expect(bashStateReference(`npm_config_cache=${state}/cache/npm npm ci`, host)).toBeNull();
+    expect(bashStateReference(`TMPDIR=${shq(`${state}/cache/tmp/leases/lease-1`)} npm test`, host)).toBeNull();
+    expect(bashStateReference(`npm_config_cache=${shq(`${state}/cache/npm`)} npm ci`, host)).toBeNull();
+  });
+
+  it('host layout with a space in the state dir (macOS ~/Library/Application Support): full-path references are seen', () => {
+    const s = '/Users/u/Library/Application Support/Minions/projects/p/host/state';
+    const g = stateGuard({ state: s, tmp: `${s}/cache/tmp` });
+    expect(bashStateReference(`sqlite3 '${s}/minions.db' .dump`, g)).toBe(`${s}/minions.db`);
+    expect(bashStateReference(`cat "${s}/briefs/lease-1.json"`, g)).toBe(`${s}/briefs/lease-1.json`);
+    expect(bashStateReference(`ls ${s}`, g)).toBe(s);
+    expect(bashStateReference(`TMPDIR='${s}/cache/tmp/leases/lease-1' npm test`, g)).toBeNull();
+    expect(bashStateReference(`cat '${s}ful/x'`, g)).toBeNull();
+    expect(bashStateReference(`cat '/x${s}/minions.db'`, g)).toBeNull();
   });
 });
 
@@ -124,20 +135,20 @@ describe('exempt subtrees lead nowhere into the state (QA attempt 2)', () => {
     symlinkSync('../../backlog', join(state, 'cache', 'tmp', 'bl-sym'));
     symlinkSync('../minions.db', join(state, 'cache', 'db-rel'));
     for (const p of [join(state, 'cache', 'tmp', 'db-sym'), join(state, 'cache', 'tmp', 'bl-sym', 'backlog', 'task-1.md'), join(state, 'cache', 'db-rel')]) {
-      expect(bashStateReference(`sqlite3 ${p} .dump`, host), p).toBe(p);
+      expect(bashStateReference(`sqlite3 ${shq(p)} .dump`, host), p).toBe(p);
       expect(denied(preFileHook(file('Write', { file_path: p, content: 'x' }), host)), p).toBe(true);
     }
     // A link inside the exempt tree that stays there is fine.
     writeFileSync(join(state, 'cache', 'tmp', 'plain'), '');
     symlinkSync('plain', join(state, 'cache', 'tmp', 'plain-sym'));
-    expect(bashStateReference(`cat ${join(state, 'cache', 'tmp', 'plain-sym')}`, host)).toBeNull();
+    expect(bashStateReference(`cat ${shq(join(state, 'cache', 'tmp', 'plain-sym'))}`, host)).toBeNull();
   });
 
   it('a hardlink to a state file is refused, in the scratch dir (Bash and file tools) and in the worktree (file tools)', () => {
     linkSync(join(state, 'minions.db'), join(state, 'cache', 'tmp', 'db-hard'));
     writeFileSync(join(state, 'backlog', 'backlog', 'task-1.md'), '# task-1');
     linkSync(join(state, 'backlog', 'backlog', 'task-1.md'), join(worktree, 'task-hard.md'));
-    expect(bashStateReference(`sqlite3 ${join(state, 'cache', 'tmp', 'db-hard')}`, host)).not.toBeNull();
+    expect(bashStateReference(`sqlite3 ${shq(join(state, 'cache', 'tmp', 'db-hard'))}`, host)).not.toBeNull();
     expect(denied(preFileHook(file('Write', { file_path: join(state, 'cache', 'tmp', 'db-hard'), content: 'x' }), host))).toBe(true);
     expect(denied(preFileHook(file('Edit', { file_path: 'task-hard.md', old_string: 'a', new_string: 'b' }), host))).toBe(true);
     // Two links to a file outside the state are no state file.
@@ -317,7 +328,7 @@ describe('workerMinionsCommand (worker allowlist of minions commands)', () => {
 describe('preBashHook: a relative MINIONS_STATE_DIR resolves against the input cwd (task-92)', () => {
   it('a relative link in the worktree to the state dir is no redirect; an absolute scratch dir still is', () => {
     symlinkSync(state, join(worktree, 'state-link'));
-    const run = (dir: string) => preBashHook(bash(`MINIONS_STATE_DIR=${dir} minions backlog update task-1 --pr-url x`, { ...sub, cwd: worktree }), host);
+    const run = (dir: string) => preBashHook(bash(`MINIONS_STATE_DIR=${shq(dir)} minions backlog update task-1 --pr-url x`, { ...sub, cwd: worktree }), host);
     expect(denied(run('./state-link'))).toBe(true);
     expect(denied(run('state-link/'))).toBe(true);
     expect(denied(run(join(tmp, 'scratch', 'state')))).toBe(false);
@@ -388,7 +399,7 @@ describe('preFileHook', () => {
       expect(denied(await runHook('pre-file', load, '{broken'))).toBe(true);
       expect(denied(await runHook('pre-file', load, JSON.stringify(file('Write', { file_path: join(state, 'minions.db'), content: '' }))))).toBe(true);
       expect((await runHook('pre-file', load, JSON.stringify(file('Write', { file_path: join(worktree, 'x'), content: '' })))).stdout).toBeUndefined();
-      expect(denied(await runHook('pre-bash', load, JSON.stringify(bash(`sqlite3 ${state}/minions.db`, sub))))).toBe(true);
+      expect(denied(await runHook('pre-bash', load, JSON.stringify(bash(`sqlite3 ${shq(`${state}/minions.db`)}`, sub))))).toBe(true);
     } finally { vi.unstubAllEnvs(); }
   });
 });
@@ -418,7 +429,8 @@ describe('the plugin hooks.json file-tool and Bash entries', () => {
   it('read tools and Bash: node starts for a subagent call naming the state dir, and fails closed then', () => {
     const subRead = JSON.stringify(file('Read', { file_path: '/state/briefs/lease-1.json' }));
     expect(runHookCommand(PRE_FILE_READ_HOOK_COMMAND, null, subRead).status).toBe(2);
-    expect(runHookCommand(PRE_FILE_READ_HOOK_COMMAND, null, JSON.stringify(file('Read', { file_path: join(worktree, 'a.ts') })))).toMatchObject({ status: 0, stdout: '' });
+    // A fixed path and cwd: the temp worktree can sit under a dir named state (the host scratch dir is <state>/cache/tmp).
+    expect(runHookCommand(PRE_FILE_READ_HOOK_COMMAND, null, JSON.stringify(file('Read', { file_path: '/workspace/worktrees/t/a.ts' }, { ...sub, cwd: '/workspace/worktrees/t' })))).toMatchObject({ status: 0, stdout: '' });
     expect(runHookCommand(PRE_BASH_HOOK_COMMAND, null, JSON.stringify(bash('sqlite3 /state/minions.db .dump', sub))).status).toBe(2);
     expect(runHookCommand(PRE_BASH_HOOK_COMMAND, null, JSON.stringify(bash('ls "$MINIONS_STATE_DIR"', sub))).status).toBe(2);
     expect(runHookCommand(PRE_BASH_HOOK_COMMAND, null, JSON.stringify(bash('sqlite3 /state/minions.db .dump')))).toMatchObject({ status: 0, stdout: '' });

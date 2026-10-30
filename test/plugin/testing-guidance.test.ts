@@ -93,3 +93,24 @@ describe('risk-based testing in the generated plugin', () => {
     expect(coord).toContain('`minions backlog update <taskId> --expected-version <v> --label needs-qa` (`<v>`: the `version` from `minions backlog show <taskId> --json`;');
   });
 });
+
+describe('minimal, in-scope changes in the generated plugin', () => {
+  it('engineer and engineer-deep make only the changes the acceptance criteria need', async () => {
+    const read = await gen();
+    for (const f of ['agents/engineer.md', 'agents/engineer-deep.md']) {
+      const eng = await read(f);
+      expect(eng, f).toMatch(/Change only what the acceptance criteria need: no unrequested features, options, abstractions, refactors, renames, reformatting or drive-by fixes, and touch only the files the task needs/);
+      expect(eng, f).toMatch(/Prefer the smallest diff that meets the criteria; report anything else worth doing in `findings` instead of doing it/);
+    }
+  });
+
+  it('reviewer treats scope creep as a requested change, not a nit', async () => {
+    const rev = await (await gen())('agents/reviewer.md');
+    expect(rev).toMatch(/Scope creep is a requested change, not a nit: .*request changes and ask the engineer to drop them/);
+  });
+
+  it('coordinator worker briefs name what is out of scope', async () => {
+    const coord = await (await gen())('coordinator.md');
+    expect(coord).toMatch(/\*\*Worker briefs\.\*\*[^\n]*Name what is out of scope, so engineers change only what the task needs/);
+  });
+});

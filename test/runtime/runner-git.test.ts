@@ -6,6 +6,7 @@ import { describe, expect, it } from 'vitest';
 import { runnerGit, runnerGitArgv, runnerGitEnv } from '../../src/runtime/git-hardening.js';
 import { cloneConfigTemplate } from '../../src/runtime/runner/repo.js';
 import { gitSync, initRepo, tmp } from './fixtures.js';
+import { shq } from '../helpers.js';
 
 const pairs = (argv: string[]) => argv.flatMap((a, i) => (a === '-c' ? [argv[i + 1]!] : []));
 
@@ -51,12 +52,13 @@ describe('runnerGit against a planted repository config', () => {
     initRepo(repo);
     const marker = join(root, 'MARKER');
     const evil = join(root, 'evil.sh');
-    writeFileSync(evil, `#!/bin/sh\necho ran >> ${marker}\ncat\n`, { mode: 0o755 });
+    writeFileSync(evil, `#!/bin/sh\necho ran >> ${shq(marker)}\ncat\n`, { mode: 0o755 });
     mkdirSync(join(root, 'hooks'));
-    writeFileSync(join(root, 'hooks', 'pre-commit'), `#!/bin/sh\necho ran >> ${marker}\n`, { mode: 0o755 });
-    gitSync(repo, 'config', 'core.fsmonitor', evil);
+    writeFileSync(join(root, 'hooks', 'pre-commit'), `#!/bin/sh\necho ran >> ${shq(marker)}\n`, { mode: 0o755 });
+    // git runs these through sh: the temp path is quoted (a host TMPDIR can contain a space).
+    gitSync(repo, 'config', 'core.fsmonitor', shq(evil));
     gitSync(repo, 'config', 'core.hooksPath', join(root, 'hooks'));
-    gitSync(repo, 'config', 'filter.evil.clean', evil);
+    gitSync(repo, 'config', 'filter.evil.clean', shq(evil));
     writeFileSync(join(repo, '.gitattributes'), '* filter=evil\n');
     writeFileSync(join(repo, 'f.txt'), 'x\n');
     const globalConfig = join(root, 'gitconfig');

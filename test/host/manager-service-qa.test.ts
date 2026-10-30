@@ -25,8 +25,15 @@ type RunResult = import('../../src/core/exec.js').RunResult;
 type ServiceHost = import('../../src/host/manager-service.js').ServiceHost;
 
 let env: ReturnType<typeof withHome>;
-beforeEach(() => { env = withHome(); });
-afterEach(() => env.cleanup());
+// The file store: setup stores a manager token, and on macOS the default backend is the user's real Keychain
+// (`security`), which fails or blocks on a prompt under another HOME (the integration gate) and must not be
+// written by tests anyway.
+let prevStore: string | undefined;
+beforeEach(() => { env = withHome(); prevStore = process.env.MINIONS_CREDENTIAL_STORE; process.env.MINIONS_CREDENTIAL_STORE = 'file'; });
+afterEach(() => {
+  if (prevStore === undefined) delete process.env.MINIONS_CREDENTIAL_STORE; else process.env.MINIONS_CREDENTIAL_STORE = prevStore;
+  env.cleanup();
+});
 
 const PROGRAM = ['/usr/bin/env', 'node', '/opt/minions/dist/cli.js', 'manager', 'run'];
 
