@@ -144,6 +144,23 @@ describe('claim worktrees (engineer and review) with .git/worktrees', () => {
     expect(existsSync(join(layout.repo, '.git', 'worktrees', 'task-1-x'))).toBe(true);
   });
 
+  it('host runtime: a claim with no .git/worktrees (fresh clone, or pruned after the last worktree) creates it, then engineer and review worktrees', async () => {
+    const layout = seeded();
+    expect(await hostWorktreesDirState(layout.repo)).toBe('missing');
+    process.env.MINIONS_RUNTIME = 'host';
+    const b = await ensureBranchWorktree(layout, 'task-2-y', 'main');
+    const r = await ensureReviewWorktree(layout, 'task-2-y', b.head);
+    expect(existsSync(join(b.worktree, 'a.txt'))).toBe(true);
+    expect(existsSync(join(r.worktree, 'a.txt'))).toBe(true);
+    // git drops the empty .git/worktrees when the last worktree goes; the next claim recreates it.
+    git(layout.repo, 'worktree', 'remove', r.worktree);
+    git(layout.repo, 'worktree', 'remove', b.worktree);
+    expect(await hostWorktreesDirState(layout.repo)).toBe('missing');
+    const again = await ensureBranchWorktree(layout, 'task-2-y', 'main');
+    expect(again.created).toBe(true);
+    expect(await hostWorktreesDirState(layout.repo)).toBe('ok');
+  });
+
   it.skipIf(process.getuid?.() === 0)('host runtime: a .git/worktrees the sandbox cannot create fails with a clear hint, not git\'s error', async () => {
     const layout = seeded();
     const gitDir = join(layout.repo, '.git');
