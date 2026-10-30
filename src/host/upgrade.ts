@@ -28,11 +28,18 @@
 //   fast-forwards a host branch to the container's base branch, and an installed CLI that differs from
 //   the project's minions checkout is rebuilt/reinstalled (the rest then runs on the new CLI) or the
 //   exact command is printed and the upgrade stops before any container step.
+// - Host runtime (opts.host, task-7): the same source phase, preflight, pause, drain, files, secrets, resume and
+//   coordinator steps run through the project's minions shim instead of `docker compose exec`. There is no image,
+//   container or origin step: in their place the `shim` step regenerates the minions and gh shims for the installed
+//   CLI (prepareHostRuntime), and it is the point of no return the recreate is for Docker. The preflight refuses a
+//   CLI that lives in (or links into) the agent-writable host runtime dirs: the shims run it outside the sandbox.
+//   The coordinator restart (no --force) is refused while a worker lease is active, so it runs only after the drain.
 import { rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { MinionsError } from '../core/errors.js';
 import { readJsonIfExists, writeJson } from '../core/fsutil.js';
 import { projectPaths } from '../core/paths.js';
+import type { RunOptions, RunResult } from '../core/exec.js';
 import { materializeSecrets, upClearingSecretsOnFailure } from './credentials.js';
 import { buildFingerprint, ensureImage, imageBuildLabel, packageRoot, type Compose, type Runner } from './docker.js';
 import { parseEnvelope, type ImportResult } from './transfer.js';
@@ -48,8 +55,24 @@ export function upgradeTimeout(raw: string | undefined, now: boolean): number {
 }
 export const UPGRADE_RELEASE_REASON = 'interrupted by minions upgrade --now (container recreated); re-dispatch on recovery';
 
-export type UpgradeStepId = 'sync' | 'cli' | 'preflight' | 'pause' | 'drain' | 'files' | 'image' | 'secrets' | 'recreate' | 'workspace' | 'origin' | 'resume' | 'coordinator';
-export const UPGRADE_STEPS: readonly UpgradeStepId[] = ['sync', 'cli', 'preflight', 'pause', 'drain', 'files', 'image', 'secrets', 'recreate', 'workspace', 'origin', 'resume', 'coordinator'];
+export type UpgradeStepId = 'sync' | 'cli' | 'preflight' | 'pause' | 'drain' | 'files' | 'image' | 'secrets' | 'recreate' | 'shim' | 'workspace' | 'origin' | 'resume' | 'coordinator';
+export const UPGRADE_STEPS: readonly UpgradeStepId[] = ['sync', 'cli', 'preflight', 'pause', 'drain', 'files', 'image', 'secrets', 'recreate', 'shim', 'workspace', 'origin', 'resume', 'coordinator'];
+/** The steps of a host-runtime upgrade (no image, container or origin step; `shim` takes the recreate's place). */
+export const HOST_UPGRADE_STEPS: readonly UpgradeStepId[] = ['sync', 'cli', 'preflight', 'pause', 'drain', 'files', 'secrets', 'shim', 'workspace', 'resume', 'coordinator'];
+
+/** What a host-runtime upgrade drives instead of the container (src/host/upgrade-host.ts builds it; faked in tests). */
+export interface HostUpgradeTarget {
+  /** Runs `minions ...` through the project's minions shim (HostRuntime.exec). */
+  exec: (args: string[], opts?: RunOptions) => Promise<RunResult>;
+  /** The host runtime was prepared by `minions start` (its shim exists), so its runtime DB is reachable. */
+  prepared: () => Promise<boolean>;
+  /** Why the CLI the shims would run is unsafe (inside or linked into the agent-writable dirs); null when it is safe. */
+  cliProblem: () => Promise<string | null>;
+  /** The dry-run detail of the shim step. */
+  shimPlan: string;
+  /** Regenerates the minions and gh shims for the installed CLI; returns the step detail. */
+  regenerate: () => Promise<string>;
+}
 export type UpgradeStepStatus = 'done' | 'skipped' | 'failed' | 'planned';
 export interface UpgradeStep { id: UpgradeStepId; status: UpgradeStepStatus; detail: string }
 
@@ -79,7 +102,10 @@ export interface UpgradeResult {
 export interface UpgradeOptions {
   projectId: string;
   imageTag: string;
-  compose: Compose;
+  /** Docker runtime: the project container. Exactly one of compose and host is given. */
+  compose?: Compose;
+  /** Host runtime: the shims, instead of a container (task-7). */
+  host?: HostUpgradeTarget;
   /** Seconds to wait for active leases to end (0: do not wait). */
   timeoutSec: number;
   /** Release the leases still active when the wait ends instead of aborting. */
@@ -93,8 +119,8 @@ export interface UpgradeOptions {
   refresh: () => Promise<string[]>;
   /** After the refresh: how the plugin on disk differs from the installed package (null: it matches). */
   checkPlugin?: () => Promise<string | null>;
-  /** Re-runs the repository import, which (re)configures origin; an existing clone is only refreshed. */
-  importRepo: () => Promise<ImportResult>;
+  /** Re-runs the repository import, which (re)configures origin; an existing clone is only refreshed (Docker only). */
+  importRepo?: () => Promise<ImportResult>;
   materialize?: () => Promise<unknown>;
   log?: (msg: string) => void;
   sleep?: (ms: number) => Promise<void>;
@@ -179,7 +205,12 @@ function alreadyEnded(r: { stdout: string; stderr: string }): boolean {
 }
 
 export async function runUpgrade(opts: UpgradeOptions): Promise<UpgradeResult> {
-  const { compose, projectId } = opts;
+  const { projectId } = opts;
+  const host = opts.host ?? null;
+  const compose = opts.compose ?? null;
+  if (!host === !compose) throw new MinionsError('INTERNAL', 'runUpgrade needs exactly one of compose (Docker) and host (host runtime).');
+  const exec = (args: string[], o: RunOptions): Promise<RunResult> => (host ? host.exec(args, o) : compose!.exec(args, o));
+  const where = host ? 'the host runtime' : 'the container';
   const log = opts.log ?? (() => undefined);
   const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
   const clock = opts.clock ?? Date.now;
@@ -208,27 +239,33 @@ export async function runUpgrade(opts: UpgradeOptions): Promise<UpgradeResult> {
 
   // Container-side status: pause state and active leases (runtime DB in the state volume).
   const status = async (): Promise<RuntimeStatus> => {
-    const r = await compose.exec(['minions', 'status', '--json'], { allowFailure: true, timeoutMs: 60_000 });
-    if (r.code !== 0 && !r.stdout.trim()) throw new MinionsError('INTERNAL', `status failed in the container: ${lastLine(r)}`);
+    const r = await exec(['minions', 'status', '--json'], { allowFailure: true, timeoutMs: 60_000 });
+    if (r.code !== 0 && !r.stdout.trim()) throw new MinionsError('INTERNAL', `status failed in ${where}: ${lastLine(r)}`);
     const d = parseEnvelope<RuntimeStatus>(r.stdout, 'status');
     return { paused: d.paused, activeLeases: d.activeLeases ?? [], ...(d.pauseChanges ? { pauseChanges: d.pauseChanges } : {}), ...(d.draining !== undefined ? { draining: d.draining } : {}) };
   };
   const execOk = async (args: string[], what: string, timeoutMs = 120_000) => {
-    const r = await compose.exec(args, { allowFailure: true, timeoutMs });
-    if (r.code !== 0) throw new MinionsError('INTERNAL', `${what} failed in the container: ${lastLine(r)}`);
+    const r = await exec(args, { allowFailure: true, timeoutMs });
+    if (r.code !== 0) throw new MinionsError('INTERNAL', `${what} failed in ${where}: ${lastLine(r)}`);
     return r;
   };
 
   // ---- preflight (read-only) ----
-  const container = await compose.containerState();
-  const fingerprint = buildFingerprint(root);
-  const previous = await imageBuildLabel(opts.imageTag, opts.runner).catch(() => null);
-  const rebuild = previous === null || (fingerprint !== null && previous !== fingerprint);
+  // Host runtime: "running" means prepared (the shim reaches the runtime DB; the coordinator need not run).
+  const container: { state: 'running' | 'absent' | 'unknown'; reason: string } = host
+    ? (await host.prepared() ? { state: 'running', reason: 'host runtime prepared' } : { state: 'absent', reason: 'the host runtime has not been started' })
+    : await compose!.containerState();
+  const fingerprint = host ? null : buildFingerprint(root);
+  const previous = host ? null : await imageBuildLabel(opts.imageTag, opts.runner).catch(() => null);
+  const rebuild = !host && (previous === null || (fingerprint !== null && previous !== fingerprint));
+  const cliProblem = host && container.state === 'running' ? await host.cliProblem() : null;
   result.image = { tag: opts.imageTag, rebuild, fingerprint, previous };
   const marker = await readJsonIfExists<UpgradeMarker>(markerPath(projectId)).catch(() => undefined);
   let before: RuntimeStatus | null = null;
   let preflightError: string | null = null;
-  if (container.state === 'unknown') preflightError = `container state is unknown (${container.reason})`;
+  if (host && container.state !== 'running') preflightError = 'the host runtime has not been started for this project (run `minions start --no-attach` first)';
+  else if (cliProblem) preflightError = cliProblem;
+  else if (container.state === 'unknown') preflightError = `container state is unknown (${container.reason})`;
   else if (rebuild && fingerprint === null) preflightError = `the package at ${root} has no dist/cli.js; cannot build the runtime image`;
   else if (container.state === 'running') {
     try { before = await status(); } catch (e) { preflightError = `cannot read the runtime status: ${errMsg(e)}`; }
@@ -242,8 +279,8 @@ export async function runUpgrade(opts: UpgradeOptions): Promise<UpgradeResult> {
   if (opts.dryRun) {
     const p = (id: UpgradeStepId, detail: string) => step(id, 'planned', detail);
     if (preflightError) { step('preflight', 'failed', preflightError); result.ok = false; }
-    else step('preflight', 'done', `container ${container.state}; image ${rebuild ? (previous === null ? 'missing' : 'outdated') : 'current'}`);
-    if (!running) { step('pause', 'skipped', 'container not running'); step('drain', 'skipped', 'container not running'); }
+    else step('preflight', 'done', host ? 'host runtime prepared; the installed CLI is outside the agent-writable dirs' : `container ${container.state}; image ${rebuild ? (previous === null ? 'missing' : 'outdated') : 'current'}`);
+    if (!running) { step('pause', 'skipped', `${host ? 'host runtime' : 'container'} not running`); step('drain', 'skipped', `${host ? 'host runtime' : 'container'} not running`); }
     else {
       if (userPaused) step('pause', 'skipped', 'starts already paused (left paused)');
       else if (inherited) step('pause', 'skipped', 'starts still paused by an unfinished upgrade (resumed at the end)');
@@ -252,6 +289,15 @@ export async function runUpgrade(opts: UpgradeOptions): Promise<UpgradeResult> {
       p('drain', n === 0 ? 'no active leases' : opts.now && opts.timeoutSec === 0
         ? `release ${n} active lease(s) now and report them interrupted: ${before!.activeLeases.map(leaseLabel).join(', ')}`
         : `ask ${n} worker(s) to commit work in progress and return partial results, wait up to ${opts.timeoutSec}s, then ${opts.now ? 'release the rest (reported interrupted)' : 'abort and resume starts'}`);
+    }
+    if (host) {
+      p('files', 'regenerate the runtime config and plugin from the installed package');
+      p('secrets', 'materialize stored tokens into the project secrets dir');
+      p('shim', host.shimPlan);
+      p('workspace', 'minions workspace setup (through the shim)');
+      if (userPaused) step('resume', 'skipped', 'starts were paused before the upgrade; left paused'); else p('resume', 'resume new starts (minions resume --starts)');
+      p('coordinator', 'minions coordinator restart --recover (through the shim; refused while a worker lease is active, so only after the drain)');
+      return result;
     }
     p('files', 'regenerate compose.yaml, runtime config and plugin from the installed package');
     if (rebuild) p('image', `build ${opts.imageTag} (${previous === null ? 'missing' : 'fingerprint changed'})`); else step('image', 'skipped', 'fingerprint unchanged; no rebuild');
@@ -267,9 +313,9 @@ export async function runUpgrade(opts: UpgradeOptions): Promise<UpgradeResult> {
   if (preflightError) {
     step('preflight', 'failed', preflightError);
     throw new MinionsError('PRECONDITION', `Upgrade not started: ${preflightError}.`,
-      container.state === 'unknown' ? 'Check `docker compose ps` for the project, then rerun `minions upgrade`.' : 'Fix the cause and rerun `minions upgrade`.', { steps });
+      host ? 'Fix the cause and rerun `minions upgrade`.' : container.state === 'unknown' ? 'Check `docker compose ps` for the project, then rerun `minions upgrade`.' : 'Fix the cause and rerun `minions upgrade`.', { steps });
   }
-  step('preflight', 'done', `container ${container.state}; image ${rebuild ? 'needs a rebuild' : 'current'}`);
+  step('preflight', 'done', host ? 'host runtime prepared; the installed CLI is outside the agent-writable dirs' : `container ${container.state}; image ${rebuild ? 'needs a rebuild' : 'current'}`);
   // With the container down the pause state is unreadable until the recreate: the marker is checked then.
   const deferred = !running && !!marker?.pausedStarts;
   // A marker whose pause is gone or is not ours any more is stale: drop it so it cannot claim a later pause.
@@ -421,13 +467,13 @@ export async function runUpgrade(opts: UpgradeOptions): Promise<UpgradeResult> {
           const ended: LeaseInfo[] = [];
           for (const l of leases) {
             await checkpoint();
-            const r = await compose.exec(['minions', 'work', 'release', l.id, '--reason', UPGRADE_RELEASE_REASON, '--json'], { allowFailure: true, timeoutMs: 120_000 });
+            const r = await exec(['minions', 'work', 'release', l.id, '--reason', UPGRADE_RELEASE_REASON, '--json'], { allowFailure: true, timeoutMs: 120_000 });
             if (r.code === 0) { result.interrupted.push({ id: l.id, task_id: l.task_id, role: l.role }); continue; }
             // The lease ended between the last poll and its release: it finished normally, nothing to interrupt.
             if (alreadyEnded(r)) { ended.push(l); continue; }
             const done = result.interrupted.length ? `; already released (re-dispatched after the upgrade): ${result.interrupted.map(leaseLabel).join(', ')}` : '';
             step('drain', 'failed', `work release ${l.id} failed: ${lastLine(r)}${done}`);
-            await abort('drain', new MinionsError('INTERNAL', `work release ${l.id} failed in the container: ${lastLine(r)}${done}`));
+            await abort('drain', new MinionsError('INTERNAL', `work release ${l.id} failed in ${where}: ${lastLine(r)}${done}`));
           }
           const parts = [
             ...(result.interrupted.length ? [`released ${result.interrupted.length} lease(s) as interrupted: ${result.interrupted.map(leaseLabel).join(', ')}`] : []),
@@ -453,7 +499,7 @@ export async function runUpgrade(opts: UpgradeOptions): Promise<UpgradeResult> {
       step('files', 'done', `derived files regenerated${plugin}`);
       await checkpoint();
     } catch (e) { await abort('files', e); }
-    try {
+    if (!host) try {
       const built = await ensureImage(opts.imageTag, { runner: opts.runner, root, onBuild: log });
       result.image.rebuild = built;
       step('image', built ? 'done' : 'skipped', built ? `built ${opts.imageTag}` : 'fingerprint unchanged; no rebuild');
@@ -471,8 +517,14 @@ export async function runUpgrade(opts: UpgradeOptions): Promise<UpgradeResult> {
         'The container was not recreated. Check the credentials with `minions doctor` (or `minions auth github` / `minions auth telegram`), then rerun `minions upgrade`.'));
     }
     recreating = true;
-    try {
-      await upClearingSecretsOnFailure({ up: () => compose.recreate() }, projectId);
+    if (host) {
+      try { step('shim', 'done', await host.regenerate()); } catch (e) {
+        step('shim', 'failed', errMsg(e));
+        throw new MinionsError('INTERNAL', `Upgrade failed while regenerating the host runtime shims: ${errMsg(e)}`,
+          'Rerun `minions upgrade` (it also resumes the starts it paused) or `minions start --no-attach`.', { steps });
+      }
+    } else try {
+      await upClearingSecretsOnFailure({ up: () => compose!.recreate() }, projectId);
       step('recreate', 'done', 'container recreated; named volumes kept');
     } catch (e) {
       step('recreate', 'failed', errMsg(e));
@@ -485,7 +537,8 @@ export async function runUpgrade(opts: UpgradeOptions): Promise<UpgradeResult> {
       try { step(id, 'done', await fn()); } catch (e) { step(id, 'failed', errMsg(e)); result.ok = false; }
     };
     await attempt('workspace', async () => { await execOk(['minions', 'workspace', 'setup', '--json'], 'workspace setup'); return 'state layout and runtime DB checked'; });
-    await attempt('origin', async () => {
+    if (!host) await attempt('origin', async () => {
+      if (!opts.importRepo) throw new MinionsError('INTERNAL', 'no repository import given');
       const r = await opts.importRepo();
       for (const w of [...r.warnings, ...(r.container.origin?.warnings ?? [])]) log(`warning: ${w}`);
       return r.container.origin ? `origin ${r.container.origin.url} (${r.container.origin.authenticated ? 'authenticated' : 'not authenticated'})` : `${r.baseBranch} refreshed; no origin`;
@@ -505,7 +558,7 @@ export async function runUpgrade(opts: UpgradeOptions): Promise<UpgradeResult> {
     else if (drainRequested) await attempt('resume', async () => { await clearDrain(); return `drain request cleared; ${notOurs}`; });
     else step('resume', 'skipped', notOurs);
     await attempt('coordinator', async () => {
-      const r = await compose.exec(['minions', 'coordinator', 'restart', '--recover', '--json'], { allowFailure: true, timeoutMs: 120_000 });
+      const r = await exec(['minions', 'coordinator', 'restart', '--recover', '--json'], { allowFailure: true, timeoutMs: 120_000 });
       const d = parseEnvelope<{ action?: string; running?: boolean; reason?: string }>(r.stdout, 'coordinator restart');
       result.coordinator = d;
       return `${d.action ?? 'unknown'} (${d.reason ?? ''})`;

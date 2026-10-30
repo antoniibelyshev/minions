@@ -299,7 +299,14 @@ export function manualReinstallCommand(checkout: string, version: string | null)
   return `cd ${shellQuote(checkout)} && npm ci && MINIONS_BUILD_KIND=packed npm pack && npm uninstall -g minions && npm install -g ${packedTarball(version)}`;
 }
 
-export async function checkCli(opts: { checkout: string; runner?: Runner; runningRoot?: string; handoff?: boolean }): Promise<CliCheck> {
+const within = (p: string, dir: string) => { const d = real(dir) ?? dir; return p === d || p.startsWith(d.endsWith('/') ? d : `${d}/`); };
+
+/**
+ * agentWritable (host runtime): dirs agents may write. A checkout inside them is never built, and a linked install
+ * whose target is inside them is never rebuilt in place (the shims run the CLI outside the sandbox): both get the
+ * manual packed reinstall instead, which the upgrade prints and stops at.
+ */
+export async function checkCli(opts: { checkout: string; runner?: Runner; runningRoot?: string; handoff?: boolean; agentWritable?: string[] }): Promise<CliCheck> {
   const checkout = real(opts.checkout) ?? opts.checkout;
   const checkoutVersion = readJson<{ version?: string }>(join(checkout, 'package.json'))?.version ?? null;
   const checkoutSource = sourceFingerprint(checkout);
@@ -313,6 +320,11 @@ export async function checkCli(opts: { checkout: string; runner?: Runner; runnin
         : `installed source ${installed.stamp.source} != checkout ${checkoutSource}`;
   const manual = { ...base, differs, reason, action: 'manual' as const, command: manualReinstallCommand(checkout, checkoutVersion) };
   if (opts.handoff) return { ...manual, reason: `${reason}; still different after the reinstall` };
+  const writable = opts.agentWritable ?? [];
+  const unsafe = writable.find((d) => within(checkout, d) || (!!installed.realPath && within(installed.realPath, d)));
+  if (unsafe) {
+    return { ...manual, reason: `${reason}; ${within(checkout, unsafe) ? `the checkout ${checkout}` : `the global install (${installed.kind}) at ${installed.realPath}`} is inside the agent-writable ${unsafe}, so it is never built or linked: install a packed tarball from a checkout outside it` };
+  }
   if (installed.kind === 'link' && installed.realPath === checkout) {
     const deps = missingDeps(checkout);
     return { ...base, differs, reason, action: 'rebuild', command: `cd ${shellQuote(checkout)} && ${deps.length ? 'npm ci' : 'npm run build'}` };
@@ -425,6 +437,8 @@ export interface SourcePhaseOptions {
   runningRoot?: string;
   /** This process already continues an upgrade after a reinstall: never reinstall again. */
   handoff?: boolean;
+  /** Host runtime: the agent-writable dirs (see checkCli). */
+  agentWritable?: string[];
   /**
    * --rebuild-cli: the user reviewed the checkout and allows the upgrade to run its npm scripts/build
    * on the host and install the result globally. Without it the command is printed and the upgrade stops.
@@ -485,7 +499,7 @@ export async function runSourcePhase<C>(opts: SourcePhaseOptions): Promise<Sourc
       return out;
     }
   }
-  const check = () => checkCli({ checkout: opts.checkout!, runner: opts.runner, runningRoot: opts.runningRoot, handoff: opts.handoff });
+  const check = () => checkCli({ checkout: opts.checkout!, runner: opts.runner, runningRoot: opts.runningRoot, handoff: opts.handoff, agentWritable: opts.agentWritable });
   const c = out.cli = await check();
   if (!c.differs || c.action === 'manual') {
     push(cliStep(c, dryRun));
