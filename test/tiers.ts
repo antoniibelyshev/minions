@@ -98,6 +98,7 @@ export const INTEGRATION_TESTS: readonly string[] = [
   'test/runtime/digest.test.ts',
   'test/runtime/drain.test.ts',
   'test/runtime/gate-forged-remote.test.ts',
+  'test/runtime/gate-history-rewrite.test.ts',
   'test/runtime/github.test.ts',
   'test/runtime/handoff.test.ts',
   'test/runtime/harness-cli-hardening-qa.test.ts',

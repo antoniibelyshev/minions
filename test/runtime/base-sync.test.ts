@@ -8,6 +8,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { MinionsConfig } from '../../src/config/schema.js';
 import { MinionsError } from '../../src/core/errors.js';
 import { syncBaseFromOrigin } from '../../src/runtime/base-sync.js';
+import { verifiedServerBase } from '../../src/runtime/base-update.js';
 import type { GitFn } from '../../src/runtime/github.js';
 import { Scheduler } from '../../src/runtime/scheduler.js';
 import { git as realGit } from '../../src/runtime/worktree.js';
@@ -83,6 +84,63 @@ describe('pre-claim base sync (GitHub delivery)', () => {
     expect(e.db.leases({ all: true })).toHaveLength(0);
     expect(e.backlog.status('task-1')).toBe('ready');
     expect(e.db.events('task-1', 'base-sync-blocked')[0]?.data).toMatchObject({ role: 'engineer', base: 'main', code: 'CONFLICT', details: { reason: 'ahead', local } });
+  });
+
+  it('an unreachable server or an unavailable GitHub API blocks the claim with a reported error', async () => {
+    const e = originEnv();
+    e.server.url = join(e.root, 'missing.git');
+    e.backlog.add({ id: 'task-1', title: 'Offline' });
+    const err = await failure(e.sched.claim('task-1', 'engineer'));
+    expect(err.code).toBe('NETWORK_RETRYABLE');
+    expect(err.message).toMatch(/could not be read and verified.*could not be read from https:\/\/github\.com\/acme\/demo\.git.*claim was blocked/);
+    expect(e.db.leases({ all: true })).toHaveLength(0);
+    expect(e.db.events('task-1', 'base-sync-blocked')[0]?.data).toMatchObject({ details: { reason: 'fetch-failed' } });
+    e.server.url = e.bare;
+    e.server.ghDown = true;
+    const down = await failure(e.sched.claim('task-1', 'engineer'));
+    expect(down.message).toMatch(/cannot verify origin's main with the GitHub API/);
+    expect(e.db.leases({ all: true })).toHaveLength(0);
+  });
+
+  it('git and the GitHub API disagreeing about origin/main blocks the claim (CONFLICT)', async () => {
+    const e = originEnv();
+    const merged = mergeOnGithub(e, 'merged.txt');
+    // git (the seam) reaches a different repository whose main is the old base; the API reports the merge.
+    const stale = join(tmp('minions-stale-'), 'demo.git');
+    execFileSync('git', ['clone', '-q', '--bare', e.bare, stale]);
+    gitSync(stale, 'update-ref', 'refs/heads/main', e.baseSha);
+    e.server.url = stale;
+    e.backlog.add({ id: 'task-1', title: 'Mismatch' });
+    const err = await failure(e.sched.claim('task-1', 'engineer'));
+    expect(err.code).toBe('CONFLICT');
+    expect(err.message).toMatch(new RegExp(`is ${e.baseSha.slice(0, 12)} for git but ${merged.slice(0, 12)} for the GitHub API`));
+    expect(e.db.leases({ all: true })).toHaveLength(0);
+    expect(main(e)).toBe(e.baseSha);
+  });
+
+  it('verifiedServerBase cross-checks the isolated git read against the GitHub API and fails closed (task-71)', async () => {
+    const e = originEnv();
+    const origin = { https: REMOTE, repository: 'acme/demo' };
+    const check = () => verifiedServerBase({ repo: e.layout.repo, origin, base: 'main', ...e.srv });
+    expect(await check()).toEqual({ sha: e.baseSha });
+    // The API is asked first: when it is down nothing else is trusted.
+    e.server.ghDown = true;
+    expect(await check()).toMatchObject({ error: expect.stringMatching(/^cannot verify origin's main with the GitHub API \(gh api \/repos\/acme\/demo\/branches\/main failed: error connecting/) });
+    e.server.ghDown = false;
+    // git cannot read the server.
+    e.server.url = join(e.root, 'missing.git');
+    expect(await check()).toMatchObject({ error: "origin's main could not be read from https://github.com/acme/demo.git" });
+    // git and the API name different commits: the error names both and no SHA is returned.
+    const stale = join(tmp('minions-stale-'), 'demo.git');
+    execFileSync('git', ['clone', '-q', '--bare', e.bare, stale]);
+    const merged = mergeOnGithub(e, 'merged.txt');
+    e.server.url = stale;
+    const r = await check();
+    expect(r).not.toHaveProperty('sha');
+    expect(r).toMatchObject({ error: expect.stringContaining(`is ${e.baseSha.slice(0, 12)} for git but ${merged.slice(0, 12)} for the GitHub API; refusing`) });
+    // A non-SHA API answer is refused too.
+    const r2 = await verifiedServerBase({ repo: e.layout.repo, origin, base: 'main', serverUrl: () => e.bare, gh: async () => ({ code: 0, stdout: '{"commit":{"sha":"main"}}', stderr: '' }) });
+    expect(r2).toMatchObject({ error: expect.stringMatching(/returned no commit SHA/) });
   });
 
   it('a diverged base blocks the claim and is left exactly as it was', async () => {

@@ -125,6 +125,26 @@ describe('repair hand-back', () => {
     expect((await env.backlog.getTask('task-1')).status).toBe('done');
   });
 
+  it('base.merge deny (supervised): approval ends delivered and the integrator never runs', async () => {
+    const env = localEnv((c) => { c.capabilities['base.merge'] = 'deny'; });
+    env.backlog.add({ id: 'task-1', title: 'Supervised' });
+    const { r } = await approveTask(env, 'task-1');
+    expect(r.to).toBe('delivered');
+    expect(integrationRows(env.db, 'task-1')).toEqual([]);
+    expect(env.starts).toBe(0);
+  });
+
+  it('a red verification counts a repair cycle; at the limit the task goes to awaiting-human', async () => {
+    const env = localEnv((c) => { c.verification.commands = ['echo boom-from-tests; exit 3']; c.execution.maxRepairCyclesBeforeReplan = 1; });
+    env.backlog.add({ id: 'task-1', title: 'Red' });
+    const before = mainOf(env);
+    await approveTask(env, 'task-1');
+    await integrate(env);
+    expect(mainOf(env)).toBe(before);
+    expect((await env.backlog.getTask('task-1')).status).toBe('awaiting-human');
+    expect(env.backlog.notes.map((n) => n.text).join('\n')).toMatch(/integration red .*repair cycle 1, the limit 1/);
+  });
+
   it('a red verification under the limit is changes-requested with the failing command in the finding', async () => {
     const env = localEnv((c) => { c.verification.commands = ['echo boom-from-tests; exit 3']; });
     env.backlog.add({ id: 'task-1', title: 'Red' });

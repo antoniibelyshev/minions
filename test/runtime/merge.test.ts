@@ -251,6 +251,22 @@ describe('CI-gated auto-merge (mocked gh)', () => {
     expect(env.gh.merges()).toEqual([]);
   });
 
+  it('task-71: the merge gate fails closed when origin\'s base cannot be verified (git and the API disagree)', async () => {
+    const env = mergeEnv((c) => { c.capabilities['pr.merge'] = 'allow'; });
+    await deliver(env, 'task-1');
+    env.gh.pr().rollup = passing;
+    // GitHub's API reports a main that git (the seam) does not see.
+    const stale = join(tmp('minions-stale-'), 'demo.git');
+    execFileSync('git', ['clone', '-q', '--bare', env.bare, stale]);
+    commitFile(env.layout.repo, 'later.txt', 'l');
+    gitSync(env.layout.repo, 'push', '-q', env.bare, 'HEAD:refs/heads/main');
+    env.sched = new Scheduler({ db: env.db, backlog: env.backlog, config: env.config, layout: env.layout, approvalPublicKeyFile: env.keys.publicKeyFile, gh: env.gh.fn, serverUrl: () => stale });
+    const m = (await sync(env, ['task-1'])).tasks[0]!.merge!;
+    expect(m.state).not.toBe('armed');
+    expect(m.reasons.join(' ')).toMatch(/could not be verified.*for git but .* for the GitHub API/);
+    expect(env.gh.merges()).toEqual([]);
+  });
+
   it('formatSync prints the merge line with state and message', () => {
     const text = formatSync({ synced: 1, failed: 0, tasks: [{
       taskId: 'task-1', prUrl: 'https://github.com/acme/demo/pull/1', prState: 'OPEN', headSha: 'a'.repeat(40), changed: false, warnings: [],
