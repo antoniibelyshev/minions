@@ -6,7 +6,6 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { MinionsConfig } from '../../src/config/schema.js';
 import { coordinatorWrapper, type SpawnLike } from '../../src/runtime/coordinator.js';
-import { ROUTER_PROMPT } from '../../src/runtime/router-prompt.js';
 import { RuntimeDb, type SupervisorLock } from '../../src/runtime/db.js';
 import { clearDrain, requestDrain } from '../../src/runtime/drain.js';
 import { coordinatorOnlyWorkCommand } from '../../src/runtime/hooks.js';
@@ -506,13 +505,8 @@ describe('the wrapper starts the supervisor', () => {
     const sp2 = spawnStub();
     const r = await wrap(on, (cfg) => startSupervisorWatch(cfg, base({ state: () => ({ state: 'none', lock: null }), spawn: sp2.fn, timer: () => () => {} })));
     expect(r.code).toBe(0);
-    // Phase 8: the same launch as the router: its own prompt, model, tool trim and first message (isolation.test.ts).
-    const prompt = (argv: string[]) => argv[argv.indexOf('--append-system-prompt') + 1]!;
-    const mask = (calls: string[][]) => calls.map((argv) => argv.filter((x, i) => !['--append-system-prompt', '--model', '--disallowedTools', '--effort'].includes(argv[i - 1]!) && !['--model', '--disallowedTools', '--effort'].includes(x))
-      .filter((x, i, a) => !(x === '--' || a[i - 1] === '--')));
-    expect(mask(r.calls as string[][])).toEqual(mask(without.calls as string[][]));
-    expect(prompt(r.calls[0] as string[])).toBe(ROUTER_PROMPT);
-    expect(prompt(without.calls[0] as string[])).not.toContain('minions router');
+    // Sessions on without Telegram: the single coordinator's launch (the gateway needs Telegram).
+    expect(r.calls).toEqual(without.calls);
     expect(sp2.calls.map((c) => c.args)).toEqual([['coordinator', 'supervise']]);
   });
 });

@@ -19,7 +19,6 @@ import { atomicWrite, ensureRealDir } from '../core/fsutil.js';
 import { CONTAINER } from '../core/paths.js';
 import { resolveOnPath } from '../host/auth.js';
 import { generatePlugin } from '../plugin/generate.js';
-import { TELEGRAM_PLUGIN_ID } from '../telegram/probe.js';
 import { coordinatorSettings, effectivePermissionMode, runtimeAuthMethod, type HostHardening, type RuntimeAuthMethod } from './coordinator.js';
 import type { RuntimeDb } from './db.js';
 import { dispatchRunDir, workerPrompt, type LaunchInput, type WorkerExit, type WorkerHandle } from './dispatcher.js';
@@ -125,7 +124,6 @@ export async function buildWorkerCommand(i: LaunchInput, deps: WorkerLaunchDeps)
   if (mode === 'bypassPermissions') plan.settings = { ...plan.settings, permissions: {} };
   const flagSettings: Record<string, unknown> = {
     ...coordinatorSettings(cfg, { telegram: false, auth: method, host: deps.host, paths: deps.paths }),
-    enabledPlugins: { [TELEGRAM_PLUGIN_ID]: false },
   };
   const pluginDir = deps.pluginDir ? await deps.pluginDir(cfg) : await livePluginDir(cfg, deps.paths);
   const model = stage.agentModel ?? stage.suggestedModel;

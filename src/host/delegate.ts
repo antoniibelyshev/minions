@@ -8,7 +8,7 @@ import { loadProjectJson, type ProjectJson } from './project.js';
 import { projectForPath } from './registry.js';
 import { HostRuntime, prepareHostRuntime, runtimeOf } from './runtime.js';
 
-export async function delegateToRuntime(args: string[], opts: { json: boolean; cwd?: string }): Promise<number> {
+export async function delegateToRuntime(args: string[], opts: { json: boolean; cwd?: string; tty?: boolean }): Promise<number> {
   const { projectId } = await projectForPath(opts.cwd ?? process.cwd());
   const argv = ['minions', ...args];
   if (opts.json && !argv.includes('--json')) argv.push('--json');
@@ -26,7 +26,7 @@ export async function delegateToRuntime(args: string[], opts: { json: boolean; c
     throw new MinionsError('PRECONDITION', 'The project container is not running.', 'Run `minions start` (or `minions start --no-attach`) first.');
   }
   // --json stdout must stay byte-exact for parsers; the JSON emitter already escapes all control characters.
-  return compose.execInherit(argv, { tty: false, rawStdout: argv.includes('--json') });
+  return compose.execInherit(argv, { tty: !!opts.tty, rawStdout: argv.includes('--json') });
 }
 
 /** @deprecated name kept for existing callers; delegates to the configured runtime. */

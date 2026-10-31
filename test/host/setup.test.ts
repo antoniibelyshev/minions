@@ -160,8 +160,8 @@ describe('minions setup', () => {
     // Attach and pairing instructions.
     const out = formatSetup(r);
     expect(r.attach).toContain('exec app minions coordinator');
-    expect(out).toContain('/telegram:access pair <code>');
-    expect(out).toContain('/telegram:access policy allowlist');
+    expect(out).toContain('minions telegram access pair <code>');
+    expect(out).toContain('minions telegram access policy allowlist');
     expect(out).toContain('/login');
 
     // Secrets never appear in the result, its rendering, prompts, notes, or generated files.

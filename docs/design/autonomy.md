@@ -185,8 +185,8 @@ Built on the minions channel server (src/telegram/channel, task-67), which the h
 
 ## Decision 7. The gateway: no router model (owner, 2026-10-31)
 
-A resident router model collects every message and gets messy. With coordinator sessions on and the minions channel
-server (host runtime), the wrapper runs `minions telegram gateway` instead of a router claude:
+A resident router model collects every message and gets messy. With coordinator sessions on and Telegram, the wrapper
+runs `minions telegram gateway` instead of a router claude (the router claude, its prompt and skill are gone):
 
 - **Inbound, deterministic first:** a reply goes to the session of the message it replies to (tg_messages), a poll
   vote to the asking session (and answers its question), a named task to its task session.
@@ -200,8 +200,11 @@ server (host runtime), the wrapper runs `minions telegram gateway` instead of a 
 - **Outbound without a model:** the gateway sends each due outbox item as a reply in its session's thread, a question
   with options as a poll, and the due digest; it acks and records each in tg_messages. A failed send stops the round
   (the item's retry backoff applies).
-- The tmux window shows the gateway's log; the owner talks through Telegram. Docker (the official plugin) keeps the
-  router claude.
+- The tmux window shows the gateway's log; the owner talks through Telegram. Sessions on without Telegram run the
+  single coordinator.
+- **One Telegram setup for both runtimes** (owner, 2026-10-31): Docker uses the minions channel server too (`minions`
+  on PATH in the container, the token from the mounted file); the official plugin, its install, probe and user-scope
+  handling are gone. Pairing is `minions telegram access pair <code>` on the host in both runtimes.
 
 ## Reversed decisions
 

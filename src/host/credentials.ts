@@ -146,7 +146,7 @@ export function telegramBotGuidance(): string[] {
     '  you run at the same time (a second poller takes the bot over or fails with 409 Conflict).',
     'Store the token with `minions auth telegram` (prompted without echo; never pass it as an argument).',
     'Pair in the coordinator terminal after `minions start`: DM your bot, it replies with a 6-character code; type',
-    '  /telegram:access pair <code>, then lock down with /telegram:access policy allowlist.',
+    '  `minions telegram access pair <code>` on the host, then lock down with `minions telegram access policy allowlist`.',
     'Pair only yourself: every allowlisted sender can control the coordinator and approve tool-permission prompts.',
     '  Unpaired senders get no access; their messages are dropped before they reach the coordinator.',
     'Residual risk: the coordinator and its tools can read the token inside the container (mount and environment).',

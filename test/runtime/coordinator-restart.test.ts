@@ -10,7 +10,8 @@ import { coordinatorRestartRecorder, register } from '../../src/runtime/commands
 import {
   buildClaudeCommand, buildCoordinatorCommand, RECOVERY_PROMPT, restartCoordinator, runCoordinator, TELEGRAM_TOKEN_ENV, type SpawnLike,
 } from '../../src/runtime/coordinator.js';
-import { evaluateTelegram, TELEGRAM_CHANNEL_SPEC, TELEGRAM_PLUGIN_ID, type TelegramProbeReport } from '../../src/telegram/probe.js';
+import type { TelegramProbeReport } from '../../src/telegram/probe.js';
+import { hostChannelServerProbe } from '../../src/telegram/channel/launch.js';
 import { openDb } from '../../src/runtime/db.js';
 import { runtimePaths } from '../../src/runtime/paths.js';
 import { defaults } from '../helpers.js';
@@ -153,12 +154,7 @@ describe('recovery startup prompt', () => {
 // --force without a session, secret-free restart events, and CLI wiring.
 const TOKEN = '123456789:AAHfakefakefakefakefakefakefake_-0123';
 const okRun = (stdout: string): RunResult => ({ code: 0, stdout, stderr: '' });
-const available = (): TelegramProbeReport => evaluateTelegram({
-  claude: okRun('2.1.292 (Claude Code)\n'), bun: okRun('1.4.3\n'),
-  marketplaces: okRun(JSON.stringify([{ name: 'claude-plugins-official', source: 'github', repo: 'anthropics/claude-plugins-official' }])),
-  plugins: okRun(JSON.stringify([{ id: TELEGRAM_PLUGIN_ID, version: '0.0.7', scope: 'user', enabled: true }])),
-  managed: { present: false },
-});
+const available = (): TelegramProbeReport => hostChannelServerProbe({ claudeVersion: '2.1.308 (Claude Code)', token: 'ok', command: true });
 const telegramCfg = (): MinionsConfig => { const c = defaults(); c.communication.channel = 'telegram'; return c; };
 function tgLayout() {
   const paths = layout();
@@ -174,28 +170,27 @@ describe('recovery prompt with Telegram enabled', () => {
       calls.push({ args, env: opts.env });
       return { on(event: string, cb: (...a: unknown[]) => void) { if (event === 'exit') setImmediate(() => cb(0, null)); return this; } } as ReturnType<SpawnLike>;
     };
-    await runCoordinator(telegramCfg(), { paths, spawn, permissionModes: autoModes, env: {}, probe: async () => available(), log: () => {}, startupPrompt: RECOVERY_PROMPT });
+    await runCoordinator(telegramCfg(), { paths, spawn, permissionModes: autoModes, env: {}, claudeVersion: async () => '2.1.308 (Claude Code)', log: () => {}, startupPrompt: RECOVERY_PROMPT });
     const args = calls[0]!.args;
-    expect(args.slice(-4)).toEqual(['--channels', TELEGRAM_CHANNEL_SPEC, '--', RECOVERY_PROMPT]);
+    expect(args.slice(-2)).toEqual(['--', RECOVERY_PROMPT]);
+    expect(args).toContain('--mcp-config');
     const dashdash = args.indexOf('--');
     expect(args.filter((a, i) => i < dashdash && a === '--')).toEqual([]);
     expect(args.slice(dashdash + 1)).toEqual([RECOVERY_PROMPT]);
     expect(args.join(' ')).not.toContain(TOKEN);
-    expect(calls[0]!.env[TELEGRAM_TOKEN_ENV]).toBe(TOKEN);
+    expect(calls[0]!.env).not.toHaveProperty(TELEGRAM_TOKEN_ENV);
   });
 
-  it('a plain launch (no startup prompt) has no `--` and keeps the --settings/--channels order', async () => {
+  it('a plain launch (no startup prompt) has no `--`, and --settings comes last', async () => {
     const paths = tgLayout();
     const calls: string[][] = [];
     const spawn: SpawnLike = (_cmd, args) => {
       calls.push(args);
       return { on(event: string, cb: (...a: unknown[]) => void) { if (event === 'exit') setImmediate(() => cb(0, null)); return this; } } as ReturnType<SpawnLike>;
     };
-    await runCoordinator(telegramCfg(), { paths, spawn, permissionModes: autoModes, env: {}, probe: async () => available(), log: () => {} });
+    await runCoordinator(telegramCfg(), { paths, spawn, permissionModes: autoModes, env: {}, claudeVersion: async () => '2.1.308 (Claude Code)', log: () => {} });
     expect(calls[0]).not.toContain('--');
-    expect(calls[0]!.slice(-2)).toEqual(['--channels', TELEGRAM_CHANNEL_SPEC]);
-    expect(calls[0]!.indexOf('--settings')).toBeLessThan(calls[0]!.indexOf('--channels'));
-    expect(calls[0]).toEqual((await buildClaudeCommand(telegramCfg(), paths, { telegram: true })).args);
+    expect(calls[0]!.at(-2)).toBe('--settings');
   });
 
   it('attached and detached tmux argv without recover are unchanged', async () => {
@@ -263,7 +258,7 @@ describe('coordinator restart edge cases', () => {
   it('the forced restart event lists lease ids but never the bot token', async () => {
     const paths = tgLayout();
     const { spawn } = fakeSpawn();
-    await runCoordinator(telegramCfg(), { paths, spawn, permissionModes: autoModes, env: {}, probe: async () => available(), log: () => {} });
+    await runCoordinator(telegramCfg(), { paths, spawn, permissionModes: autoModes, env: {}, claudeVersion: async () => '2.1.308 (Claude Code)', log: () => {} });
     const db = openDb(join(tmp('minions-restart-db-'), 'runtime.db'));
     const t = tmux(true);
     const r = await restartCoordinator(telegramCfg(), { paths, runner: t.runner, activeLeases: () => [{ id: 'lease-9' }], recordRestart: coordinatorRestartRecorder(db), sleep: noSleep }, { recover: true, force: true });
@@ -279,7 +274,7 @@ describe('coordinator restart edge cases', () => {
   it('a running session with a changed fingerprint keeps the config-change reason', async () => {
     const paths = tgLayout();
     const { spawn } = fakeSpawn();
-    await runCoordinator(telegramCfg(), { paths, spawn, permissionModes: autoModes, env: {}, probe: async () => available(), log: () => {} });
+    await runCoordinator(telegramCfg(), { paths, spawn, permissionModes: autoModes, env: {}, claudeVersion: async () => '2.1.308 (Claude Code)', log: () => {} });
     const t = tmux(true);
     const r = await restartCoordinator(defaults(), { paths, runner: t.runner, activeLeases: () => [], sleep: noSleep });
     expect(r).toMatchObject({ action: 'restarted', reason: 'communication.channel changed (telegram -> auto); coordinator relaunched detached' });

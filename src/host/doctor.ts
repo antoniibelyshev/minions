@@ -351,39 +351,12 @@ export function telegramPollerCheck(r: { code: number; stdout: string }): Check 
   return { name: 'telegram.poller', status, detail: redact(p.detail ?? p.state), ...(p.hint && status !== 'ok' ? { hint: redact(p.hint) } : {}) };
 }
 
-/**
- * telegram.plugin (task-52): the probe reports `ok` when the plugin is off at user scope, because the
- * coordinator launch enables it through its --settings enabledPlugins. If Claude Code ever ignores that
- * flag setting, the coordinator runs without the plugin and nothing else would say so. So: plugin off at
- * user scope AND a running Telegram coordinator without a live poller (bot.pid missing or dead) turns the
- * check into a warning (never a fail: terminal mode stays usable). A foreign poller is telegram.poller's
- * business (some session did load the plugin). `status`: `minions telegram status --json`, or null.
- */
-export function telegramPluginCheck(tg: ReturnType<typeof telegramDoctorCheck>, status: { code: number; stdout: string } | null): Check {
-  const base: Check = { name: 'telegram.plugin', status: tg.status, detail: tg.detail, ...(tg.hint ? { hint: tg.hint } : {}) };
-  if (tg.status !== 'ok' || tg.userScope !== 'disabled' || !status || status.code !== 0) return base;
-  let state: unknown;
-  try { const env = JSON.parse(status.stdout) as { ok?: boolean; data?: { poller?: { state?: unknown } } }; if (env.ok) state = env.data?.poller?.state; } catch { return base; }
-  if (state !== 'missing' && state !== 'dead') return base;
-  return {
-    name: 'telegram.plugin', status: 'warn',
-    detail: `${tg.detail}; but the plugin is off at user scope and the running coordinator has no live poller (bot.pid ${state}), so the coordinator launch's --settings enabledPlugins may have been ignored`,
-    hint: 'Restart the coordinator when no worker runs (`minions coordinator restart --recover`) and check /mcp for plugin:telegram:telegram. '
-      + 'If it is still missing, this Claude Code version may not apply flag enabledPlugins: report it, and see docs/compatibility.md (One Telegram poller per bot).',
-  };
-}
-
-/**
- * telegram.plugin, telegram.access and telegram.poller from the runtime. Returns the probe-only plugin
- * check: channel readiness follows the probe, not the task-52 load warning.
- */
+/** telegram.server, telegram.access and telegram.poller from the runtime. Returns the server check. */
 async function telegramRuntimeChecks(ex: (args: string[]) => Promise<{ code: number; stdout: string; stderr: string }>, wantsTelegram: boolean, checks: Check[], opts: { host?: boolean } = {}): Promise<Check> {
   const tg = telegramDoctorCheck(await ex(['minions', 'telegram', 'probe', '--json']));
   const status = wantsTelegram ? await ex(['minions', 'telegram', 'status', '--json']) : null;
-  // Host runtime (task-6): the probe checks the minions channel server, so the check is telegram.server and the
-  // task-52 plugin load warning does not apply.
-  const name = opts.host ? 'telegram.server' : 'telegram.plugin';
-  checks.push(opts.host ? { name, status: tg.status, detail: tg.detail, ...(tg.hint ? { hint: tg.hint } : {}) } : telegramPluginCheck(tg, status));
+  const name = 'telegram.server';
+  checks.push({ name, status: tg.status, detail: tg.detail, ...(tg.hint ? { hint: tg.hint } : {}) });
   if (status) { checks.push(telegramAccessCheck(status)); const pc = telegramPollerCheck(status); if (pc) checks.push(pc); }
   return { name, status: tg.status, detail: tg.detail, ...(tg.hint ? { hint: tg.hint } : {}) };
 }
@@ -420,10 +393,10 @@ export function telegramReadiness(res: ChannelResolution, tgPlugin: Check | unde
     case 'network-none': return { name, status: 'unavailable', detail: 'unavailable: container.network is none; the coordinator runs terminal-only' };
     case 'no-token': case 'invalid-token':
       return { name, status: 'warn', detail: `${token === 'missing' ? 'missing' : 'invalid'}: bot token ${token}; the coordinator runs terminal-only`, hint: 'Run `minions auth telegram`.' };
-    case 'unchecked': return { name, status: 'warn', detail: host ? 'unknown: bot token stored; the minions channel server was not checked (host runtime not prepared)' : 'unknown: bot token stored; plugin availability not checked (container not running)', hint: 'Run `minions start`, then rerun doctor.' };
+    case 'unchecked': return { name, status: 'warn', detail: `unknown: bot token stored; the minions channel server was not checked (${host ? 'host runtime not prepared' : 'container not running'})`, hint: 'Run `minions start`, then rerun doctor.' };
     case 'plugin-unavailable': case 'probe-not-run':
       return { name, status: 'unavailable', detail: `unavailable: ${tgPlugin?.detail ?? res.reason}; the coordinator runs terminal-only`, ...(tgPlugin?.hint ? { hint: tgPlugin.hint } : {}) };
-    default: return { name, status: 'ok', detail: `ok: bot token stored and ${host ? 'the minions channel server is available (host runtime)' : 'the official plugin is available'}${res.configured === 'auto' ? ' (communication.channel auto)' : ''} (see telegram.access for pairing)` };
+    default: return { name, status: 'ok', detail: `ok: bot token stored and the minions channel server is available${res.configured === 'auto' ? ' (communication.channel auto)' : ''} (see telegram.access for pairing)` };
   }
 }
 

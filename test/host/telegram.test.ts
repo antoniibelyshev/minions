@@ -30,7 +30,7 @@ const { saveRegistry } = await import('../../src/host/registry.js');
 const { DEFERRED_FEATURES, listUnavailable, validateConfig } = await import('../../src/config/resolve.js');
 const { redact } = await import('../../src/core/output.js');
 const { MinionsError } = await import('../../src/core/errors.js');
-const { evaluateTelegram, TELEGRAM_PLUGIN_ID } = await import('../../src/telegram/probe.js');
+const { hostChannelServerProbe } = await import('../../src/telegram/channel/launch.js');
 const { defaults } = await import('../helpers.js');
 const { dockerDown, dockerUp, makeRepo, withHome } = await import('./fixtures.js');
 type RunResult = import('../../src/core/exec.js').RunResult;
@@ -224,7 +224,7 @@ describe('wizard', () => {
     expect(r.config.communication.channel).toBe('telegram');
     expect(r.asked).toContain('communication.channel');
     const text = a.info.join('\n');
-    for (const s of ['https://t.me/BotFather', '/newbot', 'One coordinator per bot', '/telegram:access pair <code>', '/telegram:access policy allowlist',
+    for (const s of ['https://t.me/BotFather', '/newbot', 'One coordinator per bot', 'minions telegram access pair <code>', 'minions telegram access policy allowlist',
       'Pair only yourself', 'Unpaired senders get no access', 'research preview', 'Terminal mode always keeps working']) expect(text).toContain(s);
     for (const q of a.asked) expect(q).not.toMatch(/token|password|secret|api key/i);
   });
@@ -242,7 +242,7 @@ describe('wizard', () => {
 });
 
 describe('init and doctor', () => {
-  const container = (opts: { probe: 'available' | 'no-bun'; access?: string; offAtUserScope?: boolean; poller?: string }) => recorder((c) => {
+  const container = (opts: { probe: 'available' | 'old-claude'; access?: string; poller?: string }) => recorder((c) => {
     const a = c.args.join(' ');
     if (c.cmd !== 'docker') return undefined;
     if (a.startsWith('image inspect')) return { code: 0, stdout: 'x\n', stderr: '' };
@@ -250,11 +250,7 @@ describe('init and doctor', () => {
     if (a.endsWith('claude auth status') || a.endsWith('backlog --version') || a.endsWith('coordinator --probe --json')) return { code: 0, stdout: '1.54.0\n', stderr: '' };
     if (a.endsWith('telegram probe --json')) {
       const ok = (stdout: string) => ({ code: 0, stdout, stderr: '' });
-      const report = evaluateTelegram({
-        claude: ok('2.1.292 (Claude Code)'), bun: opts.probe === 'available' ? ok('1.4.3') : { code: 127, stdout: '', stderr: 'not found' },
-        marketplaces: ok(JSON.stringify([{ name: 'claude-plugins-official', source: 'github', repo: 'anthropics/claude-plugins-official' }])),
-        plugins: ok(JSON.stringify([{ id: TELEGRAM_PLUGIN_ID, version: '0.0.7', scope: 'user', enabled: !opts.offAtUserScope }])), managed: { present: false },
-      });
+      const report = hostChannelServerProbe({ claudeVersion: opts.probe === 'available' ? '2.1.308 (Claude Code)' : '2.0.1 (Claude Code)', token: 'ok', command: true });
       return ok(JSON.stringify({ ok: true, data: report }));
     }
     if (a.endsWith('telegram status --json')) {
@@ -272,7 +268,7 @@ describe('init and doctor', () => {
     expect(a.asked).toContain('secret:Telegram bot token (input hidden): ');
     expect(r.plan.communication.channel).toBe('telegram');
     expect(r.plan.externalSetup.join('\n')).toContain('/opt/minions/secrets/telegram-bot-token');
-    expect(r.nextSteps.join('\n')).toContain('/telegram:access pair <code>');
+    expect(r.nextSteps.join('\n')).toContain('minions telegram access pair <code>');
     expect(await C.readTelegramToken(r.plan.projectId)).toBe(TOKEN);
     expect(JSON.stringify(r) + formatInit(r)).not.toContain(TOKEN);
     const p = projectPaths(r.plan.projectId);
@@ -283,37 +279,24 @@ describe('init and doctor', () => {
     const ok = await runDoctor({ cwd: repo, probe: dockerUp, runner: container({ probe: 'available' }).runner });
     const by = (n: string) => ok.checks.find((c) => c.name === n);
     expect(by('telegram.credential')).toMatchObject({ status: 'ok', detail: expect.stringMatching(/^ok: bot 123456789/) });
-    expect(by('telegram.plugin')?.status).toBe('ok');
+    expect(by('telegram.server')?.status).toBe('ok');
     expect(by('telegram.access')?.status).toBe('ok');
     expect(by('telegram')).toMatchObject({ status: 'ok', detail: expect.stringMatching(/^ok:/) });
     expect(by('features')!.detail).not.toContain('Telegram');
     expect(ok.healthy).toBe(true);
     expect(JSON.stringify(ok) + formatDoctor(ok)).not.toContain(TOKEN);
 
-    // Task-52: plugin off at user scope (the task-51 state) and a coordinator without a live poller: the
-    // launch's flag enabledPlugins may have been ignored. telegram.plugin warns (never fails); readiness
-    // still follows the probe.
+    // No live channel server for a running Telegram coordinator: telegram.poller warns, readiness follows the probe.
     for (const poller of ['missing', 'dead']) {
-      const w = await runDoctor({ cwd: repo, probe: dockerUp, runner: container({ probe: 'available', offAtUserScope: true, poller }).runner });
-      expect(w.checks.find((c) => c.name === 'telegram.plugin'), poller).toMatchObject({ status: 'warn',
-        detail: expect.stringMatching(new RegExp(`off at user scope and the running coordinator has no live poller \\(bot.pid ${poller}\\).*enabledPlugins may have been ignored`)),
-        hint: expect.stringContaining('minions coordinator restart --recover') });
-      expect(w.checks.find((c) => c.name === 'telegram.poller')?.status).toBe('warn');
+      const w = await runDoctor({ cwd: repo, probe: dockerUp, runner: container({ probe: 'available', poller }).runner });
+      expect(w.checks.find((c) => c.name === 'telegram.poller')?.status, poller).toBe('warn');
       expect(w.checks.find((c) => c.name === 'telegram')).toMatchObject({ status: 'ok' });
       expect(w.checks.some((c) => c.name.startsWith('telegram') && c.status === 'fail')).toBe(false);
     }
-    // Off at user scope with a live coordinator poller, or no running Telegram coordinator: ok.
-    for (const poller of ['ok', 'not-applicable', undefined]) {
-      const fine = await runDoctor({ cwd: repo, probe: dockerUp, runner: container({ probe: 'available', offAtUserScope: true, ...(poller ? { poller } : {}) }).runner });
-      expect(fine.checks.find((c) => c.name === 'telegram.plugin'), String(poller)).toMatchObject({ status: 'ok', detail: expect.not.stringMatching(/no live poller/) });
-    }
-    // Enabled at user scope (pre-launch state) with no poller: telegram.poller reports it, telegram.plugin stays ok.
-    const en = await runDoctor({ cwd: repo, probe: dockerUp, runner: container({ probe: 'available', poller: 'missing' }).runner });
-    expect(en.checks.find((c) => c.name === 'telegram.plugin')?.status).toBe('ok');
 
-    // Plugin unavailable (e.g. outdated image without Bun): unavailable, never fail.
-    const un = await runDoctor({ cwd: repo, probe: dockerUp, runner: container({ probe: 'no-bun', access: 'unpaired' }).runner });
-    expect(un.checks.find((c) => c.name === 'telegram')).toMatchObject({ status: 'unavailable', detail: expect.stringMatching(/^unavailable: .*Bun is not installed.*terminal-only/) });
+    // Channel server unavailable (a Claude Code without development channels): unavailable, never fail.
+    const un = await runDoctor({ cwd: repo, probe: dockerUp, runner: container({ probe: 'old-claude', access: 'unpaired' }).runner });
+    expect(un.checks.find((c) => c.name === 'telegram')).toMatchObject({ status: 'unavailable', detail: expect.stringMatching(/^unavailable: .*terminal-only/) });
     expect(un.checks.find((c) => c.name === 'telegram.access')?.status).toBe('warn');
     expect(un.checks.filter((c) => c.name.startsWith('telegram')).some((c) => c.status === 'fail')).toBe(false);
 

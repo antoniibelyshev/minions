@@ -25,7 +25,6 @@ import { runtimeMode } from '../core/cli-helpers.js';
 import { atomicWrite, ensureRealDir } from '../core/fsutil.js';
 import { CONTAINER } from '../core/paths.js';
 import { resolveOnPath } from '../host/auth.js';
-import { TELEGRAM_PLUGIN_ID } from '../telegram/probe.js';
 import {
   coordinatorDisallowedTools, coordinatorSettings, effectivePermissionMode, hostPromptNote, readPrompt, runtimeAuthMethod,
   type HostHardening, type RuntimeAuthMethod,
@@ -238,8 +237,6 @@ export async function buildSessionCommand(cfg: MinionsConfig, key: string, deps:
   const prompt = deps.prompt ?? await readPrompt(paths) + (onHost ? hostPromptNote(paths) : '') + (k.taskId ? taskSessionPromptNote(k.taskId) : k.kind === 'thread' ? threadSessionNote(k.key) : GENERAL_SESSION_NOTE);
   const flagSettings: Record<string, unknown> = {
     ...coordinatorSettings(cfg, { telegram: false, auth: method, host: deps.host, paths }),
-    // Belt and braces: no plugin is installed in the fresh config dir, and even a project setting cannot enable it.
-    enabledPlugins: { [TELEGRAM_PLUGIN_ID]: false },
   };
   checkHookCommands(hookCommands(flagSettings), { pluginDir: paths.pluginDir });
   checkHookCommands(hookCommands(await readPluginHooks(paths.pluginDir)), { pluginDir: paths.pluginDir });

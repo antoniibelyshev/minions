@@ -1,6 +1,6 @@
 // The minions-owned Telegram channel server (docs/design/telegram-channel.md, "Server shape" layer 3; task-67.2,
-// phase 1): `minions telegram channel serve`. The host runtime coordinator launch loads it (task-6,
-// src/telegram/channel/launch.ts); the Docker runtime still uses the official plugin.
+// phase 1): `minions telegram channel serve`. The coordinator launch loads it in both runtimes (task-6,
+// src/telegram/channel/launch.ts); the gateway (src/runtime/gateway.ts) runs it without a claude.
 //
 // - MCP over stdio: newline-delimited JSON-RPC 2.0, hand-written (no SDK). initialize declares
 //   `experimental: { "claude/channel": {} }`; tools/list and tools/call serve `reply`, `poll` and `close_poll`. Inbound owner

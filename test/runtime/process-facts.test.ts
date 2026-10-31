@@ -13,7 +13,7 @@ import {
 } from '../../src/runtime/process-facts.js';
 import { groupMembers, hostIdentity, isAlive, procIdentity, procStat, sameHost } from '../../src/runtime/runner/record.js';
 import { lockViewFor, supervisorAlive, systemLockView } from '../../src/runtime/supervisor.js';
-import { checkTelegramPoller, claudeOwner } from '../../src/telegram/isolation.js';
+import { claudeOwner } from '../../src/telegram/isolation.js';
 
 interface FakeProc { pid: number; ppid: number; pgid?: number; stat?: string; start: number; cmd: string }
 
@@ -149,12 +149,7 @@ describe('Telegram poller ownership from ps', () => {
     expect(claudeOwner(4242, SELF, pc)).toBe('unknown'); // not in the table
   });
 
-  it('checkTelegramPoller reports ok for the coordinator poller and foreign for a nested one', async () => {
-    const pc = { ...psProcessControl(fakeHost(table).facts), alive: (p: number) => table.some((x) => x.pid === p) };
-    const check = (pid: number) => checkTelegramPoller({ pidFile: 'bot.pid', coordinatorPid: SELF, telegram: true, proc: pc, readText: async () => `${pid}\n` });
-    expect(await check(5003)).toMatchObject({ state: 'ok', pid: 5003 });
-    expect(await check(6003)).toMatchObject({ state: 'foreign', pid: 6003 });
-  });
+
 });
 
 describe('supervisor and integration locks from ps and sysctl', () => {

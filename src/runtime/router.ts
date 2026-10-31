@@ -1,26 +1,20 @@
-// The router's deterministic part (docs/design/coordinator-sessions.md, Routing model; task-57 phase 8): which session
-// an owner message goes to (`coordinator route`), handing it over (`coordinator send`), waiting for due outbound items
-// (`coordinator wait`) and the sent-message map (`tg_messages`, filled by `notify ack --message-id`). No model call and
-// no Telegram I/O: the router claude reads and writes the channel, these helpers only read and write the runtime DB.
+// Routing of owner messages to coordinator sessions (docs/design/coordinator-sessions.md, Routing model; the gateway,
+// src/runtime/gateway.ts, calls it): which session a message goes to, handing it over (`sendToSession`, also
+// `coordinator send`) and the sent-message map (`tg_messages`). No model call and no Telegram I/O.
 //
-// Architecture decisions (task-57.12):
-// - Rules, first match wins: (1) a reply to a bot message whose `tg_messages` row names a session (only once a channel
-//   passes reply metadata, task-67; with plugin 0.0.7 the router passes none); (2) an explicit session: `/s <key>`, a
-//   ref `#<message id>` found in `tg_messages`, or exactly one known task id in the text (`task-57.12`; several are
+// - Rules, first match wins: (1) a reply to a message whose `tg_messages` row names a session; (2) an explicit session:
+//   `/s <key>`, a ref `#<message id>` found in `tg_messages`, or exactly one known task id in the text (several are
 //   `ambiguous`); (3) `Q<n> <answer>` matching exactly one open question of the latest delivered digest, or a bare
-//   number while exactly one question is open (several: `ambiguous`); (4) otherwise `general`.
+//   number while exactly one question is open (several: `ambiguous`); (4) a new thread (threads on), else `general`.
 // - An open question is a delivered outbox `question` item without `answered_at`, delivered in the last 7 days. Its
-//   session is the outbox item's `session` (set by `notify enqueue`, by default from MINIONS_SESSION); none (the
-//   single coordinator or the router asked) is `general`. `coordinator send --answers <key>` marks it answered.
-// - `send` reopens a closed or failed session for an owner message (the owner reopens a failed one; decision 4) and
-//   leaves opening `general` to the supervisor (it opens it on its first message). It refuses while sessions are off.
-// - `wait` returns as soon as an outbox item is due (task-session summaries, questions, blockers) or the digest is due,
-//   else after its timeout; the router runs it in the background and is woken by its completion (no restart).
+//   session is the outbox item's `session` (set by `notify enqueue`, by default from MINIONS_SESSION); none is
+//   `general`.
+// - `send` reopens a closed or failed session for an owner message and leaves opening `general` to the supervisor (it
+//   opens it on its first message). It refuses while sessions are off.
 import type { MinionsConfig } from '../config/schema.js';
 import { MinionsError } from '../core/errors.js';
 import type { RuntimeDb } from './db.js';
 import { DIGEST_QUESTIONS_META } from './digest.js';
-import { pending, type OutboxItem } from './outbox.js';
 import { enqueueInbox, getSession, openSession, OWNER_INBOX_SOURCE } from './session-store.js';
 import { parseSessionKey, sessionConfigDir, sessionsSettings } from './sessions.js';
 import { taskKickoff } from './task-sessions.js';
@@ -212,44 +206,6 @@ export function sendToSession(db: RuntimeDb, cfg: Pick<MinionsConfig, 'coordinat
     db.addEvent('route-send', parseSessionKey(key).taskId, { key, inboxId, reopened, ...(answered ? { answered } : {}) }, now.toISOString());
     return { key, inboxId, reopened, answered };
   });
-}
-
-// ---------------------------------------------------------------- wait
-
-export type WaitReason = 'due' | 'digest' | 'timeout' | 'stopped';
-export interface WaitResult { reason: WaitReason; items: Pick<OutboxItem, 'key' | 'kind' | 'taskId' | 'session'>[]; digest: string | null; waitedMs: number }
-
-export interface WaitDeps {
-  db: RuntimeDb;
-  /** Whether the digest is due now (digestStatus(...).due), else null. */
-  digestDue?: (now: Date) => string | null;
-  /** The digest hold-back (reholdExpired) before each look, so a held item is not reported as due. */
-  holdBack?: (now: Date) => void;
-  now?: () => Date;
-  sleep?: (ms: number) => Promise<void>;
-  signal?: AbortSignal;
-  pollMs?: number;
-  timeoutMs: number;
-}
-
-/** `coordinator wait`: returns once an outbox item or the digest is due, or at the timeout (the router then waits again). */
-export async function waitForOutbound(d: WaitDeps): Promise<WaitResult> {
-  const now = d.now ?? (() => new Date());
-  const sleep = d.sleep ?? ((ms: number) => new Promise<void>((res) => setTimeout(res, ms)));
-  const start = now().getTime();
-  for (;;) {
-    const at = now();
-    try { d.holdBack?.(at); } catch { /* the wait never fails on the hold-back */ }
-    const items = pending(d.db, {}, () => at);
-    const digest = d.digestDue?.(at) ?? null;
-    const waitedMs = at.getTime() - start;
-    if (items.length || digest) {
-      return { reason: items.length ? 'due' : 'digest', items: items.map((i) => ({ key: i.key, kind: i.kind, taskId: i.taskId, session: i.session })), digest, waitedMs };
-    }
-    if (d.signal?.aborted) return { reason: 'stopped', items: [], digest: null, waitedMs };
-    if (waitedMs >= d.timeoutMs) return { reason: 'timeout', items: [], digest: null, waitedMs };
-    await sleep(Math.min(d.pollMs ?? 5_000, Math.max(1, d.timeoutMs - waitedMs)));
-  }
 }
 
 // ---------------------------------------------------------------- sent-message map

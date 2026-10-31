@@ -22,20 +22,18 @@ const isObj = (v: unknown): v is Record<string, unknown> => typeof v === 'object
 const ids = (v: unknown): string[] => (Array.isArray(v) ? v.filter((x) => typeof x === 'string' || typeof x === 'number').map(String) : []);
 const count = (v: unknown) => (Array.isArray(v) ? v.length : isObj(v) ? Object.keys(v).length : 0);
 
-const PAIR_HINT = 'DM the bot, then type `/telegram:access pair <code>` in the coordinator terminal (not over Telegram), then `/telegram:access policy allowlist`.';
-/** Host runtime (task-6): the minions channel server; pairing is a terminal command on the host. */
-const HOST_PAIR_HINT = 'DM the bot, then run `minions telegram access pair <code>` in a terminal on the host (not over Telegram), then `minions telegram access policy allowlist`.';
-const HOST_OPEN_HINT = 'In a terminal on the host: `minions telegram access policy allowlist`, and `minions telegram access remove <id>` for every sender except yourself (groups are ignored by the minions channel server).';
-const REPAIR_HINT = 'Re-pair from the coordinator terminal with /telegram:access.';
-const HOST_REPAIR_HINT = 'Fix or remove access.json, then pair again with `minions telegram access pair <code>` on the host.';
+/** Pairing is a terminal command on the host (both runtimes: the minions channel server). */
+const PAIR_HINT = 'DM the bot, then run `minions telegram access pair <code>` in a terminal on the host (not over Telegram), then `minions telegram access policy allowlist`.';
+const OPEN_HINT = 'In a terminal on the host: `minions telegram access policy allowlist`, and `minions telegram access remove <id>` for every sender except yourself (groups are ignored by the minions channel server).';
+const REPAIR_HINT = 'Fix or remove access.json, then pair again with `minions telegram access pair <code>` on the host.';
 
 /** Pure evaluation of a parsed access.json (null = file absent). */
 export function evaluateAccess(raw: unknown | null, opts: { host?: boolean } = {}): TelegramAccessStatus {
-  const pairHint = opts.host ? HOST_PAIR_HINT : PAIR_HINT;
+  const pairHint = PAIR_HINT;
   if (raw === null) {
     return { state: 'unpaired', policy: null, allowlisted: 0, groups: 0, detail: 'not paired yet (no access.json); nobody can control the coordinator over Telegram', hint: pairHint };
   }
-  if (!isObj(raw)) return { state: 'invalid', policy: null, allowlisted: 0, groups: 0, detail: 'access.json is not a JSON object', hint: opts.host ? HOST_REPAIR_HINT : REPAIR_HINT };
+  if (!isObj(raw)) return { state: 'invalid', policy: null, allowlisted: 0, groups: 0, detail: 'access.json is not a JSON object', hint: REPAIR_HINT };
   const policy = typeof raw.dmPolicy === 'string' ? raw.dmPolicy : 'pairing';
   const allowlisted = ids(raw.allowFrom).length;
   const groups = count(raw.groups);
@@ -48,7 +46,7 @@ export function evaluateAccess(raw: unknown | null, opts: { host?: boolean } = {
   if (groups > 0) problems.push(`${groups} group(s) are enabled; group members can reach the coordinator`);
   if (problems.length) {
     return { ...base, state: 'open', detail: problems.join('; '),
-      hint: opts.host ? HOST_OPEN_HINT : 'In the coordinator terminal: `/telegram:access policy allowlist`, and remove every sender and group except yourself.' };
+      hint: OPEN_HINT };
   }
   return { ...base, state: 'ok', detail: 'paired with one owner; DM policy allowlist; unpaired senders are dropped' };
 }
@@ -72,6 +70,6 @@ export async function readTelegramAccess(stateDir: string, readText: (p: string)
     return { state: 'invalid', policy: null, allowlisted: 0, groups: 0, detail: `access.json unreadable (${(e as NodeJS.ErrnoException).code ?? 'error'})` };
   }
   try { return evaluateAccess(JSON.parse(text) as unknown, opts); } catch {
-    return { state: 'invalid', policy: null, allowlisted: 0, groups: 0, detail: 'access.json is not valid JSON', hint: opts.host ? HOST_REPAIR_HINT : REPAIR_HINT };
+    return { state: 'invalid', policy: null, allowlisted: 0, groups: 0, detail: 'access.json is not valid JSON', hint: REPAIR_HINT };
   }
 }

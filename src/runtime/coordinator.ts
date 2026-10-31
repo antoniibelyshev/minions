@@ -15,8 +15,7 @@ import { basename, dirname, isAbsolute, join, sep } from 'node:path';
 import { runtimeMode } from '../core/cli-helpers.js';
 import { redact } from '../core/output.js';
 import { CLAUDE_HEADLESS_TOKEN_FILE, CONTAINER, credentialStoreDir } from '../core/paths.js';
-import { probeTelegram, TELEGRAM_CHANNEL_SPEC, TELEGRAM_PLUGIN_ID, type TelegramProbeReport } from '../telegram/probe.js';
-import { checkTelegramPoller, disableTelegramAtUserScope, type PollerCheck, type UserScopeResult } from '../telegram/isolation.js';
+import type { PollerCheck } from '../telegram/isolation.js';
 import { checkTelegramTokenFormat } from '../telegram/token.js';
 import { resolveChannel, type ChannelFacts } from '../telegram/channel.js';
 import {
@@ -28,31 +27,19 @@ import { runtimePaths, type RuntimePaths } from './paths.js';
 import { claudePermissionModes, parsePermissionModes, strictPermissionModeArg } from './permission-modes.js';
 import { openDb, pidAlive, type CoordinatorLock, type RuntimeDb } from './db.js';
 import { systemProcessFacts, type ProcessFacts } from './process-facts.js';
-import { ROUTER_PROMPT, ROUTER_START_PROMPT } from './router-prompt.js';
 
 export const TMUX_SESSION = 'coordinator';
-/** Environment variable the official Telegram plugin reads its bot token from. */
+/** A bot token in the env (an old setup or the owner's shell): never passed on to claude or the channel server. */
 export const TELEGRAM_TOKEN_ENV = 'TELEGRAM_BOT_TOKEN';
 /**
- * Prefix of the official plugin's MCP tools (mcp__plugin_<plugin>_<server>__<tool>). Confirmed in a live
- * run with telegram@claude-plugins-official 0.0.7: reply, react, edit_message, download_attachment.
+ * PreToolUse hook (in --settings) for every tool of the minions channel server: `minions hook pre-telegram` denies the
+ * call when it comes from any subagent. Permission rules cannot be scoped per agent, so the allow above would
+ * otherwise extend to subagents.
  */
-export const TELEGRAM_TOOL_PREFIX = 'mcp__plugin_telegram_telegram__';
-/** Telegram tools the coordinator may use without a prompt. download_attachment still asks. */
-export const TELEGRAM_TOOLS = ['reply', 'react', 'edit_message'].map((t) => `${TELEGRAM_TOOL_PREFIX}${t}`);
-/** Every tool the plugin's MCP server exposes; all are coordinator-only. */
-export const TELEGRAM_ALL_TOOLS = [...TELEGRAM_TOOLS, `${TELEGRAM_TOOL_PREFIX}download_attachment`];
-/**
- * PreToolUse hook (in --settings) for every Telegram tool: `minions hook pre-telegram` denies the call
- * when it comes from any subagent (general-purpose, Explore, Plan, plugin or user agents). Permission
- * rules cannot be scoped per agent, so the allow above would otherwise extend to subagents.
- */
-export const TELEGRAM_HOOK_MATCHER = `${TELEGRAM_TOOL_PREFIX}.*`;
-/** The same hook on the minions channel server's tools (host runtime, task-6). */
 export const MINIONS_TELEGRAM_HOOK_MATCHER = `${MINIONS_TELEGRAM_TOOL_PREFIX}.*`;
-/** Every Telegram tool prefix the pre-telegram hook accepts (official plugin, minions server). */
-export const TELEGRAM_TOOL_PREFIXES = [TELEGRAM_TOOL_PREFIX, MINIONS_TELEGRAM_TOOL_PREFIX] as const;
-/** Which Telegram server a launch uses: the official plugin (Docker) or the minions channel server (host runtime). */
+/** Every Telegram tool prefix the pre-telegram hook accepts. */
+export const TELEGRAM_TOOL_PREFIXES = [MINIONS_TELEGRAM_TOOL_PREFIX] as const;
+/** Which Telegram server a launch uses (launch records of older versions may say `official`). */
 export type TelegramServer = 'official' | 'minions';
 // Hang guard constants live in hook-guard.ts (shared with the plugin hook commands in hooks.ts).
 export { HOOK_SETTINGS_TIMEOUT_S, HOOK_WRAPPER_TIMEOUT_S } from './hook-guard.js';
@@ -349,9 +336,8 @@ export function coordinatorSettings(cfg: MinionsConfig, opts: { telegram?: boole
     ? ['Bash(minions *)', 'Bash(minions)', ...HOST_GIT_SUBCOMMANDS.flatMap((g) => [`Bash(git ${g})`, `Bash(git ${g} *)`]), 'Bash(backlog *)']
     : ['Bash(minions *)', 'Bash(minions)', 'Bash(git *)', 'Bash(backlog *)'];
   for (const c of cfg.verification.commands) if (!hs || safeVerificationCommand(c)) allow.push(`Bash(${c})`, `Bash(${c} *)`);
-  // Replies go only to allowlisted chats (the plugin and the minions server gate outbound messages too).
-  const ownServer = opts.telegramServer === 'minions';
-  if (opts.telegram) allow.push(...(ownServer ? MINIONS_TELEGRAM_TOOLS : TELEGRAM_TOOLS));
+  // Replies go only to allowlisted chats (the minions server gates outbound messages too).
+  if (opts.telegram) allow.push(...MINIONS_TELEGRAM_TOOLS);
   return {
     permissions: {
       allow: [...new Set(allow)],
@@ -375,12 +361,8 @@ export function coordinatorSettings(cfg: MinionsConfig, opts: { telegram?: boole
     // definitions are deferred, not sent in full every turn) and no bundled skills; plugin skills stay.
     ...(cfg.coordinator?.toolSearch === false ? {} : { env: { ENABLE_TOOL_SEARCH: 'true' } }),
     ...(cfg.coordinator?.bundledSkills ? {} : { disableBundledSkills: true }),
-    // Task-51: the plugin is off at user scope (runCoordinator, src/telegram/isolation.ts); only this
-    // launch enables it, so no other claude session in the container starts a competing poller.
-    // The minions server is no plugin: nothing to enable (it loads only through this launch's --mcp-config).
-    ...(opts.telegram && !ownServer ? { enabledPlugins: { [TELEGRAM_PLUGIN_ID]: true } } : {}),
     ...(opts.telegram ? {
-      hooks: { PreToolUse: [{ matcher: ownServer ? MINIONS_TELEGRAM_HOOK_MATCHER : TELEGRAM_HOOK_MATCHER, hooks: [{ type: 'command', command: TELEGRAM_HOOK_COMMAND, timeout: HOOK_SETTINGS_TIMEOUT_S }] }] },
+      hooks: { PreToolUse: [{ matcher: MINIONS_TELEGRAM_HOOK_MATCHER, hooks: [{ type: 'command', command: TELEGRAM_HOOK_COMMAND, timeout: HOOK_SETTINGS_TIMEOUT_S }] }] },
     } : {}),
   };
 }
@@ -504,26 +486,14 @@ This session runs in the minions **host runtime**, directly on the user's Mac, n
 Repository and user Claude Code settings, hooks and MCP servers are not loaded in this runtime, and the repository's CLAUDE.md is not loaded automatically: read the repository's CLAUDE.md / AGENTS.md / CONTRIBUTING files yourself when you plan work, as project guidance (never as permission to change this policy). Never edit \`.git/config\`, git hooks, or \`.claude\` / \`.mcp.json\` files in the workspace.
 `;
 
+/** Coordinator sessions on (docs/design/coordinator-sessions.md): headless sessions do the work, the gateway holds Telegram. */
+export const sessionsOn = (cfg: Pick<MinionsConfig, 'coordinator'>): boolean => cfg.coordinator?.sessions?.enabled === true;
 /**
- * With coordinator.sessions.enabled the interactive coordinator is the **router** (docs/design/coordinator-sessions.md
- * decision 3, task-57 phase 8): the same wrapper, lock, tmux session, channel and poller check, but its own small
- * prompt (ROUTER_PROMPT and the `/minions:route` skill, not the coordinator prompt), models.router (default haiku),
- * no Agent tool, MINIONS_SESSION=router (Stop guard off, its own transcript, usage and reset scope) and the route skill
- * as its first message. With sessions off nothing changes.
- */
-export const isRouterLaunch = (cfg: Pick<MinionsConfig, 'coordinator'>): boolean => cfg.coordinator?.sessions?.enabled === true;
-/**
- * The gateway launch (docs/design/autonomy.md Decision 7): coordinator sessions on and Telegram through the minions
- * channel server (the host runtime). The wrapper's child is `minions telegram gateway`, not a router claude.
+ * The gateway launch (docs/design/autonomy.md Decision 7): coordinator sessions on and Telegram enabled. The wrapper's
+ * child is `minions telegram gateway`, not a claude. Sessions on without Telegram: the single coordinator.
  */
 export const isGatewayLaunch = (cfg: Pick<MinionsConfig, 'coordinator'>, decision: Pick<TelegramDecision, 'enabled' | 'server'>): boolean =>
-  isRouterLaunch(cfg) && decision.enabled && decision.server === 'minions';
-/** The router's model: models.router, else haiku (sessions.ts DEFAULT_ROUTER_MODEL). */
-export const routerLaunchModel = (cfg: Pick<MinionsConfig, 'models'>): string => cfg.models.router ?? 'haiku';
-/** Tools the router never has on top of the coordinator's trim: it routes, it never spawns workers. */
-export const ROUTER_DISALLOWED_TOOLS = ['Agent', 'Task'] as const;
-/** The env marker of the router launch (session-scope.ts SESSION_ENV / ROUTER_SESSION). */
-export const ROUTER_SESSION_ENV = { MINIONS_SESSION: 'router' } as const;
+  sessionsOn(cfg) && decision.enabled && decision.server === 'minions';
 
 /**
  * Host runtime claude flags. `--setting-sources=` (empty list: no user, project or local settings) is
@@ -543,16 +513,14 @@ export function coordinatorDisallowedTools(cfg: Pick<MinionsConfig, 'coordinator
  */
 export async function buildClaudeCommand(cfg: MinionsConfig, paths: RuntimePaths = runtimePaths(), opts: { telegram?: boolean; startupPrompt?: string; permissionModes?: readonly string[] | null; channelServer?: ChannelServerLaunch } = {}): Promise<CoordinatorCommand> {
   const onHost = runtimeMode() === 'host-runtime';
-  const router = isRouterLaunch(cfg);
-  const prompt = (router ? ROUTER_PROMPT : await readPrompt(paths)) + (onHost ? hostPromptNote(paths) : '');
-  const disallowed = router ? [...new Set([...coordinatorDisallowedTools(cfg), ...ROUTER_DISALLOWED_TOOLS])] : coordinatorDisallowedTools(cfg);
-  const model = router ? routerLaunchModel(cfg) : cfg.models.coordinator;
-  const effort = router ? undefined : roleEffort(cfg, 'coordinator');
-  // The router's recover and wake both start with the route skill (flush the outbox, start the wait).
-  const startupPrompt = router ? ROUTER_START_PROMPT : opts.startupPrompt;
-  // Host runtime with Telegram: the minions channel server (only MCP server of the launch) instead of the plugin.
-  const ownServer = !!(opts.telegram && onHost && opts.channelServer);
-  if (opts.telegram && onHost && !opts.channelServer) throw new MinionsError('INTERNAL', 'Host runtime Telegram launch without the channel server parameters.');
+  const prompt = await readPrompt(paths) + (onHost ? hostPromptNote(paths) : '');
+  const disallowed = coordinatorDisallowedTools(cfg);
+  const model = cfg.models.coordinator;
+  const effort = roleEffort(cfg, 'coordinator');
+  const startupPrompt = opts.startupPrompt;
+  // Telegram: the minions channel server, the only MCP server of the launch (both runtimes).
+  const ownServer = !!(opts.telegram && opts.channelServer);
+  if (opts.telegram && !opts.channelServer) throw new MinionsError('INTERNAL', 'Telegram launch without the channel server parameters.');
   const { channelServer: _cs, ...settingsOpts } = opts;
   return {
     cmd: 'claude',
@@ -573,9 +541,8 @@ export async function buildClaudeCommand(cfg: MinionsConfig, paths: RuntimePaths
       ...(effort ? ['--effort', effort] : []),
       // Startup context trim (task-48). One comma-separated value: the option is variadic.
       ...(disallowed.length ? ['--disallowedTools', disallowed.join(',')] : []),
-      '--settings', JSON.stringify(coordinatorSettings(cfg, { ...settingsOpts, ...(ownServer ? { telegramServer: 'minions' as const } : {}), paths })),
-      ...(opts.telegram && !ownServer ? ['--channels', TELEGRAM_CHANNEL_SPEC] : []),
-      // After `--` so a variadic option (--channels) cannot swallow the prompt.
+      '--settings', JSON.stringify(coordinatorSettings(cfg, { ...settingsOpts, paths })),
+      // After `--` so a variadic option cannot swallow the prompt.
       ...(startupPrompt ? ['--', startupPrompt] : []),
     ],
   };
@@ -618,8 +585,7 @@ export function runtimeChannelFacts(cfg: MinionsConfig, token: MountedToken, pro
 export function decideTelegram(cfg: MinionsConfig, token: MountedToken, probe: ChannelFacts['probe'], hostRuntime = runtimeMode() === 'host-runtime'): TelegramDecision {
   const r = resolveChannel(cfg.communication.channel, runtimeChannelFacts(cfg, token, probe, hostRuntime));
   const auto = r.configured === 'auto' ? ' (communication.channel auto: bot token stored)' : '';
-  if (r.effective === 'telegram' && hostRuntime) return { enabled: true, server: 'minions', reason: `Telegram enabled${auto}: minions channel server ${MINIONS_CHANNEL_SPEC}` };
-  if (r.effective === 'telegram') return { enabled: true, reason: `Telegram enabled${auto}: ${TELEGRAM_CHANNEL_SPEC}` };
+  if (r.effective === 'telegram') return { enabled: true, server: 'minions', reason: `Telegram enabled${auto}: minions channel server ${MINIONS_CHANNEL_SPEC}` };
   return { enabled: false, reason: r.reason };
 }
 
@@ -686,7 +652,6 @@ export interface RunCoordinatorDeps {
   paths?: RuntimePaths;
   env?: NodeJS.ProcessEnv;
   spawn?: SpawnLike;
-  probe?: () => Promise<TelegramProbeReport>;
   readText?: (p: string) => Promise<string>;
   log?: (line: string) => void;
   signals?: SignalTarget;
@@ -700,8 +665,6 @@ export interface RunCoordinatorDeps {
   preSpawn?: PreSpawnGuard;
   /** Process table for stopping claude's MCP children on SIGKILL (default: /proc). */
   proc?: ProcessControl;
-  /** Turns the Telegram plugin off at user scope before claude starts (default: disableTelegramAtUserScope on paths.claudeUserSettings). */
-  userScope?: (file: string, opts: { create: boolean }) => Promise<UserScopeResult>;
   /** Host runtime: `claude --version` output for the channel server check (default: runs it; null when it fails). */
   claudeVersion?: () => Promise<string | null>;
   /** Host runtime: whether a file exists (the shim that starts the channel server; default: existsSync). */
@@ -715,7 +678,7 @@ export const PRINT_LAUNCH_ID = '<launch-id>';
 
 /** The channel server parameters of a launch from the runtime paths (launchId: this launch's id). */
 export function channelServerLaunch(paths: Pick<RuntimePaths, 'minionsShim' | 'telegramTokenFile' | 'telegramStateDir'>, launchId: string): ChannelServerLaunch | undefined {
-  return paths.minionsShim ? { command: paths.minionsShim, launchId, tokenFile: paths.telegramTokenFile, stateDir: paths.telegramStateDir } : undefined;
+  return { command: paths.minionsShim ?? 'minions', launchId, tokenFile: paths.telegramTokenFile, stateDir: paths.telegramStateDir };
 }
 
 /** `--print-command` on the host: the argv with a placeholder launch id (shim missing: the plain `minions` command). */
@@ -743,7 +706,8 @@ export async function hostChannelProbe(cfg: MinionsConfig, token: MountedToken, 
 export async function hostChannelReport(token: MountedToken, paths: Pick<RuntimePaths, 'minionsShim'>, deps: Pick<RunCoordinatorDeps, 'claudeVersion' | 'exists'> = {}): Promise<HostChannelServerReport> {
   const version = await (deps.claudeVersion ?? (() => claudeVersionText()))().catch(() => null);
   const exists = deps.exists ?? existsSync;
-  return hostChannelServerProbe({ claudeVersion: version, token: token.state, command: !!paths.minionsShim && exists(paths.minionsShim) });
+  // The container has `minions` on PATH; the host runtime starts the server through its shim.
+  return hostChannelServerProbe({ claudeVersion: version, token: token.state, command: !paths.minionsShim || exists(paths.minionsShim) });
 }
 
 /** Signals that end the wrapper cleanly before claude starts (Ctrl-C there is meant for the wrapper). */
@@ -817,13 +781,7 @@ export async function runCoordinator(cfg: MinionsConfig, deps: RunCoordinatorDep
   const paths = deps.paths ?? runtimePaths();
   const log = deps.log ?? ((l: string) => process.stderr.write(l + '\n'));
   const token = await readMountedToken(paths.telegramTokenFile, deps.readText);
-  const onHost = runtimeMode() === 'host-runtime';
-  let probe: ChannelFacts['probe'] = null;
-  if (onHost) {
-    probe = await hostChannelProbe(cfg, token, paths, deps).catch(() => null) ?? null;
-  } else if (cfg.communication.channel !== 'terminal' && cfg.container.network !== 'none' && token.state === 'ok') {
-    try { probe = await (deps.probe ?? (() => probeTelegram()))(); } catch { probe = null; }
-  }
+  const probe: ChannelFacts['probe'] = await hostChannelProbe(cfg, token, paths, deps).catch(() => null) ?? null;
   // A signal during the probe window cancels the launch (see PreSpawnGuard); checked after every await.
   const cancelled = () => (deps.preSpawn?.signal ? exitCodeOf(null, deps.preSpawn.signal) : null);
   if (cancelled() !== null) return cancelled()!;
@@ -840,7 +798,7 @@ export async function runCoordinator(cfg: MinionsConfig, deps: RunCoordinatorDep
   if (cancelled() !== null) return cancelled()!;
   const perm = decidePermissionMode(cfg, { modes: permissionModes });
   if (perm.fallback) log(`minions: ${perm.reason}`);
-  // Host runtime: the launch id ties our channel server to this launch (it activates only when the record matches).
+  // The launch id ties our channel server to this launch (it activates only when the record matches).
   const ownServer = decision.enabled && decision.server === 'minions';
   const launchId = ownServer ? (deps.newLaunchId ?? randomUUID)() : undefined;
   const channelServer = ownServer && launchId ? channelServerLaunch(paths, launchId) : undefined;
@@ -848,27 +806,17 @@ export async function runCoordinator(cfg: MinionsConfig, deps: RunCoordinatorDep
   // Decision 7); no model holds the chat.
   const gateway = isGatewayLaunch(cfg, decision) && channelServer ? channelServer : null;
   if (gateway) log('minions: coordinator sessions on: the Telegram gateway routes owner messages (no router model).');
+  else if (sessionsOn(cfg)) log('minions: coordinator sessions need Telegram; without it this is the single coordinator.');
   else if (ownServer) log(`minions: ${DEV_CHANNELS_DIALOG_NOTE}.`);
   const c = gateway ? { cmd: gateway.command, args: ['telegram', 'gateway'], cwd: paths.workspace }
     : await buildClaudeCommand(cfg, paths, { telegram: decision.enabled, startupPrompt: deps.startupPrompt, permissionModes, ...(channelServer ? { channelServer } : {}) });
   if (cancelled() !== null) return cancelled()!;
-  // Task-51: the plugin stays off at user scope, so only this launch (its --settings enabledPlugins)
-  // loads it. Re-applied on every launch: existing setups get it on the next start, restart or upgrade.
-  // The host runtime loads no user settings at all.
-  if (!onHost) {
-    const u = await (deps.userScope ?? disableTelegramAtUserScope)(paths.claudeUserSettings, { create: decision.enabled }).catch((e: unknown) => ({ state: 'error' as const, detail: (e as Error).message }));
-    if (u.state === 'disabled') log(`minions: ${u.detail}.`);
-    else if (u.state === 'error') log(`minions: warning: could not turn the Telegram plugin off at user scope (${u.detail}); other claude sessions in this container may take over the bot.`);
-  }
   // Before the launch record: a cancelled wrapper must not overwrite its successor's record.
   if (cancelled() !== null) return cancelled()!;
   const env: NodeJS.ProcessEnv = { ...(deps.env ?? process.env) };
+  // The channel server reads the token from its file: it is never in the claude env, nor in argv.
   delete env[TELEGRAM_TOKEN_ENV];
-  // The official plugin reads the token from the env (Docker). The minions server reads it from the file itself, so
-  // on the host the token is never in the claude env (nor in argv: the MCP config carries only the file path).
-  if (decision.enabled && !ownServer && token.state === 'ok') env[TELEGRAM_TOKEN_ENV] = token.token;
   if (gateway) Object.assign(env, { [TOKEN_FILE_ENV]: gateway.tokenFile, [LAUNCH_ENV]: gateway.launchId, TELEGRAM_STATE_DIR: gateway.stateDir });
-  else if (isRouterLaunch(cfg)) Object.assign(env, ROUTER_SESSION_ENV);
   const record: LaunchRecord = { version: 1, pid: process.pid, startedAt: new Date().toISOString(), fingerprint: launchFingerprint(cfg, token), channel: cfg.communication.channel, telegram: decision, ...(launchId ? { launchId } : {}) };
   await atomicWrite(paths.coordinatorLaunch, JSON.stringify(record, null, 2) + '\n').catch(() => { /* state not writable: restart detection degrades */ });
   const spawn = deps.spawn ?? (nodeSpawn as unknown as SpawnLike);
@@ -1398,11 +1346,8 @@ export async function telegramPollerStatus(deps: { paths?: RuntimePaths; proc?: 
   const paths = deps.paths ?? runtimePaths();
   const rec = await readLaunchRecord(paths);
   if (!rec) return { state: 'not-applicable', detail: 'no coordinator launch recorded' };
-  if (rec.telegram.enabled && rec.telegram.server === 'minions') {
-    return minionsChannelPollerStatus(rec, paths, { ...systemProcessControl, ...(deps.proc ?? {}) }).catch((e: unknown) => ({ state: 'unknown' as const, detail: (e as Error).message }));
-  }
-  return checkTelegramPoller({ pidFile: join(paths.telegramStateDir, 'bot.pid'), coordinatorPid: rec.pid, telegram: rec.telegram.enabled, proc: deps.proc ?? systemProcessControl, readText: deps.readText })
-    .catch((e: unknown) => ({ state: 'unknown' as const, detail: (e as Error).message }));
+  if (!rec.telegram.enabled) return { state: 'not-applicable', detail: 'the coordinator runs without Telegram' };
+  return minionsChannelPollerStatus(rec, paths, { ...systemProcessControl, ...(deps.proc ?? {}) }).catch((e: unknown) => ({ state: 'unknown' as const, detail: (e as Error).message }));
 }
 
 /**
@@ -1607,7 +1552,7 @@ export async function probeRuntime(cfg?: Pick<MinionsConfig, 'models' | 'permiss
   const text = help.stdout + help.stderr;
   const flags = ['--plugin-dir', '--append-system-prompt', '--permission-mode', '--settings',
     ...(onHost ? ['--setting-sources', '--strict-mcp-config', '--add-dir'] : []),
-    ...(cfg?.models.coordinator || (cfg && isRouterLaunch(cfg)) ? ['--model'] : []), ...(cfg && roleEffort(cfg, 'coordinator') ? ['--effort'] : [])];
+    ...(cfg?.models.coordinator ? ['--model'] : []), ...(cfg && roleEffort(cfg, 'coordinator') ? ['--effort'] : [])];
   const missing = flags.filter((f) => !text.includes(f));
   if (help.code !== 0 || missing.length) {
     throw new MinionsError('INCOMPATIBLE_RUNTIME',

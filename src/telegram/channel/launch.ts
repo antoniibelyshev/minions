@@ -1,6 +1,5 @@
-// Launch swap for the minions-owned Telegram channel server in the HOST runtime (task-6; docs/design/telegram-channel.md
-// "Launch swap and fallback", docs/design/host-runtime.md "Telegram on the host"). The Docker runtime keeps the
-// official plugin (`--channels plugin:telegram@claude-plugins-official`); nothing here is used there.
+// Launch of the minions-owned Telegram channel server (task-6; docs/design/telegram-channel.md "Launch swap and
+// fallback"), in both runtimes: the coordinator claude loads it as its only MCP server, or the gateway runs it.
 //
 // - The coordinator claude gets `--mcp-config <inline JSON>` with only our server (next to `--strict-mcp-config`, so no
 //   other MCP server loads) and `--dangerously-load-development-channels server:minions-telegram` (the tagged spec the
@@ -30,7 +29,7 @@ export const DEV_CHANNELS_MIN_VERSION = '2.1.292';
 export const DEV_CHANNELS_DIALOG_NOTE = `Claude Code shows "WARNING: Loading development channels" (${MINIONS_CHANNEL_SPEC}) at every start: attach and choose "I am using this for local development"`;
 
 export interface ChannelServerLaunch {
-  /** Absolute program that runs `minions` (the host runtime shim). */
+  /** The program that runs `minions` (the host runtime shim; `minions` on PATH in the container). */
   command: string;
   launchId: string;
   tokenFile: string;

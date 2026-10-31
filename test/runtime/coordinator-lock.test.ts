@@ -576,7 +576,7 @@ describe('wrapper signal handling releases the lock', () => {
       const probing = deferred<void>();
       const report = deferred<never>();
       const p = coordinatorWrapper(async () => cfg, {
-        paths, spawn: child.spawn, permissionModes: autoModes, probe: () => { probing.resolve(); return report.promise; }, env: {}, log: () => {}, signals: bus,
+        paths, spawn: child.spawn, permissionModes: autoModes, claudeVersion: () => { probing.resolve(); return report.promise; }, env: {}, log: () => {}, signals: bus,
       });
       await probing.promise;
       expect(lockOf(paths)).toMatchObject({ pid: process.pid });

@@ -11,7 +11,6 @@ import {
 import { runtimePaths } from '../../src/runtime/paths.js';
 import { DEV_CHANNELS_FLAG, MINIONS_CHANNEL_SPEC } from '../../src/telegram/channel/launch.js';
 import { LAUNCH_ENV, TOKEN_FILE_ENV } from '../../src/telegram/channel/server.js';
-import { TELEGRAM_CHANNEL_SPEC } from '../../src/telegram/probe.js';
 import { preTelegramHook } from '../../src/runtime/hooks.js';
 import { telegramReadiness } from '../../src/host/doctor.js';
 import { resolveChannel } from '../../src/telegram/channel.js';
@@ -97,7 +96,6 @@ describe('host coordinator launch with the minions channel server', () => {
     // Only our server, next to --strict-mcp-config; the plugin's --channels is not used.
     expect(args).toContain('--strict-mcp-config');
     expect(args).not.toContain('--channels');
-    expect(args).not.toContain(TELEGRAM_CHANNEL_SPEC);
     expect(argAfter(args, DEV_CHANNELS_FLAG)).toBe(MINIONS_CHANNEL_SPEC);
     const mcp = JSON.parse(argAfter(args, '--mcp-config')) as { mcpServers: Record<string, { command: string; args: string[]; env: Record<string, string> }> };
     expect(Object.keys(mcp.mcpServers)).toEqual(['minions-telegram']);
@@ -186,7 +184,7 @@ describe('host runtime: hook, poller status and doctor readiness', () => {
   it('doctor names the minions channel server on the host, or terminal with the precise reason', () => {
     const facts = { token: 'ok', runtime: 'host', network: 'outbound-internet' } as const;
     const okRes = resolveChannel('telegram', { ...facts, probe: { available: true, summary: 'ok', items: [] } });
-    expect(telegramReadiness(okRes, undefined, 'stored' as never, 'host')).toMatchObject({ status: 'ok', detail: expect.stringMatching(/minions channel server is available \(host runtime\)/) });
+    expect(telegramReadiness(okRes, undefined, 'stored' as never, 'host')).toMatchObject({ status: 'ok', detail: expect.stringMatching(/minions channel server is available/) });
     const old = 'the minions Telegram channel server cannot start: Claude Code 2.1.200 predates the development channel flag';
     const badRes = resolveChannel('telegram', { ...facts, probe: { available: false, summary: old, items: [] } });
     const check = { name: 'telegram.server', status: 'unavailable' as const, detail: old, hint: 'Update Claude Code on the host.' };

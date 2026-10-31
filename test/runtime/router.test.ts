@@ -9,9 +9,8 @@ import { RuntimeDb } from '../../src/runtime/db.js';
 import { DIGEST_QUESTIONS_META } from '../../src/runtime/digest.js';
 import { ack, enqueue, pending } from '../../src/runtime/outbox.js';
 import {
-  heldBySession, openQuestions, recordSent, resolveRoute, sendToSession, sessionKeyOf, waitForOutbound,
+  heldBySession, openQuestions, recordSent, resolveRoute, sendToSession, sessionKeyOf,
 } from '../../src/runtime/router.js';
-import { ROUTER_PROMPT } from '../../src/runtime/router-prompt.js';
 import { getSession, openSession, pendingInbox, updateSession } from '../../src/runtime/session-store.js';
 import { defaults } from '../helpers.js';
 import { tmp } from './fixtures.js';
@@ -158,49 +157,6 @@ describe('sendToSession (coordinator send)', () => {
   });
 });
 
-describe('waitForOutbound (coordinator wait)', () => {
-  /** A fake clock that the fake sleep advances. */
-  const fakeTime = () => {
-    let t = NOW.getTime();
-    const sleeps: number[] = [];
-    return { now: () => new Date(t), sleep: async (ms: number) => { sleeps.push(ms); t += ms; }, sleeps, advance: (ms: number) => { t += ms; } };
-  };
-
-  it('times out when nothing is due, sleeping in poll steps', async () => {
-    const f = fakeTime();
-    const r = await waitForOutbound({ db, now: f.now, sleep: f.sleep, pollMs: 1000, timeoutMs: 3000 });
-    expect(r).toMatchObject({ reason: 'timeout', items: [] });
-    expect(f.sleeps).toEqual([1000, 1000, 1000]);
-  });
-
-  it('returns as soon as a task session item is due, with its session', async () => {
-    const f = fakeTime();
-    let polls = 0;
-    const r = await waitForOutbound({
-      db, now: f.now, pollMs: 1000, timeoutMs: 60_000,
-      sleep: async (ms) => { if (++polls === 2) enqueue(db, { key: 'delivered:task-3:abc', kind: 'delivered', taskId: 'task-3', text: 'done', session: 'task:task-3' }, f.now); await f.sleep(ms); },
-    });
-    expect(r).toMatchObject({ reason: 'due', items: [{ key: 'delivered:task-3:abc', kind: 'delivered', taskId: 'task-3', session: 'task:task-3' }], waitedMs: 2000 });
-  });
-
-  it('a held item is not due; a due digest ends the wait; the hold-back runs before each look', async () => {
-    const f = fakeTime();
-    enqueue(db, { key: 'delivered:task-9:x', kind: 'delivered', text: 'held', holdUntil: '2026-10-30T07:00:00.000Z' }, f.now);
-    let holds = 0;
-    const r = await waitForOutbound({ db, now: f.now, sleep: f.sleep, pollMs: 1000, timeoutMs: 10_000, holdBack: () => { holds++; },
-      digestDue: (now) => (now.getTime() - NOW.getTime() >= 2000 ? 'digest 08:00 due' : null) });
-    expect(r).toMatchObject({ reason: 'digest', digest: 'digest 08:00 due', items: [] });
-    expect(holds).toBe(3);
-  });
-
-  it('stops on its signal', async () => {
-    const f = fakeTime();
-    const stop = new AbortController();
-    const r = await waitForOutbound({ db, now: f.now, sleep: async (ms) => { stop.abort(); await f.sleep(ms); }, signal: stop.signal, pollMs: 1000, timeoutMs: 60_000 });
-    expect(r.reason).toBe('stopped');
-  });
-});
-
 describe('outbound: notify enqueue --session and notify ack --message-id', () => {
   it('the outbox keeps the session; recordSent maps the message id to each key and its session', () => {
     enqueue(db, { key: 'status:general:1', kind: 'status', text: 'All fine', session: 'general' }, clock);
@@ -223,19 +179,5 @@ describe('helpers', () => {
 
   it('heldBySession: task and general session leases never block a router restart; the single coordinator\'s do', () => {
     expect([null, '', 'coordinator', 'task:task-1', 'general', 'router'].map(heldBySession)).toEqual([false, false, false, true, true, false]);
-  });
-});
-
-describe('the router prompt and the route skill agree on resets (task-57.12 review)', () => {
-  const skill = readFileSync(join(import.meta.dirname, '..', '..', 'templates', 'plugin', 'skills', 'route', 'SKILL.md'), 'utf8');
-  it('restart only in the Reset step, which runs handoff --check every turn; no blanket "never restart"', () => {
-    for (const text of [ROUTER_PROMPT, skill]) {
-      expect(text).not.toMatch(/never restart the coordinator/i);
-      expect(text).not.toMatch(/start \`claude\`, restart the coordinator/);
-      expect(text).toContain('minions coordinator handoff --check --json');
-      expect(text).toMatch(/only (time you restart yourself|in the Reset step)/);
-    }
-    expect(skill).toMatch(/## Reset \(the last step of every turn\)\n\n1\. Run `minions coordinator handoff --check --json`/);
-    expect(skill).toContain('minions coordinator restart --detach --recover --json');
   });
 });

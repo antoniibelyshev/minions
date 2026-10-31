@@ -452,10 +452,10 @@ async function prepare(opts: InitOptions, docker?: DockerStatus): Promise<Prepar
         `Telegram bot token from BotFather, stored on the host (Keychain or 0600 file) and mounted read-only at ${TELEGRAM_TOKEN_CONTAINER_PATH}; only the coordinator process receives it.`,
         'The runtime image includes a pinned Bun (the Telegram plugin runs on it); an existing image is rebuilt on the next `minions start`.',
         'On `minions start` the container installs telegram@claude-plugins-official at user scope (needs network; no login).',
-        'Pairing happens in the coordinator terminal (/telegram:access pair <code>, then /telegram:access policy allowlist); pair only yourself.',
+        'Pairing happens on the host (`minions telegram access pair <code>`, then `minions telegram access policy allowlist`); pair only yourself.',
         'Telegram changes are restart-required: `minions start` restarts the coordinator in a controlled way.',
       ] : effective.communication.channel === 'auto' && runtime !== 'host' && effective.container.network !== 'none' ? [
-        'Optional Telegram (communication.channel auto): create a bot with BotFather, store its token with `minions auth telegram`, then `minions down && minions start`; pair in the coordinator terminal (/telegram:access pair <code>, then /telegram:access policy allowlist). Without a token the coordinator uses the terminal.',
+        'Optional Telegram (communication.channel auto): create a bot with BotFather, store its token with `minions auth telegram`, then `minions down && minions start`; pair on the host (`minions telegram access pair <code>`, then `minions telegram access policy allowlist`). Without a token the coordinator uses the terminal.',
       ] : []),
     ],
     notes, warnings,
@@ -798,7 +798,7 @@ export async function runInit(opts: InitOptions): Promise<InitResult> {
         ...(setup?.nextSteps ?? []),
         ...(plan.communication.channel === 'telegram' ? [
           ...(tgReady ? [] : ['Run `minions auth telegram` to store the Telegram bot token (entered without echo); until then the coordinator is terminal-only.']),
-          'After the first start, pair in the coordinator terminal: DM your bot, type /telegram:access pair <code>, then /telegram:access policy allowlist.',
+          'After the first start, DM your bot, then pair on the host: `minions telegram access pair <code>`, then `minions telegram access policy allowlist`.',
         ] : plan.communication.channel === 'auto' && !hostRuntime ? [
           'Optional Telegram (channel auto): `minions auth telegram` stores a bot token; the coordinator then uses Telegram after `minions down && minions start`.',
         ] : []),

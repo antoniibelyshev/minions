@@ -1,23 +1,15 @@
 // communication.channel resolution (src/telegram/channel.ts): the matrix of configured value × token ×
-// runtime, the plugin probe fallback, and the coordinator launch decision built on it.
+// runtime, the channel server check fallback, and the coordinator launch decision built on it.
 import { describe, expect, it } from 'vitest';
 import type { ChannelSetting, MinionsConfig } from '../../src/config/schema.js';
 import type { RunResult } from '../../src/core/exec.js';
 import { decideTelegram } from '../../src/runtime/coordinator.js';
 import { resolveChannel, type ChannelFacts } from '../../src/telegram/channel.js';
 import { hostChannelServerProbe } from '../../src/telegram/channel/launch.js';
-import { evaluateTelegram, TELEGRAM_PLUGIN_ID } from '../../src/telegram/probe.js';
 import { defaults } from '../helpers.js';
 
-const ok = (stdout: string): RunResult => ({ code: 0, stdout, stderr: '' });
-const facts = (bun = true) => ({
-  claude: ok('2.1.292 (Claude Code)\n'), bun: bun ? ok('1.4.3\n') : { code: 127, stdout: '', stderr: 'bun: not found' },
-  marketplaces: ok(JSON.stringify([{ name: 'claude-plugins-official', source: 'github', repo: 'anthropics/claude-plugins-official' }])),
-  plugins: ok(JSON.stringify([{ id: TELEGRAM_PLUGIN_ID, version: '0.0.7', scope: 'user', enabled: true }])),
-  managed: { present: false } as const,
-});
-const available = () => evaluateTelegram(facts());
-const noBun = () => evaluateTelegram(facts(false));
+const available = () => hostChannelServerProbe({ claudeVersion: '2.1.308 (Claude Code)', token: 'ok', command: true });
+const noBun = () => hostChannelServerProbe({ claudeVersion: '2.0.1 (Claude Code)', token: 'ok', command: true });
 const TOKEN = '123456789:AAHfakefakefakefakefakefakefake_-0123';
 
 describe('resolution matrix: channel × token stored × runtime', () => {
@@ -26,11 +18,11 @@ describe('resolution matrix: channel × token stored × runtime', () => {
     ['terminal', 'missing', 'docker', 'terminal', false, /^communication.channel is terminal$/],
     ['terminal', 'ok', 'host', 'terminal', false, /^communication.channel is terminal$/],
     ['terminal', 'missing', 'host', 'terminal', false, /^communication.channel is terminal$/],
-    ['auto', 'ok', 'docker', 'telegram', true, /^auto: Telegram bot token stored and the official plugin is available$/],
+    ['auto', 'ok', 'docker', 'telegram', true, /^auto: Telegram bot token stored and the minions channel server is available$/],
     ['auto', 'missing', 'docker', 'terminal', false, /^auto: no Telegram bot token is stored.*minions auth telegram/],
-    ['auto', 'ok', 'host', 'telegram', true, /^auto: Telegram bot token stored and the minions channel server is available \(host runtime\)$/],
+    ['auto', 'ok', 'host', 'telegram', true, /^auto: Telegram bot token stored and the minions channel server is available$/],
     ['auto', 'missing', 'host', 'terminal', false, /^auto: no Telegram bot token is stored.*minions auth telegram/],
-    ['telegram', 'ok', 'docker', 'telegram', true, /official plugin is available/],
+    ['telegram', 'ok', 'docker', 'telegram', true, /minions channel server is available/],
     ['telegram', 'missing', 'docker', 'terminal', true, /not provisioned; run `minions auth telegram`/],
     ['telegram', 'ok', 'host', 'telegram', true, /minions channel server is available/],
     ['telegram', 'missing', 'host', 'terminal', true, /not provisioned; run `minions auth telegram`/],
@@ -51,7 +43,7 @@ describe('resolution matrix: channel × token stored × runtime', () => {
     expect(resolveChannel('auto', { ...base, probe: null })).toMatchObject({ effective: 'terminal', cause: 'probe-not-run' });
     const failing = resolveChannel('auto', { ...base, probe: noBun() });
     expect(failing).toMatchObject({ effective: 'terminal', cause: 'plugin-unavailable', degraded: true });
-    expect(failing.reason).toMatch(/^auto: .*Bun is not installed/);
+    expect(failing.reason).toMatch(/^auto: .*2\.0\.1/);
     // Host-side prediction (no probe): Telegram expected, decided at launch.
     expect(resolveChannel('auto', base)).toMatchObject({ effective: 'telegram', cause: 'unchecked' });
     expect(resolveChannel('telegram', base)).toMatchObject({ effective: 'telegram', cause: 'unchecked' });
@@ -76,7 +68,7 @@ describe('coordinator launch decision uses the same resolution', () => {
   it('auto: enabled with a mounted token and an available plugin in docker; terminal otherwise', () => {
     expect(decideTelegram(cfg('auto'), tok, available(), false)).toMatchObject({ enabled: true, reason: expect.stringMatching(/auto: bot token stored/) });
     expect(decideTelegram(cfg('auto'), { state: 'missing' }, null, false)).toMatchObject({ enabled: false, reason: expect.stringMatching(/^auto: no Telegram bot token/) });
-    expect(decideTelegram(cfg('auto'), tok, noBun(), false)).toMatchObject({ enabled: false, reason: expect.stringMatching(/Bun is not installed/) });
+    expect(decideTelegram(cfg('auto'), tok, noBun(), false)).toMatchObject({ enabled: false, reason: expect.stringMatching(/2\.0\.1/) });
     expect(decideTelegram(cfg('auto', { network: 'none' }), tok, available(), false)).toMatchObject({ enabled: false, reason: expect.stringMatching(/network is none/) });
   });
 
@@ -97,8 +89,8 @@ describe('host runtime: the minions channel server decides, with a precise fallb
     // container.network does not apply on the host.
     const none = cfg('telegram'); none.container.network = 'none';
     expect(decideTelegram(none, tok, probe('2.1.308'), true)).toMatchObject({ enabled: true, server: 'minions' });
-    // Docker keeps the official plugin.
-    expect(decideTelegram(cfg('telegram'), tok, available(), false).server).toBeUndefined();
+    // Docker uses the same server.
+    expect(decideTelegram(cfg('telegram'), tok, available(), false).server).toBe('minions');
   });
 
   it('falls back to terminal naming the cause: old Claude Code, no version, missing shim, missing token', () => {

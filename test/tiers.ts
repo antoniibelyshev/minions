@@ -111,6 +111,5 @@ export const INTEGRATION_TESTS: readonly string[] = [
   'test/runtime/workspace.test.ts',
   'test/telegram/channel-lock-processes.test.ts',
   'test/telegram/launch.test.ts',
-  'test/telegram/probe.test.ts',
   'test/telegram/wrapper-signals.test.ts',
 ];

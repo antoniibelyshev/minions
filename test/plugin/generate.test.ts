@@ -50,7 +50,7 @@ const EXPECTED = [
   'hooks/hooks.json',
   'skills/intake/SKILL.md', 'skills/maintain-context/SKILL.md', 'skills/orchestrate/SKILL.md',
   'skills/recover/SKILL.md',
-  'skills/route/SKILL.md', 'skills/status/SKILL.md', 'skills/task/SKILL.md',
+  'skills/status/SKILL.md', 'skills/task/SKILL.md',
 ];
 /** Generated worker definitions and the lease role each runs under. */
 const WORKER_AGENTS = [['engineer', 'engineer'], ['engineer-deep', 'engineer'], ['tester', 'tester'], ['reviewer', 'reviewer']] as const;
@@ -127,7 +127,7 @@ describe('generatePlugin', () => {
 
   it('skill frontmatter has name and description only', async () => {
     const { read } = await gen();
-    for (const s of ['orchestrate', 'status', 'intake', 'recover', 'maintain-context', 'task', 'route']) {
+    for (const s of ['orchestrate', 'status', 'intake', 'recover', 'maintain-context', 'task']) {
       const fm = frontmatter(await read(`skills/${s}/SKILL.md`));
       expect(Object.keys(fm).sort()).toEqual(['description', 'name']);
       expect(fm.name).toBe(s);
@@ -328,12 +328,10 @@ describe('Telegram tools are coordinator-only', () => {
     const { read } = await gen(telegram());
     const coord = await read('coordinator.md');
     expect(coord).toContain('Communication channel: Telegram');
-    // task-57.15: owner messages arrive under either source form (plugin or standalone server).
-    expect(coord).toContain('`<channel source="plugin:telegram:telegram" chat_id=… …>`');
-    expect(coord).toContain('`<channel source="telegram" chat_id=… …>`');
-    expect(coord).toContain('the plugin drops unpaired senders');
+    expect(coord).toContain('`<channel source="minions-telegram" chat_id=… message_id=… …>`');
+    expect(coord).toContain('the channel server drops unpaired senders');
     expect(coord).toMatch(/Never give them to workers/);
-    expect(coord).toMatch(/Pairing and access changes .* happen only in the terminal/);
+    expect(coord).toMatch(/Pairing and access changes .* happen only there/);
     const terminal = defaults(); terminal.communication.channel = 'terminal';
     const term = await gen(terminal);
     expect(await term.read('coordinator.md')).toContain('Telegram is not configured for this project.');
@@ -345,7 +343,7 @@ describe('Telegram tools are coordinator-only', () => {
     const { read } = await gen(telegram());
     const coord = await read('coordinator.md');
     expect(coord).toMatch(/\*\*When the channel drops\*\*.*`minions status` shows a `telegram poller` problem/);
-    expect(coord).toContain('run /mcp and reconnect plugin:telegram:telegram');
+    expect(coord).toContain('run /mcp and reconnect minions-telegram');
     expect(coord).toContain('`minions coordinator restart --recover`');
     expect(coord).toMatch(/Never launch other claude sessions yourself outside a controlled live run \(see Testing\), and never ask a worker to/);
     for (const [role] of WORKER_AGENTS) {

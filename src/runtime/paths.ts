@@ -101,7 +101,7 @@ export function runtimePaths(env: NodeJS.ProcessEnv = process.env, opts: { inCon
     /** Headless Claude token (login method) for `minions coordinator live-run` (src/runtime/headless.ts). */
     claudeHeadlessTokenFile: join(secretsDir, CLAUDE_HEADLESS_TOKEN_FILE),
     tmuxSocket: env.MINIONS_TMUX_SOCKET || null,
-    /** The official plugin's state dir (same resolution as the plugin: TELEGRAM_STATE_DIR, else CLAUDE_CONFIG_DIR/channels/telegram). */
+    /** The channel server's state dir (TELEGRAM_STATE_DIR, else CLAUDE_CONFIG_DIR/channels/telegram; the host runtime: its own dir). */
     /**
      * User-scope Claude Code settings the coordinator's claude reads (CLAUDE_CONFIG_DIR/settings.json).
      * runCoordinator turns the Telegram plugin off here (task-51: only the coordinator launch enables it).

@@ -222,7 +222,7 @@ export async function preAgentHook(input: unknown, load: HookLoader): Promise<Ho
 export function preTelegramHook(input: unknown): HookOutput {
   if (!isObj(input)) return deny('minions could not read the Telegram hook input (not a JSON object); refusing the call.');
   const tool = input.tool_name;
-  // The official plugin's tools (Docker) or the minions channel server's (host runtime, task-6).
+  // The minions channel server's tools.
   if (typeof tool !== 'string' || !TELEGRAM_TOOL_PREFIXES.some((p) => tool.startsWith(p) && tool.length > p.length)) {
     const what = typeof tool === 'string' ? `a non-Telegram tool_name (${JSON.stringify(tool.slice(0, 80))})` : 'no tool_name';
     return deny(`minions pre-telegram hook got ${what}; refusing the call.`);
@@ -282,7 +282,7 @@ type EntryMatch = (words: readonly string[], entry: number) => string | null;
  * `supervise` (task-57 phase 5) is the session supervisor, which starts headless coordinator sessions: only the
  * wrapper starts it.
  */
-export const COORDINATOR_ONLY_COORDINATOR_VERBS = ['live-run', 'supervise', 'route', 'send', 'wait'] as const;
+export const COORDINATOR_ONLY_COORDINATOR_VERBS = ['live-run', 'supervise', 'send', 'handover'] as const;
 
 /** `group` after the entry word, then one of `verbs` as the next non-option word. */
 function groupVerb(words: readonly string[], entry: number, group: string, verbs: readonly string[]): string | null {

@@ -9,7 +9,6 @@ import { validateConfig } from '../../src/config/resolve.js';
 import type { MinionsConfig } from '../../src/config/schema.js';
 import { classifyKey } from '../../src/config/setting-classes.js';
 import { MinionsError } from '../../src/core/errors.js';
-import { TELEGRAM_PLUGIN_ID } from '../../src/telegram/probe.js';
 import { RuntimeDb, SCHEMA_VERSION } from '../../src/runtime/db.js';
 import { runtimePaths, type RuntimePaths } from '../../src/runtime/paths.js';
 import {
@@ -150,7 +149,7 @@ describe('buildSessionCommand', () => {
 
     // settings: the plugin is disabled, no Telegram tool is allowed, no Telegram hook.
     expect(JSON.parse(valueOf(l.args, '--settings')!)).toEqual(l.flagSettings);
-    expect(l.flagSettings.enabledPlugins).toEqual({ [TELEGRAM_PLUGIN_ID]: false });
+    expect(l.flagSettings).not.toHaveProperty('enabledPlugins');
     const { enabledPlugins: _off, ...rest } = l.flagSettings;
     expect(JSON.stringify(rest)).not.toMatch(/telegram/i);
     expect(hookCommands(l.flagSettings)).toEqual([]);
@@ -180,7 +179,7 @@ describe('buildSessionCommand', () => {
     // The general session's note (phase 8), never the task note; no channel.
     expect(valueOf(l.args, '--append-system-prompt')).toBe('session prompt\n' + GENERAL_SESSION_NOTE);
     expect(l.args).not.toContain('--channels');
-    expect(l.flagSettings.enabledPlugins).toEqual({ [TELEGRAM_PLUGIN_ID]: false });
+    expect(l.flagSettings).not.toHaveProperty('enabledPlugins');
     expect(Object.keys(l.env).filter((k) => k.startsWith('TELEGRAM_'))).toEqual([]);
     expect(l.env.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
     expect(JSON.stringify([l.args, l.env, l.flagSettings, l.userSettings])).not.toContain(PROVISIONED_KEY);

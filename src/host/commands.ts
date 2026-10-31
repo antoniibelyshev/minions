@@ -67,19 +67,6 @@ async function materialize(json: boolean, projectId: string): Promise<void> {
   }
 }
 
-/**
- * Telegram startup integration (container): install the official plugin when Telegram is selected,
- * then apply restart-required Telegram changes with a controlled coordinator restart. Never fails
- * the start: terminal mode must keep working.
- */
-async function telegramStartup(json: boolean, compose: Compose, config: MinionsConfig, opts: { startDetached: boolean; wantsTelegram: boolean }): Promise<unknown> {
-  if (opts.wantsTelegram && config.container.network !== 'none') {
-    const r = await compose.exec(['minions', 'telegram', 'install', '--json'], { allowFailure: true, timeoutMs: 600_000 });
-    if (r.code !== 0) say(json, `warning: Telegram plugin not installed (${lastLine(r.stdout, r.stderr)}); the coordinator starts terminal-only.`);
-  }
-  return coordinatorSync(json, compose, opts);
-}
-
 async function coordinatorSync(json: boolean, compose: Compose, opts: { startDetached: boolean }): Promise<unknown> {
   const r = await compose.exec(['minions', 'coordinator', 'sync', '--json', ...(opts.startDetached ? ['--start-detached'] : [])], { allowFailure: true, timeoutMs: 60_000 });
   let data: { action?: string; reason?: string } | undefined;
@@ -143,7 +130,7 @@ function setupRuntime(json: boolean, cwd: string): SetupRuntime {
       await assertBotFree(p.project, p.config);
       const channel = await hostChannel(p.project, p.config);
       // Started detached so it runs (and Telegram works) with nobody attached; attaching comes after.
-      return (await telegramStartup(json, p.compose, p.config, { startDetached: true, wantsTelegram: channel.wantsTelegram })) as { action?: string; reason?: string } | null;
+      return (await coordinatorSync(json, p.compose, { startDetached: true })) as { action?: string; reason?: string } | null;
     },
     attachCommand: (projectId) => {
       if (hostOpened) return hostOpened.host.attachCommand;
@@ -493,7 +480,7 @@ export function register(program: Command): void {
       if (channel.degraded) say(json, `warning: Telegram is off: ${channel.reason}; the coordinator starts terminal-only.`);
       // attachOnly: never sync/relaunch the running coordinator onto a bot another project polls.
       const coordinator = attachOnly ? { action: 'unchanged', reason: 'bot conflict: the running coordinator was left unchanged' }
-        : await telegramStartup(json, compose, config, { startDetached: !attach && channel.wantsTelegram, wantsTelegram: channel.wantsTelegram });
+        : await coordinatorSync(json, compose, { startDetached: !attach && channel.wantsTelegram });
       if (!attach) {
         emit({ projectId: project.projectId, runtime: 'docker', running: true, imported, coordinator, attach: `docker compose -p ${compose.name} -f ${compose.file} exec ${'app'} minions coordinator` },
           { json, human: () => `Container ${compose.name} is running. Run \`minions start\` in a terminal to attach the coordinator.` });
@@ -796,10 +783,8 @@ export function register(program: Command): void {
         resolved ? `communication.channel: ${formatChannel(resolved)}` : '',
         ...(channel.hint ? [`hint: ${channel.hint}`] : []),
         ...(resolved?.effective === 'telegram' ? [
-          ...(channel.result ? [] : ['Start (or restart) with Telegram: `minions down && minions start` (installs the plugin and relaunches the coordinator).']),
-          runtimeOf(project) === 'host'
-            ? 'Then pair in a terminal on the host: DM your bot, run `minions telegram access pair <code>`, then `minions telegram access policy allowlist`.'
-            : 'Then pair in the coordinator terminal: DM your bot, type /telegram:access pair <code>, then /telegram:access policy allowlist.',
+          ...(channel.result ? [] : ['Start (or restart) with Telegram: `minions down && minions start` (relaunches the coordinator).']),
+          'Then pair in a terminal on the host: DM your bot, run `minions telegram access pair <code>`, then `minions telegram access policy allowlist`.',
         ] : []),
       ].filter(Boolean).join('\n') });
     }));

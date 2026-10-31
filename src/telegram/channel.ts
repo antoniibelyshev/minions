@@ -9,9 +9,9 @@
 //   the minions channel server allow it, same fallback semantics as "telegram"); otherwise terminal,
 //   quietly when no token is stored.
 //
-// Docker runs the official plugin (`--channels`); the host runtime runs the minions-owned channel server
-// (`--mcp-config` + the development channel flag, src/telegram/channel/launch.ts, task-6). There the "probe" is
-// hostChannelServerProbe (Claude Code version, token file, shim) and container.network does not apply.
+// Both runtimes run the minions-owned channel server (`--mcp-config` + the development channel flag, or the gateway;
+// src/telegram/channel/launch.ts). The "probe" is hostChannelServerProbe (Claude Code version, token file, command);
+// container.network applies to Docker only.
 import type { ChannelSetting } from '../config/schema.js';
 import type { TelegramProbeReport } from './probe.js';
 
@@ -60,16 +60,16 @@ export function resolveChannel(configured: ChannelSetting, f: ChannelFacts): Cha
     return out('terminal', 'no-token', 'auto: no Telegram bot token is stored for this project (`minions auth telegram` enables Telegram)', false);
   }
   const host = f.runtime === 'host';
-  if (!host && f.network === 'none') return out('terminal', 'network-none', `${pre}container.network is none; the Telegram plugin needs api.telegram.org and the npm registry`, true);
+  if (!host && f.network === 'none') return out('terminal', 'network-none', `${pre}container.network is none; the Telegram channel needs api.telegram.org`, true);
   if (f.token === 'missing') return out('terminal', 'no-token', TOKEN_MISSING_REASON, true);
   if (f.token === 'invalid') return out('terminal', 'invalid-token', `${pre}the Telegram bot token is ${f.tokenDetail ?? 'invalid'}; run \`minions auth telegram\` on the host`, true);
-  if (f.probe === undefined) return out('telegram', 'unchecked', `${pre}Telegram bot token stored; ${host ? 'the minions channel server is' : 'plugin availability is'} checked when the coordinator starts`, true);
-  if (f.probe === null) return out('terminal', 'probe-not-run', `${pre}the Telegram ${host ? 'channel server check' : 'capability probe'} did not run`, true);
+  if (f.probe === undefined) return out('telegram', 'unchecked', `${pre}Telegram bot token stored; the minions channel server is checked when the coordinator starts`, true);
+  if (f.probe === null) return out('terminal', 'probe-not-run', `${pre}the Telegram channel server check did not run`, true);
   if (!f.probe.available) {
     const hint = f.probe.items.find((i) => i.status !== 'ok' && i.status !== 'unknown' && i.hint)?.hint;
     return out('terminal', 'plugin-unavailable', `${pre}${f.probe.summary}${hint ? ` (${hint})` : ''}`, true);
   }
-  return out('telegram', 'enabled', `${pre}Telegram bot token stored and ${host ? 'the minions channel server is available (host runtime)' : 'the official plugin is available'}`, true);
+  return out('telegram', 'enabled', `${pre}Telegram bot token stored and the minions channel server is available`, true);
 }
 
 /** One line for humans: "auto -> telegram (reason)". */

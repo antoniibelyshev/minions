@@ -160,8 +160,8 @@ const errMsg = (e: unknown, fallback: string) => (e instanceof MinionsError ? e.
 export const PAIRING_STEPS = [
   'Telegram pairing happens in the coordinator terminal (setup cannot approve it):',
   '  1. Attach to the coordinator and DM your bot on Telegram; it replies with a pairing code.',
-  '  2. In the coordinator session run: /telegram:access pair <code>',
-  '  3. Then lock access to the allowlist: /telegram:access policy allowlist (pair only yourself).',
+  '  2. On the host run: minions telegram access pair <code>',
+  '  3. Then lock access to the allowlist: minions telegram access policy allowlist (pair only yourself).',
 ];
 
 /** POSIX shell quoting: plain paths stay as they are, anything else is single-quoted. */

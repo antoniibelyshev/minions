@@ -21,8 +21,7 @@ import { formatRestartRequired, hostStatus, parseErrorEnvelope } from '../host/r
 import { formatManagerOverview, managerOverview, managerOverviewJson } from '../host/manager-status.js';
 import { listChangeRequests } from './change-requests.js';
 import { readTelegramAccess } from '../telegram/access.js';
-import { installTelegramPlugin } from '../telegram/install.js';
-import { formatTelegramProbe, probeTelegram } from '../telegram/probe.js';
+import { formatTelegramProbe } from '../telegram/probe.js';
 import { resolveChannel } from '../telegram/channel.js';
 import { runChannelServer } from '../telegram/channel/server.js';
 import { formatAccessResult, runAccessCommand, type AccessAction } from '../telegram/channel/access-cli.js';
@@ -78,7 +77,7 @@ import { liveRun, liveRunExitCode, type LiveRunReport } from './headless.js';
 import { buildSessionCommand, sessionConfigDir, sessionsSettings, threadSettings } from './sessions.js';
 import { enqueueInbox, openSession } from './session-store.js';
 import { formatSessionsIndex, handoverSession, runGateway, sessionsIndex, setSessionTopic } from './gateway.js';
-import { heldBySession, recordSent, resolveRoute, sendToSession, sessionKeyOf, threadReplyTarget, waitForOutbound, type ReplyContext, type RouteResult, type WaitResult } from './router.js';
+import { heldBySession, recordSent, sendToSession, sessionKeyOf, threadReplyTarget, type ReplyContext } from './router.js';
 import { runSupervisor, startSupervisorWatch, supervisorEnv, supervisorLockState, type SupervisorReport, type SupervisorTaskDeps } from './supervisor.js';
 import { adoptIntegrationBase, runIntegrator, startIntegratorDetached, type IntegratorReport } from './integrator.js';
 import { collectIntegrationStatus, humanIntegration, kickInputs, kickIntegratorIfNeeded, startIntegrationWatch, type IntegrationStatus } from './integration-status.js';
@@ -606,8 +605,8 @@ export function relayRawStatus(result: { code: number; stdout: string; stderr: s
   process.exitCode = result.code || 1;
 }
 
-async function delegate(cmd: Command): Promise<void> {
-  const code = await delegateToRuntime(process.argv.slice(2), { json: globalOpts(cmd).json });
+async function delegate(cmd: Command, o: { tty?: boolean } = {}): Promise<void> {
+  const code = await delegateToRuntime(process.argv.slice(2), { json: globalOpts(cmd).json, ...o });
   process.exit(code);
 }
 
@@ -1237,18 +1236,7 @@ export function register(program: Command): void {
     }));
 
   // Task-57 phase 8: the router's deterministic helpers (src/runtime/router.ts). Coordinator-only like supervise.
-  coord.command('route').description('Router: resolve which coordinator session an owner message (stdin) goes to: a reply, /s <key>, a #ref, a task id, an open question, else general; or ambiguous with candidates (container only)')
-    .option('--reply-to <messageId>', 'the message it replies to (channel meta reply_to_message_id)', (v) => Number(v))
-    .option('--message-id <id>', 'the owner message\'s own id (channel meta message_id): a top-level message starts a new thread session', (v) => Number(v))
-    .action(action(async (o: { replyTo?: number; messageId?: number }, cmd: Command) => {
-      requireMode('runtime');
-      const text = await readInput(undefined, 'the owner message', 'Pipe the message in with a quoted heredoc.');
-      let knownTasks: string[] | null = null;
-      try { knownTasks = (await (await getBacklog()).listTasks()).map((t) => t.id); } catch { knownTasks = null; }
-      const r = resolveRoute(getDb(), { text, replyToMessageId: o.replyTo ?? null, messageId: o.messageId ?? null, threads: threadSettings(await getConfig()).enabled }, { knownTasks });
-      emit(r, { json: globalOpts(cmd).json, human: (x: RouteResult) => x.target ? `${x.target} (${x.rule}: ${x.why})` : `ambiguous (${x.why}): ${x.candidates.map((c, i) => `${i + 1}. ${c.key}`).join(' ')}` });
-    }));
-  coord.command('send <key>').description('Router: hand an owner message (stdin) to a coordinator session (general | task:<id> | thread:<id>); the supervisor delivers it and reopens a closed session (container only)')
+  coord.command('send <key>').description('Hand a message (stdin) to a coordinator session (general | task:<id> | thread:<id>); the supervisor delivers it and reopens a closed session')
     .option('--answers <questionKey>', 'the open question it answers (from coordinator route): marked answered')
     .option('--message-id <id>', 'the owner message id: kept with the inbox message, and replies to it route back to this session', (v) => Number(v))
     .option('--reply-text <text>', 'what the owner replied to (channel meta reply_to_text), shown to the session')
@@ -1284,25 +1272,6 @@ export function register(program: Command): void {
       const r = handoverSession(getDb(), await getConfig(), { from: scope.key, to, state: runtimePaths().state });
       emit(r, { json: globalOpts(cmd).json, human: (x: typeof r) => `handed ${x.messages} message(s) from ${x.from} to ${x.to}; ${x.from} closes now: end your turn` });
     }));
-  coord.command('wait').description('Router: wait until an outbox item or the digest is due (or the timeout), then exit; run it in the background (container only)')
-    .option('--timeout <minutes>', 'give up after this many minutes', (v) => Number(v), 30)
-    .option('--poll <seconds>', 'check interval', (v) => Number(v), 5)
-    .action(action(async (o: { timeout: number; poll: number }, cmd: Command) => {
-      requireMode('runtime');
-      if (!(o.timeout > 0) || !(o.poll > 0)) throw new MinionsError('PRECONDITION', '--timeout and --poll must be positive numbers.');
-      const d = getDb();
-      const cfg = await getConfig();
-      const stop = new AbortController();
-      for (const sig of ['SIGTERM', 'SIGINT', 'SIGHUP'] as const) process.on(sig, () => stop.abort());
-      const r = await waitForOutbound({
-        db: d, timeoutMs: o.timeout * 60_000, pollMs: o.poll * 1000, signal: stop.signal,
-        // As the routine pass: no digest is due while the routine is off.
-        digestDue: (now) => (routineSettings(cfg).enabled ? digestStatus(d, cfg, now).due : null), holdBack: (now) => { reholdExpired(d, cfg, now); },
-        sleep: (ms) => new Promise<void>((res) => { const t = setTimeout(res, ms); stop.signal.addEventListener('abort', () => { clearTimeout(t); res(); }, { once: true }); }),
-      });
-      emit(r, { json: globalOpts(cmd).json, human: (x: WaitResult) => x.reason === 'due' ? `due: ${x.items.map((i) => i.key).join(', ')}` : x.reason === 'digest' ? `digest due: ${x.digest}` : x.reason });
-    }));
-
   // Task-96: the coordinator's controlled live Claude run. Coordinator-only (the pre-bash hook refuses it to every
   // subagent, like `work run|claim|release`), refused while any worker lease is active, fresh CLAUDE_CONFIG_DIR.
   coord.command('live-run').description('Coordinator only: run one headless claude for a controlled live check in a fresh CLAUDE_CONFIG_DIR with the runtime\'s Claude credential (claude args after --, prompt on stdin); refused while any worker lease is active (container only)')
@@ -1335,27 +1304,12 @@ export function register(program: Command): void {
 
   // telegram: credential-free capability probe. Host mode delegates to the container, where Claude Code runs.
   const tg = program.command('telegram').description('Telegram channel support (docs/design/telegram.md, docs/design/telegram-channel.md)');
-  tg.command('probe').description('Report whether the Telegram channel is usable: the official plugin (Docker) or the minions channel server (host runtime); needs no credentials')
+  tg.command('probe').description('Report whether the minions Telegram channel server can run (Claude Code version, token file, command); needs no credentials')
     .action(action(async (_o: unknown, cmd: Command) => {
       if (runtimeMode() === 'host') return delegate(cmd);
-      if (runtimeMode() === 'host-runtime') {
-        // Task-6: the host runtime runs the minions channel server, not the plugin. The token file is only checked for
-        // format here; its content never leaves this process.
-        const paths = runtimePaths();
-        emit(await hostChannelReport(await readMountedToken(paths.telegramTokenFile), paths), { json: globalOpts(cmd).json, human: formatTelegramProbe });
-        return;
-      }
-      emit(await probeTelegram(), { json: globalOpts(cmd).json, human: formatTelegramProbe });
-    }));
-  tg.command('install').description('Install the official Telegram channel plugin at user scope in the claude volume (needs network, no login)')
-    .action(action(async (_o: unknown, cmd: Command) => {
-      if (runtimeMode() === 'host') return delegate(cmd);
-      if (runtimeMode() === 'host-runtime') {
-        throw new MinionsError('PRECONDITION', 'The official Telegram plugin is not used in the host runtime: it would install a plugin into your own Claude Code setup. The host runtime uses the minions channel server instead (nothing to install).',
-          'Store a bot token with `minions auth telegram`, then `minions start`; `minions telegram probe` checks the server.');
-      }
-      const r = await installTelegramPlugin();
-      emit(r, { json: globalOpts(cmd).json, human: (d: typeof r) => [`marketplace ${d.marketplace}; plugin ${d.plugin} (version ${d.version ?? 'unknown'})`, ...d.warnings.map((w) => `warning: ${w}`)].join('\n') });
+      // The token file is only checked for format here; its content never leaves this process.
+      const paths = runtimePaths();
+      emit(await hostChannelReport(await readMountedToken(paths.telegramTokenFile), paths), { json: globalOpts(cmd).json, human: formatTelegramProbe });
     }));
   // The minions-owned channel server (task-67.2, docs/design/telegram-channel.md). The host runtime launch loads it (task-6).
   const tgChannel = tg.command('channel').description('The minions-owned Telegram channel server (MCP over stdio; started by the coordinator launch only)');
@@ -1407,15 +1361,12 @@ export function register(program: Command): void {
     }));
 
   // Pairing for the minions channel server (task-6): a terminal command, never a skill the model can run.
-  const tgAccess = tg.command('access').description('Pair and manage who may use the Telegram channel (host runtime; interactive terminal only, with a typed confirmation)');
+  const tgAccess = tg.command('access').description('Pair and manage who may use the Telegram channel (on the host; interactive terminal only, with a typed confirmation)');
   const accessAction = (make: (...a: string[]) => AccessAction) => action(async (...args: unknown[]) => {
     const cmd = args[args.length - 1] as Command;
-    if (runtimeMode() === 'host') return delegate(cmd);
+    // Interactive (a typed confirmation): the Docker exec gets the terminal too.
+    if (runtimeMode() === 'host') return delegate(cmd, { tty: !!process.stdin.isTTY && !!process.stdout.isTTY });
     requireMode('runtime');
-    if (runtimeMode() !== 'host-runtime') {
-      throw new MinionsError('PRECONDITION', 'In the Docker runtime the official Telegram plugin owns pairing.',
-        'Pair in the coordinator terminal: /telegram:access pair <code>, then /telegram:access policy allowlist.');
-    }
     const isTty = !!process.stdin.isTTY && !!process.stdout.isTTY;
     const ask = async (q: string) => {
       if (!isTty) return null;
