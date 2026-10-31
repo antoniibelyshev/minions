@@ -164,9 +164,9 @@ describe('session processes (fake claude)', { timeout: 30_000 }, () => {
     expect(await dead(startEv.pid!)).toBe(true);
     expect(existsSync(sessionRunRecordPath(s.state, key))).toBe(false);
     expect(s.db.supervisorLock()).toBeNull();
-    // Stopped by the supervisor: no crash, and a notice makes the next supervisor resume it.
+    // Stopped by the supervisor between turns: no crash, and no notice (its next message resumes it).
     expect(getSession(s.db, key)).toMatchObject({ status: 'open', resumes: 0 });
-    expect(pendingInbox(s.db, key).map((m) => m.source)).toEqual(['supervisor']);
+    expect(pendingInbox(s.db, key)).toEqual([]);
   });
 
   it('a session process that crashes is resumed with --resume <id>; a completed turn resets the count', async () => {

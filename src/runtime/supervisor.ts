@@ -478,6 +478,9 @@ export async function runSupervisor(d: SupervisorDeps): Promise<SupervisorReport
     // Closed, or stopped while idle to free its slot: nothing to resume until its next message.
     if (!row || row.status !== 'open' || ours === 'close' || ours === 'idle') return;
     if (ours) {
+      // A session stopped between turns has nothing to continue: its next message resumes it. Task sessions always get
+      // the notice (their leases are recovered on resume).
+      if (!l.busy && !l.taskId) return;
       notice(l.key, SUPERVISOR_SOURCE, `minions supervisor: this session's process was stopped (${ours === 'drain' ? 'a drain' : 'the supervisor stopped'}) and is now resumed. Continue where you left off; check \`minions work list\` for leases you held.`);
       return;
     }
