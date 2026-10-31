@@ -3,6 +3,7 @@
 // the routine pass with catch-up, and the deterministic composition with numbered polls. Fake clock throughout.
 import { describe, expect, it } from 'vitest';
 import { MinionsConfigSchema } from '../../src/config/schema.js';
+import { writeHolds } from '../../src/runtime/dispatch-state.js';
 import { LAST_OWNER_MESSAGE_META, USAGE_META_PREFIX } from '../../src/runtime/coordinator-usage.js';
 import {
   composeDigest, DEFAULT_HOLDS, digestInput, digestStatus, holdFor, holdUntil, lastDigestSlot, nextDigestAt, parsePoll, prepareDigest, reholdExpired,
@@ -185,7 +186,7 @@ describe('the digest wake in the routine pass (fake clock)', () => {
     enqueue(env.db, { key: 'digest:2026-10-26T08:00', kind: 'digest', text: 'x' }); ack(env.db, 'digest:2026-10-26T08:00');
     const deps: RoutinePassDeps = {
       db: env.db, config: env.config, now: () => now, pid: 1, procStart: () => 's', lockAlive: () => false,
-      next: async () => ({ runnable: [] }), coordinator: async () => coordinator, activeLeases: async () => [],
+      coordinator: async () => coordinator, activeLeases: async () => [],
       budgetExhausted: () => false,
       digestDue: (n) => digestStatus(env.db, env.config, n).due,
       holdBack: (n) => reholdExpired(env.db, env.config, n),
@@ -218,8 +219,9 @@ describe('the digest wake in the routine pass (fake clock)', () => {
     expect(r.reasons?.[0]?.detail).toMatch(/caught up/);
   });
 
-  it('the budget at 100% with runnable work: no wake before the digest time (only the digest wakes)', async () => {
-    const t = passEnv({ budgetExhausted: () => true, next: async () => ({ runnable: [{ taskId: 'task-1', role: 'engineer' }] as never }) });
+  it('the budget at 100% with a held decision: no wake before the digest time (only the digest wakes)', async () => {
+    const t = passEnv({ budgetExhausted: () => true });
+    writeHolds(t.env.db, { 'task-1': { taskId: 'task-1', kind: 'blocked', message: 'stuck', leaseId: null, at: '2026-10-26T00:00:00.000Z', status: 'blocked' } });
     t.setNow('2026-10-27T05:00:00Z');
     expect((await runRoutinePass(t.deps, { trigger: 'clock' })).decision).toMatchObject({ action: 'none', why: expect.stringMatching(/only the digest/) });
   });

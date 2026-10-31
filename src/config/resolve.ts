@@ -53,13 +53,17 @@ function crossFieldIssues(c: MinionsConfig): ConfigIssue[] {
   return issues;
 }
 
-/** Keys of the removed GitHub delivery (docs/design/autonomy.md Decision 8): accepted in any layer, and dropped. */
+/**
+ * Removed keys, accepted in any layer and dropped: the GitHub delivery (docs/design/autonomy.md Decision 8) and the
+ * dispatch mode (Decision 10; `coordinator.contextReset.barrierTokens` below).
+ */
 const LEGACY_KEYS: Record<string, readonly string[]> = {
   backlog: ['repository'],
   intake: ['github'],
   delivery: ['provider', 'mode', 'method', 'deleteMergedBranches', 'identityMode', 'requireIndependentApproval', 'requiredChecksConfigured'],
   verification: ['ciAuthority', 'ciPendingTimeoutMinutes'],
   capabilities: ['git.push', 'pr.create', 'pr.review', 'pr.merge'],
+  dispatch: ['mode'],
 };
 
 /**
@@ -79,6 +83,11 @@ export function stripLegacyKeys(raw: unknown): unknown {
     out[section] = next;
   }
   if (isObj(out.backlog) && out.backlog.backend === 'github') out.backlog = { ...out.backlog, backend: 'backlogmd' };
+  const reset = isObj(out.coordinator) ? out.coordinator.contextReset : undefined;
+  if (isObj(reset) && 'barrierTokens' in reset) {
+    const { barrierTokens: _b, ...rest } = reset;
+    out.coordinator = { ...(out.coordinator as Obj), contextReset: rest };
+  }
   // Project roles name capabilities too: their policy column and `requires`.
   const legacyCap = (c: unknown) => LEGACY_KEYS.capabilities!.includes(c as string);
   if (isObj(out.roles)) {

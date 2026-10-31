@@ -10,7 +10,6 @@ import type { MinionsConfig } from '../../src/config/schema.js';
 import type { MinionsError } from '../../src/core/errors.js';
 import { generatePlugin } from '../../src/plugin/generate.js';
 import { humanNext } from '../../src/runtime/commands.js';
-import { preAgentHook } from '../../src/runtime/hooks.js';
 import { Scheduler } from '../../src/runtime/scheduler.js';
 import { commitFile, makeDefaultEnv, result, type Env } from './fixtures.js';
 
@@ -30,9 +29,6 @@ async function engineerStage(e: Env, id: string) {
   await e.sched.record(brief.leaseId, result({ branch: brief.branch, headSha: head }));
   return brief;
 }
-const loader = (e: Env) => () => ({ db: e.db, backlog: e.backlog, config: e.config });
-const agent = (subagent_type: string, prompt: string) => ({ hook_event_name: 'PreToolUse', tool_name: 'Agent', tool_input: { subagent_type, prompt, description: 'x' } });
-const decision = (o: { stdout?: string }) => (o.stdout ? JSON.parse(o.stdout) as { hookSpecificOutput: { permissionDecision: string; permissionDecisionReason: string } } : null);
 
 describe('back-compat: no harnesses', () => {
   it('the brief says harness claude and keeps the Claude model fields; work next launches an agent', async () => {
@@ -76,18 +72,6 @@ describe('phase 1 (b) pilot: codex-reviewer gate after the Claude engineer', () 
       launch: { kind: 'run', model: 'gpt-6.1-mini', effort: 'high', deep: true },
     });
     expect(await e.sched.claim('task-1')).toMatchObject({ model: 'gpt-6.1-mini', harness: 'codex' });
-  });
-
-  it('the pre-agent hook refuses to spawn a process-harness role as a Claude subagent, even with its lease', async () => {
-    const e = pilotEnv();
-    e.backlog.add({ id: 'task-1', workflow: 'pilot' });
-    await engineerStage(e, 'task-1');
-    const brief = await e.sched.claim('task-1');
-    for (const type of ['minions:codex-reviewer', 'minions:codex-reviewer-deep']) {
-      const d = decision(await preAgentHook(agent(type, brief.briefMarker), loader(e)))!;
-      expect(d.hookSpecificOutput.permissionDecision).toBe('deny');
-      expect(d.hookSpecificOutput.permissionDecisionReason).toMatch(/runs on OpenAI Codex CLI \(harness codex\), not as a Claude subagent/);
-    }
   });
 
   it('the plugin has no Claude agent file for a process-harness role, only its resolved prompt for the runner', async () => {

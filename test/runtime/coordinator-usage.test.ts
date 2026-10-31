@@ -10,6 +10,7 @@ import {
   completeOpenSessions, foldTranscriptLines, newSessionState, noteResetRequest, readIncrement, readSessionState, trackCoordinatorUsage, USAGE_META_PREFIX,
 } from '../../src/runtime/coordinator-usage.js';
 import { RuntimeDb } from '../../src/runtime/db.js';
+import { writeHolds } from '../../src/runtime/dispatch-state.js';
 import { stopHook } from '../../src/runtime/hooks.js';
 import { RECOVERY_PROMPT } from '../../src/runtime/coordinator.js';
 import { humanBaseline, humanSpend, spendReport } from '../../src/runtime/spend.js';
@@ -273,7 +274,7 @@ describe('Stop hook integration', () => {
   it('records usage on every Stop without changing the decision or defeating the no-progress guard', async () => {
     const env = makeEnv();
     env.db.acquireCoordinatorLock('coordinator', 4242, () => false);
-    env.backlog.add({ id: 'task-1' });
+    writeHolds(env.db, { 'task-1': { taskId: 'task-1', kind: 'blocked', message: 'stuck', leaseId: null, at: '2026-10-31T00:00:00.000Z', status: 'blocked' } });
     const file = transcriptFile(lines([asst('m1', usage(1, 100, 0, 1))]));
     const inp = { transcript_path: file, session_id: 'sess-a' };
     const decisions: (string | null)[] = [];
@@ -301,7 +302,7 @@ describe('Stop hook integration', () => {
       },
     });
     const o = await stopHook({ transcript_path: file, session_id: 'sess-a' }, () => ({ db, backlog: env.backlog, config: env.config }));
-    expect(o.reason).toMatch(/^allow: no runnable tasks/);
+    expect(o.reason).toMatch(/^allow: the autopilot dispatcher runs the stages; no decision waits/);
   });
 });
 

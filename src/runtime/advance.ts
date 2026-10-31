@@ -1,31 +1,12 @@
-import type { MinionsConfig } from '../config/schema.js';
-import type { Launch } from '../config/launch.js';
-import { MinionsError } from '../core/errors.js';
-import { withContextReset } from './context-reset.js';
-import type { RuntimeDb } from './db.js';
-import { claimWithBrief, compactClaim, recordSubmitted, type CompactClaim, type HandoffPaths } from './handoff.js';
-import { sessionScope, type SessionScope } from './session-scope.js';
-import type { NextReport, NextStage, RecordResponse, Scheduler, UsageFlag } from './scheduler.js';
+// The decision table after a recorded result (docs/design/autonomy.md Decision 1): when the autopilot dispatcher may
+// move the task on by itself, and when it holds the task for the coordinator's judgement.
+import type { RecordResponse, Scheduler } from './scheduler.js';
 
-/**
- * `minions work advance <leaseId>` (docs/design/unattended-delivery.md, Phases item 6): one coordinator call per
- * stage hand-off instead of record → spend → next → claim. It records the submitted result exactly as
- * `work record --submitted` (recordSubmitted), then, when nothing needs the coordinator's judgement, claims the
- * next runnable stage exactly as `work claim --compact` (claimWithBrief), picked from `work next` (Scheduler.next):
- * the same task's next stage first, else the first runnable stage overall. All checks stay in those functions;
- * this module only decides whether to claim, and never claims while paused, draining, over budget, after an
- * invalid result, when a context reset is due, or while the reset barrier holds new starts (task-57.6).
- *
- * `--task <id>` (phase 6 of docs/design/coordinator-sessions.md; the default in a `task:<id>` session): the lease
- * must be a stage of that task (else nothing is recorded), and only that task's next stage is claimed, never another
- * task's; when it has none, the decision says why.
- */
-
-/** Why advance claimed nothing: the coordinator decides (see the orchestrate skill, step 6). */
-export type AdvanceDecisionKind =
-  /** The result was rejected (`correctionAllowed`: relay `errors` once) or stored unvalidated after the correction. */
+/** Why the dispatcher holds a task after a record (handled by the coordinator, see the orchestrate skill). */
+export type RecordDecisionKind =
+  /** The result was rejected (`correctionAllowed`: one automatic correction) or stored unvalidated after the correction. */
   | 'invalid'
-  /** A drain partial, or starts are paused for a drain: start nothing. */
+  /** A drain partial: the stage stays runnable once the drain ends. */
   | 'draining'
   /** The repair-cycle limit was reached: rethink the task. */
   | 'replan'
@@ -42,69 +23,22 @@ export type AdvanceDecisionKind =
   /** A partial result (not a drain): re-dispatch with the remaining work, or split. */
   | 'partial'
   /** A QA sweep returned findings: create one backlog task per finding. */
-  | 'qa-findings'
-  /** A context reset is due: hand off and restart before dispatching more. */
-  | 'context-reset'
-  /** The reset barrier (task-57.6): the context is at the barrier and workers still run; start nothing new, record them as they return. */
-  | 'context-reset-pending'
-  /** Starts are paused (paused_starts). */
-  | 'paused'
-  /** The owner budget is used up: new claims are refused. */
-  | 'budget'
-  /** Runnable stages exist but wait for capacity (task, role or harness limits). */
-  | 'capacity'
-  /** Nothing can start now. */
-  | 'nothing-runnable'
-  /** The claim of the picked stage was refused (CONFLICT, PRECONDITION, ...); `work next` again. */
-  | 'claim-failed';
+  | 'qa-findings';
 
-export interface AdvanceDecision {
-  kind: AdvanceDecisionKind;
-  /** One line on why (the record or next message, or the claim error). */
+export interface RecordDecision {
+  kind: RecordDecisionKind;
+  /** One line on why (the record message). */
   message: string;
   taskId?: string;
   errors?: string[]; correctionAllowed?: boolean; unvalidated?: boolean;
   findings?: number;
-  code?: string; hint?: string;
-  waiting?: { taskId: string; role: string; waitingOn: string; why: string }[];
-  stuck?: NextReport['stuck'];
-  warnings?: string[];
 }
 
-/** The claimed next stage plus what the Agent call needs (or, with `launch.kind: "run"`, the runner command). */
-export interface AdvanceNext extends CompactClaim {
-  agentType: string;
-  agentModel: string | null;
-  suggestedModel: string;
-  /** Present only for a process-harness stage (`kind: "run"`): run `launch.command` instead of the Agent tool. */
-  launch?: Launch;
-  reason: string;
-}
-
-export type AdvanceRecord = RecordResponse & { contextReset?: { due: true; reason: string; steps: string[] } };
-
-export interface AdvanceResponse {
-  record: AdvanceRecord;
-  next?: AdvanceNext;
-  decision?: AdvanceDecision;
-  message: string;
-}
-
-export interface AdvanceDeps {
-  db: RuntimeDb; config: MinionsConfig; state?: string;
-  /** The coordinator session (undefined: read from MINIONS_SESSION; a malformed value is refused). */
-  session?: SessionScope | null;
-}
-
-/** The worker result fields advance reads back after a valid record. */
+/** The worker result fields read back after a valid record. */
 interface StoredResult { status?: string; findings?: unknown[] }
 
-function storedResult(db: RuntimeDb, leaseId: string): StoredResult {
-  try { return JSON.parse(db.lease(leaseId)?.result_json ?? '{}') as StoredResult; } catch { return {}; }
-}
-
-/** The decision a recorded result needs from the coordinator, or null when the next stage may be claimed. */
-export function recordDecision(sched: Scheduler, r: AdvanceRecord, worker: StoredResult): AdvanceDecision | null {
+/** The decision a recorded result needs from the coordinator, or null when the task moves on by itself. */
+export function recordDecision(sched: Scheduler, r: RecordResponse, worker: StoredResult): RecordDecision | null {
   const at = { taskId: r.taskId, message: r.message };
   if (!r.valid) {
     return { kind: 'invalid', ...at, errors: r.errors ?? [], correctionAllowed: !!r.correctionAllowed, ...(r.unvalidated ? { unvalidated: true } : {}) };
@@ -121,104 +55,5 @@ export function recordDecision(sched: Scheduler, r: AdvanceRecord, worker: Store
   if (worker.status === 'partial') return { kind: 'partial', ...at };
   if (worker.status === 'needs_changes' && !sweep && r.to !== 'changes-requested') return { kind: 'needs-changes', ...at };
   if (sweep && (worker.findings?.length ?? 0) > 0) return { kind: 'qa-findings', ...at, findings: worker.findings!.length };
-  if (r.contextReset) return { kind: 'context-reset', ...at, message: r.contextReset.reason };
   return null;
-}
-
-/** Why `work next` lets nothing start, as a decision; null when a stage is runnable. */
-export function nextDecision(db: RuntimeDb, n: NextReport): AdvanceDecision | null {
-  const extra = { ...(n.stuck.length ? { stuck: n.stuck } : {}), ...(n.warnings?.length ? { warnings: n.warnings } : {}) };
-  if (n.startsBlocked) {
-    const kind: AdvanceDecisionKind = db.drain() ? 'draining' : db.paused().starts ? 'paused' : 'budget';
-    return { kind, message: n.startsBlocked.message, code: n.startsBlocked.code, ...(n.startsBlocked.hint ? { hint: n.startsBlocked.hint } : {}), ...extra };
-  }
-  if (n.resetPending) {
-    const waiting = n.waiting.map((w) => ({ taskId: w.taskId, role: w.role, waitingOn: w.waitingOn, why: w.why }));
-    return { kind: 'context-reset-pending', message: n.resetPending.message, hint: n.resetPending.hint, ...(waiting.length ? { waiting } : {}), ...extra };
-  }
-  if (n.runnable.length) return null;
-  const capped = n.waiting.filter((w) => w.waitingOn !== 'starts' && w.waitingOn !== 'requires');
-  const waiting = n.waiting.map((w) => ({ taskId: w.taskId, role: w.role, waitingOn: w.waitingOn, why: w.why }));
-  return { kind: capped.length ? 'capacity' : 'nothing-runnable', message: n.message, ...(waiting.length ? { waiting } : {}), ...extra };
-}
-
-/** The same task's next stage first (finish what is started), else `work next`'s dispatch order. */
-export const pickStage = (n: NextReport, taskId: string): NextStage | undefined =>
-  n.runnable.find((s) => s.taskId === taskId) ?? n.runnable[0];
-
-const STARTS_HELD = new Set<AdvanceDecisionKind>(['draining', 'paused', 'budget', 'context-reset-pending']);
-
-/** `--task`: why the task has no runnable stage now, or null when it has one (other tasks' stages never count). */
-export function taskDecision(n: NextReport, taskId: string): AdvanceDecision | null {
-  if (n.runnable.some((s) => s.taskId === taskId)) return null;
-  const waiting = n.waiting.filter((w) => w.taskId === taskId).map((w) => ({ taskId: w.taskId, role: w.role, waitingOn: w.waitingOn, why: w.why }));
-  const capped = waiting.filter((w) => w.waitingOn !== 'starts' && w.waitingOn !== 'requires');
-  const message = waiting.length ? `${taskId} waits: ${waiting.map((w) => w.why).join('; ')}` : `${taskId} has no runnable stage now.`;
-  return { kind: capped.length ? 'capacity' : 'nothing-runnable', taskId, message, ...(waiting.length ? { waiting } : {}) };
-}
-
-const advanceNext = (c: CompactClaim, s: NextStage): AdvanceNext => ({
-  ...c, agentType: s.agentType, agentModel: s.agentModel, suggestedModel: s.suggestedModel,
-  ...(s.launch.kind === 'run' ? { launch: s.launch } : {}), reason: s.reason,
-});
-
-/** `minions work advance`: record the submitted result, then claim the next stage or return a decision. */
-export async function advanceLease(sched: Scheduler, p: HandoffPaths, leaseId: string, opts: { correction?: boolean; usage?: UsageFlag; task?: string }, deps: AdvanceDeps): Promise<AdvanceResponse> {
-  const only = advanceTask(deps, opts.task);
-  if (only !== null) {
-    const lease = deps.db.lease(leaseId);
-    if (lease && lease.task_id !== only) {
-      throw new MinionsError('PRECONDITION', `Lease ${leaseId} is a stage of ${lease.task_id}, not ${only}; nothing was recorded.`, `Advance only ${only}'s leases here.`, { leaseId, taskId: lease.task_id, task: only });
-    }
-  }
-  const recorded = await recordSubmitted(sched, p, leaseId, opts);
-  const record: AdvanceRecord = withContextReset(recorded, deps);
-  const worker = record.valid ? storedResult(deps.db, leaseId) : {};
-  const stop = (decision: AdvanceDecision): AdvanceResponse => ({ record, decision, message: `${record.message} Decide: ${decision.kind}.` });
-  const early = recordDecision(sched, record, worker);
-  if (early) return stop(early);
-  let stage: NextStage | undefined;
-  try {
-    const report = await sched.next();
-    const blocked = nextDecision(deps.db, report);
-    // With --task, only the start-wide holds come from `work next`; capacity and runnability are the task's own.
-    if (blocked && (only === null || STARTS_HELD.has(blocked.kind))) return stop(blocked);
-    if (only !== null) {
-      const none = taskDecision(report, only);
-      if (none) return stop(none);
-      stage = report.runnable.find((s) => s.taskId === only)!;
-    } else stage = pickStage(report, record.taskId)!;
-    const next = advanceNext(compactClaim(await claimWithBrief(sched, p, stage.taskId, stage.role)), stage);
-    return { record, next, message: `${record.message} Next: ${next.taskId} ${next.role} (${next.leaseId}).` };
-  } catch (e) {
-    // The record already happened: never fail the whole call (and hide the recorded outcome) because the
-    // follow-up step failed, whatever the error.
-    const err = e as { code?: unknown; message?: unknown; hint?: unknown };
-    const code = typeof err.code === 'string' ? err.code : 'INTERNAL';
-    const message = typeof err.message === 'string' ? err.message : String(e);
-    const kind: AdvanceDecisionKind = code === 'CAPACITY' ? 'capacity' : 'claim-failed';
-    return stop({ kind, taskId: stage?.taskId ?? record.taskId, message, code, ...(e instanceof MinionsError && e.hint ? { hint: e.hint } : {}) });
-  }
-}
-
-/**
- * The task `work advance` is limited to: `--task`, else the task of a `task:<id>` session, else null (any task). In
- * a task session `--task` must name its own task; the router and the general session never claim.
- */
-function advanceTask(deps: AdvanceDeps, task: string | undefined): string | null {
-  const scope = deps.session === undefined ? sessionScope() : deps.session;
-  if (scope && scope.kind !== 'task') throw new MinionsError('POLICY_DENIED', `The ${scope.key} session never records or claims stages.`, 'Task stages are advanced by their task session (`task:<id>`).');
-  if (task !== undefined && (task === '' || task.length > 100)) throw new MinionsError('PRECONDITION', 'Invalid --task value.', 'Name a task id, e.g. --task task-57.');
-  if (scope?.taskId && task !== undefined && task !== scope.taskId) {
-    throw new MinionsError('POLICY_DENIED', `Session ${scope.key} cannot advance ${task}: a task session advances only its own task.`, `Use --task ${scope.taskId} (or omit it).`);
-  }
-  return task ?? scope?.taskId ?? null;
-}
-
-/** Human output of `work advance`. */
-export function humanAdvance(r: AdvanceResponse): string {
-  const lines = [r.record.message, ...(r.record.errors ?? []).map((e) => `  - ${e}`), ...(r.record.budget ? [r.record.budget.message] : [])];
-  if (r.next) lines.push(`next: ${r.next.taskId} ${r.next.role} -> ${r.next.agentType}${r.next.agentModel ? ` (${r.next.agentModel})` : ''}`, r.next.briefMarker, `worktree: ${r.next.worktree}`);
-  if (r.decision) lines.push(`decision: ${r.decision.kind}: ${r.decision.message}`);
-  return lines.join('\n');
 }

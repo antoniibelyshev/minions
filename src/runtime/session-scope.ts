@@ -8,7 +8,7 @@
 //   only the open states of the same key;
 // - contextResetCheck counts only the session's own leases (holder = key) and events;
 // - the handoff file is `<state>/coordinator-handoff.<key>.json`;
-// - a lease's holder is the key, and `work advance` in a task session claims only that task's next stage.
+// - a lease's holder is the key, and a task session claims only its own task's stages.
 //
 // Unset (or empty), nothing changes: every helper here returns the single-coordinator value. A malformed value is
 // never trusted: commands refuse it (sessionScope throws), hooks fall back to allowing the stop and record nothing.

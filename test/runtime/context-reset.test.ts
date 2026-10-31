@@ -161,7 +161,7 @@ describe('settings (config defaults keep existing configs valid)', () => {
     const legacy = defaults();
     expect(legacy.coordinator).toBeUndefined();
     expect(validateConfig(legacy, 'x').coordinator).toBeUndefined();
-    expect(contextResetSettings(legacy)).toEqual({ enabled: true, afterDelivery: true, contextTokens: DEFAULT_CONTEXT_TOKENS, handoffs: DEFAULT_HANDOFFS, barrierTokens: 120_000 });
+    expect(contextResetSettings(legacy)).toEqual({ enabled: true, afterDelivery: true, contextTokens: DEFAULT_CONTEXT_TOKENS, handoffs: DEFAULT_HANDOFFS });
     expect(DEFAULT_CONTEXT_TOKENS).toBe(60_000);
     expect(DEFAULT_HANDOFFS).toBe(10);
     const pm = validateConfig({ ...legacy, coordinator: { permissionMode: 'acceptEdits' } }, 'x');
@@ -174,7 +174,7 @@ describe('settings (config defaults keep existing configs valid)', () => {
   it('triggers are configurable: null turns one off; invalid values are rejected', () => {
     const cfg = withReset({ enabled: true, afterDelivery: false, contextTokens: null, handoffs: 3 });
     expect(validateConfig(cfg, 'x').coordinator?.contextReset).toEqual({ enabled: true, afterDelivery: false, contextTokens: null, handoffs: 3 });
-    expect(contextResetSettings(cfg)).toEqual({ enabled: true, afterDelivery: false, contextTokens: null, handoffs: 3, barrierTokens: 120_000 });
+    expect(contextResetSettings(cfg)).toEqual({ enabled: true, afterDelivery: false, contextTokens: null, handoffs: 3 });
     expect(() => validateConfig(withReset({ enabled: true, handoffs: 0 }), 'x')).toThrow(/handoffs/);
     expect(() => validateConfig(withReset({ enabled: true, contextTokens: 10 }), 'x')).toThrow(/contextTokens/);
     expect(() => validateConfig({ ...defaults(), coordinator: { contextReset: { enabled: true, every: 5 } } }, 'x')).toThrow(/INVALID|Unrecognized|every/i);
@@ -307,7 +307,7 @@ describe('restart triggers', () => {
     expect(r2.contextReset).toEqual({ due: true, reason: 'context reset due: delivered task-1', steps: expect.any(Array) });
     const status = await collectStatus({ db: env.db, config: env.config, backlog: async () => env.backlog });
     expect(status.contextReset).toMatchObject({ enabled: true, due: true, triggers: ['delivered'] });
-    expect(humanStatus(status)).toMatch(/context reset: due \(3\/10 hand-offs, context unknown, barrier 120k, delivered task-1\)/);
+    expect(humanStatus(status)).toMatch(/context reset: due \(3\/10 hand-offs, context unknown, delivered task-1\)/);
   });
 });
 

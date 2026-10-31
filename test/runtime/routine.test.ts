@@ -9,6 +9,7 @@ import { scheduleCrashStart, scheduleDetachedRestart, WAKE_PROMPT, buildCoordina
 import { LAST_OWNER_MESSAGE_META } from '../../src/runtime/coordinator-usage.js';
 import { TRANSCRIPT_META } from '../../src/runtime/context-reset.js';
 import { runtimePaths } from '../../src/runtime/paths.js';
+import { writeHolds } from '../../src/runtime/dispatch-state.js';
 import {
   collectWakeReasons, coordinatorIdleSince, CRASH_START_EVENT, decideWake, endedByCrash, humanRoutine, humanRoutineReport, MAX_CRASH_STARTS_PER_DAY,
   ROUTINE_EVENT, routineLast, routineSettings, runRoutinePass, startRoutineClock, WAKE_EVENT,
@@ -22,7 +23,7 @@ const ago = (min: number, from = T0) => new Date(from.getTime() - min * 60_000).
 const ON: RoutineSettings = { enabled: true, tickMinutes: 15, minWakeGapMinutes: 30, maxWakesPerDay: 8, digestAt: ['08:00'], timezone: 'Europe/Berlin' };
 const running = (over: Partial<CoordinatorView> = {}): CoordinatorView => ({ running: true, lockAcquiredAt: ago(120), staleLock: false, exit: null, lastRestartAt: null, ...over });
 const down = (over: Partial<CoordinatorView> = {}): CoordinatorView => ({ running: false, lockAcquiredAt: null, staleLock: false, exit: null, lastRestartAt: null, ...over });
-const runnable: WakeReason = { kind: 'runnable', taskId: 'task-1', role: 'engineer', detail: 'task-1 engineer runnable' };
+const runnable: WakeReason = { kind: 'dispatch-decision', taskId: 'task-1', detail: 'task-1 needs a decision (blocked)' };
 const digest: WakeReason = { kind: 'digest', detail: 'digest 08:00 due' };
 
 const inputs = (over: Partial<WakeInputs> = {}): WakeInputs => ({
@@ -39,7 +40,7 @@ describe('routine settings', () => {
 });
 
 describe('decideWake (pure)', () => {
-  it('wakes an idle running coordinator for a runnable stage within every limit', () => {
+  it('wakes an idle running coordinator for a held decision within every limit', () => {
     expect(decideWake(inputs())).toMatchObject({ action: 'wake', digest: false });
   });
 
@@ -97,7 +98,7 @@ describe('decideWake (pure)', () => {
   });
 });
 
-/** A routine pass over a real DB with a fake clock, fake next and fake restarts. */
+/** A routine pass over a real DB with a fake clock and fake restarts. */
 function passEnv(over: Partial<RoutinePassDeps> = {}) {
   const env = makeEnv((c) => { c.routine = { enabled: true }; });
   let now = T0;
@@ -105,7 +106,6 @@ function passEnv(over: Partial<RoutinePassDeps> = {}) {
   let coordinator = running();
   const deps: RoutinePassDeps = {
     db: env.db, config: env.config, now: () => now, pid: 1111, procStart: () => 's1', lockAlive: () => true,
-    next: async () => ({ runnable: [] }),
     coordinator: async () => coordinator,
     activeLeases: async () => [],
     budgetExhausted: () => false,
@@ -120,7 +120,12 @@ function passEnv(over: Partial<RoutinePassDeps> = {}) {
   };
 }
 
-const runnableNext = async () => ({ runnable: [{ taskId: 'task-1', role: 'engineer' }] as never });
+/** passEnv with the dispatcher holding task-1 for a decision. */
+function heldEnv(over: Partial<RoutinePassDeps> = {}) {
+  const t = passEnv(over);
+  writeHolds(t.env.db, { 'task-1': { taskId: 'task-1', kind: 'blocked', message: 'stuck', leaseId: null, at: ago(60), status: 'blocked' } });
+  return t;
+}
 
 describe('runRoutinePass', () => {
   it('records a routine event with the decision, and shows last/next', async () => {
@@ -137,7 +142,7 @@ describe('runRoutinePass', () => {
   });
 
   it('routine off: clock and watchdog do nothing; a manual pass runs but never wakes', async () => {
-    const t = passEnv({ next: runnableNext });
+    const t = heldEnv();
     t.env.config.routine = undefined;
     expect(await runRoutinePass(t.deps, { trigger: 'clock' })).toMatchObject({ ran: false, skipped: 'disabled', nextAt: null });
     expect(await runRoutinePass(t.deps, { trigger: 'watchdog' })).toMatchObject({ ran: false, skipped: 'disabled' });
@@ -173,27 +178,17 @@ describe('runRoutinePass', () => {
     expect(await runRoutinePass(t.deps, { trigger: 'clock' })).toMatchObject({ ran: true });
   });
 
-  it('sessions on: runnable stages open task sessions instead of a wake; sessions off: the wake as before, no session opened', async () => {
-    const opened: string[] = [];
-    const openTaskSessions = async () => { opened.push('pass'); return { opened: [{ key: 'task:task-1', taskId: 'task-1', role: 'engineer', reopened: false }], closed: [], refused: [], runnableOpen: [] }; };
-    const on = passEnv({ next: runnableNext, openTaskSessions });
+  it('sessions on: a held decision goes to its task session, no wake; sessions off: it wakes the coordinator', async () => {
+    const on = heldEnv();
     on.env.config.coordinator = { ...on.env.config.coordinator, sessions: { enabled: true } };
-    // An unvalidated result recorded by a task session is that session's to decide: no coordinator wake either.
-    on.env.db.exec("INSERT INTO leases (id, task_id, role, attempt, holder, config_revision, started_at, ended_at, status) VALUES ('lease-u', 'task-2', 'engineer', 1, 'task:task-2', 1, ?, ?, 'unvalidated')", ago(60), ago(1));
     const r = await runRoutinePass(on.deps, { trigger: 'clock' });
-    expect(r).toMatchObject({ decision: { action: 'none', why: 'nothing needs a model' }, reasons: [], sessions: { opened: ['task:task-1'] } });
+    expect(r).toMatchObject({ decision: { action: 'none', why: 'nothing needs a model' }, reasons: [] });
     expect(on.calls.wake).toBe(0);
-    expect(opened).toEqual(['pass']);
-    expect(on.env.db.lastEventOfKind(ROUTINE_EVENT)?.data).toMatchObject({ sessions: { opened: ['task:task-1'] } });
-    expect(humanRoutineReport(r)).toMatch(/task sessions: opened task:task-1/);
 
-    opened.length = 0;
-    const off = passEnv({ next: runnableNext, openTaskSessions });
+    const off = heldEnv();
     const r2 = await runRoutinePass(off.deps, { trigger: 'clock' });
-    expect(r2).toMatchObject({ decision: { action: 'wake' }, reasons: [{ kind: 'runnable', taskId: 'task-1' }] });
-    expect(r2.sessions).toBeUndefined();
+    expect(r2).toMatchObject({ decision: { action: 'wake' }, reasons: [{ kind: 'dispatch-decision', taskId: 'task-1' }] });
     expect(off.calls.wake).toBe(1);
-    expect(opened).toEqual([]);
   });
 
   it('sessions on and the router running: a due digest does not restart it (its coordinator wait sends it); sessions off: it wakes', async () => {
@@ -212,11 +207,11 @@ describe('runRoutinePass', () => {
   });
 
   it('wakes through the fake restart, records routine-wake, then the gap and the daily cap hold', async () => {
-    const t = passEnv({ next: runnableNext });
+    const t = heldEnv();
     const r = await runRoutinePass(t.deps, { trigger: 'clock' });
-    expect(r).toMatchObject({ decision: { action: 'wake' }, outcome: { ok: true, detail: 'wake scheduled' }, reasons: [{ kind: 'runnable', taskId: 'task-1' }] });
+    expect(r).toMatchObject({ decision: { action: 'wake' }, outcome: { ok: true, detail: 'wake scheduled' }, reasons: [{ kind: 'dispatch-decision', taskId: 'task-1' }] });
     expect(t.env.db.eventsOfKindSince(WAKE_EVENT, ago(60))).toHaveLength(1);
-    expect(routineLast(t.env.db, t.env.config, T0)).toMatchObject({ wakesToday: 1, last: { reasons: [{ kind: 'runnable' }] } });
+    expect(routineLast(t.env.db, t.env.config, T0)).toMatchObject({ wakesToday: 1, last: { reasons: [{ kind: 'dispatch-decision' }] } });
     t.setNow(new Date(T0.getTime() + 15 * 60_000));
     expect(await runRoutinePass(t.deps, { trigger: 'clock' })).toMatchObject({ decision: { action: 'none', why: expect.stringMatching(/last wake 15 min ago/) } });
     expect(t.calls.wake).toBe(1);
@@ -226,14 +221,14 @@ describe('runRoutinePass', () => {
   });
 
   it('a refused wake (a lease appeared) is reported and not counted', async () => {
-    const t = passEnv({ next: runnableNext, wake: async () => { throw new Error('Coordinator restart refused: 1 active worker lease(s) (l1).'); } });
+    const t = heldEnv({ wake: async () => { throw new Error('Coordinator restart refused: 1 active worker lease(s) (l1).'); } });
     const r = await runRoutinePass(t.deps, { trigger: 'clock' });
     expect(r.outcome).toMatchObject({ ok: false, detail: expect.stringMatching(/refused/) });
     expect(t.env.db.eventsOfKindSince(WAKE_EVENT, ago(60))).toHaveLength(0);
   });
 
   it('owner activity and transcript activity block the wake (recorded owner message time, transcript mtime)', async () => {
-    const t = passEnv({ next: runnableNext, mtime: () => Date.parse(ago(2)) });
+    const t = heldEnv({ mtime: () => Date.parse(ago(2)) });
     t.env.db.setMeta(TRANSCRIPT_META, JSON.stringify({ path: '/x/t.jsonl', at: ago(30) }));
     expect((await runRoutinePass(t.deps, { trigger: 'clock' })).decision!.why).toMatch(/active 2 min ago/);
     t.deps.mtime = () => Date.parse(ago(40));
@@ -244,7 +239,7 @@ describe('runRoutinePass', () => {
   });
 
   it('a real plugin owner message (source="plugin:telegram:telegram") counted by the Stop hook blocks the wake', async () => {
-    const t = passEnv({ next: runnableNext, mtime: () => Date.parse(ago(40)) });
+    const t = heldEnv({ mtime: () => Date.parse(ago(40)) });
     expect(recordOwnerMessageViaStop(t.env.db, new Date(ago(10)))).toMatchObject({ recorded: true });
     expect((await runRoutinePass(t.deps, { trigger: 'clock' })).decision).toMatchObject({ action: 'none', why: expect.stringMatching(/owner wrote 10 min ago/) });
   });
@@ -279,22 +274,14 @@ describe('runRoutinePass', () => {
 });
 
 describe('wake reasons', () => {
-  it('runnable stages, plus unvalidated / needs_split results and awaiting-human records since the coordinator was last active', () => {
+  it('only the dispatcher\'s holds: runnable stages and unvalidated results are the dispatcher\'s', () => {
     const t = passEnv();
     const db = t.env.db;
-    const ins = (id: string, task: string, status: string, ended: string, result: unknown) => db.exec(
-      'INSERT INTO leases (id, task_id, role, attempt, config_revision, started_at, ended_at, status, result_json) VALUES (?, ?, ?, 1, 1, ?, ?, ?, ?)',
-      id, task, 'engineer', ago(200), ended, status, JSON.stringify(result));
-    ins('l-old', 'task-0', 'unvalidated', ago(100), {});
-    ins('l-unv', 'task-2', 'unvalidated', ago(5), {});
-    ins('l-split', 'task-3', 'completed', ago(5), { status: 'needs_split' });
-    ins('l-done', 'task-4', 'completed', ago(5), { status: 'complete' });
-    db.exec('INSERT INTO events (at, kind, task_id, data_json) VALUES (?, ?, ?, ?)', ago(4), 'record', 'task-5', JSON.stringify({ leaseId: 'l5', to: 'awaiting-human' }));
-    db.exec('INSERT INTO events (at, kind, task_id, data_json) VALUES (?, ?, ?, ?)', ago(4), 'record', 'task-6', JSON.stringify({ leaseId: 'l6', to: 'reviewing' }));
-    const r = collectWakeReasons(db, { runnable: [{ taskId: 'task-1', role: 'tester' }] as never }, ago(30));
-    expect(r.map((x) => [x.kind, 'taskId' in x ? x.taskId : null])).toEqual([
-      ['runnable', 'task-1'], ['unvalidated', 'task-2'], ['needs-split', 'task-3'], ['awaiting-human', 'task-5'],
-    ]);
+    db.exec('INSERT INTO leases (id, task_id, role, attempt, config_revision, started_at, ended_at, status, result_json) VALUES (?, ?, ?, 1, 1, ?, ?, ?, ?)',
+      'l-unv', 'task-2', 'engineer', ago(200), ago(5), 'unvalidated', '{}');
+    expect(collectWakeReasons(db)).toEqual([]);
+    writeHolds(db, { 'task-3': { taskId: 'task-3', kind: 'needs-split', message: 'split it', leaseId: 'l3', at: ago(4), status: 'implementing' } });
+    expect(collectWakeReasons(db)).toEqual([{ kind: 'dispatch-decision', taskId: 'task-3', detail: 'task-3 needs a decision (needs-split): split it' }]);
   });
 
   it('idle since: the transcript of this session, else the lock time', () => {

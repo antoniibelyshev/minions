@@ -1,11 +1,10 @@
 // End-to-end claim -> brief -> submit -> record on real git (integration tier). The pipeline rules themselves are
-// unit-tested on the in-memory git of ./fake-git.ts (scheduler, work-next, advance, workflows, custom-roles,
+// unit-tested on the in-memory git of ./fake-git.ts (scheduler, work-next, dispatcher, workflows, custom-roles,
 // risk-based-testing, ...); these few flows keep the real `git worktree`, rev-parse, merge-base and diff behind them.
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { MinionsError } from '../../src/core/errors.js';
-import { advanceLease } from '../../src/runtime/advance.js';
 import { claimWithBrief, fetchBrief, recordSubmitted, submitResult, type HandoffPaths } from '../../src/runtime/handoff.js';
 import type { TaskBrief } from '../../src/runtime/scheduler.js';
 import { commitFile, gitSync, makeDefaultEnv, makeEnv, result, type Env } from './fixtures.js';
@@ -74,7 +73,7 @@ describe('claim -> brief -> submit -> record (real git)', () => {
     expect(existsSync(join(rev.worktree, 'scratch.txt'))).toBe(true);
   });
 
-  it('the diff gate sees a rename out of a sensitive directory (real `git diff --no-renames`), and advance claims the tester', async () => {
+  it('the diff gate sees a rename out of a sensitive directory (real `git diff --no-renames`), and the tester is next', async () => {
     const env = makeDefaultEnv(); // risk-based testing: a tester only when the change needs one
     mkdirSync(join(env.layout.repo, '.claude'));
     commitFile(env.layout.repo, '.claude/settings.json', '{}\n');
@@ -85,9 +84,9 @@ describe('claim -> brief -> submit -> record (real git)', () => {
     gitSync(e.worktree, 'commit', '-q', '-m', 'move settings');
     await work(env, e, { headSha: gitSync(e.worktree, 'rev-parse', 'HEAD'), modifiedPaths: ['docs/settings.json'] });
     // The worker reported only the new path; the base...head diff of the real repository names the old one too.
-    const submitted = await advanceLease(env.sched, paths(env), e.leaseId, {}, { db: env.db, config: env.config });
-    expect(submitted.record).toMatchObject({ valid: true, to: 'testing' });
-    expect(submitted.record.message).toMatch(/\.claude\/settings\.json/);
-    expect(submitted.next).toMatchObject({ taskId: 'task-1', role: 'tester' });
+    const submitted = await recordSubmitted(env.sched, paths(env), e.leaseId, {});
+    expect(submitted).toMatchObject({ valid: true, to: 'testing' });
+    expect(submitted.message).toMatch(/\.claude\/settings\.json/);
+    expect((await env.sched.next()).runnable).toMatchObject([{ taskId: 'task-1', role: 'tester' }]);
   });
 });

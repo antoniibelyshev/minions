@@ -1,11 +1,7 @@
 import { closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readSync, renameSync, writeSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
-import { filterReady } from '../backlog/ready.js';
-import type { BacklogAdapter, Task } from '../backlog/types.js';
-import { dependencyDoneStatuses } from '../config/delivery.js';
-import { AGENT_MODEL_ALIASES, isAgentModelAlias } from '../config/models.js';
-import { HARNESSES, isProcessHarness } from '../config/harnesses.js';
-import { agentTypeRole, DEEP_SUFFIX, workerRoleNames } from '../config/roles.js';
+import type { BacklogAdapter } from '../backlog/types.js';
+import { agentTypeRole, DEEP_SUFFIX } from '../config/roles.js';
 import type { MinionsConfig, RoleContract } from '../config/schema.js';
 import { sha256 } from '../core/fsutil.js';
 import { hangGuarded } from './hook-guard.js';
@@ -13,11 +9,9 @@ import { redact } from '../core/output.js';
 import type { BuiltinLeaseRole, DrainNoticeVia, LeaseRole, RuntimeDb } from './db.js';
 import { TELEGRAM_TOOL_PREFIXES } from './coordinator.js';
 import { runtimePaths } from './paths.js';
-import { capacityOf, scopeOf } from './scheduler.js';
-import { currentBudget } from './spend.js';
-import { noteTranscript, resetBarrier } from './context-reset.js';
+import { noteTranscript } from './context-reset.js';
 import { trackCoordinatorUsage } from './coordinator-usage.js';
-import { dispatchMode, readHolds } from './dispatch-state.js';
+import { readHolds, type DispatchHold } from './dispatch-state.js';
 import { hookScope } from './session-scope.js';
 import { sessionStopGuard } from './session-stop.js';
 import { scanShell, ShellParseError, type ShellScan } from './shell-scan.js';
@@ -61,105 +55,58 @@ export function hookLog(line: string, path = runtimePaths().hooksLog): void {
 
 const isObj = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
 
-/** True if the Stop input reports a running background subagent/task. */
-function backgroundRunning(input: Record<string, unknown>): boolean {
-  const bt = input.background_tasks;
-  if (!Array.isArray(bt)) return false;
-  return bt.some((t) => !isObj(t) || typeof t.status !== 'string' || /^(running|pending|in[_-]?progress|active|started)$/i.test(t.status));
-}
-
 const block = (reason: string): HookOutput => ({ stdout: JSON.stringify({ decision: 'block', reason }), reason });
 
+/** The Stop guard's progress fingerprint of held decisions: a hold resolved, added or re-held changes it. */
+export const holdsFingerprint = (holds: DispatchHold[]): string => sha256(JSON.stringify({ holds: holds.map((h) => `${h.taskId}:${h.kind}:${h.at}`).sort() }));
+
+/** The continuation text while the dispatcher holds tasks for a decision. */
+export const holdsReason = (holds: DispatchHold[]): string =>
+  `minions: the dispatcher holds ${holds.length} task(s) for your decision: ${holds.slice(0, 5).map((h) => `${h.taskId} (${h.kind})`).join(', ')}. See \`minions work autopilot status --json\`; handle each, then \`minions work autopilot resume <taskId>\` if its status did not change. If you cannot decide, ask the owner and stop.`;
+
 /**
- * Stop guard: blocks only when authorized runnable work and capacity exist and state has progressed;
- * otherwise allows stopping. Any internal failure allows stopping. In a coordinator session (MINIONS_SESSION, phase 6)
- * the transcript and usage are recorded for that session and the decision is sessionStopGuard's; a malformed value
- * allows the stop and records nothing.
+ * Stop guard (docs/design/autonomy.md Decision 10): the autopilot dispatcher runs every stage, so only its held
+ * decisions keep the coordinator going, until NO_PROGRESS_LIMIT continuations passed with the holds unchanged. Any
+ * internal failure allows stopping. In a coordinator session (MINIONS_SESSION, phase 6) the transcript and usage are
+ * recorded for that session and the decision is sessionStopGuard's; a malformed value allows the stop and records nothing.
  */
 export async function stopHook(input: unknown, load: HookLoader, env: NodeJS.ProcessEnv = process.env): Promise<HookOutput> {
-  // A headless worker ends when its stage is done; the dispatcher records it (never the coordinator's continue rule).
+  // A headless worker ends when its stage is done; the dispatcher records it.
   if (env[WORKER_LEASE_ENV]) return { reason: `allow: headless worker ${String(env[WORKER_LEASE_ENV]).slice(0, 60)}` };
   const inp = isObj(input) ? input : {};
   const session = hookScope(env);
   if (session.invalid) return { reason: 'allow: MINIONS_SESSION is not a session key (nothing recorded)' };
   let deps: HookDeps;
   try { deps = await load(); } catch (e) { return { reason: `allow: state unavailable (${(e as Error).message})` }; }
-  const { db, backlog, config } = deps;
+  const { db, config } = deps;
   // Context-reset trigger input (task-45): the main session's transcript, for its latest usage. Never affects the decision.
   try { noteTranscript(db, inp, new Date(), session.scope); } catch { /* best-effort */ }
   // Coordinator token tracking (task-57.1): this turn's main-session usage from the transcript. Bounded, never throws, never affects the decision.
   try { trackCoordinatorUsage({ db, config, env }, inp); } catch { /* best-effort */ }
-  if (session.scope) return sessionStopGuard(deps, session.scope, backgroundRunning(inp));
+  if (session.scope) return sessionStopGuard(deps, session.scope);
   const allow = (reason: string, detail = reason): HookOutput => {
     try { db.setGuard({ fingerprint: null, count: 0, last_reason: reason }); } catch { /* ignore */ }
     return { reason: `allow: ${detail}` };
   };
   try {
-    // Coordinator sessions on (phase 7): task sessions dispatch, so the single coordinator is never kept running for it.
-    if (config.coordinator?.sessions?.enabled === true) return allow('sessions-on', 'coordinator sessions are on: task sessions dispatch');
-    // The autopilot dispatcher runs the stages (docs/design/autonomy.md Decision 1): only its held decisions keep the
-    // coordinator going, under the same no-progress limit.
-    if (dispatchMode(config) === 'auto') {
-      const holds = Object.values(readHolds(db));
-      if (!holds.length) return allow('dispatcher', 'the autopilot dispatcher runs the stages; no decision waits');
-      const fp = sha256(JSON.stringify({ holds: holds.map((h) => `${h.taskId}:${h.kind}:${h.at}`).sort() }));
-      const g = db.guard();
-      if (g.fingerprint === fp && g.count >= NO_PROGRESS_LIMIT) return { reason: 'allow: no-progress (the held decisions are unchanged after repeated continuation)' };
-      db.setGuard({ fingerprint: fp, count: g.fingerprint === fp ? g.count + 1 : 1, last_reason: 'dispatch-decisions' });
-      return block(`minions: the dispatcher holds ${holds.length} task(s) for your decision: ${holds.slice(0, 5).map((h) => `${h.taskId} (${h.kind})`).join(', ')}. See \`minions work autopilot status --json\`; handle each, then \`minions work autopilot resume <taskId>\` if its status did not change. If you cannot decide, ask the owner and stop.`);
-    }
-    if (db.paused().starts) return allow('paused');
-    if (currentBudget({ db, config })?.exhausted) return allow('budget', 'the owner budget is used up (new claims are refused)');
-    // The reset barrier (task-57.6): new starts are held until the running workers return, so nothing is left to dispatch.
-    const barrier = resetBarrier({ db, config, session: null });
-    if (barrier) return allow('context-reset-pending', barrier.reason);
-    if (backgroundRunning(inp)) return allow('background-running', 'a background subagent is still running');
-    const leases = db.activeLeases();
-    const leased = new Set(leases.map((l) => l.task_id));
-    // One backlog snapshot per turn end (task-24.2): ready tasks, capacity and continuing stages all derive from it.
-    let tasks: Task[];
-    try {
-      tasks = await backlog.listTasks();
-    } catch (e) {
-      return allow('backlog-error', `backlog query failed (${(e as Error).message})`);
-    }
-    const byId = new Map(tasks.map((t) => [t.id, t]));
-    const ready = filterReady(tasks, { leased, scope: scopeOf(config), lookup: (id) => byId.get(id), completed: dependencyDoneStatuses(config) }, 50);
-    const cap = capacityOf(config, leases, tasks);
-    const canStart = cap.freeTaskSlots > 0 && cap.freeEngineerSlots > 0;
-    const startable = canStart ? ready.filter((t) => !leased.has(t.id)) : [];
-    const continuing = tasks.filter((t) => !leased.has(t.id) &&
-      (t.status === 'testing' || t.status === 'reviewing' || (t.status === 'changes-requested' && cap.freeEngineerSlots > 0)));
-    if (!startable.length && !continuing.length) {
-      return ready.length ? allow('no-capacity', `${ready.length} ready but no capacity`) : allow('no-ready', 'no runnable tasks');
-    }
-    const fingerprint = sha256(JSON.stringify({
-      ready: ready.map((t) => t.id).sort(),
-      continuing: continuing.map((t) => `${t.id}:${t.status}`).sort(),
-      leases: leases.map((l) => l.id).sort(),
-      // Usage events are not progress: the coordinator's own usage is recorded on every Stop (task-57.1).
-      lastEvent: db.get<{ id: number | null }>("SELECT MAX(id) AS id FROM events WHERE kind != 'usage'")?.id ?? 0,
-    }));
+    // Coordinator sessions on: a hold goes to its task session, so the single coordinator is never kept running for it.
+    if (config.coordinator?.sessions?.enabled === true) return allow('sessions-on', 'coordinator sessions are on: holds go to their task sessions');
+    const holds = Object.values(readHolds(db));
+    if (!holds.length) return allow('no-holds', 'the autopilot dispatcher runs the stages; no decision waits');
+    const fp = holdsFingerprint(holds);
     const g = db.guard();
-    if (g.fingerprint === fingerprint && g.count >= NO_PROGRESS_LIMIT) {
-      db.setGuard({ fingerprint, count: g.count, last_reason: 'no-progress' });
-      return { reason: 'allow: no-progress (state unchanged after repeated continuation)' };
+    if (g.fingerprint === fp && g.count >= NO_PROGRESS_LIMIT) {
+      db.setGuard({ fingerprint: fp, count: g.count, last_reason: 'no-progress' });
+      return { reason: 'allow: no-progress (the held decisions are unchanged after repeated continuation)' };
     }
-    const count = g.fingerprint === fingerprint ? g.count + 1 : 1;
-    db.setGuard({ fingerprint, count, last_reason: 'continue' });
-    const parts: string[] = [];
-    if (startable.length) parts.push(`${startable.length} ready task(s) (${startable.slice(0, 5).map((t) => t.id).join(', ')}), capacity ${Math.min(cap.freeTaskSlots, cap.freeEngineerSlots)}`);
-    if (continuing.length) parts.push(`${continuing.length} task(s) awaiting the next stage (${continuing.slice(0, 5).map((t) => `${t.id}:${t.status}`).join(', ')})`);
-    return block(`minions: ${parts.join('; ')}; run /minions:orchestrate to dispatch the next one. If nothing can proceed, report why and stop.`);
+    db.setGuard({ fingerprint: fp, count: g.fingerprint === fp ? g.count + 1 : 1, last_reason: 'dispatch-decisions' });
+    return block(holdsReason(holds));
   } catch (e) {
     return { reason: `allow: internal error (${(e as Error).message})` };
   }
 }
 
-/**
- * Shape of a worker agent type: `minions:<name>` with a role-name-like name (`<role>-deep` included). Whether
- * the name is a registered role (and whether its `-deep` variant exists) is decided against the config.
- */
+/** Shape of a worker agent type: `minions:<name>` with a role-name-like name (`<role>-deep` included). */
 const WORKER_TYPE = /^minions:[a-z][a-z0-9-]{0,40}$/;
 const MARKER = /minions-lease:\s*(lease-[A-Za-z0-9_-]+)/g;
 
@@ -169,45 +116,17 @@ const deny = (reason: string): HookOutput => ({
 });
 
 /**
- * PreToolUse(Agent) guard (D10): `minions:<role>` and `minions:<role>-deep` (only for a role with a deep
- * variant) are accepted iff the role is in the registry of the runtime config and the prompt names an active
- * lease of that role. Every other `minions:*` type is denied. Fails closed (an unreadable config or DB denies).
+ * PreToolUse(Agent) guard (docs/design/autonomy.md Decision 10): minions workers run only under the autopilot
+ * dispatcher (headless `claude -p --agent minions:<role>`, or `minions work run` for a process harness), never as an
+ * Agent-tool subagent, so every `minions:*` agent type is denied. Other agent types pass.
  */
-export async function preAgentHook(input: unknown, load: HookLoader): Promise<HookOutput> {
+export function preAgentHook(input: unknown): HookOutput {
   const inp = isObj(input) ? input : {};
   const ti = isObj(inp.tool_input) ? inp.tool_input : {};
   const type = typeof ti.subagent_type === 'string' ? ti.subagent_type : '';
   if (!type.startsWith('minions:')) return { reason: `allow: not a minions worker (${type || 'none'})` };
   const shown = JSON.stringify(type.slice(0, 80)).slice(1, -1);
-  // Cheap syntactic check first: no config or DB read for a type no role could have.
-  if (!WORKER_TYPE.test(type)) return deny(`Unknown minions agent type "${shown}".`);
-  // The Agent tool only accepts model aliases; a full id would fail the launch with a less useful error.
-  if (typeof ti.model === 'string' && ti.model && !isAgentModelAlias(ti.model)) {
-    return deny(`model "${ti.model}" is not an Agent model alias (${AGENT_MODEL_ALIASES.join('|')}). Omit \`model\` to use the model set in the ${type} definition, or pass an allowed alias.`);
-  }
-  try {
-    const { db, config } = await load();
-    const def = agentTypeRole(config, type);
-    if (!def) return deny(`Unknown minions agent type "${shown}": not a registered worker role (${workerRoleNames(config).join(', ')}) or the deep variant of one.`);
-    const role = def.name;
-    // A role on a process harness (docs/design/agent-runtimes.md D1) is never a Claude subagent: it runs through
-    // `minions work run` after claim. Without this a Claude worker would silently stand in for it.
-    if (isProcessHarness(def.harness)) {
-      return deny(`${role} runs on ${HARNESSES[def.harness].label} (harness ${def.harness}), not as a Claude subagent: claim it, then run the launch command from \`minions work next --json\` (\`minions work run <leaseId> --json\`).`);
-    }
-    const prompt = typeof ti.prompt === 'string' ? ti.prompt : '';
-    const ids = [...prompt.matchAll(MARKER)].map((x) => x[1]!);
-    if (!ids.length) {
-      return deny(`${type} needs a claimed lease: run \`minions work claim <taskId> --role ${role} --json\` and include its briefMarker ("minions-lease: <leaseId>") in the prompt.`);
-    }
-    for (const id of ids) {
-      const l = db.lease(id);
-      if (l && l.status === 'active' && (l.role as string) === role) return { reason: `allow: ${type} under lease ${id} for ${l.task_id}` };
-    }
-    return deny(`No active ${role} lease matches ${ids.join(', ')}. Claim the task with \`minions work claim <taskId> --role ${role} --json\` first.`);
-  } catch (e) {
-    return deny(`minions could not verify the lease (${(e as Error).message}); refusing to launch ${type}.`);
-  }
+  return deny(`${shown} is a minions worker: workers run only under the autopilot dispatcher, which starts every runnable stage by itself. \`minions work autopilot status --json\` shows what runs and which tasks wait for your decision.`);
 }
 
 /**
@@ -251,7 +170,7 @@ export function preTelegramHook(input: unknown): HookOutput {
 export const PRE_BASH_HOOK_COMMAND = `i=$(cat) || exit 2; case "$i\${MINIONS_WORKER_LEASE:+\\"agent_id\\"}" in *'"agent_id"'*) if [ -z "$MINIONS_WORKER_LEASE" ]; then printf '%s' "$i" | grep -Eq 'minions[^:]|cli\\.[cm]?js|/state|/secrets|MINIONS_STATE_DIR|MINIONS_SECRETS_DIR'; m=$?; [ "$m" = 1 ] && exit 0; [ "$m" = 0 ] || exit 2; fi; printf '%s' "$i" | ${hangGuarded('minions hook pre-bash')} || exit 2;; esac`;
 
 /** The verbs a Claude subagent must never run: they start, claim or end worker leases, or run the local integrator (coordinator-only). */
-export const COORDINATOR_ONLY_WORK_VERBS = ['run', 'claim', 'advance', 'release', 'integrate'] as const;
+export const COORDINATOR_ONLY_WORK_VERBS = ['run', 'claim', 'release', 'integrate'] as const;
 
 /** A program word that runs the minions CLI: `minions` (any path) or its entry script (`…/dist/cli.js`). */
 const MINIONS_ENTRY = /^(minions|cli\.[cm]?js)$/;
@@ -384,7 +303,7 @@ function scriptHit(script: string, depth: number, match: EntryMatch): string | n
 }
 
 /**
- * The first `minions work run|claim|advance|release` a Bash command line would run, or null (task-14.5). The line is
+ * The first `minions work run|claim|release` a Bash command line would run, or null (task-14.5). The line is
  * scanned into simple commands (src/runtime/shell-scan.ts: quotes, continuations, separators, redirections,
  * heredoc bodies, substitutions); a command matches when, after assignments, its command word runs minions
  * (`minions` by any path, or `…/cli.js`), or a wrapper (env, sudo, timeout, xargs, node, …) has such a word
@@ -499,7 +418,7 @@ export function workerMinionsCommand(command: string, g: StateGuard = stateGuard
 
 /**
  * PreToolUse(Bash): a Claude subagent (`agent_id` set to anything but undefined/null, as for pre-telegram) may not
- * run `minions work run|claim|advance|release` (only the coordinator starts, claims and releases workers), any other minions
+ * run `minions work run|claim|release` (only the coordinator starts, claims and releases workers), any other minions
  * command that writes runtime state (task-72: WORKER_MINIONS_COMMANDS), or a command line naming the protected
  * state dir (bashStateReference: the runtime DB, backlog, briefs, results). The coordinator's own calls (no agent_id)
  * are allowed. Fails closed on input it cannot decide: non-object input, another tool or a missing command are denied.
@@ -980,7 +899,7 @@ export async function runHook(kind: HookKind, load: HookLoader | DrainLoader, st
     } else {
       if (kind !== 'stop') input = asWorkerInput(input);
       out = kind === 'drain' ? await drainHook(input, load) : kind === 'pre-telegram' ? preTelegramHook(input) : kind === 'pre-bash' ? preBashHook(input) : kind === 'pre-file' ? preFileHook(input)
-        : kind === 'stop' ? await stopHook(input, load as HookLoader) : await preAgentHook(input, load as HookLoader);
+        : kind === 'stop' ? await stopHook(input, load as HookLoader) : preAgentHook(input);
     }
   } catch (e) {
     out = failsOpen(kind) ? { reason: `allow: internal error (${(e as Error).message})` } : deny(`minions hook failed (${(e as Error).message}).`);

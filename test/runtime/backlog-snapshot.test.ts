@@ -4,7 +4,7 @@ import { MinionsError } from '../../src/core/errors.js';
 import { stopHook } from '../../src/runtime/hooks.js';
 import { makeEnv, tmp, type Env } from './fixtures.js';
 
-// task-24.2: one backlog listing per Stop hook run and per work claim.
+// task-24.2: one backlog listing per work claim, none per Stop hook run.
 let stateDir: string;
 beforeAll(() => { stateDir = tmp('minions-snapshot-'); process.env.MINIONS_STATE_DIR = stateDir; });
 afterEach(() => vi.restoreAllMocks());
@@ -26,44 +26,14 @@ const err = async (p: Promise<unknown>) => {
 };
 
 describe('stop hook backlog reads', () => {
-  it('lists the backlog once and derives ready, capacity and continuing stages from it', async () => {
-    const env = makeEnv((c) => { c.execution.maxActiveTasks = 5; });
-    env.backlog.add({ id: 'task-1', status: 'done' });
-    env.backlog.add({ id: 'task-2', dependencies: ['task-1'], priority: 'low' });
-    env.backlog.add({ id: 'task-3', dependencies: ['task-4'] });
-    env.backlog.add({ id: 'task-4', status: 'implementing' });
-    env.backlog.add({ id: 'task-5', status: 'reviewing' });
-    env.backlog.add({ id: 'task-6', authorized: false });
-    env.backlog.add({ id: 'task-7', priority: 'high' });
+  it('never reads the backlog: only the holds of the dispatcher decide (autonomy Decision 10)', async () => {
+    const env = makeEnv();
+    env.backlog.add({ id: 'task-1' });
     const s = spyReads(env.backlog);
-    const out = await stopHook({}, loader(env));
-    expect(s.listTasks).toHaveBeenCalledTimes(1);
+    expect((await stopHook({}, loader(env))).stdout).toBeUndefined();
+    expect(s.listTasks).not.toHaveBeenCalled();
     expect(s.listReady).not.toHaveBeenCalled();
     expect(s.getTask).not.toHaveBeenCalled();
-    const reason = JSON.parse(out.stdout!).reason as string;
-    // Ready by priority: task-7 (high) before task-2 (low); task-3 waits on task-4, task-6 is unauthorized.
-    expect(reason).toMatch(/2 ready task\(s\) \(task-7, task-2\), capacity \d+/);
-    expect(reason).toMatch(/1 task\(s\) awaiting the next stage \(task-5:reviewing\)/);
-  });
-
-  it('counts ready tasks from the snapshot when there is no capacity', async () => {
-    const env = makeEnv();
-    for (const id of ['task-1', 'task-2', 'task-3']) env.backlog.add({ id });
-    await env.sched.claim('task-1', 'engineer');
-    await env.sched.claim('task-2', 'engineer');
-    const s = spyReads(env.backlog);
-    const out = await stopHook({}, loader(env));
-    expect(out.reason).toBe('allow: 1 ready but no capacity');
-    expect(s.listTasks).toHaveBeenCalledTimes(1);
-    expect(s.listReady).not.toHaveBeenCalled();
-  });
-
-  it('respects the intake scope like listReady did', async () => {
-    const env = makeEnv((c) => { c.intake.scope.requiredLabels = ['qa']; });
-    env.backlog.add({ id: 'task-1' });
-    expect((await stopHook({}, loader(env))).reason).toBe('allow: no runnable tasks');
-    env.backlog.add({ id: 'task-2', labels: ['qa'] });
-    expect(JSON.parse((await stopHook({}, loader(env))).stdout!).reason).toMatch(/1 ready task\(s\) \(task-2\)/);
   });
 });
 

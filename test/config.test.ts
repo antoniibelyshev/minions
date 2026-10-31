@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { profileDefaults } from '../src/config/profiles.js';
-import { resolve, validateConfig } from '../src/config/resolve.js';
+import { applyControl, resolve, validateConfig } from '../src/config/resolve.js';
 import { CAPABILITIES } from '../src/config/schema.js';
 import { MinionsError } from '../src/core/errors.js';
 import { ctx, defaults } from './helpers.js';
@@ -126,6 +126,14 @@ describe('validation', () => {
     expect(resolve({ defaults: defaults(), local: { delivery: { mode: 'local', provider: 'none', merge: 'auto-when-eligible' } } }).config.delivery.merge).toBe('auto-when-eligible');
     expect(resolve({ defaults: defaults(), project: { delivery: { merge: 'manual' } } }).config.delivery.merge).toBe('disabled');
     expect(fail(() => resolve({ defaults: defaults(), project: { delivery: { merge: 'sometimes' } } })).message).toContain('delivery.merge');
+  });
+
+  it('accepts and drops dispatch.mode and the context-reset barrier (Decision 10: the autopilot always runs)', () => {
+    const legacy = { dispatch: { mode: 'coordinator', tickSeconds: 5 }, coordinator: { contextReset: { enabled: true, barrierTokens: 120_000 } } };
+    const { config } = resolve({ defaults: defaults(), project: legacy, local: { dispatch: { mode: 'auto' } } });
+    expect(config.dispatch).toEqual({ tickSeconds: 5 });
+    expect(config.coordinator?.contextReset).toEqual({ enabled: true });
+    expect(applyControl(defaults(), { dispatch: { mode: 'auto' } }).dispatch).toEqual({});
   });
 });
 

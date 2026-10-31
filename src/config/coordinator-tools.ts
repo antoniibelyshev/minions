@@ -14,7 +14,7 @@
 
 /**
  * Claude Code built-in tools the coordinator never uses. Each is a full tool definition in every
- * request unless removed (Artifact alone is ~48k chars). The coordinator dispatches workers, runs the
+ * request unless removed (Artifact alone is ~48k chars). The coordinator plans and files tasks, runs the
  * minions/git/backlog CLIs and talks over Telegram; it does not author artifacts, schedule itself,
  * edit notebooks, switch worktrees, plan-mode, browse the web or run workflows.
  */

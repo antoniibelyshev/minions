@@ -2,7 +2,8 @@ import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { hookLog, MAX_LOG_BYTES, preAgentHook, preTelegramHook, runHook, stopHook } from '../../src/runtime/hooks.js';
-import { commitFile, makeEnv, result, tmp, type Env } from './fixtures.js';
+import { writeHolds, type DispatchHold } from '../../src/runtime/dispatch-state.js';
+import { makeEnv, tmp, type Env } from './fixtures.js';
 
 let stateDir: string;
 beforeAll(() => { stateDir = tmp('minions-hooks-'); process.env.MINIONS_STATE_DIR = stateDir; });
@@ -11,151 +12,65 @@ afterEach(() => vi.restoreAllMocks());
 const loader = (env: Env) => () => ({ db: env.db, backlog: env.backlog, config: env.config });
 const decision = (o: { stdout?: string }) => (o.stdout ? JSON.parse(o.stdout) : null);
 
-describe('stop hook', () => {
-  it('blocks with a bounded instruction, then allows stop after repeated no-progress', async () => {
+const hold = (taskId: string, at = '2026-10-31T00:00:00.000Z'): DispatchHold => ({ taskId, kind: 'blocked', message: `${taskId} is blocked`, leaseId: null, at, status: 'blocked' });
+
+describe('stop hook (autonomy Decision 10: only held decisions keep the coordinator going)', () => {
+  it('blocks while the dispatcher holds a decision, then allows the stop after repeated no-progress', async () => {
     const env = makeEnv();
-    env.backlog.add({ id: 'task-1' });
+    writeHolds(env.db, { 'task-1': hold('task-1') });
     const a = await stopHook({ hook_event_name: 'Stop' }, loader(env));
     expect(decision(a)).toMatchObject({ decision: 'block' });
-    expect(decision(a).reason).toMatch(/1 ready task\(s\) \(task-1\), capacity 2; run \/minions:orchestrate/);
-    const b = await stopHook({ stop_hook_active: true }, loader(env));
-    expect(decision(b)?.decision).toBe('block');
+    expect(decision(a).reason).toMatch(/the dispatcher holds 1 task\(s\) for your decision: task-1 \(blocked\)/);
+    expect(decision(await stopHook({ stop_hook_active: true }, loader(env)))?.decision).toBe('block');
     const c = await stopHook({ stop_hook_active: true }, loader(env));
     expect(c.stdout).toBeUndefined();
     expect(env.db.guard().last_reason).toBe('no-progress');
-    // stays quiet while nothing changes
     expect((await stopHook({}, loader(env))).stdout).toBeUndefined();
-    // progress (a claim) resets the guard
-    env.backlog.add({ id: 'task-2' });
-    await env.sched.claim('task-1', 'engineer');
+    // A new hold is progress.
+    writeHolds(env.db, { 'task-1': hold('task-1'), 'task-2': hold('task-2') });
     expect(decision(await stopHook({}, loader(env)))?.decision).toBe('block');
   });
 
-  it('allows stop when paused', async () => {
+  it('allows the stop with runnable work and no hold: the dispatcher runs it', async () => {
     const env = makeEnv();
     env.backlog.add({ id: 'task-1' });
-    env.db.setPaused({ starts: true });
+    env.backlog.add({ id: 'task-2', status: 'testing' });
     expect((await stopHook({}, loader(env))).stdout).toBeUndefined();
-    expect(env.db.guard().last_reason).toBe('paused');
+    expect(env.db.guard().last_reason).toBe('no-holds');
   });
 
-  it('allows stop when the only tasks are blocked', async () => {
-    const env = makeEnv();
-    env.backlog.add({ id: 'task-1', status: 'blocked' });
-    env.backlog.add({ id: 'task-2', dependencies: ['task-1'] });
+  it('allows the stop with coordinator sessions on (holds go to their task sessions), for a headless worker, and on unavailable state', async () => {
+    const env = makeEnv((c) => { c.coordinator = { sessions: { enabled: true } }; });
+    writeHolds(env.db, { 'task-1': hold('task-1') });
     expect((await stopHook({}, loader(env))).stdout).toBeUndefined();
-    expect(env.db.guard().last_reason).toBe('no-ready');
-  });
-
-  it('allows stop when there is no capacity', async () => {
-    const env = makeEnv();
-    for (const id of ['task-1', 'task-2', 'task-3']) env.backlog.add({ id });
-    await env.sched.claim('task-1', 'engineer');
-    await env.sched.claim('task-2', 'engineer');
-    expect((await stopHook({}, loader(env))).stdout).toBeUndefined();
-    expect(env.db.guard().last_reason).toBe('no-capacity');
-  });
-
-  it('allows stop on backlog error or unavailable state', async () => {
-    const env = makeEnv();
-    env.backlog.add({ id: 'task-1' });
-    env.backlog.failReady = true;
-    expect((await stopHook({}, loader(env))).stdout).toBeUndefined();
-    expect(env.db.guard().last_reason).toBe('backlog-error');
+    expect(env.db.guard().last_reason).toBe('sessions-on');
+    expect((await stopHook({}, loader(env), { MINIONS_WORKER_LEASE: 'lease-abc' })).reason).toMatch(/headless worker lease-abc/);
     const r = await stopHook({}, () => { throw new Error('db locked'); });
     expect(r.stdout).toBeUndefined();
     expect(r.reason).toMatch(/db locked/);
-  });
-
-  it('allows stop while a background subagent is running', async () => {
-    const env = makeEnv();
-    env.backlog.add({ id: 'task-1' });
-    const r = await stopHook({ background_tasks: [{ id: 'x', type: 'subagent', status: 'running' }] }, loader(env));
-    expect(r.stdout).toBeUndefined();
-    expect(env.db.guard().last_reason).toBe('background-running');
-  });
-
-  it('continues for tasks awaiting the next stage', async () => {
-    const env = makeEnv();
-    env.backlog.add({ id: 'task-1', status: 'testing' });
-    expect(decision(await stopHook({}, loader(env))).reason).toMatch(/task-1:testing/);
   });
 });
 
 describe('pre-agent hook', () => {
   const agent = (subagent_type: string, prompt: string) => ({ hook_event_name: 'PreToolUse', tool_name: 'Agent', tool_input: { subagent_type, prompt, description: 'x' } });
 
-  it('denies an unclaimed minions:engineer and allows a claimed one', async () => {
+  it('denies every minions worker type, even under an active lease, and passes other agent types', async () => {
     const env = makeEnv();
     env.backlog.add({ id: 'task-1' });
-    const none = await preAgentHook(agent('minions:engineer', 'implement task-1'), loader(env));
-    expect(decision(none)).toMatchObject({ hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny' } });
-    expect(decision(none).hookSpecificOutput.permissionDecisionReason).toMatch(/work claim/);
-    expect(decision(await preAgentHook(agent('minions:engineer', 'minions-lease: lease-deadbeef0000'), loader(env))).hookSpecificOutput.permissionDecision).toBe('deny');
-
     const brief = await env.sched.claim('task-1', 'engineer');
-    const ok = await preAgentHook(agent('minions:engineer', `Brief...\n${brief.briefMarker}\n`), loader(env));
-    expect(ok.stdout).toBeUndefined();
-    // wrong role for the lease
-    expect(decision(await preAgentHook(agent('minions:tester', brief.briefMarker), loader(env))).hookSpecificOutput.permissionDecision).toBe('deny');
-    // released lease no longer authorizes
-    await env.sched.release(brief.leaseId, 'done');
-    expect(decision(await preAgentHook(agent('minions:engineer', brief.briefMarker), loader(env))).hookSpecificOutput.permissionDecision).toBe('deny');
-  });
-
-  it('accepts minions:engineer-deep under an engineer lease only', async () => {
-    const env = makeEnv();
-    env.backlog.add({ id: 'task-1' });
-    const eng = await env.sched.claim('task-1', 'engineer');
-    const ok = await preAgentHook(agent('minions:engineer-deep', eng.briefMarker), loader(env));
-    expect(ok.stdout).toBeUndefined();
-    expect(ok.reason).toMatch(/allow: minions:engineer-deep under lease/);
-    for (const t of ['minions:tester-deep', 'minions:reviewer-deep', 'minions:engineer-deeper']) {
-      expect(decision(await preAgentHook(agent(t, eng.briefMarker), loader(env))).hookSpecificOutput.permissionDecisionReason, t).toMatch(/Unknown minions agent type/);
+    for (const t of ['minions:engineer', 'minions:engineer-deep', 'minions:reviewer', 'minions:nope']) {
+      const d = decision(preAgentHook(agent(t, brief.briefMarker)));
+      expect(d, t).toMatchObject({ hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny' } });
+      expect(d.hookSpecificOutput.permissionDecisionReason).toMatch(/workers run only under the autopilot dispatcher/);
     }
-    // the engineer lease is the only thing that authorizes it
-    await env.sched.release(eng.leaseId, 'done');
-    const gone = decision(await preAgentHook(agent('minions:engineer-deep', eng.briefMarker), loader(env)));
-    expect(gone.hookSpecificOutput.permissionDecision).toBe('deny');
-    expect(gone.hookSpecificOutput.permissionDecisionReason).toMatch(/No active engineer lease/);
-    expect(decision(await preAgentHook(agent('minions:engineer-deep', 'go'), loader(env))).hookSpecificOutput.permissionDecisionReason).toMatch(/--role engineer/);
-  });
-
-  it('denies minions:engineer-deep under a tester lease', async () => {
-    const env = makeEnv();
-    env.backlog.add({ id: 'task-1' });
-    const eng = await env.sched.claim('task-1', 'engineer');
-    const head = commitFile(eng.worktree, 'a.txt', 'x');
-    await env.sched.record(eng.leaseId, result({ branch: eng.branch, headSha: head }));
-    const tester = await env.sched.claim('task-1', 'tester');
-    const r = decision(await preAgentHook(agent('minions:engineer-deep', tester.briefMarker), loader(env)));
-    expect(r.hookSpecificOutput.permissionDecision).toBe('deny');
-  });
-
-  it('denies a full model id as the Agent model and allows aliases or an omitted model', async () => {
-    const env = makeEnv();
-    env.backlog.add({ id: 'task-1' });
-    const brief = await env.sched.claim('task-1', 'engineer');
-    const withModel = (model: string) => ({ ...agent('minions:engineer', brief.briefMarker), tool_input: { ...agent('minions:engineer', brief.briefMarker).tool_input, model } });
-    const full = decision(await preAgentHook(withModel('claude-opus-5-5'), loader(env)));
-    expect(full.hookSpecificOutput.permissionDecision).toBe('deny');
-    expect(full.hookSpecificOutput.permissionDecisionReason).toMatch(/not an Agent model alias \(sonnet\|opus\|haiku\|fable\)\. Omit `model`/);
-    for (const m of ['sonnet', 'opus', 'haiku', 'fable']) expect((await preAgentHook(withModel(m), loader(env))).stdout, m).toBeUndefined();
-    expect((await preAgentHook(agent('minions:engineer', brief.briefMarker), loader(env))).stdout).toBeUndefined();
-  });
-
-  it('passes other agent types through and fails closed for minions workers', async () => {
-    expect((await preAgentHook(agent('general-purpose', 'anything'), () => { throw new Error('x'); })).stdout).toBeUndefined();
-    const r = await preAgentHook(agent('minions:reviewer', 'minions-lease: lease-abc'), () => { throw new Error('db broken'); });
-    expect(decision(r).hookSpecificOutput.permissionDecision).toBe('deny');
-    expect(decision(r).hookSpecificOutput.permissionDecisionReason).toMatch(/db broken/);
+    expect(preAgentHook(agent('general-purpose', 'anything')).stdout).toBeUndefined();
   });
 });
 
 describe('runHook', () => {
   it('prints the exact Claude Code formats and logs redacted lines', async () => {
     const env = makeEnv();
-    env.backlog.add({ id: 'task-1' });
+    writeHolds(env.db, { 'task-1': hold('task-1') });
     const writes: string[] = [];
     vi.spyOn(process.stdout, 'write').mockImplementation((s: string | Uint8Array) => { writes.push(String(s)); return true; });
     await runHook('stop', loader(env), '{"hook_event_name":"Stop"}');
