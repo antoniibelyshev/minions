@@ -106,6 +106,9 @@ export async function buildWorkerCommand(i: LaunchInput, deps: WorkerLaunchDeps)
   const { stage, claim, cfg } = i;
   if (!claim.worktree) throw new MinionsError('PRECONDITION', `Lease ${claim.leaseId} has no worktree.`);
   if (stage.launch.kind === 'run') {
+    if (workerRole(cfg, claim.role)?.secrets.length) {
+      throw new MinionsError('PRECONDITION', `${claim.role} runs on a process harness, which does not receive roles.${claim.role}.secrets yet.`, 'Run the role on claude, or drop its secrets.');
+    }
     const bin = deps.minionsBin ?? await resolveOnPath('minions', env.PATH);
     if (!bin) throw new MinionsError('PRECONDITION', '`minions` is not on PATH.');
     // The runner builds its own isolated environment and submits by proxy.

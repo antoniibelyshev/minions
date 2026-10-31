@@ -17,7 +17,7 @@
       {
         "matcher": "Bash",
         "hooks": [
-          { "type": "command", "command": "i=$(cat) || exit 2; case \"$i${MINIONS_WORKER_LEASE:+\\\"agent_id\\\"}\" in *'\"agent_id\"'*) printf '%s' \"$i\" | grep -Eq 'minions[^:]|cli\\.[cm]?js|/state|/secrets|MINIONS_STATE_DIR|MINIONS_SECRETS_DIR'; m=$?; [ \"$m\" = 1 ] && exit 0; [ \"$m\" = 0 ] || exit 2; printf '%s' \"$i\" | { if command -v timeout >/dev/null 2>&1; then timeout 20 minions hook pre-bash; else perl -e '$t=shift;$p=fork;defined $p or exit 127;if(!$p){setpgrp(0,0);exec @ARGV;print STDERR \"$ARGV[0]: $!\\n\";exit 127}setpgrp($p,$p);$SIG{ALRM}=sub{kill \"KILL\",-$p;exit 124};alarm $t;waitpid $p,0;exit($?&127?128+($?&127):$?>>8)' 20 minions hook pre-bash; fi; } || exit 2;; esac", "timeout": 30 }
+          { "type": "command", "command": "i=$(cat) || exit 2; case \"$i${MINIONS_WORKER_LEASE:+\\\"agent_id\\\"}\" in *'\"agent_id\"'*) if [ -z \"$MINIONS_WORKER_LEASE\" ]; then printf '%s' \"$i\" | grep -Eq 'minions[^:]|cli\\.[cm]?js|/state|/secrets|MINIONS_STATE_DIR|MINIONS_SECRETS_DIR'; m=$?; [ \"$m\" = 1 ] && exit 0; [ \"$m\" = 0 ] || exit 2; fi; printf '%s' \"$i\" | { if command -v timeout >/dev/null 2>&1; then timeout 20 minions hook pre-bash; else perl -e '$t=shift;$p=fork;defined $p or exit 127;if(!$p){setpgrp(0,0);exec @ARGV;print STDERR \"$ARGV[0]: $!\\n\";exit 127}setpgrp($p,$p);$SIG{ALRM}=sub{kill \"KILL\",-$p;exit 124};alarm $t;waitpid $p,0;exit($?&127?128+($?&127):$?>>8)' 20 minions hook pre-bash; fi; } || exit 2;; esac", "timeout": 30 }
         ]
       },
       {

@@ -43,6 +43,7 @@ export const overlayPath = (state: string) => join(controlDir(state), 'overlay.j
 export const journalPath = (state: string) => join(controlDir(state), 'journal.jsonl');
 const lockPath = (state: string) => join(controlDir(state), 'lock');
 const LOCK_STALE_MS = 30_000;
+const LOCK_WAIT_MS = 5_000;
 const MAX_REASON = 500;
 const KEY = /^[A-Za-z][A-Za-z0-9_-]*(\.[A-Za-z0-9_-]+)*$/;
 
@@ -77,7 +78,9 @@ export function readJournal(state: string): JournalEntry[] {
     if ((e as NodeJS.ErrnoException).code === 'ENOENT') return [];
     throw e;
   }
-  return text.split('\n').filter(Boolean).flatMap((l) => { try { return [JSON.parse(l) as JournalEntry]; } catch { return []; } });
+  // Secret changes share the file (src/runtime/secrets.ts) without a revision or a snapshot: not control entries.
+  return text.split('\n').filter(Boolean).flatMap((l) => { try { return [JSON.parse(l) as JournalEntry]; } catch { return []; } })
+    .filter((e) => Number.isInteger(e.revision) && isObj(e.before));
 }
 
 // ---------------------------------------------------------------- pure helpers
@@ -156,19 +159,21 @@ export function appliesOn(key: string): { appliesOn: AppliesOn; hostOwned: boole
 
 // ---------------------------------------------------------------- writes
 
-function withLock<T>(state: string, fn: () => Promise<T>): Promise<T> {
+/** Serializes control writes: waits up to LOCK_WAIT_MS for another change, takes over a lock older than LOCK_STALE_MS. */
+async function withLock<T>(state: string, fn: () => Promise<T>): Promise<T> {
   const p = lockPath(state);
-  let fd: number;
-  try { fd = openSync(p, 'wx', 0o600); } catch (e) {
-    if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e;
-    let stale = false;
-    try { stale = Date.now() - statSync(p).mtimeMs > LOCK_STALE_MS; } catch { stale = true; }
-    if (!stale) throw new MinionsError('CONFLICT', 'Another control change is in progress.', 'Retry in a few seconds.');
-    rmSync(p, { force: true });
-    fd = openSync(p, 'wx', 0o600);
+  const deadline = Date.now() + LOCK_WAIT_MS;
+  for (;;) {
+    try { closeSync(openSync(p, 'wx', 0o600)); break; } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e;
+      let stale = false;
+      try { stale = Date.now() - statSync(p).mtimeMs > LOCK_STALE_MS; } catch { continue; }
+      if (stale) { rmSync(p, { force: true }); continue; }
+      if (Date.now() > deadline) throw new MinionsError('CONFLICT', 'Another control change is in progress.', 'Retry in a few seconds.');
+      await new Promise((r) => setTimeout(r, 25));
+    }
   }
-  closeSync(fd);
-  return fn().finally(() => rmSync(p, { force: true }));
+  try { return await fn(); } finally { rmSync(p, { force: true }); }
 }
 
 export interface ControlDeps {
@@ -185,11 +190,13 @@ function checkReason(reason: string): string {
   return r.slice(0, MAX_REASON);
 }
 
-async function commit(d: ControlDeps, op: ControlOp, reason: string, next: Obj, extra: Partial<JournalEntry> = {}): Promise<ControlChange> {
+/** Applies `change` to the overlay read inside the lock (two coordinator sessions never lose each other's change). */
+async function commit(d: ControlDeps, op: ControlOp, reason: string, change: (cur: Obj) => Obj, extra: Partial<JournalEntry> = {}): Promise<ControlChange> {
   const why = checkReason(reason);
   await mkdir(controlDir(d.state), { recursive: true, mode: 0o700 });
   return withLock(d.state, async () => {
     const cur = readOverlay(d.state);
+    const next = change(cur.config);
     const keys = changedKeys(cur.config, next);
     if (!keys.length) return { revision: cur.revision, op, keys: [], message: `No change (control revision ${cur.revision}).` };
     // Validate against the real base: an invalid overlay is never written.
@@ -206,25 +213,30 @@ async function commit(d: ControlDeps, op: ControlOp, reason: string, next: Obj, 
 }
 
 export async function controlSet(d: ControlDeps, key: string, value: unknown, reason: string): Promise<ControlChange> {
-  return commit(d, 'set', reason, setPath(readOverlay(d.state).config, parseKey(key), value));
+  const segs = parseKey(key);
+  return commit(d, 'set', reason, (cur) => setPath(cur, segs, value));
 }
 
 export async function controlUnset(d: ControlDeps, key: string, reason: string): Promise<ControlChange> {
-  return commit(d, 'unset', reason, unsetPath(readOverlay(d.state).config, parseKey(key)));
+  const segs = parseKey(key);
+  return commit(d, 'unset', reason, (cur) => unsetPath(cur, segs));
 }
 
 /** Merges a partial config into the overlay in one change (e.g. a role and the workflow that uses it). */
 export async function controlApply(d: ControlDeps, partial: unknown, reason: string): Promise<ControlChange> {
   if (!isObj(partial)) throw new MinionsError('PRECONDITION', 'The file must hold a JSON object (a partial config).');
-  return commit(d, 'apply', reason, mergeObj(readOverlay(d.state).config, partial));
+  return commit(d, 'apply', reason, (cur) => mergeObj(cur, partial));
 }
 
-/** Restores the overlay as it was before `revision` (default: the last change). */
+/**
+ * Restores the overlay as it was before `revision` (default: the last change). It is a snapshot restore: the changes
+ * made after that revision are reverted too (the response lists every key it changes).
+ */
 export async function controlUndo(d: ControlDeps, reason: string, revision?: number): Promise<ControlChange> {
   const journal = readJournal(d.state);
   const target = revision === undefined ? journal.at(-1) : journal.find((e) => e.revision === revision);
   if (!target) throw new MinionsError('NOT_FOUND', revision === undefined ? 'Nothing to undo.' : `No control revision ${revision}.`, 'See `minions control log`.');
-  return commit(d, 'undo', reason, target.before, { undid: target.revision });
+  return commit(d, 'undo', reason, () => target.before, { undid: target.revision });
 }
 
 /** `minions control show`: the overlay, and the effective value of every key it sets. */

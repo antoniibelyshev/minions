@@ -174,3 +174,17 @@ Built on the minions channel server (src/telegram/channel, task-67), which the h
   requests need owner confirmation): the control layer applies coordinator changes directly.
 - coordinator-sessions.md (thread sessions deferred, TG 264): built as phase 5.
 - coordinator-sessions.md phase 10 / unattended-delivery.md item 7 (dispatcher waits for a spike): built as phase 1.
+
+## Known limits (review of the build, 2026-10-31)
+
+- **Secrets and same-uid workers.** Workers run as the same user as the coordinator. The worker guards deny state-dir
+  references (and a headless worker's every Bash call now goes through the full guard), but a path the guard cannot
+  see (a glob, `/proc/<pid>/environ` of another worker) is not a hard boundary. On the host runtime the sandbox is the
+  boundary. A per-worker uid or a secret broker would close it.
+- **Secret values are not masked** in worker results or in the coordinator's view of them (the process runner masks
+  its own). The worker log and config dir are removed when the lease ends.
+- **Process-harness roles** do not receive `roles.<role>.secrets` yet; such a launch is refused.
+- **`control undo`** restores the overlay snapshot from before a revision: later changes are reverted too, and the
+  response lists every key it changes.
+- **`ci` marker**: landing already waits for CI where minions knows CI (PR required checks; the local integration
+  gate's verification commands), so the marker documents the flow and selects nothing extra yet.

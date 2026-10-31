@@ -67,6 +67,15 @@ describe('control overlay', () => {
     await expect(controlUndo(deps(), 'x', 99)).rejects.toMatchObject({ code: 'NOT_FOUND' });
   });
 
+  it('concurrent changes never lose each other, and undo ignores secret journal lines', async () => {
+    await Promise.all([controlSet(deps(), 'execution.maxActiveTasks', 5, 'a'), controlSet(deps(), 'execution.maxRepairCyclesBeforeReplan', 4, 'b')]);
+    expect(readOverlay(state).config).toEqual({ execution: { maxActiveTasks: 5, maxRepairCyclesBeforeReplan: 4 } });
+    const { setSecret } = await import('../../src/runtime/secrets.js');
+    await setSecret(state, 'NPM_TOKEN', 'x', { reason: 'r' });
+    expect(readJournal(state).every((e) => Number.isInteger(e.revision))).toBe(true);
+    expect((await controlUndo(deps(), 'undo the last')).op).toBe('undo');
+  });
+
   it('a no-op change creates no revision', async () => {
     await controlSet(deps(), 'execution.maxActiveTasks', 3, 'a');
     const again = await controlSet(deps(), 'execution.maxActiveTasks', 3, 'a');

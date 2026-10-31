@@ -101,6 +101,8 @@ export interface DispatcherDeps {
   notify(hold: DispatchHold, cfg: MinionsConfig): Promise<void> | void;
   /** Whether the worker of a run record still runs (same pid and start time). Default: never (nothing adopted). */
   workerAlive?(r: DispatchRunRecord): Promise<boolean>;
+  /** Stops an adopted worker's process group (identity checked by the caller), e.g. past its wall-clock limit. */
+  stopWorker?(r: DispatchRunRecord): Promise<void>;
   /** The start time of a just-spawned worker, for its run record. */
   procStart?(pid: number): Promise<string | null>;
   now?(): Date;
@@ -124,6 +126,8 @@ export class Dispatcher {
   private readonly claimFailures = new Map<string, number>();
   /** Exit handling in flight (tests await it; the loop never overlaps a pass with a record of the same lease). */
   private readonly settling = new Set<Promise<void>>();
+  /** Tasks whose worker ended and whose result is being recorded: never claimed again until it is (no second worker). */
+  private readonly recording = new Set<string>();
   constructor(private readonly d: DispatcherDeps) {}
 
   private now = () => (this.d.now ?? (() => new Date()))();
@@ -155,7 +159,8 @@ export class Dispatcher {
     for (const [taskId, h] of Object.entries(holds)) {
       const status = await this.d.taskStatus(sched, taskId).catch(() => h.status);
       const claimedSince = this.d.db.all<{ id: string }>('SELECT id FROM leases WHERE task_id = ? AND started_at > ? AND (holder IS NULL OR holder != ?)', taskId, h.at, DISPATCH_HOLDER).length > 0;
-      if (status !== h.status || claimedSince) {
+      // A hold written while the backlog could not be read (status null) clears only by a claim or by hand.
+      if ((h.status !== null && status !== null && status !== h.status) || claimedSince) {
         delete holds[taskId];
         cleared.push(taskId);
         this.d.db.addEvent('dispatch-resume', taskId, { why: claimedSince ? 'the coordinator claimed a stage' : `status ${h.status ?? '?'} -> ${status ?? '?'}` });
@@ -204,14 +209,23 @@ export class Dispatcher {
     return outcome;
   }
 
-  /** Adopted workers that have ended since the last pass. */
-  private async reapAdopted(): Promise<void> {
+  /** Adopted workers that have ended since the last pass (one past its wall-clock limit is stopped first). */
+  private async reapAdopted(cfg: MinionsConfig): Promise<void> {
+    const limit = dispatchSettings(cfg).workerTimeoutMs;
     for (const [id, rec] of [...this.adopted]) {
-      if (await (this.d.workerAlive?.(rec) ?? Promise.resolve(false)).catch(() => false)) continue;
-      this.adopted.delete(id);
+      const alive = await (this.d.workerAlive?.(rec) ?? Promise.resolve(false)).catch(() => true);
       const l = this.d.db.lease(id);
-      if (l?.status === 'active') await this.finishOrphan(l, rec);
-      else await rm(runRecordPath(this.d.paths.state, id), { force: true });
+      const overdue = this.now().getTime() - Date.parse(rec.startedAt) > limit;
+      if (alive && (overdue || l?.status !== 'active')) { await this.d.stopWorker?.(rec).catch(() => undefined); continue; }
+      if (alive) continue;
+      this.adopted.delete(id);
+      this.recording.add(rec.taskId);
+      try {
+        if (l?.status === 'active') await this.finishOrphan(l, rec);
+      } catch (e) { this.log(`dispatch: recording the adopted ${id} failed: ${(e as Error).message}`); } finally {
+        this.recording.delete(rec.taskId);
+        await this.cleanupRun(id);
+      }
     }
   }
 
@@ -221,7 +235,7 @@ export class Dispatcher {
     const s = dispatchSettings(cfg);
     const report: PassReport = { mode: s.mode, started: [], held: [], cleared: [], blocked: null };
     if (s.mode !== 'auto') return report;
-    await this.reapAdopted();
+    await this.reapAdopted(cfg);
     const sched = await this.d.scheduler(cfg);
     report.cleared = await this.clearResolved(sched);
     const holds = readHolds(this.d.db);
@@ -230,7 +244,7 @@ export class Dispatcher {
     if (next.startsBlocked) { report.blocked = next.startsBlocked.message; return report; }
     // The coordinator's reset barrier holds stages as waiting; the dispatcher's workers are not the coordinator's.
     const stages = next.resetPending ? [...next.runnable, ...next.waiting.filter((w) => w.waitingOn === 'context-reset')] : next.runnable;
-    const busy = new Set(this.active().map((r) => r.taskId));
+    const busy = new Set([...this.active().map((r) => r.taskId), ...this.recording]);
     for (const stage of stages) {
       if (holds[stage.taskId] || busy.has(stage.taskId)) continue;
       let claim: CompactClaim;
@@ -283,27 +297,58 @@ export class Dispatcher {
   }
 
   private async onExit(run: Running, exit: WorkerExit): Promise<void> {
+    this.recording.add(run.taskId);
     this.running.delete(run.leaseId);
+    try { await this.settleExit(run, exit); } catch (e) {
+      // Never leave the lease active and the task parked silently: end it and hand the task to the coordinator.
+      this.log(`dispatch: recording ${run.leaseId} failed: ${(e as Error).message}`);
+      try {
+        const cfg = await this.d.config();
+        const sched = await this.d.scheduler(cfg);
+        if (this.d.db.lease(run.leaseId)?.status === 'active') await sched.release(run.leaseId, `the dispatcher could not record this worker: ${(e as Error).message}`).catch(() => undefined);
+        await this.hold(cfg, sched, { taskId: run.taskId, kind: 'no-result', message: `the dispatcher could not record the ${run.role} worker: ${(e as Error).message}`, leaseId: run.leaseId });
+      } catch { /* the next dispatcher's recovery picks the lease up */ }
+    } finally {
+      this.recording.delete(run.taskId);
+      await this.cleanupRun(run.leaseId);
+    }
+  }
+
+  /** The run record, the worker's config dir (its transcripts) and its output log end with the lease. */
+  private async cleanupRun(leaseId: string): Promise<void> {
+    if (this.running.has(leaseId)) return; // the correction run of the same lease reuses them
+    await rm(runRecordPath(this.d.paths.state, leaseId), { force: true });
+    if (this.d.db.lease(leaseId)?.status === 'active') return;
+    await rm(join(dispatchRunDir(this.d.paths.state), 'config', leaseId), { recursive: true, force: true });
+    await rm(join(dispatchRunDir(this.d.paths.state), `${leaseId}.log`), { force: true });
+  }
+
+  private async settleExit(run: Running, exit: WorkerExit): Promise<void> {
     const cfg = await this.d.config();
     const sched = await this.d.scheduler(cfg);
     const lease = this.d.db.lease(run.leaseId);
     const why = exit.spawnError ? `spawn error: ${exit.spawnError}` : exit.stopped ? `stopped (${exit.stopped})` : `exit ${exit.code ?? exit.signal}`;
     this.log(`dispatch: ${run.taskId} ${run.role} ended (${run.leaseId}, ${why}${exit.tokens !== null ? `, ${exit.tokens} tokens` : ''})`);
-    if (!lease || lease.status !== 'active') { await rm(runRecordPath(this.d.paths.state, run.leaseId), { force: true }); return; }
+    if (!lease || lease.status !== 'active') return;
     const usage = exit.tokens !== null ? { tokens: exit.tokens, model: exit.model } : undefined;
     let r: RecordResponse;
     try {
       r = await recordSubmitted(sched, this.d.paths, run.leaseId, { correction: run.corrections > 0, ...(usage ? { usage } : {}) });
     } catch (e) {
+      // Someone else ended the lease meanwhile (a release, a cancel): theirs is the decision.
+      if (this.d.db.lease(run.leaseId)?.status !== 'active') return;
+      // Stopped for a drain (an upgrade) without a partial: not a failed attempt; the stage stays runnable.
+      if (exit.stopped === 'drain') {
+        await sched.release(run.leaseId, 'stopped for a drain before it submitted; the next attempt continues from its branch', usage ? { usage } : {});
+        return;
+      }
       // No submitted result: the worker ran out of turns or time, or crashed. The lease ends; the coordinator decides.
       const tail = exit.stderrTail.trim().split('\n').slice(-3).join(' | ').slice(0, 300);
       const message = `the ${run.role} worker ended without a result (${why})${tail ? `: ${tail}` : ''}; ${(e as Error).message}`;
       await sched.release(run.leaseId, message, usage ? { usage } : {}).catch(() => undefined);
       await this.hold(cfg, sched, { taskId: run.taskId, kind: 'no-result', message, leaseId: run.leaseId });
-      await rm(runRecordPath(this.d.paths.state, run.leaseId), { force: true });
       return;
     }
-    await rm(runRecordPath(this.d.paths.state, run.leaseId), { force: true });
     await this.afterRecord(cfg, sched, lease, r, run.corrections, exit.sessionId ?? run.handle.sessionId(), run.stage);
   }
 

@@ -20,7 +20,7 @@ type Script = (i: LaunchInput) => Record<string, unknown> | null;
 
 const exit = (over: Partial<WorkerExit> = {}): WorkerExit => ({ code: 0, signal: null, stopped: null, tokens: 1000, model: 'sonnet', sessionId: 'sess-1', stderrTail: '', spawnError: null, ...over });
 
-function setup(script: Script, mutate?: (c: MinionsConfig) => void) {
+function setup(script: Script, mutate?: (c: MinionsConfig) => void, exitOf: (i: LaunchInput) => WorkerExit = () => exit()) {
   const env = makeDefaultEnv((c) => { c.dispatch = { mode: 'auto' }; mutate?.(c); });
   const launches: LaunchInput[] = [];
   const notified: DispatchHold[] = [];
@@ -31,7 +31,7 @@ function setup(script: Script, mutate?: (c: MinionsConfig) => void) {
       const head = i.claim.role === 'engineer' ? commitFile(i.claim.worktree, `${i.claim.leaseId}-${launches.length}.txt`, 'work') : env.db.lease(i.claim.leaseId)!.head_sha ?? i.claim.expectedHead;
       await submitResult(env.db, paths(env), i.claim.leaseId, JSON.stringify(result({ branch: i.claim.branch, headSha: head, ...over })), { role: i.claim.role, cwd: i.claim.worktree });
     }
-    return { done: Promise.resolve(exit()), pid: () => 4242, sessionId: () => 'sess-1' };
+    return { done: Promise.resolve(exitOf(i)), pid: () => 4242, sessionId: () => 'sess-1' };
   };
   const disp = new Dispatcher({
     db: env.db, paths: paths(env), config: async () => structuredClone(env.config),
@@ -131,6 +131,27 @@ describe('dispatcher: the automatic flow', () => {
     expect(collectWakeReasons(env.db, null, null, { dispatchAuto: true })).toEqual([expect.objectContaining({ kind: 'dispatch-decision', taskId: 'task-1' })]);
     expect(clearHold(env.db, 'task-1', 'handled')).toBe(true);
     expect((await disp.pass()).started.map((s) => s.taskId)).toEqual(['task-1']);
+  });
+
+  it('a worker stopped for a drain is released without a decision; the stage stays runnable', async () => {
+    const { env, disp, notified } = setup(() => null, undefined, () => exit({ stopped: 'drain', code: null, signal: 'SIGINT' }));
+    env.backlog.add({ id: 'task-1' });
+    await disp.pass(); await disp.settled();
+    expect(env.db.activeLeases()).toEqual([]);
+    expect(readHolds(env.db)).toEqual({});
+    expect(notified).toEqual([]);
+  });
+
+  it('a failure while recording never leaves the lease active: it is released and the task held', async () => {
+    const { env, disp } = setup(() => ({}));
+    env.backlog.add({ id: 'task-1' });
+    let n = 0;
+    // The pass reads the config once; the exit handling's first read fails.
+    (disp as unknown as { d: { config: () => Promise<MinionsConfig> } }).d.config = async () => { if (n++ === 1) throw new Error('config unreadable'); return structuredClone(env.config); };
+    await disp.pass();
+    await disp.settled();
+    expect(env.db.activeLeases()).toEqual([]);
+    expect(readHolds(env.db)['task-1']).toMatchObject({ kind: 'no-result' });
   });
 
   it('a hold clears itself when the coordinator changes the task status', async () => {
