@@ -97,7 +97,7 @@ Workflows exist (roles-and-workflows.md D5): named stage lists, per-task `--work
 A new config layer, **control**, owned by the coordinator:
 
 ```
-profile defaults < project < local (host) < control (coordinator) < session
+mode defaults < project < local (host) < control (coordinator) < session
 ```
 
 - **Storage:** `<state>/control/overlay.json` (a partial config, deep-merged; `unset` removes a key from it) plus a journal
@@ -235,6 +235,30 @@ message about its task), and the routine's runnable, unvalidated, split and awai
 is a hold now). `work claim|record|release` stay as primitives; the recover skill uses the last two for leases left
 from before this decision. Process-harness roles run through the dispatcher's `minions work run`, as before.
 
+## Decision 11. Two modes (owner, 2026-10-31)
+
+The owner runs `minions init`, picks a mode and works; nothing else is set up per project. The three init profiles
+differed in details nobody tuned, and the only real question was who merges: the agents or the owner. So there are two
+modes, `independent` and `supervised`, and the mode is a required choice (no default, never from `defaults.json`):
+`--mode` or the first wizard question, and a non-interactive init without it fails.
+
+- **independent**: the team runs the project. Docker, Telegram with thread sessions, the routine with a 09:00 digest,
+  local integration, `architecture: decide`, budgets ($20 a day, $5 a task). Policy allows everything except deploying;
+  a short list of truly dangerous paths (agent and minions configuration, `CLAUDE.md`/`AGENTS.md`, git hooks, CI
+  workflows) still needs the owner's signed approval before landing.
+- **supervised**: the owner reviews and merges all code, so `base.merge` is the only extra deny and the agents may
+  experiment; the prompt asks them to raise hard-to-review changes (dependencies, migrations, CI, broad refactors) and
+  anything unclear with the owner. Host runtime, terminal, one coordinator, `architecture: propose`, no budget.
+
+`minions mode set` rewrites the keys a mode decides in the project config; `config.local.json` stays, being the owner's
+own layer. Answers that are the same for every project (Claude auth, the git identity of agent commits, the owner's
+Telegram id, which pre-allowlists a new bot) live in `minions defaults`, so init asks none of them. The mode only
+chooses the runtime of a new project; an installed project keeps its runtime. `external.*` capabilities existed only
+for the removed GitHub intake (Decision 8) and are dropped from old configs, like `profile`, which becomes `mode`
+(project-owner: independent; personal-work and supervised: supervised). Setup no longer asks about local integration
+and init no longer asks about visibility, intake, the channel, verification or container resources: the mode and
+discovery decide, and `minions settings set` changes them.
+
 ## Reversed decisions
 
 - telegram-decisions.md D2 (tap buttons instead of native polls): native polls are built at the owner's request.
@@ -246,6 +270,8 @@ from before this decision. Process-harness roles run through the dispatcher's `m
   container) and unattended-delivery.md (PR and CI sync, GitHub intake in the routine pass): removed by Decision 8.
 - coordinator-sessions.md phase 7 (task sessions dispatch their stages) and the reset barrier, and unattended-delivery.md
   item 6 (`work advance`) and the routine's runnable wakes: removed by Decision 10.
+- spec.md and bootstrap.md (three init profiles, the full init wizard, setup's opt-in local integration question):
+  replaced by Decision 11.
 
 ## Known limits (review of the build, 2026-10-31)
 
