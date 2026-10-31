@@ -1264,7 +1264,7 @@ export function register(program: Command): void {
     }));
   coord.command('sessions').description('The sessions index: every open coordinator session and those closed in the last day, with topic and last activity (also <state>/sessions/index.md)')
     .action(action(async (_o: unknown, cmd: Command) => {
-      requireMode('runtime');
+      if (runtimeMode() === 'host') return delegate(cmd);
       const r = sessionsIndex(getDb());
       emit(r, { json: globalOpts(cmd).json, human: formatSessionsIndex });
     }));
