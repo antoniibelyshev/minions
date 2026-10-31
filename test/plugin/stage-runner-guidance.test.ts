@@ -64,21 +64,26 @@ describe('coordinator.md and orchestrate dispatch from work next', () => {
     expect(orch).toMatch(/Fallback \(an older CLI rejects `work advance`.*`minions work record <leaseId> --submitted --usage <subagent_tokens> --json`, then steps 1 to 3/);
   });
 
-  it('orchestrate covers assigning a workflow, proposing a role and cheap stages', async () => {
+  it('orchestrate covers assigning a workflow, defining a role and cheap stages', async () => {
     const orch = await (await gen(withWorkflows()))('skills/orchestrate/SKILL.md');
     expect(orch).toContain('## Workflows, roles and models');
     expect(orch).toMatch(/\*\*Assigning a workflow\*\* when you create a task: the default unless the task fits a configured workflow \(`docs`\).*`minions backlog create \.\.\. --workflow <name>`/);
-    expect(orch).toMatch(/\*\*Proposing a role\*\*: only when recurring project work does not fit engineer, tester and reviewer.*never for a one-off task.*`edits\.paths` scoped.*never edit `\.minions\/\*\*` yourself/);
+    expect(orch).toMatch(/\*\*Defining a role \(worker profile\)\*\*: when recurring project work does not fit the existing roles.*never for a one-off task.*`edits\.paths` scoped/);
     expect(orch).toMatch(/\*\*Cheap stages\*\*: follow `suggestedModel` \(stage hint, then role model, then the risk rule: `risk:low` → the cheapest allowed model for gates and verifiers, `risk:high` or a repair after a failed attempt → the strongest and the deep variant\)/);
     expect(await (await gen())('skills/orchestrate/SKILL.md')).toMatch(/fits a configured workflow \(none configured yet\)/);
   });
 
-  it('proposing a role names the propose command and the host apply command (task-33.6)', async () => {
+  it('defining a role and tuning a flow go through the control layer, applied at once (autonomy D3)', async () => {
     const read = await gen();
     const orch = await read('skills/orchestrate/SKILL.md');
-    expect(orch).toMatch(/\*\*Proposing a role\*\*:.*store it with `minions config roles propose --file <f> --json`.*returns `proposalId`, a `summary`.*Nothing becomes effective\..*host command `minions config roles apply <proposalId>`.*never edit `\.minions\/\*\*` yourself/);
+    expect(orch).toMatch(/\*\*Defining a role \(worker profile\)\*\*:.*`minions control apply --file <f> --reason <why> --json`.*takes effect for the next stage/);
+    expect(orch).toMatch(/\*\*Tuning flows\*\*:.*`minions control set workflows\.<name>/);
     const coord = await read('coordinator.md');
-    expect(coord).toContain('- Roles: `minions config roles list|show|propose ... --json` (propose only; the owner applies a proposal on the host with `minions config roles apply <proposalId>`');
+    expect(coord).toContain('**You own the configuration.** `minions control set <key> <json> --reason <text> --json` changes any config key at once, without the owner');
+    expect(coord).toContain('The autopilot dispatcher is off');
+    const auto = await (await gen({ ...defaults(), dispatch: { mode: 'auto' } }))('coordinator.md');
+    expect(auto).toContain('**The autopilot dispatcher runs the stages**');
+    expect(auto).toContain('`minions work autopilot status --json`');
   });
 
   it('configured workflows and per-role limits are rendered', async () => {

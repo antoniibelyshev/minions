@@ -500,6 +500,18 @@ const processRoleList = (roles: RoleDef[]) => roles.map((d) => `${code(d.name)} 
  * Coordinator prompt, dispatch flow (agent-runtimes D8): how a `launch.kind: "run"` stage starts. Empty when every
  * role runs on Claude Code, so Claude-only projects keep their prompt unchanged.
  */
+/** The autopilot (docs/design/autonomy.md Decision 1): with dispatch.mode auto the dispatcher runs the stage loop. */
+function autopilotGuidance(cfg: MinionsConfig): string {
+  if (cfg.dispatch?.mode !== 'auto') {
+    return 'The autopilot dispatcher is off (`dispatch.mode` coordinator): you dispatch every stage as below. Turn it on with `minions control set dispatch.mode auto --reason "..." --json` once the project runs smoothly; then a deterministic dispatcher runs the stages and you handle only decisions.\n\n';
+  }
+  return [
+    '**The autopilot dispatcher runs the stages** (`dispatch.mode` auto). It claims every runnable stage, runs it as a headless worker, records the result and moves the task on (engineer → tester → reviewer → merge, repairs and the single correction included) without you. Do not claim, spawn or advance stages yourself on a normal day.',
+    'Your job: keep the backlog ready and well split, set each task\'s workflow when it differs from the default, tune the flow and the roles with `minions control` (below), talk to the owner, and handle **decisions**. A decision parks the task (a hold): `minions work autopilot status --json` lists them (`kind`, `message`, `errors`). Handle one the way the steps below describe for that `decision.kind` (rewrite or split the task, re-dispatch by hand with `work claim` + Agent, ask the owner, unblock), then `minions work autopilot resume <taskId> --json` if the task status did not change. A hold clears itself when the status changes or you claim a stage.',
+    'You may still dispatch a stage by hand (steps below) when you must, e.g. a correction the dispatcher could not do; the dispatcher never claims a task you hold a lease on.',
+  ].join(' ') + '\n\n';
+}
+
 function processDispatchGuidance(cfg: MinionsConfig): string {
   const roles = processRoles(cfg);
   if (!roles.length) return '';
@@ -576,6 +588,7 @@ function baseVars(cfg: MinionsConfig): Record<string, string> {
     roleLimits: roleLimits(cfg),
     workflowGuidance: workflowGuidance(cfg),
     processDispatchGuidance: processDispatchGuidance(cfg),
+    autopilotGuidance: autopilotGuidance(cfg),
     processRunGuidance: processRunGuidance(cfg),
     workflowNames: inlineList(workflowNames(cfg).filter((n) => n !== DEFAULT_WORKFLOW), 'none configured yet'),
     deliveryMode: cfg.delivery.mode,
