@@ -11,12 +11,7 @@ import { CONTAINER } from '../core/paths.js';
 import { VERSION } from '../core/version.js';
 import { DEFAULT_REFRESH_MINUTES, authOf, containerEnv, describeSource, expandHome, isKeyAuth, maskValue, resolveOnPath, secretStatus, type ClaudeAuth } from './auth.js';
 import type { MinionsConfig } from '../config/schema.js';
-import { managerBotClash } from './bot-guard.js';
-import { loadManagerAccess } from './manager-bot.js';
-import { serviceHost } from './manager-service.js';
-import { managerOverview, managerServiceChecks } from './manager-status.js';
-import { assistantCheck, type CapabilityCheck } from './manager-assistant.js';
-import { clearStaleSecrets, managerCredentialStatus, secretCopiesExist, telegramCredentialStatus, type TelegramCredentialStatus } from './credentials.js';
+import { clearStaleSecrets, secretCopiesExist, telegramCredentialStatus, type TelegramCredentialStatus } from './credentials.js';
 import { dockerProbe, type DockerProbe, type DockerStatus } from './discovery.js';
 import { composeHint, daemonHint, linuxDockerChecks, linuxHostFacts, unknownLinuxFacts, type LinuxHostFacts } from './linux-host.js';
 import { Compose, buildFingerprint, imageBuildLabel, tmpSizeMiB, type Runner } from './docker.js';
@@ -216,7 +211,7 @@ async function telegramRuntimeChecks(ex: (args: string[]) => Promise<{ code: num
 
 /**
  * setup: obvious configuration gaps left after init (no verification commands, no setup commands for the local
- * integration of a Node project, Telegram selected without a bot token), with a pointer to the setup assistant.
+ * integration of a Node project, Telegram selected without a bot token).
  */
 export function setupGapsCheck(config: Pick<MinionsConfig, 'verification' | 'communication'> & Partial<Pick<MinionsConfig, 'delivery'>>,
   s: { telegramToken: TelegramCredentialStatus['state']; nodeProject?: boolean }): Check {
@@ -230,7 +225,7 @@ export function setupGapsCheck(config: Pick<MinionsConfig, 'verification' | 'com
   if (config.communication.channel === 'telegram' && s.telegramToken !== 'ok') gaps.push('Telegram selected without a valid bot token');
   if (config.communication.channel === 'auto' && s.telegramToken === 'invalid') gaps.push('the stored Telegram bot token is invalid (communication.channel auto)');
   return gaps.length
-    ? { name: 'setup', status: 'warn', detail: `incomplete: ${gaps.join('; ')}`, hint: 'Run `minions setup assist` (AI setup assistant in Claude Code) to finish the remaining setup, or follow the hints above.' }
+    ? { name: 'setup', status: 'warn', detail: `incomplete: ${gaps.join('; ')}`, hint: 'Set the missing values with `minions settings set <key> <value>` (or ask the coordinator), or follow the hints above.' }
     : { name: 'setup', status: 'ok', detail: 'no obvious gaps (verification commands set; credentials match the configured channel)' };
 }
 
@@ -374,67 +369,8 @@ export function restartCheck(r: RestartRequired): Check {
   }
 }
 
-/**
- * manager.token / manager.bot / manager.pairing: the host manager bot (host-wide; docs/design/host-manager.md).
- * Never 'fail': the manager is optional and the terminal stays the baseline. No network call; never the token.
- */
-export async function managerChecks(opts: { runner?: Runner } = {}): Promise<Check[]> {
-  const setup = 'Run `minions setup` in a terminal (host manager bot step).';
-  const tok = await managerCredentialStatus(opts).catch((e): Awaited<ReturnType<typeof managerCredentialStatus>> => ({ state: 'invalid', detail: `could not check (${short(String((e as Error).message ?? e))})` }));
-  if (tok.state === 'missing' && !tok.backend) {
-    return [
-      { name: 'manager.token', status: 'ok', detail: 'not set up (optional: the host manager bot confirms setup changes from Telegram)', hint: setup },
-      { name: 'manager.bot', status: 'unavailable', detail: 'no manager bot token stored' },
-      { name: 'manager.pairing', status: 'unavailable', detail: 'no manager bot token stored' },
-    ];
-  }
-  const out: Check[] = [tok.state === 'ok'
-    ? { name: 'manager.token', status: 'ok', detail: tok.detail }
-    : { name: 'manager.token', status: 'warn', detail: `${tok.state}: ${tok.detail}`, hint: `Store the manager bot token again: ${setup}` }];
-  const clash = await managerBotClash().catch(() => undefined);
-  if (clash === undefined) out.push({ name: 'manager.bot', status: 'warn', detail: 'could not compare the manager bot with the coordinator bots' });
-  else if (clash && clash.projects.length) {
-    out.push({ name: 'manager.bot', status: 'warn', detail: `bot ${clash.botId} is also the coordinator bot of project(s) ${clash.projects.join(', ')}: its token is mounted into that container`,
-      hint: 'Give the manager its own bot (BotFather /newbot, then `minions setup`), or give that project another bot (`minions auth telegram`).' });
-  } else if (clash) out.push({ name: 'manager.bot', status: 'ok', detail: `bot ${clash.botId} is not a coordinator bot of any registered project` });
-  let access: Awaited<ReturnType<typeof loadManagerAccess>> | 'invalid';
-  try { access = await loadManagerAccess(); } catch { access = 'invalid'; }
-  const pairHint = `Pair from the terminal: ${setup} and choose pair.`;
-  if (access === 'invalid') out.push({ name: 'manager.pairing', status: 'warn', detail: 'access.json is unreadable: nobody can use the manager bot', hint: pairHint });
-  else if (!access) out.push({ name: 'manager.pairing', status: 'warn', detail: 'not paired: the manager bot ignores everyone until you pair', hint: pairHint });
-  else if (tok.botId && access.botId !== tok.botId) out.push({ name: 'manager.pairing', status: 'warn', detail: `paired for bot ${access.botId}, but the stored token is bot ${tok.botId}`, hint: pairHint });
-  else out.push({ name: 'manager.pairing', status: 'ok', detail: `paired with Telegram user ${access.userId} (private chat)` });
-  return out;
-}
-
-/**
- * manager.service / manager.process: the supervisor service and the running manager (src/host/manager-status.ts).
- * Never 'fail'. Asks launchctl / systemctl (through the runner) only when setup recorded a service.
- */
-export async function managerSupervisorChecks(opts: { runner?: Runner; platform?: NodeJS.Platform; now?: Date } = {}): Promise<Check[]> {
-  const platform = opts.platform ?? process.platform;
-  try {
-    const m = await managerOverview({ host: serviceHost({ platform, ...(opts.runner ? { runner: opts.runner } : {}) }), ...(opts.now ? { now: opts.now } : {}) });
-    return managerServiceChecks(m, { platform, ...(opts.now ? { now: opts.now } : {}) });
-  } catch (e) {
-    return [{ name: 'manager.service', status: 'warn', detail: `could not check (${short(String((e as Error).message ?? e))})` }];
-  }
-}
-
-/**
- * manager.assistant: the manager's natural-language assistant (src/host/manager-assistant.ts). Never 'fail'; checks the
- * claude CLI (`--version`, `--help`; never a model call) only when the assistant is switched on.
- */
-export async function managerAssistantChecks(opts: { runner?: Runner; probe?: () => Promise<CapabilityCheck> } = {}): Promise<Check[]> {
-  try { return [await assistantCheck(opts)]; } catch (e) {
-    return [{ name: 'manager.assistant', status: 'warn', detail: `could not check (${short(String((e as Error).message ?? e))})` }];
-  }
-}
-
 export async function runDoctor(opts: {
   cwd: string; runner?: Runner; probe?: DockerProbe; fingerprint?: string | null; version?: string;
-  /** Claude CLI check of the manager assistant (tests); defaults to probeClaude through the runner. */
-  claudeProbe?: () => Promise<CapabilityCheck>;
   /** Host platform (tests); defaults to process.platform. */
   platform?: NodeJS.Platform;
   /** Linux fact probe (tests); defaults to linuxHostFacts through the runner. */
@@ -592,9 +528,6 @@ export async function runDoctor(opts: {
   }
 
   add('merge.readiness', ...mergeReadiness(effective));
-  checks.push(...await managerChecks({ runner }));
-  checks.push(...await managerAssistantChecks({ runner, ...(opts.claudeProbe ? { probe: opts.claudeProbe } : {}) }));
-  checks.push(...await managerSupervisorChecks({ runner, platform: opts.platform ?? process.platform }));
   add('features', 'unavailable', DEFERRED_FEATURES.join(', '));
   if (projectId) checks.push(restartCheck(restart));
   add('package', 'ok', `minions ${VERSION}`);

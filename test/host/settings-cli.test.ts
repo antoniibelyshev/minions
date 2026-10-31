@@ -109,27 +109,12 @@ describe('minions settings (CLI)', () => {
     expect(envelope(s.out).error).toMatchObject({ code: 'PRECONDITION' });
   });
 
-  it('without a terminal, plain `minions settings` opens the menu (numbered prompts), not a refusal; --list never opens it', async () => {
+  it('plain `minions settings` prints the same list as --list (no menu, no prompt)', async () => {
     const { repo } = await install();
-    const { Command } = await import('commander');
-    const { registerSettings } = await import('../../src/host/settings-cli.js');
-    const tty = process.stdin.isTTY;
-    Object.defineProperty(process.stdin, 'isTTY', { value: undefined, configurable: true });
-    vi.spyOn(process, 'cwd').mockReturnValue(repo);
-    try {
-      const opened: { layer: string }[] = [];
-      const program = new Command().option('--json');
-      registerSettings(program, { confirm: async () => null, menu: async (_p, o) => { opened.push(o); } });
-      program.exitOverride();
-      await program.parseAsync(['node', 'minions', 'settings']);
-      expect(opened).toEqual([{ layer: 'local' }]);
-      const w = process.stdout.write.bind(process.stdout);
-      process.stdout.write = (() => true) as typeof process.stdout.write;
-      try { await program.parseAsync(['node', 'minions', 'settings', '--list']); } finally { process.stdout.write = w; }
-      expect(opened).toHaveLength(1);
-    } finally {
-      Object.defineProperty(process.stdin, 'isTTY', { value: tty, configurable: true });
-    }
+    const plain = await cli(repo, ['settings']);
+    expect(plain.code).toBe(0);
+    expect(plain.out).toBe((await cli(repo, ['settings', '--list'])).out);
+    expect(plain.out).toContain('execution.maxActiveTasks = ');
   });
 
   it('settings --list / --list --json and set errors never contain a stored token', async () => {

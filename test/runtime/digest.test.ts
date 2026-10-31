@@ -282,7 +282,7 @@ describe('composeDigest (deterministic)', () => {
       'Digest Tue 27 Oct 08:00 (Europe/Berlin)',
       '',
       'Waiting for you:',
-      `- task-5 Settings page: merge approval, send in the manager chat: /approve task-5 ${'a'.repeat(40)} merge`,
+      `- task-5 Settings page: merge approval, on the host: minions work approve task-5 --head ${'a'.repeat(40)}`,
       '- task-6 Storage: needs your answer (Q1)',
       '',
       'Blockers:',
@@ -356,7 +356,7 @@ describe('composeDigest (deterministic)', () => {
     expect(d.text).toContain(`\n\n${d.omitted} more item(s): send /status\n`);
     expect(d.keys.length + d.left.length).toBe(1 + 4 + 40);
     // The actionable lines and the questions are kept ahead of the features.
-    expect(d.text).toContain('/approve task-5');
+    expect(d.text).toContain('minions work approve task-5');
     expect(d.text).toContain('- task-7 Flaky CI (blocked)');
     expect(d.keys).toEqual(expect.arrayContaining(['blocker:task-7:2', 'question:task-6:1', 'question:task-9:1']));
   });
@@ -368,7 +368,7 @@ describe('composeDigest (deterministic)', () => {
     const d = composeDigest(input({ items: features, tasks: [...input().tasks!, ...blocked], approvals: [approval] }));
     expect(d.text.length).toBeLessThanOrEqual(MAX_TEXT_LENGTH);
     // The approval comes first and is always there; the blockers fill the room before any feature.
-    expect(d.text).toContain(`/approve task-5 ${'c'.repeat(40)} merge`);
+    expect(d.text).toContain(`minions work approve task-5 --head ${'c'.repeat(40)}`);
     expect(d.text.indexOf('Waiting for you:')).toBeLessThan(d.text.indexOf('Blockers:'));
     expect(d.text).not.toContain('Feature 0 ');
     // Every line left out (state lines too) is counted in the closing line.
@@ -382,7 +382,7 @@ describe('composeDigest (deterministic)', () => {
     const qs = Array.from({ length: 60 }, (_, n) => item({ key: `question:q${n}:1`, kind: 'question', createdAt: `2026-10-26T12:${String(n).padStart(2, '0')}:00.000Z`, text: `Question ${n} ${'z'.repeat(100)}?\n1. Yes\n2. No` }));
     const q = composeDigest(input({ items: [...features, ...qs], tasks: [...input().tasks!, ...blocked], approvals: [approval] }));
     expect(q.text.length).toBeLessThanOrEqual(MAX_TEXT_LENGTH);
-    expect(q.text).toContain('/approve task-5');
+    expect(q.text).toContain('minions work approve task-5');
     for (const len of [3990, 3999, 4000, 4001]) {
       // Lengths around the cap: a single long line per feature, many features.
       const pad = Array.from({ length: 30 }, (_, n) => item({ key: `feature:p${n}:x`, kind: 'feature', text: `P${n} ${'w'.repeat(len % 397)}` }));
@@ -394,7 +394,7 @@ describe('composeDigest (deterministic)', () => {
     const approvals = Array.from({ length: 80 }, (_, n) => ({ taskId: `task-a${n}`, head: 'd'.repeat(40), scope: 'publish' as const }));
     const d = composeDigest(input({ items: [], approvals, merged: [], spend: null }));
     expect(d.text.length).toBeLessThanOrEqual(MAX_TEXT_LENGTH);
-    const shown = approvals.filter((a) => d.text.includes(`/approve ${a.taskId} `)).length;
+    const shown = approvals.filter((a) => d.text.includes(`minions work approve ${a.taskId} `)).length;
     expect(shown).toBeGreaterThan(10);
     expect(d.text).toContain(`${d.omitted} more item(s): send /status`);
     expect(d.omitted).toBeGreaterThanOrEqual(80 - shown);
@@ -420,7 +420,7 @@ describe('prepareDigest: stored under its key; acking the keys marks the time do
     const d = prepareDigest(env.db, env.config, { tasks, runnable: [], spend: null }, t0);
     expect(d.key).toBe('digest:2026-10-27T08:00');
     expect(d.text).toContain('Merged:\n- task-3\n');
-    expect(d.text).toContain(`/approve task-5 ${'b'.repeat(40)} merge`);
+    expect(d.text).toContain(`minions work approve task-5 --head ${'b'.repeat(40)}`);
     expect(d.text).not.toMatch(/Auto-promoted|task-11/);
     expect(d.text).toContain('Q1 (task-6) Which?');
     expect(d.keys).toEqual(['digest:2026-10-27T08:00', 'question:task-6:1']);

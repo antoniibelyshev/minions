@@ -20,7 +20,7 @@ import { run } from '../core/exec.js';
 import { atomicWrite, ensureDir, readJsonIfExists, writeJson } from '../core/fsutil.js';
 import { prepareSecretsDir, probeSecretsAccess, secretFileMode, secretGid, type SecretsAccess } from './secrets-access.js';
 import { redact } from '../core/output.js';
-import { CLAUDE_HEADLESS_TOKEN_FILE, credentialStoreDir, credentialStoreFile, defaultsPath, managerDir, managerPaths, projectPaths } from '../core/paths.js';
+import { CLAUDE_HEADLESS_TOKEN_FILE, credentialStoreDir, credentialStoreFile, defaultsPath, projectPaths } from '../core/paths.js';
 import { BOTFATHER_URL, checkTelegramTokenFormat } from '../telegram/token.js';
 import { loadRegistry } from './registry.js';
 
@@ -57,7 +57,7 @@ export function codexKeyGuidance(): string[] {
   ];
 }
 
-// ---------------------------------------------------------------- Claude token (host manager assistant)
+// ---------------------------------------------------------------- Claude token
 
 export const ANTHROPIC_API_KEYS_URL = 'https://console.anthropic.com/settings/keys';
 /** `claude setup-token` OAuth tokens (sk-ant-oat01-…) and Anthropic API keys (sk-ant-api03-…). */
@@ -80,7 +80,7 @@ export function checkClaudeTokenFormat(raw: string): { token: string; kind: Clau
   return { token, kind: m[1] === 'oat' ? 'oauth-token' : 'api-key' };
 }
 
-/** The environment variable a stored Claude credential reaches the assistant's claude process through (never argv). */
+/** The environment variable a stored Claude credential reaches a headless claude process through (never argv). */
 export const claudeTokenEnvName = (kind: ClaudeTokenKind): 'CLAUDE_CODE_OAUTH_TOKEN' | 'ANTHROPIC_API_KEY' =>
   (kind === 'oauth-token' ? 'CLAUDE_CODE_OAUTH_TOKEN' : 'ANTHROPIC_API_KEY');
 
@@ -126,7 +126,7 @@ export async function verifyTelegramToken(token: string, opts: { fetch?: Fetch; 
 
 // ---------------------------------------------------------------- credential kinds
 
-/** What a secret store needs to know about a secret type (per-project kinds and the host-wide manager token). */
+/** What a secret store needs to know about a secret type. */
 export interface StoreKind {
   /** Human label used in messages. */
   readonly label: string;
@@ -138,11 +138,6 @@ export interface StoreKind {
   check(raw: string): string;
   /** Hint for re-provisioning. */
   readonly command: string;
-  /**
-   * Host-wide kinds only: the fixed store account (Keychain/Secret Service account, file-store directory)
-   * used instead of a project id. Per-project kinds leave it unset and are keyed by the project UUID.
-   */
-  readonly account?: string;
 }
 
 /** One per-project secret type. Every kind shares the stores, the project reference file and the secrets mount. */
@@ -173,33 +168,6 @@ export const CLAUDE_HEADLESS_CREDENTIAL: CredentialKind = {
 export const CREDENTIAL_KINDS = [TELEGRAM_CREDENTIAL, CODEX_CREDENTIAL, CLAUDE_HEADLESS_CREDENTIAL] as const;
 /** Materialized copies of removed kinds (the GitHub token): deleted from the secrets directory, never written. */
 const LEGACY_SECRET_FILES = ['github-token'];
-
-/** Store account of the host-wide manager bot token (never a project UUID, so it cannot collide with one). */
-export const MANAGER_ACCOUNT = 'manager';
-/**
- * The host manager's own Telegram bot token (docs/design/host-manager.md, "Token isolation for the manager bot").
- * Host-wide, not per project: Keychain service `minions.manager` / Secret Service `service=minions.manager
- * account=manager` / `<MINIONS_HOME>/credentials/manager/manager-bot-token` (0600). Deliberately not a
- * CredentialKind and not in CREDENTIAL_KINDS: it is never materialized into a project's secrets directory, never
- * referenced from a project's credentials.json, and only the host manager process reads it.
- */
-export const MANAGER_CREDENTIAL: StoreKind & { readonly name: 'manager-bot-token'; readonly account: typeof MANAGER_ACCOUNT } = {
-  name: 'manager-bot-token', label: 'manager bot token', keychainService: 'minions.manager', keychainLabel: 'minions-manager-bot-token',
-  fileName: 'manager-bot-token', check: (raw) => checkTelegramTokenFormat(raw).token, command: 'minions setup', account: MANAGER_ACCOUNT,
-};
-
-/**
- * The host manager assistant's Claude credential (docs/design/host-manager-assistant.md, "Authentication"): a
- * `claude setup-token` OAuth token or an Anthropic API key. Same rules as MANAGER_CREDENTIAL: host-wide, fixed account
- * `manager`, Keychain service `minions.manager-claude` / Secret Service `service=minions.manager-claude account=manager`
- * / `<MINIONS_HOME>/credentials/manager/manager-claude-token` (0600). Not a CredentialKind and not in CREDENTIAL_KINDS:
- * never materialized into a project's secrets directory, never in a project's credentials.json; only the manager
- * process reads it, per call, and passes it to its claude child in the environment.
- */
-export const MANAGER_CLAUDE_CREDENTIAL: StoreKind & { readonly name: 'manager-claude-token'; readonly account: typeof MANAGER_ACCOUNT } = {
-  name: 'manager-claude-token', label: 'manager Claude token', keychainService: 'minions.manager-claude', keychainLabel: 'minions-manager-claude-token',
-  fileName: 'manager-claude-token', check: (raw) => checkClaudeTokenFormat(raw).token, command: 'minions setup', account: MANAGER_ACCOUNT,
-};
 
 // ---------------------------------------------------------------- storage backends
 
@@ -241,7 +209,7 @@ export class KeychainStore implements SecretStore {
   }
 
   async set(projectId: string, token: string): Promise<void> {
-    assertAccount(this.kind, projectId);
+    assertAccount(projectId);
     this.kind.check(token); // also guarantees the value cannot break out of the `security -i` line
     const line = `add-generic-password -U -s ${this.kind.keychainService} -a ${projectId} -l ${this.kind.keychainLabel} -w ${token}\n`;
     await this.runner('security', ['-i'], { input: line, allowFailure: true, timeoutMs: 30_000 });
@@ -279,7 +247,7 @@ export class SecretServiceStore implements SecretStore {
   }
 
   async set(projectId: string, token: string): Promise<void> {
-    assertAccount(this.kind, projectId);
+    assertAccount(projectId);
     this.kind.check(token);
     await this.runner('secret-tool', ['store', `--label=${this.kind.keychainLabel}`, ...this.attrs(projectId)], { input: token, allowFailure: true, timeoutMs: 30_000 });
     // Verify by reading back, like the Keychain store.
@@ -322,7 +290,7 @@ export class FileStore implements SecretStore {
   }
 
   async set(projectId: string, token: string): Promise<void> {
-    assertAccount(this.kind, projectId);
+    assertAccount(projectId);
     this.kind.check(token);
     const file = this.path(projectId);
     await privateDir(credentialStoreDir());
@@ -338,9 +306,9 @@ async function privateDir(dir: string): Promise<void> {
   await chmod(dir, 0o700);
 }
 
-/** A store account is a project UUID, or exactly the fixed account of a host-wide kind. */
-const assertAccount = (kind: StoreKind, id: string) => {
-  if (kind.account !== undefined ? id !== kind.account : !z.uuid().safeParse(id).success) throw new MinionsError('INTERNAL', 'invalid project id');
+/** A store account is a project UUID. */
+const assertAccount = (id: string) => {
+  if (!z.uuid().safeParse(id).success) throw new MinionsError('INTERNAL', 'invalid project id');
 };
 
 export interface StoreOptions { runner?: Runner; platform?: NodeJS.Platform; env?: NodeJS.ProcessEnv; hostRuntime?: boolean }
@@ -386,11 +354,11 @@ export async function selectStore(opts: StoreOptions & { kind: StoreKind }): Pro
 export const storeFor = (backend: Backend, runner: Runner, kind: StoreKind): SecretStore =>
   (backend === 'keychain' ? new KeychainStore(runner, kind) : backend === 'secret-service' ? new SecretServiceStore(runner, kind) : new FileStore(kind));
 
-/** A moved token: a project's (projectId set) or a host-wide manager token (projectId null). */
-export type MovedToken = { projectId: string; kind: CredentialKind['name'] } | { projectId: null; kind: typeof MANAGER_CREDENTIAL.name | typeof MANAGER_CLAUDE_CREDENTIAL.name };
+/** A moved token: a project's. */
+export type MovedToken = { projectId: string; kind: CredentialKind['name'] };
 
 /**
- * Host runtime: moves every registered project's tokens, and the host-wide manager bot token, from the macOS Keychain
+ * Host runtime: moves every registered project's tokens from the macOS Keychain
  * or the Secret Service keyring to the 0600 file store (read from Keychain, written to the file store, reference
  * updated, Keychain item deleted). A token that cannot be read (locked keychain, denied prompt) stays where it is and
  * yields a warning.
@@ -418,48 +386,6 @@ export async function moveKeychainTokensToFileStore(runner: Runner = run): Promi
       } catch (e) {
         warnings.push(`The ${kind.label} of project ${projectId} is still in ${backendLabel(ref.backend)} (${redact((e as Error).message).split('\n')[0]}); agents of a host-runtime project could read it with ${ref.backend === 'keychain' ? '/usr/bin/security' : 'secret-tool'}. Re-provision it with \`${kind.command}\`.`);
       }
-    }
-  }
-  // The manager bot token: its reference is <MINIONS_HOME>/manager/credential.json, not a project's credentials.json.
-  const mgr = await loadManagerCredentialRef().catch(() => null);
-  if (mgr && mgr.backend !== 'file') {
-    try {
-      const keychain = storeFor(mgr.backend, runner, MANAGER_CREDENTIAL);
-      const token = await keychain.get(MANAGER_ACCOUNT);
-      if (token) {
-        const file = new FileStore(MANAGER_CREDENTIAL);
-        await file.set(MANAGER_ACCOUNT, token);
-        const cur = await loadManagerCredentialRef();
-        if (cur) {
-          const ref: ManagerCredentialRef = { ...cur, backend: 'file', ref: file.ref(MANAGER_ACCOUNT), updatedAt: new Date().toISOString() };
-          await writeJson(managerPaths().credentialJson, ref, { mode: 0o600 });
-        }
-        await keychain.delete(MANAGER_ACCOUNT);
-        moved.push({ projectId: null, kind: MANAGER_CREDENTIAL.name });
-      }
-    } catch (e) {
-      warnings.push(`The host manager bot token is still in ${backendLabel(mgr.backend)} (${redact((e as Error).message).split('\n')[0]}); agents of a host-runtime project could read it with ${mgr.backend === 'keychain' ? '/usr/bin/security' : 'secret-tool'}. Store it again with \`${MANAGER_CREDENTIAL.command}\`.`);
-    }
-  }
-  // The manager's Claude token (assistant): its reference is <MINIONS_HOME>/manager/claude-credential.json.
-  const cl = await loadManagerClaudeCredentialRef().catch(() => null);
-  if (cl && cl.backend !== 'file') {
-    try {
-      const keychain = storeFor(cl.backend, runner, MANAGER_CLAUDE_CREDENTIAL);
-      const token = await keychain.get(MANAGER_ACCOUNT);
-      if (token) {
-        const file = new FileStore(MANAGER_CLAUDE_CREDENTIAL);
-        await file.set(MANAGER_ACCOUNT, token);
-        const cur = await loadManagerClaudeCredentialRef();
-        if (cur) {
-          const ref: ManagerClaudeCredentialRef = { ...cur, backend: 'file', ref: file.ref(MANAGER_ACCOUNT), updatedAt: new Date().toISOString() };
-          await writeJson(managerPaths().claudeCredentialJson, ref, { mode: 0o600 });
-        }
-        await keychain.delete(MANAGER_ACCOUNT);
-        moved.push({ projectId: null, kind: MANAGER_CLAUDE_CREDENTIAL.name });
-      }
-    } catch (e) {
-      warnings.push(`The host manager Claude token is still in ${backendLabel(cl.backend)} (${redact((e as Error).message).split('\n')[0]}); agents of a host-runtime project could read it with ${cl.backend === 'keychain' ? '/usr/bin/security' : 'secret-tool'}. Store it again with \`${MANAGER_CLAUDE_CREDENTIAL.command}\`.`);
     }
   }
   return { moved, warnings };
@@ -590,7 +516,6 @@ const oneBotWarning = (ids: string[]) =>
 export async function provisionTelegramToken(opts: TelegramProvisionOptions): Promise<TelegramProvisionResult> {
   const runner = opts.runner ?? run;
   const { token, botId } = checkTelegramTokenFormat(opts.token);
-  await assertNotManagerBot(botId);
   assertOutsideRepo(opts.projectId, opts.repoPath);
   const warnings: string[] = [];
   let verification: Verification | null = null;
@@ -611,205 +536,6 @@ export async function provisionTelegramToken(opts: TelegramProvisionOptions): Pr
 
 export const readTelegramToken = (projectId: string, runner: Runner = run) => readToken(projectId, TELEGRAM_CREDENTIAL, runner);
 export const removeTelegramToken = (projectId: string, runner: Runner = run) => removeToken(projectId, TELEGRAM_CREDENTIAL, runner);
-
-// ---------------------------------------------------------------- manager bot token (host-wide)
-//
-// One token per host (MANAGER_CREDENTIAL, store account "manager"). Its non-secret reference lives in
-// <MINIONS_HOME>/manager/credential.json (0600: backend, locator, bot id), never in a project's credentials.json,
-// so materializeSecrets / clearSecrets never see it. moveKeychainTokensToFileStore reads that file separately to move
-// it to the file store under the host runtime. Entry, the bot-id guard and pairing are in src/host/manager-bot.ts and
-// src/host/bot-guard.ts.
-
-export const ManagerCredentialRefSchema = z.object({
-  version: z.literal(1),
-  backend: z.enum(BACKENDS),
-  ref: z.string().min(1),
-  /** Non-secret numeric bot id (token prefix): the bot-id guard compares it with every coordinator bot. */
-  botId: z.string().regex(/^\d{6,12}$/),
-  updatedAt: z.string(),
-}).strict();
-export type ManagerCredentialRef = z.infer<typeof ManagerCredentialRefSchema>;
-
-/** The manager token's reference, or null when none is stored. An unreadable file is an error (INVALID_CONFIG). */
-export async function loadManagerCredentialRef(): Promise<ManagerCredentialRef | null> {
-  return (await readJsonIfExists(managerPaths().credentialJson, ManagerCredentialRefSchema)) ?? null;
-}
-
-/**
- * Stores a manager token (format-checked here again) in the selected backend, deletes a copy left in a previous
- * backend, and records the reference. The bot-id guard is the caller's job (provisionManagerToken).
- */
-export async function storeManagerToken(raw: string, opts: StoreOptions & { store?: SecretStore } = {}): Promise<ManagerCredentialRef> {
-  const runner = opts.runner ?? run;
-  const { token, botId } = checkTelegramTokenFormat(raw);
-  const store = opts.store ?? await selectStore({ ...opts, runner, kind: MANAGER_CREDENTIAL });
-  const prev = await loadManagerCredentialRef().catch(() => null);
-  await store.set(MANAGER_ACCOUNT, token);
-  if (prev && prev.backend !== store.backend) await storeFor(prev.backend, runner, MANAGER_CREDENTIAL).delete(MANAGER_ACCOUNT);
-  const ref: ManagerCredentialRef = { version: 1, backend: store.backend, ref: store.ref(MANAGER_ACCOUNT), botId, updatedAt: new Date().toISOString() };
-  await privateDir(managerDir());
-  await writeJson(managerPaths().credentialJson, ref, { mode: 0o600 });
-  return ref;
-}
-
-/**
- * Reads the manager token (host only: the manager process and terminal pairing). Null when none is stored.
- * A stored value whose bot id differs from the reference is refused, so the bot-id guard cannot be bypassed.
- */
-export async function readManagerToken(runner: Runner = run): Promise<string | null> {
-  const ref = await loadManagerCredentialRef();
-  if (!ref) return null;
-  const token = await storeFor(ref.backend, runner, MANAGER_CREDENTIAL).get(MANAGER_ACCOUNT);
-  if (!token) return null;
-  let botId: string | null = null;
-  try { botId = checkTelegramTokenFormat(token).botId; } catch { /* reported below */ }
-  if (botId !== ref.botId) {
-    throw new MinionsError('INVALID_CONFIG', `The stored manager bot token does not match the recorded bot ${ref.botId}.`, 'Store the manager bot token again with `minions setup`.');
-  }
-  return token;
-}
-
-/** Deletes the manager token and its reference (the pairing is the caller's: manager-bot.ts). */
-export async function removeManagerToken(runner: Runner = run): Promise<{ removed: boolean; backend: Backend | null }> {
-  const ref = await loadManagerCredentialRef().catch(() => null);
-  if (ref) await storeFor(ref.backend, runner, MANAGER_CREDENTIAL).delete(MANAGER_ACCOUNT);
-  await rm(managerPaths().credentialJson, { force: true });
-  return { removed: !!ref, backend: ref?.backend ?? null };
-}
-
-/**
- * Reverse direction of the bot-id guard (exported through src/host/bot-guard.ts): a coordinator token must not be the
- * manager's bot. Enforced inside provisionTelegramToken, so every entry (`auth telegram`, `setup`, `init`) is covered.
- * An unreadable manager reference refuses too (fail closed): the comparison cannot be made.
- */
-export async function assertNotManagerBot(botId: string): Promise<void> {
-  let mgr: ManagerCredentialRef | null;
-  try { mgr = await loadManagerCredentialRef(); } catch (e) {
-    throw new MinionsError('INVALID_CONFIG', `Cannot compare with the host manager's bot: ${redact((e as Error).message).split('\n')[0]}; the token was not stored.`,
-      `Fix or delete ${managerPaths().credentialJson} (then store the manager bot token again with \`minions setup\`).`);
-  }
-  if (mgr?.botId !== botId) return;
-  throw new MinionsError('CONFLICT', `Telegram bot ${botId} is the host manager's bot; a coordinator needs a different bot, so the token was not stored.`,
-    `The coordinator's token is mounted into the container and the manager's never is: create a separate bot for this project (${BOTFATHER_URL}, /newbot) and store that one.`,
-    { botId });
-}
-
-export interface ManagerCredentialStatus extends CredentialStatus { botId?: string }
-
-/** Manager token: presence, format, bot id and file mode. No network call; never includes the token. */
-export async function managerCredentialStatus(opts: { runner?: Runner } = {}): Promise<ManagerCredentialStatus> {
-  const runner = opts.runner ?? run;
-  let ref: ManagerCredentialRef | null;
-  try { ref = await loadManagerCredentialRef(); } catch (e) {
-    return { state: 'invalid', detail: `manager credential reference is invalid: ${redact((e as Error).message).split('\n')[0]}` };
-  }
-  if (!ref) return { state: 'missing', detail: 'no manager bot token stored' };
-  let token: string | null;
-  try { token = await storeFor(ref.backend, runner, MANAGER_CREDENTIAL).get(MANAGER_ACCOUNT); } catch (e) {
-    return { state: 'invalid', backend: ref.backend, botId: ref.botId, detail: redact((e as Error).message) };
-  }
-  if (!token) return { state: 'missing', backend: ref.backend, botId: ref.botId, detail: `reference ${ref.ref} exists but the token is gone` };
-  const problems: string[] = [];
-  try {
-    if (checkTelegramTokenFormat(token).botId !== ref.botId) problems.push('stored token does not match the recorded bot id');
-  } catch { problems.push('stored value is not a Telegram bot token'); }
-  let modeProblem = false;
-  if (ref.backend === 'file') {
-    const p = await fileModeProblem(MANAGER_CREDENTIAL, MANAGER_ACCOUNT);
-    if (p) { problems.push(p); modeProblem = true; }
-  }
-  const where = modeProblem ? "host file" : shortWhere(ref.backend);
-  return { state: problems.length ? 'invalid' : 'ok', backend: ref.backend, botId: ref.botId, detail: [`bot ${ref.botId}; stored in ${where}`, ...problems].join('; ') };
-}
-
-// ---------------------------------------------------------------- manager Claude token (host-wide)
-//
-// One token per host (MANAGER_CLAUDE_CREDENTIAL, store account "manager") for the manager's natural-language
-// assistant (docs/design/host-manager-assistant.md). Its non-secret reference is
-// <MINIONS_HOME>/manager/claude-credential.json (0600: backend, locator, token kind), never a project's
-// credentials.json, so materializeSecrets / clearSecrets never see it. Entry: the manager step of `minions setup`
-// (hidden prompt or --manager-claude-token-stdin). Use: src/host/manager-assistant.ts, per call, in the child env.
-
-export const ManagerClaudeCredentialRefSchema = z.object({
-  version: z.literal(1),
-  backend: z.enum(BACKENDS),
-  ref: z.string().min(1),
-  /** Non-secret: which environment variable the token reaches claude through. */
-  kind: z.enum(['oauth-token', 'api-key']),
-  updatedAt: z.string(),
-}).strict();
-export type ManagerClaudeCredentialRef = z.infer<typeof ManagerClaudeCredentialRefSchema>;
-
-/** The manager Claude token's reference, or null when none is stored. An unreadable file is an error (INVALID_CONFIG). */
-export async function loadManagerClaudeCredentialRef(): Promise<ManagerClaudeCredentialRef | null> {
-  return (await readJsonIfExists(managerPaths().claudeCredentialJson, ManagerClaudeCredentialRefSchema)) ?? null;
-}
-
-/** Stores the manager Claude token (format-checked), deletes a copy left in a previous backend, records the reference. */
-export async function storeManagerClaudeToken(raw: string, opts: StoreOptions & { store?: SecretStore } = {}): Promise<ManagerClaudeCredentialRef> {
-  const runner = opts.runner ?? run;
-  const { token, kind } = checkClaudeTokenFormat(raw);
-  const store = opts.store ?? await selectStore({ ...opts, runner, kind: MANAGER_CLAUDE_CREDENTIAL });
-  const prev = await loadManagerClaudeCredentialRef().catch(() => null);
-  await store.set(MANAGER_ACCOUNT, token);
-  if (prev && prev.backend !== store.backend) await storeFor(prev.backend, runner, MANAGER_CLAUDE_CREDENTIAL).delete(MANAGER_ACCOUNT);
-  const ref: ManagerClaudeCredentialRef = { version: 1, backend: store.backend, ref: store.ref(MANAGER_ACCOUNT), kind, updatedAt: new Date().toISOString() };
-  await privateDir(managerDir());
-  await writeJson(managerPaths().claudeCredentialJson, ref, { mode: 0o600 });
-  return ref;
-}
-
-/**
- * Reads the manager Claude token (the manager process only, once per call). Null when none is stored. A stored value
- * whose kind differs from the reference is refused (it would reach claude through the wrong variable).
- */
-export async function readManagerClaudeToken(runner: Runner = run): Promise<{ token: string; kind: ClaudeTokenKind } | null> {
-  const ref = await loadManagerClaudeCredentialRef();
-  if (!ref) return null;
-  const raw = await storeFor(ref.backend, runner, MANAGER_CLAUDE_CREDENTIAL).get(MANAGER_ACCOUNT);
-  if (!raw) return null;
-  let parsed: { token: string; kind: ClaudeTokenKind } | null = null;
-  try { parsed = checkClaudeTokenFormat(raw); } catch { /* reported below */ }
-  if (!parsed || parsed.kind !== ref.kind) {
-    throw new MinionsError('INVALID_CONFIG', 'The stored manager Claude token does not match its recorded kind.', 'Store the manager Claude token again with `minions setup` (host manager step).');
-  }
-  return parsed;
-}
-
-/** Deletes the manager Claude token and its reference. */
-export async function removeManagerClaudeToken(runner: Runner = run): Promise<{ removed: boolean; backend: Backend | null }> {
-  const ref = await loadManagerClaudeCredentialRef().catch(() => null);
-  if (ref) await storeFor(ref.backend, runner, MANAGER_CLAUDE_CREDENTIAL).delete(MANAGER_ACCOUNT);
-  await rm(managerPaths().claudeCredentialJson, { force: true });
-  return { removed: !!ref, backend: ref?.backend ?? null };
-}
-
-export interface ManagerClaudeCredentialStatus extends CredentialStatus { kind?: ClaudeTokenKind }
-
-/** Manager Claude token: presence, format, kind and file mode. No network call; never includes the token. */
-export async function managerClaudeCredentialStatus(opts: { runner?: Runner } = {}): Promise<ManagerClaudeCredentialStatus> {
-  const runner = opts.runner ?? run;
-  let ref: ManagerClaudeCredentialRef | null;
-  try { ref = await loadManagerClaudeCredentialRef(); } catch (e) {
-    return { state: 'invalid', detail: `manager Claude credential reference is invalid: ${redact((e as Error).message).split('\n')[0]}` };
-  }
-  if (!ref) return { state: 'missing', detail: 'no manager Claude token stored' };
-  let token: string | null;
-  try { token = await storeFor(ref.backend, runner, MANAGER_CLAUDE_CREDENTIAL).get(MANAGER_ACCOUNT); } catch (e) {
-    return { state: 'invalid', backend: ref.backend, kind: ref.kind, detail: redact((e as Error).message) };
-  }
-  if (!token) return { state: 'missing', backend: ref.backend, kind: ref.kind, detail: `reference ${ref.ref} exists but the token is gone` };
-  const problems: string[] = [];
-  try {
-    if (checkClaudeTokenFormat(token).kind !== ref.kind) problems.push('stored token does not match the recorded kind');
-  } catch { problems.push('stored value is not a Claude token'); }
-  if (ref.backend === 'file') {
-    const p = await fileModeProblem(MANAGER_CLAUDE_CREDENTIAL, MANAGER_ACCOUNT);
-    if (p) problems.push(p);
-  }
-  const what = ref.kind === 'oauth-token' ? 'OAuth token (claude setup-token)' : 'Anthropic API key';
-  return { state: problems.length ? 'invalid' : 'ok', backend: ref.backend, kind: ref.kind, detail: [`${what}; stored in ${shortWhere(ref.backend)}`, ...problems].join('; ') };
-}
 
 // ---------------------------------------------------------------- Codex (OpenAI API key) provisioning
 

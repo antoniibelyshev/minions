@@ -9,7 +9,7 @@ import { validateConfig } from '../config/resolve.js';
 import type { MinionsConfig } from '../config/schema.js';
 import { action, globalOpts, requireMode, runtimeMode } from '../core/cli-helpers.js';
 import { displayText, stripControlChars, truncateCodePoints } from '../core/control-chars.js';
-import { closeSync, existsSync, mkdirSync, openSync, writeSync } from 'node:fs';
+import { closeSync, existsSync, mkdirSync, openSync } from 'node:fs';
 import { EXIT_CODES, MinionsError, type ErrorCode } from '../core/errors.js';
 import { readJson } from '../core/fsutil.js';
 import { emit, redact, reportError } from '../core/output.js';
@@ -17,7 +17,6 @@ import { approveOnHost } from '../host/approvals.js';
 import { delegateToRuntime } from '../host/delegate.js';
 import { applyDoctorExit, formatDoctor, runDoctor } from '../host/doctor.js';
 import { formatRestartRequired, hostStatus, parseErrorEnvelope } from '../host/restart-required.js';
-import { formatManagerOverview, managerOverview, managerOverviewJson } from '../host/manager-status.js';
 import { listChangeRequests } from './change-requests.js';
 import { readTelegramAccess } from '../telegram/access.js';
 import { formatTelegramProbe } from '../telegram/probe.js';
@@ -1422,21 +1421,15 @@ export function register(program: Command): void {
       if (runtimeMode() === 'host') {
         // Docker runtime: the container's status plus the host-side restart-required check (`minions upgrade`).
         const h = await hostStatus({ cwd: process.cwd(), args: cmd.args });
-        // The host manager (service, process, bot, pending requests): host-wide, read-only, never fails status.
-        const mgr = await managerOverview().catch(() => null);
-        if (h.kind === 'delegate') {
-          // The host runtime answers itself; the manager block goes first (human mode only, so --json stays one envelope).
-          if (mgr && !globalOpts(cmd).json) writeSync(1, `${formatManagerOverview(mgr).join('\n')}\n\n`);
-          return delegate(cmd);
-        }
+        if (h.kind === 'delegate') return delegate(cmd); // the host runtime answers itself
         if (h.kind === 'raw') {
           relayRawStatus(h.result, { json: globalOpts(cmd).json });
           return;
         }
-        emit({ ...h.status, restartRequired: h.restartRequired, ...(mgr ? { manager: managerOverviewJson(mgr) } : {}) }, { json: globalOpts(cmd).json, human: () => {
+        emit({ ...h.status, restartRequired: h.restartRequired }, { json: globalOpts(cmd).json, human: () => {
           let base: string;
           try { base = humanStatus(h.status as unknown as StatusReport); } catch { base = JSON.stringify(h.status, null, 2); }
-          return [base, ...formatRestartRequired(h.restartRequired), ...(mgr ? ['', ...formatManagerOverview(mgr)] : [])].join('\n');
+          return [base, ...formatRestartRequired(h.restartRequired)].join('\n');
         } });
         return;
       }

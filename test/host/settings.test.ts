@@ -1,7 +1,6 @@
 // `minions settings`: the settings model (values, sources, restart/loosening flags), `--list --json`,
 // `set <key> <value>` (layer, validation, loosening confirmation, regeneration, graceful restart), runtime
-// pause controls, and the interactive menu with fake terminal IO (arrow keys and the numbered fallback).
-// Temp MINIONS_HOME, file credential store, fake runtime; no Docker.
+// pause controls. Temp MINIONS_HOME, file credential store, fake runtime; no Docker.
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -25,9 +24,6 @@ const { loadProjectJson, loadEffectiveConfig, projectConfigPath } = await import
 const C = await import('../../src/host/credentials.js');
 const S = await import('../../src/host/settings.js');
 const SC = await import('../../src/host/settings-cli.js');
-const M = await import('../../src/host/settings-menu.js');
-type MenuKey = import('../../src/host/settings-menu.js').MenuKey;
-type MenuIO = import('../../src/host/settings-menu.js').MenuIO;
 const { initFromTemplate, withHome } = await import('./fixtures.js');
 
 const TOKEN = '123456789:AAHfakefakefakefakefakefakefake_-0123';
@@ -235,100 +231,6 @@ describe('settings set', () => {
   });
 });
 
-/** Fake terminal: scripted keys and lines; collects everything written. */
-function fakeIO(tty: boolean, keys: MenuKey[], lines: string[]) {
-  const out: string[] = [];
-  const prompts: string[] = [];
-  const io: MenuIO = {
-    tty,
-    write: (t) => { out.push(t); },
-    key: async () => { const k = keys.shift(); if (!k) throw new Error('no more keys'); return k; },
-    line: async (p) => { prompts.push(p); const l = lines.shift(); if (l === undefined) throw new Error(`no more input for: ${p}`); return l; },
-  };
-  return { io, out, prompts, text: () => out.join('') };
-}
-
-const plain = (s: string) => s.replace(/\x1b\[[0-9;]*[A-Za-z]/g, '');
-const indexOf = (key: string) => S.SETTING_GROUPS.flatMap((g) => S.SETTINGS.filter((s) => s.group === g)).findIndex((s) => s.key === key);
-
-describe('interactive menu', () => {
-  it('TTY: grouped rows with values and sources; arrows move, Enter edits with validation, restart offered on exit', async () => {
-    const { project, local } = await install('private');
-    const f = fakeRuntime();
-    const down = indexOf('communication.progress');
-    // Navigate down to Reporting > Progress reports, Enter, pick "quiet" (milestones -> tasks -> quiet), quit, confirm restart.
-    const keys: MenuKey[] = [...Array(down).fill('down'), 'enter', 'down', 'down', 'enter', 'up', 'down', 'quit'];
-    const t = fakeIO(true, keys, ['y']);
-    const changed = await M.runSettingsMenu(project, { io: t.io, runtime: f.runtime, runAuth: async () => {} });
-    expect(changed).toEqual(['communication.progress']);
-    expect(readJson(local)).toEqual({ communication: { progress: 'quiet' } });
-    const text = plain(t.text());
-    for (const g of ['Delivery', 'Verification', 'Reporting', 'Models', 'Concurrency', 'Integrations', 'Pause']) expect(text).toMatch(new RegExp(`^${g}$`, 'm'));
-    expect(text).toMatch(/> Progress reports\s+milestones\s+project config/);
-    expect(text).toMatch(/Progress reports\s+quiet\s+local override/);
-    expect(text).toContain('communication.progress: what the coordinator reports unprompted');
-    expect(text).toContain('coordinator restart: restarted');
-    expect(f.calls).toContainEqual(['minions', 'coordinator', 'restart', '--recover', '--json']);
-  });
-
-  it('TTY: an invalid value is reported and nothing is saved; a loosening edit asks first', async () => {
-    const { project, local } = await install('private');
-    const f = fakeRuntime();
-    const at = indexOf('execution.maxEngineers');
-    const keys: MenuKey[] = [...Array(at).fill('down'), 'enter', 'enter', 'quit'];
-    // 5 > maxActiveTasks: invalid. Then 1 (tightening, no confirmation). No restart needed (live).
-    const t = fakeIO(true, keys, ['5', '1']);
-    await M.runSettingsMenu(project, { io: t.io, runtime: f.runtime, runAuth: async () => {} });
-    expect(plain(t.text())).toMatch(/not saved:[\s\S]*execution\.maxEngineers: must be <=/);
-    expect(readJson(local)).toEqual({ execution: { maxEngineers: 1 } });
-    expect(t.prompts.some((p) => /Restart/.test(p))).toBe(false);
-  });
-
-  it('numbered fallback without a TTY: pick by number, loosening confirmation, quit', async () => {
-    const { project, local } = await install('private');
-    const f = fakeRuntime({ running: false });
-    const n = indexOf('execution.maxActiveTasks') + 1;
-    const t = fakeIO(false, [], [String(n), '3', 'y', 'q']);
-    const changed = await M.runSettingsMenu(project, { io: t.io, runtime: f.runtime, runAuth: async () => {} });
-    expect(changed).toEqual(['execution.maxActiveTasks']);
-    expect(readJson(local)).toEqual({ execution: { maxActiveTasks: 3 } });
-    const text = t.text();
-    expect(text).toMatch(/^Concurrency:$/m);
-    expect(text).toMatch(new RegExp(`^\\s+${n}\\) Max active tasks\\s+2\\s+project config`, 'm'));
-    expect(t.prompts.some((p) => /loosens policy/.test(p))).toBe(true);
-  });
-
-  it('numbered fallback: enum choices by number, declined loosening keeps the value; token items refuse with a --stdin hint', async () => {
-    const { project, local } = await install('private');
-    const f = fakeRuntime({ running: false });
-    const auth: string[] = [];
-    const n = indexOf('verification.reviewerRequired') + 1;
-    const g = indexOf('secrets.codex') + 1;
-    const tg = indexOf('secrets.telegram') + 1;
-    // reviewerRequired: choose 2) false -> loosening -> decline. Then both token items: refused, no auth flow on
-    // the piped stdin (the next line is still read as a menu choice, not as a token). Quit.
-    const t = fakeIO(false, [], [String(n), '2', 'n', String(g), String(tg), 'q']);
-    await M.runSettingsMenu(project, { io: t.io, runtime: f.runtime, runAuth: async (k) => { auth.push(k); } });
-    expect(existsSync(local)).toBe(false);
-    expect(auth).toEqual([]);
-    expect(t.text()).toContain('not saved: Not confirmed');
-    expect(t.text()).toContain('OpenAI API key (Codex): not changed here (no terminal to enter a token without echo)');
-    expect(t.text()).toContain('hint: run `minions auth codex --stdin < token-file` instead');
-    expect(t.text()).toContain('hint: run `minions auth telegram --stdin < token-file` instead');
-    expect(t.prompts.filter((p) => /^Setting to change/.test(p))).toHaveLength(4);
-  });
-
-  it('TTY: a token item runs the auth flow and then shows provisioned / missing', async () => {
-    const { project } = await install('private');
-    const f = fakeRuntime({ running: false });
-    const auth: string[] = [];
-    const t = fakeIO(true, [...Array(indexOf('secrets.codex')).fill('down'), 'enter', 'quit'], []);
-    await M.runSettingsMenu(project, { io: t.io, runtime: f.runtime, runAuth: async (k) => { auth.push(k); } });
-    expect(auth).toEqual(['codex']);
-    expect(plain(t.text())).toContain('OpenAI API key (Codex): missing');
-  });
-});
-
 describe('tester additions (task-23)', () => {
   it('coordinator tool keys (task-48): launch-class, need a restart; a required tool is rejected; dropping the trim is loosening', async () => {
     const { project, local } = await install('private');
@@ -369,93 +271,6 @@ describe('tester additions (task-23)', () => {
     const { runtime } = fakeRuntime({ running: false });
     await expect(SC.applySetting(await ctxOf(project), 'capabilities.base.merge', 'allow', { yes: true }, { runtime, confirm: async () => true }))
       .rejects.toMatchObject({ code: 'POLICY_DENIED' });
-    expect(existsSync(local)).toBe(false);
-  });
-
-  it('the menu (TTY and numbered) never shows a stored token', async () => {
-    const { repo, project } = await install('private');
-    await C.provisionTelegramToken({ projectId: project.projectId, token: TOKEN, repoPath: repo, verify: false });
-    const f = fakeRuntime({ running: false });
-    const g = indexOf('secrets.telegram');
-    const tty = fakeIO(true, [...Array(g).fill('down'), 'enter', 'quit'], []);
-    await M.runSettingsMenu(project, { io: tty.io, runtime: f.runtime, runAuth: async () => {} });
-    const num = fakeIO(false, [], [String(g + 1), 'q']);
-    await M.runSettingsMenu(project, { io: num.io, runtime: f.runtime, runAuth: async () => {} });
-    for (const t of [tty.text(), num.text()]) {
-      expect(plain(t)).toMatch(/Telegram bot token\s+provisioned\s+credential store/);
-      expect(t).not.toContain('AAHfake');
-    }
-  });
-
-  it('menu: the restart offered on exit is graceful; refused while leases are active, never forced', async () => {
-    const { project } = await install('private');
-    const busy = fakeRuntime({ restart: 'refused' });
-    const n = indexOf('communication.progress') + 1;
-    const t = fakeIO(false, [], [String(n), '3', 'q', 'y']);
-    await M.runSettingsMenu(project, { io: t.io, runtime: busy.runtime, runAuth: async () => {} });
-    expect(t.text()).toMatch(/coordinator restart: refused - .*active worker lease/);
-    expect(t.text()).toContain('minions settings restart');
-    expect(busy.calls.filter((c) => c[1] === 'coordinator')).toEqual([['minions', 'coordinator', 'restart', '--recover', '--json']]);
-    expect(busy.calls.flat()).not.toContain('--force');
-    // Declining the restart issues no restart at all.
-    const ok = fakeRuntime();
-    const d = fakeIO(false, [], [String(n), '2', 'q', 'n']);
-    await M.runSettingsMenu(project, { io: d.io, runtime: ok.runtime, runAuth: async () => {} });
-    expect(ok.calls.some((c) => c[1] === 'coordinator')).toBe(false);
-    expect(d.text()).toContain('Restart later with `minions settings restart`');
-  });
-
-  it('terminalMenuIO on a piped (non-TTY) stdin: numbered prompts read every line of one chunk; owner raises concurrency to 3', async () => {
-    const { PassThrough } = await import('node:stream');
-    const { project, local } = await install('private');
-    const f = fakeRuntime({ running: false });
-    const stdin = new PassThrough() as unknown as NodeJS.ReadStream;
-    const out = new PassThrough();
-    let text = '';
-    out.on('data', (d: Buffer) => { text += d.toString(); });
-    const a = indexOf('execution.maxActiveTasks') + 1, e = indexOf('execution.maxEngineers') + 1;
-    (stdin as unknown as NodeJS.WritableStream).end([a, 3, 'y', e, 3, 'y', 'q'].join('\n') + '\n');
-    const io = M.terminalMenuIO(stdin, out);
-    expect(io.tty).toBe(false);
-    const changed = await M.runSettingsMenu(project, { io, runtime: f.runtime, runAuth: async () => {} });
-    expect(changed).toEqual(['execution.maxActiveTasks', 'execution.maxEngineers']);
-    expect(readJson(local)).toEqual({ execution: { maxActiveTasks: 3, maxEngineers: 3 } });
-    expect(runtimeCfg(project.projectId).execution).toMatchObject({ maxActiveTasks: 3, maxEngineers: 3 });
-    expect(text).toMatch(/Setting to change \[1-\d+, q = quit\]/);
-  });
-
-  it('terminalMenuIO on a non-TTY stdin: end of input at the restart prompt is no, not the (Y/n) default', async () => {
-    const { PassThrough } = await import('node:stream');
-    const { project } = await install('private');
-    const f = fakeRuntime({ running: true });
-    const stdin = new PassThrough();
-    const out = new PassThrough();
-    let text = '';
-    out.on('data', (d: Buffer) => { text += d.toString(); });
-    // communication.progress milestones -> tasks (choice 2): needs a restart, loosens nothing; then 'q' and end of input.
-    stdin.end([indexOf('communication.progress') + 1, 2, 'q'].join('\n') + '\n');
-    const changed = await M.runSettingsMenu(project, { io: M.terminalMenuIO(stdin as unknown as NodeJS.ReadStream, out), runtime: f.runtime, runAuth: async () => {} });
-    expect(changed).toEqual(['communication.progress']);
-    expect(text).toContain('Restart later');
-    expect(f.calls.some((c) => c[1] === 'coordinator')).toBe(false);
-  });
-
-  it('TTY: Enter at the restart prompt takes the shown default (restart)', async () => {
-    const { project } = await install('private');
-    const f = fakeRuntime();
-    const down = indexOf('communication.progress');
-    const t = fakeIO(true, [...Array(down).fill('down'), 'enter', 'down', 'enter', 'quit'], ['']);
-    await M.runSettingsMenu(project, { io: t.io, runtime: f.runtime, runAuth: async () => {} });
-    expect(f.calls).toContainEqual(['minions', 'coordinator', 'restart', '--recover', '--json']);
-  });
-
-  it('terminalMenuIO on a non-TTY stdin: end of input quits the menu without changes', async () => {
-    const { PassThrough } = await import('node:stream');
-    const { project, local } = await install('private');
-    const stdin = new PassThrough();
-    stdin.end();
-    const changed = await M.runSettingsMenu(project, { io: M.terminalMenuIO(stdin as unknown as NodeJS.ReadStream, new PassThrough()), runtime: fakeRuntime({ running: false }).runtime, runAuth: async () => {} });
-    expect(changed).toEqual([]);
     expect(existsSync(local)).toBe(false);
   });
 });
@@ -532,14 +347,5 @@ describe('remaining loosening changes (task-50)', () => {
     for (const k of ['models.allowed', 'models.default', 'coordinator.bundledSkills', 'delivery.merge', 'execution.maxRepairCyclesBeforeReplan']) {
       expect(views.find((v) => v.key === k)).toMatchObject({ canLoosen: true });
     }
-  });
-
-  it('numbered menu: raising repair cycles asks for confirmation; declining writes nothing', async () => {
-    const { project, local } = await install('private');
-    const f = fakeRuntime({ running: false });
-    const t = fakeIO(false, [], [String(indexOf('execution.maxRepairCyclesBeforeReplan') + 1), '6', 'n', 'q']);
-    await M.runSettingsMenu(project, { io: t.io, runtime: f.runtime, runAuth: async () => {} });
-    expect(t.prompts.some((p) => /loosens policy: more failed fix cycles/.test(p))).toBe(true);
-    expect(existsSync(local)).toBe(false);
   });
 });

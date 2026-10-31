@@ -218,24 +218,8 @@ describe('CLI wiring', () => {
   it('registers setup with stdin-only token flags (no option takes a token value)', () => {
     const cmd = setupCmd();
     const longs = cmd.options.map((o) => o.long).sort();
-    expect(longs).toEqual(['--attach', '--config', '--dry-run', '--manager-claude-token-stdin', '--manager-token-stdin', '--new-identity', '--no-assistant', '--no-attach-coordinator', '--private', '--profile', '--runtime', '--shared', '--telegram-token-stdin', '--yes'].sort());
+    expect(longs).toEqual(['--attach', '--config', '--dry-run', '--new-identity', '--no-attach-coordinator', '--private', '--profile', '--runtime', '--shared', '--telegram-token-stdin', '--yes'].sort());
     for (const o of cmd.options.filter((x) => /token/.test(x.long ?? ''))) expect(o.required || o.optional).toBe(false);
-  });
-
-  it('one setup command: `setup assist` is a subcommand, and flags after it belong to the subcommand', async () => {
-    const program = new Command();
-    register(program);
-    const setup = program.commands.find((c) => c.name() === 'setup')!;
-    expect(setup.commands.map((c) => c.name()).sort()).toEqual(['assist']);
-    expect(program.commands.filter((c) => c.name() === 'setup')).toHaveLength(1);
-    const seen: { sub: string; opts: Record<string, unknown> }[] = [];
-    // The parent defines the same --dry-run flag and parses it first; the subcommand reads it with optsWithGlobals.
-    const p2 = new Command();
-    register(p2);
-    const s2 = p2.commands.find((c) => c.name() === 'setup')!;
-    for (const sub of s2.commands) sub.action((_o: unknown, c: Command) => { seen.push({ sub: sub.name(), opts: c.optsWithGlobals() }); });
-    await p2.parseAsync(['setup', 'assist', '--dry-run'], { from: 'user' });
-    expect(seen).toEqual([{ sub: 'assist', opts: expect.objectContaining({ dryRun: true }) }]);
   });
 
   it('accepts the install.sh passthrough `path --private --yes`', () => {
@@ -353,7 +337,6 @@ describe('minions setup: empty piped tokens', () => {
   it.each([
     [{ telegram: '' }, /--telegram-token-stdin: no Telegram token .*empty/, /first line/],
     [{ telegram: '   ' }, /--telegram-token-stdin/, /first line/],
-    [{ telegram: TG_TOKEN, manager: '' }, /--manager-token-stdin/, /second line/],
   ])('%j fails before anything is written and does not echo the input', async (tokens, message, hint) => {
     const repo = repoNamed();
     const rt = fakeRuntime();

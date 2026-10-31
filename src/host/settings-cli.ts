@@ -205,8 +205,6 @@ export function formatSet(r: SetResult): string {
 
 export interface SettingsCliIO {
   confirm: (q: string) => Promise<boolean | null>;
-  /** Runs the interactive menu (src/host/settings-menu.ts). */
-  menu: (project: ProjectJson, o: { layer: SettingLayer }) => Promise<void>;
 }
 
 async function currentProject(): Promise<ProjectJson> {
@@ -217,19 +215,12 @@ async function currentProject(): Promise<ProjectJson> {
 export function registerSettings(program: Command, io: SettingsCliIO): Command {
   const runtime = defaultSettingsRuntime;
   const cmd = program.command('settings')
-    .description('View and change settings: an interactive menu, or --list / set <key> <value> for scripts')
-    .option('--list', 'list every setting with its value, source and how a change takes effect')
+    .description('List every setting with its value, source and how a change takes effect; change one with set <key> <value>')
+    .option('--list', 'the same list (the default)')
     .option('--shared', 'write to the shared .minions/config.json (shared installs; default: the host-only config.local.json)')
-    .action(action(async (o: { list?: boolean; shared?: boolean }, c: Command) => {
+    .action(action(async (_o: unknown, c: Command) => {
       requireMode('host');
-      const { json } = globalOpts(c);
-      const project = await currentProject();
-      if (o.list || json) {
-        await listAction(project, json, runtime);
-        return;
-      }
-      // Without a TTY the menu degrades to numbered prompts (terminalMenuIO); end of input quits it.
-      await io.menu(project, { layer: o.shared ? 'shared' : 'local' });
+      await listAction(await currentProject(), globalOpts(c).json, runtime);
     }));
   addSetCommand(cmd, io, runtime);
   cmd.command('restart')

@@ -107,19 +107,7 @@ doc="$("$M" doctor --json || true)"  # doctor exits 1 on blocking FAIL; the chec
 expect_eq "$(json 'd.data.checks.find(c=>c.name==="runtime").status' <<<"$doc")" warn "doctor: runtime is a warn-level check"
 for t in tmux claude backlog git; do expect_eq "$(json "d.data.checks.find(c=>c.name===\"host.$t\").status" <<<"$doc")" ok "doctor: host.$t"; done
 expect_eq "$(json 'd.data.checks.some(c=>c.name.startsWith("docker."))' <<<"$doc")" false "doctor does not check Docker"
-
-step "Setup assistant (never launched by init --yes; dry-run plan; needs a terminal)"
-[ ! -e "$WORK/fake/claude.json" ] && ok "init --yes did not launch claude" || fail "init --yes launched claude"
 expect_eq "$(json 'd.data.checks.find(c=>c.name==="setup").status' <<<"$doc")" ok "doctor: setup check (verification commands inferred)"
-sa="$("$M" setup assist --dry-run --json)"
-expect_eq "$(json 'd.data.args[d.data.args.indexOf("--permission-mode")+1]' <<<"$sa")" default "assistant permission mode default"
-expect_eq "$(json 'd.data.args.some(a=>/^(bypassPermissions|acceptEdits|auto|--dangerously-skip-permissions|--allow-dangerously-skip-permissions)$/.test(a))' <<<"$sa")" false "assistant never bypasses permissions"
-expect_eq "$(json 'd.data.args.includes("Bash(git push*)") && d.data.args.includes("Bash(minions runtime set*)")' <<<"$sa")" true "assistant denies push and runtime set"
-expect_eq "$(json 'd.data.cwd' <<<"$sa")" "$A" "assistant runs in the repository root"
-[ ! -e "$P/assistant-plugin" ] && ok "dry-run wrote nothing" || fail "dry-run wrote the assistant plugin"
-set +e; "$M" setup assist --json </dev/null >/dev/null 2>&1; rc=$?; set -e
-expect_eq "$rc" 11 "setup assist without a terminal fails (PRECONDITION)"
-[ ! -e "$WORK/fake/claude.json" ] && ok "claude not launched without a terminal" || fail "claude launched without a terminal"
 
 step "start --no-attach: warning, separate workspace clone, state"
 start_err="$WORK/start.err"
