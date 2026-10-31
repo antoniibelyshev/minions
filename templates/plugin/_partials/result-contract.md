@@ -8,7 +8,7 @@ cd <worktree> && minions work submit <leaseId> --role {{workerRole}} --json <<'R
 RESULT
 ```
 
-Then end with **one short line** (no JSON), e.g. `submitted <leaseId>: complete - <summary>`. The coordinator records the submitted file without reading it. If the coordinator relays validation errors, fix exactly those fields, submit again, and end with one line again. Only if `minions work submit` itself fails, make your final message exactly one fenced `json` block with the WorkerResult instead.
+Then end with **one short line** (no JSON), e.g. `submitted <leaseId>: complete - <summary>`. minions records the submitted file without anyone reading it. If you are sent validation errors (the one correction), fix exactly those fields, submit again, and end with one line again. Only if `minions work submit` itself fails, make your final message exactly one fenced `json` block with the WorkerResult instead.
 
 The WorkerResult:
 

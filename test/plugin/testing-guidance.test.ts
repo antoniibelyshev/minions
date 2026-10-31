@@ -98,7 +98,7 @@ describe('risk-based testing in the generated plugin', () => {
     expect(coord).toContain('## Testing');
     expect(coord).toMatch(/Stage order per task: engineer → tester \(only when QA is required, see Testing\) → reviewer → delivered/);
     expect(coord).toMatch(/by default a task goes engineer → reviewer/);
-    expect(coord).toMatch(/In worker briefs, ask for tests of the important, user-visible or risky behaviour of a change, not exhaustive small cases of low-importance helpers/);
+    expect(coord).toMatch(/In task descriptions, ask for tests of the important, user-visible or risky behaviour of a change, not exhaustive small cases of low-importance helpers/);
     expect(coord).toMatch(/QA label \(`qa`\), its branch touches sensitive paths, or the reviewer sets `"needsQa": true`/);
     expect(coord).toMatch(/QA sweeps test `main` itself, not a ticket branch/);
     expect(coord).toMatch(/at a milestone, before a release, after about five merges since the last sweep, or when the user asks/);
@@ -107,9 +107,8 @@ describe('risk-based testing in the generated plugin', () => {
     expect(base.verification.testerRequired).toBe(false);
 
     const orch = await (await gen())('skills/orchestrate/SKILL.md');
-    expect(orch).toMatch(/labelled `qa-sweep` → tester \(QA sweep against `main`/);
-    expect(orch).toMatch(/engineer `complete` → reviewer \(`reviewing`\), or tester \(`testing`\) when the task needs QA/);
-    expect(orch).toMatch(/Ask for tests of the important, user-visible or risky behaviour, not exhaustive small cases of low-importance helpers/);
+    expect(orch).toMatch(/engineer `complete` → reviewer, or tester when the task needs QA/);
+    expect(coord).toMatch(/the dispatcher runs it as a tester stage/);
   });
 
   it('testerRequired: true and custom QA labels are reflected', async () => {
@@ -117,7 +116,7 @@ describe('risk-based testing in the generated plugin', () => {
     const coord = await (await gen({ ...base, verification: { ...base.verification, testerRequired: true, qaLabels: ['needs-qa'] } }))('coordinator.md');
     expect(coord).toMatch(/Stage order per task: engineer → tester → reviewer → delivered/);
     expect(coord).toMatch(/`verification.testerRequired` is on: every task gets a tester stage/);
-    expect(coord).toMatch(/In worker briefs, ask for tests of the important/);
+    expect(coord).toMatch(/In task descriptions, ask for tests of the important/);
     expect(coord).toContain('QA label (`needs-qa`)');
     expect(coord).toContain('`minions backlog update <taskId> --expected-version <v> --label needs-qa` (`<v>`: the `version` from `minions backlog show <taskId> --json`;');
   });
@@ -140,6 +139,6 @@ describe('minimal, in-scope changes in the generated plugin', () => {
 
   it('coordinator worker briefs name what is out of scope', async () => {
     const coord = await (await gen())('coordinator.md');
-    expect(coord).toMatch(/\*\*Worker briefs\.\*\*[^\n]*Name what is out of scope, so engineers change only what the task needs/);
+    expect(coord).toMatch(/\*\*Task text is the brief\.\*\*[^\n]*Name what is out of scope, so engineers change only what the task needs/);
   });
 });

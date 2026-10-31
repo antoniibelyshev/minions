@@ -1,4 +1,5 @@
-// task-33.5 (D11): the coordinator dispatches from `minions work next` instead of a role-by-status table.
+// The coordinator never dispatches (docs/design/autonomy.md Decision 10): the autopilot runs every stage, the
+// coordinator handles its holds and owns the backlog and the config.
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -26,50 +27,31 @@ const withWorkflows = (): MinionsConfig => {
   return c;
 };
 
-describe('coordinator.md and orchestrate dispatch from work next', () => {
-  it('the dispatch flow lists work next, claims without --role and spawns agentType with agentModel', async () => {
+describe('coordinator.md and orchestrate: the autopilot runs the stages', () => {
+  it('the coordinator never claims, spawns or records; it handles holds with autopilot status|resume', async () => {
     const read = await gen();
     const coord = await read('coordinator.md');
-    expect(coord).toContain('`minions work next|claim|advance|record|release|list|spend ... --json`');
-    expect(coord).toMatch(/1\. Pick a stage: `minions work next --json` lists the runnable stages .*`taskId`, `role`, `agentType`, `position`, `workflow`, `suggestedModel`, `agentModel`, `reason`/);
-    expect(coord).toMatch(/Never derive the role from the task status yourself/);
-    expect(coord).toMatch(/2\. Claim it: `minions work claim <taskId> --compact --json` \(the stage machine picks the role; `--role <role>` is optional and refused unless it is the current stage's\)/);
-    expect(coord).toMatch(/`subagent_type` = the stage's `agentType`.*`model` = `agentModel`, omitted when it is null/);
-    expect(coord).not.toMatch(/--role engineer\|tester\|reviewer/);
+    expect(coord).toContain('**The autopilot dispatcher runs every stage.**');
+    expect(coord).toContain('You never claim, spawn, record or release workers; a hook refuses `minions:*` Agent calls.');
+    expect(coord).toContain('`minions work autopilot status --json` lists the holds');
+    expect(coord).toContain('`minions work autopilot resume <taskId> --json`');
+    for (const gone of ['work advance', 'work claim', 'subagent_type', 'briefMarker', 'dispatch.mode', '--usage <subagent_tokens>']) expect(coord).not.toContain(gone);
 
     const orch = await read('skills/orchestrate/SKILL.md');
-    expect(orch).not.toMatch(/Role by status/);
-    expect(orch).toMatch(/`minions work next --json` for the runnable stages: `runnable`.*`waiting`.*`stuck`/);
-    expect(orch).toMatch(/never pick a role from the task status/);
-    expect(orch).toContain('`minions work claim <taskId> --compact --json` (the CLI picks the stage\'s role');
-    expect(orch).toMatch(/`subagent_type`: the stage's `agentType` from `work next`/);
-    expect(orch).toMatch(/`model`: the stage's `agentModel`; omit it when null/);
-  });
-
-  it('after a worker returns, the coordinator advances in one call (task-68.7); record and claim stay as fallbacks', async () => {
-    const read = await gen();
-    const coord = await read('coordinator.md');
-    expect(coord).toContain('Record it and claim the next stage in one call: `minions work advance <leaseId> --usage <subagent_tokens> --json`');
-    expect(coord).toMatch(/either `next` .*spawn it as in step 3, no `work next` or `work claim` needed.* or `decision`/);
-    expect(coord).toContain('Fallback: `minions work record <leaseId> --submitted --usage <subagent_tokens> --json`');
-    const orch = await read('skills/orchestrate/SKILL.md');
-    expect(orch).toContain('## 5. Record and advance');
-    expect(orch).toContain('`minions work advance <leaseId> --usage <subagent_tokens> --json`');
-    expect(orch).toMatch(/It never claims while paused, draining or over the budget, after an invalid result, or when a context reset is due/);
-    expect(orch).toMatch(/- `next`: the claimed stage .*Spawn it right away as in step 4/);
-    for (const kind of ['invalid', 'replan', 'needs-split', 'needs-changes', 'blocked', 'partial', 'awaiting-human', 'publication', 'qa-findings', 'context-reset', 'paused', 'draining', 'budget', 'capacity', 'nothing-runnable', 'claim-failed']) {
+    expect(orch).toContain('## 2. Handle each hold');
+    for (const kind of ['invalid', 'replan', 'needs-split', 'needs-changes', 'partial', 'blocked', 'awaiting-human', 'publication', 'qa-findings', 'no-result', 'claim-failed', 'launch-failed']) {
       expect(orch).toContain(`\`${kind}\``);
     }
-    expect(orch).toContain('`minions work advance <leaseId> --correction --usage <subagent_tokens> --json`');
-    expect(orch).toMatch(/Fallback \(an older CLI rejects `work advance`.*`minions work record <leaseId> --submitted --usage <subagent_tokens> --json`, then steps 1 to 3/);
+    for (const gone of ['work advance', 'work claim', 'subagent_type', 'Spawn']) expect(orch).not.toContain(gone);
+    expect(orch).toMatch(/`minions work next --json` shows what can start \(`runnable`.*`waiting`.*`stuck`/);
   });
 
-  it('orchestrate covers assigning a workflow, defining a role and cheap stages', async () => {
+  it('orchestrate covers assigning a workflow, defining a role and models', async () => {
     const orch = await (await gen(withWorkflows()))('skills/orchestrate/SKILL.md');
     expect(orch).toContain('## Workflows, roles and models');
     expect(orch).toMatch(/\*\*Assigning a workflow\*\* when you create a task: the default unless the task fits a configured workflow \(`docs`\).*`minions backlog create \.\.\. --workflow <name>`/);
     expect(orch).toMatch(/\*\*Defining a role \(worker profile\)\*\*: when recurring project work does not fit the existing roles.*never for a one-off task.*`edits\.paths` scoped/);
-    expect(orch).toMatch(/\*\*Cheap stages\*\*: follow `suggestedModel` \(stage hint, then role model, then the risk rule: `risk:low` → the cheapest allowed model for gates and verifiers, `risk:high` or a repair after a failed attempt → the strongest and the deep variant\)/);
+    expect(orch).toMatch(/\*\*Models\*\*: The dispatcher runs each stage on the model `work next` suggests/);
     expect(await (await gen())('skills/orchestrate/SKILL.md')).toMatch(/fits a configured workflow \(none configured yet\)/);
   });
 
@@ -80,10 +62,6 @@ describe('coordinator.md and orchestrate dispatch from work next', () => {
     expect(orch).toMatch(/\*\*Tuning flows\*\*:.*`minions control set workflows\.<name>/);
     const coord = await read('coordinator.md');
     expect(coord).toContain('**You own the configuration.** `minions control set <key> <json> --reason <text> --json` changes any config key at once, without the owner');
-    expect(coord).toContain('The autopilot dispatcher is off');
-    const auto = await (await gen({ ...defaults(), dispatch: { mode: 'auto' } }))('coordinator.md');
-    expect(auto).toContain('**The autopilot dispatcher runs the stages**');
-    expect(auto).toContain('`minions work autopilot status --json`');
   });
 
   it('configured workflows and per-role limits are rendered', async () => {
@@ -92,15 +70,21 @@ describe('coordinator.md and orchestrate dispatch from work next', () => {
     expect(coord).toMatch(/\(the `default` workflow\)\. One active stage per task\. Configured workflows: `docs` \(writer → reviewer \[haiku\]\)/);
     expect(coord).toContain('2 concurrent engineers (per-role limits: engineer 2, writer 1; other roles only by the task limit)');
     expect(await read('skills/status/SKILL.md')).toContain('per role from `capacity.byRole` in the status, limits engineer 2, writer 1; other roles only by the task limit');
-    expect(await read('skills/orchestrate/SKILL.md')).toContain('per-role limits (engineer 2, writer 1; other roles only by the task limit)');
+    expect(await read('skills/orchestrate/SKILL.md')).toContain('limits engineer 2, writer 1; other roles only by the task limit applied');
     const plain = await (await gen())('coordinator.md');
     expect(plain).toContain('No other workflows are configured: tasks run the default.');
     expect(plain).toContain('per-role limits: engineer 2; other roles only by the task limit');
   });
 
-  it('the status and recover skills point at work next', async () => {
+  it('the task skill handles the hold of its task and never dispatches; recover leaves dispatcher leases alone', async () => {
     const read = await gen();
+    const task = await read('skills/task/SKILL.md');
+    expect(task).toContain('you never claim, spawn, record or release workers');
+    expect(task).toContain('`minions work autopilot resume <id> --json`');
+    expect(task).not.toContain('work advance');
+    const recover = await read('skills/recover/SKILL.md');
+    expect(recover).toMatch(/leases whose `holder` is not `dispatcher`/);
+    expect(recover).toMatch(/Tasks under `stuck` in `minions work next --json`/);
     expect(await read('skills/status/SKILL.md')).toMatch(/`minions work next --json` shows what can start next and what waits/);
-    expect(await read('skills/recover/SKILL.md')).toMatch(/without a lease with `minions work next --json`: `runnable` lists the stage each needs again; a task under `stuck`/);
   });
 });
