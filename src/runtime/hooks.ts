@@ -76,6 +76,8 @@ const block = (reason: string): HookOutput => ({ stdout: JSON.stringify({ decisi
  * allows the stop and records nothing.
  */
 export async function stopHook(input: unknown, load: HookLoader, env: NodeJS.ProcessEnv = process.env): Promise<HookOutput> {
+  // A headless worker ends when its stage is done; the dispatcher records it (never the coordinator's continue rule).
+  if (env[WORKER_LEASE_ENV]) return { reason: `allow: headless worker ${String(env[WORKER_LEASE_ENV]).slice(0, 60)}` };
   const inp = isObj(input) ? input : {};
   const session = hookScope(env);
   if (session.invalid) return { reason: 'allow: MINIONS_SESSION is not a session key (nothing recorded)' };
@@ -234,7 +236,7 @@ export function preTelegramHook(input: unknown): HookOutput {
  * like variables, that is out of reach of a text check). Reading stdin, a grep error and every failure of minions
  * itself block (exit 2).
  */
-export const PRE_BASH_HOOK_COMMAND = `i=$(cat) || exit 2; case "$i" in *'"agent_id"'*) printf '%s' "$i" | grep -Eq 'minions[^:]|cli\\.[cm]?js|/state|/secrets|MINIONS_STATE_DIR|MINIONS_SECRETS_DIR'; m=$?; [ "$m" = 1 ] && exit 0; [ "$m" = 0 ] || exit 2; printf '%s' "$i" | ${hangGuarded('minions hook pre-bash')} || exit 2;; esac`;
+export const PRE_BASH_HOOK_COMMAND = `i=$(cat) || exit 2; case "$i\${MINIONS_WORKER_LEASE:+\\"agent_id\\"}" in *'"agent_id"'*) printf '%s' "$i" | grep -Eq 'minions[^:]|cli\\.[cm]?js|/state|/secrets|MINIONS_STATE_DIR|MINIONS_SECRETS_DIR'; m=$?; [ "$m" = 1 ] && exit 0; [ "$m" = 0 ] || exit 2; printf '%s' "$i" | ${hangGuarded('minions hook pre-bash')} || exit 2;; esac`;
 
 /** The verbs a Claude subagent must never run: they start, claim or end worker leases, or run the local integrator (coordinator-only). */
 export const COORDINATOR_ONLY_WORK_VERBS = ['run', 'claim', 'advance', 'release', 'integrate'] as const;
@@ -391,7 +393,7 @@ export function coordinatorOnlyWorkCommand(command: string): string | null {
  * those in WORKER_MINIONS_COMMANDS; an unknown word is no command (minions refuses it itself), so it never matches.
  */
 export const MINIONS_COMMANDS: readonly string[] = [
-  'auth', 'backlog', 'channel', 'ci', 'config', 'coordinator', 'doctor', 'down', 'export', 'git-credential', 'help', 'hook', 'import',
+  'auth', 'backlog', 'channel', 'ci', 'config', 'control', 'coordinator', 'doctor', 'down', 'export', 'git-credential', 'help', 'hook', 'import',
   'init', 'manager', 'notify', 'pause', 'resume', 'runtime', 'settings', 'setup', 'start', 'status', 'stop', 'sync', 'telegram',
   'uninstall', 'upgrade', 'work', 'workspace',
 ];
@@ -529,14 +531,14 @@ const READ_TOOLS: Readonly<Record<string, readonly string[]>> = { Read: ['file_p
  * Plugin PreToolUse entry for the write tools: every subagent call reaches node (a symlink in the worktree can
  * point anywhere, so no text pre-filter could decide). The coordinator's own calls never start node.
  */
-export const PRE_FILE_WRITE_HOOK_COMMAND = `i=$(cat) || exit 2; case "$i" in *'"agent_id"'*) printf '%s' "$i" | ${hangGuarded('minions hook pre-file')} || exit 2;; esac`;
+export const PRE_FILE_WRITE_HOOK_COMMAND = `i=$(cat) || exit 2; case "$i\${MINIONS_WORKER_LEASE:+\\"agent_id\\"}" in *'"agent_id"'*) printf '%s' "$i" | ${hangGuarded('minions hook pre-file')} || exit 2;; esac`;
 /**
  * Plugin PreToolUse entry for the read tools: node starts only for a subagent call whose input names a state dir
  * (`/state`: the container path, and the last segment of the host runtime's), the secrets dir (`/secrets`, task-96) or
  * MINIONS_STATE_DIR. A symlink
  * that hides the path is not caught for reads (disclosure, not forgery: writes are always checked).
  */
-export const PRE_FILE_READ_HOOK_COMMAND = `i=$(cat) || exit 2; case "$i" in *'"agent_id"'*) printf '%s' "$i" | grep -Eq '/state|/secrets|MINIONS_STATE_DIR'; m=$?; [ "$m" = 1 ] && exit 0; [ "$m" = 0 ] || exit 2; printf '%s' "$i" | ${hangGuarded('minions hook pre-file')} || exit 2;; esac`;
+export const PRE_FILE_READ_HOOK_COMMAND = `i=$(cat) || exit 2; case "$i\${MINIONS_WORKER_LEASE:+\\"agent_id\\"}" in *'"agent_id"'*) printf '%s' "$i" | grep -Eq '/state|/secrets|MINIONS_STATE_DIR'; m=$?; [ "$m" = 1 ] && exit 0; [ "$m" = 0 ] || exit 2; printf '%s' "$i" | ${hangGuarded('minions hook pre-file')} || exit 2;; esac`;
 
 /**
  * PreToolUse(Edit|MultiEdit|Write|NotebookEdit|Read|Glob|Grep), task-72: a Claude subagent may not write, read or
@@ -934,6 +936,22 @@ async function readStdin(timeoutMs = 5000): Promise<string> {
 
 export type HookKind = 'stop' | 'pre-agent' | 'pre-telegram' | 'pre-bash' | 'pre-file' | 'drain';
 
+/** Set by the dispatcher in a headless worker's environment (docs/design/autonomy.md Decision 1). */
+export const WORKER_LEASE_ENV = 'MINIONS_WORKER_LEASE';
+export const WORKER_ROLE_ENV = 'MINIONS_WORKER_ROLE';
+
+/**
+ * A headless worker (`claude -p --agent minions:<role>`) is its own main thread, so its hook inputs carry no
+ * `agent_id`. Its lease marker stands in for one: every guard then treats it as the worker it is, never as the
+ * coordinator. Inputs that already name a subagent are unchanged.
+ */
+export function asWorkerInput(input: unknown, env: NodeJS.ProcessEnv = process.env): unknown {
+  const lease = env[WORKER_LEASE_ENV];
+  if (!lease || !isObj(input) || (input.agent_id !== undefined && input.agent_id !== null)) return input;
+  const role = env[WORKER_ROLE_ENV];
+  return { ...input, agent_id: `headless-${lease}`, ...(role ? { agent_type: `minions:${role}` } : {}) };
+}
+
 /** Hooks that allow on unreadable input or an internal error (the others fail closed). */
 const failsOpen = (kind: HookKind) => kind === 'stop' || kind === 'drain';
 
@@ -948,6 +966,7 @@ export async function runHook(kind: HookKind, load: HookLoader | DrainLoader, st
     if (parseError) {
       out = failsOpen(kind) ? { reason: `allow: unreadable hook input (${parseError})` } : deny(`minions could not parse the hook input (${parseError}).`);
     } else {
+      if (kind !== 'stop') input = asWorkerInput(input);
       out = kind === 'drain' ? await drainHook(input, load) : kind === 'pre-telegram' ? preTelegramHook(input) : kind === 'pre-bash' ? preBashHook(input) : kind === 'pre-file' ? preFileHook(input)
         : kind === 'stop' ? await stopHook(input, load as HookLoader) : await preAgentHook(input, load as HookLoader);
     }

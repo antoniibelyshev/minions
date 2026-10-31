@@ -23,7 +23,7 @@ describe('control overlay', () => {
     expect(c.revision).toBe(1);
     expect(c.keys).toEqual([{ key: 'workflows.default', appliesOn: 'next-stage', hostOwned: true }]);
     const cfg = withControl(defaults(), state);
-    expect(resolveWorkflow(cfg, null).stages.map((s) => s.role)).toEqual(['engineer', 'reviewer']);
+    expect(resolveWorkflow(cfg, null)!.stages.map((s) => s.role)).toEqual(['engineer', 'reviewer']);
     const [entry] = readJournal(state);
     expect(entry).toMatchObject({ revision: 1, op: 'set', keys: ['workflows.default'], reason: 'drop the tester', before: {} });
   });
@@ -32,7 +32,7 @@ describe('control overlay', () => {
     await controlApply(deps(), { roles: { researcher }, workflows: { research: ['researcher', 'reviewer'] } }, 'research tasks');
     const cfg = withControl(defaults(), state);
     expect(cfg.roles?.researcher).toMatchObject({ promptText: 'Research it.' });
-    expect(resolveWorkflow(cfg, 'research').stages.map((s) => s.role)).toEqual(['researcher', 'reviewer']);
+    expect(resolveWorkflow(cfg, "research")!.stages.map((s) => s.role)).toEqual(['researcher', 'reviewer']);
   });
 
   it('refuses an invalid change and writes nothing', async () => {
