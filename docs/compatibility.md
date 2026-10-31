@@ -176,8 +176,7 @@ Design for the open ownership cases (not implemented; needs live validation):
   coordinator runs without Telegram. Fix it inside the runtime with
   `claude plugin enable telegram@claude-plugins-official` (user scope by default; a non-session
   subcommand, it starts no poller) and restart the coordinator,
-  or upgrade back to a task-51 or later build. The setup assistant (`minions setup assist`) passes no channel flags but
-  uses your host config, so it loads the plugin if you enabled it there. The test suite sets
+  or upgrade back to a task-51 or later build. The test suite sets
   `CLAUDE_CONFIG_DIR` to a temp dir (`test/setup/global.ts`), and `test/setup/claude-guard.ts`
   fails any test that would start `claude` with the real `~/.claude`.
 - Native macOS/iOS builds (Xcode) cannot run inside the Linux runtime.
