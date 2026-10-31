@@ -10,14 +10,18 @@
 // - cli-version:        `minions --version` inside the container differs from the host CLI's VERSION;
 // - credential-mounts:  the secrets directory bind mount is missing, comes from another host path, or is writable;
 // - coordinator-launch: the running coordinator's launch record fingerprint (channel, network, bot token
-//                       hash) differs from the current one (`coordinatorLaunch` of the container's status).
+//                       hash) differs from the current one (`coordinatorLaunch` of the container's status);
+// - apt-packages:       container.aptPackages (the coordinator's control overlay, else the config) differs from the
+//                       packages the container's image was derived with: an image rebuild is pending.
 import { realpathSync } from 'node:fs';
 import { run } from '../core/exec.js';
 import { CONTAINER, projectPaths } from '../core/paths.js';
 import { VERSION } from '../core/version.js';
 import type { RunResult } from '../core/exec.js';
-import { Compose, buildFingerprint, imageId, packageRoot, type Runner } from './docker.js';
-import { loadProjectJson } from './project.js';
+import { Compose, buildFingerprint, imageId, packageRoot, runtimeImageTag, type Runner } from './docker.js';
+import { loadEffectiveConfig, loadProjectJson, type ProjectJson } from './project.js';
+import { describeAptChange, planAptPackages, readControlOverlay } from './tools.js';
+import type { MinionsConfig } from '../config/schema.js';
 import { projectForPath } from './registry.js';
 import { runtimeOf } from './runtime.js';
 import { MinionsError } from '../core/errors.js';
@@ -25,8 +29,8 @@ import { MinionsError } from '../core/errors.js';
 /** The exact command that applies every restart-required change. */
 export const RESTART_COMMAND = 'minions upgrade';
 
-export type RestartReasonKind = 'image' | 'cli-version' | 'credential-mounts' | 'coordinator-launch';
-export const RESTART_REASON_KINDS: readonly RestartReasonKind[] = ['image', 'cli-version', 'credential-mounts', 'coordinator-launch'];
+export type RestartReasonKind = 'image' | 'cli-version' | 'credential-mounts' | 'coordinator-launch' | 'apt-packages';
+export const RESTART_REASON_KINDS: readonly RestartReasonKind[] = ['image', 'cli-version', 'credential-mounts', 'coordinator-launch', 'apt-packages'];
 
 export interface RestartReason {
   kind: RestartReasonKind;
@@ -68,6 +72,11 @@ export interface RestartCheckOptions {
   version?: string;
   /** Container status already read by the caller (saves an exec); otherwise `minions status --json` is run. */
   status?: ContainerStatusLike | null;
+  /**
+   * container.aptPackages check: the project record (its base imageTag and the packages its image was derived with)
+   * and the host config's value; the control overlay is read in the container. Absent: not checked.
+   */
+  apt?: { project: Pick<ProjectJson, 'projectId' | 'imageTag' | 'container'>; config: Pick<MinionsConfig, 'container'> };
 }
 
 const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e)).slice(0, 200);
@@ -181,6 +190,17 @@ async function check(opts: RestartCheckOptions): Promise<RestartRequired> {
       unchecked.push({ kind: 'coordinator-launch', detail: l.reason ?? 'no launch record' });
     }
   }
+
+  // ---- container.aptPackages (docs/design/autonomy.md Decision 14) ----
+  if (opts.apt) {
+    const { project, config } = opts.apt;
+    const plan = await planAptPackages(project, config, () => readControlOverlay(opts.projectId, project.imageTag, { compose, runner }));
+    if (plan.warning) unchecked.push({ kind: 'apt-packages', detail: plan.warning });
+    else if (plan.changed) {
+      reasons.push({ kind: 'apt-packages', running: plan.current.join(' ') || null, current: plan.desired.join(' ') || null,
+        detail: `image rebuild pending: aptPackages changed (${describeAptChange(plan)})` });
+    }
+  }
   return result(reasons, unchecked);
 }
 
@@ -215,8 +235,10 @@ export async function hostStatus(opts: { cwd: string; args?: string[]; runner?: 
   const r = await compose.exec(['minions', 'status', ...(opts.args ?? []).filter((a) => a !== '--json'), '--json'], { allowFailure: true, timeoutMs: 60_000 });
   const status = parseStatusEnvelope(r.stdout);
   if (!status) return { kind: 'raw', result: r };
+  const config = await loadEffectiveConfig(project).then((e) => e.config).catch(() => null);
   const restartRequired = await checkRestartRequired({
-    projectId, imageTag: project.imageTag, compose, runner, status: status as ContainerStatusLike,
+    projectId, imageTag: runtimeImageTag(project), compose, runner, status: status as ContainerStatusLike,
+    ...(config ? { apt: { project, config } } : {}),
     ...(opts.fingerprint !== undefined ? { fingerprint: opts.fingerprint } : {}), ...(opts.version !== undefined ? { version: opts.version } : {}),
   });
   return { kind: 'report', status, restartRequired };

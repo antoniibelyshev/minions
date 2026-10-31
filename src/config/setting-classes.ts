@@ -67,6 +67,8 @@ export const KEY_CLASSES: readonly KeyClass[] = [
   // ---- recreate
   ...entries(['git.identity'], 'recreate', false, 'applied only by workspace setup (install, upgrade or start)'),
   ...entries(['container.cpus', 'container.memoryMiB', 'container.pidsLimit', 'container.tmpSizeMiB'], 'recreate', false, 'compose resource limits'),
+  ...entries(['container.aptPackages'], 'recreate', false,
+    'a derived image built by `minions upgrade` or the `minions start` of a stopped container (the container is the boundary: packages add no power)'),
   ...entries(['container.network', 'container.publishPorts', 'container.mountHostRepository', 'container.mountDockerSocket'], 'recreate', true,
     'isolation of the container'),
   // ---- fixed

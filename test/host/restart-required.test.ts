@@ -54,6 +54,8 @@ interface World {
   mounts: { Type: string; Source: string; Destination: string; RW: boolean }[] | null;
   cliVersion: string | null;
   launch: { state: string; reason: string } | null | 'no-status';
+  /** The control overlay the container prints (default `{}`; null: the read fails). */
+  overlay?: string | null;
 }
 
 function world(projectId: string, over: Partial<World> = {}): World {
@@ -89,6 +91,7 @@ function fakeDocker(w: World, calls: string[] = []) {
         configRevision: 1, profile: 'p', deliveryMode: 'local', capacity: null, ...(w.launch ? { coordinatorLaunch: w.launch } : {}) } }) + '\n');
     }
     if (a.endsWith('claude auth status') || a.endsWith('backlog --version')) return ok('1.0\n');
+    if (a.includes('exec -T app sh -c') && a.endsWith('/state/control/overlay.json')) return w.overlay === null ? fail('cat: denied') : ok(w.overlay ?? '{}');
     return fail();
   };
 }

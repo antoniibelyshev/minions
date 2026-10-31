@@ -112,7 +112,7 @@ describe('the settings model agrees with the classification', () => {
 
   it('the container resource limits are recreate items (task-53.9: `minions upgrade` copies them into project.json)', () => {
     const recreate = SETTINGS.filter((d) => d.class === 'recreate').map((d) => d.key).sort();
-    expect(recreate).toEqual(['container.cpus', 'container.memoryMiB', 'container.pidsLimit', 'container.tmpSizeMiB']);
+    expect(recreate).toEqual(['container.aptPackages', 'container.cpus', 'container.memoryMiB', 'container.pidsLimit', 'container.tmpSizeMiB']);
     for (const k of recreate) expect(SETTINGS.find((d) => d.key === k), k).toMatchObject({ apply: 'recreate', hostOwned: false });
   });
 });

@@ -67,7 +67,7 @@ export async function livePluginDir(cfg: MinionsConfig, paths: RuntimePaths, log
   try {
     await ensureRealDir(root, 0o700);
     await rm(dir, { recursive: true, force: true });
-    await generatePlugin(cfg, dir, { configDir: roleConfigDir(paths) });
+    await generatePlugin(cfg, dir, { configDir: roleConfigDir(paths), runtime: runtimeMode() === 'host-runtime' ? 'host' : 'docker' });
     await atomicWrite(join(dir, '.complete'), new Date().toISOString() + '\n');
   } catch (e) {
     log?.(`dispatch: could not render the live plugin (${(e as Error).message.slice(0, 200)}); using the host plugin at ${paths.pluginDir}`);

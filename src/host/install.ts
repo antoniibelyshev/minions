@@ -324,7 +324,7 @@ async function prepare(opts: InitOptions, docker?: DockerStatus): Promise<Prepar
   const staging = await mkdtemp(join(tmpdir(), 'minions-plugin-'));
   const cleanup = () => rm(staging, { recursive: true, force: true });
   try {
-    await generatePlugin(effective, staging, { configDir: roleConfigDir(project) });
+    await generatePlugin(effective, staging, { configDir: roleConfigDir(project), runtime: runtimeOf(project) });
     for (const f of await walkFiles(staging)) add(join(paths.pluginDir, relative(staging, f)), await readFile(f));
   } catch (e) { await cleanup(); throw e; }
 
@@ -499,7 +499,7 @@ const roleConfigDir = (project: Pick<ProjectJson, 'visibility' | 'repoPath' | 'p
 async function renderPlugin(pluginDir: string, effective: MinionsConfig, project: ProjectJson): Promise<[string, Buffer][]> {
   const staging = await mkdtemp(join(tmpdir(), 'minions-plugin-'));
   try {
-    await generatePlugin(effective, staging, { configDir: roleConfigDir(project) });
+    await generatePlugin(effective, staging, { configDir: roleConfigDir(project), runtime: runtimeOf(project) });
     const out: [string, Buffer][] = [];
     for (const f of await walkFiles(staging)) out.push([join(pluginDir, relative(staging, f)), await readFile(f)]);
     return out;

@@ -189,7 +189,7 @@ describe('init', () => {
     expect(u.kept.map((k) => k.path)).toEqual([paths.configJson]);
     expect(existsSync(paths.composeYaml)).toBe(false);
     expect(existsSync(paths.configJson)).toBe(true);
-    expect(u.volumesKept).toHaveLength(4);
+    expect(u.volumesKept).toHaveLength(5);
     expect(runner).toHaveBeenCalledWith('docker', expect.arrayContaining(['down']), expect.anything());
     expect(JSON.stringify(runner.mock.calls)).not.toContain('"-v"');
     expect((await loadRegistry()).projects[r.plan.projectId]).toBeUndefined();

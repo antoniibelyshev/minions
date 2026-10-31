@@ -23,7 +23,7 @@ import { roleEffort } from '../config/models.js';
 import { MinionsError } from '../core/errors.js';
 import { runtimeMode } from '../core/cli-helpers.js';
 import { atomicWrite, ensureRealDir } from '../core/fsutil.js';
-import { CONTAINER } from '../core/paths.js';
+import { CONTAINER, TOOLS_ENV } from '../core/paths.js';
 import { resolveOnPath } from '../host/auth.js';
 import {
   coordinatorDisallowedTools, coordinatorSettings, effectivePermissionMode, hostPromptNote, readPrompt, runtimeAuthMethod,
@@ -100,6 +100,8 @@ export const SESSION_ENV_ALLOW = [
   'NODE_EXTRA_CA_CERTS', 'SSL_CERT_FILE', 'SSL_CERT_DIR', 'GIT_TERMINAL_PROMPT', 'GH_PROMPT_DISABLED',
   // Tool caches (container env and host cacheVars).
   'XDG_CACHE_HOME', 'npm_config_cache', 'COREPACK_HOME', 'YARN_CACHE_FOLDER', 'PIP_CACHE_DIR', 'UV_CACHE_DIR', 'GOCACHE', 'GOMODCACHE', 'BUN_INSTALL_CACHE_DIR',
+  // Toolchain locations (the container's tools volume, TOOLS_ENV; on the host runtime the owner's own).
+  ...(Object.keys(TOOLS_ENV) as (keyof typeof TOOLS_ENV)[]),
   // Runtime location and identity (never a worker marker such as MINIONS_ROLE or MINIONS_WORKER_LEASE).
   'MINIONS_RUNTIME', 'MINIONS_CONFIG', 'MINIONS_STATE_DIR', 'MINIONS_WORKSPACE', 'MINIONS_SECRETS_DIR', 'MINIONS_PLUGIN_DIR', 'MINIONS_SCRATCH_DIR',
   'MINIONS_LOG_DIR', 'MINIONS_TMUX_SOCKET', 'MINIONS_AUTH_METHOD', 'MINIONS_HOME', 'MINIONS_PROJECT_ID', 'MINIONS_PROJECT_DIR',

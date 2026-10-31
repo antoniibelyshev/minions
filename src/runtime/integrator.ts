@@ -23,7 +23,8 @@
 //   verification.setupCommands run only when they or the lockfile hash changed since the last successful setup.
 //   Each command runs as `sh -c` in its own process group (runner/supervise.ts) with the per-command timeout
 //   delivery.integrationTimeoutMinutes and an allowlisted env: PATH, LANG, TZ, CI=1, MINIONS_TEST_MAX_WORKERS=2,
-//   a fresh HOME, MINIONS_HOME and TMPDIR under <state>/run/integration (no coordinator or Telegram secrets).
+//   a fresh HOME, MINIONS_HOME and TMPDIR under <state>/run/integration (no coordinator or Telegram secrets); in the
+//   container also the tools volume's locations (TOOLS_ENV) and its PATH entries, so agent-installed tools run there.
 //   Output goes to <state>/logs/integration/<task>-<row>.log; the tail goes into the row's detail.
 //   A failing command is `red`; a timeout, a spawn error, a setup failure or exit 127 (command not found: the
 //   worktree lacks its tools, e.g. no node_modules because verification.setupCommands is empty) is transient,
@@ -47,6 +48,7 @@ import { can } from '../config/capabilities.js';
 import { NO_VERIFICATION_COMMANDS } from '../config/delivery.js';
 import type { MinionsConfig } from '../config/schema.js';
 import { MinionsError } from '../core/errors.js';
+import { TOOLS_ENV, withToolsPath } from '../core/paths.js';
 import { redact } from '../core/output.js';
 import { FULL_SHA, withEmptyHome } from './isolated-git.js';
 import type { RuntimeDb, SupervisorLock } from './db.js';
@@ -229,7 +231,7 @@ export interface VerifyInput {
   commands: string[];
   timeoutMs: number;
   logPath: string;
-  /** Base env (PATH, LANG and TZ are read from it; nothing else). */
+  /** Base env (PATH, LANG, TZ and MINIONS_RUNTIME are read from it; nothing else). */
   env?: NodeJS.ProcessEnv;
   timing?: VerifyTiming;
   /** Polled while a command runs: true stops it (drain, signal). */
@@ -251,6 +253,10 @@ export function verifyEnv(base: NodeJS.ProcessEnv, runDir: string): Record<strin
     TMPDIR: join(runDir, 'tmp'),
   };
   for (const k of ['LANG', 'TZ'] as const) if (base[k]) env[k] = base[k]!;
+  if (base.MINIONS_RUNTIME === 'container') {
+    env.PATH = withToolsPath(env.PATH!);
+    Object.assign(env, TOOLS_ENV);
+  }
   return env;
 }
 
@@ -471,7 +477,7 @@ export interface IntegratorDeps {
   onSettled?: (row: IntegrationRow) => void | Promise<void>;
   /** Stops the integrator: a running verification is stopped and re-queued (SIGTERM). */
   signal?: AbortSignal;
-  /** Base env of the verification commands (only PATH, LANG and TZ are read). */
+  /** Base env of the verification commands (only PATH, LANG, TZ and MINIONS_RUNTIME are read). */
   env?: NodeJS.ProcessEnv;
   timing?: VerifyTiming & { reapGraceMs?: number };
   lockAlive?: (l: IntegrationLock) => boolean;

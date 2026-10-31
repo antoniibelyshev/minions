@@ -41,7 +41,7 @@ import { readJsonIfExists, writeJson } from '../core/fsutil.js';
 import { projectPaths } from '../core/paths.js';
 import type { RunOptions, RunResult } from '../core/exec.js';
 import { materializeSecrets, upClearingSecretsOnFailure } from './credentials.js';
-import { buildFingerprint, ensureImage, imageBuildLabel, packageRoot, type Compose, type Runner } from './docker.js';
+import { aptImageTag, buildFingerprint, ensureAptImage, ensureImage, imageBuildLabel, packageRoot, type Compose, type Runner } from './docker.js';
 import { parseEnvelope, type ImportResult } from './transfer.js';
 import type { CliCheck, SourcePhase, SourceStop, SyncResult } from './upgrade-source.js';
 
@@ -117,6 +117,8 @@ export interface UpgradeOptions {
   root?: string;
   /** Regenerates compose.yaml, the runtime config and the plugin from the installed package. */
   refresh: () => Promise<string[]>;
+  /** Docker: container.aptPackages after `refresh` (the image step builds their derived image; absent = none). */
+  aptPackages?: () => readonly string[] | undefined;
   /** After the refresh: how the plugin on disk differs from the installed package (null: it matches). */
   checkPlugin?: () => Promise<string | null>;
   /** Re-runs the repository import, which (re)configures origin; an existing clone is only refreshed (Docker only). */
@@ -501,8 +503,11 @@ export async function runUpgrade(opts: UpgradeOptions): Promise<UpgradeResult> {
     } catch (e) { await abort('files', e); }
     if (!host) try {
       const built = await ensureImage(opts.imageTag, { runner: opts.runner, root, onBuild: log });
-      result.image.rebuild = built;
-      step('image', built ? 'done' : 'skipped', built ? `built ${opts.imageTag}` : 'fingerprint unchanged; no rebuild');
+      const apt = opts.aptPackages?.();
+      const aptBuilt = await ensureAptImage(opts.imageTag, apt, { runner: opts.runner, onBuild: log });
+      result.image.rebuild = built || aptBuilt;
+      const builtTags = [...(built ? [opts.imageTag] : []), ...(aptBuilt ? [aptImageTag(opts.imageTag, apt)] : [])];
+      step('image', builtTags.length ? 'done' : 'skipped', builtTags.length ? `built ${builtTags.join(', ')}` : 'fingerprint unchanged; no rebuild');
       await checkpoint();
     } catch (e) { await abort('image', e); }
 

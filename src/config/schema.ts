@@ -101,7 +101,13 @@ export const SECRET_NAME = /^[A-Z][A-Z0-9_]{1,63}$/;
  * Names a worker env entry may never set: minions' own variables, and those that change what a program runs or where
  * it reads code and config (the worker's unsandboxed hooks inherit the env).
  */
-export const RESERVED_ENV = /^(CLAUDE_|ANTHROPIC_|MINIONS_|TELEGRAM_|GIT_|GH_|SSH_|LD_|DYLD_|NODE_(?!ENV$)|NPM_CONFIG_|PYTHON|PERL|RUBY|XDG_|BASH|ZDOTDIR$|ENV$|SHELL|IFS$|PS4$|PROMPT_COMMAND$|PATH$|HOME$|TMPDIR$|USER$|LOGNAME$|(HTTPS?|ALL|NO|FTP)_PROXY$|SSL_CERT_|CURL_)/;
+export const RESERVED_ENV = /^(CLAUDE_|ANTHROPIC_|MINIONS_|TELEGRAM_|GIT_|GH_|SSH_|LD_|DYLD_|NODE_(?!ENV$)|NPM_CONFIG_|PYTHON|PERL|RUBY|XDG_|BASH|ZDOTDIR$|ENV$|SHELL|IFS$|PS4$|PROMPT_COMMAND$|PATH$|HOME$|TMPDIR$|USER$|LOGNAME$|(HTTPS?|ALL|NO|FTP)_PROXY$|SSL_CERT_|CURL_|CARGO_HOME$|RUSTUP_HOME$|GO(PATH|ROOT|BIN|TOOLCHAIN)$|UV_(INSTALL_DIR|TOOL_DIR|TOOL_BIN_DIR|PYTHON_INSTALL_DIR)$)/;
+
+/** A Debian package name (Debian Policy 5.6.1), as `container.aptPackages` takes it: no version, no architecture. */
+export const APT_PACKAGE = /^[a-z0-9][a-z0-9+.-]{1,99}$/;
+export const MAX_APT_PACKAGES = 50;
+export const AptPackagesSchema = z.array(z.string().regex(APT_PACKAGE, 'must be a Debian package name (lowercase letters, digits, + - .)'))
+  .max(MAX_APT_PACKAGES);
 
 /** A project-defined worker role (D3). */
 
@@ -247,6 +253,8 @@ export const MinionsConfigSchema = z.object({
     network: z.enum(['outbound-internet', 'none']),
     mountHostRepository: z.boolean(),
     mountDockerSocket: z.boolean(),
+    /** Docker runtime: Debian packages added to the image (a derived image, rebuilt by `minions start` / `upgrade`). */
+    aptPackages: AptPackagesSchema.optional(),
   }).strict(),
   execution: z.object({
     maxActiveTasks: z.number().int().min(1),

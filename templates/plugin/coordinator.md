@@ -30,7 +30,7 @@ Your job: keep the backlog ready and well split (the task text is the worker's b
 
 ## Testing
 
-{{testingGuidance}}
+{{testingGuidance}}{{toolsGuidance}}
 
 ## Limits
 

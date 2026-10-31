@@ -14,7 +14,7 @@ import type { MinionsConfig } from '../config/schema.js';
 import { clearStaleSecrets, secretCopiesExist, telegramCredentialStatus, type TelegramCredentialStatus } from './credentials.js';
 import { dockerProbe, type DockerProbe, type DockerStatus } from './discovery.js';
 import { composeHint, daemonHint, linuxDockerChecks, linuxHostFacts, unknownLinuxFacts, type LinuxHostFacts } from './linux-host.js';
-import { Compose, buildFingerprint, imageBuildLabel, tmpSizeMiB, type Runner } from './docker.js';
+import { Compose, buildFingerprint, imageBuildLabel, runtimeImageTag, tmpSizeMiB, type Runner } from './docker.js';
 import { RESTART_COMMAND, checkRestartRequired, notApplicable, restartUnknown, type RestartRequired } from './restart-required.js';
 import { telegramDoctorCheck } from '../telegram/probe.js';
 import { fastPathHint } from '../backlog/taskfile.js';
@@ -449,11 +449,12 @@ export async function runDoctor(opts: {
       tgPlugin = await hostRuntimeChecks(project, auth, baseUrl, wantsTelegram, runner, add, checks, !!config);
       checks.push(...harnessSkipChecks(harnesses, 'host-runtime'));
     } else if (docker.daemon && docker.compose) {
-      const label = await imageBuildLabel(project.imageTag, runner);
+      const tag = runtimeImageTag(project);
+      const label = await imageBuildLabel(tag, runner);
       const fp = opts.fingerprint !== undefined ? opts.fingerprint : buildFingerprint();
-      if (label === null) add('image', 'warn', `${project.imageTag} not built yet`, '`minions start` builds it.');
-      else if (fp !== null && label !== fp) add('image', 'warn', `${project.imageTag} was built from a different minions package`, '`minions start` rebuilds it and recreates the container.');
-      else add('image', 'ok', project.imageTag);
+      if (label === null) add('image', 'warn', `${tag} not built yet`, '`minions start` builds it.');
+      else if (fp !== null && label !== fp) add('image', 'warn', `${tag} was built from a different minions package`, '`minions start` rebuilds it and recreates the container.');
+      else add('image', 'ok', tag);
       const compose = new Compose(project.projectId, runner);
       const running = await compose.isRunning();
       add('container', running ? 'ok' : 'warn', running ? `${compose.name} running` : `${compose.name} not running`, running ? undefined : 'Run `minions start`.');
@@ -505,7 +506,8 @@ export async function runDoctor(opts: {
         for (const n of ['claude.auth', ...(baseUrl ? ['claude.baseUrl'] : []), 'container.tmp', 'container.scratch', 'backlog.cli', 'claude.capabilities', 'telegram.plugin']) add(n, 'warn', 'skipped: container not running');
         checks.push(...harnessSkipChecks(harnesses, 'not-running'));
       }
-      restart = await checkRestartRequired({ projectId: project.projectId, imageTag: project.imageTag, compose, runner,
+      restart = await checkRestartRequired({ projectId: project.projectId, imageTag: runtimeImageTag(project), compose, runner,
+        ...(effective ? { apt: { project, config: effective } } : {}),
         ...(opts.fingerprint !== undefined ? { fingerprint: opts.fingerprint } : {}), ...(opts.version !== undefined ? { version: opts.version } : {}) });
     } else {
       add('container', 'fail', 'skipped: Docker unavailable');

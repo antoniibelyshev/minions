@@ -307,6 +307,31 @@ them.
   only moves by `merge --ff-only` in a clean checkout that has it checked out; everything else is reported, since
   moving a branch the user is not on, or a dirty tree, is the user's call.
 
+## Decision 14. Tools in the container (owner, 2026-10-31)
+
+Agents add the toolchains a project needs (Rust, Go, Python via uv) without the owner. Docker runtime only: the host
+runtime already uses the owner's machine.
+
+- **The container is the boundary, so an agent-installed tool adds no power.** It runs as the same unprivileged user,
+  under the same caps, network and mounts as everything the agents already run. Installing it needs no root and no
+  new escape hatch.
+- **A persistent tools volume at `/opt/tools`**, per project like the other volumes, kept across restarts and upgrades
+  so a toolchain is installed once. The image presets the toolchain homes under it and puts its bin dirs on PATH
+  **after** the system dirs, so a tool there never shadows `git` or `minions`. Workers inherit these variables, the
+  `env` map cannot override them, and the verify step and the integrator pass them on (their HOME stays fresh), so a
+  check that needs the tool finds it.
+- **Persistence is the risk** (a broken or tampered toolchain outlives the task that installed it): the owner wipes it
+  with `minions tools reset`, and the next start mounts the image's empty layout.
+- **System packages go through `container.aptPackages`**, coordinator-editable through `control`: a derived image (one
+  apt layer as root on the base) whose tag hashes the list, so a change rebuilds and recreates. `minions upgrade`
+  applies it after draining the workers, and so does `minions start` of a stopped container; `minions start` never
+  recreates a running container for it (that would cut off its workers) and says the rebuild is pending, as
+  `minions status` does. The overlay lives in the state volume, so the host reads that one key from it and validates it
+  as package names before it reaches a build. Apt maintainer scripts run as root only at build time, never in the
+  running container.
+- **No Dockerfile escape hatch for now.** Package names cover what toolchains need without letting config run
+  arbitrary build steps as root.
+
 ## Reversed decisions
 
 - telegram-decisions.md D2 (tap buttons instead of native polls): native polls are built at the owner's request.
