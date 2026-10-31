@@ -94,6 +94,26 @@ describe('gateway: sessions index, topics and handover', () => {
     expect(readFileSync(file, 'utf8')).toContain('thread:410 [closed]');
   });
 
+  it('the index shows each session\'s tokens and estimated cost, a task session\'s workers, and a total', async () => {
+    const { d } = gateway();
+    await routeInbound(d, msg('cost me', { message_id: '500' }));
+    const usage = (data: Record<string, unknown>, taskId: string | null = null) => db.addEvent('usage', taskId, data);
+    // Two claude sessions of thread:500 (a reset): both count. Components are weighted (cache read 0.1x, write 1.25x, output 5x).
+    usage({ key: 'session:s1', scope: 'session', session: 's1', sessionKey: 'thread:500', tokens: 100_000, model: 'claude-opus-5-5', source: 'transcript', components: { input: 0, cacheRead: 100_000, cacheWrite: 0, output: 0 } });
+    usage({ key: 'session:s2', scope: 'session', session: 's2', sessionKey: 'thread:500', tokens: 20_000, model: 'claude-opus-5-5', source: 'transcript', components: { input: 0, cacheRead: 0, cacheWrite: 20_000, output: 0 } });
+    db.exec("INSERT INTO sessions (key, kind, claude_session_id, status, model, config_dir, opened_at, resumes) VALUES ('task:task-7', 'task', NULL, 'open', NULL, '/x', ?, 0)", T0.toISOString());
+    usage({ key: 'lease:l1', scope: 'lease', leaseId: 'l1', role: 'engineer', attempt: 1, tokens: 1_000_000, model: 'claude-sonnet-5-5', source: 'record' }, 'task-7');
+    const idx = sessionsIndex(db, at(1), 'api-key');
+    expect(idx.find((e) => e.key === 'thread:500')!.spend).toEqual({ tokens: 120_000, usd: 0.18, workerTokens: 0, workerUsd: 0 });
+    expect(idx.find((e) => e.key === 'task:task-7')!.spend).toMatchObject({ tokens: 0, workerTokens: 1_000_000, workerUsd: 3 });
+    const text = formatSessionsIndex(idx);
+    expect(text).toContain('thread:500 [open] "cost me" · 120k tok ~$0.18');
+    expect(text).toContain('+ workers 1.0M tok ~$3.00');
+    expect(text).toMatch(/Total: 1\.1M tok ~\$3\.18/);
+    // A subscription: tokens only.
+    expect(formatSessionsIndex(sessionsIndex(db, at(1), 'subscription'))).toContain('thread:500 [open] "cost me" · 120k tok ·');
+  });
+
   it('the gateway replaces the router only with the minions channel server', () => {
     expect(isGatewayLaunch(cfg(), { enabled: true, server: 'minions' })).toBe(true);
     expect(isGatewayLaunch(cfg(), { enabled: true, server: 'official' })).toBe(false);

@@ -22,6 +22,7 @@ import type { ChannelNotification } from '../telegram/channel/core.js';
 import { CHANNEL_BOT_ERRORS, ChannelServer, fileLog, LAUNCH_ENV, readChannelToken, type ChannelProc, type ChannelServerOptions } from '../telegram/channel/server.js';
 import type { RuntimeDb, SessionRow } from './db.js';
 import { digestStatus, reholdExpired } from './digest.js';
+import { billingOf, sessionSpend, type Billing } from './spend.js';
 import { ack, fail, pending } from './outbox.js';
 import { recordSent, resolveRoute, sendToSession, threadReplyTarget, type RouteRule } from './router.js';
 import { routineSettings } from './routine.js';
@@ -133,6 +134,8 @@ export async function deliverDue(d: GatewayDeps): Promise<{ sent: string[]; fail
 export interface SessionIndexEntry {
   key: string; kind: SessionRow['kind']; status: SessionRow['status']; taskId: string | null;
   topic: string | null; openedAt: string; lastActivity: string; firstMessage: string | null;
+  /** The session's own measured tokens, and its task's workers for a task session (USD only with API billing). */
+  spend: { tokens: number; usd?: number; workerTokens: number; workerUsd?: number };
 }
 
 const TOPIC_META = 'session_topic:';
@@ -140,7 +143,8 @@ export const MAX_TOPIC = 200;
 /** How long a closed session stays in the index (a reply reopens it). */
 export const INDEX_CLOSED_HOURS = 24;
 
-export function sessionsIndex(db: RuntimeDb, now: Date = new Date()): SessionIndexEntry[] {
+export function sessionsIndex(db: RuntimeDb, now: Date = new Date(), billing: Billing = billingOf()): SessionIndexEntry[] {
+  const spent = sessionSpend(db, billing);
   const since = new Date(now.getTime() - INDEX_CLOSED_HOURS * 3600_000).toISOString();
   const rows = db.all<SessionRow>("SELECT * FROM sessions WHERE status = 'open' OR closed_at >= ? ORDER BY status = 'open' DESC, opened_at DESC", since);
   return rows.map((r) => {
@@ -150,13 +154,26 @@ export function sessionsIndex(db: RuntimeDb, now: Date = new Date()): SessionInd
       key: r.key, kind: r.kind, status: r.status, taskId: parseSessionKey(r.key).taskId,
       topic: db.getMeta(`${TOPIC_META}${r.key}`) ?? null, openedAt: r.opened_at, lastActivity: [last, r.last_wake_at, r.opened_at].filter(Boolean).sort().at(-1)!,
       firstMessage: first ? first.replace(/\s+/g, ' ').trim().slice(0, 160) : null,
+      spend: spendOf(spent.get(r.key)),
     };
   });
 }
 
+const spendOf = (s: ReturnType<typeof sessionSpend> extends Map<string, infer V> ? V | undefined : never): SessionIndexEntry['spend'] => ({
+  tokens: s?.own.tokens ?? 0, ...(s?.own.estimatedUsd !== undefined ? { usd: s.own.estimatedUsd } : {}),
+  workerTokens: s?.workers.tokens ?? 0, ...(s?.workers.estimatedUsd !== undefined ? { workerUsd: s.workers.estimatedUsd } : {}),
+});
+
+const kTok = (n: number) => (n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `${Math.round(n / 1e3)}k` : String(n));
+const cost = (tokens: number, usd?: number) => `${kTok(tokens)} tok${usd !== undefined ? ` ~$${usd.toFixed(2)}` : ''}`;
+
 export function formatSessionsIndex(entries: readonly SessionIndexEntry[]): string {
   if (!entries.length) return 'No coordinator sessions.';
-  return ['# Coordinator sessions', '', ...entries.map((e) => `- ${e.key} [${e.status}] ${e.topic ?? (e.firstMessage ? `"${e.firstMessage}"` : '(no topic yet)')} · last ${e.lastActivity.slice(0, 16).replace('T', ' ')}`)].join('\n');
+  const line = (e: SessionIndexEntry) => `- ${e.key} [${e.status}] ${e.topic ?? (e.firstMessage ? `"${e.firstMessage}"` : '(no topic yet)')} · ${cost(e.spend.tokens, e.spend.usd)}`
+    + `${e.spend.workerTokens ? ` + workers ${cost(e.spend.workerTokens, e.spend.workerUsd)}` : ''} · last ${e.lastActivity.slice(0, 16).replace('T', ' ')}`;
+  const tokens = entries.reduce((a, e) => a + e.spend.tokens + e.spend.workerTokens, 0);
+  const usd = entries.every((e) => e.spend.usd !== undefined) ? entries.reduce((a, e) => a + (e.spend.usd ?? 0) + (e.spend.workerUsd ?? 0), 0) : undefined;
+  return ['# Coordinator sessions', '', ...entries.map(line), '', `Total: ${cost(tokens, usd)} (estimate; the Console usage page is authoritative)`].join('\n');
 }
 
 /** Rewrites <state>/sessions/index.md when it changed; returns its path. */

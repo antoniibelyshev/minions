@@ -236,6 +236,28 @@ function figures(entries: KeyTally[], attempts: number, billing: Billing, fallba
   return { tokens, attempts, estimatedUsd: Math.round(usd * 100) / 100 };
 }
 
+/**
+ * Per coordinator session key (`thread:<id>`, `task:<id>`, `general`): its own measured tokens (every claude session it
+ * ran, resets included) and, for a task session, its task's workers. USD only with API billing.
+ */
+export function sessionSpend(db: RuntimeDb, billing: Billing, fallbackModel: string | null = null): Map<string, { own: SpendFigures; workers: SpendFigures }> {
+  const rows = usageRows(db);
+  const keyOf = new Map(rows.filter((r) => r.data.scope === 'session').map((r) => [r.data.key, (r.data as UsageEventData & { sessionKey?: unknown }).sessionKey]));
+  const own = new Map<string, KeyTally[]>();
+  const leases = new Map<string, KeyTally[]>();
+  for (const t of tally(rows)) {
+    if (t.scope === 'session') {
+      const k = keyOf.get(t.key);
+      if (typeof k === 'string') own.set(k, [...(own.get(k) ?? []), t]);
+    } else if (t.taskId) leases.set(`task:${t.taskId}`, [...(leases.get(`task:${t.taskId}`) ?? []), t]);
+  }
+  const out = new Map<string, { own: SpendFigures; workers: SpendFigures }>();
+  for (const k of new Set([...own.keys(), ...leases.keys()])) {
+    out.set(k, { own: figures(own.get(k) ?? [], 0, billing, fallbackModel), workers: figures(leases.get(k) ?? [], 0, billing, fallbackModel) });
+  }
+  return out;
+}
+
 const attemptsSince = (db: RuntimeDb, since?: string, taskId?: string): number => {
   const where: string[] = []; const p: string[] = [];
   if (since) { where.push('started_at >= ?'); p.push(since); }
