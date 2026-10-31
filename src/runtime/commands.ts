@@ -50,7 +50,7 @@ import { contextResetCheck, HANDOFF_MAX_BYTES, humanContextReset, readHandoff, T
 import { handoffPathFor, sessionScope } from './session-scope.js';
 export { withContextReset } from './context-reset.js';
 import { capacityOf, Scheduler, type NextReport, type NextStage, type RoleCapacity, type UsageFlag } from './scheduler.js';
-import { exportWorkspace, importWorkspace, setupState } from './workspace.js';
+import { deliveredTaskBranches, exportWorkspace, importWorkspace, setupState, type TaskBranch } from './workspace.js';
 import { createStateBackup, releaseRestoredLeases, restoreStateBackup } from './state-backup.js';
 import { cancelWork, formatCancel } from './controls.js';
 import { ack, counts as outboxCounts, enqueue, fail, formatCounts, formatItems, pending, type OutboxCounts } from './outbox.js';
@@ -1371,8 +1371,15 @@ export function register(program: Command): void {
   ws.command('export <outPath>').description('Write a bundle with the base branch and agent/* branches')
     .action(action(async (out: string, _o: unknown, cmd: Command) => {
       requireMode('runtime');
-      const r = await exportWorkspace(out, { base: (await getConfig()).git.baseBranch });
-      emit(r, { json: globalOpts(cmd).json, human: (d) => `Wrote ${d.path}\n${d.refs.join('\n')}` });
+      const w = await exportWorkspace(out, { base: (await getConfig()).git.baseBranch });
+      // The delivered/landed tasks' branches, so the host can name them minions/task-<id> (`minions pull`); best effort.
+      let tasks: TaskBranch[] = [];
+      try {
+        const b = await getBacklog();
+        tasks = await deliveredTaskBranches(getDb().leases({ all: true }), w.refs, async (id) => (await b.getTask(id)).status);
+      } catch { tasks = []; }
+      const r = { ...w, tasks };
+      emit(r, { json: globalOpts(cmd).json, human: (d: typeof r) => `Wrote ${d.path}\n${d.refs.join('\n')}` });
     }));
 
   // State backup/restore (host: `minions export --state` / `minions import --state`; src/runtime/state-backup.ts).

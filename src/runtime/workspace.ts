@@ -78,6 +78,25 @@ export async function exportWorkspace(outPath: string, opts: { base: string; lay
   return { path, refs };
 }
 
+/** A delivered or landed task and its agent branch, for `minions pull` (docs/design/autonomy.md Decision 13). */
+export interface TaskBranch { taskId: string; branch: string; status: 'delivered' | 'done' }
+
+/**
+ * The delivered/done tasks whose agent branch is among the exported refs: each task's latest lease branch (DB) and its
+ * backlog status. `statusOf` returning null (unknown task) skips it.
+ */
+export async function deliveredTaskBranches(leases: readonly { task_id: string; branch: string | null; started_at: string }[], exported: readonly string[], statusOf: (taskId: string) => Promise<string | null>): Promise<TaskBranch[]> {
+  const latest = new Map<string, string>();
+  for (const l of [...leases].sort((a, b) => a.started_at.localeCompare(b.started_at))) if (l.branch) latest.set(l.task_id, l.branch);
+  const out: TaskBranch[] = [];
+  for (const [taskId, branch] of latest) {
+    if (!exported.includes(`refs/heads/${branch}`)) continue;
+    const status = await statusOf(taskId).catch(() => null);
+    if (status === 'delivered' || status === 'done') out.push({ taskId, branch, status });
+  }
+  return out.sort((a, b) => a.taskId.localeCompare(b.taskId, undefined, { numeric: true }));
+}
+
 /** Idempotent: creates the /state layout, the runtime DB and the Backlog.md config. */
 export async function setupState(paths: RuntimePaths, writeBacklogConfig: (root: string) => Promise<{ path: string; changed: boolean }>): Promise<{ state: string; dirs: string[]; db: string; schemaVersion: number; backlogConfig: { path: string; changed: boolean } }> {
   const dirs = [paths.state, paths.backlog, paths.notes, paths.briefs, paths.results, paths.import, paths.exports, paths.logs];
