@@ -33,6 +33,7 @@ function fakeBot(queue: (TelegramUpdate[] | number | { status: number; descripti
     const body = init?.body ? JSON.parse(String(init.body)) as Record<string, any> : {};
     calls.push({ url: String(url), method, body });
     if (method === 'sendMessage') return json(200, { ok: true, result: { message_id: nextId++ } });
+    if (method === 'sendPoll') return json(200, { ok: true, result: { message_id: nextId++, poll: { id: `poll-${nextId - 1}` } } });
     if (method === 'getUpdates') {
       const next = queue.shift();
       if (next === undefined) return json(200, { ok: true, result: [] });
@@ -126,7 +127,7 @@ describe('main message flow', () => {
     expect(init.result.capabilities.experimental).toEqual({ 'claude/channel': {} });
     expect(init.result.serverInfo.name).toBe('minions-telegram');
     c.notify('notifications/initialized');
-    expect((await c.request('tools/list')).result.tools.map((t: { name: string }) => t.name)).toEqual(['reply']);
+    expect((await c.request('tools/list')).result.tools.map((t: { name: string }) => t.name)).toEqual(['reply', 'poll', 'close_poll']);
 
     expect(await s.pollOnce()).toBe(true);
     await new Promise((r) => setTimeout(r, 5));
@@ -325,6 +326,75 @@ describe('409 handling', () => {
     expect(s.status).toMatchObject({ active: false, reason: expect.stringContaining('rejected') });
     expect(logs.join('\n')).toContain('returned 400');
     expect(logs.join('\n')).not.toContain('AAHfaketoken');
+  });
+});
+
+describe('polls and threaded replies (autonomy.md Decision 5)', () => {
+  const answer = (update_id: number, poll_id: string, option_ids: number[], from = OWNER): TelegramUpdate =>
+    ({ update_id, poll_answer: { poll_id, option_ids, user: { id: from, username: 'owner' } } });
+
+  it('poll sends a non-anonymous sendPoll; the owner\'s vote and its retraction become notifications; close_poll stops it', async () => {
+    ownerAccess();
+    const bot = fakeBot();
+    const { s, logs } = server(bot);
+    await s.activate();
+    const c = mcpClient(s);
+    expect(JSON.stringify((await c.request('initialize', {})).result.instructions)).toMatch(/poll answer/);
+    const r = await c.request('tools/call', { name: 'poll', arguments: { question: 'Ship which?', options: ['A', 'B', 'C'], multiple: true, reply_to: '77', ref: 'task-9' } });
+    expect(JSON.parse(r.result.content[0].text)).toEqual({ poll_id: 'poll-100', message_id: 100 });
+    expect(bot.calls.find((x) => x.method === 'sendPoll')!.body).toEqual({
+      chat_id: String(OWNER), question: 'Ship which?', options: [{ text: 'A' }, { text: 'B' }, { text: 'C' }], is_anonymous: false, allows_multiple_answers: true,
+      reply_parameters: { message_id: 77, allow_sending_without_reply: true },
+    });
+    expect(JSON.parse(readFileSync(join(dir, 'channel-messages.json'), 'utf8')).messages[0].poll).toEqual({ pollId: 'poll-100', question: 'Ship which?', options: ['A', 'B', 'C'] });
+
+    bot.queue.push([answer(1, 'poll-100', [0, 2]), answer(2, 'poll-100', [], 777), answer(3, 'poll-unknown', [1]), answer(4, 'poll-100', [])]);
+    await s.pollOnce();
+    await new Promise((res) => setTimeout(res, 5));
+    expect(bot.calls.find((x) => x.method === 'getUpdates')!.body.allowed_updates).toEqual(['message', 'edited_message', 'poll_answer']);
+    const ns = c.notifications().map((n) => n.params);
+    expect(ns).toHaveLength(2);
+    expect(ns[0]).toMatchObject({
+      content: '[poll answer] Ship which?: A; C',
+      meta: { poll_id: 'poll-100', option_ids: '0,2', message_id: '100', reply_to_message_id: '100', reply_to_ref: 'task-9', user_id: String(OWNER) },
+    });
+    expect(ns[1]).toMatchObject({ content: '[poll answer] Ship which?: (vote retracted)', meta: { option_ids: '' } });
+    expect(logs.join('\n')).toMatch(/dropped a poll answer: poll voter not allowlisted[\s\S]*dropped a poll answer: unknown poll/);
+
+    expect((await c.request('tools/call', { name: 'close_poll', arguments: { poll_id: 'poll-100' } })).result.content[0].text).toMatch(/closed/);
+    expect(bot.calls.find((x) => x.method === 'stopPoll')!.body).toEqual({ chat_id: String(OWNER), message_id: 100 });
+    expect((await c.request('tools/call', { name: 'close_poll', arguments: { poll_id: 'nope' } })).result.isError).toBe(true);
+    expect((await c.request('tools/call', { name: 'poll', arguments: { question: 'Q', options: ['only'] } })).result.content[0].text).toMatch(/2 to 10/);
+    await c.close();
+  });
+
+  it('reply defaults reply_to to the owner\'s newest message (kept across a restart); an explicit reply_to wins; an edit does not move it back', async () => {
+    ownerAccess();
+    const bot = fakeBot([[dm(1, 'first'), dm(2, 'second')]]);
+    const { s } = server(bot);
+    await s.activate();
+    await s.pollOnce();
+    await s.callTool('reply', { text: 'ok' });
+    expect(bot.sends().at(-1)!.body.reply_parameters).toEqual({ message_id: 1002, allow_sending_without_reply: true });
+    bot.queue.push([{ update_id: 3, edited_message: { ...dm(1, 'first!').message!, message_id: 1001 } }]);
+    await s.pollOnce();
+    await s.callTool('reply', { text: 'explicit', reply_to: '1001' });
+    expect(bot.sends().at(-1)!.body.reply_parameters).toEqual({ message_id: 1001, allow_sending_without_reply: true });
+    expect((await s.callTool('reply', { text: 'bad', reply_to: 'x' })).isError).toBe(true);
+
+    const again = server(bot).s;
+    await again.activate();
+    await again.callTool('reply', { text: 'after restart' });
+    expect(bot.sends().at(-1)!.body.reply_parameters).toEqual({ message_id: 1002, allow_sending_without_reply: true });
+  });
+
+  it('reply without any inbound message sends no reply_parameters', async () => {
+    ownerAccess();
+    const bot = fakeBot();
+    const { s } = server(bot);
+    await s.activate();
+    await s.callTool('reply', { text: 'hello' });
+    expect(bot.sends().at(-1)!.body.reply_parameters).toBeUndefined();
   });
 });
 

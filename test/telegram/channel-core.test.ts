@@ -2,7 +2,7 @@
 // and the 409 backoff rule.
 import { describe, expect, it } from 'vitest';
 import {
-  assertAllowedChat, conflictBackoffMs, ConflictTracker, CONFLICT_BACKOFF_CAP_MS, gate, MessageMap, normalizeRef, parseAccess, toNotification, withRefFooter,
+  assertAllowedChat, conflictBackoffMs, ConflictTracker, CONFLICT_BACKOFF_CAP_MS, gate, MessageMap, normalizeRef, parseAccess, pollAnswerNotification, pollArgs, toNotification, withRefFooter,
 } from '../../src/telegram/channel/core.js';
 import type { TelegramMessage } from '../../src/telegram/bot-api.js';
 
@@ -117,5 +117,53 @@ describe('409 backoff', () => {
     expect(t.onConflict().action).toBe('retry');
     expect(t.onConflict().action).toBe('retry');
     expect(t.onConflict().action).toBe('persistent');
+  });
+});
+
+describe('polls and the reply default (autonomy.md Decision 5)', () => {
+  const withPoll = () => {
+    const map = new MessageMap(3);
+    map.record({ messageId: 50, chatId: String(OWNER), ref: '58', textHead: 'Q?', sentAt: '', poll: { pollId: 'p1', question: 'Q?', options: ['yes', 'no'] } });
+    return map;
+  };
+
+  it('pollArgs trims and checks the Telegram limits', () => {
+    expect(pollArgs({ question: ' Q? ', options: [' a', 'b '] })).toEqual({ question: 'Q?', options: ['a', 'b'], multiple: false });
+    expect(pollArgs({ question: 'Q', options: ['a', 'b'], multiple: true }).multiple).toBe(true);
+    expect(() => pollArgs({ question: '', options: ['a', 'b'] })).toThrow(/question/);
+    expect(() => pollArgs({ question: 'x'.repeat(301), options: ['a', 'b'] })).toThrow(/question/);
+    expect(() => pollArgs({ question: 'Q', options: ['a'] })).toThrow(/2 to 10/);
+    expect(() => pollArgs({ question: 'Q', options: Array.from({ length: 11 }, (_, i) => `o${i}`) })).toThrow(/2 to 10/);
+    expect(() => pollArgs({ question: 'Q', options: ['a', 'x'.repeat(101)] })).toThrow(/1 to 100/);
+    expect(() => pollArgs({ question: 'Q', options: ['a', 3] })).toThrow(/1 to 100/);
+    expect(() => pollArgs({ question: 'Q', options: ['a', 'a'] })).toThrow(/distinct/);
+    expect(() => pollArgs({ question: 'Q', options: ['a', 'b'], multiple: 'yes' })).toThrow(/multiple/);
+  });
+
+  it('pollAnswerNotification names the chosen options for the owner and drops everyone and everything else', () => {
+    const o = { access: allow, messages: withPoll(), now: NOW };
+    const r = pollAnswerNotification({ poll_id: 'p1', option_ids: [1], user: { id: OWNER, username: 'owner' } }, o);
+    expect(r).toMatchObject({ action: 'deliver', notification: { content: '[poll answer] Q?: no', meta: {
+      chat_id: String(OWNER), message_id: '50', reply_to_message_id: '50', reply_to_from: 'bot', poll_id: 'p1', option_ids: '1', reply_to_ref: '58', user: 'owner',
+    } } });
+    expect(pollAnswerNotification({ poll_id: 'p1', option_ids: [], user: { id: OWNER } }, o)).toMatchObject({ notification: { content: '[poll answer] Q?: (vote retracted)' } });
+    expect(pollAnswerNotification({ poll_id: 'p1', option_ids: [0], user: { id: 777 } }, o)).toEqual({ action: 'drop', why: 'poll voter not allowlisted' });
+    expect(pollAnswerNotification({ poll_id: 'p1', option_ids: [0], user: { id: OWNER, is_bot: true } }, o)).toMatchObject({ action: 'drop' });
+    expect(pollAnswerNotification({ poll_id: 'p1', option_ids: [0], voter_chat: { id: -1 } }, o)).toMatchObject({ action: 'drop' });
+    expect(pollAnswerNotification({ poll_id: 'p2', option_ids: [0], user: { id: OWNER } }, o)).toEqual({ action: 'drop', why: 'unknown poll' });
+    expect(pollAnswerNotification({ poll_id: 'p1', option_ids: [0], user: { id: OWNER } }, { ...o, access: { ...allow, dmPolicy: 'disabled' } })).toMatchObject({ action: 'drop' });
+  });
+
+  it('the message map keeps polls and the newest inbound id through JSON, and stays bounded', () => {
+    const map = withPoll();
+    map.noteInbound(String(OWNER), 40);
+    map.noteInbound(String(OWNER), 30);
+    expect(map.lastInbound(String(OWNER))).toBe(40);
+    const back = MessageMap.from(JSON.parse(JSON.stringify(map.toJSON())), 3);
+    expect(back.findPoll('p1')).toMatchObject({ messageId: 50, ref: '58', poll: { options: ['yes', 'no'] } });
+    expect(back.lastInbound(String(OWNER))).toBe(40);
+    for (let i = 1; i <= 3; i++) back.record({ messageId: 60 + i, chatId: String(OWNER), ref: null, textHead: '', sentAt: '' });
+    expect(back.findPoll('p1')).toBeUndefined();
+    expect(MessageMap.from({ version: 1, messages: [], lastInbound: { x: 'bad' } }).lastInbound('x')).toBeUndefined();
   });
 });

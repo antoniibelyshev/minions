@@ -47,13 +47,17 @@ export interface TelegramMessage {
   audio?: { file_id: string; file_name?: string; mime_type?: string; file_size?: number };
   video?: { file_id: string; file_name?: string; mime_type?: string; file_size?: number };
   sticker?: { file_id: string; emoji?: string };
+  poll?: { id?: string };
 }
+/** A vote in a non-anonymous poll (Bot API PollAnswer; empty option_ids: the vote was retracted). */
+export interface TelegramPollAnswer { poll_id?: string; user?: TelegramUser; voter_chat?: TelegramChat; option_ids?: number[] }
 export interface TelegramCallbackQuery { id?: string; data?: string; from?: TelegramUser; message?: TelegramMessage }
 export interface TelegramUpdate {
   update_id: number;
   message?: TelegramMessage;
   edited_message?: TelegramMessage;
   callback_query?: TelegramCallbackQuery;
+  poll_answer?: TelegramPollAnswer;
 }
 
 /** True for a forwarded message, in the current (forward_origin) or the older (forward_from, forward_date, ...) shape. */
@@ -155,6 +159,20 @@ export class BotApi {
       ...(o.keyboard ? { reply_markup: { inline_keyboard: o.keyboard } } : {}),
     }) as { message_id?: unknown } | null;
     return typeof r?.message_id === 'number' ? r.message_id : null;
+  }
+
+  /** sendPoll (non-anonymous, so answers arrive as poll_answer updates); the message and poll ids, or null when Telegram sent none. */
+  async sendPoll(chatId: number | string, question: string, options: string[], o: { multiple?: boolean; replyTo?: number } = {}): Promise<{ messageId: number; pollId: string } | null> {
+    const r = await this.callRetry('sendPoll', {
+      chat_id: chatId, question, options: options.map((text) => ({ text })), is_anonymous: false, allows_multiple_answers: o.multiple === true,
+      ...(o.replyTo !== undefined ? { reply_parameters: { message_id: o.replyTo, allow_sending_without_reply: true } } : {}),
+    }) as TelegramMessage | null;
+    return typeof r?.message_id === 'number' && typeof r.poll?.id === 'string' ? { messageId: r.message_id, pollId: r.poll.id } : null;
+  }
+
+  /** stopPoll: closes a poll the bot sent (no more votes). */
+  async stopPoll(chatId: number | string, messageId: number): Promise<void> {
+    await this.callRetry('stopPoll', { chat_id: chatId, message_id: messageId });
   }
 
   /** editMessageText (drops the buttons unless a keyboard is given). */
