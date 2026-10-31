@@ -968,7 +968,7 @@ export function register(program: Command): void {
   const autopilot = work.command('autopilot').description('The autopilot dispatcher (dispatch.mode auto): what it runs, which tasks wait for your decision, and resume a task after you handled it');
   autopilot.command('status').description('Mode, the dispatcher process, its running workers and the held tasks (each with the decision it needs)')
     .action(action(async (_o: unknown, cmd: Command) => {
-      requireMode('runtime');
+      if (runtimeMode() === 'host') return delegate(cmd);
       const d = getDb();
       const cfg = await getConfig();
       const lock = dispatcherLockState(d);
