@@ -4,7 +4,7 @@
 //   (INVALID_CONFIG / NOT_FOUND are thrown before anything is written);
 // - with expectRevision, the edit is refused (CONFLICT, nothing written) when the file's configRevision is no
 //   longer the expected one: a change planned (and confirmed) against an older config is never applied on top
-//   of a newer one (`settings set --expect-revision`, the change requests of docs/design/host-manager.md);
+//   of a newer one (`settings set --expect-revision`);
 // - configRevision is bumped and the result is validated like any config (with config.local.json);
 // - the write is atomic; the manifest hash is updated only when the file was unchanged since
 //   minions generated it (a hand-edited file stays "edited" for uninstall);

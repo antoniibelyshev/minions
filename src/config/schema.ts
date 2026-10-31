@@ -401,7 +401,7 @@ export const MinionsConfigSchema = z.object({
   /**
    * Unattended routine (docs/design/unattended-delivery.md, phase 1; src/runtime/routine.ts): a deterministic pass
    * (`minions sync --routine`: the wake decision) every `tickMinutes`, run by the
-   * coordinator wrapper's clock (the host manager is the watchdog). It wakes the coordinator with a fresh session only
+   * coordinator wrapper's clock. It wakes the coordinator with a fresh session only
    * when a model is needed. Unset = off; every unset field takes its default.
    */
   routine: z.object({

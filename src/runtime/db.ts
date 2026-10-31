@@ -48,23 +48,14 @@ export interface PublicationRow {
 export interface ApprovalRow { id: number; task_id: string; scope: string; head_sha: string; approved_by: string | null; note: string | null; recorded_at: string; signature: string | null }
 
 /**
- * A role proposal (docs/design/roles-and-workflows.md D2): drafted by the coordinator with
- * `minions config roles propose`, applied on the host with `minions config roles apply <id>`. Never effective
- * by itself. pending: waiting for the owner; applied: the host applied it; superseded: a later proposal for the
- * same role name replaced it.
- */
-export type RoleProposalState = 'pending' | 'applied' | 'superseded';
-export interface RoleProposalRow { id: string; name: string; json: string; created_at: string; state: RoleProposalState; updated_at: string; applied_revision: number | null }
-
-/**
- * A change request (docs/design/host-manager.md): a setup change the coordinator proposes from the runtime.
- * proposed: waiting for the owner; confirmed: the owner confirmed the host plan and the host is applying it;
- * applied / failed: the host's outcome; rejected: the owner said no; expired: superseded by a newer request of
- * the same kind (and key). Only the host moves a request past proposed.
+ * A change request: an upgrade the coordinator proposes from the runtime (src/runtime/change-requests.ts).
+ * proposed: waiting for the host; confirmed: the host is applying it; applied / failed: the host's outcome;
+ * rejected: the owner said no; expired: superseded by a newer request. Only the host moves a request past proposed.
+ * Rows of the removed kinds (config-set, restart) may remain in old databases; they are never listed.
  */
 export const CHANGE_REQUEST_STATUSES = ['proposed', 'confirmed', 'applied', 'failed', 'rejected', 'expired'] as const;
 export type ChangeRequestStatus = (typeof CHANGE_REQUEST_STATUSES)[number];
-export const CHANGE_REQUEST_KINDS = ['config-set', 'restart', 'upgrade'] as const;
+export const CHANGE_REQUEST_KINDS = ['upgrade'] as const;
 export type ChangeRequestKind = (typeof CHANGE_REQUEST_KINDS)[number];
 export interface ChangeRequestRow {
   id: string; kind: ChangeRequestKind; payload: string; reason: string | null; created_at: string;
@@ -152,7 +143,7 @@ const MIGRATIONS: Record<number, Migration> = {
       task_id TEXT PRIMARY KEY, workflow TEXT NOT NULL, stages_json TEXT NOT NULL,
       position INTEGER NOT NULL, updated_at TEXT NOT NULL);
   `,
-  // Role proposals (D2): stored by the runtime, applied by the host; a row never makes a role effective.
+  // Role proposals (D2; removed, the table stays in old databases).
   6: `
     CREATE TABLE IF NOT EXISTS role_proposals (
       id TEXT PRIMARY KEY, name TEXT NOT NULL, json TEXT NOT NULL, created_at TEXT NOT NULL,
@@ -593,38 +584,7 @@ export class RuntimeDb {
       taskId, workflow, JSON.stringify(stages), position, nowIso());
   }
 
-  // Role proposals (D2)
-  roleProposal(id: string): RoleProposalRow | undefined { return this.get<RoleProposalRow>('SELECT * FROM role_proposals WHERE id = ?', id); }
-  /** Pending proposals (all: every state), oldest first. */
-  roleProposals(opts: { all?: boolean } = {}): RoleProposalRow[] {
-    return opts.all
-      ? this.all<RoleProposalRow>('SELECT * FROM role_proposals ORDER BY created_at, id')
-      : this.all<RoleProposalRow>("SELECT * FROM role_proposals WHERE state = 'pending' ORDER BY created_at, id");
-  }
-  /** Stores a pending proposal; earlier pending proposals for the same role name become `superseded`. */
-  addRoleProposal(p: { id: string; name: string; json: string }): { row: RoleProposalRow; superseded: string[] } {
-    return this.transaction(() => {
-      const at = nowIso();
-      const superseded = this.all<{ id: string }>("SELECT id FROM role_proposals WHERE name = ? AND state = 'pending'", p.name).map((r) => r.id);
-      this.exec("UPDATE role_proposals SET state = 'superseded', updated_at = ? WHERE name = ? AND state = 'pending'", at, p.name);
-      this.exec("INSERT INTO role_proposals (id, name, json, created_at, state, updated_at) VALUES (?, ?, ?, ?, 'pending', ?)", p.id, p.name, p.json, at, at);
-      this.addEvent('role-proposed', null, { id: p.id, name: p.name, superseded });
-      return { row: this.roleProposal(p.id)!, superseded };
-    });
-  }
-  /** pending -> applied (idempotent for an applied row); false when the proposal is missing or superseded. */
-  markRoleProposalApplied(id: string, revision: number | null): boolean {
-    return this.transaction(() => {
-      const row = this.roleProposal(id);
-      if (!row || row.state === 'superseded') return false;
-      if (row.state === 'applied') return true;
-      this.exec("UPDATE role_proposals SET state = 'applied', applied_revision = ?, updated_at = ? WHERE id = ?", revision, nowIso(), id);
-      this.addEvent('role-applied', null, { id, name: row.name, revision });
-      return true;
-    });
-  }
-
-  // Change requests (docs/design/host-manager.md)
+  // Change requests (upgrade requests)
   changeRequest(id: string): ChangeRequestRow | undefined { return this.get<ChangeRequestRow>('SELECT * FROM change_requests WHERE id = ?', id); }
   /** Open requests (proposed, confirmed, failed: the owner may retry or reject a failed one); all: every status. Oldest first. */
   changeRequests(opts: { all?: boolean } = {}): ChangeRequestRow[] {
@@ -632,16 +592,11 @@ export class RuntimeDb {
       ? this.all<ChangeRequestRow>('SELECT * FROM change_requests ORDER BY created_at, id')
       : this.all<ChangeRequestRow>("SELECT * FROM change_requests WHERE status IN ('proposed', 'confirmed', 'failed') ORDER BY created_at, id");
   }
-  /**
-   * Stores a proposed request. Earlier open requests (proposed or failed) for the same thing (the same kind; for
-   * config-set the same key) become `expired`: the newer request replaces them.
-   */
+  /** Stores a proposed request. Earlier open requests (proposed or failed) of the same kind become `expired`: the newer one replaces them. */
   addChangeRequest(r: { id: string; kind: ChangeRequestKind; payload: Record<string, unknown>; reason: string | null }): { row: ChangeRequestRow; expired: string[] } {
     return this.transaction(() => {
       const at = nowIso();
-      const keyOf = (payload: string): unknown => { try { return (JSON.parse(payload) as { key?: unknown }).key; } catch { return undefined; } };
-      const expired = this.all<{ id: string; payload: string }>("SELECT id, payload FROM change_requests WHERE kind = ? AND status IN ('proposed', 'failed')", r.kind)
-        .filter((x) => r.kind !== 'config-set' || keyOf(x.payload) === r.payload.key).map((x) => x.id);
+      const expired = this.all<{ id: string }>("SELECT id FROM change_requests WHERE kind = ? AND status IN ('proposed', 'failed')", r.kind).map((x) => x.id);
       for (const id of expired) this.exec("UPDATE change_requests SET status = 'expired', detail = ?, updated_at = ? WHERE id = ?", `superseded by ${r.id}`, at, id);
       this.exec("INSERT INTO change_requests (id, kind, payload, reason, created_at, status, updated_at) VALUES (?, ?, ?, ?, ?, 'proposed', ?)",
         r.id, r.kind, JSON.stringify(r.payload), r.reason, at, at);

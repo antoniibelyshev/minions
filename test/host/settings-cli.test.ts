@@ -210,7 +210,7 @@ describe('settings set: what took effect now vs needs a restart or an upgrade (t
   });
 });
 
-describe('settings change requests on the host CLI (task-53.3)', () => {
+describe('settings set --expect-revision and settings requests on the host CLI', () => {
   it('set --expect-revision: a stale revision is refused with CONFLICT (exit 4) and writes nothing; the current one writes', async () => {
     const { repo, local } = await install();
     const stale = await cli(repo, ['settings', 'set', 'communication.progress', 'quiet', '--no-restart', '--expect-revision', '99', '--json']);
@@ -222,12 +222,11 @@ describe('settings change requests on the host CLI (task-53.3)', () => {
     expect(ok.code).toBe(0);
     expect(envelope(ok.out).data).toMatchObject({ written: true });
     expect((await cli(repo, ['settings', 'set', 'communication.progress', 'tasks', '--expect-revision', 'x', '--json'])).out).toMatch(/--expect-revision must be a whole number/);
-    expect((await cli(repo, ['settings', 'set', 'communication.progress', 'tasks', '--reason', 'r', '--json'])).out).toMatch(/--reason is for change requests recorded in the runtime/);
   });
 
-  it('settings requests / apply / reject need the runtime (it holds the requests); restart --dry-run restarts nothing', async () => {
+  it('settings requests needs the runtime (it holds the requests); restart --dry-run restarts nothing', async () => {
     const { repo } = await install();
-    for (const args of [['settings', 'requests'], ['settings', 'apply', 'cr_00000001'], ['settings', 'reject', 'cr_00000001']]) {
+    for (const args of [['settings', 'requests'], ['settings', 'requests', '--all']]) {
       const r = await cli(repo, [...args, '--json']);
       expect(envelope(r.out).error, args.join(' ')).toMatchObject({ code: 'PRECONDITION' });
       expect(envelope(r.out).error!.message).toMatch(/runtime is not running/);

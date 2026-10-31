@@ -14,7 +14,6 @@ export const INTEGRATION_TESTS: readonly string[] = [
   'test/env-hermetic.test.ts',
   'test/host/auth.test.ts',
   'test/host/bot-guard.test.ts',
-  'test/host/change-requests.test.ts',
   'test/host/channel.test.ts',
   'test/host/cli-backup.test.ts',
   'test/host/hardening.test.ts',

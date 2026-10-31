@@ -12,8 +12,7 @@
 // - `recreate` settings are compose, image or mount settings: `minions upgrade` applies them (container recreated;
 //   its files step copies the container limits into project.json, which compose is generated from).
 // Each setting also carries its class (live / restart / recreate) and hostOwned flag, consistent with the schema
-// classification (src/config/setting-classes.ts); a change request from the runtime (src/runtime/change-requests.ts)
-// for a hostOwned key is refused when recorded and again by the host (src/host/change-requests.ts).
+// classification (src/config/setting-classes.ts).
 // Writes go to the host-only config.local.json by default; the shared .minions/config.json (a sensitive,
 // committed path) only with an explicit `shared` choice on a shared install. Values are validated with the
 // full config schema (resolveEffective) before anything is written. Secrets are never read or shown: token

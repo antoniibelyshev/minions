@@ -184,9 +184,9 @@ export async function coordinatorView(d: RuntimeDb, paths = runtimePaths()): Pro
   return { running, lockAcquiredAt: running ? lock!.acquiredAt : null, staleLock: !!lock && !running, exit: exit ? { at: exit.at, code: exit.code, ...(exit.error ? { error: exit.error } : {}) } : null, lastRestartAt };
 }
 
-/** An upgrade the host is applying right now (a confirmed upgrade change request), or null. */
+/** An upgrade the host is applying right now (a confirmed upgrade request), or null. */
 function upgradeInProgress(d: RuntimeDb): string | null {
-  try { const u = listChangeRequests(d).find((r) => r.kind === 'upgrade' && r.status === 'confirmed'); return u ? `change request ${u.id}` : null; } catch { return null; }
+  try { const u = listChangeRequests(d).find((r) => r.kind === 'upgrade' && r.status === 'confirmed'); return u ? `upgrade request ${u.id}` : null; } catch { return null; }
 }
 
 /** The routine pass with the runtime context: real process table and detached restarts. */
@@ -381,7 +381,7 @@ export interface StatusReport {
   routine?: RoutineLast;
   /** The owner digest (task-68.5): its times, the last one and whether it was sent, held items. */
   digest?: DigestStatus;
-  /** Open change requests (proposed, confirmed, failed) waiting for the host: the manager or `minions settings apply`. */
+  /** Open upgrade requests (proposed, confirmed, failed) waiting for the host (`minions upgrade` there). */
   changeRequests?: { open: number; items: { id: string; kind: string; status: string; summary: string; createdAt: string }[] };
   /** The local integrator (local delivery; docs/design/local-auto-integration.md): lock, current run, queue, last result, problems. */
   integration?: IntegrationStatus;
@@ -484,11 +484,11 @@ export function humanStatus(s: StatusReport): string {
 
 const CHANGE_REQUESTS_SHOWN = 10;
 
-/** Change requests in `minions status`: they wait in the runtime until the host manager (or the terminal) handles them. */
+/** Upgrade requests in `minions status`: they wait in the runtime until the host applies them. */
 function humanChangeRequests(c: NonNullable<StatusReport['changeRequests']>): string[] {
   const line = (v: string, max: number) => truncateCodePoints(displayText(v).replace(/\s+/g, ' '), max);
   return [
-    `change requests: ${c.open} open (the host manager offers them; on the host: \`minions settings requests\`, \`settings apply <id>\`)`,
+    `upgrade requests: ${c.open} open (on the host: \`minions settings requests\`, then \`minions upgrade\`)`,
     ...c.items.map((r) => `  ${line(r.id, 20)} ${line(r.status, 12)} ${line(r.summary, 160)}`),
     ...(c.open > c.items.length ? [`  … ${c.open - c.items.length} more`] : []),
   ];

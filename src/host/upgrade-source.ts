@@ -476,12 +476,12 @@ export function upgradeSourceMode(o: { fromContainer: boolean; checkout: string 
   return o.checkout ? 'checkout' : 'none';
 }
 
-// ---------------------------------------------------------------- sync only (the manager's /sync)
+// ---------------------------------------------------------------- sync only
 
 export interface SyncOnlyResult { ok: boolean; steps: SourceStep[]; sync: SyncResult | null; stopped: null }
 
 /**
- * `minions upgrade --sync-only` (task-53.5.3, the manager's /sync): only the source sync, no CLI and no container
+ * `minions upgrade --sync-only` (scripts/dev/self-update.mjs): only the source sync, no CLI and no container
  * steps: export the container branches and strictly fast-forward the host base. Never forces, resets, stashes or checks out:
  * a dirty tree or a divergence refuses with the reason. A dry run reports a refusal as a failed step (ok false).
  */

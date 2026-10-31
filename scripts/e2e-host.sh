@@ -213,8 +213,9 @@ rm -rf "$EVIL" "$WORK/linked-cli"
 WH="$(cd "$W" && git -c user.name=a -c user.email=a@b -c commit.gpgsign=false commit -q --allow-empty -m "merged in the runtime" && git rev-parse HEAD)"
 RID="$("$SHIM" upgrade --from-container --reason "self-update" --json | json 'd.data.request.id')"
 "$M" export --json >/dev/null
-"$M" settings apply "$RID" --yes --json >/dev/null 2>&1
-expect_eq "$(git -C "$A" rev-parse main)" "$WH" "settings apply fast-forwarded main from the host workspace"
+"$M" upgrade --from-container --json >/dev/null 2>&1
+expect_eq "$(git -C "$A" rev-parse main)" "$WH" "upgrade --from-container fast-forwarded main from the host workspace"
+"$SHIM" settings requests mark "$RID" --status applied --json >/dev/null
 expect_eq "$("$SHIM" settings requests --all --json | json "d.data.requests.find(r=>r.id==='$RID').status")" applied "upgrade request marked applied"
 "$M" down --json >/dev/null
 
