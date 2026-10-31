@@ -86,6 +86,7 @@ function fakeDocker(w: World) {
     if (a.endsWith('exec -T app minions --version')) return w.versionResult;
     if (a.endsWith('exec -T app minions status --json')) return w.statusResult;
     if (a.endsWith('claude auth status') || a.endsWith('backlog --version')) return ok('1.0\n');
+    if (a.includes('exec -T app sh -c') && a.endsWith('/state/control/overlay.json')) return ok('{}');
     return fail();
   };
 }
@@ -194,7 +195,7 @@ describe('checkRestartRequired edge cases', () => {
 
   it('every reason kind yields required + the exact command', async () => {
     expect(RESTART_COMMAND).toBe('minions upgrade');
-    expect([...RESTART_REASON_KINDS].sort()).toEqual(['cli-version', 'coordinator-launch', 'credential-mounts', 'image']);
+    expect([...RESTART_REASON_KINDS].sort()).toEqual(['apt-packages', 'cli-version', 'coordinator-launch', 'credential-mounts', 'image']);
     const r = await check(world(ID, { versionResult: ok('0.0.9\n') }));
     expect(r).toMatchObject({ state: 'required', required: true, command: 'minions upgrade' });
     expect(r.detail).toContain('0.0.9');

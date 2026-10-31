@@ -18,7 +18,8 @@ import {
 } from './credentials.js';
 import { assertBotFree, startBotCheck } from './bot-guard.js';
 import { dockerProbe } from './discovery.js';
-import { Compose, ensureImage, packageRoot } from './docker.js';
+import { Compose, ensureAptImage, ensureImage, packageRoot, runtimeImageTag } from './docker.js';
+import { describeAptChange, formatToolsReset, planAptPackages, readControlOverlay, syncAptPackages, toolsReset } from './tools.js';
 import { applyDoctorExit, formatDoctor, runDoctor } from './doctor.js';
 import { checkPlugin, dockerUnavailable, formatInit, pluginMismatch, refreshDerived, refreshForUpgrade, runInit } from './install.js';
 import { loadEffectiveConfig, loadProjectJson, type ProjectJson } from './project.js';
@@ -151,6 +152,18 @@ async function ensureUp(json: boolean, opts: { provision?: boolean; cwd?: string
     await refreshKey(p.project.projectId, auth);
   }
   if (await ensureImage(p.project.imageTag, { onBuild: (m) => say(json, m) })) say(json, `Built ${p.project.imageTag}.`);
+  // container.aptPackages (Decision 14): the coordinator's control value or the config's; a change gives a new image tag.
+  const apt = await planAptPackages(p.project, p.config, () => readControlOverlay(p.project.projectId, p.project.imageTag, { compose: p.compose }));
+  if (apt.warning) say(json, `warning: ${apt.warning}`);
+  // A running container is never recreated for it here (that would cut off its workers): upgrade drains them first.
+  if (apt.changed && await p.compose.isRunning().catch(() => true)) {
+    say(json, `note: image rebuild pending: container.aptPackages changed (${describeAptChange(apt)}); \`minions upgrade\` applies it after draining the workers (or \`minions down\`, then \`minions start\`).`);
+  } else if (apt.changed) {
+    say(json, `Image rebuild: container.aptPackages changed (${describeAptChange(apt)}).`);
+    p.project = await syncAptPackages(p.project, apt.desired);
+    for (const w of await refreshDerived(p.project, p.config)) say(json, `warning: ${w}`);
+  }
+  if (await ensureAptImage(p.project.imageTag, p.project.container.aptPackages, { onBuild: (m) => say(json, m) })) say(json, `Built ${runtimeImageTag(p.project)}.`);
   await materialize(json, p.project.projectId);
   await upClearingSecretsOnFailure(p.compose, p.project.projectId);
   await p.compose.exec(['minions', 'workspace', 'setup', '--json'], { timeoutMs: 120_000 });
@@ -495,6 +508,8 @@ export function register(program: Command): void {
       const checkout = isMinionsCheckout(ref.repoPath) ? ref.repoPath : null;
       const mode = upgradeSourceMode({ fromContainer: o.fromContainer !== undefined, checkout });
       const flags = [...(o.timeout !== undefined ? ['--timeout', String(timeoutSec)] : []), ...(o.now ? ['--now'] : [])];
+      // container.aptPackages after the files step (Decision 14): the image step builds the derived image for them.
+      let aptPackages = project.container.aptPackages;
       const r = await runUpgrade({
         source: () => runSourcePhase({
           dryRun, handoff: process.env[HANDOFF_ENV] === '1', rebuildCli: !!o.rebuildCli, runningRoot: packageRoot(), log: (m) => say(json, m),
@@ -521,7 +536,16 @@ export function register(program: Command): void {
         }),
         projectId: project.projectId, imageTag: project.imageTag, timeoutSec, now: o.now, dryRun,
         ...(hostTarget ? { host: hostTarget } : { compose: compose!, importRepo: () => importRepo(project, { repoPath: ref.repoPath }) }),
-        refresh: () => refreshForUpgrade(project),
+        refresh: async () => {
+          if (hostRt) return refreshForUpgrade(project);
+          const apt = await planAptPackages(project, (await loadEffectiveConfig(project)).config,
+            () => readControlOverlay(project.projectId, project.imageTag, { compose: compose! }));
+          if (apt.changed) say(json, `Image rebuild: container.aptPackages changed (${describeAptChange(apt)}).`);
+          const next = apt.changed ? await syncAptPackages(project, apt.desired) : project;
+          aptPackages = next.container.aptPackages;
+          return [...(apt.warning ? [apt.warning] : []), ...await refreshForUpgrade(next)];
+        },
+        aptPackages: () => aptPackages,
         checkPlugin: async () => pluginMismatch(await checkPlugin(project, (await loadEffectiveConfig(project)).config)),
         materialize: () => materializeSecrets(project.projectId),
         log: (m) => say(json, m),
@@ -575,6 +599,23 @@ export function register(program: Command): void {
       const compose = new Compose(projectId);
       if (!dryRun) { await requireDocker(); await compose.down(); await clearSecrets(projectId); }
       emit({ projectId, runtime: 'docker', stopped: !dryRun, dryRun }, { json, human: () => dryRun ? `Would stop ${compose.name}.` : `Stopped ${compose.name}; volumes kept.` });
+    }));
+
+  const tools = program.command('tools').description('Docker runtime: the persistent tools volume (/opt/tools) where agents install toolchains');
+  tools.command('reset')
+    .description('Delete the tools volume so agent-installed toolchains start over (the container must be stopped; --yes stops it)')
+    .option('-y, --yes', 'stop a running container without asking')
+    .option('--dry-run', 'show what would be deleted')
+    .action(action(async (o: { yes?: boolean }, cmd: Command) => {
+      requireMode('host');
+      const { json, dryRun } = globalOpts(cmd);
+      const project = await loadProjectJson((await projectForPath(process.cwd())).projectId);
+      if (runtimeOf(project) === 'host') {
+        throw new MinionsError('INCOMPATIBLE_RUNTIME', '`minions tools reset` is for the Docker runtime: the host runtime uses the tools installed on this machine.', 'Remove a host toolchain with its own uninstaller.');
+      }
+      await requireDocker();
+      const r = await toolsReset(project, { yes: !!o.yes, dryRun, confirm: confirmMarked, afterStop: () => clearSecrets(project.projectId) });
+      emit(r, { json, human: formatToolsReset });
     }));
 
   program.command('import')

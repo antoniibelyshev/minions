@@ -2,7 +2,7 @@
 import { z } from 'zod';
 import { modeDefaults, toMode } from '../config/modes.js';
 import { resolve, type EffectiveConfig } from '../config/resolve.js';
-import { MODES } from '../config/schema.js';
+import { AptPackagesSchema, MODES } from '../config/schema.js';
 import { MinionsError } from '../core/errors.js';
 import { readJson, readJsonIfExists } from '../core/fsutil.js';
 import { projectPaths, repoPaths } from '../core/paths.js';
@@ -31,6 +31,8 @@ const ProjectJsonObject = z.object({
     tmpSizeMiB: z.number().int().min(64).optional(),
     publishPorts: z.array(z.object({ host: port, container: port }).strict()),
     network: z.enum(['outbound-internet', 'none']),
+    /** container.aptPackages applied to the image (sorted, unique; absent = none); runtimeImageTag in docker.ts derives the tag. */
+    aptPackages: AptPackagesSchema.optional(),
   }).strict(),
   /**
    * Claude authorization (host-only; never in shared/repository config, which the strict

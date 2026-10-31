@@ -161,6 +161,30 @@ export const shortId = (projectId: string) => projectId.slice(0, 8).toLowerCase(
 export const composeProjectName = (projectId: string) => `minions-${shortId(projectId)}`;
 export function volumeNames(projectId: string) {
   const b = composeProjectName(projectId);
-  return { workspace: `${b}-workspace`, state: `${b}-state`, claude: `${b}-claude`, cache: `${b}-cache` };
+  return { workspace: `${b}-workspace`, state: `${b}-state`, claude: `${b}-claude`, cache: `${b}-cache`, tools: `${b}-tools` };
+}
+
+/**
+ * Docker runtime: the persistent tools volume (docs/design/autonomy.md Decision 14). Agents install toolchains into it
+ * without root; the image and compose.yaml set these locations, and the worker and verification envs pass them on.
+ */
+export const TOOLS_DIR = '/opt/tools';
+export const TOOLS_ENV = {
+  CARGO_HOME: `${TOOLS_DIR}/cargo`,
+  RUSTUP_HOME: `${TOOLS_DIR}/rustup`,
+  GOPATH: `${TOOLS_DIR}/go`,
+  UV_INSTALL_DIR: `${TOOLS_DIR}/bin`,
+  UV_TOOL_DIR: `${TOOLS_DIR}/uv/tools`,
+  UV_TOOL_BIN_DIR: `${TOOLS_DIR}/bin`,
+  UV_PYTHON_INSTALL_DIR: `${TOOLS_DIR}/uv/python`,
+} as const;
+/** PATH entries of the tools volume. They come after the system directories, so an installed tool never shadows a system one. */
+export const TOOLS_PATH = [`${TOOLS_DIR}/bin`, `${TOOLS_DIR}/cargo/bin`, `${TOOLS_DIR}/go/bin`, `${TOOLS_DIR}/goroot/bin`] as const;
+/** The container PATH: the base image's, then the tools volume (docker/Dockerfile sets the same value). */
+export const CONTAINER_PATH = ['/usr/local/sbin', '/usr/local/bin', '/usr/sbin', '/usr/bin', '/sbin', '/bin', ...TOOLS_PATH].join(':');
+/** `path` with the missing TOOLS_PATH entries appended. */
+export function withToolsPath(path: string): string {
+  const have = path.split(':').filter(Boolean);
+  return [...have, ...TOOLS_PATH.filter((d) => !have.includes(d))].join(':');
 }
 export const imageTag = (packageVersion: string) => `minions-runtime:${packageVersion}`;

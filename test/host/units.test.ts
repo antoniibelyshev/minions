@@ -128,7 +128,7 @@ describe('compose generation', () => {
     expect(binds).toEqual([[p.pluginDir, '/opt/minions/plugin', 'true'], [p.runtimeDir, '/opt/minions/config', 'true'], [p.secretsDir, '/opt/minions/secrets', 'true']]);
     expect(y.match(/type: bind/g)).toHaveLength(3);
     const vols = [...y.matchAll(/- type: volume\n\s+source: (\w+)\n\s+target: "([^"]+)"/g)].map((m) => [m[1], m[2]]);
-    expect(vols).toEqual([['workspace', '/workspace'], ['state', '/state'], ['claude', '/home/node/.claude'], ['cache', '/home/node/.cache']]);
+    expect(vols).toEqual([['workspace', '/workspace'], ['state', '/state'], ['claude', '/home/node/.claude'], ['cache', '/home/node/.cache'], ['tools', '/opt/tools']]);
   });
 
   it('publishes ports only on loopback when configured', () => {

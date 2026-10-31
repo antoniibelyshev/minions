@@ -44,12 +44,20 @@ const EDIT_TOOLS = new Set(['Edit', 'Write', 'NotebookEdit', 'MultiEdit']);
 /** Tools of a project role that does not list its own (edit tools are removed again when it may not edit). */
 const DEFAULT_ROLE_TOOLS = ['Read', 'Grep', 'Glob', 'Bash', 'Edit', 'Write'];
 
+export type PluginRuntime = 'docker' | 'host';
+
+/** Missing toolchains in the container (docs/design/autonomy.md Decision 14): coordinator and engineer guidance. */
+export const COORDINATOR_TOOLS_GUIDANCE = 'Missing toolchains (Docker runtime): workers install them without root into the persistent `/opt/tools` volume, which is on PATH for workers, the verify step and the integrator: rustup with the preset `CARGO_HOME`/`RUSTUP_HOME`, a Go tarball unpacked into `/opt/tools/goroot`, `uv`, other binaries into `/opt/tools/bin`. System packages (libraries, `pkg-config`) need `minions control set container.aptPackages \'["<pkg>",...]\' --reason <why>`; the image is rebuilt only when the owner runs `minions upgrade` (or restarts the container), so tell the owner a restart is pending. A polluted toolchain is wiped by the owner with `minions tools reset`.';
+export const ENGINEER_TOOLS_GUIDANCE = '- A missing toolchain (Docker runtime): install it yourself without root into `/opt/tools` (kept across restarts; on PATH for you and for the verify step): `rustup-init -y --no-modify-path` (CARGO_HOME and RUSTUP_HOME are preset), a Go tarball unpacked into `/opt/tools/goroot`, `uv`, other binaries into `/opt/tools/bin`. A missing system package (apt) you cannot install: name it in `findings`; the coordinator adds it to the image.';
+
 export interface GenerateOptions {
   /**
    * Directory role `prompt` files are relative to: the project config dir on the host (`.minions/` for
    * shared installs, the project dir otherwise). Required only when a role names a prompt file.
    */
   configDir?: string;
+  /** Where the agents run (project.json `runtime`); default docker. The tools guidance (Decision 14) is Docker-only. */
+  runtime?: PluginRuntime;
 }
 
 /**
@@ -458,8 +466,10 @@ function roleLimits(cfg: MinionsConfig): string {
   return [limited.join(', '), rest].filter(Boolean).join('; ') || 'none';
 }
 
-function baseVars(cfg: MinionsConfig): Record<string, string> {
+function baseVars(cfg: MinionsConfig, runtime: PluginRuntime = 'docker'): Record<string, string> {
   return {
+    toolsGuidance: runtime === 'docker' ? `\n\n${COORDINATOR_TOOLS_GUIDANCE}` : '',
+    engineerToolsGuidance: runtime === 'docker' ? `\n${ENGINEER_TOOLS_GUIDANCE}` : '',
     telegramGuidance: telegramGuidance(cfg),
     outboxCheck: outboxCheck(cfg),
     digestRule: digestRule(cfg),
@@ -626,7 +636,7 @@ export async function generatePlugin(cfg: MinionsConfig, outDir: string, opts: G
   for (const f of all.filter((f) => f.startsWith(`${PARTIALS_DIR}/`))) {
     partials[f.slice(PARTIALS_DIR.length + 1).replace(/\.[^.]+$/, '')] = await readFile(join(src, f), 'utf8');
   }
-  const vars = baseVars(cfg);
+  const vars = baseVars(cfg, opts.runtime);
   const out = resolve(outDir);
   const results: GeneratedFile[] = [];
   const effortLine = (e: string | undefined) => (e ? `\neffort: ${e}` : '');

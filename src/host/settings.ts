@@ -271,6 +271,8 @@ const DECLARED: readonly DeclaredSetting[] = [
     description: 'maximum number of processes in the project container (compose pids_limit)' },
   { key: 'container.tmpSizeMiB', group: 'Container', label: 'Container /tmp size (MiB)', type: 'int', min: 64, optional: true, apply: 'recreate',
     description: 'size cap of the /tmp tmpfs (RAM, counted against the memory limit; default 1024)' },
+  { key: 'container.aptPackages', group: 'Container', label: 'Extra Debian packages', type: 'list', optional: true, apply: 'recreate',
+    description: 'Debian packages added to the runtime image (Docker runtime; `minions upgrade`, or `minions start` of a stopped container, builds the derived image). The coordinator\'s `minions control set container.aptPackages` takes precedence' },
 ];
 
 export const SETTINGS: readonly SettingDef[] = DECLARED.map(withClass);

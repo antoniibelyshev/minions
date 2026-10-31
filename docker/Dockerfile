@@ -65,10 +65,13 @@ COPY templates/ /opt/minions/pkg/templates/
 RUN chmod 0755 /opt/minions/pkg/dist/cli.js \
  && ln -s /opt/minions/pkg/dist/cli.js /usr/local/bin/minions \
  # Mount points. Named volumes copy this ownership on first creation, so they are writable by node.
+ # /opt/tools is the tools volume (docs/design/autonomy.md Decision 14): toolchains the agents install without root.
  && mkdir -p /workspace /state /home/node/.claude /home/node/.cache /opt/minions/plugin /opt/minions/config \
- && chown -R node:node /workspace /state /home/node \
+      /opt/tools/bin /opt/tools/cargo /opt/tools/rustup /opt/tools/go /opt/tools/uv \
+ && chown -R node:node /workspace /state /home/node /opt/tools \
  && test "$(id -u node)" = 1000
 
+# The tools locations and PATH: the same values as TOOLS_ENV and CONTAINER_PATH in src/core/paths.ts.
 ENV MINIONS_RUNTIME=container \
     MINIONS_CODEX_VERSION=${CODEX_VERSION} \
     CLAUDE_CONFIG_DIR=/home/node/.claude \
@@ -76,7 +79,15 @@ ENV MINIONS_RUNTIME=container \
     DISABLE_AUTOUPDATER=1 \
     BUN_INSTALL_CACHE_DIR=/home/node/.cache/bun \
     LANG=C.UTF-8 \
-    LC_ALL=C.UTF-8
+    LC_ALL=C.UTF-8 \
+    CARGO_HOME=/opt/tools/cargo \
+    RUSTUP_HOME=/opt/tools/rustup \
+    GOPATH=/opt/tools/go \
+    UV_INSTALL_DIR=/opt/tools/bin \
+    UV_TOOL_DIR=/opt/tools/uv/tools \
+    UV_TOOL_BIN_DIR=/opt/tools/bin \
+    UV_PYTHON_INSTALL_DIR=/opt/tools/uv/python \
+    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/tools/bin:/opt/tools/cargo/bin:/opt/tools/go/bin:/opt/tools/goroot/bin
 
 USER node
 WORKDIR /workspace
