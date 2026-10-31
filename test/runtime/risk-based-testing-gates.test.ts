@@ -1,9 +1,6 @@
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
-import type { MinionsConfig } from '../../src/config/schema.js';
-import type { BaseSyncResult } from '../../src/runtime/base-sync.js';
-import type { PublishInput, PublishOutcome } from '../../src/runtime/publish.js';
 import { Scheduler } from '../../src/runtime/scheduler.js';
 import { commitFile, gitSync, makeDefaultEnv, result, type Env } from './fixtures.js';
 // Unit tier: git runs on the in-memory fake (./fake-git.ts).
@@ -116,81 +113,6 @@ describe('risk-based testing: QA sweeps never commit', () => {
   });
 });
 
-describe('risk-based testing: publish gate (non-local delivery)', () => {
-  function branchEnv(mutate?: (c: MinionsConfig) => void) {
-    const env = makeDefaultEnv((c) => { c.delivery.mode = 'branch'; mutate?.(c); });
-    const calls: PublishInput[] = [];
-    const next: { outcome: PublishOutcome } = {
-      outcome: { state: 'published', mode: 'branch', push: 'pushed', pr: null, prUrl: null, repository: 'acme/demo', changedPaths: [], sensitivePaths: [] },
-    };
-    const sync = async (_repo: string, base: string): Promise<BaseSyncResult> =>
-      ({ base, originRef: `refs/remotes/origin/${base}`, from: null, to: env.baseSha, action: 'up-to-date' } as BaseSyncResult);
-    const sched = new Scheduler({
-      db: env.db, backlog: env.backlog, config: env.config, layout: env.layout, baseSync: sync,
-      publisher: async (input) => { calls.push(input); return next.outcome; },
-    });
-    return { ...env, sched, calls, next };
-  }
-  async function engineer(env: Env, file = 'a.txt') {
-    const b = await env.sched.claim('task-1', 'engineer');
-    const head = commitAt(b.worktree, file, `w ${Math.random()}`);
-    return env.sched.record(b.leaseId, result({ branch: b.branch, headSha: head, modifiedPaths: [file] }));
-  }
-
-  it('a plain task publishes after review without a tester', async () => {
-    const env = branchEnv();
-    env.backlog.add({ id: 'task-1' });
-    expect(await engineer(env)).toMatchObject({ to: 'reviewing' });
-    expect(await review(env, 'task-1')).toMatchObject({ approved: true, to: 'delivered' });
-    expect(env.calls).toHaveLength(1);
-  });
-
-  it('reviewer needsQa does not publish until a tester passed on the head', async () => {
-    const env = branchEnv();
-    env.backlog.add({ id: 'task-1' });
-    await engineer(env);
-    expect(await review(env, 'task-1', { needsQa: true })).toMatchObject({ approved: false, to: 'testing' });
-    expect(env.calls).toHaveLength(0);
-    expect(env.db.publication('task-1')).toBeFalsy();
-    await tester(env, 'task-1');
-    expect(await review(env, 'task-1')).toMatchObject({ approved: true, to: 'delivered' });
-    expect(env.calls).toHaveLength(1);
-  });
-
-  it('a sensitive-path task publishes only after the tester stage', async () => {
-    const env = branchEnv();
-    env.backlog.add({ id: 'task-1' });
-    expect(await engineer(env, 'infra/main.tf')).toMatchObject({ to: 'testing' });
-    await tester(env, 'task-1');
-    expect(await review(env, 'task-1')).toMatchObject({ approved: true, to: 'delivered' });
-    expect(env.calls).toHaveLength(1);
-  });
-
-  it('a publish retry re-checks the QA requirement (label added after approval) and refuses without tester evidence', async () => {
-    const env = branchEnv();
-    env.backlog.add({ id: 'task-1' });
-    await engineer(env);
-    env.next.outcome = { state: 'failed', code: 'NETWORK_RETRYABLE', message: 'network down', retryable: true };
-    expect(await review(env, 'task-1')).toMatchObject({ approved: true, to: 'blocked' });
-    expect(env.calls).toHaveLength(1);
-    env.backlog.tasks.get('task-1')!.labels = ['qa'];
-    env.next.outcome = { state: 'published', mode: 'branch', push: 'pushed', pr: null, prUrl: null, repository: 'acme/demo', changedPaths: [], sensitivePaths: [] };
-    const p = await env.sched.publish('task-1');
-    expect(p).toMatchObject({ state: 'failed', status: 'blocked', errorCode: 'PRECONDITION' });
-    expect(p.message).toMatch(/passing tester evidence/);
-    expect(env.calls).toHaveLength(1); // the publisher was not called again
-  });
-
-  it('testerRequired: true still gates publication on tester evidence', async () => {
-    const env = branchEnv((c) => { c.verification.testerRequired = true; });
-    env.backlog.add({ id: 'task-1' });
-    expect(await engineer(env)).toMatchObject({ to: 'testing' });
-    await tester(env, 'task-1');
-    expect(await review(env, 'task-1')).toMatchObject({ approved: true, to: 'delivered' });
-    expect(env.calls).toHaveLength(1);
-  });
-});
-
 describe('risk-based testing: fails closed when the branch diff cannot be computed', () => {
   /** Simulates an unresolvable base or failing git diff. */
   function breakDiff(sched: Scheduler) {
@@ -229,29 +151,5 @@ describe('risk-based testing: fails closed when the branch diff cannot be comput
     const rr = await review(env, 'task-1');
     expect(rr).toMatchObject({ approved: false, to: 'testing' });
     expect(rr.message).toMatch(reason);
-  });
-
-  it('publish without tester evidence is refused', async () => {
-    const env = makeDefaultEnv((c) => { c.delivery.mode = 'branch'; });
-    const calls: PublishInput[] = [];
-    const outcome: { v: PublishOutcome } = { v: { state: 'failed', code: 'NETWORK_RETRYABLE', message: 'network down', retryable: true } };
-    const sched = new Scheduler({
-      db: env.db, backlog: env.backlog, config: env.config, layout: env.layout,
-      baseSync: async (_repo: string, base: string): Promise<BaseSyncResult> =>
-        ({ base, originRef: `refs/remotes/origin/${base}`, from: null, to: env.baseSha, action: 'up-to-date' } as BaseSyncResult),
-      publisher: async (input) => { calls.push(input); return outcome.v; },
-    });
-    const e2: Env = { ...env, sched };
-    env.backlog.add({ id: 'task-1' });
-    const b = await sched.claim('task-1', 'engineer');
-    await sched.record(b.leaseId, result({ branch: b.branch, headSha: commitFile(b.worktree, 'a.txt', 'a') }));
-    expect(await review(e2, 'task-1')).toMatchObject({ approved: true, to: 'blocked' });
-    expect(calls).toHaveLength(1);
-    breakDiff(sched);
-    outcome.v = { state: 'published', mode: 'branch', push: 'pushed', pr: null, prUrl: null, repository: 'acme/demo', changedPaths: [], sensitivePaths: [] };
-    const p = await sched.publish('task-1');
-    expect(p).toMatchObject({ state: 'failed', status: 'blocked', errorCode: 'PRECONDITION' });
-    expect(p.message).toMatch(/passing tester evidence/);
-    expect(calls).toHaveLength(1);
   });
 });

@@ -1,6 +1,5 @@
 // CLI wiring of the routine pass (task-68.2): `minions sync --routine [--trigger] [--force] [--last]` through the real
-// commander program, the runtime DB and the routine event, with sync, intake, the scheduler and the detached
-// restarts stubbed (routine.test.ts covers the pass logic; this covers the flags, the deps the CLI builds, the exit
+// commander program, the runtime DB and the routine event, with the scheduler and the detached restarts stubbed (routine.test.ts covers the pass logic; this covers the flags, the deps the CLI builds, the exit
 // code and what `--last` and `status` read back). Nothing here spawns a process.
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -10,25 +9,15 @@ import { defaults } from '../helpers.js';
 import { tmp } from './fixtures.js';
 
 const h = vi.hoisted(() => ({
-  failed: 0,
-  syncCalls: 0,
   runnable: [] as { taskId: string; role: string }[],
   crashStart: vi.fn(() => ({ action: 'start-scheduled' as const, log: 'x', pid: 1, reason: 'fake crash start' })),
   wake: vi.fn(() => ({ action: 'restart-scheduled' as const, log: 'x', pid: 1, reason: 'fake wake' })),
 }));
 
 vi.mock('../../src/backlog/factory.js', async (orig) => ({ ...(await orig<object>()), openBacklog: () => ({}) }));
-vi.mock('../../src/runtime/intake-sync.js', async (orig) => ({
-  ...(await orig<object>()),
-  syncIntake: async () => ({ enabled: false, created: [], updated: [], skipped: [], errors: [] }),
-}));
 vi.mock('../../src/runtime/scheduler.js', async (orig) => ({
   ...(await orig<object>()),
-  Scheduler: class { autoMerge = async () => ({}); next = async () => ({ runnable: h.runnable }); },
-}));
-vi.mock('../../src/runtime/ci.js', async (orig) => ({
-  ...(await orig<object>()),
-  syncTasks: async () => { h.syncCalls++; return { failed: h.failed, synced: 1, tasks: [] }; },
+  Scheduler: class { next = async () => ({ runnable: h.runnable }); },
 }));
 vi.mock('../../src/runtime/coordinator.js', async (orig) => ({
   ...(await orig<object>()),
@@ -81,28 +70,21 @@ async function run(...args: string[]): Promise<string> {
 const json = async (...args: string[]) => (JSON.parse(await run('--json', ...args)) as { data: Record<string, any> }).data;
 
 describe('minions sync --routine (CLI)', () => {
-  it('rejects routine flags without --routine, task ids with --routine and an unknown trigger', async () => {
-    for (const args of [['sync', '--last'], ['sync', '--force'], ['sync', '--trigger', 'clock']]) {
-      const before = h.syncCalls;
-      const out = await run('--json', ...args);
-      expect(out).toMatch(/go with --routine[\s\S]*exit 11/);
-      expect(h.syncCalls).toBe(before);
+  it('rejects sync without --routine and an unknown trigger', async () => {
+    for (const args of [['sync'], ['sync', '--last'], ['sync', '--force'], ['sync', '--trigger', 'clock']]) {
+      expect(await run('--json', ...args)).toMatch(/only runs the routine pass: pass --routine[\s\S]*exit 11/);
     }
-    expect(await run('--json', 'sync', '--routine', 'task-1')).toMatch(/takes no task ids/);
     expect(await run('--json', 'sync', '--routine', '--trigger', 'cron')).toMatch(/--trigger must be one of clock, watchdog, manual/);
   });
 
-  it('routine off: clock and watchdog skip without syncing; a manual pass syncs, never wakes, and --last reads it', async () => {
+  it('routine off: clock and watchdog skip; a manual pass runs, never wakes, and --last reads it', async () => {
     await writeConfig();
-    const before = h.syncCalls;
     for (const trigger of ['clock', 'watchdog']) {
       const r = await json('sync', '--routine', '--trigger', trigger);
       expect(r).toMatchObject({ ran: false, skipped: 'disabled', nextAt: null });
     }
-    expect(h.syncCalls).toBe(before);
     const r = await json('sync', '--routine');
     expect(r).toMatchObject({ ran: true, trigger: 'manual', decision: { action: 'none', why: 'routine.enabled is off' } });
-    expect(h.syncCalls).toBe(before + 1);
     expect(process.exitCode).toBeUndefined();
     const last = await json('sync', '--routine', '--last');
     expect(last).toMatchObject({ enabled: false, last: { at: r.at, trigger: 'manual' }, nextAt: null });
@@ -112,15 +94,6 @@ describe('minions sync --routine (CLI)', () => {
     expect(await json('sync', '--routine', '--force')).toMatchObject({ ran: true });
     expect(h.wake).not.toHaveBeenCalled();
     expect(h.crashStart).not.toHaveBeenCalled();
-  });
-
-  it('a sync with failed PRs exits 1 but is still recorded', async () => {
-    h.failed = 1;
-    try {
-      const r = await json('sync', '--routine', '--force');
-      expect(r).toMatchObject({ ran: true, sync: { failed: 1, synced: 1 } });
-      expect(process.exitCode).toBe(1);
-    } finally { h.failed = 0; }
   });
 
   it('routine on, coordinator crashed (exit record, no lock): the CLI wires the crash start; a stop is never restarted', async () => {

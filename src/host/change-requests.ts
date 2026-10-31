@@ -32,7 +32,6 @@
 //   confirmed in the terminal: `settings apply --confirm` refuses them.
 import { spawn } from 'node:child_process';
 import type { Command } from 'commander';
-import { isGithubDelivery } from '../config/delivery.js';
 import { action, globalOpts, requireMode, runtimeMode } from '../core/cli-helpers.js';
 import { displayText } from '../core/control-chars.js';
 import { MinionsError, type ErrorCode } from '../core/errors.js';
@@ -72,10 +71,8 @@ export const RESTART_MODES: readonly string[] = ['when-idle', 'drain'];
 export const APPROVE_TASK_ID_PATTERN = /^task-\d+(?:\.\d+)*$/;
 /** The head an approval is bound to: the full 40-character lowercase commit SHA (short SHAs are refused). */
 export const APPROVE_HEAD_PATTERN = /^[0-9a-f]{40}$/;
-export type ApprovalPlanScope = 'publish' | 'merge';
-export const approvalScopeText = (scope: ApprovalPlanScope) => scope === 'merge'
-  ? 'merge (arms the merge of the delivered pull request at this exact head)'
-  : 'publish (push the branch / open the pull request for this exact head)';
+export type ApprovalPlanScope = 'merge';
+export const approvalScopeText = (_scope: ApprovalPlanScope) => 'merge (the local integration lands this exact head on the base)';
 
 export interface ChangePlan {
   requestId: string;
@@ -138,7 +135,7 @@ export interface ChangeRequestDeps {
   runtime: SettingsRuntime;
   /**
    * Runs `minions upgrade [--from-container [branch]] [--dry-run]` for the project as a child process; with syncOnly,
-   * `minions upgrade --sync-only` (the source sync only: export and strict fast-forward, or origin with GitHub delivery).
+   * `minions upgrade --sync-only` (the source sync only: export and strict fast-forward).
    */
   upgrade: (project: ProjectJson, o: { fromContainer: string | true | null; dryRun: boolean; syncOnly?: boolean; rebuildCli?: boolean }) => Promise<UpgradeRun>;
   now?: () => Date;
@@ -230,21 +227,13 @@ export async function upgradeDryRun(project: ProjectJson, req: RequestSnapshot, 
     }
     return dry;
   }
-  const fromContainer = fromContainerOf(req.payload);
-  await assertUpgradeDelivery(project, req, fromContainer);
-  const opts: UpgradeOpts = { fromContainer, dryRun: true };
+  const opts: UpgradeOpts = { fromContainer: fromContainerOf(req.payload), dryRun: true };
   const dry = await deps.upgrade(project, opts);
   if (!dry.ok) {
     throw new MinionsError('PRECONDITION', `Change request ${req.id}: \`${dryRunCommand(opts)}\` reports that the upgrade would fail: ${dryRunFailure(dry)}`,
       `Fix that first (run \`${dryRunCommand(opts)}\` on the host for the details), then apply again.`);
   }
   return dry;
-}
-
-async function assertUpgradeDelivery(project: ProjectJson, req: RequestSnapshot, fromContainer: string | true | null): Promise<void> {
-  if (fromContainer !== null && isGithubDelivery((await loadEffectiveConfig(project)).config)) {
-    throw new MinionsError('PRECONDITION', `Change request ${req.id}: --from-container is for local delivery only; this project delivers through GitHub.`, `Reject it: \`minions settings reject ${req.id}\`.`);
-  }
 }
 
 /**
@@ -345,9 +334,7 @@ export async function buildPlan(project: ProjectJson, req: RequestSnapshot, deps
   }
   if (req.kind === 'approve') return planApprove(req, base, configRevision);
   if (req.kind === 'upgrade') {
-    let dry = pre.dry;
-    if (dry) await assertUpgradeDelivery(project, req, fromContainerOf(req.payload));
-    else dry = await upgradeDryRun(project, req, deps);
+    const dry = pre.dry ?? await upgradeDryRun(project, req, deps);
     return {
       plan: {
         ...base, kind: 'upgrade', configRevision, upgradeSteps: dry.steps.map((s) => s.id), steps: [stepText(planArgv({ kind: 'upgrade', change: null, configRevision }, req))],
@@ -360,8 +347,8 @@ export async function buildPlan(project: ProjectJson, req: RequestSnapshot, deps
 }
 
 /**
- * An owner approval: a host-signed approval for exactly (taskId, full head SHA), scope publish or merge. It always
- * loosens (it authorizes a publication or a merge), so the chat asks twice. The head is checked against the task's
+ * An owner approval: a host-signed merge approval for exactly (taskId, full head SHA). It always loosens (it
+ * authorizes a landing), so the chat asks twice. The payload's `merge` flag (`/approve <task> <sha> merge`) is implied. The head is checked against the task's
  * awaiting head by the runtime's `work approve` at apply time (refused there on a mismatch, nothing recorded).
  */
 function planApprove(req: RequestSnapshot, base: Omit<ChangePlan, 'kind' | 'configRevision' | 'interrupts' | 'steps'>, configRevision: number): { plan: ChangePlan; notes: string[] } {
@@ -374,14 +361,14 @@ function planApprove(req: RequestSnapshot, base: Omit<ChangePlan, 'kind' | 'conf
       'Copy the full head SHA from the awaiting-approval message.');
   }
   if (typeof merge !== 'boolean') throw new MinionsError('PRECONDITION', `Request ${displayText(req.id)}: malformed approve payload; nothing to approve.`);
-  const scope: ApprovalPlanScope = merge ? 'merge' : 'publish';
+  const scope: ApprovalPlanScope = 'merge';
   return {
     plan: {
       ...base, kind: 'approve', configRevision,
       approval: { taskId, head, scope },
-      loosens: `signs a ${merge ? 'merge' : 'publication'} approval for ${taskId} at ${head}`,
+      loosens: `signs a merge approval for ${taskId} at ${head}`,
       interrupts: null,
-      steps: [`minions work approve ${taskId} --head ${head}${merge ? ' --merge' : ''} (signed with the host key in the host manager; the token never leaves the host)`],
+      steps: [`minions work approve ${taskId} --head ${head} (signed with the host key in the host manager; the token never leaves the host)`],
     },
     notes: [
       'the runtime refuses the approval when this is not the exact head awaiting it; nothing is recorded then',

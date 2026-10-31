@@ -131,8 +131,8 @@ export function linuxDockerChecks(facts: LinuxHostFacts, root: string = hostRoot
   if (facts.securityOptions) {
     if (rootless) {
       out.push({ name: 'docker.rootless', status: 'warn',
-        detail: `rootless Docker: container uid ${CONTAINER_UID} maps to a subordinate host uid, so it cannot read the 0600 secret files (GitHub/Telegram tokens, Claude key) you own in the mounted secrets directory`,
-        hint: 'Not supported yet for host-provisioned secrets. Use rootful Docker Engine (docker group) for projects with `minions auth github|telegram` or a host-provisioned Claude key; an interactive `/login` inside the container still works.' });
+        detail: `rootless Docker: container uid ${CONTAINER_UID} maps to a subordinate host uid, so it cannot read the 0600 secret files (Telegram token, Claude key) you own in the mounted secrets directory`,
+        hint: 'Not supported yet for host-provisioned secrets. Use rootful Docker Engine (docker group) for projects with `minions auth telegram` or a host-provisioned Claude key; an interactive `/login` inside the container still works.' });
     } else {
       out.push({ name: 'docker.rootless', status: 'ok', detail: 'rootful Docker Engine' });
     }
@@ -148,7 +148,7 @@ export function linuxDockerChecks(facts: LinuxHostFacts, root: string = hostRoot
       const why = facts.secretsAccess?.mode === 'unsupported' ? `: ${facts.secretsAccess.reason}` : '';
       out.push({ name: 'docker.uid', status: 'warn',
         detail: `host uid ${facts.uid} differs from the container user (uid ${CONTAINER_UID}) and the secrets cannot be shared through a private group${why}. Docker Engine keeps host ownership on bind mounts, so the 0600 secret files you own are unreadable in the container`,
-        hint: `Host-provisioned secrets (GitHub/Telegram tokens, Claude key) need either a host uid of ${CONTAINER_UID} or a private primary group (same name as your user, no other member; the default for \`useradd\` with USERGROUPS_ENAB on Ubuntu/Fedora). An interactive \`/login\` inside the container still works. minions never chowns the secrets to uid ${CONTAINER_UID} and never grants it ACLs, because on the host that uid may be another user.` });
+        hint: `Host-provisioned secrets (Telegram token, Claude key) need either a host uid of ${CONTAINER_UID} or a private primary group (same name as your user, no other member; the default for \`useradd\` with USERGROUPS_ENAB on Ubuntu/Fedora). An interactive \`/login\` inside the container still works. minions never chowns the secrets to uid ${CONTAINER_UID} and never grants it ACLs, because on the host that uid may be another user.` });
     }
   }
   if (facts.selinux === 'enforcing') {

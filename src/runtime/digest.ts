@@ -160,7 +160,7 @@ export function digestStatus(db: RuntimeDb, cfg: Pick<MinionsConfig, 'routine'>,
 
 // ---------------------------------------------------------------- composition
 
-export type DigestTask = Pick<Task, 'id' | 'title' | 'status' | 'prUrl' | 'priority'>;
+export type DigestTask = Pick<Task, 'id' | 'title' | 'status' | 'priority'>;
 
 export interface DigestInput {
   now: Date;
@@ -173,9 +173,9 @@ export interface DigestInput {
   items: OutboxItem[];
   /** The backlog (null when it could not be read). */
   tasks: DigestTask[] | null;
-  merged: { taskId: string; prUrl: string | null; at: string }[];
+  merged: { taskId: string; at: string }[];
   /** Publications and merges waiting for a host-signed approval (the manager chat's /approve). */
-  approvals: { taskId: string; head: string; scope: 'publish' | 'merge' }[];
+  approvals: { taskId: string; head: string }[];
   /**
    * Local integration (task-82.4) since `since`: failed integrations (conflict, red, refused: sent back for a repair;
    * transient: blocked) and landings whose verification passed only on a rerun (flaky). Absent: none.
@@ -250,11 +250,11 @@ export function composeDigest(i: DigestInput): Digest {
   const all = [...tasks.values()].sort((a, b) => byId(a.id, b.id));
 
   const merged = [...new Map([...i.merged].sort((a, b) => (a.at < b.at ? -1 : 1)).map((m) => [m.taskId, m])).values()].sort((a, b) => byId(a.taskId, b.taskId));
-  const approvals = [...i.approvals].sort((a, b) => byId(a.taskId, b.taskId) || a.scope.localeCompare(b.scope));
+  const approvals = [...i.approvals].sort((a, b) => byId(a.taskId, b.taskId));
   // Display order: what the owner acts on first (approvals, blockers), then what they read; questions last, next to
   // the answer hint.
   add('Waiting for you', [
-    ...approvals.map((a) => ({ text: `- ${title(a.taskId)}: ${a.scope === 'merge' ? 'merge' : 'publish'} approval, send in the manager chat: /approve ${a.taskId} ${a.head}${a.scope === 'merge' ? ' merge' : ''}`, key: null })),
+    ...approvals.map((a) => ({ text: `- ${title(a.taskId)}: merge approval, send in the manager chat: /approve ${a.taskId} ${a.head} merge`, key: null })),
     ...all.filter((t) => t.status === 'awaiting-human').map((t) => ({ text: `- ${title(t.id)}: needs your answer${qOf.has(t.id) ? ` (Q${qOf.get(t.id)})` : ''}`, key: null })),
     ...ofKind('approval').map((x) => ({ text: `- ${oneLine(x.text)}`, key: x.key })),
   ]);
@@ -262,9 +262,9 @@ export function composeDigest(i: DigestInput): Digest {
     ...all.filter((t) => t.status === 'blocked').map((t) => ({ text: `- ${title(t.id)} (blocked)`, key: null })),
     ...ofKind('blocker').map((x) => ({ text: `- ${oneLine(x.text)}`, key: x.key })),
   ]);
-  add('Merged', merged.map((m) => ({ text: `- ${title(m.taskId)}${m.prUrl ? ` ${m.prUrl}` : ''}`, key: null })));
-  add('Delivered, waiting for CI or merge', all.filter((t) => ['delivered', 'awaiting-ci', 'merging'].includes(t.status) && !heldDelivered.has(t.id))
-    .map((t) => ({ text: `- ${title(t.id)}${t.status !== 'delivered' ? ` (${t.status})` : ''}${t.prUrl ? ` ${t.prUrl}` : ''}`, key: null })));
+  add('Merged', merged.map((m) => ({ text: `- ${title(m.taskId)}`, key: null })));
+  add('Delivered, waiting for a merge', all.filter((t) => ['delivered', 'awaiting-ci', 'merging'].includes(t.status) && !heldDelivered.has(t.id))
+    .map((t) => ({ text: `- ${title(t.id)}${t.status !== 'delivered' ? ` (${t.status})` : ''}`, key: null })));
   const integ = [...new Map([...(i.integration ?? [])].sort((a, b) => (a.at < b.at ? -1 : 1)).map((x) => [`${x.taskId}:${x.outcome === 'flaky' ? 'flaky' : 'fail'}`, x])).values()]
     .sort((a, b) => byId(a.taskId, b.taskId) || a.outcome.localeCompare(b.outcome));
   add('Integration', integ.map((x) => ({ text: `- ${title(x.taskId)}: ${x.outcome === 'flaky' ? 'merged, but a test passed only on its rerun (flaky; follow-up)' : x.outcome === 'transient' ? 'integration failed twice (transient), blocked' : `integration ${x.outcome}, sent back for a repair`}${x.detail ? ` - ${oneLine(x.detail, 160)}` : ''}`, key: null })));
@@ -364,16 +364,8 @@ export function digestInput(db: RuntimeDb, cfg: DigestConfig, src: DigestSources
   const items = pending(db, { includeWaiting: true }, () => now).filter((x) => x.kind !== 'digest');
 
   const merged: DigestInput['merged'] = [];
-  for (const e of db.eventsOfKindSince('ci-observation', since)) {
-    const d = e.data as { statusChange?: { to?: string } | null; prUrl?: string } | null;
-    if (e.taskId && d?.statusChange?.to === 'done') merged.push({ taskId: e.taskId, prUrl: d.prUrl ?? null, at: e.at });
-  }
-  for (const e of db.eventsOfKindSince('merge', since)) {
-    const d = e.data as { state?: string; prUrl?: string } | null;
-    if (e.taskId && d?.state === 'merged') merged.push({ taskId: e.taskId, prUrl: d.prUrl ?? null, at: e.at });
-  }
   // Local integration (task-82.4): a landing on the local base is a merge; failures and flaky landings get a line.
-  for (const e of db.eventsOfKindSince('integrated', since)) if (e.taskId) merged.push({ taskId: e.taskId, prUrl: null, at: e.at });
+  for (const e of db.eventsOfKindSince('integrated', since)) if (e.taskId) merged.push({ taskId: e.taskId, at: e.at });
   const integration: NonNullable<DigestInput['integration']> = [];
   for (const outcome of ['conflict', 'red', 'refused', 'transient'] as const) {
     for (const e of db.eventsOfKindSince(`integration-${outcome}`, since)) {
@@ -386,17 +378,10 @@ export function digestInput(db: RuntimeDb, cfg: DigestConfig, src: DigestSources
     if (e.taskId) integration.push({ taskId: e.taskId, outcome: 'flaky', detail: d?.commands?.length ? d.commands.join(', ') : null, at: e.at });
   }
 
-  const statusOf = new Map((src.tasks ?? []).map((t) => [t.id, t.status]));
   const approvals: DigestInput['approvals'] = [];
-  // A local publication waiting for approval is a local integration: it needs a merge approval (task-82.4).
-  for (const p of db.all<{ task_id: string; head_sha: string; mode: string }>("SELECT task_id, head_sha, mode FROM publications WHERE state = 'awaiting-approval'")) {
-    approvals.push({ taskId: p.task_id, head: p.head_sha, scope: p.mode === 'local' ? 'merge' : 'publish' });
-  }
-  const lastMerge = new Map<string, { state?: string; head?: string }>();
-  for (const e of db.eventsOfKindSince('merge', weekAgo)) if (e.taskId) lastMerge.set(e.taskId, e.data as { state?: string; head?: string });
-  for (const [taskId, d] of lastMerge) {
-    const status = statusOf.get(taskId);
-    if (d?.state === 'awaiting-approval' && d.head && (!src.tasks || status === 'delivered' || status === 'awaiting-ci' || status === 'merging')) approvals.push({ taskId, head: d.head, scope: 'merge' });
+  // A local integration waiting for approval needs a merge approval (task-82.4).
+  for (const p of db.all<{ task_id: string; head_sha: string }>("SELECT task_id, head_sha FROM publications WHERE mode = 'local' AND state = 'awaiting-approval'")) {
+    approvals.push({ taskId: p.task_id, head: p.head_sha });
   }
 
   // One window for every spend figure: `since` (as merged), not the UTC or the local day.

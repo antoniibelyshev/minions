@@ -41,8 +41,8 @@ export function resolveReal(p: string, hops = 0): string {
 
 /**
  * `secretsDir` (task-96), when given, is protected like the state: the host-provisioned secrets (Claude key, headless
- * Claude token, GitHub and Telegram tokens) are read by minions itself, Claude Code's apiKeyHelper and the git
- * credential helper, never by a worker's tool call. runtimePaths() always has it, so the hooks protect it.
+ * Claude token, Telegram token) are read by minions itself and Claude Code's apiKeyHelper, never by a worker's tool
+ * call. runtimePaths() always has it, so the hooks protect it.
  */
 export function stateGuard(paths: Pick<RuntimePaths, 'state' | 'tmp'> & Partial<Pick<RuntimePaths, 'secretsDir'>> = runtimePaths()): StateGuard {
   const both = (p: string) => [...new Set([strip(posix.normalize(p)), strip(resolveReal(p))])];

@@ -31,8 +31,6 @@ export interface BacklogMdOptions {
    * a failed probe, lists through `task view`.
    */
   cliVersion?: string | null;
-  /** Provenance of a task whose meta block is missing, malformed or has no valid provenance (see toTask). */
-  provenanceFallback?: ProvenanceFallback;
   /**
    * Runs one Backlog.md CLI call (default: core/exec `run`, a real subprocess). Unit tests inject an in-process
    * fake CLI so the adapter's argument mapping, error mapping and listing paths run without spawning (task-137.2.3).
@@ -43,12 +41,6 @@ export interface BacklogMdOptions {
 /** Same contract as core/exec `run` with `allowFailure: true`: resolves with the exit code, never rejects on failure. */
 export type BacklogExec = (cmd: string, args: string[], opts: RunOptions) => Promise<RunResult>;
 
-/**
- * Provenance for a task without a usable meta provenance; undefined keeps DEFAULT_PROVENANCE. The runtime
- * maps tasks that GitHub intake tracks to `external-requirement`, so a lost meta block never upgrades an
- * imported issue to the most trusted value.
- */
-export type ProvenanceFallback = (taskId: string) => Provenance | undefined;
 
 export const TASK_STATUSES: readonly TaskStatus[] = ['idea', 'ready', 'implementing', 'testing', 'reviewing',
   'changes-requested', 'awaiting-human', 'awaiting-ci', 'merging', 'done', 'delivered', 'blocked', 'cancelled'];
@@ -59,7 +51,7 @@ const DEFAULT_PROVENANCE: Provenance = 'user-decision';
 
 export interface MinionsMeta {
   provenance?: Provenance; branch?: string | null; externalLinks?: string[];
-  commits?: string[]; prUrl?: string | null; workflow?: string; [k: string]: unknown;
+  commits?: string[]; workflow?: string; [k: string]: unknown;
 }
 
 const META_OPEN = '<!-- minions:meta ';
@@ -189,20 +181,10 @@ export function boundNotes(text: unknown, max = NOTES_MAX_CHARS): string | null 
   return `[... ${start} earlier characters of notes omitted ...]\n${t.slice(start)}`;
 }
 
-export function toTask(raw: RawTask, opts: { startReady?: boolean; provenanceFallback?: ProvenanceFallback; notes?: boolean } = {}): Task {
+export function toTask(raw: RawTask, opts: { startReady?: boolean; notes?: boolean } = {}): Task {
   const { user, meta } = parseDescription(raw.description);
   const id = normalizeId(raw.id);
-  let provenance: Provenance;
-  if (PROVENANCES.includes(meta.provenance as Provenance)) {
-    provenance = meta.provenance as Provenance;
-  } else {
-    try {
-      provenance = opts.provenanceFallback?.(id) ?? DEFAULT_PROVENANCE;
-    } catch {
-      // If the fallback throws, use the default provenance
-      provenance = DEFAULT_PROVENANCE;
-    }
-  }
+  const provenance: Provenance = PROVENANCES.includes(meta.provenance as Provenance) ? meta.provenance as Provenance : DEFAULT_PROVENANCE;
   const labels = raw.labels ?? [];
   const strArr = (v: unknown) => (Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : []);
   return {
@@ -220,7 +202,6 @@ export function toTask(raw: RawTask, opts: { startReady?: boolean; provenanceFal
     authorized: labels.includes(AUTHORIZED_LABEL) || !!opts.startReady,
     branch: typeof meta.branch === 'string' ? meta.branch : null,
     commits: strArr(meta.commits),
-    prUrl: typeof meta.prUrl === 'string' ? meta.prUrl : null,
     provenance,
     version: taskVersion(raw),
     milestone: raw.milestone ?? null,
@@ -240,7 +221,6 @@ export class BacklogMdAdapter implements BacklogAdapter {
   private readonly startReady: boolean;
   private readonly timeoutMs: number;
   private readonly concurrency: number;
-  private readonly provenanceFallback?: ProvenanceFallback;
   private readonly readFiles: boolean;
   private readonly exec: BacklogExec;
   private initialized = false;
@@ -256,7 +236,6 @@ export class BacklogMdAdapter implements BacklogAdapter {
     this.startReady = !!opts.startReady;
     this.timeoutMs = opts.timeoutMs ?? 30_000;
     this.concurrency = Math.max(1, opts.concurrency ?? 4);
-    this.provenanceFallback = opts.provenanceFallback;
     this.readFiles = opts.readFiles ?? true;
     this.exec = opts.exec ?? run;
     if (opts.cliVersion !== undefined) this.version = Promise.resolve(opts.cliVersion);
@@ -351,7 +330,7 @@ export class BacklogMdAdapter implements BacklogAdapter {
     return out;
   }
 
-  private task(raw: RawTask, notes = false): Task { return toTask(raw, { startReady: this.startReady, provenanceFallback: this.provenanceFallback, notes }); }
+  private task(raw: RawTask, notes = false): Task { return toTask(raw, { startReady: this.startReady, notes }); }
 
   /** Views ids with bounded concurrency; failed lookups are undefined when tolerant. */
   private async viewMany(ids: string[], tolerant: boolean): Promise<(RawTask | undefined)[]> {
@@ -455,13 +434,11 @@ export class BacklogMdAdapter implements BacklogAdapter {
     }
     const descChanged = patch.description !== undefined && patch.description.trim() !== cur.description;
     const branchChanged = 'branch' in patch && patch.branch !== undefined && patch.branch !== cur.branch;
-    const prUrlChanged = 'prUrl' in patch && patch.prUrl !== undefined && patch.prUrl !== cur.prUrl;
     const workflowChanged = patch.workflow !== undefined && (patch.workflow ?? undefined) !== cur.workflow;
-    if (descChanged || branchChanged || prUrlChanged || workflowChanged) {
+    if (descChanged || branchChanged || workflowChanged) {
       const parsed = parseDescription(raw.description);
       const meta: MinionsMeta = { provenance: cur.provenance, ...parsed.meta };
       if (branchChanged) meta.branch = patch.branch ?? null;
-      if (prUrlChanged) meta.prUrl = patch.prUrl ?? null;
       if (workflowChanged) { if (patch.workflow) meta.workflow = patch.workflow; else delete meta.workflow; }
       const desc = descChanged ? composeDescription(patch.description!, meta) : replaceMeta(raw.description ?? '', meta);
       args.push(`--description=${desc}`);

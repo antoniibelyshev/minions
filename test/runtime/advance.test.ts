@@ -270,21 +270,11 @@ describe('recordDecision on synthetic records', () => {
   it.each([
     ['awaiting-human', { publication: { state: 'awaiting-approval' } }],
     ['publication', { publication: { state: 'failed' } }],
-    ['publication', { publication: { state: 'pending' } }],
-    ['awaiting-human', { publication: { state: 'published', merge: { state: 'awaiting-approval', reasons: ['needs owner'] } } }],
-    ['publication', { publication: { state: 'published', merge: { state: 'failed', reasons: [] } } }],
-    ['publication', { publication: { state: 'published', merge: { state: 'denied', reasons: ['no'] } } }],
+    ['publication', { publication: { state: 'queued' } }],
     ['awaiting-human', { to: 'awaiting-human' }],
-    ['ci-unverified', { ciBlocked: 'unverified' }],
-    [null, { ciBlocked: 'fail', to: 'changes-requested' }],
-    [null, { publication: { state: 'published', merge: { state: 'waiting', reasons: [] } } }],
-    [null, { publication: { state: 'published', merge: { state: 'armed', reasons: [] } } }],
-    [null, { publication: { state: 'published', merge: { state: 'off', reasons: [] } } }],
+    [null, { to: 'changes-requested' }],
+    [null, { publication: { state: 'published' } }],
   ] as const)('%s for %j', (kind, over) => { expect(kindOf(over as Record<string, unknown>)).toBe(kind); });
-  it('uses merge reasons as the message', () => {
-    const d = recordDecision(env.sched, rec({ publication: { state: 'published', merge: { state: 'awaiting-approval', reasons: ['needs owner'] } } }), {});
-    expect(d?.message).toBe('needs owner');
-  });
 });
 
 describe('work advance is coordinator-only', () => {

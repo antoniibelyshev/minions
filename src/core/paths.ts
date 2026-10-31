@@ -77,11 +77,10 @@ export function projectPaths(projectId: string) {
     credentialsJson: join(dir, 'credentials.json'),
     /**
      * Host-provisioned secret files (dir 0700, files 0600), bind-mounted read-only as a directory at
-     * /opt/minions/secrets: the Claude key copy plus materialized GitHub/Telegram tokens and the Codex key.
+     * /opt/minions/secrets: the Claude key copy plus the materialized Telegram token and Codex key.
      */
     secretsDir: join(dir, 'secrets'),
     apiKeyFile: join(dir, 'secrets', 'anthropic-api-key'),
-    githubTokenFile: join(dir, 'secrets', 'github-token'),
     telegramTokenFile: join(dir, 'secrets', 'telegram-bot-token'),
     codexKeyFile: join(dir, 'secrets', 'codex-api-key'),
     /** Headless Claude token (`claude setup-token`, login method) for `minions coordinator live-run`; materialized like the others. */
@@ -118,10 +117,9 @@ export function hostRuntimePaths(projectId: string) {
     exports: join(root, 'transfer', 'exports'),
     /** Logs written by unsandboxed hook processes (MINIONS_LOG_DIR); outside the agent-writable dirs. */
     logs: join(root, 'logs'),
-    /** PATH shims: `minions` (pins the runtime environment) and the `gh` token wrapper. */
+    /** PATH shim: `minions` (pins the runtime environment). */
     bin: join(root, 'bin'),
     minionsShim: join(root, 'bin', 'minions'),
-    ghShim: join(root, 'bin', 'gh'),
     /**
      * Dedicated tmux server socket name (`tmux -L`), so the user's own tmux server is never touched.
      * tmux keeps it in its private per-user directory (/tmp/tmux-<uid>, 0700, ownership-checked);
@@ -147,7 +145,6 @@ export function containerPaths(root = process.env.MINIONS_CONTAINER_ROOT ?? '') 
     coordinatorPrompt: p('/opt/minions/plugin/coordinator.md'),
     configDir: p('/opt/minions/config'),
     secretsDir: p('/opt/minions/secrets'),
-    githubTokenFile: p('/opt/minions/secrets/github-token'),
     telegramTokenFile: p('/opt/minions/secrets/telegram-bot-token'),
     /** OpenAI API key for Codex process workers; read only by the process runner (agent-runtimes D5). */
     codexKeyFile: p('/opt/minions/secrets/codex-api-key'),
@@ -182,11 +179,6 @@ export function containerPaths(root = process.env.MINIONS_CONTAINER_ROOT ?? '') 
 }
 export const CONTAINER = containerPaths('');
 
-/**
- * In-container path of the GitHub token (read-only). The directory is bind-mounted, not the file,
- * so atomic host-side replacements (new inode) stay visible to a running container.
- */
-export const GITHUB_TOKEN_CONTAINER_PATH = CONTAINER.githubTokenFile;
 /** In-container path of the Telegram bot token (read-only; read only by `minions coordinator run`). */
 export const TELEGRAM_TOKEN_CONTAINER_PATH = CONTAINER.telegramTokenFile;
 

@@ -89,13 +89,13 @@ function chat(cmds: ManagerCommands, texts: string[]) {
 // ---------------------------------------------------------------- closest keys
 
 describe('closest keys for an unknown setting', () => {
-  it('a key that is part of a real key finds it first (pr.merge -> capabilities.pr.merge); typos by edit distance; nonsense finds nothing', () => {
-    expect(S.closestSettingKeys('pr.merge')[0]).toBe('capabilities.pr.merge');
-    expect(S.closestSettingKeys('merge')).toEqual(expect.arrayContaining(['delivery.merge', 'capabilities.pr.merge']));
-    expect(S.closestSettingKeys('delivery.mod')[0]).toBe('delivery.mode');
+  it('a key that is part of a real key finds it first (base.merge -> capabilities.base.merge); typos by edit distance; nonsense finds nothing', () => {
+    expect(S.closestSettingKeys('base.merge')[0]).toBe('capabilities.base.merge');
+    expect(S.closestSettingKeys('merge')).toEqual(expect.arrayContaining(['delivery.merge', 'capabilities.base.merge']));
+    expect(S.closestSettingKeys('delivery.merg')[0]).toBe('delivery.merge');
     expect(S.closestSettingKeys('execution.maxActivTasks')).toEqual(['execution.maxActiveTasks']);
     expect(S.closestSettingKeys('maxActiveTask')).toEqual(['execution.maxActiveTasks']);
-    expect(S.closestSettingKeys('DELIVERY.MODE')[0]).toBe('delivery.mode');
+    expect(S.closestSettingKeys('DELIVERY.MERGE')[0]).toBe('delivery.merge');
     expect(S.closestSettingKeys('zzz')).toEqual([]);
     expect(S.closestSettingKeys('')).toEqual([]);
     expect(S.closestSettingKeys('capabilities').length).toBe(3); // at most 3
@@ -105,9 +105,9 @@ describe('closest keys for an unknown setting', () => {
     let err: (Error & { code?: string; hint?: string; details?: any }) | undefined;
     try { S.requireSetting('pr.merge'); } catch (e) { err = e as typeof err; }
     expect(err?.code).toBe('INVALID_CONFIG');
-    expect(err?.message).toBe('Unknown setting: pr.merge. Did you mean: capabilities.pr.merge, capabilities.base.merge, delivery.merge?');
+    expect(err?.message).toBe('Unknown setting: pr.merge. Did you mean: capabilities.base.merge, delivery.merge?');
     expect(err?.hint).toContain('minions settings --list');
-    expect(err?.details).toEqual({ path: 'pr.merge', suggestions: ['capabilities.pr.merge', 'capabilities.base.merge', 'delivery.merge'] });
+    expect(err?.details).toEqual({ path: 'pr.merge', suggestions: ['capabilities.base.merge', 'delivery.merge'] });
     expect(() => S.requireSetting('zzz')).toThrow(/^Unknown setting: zzz$/);
   });
 });
@@ -126,7 +126,7 @@ describe('formatSettingsList', () => {
     view({ key: 'delivery.merge', group: 'Delivery', type: 'enum', value: 'disabled', hostOwned: true }),
     view({ key: 'models.default', group: 'Models', type: 'model', value: 'opus', source: 'local override', apply: 'launch', class: 'restart', needsRestart: true }),
     view({ key: 'container.cpus', group: 'Container', type: 'number', value: 2, apply: 'recreate', class: 'recreate', needsUpgrade: true }),
-    view({ key: 'secrets.github', group: 'Integrations', type: 'secret', value: 'provisioned', source: 'credential store', hostOwned: true }),
+    view({ key: 'secrets.codex', group: 'Integrations', type: 'secret', value: 'provisioned', source: 'credential store', hostOwned: true }),
     view({ key: 'secrets.telegram', group: 'Integrations', type: 'secret', value: 'missing', source: 'credential store', hostOwned: true }),
   ];
 
@@ -137,7 +137,7 @@ describe('formatSettingsList', () => {
     expect(text).toContain('  models.default = opus (local override; restart)\n');
     expect(text).not.toMatch(/models\.default.*host-owned/);
     expect(text).toContain('  container.cpus = 2 (profile default; upgrade)');
-    expect(text).toContain('  secrets.github = set (credential store; minions auth github) [host-owned]');
+    expect(text).toContain('  secrets.codex = set (credential store; minions auth codex) [host-owned]');
     expect(text).toContain('  secrets.telegram = unset (credential store; minions auth telegram) [host-owned]');
     expect(text).not.toContain('provisioned');
     expect(text).toContain('Change one with /set <key> <value> [shared].');
@@ -150,16 +150,16 @@ describe('formatSettingsList', () => {
     expect(g).not.toContain('models.default');
     const k = T.formatSettingsList(P, all, 'secrets.');
     expect(k).toContain('(2 of 6)');
-    expect(k).toContain('secrets.github');
+    expect(k).toContain('secrets.codex');
     expect(k).not.toContain('delivery.mode');
     const m = T.formatSettingsList(P, all, 'merge');
     expect(m).toContain('(1 of 6)');
   });
 
   it('no match: the closest keys and the groups', () => {
-    const text = T.formatSettingsList(P, all, 'delivery.mod3');
-    expect(text).toContain('No setting matches "delivery.mod3".');
-    expect(text).toContain('Closest keys: delivery.mode');
+    const text = T.formatSettingsList(P, all, 'delivery.merg3');
+    expect(text).toContain('No setting matches "delivery.merg3".');
+    expect(text).toContain('Closest keys: delivery.merge');
     expect(text).toContain('Groups: delivery, verification,');
   });
 
@@ -192,15 +192,15 @@ describe('/settings in the manager chat', () => {
     const { cmds, runs } = manager([project]);
     const r = await cmds.settings!(null);
     expect(r.projectId).toBe(project.projectId);
-    expect(r.settings.map((v) => v.key)).toEqual(expect.arrayContaining(['delivery.mode', 'capabilities.pr.merge', 'secrets.github']));
-    const c = chat(cmds, ['/settings', '/settings delivery', '/settings pr.merge', '/help']);
+    expect(r.settings.map((v) => v.key)).toEqual(expect.arrayContaining(['delivery.merge', 'capabilities.base.merge', 'secrets.telegram']));
+    const c = chat(cmds, ['/settings', '/settings delivery', '/settings base.merge', '/help']);
     await c.run();
-    const mode = (await loadEffectiveConfig(project)).config.delivery.mode;
+    const mode = (await loadEffectiveConfig(project)).config.delivery.merge;
     expect(c.sent[0]).toContain('Settings of repo (');
     expect(c.sent[0]!.length).toBeLessThanOrEqual(T.MESSAGE_MAX_CHARS);
-    expect(c.sent[1]).toMatch(new RegExp(`delivery\\.mode = ${mode} \\([a-z ]+; restart\\) \\[host-owned\\]`));
+    expect(c.sent[1]).toMatch(new RegExp(`delivery\\.merge = ${mode} \\([a-z ]+; restart\\) \\[host-owned\\]`));
     expect(c.sent[1]).not.toContain('models.default');
-    expect(c.sent[2]).toContain('capabilities.pr.merge = ');
+    expect(c.sent[2]).toContain('capabilities.base.merge = ');
     expect(c.sent[2]).toContain('[host-owned]');
     expect(c.sent.join('\n')).not.toMatch(/secrets\.\w+ = (?!set|unset)/);
     expect(c.sent[3]).toBe(T.HELP_TEXT);
@@ -239,7 +239,7 @@ describe('/set: unknown keys and values already in effect', () => {
     const { cmds } = manager([project]);
     const c = chat(cmds, ['/set pr.merge allow']);
     await c.run();
-    expect(c.sent[0]).toContain('/set failed: Unknown setting: pr.merge. Did you mean: capabilities.pr.merge');
+    expect(c.sent[0]).toContain('/set failed: Unknown setting: pr.merge. Did you mean: capabilities.base.merge');
     expect(journal()).toEqual([]);
   });
 
@@ -247,22 +247,22 @@ describe('/set: unknown keys and values already in effect', () => {
     const project = await install();
     const { cmds, runs } = manager([project]);
     const cfg = (await loadEffectiveConfig(project)).config;
-    const mode = cfg.delivery.mode;
-    const def = S.settingDef('delivery.mode')!;
-    const source = (await S.listSettings(await S.loadSettingsContext(project))).find((v) => v.key === 'delivery.mode')!.source;
-    const c = chat(cmds, [`/set delivery.mode ${mode}`, `/set execution.maxActiveTasks ${cfg.execution.maxActiveTasks}`]);
+    const mode = cfg.delivery.merge;
+    const def = S.settingDef('delivery.merge')!;
+    const source = (await S.listSettings(await S.loadSettingsContext(project))).find((v) => v.key === 'delivery.merge')!.source;
+    const c = chat(cmds, [`/set delivery.merge ${mode}`, `/set execution.maxActiveTasks ${cfg.execution.maxActiveTasks}`]);
     await c.run();
     expect(c.sent[0]).not.toContain('failed');
-    expect(c.sent[0]).toContain(`delivery.mode is already ${mode} (${source}); nothing to change.`);
+    expect(c.sent[0]).toContain(`delivery.merge is already ${mode} (${source}); nothing to change.`);
     const others = def.choices!.filter((x) => x !== mode);
     expect(c.sent[0]).toContain(`Other choices: ${others.join(', ')}.`);
-    expect(c.sent[0]).toContain('/settings delivery.mode');
+    expect(c.sent[0]).toContain('/settings delivery.merge');
     expect(c.sent[1]).toContain(`execution.maxActiveTasks is already ${cfg.execution.maxActiveTasks} (`);
     expect(c.sent[1]).not.toContain('Other choices');
     expect(journal()).toEqual([]);
     expect(runs).toEqual([]);
     // The core throws a ManagerNotice (still mentions "already"), before minting a request.
-    const e = await reason(cmds.propose(null, { kind: 'config-set', key: 'delivery.mode', value: mode, layer: 'local' }));
+    const e = await reason(cmds.propose(null, { kind: 'config-set', key: 'delivery.merge', value: mode, layer: 'local' }));
     expect(e).toBeInstanceOf(M.ManagerNotice);
     expect(journal()).toEqual([]);
   });

@@ -215,7 +215,7 @@ export type OwnerCommand =
   | { kind: 'upgrade' }
   | { kind: 'sync' }
   | { kind: 'undo'; target: string }
-  /** A host-signed approval for exactly this task and full head SHA; merge: true approves merging instead of publishing. */
+  /** A host-signed merge approval for exactly this task and full head SHA (`merge` is implied; kept from the old syntax). */
   | { kind: 'approve'; taskId: string; head: string; merge: boolean }
   /** Dev-only: `minions upgrade --rebuild-cli` with the commit range in the plan (see ManagerCommands.devRebuild). */
   | { kind: 'rebuild-cli' };
@@ -381,7 +381,7 @@ export function planSummary(plan: ChangePlan): string {
   }
   if (plan.kind === 'sync') return 'sync the host base branch (strict fast-forward)';
   if (plan.kind === 'approve' && plan.approval) {
-    return `approve ${plan.approval.scope === 'merge' ? 'merging' : 'publishing'} ${plan.approval.taskId} at ${plan.approval.head}`;
+    return `approve merging ${plan.approval.taskId} at ${plan.approval.head}`;
   }
   return plan.steps[0] ?? plan.kind;
 }
@@ -883,7 +883,7 @@ export class HostManager {
 
   /**
    * Applies an approve plan: approveOnHost signs with the host key (which never leaves the host) and delegates
-   * `work approve <task> --head <sha> [--merge] --signature <token>` through the bounded runtime. Only the runtime's
+   * `work approve <task> --head <sha> --signature <token>` through the bounded runtime. Only the runtime's
    * envelope message is reported; the argv (it carries the token) is never logged or shown.
    */
   private async approve(project: ProjectJson, plan: ChangePlan): Promise<{ status: 'applied' | 'failed'; detail: string }> {
@@ -894,7 +894,7 @@ export class HostManager {
     let code: number;
     try {
       code = await (this.deps.approveOnHost ?? approveOnHost)(a.taskId, {
-        head: a.head, merge: a.scope === 'merge', json: true, cwd: project.repoPath, note: `approved in the host manager chat (${plan.requestId})`,
+        head: a.head, json: true, cwd: project.repoPath, note: `approved in the host manager chat (${plan.requestId})`,
       }, {
         projectId: project.projectId,
         delegate: async (args) => {
@@ -1167,7 +1167,7 @@ export class HostManager {
 export function approveOutcome(a: NonNullable<ChangePlan['approval']>, code: number, r: RunResult | null, signature?: string): { status: 'applied' | 'failed'; detail: string } {
   let env: { ok?: boolean; data?: { message?: unknown }; error?: { message?: unknown } } | null = null;
   try { env = r ? JSON.parse(r.stdout.trim().split('\n').filter(Boolean).at(-1) ?? '') : null; } catch { env = null; }
-  const what = `${a.scope === 'merge' ? 'merge' : 'publication'} approval for ${a.taskId} at ${a.head}`;
+  const what = `merge approval for ${a.taskId} at ${a.head}`;
   const msg = (v: unknown) => redactApprovalText(String(v ?? ''), signature, APPROVE_MESSAGE_MAX);
   if (env && env.ok === true && code === 0) return { status: 'applied', detail: `${what} recorded: ${msg(env.data?.message)}` };
   if (env && env.ok === false) return { status: 'failed', detail: `${what} refused by the runtime: ${msg(env.error?.message)}` };

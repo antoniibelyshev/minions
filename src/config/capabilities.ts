@@ -16,8 +16,8 @@ export const DEFAULT_SENSITIVE_PATHS = [
   '**/migrations/**',
 ];
 
-/** Capabilities whose effect is upgraded allow→ask when a sensitive path is touched (base.merge: the local integrator). */
-export const PUBLICATION_CAPABILITIES: Capability[] = ['git.push', 'pr.create', 'pr.merge', 'base.merge'];
+/** Capabilities whose effect is upgraded allow→ask when a sensitive path is touched (the local integrator). */
+export const LANDING_CAPABILITIES: Capability[] = ['base.merge'];
 
 const globCache = new Map<string, RegExp>();
 /** Minimal glob: `**` any depth (incl. zero dirs), `*` within a segment, `?` one char. */
@@ -49,7 +49,7 @@ export interface CanContext { role?: Role; paths?: string[] }
  * `roles`) is denied everything. Deny anywhere (base or matching rule) wins; otherwise matching
  * role/path rules override the base (strictest among them); a project role's column (`roles.<r>.capabilities`
  * and its defaults, src/config/roles.ts) adds sub-rules for that role. Sensitive paths upgrade allow→ask
- * for publication capabilities.
+ * for the landing capability (base.merge).
  */
 export function can(config: Pick<MinionsConfig, 'capabilities' | 'sensitivePaths'> & Partial<Pick<MinionsConfig, 'roles'>>, capability: Capability, ctx: CanContext = {}): Effect {
   if (ctx.role !== undefined && !isRegisteredRole(config, ctx.role)) return 'deny';
@@ -64,7 +64,7 @@ export function can(config: Pick<MinionsConfig, 'capabilities' | 'sensitivePaths
       (!r.paths || paths.some((p) => matchesAny(p, r.paths!))));
     if (matching.length) effect = matching.map((r) => r.effect).reduce(stricter);
   }
-  if (effect === 'allow' && PUBLICATION_CAPABILITIES.includes(capability) && paths.some((p) => matchesAny(p, config.sensitivePaths))) {
+  if (effect === 'allow' && LANDING_CAPABILITIES.includes(capability) && paths.some((p) => matchesAny(p, config.sensitivePaths))) {
     effect = 'ask';
   }
   return effect;
@@ -82,8 +82,7 @@ const PROJECT_OWNER: Table = {
   'task.read': 'allow', 'task.create': 'allow', 'task.update': 'allow', 'task.start': 'allow',
   'external.read': 'allow', 'external.comment': 'ask', 'external.changeStatus': 'ask', 'external.create': 'ask',
   'code.edit': noEditFor('allow', ['reviewer']), 'dependencies.edit': 'allow', 'architecture.change': 'allow', 'migrations.edit': 'allow',
-  'git.commit': 'allow', 'git.push': 'allow',
-  'pr.create': 'allow', 'pr.review': 'allow', 'pr.merge': 'ask',
+  'git.commit': 'allow',
   // The local integrator lands approved heads on the base itself (owner allow / personal ask / supervised deny).
   'base.merge': 'allow',
   'ci.edit': 'ask', 'infrastructure.edit': 'ask',
@@ -95,14 +94,14 @@ const PERSONAL_WORK: Table = {
   ...PROJECT_OWNER,
   'external.comment': 'deny', 'external.changeStatus': 'deny', 'external.create': 'deny',
   'dependencies.edit': 'ask', 'architecture.change': 'ask', 'migrations.edit': 'ask',
-  'git.push': 'ask', 'pr.create': 'ask', 'pr.review': 'ask', 'pr.merge': 'deny', 'base.merge': 'ask',
+  'base.merge': 'ask',
   'ci.edit': 'deny',
 };
 
 const SUPERVISED: Table = {
   ...PROJECT_OWNER,
   'dependencies.edit': 'ask', 'architecture.change': 'ask', 'migrations.edit': 'ask',
-  'git.push': 'deny', 'pr.create': 'deny', 'pr.review': 'ask', 'pr.merge': 'deny', 'base.merge': 'deny',
+  'base.merge': 'deny',
 };
 
 export const DEFAULT_CAPABILITIES: Record<Profile, Table> = {

@@ -4,7 +4,7 @@
 //
 // - integrationCandidate(B, H): the merge commit C of the base B and the approved head H, built as an object
 //   only (`git merge-tree --write-tree B H`, then `git commit-tree <tree> -p B -p H`) in the isolated git dir
-//   of base-update.ts (withIsolatedRepo, MERGE_TREE_CONFIG, refusal of custom and union merge drivers). No ref
+//   of isolated-git.ts (withIsolatedRepo, MERGE_TREE_CONFIG, refusal of custom and union merge drivers). No ref
 //   and no checkout ever holds a half merge. A conflict returns the conflicted paths.
 // - integrationChangedPaths(B, C): the paths of B..C (isolated, no rename detection, so both sides of a
 //   rename count) and those matching sensitivePaths.
@@ -17,7 +17,7 @@
 import type { MinionsConfig } from '../config/schema.js';
 import { matchesAny } from '../config/capabilities.js';
 import type { RunResult } from '../core/exec.js';
-import { cfgArgs, FULL_SHA, isolatedCommitTree, isolatedMergeTree, tail, withEmptyHome, withIsolatedRepo, type IsolatedRepo } from './base-update.js';
+import { cfgArgs, FULL_SHA, isolatedCommitTree, isolatedMergeTree, tail, withEmptyHome, withIsolatedRepo, type IsolatedRepo } from './isolated-git.js';
 import { allowlistedGit, filterOverrides, gateGit, hardenedGitArgs } from './git-hardening.js';
 import { parseWorktreeList } from './worktree.js';
 

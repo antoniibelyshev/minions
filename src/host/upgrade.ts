@@ -30,7 +30,7 @@
 //   exact command is printed and the upgrade stops before any container step.
 // - Host runtime (opts.host, task-7): the same source phase, preflight, pause, drain, files, secrets, resume and
 //   coordinator steps run through the project's minions shim instead of `docker compose exec`. There is no image,
-//   container or origin step: in their place the `shim` step regenerates the minions and gh shims for the installed
+//   container or import step: in their place the `shim` step regenerates the minions shim for the installed
 //   CLI (prepareHostRuntime), and it is the point of no return the recreate is for Docker. The preflight refuses a
 //   CLI that lives in (or links into) the agent-writable host runtime dirs: the shims run it outside the sandbox.
 //   The coordinator restart (no --force) is refused while a worker lease is active, so it runs only after the drain.
@@ -55,8 +55,8 @@ export function upgradeTimeout(raw: string | undefined, now: boolean): number {
 }
 export const UPGRADE_RELEASE_REASON = 'interrupted by minions upgrade --now (container recreated); re-dispatch on recovery';
 
-export type UpgradeStepId = 'sync' | 'cli' | 'preflight' | 'pause' | 'drain' | 'files' | 'image' | 'secrets' | 'recreate' | 'shim' | 'workspace' | 'origin' | 'resume' | 'coordinator';
-export const UPGRADE_STEPS: readonly UpgradeStepId[] = ['sync', 'cli', 'preflight', 'pause', 'drain', 'files', 'image', 'secrets', 'recreate', 'shim', 'workspace', 'origin', 'resume', 'coordinator'];
+export type UpgradeStepId = 'sync' | 'cli' | 'preflight' | 'pause' | 'drain' | 'files' | 'image' | 'secrets' | 'recreate' | 'shim' | 'workspace' | 'import' | 'resume' | 'coordinator';
+export const UPGRADE_STEPS: readonly UpgradeStepId[] = ['sync', 'cli', 'preflight', 'pause', 'drain', 'files', 'image', 'secrets', 'recreate', 'shim', 'workspace', 'import', 'resume', 'coordinator'];
 /** The steps of a host-runtime upgrade (no image, container or origin step; `shim` takes the recreate's place). */
 export const HOST_UPGRADE_STEPS: readonly UpgradeStepId[] = ['sync', 'cli', 'preflight', 'pause', 'drain', 'files', 'secrets', 'shim', 'workspace', 'resume', 'coordinator'];
 
@@ -70,7 +70,7 @@ export interface HostUpgradeTarget {
   cliProblem: () => Promise<string | null>;
   /** The dry-run detail of the shim step. */
   shimPlan: string;
-  /** Regenerates the minions and gh shims for the installed CLI; returns the step detail. */
+  /** Regenerates the minions shim for the installed CLI; returns the step detail. */
   regenerate: () => Promise<string>;
 }
 export type UpgradeStepStatus = 'done' | 'skipped' | 'failed' | 'planned';
@@ -304,7 +304,7 @@ export async function runUpgrade(opts: UpgradeOptions): Promise<UpgradeResult> {
     p('secrets', 'materialize stored tokens into the secrets mount');
     p('recreate', 'docker compose up --force-recreate (named volumes kept)');
     p('workspace', 'minions workspace setup');
-    p('origin', 'refresh the repository import and origin configuration (existing clone kept)');
+    p('import', 'refresh the repository import (existing clone kept)');
     if (userPaused) step('resume', 'skipped', 'starts were paused before the upgrade; left paused'); else p('resume', 'resume new starts (minions resume --starts)');
     p('coordinator', 'minions coordinator restart --recover');
     return result;
@@ -514,7 +514,7 @@ export async function runUpgrade(opts: UpgradeOptions): Promise<UpgradeResult> {
       await checkpoint();
     } catch (e) {
       await abort('secrets', aborted.has(e as object) ? e : new MinionsError('PRECONDITION', `a stored token is not available to the container: ${errMsg(e)}`,
-        'The container was not recreated. Check the credentials with `minions doctor` (or `minions auth github` / `minions auth telegram`), then rerun `minions upgrade`.'));
+        'The container was not recreated. Check the credentials with `minions doctor` (or `minions auth telegram`), then rerun `minions upgrade`.'));
     }
     recreating = true;
     if (host) {
@@ -537,11 +537,11 @@ export async function runUpgrade(opts: UpgradeOptions): Promise<UpgradeResult> {
       try { step(id, 'done', await fn()); } catch (e) { step(id, 'failed', errMsg(e)); result.ok = false; }
     };
     await attempt('workspace', async () => { await execOk(['minions', 'workspace', 'setup', '--json'], 'workspace setup'); return 'state layout and runtime DB checked'; });
-    if (!host) await attempt('origin', async () => {
+    if (!host) await attempt('import', async () => {
       if (!opts.importRepo) throw new MinionsError('INTERNAL', 'no repository import given');
       const r = await opts.importRepo();
-      for (const w of [...r.warnings, ...(r.container.origin?.warnings ?? [])]) log(`warning: ${w}`);
-      return r.container.origin ? `origin ${r.container.origin.url} (${r.container.origin.authenticated ? 'authenticated' : 'not authenticated'})` : `${r.baseBranch} refreshed; no origin`;
+      for (const w of r.warnings) log(`warning: ${w}`);
+      return `${r.baseBranch} refreshed`;
     });
     let notOurs = userPaused ? 'starts were paused before the upgrade; left paused' : 'starts were not paused by the upgrade';
     if (deferred) {

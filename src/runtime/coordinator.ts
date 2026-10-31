@@ -150,8 +150,8 @@ export const HOST_PROTECTED_FILES = ['.zshrc', '.zprofile', '.zshenv', '.zlogin'
 export const HOST_PROTECTED_DIRS = ['.config/git', 'Library/LaunchAgents', '.claude'];
 /** Toolchain dirs under ~ that sandboxed commands may still read (the home directory itself is denied). */
 export const HOST_TOOLCHAIN_DIRS = ['.nvm', '.volta', '.fnm', '.local/share/fnm', '.asdf', '.local/share/mise', '.rustup', '.cargo/bin', '.pyenv', '.rbenv', '.bun', '.deno', 'go', '.sdkman', '.local/bin', 'Library/pnpm', '.npm-global'];
-/** Hosts sandboxed Bash may reach without a prompt (GitHub for push/PR, npm for installs). */
-export const HOST_SANDBOX_DOMAINS = ['github.com', 'api.github.com', '*.githubusercontent.com', 'codeload.github.com', 'registry.npmjs.org'];
+/** Hosts sandboxed Bash may reach without a prompt (npm for installs). */
+export const HOST_SANDBOX_DOMAINS = ['registry.npmjs.org'];
 /** Git subcommands the host-runtime coordinator may run without a prompt (no config, remotes or push). */
 export const HOST_GIT_SUBCOMMANDS = ['status', 'diff', 'log', 'show', 'add', 'commit', 'branch', 'switch', 'checkout', 'merge', 'rebase', 'restore',
   'rev-parse', 'worktree list', 'stash', 'ls-files', 'grep', 'blame', 'reset', 'cherry-pick', 'mv', 'rm', 'describe', 'shortlog', 'merge-base', 'cat-file', 'rev-list', 'tag --list'];
@@ -176,7 +176,7 @@ export function readableToolDirs(home: string, env: NodeJS.ProcessEnv = process.
   for (const d of pathDirs) add(d);
   const prefixOf = (file: string) => dirname(dirname(realOr(file)));
   for (const f of extraFiles) add(prefixOf(f));
-  for (const tool of ['node', 'claude', 'backlog', 'git', 'gh', 'tmux']) {
+  for (const tool of ['node', 'claude', 'backlog', 'git', 'tmux']) {
     for (const d of pathDirs) {
       const f = join(d, tool);
       if (existsSync(f)) { add(prefixOf(f)); break; }
@@ -264,12 +264,11 @@ export function hostSettings(h: HostHardening): { sandbox: Record<string, unknow
         // Tool caches are redirected into the state dir (hostRuntimeVars), so no home paths are writable.
         allowWrite: [h.workspace, h.state],
         denyWrite: [join(h.workspace, 'repo', '.git', 'config'), join(h.workspace, 'repo', '.git', 'hooks'), ...tmuxDirs],
-        // The whole data root is unreadable; the agent's own dirs, the shim, its config/plugin and the
-        // GitHub token (read by the git credential helper / gh wrapper inside the sandbox) are re-opened.
+        // The whole data root is unreadable; the agent's own dirs, the shim and its config/plugin are re-opened.
         denyRead: [...secretHome, ...(root ? [root] : []), h.credentialsDir, join(h.secretsDir, 'anthropic-api-key'), join(h.secretsDir, 'telegram-bot-token'), join(h.secretsDir, CLAUDE_HEADLESS_TOKEN_FILE),
           join(h.secretsDir, 'env'), ...tmuxDirs],
         allowRead: [...new Set([h.workspace, h.state, join(h.projectDir, 'host', 'bin'), join(h.projectDir, 'runtime'), pluginDir,
-          join(h.secretsDir, 'github-token'), ...(h.readable ?? [])])],
+          ...(h.readable ?? [])])],
       },
       network: {
         allowedDomains: HOST_SANDBOX_DOMAINS,
@@ -355,10 +354,10 @@ export function coordinatorSettings(cfg: MinionsConfig, opts: { telegram?: boole
   return {
     permissions: {
       allow: [...new Set(allow)],
-      // Publication runs only through `minions work publish` (gated, deterministic); the coordinator never
-      // pushes or merges itself. Also cover global options before the subcommand (git -C x push).
+      // minions never talks to a remote: the coordinator never pushes or merges a pull request. Also cover
+      // global options before the subcommand (git -C x push).
       deny: ['Bash(git push *)', 'Bash(git push)', 'Bash(git * push *)', 'Bash(git * push)', 'Bash(gh pr merge *)', 'Bash(gh pr merge)', 'Bash(gh * pr merge *)', 'Bash(gh * pr merge)',
-        // A publication approval is signed by the owner on the host (`/approve` in the manager chat, or the host
+        // A merge approval is signed by the owner on the host (`/approve` in the manager chat, or the host
         // terminal); one an agent records is rejected anyway, so it is denied instead of blocking on a prompt. Also
         // covers program-level options before the subcommand (`minions --json work approve ...`).
         ...APPROVE_RULES,
@@ -1198,8 +1197,8 @@ export interface CoordinatorWrapperDeps extends RunCoordinatorDeps {
    */
   exitAfterSignal?: (code: number) => void;
   /**
-   * Startup work run once the lock is held, before claude starts (the CLI passes the GitHub intake
-   * sync). Failures are logged and never stop the coordinator. It runs inside the pre-spawn guard:
+   * Startup work run once the lock is held, before claude starts (the CLI passes process-run recovery and the
+   * scratch sweep). Failures are logged and never stop the coordinator. It runs inside the pre-spawn guard:
    * `stop` is aborted on a signal, and the wrapper does not wait for it after that.
    */
   onStart?: (cfg: MinionsConfig, log: (line: string) => void, stop: AbortSignal) => Promise<void>;
@@ -1252,7 +1251,7 @@ export async function coordinatorWrapper(loadConfig: () => Promise<MinionsConfig
     // Before runCoordinator: a refused duplicate must not overwrite the running coordinator's launch record.
     const log = deps.log ?? ((l: string) => process.stderr.write(l + '\n'));
     // Before the lock is awaited (task-40): every hop from taking the lock until claude is spawned is
-    // covered (see PreSpawnGuard), the startup step (GitHub intake) included. A signal while waiting for
+    // covered (see PreSpawnGuard), the startup step included. A signal while waiting for
     // a previous holder ends the wait; one right after the lock was taken releases it below.
     guard = installPreSpawnGuard(deps.signals ?? process);
     const g = guard;

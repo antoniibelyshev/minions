@@ -2,7 +2,6 @@ import { spawn } from 'node:child_process';
 import { resolve as resolvePath } from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import { Option, type Command } from 'commander';
-import { isGithubDelivery } from '../config/delivery.js';
 import { PROFILES, type Profile } from '../config/schema.js';
 import { action, globalOpts, requireMode, runtimeMode } from '../core/cli-helpers.js';
 import { MinionsError } from '../core/errors.js';
@@ -16,7 +15,7 @@ import { registerAuth } from './auth-cli.js';
 import { authOf, isKeyAuth, refreshKey, startRefreshTimer } from './auth.js';
 import type { MinionsConfig } from '../config/schema.js';
 import {
-  backendLabel, clearSecrets, upClearingSecretsOnFailure, githubTokenGuidance, materializeSecrets, provisionGithubToken, provisionTelegramToken, removeGithubToken,
+  backendLabel, clearSecrets, upClearingSecretsOnFailure, materializeSecrets, provisionTelegramToken,
   removeTelegramToken, telegramBotGuidance, codexKeyGuidance, provisionCodexKey, removeCodexKey,
 } from './credentials.js';
 import { assertBotFree, startBotCheck } from './bot-guard.js';
@@ -32,9 +31,8 @@ import { HOST_RUNTIME_WARNING, HostRuntime, RUNTIMES, prepareHostRuntime, requir
 import { registerRuntime } from './runtime-cli.js';
 import { HOST_CHANNEL_NOTE, defaultSessionsOn, formatChannelSet, hostChannel, offerAutoChannel, registerChannel } from './channel-cli.js';
 import { formatChannel } from '../telegram/channel.js';
-import { githubStartHint, registerGithubSetup } from './github-setup.js';
 import { formatUninstall, runUninstall } from './uninstall.js';
-import { DELIVERY_MODES, formatSetup, runSetup, shellQuote, type DeliveryMode, type SetupRuntime } from './setup.js';
+import { formatSetup, runSetup, shellQuote, type SetupRuntime } from './setup.js';
 import { DEFAULT_UPGRADE_TIMEOUT_SEC, formatUpgrade, runUpgrade, upgradeTimeout } from './upgrade.js';
 import { HANDOFF_ENV, formatSyncOnly, isMinionsCheckout, runSourcePhase, runSyncOnly, upgradeSourceMode } from './upgrade-source.js';
 import { readSecret, readlineIO } from './wizard.js';
@@ -155,7 +153,7 @@ function setupRuntime(json: boolean, cwd: string): SetupRuntime {
 
 /**
  * Starts the container. For Claude key methods with `provision` the key is (re)obtained first and a
- * failure stops here with AUTH_REQUIRED. GitHub/Telegram tokens are then materialized into the same
+ * failure stops here with AUTH_REQUIRED. The project's tokens are then materialized into the same
  * secrets dir (which must exist: it is the bind source), and cleared again if `up` fails.
  * `compose up -d` recreates the container whenever compose.yaml changed (method, env, mounts).
  */
@@ -188,8 +186,7 @@ async function ensureHost(json: boolean, opts: { provision?: boolean; cwd?: stri
     await refreshKey(p.project.projectId, auth);
   }
   const host = new HostRuntime(p.project);
-  const prepared = await prepareHostRuntime(p.project);
-  if (!prepared.gh && p.config.delivery.mode === 'pull-request') say(json, 'warning: gh is not installed on the host; pull-request delivery cannot open PRs (brew install gh).');
+  await prepareHostRuntime(p.project);
   await materialize(json, p.project.projectId);
   const setup = await host.exec(['minions', 'workspace', 'setup', '--json'], { allowFailure: true, timeoutMs: 120_000 });
   if (setup.code !== 0) throw new MinionsError('INTERNAL', `Host runtime state setup failed: ${lastLine(setup.stdout, setup.stderr)}`);
@@ -205,8 +202,6 @@ async function startHost(json: boolean, o: { attach: boolean }): Promise<void> {
     for (const w of r.warnings) say(json, `warning: ${w}`);
     imported = r;
   }
-  const hint = await githubStartHint(project, config);
-  if (hint) say(json, hint);
   // Telegram intended (telegram, or auto with a stored token): the minions channel server (task-6).
   const channel = await hostChannel(project, config);
   if (channel.wantsTelegram) say(json, `note: ${HOST_CHANNEL_NOTE}`);
@@ -249,8 +244,8 @@ async function confirmOrNull(question: string): Promise<boolean | null> {
   try { return !/^n(o)?$/i.test((await rl.question(`${question} `)).trim()); } finally { rl.close(); }
 }
 
-/** The settings menu's token items: runs the existing `minions auth github|telegram|codex` flow in this terminal. */
-function runAuthFlow(kind: 'github' | 'telegram' | 'codex'): Promise<void> {
+/** The settings menu's token items: runs the existing `minions auth telegram|codex` flow in this terminal. */
+function runAuthFlow(kind: 'telegram' | 'codex'): Promise<void> {
   return new Promise((resolve) => {
     const child = spawn(process.execPath, [...process.execArgv, process.argv[1]!, 'auth', kind], { stdio: 'inherit' });
     child.on('error', () => resolve());
@@ -377,16 +372,14 @@ export function register(program: Command): void {
     }));
 
   const setupCmd = program.command('setup [path]')
-    .description('Guided end-to-end setup: init wizard, GitHub, CI guidance, Telegram, host manager bot, runtime start, import, coordinator, then the setup assistant (subcommands: github, assist)')
+    .description('Guided end-to-end setup: init wizard, local integration, Telegram, host manager bot, runtime start, import, coordinator, then the setup assistant (subcommand: assist)')
     .addOption(new Option('--profile <profile>', 'starting profile').choices([...PROFILES]))
     .option('--private', 'private install: nothing is written into the repository')
     .option('--shared', 'shared install: writes .minions/config.json and .minions/README.md')
     .option('-y, --yes', 'non-interactive: accept defaults (optional integrations off unless a token is piped)')
     .option('--dry-run', 'show what setup would do without writing, prompting for secrets, or starting anything')
-    .addOption(new Option('--delivery <mode>', 'delivery mode (branch/pull-request need a stored GitHub token)').choices([...DELIVERY_MODES]))
-    .option('--github-token-stdin', 'read the GitHub token from the first line of piped stdin')
-    .option('--telegram-token-stdin', 'read the Telegram bot token from piped stdin (second line when combined with --github-token-stdin)')
-    .option('--manager-token-stdin', 'read the host manager bot token from piped stdin (after the GitHub and Telegram lines when combined); pairing needs a terminal run')
+    .option('--telegram-token-stdin', 'read the Telegram bot token from the first line of piped stdin')
+    .option('--manager-token-stdin', 'read the host manager bot token from piped stdin (after the Telegram line when combined); pairing needs a terminal run')
     .option('--manager-claude-token-stdin', "read the manager assistant's Claude token (claude setup-token or an Anthropic API key) from piped stdin (last line when combined); stores it, never switches the assistant on")
     // Same semantics as `minions init` (install.sh passes init options through to setup).
     .option('--config <file>', 'use a validated config file instead of the init wizard (skips the questions it covers)')
@@ -395,21 +388,21 @@ export function register(program: Command): void {
     .addOption(new Option('--runtime <runtime>', 'agent runtime: docker (default) or host (no Docker, less safe; prints a warning)').choices([...RUNTIMES]))
     .option('--no-attach-coordinator', 'do not offer to attach the coordinator at the end')
     .option('--no-assistant', 'do not offer the AI setup assistant at the end')
-    .action(action(async (path: string | undefined, o: { profile?: Profile; private?: boolean; shared?: boolean; yes?: boolean; dryRun?: boolean; delivery?: DeliveryMode; githubTokenStdin?: boolean; telegramTokenStdin?: boolean; managerTokenStdin?: boolean; managerClaudeTokenStdin?: boolean; config?: string; attach?: boolean; newIdentity?: boolean; runtime?: RuntimeKind; attachCoordinator: boolean; assistant: boolean }, cmd: Command) => {
+    .action(action(async (path: string | undefined, o: { profile?: Profile; private?: boolean; shared?: boolean; yes?: boolean; dryRun?: boolean; telegramTokenStdin?: boolean; managerTokenStdin?: boolean; managerClaudeTokenStdin?: boolean; config?: string; attach?: boolean; newIdentity?: boolean; runtime?: RuntimeKind; attachCoordinator: boolean; assistant: boolean }, cmd: Command) => {
       requireMode('host');
       const { json } = globalOpts(cmd);
       if (o.private && o.shared) throw new MinionsError('INVALID_CONFIG', '--private and --shared are mutually exclusive.');
-      const piped = !!(o.githubTokenStdin || o.telegramTokenStdin || o.managerTokenStdin || o.managerClaudeTokenStdin);
+      const piped = !!(o.telegramTokenStdin || o.managerTokenStdin || o.managerClaudeTokenStdin);
       const interactive = !o.yes && !o.dryRun && !json && !piped && !!process.stdin.isTTY;
       // Like init, --config is a non-interactive alternative to --yes (token questions then need stdin).
       if (!o.yes && !o.config && !o.dryRun && !interactive) {
-        throw new MinionsError('PRECONDITION', 'setup needs a terminal for its questions.', 'Pass --yes to accept the defaults or --config <file> (tokens can be piped with --github-token-stdin / --telegram-token-stdin / --manager-token-stdin / --manager-claude-token-stdin), or --dry-run.');
+        throw new MinionsError('PRECONDITION', 'setup needs a terminal for its questions.', 'Pass --yes to accept the defaults or --config <file> (tokens can be piped with --telegram-token-stdin / --manager-token-stdin / --manager-claude-token-stdin), or --dry-run.');
       }
       const target = resolvePath(path ?? '.');
-      let tokens: { github?: string; telegram?: string; manager?: string; managerClaude?: string } | undefined;
+      let tokens: { telegram?: string; manager?: string; managerClaude?: string } | undefined;
       if (piped && !o.dryRun) {
-        // One line per selected flag, in the order github, telegram, manager, managerClaude.
-        const names = (['github', 'telegram', 'manager', 'managerClaude'] as const).filter((n) => o[`${n}TokenStdin`]);
+        // One line per selected flag, in the order telegram, manager, managerClaude.
+        const names = (['telegram', 'manager', 'managerClaude'] as const).filter((n) => o[`${n}TokenStdin`]);
         const lines = await readStdinLines(names.length);
         // A missing line is an empty token: runSetup rejects it instead of silently skipping the step.
         tokens = Object.fromEntries(names.map((n, i) => [n, lines[i] ?? '']));
@@ -418,7 +411,7 @@ export function register(program: Command): void {
       try {
         const r = await runSetup({
           path: target, profile: o.profile, visibility: o.private ? 'private' : o.shared ? 'shared' : undefined,
-          yes: !interactive, dryRun: o.dryRun, io, delivery: o.delivery, tokens, runtime: setupRuntime(json, target),
+          yes: !interactive, dryRun: o.dryRun, io, tokens, runtime: setupRuntime(json, target),
           configFile: o.config ? resolvePath(o.config) : undefined, attach: o.attach, newIdentity: o.newIdentity, runtimeKind: o.runtime,
         });
         emit(r, { json, human: formatSetup });
@@ -484,8 +477,6 @@ export function register(program: Command): void {
         for (const w of r.warnings) say(json, `warning: ${w}`);
         imported = r;
       }
-      const hint = await githubStartHint(project, config);
-      if (hint) say(json, hint);
       // The coordinator is a TUI in tmux: attaching needs a terminal (compose exec allocates a TTY).
       const attach = o.attach && !json && !!process.stdin.isTTY && !!process.stdout.isTTY;
       // Telegram must work with nobody attached: start the session detached in that case.
@@ -513,9 +504,9 @@ export function register(program: Command): void {
     .description('Upgrade the project container (or the host runtime: plugin and shims) to the installed minions (drains workers, keeps volumes); in the runtime: record an upgrade request for the owner')
     .option('--timeout <seconds>', `wait this long for active workers (default ${DEFAULT_UPGRADE_TIMEOUT_SEC}; 0 with --now)`)
     .option('--now', 'release workers still active when the wait ends (reported as interrupted, re-dispatched after)')
-    .option('--from-container [branch]', 'local delivery only: first export the container branches and fast-forward <branch> (default: the base branch) to minions/<base>; strict fast-forward on a clean tree only (GitHub delivery always takes origin/<base>)')
+    .option('--from-container [branch]', 'first export the container branches and fast-forward <branch> (default: the base branch) to minions/<base>; strict fast-forward on a clean tree only')
     .option('--rebuild-cli', 'in a minions checkout: allow rebuilding/reinstalling the global CLI from it (runs its npm scripts and build on the host; review it first)')
-    .option('--sync-only', 'only the source sync (the host manager /sync): local delivery exports the container branches and fast-forwards the base branch; GitHub delivery fetches origin/<base> and fast-forwards; no CLI or container steps')
+    .option('--sync-only', 'only the source sync (the host manager /sync): export the container branches and fast-forward the base branch; no CLI or container steps')
     .option('--dry-run', 'list the steps without changing anything')
     .option('--reason <text>', 'runtime: why the upgrade is needed (shown to the owner)')
     .action(action(async (o: { timeout?: string; now?: boolean; fromContainer?: string | boolean; rebuildCli?: boolean; syncOnly?: boolean; reason?: string }, cmd: Command) => {
@@ -541,16 +532,13 @@ export function register(program: Command): void {
       if (!dryRun && !hostRt) await requireDocker();
       const compose = hostRt ? null : new Compose(project.projectId);
       // The rest of the upgrade, as run again by the new CLI after a reinstall (or by the user after a stop).
-      // GitHub delivery: origin/<base> is the only source (src/host/upgrade-source.ts, upgradeSourceMode).
-      const github = isGithubDelivery((await loadEffectiveConfig(project)).config);
       const checkout = isMinionsCheckout(ref.repoPath) ? ref.repoPath : null;
-      const mode = upgradeSourceMode({ githubDelivery: github, fromContainer: o.fromContainer !== undefined, checkout, baseBranch: project.baseBranch });
+      const mode = upgradeSourceMode({ fromContainer: o.fromContainer !== undefined, checkout });
       const flags = [...(o.timeout !== undefined ? ['--timeout', String(timeoutSec)] : []), ...(o.now ? ['--now'] : [])];
       const r = await runUpgrade({
         source: () => runSourcePhase({
           dryRun, handoff: process.env[HANDOFF_ENV] === '1', rebuildCli: !!o.rebuildCli, runningRoot: packageRoot(), log: (m) => say(json, m),
           checkout,
-          origin: mode === 'origin' ? { repo: ref.repoPath, baseBranch: project.baseBranch, remote: project.remoteUrl || 'origin' } : null,
           sync: mode !== 'container' ? null : {
             repo: ref.repoPath, baseBranch: project.baseBranch,
             branch: typeof o.fromContainer === 'string' ? o.fromContainer : project.baseBranch,
@@ -587,9 +575,6 @@ export function register(program: Command): void {
     if (o.timeout !== undefined || o.now || o.rebuildCli) throw new MinionsError('PRECONDITION', '--sync-only takes no --timeout, --now or --rebuild-cli (it moves no container and builds nothing).');
     const ref = await projectForPath(process.cwd());
     const project = await loadProjectJson(ref.projectId);
-    const github = isGithubDelivery((await loadEffectiveConfig(project)).config);
-    // GitHub delivery with --from-container: refused (local delivery only).
-    if (github && o.fromContainer !== undefined) upgradeSourceMode({ githubDelivery: true, fromContainer: true, checkout: null, baseBranch: project.baseBranch });
     const exportFrom = async () => {
       if (runtimeOf(project) === 'host') {
         const host = new HostRuntime(project);
@@ -604,8 +589,7 @@ export function register(program: Command): void {
     };
     const r = await runSyncOnly({
       dryRun: g.dryRun,
-      origin: github ? { repo: ref.repoPath, baseBranch: project.baseBranch, remote: project.remoteUrl || 'origin' } : null,
-      sync: github ? null : { repo: ref.repoPath, baseBranch: project.baseBranch, branch: typeof o.fromContainer === 'string' ? o.fromContainer : project.baseBranch, exportRepo: exportFrom },
+      sync: { repo: ref.repoPath, baseBranch: project.baseBranch, branch: typeof o.fromContainer === 'string' ? o.fromContainer : project.baseBranch, exportRepo: exportFrom },
     });
     emit(r, { json: g.json, human: formatSyncOnly });
     if (!r.ok) process.exitCode = 1;
@@ -655,8 +639,7 @@ export function register(program: Command): void {
         ? await (async () => { const h = await ensureHost(json); return importRepo(h.project, { repoPath: (await projectForPath(process.cwd())).repoPath, target: h.host.transferTarget() }); })()
         : await (async () => { const { project } = await ensureUp(json); return importRepo(project, { repoPath: (await projectForPath(process.cwd())).repoPath }); })();
       emit(r, { json, human: (d: typeof r) => [`Imported ${d.baseBranch} @ ${d.commit.slice(0, 12)} into the ${isHost ? 'host runtime workspace' : 'container'}.`,
-        ...(d.container.origin ? [`origin ${d.container.origin.url}: ${d.container.origin.authenticated ? 'authenticated' : 'not authenticated'}, ${d.container.origin.fetched ? 'base fetched' : 'not fetched'}`] : []),
-        ...[...d.warnings, ...(d.container.origin?.warnings ?? [])].map((w) => `warning: ${w}`)].join('\n') });
+        ...d.warnings.map((w) => `warning: ${w}`)].join('\n') });
     }));
 
   program.command('export')
@@ -685,49 +668,6 @@ export function register(program: Command): void {
       emit(r, { json, human: (d: typeof r) => [`Bundle: ${d.bundle}`,
         ...(d.changes.length ? d.changes.map((c) => `  ${c.ref}: ${c.from?.slice(0, 12) ?? '(new)'} -> ${c.to?.slice(0, 12) ?? '(deleted)'}`) : ['  no ref changes']),
         'Local branches and the working tree were not modified.'].join('\n') });
-    }));
-
-  auth.command('github')
-    .description('Store a fine-grained GitHub token (prompted without echo; Keychain or a 0600 host file)')
-    .option('--stdin', 'read the token from piped stdin instead of the terminal prompt')
-    .option('--no-verify', 'store without checking the token against the GitHub API')
-    .option('--remove', 'delete the stored token and its reference')
-    .option('--dry-run', 'show the guidance and storage location without prompting')
-    .action(action(async (o: { stdin?: boolean; verify: boolean; remove?: boolean }, cmd: Command) => {
-      requireMode('host');
-      const { json, dryRun } = globalOpts(cmd);
-      const ref = await projectForPath(process.cwd());
-      const project = await loadProjectJson(ref.projectId);
-      if (o.remove) {
-        const r = dryRun ? { removed: false, backend: null } : await removeGithubToken(project.projectId);
-        emit({ projectId: project.projectId, dryRun, ...r }, { json, human: () => dryRun ? 'Would remove the stored GitHub token.'
-          : r.removed ? `Removed the GitHub token (${r.backend}).` : 'No GitHub token was stored.' });
-        return;
-      }
-      const guidance = githubTokenGuidance(project.remoteUrl);
-      if (dryRun) { emit({ projectId: project.projectId, dryRun: true, guidance }, { json, human: () => guidance.join('\n') }); return; }
-      say(json, guidance.join('\n'));
-      // The token is read only here, from the host terminal (no echo) or a pipe; never from argv.
-      const token = o.stdin ? await readStdinSecret()
-        : process.stdin.isTTY ? await readSecret('GitHub token (input hidden): ')
-          : (() => { throw new MinionsError('PRECONDITION', 'No terminal to prompt for the token.', 'Run in a terminal, or pipe it: `minions auth github --stdin < token-file`.'); })();
-      const r = await provisionGithubToken({ projectId: project.projectId, token, repoPath: ref.repoPath, remoteUrl: project.remoteUrl, verify: o.verify });
-      const compose = new Compose(project.projectId);
-      let mounted = false;
-      let needsRestart = false;
-      const vis = runtimeOf(project) === 'host'
-        ? (await new HostRuntime(project).prepared() ? 'mounted' : 'not-running')
-        : await compose.secretsVisibility();
-      if (vis === 'mounted') { await materialize(json, project.projectId); mounted = true; }
-      else if (vis === 'restart-required') needsRestart = true; // container predates the secrets mount: a copy would not reach it
-      emit({ ...r, mountedPath: CONTAINER.githubTokenFile, visibleInRunningContainer: mounted, ...(needsRestart ? { restartRequired: true } : {}) }, { json, human: () => [
-        `Stored the GitHub token in ${backendLabel(r.backend)} (${r.ref}).`,
-        r.verification ? `Verification: ${r.verification.status} — ${r.verification.detail}` : 'Verification skipped (--no-verify).',
-        ...r.warnings.map((w) => `warning: ${w}`),
-        mounted ? `Updated ${CONTAINER.githubTokenFile} in the running container.`
-          : needsRestart ? 'The running container has no secrets mount (created before this feature); run `minions start` to recreate it so the token becomes visible.'
-            : `It is mounted read-only at ${CONTAINER.githubTokenFile} on the next \`minions start\`.`,
-      ].join('\n') });
     }));
 
   auth.command('telegram')
@@ -853,7 +793,7 @@ export function register(program: Command): void {
   registerRuntime(program, { confirm, ask: askLine });
   registerChannel(program, { confirm: confirmOrNull });
   registerSecrets(program);
-  registerAssistant(registerGithubSetup(setupCmd));
+  registerAssistant(setupCmd);
 
   const settings = registerSettings(program, {
     confirm: confirmMarked,

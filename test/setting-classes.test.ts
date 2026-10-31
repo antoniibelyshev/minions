@@ -24,8 +24,8 @@ describe('schema walk', () => {
   it('finds the leaf keys of every section (so the guard below is not vacuous)', () => {
     expect(paths.length).toBeGreaterThan(60);
     for (const k of ['schemaVersion', 'execution.maxActiveTasks', 'execution.maxByRole', 'verification.commands', 'models.effortByRole.coordinator',
-      'container.cpus', 'container.mountDockerSocket', 'git.identity.name', 'git.baseBranch', 'capabilities.git.push', 'capabilities.deploy.execute',
-      'coordinator.contextReset.enabled', 'coordinator.contextReset.contextTokens', 'intake.github.enabled', 'intake.scope.allowedPaths',
+      'container.cpus', 'container.mountDockerSocket', 'git.identity.name', 'git.baseBranch', 'capabilities.base.merge', 'capabilities.deploy.execute',
+      'coordinator.contextReset.enabled', 'coordinator.contextReset.contextTokens', 'intake.scope.allowedPaths',
       'roles.engineer.model', 'workflows', 'harnesses.codex.models.default', 'harnesses.network.tcpConnectPorts', 'permissionMode', 'budgets.dailyUsd']) {
       expect(paths, k).toContain(k);
     }
@@ -62,13 +62,13 @@ describe('guard: every schema key has a class and a host-owned flag', () => {
     const cls = (k: string) => classifyKey(k)?.class;
     const owned = (k: string) => classifyKey(k)?.hostOwned;
     for (const k of ['execution.maxActiveTasks', 'execution.maxEngineers', 'execution.maxByRole', 'execution.maxRepairCyclesBeforeReplan',
-      'coordinator.contextReset.enabled', 'verification.commands', 'verification.qaLabels', 'verification.ciPendingTimeoutMinutes',
-      'verification.setupCommands', 'delivery.integrationTimeoutMinutes', 'intake.github.labels', 'intake.scope.milestone', 'intake.sources']) expect(cls(k), k).toBe('live');
+      'coordinator.contextReset.enabled', 'verification.commands', 'verification.qaLabels',
+      'verification.setupCommands', 'delivery.integrationTimeoutMinutes', 'intake.scope.milestone', 'intake.sources']) expect(cls(k), k).toBe('live');
     for (const k of ['execution.attemptMaxTurns', 'budgets.taskUsd', 'communication.progress', 'models.default', 'models.allowed',
       'models.selection', 'models.effortByRole.engineer', 'models.coordinator', 'models.effort', 'models.effortByRole.coordinator',
       'coordinator.toolSearch']) expect([cls(k), owned(k)], k).toEqual(['restart', false]);
-    for (const k of ['communication.channel', 'capabilities.pr.merge', 'sensitivePaths', 'architecture', 'intake.startReady', 'delivery.mode',
-      'delivery.merge', 'verification.testerRequired', 'verification.reviewerRequired', 'verification.ciAuthority', 'coordinator.permissionMode',
+    for (const k of ['communication.channel', 'capabilities.base.merge', 'sensitivePaths', 'architecture', 'intake.startReady',
+      'delivery.merge', 'verification.testerRequired', 'verification.reviewerRequired', 'coordinator.permissionMode',
       'coordinator.disallowedTools', 'coordinator.bundledSkills', 'permissionMode', 'roles.engineer.tools', 'roles.researcher', 'workflows',
       'harnesses.default']) expect([cls(k), owned(k)], k).toEqual(['restart', true]);
     for (const k of ['git.identity.email', 'container.cpus', 'container.memoryMiB', 'container.pidsLimit', 'container.tmpSizeMiB'])
@@ -80,10 +80,7 @@ describe('guard: every schema key has a class and a host-owned flag', () => {
     // The most specific entry wins: git.identity (recreate) under git, effortByRole.coordinator (launch) next to the worker roles.
     expect(classifyKey('git.identity.name')?.key).toBe('git.identity');
     expect(classifyKey('models.effortByRole.coordinator')?.reason).toMatch(/--effort/);
-    // task-79: the merge gate reads delivery.requiredChecksConfigured per call (live); still host-owned like delivery.*.
-    expect(classifyKey('delivery.requiredChecksConfigured')).toMatchObject({ key: 'delivery.requiredChecksConfigured', class: 'live', hostOwned: true });
-    expect(classifyKey('delivery.method')).toMatchObject({ key: 'delivery', class: 'restart', hostOwned: true });
-    expect(SETTINGS.find((d) => d.key === 'delivery.requiredChecksConfigured')).toMatchObject({ group: 'Delivery', type: 'bool', apply: 'live', class: 'live', hostOwned: true });
+    expect(classifyKey('delivery.merge')).toMatchObject({ key: 'delivery', class: 'restart', hostOwned: true });
   });
 });
 
@@ -106,9 +103,9 @@ describe('the settings model agrees with the classification', () => {
       expect(typeof d.hostOwned, d.key).toBe('boolean');
     }
     const byKey = (k: string) => SETTINGS.find((d) => d.key === k)!;
-    expect([byKey('secrets.github').hostOwned, byKey('secrets.telegram').hostOwned]).toEqual([true, true]);
+    expect(byKey('secrets.telegram').hostOwned).toBe(true);
     expect([byKey('pause.intake').hostOwned, byKey('pause.starts').hostOwned]).toEqual([false, false]);
-    expect(byKey('capabilities.git.push')).toMatchObject({ class: 'restart', hostOwned: true });
+    expect(byKey('capabilities.base.merge')).toMatchObject({ class: 'restart', hostOwned: true });
     expect(byKey('execution.maxActiveTasks')).toMatchObject({ class: 'live', hostOwned: false });
   });
 
@@ -144,11 +141,9 @@ describe('classes match the code that applies the key', () => {
     const base = defaults();
     base.models.allowed = ['sonnet', 'opus', 'haiku'];
     base.models.default = 'sonnet';
-    base.delivery.provider = 'github'; // so delivery.mode may move off local
-    // delivery.merge only reaches the prompt with pull-request delivery and auto-merge (its other values are
-    // enforced by the runtime gates): compare there.
+    // delivery.merge reaches the prompt only when local integration can run (verification commands configured).
     const probes: Record<string, { base: (c: MinionsConfig) => void; to: unknown }> = {
-      'delivery.merge': { base: (c) => { c.delivery.mode = 'pull-request'; c.delivery.requiredChecksConfigured = true; c.verification.ciAuthority = 'github'; }, to: 'auto-when-eligible' },
+      'delivery.merge': { base: (c) => { c.verification.commands = ['npm test']; }, to: 'auto-when-eligible' },
       // harnesses.default only reaches roles the phase allows (phase 1 b: project gates): compare with one configured.
       'harnesses.default': {
         base: (c) => {

@@ -4,8 +4,7 @@
 // - It exists only when the host CLI runs from a minions source checkout (the running package root has
 //   src/cli.ts) and the managed project is minions (its repository is a minions source checkout). Everywhere else it
 //   is not registered, not advertised in the help text and refused when it arrives anyway.
-// - It is owner-only (`/rebuild_cli` in the manager chat; never a container request) and local delivery only: with
-//   GitHub delivery the CLI is built only from the reviewed origin/<base> (`/upgrade`).
+// - It is owner-only (`/rebuild_cli` in the manager chat; never a container request).
 // - The plan shows what would be built: `git log --oneline <from>..<to>`, where <from> is the commit the running CLI
 //   was built from (dist/build.json, written by esbuild.config.mjs) and <to> the checkout's HEAD, the diffstat, and
 //   the sensitive paths (the project's sensitivePaths) the range touches. The digest covers all of it, so a moved
@@ -15,7 +14,6 @@
 //   before a reinstall, then the container steps on the new CLI).
 import { readFileSync, realpathSync } from 'node:fs';
 import { join } from 'node:path';
-import { isGithubDelivery } from '../config/delivery.js';
 import { matchesAny } from '../config/capabilities.js';
 import { displayText } from '../core/control-chars.js';
 import { MinionsError } from '../core/errors.js';
@@ -75,13 +73,10 @@ export const notAvailable = () => new MinionsError('PRECONDITION',
 
 /**
  * The range a rebuild would build, read from the host now. Refuses (PRECONDITION) when the request is not available
- * here, with GitHub delivery, on a dirty checkout, or when the build commit is unknown or not an ancestor of HEAD.
+ * here, on a dirty checkout, or when the build commit is unknown or not an ancestor of HEAD.
  */
 export async function rebuildRange(project: ProjectJson, deps: CliDevDeps = {}): Promise<RebuildRange> {
   if (!devRebuildAvailable(project, deps)) throw notAvailable();
-  if (isGithubDelivery((await loadEffectiveConfig(project)).config)) {
-    throw new MinionsError('PRECONDITION', 'rebuild-cli is for local delivery: with GitHub delivery the CLI is built only from the reviewed origin/<base>. Nothing to apply.', 'Merge the pull requests on GitHub, then send /upgrade.');
-  }
   const runner = deps.runner ?? run;
   const checkout = real(project.repoPath);
   const git = async (args: string[]) => runner('git', [...HOST_GIT, ...args], { cwd: checkout, allowFailure: true, timeoutMs: 120_000 });

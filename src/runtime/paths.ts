@@ -96,7 +96,6 @@ export function runtimePaths(env: NodeJS.ProcessEnv = process.env, opts: { inCon
     pluginDir,
     secretsDir,
     telegramTokenFile: join(secretsDir, 'telegram-bot-token'),
-    githubTokenFile: join(secretsDir, 'github-token'),
     apiKeyFile: join(secretsDir, 'anthropic-api-key'),
     /** Headless Claude token (login method) for `minions coordinator live-run` (src/runtime/headless.ts). */
     claudeHeadlessTokenFile: join(secretsDir, CLAUDE_HEADLESS_TOKEN_FILE),

@@ -60,12 +60,12 @@ describe('runtime path resolution', () => {
   it('container defaults, env overrides for the host runtime', () => {
     const c = runtimePaths({});
     expect(c).toMatchObject({ state: '/state', workspace: '/workspace', repo: '/workspace/repo', pluginDir: '/opt/minions/plugin',
-      coordinatorPrompt: '/opt/minions/plugin/coordinator.md', githubTokenFile: '/opt/minions/secrets/github-token', tmuxSocket: null });
+      coordinatorPrompt: '/opt/minions/plugin/coordinator.md', telegramTokenFile: '/opt/minions/secrets/telegram-bot-token', tmuxSocket: null });
     const h = runtimePaths({ MINIONS_RUNTIME: 'host', MINIONS_STATE_DIR: '/h/state', MINIONS_WORKSPACE: '/h/ws', MINIONS_SECRETS_DIR: '/h/sec dir',
       MINIONS_PLUGIN_DIR: '/h/plugin', MINIONS_TMUX_SOCKET: 'minions-abc', MINIONS_CONFIG: '/h/cfg.json' });
     expect(h).toMatchObject({ db: '/h/state/minions.db', backlog: '/h/state/backlog', repo: '/h/ws/repo', worktrees: '/h/ws/worktrees',
       configJson: '/h/cfg.json', pluginDir: '/h/plugin', coordinatorPrompt: '/h/plugin/coordinator.md',
-      githubTokenFile: '/h/sec dir/github-token', apiKeyFile: '/h/sec dir/anthropic-api-key', tmuxSocket: 'minions-abc' });
+      telegramTokenFile: '/h/sec dir/telegram-bot-token', apiKeyFile: '/h/sec dir/anthropic-api-key', tmuxSocket: 'minions-abc' });
   });
 
   it('host runtime env points every runtime path at <project>/host and drops tokens', async () => {
@@ -80,7 +80,7 @@ describe('runtime path resolution', () => {
     expect(e.PATH).toBe(`${hp.bin}:/usr/bin:/bin`);
     for (const k of ['GH_TOKEN', 'GITHUB_TOKEN', 'TMUX']) expect(e).not.toHaveProperty(k);
     expect(e.CLAUDE_CONFIG_DIR).toBeUndefined(); // login reuses the user's own Claude Code login
-    expect(e.MINIONS_GIT_CREDENTIAL_HELPER).toBe(`!${hp.minionsShim.includes(' ') ? `'${hp.minionsShim}'` : hp.minionsShim} git-credential`);
+    expect(e).not.toHaveProperty('MINIONS_GIT_CREDENTIAL_HELPER');
   });
 
   it('modes: host-runtime may run runtime commands, never host-control commands', () => {
@@ -197,7 +197,7 @@ describe('host runtime coordinator settings', () => {
     expect(s.sandbox).toMatchObject({ enabled: true, autoAllowBashIfSandboxed: true, allowUnsandboxedCommands: false, failIfUnavailable: true });
     expect((s.sandbox.filesystem as { allowWrite: string[] }).allowWrite).toEqual([h.workspace, h.state]);
     expect((s.sandbox.filesystem as { denyRead: string[] }).denyRead).toEqual(expect.arrayContaining(['~/.ssh', '~/.aws', '~/Library/Keychains', h.credentialsDir]));
-    expect((s.sandbox.network as { allowedDomains: string[] }).allowedDomains).toContain('github.com');
+    expect((s.sandbox.network as { allowedDomains: string[] }).allowedDomains).toEqual(['registry.npmjs.org']);
     expect(s.permissions.deny).toEqual(expect.arrayContaining(['Read(~/.ssh/**)', 'Read(~/.aws/**)', 'Bash(security *)', 'Read(//m/credentials/**)',
       'Read(//m/My Proj/secrets/anthropic-api-key)', 'Read(//m/My Proj/secrets/telegram-bot-token)', 'Edit(//m/proj/*.json)']));
     // no data root derivable from /m/proj: never deny `/` or the home directory
@@ -240,16 +240,14 @@ describe('host runtime coordinator settings', () => {
 });
 
 describe('host runtime processes', () => {
-  it('gh shim only when gh exists; it reads the project token file, not the user login', async () => {
+  it('removes the gh token wrapper an older minions wrote into the shim dir', async () => {
     const { id } = await hostProject();
     const project = await loadProjectJson(id);
-    const bin = join(env.root, 'tools');
-    mkdirSync(bin);
-    writeFileSync(join(bin, 'gh'), '#!/bin/sh\necho real\n'); chmodSync(join(bin, 'gh'), 0o755);
-    await prepareHostRuntime(project, { target: { node: process.execPath, cli: '/x' }, pathEnv: `${hostRuntimePaths(id).bin}:${bin}` });
-    const sh = readFileSync(hostRuntimePaths(id).ghShim, 'utf8');
-    expect(sh).toContain(`REAL_GH=${shQuote(join(bin, 'gh'))}`);
-    expect(sh).toContain(`TOKEN_FILE=${shQuote(projectPaths(id).githubTokenFile)}`);
+    const legacy = join(hostRuntimePaths(id).bin, 'gh');
+    mkdirSync(hostRuntimePaths(id).bin, { recursive: true });
+    writeFileSync(legacy, '#!/bin/sh\n');
+    await prepareHostRuntime(project, { target: { node: process.execPath, cli: '/x' } });
+    expect(existsSync(legacy)).toBe(false);
   });
 
   it('isRunning / down use the dedicated tmux server only', async () => {
@@ -265,7 +263,7 @@ describe('host runtime processes', () => {
     const tools = await hostTools(async (cmd) => (cmd === 'tmux' ? ok('tmux 3.5a') : cmd === 'claude' ? ok('2.1.292 (Claude Code)') : no));
     expect(tools.find((t) => t.name === 'tmux')).toMatchObject({ ok: true, version: 'tmux 3.5a' });
     expect(tools.find((t) => t.name === 'backlog')).toMatchObject({ ok: false, required: true, hint: expect.stringMatching(/npm install -g backlog.md/) });
-    expect(tools.find((t) => t.name === 'gh')).toMatchObject({ ok: false, required: false });
+    expect(tools.find((t) => t.name === 'gh')).toBeUndefined();
   });
 
   it('doctor in host mode: warn-level runtime check, host tools, no Docker calls', async () => {
@@ -300,7 +298,7 @@ describe('minions upgrade on the host runtime', () => {
     const up = program.commands.find((c) => c.name() === 'upgrade')!;
     const opt = (flag: string) => up.options.find((o) => o.long === flag);
     expect(opt('--rebuild-cli')?.description).toMatch(/rebuilding\/reinstalling the global CLI .*review it first/);
-    expect(opt('--from-container')?.description).toMatch(/^local delivery only: .*strict fast-forward on a clean tree only \(GitHub delivery always takes origin\/<base>\)$/);
+    expect(opt('--from-container')?.description).toMatch(/^first export the container branches .*strict fast-forward on a clean tree only$/);
     expect(opt('--from-container')?.description).not.toMatch(/built|install/);
     expect(opt('--timeout')).toBeDefined();
     expect(opt('--now')).toBeDefined();

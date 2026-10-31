@@ -3,7 +3,6 @@ import type { MinionsConfig } from '../config/schema.js';
 import { MinionsError } from '../core/errors.js';
 import { ensureDir, exists } from '../core/fsutil.js';
 import { openDb } from './db.js';
-import { configureOrigin, type OriginResult } from './github.js';
 import type { RuntimePaths } from './paths.js';
 import { BRANCH_PREFIX, git, workspaceLayout, type WorkspaceLayout } from './worktree.js';
 
@@ -11,8 +10,6 @@ const validBranch = (b: string) => /^[A-Za-z0-9._/-]+$/.test(b) && !b.startsWith
 
 export interface ImportResult {
   head: string; base: string; imported: boolean; baseFastForwarded: boolean; repo: string; hostRefs: string[];
-  /** Present only when a GitHub token file is mounted (readable or not); absent = unchanged v0.1 behaviour. */
-  origin?: OriginResult;
 }
 
 /**
@@ -20,11 +17,8 @@ export interface ImportResult {
  * Existing repo: fetch into refs/remotes/host/*; the local base branch is only fast-forwarded (so new
  * agent branches start from the refreshed base) and never rewritten — a diverged base is left alone.
  * `imported` is true when the repo was cloned, false when an existing clone was refreshed.
- * `baseFrom: 'origin'` (GitHub delivery): the host refs are still fetched, but the local base is never
- * moved to the host's base: origin/<base> is the single source of truth and every claim fast-forwards
- * the base from it (./base-sync.ts).
  */
-export async function importWorkspace(bundlePath: string, opts: { base: string; remoteUrl?: string; config: Pick<MinionsConfig, 'git'>; layout?: WorkspaceLayout; tokenFile?: string; baseFrom?: 'host' | 'origin' }): Promise<ImportResult> {
+export async function importWorkspace(bundlePath: string, opts: { base: string; config: Pick<MinionsConfig, 'git'>; layout?: WorkspaceLayout }): Promise<ImportResult> {
   const layout = opts.layout ?? workspaceLayout();
   const bundle = resolvePath(bundlePath);
   if (!validBranch(opts.base)) throw new MinionsError('PRECONDITION', `Invalid base branch name "${opts.base}".`);
@@ -45,17 +39,14 @@ export async function importWorkspace(bundlePath: string, opts: { base: string; 
     const inside = await git(repo, ['rev-parse', '--is-inside-work-tree'], true);
     if (inside.code !== 0) throw new MinionsError('PRECONDITION', `${repo} exists but is not a git repository.`, 'Inspect the workspace volume manually.');
     await git(repo, ['fetch', '--no-tags', bundle, '+refs/heads/*:refs/remotes/host/*']);
-    if (opts.baseFrom !== 'origin') baseFastForwarded = await fastForwardBase(repo, opts.base);
+    baseFastForwarded = await fastForwardBase(repo, opts.base);
   }
   const id = opts.config.git.identity;
   await git(repo, ['config', 'user.name', id.name]);
   await git(repo, ['config', 'user.email', id.email]);
-  // Without a mounted GitHub token the URL is recorded verbatim and never fetched (unchanged v0.1
-  // behaviour); with one, origin becomes the https URL backed by the credential helper.
-  const origin = await configureOrigin(repo, { remoteUrl: opts.remoteUrl, base: opts.base, tokenFile: opts.tokenFile });
   const head = (await git(repo, ['rev-parse', 'HEAD'])).stdout.trim();
   const hostRefs = (await git(repo, ['for-each-ref', '--format=%(refname)', 'refs/remotes/host/'])).stdout.split('\n').filter(Boolean);
-  return { head, base: opts.base, imported, baseFastForwarded, repo, hostRefs, ...(origin ? { origin } : {}) };
+  return { head, base: opts.base, imported, baseFastForwarded, repo, hostRefs };
 }
 
 /** Fast-forwards the local base branch to refs/remotes/host/<base> when that is a pure fast-forward. */

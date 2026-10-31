@@ -46,8 +46,8 @@ describe('README Custom roles example', () => {
       expect(r).toMatchObject({ name: 'researcher', state: 'pending', effective: false });
       expect(r.summary).toMatchObject({ change: 'add', contract: 'producer', edits: { paths: ['docs/research/**'] }, model: 'sonnet', requires: ['network.use'] });
       expect(r.summary.workflows).toEqual([{ name: 'research', stages: ['researcher', 'reviewer'], change: 'add' }]);
-      // README: pr.merge, external.*, ci.edit, infrastructure.edit and deploy.execute default to deny.
-      expect(r.summary.policy.deny).toEqual(expect.arrayContaining(['pr.merge', 'external.comment', 'ci.edit', 'infrastructure.edit', 'deploy.execute']));
+      // README: base.merge, external.*, ci.edit, infrastructure.edit and deploy.execute default to deny.
+      expect(r.summary.policy.deny).toEqual(expect.arrayContaining(['base.merge', 'external.comment', 'ci.edit', 'infrastructure.edit', 'deploy.execute']));
     } finally { db.close(); }
   });
 });
@@ -221,17 +221,17 @@ describe('loosening is stated explicitly', () => {
   it('propose summary and the host apply plan list each capability the role gets looser than the profile', async () => {
     const { projectId } = await initFromTemplate(env.root, { visibility: 'private' });
     const project = await loadProjectJson(projectId);
-    const p = { name: 'researcher', role: { ...ROLE, capabilities: { 'pr.merge': 'allow', 'ci.edit': 'allow', 'external.comment': 'allow' } }, promptText: 'Research.', reason: 'r' };
+    const p = { name: 'researcher', role: { ...ROLE, capabilities: { 'infrastructure.edit': 'allow', 'ci.edit': 'allow', 'external.comment': 'allow' } }, promptText: 'Research.', reason: 'r' };
     const f = join(env.root, 'loose.json');
     writeFileSync(f, JSON.stringify(p));
     const proposed = await proposeRole({ db, config: runtimeConfig(project) }, f);
     // project-owner has these at ask.
     expect(proposed.summary.loosens).toEqual([
       { capability: 'external.comment', profile: 'ask', proposed: 'allow' },
-      { capability: 'pr.merge', profile: 'ask', proposed: 'allow' },
       { capability: 'ci.edit', profile: 'ask', proposed: 'allow' },
+      { capability: 'infrastructure.edit', profile: 'ask', proposed: 'allow' },
     ]);
-    const line = '  LOOSENS: external.comment ask -> allow, pr.merge ask -> allow, ci.edit ask -> allow (looser than the active profile)';
+    const line = '  LOOSENS: external.comment ask -> allow, ci.edit ask -> allow, infrastructure.edit ask -> allow (looser than the active profile)';
     expect(formatSummary(proposed.summary).split('\n')[1]).toBe(line);
     const plan = formatApplyPlan(await applyRoleProposal(project, proposed.proposalId, { dryRun: true }, deps(fakeRuntime(project))));
     expect(plan.split('\n')[1]).toBe(line);
@@ -240,7 +240,7 @@ describe('loosening is stated explicitly', () => {
 
   it('a role within the profile has no LOOSENS line', async () => {
     const config = validateConfig(defaults('project-owner'));
-    const { summary } = await checkProposal(config, { name: 'researcher', role: { ...ROLE, capabilities: { 'pr.merge': 'deny' } }, promptText: 'x', reason: 'r' });
+    const { summary } = await checkProposal(config, { name: 'researcher', role: { ...ROLE, capabilities: { 'base.merge': 'deny' } }, promptText: 'x', reason: 'r' });
     expect(summary.loosens).toEqual([]);
     expect(formatSummary(summary)).not.toMatch(/LOOSENS/);
   });

@@ -204,7 +204,7 @@ describe('manager-bot-token credential', () => {
     expect(r.steps.find((s) => s.id === 'manager')).toMatchObject({ status: 'done', detail: expect.stringMatching(/^bot 555666777 stored in a 0600 host file; not paired/) });
     const id = r.projectId;
     const secretsBefore = await C.materializeSecrets(id);
-    expect(secretsBefore).toEqual({ github: false, telegram: true, codex: false, claude: false });
+    expect(secretsBefore).toEqual({ telegram: true, codex: false, claude: false });
     const p = projectPaths(id);
     expect(readdirSync(p.secretsDir).sort()).toEqual(['telegram-bot-token']);
     expect(readFileSync(p.telegramTokenFile, 'utf8')).toBe(COORD + '\n');
@@ -474,8 +474,8 @@ describe('minions setup: host manager bot step', () => {
 
   it('an empty piped manager token fails before anything is written, naming its stdin line', async () => {
     const repo = makeRepo(env.root);
-    await expect(runSetup({ path: repo, yes: true, tokens: { github: 'x', telegram: COORD, manager: ' ' }, runtime: fakeRuntime() }))
-      .rejects.toMatchObject({ code: 'PRECONDITION', message: expect.stringContaining('--manager-token-stdin'), hint: expect.stringContaining('third line') });
+    await expect(runSetup({ path: repo, yes: true, tokens: { telegram: COORD, manager: ' ' }, runtime: fakeRuntime() }))
+      .rejects.toMatchObject({ code: 'PRECONDITION', message: expect.stringContaining('--manager-token-stdin'), hint: expect.stringContaining('second line') });
     await expect(runSetup({ path: repo, yes: true, tokens: { manager: '' }, runtime: fakeRuntime() }))
       .rejects.toMatchObject({ hint: expect.stringContaining('first line') });
     expect(existsSync(managerPaths().dir)).toBe(false);

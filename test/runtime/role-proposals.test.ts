@@ -87,7 +87,7 @@ describe('config roles propose (runtime)', () => {
       tools: ['Read', 'Grep', 'Glob', 'Bash', 'Edit', 'Write', 'WebSearch', 'WebFetch'],
       workflows: [{ name: 'research', stages: ['researcher', 'reviewer'], change: 'add' }],
     });
-    expect(r.data.summary.policy.deny).toEqual(expect.arrayContaining(['deploy.execute', 'pr.merge', 'external.read', 'ci.edit']));
+    expect(r.data.summary.policy.deny).toEqual(expect.arrayContaining(['deploy.execute', 'base.merge', 'external.read', 'ci.edit']));
     // Nothing effective: the runtime config is untouched and the role is not registered.
     expect(readFileSync(configFile(), 'utf8')).toBe(configBefore);
     const list = await run('config', 'roles', 'list');

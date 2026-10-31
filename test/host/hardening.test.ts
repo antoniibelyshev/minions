@@ -123,9 +123,9 @@ describe('host runtime sandbox settings (H4, M3, M5, M7, L1)', () => {
   const fs = s.sandbox.filesystem as { allowWrite: string[]; denyWrite: string[]; denyRead: string[]; allowRead: string[] };
   const net = s.sandbox.network as Record<string, unknown>;
 
-  it('data root unreadable to sandboxed commands; only this project\'s dirs, config, plugin and GitHub token re-opened', () => {
+  it('data root unreadable to sandboxed commands; only this project\'s dirs, config and plugin re-opened', () => {
     expect(fs.denyRead).toEqual(expect.arrayContaining([h.hostRoot, h.credentialsDir, `${h.secretsDir}/anthropic-api-key`, `${h.secretsDir}/telegram-bot-token`]));
-    expect(fs.allowRead).toEqual(expect.arrayContaining([h.workspace, h.state, `${h.projectDir}/host/bin`, `${h.projectDir}/runtime`, h.pluginDir, `${h.secretsDir}/github-token`, '/Users/u/.nvm/versions/node/v22']));
+    expect(fs.allowRead).toEqual(expect.arrayContaining([h.workspace, h.state, `${h.projectDir}/host/bin`, `${h.projectDir}/runtime`, h.pluginDir, '/Users/u/.nvm/versions/node/v22']));
     expect(fs.allowRead).not.toContain(h.secretsDir);
     expect(s.deny).toEqual(expect.arrayContaining([`Read(//${h.hostRoot.slice(1)}/*.json)`, `Read(//${h.otherProjects[0]!.slice(1)}/**)`, `Edit(//${h.projectDir.slice(1)}/runtime/**)`]));
     expect(s.blockReadsOutsideWorkingDirectories).toBe(true);
@@ -234,11 +234,11 @@ describe('host-runtime git hardening (H2)', () => {
   });
 
   it('argv/env: hooks off, only https (+file for bundles), no file transport for network ops, helpers reset, no system config', () => {
-    const a = G.hardenedGitArgs({ credentialHelper: '!/x/minions git-credential' });
-    for (const v of ['core.hooksPath=/dev/null', 'core.fsmonitor=false', 'credential.helper=', 'credential.https://github.com.helper=!/x/minions git-credential',
+    const a = G.hardenedGitArgs();
+    for (const v of ['core.hooksPath=/dev/null', 'core.fsmonitor=false', 'credential.helper=',
       'protocol.allow=never', 'protocol.https.allow=always', 'protocol.file.allow=always', 'protocol.ssh.allow=never', 'protocol.ext.allow=never', 'submodule.recurse=false', 'gc.auto=0'])
       expect(a).toContain(v);
-    expect(a.indexOf('credential.helper=')).toBeLessThan(a.indexOf('credential.https://github.com.helper=!/x/minions git-credential'));
+    expect(a.some((v) => v.startsWith('credential.https://'))).toBe(false);
     expect(G.hardenedGitArgs({ network: true })).toContain('protocol.file.allow=never');
     expect(G.isNetworkOp(['push', '--porcelain', 'https://github.com/a/b.git', 'x:y'])).toBe(true);
     expect(G.isNetworkOp(['ls-remote', 'origin'])).toBe(true);
@@ -361,7 +361,7 @@ describe('host runtime environment (M4, L2, L3)', () => {
     const { project } = await hostProject();
     const cli = join(env.root, 'fake cli.mjs');
     writeFileSync(cli, 'process.stdout.write(JSON.stringify(process.env))\n');
-    await prepareHostRuntime(project, { target: { node: process.execPath, cli }, pathEnv: '/usr/bin:/bin', runner: async () => ok() });
+    await prepareHostRuntime(project, { target: { node: process.execPath, cli }, runner: async () => ok() });
     const shim = hostRuntimePaths(project.projectId).minionsShim;
     expect(minionsShim(project, { node: '/n', cli: '/c' })).toMatch(/unset .*AWS|sed -n -E/);
     const out = execFileSync(shim, [], { encoding: 'utf8', env: { PATH: '/usr/bin:/bin', AWS_SESSION_TOKEN: 'x', GIT_CONFIG_KEY_0: 'core.hooksPath', GIT_CONFIG_COUNT: '1', NODE_OPTIONS: '--x', KEEP_ME: '1' } });
@@ -389,14 +389,15 @@ describe('Keychain avoidance (H3)', () => {
     };
     return { runner, calls };
   }
-  const TOKEN = 'github_pat_' + 'A'.repeat(40);
+  const TOKEN = 'sk-proj-' + 'A'.repeat(40);
 
   it('selectStore uses the file store while any project uses the host runtime', async () => {
     const { runner } = fakeSecurity(new Map());
-    expect((await Cred.selectStore({ runner, platform: 'darwin', env: {} })).backend).toBe('keychain');
+    const kind = Cred.CODEX_CREDENTIAL;
+    expect((await Cred.selectStore({ kind, runner, platform: 'darwin', env: {} })).backend).toBe('keychain');
     await hostProject();
-    expect((await Cred.selectStore({ runner, platform: 'darwin', env: {} })).backend).toBe('file');
-    expect((await Cred.selectStore({ runner, platform: 'darwin', env: { MINIONS_CREDENTIAL_STORE: 'keychain' } })).backend).toBe('file');
+    expect((await Cred.selectStore({ kind, runner, platform: 'darwin', env: {} })).backend).toBe('file');
+    expect((await Cred.selectStore({ kind, runner, platform: 'darwin', env: { MINIONS_CREDENTIAL_STORE: 'keychain' } })).backend).toBe('file');
   });
 
   it('prepareHostRuntime moves Keychain tokens of every project to the 0600 file store', async () => {
@@ -405,15 +406,15 @@ describe('Keychain avoidance (H3)', () => {
     const other = makeRepo(env.root, 'docker-repo');
     const r = await runInit({ path: other, yes: true, visibility: 'private', dockerProbe: async () => ({ daemon: true, serverVersion: '1', compose: true, composeVersion: '1' }) });
     const otherId = r.plan.projectId;
-    await Cred.provisionGithubToken({ projectId: otherId, token: TOKEN, repoPath: other, verify: false, runner, platform: 'darwin', env: {} });
-    expect((await Cred.loadCredentialRefs(otherId)).github?.backend).toBe('keychain');
+    await Cred.provisionCodexKey({ projectId: otherId, token: TOKEN, repoPath: other, runner, platform: 'darwin', env: {} });
+    expect((await Cred.loadCredentialRefs(otherId)).codex?.backend).toBe('keychain');
     const { project } = await hostProject();
     const prep = await prepareHostRuntime(project, { target: { node: process.execPath, cli: '/x' }, runner });
-    expect(prep.movedToFileStore).toEqual([{ projectId: otherId, kind: 'github' }]);
-    expect((await Cred.loadCredentialRefs(otherId)).github?.backend).toBe('file');
+    expect(prep.movedToFileStore).toEqual([{ projectId: otherId, kind: 'codex' }]);
+    expect((await Cred.loadCredentialRefs(otherId)).codex?.backend).toBe('file');
     expect(items.size).toBe(0);
-    expect(await Cred.readGithubToken(otherId, runner)).toBe(TOKEN);
-    expect(lstatSync(new Cred.FileStore().path(otherId)).mode & 0o777).toBe(0o600);
+    expect(await Cred.readCodexKey(otherId, runner)).toBe(TOKEN);
+    expect(lstatSync(new Cred.FileStore(Cred.CODEX_CREDENTIAL).path(otherId)).mode & 0o777).toBe(0o600);
     expect(projectPaths(otherId).dir).toBeTruthy();
   });
 });

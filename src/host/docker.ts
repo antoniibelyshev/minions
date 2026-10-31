@@ -98,7 +98,7 @@ export function composeYaml(p: ProjectJson, access: SecretsAccess = probeSecrets
   bind(paths.runtimeDir, CONTAINER.configDir);
   // Secrets: a directory mount (never a single-file mount) so a key/token replaced on the host via
   // rename (new inode) is visible without recreating the container. Only the Claude key copy and
-  // materialized GitHub/Telegram tokens live here; the host credential store (Keychain / credentials
+  // materialized tokens live here; the host credential store (Keychain / credentials
   // dir) and the Claude key source are never mounted.
   bind(paths.secretsDir, CONTAINER.secretsDir);
   if (c.publishPorts.length && c.network !== 'none') {
@@ -285,7 +285,7 @@ export async function imageBuildLabel(tag: string, runner: Runner = run): Promis
 
 /** Fingerprint of what goes into the image from the package (null when dist/ is not built). */
 export function buildFingerprint(root: string = packageRoot()): string | null {
-  const files = [join('dist', 'cli.js'), join('docker', 'Dockerfile'), join('docker', 'gh-wrapper.sh'), join('docker', 'minions-sandbox', 'minions-sandbox.c'), 'package.json'];
+  const files = [join('dist', 'cli.js'), join('docker', 'Dockerfile'), join('docker', 'minions-sandbox', 'minions-sandbox.c'), 'package.json'];
   if (!existsSync(join(root, files[0]!))) return null;
   const h = createHash('sha256');
   for (const f of files) h.update(f).update('\0').update(existsSync(join(root, f)) ? readFileSync(join(root, f)) : '').update('\0');

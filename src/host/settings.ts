@@ -132,15 +132,9 @@ const withClass = (d: DeclaredSetting): SettingDef =>
 
 const DECLARED: readonly DeclaredSetting[] = [
   // ---- Delivery
-  { key: 'delivery.mode', group: 'Delivery', label: 'Delivery mode', type: 'enum', choices: ['local', 'branch', 'pull-request'], apply: 'prompt',
-    description: 'local: commits stay in the runtime; branch: push agent/<slug>; pull-request: push and open a PR',
-    loosens: (f, t) => (f === 'local' && t !== 'local' ? `agents push agent/<slug> branches to GitHub${t === 'pull-request' ? ' and open pull requests' : ''}` : f === 'branch' && t === 'pull-request' ? 'agents open pull requests on GitHub' : null) },
-  { key: 'delivery.merge', group: 'Delivery', label: 'Merge mode', type: 'enum', choices: ['disabled', 'manual', 'auto-when-eligible'], apply: 'prompt',
-    description: 'whether minions merges approved work: never, on request, or automatically when every gate passes (pull-request delivery: GitHub merges once CI and approvals pass; local delivery: the runtime merges the approved head into the base after its own verification, base.merge policy)',
-    loosens: (f, t) => (t === 'auto-when-eligible' ? 'pull requests that pass every gate are merged on GitHub without asking (local delivery: approved branches that pass verification are merged into the base without asking)' : f === 'disabled' && t === 'manual' ? 'minions may merge pull requests on GitHub when asked' : null) },
-  { key: 'delivery.requiredChecksConfigured', group: 'Delivery', label: 'Required checks configured', type: 'bool', apply: 'live',
-    description: 'true records that required status checks on the base branch gate merging (auto-merge needs it; minions doctor reports ci.requiredChecks)',
-    loosens: turnsOn('auto-merge may arm for pull requests once their required checks pass (with delivery.merge auto-when-eligible)') },
+  { key: 'delivery.merge', group: 'Delivery', label: 'Merge mode', type: 'enum', choices: ['disabled', 'auto-when-eligible'], apply: 'prompt',
+    description: 'whether the runtime merges approved work: never (the coordinator or you merge), or automatically: the local integrator merges the approved head into the base after its own verification (base.merge policy)',
+    loosens: (_f, t) => (t === 'auto-when-eligible' ? 'approved branches that pass verification are merged into the base without asking' : null) },
   // ---- Verification
   // Shell commands may contain commas: entries are separated with ';' (task-136: the runtime can request them).
   { key: 'verification.commands', group: 'Verification', label: 'Verification commands', type: 'list', separator: ';', apply: 'live',
@@ -163,9 +157,6 @@ const DECLARED: readonly DeclaredSetting[] = [
   { key: 'verification.reviewerRequired', group: 'Verification', label: 'Reviewer required', type: 'bool', apply: 'prompt',
     description: 'whether every task needs an independent reviewer approval before delivery',
     loosens: turnsOff('tasks can be delivered without a reviewer approval') },
-  { key: 'verification.ciAuthority', group: 'Verification', label: 'CI authority', type: 'enum', choices: ['none', 'github'], apply: 'prompt',
-    description: 'github: passing required CI checks may replace the full local verification; none: local only',
-    loosens: (f, t) => (f === 'none' && t === 'github' ? 'testers and reviewers may rely on passing GitHub CI instead of re-running verification locally' : null) },
   // ---- Reporting
   { key: 'communication.progress', group: 'Reporting', label: 'Progress reports', type: 'enum', choices: ['milestones', 'tasks', 'quiet'], apply: 'prompt',
     description: 'what the coordinator reports unprompted: feature milestones, every task, or only blockers' },
@@ -220,7 +211,7 @@ const DECLARED: readonly DeclaredSetting[] = [
         : 'a classifier may approve coordinator actions outside the allow list without prompting';
     } },
   { key: 'coordinator.sandbox', group: 'Policy', label: 'Host runtime sandbox', type: 'bool', optional: true, apply: 'launch',
-    description: 'host runtime: Bash runs in the Claude Code sandbox (writes limited to the workspace and state, network to GitHub and npm); false: unsandboxed, as your user (local config only)',
+    description: 'host runtime: Bash runs in the Claude Code sandbox (writes limited to the workspace and state, network to npm); false: unsandboxed, as your user (local config only)',
     loosens: (f, t) => (f !== false && t === false ? 'agent commands run on your host without the sandbox, with your full user access' : null) },
   { key: 'coordinator.contextReset.enabled', group: 'Policy', label: 'Routine context resets', type: 'bool', apply: 'live',
     description: 'the coordinator hands off and restarts with a fresh context when idle' },
@@ -246,14 +237,6 @@ const DECLARED: readonly DeclaredSetting[] = [
     loosens: (f, t) => (Array.isArray(t) && t.length > (Array.isArray(f) ? f.length : 1) ? `more digests a day (${t.length}: one coordinator wake each)` : null) },
   { key: 'routine.timezone', group: 'Policy', label: 'Routine time zone', type: 'text', optional: true, apply: 'live',
     description: 'IANA time zone of the digest times and the routine\'s days (default Europe/Berlin)' },
-  // Phase 5 (task-68.6): GitHub labels that import ready. Host-owned.
-  { key: 'intake.github.readyLabels', group: 'Policy', label: 'GitHub labels that import ready', type: 'list', optional: true, apply: 'live',
-    description: 'an imported issue carrying every one of these labels (comma-separated) is created ready instead of idea (needs intake.github; default none)',
-    loosens: (f, t) => {
-      const to = Array.isArray(t) ? (t as string[]) : [];
-      const from = Array.isArray(f) ? (f as string[]) : [];
-      return to.length && (!from.length || !from.every((l) => to.includes(l))) ? `GitHub issues labelled ${to.join(' + ')} are imported ready (they start without you)` : null;
-    } },
   { key: 'coordinator.disallowedTools', group: 'Policy', label: 'Coordinator tool trim', type: 'list', optional: true, apply: 'launch',
     description: 'Claude Code tools removed from the coordinator session (default: the built-in trim; none: keep every tool; tools it needs cannot be listed)',
     loosens: (f, t) => {
@@ -272,8 +255,6 @@ const DECLARED: readonly DeclaredSetting[] = [
     loosens: (f, t) => (capRank(t) < capRank(f) ? `${cap} becomes "${String(t)}" (was ${JSON.stringify(f)}): ${t === 'allow' ? 'agents may do it without asking' : 'agents may do it with your approval'}` : null),
   })),
   // ---- Integrations (never shows a secret)
-  { key: 'secrets.github', group: 'Integrations', label: 'GitHub token', type: 'secret', apply: 'live', hostOwned: true,
-    description: 'GitHub token for branch/PR delivery (`minions auth github`)' },
   { key: 'secrets.telegram', group: 'Integrations', label: 'Telegram bot token', type: 'secret', apply: 'launch', hostOwned: true,
     description: 'Telegram bot token for the Telegram channel (`minions auth telegram`)' },
   // ---- Pause (runtime controls)
@@ -350,8 +331,8 @@ function editDistance(a: string, b: string): number {
 }
 
 /**
- * The keys closest to an unknown one, best first (at most `max`): first keys that contain it (`pr.merge` ->
- * `capabilities.pr.merge`), then keys whose last segment contains its last segment (or the reverse), then keys within a
+ * The keys closest to an unknown one, best first (at most `max`): first keys that contain it (`base.merge` ->
+ * `capabilities.base.merge`), then keys whose last segment contains its last segment (or the reverse), then keys within a
  * small edit distance of it (whole key or last segment: typos). Case-insensitive. `keys`: the catalog by default.
  */
 export function closestSettingKeys(input: string, keys: readonly string[] = SETTINGS.map((s) => s.key), max = 3): string[] {
@@ -455,7 +436,7 @@ function sourceOf(def: SettingDef, ctx: SettingsContext): SourceLabel {
 }
 
 /** The credential kind of a `secrets.<kind>` item. */
-export const secretKind = (key: string): 'github' | 'telegram' | 'codex' => key.slice('secrets.'.length) as 'github' | 'telegram' | 'codex';
+export const secretKind = (key: string): 'telegram' | 'codex' => key.slice('secrets.'.length) as 'telegram' | 'codex';
 
 export function currentValue(def: SettingDef, ctx: SettingsContext): Value {
   if (def.type === 'secret') return ctx.credentials[secretKind(def.key)] ? 'provisioned' : 'missing';

@@ -6,8 +6,7 @@
 // git run programs or talk to other hosts:
 //
 // - hooks (core.hooksPath=/dev/null), fsmonitor, pager, askpass and ssh commands;
-// - credential helpers: the inherited list is reset (`credential.helper=` empties it) and only the
-//   minions helper is added for https://github.com;
+// - credential helpers: the inherited list is reset (`credential.helper=` empties it);
 // - transports: everything but https (and local files/bundles where minions needs them) is denied;
 //   network operations deny `file` too, so an insteadOf rewrite cannot reach a local repository with
 //   an agent-chosen upload-pack/receive-pack;
@@ -20,7 +19,7 @@
 // Residual: the filter list is read just before the command runs, so a concurrently running agent
 // could race a new driver in between (the sandbox already denies sandboxed writes to <repo>/.git/config
 // and minions denies Edit/Write there). In the container, only the process runner (runnerGit below) and the
-// allowlisted git of the base update (allowlistedGit, at the end) use it.
+// allowlisted git of the local integration (allowlistedGit, at the end) use it.
 import { lstat } from 'node:fs/promises';
 import { isAbsolute, join } from 'node:path';
 import { MinionsError } from '../core/errors.js';
@@ -29,9 +28,8 @@ import { run, type RunResult } from '../core/exec.js';
 export const isHostRuntime = (env: NodeJS.ProcessEnv = process.env) => env.MINIONS_RUNTIME === 'host';
 
 // ---------------------------------------------------------------------------------------------------------
-// Gate git (task-71). The git reads whose answer decides a gate: the sensitive-path diff of publication and
-// of the merge gate (publish.ts gateChangedPaths), the scheduler's QA-requirement and edit-scope diffs, its
-// ancestry check of a verifier's head, and the ref -> commit reads of the heads those gates are bound to.
+// Gate git (task-71). The git reads whose answer decides a gate: the scheduler's QA-requirement and edit-scope
+// diffs, its ancestry check of a verifier's head, and the ref -> commit reads of the heads those gates are bound to.
 // Workers can write the shared .git, so in both runtimes these reads ignore every history rewrite git
 // would otherwise apply on read:
 //
@@ -103,7 +101,7 @@ export function isNetworkOp(args: string[]): boolean {
   return sub === 'fetch' && args.some((a) => /^https?:\/\//i.test(a));
 }
 
-export interface HardeningOptions { network?: boolean; credentialHelper?: string }
+export interface HardeningOptions { network?: boolean }
 
 /** Leading `-c` options for host-runtime git. */
 export function hardenedGitArgs(opts: HardeningOptions = {}): string[] {
@@ -111,7 +109,6 @@ export function hardenedGitArgs(opts: HardeningOptions = {}): string[] {
     'core.hooksPath=/dev/null', 'core.fsmonitor=false', 'core.sshCommand=/usr/bin/false', 'core.askPass=/usr/bin/false',
     'core.pager=cat', 'core.attributesFile=/dev/null',
     'credential.helper=',
-    ...(opts.credentialHelper ? [`credential.https://github.com.helper=${opts.credentialHelper}`] : []),
     'gc.auto=0', 'maintenance.auto=false',
     'submodule.recurse=false', 'fetch.recurseSubmodules=false', 'push.recurseSubmodules=no',
     'protocol.allow=never', 'protocol.https.allow=always', `protocol.file.allow=${opts.network ? 'never' : 'always'}`,
@@ -157,8 +154,7 @@ export type RawRun = (cmd: string, args: string[], opts: { cwd: string; env: Nod
 export async function hardenedGit(cwd: string, args: string[], allowFailure: boolean, opts: { env?: NodeJS.ProcessEnv; run?: RawRun; timeoutMs?: number; signal?: AbortSignal } = {}): Promise<RunResult> {
   const runner = opts.run ?? ((c, a, o) => run(c, a, o));
   const base = opts.env ?? process.env;
-  const helper = base.MINIONS_GIT_CREDENTIAL_HELPER || undefined;
-  const lead = hardenedGitArgs({ network: isNetworkOp(args), credentialHelper: helper });
+  const lead = hardenedGitArgs({ network: isNetworkOp(args) });
   const timeoutMs = opts.timeoutMs ?? 120_000;
   const signal = opts.signal ? { signal: opts.signal } : {};
   const sub = subcommand(args);
@@ -281,12 +277,10 @@ export async function runnerGit(target: RunnerGitTarget | null, args: string[], 
 }
 
 // ---------------------------------------------------------------------------------------------------------
-// Allowlisted git (task-68.3, docs/design/bootstrap.md "Base update and derived approval"). The git calls a
-// base update or a derived approval depends on (base-update.ts) run in both runtimes with an environment
-// built from an ALLOWLIST, never from the minions process environment: an agent invoking a minions command
-// chooses that environment (GIT_COMMON_DIR, GIT_GRAFT_FILE, GIT_CONFIG_PARAMETERS, HOME/.gitconfig,
-// XDG_CONFIG_HOME, ...). Only the locale, PATH, TZ and TMPDIR are kept (network calls also keep the proxy
-// variables and minions' own MINIONS_* variables, which the credential helper reads); HOME is an empty
+// Allowlisted git (task-68.3). The git calls a local integration depends on (isolated-git.ts) run in both
+// runtimes with an environment built from an ALLOWLIST, never from the minions process environment: an agent
+// invoking a minions command chooses that environment (GIT_COMMON_DIR, GIT_GRAFT_FILE, GIT_CONFIG_PARAMETERS,
+// HOME/.gitconfig, XDG_CONFIG_HOME, ...). Only the locale, PATH, TZ and TMPDIR are kept; HOME is an empty
 // directory the caller owns, no global or system config or attributes are read, and the only GIT_*
 // variables are the ones set here (hardenedGitEnv plus GIT_CONFIG_GLOBAL, GIT_NO_REPLACE_OBJECTS,
 // GIT_OPTIONAL_LOCKS). The host runtime adds the hardened `-c` options as for every host git call.
@@ -294,15 +288,10 @@ export async function runnerGit(target: RunnerGitTarget | null, args: string[], 
 /** Variables an allowlisted git call keeps from the caller's environment; everything else is dropped. */
 const ALLOWED_ENV = new Set(['PATH', 'LANG', 'LANGUAGE', 'TZ', 'TMPDIR']);
 const ALLOWED_ENV_PREFIXES = ['LC_'];
-/** Additionally kept for network calls (ls-remote, fetch): proxies and minions' own variables (credential helper). */
-const NETWORK_ENV = new Set(['HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy', 'ALL_PROXY', 'all_proxy', 'NO_PROXY', 'no_proxy']);
-const NETWORK_ENV_PREFIXES = ['MINIONS_'];
 
 export interface AllowlistedGitEnvOptions {
   /** An empty directory owned by the caller: git's HOME (no ~/.gitconfig, ~/.config/git/*). */
   home: string;
-  /** ls-remote / fetch: keep the proxy and MINIONS_* variables. */
-  network?: boolean;
 }
 
 /** Environment of an allowlisted git call (see above). `base` is only read for the allowlisted names. */
@@ -311,9 +300,7 @@ export function allowlistedGitEnv(base: NodeJS.ProcessEnv, opts: AllowlistedGitE
   const kept: NodeJS.ProcessEnv = {};
   for (const [k, v] of Object.entries(base)) {
     if (v === undefined) continue;
-    const allowed = ALLOWED_ENV.has(k) || ALLOWED_ENV_PREFIXES.some((p) => k.startsWith(p))
-      || (!!opts.network && (NETWORK_ENV.has(k) || NETWORK_ENV_PREFIXES.some((p) => k.startsWith(p))));
-    if (allowed) kept[k] = v;
+    if (ALLOWED_ENV.has(k) || ALLOWED_ENV_PREFIXES.some((p) => k.startsWith(p))) kept[k] = v;
   }
   kept.HOME = opts.home;
   // hardenedGitEnv drops every GIT_* (none is kept above anyway) and adds GIT_CONFIG_NOSYSTEM, GIT_ATTR_NOSYSTEM,
@@ -337,7 +324,6 @@ export function allowlistedGit(cwd: string, args: string[], allowFailure: boolea
   const runner = opts.run ?? ((c, a, o) => run(c, a, o));
   const base = opts.env ?? process.env;
   const env = allowlistedGitEnv(base, opts);
-  // `network` is explicit: behind an isolated call's leading --git-dir / -c options isNetworkOp cannot see the subcommand.
-  const lead = isHostRuntime(base) ? hardenedGitArgs({ network: !!opts.network || isNetworkOp(args), credentialHelper: base.MINIONS_GIT_CREDENTIAL_HELPER || undefined }) : [];
+  const lead = isHostRuntime(base) ? hardenedGitArgs({ network: isNetworkOp(args) }) : [];
   return runner('git', [...lead, ...args], { cwd, env, allowFailure, timeoutMs: opts.timeoutMs ?? 120_000, ...(opts.signal ? { signal: opts.signal } : {}) });
 }

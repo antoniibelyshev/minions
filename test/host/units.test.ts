@@ -1,5 +1,4 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { addOrigin } from './fs-git.js';
 vi.mock('../../src/core/exec.js', async (orig) => (await import('./fs-git.js')).withFsGit(await orig()));
 import { existsSync, mkdirSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -114,7 +113,7 @@ describe('compose generation', () => {
     expect(ProjectJsonSchema.safeParse(base).success).toBe(true);
     expect(ProjectJsonSchema.safeParse({ ...base, container: { ...base.container, tmpSizeMiB: 2048 } }).success).toBe(true);
     expect(ProjectJsonSchema.safeParse({ ...base, container: { ...base.container, tmpSizeMiB: 8 } }).success).toBe(false);
-    const cfg = profileDefaults('project-owner', { hasGitHub: false, hasGitHubCredential: false, baseBranch: 'main', identity: { name: 'Ada', email: 'ada@example.com' }, projectId: ID, packageVersion: '0.1.0' }).config;
+    const cfg = profileDefaults('project-owner', { baseBranch: 'main', identity: { name: 'Ada', email: 'ada@example.com' }, projectId: ID, packageVersion: '0.1.0' }).config;
     expect(cfg.container.memoryMiB).toBe(6144);
     expect(cfg.container.cpus).toBe(4);
     const shape = MinionsConfigSchema.shape.container;
@@ -293,15 +292,13 @@ describe('wizard', () => {
     expect(r.config.container.cpus).toBe(2);
     expect(r.config.container.publishPorts).toEqual([{ host: 3000, container: 3000 }]);
     expect(r.config.verification.commands).toEqual(['npm run lint', 'npm test']);
-    expect(info.join('\n')).toMatch(/GitHub Issues \(not available in v0\.1\)/);
     expect(info.join('\n')).toMatch(/Telegram uses the official Claude Code channel plugin/);
     expect(info.join('\n')).toMatch(/auto \(default: Telegram when a bot token is stored for this project with `minions auth telegram`, otherwise terminal\)/);
     expect(questions).toContain('Communication channel (auto/terminal/telegram)');
     expect(r.config.communication.channel).toBe('auto');
-    expect(info.join('\n')).toMatch(/Branch push and pull requests are not selectable: the repository has no GitHub remote/);
-    expect(info.join('\n')).toMatch(/Auto-merge needs pull-request delivery/);
+    expect(info.join('\n')).toMatch(/Delivery: local commits on agent\/<slug> branches/);
     expect(questions.some((q) => q.startsWith('Delivery mode'))).toBe(false);
-    expect(r.config.delivery.mode).toBe('local');
+    expect(r.config.delivery.merge).toBe('disabled');
     for (const q of questions) expect(q).not.toMatch(/token|password|secret|api key/i);
   });
 
@@ -322,62 +319,6 @@ describe('wizard', () => {
     expect((await runWizard({ discovery: bare, projectId: ID, yes: true })).config.verification.setupCommands).toBeUndefined();
   });
 
-  it('offers branch/pull-request delivery only with a GitHub remote and a stored token', async () => {
-    const repo = makeRepo(env.root);
-    addOrigin(repo, 'git@github.com:acme/demo.git');
-    const discovery = await discover(repo);
-    const run = async (githubCredential: boolean, mode = 'pull-request') => {
-      const questions: string[] = [], info: string[] = [];
-      const io: WizardIO = {
-        ask: async (q, def) => { questions.push(q); return q.startsWith('Starting profile') ? '1' : q.startsWith('Delivery mode') ? mode : def; },
-        info: (l) => info.push(l),
-      };
-      const r = await runWizard({ discovery, projectId: ID, yes: false, io, githubCredential });
-      return { r, questions, info: info.join('\n') };
-    };
-    const ok = await run(true);
-    expect(ok.questions.some((q) => q.startsWith('Delivery mode (local/branch/pull-request)'))).toBe(true);
-    expect(ok.r.config.delivery).toMatchObject({ mode: 'pull-request', provider: 'github', merge: 'disabled' });
-    expect(ok.info).toMatch(/minions does not merge pull requests unless you opt into CI-gated auto-merge/);
-    expect((await run(true, 'branch')).r.config.delivery.mode).toBe('branch');
-    expect((await run(true, 'local')).r.config.delivery.mode).toBe('local');
-
-    const noToken = await run(false);
-    expect(noToken.questions.some((q) => q.startsWith('Delivery mode'))).toBe(false);
-    expect(noToken.r.config.delivery.mode).toBe('local');
-    expect(noToken.info).toMatch(/not selectable: no GitHub token is stored for this project \(run `minions auth github`/);
-
-    // --yes: project-owner defaults to pull-request only when the token exists.
-    expect((await runWizard({ discovery, projectId: ID, yes: true, githubCredential: true })).config.delivery.mode).toBe('pull-request');
-    const fallback = await runWizard({ discovery, projectId: ID, yes: true });
-    expect(fallback.config.delivery.mode).toBe('local');
-    expect(fallback.notes.join('\n')).toMatch(/pull-request delivery .* no GitHub token/);
-  });
-
-  it('does not offer branch/pull-request under a profile that denies git.push (supervised)', async () => {
-    const repo = makeRepo(env.root);
-    addOrigin(repo, 'git@github.com:acme/demo.git');
-    const discovery = await discover(repo);
-    const questions: string[] = [], info: string[] = [];
-    const io: WizardIO = { ask: async (q, def) => { questions.push(q); return def; }, info: (l) => info.push(l) };
-    const r = await runWizard({ discovery, projectId: ID, yes: false, io, githubCredential: true, profile: 'supervised' });
-    expect(questions.some((q) => q.startsWith('Delivery mode'))).toBe(false);
-    expect(r.config.delivery.mode).toBe('local');
-    expect(info.join('\n')).toMatch(/not selectable: the profile denies git\.push/);
-  });
-
-  it('--config with pull-request delivery falls back to local without a GitHub remote, with a reason', async () => {
-    const repo = makeRepo(env.root);
-    const { writeFileSync } = await import('node:fs');
-    const cfg = profileDefaults('project-owner', { hasGitHub: true, hasGitHubCredential: true, baseBranch: 'main', identity: { name: 'A', email: 'a@b' }, projectId: ID, packageVersion: '0.1.0' }).config;
-    expect(cfg.delivery.mode).toBe('pull-request');
-    const file = join(env.root, 'pr.json');
-    writeFileSync(file, JSON.stringify(cfg));
-    const r = await runWizard({ discovery: await discover(repo), projectId: ID, yes: false, configFile: file, githubCredential: true });
-    expect(r.config.delivery).toMatchObject({ mode: 'local', provider: 'none' });
-    expect(r.notes.join('\n')).toMatch(/delivery.mode "pull-request" is not selectable: the repository has no GitHub remote/);
-  });
-
   it('--yes accepts profile defaults without asking', async () => {
     const repo = makeRepo(env.root);
     const r = await runWizard({ discovery: await discover(repo), projectId: ID, yes: true });
@@ -389,7 +330,7 @@ describe('wizard', () => {
   it('--config uses a validated file; unknown fields fail', async () => {
     const repo = makeRepo(env.root);
     const { writeFileSync } = await import('node:fs');
-    const cfg = profileDefaults('supervised', { hasGitHub: false, baseBranch: 'main', identity: { name: 'A', email: 'a@b' }, projectId: ID, packageVersion: '0.1.0' }).config;
+    const cfg = profileDefaults('supervised', { baseBranch: 'main', identity: { name: 'A', email: 'a@b' }, projectId: ID, packageVersion: '0.1.0' }).config;
     const good = join(env.root, 'good.json');
     writeFileSync(good, JSON.stringify(cfg));
     const r = await runWizard({ discovery: await discover(repo), projectId: ID, yes: false, configFile: good });

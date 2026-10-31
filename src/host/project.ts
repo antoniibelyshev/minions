@@ -84,7 +84,7 @@ type Ctx = Pick<ProjectJson, 'projectId' | 'profile' | 'baseBranch' | 'gitIdenti
 export function resolveEffective(project: Ctx, projectRaw: Record<string, unknown>, local: unknown, sources?: Record<string, string>): EffectiveConfig {
   const profile = (PROFILES as readonly string[]).includes(String(projectRaw.profile)) ? projectRaw.profile as ProjectJson['profile'] : project.profile;
   const defaults = profileDefaults(profile, {
-    hasGitHub: false, baseBranch: project.baseBranch, identity: project.gitIdentity,
+    baseBranch: project.baseBranch, identity: project.gitIdentity,
     projectId: project.projectId, packageVersion: VERSION,
   }).config;
   return resolve({ defaults, project: projectRaw, local, sources });

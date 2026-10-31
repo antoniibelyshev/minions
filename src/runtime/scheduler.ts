@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { BacklogAdapter, ScopeFilter, Task, TaskStatus } from '../backlog/types.js';
 import { can, matchesAny } from '../config/capabilities.js';
-import { autoMergeConfigReasons, dependencyDoneStatuses, isGithubDelivery, localIntegrationEnabled } from '../config/delivery.js';
+import { autoMergeConfigReasons, dependencyDoneStatuses, localIntegrationEnabled } from '../config/delivery.js';
 import { isSmall, notReadyReason, sortByPriority } from '../backlog/ready.js';
 import { CURRENT_PHASE, HARNESSES, harnessModels, isHarnessId, isProcessHarness, phaseAllows, type HarnessId, type PhaseRules } from '../config/harnesses.js';
 import { launchFor, type Launch } from '../config/launch.js';
@@ -16,24 +16,18 @@ import {
 } from '../config/workflows.js';
 import { verifyApproval } from '../core/approval.js';
 import { MinionsError } from '../core/errors.js';
-import { syncBaseFromOrigin, type BaseSyncResult } from './base-sync.js';
 import type { BuiltinLeaseRole, Lease, LeaseRole, PublicationState, RuntimeDb } from './db.js';
 import { removeLeaseFiles, type HandoffPaths } from './handoff.js';
 import { corruptRecordHint, hasOpenRun, readRunRecord, removeRunRecord } from './runner/record.js';
 import { RESET_PENDING_HINT, resetBarrier, resetPendingError, type ContextResetCheck } from './context-reset.js';
 import { sessionScope } from './session-scope.js';
 import { missingApprovalKeyReason, runtimePaths } from './paths.js';
-import { ORIGIN_REPOSITORY_META, publishTask, realGh, serverOriginOf, type GhFn, type PublishInput, type PublishOutcome } from './publish.js';
-import type { ServerOrigin, ServerUrlFn } from './base-update.js';
-import { isCiCheck, normalizeCheckCommand, resultContractText, validateResult, type WorkerResult } from './results.js';
+import { normalizeCheckCommand, resultContractText, validateResult, type WorkerResult } from './results.js';
 import { assertBudgetAllowsStart, billingOf, budgetNotice, latestLeaseUsage, recordLeaseUsage, tokensFromResultUsage, type Billing, type BudgetNotice, type SpendContext } from './spend.js';
-import { readRequiredChecks, type RequiredChecksReport } from './ci.js';
-import { ciGateFromDb, formatCiGate, type CiGate } from './ci-gate.js';
-import { autoMergeTask, type MergeResult } from './merge.js';
 import { gateGit } from './git-hardening.js';
 import { enqueueIntegration, FLAKY_OUTCOME, integrationRows, openIntegration, startIntegratorDetached, type IntegrationRow } from './integrator.js';
 import { enqueue as enqueueNotice } from './outbox.js';
-import { BRANCH_PREFIX, branchFor, ensureBranchWorktree, ensureReviewWorktree, git, headOf, resolveBaseBranch, taskSlug, workspaceLayout, type WorkspaceLayout } from './worktree.js';
+import { BRANCH_PREFIX, branchFor, ensureBranchWorktree, ensureReviewWorktree, headOf, resolveBaseBranch, taskSlug, workspaceLayout, type WorkspaceLayout } from './worktree.js';
 
 export const LEASE_ROLES: readonly BuiltinLeaseRole[] = ['engineer', 'tester', 'reviewer'];
 
@@ -55,17 +49,11 @@ export interface SchedulerDeps {
   backlog: BacklogAdapter;
   config: MinionsConfig;
   layout?: WorkspaceLayout;
-  /** Branch/PR publisher (tests inject one with mocked git/gh). */
-  publisher?: (input: PublishInput) => Promise<PublishOutcome>;
   /** Where briefs and submitted results live; their files are removed whenever a lease ends. Omitted: no file cleanup. */
   handoff?: HandoffPaths;
-  /** GitHub delivery: pre-claim fetch + fast-forward of the base from origin (tests may inject one). */
-  baseSync?: (repo: string, base: string) => Promise<BaseSyncResult>;
-  /** Public key verifying host-signed publication approvals (default: runtimePaths().approvalPublicKey). */
+  /** Public key verifying host-signed merge approvals (default: runtimePaths().approvalPublicKey). */
   approvalPublicKeyFile?: string;
-  /** gh for read-only CI lookups (required checks); tests inject a mock. Default: the PATH wrapper. */
-  gh?: GhFn;
-  /** Clock for the CI pending timeout and the spend tally (tests). */
+  /** Clock of the spend tally (tests). */
   now?: () => Date;
   /** API-key billing or a Claude subscription (default: MINIONS_AUTH_METHOD); only units and wording differ. */
   billing?: Billing;
@@ -73,11 +61,6 @@ export interface SchedulerDeps {
   phase?: PhaseRules;
   /** Process-harness run records (agent-runtimes D3b). Omitted: no run records are consulted (tests of other paths). */
   runs?: RunControl;
-  /**
-   * Test seam: where git reaches the recorded origin URL for the verified base reads and the push
-   * (base-update.ts ServerUrlFn; default the URL itself). Only code sets it, never config or the environment.
-   */
-  serverUrl?: ServerUrlFn;
   /**
    * Starts the local integrator (`minions work integrate`) detached after an integration was queued (local
    * integration on). Default: integrator.ts startIntegratorDetached. Tests inject one.
@@ -95,19 +78,12 @@ export interface RunControl { state: string; reap(leaseId: string): Promise<{ no
 /** The worker's token total from the coordinator's task notification (`--usage`); cumulative per agent. */
 export interface UsageFlag { tokens: number; model?: string | null }
 
-/** Result of a publication attempt (`minions work publish`, or embedded in a record response). */
+/** A queued local integration (`minions work publish`, or embedded in a record response). */
 export interface PublishResponse {
-  taskId: string; branch: string; headSha: string; mode: string;
-  state: PublicationState; status: TaskStatus; prUrl: string | null;
-  /** True only when the pull request is merged (task `done`); an open PR is `delivered`, never merged. */
+  taskId: string; branch: string; headSha: string;
+  state: PublicationState; status: TaskStatus;
+  /** True only when the head landed on the base (task `done`). */
   merged: boolean;
-  /** delivery.merge "auto-when-eligible": the auto-merge pass that followed delivery (src/runtime/merge.ts). */
-  merge?: MergeResult;
-  push?: 'pushed' | 'already-current'; pr?: 'created' | 'existing' | null;
-  reasons?: string[]; sensitivePaths?: string[];
-  /** awaiting-approval: why no recorded approval was accepted (missing, invalid signature, other head, expired). */
-  approvalError?: string;
-  errorCode?: string; retryable?: boolean;
   message: string;
 }
 
@@ -265,15 +241,9 @@ export interface TaskBrief {
   harness: HarnessId;
   maxTurns: number;
   configRevision: number;
-  deliveryMode: string;
   priorFindings: { leaseId: string; role: string; status: string; findings: unknown[]; nextAction: string }[];
   /** Present when the previous stage of this task was wound down by a drain (upgrade): continue from its checkpoint. */
   resume?: DrainResume;
-  /**
-   * Tester/reviewer with verification.ciAuthority "github": the CI evidence gate for expectedHead at claim
-   * time. Only `state: "pass"` lets the worker rely on CI instead of re-running the full verification.
-   */
-  ci?: CiGate;
   /**
    * The lease's own disk-backed, exec-allowed scratch dir (set by claimWithBrief): the worker uses it as TMPDIR
    * for test runs and tools. Removed when the lease ends and on coordinator start; absent = use the inherited TMPDIR.
@@ -303,9 +273,7 @@ export interface RecordResponse {
   repairCycles?: number; headSha?: string; message: string;
   /** A partial result returned because of a drain (upgrade): not a failed attempt or a repair cycle. */
   drain?: boolean;
-  /** The CI gate kept the result from counting: `fail` = sent to repair, `unverified` = status unchanged (re-dispatch with local verification). */
-  ciBlocked?: 'fail' | 'unverified';
-  /** Present when the approval started branch/PR publication. */
+  /** Present when the approval queued a local integration. */
   publication?: PublishResponse;
   /** The token total stored for this lease (from --usage, else the result's usage block). */
   usage?: { tokens: number; model: string | null; source: string };
@@ -319,42 +287,24 @@ const nowIso = () => new Date().toISOString();
 
 export { normalizeCheckCommand };
 
-/** The full configured verification passed locally (source not ci); with no commands configured, any passing local check. */
-export function localVerificationComplete(checks: { command: string; outcome: string; source?: 'local' | 'ci' }[], configured: string[]): boolean {
-  const passed = checks.filter((c) => !isCiCheck(c) && c.outcome === 'pass');
-  if (!configured.length) return passed.length > 0;
-  const ran = new Set(passed.map((c) => normalizeCheckCommand(c.command)));
-  return configured.every((cmd) => ran.has(normalizeCheckCommand(cmd)));
-}
-
 export class Scheduler {
   readonly db: RuntimeDb;
   readonly backlog: BacklogAdapter;
   readonly config: MinionsConfig;
   readonly layout: WorkspaceLayout;
-  private readonly publisher: (input: PublishInput) => Promise<PublishOutcome>;
   private readonly handoff: HandoffPaths | null;
-  private readonly baseSync: (repo: string, base: string) => Promise<BaseSyncResult>;
   private readonly approvalPublicKeyFile: string;
-  private readonly gh: GhFn;
   private readonly now: () => Date;
   private readonly runs: RunControl | null;
-  private readonly serverUrl: ServerUrlFn | undefined;
   private readonly startIntegratorFn: () => void;
 
   constructor(deps: SchedulerDeps) {
-    this.serverUrl = deps.serverUrl;
     this.startIntegratorFn = deps.startIntegrator ?? (() => { startIntegratorDetached({ log: join(runtimePaths().logs, 'integration', 'integrator.log'), cwd: this.layout.repo }); });
     this.runs = deps.runs ?? null;
     this.db = deps.db; this.backlog = deps.backlog; this.config = deps.config;
     this.layout = deps.layout ?? workspaceLayout();
     this.handoff = deps.handoff ?? null;
-    this.publisher = deps.publisher ?? publishTask;
-    this.baseSync = deps.baseSync ?? ((repo, base) => syncBaseFromOrigin(repo, base, {
-      gh: this.gh, ...this.originOpts(), ...(this.serverUrl ? { serverUrl: this.serverUrl } : {}),
-    }));
     this.approvalPublicKeyFile = deps.approvalPublicKeyFile ?? runtimePaths().approvalPublicKey;
-    this.gh = deps.gh ?? realGh;
     this.now = deps.now ?? (() => new Date());
     this.billing = deps.billing ?? billingOf();
     this.phase = deps.phase ?? CURRENT_PHASE;
@@ -399,19 +349,6 @@ export class Scheduler {
   private withBudget<T extends object>(r: T, usage: RecordResponse['usage']): T & Pick<RecordResponse, 'usage' | 'budget'> {
     const budget = budgetNotice(this.spendContext()) ?? undefined;
     return { ...r, ...(usage ? { usage } : {}), ...(budget ? { budget } : {}) };
-  }
-
-  /**
-   * CI evidence gate for a task head (src/runtime/ci-gate.ts): required checks read now (read-only gh
-   * api), observations from `minions sync`. Never throws; unreadable required checks are `unknown`.
-   * Shared by the tester/reviewer stages and the merge gate (task-1.9).
-   */
-  async ciGate(taskId: string, head: string): Promise<CiGate> {
-    let required: RequiredChecksReport | null = null;
-    if (this.config.verification.ciAuthority === 'github') {
-      try { required = await readRequiredChecks(this.layout.repo, this.config, { git, gh: this.gh }); } catch { required = null; }
-    }
-    return ciGateFromDb(this.db, this.config, taskId, head, required, this.now());
   }
 
   list(opts: { all?: boolean; taskId?: string } = {}): Lease[] { return this.db.leases(opts); }
@@ -885,9 +822,6 @@ export class Scheduler {
         if (!dependencyDoneStatuses(cfg).has(d.status)) throw new MinionsError('PRECONDITION', `Task ${task.id} depends on ${dep}, which is "${d.status}".`);
       }
     }
-    // GitHub delivery: the base recorded for the lease is origin's base as the server reported it and the
-    // GitHub API confirmed (base-sync.ts), never the local base ref a worker can move (task-71).
-    const verifiedBase = isGithubDelivery(cfg) ? await this.syncBase(task.id, role) : null;
     const allTasks = await listing();
     // A QA sweep's lease is on the base branch itself; its worktree is detached at the base head.
     const sweepBase = sweep ? await resolveBaseBranch(this.layout.repo, cfg.git.baseBranch) : null;
@@ -938,11 +872,11 @@ export class Scheduler {
       // Worktree kind from the role (D4): review = detached at the exact head (read-only); branch = the task branch.
       if (def.worktree === 'review') {
         const b = await resolveBaseBranch(this.layout.repo, cfg.git.baseBranch);
-        baseBranch = b.branch; baseSha = verifiedBase ?? b.sha; head = (await headOf(this.layout.repo, branch))!;
+        baseBranch = b.branch; baseSha = b.sha; head = (await headOf(this.layout.repo, branch))!;
         worktree = (await ensureReviewWorktree(this.layout, slug, head)).worktree;
       } else {
         const wt = await ensureBranchWorktree(this.layout, slug, cfg.git.baseBranch);
-        baseBranch = wt.baseBranch; baseSha = verifiedBase ?? wt.baseSha; head = wt.head; worktree = wt.worktree;
+        baseBranch = wt.baseBranch; baseSha = wt.baseSha; head = wt.head; worktree = wt.worktree;
       }
       this.db.exec('UPDATE leases SET worktree = ?, base_sha = ?, head_sha = ? WHERE id = ?', worktree, baseSha, head, leaseId);
       // The task sits in the stage's status while it runs (D6): an engineer claimed from ready/changes-requested
@@ -959,38 +893,7 @@ export class Scheduler {
       throw e;
     }
 
-    const brief = this.buildBrief(this.db.lease(leaseId)!, task, { attempt, branch, worktree, baseBranch, baseSha, head, startEffect, plan });
-    if (def.contract !== 'producer' && cfg.verification.ciAuthority === 'github') brief.ci = await this.ciGate(task.id, head);
-    return brief;
-  }
-
-  /**
-   * GitHub delivery: origin/<base> is the single source of truth. Fetch it and fast-forward the local
-   * base before any lease exists; a fetch failure or a local base that origin does not contain blocks
-   * the claim (the error propagates unchanged and is recorded as a `base-sync-blocked` event).
-   */
-  /**
-   * The GitHub repository from minions' own record (publish.ts serverOriginOf): the task's PR URL, else the
-   * repository `minions workspace import --remote-url` recorded. `{}` when there is no record (the callee
-   * then falls back to the workspace's origin URL, still reached only at that explicit https URL).
-   */
-  private originOpts(task?: Pick<Task, 'prUrl'> | null): { origin?: ServerOrigin } {
-    const origin = serverOriginOf({ prUrls: [task?.prUrl], recorded: this.db.getMeta(ORIGIN_REPOSITORY_META) ?? null });
-    return origin ? { origin } : {};
-  }
-
-  /** Returns origin's verified base (the commit the lease records), or null for an injected sync without one. */
-  private async syncBase(taskId: string, role: LeaseRole): Promise<string | null> {
-    const base = this.config.git.baseBranch;
-    try {
-      const r = await this.baseSync(this.layout.repo, base);
-      if (r.action !== 'up-to-date') this.db.addEvent('base-sync', taskId, { role, ...r });
-      return /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(r.to) ? r.to : null;
-    } catch (e) {
-      const err = e as Partial<MinionsError>;
-      this.db.addEvent('base-sync-blocked', taskId, { role, base, code: err.code ?? 'INTERNAL', message: err.message ?? String(e), details: err.details ?? null });
-      throw e;
-    }
+    return this.buildBrief(this.db.lease(leaseId)!, task, { attempt, branch, worktree, baseBranch, baseSha, head, startEffect, plan });
   }
 
   private buildBrief(lease: Lease, task: Task, x: { attempt: number; branch: string; worktree: string; baseBranch: string; baseSha: string; head: string; startEffect: string; sweep?: boolean; plan?: StagePlan | null }): TaskBrief {
@@ -1032,8 +935,6 @@ export class Scheduler {
       authorizedCommands: ['git', ...cfg.verification.commands],
       publication: {
         'git.commit': def.worktree === 'review' || !def.commits || x.sweep ? 'deny' : can(cfg, 'git.commit', { role }),
-        'git.push': x.sweep ? 'deny' : can(cfg, 'git.push', { role }),
-        'pr.create': x.sweep ? 'deny' : can(cfg, 'pr.create', { role }),
       },
       policy: {
         taskStart: x.startEffect, codeEdit: can(cfg, 'code.edit', { role }), gitCommit: can(cfg, 'git.commit', { role }),
@@ -1043,7 +944,6 @@ export class Scheduler {
       ...this.briefModel(def, stage),
       maxTurns: cfg.execution.attemptMaxTurns,
       configRevision: cfg.configRevision,
-      deliveryMode: cfg.delivery.mode,
       priorFindings,
       ...(resume ? { resume } : {}),
       ...(x.plan && stage ? { stage: { workflow: x.plan.workflow, position: x.plan.position, count: x.plan.stages.length, role: stage.role, ...(stage.model ? { model: stage.model } : {}) } } : {}),
@@ -1285,7 +1185,7 @@ export class Scheduler {
       throw new MinionsError('INVALID_CONFIG', `Lease ${leaseId} has role "${lease.role}", which is not a registered worker role in this configuration.`,
         `Release it (minions work release ${leaseId}) or ask the owner to restore the role on the host.`);
     }
-    const v = validateResult(raw, def.contract, { ciAuthority: this.config.verification.ciAuthority, verificationCommands: baseRoleName(this.config, lease.role) === ENGINEER_ROLE ? this.config.verification.commands : undefined });
+    const v = validateResult(raw, def.contract, { verificationCommands: baseRoleName(this.config, lease.role) === ENGINEER_ROLE ? this.config.verification.commands : undefined });
     let errors: string[] = v.ok ? [] : v.errors;
     const result = v.ok ? v.result : undefined;
     let actualHead: string | null = null;
@@ -1310,16 +1210,6 @@ export class Scheduler {
       }
       // Edit scope (D3): enforced on the stage diff, not just recorded in the brief.
       if (actualHead && !errors.length) errors.push(...await this.editScopeErrors(lease, def, actualHead));
-    }
-
-    // CI evidence cited by a verifier/gate (tester, reviewer): decided by the runtime gate for the exact head, never by the claim itself.
-    let ciGate: CiGate | null = null;
-    if (result && !errors.length && !sweep && result.status === 'complete' && def.contract !== 'producer' && result.checks.some(isCiCheck)) {
-      ciGate = await this.ciGate(lease.task_id, actualHead!);
-      if (ciGate.state === 'pass') {
-        const bad = result.checks.filter((c) => isCiCheck(c) && c.outcome === 'pass' && !ciGate!.passed.includes(c.command)).map((c) => c.command);
-        if (bad.length) errors.push(`checks: CI evidence entries must name required checks that passed at ${actualHead} (required: ${ciGate.requiredChecks.join(', ')}); not: ${bad.join(', ')}`);
-      }
     }
 
     if (errors.length) {
@@ -1347,7 +1237,7 @@ export class Scheduler {
     const from = task.status;
     let to: TaskStatus = from;
     let approved = false, replan = false, needsSplit = false, repairCycles: number | undefined;
-    let publish = false, integrate = false;
+    let integrate = false;
     let message = '';
     // The stage this lease ran (D6) and its result-contract variant (D4); a QA sweep ignores workflows.
     const plan = sweep ? null : this.leaseStage(task, lease);
@@ -1365,10 +1255,6 @@ export class Scheduler {
     // A drain partial: this lease received the drain notice (the drain hook records it on delivery) for a
     // drain that was active then, even if the drain is cleared by now. Merely spanning a drain does not count.
     const drained = r.status === 'partial' && !sweep && this.db.drainNoticeReceived(lease);
-    // CI not usable as evidence: failing -> repair; otherwise fall back to the result's own local checks, or no approval.
-    const localPass = localVerificationComplete(r.checks, cfg.verification.commands);
-    const ciBlock: 'fail' | 'unverified' | null = !ciGate || ciGate.state === 'pass' ? null : ciGate.state === 'fail' ? 'fail' : localPass ? null : 'unverified';
-    const ciFallback = !!ciGate && ciGate.state !== 'pass' && !ciBlock;
     // D7: a gate/verifier asking for changes sends the task to its repair target; gate results count repair
     // cycles (verifier results do not), and the limit sends the task to awaiting-human for a replan.
     const repair = (): string => {
@@ -1388,13 +1274,6 @@ export class Scheduler {
       } else if (r.status === 'blocked') to = 'blocked';
       else if (r.status === 'needs_split') { to = 'awaiting-human'; needsSplit = true; message = 'QA sweep reported needs_split: create smaller sweep tasks.'; }
       else message = 'Partial QA sweep recorded; status unchanged (claim it again to finish).';
-    } else if (ciBlock === 'fail') {
-      message = `Not approved: ${formatCiGate(ciGate!)}. Task → changes-requested; repair with the failing checks as findings.`;
-      const limit = repair();
-      if (limit) message += ` ${limit}`;
-    } else if (ciBlock === 'unverified') {
-      to = from;
-      message = `Not approved: the ${lease.role} relied on CI, but ${formatCiGate(ciGate!)}. Task stays ${from}: ${ciGate!.state === 'pending' ? 'run \`minions sync\` after CI finishes and re-dispatch, or ' : ''}re-dispatch the ${lease.role} with local verification and without citing CI (engineers: typecheck + unit tier; reviewers run no tests).`;
     } else switch (r.status) {
       case 'complete': {
         const pos = plan!.position;
@@ -1434,12 +1313,9 @@ export class Scheduler {
         // The flow's end (docs/design/autonomy.md Decision 2): without a `merge` marker the approved head is delivered, never landed.
         const end = this.workflowOf(task).end;
         if (!gateOk) to = 'delivered';
-        else if (end && !end.merge && cfg.delivery.mode === 'local') {
+        else if (end && !end.merge) {
           to = 'delivered'; approved = true;
           message = `Approved at ${head}; delivered (the ${plan!.workflow} flow ends without merge: the owner or the coordinator merges it).`;
-        } else if (cfg.delivery.mode !== 'local') {
-          // Publication (below) decides the final status; the task is never delivered before it succeeds.
-          approved = true; publish = true;
         } else if (localIntegrationEnabled(cfg)) {
           // Local integration (docs/design/local-auto-integration.md): the runtime merges, verifies and lands the head.
           to = 'merging'; approved = true; integrate = true;
@@ -1464,7 +1340,7 @@ export class Scheduler {
         break;
     }
 
-    // Record the QA requirement on the task (first QA label) so later stages and publication see it.
+    // Record the QA requirement on the task (first QA label) so later stages and the integration see it.
     const labels = qa.record && to !== 'delivered' ? [...task.labels, qaLabelsOf(cfg)[0]!] : undefined;
     if (to !== from || labels) {
       if (to === 'done' || to === 'delivered') await this.backlog.closeTask(task.id, to);
@@ -1473,49 +1349,29 @@ export class Scheduler {
     if (labels) this.db.addEvent('qa-required', task.id, { leaseId, role: lease.role, head, reasons: qa.reasons, label: labels.at(-1) });
 
     this.db.transaction(() => {
-      // A stage blocked by the CI gate is not a complete stage (publication checks role evidence 'complete').
       this.db.addEvidence({ task_id: task.id, head_sha: head, kind: lease.role, config_revision: cfg.configRevision,
-        outcome: ciBlock ? `ci-${ciGate!.state}` : r.status, details_json: JSON.stringify({ leaseId, verdict: r.verdict ?? null, summary: r.summary }) });
+        outcome: r.status, details_json: JSON.stringify({ leaseId, verdict: r.verdict ?? null, summary: r.summary }) });
       for (const c of r.checks) {
         this.db.addEvidence({ task_id: task.id, head_sha: head, kind: 'check', config_revision: cfg.configRevision,
           outcome: c.outcome, details_json: JSON.stringify({ leaseId, command: c.command, details: c.details ?? null, source: c.source ?? 'local' }) });
       }
-      if (ciGate) {
-        this.db.addEvidence({ task_id: task.id, head_sha: head, kind: 'ci-gate', config_revision: cfg.configRevision,
-          outcome: ciGate.state, details_json: JSON.stringify({ leaseId, role: lease.role, usedAs: ciGate.state === 'pass' ? 'ci' : ciFallback ? 'local-fallback' : 'none', gate: ciGate }) });
-      }
       this.db.exec('UPDATE leases SET head_sha = ? WHERE id = ?', head, leaseId);
       if (plan) this.db.setTaskStage(task.id, plan.workflow, nextStages, nextPos);
-      if (publish) this.db.upsertPublication({ task_id: task.id, branch: lease.branch!, head_sha: head, mode: cfg.delivery.mode, config_revision: cfg.configRevision });
       if (integrate) this.queueIntegration(task.id, lease.branch!, head);
-      this.endLease(leaseId, 'completed', { from, to, approved, replan, needsSplit, publish, ...(integrate ? { integrate } : {}), ...(drained ? { drain: true, reason: 'drain' } : {}) }, { json: JSON.stringify(r), valid: 1 });
+      this.endLease(leaseId, 'completed', { from, to, approved, replan, needsSplit, ...(integrate ? { integrate } : {}), ...(drained ? { drain: true, reason: 'drain' } : {}) }, { json: JSON.stringify(r), valid: 1 });
     });
     await this.cleanupLeaseFiles(leaseId);
     try {
-      const ciNote = ciGate ? (ciBlock ? ` (not approved: ${formatCiGate(ciGate)})` : ciFallback ? ` (CI not usable: ${ciGate.state}; accepted on local checks)` : ' (CI evidence: required checks passed)') : '';
-      await this.backlog.addNote(task.id, `minions: ${lease.role} ${r.status}${drained ? ' (drain)' : ''}${r.verdict ? ` (${r.verdict})` : ''} at ${head.slice(0, 12)}: ${r.summary}${to === 'testing' && qa.reasons.length ? ` (QA required: ${qaWhy})` : ''}${ciNote}`);
+      await this.backlog.addNote(task.id, `minions: ${lease.role} ${r.status}${drained ? ' (drain)' : ''}${r.verdict ? ` (${r.verdict})` : ''} at ${head.slice(0, 12)}: ${r.summary}${to === 'testing' && qa.reasons.length ? ` (QA required: ${qaWhy})` : ''}`);
     } catch (e) {
       this.db.addEvent('record-backlog-error', task.id, { leaseId, error: (e as Error).message });
     }
     if (integrate) {
       this.kickIntegrator(task.id);
-      const publication: PublishResponse = { taskId: task.id, branch: lease.branch!, headSha: head, mode: 'local', state: 'queued', status: 'merging', prUrl: null, merged: false, message };
+      const publication: PublishResponse = { taskId: task.id, branch: lease.branch!, headSha: head, state: 'queued', status: 'merging', merged: false, message };
       return { ...base, valid: true, from, to, approved, replan, needsSplit, repairCycles, headSha: head, publication, message };
     }
-    if (publish) {
-      let publication: PublishResponse;
-      try { publication = await this.publish(task.id); } catch (e) {
-        // The approval and the pending publication are recorded; `minions work publish` retries.
-        this.db.addEvent('publish-error', task.id, { error: (e as Error).message });
-        publication = {
-          taskId: task.id, branch: lease.branch!, headSha: head, mode: cfg.delivery.mode, state: 'pending', status: from, prUrl: null, merged: false,
-          errorCode: (e as MinionsError).code ?? 'INTERNAL', retryable: true,
-          message: `Approved at ${head}, but publication did not complete (${(e as Error).message}). Retry with \`minions work publish ${task.id}\`.`,
-        };
-      }
-      return { ...base, valid: true, from, to: publication.status, approved, replan, needsSplit, repairCycles, headSha: head, publication, message: publication.message };
-    }
-    return { ...base, valid: true, from, to, approved, replan, needsSplit, repairCycles, headSha: head, ...(drained ? { drain: true } : {}), ...(ciBlock ? { ciBlocked: ciBlock } : {}),
+    return { ...base, valid: true, from, to, approved, replan, needsSplit, repairCycles, headSha: head, ...(drained ? { drain: true } : {}),
       message: message || `Recorded ${lease.role} ${r.status}; task ${from} → ${to}.` };
   }
 
@@ -1531,110 +1387,19 @@ export class Scheduler {
   }
 
   /**
-   * Publishes an approved task (branch / pull-request delivery). Idempotent: reruns after a crash
-   * or failure reconcile with the remote branch and an existing PR. The task becomes `delivered`
-   * (with prUrl in pull-request mode) only after publication succeeded; it is never merged.
+   * `minions work publish <task>` with local integration on: queues the approved head again (after a merge approval,
+   * a transient failure, or a lost start) and starts the integrator.
    */
   async publish(taskId: string): Promise<PublishResponse> {
-    const cfg = this.config;
     const pub = this.db.publication(taskId);
-    if (!pub) {
-      throw new MinionsError('PRECONDITION', `Task ${taskId} has no approved publication.`,
-        'Publication starts when a reviewer approval is recorded with delivery.mode branch or pull-request (or local with delivery.merge "auto-when-eligible": a local integration).');
+    if (!pub || pub.mode !== 'local') {
+      throw new MinionsError('PRECONDITION', `Task ${taskId} has no approved head queued for local integration.`,
+        'An integration is queued when a reviewer approval is recorded with delivery.merge "auto-when-eligible".');
     }
-    if (cfg.delivery.mode === 'local') {
-      if (pub.mode === 'local' && localIntegrationEnabled(cfg)) return this.requeueIntegration(taskId);
-      throw new MinionsError('PRECONDITION', 'delivery.mode is "local": nothing is published.', 'Export branches with `minions export` on the host.');
+    if (!localIntegrationEnabled(this.config)) {
+      throw new MinionsError('PRECONDITION', `Local integration is off (${autoMergeConfigReasons(this.config).join('; ')}).`, 'Export branches with `minions export` on the host.');
     }
-    const held = this.db.activeLeases().find((l) => l.task_id === taskId);
-    if (held) throw new MinionsError('CONFLICT', `Task ${taskId} has an active ${held.role} lease (${held.id}); publish after it ends.`);
-    let task = await this.backlog.getTask(taskId);
-    const resp = (state: PublicationState, status: TaskStatus, message: string, extra: Partial<PublishResponse> = {}): PublishResponse =>
-      ({ taskId, branch: pub.branch, headSha: pub.head_sha, mode: cfg.delivery.mode, state, status, prUrl: extra.prUrl ?? pub.pr_url, merged: false, ...extra, message });
-
-    if (pub.state === 'published' && task.status === 'delivered' && (cfg.delivery.mode === 'branch' || task.prUrl)) {
-      return this.withMerge(resp('published', 'delivered', `Already delivered: ${pub.branch} at ${pub.head_sha}${task.prUrl ? ` (${task.prUrl}, not merged)` : ''}.`, { prUrl: task.prUrl }));
-    }
-
-    const failWith = async (code: string, message: string, retryable: boolean): Promise<PublishResponse> => {
-      this.db.setPublicationState(taskId, 'failed', { errorCode: code, error: message });
-      this.db.addEvent('publish', taskId, { state: 'failed', code, message });
-      await this.setStatus(taskId, 'blocked');
-      await this.note(taskId, `minions: publication of ${pub.branch} at ${pub.head_sha.slice(0, 12)} failed (${code}): ${message} Local branch kept; retry with \`minions work publish ${taskId}\`.`);
-      return resp('failed', 'blocked', `Publication failed (${code}): ${message} The local branch is kept; the task is blocked until \`minions work publish ${taskId}\` succeeds.`, { errorCode: code, retryable });
-    };
-
-    const head = await headOf(this.layout.repo, pub.branch);
-    if (head !== pub.head_sha) {
-      return failWith('PRECONDITION', `${pub.branch} is at ${head ?? '(missing)'}, not the approved head ${pub.head_sha}; test and review the new head before publishing.`, false);
-    }
-    // Delivery evidence (D6): a complete gate (reviewer) for this head, and a complete verifier (tester) when QA is required.
-    const reviewed = this.passedAt(taskId, head, 'gate');
-    const tested = this.passedAt(taskId, head, 'verifier') ||
-      !(await this.qaRequirement(task, head)).reasons.length;
-    if (!reviewed || !tested) {
-      return failWith('PRECONDITION', `no ${!reviewed ? 'reviewer approval' : 'passing tester evidence'} for ${head} at config revision ${cfg.configRevision}; run the stage again.`, false);
-    }
-
-    const outcome = await this.publisher({
-      config: cfg, task, repo: this.layout.repo, branch: pub.branch, head,
-      approvals: this.db.approvals(taskId, 'publish', head).map((a) => a.signature),
-      // Bases recorded at claim time: the sensitive-path gate must not depend on the movable local base ref.
-      baseShas: this.db.leases({ taskId, all: true }).map((l) => l.base_sha),
-      approvalPublicKeyFile: this.approvalPublicKeyFile,
-      // The server: minions' recorded repository (the task's PR URL, else the import record).
-      ...this.originOpts(task),
-      ...(this.serverUrl ? { serverUrl: this.serverUrl } : {}),
-    });
-
-    if (outcome.state === 'failed') return failWith(outcome.code, outcome.message, outcome.retryable);
-    if (outcome.state === 'awaiting-approval') {
-      this.db.setPublicationState(taskId, 'awaiting-approval');
-      this.db.addEvent('publish', taskId, { state: 'awaiting-approval', reasons: outcome.reasons, sensitivePaths: outcome.sensitivePaths, approvalError: outcome.approvalError });
-      await this.setStatus(taskId, 'awaiting-human');
-      const how = `the user approves on the host (in the repository, outside the container) with \`minions work approve ${taskId} --head ${head}\`, which signs the approval with the host-held key; then run \`minions work publish ${taskId}\``;
-      await this.note(taskId, `minions: publication of ${pub.branch} at ${head.slice(0, 12)} waits for human approval: ${outcome.reasons.join('; ')}.`);
-      return resp('awaiting-approval', 'awaiting-human', `Not published: ${outcome.reasons.join('; ')} (${outcome.approvalError}). Nothing was pushed; ask the user — ${how}.`,
-        { reasons: outcome.reasons, sensitivePaths: outcome.sensitivePaths, approvalError: outcome.approvalError });
-    }
-
-    this.db.setPublicationState(taskId, 'published', { prUrl: outcome.prUrl });
-    this.db.addEvent('publish', taskId, { state: 'published', push: outcome.push, pr: outcome.pr, prUrl: outcome.prUrl, head });
-    task = await this.backlog.getTask(taskId);
-    if ((outcome.prUrl && task.prUrl !== outcome.prUrl) || task.branch !== pub.branch) {
-      task = await this.backlog.updateTask(taskId, task.version, { ...(outcome.prUrl ? { prUrl: outcome.prUrl } : {}), branch: pub.branch });
-    }
-    if (task.status !== 'delivered') await this.backlog.closeTask(taskId, 'delivered');
-    const what = outcome.prUrl ? `pull request ${outcome.prUrl} (${outcome.pr === 'created' ? 'opened' : 'existing'}, open, not merged)` : `branch ${pub.branch} on origin`;
-    await this.note(taskId, `minions: delivered ${pub.branch} at ${head.slice(0, 12)} as ${what}.`);
-    return this.withMerge(resp('published', 'delivered', `Delivered ${pub.branch} at ${head} as ${what}.${cfg.delivery.merge === 'auto-when-eligible' ? '' : ' minions does not merge.'}`,
-      { prUrl: outcome.prUrl, push: outcome.push, pr: outcome.pr, sensitivePaths: outcome.sensitivePaths }));
-  }
-
-  /** Appends the auto-merge pass to a delivered response (only with delivery.merge "auto-when-eligible"). */
-  private async withMerge(r: PublishResponse): Promise<PublishResponse> {
-    if (this.config.delivery.merge !== 'auto-when-eligible' || this.config.delivery.mode !== 'pull-request') return r;
-    let merge: MergeResult;
-    try { merge = await this.autoMerge(r.taskId); } catch (e) {
-      this.db.addEvent('merge-error', r.taskId, { error: (e as Error).message });
-      return { ...r, message: `${r.message} Auto-merge was not evaluated (${(e as Error).message}); \`minions sync ${r.taskId}\` retries.` };
-    }
-    if (merge.merged) return { ...r, status: 'done', merged: true, merge, message: `${r.message} ${merge.message}` };
-    return { ...r, merge, message: `${r.message} ${merge.message}` };
-  }
-
-  /**
-   * CI-gated auto-merge pass for a delivered task (delivery.merge "auto-when-eligible"; src/runtime/merge.ts):
-   * every gate is evaluated for the approved publication head (CI through `ciGate`, the sensitive-path
-   * gate, pr.merge policy with host-signed merge approvals); GitHub auto-merge is armed only then, and
-   * disarmed when a PR minions armed stops passing. Run by `minions sync` and `minions work publish`.
-   */
-  async autoMerge(taskId: string): Promise<MergeResult> {
-    return autoMergeTask({
-      db: this.db, backlog: this.backlog, config: this.config, repo: this.layout.repo, gh: this.gh, git,
-      ciGate: (id, head) => this.ciGate(id, head), approvalPublicKeyFile: this.approvalPublicKeyFile, now: this.now,
-      ...(this.serverUrl ? { serverUrl: this.serverUrl } : {}),
-    }, taskId);
+    return this.requeueIntegration(taskId);
   }
 
   // ---------------------------------------------------------------- local integration (task-82.3)
@@ -1656,11 +1421,7 @@ export class Scheduler {
     try { this.startIntegratorFn(); } catch (e) { this.db.addEvent('integrator-start-error', taskId, { error: (e as Error).message }); }
   }
 
-  /**
-   * `minions work publish <task>` in local mode with local integration on: queues the approved head again (after a
-   * merge approval, a transient failure, or a lost start) and starts the integrator. The head must still be the
-   * branch head and carry gate approval for it.
-   */
+  /** Queues the approved head again; it must still be the branch head and carry gate approval for it. */
   private async requeueIntegration(taskId: string): Promise<PublishResponse> {
     const cfg = this.config;
     const pub = this.db.publication(taskId)!;
@@ -1668,7 +1429,7 @@ export class Scheduler {
     if (held) throw new MinionsError('CONFLICT', `Task ${taskId} has an active ${held.role} lease (${held.id}); queue the integration after it ends.`);
     const task = await this.backlog.getTask(taskId);
     const resp = (state: PublicationState, status: TaskStatus, message: string): PublishResponse =>
-      ({ taskId, branch: pub.branch, headSha: pub.head_sha, mode: 'local', state, status, prUrl: null, merged: state === 'published', message });
+      ({ taskId, branch: pub.branch, headSha: pub.head_sha, state, status, merged: state === 'published', message });
     if (pub.state === 'published' || task.status === 'done') return resp('published', task.status, `Already integrated: ${pub.branch} at ${pub.head_sha} is in ${cfg.git.baseBranch}.`);
     if (!['merging', 'awaiting-human', 'blocked'].includes(task.status)) {
       throw new MinionsError('PRECONDITION', `Task ${taskId} is "${task.status}"; only an approved task waiting for its integration (merging, awaiting-human, blocked) can be queued again.`);
@@ -1779,9 +1540,9 @@ export class Scheduler {
         this.db.transaction(() => { this.db.setPublicationState(taskId, 'awaiting-approval', { error: row.detail ?? null }); evidence(); });
         await this.setStatus(taskId, 'awaiting-human');
         status = 'awaiting-human';
-        message = `the integration of ${pub.branch} waits for human approval (${row.detail ?? 'merge approval needed'}); the user runs \`minions work approve ${taskId} --head ${row.head_sha} --merge\` on the host, then \`minions work publish ${taskId}\``;
+        message = `the integration of ${pub.branch} waits for human approval (${row.detail ?? 'merge approval needed'}); the user runs \`minions work approve ${taskId} --head ${row.head_sha}\` on the host, then \`minions work publish ${taskId}\``;
         this.integrationNotice({ key: `integration-approval:${taskId}:${row.head_sha}`, kind: 'approval', taskId,
-          text: `${taskId} waits for your merge approval before it lands on ${base} (${(row.detail ?? 'merge approval needed').slice(0, 400)}). On the host: \`minions work approve ${taskId} --head ${row.head_sha} --merge\` (or /approve ${taskId} ${row.head_sha} merge in the manager chat).` });
+          text: `${taskId} waits for your merge approval before it lands on ${base} (${(row.detail ?? 'merge approval needed').slice(0, 400)}). On the host: \`minions work approve ${taskId} --head ${row.head_sha}\` (or /approve ${taskId} ${row.head_sha} merge in the manager chat).` });
         break;
       }
       case 'transient': {
@@ -1802,33 +1563,31 @@ export class Scheduler {
   }
 
   /**
-   * Records a host-signed approval (scope "merge") to merge the delivered PR at its approved head, which
-   * pr.merge "ask" requires (the default, and any sensitive-path change). Verified now and again by
-   * every auto-merge pass; the DB row only carries the token. A new head needs a new approval.
+   * Records a host-signed approval (scope "merge") that lets the integrator land the approved head (sensitive paths,
+   * base.merge "ask"). Verified now and again by the integrator; the DB row only carries the token. A new head needs
+   * a new approval.
    */
   approveMerge(taskId: string, opts: { head?: string; by?: string; note?: string; signature?: string; now?: Date } = {}): { taskId: string; headSha: string; approvalId: number; expiresAt: string; message: string } {
     const pub = this.db.publication(taskId);
-    // Local integration: the approval lets the integrator land the head (sensitive paths, base.merge "ask").
-    const local = !!pub && pub.mode === 'local';
-    if (local && pub.state === 'published') throw new MinionsError('PRECONDITION', `Task ${taskId} is already integrated at ${pub.head_sha}.`);
+    if (!pub || pub.mode !== 'local') {
+      throw new MinionsError('PRECONDITION', `Task ${taskId} has no queued local integration to approve.`, 'Merge approval applies to a local integration waiting for approval.');
+    }
+    if (pub.state === 'published') throw new MinionsError('PRECONDITION', `Task ${taskId} is already integrated at ${pub.head_sha}.`);
     // A failed integration (conflict, red, refused, or base.merge denied) is not landable at this head: an approval
     // would change nothing. Only a transient failure (blocked) can be retried at the same head.
-    if (local && pub.state === 'failed' && pub.error_code !== 'TRANSIENT') {
+    if (pub.state === 'failed' && pub.error_code !== 'TRANSIENT') {
       throw new MinionsError('PRECONDITION',
         pub.error_code === 'POLICY_DENIED'
           ? `Task ${taskId} is delivered: base.merge is denied by policy, so the runtime never lands it; the user integrates it.`
           : `The integration of ${taskId} at ${pub.head_sha} failed (${pub.error_code ?? 'failed'}): a merge approval cannot land it. The task goes back for a repair; approve the new head after it is re-reviewed.`,
         'Merge approval applies to an integration waiting for approval (publication state awaiting-approval).');
     }
-    if (!pub || (!local && (pub.state !== 'published' || !pub.pr_url))) {
-      throw new MinionsError('PRECONDITION', `Task ${taskId} has no delivered pull request (or queued local integration) to approve for merging.`, 'Merge approval applies after pull-request delivery, or to a local integration.');
-    }
     if (opts.head && opts.head !== pub.head_sha) {
-      throw new MinionsError('CONFLICT', `--head ${opts.head} is not the approved, delivered head (${pub.head_sha}).`, 'Approve the exact head that was reviewed and delivered.');
+      throw new MinionsError('CONFLICT', `--head ${opts.head} is not the approved head (${pub.head_sha}).`, 'Approve the exact head that was reviewed.');
     }
     if (!opts.signature) {
       throw new MinionsError('PRECONDITION', 'Merge approvals must be signed on the host; an unsigned approval is not accepted.',
-        `The user runs \`minions work approve ${taskId} --head ${pub.head_sha} --merge\` on the host, in the repository (not inside the runtime).`);
+        `The user runs \`minions work approve ${taskId} --head ${pub.head_sha}\` on the host, in the repository (not inside the runtime).`);
     }
     let publicKey: string | null = null;
     try { publicKey = readFileSync(this.approvalPublicKeyFile, 'utf8'); } catch { publicKey = null; }
@@ -1837,50 +1596,12 @@ export class Scheduler {
       : { ok: false as const, reason: missingApprovalKeyReason(this.approvalPublicKeyFile) };
     if (!check.ok) {
       throw new MinionsError('POLICY_DENIED', `Merge approval rejected: ${check.reason}.`,
-        `The user re-runs \`minions work approve ${taskId} --head ${pub.head_sha} --merge\` on the host.`);
+        `The user re-runs \`minions work approve ${taskId} --head ${pub.head_sha}\` on the host.`);
     }
     const by = check.payload.by ?? opts.by ?? null;
     const a = this.db.addApproval({ task_id: taskId, scope: 'merge', head_sha: pub.head_sha, approved_by: by, note: opts.note ?? null, signature: opts.signature });
     this.db.addEvent('approval', taskId, { scope: 'merge', head: pub.head_sha, by, approvalId: a.id, kid: check.payload.kid, expiresAt: check.payload.expiresAt });
-    if (local) {
-      return { taskId, headSha: pub.head_sha, approvalId: a.id, expiresAt: check.payload.expiresAt,
-        message: `Recorded host-signed approval to integrate ${pub.branch} at ${pub.head_sha} into ${this.config.git.baseBranch} (valid until ${check.payload.expiresAt}). Run \`minions work publish ${taskId}\` to queue the integration again.` };
-    }
     return { taskId, headSha: pub.head_sha, approvalId: a.id, expiresAt: check.payload.expiresAt,
-      message: `Recorded host-signed approval to merge ${pub.pr_url} at ${pub.head_sha} (valid until ${check.payload.expiresAt}). Run \`minions sync ${taskId}\`; auto-merge is armed once every other gate passes.` };
-  }
-
-  /**
-   * Records a host-signed human approval to publish the task's approved head (needed when publication
-   * touches sensitive paths or git.push / pr.create are "ask"). The signature (made by the host CLI
-   * with a key the runtime cannot read) must cover exactly this task and head; it is checked here to
-   * fail fast and again by publishTask right before pushing, because the DB row itself is writable by
-   * in-runtime code and is not trusted. New commits need a new approval.
-   */
-  approvePublication(taskId: string, opts: { head?: string; by?: string; note?: string; signature?: string; now?: Date } = {}): { taskId: string; headSha: string; approvalId: number; expiresAt: string; message: string } {
-    const pub = this.db.publication(taskId);
-    if (!pub) throw new MinionsError('PRECONDITION', `Task ${taskId} has no approved publication to authorize.`, 'Approval applies after the reviewer approved the task.');
-    if (pub.state === 'published') throw new MinionsError('PRECONDITION', `Task ${taskId} is already published at ${pub.head_sha}.`);
-    if (opts.head && opts.head !== pub.head_sha) {
-      throw new MinionsError('CONFLICT', `--head ${opts.head} is not the head awaiting publication (${pub.head_sha}).`, 'Approve the exact head that was reviewed.');
-    }
-    if (!opts.signature) {
-      throw new MinionsError('PRECONDITION', 'Publication approvals must be signed on the host; an unsigned approval is not accepted.',
-        `The user runs \`minions work approve ${taskId} --head ${pub.head_sha}\` on the host, in the repository (not inside the runtime).`);
-    }
-    let publicKey: string | null = null;
-    try { publicKey = readFileSync(this.approvalPublicKeyFile, 'utf8'); } catch { publicKey = null; }
-    const check = publicKey
-      ? verifyApproval(opts.signature, publicKey, { taskId, head: pub.head_sha, now: opts.now })
-      : { ok: false as const, reason: missingApprovalKeyReason(this.approvalPublicKeyFile) };
-    if (!check.ok) {
-      throw new MinionsError('POLICY_DENIED', `Approval rejected: ${check.reason}.`,
-        `The user re-runs \`minions work approve ${taskId} --head ${pub.head_sha}\` on the host.`);
-    }
-    const by = check.payload.by ?? opts.by ?? null;
-    const a = this.db.addApproval({ task_id: taskId, scope: 'publish', head_sha: pub.head_sha, approved_by: by, note: opts.note ?? null, signature: opts.signature });
-    this.db.addEvent('approval', taskId, { scope: 'publish', head: pub.head_sha, by, approvalId: a.id, kid: check.payload.kid, expiresAt: check.payload.expiresAt });
-    return { taskId, headSha: pub.head_sha, approvalId: a.id, expiresAt: check.payload.expiresAt,
-      message: `Recorded host-signed approval to publish ${pub.branch} at ${pub.head_sha} (valid until ${check.payload.expiresAt}). Run \`minions work publish ${taskId}\`.` };
+      message: `Recorded host-signed approval to integrate ${pub.branch} at ${pub.head_sha} into ${this.config.git.baseBranch} (valid until ${check.payload.expiresAt}). Run \`minions work publish ${taskId}\` to queue the integration again.` };
   }
 }

@@ -36,24 +36,3 @@ describe('config: routine.autoPromote is legacy', () => {
     }
   });
 });
-
-// Kept from the task-68.6 tests (they lived next to the removed caps).
-describe('settings: intake.github.readyLabels', () => {
-  it('the schema validates the labels', () => {
-    const ok = defaults();
-    ok.intake.github = { enabled: true, repository: 'acme/demo', labels: [], assignee: null, milestone: null, state: 'open', readyLabels: ['minions:ready'] };
-    expect(() => validateConfig(ok, 'test')).not.toThrow();
-    const c = defaults(); c.intake.github = { ...ok.intake.github, readyLabels: ['a,b'] };
-    expect(() => validateConfig(c, 'test')).toThrow();
-  });
-
-  it('is a host-owned live setting; adding a ready label loosens policy', () => {
-    expect(classifyKey('intake.github.readyLabels')).toMatchObject({ class: 'live', hostOwned: true });
-    expect(settingDef('intake.github.readyLabels')).toMatchObject({ class: 'live', hostOwned: true });
-    const labels = settingDef('intake.github.readyLabels')!;
-    expect(labels.loosens!(undefined, ['minions:ready'])).toMatch(/imported ready/);
-    expect(labels.loosens!(['a', 'b'], ['a'])).toMatch(/imported ready/); // fewer labels match more issues
-    expect(labels.loosens!(['a'], ['a', 'b'])).toBeNull();
-    expect(labels.loosens!(['a'], [])).toBeNull();
-  });
-});

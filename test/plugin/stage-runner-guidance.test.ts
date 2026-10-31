@@ -57,7 +57,7 @@ describe('coordinator.md and orchestrate dispatch from work next', () => {
     expect(orch).toContain('`minions work advance <leaseId> --usage <subagent_tokens> --json`');
     expect(orch).toMatch(/It never claims while paused, draining or over the budget, after an invalid result, or when a context reset is due/);
     expect(orch).toMatch(/- `next`: the claimed stage .*Spawn it right away as in step 4/);
-    for (const kind of ['invalid', 'replan', 'needs-split', 'needs-changes', 'blocked', 'partial', 'awaiting-human', 'publication', 'ci-unverified', 'qa-findings', 'context-reset', 'paused', 'draining', 'budget', 'capacity', 'nothing-runnable', 'claim-failed']) {
+    for (const kind of ['invalid', 'replan', 'needs-split', 'needs-changes', 'blocked', 'partial', 'awaiting-human', 'publication', 'qa-findings', 'context-reset', 'paused', 'draining', 'budget', 'capacity', 'nothing-runnable', 'claim-failed']) {
       expect(orch).toContain(`\`${kind}\``);
     }
     expect(orch).toContain('`minions work advance <leaseId> --correction --usage <subagent_tokens> --json`');

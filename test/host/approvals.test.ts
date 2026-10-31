@@ -19,7 +19,7 @@ describe('approval tokens (src/core/approval.ts)', () => {
 
   it('a valid signature for the exact task and head verifies', () => {
     const r = verifyApproval(sign('task-1', HEAD), pair.publicKeyPem, { taskId: 'task-1', head: HEAD });
-    expect(r).toMatchObject({ ok: true, payload: { taskId: 'task-1', head: HEAD, by: 'ada', scope: 'publish', v: 1 } });
+    expect(r).toMatchObject({ ok: true, payload: { taskId: 'task-1', head: HEAD, by: 'ada', scope: 'merge', v: 1 } });
   });
 
   it('fails closed: wrong head, wrong task, tampered, foreign key, unsigned, no key, expired, future', () => {

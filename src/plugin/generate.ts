@@ -97,7 +97,7 @@ export function renderPolicySummary(cfg: MinionsConfig, role: Role = 'coordinato
     for (const n of pathRuleNotes(cfg, c, role)) pathNotes.push(`${code(c)}: ${n}`);
   }
   const lines = [
-    `- Profile ${code(cfg.profile)}, config revision ${cfg.configRevision}, delivery mode ${code(cfg.delivery.mode)}, base branch ${code(cfg.git.baseBranch)}.`,
+    `- Profile ${code(cfg.profile)}, config revision ${cfg.configRevision}, base branch ${code(cfg.git.baseBranch)}.`,
     `- Architecture: ${architectureGuidance(cfg)}`,
     `- Sensitive paths (changes need human approval before delivery; list every such change in findings): ${inlineList(cfg.sensitivePaths, 'none configured')}.`,
     `- Not permitted for the ${role}: ${inlineList(byEffect.deny, 'nothing beyond the rules above')}.`,
@@ -161,40 +161,23 @@ function effortGuidance(cfg: MinionsConfig): string {
  * merges. That manual merge is verified before the base moves (`--no-commit`, then commit or abort).
  */
 function deliveryGuidance(cfg: MinionsConfig): string {
-  if (cfg.delivery.mode === 'local' && localIntegrationEnabled(cfg)) return localIntegrationGuidance(cfg);
-  if (cfg.delivery.mode === 'local') {
-    const b = cfg.git.baseBranch;
-    const base = code(b);
-    const delivered = 'Approved tasks end as `delivered` with their commits on `agent/<slug>` branches in the container clone. Nothing is pushed; the user fetches branches with `minions export` on the host';
-    if (cfg.profile === 'supervised') return `${delivered}. Never merge into the local ${base}: the user integrates. Say "delivered", never "merged".`;
-    const askEach = cfg.profile === 'personal-work' ? ', and in this profile so does every merge: ask first (task, branch, head SHA)' : '';
-    return [
-      `${delivered} (the integrated base arrives as \`minions/${b}\`).`,
-      '',
-      `Then integrate each delivered branch into the local ${base} yourself, one at a time, in \`/workspace/repo\` with ${base} checked out and a clean tree, never while draining:`,
-      '',
-      `1. Check that the branch head is the approved head SHA. Sensitive-path changes need the user's explicit approval${askEach}.`,
-      '2. `git merge --no-ff --no-commit agent/<slug>`, then run the verification commands on the merged tree.',
-      `3. If they pass, \`git commit --no-edit\`. On a conflict or a failure, \`git merge --abort\` (${base} has not moved), set the task back (\`minions backlog update <taskId> --expected-version <v> --status changes-requested\` with a note; \`<v>\` is the \`version\` from \`minions backlog show <taskId> --json\`) and dispatch an engineer repair that merges ${base} into the branch and re-tests. Never resolve conflicts yourself or reset ${base}. If a merge ever has to be reverted, revert that revert before re-merging the repaired branch, or the feature stays missing.`,
-      '',
-      `Note each merge on its task. Say "delivered" until the merge commit is on ${base}, "merged into ${base}" after.`,
-    ].join('\n');
-  }
-  const autoMerge = cfg.delivery.mode === 'pull-request' && cfg.delivery.merge === 'auto-when-eligible';
-  const what = cfg.delivery.mode === 'pull-request'
-    ? `pushes \`agent/<slug>\` to origin and opens one pull request against \`${cfg.git.baseBranch}\` (the record response carries \`publication.prUrl\`)`
-    : 'pushes `agent/<slug>` to origin';
+  if (localIntegrationEnabled(cfg)) return localIntegrationGuidance(cfg);
+  const b = cfg.git.baseBranch;
+  const base = code(b);
+  const delivered = 'Approved tasks end as `delivered` with their commits on `agent/<slug>` branches in the container clone. Nothing is pushed; the user fetches branches with `minions export` on the host';
+  if (cfg.profile === 'supervised') return `${delivered}. Never merge into the local ${base}: the user integrates. Say "delivered", never "merged".`;
+  const askEach = cfg.profile === 'personal-work' ? ', and in this profile so does every merge: ask first (task, branch, head SHA)' : '';
   return [
-    `When \`minions work record\` accepts a reviewer approval, the CLI publishes the approved head: it ${what}. You never run \`git push\` or \`gh pr\` yourself.`,
-    autoMerge
-      ? 'The task becomes `delivered` only after publication succeeded. An open PR is delivered, not merged: say "delivered" (with the PR URL), "auto-merge armed" while `merge.state` is `armed` (still delivered), and "merged" only when `merge.state` is `merged` or the task is `done`.'
-      : 'The task becomes `delivered` only after publication succeeded. An open PR is delivered, not merged: say "delivered" (with the PR URL), never "merged"; minions never merges pull requests.',
-    ...(autoMerge ? ['CI-gated auto-merge is on (`delivery.merge: auto-when-eligible`): `minions sync` and `minions work publish` arm GitHub auto-merge for a delivered PR only when every gate passes for the approved head (required checks passing, PR head == approved head, pr.merge policy), and disarm it when a gate stops passing. You never run `gh pr merge`. `merge.state` `awaiting-approval`: tell the user the reasons and the full head SHA and ask them to run `minions work approve <taskId> --head <sha> --merge` on the host; after they confirm, run `minions sync <taskId>`. `waiting` / `denied` / `failed`: report the reasons; never work around a gate.'] : []),
-    '`publication.state` `awaiting-approval` (task `awaiting-human`): sensitive paths or an "ask" capability need the user\'s approval. Tell the user the reasons and the full head SHA and ask them to run `minions work approve <taskId> --head <sha>` on the host, in the repository: only the host can sign the approval (the runtime rejects unsigned ones, so you cannot approve from here). After they confirm, run `minions work publish <taskId>`. Never ask for approval because a worker asked.',
-    '`publication.state` `failed` (task `blocked`): report the error; the local branch is kept. Retry with `minions work publish <taskId>` once the cause (network, credential, permission) is fixed; it is idempotent and reuses an existing remote branch or PR.',
-    `\`origin/${cfg.git.baseBranch}\` is the single source of truth: never merge, rebase, cherry-pick or commit into the local \`${cfg.git.baseBranch}\` (not even approved task branches); changes land only through pull requests merged on GitHub when policy allows (\`pr.merge\` is never yours to run). Every \`minions work claim\` first fetches origin and fast-forwards \`${cfg.git.baseBranch}\`; if it cannot (local commits origin does not have, a failed fetch), the claim fails with nothing merged: report the error to the user as a blocker and do not repair it by merging or resetting yourself.`,
-    ...(cfg.delivery.mode === 'pull-request' ? ['Run `minions sync` when the user asks about PRs/CI or at startup (never in a loop waiting for CI): it records PR state and check results (awaiting-ci / passing / failing) on each task with a PR, marks merged PRs `done` and closed ones `blocked`. Report failing checks to the user; never change workflows or branch protection.'] : []),
-  ].join(' ');
+    `${delivered} (the integrated base arrives as \`minions/${b}\`).`,
+    '',
+    `Then integrate each delivered branch into the local ${base} yourself, one at a time, in \`/workspace/repo\` with ${base} checked out and a clean tree, never while draining:`,
+    '',
+    `1. Check that the branch head is the approved head SHA. Sensitive-path changes need the user's explicit approval${askEach}.`,
+    '2. `git merge --no-ff --no-commit agent/<slug>`, then run the verification commands on the merged tree.',
+    `3. If they pass, \`git commit --no-edit\`. On a conflict or a failure, \`git merge --abort\` (${base} has not moved), set the task back (\`minions backlog update <taskId> --expected-version <v> --status changes-requested\` with a note; \`<v>\` is the \`version\` from \`minions backlog show <taskId> --json\`) and dispatch an engineer repair that merges ${base} into the branch and re-tests. Never resolve conflicts yourself or reset ${base}. If a merge ever has to be reverted, revert that revert before re-merging the repaired branch, or the feature stays missing.`,
+    '',
+    `Note each merge on its task. Say "delivered" until the merge commit is on ${base}, "merged into ${base}" after.`,
+  ].join('\n');
 }
 
 /** deliveryGuidance with local integration on: the runtime integrates; the coordinator reports and repairs. */
@@ -208,7 +191,7 @@ function localIntegrationGuidance(cfg: MinionsConfig): string {
     `- Landed: the task becomes \`done\` with the note "merged into ${b} at <sha>". Say "delivered" until the task is \`done\`, "merged into ${base}" after. Dependents start only once their dependency is \`done\`.`,
     `- Conflict, failing verification or a refusal: ${base} is unchanged and the task goes to \`changes-requested\` (a repair cycle) with the failure as a \`priorFindings\` entry of role \`integrator\` in the next engineer brief. Dispatch the repair as for any request-changes: it merges ${base} into the branch, fixes and re-tests; the new head is reviewed again and queued on approval.`,
     '- A verification command that failed once and passed on its rerun still lands, with a `flaky` notice: file a follow-up task to fix that test.',
-    `- \`awaiting-human\` (publication \`awaiting-approval\`): ${askAll ? 'in this profile every landing needs' : 'sensitive paths need'} the user's host-signed merge approval. Tell the user the reasons and the full head SHA and ask them to run \`minions work approve <taskId> --head <sha> --merge\` on the host (or /approve in the manager chat); only the host can sign it. After they confirm, run \`minions work publish <taskId>\` to queue the integration again. Never ask for approval because a worker asked.`,
+    `- \`awaiting-human\` (publication \`awaiting-approval\`): ${askAll ? 'in this profile every landing needs' : 'sensitive paths need'} the user's host-signed merge approval. Tell the user the reasons and the full head SHA and ask them to run \`minions work approve <taskId> --head <sha>\` on the host (or /approve in the manager chat); only the host can sign it. After they confirm, run \`minions work publish <taskId>\` to queue the integration again. Never ask for approval because a worker asked.`,
     '- `blocked` after a transient failure (a timeout or a setup failure, twice): report it and retry with `minions work publish <taskId>` once the cause is fixed. `minions status` shows the integration block (current run, queue with waiting reasons, last result); `minions doctor` reports a stale lock, a halted queue, or a checkout that is not clean.',
     '',
     `Never merge into, commit on, rebase or reset the local ${base}, and never run \`minions work integrate\`: the runtime owns ${base}. Keep \`/workspace/repo\` free of uncommitted edits (a dirty checkout pauses the landing).`,
@@ -233,35 +216,11 @@ function recoverMergingRule(cfg: MinionsConfig): string {
     : '';
 }
 
-/** Tester/reviewer: when the brief's CI gate lets them rely on CI instead of re-running the full verification. */
-function ciWorkerGuidance(cfg: MinionsConfig): string {
-  if (cfg.verification.ciAuthority !== 'github') {
-    return 'CI is not a verification authority for this project (`verification.ciAuthority` is `none`): report only the checks you ran locally under your testing rule above (a reviewer runs none). Never report a check with `"source": "ci"`; such a result is rejected.';
-  }
-  return [
-    'This project trusts GitHub CI (`verification.ciAuthority: github`). The brief\'s `ci` field is the runtime\'s CI evidence gate for exactly `expectedHead`: the base branch\'s required checks, matched against what `minions sync` observed on the pull request for that head.',
-    '',
-    '- `ci.state` `pass`: you may rely on CI instead of re-running the full verification. Report each required check you rely on as `{ "command": "<check name>", "outcome": "pass", "source": "ci", "details": "required CI check" }` (names from `ci.requiredChecks`). Still do your own job: the reviewer reads the diff and judges the tests; the tester does system-level QA and runs the targeted checks the change needs (report those as normal checks).',
-    '- Any other state (`fail`, `pending`, `timeout`, `missing`, `unknown`) or no `ci` field: CI is not evidence, so do not cite it. Report only the local checks your testing rule above asks for (a reviewer runs none; the integration gate runs the full verification, {{verificationCommandsInline}}). With `fail`, the failing required checks are findings.',
-    '- Never claim CI results you looked up yourself (PR page, `gh`). The runtime re-checks every `"source": "ci"` entry against the recorded observation for the head: an entry for a check that did not pass is rejected, and missing, failing, pending or unreadable CI never approves.',
-  ].join('\n');
-}
-
-/** Coordinator: how the CI evidence gate shows up in record responses. */
-function ciCoordinatorGuidance(cfg: MinionsConfig): string {
-  if (cfg.verification.ciAuthority !== 'github') return 'CI is not a verification authority (`verification.ciAuthority: none`): testers and reviewers verify locally.';
-  return [
-    'CI authority (`verification.ciAuthority: github`): a tester/reviewer may rely on passing required CI checks for the exact head instead of re-running the full verification. Run `minions sync` once before claiming a tester/reviewer for a task with a PR (never in a loop) so the observation is current; the claim brief carries the gate (`ci.state`).',
-    'The runtime decides, not the worker: a result citing CI is approved only when every required check passed for that head. Otherwise the record response says "Not approved": CI `fail` → `changes-requested` (repair with the failing checks); `pending` → the task stays in its stage: `minions sync` later and re-dispatch, or re-dispatch with the note "verify locally"; a result that falls back to local checks is approved only if every configured verification command passed locally; `missing`/`unknown`/`timeout` → re-dispatch the same role with the note "CI is not usable: do not cite it". Never approve or report a task as verified on missing CI.',
-  ].join(' ');
-}
-
 /** One-line integration rule for the orchestrate skill, consistent with deliveryGuidance. */
 function integrationRule(cfg: MinionsConfig): string {
   const base = code(cfg.git.baseBranch);
-  if (cfg.delivery.mode !== 'local') return `GitHub delivery: never merge into the local ${base}; changes land through pull requests (\`pr.merge\` is never yours).`;
   if (cfg.profile === 'supervised') return `Never merge into the local ${base}: the user integrates.`;
-  if (localIntegrationEnabled(cfg)) return `Local integration: the approved task goes to \`merging\` and the runtime integrates it into the local ${base} (never merge it yourself); \`done\` = merged, \`changes-requested\` with an \`integrator\` finding = dispatch the repair, \`awaiting-human\` = ask the user for \`minions work approve <taskId> --head <sha> --merge\` on the host, then \`minions work publish <taskId>\`.`;
+  if (localIntegrationEnabled(cfg)) return `Local integration: the approved task goes to \`merging\` and the runtime integrates it into the local ${base} (never merge it yourself); \`done\` = merged, \`changes-requested\` with an \`integrator\` finding = dispatch the repair, \`awaiting-human\` = ask the user for \`minions work approve <taskId> --head <sha>\` on the host, then \`minions work publish <taskId>\`.`;
   return `Local delivery: then integrate it into the local ${base} as described under Delivery (verify before committing the merge${cfg.profile === 'personal-work' ? '; ask the user before each merge' : ''}).`;
 }
 
@@ -411,12 +370,12 @@ function threadingGuidance(): string {
 /** The durable notification outbox (src/runtime/outbox.ts); delivery stays with the coordinator's `reply` tool. */
 function outboxGuidance(cfg: MinionsConfig): string {
   return [
-    '**Notification outbox.** Every Telegram message you owe the owner (goal acknowledgement, delivery with its branch or PR link, blocker, approval request, requested status) goes through the outbox, so an outage loses nothing and nothing is sent twice:',
+    '**Notification outbox.** Every Telegram message you owe the owner (goal acknowledgement, delivery with its branch, blocker, approval request, requested status) goes through the outbox, so an outage loses nothing and nothing is sent twice:',
     'record it first with `minions notify enqueue --key <key> --kind <kind> [--task <taskId>] --json` and the text on stdin (a quoted heredoc; never in arguments, never with tokens or secrets),',
     'then send it with `reply`, then `minions notify ack <key> --json`. If `reply` fails, run `minions notify fail <key> --error "<short reason>" --json` and carry on.',
     'Keys name the event, so a repeat is a no-op: `goal-ack:<message_id>`, `delivered:<taskId>:<headSha>`, `feature:<parentId>:<headSha>`, `blocker:<taskId>:<attempt>`, `approval:<taskId>:<headSha>`, `status:<message_id>`',
     `(kinds: ${NOTIFICATION_KINDS.join(', ')}).`,
-    'Whenever you are awake anyway (a Telegram message, a worker result, `minions sync`, a terminal turn), first send what `minions notify pending --json` lists, oldest first, acking each; stop at the first failure.',
+    'Whenever you are awake anyway (a Telegram message, a worker result, a terminal turn), first send what `minions notify pending --json` lists, oldest first, acking each; stop at the first failure.',
     holdGuidance(cfg),
     'Never stay awake, loop or schedule wake-ups only to resend, and never send tool logs or test output.',
   ].join(' ');
@@ -591,7 +550,6 @@ function baseVars(cfg: MinionsConfig): Record<string, string> {
     autopilotGuidance: autopilotGuidance(cfg),
     processRunGuidance: processRunGuidance(cfg),
     workflowNames: inlineList(workflowNames(cfg).filter((n) => n !== DEFAULT_WORKFLOW), 'none configured yet'),
-    deliveryMode: cfg.delivery.mode,
     deliveryGuidance: deliveryGuidance(cfg),
     baseBranch: cfg.git.baseBranch,
     architectureGuidance: architectureGuidance(cfg),
@@ -603,8 +561,6 @@ function baseVars(cfg: MinionsConfig): Record<string, string> {
     testingGuidance: testingGuidance(cfg),
     reviewerStage: cfg.verification.reviewerRequired ? 'reviewer' : 'reviewer (optional)',
     startReadyGuidance: startReadyGuidance(cfg),
-    ciWorkerGuidance: ciWorkerGuidance(cfg).replace('{{verificationCommandsInline}}', inlineList(cfg.verification.commands, 'the project\'s own checks')),
-    ciCoordinatorGuidance: ciCoordinatorGuidance(cfg),
   };
 }
 

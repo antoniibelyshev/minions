@@ -20,7 +20,6 @@ describe('control mapping', () => {
     ['Resume intake', ['resume', '--intake']],
     ['status?', ['status']],
     ['/status', ['status']],
-    ['sync', ['sync']],
     ['cancel task-2.3', ['work', 'cancel', 'task-2.3', '--reason', 'owner cancelled']],
     ['Cancel TASK-7', ['work', 'cancel', 'task-7', '--reason', 'owner cancelled']],
     ['cancel all', ['work', 'cancel', '--all', '--reason', 'owner cancelled']],

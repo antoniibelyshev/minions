@@ -11,7 +11,7 @@ import {
 } from '../../src/runtime/state-backup.js';
 import { projectPaths } from '../../src/core/paths.js';
 import { APPROVAL_SIGNING_KEY_NAME } from '../../src/host/approvals.js';
-import { GITHUB_CREDENTIAL, TELEGRAM_CREDENTIAL } from '../../src/host/credentials.js';
+import { TELEGRAM_CREDENTIAL } from '../../src/host/credentials.js';
 import { basename } from 'node:path';
 import { tmp } from './fixtures.js';
 
@@ -268,8 +268,8 @@ describe('state backup: minions secret file names (task-20.1)', () => {
   it('lists the real secret file names of the host and the runtime', () => {
     const pp = projectPaths('3f2b8c1e-7d4a-4e9b-9c2f-1a2b3c4d5e6f');
     const rp = runtimePaths();
-    const real = [pp.apiKeyFile, pp.githubTokenFile, pp.telegramTokenFile, rp.apiKeyFile, rp.githubTokenFile, rp.telegramTokenFile].map((f) => basename(f));
-    for (const n of [...real, GITHUB_CREDENTIAL.fileName, TELEGRAM_CREDENTIAL.fileName, APPROVAL_SIGNING_KEY_NAME]) expect(MINIONS_SECRET_FILE_NAMES).toContain(n);
+    const real = [pp.apiKeyFile, pp.telegramTokenFile, rp.apiKeyFile, rp.telegramTokenFile].map((f) => basename(f));
+    for (const n of [...real, TELEGRAM_CREDENTIAL.fileName, APPROVAL_SIGNING_KEY_NAME]) expect(MINIONS_SECRET_FILE_NAMES).toContain(n);
     expect([...MINIONS_SECRET_FILE_NAMES].sort()).toEqual(['anthropic-api-key', 'approval-signing-key', 'claude-headless-token', 'github-token', 'telegram-bot-token']);
   });
 

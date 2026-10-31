@@ -9,7 +9,7 @@ import { MinionsError } from '../core/errors.js';
 import { readJson } from '../core/fsutil.js';
 import { emit } from '../core/output.js';
 import { containerPaths } from '../core/paths.js';
-import { TASK_STATUSES, type ProvenanceFallback } from './backlogmd.js';
+import { TASK_STATUSES } from './backlogmd.js';
 import { MemoryIdempotencyStore, openBacklog } from './factory.js';
 import { assertIntakeOpen } from './intake.js';
 import type { BacklogAdapter, IdempotencyStore, Provenance, ScopeFilter, Task, TaskStatus } from './types.js';
@@ -22,7 +22,6 @@ export interface ReadyHookState { leased: Set<string>; paused: boolean }
 let readyContext: () => ReadyHookState | Promise<ReadyHookState> = () => ({ leased: new Set(), paused: false });
 let idempotencyStore: IdempotencyStore = new MemoryIdempotencyStore();
 let intakePaused: () => boolean | Promise<boolean> = () => false;
-let provenanceFallback: ProvenanceFallback | undefined;
 
 /** Runtime installs this at startup: active-lease task ids and paused_starts from the DB. */
 export function setReadyContext(fn: () => ReadyHookState | Promise<ReadyHookState>): void { readyContext = fn; }
@@ -30,8 +29,6 @@ export function setReadyContext(fn: () => ReadyHookState | Promise<ReadyHookStat
 export function setIdempotencyStore(store: IdempotencyStore): void { idempotencyStore = store; }
 /** Runtime installs this at startup: paused_intake from the DB (`backlog create` refuses new intake while set). */
 export function setIntakePausedContext(fn: () => boolean | Promise<boolean>): void { intakePaused = fn; }
-/** Runtime installs this at startup: intake-tracked tasks without a usable meta provenance read as external-requirement. */
-export function setProvenanceFallback(fn: ProvenanceFallback | undefined): void { provenanceFallback = fn; }
 
 
 // ---------------------------------------------------------------- config + adapter
@@ -43,7 +40,7 @@ export async function loadRuntimeConfig(path = process.env.MINIONS_CONFIG || con
 
 async function open(): Promise<{ cfg: MinionsConfig; backlog: BacklogAdapter }> {
   const cfg = await loadRuntimeConfig();
-  return { cfg, backlog: openBacklog(cfg, { idempotency: idempotencyStore, provenanceFallback }) };
+  return { cfg, backlog: openBacklog(cfg, { idempotency: idempotencyStore }) };
 }
 
 export const scopeOf = (cfg: MinionsConfig): ScopeFilter => ({
@@ -108,7 +105,7 @@ function detail(t: Task): string {
 /** Fields `--compact` keeps for `backlog list|ready` (coordinator reads without full descriptions). */
 export const COMPACT_FIELDS = ['id', 'title', 'status', 'priority', 'dependencies'] as const;
 export const TASK_FIELDS: readonly (keyof Task)[] = ['id', 'locator', 'title', 'description', 'acceptanceCriteria', 'status', 'priority',
-  'dependencies', 'parent', 'externalLinks', 'labels', 'authorized', 'branch', 'commits', 'prUrl', 'provenance', 'version', 'milestone', 'workflow'];
+  'dependencies', 'parent', 'externalLinks', 'labels', 'authorized', 'branch', 'commits', 'provenance', 'version', 'milestone', 'workflow'];
 
 /** Resolves `--fields a,b` / `--compact` into a field list (undefined = full tasks). Unknown fields are an error. */
 export function selectFields(o: { fields?: string; compact?: boolean }): (keyof Task)[] | undefined {

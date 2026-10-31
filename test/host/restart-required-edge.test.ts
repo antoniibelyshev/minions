@@ -47,7 +47,7 @@ const fail = (stderr = 'unavailable', code = 1): RunResult => ({ code, stdout: '
 
 const STATUS_DATA = {
   paused: { intake: false, starts: true }, activeLeases: [], queue: { 'To Do': 2 }, guard: { lastReason: null },
-  configRevision: 3, profile: 'project-owner', deliveryMode: 'local', capacity: null, coordinatorLock: null,
+  configRevision: 3, profile: 'project-owner', capacity: null, coordinatorLock: null,
 };
 
 interface World {
@@ -307,7 +307,7 @@ describe('host status', () => {
     // Older image without coordinatorLaunch: the CLI version mismatch explains it; no extra unchecked entry.
     expect(h.restartRequired).toMatchObject({ state: 'required', unchecked: [], reasons: [expect.objectContaining({ kind: 'cli-version' })] });
     const text = [humanStatus(h.status as unknown as StatusReport), ...formatRestartRequired(h.restartRequired)].join('\n');
-    expect(text).toContain('config revision 3  profile project-owner  delivery local');
+    expect(text).toContain('config revision 3  profile project-owner');
     expect(text).toContain('paused: intake=false starts=true');
     expect(text).toContain('queue: To Do=2');
     expect(text).toContain('restart required (run `minions upgrade`):');

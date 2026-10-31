@@ -32,14 +32,11 @@ export interface EvidenceRow {
 }
 
 /**
- * Publication of an approved task (branch / pull-request delivery). One row per task, bound to the
- * approved head. pending: approved, not yet published (or interrupted); awaiting-approval: needs a
- * recorded human approval (sensitive paths or an "ask" capability); failed: retryable with
- * `minions work publish`; published: pushed (and PR opened in pull-request mode).
- * Local delivery with local integration on (mode `local`, docs/design/local-auto-integration.md): queued: the
- * approved head waits for or runs in the local integrator; awaiting-approval: the landing needs a host-signed
- * merge approval; failed: the integration failed (repair, or a blocked transient failure); published: landed on
- * the base.
+ * The local integration of an approved task (mode `local`, docs/design/local-auto-integration.md). One row per task,
+ * bound to the approved head. queued: the approved head waits for or runs in the local integrator;
+ * awaiting-approval: the landing needs a host-signed merge approval; failed: the integration failed (repair, or a
+ * blocked transient failure); published: landed on the base. `pending` and rows of other modes come from the removed
+ * GitHub delivery.
  */
 export type PublicationState = 'pending' | 'queued' | 'awaiting-approval' | 'failed' | 'published';
 export interface PublicationRow {
@@ -671,7 +668,7 @@ export class RuntimeDb {
     });
   }
 
-  // Publications (branch / pull-request delivery)
+  // Publications (local integrations)
   publication(taskId: string): PublicationRow | undefined { return this.get<PublicationRow>('SELECT * FROM publications WHERE task_id = ?', taskId); }
   /** Starts (or restarts) the publication of an approved head; a new head resets any earlier state. */
   upsertPublication(p: { task_id: string; branch: string; head_sha: string; mode: string; config_revision: number }): PublicationRow {

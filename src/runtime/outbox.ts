@@ -1,10 +1,10 @@
 // Notification outbox (spec §611, docs/design/telegram.md#notification-outbox): every notification the
-// coordinator owes the owner (goal acknowledgements, deliveries with links, blockers, approvals,
-// on-demand status) is recorded in the runtime DB under a dedup key *before* it is sent and acknowledged
-// after. A channel outage therefore loses nothing: pending rows are retried on the next interaction or
-// `minions sync`, and a key that was delivered once is never sent again. Nothing here wakes an LLM: the
-// outbox is only read when the coordinator is awake anyway. Transport-agnostic: Telegram (the plugin's
-// `reply` tool, called by the coordinator) is one transport; tests use a fake one.
+// coordinator owes the owner (goal acknowledgements, deliveries, blockers, approvals, on-demand status) is
+// recorded in the runtime DB under a dedup key *before* it is sent and acknowledged after. A channel outage
+// therefore loses nothing: pending rows are retried on the next interaction, and a key that was delivered once is
+// never sent again. Nothing here wakes an LLM: the outbox is only read when the coordinator is awake anyway.
+// Transport-agnostic: Telegram (the plugin's `reply` tool, called by the coordinator) is one transport; tests use a
+// fake one.
 import type { RuntimeDb } from './db.js';
 import { MinionsError } from '../core/errors.js';
 

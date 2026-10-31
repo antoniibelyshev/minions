@@ -9,7 +9,6 @@
  * plan (src/host/change-requests.ts). The output therefore always says "recorded, not applied".
  */
 import { randomBytes } from 'node:crypto';
-import { isGithubDelivery } from '../config/delivery.js';
 import { validateConfig } from '../config/resolve.js';
 import type { MinionsConfig } from '../config/schema.js';
 import { displayText } from '../core/control-chars.js';
@@ -177,9 +176,6 @@ const BRANCH_RE = /^(?!-)(?!.*\.\.)[A-Za-z0-9._/-]{1,200}$/;
 export function recordUpgradeRequest(ctx: RecordContext, o: { fromContainer?: string | boolean; reason?: string; dryRun?: boolean }): RecordResult {
   let fromContainer: UpgradePayload['fromContainer'] = null;
   if (o.fromContainer !== undefined && o.fromContainer !== false) {
-    if (isGithubDelivery(ctx.config)) {
-      throw new MinionsError('PRECONDITION', '--from-container is for local delivery only: with GitHub delivery the upgrade always takes origin/<base>.', 'Request `minions upgrade` without --from-container.');
-    }
     if (typeof o.fromContainer === 'string') {
       if (!BRANCH_RE.test(o.fromContainer)) throw new MinionsError('PRECONDITION', `--from-container: "${displayText(o.fromContainer)}" is not a branch name.`);
       fromContainer = o.fromContainer;

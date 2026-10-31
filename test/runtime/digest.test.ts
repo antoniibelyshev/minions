@@ -185,7 +185,6 @@ describe('the digest wake in the routine pass (fake clock)', () => {
     enqueue(env.db, { key: 'digest:2026-10-26T08:00', kind: 'digest', text: 'x' }); ack(env.db, 'digest:2026-10-26T08:00');
     const deps: RoutinePassDeps = {
       db: env.db, config: env.config, now: () => now, pid: 1, procStart: () => 's', lockAlive: () => false,
-      sync: async () => ({ intakeCreated: 0, synced: 0, failed: 0, statusChanges: 0, merged: 0, armed: 0, errors: [] }),
       next: async () => ({ runnable: [] }), coordinator: async () => coordinator, activeLeases: async () => [],
       budgetExhausted: () => false,
       digestDue: (n) => digestStatus(env.db, env.config, n).due,
@@ -261,15 +260,15 @@ function input(over: Partial<DigestInput> = {}): DigestInput {
       item({ key: 'blocker:task-7:2', kind: 'blocker', taskId: 'task-7', createdAt: '2026-10-26T09:00:00.000Z', text: 'task-7 is blocked: CI red three times', nextAttemptAt: null }),
     ],
     tasks: [
-      { id: 'task-10', title: 'Search', status: 'ready', prUrl: null, priority: 'low' },
-      { id: 'task-4', title: 'Login form', status: 'delivered', prUrl: 'https://github.com/o/r/pull/4', priority: null },
-      { id: 'task-5', title: 'Settings page', status: 'delivered', prUrl: 'https://github.com/o/r/pull/5', priority: null },
-      { id: 'task-6', title: 'Storage', status: 'awaiting-human', prUrl: null, priority: 'high' },
-      { id: 'task-7', title: 'Flaky CI', status: 'blocked', prUrl: null, priority: null },
-      { id: 'task-8', title: 'Export', status: 'ready', prUrl: null, priority: 'high' },
+      { id: 'task-10', title: 'Search', status: 'ready', priority: 'low' },
+      { id: 'task-4', title: 'Login form', status: 'delivered', priority: null },
+      { id: 'task-5', title: 'Settings page', status: 'delivered', priority: null },
+      { id: 'task-6', title: 'Storage', status: 'awaiting-human', priority: 'high' },
+      { id: 'task-7', title: 'Flaky CI', status: 'blocked', priority: null },
+      { id: 'task-8', title: 'Export', status: 'ready', priority: 'high' },
     ],
-    merged: [{ taskId: 'task-3', prUrl: 'https://github.com/o/r/pull/3', at: '2026-10-26T20:00:00.000Z' }],
-    approvals: [{ taskId: 'task-5', head: 'a'.repeat(40), scope: 'merge' }],
+    merged: [{ taskId: 'task-3', at: '2026-10-26T20:00:00.000Z' }],
+    approvals: [{ taskId: 'task-5', head: 'a'.repeat(40) }],
     spend: { window: 'last-digest', tokens: 1_234_567, budget: { percent: 45, text: '5M tokens', exhausted: false }, wakes: 2, wakeTokens: 310_000 },
     runnable: [],
     ...over,
@@ -291,10 +290,10 @@ describe('composeDigest (deterministic)', () => {
       '- task-7 is blocked: CI red three times',
       '',
       'Merged:',
-      '- task-3 https://github.com/o/r/pull/3',
+      '- task-3',
       '',
-      'Delivered, waiting for CI or merge:',
-      '- task-5 Settings page https://github.com/o/r/pull/5',
+      'Delivered, waiting for a merge:',
+      '- task-5 Settings page',
       '',
       'Updates:',
       '- Delivered task-4 Login form: https://github.com/o/r/pull/4',
@@ -364,7 +363,7 @@ describe('composeDigest (deterministic)', () => {
 
   it('never over MAX_TEXT_LENGTH and never drops an approval or a blocker silently (no questions, many state lines)', () => {
     const features = Array.from({ length: 200 }, (_, n) => item({ key: `feature:f${n}:x`, kind: 'feature', createdAt: `2026-10-26T${String(10 + Math.floor(n / 60)).padStart(2, '0')}:${String(n % 60).padStart(2, '0')}:00.000Z`, text: `Feature ${n} ${'y'.repeat(120)}` }));
-    const blocked = Array.from({ length: 100 }, (_, n) => ({ id: `task-b${n}`, title: `Blocked thing ${n}`, status: 'blocked' as const, prUrl: null, priority: null }));
+    const blocked = Array.from({ length: 100 }, (_, n) => ({ id: `task-b${n}`, title: `Blocked thing ${n}`, status: 'blocked' as const, priority: null }));
     const approval = { taskId: 'task-5', head: 'c'.repeat(40), scope: 'merge' as const };
     const d = composeDigest(input({ items: features, tasks: [...input().tasks!, ...blocked], approvals: [approval] }));
     expect(d.text.length).toBeLessThanOrEqual(MAX_TEXT_LENGTH);
@@ -413,13 +412,14 @@ describe('prepareDigest: stored under its key; acking the keys marks the time do
     const env = makeEnv((c) => { c.routine = { enabled: true }; });
     const t0 = at('2026-10-27T07:05:00Z');
     enqueue(env.db, { key: 'question:task-6:1', kind: 'question', taskId: 'task-6', text: 'Which?\n1. A (recommended)\n2. B', holdUntil: '2026-10-28T07:00:00.000Z' }, () => t0);
-    env.db.addEvent('ci-observation', 'task-3', { prUrl: 'https://github.com/o/r/pull/3', statusChange: { from: 'delivered', to: 'done' } }, '2026-10-27T01:00:00.000Z');
-    env.db.addEvent('merge', 'task-5', { state: 'awaiting-approval', head: 'b'.repeat(40), prUrl: 'u' }, '2026-10-27T02:00:00.000Z');
+    env.db.addEvent('integrated', 'task-3', {}, '2026-10-27T01:00:00.000Z');
+    env.db.upsertPublication({ task_id: 'task-5', branch: 'agent/task-5-five', head_sha: 'b'.repeat(40), mode: 'local', config_revision: 1 });
+    env.db.setPublicationState('task-5', 'awaiting-approval');
     env.db.addEvent('auto-promote', 'task-11', {}, '2026-10-27T03:00:00.000Z'); // left over from the removed caps (task-130): ignored
-    const tasks = [{ id: 'task-5', title: 'Five', status: 'delivered' as const, prUrl: 'u', priority: null }];
+    const tasks = [{ id: 'task-5', title: 'Five', status: 'delivered' as const, priority: null }];
     const d = prepareDigest(env.db, env.config, { tasks, runnable: [], spend: null }, t0);
     expect(d.key).toBe('digest:2026-10-27T08:00');
-    expect(d.text).toContain('- task-3 https://github.com/o/r/pull/3');
+    expect(d.text).toContain('Merged:\n- task-3\n');
     expect(d.text).toContain(`/approve task-5 ${'b'.repeat(40)} merge`);
     expect(d.text).not.toMatch(/Auto-promoted|task-11/);
     expect(d.text).toContain('Q1 (task-6) Which?');

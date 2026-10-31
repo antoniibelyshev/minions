@@ -108,13 +108,6 @@ expect_eq "$(json 'd.data.checks.find(c=>c.name==="runtime").status' <<<"$doc")"
 for t in tmux claude backlog git; do expect_eq "$(json "d.data.checks.find(c=>c.name===\"host.$t\").status" <<<"$doc")" ok "doctor: host.$t"; done
 expect_eq "$(json 'd.data.checks.some(c=>c.name.startsWith("docker."))' <<<"$doc")" false "doctor does not check Docker"
 
-step "GitHub setup hints (--yes: no prompt, push or browser)"
-gs="$("$M" setup github --yes --json)"
-expect_eq "$(json 'd.data.remote.status' <<<"$gs")" missing "setup github sees no remote"
-json 'd.data.nextSteps.join(" ")' <<<"$gs" | grep -q 'minions setup github' || fail "setup github hints"
-expect_eq "$(json 'd.data.checks.find(c=>c.name==="github.setup").status' <<<"$doc")" ok "doctor has a github.setup check"
-expect_eq "$(git remote)" "" "no remote added"
-
 step "Setup assistant (never launched by init --yes; dry-run plan; needs a terminal)"
 [ ! -e "$WORK/fake/claude.json" ] && ok "init --yes did not launch claude" || fail "init --yes launched claude"
 expect_eq "$(json 'd.data.checks.find(c=>c.name==="setup").status' <<<"$doc")" ok "doctor: setup check (verification commands inferred)"
@@ -178,14 +171,6 @@ expect_eq "$("$M" status --json | json 'd.data.paused.starts')" true "status"
 expect_eq "$("$M" status --json | json 'd.data.channel.configured+" "+d.data.channel.effective')" "auto terminal" "status: channel auto is terminal in the host runtime"
 expect_eq "$("$M" channel show --json | json 'd.data.cause')" "no-token" "channel show in the host runtime"
 expect_eq "$("$M" resume --json | json 'd.data.paused.starts')" false "resume"
-
-step "git credential helper through the shim (quoted path with a space; fake token file)"
-FAKE_TOKEN="ghp_fakeE2eHostToken00000000000000000000"
-printf '%s\n' "$FAKE_TOKEN" > "$P/secrets/github-token"; chmod 600 "$P/secrets/github-token"
-helper="!'$SHIM' git-credential"
-cred="$(printf 'protocol=https\nhost=github.com\n\n' | git -C "$W" -c credential.helper= -c credential.helper="$helper" credential fill)"
-expect_eq "$(grep '^password=' <<<"$cred")" "password=$FAKE_TOKEN" "helper answers with the project token (not the user's GH_TOKEN)"
-rm -f "$P/secrets/github-token"
 
 step "coordinator launch (fake tmux + fake claude) and down"
 "$SHIM" coordinator sync --start-detached --json >/dev/null

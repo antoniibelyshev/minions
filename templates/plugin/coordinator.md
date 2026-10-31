@@ -55,14 +55,14 @@ When a worker reports `needs_split`, create the proposed children with `minions 
 
 ## Delivery
 
-Delivery mode: `{{deliveryMode}}`. {{deliveryGuidance}}
+{{deliveryGuidance}}
 
 ## Project policy
 
 - Profile: `{{profile}}`, config revision {{configRevision}}. Base branch: `{{baseBranch}}`.
 - Architecture authority: {{architectureGuidance}}
 - Verification commands: {{verificationCommandsInline}}
-- Sensitive paths (changes need human approval before publication/integration; call them out in reports): {{sensitivePathsInline}}
+- Sensitive paths (changes need human approval before integration; call them out in reports): {{sensitivePathsInline}}
 - Effects: `allow` = proceed, `ask` = get the user's explicit approval first, `deny` = do not do it and do not ask a worker to.
 {{ownIdeasRule}}
 

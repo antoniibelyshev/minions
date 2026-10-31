@@ -178,24 +178,6 @@ describe('/set: an owner config change is a plan to confirm', () => {
     }
   });
 
-  it('delivery.requiredChecksConfigured (task-79): /set true is offered with its loosening text and applied; a container request is planned with it too', async () => {
-    const { project, local } = await install();
-    const s = setup([project]);
-    const o = await s.cmds.propose(null, { kind: 'config-set', key: 'delivery.requiredChecksConfigured', value: 'true', layer: 'local' });
-    expect(o.summary).toBe('set delivery.requiredChecksConfigured: false -> true');
-    expect(o.loosens).toMatch(/auto-merge may arm for pull requests once their required checks pass/);
-    expect(o.text).toContain('LOOSENS POLICY');
-    await s.confirm(o);
-    expect(s.outcomes.map((x) => x.status)).toEqual(['applying', 'applied']);
-    expect(readJson(local).delivery.requiredChecksConfigured).toBe(true);
-    const off = await s.cmds.propose(null, { kind: 'config-set', key: 'delivery.requiredChecksConfigured', value: 'false', layer: 'local' });
-    expect(off.loosens ?? null).toBeNull();
-    await s.confirm(off);
-    expect(readJson(local).delivery.requiredChecksConfigured).toBe(false);
-    const forged = { id: 'cr_0a1b2c3e', kind: 'config-set', payload: { key: 'delivery.requiredChecksConfigured', value: 'true', layer: 'local' }, reason: null };
-    expect((await CR.buildPlan(project, forged, { runtime: s.manager.runtime, upgrade: s.deps.upgrade })).plan.loosens).toMatch(/auto-merge may arm/);
-  });
-
   it('with several projects the command needs /project first; with a picked project it targets that one', async () => {
     const a = await install('a');
     const b = await install('b');
@@ -509,10 +491,10 @@ describe('runSyncOnly (minions upgrade --sync-only)', () => {
   it('dry run plans the fast-forward without exporting; the run exports and fast-forwards', async () => {
     const r = syncRepo();
     const sync = { repo: r.repo, branch: 'main', baseBranch: 'main', exportRepo: r.exportRepo };
-    const dry = await US.runSyncOnly({ sync, origin: null, dryRun: true });
+    const dry = await US.runSyncOnly({ sync, dryRun: true });
     expect(dry).toMatchObject({ ok: true, steps: [{ id: 'sync', status: 'planned' }], stopped: null });
     expect(r.exports()).toBe(0);
-    const done = await US.runSyncOnly({ sync, origin: null });
+    const done = await US.runSyncOnly({ sync });
     expect(done).toMatchObject({ ok: true, steps: [{ id: 'sync', status: 'done' }] });
     expect(git(r.repo, 'rev-parse', 'HEAD')).toBe(r.ahead);
     expect(r.exports()).toBe(1);
@@ -522,10 +504,10 @@ describe('runSyncOnly (minions upgrade --sync-only)', () => {
     const r = syncRepo();
     writeFileSync(join(r.repo, 'README.md'), '# local edit\n');
     const sync = { repo: r.repo, branch: 'main', baseBranch: 'main', exportRepo: r.exportRepo };
-    const dry = await US.runSyncOnly({ sync, origin: null, dryRun: true });
+    const dry = await US.runSyncOnly({ sync, dryRun: true });
     expect(dry.ok).toBe(false);
     expect(dry.steps[0]!.detail).toMatch(/would refuse: .*uncommitted or untracked changes/);
-    await expect(US.runSyncOnly({ sync, origin: null })).rejects.toThrow(/refusing to move main/);
+    await expect(US.runSyncOnly({ sync })).rejects.toThrow(/refusing to move main/);
     expect(git(r.repo, 'rev-parse', 'HEAD')).toBe(r.base);
     expect(readFileSync(join(r.repo, 'README.md'), 'utf8')).toBe('# local edit\n');
   });
@@ -547,18 +529,14 @@ describe('QA: runSyncOnly never forces', () => {
     const head = git(repo, 'rev-parse', 'HEAD');
     let exports = 0;
     const sync = { repo, branch: 'main', baseBranch: 'main', exportRepo: async () => { exports++; return { bundle: 'b', refs: [], changes: [] }; } };
-    const dry = await US.runSyncOnly({ sync, origin: null, dryRun: true });
+    const dry = await US.runSyncOnly({ sync, dryRun: true });
     expect(dry.ok).toBe(false);
     expect(dry.steps[0]!.detail).toMatch(/^would refuse: /);
-    await expect(US.runSyncOnly({ sync, origin: null })).rejects.toThrow();
+    await expect(US.runSyncOnly({ sync })).rejects.toThrow();
     expect(git(repo, 'rev-parse', 'HEAD')).toBe(head);
     expect(git(repo, 'status', '--porcelain')).toBe('');
     expect(existsSync(join(repo, 'agent.txt'))).toBe(false);
     expect(exports).toBeLessThanOrEqual(1);
-  });
-
-  it('needs exactly one source', async () => {
-    await expect(US.runSyncOnly({ sync: null, origin: null })).rejects.toThrow(/exactly one source/);
   });
 });
 
