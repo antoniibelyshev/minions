@@ -226,9 +226,9 @@ describe('queue and helpers', () => {
   });
 });
 
-describe('schema 12: integrations (after 57.12 schema 11)', () => {
+describe('schema 12: integrations (after 57.12 schema 11), then 13: poll options', () => {
   it('a schema-11 database (the 57.12 router schema) migrates to 12: integrations is added, the 11 data is kept', () => {
-    expect(SCHEMA_VERSION).toBe(12);
+    expect(SCHEMA_VERSION).toBe(13);
     const file = join(tmp('minions-integrator-db-'), 'v11.db');
     const v11 = new RuntimeDb(file);
     v11.sql.exec('DROP TABLE integrations;');
@@ -237,7 +237,7 @@ describe('schema 12: integrations (after 57.12 schema 11)', () => {
     v11.close();
     const up = new RuntimeDb(file);
     try {
-      expect(up.getMeta('schema_version')).toBe('12');
+      expect(up.getMeta('schema_version')).toBe(String(SCHEMA_VERSION));
       expect(up.all('SELECT message_id, session FROM tg_messages')).toEqual([{ message_id: 7, session: 'general' }]);
       enqueueIntegration(up, { taskId: 'task-1', branch: 'agent/task-1', head: 'a'.repeat(40) });
       expect(() => up.exec("INSERT INTO integrations (task_id, branch, head_sha, phase, queued_at) VALUES ('task-1', 'b', 'c', 'verifying', 'now')")).toThrow(/UNIQUE/);
@@ -253,9 +253,9 @@ describe('schema 12: integrations (after 57.12 schema 11)', () => {
     v10.close();
     const up = new RuntimeDb(file);
     try {
-      expect(up.getMeta('schema_version')).toBe('12');
+      expect(up.getMeta('schema_version')).toBe(String(SCHEMA_VERSION));
       const cols = up.all<{ name: string }>('PRAGMA table_info(outbox)').map((c) => c.name);
-      expect(cols).toEqual(expect.arrayContaining(['session', 'answered_at']));
+      expect(cols).toEqual(expect.arrayContaining(['session', 'answered_at', 'options_json']));
       expect(up.all("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('tg_messages', 'integrations') ORDER BY name")).toEqual([{ name: 'integrations' }, { name: 'tg_messages' }]);
     } finally { up.close(); }
   });
