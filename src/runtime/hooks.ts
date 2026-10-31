@@ -324,9 +324,9 @@ export function coordinatorOnlyWorkCommand(command: string): string | null {
  * those in WORKER_MINIONS_COMMANDS; an unknown word is no command (minions refuses it itself), so it never matches.
  */
 export const MINIONS_COMMANDS: readonly string[] = [
-  'auth', 'backlog', 'channel', 'config', 'control', 'coordinator', 'doctor', 'down', 'export', 'help', 'hook', 'import',
-  'init', 'notify', 'pause', 'resume', 'runtime', 'secrets', 'settings', 'setup', 'start', 'status', 'stop', 'sync', 'telegram',
-  'uninstall', 'upgrade', 'work', 'workspace',
+  'auth', 'backlog', 'channel', 'config', 'control', 'coordinator', 'defaults', 'doctor', 'down', 'export', 'help', 'hook',
+  'import', 'init', 'mode', 'notify', 'pause', 'pull', 'resume', 'runtime', 'secrets', 'session', 'settings', 'setup', 'start',
+  'status', 'stop', 'sync', 'telegram', 'uninstall', 'upgrade', 'work', 'workspace',
 ];
 
 /**
