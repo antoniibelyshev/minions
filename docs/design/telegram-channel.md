@@ -157,7 +157,7 @@ to one line and cut to 300 characters.
 | Media (photo, document, voice, ...) | caption or `(photo)` | as in 0.0.7: `image_path` (downloaded photo) or `attachment_file_id`, `attachment_kind`, `attachment_name`; plus the reply keys |
 | Button tap on a decision | `answer: 2. Keep the current order` (or `answer: other`) | `message_id` = the question, `decision_id`, `decision_option`, `reply_to_ref` = the decision's ref |
 | Tap on a closed/unknown decision | not forwarded; toast "This question is closed. Reply with the number instead." | |
-| `poll_answer` | not used: native polls are not built (task-35 chose buttons). Format reserved: `answer: <labels>`, meta `poll_id`, `option_ids` | |
+| `poll_answer` (built, [autonomy.md](autonomy.md) Decision 5) | `[poll answer] <question>: <option texts>` (joined by `; `), or `[poll answer] <question>: (vote retracted)` | `poll_id`, `option_ids` (comma-separated), `message_id` and `reply_to_message_id` = the poll message, `reply_to_from: bot`, `reply_to_text` = the question, `reply_to_ref` = the poll's ref. A poll_answer has no chat: only a vote by an allowlisted user on a poll this bot sent (still in the message map) is forwarded; the rest is dropped and logged. |
 | Edited owner message | `(edited) <text>` | `edited: "true"` |
 | Forwarded message | dropped, like the manager bot: only what the owner types counts | |
 
@@ -173,7 +173,9 @@ defaults to the single allowlisted owner DM. Text is plain (no `parse_mode`), cu
 
 | Tool | Arguments | Notes |
 | - | - | - |
-| `reply` | `text`, `reply_to?`, `ref?`, `files?` (absolute paths) | Appends `ref: #<ref>` when `ref` is given, records `tg_messages(message_id, ref, outbox key?, text head, sent_at)`, returns `sent (id: N)`. Files go out as documents (photos when the extension is an image), max 50 MB, and only paths under the worktree, `/state` or the scratch dir. |
+| `reply` | `text`, `reply_to?`, `ref?`, `files?` (absolute paths) | Appends `ref: #<ref>` when `ref` is given, records `tg_messages(message_id, ref, outbox key?, text head, sent_at)`, returns `sent (id: N)`. Without `reply_to` it replies to the newest inbound owner message of the chat (built; a poll answer counts as the poll message; kept in the message map, so it survives a restart). Files go out as documents (photos when the extension is an image), max 50 MB, and only paths under the worktree, `/state` or the scratch dir. |
+| `poll` (built) | `question` (≤300), `options` (2 to 10 distinct, ≤100 each), `multiple?`, `reply_to?`, `ref?` | Non-anonymous `sendPoll`; returns `{poll_id, message_id}`. The poll (id, question, options, ref) is kept in the message map, so the answer can be named. Reverses telegram-decisions.md D2 at the owner's request. |
+| `close_poll` (built) | `poll_id` | `stopPoll` on a poll in the message map. |
 | `ask` | `text`, `options[{label, button?}]` (2 to 10), `recommended?`, `allow_other?` (default true), `reply_to?`, `ref?`, `decision_id?` | The task-35 design unchanged: numbered text in the body, inline buttons `dec:<id>:<n>`, persisted in `tg_decisions`, keyboard removed and "Chosen: …" appended on the first tap. |
 | `close_decision` | `decision_id`, `note?` | For a question answered by typing, or one that is obsolete. |
 | `edit_message` | `message_id`, `text`, `keep_buttons?` | Only messages this bot sent (`tg_messages`). Edits do not notify, so finished work gets a new `reply`. |
@@ -241,7 +243,8 @@ With reply metadata visible, threads become deterministic:
 4. **Bare number:** answers the replied-to question. Without a reply, it answers the only open decision, otherwise
    the coordinator asks which one (task-66, unchanged). Taps make this case rare.
 
-The coordinator still answers with `reply_to` = the owner's message (task 58). The `ref: #<id>` footer stays as a
+The coordinator still answers with `reply_to` = the owner's message (task 58); the server now defaults it to the
+owner's newest message when the coordinator omits it. The `ref: #<id>` footer stays as a
 visible label, but the server appends it from the `ref` argument, so the model no longer types it. The prompt's
 Threads bullet changes in phase 3. [coordinator-sessions.md](coordinator-sessions.md) routing rule 3 ("no ref =
 latest message") is replaced by rules 1 and 3 above. See that doc.
