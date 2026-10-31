@@ -348,7 +348,7 @@ export interface SupervisorTaskDeps {
 export type SupervisorExit = 'disabled' | 'conflict' | 'stopped' | 'lock-lost';
 export interface SupervisorReport { exit: SupervisorExit; holder: SupervisorLock | null; reaped: ReapResult[]; reapErrors: { key: string; error: string }[]; starts: number; opened: number; closed: number }
 
-type EndReason = 'close' | 'drain' | 'disabled' | 'shutdown';
+type EndReason = 'close' | 'drain' | 'disabled' | 'shutdown' | 'idle';
 
 interface Live {
   key: string;
@@ -360,6 +360,8 @@ interface Live {
   stopNow: boolean;
   /** A turn is in progress: a message was written and its `result` has not come yet. */
   busy: boolean;
+  /** When its last turn ended (ms): the least recently used idle process yields its slot first. */
+  idleSince: number;
   record: SessionRunRecord;
   done: Promise<void>;
 }
@@ -446,7 +448,7 @@ export async function runSupervisor(d: SupervisorDeps): Promise<SupervisorReport
     const row = getSession(db, l.key);
     if (!row) return;
     if (typeof ev.session_id === 'string' && SESSION_ID.test(ev.session_id) && ev.session_id !== row.claude_session_id) updateSession(db, l.key, { claude_session_id: ev.session_id });
-    if (ev.type === 'result') l.busy = false;
+    if (ev.type === 'result') { l.busy = false; l.idleSince = now().getTime(); }
     if (ev.type === 'result' && row.resumes > 0) updateSession(db, l.key, { resumes: 0, failure: null });
   };
 
@@ -473,7 +475,8 @@ export async function runSupervisor(d: SupervisorDeps): Promise<SupervisorReport
     const ours = l.ending ?? (l.stopNow ? 'shutdown' : null);
     db.addEvent('session-exit', l.taskId, { key: l.key, code: out.code, signal: out.signal, stopped: out.stopped, ending: ours });
     const row = getSession(db, l.key);
-    if (!row || row.status !== 'open' || ours === 'close') return;
+    // Closed, or stopped while idle to free its slot: nothing to resume until its next message.
+    if (!row || row.status !== 'open' || ours === 'close' || ours === 'idle') return;
     if (ours) {
       notice(l.key, SUPERVISOR_SOURCE, `minions supervisor: this session's process was stopped (${ours === 'drain' ? 'a drain' : 'the supervisor stopped'}) and is now resumed. Continue where you left off; check \`minions work list\` for leases you held.`);
       return;
@@ -509,7 +512,7 @@ export async function runSupervisor(d: SupervisorDeps): Promise<SupervisorReport
         }
       } catch (e) { log(`minions supervisor: ${key}: recovery failed: ${(e as Error).message}`); }
     }
-    const l: Live = { key, taskId: parseSessionKey(key).taskId, stdin: null, ending: null, stopNow: false, busy: false, record, done: Promise.resolve() };
+    const l: Live = { key, taskId: parseSessionKey(key).taskId, stdin: null, ending: null, stopNow: false, busy: false, idleSince: now().getTime(), record, done: Promise.resolve() };
     live.set(key, l);
     updateSession(db, key, { last_wake_at: at });
     db.addEvent('session-start', l.taskId, { key, resume: resume ?? null });
@@ -544,8 +547,15 @@ export async function runSupervisor(d: SupervisorDeps): Promise<SupervisorReport
       openSession(db, k, { configDir: sessionConfigDir({ state: d.state }, k), model: cfg.models.coordinator ?? null, now: now() });
     }
     for (const key of keys) {
-      if (live.size >= max || stopping) break;
+      if (stopping) break;
       if (live.has(key)) continue;
+      if (live.size >= max) {
+        // Every slot is taken: the least recently used idle process yields (its session stays open and resumes from
+        // its transcript on its next message). The waiting session starts once that process has exited.
+        const idle = [...live.values()].filter((x) => !x.busy && !x.ending && !x.stopNow && !pendingInbox(db, x.key).length).sort((a, b) => a.idleSince - b.idleSince)[0];
+        if (idle) { log(`minions supervisor: ${idle.key} idle; stopping its process to free a slot for ${key}`); end(idle, 'idle'); }
+        break;
+      }
       const row = getSession(db, key);
       if (!row || row.status !== 'open') continue;
       if (paused && !pendingInbox(db, key, { sources: [OWNER_SOURCE] }).length) continue;

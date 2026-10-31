@@ -297,6 +297,8 @@ export class HostRuntime {
   /** Stops the coordinator: kills the dedicated tmux server (only minions sessions live there). */
   async down(): Promise<boolean> {
     const was = await this.isRunning();
+    // The detached supervisor and dispatcher are not in the tmux server: stop them too, so a start runs current code.
+    if (await this.prepared()) await this.exec(['minions', 'coordinator', 'stop-helpers', '--json'], { allowFailure: true, timeoutMs: 30_000 });
     await this.runner('tmux', ['-L', this.paths.tmuxSocket, 'kill-server'], { allowFailure: true, timeoutMs: 10_000, env: this.env() });
     return was;
   }

@@ -268,15 +268,21 @@ describe('session processes (fake claude)', { timeout: 30_000 }, () => {
     await sup.stop();
   });
 
-  it('never starts more than coordinator.sessions.max processes', async () => {
+  it('never runs more than coordinator.sessions.max processes; an idle one yields its slot to a waiting session', async () => {
     const s = setup();
     s.cfg.coordinator = { ...s.cfg.coordinator, sessions: { enabled: true, max: 1 } };
     const a = uniq('max-a'), b = uniq('max-b');
     for (const k of [a, b]) { s.open(k); enqueueInbox(s.db, k, 'router', `hi ${k}`); }
     const sup = start(s);
-    await until('one start', () => s.launches.length === 1);
-    await settle();
-    expect(s.launches).toHaveLength(1);
+    await until('both started', () => events(s.log).filter((e) => e.ev === 'start').length === 2);
+    // One at a time: the first process ended (stdin closed while idle) before the second started.
+    const evs = events(s.log).map((e) => e.ev);
+    expect(evs.indexOf('eof')).toBeGreaterThan(-1);
+    expect(evs.indexOf('eof')).toBeLessThan(evs.lastIndexOf('start'));
+    // The yielded session stays open, with no resume notice queued: it resumes on its next message.
+    const first = s.launches[0]!.key;
+    expect(getSession(s.db, first)).toMatchObject({ status: 'open', resumes: 0 });
+    expect(pendingInbox(s.db, first)).toEqual([]);
     await sup.stop();
   });
 

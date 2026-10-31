@@ -1248,6 +1248,20 @@ export function register(program: Command): void {
       const r = sendToSession(getDb(), await getConfig(), { key, text, state: runtimePaths().state, answers: o.answers ?? null, messageId: o.messageId ?? null, reply });
       emit(r, { json: globalOpts(cmd).json, human: (x: typeof r) => `queued for ${x.key}${x.reopened ? ' (reopened)' : ''}${x.answered ? `; ${x.answered} answered` : ''}` });
     }));
+  // Host runtime `minions down` (the container ends with its processes): the detached helpers would outlive the tmux
+  // server and keep running the old code. Each is signalled only when its lock names a live process with its identity.
+  coord.command('stop-helpers', { hidden: true }).description('Internal: stop the detached session supervisor and autopilot dispatcher (SIGTERM; identity-checked)')
+    .action(action(async (_o: unknown, cmd: Command) => {
+      requireMode('runtime');
+      const d = getDb();
+      const stopped: { helper: string; pid: number }[] = [];
+      for (const [helper, st] of [['supervisor', supervisorLockState(d)], ['dispatcher', dispatcherLockState(d)]] as const) {
+        if (st.state !== 'live' || !st.lock) continue;
+        const { pid } = st.lock;
+        try { process.kill(pid, 'SIGTERM'); stopped.push({ helper, pid }); } catch { /* already gone */ }
+      }
+      emit({ stopped }, { json: globalOpts(cmd).json, human: (x: { stopped: typeof stopped }) => x.stopped.map((h) => `stopped the ${h.helper} (pid ${h.pid})`).join('\n') || 'no helper running' });
+    }));
   coord.command('sessions').description('The sessions index: every open coordinator session and those closed in the last day, with topic and last activity (also <state>/sessions/index.md)')
     .action(action(async (_o: unknown, cmd: Command) => {
       requireMode('runtime');
