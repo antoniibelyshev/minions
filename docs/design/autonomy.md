@@ -22,16 +22,12 @@ therefore comes from an audit trail, undo and notices, not from owner confirmati
 
 | Phase | What | State |
 | - | - | - |
-| 1 | Autopilot dispatcher: deterministic stage loop with headless workers | built (`dispatch.mode` defaults to `coordinator` until the live check) |
+| 1 | Autopilot dispatcher: deterministic stage loop with headless workers | built, verified live; the only dispatch path (Decision 10) |
 | 2 | Control layer, flows with `ci` / `merge` ends, live workflow edits mid-flight | built |
 | 3 | Owner secrets granted per role, and the coordinator's plain `env` | built (`verification.secrets` for the integrator: not yet) |
 | 4 | Telegram: reply context end to end, threaded replies, native polls | built |
 | 5 | Thread sessions: one coordinator session per Telegram thread | built |
 | 6 | New projects: `minions setup` in an empty directory creates the repository; the coordinator does the rest | built |
-
-Live check before `dispatch.mode` defaults to `auto` (the build had no real `claude -p` run): one headless worker
-under `--agent minions:engineer` loads the plugin agent, its hooks see `MINIONS_WORKER_LEASE`, `minions work submit`
-works from the worktree, and the stream-json log yields the usage and the session id.
 
 ## Decision 1. The autopilot dispatcher
 
@@ -46,14 +42,14 @@ loop:
     spawn a headless worker for the lease
   on worker exit:
     record (recordSubmitted)                    # same checks as `work record --submitted`
-    decision = recordDecision(...)              # same table as `work advance`
+    decision = recordDecision(...)              # src/runtime/advance.ts
     decision != null -> hand it to the coordinator (inbox / outbox `decision` item), do not retry blindly
 ```
 
 - **Everything goes through the existing functions.** Claim, brief, record, the stage machine, QA insertion, repair
   cycles, CI gates, publication and local integration stay in `Scheduler`; the dispatcher only replaces the
-  coordinator's turns between them. `recordDecision` and `nextDecision` (src/runtime/advance.ts) already say exactly
-  when a human-level judgement is needed; those are the coordinator's exceptions.
+  coordinator's turns between them. `recordDecision` (src/runtime/advance.ts) says exactly when a human-level judgement
+  is needed; those are the coordinator's exceptions.
 - **One correction.** An `invalid` result with `correctionAllowed` gets one automatic correction run (the same lease,
   a resumed worker with the errors) before it becomes an exception, as the coordinator does today.
 - **Headless workers.** A stage runs as `claude -p --plugin-dir <fresh plugin> --agent minions:<role>` in the lease
@@ -70,16 +66,13 @@ loop:
   (runner/supervise.ts: own process group, wall-clock timeout, SIGINT/TERM/KILL). A run record per lease
   (`<state>/run/dispatch/<leaseId>.json`) lets a restarted dispatcher reap orphans and recover leases.
 - **Lock and start.** Meta row `dispatcher_lock` (same liveness rules as the supervisor lock). The coordinator
-  wrapper starts it (and restarts it when the lock is stale) when `dispatch.mode` is `auto`.
-- **Setting.** `dispatch.mode: "auto" | "coordinator"` (live; unset = `coordinator` until the live check). With `auto`,
-  `work next/claim/advance` from the coordinator still work (it may dispatch a stage by hand), but the coordinator
-  prompt tells it that the dispatcher runs the happy path and it should only handle decisions.
+  wrapper always starts it (and restarts it when the lock is stale; Decision 10).
 - **Capacity.** `execution.maxActiveTasks`, `execution.maxByRole`, the budget, pause and drain are honoured because
   they are checked by `next` and `claim`.
 - **Exceptions.** A decision is stored as an outbox `decision` item (session = the task's session when sessions are
   on, else the coordinator) and as a `dispatch-decision` event, so the coordinator's next turn sees it in
   `minions status`. The dispatcher never starts work on a task that has an unhandled decision; the coordinator
-  clears it by acting (`work claim`, `backlog update`, ...) or with `minions work autopilot resume <taskId>`.
+  clears it by acting (`backlog update`, ...) or with `minions work autopilot resume <taskId>`.
 
 ## Decision 2. Flows (workflows) as coordinator-owned config
 
@@ -217,6 +210,19 @@ the GitHub token, credential helper and gh wrapper, the guided GitHub setup, the
 `merge` only). Configs that still carry the removed keys load: the keys are dropped, and an `auto-when-eligible` that
 came with branch or pull-request delivery becomes `disabled`.
 
+## Decision 10. The autopilot is the only dispatch path (owner, 2026-10-31)
+
+After the live check of phase 1, the dispatcher runs every stage, always; the wrapper always starts it. The coordinator
+plans, files and updates tasks, tunes the config (`minions control`) and handles held decisions
+(`minions work autopilot status|resume`); it never claims, spawns, records or releases a worker, and the pre-agent
+hook denies every `minions:*` Agent call. Removed: `dispatch.mode` (an old config's value is dropped), `work advance`,
+the coordinator's dispatch flow in its prompt and skills, the Stop guard's push to dispatch runnable work (only holds
+keep the coordinator or a task session going), the context-reset barrier (`coordinator.contextReset.barrierTokens`,
+dropped as well), task sessions opened or nudged for runnable stages (a task session is opened for a hold or an owner
+message about its task), and the routine's runnable, unvalidated, split and awaiting-human wake reasons (each of those
+is a hold now). `work claim|record|release` stay as primitives; the recover skill uses the last two for leases left
+from before this decision. Process-harness roles run through the dispatcher's `minions work run`, as before.
+
 ## Reversed decisions
 
 - telegram-decisions.md D2 (tap buttons instead of native polls): native polls are built at the owner's request.
@@ -226,6 +232,8 @@ came with branch or pull-request delivery becomes `disabled`.
 - coordinator-sessions.md phase 10 / unattended-delivery.md item 7 (dispatcher waits for a spike): built as phase 1.
 - bootstrap.md (GitHub delivery, "origin/<base> as the single source of truth", CI-gated auto-merge, GitHub in the
   container) and unattended-delivery.md (PR and CI sync, GitHub intake in the routine pass): removed by Decision 8.
+- coordinator-sessions.md phase 7 (task sessions dispatch their stages) and the reset barrier, and unattended-delivery.md
+  item 6 (`work advance`) and the routine's runnable wakes: removed by Decision 10.
 
 ## Known limits (review of the build, 2026-10-31)
 
