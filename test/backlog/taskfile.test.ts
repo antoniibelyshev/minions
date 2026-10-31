@@ -48,7 +48,7 @@ describe.skipIf(!hasCli)('fast listing vs task view (real CLI)', { timeout: 30_0
       labels: ['minions:authorized'], workflow: 'docs', idempotencyKey: 'f2' })).task;
     await a.addNote(c.id, 'first note');
     await a.addNote(c.id, 'second note with `code` and "quotes"');
-    const u = await a.updateTask(c.id, (await a.getTask(c.id)).version, { branch: 'agent/child', prUrl: 'https://github.com/o/r/pull/1' });
+    const u = await a.updateTask(c.id, (await a.getTask(c.id)).version, { branch: 'agent/child' });
     expect(u.branch).toBe('agent/child');
     await a.createTask({ title: "It's: tricky #1", status: 'ready', labels: ['minions:authorized'], dependencies: [p.id, c.id], idempotencyKey: 'f3' });
     await a.closeTask((await a.createTask({ title: 'Done dep', idempotencyKey: 'f4' })).task.id, 'done');
@@ -89,7 +89,7 @@ describe.skipIf(!hasCli)('fast listing vs task view (real CLI)', { timeout: 30_0
     expect(readdirSync(tasksDir()).some((n) => readFileSync(join(tasksDir(), n), 'utf8').includes('\\U0001F680'))).toBe(true);
     const child = tasks.find((t) => t.id === 'task-1.1')!;
     expect(child).toMatchObject({ parent: 'task-1', dependencies: ['task-1'], branch: 'agent/child', workflow: 'docs',
-      prUrl: 'https://github.com/o/r/pull/1', acceptanceCriteria: [{ text: 'works', done: false }] });
+      acceptanceCriteria: [{ text: 'works', done: false }] });
     expect(child.version).toBe((await a.getTask('task-1.1')).version);
     expect(tasks.find((t) => t.id === 'task-1.2')).toMatchObject({ milestone: 'M1', parent: 'task-1', dependencies: ['task-3'],
       acceptanceCriteria: [{ text: 'h1', done: true }] });

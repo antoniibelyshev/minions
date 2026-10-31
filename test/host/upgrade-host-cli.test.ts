@@ -78,7 +78,7 @@ describe('minions upgrade --from-container on the host runtime (CLI)', () => {
     const safeCli = join(env.root, 'installed', 'node_modules', 'minions', 'dist', 'cli.js');
     mkdirSync(join(safeCli, '..'), { recursive: true });
     writeFileSync(safeCli, '');
-    await prepareHostRuntime(project, { target: { node: process.execPath, cli: safeCli }, pathEnv: '/nonexistent', runner: async () => ok() });
+    await prepareHostRuntime(project, { target: { node: process.execPath, cli: safeCli }, runner: async () => ok() });
     const shimBefore = readFileSync(hp.minionsShim, 'utf8');
     const mtimeBefore = statSync(hp.minionsShim).mtimeMs;
     expect(shimBefore).toContain(safeCli);
@@ -104,11 +104,11 @@ describe('minions upgrade --from-container on the host runtime (CLI)', () => {
     const r = await runInit({ path: repo, yes: true, visibility: 'private', runtime: 'host', dockerProbe: dockerDown });
     const project = await loadProjectJson(r.plan.projectId);
     const hp = hostRuntimePaths(project.projectId);
-    await prepareHostRuntime(project, { target: { node: process.execPath, cli: '/opt/minions/dist/cli.js' }, pathEnv: '/nonexistent', runner: async () => ok() });
+    await prepareHostRuntime(project, { target: { node: process.execPath, cli: '/opt/minions/dist/cli.js' }, runner: async () => ok() });
     const before = readFileSync(hp.minionsShim, 'utf8');
     for (const dir of [hp.workspace, hp.state]) {
       const cli = join(dir, 'm', 'dist', 'cli.js');
-      await expect(prepareHostRuntime(project, { target: { node: process.execPath, cli }, pathEnv: '/nonexistent', runner: async () => ok() }))
+      await expect(prepareHostRuntime(project, { target: { node: process.execPath, cli }, runner: async () => ok() }))
         .rejects.toMatchObject({ code: 'PRECONDITION', message: expect.stringMatching(/Refusing to point the host runtime shim at .* agent-writable/) });
       expect(readFileSync(hp.minionsShim, 'utf8')).toBe(before);
     }

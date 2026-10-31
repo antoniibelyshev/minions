@@ -2,11 +2,10 @@
 // Questions whose answer cannot change v0.1 behaviour are shown as information only, with the
 // deferred options marked "(not available in v0.1)". The wizard questions never ask for secrets:
 // the Claude authorization question only asks where the host should read a key from, never the key
-// itself; the only secret prompts (GitHub token, Telegram bot token, after the plan is applied) go
+// itself; the only secret prompt (the Telegram bot token, after the plan is applied) goes
 // through `secret()`, which reads from the host terminal without echo.
 import { createInterface, type Interface } from 'node:readline/promises';
-import { can } from '../config/capabilities.js';
-import { defaultDeliveryMode, githubDeliveryUnavailableReason, profileDefaults } from '../config/profiles.js';
+import { profileDefaults } from '../config/profiles.js';
 import { validateConfig } from '../config/resolve.js';
 import { PROFILES, type MinionsConfig, type Profile } from '../config/schema.js';
 import { stripTerminalEscapes } from '../core/control-chars.js';
@@ -93,12 +92,10 @@ export interface WizardInput {
   existing?: MinionsConfig;
   /** --config <file>: validated config, no questions. */
   configFile?: string;
-  /** A GitHub token is already stored for this project (branch/PR delivery needs it). */
-  githubCredential?: boolean;
   /** --yes: accept defaults. */
   yes: boolean;
   /**
-   * `minions setup`: the delivery-mode, channel and token questions are asked by setup after the
+   * `minions setup`: the channel and token questions are asked by setup after the
    * plan is applied (it needs the project id to store tokens), so the wizard skips them here.
    */
   skipIntegrations?: boolean;
@@ -111,7 +108,6 @@ export interface WizardInput {
 
 export interface WizardResult { config: MinionsConfig; notes: string[]; asked: string[]; claudeAuth?: ClaudeAuth }
 
-const NA = '(not available in v0.1)';
 
 export function parsePorts(s: string): { host: number; container: number }[] {
   const t = s.trim();
@@ -158,34 +154,13 @@ function baseConfig(input: WizardInput, profile: Profile): { config: MinionsConf
     return { config: { ...structuredClone(input.existing), projectId: input.projectId, packageVersion: VERSION }, notes: [] };
   }
   const r = profileDefaults(profile, {
-    hasGitHub: d.git.hasGitHub, hasGitHubCredential: !!input.githubCredential, baseBranch: d.git.baseBranch,
+    baseBranch: d.git.baseBranch,
     identity: { name: d.git.userName ?? '', email: d.git.userEmail ?? '' },
     projectId: input.projectId, packageVersion: VERSION,
   });
   r.config.verification.commands = [...d.verificationCommands];
   if (d.setupCommands.length) r.config.verification.setupCommands = [...d.setupCommands];
   return r;
-}
-
-const DELIVERY_MODES = ['local', 'branch', 'pull-request'] as const;
-
-/** Branch/PR delivery without a GitHub remote and stored token falls back to local, with the reason. */
-const PUSH_DENIED = 'the profile denies git.push (e.g. supervised), so nothing could be published';
-
-/** Why branch/pull-request delivery cannot be selected, or null: GitHub remote + token, and git.push not denied. */
-function deliveryBlockedReason(cfg: MinionsConfig, input: WizardInput): string | null {
-  return githubDeliveryUnavailableReason({ hasGitHub: input.discovery.git.hasGitHub, hasGitHubCredential: !!input.githubCredential })
-    ?? (can(cfg, 'git.push') === 'deny' ? PUSH_DENIED : null);
-}
-
-/** Branch/PR delivery without a GitHub remote and stored token (or with git.push denied) falls back to local, with the reason. */
-function deliveryFallback(cfg: MinionsConfig, input: WizardInput, notes: string[]): void {
-  const why = deliveryBlockedReason(cfg, input);
-  if (cfg.delivery.mode !== 'local' && why) {
-    notes.push(`delivery.mode "${cfg.delivery.mode}" is not selectable: ${why}; using local delivery.`);
-    cfg.delivery.mode = 'local';
-    cfg.delivery.provider = 'none';
-  }
 }
 
 export async function runWizard(input: WizardInput): Promise<WizardResult> {
@@ -196,7 +171,6 @@ export async function runWizard(input: WizardInput): Promise<WizardResult> {
     const cfg = validateConfig({ ...raw, projectId: input.projectId, packageVersion: VERSION }, input.configFile);
     if (input.visibility) cfg.visibility = input.visibility;
     const notes = [`configuration from ${input.configFile}`];
-    deliveryFallback(cfg, input, notes);
     return { config: validateConfig(cfg, input.configFile), notes, asked };
   }
 
@@ -216,7 +190,6 @@ export async function runWizard(input: WizardInput): Promise<WizardResult> {
   }
   const { config: cfg, notes } = baseConfig(input, profile);
   let claudeAuth = input.auth?.default;
-  deliveryFallback(cfg, input, notes);
 
   // 2. Visibility.
   if (input.visibility) cfg.visibility = input.visibility;
@@ -227,21 +200,13 @@ export async function runWizard(input: WizardInput): Promise<WizardResult> {
 
   if (interactive) {
     // 3. Backlog backend and ownership — single supported option in v0.1.
-    io.info(`Backlog: Backlog.md inside the container (ownership: ${cfg.backlog.ownership}). GitHub Issues ${NA}.`);
+    io.info(`Backlog: Backlog.md inside the container (ownership: ${cfg.backlog.ownership}).`);
     // 4. Intake and authorized scope.
     cfg.intake.startReady = await ask('intake.startReady',
       'Start ready tasks automatically? (n = only tasks labelled minions:authorized)', cfg.intake.startReady ? 'y' : 'n', yesNo);
-    // 5. Publication and merge authority.
-    const blocked = deliveryBlockedReason(cfg, input);
-    if (input.skipIntegrations) {
-      io.info('Delivery, GitHub and Telegram: asked by `minions setup` after this plan is applied.');
-    } else if (blocked) {
-      io.info(`Delivery: local commits on agent/<slug> branches, fetched with \`minions export\`. Branch push and pull requests are not selectable: ${blocked}. Auto-merge needs pull-request delivery.`);
-    } else {
-      io.info(`Delivery: pull-request (default: push agent/<slug> and open a PR against ${cfg.git.baseBranch}; CI runs on it), branch (push agent/<slug> to origin), or local (commits stay in the container; \`minions export\`). minions does not merge pull requests unless you opt into CI-gated auto-merge (\`minions setup\`, default no)${cfg.profile === 'supervised' ? '' : `; with local delivery the coordinator integrates approved branches into the container's local ${cfg.git.baseBranch}${cfg.profile === 'personal-work' ? ' (asking before each merge)' : ''}`}.`);
-      cfg.delivery.mode = await ask('delivery.mode', 'Delivery mode (local/branch/pull-request)', defaultDeliveryMode(cfg.delivery.mode, false), choice(DELIVERY_MODES));
-      cfg.delivery.provider = cfg.delivery.mode === 'local' ? cfg.delivery.provider : 'github';
-    }
+    // 5. Delivery: local only.
+    if (input.skipIntegrations) io.info('Local integration and Telegram: asked by `minions setup` after this plan is applied.');
+    else io.info(`Delivery: local commits on agent/<slug> branches, fetched with \`minions export\`${cfg.profile === 'supervised' ? '' : `; the coordinator integrates approved branches into the container's local ${cfg.git.baseBranch}${cfg.profile === 'personal-work' ? ' (asking before each merge)' : ''}, or the runtime does with local integration (\`minions setup\`, default no)`}.`);
     // 6. Communication. Terminal is always available; Telegram is optional and degrades to terminal.
     let channel = cfg.communication.channel;
     if (!input.skipIntegrations) {
@@ -269,9 +234,6 @@ export async function runWizard(input: WizardInput): Promise<WizardResult> {
     cfg.communication.channel = channel;
     // 7. Credentials — references only; no secret is requested by these questions.
     claudeAuth = parseWith(ClaudeAuthSchema, await askClaudeAuth(input, ask, io), 'wizard answers (Claude authorization)');
-    if (!input.skipIntegrations) io.info(d.git.hasGitHub
-      ? 'GitHub token: after the plan is applied you can store a fine-grained token (entered without echo, kept in the Keychain or a 0600 host file), or later with `minions auth github`.'
-      : 'GitHub token: not needed (no GitHub remote); `minions auth github` can store one later.');
   }
   if (!cfg.git.identity.name || !cfg.git.identity.email) {
     if (!interactive) {

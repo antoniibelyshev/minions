@@ -20,7 +20,7 @@ interface LocalEnv extends Env { keys: ReturnType<typeof approvalKeys>; starts: 
 function localEnv(mutate?: (c: MinionsConfig) => void): LocalEnv {
   const keys = approvalKeys();
   const env = makeEnv((c) => {
-    c.delivery.mode = 'local'; c.delivery.provider = 'none'; c.delivery.merge = 'auto-when-eligible';
+    c.delivery.merge = 'auto-when-eligible';
     c.verification.commands = ['true'];
     c.verification.setupCommands = [];
     mutate?.(c);
@@ -69,7 +69,7 @@ describe('local approval queues an integration', () => {
     const env = localEnv();
     env.backlog.add({ id: 'task-1', title: 'Add thing' });
     const { r, head, branch } = await approveTask(env, 'task-1');
-    expect(r).toMatchObject({ approved: true, to: 'merging', publication: { mode: 'local', state: 'queued', status: 'merging', headSha: head } });
+    expect(r).toMatchObject({ approved: true, to: 'merging', publication: { state: 'queued', status: 'merging', headSha: head } });
     expect((await env.backlog.getTask('task-1')).status).toBe('merging');
     expect(env.db.publication('task-1')).toMatchObject({ mode: 'local', state: 'queued', head_sha: head, branch });
     expect(integrationRows(env.db, 'task-1').map((x) => [x.phase, x.head_sha])).toEqual([['queued', head]]);
@@ -83,7 +83,7 @@ describe('local approval queues an integration', () => {
     expect(env.db.publication('task-1')!.state).toBe('published');
     expect(env.backlog.notes.map((n) => n.text).join('\n')).toMatch(/merged into main at [0-9a-f]{40}/);
     // A landed task re-published is a no-op.
-    expect(await env.sched.publish('task-1')).toMatchObject({ state: 'published', status: 'done', mode: 'local' });
+    expect(await env.sched.publish('task-1')).toMatchObject({ state: 'published', status: 'done' });
   });
 
 });
@@ -159,7 +159,7 @@ describe('repair hand-back', () => {
 });
 
 describe('policy: sensitive paths and base.merge ask', () => {
-  it('a sensitive path waits in awaiting-human; work approve --merge then work publish lands it', async () => {
+  it('a sensitive path waits in awaiting-human; work approve then work publish lands it', async () => {
     const env = localEnv();
     env.backlog.add({ id: 'task-1', title: 'Touch CI' });
     const { head } = await approveTask(env, 'task-1', '.github/workflows/ci.yml', 'on: push\n');
@@ -169,7 +169,7 @@ describe('policy: sensitive paths and base.merge ask', () => {
     expect(mainOf(env)).toBe(before);
     expect((await env.backlog.getTask('task-1')).status).toBe('awaiting-human');
     expect(env.db.publication('task-1')!.state).toBe('awaiting-approval');
-    expect(env.backlog.notes.map((n) => n.text).join('\n')).toContain(`minions work approve task-1 --head ${head} --merge`);
+    expect(env.backlog.notes.map((n) => n.text).join('\n')).toContain(`minions work approve task-1 --head ${head}`);
 
     // Unsigned or wrong-head approvals are refused; a signed merge approval is recorded.
     expect(() => env.sched.approveMerge('task-1', { head })).toThrow(/signed on the host/);
@@ -178,7 +178,7 @@ describe('policy: sensitive paths and base.merge ask', () => {
     expect(a.message).toMatch(/minions work publish task-1/);
 
     const p = await env.sched.publish('task-1');
-    expect(p).toMatchObject({ mode: 'local', state: 'queued', status: 'merging' });
+    expect(p).toMatchObject({ state: 'queued', status: 'merging' });
     expect((await env.backlog.getTask('task-1')).status).toBe('merging');
     expect(env.starts).toBe(2);
     await integrate(env);
@@ -209,13 +209,13 @@ describe('base.merge capability and mode-aware auto-merge reasons', () => {
 
   const local = (mutate?: (c: MinionsConfig) => void) => {
     const c = defaults('project-owner');
-    c.delivery.mode = 'local'; c.delivery.provider = 'none'; c.delivery.merge = 'auto-when-eligible';
+    c.delivery.merge = 'auto-when-eligible';
     c.verification.commands = ['npm test'];
     mutate?.(c);
     return c;
   };
 
-  it('local mode: integration readiness reasons only, and listUnavailable no longer reports it unavailable', () => {
+  it('integration readiness reasons, and listUnavailable reports what keeps it off', () => {
     expect(autoMergeConfigReasons(local())).toEqual([]);
     expect(localIntegrationEnabled(local())).toBe(true);
     expect(listUnavailable(local()).find((u) => u.path === 'delivery.merge')).toBeUndefined();
@@ -223,21 +223,6 @@ describe('base.merge capability and mode-aware auto-merge reasons', () => {
     expect(autoMergeConfigReasons(local((c) => { c.verification.commands = []; }))).toEqual([expect.stringMatching(/verification\.commands is empty/)]);
     expect(listUnavailable(local((c) => { c.verification.commands = []; })).find((u) => u.path === 'delivery.merge')?.reason).toMatch(/verification\.commands is empty/);
     expect(localIntegrationEnabled(local((c) => { c.delivery.merge = 'disabled'; }))).toBe(false);
-  });
-
-  it('pull-request mode is unchanged (pinned)', () => {
-    const c = defaults('project-owner');
-    c.delivery.mode = 'pull-request'; c.delivery.provider = 'github'; c.delivery.merge = 'auto-when-eligible';
-    expect(autoMergeConfigReasons(c)).toEqual([
-      'delivery.requiredChecksConfigured is false (never treated as zero required checks)',
-      'verification.ciAuthority is not "github": required checks are not read as merge evidence',
-    ]);
-    c.capabilities['pr.merge'] = 'deny';
-    expect(autoMergeConfigReasons(c)).toContain('pr.merge is denied by policy');
-    c.delivery.mode = 'branch';
-    expect(autoMergeConfigReasons(c)).toContain('auto-merge needs pull-request delivery to GitHub (delivery.mode is "branch")');
-    expect(localIntegrationEnabled(c)).toBe(false);
-    expect(dependencyDoneStatuses(c)).toEqual(new Set(['done', 'delivered']));
   });
 });
 

@@ -1,20 +1,17 @@
 // The unattended routine pass (task-68.2, docs/design/unattended-delivery.md phase 1): the pure wake decision, the
 // pass with its lock, interval, events and wake/crash-start actions, and the wrapper clock. Everything runs with
-// fakes: a fake gh (real syncTasks), a fake clock, a fake restart spawn. No tmux, claude or network.
+// fakes: a fake clock, a fake restart spawn. No tmux, claude or network.
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import type { RunResult } from '../../src/core/exec.js';
 import type { RoutineLock } from '../../src/runtime/db.js';
-import { syncTasks } from '../../src/runtime/ci.js';
 import { scheduleCrashStart, scheduleDetachedRestart, WAKE_PROMPT, buildCoordinatorCommand, type DetachedSpawn } from '../../src/runtime/coordinator.js';
 import { LAST_OWNER_MESSAGE_META } from '../../src/runtime/coordinator-usage.js';
 import { TRANSCRIPT_META } from '../../src/runtime/context-reset.js';
 import { runtimePaths } from '../../src/runtime/paths.js';
-import type { GhFn } from '../../src/runtime/publish.js';
 import {
   collectWakeReasons, coordinatorIdleSince, CRASH_START_EVENT, decideWake, endedByCrash, humanRoutine, humanRoutineReport, MAX_CRASH_STARTS_PER_DAY,
-  ROUTINE_EVENT, routineLast, routineSettings, runRoutinePass, startRoutineClock, summarizeSync, WAKE_EVENT,
+  ROUTINE_EVENT, routineLast, routineSettings, runRoutinePass, startRoutineClock, WAKE_EVENT,
   type CoordinatorView, type RoutinePassDeps, type RoutineSettings, type WakeInputs, type WakeReason,
 } from '../../src/runtime/routine.js';
 import { makeEnv, tmp } from './fixtures.js';
@@ -100,15 +97,14 @@ describe('decideWake (pure)', () => {
   });
 });
 
-/** A routine pass over a real DB with a fake clock, fake sync, fake next and fake restarts. */
+/** A routine pass over a real DB with a fake clock, fake next and fake restarts. */
 function passEnv(over: Partial<RoutinePassDeps> = {}) {
   const env = makeEnv((c) => { c.routine = { enabled: true }; });
   let now = T0;
-  const calls = { wake: 0, crash: 0, sync: 0 };
+  const calls = { wake: 0, crash: 0 };
   let coordinator = running();
   const deps: RoutinePassDeps = {
     db: env.db, config: env.config, now: () => now, pid: 1111, procStart: () => 's1', lockAlive: () => true,
-    sync: async () => { calls.sync++; return { intakeCreated: 0, synced: 1, failed: 0, statusChanges: 0, merged: 0, armed: 0, errors: [] }; },
     next: async () => ({ runnable: [] }),
     coordinator: async () => coordinator,
     activeLeases: async () => [],
@@ -127,28 +123,27 @@ function passEnv(over: Partial<RoutinePassDeps> = {}) {
 const runnableNext = async () => ({ runnable: [{ taskId: 'task-1', role: 'engineer' }] as never });
 
 describe('runRoutinePass', () => {
-  it('runs sync, records a routine event with counts and the decision, and shows last/next', async () => {
+  it('records a routine event with the decision, and shows last/next', async () => {
     const t = passEnv();
     const r = await runRoutinePass(t.deps, { trigger: 'clock' });
-    expect(r).toMatchObject({ ran: true, trigger: 'clock', sync: { synced: 1 }, decision: { action: 'none', why: 'nothing needs a model' }, nextAt: '2026-10-27T12:15:00.000Z' });
+    expect(r).toMatchObject({ ran: true, trigger: 'clock', decision: { action: 'none', why: 'nothing needs a model' }, nextAt: '2026-10-27T12:15:00.000Z' });
     const ev = t.env.db.lastEventOfKind(ROUTINE_EVENT)!;
-    expect(ev.data).toMatchObject({ trigger: 'clock', sync: { synced: 1 }, decision: { action: 'none' } });
+    expect(ev.data).toMatchObject({ trigger: 'clock', decision: { action: 'none' } });
     const last = routineLast(t.env.db, t.env.config, T0);
     expect(last).toMatchObject({ enabled: true, tickMinutes: 15, last: { trigger: 'clock' }, nextAt: expect.stringMatching(/T12:15:00/) });
     expect(humanRoutine(last)).toMatch(/routine: every 15 min; last pass .* next 2026-10-27T12:15/);
-    expect(humanRoutineReport(r)).toMatch(/synced 1, failed 0/);
+    expect(humanRoutineReport(r)).toMatch(/^routine pass \(clock\) at 2026-10-27T12:00:00.000Z\n/);
     expect(t.env.db.routineLock()).toBeNull(); // released
   });
 
-  it('routine off: clock and watchdog do nothing; a manual pass syncs but never wakes', async () => {
+  it('routine off: clock and watchdog do nothing; a manual pass runs but never wakes', async () => {
     const t = passEnv({ next: runnableNext });
     t.env.config.routine = undefined;
     expect(await runRoutinePass(t.deps, { trigger: 'clock' })).toMatchObject({ ran: false, skipped: 'disabled', nextAt: null });
     expect(await runRoutinePass(t.deps, { trigger: 'watchdog' })).toMatchObject({ ran: false, skipped: 'disabled' });
-    expect(t.calls.sync).toBe(0);
     const m = await runRoutinePass(t.deps, { trigger: 'manual' });
     expect(m).toMatchObject({ ran: true, decision: { action: 'none', why: 'routine.enabled is off' } });
-    expect(t.calls).toMatchObject({ sync: 1, wake: 0 });
+    expect(t.calls).toMatchObject({ wake: 0 });
   });
 
   it('interval: at most once per half tick unless --force; the watchdog only after 2 ticks', async () => {
@@ -176,12 +171,6 @@ describe('runRoutinePass', () => {
     t.env.db.acquireRoutineLock(2222, 's2', () => false, T0);
     t.env.db.exec(`DELETE FROM events WHERE kind = 'routine'`);
     expect(await runRoutinePass(t.deps, { trigger: 'clock' })).toMatchObject({ ran: true });
-  });
-
-  it('a failing sync is recorded and the pass still decides', async () => {
-    const t = passEnv({ sync: async () => { throw new Error('gh down'); }, next: runnableNext });
-    const r = await runRoutinePass(t.deps, { trigger: 'clock' });
-    expect(r).toMatchObject({ ran: true, syncError: 'gh down', decision: { action: 'wake' } });
   });
 
   it('sessions on: runnable stages open task sessions instead of a wake; sessions off: the wake as before, no session opened', async () => {
@@ -317,22 +306,6 @@ describe('wake reasons', () => {
     t.env.db.setMeta(TRANSCRIPT_META, JSON.stringify({ path: '/x.jsonl', at: ago(20) }));
     expect(coordinatorIdleSince(t.env.db, c, () => Date.parse(ago(7)))).toBe(ago(7));
     expect(coordinatorIdleSince(t.env.db, c, () => null)).toBe(ago(20));
-  });
-});
-
-describe('the pass sync step with a fake gh (real syncTasks)', () => {
-  it('a merged PR closes its task as done and is counted in the routine event', async () => {
-    const t = passEnv();
-    const url = 'https://github.com/acme/demo/pull/7';
-    t.env.backlog.add({ id: 'task-7', status: 'delivered', prUrl: url });
-    const pr = { url, state: 'MERGED', isDraft: false, headRefOid: 'a'.repeat(40), baseRefName: 'main', mergedAt: '2026-10-27T11:00:00Z', closedAt: null, mergeStateStatus: 'CLEAN', statusCheckRollup: [] };
-    const calls: string[][] = [];
-    const gh: GhFn = async (args): Promise<RunResult> => { calls.push(args); return args[0] === 'pr' && args[1] === 'view' && args[2] === url ? { code: 0, stdout: JSON.stringify(pr), stderr: '' } : { code: 1, stdout: '', stderr: 'unexpected' }; };
-    t.deps.sync = async () => summarizeSync(await syncTasks({ db: t.env.db, backlog: t.env.backlog, config: t.env.config, gh }), null);
-    const r = await runRoutinePass(t.deps, { trigger: 'clock' });
-    expect(r.sync).toMatchObject({ synced: 1, statusChanges: 1, merged: 1, failed: 0 });
-    expect(t.env.backlog.status('task-7')).toBe('done');
-    expect(calls.every((c) => c[0] === 'pr' && c[1] === 'view')).toBe(true); // read-only
   });
 });
 

@@ -88,7 +88,7 @@ describe('assistant argv', () => {
     expect(`Read(/${ctx.repoPath}/**)`.startsWith('Read(//')).toBe(true);
     const denied = variadic(args, '--disallowedTools');
     for (const d of ['Bash(minions runtime set*)', 'Bash(security *)', 'Bash(gh auth token*)', 'Bash(cat *secrets*)', 'Bash(git push*)', 'Bash(open *)',
-      'Bash(minions auth set*)', 'Bash(minions auth github*)', 'Bash(minions auth telegram*)', 'Bash(minions channel set*)']) expect(denied).toContain(d);
+      'Bash(minions auth set*)', 'Bash(minions auth telegram*)', 'Bash(minions channel set*)']) expect(denied).toContain(d);
     // Host-side secret stores are unreadable; host-side minions files are not editable.
     const p = projectPaths(id);
     expect(denied).toContain(`Read(/${credentialStoreDir()}/**)`);
@@ -120,7 +120,7 @@ describe('assistant argv', () => {
     expect(sp).toContain(id);
     expect(sp).toContain(join(repo, '.minions', 'config.json'));
     expect(sp).toMatch(/Never ask for, accept, or repeat a secret/);
-    expect(sp).toMatch(/! minions auth github/);
+    expect(sp).toMatch(/! minions auth telegram/);
     expect(sp).toMatch(/Never switch the agent runtime, never push, never open a browser/);
     expect(sp).toMatch(/Show a diff before every edit/);
     const skill = plan.files.find((f) => f.path.endsWith('SKILL.md'))!.content;
@@ -253,24 +253,23 @@ describe('init offer', () => {
 describe('doctor setup check', () => {
   it('points at the setup assistant when there are obvious gaps', async () => {
     const { setupGapsCheck } = await import('../../src/host/doctor.js');
-    const cfg = (commands: string[], channel: 'terminal' | 'telegram' = 'terminal') => ({ verification: { commands, testerRequired: true, reviewerRequired: true, ciAuthority: 'none' as const }, communication: { channel, progress: 'milestones' as const } });
-    const none = { onGitHub: false, githubCredential: null, telegramToken: 'missing' as const };
+    const cfg = (commands: string[], channel: 'terminal' | 'telegram' = 'terminal') => ({ verification: { commands, testerRequired: true, reviewerRequired: true }, communication: { channel, progress: 'milestones' as const } });
+    const none = { telegramToken: 'missing' as const };
     const gap = setupGapsCheck(cfg([]), none);
     expect(gap).toMatchObject({ name: 'setup', status: 'warn' });
     expect(gap.detail).toMatch(/no verification commands/);
     expect(gap.hint).toMatch(/minions setup assist/);
-    expect(setupGapsCheck(cfg(['npm test']), { ...none, onGitHub: true, githubCredential: 'missing' }).detail).toMatch(/GitHub remote without a stored token/);
     expect(setupGapsCheck(cfg(['npm test'], 'telegram'), none).detail).toMatch(/Telegram/);
     expect(setupGapsCheck(cfg(['npm test']), none)).toMatchObject({ status: 'ok' });
   });
 
   it('flags a Node project with local integration on and no verification.setupCommands (task-136)', async () => {
     const { setupGapsCheck } = await import('../../src/host/doctor.js');
-    const none = { onGitHub: false, githubCredential: null, telegramToken: 'missing' as const };
+    const none = { telegramToken: 'missing' as const };
     const cfg = (setupCommands: string[] | undefined, merge: 'auto-when-eligible' | 'disabled' = 'auto-when-eligible') => ({
-      verification: { commands: ['npm test'], ...(setupCommands ? { setupCommands } : {}), testerRequired: true, reviewerRequired: true, ciAuthority: 'none' as const },
+      verification: { commands: ['npm test'], ...(setupCommands ? { setupCommands } : {}), testerRequired: true, reviewerRequired: true },
       communication: { channel: 'terminal' as const, progress: 'milestones' as const },
-      delivery: { ...defaults().delivery, mode: 'local' as const, merge },
+      delivery: { ...defaults().delivery, merge },
     });
     const gap = setupGapsCheck(cfg(undefined), { ...none, nodeProject: true });
     expect(gap.status).toBe('warn');

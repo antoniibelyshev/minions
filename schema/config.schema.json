@@ -41,8 +41,7 @@
         "backend": {
           "type": "string",
           "enum": [
-            "backlogmd",
-            "github"
+            "backlogmd"
           ]
         },
         "ownership": {
@@ -52,18 +51,11 @@
             "personal",
             "assigned"
           ]
-        },
-        "repository": {
-          "type": [
-            "string",
-            "null"
-          ]
         }
       },
       "required": [
         "backend",
-        "ownership",
-        "repository"
+        "ownership"
       ],
       "additionalProperties": false
     },
@@ -114,78 +106,6 @@
             "externalAssignee",
             "requiredLabels",
             "allowedPaths"
-          ],
-          "additionalProperties": false
-        },
-        "github": {
-          "type": "object",
-          "properties": {
-            "enabled": {
-              "type": "boolean"
-            },
-            "repository": {
-              "anyOf": [
-                {
-                  "type": "string",
-                  "pattern": "^[A-Za-z0-9_.-]+\\/[A-Za-z0-9_.-]+$"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "labels": {
-              "type": "array",
-              "items": {
-                "type": "string",
-                "pattern": "^[^,\\r\\n]+$"
-              }
-            },
-            "assignee": {
-              "anyOf": [
-                {
-                  "type": "string",
-                  "pattern": "^(?:\\*|none|[A-Za-z0-9][A-Za-z0-9-]{0,38})$"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "milestone": {
-              "anyOf": [
-                {
-                  "type": "string",
-                  "pattern": "^[^\\r\\n]+$"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "state": {
-              "type": "string",
-              "enum": [
-                "open",
-                "closed",
-                "all"
-              ]
-            },
-            "readyLabels": {
-              "type": "array",
-              "items": {
-                "type": "string",
-                "pattern": "^[^,\\r\\n]+$"
-              }
-            }
-          },
-          "required": [
-            "enabled",
-            "repository",
-            "labels",
-            "assignee",
-            "milestone",
-            "state"
           ],
           "additionalProperties": false
         }
@@ -423,53 +343,12 @@
     "delivery": {
       "type": "object",
       "properties": {
-        "provider": {
-          "type": "string",
-          "enum": [
-            "none",
-            "github"
-          ]
-        },
-        "mode": {
-          "type": "string",
-          "enum": [
-            "local",
-            "branch",
-            "pull-request"
-          ]
-        },
         "merge": {
           "type": "string",
           "enum": [
             "disabled",
-            "manual",
             "auto-when-eligible"
           ]
-        },
-        "method": {
-          "type": "string",
-          "enum": [
-            "squash",
-            "merge",
-            "rebase"
-          ]
-        },
-        "deleteMergedBranches": {
-          "type": "boolean"
-        },
-        "identityMode": {
-          "type": "string",
-          "enum": [
-            "git-identity",
-            "user-token",
-            "github-apps"
-          ]
-        },
-        "requireIndependentApproval": {
-          "type": "boolean"
-        },
-        "requiredChecksConfigured": {
-          "type": "boolean"
         },
         "integrationTimeoutMinutes": {
           "type": "integer",
@@ -478,14 +357,7 @@
         }
       },
       "required": [
-        "provider",
-        "mode",
-        "merge",
-        "method",
-        "deleteMergedBranches",
-        "identityMode",
-        "requireIndependentApproval",
-        "requiredChecksConfigured"
+        "merge"
       ],
       "additionalProperties": false
     },
@@ -516,25 +388,12 @@
           "items": {
             "$ref": "#/$defs/__schema0"
           }
-        },
-        "ciAuthority": {
-          "type": "string",
-          "enum": [
-            "none",
-            "github"
-          ]
-        },
-        "ciPendingTimeoutMinutes": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 9007199254740991
         }
       },
       "required": [
         "commands",
         "testerRequired",
-        "reviewerRequired",
-        "ciAuthority"
+        "reviewerRequired"
       ],
       "additionalProperties": false
     },
@@ -638,18 +497,6 @@
         "git.commit": {
           "$ref": "#/$defs/__schema4"
         },
-        "git.push": {
-          "$ref": "#/$defs/__schema4"
-        },
-        "pr.create": {
-          "$ref": "#/$defs/__schema4"
-        },
-        "pr.review": {
-          "$ref": "#/$defs/__schema4"
-        },
-        "pr.merge": {
-          "$ref": "#/$defs/__schema4"
-        },
         "base.merge": {
           "default": "deny",
           "$ref": "#/$defs/__schema4"
@@ -681,10 +528,6 @@
         "architecture.change",
         "migrations.edit",
         "git.commit",
-        "git.push",
-        "pr.create",
-        "pr.review",
-        "pr.merge",
         "ci.edit",
         "infrastructure.edit",
         "network.use",
@@ -858,10 +701,6 @@
                 "architecture.change",
                 "migrations.edit",
                 "git.commit",
-                "git.push",
-                "pr.create",
-                "pr.review",
-                "pr.merge",
                 "base.merge",
                 "ci.edit",
                 "infrastructure.edit",
@@ -910,18 +749,6 @@
                 "$ref": "#/$defs/__schema5"
               },
               "git.commit": {
-                "$ref": "#/$defs/__schema5"
-              },
-              "git.push": {
-                "$ref": "#/$defs/__schema5"
-              },
-              "pr.create": {
-                "$ref": "#/$defs/__schema5"
-              },
-              "pr.review": {
-                "$ref": "#/$defs/__schema5"
-              },
-              "pr.merge": {
                 "$ref": "#/$defs/__schema5"
               },
               "base.merge": {

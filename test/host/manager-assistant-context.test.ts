@@ -85,7 +85,7 @@ describe('context bundle', () => {
     // Grouped by the listSettings group: every setting sits under its own group name.
     for (const v of settings) expect(bundle.settings[v.group]!.map((s) => s.key)).toContain(v.key);
     const find = (key: string) => flat.find((s) => s.key === key);
-    expect(find('delivery.merge')).toMatchObject({ type: 'enum', choices: expect.arrayContaining(['disabled', 'manual']), hostOwned: true });
+    expect(find('delivery.merge')).toMatchObject({ type: 'enum', choices: expect.arrayContaining(['disabled', 'auto-when-eligible']), hostOwned: true });
     // Trimmed (task-65.4): no per-setting "effect" sentence, group or label, and /set is named once at the top level.
     expect(flat.every((s) => !('effect' in s) && !('group' in s) && !('label' in s))).toBe(true);
     expect(find('delivery.merge')!.changeWith).toBeUndefined();

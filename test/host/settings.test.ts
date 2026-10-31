@@ -87,7 +87,7 @@ describe('settings model and --list', () => {
     expect(by('communication.progress')).toMatchObject({ value: 'quiet', source: 'local override', needsRestart: true });
     expect(by('communication.channel')).toMatchObject({ apply: 'launch', needsRestart: true });
     expect(by('secrets.telegram')).toMatchObject({ value: 'provisioned', source: 'credential store', needsRegenerate: false });
-    expect(by('secrets.github')).toMatchObject({ value: 'missing' });
+    expect(by('secrets.codex')).toMatchObject({ value: 'missing' });
     expect(by('pause.starts')).toMatchObject({ value: 'running', source: 'runtime' });
     expect(JSON.stringify(views)).not.toContain(TOKEN);
     expect(JSON.stringify(views)).not.toContain('AAHfake');
@@ -101,7 +101,7 @@ describe('settings model and --list', () => {
     const { project } = await install('shared');
     const views = S.listSettings(await ctxOf(project, fakeRuntime({ running: false }).runtime));
     expect(views.find((v) => v.key === 'pause.intake')!.value).toBeNull();
-    expect(views.find((v) => v.key === 'delivery.mode')!.source).toBe('shared config');
+    expect(views.find((v) => v.key === 'delivery.merge')!.source).toBe('shared config');
   });
 });
 
@@ -152,7 +152,7 @@ describe('settings set', () => {
     await expect(SC.applySetting(ctx, 'communication.progress', 'loud', {}, deps)).rejects.toMatchObject({ code: 'INVALID_CONFIG' });
     await expect(SC.applySetting(ctx, 'models.default', 'not-allowed-model', {}, deps)).rejects.toMatchObject({ code: 'INVALID_CONFIG' });
     await expect(SC.applySetting(ctx, 'no.such.key', '1', {}, deps)).rejects.toMatchObject({ code: 'INVALID_CONFIG' });
-    await expect(SC.applySetting(ctx, 'secrets.github', 'ghp_x', {}, deps)).rejects.toMatchObject({ code: 'PRECONDITION' });
+    await expect(SC.applySetting(ctx, 'secrets.telegram', 'x', {}, deps)).rejects.toMatchObject({ code: 'PRECONDITION' });
     expect(existsSync(local)).toBe(false);
   });
 
@@ -303,7 +303,7 @@ describe('interactive menu', () => {
     const f = fakeRuntime({ running: false });
     const auth: string[] = [];
     const n = indexOf('verification.reviewerRequired') + 1;
-    const g = indexOf('secrets.github') + 1;
+    const g = indexOf('secrets.codex') + 1;
     const tg = indexOf('secrets.telegram') + 1;
     // reviewerRequired: choose 2) false -> loosening -> decline. Then both token items: refused, no auth flow on
     // the piped stdin (the next line is still read as a menu choice, not as a token). Quit.
@@ -312,8 +312,8 @@ describe('interactive menu', () => {
     expect(existsSync(local)).toBe(false);
     expect(auth).toEqual([]);
     expect(t.text()).toContain('not saved: Not confirmed');
-    expect(t.text()).toContain('GitHub token: not changed here (no terminal to enter a token without echo)');
-    expect(t.text()).toContain('hint: run `minions auth github --stdin < token-file` instead');
+    expect(t.text()).toContain('OpenAI API key (Codex): not changed here (no terminal to enter a token without echo)');
+    expect(t.text()).toContain('hint: run `minions auth codex --stdin < token-file` instead');
     expect(t.text()).toContain('hint: run `minions auth telegram --stdin < token-file` instead');
     expect(t.prompts.filter((p) => /^Setting to change/.test(p))).toHaveLength(4);
   });
@@ -322,10 +322,10 @@ describe('interactive menu', () => {
     const { project } = await install('private');
     const f = fakeRuntime({ running: false });
     const auth: string[] = [];
-    const t = fakeIO(true, [...Array(indexOf('secrets.github')).fill('down'), 'enter', 'quit'], []);
+    const t = fakeIO(true, [...Array(indexOf('secrets.codex')).fill('down'), 'enter', 'quit'], []);
     await M.runSettingsMenu(project, { io: t.io, runtime: f.runtime, runAuth: async (k) => { auth.push(k); } });
-    expect(auth).toEqual(['github']);
-    expect(plain(t.text())).toContain('GitHub token: missing');
+    expect(auth).toEqual(['codex']);
+    expect(plain(t.text())).toContain('OpenAI API key (Codex): missing');
   });
 });
 
@@ -364,10 +364,10 @@ describe('tester additions (task-23)', () => {
   it('a local override cannot lift a project-level deny rule either (rule-level deny, plain allow attempt)', async () => {
     const { project, file, local } = await install('private');
     const cfg = readJson(file);
-    cfg.capabilities['git.push'] = { effect: 'ask', rules: [{ effect: 'deny', roles: ['reviewer'] }] };
+    cfg.capabilities['base.merge'] = { effect: 'ask', rules: [{ effect: 'deny', roles: ['reviewer'] }] };
     writeFileSync(file, JSON.stringify(cfg));
     const { runtime } = fakeRuntime({ running: false });
-    await expect(SC.applySetting(await ctxOf(project), 'capabilities.git.push', 'allow', { yes: true }, { runtime, confirm: async () => true }))
+    await expect(SC.applySetting(await ctxOf(project), 'capabilities.base.merge', 'allow', { yes: true }, { runtime, confirm: async () => true }))
       .rejects.toMatchObject({ code: 'POLICY_DENIED' });
     expect(existsSync(local)).toBe(false);
   });
@@ -480,7 +480,7 @@ describe('remaining loosening changes (task-50)', () => {
     { key: 'models.default', to: 'opus', back: 'sonnet', msg: /workers default to a pricier model \(sonnet ~\$3\/MTok -> opus ~\$5\/MTok; higher spend\)/ },
     { key: 'models.selection', to: 'coordinator', back: 'fixed', seed: { models: { selection: 'fixed' } }, msg: /the coordinator may pick other allowed models per worker \(possibly pricier\)/ },
     { key: 'coordinator.bundledSkills', to: 'true', back: 'false', msg: /the coordinator session gets Claude Code's bundled skills/ },
-    { key: 'delivery.merge', to: 'manual', back: 'disabled', seed: { delivery: { provider: 'github', mode: 'pull-request' } }, msg: /minions may merge pull requests on GitHub when asked/ },
+    { key: 'delivery.merge', to: 'auto-when-eligible', back: 'disabled', msg: /approved branches that pass verification are merged into the base without asking/ },
     { key: 'execution.maxRepairCyclesBeforeReplan', to: '5', back: '3', msg: /more failed fix cycles may run before a task is replanned \(higher spend\) \(3 -> 5\)/ },
   ];
   for (const c of cases) {
@@ -523,11 +523,10 @@ describe('remaining loosening changes (task-50)', () => {
     expect((await S.planSetting(await ctxOf(project), 'models.allowed', ['haiku', 'opus'])).loosens).toMatch(/may pick opus/);
   });
 
-  it('delivery.merge: manual -> disabled and auto -> manual are not loosening; the settings list flags every new key as canLoosen', async () => {
+  it('delivery.merge: auto -> disabled is not loosening; the settings list flags every new key as canLoosen', async () => {
     const { project, local } = await install('private');
-    writeFileSync(local, JSON.stringify({ delivery: { provider: 'github', mode: 'pull-request', merge: 'auto-when-eligible' } }));
+    writeFileSync(local, JSON.stringify({ delivery: { merge: 'auto-when-eligible' } }));
     const ctx = await ctxOf(project);
-    expect((await S.planSetting(ctx, 'delivery.merge', 'manual')).loosens).toBeNull();
     expect((await S.planSetting(ctx, 'delivery.merge', 'disabled')).loosens).toBeNull();
     const views = S.listSettings(ctx);
     for (const k of ['models.allowed', 'models.default', 'coordinator.bundledSkills', 'delivery.merge', 'execution.maxRepairCyclesBeforeReplan']) {

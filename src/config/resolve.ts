@@ -7,16 +7,13 @@ import { MinionsConfigSchema, CapabilityRuleSchema, type Capability, type Capabi
 
 export const SUPPORTED = {
   backlog: ['backlogmd'],
-  delivery: ['local', 'branch', 'pull-request'],
   communication: ['terminal', 'telegram', 'auto'],
 } as const;
 
 /** Features deferred in v0.1; doctor and the wizard report them as unavailable. */
 export const DEFERRED_FEATURES = [
-  'GitHub Issues backend', 'merge requests (delivery.merge "manual")', 'review publication',
   'config plan/apply transactions', 'backlog migration', 'upgrade plan and schema migration', 'budgets',
-  'companion containers', 'GitHub App short-lived tokens (a fine-grained PAT is used instead)',
-  'CODEOWNERS mapping of sensitive paths', 'shared backlog versioned in Git',
+  'companion containers', 'shared backlog versioned in Git',
 ] as const;
 
 export interface Unavailable { path: string; value: unknown; reason: string }
@@ -26,18 +23,13 @@ export function listUnavailable(config: MinionsConfig): Unavailable[] {
   const out: Unavailable[] = [];
   const has = (list: readonly string[], v: string) => list.includes(v);
   if (!has(SUPPORTED.backlog, config.backlog.backend)) out.push({ path: 'backlog.backend', value: config.backlog.backend, reason: 'only Backlog.md is supported in v0.1' });
-  if (!has(SUPPORTED.delivery, config.delivery.mode)) out.push({ path: 'delivery.mode', value: config.delivery.mode, reason: `delivery mode is not supported (supported: ${SUPPORTED.delivery.join(', ')})` });
   if (!has(SUPPORTED.communication, config.communication.channel)) out.push({ path: 'communication.channel', value: config.communication.channel, reason: 'this communication channel is not supported in v0.1' });
   if (config.communication.channel === 'telegram' && config.container.network === 'none') {
     out.push({ path: 'communication.channel', value: 'telegram', reason: 'Telegram needs outbound network (api.telegram.org, and the npm registry for the plugin\'s dependencies) but container.network is none; the coordinator runs terminal-only' });
   }
   if (config.delivery.merge === 'auto-when-eligible') {
     const why = autoMergeConfigReasons(config);
-    if (why.length) out.push({ path: 'delivery.merge', value: config.delivery.merge, reason: `automatic merge is unavailable: ${why.join('; ')}` });
-  } else if (config.delivery.merge === 'manual') {
-    out.push({ path: 'delivery.merge', value: 'manual', reason: config.delivery.mode === 'pull-request'
-      ? 'merge requests through minions are deferred; minions never merges: merge the pull request through your normal process'
-      : 'merge requests need pull-request delivery and are deferred in v0.1' });
+      if (why.length) out.push({ path: 'delivery.merge', value: config.delivery.merge, reason: `local integration is unavailable: ${why.join('; ')}` });
   }
   if (config.budgets.taskUsd !== null || config.budgets.dailyUsd !== null) out.push({ path: 'budgets', value: config.budgets, reason: 'budgets are not enforced in v0.1' });
   return out;
@@ -45,10 +37,8 @@ export function listUnavailable(config: MinionsConfig): Unavailable[] {
 
 function crossFieldIssues(c: MinionsConfig): ConfigIssue[] {
   const issues: ConfigIssue[] = [];
-  if (!(SUPPORTED.delivery as readonly string[]).includes(c.delivery.mode)) issues.push({ path: 'delivery.mode', message: `"${c.delivery.mode}" is not supported by this build (supported: ${SUPPORTED.delivery.join(', ')})` });
   if (!(SUPPORTED.backlog as readonly string[]).includes(c.backlog.backend)) issues.push({ path: 'backlog.backend', message: `"${c.backlog.backend}" is not supported by this build (supported: ${SUPPORTED.backlog.join(', ')})` });
   if (!(SUPPORTED.communication as readonly string[]).includes(c.communication.channel)) issues.push({ path: 'communication.channel', message: `"${c.communication.channel}" is not supported by this build (supported: ${SUPPORTED.communication.join(', ')})` });
-  if (c.delivery.mode !== 'local' && c.delivery.provider !== 'github') issues.push({ path: 'delivery.provider', message: `delivery.mode "${c.delivery.mode}" publishes to GitHub and needs delivery.provider "github" (got "${c.delivery.provider}")` });
   if (!c.models.allowed.includes(c.models.default)) issues.push({ path: 'models.default', message: `"${c.models.default}" is not in models.allowed [${c.models.allowed.join(', ')}]` });
   if (c.models.coordinator !== undefined && !c.models.allowed.includes(c.models.coordinator)) issues.push({ path: 'models.coordinator', message: `"${c.models.coordinator}" is not in models.allowed [${c.models.allowed.join(', ')}]` });
   if (c.models.router !== undefined && !c.models.allowed.includes(c.models.router)) issues.push({ path: 'models.router', message: `"${c.models.router}" is not in models.allowed [${c.models.allowed.join(', ')}]` });
@@ -63,9 +53,49 @@ function crossFieldIssues(c: MinionsConfig): ConfigIssue[] {
   return issues;
 }
 
-/** Strict schema parse + cross-field checks. Throws INVALID_CONFIG listing dotted paths. */
+/** Keys of the removed GitHub delivery (docs/design/autonomy.md Decision 8): accepted in any layer, and dropped. */
+const LEGACY_KEYS: Record<string, readonly string[]> = {
+  backlog: ['repository'],
+  intake: ['github'],
+  delivery: ['provider', 'mode', 'method', 'deleteMergedBranches', 'identityMode', 'requireIndependentApproval', 'requiredChecksConfigured'],
+  verification: ['ciAuthority', 'ciPendingTimeoutMinutes'],
+  capabilities: ['git.push', 'pr.create', 'pr.review', 'pr.merge'],
+};
+
+/**
+ * A copy of a config (or a layer of one) without the legacy keys. delivery.merge "manual" (never implemented) becomes
+ * "disabled", and so does an "auto-when-eligible" that meant GitHub auto-merge (delivery.mode branch or pull-request):
+ * it never switches local integration on by itself. Anything that is not an object is returned as is.
+ */
+export function stripLegacyKeys(raw: unknown): unknown {
+  if (!isObj(raw)) return raw;
+  const out: Obj = { ...raw };
+  for (const [section, keys] of Object.entries(LEGACY_KEYS)) {
+    const sec = out[section];
+    if (!isObj(sec) || !(keys.some((k) => k in sec) || (section === 'delivery' && sec.merge === 'manual'))) continue;
+    const next: Obj = { ...sec };
+    for (const k of keys) delete next[k];
+    if (section === 'delivery' && (next.merge === 'manual' || (next.merge === 'auto-when-eligible' && typeof sec.mode === 'string' && sec.mode !== 'local'))) next.merge = 'disabled';
+    out[section] = next;
+  }
+  if (isObj(out.backlog) && out.backlog.backend === 'github') out.backlog = { ...out.backlog, backend: 'backlogmd' };
+  // Project roles name capabilities too: their policy column and `requires`.
+  const legacyCap = (c: unknown) => LEGACY_KEYS.capabilities!.includes(c as string);
+  if (isObj(out.roles)) {
+    out.roles = Object.fromEntries(Object.entries(out.roles).map(([name, r]) => {
+      if (!isObj(r)) return [name, r];
+      const next: Obj = { ...r };
+      if (isObj(r.capabilities)) next.capabilities = Object.fromEntries(Object.entries(r.capabilities).filter(([c]) => !legacyCap(c)));
+      if (Array.isArray(r.requires)) next.requires = r.requires.filter((c) => !legacyCap(c));
+      return [name, next];
+    }));
+  }
+  return out;
+}
+
+/** Strict schema parse (after stripLegacyKeys) + cross-field checks. Throws INVALID_CONFIG listing dotted paths. */
 export function validateConfig(raw: unknown, source?: string): MinionsConfig {
-  const r = MinionsConfigSchema.safeParse(raw);
+  const r = MinionsConfigSchema.safeParse(stripLegacyKeys(raw));
   if (!r.success) throw invalidConfig(zodIssues(r.error.issues), source);
   const issues = crossFieldIssues(r.data);
   if (issues.length) throw invalidConfig(issues, source);

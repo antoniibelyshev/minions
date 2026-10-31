@@ -88,7 +88,7 @@ export function readJournal(state: string): JournalEntry[] {
 export function parseKey(key: string): string[] {
   if (!KEY.test(key) || key.length > 200) throw new MinionsError('PRECONDITION', `Invalid config key "${key.slice(0, 80)}".`, 'Use a dotted path, e.g. workflows.default or roles.researcher.model.');
   const segs = key.split('.');
-  // Capability names contain dots (capabilities.git.push): the name is one key.
+  // Capability names contain dots (capabilities.git.commit): the name is one key.
   return segs[0] === 'capabilities' && segs.length > 2 ? ['capabilities', segs.slice(1).join('.')] : segs;
 }
 

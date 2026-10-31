@@ -182,13 +182,13 @@ describe('runHook', () => {
 });
 
 describe('pre-telegram hook', () => {
-  const call = (extra: Record<string, unknown>) => ({ hook_event_name: 'PreToolUse', tool_name: 'mcp__plugin_telegram_telegram__reply', tool_input: { chat_id: '1', text: 'hi' }, ...extra });
+  const call = (extra: Record<string, unknown>) => ({ hook_event_name: 'PreToolUse', tool_name: 'mcp__minions-telegram__reply', tool_input: { chat_id: '1', text: 'hi' }, ...extra });
   const permission = (o: { stdout?: string }) => decision(o)?.hookSpecificOutput?.permissionDecision;
 
   it('allows the coordinator main thread', () => {
     const r = preTelegramHook(call({}));
     expect(r.stdout).toBeUndefined();
-    expect(r.reason).toMatch(/^allow: mcp__plugin_telegram_telegram__reply from the coordinator/);
+    expect(r.reason).toMatch(/^allow: mcp__minions-telegram__reply from the coordinator/);
   });
 
   it('denies the built-in general-purpose subagent and every other subagent type', () => {
@@ -213,10 +213,10 @@ describe('pre-telegram hook', () => {
 
 describe('pre-telegram hook fails closed on input it cannot decide', () => {
   const permission = (o: { stdout?: string }) => decision(o)?.hookSpecificOutput?.permissionDecision;
-  const reply = 'mcp__plugin_telegram_telegram__reply';
+  const reply = 'mcp__minions-telegram__reply';
 
   it('denies a missing, non-string or non-Telegram tool_name', () => {
-    for (const tool_name of [undefined, null, 42, {}, '', 'Bash', 'Agent', 'mcp__other__reply', 'mcp__plugin_telegram_telegram__', 'xmcp__plugin_telegram_telegram__reply']) {
+    for (const tool_name of [undefined, null, 42, {}, '', 'Bash', 'Agent', 'mcp__other__reply', 'mcp__minions-telegram__', 'xmcp__minions-telegram__reply']) {
       const r = preTelegramHook({ hook_event_name: 'PreToolUse', tool_name, tool_input: {} });
       expect(permission(r), String(tool_name)).toBe('deny');
       expect(decision(r).hookSpecificOutput.permissionDecisionReason).toMatch(/minions pre-telegram hook got (no tool_name|a non-Telegram tool_name)/);
@@ -260,22 +260,22 @@ describe('tester: pre-telegram edge cases', () => {
   const permission = (o: { stdout?: string }) => decision(o)?.hookSpecificOutput?.permissionDecision;
 
   it('never emits an explicit allow on the main thread, so download_attachment still prompts', () => {
-    for (const tool of ['reply', 'react', 'edit_message', 'download_attachment'].map((t) => `mcp__plugin_telegram_telegram__${t}`)) {
+    for (const tool of ['reply', 'react', 'edit_message', 'download_attachment'].map((t) => `mcp__minions-telegram__${t}`)) {
       const r = preTelegramHook({ hook_event_name: 'PreToolUse', tool_name: tool, tool_input: {} });
       expect(r.stdout, tool).toBeUndefined();
     }
   });
 
   it('denies a subagent download_attachment call and names the tool', () => {
-    const r = preTelegramHook({ hook_event_name: 'PreToolUse', tool_name: 'mcp__plugin_telegram_telegram__download_attachment', agent_id: 'a', agent_type: 'general-purpose' });
+    const r = preTelegramHook({ hook_event_name: 'PreToolUse', tool_name: 'mcp__minions-telegram__download_attachment', agent_id: 'a', agent_type: 'general-purpose' });
     expect(permission(r)).toBe('deny');
-    expect(decision(r).hookSpecificOutput.permissionDecisionReason).toMatch(/^mcp__plugin_telegram_telegram__download_attachment is coordinator-only/);
+    expect(decision(r).hookSpecificOutput.permissionDecisionReason).toMatch(/^mcp__minions-telegram__download_attachment is coordinator-only/);
   });
 
   it('logs the deny to hooks.log so the first live run can confirm the gate', async () => {
     const env = makeEnv();
     vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
-    await runHook('pre-telegram', loader(env), JSON.stringify({ tool_name: 'mcp__plugin_telegram_telegram__reply', agent_id: 'a', agent_type: 'general-purpose' }));
+    await runHook('pre-telegram', loader(env), JSON.stringify({ tool_name: 'mcp__minions-telegram__reply', agent_id: 'a', agent_type: 'general-purpose' }));
     expect(readFileSync(join(stateDir, 'logs', 'hooks.log'), 'utf8')).toMatch(/pre-telegram deny/);
   });
 });

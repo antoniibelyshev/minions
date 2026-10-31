@@ -12,7 +12,7 @@ import { dockerDown, dockerUp, makeRepo, withHome } from './fixtures.js';
 
 type RunResult = import('../../src/core/exec.js').RunResult;
 const ID = '3f2b8c1e-7d4a-4e9b-9c2f-1a2b3c4d5e6f';
-const TOKEN = 'github_pat_11ABCDEFG0123456789_abcdefghijklmnopqrstuvwxyzABCDEFGHIJ0123456789';
+const TOKEN = 'sk-proj-11ABCDEFG0123456789_abcdefghijklmnopqrstuvwxyzABCDEFGHIJ0123456789';
 
 let env: ReturnType<typeof withHome>;
 let prev: string | undefined;
@@ -34,21 +34,21 @@ describe('container copy lifecycle', () => {
     await plant(ID);
     const err = new Error('up failed');
     await expect(C.upClearingSecretsOnFailure({ up: async () => { throw err; } }, ID)).rejects.toBe(err);
-    expect(copies(ID)).toEqual([false, false, false, false]);
+    expect(copies(ID)).toEqual([false, false, false]);
   });
 
   it('keeps the copies when compose.up succeeds', async () => {
     await plant(ID);
     await C.upClearingSecretsOnFailure({ up: async () => undefined }, ID);
-    expect(copies(ID)).toEqual([true, true, true, true]);
+    expect(copies(ID)).toEqual([true, true, true]);
   });
 
   it('clearStaleSecrets removes copies only when no container is running', async () => {
     await plant(ID);
     expect(await C.clearStaleSecrets(ID, true)).toBe(false);
-    expect(copies(ID)).toEqual([true, true, true, true]);
+    expect(copies(ID)).toEqual([true, true, true]);
     expect(await C.clearStaleSecrets(ID, false)).toBe(true);
-    expect(copies(ID)).toEqual([false, false, false, false]);
+    expect(copies(ID)).toEqual([false, false, false]);
     expect(await C.clearStaleSecrets(ID, false)).toBe(false);
   });
 
@@ -56,13 +56,13 @@ describe('container copy lifecycle', () => {
     const repo = makeRepo(env.root);
     const r = await runInit({ path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
     const id = r.plan.projectId;
-    await new C.FileStore().set(id, TOKEN);
+    await new C.FileStore(C.CODEX_CREDENTIAL).set(id, TOKEN);
     await plant(id);
     const runner = async (_c: string, args: string[]): Promise<RunResult> => ok(args.includes('ps') ? '' : '');
     const doc = await runDoctor({ cwd: repo, probe: dockerUp, runner });
     expect(doc.checks.find((c) => c.name === 'secrets.copy')).toMatchObject({ status: 'warn' });
-    expect(copies(id)).toEqual([false, false, false, false]);
-    expect(existsSync(new C.FileStore().path(id))).toBe(true);
+    expect(copies(id)).toEqual([false, false, false]);
+    expect(existsSync(new C.FileStore(C.CODEX_CREDENTIAL).path(id))).toBe(true);
   });
 
   it('doctor leaves copies alone when the container is running', async () => {
@@ -73,7 +73,7 @@ describe('container copy lifecycle', () => {
     const runner = async (_c: string, args: string[]): Promise<RunResult> => args.includes('ps') ? ok('abc\n') : ok('{}');
     const doc = await runDoctor({ cwd: repo, probe: dockerUp, runner });
     expect(doc.checks.find((c) => c.name === 'secrets.copy')).toBeUndefined();
-    expect(copies(id)).toEqual([true, true, true, true]);
+    expect(copies(id)).toEqual([true, true, true]);
   });
 });
 
@@ -154,7 +154,7 @@ describe('doctor keeps copies unless the container is confirmed gone', () => {
         return args.includes('-a') ? res : ok(''); // `--status running` lookup finds nothing
       };
       const doc = await runDoctor({ cwd: repo, probe: dockerUp, runner });
-      expect(copies(id)).toEqual([true, true, true, true]);
+      expect(copies(id)).toEqual([true, true, true]);
       expect(doc.checks.find((c) => c.name === 'secrets.copy')).toMatchObject({ status: 'warn', detail: expect.stringContaining('not removed') });
     });
   }
@@ -165,11 +165,11 @@ describe('doctor keeps copies unless the container is confirmed gone', () => {
     const runner = async (_c: string, args: string[]): Promise<RunResult> =>
       args.includes('ps') && args.includes('-a') ? ok(JSON.stringify({ State: 'exited' })) : ok('');
     await runDoctor({ cwd: repo, probe: dockerUp, runner });
-    expect(copies(r.plan.projectId)).toEqual([false, false, false, false]);
+    expect(copies(r.plan.projectId)).toEqual([false, false, false]);
   });
 });
 
-describe('Compose.secretsVisibility (auth github / auth telegram)', () => {
+describe('Compose.secretsVisibility (auth telegram / auth codex)', () => {
   const mk = (running: boolean, mounts: unknown) => new Compose(ID, async (_c, args) =>
     args[0] === 'inspect' ? ok(JSON.stringify(mounts)) : ok(running ? 'abc\n' : ''));
   it('claims visibility only when running with the secrets mount', async () => {
@@ -204,7 +204,7 @@ describe('doctor never deletes when Docker or ps is unreachable (tester)', () =>
     const r = await runInit({ path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
     await plant(r.plan.projectId);
     await runDoctor({ cwd: repo, probe: dockerDown, runner: async () => ok('') });
-    expect(copies(r.plan.projectId)).toEqual([true, true, true, true]);
+    expect(copies(r.plan.projectId)).toEqual([true, true, true]);
   });
   it('keeps copies when ps -a throws (timeout) at doctor level', async () => {
     const repo = makeRepo(env.root);
@@ -215,7 +215,7 @@ describe('doctor never deletes when Docker or ps is unreachable (tester)', () =>
       return ok('');
     };
     const doc = await runDoctor({ cwd: repo, probe: dockerUp, runner });
-    expect(copies(r.plan.projectId)).toEqual([true, true, true, true]);
+    expect(copies(r.plan.projectId)).toEqual([true, true, true]);
     expect(doc.checks.find((c) => c.name === 'secrets.copy')?.status).toBe('warn');
   });
   it('keeps copies when another service is running but ours is restarting (filtered ps -a returns ours only)', async () => {
@@ -225,6 +225,6 @@ describe('doctor never deletes when Docker or ps is unreachable (tester)', () =>
     const runner = async (_c: string, args: string[]): Promise<RunResult> =>
       args.includes('ps') && args.includes('-a') ? ok(JSON.stringify({ Service: 'app', State: 'restarting' })) : ok('');
     await runDoctor({ cwd: repo, probe: dockerUp, runner });
-    expect(copies(r.plan.projectId)).toEqual([true, true, true, true]);
+    expect(copies(r.plan.projectId)).toEqual([true, true, true]);
   });
 });

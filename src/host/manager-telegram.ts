@@ -103,11 +103,11 @@ const HELP_LINES = [
   '/project [name] - list the projects, or pick the one the other commands use',
   '/settings [query] - the settings with value, source, when a change takes effect and the host-owned mark; query: a group (e.g. delivery) or part of a key',
   '/set <key> <value> [shared] - change a setting (like minions settings set; local layer unless "shared"); host-owned keys too',
-  '/sync - fast-forward the host base branch (local delivery: from the container; GitHub delivery: from origin)',
+  '/sync - fast-forward the host base branch from the container',
   '/upgrade - minions upgrade (a dry run first; a failing one stops it); it never builds the host CLI',
   '/restart - graceful coordinator restart (refused while workers are active; then "Restart when idle" and "Drain now" are offered)',
   '/undo <id> - restore the config file as it was before change <id> (only while nothing changed it since)',
-  '/approve <task> <sha> [merge] - sign an approval to publish (or with "merge": to merge) <task> at that full head SHA (always asks twice)',
+  '/approve <task> <sha> [merge] - sign a merge approval that lets the local integration land <task> at that full head SHA (always asks twice)',
   '/assistant [on|off|status] - the plain-language assistant: switch it on or off, or show it (calls today, limit, last error). When it is on, a message without "/" goes to it; it only explains and proposes a plan',
   '/help - this text',
   REBUILD_HELP_MARK,
@@ -130,7 +130,7 @@ export function fallbackText(reason: string, devRebuild = false): string {
 const USAGE: Record<string, string> = {
   set: 'Usage: /set <key> <value> [shared], e.g. /set execution.maxActiveTasks 3 (value "default" unsets an optional setting). Keys: /settings, or minions settings --list on the host.',
   undo: 'Usage: /undo <id>, the id of an applied config change (cr_... or ow_...).',
-  approve: 'Usage: /approve <task> <sha> [merge], e.g. /approve task-12 <sha>. <sha> must be the full 40-character lowercase head SHA from the awaiting-approval message (short or non-hex SHAs are refused). Without "merge" it approves publishing that head; with "merge" it approves merging its delivered pull request.',
+  approve: 'Usage: /approve <task> <sha> [merge], e.g. /approve task-12 <sha>. <sha> must be the full 40-character lowercase head SHA from the awaiting-approval message (short or non-hex SHAs are refused). It approves landing that head through the local integration ("merge" is implied).',
   sync: 'Usage: /sync (no arguments).', upgrade: 'Usage: /upgrade (no arguments).', restart: 'Usage: /restart (no arguments).',
   rebuild_cli: 'Usage: /rebuild_cli (no arguments).',
 };

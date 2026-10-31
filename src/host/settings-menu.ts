@@ -28,8 +28,8 @@ export interface MenuIO {
 export interface MenuDeps {
   io: MenuIO;
   runtime: SettingsRuntime;
-  /** Runs the existing auth flow for a token item (`minions auth github|telegram`). */
-  runAuth: (kind: 'github' | 'telegram' | 'codex') => Promise<void>;
+  /** Runs the existing auth flow for a token item (`minions auth telegram|codex`). */
+  runAuth: (kind: 'telegram' | 'codex') => Promise<void>;
   layer?: SettingLayer;
 }
 
@@ -189,7 +189,7 @@ export async function runSettingsMenu(project: ProjectJson, deps: MenuDeps): Pro
   }
 }
 
-const currentToken = (ctx: Awaited<ReturnType<typeof loadSettingsContext>>, kind: 'github' | 'telegram' | 'codex') => (ctx.credentials[kind] ? 'provisioned' : 'missing');
+const currentToken = (ctx: Awaited<ReturnType<typeof loadSettingsContext>>, kind: 'telegram' | 'codex') => (ctx.credentials[kind] ? 'provisioned' : 'missing');
 
 /**
  * Line reader for a non-TTY stdin (a pipe or a terminal emulator without a TTY): one readline interface for

@@ -9,7 +9,7 @@
 //   A new CLI only ever arrives as a packed tarball (`npm pack` + `npm install -g`, src/host/upgrade-source.ts
 //   applyCli, with the CLI backup first), built from the owner's checkout after the strict fast-forward of
 //   `--from-container`; never from the agent workspace itself.
-// - The shim step regenerates the minions and gh shims (prepareHostRuntime) for the CLI that runs the step: after a
+// - The shim step regenerates the minions shim (prepareHostRuntime) for the CLI that runs the step: after a
 //   reinstall that is the newly installed CLI (the upgrade is handed off to it), so agents run the new CLI next.
 import { dirname, join } from 'node:path';
 import { hostRuntimePaths } from '../core/paths.js';
@@ -41,7 +41,7 @@ export interface HostTargetOptions {
   /** The global install (default: detectInstalled). */
   installed?: () => Promise<InstalledCli | null>;
   /** Regenerates the shims (default: prepareHostRuntime). */
-  prepare?: (project: ProjectJson, o: { target: ShimTarget }) => Promise<{ gh: string | null }>;
+  prepare?: (project: ProjectJson, o: { target: ShimTarget }) => Promise<unknown>;
 }
 
 export function hostUpgradeTarget(project: ProjectJson, host: HostRuntime, o: HostTargetOptions = {}): HostUpgradeTarget {
@@ -55,10 +55,10 @@ export function hostUpgradeTarget(project: ProjectJson, host: HostRuntime, o: Ho
       const installed = await (o.installed ?? (() => detectInstalled({ runningRoot: pkgRoot })))().catch(() => null);
       return unsafeCliReason({ cliPaths: [target.cli, pkgRoot], installed, agentWritable: agentWritableDirs(project.projectId) });
     },
-    shimPlan: `regenerate ${hp.minionsShim} (and the gh shim) for the installed CLI (${target.node} ${target.cli}); agents run it from their next command`,
+    shimPlan: `regenerate ${hp.minionsShim} for the installed CLI (${target.node} ${target.cli}); agents run it from their next command`,
     regenerate: async () => {
-      const r = await (o.prepare ?? ((p, x) => prepareHostRuntime(p, x)))(project, { target });
-      return `${join(hp.bin, 'minions')} -> ${target.cli}; ${r.gh ? 'gh shim refreshed' : 'no gh on the host (no gh shim)'}`;
+      await (o.prepare ?? ((p, x) => prepareHostRuntime(p, x)))(project, { target });
+      return `${join(hp.bin, 'minions')} -> ${target.cli}`;
     },
   };
 }

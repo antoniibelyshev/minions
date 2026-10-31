@@ -15,13 +15,10 @@ export const PRIMARY_COMMANDS = ['setup', 'start', 'status', 'settings', 'upgrad
 /** User commands for single steps and fine-grained control (shown by `minions help --all`). */
 export const ADVANCED_COMMANDS = ['init', 'doctor', 'auth', 'secrets', 'config', 'channel', 'runtime', 'import', 'export', 'pause', 'resume'] as const;
 /** Used by the coordinator, workers, hooks and the container (shown by `minions help --all`). */
-export const INTERNAL_COMMANDS = ['work', 'backlog', 'control', 'hook', 'coordinator', 'telegram', 'workspace', 'sync', 'ci', 'notify', 'manager'] as const;
-/** Never listed, not even by `help --all` (a git credential helper protocol entry point). */
-export const UNLISTED_COMMANDS = ['git-credential'] as const;
+export const INTERNAL_COMMANDS = ['work', 'backlog', 'control', 'hook', 'coordinator', 'telegram', 'workspace', 'sync', 'notify', 'manager'] as const;
+export type Tier = 'primary' | 'advanced' | 'internal';
 
-export type Tier = 'primary' | 'advanced' | 'internal' | 'unlisted';
-
-const HEADINGS: Record<Exclude<Tier, 'unlisted'>, string> = {
+const HEADINGS: Record<Tier, string> = {
   primary: 'Commands:',
   advanced: 'Advanced commands:',
   internal: 'Internal commands (used by the coordinator, agents and the container):',
@@ -34,7 +31,6 @@ export function tierOf(name: string): Tier | undefined {
   if (has(PRIMARY_COMMANDS) || name === 'help') return 'primary';
   if (has(ADVANCED_COMMANDS)) return 'advanced';
   if (has(INTERNAL_COMMANDS)) return 'internal';
-  if (has(UNLISTED_COMMANDS)) return 'unlisted';
   return undefined;
 }
 
@@ -50,7 +46,7 @@ export function applySurface(program: Command): void {
   let showAll = false;
   for (const c of program.commands) {
     const tier = tierOf(c.name());
-    if (tier && tier !== 'unlisted') c.helpGroup(HEADINGS[tier]);
+    if (tier) c.helpGroup(HEADINGS[tier]);
   }
   program.helpCommand(false);
   program.command('help [command...]')
@@ -85,7 +81,7 @@ export function applySurface(program: Command): void {
       if (cmd !== program) return all;
       const rank = (c: Command) => LISTING_ORDER.indexOf(c.name());
       return all
-        .filter((c) => (showAll ? tierOf(c.name()) !== undefined && tierOf(c.name()) !== 'unlisted' : tierOf(c.name()) === 'primary'))
+        .filter((c) => (showAll ? tierOf(c.name()) !== undefined : tierOf(c.name()) === 'primary'))
         .sort((a, b) => rank(a) - rank(b));
     },
     groupItems<T extends Command | Option>(unsorted: T[], visible: T[], getGroup: (item: T) => string): Map<string, T[]> {

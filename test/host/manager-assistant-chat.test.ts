@@ -257,7 +257,7 @@ describe('plain text goes to the assistant; slash commands never do', () => {
   });
 
   it('a loosening plan keeps the double tap; the confirmed assistant offer passes the digest check and applies; the outcome lands in the history', async () => {
-    const s = await stack({ reply: () => answer('delivery.merge manual lets minions merge when asked. Check the plan below; nothing is applied yet.', { kind: 'config-set', key: 'delivery.merge', value: 'manual', layer: 'local' }) });
+    const s = await stack({ reply: () => answer('delivery.merge auto-when-eligible lets the runtime land approved work. Check the plan below; nothing is applied yet.', { kind: 'config-set', key: 'delivery.merge', value: 'auto-when-eligible', layer: 'local' }) });
     const { out } = await s.say('switch to manual merges');
     expect(out[0]!.text).toMatch(/^Assistant: /);
     const offer = out[1]!;
@@ -273,10 +273,10 @@ describe('plain text goes to the assistant; slash commands never do', () => {
     (s.m as unknown as { deps: ManagerDeps }).deps.transport = s.t;
     await s.m.handle(second.events[0] as ManagerEvent);
     expect(s.childRuns).toHaveLength(1);
-    expect(s.childRuns[0]!.join(' ')).toContain('delivery.merge manual');
+    expect(s.childRuns[0]!.join(' ')).toContain('delivery.merge auto-when-eligible');
     const last = journal().at(-1);
     expect(last).toMatchObject({ type: 'applied' });
-    expect(s.chat.exchanges().at(-1)).toMatchObject({ owner: 'switch to manual merges', proposal: 'set delivery.merge: disabled -> manual', outcome: 'applied' });
+    expect(s.chat.exchanges().at(-1)).toMatchObject({ owner: 'switch to manual merges', proposal: 'set delivery.merge: disabled -> auto-when-eligible', outcome: 'applied' });
   });
 
   it('an assistant plan that loosens nothing (one a typed command would apply at once, task-78) still waits for a Confirm tap', async () => {
@@ -359,10 +359,10 @@ describe('plain text goes to the assistant; slash commands never do', () => {
     let r = await s.say('zero tasks');
     expect(r.out[0]!.text).toBe('Assistant: Proposed.');
     expect(r.out[1]!.text).toMatch(/^\/set failed: /);
-    const current = (await s.m.commands().settings!(null)).settings.find((v) => v.key === 'delivery.mode')!;
-    proposal = { kind: 'config-set', key: 'delivery.mode', value: String(current.value), layer: 'local' };
-    r = await s.say('keep the delivery mode');
-    expect(r.out[1]!.text).toMatch(/^delivery\.mode is already /);
+    const current = (await s.m.commands().settings!(null)).settings.find((v) => v.key === 'delivery.merge')!;
+    proposal = { kind: 'config-set', key: 'delivery.merge', value: String(current.value), layer: 'local' };
+    r = await s.say('keep the merge mode');
+    expect(r.out[1]!.text).toMatch(/^delivery\.merge is already /);
     expect(journal().filter((e) => e.type === 'offer')).toEqual([]);
   });
 

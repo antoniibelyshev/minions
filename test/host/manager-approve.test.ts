@@ -84,7 +84,7 @@ function setup(projects: ProjectJson[], o: { awaiting?: string; realApprove?: bo
       approveCalls.push({ taskId, o: { ...ao }, deps: { ...ad } as Record<string, unknown> });
       if (o.realApprove) return A.approveOnHost(taskId, ao, { ...ad, inContainer: false });
       // The stub signs nothing; it forwards a fake token the way approveOnHost does.
-      return ad!.delegate!(['work', 'approve', taskId, '--head', ao.head, '--by', 'owner', ...(ao.merge ? ['--merge'] : []), '--signature', 'FAKE-TOKEN-SECRET'], { json: true, cwd: ao.cwd });
+      return ad!.delegate!(['work', 'approve', taskId, '--head', ao.head, '--by', 'owner', '--signature', 'FAKE-TOKEN-SECRET'], { json: true, cwd: ao.cwd });
     },
   };
   const manager = new M.HostManager(deps);
@@ -130,10 +130,10 @@ describe('/approve: the plan and its confirmation', () => {
     const o = await s.cmds.propose(null, { kind: 'approve', taskId: 'task-12', head: HEAD, merge: false });
     expect(o.requestId).toMatch(J.OWNER_REQUEST_ID_PATTERN);
     expect(o.kind).toBe('approve');
-    expect(o.summary).toBe(`approve publishing task-12 at ${HEAD}`);
-    expect(o.loosens).toBe(`signs a publication approval for task-12 at ${HEAD}`);
+    expect(o.summary).toBe(`approve merging task-12 at ${HEAD}`);
+    expect(o.loosens).toBe(`signs a merge approval for task-12 at ${HEAD}`);
     expect(o.text).toContain(`approves: task-12 at head ${HEAD}`);
-    expect(o.text).toMatch(/scope: publish \(push the branch/);
+    expect(o.text).toMatch(/scope: merge \(the local integration lands/);
     expect(o.text).toContain('LOOSENS POLICY');
     expect(journal().map((e) => e.type)).toEqual(['offer']);
     expect(s.approveCalls).toEqual([]);
@@ -141,10 +141,10 @@ describe('/approve: the plan and its confirmation', () => {
 
     await s.confirm(o);
     expect(s.approveCalls).toHaveLength(1);
-    expect(s.approveCalls[0]).toMatchObject({ taskId: 'task-12', o: { head: HEAD, merge: false, json: true, cwd: project.repoPath }, deps: { projectId: project.projectId } });
+    expect(s.approveCalls[0]).toMatchObject({ taskId: 'task-12', o: { head: HEAD, json: true, cwd: project.repoPath }, deps: { projectId: project.projectId } });
     expect(s.delegateCalls).toEqual([['minions', 'work', 'approve', 'task-12', '--head', HEAD, '--by', 'owner', '--signature', 'FAKE-TOKEN-SECRET', '--json']]);
     expect(s.outcomes.map((x) => x.status)).toEqual(['applying', 'applied']);
-    expect(s.outcomes[1]!.text).toMatch(/publication approval for task-12 at a{40} recorded: Recorded host-signed approval/);
+    expect(s.outcomes[1]!.text).toMatch(/merge approval for task-12 at a{40} recorded: Recorded host-signed approval/);
     expect(journal().map((e) => e.type)).toEqual(['offer', 'confirmed', 'applying', 'applied']);
     // The token never reaches the journal, the chat or the log.
     expect(readFileSync(J.journalPath(), 'utf8')).not.toContain('FAKE-TOKEN-SECRET');
@@ -156,17 +156,16 @@ describe('/approve: the plan and its confirmation', () => {
     expect(s.approveCalls).toHaveLength(1);
   });
 
-  it('merge: the scope is explicit in the offer and approveOnHost gets merge: true', async () => {
+  it('merge: the keyword is implied; the offer and the delegated call are the same as without it', async () => {
     const { project } = await install();
     const s = setup([project]);
     const o = await s.cmds.propose(null, { kind: 'approve', taskId: 'task-12', head: HEAD, merge: true });
     expect(o.summary).toBe(`approve merging task-12 at ${HEAD}`);
     expect(o.loosens).toBe(`signs a merge approval for task-12 at ${HEAD}`);
-    expect(o.text).toMatch(/scope: merge \(arms the merge of the delivered pull request/);
-    expect(o.text).toContain('--merge');
+    expect(o.text).not.toContain('--merge');
     await s.confirm(o);
-    expect(s.approveCalls[0]!.o).toMatchObject({ head: HEAD, merge: true });
-    expect(s.delegateCalls[0]).toContain('--merge');
+    expect(s.approveCalls[0]!.o).not.toHaveProperty('merge');
+    expect(s.delegateCalls[0]).not.toContain('--merge');
     expect(s.outcomes.at(-1)).toMatchObject({ status: 'applied' });
   });
 
@@ -213,11 +212,10 @@ describe('/approve: the plan and its confirmation', () => {
     expect(s.outcomes.at(-1)).toMatchObject({ status: 'applied' });
     const argv = s.delegateCalls[0]!;
     expect(argv.slice(0, 6)).toEqual(['minions', 'work', 'approve', 'task-12', '--head', HEAD]);
-    expect(argv).toContain('--merge');
+    expect(argv).not.toContain('--merge');
     const token = argv[argv.indexOf('--signature') + 1]!;
     const pub = readFileSync(A.approvalPublicKeyFile(project.projectId), 'utf8');
     expect(AP.verifyApproval(token, pub, { taskId: 'task-12', head: HEAD, scope: 'merge' }).ok).toBe(true);
-    expect(AP.verifyApproval(token, pub, { taskId: 'task-12', head: HEAD, scope: 'publish' }).ok).toBe(false);
     expect(readFileSync(J.journalPath(), 'utf8')).not.toContain(token);
     expect(JSON.stringify(s.outcomes)).not.toContain(token);
     expect(s.logs.join('\n')).not.toContain(token);
@@ -319,7 +317,7 @@ describe('/approve in the manager chat', () => {
     expect(s.approveCalls).toEqual([]);
     await s.manager.handle(events[0]!);
     expect(s.approveCalls).toHaveLength(1);
-    expect(s.approveCalls[0]).toMatchObject({ taskId: 'task-12', o: { head: HEAD, merge: true } });
+    expect(s.approveCalls[0]).toMatchObject({ taskId: 'task-12', o: { head: HEAD } });
     expect(s.outcomes.at(-1)).toMatchObject({ status: 'applied', requestId: rid });
   });
 
@@ -331,7 +329,7 @@ describe('/approve in the manager chat', () => {
     const t = T.telegramTransport({ token: TOKEN, access: ACCESS, fetch: api.f, now: () => api.clock.t, sleep: async () => undefined });
     t.attach(s.cmds);
     expect(await t.receive(30_000)).toEqual([]);
-    expect(api.texts().at(-1)).toMatch(/^Second confirmation for change request ow_.*signs a publication approval/s);
+    expect(api.texts().at(-1)).toMatch(/^Second confirmation for change request ow_.*signs a merge approval/s);
     expect(s.approveCalls).toEqual([]);
   });
 
@@ -405,7 +403,7 @@ describe('/approve QA: replay, forgery and failures', () => {
       await s.confirm(o);
       const last = s.outcomes.at(-1)!;
       expect(last.status).toBe('failed');
-      expect(last.text).toMatch(answer.timedOut ? /timed out/ : /publication approval for task-12 at a{40}: no result from the runtime \(exit 1\)/);
+      expect(last.text).toMatch(answer.timedOut ? /timed out/ : /merge approval for task-12 at a{40}: no result from the runtime \(exit 1\)/);
       expect(JSON.stringify(s.outcomes)).not.toContain('FAKE-TOKEN-SECRET');
       expect(s.logs.join('\n')).not.toContain('FAKE-TOKEN-SECRET');
       expect(readFileSync(J.journalPath(), 'utf8')).not.toContain('FAKE-TOKEN-SECRET');
@@ -497,7 +495,7 @@ describe('/approve QA: the chat side', () => {
     t.attach(s.cmds);
     await t.receive(30_000);
     expect(api.texts()[0]).toMatch(/^Usage: \/approve/);
-    expect(api.texts()[1]).toMatch(/^Your request ow_[0-9a-f]{8} .*approve publishing task-12 at a{40}/);
+    expect(api.texts()[1]).toMatch(/^Your request ow_[0-9a-f]{8} .*approve merging task-12 at a{40}/);
     expect(journal().map((e) => e.type)).toEqual(['offer']);
     expect(s.approveCalls).toEqual([]);
   });
@@ -556,7 +554,7 @@ describe('/approve QA: token redaction against injected characters', () => {
   const SIG = `mnap1.${'P'.repeat(40)}.${'S'.repeat(86)}`;
   const PAYLOAD = 'P'.repeat(40);
   const SIGPART = 'S'.repeat(86);
-  const plan = { taskId: 'task-12', head: HEAD, scope: 'publish' } as never;
+  const plan = { taskId: 'task-12', head: HEAD, scope: 'merge' } as never;
   /** No run of 12 or more characters of the token survives, in any of its parts. */
   const leaks = (text: string, token = SIG) => {
     const bare = text.replace(/<U\+[0-9A-F]{4,6}>|\p{M}|\s/gu, '');
@@ -640,9 +638,9 @@ describe('/approve QA: token redaction against injected characters', () => {
   it('approveOutcome: both envelope paths go through the redaction', () => {
     const tok = split(SIG, 47, '\u001b[31m​');
     const okA = M.approveOutcome(plan, 0, ok({ message: `recorded ${tok}` }), SIG);
-    expect(okA).toEqual({ status: 'applied', detail: `publication approval for task-12 at ${HEAD} recorded: recorded [REDACTED]` });
+    expect(okA).toEqual({ status: 'applied', detail: `merge approval for task-12 at ${HEAD} recorded: recorded [REDACTED]` });
     const bad = M.approveOutcome(plan, 1, refused('CONFLICT', `bad ${tok}`), SIG);
-    expect(bad).toEqual({ status: 'failed', detail: `publication approval for task-12 at ${HEAD} refused by the runtime: bad [REDACTED]` });
+    expect(bad).toEqual({ status: 'failed', detail: `merge approval for task-12 at ${HEAD} refused by the runtime: bad [REDACTED]` });
   });
 
   let repos = 0;

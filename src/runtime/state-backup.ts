@@ -29,8 +29,8 @@ export const STATE_BACKUP_FILES = ['coordinator-handoff.json'] as const;
 export const STATE_BACKUP_MAX_BYTES = 1024 * 1024 * 1024;
 
 /**
- * minions' own secret file names: the mounted secrets (src/core/paths.ts `apiKeyFile`, `githubTokenFile`,
- * `telegramTokenFile`; src/host/credentials.ts `fileName`) and the host's approval signing key
+ * minions' own secret file names: the mounted secrets (src/core/paths.ts `apiKeyFile`,
+ * `telegramTokenFile`; src/host/credentials.ts `fileName`; `github-token` of the removed GitHub delivery) and the host's approval signing key
  * (src/host/approvals.ts). A copy of one of them inside an archived dir is never archived.
  */
 export const MINIONS_SECRET_FILE_NAMES = ['anthropic-api-key', 'github-token', 'telegram-bot-token', 'claude-headless-token', 'approval-signing-key'] as const;

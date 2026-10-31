@@ -62,13 +62,9 @@ describe('host runtime processes', () => {
     const project = await loadProjectJson(id);
     const cli = join(env.root, 'fake cli.mjs');
     writeFileSync(cli, 'process.stdout.write(JSON.stringify({ argv: process.argv.slice(2), env: process.env }))\n');
-    // An empty dir as PATH: hosts and CI runners may have gh in /usr/bin (GitHub runners do).
-    const noGh = join(env.root, 'empty-bin');
-    mkdirSync(noGh);
-    await prepareHostRuntime(project, { target: { node: process.execPath, cli }, pathEnv: noGh });
+    await prepareHostRuntime(project, { target: { node: process.execPath, cli } });
     const hp = hostRuntimePaths(id);
     expect(readFileSync(hp.minionsShim, 'utf8')).toMatch(/^#!\/bin\/sh\n/);
-    expect(existsSync(hp.ghShim)).toBe(false); // no gh on that PATH
     const out = await new HostRuntime(project).exec(['minions', 'status', '--json']);
     const d = JSON.parse(out.stdout) as { argv: string[]; env: Record<string, string> };
     expect(d.argv).toEqual(['status', '--json']);

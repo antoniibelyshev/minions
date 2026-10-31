@@ -143,22 +143,18 @@ minions status --check        # telegram, telegram.credential, telegram.bot, tel
   `minions settings restart` (or `minions down && minions start`). Never start an interactive `claude`
   in the container: it takes over the bot.
 
-## Token problems (GitHub or Telegram)
+## Token problems (Telegram)
 
-Symptoms: push or pull-request delivery fails with an authentication error, `minions work publish`
-reports a credential error, `minions status` lists "credential mounts changed or missing" under
-restart-required, the bot does not start.
+Symptoms: `minions status` lists "credential mounts changed or missing" under restart-required, the bot
+does not start.
 
 ```sh
-minions auth github                     # store a new fine-grained token (prompted without echo; --stdin to pipe it)
-minions auth github --remove            # delete a revoked token
 minions auth telegram                   # store a new bot token (BotFather /token or /revoke)
 minions upgrade                         # mount the new token copies and restart the coordinator
                                         # (host runtime: minions down && minions start)
-minions work publish <taskId>           # retry a failed publication (idempotent)
 ```
 
-`minions setup github` walks through the remote, base branch and token again. Tokens are stored only on
+Tokens are stored only on
 the host (Keychain or a 0600 file) and copied into the runtime's read-only secrets mount at start and
 on `minions upgrade`; they never enter the state volume or a state backup.
 
@@ -181,7 +177,7 @@ then `minions settings restart`.
 
 ## The verification gate fails under load
 
-With `local` delivery the coordinator verifies each merge on the merged tree (`git merge --no-ff
+The coordinator verifies each merge on the merged tree (`git merge --no-ff
 --no-commit`, then the verification commands) while engineers and testers run their own suites in the
 same container. Two kinds of failure come from that load, not from the change:
 

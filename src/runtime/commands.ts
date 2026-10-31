@@ -2,11 +2,10 @@ import { readFile } from 'node:fs/promises';
 import { spawn as nodeSpawn } from 'node:child_process';
 import { dirname, join } from 'node:path';
 import { Option, type Command } from 'commander';
-import { setIdempotencyStore, setIntakePausedContext, setProvenanceFallback, setReadyContext } from '../backlog/commands.js';
+import { setIdempotencyStore, setIntakePausedContext, setReadyContext } from '../backlog/commands.js';
 import { openBacklog, writeBacklogConfig } from '../backlog/factory.js';
 import type { BacklogAdapter, IdempotencyStore, Task } from '../backlog/types.js';
 import { validateConfig } from '../config/resolve.js';
-import { isGithubDelivery } from '../config/delivery.js';
 import type { MinionsConfig } from '../config/schema.js';
 import { action, globalOpts, requireMode, runtimeMode } from '../core/cli-helpers.js';
 import { displayText, stripControlChars, truncateCodePoints } from '../core/control-chars.js';
@@ -35,7 +34,7 @@ import {
 import { pidAlive } from './db.js';
 import { run as runChild } from '../core/exec.js';
 import {
-  humanRoutine, humanRoutineReport, ROUTINE_TRIGGERS, routineLast, routineSettings, runRoutinePass, startRoutineClock, summarizeSync,
+  humanRoutine, humanRoutineReport, ROUTINE_TRIGGERS, routineLast, routineSettings, runRoutinePass, startRoutineClock,
   type CoordinatorView, type RoutineLast, type RoutineTrigger,
 } from './routine.js';
 import { currentBudget } from './spend.js';
@@ -52,16 +51,12 @@ import { contextResetCheck, HANDOFF_MAX_BYTES, humanContextReset, readHandoff, T
 import { handoffPathFor, sessionScope } from './session-scope.js';
 export { withContextReset } from './context-reset.js';
 import { capacityOf, Scheduler, type NextReport, type NextStage, type RoleCapacity, type UsageFlag } from './scheduler.js';
-import { gitCredential } from './github.js';
-import { ciStatus, formatCiStatus, formatSync, syncTasks, type SyncReport } from './ci.js';
-import { formatIntake, intakeProvenanceFallback, originRepository, syncIntake, type IntakeSyncReport } from './intake-sync.js';
-import { ghWithTimeout, ORIGIN_REPOSITORY_META, originOfRemoteUrl, type GhFn } from './publish.js';
 import { exportWorkspace, importWorkspace, setupState } from './workspace.js';
 import { createStateBackup, releaseRestoredLeases, restoreStateBackup } from './state-backup.js';
 import { cancelWork, formatCancel } from './controls.js';
 import { ack, counts as outboxCounts, enqueue, fail, formatCounts, formatItems, pending, type OutboxCounts } from './outbox.js';
 import { digestStatus, holdFor, humanDigest, humanDigestStatus, prepareDigest, reholdExpired, type DigestStatus } from './digest.js';
-import { git, workspaceLayout } from './worktree.js';
+import { workspaceLayout } from './worktree.js';
 import { containerPaths } from '../core/paths.js';
 import { formatWorkProbe, workProbe } from './sandbox/probe.js';
 import { containerProtectedPaths } from './sandbox/rules.js';
@@ -125,7 +120,7 @@ const lazyIdempotency: IdempotencyStore = {
 };
 
 async function getBacklog(): Promise<BacklogAdapter> {
-  return (backlog ??= openBacklog(await getConfig(), { idempotency: lazyIdempotency, root: runtimePaths().backlog, provenanceFallback: intakeProvenanceFallback(getDb) }));
+  return (backlog ??= openBacklog(await getConfig(), { idempotency: lazyIdempotency, root: runtimePaths().backlog }));
 }
 
 async function context() {
@@ -137,53 +132,6 @@ async function context() {
 export const coordinatorRestartRecorder = (d: RuntimeDb) => (info: { at: string; reason: string; leases: string[]; recover?: boolean }): void => {
   d.setMeta('coordinator_restart', JSON.stringify(info));
   d.addEvent('coordinator-restart', null, info);
-};
-
-/** One intake pass with the runtime context (`minions sync` and coordinator startup). */
-export async function runIntakeSync(opts: { signal?: AbortSignal; gh?: GhFn } = {}): Promise<IntakeSyncReport> {
-  const { db: d, backlog: b, config: cfg } = await context();
-  return syncIntake({ db: d, backlog: b, config: cfg, originRepository: () => originRepository(workspaceLayout().repo, git), ...opts });
-}
-
-/** Overall time budget of the startup intake pass (`minions sync` keeps the per-call gh timeout). */
-export const STARTUP_INTAKE_BUDGET_MS = 25_000;
-/** Extra wait after the abort for the pass to save its state before the coordinator starts anyway. */
-const STARTUP_INTAKE_GRACE_MS = 2_000;
-
-/**
- * Coordinator startup: one intake pass when intake.github is enabled. Bounded by `budgetMs`: the pass
- * is aborted (in-flight gh children are killed on the abort, SIGTERM then SIGKILL after 2 s; also when
- * `stop` aborts) and, should it still not return, the coordinator
- * starts without waiting for it; the next `minions sync` completes the import.
- */
-export const intakeOnStart = async (
-  cfg: MinionsConfig, log: (line: string) => void,
-  sync: (opts: { signal: AbortSignal; gh?: GhFn }) => Promise<IntakeSyncReport> = runIntakeSync,
-  budgetMs = STARTUP_INTAKE_BUDGET_MS,
-  /** Aborted by the wrapper on a signal before claude starts (task-38): the pass is aborted with it. */
-  stop?: AbortSignal,
-): Promise<void> => {
-  if (!cfg.intake.github?.enabled || stop?.aborted) return;
-  const ctl = new AbortController();
-  const onStop = () => ctl.abort();
-  stop?.addEventListener('abort', onStop, { once: true });
-  const timers: NodeJS.Timeout[] = [];
-  const late = new Promise<null>((resolve) => {
-    timers.push(setTimeout(() => ctl.abort(), budgetMs));
-    timers.push(setTimeout(() => resolve(null), budgetMs + STARTUP_INTAKE_GRACE_MS));
-  });
-  // The gh children share the pass signal: the budget abort and the pre-spawn guard (`stop`) kill them.
-  const pass = sync({ signal: ctl.signal, gh: ghWithTimeout(budgetMs, ctl.signal) });
-  pass.catch(() => { /* reported below when it settles in time; ignored after the start */ });
-  try {
-    const r = await Promise.race([pass, late]);
-    if (r) log(`minions: ${formatIntake(r).split('\n').join('\nminions: ')}`);
-    else log(`minions: intake sync did not finish within ${Math.round(budgetMs / 1000)} s; starting the coordinator without it (run \`minions sync\` later)`);
-  } finally {
-    stop?.removeEventListener('abort', onStop);
-    ctl.abort();
-    for (const t of timers) clearTimeout(t);
-  }
 };
 
 /** reapRun in production: the real /proc, including the escapee sweep (agent-runtimes D3b). */
@@ -227,15 +175,6 @@ export function leaseBlockers<T extends { id: string }>(d: Pick<RuntimeDb, 'leas
   });
 }
 
-/** `minions sync`: intake (full sync only), then PR/CI observations with the auto-merge pass (the runtime's own gates). */
-async function fullSync(taskIds: string[] = []): Promise<{ report: SyncReport; intake: IntakeSyncReport | null }> {
-  const { db: d, backlog: b, config: cfg } = await context();
-  // Intake runs on a full sync only (`minions sync <taskIds>` refreshes just those PRs).
-  const intake = taskIds.length ? null : await runIntakeSync();
-  const sched = await scheduler();
-  return { report: await syncTasks({ db: d, backlog: b, config: cfg, merge: (id) => sched.autoMerge(id) }, { taskIds }), intake };
-}
-
 /** How the coordinator stands: a live lock holder, a dead one, the exit record and the last recorded restart. */
 export async function coordinatorView(d: RuntimeDb, paths = runtimePaths()): Promise<CoordinatorView> {
   const lock = d.coordinatorLock();
@@ -251,7 +190,7 @@ function upgradeInProgress(d: RuntimeDb): string | null {
   try { const u = listChangeRequests(d).find((r) => r.kind === 'upgrade' && r.status === 'confirmed'); return u ? `change request ${u.id}` : null; } catch { return null; }
 }
 
-/** The routine pass with the runtime context: real gh, git, process table and detached restarts. */
+/** The routine pass with the runtime context: real process table and detached restarts. */
 async function routineDeps(): Promise<Parameters<typeof runRoutinePass>[0]> {
   const d = getDb();
   const cfg = await getConfig();
@@ -262,7 +201,6 @@ async function routineDeps(): Promise<Parameters<typeof runRoutinePass>[0]> {
   return {
     db: d, config: cfg, now: () => new Date(), procStart: procStartTime,
     lockAlive: (l) => pidAlive(l.pid) && (!l.start || procStartTime(l.pid) === l.start),
-    sync: async () => { const r = await fullSync(); return summarizeSync(r.report, r.intake); },
     next: async () => (await scheduler()).next(),
     coordinator: () => coordinatorView(d, paths),
     activeLeases: async () => leases(),
@@ -285,7 +223,7 @@ async function routineDeps(): Promise<Parameters<typeof runRoutinePass>[0]> {
 function taskSessionDeps(cfg: MinionsConfig): TaskSessionDeps {
   const d = getDb();
   const paths = runtimePaths();
-  const b = openBacklog(cfg, { idempotency: lazyIdempotency, root: paths.backlog, provenanceFallback: intakeProvenanceFallback(getDb) });
+  const b = openBacklog(cfg, { idempotency: lazyIdempotency, root: paths.backlog });
   const sched = new Scheduler({ config: cfg, db: d, backlog: b, layout: workspaceLayout(), handoff: paths, runs: { state: paths.state, reap: (leaseId) => reapRun(leaseId, reapDeps()) } });
   return {
     db: d, config: cfg, state: paths.state,
@@ -422,7 +360,6 @@ export interface StatusReport {
   lastDrainNotice?: DrainNotice | null;
   configRevision: number;
   profile: string;
-  deliveryMode: string;
   queue: Record<string, number>;
   activeLeases: Pick<Lease, 'id' | 'task_id' | 'role' | 'attempt' | 'branch' | 'worktree' | 'head_sha' | 'started_at'>[];
   /** byRole: lease usage per worker role (`limited` = an execution.maxByRole / maxEngineers limit applies). */
@@ -481,7 +418,7 @@ export async function collectStatus(deps: { db: RuntimeDb; config: MinionsConfig
   const { db: d, config: cfg } = deps;
   const leases = d.activeLeases();
   const report: StatusReport = {
-    paused: d.paused(), pauseChanges: d.pauseChanges(), draining: d.drain(), configRevision: cfg.configRevision, profile: cfg.profile, deliveryMode: cfg.delivery.mode,
+    paused: d.paused(), pauseChanges: d.pauseChanges(), draining: d.drain(), configRevision: cfg.configRevision, profile: cfg.profile,
     queue: {}, capacity: null,
     activeLeases: leases.map((l) => ({ id: l.id, task_id: l.task_id, role: l.role, attempt: l.attempt, branch: l.branch, worktree: l.worktree, head_sha: l.head_sha, started_at: l.started_at })),
     guard: { lastReason: d.guard().last_reason, updatedAt: d.guard().updated_at },
@@ -524,7 +461,7 @@ function roleCapacityLine(c: NonNullable<StatusReport['capacity']>): string {
 
 export function humanStatus(s: StatusReport): string {
   const out = [
-    `config revision ${s.configRevision}  profile ${s.profile}  delivery ${s.deliveryMode}`,
+    `config revision ${s.configRevision}  profile ${s.profile}`,
     `paused: intake=${s.paused.intake} starts=${s.paused.starts}`,
     ...(s.draining ? [`draining: ${s.draining.reason} since ${s.draining.requestedAt} (${s.activeLeases.length} lease(s) winding down)`] : []),
     ...(s.lastDrainNotice ? [`last drain notice: ${s.lastDrainNotice.at} to ${s.lastDrainNotice.agentType} ${s.lastDrainNotice.agentId} (lease ${s.lastDrainNotice.leaseId}, ${s.lastDrainNotice.taskId ?? '-'}, drain event ${s.lastDrainNotice.eventId}, via ${s.lastDrainNotice.via})`] : []),
@@ -672,7 +609,6 @@ export function register(program: Command): void {
       return { leased: new Set(d.activeLeases().map((l) => l.task_id)), paused: d.paused().starts };
     });
     setIntakePausedContext(() => getDb().paused().intake);
-    setProvenanceFallback(intakeProvenanceFallback(getDb));
   }
 
   // control (docs/design/autonomy.md Decision 3): the coordinator-owned config overlay, applied at once
@@ -829,27 +765,26 @@ export function register(program: Command): void {
       emit(r, { json: globalOpts(cmd).json, human: formatCancel });
       if (r.failed.length || r.blockFailed.length) process.exitCode = 1;
     }));
-  work.command('publish <taskId>').description('Publish an approved task (branch / pull-request delivery), or in local delivery with local integration on queue its integration again; idempotent, retryable')
+  work.command('publish <taskId>').description('Queue the local integration of an approved task again (after a merge approval or a transient failure); idempotent')
     .action(action(async (taskId: string, _o: unknown, cmd: Command) => {
       if (runtimeMode() === 'host') return delegate(cmd);
       const r = await (await scheduler()).publish(taskId);
       emit(r, { json: globalOpts(cmd).json, human: (d) => d.message });
-      if (r.state === 'failed') process.exitCode = 1;
     }));
-  work.command('approve <taskId>').description('Approve publishing the approved head (sensitive paths / "ask" publication), or with --merge merging its delivered PR (pr.merge "ask") or landing its local integration (base.merge "ask", sensitive paths); run on the host, which signs the approval')
+  work.command('approve <taskId>').description('Approve landing the approved head through the local integration (base.merge "ask", sensitive paths); run on the host, which signs the approval')
     .requiredOption('--head <sha>', 'the full approved head SHA being authorized (binds the approval to that commit)')
-    .option('--merge', 'approve merging the delivered pull request at that head (CI-gated auto-merge), or the local integration of that head, instead of publishing it')
+    .addOption(new Option('--merge', 'implied (kept for older instructions)').hideHelp())
     .option('--by <name>', 'who approved (default: the host user)')
     .option('--note <text>', 'why')
     .addOption(new Option('--signature <token>', 'host-signed approval token (set by the host CLI when it delegates; never needed by hand)').hideHelp())
     .action(action(async (taskId: string, o: { head: string; merge?: boolean; by?: string; note?: string; signature?: string }, cmd: Command) => {
       if (runtimeMode() === 'host') {
         if (o.signature) throw new MinionsError('PRECONDITION', 'The host CLI signs approvals itself; --signature is only accepted inside the agent runtime.');
-        process.exit(await approveOnHost(taskId, { head: o.head, by: o.by, note: o.note, merge: !!o.merge, json: globalOpts(cmd).json }));
+        process.exit(await approveOnHost(taskId, { head: o.head, by: o.by, note: o.note, json: globalOpts(cmd).json }));
       }
       const s = await scheduler();
       const opts = { head: o.head, by: o.by, note: o.note, signature: o.signature };
-      const r = o.merge ? s.approveMerge(taskId, opts) : s.approvePublication(taskId, opts);
+      const r = s.approveMerge(taskId, opts);
       emit(r, { json: globalOpts(cmd).json, human: (d) => d.message });
     }));
   work.command('probe').description('Process-harness probe (no credentials, no model request): configured harness binaries and pinned versions, the minions-sandbox isolation self-test (cached per container start), loopback listeners on allowed TCP connect ports')
@@ -1139,7 +1074,6 @@ export function register(program: Command): void {
           try { completeOpenSessions({ db: getDb(), config: c }); } catch { /* best-effort */ }
           // Restart/crash recovery: drop the scratch dirs of leases that ended (active ones, and unreaped runs, keep theirs).
           await sweepScratchOnStart(getDb(), runtimePaths(), l, open);
-          await intakeOnStart(c, l, undefined, undefined, stop);
         },
         exitAfterSignal: (c) => process.exit(c),
       });
@@ -1409,35 +1343,12 @@ export function register(program: Command): void {
     }));
   ws.command('import <bundlePath>').description('Clone or refresh /workspace/repo from a git bundle')
     .requiredOption('--base <branch>', 'base branch')
-    .option('--remote-url <url>', 'origin URL to record (fetched over https only when a GitHub token is mounted)')
-    .action(action(async (bundle: string, o: { base: string; remoteUrl?: string }, cmd: Command) => {
+    .action(action(async (bundle: string, o: { base: string }, cmd: Command) => {
       requireMode('runtime');
-      const config = await getConfig();
-      const r = await importWorkspace(bundle, { base: o.base, remoteUrl: o.remoteUrl, config, baseFrom: isGithubDelivery(config) ? 'origin' : 'host' });
-      // minions' own record of the GitHub repository (publish.ts serverOriginOf): the verified base reads and
-      // the push go to it, never to whatever the agent-writable .git/config names (task-71).
-      const repository = originOfRemoteUrl(o.remoteUrl)?.repository;
-      if (repository) getDb().setMeta(ORIGIN_REPOSITORY_META, repository);
-      emit(r, { json: globalOpts(cmd).json, human: (d: typeof r) => [`${d.imported ? 'Cloned' : 'Refreshed'} ${d.repo} at ${d.head} (base ${d.base})`,
-        ...(d.origin ? [`origin ${d.origin.url}: ${d.origin.authenticated ? 'authenticated' : 'not authenticated'}, ${d.origin.fetched ? `fetched ${d.base}` : 'not fetched'}`] : []),
-        ...(d.origin?.warnings ?? []).map((w) => `warning: ${w}`)].join('\n') });
+      const r = await importWorkspace(bundle, { base: o.base, config: await getConfig() });
+      emit(r, { json: globalOpts(cmd).json, human: (d: typeof r) => `${d.imported ? 'Cloned' : 'Refreshed'} ${d.repo} at ${d.head} (base ${d.base})` });
     }));
 
-  // git credential helper (configured per repository by `workspace import` when a token is mounted).
-  // Reads the mounted token at use time; answers only `get` for https://github.com; no JSON envelope.
-  // The hidden --token-file takes a file path only (tests point it away from the real mount); the
-  // token value itself is never accepted on argv or via the environment.
-  program.command('git-credential <operation>', { hidden: true })
-    .description('git credential helper for https://github.com backed by the mounted GitHub token')
-    .addOption(new Option('--token-file <path>', 'read the token from this file instead of the mounted secret').hideHelp())
-    .action(async (operation: string, o: { tokenFile?: string }) => {
-      const chunks: Buffer[] = [];
-      if (!process.stdin.isTTY) for await (const c of process.stdin) chunks.push(c as Buffer);
-      const r = await gitCredential(operation, Buffer.concat(chunks).toString('utf8'), { tokenFile: o.tokenFile });
-      if (r.stderr) process.stderr.write(r.stderr + '\n');
-      if (r.stdout) process.stdout.write(r.stdout);
-      process.exitCode = 0;
-    });
   ws.command('export <outPath>').description('Write a bundle with the base branch and agent/* branches')
     .action(action(async (out: string, _o: unknown, cmd: Command) => {
       requireMode('runtime');
@@ -1476,54 +1387,29 @@ export function register(program: Command): void {
         ...d.warnings.map((w) => `warning: ${w}`)].join('\n') });
     }));
 
-  // sync: one-shot GitHub intake import (when intake.github is enabled) plus a refresh of PR state and
-  // CI check results (no polling loop); host delegates.
-  program.command('sync [taskIds...]').description('Import issues matching intake.github into the backlog (when enabled), refresh pull-request state and CI check results for tasks with a PR; reconcile merged/closed PRs; with delivery.merge auto-when-eligible, arm/disarm GitHub auto-merge for PRs that pass every gate')
-    // The unattended routine pass (docs/design/unattended-delivery.md; src/runtime/routine.ts): internal, so hidden.
-    .addOption(new Option('--routine', 'run the routine pass: sync, merge pass, wake decision, routine event (routine.enabled)').hideHelp())
-    .addOption(new Option('--last', 'with --routine: print the last recorded pass (the woken coordinator reads its reasons here)').hideHelp())
-    .addOption(new Option('--force', 'with --routine: run even within half an interval of the last pass').hideHelp())
-    .addOption(new Option('--trigger <who>', 'with --routine: clock, watchdog or manual (default manual)').hideHelp())
-    .action(action(async (taskIds: string[], o: { routine?: boolean; last?: boolean; force?: boolean; trigger?: string }, cmd: Command) => {
+  // sync --routine: the unattended routine pass (docs/design/unattended-delivery.md; src/runtime/routine.ts); internal,
+  // so hidden. Host delegates.
+  program.command('sync').description('The unattended routine pass (--routine: wake decision, routine event; routine.enabled)')
+    .option('--routine', 'run the routine pass')
+    .option('--last', 'with --routine: print the last recorded pass (the woken coordinator reads its reasons here)')
+    .option('--force', 'with --routine: run even within half an interval of the last pass')
+    .option('--trigger <who>', 'with --routine: clock, watchdog or manual (default manual)')
+    .action(action(async (o: { routine?: boolean; last?: boolean; force?: boolean; trigger?: string }, cmd: Command) => {
       if (runtimeMode() === 'host') return delegate(cmd);
-      if (o.routine || o.last || o.force || o.trigger) {
-        if (!o.routine) throw new MinionsError('PRECONDITION', '--last, --force and --trigger go with --routine.');
-        if (taskIds.length) throw new MinionsError('PRECONDITION', 'The routine pass syncs every task; it takes no task ids.');
-        if (o.last) {
-          const r = routineLast(getDb(), await getConfig());
-          emit(r, { json: globalOpts(cmd).json, human: (x: RoutineLast) => [humanRoutine(x), ...(x.last?.reasons ?? []).map((w) => `  ${w.kind}: ${w.detail}`)].join('\n') });
-          return;
-        }
-        const trigger = (o.trigger ?? 'manual') as RoutineTrigger;
-        if (!ROUTINE_TRIGGERS.includes(trigger)) throw new MinionsError('PRECONDITION', `--trigger must be one of ${ROUTINE_TRIGGERS.join(', ')}.`);
-        const r = await runRoutinePass(await routineDeps(), { trigger, force: o.force });
-        emit(r, { json: globalOpts(cmd).json, human: humanRoutineReport });
-        if (r.syncError || (r.sync?.failed ?? 0) > 0) process.exitCode = 1;
+      if (!o.routine) throw new MinionsError('PRECONDITION', '`minions sync` only runs the routine pass: pass --routine.');
+      if (o.last) {
+        const r = routineLast(getDb(), await getConfig());
+        emit(r, { json: globalOpts(cmd).json, human: (x: RoutineLast) => [humanRoutine(x), ...(x.last?.reasons ?? []).map((w) => `  ${w.kind}: ${w.detail}`)].join('\n') });
         return;
       }
-      const d = getDb();
-      const { report: rep, intake } = await fullSync(taskIds);
-      const r: SyncReport & { intake: IntakeSyncReport | null; notifications: OutboxCounts } = {
-        ...rep, intake,
-        // Pending notifications are retried by whoever runs sync (the coordinator sends them; nothing is woken).
-        notifications: outboxCounts(d),
-      };
-      emit(r, { json: globalOpts(cmd).json, human: (x) => [...(x.intake?.enabled ? [formatIntake(x.intake)] : []), formatSync(x),
-        ...(x.notifications.pending ? [`${formatCounts(x.notifications)} (send with \`minions notify pending\`)`] : [])].join('\n') });
-      if (r.failed || intake?.errors.length || r.tasks.some((t) => t.merge?.state === 'failed')) process.exitCode = 1;
-    }));
-
-  // ci: read-only required-checks status for the base branch (used by `minions doctor`).
-  const ci = program.command('ci').description('CI awareness (read-only; minions never creates workflows or changes branch protection)');
-  ci.command('status').description('Report required status checks on the base branch and the external CI setup plan')
-    .action(action(async (_o: unknown, cmd: Command) => {
-      if (runtimeMode() === 'host') return delegate(cmd);
-      const r = await ciStatus(workspaceLayout().repo, await getConfig(), { git });
-      emit(r, { json: globalOpts(cmd).json, human: formatCiStatus });
+      const trigger = (o.trigger ?? 'manual') as RoutineTrigger;
+      if (!ROUTINE_TRIGGERS.includes(trigger)) throw new MinionsError('PRECONDITION', `--trigger must be one of ${ROUTINE_TRIGGERS.join(', ')}.`);
+      const r = await runRoutinePass(await routineDeps(), { trigger, force: o.force });
+      emit(r, { json: globalOpts(cmd).json, human: humanRoutineReport });
     }));
 
   // status / pause / resume (host mode delegates to the container)
-  program.command('status').description('Show queue, workers, pause state, config revision, delivery mode and channel (configured vs effective); --check: host health checks (same as `doctor`)')
+  program.command('status').description('Show queue, workers, pause state, config revision and channel (configured vs effective); --check: host health checks (same as `doctor`)')
     .option('--check', 'run the host health checks (tools, Docker, container, Claude auth, configuration) instead; same as `minions doctor`')
     .action(action(async (o: { check?: boolean }, cmd: Command) => {
       if (o.check) {

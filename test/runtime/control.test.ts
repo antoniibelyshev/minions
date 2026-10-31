@@ -44,9 +44,9 @@ describe('control overlay', () => {
 
   it('may lift a project deny (full control), unlike the local layer', async () => {
     const base = defaults();
-    expect(base.capabilities['git.push']).toBeDefined();
-    await controlSet(deps(), 'capabilities.git.push', 'allow', 'owner said the coordinator may push');
-    expect(withControl(base, state).capabilities['git.push']).toBe('allow');
+    expect(base.capabilities['base.merge']).toBeDefined();
+    await controlSet(deps(), 'capabilities.base.merge', 'allow', 'owner said the runtime may land approved work');
+    expect(withControl(base, state).capabilities['base.merge']).toBe('allow');
   });
 
   it('unset falls back to the lower layers; undo restores the snapshot before a revision', async () => {

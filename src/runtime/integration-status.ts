@@ -18,7 +18,7 @@ import type { Task } from '../backlog/types.js';
 import { autoMergeConfigReasons, localIntegrationEnabled } from '../config/delivery.js';
 import type { MinionsConfig } from '../config/schema.js';
 import { gateGit } from './git-hardening.js';
-import { withEmptyHome } from './base-update.js';
+import { withEmptyHome } from './isolated-git.js';
 import type { RuntimeDb } from './db.js';
 import { checkoutGit, porcelainPaths } from './integration.js';
 import {
@@ -94,13 +94,9 @@ export interface IntegrationStatusDeps {
   inspect?: (repo: string, baseBranch: string) => Promise<BaseCheckout>;
 }
 
-/**
- * The `integration` block of `minions status`; null when there is nothing to show (not local delivery, or local
- * integration off and never used).
- */
+/** The `integration` block of `minions status`; null when there is nothing to show (local integration off and never used). */
 export async function collectIntegrationStatus(d: IntegrationStatusDeps): Promise<IntegrationStatus | null> {
   const cfg = d.config;
-  if (cfg.delivery.mode !== 'local') return null;
   const enabled = localIntegrationEnabled(cfg);
   const any = !!d.db.get('SELECT 1 FROM integrations LIMIT 1');
   if (!enabled && !any) return null;
@@ -185,7 +181,7 @@ export function humanIntegration(s: IntegrationStatus): string[] {
   const out = [`integration: ${s.enabled ? 'on' : `off (${s.reasons.join('; ') || 'not configured'})`}; ${lock}; base ${s.base ? s.base.slice(0, 12) : '-'}`];
   if (s.current) out.push(`  current: ${s.current.taskId} ${s.current.phase} for ${dur(s.current.elapsedSeconds)} (attempt ${s.current.attempt}, head ${s.current.head.slice(0, 12)})`);
   if (s.queue.length) out.push(`  queue: ${s.queue.map((q) => `${q.taskId}${q.waiting ? ` (${q.waiting})` : ''}`).join(', ')}`);
-  for (const a of s.awaitingApproval) out.push(`  awaiting approval: ${a.taskId} at ${a.head} (on the host: minions work approve ${a.taskId} --head ${a.head} --merge)`);
+  for (const a of s.awaitingApproval) out.push(`  awaiting approval: ${a.taskId} at ${a.head} (on the host: minions work approve ${a.taskId} --head ${a.head})`);
   if (s.last) out.push(`  last: ${s.last.taskId} ${s.last.outcome === 'landed-flaky' ? 'landed (flaky)' : s.last.phase}${s.last.endedAt ? ` at ${s.last.endedAt}` : ''}${s.last.detail ? `: ${s.last.detail}` : ''}`);
   if (s.halted) out.push(`  halted: ${s.halted.reason}`);
   for (const p of s.problems) out.push(`  ${p.status === 'fail' ? 'FAIL' : 'warn'} ${p.name}: ${p.detail}`);

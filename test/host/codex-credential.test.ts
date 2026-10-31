@@ -29,7 +29,7 @@ describe('codex credential kind', () => {
       expect(msg).not.toContain(KEY);
     }
     expect(C.codexKeyGuidance().join('\n')).toMatch(/CODEX_API_KEY, never as an argument/);
-    expect(C.CREDENTIAL_KINDS.map((k) => k.name)).toEqual(['github', 'telegram', 'codex', 'claude']);
+    expect(C.CREDENTIAL_KINDS.map((k) => k.name)).toEqual(['telegram', 'codex', 'claude']);
     expect(C.CODEX_CREDENTIAL.fileName).toBe('codex-api-key');
     expect(CONTAINER.codexKeyFile.endsWith('/codex-api-key')).toBe(true);
   });
@@ -45,7 +45,7 @@ describe('codex credential kind', () => {
 
     await C.provisionCodexKey({ projectId: ID, token: KEY2, repoPath: repo });
     expect(await C.readCodexKey(ID)).toBe(KEY2);
-    expect(await C.materializeSecrets(ID)).toEqual({ github: false, telegram: false, codex: true, claude: false });
+    expect(await C.materializeSecrets(ID)).toEqual({ telegram: false, codex: true, claude: false });
     const mounted = `${projectPaths(ID).secretsDir}/codex-api-key`;
     expect(readFileSync(mounted, 'utf8')).toBe(KEY2 + '\n');
     expect(statSync(mounted).mode & 0o777).toBe(0o600);

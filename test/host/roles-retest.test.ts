@@ -169,7 +169,7 @@ describe('mark-applied matches field by field', () => {
   }
   const VARIANTS: [string, Record<string, unknown>][] = [
     ['widened edits', { role: { ...ROLE, edits: 'any' } }],
-    ['widened capabilities', { role: { ...ROLE, capabilities: { 'pr.merge': 'allow' } } }],
+    ['widened capabilities', { role: { ...ROLE, capabilities: { 'infrastructure.edit': 'allow' } } }],
     ['extra role field', { role: { ...ROLE, maxTurns: 99 } }],
     ['reordered workflow stages', { workflows: { research: ['tester', 'researcher', 'reviewer'] } }],
     ['extra workflow stage', { workflows: { research: ['engineer', 'researcher', 'tester', 'reviewer'] } }],
@@ -184,7 +184,7 @@ describe('mark-applied matches field by field', () => {
 
   it('an unknown top-level proposal field is rejected at propose', async () => {
     const project = await applied();
-    await expect(propose(project, { name: 'researcher', role: ROLE, promptText: 'v1', reason: 'r', capabilities: { 'pr.merge': 'allow' } })).rejects.toThrow();
+    await expect(propose(project, { name: 'researcher', role: ROLE, promptText: 'v1', reason: 'r', capabilities: { 'infrastructure.edit': 'allow' } })).rejects.toThrow();
   });
 
   it('an unknown role field is rejected at propose (strict role schema)', async () => {
@@ -202,9 +202,9 @@ describe('mark-applied matches field by field', () => {
 describe('LOOSENS vs the active profile and project overrides', () => {
   it('a project override counts as the base: allowed by the project -> not listed; tightened by the project -> listed', async () => {
     const base = defaults('project-owner');
-    const cfg = validateConfig({ ...base, capabilities: { ...base.capabilities, 'pr.merge': 'allow', 'git.push': 'ask' } });
-    const { summary } = await checkProposal(cfg, { name: 'researcher', role: { ...ROLE, capabilities: { 'pr.merge': 'allow', 'git.push': 'allow' } }, promptText: 'x', reason: 'r' });
-    expect(summary.loosens).toEqual([{ capability: 'git.push', profile: 'ask', proposed: 'allow' }]);
+    const cfg = validateConfig({ ...base, capabilities: { ...base.capabilities, 'infrastructure.edit': 'allow', 'migrations.edit': 'ask' } });
+    const { summary } = await checkProposal(cfg, { name: 'researcher', role: { ...ROLE, capabilities: { 'infrastructure.edit': 'allow', 'migrations.edit': 'allow' } }, promptText: 'x', reason: 'r' });
+    expect(summary.loosens).toEqual([{ capability: 'migrations.edit', profile: 'ask', proposed: 'allow' }]);
   });
 
   it.each(PROFILES)('profile %s: every base deny stays deny for the role and is never listed', async (profile) => {
@@ -228,11 +228,11 @@ describe('LOOSENS vs the active profile and project overrides', () => {
 
   it('interactive apply: LOOSENS is the last line shown right before the y/N question', async () => {
     const { project } = await initProject();
-    const p = await propose(project, { name: 'researcher', role: { ...ROLE, capabilities: { 'pr.merge': 'allow' } }, promptText: 'line1\nline2', reason: 'r' });
+    const p = await propose(project, { name: 'researcher', role: { ...ROLE, capabilities: { 'infrastructure.edit': 'allow' } }, promptText: 'line1\nline2', reason: 'r' });
     const events: string[] = [];
     await applyRoleProposal(project, p.proposalId, {}, deps(project, events));
     expect(events).toHaveLength(2);
-    expect(events[0]!.split('\n').at(-1)).toBe('LOOSENS: pr.merge ask -> allow (looser than the active profile)');
+    expect(events[0]!.split('\n').at(-1)).toBe('LOOSENS: infrastructure.edit ask -> allow (looser than the active profile)');
     expect(events[1]).toMatch(/^Q:Apply role proposal rp_[0-9a-f]{8} \(researcher\)/);
   });
 });

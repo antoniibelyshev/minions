@@ -7,7 +7,6 @@ import type { Profile } from '../src/config/schema.js';
 import { HANG_GUARD_TIMEOUT_TEST, HOOK_WRAPPER_TIMEOUT_S } from '../src/runtime/hook-guard.js';
 
 export const ctx = {
-  hasGitHub: true,
   baseBranch: 'main',
   identity: { name: 'Ada', email: 'ada@example.com' },
   projectId: '3f2b8c1e-7d4a-4e9b-9c2f-1a2b3c4d5e6f',

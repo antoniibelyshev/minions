@@ -43,7 +43,7 @@ import { can } from '../config/capabilities.js';
 import type { MinionsConfig } from '../config/schema.js';
 import { MinionsError } from '../core/errors.js';
 import { redact } from '../core/output.js';
-import { FULL_SHA, withEmptyHome } from './base-update.js';
+import { FULL_SHA, withEmptyHome } from './isolated-git.js';
 import type { RuntimeDb, SupervisorLock } from './db.js';
 import { allowlistedGit, gateGit } from './git-hardening.js';
 import { enqueue } from './outbox.js';

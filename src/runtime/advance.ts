@@ -33,16 +33,14 @@ export type AdvanceDecisionKind =
   | 'needs-split'
   /** A producer reported needs_changes: the task returned for re-planning. */
   | 'needs-changes'
-  /** The task waits for the owner (e.g. a host-signed publication or merge approval). */
+  /** The task waits for the owner (e.g. a host-signed merge approval). */
   | 'awaiting-human'
-  /** Publication or merge did not complete (failed or pending): report it and retry `work publish`. */
+  /** The local integration was queued or did not complete: report it (retry with `work publish`). */
   | 'publication'
   /** The worker reported blocked. */
   | 'blocked'
   /** A partial result (not a drain): re-dispatch with the remaining work, or split. */
   | 'partial'
-  /** The stage relied on CI that is not usable: re-dispatch with local verification. */
-  | 'ci-unverified'
   /** A QA sweep returned findings: create one backlog task per finding. */
   | 'qa-findings'
   /** A context reset is due: hand off and restart before dispatching more. */
@@ -116,16 +114,12 @@ export function recordDecision(sched: Scheduler, r: AdvanceRecord, worker: Store
   if (r.needsSplit) return { kind: 'needs-split', ...at };
   const pub = r.publication;
   if (pub && pub.state !== 'published') return { kind: pub.state === 'awaiting-approval' ? 'awaiting-human' : 'publication', ...at };
-  const merge = pub?.merge?.state;
-  if (merge === 'awaiting-approval') return { kind: 'awaiting-human', ...at, message: pub!.merge!.reasons.join('; ') || r.message };
-  if (merge === 'failed' || merge === 'denied') return { kind: 'publication', ...at, message: pub!.merge!.reasons.join('; ') || r.message };
   if (r.to === 'blocked') return { kind: 'blocked', ...at };
   if (r.to === 'awaiting-human') return { kind: 'awaiting-human', ...at };
   const lease = sched.db.lease(r.leaseId);
   const sweep = !!lease && sched.isSweepLease(lease);
   if (worker.status === 'partial') return { kind: 'partial', ...at };
   if (worker.status === 'needs_changes' && !sweep && r.to !== 'changes-requested') return { kind: 'needs-changes', ...at };
-  if (r.ciBlocked === 'unverified') return { kind: 'ci-unverified', ...at };
   if (sweep && (worker.findings?.length ?? 0) > 0) return { kind: 'qa-findings', ...at, findings: worker.findings!.length };
   if (r.contextReset) return { kind: 'context-reset', ...at, message: r.contextReset.reason };
   return null;

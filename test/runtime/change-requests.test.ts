@@ -126,12 +126,12 @@ describe('settings set in the runtime records a request', () => {
   });
 
   it('records host-owned keys too (the owner confirms them on the host); only secrets are refused', async () => {
-    for (const [key, value] of [['architecture', 'propose'], ['capabilities.pr.merge', 'allow'], ['verification.reviewerRequired', 'false']]) {
+    for (const [key, value] of [['architecture', 'propose'], ['capabilities.ci.edit', 'allow'], ['verification.reviewerRequired', 'false']]) {
       const { env } = await cli(['settings', 'set', key!, value!, '--reason', 'faster']);
       expect(env.ok, key).toBe(true);
       expect((env.data as { recorded: boolean; applied: boolean })).toMatchObject({ recorded: true, applied: false });
     }
-    const secret = await cli(['settings', 'set', 'secrets.github', 'x', '--reason', 'r']);
+    const secret = await cli(['settings', 'set', 'secrets.telegram', 'x', '--reason', 'r']);
     expect(secret.env.error!.code).toBe('CONFLICT');
     expect(secret.env.error!.message).toMatch(/secret/);
     expect(rows()).toHaveLength(3);
@@ -198,7 +198,7 @@ describe('settings restart and upgrade in the runtime record requests', () => {
     expect(rows().map((r) => r.status)).toEqual(['expired', 'proposed']);
   });
 
-  it('upgrade records an upgrade request; --from-container [branch] only with local delivery; drain and CLI options are refused', async () => {
+  it('upgrade records an upgrade request with --from-container [branch]; drain and CLI options are refused', async () => {
     const plain = await cli(['upgrade', '--reason', 'new minions release']);
     expect(plain.env.data.request).toMatchObject({ kind: 'upgrade', payload: { fromContainer: null } });
     const fc = await cli(['upgrade', '--from-container', '--reason', 'sync']);
@@ -211,9 +211,6 @@ describe('settings restart and upgrade in the runtime record requests', () => {
       expect(r.env.error!.code, flag.join(' ')).toBe('PRECONDITION');
       expect(r.env.error!.message).toMatch(/not available in an upgrade request/);
     }
-    writeConfig({ delivery: { ...defaults().delivery, mode: 'branch', provider: 'github' } });
-    const gh = await cli(['upgrade', '--from-container', '--reason', 'x']);
-    expect(gh.env.error!.message).toMatch(/local delivery only/);
     expect(rows().filter((r) => r.status === 'proposed')).toHaveLength(1); // each upgrade request replaced the previous one
   });
 });

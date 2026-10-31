@@ -1,5 +1,5 @@
 // How the container user (uid/gid 1000) reads the host-provisioned secret files in the bind-mounted
-// secrets directory (GitHub/Telegram tokens, Claude key copy).
+// secrets directory (Telegram token, Claude key copy).
 //
 // - macOS (Docker Desktop maps ownership), unknown uid, or host uid 1000: `owner` — dir 0700, files 0600,
 //   no group_add. This path is byte-identical to the original behavior.

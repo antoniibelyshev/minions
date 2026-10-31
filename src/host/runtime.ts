@@ -14,7 +14,7 @@
 //   config.local.json only); bypassPermissions likewise only from config.local.json.
 import { spawn } from 'node:child_process';
 import { realpathSync } from 'node:fs';
-import { chmod, lstat, mkdir, readFile, rm } from 'node:fs/promises';
+import { chmod, lstat, mkdir, rm } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, relative } from 'node:path';
 import { MinionsError } from '../core/errors.js';
 import { run, type RunOptions, type RunResult } from '../core/exec.js';
@@ -23,7 +23,7 @@ import { hostRoot, hostRuntimePaths, projectPaths } from '../core/paths.js';
 import { shQuote } from '../runtime/coordinator.js';
 import { hardenedGitArgs, hardenedGitEnv } from '../runtime/git-hardening.js';
 import { moveKeychainTokensToFileStore, type MovedToken } from './credentials.js';
-import { KEY_HELPER_TTL_MS, authOf, isKeyAuth, resolveOnPath } from './auth.js';
+import { KEY_HELPER_TTL_MS, authOf, isKeyAuth } from './auth.js';
 import { packageRoot, type Runner } from './docker.js';
 import type { ProjectJson } from './project.js';
 import { fastPathHint } from '../backlog/taskfile.js';
@@ -98,9 +98,7 @@ export function hostRuntimeVars(project: ProjectJson): Record<string, string> {
     MINIONS_PLUGIN_DIR: pp.pluginDir,
     MINIONS_TMUX_SOCKET: hp.tmuxSocket,
     MINIONS_AUTH_METHOD: auth.method,
-    MINIONS_GIT_CREDENTIAL_HELPER: `!${shQuote(hp.minionsShim)} git-credential`,
     GIT_TERMINAL_PROMPT: '0',
-    GH_PROMPT_DISABLED: '1',
     // Tool caches live in the agent state, so sandboxed commands never write ~/.npm or ~/.cache (cache poisoning).
     ...cacheVars(hp.cache),
     ...(isKeyAuth(auth) ? { CLAUDE_CODE_API_KEY_HELPER_TTL_MS: String(KEY_HELPER_TTL_MS) } : {}),
@@ -147,18 +145,6 @@ export function minionsShim(project: ProjectJson, target: ShimTarget): string {
   return L.join('\n') + '\n';
 }
 
-/** Host gh wrapper from docker/gh-wrapper.sh: same token handling, host paths. */
-export async function ghShim(realGh: string, tokenFile: string, root: string = packageRoot()): Promise<string> {
-  const src = await readFile(join(root, 'docker', 'gh-wrapper.sh'), 'utf8');
-  const out = src
-    .replace(/^REAL_GH=.*$/m, `REAL_GH=${shQuote(realGh)}`)
-    .replace(/^TOKEN_FILE=.*$/m, `TOKEN_FILE=${shQuote(tokenFile)}`)
-    .replace('# minions gh wrapper, installed as /usr/local/bin/gh (the real binary is /opt/gh/bin/gh, off PATH).',
-      '# minions gh wrapper for the host runtime (generated; the real gh is REAL_GH). Your own gh login is not used.');
-  if (!out.includes(`REAL_GH=${shQuote(realGh)}`)) throw new MinionsError('INTERNAL', 'gh wrapper template has an unexpected shape.');
-  return out;
-}
-
 /** realpath of the deepest existing ancestor, with the rest appended (a missing file still resolves its links). */
 export function realPathOf(p: string): string {
   try { return realpathSync(p); } catch {
@@ -198,12 +184,11 @@ export function assertShimTargetSafe(projectId: string, target: ShimTarget): voi
 }
 
 /**
- * Writes the shims (0755 in a 0700 dir) and creates the 0700 host runtime dirs. The gh shim exists
- * only when gh is installed on the host (needed for pull-request delivery). Tokens still in the macOS
+ * Writes the shim (0755 in a 0700 dir) and creates the 0700 host runtime dirs. Tokens still in the macOS
  * Keychain are moved to the 0600 file store first (see moveKeychainTokensToFileStore: sandboxed agent
  * commands can run /usr/bin/security, which every minions Keychain item trusts).
  */
-export async function prepareHostRuntime(project: ProjectJson, opts: { target?: ShimTarget; pathEnv?: string; runner?: Runner } = {}): Promise<{ gh: string | null; movedToFileStore: MovedToken[]; keychainWarnings: string[] }> {
+export async function prepareHostRuntime(project: ProjectJson, opts: { target?: ShimTarget; runner?: Runner } = {}): Promise<{ movedToFileStore: MovedToken[]; keychainWarnings: string[] }> {
   const target = opts.target ?? defaultShimTarget();
   assertShimTargetSafe(project.projectId, target); // before any write: a refused target leaves the shim as it was
   const hp = hostRuntimePaths(project.projectId);
@@ -211,12 +196,10 @@ export async function prepareHostRuntime(project: ProjectJson, opts: { target?: 
   await ensureDir(projectPaths(project.projectId).secretsDir, 0o700);
   const moved = await moveKeychainTokensToFileStore(opts.runner ?? run);
   await atomicWrite(hp.minionsShim, minionsShim(project, target), { mode: 0o755 });
-  const pathEnv = (opts.pathEnv ?? process.env.PATH ?? '').split(':').filter((d) => d && d !== hp.bin && isAbsolute(d)).join(':');
-  const gh = await resolveOnPath('gh', pathEnv);
-  if (gh) await atomicWrite(hp.ghShim, await ghShim(gh, projectPaths(project.projectId).githubTokenFile), { mode: 0o755 });
-  else await rm(hp.ghShim, { force: true });
+  // The gh token wrapper of the removed GitHub delivery (docs/design/autonomy.md Decision 8).
+  await rm(join(hp.bin, 'gh'), { force: true });
   await ensureHostWorktreesDir(hp.repo);
-  return { gh, movedToFileStore: moved.moved, keychainWarnings: moved.warnings };
+  return { movedToFileStore: moved.moved, keychainWarnings: moved.warnings };
 }
 
 /**
@@ -270,7 +253,7 @@ export class HostRuntime {
     const [cmd, ...rest] = args;
     if (cmd === 'git') {
       const env = this.env();
-      return this.runner('git', [...hardenedGitArgs({ credentialHelper: env.MINIONS_GIT_CREDENTIAL_HELPER }), ...rest], { cwd: this.paths.workspace, timeoutMs: 300_000, ...opts, env: hardenedGitEnv(env) });
+      return this.runner('git', [...hardenedGitArgs(), ...rest], { cwd: this.paths.workspace, timeoutMs: 300_000, ...opts, env: hardenedGitEnv(env) });
     }
     const bin = cmd === 'minions' ? this.paths.minionsShim : cmd!;
     return this.runner(bin, rest, { cwd: this.paths.workspace, timeoutMs: 300_000, ...opts, env: this.env() });
@@ -335,7 +318,6 @@ const TOOLS: { name: string; args: string[]; required: boolean; hint: string; te
   { name: 'claude', args: ['--version'], required: true, hint: 'npm install -g @anthropic-ai/claude-code (or brew install --cask claude-code)', tested: '2.1.292', purpose: 'Claude Code' },
   { name: 'backlog', args: ['--version'], required: true, hint: 'npm install -g backlog.md@1.54.0', tested: '1.54.0', purpose: 'Backlog.md CLI', note: fastPathHint },
   { name: 'git', args: ['--version'], required: true, hint: 'xcode-select --install (or brew install git)', purpose: 'workspace clone' },
-  { name: 'gh', args: ['--version'], required: false, hint: 'brew install gh (needed only for pull-request delivery)', purpose: 'GitHub CLI' },
 ];
 
 const firstLine = (s: string) => s.trim().split('\n')[0]?.trim().slice(0, 120) ?? '';

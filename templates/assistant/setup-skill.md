@@ -1,6 +1,6 @@
 ---
 name: setup
-description: Finish setting up minions for this repository after `minions init` - gather state, close gaps (GitHub, Claude auth, Telegram, verification commands, models, first tasks), then verify with minions doctor.
+description: Finish setting up minions for this repository after `minions init` - gather state, close gaps (Claude auth, Telegram, verification commands, models, first tasks), then verify with minions doctor.
 ---
 
 # Finish minions setup
@@ -18,13 +18,9 @@ Run these and read the results before proposing anything:
 - `git remote -v`, `git status --short`, `git log --oneline -5`
 - Build and CI files: `package.json` (scripts), `Makefile`, `justfile`, `pyproject.toml`, `Cargo.toml`, `go.mod`, `.github/workflows/*`, `CONTRIBUTING.md`, `CLAUDE.md`
 
-Then give the user a short list of the gaps you found and ask what they want to do first. Ask about their goals for the team (step 8) early: it shapes the rest.
+Then give the user a short list of the gaps you found and ask what they want to do first. Ask about their goals for the team (step 7) early: it shapes the rest.
 
-## 2. GitHub (only if delivery should reach GitHub)
-
-If `github.setup` or `github.credential` is not `ok` and the user wants branches or pull requests: explain in two lines what a per-project fine-grained token enables, then ask the user to run `! minions setup github` (guided: remote, base branch, pre-filled token page, hidden token prompt, delivery mode). Do not run it, do not push, do not open the token page yourself. Afterwards rerun `minions doctor --json` and check `github.setup`.
-
-## 3. Claude authorization for the agents
+## 2. Claude authorization for the agents
 
 From `minions auth show --json`, explain the current method and the options in a few lines:
 
@@ -34,15 +30,15 @@ From `minions auth show --json`, explain the current method and the options in a
 
 The user runs the chosen `! minions auth set ...` themselves (it shows the plan and asks). Never handle the key.
 
-## 4. Telegram (optional)
+## 3. Telegram (optional)
 
 Only if the user wants remote control: explain that it uses the official Claude Code channel plugin with their own bot (BotFather `/newbot`), one bot per project. `communication.channel` `auto` (the default) already uses Telegram once a bot token is stored; for an explicit `terminal` channel, switch with `! minions channel set auto` (or `telegram`). The bot token goes in with `! minions auth telegram`, then `! minions down && minions start`. Pairing happens later in the coordinator terminal (`/telegram:access pair <code>`, then `/telegram:access policy allowlist`).
 
-## 5. Verification commands
+## 4. Verification commands
 
 `verification.commands` are the checks the agents run before handing work over. Infer them only from the repository's real scripts and CI (for example `npm run typecheck`, `npm test`, `make check`), prefer what CI runs, and skip commands that need secrets, a network service, or a GUI. Propose the list with one line of reasoning per command.
 
-To change the configuration (this step and steps 4 and 6):
+To change the configuration (this step and steps 3 and 5):
 
 1. Read `{{configPath}}`.
 2. Show the exact diff (including `configRevision` + 1) and ask for a yes.
@@ -50,21 +46,21 @@ To change the configuration (this step and steps 4 and 6):
 4. Run `minions config show --explain` to validate. On an error, fix or revert.
 5. Tell the user it applies on the next `minions start`{{commitNote}}.
 
-## 6. Models, effort and budgets
+## 5. Models, effort and budgets
 
-Explain the current `models` block in two lines (`default`, `allowed`, `selection`, optional `effort` and `coordinator`) and recommend keeping the defaults unless the user has a reason (cost, a specific model). Budgets (`budgets.taskUsd`, `budgets.dailyUsd`) are not enforced in v0.1: recommend leaving them `null`. Changes follow the step 5 procedure.
+Explain the current `models` block in two lines (`default`, `allowed`, `selection`, optional `effort` and `coordinator`) and recommend keeping the defaults unless the user has a reason (cost, a specific model). Budgets (`budgets.taskUsd`, `budgets.dailyUsd`) are not enforced in v0.1: recommend leaving them `null`. Changes follow the step 4 procedure.
 
-## 7. Doctor warnings
+## 6. Doctor warnings
 
 Walk through the remaining `warn`/`fail` checks from `minions doctor --json`. For each: one line on what it means and the exact command from its hint. List what the user must do (start Docker, `minions start`, `/login`); do not do it yourself.
 
-## 8. First backlog tasks
+## 7. First backlog tasks
 
 Ask the user what they want the team to work on first. Turn the answer into 1-5 small, independent tasks, each with a title, a short description, 2-4 acceptance criteria, and a priority. Show them for review.
 
 `minions backlog ...` runs only inside the agent runtime, so you cannot create tasks from here. Give the user one ready-to-paste message for the coordinator (after `minions start`), for example "Create these tasks in the backlog: ...". {{intakeNote}}
 
-## 9. Finish
+## 8. Finish
 
 Run `minions doctor` and summarize in a short list:
 

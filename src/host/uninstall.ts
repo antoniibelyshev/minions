@@ -83,7 +83,6 @@ export async function runUninstall(opts: UninstallOptions): Promise<UninstallRes
 
   // Credentials are preserved by default (spec: uninstall keeps credentials).
   const refs = await loadCredentialRefs(projectId).catch(() => undefined);
-  if (refs?.github) kept.push({ path: refs.github.ref, reason: 'GitHub token kept; run `minions auth github --remove` before uninstalling to delete it' });
   if (refs?.telegram) kept.push({ path: refs.telegram.ref, reason: 'Telegram bot token kept; run `minions auth telegram --remove` before uninstalling to delete it (or revoke it in BotFather)' });
 
   let container: UninstallResult['container'] = 'skipped';
@@ -106,7 +105,7 @@ export async function runUninstall(opts: UninstallOptions): Promise<UninstallRes
     for (const p of toRemove) { await rm(p, { force: true }); removed.push(p); await pruneEmptyDirs(dirname(p), p.startsWith(paths.dir) ? paths.dir : entry.repoPath); }
     await rm(paths.manifestJson, { force: true });
     await rm(paths.journalJson, { force: true });
-    // The container is gone: drop the materialized GitHub/Telegram token copies, the host-provisioned
+    // The container is gone: drop the materialized token copies, the host-provisioned
     // Claude key copy (its original source is untouched), the mount dir, and the non-secret refresh state.
     await clearSecrets(projectId);
     await removeApprovalKeys(projectId); // host-held approval signing key and its public half

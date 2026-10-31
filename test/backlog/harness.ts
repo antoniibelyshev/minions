@@ -55,7 +55,7 @@ export class MemoryBacklog implements BacklogAdapter {
       id, locator: `backlogmd:${id.toUpperCase()}`, title: input.title, description: input.description ?? '',
       acceptanceCriteria: (input.acceptanceCriteria ?? []).map((text) => ({ text, done: false })), status: input.status ?? 'idea',
       priority: input.priority ?? null, dependencies: (input.dependencies ?? []).map(normalizeId), parent: input.parent ? normalizeId(input.parent) : null,
-      externalLinks: input.externalLinks ?? [], labels: input.labels ?? [], authorized: false, branch: null, commits: [], prUrl: null,
+      externalLinks: input.externalLinks ?? [], labels: input.labels ?? [], authorized: false, branch: null, commits: [],
       provenance: input.provenance ?? 'user-decision', version: '', milestone: null, ...(input.workflow ? { workflow: input.workflow } : {}),
     };
     this.bump(task);

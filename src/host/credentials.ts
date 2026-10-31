@@ -1,5 +1,5 @@
-// Host-side credential provisioning, shared by every credential kind (GitHub fine-grained PAT,
-// Telegram bot token). Per project:
+// Host-side credential provisioning, shared by every credential kind (Telegram bot token, OpenAI API key,
+// headless Claude token). Per project:
 //
 // - The token is entered on the host only (non-echoing TTY prompt or piped stdin), never as argv.
 // - Long-lived storage: macOS Keychain (`security`) or, on Linux, the Secret Service keyring
@@ -28,54 +28,6 @@ export { BOTFATHER_URL, checkTelegramTokenFormat };
 import type { Runner } from './docker.js';
 
 export type Fetch = typeof fetch;
-
-// ---------------------------------------------------------------- guidance
-
-export const GITHUB_TOKEN_CREATE_URL = 'https://github.com/settings/personal-access-tokens/new';
-
-/** Fine-grained PAT repository permissions minions needs (current and upcoming delivery/CI tasks). */
-export const GITHUB_TOKEN_PERMISSIONS = [
-  { permission: 'Contents', access: 'Read and write' },
-  { permission: 'Pull requests', access: 'Read and write' },
-  { permission: 'Checks', access: 'Read-only' },
-  { permission: 'Actions', access: 'Read-only' },
-  { permission: 'Commit statuses', access: 'Read-only' },
-  { permission: 'Metadata', access: 'Read-only' },
-] as const;
-
-/** Parses owner/repo from a GitHub remote URL (https or scp-like ssh). */
-export function githubRepoFromRemote(remoteUrl: string | null | undefined): { owner: string; repo: string } | null {
-  if (!remoteUrl) return null;
-  const m = /github\.com[:/]+([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?\/?$/.exec(remoteUrl.trim());
-  return m ? { owner: m[1]!, repo: m[2]! } : null;
-}
-
-export function githubTokenGuidance(remoteUrl?: string | null): string[] {
-  const r = githubRepoFromRemote(remoteUrl);
-  return [
-    `Create a fine-grained personal access token: ${GITHUB_TOKEN_CREATE_URL}`,
-    `  Repository access: Only select repositories -> ${r ? `${r.owner}/${r.repo}` : 'this project\'s repository'}`,
-    '  Repository permissions:',
-    ...GITHUB_TOKEN_PERMISSIONS.map((p) => `    - ${p.permission}: ${p.access}`),
-    '  Grant nothing else (no account permissions, no other repositories). Choose an expiration.',
-    'Store it with `minions auth github` (prompted without echo; never pass a token as an argument).',
-  ];
-}
-
-// ---------------------------------------------------------------- token format
-
-const FINE_GRAINED = /^github_pat_[A-Za-z0-9_]{20,255}$/;
-const CLASSIC = /^gh[pousr]_[A-Za-z0-9]{20,255}$/;
-
-/** Validates token shape (also guarantees no whitespace/quotes, so it is safe on a `security -i` line). */
-export function checkTokenFormat(raw: string): { token: string; fineGrained: boolean } {
-  const token = raw.trim();
-  if (!token) throw new MinionsError('INVALID_CONFIG', 'No token entered.', 'Paste the token at the prompt.');
-  if (FINE_GRAINED.test(token)) return { token, fineGrained: true };
-  if (CLASSIC.test(token)) return { token, fineGrained: false };
-  throw new MinionsError('INVALID_CONFIG', 'That does not look like a GitHub token (expected github_pat_…).',
-    `Create a fine-grained personal access token at ${GITHUB_TOKEN_CREATE_URL}.`);
-}
 
 // ---------------------------------------------------------------- OpenAI API key (Codex harness)
 
@@ -153,6 +105,8 @@ export function telegramBotGuidance(): string[] {
   ];
 }
 
+export type Verification = { status: 'ok' | 'invalid' | 'unverified'; detail: string; login?: string };
+
 /** Result of the optional, consented Bot API getMe check. The token travels only in the request URL path. */
 export async function verifyTelegramToken(token: string, opts: { fetch?: Fetch; timeoutMs?: number } = {}): Promise<Verification> {
   const f = opts.fetch ?? fetch;
@@ -193,13 +147,9 @@ export interface StoreKind {
 
 /** One per-project secret type. Every kind shares the stores, the project reference file and the secrets mount. */
 export interface CredentialKind extends StoreKind {
-  readonly name: 'github' | 'telegram' | 'codex' | 'claude';
+  readonly name: 'telegram' | 'codex' | 'claude';
 }
 
-export const GITHUB_CREDENTIAL: CredentialKind = {
-  name: 'github', label: 'GitHub token', keychainService: 'minions.github', keychainLabel: 'minions-github-token',
-  fileName: 'github-token', check: (raw) => checkTokenFormat(raw).token, command: 'minions auth github',
-};
 export const TELEGRAM_CREDENTIAL: CredentialKind = {
   name: 'telegram', label: 'Telegram bot token', keychainService: 'minions.telegram', keychainLabel: 'minions-telegram-bot-token',
   fileName: 'telegram-bot-token', check: (raw) => checkTelegramTokenFormat(raw).token, command: 'minions auth telegram',
@@ -220,7 +170,9 @@ export const CLAUDE_HEADLESS_CREDENTIAL: CredentialKind = {
   name: 'claude', label: 'headless Claude token', keychainService: 'minions.claude-headless', keychainLabel: 'minions-claude-headless-token',
   fileName: CLAUDE_HEADLESS_TOKEN_FILE, check: (raw) => checkClaudeTokenFormat(raw).token, command: 'minions auth set login --headless-token',
 };
-export const CREDENTIAL_KINDS = [GITHUB_CREDENTIAL, TELEGRAM_CREDENTIAL, CODEX_CREDENTIAL, CLAUDE_HEADLESS_CREDENTIAL] as const;
+export const CREDENTIAL_KINDS = [TELEGRAM_CREDENTIAL, CODEX_CREDENTIAL, CLAUDE_HEADLESS_CREDENTIAL] as const;
+/** Materialized copies of removed kinds (the GitHub token): deleted from the secrets directory, never written. */
+const LEGACY_SECRET_FILES = ['github-token'];
 
 /** Store account of the host-wide manager bot token (never a project UUID, so it cannot collide with one). */
 export const MANAGER_ACCOUNT = 'manager';
@@ -253,7 +205,6 @@ export const MANAGER_CLAUDE_CREDENTIAL: StoreKind & { readonly name: 'manager-cl
 
 export const BACKENDS = ['keychain', 'secret-service', 'file'] as const;
 export type Backend = typeof BACKENDS[number];
-export const KEYCHAIN_SERVICE = GITHUB_CREDENTIAL.keychainService;
 
 /** Where a token of this backend lives, for user-facing messages ("stored in <label>"). */
 export function backendLabel(backend: Backend): string {
@@ -278,7 +229,7 @@ export interface SecretStore {
  */
 export class KeychainStore implements SecretStore {
   readonly backend = 'keychain' as const;
-  constructor(private readonly runner: Runner = run, readonly kind: StoreKind = GITHUB_CREDENTIAL) {}
+  constructor(private readonly runner: Runner, readonly kind: StoreKind) {}
   ref(projectId: string) { return `keychain:${this.kind.keychainService}/${projectId}`; }
 
   async get(projectId: string): Promise<string | null> {
@@ -315,7 +266,7 @@ export class KeychainStore implements SecretStore {
  */
 export class SecretServiceStore implements SecretStore {
   readonly backend = 'secret-service' as const;
-  constructor(private readonly runner: Runner = run, readonly kind: StoreKind = GITHUB_CREDENTIAL) {}
+  constructor(private readonly runner: Runner, readonly kind: StoreKind) {}
   ref(projectId: string) { return `secret-service:${this.kind.keychainService}/${projectId}`; }
   private attrs(projectId: string) { return ['service', this.kind.keychainService, 'account', projectId]; }
 
@@ -359,7 +310,7 @@ export async function secretServiceAvailable(runner: Runner, env: NodeJS.Process
 /** 0600 file in a 0700 directory under the host data root. */
 export class FileStore implements SecretStore {
   readonly backend = 'file' as const;
-  constructor(readonly kind: StoreKind = GITHUB_CREDENTIAL) {}
+  constructor(readonly kind: StoreKind) {}
   path(projectId: string) { return credentialStoreFile(projectId, this.kind.fileName); }
   ref(projectId: string) { return `file:${this.path(projectId)}`; }
 
@@ -392,7 +343,7 @@ const assertAccount = (kind: StoreKind, id: string) => {
   if (kind.account !== undefined ? id !== kind.account : !z.uuid().safeParse(id).success) throw new MinionsError('INTERNAL', 'invalid project id');
 };
 
-export interface StoreOptions { runner?: Runner; platform?: NodeJS.Platform; env?: NodeJS.ProcessEnv; kind?: StoreKind; hostRuntime?: boolean }
+export interface StoreOptions { runner?: Runner; platform?: NodeJS.Platform; env?: NodeJS.ProcessEnv; hostRuntime?: boolean }
 
 /**
  * True when any registered project (or the host-wide default) uses the host runtime. Its agents run
@@ -416,9 +367,9 @@ export async function hostRuntimeInUse(): Promise<boolean> {
  * else the file store. MINIONS_CREDENTIAL_STORE=file|keychain|secret-service overrides, except that the
  * file store is always used while the host runtime is in use (see hostRuntimeInUse).
  */
-export async function selectStore(opts: StoreOptions = {}): Promise<SecretStore> {
+export async function selectStore(opts: StoreOptions & { kind: StoreKind }): Promise<SecretStore> {
   const runner = opts.runner ?? run;
-  const kind = opts.kind ?? GITHUB_CREDENTIAL;
+  const kind = opts.kind;
   const env = opts.env ?? process.env;
   const pref = env.MINIONS_CREDENTIAL_STORE;
   if (pref === 'file') return new FileStore(kind);
@@ -432,7 +383,7 @@ export async function selectStore(opts: StoreOptions = {}): Promise<SecretStore>
   return probe.code === 0 ? new KeychainStore(runner, kind) : new FileStore(kind);
 }
 
-export const storeFor = (backend: Backend, runner: Runner, kind: StoreKind = GITHUB_CREDENTIAL): SecretStore =>
+export const storeFor = (backend: Backend, runner: Runner, kind: StoreKind): SecretStore =>
   (backend === 'keychain' ? new KeychainStore(runner, kind) : backend === 'secret-service' ? new SecretServiceStore(runner, kind) : new FileStore(kind));
 
 /** A moved token: a project's (projectId set) or a host-wide manager token (projectId null). */
@@ -518,12 +469,8 @@ export async function moveKeychainTokensToFileStore(runner: Runner = run): Promi
 
 export const CredentialsJsonSchema = z.object({
   version: z.literal(1),
-  github: z.object({
-    backend: z.enum(BACKENDS),
-    ref: z.string().min(1),
-    kind: z.enum(['fine-grained-pat', 'classic-pat']),
-    updatedAt: z.string(),
-  }).strict().optional(),
+  /** Legacy: the reference of the removed GitHub token (docs/design/autonomy.md Decision 8); accepted and unused. */
+  github: z.unknown().optional(),
   telegram: z.object({
     backend: z.enum(BACKENDS),
     ref: z.string().min(1),
@@ -545,7 +492,6 @@ export const CredentialsJsonSchema = z.object({
   }).strict().optional(),
 }).strict();
 export type CredentialsJson = z.infer<typeof CredentialsJsonSchema>;
-export type GithubCredentialRef = NonNullable<CredentialsJson['github']>;
 export type TelegramCredentialRef = NonNullable<CredentialsJson['telegram']>;
 export type CodexCredentialRef = NonNullable<CredentialsJson['codex']>;
 
@@ -557,67 +503,12 @@ async function saveCredentialRefs(projectId: string, refs: CredentialsJson): Pro
   await writeJson(projectPaths(projectId).credentialsJson, refs, { mode: 0o600 });
 }
 
-// ---------------------------------------------------------------- verification (GitHub API)
-
-export type Verification = { status: 'ok' | 'invalid' | 'unverified'; detail: string; login?: string };
-
-/**
- * Checks the token against the GitHub API (repository endpoint when the remote is on GitHub, else
- * /user). The token travels only in the Authorization header; details never include it.
- */
-export async function verifyGithubToken(token: string, opts: { remoteUrl?: string | null; fetch?: Fetch; timeoutMs?: number } = {}): Promise<Verification> {
-  const f = opts.fetch ?? fetch;
-  const repo = githubRepoFromRemote(opts.remoteUrl);
-  const url = repo ? `https://api.github.com/repos/${repo.owner}/${repo.repo}` : 'https://api.github.com/user';
-  let res: Response;
-  try {
-    res = await f(url, {
-      headers: {
-        Authorization: `Bearer ${token}`, Accept: 'application/vnd.github+json',
-        'X-GitHub-Api-Version': '2022-11-28', 'User-Agent': 'minions-cli',
-      },
-      signal: AbortSignal.timeout(opts.timeoutMs ?? 15_000),
-    });
-  } catch (e) {
-    return { status: 'unverified', detail: `could not reach the GitHub API: ${redact(String((e as Error).message ?? e)).slice(0, 200)}` };
-  }
-  if (res.status === 401) return { status: 'invalid', detail: 'rejected by GitHub (expired, revoked, or mistyped)' };
-  if (res.status === 403 || res.status === 404) {
-    return { status: 'invalid', detail: repo ? `token cannot access ${repo.owner}/${repo.repo} (grant it repository access)` : `GitHub returned ${res.status}` };
-  }
-  if (!res.ok) return { status: 'unverified', detail: `GitHub API returned ${res.status}` };
-  const body = await res.json().catch(() => ({})) as { login?: string; full_name?: string; permissions?: { push?: boolean } };
-  if (repo) {
-    const push = body.permissions?.push;
-    return { status: 'ok', detail: `access to ${body.full_name ?? `${repo.owner}/${repo.repo}`}${push === false ? ' (read-only: Contents write permission missing)' : ''}` };
-  }
-  return { status: 'ok', detail: `authenticated${body.login ? ` as ${body.login}` : ''}`, ...(body.login ? { login: body.login } : {}) };
-}
-
 // ---------------------------------------------------------------- provisioning
 
 const isInside = (child: string, parent: string) => {
   const r = relative(parent, child);
   return !!r && r !== '..' && !r.startsWith('..' + sep) && !r.startsWith(sep);
 };
-
-export interface ProvisionOptions extends StoreOptions {
-  projectId: string;
-  token: string;
-  repoPath: string;
-  remoteUrl?: string | null;
-  verify?: boolean;
-  fetch?: Fetch;
-  store?: SecretStore;
-}
-export interface ProvisionResult {
-  projectId: string;
-  backend: Backend;
-  ref: string;
-  kind: GithubCredentialRef['kind'];
-  verification: Verification | null;
-  warnings: string[];
-}
 
 function assertOutsideRepo(projectId: string, repoPath: string): void {
   for (const p of [credentialStoreDir(), projectPaths(projectId).dir]) {
@@ -628,30 +519,8 @@ function assertOutsideRepo(projectId: string, repoPath: string): void {
   }
 }
 
-/** Validates, optionally verifies (an invalid token is not stored), stores, and records the reference. */
-export async function provisionGithubToken(opts: ProvisionOptions): Promise<ProvisionResult> {
-  const runner = opts.runner ?? run;
-  const { token, fineGrained } = checkTokenFormat(opts.token);
-  const warnings: string[] = [];
-  if (!fineGrained) warnings.push('This is a classic token; a fine-grained token limited to this repository is recommended.');
-  assertOutsideRepo(opts.projectId, opts.repoPath);
-  let verification: Verification | null = null;
-  if (opts.verify !== false) {
-    verification = await verifyGithubToken(token, { remoteUrl: opts.remoteUrl, fetch: opts.fetch });
-    if (verification.status === 'invalid') {
-      throw new MinionsError('AUTH_REQUIRED', `GitHub token not stored: ${verification.detail}.`, githubTokenGuidance(opts.remoteUrl).join('\n'));
-    }
-    if (verification.status === 'unverified') warnings.push(`Token stored without verification: ${verification.detail}.`);
-  }
-  const { backend, ref } = await storeToken(opts, GITHUB_CREDENTIAL, token, runner);
-  const entry: GithubCredentialRef = { backend, ref, kind: fineGrained ? 'fine-grained-pat' : 'classic-pat', updatedAt: new Date().toISOString() };
-  const refs = await loadCredentialRefs(opts.projectId);
-  await saveCredentialRefs(opts.projectId, { ...refs, github: entry });
-  return { projectId: opts.projectId, backend, ref, kind: entry.kind, verification, warnings };
-}
-
 /** Stores the token in the selected backend and deletes a copy left in a previous backend. */
-async function storeToken(opts: ProvisionOptions | TelegramProvisionOptions | CodexProvisionOptions | ClaudeHeadlessProvisionOptions, kind: CredentialKind, token: string, runner: Runner): Promise<{ backend: Backend; ref: string }> {
+async function storeToken(opts: TelegramProvisionOptions | CodexProvisionOptions | ClaudeHeadlessProvisionOptions, kind: CredentialKind, token: string, runner: Runner): Promise<{ backend: Backend; ref: string }> {
   const store = opts.store ?? await selectStore({ ...opts, runner, kind });
   const prev = (await loadCredentialRefs(opts.projectId))[kind.name];
   await store.set(opts.projectId, token);
@@ -666,11 +535,6 @@ export async function readToken(projectId: string, kind: CredentialKind, runner:
   return storeFor(ref.backend, runner, kind).get(projectId);
 }
 
-/** Reads the stored GitHub token (host only). Null when none is provisioned. */
-export async function readGithubToken(projectId: string, runner: Runner = run): Promise<string | null> {
-  return readToken(projectId, GITHUB_CREDENTIAL, runner);
-}
-
 /** Deletes the stored token of one kind, its reference, and its materialized copy. */
 export async function removeToken(projectId: string, kind: CredentialKind, runner: Runner = run): Promise<{ removed: boolean; backend: Backend | null }> {
   const refs = await loadCredentialRefs(projectId);
@@ -683,11 +547,6 @@ export async function removeToken(projectId: string, kind: CredentialKind, runne
     await saveCredentialRefs(projectId, rest);
   }
   return { removed: !!ref, backend: ref?.backend ?? null };
-}
-
-/** Deletes the stored GitHub token, its reference, and any materialized copy. */
-export async function removeGithubToken(projectId: string, runner: Runner = run): Promise<{ removed: boolean; backend: Backend | null }> {
-  return removeToken(projectId, GITHUB_CREDENTIAL, runner);
 }
 
 // ---------------------------------------------------------------- Telegram provisioning
@@ -1063,7 +922,8 @@ export type Materialized = Record<CredentialKind['name'], boolean>;
  */
 export async function materializeSecrets(projectId: string, runner: Runner = run, access: SecretsAccess = probeSecretsAccess()): Promise<Materialized> {
   await prepareSecretsDir(projectPaths(projectId).secretsDir, access);
-  const out = { github: false, telegram: false, codex: false, claude: false } as Materialized;
+  const out = { telegram: false, codex: false, claude: false } as Materialized;
+  for (const f of LEGACY_SECRET_FILES) await rm(join(projectPaths(projectId).secretsDir, f), { force: true });
   let failure: unknown;
   for (const kind of CREDENTIAL_KINDS) {
     const file = secretFile(projectId, kind);
@@ -1080,6 +940,7 @@ export async function materializeSecrets(projectId: string, runner: Runner = run
 /** Removes materialized secrets (container stopped / uninstall). Keeps the directory for the mount. */
 export async function clearSecrets(projectId: string): Promise<void> {
   for (const kind of CREDENTIAL_KINDS) await rm(secretFile(projectId, kind), { force: true });
+  for (const f of LEGACY_SECRET_FILES) await rm(join(projectPaths(projectId).secretsDir, f), { force: true });
 }
 
 // ---------------------------------------------------------------- status (doctor)
@@ -1090,31 +951,6 @@ export interface CredentialStatus { state: CredentialState; detail: string; back
 async function fileModeProblem(kind: StoreKind, projectId: string): Promise<string | null> {
   const mode = (await stat(new FileStore(kind).path(projectId))).mode & 0o777;
   return mode & 0o077 ? `token file mode is ${mode.toString(8)} (expected 600)` : null;
-}
-
-export async function githubCredentialStatus(project: { projectId: string; remoteUrl: string | null }, opts: { runner?: Runner; fetch?: Fetch } = {}): Promise<CredentialStatus> {
-  const runner = opts.runner ?? run;
-  let refs: CredentialsJson;
-  try { refs = await loadCredentialRefs(project.projectId); } catch (e) {
-    return { state: 'invalid', detail: `credential reference file is invalid: ${redact((e as Error).message).split('\n')[0]}` };
-  }
-  const ref = refs.github;
-  if (!ref) return { state: 'missing', detail: 'no GitHub token provisioned' };
-  let token: string | null;
-  try { token = await storeFor(ref.backend, runner).get(project.projectId); } catch (e) {
-    return { state: 'invalid', backend: ref.backend, detail: redact((e as Error).message) };
-  }
-  if (!token) return { state: 'missing', backend: ref.backend, detail: `reference ${ref.ref} exists but the token is gone` };
-  const problems: string[] = [];
-  if (ref.backend === 'file') {
-    const p = await fileModeProblem(GITHUB_CREDENTIAL, project.projectId);
-    if (p) problems.push(p);
-  }
-  const v = await verifyGithubToken(token, { remoteUrl: project.remoteUrl, fetch: opts.fetch });
-  const where = shortWhere(ref.backend);
-  if (v.status === 'invalid') return { state: 'invalid', backend: ref.backend, detail: `${v.detail} (stored in ${where})` };
-  if (v.status === 'unverified') return { state: 'unverified', backend: ref.backend, detail: `stored in ${where}; ${v.detail}` };
-  return { state: problems.length ? 'invalid' : 'ok', backend: ref.backend, detail: [`${v.detail}; stored in ${where}`, ...problems].join('; ') };
 }
 
 export interface TelegramCredentialStatus extends CredentialStatus { botId?: string; sharedWith?: string[] }

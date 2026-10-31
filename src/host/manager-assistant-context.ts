@@ -42,7 +42,7 @@ export const TYPED_ONLY = [
 
 /** What the chat cannot do at all, with the host terminal command instead. */
 export const OUT_OF_REACH = [
-  'secrets and tokens (GitHub, Telegram, Codex): `minions auth github`, `minions auth telegram`, `minions auth codex` in a terminal on the host; never paste a secret into the chat',
+  'secrets and tokens (Telegram, Codex): `minions auth telegram`, `minions auth codex` in a terminal on the host; never paste a secret into the chat',
   'pairing the bots, the manager token and the assistant token: `minions setup` on the host',
   'switching the assistant on or off: the typed /assistant command, or `minions setup`',
   'removing minions: `minions uninstall` on the host',

@@ -7,7 +7,7 @@ import { buildProgram } from '../src/program.js';
 import { generatePlugin } from '../src/plugin/generate.js';
 import { PROFILES } from '../src/config/schema.js';
 import {
-  ADVANCED_COMMANDS, INTERNAL_COMMANDS, PRIMARY_COMMANDS, UNLISTED_COMMANDS, surfaceListing, tierOf,
+  ADVANCED_COMMANDS, INTERNAL_COMMANDS, PRIMARY_COMMANDS, surfaceListing, tierOf,
 } from '../src/surface.js';
 import { defaults } from './helpers.js';
 
@@ -88,7 +88,7 @@ describe('CLI surface (docs/design/cli-surface.md)', () => {
     expect(PRIMARY_COMMANDS.length).toBeGreaterThanOrEqual(5);
     expect(PRIMARY_COMMANDS.length).toBeLessThanOrEqual(7);
     expect(help).not.toMatch(/Advanced commands:|Internal commands/);
-    for (const name of [...ADVANCED_COMMANDS, ...INTERNAL_COMMANDS, ...UNLISTED_COMMANDS]) {
+    for (const name of [...ADVANCED_COMMANDS, ...INTERNAL_COMMANDS]) {
       expect(help).not.toMatch(new RegExp(`^ {2}${name}\\b`, 'm'));
     }
   });
@@ -98,7 +98,7 @@ describe('CLI surface (docs/design/cli-surface.md)', () => {
     const names = program.commands.map((c) => c.name()).filter((n) => n !== 'help');
     const unclassified = names.filter((n) => tierOf(n) === undefined);
     expect(unclassified, 'new top-level commands need an explicit tier in src/surface.ts').toEqual([]);
-    const tiers = [PRIMARY_COMMANDS, ADVANCED_COMMANDS, INTERNAL_COMMANDS, UNLISTED_COMMANDS].flat() as string[];
+    const tiers = [PRIMARY_COMMANDS, ADVANCED_COMMANDS, INTERNAL_COMMANDS].flat() as string[];
     expect(new Set(tiers).size).toBe(tiers.length);
     expect([...tiers].sort()).toEqual([...names].sort());
   });
@@ -137,7 +137,7 @@ describe('CLI surface (docs/design/cli-surface.md)', () => {
       [['coordinator', '--help'], ['run', 'sync', 'restart']],
       [['manager', '--help'], ['run']],
       [['workspace', '--help'], ['setup', 'import', 'export']],
-      [['auth', '--help'], ['show', 'set', 'refresh', 'github', 'telegram', 'codex']],
+      [['auth', '--help'], ['show', 'set', 'refresh', 'telegram', 'codex']],
       [['help', 'work'], ['claim', 'record']],
     ] as const) {
       const { out, code } = await run([...args]);
@@ -271,7 +271,7 @@ describe('back-compat: every `minions ...` call shipped to agents, hooks and ins
     check(found, 'the generated plugin');
   });
 
-  it('install.sh, the setup and manager assistant templates and the container scripts', async () => {
+  it('install.sh and the setup and manager assistant templates', async () => {
     const install = invocations(await readFile(join(root, 'install.sh'), 'utf8'), { shell: true });
     expect(install).toContainEqual(['setup']);
     check(install, 'install.sh');
@@ -280,6 +280,5 @@ describe('back-compat: every `minions ...` call shipped to agents, hooks and ins
     const managerAssistant = (await textFiles(join(root, 'templates', 'manager-assistant'))).flatMap((t) => invocations(t));
     expect(managerAssistant.length).toBeGreaterThan(0);
     check(managerAssistant, 'templates/manager-assistant');
-    check(invocations(await readFile(join(root, 'docker', 'gh-wrapper.sh'), 'utf8')), 'docker/gh-wrapper.sh');
   });
 });

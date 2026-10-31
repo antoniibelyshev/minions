@@ -286,7 +286,7 @@ describe('loosening and code-execution plans keep the offer and the double tap',
     const m = new M.HostManager({ ...s.deps, approveOnHost: approve });
     const r = await m.submit(null, { kind: 'approve', taskId: 'task-12', head: 'a'.repeat(40), merge: false }, { key: `telegram:${ACCESS.botId}:${OWNER}:5` });
     expect(r.status).toBe('offered');
-    expect(r.status === 'offered' && r.offer.loosens).toMatch(/signs a publication approval/);
+    expect(r.status === 'offered' && r.offer.loosens).toMatch(/signs a merge approval/);
     expect(approve).not.toHaveBeenCalled();
     expect(journal().map((e) => e.type)).toEqual(['offer']);
   });

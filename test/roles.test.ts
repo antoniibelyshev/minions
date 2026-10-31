@@ -75,7 +75,7 @@ describe('role registry', () => {
     const cfg = withRoles({ engineer: { promptAppend: 'Use pnpm.', model: 'opus', effort: 'high', maxTurns: 50, tools: ['Read', 'Bash'], deepEffort: 'max' }, reviewer: { prompt: 'agents/review-notes.md' } });
     expect(workerRole(cfg, 'engineer')).toMatchObject({ builtin: true, contract: 'producer', model: 'opus', effort: 'high', maxTurns: 50, tools: ['Read', 'Bash'], promptText: 'Use pnpm.' });
     expect(workerRole(cfg, 'reviewer')).toMatchObject({ contract: 'gate', prompt: 'agents/review-notes.md' });
-    for (const field of [{ contract: 'gate' }, { stageStatus: 'testing' }, { capabilities: { 'pr.merge': 'allow' } }, { description: 'x' }]) {
+    for (const field of [{ contract: 'gate' }, { stageStatus: 'testing' }, { capabilities: { 'base.merge': 'allow' } }, { description: 'x' }]) {
       expect(issuesOf(() => withRoles({ tester: field })), JSON.stringify(field)).toContain('roles.tester');
     }
     expect(issuesOf(() => withRoles({ tester: { deepEffort: 'high' } }))).toContain('roles.tester');
@@ -99,9 +99,9 @@ describe('role registry', () => {
 
   it('validates capability sub-rule roles against the registry', () => {
     const d = defaults();
-    const rule = (role: string) => ({ ...d.capabilities, 'pr.review': { effect: 'allow' as const, rules: [{ effect: 'deny' as const, roles: [role] }] } });
+    const rule = (role: string) => ({ ...d.capabilities, 'infrastructure.edit': { effect: 'allow' as const, rules: [{ effect: 'deny' as const, roles: [role] }] } });
     expect(issuesOf(() => validateConfig({ ...d, capabilities: rule('researcher') }))).toContain('unknown role \\"researcher\\"');
-    expect(can(withRoles({ researcher }, { capabilities: rule('researcher') }), 'pr.review', { role: 'researcher' })).toBe('deny');
+    expect(can(withRoles({ researcher }, { capabilities: rule('researcher') }), 'infrastructure.edit', { role: 'researcher' })).toBe('deny');
     expect(() => validateConfig({ ...d, capabilities: rule('coordinator') })).not.toThrow();
   });
 });
@@ -141,7 +141,7 @@ describe('policy columns', () => {
 
   it('gives project roles the base effect, D8 default denies and edits/commits-derived columns', () => {
     const cfg = withRoles({ researcher, judge: { description: 'j', promptText: 'x', contract: 'gate' } });
-    expect(CUSTOM_ROLE_DENY_BY_DEFAULT).toEqual(['external.read', 'external.comment', 'external.changeStatus', 'external.create', 'pr.merge', 'base.merge', 'ci.edit', 'infrastructure.edit', 'deploy.execute']);
+    expect(CUSTOM_ROLE_DENY_BY_DEFAULT).toEqual(['external.read', 'external.comment', 'external.changeStatus', 'external.create', 'base.merge', 'ci.edit', 'infrastructure.edit', 'deploy.execute']);
     for (const c of CUSTOM_ROLE_DENY_BY_DEFAULT) expect(can(cfg, c, { role: 'researcher' }), c).toBe('deny');
     expect(can(cfg, 'task.read', { role: 'researcher' })).toBe('allow');
     expect(can(cfg, 'network.use', { role: 'researcher' })).toBe('allow');
@@ -150,24 +150,24 @@ describe('policy columns', () => {
     expect(can(cfg, 'code.edit', { role: 'judge' })).toBe('deny');
     expect(can(cfg, 'git.commit', { role: 'judge' })).toBe('deny');
     // Built-in columns are untouched by project roles.
-    expect(can(cfg, 'pr.merge', { role: 'engineer' })).toBe(can(defaults(), 'pr.merge', { role: 'engineer' }));
+    expect(can(cfg, 'base.merge', { role: 'engineer' })).toBe(can(defaults(), 'base.merge', { role: 'engineer' }));
   });
 
   it('applies explicit column entries like hand-written sub-rules; a base deny still wins', () => {
-    const cfg = withRoles({ researcher: { ...researcher, capabilities: { 'pr.review': 'deny', 'external.read': 'allow', 'pr.merge': 'allow', 'deploy.execute': 'allow', 'code.edit': 'allow' } },
+    const cfg = withRoles({ researcher: { ...researcher, capabilities: { 'infrastructure.edit': 'deny', 'external.read': 'allow', 'base.merge': 'allow', 'deploy.execute': 'allow', 'code.edit': 'allow' } },
       notes: { description: 'n', promptText: 'x', contract: 'producer', capabilities: { 'code.edit': 'allow' } } });
-    expect(can(cfg, 'pr.review', { role: 'researcher' })).toBe('deny');
+    expect(can(cfg, 'infrastructure.edit', { role: 'researcher' })).toBe('deny');
     expect(can(cfg, 'external.read', { role: 'researcher' })).toBe('allow');
-    expect(can(cfg, 'pr.merge', { role: 'researcher' })).toBe('allow');
-    expect(can(cfg, 'pr.merge', { role: 'researcher', paths: ['.github/workflows/ci.yml'] })).toBe('ask');
+    expect(can(cfg, 'base.merge', { role: 'researcher' })).toBe('allow');
+    expect(can(cfg, 'base.merge', { role: 'researcher', paths: ['.github/workflows/ci.yml'] })).toBe('ask');
     expect(can(cfg, 'deploy.execute', { role: 'researcher' })).toBe('deny');
     // edits: none keeps code.edit denied even when the column says allow.
     expect(can(cfg, 'code.edit', { role: 'notes' })).toBe('deny');
   });
 
   it('a local layer cannot lift a project role column deny', () => {
-    const project = { roles: { researcher: { ...researcher, capabilities: { 'pr.review': 'deny' } } } };
-    const e = fail(() => resolve({ defaults: defaults(), project, local: { roles: { researcher: { capabilities: { 'pr.review': 'allow' } } } } }));
+    const project = { roles: { researcher: { ...researcher, capabilities: { 'infrastructure.edit': 'deny' } } } };
+    const e = fail(() => resolve({ defaults: defaults(), project, local: { roles: { researcher: { capabilities: { 'infrastructure.edit': 'allow' } } } } }));
     expect(e.code).toBe('POLICY_DENIED');
     expect(e.message).toContain('roles.researcher');
     expect(() => resolve({ defaults: defaults(), project, local: { roles: { researcher: { maxTurns: 10 } } } })).not.toThrow();
@@ -175,8 +175,8 @@ describe('policy columns', () => {
 
   it('a local layer cannot lift a project capability deny even when roles are configured', () => {
     const d = defaults();
-    const project = { roles: { researcher }, capabilities: { 'pr.review': 'deny' } };
-    expect(fail(() => resolve({ defaults: d, project, local: { capabilities: { 'pr.review': 'allow' } } })).code).toBe('POLICY_DENIED');
+    const project = { roles: { researcher }, capabilities: { 'infrastructure.edit': 'deny' } };
+    expect(fail(() => resolve({ defaults: d, project, local: { capabilities: { 'infrastructure.edit': 'allow' } } })).code).toBe('POLICY_DENIED');
     const roleDeny = { roles: { researcher: { ...researcher, capabilities: { 'external.read': 'deny' } } } };
     const e2 = fail(() => resolve({ defaults: d, project: roleDeny, local: { roles: { researcher: { capabilities: { 'external.read': 'allow' } } } } }));
     expect(e2.code).toBe('POLICY_DENIED');
@@ -189,7 +189,7 @@ describe('policy columns', () => {
     const table = renderCapabilityTable(cfg).split('\n');
     expect(table[0]).toBe('| Capability | coordinator | engineer | tester | reviewer | researcher | Path rules |');
     expect(table[1]).toBe('| - | - | - | - | - | - | - |');
-    expect(table.find((l) => l.startsWith('| pr.merge |'))).toBe('| pr.merge | ask | ask | ask | ask | deny |  |');
+    expect(table.find((l) => l.startsWith('| base.merge |'))).toBe('| base.merge | allow | allow | allow | allow | deny |  |');
   });
 });
 

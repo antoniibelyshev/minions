@@ -567,41 +567,6 @@ describe('file hand-off templates render completely (task-9 edge cases)', () => 
   });
 });
 
-describe('coordinator prompt: origin/<base> as the single source of truth', () => {
-  it('GitHub delivery forbids local base merges and explains the pre-claim sync; local delivery does not', async () => {
-    for (const mode of ['branch', 'pull-request'] as const) {
-      const cfg = defaults();
-      cfg.delivery.mode = mode;
-      cfg.delivery.provider = 'github';
-      const md = await (await gen(cfg)).read('coordinator.md');
-      expect(md).toContain('`origin/main` is the single source of truth');
-      expect(md).toMatch(/never merge, rebase, cherry-pick or commit into the local `main`/);
-      expect(md).toMatch(/Every `minions work claim` first fetches origin and fast-forwards `main`/);
-      expect(md).toMatch(/do not repair it by merging or resetting yourself/);
-    }
-    const local = await (await gen(defaults())).read('coordinator.md');
-    expect(local).not.toContain('single source of truth');
-    expect(local).not.toContain('CI-gated auto-merge is on');
-    expect(local).toContain('the user fetches branches with `minions export` on the host');
-  });
-});
-
-describe('coordinator prompt: CI-gated auto-merge (task-1.9)', () => {
-  it('explains merge states and the host-signed --merge approval only when auto-merge is on', async () => {
-    const cfg = defaults();
-    Object.assign(cfg.delivery, { mode: 'pull-request', provider: 'github' });
-    const off = await (await gen(cfg)).read('coordinator.md');
-    expect(off).toContain('minions never merges pull requests');
-    expect(off).not.toContain('--merge');
-    cfg.delivery.merge = 'auto-when-eligible';
-    const on = await (await gen(cfg)).read('coordinator.md');
-    expect(on).toContain('CI-gated auto-merge is on');
-    expect(on).toContain('minions work approve <taskId> --head <sha> --merge');
-    expect(on).toMatch(/You never run `gh pr merge`/);
-    expect(on).not.toContain('minions never merges pull requests');
-  });
-});
-
 describe('owner behaviour defaults (task-34)', () => {
   const ownerSection = (coord: string) => coord.slice(coord.indexOf('## Owner defaults'), coord.indexOf('## Communicating with the user'));
 
@@ -690,7 +655,7 @@ describe('owner behaviour defaults (task-34)', () => {
 
   it('local delivery, project-owner: verifies the merge before the base moves, then commits or aborts', async () => {
     const base = defaults('project-owner');
-    const cfg = { ...base, delivery: { ...base.delivery, mode: 'local' as const, provider: 'none' as const }, git: { ...base.git, baseBranch: 'trunk' } };
+    const cfg = { ...base, git: { ...base.git, baseBranch: 'trunk' } };
     const g = await gen(cfg);
     const coord = await g.read('coordinator.md');
     expect(coord).toContain('Then integrate each delivered branch into the local `trunk` yourself, one at a time, in `/workspace/repo` with `trunk` checked out and a clean tree');
@@ -730,19 +695,6 @@ describe('owner behaviour defaults (task-34)', () => {
     const orch = await g.read('skills/orchestrate/SKILL.md');
     expect(orch).toContain('Never merge into the local `main`: the user integrates.');
     expect(orch).not.toContain('Local delivery: then integrate');
-  });
-
-  it('GitHub delivery: never merges locally, PR merges are not the coordinator\'s', async () => {
-    for (const mode of ['branch', 'pull-request'] as const) {
-      const cfg = defaults();
-      cfg.delivery.mode = mode;
-      cfg.delivery.provider = 'github';
-      const g = await gen(cfg);
-      expect(await g.read('coordinator.md')).not.toContain('Then integrate each delivered branch');
-      const orch = await g.read('skills/orchestrate/SKILL.md');
-      expect(orch).toContain('GitHub delivery: never merge into the local `main`; changes land through pull requests');
-      expect(orch).not.toContain('Local delivery: then integrate');
-    }
   });
 
   it('paused intake: follow-ups stay exempt, QA sweep scheduling does not', async () => {
@@ -793,21 +745,20 @@ describe('own ideas rule (task-130): the coordinator promotes its own ideas free
     expect(await (await gen(c)).read('coordinator.md')).toMatch(/Move one to `ready` yourself/);
   });
 
-  it('the intake skill names no caps and mentions readyLabels', async () => {
+  it('the intake skill names no caps', async () => {
     const intake = await (await gen()).read('skills/intake/SKILL.md');
     expect(intake).not.toMatch(/auto-promotion|runtime caps/);
-    expect(intake).toContain('`intake.github.readyLabels`');
   });
 });
 
 describe('local integration prompts (task-82.4)', () => {
   const local = (profile: 'project-owner' | 'personal-work' | 'supervised', merge: 'disabled' | 'auto-when-eligible') => {
     const c = defaults(profile);
-    c.delivery = { ...c.delivery, mode: 'local', provider: 'none', merge };
+    c.delivery = { ...c.delivery, merge };
     c.verification.commands = ['npm run typecheck', 'npm test'];
     return c;
   };
-  const deliverySection = (md: string) => md.slice(md.indexOf('Delivery mode: `local`.'), md.indexOf('\n\n', md.indexOf('Never merge into, commit on')) + 1 || undefined);
+  const deliverySection = (md: string) => md.slice(md.indexOf('## Delivery'), md.indexOf('\n\n', md.indexOf('Never merge into, commit on')) + 1 || undefined);
 
   it('with local integration on, the coordinator gets no manual merge steps and never merges, commits on or resets the base', async () => {
     const g = await gen(local('project-owner', 'auto-when-eligible'));
@@ -842,16 +793,12 @@ describe('local integration prompts (task-82.4)', () => {
   });
 
   it('the `merging` lines of the drain rule, orchestrate and recover skills appear only with local integration on', async () => {
-    const pr = defaults();
-    Object.assign(pr.delivery, { mode: 'pull-request', provider: 'github', merge: 'auto-when-eligible' });
-    for (const cfg of [pr, local('project-owner', 'disabled')]) {
-      const g = await gen(cfg);
-      expect(await g.read('coordinator.md')).toContain('re-dispatch nothing, and start no local integration merge (an upgrade could interrupt a `--no-commit` merge and leave the repo mid-merge). A hook');
-      expect(await g.read('skills/orchestrate/SKILL.md')).toContain('- reviewer `approve` → `delivered` (local delivery). In branch');
-      expect(await g.read('skills/recover/SKILL.md')).not.toContain('Tasks in `merging`');
-    }
+    const off = await gen(local('project-owner', 'disabled'));
+    expect(await off.read('coordinator.md')).toContain('re-dispatch nothing, and start no local integration merge (an upgrade could interrupt a `--no-commit` merge and leave the repo mid-merge). A hook');
+    expect(await off.read('skills/orchestrate/SKILL.md')).toContain('- reviewer `approve` → `delivered` (local delivery). Local delivery: then integrate');
+    expect(await off.read('skills/recover/SKILL.md')).not.toContain('Tasks in `merging`');
     const on = await gen(local('project-owner', 'auto-when-eligible'));
-    expect(await on.read('skills/orchestrate/SKILL.md')).toContain('(local delivery; `merging` with local integration on: the runtime integrates it, no worker runs for it). In branch');
+    expect(await on.read('skills/orchestrate/SKILL.md')).toContain('(local delivery; `merging` with local integration on: the runtime integrates it, no worker runs for it). Local integration:');
     expect(await on.read('skills/recover/SKILL.md')).toMatch(/This is not a failed attempt\.\n {3}- Tasks in `merging` have no lease and no worker: the runtime's integrator owns them/);
   });
 });

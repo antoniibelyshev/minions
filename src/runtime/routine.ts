@@ -3,22 +3,18 @@
 // One deterministic pass, no model call anywhere in it:
 //   1. the routine lock (meta `routine_lock`, {pid, start}: a dead or reused pid is taken over) and the interval
 //      (at most once per half tick unless --force; the watchdog only when the last pass is older than 2 ticks);
-//   2. the full `minions sync` (intake import, PR and CI observations, merged -> done, closed -> blocked, the
-//      auto-merge pass), injected as `sync`;
-//   3. the wake decision (decideWake, a pure function) and its action: a fresh coordinator session through the
+//   2. the wake decision (decideWake, a pure function) and its action: a fresh coordinator session through the
 //      detached restart with the constant wake prompt (never with force), or the separate crash start (recover);
-//   4. a `routine` event with the counts, the decision and the reasons (`--last` reads it back).
-// With coordinator.sessions.enabled (docs/design/coordinator-sessions.md phase 7) step 3 changes: the pass opens task
+//   3. a `routine` event with the counts, the decision and the reasons (`--last` reads it back).
+// With coordinator.sessions.enabled (docs/design/coordinator-sessions.md phase 7) step 2 changes: the pass opens task
 // sessions for runnable stages (openTaskSessions, the supervisor's task session pass with the same limits) instead of
 // waking the coordinator; only the digest still wakes it. Task sessions record and decide their own results, so the
 // unvalidated, needs-split and awaiting-human reasons are not wake reasons either.
-// Every external effect (gh, git, restart, clock, process table, files) is an injected dependency, so tests run it
-// with a fake gh, a fake clock and a fake restart.
+// Every external effect (restart, clock, process table, files) is an injected dependency, so tests run it with a
+// fake clock and a fake restart.
 import { statSync } from 'node:fs';
 import type { MinionsConfig } from '../config/schema.js';
 import type { RuntimeDb, RoutineLock } from './db.js';
-import type { IntakeSyncReport } from './intake-sync.js';
-import type { SyncReport } from './ci.js';
 import type { NextReport } from './scheduler.js';
 import { lastOwnerMessageAt } from './coordinator-usage.js';
 import { TRANSCRIPT_META } from './context-reset.js';
@@ -221,29 +217,6 @@ export function collectWakeReasons(db: RuntimeDb, next: Pick<NextReport, 'runnab
 
 // ---------------------------------------------------------------- the pass
 
-export interface RoutineSyncSummary {
-  intakeCreated: number;
-  synced: number;
-  failed: number;
-  statusChanges: number;
-  merged: number;
-  armed: number;
-  errors: string[];
-}
-
-/** Counts of one `minions sync` (the routine event keeps counts, not the full report). */
-export function summarizeSync(r: SyncReport, intake: IntakeSyncReport | null): RoutineSyncSummary {
-  return {
-    intakeCreated: intake?.created.length ?? 0,
-    synced: r.synced,
-    failed: r.failed,
-    statusChanges: r.tasks.filter((t) => t.statusChange).length,
-    merged: r.tasks.filter((t) => t.merge?.merged || t.statusChange?.to === 'done').length,
-    armed: r.tasks.filter((t) => t.merge?.armed).length,
-    errors: [...(intake?.errors ?? []).map((e) => `intake: ${e}`), ...r.tasks.filter((t) => t.error).map((t) => `${t.taskId}: ${t.error}`)].map((e) => e.slice(0, 300)).slice(0, 10),
-  };
-}
-
 export interface RoutinePassDeps {
   db: RuntimeDb;
   config: MinionsConfig;
@@ -253,8 +226,6 @@ export interface RoutinePassDeps {
   procStart?: (pid: number) => string | null;
   /** Whether a routine lock holder still runs (pid alive with the recorded start time). */
   lockAlive: (l: RoutineLock) => boolean;
-  /** The full `minions sync` (intake, PR/CI observations, merged/closed, the merge pass). */
-  sync: () => Promise<RoutineSyncSummary>;
   /** `work next` (null when it fails: no runnable reasons this pass). */
   next: () => Promise<Pick<NextReport, 'runnable'> | null>;
   coordinator: () => Promise<CoordinatorView>;
@@ -288,8 +259,6 @@ export interface RoutineReport {
   nextAt: string | null;
   lastAt: string | null;
   durationMs?: number;
-  sync?: RoutineSyncSummary;
-  syncError?: string;
   /** Held notifications moved on to the next digest by the hold-back step. */
   reheld?: number;
   reasons?: WakeReason[];
@@ -343,10 +312,8 @@ export async function runRoutinePass(deps: RoutinePassDeps, opts: { trigger: Rou
   }
   try {
     const report: RoutineReport = { ...base, ran: true, why: '' };
-    try { report.sync = await deps.sync(); } catch (e) { report.syncError = msg(e); }
     // With the routine on it keeps held items for the digest; off (a manual pass), it releases them.
     if (deps.holdBack) { try { report.reheld = deps.holdBack(now); } catch { /* the hold-back never stops the pass */ } }
-    // The sync may have changed what the coordinator sees (merged, imported, CI): read the state after it.
     const c = await deps.coordinator();
     report.coordinator = coordinatorLine(c);
     const since = c.running ? coordinatorIdleSince(deps.db, c, deps.mtime) : null;
@@ -391,7 +358,7 @@ export async function runRoutinePass(deps: RoutinePassDeps, opts: { trigger: Rou
     report.durationMs = deps.now().getTime() - now.getTime();
     report.nextAt = settings.enabled ? plusMinutes(at, settings.tickMinutes) : null;
     deps.db.addEvent(ROUTINE_EVENT, null, {
-      trigger: report.trigger, durationMs: report.durationMs, sync: report.sync ?? null, syncError: report.syncError ?? null, reheld: report.reheld ?? 0,
+      trigger: report.trigger, durationMs: report.durationMs, reheld: report.reheld ?? 0,
       reasons: reasons.slice(0, 50), decision, outcome: report.outcome ?? null, coordinator: report.coordinator,
       ...(report.sessions ? { sessions: report.sessions } : {}),
     }, at);
@@ -405,7 +372,7 @@ export async function runRoutinePass(deps: RoutinePassDeps, opts: { trigger: Rou
 export interface RoutineLast {
   enabled: boolean;
   tickMinutes: number;
-  last: { at: string; trigger: string; decision: WakeDecision | null; reasons: WakeReason[]; outcome: { ok: boolean; detail: string } | null; sync: RoutineSyncSummary | null; syncError: string | null } | null;
+  last: { at: string; trigger: string; decision: WakeDecision | null; reasons: WakeReason[]; outcome: { ok: boolean; detail: string } | null } | null;
   nextAt: string | null;
   wakesToday: number;
   lastWakeAt: string | null;
@@ -414,10 +381,10 @@ export interface RoutineLast {
 export function routineLast(db: RuntimeDb, cfg: Pick<MinionsConfig, 'routine'>, now: Date = new Date()): RoutineLast {
   const s = routineSettings(cfg);
   const e = db.lastEventOfKind(ROUTINE_EVENT);
-  const d = (e?.data ?? {}) as { trigger?: string; decision?: WakeDecision; reasons?: WakeReason[]; outcome?: { ok: boolean; detail: string }; sync?: RoutineSyncSummary; syncError?: string };
+  const d = (e?.data ?? {}) as { trigger?: string; decision?: WakeDecision; reasons?: WakeReason[]; outcome?: { ok: boolean; detail: string } };
   return {
     enabled: s.enabled, tickMinutes: s.tickMinutes,
-    last: e ? { at: e.at, trigger: d.trigger ?? 'unknown', decision: d.decision ?? null, reasons: d.reasons ?? [], outcome: d.outcome ?? null, sync: d.sync ?? null, syncError: d.syncError ?? null } : null,
+    last: e ? { at: e.at, trigger: d.trigger ?? 'unknown', decision: d.decision ?? null, reasons: d.reasons ?? [], outcome: d.outcome ?? null } : null,
     nextAt: s.enabled ? (e ? plusMinutes(e.at, s.tickMinutes) : now.toISOString()) : null,
     wakesToday: db.eventsOfKindSince(WAKE_EVENT, localDayStart(now, s.timezone)).length,
     lastWakeAt: db.lastEventOfKind(WAKE_EVENT)?.at ?? null,
@@ -433,9 +400,8 @@ export function humanRoutine(r: RoutineLast): string {
 
 export function humanRoutineReport(r: RoutineReport): string {
   if (!r.ran) return `routine pass skipped (${r.skipped}): ${r.why}`;
-  const s = r.sync;
   return [
-    `routine pass (${r.trigger}) at ${r.at}: ${s ? `synced ${s.synced}, failed ${s.failed}, ${s.statusChanges} status change(s), ${s.merged} merged, ${s.armed} armed, ${s.intakeCreated} imported` : `sync failed: ${r.syncError ?? 'unknown'}`}`,
+    `routine pass (${r.trigger}) at ${r.at}`,
     `decision: ${r.decision?.action ?? 'none'} - ${r.why}${r.outcome ? ` (${r.outcome.ok ? 'scheduled' : 'refused'}: ${r.outcome.detail})` : ''}`,
     ...(r.sessions ? ['error' in r.sessions ? `task sessions: pass failed: ${r.sessions.error}` : `task sessions: opened ${r.sessions.opened.join(', ') || 'none'}; closed ${r.sessions.closed.join(', ') || 'none'}${r.sessions.refused.length ? `; not opened: ${r.sessions.refused.slice(0, 3).map((x) => `${x.taskId} (${x.why})`).join(', ')}` : ''}`] : []),
     ...(r.reasons?.length ? ['reasons:', ...r.reasons.map((x) => `  ${x.kind}: ${x.detail}`)] : []),

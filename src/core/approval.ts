@@ -1,10 +1,10 @@
-// Host-signed publication approvals (decision record: docs/design/bootstrap.md, "Host-signed
-// publication approvals").
+// Host-signed merge approvals (decision record: docs/design/bootstrap.md, "Host-signed publication approvals";
+// the local integrator uses them for base.merge "ask" and sensitive paths, docs/design/local-auto-integration.md).
 //
 // The host CLI holds an Ed25519 private key per project in the host credential store (never mounted
 // into the container, under a read deny of the host-runtime sandbox). It signs one approval per task
 // and exact head SHA. The agent runtime only has the public key (read-only runtime config dir) and
-// verifies the signature right before publishing changes that need a human approval. Anything an
+// verifies the signature right before landing changes that need a human approval. Anything an
 // in-container process can write (the SQLite approvals table, state files, CLI arguments) can at most
 // carry a token; it cannot mint one.
 //
@@ -23,12 +23,11 @@ const CLOCK_SKEW_MS = 5 * 60 * 1000;
 export const FULL_SHA_RE = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 
 /**
- * What a signed approval authorizes. `publish`: push / open the PR for the head (task-1.8). `merge`:
- * arm GitHub auto-merge for the PR at that head when `pr.merge` is "ask" (task-1.9). A token of one
- * scope never satisfies the other.
+ * What a signed approval authorizes: `merge` = the local integrator may land the head on the base. Tokens of the
+ * removed `publish` scope (GitHub publication) are refused.
  */
-export type ApprovalScope = 'publish' | 'merge';
-export const APPROVAL_SCOPES: readonly ApprovalScope[] = ['publish', 'merge'];
+export type ApprovalScope = 'merge';
+export const APPROVAL_SCOPES: readonly ApprovalScope[] = ['merge'];
 
 export interface ApprovalPayload {
   v: 1;
@@ -73,9 +72,9 @@ export function approvalKeyId(publicKeyPem: string): string {
   return createHash('sha256').update(der).digest('hex').slice(0, 16);
 }
 
-/** Signs an approval (default scope publish) for exactly (taskId, head). Host only: needs the private key. */
+/** Signs an approval for exactly (taskId, head). Host only: needs the private key. */
 export function signApproval(privateKeyPem: string, f: { taskId: string; head: string; by?: string | null; now?: Date; ttlMs?: number; scope?: ApprovalScope }): { token: string; payload: ApprovalPayload } {
-  const scope = f.scope ?? 'publish';
+  const scope = f.scope ?? 'merge';
   if (!APPROVAL_SCOPES.includes(scope)) throw new Error(`unknown approval scope ${String(scope)}`);
   if (!FULL_SHA_RE.test(f.head)) throw new Error('--head must be the full commit SHA (40 or 64 lowercase hex characters)');
   if (!f.taskId.trim()) throw new Error('task id is empty');
@@ -96,7 +95,7 @@ export function signApproval(privateKeyPem: string, f: { taskId: string; head: s
  */
 export function verifyApproval(token: string | null | undefined, publicKeyPem: string | null | undefined,
   expect: { taskId: string; head: string; now?: Date; scope?: ApprovalScope }): ApprovalCheck {
-  const scope = expect.scope ?? 'publish';
+  const scope = expect.scope ?? 'merge';
   if (!publicKeyPem) return { ok: false, reason: 'no approval public key is provisioned in this runtime (the host creates it on the first `minions work approve`)' };
   if (!token) return { ok: false, reason: 'no host-signed approval is recorded' };
   let key: KeyObject;

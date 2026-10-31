@@ -39,7 +39,7 @@ type RunOptions = import('../../src/core/exec.js').RunOptions;
 const ID = '3f2b8c1e-7d4a-4e9b-9c2f-1a2b3c4d5e6f';
 const OTHER = '9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d';
 const TOKEN = '123456789:AAHfakefakefakefakefakefakefake_-0123';
-const GH = 'github_pat_11ABCDEFG0123456789_abcdefghijklmnopqrstuvwxyzABCDEFGHIJ0123456789';
+const KEY = 'sk-proj-11ABCDEFG0123456789_abcdefghijklmnopqrstuvwxyzABCDEFGHIJ0123456789';
 
 let env: ReturnType<typeof withHome>;
 let prevStore: string | undefined;
@@ -78,7 +78,7 @@ describe('bot token format', () => {
 
   it('rejects anything that could break out of a keychain line or environment, before any store call', async () => {
     const hostile = ['', 'hunter2', `${TOKEN} -w x`, `${TOKEN}\nadd-generic-password -s evil`, `${TOKEN}"`, `${TOKEN};id`, `${TOKEN}$(id)`,
-      '12:AAHfakefakefakefakefakefakefake_-0123', `123456789:${'a'.repeat(10)}`, GH];
+      '12:AAHfakefakefakefakefakefakefake_-0123', `123456789:${'a'.repeat(10)}`, KEY];
     const { calls, runner } = recorder();
     const ks = new C.KeychainStore(runner, C.TELEGRAM_CREDENTIAL);
     for (const t of hostile) {
@@ -98,36 +98,36 @@ describe('bot token format', () => {
 });
 
 describe('provisioning through the shared credential mechanism', () => {
-  it('file store: 0600 token file separate from the GitHub token; reference holds only the bot id', async () => {
+  it('file store: 0600 token file separate from the Codex key; reference holds only the bot id', async () => {
     const repo = makeRepo(env.root);
-    await C.provisionGithubToken({ projectId: ID, token: GH, repoPath: repo, verify: false });
+    await C.provisionCodexKey({ projectId: ID, token: KEY, repoPath: repo });
     const r = await C.provisionTelegramToken({ projectId: ID, token: TOKEN, repoPath: repo });
     expect(r).toMatchObject({ backend: 'file', botId: '123456789', verification: null, sharedWith: [], warnings: [] });
     const file = new C.FileStore(C.TELEGRAM_CREDENTIAL).path(ID);
-    expect(file).not.toBe(new C.FileStore().path(ID));
+    expect(file).not.toBe(new C.FileStore(C.CODEX_CREDENTIAL).path(ID));
     expect(readFileSync(file, 'utf8')).toBe(TOKEN + '\n');
     expect(mode(file)).toBe(0o600);
     const refText = readFileSync(projectPaths(ID).credentialsJson, 'utf8');
     expect(refText).not.toContain(TOKEN);
-    expect(JSON.parse(refText)).toMatchObject({ github: { backend: 'file' }, telegram: { backend: 'file', botId: '123456789', ref: `file:${file}` } });
+    expect(JSON.parse(refText)).toMatchObject({ codex: { backend: 'file' }, telegram: { backend: 'file', botId: '123456789', ref: `file:${file}` } });
     expect(JSON.stringify(r)).not.toContain(TOKEN);
     for (const p of allFiles(repo)) expect(readFileSync(p, 'utf8')).not.toContain(TOKEN);
 
-    // Materialized next to the GitHub token in the read-only mounted dir.
-    expect(await C.materializeSecrets(ID)).toEqual({ github: true, telegram: true, codex: false, claude: false });
+    // Materialized next to the Codex key in the read-only mounted dir.
+    expect(await C.materializeSecrets(ID)).toEqual({ telegram: true, codex: true, claude: false });
     expect(readFileSync(projectPaths(ID).telegramTokenFile, 'utf8')).toBe(TOKEN + '\n');
     expect(mode(projectPaths(ID).telegramTokenFile)).toBe(0o600);
     expect(CONTAINER.telegramTokenFile).toBe('/opt/minions/secrets/telegram-bot-token');
 
-    // Removing the Telegram token leaves the GitHub token alone.
+    // Removing the Telegram token leaves the Codex key alone.
     expect(await C.removeTelegramToken(ID)).toEqual({ removed: true, backend: 'file' });
     expect(existsSync(file)).toBe(false);
     expect(existsSync(projectPaths(ID).telegramTokenFile)).toBe(false);
-    expect(existsSync(projectPaths(ID).githubTokenFile)).toBe(true);
-    expect(await C.readGithubToken(ID)).toBe(GH);
-    expect(await C.materializeSecrets(ID)).toEqual({ github: true, telegram: false, codex: false, claude: false });
+    expect(existsSync(projectPaths(ID).codexKeyFile)).toBe(true);
+    expect(await C.readCodexKey(ID)).toBe(KEY);
+    expect(await C.materializeSecrets(ID)).toEqual({ telegram: false, codex: true, claude: false });
     await C.clearSecrets(ID);
-    expect(existsSync(projectPaths(ID).githubTokenFile)).toBe(false);
+    expect(existsSync(projectPaths(ID).codexKeyFile)).toBe(false);
   });
 
   it('keychain: own service name; the token goes through stdin, never argv', async () => {
@@ -232,7 +232,7 @@ describe('wizard', () => {
   it('falls back to terminal with a clear reason when Telegram cannot work (network none)', async () => {
     const repo = makeRepo(env.root);
     const { profileDefaults } = await import('../../src/config/profiles.js');
-    const existing = profileDefaults('project-owner', { hasGitHub: false, baseBranch: 'main', identity: { name: 'A', email: 'a@b' }, projectId: ID, packageVersion: '0.1.0' }).config;
+    const existing = profileDefaults('project-owner', { baseBranch: 'main', identity: { name: 'A', email: 'a@b' }, projectId: ID, packageVersion: '0.1.0' }).config;
     existing.container.network = 'none';
     const a = answering({ 'Communication channel': 'telegram' });
     const r = await runWizard({ discovery: await discover(repo), projectId: ID, yes: false, io: a.io, existing });

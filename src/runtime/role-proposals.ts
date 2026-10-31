@@ -135,7 +135,7 @@ export interface ProposalSummary {
   requires: Capability[];
   /** The role's effective policy column: capabilities that are not `allow`. */
   policy: { deny: Capability[]; ask: Capability[] };
-  /** Capabilities the role gets with a looser effect than the active profile's (e.g. pr.merge ask -> allow). */
+  /** Capabilities the role gets with a looser effect than the active profile's (e.g. base.merge ask -> allow). */
   loosens: { capability: Capability; profile: Effect; proposed: Effect }[];
   workflows: { name: string; stages: string[]; change: 'add' | 'change' }[];
   promptBytes: number;

@@ -66,7 +66,7 @@ export function parseEnvelope<T>(stdout: string, what: string): T {
   return env.data as T;
 }
 
-export interface ImportResult { bundle: string; commit: string; baseBranch: string; warnings: string[]; container: { head?: string; base?: string; imported?: boolean; origin?: { url: string; authenticated: boolean; fetched: boolean; warnings: string[] } } }
+export interface ImportResult { bundle: string; commit: string; baseBranch: string; warnings: string[]; container: { head?: string; base?: string; imported?: boolean } }
 
 export async function importRepo(project: ProjectJson, opts: { runner?: Runner; repoPath?: string; compose?: Compose; target?: TransferTarget } = {}): Promise<ImportResult> {
   const runner = opts.runner ?? run;
@@ -103,10 +103,7 @@ export async function importRepo(project: ProjectJson, opts: { runner?: Runner; 
   } finally {
     await rm(tmp, { recursive: true, force: true });
   }
-  const args = ['minions', 'workspace', 'import', `${target.dirs.import}/${file}`, '--base', base];
-  if (project.remoteUrl) args.push('--remote-url', project.remoteUrl);
-  args.push('--json');
-  const r = await target.exec(args, { allowFailure: true, timeoutMs: 600_000 });
+  const r = await target.exec(['minions', 'workspace', 'import', `${target.dirs.import}/${file}`, '--base', base, '--json'], { allowFailure: true, timeoutMs: 600_000 });
   const data = parseEnvelope<ImportResult['container']>(r.stdout, 'workspace import');
   return { bundle: file, commit, baseBranch: base, warnings, container: data ?? {} };
 }

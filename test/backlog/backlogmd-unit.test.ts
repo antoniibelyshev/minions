@@ -5,9 +5,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { BacklogMdAdapter, composeDescription, parseDescription, replaceMeta } from '../../src/backlog/backlogmd.js';
-import { BACKLOG_CONFIG_YML, MemoryIdempotencyStore, openBacklog, writeBacklogConfig } from '../../src/backlog/factory.js';
+import { BACKLOG_CONFIG_YML, MemoryIdempotencyStore, writeBacklogConfig } from '../../src/backlog/factory.js';
 import { MinionsError } from '../../src/core/errors.js';
-import { defaults } from '../helpers.js';
 
 const code = async (p: Promise<unknown>) => {
   try { await p; } catch (e) { return e instanceof MinionsError ? e : undefined; }
@@ -60,13 +59,6 @@ describe('meta block', () => {
 });
 
 describe('factory', () => {
-  it('rejects deferred backends', () => {
-    const cfg = defaults();
-    const e = (() => { try { openBacklog({ ...cfg, backlog: { ...cfg.backlog, backend: 'github' } }, { idempotency: new MemoryIdempotencyStore() }); } catch (err) { return err as MinionsError; } })();
-    expect(e?.code).toBe('INCOMPATIBLE_RUNTIME');
-    expect(e?.message).toMatch(/deferred in v0\.1/);
-  });
-
   it('writes config.yml idempotently with done last', async () => {
     const root = mkdtempSync(join(tmpdir(), 'minions-blcfg-'));
     try {

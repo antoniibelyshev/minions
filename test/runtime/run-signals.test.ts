@@ -1,10 +1,7 @@
-// task-39 tester: gaps around run() signal handling and the provenance fallback hook. No live /state.
+// task-39 tester: gaps around run() signal handling. No live /state.
 import { getEventListeners } from 'node:events';
 import { describe, expect, it } from 'vitest';
-import { toTask } from '../../src/backlog/backlogmd.js';
 import { run } from '../../src/core/exec.js';
-import { INTAKE_STATE_META, intakeKey, intakeProvenanceFallback } from '../../src/runtime/intake-sync.js';
-import { makeDefaultEnv } from './fixtures.js';
 
 const HANG = ['-e', 'setTimeout(()=>{}, 10000)'];
 
@@ -59,41 +56,5 @@ describe('run(): signal listeners and abort/timeout interplay', () => {
     expect('aborted' in r).toBe(false);
     const f = await run('node', ['-e', 'process.stderr.write("e"); process.exit(2)'], { allowFailure: true });
     expect(f).toEqual({ code: 2, stdout: '', stderr: 'e' });
-  });
-});
-
-describe('provenance fallback hook: cost', () => {
-  it('only consults the DB for tasks without a usable meta provenance', () => {
-    let calls = 0;
-    const fallback = (id: string) => { calls++; return id === 'task-1' ? 'external-requirement' as const : undefined; };
-    const good = { id: 'TASK-1', description: 'B\n\n<!-- minions:meta {"provenance":"user-decision"} -->' };
-    for (let i = 0; i < 50; i++) toTask(good, { provenanceFallback: fallback });
-    expect(calls).toBe(0);
-    toTask({ id: 'TASK-1', description: 'no meta' }, { provenanceFallback: fallback });
-    expect(calls).toBe(1);
-  });
-
-  it('stays cheap with a large sync record and many meta-less tasks', () => {
-    const e = makeDefaultEnv();
-    const issues: Record<string, unknown> = {};
-    for (let n = 1; n <= 1000; n++) {
-      issues[intakeKey('acme/demo', n)] = { taskId: `task-${n}`, url: `https://github.com/acme/demo/issues/${n}`, repository: 'acme/demo', number: n, assignees: [], inFilter: true, lastSeenAt: 'x' };
-    }
-    e.db.setMeta(INTAKE_STATE_META, JSON.stringify({ version: 1, issues }));
-    const fallback = intakeProvenanceFallback(() => e.db);
-    const t = Date.now();
-    for (let i = 1; i <= 500; i++) expect(toTask({ id: `TASK-${i}`, description: 'x' }, { provenanceFallback: fallback }).provenance).toBe('external-requirement');
-    // Generous bound: 500 meta reads + parses of a 1000-entry record.
-    expect(Date.now() - t).toBeLessThan(3000);
-  });
-
-  it('a getMeta that throws falls back to the default instead of breaking the read', () => {
-    const fallback = intakeProvenanceFallback(() => ({ getMeta: () => { throw new Error('database is locked'); } }));
-    expect(toTask({ id: 'TASK-1', description: 'x' }, { provenanceFallback: fallback }).provenance).toBe('user-decision');
-  });
-
-  it('a db getter that throws falls back to the default instead of breaking the read', () => {
-    const fallback = intakeProvenanceFallback(() => { throw new Error('SQLITE_CANTOPEN'); });
-    expect(toTask({ id: 'TASK-1', description: 'x' }, { provenanceFallback: fallback }).provenance).toBe('user-decision');
   });
 });

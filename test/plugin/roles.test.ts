@@ -82,7 +82,7 @@ describe('project roles in the plugin (D10)', () => {
     expect(md).toContain('minions work brief <leaseId> --role researcher --json');
     expect(md).toContain('minions work submit <leaseId> --role researcher --json');
     expect(md).toContain('Not permitted for the researcher');
-    expect(md).toContain('`pr.merge`'); // custom roles are denied pr.merge by default (D8)
+    expect(md).toContain('`base.merge`'); // custom roles are denied base.merge by default (D8)
     expect(md).toContain('You may edit and create files only under `docs/research/**`');
     expect(md).toContain('Status guide (producer stage)');
     for (const f of ['status', 'summary', 'headSha', 'acceptanceEvidence', 'nextAction']) expect(md).toContain(`"${f}"`);

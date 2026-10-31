@@ -22,7 +22,6 @@ export interface Discovery {
     currentBranch: string | null;
     baseBranch: string;
     remoteUrl: string | null;
-    hasGitHub: boolean;
     dirty: boolean;
     userName: string | null;
     userEmail: string | null;
@@ -32,7 +31,6 @@ export interface Discovery {
   verificationCommands: string[];
   /** Proposed verification.setupCommands from the lockfile (empty without one). */
   setupCommands: string[];
-  ciWorkflows: string[];
   dockerfile: boolean;
   host: { cpus: number; memoryMiB: number; platform: string; arch: string };
 }
@@ -137,15 +135,10 @@ export async function discover(repoPath: string, runner: Runner = run): Promise<
   }
   const packageManager = lockfileManager(top);
 
-  const wfDir = join(repoPath, '.github', 'workflows');
-  const ciWorkflows = (await readdir(wfDir).catch(() => [] as string[])).filter((f) => /\.ya?ml$/.test(f)).map((f) => `.github/workflows/${f}`);
-  for (const f of ['.gitlab-ci.yml', '.circleci/config.yml', 'azure-pipelines.yml']) if (await isFile(join(repoPath, f))) ciWorkflows.push(f);
-
   return {
     repoPath,
     git: {
       currentBranch, baseBranch, remoteUrl,
-      hasGitHub: !!remoteUrl && /github\.com[:/]/.test(remoteUrl),
       dirty: !!status,
       userName: await g(['config', '--get', 'user.name']),
       userEmail: await g(['config', '--get', 'user.email']),
@@ -157,7 +150,6 @@ export async function discover(repoPath: string, runner: Runner = run): Promise<
     packageJson: { present: pkgPresent, scripts, packageManager },
     verificationCommands: proposeVerification(scripts, packageManager),
     setupCommands: proposeSetup(top),
-    ciWorkflows,
     dockerfile: top.has('Dockerfile') || top.has('Containerfile'),
     host: { cpus: cpus().length, memoryMiB: Math.floor(totalmem() / 1048576), platform: process.platform, arch: process.arch },
   };

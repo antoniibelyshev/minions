@@ -133,7 +133,7 @@ function harness(w: World) {
   const opts = (over: Partial<UpgradeOptions> = {}): UpgradeOptions => ({
     projectId: ID, imageTag: TAG, compose: new Compose(ID, runner), runner, root, timeoutSec: 60,
     refresh: async () => { events.push('files'); return []; },
-    importRepo: async () => { events.push('origin'); return { bundle: 'b', commit: 'c', baseBranch: 'main', warnings: [], container: { origin: { url: 'https://github.com/o/r.git', authenticated: true, fetched: true, warnings: [] } } } satisfies ImportResult; },
+    importRepo: async () => { events.push('import'); return { bundle: 'b', commit: 'c', baseBranch: 'main', warnings: [], container: {} } satisfies ImportResult; },
     materialize: async () => { events.push('secrets'); },
     sleep: async (ms) => { t += ms; }, clock: () => t, pollMs: 10_000,
     interrupt: { subscribe: () => () => undefined, exit: () => undefined, notice: () => undefined },
@@ -159,9 +159,9 @@ describe('runUpgrade', () => {
     const h = harness(w);
     const r = await runUpgrade(h.opts());
     expect(r.ok).toBe(true);
-    expect(h.events).toEqual(['status', 'pause', 'files', 'secrets', 'recreate', 'workspace', 'origin', 'resume', 'coordinator']);
+    expect(h.events).toEqual(['status', 'pause', 'files', 'secrets', 'recreate', 'workspace', 'import', 'resume', 'coordinator']);
     expect(ids(r)).toEqual(['preflight:done', 'pause:done', 'drain:done', 'files:done', 'image:skipped', 'secrets:done', 'recreate:done',
-      'workspace:done', 'origin:done', 'resume:done', 'coordinator:done']);
+      'workspace:done', 'import:done', 'resume:done', 'coordinator:done']);
     expect(r.image.rebuild).toBe(false);
     expect(h.calls.some((c) => c[1] === 'build')).toBe(false);
     expect(r.coordinator).toMatchObject({ action: 'started', running: true });
@@ -189,7 +189,7 @@ describe('runUpgrade', () => {
     const w = world({ label: 'stale0000000000' });
     const h = harness(w);
     const r = await runUpgrade(h.opts());
-    expect(h.events).toEqual(['status', 'pause', 'files', 'build', 'secrets', 'recreate', 'workspace', 'origin', 'resume', 'coordinator']);
+    expect(h.events).toEqual(['status', 'pause', 'files', 'build', 'secrets', 'recreate', 'workspace', 'import', 'resume', 'coordinator']);
     expect(r.image).toMatchObject({ rebuild: true, previous: 'stale0000000000', fingerprint: buildFingerprint(root) });
     expect(w.label).toBe(buildFingerprint(root));
     expect(r.steps.find((s) => s.id === 'image')?.status).toBe('done');
@@ -229,7 +229,7 @@ describe('runUpgrade', () => {
     const r = await runUpgrade(h.opts({ timeoutSec: 0, now: true }));
     expect(r.ok).toBe(true);
     expect(r.interrupted).toEqual([a, b]);
-    expect(h.events).toEqual(['status', 'pause', 'release:l1', 'release:l2', 'files', 'secrets', 'recreate', 'workspace', 'origin', 'resume', 'coordinator']);
+    expect(h.events).toEqual(['status', 'pause', 'release:l1', 'release:l2', 'files', 'secrets', 'recreate', 'workspace', 'import', 'resume', 'coordinator']);
     expect(r.steps.find((s) => s.id === 'drain')?.detail).toMatch(/released 2 lease\(s\) as interrupted/);
     expect(formatUpgrade(r)).toMatch(/Interrupted leases .*l1 \(task-1, engineer\), l2 \(task-2, tester\)/);
   });
@@ -250,7 +250,7 @@ describe('runUpgrade', () => {
     const h = harness(w);
     const r = await runUpgrade(h.opts({ dryRun: true, now: true, timeoutSec: 0 }));
     expect(r.dryRun).toBe(true);
-    expect(r.steps.map((s) => s.id)).toEqual(['preflight', 'pause', 'drain', 'files', 'image', 'secrets', 'recreate', 'workspace', 'origin', 'resume', 'coordinator']);
+    expect(r.steps.map((s) => s.id)).toEqual(['preflight', 'pause', 'drain', 'files', 'image', 'secrets', 'recreate', 'workspace', 'import', 'resume', 'coordinator']);
     expect(r.steps.filter((s) => s.id !== 'preflight').every((s) => s.status === 'planned')).toBe(true);
     expect(r.steps.find((s) => s.id === 'drain')?.detail).toMatch(/release 1 active lease\(s\) now .*l1 \(task-1, engineer\)/);
     expect(h.mutating()).toEqual([]);
@@ -264,7 +264,7 @@ describe('runUpgrade', () => {
     const h = harness(w);
     const r = await runUpgrade(h.opts());
     expect(r.ok).toBe(false);
-    expect(h.events.slice(-4)).toEqual(['workspace', 'origin', 'resume', 'coordinator']);
+    expect(h.events.slice(-4)).toEqual(['workspace', 'import', 'resume', 'coordinator']);
     expect(r.steps.find((s) => s.id === 'workspace')).toMatchObject({ status: 'failed', detail: expect.stringMatching(/disk full/) });
     expect(w.paused.starts).toBe(false);
     expect(w.coordinatorRunning).toBe(true);
@@ -315,7 +315,7 @@ describe('runUpgrade', () => {
     const r = await runUpgrade(h.opts());
     expect(r.ok).toBe(true);
     expect(ids(r).slice(0, 3)).toEqual(['preflight:done', 'pause:skipped', 'drain:skipped']);
-    expect(h.events).toEqual(['files', 'secrets', 'recreate', 'workspace', 'origin', 'coordinator']);
+    expect(h.events).toEqual(['files', 'secrets', 'recreate', 'workspace', 'import', 'coordinator']);
   });
 
   it('refuses to start when the container state is unknown', async () => {
@@ -395,7 +395,7 @@ describe('runUpgrade: interruption and recovery', () => {
     const h = harness(w);
     const r = await runUpgrade(h.opts());
     expect(r.ok).toBe(true);
-    expect(h.events).toEqual(['status', 'pause', 'files', 'secrets', 'recreate', 'workspace', 'origin', 'resume', 'coordinator']);
+    expect(h.events).toEqual(['status', 'pause', 'files', 'secrets', 'recreate', 'workspace', 'import', 'resume', 'coordinator']);
     expect(w.paused.starts).toBe(false);
     expect(existsSync(markerFile())).toBe(false);
   });
@@ -429,7 +429,7 @@ describe('runUpgrade: interruption and recovery', () => {
     const r = await runUpgrade(h.opts({ timeoutSec: 0, now: true }));
     expect(r.ok).toBe(true);
     expect(r.interrupted).toEqual([b]);
-    expect(h.events).toEqual(['status', 'pause', 'release:l1', 'release:l2', 'files', 'secrets', 'recreate', 'workspace', 'origin', 'resume', 'coordinator']);
+    expect(h.events).toEqual(['status', 'pause', 'release:l1', 'release:l2', 'files', 'secrets', 'recreate', 'workspace', 'import', 'resume', 'coordinator']);
     expect(r.steps.find((s) => s.id === 'drain')).toMatchObject({ status: 'done', detail: expect.stringMatching(/released 1 lease\(s\) as interrupted: l2 .*; 1 lease\(s\) ended on their own before the release: l1/) });
     // The human (non-JSON) message from an older CLI is recognized too.
     const w2 = world({ leases: [a], leaseTimeline: [[a]] });
@@ -735,7 +735,7 @@ describe('runUpgrade: pause ownership (stale marker)', () => {
     const h = harness(w);
     const r = await runUpgrade(h.opts());
     expect(r.ok).toBe(true);
-    expect(h.events).toEqual(['files', 'secrets', 'recreate', 'workspace', 'origin', 'status', 'resume', 'coordinator']);
+    expect(h.events).toEqual(['files', 'secrets', 'recreate', 'workspace', 'import', 'status', 'resume', 'coordinator']);
     expect(w.paused.starts).toBe(false);
     expect(existsSync(markerFile())).toBe(false);
 
@@ -835,7 +835,7 @@ describe('runUpgrade: drain request (workers wind down)', () => {
     const h = harness(w);
     const r = await runUpgrade(h.opts());
     expect(r.ok).toBe(true);
-    expect(h.events.filter((e) => e !== 'status')).toEqual(['drain', 'files', 'secrets', 'recreate', 'workspace', 'origin', 'undrain', 'coordinator']);
+    expect(h.events.filter((e) => e !== 'status')).toEqual(['drain', 'files', 'secrets', 'recreate', 'workspace', 'import', 'undrain', 'coordinator']);
     expect(w.startsChange?.id).toBe(3); // the user's pause event is untouched
     expect(w.paused.starts).toBe(true);
     expect(w.draining).toBeNull();

@@ -419,18 +419,6 @@ describe('QA: dev-only /rebuild_cli', () => {
     expect(chat.proposed).toEqual([{ kind: 'rebuild-cli' }]);
   });
 
-  it('with GitHub delivery the plan is refused (local delivery only); nothing is upgraded', async () => {
-    const { project, repo } = await install('minions-repo', { minions: true });
-    const from = git(repo, 'rev-parse', 'HEAD');
-    writeFileSync(join(repo, 'a.txt'), 'a\n'); git(repo, 'add', '-A'); git(repo, 'commit', '-q', '-m', 'a');
-    writeFileSync(PATHS.projectPaths(project.projectId).configLocalJson, JSON.stringify({ delivery: { provider: 'github', mode: 'pull-request' } }));
-    const s = setup([project], { leases: 0, pausedStarts: false, running: true, restart: () => 'restarted' }, { cli: { runningRoot: runningRoot(from) } });
-    const e = await reason(s.cmds.propose(null, { kind: 'rebuild-cli' }));
-    expect(e.code).toBe('PRECONDITION');
-    expect(e.message).toMatch(/rebuild-cli is for local delivery: with GitHub delivery the CLI is built only from the reviewed origin\/<base>/);
-    expect(s.upgrades).toEqual([]);
-  });
-
   it('parseOwnerCommand: rebuild_cli takes no arguments', () => {
     expect(T.parseOwnerCommand('rebuild_cli', '')).toEqual({ kind: 'rebuild-cli' });
     expect(T.parseOwnerCommand('rebuild_cli', 'x')).toBeNull();

@@ -60,7 +60,7 @@ try {
     define: { __MINIONS_VERSION__: '"0.0.0"' },
   });
   const { profileDefaults, writeBacklogConfig } = await import(helper);
-  const ctx = { hasGitHub: false, baseBranch: 'main', identity: { name: 'QA', email: 'qa@example.com' }, projectId: '3f2b8c1e-7d4a-4e9b-9c2f-1a2b3c4d5e6f', packageVersion: '0.1.0' };
+  const ctx = { baseBranch: 'main', identity: { name: 'QA', email: 'qa@example.com' }, projectId: '3f2b8c1e-7d4a-4e9b-9c2f-1a2b3c4d5e6f', packageVersion: '0.1.0' };
   writeFileSync(config, JSON.stringify(profileDefaults('project-owner', ctx).config));
   mkdirSync(state, { recursive: true });
   await writeBacklogConfig(join(state, 'backlog'));

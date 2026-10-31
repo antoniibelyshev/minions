@@ -84,13 +84,14 @@ describe('validateResult by contract variant (D4)', () => {
     expect(validateResult(base(), 'producer').ok).toBe(true);
     expect(validateResult(base({ checks: [{ command: 'npm test', outcome: 'fail' }] }), 'producer').ok).toBe(true);
     for (const over of [{ verdict: 'approve' }, { needsQa: true }, { checks: [{ command: 'test', outcome: 'pass', source: 'ci' }] }]) {
-      const v = validateResult(base(over), 'producer', { ciAuthority: 'github' });
+      const v = validateResult(base(over), 'producer');
       expect(v.ok, JSON.stringify(over)).toBe(false);
     }
   });
 
-  it('verifier: no verdict or needsQa; complete cannot fail checks; may cite CI with ciAuthority github', () => {
-    expect(validateResult(base({ checks: [{ command: 'test', outcome: 'pass', source: 'ci' }] }), 'verifier', { ciAuthority: 'github' }).ok).toBe(true);
+  it('verifier: no verdict or needsQa; complete cannot fail checks; never cites CI', () => {
+    expect(validateResult(base({ checks: [{ command: 'test', outcome: 'pass', source: 'ci' }] }), 'verifier').ok).toBe(false);
+    expect(validateResult(base({ checks: [{ command: 'test', outcome: 'pass', source: 'local' }] }), 'verifier').ok).toBe(true);
     expect(validateResult(base({ verdict: 'approve' }), 'verifier').ok).toBe(false);
     expect(validateResult(base({ needsQa: true }), 'verifier').ok).toBe(false);
     const failed = validateResult(base({ checks: [{ command: 'npm test', outcome: 'fail' }] }), 'verifier');
@@ -121,10 +122,10 @@ describe('validateResult by contract variant (D4)', () => {
 });
 
 describe('result contract text per variant (D4)', () => {
-  it('a producer is never told about verdict, needsQa or CI evidence; verifier and gate are', () => {
+  it('a producer is never told about verdict or needsQa; a gate is; nobody is told about CI evidence', () => {
     const p = resultContractText('producer');
     expect(p).not.toMatch(/verdict\?|verdict:|needsQa\?|source\?/);
-    expect(resultContractText('verifier')).toMatch(/source\?: local\|ci/);
+    expect(resultContractText('verifier')).not.toMatch(/source\?/);
     expect(resultContractText('verifier')).not.toMatch(/verdict:/);
     const g = resultContractText('gate');
     expect(g).toMatch(/verdict: approve\|request-changes/);

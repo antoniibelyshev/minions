@@ -9,8 +9,7 @@ export const CAPABILITIES = [
   'task.read', 'task.create', 'task.update', 'task.start',
   'external.read', 'external.comment', 'external.changeStatus', 'external.create',
   'code.edit', 'dependencies.edit', 'architecture.change', 'migrations.edit',
-  'git.commit', 'git.push',
-  'pr.create', 'pr.review', 'pr.merge',
+  'git.commit',
   // Local integration (docs/design/local-auto-integration.md): the runtime merging an approved head into the local base.
   'base.merge',
   'ci.edit', 'infrastructure.edit',
@@ -225,9 +224,8 @@ export const MinionsConfigSchema = z.object({
   profile: z.enum(PROFILES),
   visibility: z.enum(['shared', 'private']),
   backlog: z.object({
-    backend: z.enum(['backlogmd', 'github']),
+    backend: z.enum(['backlogmd']),
     ownership: z.enum(['direct', 'personal', 'assigned']),
-    repository: z.string().nullable(),
   }).strict(),
   intake: z.object({
     sources: z.array(z.enum(['user', 'milestone', 'external'])).min(1),
@@ -238,27 +236,6 @@ export const MinionsConfigSchema = z.object({
       requiredLabels: z.array(nonEmpty),
       allowedPaths: z.array(nonEmpty).min(1),
     }).strict(),
-    /**
-     * GitHub-filtered intake sync (src/runtime/intake-sync.ts): `minions sync` and coordinator startup import
-     * matching issues into the backlog (read-only on GitHub, additive, idempotent). Unset or disabled = off.
-     */
-    github: z.object({
-      enabled: z.boolean(),
-      /** "owner/repo"; null = the workspace origin. */
-      repository: z.string().regex(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/, 'must be "owner/repo"').nullable(),
-      /** Issues must carry all of these labels. */
-      labels: z.array(z.string().regex(/^[^,\r\n]+$/, 'must be non-empty, without commas or newlines')),
-      /** GitHub login, "none" (unassigned) or "*" (any assignee); null = no assignee filter. */
-      assignee: z.string().regex(/^(?:\*|none|[A-Za-z0-9][A-Za-z0-9-]{0,38})$/, 'must be a GitHub login, "none" or "*"').nullable(),
-      /** Milestone title or number, "none" or "*"; null = no milestone filter. */
-      milestone: z.string().regex(/^[^\r\n]+$/, 'must be a single non-empty line').nullable(),
-      state: z.enum(['open', 'closed', 'all']),
-      /**
-       * Host-owned (phase 5): an imported issue that carries every one of these labels is created `ready`, otherwise
-       * `idea` (unset or [] = always idea). Authorization still follows minions:authorized or intake.startReady.
-       */
-      readyLabels: z.array(z.string().regex(/^[^,\r\n]+$/, 'must be non-empty, without commas or newlines')).optional(),
-    }).strict().optional(),
   }).strict(),
   container: z.object({
     required: z.literal(true),
@@ -309,14 +286,8 @@ export const MinionsConfigSchema = z.object({
     router: modelId.optional(),
   }).strict(),
   delivery: z.object({
-    provider: z.enum(['none', 'github']),
-    mode: z.enum(['local', 'branch', 'pull-request']),
-    merge: z.enum(['disabled', 'manual', 'auto-when-eligible']),
-    method: z.enum(['squash', 'merge', 'rebase']),
-    deleteMergedBranches: z.boolean(),
-    identityMode: z.enum(['git-identity', 'user-token', 'github-apps']),
-    requireIndependentApproval: z.boolean(),
-    requiredChecksConfigured: z.boolean(),
+    /** "auto-when-eligible": the local integrator lands approved heads on the base (docs/design/local-auto-integration.md). */
+    merge: z.enum(['disabled', 'auto-when-eligible']),
     /**
      * Local integration (docs/design/local-auto-integration.md, src/runtime/integrator.ts): the wall-clock limit of
      * each setup and verification command of the integration gate, in minutes. A timeout is transient (one retry).
@@ -337,15 +308,6 @@ export const MinionsConfigSchema = z.object({
     reviewerRequired: z.boolean(),
     /** Labels that opt a task into a tester stage; the first is added when the runtime records a QA need. Default ["qa"]. */
     qaLabels: z.array(nonEmpty).min(1).optional(),
-    /**
-     * "github": tester/reviewer stages may rely on passing required CI checks (branch protection or
-     * rulesets on the base) observed by `minions sync` for the exact head under test/review, instead of
-     * re-running the full verification locally (src/runtime/ci-gate.ts). Missing, failing, unknown or
-     * pending-too-long CI never approves; the stage falls back to the full local verification (every verification.commands entry passing locally). "none": local only.
-     */
-    ciAuthority: z.enum(['none', 'github']),
-    /** ciAuthority github: minutes required checks may stay pending (from the first observation of a head) before CI counts as timed out. Default 60. */
-    ciPendingTimeoutMinutes: z.number().int().min(1).optional(),
   }).strict(),
   communication: z.object({
     /** "auto": Telegram when a bot token is stored and the runtime supports it, else terminal (src/telegram/channel.ts). */
@@ -438,7 +400,7 @@ export const MinionsConfigSchema = z.object({
   }).strict().optional(),
   /**
    * Unattended routine (docs/design/unattended-delivery.md, phase 1; src/runtime/routine.ts): a deterministic pass
-   * (`minions sync --routine`: intake, PR and CI sync, merge pass, wake decision) every `tickMinutes`, run by the
+   * (`minions sync --routine`: the wake decision) every `tickMinutes`, run by the
    * coordinator wrapper's clock (the host manager is the watchdog). It wakes the coordinator with a fresh session only
    * when a model is needed. Unset = off; every unset field takes its default.
    */

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { defaultDeliveryMode, profileDefaults } from '../src/config/profiles.js';
-import { listUnavailable, resolve, validateConfig, SUPPORTED } from '../src/config/resolve.js';
+import { profileDefaults } from '../src/config/profiles.js';
+import { resolve, validateConfig } from '../src/config/resolve.js';
 import { CAPABILITIES } from '../src/config/schema.js';
 import { MinionsError } from '../src/core/errors.js';
 import { ctx, defaults } from './helpers.js';
@@ -19,7 +19,7 @@ describe('profiles', () => {
       profile: 'project-owner', visibility: 'shared', architecture: 'decide',
       backlog: { backend: 'backlogmd', ownership: 'direct' },
       intake: { sources: ['user', 'milestone'], startReady: true },
-      delivery: { mode: 'local', merge: 'disabled', requiredChecksConfigured: false },
+      delivery: { merge: 'disabled' },
       container: { mountDockerSocket: false, mountHostRepository: false, cpus: 4, memoryMiB: 6144, pidsLimit: 512 },
       execution: { maxActiveTasks: 2, maxEngineers: 2 },
       git: { baseBranch: 'main', identity: ctx.identity },
@@ -29,32 +29,23 @@ describe('profiles', () => {
     // Routine context resets are on by default with coordinator.contextReset unset (task-45).
     expect(c).not.toHaveProperty('coordinator');
     expect(Object.keys(c.capabilities).sort()).toEqual([...CAPABILITIES].sort());
-    expect(c.capabilities['pr.merge']).toBe('ask');
+    expect(c.capabilities['base.merge']).toBe('allow');
     expect(c.capabilities['ci.edit']).toBe('ask');
     expect(c.capabilities['deploy.execute']).toBe('deny');
     expect(c.sensitivePaths).toContain('.github/workflows/**');
-    expect(notes.some((n) => n.includes('GitHub Issues'))).toBe(true);
-    expect(profileDefaults('project-owner', { ...ctx, hasGitHub: false }).notes).toEqual([]);
-    expect(notes.some((n) => /pull-request delivery .*no GitHub token/.test(n))).toBe(true);
-  });
-
-  it('project-owner defaults to pull-request delivery only with a GitHub remote and token', () => {
-    const withToken = profileDefaults('project-owner', { ...ctx, hasGitHubCredential: true }).config;
-    expect(validateConfig(withToken).delivery).toMatchObject({ provider: 'github', mode: 'pull-request', merge: 'disabled' });
-    expect(profileDefaults('project-owner', { ...ctx, hasGitHub: false, hasGitHubCredential: true }).config.delivery.mode).toBe('local');
-    expect(profileDefaults('personal-work', { ...ctx, hasGitHubCredential: true }).config.delivery.mode).toBe('local');
-    expect(profileDefaults('supervised', { ...ctx, hasGitHubCredential: true }).config.delivery.mode).toBe('local');
+    expect(notes).toEqual([]);
   });
 
   it('personal-work yields documented explicit defaults', () => {
     const { config: c, notes } = profileDefaults('personal-work', ctx);
     validateConfig(c);
     expect(c).toMatchObject({ visibility: 'private', architecture: 'propose', backlog: { backend: 'backlogmd', ownership: 'personal' },
-      intake: { sources: ['user', 'external'], startReady: true }, delivery: { mode: 'local', merge: 'disabled' } });
-    for (const k of ['external.comment', 'external.changeStatus', 'external.create', 'pr.merge', 'ci.edit', 'deploy.execute'] as const)
+      intake: { sources: ['user', 'external'], startReady: true }, delivery: { merge: 'disabled' } });
+    for (const k of ['external.comment', 'external.changeStatus', 'external.create', 'ci.edit', 'deploy.execute'] as const)
       expect(c.capabilities[k]).toBe('deny');
     expect(c.capabilities['external.read']).toBe('allow');
-    expect(notes.length).toBe(1);
+    expect(c.capabilities['base.merge']).toBe('ask');
+    expect(notes).toEqual([]);
   });
 
   it('supervised yields documented explicit defaults', () => {
@@ -62,9 +53,8 @@ describe('profiles', () => {
     validateConfig(c);
     expect(c).toMatchObject({ visibility: 'private', architecture: 'propose', backlog: { ownership: 'assigned' },
       intake: { sources: ['user'], startReady: false }, execution: { maxActiveTasks: 1, maxEngineers: 1 },
-      delivery: { mode: 'local', merge: 'disabled' } });
-    expect(c.capabilities['git.push']).toBe('deny');
-    expect(c.capabilities['pr.merge']).toBe('deny');
+      delivery: { merge: 'disabled' } });
+    expect(c.capabilities['base.merge']).toBe('deny');
     expect(c.capabilities['deploy.execute']).toBe('deny');
     expect(notes).toEqual([]);
   });
@@ -110,40 +100,32 @@ describe('validation', () => {
     [{ models: { default: 'gpt' } }, 'models.default'],
     [{ container: { mountDockerSocket: true } }, 'container.mountDockerSocket'],
     [{ container: { mountHostRepository: true } }, 'container.mountHostRepository'],
-    [{ delivery: { mode: 'pull-request' } }, 'delivery.provider'],
-    [{ delivery: { mode: 'branch', provider: 'none' } }, 'delivery.provider'],
-    [{ backlog: { backend: 'github' } }, 'backlog.backend'],
   ])('rejects conflicting settings %j', (project, path) => {
     const e = fail(() => resolve({ defaults: defaults(), project }));
     expect(e.code).toBe('INVALID_CONFIG');
     expect(e.message).toContain(path);
   });
 
-  it('reports auto-merge without required checks as unavailable, not as zero checks', () => {
-    // Pull-request delivery (local delivery reports integration readiness instead: test/runtime/local-integration.test.ts).
-    const c = { ...defaults(), delivery: { ...defaults().delivery, mode: 'pull-request' as const, provider: 'github' as const, merge: 'auto-when-eligible' as const } };
-    validateConfig(c);
-    const u = listUnavailable(c).find((x) => x.path === 'delivery.merge');
-    expect(u?.reason).toContain('requiredChecksConfigured is false');
-    expect(SUPPORTED.delivery).toEqual(['local', 'branch', 'pull-request']);
-  });
-
-  it('accepts branch and pull-request delivery with the github provider; merge requests stay deferred, auto-merge is opt-in', () => {
-    for (const mode of ['branch', 'pull-request'] as const) {
-      const c = validateConfig({ ...defaults(), delivery: { ...defaults().delivery, provider: 'github', mode } });
-      expect(c.delivery.mode).toBe(mode);
-      expect(listUnavailable(c).map((u) => u.path)).not.toContain('delivery.mode');
-    }
-    const pr = { ...defaults(), delivery: { ...defaults().delivery, provider: 'github' as const, mode: 'pull-request' as const, merge: 'manual' as const } };
-    expect(listUnavailable(validateConfig(pr)).find((u) => u.path === 'delivery.merge')?.reason).toMatch(/never merges/);
-    const auto = { ...pr, delivery: { ...pr.delivery, merge: 'auto-when-eligible' as const, requiredChecksConfigured: true } };
-    expect(listUnavailable(validateConfig(auto)).find((u) => u.path === 'delivery.merge')?.reason).toMatch(/ciAuthority is not "github"/);
-    // With every configuration prerequisite, auto-merge is available (each PR still passes its own gates).
-    const ready = { ...auto, verification: { ...auto.verification, ciAuthority: 'github' as const } };
-    expect(listUnavailable(validateConfig(ready)).map((u) => u.path)).not.toContain('delivery.merge');
-    const branchAuto = { ...ready, delivery: { ...ready.delivery, mode: 'branch' as const } };
-    expect(listUnavailable(validateConfig(branchAuto)).find((u) => u.path === 'delivery.merge')?.reason).toMatch(/needs pull-request delivery/);
-    expect(resolve({ defaults: defaults(), project: { delivery: { provider: 'github', mode: 'branch' } } }).config.delivery.mode).toBe('branch');
+  it('accepts and drops the keys of the removed GitHub delivery (docs/design/autonomy.md Decision 8)', () => {
+    const legacy = {
+      backlog: { backend: 'github', repository: null },
+      intake: { github: { enabled: true, repository: null, labels: [], assignee: null, milestone: null, state: 'open' } },
+      delivery: { provider: 'github', mode: 'pull-request', merge: 'auto-when-eligible', method: 'squash', deleteMergedBranches: true,
+        identityMode: 'git-identity', requireIndependentApproval: true, requiredChecksConfigured: true },
+      verification: { ciAuthority: 'github', ciPendingTimeoutMinutes: 30 },
+      capabilities: { 'git.push': 'allow', 'pr.create': 'allow', 'pr.review': 'allow', 'pr.merge': 'ask' },
+    };
+    const { config } = resolve({ defaults: defaults(), project: legacy });
+    // GitHub auto-merge never turns into local integration.
+    expect(config.delivery).toEqual({ merge: 'disabled' });
+    expect(config.backlog).toEqual({ backend: 'backlogmd', ownership: 'direct' });
+    expect(config.intake).not.toHaveProperty('github');
+    expect(config.verification).not.toHaveProperty('ciAuthority');
+    expect(Object.keys(config.capabilities).sort()).toEqual([...CAPABILITIES].sort());
+    // Local delivery keeps its switch; the never-implemented "manual" is off.
+    expect(resolve({ defaults: defaults(), local: { delivery: { mode: 'local', provider: 'none', merge: 'auto-when-eligible' } } }).config.delivery.merge).toBe('auto-when-eligible');
+    expect(resolve({ defaults: defaults(), project: { delivery: { merge: 'manual' } } }).config.delivery.merge).toBe('disabled');
+    expect(fail(() => resolve({ defaults: defaults(), project: { delivery: { merge: 'sometimes' } } })).message).toContain('delivery.merge');
   });
 });
 
@@ -168,7 +150,7 @@ describe('layering and provenance', () => {
     expect(provenance['container.cpus']).toBe('local');
     expect(provenance['execution.maxEngineers']).toBe('session');
     expect(provenance['models.default']).toBe('default');
-    expect(provenance['capabilities.pr.merge']).toBe('default');
+    expect(provenance['capabilities.base.merge']).toBe('default');
   });
 
   it('replaces arrays instead of concatenating', () => {
@@ -177,20 +159,20 @@ describe('layering and provenance', () => {
   });
 
   it('session override cannot widen', () => {
-    const project = { capabilities: { 'git.push': 'deny' } };
-    const e = fail(() => resolve({ defaults: defaults(), project, session: { capabilities: { 'git.push': 'allow' } } }));
+    const project = { capabilities: { 'base.merge': 'deny' } };
+    const e = fail(() => resolve({ defaults: defaults(), project, session: { capabilities: { 'base.merge': 'allow' } } }));
     expect(e.code).toBe('POLICY_DENIED');
-    expect(e.message).toContain('capabilities.git.push');
+    expect(e.message).toContain('capabilities.base.merge');
     expect(fail(() => resolve({ defaults: defaults(), session: { execution: { maxActiveTasks: 5 } } })).code).toBe('POLICY_DENIED');
     expect(fail(() => resolve({ defaults: defaults(), session: { models: { default: 'gpt' } } })).code).toBe('POLICY_DENIED');
     expect(fail(() => resolve({ defaults: defaults(), session: { container: { cpus: 1 } } })).code).toBe('INVALID_CONFIG');
   });
 
   it('session override can narrow, raising role rules too', () => {
-    const { config, provenance } = resolve({ defaults: defaults(), session: { capabilities: { 'code.edit': 'ask', 'pr.merge': 'deny' } } });
-    expect(config.capabilities['pr.merge']).toBe('deny');
+    const { config, provenance } = resolve({ defaults: defaults(), session: { capabilities: { 'code.edit': 'ask', 'base.merge': 'deny' } } });
+    expect(config.capabilities['base.merge']).toBe('deny');
     expect(config.capabilities['code.edit']).toEqual({ effect: 'ask', rules: [{ effect: 'deny', roles: ['reviewer'] }] });
-    expect(provenance['capabilities.pr.merge']).toBe('session');
+    expect(provenance['capabilities.base.merge']).toBe('session');
   });
 
   it('local overrides cannot remove a project deny', () => {
@@ -231,29 +213,5 @@ describe('models.effort and models.coordinator', async () => {
     const cfg = validateConfig({ ...raw, git: { ...raw.git, identity: { name: 'x', email: 'x@example.com' } } }, '.minions/config.json');
     expect(cfg.models).toMatchObject({ default: 'claude-opus-5-5', effort: 'medium', selection: 'coordinator' });
     expect(cfg.models.allowed).toEqual(['claude-opus-5-5', 'sonnet', 'opus', 'haiku']);
-  });
-});
-
-describe('PR-first delivery default and CI authority', () => {
-  it('offers pull-request as the default when GitHub delivery is selectable; local stays local when blocked', () => {
-    expect(defaultDeliveryMode('local', false)).toBe('pull-request');
-    expect(defaultDeliveryMode('branch', false)).toBe('branch');
-    expect(defaultDeliveryMode('pull-request', false)).toBe('pull-request');
-    expect(defaultDeliveryMode('local', true)).toBe('local');
-    expect(defaultDeliveryMode('pull-request', true)).toBe('local');
-    // project-owner with a GitHub remote and a stored token defaults to pull-request; without the token, local.
-    expect(profileDefaults('project-owner', { ...ctx, hasGitHubCredential: true }).config.delivery).toMatchObject({ mode: 'pull-request', provider: 'github' });
-    expect(profileDefaults('project-owner', ctx).config.delivery.mode).toBe('local');
-  });
-
-  it('ciAuthority github is no longer reported unavailable; the pending timeout is optional and validated', () => {
-    const c = defaults();
-    c.verification.ciAuthority = 'github';
-    expect(listUnavailable(c).map((u) => u.path)).not.toContain('verification.ciAuthority');
-    expect(validateConfig({ ...c, verification: { ...c.verification, ciPendingTimeoutMinutes: 45 } }).verification.ciPendingTimeoutMinutes).toBe(45);
-    expect(fail(() => validateConfig({ ...c, verification: { ...c.verification, ciPendingTimeoutMinutes: 0 } })).code).toBe('INVALID_CONFIG');
-    const notes = profileDefaults('project-owner', { ...ctx, hasGitHubCredential: true }).notes.join('\n');
-    expect(notes).not.toMatch(/CI authority is deferred/);
-    expect(notes).toMatch(/CI authority is opt-in/);
   });
 });

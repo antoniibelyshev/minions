@@ -81,7 +81,7 @@ describe('runUpgrade on the host runtime', () => {
     expect(r.steps.every((s) => s.status === 'done')).toBe(true);
     expect(w.events).toEqual(['status:1', 'pause', 'status:1', 'status:0', 'files', 'secrets', 'shim', 'workspace', 'resume', 'coordinator']);
     expect(r.coordinator).toMatchObject({ action: 'restarted' });
-    expect(r.steps.some((s) => s.id === 'image' || s.id === 'recreate' || s.id === 'origin')).toBe(false);
+    expect(r.steps.some((s) => s.id === 'image' || s.id === 'recreate' || s.id === 'import')).toBe(false);
   });
 
   it('dry run explains each host step and changes nothing', async () => {
@@ -157,24 +157,24 @@ describe('agent-writable CLI guard', () => {
     expect(unsafeCliReason({ cliPaths: [join(outside, 'pkg', 'dist', 'cli.js')], installed: { kind: 'packed', path: join(outside, 'pkg'), realPath: join(outside, 'pkg') }, agentWritable: [ws!, st!] })).toBeNull();
   });
 
-  it('hostUpgradeTarget checks the shim target and the global install, and regenerates the shims for that target', async () => {
+  it('hostUpgradeTarget checks the shim target and the global install, and regenerates the shim for that target', async () => {
     const hp = hostRuntimePaths(ID);
     const fakeHost = { exec: async () => ok({}), prepared: async () => true } as unknown as HostRuntime;
     const prepared: string[] = [];
     const t = hostUpgradeTarget(project, fakeHost, {
       target: { node: '/usr/bin/node', cli: join(hp.workspace, 'repo', 'dist', 'cli.js') },
       installed: async () => null,
-      prepare: async (_p, o) => { prepared.push(o.target.cli); return { gh: null }; },
+      prepare: async (_p, o) => { prepared.push(o.target.cli); },
     });
     expect(await t.cliProblem()).toMatch(/inside the agent-writable/);
     const safe = hostUpgradeTarget(project, fakeHost, {
       target: { node: '/usr/bin/node', cli: '/opt/homebrew/lib/node_modules/minions/dist/cli.js' },
       installed: async () => ({ path: '/opt/homebrew/lib/node_modules/minions', realPath: '/opt/homebrew/lib/node_modules/minions', kind: 'packed', version: '0.1.0', stamp: null, resolved: null, running: true }),
-      prepare: async (_p, o) => { prepared.push(o.target.cli); return { gh: '/usr/local/bin/gh' }; },
+      prepare: async (_p, o) => { prepared.push(o.target.cli); },
     });
     expect(await safe.cliProblem()).toBeNull();
     expect(safe.shimPlan).toContain(hp.minionsShim);
-    expect(await safe.regenerate()).toContain('gh shim refreshed');
+    expect(await safe.regenerate()).toBe(`${join(hp.bin, 'minions')} -> /opt/homebrew/lib/node_modules/minions/dist/cli.js`);
     expect(prepared).toEqual(['/opt/homebrew/lib/node_modules/minions/dist/cli.js']);
   });
 });

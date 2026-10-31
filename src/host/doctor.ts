@@ -11,14 +11,12 @@ import { CONTAINER } from '../core/paths.js';
 import { VERSION } from '../core/version.js';
 import { DEFAULT_REFRESH_MINUTES, authOf, containerEnv, describeSource, expandHome, isKeyAuth, maskValue, resolveOnPath, secretStatus, type ClaudeAuth } from './auth.js';
 import type { MinionsConfig } from '../config/schema.js';
-import { ciSetupPlan, fetchApi, requiredChecksStatus, type RequiredChecksReport } from '../runtime/ci.js';
-import { DEFAULT_CI_PENDING_TIMEOUT_MINUTES } from '../runtime/ci-gate.js';
 import { managerBotClash } from './bot-guard.js';
 import { loadManagerAccess } from './manager-bot.js';
 import { serviceHost } from './manager-service.js';
 import { managerOverview, managerServiceChecks } from './manager-status.js';
 import { assistantCheck, type CapabilityCheck } from './manager-assistant.js';
-import { clearStaleSecrets, managerCredentialStatus, secretCopiesExist, githubCredentialStatus, readGithubToken, githubRepoFromRemote, telegramCredentialStatus, type CredentialStatus, type Fetch, type TelegramCredentialStatus } from './credentials.js';
+import { clearStaleSecrets, managerCredentialStatus, secretCopiesExist, telegramCredentialStatus, type TelegramCredentialStatus } from './credentials.js';
 import { dockerProbe, type DockerProbe, type DockerStatus } from './discovery.js';
 import { composeHint, daemonHint, linuxDockerChecks, linuxHostFacts, unknownLinuxFacts, type LinuxHostFacts } from './linux-host.js';
 import { Compose, buildFingerprint, imageBuildLabel, tmpSizeMiB, type Runner } from './docker.js';
@@ -29,7 +27,6 @@ import { resolveChannel, type ChannelResolution } from '../telegram/channel.js';
 import { loadEffectiveConfig, loadProjectJson } from './project.js';
 import { checkPlugin, pluginMismatch, type PluginCheck } from './install.js';
 import { projectForPath } from './registry.js';
-import { githubHints, inspectGithub } from './github-setup.js';
 import { harnessChecks, harnessSkipChecks, parseWorkProbe } from './harness-checks.js';
 import { harnessView } from '../runtime/sandbox/probe.js';
 import { HANG_GUARD_TIMEOUT_TEST, hangGuarded } from '../runtime/hook-guard.js';
@@ -142,177 +139,33 @@ async function hostAuthChecks(projectId: string, a: ClaudeAuth, add: Add): Promi
   }
 }
 
-/** github.credential: ok / missing / invalid (/ unverified when the API is unreachable). Never includes the token. */
-async function githubCheck(project: { projectId: string; remoteUrl: string | null }, runner: Runner, f?: Fetch): Promise<[string, CheckStatus, string, string?]> {
-  const name = 'github.credential';
-  const onGitHub = githubRepoFromRemote(project.remoteUrl) !== null;
-  let s: CredentialStatus;
-  try { s = await githubCredentialStatus(project, { runner, fetch: f }); } catch (e) {
-    return [name, 'warn', `invalid: could not check (${short(String((e as Error).message ?? e))})`, 'Run `minions auth github` to store the token again.'];
-  }
-  switch (s.state) {
-    case 'ok': return [name, 'ok', `ok: ${s.detail}`];
-    case 'missing': return onGitHub
-      ? [name, 'warn', `missing: ${s.detail}`, 'Run `minions auth github` (needed for branch/pull-request delivery).']
-      : [name, 'ok', 'missing: not needed (no GitHub remote)'];
-    case 'invalid': return [name, 'fail', `invalid: ${s.detail}`, 'Create a new fine-grained token and run `minions auth github`.'];
-    case 'unverified': return [name, 'warn', `unverified: ${s.detail}`, 'Check network access to api.github.com and rerun doctor.'];
-  }
-}
-
 /**
- * github.setup: the GitHub section with one actionable next step (remote, base branch on the remote,
- * token, delivery). Local git data and stored references only; the token check is github.credential.
- */
-async function githubSetupCheck(project: ProjectJson, repoPath: string, credential: CredentialStatus['state'] | null, runner: Runner): Promise<Check> {
-  const name = 'github.setup';
-  const s = await inspectGithub(project, repoPath, { runner }).catch(() => null);
-  if (!s) return { name, status: 'warn', detail: 'could not inspect the repository remote', hint: 'Run `minions setup github`.' };
-  if (!s.repository) {
-    return { name, status: 'ok', detail: s.nonGithubOrigin ? `not set up: origin is not on github.com; delivery stays local` : 'not set up: no GitHub remote; delivery stays local',
-      hint: githubHints(s)[0] ?? 'Run `minions setup github`.' };
-  }
-  const parts = [`origin ${s.repository}`, `base ${s.baseBranch} ${s.baseOnRemote ? 'on origin' : 'not known on origin'}`, `token ${credential ?? s.token}`, `delivery ${s.deliveryMode ?? 'unknown'}`];
-  const hints = githubHints(s);
-  const ready = s.token === 'stored' && credential === 'ok' && s.baseOnRemote !== false;
-  return { name, status: ready ? 'ok' : 'warn', detail: `${ready ? 'ready' : 'incomplete'}: ${parts.join(', ')}`, ...(hints.length ? { hint: hints.join(' ') } : credential && credential !== 'ok' ? { hint: 'Run `minions setup github` to replace the token.' } : {}) };
-}
-
-/**
- * Auto-merge part of merge.readiness: off (opt-in), ready, or enabled with the reasons it cannot be
- * used (configuration, required checks on the base, GitHub credential). Per-PR gates (CI for the
- * approved head, PR head == approved head, pr.merge approvals) are evaluated by `minions sync`.
+ * Local integration part of merge.readiness: off (opt-in), ready, or enabled with the reasons it cannot be used
+ * (docs/design/local-auto-integration.md).
  */
 export function autoMergeReadiness(
   config: Pick<MinionsConfig, 'delivery'> & Partial<Pick<MinionsConfig, 'verification' | 'capabilities' | 'sensitivePaths'>>,
-  github: { onGitHub: boolean; credential: CredentialStatus['state'] | null },
-  rc?: RequiredChecksReport | null,
-): { ready: boolean; enabled: boolean; detail: string; reasons: string[] } {
+): { ready: boolean; enabled: boolean; reasons: string[]; detail: string } {
   const enabled = config.delivery.merge === 'auto-when-eligible';
-  if (config.delivery.mode === 'local') {
-    // Local delivery (docs/design/local-auto-integration.md): the switch is local integration; no GitHub involved.
-    if (!enabled) return { ready: false, enabled, reasons: [], detail: `local integration off: approved tasks end delivered and the coordinator merges them (opt-in: delivery.merge "auto-when-eligible" or \`minions setup\`; currently "${config.delivery.merge}")` };
-    const reasons = autoMergeConfigReasons(config);
-    if (reasons.length) return { ready: false, enabled, reasons, detail: `local integration enabled but not usable: ${reasons.join('; ')}` };
-    const ask = config.capabilities && config.sensitivePaths ? can({ capabilities: config.capabilities, sensitivePaths: config.sensitivePaths }, 'base.merge') === 'ask' : false;
-    const cmds = config.verification?.commands ?? [];
-    return { ready: true, enabled, reasons: [], detail: `local integration ready: the runtime merges each approved head, runs the verification (${cmds.join(', ')}) on the merged tree and lands it on the base when it passes${ask ? '; base.merge "ask": each landing needs \`minions work approve <taskId> --head <sha> --merge\` on the host' : '; sensitive paths need \`minions work approve <taskId> --head <sha> --merge\` on the host'}` };
-  }
-  if (!enabled) {
-    return { ready: false, enabled, reasons: [], detail: `auto-merge off (opt-in: delivery.merge "auto-when-eligible" or \`minions setup\`; currently "${config.delivery.merge}")` };
-  }
-  const reasons = autoMergeConfigReasons(config);
-  if (!github.onGitHub) reasons.push('no GitHub remote');
-  else if (github.credential !== 'ok') reasons.push(`GitHub credential ${github.credential ?? 'unknown'}`);
-  if (rc === undefined) reasons.push('required checks on the base branch were not checked');
-  else if (!rc || rc.state === 'unknown') reasons.push('required checks on the base branch could not be read');
-  else if (rc.state !== 'configured' || !rc.requiredChecks.length) reasons.push(`no required status checks on ${rc.baseBranch} (never treated as zero required checks)`);
-  if (reasons.length) return { ready: false, enabled, reasons, detail: `auto-merge enabled but not usable: ${reasons.join('; ')}` };
-  const ask = config.capabilities && config.sensitivePaths ? can({ capabilities: config.capabilities, sensitivePaths: config.sensitivePaths }, 'pr.merge') === 'ask' : true;
-  return { ready: true, enabled, reasons: [], detail: `auto-merge ready: \`minions sync\` arms GitHub auto-merge (${config.delivery.method}) once the required checks (${rc!.requiredChecks.join(', ')}) pass for the approved head${ask ? '; pr.merge "ask": each PR also needs `minions work approve <taskId> --head <sha> --merge` on the host' : ''}` };
+  if (!enabled) return { ready: false, enabled, reasons: [], detail: `local integration off: approved tasks end delivered and the coordinator merges them (opt-in: delivery.merge "auto-when-eligible" or \`minions setup\`; currently "${config.delivery.merge}")` };
+  const why = autoMergeConfigReasons(config);
+  if (why.length) return { ready: false, enabled, reasons: why, detail: `local integration enabled but not usable: ${why.join('; ')}` };
+  const ask = config.capabilities && config.sensitivePaths ? can({ capabilities: config.capabilities, sensitivePaths: config.sensitivePaths }, 'base.merge') === 'ask' : false;
+  const cmds = config.verification?.commands ?? [];
+  return { ready: true, enabled, reasons: [], detail: `local integration ready: the runtime merges each approved head, runs the verification (${cmds.join(', ')}) on the merged tree and lands it on the base when it passes${ask ? '; base.merge "ask": each landing needs \`minions work approve <taskId> --head <sha>\` on the host' : '; sensitive paths need \`minions work approve <taskId> --head <sha>\` on the host'}` };
 }
 
-/**
- * merge.readiness: what delivery can do now. PR/branch delivery is available with a GitHub remote and
- * credential; auto-merge is opt-in and reported as off, ready, or enabled-but-not-usable with reasons.
- */
+/** merge.readiness: local integration off, ready, or enabled-but-not-usable with reasons. Nothing is ever pushed. */
 export function mergeReadiness(
   config: (Pick<MinionsConfig, 'delivery'> & Partial<Pick<MinionsConfig, 'verification' | 'capabilities' | 'sensitivePaths'>>) | null,
-  github: { onGitHub: boolean; credential: CredentialStatus['state'] | null },
-  rc?: RequiredChecksReport | null,
 ): [CheckStatus, string, string?] {
-  if (!config) return ['unavailable', 'configuration not loaded; auto-merge not evaluated'];
-  const am = autoMergeReadiness(config, github, rc);
-  const deferred = am.detail;
-  const ready = github.onGitHub && github.credential === 'ok';
-  const mode = config.delivery.mode;
-  if (mode === 'local') {
-    if (am.enabled && am.ready) return ['ok', `local delivery (nothing is pushed); ${deferred}`];
-    if (am.enabled) return ['warn', `local delivery (nothing is pushed); ${deferred}`, 'Fix the reasons above, or set delivery.merge "disabled" (the coordinator then merges approved branches).'];
-    return ['unavailable', ready
-      ? `local delivery (nothing is pushed); pull-request delivery is available: set delivery.mode "pull-request"; ${deferred}`
-      : `local delivery only: branch/pull-request delivery needs ${github.onGitHub ? 'a valid GitHub token' : 'a GitHub remote and token'}; ${deferred}`];
-  }
-  const what = mode === 'pull-request' ? 'pull-request delivery available (push agent/<slug> and open a PR, never merged)' : 'branch delivery available (push agent/<slug>)';
-  if (!github.onGitHub) return ['fail', `delivery.mode "${mode}" but the repository has no GitHub remote; ${deferred}`, 'Add a github.com origin or set delivery.mode "local".'];
-  if (am.enabled && !am.ready) return ['warn', `${what.replace(/, never merged\)/, ')')}; ${deferred}`, 'Fix the reasons above (see ci.requiredChecks and ci.authority), or set delivery.merge "disabled".'];
-  if (ready) return ['ok', `${am.enabled ? what.replace(/, never merged\)/, ')') : what}; ${deferred}`];
-  return ['warn', `delivery.mode "${mode}" cannot publish: GitHub credential ${github.credential ?? 'unknown'}; ${deferred}`, 'Run `minions auth github`; approved tasks wait (blocked) until `minions work publish` succeeds.'];
+  if (!config) return ['unavailable', 'configuration not loaded; local integration not evaluated'];
+  const am = autoMergeReadiness(config);
+  if (am.enabled && am.ready) return ['ok', `local delivery (nothing is pushed); ${am.detail}`];
+  if (am.enabled) return ['warn', `local delivery (nothing is pushed); ${am.detail}`, 'Fix the reasons above, or set delivery.merge "disabled" (the coordinator then merges approved branches).'];
+  return ['ok', `local delivery (nothing is pushed); ${am.detail}`];
 }
 
-/**
- * ci.requiredChecks: whether the base branch has required status checks (read-only observation) and
- * how that maps to delivery.requiredChecksConfigured. No CI / no required checks is usable for local
- * work and pull-request delivery, never for automatic merge. Never 'fail'.
- */
-export function requiredChecksReadiness(
-  config: Pick<MinionsConfig, 'delivery' | 'verification' | 'git'> | null,
-  rc: RequiredChecksReport | null,
-  ctx: { onGitHub: boolean; unknownReason?: string },
-): Check {
-  const name = 'ci.requiredChecks';
-  const noMerge = 'usable for local work and pull-request delivery; automatic merge unavailable';
-  if (!ctx.onGitHub) return { name, status: 'unavailable', detail: `no GitHub remote: CI observation not applicable; ${noMerge}` };
-  if (!config) return { name, status: 'unavailable', detail: 'configuration not loaded' };
-  const flag = config.delivery.requiredChecksConfigured;
-  const base = config.git.baseBranch;
-  if (!rc || rc.state === 'unknown') {
-    const why = ctx.unknownReason ?? rc?.errors.join('; ') ?? 'not checked';
-    return { name, status: 'warn', detail: `unknown: required checks on ${base} could not be read (${why}); delivery.requiredChecksConfigured ${flag}`,
-      hint: 'Rerun doctor with the container running and a GitHub token that can read the repository (`minions auth github`).' };
-  }
-  const workflows = rc.workflows;
-  if (rc.state === 'configured') {
-    const detail = `required checks on ${base}: ${rc.requiredChecks.join(', ')}; delivery.requiredChecksConfigured ${flag}`;
-    return flag
-      ? { name, status: 'ok', detail: `${detail}; automatic merge can use them (delivery.merge "auto-when-eligible", see merge.readiness)` }
-      : { name, status: 'ok', detail, hint: 'Run `minions settings set delivery.requiredChecksConfigured true` to record that these checks gate merging.' };
-  }
-  const plan = ciSetupPlan({ hasWorkflows: workflows === null ? null : workflows > 0, requiredChecks: rc.state, verificationCommands: config.verification.commands, baseBranch: base, repository: rc.repository });
-  const hint = plan.join('\n       ');
-  const what = `no required status checks on ${base}${workflows === 0 ? ' and no CI workflows' : workflows ? ` (${workflows} workflow(s), none required)` : ''}`;
-  if (flag) return { name, status: 'warn', detail: `${what}, but delivery.requiredChecksConfigured is true (never treated as zero required checks); ${noMerge}`, hint: `Run \`minions settings set delivery.requiredChecksConfigured false\`, or configure required checks:\n       ${hint}` };
-  return { name, status: 'unavailable', detail: `${what}: ${noMerge}`, hint };
-}
-
-/**
- * ci.authority: whether verification.ciAuthority "github" can take effect. Ready only when the base has
- * required status checks (read-only observation); otherwise every stage falls back to local
- * verification (the gate never approves on missing or unknown CI). Never 'fail'.
- */
-export function ciAuthorityReadiness(
-  config: Pick<MinionsConfig, 'delivery' | 'verification' | 'git'> | null,
-  rc: RequiredChecksReport | null,
-  ctx: { onGitHub: boolean; unknownReason?: string },
-): Check {
-  const name = 'ci.authority';
-  if (!config) return { name, status: 'unavailable', detail: 'configuration not loaded' };
-  const base = config.git.baseBranch;
-  const timeout = config.verification.ciPendingTimeoutMinutes ?? DEFAULT_CI_PENDING_TIMEOUT_MINUTES;
-  const required = rc?.state === 'configured' ? rc.requiredChecks : null;
-  if (config.verification.ciAuthority !== 'github') {
-    return required && ctx.onGitHub
-      ? { name, status: 'ok', detail: `verification.ciAuthority none: stages verify locally; required checks on ${base} (${required.join(', ')}) could serve as CI evidence`,
-          hint: 'Set verification.ciAuthority to "github" to let tester/reviewer stages rely on passing required checks for the reviewed head.' }
-      : { name, status: 'ok', detail: 'verification.ciAuthority none: stages verify locally' };
-  }
-  const fallback = 'stages fall back to local verification (CI never approves without readable, passing required checks)';
-  if (!ctx.onGitHub) return { name, status: 'warn', detail: `verification.ciAuthority github, but there is no GitHub remote: ${fallback}`, hint: 'Add a github.com origin and run `minions setup github`, or set verification.ciAuthority to "none".' };
-  if (config.delivery.mode !== 'pull-request') {
-    return { name, status: 'warn', detail: `verification.ciAuthority github, but delivery.mode is ${config.delivery.mode}: no pull request runs CI for task heads; ${fallback}`, hint: 'Run `minions setup` and choose pull-request delivery.' };
-  }
-  if (!rc || rc.state === 'unknown') {
-    return { name, status: 'warn', detail: `not ready: required checks on ${base} could not be read (${ctx.unknownReason ?? rc?.errors.join('; ') ?? 'not checked'}); ${fallback}`,
-      hint: 'Rerun doctor with the container running and a GitHub token that can read the repository (`minions auth github`).' };
-  }
-  if (!required) {
-    return { name, status: 'warn', detail: `not ready: no required status checks on ${base}; ${fallback}`,
-      hint: `Mark the CI check required for ${base} (branch protection or a ruleset: "Require status checks to pass"), then rerun doctor.` };
-  }
-  return { name, status: 'ok', detail: `ready: required checks on ${base} (${required.join(', ')}) count as CI evidence for the exact head observed by \`minions sync\`; pending timeout ${timeout} min` };
-}
-
-/** telegram.credential: ok / missing / invalid. Never 'fail': terminal mode must stay usable without Telegram. */
 function telegramCredentialCheck(s: TelegramCredentialStatus, channel: MinionsConfig['communication']['channel'] | undefined): Check {
   const name = 'telegram.credential';
   switch (s.state) {
@@ -363,24 +216,22 @@ async function telegramRuntimeChecks(ex: (args: string[]) => Promise<{ code: num
 
 /**
  * setup: obvious configuration gaps left after init (no verification commands, no setup commands for the local
- * integration of a Node project, GitHub remote without a
- * working token, Telegram selected without a bot token), with a pointer to the setup assistant.
+ * integration of a Node project, Telegram selected without a bot token), with a pointer to the setup assistant.
  */
 export function setupGapsCheck(config: Pick<MinionsConfig, 'verification' | 'communication'> & Partial<Pick<MinionsConfig, 'delivery'>>,
-  s: { onGitHub: boolean; githubCredential: CredentialStatus['state'] | null; telegramToken: TelegramCredentialStatus['state']; nodeProject?: boolean }): Check {
+  s: { telegramToken: TelegramCredentialStatus['state']; nodeProject?: boolean }): Check {
   const gaps: string[] = [];
   if (!config.verification.commands.length) gaps.push('no verification commands (verification.commands is empty)');
   // Local integration verifies in its own worktree, which has no node_modules unless setup installs them (task-136).
-  const localIntegration = config.delivery?.mode === 'local' && config.delivery.merge === 'auto-when-eligible';
+  const localIntegration = config.delivery?.merge === 'auto-when-eligible';
   if (s.nodeProject && localIntegration && !config.verification.setupCommands?.length) {
     gaps.push('local integration is on for a Node project but verification.setupCommands is empty: the integration worktree has no node_modules, so verification fails with "command not found" (set it to e.g. `npm ci`, `pnpm i --frozen-lockfile` or `yarn --immutable`)');
   }
-  if (s.onGitHub && s.githubCredential === 'missing') gaps.push('GitHub remote without a stored token');
   if (config.communication.channel === 'telegram' && s.telegramToken !== 'ok') gaps.push('Telegram selected without a valid bot token');
   if (config.communication.channel === 'auto' && s.telegramToken === 'invalid') gaps.push('the stored Telegram bot token is invalid (communication.channel auto)');
   return gaps.length
     ? { name: 'setup', status: 'warn', detail: `incomplete: ${gaps.join('; ')}`, hint: 'Run `minions setup assist` (AI setup assistant in Claude Code) to finish the remaining setup, or follow the hints above.' }
-    : { name: 'setup', status: 'ok', detail: 'no obvious gaps (verification commands set; credentials match the configured delivery and channel)' };
+    : { name: 'setup', status: 'ok', detail: 'no obvious gaps (verification commands set; credentials match the configured channel)' };
 }
 
 /** Overall Telegram readiness from the channel resolution. Never 'fail': terminal is the baseline. */
@@ -470,7 +321,7 @@ async function hostRuntimeChecks(project: ProjectJson, auth: ClaudeAuth, baseUrl
 /**
  * integration.* checks (local integration, task-82.4) from the runtime's `minions status --json`: its integration
  * block carries the problems the runtime derived (stale lock, halted queue, a dirty checkout, a crash during
- * `git merge --ff-only`). No block (not local delivery, an older image): no checks. One ok line when all is well.
+ * `git merge --ff-only`). No block (an older image): no checks. One ok line when all is well.
  */
 export function integrationDoctorChecks(r: { code: number; stdout: string }): Check[] {
   if (r.code !== 0) return [];
@@ -484,27 +335,6 @@ export function integrationDoctorChecks(r: { code: number; stdout: string }): Ch
     const queued = Array.isArray(i.queue) ? i.queue.length : 0;
     return [{ name: 'integration', status: 'ok', detail: `local integration ${i.enabled ? 'on' : 'off'}; ${i.lock?.state === 'live' ? 'integrator running' : 'integrator idle'}; ${queued} queued` }];
   } catch { return []; }
-}
-
-/** `minions ci status --json` output from the container (gh api); null when unavailable (e.g. an older image). */
-function parseCiStatus(r: { code: number; stdout: string }): RequiredChecksReport | null {
-  if (r.code !== 0) return null;
-  try {
-    const env = JSON.parse(r.stdout) as { ok?: boolean; data?: { requiredChecks?: RequiredChecksReport | null } };
-    const rc = env.ok ? env.data?.requiredChecks : null;
-    return rc && typeof rc.state === 'string' && rc.state !== 'unknown' ? rc : null;
-  } catch { return null; }
-}
-
-/** Host fallback: read-only GETs with the stored token when the container cannot answer. */
-async function hostRequiredChecks(project: { projectId: string; remoteUrl: string | null }, config: MinionsConfig | undefined, credential: CredentialStatus['state'] | null,
-  runner: Runner, f?: Fetch): Promise<{ rc: RequiredChecksReport | null; reason?: string }> {
-  const r = githubRepoFromRemote(project.remoteUrl);
-  if (!r || !config) return { rc: null, reason: 'configuration not loaded' };
-  if (credential !== 'ok') return { rc: null, reason: `GitHub credential ${credential ?? 'unknown'}` };
-  const token = await readGithubToken(project.projectId, runner).catch(() => null);
-  if (!token) return { rc: null, reason: 'GitHub token unreadable' };
-  return { rc: await requiredChecksStatus(fetchApi(token, f), `${r.owner}/${r.repo}`, config.git.baseBranch) };
 }
 
 /**
@@ -602,7 +432,7 @@ export async function managerAssistantChecks(opts: { runner?: Runner; probe?: ()
 }
 
 export async function runDoctor(opts: {
-  cwd: string; runner?: Runner; probe?: DockerProbe; fetch?: Fetch; fingerprint?: string | null; version?: string;
+  cwd: string; runner?: Runner; probe?: DockerProbe; fingerprint?: string | null; version?: string;
   /** Claude CLI check of the manager assistant (tests); defaults to probeClaude through the runner. */
   claudeProbe?: () => Promise<CapabilityCheck>;
   /** Host platform (tests); defaults to process.platform. */
@@ -645,9 +475,6 @@ export async function runDoctor(opts: {
 
   let projectId: string | null = null;
   let effective: MinionsConfig | null = null;
-  const github: { onGitHub: boolean; credential: CredentialStatus['state'] | null } = { onGitHub: false, credential: null };
-  // Required status checks on the base branch (read-only GET only; never modifies repository settings).
-  let ci: { rc: RequiredChecksReport | null; reason?: string } = { rc: null, reason: 'project not found' };
   try {
     const ref = await projectForPath(opts.cwd);
     projectId = ref.projectId;
@@ -666,11 +493,6 @@ export async function runDoctor(opts: {
     } catch (e) {
       add('config', 'fail', isMinionsError(e) ? e.message : String(e), 'Fix the configuration file, then rerun doctor.');
     }
-    const gc = await githubCheck(project, runner, opts.fetch);
-    add(...gc);
-    github.onGitHub = githubRepoFromRemote(project.remoteUrl) !== null;
-    github.credential = (['ok', 'missing', 'invalid', 'unverified'] as const).find((s) => gc[2].startsWith(`${s}:`)) ?? null;
-    checks.push(await githubSetupCheck(project, ref.repoPath, github.credential, runner));
     const channel = config?.communication.channel;
     const tgCred = await telegramCredentialStatus(project.projectId, { runner })
       .catch((e): TelegramCredentialStatus => ({ state: 'invalid', detail: `could not check (${short(String((e as Error).message ?? e))})` }));
@@ -688,7 +510,7 @@ export async function runDoctor(opts: {
     const harnesses = harnessView(config);
     if (hostMode) {
       restart = notApplicable('host runtime: no container to restart');
-      tgPlugin = await hostRuntimeChecks(project, auth, baseUrl, wantsTelegram, runner, add, checks, config?.delivery.mode === 'local');
+      tgPlugin = await hostRuntimeChecks(project, auth, baseUrl, wantsTelegram, runner, add, checks, !!config);
       checks.push(...harnessSkipChecks(harnesses, 'host-runtime'));
     } else if (docker.daemon && docker.compose) {
       const label = await imageBuildLabel(project.imageTag, runner);
@@ -730,7 +552,7 @@ export async function runDoctor(opts: {
         }
         checks.push(...tmpUsageChecks(await ex(['df', '-Pk', '/tmp', CONTAINER.scratch]), { capMiB: tmpSizeMiB(project.container), scratch: CONTAINER.scratch }));
         checks.push(backlogCliCheck(await ex(['backlog', '--version'])));
-        if (config?.delivery.mode === 'local') checks.push(...integrationDoctorChecks(await ex(['minions', 'status', '--json'])));
+        if (config) checks.push(...integrationDoctorChecks(await ex(['minions', 'status', '--json'])));
         const probe = await ex(['minions', 'coordinator', '--probe', '--json']);
         const perm = probe.code === 0 ? probePermission(probe.stdout) : undefined;
         add('claude.capabilities', probe.code !== 0 ? 'fail' : perm?.fallback ? 'warn' : 'ok', probe.code === 0
@@ -738,7 +560,6 @@ export async function runDoctor(opts: {
           : `coordinator probe failed (exit ${probe.code}): ${short(probe.stderr || probe.stdout)}`);
         // Credential-free; never 'fail' because terminal mode must stay usable without Telegram.
         tgPlugin = await telegramRuntimeChecks(ex, wantsTelegram, checks);
-        if (github.onGitHub) ci = { rc: parseCiStatus(await ex(['minions', 'ci', 'status', '--json'])) };
         // The self-test takes a few seconds on the first run per container start (cached after that).
         if (harnesses.processHarnesses.length) {
           const probe = await compose.exec(['minions', 'work', 'probe', '--json'], { allowFailure: true, timeoutMs: 180_000 });
@@ -755,7 +576,6 @@ export async function runDoctor(opts: {
       checks.push(...harnessSkipChecks(harnesses, 'no-docker'));
       restart = restartUnknown('Docker unavailable');
     }
-    if (github.onGitHub && !ci.rc) ci = await hostRequiredChecks(project, config, github.credential, runner, opts.fetch);
     // Overall Telegram readiness: ok / missing / unavailable (never fail; terminal is the baseline).
     if (channel) {
       const probe = tgPlugin ? { available: tgPlugin.status === 'ok', summary: tgPlugin.detail, items: [] } : undefined;
@@ -765,15 +585,13 @@ export async function runDoctor(opts: {
     }
     if (config) {
       const nodeProject = await stat(join(ref.repoPath, 'package.json')).then((x) => x.isFile(), () => false);
-      checks.push(setupGapsCheck(config, { onGitHub: github.onGitHub, githubCredential: github.credential, telegramToken: tgCred.state, nodeProject }));
+      checks.push(setupGapsCheck(config, { telegramToken: tgCred.state, nodeProject }));
     }
   } catch (e) {
     add('project', 'warn', isMinionsError(e) ? e.message : String(e), 'Run `minions init` in this repository.');
   }
 
-  add('merge.readiness', ...mergeReadiness(effective, github, github.onGitHub ? ci.rc ?? null : undefined));
-  checks.push(requiredChecksReadiness(effective, ci.rc, { onGitHub: github.onGitHub, unknownReason: ci.reason }));
-  checks.push(ciAuthorityReadiness(effective, ci.rc, { onGitHub: github.onGitHub, unknownReason: ci.reason }));
+  add('merge.readiness', ...mergeReadiness(effective));
   checks.push(...await managerChecks({ runner }));
   checks.push(...await managerAssistantChecks({ runner, ...(opts.claudeProbe ? { probe: opts.claudeProbe } : {}) }));
   checks.push(...await managerSupervisorChecks({ runner, platform: opts.platform ?? process.platform }));
