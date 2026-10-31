@@ -235,6 +235,34 @@ message about its task), and the routine's runnable, unvalidated, split and awai
 is a hold now). `work claim|record|release` stay as primitives; the recover skill uses the last two for leases left
 from before this decision. Process-harness roles run through the dispatcher's `minions work run`, as before.
 
+## Decision 12. Verify before review; two test tiers (owner, 2026-10-31)
+
+Owner: unit tests are cheap and fast, catch edge cases and general functionality, and run before merges; integration
+tests run on the base once in a while (and rarely on a branch with heavy changes) and should fail rarely and
+meaningfully. Tasks need no tester: the engineer writes the tests, the code is verified, and the reviewer does not rerun
+them.
+
+- **Default flow: engineer → reviewer.** Risk-based testing is gone (`verification.testerRequired`, `qaLabels`, the
+  reviewer's `needsQa`, the QA insertion and `{ "when": "qa" }` stages; old configs load with them dropped). The tester
+  role stays for QA sweeps and explicit flows: removing it would cost more (statuses, sweeps, legacy `testing` tasks)
+  than it saves.
+- **Verify step.** A gate stage starts only on a head whose `verification.commands` (the fast tier) passed. The
+  dispatcher runs them deterministically in its own worktree with the integrator's runner (setup caching, allowlisted
+  env, per-command timeout, logs), one run at a time, before it claims the gate. Red: a counted repair cycle with the
+  failing command and output tail as the engineer's finding. Timeout, exit 127 or a setup failure: blocked with a setup
+  hint, as in the integrator. Green: `verify` evidence with the head's tree. Checked at the gate rather than at the
+  producer's record, so a restart, a legacy task or a re-review can never skip it.
+- **The integrator does not repeat it** when the merged tree is the verified tree (the base did not move); otherwise it
+  verifies the merged tree as before.
+- **Slow tier: `verification.periodic`** (`commands`, `everyHours`, default 24), run by the dispatcher (it has the
+  clock and the verify slot) on the base head when due and the base moved since the last run. A failure files one
+  `verify:periodic` task and a notice; none while one is still open. A task labelled `verify:full` runs the periodic
+  commands in its verify step too, for heavy changes; the coordinator uses it sparingly.
+- **No unverified landings.** With `delivery.merge` "auto-when-eligible" and no `verification.commands`, integration
+  stays on and the integrator refuses every landing (the task is blocked with the hint), instead of approvals quietly
+  ending `delivered`. The coordinator's first task in such a project is to set up the fast checks, and the slow ones
+  as `verification.periodic`.
+
 ## Reversed decisions
 
 - telegram-decisions.md D2 (tap buttons instead of native polls): native polls are built at the owner's request.
@@ -244,6 +272,8 @@ from before this decision. Process-harness roles run through the dispatcher's `m
 - coordinator-sessions.md phase 10 / unattended-delivery.md item 7 (dispatcher waits for a spike): built as phase 1.
 - bootstrap.md (GitHub delivery, "origin/<base> as the single source of truth", CI-gated auto-merge, GitHub in the
   container) and unattended-delivery.md (PR and CI sync, GitHub intake in the routine pass): removed by Decision 8.
+- Risk-based testing (per-task tester on QA labels, sensitive paths or a reviewer's `needsQa`; README Testing):
+  replaced by Decision 12.
 - coordinator-sessions.md phase 7 (task sessions dispatch their stages) and the reset barrier, and unattended-delivery.md
   item 6 (`work advance`) and the routine's runnable wakes: removed by Decision 10.
 

@@ -203,9 +203,9 @@ Talk to the coordinator in plain language in the attached terminal, or over Tele
 The coordinator turns each goal into backlog tasks with acceptance criteria and dispatches them:
 
 1. **Claim.** A helper takes a lease on the task. A task can't be claimed twice, and each task has only one active stage at a time.
-2. **Engineer.** Implements the task on `agent/<task-slug>` in its own worktree, branched from the configured base branch (not necessarily `main`). It adds or updates tests for the acceptance criteria and runs the verification commands.
-3. **Tester (only when the task needs QA).** See [Testing](#testing). Runs after the engineer, never at the same time on the same branch.
-4. **Reviewer.** Inspects the exact head commit in a separate checkout and returns a structured verdict. It owns test adequacy: missing or weak tests are a reason to request changes. The reviewer never fixes production code and never publishes merges.
+2. **Engineer.** Implements the task on `agent/<task-slug>` in its own worktree, branched from the configured base branch (not necessarily `main`). It writes or updates unit tests for the new behaviour and runs the fast checks.
+3. **Verify.** The dispatcher runs `verification.commands` on the engineer's head (no worker). A failure goes back to the engineer as a repair; see [Testing](#testing).
+4. **Reviewer.** Inspects the exact head commit in a separate checkout and returns a structured verdict. It reruns no tests: it judges the code, the test quality and the coverage of new behaviour. The reviewer never fixes production code and never publishes merges.
 5. **Deliver.** The approved commit stays on its branch; the coordinator or the local integration merges it into the local base, depending on configuration.
 
 Each worker receives a compact task brief: objective, acceptance criteria, non-goals, relevant decisions and files, branch, worktree, expected head, authorized commands, model, and attempt limit. Each worker returns a validated result with one of these statuses: `complete`, `needs_changes`, `blocked`, `needs_split`, or `partial`. A malformed result gets one correction attempt. After that it is stored as unvalidated and is never promoted to an approval.
@@ -224,7 +224,7 @@ Every project's coordinator follows these defaults unless you tell it otherwise.
 - **Spend:** tallies coordinator and worker usage per session and reports it with deliveries and on request: USD with API-key billing, tokens on a subscription. With a budget you give in chat (USD, or tokens on a subscription), it warns at about 50% and 80% and pauses starts at 100%. `budgets.*` is USD-only and not enforced in v0.1.
 - **Quota mode:** on "major things only, then stop", it finishes or parks in-flight work, pauses starts, and asks before spending more.
 - **Briefs and staffing:** investigates first, then briefs engineers with context, goal, pitfalls and how to verify. Reasoning effort is set per role on the host (`models.effortByRole`; unset means the Claude Code default), not per call. For hard work or after a failure it uses the deep engineer, then a stronger model; a small model for mechanical checks.
-- **Testing:** the reviewer owns test adequacy. Testers are for risky tasks and QA sweeps (see [Testing](#testing)).
+- **Testing:** no tester per task; the runtime verifies each head before review, and the reviewer owns test adequacy (see [Testing](#testing)).
 - **Merging:** the `project-owner` coordinator merges approved branches into the container's local base itself, `personal-work` asks before each merge, and `supervised` never merges. The merge is verified before it is committed (`git merge --no-commit`, run the verification commands, then commit or abort); on a conflict or failure the task goes back for a repair. `minions export` brings the integrated base to the host as `minions/<base>`. With **automatic local integration** (`delivery.merge: "auto-when-eligible"`, offered by `minions setup`; `base.merge` allow in `project-owner`, ask in `personal-work`, deny in `supervised`) the coordinator merges nothing: the runtime merges each approved head as a commit object, runs the verification commands on the merged tree in its own worktree (a failed command is rerun once; a pass on the rerun lands with a `flaky` notice), and fast-forwards the base only when they pass. The task is `merging` meanwhile and `done` once it lands; a conflict or failure sends it back for a repair, and sensitive paths need `minions work approve <task> --head <sha>` on the host. Workers keep running during an integration. `minions status` shows the integration block, `minions doctor` reports a stale lock, a halted queue or a checkout that is not clean ([design](docs/design/local-auto-integration.md)).
 - **Design first** for big features, shown to you before the build.
 - **Graceful operations:** pauses or drains before restarts and upgrades, and keeps uncommitted work.
@@ -235,22 +235,14 @@ Every project's coordinator follows these defaults unless you tell it otherwise.
 
 ### Testing
 
-Testing is risk-based. Per-ticket testers mostly re-ran the suite; the problems worth a tester were integration and system-level ones. So by default a task goes **engineer → reviewer → delivered**:
+Two tiers ([design](docs/design/autonomy.md), Decision 12). A task goes **engineer → verify → reviewer → delivered**:
 
-- The **engineer** writes and updates tests for the acceptance criteria and runs the verification commands.
-- The **reviewer** judges whether those tests are meaningful and cover the criteria and edge cases, and requests changes if not.
+- **Fast tier: `verification.commands`** (unit tests, typecheck, lint). The **engineer** writes the tests for new behaviour and runs these before recording. The dispatcher then runs them on the engineer's head in its own worktree: a failure sends the task back to the engineer as a repair cycle with the failing command and its output; a setup problem (timeout, a missing tool) blocks it. The **reviewer** starts only on a verified head and reruns nothing. The local integration runs them again on the merged tree, unless that tree is the one already verified.
+- **Slow tier: `verification.periodic`** (`{ "commands": [...], "everyHours": 24 }`, integration tests). The dispatcher runs it on the base head when it is due and the base moved since the last run. A failure files one backlog task labelled `verify:periodic` and notifies you. A task labelled `verify:full` (heavy changes) also runs these in its verify step.
 
-A task gets a **tester stage** (status `testing`, before delivery) only when it needs QA:
-
-- it has a QA label: `qa` by default, or the labels in `verification.qaLabels`. The coordinator adds one for risky tasks;
-- its branch touches a [sensitive path](#sensitive-changes) (checked against the diff and the engineer's `modifiedPaths`);
-- the reviewer sets `"needsQa": true` in its result. An approval with `needsQa` moves the task to `testing` instead of delivered, and it comes back to review afterwards.
-
-The last two are recorded on the task as its first QA label (plus a `qa-required` event), so later stages and the merge apply the same requirement. A reviewer approval, and the merge, need passing tester evidence for the exact head whenever the task needs QA.
+With automatic local integration and no `verification.commands`, nothing lands: the integrator blocks each approved task until the commands are set, and setting them up is the coordinator's first task.
 
 **QA sweeps.** Testers mainly run QA sweeps against the base branch, not a ticket branch. The coordinator schedules one at a milestone, before a release, after several merges (about five), or when you ask. A sweep is a backlog task labelled `qa-sweep`, claimed with `--role tester`. The tester works in a detached worktree at the base head and commits nothing. It checks end-to-end flows, install and upgrade paths, and regressions across features. Recording the sweep closes it as `done`, and the coordinator creates one backlog task per finding. There is no separate command for this: ask the coordinator ("run a QA sweep").
-
-To keep the old flow, with a tester for every task, set `verification.testerRequired` to `true`. The tester-evidence gate then applies to every approval and merge, as before.
 
 ### Built-in skills
 
@@ -323,7 +315,7 @@ The engineer, tester and reviewer are the built-in roles. A project can add its 
 - `edits`: `none` (default), `any`, or `{ "paths": [globs] }`; `commits` (default: true when it may edit). Enforced: a stage that changes a file outside `edits.paths` is an invalid result.
 - `tools`, `model`, `effort`, `maxTurns`, `requires` (capabilities the stage needs; a `deny` or `ask` refuses the claim) and `capabilities` (the role's column in the policy table; `base.merge`, `external.*`, `ci.edit`, `infrastructure.edit` and `deploy.execute` default to `deny`).
 
-**Workflows.** `workflows.<name>` is an ordered list of stages, each a role name or `{ "role", "when": "qa", "model" }`. The coordinator assigns one when it creates a task (`minions backlog create ... --workflow <name>`); tasks without one run the default (engineer, tester when QA is required, reviewer). With `verification.reviewerRequired`, a gate must come after the last stage that commits, and a task that needs QA always gets a tester before its final gate, whatever its workflow.
+**Workflows.** `workflows.<name>` is an ordered list of stages, each a role name or `{ "role", "model" }`. The coordinator assigns one when it creates a task (`minions backlog create ... --workflow <name>`); tasks without one run the default (engineer, reviewer). With `verification.reviewerRequired`, a gate must come after the last stage that commits. Every gate stage starts only on a verified head (see [Testing](#testing)).
 
 **How a role is added.** The coordinator owns the configuration: it writes a partial config (the role under `roles.<name>` with an inline `promptText`, and the workflow that uses it) and applies it with `minions control apply --file <f> --reason <why> --json`. The change is validated like any config (an invalid one is refused with the field named, nothing is written), journaled and undoable (`minions control undo`), and takes effect for the next stage. `minions control show --json` shows what it set. You can also edit `roles` and `workflows` by hand on the host; validation is the same.
 
@@ -498,7 +490,7 @@ Tightening permissions suspends the affected external actions immediately. A wor
   "execution": { "maxActiveTasks": 2, "maxEngineers": 2, "maxRepairCyclesBeforeReplan": 3, "attemptMaxTurns": 80 },
   "models": { "default": "sonnet", "allowed": ["sonnet", "opus", "haiku"], "selection": "coordinator" },
   "delivery": { "merge": "auto-when-eligible" },
-  "verification": { "commands": [], "testerRequired": false, "reviewerRequired": true, "qaLabels": ["qa"] },
+  "verification": { "commands": [], "reviewerRequired": true },
   "communication": { "channel": "auto", "progress": "milestones" },
   "budgets": { "taskUsd": null, "dailyUsd": null }
 }
@@ -529,7 +521,7 @@ By default every worker is a Claude Code subagent. minions can also run workers 
 1. stores an OpenAI API key (prompted without echo; the same as `minions auth codex`). Use a key of a dedicated OpenAI project with a usage limit: it is billed at API prices;
 2. asks for the Codex model (an OpenAI model id your key can use) and writes `harnesses.codex.models`;
 3. sets `harnesses.default: "codex"`. It applies only to the roles this version allows on a process harness (project gate roles); every other role stays on Claude Code;
-4. adds the `codex-reviewer` role and its stage after the reviewer in the workflow you choose (`default` writes the derived default stages out explicitly, so `verification.testerRequired` / `reviewerRequired` no longer reshape it).
+4. adds the `codex-reviewer` role and its stage after the reviewer in the workflow you choose (`default` writes the derived default stages out explicitly, so `verification.reviewerRequired` no longer reshapes it).
 
 Everything goes to the host-only `config.local.json` and is validated before it is written. The host runtime refuses process harnesses, so setup does not ask there.
 
