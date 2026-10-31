@@ -1,0 +1,170 @@
+# Autonomy: automatic flow, coordinator-owned control, Telegram threads and polls
+
+Status: **owner direction (2026-10-31), build in progress on branch `autonomy`.** This document supersedes the parts of
+earlier designs it names under [Reversed decisions](#reversed-decisions).
+
+Owner direction (2026-10-31, after a minions-on-minions run was too slow and too expensive):
+
+1. **Automatic flow.** Tasks move between dev, review and merge without the coordinator on a normal day. The
+   coordinator is needed only for exceptions.
+2. **The coordinator has full control.** It sets up projects, stores secrets, defines worker profiles (roles) and
+   flows (workflows), assigns a flow per task with a default for the rest, and changes any of it live: "remove the
+   tester from the flow" takes effect on the next stage, without a restart and without the owner.
+3. **Telegram: threads and polls.** Replies carry their context to the coordinator, the coordinator answers in the
+   thread, and it can ask a multiple-choice question as a native poll and get the answer back.
+4. **Context management by thread.** Each Telegram thread gets its own coordinator session; a new thread gets a new
+   session.
+
+The owner trusts the coordinator with this ("I believe in it, and think it should turn out to be safe"). Safety
+therefore comes from an audit trail, undo and notices, not from owner confirmation of each change.
+
+## Phases
+
+| Phase | What | State |
+| - | - | - |
+| 1 | Autopilot dispatcher: deterministic stage loop with headless workers | build |
+| 2 | Control layer: coordinator-owned config overlay, applied live, journaled, undoable | build |
+| 3 | Secrets the coordinator stores, injected into the roles that declare them | build |
+| 4 | Telegram: reply context end to end, threaded replies, native polls | build |
+| 5 | Thread sessions: one coordinator session per Telegram thread | build after 4 |
+| 6 | Project setup by the coordinator (`minions projects create` from the runtime) | later |
+
+## Decision 1. The autopilot dispatcher
+
+A deterministic node process, `minions work dispatch` (hidden; `minions work autopilot status` shows it), runs the
+stage loop the coordinator runs by hand today:
+
+```
+loop:
+  report = scheduler.next()                     # same checks as `work next`
+  for each runnable stage within limits:
+    claim it (claimWithBrief)                   # same checks as `work claim`
+    spawn a headless worker for the lease
+  on worker exit:
+    record (recordSubmitted)                    # same checks as `work record --submitted`
+    decision = recordDecision(...)              # same table as `work advance`
+    decision != null -> hand it to the coordinator (inbox / outbox `decision` item), do not retry blindly
+```
+
+- **Everything goes through the existing functions.** Claim, brief, record, the stage machine, QA insertion, repair
+  cycles, CI gates, publication and local integration stay in `Scheduler`; the dispatcher only replaces the
+  coordinator's turns between them. `recordDecision` and `nextDecision` (src/runtime/advance.ts) already say exactly
+  when a human-level judgement is needed; those are the coordinator's exceptions.
+- **One correction.** An `invalid` result with `correctionAllowed` gets one automatic correction run (the same lease,
+  a resumed worker with the errors) before it becomes an exception, as the coordinator does today.
+- **Headless workers.** A stage runs as `claude -p --plugin-dir <fresh plugin> --agent minions:<role>` in the lease
+  worktree, in a fresh `CLAUDE_CONFIG_DIR` with the task-96 headless credential (src/runtime/headless.ts), no
+  channel (`--strict-mcp-config`), stream-json output for usage, and `--max-turns` from the role. The prompt is the
+  lease marker plus `worktree:` line, exactly what the coordinator sends today.
+- **Live roles.** The plugin is generated from the *current* effective config for each spawn (into the run dir), so
+  a role, prompt, model or tool change takes effect on the next stage. No coordinator restart.
+- **Guards without `agent_id`.** A headless worker is its own main thread, so hook inputs have no `agent_id`. The
+  dispatcher sets `MINIONS_WORKER_LEASE=<leaseId>` and `MINIONS_WORKER_ROLE=<role>` in the worker env; hooks treat
+  either `agent_id` or `MINIONS_WORKER_LEASE` as "a worker" (pre-bash, pre-file, drain, Telegram). The pre-filter
+  shell snippets test the variable as well, so a headless worker never takes the fast "coordinator" path.
+- **Process model.** Each worker is supervised by the same code as process harnesses and sessions
+  (runner/supervise.ts: own process group, wall-clock timeout, SIGINT/TERM/KILL). A run record per lease
+  (`<state>/run/dispatch/<leaseId>.json`) lets a restarted dispatcher reap orphans and recover leases.
+- **Lock and start.** Meta row `dispatcher_lock` (same liveness rules as the supervisor lock). The coordinator
+  wrapper starts it (and restarts it when the lock is stale) when `dispatch.mode` is `auto`.
+- **Setting.** `dispatch.mode: "auto" | "coordinator"` (live). `auto` is the default for new projects. With `auto`,
+  `work next/claim/advance` from the coordinator still work (it may dispatch a stage by hand), but the coordinator
+  prompt tells it that the dispatcher runs the happy path and it should only handle decisions.
+- **Capacity.** `execution.maxActiveTasks`, `execution.maxByRole`, the budget, pause and drain are honoured because
+  they are checked by `next` and `claim`.
+- **Exceptions.** A decision is stored as an outbox `decision` item (session = the task's session when sessions are
+  on, else the coordinator) and as a `dispatch-decision` event, so the coordinator's next turn sees it in
+  `minions status`. The dispatcher never starts work on a task that has an unhandled decision; the coordinator
+  clears it by acting (`work claim`, `backlog update`, ...) or with `minions work autopilot resume <taskId>`.
+
+## Decision 2. Flows (workflows) as coordinator-owned config
+
+Workflows exist (roles-and-workflows.md D5): named stage lists, per-task `--workflow`, a `default`. What changes:
+
+- **The coordinator edits them itself, live** (Decision 3): `minions control set workflows.docs '["engineer","reviewer"]'`
+  or `minions control set workflows.default '["engineer","reviewer"]'`. The scheduler already re-reads workflows per
+  command; with the dispatcher's fresh plugin per spawn nothing else needs a restart.
+- **Explicit end stages.** A flow may end with `ci` and/or `merge`:
+  - `ci`: the stage before it may complete only with green required checks (today `verification.ciAuthority`), and
+    the delivery waits for CI.
+  - `merge`: the flow lands the work (local integration or PR auto-merge per `delivery.*`). A flow without `merge`
+    stops at `delivered` (the owner or the coordinator merges).
+  These are pseudo-stages: they run no worker, they select the existing delivery behaviour per task. A flow without
+  either keeps today's behaviour (delivery from `delivery.*`).
+- **Invariants stay, but are config.** The "gate after the last committing stage" and "QA tester inserted for risky
+  changes" rules are on by default and can be turned off by the coordinator (`verification.reviewerRequired`,
+  `verification.qaInsertion`), because the owner asked for full control.
+
+## Decision 3. The control layer
+
+A new config layer, **control**, owned by the coordinator:
+
+```
+profile defaults < project < local (host) < control (coordinator) < session
+```
+
+- **Storage:** `<state>/control/overlay.json` (a partial config, deep-merged; `null` deletes a key) plus a journal
+  `<state>/control/journal.jsonl` (one line per change: revision, time, actor, reason, key, before, after).
+- **Commands (runtime and host):**
+  - `minions control show [--json]`: the overlay, its revision, and the effective value of every changed key.
+  - `minions control set <key> <json-value> --reason <text>`: any config key (dot path; arrays and objects as JSON).
+  - `minions control unset <key> --reason <text>`.
+  - `minions control apply --file <f> --reason <text>`: a partial config, merged at once (roles plus workflows in one
+    change).
+  - `minions control log [--limit n]` and `minions control undo [<revision>]`.
+- **Validation:** the merged config is validated by the same schema (`validateConfig`) before the write; an invalid
+  change is refused with the field named. Writes are atomic and serialized by a lock file.
+- **Effect:** the runtime merges the overlay on every config load (it was cached per process; the cache now keys
+  on the overlay revision), so `live` settings apply on the next command. The dispatcher re-reads it each tick.
+  Restart-class settings (coordinator prompt, launch args, container mounts) are applied by the host the next time it
+  resolves the config; `control set` says so in its response (`appliesOn: "next-command" | "next-stage" |
+  "coordinator-restart" | "container-recreate"`) from setting-classes.ts.
+- **No owner confirmation.** Every change is applied at once and journaled; a change to a `host-owned` key (policy,
+  capabilities, delivery, sandbox, permissions) queues an outbox `notice` so the owner sees it in the digest. Undo is
+  one command.
+- **Roles (worker profiles)** are config like any other key: `minions control set roles.researcher '{...}'` with an
+  inline `promptText`. The `config roles propose/apply` flow stays for the host but is no longer needed.
+
+## Decision 4. Secrets
+
+- `minions secrets set <NAME> [--stdin] --reason <text>` (runtime and host): stores a named secret in the project's
+  secret store `<state>/control/secrets/<NAME>` (0600, the dir 0700). `NAME` is `^[A-Z][A-Z0-9_]{1,63}$`. The value is
+  read from stdin only (never argv), never printed, never journaled (the journal stores its sha256 prefix).
+- `minions secrets list` (names, sizes, set time) and `minions secrets remove <NAME>`.
+- **Use:** a role declares `secrets: ["NPM_TOKEN"]`; the dispatcher puts them into that worker's env. Verification
+  commands of the integrator get `verification.secrets`. The coordinator never needs to read a value back.
+- Workers' existing guards already deny reads of the state dir.
+
+## Decision 5. Telegram threads and polls
+
+Built on the minions channel server (src/telegram/channel, task-67), which the host runtime already uses.
+
+- **Reply context.** Inbound notifications carry `reply_to_message_id`, `reply_to_text` and `quote` (built). The
+  router forwards them to the session (`coordinator send --reply-to-text`), and sessions see them in the inbox
+  message header.
+- **Threaded replies.** The coordinator's `reply` defaults `reply_to` to the message it is answering (the last
+  inbound message of the thread) when none is given.
+- **Native polls** (reverses telegram-decisions.md D2 "buttons over polls" at the owner's request): a `poll` tool
+  `{question, options[2..10], multiple?, reply_to?}` sends a non-anonymous `sendPoll` and returns `poll_id` and
+  `message_id`. The server polls `poll_answer` updates; an answer from the owner becomes a channel notification
+  `"[poll answer] <question>: <option text(s)>"` with meta `poll_id`, `option_ids`, `reply_to_message_id` = the
+  poll message. `close_poll {poll_id}` stops it. Polls are stored in the channel message map so the answer reaches
+  the session that asked (Decision 6).
+
+## Decision 6. Thread sessions
+
+- A **thread** is a reply chain: its id is the message id of its root. A message that replies to a message of a
+  known thread joins that thread; a top-level message (no reply) starts a **new thread**.
+- With `coordinator.sessions.enabled`, each thread gets its own session `thread:<rootId>`; a new thread gets a new
+  session. Task sessions stay (`task:<id>`); a thread that creates or discusses a task keeps talking to the owner,
+  and the task's decisions are posted as replies into the thread that created the task.
+- Thread sessions close after `coordinator.sessions.threadIdleMinutes` (default 240) without traffic; a later reply
+  into the thread reopens it with its handoff note.
+
+## Reversed decisions
+
+- telegram-decisions.md D2 (tap buttons instead of native polls): native polls are built at the owner's request.
+- roles-and-workflows.md D2 (roles only via owner-applied proposals) and host-manager.md Decision 4 (container
+  requests need owner confirmation): the control layer applies coordinator changes directly.
+- coordinator-sessions.md (thread sessions deferred, TG 264): built as phase 5.
+- coordinator-sessions.md phase 10 / unattended-delivery.md item 7 (dispatcher waits for a spike): built as phase 1.
