@@ -48,28 +48,21 @@ describe('work next: runnable stages from the stage machine', () => {
     const n = await e.sched.next();
     expect(n.runnable).toEqual([{
       taskId: 'task-1', title: 'First', status: 'ready', priority: 'medium', kind: 'task',
-      role: 'engineer', agentType: 'minions:engineer', position: 0, count: 3, workflow: 'default',
+      role: 'engineer', agentType: 'minions:engineer', position: 0, count: 2, workflow: 'default',
       suggestedModel: 'sonnet', agentModel: null, modelRule: 'default',
       harness: 'claude', launch: { kind: 'agent', agentType: 'minions:engineer', agentModel: null },
-      reason: 'ready: stage 1/3 (engineer) of workflow default; model: default',
+      reason: 'ready: stage 1/2 (engineer) of workflow default; model: default',
     }]);
     expect(n).toMatchObject({ waiting: [], stuck: [], startsBlocked: null, message: '1 runnable stage(s): task-1 engineer' });
     expect(n.capacity.byRole.engineer).toMatchObject({ active: 0, max: 2, limited: true });
   });
 
-  it('follows the task through its workflow: reviewer after the engineer, the inserted tester when QA is required', async () => {
+  it('follows the task through its workflow: reviewer after the engineer', async () => {
     const e = env();
     e.backlog.add({ id: 'task-1' });
     await stageIn(e, 'task-1', undefined);
     expect(e.backlog.status('task-1')).toBe('reviewing');
-    expect((await e.sched.next()).runnable[0]).toMatchObject({ taskId: 'task-1', role: 'reviewer', agentType: 'minions:reviewer', position: 2, status: 'reviewing' });
-
-    e.backlog.add({ id: 'task-2', labels: ['qa'] });
-    await stageIn(e, 'task-2', 'engineer');
-    expect(e.backlog.status('task-2')).toBe('testing');
-    const t = (await e.sched.next()).runnable.find((x) => x.taskId === 'task-2')!;
-    expect(t).toMatchObject({ role: 'tester', position: 1, workflow: 'default' });
-    expect(t.reason).toMatch(/^testing: stage 2\/3 \(tester\) of workflow default/);
+    expect((await e.sched.next()).runnable[0]).toMatchObject({ taskId: 'task-1', role: 'reviewer', agentType: 'minions:reviewer', position: 1, status: 'reviewing' });
   });
 
   it('a multi-producer workflow: the task sits in implementing without a lease and the next producer is runnable (33.3 review)', async () => {
@@ -89,7 +82,7 @@ describe('work next: runnable stages from the stage machine', () => {
     await stageIn(e, 'task-1', 'reviewer', [], { status: 'needs_changes', verdict: 'request-changes', modifiedPaths: [] });
     const r = (await e.sched.next()).runnable[0]!;
     expect(r).toMatchObject({ taskId: 'task-1', role: 'engineer', position: 0, status: 'changes-requested' });
-    expect(r.reason).toMatch(/^changes-requested: repair \(cycle 1\) at stage 1\/3 \(engineer\)/);
+    expect(r.reason).toMatch(/^changes-requested: repair \(cycle 1\) at stage 1\/2 \(engineer\)/);
   });
 
   it('excludes leased tasks and ready tasks that are not startable (unauthorized, unmet dependency)', async () => {
@@ -327,7 +320,7 @@ describe('humanNext', () => {
     e.backlog.add({ id: 'task-4', status: 'implementing' });
     const out = humanNext(await e.sched.next());
     expect(out.split('\n')[0]).toBe('1 runnable stage(s): task-1 engineer');
-    expect(out).toMatch(/ {2}task-1 engineer -> minions:engineer: ready: stage 1\/3/);
+    expect(out).toMatch(/ {2}task-1 engineer -> minions:engineer: ready: stage 1\/2/);
     expect(out).toMatch(/waiting:\n {2}task-2 engineer: active task limit \(2\/2\)\n {2}task-3 engineer: active task limit/);
     expect(out).toMatch(/stuck:\n {2}task-4 \(implementing\):/);
   });

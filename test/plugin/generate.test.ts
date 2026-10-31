@@ -77,7 +77,7 @@ describe('generatePlugin', () => {
         expect(m[0], r).toContain('--expected-version <v>');
       }
     }
-    expect(seen).toBeGreaterThanOrEqual(4);
+    expect(seen).toBeGreaterThanOrEqual(3);
   });
 
   it('renders every placeholder', async () => {

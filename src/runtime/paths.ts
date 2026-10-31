@@ -90,6 +90,8 @@ export function runtimePaths(env: NodeJS.ProcessEnv = process.env, opts: { inCon
     review: join(workspace, 'review'),
     /** The local integrator's persistent detached worktree (never /workspace/repo; src/runtime/integrator.ts). */
     integration: join(workspace, 'integration'),
+    /** The dispatcher's detached verification worktree (the verify step and the periodic run; src/runtime/verify-step.ts). */
+    verify: join(workspace, 'verify'),
     configJson: env.MINIONS_CONFIG || c.configJson,
     /** Public key verifying host-signed publication approvals (see approvalPublicKeyPath; never env-redirectable in the container). */
     approvalPublicKey: approvalPublicKeyPath(env, opts.inContainer ?? inMinionsContainer()),

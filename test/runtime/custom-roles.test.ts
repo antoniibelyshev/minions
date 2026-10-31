@@ -80,7 +80,7 @@ describe('config: the test roles and workflows are valid, reserved names', () =>
 });
 
 describe('validateResult by contract variant (D4)', () => {
-  it('producer: no verdict, no needsQa, no CI evidence; failing checks allowed on complete', () => {
+  it('producer: no verdict, no CI evidence; failing checks allowed on complete', () => {
     expect(validateResult(base(), 'producer').ok).toBe(true);
     expect(validateResult(base({ checks: [{ command: 'npm test', outcome: 'fail' }] }), 'producer').ok).toBe(true);
     for (const over of [{ verdict: 'approve' }, { needsQa: true }, { checks: [{ command: 'test', outcome: 'pass', source: 'ci' }] }]) {
@@ -89,7 +89,7 @@ describe('validateResult by contract variant (D4)', () => {
     }
   });
 
-  it('verifier: no verdict or needsQa; complete cannot fail checks; never cites CI', () => {
+  it('verifier: no verdict; complete cannot fail checks; never cites CI', () => {
     expect(validateResult(base({ checks: [{ command: 'test', outcome: 'pass', source: 'ci' }] }), 'verifier').ok).toBe(false);
     expect(validateResult(base({ checks: [{ command: 'test', outcome: 'pass', source: 'local' }] }), 'verifier').ok).toBe(true);
     expect(validateResult(base({ verdict: 'approve' }), 'verifier').ok).toBe(false);
@@ -99,8 +99,9 @@ describe('validateResult by contract variant (D4)', () => {
     expect(validateResult(base({ status: 'needs_changes', checks: [{ command: 'npm test', outcome: 'fail' }] }), 'verifier').ok).toBe(true);
   });
 
-  it('gate: complete requires approve; needs_changes cannot approve; may set needsQa', () => {
-    expect(validateResult(base({ verdict: 'approve', needsQa: true }), 'gate').ok).toBe(true);
+  it('gate: complete requires approve; needs_changes cannot approve; needsQa is gone', () => {
+    expect(validateResult(base({ verdict: 'approve' }), 'gate').ok).toBe(true);
+    expect(validateResult(base({ verdict: 'approve', needsQa: true }), 'gate').ok).toBe(false);
     expect(validateResult(base(), 'gate').ok).toBe(false);
     expect(validateResult(base({ status: 'needs_changes', verdict: 'approve' }), 'gate').ok).toBe(false);
     expect(validateResult(base({ status: 'needs_changes', verdict: 'request-changes' }), 'gate').ok).toBe(true);
@@ -122,14 +123,14 @@ describe('validateResult by contract variant (D4)', () => {
 });
 
 describe('result contract text per variant (D4)', () => {
-  it('a producer is never told about verdict or needsQa; a gate is; nobody is told about CI evidence', () => {
+  it('a producer is never told about verdict; a gate is; nobody is told about CI evidence', () => {
     const p = resultContractText('producer');
     expect(p).not.toMatch(/verdict\?|verdict:|needsQa\?|source\?/);
     expect(resultContractText('verifier')).not.toMatch(/source\?/);
     expect(resultContractText('verifier')).not.toMatch(/verdict:/);
     const g = resultContractText('gate');
     expect(g).toMatch(/verdict: approve\|request-changes/);
-    expect(g).toMatch(/needsQa\?/);
+    expect(g).not.toMatch(/needsQa/);
     expect(g).toMatch(/head must not move/);
   });
 

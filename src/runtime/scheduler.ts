@@ -11,12 +11,12 @@ import { suggestModel, type ModelSuggestion } from '../config/models.js';
 import { baseRoleName, defaultMovedGates, ENGINEER_ROLE, exactWorkerRole, harnessRoleEffort, TESTER_ROLE, roleLimit, workerRole, workerRoleNames, type RoleDef } from '../config/roles.js';
 import type { MinionsConfig, RoleContract } from '../config/schema.js';
 import {
-  claimableStatuses, configuredStages, contractOf, derivePosition, finalGateIndex, nextRunnable, parseStages, positionForRole, repairTarget,
-  resolveWorkflow, sameStages, stageStatusOf, statusesAt, verifierBefore, withQaTester, workflowNames, type Stage, type Workflow,
+  claimableStatuses, configuredStages, contractOf, derivePosition, finalGateIndex, parseStages, positionForRole, repairTarget,
+  resolveWorkflow, sameStages, stageStatusOf, statusesAt, workflowNames, type Stage, type Workflow,
 } from '../config/workflows.js';
 import { verifyApproval } from '../core/approval.js';
 import { MinionsError } from '../core/errors.js';
-import type { BuiltinLeaseRole, Lease, LeaseRole, PublicationState, RuntimeDb } from './db.js';
+import type { BuiltinLeaseRole, EvidenceRow, Lease, LeaseRole, PublicationState, RuntimeDb } from './db.js';
 import { removeLeaseFiles, type HandoffPaths } from './handoff.js';
 import { corruptRecordHint, hasOpenRun, readRunRecord, removeRunRecord } from './runner/record.js';
 import { sessionScope } from './session-scope.js';
@@ -24,7 +24,7 @@ import { missingApprovalKeyReason, runtimePaths } from './paths.js';
 import { normalizeCheckCommand, resultContractText, validateResult, type WorkerResult } from './results.js';
 import { assertBudgetAllowsStart, billingOf, budgetNotice, latestLeaseUsage, recordLeaseUsage, tokensFromResultUsage, type Billing, type BudgetNotice, type SpendContext } from './spend.js';
 import { gateGit } from './git-hardening.js';
-import { enqueueIntegration, FLAKY_OUTCOME, integrationRows, openIntegration, startIntegratorDetached, type IntegrationRow } from './integrator.js';
+import { enqueueIntegration, FLAKY_OUTCOME, integrationRows, openIntegration, startIntegratorDetached, verifiedTree, VERIFY_EVIDENCE, type IntegrationRow, type VerifyResult } from './integrator.js';
 import { enqueue as enqueueNotice } from './outbox.js';
 import { BRANCH_PREFIX, branchFor, ensureBranchWorktree, ensureReviewWorktree, headOf, resolveBaseBranch, taskSlug, workspaceLayout, type WorkspaceLayout } from './worktree.js';
 
@@ -106,15 +106,15 @@ export interface Capacity {
 /** The harness a lease was claimed on; null (a lease from before schema 7) or an unknown id = claude. */
 export const leaseHarness = (l: Pick<Lease, 'harness'>): HarnessId => (isHarnessId(l.harness) ? l.harness : 'claude');
 
-/** Labels that opt a task into a per-task tester stage (verification.qaLabels, default ["qa"]). */
-export const qaLabelsOf = (cfg: MinionsConfig): string[] => cfg.verification.qaLabels ?? ['qa'];
-
 /**
  * A task with this label is a QA sweep: a tester runs it against the current base branch (not a
  * ticket branch), claimed from `ready`; its findings become new backlog tasks.
  */
 export const QA_SWEEP_LABEL = 'qa-sweep';
 export const isQaSweep = (task: Pick<Task, 'labels'>): boolean => task.labels.includes(QA_SWEEP_LABEL);
+
+/** A task whose verify step also runs verification.periodic.commands (heavy changes; docs/design/autonomy.md Decision 12). */
+export const VERIFY_FULL_LABEL = 'verify:full';
 
 /**
  * A task's position in its workflow (docs/design/roles-and-workflows.md D6): the stage list (with runtime
@@ -175,9 +175,6 @@ export interface NextReport {
    */
   warnings?: string[];
 }
-
-/** Why a task needs a tester stage; empty = engineer → reviewer only. `record` = add the QA label to the task. */
-export interface QaRequirement { reasons: string[]; record: boolean }
 
 /** Readiness scope from config (mirrors backlog/commands scopeOf, kept local so hooks don't load the CLI module). */
 export const scopeOf = (cfg: MinionsConfig): ScopeFilter => ({
@@ -428,8 +425,7 @@ export class Scheduler {
 
   /**
    * D5: a workflow assigned between stages (the stage row names another workflow) resets the position to the
-   * first stage of the new workflow without `complete` evidence at the current head (`when: qa` stages count
-   * only when QA is required); with evidence for every stage, the final gate (else the last stage) runs again.
+   * first stage of the new workflow without `complete` evidence at the current head; with evidence for every stage, the final gate (else the last stage) runs again.
    * The task's status moves to that stage's when it cannot be claimed from the current one, and the reset is
    * recorded as a `workflow-reset` event. A changed stage list of the same workflow (a config edit) keeps the
    * status-derived position of stagePlan. Without a stage row or a branch head nothing changes.
@@ -464,8 +460,7 @@ export class Scheduler {
     if (!head) return null;
     const evidence = this.db.evidenceFor(task.id, head, undefined, cfg.configRevision);
     const done = (s: Stage) => evidence.some((e) => e.kind === s.role && e.outcome === 'complete');
-    const qa = wf.stages.some((s) => s.when === 'qa') && (await this.qaRequirement(task, head)).reasons.length > 0;
-    let position = wf.stages.findIndex((s) => (s.when !== 'qa' || qa) && !done(s));
+    let position = wf.stages.findIndex((s) => !done(s));
     if (position < 0) { const gate = finalGateIndex(cfg, wf.stages); position = gate >= 0 ? gate : wf.stages.length - 1; }
     const status: TaskStatus = claimableStatuses(cfg, wf.stages, position).includes(task.status) ? task.status
       : position === 0 ? 'changes-requested' : stageStatusOf(cfg, wf.stages[position]!);
@@ -594,7 +589,7 @@ export class Scheduler {
       const at = `stage ${plan.position + 1}/${plan.stages.length} (${stage.role}) of workflow ${plan.workflow}`;
       const why = [
         task.status === 'changes-requested' ? `changes-requested: repair (cycle ${this.db.repairCycles(task.id)}) at ${at}` : `${task.status}: ${at}`,
-        stage.inserted === 'qa' ? 'tester inserted: QA required' : stage.inserted === 'legacy' ? 'stage added for a legacy status' : null,
+        stage.inserted === 'legacy' ? 'stage added for a legacy status' : null,
         reset ? `workflow changed: the claim resets the position by evidence at the head${status !== task.status ? ` and moves the task to ${status}` : ''}` : null,
       ].filter(Boolean).join('; ');
       const entry = this.nextEntry(task, def, m, { kind: 'task', position: plan.position, count: plan.stages.length, workflow: plan.workflow }, why);
@@ -889,6 +884,8 @@ export class Scheduler {
       });
     const integ = this.integratorFinding(task.id);
     if (integ) priorFindings.push(integ);
+    const verify = this.verifyFinding(task.id);
+    if (verify) priorFindings.push(verify);
     const resume = this.drainResume(task.id, lease, x.branch);
     return {
       briefMarker: `minions-lease: ${lease.id}`,
@@ -985,38 +982,6 @@ export class Scheduler {
     if (lease.role !== 'tester') return false;
     const ev = this.db.events(lease.task_id, 'claim').find((e) => (e.data as { leaseId?: string })?.leaseId === lease.id);
     return (ev?.data as { kind?: string } | undefined)?.kind === 'qa-sweep';
-  }
-
-  /** Paths the branch changes against the base (null when the diff cannot be computed). A gate read (gateGit, task-71). */
-  private async changedPaths(head: string): Promise<string[] | null> {
-    try {
-      const base = await resolveBaseBranch(this.layout.repo, this.config.git.baseBranch);
-      const d = await gateGit(this.layout.repo, ['diff', '--name-only', '--no-renames', '--no-ext-diff', '--ignore-submodules=none', '-z', `${base.ref}...${head}`], true);
-      return d.code === 0 ? d.stdout.split('\0').filter(Boolean) : null;
-    } catch { return null; }
-  }
-
-  /**
-   * Risk-based testing: a task needs a tester stage when verification.testerRequired is set, it carries a
-   * QA label (verification.qaLabels; the coordinator may add one), its diff (or the reported modifiedPaths)
-   * touches sensitive paths, the branch diff cannot be computed (fail closed), or the reviewer flagged it (`needsQa`). Sensitive paths and reviewer flags are
-   * recorded on the task as the first QA label so later stages and publication see the same requirement.
-   */
-  async qaRequirement(task: Task, head: string, opts: { paths?: string[]; flagged?: boolean } = {}): Promise<QaRequirement> {
-    const cfg = this.config;
-    const reasons: string[] = [];
-    let record = false;
-    if (cfg.verification.testerRequired) reasons.push('verification.testerRequired');
-    const label = task.labels.find((l) => qaLabelsOf(cfg).includes(l));
-    if (label) reasons.push(`label ${label}`);
-    const diff = await this.changedPaths(head);
-    // Fail closed: without the branch diff an unreported sensitive change could skip QA.
-    if (diff === null) { reasons.push('branch diff unavailable (QA required, fail closed)'); record = !label; }
-    const paths = [...new Set([...(opts.paths ?? []), ...(diff ?? [])])];
-    const sensitive = paths.filter((p) => matchesAny(p, cfg.sensitivePaths));
-    if (sensitive.length) { reasons.push(`sensitive paths (${sensitive.slice(0, 5).join(', ')}${sensitive.length > 5 ? ', …' : ''})`); record = !label; }
-    if (opts.flagged) { reasons.push('reviewer flagged needsQa'); record = !label; }
-    return { reasons, record };
   }
 
   /** Paths changed between two commits (the stage diff of an edit-scope check); null when it cannot be computed. A gate read (gateGit, task-71). */
@@ -1224,12 +1189,6 @@ export class Scheduler {
     // Where the task goes next in its workflow; stays put unless the transition below moves it.
     let nextStages: Stage[] = plan?.stages ?? [];
     let nextPos = plan?.position ?? 0;
-    // Per-task QA requirement (risk-based testing), evaluated when a producer or gate (engineer, reviewer) finishes.
-    const flagged = contract === 'gate' && r.needsQa === true;
-    const qa: QaRequirement = !sweep && contract !== 'verifier' && (r.status === 'complete' || flagged)
-      ? await this.qaRequirement(task, head, { paths: r.modifiedPaths, flagged })
-      : { reasons: [], record: false };
-    const qaWhy = qa.reasons.join('; ');
     // A drain partial: this lease received the drain notice (the drain hook records it on delivery) for a
     // drain that was active then, even if the drain is cleared by now. Merely spanning a drain does not count.
     const drained = r.status === 'partial' && !sweep && this.db.drainNoticeReceived(lease);
@@ -1255,27 +1214,10 @@ export class Scheduler {
     } else switch (r.status) {
       case 'complete': {
         const pos = plan!.position;
-        let stages = plan!.stages;
-        // A gate approves only with verifier evidence for this head when QA is required: back to the verifier
-        // before it (the built-in tester is inserted when the workflow has none there).
-        if (contract === 'gate' && qa.reasons.length && !this.passedAt(task.id, head, 'verifier')) {
-          const back = verifierBefore(cfg, stages, pos);
-          nextStages = back.stages; nextPos = back.position; to = stageStatusOf(cfg, back.stages[back.position]!);
-          message = `Approval not applied: QA required (${qaWhy}) and no passing tester evidence for head ${head} at config revision ${cfg.configRevision}. Run the tester.`;
-          break;
-        }
-        // Invariant 3: QA required after a producer and no runnable verifier before the final gate -> insert the tester.
-        if (contract === 'producer' && qa.reasons.length) stages = withQaTester(cfg, stages, pos);
-        // `when: qa` stages after a verifier: QA evaluated now (not recorded as a label; the verifier does not change the requirement).
-        const qaNow = contract !== 'verifier' ? qa.reasons.length > 0
-          : stages.slice(pos + 1).some((s) => s.when === 'qa') && (await this.qaRequirement(task, head, { paths: r.modifiedPaths })).reasons.length > 0;
-        nextStages = stages;
-        const next = nextRunnable(stages, pos, qaNow);
-        if (next !== null) {
-          nextPos = next; to = stageStatusOf(cfg, stages[next]!);
-          if (contract === 'producer' && qa.reasons.length && !cfg.verification.testerRequired && contractOf(cfg, stages[next]!) === 'verifier') {
-            message = `Recorded ${lease.role} complete; QA required (${qaWhy}): task → ${to}.`;
-          }
+        const stages = plan!.stages;
+        if (pos + 1 < stages.length) {
+          // The dispatcher verifies a producer head before it starts a gate (docs/design/autonomy.md Decision 12).
+          nextPos = pos + 1; to = stageStatusOf(cfg, stages[nextPos]!);
           break;
         }
         // Last stage done: deliver as after a reviewer approval, with the gate evidence for the current head.
@@ -1318,13 +1260,10 @@ export class Scheduler {
         break;
     }
 
-    // Record the QA requirement on the task (first QA label) so later stages and the integration see it.
-    const labels = qa.record && to !== 'delivered' ? [...task.labels, qaLabelsOf(cfg)[0]!] : undefined;
-    if (to !== from || labels) {
+    if (to !== from) {
       if (to === 'done' || to === 'delivered') await this.backlog.closeTask(task.id, to);
-      else await this.backlog.updateTask(task.id, task.version, { ...(to !== from ? { status: to } : {}), ...(labels ? { labels } : {}) });
+      else await this.backlog.updateTask(task.id, task.version, { status: to });
     }
-    if (labels) this.db.addEvent('qa-required', task.id, { leaseId, role: lease.role, head, reasons: qa.reasons, label: labels.at(-1) });
 
     this.db.transaction(() => {
       this.db.addEvidence({ task_id: task.id, head_sha: head, kind: lease.role, config_revision: cfg.configRevision,
@@ -1340,7 +1279,7 @@ export class Scheduler {
     });
     await this.cleanupLeaseFiles(leaseId);
     try {
-      await this.backlog.addNote(task.id, `minions: ${lease.role} ${r.status}${drained ? ' (drain)' : ''}${r.verdict ? ` (${r.verdict})` : ''} at ${head.slice(0, 12)}: ${r.summary}${to === 'testing' && qa.reasons.length ? ` (QA required: ${qaWhy})` : ''}`);
+      await this.backlog.addNote(task.id, `minions: ${lease.role} ${r.status}${drained ? ' (drain)' : ''}${r.verdict ? ` (${r.verdict})` : ''} at ${head.slice(0, 12)}: ${r.summary}`);
     } catch (e) {
       this.db.addEvent('record-backlog-error', task.id, { leaseId, error: (e as Error).message });
     }
@@ -1450,6 +1389,93 @@ export class Scheduler {
   /** An owner notice of the integration (outbox; one line each). A failure to queue it is an event, never fatal. */
   private integrationNotice(n: { key: string; kind: 'approval' | 'blocker' | 'other'; taskId: string; text: string }): void {
     try { enqueueNotice(this.db, { ...n, text: n.text.slice(0, 3_900) }, () => this.now()); } catch (e) { this.db.addEvent('integration-notice-error', n.taskId, { key: n.key, error: (e as Error).message }); }
+  }
+
+  // ---------------------------------------------------------------- the verify step (docs/design/autonomy.md Decision 12)
+
+  /** What the verify step runs on a task head: verification.commands, plus verification.periodic.commands for `verify:full`. */
+  verifyCommands(task: Pick<Task, 'labels'>): string[] {
+    const v = this.config.verification;
+    return [...new Set([...v.commands, ...(task.labels.includes(VERIFY_FULL_LABEL) ? v.periodic?.commands ?? [] : [])])];
+  }
+
+  /**
+   * What the dispatcher verifies before it starts `role` on the task: a gate stage starts only on a head whose verify
+   * step passed with the current commands. null = nothing to run (not a gate, no commands, or already verified).
+   */
+  async verificationDue(taskId: string, role: string): Promise<{ head: string; commands: string[] } | null> {
+    if (workerRole(this.config, role)?.contract !== 'gate') return null;
+    const task = await this.backlog.getTask(taskId);
+    const commands = this.verifyCommands(task);
+    if (!commands.length) return null;
+    const head = await headOf(this.layout.repo, this.branchForTask(task).branch);
+    if (!head || verifiedTree(this.db, taskId, head, commands) !== null) return null;
+    return { head, commands };
+  }
+
+  /**
+   * Records the verify step's result for `head`. Green: evidence with the head's tree (the reviewer starts; the
+   * integrator skips a candidate with that tree). Red: a repair cycle as after a request-changes (the failing command
+   * and its output tail reach the engineer as a `verify` finding); the limit sends the task to awaiting-human. Transient
+   * (timeout, exit 127, setup): blocked with a setup hint, as in the integrator. Ignored when the head moved or a lease
+   * started meanwhile. `hold` = the decision the coordinator must take.
+   */
+  async settleVerification(taskId: string, head: string, commands: string[], v: VerifyResult): Promise<{ status: TaskStatus | null; message: string; hold?: { kind: 'replan' | 'blocked'; message: string } }> {
+    const cfg = this.config;
+    if (v.state === 'stopped') return { status: null, message: `the verification of ${head.slice(0, 12)} was stopped; it runs again` };
+    const task = await this.backlog.getTask(taskId);
+    const current = await headOf(this.layout.repo, this.branchForTask(task).branch);
+    if (current !== head || this.db.activeLeases().some((l) => l.task_id === taskId)) {
+      return { status: null, message: `the verification of ${head.slice(0, 12)} is stale (the task moved on); nothing changed` };
+    }
+    const short = head.slice(0, 12);
+    const evidence = (outcome: string, details: Record<string, unknown>) => this.db.addEvidence({ task_id: taskId, head_sha: head, kind: VERIFY_EVIDENCE,
+      config_revision: cfg.configRevision, outcome, details_json: JSON.stringify({ commands, ...details }) });
+    let status: TaskStatus;
+    let message: string;
+    let hold: { kind: 'replan' | 'blocked'; message: string } | undefined;
+    if (v.state === 'passed') {
+      const t = await gateGit(this.layout.repo, ['rev-parse', '--verify', '--quiet', `${head}^{tree}`], true);
+      const tree = t.code === 0 ? t.stdout.trim() : null;
+      evidence('pass', { tree, flaky: (v.flaky ?? []).map((f) => f.command) });
+      status = task.status;
+      message = `verification passed at ${short}${v.flaky?.length ? ` (flaky: ${v.flaky.map((f) => `\`${f.command}\``).join(', ')} passed only on its rerun)` : ''}`;
+    } else if (v.state === 'red') {
+      let cycles = 0;
+      this.db.transaction(() => {
+        evidence('red', { command: v.command, detail: v.detail.slice(-3_000) });
+        cycles = this.db.incrementRepairs(taskId);
+        const st = this.db.taskStage(taskId);
+        const stages = st ? parseStages(st.stages_json) : null;
+        if (st && stages) this.db.setTaskStage(taskId, st.workflow, stages, repairTarget(cfg, stages, st.position));
+      });
+      const replan = cycles >= cfg.execution.maxRepairCyclesBeforeReplan;
+      status = replan ? 'awaiting-human' : 'changes-requested';
+      message = `verification failed at ${short} (\`${v.command}\`); task → ${status} (repair cycle ${cycles}${replan ? `, the limit ${cfg.execution.maxRepairCyclesBeforeReplan}: replan before more repairs` : ''})`;
+      if (replan) hold = { kind: 'replan', message };
+    } else {
+      evidence('transient', { detail: v.detail.slice(-3_000) });
+      status = 'blocked';
+      message = `the verification of ${short} could not run (a setup problem, not a code failure): ${v.detail.split('\n')[0]!.slice(0, 400)}. Fix the setup (verification.setupCommands, the tools the commands need), then set the task back to ${task.status}`;
+      hold = { kind: 'blocked', message };
+    }
+    if (status !== task.status) await this.backlog.updateTask(taskId, task.version, { status });
+    this.db.addEvent('verify-settled', taskId, { head, outcome: v.state, status });
+    await this.note(taskId, `minions: ${message}.`);
+    return { status, message, ...(hold ? { hold } : {}) };
+  }
+
+  /** The latest verify step of a task when it failed: repair brief input (the command and its output tail). */
+  private verifyFinding(taskId: string): TaskBrief['priorFindings'][number] | null {
+    const last = this.db.all<EvidenceRow>('SELECT * FROM evidence WHERE task_id = ? AND kind = ? ORDER BY recorded_at DESC, rowid DESC LIMIT 1', taskId, VERIFY_EVIDENCE)[0];
+    if (!last || last.outcome !== 'red') return null;
+    let d: { command?: string; detail?: string } = {};
+    try { d = JSON.parse(last.details_json ?? '{}') as typeof d; } catch { /* the head is still named */ }
+    return {
+      leaseId: 'verify', role: 'verify', status: 'needs_changes',
+      findings: [`verification failed at ${last.head_sha}: \`${d.command ?? '(unknown command)'}\``, ...(d.detail ? [d.detail] : [])],
+      nextAction: 'Fix the failure (run the command yourself), commit, and record the new head.',
+    };
   }
 
   /**

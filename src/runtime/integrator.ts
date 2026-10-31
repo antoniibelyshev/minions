@@ -27,7 +27,11 @@
 //   Output goes to <state>/logs/integration/<task>-<row>.log; the tail goes into the row's detail.
 //   A failing command is `red`; a timeout, a spawn error, a setup failure or exit 127 (command not found: the
 //   worktree lacks its tools, e.g. no node_modules because verification.setupCommands is empty) is transient,
-//   so the task goes blocked for a setup fix instead of a repair cycle (task-136).
+//   so the task goes blocked for a setup fix instead of a repair cycle (task-136). The dispatcher's verify step
+//   (docs/design/autonomy.md Decision 12) runs the same runner on each producer head in its own worktree.
+// - No unverified landings (Decision 12): without verification.commands every row ends transient (the task blocked)
+//   with the hint to set them. When the candidate's tree is exactly a tree the verify step passed for this head with
+//   the current commands (the base did not move), the integrator lands it without running them again.
 // - Pause and drain: while starts are paused or a drain is active no new integration starts. A drain (or SIGTERM)
 //   stops a running verification at once (its group is killed) and re-queues the row without an attempt; only the
 //   landing (two git calls) is allowed to finish.
@@ -40,6 +44,7 @@ import { closeSync, createWriteStream, existsSync, mkdirSync, openSync, readFile
 import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { can } from '../config/capabilities.js';
+import { NO_VERIFICATION_COMMANDS } from '../config/delivery.js';
 import type { MinionsConfig } from '../config/schema.js';
 import { MinionsError } from '../core/errors.js';
 import { redact } from '../core/output.js';
@@ -59,6 +64,8 @@ export const INTEGRATION_HALT_META = 'integration_halted';
 /** Counted runs of one queued integration: the first plus one automatic retry of a transient failure. */
 export const MAX_INTEGRATION_ATTEMPTS = 2;
 export const DEFAULT_INTEGRATION_TIMEOUT_MINUTES = 30;
+/** The per-command limit of a verification (the integrator's and the dispatcher's verify step). */
+export const verifyTimeoutMs = (cfg: Pick<MinionsConfig, 'delivery'>) => (cfg.delivery.integrationTimeoutMinutes ?? DEFAULT_INTEGRATION_TIMEOUT_MINUTES) * 60_000;
 /** `outcome` of a landed row whose verification passed only on a rerun of a failed command (Decision 2). */
 export const FLAKY_OUTCOME = 'landed-flaky';
 /** Test workers of the gate's verification (design: fixed configuration). */
@@ -392,6 +399,24 @@ export async function runVerification(i: VerifyInput): Promise<VerifyResult> {
   }
 }
 
+/** Evidence kind of the dispatcher's verify step: outcome pass | red | transient, details {tree?, commands, ...}. */
+export const VERIFY_EVIDENCE = 'verify';
+
+/**
+ * The tree the verify step passed for (task, head) running at least `commands`, or null. The integrator lands a
+ * candidate with this tree without verifying it again.
+ */
+export function verifiedTree(db: Pick<RuntimeDb, 'evidenceFor'>, taskId: string, head: string, commands: readonly string[]): string | null {
+  for (const e of db.evidenceFor(taskId, head, VERIFY_EVIDENCE).reverse()) {
+    if (e.outcome !== 'pass') continue;
+    try {
+      const d = JSON.parse(e.details_json ?? '{}') as { tree?: string; commands?: string[] };
+      if (d.tree && commands.every((c) => d.commands?.includes(c))) return d.tree;
+    } catch { /* unreadable evidence never counts */ }
+  }
+  return null;
+}
+
 // ---------------------------------------------------------------- recovery
 
 export interface ReapVerifyOptions { proc?: ProcSource; kill?: (pid: number, sig: NodeJS.Signals) => void; graceMs?: number; sleep?: (ms: number) => Promise<void> }
@@ -652,20 +677,11 @@ export async function runIntegrator(d: IntegratorDeps): Promise<IntegratorReport
     if (rev.state === 'error') { await transient(row, rev.message); return null; }
 
     if (stopRequested()) return stopped('before the verification');
-    d.db.exec("UPDATE integrations SET phase = 'verifying' WHERE id = ?", row.id);
-    row = getRow(d.db, row.id);
-    const timeoutMs = d.timing?.commandTimeoutMs ?? (cfg.delivery.integrationTimeoutMinutes ?? DEFAULT_INTEGRATION_TIMEOUT_MINUTES) * 60_000;
-    const v = await runVerification({
-      repo: d.repo, dir: d.integrationDir, runDir: d.runDir, candidate: C, logPath, timeoutMs,
-      setupCommands: cfg.verification.setupCommands ?? [], commands: cfg.verification.commands,
-      ...(d.env ? { env: d.env } : {}), ...(d.timing ? { timing: d.timing } : {}),
-      shouldStop: stopRequested,
-      onSpawn: async (pid) => {
-        const id = await procIdentity(pid, proc);
-        d.db.exec('UPDATE integrations SET verify_pid = ?, verify_start = ?, verify_boot = ? WHERE id = ?', pid, id?.startTime ?? null, host?.bootId ?? null, row.id);
-      },
-    });
-    d.db.exec('UPDATE integrations SET verify_pid = NULL, verify_start = NULL, verify_boot = NULL WHERE id = ?', row.id);
+    // Decision 12: never land unverified work. A hard refusal, not a retry: the task is blocked until commands are set.
+    if (!cfg.verification.commands.length) { await settle(row, 'transient', NO_VERIFICATION_COMMANDS); return null; }
+    const alreadyVerified = verifiedTree(d.db, row.task_id, row.head_sha, cfg.verification.commands) === cand.tree;
+    if (alreadyVerified) event('integration-verify-skipped', row, { candidate: C, tree: cand.tree });
+    const v: VerifyResult = alreadyVerified ? { state: 'passed' } : await verifyCandidate();
     if (v.state === 'stopped') return stopped('during the setup or verification');
     // A command killed by the stop may exit before the poll notices it: never count that as red or transient.
     if (v.state !== 'passed' && stopRequested()) return stopped('during the setup or verification');
@@ -700,6 +716,24 @@ export async function runIntegrator(d: IntegratorDeps): Promise<IntegratorReport
     // The base moved in an unknown way during the landing: leave the row in `landing` for recovery and halt.
     halt(`the landing of ${row.task_id} left ${branch} in an unexpected state: ${l.message}`, await baseSha(d.repo, branch), B);
     return 'halted';
+
+    async function verifyCandidate(): Promise<VerifyResult> {
+      d.db.exec("UPDATE integrations SET phase = 'verifying' WHERE id = ?", row.id);
+      row = getRow(d.db, row.id);
+      const timeoutMs = d.timing?.commandTimeoutMs ?? verifyTimeoutMs(cfg);
+      const out = await runVerification({
+        repo: d.repo, dir: d.integrationDir, runDir: d.runDir, candidate: C, logPath, timeoutMs,
+        setupCommands: cfg.verification.setupCommands ?? [], commands: cfg.verification.commands,
+        ...(d.env ? { env: d.env } : {}), ...(d.timing ? { timing: d.timing } : {}),
+        shouldStop: stopRequested,
+        onSpawn: async (pid) => {
+          const id = await procIdentity(pid, proc);
+          d.db.exec('UPDATE integrations SET verify_pid = ?, verify_start = ?, verify_boot = ? WHERE id = ?', pid, id?.startTime ?? null, host?.bootId ?? null, row.id);
+        },
+      });
+      d.db.exec('UPDATE integrations SET verify_pid = NULL, verify_start = NULL, verify_boot = NULL WHERE id = ?', row.id);
+      return out;
+    }
   }
 }
 

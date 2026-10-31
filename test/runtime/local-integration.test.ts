@@ -223,6 +223,8 @@ describe('base.merge capability and mode-aware auto-merge reasons', () => {
     expect(autoMergeConfigReasons(local((c) => { c.verification.commands = []; }))).toEqual([expect.stringMatching(/verification\.commands is empty/)]);
     expect(listUnavailable(local((c) => { c.verification.commands = []; })).find((u) => u.path === 'delivery.merge')?.reason).toMatch(/verification\.commands is empty/);
     expect(localIntegrationEnabled(local((c) => { c.delivery.merge = 'disabled'; }))).toBe(false);
+    // Without commands integration stays on and the integrator refuses each landing (Decision 12): nothing ends delivered unverified.
+    expect(localIntegrationEnabled(local((c) => { c.verification.commands = []; }))).toBe(true);
   });
 });
 

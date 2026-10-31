@@ -127,7 +127,7 @@ export async function collectIntegrationStatus(d: IntegrationStatusDeps): Promis
   const checkout = await (d.inspect ?? inspectBaseCheckout)(d.repo, base).catch((): BaseCheckout => ({ path: null, state: 'unknown' }));
   const status: IntegrationStatus = {
     enabled,
-    reasons: enabled ? [] : autoMergeConfigReasons(cfg),
+    reasons: autoMergeConfigReasons(cfg),
     lock,
     current: cur ? {
       taskId: cur.task_id, head: cur.head_sha, phase: cur.phase, attempt: cur.attempt, startedAt: cur.started_at,

@@ -8,7 +8,7 @@ import { RuntimeDb, SCHEMA_VERSION } from '../../src/runtime/db.js';
 import { porcelainPaths } from '../../src/runtime/integration.js';
 import {
   adoptIntegrationBase, enqueueIntegration, INTEGRATION_BASE_META, integrationHalt, integrationLock,
-  integrationRows, integratorAlive, runIntegrator, type IntegratorDeps,
+  integrationRows, integratorAlive, runIntegrator, VERIFY_EVIDENCE, type IntegratorDeps,
 } from '../../src/runtime/integrator.js';
 import { pending } from '../../src/runtime/outbox.js';
 import { defaults } from '../helpers.js';
@@ -258,5 +258,40 @@ describe('schema 12: integrations (after 57.12 schema 11), then 13: poll options
       expect(cols).toEqual(expect.arrayContaining(['session', 'answered_at', 'options_json']));
       expect(up.all("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('tg_messages', 'integrations') ORDER BY name")).toEqual([{ name: 'integrations' }, { name: 'tg_messages' }]);
     } finally { up.close(); }
+  });
+});
+
+describe('runIntegrator: the verify step and unverified work (docs/design/autonomy.md Decision 12)', () => {
+  const verified = (s: ReturnType<typeof setup>, task: string, head: string, commands: string[]) =>
+    s.db.addEvidence({ task_id: task, head_sha: head, kind: VERIFY_EVIDENCE, config_revision: s.cfg.configRevision, outcome: 'pass',
+      details_json: JSON.stringify({ tree: gitSync(s.repo, 'rev-parse', `${head}^{tree}`), commands }) });
+
+  it('lands without running the commands again when the merged tree is the tree the verify step passed (base did not move)', async () => {
+    const s = setup({ commands: ['false'] });
+    const H = branchWith(s.repo, branchOf('task-1'), s.B, { 'task-1.txt': 'x\n' });
+    enqueueIntegration(s.db, { taskId: 'task-1', branch: branchOf('task-1'), head: H });
+    verified(s, 'task-1', H, ['false']);
+    const r = await runIntegrator(s.deps);
+    expect(r.settled).toEqual([{ id: 1, taskId: 'task-1', phase: 'landed' }]);
+    expect(s.db.events('task-1', 'integration-verify-skipped')).toHaveLength(1);
+  });
+
+  it('verifies the merged tree when the base moved since the verify step', async () => {
+    const s = setup({ commands: ['false'] });
+    const H = s.queue('task-1'); // from init: main moved to B since
+    verified(s, 'task-1', H, ['false']);
+    const r = await runIntegrator(s.deps);
+    expect(r.settled.map((x) => x.phase)).toEqual(['red']);
+    expect(mainOf(s.repo)).toBe(s.B);
+  });
+
+  it('refuses to land anything without verification commands (transient at once: the task is blocked with the hint)', async () => {
+    const s = setup({ commands: [] });
+    s.queue('task-1');
+    const r = await runIntegrator(s.deps);
+    expect(r.settled.map((x) => x.phase)).toEqual(['transient']);
+    expect(rowOf(s.db, 'task-1')).toMatchObject({ attempt: 1 });
+    expect(rowOf(s.db, 'task-1').detail).toMatch(/verification\.commands is empty: the integrator never lands unverified work/);
+    expect(mainOf(s.repo)).toBe(s.B);
   });
 });

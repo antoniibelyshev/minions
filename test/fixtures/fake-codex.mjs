@@ -42,7 +42,7 @@ out({ type: 'item.completed', item: { id: 'item_0', type: 'reasoning', text: '**
 const head = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: cd, encoding: 'utf8' }).trim();
 const { branch } = JSON.parse(readFileSync(process.env.MINIONS_BRIEF_FILE, 'utf8'));
 out({ type: 'item.completed', item: { id: 'item_1', type: 'command_execution', command: 'bash -lc "git rev-parse HEAD"', aggregated_output: head + '\n', exit_code: 0, status: 'completed' } });
-const nul = scenario.nulls === false ? {} : { needsQa: null };
+const nul = scenario.nulls === false ? {} : { usage: null };
 const text = typeof scenario.message === 'string' ? scenario.message : JSON.stringify({
   status: 'complete', summary: 'Reviewed by fake codex.', branch, headSha: head, modifiedPaths: [],
   checks: [{ command: 'npm test', outcome: 'pass', details: null, source: null }],

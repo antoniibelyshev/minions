@@ -68,7 +68,7 @@ describe('work run with the Codex adapter (gate pilot, fake codex)', () => {
     // The gate did not move the branch; the coordinator records the submission as an approval.
     expect(gitSync(r.layout.repo, 'rev-parse', `refs/heads/${b.branch}`)).toBe(b.expectedHead);
     const s = submitted(r, b);
-    expect(s).not.toHaveProperty('needsQa');
+    expect(s).not.toHaveProperty('usage');
     expect(s.checks[0]).toEqual({ command: 'npm test', outcome: 'pass' });
     expect(await recordSubmitted(r.sched, r.paths, b.leaseId)).toMatchObject({ valid: true, approved: true });
     // Usage: the last turn.completed running total, not the sum (6500).

@@ -22,7 +22,7 @@ async function work(env: Env, claimed: TaskBrief, over: Record<string, unknown> 
 
 describe('claim -> brief -> submit -> record (real git)', () => {
   it('engineer, tester and reviewer take a task to delivered, with evidence bound to the real head', async () => {
-    const env = makeEnv(); // testerRequired: engineer -> tester -> reviewer
+    const env = makeEnv(); // workflows.default: engineer -> tester -> reviewer
     env.backlog.add({ id: 'task-1', title: 'Add login' });
     const e = await claimWithBrief(env.sched, paths(env), 'task-1', 'engineer');
     expect(e).toMatchObject({ branch: 'agent/task-1-add-login', baseBranch: 'main', baseSha: env.baseSha, expectedHead: env.baseSha });

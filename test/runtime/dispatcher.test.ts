@@ -1,14 +1,18 @@
 // The autopilot dispatcher (docs/design/autonomy.md Decision 1): stages move dev -> review -> delivered without the
 // coordinator; decisions park the task (a hold) and reach the coordinator.
+import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import type { MinionsConfig } from '../../src/config/schema.js';
-import { DISPATCH_HOLDER, Dispatcher, clearHold, readHolds, workerPrompt, type DispatchHold, type LaunchInput, type WorkerExit, type WorkerHandle } from '../../src/runtime/dispatcher.js';
+import { DISPATCH_HOLDER, Dispatcher, clearHold, readHolds, workerPrompt, type DispatchHold, type DispatcherDeps, type LaunchInput, type WorkerExit, type WorkerHandle } from '../../src/runtime/dispatcher.js';
 import { claimWithBrief, submitResult, type HandoffPaths } from '../../src/runtime/handoff.js';
-import { Scheduler } from '../../src/runtime/scheduler.js';
+import { Scheduler, VERIFY_FULL_LABEL } from '../../src/runtime/scheduler.js';
 import { asWorkerInput, preBashHook, stopHook, WORKER_LEASE_ENV } from '../../src/runtime/hooks.js';
 import { parseStreamLine, summarizeWorkerLog, workerEnv } from '../../src/runtime/dispatch-launch.js';
 import { collectWakeReasons } from '../../src/runtime/routine.js';
+import type { VerifyResult } from '../../src/runtime/integrator.js';
+import { pending } from '../../src/runtime/outbox.js';
+import { PERIODIC_META, type VerifyRun } from '../../src/runtime/verify-step.js';
 import { commitFile, makeDefaultEnv, result, type Env } from './fixtures.js';
 // Unit tier: git runs on the in-memory fake (./fake-git.ts).
 vi.mock('../../src/core/exec.js', async (orig) => (await import('./fake-git.js')).mockExec(await orig()));
@@ -20,7 +24,7 @@ type Script = (i: LaunchInput) => Record<string, unknown> | null;
 
 const exit = (over: Partial<WorkerExit> = {}): WorkerExit => ({ code: 0, signal: null, stopped: null, tokens: 1000, model: 'sonnet', sessionId: 'sess-1', stderrTail: '', spawnError: null, ...over });
 
-function setup(script: Script, mutate?: (c: MinionsConfig) => void, exitOf: (i: LaunchInput) => WorkerExit = () => exit()) {
+function setup(script: Script, mutate?: (c: MinionsConfig) => void, exitOf: (i: LaunchInput) => WorkerExit = () => exit(), extra: Partial<DispatcherDeps> = {}) {
   const env = makeDefaultEnv((c) => { mutate?.(c); });
   const launches: LaunchInput[] = [];
   const notified: DispatchHold[] = [];
@@ -37,7 +41,7 @@ function setup(script: Script, mutate?: (c: MinionsConfig) => void, exitOf: (i: 
     db: env.db, paths: paths(env), config: async () => structuredClone(env.config),
     // As in production: a scheduler on each pass's fresh config.
     scheduler: async (cfg) => new Scheduler({ db: env.db, backlog: env.backlog, config: cfg, layout: env.layout, handoff: paths(env) }), launch,
-    taskStatus: async (_s, id) => (await env.backlog.getTask(id)).status, notify: (h) => { notified.push(h); },
+    taskStatus: async (_s, id) => (await env.backlog.getTask(id)).status, notify: (h) => { notified.push(h); }, ...extra,
   });
   return { env, disp, launches, notified };
 }
@@ -48,7 +52,7 @@ async function drive(disp: Dispatcher, max = 10): Promise<number> {
   for (let i = 0; i < max; i++) {
     const r = await disp.pass();
     await disp.settled();
-    if (!r.started.length) break;
+    if (!r.started.length && !r.verifying) break;
     started += r.started.length;
   }
   return started;
@@ -70,9 +74,9 @@ describe('dispatcher: the automatic flow', () => {
   it('a workflow change applies to the next stage: dropping the tester while the engineer runs', async () => {
     let env!: Env;
     const { env: e, disp, launches } = setup((i) => {
-      if (i.claim.role === 'engineer') { env.config.workflows = { default: ['engineer', 'reviewer'] }; env.config.verification.testerRequired = false; } // `minions control set ...`
+      if (i.claim.role === 'engineer') env.config.workflows = { default: ['engineer', 'reviewer'] }; // `minions control set ...`
       return i.claim.role === 'reviewer' ? { verdict: 'approve' } : {};
-    }, (c) => { c.verification.testerRequired = true; });
+    }, (c) => { c.workflows = { default: ['engineer', 'tester', 'reviewer'] }; });
     env = e;
     env.backlog.add({ id: 'task-1' });
     await drive(disp);
@@ -82,13 +86,12 @@ describe('dispatcher: the automatic flow', () => {
 
   it('a task already waiting for a removed stage moves on to the next one', async () => {
     let env!: Env;
-    const { env: e, disp, launches } = setup((i) => (i.claim.role === 'reviewer' ? { verdict: 'approve' } : {}), (c) => { c.verification.testerRequired = true; });
+    const { env: e, disp, launches } = setup((i) => (i.claim.role === 'reviewer' ? { verdict: 'approve' } : {}), (c) => { c.workflows = { default: ['engineer', 'tester', 'reviewer'] }; });
     env = e;
     env.backlog.add({ id: 'task-1' });
     await disp.pass(); await disp.settled(); // engineer -> testing
     expect((await env.backlog.getTask('task-1')).status).toBe('testing');
     env.config.workflows = { default: ['engineer', 'reviewer'] };
-    env.config.verification.testerRequired = false;
     await drive(disp);
     expect(launches.map((l) => l.stage.role)).toEqual(['engineer', 'reviewer']);
     expect((await env.backlog.getTask('task-1')).status).toBe('delivered');
@@ -194,6 +197,112 @@ describe('dispatcher: the automatic flow', () => {
     expect(r).toEqual({ recorded: [a.leaseId], released: [b.leaseId], adopted: [] });
     expect((await env.backlog.getTask('task-1')).status).toBe('reviewing');
     expect(env.db.activeLeases()).toEqual([]);
+  });
+});
+
+describe('dispatcher: the verify step and periodic verification (docs/design/autonomy.md Decision 12)', () => {
+  /** A fake verifier: answers each run from `answer` and records it. */
+  function verifier(answer: (r: VerifyRun) => VerifyResult = () => ({ state: 'passed' })) {
+    const runs: VerifyRun[] = [];
+    return { runs, verify: async (r: VerifyRun) => { runs.push(r); return answer(r); } };
+  }
+  const approve: Script = (i) => (i.claim.role === 'reviewer' ? { verdict: 'approve' } : {});
+  const unit = (c: MinionsConfig) => { c.verification.commands = ['npm run test:unit']; };
+
+  it('verifies the engineer head before the reviewer starts; green records the tree and the reviewer runs on that head', async () => {
+    const v = verifier();
+    const { env, disp, launches } = setup(approve, unit, undefined, { verify: v.verify });
+    env.backlog.add({ id: 'task-1' });
+    await drive(disp);
+    expect(launches.map((l) => l.stage.role)).toEqual(['engineer', 'reviewer']);
+    const head = env.db.leases({ taskId: 'task-1', all: true })[0]!.head_sha!;
+    expect(v.runs).toEqual([expect.objectContaining({ key: 'task-1', head, commands: ['npm run test:unit'] })]);
+    expect(launches[1]!.claim.expectedHead).toBe(head);
+    const ev = env.db.evidenceFor('task-1', head, 'verify');
+    expect(ev).toEqual([expect.objectContaining({ outcome: 'pass' })]);
+    expect(JSON.parse(ev[0]!.details_json!)).toMatchObject({ tree: expect.stringMatching(/^[0-9a-f]{40}$/), commands: ['npm run test:unit'] });
+    expect((await env.backlog.getTask('task-1')).status).toBe('delivered');
+  });
+
+  it('red: back to the engineer as a counted repair with the failing command and output tail in its brief', async () => {
+    let n = 0;
+    const v = verifier(() => (++n === 1 ? { state: 'red', command: 'npm run test:unit', detail: '`npm run test:unit` failed twice\nexpected 2 to be 3' } : { state: 'passed' }));
+    const briefs: { priorFindings: { role: string; findings: unknown[] }[] }[] = [];
+    const { env, disp, launches, notified } = setup((i) => {
+      if (i.claim.role === 'engineer') briefs.push(JSON.parse(readFileSync(join(paths(env).briefs, `${i.claim.leaseId}.json`), 'utf8')));
+      return approve(i);
+    }, unit, undefined, { verify: v.verify });
+    env.backlog.add({ id: 'task-1' });
+    await drive(disp);
+    expect(launches.map((l) => l.stage.role)).toEqual(['engineer', 'engineer', 'reviewer']);
+    expect(env.db.repairCycles('task-1')).toBe(1);
+    const finding = briefs[1]!.priorFindings.find((f) => f.role === 'verify')!;
+    expect(finding.findings.join('\n')).toMatch(/verification failed at [0-9a-f]{40}: `npm run test:unit`[\s\S]*expected 2 to be 3/);
+    expect(briefs[0]!.priorFindings.some((f) => f.role === 'verify')).toBe(false);
+    expect(notified).toEqual([]);
+    expect((await env.backlog.getTask('task-1')).status).toBe('delivered');
+  });
+
+  it('red at the repair limit: awaiting-human and a replan hold', async () => {
+    const v = verifier(() => ({ state: 'red', command: 'npm run test:unit', detail: 'boom' }));
+    const { env, disp, notified } = setup(approve, (c) => { unit(c); c.execution.maxRepairCyclesBeforeReplan = 1; }, undefined, { verify: v.verify });
+    env.backlog.add({ id: 'task-1' });
+    await drive(disp);
+    expect((await env.backlog.getTask('task-1')).status).toBe('awaiting-human');
+    expect(notified.map((h) => h.kind)).toEqual(['replan']);
+  });
+
+  it('transient (a setup problem): blocked with a setup hint and a hold, no repair cycle', async () => {
+    const v = verifier(() => ({ state: 'transient', detail: '`npm run test:unit` failed (exit 127: command not found): a setup problem' }));
+    const { env, disp, launches, notified } = setup(approve, unit, undefined, { verify: v.verify });
+    env.backlog.add({ id: 'task-1' });
+    await drive(disp);
+    expect(launches.map((l) => l.stage.role)).toEqual(['engineer']);
+    expect((await env.backlog.getTask('task-1')).status).toBe('blocked');
+    expect(env.db.repairCycles('task-1')).toBe(0);
+    expect(notified).toEqual([expect.objectContaining({ kind: 'blocked', message: expect.stringMatching(/a setup problem, not a code failure.*verification\.setupCommands/) })]);
+  });
+
+  it('no verification commands: no verify step; verify:full adds the periodic commands', async () => {
+    const v = verifier();
+    const { env, disp, launches } = setup(approve, (c) => { c.verification.commands = []; }, undefined, { verify: v.verify });
+    env.backlog.add({ id: 'task-1' });
+    await drive(disp);
+    expect(launches.map((l) => l.stage.role)).toEqual(['engineer', 'reviewer']);
+    expect(v.runs).toEqual([]);
+
+    const w = verifier();
+    const full = setup(approve, (c) => { unit(c); c.verification.periodic = { commands: ['npm run test:integration'] }; c.execution.maxActiveTasks = 2; c.execution.maxEngineers = 2; },
+      undefined, { verify: w.verify, now: () => new Date('2026-01-01T00:00:00Z') });
+    full.env.db.setMeta(PERIODIC_META, JSON.stringify({ base: full.env.baseSha, at: '2026-01-01T00:00:00Z', outcome: 'passed' })); // not due
+    full.env.backlog.add({ id: 'task-1', labels: [VERIFY_FULL_LABEL] });
+    await drive(full.disp);
+    expect(w.runs.map((r) => r.commands)).toEqual([['npm run test:unit', 'npm run test:integration']]);
+  });
+
+  it('periodic: runs on the base head when due and moved; a failure files one verify:periodic task and a notice, never a duplicate', async () => {
+    let now = new Date('2026-01-01T00:00:00Z');
+    const v = verifier((r) => (r.key === 'periodic' ? { state: 'red', command: 'npm run test:integration', detail: 'it broke' } : { state: 'passed' }));
+    const { env, disp } = setup(approve, (c) => { unit(c); c.verification.periodic = { commands: ['npm run test:integration'], everyHours: 24 }; }, undefined, { verify: v.verify, now: () => now });
+    const periodic = () => v.runs.filter((r) => r.key === 'periodic');
+    await drive(disp);
+    expect(periodic()).toEqual([expect.objectContaining({ key: 'periodic', head: env.baseSha, commands: ['npm run test:integration'] })]);
+    const filed = [...env.backlog.tasks.values()].filter((t) => t.labels.includes('verify:periodic'));
+    expect(filed.map((t) => t.title)).toEqual([`Periodic verification failed on ${env.baseSha.slice(0, 12)}: npm run test:integration`]);
+    expect(pending(env.db, { includeWaiting: true }).filter((n) => n.key.startsWith('verify-periodic:'))).toHaveLength(1);
+
+    // Due but the base did not move, or moved but not due yet: no run.
+    now = new Date('2026-01-02T01:00:00Z');
+    await drive(disp);
+    now = new Date('2026-01-01T12:00:00Z');
+    commitFile(env.layout.repo, 'later.txt', 'merged');
+    await drive(disp);
+    expect(periodic()).toHaveLength(1);
+    // Due and moved: runs again; the open (here delivered, not yet on the base) task is not duplicated.
+    now = new Date('2026-01-02T01:00:00Z');
+    await drive(disp);
+    expect(periodic()).toHaveLength(2);
+    expect([...env.backlog.tasks.values()].filter((t) => t.labels.includes('verify:periodic'))).toHaveLength(1);
   });
 });
 

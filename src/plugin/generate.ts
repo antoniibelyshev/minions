@@ -423,7 +423,7 @@ function outboxCheck(cfg: MinionsConfig): string {
 /** Configured workflows for the coordinator (D11): names and stages, and how a task gets one. */
 function workflowGuidance(cfg: MinionsConfig): string {
   const named = Object.keys(cfg.workflows ?? {}).filter((n) => n !== DEFAULT_WORKFLOW);
-  const stages = (n: string) => (resolveWorkflow(cfg, n)?.stages ?? []).map((st) => st.role + (st.when === 'qa' ? ' (QA)' : '') + (st.model ? ` [${st.model}]` : '')).join(' → ');
+  const stages = (n: string) => (resolveWorkflow(cfg, n)?.stages ?? []).map((st) => st.role + (st.model ? ` [${st.model}]` : '')).join(' → ');
   const own = Object.hasOwn(cfg.workflows ?? {}, DEFAULT_WORKFLOW) ? ` The project configures \`default\` itself: ${stages(DEFAULT_WORKFLOW)}.` : '';
   if (!named.length) return `No other workflows are configured: tasks run the default.${own}`;
   return `Configured workflows: ${named.map((n) => `${code(n)} (${stages(n)})`).join('; ')}. A task runs the workflow assigned at creation (\`--workflow <name>\`, see \`/minions:orchestrate\`), else the default.${own}`;
@@ -497,7 +497,6 @@ function baseVars(cfg: MinionsConfig): Record<string, string> {
     sensitivePathsInline: inlineList(cfg.sensitivePaths, 'none configured'),
     capabilityTable: renderCapabilityTable(cfg),
     policySummary: renderPolicySummary(cfg, 'coordinator'),
-    testerStage: cfg.verification.testerRequired ? 'tester' : 'tester (only when QA is required, see Testing)',
     testingGuidance: testingGuidance(cfg),
     reviewerStage: cfg.verification.reviewerRequired ? 'reviewer' : 'reviewer (optional)',
     startReadyGuidance: startReadyGuidance(cfg),
@@ -592,9 +591,9 @@ export function roleTools(def: Pick<RoleDef, 'tools' | 'edits' | 'worktree'>, fa
 const yamlString = (s: string) => JSON.stringify(s.replace(/\s+/g, ' ').trim());
 
 const STATUS_GUIDE: Record<RoleDef['contract'], string> = {
-  producer: 'Status guide (producer stage): `complete` when the stage\'s work is done (and committed, if your role commits) and verified; `needs_changes` only when the task itself must be replanned (say why in `findings`); `partial`/`blocked`/`needs_split` as described above. Omit `verdict` and `needsQa`, and never report a check with `"source": "ci"`.',
+  producer: 'Status guide (producer stage): `complete` when the stage\'s work is done (and committed, if your role commits) and verified; `needs_changes` only when the task itself must be replanned (say why in `findings`); `partial`/`blocked`/`needs_split` as described above. Omit `verdict`, and never report a check with `"source": "ci"`.',
   verifier: 'Status guide (verifier stage): `complete` only when every acceptance criterion has passing evidence at the head you report (a `complete` result with a failing check is rejected); `needs_changes` when the work is wrong or criteria are not met (each defect in `findings`, with how to reproduce); `partial`/`blocked` as described above. Never rewrite history: commits you add go on top of the branch. Omit `verdict`.',
-  gate: 'Status and verdict (gate stage): `complete` with `"verdict": "approve"` only when every criterion is met and nothing blocking remains; `needs_changes` with `"verdict": "request-changes"` otherwise, each required change in `findings` (file, line, problem, expected fix). Set `"needsQa": true` when the change needs a tester stage before delivery. `branch` is the task branch and `headSha` the head you judged; it must not move.',
+  gate: 'Status and verdict (gate stage): `complete` with `"verdict": "approve"` only when every criterion is met and nothing blocking remains; `needs_changes` with `"verdict": "request-changes"` otherwise, each required change in `findings` (file, line, problem, expected fix). `branch` is the task branch and `headSha` the head you judged; it must not move.',
 };
 
 function roleWorktreeGuide(def: RoleDef): string {
@@ -719,17 +718,16 @@ export const LIVE_CLAUDE_RUN_GUIDANCE = 'Live Claude Code runs: workers never la
   + 'Start it with `minions coordinator live-run -- <claude args>` (prompt on stdin; `--dry-run` first to see the plan): it creates the fresh config dir, passes the Claude credential for this project\'s auth method only in the environment or an apiKeyHelper, and refuses while a worker lease is active. If it reports AUTH_REQUIRED for the login method, ask the owner to run `claude setup-token` on the host and store it with `minions auth set login --headless-token`. '
   + 'Never launch any other nested claude session. `claude --version` and `claude --help` are always fine. Afterwards check `minions status` for a `telegram poller` problem.';
 
-/** Coordinator guidance for risk-based testing: when a task gets a tester, and when to run a QA sweep on the base. */
+/** Coordinator guidance on the two test tiers (docs/design/autonomy.md Decision 12) and QA sweeps on the base. */
 function testingGuidance(cfg: MinionsConfig): string {
-  const labels = cfg.verification.qaLabels ?? ['qa'];
   const base = code(cfg.git.baseBranch);
+  const v = cfg.verification;
+  const p = v.periodic;
   return [
-    cfg.verification.testerRequired
-      ? '`verification.testerRequired` is on: every task gets a tester stage after the engineer (set it to false on the host for risk-based testing).'
-      : 'Testing is risk-based: by default a task goes engineer → reviewer. The engineer writes and updates tests for the acceptance criteria; the reviewer owns test adequacy and requests changes when tests are missing or weak.',
-    'In task descriptions, ask for tests of the important, user-visible or risky behaviour of a change, not exhaustive small cases of low-importance helpers; reviewers do not request changes only for missing tests of trivial code.',
-    'Testing rule: engineers run the typecheck and unit tests only (targeted files while iterating, the unit tier once before submitting, e.g. `npm run test:unit`), and the CLI refuses a `complete` engineer result without passing evidence. Reviewers run no tests: they rely on the engineer\'s recorded checks and judge the code and the tests. Testers in a task stage run targeted checks only. The full suite and the integration tier run only in the integration gate (and in QA sweeps). Nobody reruns tests on the base branch for a baseline comparison. Never ask a worker for the full suite, the integration tier or a baseline run in a task.',
-    `A task gets a tester stage when it carries a QA label (${inlineList(labels, '`qa`')}), its branch touches sensitive paths, or the reviewer sets \`"needsQa": true\`; the CLI records the last two as the ${code(labels[0]!)} label and moves the task to \`testing\` instead of delivered. Add the label yourself for risky tasks (install/upgrade paths, cross-feature changes) with \`minions backlog update <taskId> --expected-version <v> --label ${labels[0]}\` (\`<v>\`: the \`version\` from \`minions backlog show <taskId> --json\`; repeat \`--label\` for the existing labels: it replaces the list).`,
+    `Two test tiers. The fast tier, \`verification.commands\` (${inlineList(v.commands, 'none configured')}): unit tests, typecheck and lint, cheap and quick. The dispatcher runs it on every engineer head before the reviewer starts (red: back to the engineer as a repair cycle with the failing command; a setup problem such as a missing tool: \`blocked\`), and the integrator on the merged tree before ${base} moves (not again when the merged tree is the one already verified). The slow tier, \`verification.periodic\` (${p ? `${inlineList(p.commands, '')} every ${p.everyHours ?? 24} h` : 'not configured'}): integration tests, run by the dispatcher on the ${base} head when the base moved since the last run; a failure becomes one backlog task labelled \`verify:periodic\` and a notice.`,
+    ...(v.commands.length ? [] : [`This project has no \`verification.commands\`, so nothing is verified before review${localIntegrationEnabled(cfg) ? ` and the integrator lands nothing on ${base} (approved tasks are blocked)` : ''}. Your first task is to set them up: find the project's fast checks (unit tests, typecheck, lint; add a cheap unit tier if there is none) and set them with \`minions control set verification.commands '["..."]'\` (and \`verification.setupCommands\`, e.g. \`["npm ci"]\`, when the checks need installed dependencies). If the project has slow integration or end-to-end tests, set them as \`verification.periodic\` (\`{"commands": [...], "everyHours": 24}\`), not as verification.commands.`]),
+    'Tasks need no tester. The engineer writes or updates the tests for new behaviour and runs the fast checks before recording; the reviewer reruns nothing and judges the code, the test quality and the coverage of new behaviour. In task descriptions, ask for tests of the important, user-visible or risky behaviour of a change, not exhaustive small cases of low-importance helpers. Never ask a worker for the slow tier or a baseline run on the base branch.',
+    `Label a task \`verify:full\` only when its change is heavy enough to break the slow tier (install/upgrade paths, cross-cutting runtime changes): its verify step then runs \`verification.periodic.commands\` too, which makes it slow. Use it sparingly.`,
     `QA sweeps test ${base} itself, not a ticket branch. Schedule one at a milestone, before a release, after about five merges since the last sweep, or when the user asks: create a task labelled \`qa-sweep\` (\`minions backlog create --title "QA sweep: <scope>" --label qa-sweep --key qa-sweep:<milestone or date>\`); the dispatcher runs it as a tester stage. The tester checks end-to-end flows, install/upgrade paths and cross-feature regressions in a detached worktree at the ${base} head and commits nothing. Every sweep includes an efficiency pass (logical inefficiencies, code style) on the same cadence, with no separate role or command; its findings carry a severity, so batch or skip low-value nits. Recording it closes the sweep as done; create one backlog task per finding (idempotency key \`qa:<sweepId>:<n>\`). Sweeps are not per-ticket work: never start one per task. Scheduling a sweep is new work, not a follow-up: while intake is paused, \`qa-sweep:\` tasks are refused like any other intake, so wait until intake reopens.`,
     LIVE_CLAUDE_RUN_GUIDANCE,
   ].join('\n\n');

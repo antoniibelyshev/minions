@@ -54,14 +54,14 @@ function crossFieldIssues(c: MinionsConfig): ConfigIssue[] {
 }
 
 /**
- * Removed keys, accepted in any layer and dropped: the GitHub delivery (docs/design/autonomy.md Decision 8) and the
- * dispatch mode (Decision 10; `coordinator.contextReset.barrierTokens` below).
+ * Removed keys, accepted in any layer and dropped: the GitHub delivery (docs/design/autonomy.md Decision 8), the
+ * dispatch mode (Decision 10; `coordinator.contextReset.barrierTokens` below) and risk-based testing (Decision 12).
  */
 const LEGACY_KEYS: Record<string, readonly string[]> = {
   backlog: ['repository'],
   intake: ['github'],
   delivery: ['provider', 'mode', 'method', 'deleteMergedBranches', 'identityMode', 'requireIndependentApproval', 'requiredChecksConfigured'],
-  verification: ['ciAuthority', 'ciPendingTimeoutMinutes'],
+  verification: ['ciAuthority', 'ciPendingTimeoutMinutes', 'testerRequired', 'qaLabels'],
   capabilities: ['git.push', 'pr.create', 'pr.review', 'pr.merge'],
   dispatch: ['mode'],
 };
@@ -81,6 +81,11 @@ export function stripLegacyKeys(raw: unknown): unknown {
     for (const k of keys) delete next[k];
     if (section === 'delivery' && (next.merge === 'manual' || (next.merge === 'auto-when-eligible' && typeof sec.mode === 'string' && sec.mode !== 'local'))) next.merge = 'disabled';
     out[section] = next;
+  }
+  // `{ role, when: "qa" }` stages (risk-based testing) are dropped: the verify step replaced them.
+  if (isObj(out.workflows)) {
+    out.workflows = Object.fromEntries(Object.entries(out.workflows).map(([name, list]) =>
+      [name, Array.isArray(list) ? list.filter((x) => !(isObj(x) && x.when === 'qa')) : list]));
   }
   if (isObj(out.backlog) && out.backlog.backend === 'github') out.backlog = { ...out.backlog, backend: 'backlogmd' };
   const reset = isObj(out.coordinator) ? out.coordinator.contextReset : undefined;
@@ -250,9 +255,8 @@ function applySession(base: MinionsConfig, session: unknown, prov: Record<string
     } else if (path === 'intake.scope.requiredLabels') {
       if (!Array.isArray(v) || !base.intake.scope.requiredLabels.every((l) => v.includes(l))) throw widen(path, 'must keep existing required labels');
       out.intake.scope.requiredLabels = v as string[];
-    } else if (path === 'verification.testerRequired' || path === 'verification.reviewerRequired') {
-      const k = key as 'testerRequired' | 'reviewerRequired';
-      out.verification[k] = onlyTrue(base.verification[k]);
+    } else if (path === 'verification.reviewerRequired') {
+      out.verification.reviewerRequired = onlyTrue(base.verification.reviewerRequired);
     } else if (path === 'sensitivePaths') {
       if (!Array.isArray(v) || !base.sensitivePaths.every((p) => v.includes(p))) throw widen(path, 'must keep existing sensitive paths');
       out.sensitivePaths = v as string[];
