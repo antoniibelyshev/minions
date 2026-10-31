@@ -397,7 +397,7 @@ export function coordinatorBaseline(ctx: { db: RuntimeDb; billing: Billing; fall
   };
 }
 
-export interface SpendContext { db: RuntimeDb; billing?: Billing; config?: Pick<MinionsConfig, 'models'>; now?: Date }
+export interface SpendContext { db: RuntimeDb; billing?: Billing; config?: Pick<MinionsConfig, 'models'> & Partial<Pick<MinionsConfig, 'budgets'>>; now?: Date }
 
 export function readBudget(db: RuntimeDb): Budget | null {
   const v = db.getControl('budget');
@@ -493,13 +493,61 @@ export function describeBudget(s: BudgetStatus): string {
   return `${fmt(s.used, s.unit)} of ${fmt(s.limit, s.unit)} ${windowText(s)} (${s.percent}%; budget "${s.text}")`;
 }
 
-/** Refuses a new claim when the budget is used up. Running leases are never touched. */
-export function assertBudgetAllowsStart(ctx: SpendContext): void {
+/**
+ * The owner's USD caps (`budgets.dailyUsd`, `budgets.taskUsd`; docs/design/autonomy.md Decision 13), against the
+ * estimated USD: today's (UTC) spend of everything, and a task's worker spend since it began. Enforced only with
+ * API-key billing (a subscription has no USD figure).
+ */
+export interface UsdCaps {
+  enforced: boolean;
+  day: { capUsd: number | null; usedUsd: number; tokens: number; exhausted: boolean };
+  /** The per-task cap; with a task id, that task's worker spend; `atCap`: tasks whose workers reached it. */
+  task: { capUsd: number | null; taskId?: string; usedUsd?: number; exhausted: boolean; atCap: string[] };
+}
+
+export function usdCaps(ctx: SpendContext, taskId?: string): UsdCaps {
+  const now = ctx.now ?? new Date();
+  const fallback = ctx.config?.models.default ?? null;
+  const caps = ctx.config?.budgets ?? { dailyUsd: null, taskUsd: null };
+  const enforced = (ctx.billing ?? billingOf()) === 'api-key';
+  const rows = usageRows(ctx.db);
+  const usd = (e: KeyTally[]) => figures(e, 0, 'api-key', fallback).estimatedUsd ?? 0;
+  const today = tally(rows, utcDayStart(now));
+  const dayUsd = usd(today);
+  const all = tally(rows).filter((e) => e.scope === 'lease' && e.taskId);
+  const perTask = new Map<string, KeyTally[]>();
+  for (const e of all) perTask.set(e.taskId!, [...(perTask.get(e.taskId!) ?? []), e]);
+  const taskUsd = (id: string) => usd(perTask.get(id) ?? []);
+  const atCap = caps.taskUsd === null ? [] : [...perTask.keys()].filter((id) => taskUsd(id) >= caps.taskUsd!).sort();
+  const used = taskId === undefined ? undefined : taskUsd(taskId);
+  return {
+    enforced,
+    day: { capUsd: caps.dailyUsd, usedUsd: dayUsd, tokens: today.reduce((a, e) => a + e.tokens, 0), exhausted: enforced && caps.dailyUsd !== null && dayUsd >= caps.dailyUsd },
+    task: { capUsd: caps.taskUsd, ...(taskId !== undefined ? { taskId, usedUsd: used } : {}), exhausted: enforced && caps.taskUsd !== null && used !== undefined && used >= caps.taskUsd, atCap },
+  };
+}
+
+const CAP_HINT = 'Record returning workers and tell the owner; the owner changes the caps with /budget in Telegram (the coordinator cannot).';
+
+/**
+ * Refuses a new claim when the budget is used up, or (with a task id) when the owner's daily or per-task USD cap is
+ * reached. Running leases are never touched.
+ */
+export function assertBudgetAllowsStart(ctx: SpendContext, taskId?: string): void {
   const s = currentBudget(ctx);
-  if (!s?.exhausted) return;
-  throw new MinionsError('POLICY_DENIED', `Budget reached: ${describeBudget(s)}. New starts are refused; running workers continue.`,
-    'Record returning workers and report to the owner; starts resume when the owner raises the budget (`minions work spend --budget "<amount>"`) or clears it (`--budget off`).',
-    { budget: s });
+  if (s?.exhausted) {
+    throw new MinionsError('POLICY_DENIED', `Budget reached: ${describeBudget(s)}. New starts are refused; running workers continue.`,
+      'Record returning workers and report to the owner; starts resume when the owner raises the budget (`minions work spend --budget "<amount>"`) or clears it (`--budget off`).',
+      { budget: s });
+  }
+  if (!ctx.config?.budgets) return;
+  const c = usdCaps(ctx, taskId);
+  if (c.day.exhausted) {
+    throw new MinionsError('POLICY_DENIED', `Daily spend cap reached: ~$${c.day.usedUsd.toFixed(2)} of $${c.day.capUsd} today (UTC, estimated). New starts are refused; running workers continue.`, CAP_HINT, { caps: c });
+  }
+  if (c.task.exhausted) {
+    throw new MinionsError('POLICY_DENIED', `Per-task spend cap reached for ${taskId}: ~$${c.task.usedUsd!.toFixed(2)} of $${c.task.capUsd} (estimated). Its next stage is refused.`, CAP_HINT, { caps: c });
+  }
 }
 
 export interface BudgetNotice extends BudgetStatus {

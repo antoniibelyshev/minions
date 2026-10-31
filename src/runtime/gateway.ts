@@ -11,6 +11,8 @@
 // - The sessions index (<state>/sessions/index.md): every open session and those closed in the last day, with its topic
 //   (`coordinator topic`), last activity and first owner message. Rewritten when it changes; `/sessions` in the chat
 //   shows it.
+// - `/budget` (Decision 13): shows and changes the owner's USD caps, handled here and never routed to a coordinator, so a
+//   coordinator cannot raise its own caps. Changes go to the control overlay as the owner's (journaled, live).
 import { mkdir, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { MinionsConfig } from '../config/schema.js';
@@ -18,11 +20,12 @@ import { MinionsError } from '../core/errors.js';
 import { atomicWrite } from '../core/fsutil.js';
 import { redact } from '../core/output.js';
 import { BotApi } from '../telegram/bot-api.js';
-import type { ChannelNotification } from '../telegram/channel/core.js';
+import { parseAccess, type ChannelNotification } from '../telegram/channel/core.js';
 import { CHANNEL_BOT_ERRORS, ChannelServer, fileLog, LAUNCH_ENV, readChannelToken, type ChannelProc, type ChannelServerOptions } from '../telegram/channel/server.js';
 import type { RuntimeDb, SessionRow } from './db.js';
 import { digestStatus, reholdExpired } from './digest.js';
-import { billingOf, sessionSpend, type Billing } from './spend.js';
+import { billingOf, sessionSpend, usdCaps, type Billing } from './spend.js';
+import { controlSet, withControl } from './control.js';
 import { ack, fail, pending } from './outbox.js';
 import { recordSent, resolveRoute, sendToSession, threadReplyTarget, type RouteRule } from './router.js';
 import { routineSettings } from './routine.js';
@@ -46,6 +49,11 @@ export interface GatewayDeps {
   digest?: () => Promise<{ text: string; keys: string[] } | null>;
   log: (line: string) => void;
   now?: () => Date;
+  /** The config below the control overlay (`/budget` writes the overlay); without it `/budget` changes are refused. */
+  controlBase?: () => Promise<MinionsConfig>;
+  /** Whether a Telegram user id is the paired owner (access.json allowFrom); without it `/budget` changes are refused. */
+  isOwner?: (userId: string | undefined) => Promise<boolean>;
+  billing?: Billing;
 }
 
 const num = (v: string | undefined): number | null => {
@@ -53,7 +61,7 @@ const num = (v: string | undefined): number | null => {
   return v !== undefined && Number.isSafeInteger(n) && n > 0 ? n : null;
 };
 
-export type InboundResult = { key: string; rule: RouteRule | 'ambiguous-thread' } | { command: 'sessions' };
+export type InboundResult = { key: string; rule: RouteRule | 'ambiguous-thread' } | { command: 'sessions' | 'budget' };
 
 /** Routes one owner message (a channel notification) to its session's inbox. */
 export async function routeInbound(d: GatewayDeps, n: ChannelNotification): Promise<InboundResult> {
@@ -62,6 +70,12 @@ export async function routeInbound(d: GatewayDeps, n: ChannelNotification): Prom
   if (/^\/sessions(?:@\w+)?\s*$/i.test(text.trim())) {
     await d.sender.send({ text: formatSessionsIndex(sessionsIndex(d.db, now)), replyTo: num(n.meta.message_id) });
     return { command: 'sessions' };
+  }
+  // A poll vote's text is an option the coordinator wrote: never a command.
+  const budget = n.meta.poll_id ? null : parseBudgetCommand(text);
+  if (budget) {
+    await d.sender.send({ text: await budgetReply(d, budget, n.meta.user_id, now), replyTo: num(n.meta.message_id) });
+    return { command: 'budget' };
   }
   const cfg = await d.config();
   // A poll vote: its message id is the poll's, which belongs to the asking session; it starts no thread.
@@ -127,6 +141,59 @@ export async function deliverDue(d: GatewayDeps): Promise<{ sent: string[]; fail
     }
   }
   return { sent, failed: null };
+}
+
+// ---------------------------------------------------------------- /budget
+
+export type BudgetCommand =
+  | { kind: 'show' }
+  | { kind: 'set'; key: 'dailyUsd' | 'taskUsd'; usd: number | null }
+  | { kind: 'usage'; why: string };
+
+export const BUDGET_USAGE = 'Usage: /budget (show), /budget day <usd|off>, /budget task <usd|off>.';
+
+/** `/budget [day|task <usd|off>]`; null when the message is not a /budget command. */
+export function parseBudgetCommand(text: string): BudgetCommand | null {
+  const m = /^\/budget(?:@\w+)?(?:\s+(.*))?$/is.exec(text.trim());
+  if (!m) return null;
+  const args = (m[1] ?? '').trim().split(/\s+/).filter(Boolean);
+  if (!args.length) return { kind: 'show' };
+  const which = args[0]!.toLowerCase();
+  const key = which === 'day' || which === 'daily' ? 'dailyUsd' : which === 'task' ? 'taskUsd' : null;
+  if (!key) return { kind: 'usage', why: `unknown cap "${args[0]!.slice(0, 20)}"` };
+  if (args.length !== 2) return { kind: 'usage', why: `give one amount for the ${which} cap` };
+  const v = args[1]!.toLowerCase();
+  if (v === 'off' || v === 'none') return { kind: 'set', key, usd: null };
+  const usd = Number(v.replace(/^\$/, ''));
+  if (!/^\$?\d+(\.\d+)?$/.test(v) || !(usd > 0)) return { kind: 'usage', why: `"${args[1]!.slice(0, 20)}" is not a positive USD amount` };
+  return { kind: 'set', key, usd: Math.round(usd * 100) / 100 };
+}
+
+const capText = (usd: number | null) => (usd === null ? 'off' : `$${usd}`);
+
+/** Runs a /budget command and returns the reply. Changes need the paired owner and the control base. */
+export async function budgetReply(d: GatewayDeps, c: BudgetCommand, userId: string | undefined, now: Date): Promise<string> {
+  if (c.kind === 'usage') return `${c.why}. ${BUDGET_USAGE}`;
+  if (!d.controlBase) return 'Budget caps are unavailable here (no runtime config).';
+  const base = await d.controlBase();
+  if (c.kind === 'set') {
+    if (!d.isOwner || !(await d.isOwner(userId))) return 'Only the paired owner changes the budget.';
+    const key = `budgets.${c.key}`;
+    const reason = `owner: /budget ${c.key === 'dailyUsd' ? 'day' : 'task'} ${capText(c.usd)} (Telegram)`;
+    const r = await controlSet({ state: d.state, base, actor: 'owner (telegram)', owner: true, now: () => now }, key, c.usd, reason);
+    d.db.addEvent('budget-cap', null, { key, usd: c.usd, revision: r.revision, via: 'telegram' }, now.toISOString());
+    const head = `${c.key === 'dailyUsd' ? 'Daily' : 'Per-task'} cap ${r.keys.length ? 'set to' : 'already'} ${capText(c.usd)}${r.keys.length ? ` (control revision ${r.revision}; applies to the next claim)` : ''}.`;
+    return `${head}\n${budgetSummary(d, withControl(base, d.state), now)}`;
+  }
+  return budgetSummary(d, withControl(base, d.state), now);
+}
+
+function budgetSummary(d: GatewayDeps, cfg: MinionsConfig, now: Date): string {
+  const c = usdCaps({ db: d.db, config: cfg, billing: d.billing ?? billingOf(), now });
+  const day = `Today (UTC): ~$${c.day.usedUsd.toFixed(2)} est. (${kTok(c.day.tokens)} tok) of daily cap ${capText(c.day.capUsd)}${c.day.exhausted ? ': reached, new starts refused' : ''}.`;
+  const task = `Per-task cap: ${capText(c.task.capUsd)}${c.task.atCap.length ? ` (reached: ${c.task.atCap.join(', ')})` : ''}.`;
+  const note = c.enforced ? null : 'Not enforced: this runtime uses a Claude subscription (no USD figure); the estimate is the API-rate equivalent.';
+  return [day, task, ...(note ? [note] : [])].join('\n');
 }
 
 // ---------------------------------------------------------------- sessions index
@@ -250,7 +317,13 @@ export async function runGateway(o: RunGatewayOptions): Promise<void> {
   });
   const st = await server.activate();
   if (!st.active) throw new MinionsError('PRECONDITION', `The Telegram gateway is not active: ${st.reason}.`);
-  const deps: GatewayDeps = { ...o, sender: server, log };
+  const accessFile = join(o.telegramStateDir, 'access.json');
+  const isOwner = o.isOwner ?? (async (userId: string | undefined) => {
+    if (!userId) return false;
+    const raw = await readFile(accessFile, 'utf8').then((t) => JSON.parse(t) as unknown, () => null);
+    return parseAccess(raw).allowFrom.includes(userId);
+  });
+  const deps: GatewayDeps = { ...o, sender: server, log, isOwner };
   let inbound = Promise.resolve();
   server.onNotification((n) => {
     inbound = inbound.then(() => routeInbound(deps, n)).then(

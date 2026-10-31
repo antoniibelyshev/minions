@@ -23,6 +23,7 @@ import { checkPlugin, dockerUnavailable, formatInit, pluginMismatch, refreshDeri
 import { loadEffectiveConfig, loadProjectJson, type ProjectJson } from './project.js';
 import { projectForPath } from './registry.js';
 import { composeTarget, exportRepo, exportState, importRepo, importState, inspectStateBackup, type TransferTarget } from './transfer.js';
+import { fastForwardBase } from './pull.js';
 import { agentWritableDirs, hostUpgradeTarget } from './upgrade-host.js';
 import { HOST_RUNTIME_WARNING, HostRuntime, RUNTIMES, prepareHostRuntime, requireHostTools, runtimeOf, type RuntimeKind } from './runtime.js';
 import { registerRuntime } from './runtime-cli.js';
@@ -589,32 +590,52 @@ export function register(program: Command): void {
         ...d.warnings.map((w) => `warning: ${w}`)].join('\n') });
     }));
 
+  // `minions pull` (docs/design/autonomy.md Decision 13); a bare `minions export` is `pull --no-ff-main`.
+  const pull = async (json: boolean, dryRun: boolean, ffMain: boolean) => {
+    const ref = await projectForPath(process.cwd());
+    if (dryRun) { emit({ dryRun: true, target: 'refs/remotes/minions/*', ffMain }, { json }); return; }
+    const project = await loadProjectJson(ref.projectId);
+    let r;
+    if (runtimeOf(project) === 'host') {
+      const host = new HostRuntime(project);
+      if (!(await host.prepared())) throw new MinionsError('PRECONDITION', 'The host runtime has not been started for this project.', 'Run `minions start --no-attach` first.');
+      await prepareHostRuntime(project);
+      r = await exportRepo(project, { repoPath: ref.repoPath, target: host.transferTarget() });
+    } else {
+      await requireDocker();
+      const compose = new Compose(ref.projectId);
+      if (!(await compose.isRunning())) throw new MinionsError('PRECONDITION', 'The project container is not running.', 'Run `minions start --no-attach` first.');
+      r = await exportRepo(project, { repoPath: ref.repoPath, compose });
+    }
+    const ff = ffMain ? await fastForwardBase(ref.repoPath, project.baseBranch) : null;
+    const out = { ...r, ff };
+    const name = (full: string) => full.replace(/^refs\/remotes\//, '');
+    emit(out, { json, human: (d: typeof out) => [
+      ...(d.changes.length ? d.changes.map((c) => `  ${name(c.ref)}: ${c.from?.slice(0, 12) ?? '(new)'} -> ${c.to?.slice(0, 12) ?? '(deleted)'}`) : ['  no ref changes']),
+      d.tasks.length ? `Delivered/landed tasks (git merge <ref>): ${d.tasks.map((t) => name(t.ref)).join(', ')}` : 'No delivered or landed task branches.',
+      d.ff ? `${project.baseBranch}: ${d.ff.applied ? `fast-forwarded (${d.ff.reason})` : `${d.ff.action === 'up-to-date' ? 'up to date' : 'not moved'}: ${d.ff.reason}`}` : `${project.baseBranch}: not touched (--no-ff-main); minions/${project.baseBranch} has the agents' base`,
+      d.ff?.applied ? 'No other local branch was modified.' : 'Local branches and the working tree were not modified.'].join('\n') });
+  };
+
+  program.command('pull')
+    .description('Fetch the agents\' branches into refs/remotes/minions/* (delivered and landed tasks as minions/task-<id>, the agents\' base as minions/<base>), then fast-forward your base branch to it when the checkout is clean and on it')
+    .option('--no-ff-main', 'only fetch; never move the base branch')
+    .option('--dry-run', 'show what would be fetched')
+    .action(action(async (o: { ffMain: boolean }, cmd: Command) => {
+      requireMode('host');
+      const { json, dryRun } = globalOpts(cmd);
+      await pull(json, dryRun, o.ffMain);
+    }));
+
   program.command('export')
-    .description('Fetch agent branches from the runtime workspace into refs/remotes/minions/* (non-destructive); with --state, write a state backup instead')
+    .description('Same as `minions pull --no-ff-main` (fetch agent branches, non-destructive); with --state, write a state backup instead')
     .option('--state [file]', 'write a backup of the runtime state (backlog, notes, briefs, results, runtime DB snapshot; no secrets, no Claude login) to <file> (default: <project>/exports/state-<time>.tar.gz)')
     .option('--dry-run', 'show what would be exported')
     .action(action(async (o: { state?: string | boolean }, cmd: Command) => {
       requireMode('host');
       const { json, dryRun } = globalOpts(cmd);
       if (o.state !== undefined) return exportStateCommand(typeof o.state === 'string' ? o.state : undefined, { json, dryRun });
-      const ref = await projectForPath(process.cwd());
-      if (dryRun) { emit({ dryRun: true, target: 'refs/remotes/minions/*' }, { json }); return; }
-      const project = await loadProjectJson(ref.projectId);
-      let r;
-      if (runtimeOf(project) === 'host') {
-        const host = new HostRuntime(project);
-        if (!(await host.prepared())) throw new MinionsError('PRECONDITION', 'The host runtime has not been started for this project.', 'Run `minions start --no-attach` first.');
-        await prepareHostRuntime(project);
-        r = await exportRepo(project, { repoPath: ref.repoPath, target: host.transferTarget() });
-      } else {
-        await requireDocker();
-        const compose = new Compose(ref.projectId);
-        if (!(await compose.isRunning())) throw new MinionsError('PRECONDITION', 'The project container is not running.', 'Run `minions start --no-attach` first.');
-        r = await exportRepo(project, { repoPath: ref.repoPath, compose });
-      }
-      emit(r, { json, human: (d: typeof r) => [`Bundle: ${d.bundle}`,
-        ...(d.changes.length ? d.changes.map((c) => `  ${c.ref}: ${c.from?.slice(0, 12) ?? '(new)'} -> ${c.to?.slice(0, 12) ?? '(deleted)'}`) : ['  no ref changes']),
-        'Local branches and the working tree were not modified.'].join('\n') });
+      await pull(json, dryRun, false);
     }));
 
   auth.command('telegram')

@@ -235,6 +235,26 @@ message about its task), and the routine's runnable, unvalidated, split and awai
 is a hold now). `work claim|record|release` stay as primitives; the recover skill uses the last two for leases left
 from before this decision. Process-harness roles run through the dispatcher's `minions work run`, as before.
 
+## Decision 13. Budget from Telegram, extra terminal sessions, `minions pull` (owner, 2026-10-31)
+
+- **`/budget` is the gateway's, never a coordinator's.** A coordinator that reads the command could raise its own cap,
+  so the gateway answers it without a model and only the paired owner (access.json) may change a cap. The change goes
+  to the control overlay as the owner's: journaled with undo, and live because the dispatcher re-reads the config every
+  pass, which a write to the host-owned project config would not be without a host round trip. The control layer
+  refuses `budgets.*` from the coordinator (set, apply, or an undo that would touch them), so the overlay being
+  coordinator-writable does not reopen the hole. `budgets.*` stop being prompt text: they refuse claims against the
+  USD estimate, with API-key billing only (a subscription has no USD figure; they are shown, not enforced). The
+  per-task cap counts the task's workers; the daily cap counts everything since the UTC day start.
+- **`minions session new` runs outside the wrapper.** The wrapper owns the coordinator lock, the launch record,
+  Telegram and the helpers; a second interactive coordinator needs none of them and must not take them over. It is its
+  own tmux session on the runtime's server, not a window of `coordinator`: windows of one tmux session share the
+  current window across attached clients, so two terminals would switch each other. `session:<name>` is a scope with
+  no DB row, so it claims nothing and leaves notifications and topics to the primary coordinator.
+- **`minions pull` replaces `minions export`** (kept as `pull --no-ff-main`). Task refs come from the runtime (latest
+  lease branch, backlog status delivered or done) because a branch slug does not encode the task id reliably. The base
+  only moves by `merge --ff-only` in a clean checkout that has it checked out; everything else is reported, since
+  moving a branch the user is not on, or a dirty tree, is the user's call.
+
 ## Reversed decisions
 
 - telegram-decisions.md D2 (tap buttons instead of native polls): native polls are built at the owner's request.

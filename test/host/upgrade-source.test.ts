@@ -35,7 +35,7 @@ function syncRepo() {
   git(repo, 'update-ref', 'refs/remotes/minions/main', ahead);
   git(repo, 'branch', '-q', '-D', 'tmp');
   let exports = 0;
-  const exportRepo = async (): Promise<ExportResult> => { exports++; return { bundle: 'b', refs: ['refs/heads/main'], changes: [{ ref: 'refs/remotes/minions/main', from: base, to: ahead }] }; };
+  const exportRepo = async (): Promise<ExportResult> => { exports++; return { bundle: 'b', refs: ['refs/heads/main'], changes: [{ ref: 'refs/remotes/minions/main', from: base, to: ahead }], tasks: [] }; };
   return { repo, base, ahead, exportRepo, exports: () => exports };
 }
 const head = (repo: string, ref = 'refs/heads/main') => git(repo, 'rev-parse', ref);
@@ -528,7 +528,7 @@ describe('installed CLI check', () => {
     symlinkSync(repo, join(g, 'minions'));
     const w: NpmWorld = { globalRoot: g, checkout: repo, calls: [], lsResolved: `file:${repo}` };
     const logs: string[] = [];
-    const exportRepo = async (): Promise<ExportResult> => ({ bundle: 'b', refs: ['refs/heads/main'], changes: [{ ref: 'refs/remotes/minions/main', from: base, to: ahead }] });
+    const exportRepo = async (): Promise<ExportResult> => ({ bundle: 'b', refs: ['refs/heads/main'], changes: [{ ref: 'refs/remotes/minions/main', from: base, to: ahead }], tasks: [] });
     const p = await runSourcePhase<UpgradeResult>(phaseBase({
       checkout: repo, runner: fakeNpm(w), log: (m) => logs.push(m), rebuildCli: true,
       sync: { repo, branch: 'main', baseBranch: 'main', exportRepo, runner: run },

@@ -250,14 +250,10 @@ function decisionGuidance(): string {
 
 /**
  * Usage-based spend guidance (task-32): the dispatcher records each worker's token total, the runtime keeps the
- * tally (src/runtime/spend.ts) and refuses claims at the owner's budget. `budgets.*` is USD-only and unenforced in v0.1.
+ * tally (src/runtime/spend.ts) and refuses claims at the owner's budget and at the owner's USD caps (`budgets.*`).
  */
-function spendGuidance(cfg: MinionsConfig): string {
-  const caps = [
-    cfg.budgets.dailyUsd !== null ? `$${cfg.budgets.dailyUsd} per day` : null,
-    cfg.budgets.taskUsd !== null ? `$${cfg.budgets.taskUsd} per task` : null,
-  ].filter(Boolean);
-  const configured = caps.length ? ` The config's \`budgets\` (${caps.join(', ')}; not enforced in v0.1) counts as a budget until the owner gives one.` : '';
+function spendGuidance(_cfg: MinionsConfig): string {
+  const configured = ' The owner\'s USD caps (`budgets.dailyUsd`, `budgets.taskUsd`; estimated USD, API-key billing only) also refuse new claims once reached; only the owner changes them (`/budget` in Telegram), never you.';
   return [
     '**Spend.** The dispatcher records each worker\'s token total; your own session tokens are measured from the transcript. The tally is durable: `minions status --json` shows `spend` (total, today, per task, budget). Report it with deliveries and when asked: tokens plus a rough USD estimate with API-key billing (the Console usage page is authoritative), tokens only on a subscription (its remaining plan quota is not visible). Never invent figures.',
     `When the owner gives a budget in plain language, set it: \`minions work spend --budget "<their words>" --json\` (tokens or attempts; USD only with API-key billing; \`off\` clears). \`spend.budget\` in the status has the percent used: tell the owner when it passes 50 or 80; at 100 new claims are refused (running workers continue): say why starts stopped and ask before spending more. If workers hit a plan usage or rate limit, pause starts (\`minions pause --starts --json\`) and report it.${configured}`,
