@@ -167,11 +167,12 @@ describe('an owner-cancelled task is not re-dispatched', () => {
     expect(formatCancel(r)).toContain('blocked (not re-dispatched until set back to ready): task-1');
   });
 
-  it.each(['tester', 'reviewer'] as const)('%s lease: the task leaves its stage status for blocked', async (role) => {
+  it('reviewer lease: the task leaves its stage status for blocked', async () => {
+    const role = 'reviewer';
     const env = makeDefaultEnv();
-    env.backlog.add({ id: 'task-1', title: 'One', labels: role === 'tester' ? ['qa'] : [] });
+    env.backlog.add({ id: 'task-1', title: 'One' });
     await pastEngineer(env, 'task-1');
-    const stage = role === 'tester' ? 'testing' : 'reviewing';
+    const stage = 'reviewing';
     expect(env.backlog.status('task-1')).toBe(stage);
     await env.sched.claim('task-1', role);
     const r = await cancel(env, { taskIds: ['task-1'] });

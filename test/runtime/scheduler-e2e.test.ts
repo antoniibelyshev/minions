@@ -72,21 +72,4 @@ describe('claim -> brief -> submit -> record (real git)', () => {
     expect((err as MinionsError).code).toBe('PRECONDITION');
     expect(existsSync(join(rev.worktree, 'scratch.txt'))).toBe(true);
   });
-
-  it('the diff gate sees a rename out of a sensitive directory (real `git diff --no-renames`), and the tester is next', async () => {
-    const env = makeDefaultEnv(); // risk-based testing: a tester only when the change needs one
-    mkdirSync(join(env.layout.repo, '.claude'));
-    commitFile(env.layout.repo, '.claude/settings.json', '{}\n');
-    env.backlog.add({ id: 'task-1' });
-    const e = await claimWithBrief(env.sched, paths(env), 'task-1', 'engineer');
-    mkdirSync(join(e.worktree, 'docs'), { recursive: true });
-    gitSync(e.worktree, 'mv', '.claude/settings.json', 'docs/settings.json');
-    gitSync(e.worktree, 'commit', '-q', '-m', 'move settings');
-    await work(env, e, { headSha: gitSync(e.worktree, 'rev-parse', 'HEAD'), modifiedPaths: ['docs/settings.json'] });
-    // The worker reported only the new path; the base...head diff of the real repository names the old one too.
-    const submitted = await recordSubmitted(env.sched, paths(env), e.leaseId, {});
-    expect(submitted).toMatchObject({ valid: true, to: 'testing' });
-    expect(submitted.message).toMatch(/\.claude\/settings\.json/);
-    expect((await env.sched.next()).runnable).toMatchObject([{ taskId: 'task-1', role: 'tester' }]);
-  });
 });

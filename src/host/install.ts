@@ -403,14 +403,10 @@ async function prepare(opts: InitOptions, docker?: DockerStatus): Promise<Prepar
           : 'Claude login inside the container on first start: run /login in the coordinator session (host login is not reused).',
         'Repository is imported into the container from a Git bundle of committed history on first start.',
       ]),
-      ...(effective.communication.channel === 'telegram' ? [
+      ...(effective.communication.channel !== 'terminal' ? [
         `Telegram bot token from BotFather, stored on the host (Keychain or 0600 file) and mounted read-only at ${TELEGRAM_TOKEN_CONTAINER_PATH}; only the coordinator process receives it.`,
-        'The runtime image includes a pinned Bun (the Telegram plugin runs on it); an existing image is rebuilt on the next `minions start`.',
-        'On `minions start` the container installs telegram@claude-plugins-official at user scope (needs network; no login).',
         'Pairing happens on the host (`minions telegram access pair <code>`, then `minions telegram access policy allowlist`); pair only yourself.',
         'Telegram changes are restart-required: `minions start` restarts the coordinator in a controlled way.',
-      ] : effective.communication.channel === 'auto' && runtime !== 'host' && effective.container.network !== 'none' ? [
-        'Optional Telegram (communication.channel auto): create a bot with BotFather, store its token with `minions auth telegram`, then `minions down && minions start`; pair on the host (`minions telegram access pair <code>`, then `minions telegram access policy allowlist`). Without a token the coordinator uses the terminal.',
       ] : []),
     ],
     notes, warnings,
