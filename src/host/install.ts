@@ -20,9 +20,10 @@ import {
 } from './credentials.js';
 import { composeYaml, type Runner } from './docker.js';
 import { composeHint, daemonHint } from './linux-host.js';
-import { ProjectJsonSchema, loadEffectiveConfig, projectConfigPath, resolveEffective, runtimeProjectInfo, sharedConfigView, type ProjectJson } from './project.js';
+import { ProjectJsonSchema, loadEffectiveConfig, loadProjectJson, projectConfigPath, resolveEffective, runtimeProjectInfo, sharedConfigView, type ProjectJson } from './project.js';
 import { bindProject, gitCommonDir, loadRegistry, repoRoot, resolveIdentity, saveRegistry, sharedProjectId, type Identity, type Registry } from './registry.js';
 import { bootstrapRepo } from './repo-bootstrap.js';
+import { defaultSessionsOn } from './channel-cli.js';
 import { runWizard, type WizardIO } from './wizard.js';
 import { runGithubSetup, type GithubSetupResult } from './github-setup.js';
 import { HOST_CONFIRM_WORD, HOST_RUNTIME_SHORT, HOST_RUNTIME_WARNING, RUNTIMES, type RuntimeKind } from './runtime.js';
@@ -723,6 +724,7 @@ async function offerTelegramToken(opts: InitOptions, plan: InitResult['plan']): 
     const { projectId: _id, ...provisioned } = await provisionTelegramToken({
       projectId: plan.projectId, token, repoPath: plan.repoPath, verify, runner: opts.runner, fetch: opts.fetch,
     });
+    await defaultSessionsOn(await loadProjectJson(plan.projectId)).catch(() => false);
     return { status: 'stored', detail: `bot ${provisioned.botId} stored in ${backendLabel(provisioned.backend)}`, provisioned };
   } catch (e) {
     return { status: 'failed', detail: `${e instanceof MinionsError ? e.message : 'could not store the token'}; ${TERMINAL_UNTIL_TOKEN}.` };

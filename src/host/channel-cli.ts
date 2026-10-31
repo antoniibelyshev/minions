@@ -202,6 +202,19 @@ export async function offerAutoChannel(project: ProjectJson, o: { interactive: b
   return { configured, offered: true, switched: result.applied, hint: null, result };
 }
 
+/**
+ * Telegram set up: coordinator sessions (a router plus one session per thread and per task; docs/design/autonomy.md
+ * Decision 6) default on, unless the owner set coordinator.sessions.enabled. Returns whether the config changed.
+ */
+export async function defaultSessionsOn(project: ProjectJson): Promise<boolean> {
+  const done = await editProjectConfig(project, (raw) => {
+    const c = (raw.coordinator ?? {}) as Record<string, unknown>;
+    const sessions = (c.sessions ?? {}) as Record<string, unknown>;
+    return sessions.enabled !== undefined ? null : { ...raw, coordinator: { ...c, sessions: { ...sessions, enabled: true } } };
+  });
+  return done.written;
+}
+
 // ---------------------------------------------------------------- register
 
 export function registerChannel(program: Command, io: { confirm: (q: string) => Promise<boolean | null> }): Command {

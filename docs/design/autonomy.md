@@ -179,6 +179,9 @@ Built on the minions channel server (src/telegram/channel, task-67), which the h
   and the task's decisions are posted as replies into the thread that created the task.
 - Thread sessions close after `coordinator.sessions.threadIdleMinutes` (default 240) without traffic; a later reply
   into the thread reopens it with its handoff note.
+- **On by default with Telegram** (owner, 2026-10-31): storing a bot token (`minions auth telegram`, the init and
+  setup steps) sets `coordinator.sessions.enabled: true` in the project config unless the owner set it. Terminal-only
+  projects keep the single coordinator: the router answers through Telegram.
 
 ## Reversed decisions
 

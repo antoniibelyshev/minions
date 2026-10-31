@@ -46,6 +46,7 @@ import type { Runner } from './docker.js';
 import { runGithubSetup, type GithubSetupResult } from './github-setup.js';
 import { harnessStep } from './harness-setup.js';
 import { formatPlan, runInit, type InitResult } from './install.js';
+import { defaultSessionsOn } from './channel-cli.js';
 import { loadEffectiveConfig, loadProjectJson } from './project.js';
 import { findByCommonDir, gitCommonDir, loadRegistry, repoRoot } from './registry.js';
 import type { RuntimeKind } from './runtime.js';
@@ -399,8 +400,9 @@ export async function runSetup(opts: SetupOptions): Promise<SetupResult> {
         const verify = interactive ? await yesNo(io!, 'Check the token with Telegram now (Bot API getMe; sends it to api.telegram.org)?', false) : false;
         const r = await provisionTelegramToken({ projectId, token, repoPath: project.repoPath, verify, runner: opts.runner, fetch: opts.fetch });
         channel = telegramChannel;
+        const sessionsOn = await defaultSessionsOn(await loadProjectJson(projectId)).catch(() => false);
         step({ id: 'telegram', status: action === 'change' ? 'changed' : 'done',
-          detail: `bot ${r.botId} stored in ${backendLabel(r.backend)}; communication.channel ${channel}`,
+          detail: `bot ${r.botId} stored in ${backendLabel(r.backend)}; communication.channel ${channel}${sessionsOn ? '; coordinator sessions on (one per thread)' : ''}`,
           ...(r.warnings.length ? { lines: r.warnings.map((w) => `warning: ${w}`) } : {}) });
       } catch (e) {
         step({ id: 'telegram', status: 'failed', detail: `${errMsg(e, 'could not store the token')}; nothing was stored, the coordinator stays terminal-only`, later: LATER.telegram });

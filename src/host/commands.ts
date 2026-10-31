@@ -30,7 +30,7 @@ import { composeTarget, exportRepo, exportState, importRepo, importState, inspec
 import { agentWritableDirs, hostUpgradeTarget } from './upgrade-host.js';
 import { HOST_RUNTIME_WARNING, HostRuntime, RUNTIMES, prepareHostRuntime, requireHostTools, runtimeOf, type RuntimeKind } from './runtime.js';
 import { registerRuntime } from './runtime-cli.js';
-import { HOST_CHANNEL_NOTE, formatChannelSet, hostChannel, offerAutoChannel, registerChannel } from './channel-cli.js';
+import { HOST_CHANNEL_NOTE, defaultSessionsOn, formatChannelSet, hostChannel, offerAutoChannel, registerChannel } from './channel-cli.js';
 import { formatChannel } from '../telegram/channel.js';
 import { githubStartHint, registerGithubSetup } from './github-setup.js';
 import { formatUninstall, runUninstall } from './uninstall.js';
@@ -774,6 +774,7 @@ export function register(program: Command): void {
         : process.stdin.isTTY ? await readSecret('Telegram bot token (input hidden): ')
           : (() => { throw new MinionsError('PRECONDITION', 'No terminal to prompt for the token.', 'Run in a terminal, or pipe it: `minions auth telegram --stdin < token-file`.'); })();
       const r = await provisionTelegramToken({ projectId: project.projectId, token, repoPath: ref.repoPath, verify: !!o.verify });
+      const sessionsOn = await defaultSessionsOn(project).catch(() => false);
       // Explicit "terminal" would leave the token unused: offer auto (same path as `minions channel set auto`).
       const interactive = !o.stdin && !json && !!process.stdin.isTTY;
       const channel = await offerAutoChannel(project, { interactive, confirm: confirmDefaultYes });
@@ -784,6 +785,7 @@ export function register(program: Command): void {
         channel: { configured: resolved?.configured ?? channel.configured, effective: resolved?.effective ?? 'terminal', reason: resolved?.reason ?? null, switchedToAuto: channel.switched, hint: channel.hint } }, { json, human: () => [
         `Stored the Telegram bot token for bot ${r.botId} in ${backendLabel(r.backend)} (${r.ref}).`,
         r.verification ? `Verification: ${r.verification.status} — ${r.verification.detail}` : 'Not checked with Telegram (pass --verify to call getMe).',
+        sessionsOn ? 'Coordinator sessions are on (one coordinator session per Telegram thread); `minions settings set coordinator.sessions.enabled false` turns them off.' : '',
         ...r.warnings.map((w) => `warning: ${w}`),
         applied ? 'Applied to the running container (controlled coordinator restart when needed).'
           : needsRestart ? 'The running container has no secrets mount (created before this feature); run `minions start` to recreate it so the token becomes visible.'
