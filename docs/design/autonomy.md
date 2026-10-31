@@ -203,6 +203,17 @@ server (host runtime), the wrapper runs `minions telegram gateway` instead of a 
 - The tmux window shows the gateway's log; the owner talks through Telegram. Docker (the official plugin) keeps the
   router claude.
 
+## Decision 8. Local only (owner, 2026-10-31)
+
+minions supports only local development: talking to a remote and to GitHub is a separate concern it does not handle.
+Approved work lands on the local base branch through the local integrator (`delivery.merge: auto-when-eligible`) or
+the coordinator's own merge; the owner exports branches with `minions export` and pushes them. Removed: branch and
+pull-request delivery, PR auto-merge, CI awareness and the CI gate, GitHub intake, the pre-claim base sync from origin,
+the GitHub token, credential helper and gh wrapper, the guided GitHub setup, the capabilities `git.push`, `pr.create`,
+`pr.review` and `pr.merge`, and the upgrade's origin mode. Host-signed approvals stay for the local integration (scope
+`merge` only). Configs that still carry the removed keys load: the keys are dropped, and an `auto-when-eligible` that
+came with branch or pull-request delivery becomes `disabled`.
+
 ## Reversed decisions
 
 - telegram-decisions.md D2 (tap buttons instead of native polls): native polls are built at the owner's request.
@@ -210,6 +221,8 @@ server (host runtime), the wrapper runs `minions telegram gateway` instead of a 
   requests need owner confirmation): the control layer applies coordinator changes directly.
 - coordinator-sessions.md (thread sessions deferred, TG 264): built as phase 5.
 - coordinator-sessions.md phase 10 / unattended-delivery.md item 7 (dispatcher waits for a spike): built as phase 1.
+- bootstrap.md (GitHub delivery, "origin/<base> as the single source of truth", CI-gated auto-merge, GitHub in the
+  container) and unattended-delivery.md (PR and CI sync, GitHub intake in the routine pass): removed by Decision 8.
 
 ## Known limits (review of the build, 2026-10-31)
 
