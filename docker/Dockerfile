@@ -45,9 +45,9 @@ ARG BACKLOG_MD_VERSION=1.54.0
 # @openai/codex@0.164.0: sha512-TWj7UGyPRe3Pj/A3ddNAxs1te3a/W/xAd+J0LHrrFTmsSfahGMOLF/vn88D3QCIgAT3B1rm1y/Z3NYE0rx6cZQ==
 ARG CODEX_VERSION=0.164.0
 
-# Reviewed system packages only; nothing is installed as root at runtime.
+# Reviewed system packages only; nothing is installed as root at runtime. curl, xz and unzip fetch toolchains into /opt/tools.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends git tmux ca-certificates ripgrep less procps \
+ && apt-get install -y --no-install-recommends git tmux ca-certificates ripgrep less procps curl xz-utils unzip \
  && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
 RUN npm install -g --no-fund --no-audit \
@@ -69,6 +69,8 @@ RUN chmod 0755 /opt/minions/pkg/dist/cli.js \
  && mkdir -p /workspace /state /home/node/.claude /home/node/.cache /opt/minions/plugin /opt/minions/config \
       /opt/tools/bin /opt/tools/cargo /opt/tools/rustup /opt/tools/go /opt/tools/uv \
  && chown -R node:node /workspace /state /home/node /opt/tools \
+ # Login shells reset PATH from /etc/profile: keep the tools on it there too.
+ && printf 'case ":$PATH:" in *:/opt/tools/bin:*) ;; *) PATH="$PATH:/opt/tools/bin:/opt/tools/cargo/bin:/opt/tools/go/bin:/opt/tools/goroot/bin" ;; esac\n' > /etc/profile.d/minions-tools.sh \
  && test "$(id -u node)" = 1000
 
 # The tools locations and PATH: the same values as TOOLS_ENV and CONTAINER_PATH in src/core/paths.ts.
