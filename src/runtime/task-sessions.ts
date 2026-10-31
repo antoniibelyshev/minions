@@ -27,7 +27,8 @@ import { SESSION_HANDOFF_EVENT } from './context-reset.js';
 import type { Lease, RuntimeDb } from './db.js';
 import { routineSettings, WAKE_EVENT } from './routine.js';
 import { enqueueInbox, getSession, openSession, OWNER_INBOX_SOURCE, pendingInbox, sessionsByStatus, updateSession } from './session-store.js';
-import { parseSessionKey, sessionConfigDir, sessionsSettings } from './sessions.js';
+import { dispatchMode } from './dispatch-state.js';
+import { parseSessionKey, sessionConfigDir, sessionsSettings, threadSettings } from './sessions.js';
 import { localDayStart } from './zoned-time.js';
 
 /** Statuses that close a task session (decision 4); `awaiting-human` closes after the session's handoff. */
@@ -59,7 +60,7 @@ export interface TaskSessionDeps {
 
 export interface TaskSessionPass {
   opened: { key: string; taskId: string; role: string; reopened: boolean }[];
-  closed: { key: string; taskId: string; reason: string }[];
+  closed: { key: string; taskId: string | null; reason: string }[];
   /** Runnable tasks that got no session, with why (the first refusal ends the opens of this pass). */
   refused: { taskId: string; why: string }[];
   /** Runnable tasks whose session is already open (the supervisor may nudge an idle one). */
@@ -134,6 +135,19 @@ export async function taskSessionPass(d: TaskSessionDeps): Promise<TaskSessionPa
     }
   }
 
+  // Thread sessions (docs/design/autonomy.md Decision 6) close after a quiet period; a later reply reopens them.
+  const { idleMinutes } = threadSettings(d.config);
+  for (const s of open.filter((x) => x.kind === 'thread')) {
+    if (db.activeLeases().some((l) => l.holder === s.key) || pendingInbox(db, s.key).length) continue;
+    const last = db.get<{ at: string | null }>('SELECT MAX(created_at) AS at FROM session_inbox WHERE session_key = ?', s.key)?.at;
+    const since = [s.opened_at, s.last_wake_at, last].filter((x): x is string => !!x).sort().at(-1)!;
+    if (now.getTime() - Date.parse(since) < idleMinutes * 60_000) continue;
+    const why = `quiet for ${idleMinutes} min (coordinator.sessions.threadIdleMinutes)`;
+    if (closeSession(db, s.key, why, now)) out.closed.push({ key: s.key, taskId: null, reason: why });
+  }
+
+  // With the autopilot dispatcher on, runnable stages are its job: task sessions open only for its decisions and owner messages.
+  if (dispatchMode(d.config) === 'auto') return out;
   const stages = await d.runnable();
   if (!stages) return out;
   const seen = new Set<string>();

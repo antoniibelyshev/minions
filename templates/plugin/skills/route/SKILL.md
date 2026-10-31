@@ -14,8 +14,8 @@ You are the router (`MINIONS_SESSION=router`). You hold the Telegram chat; headl
 
 ## Owner message
 
-1. Route it: `minions coordinator route --json` with the message text on stdin (a quoted heredoc: `<<'MSG'`). When the channel tag carries `reply_to_message_id`, add `--reply-to <that id>`.
-2. A `target`: `minions coordinator send <target> --json` with the same text on stdin (the `text` field of the route, which drops a `/s <key>` prefix), plus `--answers <question>` when the route has a `question`, and `--message-id <message_id>` of the owner message. Then react to the owner message with one emoji (👀). Do not answer its content.
+1. Route it: `minions coordinator route --message-id <message_id> --json` with the message text on stdin (a quoted heredoc: `<<'MSG'`). When the channel tag carries `reply_to_message_id`, add `--reply-to <that id>`. A poll answer (`[poll answer] ...`, with `poll_id`) is routed the same way: its `reply_to_message_id` is the poll.
+2. A `target`: `minions coordinator send <target> --message-id <message_id> --json` with the same text on stdin (the `text` field of the route, which drops a `/s <key>` prefix), plus `--answers <question>` when the route has a `question`, and `--reply-text "<reply_to_text>"` (plus `--quote partial` when the tag says so) when the tag carries `reply_to_text`. Then react to the owner message with one emoji (👀). Do not answer its content. A `thread:<id>` target (rule `thread`) is a new thread: the owner started a new topic with a top-level message, and it gets its own session.
 3. `ambiguous`: one numbered poll with the `candidates` (recommended first) and "Other", e.g. "Which session? 1. task:task-57 (recommended) 2. general 3. Other". Remember the original text. When the owner answers with a number, send the original text to that candidate (`send`), then react.
 4. Things you answer yourself, without routing: `status` (`minions status --json`, at most five lines: running sessions and tasks, what waits on the owner, spend), `sessions` (the sessions part of `minions status --json`), `pause` / `resume` (`minions pause --json` / `minions resume --json`, then confirm in one line).
 5. Then do **Reset**.
@@ -32,7 +32,7 @@ Then do **Reset**.
 
 ## Send
 
-For each item of `minions notify pending --json` (oldest first): one `reply` with its text, then `minions notify ack <key> --message-id <id> --json` with the id the reply returned (`sent (id: N)`). This records which session the message belongs to, so the owner's reply or `#ref` routes back. A failed send: `minions notify fail <key> --error "<short reason>" --json` and stop sending this round (the channel is likely down).
+For each item of `minions notify pending --json` (oldest first): one `reply` with its text (with `reply_to` = the item's `replyTo` when it has one: that keeps the answer in its thread), or, when the item has `options`, one `poll` with `question` = its text, those `options` and the same `reply_to`; then `minions notify ack <key> --message-id <id> --json` with the message id the reply or the poll returned. This records which session the message belongs to, so the owner's reply, vote or `#ref` routes back. A failed send: `minions notify fail <key> --error "<short reason>" --json` and stop sending this round (the channel is likely down).
 
 ## Reset (the last step of every turn)
 

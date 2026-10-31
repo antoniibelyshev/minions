@@ -25,11 +25,15 @@ import { enqueueInbox, getSession, openSession, OWNER_INBOX_SOURCE } from './ses
 import { parseSessionKey, sessionConfigDir, sessionsSettings } from './sessions.js';
 import { taskKickoff } from './task-sessions.js';
 
-export type RouteRule = 'reply' | 'session' | 'ref' | 'task' | 'question' | 'general' | 'ambiguous';
+export type RouteRule = 'reply' | 'session' | 'ref' | 'task' | 'question' | 'thread' | 'general' | 'ambiguous';
 export interface RouteInput {
   text: string;
-  /** The replied-to bot message (channel meta `reply_to_message_id`), when the channel passes it. */
+  /** The replied-to message (channel meta `reply_to_message_id`): a bot message, or an owner message of a thread. */
   replyToMessageId?: number | null;
+  /** The owner message's own id (channel meta `message_id`): a top-level message starts thread `thread:<id>`. */
+  messageId?: number | null;
+  /** coordinator.sessions.threads (threadSettings): new topics open thread sessions instead of going to `general`. */
+  threads?: boolean;
 }
 export interface RouteCandidate { key: string; why: string; question?: string }
 export interface RouteResult {
@@ -145,11 +149,33 @@ export function resolveRoute(db: RuntimeDb, input: RouteInput, o: { knownTasks?:
       return ambiguous(`a bare number while ${open.length} questions are open`, text, open.map((q) => ({ key: q.session, why: `question ${q.n ? `Q${q.n} ` : ''}${q.key}`, question: q.key })));
     }
   }
-  // Rule 4: a new topic.
+  // Rule 4: a new topic. With thread sessions (docs/design/autonomy.md Decision 6) it opens its own thread session.
+  if (input.threads && input.messageId && Number.isSafeInteger(input.messageId) && input.messageId > 0) {
+    return result(`thread:${input.messageId}`, 'thread', `a top-level message: a new thread (${input.messageId})`, text);
+  }
   return result('general', 'general', 'no reply, session, ref, task or open question matched: a new topic', text);
 }
 
 // ---------------------------------------------------------------- send
+
+/** What the owner replied to (channel meta reply_to_text / quote), handed to the session with the message. */
+export interface ReplyContext { text: string; quote?: 'partial' | 'full' | null }
+
+/** The message with a one-line header naming what it replies to, so the session sees the thread's context. */
+export function withReplyContext(text: string, reply: ReplyContext | null | undefined): string {
+  const r = reply?.text.replace(/\s+/g, ' ').trim();
+  if (!r) return text;
+  return `(in reply to${reply!.quote === 'partial' ? ' the quoted part' : ''}: "${r.slice(0, 300)}")\n${text}`;
+}
+
+/**
+ * The message a session's outbound item should reply to: the newest message of its thread (an owner message or a
+ * bot message recorded for the session). null = none known (a plain message).
+ */
+export function threadReplyTarget(db: RuntimeDb, session: string | null): number | null {
+  if (!session) return null;
+  return db.get<{ message_id: number }>('SELECT message_id FROM tg_messages WHERE session = ? ORDER BY id DESC LIMIT 1', session)?.message_id ?? null;
+}
 
 export interface SendResult { key: string; inboxId: number; reopened: boolean; answered: string | null }
 
@@ -157,7 +183,7 @@ export interface SendResult { key: string; inboxId: number; reopened: boolean; a
  * Hands one owner message to a session's inbox (`coordinator send <key>`). A closed or failed session is reopened (the
  * owner wrote to it); `general` is opened by the supervisor on its first message. `answers` marks that question answered.
  */
-export function sendToSession(db: RuntimeDb, cfg: Pick<MinionsConfig, 'coordinator' | 'execution' | 'models'>, o: { key: string; text: string; state: string; meta?: unknown; answers?: string | null; now?: Date }): SendResult {
+export function sendToSession(db: RuntimeDb, cfg: Pick<MinionsConfig, 'coordinator' | 'execution' | 'models'>, o: { key: string; text: string; state: string; meta?: unknown; answers?: string | null; messageId?: number | null; reply?: ReplyContext | null; now?: Date }): SendResult {
   if (!sessionsSettings(cfg).enabled) {
     throw new MinionsError('PRECONDITION', 'Coordinator sessions are off (coordinator.sessions.enabled), so there is no session to send to.', 'Handle the message yourself.');
   }
@@ -170,12 +196,17 @@ export function sendToSession(db: RuntimeDb, cfg: Pick<MinionsConfig, 'coordinat
   return db.transaction(() => {
     const row = getSession(db, key);
     const reopened = !!row && row.status !== 'open';
-    const taskId = parseSessionKey(key).taskId;
-    const fresh = !row && taskId !== null;
+    const k = parseSessionKey(key);
+    const taskId = k.taskId;
+    const fresh = !row && (taskId !== null || k.kind === 'thread');
     if (reopened || fresh) openSession(db, key, { configDir: sessionConfigDir({ state: o.state }, key), model: cfg.models.coordinator ?? null, now });
     // A task session that never ran starts with its kickoff, so it loads /minions:task before the owner's text.
-    if (fresh) enqueueInbox(db, key, OWNER_INBOX_SOURCE, taskKickoff(taskId, 'the owner wrote to this task; their message follows.'), { now });
-    const inboxId = enqueueInbox(db, key, ROUTER_INBOX_SOURCE, text, { meta: o.meta, now });
+    if (fresh && taskId !== null) enqueueInbox(db, key, OWNER_INBOX_SOURCE, taskKickoff(taskId, 'the owner wrote to this task; their message follows.'), { now });
+    // The owner's message joins the session's thread: a reply to it routes back here (rule 1), and replies go under it.
+    if (o.messageId && Number.isSafeInteger(o.messageId) && o.messageId > 0) {
+      db.exec('INSERT INTO tg_messages (message_id, ref, outbox_key, text_head, session, sent_at) VALUES (?, NULL, NULL, ?, ?, ?)', o.messageId, `owner: ${text.slice(0, 112)}`, key, now.toISOString());
+    }
+    const inboxId = enqueueInbox(db, key, ROUTER_INBOX_SOURCE, withReplyContext(text, o.reply), { meta: { ...(o.meta as object ?? {}), ...(o.messageId ? { messageId: o.messageId } : {}) }, now });
     let answered: string | null = null;
     if (o.answers && db.exec("UPDATE outbox SET answered_at = ? WHERE dedup_key = ? AND kind = 'question' AND answered_at IS NULL", now.toISOString(), o.answers).changes > 0) answered = o.answers;
     db.addEvent('route-send', parseSessionKey(key).taskId, { key, inboxId, reopened, ...(answered ? { answered } : {}) }, now.toISOString());
@@ -245,4 +276,4 @@ export function recordSent(db: RuntimeDb, o: { messageId: number; keys: readonly
 // ---------------------------------------------------------------- restart blockers
 
 /** A lease held by a headless session (`task:<id>`, `general`): its worker runs under the supervisor, not the router. */
-export const heldBySession = (holder: string | null | undefined): boolean => !!holder && (holder === 'general' || holder.startsWith('task:'));
+export const heldBySession = (holder: string | null | undefined): boolean => !!holder && (holder === 'general' || holder.startsWith('task:') || holder.startsWith('thread:'));

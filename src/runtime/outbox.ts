@@ -28,19 +28,30 @@ export interface OutboxItem {
   session: string | null;
   /** A question the owner answered (the router routed the answer back to its session). */
   answeredAt: string | null;
+  /** A question's choices (2 to 10): the router sends it as a native poll. */
+  options?: string[];
 }
 
 interface OutboxRow {
   dedup_key: string; kind: string; task_id: string | null; text: string; created_at: string;
   attempts: number; last_error: string | null; next_attempt_at: string | null; delivered_at: string | null; delivered_via: string | null;
-  session: string | null; answered_at: string | null;
+  session: string | null; answered_at: string | null; options_json?: string | null;
 }
 
 const toItem = (r: OutboxRow): OutboxItem => ({
   key: r.dedup_key, kind: r.kind as NotificationKind, taskId: r.task_id, text: r.text, createdAt: r.created_at,
   attempts: r.attempts, lastError: r.last_error, nextAttemptAt: r.next_attempt_at, deliveredAt: r.delivered_at, deliveredVia: r.delivered_via,
   session: r.session ?? null, answeredAt: r.answered_at ?? null,
+  ...(r.options_json ? { options: parseOptions(r.options_json) } : {}),
 });
+
+function parseOptions(json: string): string[] {
+  try { const v = JSON.parse(json) as unknown; return Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : []; } catch { return []; }
+}
+
+export const MAX_POLL_OPTIONS = 10;
+export const MAX_POLL_OPTION_LENGTH = 100;
+export const MAX_POLL_QUESTION_LENGTH = 300;
 
 /** A channel that can deliver one notification; it throws when the send fails. */
 export interface NotificationTransport {
@@ -295,6 +306,8 @@ export interface EnqueueInput {
   holdUntil?: string | null;
   /** The enqueuing coordinator session (task-57 phase 8): an answer to its question routes back to it. */
   session?: string | null;
+  /** A question's choices: sent as a native poll (the text is the poll question, at most 300 characters). */
+  options?: string[] | null;
 }
 export interface EnqueueResult { created: boolean; item: OutboxItem }
 
@@ -310,11 +323,19 @@ export function enqueue(db: RuntimeDb, input: EnqueueInput, clock: Clock = syste
   const text = input.text.trim();
   if (!text) throw new MinionsError('PRECONDITION', 'The notification text is empty.', 'Pass the text on stdin.');
   if (text.length > MAX_TEXT_LENGTH) throw new MinionsError('PRECONDITION', `The notification text is ${text.length} characters (max ${MAX_TEXT_LENGTH}).`, 'Shorten it: report outcomes, not logs.');
+  const options = input.options?.length ? input.options.map((o) => o.trim()) : null;
+  if (options) {
+    if (input.kind !== 'question') throw new MinionsError('PRECONDITION', 'Only a question has options.', 'Use --kind question.');
+    if (options.length < 2 || options.length > MAX_POLL_OPTIONS) throw new MinionsError('PRECONDITION', `A poll has 2 to ${MAX_POLL_OPTIONS} options (got ${options.length}).`);
+    if (options.some((o) => !o || [...o].length > MAX_POLL_OPTION_LENGTH)) throw new MinionsError('PRECONDITION', `Every option must be 1 to ${MAX_POLL_OPTION_LENGTH} characters.`);
+    if (new Set(options).size !== options.length) throw new MinionsError('PRECONDITION', 'The options must be distinct.');
+    if ([...text].length > MAX_POLL_QUESTION_LENGTH) throw new MinionsError('PRECONDITION', `A poll question is at most ${MAX_POLL_QUESTION_LENGTH} characters (got ${[...text].length}).`, 'Shorten the question; put the context in a separate status message first.');
+  }
   return db.transaction(() => {
     const existing = get(db, key);
     if (existing) return { created: false, item: existing };
-    db.exec('INSERT INTO outbox (dedup_key, kind, task_id, text, created_at, attempts, next_attempt_at, session) VALUES (?, ?, ?, ?, ?, 0, ?, ?)',
-      key, input.kind, input.taskId ?? null, text, clock().toISOString(), input.holdUntil ?? null, input.session ?? null);
+    db.exec('INSERT INTO outbox (dedup_key, kind, task_id, text, created_at, attempts, next_attempt_at, session, options_json) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?)',
+      key, input.kind, input.taskId ?? null, text, clock().toISOString(), input.holdUntil ?? null, input.session ?? null, options ? JSON.stringify(options) : null);
     db.addEvent('notify-enqueue', input.taskId ?? null, { key, kind: input.kind, ...(input.holdUntil ? { holdUntil: input.holdUntil } : {}), ...(input.session ? { session: input.session } : {}) });
     return { created: true, item: get(db, key)! };
   });

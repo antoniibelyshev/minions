@@ -5,7 +5,7 @@ import type { IdempotencyStore } from '../backlog/types.js';
 import { MinionsError } from '../core/errors.js';
 import { runtimePaths } from './paths.js';
 
-export const SCHEMA_VERSION = 12;
+export const SCHEMA_VERSION = 13;
 
 /** The built-in worker roles (always registered). */
 export type BuiltinLeaseRole = 'engineer' | 'tester' | 'reviewer';
@@ -83,7 +83,8 @@ export interface TaskStageRow { task_id: string; workflow: string; stages_json: 
  * process may serve it, `closed` (task delivered, done, cancelled, blocked, or awaiting the owner after a handoff),
  * `failed` (resumes exhausted). config_dir: its persistent CLAUDE_CONFIG_DIR (src/runtime/sessions.ts).
  */
-export type SessionKind = 'task' | 'general';
+/** `thread`: one Telegram thread (a reply chain, keyed by its root message id; docs/design/autonomy.md Decision 6). */
+export type SessionKind = 'task' | 'general' | 'thread';
 export type SessionStatus = 'open' | 'closed' | 'failed';
 export interface SessionRow {
   key: string; kind: SessionKind; claude_session_id: string | null; status: SessionStatus; model: string | null;
@@ -222,6 +223,8 @@ const MIGRATIONS: Record<number, Migration> = {
     CREATE UNIQUE INDEX IF NOT EXISTS integrations_one_open_per_task ON integrations(task_id)
       WHERE phase IN ('queued', 'merging', 'verifying', 'landing');
   `,
+  // Polls (docs/design/autonomy.md Decision 5): a question's choices; the router sends it as a native Telegram poll.
+  13: (sql) => { addColumn(sql, 'outbox', 'options_json', 'TEXT'); },
 };
 
 let warningFilterInstalled = false;

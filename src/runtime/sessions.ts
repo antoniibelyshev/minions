@@ -32,7 +32,7 @@ import {
 } from './coordinator.js';
 import { checkHeadlessArgs, credentialEnv, HEADLESS_DROP_ENV, prepareHeadlessCredential, type HeadlessCredential, type HeadlessLaunch, type ReadText } from './headless.js';
 import type { SessionKind } from './db.js';
-import { GENERAL_SESSION_NOTE } from './router-prompt.js';
+import { GENERAL_SESSION_NOTE, threadSessionNote } from './router-prompt.js';
 import { runtimePaths, type RuntimePaths } from './paths.js';
 
 // ---------------------------------------------------------------- settings
@@ -55,12 +55,22 @@ export interface SessionKey { key: string; kind: SessionKind; taskId: string | n
 
 const TASK_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/;
 
-/** Parses `general` or `task:<id>` (the key is also a path segment, so the id has a strict charset). */
+/**
+ * Parses `general`, `task:<id>` or `thread:<root message id>` (the key is also a path segment, so the id has a strict
+ * charset).
+ */
 export function parseSessionKey(key: string): SessionKey {
   if (key === 'general') return { key, kind: 'general', taskId: null };
   const m = /^task:(.+)$/.exec(key);
   if (m && TASK_ID.test(m[1]!)) return { key, kind: 'task', taskId: m[1]! };
-  throw new MinionsError('INVALID_CONFIG', `Not a session key: ${JSON.stringify(key.slice(0, 120))}.`, 'Use `general` or `task:<task id>`.');
+  if (/^thread:[1-9]\d{0,15}$/.test(key)) return { key, kind: 'thread', taskId: null };
+  throw new MinionsError('INVALID_CONFIG', `Not a session key: ${JSON.stringify(key.slice(0, 120))}.`, 'Use `general`, `task:<task id>` or `thread:<message id>`.');
+}
+
+/** coordinator.sessions.threads (default on): a new Telegram thread opens its own session (docs/design/autonomy.md Decision 6). */
+export function threadSettings(cfg: Pick<MinionsConfig, 'coordinator'>): { enabled: boolean; idleMinutes: number } {
+  const s = cfg.coordinator?.sessions;
+  return { enabled: s?.enabled === true && s.threads !== false, idleMinutes: s?.threadIdleMinutes ?? 240 };
 }
 
 /** <state>/run/sessions/<key>: the session's persistent dir (its config dir, later its run record). */
@@ -225,7 +235,7 @@ export async function buildSessionCommand(cfg: MinionsConfig, key: string, deps:
   const plan = await prepareHeadlessCredential(method, paths, deps.readText);
   // The owner's bypassPermissions: the session's own config dir must not disable it (coordinatorSettings below does otherwise).
   if (mode === 'bypassPermissions') plan.settings = { ...plan.settings, permissions: {} };
-  const prompt = deps.prompt ?? await readPrompt(paths) + (onHost ? hostPromptNote(paths) : '') + (k.taskId ? taskSessionPromptNote(k.taskId) : GENERAL_SESSION_NOTE);
+  const prompt = deps.prompt ?? await readPrompt(paths) + (onHost ? hostPromptNote(paths) : '') + (k.taskId ? taskSessionPromptNote(k.taskId) : k.kind === 'thread' ? threadSessionNote(k.key) : GENERAL_SESSION_NOTE);
   const flagSettings: Record<string, unknown> = {
     ...coordinatorSettings(cfg, { telegram: false, auth: method, host: deps.host, paths }),
     // Belt and braces: no plugin is installed in the fresh config dir, and even a project setting cannot enable it.

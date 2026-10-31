@@ -20,10 +20,10 @@ export const SESSION_ENV = 'MINIONS_SESSION';
 /** The router is the existing coordinator launch (decision 3): not a headless session row, but scoped like one. */
 export const ROUTER_SESSION = 'router';
 
-export type SessionScopeKind = 'router' | 'task' | 'general';
+export type SessionScopeKind = 'router' | 'task' | 'general' | 'thread';
 export interface SessionScope { key: string; kind: SessionScopeKind; taskId: string | null }
 
-/** Parses a session key: `router`, `general` or `task:<id>` (parseSessionKey); throws MinionsError otherwise. */
+/** Parses a session key: `router`, `general`, `task:<id>` or `thread:<root message id>` (parseSessionKey); throws MinionsError otherwise. */
 export function parseScope(raw: string): SessionScope {
   if (raw === ROUTER_SESSION) return { key: raw, kind: 'router', taskId: null };
   const k = parseSessionKey(raw);

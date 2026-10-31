@@ -46,6 +46,7 @@ export const KEY_CLASSES: readonly KeyClass[] = [
   ...entries(['intake.github.readyLabels'], 'live', true, 'imported issues with these labels start ready without a model or the owner'),
   ...entries(['routine.enabled'], 'live', true, 'lets the runtime start coordinator sessions on its own (wakes, crash starts: model spend)'),
   ...entries(['coordinator.sessions.max'], 'live', false, 'cap read by the session supervisor before it opens a session'),
+  ...entries(['coordinator.sessions.threads', 'coordinator.sessions.threadIdleMinutes'], 'live', false, 'read by `coordinator route` and the session pass on each call'),
   ...entries(['dispatch'], 'live', false, 'the dispatcher re-reads it every pass (docs/design/autonomy.md Decision 1)'),
   // ---- live, host-owned
   ...entries(['delivery.requiredChecksConfigured'], 'live', true,

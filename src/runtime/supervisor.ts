@@ -539,8 +539,9 @@ export async function runSupervisor(d: SupervisorDeps): Promise<SupervisorReport
     const { max } = sessionsSettings(cfg);
     const paused = db.paused().starts;
     const keys = keysWithPendingInbox(db);
-    if (keys.includes('general') && !getSession(db, 'general')) {
-      openSession(db, 'general', { configDir: sessionConfigDir({ state: d.state }, 'general'), model: cfg.models.coordinator ?? null, now: now() });
+    // `general` and thread sessions (docs/design/autonomy.md Decision 6) are opened by their first message.
+    for (const k of keys.filter((x) => (x === 'general' || x.startsWith('thread:')) && !getSession(db, x))) {
+      openSession(db, k, { configDir: sessionConfigDir({ state: d.state }, k), model: cfg.models.coordinator ?? null, now: now() });
     }
     for (const key of keys) {
       if (live.size >= max || stopping) break;

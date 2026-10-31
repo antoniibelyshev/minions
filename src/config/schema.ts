@@ -428,6 +428,10 @@ export const MinionsConfigSchema = z.object({
       enabled: z.boolean().optional(),
       /** Headless session processes at once (default execution.maxActiveTasks + 1). */
       max: z.number().int().min(1).optional(),
+      /** One session per Telegram thread: a top-level owner message opens a new one (default true; docs/design/autonomy.md Decision 6). */
+      threads: z.boolean().optional(),
+      /** A thread session closes after this many minutes without a message (default 240); a reply reopens it. */
+      threadIdleMinutes: z.number().int().min(5).max(7 * 24 * 60).optional(),
     }).strict().optional(),
   }).strict().optional(),
   /**

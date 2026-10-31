@@ -1142,6 +1142,14 @@
               "type": "integer",
               "minimum": 1,
               "maximum": 9007199254740991
+            },
+            "threads": {
+              "type": "boolean"
+            },
+            "threadIdleMinutes": {
+              "type": "integer",
+              "minimum": 5,
+              "maximum": 10080
             }
           },
           "additionalProperties": false

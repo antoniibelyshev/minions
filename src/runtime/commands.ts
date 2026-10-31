@@ -76,9 +76,9 @@ import { clearHold, DISPATCH_HOLDER, dispatcherLockState, dispatchMode, readHold
 import { launchWorker } from './dispatch-launch.js';
 import { listSecrets, removeSecret, setSecret } from './secrets.js';
 import { liveRun, liveRunExitCode, type LiveRunReport } from './headless.js';
-import { buildSessionCommand, sessionConfigDir, sessionsSettings } from './sessions.js';
+import { buildSessionCommand, sessionConfigDir, sessionsSettings, threadSettings } from './sessions.js';
 import { enqueueInbox, openSession } from './session-store.js';
-import { heldBySession, recordSent, resolveRoute, sendToSession, sessionKeyOf, waitForOutbound, type RouteResult, type WaitResult } from './router.js';
+import { heldBySession, recordSent, resolveRoute, sendToSession, sessionKeyOf, threadReplyTarget, waitForOutbound, type ReplyContext, type RouteResult, type WaitResult } from './router.js';
 import { runSupervisor, startSupervisorWatch, supervisorEnv, supervisorLockState, type SupervisorReport, type SupervisorTaskDeps } from './supervisor.js';
 import { adoptIntegrationBase, runIntegrator, startIntegratorDetached, type IntegratorReport } from './integrator.js';
 import { collectIntegrationStatus, humanIntegration, kickInputs, kickIntegratorIfNeeded, startIntegrationWatch, type IntegrationStatus } from './integration-status.js';
@@ -209,7 +209,7 @@ async function restartWorkers(d: RuntimeDb, o: { exceptSessions?: boolean } = {}
 function notifySession(explicit: string | undefined): string | null {
   if (explicit !== undefined) {
     const k = sessionKeyOf(explicit);
-    if (!k) throw new MinionsError('PRECONDITION', `Not a session key: ${JSON.stringify(explicit.slice(0, 120))}.`, 'Use general or task:<task id>.');
+    if (!k) throw new MinionsError('PRECONDITION', `Not a session key: ${JSON.stringify(explicit.slice(0, 120))}.`, 'Use general, task:<task id> or thread:<message id>.');
     return k;
   }
   const scope = sessionScope();
@@ -1024,14 +1024,15 @@ export function register(program: Command): void {
     .option('--task <taskId>', 'related task')
     .option('--text-file <path>', 'read the text from a file ("-" = stdin, the default)')
     .addOption(new Option('--hold <hold>', 'digest: hold it for the next owner digest; none: send now; default: per kind (delivered, feature and question are held while routine.enabled and the owner is not in the chat)'))
-    .option('--session <key>', 'the coordinator session it comes from (general | task:<id>; default: MINIONS_SESSION): an answer to a question routes back to it')
-    .action(action(async (o: { key: string; kind: string; task?: string; textFile?: string; hold?: string; session?: string }, cmd: Command) => {
+    .option('--session <key>', 'the coordinator session it comes from (general | task:<id> | thread:<id>; default: MINIONS_SESSION): an answer to a question routes back to it')
+    .option('--option <text>', 'a question\'s choice (repeat: 2 to 10, recommended first): sent as a Telegram poll', (v: string, acc: string[] = []) => [...acc, v])
+    .action(action(async (o: { key: string; kind: string; task?: string; textFile?: string; hold?: string; session?: string; option?: string[] }, cmd: Command) => {
       if (runtimeMode() === 'host') return delegate(cmd);
       const session = notifySession(o.session);
       const text = await readInput(o.textFile, 'the notification text', 'Pipe the text in (never pass it as an argument) or use --text-file <path>.');
       const d = getDb();
       const holdUntil = holdFor(d, await getConfig(), o.kind, o.hold);
-      const r = { ...enqueue(d, { key: o.key, kind: o.kind, taskId: o.task ?? null, text, holdUntil, session }), heldUntil: holdUntil };
+      const r = { ...enqueue(d, { key: o.key, kind: o.kind, taskId: o.task ?? null, text, holdUntil, session, options: o.option ?? null }), heldUntil: holdUntil };
       emit(r, { json: globalOpts(cmd).json, human: (x: typeof r) => (x.created ? `queued ${x.item.key}${x.item.nextAttemptAt && x.item.attempts === 0 ? ` (held for the digest at ${x.item.nextAttemptAt})` : ''}` : `${x.item.key} already ${x.item.deliveredAt ? 'delivered' : 'queued'} (no-op)`) });
     }));
   notify.command('pending').description('List undelivered notifications due now, oldest first (send each, then ack it)')
@@ -1042,7 +1043,12 @@ export function register(program: Command): void {
       const d = getDb();
       // The hold-back first: while the routine is on, a held item whose time came waits for the digest.
       try { reholdExpired(d, await getConfig()); } catch { /* listing never fails on the hold-back */ }
-      const r = { items: pending(d, { includeWaiting: !!o.all, limit: o.limit }), counts: outboxCounts(d) };
+      // A session's item replies into its thread (docs/design/autonomy.md Decision 6): `replyTo` is the thread's newest message.
+      const items = pending(d, { includeWaiting: !!o.all, limit: o.limit }).map((i) => {
+        const replyTo = threadReplyTarget(d, i.session);
+        return replyTo ? { ...i, replyTo } : i;
+      });
+      const r = { items, counts: outboxCounts(d) };
       emit(r, { json: globalOpts(cmd).json, human: (x: typeof r) => `${formatItems(x.items)}\n${formatCounts(x.counts)}` });
     }));
   notify.command('digest').description('Compose the owner digest (held updates, waiting approvals, blockers, spend, next up, questions as numbered polls) and store it under its key; send the text with one reply, then ack the returned keys')
@@ -1252,22 +1258,26 @@ export function register(program: Command): void {
 
   // Task-57 phase 8: the router's deterministic helpers (src/runtime/router.ts). Coordinator-only like supervise.
   coord.command('route').description('Router: resolve which coordinator session an owner message (stdin) goes to: a reply, /s <key>, a #ref, a task id, an open question, else general; or ambiguous with candidates (container only)')
-    .option('--reply-to <messageId>', 'the bot message it replies to (channel meta reply_to_message_id)', (v) => Number(v))
-    .action(action(async (o: { replyTo?: number }, cmd: Command) => {
+    .option('--reply-to <messageId>', 'the message it replies to (channel meta reply_to_message_id)', (v) => Number(v))
+    .option('--message-id <id>', 'the owner message\'s own id (channel meta message_id): a top-level message starts a new thread session', (v) => Number(v))
+    .action(action(async (o: { replyTo?: number; messageId?: number }, cmd: Command) => {
       requireMode('runtime');
       const text = await readInput(undefined, 'the owner message', 'Pipe the message in with a quoted heredoc.');
       let knownTasks: string[] | null = null;
       try { knownTasks = (await (await getBacklog()).listTasks()).map((t) => t.id); } catch { knownTasks = null; }
-      const r = resolveRoute(getDb(), { text, replyToMessageId: o.replyTo ?? null }, { knownTasks });
+      const r = resolveRoute(getDb(), { text, replyToMessageId: o.replyTo ?? null, messageId: o.messageId ?? null, threads: threadSettings(await getConfig()).enabled }, { knownTasks });
       emit(r, { json: globalOpts(cmd).json, human: (x: RouteResult) => x.target ? `${x.target} (${x.rule}: ${x.why})` : `ambiguous (${x.why}): ${x.candidates.map((c, i) => `${i + 1}. ${c.key}`).join(' ')}` });
     }));
-  coord.command('send <key>').description('Router: hand an owner message (stdin) to a coordinator session (general | task:<id>); the supervisor delivers it and reopens a closed session (container only)')
+  coord.command('send <key>').description('Router: hand an owner message (stdin) to a coordinator session (general | task:<id> | thread:<id>); the supervisor delivers it and reopens a closed session (container only)')
     .option('--answers <questionKey>', 'the open question it answers (from coordinator route): marked answered')
-    .option('--message-id <id>', 'the owner message id (kept with the inbox message)', (v) => Number(v))
-    .action(action(async (key: string, o: { answers?: string; messageId?: number }, cmd: Command) => {
+    .option('--message-id <id>', 'the owner message id: kept with the inbox message, and replies to it route back to this session', (v) => Number(v))
+    .option('--reply-text <text>', 'what the owner replied to (channel meta reply_to_text), shown to the session')
+    .option('--quote <kind>', 'partial | full (channel meta quote)')
+    .action(action(async (key: string, o: { answers?: string; messageId?: number; replyText?: string; quote?: string }, cmd: Command) => {
       requireMode('runtime');
       const text = await readInput(undefined, 'the owner message', 'Pipe the message in with a quoted heredoc.');
-      const r = sendToSession(getDb(), await getConfig(), { key, text, state: runtimePaths().state, answers: o.answers ?? null, ...(o.messageId !== undefined ? { meta: { messageId: o.messageId } } : {}) });
+      const reply: ReplyContext | null = o.replyText ? { text: o.replyText, quote: o.quote === 'partial' || o.quote === 'full' ? o.quote : null } : null;
+      const r = sendToSession(getDb(), await getConfig(), { key, text, state: runtimePaths().state, answers: o.answers ?? null, messageId: o.messageId ?? null, reply });
       emit(r, { json: globalOpts(cmd).json, human: (x: typeof r) => `queued for ${x.key}${x.reopened ? ' (reopened)' : ''}${x.answered ? `; ${x.answered} answered` : ''}` });
     }));
   coord.command('wait').description('Router: wait until an outbox item or the digest is due (or the timeout), then exit; run it in the background (container only)')
