@@ -93,7 +93,7 @@ before="$(git status --porcelain)"
 
 step "init --runtime host (no Docker)"
 init_err="$WORK/init.err"
-out="$("$M" init "$A" --yes --private --runtime host --json 2>"$init_err")"
+out="$("$M" init "$A" --mode independent --yes --private --runtime host --json 2>"$init_err")"
 ID="$(json 'd.data.plan.projectId' <<<"$out")"
 expect_eq "$(json 'd.data.plan.runtime' <<<"$out")" host "plan records the host runtime"
 json 'd.data.plan.warnings.join(" ")' <<<"$out" | grep -q 'agents run as your macOS user' || fail "init warning missing"

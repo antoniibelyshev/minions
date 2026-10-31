@@ -190,12 +190,11 @@ describe('policy: sensitive paths and base.merge ask', () => {
 });
 
 describe('base.merge capability and mode-aware auto-merge reasons', () => {
-  it('profile defaults: owner allow, personal ask, supervised deny; a sensitive path upgrades allow to ask', () => {
-    expect(can(defaults('project-owner'), 'base.merge')).toBe('allow');
-    expect(can(defaults('personal-work'), 'base.merge')).toBe('ask');
+  it('mode defaults: independent allow, supervised deny; a sensitive path upgrades allow to ask', () => {
+    expect(can(defaults('independent'), 'base.merge')).toBe('allow');
     expect(can(defaults('supervised'), 'base.merge')).toBe('deny');
-    expect(can(defaults('project-owner'), 'base.merge', { paths: ['.github/workflows/ci.yml'] })).toBe('ask');
-    expect(can(defaults('project-owner'), 'base.merge', { paths: ['src/a.ts'] })).toBe('allow');
+    expect(can(defaults('independent'), 'base.merge', { paths: ['.github/workflows/ci.yml'] })).toBe('ask');
+    expect(can(defaults('independent'), 'base.merge', { paths: ['src/a.ts'] })).toBe('allow');
   });
 
   it('an effective config written before base.merge existed still validates, with local integration off (fail closed)', () => {
@@ -208,7 +207,7 @@ describe('base.merge capability and mode-aware auto-merge reasons', () => {
   });
 
   const local = (mutate?: (c: MinionsConfig) => void) => {
-    const c = defaults('project-owner');
+    const c = defaults('independent');
     c.delivery.merge = 'auto-when-eligible';
     c.verification.commands = ['npm test'];
     mutate?.(c);

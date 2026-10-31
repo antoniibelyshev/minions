@@ -52,7 +52,7 @@ const no: RunResult = { code: 127, stdout: '', stderr: 'not found' };
 
 async function hostProject(extra: Parameters<typeof runInit>[0] extends infer T ? Partial<T> : never = {}) {
   const repo = makeRepo(env.root);
-  const r = await runInit({ path: repo, yes: true, visibility: 'private', runtime: 'host', dockerProbe: dockerDown, ...extra });
+  const r = await runInit({ mode: 'independent', path: repo, yes: true, visibility: 'private', runtime: 'host', dockerProbe: dockerDown, ...extra });
   return { repo, r, id: r.plan.projectId };
 }
 
@@ -97,13 +97,13 @@ describe('runtime selection is host-controlled', () => {
   it('repository config cannot select the host runtime (strict schema)', async () => {
     expect(() => validateConfig({ ...defaults(), runtime: 'host' }, 'x')).toThrow(expect.objectContaining({ code: 'INVALID_CONFIG' }));
     const repo = makeRepo(env.root);
-    const r = await runInit({ path: repo, yes: true, visibility: 'shared', dockerProbe: dockerUp });
+    const r = await runInit({ mode: 'independent', path: repo, yes: true, visibility: 'shared', dockerProbe: dockerUp });
     const shared = repoPaths(repo).configJson;
     writeFileSync(shared, JSON.stringify({ ...JSON.parse(readFileSync(shared, 'utf8')), runtime: 'host' }));
     const project = await loadProjectJson(r.plan.projectId);
     expect(project.runtime).toBeUndefined();
     await expect(loadEffectiveConfig(project)).rejects.toMatchObject({ code: 'INVALID_CONFIG' });
-    await expect(runInit({ path: repo, yes: true, dockerProbe: dockerUp })).rejects.toMatchObject({ code: 'INVALID_CONFIG' });
+    await expect(runInit({ mode: 'independent', path: repo, yes: true, dockerProbe: dockerUp })).rejects.toMatchObject({ code: 'INVALID_CONFIG' });
   });
 
   it('init --runtime host needs no Docker, records the runtime in project.json, and warns', async () => {
@@ -115,57 +115,29 @@ describe('runtime selection is host-controlled', () => {
     for (const l of HOST_RUNTIME_WARNING) expect(text).toContain(l);
     expect(r.plan.externalSetup.join('\n')).toMatch(/tmux, claude .* backlog/);
     // the docker runtime still refuses without Docker
-    await expect(runInit({ path: makeRepo(env.root, 'other'), yes: true, visibility: 'private', dockerProbe: dockerDown }))
+    await expect(runInit({ mode: 'independent', path: makeRepo(env.root, 'other'), yes: true, visibility: 'private', dockerProbe: dockerDown }))
       .rejects.toMatchObject({ code: 'DOCKER_UNAVAILABLE' });
   });
 
-  it('a global default of host is never inherited by a non-interactive init; the wizard asks with the typed word', async () => {
+  it('the mode picks the runtime: independent docker (even with a host default), supervised host (or the default); --runtime wins', async () => {
     await saveDefaults({ runtime: 'host' });
     const repo = makeRepo(env.root);
-    const r = await runInit({ path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
+    const r = await runInit({ mode: 'independent', path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
     expect(r.plan.runtime).toBe('docker');
-    expect(r.plan.notes.join(' ')).toMatch(/never inherits it/);
     await runUninstall({ cwd: repo, yes: true, runner: async () => no });
-    const asked: string[] = [];
-    const io = { info: () => undefined, ask: async (q: string, def: string) => { asked.push(`${q}=${def}`); return q.startsWith('Type "host"') ? 'host' : q.startsWith('Apply this plan') ? 'y' : def; } };
-    const r2 = await runInit({ path: repo, io, dockerProbe: dockerDown, visibility: 'private' });
+    const r2 = await runInit({ mode: 'supervised', path: repo, yes: true, dockerProbe: dockerDown });
     expect(r2.plan.runtime).toBe('host');
-    expect(asked.some((a) => a.startsWith('Agent runtime (docker/host)=host'))).toBe(true);
-    expect(r2.plan.warnings.join('\n')).toMatch(/Use Docker for untrusted repositories/);
-  });
-
-  it('--runtime host: non-interactive needs --yes; interactive needs the typed word', async () => {
-    const repo = makeRepo(env.root);
-    await expect(runInit({ path: repo, visibility: 'private', runtime: 'host', dockerProbe: dockerDown })).rejects.toMatchObject({ code: 'PRECONDITION', message: expect.stringMatching(/needs confirmation/) });
-    const io = (typed: string) => ({ info: () => undefined, ask: async (q: string, def: string) => (q.startsWith('Type "host"') ? typed : q.startsWith('Apply this plan') ? 'y' : def) });
-    const r1 = await runInit({ path: repo, io: io('no'), visibility: 'private', runtime: 'host', dockerProbe: dockerUp });
-    expect(r1.plan.runtime).toBe('docker');
+    expect(r2.plan.warnings.join('\n')).toMatch(/agents run as your macOS user/);
     await runUninstall({ cwd: repo, yes: true, runner: async () => no });
-    const r2 = await runInit({ path: repo, io: io('host'), visibility: 'private', runtime: 'host', dockerProbe: dockerDown });
-    expect(r2.plan.runtime).toBe('host');
-  });
-
-  it('wizard: host needs the typed word, anything else keeps docker', async () => {
-    const repo = makeRepo(env.root);
-    const mk = (typed: string) => {
-      const info: string[] = [];
-      return { info, io: { info: (l: string) => info.push(l), ask: async (q: string, def: string) =>
-        q.startsWith('Agent runtime') ? 'host' : q.startsWith('Type "host"') ? typed : q.startsWith('Apply this plan') ? 'y' : def } };
-    };
-    const a = mk('nope');
-    const r1 = await runInit({ path: repo, io: a.io, dockerProbe: dockerUp, visibility: 'private' });
-    expect(r1.plan.runtime).toBe('docker');
-    expect(a.info.join('\n')).toContain(HOST_RUNTIME_WARNING[1]);
-    expect(r1.plan.notes.join(' ')).toMatch(/not confirmed/);
-    const b = mk('host');
+    await saveDefaults({ runtime: 'docker' });
+    expect((await runInit({ mode: 'supervised', path: repo, yes: true, dockerProbe: dockerUp })).plan.runtime).toBe('docker');
     await runUninstall({ cwd: repo, yes: true, runner: async () => no });
-    const r2 = await runInit({ path: repo, io: b.io, dockerProbe: dockerDown, visibility: 'private' });
-    expect(r2.plan.runtime).toBe('host');
+    expect((await runInit({ mode: 'independent', path: repo, yes: true, runtime: 'host', visibility: 'private', dockerProbe: dockerDown })).plan.runtime).toBe('host');
   });
 
   it('runtime set host: warning always, typed confirmation or --yes, refuses while running', async () => {
     const repo = makeRepo(env.root);
-    const { plan } = await runInit({ path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
+    const { plan } = await runInit({ mode: 'independent', path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
     const warned: string[][] = [];
     const deps = { cwd: repo, warn: (l: string[]) => warned.push(l), isRunning: async () => false };
     await expect(runRuntimeSet('host', {}, { ...deps, ask: async () => null })).rejects.toMatchObject({ code: 'PRECONDITION' });

@@ -14,7 +14,7 @@ let root = '';
 beforeAll(() => {
   root = tmp();
   mkdirSync(join(root, 'state'), { recursive: true });
-  writeFileSync(join(root, 'config.json'), JSON.stringify(defaults('project-owner')));
+  writeFileSync(join(root, 'config.json'), JSON.stringify(defaults('independent')));
   process.env.MINIONS_RUNTIME = 'container';
   process.env.MINIONS_STATE_DIR = join(root, 'state');
   process.env.MINIONS_CONFIG = join(root, 'config.json');

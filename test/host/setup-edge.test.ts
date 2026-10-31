@@ -27,7 +27,7 @@ const { loadCredentialRefs } = await import('../../src/host/credentials.js');
 const { loadRegistry } = await import('../../src/host/registry.js');
 const { projectPaths, repoPaths } = await import('../../src/core/paths.js');
 const { register } = await import('../../src/host/commands.js');
-const { profileDefaults } = await import('../../src/config/profiles.js');
+const { modeDefaults } = await import('../../src/config/modes.js');
 const { dockerUp, makeRepo, withHome } = await import('./fixtures.js');
 type SetupRuntime = import('../../src/host/setup.js').SetupRuntime;
 type SetupResult = import('../../src/host/setup.js').SetupResult;
@@ -109,14 +109,14 @@ describe('minions setup: idempotent reruns', () => {
   it.each(['shared', 'private'] as const)('--yes rerun (%s) writes nothing, keeps one registry entry, and does not re-import', async (visibility) => {
     const repo = repoNamed();
     const rt = fakeRuntime();
-    const first = await runSetup({ path: repo, yes: true, visibility, runtime: rt.runtime, dockerProbe: dockerUp });
+    const first = await runSetup({ mode: 'independent', path: repo, yes: true, visibility, runtime: rt.runtime, dockerProbe: dockerUp });
     expect(step(first, 'init').status).toBe('done');
     if (visibility === 'shared') expect(existsSync(repoPaths(repo).configJson)).toBe(true);
     else expect(existsSync(repoPaths(repo).dir)).toBe(false);
     const before = snapshot(env.home, repo);
 
     rt.calls.length = 0;
-    const again = await runSetup({ path: repo, yes: true, runtime: rt.runtime, dockerProbe: dockerUp });
+    const again = await runSetup({ mode: 'independent', path: repo, yes: true, runtime: rt.runtime, dockerProbe: dockerUp });
     expect(again.projectId).toBe(first.projectId);
     expect(again.rerun).toBe(true);
     expect(step(again, 'init').status).toBe('kept');
@@ -134,9 +134,9 @@ describe('minions setup: idempotent reruns', () => {
   it('a --yes rerun after an interactive install with tokens keeps them and changes nothing', async () => {
     const repo = repoNamed();
     const rt = fakeRuntime();
-    await runSetup({ path: repo, yes: true, visibility: 'private', tokens: { telegram: TG_TOKEN }, runtime: rt.runtime, dockerProbe: dockerUp });
+    await runSetup({ mode: 'independent', path: repo, yes: true, visibility: 'private', tokens: { telegram: TG_TOKEN }, runtime: rt.runtime, dockerProbe: dockerUp });
     const before = snapshot(env.home, repo);
-    const again = await runSetup({ path: repo, yes: true, runtime: rt.runtime, dockerProbe: dockerUp });
+    const again = await runSetup({ mode: 'independent', path: repo, yes: true, runtime: rt.runtime, dockerProbe: dockerUp });
     expect(step(again, 'telegram').status).toBe('kept');
     expect(snapshot(env.home, repo)).toEqual(before);
   });
@@ -146,11 +146,11 @@ describe('minions setup: --dry-run', () => {
   it('on an existing installation writes nothing, stores no piped token, and makes no container calls', async () => {
     const repo = repoNamed();
     const rt = fakeRuntime();
-    const first = await runSetup({ path: repo, yes: true, visibility: 'shared', runtime: rt.runtime, dockerProbe: dockerUp });
+    const first = await runSetup({ mode: 'independent', path: repo, yes: true, visibility: 'shared', runtime: rt.runtime, dockerProbe: dockerUp });
     const before = snapshot(env.home, repo);
     rt.calls.length = 0;
     const a = scripted();
-    const r = await runSetup({ path: repo, yes: false, dryRun: true, io: a.io, tokens: { telegram: TG_TOKEN }, runtime: rt.runtime, dockerProbe: dockerUp });
+    const r = await runSetup({ mode: 'independent', path: repo, yes: false, dryRun: true, io: a.io, tokens: { telegram: TG_TOKEN }, runtime: rt.runtime, dockerProbe: dockerUp });
     expect(r.dryRun).toBe(true);
     expect(r.rerun).toBe(true);
     expect(r.projectId).toBe(first.projectId);
@@ -163,10 +163,10 @@ describe('minions setup: --dry-run', () => {
 });
 
 describe('minions setup: declined integrations leave nothing behind', () => {
-  it('declining local integration and Telegram writes no credential, secret, local layer, or repo file', async () => {
+  it('declining Telegram writes no credential, secret, local layer, or repo file', async () => {
     const repo = repoNamed();
-    const a = scripted({ 'Installation visibility': 'private', 'Integrate approved tasks automatically?': 'n', 'Set up Telegram': 'n' });
-    const r = await runSetup({ path: repo, yes: false, io: a.io, runtime: fakeRuntime().runtime, dockerProbe: dockerUp });
+    const a = scripted({ 'Set up Telegram': 'n' });
+    const r = await runSetup({ mode: 'independent', path: repo, yes: false, io: a.io, visibility: 'private', runtime: fakeRuntime().runtime, dockerProbe: dockerUp });
     const paths = projectPaths(r.projectId);
     expect(a.asked.some((q) => q.startsWith('secret:'))).toBe(false);
     expect(existsSync(join(paths.dir, 'credentials.json'))).toBe(false);
@@ -175,7 +175,7 @@ describe('minions setup: declined integrations leave nothing behind', () => {
     expect(fsStatus(repo).join('\n')).toBe('');
     const eff = JSON.parse(readFileSync(paths.runtimeConfigJson, 'utf8'));
     expect(eff.communication.channel).toBe('auto'); // the default; terminal while no bot token is stored
-    expect(eff.delivery.merge).toBe('disabled');
+    expect(eff.delivery.merge).toBe('auto-when-eligible');
   });
 });
 
@@ -183,7 +183,7 @@ describe('minions setup: secrets on error paths', () => {
   it('a malformed piped Telegram token fails without echoing the value', async () => {
     const repo = repoNamed();
     const badTg = 'not:a-telegram-secret-value';
-    const r = await runSetup({ path: repo, yes: true, visibility: 'private', tokens: { telegram: badTg }, runtime: fakeRuntime().runtime, dockerProbe: dockerUp });
+    const r = await runSetup({ mode: 'independent', path: repo, yes: true, visibility: 'private', tokens: { telegram: badTg }, runtime: fakeRuntime().runtime, dockerProbe: dockerUp });
     expect(step(r, 'telegram').status).toBe('failed');
     expect(visible(r)).not.toContain(badTg);
     expect(existsSync(join(projectPaths(r.projectId).dir, 'credentials.json'))).toBe(false);
@@ -191,20 +191,29 @@ describe('minions setup: secrets on error paths', () => {
 
   it('interactive prompts never carry a token and the token is read only through io.secret', async () => {
     const repo = repoNamed();
-    const a = scripted({ 'Installation visibility': 'private', 'Set up Telegram': 'y' }, [TG_TOKEN]);
-    const r = await runSetup({ path: repo, yes: false, io: a.io, runtime: fakeRuntime().runtime, dockerProbe: dockerUp });
+    const a = scripted({ 'Set up Telegram': 'y' }, [TG_TOKEN]);
+    const r = await runSetup({ mode: 'independent', path: repo, yes: false, io: a.io, visibility: 'private', runtime: fakeRuntime().runtime, dockerProbe: dockerUp });
     expect(a.asked.filter((q) => q.startsWith('secret:'))).toEqual(['secret:Telegram bot token (input hidden): ']);
     expect(visible(r, a)).not.toContain(TG_TOKEN);
   });
 });
 
-describe('plain `minions init` is unaffected by the setup options', () => {
-  it('still asks the channel questions', async () => {
+describe('plain `minions init`', () => {
+  it('asks the mode first (no default) and offers the Telegram token for independent mode', async () => {
     const repo = repoNamed();
-    const a = scripted({ 'Installation visibility': 'private' });
-    await runInit({ path: repo, yes: false, io: a.io, dockerProbe: dockerUp });
-    expect(a.asked.some((q) => q.startsWith('Communication channel'))).toBe(true);
-    expect(a.info.some((l) => l.includes('asked by `minions setup`'))).toBe(false);
+    const a = scripted({ 'Mode': 'independent', 'Store the Telegram bot token': 'n' });
+    const r = await runInit({ path: repo, yes: false, io: a.io, visibility: 'private', dockerProbe: dockerUp });
+    expect(a.asked[0]).toBe('Mode (independent/supervised)');
+    expect(r.plan.mode).toBe('independent');
+    expect(a.asked.some((q) => q.startsWith('Store the Telegram bot token'))).toBe(true);
+    expect(r.telegram?.status).toBe('skipped');
+  });
+
+  it('non-interactive init without --mode fails with a clear error and writes nothing', async () => {
+    const repo = repoNamed();
+    await expect(runInit({ path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp }))
+      .rejects.toMatchObject({ code: 'PRECONDITION', message: expect.stringMatching(/Choose a mode/), hint: expect.stringMatching(/--mode independent/) });
+    expect((await loadRegistry()).projects).toEqual({});
   });
 });
 
@@ -218,7 +227,7 @@ describe('CLI wiring', () => {
   it('registers setup with stdin-only token flags (no option takes a token value)', () => {
     const cmd = setupCmd();
     const longs = cmd.options.map((o) => o.long).sort();
-    expect(longs).toEqual(['--attach', '--config', '--dry-run', '--new-identity', '--no-attach-coordinator', '--private', '--profile', '--runtime', '--shared', '--telegram-token-stdin', '--yes'].sort());
+    expect(longs).toEqual(['--attach', '--config', '--dry-run', '--mode', '--new-identity', '--no-attach-coordinator', '--private', '--profile', '--runtime', '--shared', '--telegram-token-stdin', '--yes'].sort());
     for (const o of cmd.options.filter((x) => /token/.test(x.long ?? ''))) expect(o.required || o.optional).toBe(false);
   });
 
@@ -268,7 +277,7 @@ describe('install.sh', () => {
 describe('minions setup: init options (--config, --attach, --new-identity)', () => {
   const writeCfg = async (name: string, mutate: (c: Record<string, any>) => void = () => {}) => {
     const { writeFileSync } = await import('node:fs');
-    const cfg = profileDefaults('supervised', { baseBranch: 'main', identity: { name: 'A', email: 'a@b' }, projectId: '00000000-0000-4000-8000-000000000000', packageVersion: '0.1.0' }).config as unknown as Record<string, any>;
+    const cfg = modeDefaults('supervised', { baseBranch: 'main', identity: { name: 'A', email: 'a@b' }, projectId: '00000000-0000-4000-8000-000000000000', packageVersion: '0.1.0' }) as unknown as Record<string, any>;
     mutate(cfg);
     const file = join(env.root, name);
     writeFileSync(file, JSON.stringify(cfg));
@@ -279,10 +288,10 @@ describe('minions setup: init options (--config, --attach, --new-identity)', () 
     const repo = repoNamed();
     const cfg = await writeCfg('cfg.json');
     const a = scripted();
-    const r = await runSetup({ path: repo, yes: false, io: a.io, visibility: 'private', configFile: cfg, runtime: fakeRuntime().runtime, dockerProbe: dockerUp });
-    expect(r.init.plan.profile).toBe('supervised');
+    const r = await runSetup({ mode: 'independent', path: repo, yes: false, io: a.io, visibility: 'private', configFile: cfg, runtime: fakeRuntime().runtime, dockerProbe: dockerUp });
+    expect(r.init.plan.mode).toBe('supervised');
     expect(step(r, 'init').status).toBe('done');
-    for (const q of ['Installation visibility', 'Starting profile', 'Project configuration', 'Delivery mode', 'Set up Telegram', 'Communication channel']) {
+    for (const q of ['Installation visibility', 'Mode', 'Project configuration', 'Delivery mode', 'Set up Telegram', 'Communication channel']) {
       expect(a.asked.some((x) => x.startsWith(q)), q).toBe(false);
     }
     expect(a.asked.some((x) => x.startsWith('Build and start the container'))).toBe(true);
@@ -291,7 +300,7 @@ describe('minions setup: init options (--config, --attach, --new-identity)', () 
     // Rerun with a changed file: applied without the keep/change question.
     const cfg2 = await writeCfg('cfg2.json', (c) => { c.execution.maxEngineers = 1; });
     const b = scripted();
-    const again = await runSetup({ path: repo, yes: false, io: b.io, configFile: cfg2, runtime: fakeRuntime().runtime, dockerProbe: dockerUp });
+    const again = await runSetup({ mode: 'independent', path: repo, yes: false, io: b.io, configFile: cfg2, runtime: fakeRuntime().runtime, dockerProbe: dockerUp });
     expect(again.rerun).toBe(true);
     expect(again.projectId).toBe(r.projectId);
     expect(step(again, 'init').status).toBe('changed');
@@ -301,23 +310,23 @@ describe('minions setup: init options (--config, --attach, --new-identity)', () 
 
   it('--yes --config applies the file non-interactively', async () => {
     const repo = repoNamed();
-    const r = await runSetup({ path: repo, yes: true, visibility: 'private', configFile: await writeCfg('cfg.json'), runtime: fakeRuntime().runtime, dockerProbe: dockerUp });
-    expect(r.init.plan.profile).toBe('supervised');
+    const r = await runSetup({ mode: 'independent', path: repo, yes: true, visibility: 'private', configFile: await writeCfg('cfg.json'), runtime: fakeRuntime().runtime, dockerProbe: dockerUp });
+    expect(r.init.plan.mode).toBe('supervised');
   });
 
   it('--new-identity and --attach are forwarded to init for a copied shared identity', async () => {
     const { cpSync } = await import('node:fs');
     const a = repoNamed('a');
-    const ra = await runSetup({ path: a, yes: true, visibility: 'shared', runtime: fakeRuntime().runtime, dockerProbe: dockerUp });
+    const ra = await runSetup({ mode: 'independent', path: a, yes: true, visibility: 'shared', runtime: fakeRuntime().runtime, dockerProbe: dockerUp });
     commitAll(a, 'minions');
     const b = join(env.root, 'b');
     cpSync(a, b, { recursive: true });
-    await expect(runSetup({ path: b, yes: true, runtime: fakeRuntime().runtime, dockerProbe: dockerUp })).rejects.toMatchObject({ code: 'CONFLICT' });
-    const rb = await runSetup({ path: b, yes: true, newIdentity: true, runtime: fakeRuntime().runtime, dockerProbe: dockerUp });
+    await expect(runSetup({ mode: 'independent', path: b, yes: true, runtime: fakeRuntime().runtime, dockerProbe: dockerUp })).rejects.toMatchObject({ code: 'CONFLICT' });
+    const rb = await runSetup({ mode: 'independent', path: b, yes: true, newIdentity: true, runtime: fakeRuntime().runtime, dockerProbe: dockerUp });
     expect(rb.projectId).not.toBe(ra.projectId);
     const c = join(env.root, 'c');
     cpSync(a, c, { recursive: true });
-    const rc = await runSetup({ path: c, yes: true, attach: true, runtime: fakeRuntime().runtime, dockerProbe: dockerUp });
+    const rc = await runSetup({ mode: 'independent', path: c, yes: true, attach: true, runtime: fakeRuntime().runtime, dockerProbe: dockerUp });
     expect(rc.projectId).toBe(ra.projectId);
     expect((await loadRegistry()).projects[ra.projectId]!.repoPath).toBe(c);
   });
@@ -340,7 +349,7 @@ describe('minions setup: empty piped tokens', () => {
   ])('%j fails before anything is written and does not echo the input', async (tokens, message, hint) => {
     const repo = repoNamed();
     const rt = fakeRuntime();
-    const e = await runSetup({ path: repo, yes: true, visibility: 'private', tokens, runtime: rt.runtime, dockerProbe: dockerUp }).then(() => null, (x: unknown) => x as { code: string; message: string; hint?: string });
+    const e = await runSetup({ mode: 'independent', path: repo, yes: true, visibility: 'private', tokens, runtime: rt.runtime, dockerProbe: dockerUp }).then(() => null, (x: unknown) => x as { code: string; message: string; hint?: string });
     expect(e).toMatchObject({ code: 'PRECONDITION', message: expect.stringMatching(message), hint: expect.stringMatching(hint) });
     expect(JSON.stringify(e)).not.toContain(TG_TOKEN);
     expect(rt.calls).toEqual([]);

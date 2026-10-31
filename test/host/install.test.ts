@@ -8,11 +8,11 @@ vi.mock('../../src/plugin/generate.js', async () => {
   const { mkdir, writeFile } = await import('node:fs/promises');
   const { join: j } = await import('node:path');
   return {
-    generatePlugin: async (cfg: { profile: string; execution: { maxEngineers: number } }, outDir: string) => {
+    generatePlugin: async (cfg: { mode: string; execution: { maxEngineers: number } }, outDir: string) => {
       await mkdir(j(outDir, '.claude-plugin'), { recursive: true });
       await mkdir(j(outDir, 'agents'), { recursive: true });
       await writeFile(j(outDir, '.claude-plugin', 'plugin.json'), JSON.stringify({ name: 'minions' }) + '\n');
-      await writeFile(j(outDir, 'agents', 'engineer.md'), `profile ${cfg.profile} engineers ${cfg.execution.maxEngineers}\n`);
+      await writeFile(j(outDir, 'agents', 'engineer.md'), `mode ${cfg.mode} engineers ${cfg.execution.maxEngineers}\n`);
       await writeFile(j(outDir, 'coordinator.md'), 'coordinator\n');
       return [];
     },
@@ -31,7 +31,7 @@ beforeEach(() => { env = withHome(); });
 afterEach(() => env.cleanup());
 
 const init = (path: string, extra: Partial<Parameters<typeof runInit>[0]> = {}) =>
-  runInit({ path, yes: true, dockerProbe: dockerUp, ...extra });
+  runInit({ mode: 'independent', path, yes: true, dockerProbe: dockerUp, ...extra });
 
 async function failure(p: Promise<unknown>) {
   try { await p; } catch (e) { if (e instanceof MinionsError) return e; throw e; }
@@ -72,7 +72,7 @@ describe('init', () => {
     cfg.execution.maxEngineers = 1;
     const cfgFile = join(env.root, 'cfg.json');
     writeFileSync(cfgFile, JSON.stringify(cfg));
-    const again = await runInit({ path: repo, configFile: cfgFile, dockerProbe: dockerUp });
+    const again = await runInit({ mode: 'independent', path: repo, configFile: cfgFile, dockerProbe: dockerUp });
     const w = again.plan.writes.find((x) => x.path === engineer)!;
     expect(w.action).toBe('drift');
     expect(again.applied!.skipped.map((s) => s.path)).toContain(engineer);
@@ -139,19 +139,19 @@ describe('init', () => {
 
   it('fails with DOCKER_UNAVAILABLE and writes nothing when Docker is down', async () => {
     const repo = makeRepo(env.root);
-    const e = await failure(runInit({ path: repo, yes: true, visibility: 'private', dockerProbe: dockerDown }));
+    const e = await failure(runInit({ mode: 'independent', path: repo, yes: true, visibility: 'private', dockerProbe: dockerDown }));
     expect(e.code).toBe('DOCKER_UNAVAILABLE');
     expect(e.message).toMatch(/never falls back to the host/);
     expect(existsSync(env.home)).toBe(false);
     // dry-run still works and reports it
-    const dry = await runInit({ path: repo, yes: true, visibility: 'private', dockerProbe: dockerDown, dryRun: true });
+    const dry = await runInit({ mode: 'independent', path: repo, yes: true, visibility: 'private', dockerProbe: dockerDown, dryRun: true });
     expect(dry.plan.warnings.join(' ')).toMatch(/Docker daemon is not reachable/);
     expect(existsSync(env.home)).toBe(false);
   });
 
   it('plan lists permissions, verification commands, unavailable capabilities and external setup', async () => {
     const repo = makeRepo(env.root);
-    const r = await init(repo, { visibility: 'private', profile: 'personal-work', dryRun: true });
+    const r = await init(repo, { visibility: 'private', mode: 'supervised', dryRun: true });
     expect(r.plan.verificationCommands).toEqual(['npm run lint', 'npm test']);
     expect(r.plan.permissions.deny).toContain('deploy.execute');
     expect(r.plan.unavailable.features).not.toContain('Telegram');

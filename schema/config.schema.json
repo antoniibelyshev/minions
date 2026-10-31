@@ -20,11 +20,10 @@
     "packageVersion": {
       "$ref": "#/$defs/__schema0"
     },
-    "profile": {
+    "mode": {
       "type": "string",
       "enum": [
-        "project-owner",
-        "personal-work",
+        "independent",
         "supervised"
       ]
     },
@@ -470,18 +469,6 @@
         "task.start": {
           "$ref": "#/$defs/__schema4"
         },
-        "external.read": {
-          "$ref": "#/$defs/__schema4"
-        },
-        "external.comment": {
-          "$ref": "#/$defs/__schema4"
-        },
-        "external.changeStatus": {
-          "$ref": "#/$defs/__schema4"
-        },
-        "external.create": {
-          "$ref": "#/$defs/__schema4"
-        },
         "code.edit": {
           "$ref": "#/$defs/__schema4"
         },
@@ -519,10 +506,6 @@
         "task.create",
         "task.update",
         "task.start",
-        "external.read",
-        "external.comment",
-        "external.changeStatus",
-        "external.create",
         "code.edit",
         "dependencies.edit",
         "architecture.change",
@@ -692,10 +675,6 @@
                 "task.create",
                 "task.update",
                 "task.start",
-                "external.read",
-                "external.comment",
-                "external.changeStatus",
-                "external.create",
                 "code.edit",
                 "dependencies.edit",
                 "architecture.change",
@@ -722,18 +701,6 @@
                 "$ref": "#/$defs/__schema5"
               },
               "task.start": {
-                "$ref": "#/$defs/__schema5"
-              },
-              "external.read": {
-                "$ref": "#/$defs/__schema5"
-              },
-              "external.comment": {
-                "$ref": "#/$defs/__schema5"
-              },
-              "external.changeStatus": {
-                "$ref": "#/$defs/__schema5"
-              },
-              "external.create": {
                 "$ref": "#/$defs/__schema5"
               },
               "code.edit": {
@@ -1044,7 +1011,7 @@
     "configRevision",
     "projectId",
     "packageVersion",
-    "profile",
+    "mode",
     "visibility",
     "backlog",
     "intake",

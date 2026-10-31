@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { MinionsError } from '../../src/core/errors.js';
 import { validateResult } from '../../src/runtime/results.js';
-import { PROFILES } from '../../src/config/schema.js';
+import { MODES } from '../../src/config/schema.js';
 import { defaults } from '../helpers.js';
 import { commitFile, gitSync, makeDefaultEnv, result, type Env } from './fixtures.js';
 // Unit tier: git runs on the in-memory fake (./fake-git.ts).
@@ -29,7 +29,7 @@ async function review(env: Env, id: string, over: Record<string, unknown> = {}) 
 
 describe('risk-based testing: default pipeline', () => {
   it('the profile default no longer requires a tester for every task', () => {
-    for (const p of PROFILES) {
+    for (const p of MODES) {
       expect(defaults(p).verification.testerRequired).toBe(false);
     }
   });

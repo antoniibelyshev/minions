@@ -27,7 +27,7 @@ const oldClaude = (): TelegramProbeReport => hostChannelServerProbe({ claudeVers
 /** runCoordinator deps for the channel server check: this Claude Code version (null: `claude --version` failed). */
 const version = (v: string | null = '2.1.308 (Claude Code)') => ({ claudeVersion: async () => v, newLaunchId: () => 'launch-1' });
 
-/** Explicit terminal (the profile default is auto). */
+/** Explicit terminal (the independent default is auto). */
 /** --permission-mode choices of Claude Code 2.1.292 (stub for `claude --help`). */
 const autoModes = async () => ['acceptEdits', 'auto', 'bypassPermissions', 'manual', 'dontAsk', 'plan'];
 const terminalCfg = (): MinionsConfig => { const c = defaults(); c.communication.channel = 'terminal'; return c; };

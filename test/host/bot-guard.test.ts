@@ -21,7 +21,7 @@ const OTHER_BOT = '987654321:CCHotherbototherbototherbotother_-55';
 const SECRET = TOKEN.split(':')[1]!;
 
 const project = (projectId: string, over: Partial<ProjectJson> = {}): ProjectJson => ({
-  version: 1, projectId, repoPath: `/r/${projectId}`, gitCommonDir: `/r/${projectId}/.git`, visibility: 'private', profile: 'project-owner',
+  version: 1, projectId, repoPath: `/r/${projectId}`, gitCommonDir: `/r/${projectId}/.git`, visibility: 'private', mode: 'independent',
   imageTag: 'minions-runtime:0.1.0', baseBranch: 'main', remoteUrl: null, gitIdentity: { name: 'Ada', email: 'ada@example.com' },
   container: { cpus: 2, memoryMiB: 4096, pidsLimit: 512, publishPorts: [], network: 'outbound-internet' }, ...over,
 });

@@ -1,7 +1,8 @@
 import { resolve as resolvePath } from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import { Option, type Command } from 'commander';
-import { PROFILES, type Profile } from '../config/schema.js';
+import { MODES, type Mode } from '../config/schema.js';
+import { toMode } from '../config/modes.js';
 import { action, globalOpts, requireMode, runtimeMode } from '../core/cli-helpers.js';
 import { MinionsError } from '../core/errors.js';
 import { emit } from '../core/output.js';
@@ -26,7 +27,9 @@ import { composeTarget, exportRepo, exportState, importRepo, importState, inspec
 import { agentWritableDirs, hostUpgradeTarget } from './upgrade-host.js';
 import { HOST_RUNTIME_WARNING, HostRuntime, RUNTIMES, prepareHostRuntime, requireHostTools, runtimeOf, type RuntimeKind } from './runtime.js';
 import { registerRuntime } from './runtime-cli.js';
-import { HOST_CHANNEL_NOTE, defaultSessionsOn, formatChannelSet, hostChannel, offerAutoChannel, registerChannel } from './channel-cli.js';
+import { registerMode } from './mode-cli.js';
+import { registerDefaults } from './defaults-cli.js';
+import { HOST_CHANNEL_NOTE, formatChannelSet, hostChannel, offerAutoChannel, registerChannel } from './channel-cli.js';
 import { formatChannel } from '../telegram/channel.js';
 import { formatUninstall, runUninstall } from './uninstall.js';
 import { formatSetup, runSetup, shellQuote, type SetupRuntime } from './setup.js';
@@ -290,6 +293,13 @@ async function importStateCommand(file: string, o: { force: boolean; json: boole
     ...d.container.warnings.map((w) => `warning: ${w}`)].join('\n') });
 }
 
+/** `--profile` (before the two modes): the old names, read as the mode they map to. */
+function legacyProfile(v: string): Mode {
+  const m = toMode(v);
+  if (!m) throw new MinionsError('INVALID_CONFIG', `Unknown profile "${v}".`, 'Use --mode independent or --mode supervised.');
+  return m;
+}
+
 export function register(program: Command): void {
   const auth = registerAuth(program, async (plan) => { process.stderr.write(plan + '\n'); return confirm('Apply? (y/n)'); }, {
     // `auth set login --headless-token` (task-96): the token is read only here, from the host terminal (no echo) or a pipe; never from argv.
@@ -307,7 +317,8 @@ export function register(program: Command): void {
   });
   program.command('init [path]')
     .description('Inspect a Git repository, propose an install plan, apply it, and verify the runtime')
-    .addOption(new Option('--profile <profile>', 'starting profile').choices([...PROFILES]))
+    .addOption(new Option('--mode <mode>', 'independent (the agents run the project) or supervised (you review and merge all code); asked first when omitted').choices([...MODES]))
+    .addOption(new Option('--profile <profile>').hideHelp().argParser(legacyProfile))
     .option('--private', 'private install: nothing is written into the repository')
     .option('--shared', 'shared install: writes .minions/config.json and .minions/README.md')
     .option('-y, --yes', 'accept defaults without prompting')
@@ -316,7 +327,7 @@ export function register(program: Command): void {
     .option('--attach', 'attach this repository to the project id in .minions/config.json')
     .option('--new-identity', 'create a new project identity for this repository')
     .addOption(new Option('--runtime <runtime>', 'agent runtime: docker (default) or host (no Docker, less safe; prints a warning)').choices([...RUNTIMES]))
-    .action(action(async (path: string | undefined, o: { profile?: Profile; private?: boolean; shared?: boolean; yes?: boolean; config?: string; dryRun?: boolean; attach?: boolean; newIdentity?: boolean; runtime?: RuntimeKind }, cmd: Command) => {
+    .action(action(async (path: string | undefined, o: { mode?: Mode; profile?: Mode; private?: boolean; shared?: boolean; yes?: boolean; config?: string; dryRun?: boolean; attach?: boolean; newIdentity?: boolean; runtime?: RuntimeKind }, cmd: Command) => {
       requireMode('host');
       const { json } = globalOpts(cmd);
       if (o.private && o.shared) throw new MinionsError('INVALID_CONFIG', '--private and --shared are mutually exclusive.');
@@ -327,7 +338,7 @@ export function register(program: Command): void {
       const io = interactive ? readlineIO() : undefined;
       try {
         const r = await runInit({
-          path: resolvePath(path ?? '.'), profile: o.profile, visibility: o.private ? 'private' : o.shared ? 'shared' : undefined,
+          path: resolvePath(path ?? '.'), mode: o.mode ?? o.profile, visibility: o.private ? 'private' : o.shared ? 'shared' : undefined,
           yes: !interactive, configFile: o.config ? resolvePath(o.config) : undefined, dryRun: o.dryRun,
           attach: o.attach, newIdentity: o.newIdentity, io, runtime: o.runtime,
         });
@@ -337,7 +348,8 @@ export function register(program: Command): void {
 
   program.command('setup [path]')
     .description('Guided end-to-end setup: init wizard, local integration, Telegram, runtime start, import, coordinator')
-    .addOption(new Option('--profile <profile>', 'starting profile').choices([...PROFILES]))
+    .addOption(new Option('--mode <mode>', 'independent (the agents run the project) or supervised (you review and merge all code); asked first when omitted').choices([...MODES]))
+    .addOption(new Option('--profile <profile>').hideHelp().argParser(legacyProfile))
     .option('--private', 'private install: nothing is written into the repository')
     .option('--shared', 'shared install: writes .minions/config.json and .minions/README.md')
     .option('-y, --yes', 'non-interactive: accept defaults (optional integrations off unless a token is piped)')
@@ -349,7 +361,7 @@ export function register(program: Command): void {
     .option('--new-identity', 'create a new project identity for this repository')
     .addOption(new Option('--runtime <runtime>', 'agent runtime: docker (default) or host (no Docker, less safe; prints a warning)').choices([...RUNTIMES]))
     .option('--no-attach-coordinator', 'do not offer to attach the coordinator at the end')
-    .action(action(async (path: string | undefined, o: { profile?: Profile; private?: boolean; shared?: boolean; yes?: boolean; dryRun?: boolean; telegramTokenStdin?: boolean; config?: string; attach?: boolean; newIdentity?: boolean; runtime?: RuntimeKind; attachCoordinator: boolean }, cmd: Command) => {
+    .action(action(async (path: string | undefined, o: { mode?: Mode; profile?: Mode; private?: boolean; shared?: boolean; yes?: boolean; dryRun?: boolean; telegramTokenStdin?: boolean; config?: string; attach?: boolean; newIdentity?: boolean; runtime?: RuntimeKind; attachCoordinator: boolean }, cmd: Command) => {
       requireMode('host');
       const { json } = globalOpts(cmd);
       if (o.private && o.shared) throw new MinionsError('INVALID_CONFIG', '--private and --shared are mutually exclusive.');
@@ -366,7 +378,7 @@ export function register(program: Command): void {
       const io = interactive ? readlineIO() : undefined;
       try {
         const r = await runSetup({
-          path: target, profile: o.profile, visibility: o.private ? 'private' : o.shared ? 'shared' : undefined,
+          path: target, mode: o.mode ?? o.profile, visibility: o.private ? 'private' : o.shared ? 'shared' : undefined,
           yes: !interactive, dryRun: o.dryRun, io, tokens, runtime: setupRuntime(json, target),
           configFile: o.config ? resolvePath(o.config) : undefined, attach: o.attach, newIdentity: o.newIdentity, runtimeKind: o.runtime,
         });
@@ -661,7 +673,6 @@ export function register(program: Command): void {
         : process.stdin.isTTY ? await readSecret('Telegram bot token (input hidden): ')
           : (() => { throw new MinionsError('PRECONDITION', 'No terminal to prompt for the token.', 'Run in a terminal, or pipe it: `minions auth telegram --stdin < token-file`.'); })();
       const r = await provisionTelegramToken({ projectId: project.projectId, token, repoPath: ref.repoPath, verify: !!o.verify });
-      const sessionsOn = await defaultSessionsOn(project).catch(() => false);
       // Explicit "terminal" would leave the token unused: offer auto (same path as `minions channel set auto`).
       const interactive = !o.stdin && !json && !!process.stdin.isTTY;
       const channel = await offerAutoChannel(project, { interactive, confirm: confirmDefaultYes });
@@ -672,7 +683,6 @@ export function register(program: Command): void {
         channel: { configured: resolved?.configured ?? channel.configured, effective: resolved?.effective ?? 'terminal', reason: resolved?.reason ?? null, switchedToAuto: channel.switched, hint: channel.hint } }, { json, human: () => [
         `Stored the Telegram bot token for bot ${r.botId} in ${backendLabel(r.backend)} (${r.ref}).`,
         r.verification ? `Verification: ${r.verification.status} — ${r.verification.detail}` : 'Not checked with Telegram (pass --verify to call getMe).',
-        sessionsOn ? 'Coordinator sessions are on (one coordinator session per Telegram thread); `minions settings set coordinator.sessions.enabled false` turns them off.' : '',
         ...r.warnings.map((w) => `warning: ${w}`),
         applied ? 'Applied to the running container (controlled coordinator restart when needed).'
           : needsRestart ? 'The running container has no secrets mount (created before this feature); run `minions start` to recreate it so the token becomes visible.'
@@ -736,6 +746,8 @@ export function register(program: Command): void {
     }));
 
   registerRuntime(program, { confirm, ask: askLine });
+  registerMode(program);
+  registerDefaults(program);
   registerChannel(program, { confirm: confirmOrNull });
   registerSecrets(program);
 

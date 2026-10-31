@@ -14,7 +14,7 @@ export interface BacklogMdOptions {
   /** CLI binary. Default: env MINIONS_BACKLOG_BIN, else `backlog` on PATH. */
   bin?: string;
   idempotency: IdempotencyStore;
-  /** Profile allows starting ready tasks without the minions:authorized label. */
+  /** The config allows starting ready tasks without the minions:authorized label (intake.startReady). */
   startReady?: boolean;
   timeoutMs?: number;
   /** Max concurrent `task view` calls in listings (only for tasks the file reader falls back on). */

@@ -297,7 +297,7 @@ describe('secret service store (Linux, secret-tool)', () => {
   it('host runtime: moveKeychainTokensToFileStore also moves Secret Service tokens to the 0600 file store', async () => {
     const repo = makeRepo(env.root);
     const { runner, items } = fakeSecretTool();
-    const r = await runInit({ path: repo, yes: true, visibility: 'private', dockerProbe: async () => ({ daemon: true, serverVersion: '1', compose: true, composeVersion: '2.29.1' }) });
+    const r = await runInit({ mode: 'independent', path: repo, yes: true, visibility: 'private', dockerProbe: async () => ({ daemon: true, serverVersion: '1', compose: true, composeVersion: '2.29.1' }) });
     const pid = r.plan.projectId;
     await C.provisionCodexKey({ projectId: pid, token: TOKEN, repoPath: repo, runner, env: DBUS, platform: 'linux', hostRuntime: false });
     expect((await C.loadCredentialRefs(pid)).codex?.backend).toBe('secret-service');
@@ -313,7 +313,7 @@ describe('container mount', () => {
   it('mounts the secrets directory read-only at a fixed path; never the credential store or a single file', () => {
     const y = composeYaml({
       version: 1, projectId: ID, repoPath: '/Users/x/repo', gitCommonDir: '/Users/x/repo/.git', visibility: 'private',
-      profile: 'personal-work', imageTag: 'minions-runtime:0.1.0', baseBranch: 'main', remoteUrl: REMOTE,
+      mode: 'supervised', imageTag: 'minions-runtime:0.1.0', baseBranch: 'main', remoteUrl: REMOTE,
       gitIdentity: { name: 'Ada', email: 'ada@example.com' },
       container: { cpus: 4, memoryMiB: 6144, pidsLimit: 512, publishPorts: [], network: 'outbound-internet' },
     });

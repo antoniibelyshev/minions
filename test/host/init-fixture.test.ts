@@ -34,7 +34,7 @@ function snapshot(root: string, projectId: string): Record<string, string> {
 describe.each(['private', 'shared'] as const)('initFromTemplate (%s)', (visibility) => {
   it('writes what a real init writes, at the new paths, and a rerun of init finds nothing to change', async () => {
     const real = home();
-    const r = await runInit({ path: makeRepo(real.root), yes: true, visibility, dockerProbe: dockerUp });
+    const r = await runInit({ mode: 'independent', path: makeRepo(real.root), yes: true, visibility, dockerProbe: dockerUp });
     const expected = snapshot(real.root, r.plan.projectId);
     // The first call builds the template, the second copies it: both must match the real install.
     for (let i = 0; i < 2; i++) {
@@ -44,7 +44,7 @@ describe.each(['private', 'shared'] as const)('initFromTemplate (%s)', (visibili
       expect(snapshot(env.root, projectId)).toEqual(expected);
       const project = await loadProjectJson(projectId);
       expect(project.repoPath).toBe(repo);
-      const again = await runInit({ path: repo, yes: true, visibility, dockerProbe: dockerUp });
+      const again = await runInit({ mode: 'independent', path: repo, yes: true, visibility, dockerProbe: dockerUp });
       expect(again.plan.projectId).toBe(projectId);
       expect(again.plan.writes.filter((w) => !['unchanged', 'keep'].includes(w.action))).toEqual([]);
     }

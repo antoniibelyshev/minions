@@ -10,7 +10,7 @@ export interface Task {
   acceptanceCriteria: { text: string; done: boolean }[];
   status: TaskStatus; priority: 'high' | 'medium' | 'low' | null;
   dependencies: string[]; parent: string | null; externalLinks: string[];
-  labels: string[]; authorized: boolean;   // label 'minions:authorized' or profile allows startReady
+  labels: string[]; authorized: boolean;   // label 'minions:authorized' or intake.startReady
   branch: string | null; commits: string[];
   provenance: Provenance; version: string; // content hash for conflict checks
   milestone?: string | null; // backend milestone, used by intake.scope.milestone

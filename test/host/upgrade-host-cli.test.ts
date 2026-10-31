@@ -70,7 +70,7 @@ const ok = (): RunResult => ({ code: 0, stdout: '', stderr: '' });
 describe('minions upgrade --from-container on the host runtime (CLI)', () => {
   it('refuses a CLI inside the agent-writable workspace before touching the shim', async () => {
     const repo = makeRepo(env.root);
-    const r = await runInit({ path: repo, yes: true, visibility: 'private', runtime: 'host', dockerProbe: dockerDown });
+    const r = await runInit({ mode: 'independent', path: repo, yes: true, visibility: 'private', runtime: 'host', dockerProbe: dockerDown });
     const id = r.plan.projectId;
     const project = await loadProjectJson(id);
     const hp = hostRuntimePaths(id);
@@ -101,7 +101,7 @@ describe('minions upgrade --from-container on the host runtime (CLI)', () => {
 
   it('prepareHostRuntime refuses a shim target inside the agent-writable dirs and leaves the shim as it was', async () => {
     const repo = makeRepo(env.root);
-    const r = await runInit({ path: repo, yes: true, visibility: 'private', runtime: 'host', dockerProbe: dockerDown });
+    const r = await runInit({ mode: 'independent', path: repo, yes: true, visibility: 'private', runtime: 'host', dockerProbe: dockerDown });
     const project = await loadProjectJson(r.plan.projectId);
     const hp = hostRuntimePaths(project.projectId);
     await prepareHostRuntime(project, { target: { node: process.execPath, cli: '/opt/minions/dist/cli.js' }, runner: async () => ok() });

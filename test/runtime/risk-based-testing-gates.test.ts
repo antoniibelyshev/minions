@@ -61,10 +61,10 @@ describe('risk-based testing: sensitive paths changed only by delete or rename',
     const b = await env.sched.claim('task-1', 'engineer');
     const h1 = commitFile(b.worktree, 'a.txt', 'a');
     expect(await env.sched.record(b.leaseId, result({ branch: b.branch, headSha: h1 }))).toMatchObject({ to: 'reviewing' });
-    commitAt(b.worktree, 'automation/run.sh', 'echo\n'); // lands on the branch after the engineer stage
+    commitAt(b.worktree, '.husky/pre-commit', 'echo\n'); // lands on the branch after the engineer stage
     const rr = await review(env, 'task-1');
     expect(rr).toMatchObject({ approved: false, to: 'testing' });
-    expect(rr.message).toMatch(/sensitive paths \(automation\/run\.sh\)/);
+    expect(rr.message).toMatch(/sensitive paths \(\.husky\/pre-commit\)/);
     expect(env.backlog.status('task-1')).toBe('testing');
   });
 });

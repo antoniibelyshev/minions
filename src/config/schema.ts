@@ -7,7 +7,6 @@ export const COORDINATOR_PERMISSION_MODES = ['auto', 'acceptEdits', 'bypassPermi
 
 export const CAPABILITIES = [
   'task.read', 'task.create', 'task.update', 'task.start',
-  'external.read', 'external.comment', 'external.changeStatus', 'external.create',
   'code.edit', 'dependencies.edit', 'architecture.change', 'migrations.edit',
   'git.commit',
   // Local integration (docs/design/local-auto-integration.md): the runtime merging an approved head into the local base.
@@ -47,7 +46,7 @@ export type CapabilityRule = z.infer<typeof CapabilityRuleSchema>;
 /**
  * Capabilities added after configs were first written default when an effective config lacks them, fail closed:
  * an effective config generated before base.merge existed (task-82.3) keeps local integration off (deny: approvals
- * end delivered, as before) until the host regenerates it from the profile defaults.
+ * end delivered, as before) until the host regenerates it from the mode defaults.
  */
 const LATER_CAPABILITY_DEFAULTS: Partial<Record<Capability, 'deny'>> = { 'base.merge': 'deny' };
 
@@ -55,8 +54,9 @@ export const CapabilitiesSchema = z.object(
   Object.fromEntries(CAPABILITIES.map((c) => [c, LATER_CAPABILITY_DEFAULTS[c] ? CapabilityRuleSchema.default(LATER_CAPABILITY_DEFAULTS[c]) : CapabilityRuleSchema])) as Record<Capability, typeof CapabilityRuleSchema>,
 ).strict();
 
-export const PROFILES = ['project-owner', 'personal-work', 'supervised'] as const;
-export type Profile = (typeof PROFILES)[number];
+/** Operating modes (docs/design/autonomy.md Decision 11): the agents run the project, or the owner reviews and merges. */
+export const MODES = ['independent', 'supervised'] as const;
+export type Mode = (typeof MODES)[number];
 
 /** communication.channel values. */
 export const CHANNELS = ['terminal', 'telegram', 'auto'] as const;
@@ -221,7 +221,7 @@ export const MinionsConfigSchema = z.object({
   configRevision: z.number().int().min(1),
   projectId: z.uuid(),
   packageVersion: nonEmpty,
-  profile: z.enum(PROFILES),
+  mode: z.enum(MODES),
   visibility: z.enum(['shared', 'private']),
   backlog: z.object({
     backend: z.enum(['backlogmd']),

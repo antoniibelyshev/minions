@@ -198,20 +198,6 @@ describe('auth telegram: offer to switch from terminal to auto', () => {
   });
 });
 
-describe('Telegram set up: coordinator sessions default on', () => {
-  it('turns coordinator.sessions.enabled on once, and never overrides an explicit setting', async () => {
-    const { project, file } = await install('private');
-    expect(await CH.defaultSessionsOn(project)).toBe(true);
-    expect((await loadEffectiveConfig(project)).config.coordinator?.sessions?.enabled).toBe(true);
-    expect(await CH.defaultSessionsOn(project)).toBe(false);
-    const raw = JSON.parse(readFileSync(file, 'utf8')) as Record<string, unknown> & { coordinator: { sessions: Record<string, unknown> } };
-    raw.coordinator.sessions.enabled = false;
-    writeFileSync(file, JSON.stringify(raw, null, 2) + '\n');
-    expect(await CH.defaultSessionsOn(project)).toBe(false);
-    expect((await loadEffectiveConfig(project)).config.coordinator?.sessions?.enabled).toBe(false);
-  });
-});
-
 describe('minions status: channel inside the runtime', () => {
   it('predicted from the mounted token without a launch record; the launch decision once the coordinator ran', async () => {
     const root = join(env.root, 'rt');

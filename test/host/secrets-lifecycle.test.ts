@@ -54,7 +54,7 @@ describe('container copy lifecycle', () => {
 
   it('doctor removes stale copies when the container is not running, keeps the stored original', async () => {
     const repo = makeRepo(env.root);
-    const r = await runInit({ path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
+    const r = await runInit({ mode: 'independent', path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
     const id = r.plan.projectId;
     await new C.FileStore(C.CODEX_CREDENTIAL).set(id, TOKEN);
     await plant(id);
@@ -67,7 +67,7 @@ describe('container copy lifecycle', () => {
 
   it('doctor leaves copies alone when the container is running', async () => {
     const repo = makeRepo(env.root);
-    const r = await runInit({ path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
+    const r = await runInit({ mode: 'independent', path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
     const id = r.plan.projectId;
     await plant(id);
     const runner = async (_c: string, args: string[]): Promise<RunResult> => args.includes('ps') ? ok('abc\n') : ok('{}');
@@ -146,7 +146,7 @@ describe('doctor keeps copies unless the container is confirmed gone', () => {
   ] as const) {
     it(`does not delete on ${label}, and warns`, async () => {
       const repo = makeRepo(env.root);
-      const r = await runInit({ path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
+      const r = await runInit({ mode: 'independent', path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
       const id = r.plan.projectId;
       await plant(id);
       const runner = async (_c: string, args: string[]): Promise<RunResult> => {
@@ -160,7 +160,7 @@ describe('doctor keeps copies unless the container is confirmed gone', () => {
   }
   it('deletes on exited', async () => {
     const repo = makeRepo(env.root);
-    const r = await runInit({ path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
+    const r = await runInit({ mode: 'independent', path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
     await plant(r.plan.projectId);
     const runner = async (_c: string, args: string[]): Promise<RunResult> =>
       args.includes('ps') && args.includes('-a') ? ok(JSON.stringify({ State: 'exited' })) : ok('');
@@ -201,14 +201,14 @@ describe('containerState edge cases (tester)', () => {
 describe('doctor never deletes when Docker or ps is unreachable (tester)', () => {
   it('keeps copies when the daemon is down', async () => {
     const repo = makeRepo(env.root);
-    const r = await runInit({ path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
+    const r = await runInit({ mode: 'independent', path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
     await plant(r.plan.projectId);
     await runDoctor({ cwd: repo, probe: dockerDown, runner: async () => ok('') });
     expect(copies(r.plan.projectId)).toEqual([true, true, true]);
   });
   it('keeps copies when ps -a throws (timeout) at doctor level', async () => {
     const repo = makeRepo(env.root);
-    const r = await runInit({ path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
+    const r = await runInit({ mode: 'independent', path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
     await plant(r.plan.projectId);
     const runner = async (_c: string, args: string[]): Promise<RunResult> => {
       if (args.includes('ps') && args.includes('-a')) throw new Error('timed out');
@@ -220,7 +220,7 @@ describe('doctor never deletes when Docker or ps is unreachable (tester)', () =>
   });
   it('keeps copies when another service is running but ours is restarting (filtered ps -a returns ours only)', async () => {
     const repo = makeRepo(env.root);
-    const r = await runInit({ path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
+    const r = await runInit({ mode: 'independent', path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
     await plant(r.plan.projectId);
     const runner = async (_c: string, args: string[]): Promise<RunResult> =>
       args.includes('ps') && args.includes('-a') ? ok(JSON.stringify({ Service: 'app', State: 'restarting' })) : ok('');

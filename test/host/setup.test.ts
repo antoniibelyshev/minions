@@ -83,27 +83,23 @@ function allFiles(dir: string): string[] {
 }
 
 describe('minions setup', () => {
-  it('runs the whole flow end to end: wizard, local integration, Telegram, container, import, coordinator', async () => {
+  it('runs the whole flow end to end: mode, Telegram, container, import, coordinator', async () => {
     const repo = makeRepo(env.root);
-    const a = scripted({
-      'Installation visibility': 'private',
-      'Integrate approved tasks automatically?': 'y',
-      'Set up Telegram': 'y',
-    }, [TG_TOKEN]);
+    const a = scripted({ 'Mode': '1', 'Set up Telegram': 'y' }, [TG_TOKEN]);
     const rt = fakeRuntime();
-    const r = await runSetup({ path: repo, yes: false, io: a.io, runtime: rt.runtime, dockerProbe: dockerUp });
+    const r = await runSetup({ path: repo, yes: false, io: a.io, visibility: 'private', runtime: rt.runtime, dockerProbe: dockerUp });
 
-    // Order of the questions: project first, then each integration, then the container.
-    const order = ['Starting profile', 'Installation visibility', 'Apply this plan?', 'Integrate approved tasks automatically?',
+    // Order of the questions: the mode first, then what defaults.json does not answer, then the integrations and the container.
+    const order = ['Mode', 'Claude authorization', 'Apply this plan?',
       'Set up Telegram', 'secret:Telegram bot token', 'Check the token with Telegram', 'Build and start the container'];
     const idx = order.map((q) => a.asked.findIndex((x) => x.startsWith(q)));
     expect(idx.every((i) => i >= 0), JSON.stringify(a.asked)).toBe(true);
     expect([...idx].sort((x, y) => x - y)).toEqual(idx);
-    // The wizard does not ask the questions setup owns.
-    expect(a.asked.some((q) => q.startsWith('Communication channel') || q.startsWith('Store the Telegram'))).toBe(false);
+    // The mode answers the rest: no visibility, channel or local integration question.
+    expect(a.asked.some((q) => /^(Installation visibility|Communication channel|Store the Telegram|Integrate approved)/.test(q))).toBe(false);
 
     expect(r.steps.map((s) => [s.id, s.status])).toEqual([
-      ['init', 'done'], ['autoMerge', 'done'],
+      ['init', 'done'],
       ['telegram', 'done'], ['harness', 'skipped'], ['container', 'done'], ['import', 'done'], ['coordinator', 'done'],
     ]);
     expect(rt.calls).toEqual(['running?', 'start', 'repo?', 'import', 'coordinator']);
@@ -113,13 +109,12 @@ describe('minions setup', () => {
     // Choices land in the host-only local layer and in the regenerated plugin/runtime config.
     const paths = projectPaths(r.projectId);
     // communication.channel stays auto (the default): a stored bot token is what turns Telegram on.
-    expect(JSON.parse(readFileSync(paths.configLocalJson, 'utf8'))).toEqual({ delivery: { merge: 'auto-when-eligible' } });
+    expect(existsSync(paths.configLocalJson)).toBe(false);
     const eff = (await loadEffectiveConfig(await loadProjectJson(r.projectId))).config;
     expect(eff.delivery.merge).toBe('auto-when-eligible');
     expect(eff.communication.channel).toBe('auto');
     expect(readFileSync(join(paths.pluginDir, 'coordinator.md'), 'utf8')).toBe('merge auto-when-eligible channel auto\n');
     expect(JSON.parse(readFileSync(paths.runtimeConfigJson, 'utf8')).communication.channel).toBe('auto');
-    expect(a.asked.find((x) => x.startsWith('Integrate approved tasks automatically?'))).toBe('Integrate approved tasks automatically? (y/n)');
 
     // Attach and pairing instructions.
     const out = formatSetup(r);
@@ -131,40 +126,19 @@ describe('minions setup', () => {
     // Secrets never appear in the result, its rendering, prompts, notes, or generated files.
     const visible = JSON.stringify(r) + out + a.asked.join('\n') + a.info.join('\n');
     expect(visible).not.toContain(TG_TOKEN);
-    for (const p of [...allFiles(repo), ...allFiles(paths.pluginDir), paths.configLocalJson, paths.configJson, paths.runtimeConfigJson, paths.composeYaml]) {
+    for (const p of [...allFiles(repo), ...allFiles(paths.pluginDir), paths.configJson, paths.runtimeConfigJson, paths.composeYaml]) {
       expect(readFileSync(p, 'utf8'), p).not.toContain(TG_TOKEN);
     }
   });
-  it('local delivery offers automatic local integration (default no); yes records delivery.merge auto-when-eligible', async () => {
-    const repo = makeRepo(env.root);
-    const declined = scripted({ 'Installation visibility': 'private' });
-    const r0 = await runSetup({ path: repo, yes: false, io: declined.io, runtime: fakeRuntime().runtime, dockerProbe: dockerUp });
-    expect(declined.asked).toContain('Integrate approved tasks automatically? (y/n)');
-    expect(declined.asked.some((q) => q.startsWith('Enable auto-merge?'))).toBe(false);
-    expect(step(r0, 'autoMerge')).toMatchObject({ status: 'skipped', detail: 'automatic local integration not enabled' });
-
-    const a = scripted({ 'Installation visibility': 'private', 'Integrate approved tasks automatically?': 'y' });
-    const r = await runSetup({ path: repo, yes: false, io: a.io, runtime: fakeRuntime().runtime, dockerProbe: dockerUp });
-    expect(a.info.some((l) => /runs the verification commands/.test(l))).toBe(true);
-    expect(step(r, 'autoMerge')).toMatchObject({ status: 'done', detail: expect.stringMatching(/the runtime integrates approved tasks into the local main/) });
-    expect(JSON.parse(readFileSync(projectPaths(r.projectId).configLocalJson, 'utf8')).delivery.merge).toBe('auto-when-eligible');
-    const eff = (await loadEffectiveConfig(await loadProjectJson(r.projectId))).config;
-    expect(eff.delivery).toMatchObject({ merge: 'auto-when-eligible' });
-  });
-
   it('asks each optional integration with default no; declining skips cleanly with a note on enabling later', async () => {
     const repo = makeRepo(env.root);
     const a = scripted({ 'Installation visibility': 'private' });
     const rt = fakeRuntime();
-    const r = await runSetup({ path: repo, yes: false, io: a.io, runtime: rt.runtime, dockerProbe: dockerUp });
-    const q = (p: string) => a.asked.find((x) => x.startsWith(p));
-    expect(q('Integrate approved tasks automatically?')).toBeDefined();
-    expect(q('Set up Telegram')).toBeDefined();
+    const r = await runSetup({ mode: 'independent', path: repo, yes: false, io: a.io, runtime: rt.runtime, dockerProbe: dockerUp });
+    expect(a.asked.find((x) => x.startsWith('Set up Telegram'))).toBeDefined();
     expect(a.asked.some((x) => x.startsWith('secret:'))).toBe(false);
-    for (const id of ['autoMerge', 'telegram']) {
-      expect(step(r, id).status).toBe('skipped');
-      expect(step(r, id).later).toMatch(/minions setup/);
-    }
+    expect(step(r, 'telegram').status).toBe('skipped');
+    expect(step(r, 'telegram').later).toMatch(/minions setup/);
     expect(r.localConfig.changed).toEqual([]);
     expect(existsSync(projectPaths(r.projectId).configLocalJson)).toBe(false);
     const rp = shellQuote(r.init.plan.repoPath); // quoted when the temp path has a space (host TMPDIR)
@@ -175,7 +149,7 @@ describe('minions setup', () => {
   });
   it('every printed command names the repository (shell-quoted), so it works from any directory', async () => {
     const repo = makeRepo(env.root, "my repo's dir");
-    const r = await runSetup({ path: repo, yes: true, runtime: fakeRuntime().runtime, dockerProbe: dockerUp });
+    const r = await runSetup({ mode: 'independent', path: repo, yes: true, runtime: fakeRuntime().runtime, dockerProbe: dockerUp });
     const q = `'${r.init.plan.repoPath.replace(/'/g, `'\\''`)}'`;
     expect(r.init.plan.repoPath).toContain("my repo's dir");
     expect(r.ready).toBe(true);
@@ -193,7 +167,7 @@ describe('minions setup', () => {
 
   it('declining the container step says how to start later from any directory', async () => {
     const repo = makeRepo(env.root);
-    const r = await runSetup({ path: repo, yes: false, io: scripted({ 'Installation visibility': 'private', 'Build and start the container': 'n' }).io, runtime: fakeRuntime().runtime, dockerProbe: dockerUp });
+    const r = await runSetup({ mode: 'independent', path: repo, yes: false, io: scripted({ 'Installation visibility': 'private', 'Build and start the container': 'n' }).io, runtime: fakeRuntime().runtime, dockerProbe: dockerUp });
     const rp = shellQuote(r.init.plan.repoPath); // quoted when the temp path has a space (host TMPDIR)
     expect(step(r, 'container').later).toBe(`Run \`minions setup ${rp}\` again or \`cd ${rp} && minions start\` to start the container and attach the coordinator.`);
     expect(r.nextSteps[0]).toBe(`Run \`cd ${rp} && minions start\` to start the container and attach the coordinator.`);
@@ -203,7 +177,7 @@ describe('minions setup', () => {
     const repo = makeRepo(env.root);
     const a = scripted({ 'Installation visibility': 'private', 'Build and start the container': 'n' });
     const rt = fakeRuntime();
-    const r = await runSetup({ path: repo, yes: false, io: a.io, runtime: rt.runtime, dockerProbe: dockerUp });
+    const r = await runSetup({ mode: 'independent', path: repo, yes: false, io: a.io, runtime: rt.runtime, dockerProbe: dockerUp });
     expect(rt.calls).toEqual([]);
     expect(step(r, 'container')).toMatchObject({ status: 'skipped', later: expect.stringContaining('minions start') });
     expect(r.attach).toBeNull();
@@ -212,7 +186,7 @@ describe('minions setup', () => {
   it('rerun is idempotent: detects config, credentials and container and offers keep/change without duplicating state', async () => {
     const repo = makeRepo(env.root);
     const rt = fakeRuntime();
-    const first = await runSetup({
+    const first = await runSetup({ mode: 'independent', 
       path: repo, yes: false, runtime: rt.runtime, dockerProbe: dockerUp,
       io: scripted({ 'Installation visibility': 'private', 'Set up Telegram': 'y' }, [TG_TOKEN]).io,
     });
@@ -224,7 +198,7 @@ describe('minions setup', () => {
 
     const a = scripted();
     rt.calls.length = 0;
-    const again = await runSetup({ path: repo, yes: false, io: a.io, runtime: rt.runtime, dockerProbe: dockerUp });
+    const again = await runSetup({ mode: 'independent', path: repo, yes: false, io: a.io, runtime: rt.runtime, dockerProbe: dockerUp });
     expect(again.projectId).toBe(first.projectId);
     expect(again.rerun).toBe(true);
     expect(a.asked.find((q) => q.startsWith('Project configuration: keep it or change it?'))).toBeDefined();
@@ -242,11 +216,11 @@ describe('minions setup', () => {
   it('every printed command in the kept and import branches also names the repository', async () => {
     const repo = makeRepo(env.root, "my repo's dir");
     const rt = fakeRuntime();
-    const first = await runSetup({ path: repo, yes: true, runtime: rt.runtime, dockerProbe: dockerUp, tokens: { telegram: TG_TOKEN }, visibility: 'private' });
+    const first = await runSetup({ mode: 'independent', path: repo, yes: true, runtime: rt.runtime, dockerProbe: dockerUp, tokens: { telegram: TG_TOKEN }, visibility: 'private' });
     const q = `'${first.init.plan.repoPath.replace(/'/g, `'\\''`)}'`;
     const inRepo = (c: string) => `\`cd ${q} && ${c}\``;
     // kept import + telegram disabled (token kept)
-    const kept = await runSetup({ path: repo, yes: false, runtime: rt.runtime, dockerProbe: dockerUp,
+    const kept = await runSetup({ mode: 'independent', path: repo, yes: false, runtime: rt.runtime, dockerProbe: dockerUp,
       io: scripted({ 'Telegram is set up': 'disable' }).io });
     expect(step(kept, 'import').detail).toContain(inRepo('minions import'));
     expect(step(kept, 'telegram').detail).toContain(inRepo('minions auth telegram --remove'));
@@ -254,66 +228,51 @@ describe('minions setup', () => {
       expect(m[1]!.startsWith(`cd ${q} && `) || m[1] === `minions setup ${q}`, m[1]).toBe(true);
     }
   });
-  it('every printed command in the local integration and dry-run branches also names the repository', async () => {
-    const repo = makeRepo(env.root, "my repo's dir");
+  it('every printed command in the dry-run branch also names the repository', async () => {
     const rt = fakeRuntime();
-    const a = scripted({ 'Installation visibility': 'private', 'Integrate approved tasks automatically?': 'y' });
-    const r = await runSetup({ path: repo, yes: false, io: a.io, runtime: rt.runtime, dockerProbe: dockerUp });
-    const q = `'${r.init.plan.repoPath.replace(/'/g, `'\\''`)}'`;
-    const inRepo = (c: string) => `\`cd ${q} && ${c}\``;
-    const check = (text: string) => {
-      for (const m of text.matchAll(/\`([^\`]*minions [^\`]*)\`/g)) {
-        expect(m[1]!.startsWith(`cd ${q} && `) || m[1] === `minions setup ${q}`, m[1]).toBe(true);
-      }
-    };
-    // The wizard's own plan text (before the integration steps) is not part of the setup steps.
-    const stepInfo = (info: string[]) => info.slice(info.findIndex((l) => l.includes('minions can integrate approved tasks'))).join('\n');
-    check(stepInfo(a.info) + '\n' + formatSetup(r));
-    expect(a.info.join('\n')).toContain(inRepo('minions work approve <taskId> --head <sha>'));
-    // dry run
     const repo3 = makeRepo(env.root, "my repo's dir 3");
-    const d = await runSetup({ path: repo3, yes: false, dryRun: true, io: scripted().io, runtime: rt.runtime, dockerProbe: dockerUp });
+    const d = await runSetup({ mode: 'independent', path: repo3, yes: false, dryRun: true, io: scripted().io, runtime: rt.runtime, dockerProbe: dockerUp });
     const q3 = `'${d.init.plan.repoPath.replace(/'/g, `'\\''`)}'`;
     const planned = formatSetup(d); // the init plan above the setup plan is shared with `minions init`
     for (const m of planned.slice(planned.indexOf('Setup plan')).matchAll(/\`([^\`]*minions [^\`]*)\`/g)) {
       expect(m[1]!.startsWith(`cd ${q3} && `) || m[1] === `minions setup ${q3}`, m[1]).toBe(true);
     }
   });
-  it('rerun with "change" reruns the wizard with the existing values as defaults; integrations can be changed or disabled', async () => {
+  it('rerun with "change" asks the mode again and rebuilds the configuration from it; the runtime and the token stay', async () => {
     const repo = makeRepo(env.root);
     const rt = fakeRuntime();
-    const first = await runSetup({ path: repo, yes: true, runtime: rt.runtime, dockerProbe: dockerUp, tokens: { telegram: TG_TOKEN }, visibility: 'private' });
+    const first = await runSetup({ mode: 'independent', path: repo, yes: true, runtime: rt.runtime, dockerProbe: dockerUp, tokens: { telegram: TG_TOKEN }, visibility: 'private' });
     expect(step(first, 'telegram').status).toBe('done');
     const a = scripted({
       'Project configuration: keep it or change it?': 'change',
-      'Start ready tasks automatically?': 'n',
-      'Telegram is set up': 'disable',
+      'Mode': 'supervised',
     });
     const r = await runSetup({ path: repo, yes: false, io: a.io, runtime: rt.runtime, dockerProbe: dockerUp });
-    expect(a.asked.find((q) => q.startsWith('Starting profile'))).toBeDefined();
+    expect(a.asked.find((q) => q.startsWith('Mode'))).toBe('Mode (independent/supervised)');
     expect(a.asked.some((q) => q.startsWith('Installation visibility'))).toBe(false); // visibility stays as installed
     expect(step(r, 'init').status).toBe('changed');
-    expect(step(r, 'telegram').status).toBe('changed');
-    expect(await readTelegramToken(r.projectId)).toBe(TG_TOKEN); // disabling keeps the token
+    expect(step(r, 'telegram').status).toBe('skipped'); // supervised talks in the terminal
+    expect(await readTelegramToken(r.projectId)).toBe(TG_TOKEN); // the token is kept
     const eff = (await loadEffectiveConfig(await loadProjectJson(r.projectId))).config;
-    expect(eff.intake.startReady).toBe(false);
+    expect(eff).toMatchObject({ mode: 'supervised', delivery: { merge: 'disabled' } });
     expect(eff.communication.channel).toBe('terminal');
+    expect(r.init.plan.runtime).toBe('docker'); // an installed project keeps its runtime
   });
   it('--yes uses defaults: optional integrations off, core steps on, no prompts', async () => {
     const repo = makeRepo(env.root);
     const rt = fakeRuntime();
-    const r = await runSetup({ path: repo, yes: true, runtime: rt.runtime, dockerProbe: dockerUp });
+    const r = await runSetup({ mode: 'independent', path: repo, yes: true, runtime: rt.runtime, dockerProbe: dockerUp });
     expect(r.steps.map((s) => [s.id, s.status])).toEqual([
-      ['init', 'done'], ['autoMerge', 'skipped'],
+      ['init', 'done'],
       ['telegram', 'skipped'], ['harness', 'skipped'], ['container', 'done'], ['import', 'done'], ['coordinator', 'done'],
     ]);
-    expect((await loadEffectiveConfig(await loadProjectJson(r.projectId))).config.delivery.merge).toBe('disabled');
+    expect((await loadEffectiveConfig(await loadProjectJson(r.projectId))).config.delivery.merge).toBe('auto-when-eligible');
   });
   it('an invalid token is reported as failed, nothing is stored, and the rest of setup continues', async () => {
     const repo = makeRepo(env.root);
     const rt = fakeRuntime();
     const a = scripted({ 'Installation visibility': 'private', 'Set up Telegram': 'y' }, ['not-a-token']);
-    const r = await runSetup({ path: repo, yes: false, io: a.io, runtime: rt.runtime, dockerProbe: dockerUp });
+    const r = await runSetup({ mode: 'independent', path: repo, yes: false, io: a.io, runtime: rt.runtime, dockerProbe: dockerUp });
     expect(step(r, 'telegram')).toMatchObject({ status: 'failed', later: expect.stringContaining('minions auth telegram') });
     expect(JSON.stringify(step(r, 'telegram'))).not.toContain('not-a-token');
     expect((await loadCredentialRefs(r.projectId)).telegram).toBeUndefined();
@@ -325,7 +284,7 @@ describe('minions setup', () => {
     const repo = makeRepo(env.root);
     const rt = fakeRuntime();
     const a = scripted();
-    const r = await runSetup({ path: repo, yes: false, dryRun: true, io: a.io, runtime: rt.runtime, dockerProbe: dockerUp });
+    const r = await runSetup({ mode: 'independent', path: repo, yes: false, dryRun: true, io: a.io, runtime: rt.runtime, dockerProbe: dockerUp });
     expect(r.dryRun).toBe(true);
     expect(a.asked).toEqual([]);
     expect(rt.calls).toEqual([]);
@@ -337,14 +296,14 @@ describe('minions setup', () => {
 
   it('refuses to run without prompts unless --yes or --dry-run', async () => {
     const repo = makeRepo(env.root);
-    await expect(runSetup({ path: repo, yes: false, runtime: fakeRuntime().runtime, dockerProbe: dockerUp })).rejects.toBeInstanceOf(MinionsError);
+    await expect(runSetup({ mode: 'independent', path: repo, yes: false, runtime: fakeRuntime().runtime, dockerProbe: dockerUp })).rejects.toBeInstanceOf(MinionsError);
   });
 
   it('a container failure is reported as a failed step with how to retry', async () => {
     const repo = makeRepo(env.root);
     const rt = fakeRuntime();
     rt.runtime.start = async () => { throw new MinionsError('DOCKER_UNAVAILABLE', 'Docker daemon is not reachable.'); };
-    const r = await runSetup({ path: repo, yes: true, runtime: rt.runtime, dockerProbe: dockerUp });
+    const r = await runSetup({ mode: 'independent', path: repo, yes: true, runtime: rt.runtime, dockerProbe: dockerUp });
     expect(step(r, 'container')).toMatchObject({ status: 'failed', detail: 'Docker daemon is not reachable.' });
     expect(r.ready).toBe(false);
     expect(r.steps.some((s) => s.id === 'coordinator')).toBe(false);
@@ -354,7 +313,7 @@ describe('minions setup', () => {
     const repo = makeRepo(env.root);
     const rt = fakeRuntime();
     rt.runtime.kind = async () => 'host';
-    const r = await runSetup({ path: repo, yes: true, runtime: rt.runtime, dockerProbe: dockerUp, tokens: { telegram: TG_TOKEN } });
+    const r = await runSetup({ mode: 'independent', path: repo, yes: true, runtime: rt.runtime, dockerProbe: dockerUp, tokens: { telegram: TG_TOKEN } });
     expect(step(r, 'telegram')).toMatchObject({ status: 'skipped', detail: expect.stringContaining('host runtime has no Telegram') });
     expect(await readTelegramToken(r.projectId)).toBeNull();
     expect(r.pairing).toEqual([]);

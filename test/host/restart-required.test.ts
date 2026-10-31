@@ -177,7 +177,7 @@ describe('checkRestartRequired', () => {
 describe('doctor and status integration', () => {
   it('doctor reports the restart check and restartRequired (--json data); never a FAIL', async () => {
     const repo = makeRepo(env.root);
-    await runInit({ path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
+    await runInit({ mode: 'independent', path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
     const { projectId } = await projectForPath(repo);
     const base = world(projectId);
     let r = await runDoctor({ cwd: repo, probe: dockerUp, runner: fakeDocker(base), fingerprint: FP, version: HOST_VERSION });
@@ -203,7 +203,7 @@ describe('doctor and status integration', () => {
 
   it('doctor with Docker unavailable reports unknown', async () => {
     const repo = makeRepo(env.root);
-    await runInit({ path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
+    await runInit({ mode: 'independent', path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
     const { dockerDown } = await import('./fixtures.js');
     const r = await runDoctor({ cwd: repo, probe: dockerDown, runner: fakeDocker(world('x')), fingerprint: FP, version: HOST_VERSION });
     expect(r.restartRequired).toMatchObject({ state: 'unknown', detail: 'Docker unavailable' });
@@ -212,7 +212,7 @@ describe('doctor and status integration', () => {
 
   it('host status merges the container status with restartRequired', async () => {
     const repo = makeRepo(env.root);
-    await runInit({ path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
+    await runInit({ mode: 'independent', path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
     const { projectId } = await projectForPath(repo);
     const h = await hostStatus({ cwd: repo, runner: fakeDocker(world(projectId, { containerLabel: 'old' })), fingerprint: FP, version: HOST_VERSION });
     expect(h.kind).toBe('report');

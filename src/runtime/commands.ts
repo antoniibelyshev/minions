@@ -341,7 +341,7 @@ export interface StatusReport {
   /** The last drain notice the worker hook delivered (task-3.10): proof the '*' PreToolUse hook fired in a subagent with agent_id/agent_type. */
   lastDrainNotice?: DrainNotice | null;
   configRevision: number;
-  profile: string;
+  mode: string;
   queue: Record<string, number>;
   activeLeases: Pick<Lease, 'id' | 'task_id' | 'role' | 'attempt' | 'branch' | 'worktree' | 'head_sha' | 'started_at'>[];
   /** byRole: lease usage per worker role (`limited` = an execution.maxByRole / maxEngineers limit applies). */
@@ -400,7 +400,7 @@ export async function collectStatus(deps: { db: RuntimeDb; config: MinionsConfig
   const { db: d, config: cfg } = deps;
   const leases = d.activeLeases();
   const report: StatusReport = {
-    paused: d.paused(), pauseChanges: d.pauseChanges(), draining: d.drain(), configRevision: cfg.configRevision, profile: cfg.profile,
+    paused: d.paused(), pauseChanges: d.pauseChanges(), draining: d.drain(), configRevision: cfg.configRevision, mode: cfg.mode,
     queue: {}, capacity: null,
     activeLeases: leases.map((l) => ({ id: l.id, task_id: l.task_id, role: l.role, attempt: l.attempt, branch: l.branch, worktree: l.worktree, head_sha: l.head_sha, started_at: l.started_at })),
     guard: { lastReason: d.guard().last_reason, updatedAt: d.guard().updated_at },
@@ -443,7 +443,7 @@ function roleCapacityLine(c: NonNullable<StatusReport['capacity']>): string {
 
 export function humanStatus(s: StatusReport): string {
   const out = [
-    `config revision ${s.configRevision}  profile ${s.profile}`,
+    `config revision ${s.configRevision}  mode ${s.mode}`,
     `paused: intake=${s.paused.intake} starts=${s.paused.starts}`,
     ...(s.draining ? [`draining: ${s.draining.reason} since ${s.draining.requestedAt} (${s.activeLeases.length} lease(s) winding down)`] : []),
     ...(s.lastDrainNotice ? [`last drain notice: ${s.lastDrainNotice.at} to ${s.lastDrainNotice.agentType} ${s.lastDrainNotice.agentId} (lease ${s.lastDrainNotice.leaseId}, ${s.lastDrainNotice.taskId ?? '-'}, drain event ${s.lastDrainNotice.eventId}, via ${s.lastDrainNotice.via})`] : []),

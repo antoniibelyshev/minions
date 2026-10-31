@@ -23,6 +23,7 @@ import {
   type ChannelServerLaunch, type HostChannelServerReport,
 } from '../telegram/channel/launch.js';
 import { LAUNCH_ENV, readChannelLock, TOKEN_FILE_ENV } from '../telegram/channel/server.js';
+import { seedOwnerAccess } from '../telegram/channel/access-cli.js';
 import { runtimePaths, type RuntimePaths } from './paths.js';
 import { claudePermissionModes, parsePermissionModes, strictPermissionModeArg } from './permission-modes.js';
 import { openDb, pidAlive, type CoordinatorLock, type RuntimeDb } from './db.js';
@@ -786,8 +787,12 @@ export async function runCoordinator(cfg: MinionsConfig, deps: RunCoordinatorDep
   const decision = decideTelegram(cfg, token, probe);
   // Intended Telegram (telegram, or auto with a token) says why it is off; auto without a token is plain terminal mode.
   const intended = resolveChannel(cfg.communication.channel, runtimeChannelFacts(cfg, token, probe)).wantsTelegram;
-  if (decision.enabled) log(`minions: ${decision.reason}`);
-  else if (intended) log(`minions: Telegram disabled for this session: ${decision.reason}. Terminal mode is active.`);
+  if (decision.enabled) {
+    log(`minions: ${decision.reason}`);
+    if (await seedOwnerAccess(paths.telegramStateDir, join(dirname(paths.configJson), 'project.json')).catch(() => false)) {
+      log('minions: Telegram access allowlisted to the owner from `minions defaults` (no pairing needed).');
+    }
+  } else if (intended) log(`minions: Telegram disabled for this session: ${decision.reason}. Terminal mode is active.`);
   else if (cfg.communication.channel === 'auto') log(`minions: terminal mode (${decision.reason}).`);
   // Auto mode only where this Claude Code offers it; otherwise acceptEdits with a clear message. The
   // strict mode (host runtime, legacy "default") is passed under the name this Claude Code lists.

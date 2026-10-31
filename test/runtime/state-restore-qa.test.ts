@@ -19,7 +19,7 @@ beforeAll(() => {
   root = tmp('minions-restore-qa-');
   mkdirSync(join(root, 'state'), { recursive: true });
   mkdirSync(join(root, 'secrets'), { recursive: true });
-  writeFileSync(join(root, 'config.json'), JSON.stringify(defaults('project-owner')));
+  writeFileSync(join(root, 'config.json'), JSON.stringify(defaults('independent')));
   process.env.MINIONS_RUNTIME = 'container';
   process.env.MINIONS_STATE_DIR = join(root, 'state');
   process.env.MINIONS_SECRETS_DIR = join(root, 'secrets');

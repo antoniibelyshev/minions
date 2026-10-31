@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { profileDefaults } from '../src/config/profiles.js';
+import { modeDefaults } from '../src/config/modes.js';
 import { applyControl, resolve, validateConfig } from '../src/config/resolve.js';
 import { CAPABILITIES } from '../src/config/schema.js';
 import { MinionsError } from '../src/core/errors.js';
@@ -10,53 +10,61 @@ const fail = (fn: () => unknown): MinionsError => {
   throw new Error('expected a MinionsError');
 };
 
-describe('profiles', () => {
-  it('project-owner yields documented explicit defaults', () => {
-    const { config: c, notes } = profileDefaults('project-owner', ctx);
+describe('modes', () => {
+  it('independent yields documented explicit defaults', () => {
+    const c = modeDefaults('independent', ctx);
     expect(validateConfig(c)).toEqual(c);
     expect(c).toMatchObject({
       schemaVersion: 1, configRevision: 1, projectId: ctx.projectId, packageVersion: '0.1.0',
-      profile: 'project-owner', visibility: 'shared', architecture: 'decide',
+      mode: 'independent', visibility: 'shared', architecture: 'decide',
       backlog: { backend: 'backlogmd', ownership: 'direct' },
       intake: { sources: ['user', 'milestone'], startReady: true },
-      delivery: { merge: 'disabled' },
+      delivery: { merge: 'auto-when-eligible' },
+      communication: { channel: 'auto' },
+      budgets: { dailyUsd: 20, taskUsd: 5 },
       container: { mountDockerSocket: false, mountHostRepository: false, cpus: 4, memoryMiB: 6144, pidsLimit: 512 },
-      execution: { maxActiveTasks: 2, maxEngineers: 2 },
+      execution: { maxActiveTasks: 3, maxEngineers: 2 },
+      coordinator: { sessions: { enabled: true, threads: true } },
+      routine: { enabled: true, digestAt: ['09:00'] },
       git: { baseBranch: 'main', identity: ctx.identity },
     });
     // The coordinator permission mode is left unset: auto by default (opt-out: coordinator.permissionMode).
     expect(c).not.toHaveProperty('permissionMode');
-    // Routine context resets are on by default with coordinator.contextReset unset (task-45).
-    expect(c).not.toHaveProperty('coordinator');
     expect(Object.keys(c.capabilities).sort()).toEqual([...CAPABILITIES].sort());
-    expect(c.capabilities['base.merge']).toBe('allow');
-    expect(c.capabilities['ci.edit']).toBe('ask');
-    expect(c.capabilities['deploy.execute']).toBe('deny');
-    expect(c.sensitivePaths).toContain('.github/workflows/**');
-    expect(notes).toEqual([]);
-  });
-
-  it('personal-work yields documented explicit defaults', () => {
-    const { config: c, notes } = profileDefaults('personal-work', ctx);
-    validateConfig(c);
-    expect(c).toMatchObject({ visibility: 'private', architecture: 'propose', backlog: { backend: 'backlogmd', ownership: 'personal' },
-      intake: { sources: ['user', 'external'], startReady: true }, delivery: { merge: 'disabled' } });
-    for (const k of ['external.comment', 'external.changeStatus', 'external.create', 'ci.edit', 'deploy.execute'] as const)
-      expect(c.capabilities[k]).toBe('deny');
-    expect(c.capabilities['external.read']).toBe('allow');
-    expect(c.capabilities['base.merge']).toBe('ask');
-    expect(notes).toEqual([]);
+    for (const cap of CAPABILITIES) {
+      const r = c.capabilities[cap];
+      expect(typeof r === 'string' ? r : r.effect).toBe(cap === 'deploy.execute' ? 'deny' : 'allow');
+    }
+    expect(c.capabilities['code.edit']).toEqual({ effect: 'allow', rules: [{ effect: 'deny', roles: ['reviewer'] }] });
+    expect(c.sensitivePaths).toEqual(['.claude/**', '.minions/**', 'CLAUDE.md', 'AGENTS.md', '.githooks/**', '.husky/**', '.github/workflows/**']);
   });
 
   it('supervised yields documented explicit defaults', () => {
-    const { config: c, notes } = profileDefaults('supervised', ctx);
+    const c = modeDefaults('supervised', ctx);
     validateConfig(c);
-    expect(c).toMatchObject({ visibility: 'private', architecture: 'propose', backlog: { ownership: 'assigned' },
-      intake: { sources: ['user'], startReady: false }, execution: { maxActiveTasks: 1, maxEngineers: 1 },
-      delivery: { merge: 'disabled' } });
+    expect(c).toMatchObject({ mode: 'supervised', visibility: 'private', architecture: 'propose', intake: { startReady: true },
+      execution: { maxActiveTasks: 2, maxEngineers: 1 }, delivery: { merge: 'disabled' }, communication: { channel: 'terminal' },
+      budgets: { dailyUsd: null, taskUsd: null } });
+    expect(c).not.toHaveProperty('coordinator');
+    expect(c).not.toHaveProperty('routine');
     expect(c.capabilities['base.merge']).toBe('deny');
+    expect(c.capabilities['ci.edit']).toBe('allow');
     expect(c.capabilities['deploy.execute']).toBe('deny');
-    expect(notes).toEqual([]);
+    expect(c.sensitivePaths).toContain('**/migrations/**');
+  });
+
+  it('loads configs written with the old profiles: profile becomes mode, external.* capabilities are dropped', () => {
+    const { mode: _m, ...raw } = defaults();
+    for (const [profile, mode] of [['project-owner', 'independent'], ['personal-work', 'supervised'], ['supervised', 'supervised']] as const) {
+      const old = { ...raw, profile, capabilities: { ...raw.capabilities, 'external.read': 'allow', 'external.comment': 'ask', 'external.changeStatus': 'deny', 'external.create': 'ask' } };
+      const c = validateConfig(old);
+      expect(c.mode).toBe(mode);
+      expect(c).not.toHaveProperty('profile');
+      expect(Object.keys(c.capabilities).some((k) => k.startsWith('external.'))).toBe(false);
+    }
+    // An explicit mode wins over a leftover profile.
+    expect(validateConfig({ ...raw, mode: 'supervised', profile: 'project-owner' }).mode).toBe('supervised');
+    expect(fail(() => validateConfig({ ...raw, profile: 'other' })).message).toContain('mode');
   });
 });
 
@@ -79,8 +87,8 @@ describe('validation', () => {
   });
 
   it('validates communication.progress (reporting level) and defaults it to feature-level milestones', () => {
-    for (const p of ['project-owner', 'personal-work', 'supervised'] as const) {
-      expect(profileDefaults(p, ctx).config.communication.progress).toBe('milestones');
+    for (const p of ['independent', 'supervised'] as const) {
+      expect(modeDefaults(p, ctx).communication.progress).toBe('milestones');
     }
     const d = defaults();
     for (const progress of ['milestones', 'tasks', 'quiet']) {
@@ -96,7 +104,7 @@ describe('validation', () => {
   });
 
   it.each([
-    [{ execution: { maxEngineers: 3 } }, 'execution.maxEngineers'],
+    [{ execution: { maxEngineers: 4 } }, 'execution.maxEngineers'],
     [{ models: { default: 'gpt' } }, 'models.default'],
     [{ container: { mountDockerSocket: true } }, 'container.mountDockerSocket'],
     [{ container: { mountHostRepository: true } }, 'container.mountHostRepository'],

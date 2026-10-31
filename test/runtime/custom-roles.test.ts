@@ -69,7 +69,7 @@ async function stageIn(e: Env, id: string, role: string, files: string[] = [], o
 describe('config: the test roles and workflows are valid, reserved names', () => {
   it('validates ROLES and WORKFLOWS under the project-owner defaults', async () => {
     const { defaults } = await import('../helpers.js');
-    expect(() => validateConfig({ ...defaults('project-owner'), roles: ROLES, workflows: WORKFLOWS })).not.toThrow();
+    expect(() => validateConfig({ ...defaults('independent'), roles: ROLES, workflows: WORKFLOWS })).not.toThrow();
   });
 
   it('reserves the runtime evidence kinds "check" and "ci-gate" as role names (33.3 review nit)', () => {

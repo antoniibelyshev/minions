@@ -98,7 +98,7 @@ const container = (dfOut: RunResult, calls: string[][]) => async (cmd: string, a
 describe('runDoctor: /tmp usage in the running container', () => {
   it('runs df on /tmp and the scratch dir in the container and warns on high /tmp usage', async () => {
     const repo = makeRepo(env.root);
-    await runInit({ path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
+    await runInit({ mode: 'independent', path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
     const calls: string[][] = [];
     const check = async (out: RunResult) => (await runDoctor({ cwd: repo, probe: dockerUp, runner: container(out, calls) })).checks.filter((c) => c.name.startsWith('container.'));
 
@@ -113,7 +113,7 @@ describe('runDoctor: /tmp usage in the running container', () => {
 
   it('lists container.tmp and container.scratch as skipped when the container is not running', async () => {
     const repo = makeRepo(env.root);
-    await runInit({ path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
+    await runInit({ mode: 'independent', path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
     const down = async (cmd: string, args: string[], _o?: RunOptions): Promise<RunResult> => {
       const a = args.join(' ');
       if (cmd === 'docker' && a.startsWith('image inspect')) return { code: 0, stdout: 'x\n', stderr: '' };

@@ -47,7 +47,7 @@ const fail = (stderr = 'unavailable', code = 1): RunResult => ({ code, stdout: '
 
 const STATUS_DATA = {
   paused: { intake: false, starts: true }, activeLeases: [], queue: { 'To Do': 2 }, guard: { lastReason: null },
-  configRevision: 3, profile: 'project-owner', capacity: null, coordinatorLock: null,
+  configRevision: 3, mode: 'independent', capacity: null, coordinatorLock: null,
 };
 
 interface World {
@@ -218,7 +218,7 @@ describe('doctor restart check never fails', () => {
 
   it('doctor health is the same whether or not a restart is required', async () => {
     const repo = makeRepo(env.root);
-    await runInit({ path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
+    await runInit({ mode: 'independent', path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
     const { projectId } = await projectForPath(repo);
     const base = await runDoctor({ cwd: repo, probe: dockerUp, runner: fakeDocker(world(projectId)), fingerprint: FP, version: HOST_VERSION });
     const stale = await runDoctor({ cwd: repo, probe: dockerUp, fingerprint: FP, version: HOST_VERSION,
@@ -236,7 +236,7 @@ describe('doctor restart check never fails', () => {
 
   it('host runtime: restart check is not applicable', async () => {
     const repo = makeRepo(env.root);
-    await runInit({ path: repo, yes: true, visibility: 'private', runtime: 'host', dockerProbe: dockerDown });
+    await runInit({ mode: 'independent', path: repo, yes: true, visibility: 'private', runtime: 'host', dockerProbe: dockerDown });
     const r = await runDoctor({ cwd: repo, probe: dockerDown, runner: async () => fail('not found', 127) });
     expect(r.restartRequired.state).toBe('not-applicable');
     expect(r.checks.find((c) => c.name === 'restart')?.status).toBe('unavailable');
@@ -246,7 +246,7 @@ describe('doctor restart check never fails', () => {
 describe('host status', () => {
   async function dockerProject() {
     const repo = makeRepo(env.root);
-    await runInit({ path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
+    await runInit({ mode: 'independent', path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
     const { projectId } = await projectForPath(repo);
     return { repo, projectId };
   }
@@ -293,7 +293,7 @@ describe('host status', () => {
 
   it('host runtime delegates unchanged', async () => {
     const repo = makeRepo(env.root);
-    await runInit({ path: repo, yes: true, visibility: 'private', runtime: 'host', dockerProbe: dockerDown });
+    await runInit({ mode: 'independent', path: repo, yes: true, visibility: 'private', runtime: 'host', dockerProbe: dockerDown });
     const h = await hostStatus({ cwd: repo, runner: async () => { throw new Error('must not run docker'); } });
     expect(h).toEqual({ kind: 'delegate' });
   });
@@ -307,7 +307,7 @@ describe('host status', () => {
     // Older image without coordinatorLaunch: the CLI version mismatch explains it; no extra unchecked entry.
     expect(h.restartRequired).toMatchObject({ state: 'required', unchecked: [], reasons: [expect.objectContaining({ kind: 'cli-version' })] });
     const text = [humanStatus(h.status as unknown as StatusReport), ...formatRestartRequired(h.restartRequired)].join('\n');
-    expect(text).toContain('config revision 3  profile project-owner');
+    expect(text).toContain('config revision 3  mode independent');
     expect(text).toContain('paused: intake=false starts=true');
     expect(text).toContain('queue: To Do=2');
     expect(text).toContain('restart required (run `minions upgrade`):');

@@ -141,7 +141,7 @@ describe('policy columns', () => {
 
   it('gives project roles the base effect, D8 default denies and edits/commits-derived columns', () => {
     const cfg = withRoles({ researcher, judge: { description: 'j', promptText: 'x', contract: 'gate' } });
-    expect(CUSTOM_ROLE_DENY_BY_DEFAULT).toEqual(['external.read', 'external.comment', 'external.changeStatus', 'external.create', 'base.merge', 'ci.edit', 'infrastructure.edit', 'deploy.execute']);
+    expect(CUSTOM_ROLE_DENY_BY_DEFAULT).toEqual(['base.merge', 'ci.edit', 'infrastructure.edit', 'deploy.execute']);
     for (const c of CUSTOM_ROLE_DENY_BY_DEFAULT) expect(can(cfg, c, { role: 'researcher' }), c).toBe('deny');
     expect(can(cfg, 'task.read', { role: 'researcher' })).toBe('allow');
     expect(can(cfg, 'network.use', { role: 'researcher' })).toBe('allow');
@@ -154,10 +154,10 @@ describe('policy columns', () => {
   });
 
   it('applies explicit column entries like hand-written sub-rules; a base deny still wins', () => {
-    const cfg = withRoles({ researcher: { ...researcher, capabilities: { 'infrastructure.edit': 'deny', 'external.read': 'allow', 'base.merge': 'allow', 'deploy.execute': 'allow', 'code.edit': 'allow' } },
+    const cfg = withRoles({ researcher: { ...researcher, capabilities: { 'infrastructure.edit': 'deny', 'migrations.edit': 'allow', 'base.merge': 'allow', 'deploy.execute': 'allow', 'code.edit': 'allow' } },
       notes: { description: 'n', promptText: 'x', contract: 'producer', capabilities: { 'code.edit': 'allow' } } });
     expect(can(cfg, 'infrastructure.edit', { role: 'researcher' })).toBe('deny');
-    expect(can(cfg, 'external.read', { role: 'researcher' })).toBe('allow');
+    expect(can(cfg, 'migrations.edit', { role: 'researcher' })).toBe('allow');
     expect(can(cfg, 'base.merge', { role: 'researcher' })).toBe('allow');
     expect(can(cfg, 'base.merge', { role: 'researcher', paths: ['.github/workflows/ci.yml'] })).toBe('ask');
     expect(can(cfg, 'deploy.execute', { role: 'researcher' })).toBe('deny');
@@ -177,8 +177,8 @@ describe('policy columns', () => {
     const d = defaults();
     const project = { roles: { researcher }, capabilities: { 'infrastructure.edit': 'deny' } };
     expect(fail(() => resolve({ defaults: d, project, local: { capabilities: { 'infrastructure.edit': 'allow' } } })).code).toBe('POLICY_DENIED');
-    const roleDeny = { roles: { researcher: { ...researcher, capabilities: { 'external.read': 'deny' } } } };
-    const e2 = fail(() => resolve({ defaults: d, project: roleDeny, local: { roles: { researcher: { capabilities: { 'external.read': 'allow' } } } } }));
+    const roleDeny = { roles: { researcher: { ...researcher, capabilities: { 'network.use': 'deny' } } } };
+    const e2 = fail(() => resolve({ defaults: d, project: roleDeny, local: { roles: { researcher: { capabilities: { 'network.use': 'allow' } } } } }));
     expect(e2.code).toBe('POLICY_DENIED');
   });
 
@@ -236,8 +236,8 @@ describe('per-role capacity', () => {
     expect(issuesOf(() => validateConfig({ ...d, execution: exec(d, { maxByRole: { researcher: 1 } }) }))).toContain('execution.maxByRole.researcher');
     expect(issuesOf(() => validateConfig({ ...d, execution: exec(d, { maxByRole: { 'engineer-deep': 1 } }) }))).toContain('execution.maxByRole.engineer-deep');
     expect(issuesOf(() => validateConfig({ ...d, execution: exec(d, { maxByRole: { coordinator: 1 } }) }))).toContain('execution.maxByRole.coordinator');
-    expect(issuesOf(() => validateConfig({ ...d, execution: exec(d, { maxByRole: { tester: 3 } }) }))).toContain('must be <= execution.maxActiveTasks');
-    expect(issuesOf(() => validateConfig({ ...d, execution: exec(d, { maxEngineers: 3 }) }))).toContain('must be <= execution.maxActiveTasks');
+    expect(issuesOf(() => validateConfig({ ...d, execution: exec(d, { maxByRole: { tester: 4 } }) }))).toContain('must be <= execution.maxActiveTasks');
+    expect(issuesOf(() => validateConfig({ ...d, execution: exec(d, { maxEngineers: 4 }) }))).toContain('must be <= execution.maxActiveTasks');
     expect(() => withRoles({ researcher }, { execution: exec(d, { maxByRole: { researcher: 1 } }) as MinionsConfig['execution'] })).not.toThrow();
   });
 
@@ -256,7 +256,7 @@ describe('per-role capacity', () => {
     const r = resolve({ defaults: defaults(), local: { execution: { maxEngineers: 1 } } }).config;
     expect(r.execution.maxEngineers).toBe(1);
     expect(roleLimit(r, 'engineer')).toBe(1);
-    expect(fail(() => resolve({ defaults: defaults(), local: { execution: { maxEngineers: 3 } } })).code).toBe('INVALID_CONFIG');
+    expect(fail(() => resolve({ defaults: defaults(), local: { execution: { maxEngineers: 4 } } })).code).toBe('INVALID_CONFIG');
     const r3 = resolve({ defaults: defaults(), local: { execution: { maxActiveTasks: 3, maxEngineers: 3 } } }).config;
     expect(roleLimit(r3, 'engineer')).toBe(3);
   });
@@ -267,11 +267,11 @@ describe('per-role capacity', () => {
     const cap = capacityOf(cfg, [lease('a', 'engineer'), lease('b', 'researcher'), lease('c', 'tester')], []);
     expect(cap.byRole).toEqual({
       engineer: { active: 1, max: 2, free: 1, limited: true },
-      tester: { active: 1, max: 2, free: 1, limited: false },
-      reviewer: { active: 0, max: 2, free: 2, limited: false },
+      tester: { active: 1, max: 3, free: 2, limited: false },
+      reviewer: { active: 0, max: 3, free: 3, limited: false },
       researcher: { active: 1, max: 1, free: 0, limited: true },
     });
-    expect(cap).toMatchObject({ activeEngineers: 1, maxEngineers: 2, freeEngineerSlots: 1, maxActiveTasks: 2, freeTaskSlots: 0 });
+    expect(cap).toMatchObject({ activeEngineers: 1, maxEngineers: 2, freeEngineerSlots: 1, maxActiveTasks: 3, freeTaskSlots: 0 });
     const old = capacityOf(d, [lease('a', 'engineer'), lease('b', 'engineer')], []);
     expect(old).toMatchObject({ activeEngineers: 2, maxEngineers: 2, freeEngineerSlots: 0 });
     expect(Object.keys(old.byRole)).toEqual(['engineer', 'tester', 'reviewer']);
@@ -280,7 +280,7 @@ describe('per-role capacity', () => {
 
 describe('back-compat', () => {
   it('configs without roles validate unchanged', () => {
-    for (const p of ['project-owner', 'personal-work', 'supervised'] as const) {
+    for (const p of ['independent', 'supervised'] as const) {
       const d = defaults(p);
       expect(validateConfig(structuredClone(d))).toEqual(d);
       expect(d.roles).toBeUndefined();

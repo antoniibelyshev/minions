@@ -5,7 +5,7 @@ import { afterAll, describe, expect, it } from 'vitest';
 import type { Command } from 'commander';
 import { buildProgram } from '../src/program.js';
 import { generatePlugin } from '../src/plugin/generate.js';
-import { PROFILES } from '../src/config/schema.js';
+import { MODES } from '../src/config/schema.js';
 import {
   ADVANCED_COMMANDS, INTERNAL_COMMANDS, PRIMARY_COMMANDS, surfaceListing, tierOf,
 } from '../src/surface.js';
@@ -259,11 +259,11 @@ describe('back-compat: every `minions ...` call shipped to agents, hooks and ins
     expect(invocations('run `minions work record L1` then\n```sh\nminions backlog ready --json\n```')).toEqual([['work', 'record'], ['backlog', 'ready']]);
   });
 
-  it('generated plugin text (coordinator, agents, skills, hooks) for every profile', async () => {
+  it('generated plugin text (coordinator, agents, skills, hooks) for every mode', async () => {
     const found: string[][] = [];
-    for (const profile of PROFILES) {
+    for (const mode of MODES) {
       const out = await mkdtemp(join(tmpdir(), 'minions-surface-')); dirs.push(out);
-      await generatePlugin(defaults(profile), out);
+      await generatePlugin(defaults(mode), out);
       for (const text of await textFiles(out)) found.push(...invocations(text));
     }
     expect(found.map((i) => i[0])).toEqual(expect.arrayContaining(['work', 'backlog', 'hook', 'status']));
