@@ -96,9 +96,15 @@ const effectColumn = z.object(
   Object.fromEntries(CAPABILITIES.map((c) => [c, EffectSchema.optional()])) as Record<Capability, z.ZodOptional<typeof EffectSchema>>,
 ).strict();
 
-/** A project-defined worker role (D3). */
-/** A coordinator-stored secret's name (docs/design/autonomy.md Decision 4): an env variable name. */
+/** A worker env variable name (an owner secret or an `env` entry; docs/design/autonomy.md Decision 4). */
 export const SECRET_NAME = /^[A-Z][A-Z0-9_]{1,63}$/;
+/**
+ * Names a worker env entry may never set: minions' own variables, and those that change what a program runs or where
+ * it reads code and config (the worker's unsandboxed hooks inherit the env).
+ */
+export const RESERVED_ENV = /^(CLAUDE_|ANTHROPIC_|MINIONS_|TELEGRAM_|GIT_|GH_|SSH_|LD_|DYLD_|NODE_(?!ENV$)|NPM_CONFIG_|PYTHON|PERL|RUBY|XDG_|BASH|ZDOTDIR$|ENV$|SHELL|IFS$|PS4$|PROMPT_COMMAND$|PATH$|HOME$|TMPDIR$|USER$|LOGNAME$|(HTTPS?|ALL|NO|FTP)_PROXY$|SSL_CERT_|CURL_)/;
+
+/** A project-defined worker role (D3). */
 
 export const CustomRoleSchema = z.object({
   description: nonEmpty,
@@ -133,8 +139,6 @@ export const CustomRoleSchema = z.object({
    * nearest earlier producer stage that can commit. Checked by workflowConfigIssues (src/config/workflows.ts).
    */
   repairTo: nonEmpty.optional(),
-  /** Coordinator-stored secrets (`minions secrets set`) the dispatcher puts into this role's worker env, by name. */
-  secrets: z.array(z.string().regex(SECRET_NAME, 'must be an env-style secret name (A-Z, 0-9, _)')).max(20).optional(),
 }).strict();
 export type CustomRoleConfig = z.infer<typeof CustomRoleSchema>;
 
@@ -151,8 +155,6 @@ const builtinRoleOverride = {
   harness: z.enum(HARNESS_IDS).optional(),
   /** May only remove tools from the built-in definition. */
   tools: z.array(toolName).min(1).optional(),
-  /** Coordinator-stored secrets the dispatcher puts into this role's worker env, by name. */
-  secrets: z.array(z.string().regex(SECRET_NAME, 'must be an env-style secret name (A-Z, 0-9, _)')).max(20).optional(),
 };
 export const BuiltinRoleOverrideSchema = z.object(builtinRoleOverride).strict();
 export const EngineerRoleOverrideSchema = z.object({
@@ -471,6 +473,18 @@ export const MinionsConfigSchema = z.object({
     /** Seconds between dispatcher passes (default 10). */
     tickSeconds: z.number().int().min(2).max(600).optional(),
   }).strict().optional(),
+  /**
+   * Plain (non-secret) env variables of the dispatcher's workers, which the coordinator may change
+   * (docs/design/autonomy.md Decision 4). Visible in config and the journal: never a credential (those are owner secrets).
+   */
+  env: z.record(z.string(), z.string().max(4096).refine((v) => !v.includes('\0'), 'must not contain NUL')).superRefine((r, ctx) => {
+    const names = Object.keys(r);
+    if (names.length > 50) ctx.addIssue({ code: 'custom', message: 'at most 50 entries' });
+    for (const n of names) {
+      if (!SECRET_NAME.test(n)) ctx.addIssue({ code: 'custom', path: [n], message: 'must be an env variable name (A-Z, 0-9, _)' });
+      else if (RESERVED_ENV.test(n)) ctx.addIssue({ code: 'custom', path: [n], message: 'is reserved (minions sets it, or it changes what programs run)' });
+    }
+  }).optional(),
   /**
    * Legacy coordinator permission mode. Only "default" is still honoured (as a stricter choice) when
    * coordinator.permissionMode is unset; "acceptEdits" and "auto" mean the default (auto).

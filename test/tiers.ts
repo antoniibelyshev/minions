@@ -25,6 +25,7 @@ export const INTEGRATION_TESTS: readonly string[] = [
   'test/host/init-fixture.test.ts',
   'test/host/install-git.test.ts',
   'test/host/manager-approve.test.ts',
+  'test/host/repo-bootstrap.test.ts',
   'test/host/manager-assistant-chat.test.ts',
   'test/host/manager-assistant-context.test.ts',
   'test/host/manager-assistant.test.ts',

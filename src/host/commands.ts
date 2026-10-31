@@ -41,6 +41,7 @@ import { readSecret, readlineIO } from './wizard.js';
 import { addListCommand, addSetCommand, defaultSettingsRuntime, registerSettings } from './settings-cli.js';
 import { runSettingsMenu, terminalMenuIO } from './settings-menu.js';
 import { registerRoles } from './roles-cli.js';
+import { registerSecrets } from './secrets-cli.js';
 import { initMayOfferAssistant, launchAssistant, loadAssistantContext, offerSetupAssistant, registerAssistant } from './assistant.js';
 
 const say = (json: boolean, msg: string) => { if (!json) process.stderr.write(msg + '\n'); };
@@ -849,6 +850,7 @@ export function register(program: Command): void {
 
   registerRuntime(program, { confirm, ask: askLine });
   registerChannel(program, { confirm: confirmOrNull });
+  registerSecrets(program);
   registerAssistant(registerGithubSetup(setupCmd));
 
   const settings = registerSettings(program, {

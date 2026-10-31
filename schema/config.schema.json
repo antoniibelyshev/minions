@@ -719,9 +719,6 @@
             "tools": {
               "$ref": "#/$defs/__schema15"
             },
-            "secrets": {
-              "$ref": "#/$defs/__schema17"
-            },
             "deepEffort": {
               "type": "string",
               "enum": [
@@ -736,10 +733,10 @@
           "additionalProperties": false
         },
         "tester": {
-          "$ref": "#/$defs/__schema19"
+          "$ref": "#/$defs/__schema17"
         },
         "reviewer": {
-          "$ref": "#/$defs/__schema19"
+          "$ref": "#/$defs/__schema17"
         }
       },
       "additionalProperties": {
@@ -947,13 +944,6 @@
           },
           "repairTo": {
             "$ref": "#/$defs/__schema0"
-          },
-          "secrets": {
-            "maxItems": 20,
-            "type": "array",
-            "items": {
-              "$ref": "#/$defs/__schema20"
-            }
           }
         },
         "required": [
@@ -972,7 +962,7 @@
         "minItems": 1,
         "type": "array",
         "items": {
-          "$ref": "#/$defs/__schema21"
+          "$ref": "#/$defs/__schema18"
         }
       }
     },
@@ -988,10 +978,10 @@
           ]
         },
         "codex": {
-          "$ref": "#/$defs/__schema22"
+          "$ref": "#/$defs/__schema19"
         },
         "junie": {
-          "$ref": "#/$defs/__schema22"
+          "$ref": "#/$defs/__schema19"
         },
         "network": {
           "type": "object",
@@ -1183,7 +1173,7 @@
           "maxItems": 4,
           "type": "array",
           "items": {
-            "$ref": "#/$defs/__schema23"
+            "$ref": "#/$defs/__schema20"
           }
         },
         "timezone": {
@@ -1222,6 +1212,15 @@
         }
       },
       "additionalProperties": false
+    },
+    "env": {
+      "type": "object",
+      "propertyNames": {
+        "$ref": "#/$defs/__schema21"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/__schema22"
+      }
     },
     "permissionMode": {
       "type": "string",
@@ -1388,17 +1387,6 @@
       "pattern": "^[A-Za-z0-9_*()-]+$"
     },
     "__schema17": {
-      "maxItems": 20,
-      "type": "array",
-      "items": {
-        "$ref": "#/$defs/__schema18"
-      }
-    },
-    "__schema18": {
-      "type": "string",
-      "pattern": "^[A-Z][A-Z0-9_]{1,63}$"
-    },
-    "__schema19": {
       "type": "object",
       "properties": {
         "promptAppend": {
@@ -1421,18 +1409,11 @@
         },
         "tools": {
           "$ref": "#/$defs/__schema15"
-        },
-        "secrets": {
-          "$ref": "#/$defs/__schema17"
         }
       },
       "additionalProperties": false
     },
-    "__schema20": {
-      "type": "string",
-      "pattern": "^[A-Z][A-Z0-9_]{1,63}$"
-    },
-    "__schema21": {
+    "__schema18": {
       "anyOf": [
         {
           "$ref": "#/$defs/__schema0"
@@ -1460,7 +1441,7 @@
         }
       ]
     },
-    "__schema22": {
+    "__schema19": {
       "type": "object",
       "properties": {
         "models": {
@@ -1504,9 +1485,16 @@
       ],
       "additionalProperties": false
     },
-    "__schema23": {
+    "__schema20": {
       "type": "string",
       "pattern": "^(?:[01]\\d|2[0-3]):[0-5]\\d$"
+    },
+    "__schema21": {
+      "type": "string"
+    },
+    "__schema22": {
+      "type": "string",
+      "maxLength": 4096
     }
   }
 }

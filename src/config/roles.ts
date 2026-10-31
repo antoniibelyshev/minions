@@ -86,8 +86,6 @@ export interface RoleDef {
   /** Prompt source: a file relative to the config dir and/or inline text (project roles), or the D9 append (built-ins). */
   prompt?: string;
   promptText?: string;
-  /** Coordinator-stored secrets the dispatcher puts into the worker env (docs/design/autonomy.md Decision 4). */
-  secrets: string[];
 }
 
 type RolesCfg = Partial<Pick<MinionsConfig, 'roles' | 'harnesses'>>;
@@ -122,7 +120,7 @@ function builtinDef(cfg: DefCfg, name: BuiltinWorkerRole): RoleDef {
     maxTurns: o?.maxTurns ?? cfg.execution.attemptMaxTurns,
     deepVariant: name === ENGINEER_ROLE,
     harness: resolveRoleHarness(cfg, { contract: BUILTIN_DEFS[name].contract, builtin: true, ...(o?.harness ? { harness: o.harness } : {}) }),
-    requires: [], capabilities: {}, secrets: [...(o?.secrets ?? [])],
+    requires: [], capabilities: {},
     ...(o?.prompt ? { prompt: o.prompt } : {}),
     ...(o?.promptAppend ? { promptText: o.promptAppend } : {}),
   };
@@ -144,7 +142,6 @@ function customDef(cfg: DefCfg, name: string, r: CustomRoleConfig): RoleDef {
     harness: resolveRoleHarness(cfg, { contract: r.contract, builtin: false, ...(r.harness ? { harness: r.harness } : {}) }),
     requires: [...(r.requires ?? [])],
     capabilities: { ...(r.capabilities ?? {}) },
-    secrets: [...(r.secrets ?? [])],
     ...(r.prompt ? { prompt: r.prompt } : {}),
     ...(r.promptText ? { promptText: r.promptText } : {}),
   };

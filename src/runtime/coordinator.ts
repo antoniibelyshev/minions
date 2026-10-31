@@ -227,6 +227,8 @@ export function hostSettings(h: HostHardening): { sandbox: Record<string, unknow
   for (const o of h.otherProjects ?? []) readEdit(ruleAbs(o));
   const secretsAbs = ruleAbs(h.secretsDir);
   for (const f of ['anthropic-api-key', 'telegram-bot-token', CLAUDE_HEADLESS_TOKEN_FILE]) deny.push(`Read(${secretsAbs}/${f})`);
+  // Owner secrets (docs/design/autonomy.md Decision 4): only the unsandboxed dispatcher reads them.
+  readEdit(`${secretsAbs}/env`);
   // File globs only (`*.json`): a directory-matching wildcard would also become a sandbox write deny of its contents.
   if (root) deny.push(`Read(${ruleAbs(root)}/*.json)`, `Edit(${ruleAbs(root)}/*.json)`);
   // Host manager state (owner pairing, token reference, journal): the directory rule is also a sandbox write deny.
@@ -265,7 +267,7 @@ export function hostSettings(h: HostHardening): { sandbox: Record<string, unknow
         // The whole data root is unreadable; the agent's own dirs, the shim, its config/plugin and the
         // GitHub token (read by the git credential helper / gh wrapper inside the sandbox) are re-opened.
         denyRead: [...secretHome, ...(root ? [root] : []), h.credentialsDir, join(h.secretsDir, 'anthropic-api-key'), join(h.secretsDir, 'telegram-bot-token'), join(h.secretsDir, CLAUDE_HEADLESS_TOKEN_FILE),
-          ...tmuxDirs],
+          join(h.secretsDir, 'env'), ...tmuxDirs],
         allowRead: [...new Set([h.workspace, h.state, join(h.projectDir, 'host', 'bin'), join(h.projectDir, 'runtime'), pluginDir,
           join(h.secretsDir, 'github-token'), ...(h.readable ?? [])])],
       },
@@ -292,6 +294,15 @@ const UNSAFE_COMMAND = /[*?;&|`$<>(){}\[\]\\!#~'"\n\r]/;
 export function containerStateDenies(state: string): string[] {
   const s = ruleAbs(state);
   return [`Edit(${s}/minions.db)`, `Edit(${s}/minions.db-*)`, ...['backlog', 'briefs', 'results', 'run'].flatMap((d) => [`Edit(${s}/${d})`, `Edit(${s}/${d}/**)`])];
+}
+
+/**
+ * Container runtime: the owner secrets (docs/design/autonomy.md Decision 4) for the file tools; only the dispatcher reads
+ * them. The host runtime denies them in hostSettings (there the sandbox also covers Bash).
+ */
+export function ownerSecretDenies(secretsDir: string): string[] {
+  const d = `${ruleAbs(secretsDir)}/env`;
+  return [`Read(${d})`, `Read(${d}/**)`, `Edit(${d})`, `Edit(${d}/**)`];
 }
 
 /** Programs whose allow rule would allow anything (shells, wrappers, credential and network CLIs). */
@@ -353,7 +364,7 @@ export function coordinatorSettings(cfg: MinionsConfig, opts: { telegram?: boole
         ...APPROVE_RULES,
         // Host runtime: pairing is the owner's terminal step (`minions telegram access`), never the coordinator's.
         ...(hs ? TELEGRAM_ACCESS_RULES : []),
-        ...(hs ? hs.deny : containerStateDenies(runtimePaths().state))],
+        ...(hs ? hs.deny : [...containerStateDenies(runtimePaths().state), ...ownerSecretDenies(runtimePaths().secretsDir)])],
       // bypassPermissions is the owner's explicit choice (config.local.json only); otherwise it stays off.
       ...(bypass ? {} : { disableBypassPermissionsMode: 'disable' }),
       ...(sandboxed ? { blockReadsOutsideWorkingDirectories: true } : {}),

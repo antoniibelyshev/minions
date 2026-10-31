@@ -78,7 +78,7 @@ export function readJournal(state: string): JournalEntry[] {
     if ((e as NodeJS.ErrnoException).code === 'ENOENT') return [];
     throw e;
   }
-  // Secret changes share the file (src/runtime/secrets.ts) without a revision or a snapshot: not control entries.
+  // Only entries with a revision and a snapshot are control changes (a torn or foreign line is skipped).
   return text.split('\n').filter(Boolean).flatMap((l) => { try { return [JSON.parse(l) as JournalEntry]; } catch { return []; } })
     .filter((e) => Number.isInteger(e.revision) && isObj(e.before));
 }

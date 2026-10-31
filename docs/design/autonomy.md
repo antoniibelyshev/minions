@@ -7,7 +7,7 @@ Owner direction (2026-10-31, after a minions-on-minions run was too slow and too
 
 1. **Automatic flow.** Tasks move between dev, review and merge without the coordinator on a normal day. The
    coordinator is needed only for exceptions.
-2. **The coordinator has full control.** It sets up projects, stores secrets, defines worker profiles (roles) and
+2. **The coordinator has full control.** It sets up projects, uses the owner's secrets, defines worker profiles (roles) and
    flows (workflows), assigns a flow per task with a default for the rest, and changes any of it live: "remove the
    tester from the flow" takes effect on the next stage, without a restart and without the owner.
 3. **Telegram: threads and polls.** Replies carry their context to the coordinator, the coordinator answers in the
@@ -24,10 +24,10 @@ therefore comes from an audit trail, undo and notices, not from owner confirmati
 | - | - | - |
 | 1 | Autopilot dispatcher: deterministic stage loop with headless workers | built (`dispatch.mode` defaults to `coordinator` until the live check) |
 | 2 | Control layer, flows with `ci` / `merge` ends, live workflow edits mid-flight | built |
-| 3 | Secrets the coordinator stores, injected into the roles that declare them | built (`verification.secrets` for the integrator: not yet) |
+| 3 | Owner secrets granted per role, and the coordinator's plain `env` | built (`verification.secrets` for the integrator: not yet) |
 | 4 | Telegram: reply context end to end, threaded replies, native polls | built |
 | 5 | Thread sessions: one coordinator session per Telegram thread | built |
-| 6 | Project setup by the coordinator (`minions projects create` from the runtime) | open |
+| 6 | New projects: `minions setup` in an empty directory creates the repository; the coordinator does the rest | built |
 
 Live check before `dispatch.mode` defaults to `auto` (the build had no real `claude -p` run): one headless worker
 under `--agent minions:engineer` loads the plugin agent, its hooks see `MINIONS_WORKER_LEASE`, `minions work submit`
@@ -131,15 +131,28 @@ profile defaults < project < local (host) < control (coordinator) < session
 - **Roles (worker profiles)** are config like any other key: `minions control set roles.researcher '{...}'` with an
   inline `promptText`. The `config roles propose/apply` flow stays for the host but is no longer needed.
 
-## Decision 4. Secrets
+## Decision 4. Owner secrets and the coordinator's env (revised 2026-10-31, owner)
 
-- `minions secrets set <NAME> [--stdin] --reason <text>` (runtime and host): stores a named secret in the project's
-  secret store `<state>/control/secrets/<NAME>` (0600, the dir 0700). `NAME` is `^[A-Z][A-Z0-9_]{1,63}$`. The value is
-  read from stdin only (never argv), never printed, never journaled (the journal stores its sha256 prefix).
-- `minions secrets list` (names, sizes, set time) and `minions secrets remove <NAME>`.
-- **Use:** a role declares `secrets: ["NPM_TOKEN"]`; the dispatcher puts them into that worker's env. Verification
-  commands of the integrator get `verification.secrets`. The coordinator never needs to read a value back.
-- Workers' existing guards already deny reads of the state dir.
+The first build let the coordinator store secrets itself. The owner wants secrets to be theirs only, with plain
+variables the agents may change kept apart:
+
+- **Secrets are set only on the host** (`minions secrets set <NAME> [--role <r>]...`, value from a hidden prompt or
+  `--stdin`; `grant` / `revoke` / `remove`). The value goes into `<project>/secrets/env/<NAME>` (the host-provisioned
+  secrets dir, mounted read-only into the container); a value-free manifest `<project>/runtime/secrets.json` holds the
+  grants. The coordinator lists names and grants (`minions secrets list`) and asks the owner for what it needs.
+- **A grant names worker roles**, not tasks: the dispatcher puts a secret into the env of each worker of a granted role
+  and of no one else. A granted secret without a value refuses the launch.
+- **Who can read a value.** Host runtime: the sandbox denies the secrets dir to every agent's Bash and the permission
+  rules deny it to the file tools; only the unsandboxed dispatcher reads it. Docker: the file tools are denied, but the
+  coordinator and workers share one uid, so a Bash read is not blocked (as for the other mounted tokens). In both, the
+  worker that receives a secret can read it: that is what it is for. A broker (a git credential helper, an auth proxy)
+  would keep a credential out of the worker's env; not built.
+- **A grant trusts the role.** The coordinator owns role prompts (Decision 3), so it can change what a granted role does
+  with the secret. Grant to roles whose use of it you accept.
+- **`env`** (config, live, coordinator-owned through `control`): plain variables of the dispatcher's claude workers,
+  visible in config and the journal. Names that minions sets or that change what programs run (`NODE_OPTIONS`,
+  `GIT_*`, `LD_*`, `PATH`, proxies, ...) are refused, because the workers' unsandboxed hooks inherit the env. Owner
+  secrets win over `env`; minions' own variables win over both. Process-harness workers get neither yet.
 
 ## Decision 5. Telegram threads and polls
 
@@ -177,13 +190,13 @@ Built on the minions channel server (src/telegram/channel, task-67), which the h
 
 ## Known limits (review of the build, 2026-10-31)
 
-- **Secrets and same-uid workers.** Workers run as the same user as the coordinator. The worker guards deny state-dir
-  references (and a headless worker's every Bash call now goes through the full guard), but a path the guard cannot
-  see (a glob, `/proc/<pid>/environ` of another worker) is not a hard boundary. On the host runtime the sandbox is the
-  boundary. A per-worker uid or a secret broker would close it.
+- **Secrets in Docker.** Workers run as the same user as the coordinator: a worker's env is readable through
+  `/proc/<pid>/environ`, and the secrets dir through a Bash path the guard cannot see. On the host runtime the
+  sandbox is the boundary for the files; whether sandboxed Bash can read a running worker's env (`ps eww <pid>`, same
+  uid) is not verified. A per-worker uid or a secret broker would close both.
 - **Secret values are not masked** in worker results or in the coordinator's view of them (the process runner masks
   its own). The worker log and config dir are removed when the lease ends.
-- **Process-harness roles** do not receive `roles.<role>.secrets` yet; such a launch is refused.
+- **Process-harness roles** do not receive owner secrets or `env` yet; a launch of a role with a grant is refused.
 - **`control undo`** restores the overlay snapshot from before a revision: later changes are reverted too, and the
   response lists every key it changes.
 - **`ci` marker**: landing already waits for CI where minions knows CI (PR required checks; the local integration

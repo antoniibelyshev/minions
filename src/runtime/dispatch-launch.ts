@@ -18,7 +18,6 @@ import { MinionsError } from '../core/errors.js';
 import { atomicWrite, ensureRealDir } from '../core/fsutil.js';
 import { CONTAINER } from '../core/paths.js';
 import { resolveOnPath } from '../host/auth.js';
-import { workerRole } from '../config/roles.js';
 import { generatePlugin } from '../plugin/generate.js';
 import { TELEGRAM_PLUGIN_ID } from '../telegram/probe.js';
 import { coordinatorSettings, effectivePermissionMode, runtimeAuthMethod, type HostHardening, type RuntimeAuthMethod } from './coordinator.js';
@@ -28,7 +27,7 @@ import { checkHeadlessArgs, credentialEnv, HEADLESS_DROP_ENV, prepareHeadlessCre
 import { WORKER_LEASE_ENV, WORKER_ROLE_ENV } from './hooks.js';
 import type { RuntimePaths } from './paths.js';
 import { DEFAULT_TIMING, supervise, type SpawnSpec, type StopReason } from './runner/supervise.js';
-import { secretEnv } from './secrets.js';
+import { readManifest, secretEnv, secretManifestPath } from './secrets.js';
 import { SESSION_ENV_ALLOW, SESSION_ENV_ALLOW_PREFIXES } from './sessions.js';
 
 /** Plugin dirs kept under <state>/run/dispatch/plugin (one per config the dispatcher has run workers with). */
@@ -100,14 +99,17 @@ export function workerEnv(base: NodeJS.ProcessEnv, configDir: string, cred: Head
   return Object.assign(env, credentialEnv(configDir, cred), { [WORKER_LEASE_ENV]: o.leaseId, [WORKER_ROLE_ENV]: o.role });
 }
 
+const roleSecrets = (paths: { secretsDir: string; configJson: string }, role: string) =>
+  secretEnv(paths.secretsDir, readManifest(secretManifestPath(paths.configJson)), role);
+
 /** The command of one worker (pure apart from the credential read, the config dir and the plugin render). */
 export async function buildWorkerCommand(i: LaunchInput, deps: WorkerLaunchDeps): Promise<WorkerCommand> {
   const env = deps.env ?? process.env;
   const { stage, claim, cfg } = i;
   if (!claim.worktree) throw new MinionsError('PRECONDITION', `Lease ${claim.leaseId} has no worktree.`);
   if (stage.launch.kind === 'run') {
-    if (workerRole(cfg, claim.role)?.secrets.length) {
-      throw new MinionsError('PRECONDITION', `${claim.role} runs on a process harness, which does not receive roles.${claim.role}.secrets yet.`, 'Run the role on claude, or drop its secrets.');
+    if (Object.keys(roleSecrets(deps.paths, claim.role)).length) {
+      throw new MinionsError('PRECONDITION', `${claim.role} runs on a process harness, which does not receive owner secrets yet.`, `Run the role on claude, or ask the owner to revoke its secrets (\`minions secrets revoke <NAME> --role ${claim.role}\`).`);
     }
     const bin = deps.minionsBin ?? await resolveOnPath('minions', env.PATH);
     if (!bin) throw new MinionsError('PRECONDITION', '`minions` is not on PATH.');
@@ -149,12 +151,12 @@ export async function buildWorkerCommand(i: LaunchInput, deps: WorkerLaunchDeps)
   await ensureRealDir(join(dispatchRunDir(deps.paths.state), 'config'), 0o700);
   await ensureRealDir(configDir, 0o700);
   await atomicWrite(join(configDir, 'settings.json'), JSON.stringify(plan.settings, null, 2) + '\n', { mode: 0o600 });
-  // The role's declared secrets (docs/design/autonomy.md Decision 4); a missing one refuses the launch.
-  const def = workerRole(cfg, claim.role);
-  const secrets = def?.secrets.length ? secretEnv(deps.paths.state, def.secrets) : {};
+  // The coordinator's plain `env`, then the owner secrets granted to the role (docs/design/autonomy.md Decision 4); a
+  // granted secret without a value refuses the launch. minions' own variables win over both.
+  const secrets = roleSecrets(deps.paths, claim.role);
   return {
     kind: 'claude', argv: [bin, ...args], cwd: claim.worktree,
-    env: { ...secrets, ...workerEnv(env, configDir, plan.cred, { leaseId: claim.leaseId, role: claim.role, tmp: deps.paths.tmp, ...(claim.scratchDir ? { scratchDir: claim.scratchDir } : {}) }) },
+    env: { ...(cfg.env ?? {}), ...secrets, ...workerEnv(env, configDir, plan.cred, { leaseId: claim.leaseId, role: claim.role, tmp: deps.paths.tmp, ...(claim.scratchDir ? { scratchDir: claim.scratchDir } : {}) }) },
     stdin: workerPrompt(claim, i.correction),
   };
 }

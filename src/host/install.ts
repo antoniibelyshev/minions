@@ -22,6 +22,7 @@ import { composeYaml, type Runner } from './docker.js';
 import { composeHint, daemonHint } from './linux-host.js';
 import { ProjectJsonSchema, loadEffectiveConfig, projectConfigPath, resolveEffective, runtimeProjectInfo, sharedConfigView, type ProjectJson } from './project.js';
 import { bindProject, gitCommonDir, loadRegistry, repoRoot, resolveIdentity, saveRegistry, sharedProjectId, type Identity, type Registry } from './registry.js';
+import { bootstrapRepo } from './repo-bootstrap.js';
 import { runWizard, type WizardIO } from './wizard.js';
 import { runGithubSetup, type GithubSetupResult } from './github-setup.js';
 import { HOST_CONFIRM_WORD, HOST_RUNTIME_SHORT, HOST_RUNTIME_WARNING, RUNTIMES, type RuntimeKind } from './runtime.js';
@@ -229,11 +230,12 @@ const isInside = (child: string, parent: string) => {
 
 async function prepare(opts: InitOptions, docker?: DockerStatus): Promise<Prepared> {
   if (!(await exists(opts.path))) throw new MinionsError('NOT_FOUND', `Path not found: ${opts.path}`);
+  const bootstrapped = await bootstrapRepo(opts.path, { dryRun: opts.dryRun, ...(opts.runner ? { runner: opts.runner } : {}) });
   const repoPath = await repoRoot(opts.path);
   const commonDir = await gitCommonDir(repoPath);
   const discovery = await discover(repoPath, opts.runner);
   const registry = await loadRegistry();
-  const notes: string[] = [];
+  const notes: string[] = [...bootstrapped];
   const warnings: string[] = [];
 
   const registered = Object.entries(registry.projects).find(([, e]) => e.gitCommonDir === commonDir);

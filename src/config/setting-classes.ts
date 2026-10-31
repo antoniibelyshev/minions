@@ -48,6 +48,7 @@ export const KEY_CLASSES: readonly KeyClass[] = [
   ...entries(['coordinator.sessions.max'], 'live', false, 'cap read by the session supervisor before it opens a session'),
   ...entries(['coordinator.sessions.threads', 'coordinator.sessions.threadIdleMinutes'], 'live', false, 'read by `coordinator route` and the session pass on each call'),
   ...entries(['dispatch'], 'live', false, 'the dispatcher re-reads it every pass (docs/design/autonomy.md Decision 1)'),
+  ...entries(['env'], 'live', false, 'the dispatcher puts it into each new worker env (docs/design/autonomy.md Decision 4)'),
   // ---- live, host-owned
   ...entries(['delivery.requiredChecksConfigured'], 'live', true,
     'the merge gate (autoMergeConfigReasons) reads it on each sync / publish; it gates what merges on GitHub (local delivery ignores it: the local integrator gates merges into the base)'),
