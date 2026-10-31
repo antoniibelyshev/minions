@@ -43,6 +43,7 @@ export function roleNameProblem(name: string): string | null {
   if (!ROLE_NAME_PATTERN.test(name)) return `role name must match ${ROLE_NAME_PATTERN.source}`;
   if (name === COORDINATOR_ROLE) return 'the coordinator is not a configurable role';
   if ((RESERVED_EVIDENCE_KINDS as readonly string[]).includes(name)) return `"${name}" is reserved (an evidence kind of the runtime)`;
+  if (name === 'ci' || name === 'merge') return `"${name}" is a flow end marker (docs/design/autonomy.md Decision 2)`;
   if (name.endsWith(DEEP_SUFFIX)) return `role name must not end in "${DEEP_SUFFIX}" (use deepVariant)`;
   if ((SKILL_NAMES as readonly string[]).includes(name)) return `"${name}" is a minions skill name`;
   return null;

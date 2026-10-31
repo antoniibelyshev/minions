@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { BacklogAdapter, ScopeFilter, Task, TaskStatus } from '../backlog/types.js';
 import { can, matchesAny } from '../config/capabilities.js';
-import { dependencyDoneStatuses, isGithubDelivery, localIntegrationEnabled } from '../config/delivery.js';
+import { autoMergeConfigReasons, dependencyDoneStatuses, isGithubDelivery, localIntegrationEnabled } from '../config/delivery.js';
 import { isSmall, notReadyReason, sortByPriority } from '../backlog/ready.js';
 import { CURRENT_PHASE, HARNESSES, harnessModels, isHarnessId, isProcessHarness, phaseAllows, type HarnessId, type PhaseRules } from '../config/harnesses.js';
 import { launchFor, type Launch } from '../config/launch.js';
@@ -1431,15 +1431,23 @@ export class Scheduler {
           break;
         }
         nextPos = stages.length;
+        // The flow's end (docs/design/autonomy.md Decision 2): without a `merge` marker the approved head is delivered, never landed.
+        const end = this.workflowOf(task).end;
         if (!gateOk) to = 'delivered';
-        else if (cfg.delivery.mode !== 'local') {
+        else if (end && !end.merge && cfg.delivery.mode === 'local') {
+          to = 'delivered'; approved = true;
+          message = `Approved at ${head}; delivered (the ${plan!.workflow} flow ends without merge: the owner or the coordinator merges it).`;
+        } else if (cfg.delivery.mode !== 'local') {
           // Publication (below) decides the final status; the task is never delivered before it succeeds.
           approved = true; publish = true;
         } else if (localIntegrationEnabled(cfg)) {
           // Local integration (docs/design/local-auto-integration.md): the runtime merges, verifies and lands the head.
           to = 'merging'; approved = true; integrate = true;
           message = `Approved at ${head}; queued for local integration into ${cfg.git.baseBranch} (the runtime merges, verifies and lands it; the task becomes done when it lands).`;
-        } else { to = 'delivered'; approved = true; message = `Approved at ${head}; delivered locally (export with minions export).`; }
+        } else {
+          to = 'delivered'; approved = true;
+          message = `Approved at ${head}; delivered locally (export with minions export)${end?.merge ? `; the ${plan!.workflow} flow asks for a merge, but local integration is off (${autoMergeConfigReasons(cfg).join('; ')})` : ''}.`;
+        }
         break;
       }
       case 'needs_changes':

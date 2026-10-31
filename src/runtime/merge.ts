@@ -22,6 +22,7 @@
 import { can } from '../config/capabilities.js';
 import { autoMergeConfigReasons } from '../config/delivery.js';
 import type { MinionsConfig } from '../config/schema.js';
+import { resolveWorkflow } from '../config/workflows.js';
 import type { BacklogAdapter, Task } from '../backlog/types.js';
 import { verifyAnyApproval } from '../core/approval.js';
 import type { ErrorCode } from '../core/errors.js';
@@ -112,6 +113,8 @@ export interface MergeGateInput {
   paths: { ok: true; changedPaths: string[]; sensitivePaths: string[] } | { ok: false; message: string };
   /** Verifies the recorded merge approvals (only called when pr.merge evaluates to "ask"). */
   approval: () => { ok: true } | { ok: false; reason: string };
+  /** false: the task's flow ends without a `merge` stage (docs/design/autonomy.md Decision 2). */
+  flowMerge?: boolean;
 }
 
 export interface MergeGate {
@@ -125,6 +128,7 @@ export interface MergeGate {
 export function evaluateMergeGate(i: MergeGateInput): MergeGate {
   const cfg = i.config;
   const reasons = autoMergeConfigReasons(cfg);
+  if (i.flowMerge === false) reasons.push('the task\'s flow ends without a merge stage (the owner or the coordinator merges it)');
   const pr = i.pr;
   if (pr.isDraft) reasons.push('the pull request is a draft');
   if (pr.isCrossRepository) reasons.push('the pull request comes from another repository');
@@ -231,8 +235,9 @@ export async function autoMergeTask(d: MergeDeps, taskId: string): Promise<Merge
       baseShas: d.db.leases({ taskId, all: true }).map((l) => l.base_sha), sensitivePaths: cfg.sensitivePaths })
     : { ok: false as const, message: `origin's ${base} could not be verified: ${vb.message}` };
   const pem = await readFile(d.approvalPublicKeyFile, 'utf8').catch(() => null);
+  const flow = resolveWorkflow(cfg, (await d.backlog.getTask(taskId).catch(() => null))?.workflow);
   const gate = evaluateMergeGate({
-    config: cfg, approvedHead: head, pr, reviewed, ci, paths,
+    config: cfg, approvedHead: head, pr, reviewed, ci, paths, ...(flow?.end ? { flowMerge: flow.end.merge } : {}),
     approval: () => pem
       ? verifyAnyApproval(d.db.approvals(taskId, 'merge', head).map((a) => a.signature), pem, { taskId, head, now: d.now?.(), scope: 'merge' })
       : { ok: false, reason: missingApprovalKeyReason(d.approvalPublicKeyFile) },

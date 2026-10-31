@@ -18,7 +18,25 @@ export const DEFAULT_WORKFLOW = 'default';
  * of invariant 3 (`qa`) or, for a legacy task whose status names a stage its workflow lacks, `legacy`.
  */
 export interface Stage { role: string; when?: 'qa'; model?: string; inserted?: 'qa' | 'legacy' }
-export interface Workflow { name: string; stages: Stage[] }
+/**
+ * How a flow ends (docs/design/autonomy.md Decision 2): the trailing `ci` / `merge` markers of a configured list.
+ * Absent (no marker) = the delivery settings decide, as before. With markers: `merge` = the approved head lands (local
+ * integration or PR auto-merge); without it the task stops at `delivered`. `ci` = landing waits for CI: the PR's
+ * required checks, or in local delivery the integration gate's verification commands.
+ */
+export interface FlowEnd { ci: boolean; merge: boolean }
+export interface Workflow { name: string; stages: Stage[]; end?: FlowEnd }
+
+/** Flow end markers: pseudo-stages that run no worker. */
+export const FLOW_MARKERS = ['ci', 'merge'] as const;
+const isMarker = (s: WorkflowStageConfig): s is (typeof FLOW_MARKERS)[number] => typeof s === 'string' && (FLOW_MARKERS as readonly string[]).includes(s);
+
+/** A configured stage list split into its worker stages and its end markers (undefined when it has none). */
+export function splitFlow(list: readonly WorkflowStageConfig[]): { stages: Stage[]; end?: FlowEnd } {
+  const markers = list.filter(isMarker);
+  const stages = list.filter((s) => !isMarker(s)).map(normalizeStage);
+  return markers.length ? { stages, end: { ci: markers.includes('ci'), merge: markers.includes('merge') } } : { stages };
+}
 
 type WfCfg = Pick<MinionsConfig, 'verification' | 'execution' | 'models'> & Partial<Pick<MinionsConfig, 'roles' | 'workflows' | 'harnesses'>>;
 
@@ -45,7 +63,7 @@ export function workflowNames(cfg: Partial<Pick<MinionsConfig, 'workflows'>>): s
 export function resolveWorkflow(cfg: WfCfg, name: string | null | undefined): Workflow | undefined {
   const n = name ?? DEFAULT_WORKFLOW;
   const configured = own(cfg.workflows, n);
-  if (configured) return { name: n, stages: configured.map(normalizeStage) };
+  if (configured) return { name: n, ...splitFlow(configured) };
   return n === DEFAULT_WORKFLOW ? { name: n, stages: derivedDefaultWorkflow(cfg) } : undefined;
 }
 
@@ -181,7 +199,13 @@ export function workflowConfigIssues(c: MinionsConfig): ConfigIssue[] {
   for (const [name, list] of Object.entries(c.workflows ?? {})) {
     const at = `workflows.${name}`;
     if (!ROLE_NAME_PATTERN.test(name)) { issues.push({ path: at, message: `workflow name must match ${ROLE_NAME_PATTERN.source}` }); continue; }
-    for (const p of workflowProblems(c, list.map(normalizeStage))) issues.push({ path: p.index === null ? at : `${at}.${p.index}`, message: p.message });
+    // End markers come after every worker stage (`["engineer", "reviewer", "ci", "merge"]`).
+    const firstMarker = list.findIndex(isMarker);
+    if (firstMarker >= 0 && list.slice(firstMarker).some((x) => !isMarker(x))) issues.push({ path: `${at}.${firstMarker}`, message: `"ci" and "merge" end the flow: put them after every worker stage` });
+    if (new Set(list.filter(isMarker)).size !== list.filter(isMarker).length) issues.push({ path: at, message: 'each end marker ("ci", "merge") at most once' });
+    const { stages } = splitFlow(list);
+    if (!stages.length) { issues.push({ path: at, message: 'a flow needs at least one worker stage' }); continue; }
+    for (const p of workflowProblems(c, stages)) issues.push({ path: p.index === null ? at : `${at}.${p.index}`, message: p.message });
   }
   for (const [name, raw] of Object.entries(c.roles ?? {})) {
     const to = (raw as { repairTo?: string } | undefined)?.repairTo;

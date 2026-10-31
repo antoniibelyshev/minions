@@ -117,3 +117,18 @@ describe('stage machine helpers', () => {
     expect(derivePosition(cfg, dflt, 'delivered')).toBeNull();
   });
 });
+
+describe('flow end markers (docs/design/autonomy.md Decision 2)', () => {
+  it('splits "ci" and "merge" off the worker stages', () => {
+    const cfg = validateConfig({ ...defaults(), workflows: { full: ['engineer', 'tester', 'reviewer', 'ci', 'merge'], review: ['engineer', 'reviewer'], nomerge: ['engineer', 'reviewer', 'ci'] } });
+    expect(resolveWorkflow(cfg, 'full')).toEqual({ name: 'full', stages: [{ role: 'engineer' }, { role: 'tester' }, { role: 'reviewer' }], end: { ci: true, merge: true } });
+    expect(resolveWorkflow(cfg, 'review')!.end).toBeUndefined();
+    expect(resolveWorkflow(cfg, 'nomerge')!.end).toEqual({ ci: true, merge: false });
+  });
+  it('refuses markers before a worker stage, twice, or alone; and as role names', () => {
+    expect(issuesOf({ workflows: { bad: ['engineer', 'merge', 'reviewer'] } } as never).map((i) => i.message)).toContain('"ci" and "merge" end the flow: put them after every worker stage');
+    expect(issuesOf({ workflows: { bad: ['engineer', 'reviewer', 'merge', 'merge'] } } as never).map((i) => i.message)).toContain('each end marker ("ci", "merge") at most once');
+    expect(issuesOf({ workflows: { bad: ['merge'] } } as never).map((i) => i.message)).toContain('a flow needs at least one worker stage');
+    expect(issuesOf({ roles: { merge: { description: 'x', promptText: 'x', contract: 'producer' } } } as never).length).toBeGreaterThan(0);
+  });
+});

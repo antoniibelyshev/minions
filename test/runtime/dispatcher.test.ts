@@ -94,6 +94,19 @@ describe('dispatcher: the automatic flow', () => {
     expect((await env.backlog.getTask('task-1')).status).toBe('delivered');
   });
 
+  it('the flow decides whether the work lands: with local integration on, a flow without merge stops at delivered', async () => {
+    const { env, disp } = setup((i) => (i.claim.role === 'reviewer' ? { verdict: 'approve' } : {}), (c) => {
+      c.delivery.merge = 'auto-when-eligible'; c.verification.commands = ['npm test'];
+      c.workflows = { review: ['engineer', 'reviewer', 'ci'], land: ['engineer', 'reviewer', 'ci', 'merge'] };
+    });
+    env.backlog.add({ id: 'task-1', workflow: 'review' } as never);
+    env.backlog.add({ id: 'task-2', workflow: 'land' } as never);
+    env.config.execution.maxActiveTasks = 2; env.config.execution.maxEngineers = 2;
+    await drive(disp);
+    expect((await env.backlog.getTask('task-1')).status).toBe('delivered');
+    expect((await env.backlog.getTask('task-2')).status).toBe('merging');
+  });
+
   it('runs a repair cycle on its own: reviewer request-changes -> engineer -> reviewer', async () => {
     let reviews = 0;
     const { env, disp, launches } = setup((i) => {
