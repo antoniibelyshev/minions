@@ -1,5 +1,5 @@
-// The Telegram Bot API client shared by the host manager bot (src/host/manager-telegram.ts) and the minions-owned
-// channel server (src/telegram/channel/server.ts); docs/design/telegram-channel.md, "Server shape", layer 1.
+// The Telegram Bot API client of the minions-owned channel server (src/telegram/channel/server.ts);
+// docs/design/telegram-channel.md, "Server shape", layer 1.
 //
 // - fetch only, JSON bodies, plain text (no parse_mode). The token travels only in the request URL path; every error
 //   message is redacted (the token itself and anything token-shaped) and never includes it.

@@ -217,6 +217,18 @@ the GitHub token, credential helper and gh wrapper, the guided GitHub setup, the
 `merge` only). Configs that still carry the removed keys load: the keys are dropped, and an `auto-when-eligible` that
 came with branch or pull-request delivery becomes `disabled`.
 
+## Decision 9. Removed the host manager, change requests and the setup assistant (owner, 2026-10-31)
+
+The coordinator talks to the owner through the minions Telegram channel and owns the configuration through the control
+layer, so the host manager bot (with its assistant, service and tokens), config change requests, the config history,
+role proposals (`minions config roles`), the setup assistant (`minions setup assist`) and the interactive settings menu
+are gone. Merge approvals are signed in the host terminal (`minions work approve`). One request kind stays: `upgrade`
+(`minions upgrade --reason` in the runtime, `settings requests` and the hidden `settings requests mark`), which the
+self-update script reads and marks. `settings set` and `settings restart` are host-only; a `coordinator-restart` key
+applies at the coordinator's next context reset. Old databases keep their `change_requests` and `role_proposals`
+tables; rows of the removed kinds are never listed. A manager service installed earlier (launchd agent or systemd
+user unit running `minions manager run`) and the stored manager tokens are left in place: remove them by hand.
+
 ## Reversed decisions
 
 - telegram-decisions.md D2 (tap buttons instead of native polls): native polls are built at the owner's request.

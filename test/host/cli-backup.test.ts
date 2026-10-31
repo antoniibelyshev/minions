@@ -5,9 +5,8 @@ import { execFileSync } from 'node:child_process';
 import { chmodSync, mkdirSync, readFileSync, readdirSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { run, type RunOptions } from '../../src/core/exec.js';
-import { backupInstalledCli, installCliBackup } from '../../src/host/cli-backup.js';
-import { sha256File } from '../../src/core/fsutil.js';
+import { run } from '../../src/core/exec.js';
+import { backupInstalledCli } from '../../src/host/cli-backup.js';
 import { tempDir, withHome } from './fixtures.js';
 
 let home: ReturnType<typeof withHome>;
@@ -28,7 +27,7 @@ function files(dir: string): Map<string, { data: string; exec: boolean }> {
   return out;
 }
 
-describe('backupInstalledCli and installCliBackup (real npm)', () => {
+describe('backupInstalledCli and its restore (real npm)', () => {
   it('backs up an install whose prepare script fails and reinstalls it byte for byte', async () => {
     const install = join(tempDir('minions-install-'), 'minions');
     mkdirSync(join(install, 'dist'), { recursive: true });
@@ -67,9 +66,9 @@ describe('backupInstalledCli and installCliBackup (real npm)', () => {
     // Restore into a scratch global prefix with the real npm (offline: the package has no dependencies).
     const prefix = tempDir('minions-prefix-');
     const npmEnv = { npm_config_prefix: prefix, npm_config_cache: join(prefix, '.cache'), npm_config_offline: 'true', npm_config_update_notifier: 'false' };
-    const runner = (cmd: string, args: string[], o?: RunOptions) => run(cmd, args, { ...o, env: { ...(o?.env ?? process.env), ...npmEnv } });
-    const done = await installCliBackup(b.name, await sha256File(b.file), { runner });
-    expect(done).toMatch(/reinstalled minions 0\.1\.0/);
+    // The rollback of scripts/dev/self-update.mjs: `npm install -g --no-audit --no-fund <backup>` from the backup directory.
+    const done = await run('npm', ['install', '-g', '--no-audit', '--no-fund', b.file], { cwd: join(b.file, '..'), env: { ...process.env, ...npmEnv }, allowFailure: true, timeoutMs: 120_000 });
+    expect(done.code, done.stderr).toBe(0);
 
     const installed = join(prefix, 'lib', 'node_modules', 'minions');
     const expected = files(install);

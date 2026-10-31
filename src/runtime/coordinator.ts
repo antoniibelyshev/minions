@@ -218,7 +218,7 @@ export function hostSettings(h: HostHardening): { sandbox: Record<string, unknow
   readEdit(`${secretsAbs}/env`);
   // File globs only (`*.json`): a directory-matching wildcard would also become a sandbox write deny of its contents.
   if (root) deny.push(`Read(${ruleAbs(root)}/*.json)`, `Edit(${ruleAbs(root)}/*.json)`);
-  // Host manager state (owner pairing, token reference, journal): the directory rule is also a sandbox write deny.
+  // Host-only state (CLI backups; files the removed host manager left): the directory rule is also a sandbox write deny.
   if (root) readEdit(`${ruleAbs(root)}/manager`);
   deny.push(`Read(${ruleAbs(h.projectDir)}/credentials.json)`,
     `Edit(${ruleAbs(h.projectDir)}/*.json)`, `Edit(${ruleAbs(h.projectDir)}/*.yaml)`, `Edit(${secretsAbs}/**)`);
@@ -343,8 +343,7 @@ export function coordinatorSettings(cfg: MinionsConfig, opts: { telegram?: boole
       // minions never talks to a remote: the coordinator never pushes or merges a pull request. Also cover
       // global options before the subcommand (git -C x push).
       deny: ['Bash(git push *)', 'Bash(git push)', 'Bash(git * push *)', 'Bash(git * push)', 'Bash(gh pr merge *)', 'Bash(gh pr merge)', 'Bash(gh * pr merge *)', 'Bash(gh * pr merge)',
-        // A merge approval is signed by the owner on the host (`/approve` in the manager chat, or the host
-        // terminal); one an agent records is rejected anyway, so it is denied instead of blocking on a prompt. Also
+        // A merge approval is signed by the owner in the host terminal; one an agent records is rejected anyway, so it is denied instead of blocking on a prompt. Also
         // covers program-level options before the subcommand (`minions --json work approve ...`).
         ...APPROVE_RULES,
         // Host runtime: pairing is the owner's terminal step (`minions telegram access`), never the coordinator's.
@@ -393,8 +392,8 @@ export interface PermissionModeDecision {
   reason: string;
 }
 
-// The --help choice parser and the strict-mode mapping live in ./permission-modes.ts (shared with the
-// setup assistant); re-exported here for existing callers.
+// The --help choice parser and the strict-mode mapping live in ./permission-modes.ts; re-exported here for
+// existing callers.
 export { claudePermissionModes, parsePermissionModes } from './permission-modes.js';
 
 /**

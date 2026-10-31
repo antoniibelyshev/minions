@@ -96,7 +96,6 @@ function setup(): Fx {
     '    echo "{\\"ok\\":true,\\"data\\":{\\"healthy\\":false,\\"checks\\":[{\\"name\\":\\"telegram.plugin\\",\\"status\\":\\"$st\\",\\"detail\\":\\"plugin $st\\"}]}}" ;;',
     '  "--json down") rm -f "$FAKE/container-image" "$FAKE/running"; echo \'{"ok":true,"data":{}}\' ;;',
     '  "--json start --no-attach") cp "$FAKE/img/minions-runtime:0.1.0" "$FAKE/container-image"; touch "$FAKE/running"; echo \'{"ok":true,"data":{"running":true}}\' ;;',
-    '  "--json manager notify") cat > "$FAKE/manager-notice.txt"; echo \'{"ok":true,"data":{"sent":true,"botId":"555"}}\' ;;',
     '  *) echo \'{"ok":false,"error":{"code":"INTERNAL","message":"unexpected fake call"}}\'; exit 1 ;;',
     'esac',
   ].join('\n'));

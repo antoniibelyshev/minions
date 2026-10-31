@@ -104,7 +104,7 @@ describe('minions setup', () => {
 
     expect(r.steps.map((s) => [s.id, s.status])).toEqual([
       ['init', 'done'], ['autoMerge', 'done'],
-      ['telegram', 'done'], ['harness', 'skipped'], ['manager', 'skipped'], ['container', 'done'], ['import', 'done'], ['coordinator', 'done'],
+      ['telegram', 'done'], ['harness', 'skipped'], ['container', 'done'], ['import', 'done'], ['coordinator', 'done'],
     ]);
     expect(rt.calls).toEqual(['running?', 'start', 'repo?', 'import', 'coordinator']);
     expect(r.ready).toBe(true);
@@ -305,7 +305,7 @@ describe('minions setup', () => {
     const r = await runSetup({ path: repo, yes: true, runtime: rt.runtime, dockerProbe: dockerUp });
     expect(r.steps.map((s) => [s.id, s.status])).toEqual([
       ['init', 'done'], ['autoMerge', 'skipped'],
-      ['telegram', 'skipped'], ['harness', 'skipped'], ['manager', 'skipped'], ['container', 'done'], ['import', 'done'], ['coordinator', 'done'],
+      ['telegram', 'skipped'], ['harness', 'skipped'], ['container', 'done'], ['import', 'done'], ['coordinator', 'done'],
     ]);
     expect((await loadEffectiveConfig(await loadProjectJson(r.projectId))).config.delivery.merge).toBe('disabled');
   });
@@ -358,6 +358,5 @@ describe('minions setup', () => {
     expect(step(r, 'telegram')).toMatchObject({ status: 'skipped', detail: expect.stringContaining('host runtime has no Telegram') });
     expect(await readTelegramToken(r.projectId)).toBeNull();
     expect(r.pairing).toEqual([]);
-    expect(r.nextSteps.join('\n')).toContain('minions setup assist');
   });
 });

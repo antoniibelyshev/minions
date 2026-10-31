@@ -1,4 +1,3 @@
-import { spawn } from 'node:child_process';
 import { resolve as resolvePath } from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import { Option, type Command } from 'commander';
@@ -8,9 +7,7 @@ import { MinionsError } from '../core/errors.js';
 import { emit } from '../core/output.js';
 import { CONTAINER, projectPaths } from '../core/paths.js';
 import { PRE_RESTORE_KEEP, STATE_BACKUP_DIRS, STATE_BACKUP_FILES } from '../runtime/state-backup.js';
-import { formatRecord, recordUpgradeRequest, withRequestContext } from '../runtime/change-requests.js';
-import { registerChangeRequestCommands } from './change-requests.js';
-import { registerManager } from './manager.js';
+import { formatRecord, recordUpgradeRequest, withRequestDb } from '../runtime/change-requests.js';
 import { registerAuth } from './auth-cli.js';
 import { authOf, isKeyAuth, refreshKey, startRefreshTimer } from './auth.js';
 import type { MinionsConfig } from '../config/schema.js';
@@ -36,11 +33,8 @@ import { formatSetup, runSetup, shellQuote, type SetupRuntime } from './setup.js
 import { DEFAULT_UPGRADE_TIMEOUT_SEC, formatUpgrade, runUpgrade, upgradeTimeout } from './upgrade.js';
 import { HANDOFF_ENV, formatSyncOnly, isMinionsCheckout, runSourcePhase, runSyncOnly, upgradeSourceMode } from './upgrade-source.js';
 import { readSecret, readlineIO } from './wizard.js';
-import { addListCommand, addSetCommand, defaultSettingsRuntime, registerSettings } from './settings-cli.js';
-import { runSettingsMenu, terminalMenuIO } from './settings-menu.js';
-import { registerRoles } from './roles-cli.js';
+import { addListCommand, addSetCommand, registerSettings } from './settings-cli.js';
 import { registerSecrets } from './secrets-cli.js';
-import { initMayOfferAssistant, launchAssistant, loadAssistantContext, offerSetupAssistant, registerAssistant } from './assistant.js';
 
 const say = (json: boolean, msg: string) => { if (!json) process.stderr.write(msg + '\n'); };
 
@@ -231,15 +225,6 @@ async function confirmOrNull(question: string): Promise<boolean | null> {
   try { return !/^n(o)?$/i.test((await rl.question(`${question} `)).trim()); } finally { rl.close(); }
 }
 
-/** The settings menu's token items: runs the existing `minions auth telegram|codex` flow in this terminal. */
-function runAuthFlow(kind: 'telegram' | 'codex'): Promise<void> {
-  return new Promise((resolve) => {
-    const child = spawn(process.execPath, [...process.execArgv, process.argv[1]!, 'auth', kind], { stdio: 'inherit' });
-    child.on('error', () => resolve());
-    child.on('close', () => resolve());
-  });
-}
-
 /** Yes/no; the default follows the (Y/n) / (y/N) marker; null without a terminal. */
 async function confirmMarked(question: string): Promise<boolean | null> {
   if (!process.stdin.isTTY) return null;
@@ -347,53 +332,37 @@ export function register(program: Command): void {
           attach: o.attach, newIdentity: o.newIdentity, io, runtime: o.runtime,
         });
         emit(r, { json, human: formatInit });
-        // Interactive init only (never --yes / --config / --json / --dry-run / no terminal): offer the AI setup assistant.
-        const offer = initMayOfferAssistant({ ...o, json, stdinTTY: !!process.stdin.isTTY, stdoutTTY: !!process.stdout.isTTY }) && !r.dryRun;
-        if (offer && io) {
-          await offerSetupAssistant({ interactive: true, io, launch: async () => {
-            io.close?.(); // the assistant owns the terminal from here
-            return launchAssistant(await loadAssistantContext(r.plan.repoPath), { onInfo: (l) => process.stderr.write(l + '\n') });
-          } });
-        }
       } finally { io?.close?.(); }
     }));
 
-  const setupCmd = program.command('setup [path]')
-    .description('Guided end-to-end setup: init wizard, local integration, Telegram, host manager bot, runtime start, import, coordinator, then the setup assistant (subcommand: assist)')
+  program.command('setup [path]')
+    .description('Guided end-to-end setup: init wizard, local integration, Telegram, runtime start, import, coordinator')
     .addOption(new Option('--profile <profile>', 'starting profile').choices([...PROFILES]))
     .option('--private', 'private install: nothing is written into the repository')
     .option('--shared', 'shared install: writes .minions/config.json and .minions/README.md')
     .option('-y, --yes', 'non-interactive: accept defaults (optional integrations off unless a token is piped)')
     .option('--dry-run', 'show what setup would do without writing, prompting for secrets, or starting anything')
     .option('--telegram-token-stdin', 'read the Telegram bot token from the first line of piped stdin')
-    .option('--manager-token-stdin', 'read the host manager bot token from piped stdin (after the Telegram line when combined); pairing needs a terminal run')
-    .option('--manager-claude-token-stdin', "read the manager assistant's Claude token (claude setup-token or an Anthropic API key) from piped stdin (last line when combined); stores it, never switches the assistant on")
     // Same semantics as `minions init` (install.sh passes init options through to setup).
     .option('--config <file>', 'use a validated config file instead of the init wizard (skips the questions it covers)')
     .option('--attach', 'attach this repository to the project id in .minions/config.json')
     .option('--new-identity', 'create a new project identity for this repository')
     .addOption(new Option('--runtime <runtime>', 'agent runtime: docker (default) or host (no Docker, less safe; prints a warning)').choices([...RUNTIMES]))
     .option('--no-attach-coordinator', 'do not offer to attach the coordinator at the end')
-    .option('--no-assistant', 'do not offer the AI setup assistant at the end')
-    .action(action(async (path: string | undefined, o: { profile?: Profile; private?: boolean; shared?: boolean; yes?: boolean; dryRun?: boolean; telegramTokenStdin?: boolean; managerTokenStdin?: boolean; managerClaudeTokenStdin?: boolean; config?: string; attach?: boolean; newIdentity?: boolean; runtime?: RuntimeKind; attachCoordinator: boolean; assistant: boolean }, cmd: Command) => {
+    .action(action(async (path: string | undefined, o: { profile?: Profile; private?: boolean; shared?: boolean; yes?: boolean; dryRun?: boolean; telegramTokenStdin?: boolean; config?: string; attach?: boolean; newIdentity?: boolean; runtime?: RuntimeKind; attachCoordinator: boolean }, cmd: Command) => {
       requireMode('host');
       const { json } = globalOpts(cmd);
       if (o.private && o.shared) throw new MinionsError('INVALID_CONFIG', '--private and --shared are mutually exclusive.');
-      const piped = !!(o.telegramTokenStdin || o.managerTokenStdin || o.managerClaudeTokenStdin);
+      const piped = !!o.telegramTokenStdin;
       const interactive = !o.yes && !o.dryRun && !json && !piped && !!process.stdin.isTTY;
       // Like init, --config is a non-interactive alternative to --yes (token questions then need stdin).
       if (!o.yes && !o.config && !o.dryRun && !interactive) {
-        throw new MinionsError('PRECONDITION', 'setup needs a terminal for its questions.', 'Pass --yes to accept the defaults or --config <file> (tokens can be piped with --telegram-token-stdin / --manager-token-stdin / --manager-claude-token-stdin), or --dry-run.');
+        throw new MinionsError('PRECONDITION', 'setup needs a terminal for its questions.', 'Pass --yes to accept the defaults or --config <file> (the Telegram token can be piped with --telegram-token-stdin), or --dry-run.');
       }
       const target = resolvePath(path ?? '.');
-      let tokens: { telegram?: string; manager?: string; managerClaude?: string } | undefined;
-      if (piped && !o.dryRun) {
-        // One line per selected flag, in the order telegram, manager, managerClaude.
-        const names = (['telegram', 'manager', 'managerClaude'] as const).filter((n) => o[`${n}TokenStdin`]);
-        const lines = await readStdinLines(names.length);
-        // A missing line is an empty token: runSetup rejects it instead of silently skipping the step.
-        tokens = Object.fromEntries(names.map((n, i) => [n, lines[i] ?? '']));
-      }
+      let tokens: { telegram?: string } | undefined;
+      // A missing line is an empty token: runSetup rejects it instead of silently skipping the step.
+      if (piped && !o.dryRun) tokens = { telegram: (await readStdinLines(1))[0] ?? '' };
       const io = interactive ? readlineIO() : undefined;
       try {
         const r = await runSetup({
@@ -404,17 +373,8 @@ export function register(program: Command): void {
         emit(r, { json, human: formatSetup });
         if (r.steps.some((s) => s.status === 'failed')) process.exitCode = 1;
         const tty = interactive && !!process.stdout.isTTY && !!io;
-        // Last question of the guided flow: the AI setup assistant finishes whatever is left (failures never fail setup).
-        let assisted = false;
-        if (tty && o.assistant && !r.dryRun) {
-          assisted = await offerSetupAssistant({ interactive: true, io: io!, launch: async () => {
-            io!.close?.(); // the assistant owns the terminal from here
-            return launchAssistant(await loadAssistantContext(r.init.plan.repoPath), { onInfo: (l) => process.stderr.write(l + '\n') });
-          } }) === 'launched';
-          if (assisted && r.ready) say(json, `Attach to the coordinator any time: ${r.attachStart ?? 'minions start'}`);
-        }
         // The coordinator is a TUI in tmux: attaching needs a terminal (compose exec allocates a TTY).
-        if (r.ready && tty && !assisted && o.attachCoordinator && /^y(es)?$/i.test(await io!.ask('Attach to the coordinator now? (y/n)', 'y'))) {
+        if (r.ready && tty && o.attachCoordinator && /^y(es)?$/i.test(await io!.ask('Attach to the coordinator now? (y/n)', 'y'))) {
           io!.close?.();
           const project = await loadProjectJson(r.projectId);
           if (runtimeOf(project) === 'host') {
@@ -493,18 +453,18 @@ export function register(program: Command): void {
     .option('--now', 'release workers still active when the wait ends (reported as interrupted, re-dispatched after)')
     .option('--from-container [branch]', 'first export the container branches and fast-forward <branch> (default: the base branch) to minions/<base>; strict fast-forward on a clean tree only')
     .option('--rebuild-cli', 'in a minions checkout: allow rebuilding/reinstalling the global CLI from it (runs its npm scripts and build on the host; review it first)')
-    .option('--sync-only', 'only the source sync (the host manager /sync): export the container branches and fast-forward the base branch; no CLI or container steps')
+    .option('--sync-only', 'only the source sync: export the container branches and fast-forward the base branch; no CLI or container steps')
     .option('--dry-run', 'list the steps without changing anything')
     .option('--reason <text>', 'runtime: why the upgrade is needed (shown to the owner)')
     .action(action(async (o: { timeout?: string; now?: boolean; fromContainer?: string | boolean; rebuildCli?: boolean; syncOnly?: boolean; reason?: string }, cmd: Command) => {
       const { json, dryRun } = globalOpts(cmd);
       if (runtimeMode() !== 'host') {
-        // The container can only propose (docs/design/host-manager.md): record a request; the owner applies it on the host.
+        // The container can only propose: record a request; the owner applies it on the host.
         const hostOnly = [o.timeout !== undefined ? '--timeout' : null, o.now ? '--now' : null, o.rebuildCli ? '--rebuild-cli' : null, o.syncOnly ? '--sync-only' : null].filter(Boolean);
         if (hostOnly.length) {
           throw new MinionsError('PRECONDITION', `${hostOnly.join(', ')}: not available in an upgrade request (the owner picks how to drain, and a CLI rebuild is never requested from the container).`, 'Request `minions upgrade [--from-container [branch]] --reason <text>`.');
         }
-        const r = await withRequestContext((ctx) => recordUpgradeRequest(ctx, { fromContainer: o.fromContainer, reason: o.reason, dryRun }));
+        const r = await withRequestDb((db) => recordUpgradeRequest(db, { fromContainer: o.fromContainer, reason: o.reason, dryRun }));
         emit(r, { json, human: formatRecord });
         return;
       }
@@ -557,7 +517,7 @@ export function register(program: Command): void {
       if (!r.ok) process.exitCode = 1;
     }));
 
-  /** `minions upgrade --sync-only`: the source sync alone (docs/design/host-manager.md, "Change kinds", outer repo sync). */
+  /** `minions upgrade --sync-only`: the source sync alone. */
   async function upgradeSyncOnly(o: { timeout?: string; now?: boolean; fromContainer?: string | boolean; rebuildCli?: boolean }, g: { json: boolean; dryRun: boolean }): Promise<void> {
     if (o.timeout !== undefined || o.now || o.rebuildCli) throw new MinionsError('PRECONDITION', '--sync-only takes no --timeout, --now or --rebuild-cli (it moves no container and builds nothing).');
     const ref = await projectForPath(process.cwd());
@@ -778,23 +738,13 @@ export function register(program: Command): void {
   registerRuntime(program, { confirm, ask: askLine });
   registerChannel(program, { confirm: confirmOrNull });
   registerSecrets(program);
-  registerAssistant(setupCmd);
 
-  const settings = registerSettings(program, {
-    confirm: confirmMarked,
-    menu: async (project, o) => {
-      await runSettingsMenu(project, { io: terminalMenuIO(), runtime: defaultSettingsRuntime, layer: o.layer, runAuth: runAuthFlow });
-    },
-  });
-  registerChangeRequestCommands(settings, { runtime: defaultSettingsRuntime, confirm: confirmMarked, show: (t) => process.stderr.write(`${t}\n`) });
-  registerManager(program);
+  registerSettings(program, { confirm: confirmMarked });
 
-  // Advanced alias of `minions settings` (kept for scripts): `config show` (raw effective config), `config list`, `config set`;
-  // plus `config roles ...`, the role proposal/approval path (src/host/roles-cli.ts).
-  const config = program.command('config').description('Alias of `minions settings`: show the raw effective config, list or set settings; `config roles`: project worker roles');
+  // Advanced alias of `minions settings` (kept for scripts): `config show` (raw effective config), `config list`, `config set`.
+  const config = program.command('config').description('Alias of `minions settings`: show the raw effective config, list or set settings');
   addListCommand(config);
   addSetCommand(config, { confirm: confirmMarked });
-  registerRoles(config, { confirm: confirmMarked });
   config.command('show')
     .description('Show the effective configuration')
     .option('--explain', 'include the source of every value (default/project/local/session)')

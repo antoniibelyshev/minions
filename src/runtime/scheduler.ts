@@ -1542,7 +1542,7 @@ export class Scheduler {
         status = 'awaiting-human';
         message = `the integration of ${pub.branch} waits for human approval (${row.detail ?? 'merge approval needed'}); the user runs \`minions work approve ${taskId} --head ${row.head_sha}\` on the host, then \`minions work publish ${taskId}\``;
         this.integrationNotice({ key: `integration-approval:${taskId}:${row.head_sha}`, kind: 'approval', taskId,
-          text: `${taskId} waits for your merge approval before it lands on ${base} (${(row.detail ?? 'merge approval needed').slice(0, 400)}). On the host: \`minions work approve ${taskId} --head ${row.head_sha}\` (or /approve ${taskId} ${row.head_sha} merge in the manager chat).` });
+          text: `${taskId} waits for your merge approval before it lands on ${base} (${(row.detail ?? 'merge approval needed').slice(0, 400)}). On the host: \`minions work approve ${taskId} --head ${row.head_sha}\`.` });
         break;
       }
       case 'transient': {

@@ -36,7 +36,7 @@ interface World {
   /** The coordinator has Telegram; the value is the poller state. */
   telegram: string | null; doctorFailImage: string | null;
   npmInstallFail: boolean; gateFail: string | null; markFail: boolean;
-  notice: string | null; managerNotice: string | null; coordinatorRestarts: number;
+  notice: string | null; coordinatorRestarts: number;
   /** Runs first for a host `minions` call; a result replaces the fake's own answer. */
   minionsHook: ((a: string, input?: string) => RunResult | undefined) | null;
   /** Runs first for a gate npm step (ci, run typecheck, test). */
@@ -131,7 +131,6 @@ function fakeMinions(args: string[], input?: string): RunResult {
     }
     case '--json down': w.container = null; w.running = false; return res(okEnv());
     case '--json start --no-attach': w.container = w.img[TAG] ?? null; w.running = true; return res(okEnv({ running: true }));
-    case '--json manager notify': w.managerNotice = input ?? ''; return res(okEnv({ sent: true, botId: '555' }));
     default: return res(envl({ ok: false, error: { code: 'INTERNAL', message: 'unexpected fake call' } }), 1);
   }
 }
@@ -205,7 +204,7 @@ function setup(): World {
     newImage: null, upgradeStopsRuntime: false, upgradeFail: false,
     brokenImage: null, flapImage: null, flaps: 0, telegram: null, doctorFailImage: null,
     npmInstallFail: false, gateFail: null, markFail: false,
-    notice: null, managerNotice: null, coordinatorRestarts: 0,
+    notice: null, coordinatorRestarts: 0,
     minionsHook: null, gateHook: null, hostBroken: false,
   };
 }
@@ -793,7 +792,6 @@ describe('self-update health check and rollback (phase 3)', () => {
     expect(statuses()).toEqual(['confirmed', 'failed']);
     expect(marks()[1]).toMatch(new RegExp(`not healthy after the upgrade to ${to.slice(0, 12)} \\(not healthy within 1 s: the coordinator is not running\\); rolled back to the previous CLI and image \\(minions-runtime:0.1.0-prev\\); the coordinator is healthy again on the previous build; ${to.slice(0, 12)} is recorded as bad`));
     expect(w.notice).toMatch(/^Self-update failed .*rolled back to the previous CLI and image/);
-    expect(w.managerNotice).toBeNull();
     expect(readState()).toMatchObject({ current: null, lastApplied: null, badShas: [to] });
   });
 
@@ -835,37 +833,17 @@ describe('self-update health check and rollback (phase 3)', () => {
     expect(w.container).toBe('sha256:0ldimage');
   });
 
-  it('no healthy coordinator even after the rollback: the owner is told through the manager bot too', async () => {
+  it('no healthy coordinator even after the rollback: the request is marked failed and the notice says so', async () => {
     w.newImage = 'sha256:newimage';
     w.brokenImage = 'sha256:newimage';
     w.npmInstallFail = true; // the CLI cannot be reinstalled: the rollback stops there
     setRequests([request('cr_aaaaaaaa')]);
     expect((await runScript('--once')).code).toBe(0);
     expect(minionsLog()).not.toMatch(/--json (down|start)/); // never `start` on the new CLI (it would rebuild the image)
-    expect(w.managerNotice).toMatch(/^Self-update failed \(request cr_aaaaaaaa\): NO HEALTHY COORDINATOR even after the rollback/);
-    expect(w.managerNotice).toContain('the CLI backup could not be reinstalled');
-    expect(w.managerNotice).toContain(`Log: ${join(stateDir(), 'log.jsonl')}`);
-    expect(events().find((e) => e.event === 'manager-notice')).toMatchObject({ request: 'cr_aaaaaaaa', ok: true });
     // The rollback restarted nothing, so the check after it does not wait out the window: 2 probes, then the notice.
     expect(applyEvent()).toMatchObject({ rollback: { healthy: false, health: expect.stringMatching(/^not healthy in 2 probe\(s\): the coordinator is not running/) } });
-    expect(marks()[1]).toMatch(/no healthy coordinator even after the rollback .*; the owner was told through the manager bot; .* is recorded as bad/);
-    expect(w.notice).toMatch(/NO HEALTHY COORDINATOR|no healthy coordinator/);
-  });
-
-  it('an old CLI without `manager notify`: the failure is logged and printed, the request is still marked failed', async () => {
-    w.newImage = 'sha256:newimage';
-    w.brokenImage = 'sha256:newimage';
-    w.npmInstallFail = true;
-    w.minionsHook = (a) => (a === '--json manager notify' ? res('', 1, "error: unknown command 'notify'") : undefined);
-    setRequests([request('cr_aaaaaaaa')]);
-    const r = await runScript('--once');
-    expect(r.code, r.err).toBe(0);
-    expect(w.managerNotice).toBeNull();
-    expect(events().find((e) => e.event === 'manager-notice')).toMatchObject({ request: 'cr_aaaaaaaa', ok: false, message: expect.stringMatching(/unknown command 'notify'/) });
-    expect(r.out).toMatch(/could not tell the owner through the manager bot: .*unknown command 'notify'/);
     expect(statuses()).toEqual(['confirmed', 'failed']);
-    expect(marks()[1]).toMatch(/no healthy coordinator even after the rollback .*; the manager bot could not tell the owner \(.*unknown command 'notify'.*\); .* is recorded as bad/);
-    // The coordinator outbox notice is still enqueued (it goes out if the coordinator comes back).
+    expect(marks()[1]).toMatch(/the CLI backup could not be reinstalled.*; no healthy coordinator even after the rollback .*; .* is recorded as bad/);
     expect(w.notice).toMatch(/no healthy coordinator even after the rollback/);
   });
 
@@ -990,7 +968,6 @@ describe('self-update health check and rollback (phase 3)', () => {
     expect(steps(applyEvent())).toEqual(expect.arrayContaining(['rollback-cli:done', 'rollback-image:failed', 'rollback-down:done', 'rollback-start:done', 'rollback-coordinator:done', 'health-after-rollback:done']));
     expect(applyEvent()).toMatchObject({ outcome: 'failed', rollback: { ok: false, healthy: true } });
     expect(marks()[1]).toMatch(/rolled back with failures \(image re-tag; see the log\); the coordinator is healthy again on the previous build; .* is recorded as bad/);
-    expect(w.managerNotice).toBeNull();
     expect(readState().prevPin).toBeNull();
   });
 });

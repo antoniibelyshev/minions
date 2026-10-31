@@ -1,4 +1,4 @@
-// Settings classification (docs/design/host-manager.md, "Settings classification (task-44)"): every key of the
+// Settings classification (task-44): every key of the
 // config schema has a class that says how a change takes effect, and a host-owned flag.
 //
 // - live:     the runtime reads the regenerated runtime config.json on its next command or claim (the

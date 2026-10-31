@@ -22,32 +22,8 @@ export const defaultsPath = () => join(hostRoot(), 'defaults.json');
 export const credentialStoreDir = () => join(hostRoot(), 'credentials');
 export const credentialStoreFile = (projectId: string, name: string) => join(credentialStoreDir(), projectId, name);
 export const projectDir = (projectId: string) => join(hostRoot(), 'projects', projectId);
-/** Host manager state (docs/design/host-manager.md): journal, lock, owner pairing. Host-only, never mounted. */
+/** Host-only, never mounted: the CLI backups `minions upgrade` keeps (src/host/cli-backup.ts). */
 export const managerDir = () => join(hostRoot(), 'manager');
-export function managerPaths() {
-  const dir = managerDir();
-  return {
-    dir,
-    /** Owner pairing of the manager bot (numeric user id and private chat id), 0600. */
-    accessJson: join(dir, 'access.json'),
-    /** Non-secret reference to the stored manager bot token (backend, locator, bot id), 0600. Never the token. */
-    credentialJson: join(dir, 'credential.json'),
-    /** Non-secret reference to the stored manager Claude token (backend, locator, token kind), 0600. Never the token. */
-    claudeCredentialJson: join(dir, 'claude-credential.json'),
-    /** The natural-language assistant settings ({version, enabled, model, dailyLimit}), 0600 (manager-assistant.ts). */
-    assistantJson: join(dir, 'assistant.json'),
-    /** The assistant's calls today and its last error ({version, day, calls, limitNoticeDay, lastError}), 0600; written by the manager. */
-    assistantUsageJson: join(dir, 'assistant-usage.json'),
-    /** Parent (0700) of the per-call run dirs of the assistant (fresh CLAUDE_CONFIG_DIR, empty cwd), removed after each call. */
-    assistantRunsDir: join(dir, 'assistant'),
-    /** The installed supervisor service (kind, unit file path, its sha256), 0600. Written by setup. */
-    serviceJson: join(dir, 'service.json'),
-    /** The running manager's heartbeat ({pid, start, transport, botId, lastPollAt}), 0600. */
-    stateJson: join(dir, 'state.json'),
-    /** stdout/stderr of the launchd agent (systemd uses the journal). */
-    logFile: join(dir, 'manager.log'),
-  };
-}
 
 /**
  * File name of the headless Claude token in the secrets dir: a `claude setup-token` OAuth token (or an Anthropic API
@@ -70,8 +46,6 @@ export function projectPaths(projectId: string) {
     /** Public half of the host-held approval signing key (read-only for agents; see src/host/approvals.ts). */
     approvalPublicKey: join(dir, 'runtime', 'approval-public-key.pem'),
     pluginDir: join(dir, 'plugin'),
-    /** Host-side plugin of the setup assistant (`minions setup assist`), regenerated on every launch. */
-    assistantPluginDir: join(dir, 'assistant-plugin'),
     exportsDir: join(dir, 'exports'),
     /** Host-only credential references (never mounted). */
     credentialsJson: join(dir, 'credentials.json'),

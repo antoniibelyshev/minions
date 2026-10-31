@@ -11,7 +11,6 @@ import type { MinionsError } from '../../src/core/errors.js';
 import { generatePlugin } from '../../src/plugin/generate.js';
 import { humanNext } from '../../src/runtime/commands.js';
 import { preAgentHook } from '../../src/runtime/hooks.js';
-import { checkProposal, formatSummary } from '../../src/runtime/role-proposals.js';
 import { Scheduler } from '../../src/runtime/scheduler.js';
 import { commitFile, makeDefaultEnv, result, type Env } from './fixtures.js';
 
@@ -100,21 +99,6 @@ describe('phase 1 (b) pilot: codex-reviewer gate after the Claude engineer', () 
       expect(files.filter((f) => f.includes('codex-reviewer'))).toEqual(['harness-prompts/codex-reviewer.md']);
       expect(await readFile(join(out, 'harness-prompts', 'codex-reviewer.md'), 'utf8')).toBe('Review the head.\n');
     } finally { await rm(out, { recursive: true, force: true }); }
-  });
-});
-
-describe('role proposals', () => {
-  it('a proposal may put a project gate on a configured harness; the summary shows it; the phase rules still apply', async () => {
-    const e = makeDefaultEnv((c) => set(c, { harnesses: { codex: CODEX } }));
-    const { summary } = await checkProposal(e.config, { name: 'codex-reviewer', role: { description: 'Second opinion.', contract: 'gate', harness: 'codex' }, promptText: 'Review.', reason: 'cross-model review' });
-    expect(summary.harness).toBe('codex');
-    expect(formatSummary(summary)).toMatch(/, harness codex/);
-    const claude = await checkProposal(e.config, { name: 'judge', role: { description: 'Judge.', contract: 'gate' }, promptText: 'Judge.', reason: 'r' });
-    expect(claude.summary.harness).toBe('claude');
-    expect(formatSummary(claude.summary)).not.toMatch(/harness/);
-    const x = await err(checkProposal(e.config, { name: 'maker', role: { description: 'Makes.', contract: 'producer', edits: 'any', harness: 'codex' }, promptText: 'Make.', reason: 'r' }));
-    expect(x.code).toBe('INVALID_CONFIG');
-    expect(JSON.stringify(x.details)).toMatch(/roles\.maker\.harness/);
   });
 });
 

@@ -1,8 +1,7 @@
-// task-53.3 (docs/design/host-manager.md, phase 2), runtime side: the change_requests table (schema 8 migration),
-// and `settings set ... --reason`, `settings restart`, `upgrade` recording requests in the runtime (never applying
-// them), validated against the runtime config, host-owned keys refused with CONFLICT; `settings requests` lists
-// them and the hidden `settings requests mark` records the host's outcome. Real program, temp state, no Docker.
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+// Upgrade requests, runtime side: the change_requests table (schema 8 migration), `upgrade` recording a request in the
+// runtime (never applying it), `settings requests` listing them and the hidden `settings requests mark` recording the
+// host's outcome; `settings set` and `settings restart` are host-only. Real program, temp state, no Docker.
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Command } from 'commander';
@@ -15,7 +14,7 @@ vi.mock('../../src/core/exec.js', async (orig) => ({
 }));
 import { buildProgram } from '../../src/program.js';
 import { RuntimeDb, SCHEMA_VERSION } from '../../src/runtime/db.js';
-import { isChangeRequestId, quotedReason, recordSettingRequest, REASON_MAX } from '../../src/runtime/change-requests.js';
+import { isChangeRequestId, quotedReason, REASON_MAX } from '../../src/runtime/change-requests.js';
 import { defaults } from '../helpers.js';
 
 let state: string;
@@ -79,132 +78,43 @@ describe('change_requests migration', () => {
     } finally { up.close(); }
   });
 
-  it('a newer request for the same thing expires the open one; status transitions are checked', () => {
+  it('a newer request expires the open one; status transitions are checked', () => {
     const db = new RuntimeDb(':memory:');
     try {
-      db.addChangeRequest({ id: 'cr_00000001', kind: 'config-set', payload: { key: 'execution.maxActiveTasks', value: '3' }, reason: 'a' });
-      db.addChangeRequest({ id: 'cr_00000002', kind: 'config-set', payload: { key: 'execution.maxEngineers', value: '2' }, reason: 'b' });
-      db.addChangeRequest({ id: 'cr_00000003', kind: 'restart', payload: {}, reason: null });
-      const r = db.addChangeRequest({ id: 'cr_00000004', kind: 'config-set', payload: { key: 'execution.maxActiveTasks', value: '4' }, reason: 'c' });
+      db.addChangeRequest({ id: 'cr_00000001', kind: 'upgrade', payload: { fromContainer: null }, reason: 'a' });
+      const r = db.addChangeRequest({ id: 'cr_00000002', kind: 'upgrade', payload: { fromContainer: true }, reason: 'b' });
       expect(r.expired).toEqual(['cr_00000001']);
-      expect(db.changeRequest('cr_00000001')).toMatchObject({ status: 'expired', detail: 'superseded by cr_00000004' });
-      expect(db.changeRequests().map((x) => x.id)).toEqual(['cr_00000002', 'cr_00000003', 'cr_00000004']);
+      expect(db.changeRequest('cr_00000001')).toMatchObject({ status: 'expired', detail: 'superseded by cr_00000002' });
+      expect(db.changeRequests().map((x) => x.id)).toEqual(['cr_00000002']);
       // proposed -> confirmed -> applied; final states stay final.
-      expect(db.setChangeRequestStatus('cr_00000004', 'confirmed').status).toBe('confirmed');
-      expect(() => db.setChangeRequestStatus('cr_00000004', 'rejected')).toThrow(/is confirmed; it cannot become rejected/);
-      expect(db.setChangeRequestStatus('cr_00000004', 'applied', 'done').detail).toBe('done');
-      expect(db.setChangeRequestStatus('cr_00000004', 'applied').status).toBe('applied'); // idempotent
-      expect(() => db.setChangeRequestStatus('cr_00000004', 'failed')).toThrow(/is applied/);
+      expect(db.setChangeRequestStatus('cr_00000002', 'confirmed').status).toBe('confirmed');
+      expect(() => db.setChangeRequestStatus('cr_00000002', 'rejected')).toThrow(/is confirmed; it cannot become rejected/);
+      expect(db.setChangeRequestStatus('cr_00000002', 'applied', 'done').detail).toBe('done');
+      expect(db.setChangeRequestStatus('cr_00000002', 'applied').status).toBe('applied'); // idempotent
+      expect(() => db.setChangeRequestStatus('cr_00000002', 'failed')).toThrow(/is applied/);
       // failed stays open: it can be retried (confirmed) or rejected.
+      db.addChangeRequest({ id: 'cr_00000003', kind: 'upgrade', payload: {}, reason: null });
       db.setChangeRequestStatus('cr_00000003', 'failed', 'refused');
       expect(db.setChangeRequestStatus('cr_00000003', 'rejected').status).toBe('rejected');
-      expect(() => db.setChangeRequestStatus('cr_00000004', 'proposed')).toThrow(/is applied; it cannot become proposed/);
+      expect(() => db.setChangeRequestStatus('cr_00000002', 'proposed')).toThrow(/is applied; it cannot become proposed/);
       expect(() => db.setChangeRequestStatus('cr_99999999', 'applied')).toThrow(/No change request/);
     } finally { db.close(); }
   });
 });
 
-describe('settings set in the runtime records a request', () => {
-  it('records a proposed config-set request (validated against the runtime config); nothing is applied', async () => {
-    const { code, env } = await cli(['settings', 'set', 'execution.maxActiveTasks', '5', '--reason', 'the backlog has 12 independent tasks']);
-    expect(code).toBe(0);
-    expect(env.ok).toBe(true);
-    const d = env.data;
-    expect(d).toMatchObject({ recorded: true, applied: false, unchanged: false, dryRun: false });
-    expect(isChangeRequestId(d.request.id)).toBe(true);
-    expect(d.request).toMatchObject({ kind: 'config-set', status: 'proposed', reason: 'the backlog has 12 independent tasks',
-      payload: { key: 'execution.maxActiveTasks', value: '5', layer: 'local', baseRevision: 1 } });
-    expect(d.change).toMatchObject({ key: 'execution.maxActiveTasks', to: 5, takesEffect: 'now' });
-    expect(d.change.loosens).toMatch(/more tasks may run in parallel/);
-    expect(d.applyCommand).toBe(`minions settings apply ${d.request.id}`);
-    expect(d.message).toMatch(/recorded \(proposed, not applied\)/);
-    expect(d.message).toMatch(/never say the change was made/);
-    expect(d.message).not.toMatch(/\bapplied:/);
-    expect(rows()).toHaveLength(1);
-    // The runtime config is untouched: the runtime cannot write it.
-    expect(JSON.parse((await import('node:fs')).readFileSync(configFile, 'utf8')).execution.maxActiveTasks).toBe(defaults().execution.maxActiveTasks);
-  });
-
-  it('records host-owned keys too (the owner confirms them on the host); only secrets are refused', async () => {
-    for (const [key, value] of [['architecture', 'propose'], ['capabilities.ci.edit', 'allow'], ['verification.reviewerRequired', 'false']]) {
-      const { env } = await cli(['settings', 'set', key!, value!, '--reason', 'faster']);
-      expect(env.ok, key).toBe(true);
-      expect((env.data as { recorded: boolean; applied: boolean })).toMatchObject({ recorded: true, applied: false });
-    }
-    const secret = await cli(['settings', 'set', 'secrets.telegram', 'x', '--reason', 'r']);
-    expect(secret.env.error!.code).toBe('CONFLICT');
-    expect(secret.env.error!.message).toMatch(/secret/);
-    expect(rows()).toHaveLength(3);
-  });
-
-  it('validates before recording: invalid values, unknown keys, a missing reason, controls, shared on a private install', async () => {
-    expect((await cli(['settings', 'set', 'execution.maxActiveTasks', 'many', '--reason', 'r'])).env.error!.code).toBe('INVALID_CONFIG');
-    expect((await cli(['settings', 'set', 'execution.maxEngineers', '99', '--reason', 'r'])).env.error!.code).toBe('INVALID_CONFIG'); // > maxActiveTasks (cross-field rule)
-    expect((await cli(['settings', 'set', 'no.such.key', '1', '--reason', 'r'])).env.error!.code).toBe('INVALID_CONFIG');
-    const noReason = await cli(['settings', 'set', 'execution.maxActiveTasks', '5']);
-    expect(noReason.env.error).toMatchObject({ code: 'PRECONDITION' });
-    expect(noReason.env.error!.message).toMatch(/needs a reason/);
-    expect((await cli(['settings', 'set', 'pause.starts', 'paused', '--reason', 'r'])).env.error!.message).toMatch(/runtime control/);
-    writeConfig({ visibility: 'private' });
-    expect((await cli(['settings', 'set', 'execution.maxActiveTasks', '5', '--shared', '--reason', 'r'])).env.error!.message).toMatch(/private install/);
-    expect((await cli(['settings', 'set', 'execution.maxActiveTasks', '5', '--yes', '--reason', 'r'])).env.error!.message).toMatch(/--yes: host-only/);
-    expect((await cli(['settings', 'set', 'execution.maxActiveTasks', '5', '--expect-revision', '1', '--reason', 'r'])).env.error!.message).toMatch(/--expect-revision: host-only/);
-    expect(rows()).toHaveLength(0);
-  });
-
-  it('the `config set` alias records the same request and refuses the same direct-apply options (task-53.10)', async () => {
-    const { code, env } = await cli(['config', 'set', 'execution.maxActiveTasks', '5', '--reason', 'more parallelism']);
-    expect(code).toBe(0);
-    expect(env.data).toMatchObject({ recorded: true, applied: false, unchanged: false, dryRun: false });
-    expect(env.data.request).toMatchObject({ kind: 'config-set', status: 'proposed', reason: 'more parallelism',
-      payload: { key: 'execution.maxActiveTasks', value: '5', layer: 'local' } });
-    expect(env.data.applyCommand).toBe(`minions settings apply ${env.data.request.id}`);
-    expect(rows()).toHaveLength(1);
-    expect(JSON.parse(readFileSync(configFile, 'utf8')).execution.maxActiveTasks).toBe(defaults().execution.maxActiveTasks);
-    for (const [flag, extra] of [['--yes', []], ['--restart', []], ['--no-restart', []], ['--expect-revision', ['1']]] as const) {
-      const r = await cli(['config', 'set', 'execution.maxActiveTasks', '6', flag, ...extra, '--reason', 'r']);
-      expect(r.env.ok, flag).toBe(false);
-      expect(r.env.error, flag).toMatchObject({ code: 'PRECONDITION' });
-      expect(r.env.error!.message, flag).toMatch(new RegExp(`${flag}: host-only`));
-    }
-    expect((await cli(['config', 'set', 'execution.maxActiveTasks', '6'])).env.error!.message).toMatch(/needs a reason/);
-    expect(rows()).toHaveLength(1); // only the first request was recorded
-  });
-
-  it('an unchanged value and --dry-run record nothing', async () => {
-    const same = await cli(['settings', 'set', 'execution.maxActiveTasks', String(defaults().execution.maxActiveTasks), '--reason', 'r']);
-    expect(same.env.data).toMatchObject({ recorded: false, applied: false, unchanged: true });
-    const dry = await cli(['settings', 'set', 'execution.maxActiveTasks', '6', '--reason', 'r', '--dry-run']);
-    expect(dry.env.data).toMatchObject({ recorded: false, applied: false, dryRun: true, request: null });
-    expect(dry.env.data.message).toMatch(/dry run: would record/);
-    expect(rows()).toHaveLength(0);
-  });
-
-  it('a shared install (the project-owner default) may request the shared layer; reasons are capped and shown quoted and cut', async () => {
-    const { env } = await cli(['settings', 'set', 'models.selection', 'fixed', '--shared', '--reason', 'x'.repeat(REASON_MAX + 50)]);
-    expect(env.data.request.payload.layer).toBe('shared');
-    expect(env.data.request.reason).toHaveLength(REASON_MAX);
-    expect(quotedReason(env.data.request.reason)).toHaveLength(300 + 3); // quotes + ellipsis
-    expect(quotedReason('evil\u001b[2Jtext‮')).toBe('"eviltext<U+202E>"');
-  });
-});
-
-describe('settings restart and upgrade in the runtime record requests', () => {
-  it('settings restart records a restart request (reason optional)', async () => {
-    const { env } = await cli(['settings', 'restart', '--reason', 'new attemptMaxTurns']);
-    expect(env.data).toMatchObject({ recorded: true, applied: false, request: { kind: 'restart', status: 'proposed', reason: 'new attemptMaxTurns', payload: {} } });
-    const again = await cli(['settings', 'restart']);
-    expect(again.env.data.expired).toEqual([env.data.request.id]);
-    expect(rows().map((r) => r.status)).toEqual(['expired', 'proposed']);
-  });
-
-  it('upgrade records an upgrade request with --from-container [branch]; drain and CLI options are refused', async () => {
+describe('upgrade in the runtime records a request', () => {
+  it('records an upgrade request with --from-container [branch]; drain and CLI options are refused', async () => {
     const plain = await cli(['upgrade', '--reason', 'new minions release']);
-    expect(plain.env.data.request).toMatchObject({ kind: 'upgrade', payload: { fromContainer: null } });
+    expect(plain.code).toBe(0);
+    expect(plain.env.data).toMatchObject({ recorded: true, applied: false, dryRun: false });
+    expect(isChangeRequestId(plain.env.data.request.id)).toBe(true);
+    expect(plain.env.data.request).toMatchObject({ kind: 'upgrade', status: 'proposed', reason: 'new minions release', payload: { fromContainer: null }, summary: 'upgrade' });
+    expect(plain.env.data.message).toMatch(/recorded \(proposed, not applied\)/);
     const fc = await cli(['upgrade', '--from-container', '--reason', 'sync']);
     expect(fc.env.data.request.payload).toEqual({ fromContainer: true });
+    expect(fc.env.data.expired).toEqual([plain.env.data.request.id]);
     const fcb = await cli(['upgrade', '--from-container', 'release/1.2', '--reason', 'sync']);
-    expect(fcb.env.data.request.payload).toEqual({ fromContainer: 'release/1.2' });
+    expect(fcb.env.data.request).toMatchObject({ payload: { fromContainer: 'release/1.2' }, summary: 'upgrade --from-container release/1.2' });
     expect((await cli(['upgrade', '--from-container', '--evil', '--reason', 'x'])).env.ok).toBe(false);
     for (const flag of [['--now'], ['--timeout', '10'], ['--rebuild-cli'], ['--sync-only']]) {
       const r = await cli(['upgrade', ...flag, '--reason', 'x']);
@@ -213,17 +123,37 @@ describe('settings restart and upgrade in the runtime record requests', () => {
     }
     expect(rows().filter((r) => r.status === 'proposed')).toHaveLength(1); // each upgrade request replaced the previous one
   });
+
+  it('--dry-run records nothing; reasons are optional, capped and shown quoted and cut', async () => {
+    const dry = await cli(['upgrade', '--from-container', '--reason', 'r', '--dry-run']);
+    expect(dry.env.data).toMatchObject({ recorded: false, applied: false, dryRun: true, request: null });
+    expect(dry.env.data.message).toMatch(/dry run: would record/);
+    expect(rows()).toHaveLength(0);
+    expect((await cli(['upgrade'])).env.data.request.reason).toBeNull();
+    const long = await cli(['upgrade', '--reason', 'x'.repeat(REASON_MAX + 50)]);
+    expect(long.env.data.request.reason).toHaveLength(REASON_MAX);
+    expect(quotedReason(long.env.data.request.reason)).toHaveLength(300 + 3); // quotes + ellipsis
+    expect(quotedReason('evil\u001b[2Jtext‮')).toBe('"eviltext<U+202E>"');
+  });
+
+  it('settings set and settings restart are host-only in the runtime; nothing is recorded', async () => {
+    const set = await cli(['settings', 'set', 'execution.maxActiveTasks', '5']);
+    expect(set.env.error).toMatchObject({ code: 'INCOMPATIBLE_RUNTIME', hint: expect.stringContaining('minions control set') });
+    expect((await cli(['config', 'set', 'execution.maxActiveTasks', '5'])).env.error!.code).toBe('INCOMPATIBLE_RUNTIME');
+    const restart = await cli(['settings', 'restart']);
+    expect(restart.env.error).toMatchObject({ code: 'INCOMPATIBLE_RUNTIME', hint: expect.stringContaining('minions coordinator restart --recover --detach') });
+    expect(rows()).toHaveLength(0);
+  });
 });
 
 describe('settings requests (runtime)', () => {
   it('lists open requests (--all: every status) and records the host outcome with the hidden mark', async () => {
-    const a = (await cli(['settings', 'set', 'execution.maxActiveTasks', '5', '--reason', 'r'])).env.data.request.id as string;
-    const b = (await cli(['settings', 'restart'])).env.data.request.id as string;
+    const a = (await cli(['upgrade', '--reason', 'r'])).env.data.request.id as string;
     const list = await cli(['settings', 'requests']);
-    expect(list.env.data.requests.map((r: { id: string }) => r.id)).toEqual([a, b]);
-    expect(list.env.data.requests[0]).toMatchObject({ id: a, kind: 'config-set', status: 'proposed', summary: 'settings set execution.maxActiveTasks 5' });
+    expect(list.env.data.requests).toEqual([expect.objectContaining({ id: a, kind: 'upgrade', status: 'proposed', summary: 'upgrade' })]);
     expect((await cli(['settings', 'requests', 'mark', a, '--status', 'confirmed'])).env.data.status).toBe('confirmed');
-    expect((await cli(['settings', 'requests', 'mark', a, '--status', 'applied', '--detail', 'written'])).env.data).toMatchObject({ status: 'applied', detail: 'written' });
+    expect((await cli(['settings', 'requests', 'mark', a, '--status', 'applied', '--detail', 'synced'])).env.data).toMatchObject({ status: 'applied', detail: 'synced' });
+    const b = (await cli(['upgrade'])).env.data.request.id as string;
     expect((await cli(['settings', 'requests', 'mark', b, '--status', 'rejected'])).env.data.status).toBe('rejected');
     expect((await cli(['settings', 'requests'])).env.data.requests).toEqual([]);
     expect((await cli(['settings', 'requests', '--all'])).env.data.requests.map((r: { status: string }) => r.status)).toEqual(['applied', 'rejected']);
@@ -231,59 +161,24 @@ describe('settings requests (runtime)', () => {
     expect((await cli(['settings', 'requests', 'mark', a, '--status', 'failed'])).env.error!.code).toBe('CONFLICT');
   });
 
-  it('status lists the open requests, so nothing is lost while the host manager is down (task-53.6)', async () => {
+  it('rows of the removed kinds (config-set, restart) in an old database are never listed', async () => {
+    const db = openState();
+    try {
+      db.exec("INSERT INTO change_requests (id, kind, payload, reason, created_at, status, updated_at) VALUES ('cr_0000000a', 'config-set', '{}', null, '2026-01-01T00:00:00Z', 'proposed', '2026-01-01T00:00:00Z')");
+      db.exec("INSERT INTO change_requests (id, kind, payload, reason, created_at, status, updated_at) VALUES ('cr_0000000b', 'restart', '{}', null, '2026-01-01T00:00:00Z', 'proposed', '2026-01-01T00:00:00Z')");
+    } finally { db.close(); }
+    const id = (await cli(['upgrade'])).env.data.request.id as string;
+    expect((await cli(['settings', 'requests', '--all'])).env.data.requests.map((r: { id: string }) => r.id)).toEqual([id]);
+  });
+
+  it('status lists the open requests', async () => {
     const { humanStatus } = await import('../../src/runtime/commands.js');
     expect((await cli(['status'])).env.data.changeRequests).toEqual({ open: 0, items: [] });
-    const id = (await cli(['settings', 'restart'])).env.data.request.id as string;
+    const id = (await cli(['upgrade', '--from-container'])).env.data.request.id as string;
     const st = (await cli(['status'])).env.data;
-    expect(st.changeRequests).toEqual({ open: 1, items: [expect.objectContaining({ id, kind: 'restart', status: 'proposed' })] });
+    expect(st.changeRequests).toEqual({ open: 1, items: [expect.objectContaining({ id, kind: 'upgrade', status: 'proposed' })] });
     const text = humanStatus(st);
-    expect(text).toContain('change requests: 1 open');
+    expect(text).toContain('upgrade requests: 1 open');
     expect(text).toMatch(new RegExp(`${id} proposed `));
-  });
-
-  it('apply and reject are host-only', async () => {
-    const id = (await cli(['settings', 'restart'])).env.data.request.id as string;
-    for (const sub of ['apply', 'reject']) {
-      const r = await cli(['settings', sub, id]);
-      expect(r.env.error!.code).toBe('INCOMPATIBLE_RUNTIME');
-      expect(r.env.error!.hint).toContain(`minions settings apply ${id}`);
-    }
-    expect(rows()[0]!.status).toBe('proposed');
-  });
-});
-
-describe('recordSettingRequest (unit)', () => {
-  it('validates a host-owned value like any other before recording', () => {
-    const db = new RuntimeDb(':memory:');
-    try {
-      expect(() => recordSettingRequest({ db, config: defaults() }, 'architecture', 'not-a-choice', { reason: 'r' })).toThrow();
-      expect(db.changeRequests({ all: true })).toEqual([]);
-    } finally { db.close(); }
-  });
-});
-
-describe('recordSettingRequest: verification commands (task-136)', () => {
-  it('records verification.setupCommands and verification.commands (";"-separated, commas kept) instead of "Unknown setting"', () => {
-    const db = new RuntimeDb(':memory:');
-    try {
-      const setup = recordSettingRequest({ db, config: defaults() }, 'verification.setupCommands', 'npm ci', { reason: 'integration has no node_modules' });
-      expect(setup.recorded).toBe(true);
-      expect(setup.change).toMatchObject({ key: 'verification.setupCommands', from: undefined, to: ['npm ci'], takesEffect: 'now' });
-      expect(setup.change!.loosens).toMatch(/runs `npm ci` in the integration worktree/);
-      const cmds = recordSettingRequest({ db, config: defaults() }, 'verification.commands', 'npm run typecheck; node -e "console.log(1,2)"', { reason: 'add a check' });
-      expect(cmds.change).toMatchObject({ to: ['npm run typecheck', 'node -e "console.log(1,2)"'] });
-      expect(db.changeRequests({ all: true }).map((r) => JSON.parse(r.payload).key).sort()).toEqual(['verification.commands', 'verification.setupCommands']);
-    } finally { db.close(); }
-  });
-
-  it('dropping a verification command is reported as loosening', () => {
-    const db = new RuntimeDb(':memory:');
-    try {
-      const cfg = defaults();
-      cfg.verification.commands = ['npm run typecheck', 'npm test'];
-      const r = recordSettingRequest({ db, config: cfg }, 'verification.commands', 'npm test', { reason: 'r', dryRun: true });
-      expect(r.change!.loosens).toMatch(/verified without `npm run typecheck`/);
-    } finally { db.close(); }
   });
 });

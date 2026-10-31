@@ -2,8 +2,7 @@
 // everything outside the allow list") mode's argv name. Claude Code 2.1.292 lists `manual` where older
 // versions listed `default` (the same mode under its new name), so callers that want the strict mode
 // pass `default` when the CLI lists it, `manual` when it lists only that, and fail closed when it lists
-// neither. Never a looser mode. Shared by the coordinator (src/runtime/coordinator.ts) and the setup
-// assistant (src/host/assistant.ts); the host manager assistant can switch to it too.
+// neither. Never a looser mode. Used by the coordinator (src/runtime/coordinator.ts).
 import { run, type RunOptions, type RunResult } from '../core/exec.js';
 
 type HelpRunner = (cmd: string, args: string[], opts?: RunOptions) => Promise<RunResult>;

@@ -174,7 +174,7 @@ export interface DigestInput {
   /** The backlog (null when it could not be read). */
   tasks: DigestTask[] | null;
   merged: { taskId: string; at: string }[];
-  /** Publications and merges waiting for a host-signed approval (the manager chat's /approve). */
+  /** Publications and merges waiting for a host-signed approval (`minions work approve` on the host). */
   approvals: { taskId: string; head: string }[];
   /**
    * Local integration (task-82.4) since `since`: failed integrations (conflict, red, refused: sent back for a repair;
@@ -254,7 +254,7 @@ export function composeDigest(i: DigestInput): Digest {
   // Display order: what the owner acts on first (approvals, blockers), then what they read; questions last, next to
   // the answer hint.
   add('Waiting for you', [
-    ...approvals.map((a) => ({ text: `- ${title(a.taskId)}: merge approval, send in the manager chat: /approve ${a.taskId} ${a.head} merge`, key: null })),
+    ...approvals.map((a) => ({ text: `- ${title(a.taskId)}: merge approval, on the host: minions work approve ${a.taskId} --head ${a.head}`, key: null })),
     ...all.filter((t) => t.status === 'awaiting-human').map((t) => ({ text: `- ${title(t.id)}: needs your answer${qOf.has(t.id) ? ` (Q${qOf.get(t.id)})` : ''}`, key: null })),
     ...ofKind('approval').map((x) => ({ text: `- ${oneLine(x.text)}`, key: x.key })),
   ]);

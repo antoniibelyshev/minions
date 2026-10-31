@@ -135,7 +135,6 @@ describe('CLI surface (docs/design/cli-surface.md)', () => {
       [['backlog', '--help'], ['ready', 'list', 'show', 'create', 'update', 'note', 'export']],
       [['hook', '--help'], ['stop', 'pre-agent', 'pre-telegram', 'pre-bash', 'pre-file']],
       [['coordinator', '--help'], ['run', 'sync', 'restart']],
-      [['manager', '--help'], ['run']],
       [['workspace', '--help'], ['setup', 'import', 'export']],
       [['auth', '--help'], ['show', 'set', 'refresh', 'telegram', 'codex']],
       [['help', 'work'], ['claim', 'record']],
@@ -189,9 +188,9 @@ describe('CLI surface (docs/design/cli-surface.md)', () => {
     expect(out).toContain('Usage: minions down|stop');
   });
 
-  it('`status --check`, `doctor` and `manager run` fail closed with INCOMPATIBLE_RUNTIME inside the container (no stack trace)', async () => {
+  it('`status --check` and `doctor` fail closed with INCOMPATIBLE_RUNTIME inside the container (no stack trace)', async () => {
     // requireMode('host') runs before any runtime state is opened, so this never touches /state.
-    for (const args of [['status', '--check'], ['doctor'], ['manager', 'run']]) {
+    for (const args of [['status', '--check'], ['doctor']]) {
       const { out, code } = await runIn('container', [...args, '--json']);
       expect(code, args.join(' ')).toBe(6);
       const parsed = JSON.parse(out) as { ok: boolean; error: { code: string; hint?: string } };
@@ -271,14 +270,9 @@ describe('back-compat: every `minions ...` call shipped to agents, hooks and ins
     check(found, 'the generated plugin');
   });
 
-  it('install.sh and the setup and manager assistant templates', async () => {
+  it('install.sh', async () => {
     const install = invocations(await readFile(join(root, 'install.sh'), 'utf8'), { shell: true });
     expect(install).toContainEqual(['setup']);
     check(install, 'install.sh');
-    const assistant = (await textFiles(join(root, 'templates', 'assistant'))).flatMap((t) => invocations(t));
-    check(assistant, 'templates/assistant');
-    const managerAssistant = (await textFiles(join(root, 'templates', 'manager-assistant'))).flatMap((t) => invocations(t));
-    expect(managerAssistant.length).toBeGreaterThan(0);
-    check(managerAssistant, 'templates/manager-assistant');
   });
 });

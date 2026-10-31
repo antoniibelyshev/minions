@@ -26,7 +26,6 @@ Everything the model controls runs inside one Docker container per project. Your
 - [Models and budgets](#models-and-budgets)
 - [Other agents (OpenAI Codex)](#other-agents-openai-codex)
 - [Communication](#communication)
-- [Setup assistant](#setup-assistant)
 - [Claude authorization](#claude-authorization)
 - [Security model](#security-model)
 - [Running without Docker](#running-without-docker)
@@ -115,7 +114,7 @@ That one command asks everything it needs and runs the whole setup. You don't ne
 2. **Local integration (optional).** *Integrate approved tasks automatically?* (default no). Yes records `delivery.merge: "auto-when-eligible"` in the host-only `config.local.json`: the runtime merges each approved head into the container's local base after its own verification (see [Delivery, review, and merging](#delivery-review-and-merging)).
 3. **Telegram (optional).** *Set up Telegram?* It gives BotFather guidance, reads the bot token without echo, and prints the pairing instructions. With the default `communication.channel` `auto`, a stored token is enough; the host runtime has no Telegram, so this step is skipped there.
 4. **Runtime.** It builds the image if needed, starts the container (or prepares the host runtime), imports the committed history of the base branch, and launches the coordinator. Then it prints exactly how to attach (`minions start`), how to log in to Claude (`/login`, login method in the container), and how to pair Telegram (`/telegram:access pair <code>` in the coordinator terminal).
-5. **Setup assistant.** Finally it offers the AI setup assistant (`minions setup assist`, Claude Code on the host with a minions setup skill) to finish whatever is left, then offers to attach the coordinator.
+5. **Attach.** Finally it offers to attach the coordinator.
 
 If you decline a step, setup skips it and prints how to enable it later. Rerunning `minions setup` is safe. It detects the existing configuration, stored tokens, container, and imported repository, and offers to keep or change each one without duplicating anything. Integration choices that differ from the project configuration (`delivery.merge`, `communication.channel`) are recorded in the host-only `config.local.json`.
 
@@ -165,7 +164,7 @@ These are the only commands you need day to day. `minions --help` lists exactly 
 | `minions setup [path]` | Install, configure or reconfigure minions for a repository. Safe to rerun. |
 | `minions start` | Start the team (if needed) and attach to the coordinator. Use it after a reboot or to resume work. |
 | `minions status` | Queue, workers, pause state and channel. `minions status --check` checks the host, Docker, the container and Claude authorization. |
-| `minions settings` | Change everyday settings in a menu: merge mode, testing, reporting, models, concurrency, permissions, tokens (shown only as provisioned/missing), pause/resume. `minions settings --list` and `minions settings set <key> <value>` do the same from scripts. See [Changing settings](#changing-settings). |
+| `minions settings` | List every setting with its value, source and how a change takes effect: merge mode, testing, reporting, models, concurrency, permissions, tokens (shown only as provisioned/missing), pause/resume. `minions settings set <key> <value>` changes one. See [Changing settings](#changing-settings). |
 | `minions upgrade` | Move the running team onto the installed minions version without losing work. Running workers commit their progress and hand back; they continue after the upgrade. |
 | `minions down` (or `minions stop`) | Stop the team. Data and progress are kept; `minions start` resumes. |
 | `minions uninstall` | Remove minions from the project, keeping task data unless you ask otherwise. |
@@ -312,7 +311,7 @@ Briefs and worker results go through files under `/state`, not through the coord
 
 **Routine context resets (on by default).** To keep its context small, the coordinator restarts itself with a fresh context when no worker is running and a trigger holds: a task was delivered, its context reached about 60k tokens, or 10 worker hand-offs happened. It first writes a short handoff (`minions coordinator handoff`: open questions, pending decisions, what it waits on; at most 4 KB, secrets redacted), which the new session reads at startup. All other state is durable. Tune or turn it off with `coordinator.contextReset` (`{ "enabled": false }`); see [design/bootstrap.md](docs/design/bootstrap.md#coordinator-context-resets).
 
-**Unattended routine (off by default).** With `routine.enabled` on, a deterministic routine pass (`minions sync --routine`) runs every `routine.tickMinutes` (default 15) and makes a wake decision. It costs no model tokens. The coordinator wrapper runs the clock; the host manager is the watchdog (it runs the pass when the last one is older than 2 intervals). Only then does the runtime restart the coordinator on its own: it wakes an idle coordinator with a fresh session (constant prompt `/minions:orchestrate wake`) when a model is needed (a runnable stage, an unvalidated or `needs_split` result, a task that reached `awaiting-human`). A wake needs no active worker lease, no drain, starts not paused, budget left, 10 minutes of transcript idle and no owner message in the last 30 minutes, and it is capped by `routine.minWakeGapMinutes` (30) and `routine.maxWakesPerDay` (8). A coordinator that crashed is started again with the recovery prompt at most twice a day. Without `routine.enabled`, the runtime never restarts the coordinator on its own. `minions status` shows the last and the next pass; see [design/unattended-delivery.md](docs/design/unattended-delivery.md).
+**Unattended routine (off by default).** With `routine.enabled` on, a deterministic routine pass (`minions sync --routine`) runs every `routine.tickMinutes` (default 15) and makes a wake decision. It costs no model tokens. The coordinator wrapper runs the clock. Only then does the runtime restart the coordinator on its own: it wakes an idle coordinator with a fresh session (constant prompt `/minions:orchestrate wake`) when a model is needed (a runnable stage, an unvalidated or `needs_split` result, a task that reached `awaiting-human`). A wake needs no active worker lease, no drain, starts not paused, budget left, 10 minutes of transcript idle and no owner message in the last 30 minutes, and it is capped by `routine.minWakeGapMinutes` (30) and `routine.maxWakesPerDay` (8). A coordinator that crashed is started again with the recovery prompt at most twice a day. Without `routine.enabled`, the runtime never restarts the coordinator on its own. `minions status` shows the last and the next pass; see [design/unattended-delivery.md](docs/design/unattended-delivery.md).
 
 ## Custom roles
 
@@ -326,43 +325,33 @@ The engineer, tester and reviewer are the built-in roles. A project can add its 
 
 **Workflows.** `workflows.<name>` is an ordered list of stages, each a role name or `{ "role", "when": "qa", "model" }`. The coordinator assigns one when it creates a task (`minions backlog create ... --workflow <name>`); tasks without one run the default (engineer, tester when QA is required, reviewer). With `verification.reviewerRequired`, a gate must come after the last stage that commits, and a task that needs QA always gets a tester before its final gate, whatever its workflow.
 
-**Approval path.** The coordinator can only propose a role; you apply it on the host:
+**How a role is added.** The coordinator owns the configuration: it writes a partial config (the role under `roles.<name>` with an inline `promptText`, and the workflow that uses it) and applies it with `minions control apply --file <f> --reason <why> --json`. The change is validated like any config (an invalid one is refused with the field named, nothing is written), journaled and undoable (`minions control undo`), and takes effect for the next stage. `minions control show --json` shows what it set. You can also edit `roles` and `workflows` by hand on the host; validation is the same.
 
-1. The coordinator writes a proposal and stores it with `minions config roles propose --file <f> --json`. The CLI validates it with the config rules and stores it in the runtime database. Nothing becomes effective; you get a summary (fields, tools, edit scope, the policy row the role implies) and the apply command.
-2. You run `minions config roles apply <proposalId>` **on the host**, in the repository. It reads the proposal from the running runtime, validates it again against the host config, shows the config diff and the prompt, states on a `LOOSENS:` line every capability the role would get looser than your profile (for example `base.merge ask -> allow`), and asks (`--yes` to skip, `--dry-run` to only show the diff). It writes `roles.<name>`, the proposed workflows and the prompt file, bumps `configRevision`, regenerates the runtime config and the plugin, and marks the proposal applied. Inside the container (or by an agent of the host runtime) `apply` is rejected.
-3. Apply never commits and never restarts. Shared installs: commit `.minions/config.json` and `.minions/agents/<name>.md`. The coordinator loads agent definitions at session start, so restart it: `minions settings restart` (graceful, refused while workers run) or `minions down && minions start`, or let its idle restart pick it up.
-
-`minions config roles list` and `minions config roles show <name|proposalId>` are read-only. `minions config roles remove <name>` (host only) removes a project role; it is refused while a configured workflow or an active lease uses the role. You can also edit `roles` and `workflows` by hand on the host; validation is the same.
-
-**Worked example: a researcher.** Research questions keep coming up, and their output is a notes file, not code. The coordinator proposes a researcher that may write only under `docs/research/`, plus a `research` workflow that sends its notes to the reviewer:
+**Worked example: a researcher.** Research questions keep coming up, and their output is a notes file, not code. The coordinator adds a researcher that may write only under `docs/research/`, plus a `research` workflow that sends its notes to the reviewer:
 
 ```json
 {
-  "name": "researcher",
-  "role": {
-    "description": "Researches a question and writes findings to a notes file. No code edits.",
-    "contract": "producer",
-    "edits": { "paths": ["docs/research/**"] },
-    "tools": ["Read", "Grep", "Glob", "Bash", "Edit", "Write", "WebSearch", "WebFetch"],
-    "model": "sonnet",
-    "requires": ["network.use"]
+  "roles": {
+    "researcher": {
+      "description": "Researches a question and writes findings to a notes file. No code edits.",
+      "contract": "producer",
+      "edits": { "paths": ["docs/research/**"] },
+      "tools": ["Read", "Grep", "Glob", "Bash", "Edit", "Write", "WebSearch", "WebFetch"],
+      "model": "sonnet",
+      "requires": ["network.use"],
+      "promptText": "You research the question in the task. Read the code and the sources you need, then write your findings to docs/research/<task-id>.md: the question, the answer, the evidence (links, file references), open points. Never edit code, tests or configuration. Commit the notes file on the task branch."
+    }
   },
-  "promptText": "You research the question in the task. Read the code and the sources you need, then write your findings to docs/research/<task-id>.md: the question, the answer, the evidence (links, file references), open points. Never edit code, tests or configuration. Commit the notes file on the task branch.",
-  "reason": "Recurring research tasks need web access and a notes file, not code edits.",
   "workflows": { "research": ["researcher", "reviewer"] }
 }
 ```
 
 ```sh
 # inside the runtime (the coordinator does this)
-minions config roles propose --file /tmp/researcher.json --json   # -> proposalId rp_1a2b3c4d, summary, applyCommand
-
-# on the host, after reading the summary
-minions config roles apply rp_1a2b3c4d     # shows the diff and agents/researcher.md, asks, writes, configRevision + 1
-minions settings restart                   # the coordinator now knows minions:researcher
+minions control apply --file /tmp/researcher.json --reason "recurring research tasks need web access and a notes file" --json
 ```
 
-After the restart, the coordinator creates research tasks with `--workflow research`. `minions work next` then offers a `researcher` stage first (agent `minions:researcher`, model `sonnet`) and a `reviewer` stage after it. The researcher's commit may touch only `docs/research/**`, so a code edit makes its result invalid. `requires: ["network.use"]` makes the claim fail with a clear reason under a policy that does not allow the network. WebSearch and WebFetch also need a container network that allows outbound traffic.
+The coordinator then creates research tasks with `--workflow research`. `minions work next` offers a `researcher` stage first (agent `minions:researcher`, model `sonnet`) and a `reviewer` stage after it. The researcher's commit may touch only `docs/research/**`, so a code edit makes its result invalid. `requires: ["network.use"]` makes the claim fail with a clear reason under a policy that does not allow the network. WebSearch and WebFetch also need a container network that allows outbound traffic.
 
 ## Delivery, review, and merging
 
@@ -373,7 +362,7 @@ minions works only locally: it never pushes or talks to GitHub; you push the bas
 | `disabled` (default) | Commits locally, writes a handoff; the coordinator integrates approved branches into the local base (by profile) |
 | `auto-when-eligible` | The runtime's local integrator merges each approved head, verifies the merged tree, and fast-forwards the local base (automatic local integration); the coordinator merges nothing |
 
-**Approvals are signed on the host.** If a change touches a sensitive path (or `base.merge` is `ask`), nothing lands until you approve that exact commit with `minions work approve <taskId> --head <sha>` **on the host** (in the repository, not inside the container), or with `/approve <task> <sha>` in the manager chat. The host signs the approval with a per-project key the container cannot read, and the runtime checks the signature before it lands the commit. An approval recorded inside the container (by the coordinator, a worker, or a script) is rejected. `minions work publish <taskId>` queues the integration again after an approval or a transient failure.
+**Approvals are signed on the host.** If a change touches a sensitive path (or `base.merge` is `ask`), nothing lands until you approve that exact commit with `minions work approve <taskId> --head <sha>` **on the host** (in the repository, not inside the container). The host signs the approval with a per-project key the container cannot read, and the runtime checks the signature before it lands the commit. An approval recorded inside the container (by the coordinator, a worker, or a script) is rejected. `minions work publish <taskId>` queues the integration again after an approval or a transient failure.
 
 **How the base reaches your remote.** In the `project-owner` profile the coordinator integrates each approved branch into the container's base branch itself (`personal-work` asks before each merge, `supervised` never merges) through a gate: `git merge --no-ff --no-commit` of the approved branch, then every configured verification command on the merged tree (for example `npm run typecheck` and `npm test`); it commits the merge only when all of them pass, and otherwise aborts it (the base has not moved) and sends the task back for a repair. With automatic local integration on, the runtime runs this gate itself (see [Merging](#coordinator-defaults)); the coordinator never merges. The integrated base stays in the container's clone until you take it, on the host, in your repository:
 
@@ -405,7 +394,7 @@ Authority is a set of independent capabilities. Each rule is `allow`, `ask`, or 
 
 ### Coordinator permission mode
 
-The coordinator Claude Code session (and the workers it spawns) runs in permission mode **`auto`** by default, in both runtimes. The fixed rules are the same in every mode: `git push` and recording an approval (`minions work approve` / `minions approve`) are denied, so the coordinator never blocks on a prompt for them. Approvals are signed by you on the host (`/approve` in the manager chat, or the host terminal).
+The coordinator Claude Code session (and the workers it spawns) runs in permission mode **`auto`** by default, in both runtimes. The fixed rules are the same in every mode: `git push` and recording an approval (`minions work approve` / `minions approve`) are denied, so the coordinator never blocks on a prompt for them. Approvals are signed by you in the host terminal.
 
 | `coordinator.permissionMode` | What prompts |
 | - | - |
@@ -461,7 +450,7 @@ minions config show --explain     # advanced: the raw effective config, every va
 
 ### Changing settings
 
-`minions settings` opens a menu in the terminal: arrow keys (or j/k) move through grouped sections (Delivery, Verification, Reporting, Models, Concurrency, Policy, Permissions, Integrations, Pause, Agents, Container), Enter edits the selected item, q quits. Each row shows the current value and where it comes from; the selected row shows a one-line description and how a change takes effect. Without a terminal the menu falls back to numbered prompts. For scripts:
+`minions settings` (or `minions settings --list`) lists every setting in grouped sections (Delivery, Verification, Reporting, Models, Concurrency, Policy, Permissions, Integrations, Pause, Agents, Container) with its current value, where it comes from and how a change takes effect. `settings set` changes one:
 
 ```sh
 minions settings --list [--json]                      # every setting, value, source, restart/loosening flags
@@ -474,8 +463,8 @@ minions settings restart                              # graceful coordinator res
 - **Validation first.** Every edit is checked with the full config schema against all layers before anything is written; an invalid value (say `maxEngineers` above `maxActiveTasks`) is rejected with the reason.
 - **Where it is saved.** Changes go to the host-only `config.local.json` of the project. On a shared install, `--shared` writes the committed `.minions/config.json` instead (with a `configRevision` bump; commit it yourself). A local override can't lift a `deny` set in the project config.
 - **No silent loosening.** A change that widens what the team may do (more concurrency or turns, skipping the reviewer or tester, automatic local integration, starting tasks without asking, a looser capability or permission mode) shows what it allows and needs a yes; `set` needs `--yes` without a terminal.
-- **Taking effect.** Each save regenerates the runtime config and the mounted plugin. Concurrency (max active tasks and engineers), repair cycles, context resets and pause/resume take effect on the runtime's next command. Settings the coordinator and worker definitions read at session start (delivery, verification, reporting, models including the default model, the per-attempt turn limit, permissions) and launch settings (channel, coordinator model, effort, permission mode, the coordinator tool trim, tool search and bundled skills) need a coordinator restart: `settings` offers it (`set --restart` / `--no-restart` decide up front). The restart is graceful: it is refused while workers are active, and `minions settings restart` retries it later. Container resource limits (CPUs, memory, process limit, /tmp size) take effect with `minions upgrade`, which recreates the container with them (volumes kept).
-- **Tokens.** The Telegram and OpenAI (Codex) key items show only provisioned/missing; selecting one runs `minions auth telegram` / `minions auth codex`.
+- **Taking effect.** Each save regenerates the runtime config and the mounted plugin. Concurrency (max active tasks and engineers), repair cycles, context resets and pause/resume take effect on the runtime's next command. Settings the coordinator and worker definitions read at session start (delivery, verification, reporting, models including the default model, the per-attempt turn limit, permissions) and launch settings (channel, coordinator model, effort, permission mode, the coordinator tool trim, tool search and bundled skills) need a coordinator restart: `settings set` offers it (`set --restart` / `--no-restart` decide up front). The restart is graceful: it is refused while workers are active, and `minions settings restart` retries it later. Container resource limits (CPUs, memory, process limit, /tmp size) take effect with `minions upgrade`, which recreates the container with them (volumes kept).
+- **Tokens.** The Telegram and OpenAI (Codex) key items show only provisioned/missing; store or remove them with `minions auth telegram` / `minions auth codex`.
 
 `minions config` stays as an advanced alias: `config show [--explain]` (raw effective config), `config list` (= `settings --list`), `config set` (= `settings set`).
 
@@ -488,7 +477,7 @@ Each change is classified by when it takes effect (`minions settings --list --js
 | upgrade (`recreate`) | Container resources, network, published ports and mounts, the git identity: `minions upgrade` recreates the container (volumes kept) |
 | migration (`fixed`) | Switching backlog backend, switching private and shared visibility |
 
-Tightening permissions suspends the affected external actions immediately. A worker still running on an older config revision is blocked from sensitive external operations. The coordinator can request a change to **any** setting, host-owned ones included (capabilities, delivery, permission mode, sandbox, container resources, models, concurrency): `minions settings set <key> <value> --reason <text>` in the runtime records a change request, and it does so on its own when it sees that a change would help. Nothing changes until you confirm the host-computed plan, with `minions settings apply <id>` in the terminal or one tap in the manager chat (two when the plan loosens policy). Only tokens and other secrets stay with you (`minions auth ...`). New worker roles go through `minions config roles propose` and `minions config roles apply <id>`.
+Tightening permissions suspends the affected external actions immediately. A worker still running on an older config revision is blocked from sensitive external operations. The coordinator changes configuration itself with `minions control set <key> <json> --reason <text>` (validated, journaled, undoable with `minions control undo`; a change to a host-owned key also notifies you), and adds worker roles the same way (see [Custom roles](#custom-roles)). For a newer minions or a container setting it records an upgrade request (`minions upgrade --reason <text>` in the runtime) that you apply with `minions upgrade` on the host. Only tokens and other secrets stay with you (`minions auth ...`).
 
 ### Example (abridged)
 
@@ -603,36 +592,6 @@ The reporting level never changes what needs approval. The coordinator prompt an
 You won't get tool-call or test-log spam. Every question includes a recommended answer and says what is blocked until you reply. Notifications that fail during a Telegram outage are queued with deduplication keys and resent later; the model is not woken up just to resend them.
 
 The Telegram controls (pause intake, pause new starts, cancel workers, resume, status) also exist as terminal commands that work without Claude.
-
-## Setup assistant
-
-`minions init` is deterministic and complete on its own. At the end of an interactive init it asks:
-
-```
-Open the setup assistant to finish remaining setup? [Y/n]
-```
-
-Yes opens **your own** Claude Code (`claude` on the host, in the repository root, in the foreground) with a small generated skill, `minions-setup:setup`, that helps you close what is left. You can open it any time:
-
-```sh
-minions setup assist             # interactive; needs a terminal and `claude` on PATH
-minions setup assist --dry-run   # print the claude command; writes and launches nothing
-```
-
-It is never offered with `--yes`, `--config`, `--json`, `--dry-run`, or without a terminal. The assistant:
-
-1. Gathers context first, read-only: `minions doctor --json`, `minions status --json`, `minions auth show --json`, `minions config show --explain`, `git remote -v`, and your build and CI files.
-2. Works only on the gaps: the Claude authorization choice (you run `! minions auth set ...`), Telegram if you want it (`! minions auth telegram`), verification commands taken from your real scripts and CI, models and effort, and doctor warnings.
-3. Turns your goals into a few first tasks. The backlog lives in the agent runtime, so it gives you a message to paste into the coordinator after `minions start`.
-4. Ends with `minions doctor` and a summary of what was done and what remains.
-
-Guard rails:
-
-- Claude Code runs in permission mode `default` (passed as `manual` on Claude Code versions that list only that newer name; the assistant does not start if neither is offered), with bypass mode disabled for the session. Only read-only commands run without asking: `minions doctor|status|auth show|config show|runtime show`, `git remote -v`, `git status`, `git log`, and file reads inside the repository (`Read(//<repo>/**)`, which also covers Glob/Grep there). Reads anywhere else prompt.
-- It never asks for a token or key. Credential, runtime and publishing commands (`minions auth ...`, `minions runtime set`, `minions start`, `git push`, `open`, `security`, `gh auth token`) are denied to the assistant. You run them yourself with `!` (or in another terminal), so secrets are typed only at minions' hidden prompts.
-- It can't read the minions secret and credential stores (of any project), `~/.ssh`, `~/.aws`, `~/.config/gh`, the Keychains and other host secret dirs, or `.env` files, and can't edit host-side minions files (`project.json`, `defaults.json`, secrets). Changes to the project configuration are shown as a diff first, need your yes, bump `configRevision`, and are validated with `minions config show --explain`.
-
-`minions doctor` shows a `setup` check that suggests `minions setup assist` when there are obvious gaps, such as no verification commands.
 
 ## Claude authorization
 
@@ -795,7 +754,6 @@ When something breaks (Docker down, Claude auth expired, the coordinator died, a
 - **State backup and restore.** `minions export --state [file]` writes a backup of the runtime state (backlog, notes, worker briefs and results, and a consistent snapshot of the runtime database) as a tarball with a checksummed manifest; it never contains tokens, the Claude key or the Claude login. `minions import --state <file>` validates it and restores it into the running runtime (for example a fresh project volume); it is refused while workers or the coordinator are active unless `--force`, and the replaced state is kept under `pre-restore/`. See [docs/troubleshooting.md](docs/troubleshooting.md#before-risky-steps-back-up-the-runtime-state).
 - **Restart and recovery.** `minions start` reconciles sessions, branches, leases, and completed external actions before it retries anything, then attaches to or relaunches the coordinator. If a worker fails, its worktree and a recovery record are kept. minions never cleans up worktrees it doesn't own.
 - **Upgrades.** `minions upgrade` moves the container onto the installed minions package without losing progress. By default it drains: it pauses new starts, asks running workers to commit their work in progress and hand back, waits up to `--timeout` seconds (default 1800), and aborts with starts resumed if workers are still running. `--now` releases the workers still active instead (they are reported as interrupted and re-dispatched). It then regenerates the derived files (including the mounted plugin), rebuilds the image only when its fingerprint changed, recreates the container, refreshes the workspace and the repository import, resumes starts and restarts the coordinator with recovery. Volumes are never removed and the repository is never re-cloned; a failure before the container is recreated leaves it running and resumes starts. `--dry-run` lists the steps and `--json` prints the result. The restarted coordinator starts with a fresh context (see routine context resets above) and the trimmed tool set. `minions status` and `minions doctor` report when a running container needs an upgrade (restart-required), and `minions doctor` warns about a stale plugin. In a minions checkout it also brings the installed CLI up to date (`--rebuild-cli` allows the rebuild) or prints the command to do so; `--from-container` fast-forwards a host branch from the container first. Details: [docs/compatibility.md](docs/compatibility.md#upgrading-minions-upgrade).
-- **Live changes from the host manager chat.** With the optional host manager bot (set up in `minions setup`), change requests and the owner commands (`/set`, `/sync`, `/upgrade`, `/restart`, `/undo`, `/approve`) are shown as plans and applied only after you tap Confirm. A `/restart` refused because workers are active is followed by **Restart when idle** (queued, runs at the first moment no worker is active) and **Drain now** (workers commit `wip:` and hand back, then the restart). `/undo <id>` restores a config file only while it is still what that change wrote (the last 20 changes are kept). Before an upgrade reinstalls the CLI the old one is kept (the last 2), and if the new CLI fails `minions --version` or `minions status` the chat offers **Roll back CLI**. With the optional assistant (`minions setup`, host manager step, its own Claude token) you can also write in plain language ("switch to manual merges", "what can I change?"): the reply comes first, labelled `Assistant:`, then any change as the usual host plan marked "proposed by the assistant", which still applies only after your tap (twice when it loosens policy). Commands starting with `/` never go to it, it has no tools, and when it is off or fails the chat answers with the command list. `/assistant on|off|status` switches it or shows calls today, the daily limit (50 by default) and the last error. When you develop minions itself (the host CLI runs from a minions source checkout and the project is minions), `/rebuild_cli` rebuilds the host CLI from the checkout and shows the commits, the diffstat and any sensitive paths first; it always asks twice and does not exist on normal installs. See [docs/design/host-manager.md](docs/design/host-manager.md).
 - **Upgrade note: host-signed approvals (runtime DB schema 3).** Approvals recorded before this upgrade were unsigned and no longer count. Tasks that were waiting for approval stay `awaiting-human` after the upgrade: approve each again **on the host** with `minions work approve <taskId> --head <sha>`, then run `minions work publish <taskId>`. See [Host-signed publication approvals](docs/design/bootstrap.md#host-signed-publication-approvals). Deferred in v0.1 (not implemented; `minions doctor` lists it as unavailable): the upgrade plan and schema/config migration, which would produce a plan, back up the config, migrate schemas deterministically, preserve your overrides, detect edits to managed files, mark running workers stale when behavior changes, and never turn on new authority.
 - **Uninstall.** Removes only the files and owned blocks recorded in the manifest that are unchanged since minions generated them. Backlogs, decision records, worktrees with work, credentials, and Docker volumes are kept. Deleting data is a separate, explicit step. A private uninstall leaves the repository unchanged.
 - **Interrupted operations.** Rerunning `minions upgrade` finishes an interrupted upgrade (it remembers a pause it made). Recovery from an install/upgrade journal is deferred in v0.1.
