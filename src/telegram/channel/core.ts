@@ -91,7 +91,7 @@ export function gate(access: ChannelAccess, m: TelegramMessage, now: number, new
 }
 
 export const pairingText = (code: string, isResend: boolean) =>
-  `${isResend ? 'Still pending' : 'Pairing required'}: ask the owner to approve code ${code} in the coordinator terminal (never over Telegram).`;
+  `${isResend ? 'Still pending' : 'Pairing required'}: approve it on the host: \`minions telegram access pair ${code}\` in the project directory (never over Telegram).`;
 
 /**
  * The outbound check of every tool: the chat must be in allowFrom (Telegram DM chat_id == user_id). Without a chat_id
