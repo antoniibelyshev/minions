@@ -56,6 +56,27 @@ const settingsOf = (args: string[]) => JSON.parse(argAfter(args, '--settings')) 
 
 afterEach(() => { for (const k of Object.keys(process.env)) if (!(k in saved)) delete process.env[k]; Object.assign(process.env, saved); });
 
+describe('host coordinator launch with coordinator sessions: the gateway', () => {
+  it('runs `minions telegram gateway` in place of a router claude, with the channel env and no token', async () => {
+    const { paths } = hostLayout();
+    const { calls, spawn } = fakeSpawn();
+    const cfg = telegramCfg();
+    cfg.coordinator = { ...cfg.coordinator, sessions: { enabled: true } };
+    const code = await runCoordinator(cfg, {
+      paths, spawn, permissionModes: modes, env: { PATH: '/usr/bin', [TELEGRAM_TOKEN_ENV]: TOKEN }, log: () => undefined,
+      claudeVersion: async () => '2.1.308 (Claude Code)', exists: () => true, newLaunchId: () => 'launch-gw',
+    });
+    expect(code).toBe(0);
+    const { cmd, args, env } = calls[0]!;
+    expect(cmd).toBe(paths.minionsShim);
+    expect(args).toEqual(['telegram', 'gateway']);
+    expect(env).toMatchObject({ [LAUNCH_ENV]: 'launch-gw', [TOKEN_FILE_ENV]: paths.telegramTokenFile, TELEGRAM_STATE_DIR: paths.telegramStateDir });
+    expect(env).not.toHaveProperty(TELEGRAM_TOKEN_ENV);
+    expect(env).not.toHaveProperty('MINIONS_SESSION');
+    expect((JSON.parse(readFileSync(paths.coordinatorLaunch, 'utf8')) as LaunchRecord).launchId).toBe('launch-gw');
+  });
+});
+
 describe('host coordinator launch with the minions channel server', () => {
   it('starts claude with only our MCP server and the dev channel flag; the token is never in env or argv', async () => {
     const { paths } = hostLayout();

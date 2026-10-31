@@ -23,7 +23,7 @@ import {
   DEV_CHANNELS_DIALOG_NOTE, hostChannelServerProbe, MINIONS_CHANNEL_SPEC, MINIONS_TELEGRAM_TOOL_PREFIX, MINIONS_TELEGRAM_TOOLS, minionsChannelArgs,
   type ChannelServerLaunch, type HostChannelServerReport,
 } from '../telegram/channel/launch.js';
-import { readChannelLock } from '../telegram/channel/server.js';
+import { LAUNCH_ENV, readChannelLock, TOKEN_FILE_ENV } from '../telegram/channel/server.js';
 import { runtimePaths, type RuntimePaths } from './paths.js';
 import { claudePermissionModes, parsePermissionModes, strictPermissionModeArg } from './permission-modes.js';
 import { openDb, pidAlive, type CoordinatorLock, type RuntimeDb } from './db.js';
@@ -512,6 +512,12 @@ Repository and user Claude Code settings, hooks and MCP servers are not loaded i
  * as its first message. With sessions off nothing changes.
  */
 export const isRouterLaunch = (cfg: Pick<MinionsConfig, 'coordinator'>): boolean => cfg.coordinator?.sessions?.enabled === true;
+/**
+ * The gateway launch (docs/design/autonomy.md Decision 7): coordinator sessions on and Telegram through the minions
+ * channel server (the host runtime). The wrapper's child is `minions telegram gateway`, not a router claude.
+ */
+export const isGatewayLaunch = (cfg: Pick<MinionsConfig, 'coordinator'>, decision: Pick<TelegramDecision, 'enabled' | 'server'>): boolean =>
+  isRouterLaunch(cfg) && decision.enabled && decision.server === 'minions';
 /** The router's model: models.router, else haiku (sessions.ts DEFAULT_ROUTER_MODEL). */
 export const routerLaunchModel = (cfg: Pick<MinionsConfig, 'models'>): string => cfg.models.router ?? 'haiku';
 /** Tools the router never has on top of the coordinator's trim: it routes, it never spawns workers. */
@@ -839,7 +845,12 @@ export async function runCoordinator(cfg: MinionsConfig, deps: RunCoordinatorDep
   const launchId = ownServer ? (deps.newLaunchId ?? randomUUID)() : undefined;
   const channelServer = ownServer && launchId ? channelServerLaunch(paths, launchId) : undefined;
   if (ownServer) log(`minions: ${DEV_CHANNELS_DIALOG_NOTE}.`);
-  const c = await buildClaudeCommand(cfg, paths, { telegram: decision.enabled, startupPrompt: deps.startupPrompt, permissionModes, ...(channelServer ? { channelServer } : {}) });
+  // Coordinator sessions with the minions channel server: the gateway replaces the router claude (docs/design/autonomy.md
+  // Decision 7); no model holds the chat.
+  const gateway = isGatewayLaunch(cfg, decision) && channelServer ? channelServer : null;
+  if (gateway) log('minions: coordinator sessions on: the Telegram gateway routes owner messages (no router model).');
+  const c = gateway ? { cmd: gateway.command, args: ['telegram', 'gateway'], cwd: paths.workspace }
+    : await buildClaudeCommand(cfg, paths, { telegram: decision.enabled, startupPrompt: deps.startupPrompt, permissionModes, ...(channelServer ? { channelServer } : {}) });
   if (cancelled() !== null) return cancelled()!;
   // Task-51: the plugin stays off at user scope, so only this launch (its --settings enabledPlugins)
   // loads it. Re-applied on every launch: existing setups get it on the next start, restart or upgrade.
@@ -856,7 +867,8 @@ export async function runCoordinator(cfg: MinionsConfig, deps: RunCoordinatorDep
   // The official plugin reads the token from the env (Docker). The minions server reads it from the file itself, so
   // on the host the token is never in the claude env (nor in argv: the MCP config carries only the file path).
   if (decision.enabled && !ownServer && token.state === 'ok') env[TELEGRAM_TOKEN_ENV] = token.token;
-  if (isRouterLaunch(cfg)) Object.assign(env, ROUTER_SESSION_ENV);
+  if (gateway) Object.assign(env, { [TOKEN_FILE_ENV]: gateway.tokenFile, [LAUNCH_ENV]: gateway.launchId, TELEGRAM_STATE_DIR: gateway.stateDir });
+  else if (isRouterLaunch(cfg)) Object.assign(env, ROUTER_SESSION_ENV);
   const record: LaunchRecord = { version: 1, pid: process.pid, startedAt: new Date().toISOString(), fingerprint: launchFingerprint(cfg, token), channel: cfg.communication.channel, telegram: decision, ...(launchId ? { launchId } : {}) };
   await atomicWrite(paths.coordinatorLaunch, JSON.stringify(record, null, 2) + '\n').catch(() => { /* state not writable: restart detection degrades */ });
   const spawn = deps.spawn ?? (nodeSpawn as unknown as SpawnLike);

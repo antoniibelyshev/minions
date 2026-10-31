@@ -271,6 +271,12 @@ export interface ChannelServerOptions {
   newCode?: () => string;
   /** Long-poll seconds per getUpdates (default 25). */
   pollSeconds?: number;
+  /**
+   * Whose process this server is: the coordinator launch's, or another. Default: its nearest claude ancestor is the
+   * wrapper's direct child (the MCP server of the coordinator claude). The gateway (src/runtime/gateway.ts) is the
+   * wrapper's direct child itself.
+   */
+  owner?: (selfPid: number, launchPid: number) => 'coordinator' | 'other' | 'unknown';
 }
 
 export type ChannelState = { active: true } | { active: false; reason: string };
@@ -317,8 +323,8 @@ export class ChannelServer {
     if (!this.opts.launchId) { this.deactivate(`${LAUNCH_ENV} is not set (not the coordinator launch)`); return this.state; }
     const rec = await this.opts.readLaunch().catch(() => null);
     if (!rec || !rec.launchId || rec.launchId !== this.opts.launchId) { this.deactivate('the launch id does not match the running coordinator launch'); return this.state; }
-    const owner = claudeOwner(this.selfPid, rec.pid, this.opts.proc);
-    if (owner !== 'coordinator') { this.deactivate(owner === 'unknown' ? 'cannot tell which claude session started this server' : 'this server was not started by the coordinator claude'); return this.state; }
+    const owner = (this.opts.owner ?? ((self, launch) => claudeOwner(self, launch, this.opts.proc)))(this.selfPid, rec.pid);
+    if (owner !== 'coordinator') { this.deactivate(owner === 'unknown' ? 'cannot tell which process started this server' : 'this server was not started by the coordinator launch'); return this.state; }
     await ensureDir(this.opts.stateDir, 0o700);
     const got = await acquireChannelLock(this.paths.lock, { pid: this.selfPid, start: this.opts.proc.startTime(this.selfPid), launchId: this.opts.launchId }, this.opts.proc);
     if (!got.ok) { this.deactivate(`channel.lock is held by pid ${got.holder}`); return this.state; }
@@ -502,33 +508,52 @@ export class ChannelServer {
     }
   }
 
+  /**
+   * Sends a message to the allowlisted owner DM (or `chatId`) and records it. `replyTo`: a message id, null for none,
+   * undefined for the owner's latest message. Returns the message id.
+   */
+  async send(o: { text: string; replyTo?: number | null; ref?: string | null; chatId?: string }): Promise<number> {
+    if (!this.state.active) throw new MinionsError('PRECONDITION', `${NOT_ACTIVE}: ${this.state.reason}`);
+    if (!o.text.trim()) throw new MinionsError('PRECONDITION', 'text is required');
+    const chatId = assertAllowedChat(await this.access(), o.chatId);
+    const ref = normalizeRef(o.ref);
+    const map = await this.messageMap();
+    const replyTo = o.replyTo === undefined ? map.lastInbound(chatId) : o.replyTo ?? undefined;
+    const id = await this.opts.api.sendMessage(chatId, withRefFooter(o.text, ref), { replyTo });
+    if (id === null) throw new MinionsError('INTERNAL', 'Telegram did not return a message id');
+    map.record({ messageId: id, chatId, ref, textHead: textHead(o.text), sentAt: new Date(this.now()).toISOString() });
+    await this.saveMessages(map);
+    return id;
+  }
+
+  /** Sends a native poll (see send for `replyTo`, except that undefined means none). */
+  async sendPoll(o: { question: string; options: string[]; multiple?: boolean; replyTo?: number | null; ref?: string | null; chatId?: string }): Promise<{ messageId: number; pollId: string }> {
+    if (!this.state.active) throw new MinionsError('PRECONDITION', `${NOT_ACTIVE}: ${this.state.reason}`);
+    const { question, options, multiple } = pollArgs({ question: o.question, options: o.options, multiple: o.multiple });
+    const chatId = assertAllowedChat(await this.access(), o.chatId);
+    const ref = normalizeRef(o.ref);
+    const sent = await this.opts.api.sendPoll(chatId, question, options, { multiple, replyTo: o.replyTo ?? undefined });
+    if (!sent) throw new MinionsError('INTERNAL', 'Telegram did not return a poll');
+    const map = await this.messageMap();
+    map.record({ messageId: sent.messageId, chatId, ref, textHead: textHead(question), sentAt: new Date(this.now()).toISOString(), poll: { pollId: sent.pollId, question, options } });
+    await this.saveMessages(map);
+    return sent;
+  }
+
   private async reply(args: Record<string, unknown>): Promise<{ text: string } | { error: string }> {
     const text = typeof args.text === 'string' ? args.text : '';
     if (!text.trim()) return { error: 'text is required' };
-    const chatId = assertAllowedChat(await this.access(), args.chat_id === undefined ? undefined : String(args.chat_id));
-    const ref = normalizeRef(args.ref);
-    const map = await this.messageMap();
     const asked = messageIdArg(args.reply_to);
     if (asked === null) return { error: 'reply_to must be a message_id' };
-    const replyTo = asked ?? map.lastInbound(chatId);
-    const id = await this.opts.api.sendMessage(chatId, withRefFooter(text, ref), { replyTo });
-    if (id === null) return { error: 'Telegram did not return a message id' };
-    map.record({ messageId: id, chatId, ref, textHead: textHead(text), sentAt: new Date(this.now()).toISOString() });
-    await this.saveMessages(map);
+    const id = await this.send({ text, replyTo: asked, ref: normalizeRef(args.ref), ...(args.chat_id === undefined ? {} : { chatId: String(args.chat_id) }) });
     return { text: `sent (id: ${id})` };
   }
 
   private async poll(args: Record<string, unknown>): Promise<{ text: string } | { error: string }> {
     const { question, options, multiple } = pollArgs(args);
-    const chatId = assertAllowedChat(await this.access(), args.chat_id === undefined ? undefined : String(args.chat_id));
-    const ref = normalizeRef(args.ref);
     const replyTo = messageIdArg(args.reply_to);
     if (replyTo === null) return { error: 'reply_to must be a message_id' };
-    const sent = await this.opts.api.sendPoll(chatId, question, options, { multiple, replyTo });
-    if (!sent) return { error: 'Telegram did not return a poll' };
-    const map = await this.messageMap();
-    map.record({ messageId: sent.messageId, chatId, ref, textHead: textHead(question), sentAt: new Date(this.now()).toISOString(), poll: { pollId: sent.pollId, question, options } });
-    await this.saveMessages(map);
+    const sent = await this.sendPoll({ question, options, multiple, replyTo, ref: normalizeRef(args.ref), ...(args.chat_id === undefined ? {} : { chatId: String(args.chat_id) }) });
     return { text: JSON.stringify({ poll_id: sent.pollId, message_id: sent.messageId }) };
   }
 

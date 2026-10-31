@@ -181,7 +181,27 @@ Built on the minions channel server (src/telegram/channel, task-67), which the h
   into the thread reopens it with its handoff note.
 - **On by default with Telegram** (owner, 2026-10-31): storing a bot token (`minions auth telegram`, the init and
   setup steps) sets `coordinator.sessions.enabled: true` in the project config unless the owner set it. Terminal-only
-  projects keep the single coordinator: the router answers through Telegram.
+  projects keep the single coordinator.
+
+## Decision 7. The gateway: no router model (owner, 2026-10-31)
+
+A resident router model collects every message and gets messy. With coordinator sessions on and the minions channel
+server (host runtime), the wrapper runs `minions telegram gateway` instead of a router claude:
+
+- **Inbound, deterministic first:** a reply goes to the session of the message it replies to (tg_messages), a poll
+  vote to the asking session (and answers its question), a named task to its task session.
+- **A new top-level message gets a fresh thread session.** Its first step is the sessions index: when the message
+  continues an open session, `minions coordinator handover <key>` moves the message, the thread's Telegram messages and
+  its pending items there and closes the new session; otherwise it sets its topic (`coordinator topic`) and answers.
+  An ambiguous message (a reply to a message of several sessions, several tasks named) is handled the same way, with
+  the candidates named.
+- **The sessions index** `<state>/sessions/index.md` (and `minions coordinator sessions`, `/sessions` in the chat):
+  every open session and those closed in the last day, with topic, last activity and first owner message.
+- **Outbound without a model:** the gateway sends each due outbox item as a reply in its session's thread, a question
+  with options as a poll, and the due digest; it acks and records each in tg_messages. A failed send stops the round
+  (the item's retry backoff applies).
+- The tmux window shows the gateway's log; the owner talks through Telegram. Docker (the official plugin) keeps the
+  router claude.
 
 ## Reversed decisions
 

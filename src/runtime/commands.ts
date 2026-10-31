@@ -77,6 +77,7 @@ import { launchWorker } from './dispatch-launch.js';
 import { liveRun, liveRunExitCode, type LiveRunReport } from './headless.js';
 import { buildSessionCommand, sessionConfigDir, sessionsSettings, threadSettings } from './sessions.js';
 import { enqueueInbox, openSession } from './session-store.js';
+import { formatSessionsIndex, handoverSession, runGateway, sessionsIndex, setSessionTopic } from './gateway.js';
 import { heldBySession, recordSent, resolveRoute, sendToSession, sessionKeyOf, threadReplyTarget, waitForOutbound, type ReplyContext, type RouteResult, type WaitResult } from './router.js';
 import { runSupervisor, startSupervisorWatch, supervisorEnv, supervisorLockState, type SupervisorReport, type SupervisorTaskDeps } from './supervisor.js';
 import { adoptIntegrationBase, runIntegrator, startIntegratorDetached, type IntegratorReport } from './integrator.js';
@@ -1259,6 +1260,30 @@ export function register(program: Command): void {
       const r = sendToSession(getDb(), await getConfig(), { key, text, state: runtimePaths().state, answers: o.answers ?? null, messageId: o.messageId ?? null, reply });
       emit(r, { json: globalOpts(cmd).json, human: (x: typeof r) => `queued for ${x.key}${x.reopened ? ' (reopened)' : ''}${x.answered ? `; ${x.answered} answered` : ''}` });
     }));
+  coord.command('sessions').description('The sessions index: every open coordinator session and those closed in the last day, with topic and last activity (also <state>/sessions/index.md)')
+    .action(action(async (_o: unknown, cmd: Command) => {
+      requireMode('runtime');
+      const r = sessionsIndex(getDb());
+      emit(r, { json: globalOpts(cmd).json, human: formatSessionsIndex });
+    }));
+  coord.command('topic <text>').description('Set the one-line topic the sessions index shows for this session (MINIONS_SESSION)')
+    .action(action(async (text: string, _o: unknown, cmd: Command) => {
+      requireMode('runtime');
+      const scope = sessionScope();
+      if (!scope || scope.kind === 'router') throw new MinionsError('PRECONDITION', 'Only a coordinator session has a topic (MINIONS_SESSION is not a session key).');
+      const r = { key: scope.key, topic: setSessionTopic(getDb(), scope.key, text) };
+      emit(r, { json: globalOpts(cmd).json, human: (x: typeof r) => `${x.key}: ${x.topic}` });
+    }));
+  coord.command('handover <key>').description('A thread session whose messages continue another session: move them, and the thread, to <key>, and close this session')
+    .action(action(async (key: string, _o: unknown, cmd: Command) => {
+      requireMode('runtime');
+      const scope = sessionScope();
+      if (!scope || scope.kind !== 'thread') throw new MinionsError('PRECONDITION', 'Only a thread session hands over (MINIONS_SESSION=thread:<id>).');
+      const to = sessionKeyOf(key);
+      if (!to) throw new MinionsError('PRECONDITION', `Not a session key: ${JSON.stringify(key.slice(0, 80))}.`);
+      const r = handoverSession(getDb(), await getConfig(), { from: scope.key, to, state: runtimePaths().state });
+      emit(r, { json: globalOpts(cmd).json, human: (x: typeof r) => `handed ${x.messages} message(s) from ${x.from} to ${x.to}; ${x.from} closes now: end your turn` });
+    }));
   coord.command('wait').description('Router: wait until an outbox item or the digest is due (or the timeout), then exit; run it in the background (container only)')
     .option('--timeout <minutes>', 'give up after this many minutes', (v) => Number(v), 30)
     .option('--poll <seconds>', 'check interval', (v) => Number(v), 5)
@@ -1341,6 +1366,32 @@ export function register(program: Command): void {
       await runChannelServer({
         env: process.env, stateDir: paths.telegramStateDir, logFile: join(paths.logs, 'telegram-channel.log'), proc: systemProcessControl,
         readLaunch: () => readLaunchRecord(paths), input: process.stdin, output: process.stdout,
+      });
+    }));
+  // The gateway (docs/design/autonomy.md Decision 7): with coordinator sessions on, the wrapper runs it in place of the router claude.
+  tg.command('gateway', { hidden: true }).description('Internal: poll Telegram, route owner messages to coordinator sessions and send due notifications (started by the coordinator wrapper)')
+    .action(action(async () => {
+      requireMode('runtime');
+      const paths = runtimePaths();
+      const stop = new AbortController();
+      for (const sig of ['SIGTERM', 'SIGINT', 'SIGHUP'] as const) process.on(sig, () => stop.abort());
+      await runGateway({
+        env: process.env, telegramStateDir: paths.telegramStateDir, logFile: join(paths.logs, 'telegram-gateway.log'), proc: systemProcessControl,
+        readLaunch: () => readLaunchRecord(paths), signal: stop.signal, echo: (l) => process.stdout.write(`${new Date().toISOString().slice(11, 19)} ${l}\n`),
+        db: getDb(), state: paths.state, config: getConfig,
+        knownTasks: async () => (await (await getBacklog()).listTasks()).map((t) => t.id),
+        digest: async () => {
+          const d = getDb();
+          const cfg = await getConfig();
+          let tasks: Awaited<ReturnType<BacklogAdapter['listTasks']>> | null = null;
+          try { tasks = await (await getBacklog()).listTasks(); } catch { tasks = null; }
+          let runnable: { taskId: string; role: string }[] = [];
+          try { runnable = (await (await scheduler()).next()).runnable.map((r) => ({ taskId: r.taskId, role: r.role })); } catch { runnable = []; }
+          let spend: SpendReport | null = null;
+          try { spend = spendReport({ db: d, config: cfg }); } catch { spend = null; }
+          const r = prepareDigest(d, cfg, { tasks, runnable, spend });
+          return { text: r.text, keys: r.keys };
+        },
       });
     }));
   tg.command('status').description('Pairing/allowlist policy and whether the running coordinator has Telegram (no codes, ids or tokens)')

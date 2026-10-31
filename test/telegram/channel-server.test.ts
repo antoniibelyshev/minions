@@ -231,7 +231,7 @@ describe('coordinator wins, strays lose', () => {
     const proc = fakeProc({ 700: { cmd: 'bash -c claude -p hi', parent: CLAUDE, start: 'b' }, 800: { cmd: 'claude -p hi', parent: 700, start: 'n' },
       900: { cmd: 'node minions telegram channel serve', parent: 800, start: 'x' } });
     const nested = server(fakeBot(), { proc, selfPid: 900 });
-    expect(await nested.s.activate()).toEqual({ active: false, reason: 'this server was not started by the coordinator claude' });
+    expect(await nested.s.activate()).toEqual({ active: false, reason: 'this server was not started by the coordinator launch' });
     expect(existsSync(join(dir, 'channel.lock'))).toBe(false);
   });
 

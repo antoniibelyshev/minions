@@ -129,11 +129,11 @@ export function commandReply(cmd: BotCommand, access: ChannelAccess, m: Telegram
   const sender = String(m.from.id);
   const owner = access.allowFrom.includes(sender);
   if (!owner && access.dmPolicy === 'allowlist') return null;
-  if (cmd === 'start') return 'This bot connects Telegram to a minions coordinator. To pair: DM me anything to get a 6-character code, then the owner approves it in the coordinator terminal. After that, your DMs reach the coordinator.';
+  if (cmd === 'start') return 'This bot connects Telegram to a minions coordinator. To pair: DM me anything to get a 6-character code, then the owner approves it on the host (`minions telegram access pair <code>`). After that, your DMs reach the coordinator.';
   if (cmd === 'help') return 'Messages you send here reach the minions coordinator once you are paired. Text and replies are forwarded; answers come back here.\n/start - pairing instructions\n/status - your pairing state';
   if (owner) return 'Paired: your messages reach the coordinator.';
   const mine = Object.entries(access.pending).find(([, p]) => p.senderId === sender && p.expiresAt >= now);
-  return mine ? `Pairing pending: code ${mine[0]}, to be approved in the coordinator terminal.` : 'Not paired. Send me a message to get a pairing code.';
+  return mine ? `Pairing pending: code ${mine[0]}, to be approved on the host.` : 'Not paired. Send me a message to get a pairing code.';
 }
 
 // ---------------------------------------------------------------- message map
