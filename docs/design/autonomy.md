@@ -1,6 +1,6 @@
 # Autonomy: automatic flow, coordinator-owned control, Telegram threads and polls
 
-Status: **owner direction (2026-10-31), build in progress on branch `autonomy`.** This document supersedes the parts of
+Status: **owner direction (2026-10-31); phases 1 to 5 built on branch `autonomy`, not yet run live.** This document supersedes the parts of
 earlier designs it names under [Reversed decisions](#reversed-decisions).
 
 Owner direction (2026-10-31, after a minions-on-minions run was too slow and too expensive):
@@ -22,12 +22,16 @@ therefore comes from an audit trail, undo and notices, not from owner confirmati
 
 | Phase | What | State |
 | - | - | - |
-| 1 | Autopilot dispatcher: deterministic stage loop with headless workers | build |
-| 2 | Control layer: coordinator-owned config overlay, applied live, journaled, undoable | build |
-| 3 | Secrets the coordinator stores, injected into the roles that declare them | build |
-| 4 | Telegram: reply context end to end, threaded replies, native polls | build |
-| 5 | Thread sessions: one coordinator session per Telegram thread | build after 4 |
-| 6 | Project setup by the coordinator (`minions projects create` from the runtime) | later |
+| 1 | Autopilot dispatcher: deterministic stage loop with headless workers | built (`dispatch.mode` defaults to `coordinator` until the live check) |
+| 2 | Control layer, flows with `ci` / `merge` ends, live workflow edits mid-flight | built |
+| 3 | Secrets the coordinator stores, injected into the roles that declare them | built (`verification.secrets` for the integrator: not yet) |
+| 4 | Telegram: reply context end to end, threaded replies, native polls | built |
+| 5 | Thread sessions: one coordinator session per Telegram thread | built |
+| 6 | Project setup by the coordinator (`minions projects create` from the runtime) | open |
+
+Live check before `dispatch.mode` defaults to `auto` (the build had no real `claude -p` run): one headless worker
+under `--agent minions:engineer` loads the plugin agent, its hooks see `MINIONS_WORKER_LEASE`, `minions work submit`
+works from the worktree, and the stream-json log yields the usage and the session id.
 
 ## Decision 1. The autopilot dispatcher
 
@@ -67,7 +71,7 @@ loop:
   (`<state>/run/dispatch/<leaseId>.json`) lets a restarted dispatcher reap orphans and recover leases.
 - **Lock and start.** Meta row `dispatcher_lock` (same liveness rules as the supervisor lock). The coordinator
   wrapper starts it (and restarts it when the lock is stale) when `dispatch.mode` is `auto`.
-- **Setting.** `dispatch.mode: "auto" | "coordinator"` (live). `auto` is the default for new projects. With `auto`,
+- **Setting.** `dispatch.mode: "auto" | "coordinator"` (live; unset = `coordinator` until the live check). With `auto`,
   `work next/claim/advance` from the coordinator still work (it may dispatch a stage by hand), but the coordinator
   prompt tells it that the dispatcher runs the happy path and it should only handle decisions.
 - **Capacity.** `execution.maxActiveTasks`, `execution.maxByRole`, the budget, pause and drain are honoured because
@@ -103,7 +107,7 @@ A new config layer, **control**, owned by the coordinator:
 profile defaults < project < local (host) < control (coordinator) < session
 ```
 
-- **Storage:** `<state>/control/overlay.json` (a partial config, deep-merged; `null` deletes a key) plus a journal
+- **Storage:** `<state>/control/overlay.json` (a partial config, deep-merged; `unset` removes a key from it) plus a journal
   `<state>/control/journal.jsonl` (one line per change: revision, time, actor, reason, key, before, after).
 - **Commands (runtime and host):**
   - `minions control show [--json]`: the overlay, its revision, and the effective value of every changed key.
@@ -114,8 +118,10 @@ profile defaults < project < local (host) < control (coordinator) < session
   - `minions control log [--limit n]` and `minions control undo [<revision>]`.
 - **Validation:** the merged config is validated by the same schema (`validateConfig`) before the write; an invalid
   change is refused with the field named. Writes are atomic and serialized by a lock file.
-- **Effect:** the runtime merges the overlay on every config load (it was cached per process; the cache now keys
-  on the overlay revision), so `live` settings apply on the next command. The dispatcher re-reads it each tick.
+- **Effect:** the runtime merges the overlay on every config load (each CLI command is its own process), so `live`
+  settings apply on the next command. The dispatcher re-reads it each pass and builds a scheduler on that config.
+  The host does not bake the overlay into `runtime/config.json` (an `unset` or `undo` would then not revert), so
+  coordinator-launch settings set here apply only where the runtime renders them.
   Restart-class settings (coordinator prompt, launch args, container mounts) are applied by the host the next time it
   resolves the config; `control set` says so in its response (`appliesOn: "next-command" | "next-stage" |
   "coordinator-restart" | "container-recreate"`) from setting-classes.ts.
