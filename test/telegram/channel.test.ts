@@ -59,10 +59,9 @@ describe('coordinator launch decision uses the same resolution', () => {
   };
   const tok = { state: 'ok' as const, token: TOKEN, botId: '123456789' };
 
-  it('profile default is auto', () => {
+  it('mode default: independent auto, supervised terminal', () => {
     expect(defaults().communication.channel).toBe('auto');
-    expect(defaults('personal-work').communication.channel).toBe('auto');
-    expect(defaults('supervised').communication.channel).toBe('auto');
+    expect(defaults('supervised').communication.channel).toBe('terminal');
   });
 
   it('auto: enabled with a mounted token and an available plugin in docker; terminal otherwise', () => {

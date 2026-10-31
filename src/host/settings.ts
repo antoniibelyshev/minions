@@ -352,7 +352,7 @@ export function closestSettingKeys(input: string, keys: readonly string[] = SETT
 
 // ---------------------------------------------------------------- reading
 
-export type SourceLabel = 'profile default' | 'shared config' | 'project config' | 'local override' | 'session' | 'credential store' | 'runtime';
+export type SourceLabel = 'mode default' | 'shared config' | 'project config' | 'local override' | 'session' | 'credential store' | 'runtime';
 
 export interface SettingView {
   key: string;
@@ -425,7 +425,7 @@ function sourceOf(def: SettingDef, ctx: SettingsContext): SourceLabel {
   if (prov === 'local') return 'local override';
   if (prov === 'project') return ctx.project.visibility === 'shared' ? 'shared config' : 'project config';
   if (prov === 'session') return 'session';
-  return 'profile default';
+  return 'mode default';
 }
 
 /** The credential kind of a `secrets.<kind>` item. */

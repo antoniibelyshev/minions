@@ -167,7 +167,7 @@ describe('settings (config defaults keep existing configs valid)', () => {
     const pm = validateConfig({ ...legacy, coordinator: { permissionMode: 'acceptEdits' } }, 'x');
     expect(pm.coordinator).toEqual({ permissionMode: 'acceptEdits' });
     expect(contextResetSettings(pm).enabled).toBe(true);
-    for (const p of ['personal-work', 'supervised'] as const) expect(contextResetSettings(defaults(p)).enabled).toBe(true);
+    for (const p of ['independent', 'supervised'] as const) expect(contextResetSettings(defaults(p)).enabled).toBe(true);
     expect(contextResetSettings(withReset({ enabled: false }))).toMatchObject({ enabled: false });
   });
 

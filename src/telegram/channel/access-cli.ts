@@ -63,6 +63,21 @@ export async function saveAccessFile(stateDir: string, a: ChannelAccess): Promis
   await atomicWrite(join(stateDir, 'access.json'), JSON.stringify(serializeAccess(a), null, 2) + '\n', { mode: 0o600 });
 }
 
+/**
+ * The owner's Telegram id from defaults.json (`telegramOwner` in the runtime's project.json): a bot without an
+ * access.json yet starts allowlisted to that user, so no pairing is needed. An existing access.json is never touched.
+ */
+export async function seedOwnerAccess(stateDir: string, projectInfoFile: string): Promise<boolean> {
+  let owner: unknown;
+  try { owner = (JSON.parse(await readFile(projectInfoFile, 'utf8')) as { telegramOwner?: unknown }).telegramOwner; } catch { return false; }
+  if (typeof owner !== 'string' || !/^\d{1,20}$/.test(owner)) return false;
+  try { await readFile(join(stateDir, 'access.json')); return false; } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== 'ENOENT') return false;
+  }
+  await saveAccessFile(stateDir, { dmPolicy: 'allowlist', allowFrom: [owner], groups: {}, pending: {}, rest: {} });
+  return true;
+}
+
 export interface AccessCliIo {
   /** Both stdin and stdout are a terminal. */
   isTty: boolean;

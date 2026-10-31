@@ -9,11 +9,11 @@ vi.mock('../../src/plugin/generate.js', async () => {
   const { mkdir, writeFile } = await import('node:fs/promises');
   const { join: j } = await import('node:path');
   return {
-    generatePlugin: async (cfg: { profile: string; execution: { maxEngineers: number } }, outDir: string) => {
+    generatePlugin: async (cfg: { mode: string; execution: { maxEngineers: number } }, outDir: string) => {
       await mkdir(j(outDir, '.claude-plugin'), { recursive: true });
       await mkdir(j(outDir, 'agents'), { recursive: true });
       await writeFile(j(outDir, '.claude-plugin', 'plugin.json'), JSON.stringify({ name: 'minions' }) + '\n');
-      await writeFile(j(outDir, 'agents', 'engineer.md'), `profile ${cfg.profile} engineers ${cfg.execution.maxEngineers}\n`);
+      await writeFile(j(outDir, 'agents', 'engineer.md'), `mode ${cfg.mode} engineers ${cfg.execution.maxEngineers}\n`);
       await writeFile(j(outDir, 'coordinator.md'), 'coordinator\n');
       return [];
     },
@@ -30,7 +30,7 @@ beforeEach(() => { env = withHome(); });
 afterEach(() => env.cleanup());
 
 const init = (path: string, extra: Partial<Parameters<typeof runInit>[0]> = {}) =>
-  runInit({ path, yes: true, dockerProbe: dockerUp, ...extra });
+  runInit({ mode: 'independent', path, yes: true, dockerProbe: dockerUp, ...extra });
 
 describe('init against real git', () => {
   it('private init leaves git status unchanged, including dirty files', async () => {

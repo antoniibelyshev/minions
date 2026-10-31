@@ -906,7 +906,7 @@ describe('plugin regeneration after a CLI rebuild in the same upgrade run', () =
     for (const f of ['agents/engineer.md', 'coordinator.md']) appendFileSync(join(newPkg, 'plugin', f), `\n${NEW_LINE}\n`);
     // Installed with the old package.
     process.env.MINIONS_TEMPLATES = oldPkg;
-    const init = await runInit({ path: makeRepo(home.root), yes: true, visibility: 'private', dockerProbe: dockerUp });
+    const init = await runInit({ mode: 'independent', path: makeRepo(home.root), yes: true, visibility: 'private', dockerProbe: dockerUp });
     const project = await loadProjectJson(init.plan.projectId);
     const config = (await loadEffectiveConfig(project)).config;
     const pluginDir = projectPaths(project.projectId).pluginDir;

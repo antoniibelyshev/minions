@@ -49,7 +49,7 @@ const ok = (stdout = ''): RunResult => ({ code: 0, stdout, stderr: '' });
 
 async function hostProject() {
   const repo = makeRepo(env.root);
-  const r = await runInit({ path: repo, yes: true, visibility: 'private', runtime: 'host', dockerProbe: dockerDown });
+  const r = await runInit({ mode: 'independent', path: repo, yes: true, visibility: 'private', runtime: 'host', dockerProbe: dockerDown });
   return { repo, id: r.plan.projectId, project: await loadProjectJson(r.plan.projectId) };
 }
 
@@ -404,7 +404,7 @@ describe('Keychain avoidance (H3)', () => {
     const items = new Map<string, string>();
     const { runner } = fakeSecurity(items);
     const other = makeRepo(env.root, 'docker-repo');
-    const r = await runInit({ path: other, yes: true, visibility: 'private', dockerProbe: async () => ({ daemon: true, serverVersion: '1', compose: true, composeVersion: '1' }) });
+    const r = await runInit({ mode: 'independent', path: other, yes: true, visibility: 'private', dockerProbe: async () => ({ daemon: true, serverVersion: '1', compose: true, composeVersion: '1' }) });
     const otherId = r.plan.projectId;
     await Cred.provisionCodexKey({ projectId: otherId, token: TOKEN, repoPath: other, runner, platform: 'darwin', env: {} });
     expect((await Cred.loadCredentialRefs(otherId)).codex?.backend).toBe('keychain');

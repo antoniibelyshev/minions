@@ -1,6 +1,7 @@
 import { MinionsError, invalidConfig, zodIssues, type ConfigIssue } from '../core/errors.js';
 import { CAPABILITIES, can, ruleEffects, stricter, strictness } from './capabilities.js';
 import { autoMergeConfigReasons } from './delivery.js';
+import { toMode } from './modes.js';
 import { ENGINEER_ROLE, harnessConfigIssues, registeredRoleNames, roleConfigIssues, roleLimit } from './roles.js';
 import { workflowConfigIssues } from './workflows.js';
 import { MinionsConfigSchema, CapabilityRuleSchema, type Capability, type CapabilityRule, type MinionsConfig } from './schema.js';
@@ -53,26 +54,32 @@ function crossFieldIssues(c: MinionsConfig): ConfigIssue[] {
 }
 
 /**
- * Removed keys, accepted in any layer and dropped: the GitHub delivery (docs/design/autonomy.md Decision 8), the
- * dispatch mode (Decision 10; `coordinator.contextReset.barrierTokens` below) and risk-based testing (Decision 12).
+ * Removed keys, accepted in any layer and dropped: the GitHub delivery and issue capabilities (docs/design/autonomy.md
+ * Decision 8), the dispatch mode (Decision 10; `coordinator.contextReset.barrierTokens` below) and risk-based testing
+ * (Decision 12).
  */
 const LEGACY_KEYS: Record<string, readonly string[]> = {
   backlog: ['repository'],
   intake: ['github'],
   delivery: ['provider', 'mode', 'method', 'deleteMergedBranches', 'identityMode', 'requireIndependentApproval', 'requiredChecksConfigured'],
   verification: ['ciAuthority', 'ciPendingTimeoutMinutes', 'testerRequired', 'qaLabels'],
-  capabilities: ['git.push', 'pr.create', 'pr.review', 'pr.merge'],
+  capabilities: ['git.push', 'pr.create', 'pr.review', 'pr.merge', 'external.read', 'external.comment', 'external.changeStatus', 'external.create'],
   dispatch: ['mode'],
 };
 
 /**
  * A copy of a config (or a layer of one) without the legacy keys. delivery.merge "manual" (never implemented) becomes
  * "disabled", and so does an "auto-when-eligible" that meant GitHub auto-merge (delivery.mode branch or pull-request):
- * it never switches local integration on by itself. Anything that is not an object is returned as is.
+ * it never switches local integration on by itself. The old `profile` becomes `mode` (Decision 11). Anything that is
+ * not an object is returned as is.
  */
 export function stripLegacyKeys(raw: unknown): unknown {
   if (!isObj(raw)) return raw;
   const out: Obj = { ...raw };
+  if ('profile' in out) {
+    const { profile, ...rest } = out;
+    return stripLegacyKeys(rest.mode === undefined ? { ...rest, mode: toMode(profile) ?? profile } : rest);
+  }
   for (const [section, keys] of Object.entries(LEGACY_KEYS)) {
     const sec = out[section];
     if (!isObj(sec) || !(keys.some((k) => k in sec) || (section === 'delivery' && sec.merge === 'manual'))) continue;

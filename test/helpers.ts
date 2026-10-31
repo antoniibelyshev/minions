@@ -2,8 +2,8 @@ import { spawnSync } from 'node:child_process';
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { profileDefaults } from '../src/config/profiles.js';
-import type { Profile } from '../src/config/schema.js';
+import { modeDefaults } from '../src/config/modes.js';
+import type { Mode } from '../src/config/schema.js';
 import { HANG_GUARD_TIMEOUT_TEST, HOOK_WRAPPER_TIMEOUT_S } from '../src/runtime/hook-guard.js';
 
 export const ctx = {
@@ -12,7 +12,15 @@ export const ctx = {
   projectId: '3f2b8c1e-7d4a-4e9b-9c2f-1a2b3c4d5e6f',
   packageVersion: '0.1.0',
 };
-export const defaults = (p: Profile = 'project-owner', c = ctx) => profileDefaults(p, c).config;
+/**
+ * A test baseline: the mode's values without the subsystems a test opts into explicitly (coordinator sessions, the
+ * routine, budgets and local integration), so a test of one mechanism does not run the others. The full mode
+ * defaults are `modeDefaults` (test/config.test.ts pins them).
+ */
+export const defaults = (m: Mode = 'independent', c = ctx) => {
+  const { coordinator: _c, routine: _r, ...cfg } = modeDefaults(m, c);
+  return { ...cfg, delivery: { merge: 'disabled' as const }, budgets: { taskUsd: null, dailyUsd: null } } as ReturnType<typeof modeDefaults>;
+};
 
 /**
  * Whether this host has the Linux /proc the runtime's process code reads. Container-only code (the process runner and

@@ -75,7 +75,7 @@ describe('host-held approval key', () => {
     await ensureApprovalKey(ID);
     const y = composeYaml({
       version: 1, projectId: ID, repoPath: '/Users/x/repo', gitCommonDir: '/Users/x/repo/.git', visibility: 'private',
-      profile: 'personal-work', imageTag: 'minions-runtime:0.1.0', baseBranch: 'main', remoteUrl: null,
+      mode: 'supervised', imageTag: 'minions-runtime:0.1.0', baseBranch: 'main', remoteUrl: null,
       gitIdentity: { name: 'Ada', email: 'ada@example.com' },
       container: { cpus: 4, memoryMiB: 6144, pidsLimit: 512, publishPorts: [], network: 'outbound-internet' },
     });

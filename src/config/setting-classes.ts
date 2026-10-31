@@ -70,7 +70,7 @@ export const KEY_CLASSES: readonly KeyClass[] = [
   ...entries(['container.network', 'container.publishPorts', 'container.mountHostRepository', 'container.mountDockerSocket'], 'recreate', true,
     'isolation of the container'),
   // ---- fixed
-  ...entries(['schemaVersion', 'configRevision', 'projectId', 'packageVersion', 'profile', 'visibility', 'backlog', 'git.baseBranch',
+  ...entries(['schemaVersion', 'configRevision', 'projectId', 'packageVersion', 'mode', 'visibility', 'backlog', 'git.baseBranch',
     'container.required', 'container.workspace', 'execution.oneActiveStagePerTask'], 'fixed', false, 'identity, literals or derived: a re-setup'),
 ];
 

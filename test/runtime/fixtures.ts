@@ -124,7 +124,8 @@ export function makeDefaultEnv(mutate?: (c: MinionsConfig) => void, o: { git?: b
   const baseSha = o.git === false ? '0'.repeat(40) : initRepo(layout.repo);
   const db = new RuntimeDb(join(root, 'state', 'minions.db'));
   const backlog = new FakeBacklog();
-  const config = defaults('project-owner');
+  const config = defaults('independent');
+  config.execution.maxActiveTasks = 2; // the scheduler scenarios are sized for two task slots
   mutate?.(config);
   const sched = new Scheduler({ db, backlog, config, layout, handoff: { briefs: join(root, 'state', 'briefs'), results: join(root, 'state', 'results') } });
   return { root, layout, db, backlog, config, sched, baseSha };

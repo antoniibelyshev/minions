@@ -51,7 +51,7 @@ async function runtimeRunning(project: ProjectJson, runner?: Runner): Promise<bo
 
 export interface ChannelShowResult extends ChannelResolution {
   projectId: string;
-  /** File holding the setting and the layer it comes from (project file, config.local.json, or the profile default). */
+  /** File holding the setting and the layer it comes from (project file, config.local.json, or the mode default). */
   file: string;
   source: string;
   runtime: 'docker' | 'host';
@@ -200,19 +200,6 @@ export async function offerAutoChannel(project: ProjectJson, o: { interactive: b
   }
   const result = await setChannel(project, 'auto', { yes: true }, deps);
   return { configured, offered: true, switched: result.applied, hint: null, result };
-}
-
-/**
- * Telegram set up: coordinator sessions (a router plus one session per thread and per task; docs/design/autonomy.md
- * Decision 6) default on, unless the owner set coordinator.sessions.enabled. Returns whether the config changed.
- */
-export async function defaultSessionsOn(project: ProjectJson): Promise<boolean> {
-  const done = await editProjectConfig(project, (raw) => {
-    const c = (raw.coordinator ?? {}) as Record<string, unknown>;
-    const sessions = (c.sessions ?? {}) as Record<string, unknown>;
-    return sessions.enabled !== undefined ? null : { ...raw, coordinator: { ...c, sessions: { ...sessions, enabled: true } } };
-  });
-  return done.written;
 }
 
 // ---------------------------------------------------------------- register

@@ -49,7 +49,7 @@ describe('config: reserved evidence kinds are refused as project role names', ()
     const { defaults } = await import('../helpers.js');
     for (const name of ['check', 'ci-gate']) {
       const roles = { [name]: { description: 'x', promptText: 'x', contract: 'verifier' } };
-      expect(() => validateConfig({ ...defaults('project-owner'), roles }), name).toThrow(/reserved/);
+      expect(() => validateConfig({ ...defaults('independent'), roles }), name).toThrow(/reserved/);
     }
   });
 });

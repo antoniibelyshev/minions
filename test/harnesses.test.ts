@@ -9,7 +9,7 @@ import { launchFor, runCommand } from '../src/config/launch.js';
 import { suggestModel } from '../src/config/models.js';
 import { resolve, validateConfig } from '../src/config/resolve.js';
 import { harnessConfigIssues, harnessRoleEffort, roleRegistry, workerRole } from '../src/config/roles.js';
-import { PROFILES, configJsonSchema, type MinionsConfig } from '../src/config/schema.js';
+import { MODES, configJsonSchema, type MinionsConfig } from '../src/config/schema.js';
 import { MinionsError } from '../src/core/errors.js';
 import { defaults } from './helpers.js';
 
@@ -34,7 +34,7 @@ const paths = (patch: Record<string, unknown>) => issues(patch).map((i) => i.pat
 
 describe('back-compat: no harnesses block', () => {
   it('every profile default validates unchanged and runs every worker on claude', () => {
-    for (const p of PROFILES) {
+    for (const p of MODES) {
       const cfg = defaults(p);
       expect(cfg.harnesses).toBeUndefined();
       expect(validateConfig(structuredClone(cfg))).toEqual(cfg);

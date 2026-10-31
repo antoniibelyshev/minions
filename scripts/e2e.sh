@@ -64,10 +64,10 @@ make_repo "$A"; make_repo "$B"
 
 step "init (private), idempotent rerun, config, doctor"
 before="$(git -C "$A" status --porcelain)"
-out="$("$M" init "$A" --yes --private --json)"
+out="$("$M" init "$A" --mode independent --yes --private --json)"
 ID_A="$(json 'd.data.plan.projectId' <<<"$out")"; PROJECT_IDS+=("$ID_A")
 expect_eq "$(git -C "$A" status --porcelain)" "$before" "private init leaves git status unchanged"
-expect_eq "$("$M" init "$A" --yes --private --json | json 'd.data.applied.written.length')" 0 "rerun writes nothing"
+expect_eq "$("$M" init "$A" --mode independent --yes --private --json | json 'd.data.applied.written.length')" 0 "rerun writes nothing"
 cd "$A"
 "$M" config show --explain | grep -q '^capabilities.code.edit = {' || fail "config show --explain resolves dotted capability keys"
 ok "config show --explain"
@@ -76,7 +76,7 @@ expect_eq "$(json 'd.ok' <<<"$doc")" true "doctor --json returns ok"
 case "$(json 'd.data.checks.find(c=>c.name==="claude.auth").status' <<<"$doc")" in warn|fail) ok "doctor reports Claude auth as not ready";; *) fail "claude.auth should be warn/fail without login";; esac
 
 step "init (shared)"
-out="$("$M" init "$B" --yes --shared --json)"; PROJECT_IDS+=("$(json 'd.data.plan.projectId' <<<"$out")")
+out="$("$M" init "$B" --mode independent --yes --shared --json)"; PROJECT_IDS+=("$(json 'd.data.plan.projectId' <<<"$out")")
 [ -f "$B/.minions/config.json" ] && ok "shared init wrote .minions/config.json" || fail ".minions/config.json missing"
 
 step "channel show / set (shared config, never committed)"

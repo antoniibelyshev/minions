@@ -147,7 +147,7 @@ describe('notification outbox', () => {
   it('minions status reports pending notifications so nothing is lost if the channel never returns', async () => {
     const db = new RuntimeDb(dbPath());
     enqueue(db, { key: 'blocker:task-1:1', kind: 'blocker', taskId: 'task-1', text: 'blocked' });
-    const s = await collectStatus({ db, config: defaults('project-owner'), backlog: async () => { throw new Error('no backlog'); } });
+    const s = await collectStatus({ db, config: defaults('independent'), backlog: async () => { throw new Error('no backlog'); } });
     expect(s.notifications).toMatchObject({ pending: 1, delivered: 0 });
   });
 });

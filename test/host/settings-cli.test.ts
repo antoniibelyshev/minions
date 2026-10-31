@@ -79,26 +79,26 @@ describe('minions settings (CLI)', () => {
     expect(code).toBe(0);
     expect(out).not.toContain('AAHfake');
     const d = envelope(out).data as { settings: { key: string; value: unknown; source: string }[] };
-    expect(d.settings.find((s) => s.key === 'execution.maxActiveTasks')).toMatchObject({ value: 2, source: 'project config' });
+    expect(d.settings.find((s) => s.key === 'execution.maxActiveTasks')).toMatchObject({ value: 3, source: 'project config' });
     expect(d.settings.find((s) => s.key === 'secrets.telegram')).toMatchObject({ value: 'provisioned' });
   });
 
   it('set --json: a loosening change is refused without --yes, applied with it; the config set alias works too', async () => {
     const { repo, local } = await install();
-    const refused = await cli(repo, ['settings', 'set', 'execution.maxActiveTasks', '3', '--json']);
+    const refused = await cli(repo, ['settings', 'set', 'execution.maxActiveTasks', '4', '--json']);
     expect(refused.code).not.toBe(0);
     expect(envelope(refused.out).error).toMatchObject({ code: 'POLICY_DENIED' });
-    const ok = await cli(repo, ['settings', 'set', 'execution.maxActiveTasks', '3', '--yes', '--json']);
+    const ok = await cli(repo, ['settings', 'set', 'execution.maxActiveTasks', '4', '--yes', '--json']);
     expect(ok.code).toBe(0);
-    expect(envelope(ok.out).data).toMatchObject({ key: 'execution.maxActiveTasks', from: 2, to: 3, layer: 'local', written: true });
-    const alias = await cli(repo, ['config', 'set', 'execution.maxEngineers', '3', '--yes']);
+    expect(envelope(ok.out).data).toMatchObject({ key: 'execution.maxActiveTasks', from: 3, to: 4, layer: 'local', written: true });
+    const alias = await cli(repo, ['config', 'set', 'execution.maxEngineers', '4', '--yes']);
     expect(alias.code).toBe(0);
-    expect(alias.out).toContain('execution.maxEngineers: 2 -> 3');
-    expect(JSON.parse(readFileSync(local, 'utf8'))).toEqual({ execution: { maxActiveTasks: 3, maxEngineers: 3 } });
+    expect(alias.out).toContain('execution.maxEngineers: 2 -> 4');
+    expect(JSON.parse(readFileSync(local, 'utf8'))).toEqual({ execution: { maxActiveTasks: 4, maxEngineers: 4 } });
     const list = await cli(repo, ['config', 'list']);
-    expect(list.out).toContain('execution.maxEngineers = 3  (local override)');
+    expect(list.out).toContain('execution.maxEngineers = 4  (local override)');
     const show = await cli(repo, ['config', 'show', '--json']);
-    expect(envelope(show.out).data.execution.maxEngineers).toBe(3);
+    expect(envelope(show.out).data.execution.maxEngineers).toBe(4);
   });
 
   it('set: a restart-needing change with the runtime down reports not-running; --shared is refused on a private install', async () => {
@@ -137,13 +137,13 @@ describe('minions settings (CLI)', () => {
 
   it('set: the reverse order (maxEngineers before maxActiveTasks) fails with a clear message and writes nothing', async () => {
     const { repo, local } = await install();
-    const r = await cli(repo, ['settings', 'set', 'execution.maxEngineers', '3', '--yes', '--json']);
+    const r = await cli(repo, ['settings', 'set', 'execution.maxEngineers', '4', '--yes', '--json']);
     expect(r.code).not.toBe(0);
     const err = envelope(r.out).error!;
     expect(err.code).toBe('INVALID_CONFIG');
     expect(err.message).toMatch(/maxEngineers/);
     expect(err.message).toMatch(/maxActiveTasks/);
-    const human = await cli(repo, ['settings', 'set', 'execution.maxEngineers', '3', '--yes']);
+    const human = await cli(repo, ['settings', 'set', 'execution.maxEngineers', '4', '--yes']);
     expect(human.code).not.toBe(0);
     expect(human.out).toMatch(/maxEngineers[\s\S]*maxActiveTasks/);
     expect(existsSync(local)).toBe(false);
@@ -154,7 +154,7 @@ describe('minions settings (CLI)', () => {
     const tty = process.stdin.isTTY;
     Object.defineProperty(process.stdin, 'isTTY', { value: undefined, configurable: true });
     try {
-      const r = await cli(repo, ['settings', 'set', 'execution.maxActiveTasks', '3']);
+      const r = await cli(repo, ['settings', 'set', 'execution.maxActiveTasks', '4']);
       expect(r.code).not.toBe(0);
       expect(r.out).toMatch(/loosens policy/);
       expect(r.out).toMatch(/--yes/);
@@ -168,7 +168,7 @@ describe('minions settings (CLI)', () => {
 describe('settings set: what took effect now vs needs a restart or an upgrade (task-53.2)', () => {
   it('--json reports class, hostOwned and takesEffect for live, restart and host-owned keys; --list --json carries the new fields', async () => {
     const { repo } = await install();
-    const live = envelope((await cli(repo, ['settings', 'set', 'execution.maxActiveTasks', '3', '--yes', '--json'])).out);
+    const live = envelope((await cli(repo, ['settings', 'set', 'execution.maxActiveTasks', '4', '--yes', '--json'])).out);
     expect(live.ok).toBe(true);
     expect(live.data).toMatchObject({ key: 'execution.maxActiveTasks', class: 'live', hostOwned: false, takesEffect: 'now',
       needsRestart: false, needsUpgrade: false, restart: null, written: true });
@@ -183,7 +183,7 @@ describe('settings set: what took effect now vs needs a restart or an upgrade (t
     expect(owned.data).toMatchObject({ class: 'restart', hostOwned: true, takesEffect: 'restart' });
 
     // Unchanged: nothing takes effect.
-    const same = envelope((await cli(repo, ['settings', 'set', 'execution.maxActiveTasks', '3', '--yes', '--json'])).out);
+    const same = envelope((await cli(repo, ['settings', 'set', 'execution.maxActiveTasks', '4', '--yes', '--json'])).out);
     expect(same.data).toMatchObject({ changed: false, takesEffect: null, effect: '' });
 
     const list = envelope((await cli(repo, ['settings', '--list', '--json'])).out).data as { settings: Record<string, unknown>[] };

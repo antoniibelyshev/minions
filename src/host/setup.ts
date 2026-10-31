@@ -1,19 +1,18 @@
 // `minions setup`: one guided command for the whole host-side setup (decision record:
 // docs/design/bootstrap.md, "Guided setup").
 //
-// Order: init wizard (repo/profile/visibility/runtime/Claude auth) -> local integration (opt-in, default no) -> Telegram (token + pairing guidance) -> agents (which harness does
+// Order: init (mode first; Claude auth and git identity only when defaults.json does not answer them) -> Telegram (token + pairing guidance) -> agents (which harness does
 // the work; src/host/harness-setup.ts) -> runtime start
 // (container, or the host runtime), repository import, coordinator launch -> attach/pair instructions.
 //
 // - Reuses runInit (wizard, plan, apply), the credential provisioning of `auth telegram`, and (through
 //   SetupRuntime) the start/import code of `minions start`.
-// - Integration choices that differ from the project configuration (delivery.merge, communication.channel) go
-//   into the host-only config.local.json, never into shared repo files.
+// - Integration choices that differ from the project configuration (communication.channel, harnesses) go
+//   into the host-only config.local.json, never into shared repo files. The mode decides local integration.
 // - Secrets are read only through the non-echoing terminal prompt or from stdin (never argv), and never
 //   appear in the result, the notes, or any prompt text.
 import { rm } from 'node:fs/promises';
-import { autoMergeConfigReasons } from '../config/delivery.js';
-import type { MinionsConfig, Profile } from '../config/schema.js';
+import type { MinionsConfig, Mode } from '../config/schema.js';
 import { MinionsError } from '../core/errors.js';
 import { readJsonIfExists, writeJson } from '../core/fsutil.js';
 import { projectPaths } from '../core/paths.js';
@@ -24,7 +23,6 @@ import type { DockerProbe } from './discovery.js';
 import type { Runner } from './docker.js';
 import { harnessStep } from './harness-setup.js';
 import { formatPlan, runInit, type InitResult } from './install.js';
-import { defaultSessionsOn } from './channel-cli.js';
 import { loadEffectiveConfig, loadProjectJson } from './project.js';
 import { findByCommonDir, gitCommonDir, loadRegistry, repoRoot } from './registry.js';
 import type { RuntimeKind } from './runtime.js';
@@ -51,7 +49,7 @@ export interface SetupRuntime {
 
 export interface SetupOptions {
   path: string;
-  profile?: Profile;
+  mode?: Mode;
   visibility?: 'shared' | 'private';
   /**
    * --config <file>: validated project configuration (same semantics as `minions init --config`). The
@@ -77,7 +75,7 @@ export interface SetupOptions {
   fetch?: Fetch;
 }
 
-export type StepId = 'init' | 'autoMerge' | 'telegram' | 'harness' | 'container' | 'import' | 'coordinator';
+export type StepId = 'init' | 'telegram' | 'harness' | 'container' | 'import' | 'coordinator';
 export type StepStatus = 'done' | 'kept' | 'changed' | 'skipped' | 'failed' | 'deferred' | 'planned';
 export interface SetupStep { id: StepId; status: StepStatus; detail: string; later?: string; lines?: string[] }
 
@@ -144,7 +142,6 @@ export function setupCommands(repoPath: string) {
   return {
     setup, inRepo,
     later: {
-      autoMerge: `Run ${setup} again to enable automatic local integration (default no).`,
       telegram: `Run ${setup} again (or ${inRepo('minions auth telegram')}) to connect a Telegram bot.`,
       container: `Run ${setup} again or ${inRepo('minions start')} to start the container and attach the coordinator.`,
     },
@@ -184,7 +181,7 @@ export async function runSetup(opts: SetupOptions): Promise<SetupResult> {
   }
   if (interactive) say('\n== Project ==');
   const init = await runInit({
-    path: opts.path, profile: opts.profile, visibility: opts.visibility, yes: !interactive, dryRun: opts.dryRun,
+    path: opts.path, mode: opts.mode, visibility: opts.visibility, yes: !interactive, dryRun: opts.dryRun,
     configFile: opts.configFile, attach: opts.attach, newIdentity: opts.newIdentity, runtime: opts.runtimeKind,
     io: interactive ? io : undefined, skipIntegrations: true, reconfigure,
     dockerProbe: opts.dockerProbe, runner: opts.runner, fetch: opts.fetch,
@@ -192,8 +189,8 @@ export async function runSetup(opts: SetupOptions): Promise<SetupResult> {
   const projectId = init.plan.projectId;
   const written = init.applied ? init.applied.written.length + init.applied.removed.length : 0;
   step({ id: 'init', status: opts.dryRun ? 'planned' : priorId ? (reconfigure || opts.configFile ? 'changed' : 'kept') : 'done',
-    detail: opts.dryRun ? `would install project ${projectId} (${init.plan.visibility}, profile ${init.plan.profile})`
-      : `project ${projectId} (${init.plan.visibility}, profile ${init.plan.profile}); ${written} file(s) written, ${init.applied?.unchanged ?? 0} unchanged` });
+    detail: opts.dryRun ? `would install project ${projectId} (${init.plan.visibility}, ${init.plan.mode})`
+      : `project ${projectId} (${init.plan.visibility}, ${init.plan.mode}); ${written} file(s) written, ${init.applied?.unchanged ?? 0} unchanged` });
 
   const cmds = setupCommands(init.plan.repoPath);
   const LATER = cmds.later;
@@ -217,10 +214,6 @@ export async function runSetup(opts: SetupOptions): Promise<SetupResult> {
     cur[keys.at(-1)!] = value;
     if (!changed.includes(dotted)) changed.push(dotted);
   };
-
-  // ---------------------------------------------------------------- 2. local integration (opt-in, default no)
-  if (interactive) say('\n== Local integration ==');
-  step(await localIntegrationStep(interactive && !opts.configFile ? io! : null, config, setLocal, LATER.autoMerge, cmds.inRepo));
 
   // ---------------------------------------------------------------- 3. Telegram
   if (interactive) say('\n== Telegram ==');
@@ -256,9 +249,8 @@ export async function runSetup(opts: SetupOptions): Promise<SetupResult> {
         const verify = interactive ? await yesNo(io!, 'Check the token with Telegram now (Bot API getMe; sends it to api.telegram.org)?', false) : false;
         const r = await provisionTelegramToken({ projectId, token, repoPath: project.repoPath, verify, runner: opts.runner, fetch: opts.fetch });
         channel = telegramChannel;
-        const sessionsOn = await defaultSessionsOn(await loadProjectJson(projectId)).catch(() => false);
         step({ id: 'telegram', status: action === 'change' ? 'changed' : 'done',
-          detail: `bot ${r.botId} stored in ${backendLabel(r.backend)}; communication.channel ${channel}${sessionsOn ? '; coordinator sessions on (one per thread)' : ''}`,
+          detail: `bot ${r.botId} stored in ${backendLabel(r.backend)}; communication.channel ${channel}`,
           ...(r.warnings.length ? { lines: r.warnings.map((w) => `warning: ${w}`) } : {}) });
       } catch (e) {
         step({ id: 'telegram', status: 'failed', detail: `${errMsg(e, 'could not store the token')}; nothing was stored, the coordinator stays terminal-only`, later: LATER.telegram });
@@ -354,39 +346,8 @@ function importStep(r: ImportResult, status: StepStatus): SetupStep {
   return { id: 'import', status, detail: `${r.baseBranch} @ ${r.commit.slice(0, 12)}`, ...(r.warnings.length ? { lines: r.warnings.map((w) => `warning: ${w}`) } : {}) };
 }
 
-/**
- * The autoMerge step in local delivery (task-82.4): asks "Integrate approved tasks automatically?" (default: the
- * current setting). Yes records delivery.merge "auto-when-eligible": the runtime merges each approved head, runs the
- * verification commands on the merged tree, and lands it on the local base (docs/design/local-auto-integration.md).
- * Not asked in the supervised profile (base.merge is denied there: the user integrates).
- */
-async function localIntegrationStep(io: WizardIO | null, config: MinionsConfig, setLocal: (k: string, v: unknown) => void, later: string, inRepo: (c: string) => string): Promise<SetupStep> {
-  const on = config.delivery.merge === 'auto-when-eligible';
-  const missing = () => autoMergeConfigReasons({ ...config, delivery: { ...config.delivery, merge: 'auto-when-eligible' } });
-  const base = config.git.baseBranch;
-  const lines = () => missing().map((r) => `still needed: ${r}`);
-  const kept = (): SetupStep => ({ id: 'autoMerge', status: 'kept', detail: `delivery.merge auto-when-eligible: the runtime integrates approved tasks into the local ${base}`, ...(missing().length ? { lines: lines() } : {}) });
-  const denied = missing().some((r) => r.startsWith('base.merge is denied'));
-  if (denied && !on) {
-    io?.info(`  Automatic local integration is off in this profile (base.merge is denied: you integrate approved branches); not asked.`);
-    return { id: 'autoMerge', status: 'skipped', detail: 'local integration not offered: base.merge is denied by policy', later };
-  }
-  if (!io) return on ? kept() : { id: 'autoMerge', status: 'skipped', detail: 'automatic local integration not enabled (default no)', later };
-  io.info(`  minions can integrate approved tasks into the local ${base} itself: it merges the approved head, runs the verification commands`);
-  io.info(`  (${config.verification.commands.join(', ') || 'none configured'}) on the merged tree, and moves ${base} only when they pass. A conflict or a failure`);
-  io.info(`  sends the task back for a repair. Sensitive paths need your approval (${inRepo('minions work approve <taskId> --head <sha>')}).`);
-  const yes = await yesNo(io, 'Integrate approved tasks automatically?', on);
-  if (yes === on) return on ? kept() : { id: 'autoMerge', status: 'skipped', detail: 'automatic local integration not enabled', later };
-  setLocal('delivery.merge', yes ? 'auto-when-eligible' : 'disabled');
-  if (!yes) return { id: 'autoMerge', status: 'changed', detail: `delivery.merge disabled (approved tasks end delivered; the coordinator merges them into the local ${base})` };
-  const l = lines();
-  for (const x of l) io.info(`  ${x}`);
-  return { id: 'autoMerge', status: 'done', detail: `delivery.merge auto-when-eligible: the runtime integrates approved tasks into the local ${base}${l.length ? ` (not usable yet; see below and ${inRepo('minions doctor')} merge.readiness)` : ''}`, ...(l.length ? { lines: l } : {}) };
-}
-
 function dryRunResult(init: InitResult, steps: SetupStep[], refs: CredentialsJson, rerun: boolean, localPath: string): SetupResult {
   const would = (id: StepId, detail: string) => steps.push({ id, status: 'planned', detail });
-  would('autoMerge', 'would ask "Integrate approved tasks automatically?" (default no); yes records delivery.merge "auto-when-eligible" in the local layer');
   would('telegram', refs.telegram ? `bot ${refs.telegram.botId} stored: would offer keep/change/disable` : 'would ask "Set up Telegram?" (default no); bot token entered without echo');
   would('harness', 'would ask "Which agent should do the work?" (default Claude Code; OpenAI Codex: OpenAI API key without echo, model, and in this version the read-only codex-reviewer stage after the Claude reviewer)');
   would('container', 'would build the image if needed and start the container (idempotent)');

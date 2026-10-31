@@ -47,7 +47,7 @@ const probeOut = (permission?: object): RunResult => ({
 describe('doctor claude.capabilities: coordinator permission mode', () => {
   it('ok with auto, warn with the reason on fallback, ok for older probe output, fail when the probe fails', async () => {
     const repo = makeRepo(env.root);
-    await runInit({ path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
+    await runInit({ mode: 'independent', path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
     const cap = async (probe: RunResult) =>
       (await runDoctor({ cwd: repo, probe: dockerUp, runner: container(probe) })).checks.find((c) => c.name === 'claude.capabilities');
 

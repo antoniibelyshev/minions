@@ -34,7 +34,7 @@ beforeAll(async () => {
   env = withHome();
   repo = makeRepo(env.root);
   writeFileSync(join(repo, '.env'), `ANTHROPIC_API_KEY=${SECRET}\n`); // ignored by .gitignore
-  const r = await runInit({ path: repo, yes: true, visibility: 'private' });
+  const r = await runInit({ mode: 'independent', path: repo, yes: true, visibility: 'private' });
   projectId = r.plan.projectId;
   const paths = projectPaths(projectId);
   // Retarget image + resource names to test-prefixed ones.

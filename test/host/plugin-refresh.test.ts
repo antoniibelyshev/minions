@@ -46,7 +46,7 @@ afterEach(() => {
 async function initOld() {
   process.env.MINIONS_TEMPLATES = oldPkg;
   const repo = makeRepo(home.root);
-  const r = await runInit({ path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
+  const r = await runInit({ mode: 'independent', path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
   const project = await loadProjectJson(r.plan.projectId);
   const config = (await loadEffectiveConfig(project)).config;
   return { project, config, dir: projectPaths(project.projectId).pluginDir };

@@ -52,7 +52,7 @@ const no: RunResult = { code: 127, stdout: '', stderr: 'not found' };
 
 async function hostProject(extra: Parameters<typeof runInit>[0] extends infer T ? Partial<T> : never = {}) {
   const repo = makeRepo(env.root);
-  const r = await runInit({ path: repo, yes: true, visibility: 'private', runtime: 'host', dockerProbe: dockerDown, ...extra });
+  const r = await runInit({ mode: 'independent', path: repo, yes: true, visibility: 'private', runtime: 'host', dockerProbe: dockerDown, ...extra });
   return { repo, r, id: r.plan.projectId };
 }
 
@@ -80,7 +80,7 @@ describe('host runtime processes', () => {
     await prepareHostRuntime(project, { target: { node: process.execPath, cli: '/nonexistent' } });
     // a real shim run (re-prepared with the package CLI) would start the CLI; check the docker branch instead:
     const other = makeRepo(env.root, 'docker-repo');
-    await runInit({ path: other, yes: true, visibility: 'private', dockerProbe: dockerUp });
+    await runInit({ mode: 'independent', path: other, yes: true, visibility: 'private', dockerProbe: dockerUp });
     const only = join(env.root, 'only-git');
     mkdirSync(only);
     symlinkSync(execFileSync('which', ['git'], { encoding: 'utf8' }).trim(), join(only, 'git'));
@@ -116,7 +116,7 @@ describe('host runtime processes', () => {
     expect(kept.hostData).toEqual({ path: hostRuntimePaths(id).root, deleted: false });
     expect(existsSync(hostRuntimePaths(id).state)).toBe(true);
     expect(existsSync(hostRuntimePaths(id).bin)).toBe(false);
-    const again = await runInit({ path: repo, yes: true, visibility: 'private', runtime: 'host', dockerProbe: dockerDown });
+    const again = await runInit({ mode: 'independent', path: repo, yes: true, visibility: 'private', runtime: 'host', dockerProbe: dockerDown });
     const id2 = again.plan.projectId;
     await prepareHostRuntime(await loadProjectJson(id2), { target: { node: process.execPath, cli: '/x' } });
     const del = await runUninstall({ cwd: repo, yes: true, deleteData: true, runner });

@@ -415,7 +415,7 @@ export async function runDoctor(opts: {
     const ref = await projectForPath(opts.cwd);
     projectId = ref.projectId;
     const project = pre ?? await loadProjectJson(ref.projectId);
-    add('project', 'ok', `${project.projectId} (${project.visibility}, ${project.profile}) at ${project.repoPath}`);
+    add('project', 'ok', `${project.projectId} (${project.visibility}, ${project.mode}) at ${project.repoPath}`);
     const auth = authOf(project);
     await hostAuthChecks(project.projectId, auth, add);
     const baseUrl = containerEnv(auth).ANTHROPIC_BASE_URL;

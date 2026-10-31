@@ -23,7 +23,7 @@ beforeAll(() => {
   root = tmp('minions-restore-cmd-');
   mkdirSync(join(root, 'state'), { recursive: true });
   mkdirSync(join(root, 'secrets'), { recursive: true });
-  writeFileSync(join(root, 'config.json'), JSON.stringify(defaults('project-owner')));
+  writeFileSync(join(root, 'config.json'), JSON.stringify(defaults('independent')));
   // The restart renders the coordinator prompt: a plugin dir of its own, never the container's /opt/minions/plugin.
   mkdirSync(join(root, 'plugin'), { recursive: true });
   writeFileSync(join(root, 'plugin', 'coordinator.md'), 'coordinator prompt\n');
@@ -127,7 +127,7 @@ describe('minions workspace state-import --force (command layer)', () => {
 
       // `minions settings restart` runs `coordinator restart --recover` (not forced) in the runtime.
       let killed = false;
-      const res = await restartCoordinator(defaults('project-owner'), {
+      const res = await restartCoordinator(defaults('independent'), {
         paths: p, runner: tmux(() => { killed = true; wrapper!.kill('SIGKILL'); }), activeLeases: () => db.activeLeases(),
         lock: db, lockAlive: (lp) => lp === pid ? !killed : false, sleep: async () => {}, handoverWaitMs: 0,
       }, { recover: true });

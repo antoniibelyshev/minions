@@ -23,7 +23,8 @@ describe('can()', () => {
   it('sensitive paths upgrade allow to ask for the landing', () => {
     expect(can(base, 'base.merge', { paths: ['src/index.ts'] })).toBe('allow');
     expect(can(base, 'base.merge', { paths: ['src/index.ts', '.github/workflows/ci.yml'] })).toBe('ask');
-    expect(can(base, 'base.merge', { paths: ['db/migrations/001.sql'] })).toBe('ask');
+    expect(can(base, 'base.merge', { paths: ['db/migrations/001.sql'] })).toBe('allow');
+    expect(can(base, 'base.merge', { paths: ['.husky/pre-commit'] })).toBe('ask');
     expect(can(base, 'git.commit', { paths: ['.github/workflows/ci.yml'] })).toBe('allow');
   });
 

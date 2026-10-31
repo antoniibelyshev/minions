@@ -14,7 +14,7 @@ let root = '';
 beforeAll(() => {
   root = tmp();
   mkdirSync(join(root, 'state'), { recursive: true });
-  const cfg = defaults('project-owner');
+  const cfg = defaults('independent');
   cfg.routine = { enabled: true, digestAt: ['08:00'], timezone: 'Europe/Berlin' };
   writeFileSync(join(root, 'config.json'), JSON.stringify(cfg));
   process.env.MINIONS_RUNTIME = 'container';

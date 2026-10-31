@@ -106,7 +106,7 @@ describe('ensureHostWorktreesDir (host CLI, outside the sandbox)', () => {
 
   it('prepareHostRuntime (every start/restart) and the transfer target (first import) create it', async () => {
     const path = makeRepo(env.root);
-    const r = await runInit({ path, yes: true, visibility: 'private', runtime: 'host', dockerProbe: dockerDown });
+    const r = await runInit({ mode: 'independent', path, yes: true, visibility: 'private', runtime: 'host', dockerProbe: dockerDown });
     const project = await loadProjectJson(r.plan.projectId);
     const hp = hostRuntimePaths(project.projectId);
     await prepareHostRuntime(project, { target: { node: process.execPath, cli: '/x' }, runner: async () => ok() });

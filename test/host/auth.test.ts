@@ -40,7 +40,7 @@ let env: ReturnType<typeof withHome>;
 beforeEach(() => { env = withHome(); });
 afterEach(() => env.cleanup());
 
-const init = (repo: string) => runInit({ path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp, centralOnPath: false });
+const init = (repo: string) => runInit({ mode: 'independent', path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp, centralOnPath: false });
 
 function fakeHelper(name: string, body: string): string {
   const p = join(env.root, name);
@@ -63,7 +63,7 @@ async function failure(p: Promise<unknown>) {
 
 const baseProject = {
   version: 1 as const, projectId: '3f2b8c1e-7d4a-4e9b-9c2f-1a2b3c4d5e6f', repoPath: '/r', gitCommonDir: '/r/.git', visibility: 'private' as const,
-  profile: 'personal-work' as const, imageTag: 'minions-runtime:0.1.0', baseBranch: 'main', remoteUrl: null,
+  mode: 'supervised' as const, imageTag: 'minions-runtime:0.1.0', baseBranch: 'main', remoteUrl: null,
   gitIdentity: { name: 'Ada', email: 'ada@example.com' },
   container: { cpus: 4, memoryMiB: 6144, pidsLimit: 512, publishPorts: [], network: 'outbound-internet' as const },
 };
@@ -331,11 +331,11 @@ describe('defaults.json and init', () => {
       ask: async (q: string, def: string) => (q === 'Claude authorization' ? answer : def),
       info: (l: string) => info.push(l),
     });
-    const plain = await runWizard({ discovery, projectId: baseProject.projectId, profile: 'personal-work', visibility: 'private', yes: false, io: io('login'), auth: { centralOnPath: false, home } });
+    const plain = await runWizard({ discovery, projectId: baseProject.projectId, mode: 'supervised', visibility: 'private', yes: false, io: io('login'), auth: { centralOnPath: false, home } });
     expect(info.join('\n')).not.toMatch(/JetBrains Central/);
     expect(plain.claudeAuth).toEqual({ method: 'login' });
     info.length = 0;
-    const jb = await runWizard({ discovery, projectId: baseProject.projectId, profile: 'personal-work', visibility: 'private', yes: false, io: io('3'), auth: { centralOnPath: true, home } });
+    const jb = await runWizard({ discovery, projectId: baseProject.projectId, mode: 'supervised', visibility: 'private', yes: false, io: io('3'), auth: { centralOnPath: true, home } });
     expect(info.join('\n')).toMatch(/3\) JetBrains Central \(detected\)/);
     expect(jb.claudeAuth).toMatchObject({ method: 'helper', preset: 'jbcentral', env: { ANTHROPIC_BASE_URL: CENTRAL_URL } });
   });

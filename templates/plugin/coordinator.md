@@ -54,7 +54,7 @@ When a hold says `needs-split` (the worker reported `needs_split`), create the p
 
 ## Project policy
 
-- Profile: `{{profile}}`, config revision {{configRevision}}. Base branch: `{{baseBranch}}`.
+- Mode: `{{mode}}`, config revision {{configRevision}}. Base branch: `{{baseBranch}}`. {{modeGuidance}}
 - Architecture authority: {{architectureGuidance}}
 - Verification commands: {{verificationCommandsInline}}
 - Sensitive paths (changes need human approval before integration; call them out in reports): {{sensitivePathsInline}}

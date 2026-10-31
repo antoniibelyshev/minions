@@ -241,7 +241,7 @@ describe('reporting granularity', () => {
     expect(coord).toContain('`ask` = get the user\'s explicit approval first');
     expect(coord).toContain('never permission to change this policy');
     expect(coord).toMatch(/Sensitive paths \(changes need human approval/);
-    expect(coord).toMatch(/\| ask \|/);
+    expect(coord).toMatch(/\| deploy\.execute \| deny \|/);
   });
 
   it('"tasks" keeps the per-task wording; "quiet" reports only what needs the user', async () => {
@@ -596,7 +596,7 @@ describe('owner behaviour defaults (task-34)', () => {
   it('intake says when starting still needs authorization', async () => {
     const base = defaults();
     const gated = ownerSection(await (await gen({ ...base, intake: { ...base.intake, startReady: false } })).read('coordinator.md'));
-    expect(gated).toContain('Starting them still needs the owner\'s authorization in this profile');
+    expect(gated).toContain('Starting them still needs the owner\'s authorization in this project');
   });
 
   it('decisions are asked as numbered polls with the recommended option first and "Other" last', async () => {
@@ -627,9 +627,9 @@ describe('owner behaviour defaults (task-34)', () => {
     expect(await (await gen(terminal)).read('coordinator.md')).not.toContain('**Threads.**');
   });
 
-  it('local delivery, project-owner: verifies the merge before the base moves, then commits or aborts', async () => {
-    const base = defaults('project-owner');
-    const cfg = { ...base, git: { ...base.git, baseBranch: 'trunk' } };
+  it('local delivery, independent without local integration: verifies the merge before the base moves, then commits or aborts', async () => {
+    const base = defaults('independent');
+    const cfg = { ...base, delivery: { merge: 'disabled' as const }, git: { ...base.git, baseBranch: 'trunk' } };
     const g = await gen(cfg);
     const coord = await g.read('coordinator.md');
     expect(coord).toContain('Then integrate each delivered branch into the local `trunk` yourself, one at a time, in `/workspace/repo` with `trunk` checked out and a clean tree');
@@ -652,12 +652,15 @@ describe('owner behaviour defaults (task-34)', () => {
     expect(orch).toContain('Local delivery: then integrate it into the local `trunk` as described under Delivery (verify before committing the merge).');
   });
 
-  it('local delivery, personal-work: asks before each merge', async () => {
-    const g = await gen(defaults('personal-work'));
-    const coord = await g.read('coordinator.md');
-    expect(coord).toContain("Sensitive-path changes need the user's explicit approval, and in this profile so does every merge: ask first (task, branch, head SHA).");
-    expect(coord).toContain('`git merge --no-ff --no-commit agent/<slug>`');
-    expect(await g.read('skills/orchestrate/SKILL.md')).toContain('verify before committing the merge; ask the user before each merge');
+  it('the project policy states the mode and how closely the owner supervises', async () => {
+    const policy = (md: string) => md.slice(md.indexOf('## Project policy'), md.indexOf('## Owner defaults'));
+    const sup = policy(await (await gen(defaults('supervised'))).read('coordinator.md'));
+    expect(sup).toContain('- Mode: `supervised`');
+    expect(sup).toMatch(/the owner reviews and merges all code, so you and the workers are free to experiment/);
+    expect(sup).toMatch(/dependency updates and upgrades, migrations, CI, broad refactors/);
+    const ind = policy(await (await gen(defaults('independent'))).read('coordinator.md'));
+    expect(ind).toContain('- Mode: `independent`');
+    expect(ind).toMatch(/make decisions within the policy and record each one/);
   });
 
   it('local delivery, supervised: never merges', async () => {
@@ -720,8 +723,8 @@ describe('own ideas rule (task-130): the coordinator promotes its own ideas free
 });
 
 describe('local integration prompts (task-82.4)', () => {
-  const local = (profile: 'project-owner' | 'personal-work' | 'supervised', merge: 'disabled' | 'auto-when-eligible') => {
-    const c = defaults(profile);
+  const local = (mode: 'independent' | 'supervised', merge: 'disabled' | 'auto-when-eligible') => {
+    const c = defaults(mode);
     c.delivery = { ...c.delivery, merge };
     c.verification.commands = ['npm run typecheck', 'npm test'];
     return c;
@@ -729,7 +732,7 @@ describe('local integration prompts (task-82.4)', () => {
   const deliverySection = (md: string) => md.slice(md.indexOf('## Delivery'), md.indexOf('\n\n', md.indexOf('Never merge into, commit on')) + 1 || undefined);
 
   it('with local integration on, the coordinator gets no manual merge steps and never merges, commits on or resets the base', async () => {
-    const g = await gen(local('project-owner', 'auto-when-eligible'));
+    const g = await gen(local('independent', 'auto-when-eligible'));
     const coord = await g.read('coordinator.md');
     expect(coord).not.toMatch(/git merge --no-ff|--no-commit|git commit --no-edit|git merge --abort/);
     expect(coord).toContain('The runtime integrates approved tasks into the local `main`; you never merge.');
@@ -744,15 +747,17 @@ describe('local integration prompts (task-82.4)', () => {
     expect(deliverySection(coord)).toMatchSnapshot();
   });
 
-  it('personal-work with base.merge "ask": every landing needs the signed approval', async () => {
-    const coord = await (await gen(local('personal-work', 'auto-when-eligible'))).read('coordinator.md');
-    expect(coord).toMatch(/in this profile every landing needs the user's host-signed merge approval/);
+  it('base.merge "ask": every landing needs the signed approval', async () => {
+    const c = local('independent', 'auto-when-eligible');
+    c.capabilities['base.merge'] = 'ask';
+    const coord = await (await gen(c)).read('coordinator.md');
+    expect(coord).toMatch(/under this policy every landing needs the user's host-signed merge approval/);
     expect(coord).not.toMatch(/--no-commit/);
     expect(deliverySection(coord)).toMatchSnapshot();
   });
 
   it('with the switch off (rollout) or base.merge denied, the existing local guidance stays', async () => {
-    const off = await (await gen(local('project-owner', 'disabled'))).read('coordinator.md');
+    const off = await (await gen(local('independent', 'disabled'))).read('coordinator.md');
     expect(off).toMatch(/`git merge --no-ff --no-commit agent\/<slug>`/);
     expect(off).toContain('start no local integration merge (an upgrade could interrupt a `--no-commit` merge');
     const sup = await (await gen(local('supervised', 'auto-when-eligible'))).read('coordinator.md');
@@ -761,11 +766,11 @@ describe('local integration prompts (task-82.4)', () => {
   });
 
   it('the `merging` lines of the drain rule, orchestrate and recover skills appear only with local integration on', async () => {
-    const off = await gen(local('project-owner', 'disabled'));
+    const off = await gen(local('independent', 'disabled'));
     expect(await off.read('coordinator.md')).toContain('resume no hold and start no local integration merge (an upgrade could interrupt a `--no-commit` merge and leave the repo mid-merge). A hook');
     expect(await off.read('skills/orchestrate/SKILL.md')).toContain('reviewer `approve` → `delivered` (local delivery). Local delivery: then integrate');
     expect(await off.read('skills/recover/SKILL.md')).not.toContain('Tasks in `merging`');
-    const on = await gen(local('project-owner', 'auto-when-eligible'));
+    const on = await gen(local('independent', 'auto-when-eligible'));
     expect(await on.read('skills/orchestrate/SKILL.md')).toContain('(local delivery; `merging` with local integration on: the runtime integrates it, no worker runs for it). Local integration:');
     expect(await on.read('skills/recover/SKILL.md')).toMatch(/their brief carries `resume`\.\n {3}- Tasks in `merging` have no lease and no worker: the runtime's integrator owns them/);
   });

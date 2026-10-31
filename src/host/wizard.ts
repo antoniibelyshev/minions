@@ -1,19 +1,17 @@
-// Init wizard (spec §7). Questions are prefilled from the profile, an existing config, and discovery.
-// Questions whose answer cannot change v0.1 behaviour are shown as information only, with the
-// deferred options marked "(not available in v0.1)". The wizard questions never ask for secrets:
+// Init wizard (spec §7). The config comes from the mode, an existing config, discovery and the host defaults
+// (defaults.json); the wizard asks only what none of them answers. The wizard questions never ask for secrets:
 // the Claude authorization question only asks where the host should read a key from, never the key
 // itself; the only secret prompt (the Telegram bot token, after the plan is applied) goes
 // through `secret()`, which reads from the host terminal without echo.
 import { createInterface, type Interface } from 'node:readline/promises';
-import { profileDefaults } from '../config/profiles.js';
+import { modeDefaults } from '../config/modes.js';
 import { validateConfig } from '../config/resolve.js';
-import { PROFILES, type MinionsConfig, type Profile } from '../config/schema.js';
+import { MODES, type MinionsConfig, type Mode } from '../config/schema.js';
 import { stripTerminalEscapes } from '../core/control-chars.js';
 import { MinionsError } from '../core/errors.js';
 import { parseWith, readJson } from '../core/fsutil.js';
 import { VERSION } from '../core/version.js';
 import { ClaudeAuthSchema, PRESETS, checkUrl, parseEnvPairs, type ClaudeAuth } from './auth.js';
-import { telegramBotGuidance } from './credentials.js';
 import type { Discovery } from './discovery.js';
 
 export interface WizardIO {
@@ -86,7 +84,8 @@ export function readSecret(prompt: string, input: SecretInput = process.stdin, o
 export interface WizardInput {
   discovery: Discovery;
   projectId: string;
-  profile?: Profile;
+  /** Chosen before the wizard (`--mode` or askMode). */
+  mode: Mode;
   visibility?: 'shared' | 'private';
   /** Config from a previous install (rerun): its values become the defaults. */
   existing?: MinionsConfig;
@@ -94,11 +93,8 @@ export interface WizardInput {
   configFile?: string;
   /** --yes: accept defaults. */
   yes: boolean;
-  /**
-   * `minions setup`: the channel and token questions are asked by setup after the
-   * plan is applied (it needs the project id to store tokens), so the wizard skips them here.
-   */
-  skipIntegrations?: boolean;
+  /** Git identity from defaults.json (wins over the repository's git config). */
+  gitIdentity?: { name?: string; email?: string };
   io?: WizardIO;
   /** Claude authorization: default (previous project / defaults.json) and preset detection. */
   auth?: { default?: ClaudeAuth; centralOnPath?: boolean; home?: string };
@@ -107,21 +103,6 @@ export interface WizardInput {
 }
 
 export interface WizardResult { config: MinionsConfig; notes: string[]; asked: string[]; claudeAuth?: ClaudeAuth }
-
-
-export function parsePorts(s: string): { host: number; container: number }[] {
-  const t = s.trim();
-  if (!t || t === 'none') return [];
-  return t.split(',').map((part) => {
-    const m = /^\s*(\d{1,5})(?::(\d{1,5}))?\s*$/.exec(part);
-    const host = Number(m?.[1]), container = Number(m?.[2] ?? m?.[1]);
-    if (!m || !(host >= 1 && host <= 65535) || !(container >= 1 && container <= 65535)) {
-      throw new Error(`invalid port mapping "${part.trim()}" (use host:container, e.g. 3000:3000)`);
-    }
-    return { host, container };
-  });
-}
-const fmtPorts = (p: { host: number; container: number }[]) => (p.length ? p.map((x) => `${x.host}:${x.container}`).join(',') : 'none');
 
 async function askValid<T>(io: WizardIO, q: string, def: string, parse: (s: string) => T): Promise<T> {
   for (let i = 0; ; i++) {
@@ -141,28 +122,40 @@ const choice = <T extends string>(opts: readonly T[]) => (s: string): T => {
   return hit;
 };
 const yesNo = (s: string) => { if (/^y(es)?$/i.test(s)) return true; if (/^no?$/i.test(s)) return false; throw new Error('answer y or n'); };
-const posNum = (int: boolean, min: number) => (s: string) => {
-  const n = Number(s);
-  if (!Number.isFinite(n) || n < min || (int && !Number.isInteger(n))) throw new Error(`enter a ${int ? 'whole ' : ''}number >= ${min}`);
-  return n;
-};
 const nonEmpty = (s: string) => { if (!s.trim()) throw new Error('required'); return s.trim(); };
 
-function baseConfig(input: WizardInput, profile: Profile): { config: MinionsConfig; notes: string[] } {
-  const d = input.discovery;
-  if (input.existing && input.existing.profile === profile) {
-    return { config: { ...structuredClone(input.existing), projectId: input.projectId, packageVersion: VERSION }, notes: [] };
-  }
-  const r = profileDefaults(profile, {
-    baseBranch: d.git.baseBranch,
-    identity: { name: d.git.userName ?? '', email: d.git.userEmail ?? '' },
-    projectId: input.projectId, packageVersion: VERSION,
-  });
-  r.config.verification.commands = [...d.verificationCommands];
-  if (d.setupCommands.length) r.config.verification.setupCommands = [...d.setupCommands];
-  return r;
+/** The mode question (the first one; no default for a new project). */
+export async function askMode(io: WizardIO, def?: Mode): Promise<Mode> {
+  io.info('Mode:');
+  io.info('  1) independent  the agents plan, decide, merge into the local base and report milestones (Docker, Telegram, daily digest)');
+  io.info('  2) supervised   you review and merge all code; the agents experiment freely and ask about risky changes (host, terminal)');
+  return askValid(io, 'Mode (independent/supervised)', def ?? '', choice(MODES));
 }
 
+/** A mode is never assumed: a non-interactive init needs `--mode`. */
+export const modeRequired = () => new MinionsError('PRECONDITION', 'Choose a mode: independent or supervised.',
+  'Pass `--mode independent` (the agents run the project) or `--mode supervised` (you review and merge all code).');
+
+function baseConfig(input: WizardInput): MinionsConfig {
+  const d = input.discovery;
+  if (input.existing && input.existing.mode === input.mode) {
+    return { ...structuredClone(input.existing), projectId: input.projectId, packageVersion: VERSION };
+  }
+  const config = modeDefaults(input.mode, {
+    baseBranch: input.existing?.git.baseBranch ?? d.git.baseBranch,
+    identity: input.existing?.git.identity ?? { name: input.gitIdentity?.name ?? d.git.userName ?? '', email: input.gitIdentity?.email ?? d.git.userEmail ?? '' },
+    projectId: input.projectId, packageVersion: VERSION,
+  });
+  config.verification.commands = [...(input.existing?.verification.commands ?? d.verificationCommands)];
+  const setup = input.existing ? input.existing.verification.setupCommands ?? [] : d.setupCommands;
+  if (setup.length) config.verification.setupCommands = [...setup];
+  return config;
+}
+
+/**
+ * Builds the project config from the mode, discovery and the host defaults. It asks only what nothing else answers:
+ * Claude authorization without a default, and the git identity when neither defaults.json nor git config has one.
+ */
 export async function runWizard(input: WizardInput): Promise<WizardResult> {
   const d = input.discovery;
   const asked: string[] = [];
@@ -182,88 +175,18 @@ export async function runWizard(input: WizardInput): Promise<WizardResult> {
     return askValid(io, q, def, parse);
   };
 
-  // 1. Starting profile.
-  let profile: Profile = input.profile ?? input.existing?.profile ?? 'project-owner';
-  if (interactive && !input.profile) {
-    io.info('Profiles: 1) project-owner  2) personal-work  3) supervised');
-    profile = await ask('profile', 'Starting profile', profile, choice(PROFILES));
-  }
-  const { config: cfg, notes } = baseConfig(input, profile);
-  let claudeAuth = input.auth?.default;
-
-  // 2. Visibility.
+  const cfg = baseConfig(input);
+  const notes: string[] = [];
   if (input.visibility) cfg.visibility = input.visibility;
-  else if (interactive) {
-    io.info('Installation: shared writes .minions/config.json + README into the repo; private writes nothing into the repo.');
-    cfg.visibility = await ask('visibility', 'Installation visibility (shared/private)', cfg.visibility, choice(['shared', 'private'] as const));
-  }
-
-  if (interactive) {
-    // 3. Backlog backend and ownership — single supported option in v0.1.
-    io.info(`Backlog: Backlog.md inside the container (ownership: ${cfg.backlog.ownership}).`);
-    // 4. Intake and authorized scope.
-    cfg.intake.startReady = await ask('intake.startReady',
-      'Start ready tasks automatically? (n = only tasks labelled minions:authorized)', cfg.intake.startReady ? 'y' : 'n', yesNo);
-    // 5. Delivery: local only.
-    if (input.skipIntegrations) io.info('Local integration and Telegram: asked by `minions setup` after this plan is applied.');
-    else io.info(`Delivery: local commits on agent/<slug> branches, fetched with \`minions export\`${cfg.profile === 'supervised' ? '' : `; the coordinator integrates approved branches into the container's local ${cfg.git.baseBranch}${cfg.profile === 'personal-work' ? ' (asking before each merge)' : ''}, or the runtime does with local integration (\`minions setup\`, default no)`}.`);
-    // 6. Communication. Terminal is always available; Telegram is optional and degrades to terminal.
-    let channel = cfg.communication.channel;
-    if (!input.skipIntegrations) {
-      io.info('Communication: auto (default: Telegram when a bot token is stored for this project with `minions auth telegram`, otherwise terminal),');
-      io.info('  terminal (always available), or telegram (explicit; warns when it cannot start). Telegram uses the official Claude Code channel plugin (research preview).');
-      if (input.runtime === 'host') io.info('  In the host runtime Telegram uses the minions channel server instead of the plugin (pairing: `minions telegram access pair <code>` on the host).');
-      channel = await ask('communication.channel', 'Communication channel (auto/terminal/telegram)', cfg.communication.channel, choice(['auto', 'terminal', 'telegram'] as const));
-    }
-    if (channel === 'auto' && !input.skipIntegrations) {
-      io.info(cfg.container.network === 'none' && input.runtime !== 'host'
-        ? '  container.network is none, so auto means terminal (the Telegram plugin needs api.telegram.org and the npm registry).'
-        : '  To use Telegram later: create a bot with BotFather, run `minions auth telegram`, then `minions down && minions start`.');
-    } else if (channel === 'telegram' && !input.skipIntegrations) {
-      for (const l of telegramBotGuidance()) io.info(`  ${l}`);
-      if (cfg.container.network === 'none') {
-        const why = 'Telegram is unavailable: container.network is none, and the plugin needs api.telegram.org and the npm registry. Using terminal.';
-        io.info(`  ${why}`);
-        notes.push(why);
-        channel = 'terminal';
-      } else {
-        io.info('  After the plan is applied you can store the bot token (input hidden). Until a token is stored and the plugin');
-        io.info('  is available in the container, the coordinator starts terminal-only and says why.');
-      }
-    }
-    cfg.communication.channel = channel;
-    // 7. Credentials — references only; no secret is requested by these questions.
-    claudeAuth = parseWith(ClaudeAuthSchema, await askClaudeAuth(input, ask, io), 'wizard answers (Claude authorization)');
-  }
+  let claudeAuth = input.auth?.default;
+  if (interactive && !claudeAuth) claudeAuth = parseWith(ClaudeAuthSchema, await askClaudeAuth(input, ask, io), 'wizard answers (Claude authorization)');
   if (!cfg.git.identity.name || !cfg.git.identity.email) {
     if (!interactive) {
-      throw new MinionsError('PRECONDITION', 'Git identity (user.name / user.email) is not configured for this repository.',
-        'Run `git config user.name "…"` and `git config user.email "…"`, or run init interactively.');
+      throw new MinionsError('PRECONDITION', 'Git identity for agent commits is not configured.',
+        'Run `minions defaults set git.name <name>` and `minions defaults set git.email <email>` (or set git user.name/user.email), or run init interactively.');
     }
     cfg.git.identity.name = await ask('git.identity.name', 'Commit author name for agent commits', cfg.git.identity.name, nonEmpty);
     cfg.git.identity.email = await ask('git.identity.email', 'Commit author email for agent commits', cfg.git.identity.email, nonEmpty);
-  }
-
-  if (interactive) {
-    // Verification commands (inferred from package.json scripts, never executed on the host).
-    const v = await ask('verification.commands', `Verification commands run by the agents ${input.runtime === 'host' ? 'in their workspace clone' : 'inside the container'} (separate with ';', 'none' for none)`,
-      cfg.verification.commands.join('; ') || 'none', (s) => (s.trim() === 'none' ? [] : s.split(';').map((x) => x.trim()).filter(Boolean)));
-    cfg.verification.commands = v;
-    // Setup commands of the local integration worktree (detected from the lockfile, never executed on the host).
-    const setupDefault = cfg.verification.setupCommands ?? d.setupCommands;
-    const setup = await ask('verification.setupCommands', 'Setup commands that install dependencies before local integration verifies a merge (separate with \';\', \'none\' for none)',
-      setupDefault.join('; ') || 'none', (s) => (s.trim() === 'none' ? [] : s.split(';').map((x) => x.trim()).filter(Boolean)));
-    if (setup.length) cfg.verification.setupCommands = setup;
-    else delete cfg.verification.setupCommands;
-    // 8. Container resources and preview ports (docker runtime only).
-    if (input.runtime === 'host') io.info('Container resources and preview ports: not applicable (host runtime has no container limits).');
-    else {
-      io.info(`Container: image minions-runtime:${VERSION}${d.dockerfile ? ' (the repository Dockerfile is not built)' : ''}; host has ${d.host.cpus} CPUs, ${d.host.memoryMiB} MiB RAM.`);
-      cfg.container.cpus = await ask('container.cpus', 'Container CPUs', String(cfg.container.cpus), posNum(false, 0.5));
-      cfg.container.memoryMiB = await ask('container.memoryMiB', 'Container memory (MiB)', String(cfg.container.memoryMiB), posNum(true, 512));
-      cfg.container.publishPorts = await ask('container.publishPorts', 'Preview ports to publish on 127.0.0.1 (host:container, comma separated)',
-        fmtPorts(cfg.container.publishPorts), parsePorts);
-    }
   }
   if (input.runtime !== 'host' && cfg.container.cpus > d.host.cpus) notes.push(`container.cpus ${cfg.container.cpus} exceeds host CPUs (${d.host.cpus}).`);
   if (input.runtime !== 'host' && cfg.container.memoryMiB > d.host.memoryMiB) notes.push(`container.memoryMiB ${cfg.container.memoryMiB} exceeds host memory (${d.host.memoryMiB} MiB).`);

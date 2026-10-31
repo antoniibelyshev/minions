@@ -65,7 +65,7 @@ export async function initFromTemplate(root: string, opts: { visibility?: 'priva
   const { runInit } = await import('../../src/host/install.js');
   const real = async () => {
     makeRepo(root, opts.name);
-    return { repo, projectId: (await runInit({ path: repo, yes: true, visibility, dockerProbe: dockerUp })).plan.projectId };
+    return { repo, projectId: (await runInit({ mode: 'independent', path: repo, yes: true, visibility, dockerProbe: dockerUp })).plan.projectId };
   };
   if (!isEmptyDir(repo) || !isEmptyDir(home)) return real();
   const key = [visibility, name, ...INIT_ENV.map((v) => process.env[v] ?? '')].join('\0');
@@ -76,7 +76,7 @@ export async function initFromTemplate(root: string, opts: { visibility?: 'priva
     process.env.MINIONS_HOME = tHome;
     try {
       const tRepo = makeRepo(tRoot, name);
-      const r = await runInit({ path: tRepo, yes: true, visibility, dockerProbe: dockerUp });
+      const r = await runInit({ mode: 'independent', path: tRepo, yes: true, visibility, dockerProbe: dockerUp });
       t = { repo: tRepo, home: tHome, projectId: r.plan.projectId };
     } finally { process.env.MINIONS_HOME = home; }
     initTemplates.set(key, t);

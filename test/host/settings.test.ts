@@ -79,7 +79,7 @@ describe('settings model and --list', () => {
     const views = S.listSettings(await ctxOf(project, runtime));
     const by = (k: string) => views.find((v) => v.key === k)!;
     expect(new Set(views.map((v) => v.group))).toEqual(new Set(S.SETTING_GROUPS));
-    expect(by('execution.maxActiveTasks')).toMatchObject({ value: 2, source: 'project config', apply: 'live', needsRegenerate: true, needsRestart: false, canLoosen: true });
+    expect(by('execution.maxActiveTasks')).toMatchObject({ value: 3, source: 'project config', apply: 'live', needsRegenerate: true, needsRestart: false, canLoosen: true });
     expect(by('communication.progress')).toMatchObject({ value: 'quiet', source: 'local override', needsRestart: true });
     expect(by('communication.channel')).toMatchObject({ apply: 'launch', needsRestart: true });
     expect(by('secrets.telegram')).toMatchObject({ value: 'provisioned', source: 'credential store', needsRegenerate: false });
@@ -89,7 +89,7 @@ describe('settings model and --list', () => {
     expect(JSON.stringify(views)).not.toContain('AAHfake');
     const human = SC.formatList(views);
     expect(human).toMatch(/^Delivery:/m);
-    expect(human).toContain('execution.maxActiveTasks = 2  (project config)');
+    expect(human).toContain('execution.maxActiveTasks = 3  (project config)');
     expect(human).not.toContain('AAHfake');
   });
 
@@ -108,16 +108,16 @@ describe('settings set', () => {
     const { runtime, calls } = fakeRuntime();
     const confirms: string[] = [];
     const confirm = async (q: string) => { confirms.push(q); return true; };
-    const r1 = await SC.applySetting(await ctxOf(project), 'execution.maxActiveTasks', '3', {}, { runtime, confirm });
-    expect(r1).toMatchObject({ from: 2, to: 3, layer: 'local', file: local, changed: true, written: true, needsRestart: false, restart: null });
+    const r1 = await SC.applySetting(await ctxOf(project), 'execution.maxActiveTasks', '4', {}, { runtime, confirm });
+    expect(r1).toMatchObject({ from: 3, to: 4, layer: 'local', file: local, changed: true, written: true, needsRestart: false, restart: null });
     expect(r1.loosens).toMatch(/more tasks may run in parallel/);
-    expect(confirms[0]).toMatch(/loosens policy: more tasks may run in parallel \(higher spend\) \(2 -> 3\).*\(y\/N\)/);
-    const r2 = await SC.applySetting(await ctxOf(project), 'execution.maxEngineers', '3', { yes: true }, { runtime, confirm: never });
-    expect(r2).toMatchObject({ from: 2, to: 3, written: true });
-    expect(readJson(local)).toEqual({ execution: { maxActiveTasks: 3, maxEngineers: 3 } });
+    expect(confirms[0]).toMatch(/loosens policy: more tasks may run in parallel \(higher spend\) \(3 -> 4\).*\(y\/N\)/);
+    const r2 = await SC.applySetting(await ctxOf(project), 'execution.maxEngineers', '4', { yes: true }, { runtime, confirm: never });
+    expect(r2).toMatchObject({ from: 2, to: 4, written: true });
+    expect(readJson(local)).toEqual({ execution: { maxActiveTasks: 4, maxEngineers: 4 } });
     expect(readFileSync(file, 'utf8')).toBe(before);
-    expect(runtimeCfg(project.projectId).execution).toMatchObject({ maxActiveTasks: 3, maxEngineers: 3 });
-    expect(readFileSync(join(projectPaths(project.projectId).pluginDir, 'coordinator.md'), 'utf8')).toContain('maxActiveTasks 3');
+    expect(runtimeCfg(project.projectId).execution).toMatchObject({ maxActiveTasks: 4, maxEngineers: 4 });
+    expect(readFileSync(join(projectPaths(project.projectId).pluginDir, 'coordinator.md'), 'utf8')).toContain('maxActiveTasks 4');
     expect((await loadEffectiveConfig(project)).provenance['execution.maxActiveTasks']).toBe('local');
     expect(calls).toEqual([]); // live setting: no restart
   });
@@ -236,7 +236,7 @@ describe('tester additions (task-23)', () => {
     const { project, local } = await install('private');
     const views = S.listSettings(await ctxOf(project));
     const by = (k: string) => views.find((v) => v.key === k)!;
-    expect(by('coordinator.disallowedTools')).toMatchObject({ value: undefined, apply: 'launch', needsRestart: true, canLoosen: true, source: 'profile default' });
+    expect(by('coordinator.disallowedTools')).toMatchObject({ value: undefined, apply: 'launch', needsRestart: true, canLoosen: true, source: 'mode default' });
     expect(by('coordinator.toolSearch')).toMatchObject({ value: true, apply: 'launch', needsRestart: true });
     expect(by('coordinator.bundledSkills')).toMatchObject({ value: false, apply: 'launch', needsRestart: true });
     const { runtime, calls } = fakeRuntime({ running: false });
@@ -295,7 +295,7 @@ describe('remaining loosening changes (task-50)', () => {
     { key: 'models.default', to: 'opus', back: 'sonnet', msg: /workers default to a pricier model \(sonnet ~\$3\/MTok -> opus ~\$5\/MTok; higher spend\)/ },
     { key: 'models.selection', to: 'coordinator', back: 'fixed', seed: { models: { selection: 'fixed' } }, msg: /the coordinator may pick other allowed models per worker \(possibly pricier\)/ },
     { key: 'coordinator.bundledSkills', to: 'true', back: 'false', msg: /the coordinator session gets Claude Code's bundled skills/ },
-    { key: 'delivery.merge', to: 'auto-when-eligible', back: 'disabled', msg: /approved branches that pass verification are merged into the base without asking/ },
+    { key: 'delivery.merge', to: 'auto-when-eligible', back: 'disabled', seed: { delivery: { merge: 'disabled' } }, msg: /approved branches that pass verification are merged into the base without asking/ },
     { key: 'execution.maxRepairCyclesBeforeReplan', to: '5', back: '3', msg: /more failed fix cycles may run before a task is replanned \(higher spend\) \(3 -> 5\)/ },
   ];
   for (const c of cases) {

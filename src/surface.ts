@@ -13,7 +13,7 @@ import { emit } from './core/output.js';
  */
 export const PRIMARY_COMMANDS = ['setup', 'start', 'status', 'settings', 'upgrade', 'down', 'uninstall'] as const;
 /** User commands for single steps and fine-grained control (shown by `minions help --all`). */
-export const ADVANCED_COMMANDS = ['init', 'doctor', 'auth', 'secrets', 'config', 'channel', 'runtime', 'import', 'export', 'pull', 'session', 'pause', 'resume'] as const;
+export const ADVANCED_COMMANDS = ['init', 'doctor', 'mode', 'defaults', 'auth', 'secrets', 'config', 'channel', 'runtime', 'import', 'export', 'pull', 'session', 'pause', 'resume'] as const;
 /** Used by the coordinator, workers, hooks and the container (shown by `minions help --all`). */
 export const INTERNAL_COMMANDS = ['work', 'backlog', 'control', 'hook', 'coordinator', 'telegram', 'workspace', 'sync', 'notify'] as const;
 export type Tier = 'primary' | 'advanced' | 'internal';

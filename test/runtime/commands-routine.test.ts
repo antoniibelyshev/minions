@@ -31,7 +31,7 @@ let register: (p: Command) => void;
 let root = '';
 let state = '';
 async function writeConfig(routine?: Record<string, unknown>) {
-  writeFileSync(join(root, 'config.json'), JSON.stringify({ ...defaults('project-owner'), ...(routine ? { routine } : {}) }));
+  writeFileSync(join(root, 'config.json'), JSON.stringify({ ...defaults('independent'), ...(routine ? { routine } : {}) }));
   vi.resetModules();
   register = (await import('../../src/runtime/commands.js')).register;
 }

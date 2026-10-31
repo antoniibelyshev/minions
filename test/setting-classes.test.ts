@@ -76,7 +76,7 @@ describe('guard: every schema key has a class and a host-owned flag', () => {
       expect([cls(k), owned(k)], k).toEqual(['recreate', false]);
     for (const k of ['container.network', 'container.publishPorts', 'container.mountHostRepository', 'container.mountDockerSocket'])
       expect([cls(k), owned(k)], k).toEqual(['recreate', true]);
-    for (const k of ['schemaVersion', 'configRevision', 'projectId', 'packageVersion', 'profile', 'visibility', 'backlog.backend',
+    for (const k of ['schemaVersion', 'configRevision', 'projectId', 'packageVersion', 'mode', 'visibility', 'backlog.backend',
       'git.baseBranch', 'container.required', 'container.workspace', 'execution.oneActiveStagePerTask']) expect(cls(k), k).toBe('fixed');
     // The most specific entry wins: git.identity (recreate) under git, effortByRole.coordinator (launch) next to the worker roles.
     expect(classifyKey('git.identity.name')?.key).toBe('git.identity');
@@ -144,7 +144,7 @@ describe('classes match the code that applies the key', () => {
     base.models.default = 'sonnet';
     // delivery.merge reaches the prompt only when local integration can run (verification commands configured).
     const probes: Record<string, { base: (c: MinionsConfig) => void; to: unknown }> = {
-      'delivery.merge': { base: (c) => { c.verification.commands = ['npm test']; }, to: 'auto-when-eligible' },
+      'delivery.merge': { base: (c) => { c.verification.commands = ['npm test']; c.delivery.merge = 'disabled'; }, to: 'auto-when-eligible' },
       // harnesses.default only reaches roles the phase allows (phase 1 b: project gates): compare with one configured.
       'harnesses.default': {
         base: (c) => {
