@@ -509,9 +509,9 @@ export function coordinatorDisallowedTools(cfg: Pick<MinionsConfig, 'coordinator
  * argv of the coordinator's claude process. Never contains a secret. `startupPrompt` becomes the first user message.
  * `permissionModes`: the installed Claude Code's --permission-mode choices (claudePermissionModes); undefined = not checked.
  */
-export async function buildClaudeCommand(cfg: MinionsConfig, paths: RuntimePaths = runtimePaths(), opts: { telegram?: boolean; startupPrompt?: string; permissionModes?: readonly string[] | null; channelServer?: ChannelServerLaunch } = {}): Promise<CoordinatorCommand> {
+export async function buildClaudeCommand(cfg: MinionsConfig, paths: RuntimePaths = runtimePaths(), opts: { telegram?: boolean; startupPrompt?: string; permissionModes?: readonly string[] | null; channelServer?: ChannelServerLaunch; extraPrompt?: string } = {}): Promise<CoordinatorCommand> {
   const onHost = runtimeMode() === 'host-runtime';
-  const prompt = await readPrompt(paths) + (onHost ? hostPromptNote(paths) : '');
+  const prompt = await readPrompt(paths) + (onHost ? hostPromptNote(paths) : '') + (opts.extraPrompt ?? '');
   const disallowed = coordinatorDisallowedTools(cfg);
   const model = cfg.models.coordinator;
   const effort = roleEffort(cfg, 'coordinator');
@@ -519,7 +519,7 @@ export async function buildClaudeCommand(cfg: MinionsConfig, paths: RuntimePaths
   // Telegram: the minions channel server, the only MCP server of the launch (both runtimes).
   const ownServer = !!(opts.telegram && opts.channelServer);
   if (opts.telegram && !opts.channelServer) throw new MinionsError('INTERNAL', 'Telegram launch without the channel server parameters.');
-  const { channelServer: _cs, ...settingsOpts } = opts;
+  const { channelServer: _cs, extraPrompt: _ep, ...settingsOpts } = opts;
   return {
     cmd: 'claude',
     cwd: paths.repo,

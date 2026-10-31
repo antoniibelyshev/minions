@@ -28,7 +28,7 @@ import type { PollerCheck } from '../telegram/isolation.js';
 import {
   buildClaudeCommand, buildCoordinatorCommand, hostChannelReport, printChannelServer, telegramPollerStatus, claudePermissionModes, coordinatorWrapper, launchCoordinator, permissionModesNeeded, probeRuntime, readLaunchRecord, readMountedToken, RECOVERY_PROMPT,
   restartCoordinator, runtimeChannelFacts, scheduleDetachedRestart, syncCoordinator, coordinatorLaunchStatus, type LaunchStatus,
-  coordinatorPidAlive, procStartTime, readExitRecord, runtimeAuthMethod, systemProcessControl, scheduleCrashStart, TELEGRAM_TOKEN_ENV, WAKE_PROMPT,
+  coordinatorPidAlive, procStartTime, readExitRecord, readPrompt, runtimeAuthMethod, systemProcessControl, scheduleCrashStart, TELEGRAM_TOKEN_ENV, WAKE_PROMPT,
 } from './coordinator.js';
 import { pidAlive } from './db.js';
 import { run as runChild } from '../core/exec.js';
@@ -43,7 +43,8 @@ import { claimWithBrief, compactClaim, fetchBrief, recordSubmitted, requireWorke
 import { runHook } from './hooks.js';
 import { completeOpenSessions, noteResetRequest } from './coordinator-usage.js';
 import { budgetNotice, humanBaseline, humanSpend, parseTokens, recordLeaseUsage, recordSessionUsage, setBudget, spendReport, type SpendReport } from './spend.js';
-import { runtimePaths } from './paths.js';
+import { runtimePaths, type RuntimePaths } from './paths.js';
+import { attachArgs, checkSessionName, listSessionsArgs, newSessionCommand, nextSessionName, parseTmuxSessions, runInteractive } from './interactive.js';
 import { controlApply, controlSet, controlShow, controlUndo, controlUnset, parseValue, readJournal, withControl, type ControlChange } from './control.js';
 import { contextResetCheck, HANDOFF_MAX_BYTES, humanContextReset, readHandoff, TRANSCRIPT_META, withContextReset, writeHandoff, type ContextResetCheck } from './context-reset.js';
 import { handoffPathFor, sessionScope } from './session-scope.js';
@@ -158,7 +159,7 @@ function notifySession(explicit: string | undefined): string | null {
     return k;
   }
   const scope = sessionScope();
-  return scope && scope.kind !== 'router' ? scope.key : null;
+  return scope && scope.kind !== 'router' && scope.kind !== 'interactive' ? scope.key : null;
 }
 
 /**
@@ -592,6 +593,48 @@ export function register(program: Command): void {
     });
     setIntakePausedContext(() => getDb().paused().intake);
   }
+
+  // session (docs/design/autonomy.md Decision 13): extra interactive coordinators in the terminal
+  const session = program.command('session').description('Extra interactive coordinator sessions in the terminal (each in its own tmux session of the runtime)');
+  const tmuxSessions = async (paths: RuntimePaths) => {
+    const r = await runChild('tmux', listSessionsArgs(paths), { allowFailure: true, timeoutMs: 10_000 });
+    return r.code === 0 ? parseTmuxSessions(r.stdout) : []; // no server yet: none
+  };
+  const attachSession = (paths: RuntimePaths, name: string) => new Promise<number>((resolve, reject) => {
+    const child = nodeSpawn('tmux', attachArgs(paths, name), { stdio: 'inherit', shell: false });
+    child.on('error', reject);
+    child.on('close', (code, signal) => resolve(code ?? (signal ? 128 : 1)));
+  });
+  const canAttach = (cmd: Command) => !globalOpts(cmd).json && !!process.stdin.isTTY && !!process.stdout.isTTY;
+  session.command('new [name]').description('Open another interactive coordinator (same prompt, plugin and settings; no Telegram) as session:<name> (default: the next free number) and attach to it')
+    .option('--no-attach', 'start it and print the attach command')
+    .action(action(async (name: string | undefined, o: { attach: boolean }, cmd: Command) => {
+      if (runtimeMode() === 'host') return delegate(cmd, { tty: o.attach && !!process.stdin.isTTY && !!process.stdout.isTTY });
+      const paths = runtimePaths();
+      await readPrompt(paths); // fail here, not inside the new pane
+      const existing = await tmuxSessions(paths);
+      const n = name === undefined ? nextSessionName(existing.map((s) => s.name)) : checkSessionName(name);
+      if (existing.some((s) => s.name === n)) throw new MinionsError('CONFLICT', `Session session:${n} is already open.`, `Attach to it: minions session attach ${n}`);
+      const c = newSessionCommand(paths, n);
+      await runChild(c.cmd, c.args, { cwd: c.cwd, timeoutMs: 15_000 });
+      const r = { key: `session:${n}`, name: n, tmux: `session-${n}`, attach: `minions session attach ${n}` };
+      if (!o.attach || !canAttach(cmd)) { emit(r, { json: globalOpts(cmd).json, human: () => `Opened ${r.key}. Attach: ${r.attach} (detach with Ctrl-b d).` }); return; }
+      process.stderr.write(`Opened ${r.key}; attaching (detach with Ctrl-b d).\n`);
+      process.exitCode = await attachSession(paths, n);
+    }));
+  session.command('attach <name>').description('Attach to an extra interactive coordinator session')
+    .action(action(async (name: string, _o: unknown, cmd: Command) => {
+      if (runtimeMode() === 'host') return delegate(cmd, { tty: !!process.stdin.isTTY });
+      const paths = runtimePaths();
+      if (!(await tmuxSessions(paths)).some((s) => s.name === checkSessionName(name))) throw new MinionsError('NOT_FOUND', `No open session session:${name}.`, 'See `minions session list`.');
+      process.exitCode = await attachSession(paths, name);
+    }));
+  session.command('list').description('The open extra interactive coordinator sessions')
+    .action(action(async (_o: unknown, cmd: Command) => {
+      if (runtimeMode() === 'host') return delegate(cmd);
+      const r = await tmuxSessions(runtimePaths());
+      emit(r, { json: globalOpts(cmd).json, human: (x: typeof r) => x.length ? x.map((s) => `${s.key}${s.attached ? ' (attached)' : ''}${s.created ? ` since ${s.created.slice(0, 16).replace('T', ' ')}` : ''}`).join('\n') : 'No extra interactive sessions (open one with `minions session new`).' });
+    }));
 
   // control (docs/design/autonomy.md Decision 3): the coordinator-owned config overlay, applied at once
   const control = program.command('control').description('Coordinator-owned configuration: change any setting, role (worker profile) or workflow at once, without the owner (journaled; undo with `control undo`)');
@@ -1048,6 +1091,11 @@ export function register(program: Command): void {
         exitAfterSignal: (c) => process.exit(c),
       });
     }));
+  coord.command('interactive <key>', { hidden: true }).description('Internal: started by `minions session new` in its tmux session; runs an extra interactive coordinator claude (session:<name>)')
+    .action(action(async (key: string) => {
+      requireMode('runtime');
+      process.exitCode = await runInteractive(await getConfig(), key);
+    }));
   coord.command('sync').description('Apply restart-required Telegram changes with a controlled coordinator restart (container only)')
     .option('--force', 'restart even while worker leases are active (they stay recorded for recovery)')
     .option('--start-detached', 'start the coordinator session without attaching when it is not running')
@@ -1176,7 +1224,7 @@ export function register(program: Command): void {
     .action(action(async (text: string, _o: unknown, cmd: Command) => {
       requireMode('runtime');
       const scope = sessionScope();
-      if (!scope || scope.kind === 'router') throw new MinionsError('PRECONDITION', 'Only a coordinator session has a topic (MINIONS_SESSION is not a session key).');
+      if (!scope || scope.kind === 'router' || scope.kind === 'interactive') throw new MinionsError('PRECONDITION', 'Only a coordinator session has a topic (MINIONS_SESSION is not a session key).');
       const r = { key: scope.key, topic: setSessionTopic(getDb(), scope.key, text) };
       emit(r, { json: globalOpts(cmd).json, human: (x: typeof r) => `${x.key}: ${x.topic}` });
     }));

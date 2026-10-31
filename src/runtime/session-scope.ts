@@ -20,12 +20,17 @@ export const SESSION_ENV = 'MINIONS_SESSION';
 /** The router is the existing coordinator launch (decision 3): not a headless session row, but scoped like one. */
 export const ROUTER_SESSION = 'router';
 
-export type SessionScopeKind = 'router' | 'task' | 'general' | 'thread';
+export type SessionScopeKind = 'router' | 'task' | 'general' | 'thread' | 'interactive';
+
+/** An extra interactive coordinator the owner opened in the terminal (`minions session new`): `session:<name>`, no DB row. */
+export const INTERACTIVE_PREFIX = 'session:';
+export const INTERACTIVE_NAME = /^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$/;
 export interface SessionScope { key: string; kind: SessionScopeKind; taskId: string | null }
 
-/** Parses a session key: `router`, `general`, `task:<id>` or `thread:<root message id>` (parseSessionKey); throws MinionsError otherwise. */
+/** Parses a session key: `router`, `session:<name>`, `general`, `task:<id>` or `thread:<root message id>` (parseSessionKey); throws MinionsError otherwise. */
 export function parseScope(raw: string): SessionScope {
   if (raw === ROUTER_SESSION) return { key: raw, kind: 'router', taskId: null };
+  if (raw.startsWith(INTERACTIVE_PREFIX) && INTERACTIVE_NAME.test(raw.slice(INTERACTIVE_PREFIX.length))) return { key: raw, kind: 'interactive', taskId: null };
   const k = parseSessionKey(raw);
   return { key: k.key, kind: k.kind, taskId: k.taskId };
 }
