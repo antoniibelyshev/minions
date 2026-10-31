@@ -1,7 +1,7 @@
 // Dispatcher state the hooks, the routine and the CLI read without loading the dispatcher itself
-// (docs/design/autonomy.md Decision 1): the mode setting and the holds (tasks parked for a coordinator decision).
+// (docs/design/autonomy.md Decision 1): the settings and the holds (tasks parked for a coordinator decision).
 import type { MinionsConfig } from '../config/schema.js';
-import type { AdvanceDecisionKind } from './advance.js';
+import type { RecordDecisionKind } from './advance.js';
 import type { RuntimeDb } from './db.js';
 
 export const DISPATCH_EVENT = 'dispatch-decision';
@@ -9,15 +9,12 @@ export const HOLDS_META = 'dispatch_holds';
 export const DEFAULT_TICK_SECONDS = 10;
 export const DEFAULT_WORKER_TIMEOUT_MINUTES = 120;
 
-export type DispatchMode = 'auto' | 'coordinator';
-export const dispatchMode = (cfg: Pick<MinionsConfig, 'dispatch'>): DispatchMode => cfg.dispatch?.mode ?? 'coordinator';
 export const dispatchSettings = (cfg: Pick<MinionsConfig, 'dispatch'>) => ({
-  mode: dispatchMode(cfg),
   tickMs: (cfg.dispatch?.tickSeconds ?? DEFAULT_TICK_SECONDS) * 1000,
   workerTimeoutMs: (cfg.dispatch?.workerTimeoutMinutes ?? DEFAULT_WORKER_TIMEOUT_MINUTES) * 60_000,
 });
 
-export type HoldKind = AdvanceDecisionKind | 'no-result' | 'launch-failed';
+export type HoldKind = RecordDecisionKind | 'claim-failed' | 'no-result' | 'launch-failed';
 export interface DispatchHold {
   taskId: string; kind: HoldKind; message: string; leaseId: string | null; at: string;
   /** The task's status when it was held: a different status later means the coordinator acted. */

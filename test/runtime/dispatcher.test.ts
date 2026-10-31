@@ -21,7 +21,7 @@ type Script = (i: LaunchInput) => Record<string, unknown> | null;
 const exit = (over: Partial<WorkerExit> = {}): WorkerExit => ({ code: 0, signal: null, stopped: null, tokens: 1000, model: 'sonnet', sessionId: 'sess-1', stderrTail: '', spawnError: null, ...over });
 
 function setup(script: Script, mutate?: (c: MinionsConfig) => void, exitOf: (i: LaunchInput) => WorkerExit = () => exit()) {
-  const env = makeDefaultEnv((c) => { c.dispatch = { mode: 'auto' }; mutate?.(c); });
+  const env = makeDefaultEnv((c) => { mutate?.(c); });
   const launches: LaunchInput[] = [];
   const notified: DispatchHold[] = [];
   const launch = async (i: LaunchInput): Promise<WorkerHandle> => {
@@ -128,7 +128,7 @@ describe('dispatcher: the automatic flow', () => {
     expect(notified.map((h) => h.kind)).toEqual(['no-result']);
     // Held: never claimed again until the coordinator acts.
     expect((await disp.pass()).started).toEqual([]);
-    expect(collectWakeReasons(env.db, null, null, { dispatchAuto: true })).toEqual([expect.objectContaining({ kind: 'dispatch-decision', taskId: 'task-1' })]);
+    expect(collectWakeReasons(env.db)).toEqual([expect.objectContaining({ kind: 'dispatch-decision', taskId: 'task-1' })]);
     expect(clearHold(env.db, 'task-1', 'handled')).toBe(true);
     expect((await disp.pass()).started.map((s) => s.taskId)).toEqual(['task-1']);
   });
@@ -180,13 +180,6 @@ describe('dispatcher: the automatic flow', () => {
     expect(launches[1]!.correction!.errors.length).toBeGreaterThan(0);
     expect(workerPrompt(launches[1]!.claim, launches[1]!.correction)).toMatch(/rejected[\s\S]*only correction/);
     expect(launches.map((l) => l.stage.role)).toEqual(['engineer', 'engineer', 'reviewer']);
-  });
-
-  it('does nothing in coordinator mode', async () => {
-    const { env, disp, launches } = setup(() => ({}), (c) => { c.dispatch = { mode: 'coordinator' }; });
-    env.backlog.add({ id: 'task-1' });
-    expect(await disp.pass()).toMatchObject({ mode: 'coordinator', started: [] });
-    expect(launches).toEqual([]);
   });
 
   it('recovers a previous dispatcher\'s lease: a submitted result is recorded, one without is released', async () => {

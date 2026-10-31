@@ -17,11 +17,10 @@
 // - When a process runs: an `open` session with undelivered inbox messages gets one (within coordinator.sessions.max,
 //   never during a drain, and while starts are paused only for an owner message). It stays resident until the session
 //   is no longer open (stdin closed), a drain (drain notice, stdin closed), the supervisor stops, or a crash. The
-//   `general` session is opened on its first message; task sessions are opened, closed and reopened by the task
-//   session pass (./task-sessions.ts, phase 7), run every timing.openMs.
-// - Task sessions (phase 7): an open task session whose task is runnable while its process is idle (its last turn
-//   ended, nothing pending) gets a nudge, at most once per timing.nudgeMs. Before a task session is resumed (a crash,
-//   a drain, a supervisor restart), its leases are recovered (recoverTaskSession) and the outcome is in its inbox.
+//   `general` and thread sessions are opened by their first message, a task session by a held decision or an owner
+//   message about its task; the task session pass (./task-sessions.ts, phase 7), run every timing.openMs, closes them.
+// - Task sessions (phase 7): before a task session is resumed (a crash, a drain, a supervisor restart), its leases are
+//   recovered (recoverTaskSession) and the outcome is in its inbox.
 // - Resumes: a process that ends without being asked to is a crash. The session is resumed (`--resume <claude session
 //   id>`, prompted by a supervisor notice in its inbox) at most MAX_SESSION_RESUMES times in a row; a completed turn
 //   (a stream-json `result`) resets the count. One more crash marks it `failed` and queues an outbox `blocker`.
@@ -56,7 +55,7 @@ import { groupMembers, hostIdentity, isAlive, procIdentity, procStat, sameHost, 
 import { supervise, type StopReason, type SuperviseOutcome } from './runner/supervise.js';
 import { enqueueInbox, getSession, keysWithPendingInbox, markInboxDelivered, openSession, pendingInbox, updateSession } from './session-store.js';
 import { NOEXEC_ROOTS, parseSessionKey, sessionConfigDir, sessionDir, sessionsSettings } from './sessions.js';
-import { recoverNotice, TASK_SESSION_SOURCE, type RecoverOutcome, type TaskSessionPass } from './task-sessions.js';
+import { recoverNotice, type RecoverOutcome, type TaskSessionPass } from './task-sessions.js';
 
 /** Resumes in a row (without a completed turn) before a session is marked failed. */
 export const MAX_SESSION_RESUMES = 2;
@@ -86,14 +85,12 @@ export interface SupervisorTiming {
   drainGraceMs: number;
   /** Orphan stop: SIGTERM -> SIGKILL. */
   reapGraceMs: number;
-  /** Task session pass: open, close and reopen (phase 7). */
+  /** Task session pass: closes task and thread sessions (phase 7). */
   openMs: number;
-  /** At most one nudge per idle task session in this time. */
-  nudgeMs: number;
 }
 export const DEFAULT_SUPERVISOR_TIMING: SupervisorTiming = {
   tickMs: 2_000, pollMs: 1_000, configMs: 15_000, timeoutMs: 24 * 3_600_000, interruptGraceMs: 5_000, killGraceMs: 15_000,
-  drainGraceMs: 10 * 60_000, reapGraceMs: 5_000, openMs: 30_000, nudgeMs: 5 * 60_000,
+  drainGraceMs: 10 * 60_000, reapGraceMs: 5_000, openMs: 30_000,
 };
 
 // ---------------------------------------------------------------- lock
@@ -346,7 +343,7 @@ export interface SupervisorTaskDeps {
 }
 
 export type SupervisorExit = 'disabled' | 'conflict' | 'stopped' | 'lock-lost';
-export interface SupervisorReport { exit: SupervisorExit; holder: SupervisorLock | null; reaped: ReapResult[]; reapErrors: { key: string; error: string }[]; starts: number; opened: number; closed: number }
+export interface SupervisorReport { exit: SupervisorExit; holder: SupervisorLock | null; reaped: ReapResult[]; reapErrors: { key: string; error: string }[]; starts: number; closed: number }
 
 type EndReason = 'close' | 'drain' | 'disabled' | 'shutdown' | 'idle';
 
@@ -386,7 +383,7 @@ export async function runSupervisor(d: SupervisorDeps): Promise<SupervisorReport
   const proc = d.proc ?? '/proc';
   const now = d.now ?? (() => new Date());
   const db = d.db;
-  const report: SupervisorReport = { exit: 'stopped', holder: null, reaped: [], reapErrors: [], starts: 0, opened: 0, closed: 0 };
+  const report: SupervisorReport = { exit: 'stopped', holder: null, reaped: [], reapErrors: [], starts: 0, closed: 0 };
   let cfg = await d.config();
   if (!sessionsSettings(cfg).enabled) return { ...report, exit: 'disabled' };
 
@@ -566,25 +563,12 @@ export async function runSupervisor(d: SupervisorDeps): Promise<SupervisorReport
     }
   };
 
-  // Task sessions (phase 7): the open/close/reopen pass, then nudges for runnable tasks whose session idles.
-  const nudged = new Map<string, number>();
+  // Task sessions (phase 7): the close pass.
   const taskPass = async () => {
     if (!d.tasks || stopping) return;
     const r = await d.tasks.pass(cfg);
-    report.opened += r.opened.length;
     report.closed += r.closed.length;
-    for (const o of r.opened) log(`minions supervisor: ${o.key} ${o.reopened ? 'reopened' : 'opened'} (${o.role} runnable)`);
     for (const c of r.closed) log(`minions supervisor: ${c.key} closed (${c.reason})`);
-    if (r.refused.length) log(`minions supervisor: no session for ${r.refused.slice(0, 3).map((x) => `${x.taskId} (${x.why})`).join(', ')}${r.refused.length > 3 ? ', …' : ''}`);
-    for (const taskId of r.runnableOpen) {
-      const key = `task:${taskId}`;
-      const l = live.get(key);
-      // A live process mid-turn or ending is left alone; an open session without a process gets one through the nudge.
-      if ((l && (l.busy || l.ending)) || pendingInbox(db, key).length) continue;
-      if (Date.now() - (nudged.get(key) ?? -Infinity) < t.nudgeMs) continue;
-      nudged.set(key, Date.now());
-      enqueueInbox(db, key, TASK_SESSION_SOURCE, `minions supervisor: ${taskId} has a runnable stage now. Continue with /minions:task ${taskId} (claim it).`, { now: now() });
-    }
   };
 
   const abortable = (ms: number) => new Promise<void>((res) => {

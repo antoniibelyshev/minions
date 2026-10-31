@@ -376,12 +376,6 @@ export const MinionsConfigSchema = z.object({
       contextTokens: z.number().int().min(1000).nullable().optional(),
       /** Reset after this many worker hand-offs (records and releases) in this session (default 10). */
       handoffs: z.number().int().min(1).nullable().optional(),
-      /**
-       * Reset barrier (default 120000): once the session's context reaches this many tokens and only running workers
-       * block the reset, new stages are held (`work claim`/`work advance`/`work next`: `context-reset-pending`) and
-       * the reset is due when the last worker is recorded. `null` = no barrier.
-       */
-      barrierTokens: z.number().int().min(1000).nullable().optional(),
     }).strict().optional(),
     /**
      * Router plus per-task coordinator sessions (docs/design/coordinator-sessions.md; src/runtime/sessions.ts). Unset =
@@ -424,12 +418,11 @@ export const MinionsConfigSchema = z.object({
     autoPromote: z.record(z.string(), z.unknown()).optional(),
   }).strict().optional(),
   /**
-   * The autopilot dispatcher (docs/design/autonomy.md Decision 1; src/runtime/dispatcher.ts): `auto` = a deterministic
-   * process claims runnable stages, runs each as a headless worker, records the result and hands only decisions to the
-   * coordinator; `coordinator` = the coordinator dispatches every stage itself (as before). Unset = coordinator.
+   * The autopilot dispatcher (docs/design/autonomy.md Decisions 1 and 10; src/runtime/dispatcher.ts), the only way
+   * stages run: it claims runnable stages, runs each as a headless worker, records the result and hands only decisions
+   * to the coordinator.
    */
   dispatch: z.object({
-    mode: z.enum(['auto', 'coordinator']).optional(),
     /** Wall-clock limit of one headless worker in minutes (default 120). */
     workerTimeoutMinutes: z.number().int().min(5).max(24 * 60).optional(),
     /** Seconds between dispatcher passes (default 10). */

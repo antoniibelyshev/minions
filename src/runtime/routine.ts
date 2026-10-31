@@ -6,21 +6,18 @@
 //   2. the wake decision (decideWake, a pure function) and its action: a fresh coordinator session through the
 //      detached restart with the constant wake prompt (never with force), or the separate crash start (recover);
 //   3. a `routine` event with the counts, the decision and the reasons (`--last` reads it back).
-// With coordinator.sessions.enabled (docs/design/coordinator-sessions.md phase 7) step 2 changes: the pass opens task
-// sessions for runnable stages (openTaskSessions, the supervisor's task session pass with the same limits) instead of
-// waking the coordinator; only the digest still wakes it. Task sessions record and decide their own results, so the
-// unvalidated, needs-split and awaiting-human reasons are not wake reasons either.
+// The autopilot dispatcher runs every stage (docs/design/autonomy.md Decision 10), so the only work a wake is for is its
+// held decisions and the digest. With coordinator.sessions.enabled a hold goes to its task session instead, and only
+// the digest still wakes the coordinator.
 // Every external effect (restart, clock, process table, files) is an injected dependency, so tests run it with a
 // fake clock and a fake restart.
 import { statSync } from 'node:fs';
 import type { MinionsConfig } from '../config/schema.js';
 import type { RuntimeDb, RoutineLock } from './db.js';
-import type { NextReport } from './scheduler.js';
 import { lastOwnerMessageAt } from './coordinator-usage.js';
 import { TRANSCRIPT_META } from './context-reset.js';
 import { localDayStart } from './zoned-time.js';
-import type { TaskSessionPass } from './task-sessions.js';
-import { dispatchMode, readHolds } from './dispatch-state.js';
+import { readHolds } from './dispatch-state.js';
 
 export const ROUTINE_DEFAULTS = { tickMinutes: 15, minWakeGapMinutes: 30, maxWakesPerDay: 8, digestAt: ['08:00'] as readonly string[], timezone: 'Europe/Berlin' } as const;
 /** The main transcript must be idle this long before a wake (the prompt cache has expired by then). */
@@ -64,10 +61,6 @@ export const ROUTINE_TRIGGERS: readonly RoutineTrigger[] = ['clock', 'watchdog',
 
 /** Why the coordinator should be woken: only work that needs a model (decision 3). */
 export type WakeReason =
-  | { kind: 'runnable'; taskId: string; role: string; detail: string }
-  | { kind: 'unvalidated'; taskId: string; leaseId: string; detail: string }
-  | { kind: 'needs-split'; taskId: string; leaseId: string; detail: string }
-  | { kind: 'awaiting-human'; taskId: string; detail: string }
   /** The autopilot dispatcher holds a task for a decision (docs/design/autonomy.md Decision 1). */
   | { kind: 'dispatch-decision'; taskId: string; detail: string }
   /** The digest is due (phase 4 composes it): always allowed, also at 100% budget and past maxWakesPerDay. */
@@ -186,33 +179,11 @@ export function fileMtime(path: string): number | null {
 }
 
 /**
- * Wake reasons: the stages `work next` lists as runnable (capacity, pauses, drain and the budget already applied),
- * plus what happened while the coordinator was idle (since `since`): an unvalidated result, a needs_split result, a
- * task that reached awaiting-human. Things the coordinator did itself happen inside its turns, before `since`.
+ * Wake reasons: the tasks the autopilot dispatcher holds for a decision. Every unvalidated result, split request and
+ * awaiting-human record of a dispatcher worker is a hold too, so nothing else needs a model.
  */
-export function collectWakeReasons(db: RuntimeDb, next: Pick<NextReport, 'runnable'> | null, since: string | null, o: { dispatchAuto?: boolean } = {}): WakeReason[] {
-  const out: WakeReason[] = [];
-  // With the autopilot dispatcher on, runnable stages are its job; the tasks it holds are the coordinator's.
-  if (o.dispatchAuto) {
-    for (const h of Object.values(readHolds(db))) out.push({ kind: 'dispatch-decision', taskId: h.taskId, detail: `${h.taskId} needs a decision (${h.kind}): ${h.message.slice(0, 120)}` });
-  } else for (const r of next?.runnable ?? []) out.push({ kind: 'runnable', taskId: r.taskId, role: r.role, detail: `${r.taskId} ${r.role} runnable` });
-  if (!since) return out;
-  for (const l of db.all<{ id: string; task_id: string; status: string; result_json: string | null }>(
-    "SELECT id, task_id, status, result_json FROM leases WHERE ended_at >= ? AND status IN ('unvalidated', 'completed') ORDER BY ended_at", since)) {
-    if (l.status === 'unvalidated') { out.push({ kind: 'unvalidated', taskId: l.task_id, leaseId: l.id, detail: `${l.task_id}: result of ${l.id} is unvalidated` }); continue; }
-    let status: unknown = null;
-    try { status = (JSON.parse(l.result_json ?? 'null') as { status?: unknown } | null)?.status; } catch { status = null; }
-    if (status === 'needs_split') out.push({ kind: 'needs-split', taskId: l.task_id, leaseId: l.id, detail: `${l.task_id}: ${l.id} asks for a split` });
-  }
-  const seen = new Set<string>();
-  for (const e of db.eventsOfKindSince('record', since)) {
-    const d = e.data as { to?: unknown } | null;
-    const taskId = e.taskId;
-    if (d?.to !== 'awaiting-human' || !taskId || seen.has(taskId)) continue;
-    seen.add(taskId);
-    out.push({ kind: 'awaiting-human', taskId, detail: `${taskId} needs the owner (awaiting-human): compose the question` });
-  }
-  return out;
+export function collectWakeReasons(db: Pick<RuntimeDb, 'getMeta'>): WakeReason[] {
+  return Object.values(readHolds(db)).map((h) => ({ kind: 'dispatch-decision', taskId: h.taskId, detail: `${h.taskId} needs a decision (${h.kind}): ${h.message.slice(0, 120)}` }));
 }
 
 // ---------------------------------------------------------------- the pass
@@ -226,8 +197,6 @@ export interface RoutinePassDeps {
   procStart?: (pid: number) => string | null;
   /** Whether a routine lock holder still runs (pid alive with the recorded start time). */
   lockAlive: (l: RoutineLock) => boolean;
-  /** `work next` (null when it fails: no runnable reasons this pass). */
-  next: () => Promise<Pick<NextReport, 'runnable'> | null>;
   coordinator: () => Promise<CoordinatorView>;
   /** Active leases as the restart counts them (open process runs included). */
   activeLeases: () => Promise<string[]>;
@@ -243,8 +212,6 @@ export interface RoutinePassDeps {
   wake: () => Promise<string>;
   /** The crash start: `coordinator restart --recover` detached, after its own drain check. */
   crashStart: () => Promise<string>;
-  /** Sessions on (phase 7): the task session pass (taskSessionPass), run instead of a wake for runnable stages. */
-  openTaskSessions?: () => Promise<TaskSessionPass>;
 }
 
 export type RoutineSkip = 'disabled' | 'locked' | 'interval' | 'fresh';
@@ -265,8 +232,6 @@ export interface RoutineReport {
   decision?: WakeDecision;
   /** What the wake or crash start did (scheduled, or the refusal). */
   outcome?: { ok: boolean; detail: string };
-  /** Sessions on: what the task session pass opened, closed and refused (or why it failed). */
-  sessions?: { opened: string[]; closed: string[]; refused: { taskId: string; why: string }[] } | { error: string };
   coordinator: { running: boolean; since: string | null };
 }
 
@@ -317,17 +282,9 @@ export async function runRoutinePass(deps: RoutinePassDeps, opts: { trigger: Rou
     const c = await deps.coordinator();
     report.coordinator = coordinatorLine(c);
     const since = c.running ? coordinatorIdleSince(deps.db, c, deps.mtime) : null;
-    let next: Pick<NextReport, 'runnable'> | null = null;
-    try { next = await deps.next(); } catch { next = null; }
-    // Sessions on: runnable stages open task sessions; nothing but the digest wakes the coordinator.
+    // Sessions on: holds go to their task sessions; nothing but the digest wakes the coordinator.
     const sessionsOn = deps.config.coordinator?.sessions?.enabled === true;
-    if (sessionsOn && deps.openTaskSessions) {
-      try {
-        const p = await deps.openTaskSessions();
-        report.sessions = { opened: p.opened.map((o) => o.key), closed: p.closed.map((x) => x.key), refused: p.refused.slice(0, 20) };
-      } catch (e) { report.sessions = { error: msg(e) }; }
-    }
-    const reasons = settings.enabled && c.running && !sessionsOn ? collectWakeReasons(deps.db, next, since, { dispatchAuto: dispatchMode(deps.config) === 'auto' }) : [];
+    const reasons = settings.enabled && c.running && !sessionsOn ? collectWakeReasons(deps.db) : [];
     const digest = settings.enabled ? deps.digestDue?.(deps.now()) ?? null : null;
     // Sessions on and the router running: its background `coordinator wait` returns for the digest, so no restart.
     if (digest && !(sessionsOn && c.running)) reasons.push({ kind: 'digest', detail: digest });
@@ -360,7 +317,6 @@ export async function runRoutinePass(deps: RoutinePassDeps, opts: { trigger: Rou
     deps.db.addEvent(ROUTINE_EVENT, null, {
       trigger: report.trigger, durationMs: report.durationMs, reheld: report.reheld ?? 0,
       reasons: reasons.slice(0, 50), decision, outcome: report.outcome ?? null, coordinator: report.coordinator,
-      ...(report.sessions ? { sessions: report.sessions } : {}),
     }, at);
     return report;
   } finally {
@@ -403,7 +359,6 @@ export function humanRoutineReport(r: RoutineReport): string {
   return [
     `routine pass (${r.trigger}) at ${r.at}`,
     `decision: ${r.decision?.action ?? 'none'} - ${r.why}${r.outcome ? ` (${r.outcome.ok ? 'scheduled' : 'refused'}: ${r.outcome.detail})` : ''}`,
-    ...(r.sessions ? ['error' in r.sessions ? `task sessions: pass failed: ${r.sessions.error}` : `task sessions: opened ${r.sessions.opened.join(', ') || 'none'}; closed ${r.sessions.closed.join(', ') || 'none'}${r.sessions.refused.length ? `; not opened: ${r.sessions.refused.slice(0, 3).map((x) => `${x.taskId} (${x.why})`).join(', ')}` : ''}`] : []),
     ...(r.reasons?.length ? ['reasons:', ...r.reasons.map((x) => `  ${x.kind}: ${x.detail}`)] : []),
     `next pass ${r.nextAt ?? '-'}`,
   ].join('\n');

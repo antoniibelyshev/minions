@@ -52,13 +52,13 @@ export const TELEGRAM_HOOK_COMMAND = `${hangGuarded('minions hook pre-telegram')
 
 /**
  * First user message of a coordinator started by `minions coordinator restart --recover`: run the recover
- * skill (read the previous session's handoff, reconcile leases left by it, re-dispatch), then resume the queue. Fixed
+ * skill (read the previous session's handoff, reconcile leases the dispatcher does not own), then the held decisions. Fixed
  * text, no secrets (the handoff is read with a command, never passed in argv); the pause state still applies (orchestrate stops when starts are paused).
  */
 export const RECOVERY_PROMPT = '/minions:recover The coordinator was just restarted (minions coordinator restart --recover). '
   + 'First read the previous session\'s handoff (minions coordinator handoff --read --json) with minions status --json. '
-  + 'Reconcile the leases left by the previous session, release those without a live worker, re-dispatch interrupted tasks, '
-  + 'then resume the queue with /minions:orchestrate. If starts are paused, report that instead of dispatching.';
+  + 'Reconcile the leases the dispatcher does not own, fix stuck tasks, '
+  + 'then continue with /minions:orchestrate (the held decisions). If starts are paused, report that.';
 
 /**
  * First user message of a coordinator woken by the routine pass (docs/design/unattended-delivery.md decision 3):
@@ -1169,8 +1169,8 @@ export interface CoordinatorWrapperDeps extends RunCoordinatorDeps {
    */
   integrationWatch?: (cfg: MinionsConfig, log: (line: string) => void) => () => void;
   /**
-   * The autopilot dispatcher watch (docs/design/autonomy.md Decision 1): keeps `minions work dispatch` running while
-   * dispatch.mode is auto (a live setting: it re-reads it). The CLI passes wrapperDispatchWatch. Returns its stop function.
+   * The autopilot dispatcher watch (docs/design/autonomy.md Decisions 1 and 10): keeps `minions work dispatch` running,
+   * always. The CLI passes wrapperDispatchWatch. Returns its stop function.
    */
   dispatchWatch?: (cfg: MinionsConfig, log: (line: string) => void) => () => void;
 }

@@ -1,5 +1,5 @@
 // The autopilot dispatcher (docs/design/autonomy.md Decision 1): `minions work dispatch`, a deterministic node process
-// that runs the stage loop the coordinator ran by hand. No model decides anything here.
+// that runs the stage loop: the only way stages run (Decision 10). No model decides anything here.
 //
 //   pass: holds cleared when the coordinator acted -> `next` -> claim each runnable stage -> start a headless worker
 //   exit: record the submitted result -> recordDecision -> one automatic correction, or a hold for the coordinator
@@ -17,8 +17,7 @@
 //   lease (<state>/run/dispatch/<leaseId>.json) so a restarted dispatcher recovers its leases instead of losing them.
 // - Leases it claims have holder `dispatcher`; the coordinator's restart and wake rules ignore them (they are not its
 //   subagents).
-// - The coordinator context-reset barrier does not apply: it exists because the coordinator had to wait for its own
-//   workers. Budget, pause and drain do (Scheduler.next reports them as startsBlocked).
+// - Budget, pause and drain apply (Scheduler.next reports them as startsBlocked).
 import { readFile, rm, readdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { MinionsConfig } from '../config/schema.js';
@@ -26,7 +25,7 @@ import { MinionsError } from '../core/errors.js';
 import { atomicWrite, ensureDir } from '../core/fsutil.js';
 import { recordDecision } from './advance.js';
 import { DISPATCH_HOLDER, type Lease, type RuntimeDb, type SupervisorLock } from './db.js';
-import { DEFAULT_TICK_SECONDS, DISPATCH_EVENT, dispatchMode, dispatchSettings, readHolds, writeHolds, type DispatchHold, type DispatchMode } from './dispatch-state.js';
+import { DEFAULT_TICK_SECONDS, DISPATCH_EVENT, dispatchSettings, readHolds, writeHolds, type DispatchHold } from './dispatch-state.js';
 import { claimWithBrief, compactClaim, recordSubmitted, type CompactClaim, type HandoffPaths } from './handoff.js';
 import type { NextStage, RecordResponse, Scheduler } from './scheduler.js';
 import { hostIdentity, procIdentity } from './runner/record.js';
@@ -110,7 +109,6 @@ export interface DispatcherDeps {
 }
 
 export interface PassReport {
-  mode: DispatchMode;
   started: { taskId: string; role: string; leaseId: string }[];
   held: string[];
   cleared: string[];
@@ -232,9 +230,7 @@ export class Dispatcher {
   /** One pass: clear resolved holds, then claim and start every runnable stage within the limits. */
   async pass(): Promise<PassReport> {
     const cfg = await this.d.config();
-    const s = dispatchSettings(cfg);
-    const report: PassReport = { mode: s.mode, started: [], held: [], cleared: [], blocked: null };
-    if (s.mode !== 'auto') return report;
+    const report: PassReport = { started: [], held: [], cleared: [], blocked: null };
     await this.reapAdopted(cfg);
     const sched = await this.d.scheduler(cfg);
     report.cleared = await this.clearResolved(sched);
@@ -242,10 +238,8 @@ export class Dispatcher {
     report.held = Object.keys(holds);
     const next = await sched.next();
     if (next.startsBlocked) { report.blocked = next.startsBlocked.message; return report; }
-    // The coordinator's reset barrier holds stages as waiting; the dispatcher's workers are not the coordinator's.
-    const stages = next.resetPending ? [...next.runnable, ...next.waiting.filter((w) => w.waitingOn === 'context-reset')] : next.runnable;
     const busy = new Set([...this.active().map((r) => r.taskId), ...this.recording]);
-    for (const stage of stages) {
+    for (const stage of next.runnable) {
       if (holds[stage.taskId] || busy.has(stage.taskId)) continue;
       let claim: CompactClaim;
       try {
@@ -355,7 +349,7 @@ export class Dispatcher {
   private async afterRecord(cfg: MinionsConfig, sched: Scheduler, lease: Lease, r: RecordResponse, corrections: number, sessionId: string | null, stage?: NextStage): Promise<void> {
     const worker = r.valid ? storedResult(this.d.db, lease.id) : {};
     const decision = recordDecision(sched, r, worker);
-    if (!decision || decision.kind === 'context-reset' || decision.kind === 'draining') return;
+    if (!decision || decision.kind === 'draining') return;
     if (decision.kind === 'invalid' && decision.correctionAllowed && corrections === 0 && stage) {
       // The one bounded correction: same lease, the worker's own session resumed with the errors.
       const claim: CompactClaim = {
@@ -376,7 +370,7 @@ function storedResult(db: RuntimeDb, leaseId: string): { status?: string; findin
   try { return JSON.parse(db.lease(leaseId)?.result_json ?? '{}') as { status?: string; findings?: unknown[] }; } catch { return {}; }
 }
 
-/** The prompt of a headless worker: exactly what the coordinator's Agent call carried, plus the correction. */
+/** The prompt of a headless worker: the lease marker, the worktree and what to do, or the correction. */
 export function workerPrompt(claim: Pick<CompactClaim, 'briefMarker' | 'worktree' | 'leaseId' | 'role'>, correction?: LaunchInput['correction']): string {
   const head = `${claim.briefMarker}\nworktree: ${claim.worktree}\n`;
   if (!correction) return `${head}\nFetch your brief (\`${`minions work brief ${claim.leaseId} --role ${claim.role} --json`}\` from the worktree), do the task, and submit your WorkerResult with \`minions work submit ${claim.leaseId} --role ${claim.role}\` before you end.`;
@@ -401,7 +395,7 @@ export interface RunDispatcherDeps extends DispatcherDeps {
   /** Test seam: resolves after `ms` or when aborted. */
   sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
 }
-export type DispatcherExit = 'disabled' | 'conflict' | 'stopped' | 'lock-lost';
+export type DispatcherExit = 'conflict' | 'stopped' | 'lock-lost';
 
 const abortableSleep = (ms: number, signal?: AbortSignal) => new Promise<void>((resolve) => {
   if (signal?.aborted) return resolve();
@@ -411,12 +405,10 @@ const abortableSleep = (ms: number, signal?: AbortSignal) => new Promise<void>((
 
 /**
  * `minions work dispatch`: takes the dispatcher lock, recovers the previous holder's leases, then runs a pass every
- * tick until stopped, the lock is lost, or dispatch.mode leaves `auto` with no worker left (the wrapper's watch starts
- * it again when the mode returns). Running workers are waited for on the way out, never abandoned.
+ * tick until stopped or the lock is lost. Running workers are waited for on the way out, never abandoned.
  */
 export async function runDispatcher(d: RunDispatcherDeps): Promise<{ exit: DispatcherExit; passes: number; holder: SupervisorLock | null }> {
   const log = (l: string) => { try { d.log?.(l); } catch { /* ignore */ } };
-  if (dispatchMode(await d.config()) !== 'auto') return { exit: 'disabled', passes: 0, holder: null };
   const self = await procIdentity(process.pid);
   const host = await hostIdentity();
   const now = d.now ?? (() => new Date());
@@ -439,7 +431,6 @@ export async function runDispatcher(d: RunDispatcherDeps): Promise<{ exit: Dispa
       try {
         const cfg = await d.config();
         tick = d.tickMs ?? dispatchSettings(cfg).tickMs;
-        if (dispatchMode(cfg) !== 'auto' && !disp.active().length) { exit = 'disabled'; break; }
         const r = await disp.pass();
         passes++;
         if (r.started.length) log(`minions dispatcher: started ${r.started.map((x) => `${x.taskId} ${x.role}`).join(', ')}`);
@@ -447,7 +438,7 @@ export async function runDispatcher(d: RunDispatcherDeps): Promise<{ exit: Dispa
       await sleep(tick, d.signal);
     }
     // Stopped (an upgrade, a restart): running workers keep going in their own process groups; the next dispatcher
-    // adopts them. Disabled or lock lost: wait for the exits already being recorded.
+    // adopts them. Lock lost: wait for the exits already being recorded.
     if (!d.signal?.aborted) await disp.settled();
   } finally {
     d.db.releaseSupervisorLock(lock, 'dispatcher_lock');

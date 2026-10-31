@@ -166,14 +166,13 @@ describe('state guard QA: submit-heredoc allowlist, more one-call variants (atte
   });
 });
 
-// Merge regression (main f7a29ca added the coordinator-only `work advance`): the worker allowlist must cover every
+// Merge regression (main f7a29ca added a coordinator-only `work` verb): the worker allowlist must cover every
 // `work` subcommand the program has, so a new one is refused to workers by default.
 describe("state guard QA: every work subcommand but brief and submit is the coordinator's", () => {
   const work = buildProgram().commands.find((c) => c.name() === 'work')!;
   const subs = work.commands.flatMap((c) => [c.name(), ...c.aliases()]);
 
-  it('the program has work advance and every coordinator-only verb', () => {
-    expect(COORDINATOR_ONLY_WORK_VERBS).toContain('advance');
+  it('the program has every coordinator-only verb', () => {
     for (const v of COORDINATOR_ONLY_WORK_VERBS) expect(subs).toContain(v);
   });
 

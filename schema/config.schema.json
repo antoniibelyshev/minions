@@ -930,18 +930,6 @@
                   "type": "null"
                 }
               ]
-            },
-            "barrierTokens": {
-              "anyOf": [
-                {
-                  "type": "integer",
-                  "minimum": 1000,
-                  "maximum": 9007199254740991
-                },
-                {
-                  "type": "null"
-                }
-              ]
             }
           },
           "required": [
@@ -1020,13 +1008,6 @@
     "dispatch": {
       "type": "object",
       "properties": {
-        "mode": {
-          "type": "string",
-          "enum": [
-            "auto",
-            "coordinator"
-          ]
-        },
         "workerTimeoutMinutes": {
           "type": "integer",
           "minimum": 5,
