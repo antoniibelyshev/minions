@@ -75,7 +75,10 @@
       ]
     },
     "reviewerRequired": true,
-    "ciAuthority": "none"
+    "ciAuthority": "none",
+    "setupCommands": [
+      "npm ci"
+    ]
   },
   "communication": {
     "channel": "auto",
