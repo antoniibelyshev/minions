@@ -10,7 +10,7 @@
 //   most 300 characters.
 import { displayText, truncateCodePoints } from '../../core/control-chars.js';
 import { MinionsError } from '../../core/errors.js';
-import { isForwarded, oneLine, type TelegramMessage, type TelegramPollAnswer, type TelegramUpdate } from '../bot-api.js';
+import { isForwarded, oneLine, type BotMenuCommand, type TelegramMessage, type TelegramPollAnswer, type TelegramUpdate } from '../bot-api.js';
 
 // ---------------------------------------------------------------- access
 
@@ -112,6 +112,12 @@ export function assertAllowedChat(access: ChannelAccess, chatId?: string): strin
 // ---------------------------------------------------------------- bot commands
 
 export const BOT_COMMANDS = ['start', 'help', 'status'] as const;
+/** The channel server's own commands, for /help and the bot's "/" menu. */
+export const SERVER_COMMANDS: BotMenuCommand[] = [
+  { command: 'help', description: 'all commands' },
+  { command: 'status', description: 'your pairing state' },
+  { command: 'start', description: 'pairing instructions' },
+];
 export type BotCommand = typeof BOT_COMMANDS[number];
 
 /** `/start`, `/help`, `/status` (optionally `@botname`), else null. */
@@ -124,12 +130,16 @@ export function botCommand(text: string | undefined): BotCommand | null {
  * The server's own answer to a bot command in a DM, or null (dropped: not a DM, a bot, policy disabled, or a stranger
  * under `allowlist`). /status never shows another sender's code or any id.
  */
-export function commandReply(cmd: BotCommand, access: ChannelAccess, m: TelegramMessage, now: number): string | null {
+export function commandReply(cmd: BotCommand, access: ChannelAccess, m: TelegramMessage, now: number, extra: BotMenuCommand[] = []): string | null {
   if (!m.from || m.from.is_bot === true || m.chat?.type !== 'private' || access.dmPolicy === 'disabled') return null;
   const sender = String(m.from.id);
   const owner = access.allowFrom.includes(sender);
   if (!owner && access.dmPolicy === 'allowlist') return null;
-  if (cmd === 'start' && owner) return 'Paired: your messages reach the coordinator. Each new message starts its own thread; reply to a message to continue that thread. /sessions lists open threads, /budget shows spend and caps.';
+  if (owner && (cmd === 'help' || cmd === 'start')) {
+    const head = cmd === 'start' ? 'Paired: your messages reach the coordinator.' : 'Messages you send here reach the coordinator.';
+    const threads = extra.length ? ' Each new message starts its own thread; reply to a message to continue that thread.' : '';
+    return [`${head}${threads}`, '', ...[...extra, ...SERVER_COMMANDS].map((c) => `/${c.command} - ${c.description}`)].join('\n');
+  }
   if (cmd === 'start') return 'This bot connects Telegram to a minions coordinator. To pair: DM me anything to get a 6-character code, then the owner approves it on the host (`minions telegram access pair <code>`). After that, your DMs reach the coordinator.';
   if (cmd === 'help') return 'Messages you send here reach the minions coordinator once you are paired. Text and replies are forwarded; answers come back here.\n/start - pairing instructions\n/status - your pairing state';
   if (owner) return 'Paired: your messages reach the coordinator.';

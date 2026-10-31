@@ -68,6 +68,9 @@ export function isForwarded(m: TelegramMessage): boolean {
 export type InlineKeyboard = { text: string; callback_data: string }[][];
 
 /** The caller-specific wording of the two errors a human acts on. */
+/** One entry of the bot's "/" menu. */
+export interface BotMenuCommand { command: string; description: string }
+
 export interface BotApiErrorText {
   auth: { message: string; hint: string };
   conflict: { message: string; hint: string };
@@ -168,6 +171,11 @@ export class BotApi {
       ...(o.replyTo !== undefined ? { reply_parameters: { message_id: o.replyTo, allow_sending_without_reply: true } } : {}),
     }) as TelegramMessage | null;
     return typeof r?.message_id === 'number' && typeof r.poll?.id === 'string' ? { messageId: r.message_id, pollId: r.poll.id } : null;
+  }
+
+  /** setMyCommands: the bot's "/" menu in every chat. */
+  async setMyCommands(commands: BotMenuCommand[]): Promise<void> {
+    await this.callRetry('setMyCommands', { commands });
   }
 
   /** stopPoll: closes a poll the bot sent (no more votes). */

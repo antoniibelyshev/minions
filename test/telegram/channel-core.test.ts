@@ -2,7 +2,7 @@
 // and the 409 backoff rule.
 import { describe, expect, it } from 'vitest';
 import {
-  assertAllowedChat, conflictBackoffMs, ConflictTracker, CONFLICT_BACKOFF_CAP_MS, gate, MessageMap, normalizeRef, parseAccess, pollAnswerNotification, pollArgs, toNotification, withRefFooter,
+  assertAllowedChat, commandReply, conflictBackoffMs, ConflictTracker, CONFLICT_BACKOFF_CAP_MS, gate, MessageMap, normalizeRef, parseAccess, pollAnswerNotification, pollArgs, toNotification, withRefFooter,
 } from '../../src/telegram/channel/core.js';
 import type { TelegramMessage } from '../../src/telegram/bot-api.js';
 
@@ -165,5 +165,21 @@ describe('polls and the reply default (autonomy.md Decision 5)', () => {
     for (let i = 1; i <= 3; i++) back.record({ messageId: 60 + i, chatId: String(OWNER), ref: null, textHead: '', sentAt: '' });
     expect(back.findPoll('p1')).toBeUndefined();
     expect(MessageMap.from({ version: 1, messages: [], lastInbound: { x: 'bad' } }).lastInbound('x')).toBeUndefined();
+  });
+});
+
+describe('commandReply', () => {
+  const extra = [{ command: 'sessions', description: 'open threads' }];
+  it("an owner's /help lists the gateway's and the server's commands; /start says they are paired", () => {
+    const help = commandReply('help', allow, dm('/help'), NOW, extra)!;
+    expect(help).toMatch(/new message starts its own thread/);
+    for (const c of ['/sessions', '/help', '/status', '/start']) expect(help).toContain(c);
+    expect(commandReply('start', allow, dm('/start'), NOW, extra)).toMatch(/^Paired: /);
+    expect(commandReply('help', allow, dm('/help'), NOW)).not.toMatch(/thread/);
+  });
+  it('a stranger under pairing gets the pairing help, never the command list', () => {
+    const pairing = parseAccess({ dmPolicy: 'pairing', allowFrom: [String(OWNER)], groups: {}, pending: {} });
+    expect(commandReply('help', pairing, dm('/help', { from: 7 }), NOW, extra)).not.toContain('/sessions');
+    expect(commandReply('help', allow, dm('/help', { from: 7 }), NOW, extra)).toBeNull();
   });
 });

@@ -30,7 +30,7 @@ import { atomicWrite, ensureDir, sha256 } from '../../core/fsutil.js';
 import { redact } from '../../core/output.js';
 import { checkTelegramTokenFormat } from '../token.js';
 import { claudeOwner, isOfficialServerCmdline } from '../isolation.js';
-import { BotApi, defaultSleep, nextOffset, OffsetFile, retryAfterMs, type TelegramUpdate } from '../bot-api.js';
+import { BotApi, defaultSleep, nextOffset, OffsetFile, retryAfterMs, type BotMenuCommand, type TelegramUpdate } from '../bot-api.js';
 import {
   assertAllowedChat, botCommand, commandReply, ConflictTracker, gate, LOCKED_ACCESS, MessageMap, normalizeRef, pairingText,
   parseAccess, pollAnswerNotification, pollArgs, serializeAccess, textHead, toNotification, updateMessage, withRefFooter, type ChannelAccess,
@@ -277,6 +277,8 @@ export interface ChannelServerOptions {
    * wrapper's direct child itself.
    */
   owner?: (selfPid: number, launchPid: number) => 'coordinator' | 'other' | 'unknown';
+  /** Commands handled by the server's user (the gateway), listed in an owner's /help. */
+  extraCommands?: BotMenuCommand[];
 }
 
 export type ChannelState = { active: true } | { active: false; reason: string };
@@ -468,7 +470,7 @@ export class ChannelServer {
     const access = await this.access();
     const cmd = edited ? null : botCommand(m.text);
     if (cmd) {
-      const text = commandReply(cmd, access, m, this.now());
+      const text = commandReply(cmd, access, m, this.now(), this.opts.extraCommands);
       if (text && m.chat) await this.opts.api.sendMessage(m.chat.id, text);
       return;
     }

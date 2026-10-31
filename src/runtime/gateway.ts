@@ -19,8 +19,8 @@ import type { MinionsConfig } from '../config/schema.js';
 import { MinionsError } from '../core/errors.js';
 import { atomicWrite } from '../core/fsutil.js';
 import { redact } from '../core/output.js';
-import { BotApi } from '../telegram/bot-api.js';
-import { parseAccess, type ChannelNotification } from '../telegram/channel/core.js';
+import { BotApi, type BotMenuCommand } from '../telegram/bot-api.js';
+import { parseAccess, SERVER_COMMANDS, type ChannelNotification } from '../telegram/channel/core.js';
 import { CHANNEL_BOT_ERRORS, ChannelServer, fileLog, LAUNCH_ENV, readChannelToken, type ChannelProc, type ChannelServerOptions } from '../telegram/channel/server.js';
 import type { RuntimeDb, SessionRow } from './db.js';
 import { digestStatus, reholdExpired } from './digest.js';
@@ -149,6 +149,12 @@ export type BudgetCommand =
   | { kind: 'show' }
   | { kind: 'set'; key: 'dailyUsd' | 'taskUsd'; usd: number | null }
   | { kind: 'usage'; why: string };
+
+/** The gateway's own commands (never routed to a coordinator). */
+export const GATEWAY_COMMANDS: BotMenuCommand[] = [
+  { command: 'sessions', description: 'open threads and their spend' },
+  { command: 'budget', description: 'spend vs caps; /budget day|task <usd|off>' },
+];
 
 export const BUDGET_USAGE = 'Usage: /budget (show), /budget day <usd|off>, /budget task <usd|off>.';
 
@@ -314,9 +320,11 @@ export async function runGateway(o: RunGatewayOptions): Promise<void> {
   const server = new ChannelServer({
     api, botId, stateDir: o.telegramStateDir, launchId: o.env[LAUNCH_ENV], readLaunch: o.readLaunch, proc: o.proc, log,
     owner: (self, launch) => { const p = o.proc.parentOf(self); return p === null ? 'unknown' : p === launch ? 'coordinator' : 'other'; },
+    extraCommands: GATEWAY_COMMANDS,
   });
   const st = await server.activate();
   if (!st.active) throw new MinionsError('PRECONDITION', `The Telegram gateway is not active: ${st.reason}.`);
+  await api.setMyCommands([...GATEWAY_COMMANDS, ...SERVER_COMMANDS]).catch((e: unknown) => log(`minions gateway: setting the command menu failed: ${(e as Error).message}`));
   const accessFile = join(o.telegramStateDir, 'access.json');
   const isOwner = o.isOwner ?? (async (userId: string | undefined) => {
     if (!userId) return false;
