@@ -18,6 +18,7 @@ import { MinionsError } from '../core/errors.js';
 import { atomicWrite, ensureRealDir } from '../core/fsutil.js';
 import { CONTAINER } from '../core/paths.js';
 import { resolveOnPath } from '../host/auth.js';
+import { workerRole } from '../config/roles.js';
 import { generatePlugin } from '../plugin/generate.js';
 import { TELEGRAM_PLUGIN_ID } from '../telegram/probe.js';
 import { coordinatorSettings, effectivePermissionMode, runtimeAuthMethod, type HostHardening, type RuntimeAuthMethod } from './coordinator.js';
@@ -27,6 +28,7 @@ import { checkHeadlessArgs, credentialEnv, HEADLESS_DROP_ENV, prepareHeadlessCre
 import { WORKER_LEASE_ENV, WORKER_ROLE_ENV } from './hooks.js';
 import type { RuntimePaths } from './paths.js';
 import { DEFAULT_TIMING, supervise, type SpawnSpec, type StopReason } from './runner/supervise.js';
+import { secretEnv } from './secrets.js';
 import { SESSION_ENV_ALLOW, SESSION_ENV_ALLOW_PREFIXES } from './sessions.js';
 
 /** Plugin dirs kept under <state>/run/dispatch/plugin (one per config the dispatcher has run workers with). */
@@ -144,9 +146,12 @@ export async function buildWorkerCommand(i: LaunchInput, deps: WorkerLaunchDeps)
   await ensureRealDir(join(dispatchRunDir(deps.paths.state), 'config'), 0o700);
   await ensureRealDir(configDir, 0o700);
   await atomicWrite(join(configDir, 'settings.json'), JSON.stringify(plan.settings, null, 2) + '\n', { mode: 0o600 });
+  // The role's declared secrets (docs/design/autonomy.md Decision 4); a missing one refuses the launch.
+  const def = workerRole(cfg, claim.role);
+  const secrets = def?.secrets.length ? secretEnv(deps.paths.state, def.secrets) : {};
   return {
     kind: 'claude', argv: [bin, ...args], cwd: claim.worktree,
-    env: workerEnv(env, configDir, plan.cred, { leaseId: claim.leaseId, role: claim.role, tmp: deps.paths.tmp, ...(claim.scratchDir ? { scratchDir: claim.scratchDir } : {}) }),
+    env: { ...secrets, ...workerEnv(env, configDir, plan.cred, { leaseId: claim.leaseId, role: claim.role, tmp: deps.paths.tmp, ...(claim.scratchDir ? { scratchDir: claim.scratchDir } : {}) }) },
     stdin: workerPrompt(claim, i.correction),
   };
 }

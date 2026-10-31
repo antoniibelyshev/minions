@@ -97,6 +97,9 @@ const effectColumn = z.object(
 ).strict();
 
 /** A project-defined worker role (D3). */
+/** A coordinator-stored secret's name (docs/design/autonomy.md Decision 4): an env variable name. */
+export const SECRET_NAME = /^[A-Z][A-Z0-9_]{1,63}$/;
+
 export const CustomRoleSchema = z.object({
   description: nonEmpty,
   /** Markdown prompt body, relative to the config dir (e.g. `agents/researcher.md`). Exactly one of prompt / promptText. */
@@ -130,6 +133,8 @@ export const CustomRoleSchema = z.object({
    * nearest earlier producer stage that can commit. Checked by workflowConfigIssues (src/config/workflows.ts).
    */
   repairTo: nonEmpty.optional(),
+  /** Coordinator-stored secrets (`minions secrets set`) the dispatcher puts into this role's worker env, by name. */
+  secrets: z.array(z.string().regex(SECRET_NAME, 'must be an env-style secret name (A-Z, 0-9, _)')).max(20).optional(),
 }).strict();
 export type CustomRoleConfig = z.infer<typeof CustomRoleSchema>;
 
@@ -146,6 +151,8 @@ const builtinRoleOverride = {
   harness: z.enum(HARNESS_IDS).optional(),
   /** May only remove tools from the built-in definition. */
   tools: z.array(toolName).min(1).optional(),
+  /** Coordinator-stored secrets the dispatcher puts into this role's worker env, by name. */
+  secrets: z.array(z.string().regex(SECRET_NAME, 'must be an env-style secret name (A-Z, 0-9, _)')).max(20).optional(),
 };
 export const BuiltinRoleOverrideSchema = z.object(builtinRoleOverride).strict();
 export const EngineerRoleOverrideSchema = z.object({

@@ -74,6 +74,7 @@ import { reapRun, recoverRuns, runLease, type ReapDeps, type RecoverySweep, type
 import { hasOpenRun, isAlive, openRunsSync, procIdentity, withOpenRuns } from './runner/record.js';
 import { clearHold, DISPATCH_HOLDER, dispatcherLockState, dispatchMode, readHolds, runDispatcher, type DispatchHold } from './dispatcher.js';
 import { launchWorker } from './dispatch-launch.js';
+import { listSecrets, removeSecret, setSecret } from './secrets.js';
 import { liveRun, liveRunExitCode, type LiveRunReport } from './headless.js';
 import { buildSessionCommand, sessionConfigDir, sessionsSettings } from './sessions.js';
 import { enqueueInbox, openSession } from './session-store.js';
@@ -672,6 +673,30 @@ export function register(program: Command): void {
     setIntakePausedContext(() => getDb().paused().intake);
     setProvenanceFallback(intakeProvenanceFallback(getDb));
   }
+
+  // secrets (docs/design/autonomy.md Decision 4): values the coordinator stores for the worker roles that declare them
+  const secrets = program.command('secrets').description('Secrets the coordinator stores itself (value on stdin, never printed) and the dispatcher puts into the env of the worker roles that list them in roles.<role>.secrets');
+  secrets.command('set <name>').description('Store or replace a secret; the value is read from stdin')
+    .requiredOption('--reason <text>', 'what it is for (journaled; the value never is)')
+    .action(action(async (name: string, o: { reason: string }, cmd: Command) => {
+      requireMode('runtime');
+      const value = await readInput(undefined, 'the secret value', `Pipe it in: printf %s "$VALUE" | minions secrets set ${name} --reason <why>`);
+      const r = await setSecret(runtimePaths().state, name, value, { reason: o.reason });
+      emit(r, { json: globalOpts(cmd).json, human: (x: typeof r) => `${x.replaced ? 'Replaced' : 'Stored'} ${x.name} (${x.bytes} bytes, sha256 ${x.sha256}). Give it to a role with \`minions control set roles.<role>.secrets '["${x.name}"]'\`.` });
+    }));
+  secrets.command('list').description('Stored secret names, sizes and set times (never values)')
+    .action(action(async (_o: unknown, cmd: Command) => {
+      requireMode('runtime');
+      const r = listSecrets(runtimePaths().state);
+      emit(r, { json: globalOpts(cmd).json, human: (xs: typeof r) => xs.map((x) => `${x.name}  ${x.bytes} bytes  ${x.setAt}`).join('\n') || 'No secrets stored.' });
+    }));
+  secrets.command('remove <name>').description('Remove a stored secret')
+    .requiredOption('--reason <text>', 'why (journaled)')
+    .action(action(async (name: string, o: { reason: string }, cmd: Command) => {
+      requireMode('runtime');
+      const r = await removeSecret(runtimePaths().state, name, { reason: o.reason });
+      emit(r, { json: globalOpts(cmd).json, human: (x: typeof r) => (x.removed ? `Removed ${x.name}.` : `${x.name} was not stored.`) });
+    }));
 
   // control (docs/design/autonomy.md Decision 3): the coordinator-owned config overlay, applied at once
   const control = program.command('control').description('Coordinator-owned configuration: change any setting, role (worker profile) or workflow at once, without the owner (journaled; undo with `control undo`)');

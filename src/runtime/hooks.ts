@@ -406,7 +406,7 @@ export function coordinatorOnlyWorkCommand(command: string): string | null {
  */
 export const MINIONS_COMMANDS: readonly string[] = [
   'auth', 'backlog', 'channel', 'ci', 'config', 'control', 'coordinator', 'doctor', 'down', 'export', 'git-credential', 'help', 'hook', 'import',
-  'init', 'manager', 'notify', 'pause', 'resume', 'runtime', 'settings', 'setup', 'start', 'status', 'stop', 'sync', 'telegram',
+  'init', 'manager', 'notify', 'pause', 'resume', 'runtime', 'secrets', 'settings', 'setup', 'start', 'status', 'stop', 'sync', 'telegram',
   'uninstall', 'upgrade', 'work', 'workspace',
 ];
 
