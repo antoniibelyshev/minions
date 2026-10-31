@@ -138,6 +138,8 @@ describe('holds', () => {
 
 describe('digest due (with catch-up)', () => {
   const cfg = { routine: { enabled: true } };
+  /** The runtime existed long before the slots under test (catch-up only applies then). */
+  const existed = (env: ReturnType<typeof makeEnv>) => env.db.addEvent('started', null, {}, '2026-10-01T00:00:00.000Z');
 
   it('due at its time, not before; once delivered it is done until the next time', () => {
     const env = makeEnv((c) => { c.routine = { enabled: true }; });
@@ -154,6 +156,7 @@ describe('digest due (with catch-up)', () => {
 
   it('a missed time (host asleep) is caught up at the first pass after it; a missed day sends one digest, not two', () => {
     const env = makeEnv();
+    existed(env);
     // Asleep from Sunday evening to Tuesday 14:00 Berlin: only Tuesday 08:00 counts.
     const s = digestStatus(env.db, cfg, at('2026-10-27T13:00:00Z'));
     expect(s.slot.local).toBe('2026-10-27T08:00');
@@ -161,8 +164,16 @@ describe('digest due (with catch-up)', () => {
     expect(s.due).toMatch(/missed at its time: caught up 360 min late/);
   });
 
+  it('a fresh project does not catch up a time from before it existed', () => {
+    const env = makeEnv();
+    env.db.addEvent('started', null, {}, '2026-10-27T12:00:00.000Z');
+    expect(digestStatus(env.db, cfg, at('2026-10-27T13:00:00Z')).due).toBeNull();
+    expect(digestStatus(env.db, cfg, at('2026-10-28T07:05:00Z')).due).toMatch(/^digest 2026-10-28T08:00/);
+  });
+
   it('a digest wake counts: no second wake for the same time until the retry, at most two', () => {
     const env = makeEnv();
+    existed(env);
     env.db.addEvent(WAKE_EVENT, null, { digest: true }, '2026-10-27T07:01:00.000Z');
     expect(digestStatus(env.db, cfg, at('2026-10-27T07:30:00Z')).due).toBeNull();
     expect(digestStatus(env.db, cfg, at('2026-10-27T08:05:00Z')).due).toMatch(/retry/);
@@ -182,6 +193,7 @@ describe('the digest wake in the routine pass (fake clock)', () => {
     let now = at('2026-10-26T15:00:00Z');
     const wakes: string[] = [];
     const coordinator: CoordinatorView = { running: true, lockAcquiredAt: '2026-10-20T00:00:00.000Z', staleLock: false, exit: null, lastRestartAt: null };
+    env.db.addEvent('started', null, {}, '2026-10-01T00:00:00.000Z');
     // Yesterday's digest was sent: the pass starts from a clean state.
     enqueue(env.db, { key: 'digest:2026-10-26T08:00', kind: 'digest', text: 'x' }); ack(env.db, 'digest:2026-10-26T08:00');
     const deps: RoutinePassDeps = {

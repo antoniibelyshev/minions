@@ -129,6 +129,7 @@ export function commandReply(cmd: BotCommand, access: ChannelAccess, m: Telegram
   const sender = String(m.from.id);
   const owner = access.allowFrom.includes(sender);
   if (!owner && access.dmPolicy === 'allowlist') return null;
+  if (cmd === 'start' && owner) return 'Paired: your messages reach the coordinator. Each new message starts its own thread; reply to a message to continue that thread. /sessions lists open threads, /budget shows spend and caps.';
   if (cmd === 'start') return 'This bot connects Telegram to a minions coordinator. To pair: DM me anything to get a 6-character code, then the owner approves it on the host (`minions telegram access pair <code>`). After that, your DMs reach the coordinator.';
   if (cmd === 'help') return 'Messages you send here reach the minions coordinator once you are paired. Text and replies are forwarded; answers come back here.\n/start - pairing instructions\n/status - your pairing state';
   if (owner) return 'Paired: your messages reach the coordinator.';

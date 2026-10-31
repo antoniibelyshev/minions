@@ -151,7 +151,9 @@ export function digestStatus(db: RuntimeDb, cfg: Pick<MinionsConfig, 'routine'>,
   const base = { enabled: s.enabled, timezone: s.timezone, times: s.digestAt, slot, nextAt: nextDigestAt(now, s), deliveredAt: row?.delivered_at ?? null, wakes: wakes.length, missed, held: Number(held) };
   let due: string | null = null;
   const lastWake = wakes.at(-1);
-  if (s.enabled && !base.deliveredAt && wakes.length < MAX_DIGEST_WAKES_PER_SLOT
+  // A slot from before this runtime existed (a fresh project) is not caught up: there is nothing to report on.
+  const existed = !missed || !!db.get<{ n: number }>('SELECT 1 AS n FROM events WHERE at < ? LIMIT 1', slot.at);
+  if (s.enabled && existed && !base.deliveredAt && wakes.length < MAX_DIGEST_WAKES_PER_SLOT
     && (!lastWake || (now.getTime() - Date.parse(lastWake.at)) / 60_000 >= DIGEST_RETRY_MINUTES)) {
     due = `digest ${slot.local} (${s.timezone}) due${missed ? ` (missed at its time: caught up ${Math.floor(age)} min late)` : ''}${lastWake ? '; retry: the last digest wake did not send it' : ''}`;
   }
