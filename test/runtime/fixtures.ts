@@ -76,7 +76,8 @@ export class FakeBacklog implements BacklogAdapter {
   }
   async getTask(id: string) { return structuredClone(this.must(id)); }
   async createTask(input: CreateTaskInput) {
-    const t = this.add({ id: `task-${this.tasks.size + 1}`, title: input.title, status: input.status ?? 'idea', ...(input.workflow ? { workflow: input.workflow } : {}) });
+    const t = this.add({ id: `task-${this.tasks.size + 1}`, title: input.title, status: input.status ?? 'idea', ...(input.workflow ? { workflow: input.workflow } : {}),
+      ...(input.labels ? { labels: input.labels } : {}), ...(input.description ? { description: input.description } : {}) });
     return { task: t, created: true };
   }
   async updateTask(id: string, expectedVersion: string, patch: Partial<Pick<Task, 'status' | 'title' | 'description' | 'priority' | 'labels' | 'branch'>> & { workflow?: string | null }) {
@@ -96,13 +97,16 @@ export class FakeBacklog implements BacklogAdapter {
 
 export interface Env { root: string; layout: WorkspaceLayout; db: RuntimeDb; backlog: FakeBacklog; config: MinionsConfig; sched: Scheduler; baseSha: string }
 
+/** A default workflow with a tester stage (a custom flow), which the pipeline tests exercise. */
+export const TESTER_FLOW = ['engineer', 'tester', 'reviewer'];
+
 /**
- * Runtime env on the project-owner defaults, except `verification.testerRequired: true` so the existing
- * pipeline tests keep exercising the full engineer → tester → reviewer flow (the opt-in old behaviour).
- * Use makeDefaultEnv for the profile's real default (risk-based testing, testerRequired false).
+ * Runtime env on the project-owner defaults, except a `workflows.default` with a tester stage (TESTER_FLOW) so the
+ * pipeline tests keep exercising engineer → tester → reviewer. Use makeDefaultEnv for the real default (engineer →
+ * reviewer).
  */
 export function makeEnv(mutate?: (c: MinionsConfig) => void): Env {
-  return makeDefaultEnv((c) => { c.verification.testerRequired = true; mutate?.(c); });
+  return makeDefaultEnv((c) => { c.workflows = { ...c.workflows, default: [...TESTER_FLOW] }; mutate?.(c); });
 }
 
 /**
@@ -111,7 +115,7 @@ export function makeEnv(mutate?: (c: MinionsConfig) => void): Env {
  * baseSha is a placeholder.
  */
 export function makeDbEnv(mutate?: (c: MinionsConfig) => void): Env {
-  return makeDefaultEnv((c) => { c.verification.testerRequired = true; mutate?.(c); }, { git: false });
+  return makeDefaultEnv((c) => { c.workflows = { ...c.workflows, default: [...TESTER_FLOW] }; mutate?.(c); }, { git: false });
 }
 
 export function makeDefaultEnv(mutate?: (c: MinionsConfig) => void, o: { git?: boolean } = {}): Env {

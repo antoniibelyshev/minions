@@ -8,7 +8,7 @@
 //   prompt) added as an extra stage after the Claude reviewer in one workflow the owner picks (default: `default`).
 //   An existing `codex-reviewer` role is kept as configured; a non-gate role of that name is refused.
 // - Choosing `default` while the project has no `workflows.default` writes the derived default stages explicitly plus
-//   the pilot stage. From then on `verification.testerRequired` / `reviewerRequired` no longer reshape that workflow;
+//   the pilot stage. From then on `verification.reviewerRequired` no longer reshapes that workflow;
 //   the step says so.
 // - Everything goes to the host-only config.local.json, like the other setup choices. The whole planned layer is
 //   validated with the full config rules before anything is recorded; a refusal records nothing (a key stored in the
@@ -58,7 +58,7 @@ export function pilotRole(): CustomRoleConfig {
 
 /** A resolved stage back in config form (a plain role name when it has nothing else). */
 const stageConfig = (s: Stage): WorkflowStageConfig =>
-  s.when || s.model ? { role: s.role, ...(s.when ? { when: s.when } : {}), ...(s.model ? { model: s.model } : {}) } : s.role;
+  s.model ? { role: s.role, model: s.model } : s.role;
 
 /**
  * The stages of `workflow` with the pilot stage after its last reviewer stage (at the end when it has none), or null
@@ -208,7 +208,7 @@ async function codexChoice(x: HarnessStepInput, current: HarnessId): Promise<Har
       const localWf = (x.local.workflows && typeof x.local.workflows === 'object' ? x.local.workflows : {}) as Record<string, unknown>;
       planned.push(['workflows', { ...localWf, [workflow]: stages }]);
       if (workflow === DEFAULT_WORKFLOW && !Object.hasOwn(config.workflows ?? {}, DEFAULT_WORKFLOW)) {
-        lines.push('workflows.default is now written out (the derived stages plus the pilot): verification.testerRequired / reviewerRequired no longer reshape it.');
+        lines.push('workflows.default is now written out (the derived stages plus the pilot): verification.reviewerRequired no longer reshapes it.');
       }
     }
   }

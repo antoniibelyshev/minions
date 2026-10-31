@@ -376,23 +376,32 @@
             "$ref": "#/$defs/__schema0"
           }
         },
-        "testerRequired": {
-          "type": "boolean"
-        },
         "reviewerRequired": {
           "type": "boolean"
         },
-        "qaLabels": {
-          "minItems": 1,
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/__schema0"
-          }
+        "periodic": {
+          "type": "object",
+          "properties": {
+            "commands": {
+              "minItems": 1,
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/__schema0"
+              }
+            },
+            "everyHours": {
+              "type": "number",
+              "exclusiveMinimum": 0
+            }
+          },
+          "required": [
+            "commands"
+          ],
+          "additionalProperties": false
         }
       },
       "required": [
         "commands",
-        "testerRequired",
         "reviewerRequired"
       ],
       "additionalProperties": false
@@ -1231,12 +1240,6 @@
           "properties": {
             "role": {
               "$ref": "#/$defs/__schema0"
-            },
-            "when": {
-              "type": "string",
-              "enum": [
-                "qa"
-              ]
             },
             "model": {
               "$ref": "#/$defs/__schema3"

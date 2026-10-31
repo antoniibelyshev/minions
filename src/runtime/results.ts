@@ -36,8 +36,6 @@ export const WorkerResultSchema = z.object({
   findings: z.array(FindingSchema),
   nextAction: text,
   verdict: z.enum(['approve', 'request-changes']).optional(),
-  /** Reviewer only: the change needs a tester (QA) stage before delivery; recorded on the task as a QA label. */
-  needsQa: z.boolean().optional(),
   usage: z.object({
     inputTokens: z.number().int().min(0).optional(),
     outputTokens: z.number().int().min(0).optional(),
@@ -120,7 +118,7 @@ export const contractOfRef = (ref: ContractRef): RoleContract =>
 
 /**
  * Validates a worker result (object or JSON text). With a contract variant (D4; a built-in role name maps to
- * its variant), also checks the variant's rules: only a gate gives a verdict or sets needsQa; a gate
+ * its variant), also checks the variant's rules: only a gate gives a verdict; a gate
  * `complete` means `approve`, `needs_changes` means `request-changes`; a verifier/gate `complete` may not
  * report failing checks; an engineer `complete` needs passing local evidence (ValidateOptions.verificationCommands).
  * `blocked`, `needs_split` and `partial` mean the same for every variant.
@@ -141,7 +139,6 @@ export function validateResult(raw: unknown, contractRef?: ContractRef, opts: Va
   const contract = contractRef === undefined ? undefined : contractOfRef(contractRef);
   const as = contract ? `contract ${VARIANT_LABEL[contract]}` : '';
   if (contract && contract !== 'gate' && res.verdict !== undefined) errors.push(`verdict: only reviewer (gate) results carry a verdict (${as})`);
-  if (contract && contract !== 'gate' && res.needsQa !== undefined) errors.push(`needsQa: only reviewer (gate) results can request a QA stage (${as})`);
   if (contract === 'producer' && res.status === 'complete' && opts.verificationCommands) errors.push(...producerEvidenceErrors(res.checks, opts.verificationCommands));
   if ((contract === 'verifier' || contract === 'gate') && res.status === 'complete') {
     const failed = res.checks.filter((c) => c.outcome === 'fail').map((c) => c.command);
@@ -156,17 +153,16 @@ export function validateResult(raw: unknown, contractRef?: ContractRef, opts: Va
 }
 
 /**
- * The result-contract text of a brief (D4), rendered per variant: a producer is never told about `verdict`,
- * `needsQa`; a gate is told its verdict rule and that the head must not move.
+ * The result-contract text of a brief (D4), rendered per variant: a producer is never told about `verdict`; a gate is told its verdict rule and that the head must not move.
  */
 export function resultContractText(contract: RoleContract, opts: { commits?: boolean } = {}): string {
   const commits = opts.commits ?? contract !== 'gate';
   const head = contract === 'gate' || !commits ? 'headSha (full SHA of the exact head you were given; you do not commit)' : 'headSha (full SHA of the branch head you leave)';
-  const gate = contract === 'gate' ? ', verdict: approve|request-changes (complete requires approve; needs_changes = request-changes), needsQa? (true: a tester must run before delivery)' : '';
+  const gate = contract === 'gate' ? ', verdict: approve|request-changes (complete requires approve; needs_changes = request-changes)' : '';
   const rule = contract === 'producer'
-    ? ' No verdict or needsQa. complete = your stage is done; needs_changes = the task must be replanned.'
+    ? ' No verdict. complete = your stage is done; needs_changes = the task must be replanned.'
     : contract === 'verifier'
-      ? ' No verdict or needsQa. complete = verified at the head you report (no failing checks); needs_changes = defects for the repair stage. Commits go on top of the head you were given (never rewrite it).'
+      ? ' No verdict. complete = verified at the head you report (no failing checks); needs_changes = defects for the repair stage. Commits go on top of the head you were given (never rewrite it).'
       : ' complete = approved at the head (no failing checks); needs_changes = request changes. The head must not move.';
   return `Return exactly one JSON object: {status: complete|needs_changes|blocked|needs_split|partial, summary, branch, ${head}, modifiedPaths[], checks[{command, outcome: pass|fail|skipped, details?}], acceptanceEvidence[{criterion, evidence}], findings[], nextAction${gate}, usage? (only when actually available)}.${rule}`;
 }

@@ -39,12 +39,12 @@ function reconfigure(env: Env, mutate: (c: MinionsConfig) => void): Env {
 }
 
 describe('no workflows configured: the built-in pipeline is unchanged', () => {
-  it('risk-based default: engineer without QA reasons goes straight to reviewing, then delivered; brief.model stays models.default', async () => {
+  it('the default: engineer goes straight to reviewing, then delivered; brief.model stays models.default', async () => {
     const env = makeDefaultEnv();
     env.backlog.add({ id: 'task-1' });
     const e = await engineer(env, 'task-1');
     expect(e.brief.model).toBe(env.config.models.default);
-    expect(e.brief.stage).toEqual({ workflow: 'default', position: 0, count: 3, role: 'engineer' });
+    expect(e.brief.stage).toEqual({ workflow: 'default', position: 0, count: 2, role: 'engineer' });
     expect(e.r).toMatchObject({ valid: true, from: 'implementing', to: 'reviewing' });
     expect(e.r.message ?? '').not.toMatch(/QA required/);
     expect((await err(env.sched.claim('task-1', 'tester'))).code).toBe('PRECONDITION');
@@ -54,8 +54,8 @@ describe('no workflows configured: the built-in pipeline is unchanged', () => {
     expect(rv.r.message).toMatch(/^Approved at [0-9a-f]{40}; delivered locally/);
   });
 
-  it('testerRequired: engineer → testing even without QA reasons, and no "QA required" message', async () => {
-    const env = makeDefaultEnv((c) => { c.verification.testerRequired = true; });
+  it('a default workflow with a tester: engineer → testing → reviewing → delivered', async () => {
+    const env = makeDefaultEnv((c) => { c.workflows = { default: ['engineer', 'tester', 'reviewer'] }; });
     env.backlog.add({ id: 'task-1' });
     const e = await engineer(env, 'task-1');
     expect(e.r).toMatchObject({ to: 'testing' });
@@ -64,19 +64,12 @@ describe('no workflows configured: the built-in pipeline is unchanged', () => {
     expect((await reviewer(env, 'task-1')).r).toMatchObject({ approved: true, to: 'delivered' });
   });
 
-  it('reviewerRequired false, no QA: engineer → delivered without approval (as before)', async () => {
+  it('reviewerRequired false: engineer → delivered without approval (as before)', async () => {
     const env = makeDefaultEnv((c) => { c.verification.reviewerRequired = false; });
     env.backlog.add({ id: 'task-1' });
     const e = await engineer(env, 'task-1');
-    expect(e.brief.stage!.count).toBe(2);
+    expect(e.brief.stage!.count).toBe(1);
     expect(e.r).toMatchObject({ to: 'delivered', approved: false });
-  });
-
-  it('reviewerRequired false with QA: engineer → testing → delivered (tester last, no approval)', async () => {
-    const env = makeDefaultEnv((c) => { c.verification.reviewerRequired = false; });
-    env.backlog.add({ id: 'task-1', labels: ['qa'] });
-    expect((await engineer(env, 'task-1')).r).toMatchObject({ to: 'testing' });
-    expect((await tester(env, 'task-1')).r).toMatchObject({ to: 'delivered', approved: false });
   });
 
   it('reviewerRequired false: an optional reviewer on a reviewing task still runs (appended stage) and approves', async () => {
@@ -85,7 +78,7 @@ describe('no workflows configured: the built-in pipeline is unchanged', () => {
     await engineer(env, 'task-1');
     env.backlog.tasks.get('task-1')!.status = 'reviewing';
     const rv = await reviewer(env, 'task-1');
-    expect(rv.brief.stage).toMatchObject({ workflow: 'default', position: 2, count: 3, role: 'reviewer' });
+    expect(rv.brief.stage).toMatchObject({ workflow: 'default', position: 1, count: 2, role: 'reviewer' });
     expect(rv.r).toMatchObject({ approved: true, to: 'delivered' });
   });
 
@@ -125,18 +118,6 @@ describe('no workflows configured: the built-in pipeline is unchanged', () => {
     expect(r).toMatchObject({ to: 'changes-requested', repairCycles: 1 });
     expect(pos(env, 'task-1')).toBe(0);
   });
-
-  it('a QA-required reviewer approval without tester evidence goes back to testing (default workflow tester, no insertion)', async () => {
-    const env = makeDefaultEnv();
-    env.backlog.add({ id: 'task-1' });
-    await engineer(env, 'task-1');
-    env.backlog.tasks.get('task-1')!.labels.push('qa');
-    const rv = await reviewer(env, 'task-1');
-    expect(rv.r).toMatchObject({ approved: false, to: 'testing' });
-    const row = env.db.taskStage('task-1')!;
-    expect(JSON.parse(row.stages_json)).toEqual([{ role: 'engineer' }, { role: 'tester', when: 'qa' }, { role: 'reviewer' }]);
-    expect(row.position).toBe(1);
-  });
 });
 
 describe('stale or mismatched task_stages rows', () => {
@@ -145,9 +126,9 @@ describe('stale or mismatched task_stages rows', () => {
     env.backlog.add({ id: 'task-1' });
     await engineer(env, 'task-1');
     env.db.exec("UPDATE task_stages SET stages_json = 'not json'");
-    expect(env.sched.stagePlan(env.backlog.tasks.get('task-1')!)).toMatchObject({ workflow: 'default', position: 2 });
+    expect(env.sched.stagePlan(env.backlog.tasks.get('task-1')!)).toMatchObject({ workflow: 'default', position: 1 });
     env.db.exec(`UPDATE task_stages SET stages_json = '[{"x":1}]'`);
-    expect(env.sched.stagePlan(env.backlog.tasks.get('task-1')!)).toMatchObject({ workflow: 'default', position: 2 });
+    expect(env.sched.stagePlan(env.backlog.tasks.get('task-1')!)).toMatchObject({ workflow: 'default', position: 1 });
     expect((await reviewer(env, 'task-1')).r).toMatchObject({ approved: true, to: 'delivered' });
   });
 
@@ -156,7 +137,7 @@ describe('stale or mismatched task_stages rows', () => {
     env.backlog.add({ id: 'task-1' });
     await engineer(env, 'task-1');
     env.db.setTaskStage('task-1', 'docs', [{ role: 'engineer' }, { role: 'reviewer' }], 1);
-    expect(env.sched.stagePlan(env.backlog.tasks.get('task-1')!)).toMatchObject({ workflow: 'default', position: 2 });
+    expect(env.sched.stagePlan(env.backlog.tasks.get('task-1')!)).toMatchObject({ workflow: 'default', position: 1 });
   });
 
   it('a workflow whose stages changed in config ignores the stored row and derives from the status', async () => {
@@ -172,7 +153,7 @@ describe('stale or mismatched task_stages rows', () => {
   });
 
   it('a status set outside the stage machine (CI sync → changes-requested) on a tester/reviewer stage routes to the engineer', async () => {
-    const env = makeDefaultEnv((c) => { c.verification.testerRequired = true; });
+    const env = makeDefaultEnv((c) => { c.workflows = { default: ['engineer', 'tester', 'reviewer'] }; });
     env.backlog.add({ id: 'task-1' });
     await engineer(env, 'task-1');
     expect(pos(env, 'task-1')).toBe(1);
@@ -209,7 +190,7 @@ describe('a workflow removed from the config', () => {
     const t = env2.backlog.tasks.get('task-1')!;
     await env2.backlog.updateTask('task-1', t.version, { workflow: null });
     const rv = await reviewer(env2, 'task-1');
-    expect(rv.brief.stage).toMatchObject({ workflow: 'default', position: 2 });
+    expect(rv.brief.stage).toMatchObject({ workflow: 'default', position: 1 });
     expect(rv.r).toMatchObject({ approved: true, to: 'delivered' });
   });
 });

@@ -37,7 +37,7 @@ export function profileDefaults(profile: Profile, ctx: ProfileContext): { config
     },
     models: { default: 'sonnet', allowed: ['sonnet', 'opus', 'haiku'], selection: 'coordinator' },
     delivery: { merge: 'disabled' },
-    verification: { commands: [], testerRequired: false, reviewerRequired: true },
+    verification: { commands: [], reviewerRequired: true },
     communication: { channel: 'auto', progress: 'milestones' },
     budgets: { taskUsd: null, dailyUsd: null },
     capabilities: defaultCapabilities(profile),

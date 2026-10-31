@@ -213,16 +213,7 @@ describe('scheduler record', () => {
     await env.sched.record(b.leaseId, result({ branch: b.branch, headSha: head }), { correction: true });
     await testerPass(env, 'task-1');
 
-    // a new commit after testing: tester evidence for the old head no longer counts
-    const newHead = commitFile(b.worktree, 'late.txt', 'late change');
-    const rev = await env.sched.claim('task-1', 'reviewer');
-    const rr = await env.sched.record(rev.leaseId, result({ branch: rev.branch, headSha: newHead, verdict: 'approve' }));
-    expect(rr).toMatchObject({ valid: true, approved: false, to: 'testing' });
-    expect(rr.message).toMatch(/no passing tester evidence/);
-    expect(env.backlog.status('task-1')).toBe('testing');
-
     // reviewer whose branch moved during review is stale
-    await testerPass(env, 'task-1');
     const rev2 = await env.sched.claim('task-1', 'reviewer');
     const moved = commitFile(b.worktree, 'during.txt', 'x');
     const r2 = await env.sched.record(rev2.leaseId, result({ branch: rev2.branch, headSha: moved, verdict: 'approve' }));

@@ -147,9 +147,9 @@ describe('codex output schema', () => {
     for (const c of ['gate', 'verifier', 'producer'] as const) expect(walkStrict(codexOutputSchema(c))).toEqual([]);
   });
 
-  it('has the WorkerResult fields; verdict and needsQa only for a gate; no usage', () => {
+  it('has the WorkerResult fields; verdict only for a gate; no usage', () => {
     const g = codexOutputSchema('gate') as { properties: Record<string, { enum?: unknown[] }> };
-    expect(Object.keys(g.properties)).toEqual(['status', 'summary', 'branch', 'headSha', 'modifiedPaths', 'checks', 'acceptanceEvidence', 'findings', 'nextAction', 'verdict', 'needsQa']);
+    expect(Object.keys(g.properties)).toEqual(['status', 'summary', 'branch', 'headSha', 'modifiedPaths', 'checks', 'acceptanceEvidence', 'findings', 'nextAction', 'verdict']);
     expect(g.properties.status!.enum).toEqual(['complete', 'needs_changes', 'blocked', 'needs_split', 'partial']);
     expect(g.properties.verdict!.enum).toEqual(['approve', 'request-changes', null]);
     const p = codexOutputSchema('producer') as { properties: Record<string, unknown> };
@@ -163,11 +163,11 @@ describe('codex output schema', () => {
     const msg = {
       status: 'complete', summary: 'Looks good.', branch: 'agent/task-1', headSha: 'a'.repeat(40), modifiedPaths: [],
       checks: [{ command: 'npm test', outcome: 'pass', details: null, source: null }, { command: 'npm run typecheck', outcome: 'pass', details: 'ok', source: 'local' }],
-      acceptanceEvidence: [{ criterion: 'works', evidence: 'test' }], findings: [], nextAction: 'merge', verdict: 'approve', needsQa: null,
+      acceptanceEvidence: [{ criterion: 'works', evidence: 'test' }], findings: [], nextAction: 'merge', verdict: 'approve', usage: null,
     };
     expect(validateResult(JSON.stringify(msg), 'gate').ok).toBe(false);
     const norm = JSON.parse(normalizeCodexResult(JSON.stringify(msg))) as Record<string, unknown> & { checks: Record<string, unknown>[] };
-    expect(norm).not.toHaveProperty('needsQa');
+    expect(norm).not.toHaveProperty('usage');
     expect(norm.checks[0]).toEqual({ command: 'npm test', outcome: 'pass' });
     expect(norm.checks[1]).toEqual({ command: 'npm run typecheck', outcome: 'pass', details: 'ok', source: 'local' });
     expect(validateResult(JSON.stringify(norm), 'gate')).toMatchObject({ ok: true });
@@ -185,7 +185,7 @@ describe('codex JSONL parser', () => {
     '{"type":"turn.started"}',
     '{"type":"item.completed","item":{"id":"item_0","type":"reasoning","text":"**Reviewing**"}}',
     '{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"bash -lc ls","aggregated_output":"a\\n","exit_code":0,"status":"completed"}}',
-    '{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"{\\"status\\":\\"complete\\",\\"verdict\\":\\"approve\\",\\"needsQa\\":null}"}}',
+    '{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"{\\"status\\":\\"complete\\",\\"verdict\\":\\"approve\\",\\"usage\\":null}"}}',
     '{"type":"turn.completed","usage":{"input_tokens":24763,"cached_input_tokens":24448,"output_tokens":122}}',
   ];
 

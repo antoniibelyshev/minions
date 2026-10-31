@@ -137,22 +137,19 @@ const DECLARED: readonly DeclaredSetting[] = [
   // ---- Verification
   // Shell commands may contain commas: entries are separated with ';' (task-136: the runtime can request them).
   { key: 'verification.commands', group: 'Verification', label: 'Verification commands', type: 'list', separator: ';', apply: 'live',
-    description: 'commands that verify a change (stages, local integration); \';\'-separated',
+    description: 'the fast tier (unit tests, typecheck, lint): run on every engineer head before review and on the merged tree before it lands; \';\'-separated',
     loosens: (f, t) => {
       const to = Array.isArray(t) ? (t as string[]) : [];
       const dropped = (Array.isArray(f) ? (f as string[]) : []).filter((c) => !to.includes(c));
       return dropped.length ? `changes are verified without ${dropped.map((c) => `\`${c}\``).join(', ')}` : null;
     } },
   { key: 'verification.setupCommands', group: 'Verification', label: 'Integration setup commands', type: 'list', separator: ';', optional: true, apply: 'live',
-    description: 'local integration: dependency install before verifying, e.g. npm ci; \';\'-separated',
+    description: 'dependency install before verifying, e.g. npm ci; \';\'-separated',
     loosens: (f, t) => {
       const from = Array.isArray(f) ? (f as string[]) : [];
       const added = (Array.isArray(t) ? (t as string[]) : []).filter((c) => !from.includes(c));
-      return added.length ? `the local integrator runs ${added.map((c) => `\`${c}\``).join(', ')} in the integration worktree` : null;
+      return added.length ? `the runtime runs ${added.map((c) => `\`${c}\``).join(', ')} in its verification worktrees` : null;
     } },
-  { key: 'verification.testerRequired', group: 'Verification', label: 'Tester on every task', type: 'bool', apply: 'prompt',
-    description: 'true: every task gets a tester stage; false: only tasks that need QA (labels, sensitive paths, reviewer request)',
-    loosens: turnsOff('tasks without a QA need are delivered without a tester stage') },
   { key: 'verification.reviewerRequired', group: 'Verification', label: 'Reviewer required', type: 'bool', apply: 'prompt',
     description: 'whether every task needs an independent reviewer approval before delivery',
     loosens: turnsOff('tasks can be delivered without a reviewer approval') },

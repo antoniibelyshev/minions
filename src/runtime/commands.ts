@@ -74,6 +74,7 @@ import { formatSessionsIndex, handoverSession, runGateway, sessionsIndex, setSes
 import { heldBySession, recordSent, sendToSession, sessionKeyOf, threadReplyTarget, type ReplyContext } from './router.js';
 import { runSupervisor, startSupervisorWatch, supervisorEnv, supervisorLockState, type SupervisorReport, type SupervisorTaskDeps } from './supervisor.js';
 import { adoptIntegrationBase, runIntegrator, startIntegratorDetached, type IntegratorReport } from './integrator.js';
+import { worktreeVerifier } from './verify-step.js';
 import { collectIntegrationStatus, humanIntegration, kickInputs, kickIntegratorIfNeeded, startIntegrationWatch, type IntegrationStatus } from './integration-status.js';
 import { verifyAnyApproval } from '../core/approval.js';
 import { recoverTaskSession, taskSessionPass, type TaskSessionDeps } from './task-sessions.js';
@@ -910,6 +911,7 @@ export function register(program: Command): void {
         workerAlive: async (rec) => rec.pid !== null && (rec.procStart ? isAlive({ pid: rec.pid, startTime: rec.procStart }) : pidAlive(rec.pid)),
         stopWorker: async (rec) => { if (rec.pid !== null && rec.procStart && await isAlive({ pid: rec.pid, startTime: rec.procStart })) { try { process.kill(-rec.pid, 'SIGTERM'); } catch { /* gone */ } } },
         procStart: async (pid) => (await procIdentity(pid))?.startTime ?? null,
+        verify: worktreeVerifier({ repo: paths.repo, dir: paths.verify, runDir: join(paths.state, 'run', 'verify'), logDir: join(paths.logs, 'verify') }),
         log,
       });
       emit(r, { json: globalOpts(cmd).json, human: (x: typeof r) => `dispatcher: ${x.exit} (${x.passes} passes)` });

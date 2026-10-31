@@ -27,7 +27,7 @@ const pilot = (): MinionsConfig => {
     ...c,
     harnesses: { default: 'codex', codex: { models: { default: 'gpt-test', allowed: ['gpt-test'] } } },
     roles: { 'codex-reviewer': { description: 'Second review.', promptText: 'Review.', contract: 'gate', harness: 'codex' } },
-    workflows: { default: ['engineer', { role: 'tester', when: 'qa' }, 'reviewer', 'codex-reviewer'] },
+    workflows: { default: ['engineer', 'reviewer', 'codex-reviewer'] },
   }, 'test');
 };
 

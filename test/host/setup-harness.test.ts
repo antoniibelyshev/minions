@@ -105,7 +105,7 @@ describe('setup: which agent does the work', () => {
     const local = localOf(r);
     expect(local.harnesses).toEqual({ default: 'codex', codex: { models: { default: 'gpt-pilot', allowed: ['gpt-pilot'] } } });
     expect(local.roles['codex-reviewer']).toMatchObject({ contract: 'gate', harness: 'codex' });
-    expect(local.workflows).toEqual({ default: ['engineer', { role: 'tester', when: 'qa' }, 'reviewer', 'codex-reviewer'] });
+    expect(local.workflows).toEqual({ default: ['engineer', 'reviewer', 'codex-reviewer'] });
     expect(r.localConfig.changed).toEqual(expect.arrayContaining(['harnesses.default', 'harnesses.codex', 'roles.codex-reviewer', 'workflows']));
     expect(readFileSync(projectConfigPath(await loadProjectJson(r.projectId)), 'utf8')).not.toContain('codex');
 
@@ -205,15 +205,15 @@ describe('setup: which agent does the work', () => {
 });
 
 describe('withPilotStage', () => {
-  const cfg = (v: Partial<{ testerRequired: boolean; reviewerRequired: boolean }>) => {
+  const cfg = (v: Partial<{ reviewerRequired: boolean }>) => {
     const c = defaults();
     Object.assign(c.verification, v);
     c.roles = { 'codex-reviewer': H.pilotRole() } as never;
     return c;
   };
   it('goes after the last reviewer stage of the derived default, or at the end without one; null when present', () => {
-    expect(H.withPilotStage(cfg({ testerRequired: true }), 'default')).toEqual(['engineer', 'tester', 'reviewer', 'codex-reviewer']);
-    expect(H.withPilotStage(cfg({ reviewerRequired: false }), 'default')).toEqual(['engineer', { role: 'tester', when: 'qa' }, 'codex-reviewer']);
+    expect(H.withPilotStage(cfg({}), 'default')).toEqual(['engineer', 'reviewer', 'codex-reviewer']);
+    expect(H.withPilotStage(cfg({ reviewerRequired: false }), 'default')).toEqual(['engineer', 'codex-reviewer']);
     const c = cfg({});
     c.workflows = { x: ['engineer', { role: 'reviewer', model: 'sonnet' }, 'codex-reviewer'] };
     expect(H.withPilotStage(c, 'x')).toBeNull();

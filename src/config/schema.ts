@@ -199,15 +199,13 @@ export const HarnessesSchema = z.object({
 }).strict();
 export type HarnessesConfig = z.infer<typeof HarnessesSchema>;
 
-/** Conditions of a conditional workflow stage (D5): `qa` = run only when the task needs QA. */
-export const STAGE_WHEN = ['qa'] as const;
 /**
- * One workflow stage (D5): a role name, or `{ role, when?, model? }`; `model` is a model hint validated against the
+ * One workflow stage (D5): a role name, or `{ role, model? }`; `model` is a model hint validated against the
  * stage role's harness (models.allowed for claude). A hint never names a harness (agent-runtimes D8).
  */
 export const WorkflowStageSchema = z.union([
   nonEmpty,
-  z.object({ role: nonEmpty, when: z.enum(STAGE_WHEN).optional(), model: modelId.optional() }).strict(),
+  z.object({ role: nonEmpty, model: modelId.optional() }).strict(),
 ]);
 export type WorkflowStageConfig = z.infer<typeof WorkflowStageSchema>;
 /**
@@ -296,18 +294,25 @@ export const MinionsConfigSchema = z.object({
     integrationTimeoutMinutes: z.number().int().min(1).optional(),
   }).strict(),
   verification: z.object({
+    /**
+     * The fast tier (docs/design/autonomy.md Decision 12): unit tests, typecheck, lint. The dispatcher runs them on
+     * every producer head before the reviewer, and the local integrator on the merged tree before it lands.
+     */
     commands: z.array(nonEmpty),
     /**
-     * Local integration: commands that install dependencies in the integration worktree before
-     * verification.commands (for example `npm ci`). Run only when they or the lockfile changed since the last
-     * successful setup; a failure is transient. Default [].
+     * Commands that install dependencies in a verification worktree before the commands (for example `npm ci`).
+     * Run only when they or the lockfile changed since the last successful setup; a failure is transient. Default [].
      */
     setupCommands: z.array(nonEmpty).optional(),
-    /** true: every task gets a tester stage (the old flow). false: only tasks that need QA (qaLabels, sensitive paths, reviewer needsQa). */
-    testerRequired: z.boolean(),
     reviewerRequired: z.boolean(),
-    /** Labels that opt a task into a tester stage; the first is added when the runtime records a QA need. Default ["qa"]. */
-    qaLabels: z.array(nonEmpty).min(1).optional(),
+    /**
+     * The slow tier (Decision 12): run by the dispatcher on the base head every `everyHours` (default 24) when the
+     * base moved since the last run, and on the head of a task labelled `verify:full`. A failure becomes one backlog task.
+     */
+    periodic: z.object({
+      commands: z.array(nonEmpty).min(1),
+      everyHours: z.number().positive().optional(),
+    }).strict().optional(),
   }).strict(),
   communication: z.object({
     /** "auto": Telegram when a bot token is stored and the runtime supports it, else terminal (src/telegram/channel.ts). */

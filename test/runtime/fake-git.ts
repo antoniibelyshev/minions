@@ -135,6 +135,10 @@ export function fakeGit(cwd0: string, args0: string[]): RunResult {
     case 'rev-parse': {
       if (flags.includes('--is-inside-work-tree')) return ok('true\n');
       if (flags.includes('--abbrev-ref')) return ok(`${wt.branch ?? 'HEAD'}\n`);
+      if (pos[0]?.endsWith('^{tree}')) {
+        const sha = resolveRef(repo, wt, pos[0].slice(0, -'^{tree}'.length));
+        return sha ? ok(`${createHash('sha1').update(JSON.stringify(Object.entries(repo.commits.get(sha)!.tree).sort())).digest('hex')}\n`) : fail('', 1);
+      }
       const sha = resolveRef(repo, wt, pos[0] ?? 'HEAD');
       return sha ? ok(`${sha}\n`) : fail(flags.includes('--quiet') ? '' : `fatal: bad revision '${pos[0]}'`, flags.includes('--quiet') ? 1 : 128);
     }

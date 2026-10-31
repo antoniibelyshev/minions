@@ -1,7 +1,8 @@
 /**
  * Workflow model (docs/design/roles-and-workflows.md D5-D7): a task runs an ordered list of stages, each a
  * worker role from the registry (src/config/roles.ts). The default workflow is derived from the
- * verification settings and equals the built-in pipeline (engineer -> tester on QA -> reviewer); a project
+ * verification settings (engineer -> reviewer; the dispatcher's verify step runs between them: docs/design/autonomy.md
+ * Decision 12); a project
  * may configure named workflows (and replace `default`). These are pure functions over the config; the
  * scheduler (src/runtime/scheduler.ts) keeps the per-task position in the `task_stages` table.
  */
@@ -14,10 +15,10 @@ import { type MinionsConfig, type RoleContract, type WorkflowStageConfig } from 
 export const DEFAULT_WORKFLOW = 'default';
 
 /**
- * A resolved stage. `inserted` marks a stage the runtime added to the configured list: the built-in tester
- * of invariant 3 (`qa`) or, for a legacy task whose status names a stage its workflow lacks, `legacy`.
+ * A resolved stage. `inserted` marks a stage the runtime added to the configured list for a legacy task whose
+ * status names a stage its workflow lacks.
  */
-export interface Stage { role: string; when?: 'qa'; model?: string; inserted?: 'qa' | 'legacy' }
+export interface Stage { role: string; model?: string; inserted?: 'legacy' }
 /**
  * How a flow ends (docs/design/autonomy.md Decision 2): the trailing `ci` / `merge` markers of a configured list.
  * Absent (no marker) = the delivery settings decide, as before. With markers: `merge` = the approved head lands (local
@@ -43,15 +44,11 @@ type WfCfg = Pick<MinionsConfig, 'verification' | 'execution' | 'models'> & Part
 const own = <T>(obj: Record<string, T> | undefined, key: string): T | undefined => (obj && Object.hasOwn(obj, key) ? obj[key] : undefined);
 
 export const normalizeStage = (s: WorkflowStageConfig): Stage =>
-  typeof s === 'string' ? { role: s } : { role: s.role, ...(s.when ? { when: s.when } : {}), ...(s.model ? { model: s.model } : {}) };
+  typeof s === 'string' ? { role: s } : { role: s.role, ...(s.model ? { model: s.model } : {}) };
 
-/** The derived default (D5): engineer, tester (always with testerRequired, else on QA), reviewer when required. */
+/** The derived default (D5): engineer, then the reviewer when required. */
 export function derivedDefaultWorkflow(cfg: Pick<MinionsConfig, 'verification'>): Stage[] {
-  return [
-    { role: 'engineer' },
-    cfg.verification.testerRequired ? { role: TESTER_ROLE } : { role: TESTER_ROLE, when: 'qa' },
-    ...(cfg.verification.reviewerRequired ? [{ role: REVIEWER_ROLE }] : []),
-  ];
+  return [{ role: 'engineer' }, ...(cfg.verification.reviewerRequired ? [{ role: REVIEWER_ROLE }] : [])];
 }
 
 /** Workflow names a task may be assigned: `default` plus the configured ones. */
@@ -78,22 +75,11 @@ export function finalGateIndex(cfg: WfCfg, stages: Stage[]): number {
   return -1;
 }
 
-/**
- * Invariant 3 (D5): with QA required, a runnable verifier must run after `position` and before the final
- * gate (or before the end when the final gate is not ahead). Returns the stages with the built-in tester
- * inserted there when none does, else the stages unchanged.
- */
-export function withQaTester(cfg: WfCfg, stages: Stage[], position: number): Stage[] {
+/** A legacy `testing` task without a testing stage: the built-in tester inserted before the final gate. */
+function withLegacyTester(cfg: WfCfg, stages: Stage[]): { stages: Stage[]; position: number } {
   const gate = finalGateIndex(cfg, stages);
-  const end = gate > position ? gate : stages.length;
-  for (let i = position + 1; i < end; i++) if (contractOf(cfg, stages[i]!) === 'verifier') return stages;
-  return [...stages.slice(0, end), { role: TESTER_ROLE, inserted: 'qa' }, ...stages.slice(end)];
-}
-
-/** The next runnable stage after `position` (`when: qa` stages run only with QA reasons); null = workflow finished. */
-export function nextRunnable(stages: Stage[], position: number, qaRequired: boolean): number | null {
-  for (let i = position + 1; i < stages.length; i++) if (stages[i]!.when !== 'qa' || qaRequired) return i;
-  return null;
+  const at = gate >= 0 ? gate : stages.length;
+  return { stages: [...stages.slice(0, at), { role: TESTER_ROLE, inserted: 'legacy' }, ...stages.slice(at)], position: at };
 }
 
 /**
@@ -143,8 +129,8 @@ export function statusesAt(cfg: WfCfg, stages: Stage[], position: number): TaskS
 /**
  * Position of a task without a stage row (legacy tasks, or a status changed outside the stage machine), from
  * its status (D6): ready / changes-requested / implementing = the first producer; otherwise the first stage
- * whose stageStatus is the status. A `testing` task whose workflow has no testing stage gets the inserted
- * tester (invariant 3); a `reviewing` one without a reviewing stage gets the built-in reviewer appended (the
+ * whose stageStatus is the status. A `testing` task whose workflow has no testing stage (one from before the
+ * verify step, docs/design/autonomy.md Decision 12) gets the built-in tester inserted; a `reviewing` one without a reviewing stage gets the built-in reviewer appended (the
  * optional reviewer of a config without reviewerRequired). null = no stage can run from this status.
  */
 export function derivePosition(cfg: WfCfg, stages: Stage[], status: TaskStatus): { stages: Stage[]; position: number } | null {
@@ -154,11 +140,7 @@ export function derivePosition(cfg: WfCfg, stages: Stage[], status: TaskStatus):
   }
   const i = stages.findIndex((s) => stageStatusOf(cfg, s) === status && contractOf(cfg, s) !== 'producer');
   if (i >= 0) return { stages, position: i };
-  if (status === 'testing') {
-    const withTester = withQaTester(cfg, stages, 0);
-    const at = withTester.findIndex((s) => s.inserted === 'qa');
-    if (at >= 0) return { stages: withTester, position: at };
-  }
+  if (status === 'testing') return withLegacyTester(cfg, stages);
   if (status === 'reviewing') return { stages: [...stages, { role: REVIEWER_ROLE, inserted: 'legacy' }], position: stages.length };
   return null;
 }
@@ -219,30 +201,13 @@ export function workflowConfigIssues(c: MinionsConfig): ConfigIssue[] {
 }
 
 /**
- * Where a gate that needs QA evidence sends the task (D6): the nearest verifier stage between the last
- * producer before the gate and the gate; without one, the built-in tester inserted right before the gate.
- */
-export function verifierBefore(cfg: WfCfg, stages: Stage[], position: number): { stages: Stage[]; position: number } {
-  for (let i = position - 1; i >= 0; i--) {
-    const c = contractOf(cfg, stages[i]!);
-    if (c === 'verifier') return { stages, position: i };
-    if (c === 'producer') break;
-  }
-  return { stages: [...stages.slice(0, position), { role: TESTER_ROLE, inserted: 'qa' }, ...stages.slice(position)], position };
-}
-
-/**
  * The stage a lease of `role` runs when no stage row names it (a lease claimed before task_stages existed):
  * the first stage of that role, else the inserted tester / appended reviewer of derivePosition.
  */
 export function positionForRole(cfg: WfCfg, stages: Stage[], role: string): { stages: Stage[]; position: number } {
   const i = stages.findIndex((s) => s.role === role);
   if (i >= 0) return { stages, position: i };
-  if (role === TESTER_ROLE) {
-    const withTester = withQaTester(cfg, stages, 0);
-    const at = withTester.findIndex((s) => s.inserted === 'qa');
-    if (at >= 0) return { stages: withTester, position: at };
-  }
+  if (role === TESTER_ROLE) return withLegacyTester(cfg, stages);
   return { stages: [...stages, { role, inserted: 'legacy' }], position: stages.length };
 }
 

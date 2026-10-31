@@ -481,7 +481,7 @@ describe('drain partials (record + re-dispatch)', () => {
   });
 
   it('a reviewer drain partial keeps the task in reviewing; the rerun review gets the resume note', async () => {
-    const env = makeEnv((c) => { c.verification.testerRequired = false; });
+    const env = makeEnv((c) => { delete c.workflows; });
     env.backlog.add({ id: 'task-1' });
     const e = await env.sched.claim('task-1', 'engineer');
     const head = commitFile(e.worktree, 'a.txt', 'x');

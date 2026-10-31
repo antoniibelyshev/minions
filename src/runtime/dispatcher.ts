@@ -18,6 +18,10 @@
 // - Leases it claims have holder `dispatcher`; the coordinator's restart and wake rules ignore them (they are not its
 //   subagents).
 // - Budget, pause and drain apply (Scheduler.next reports them as startsBlocked).
+// - Verify step (Decision 12): a gate stage starts only on a head whose verification passed (Scheduler.verificationDue).
+//   The dispatcher runs it through deps.verify (./verify-step.ts) instead of claiming, one run at a time, and records it
+//   with Scheduler.settleVerification. With the slot free it runs verification.periodic on the base head when due.
+//   Without deps.verify (tests of other paths) nothing is verified.
 import { readFile, rm, readdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { MinionsConfig } from '../config/schema.js';
@@ -29,6 +33,9 @@ import { DEFAULT_TICK_SECONDS, DISPATCH_EVENT, dispatchSettings, readHolds, writ
 import { claimWithBrief, compactClaim, recordSubmitted, type CompactClaim, type HandoffPaths } from './handoff.js';
 import type { NextStage, RecordResponse, Scheduler } from './scheduler.js';
 import { hostIdentity, procIdentity } from './runner/record.js';
+import { verifyTimeoutMs } from './integrator.js';
+import { periodicDue, settlePeriodic, type Verifier } from './verify-step.js';
+import { headOf } from './worktree.js';
 import type { StopReason } from './runner/supervise.js';
 import { supervisorAlive, systemLockView, type LockProcessView } from './supervisor.js';
 
@@ -104,12 +111,16 @@ export interface DispatcherDeps {
   stopWorker?(r: DispatchRunRecord): Promise<void>;
   /** The start time of a just-spawned worker, for its run record. */
   procStart?(pid: number): Promise<string | null>;
+  /** Runs verification commands on a commit (production: verify-step.ts worktreeVerifier). Omitted: no verify step. */
+  verify?: Verifier;
   now?(): Date;
   log?(line: string): void;
 }
 
 export interface PassReport {
   started: { taskId: string; role: string; leaseId: string }[];
+  /** The verification started this pass: a task id, or `periodic` for the base head. */
+  verifying: string | null;
   held: string[];
   cleared: string[];
   blocked: string | null;
@@ -126,6 +137,8 @@ export class Dispatcher {
   private readonly settling = new Set<Promise<void>>();
   /** Tasks whose worker ended and whose result is being recorded: never claimed again until it is (no second worker). */
   private readonly recording = new Set<string>();
+  /** The one verification running now (a task id, or `periodic`). */
+  private verifying: string | null = null;
   constructor(private readonly d: DispatcherDeps) {}
 
   private now = () => (this.d.now ?? (() => new Date()))();
@@ -230,7 +243,7 @@ export class Dispatcher {
   /** One pass: clear resolved holds, then claim and start every runnable stage within the limits. */
   async pass(): Promise<PassReport> {
     const cfg = await this.d.config();
-    const report: PassReport = { started: [], held: [], cleared: [], blocked: null };
+    const report: PassReport = { started: [], verifying: null, held: [], cleared: [], blocked: null };
     await this.reapAdopted(cfg);
     const sched = await this.d.scheduler(cfg);
     report.cleared = await this.clearResolved(sched);
@@ -238,9 +251,22 @@ export class Dispatcher {
     report.held = Object.keys(holds);
     const next = await sched.next();
     if (next.startsBlocked) { report.blocked = next.startsBlocked.message; return report; }
-    const busy = new Set([...this.active().map((r) => r.taskId), ...this.recording]);
+    const busy = new Set([...this.active().map((r) => r.taskId), ...this.recording, ...(this.verifying ? [this.verifying] : [])]);
     for (const stage of next.runnable) {
       if (holds[stage.taskId] || busy.has(stage.taskId)) continue;
+      if (this.d.verify) {
+        // A gate starts only on a verified head: verify first (one run at a time; the others wait for the slot).
+        let due: Awaited<ReturnType<Scheduler['verificationDue']>>;
+        try { due = await sched.verificationDue(stage.taskId, stage.role); } catch (e) {
+          this.log(`dispatch: verify check of ${stage.taskId} failed: ${(e as Error).message}`);
+          continue;
+        }
+        if (due) {
+          if (!this.verifying) { this.startVerify(cfg, stage.taskId, due.head, due.commands); report.verifying = stage.taskId; }
+          busy.add(stage.taskId);
+          continue;
+        }
+      }
       let claim: CompactClaim;
       try {
         claim = compactClaim(await claimWithBrief(sched, this.d.paths, stage.taskId, stage.role, { holder: DISPATCH_HOLDER }));
@@ -263,7 +289,43 @@ export class Dispatcher {
         report.started.push({ taskId: stage.taskId, role: stage.role, leaseId: claim.leaseId });
       } else report.held.push(stage.taskId);
     }
+    if (this.d.verify && !this.verifying && await this.startPeriodicIfDue(cfg, sched)) report.verifying = 'periodic';
     return report;
+  }
+
+  /** Runs `work` in the verification slot, tracked like an exit (settled() awaits it). */
+  private occupy(id: string, work: () => Promise<void>): void {
+    this.verifying = id;
+    const p = work().catch((e) => this.log(`dispatch: verification ${id} failed: ${(e as Error).message}`))
+      .finally(() => { this.verifying = null; this.settling.delete(p); });
+    this.settling.add(p);
+  }
+
+  private startVerify(cfg: MinionsConfig, taskId: string, head: string, commands: string[]): void {
+    this.log(`dispatch: verifying ${taskId} at ${head.slice(0, 12)} (${commands.join('; ')})`);
+    this.occupy(taskId, async () => {
+      const v = await this.d.verify!({ key: taskId, head, commands, setupCommands: cfg.verification.setupCommands ?? [], timeoutMs: verifyTimeoutMs(cfg), shouldStop: () => !!this.d.db.drain() });
+      const now = await this.d.config();
+      const sched = await this.d.scheduler(now);
+      const out = await sched.settleVerification(taskId, head, commands, v);
+      this.log(`dispatch: ${taskId}: ${out.message}`);
+      if (out.hold) await this.hold(now, sched, { taskId, kind: out.hold.kind, message: out.hold.message, leaseId: null });
+    });
+  }
+
+  /** Starts the periodic run of verification.periodic on the base head when it is due (verify-step.ts). */
+  private async startPeriodicIfDue(cfg: MinionsConfig, sched: Scheduler): Promise<boolean> {
+    const p = cfg.verification.periodic;
+    if (!p || this.d.db.drain()) return false;
+    const base = await headOf(sched.layout.repo, cfg.git.baseBranch).catch(() => null);
+    if (!base || !periodicDue(this.d.db, cfg, base, this.now())) return false;
+    this.log(`dispatch: periodic verification of ${cfg.git.baseBranch} at ${base.slice(0, 12)} (${p.commands.join('; ')})`);
+    this.occupy('periodic', async () => {
+      const v = await this.d.verify!({ key: 'periodic', head: base, commands: p.commands, setupCommands: cfg.verification.setupCommands ?? [], timeoutMs: verifyTimeoutMs(cfg), shouldStop: () => !!this.d.db.drain() });
+      const taskId = await settlePeriodic({ db: this.d.db, backlog: sched.backlog, cfg, now: this.now() }, base, v);
+      this.log(`dispatch: periodic verification at ${base.slice(0, 12)}: ${v.state}${taskId ? ` (${taskId} created)` : ''}`);
+    });
+    return true;
   }
 
   private async start(cfg: MinionsConfig, sched: Scheduler, stage: NextStage, claim: CompactClaim, corrections: number, correction?: LaunchInput['correction']): Promise<boolean> {
