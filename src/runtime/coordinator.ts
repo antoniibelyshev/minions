@@ -844,11 +844,11 @@ export async function runCoordinator(cfg: MinionsConfig, deps: RunCoordinatorDep
   const ownServer = decision.enabled && decision.server === 'minions';
   const launchId = ownServer ? (deps.newLaunchId ?? randomUUID)() : undefined;
   const channelServer = ownServer && launchId ? channelServerLaunch(paths, launchId) : undefined;
-  if (ownServer) log(`minions: ${DEV_CHANNELS_DIALOG_NOTE}.`);
   // Coordinator sessions with the minions channel server: the gateway replaces the router claude (docs/design/autonomy.md
   // Decision 7); no model holds the chat.
   const gateway = isGatewayLaunch(cfg, decision) && channelServer ? channelServer : null;
   if (gateway) log('minions: coordinator sessions on: the Telegram gateway routes owner messages (no router model).');
+  else if (ownServer) log(`minions: ${DEV_CHANNELS_DIALOG_NOTE}.`);
   const c = gateway ? { cmd: gateway.command, args: ['telegram', 'gateway'], cwd: paths.workspace }
     : await buildClaudeCommand(cfg, paths, { telegram: decision.enabled, startupPrompt: deps.startupPrompt, permissionModes, ...(channelServer ? { channelServer } : {}) });
   if (cancelled() !== null) return cancelled()!;
