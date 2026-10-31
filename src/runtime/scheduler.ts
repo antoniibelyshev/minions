@@ -518,7 +518,14 @@ export class Scheduler {
     const row = this.db.taskStage(task.id);
     if (!row) return null;
     const wf = this.workflowOf(task);
-    if (row.workflow === wf.name || !wf.stages.length) return null;
+    if (!wf.stages.length) return null;
+    if (row.workflow === wf.name) {
+      // A live edit of the same workflow (docs/design/autonomy.md Decision 2) resets like a new workflow only when the
+      // stage the task waits for was removed; otherwise the stage list is re-read in place (stagePlan, leaseStage).
+      const stored = parseStages(row.stages_json);
+      const waiting = stored?.[row.position];
+      if (!stored || !waiting || waiting.inserted || sameStages(configuredStages(stored), wf.stages) || wf.stages.some((x) => x.role === waiting.role)) return null;
+    }
     if (!(['ready', 'changes-requested', 'implementing', 'testing', 'reviewing'] as TaskStatus[]).includes(task.status)) return null;
     const head = await headOf(this.layout.repo, this.branchForTask(task).branch);
     if (!head) return null;
@@ -562,8 +569,11 @@ export class Scheduler {
   private leaseStage(task: Task, lease: Lease): StagePlan {
     const row = this.db.taskStage(task.id);
     const stages = row ? parseStages(row.stages_json) : null;
-    if (row && stages && stages[row.position]?.role === lease.role) return { workflow: row.workflow, stages, position: row.position };
     const wf = resolveWorkflow(this.config, task.workflow) ?? resolveWorkflow(this.config, null)!;
+    // A live edit of the same workflow (docs/design/autonomy.md Decision 2: `control set workflows.<name>`) applies
+    // from the next stage: the lease's role is placed in the current stage list unless that list no longer has it.
+    const edited = !!row && !!stages && row.workflow === wf.name && !sameStages(configuredStages(stages), wf.stages) && wf.stages.some((s) => s.role === lease.role);
+    if (row && stages && stages[row.position]?.role === lease.role && !edited) return { workflow: row.workflow, stages, position: row.position };
     return { workflow: wf.name, ...positionForRole(this.config, wf.stages, lease.role) };
   }
 

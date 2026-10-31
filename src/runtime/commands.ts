@@ -1,5 +1,6 @@
 import { readFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { spawn as nodeSpawn } from 'node:child_process';
+import { dirname, join } from 'node:path';
 import { Option, type Command } from 'commander';
 import { setIdempotencyStore, setIntakePausedContext, setProvenanceFallback, setReadyContext } from '../backlog/commands.js';
 import { openBacklog, writeBacklogConfig } from '../backlog/factory.js';
@@ -9,10 +10,10 @@ import { isGithubDelivery } from '../config/delivery.js';
 import type { MinionsConfig } from '../config/schema.js';
 import { action, globalOpts, requireMode, runtimeMode } from '../core/cli-helpers.js';
 import { displayText, stripControlChars, truncateCodePoints } from '../core/control-chars.js';
-import { existsSync, writeSync } from 'node:fs';
+import { closeSync, existsSync, mkdirSync, openSync, writeSync } from 'node:fs';
 import { EXIT_CODES, MinionsError, type ErrorCode } from '../core/errors.js';
 import { readJson } from '../core/fsutil.js';
-import { emit, reportError } from '../core/output.js';
+import { emit, redact, reportError } from '../core/output.js';
 import { approveOnHost } from '../host/approvals.js';
 import { delegateToRuntime } from '../host/delegate.js';
 import { applyDoctorExit, formatDoctor, runDoctor } from '../host/doctor.js';
@@ -70,11 +71,14 @@ import { SANDBOX_BIN } from './sandbox/rules.js';
 import { HARNESS_PROMPTS_DIR } from '../plugin/generate.js';
 import { PROCESS_ADAPTERS } from './runner/adapters.js';
 import { reapRun, recoverRuns, runLease, type ReapDeps, type RecoverySweep, type RunOutput } from './runner/run.js';
-import { hasOpenRun, openRunsSync, withOpenRuns } from './runner/record.js';
+import { hasOpenRun, isAlive, openRunsSync, procIdentity, withOpenRuns } from './runner/record.js';
+import { clearHold, DISPATCH_HOLDER, dispatcherLockState, dispatchMode, readHolds, runDispatcher, type DispatchHold } from './dispatcher.js';
+import { launchWorker } from './dispatch-launch.js';
 import { liveRun, liveRunExitCode, type LiveRunReport } from './headless.js';
-import { buildSessionCommand, sessionsSettings } from './sessions.js';
+import { buildSessionCommand, sessionConfigDir, sessionsSettings } from './sessions.js';
+import { enqueueInbox, openSession } from './session-store.js';
 import { heldBySession, recordSent, resolveRoute, sendToSession, sessionKeyOf, waitForOutbound, type RouteResult, type WaitResult } from './router.js';
-import { runSupervisor, startSupervisorWatch, supervisorLockState, type SupervisorReport, type SupervisorTaskDeps } from './supervisor.js';
+import { runSupervisor, startSupervisorWatch, supervisorEnv, supervisorLockState, type SupervisorReport, type SupervisorTaskDeps } from './supervisor.js';
 import { adoptIntegrationBase, runIntegrator, startIntegratorDetached, type IntegratorReport } from './integrator.js';
 import { collectIntegrationStatus, humanIntegration, kickInputs, kickIntegratorIfNeeded, startIntegrationWatch, type IntegrationStatus } from './integration-status.js';
 import { verifyAnyApproval } from '../core/approval.js';
@@ -216,8 +220,11 @@ function notifySession(explicit: string | undefined): string | null {
  * under the supervisor, so they never block a router restart, reset or digest wake. Live runs still count every lease.
  */
 export function leaseBlockers<T extends { id: string }>(d: Pick<RuntimeDb, 'lease'>, leases: () => T[], o: { exceptSessions?: boolean } = {}): () => T[] {
-  if (!o.exceptSessions) return leases;
-  return () => leases().filter((l) => !heldBySession(d.lease(l.id.split(' ')[0]!)?.holder));
+  // The dispatcher's workers (docs/design/autonomy.md Decision 1) are never the coordinator's: they run on without it.
+  return () => leases().filter((l) => {
+    const holder = d.lease(l.id.split(' ')[0]!)?.holder;
+    return holder !== DISPATCH_HOLDER && !(o.exceptSessions && heldBySession(holder));
+  });
 }
 
 /** `minions sync`: intake (full sync only), then PR/CI observations with the auto-merge pass (the runtime's own gates). */
@@ -339,6 +346,51 @@ export function wrapperIntegrationWatch(_cfg: MinionsConfig, log: (line: string)
 export function wrapperSupervisorWatch(cfg: MinionsConfig, log: (line: string) => void): () => void {
   const paths = runtimePaths();
   return startSupervisorWatch(cfg, { state: paths.state, log: join(paths.logs, 'supervisor.log'), tmp: paths.tmp, lockState: () => supervisorLockState(getDb()), say: log });
+}
+
+/**
+ * A dispatcher hold reaches the coordinator (docs/design/autonomy.md Decision 1): with sessions on, the task's own
+ * session gets it in its inbox (and is opened); otherwise the routine's wake reasons and the Stop hook pick up the
+ * `dispatch-decision` event and the hold itself.
+ */
+function notifyHold(d: RuntimeDb, hold: DispatchHold, cfg: MinionsConfig): void {
+  if (!sessionsSettings(cfg).enabled) return;
+  const key = `task:${hold.taskId}`;
+  const paths = runtimePaths();
+  openSession(d, key, { configDir: sessionConfigDir(paths, key) });
+  enqueueInbox(d, key, DISPATCH_HOLDER, `minions dispatcher: ${hold.taskId} needs your decision (${hold.kind}): ${hold.message}${hold.errors?.length ? `\nerrors:\n${hold.errors.map((e) => `- ${e}`).join('\n')}` : ''}\nHandle it (claim, update or split the task), then \`minions work autopilot resume ${hold.taskId}\` if the status did not change.`);
+}
+
+/** The wrapper's dispatcher watch: with dispatch.mode auto (re-read every check: the mode is live) it keeps `minions work dispatch` running. */
+export function wrapperDispatchWatch(_cfg: MinionsConfig, log: (line: string) => void): () => void {
+  const paths = runtimePaths();
+  let lastStart = -Infinity;
+  const check = async () => {
+    try {
+      if (dispatchMode(await loadRuntimeConfig()) !== 'auto') return;
+      const s = dispatcherLockState(getDb());
+      if (s.state === 'live' || Date.now() - lastStart < 30_000) return;
+      lastStart = Date.now();
+      const pid = spawnDetachedMinions(['work', 'dispatch'], { cwd: paths.state, log: join(paths.logs, 'dispatcher.log'), env: supervisorEnv(process.env, paths.tmp) });
+      log(`minions: started the dispatcher (pid ${pid ?? '?'}; output: ${join(paths.logs, 'dispatcher.log')})`);
+    } catch (e) { log(`minions: could not start the dispatcher: ${redact((e as Error).message).slice(0, 300)}`); }
+  };
+  void check();
+  const h = setInterval(() => { void check(); }, 20_000);
+  h.unref?.();
+  return () => clearInterval(h);
+}
+
+/** Spawns `minions <args>` detached with output appended to `log`; returns its pid. */
+function spawnDetachedMinions(args: string[], o: { cwd: string; log: string; env: Record<string, string> }): number | null {
+  mkdirSync(dirname(o.log), { recursive: true });
+  const fd = openSync(o.log, 'a', 0o600);
+  try {
+    const child = nodeSpawn('minions', args, { cwd: o.cwd, detached: true, stdio: ['ignore', fd, fd], env: o.env });
+    child.on('error', () => { /* the next check sees no live lock and tries again */ });
+    child.unref();
+    return child.pid ?? null;
+  } finally { try { closeSync(fd); } catch { /* the child holds its own copy */ } }
 }
 
 function logRecovery(r: RecoverySweep, log: (line: string) => void): void {
@@ -888,6 +940,49 @@ export function register(program: Command): void {
         ? `integrator: already running (pid ${x.holder?.pid ?? '?'})`
         : `integrator: ${x.exit} (${x.settled.map((s) => `${s.taskId} ${s.phase}`).join(', ') || 'nothing settled'}${x.recovered.length ? `; ${x.recovered.length} recovered` : ''}${x.waiting.length ? `; waiting: ${x.waiting.map((w) => `${w.taskId} on ${w.on.join(', ')}`).join('; ')}` : ''})` });
     }));
+  work.command('dispatch', { hidden: true }).description('Internal: the autopilot dispatcher the wrapper starts detached with dispatch.mode auto; claims runnable stages, runs each as a headless worker, records results and hands decisions to the coordinator (docs/design/autonomy.md Decision 1)')
+    .action(action(async (_o: unknown, cmd: Command) => {
+      requireMode('runtime');
+      const stop = new AbortController();
+      for (const sig of ['SIGTERM', 'SIGINT'] as const) process.once(sig, () => stop.abort());
+      const paths = runtimePaths();
+      const d = getDb();
+      const log = (line: string) => process.stdout.write(`${new Date().toISOString()} ${redact(line)}\n`);
+      const r = await runDispatcher({
+        db: d, paths, signal: stop.signal,
+        config: () => loadRuntimeConfig(),
+        scheduler: async (cfg) => new Scheduler({ config: cfg, db: d, backlog: await getBacklog(), layout: workspaceLayout(), handoff: paths, runs: { state: paths.state, reap: (leaseId) => reapRun(leaseId, reapDeps()) } }),
+        launch: launchWorker(d, { paths, log }),
+        taskStatus: async (_s, taskId) => (await (await getBacklog()).getTask(taskId)).status,
+        notify: (hold, cfg) => notifyHold(d, hold, cfg),
+        workerAlive: (rec) => isAlive(rec.pid !== null && rec.procStart ? { pid: rec.pid, startTime: rec.procStart } : null),
+        procStart: async (pid) => (await procIdentity(pid))?.startTime ?? null,
+        log,
+      });
+      emit(r, { json: globalOpts(cmd).json, human: (x: typeof r) => `dispatcher: ${x.exit} (${x.passes} passes)` });
+    }));
+  const autopilot = work.command('autopilot').description('The autopilot dispatcher (dispatch.mode auto): what it runs, which tasks wait for your decision, and resume a task after you handled it');
+  autopilot.command('status').description('Mode, the dispatcher process, its running workers and the held tasks (each with the decision it needs)')
+    .action(action(async (_o: unknown, cmd: Command) => {
+      requireMode('runtime');
+      const d = getDb();
+      const cfg = await getConfig();
+      const lock = dispatcherLockState(d);
+      const workers = d.activeLeases().filter((l) => l.holder === DISPATCH_HOLDER).map((l) => ({ leaseId: l.id, taskId: l.task_id, role: l.role, startedAt: l.started_at }));
+      const holds = Object.values(readHolds(d));
+      const r = { mode: dispatchMode(cfg), dispatcher: lock.state, pid: lock.lock?.pid ?? null, workers, holds };
+      emit(r, { json: globalOpts(cmd).json, human: (x: typeof r) => [
+        `dispatch mode ${x.mode}; dispatcher ${x.dispatcher}${x.pid ? ` (pid ${x.pid})` : ''}`,
+        ...x.workers.map((w) => `  running ${w.taskId} ${w.role} (${w.leaseId}) since ${w.startedAt}`),
+        ...x.holds.map((h) => `  held ${h.taskId}: ${h.kind}: ${h.message}`),
+      ].join('\n') });
+    }));
+  autopilot.command('resume <taskId>').description('Clear the hold of a task once you handled its decision (a hold also clears itself when the task status changes or you claim a stage)')
+    .action(action(async (taskId: string, _o: unknown, cmd: Command) => {
+      requireMode('runtime');
+      const cleared = clearHold(getDb(), taskId, 'coordinator: work autopilot resume');
+      emit({ taskId, cleared }, { json: globalOpts(cmd).json, human: () => cleared ? `${taskId}: the dispatcher picks it up again.` : `${taskId} was not held.` });
+    }));
   work.command('list').description('List active leases')
     .option('--all', 'include ended leases')
     .action(action(async (o: { all?: boolean }, cmd: Command) => {
@@ -1021,6 +1116,7 @@ export function register(program: Command): void {
         routineClock: wrapperRoutineClock,
         supervisorWatch: wrapperSupervisorWatch,
         integrationWatch: wrapperIntegrationWatch,
+        dispatchWatch: wrapperDispatchWatch,
         onStart: async (c, l, stop) => {
           // D3b: no process run of the previous session outlives it. Every record that is not done is reaped
           // (cancel or kill, escapee sweep, wip: checkpoint) before anything else touches its scratch dir.

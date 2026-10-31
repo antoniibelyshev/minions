@@ -1182,6 +1182,29 @@
       },
       "additionalProperties": false
     },
+    "dispatch": {
+      "type": "object",
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "coordinator"
+          ]
+        },
+        "workerTimeoutMinutes": {
+          "type": "integer",
+          "minimum": 5,
+          "maximum": 1440
+        },
+        "tickSeconds": {
+          "type": "integer",
+          "minimum": 2,
+          "maximum": 600
+        }
+      },
+      "additionalProperties": false
+    },
     "permissionMode": {
       "type": "string",
       "enum": [

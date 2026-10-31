@@ -139,7 +139,7 @@ export const systemLockView: LockProcessView = lockViewFor();
  * time, and its command line is `minions coordinator supervise` (/proc, or `ps` on macOS). When none of these can be
  * read a live pid counts as the holder (a second supervisor is refused, nothing is signalled).
  */
-export function supervisorAlive(l: SupervisorLock, pc: LockProcessView = systemLockView): boolean {
+export function supervisorAlive(l: SupervisorLock, pc: LockProcessView = systemLockView, cmdline: RegExp = SUPERVISOR_CMDLINE): boolean {
   if (!pc.alive(l.pid)) return false;
   const boot = pc.bootId();
   if (l.bootId && boot && l.bootId !== boot) return false;
@@ -148,7 +148,7 @@ export function supervisorAlive(l: SupervisorLock, pc: LockProcessView = systemL
     if (s !== null && s !== l.start) return false;
   }
   const cmd = pc.cmdline(l.pid);
-  return cmd === null || SUPERVISOR_CMDLINE.test(cmd);
+  return cmd === null || cmdline.test(cmd);
 }
 
 export type SupervisorLockState = { state: 'none'; lock: null } | { state: 'live' | 'stale'; lock: SupervisorLock };

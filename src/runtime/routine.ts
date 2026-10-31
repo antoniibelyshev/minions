@@ -24,6 +24,7 @@ import { lastOwnerMessageAt } from './coordinator-usage.js';
 import { TRANSCRIPT_META } from './context-reset.js';
 import { localDayStart } from './zoned-time.js';
 import type { TaskSessionPass } from './task-sessions.js';
+import { dispatchMode, readHolds } from './dispatch-state.js';
 
 export const ROUTINE_DEFAULTS = { tickMinutes: 15, minWakeGapMinutes: 30, maxWakesPerDay: 8, digestAt: ['08:00'] as readonly string[], timezone: 'Europe/Berlin' } as const;
 /** The main transcript must be idle this long before a wake (the prompt cache has expired by then). */
@@ -71,6 +72,8 @@ export type WakeReason =
   | { kind: 'unvalidated'; taskId: string; leaseId: string; detail: string }
   | { kind: 'needs-split'; taskId: string; leaseId: string; detail: string }
   | { kind: 'awaiting-human'; taskId: string; detail: string }
+  /** The autopilot dispatcher holds a task for a decision (docs/design/autonomy.md Decision 1). */
+  | { kind: 'dispatch-decision'; taskId: string; detail: string }
   /** The digest is due (phase 4 composes it): always allowed, also at 100% budget and past maxWakesPerDay. */
   | { kind: 'digest'; detail: string };
 
@@ -191,9 +194,12 @@ export function fileMtime(path: string): number | null {
  * plus what happened while the coordinator was idle (since `since`): an unvalidated result, a needs_split result, a
  * task that reached awaiting-human. Things the coordinator did itself happen inside its turns, before `since`.
  */
-export function collectWakeReasons(db: RuntimeDb, next: Pick<NextReport, 'runnable'> | null, since: string | null): WakeReason[] {
+export function collectWakeReasons(db: RuntimeDb, next: Pick<NextReport, 'runnable'> | null, since: string | null, o: { dispatchAuto?: boolean } = {}): WakeReason[] {
   const out: WakeReason[] = [];
-  for (const r of next?.runnable ?? []) out.push({ kind: 'runnable', taskId: r.taskId, role: r.role, detail: `${r.taskId} ${r.role} runnable` });
+  // With the autopilot dispatcher on, runnable stages are its job; the tasks it holds are the coordinator's.
+  if (o.dispatchAuto) {
+    for (const h of Object.values(readHolds(db))) out.push({ kind: 'dispatch-decision', taskId: h.taskId, detail: `${h.taskId} needs a decision (${h.kind}): ${h.message.slice(0, 120)}` });
+  } else for (const r of next?.runnable ?? []) out.push({ kind: 'runnable', taskId: r.taskId, role: r.role, detail: `${r.taskId} ${r.role} runnable` });
   if (!since) return out;
   for (const l of db.all<{ id: string; task_id: string; status: string; result_json: string | null }>(
     "SELECT id, task_id, status, result_json FROM leases WHERE ended_at >= ? AND status IN ('unvalidated', 'completed') ORDER BY ended_at", since)) {
@@ -354,7 +360,7 @@ export async function runRoutinePass(deps: RoutinePassDeps, opts: { trigger: Rou
         report.sessions = { opened: p.opened.map((o) => o.key), closed: p.closed.map((x) => x.key), refused: p.refused.slice(0, 20) };
       } catch (e) { report.sessions = { error: msg(e) }; }
     }
-    const reasons = settings.enabled && c.running && !sessionsOn ? collectWakeReasons(deps.db, next, since) : [];
+    const reasons = settings.enabled && c.running && !sessionsOn ? collectWakeReasons(deps.db, next, since, { dispatchAuto: dispatchMode(deps.config) === 'auto' }) : [];
     const digest = settings.enabled ? deps.digestDue?.(deps.now()) ?? null : null;
     // Sessions on and the router running: its background `coordinator wait` returns for the digest, so no restart.
     if (digest && !(sessionsOn && c.running)) reasons.push({ kind: 'digest', detail: digest });

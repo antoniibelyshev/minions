@@ -1198,6 +1198,11 @@ export interface CoordinatorWrapperDeps extends RunCoordinatorDeps {
    * start, a dead holder). The CLI passes wrapperIntegrationWatch (src/runtime/commands.ts). Returns its stop function.
    */
   integrationWatch?: (cfg: MinionsConfig, log: (line: string) => void) => () => void;
+  /**
+   * The autopilot dispatcher watch (docs/design/autonomy.md Decision 1): keeps `minions work dispatch` running while
+   * dispatch.mode is auto (a live setting: it re-reads it). The CLI passes wrapperDispatchWatch. Returns its stop function.
+   */
+  dispatchWatch?: (cfg: MinionsConfig, log: (line: string) => void) => () => void;
 }
 
 /**
@@ -1216,6 +1221,7 @@ export async function coordinatorWrapper(loadConfig: () => Promise<MinionsConfig
   let stopClock: (() => void) | undefined;
   let stopWatch: (() => void) | undefined;
   let stopIntegration: (() => void) | undefined;
+  let stopDispatch: (() => void) | undefined;
   const store = (): CoordinatorLockStore => deps.lock ?? (db ??= openDb(paths.db));
   let code: number;
   try {
@@ -1253,6 +1259,9 @@ export async function coordinatorWrapper(loadConfig: () => Promise<MinionsConfig
       if (deps.integrationWatch) {
         try { stopIntegration = deps.integrationWatch(cfg, log); } catch (e) { log(`minions: the integration watch did not start: ${redact((e as Error).message).slice(0, 300)}`); }
       }
+      if (deps.dispatchWatch) {
+        try { stopDispatch = deps.dispatchWatch(cfg, log); } catch (e) { log(`minions: the dispatcher watch did not start: ${redact((e as Error).message).slice(0, 300)}`); }
+      }
       return runCoordinator(cfg, { ...deps, preSpawn: g });
     })();
     // Errors still reach us through the race; after a pre-spawn signal a late one no longer matters.
@@ -1266,6 +1275,7 @@ export async function coordinatorWrapper(loadConfig: () => Promise<MinionsConfig
     try { stopClock?.(); } catch { /* best effort */ }
     try { stopWatch?.(); } catch { /* best effort */ }
     try { stopIntegration?.(); } catch { /* best effort */ }
+    try { stopDispatch?.(); } catch { /* best effort */ }
     guard?.dispose();
     if (held) { try { store().releaseCoordinatorLock(held.session, held.pid); } catch { /* a dead holder is taken over next time */ } }
     db?.close();

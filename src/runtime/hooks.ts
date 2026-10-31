@@ -17,6 +17,7 @@ import { capacityOf, scopeOf } from './scheduler.js';
 import { currentBudget } from './spend.js';
 import { noteTranscript, resetBarrier } from './context-reset.js';
 import { trackCoordinatorUsage } from './coordinator-usage.js';
+import { dispatchMode, readHolds } from './dispatch-state.js';
 import { hookScope } from './session-scope.js';
 import { sessionStopGuard } from './session-stop.js';
 import { scanShell, ShellParseError, type ShellScan } from './shell-scan.js';
@@ -96,6 +97,17 @@ export async function stopHook(input: unknown, load: HookLoader, env: NodeJS.Pro
   try {
     // Coordinator sessions on (phase 7): task sessions dispatch, so the single coordinator is never kept running for it.
     if (config.coordinator?.sessions?.enabled === true) return allow('sessions-on', 'coordinator sessions are on: task sessions dispatch');
+    // The autopilot dispatcher runs the stages (docs/design/autonomy.md Decision 1): only its held decisions keep the
+    // coordinator going, under the same no-progress limit.
+    if (dispatchMode(config) === 'auto') {
+      const holds = Object.values(readHolds(db));
+      if (!holds.length) return allow('dispatcher', 'the autopilot dispatcher runs the stages; no decision waits');
+      const fp = sha256(JSON.stringify({ holds: holds.map((h) => `${h.taskId}:${h.kind}:${h.at}`).sort() }));
+      const g = db.guard();
+      if (g.fingerprint === fp && g.count >= NO_PROGRESS_LIMIT) return { reason: 'allow: no-progress (the held decisions are unchanged after repeated continuation)' };
+      db.setGuard({ fingerprint: fp, count: g.fingerprint === fp ? g.count + 1 : 1, last_reason: 'dispatch-decisions' });
+      return block(`minions: the dispatcher holds ${holds.length} task(s) for your decision: ${holds.slice(0, 5).map((h) => `${h.taskId} (${h.kind})`).join(', ')}. See \`minions work autopilot status --json\`; handle each, then \`minions work autopilot resume <taskId>\` if its status did not change. If you cannot decide, ask the owner and stop.`);
+    }
     if (db.paused().starts) return allow('paused');
     if (currentBudget({ db, config })?.exhausted) return allow('budget', 'the owner budget is used up (new claims are refused)');
     // The reset barrier (task-57.6): new starts are held until the running workers return, so nothing is left to dispatch.

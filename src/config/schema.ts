@@ -449,6 +449,18 @@ export const MinionsConfigSchema = z.object({
     autoPromote: z.record(z.string(), z.unknown()).optional(),
   }).strict().optional(),
   /**
+   * The autopilot dispatcher (docs/design/autonomy.md Decision 1; src/runtime/dispatcher.ts): `auto` = a deterministic
+   * process claims runnable stages, runs each as a headless worker, records the result and hands only decisions to the
+   * coordinator; `coordinator` = the coordinator dispatches every stage itself (as before). Unset = coordinator.
+   */
+  dispatch: z.object({
+    mode: z.enum(['auto', 'coordinator']).optional(),
+    /** Wall-clock limit of one headless worker in minutes (default 120). */
+    workerTimeoutMinutes: z.number().int().min(5).max(24 * 60).optional(),
+    /** Seconds between dispatcher passes (default 10). */
+    tickSeconds: z.number().int().min(2).max(600).optional(),
+  }).strict().optional(),
+  /**
    * Legacy coordinator permission mode. Only "default" is still honoured (as a stricter choice) when
    * coordinator.permissionMode is unset; "acceptEdits" and "auto" mean the default (auto).
    */

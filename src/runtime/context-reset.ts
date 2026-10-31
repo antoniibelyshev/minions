@@ -3,7 +3,7 @@ import type { MinionsConfig } from '../config/schema.js';
 import { MinionsError } from '../core/errors.js';
 import { atomicWrite } from '../core/fsutil.js';
 import { redact } from '../core/output.js';
-import type { RuntimeDb } from './db.js';
+import { DISPATCH_HOLDER, type RuntimeDb } from './db.js';
 import { withOpenRuns } from './runner/record.js';
 import { scopedMetaKey, sessionScope, type SessionScope } from './session-scope.js';
 
@@ -342,7 +342,9 @@ export function contextResetCheck(deps: ContextResetDeps): ContextResetCheck {
   const blockers: string[] = [];
   if (!settings.enabled) blockers.push('context resets are off (coordinator.contextReset.enabled)');
   // The workers a restart would count (the restart refuses while any exist): active leases, plus unfinished runs.
-  const leases = deps.state !== undefined ? withOpenRuns(() => db.activeLeases(), deps.state)() : db.activeLeases();
+  // Dispatcher workers (docs/design/autonomy.md Decision 1) are not the coordinator's: they never block its reset.
+  const own = (l: { id: string }) => db.lease(l.id.split(' ')[0]!)?.holder !== DISPATCH_HOLDER;
+  const leases = (deps.state !== undefined ? withOpenRuns(() => db.activeLeases(), deps.state)() : db.activeLeases()).filter(own);
   if (leases.length) blockers.push(`${leases.length} active worker lease(s) (${leases.map((l) => l.id).join(', ')})`);
   const draining = !!db.drain();
   if (draining) blockers.push('a drain is in progress (the upgrade restarts the coordinator itself)');
