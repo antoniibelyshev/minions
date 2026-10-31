@@ -12,7 +12,7 @@ export const SUPPORTED = {
 
 /** Features deferred in v0.1; doctor and the wizard report them as unavailable. */
 export const DEFERRED_FEATURES = [
-  'config plan/apply transactions', 'backlog migration', 'upgrade plan and schema migration', 'budgets',
+  'config plan/apply transactions', 'backlog migration', 'upgrade plan and schema migration',
   'companion containers', 'shared backlog versioned in Git',
 ] as const;
 
@@ -31,7 +31,6 @@ export function listUnavailable(config: MinionsConfig): Unavailable[] {
     const why = autoMergeConfigReasons(config);
       if (why.length) out.push({ path: 'delivery.merge', value: config.delivery.merge, reason: `local integration is unavailable: ${why.join('; ')}` });
   }
-  if (config.budgets.taskUsd !== null || config.budgets.dailyUsd !== null) out.push({ path: 'budgets', value: config.budgets, reason: 'budgets are not enforced in v0.1' });
   return out;
 }
 

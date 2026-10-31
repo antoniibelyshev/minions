@@ -181,8 +181,14 @@ export interface ControlDeps {
   /** The config below the overlay (the runtime config the host resolved). */
   base: MinionsConfig;
   actor?: string;
+  /** The owner's own change (the Telegram gateway's `/budget`): may touch OWNER_ONLY_KEYS. */
+  owner?: boolean;
   now?: () => Date;
 }
+
+/** Keys only the owner changes (docs/design/autonomy.md Decision 13): the coordinator never raises its own spend caps. */
+export const OWNER_ONLY_KEYS = ['budgets'];
+export const ownerOnlyKey = (key: string) => OWNER_ONLY_KEYS.some((k) => key === k || key.startsWith(k + '.'));
 
 function checkReason(reason: string): string {
   const r = reason.trim();
@@ -199,6 +205,8 @@ async function commit(d: ControlDeps, op: ControlOp, reason: string, change: (cu
     const next = change(cur.config);
     const keys = changedKeys(cur.config, next);
     if (!keys.length) return { revision: cur.revision, op, keys: [], message: `No change (control revision ${cur.revision}).` };
+    const owned = d.owner ? [] : keys.filter(ownerOnlyKey);
+    if (owned.length) throw new MinionsError('POLICY_DENIED', `Only the owner changes ${owned.join(', ')}.`, 'The owner sets the spend caps with /budget in Telegram; leave them out of the change.');
     // Validate against the real base: an invalid overlay is never written.
     applyControl(d.base, next, `control ${op} (${keys.slice(0, 3).join(', ')}${keys.length > 3 ? ', ...' : ''})`);
     const at = (d.now ?? (() => new Date()))().toISOString();

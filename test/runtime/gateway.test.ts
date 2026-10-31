@@ -6,9 +6,10 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { MinionsConfig } from '../../src/config/schema.js';
 import { RuntimeDb } from '../../src/runtime/db.js';
 import { isGatewayLaunch } from '../../src/runtime/coordinator.js';
-import { deliverDue, formatSessionsIndex, handoverSession, routeInbound, sessionsIndex, setSessionTopic, writeSessionsIndex, type GatewayDeps } from '../../src/runtime/gateway.js';
+import { BUDGET_USAGE, deliverDue, formatSessionsIndex, handoverSession, parseBudgetCommand, routeInbound, sessionsIndex, setSessionTopic, writeSessionsIndex, type GatewayDeps } from '../../src/runtime/gateway.js';
 import { enqueue } from '../../src/runtime/outbox.js';
 import { getSession, pendingInbox } from '../../src/runtime/session-store.js';
+import { readJournal, withControl } from '../../src/runtime/control.js';
 import { defaults } from '../helpers.js';
 import { tmp } from './fixtures.js';
 
@@ -70,6 +71,59 @@ describe('gateway: inbound', () => {
     const down = gateway(at(1), { failSend: true });
     expect(await deliverDue(down.d)).toEqual({ sent: [], failed: 'status:thread:300:1' });
     expect(db.get<{ attempts: number }>("SELECT attempts FROM outbox WHERE dedup_key = 'status:thread:300:1'")?.attempts).toBe(1);
+  });
+});
+
+describe('gateway: /budget', () => {
+  it('parses show, day and task with an amount or off; anything else is usage', () => {
+    expect(parseBudgetCommand('/budget')).toEqual({ kind: 'show' });
+    expect(parseBudgetCommand(' /budget@minions_bot ')).toEqual({ kind: 'show' });
+    expect(parseBudgetCommand('/budget day 25')).toEqual({ kind: 'set', key: 'dailyUsd', usd: 25 });
+    expect(parseBudgetCommand('/budget daily $7.5')).toEqual({ kind: 'set', key: 'dailyUsd', usd: 7.5 });
+    expect(parseBudgetCommand('/budget task off')).toEqual({ kind: 'set', key: 'taskUsd', usd: null });
+    expect(parseBudgetCommand('/budget task 0')).toMatchObject({ kind: 'usage' });
+    expect(parseBudgetCommand('/budget task -3')).toMatchObject({ kind: 'usage' });
+    expect(parseBudgetCommand('/budget week 5')).toMatchObject({ kind: 'usage' });
+    expect(parseBudgetCommand('/budget day')).toMatchObject({ kind: 'usage' });
+    expect(parseBudgetCommand('/budgets')).toBeNull();
+    expect(parseBudgetCommand('raise the /budget day 50')).toBeNull();
+    expect(parseBudgetCommand('(edited) /budget day 50')).toBeNull();
+  });
+
+  const budgetGateway = (owner: string | null) => {
+    const g = gateway();
+    g.d.controlBase = async () => cfg();
+    g.d.billing = 'api-key';
+    if (owner !== null) g.d.isOwner = async (id) => id === owner;
+    return g;
+  };
+
+  it('the paired owner changes a cap: written to the control overlay as the owner, confirmed, never routed to a session', async () => {
+    const { d, sent } = budgetGateway('42');
+    expect(await routeInbound(d, msg('/budget day 20', { message_id: '700', user_id: '42' }))).toEqual({ command: 'budget' });
+    expect(sent[0]).toMatchObject({ kind: 'text', replyTo: 700 });
+    expect(sent[0]!.text).toMatch(/^Daily cap set to \$20 \(control revision 1; applies to the next claim\)\.\nToday \(UTC\): ~\$0\.00 est\. \(0 tok\) of daily cap \$20\.\nPer-task cap: off\./);
+    expect(withControl(cfg(), state).budgets).toEqual({ dailyUsd: 20, taskUsd: null });
+    expect(readJournal(state)[0]).toMatchObject({ actor: 'owner (telegram)', keys: ['budgets.dailyUsd'] });
+    expect(getSession(db, 'thread:700')).toBeNull();
+    await routeInbound(d, msg('/budget day off', { message_id: '701', user_id: '42' }));
+    expect(withControl(cfg(), state).budgets.dailyUsd).toBeNull();
+    await routeInbound(d, msg('/budget', { message_id: '702', user_id: '42' }));
+    expect(sent[2]!.text).toContain('of daily cap off');
+  });
+
+  it('refuses a change from anyone but the paired owner (or without an owner check), and a poll vote is never a command', async () => {
+    for (const [owner, user] of [['42', '43'], [null, '42']] as const) {
+      const { d, sent } = budgetGateway(owner);
+      expect(await routeInbound(d, msg('/budget task 1', { message_id: '710', user_id: user }))).toEqual({ command: 'budget' });
+      expect(sent[0]!.text).toBe('Only the paired owner changes the budget.');
+      expect(readJournal(state)).toEqual([]);
+    }
+    const { d, sent } = budgetGateway('42');
+    await routeInbound(d, msg('/budget week 3', { message_id: '711', user_id: '42' }));
+    expect(sent[0]!.text).toBe(`unknown cap "week". ${BUDGET_USAGE}`);
+    expect(await routeInbound(d, msg('/budget day 999', { poll_id: 'p9', message_id: '712', user_id: '42' }))).not.toEqual({ command: 'budget' });
+    expect(readJournal(state)).toEqual([]);
   });
 });
 

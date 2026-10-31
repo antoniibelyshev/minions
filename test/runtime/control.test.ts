@@ -35,6 +35,18 @@ describe('control overlay', () => {
     expect(resolveWorkflow(cfg, "research")!.stages.map((s) => s.role)).toEqual(['researcher', 'reviewer']);
   });
 
+  it('budgets.* are owner-only: the coordinator\'s set, apply or undo touching them is refused', async () => {
+    await expect(controlSet(deps(), 'budgets.dailyUsd', 500, 'more room')).rejects.toMatchObject({ code: 'POLICY_DENIED' });
+    await expect(controlApply(deps(), { budgets: { taskUsd: null } }, 'uncap')).rejects.toMatchObject({ code: 'POLICY_DENIED' });
+    const c = await controlSet({ ...deps(), owner: true, actor: 'owner (telegram)' }, 'budgets.dailyUsd', 20, 'owner: /budget day $20');
+    expect(c.keys).toEqual([{ key: 'budgets.dailyUsd', appliesOn: 'next-command', hostOwned: true }]);
+    expect(withControl(defaults(), state).budgets.dailyUsd).toBe(20);
+    await expect(controlUndo(deps(), 'revert')).rejects.toMatchObject({ code: 'POLICY_DENIED' });
+    // Other keys stay the coordinator's, with the owner's caps in the overlay.
+    await controlSet(deps(), 'execution.maxActiveTasks', 2, 'fewer');
+    expect(withControl(defaults(), state).budgets.dailyUsd).toBe(20);
+  });
+
   it('refuses an invalid change and writes nothing', async () => {
     await expect(controlSet(deps(), 'workflows.docs', ['nobody'], 'typo')).rejects.toMatchObject({ code: 'INVALID_CONFIG' });
     expect(readOverlay(state).revision).toBe(0);

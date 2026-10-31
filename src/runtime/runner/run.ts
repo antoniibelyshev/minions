@@ -130,7 +130,7 @@ export async function assertRunAllowed(leaseId: string, deps: RunnerDeps): Promi
     const drain = db.drain();
     throw deny(drain ? `Starts are paused for a drain (${drain.reason}).` : 'Starts are paused (paused_starts).', drain ? undefined : 'Run `minions resume` to allow new work.');
   }
-  assertBudgetAllowsStart({ db, billing: deps.billing ?? billingOf(), config, now: (deps.now ?? (() => new Date()))() });
+  assertBudgetAllowsStart({ db, billing: deps.billing ?? billingOf(), config, now: (deps.now ?? (() => new Date()))() }, lease.task_id);
   const others = active.filter((l) => l.id !== leaseId);
   const otherTasks = new Set(others.map((l) => l.task_id).filter((t) => t !== lease.task_id));
   if (otherTasks.size >= config.execution.maxActiveTasks) throw deny(`Active task limit reached without this lease (${otherTasks.size}/${config.execution.maxActiveTasks}).`);

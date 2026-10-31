@@ -22,7 +22,7 @@ import { corruptRecordHint, hasOpenRun, readRunRecord, removeRunRecord } from '.
 import { sessionScope } from './session-scope.js';
 import { missingApprovalKeyReason, runtimePaths } from './paths.js';
 import { normalizeCheckCommand, resultContractText, validateResult, type WorkerResult } from './results.js';
-import { assertBudgetAllowsStart, billingOf, budgetNotice, latestLeaseUsage, recordLeaseUsage, tokensFromResultUsage, type Billing, type BudgetNotice, type SpendContext } from './spend.js';
+import { assertBudgetAllowsStart, billingOf, usdCaps, budgetNotice, latestLeaseUsage, recordLeaseUsage, tokensFromResultUsage, type Billing, type BudgetNotice, type SpendContext } from './spend.js';
 import { gateGit } from './git-hardening.js';
 import { enqueueIntegration, FLAKY_OUTCOME, integrationRows, openIntegration, startIntegratorDetached, type IntegrationRow } from './integrator.js';
 import { enqueue as enqueueNotice } from './outbox.js';
@@ -154,7 +154,7 @@ export interface WaitingStage extends NextStage {
    * harness-capacity: the phase cap on process-harness producers (agent-runtimes D9); requires: a stage capability not allowed;
    * small-task-slot: the last engineer slot is kept for a runnable `small` task (task-97).
    */
-  waitingOn: 'starts' | 'capacity' | 'role-capacity' | 'harness-capacity' | 'requires' | 'small-task-slot';
+  waitingOn: 'starts' | 'budget' | 'capacity' | 'role-capacity' | 'harness-capacity' | 'requires' | 'small-task-slot';
   why: string;
 }
 
@@ -626,8 +626,10 @@ export class Scheduler {
     const smallReady = ordered.filter((c) => isEngineer(c.role) && smallTask(c.taskId)).map((c) => c.taskId);
     const laneCap = engMax >= 2 && smallReady.length ? engMax - 1 : null;
     let bigEngineers = leases.filter((l) => isEngineer(l.role) && !smallTask(l.task_id)).length;
+    const caps = usdCaps(this.spendContext());
     for (const c of ordered) {
       if (startsBlocked) { waiting.push({ ...c, waitingOn: 'starts', why: startsBlocked.message }); continue; }
+      if (caps.enforced && caps.task.atCap.includes(c.taskId)) { waiting.push({ ...c, waitingOn: 'budget', why: `per-task spend cap ($${caps.task.capUsd}) reached` }); continue; }
       if (!active.has(c.taskId) && active.size >= cfg.execution.maxActiveTasks) {
         waiting.push({ ...c, waitingOn: 'capacity', why: `active task limit (${active.size}/${cfg.execution.maxActiveTasks})` }); continue;
       }
@@ -723,7 +725,7 @@ export class Scheduler {
   }
 
   /** Refuses new starts while paused, draining or over the owner budget (claim; `work next` reports the same). */
-  private assertStartsAllowed(): void {
+  private assertStartsAllowed(taskId?: string): void {
     if (this.db.paused().starts) {
       const drain = this.db.drain();
       if (drain) {
@@ -733,7 +735,7 @@ export class Scheduler {
       throw new MinionsError('POLICY_DENIED', 'Starts are paused (paused_starts).', 'Run `minions resume` to allow new work.');
     }
     // Owner budget used up: refuse new claims (running leases continue and are recorded as usual).
-    assertBudgetAllowsStart(this.spendContext());
+    assertBudgetAllowsStart(this.spendContext(), taskId);
   }
 
   /**
@@ -751,7 +753,7 @@ export class Scheduler {
     // task's stages; the router and the general session never claim (decisions 3 and 4).
     const scope = sessionScope();
     if (scope && scope.kind !== 'task') throw new MinionsError('POLICY_DENIED', `The ${scope.key} session never claims stages.`, 'Task stages are claimed by their task session (`task:<id>`).');
-    this.assertStartsAllowed();
+    this.assertStartsAllowed(taskId);
     role ??= await this.stageRole(taskId);
     const def = exactWorkerRole(cfg, role);
     if (!def) throw new MinionsError('INVALID_CONFIG', `Unknown role "${String(role).slice(0, 40)}" (${workerRoleNames(cfg).join('|')}).`);
