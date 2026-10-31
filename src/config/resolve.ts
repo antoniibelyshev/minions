@@ -72,7 +72,7 @@ export function validateConfig(raw: unknown, source?: string): MinionsConfig {
   return r.data;
 }
 
-export type Source = 'default' | 'project' | 'local' | 'session';
+export type Source = 'default' | 'project' | 'local' | 'control' | 'session';
 export interface EffectiveConfig { config: MinionsConfig; provenance: Record<string, Source> }
 export interface ResolveInput {
   defaults: MinionsConfig;
@@ -245,7 +245,17 @@ function checkHostOnlyChoices(project: MinionsConfig, label: string): void {
   }
 }
 
-/** defaults < project < local < session. Returns the validated config with per-leaf provenance. */
+/**
+ * A resolved config with the coordinator's control overlay on top (docs/design/autonomy.md Decision 3). The runtime
+ * applies it to the config the host resolved; it is trusted like the local layer but without the deny-preservation
+ * check (the owner gave the coordinator full control).
+ */
+export function applyControl(base: MinionsConfig, control: unknown, label = 'control overlay'): MinionsConfig {
+  if (control === undefined) return base;
+  return validateConfig(overlay(base as unknown as Obj, control, 'control', {}, label), label);
+}
+
+/** defaults < project < local < session (the runtime adds control, applyControl). Returns the validated config with per-leaf provenance. */
 export function resolve(input: ResolveInput): EffectiveConfig {
   const label = (s: Source) => input.sources?.[s] ?? `${s} configuration`;
   const prov: Record<string, Source> = {};

@@ -13,6 +13,8 @@ import { TASK_STATUSES, type ProvenanceFallback } from './backlogmd.js';
 import { MemoryIdempotencyStore, openBacklog } from './factory.js';
 import { assertIntakeOpen } from './intake.js';
 import type { BacklogAdapter, IdempotencyStore, Provenance, ScopeFilter, Task, TaskStatus } from './types.js';
+import { withControl } from '../runtime/control.js';
+import { runtimePaths } from '../runtime/paths.js';
 
 // ---------------------------------------------------------------- hooks set by the runtime
 
@@ -34,9 +36,9 @@ export function setProvenanceFallback(fn: ProvenanceFallback | undefined): void 
 
 // ---------------------------------------------------------------- config + adapter
 
-/** Reads the effective config: env MINIONS_CONFIG, default /opt/minions/config/config.json. */
+/** Reads the effective config: env MINIONS_CONFIG, default /opt/minions/config/config.json, plus the control overlay. */
 export async function loadRuntimeConfig(path = process.env.MINIONS_CONFIG || containerPaths().configJson): Promise<MinionsConfig> {
-  return validateConfig(await readJson(path), path);
+  return withControl(validateConfig(await readJson(path), path), runtimePaths().state);
 }
 
 async function open(): Promise<{ cfg: MinionsConfig; backlog: BacklogAdapter }> {

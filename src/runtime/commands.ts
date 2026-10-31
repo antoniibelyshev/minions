@@ -47,6 +47,7 @@ import { runHook } from './hooks.js';
 import { completeOpenSessions, noteResetRequest } from './coordinator-usage.js';
 import { budgetNotice, humanBaseline, humanSpend, parseTokens, recordLeaseUsage, recordSessionUsage, setBudget, spendReport, type SpendReport } from './spend.js';
 import { runtimePaths } from './paths.js';
+import { controlApply, controlSet, controlShow, controlUndo, controlUnset, parseValue, readJournal, withControl, type ControlChange } from './control.js';
 import { contextResetCheck, HANDOFF_MAX_BYTES, humanContextReset, readHandoff, TRANSCRIPT_META, withContextReset, writeHandoff, type ContextResetCheck } from './context-reset.js';
 import { handoffPathFor, sessionScope } from './session-scope.js';
 export { withContextReset } from './context-reset.js';
@@ -109,7 +110,7 @@ function resetRuntimeHandles(): void {
 
 /** Effective config from MINIONS_CONFIG (default /opt/minions/config/config.json), strictly validated. */
 export async function loadRuntimeConfig(path = runtimePaths().configJson): Promise<MinionsConfig> {
-  return validateConfig(await readJson(path), path);
+  return withControl(validateConfig(await readJson(path), path), runtimePaths().state);
 }
 async function getConfig(): Promise<MinionsConfig> { return (config ??= await loadRuntimeConfig()); }
 
@@ -619,6 +620,64 @@ export function register(program: Command): void {
     setIntakePausedContext(() => getDb().paused().intake);
     setProvenanceFallback(intakeProvenanceFallback(getDb));
   }
+
+  // control (docs/design/autonomy.md Decision 3): the coordinator-owned config overlay, applied at once
+  const control = program.command('control').description('Coordinator-owned configuration: change any setting, role (worker profile) or workflow at once, without the owner (journaled; undo with `control undo`)');
+  const controlDeps = async () => {
+    requireMode('runtime');
+    const paths = runtimePaths();
+    return { state: paths.state, base: validateConfig(await readJson(paths.configJson), paths.configJson), actor: process.env.MINIONS_SESSION ? `coordinator (${process.env.MINIONS_SESSION})` : 'coordinator' };
+  };
+  const humanChange = (c: ControlChange) => [c.message, ...c.keys.map((k) => `  ${k.key}: ${k.appliesOn}${k.hostOwned ? ' (host-owned: the owner is notified)' : ''}`)].join('\n');
+  const noticeHostOwned = (c: ControlChange, reason: string) => {
+    const owned = c.keys.filter((k) => k.hostOwned).map((k) => k.key);
+    if (owned.length) enqueue(getDb(), { key: `control-${c.revision}`, kind: 'status', text: `Coordinator changed ${owned.join(', ')} (control revision ${c.revision}): ${reason}. Undo: minions control undo ${c.revision}` });
+  };
+  control.command('show').description('The overlay, its revision, and the effective value of every key it sets')
+    .action(action(async (_o: unknown, cmd: Command) => {
+      const d = await controlDeps();
+      emit(controlShow(d), { json: globalOpts(cmd).json, human: (r: ReturnType<typeof controlShow>) => [`control revision ${r.revision}${r.updatedAt ? ` (${r.updatedAt})` : ''}`, ...Object.entries(r.effective).map(([k, v]) => `  ${k} = ${JSON.stringify(v)}`)].join('\n') });
+    }));
+  control.command('set <key> <value>').description('Set any config key (dotted path; the value is JSON, or a plain string), e.g. `control set workflows.default \'["engineer","reviewer"]\'`')
+    .requiredOption('--reason <text>', 'why (journaled)')
+    .action(action(async (key: string, value: string, o: { reason: string }, cmd: Command) => {
+      const c = await controlSet(await controlDeps(), key, parseValue(value), o.reason);
+      noticeHostOwned(c, o.reason);
+      emit(c, { json: globalOpts(cmd).json, human: humanChange });
+    }));
+  control.command('unset <key>').description('Remove a key from the overlay (the value falls back to the project and host configuration)')
+    .requiredOption('--reason <text>', 'why (journaled)')
+    .action(action(async (key: string, o: { reason: string }, cmd: Command) => {
+      const c = await controlUnset(await controlDeps(), key, o.reason);
+      noticeHostOwned(c, o.reason);
+      emit(c, { json: globalOpts(cmd).json, human: humanChange });
+    }));
+  control.command('apply').description('Merge a partial config (JSON file or stdin) into the overlay in one change, e.g. a new role plus the workflow that uses it')
+    .requiredOption('--file <path>', 'the partial config ("-" = stdin)')
+    .requiredOption('--reason <text>', 'why (journaled)')
+    .action(action(async (o: { file: string; reason: string }, cmd: Command) => {
+      let partial: unknown;
+      try { partial = JSON.parse(await readInput(o.file, 'the partial config JSON', 'Pass --file <path>, or --file - with the JSON on stdin.')); } catch { throw new MinionsError('PRECONDITION', 'The file is not valid JSON.'); }
+      const c = await controlApply(await controlDeps(), partial, o.reason);
+      noticeHostOwned(c, o.reason);
+      emit(c, { json: globalOpts(cmd).json, human: humanChange });
+    }));
+  control.command('undo [revision]').description('Restore the overlay as it was before a revision (default: the last change); the undo is itself a new revision')
+    .requiredOption('--reason <text>', 'why (journaled)')
+    .action(action(async (revision: string | undefined, o: { reason: string }, cmd: Command) => {
+      const rev = revision === undefined ? undefined : Number(revision);
+      if (rev !== undefined && !Number.isInteger(rev)) throw new MinionsError('PRECONDITION', `Invalid revision "${revision}".`);
+      const c = await controlUndo(await controlDeps(), o.reason, rev);
+      noticeHostOwned(c, o.reason);
+      emit(c, { json: globalOpts(cmd).json, human: humanChange });
+    }));
+  control.command('log').description('The control journal, newest first')
+    .option('--limit <n>', 'entries', '20')
+    .action(action(async (o: { limit: string }, cmd: Command) => {
+      const d = await controlDeps();
+      const entries = readJournal(d.state).reverse().slice(0, Math.max(1, Number(o.limit) || 20)).map(({ before: _b, ...e }) => e);
+      emit(entries, { json: globalOpts(cmd).json, human: (es: typeof entries) => es.map((e) => `${e.revision} ${e.at} ${e.actor} ${e.op} ${e.keys.join(', ')}: ${e.reason}`).join('\n') || 'No control changes.' });
+    }));
 
   // work
   const work = program.command('work').description('Claim, record and release worker leases (container only)');
