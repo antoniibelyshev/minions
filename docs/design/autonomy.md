@@ -296,7 +296,10 @@ them.
   refuses `budgets.*` from the coordinator (set, apply, or an undo that would touch them), so the overlay being
   coordinator-writable does not reopen the hole. `budgets.*` stop being prompt text: they refuse claims against the
   USD estimate, with API-key billing only (a subscription has no USD figure; they are shown, not enforced). The
-  per-task cap counts the task's workers; the daily cap counts everything since the UTC day start.
+  per-task cap counts the task's workers; the daily cap counts everything since the UTC day start. A cap that stops
+  work queues one owner notice per cap value (per UTC day for the daily cap), since a silent wait looks like a hang.
+  The verify step still runs for stages a cap holds back: it spends no tokens, and the stage is ready when the owner
+  raises the cap. A claim-time check cannot stop a stage already running, so one stage can overshoot the cap.
 - **`minions session new` runs outside the wrapper.** The wrapper owns the coordinator lock, the launch record,
   Telegram and the helpers; a second interactive coordinator needs none of them and must not take them over. It is its
   own tmux session on the runtime's server, not a window of `coordinator`: windows of one tmux session share the

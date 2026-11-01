@@ -17,7 +17,8 @@
 //   lease (<state>/run/dispatch/<leaseId>.json) so a restarted dispatcher recovers its leases instead of losing them.
 // - Leases it claims have holder `dispatcher`; the coordinator's restart and wake rules ignore them (they are not its
 //   subagents).
-// - Budget, pause and drain apply (Scheduler.next reports them as startsBlocked).
+// - Budget, pause and drain apply (Scheduler.next reports them as startsBlocked). A spend cap that stops work is told to
+//   the owner once per cap value; stages it holds back are still verified (verification spends no tokens).
 // - Verify step (Decision 12): a gate stage starts only on a head whose verification passed (Scheduler.verificationDue).
 //   The dispatcher runs it through deps.verify (./verify-step.ts) instead of claiming, one run at a time, and records it
 //   with Scheduler.settleVerification. With the slot free it runs verification.periodic on the base head when due.
@@ -31,7 +32,8 @@ import { recordDecision } from './advance.js';
 import { DISPATCH_HOLDER, type Lease, type RuntimeDb, type SupervisorLock } from './db.js';
 import { DEFAULT_TICK_SECONDS, DISPATCH_EVENT, dispatchSettings, readHolds, writeHolds, type DispatchHold } from './dispatch-state.js';
 import { claimWithBrief, compactClaim, recordSubmitted, type CompactClaim, type HandoffPaths } from './handoff.js';
-import type { NextStage, RecordResponse, Scheduler } from './scheduler.js';
+import { enqueue } from './outbox.js';
+import type { NextReport, NextStage, RecordResponse, Scheduler } from './scheduler.js';
 import { hostIdentity, procIdentity } from './runner/record.js';
 import { verifyTimeoutMs } from './integrator.js';
 import { periodicDue, settlePeriodic, type Verifier } from './verify-step.js';
@@ -250,8 +252,14 @@ export class Dispatcher {
     const holds = readHolds(this.d.db);
     report.held = Object.keys(holds);
     const next = await sched.next();
-    if (next.startsBlocked) { report.blocked = next.startsBlocked.message; return report; }
+    this.capNotices(next);
     const busy = new Set([...this.active().map((r) => r.taskId), ...this.recording, ...(this.verifying ? [this.verifying] : [])]);
+    if (next.startsBlocked) {
+      // Verification spends no tokens: a stage held only by the daily cap is still verified (not while paused or draining).
+      if (next.caps.day.exhausted && !this.d.db.paused().starts) report.verifying = await this.verifyCapped(cfg, sched, next.waiting, holds, busy);
+      report.blocked = next.startsBlocked.message;
+      return report;
+    }
     for (const stage of next.runnable) {
       if (holds[stage.taskId] || busy.has(stage.taskId)) continue;
       if (this.d.verify) {
@@ -289,8 +297,43 @@ export class Dispatcher {
         report.started.push({ taskId: stage.taskId, role: stage.role, leaseId: claim.leaseId });
       } else report.held.push(stage.taskId);
     }
+    report.verifying ??= await this.verifyCapped(cfg, sched, next.waiting.filter((w) => w.waitingOn === 'budget'), holds, busy);
     if (this.d.verify && !this.verifying && await this.startPeriodicIfDue(cfg, sched)) report.verifying = 'periodic';
     return report;
+  }
+
+  /** Verifies the first stage among `stages` (held back by a spend cap) whose head needs it, if the slot is free. */
+  private async verifyCapped(cfg: MinionsConfig, sched: Scheduler, stages: NextStage[], holds: Record<string, DispatchHold>, busy: Set<string>): Promise<string | null> {
+    if (!this.d.verify || this.verifying) return null;
+    for (const stage of stages) {
+      if (holds[stage.taskId] || busy.has(stage.taskId)) continue;
+      const due = await sched.verificationDue(stage.taskId, stage.role).catch(() => null);
+      if (!due) continue;
+      this.startVerify(cfg, stage.taskId, due.head, due.commands);
+      return stage.taskId;
+    }
+    return null;
+  }
+
+  /** Tells the owner once per cap value when a spend cap stops work: the daily cap per UTC day, the per-task cap per task. */
+  private capNotices(next: NextReport): void {
+    const { caps } = next;
+    if (!caps.enforced) return;
+    const notice = (key: string, taskId: string | null, text: string) => {
+      try {
+        if (enqueue(this.d.db, { key, kind: 'blocker', taskId, text }, () => this.now()).created) this.log(`dispatch: ${text}`);
+      } catch (e) { this.log(`dispatch: could not queue the notice ${key}: ${(e as Error).message}`); }
+    };
+    if (caps.day.exhausted) {
+      notice(`budget-cap:day:${this.now().toISOString().slice(0, 10)}:${caps.day.capUsd}`, null,
+        `Daily spend cap reached: ~$${caps.day.usedUsd.toFixed(2)} of $${caps.day.capUsd} today (UTC, estimated). New stages wait; running workers finish. Raise it with /budget day <usd> (or off).`);
+      return;
+    }
+    const capped = [...new Map(next.waiting.filter((w) => w.waitingOn === 'budget').map((w) => [w.taskId, w])).values()];
+    for (const w of capped) {
+      notice(`budget-cap:task:${w.taskId}:${caps.task.capUsd}`, w.taskId,
+        `${w.taskId} reached the per-task spend cap: ~$${(caps.task.atCapUsd[w.taskId] ?? 0).toFixed(2)} of $${caps.task.capUsd} (estimated). Its ${w.role} stage waits (verification still runs). Raise it with /budget task <usd> (or off).`);
+    }
   }
 
   /** Runs `work` in the verification slot, tracked like an exit (settled() awaits it). */

@@ -286,6 +286,8 @@ export interface SpendReport {
   /** The coordinator sessions' own totals: measured from the transcript by the Stop hook, or set by hand. */
   coordinator: SpendFigures & { baseline: CoordinatorBaseline };
   budget: BudgetStatus | null;
+  /** The owner's USD caps (null when neither is set). */
+  caps: UsdCaps | null;
   /** Shortcut for budget.percent (null without a budget). */
   percent: number | null;
   notes: string[];
@@ -458,7 +460,8 @@ export function spendReport(ctx: SpendContext): SpendReport {
     today: { ...figures(tally(rows, day), attemptsSince(ctx.db, day), billing, fallback), since: day },
     perTask: perTask.filter((t) => t.tokens > 0 || t.attempts > 0),
     coordinator: { ...figures(all.filter((e) => e.scope === 'session'), 0, billing, fallback), baseline: coordinatorBaseline({ db: ctx.db, billing, fallbackModel: ctx.config?.models.coordinator ?? fallback, rows }) },
-    budget, percent: budget?.percent ?? null, notes,
+    budget, caps: ctx.config?.budgets && (ctx.config.budgets.dailyUsd !== null || ctx.config.budgets.taskUsd !== null) ? usdCaps({ ...ctx, billing, now }) : null,
+    percent: budget?.percent ?? null, notes,
   };
 }
 
@@ -501,8 +504,8 @@ export function describeBudget(s: BudgetStatus): string {
 export interface UsdCaps {
   enforced: boolean;
   day: { capUsd: number | null; usedUsd: number; tokens: number; exhausted: boolean };
-  /** The per-task cap; with a task id, that task's worker spend; `atCap`: tasks whose workers reached it. */
-  task: { capUsd: number | null; taskId?: string; usedUsd?: number; exhausted: boolean; atCap: string[] };
+  /** The per-task cap; with a task id, that task's worker spend; `atCap`: tasks whose workers reached it (`atCapUsd`: their spend). */
+  task: { capUsd: number | null; taskId?: string; usedUsd?: number; exhausted: boolean; atCap: string[]; atCapUsd: Record<string, number> };
 }
 
 export function usdCaps(ctx: SpendContext, taskId?: string): UsdCaps {
@@ -519,11 +522,12 @@ export function usdCaps(ctx: SpendContext, taskId?: string): UsdCaps {
   for (const e of all) perTask.set(e.taskId!, [...(perTask.get(e.taskId!) ?? []), e]);
   const taskUsd = (id: string) => usd(perTask.get(id) ?? []);
   const atCap = caps.taskUsd === null ? [] : [...perTask.keys()].filter((id) => taskUsd(id) >= caps.taskUsd!).sort();
+  const atCapUsd = Object.fromEntries(atCap.map((id) => [id, taskUsd(id)]));
   const used = taskId === undefined ? undefined : taskUsd(taskId);
   return {
     enforced,
     day: { capUsd: caps.dailyUsd, usedUsd: dayUsd, tokens: today.reduce((a, e) => a + e.tokens, 0), exhausted: enforced && caps.dailyUsd !== null && dayUsd >= caps.dailyUsd },
-    task: { capUsd: caps.taskUsd, ...(taskId !== undefined ? { taskId, usedUsd: used } : {}), exhausted: enforced && caps.taskUsd !== null && used !== undefined && used >= caps.taskUsd, atCap },
+    task: { capUsd: caps.taskUsd, ...(taskId !== undefined ? { taskId, usedUsd: used } : {}), exhausted: enforced && caps.taskUsd !== null && used !== undefined && used >= caps.taskUsd, atCap, atCapUsd },
   };
 }
 
@@ -582,8 +586,18 @@ export function humanSpend(r: SpendReport): string {
   return [
     `spend (${r.billing}): total ${tok(r.total)}; today ${tok(r.today)}`,
     `coordinator: ${c.tokens.toLocaleString('en-US')} tokens${usd(c)}; workers: ${Math.max(0, r.total.tokens - c.tokens).toLocaleString('en-US')} tokens`,
-    r.budget ? `budget: ${describeBudget(r.budget)}${r.budget.exhausted ? ' - new starts refused' : ''}` : 'budget: none',
+    ...(r.caps ? [humanCaps(r.caps)] : []),
+    ...(r.budget ? [`budget: ${describeBudget(r.budget)}${r.budget.exhausted ? ' - new starts refused' : ''}`] : r.caps ? [] : ['budget: none']),
   ].join('\n');
+}
+
+const capUsd = (n: number | null) => (n === null ? 'off' : `$${n}`);
+
+function humanCaps(c: UsdCaps): string {
+  const day = `daily ~$${c.day.usedUsd.toFixed(2)} of ${capUsd(c.day.capUsd)}${c.day.exhausted ? ' (reached: new stages wait)' : ''}`;
+  const reached = c.task.atCap.map((id) => `${id} ~$${c.task.atCapUsd[id]!.toFixed(2)}`).join(', ');
+  const task = `per-task ${capUsd(c.task.capUsd)}${reached ? ` (reached: ${reached})` : ''}`;
+  return `spend caps: ${day}; ${task}${c.enforced ? '' : ' (not enforced: subscription billing)'}`;
 }
 
 const k = (n: number | null) => (n === null ? '-' : n >= 10_000 ? `${Math.round(n / 1000)}k` : n.toLocaleString('en-US'));

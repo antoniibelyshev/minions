@@ -22,7 +22,7 @@ import { corruptRecordHint, hasOpenRun, readRunRecord, removeRunRecord } from '.
 import { sessionScope } from './session-scope.js';
 import { missingApprovalKeyReason, runtimePaths } from './paths.js';
 import { normalizeCheckCommand, resultContractText, validateResult, type WorkerResult } from './results.js';
-import { assertBudgetAllowsStart, billingOf, usdCaps, budgetNotice, latestLeaseUsage, recordLeaseUsage, tokensFromResultUsage, type Billing, type BudgetNotice, type SpendContext } from './spend.js';
+import { assertBudgetAllowsStart, billingOf, usdCaps, budgetNotice, latestLeaseUsage, recordLeaseUsage, tokensFromResultUsage, type Billing, type BudgetNotice, type SpendContext, type UsdCaps } from './spend.js';
 import { gateGit } from './git-hardening.js';
 import { enqueueIntegration, FLAKY_OUTCOME, integrationRows, openIntegration, startIntegratorDetached, verifiedTree, VERIFY_EVIDENCE, type IntegrationRow, type VerifyResult } from './integrator.js';
 import { enqueue as enqueueNotice } from './outbox.js';
@@ -168,6 +168,8 @@ export interface NextReport {
   /** Why nothing may start (the error a claim would return), or null. */
   startsBlocked: { code: string; message: string; hint?: string } | null;
   capacity: Capacity;
+  /** The owner's USD caps at this pass (docs/design/autonomy.md Decision 13): the dispatcher tells the owner when one stops work. */
+  caps: UsdCaps;
   message: string;
   /**
    * Config notes the coordinator should relay (absent when there are none): gate roles that `harnesses.default`
@@ -656,7 +658,7 @@ export class Scheduler {
           : 'Nothing runnable: no ready task and no task waiting for its next stage.';
     const warnings = defaultMovedGates(cfg, this.phase).map(({ role, harness }) =>
       `harnesses.default moves the gate role ${role} onto ${HARNESSES[harness].label} (harness ${harness}); set roles.${role}.harness to claude on the host to keep it on Claude Code, or to ${harness} to make it explicit`);
-    return { runnable, waiting, stuck, startsBlocked, capacity: cap, message, ...(warnings.length ? { warnings } : {}) };
+    return { runnable, waiting, stuck, startsBlocked, capacity: cap, caps, message, ...(warnings.length ? { warnings } : {}) };
   }
 
   private nextEntry(task: Task, def: RoleDef, m: ModelSuggestion, at: Pick<NextStage, 'kind' | 'position' | 'count' | 'workflow'>, reason: string): NextStage {

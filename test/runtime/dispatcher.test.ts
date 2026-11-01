@@ -224,6 +224,43 @@ describe('dispatcher: the verify step and periodic verification (docs/design/aut
     expect((await env.backlog.getTask('task-1')).status).toBe('delivered');
   });
 
+  it('a task at its per-task spend cap is still verified; its reviewer waits and the owner is told once', async () => {
+    vi.stubEnv('MINIONS_AUTH_METHOD', 'api-key');
+    try {
+      const v = verifier();
+      // 3M sonnet tokens: ~$9 at the input rate, over the $5 cap.
+      const { env, disp, launches } = setup(approve, (c) => { unit(c); c.budgets = { dailyUsd: null, taskUsd: 5 }; }, () => exit({ tokens: 3_000_000 }), { verify: v.verify });
+      env.backlog.add({ id: 'task-1' });
+      await drive(disp);
+      await disp.pass(); await disp.settled();
+      expect(launches.map((l) => l.stage.role)).toEqual(['engineer']);
+      expect(v.runs.map((r) => r.key)).toEqual(['task-1']);
+      const notices = pending(env.db, { includeWaiting: true }).filter((n) => n.key.startsWith('budget-cap:'));
+      expect(notices.map((n) => [n.key, n.taskId])).toEqual([['budget-cap:task:task-1:5', 'task-1']]);
+      expect(notices[0]!.text).toMatch(/^task-1 reached the per-task spend cap: ~\$9\.00 of \$5 \(estimated\)\. Its reviewer stage waits/);
+      env.config.budgets = { dailyUsd: null, taskUsd: 20 }; // the owner's /budget task 20
+      await drive(disp);
+      expect(launches.map((l) => l.stage.role)).toEqual(['engineer', 'reviewer']);
+      expect(v.runs).toHaveLength(1);
+    } finally { vi.unstubAllEnvs(); }
+  });
+
+  it('at the daily cap: nothing starts, a stage waiting for verification is still verified, one notice per day', async () => {
+    vi.stubEnv('MINIONS_AUTH_METHOD', 'api-key');
+    try {
+      const v = verifier();
+      const { env, disp, launches } = setup(approve, (c) => { unit(c); c.budgets = { dailyUsd: 5, taskUsd: null }; }, () => exit({ tokens: 3_000_000 }), { verify: v.verify });
+      env.backlog.add({ id: 'task-1' });
+      await drive(disp);
+      await disp.pass(); await disp.settled();
+      expect(launches.map((l) => l.stage.role)).toEqual(['engineer']);
+      expect(v.runs.map((r) => r.key)).toEqual(['task-1']);
+      const notices = pending(env.db, { includeWaiting: true }).filter((n) => n.key.startsWith('budget-cap:'));
+      expect(notices.map((n) => n.key)).toEqual([expect.stringMatching(/^budget-cap:day:\d{4}-\d{2}-\d{2}:5$/)]);
+      expect(notices[0]!.text).toMatch(/^Daily spend cap reached: ~\$9\.00 of \$5 today/);
+    } finally { vi.unstubAllEnvs(); }
+  });
+
   it('red: back to the engineer as a counted repair with the failing command and output tail in its brief', async () => {
     let n = 0;
     const v = verifier(() => (++n === 1 ? { state: 'red', command: 'npm run test:unit', detail: '`npm run test:unit` failed twice\nexpected 2 to be 3' } : { state: 'passed' }));

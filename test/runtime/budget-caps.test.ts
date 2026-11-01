@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { MinionsConfig } from '../../src/config/schema.js';
 import { RuntimeDb } from '../../src/runtime/db.js';
-import { assertBudgetAllowsStart, usdCaps } from '../../src/runtime/spend.js';
+import { assertBudgetAllowsStart, humanSpend, spendReport, usdCaps } from '../../src/runtime/spend.js';
 import { defaults } from '../helpers.js';
 import { tmp } from './fixtures.js';
 
@@ -27,7 +27,7 @@ describe('USD caps', () => {
     expect(c).toEqual({
       enforced: true,
       day: { capUsd: 10, usedUsd: 9, tokens: 3_000_000, exhausted: false },
-      task: { capUsd: 5, taskId: 'task-2', usedUsd: 6, exhausted: true, atCap: ['task-1', 'task-2'] },
+      task: { capUsd: 5, taskId: 'task-2', usedUsd: 6, exhausted: true, atCap: ['task-1', 'task-2'], atCapUsd: { 'task-1': 6, 'task-2': 6 } },
     });
   });
 
@@ -39,5 +39,15 @@ describe('USD caps', () => {
     expect(() => assertBudgetAllowsStart(ctx({ dailyUsd: 5, taskUsd: null }), 'task-2')).toThrow(/^Daily spend cap reached: ~\$6\.00 of \$5 today/);
     expect(() => assertBudgetAllowsStart(ctx({ dailyUsd: 5, taskUsd: 5 }, 'subscription'), 'task-1')).not.toThrow();
     expect(() => assertBudgetAllowsStart(ctx({ dailyUsd: null, taskUsd: null }), 'task-1')).not.toThrow();
+  });
+
+  it('status shows the caps and the tasks at the per-task cap', () => {
+    usage('task-1', 'l1', 2_000_000);
+    const line = (budgets: MinionsConfig['budgets'], billing: 'api-key' | 'subscription' = 'api-key') =>
+      humanSpend(spendReport({ db, billing, config: cfg(budgets), now: NOW })).split('\n').slice(2);
+    expect(line({ dailyUsd: 40, taskUsd: 5 })).toEqual(['spend caps: daily ~$6.00 of $40; per-task $5 (reached: task-1 ~$6.00)']);
+    expect(line({ dailyUsd: 5, taskUsd: null })).toEqual(['spend caps: daily ~$6.00 of $5 (reached: new stages wait); per-task off']);
+    expect(line({ dailyUsd: 40, taskUsd: null }, 'subscription')).toEqual(['spend caps: daily ~$6.00 of $40; per-task off (not enforced: subscription billing)']);
+    expect(line({ dailyUsd: null, taskUsd: null })).toEqual(['budget: none']);
   });
 });
