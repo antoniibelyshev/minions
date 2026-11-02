@@ -280,7 +280,7 @@ function applySession(base: MinionsConfig, session: unknown, prov: Record<string
 }
 
 /**
- * The two choices that drop the agents' last local boundary (no permission prompts at all, no host sandbox) are the
+ * The choices that drop the agents' last local boundary (no permission prompts at all, no host sandbox, SSH hosts) are the
  * owner's alone: the project layer may be committed to the repository, so only config.local.json may make them.
  */
 function checkHostOnlyChoices(project: MinionsConfig, label: string): void {
@@ -291,6 +291,10 @@ function checkHostOnlyChoices(project: MinionsConfig, label: string): void {
   if (project.coordinator?.sandbox === false) {
     throw new MinionsError('POLICY_DENIED', `coordinator.sandbox: ${label} cannot turn the host sandbox off.`,
       'Set it in the host-only config.local.json: `minions settings set coordinator.sandbox false`.', { path: 'coordinator.sandbox' });
+  }
+  if (project.coordinator?.sshHosts?.length) {
+    throw new MinionsError('POLICY_DENIED', `coordinator.sshHosts: ${label} cannot let agent commands reach SSH hosts.`,
+      'Set it in the host-only config.local.json: `minions settings set coordinator.sshHosts <user@host>`.', { path: 'coordinator.sshHosts' });
   }
 }
 

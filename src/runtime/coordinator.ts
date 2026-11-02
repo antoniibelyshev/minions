@@ -269,6 +269,16 @@ export function hostSettings(h: HostHardening): { sandbox: Record<string, unknow
   };
 }
 
+/**
+ * Host runtime: `ssh`, `scp` and `rsync` calls to the owner's coordinator.sshHosts, as Bash patterns. The sandbox proxy
+ * carries only HTTP(S)/SOCKS-aware tools and ~/.ssh is unreadable inside it, so these run outside it
+ * (`sandbox.excludedCommands`, the owner's SSH config and keys) and are allowed without a prompt. Claude Code keeps a
+ * call sandboxed unless every command of it matches; a redirect, `cd` or `$(...)` keeps it sandboxed too.
+ */
+export function sshPatterns(hosts: readonly string[]): string[] {
+  return hosts.flatMap((h) => [`ssh ${h}`, `ssh ${h} *`, `scp * ${h}:*`, `scp ${h}:* *`, `rsync * ${h}:*`, `rsync ${h}:* *`]);
+}
+
 /** Shell metacharacters and globs a verification command may not contain in the host runtime. */
 const UNSAFE_COMMAND = /[*?;&|`$<>(){}\[\]\\!#~'"\n\r]/;
 /**
@@ -336,6 +346,8 @@ export function coordinatorSettings(cfg: MinionsConfig, opts: { telegram?: boole
     ? ['Bash(minions *)', 'Bash(minions)', ...HOST_GIT_SUBCOMMANDS.flatMap((g) => [`Bash(git ${g})`, `Bash(git ${g} *)`]), 'Bash(backlog *)']
     : ['Bash(minions *)', 'Bash(minions)', 'Bash(git *)', 'Bash(backlog *)'];
   for (const c of cfg.verification.commands) if (!hs || safeVerificationCommand(c)) allow.push(`Bash(${c})`, `Bash(${c} *)`);
+  const ssh = sandboxed ? sshPatterns(cfg.coordinator?.sshHosts ?? []) : [];
+  allow.push(...ssh.map((p) => `Bash(${p})`));
   // Replies go only to allowlisted chats (the minions server gates outbound messages too).
   if (opts.telegram) allow.push(...MINIONS_TELEGRAM_TOOLS);
   return {
@@ -355,7 +367,7 @@ export function coordinatorSettings(cfg: MinionsConfig, opts: { telegram?: boole
       ...(sandboxed ? { blockReadsOutsideWorkingDirectories: true } : {}),
     },
     ...(auth === 'login' ? {} : { apiKeyHelper: opts.paths ? apiKeyHelperFor(opts.paths) : host ? apiKeyHelperFor(runtimePaths()) : API_KEY_HELPER }),
-    ...(sandboxed && hs ? { sandbox: hs.sandbox } : {}),
+    ...(sandboxed && hs ? { sandbox: ssh.length ? { ...hs.sandbox, excludedCommands: ssh } : hs.sandbox } : {}),
     // Startup context trim (task-48, src/config/coordinator-tools.ts): tool search on (rarely used tool
     // definitions are deferred, not sent in full every turn) and no bundled skills; plugin skills stay.
     ...(cfg.coordinator?.toolSearch === false ? {} : { env: { ENABLE_TOOL_SEARCH: 'true' } }),

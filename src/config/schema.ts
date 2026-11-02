@@ -2,6 +2,9 @@ import { z } from 'zod';
 import { isRequiredCoordinatorTool } from './coordinator-tools.js';
 import { HARNESS_IDS, PROCESS_HARNESS_IDS } from './harnesses.js';
 
+/** An SSH target of coordinator.sshHosts: `host` or `user@host`, nothing a permission pattern or a shell would expand. */
+export const SSH_TARGET = /^(?:[A-Za-z_][A-Za-z0-9_.-]*@)?[A-Za-z0-9][A-Za-z0-9.-]*$/;
+
 /** Permission modes the coordinator (and its workers) may run in. */
 export const COORDINATOR_PERMISSION_MODES = ['auto', 'acceptEdits', 'bypassPermissions'] as const;
 
@@ -358,6 +361,12 @@ export const MinionsConfigSchema = z.object({
      * false runs commands unsandboxed as the owner's user. Only config.local.json may turn it off.
      */
     sandbox: z.boolean().optional(),
+    /**
+     * Host runtime only: SSH targets (`user@host` or `host`) that `ssh`, `scp` and `rsync` may reach. Those calls run
+     * outside the sandbox with the owner's SSH setup, without a prompt (workers too). Only config.local.json and the
+     * owner set it, never the coordinator's control overlay.
+     */
+    sshHosts: z.array(z.string().regex(SSH_TARGET, 'must be host or user@host (letters, digits, . _ -)')).optional(),
     /**
      * Claude Code tools removed from the coordinator session (`--disallowedTools`). Unset = the default
      * trim (COORDINATOR_DISALLOWED_TOOLS, src/config/coordinator-tools.ts); a list replaces it; [] keeps

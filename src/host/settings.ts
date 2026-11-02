@@ -209,6 +209,12 @@ const DECLARED: readonly DeclaredSetting[] = [
   { key: 'coordinator.sandbox', group: 'Policy', label: 'Host runtime sandbox', type: 'bool', optional: true, apply: 'launch',
     description: 'host runtime: Bash runs in the Claude Code sandbox (writes limited to the workspace and state, network to npm); false: unsandboxed, as your user (local config only)',
     loosens: (f, t) => (f !== false && t === false ? 'agent commands run on your host without the sandbox, with your full user access' : null) },
+  { key: 'coordinator.sshHosts', group: 'Policy', label: 'SSH hosts', type: 'list', optional: true, apply: 'launch',
+    description: 'host runtime: user@host targets that ssh, scp and rsync may reach from agent commands, outside the sandbox with your SSH keys (local config only)',
+    loosens: (f, t) => {
+      const added = (Array.isArray(t) ? t : []).filter((h) => !(Array.isArray(f) ? f : []).includes(h));
+      return added.length ? `agent commands may run anything on ${added.join(', ')} over SSH, and scp/rsync from there write outside the sandbox` : null;
+    } },
   { key: 'coordinator.contextReset.enabled', group: 'Policy', label: 'Routine context resets', type: 'bool', apply: 'live',
     description: 'the coordinator hands off and restarts with a fresh context when idle' },
   { key: 'coordinator.sessions.enabled', group: 'Policy', label: 'Coordinator sessions', type: 'bool', optional: true, apply: 'launch',
