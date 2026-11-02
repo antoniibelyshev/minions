@@ -61,3 +61,15 @@ describe('coordinator.sshHosts', () => {
     expect(sandboxExceptionGuidance(withHosts(['h'], false))).toBe('');
   });
 });
+
+describe('coordinator.allowedDomains', () => {
+  it('adds the owner\'s hosts to the sandbox network list; host names only; owner only', () => {
+    const cfg: MinionsConfig = { ...defaults(), coordinator: { ...defaults().coordinator, allowedDomains: ['crates.io', '*.pythonhosted.org'] } };
+    const s = coordinatorSettings(cfg, { auth: 'login', host }) as { sandbox: { network: { allowedDomains: string[] } } };
+    expect(s.sandbox.network.allowedDomains).toEqual(['registry.npmjs.org', 'crates.io', '*.pythonhosted.org']);
+    const v = (d: string) => () => validateConfig({ ...defaults(), coordinator: { ...defaults().coordinator, allowedDomains: [d] } });
+    for (const bad of ['*', 'localhost', 'crates.io/x', 'a b.com', '*.', 'evil.com:22']) expect(v(bad), bad).toThrow();
+    expect(() => resolve({ defaults: defaults(), project: { coordinator: { allowedDomains: ['crates.io'] } } })).toThrow(/cannot open network hosts/);
+    expect(ownerOnlyKey('coordinator.allowedDomains')).toBe(true);
+  });
+});

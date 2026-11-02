@@ -292,6 +292,10 @@ function checkHostOnlyChoices(project: MinionsConfig, label: string): void {
     throw new MinionsError('POLICY_DENIED', `coordinator.sandbox: ${label} cannot turn the host sandbox off.`,
       'Set it in the host-only config.local.json: `minions settings set coordinator.sandbox false`.', { path: 'coordinator.sandbox' });
   }
+  if (project.coordinator?.allowedDomains?.length) {
+    throw new MinionsError('POLICY_DENIED', `coordinator.allowedDomains: ${label} cannot open network hosts to sandboxed commands.`,
+      'Set it in the host-only config.local.json: `minions settings set coordinator.allowedDomains <host>`.', { path: 'coordinator.allowedDomains' });
+  }
   if (project.coordinator?.unsandboxedCommands?.length) {
     throw new MinionsError('POLICY_DENIED', `coordinator.unsandboxedCommands: ${label} cannot run agent commands outside the sandbox.`,
       'Set it in the host-only config.local.json: `minions settings set coordinator.unsandboxedCommands "<pattern>"`.', { path: 'coordinator.unsandboxedCommands' });

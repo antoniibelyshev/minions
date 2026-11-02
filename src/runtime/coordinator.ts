@@ -282,6 +282,16 @@ export function sshPatterns(hosts: readonly string[]): string[] {
     ...['scp', 'rsync'].flatMap((p) => [`${p} * ${h}:/*`, `${p} * ${h}:~/*`, `${p} ${h}:/* *`, `${p} ${h}:~/* *`, `${p} * ${h}:/* *`, `${p} * ${h}:~/* *`])]);
 }
 
+/** The host sandbox with the owner's exceptions: excluded command patterns and extra network hosts. */
+function withOwnerSandbox(sandbox: Record<string, unknown>, excluded: string[], domains: string[]): Record<string, unknown> {
+  const network = sandbox.network as { allowedDomains: string[] };
+  return {
+    ...sandbox,
+    ...(excluded.length ? { excludedCommands: excluded } : {}),
+    ...(domains.length ? { network: { ...network, allowedDomains: [...new Set([...network.allowedDomains, ...domains])] } } : {}),
+  };
+}
+
 /** Shell metacharacters and globs a verification command may not contain in the host runtime. */
 const UNSAFE_COMMAND = /[*?;&|`$<>(){}\[\]\\!#~'"\n\r]/;
 /**
@@ -370,7 +380,7 @@ export function coordinatorSettings(cfg: MinionsConfig, opts: { telegram?: boole
       ...(sandboxed ? { blockReadsOutsideWorkingDirectories: true } : {}),
     },
     ...(auth === 'login' ? {} : { apiKeyHelper: opts.paths ? apiKeyHelperFor(opts.paths) : host ? apiKeyHelperFor(runtimePaths()) : API_KEY_HELPER }),
-    ...(sandboxed && hs ? { sandbox: ssh.length ? { ...hs.sandbox, excludedCommands: ssh } : hs.sandbox } : {}),
+    ...(sandboxed && hs ? { sandbox: withOwnerSandbox(hs.sandbox, ssh, cfg.coordinator?.allowedDomains ?? []) } : {}),
     // Startup context trim (task-48, src/config/coordinator-tools.ts): tool search on (rarely used tool
     // definitions are deferred, not sent in full every turn) and no bundled skills; plugin skills stay.
     ...(cfg.coordinator?.toolSearch === false ? {} : { env: { ENABLE_TOOL_SEARCH: 'true' } }),

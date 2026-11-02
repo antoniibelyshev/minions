@@ -8,6 +8,9 @@ export const SSH_TARGET = /^(?:[A-Za-z_][A-Za-z0-9_.-]*@)?[A-Za-z0-9][A-Za-z0-9.
 /** A pattern of coordinator.unsandboxedCommands: a program name or path, then plain words or `*`; no shell operators or quotes. */
 export const UNSANDBOXED_PATTERN = /^[A-Za-z0-9_./][A-Za-z0-9_./+=:@-]*(?: (?:[A-Za-z0-9_./+=:@,%-]+|\*))*$/;
 
+/** A host of coordinator.allowedDomains: a DNS name, optionally with a leading `*.` wildcard. */
+export const SANDBOX_DOMAIN = /^(?:\*\.)?[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)+$/;
+
 /** Permission modes the coordinator (and its workers) may run in. */
 export const COORDINATOR_PERMISSION_MODES = ['auto', 'acceptEdits', 'bypassPermissions'] as const;
 
@@ -379,6 +382,11 @@ export const MinionsConfigSchema = z.object({
      * Host runtime only: Bash permission patterns (`uv run python -m train *`) whose calls run outside the sandbox, without
      * a prompt (workers too), e.g. GPU training: the sandbox blocks Metal (MPS). Same owner-only rule as sshHosts.
      */
+    /**
+     * Host runtime only: hosts sandboxed commands may reach besides the npm registry (`crates.io`, `*.pythonhosted.org`),
+     * through the sandbox proxy (HTTP(S)-aware tools). Same owner-only rule as sshHosts.
+     */
+    allowedDomains: z.array(z.string().regex(SANDBOX_DOMAIN, 'must be a host name, optionally *.<domain>')).optional(),
     unsandboxedCommands: z.array(z.string().regex(UNSANDBOXED_PATTERN, 'must be a plain command pattern (a program, then words or *; no shell operators)')).optional(),
     /**
      * Claude Code tools removed from the coordinator session (`--disallowedTools`). Unset = the default

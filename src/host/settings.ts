@@ -215,6 +215,12 @@ const DECLARED: readonly DeclaredSetting[] = [
       const added = (Array.isArray(t) ? t : []).filter((h) => !(Array.isArray(f) ? f : []).includes(h));
       return added.length ? `agent commands may run anything on ${added.join(', ')} over SSH, and scp/rsync from there write outside the sandbox` : null;
     } },
+  { key: 'coordinator.allowedDomains', group: 'Policy', label: 'Sandbox network hosts', type: 'list', optional: true, apply: 'launch',
+    description: 'host runtime: hosts sandboxed agent commands may reach besides the npm registry, e.g. crates.io, static.crates.io, index.crates.io, pypi.org, files.pythonhosted.org, github.com (local config only)',
+    loosens: (f, t) => {
+      const added = (Array.isArray(t) ? t : []).filter((d) => !(Array.isArray(f) ? f : []).includes(d));
+      return added.length ? `sandboxed agent commands may reach ${added.join(', ')}` : null;
+    } },
   { key: 'coordinator.unsandboxedCommands', group: 'Policy', label: 'Unsandboxed commands', type: 'list', separator: ';', optional: true, apply: 'launch',
     description: 'host runtime: command patterns (e.g. "uv run python -m train *") that agent commands run outside the sandbox, as your user, e.g. for the GPU (the sandbox blocks Metal/MPS) (local config only)',
     loosens: (f, t) => {
