@@ -215,6 +215,12 @@ const DECLARED: readonly DeclaredSetting[] = [
       const added = (Array.isArray(t) ? t : []).filter((h) => !(Array.isArray(f) ? f : []).includes(h));
       return added.length ? `agent commands may run anything on ${added.join(', ')} over SSH, and scp/rsync from there write outside the sandbox` : null;
     } },
+  { key: 'coordinator.unsandboxedCommands', group: 'Policy', label: 'Unsandboxed commands', type: 'list', separator: ';', optional: true, apply: 'launch',
+    description: 'host runtime: command patterns (e.g. "uv run python -m train *") that agent commands run outside the sandbox, as your user, e.g. for the GPU (the sandbox blocks Metal/MPS) (local config only)',
+    loosens: (f, t) => {
+      const added = (Array.isArray(t) ? t : []).filter((c) => !(Array.isArray(f) ? f : []).includes(c));
+      return added.length ? `agent commands matching ${added.map((c) => `"${c}"`).join(', ')} run on your host without the sandbox, with your full user access` : null;
+    } },
   { key: 'coordinator.contextReset.enabled', group: 'Policy', label: 'Routine context resets', type: 'bool', apply: 'live',
     description: 'the coordinator hands off and restarts with a fresh context when idle' },
   { key: 'coordinator.sessions.enabled', group: 'Policy', label: 'Coordinator sessions', type: 'bool', optional: true, apply: 'launch',
@@ -277,6 +283,8 @@ const DECLARED: readonly DeclaredSetting[] = [
     description: 'maximum number of processes in the project container (compose pids_limit)' },
   { key: 'container.tmpSizeMiB', group: 'Container', label: 'Container /tmp size (MiB)', type: 'int', min: 64, optional: true, apply: 'recreate',
     description: 'size cap of the /tmp tmpfs (RAM, counted against the memory limit; default 1024)' },
+  { key: 'container.gpus', group: 'Container', label: 'Container GPUs', type: 'enum', choices: ['auto', 'nvidia', 'none'], optional: true, apply: 'recreate',
+    description: 'GPUs in the project container: auto = NVIDIA GPUs when the host has the NVIDIA container toolkit (Linux); Docker on macOS cannot pass Metal (MPS) through' },
   { key: 'container.aptPackages', group: 'Container', label: 'Extra Debian packages', type: 'list', optional: true, apply: 'recreate',
     description: 'Debian packages added to the runtime image (Docker runtime; `minions upgrade`, or `minions start` of a stopped container, builds the derived image). The coordinator\'s `minions control set container.aptPackages` takes precedence' },
 ];

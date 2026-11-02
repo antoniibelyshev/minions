@@ -187,7 +187,7 @@ export interface ControlDeps {
 }
 
 /** Keys only the owner changes (docs/design/autonomy.md Decision 13): the coordinator never raises its own spend caps. */
-export const OWNER_ONLY_KEYS = ['budgets', 'coordinator.sshHosts'];
+export const OWNER_ONLY_KEYS = ['budgets', 'coordinator.sshHosts', 'coordinator.unsandboxedCommands'];
 export const ownerOnlyKey = (key: string) => OWNER_ONLY_KEYS.some((k) => key === k || key.startsWith(k + '.'));
 
 function checkReason(reason: string): string {

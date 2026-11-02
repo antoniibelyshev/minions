@@ -5,7 +5,7 @@ import type { MinionsConfig } from '../../src/config/schema.js';
 import { resolve, validateConfig } from '../../src/config/resolve.js';
 import { coordinatorSettings, sshPatterns } from '../../src/runtime/coordinator.js';
 import { ownerOnlyKey } from '../../src/runtime/control.js';
-import { sshGuidance } from '../../src/plugin/generate.js';
+import { sandboxExceptionGuidance } from '../../src/plugin/generate.js';
 import { defaults } from '../helpers.js';
 
 const host = { home: '/Users/u', workspace: '/r/projects/p/host/workspace', state: '/r/projects/p/host/state', secretsDir: '/r/projects/p/secrets', credentialsDir: '/r/credentials', projectDir: '/r/projects/p', hostRoot: '/r' };
@@ -39,9 +39,22 @@ describe('coordinator.sshHosts', () => {
     expect(ownerOnlyKey('coordinator.sshHosts')).toBe(true);
   });
 
+  it('unsandboxedCommands: excluded and allowed like the SSH patterns; plain patterns only; owner only', () => {
+    const cfg = { ...withHosts(['me@h']), coordinator: { ...withHosts(['me@h']).coordinator, unsandboxedCommands: ['uv run python -m training.train *'] } };
+    const s = coordinatorSettings(cfg, { auth: 'login', host }) as Settings;
+    expect(s.sandbox?.excludedCommands).toEqual([...sshPatterns(['me@h']), 'uv run python -m training.train *']);
+    expect(s.permissions.allow).toContain('Bash(uv run python -m training.train *)');
+    const v = (p: string) => () => validateConfig({ ...defaults(), coordinator: { ...defaults().coordinator, unsandboxedCommands: [p] } });
+    for (const ok of ['uv run python -m training.train *', 'scripts/train.sh *', 'make train']) expect(v(ok)).not.toThrow();
+    for (const bad of ['*', 'uv run x; rm -rf ~', 'sh -c "x"', 'a | b', 'x $(id)', '']) expect(v(bad), bad).toThrow();
+    expect(() => resolve({ defaults: defaults(), project: { coordinator: { unsandboxedCommands: ['make train'] } } })).toThrow(/cannot run agent commands outside the sandbox/);
+    expect(ownerOnlyKey('coordinator.unsandboxedCommands')).toBe(true);
+    expect(sandboxExceptionGuidance(cfg)).toMatch(/SSH hosts .* Commands the owner lets run outside the sandbox.*Metal\/MPS\): `uv run python -m training\.train \*`/);
+  });
+
   it('tells the agents how to call the hosts (host runtime, sandbox on)', () => {
-    expect(sshGuidance(withHosts(['me@10.0.0.1']))).toMatch(/^SSH hosts the owner opened: `me@10\.0\.0\.1`\..*a pipe, a local redirect/);
-    expect(sshGuidance(withHosts())).toBe('');
-    expect(sshGuidance(withHosts(['h'], false))).toBe('');
+    expect(sandboxExceptionGuidance(withHosts(['me@10.0.0.1']))).toMatch(/^SSH hosts the owner opened: `me@10\.0\.0\.1`\..*a pipe, a local redirect/);
+    expect(sandboxExceptionGuidance(withHosts())).toBe('');
+    expect(sandboxExceptionGuidance(withHosts(['h'], false))).toBe('');
   });
 });

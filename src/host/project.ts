@@ -33,6 +33,8 @@ const ProjectJsonObject = z.object({
     network: z.enum(['outbound-internet', 'none']),
     /** container.aptPackages applied to the image (sorted, unique; absent = none); runtimeImageTag in docker.ts derives the tag. */
     aptPackages: AptPackagesSchema.optional(),
+    /** GPUs passed to the container, resolved from container.gpus (absent = none; resolveGpus in docker.ts). */
+    gpus: z.literal('nvidia').optional(),
   }).strict(),
   /**
    * Claude authorization (host-only; never in shared/repository config, which the strict

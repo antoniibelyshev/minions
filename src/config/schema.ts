@@ -5,6 +5,9 @@ import { HARNESS_IDS, PROCESS_HARNESS_IDS } from './harnesses.js';
 /** An SSH target of coordinator.sshHosts: `host` or `user@host`, nothing a permission pattern or a shell would expand. */
 export const SSH_TARGET = /^(?:[A-Za-z_][A-Za-z0-9_.-]*@)?[A-Za-z0-9][A-Za-z0-9.-]*$/;
 
+/** A pattern of coordinator.unsandboxedCommands: a program name or path, then plain words or `*`; no shell operators or quotes. */
+export const UNSANDBOXED_PATTERN = /^[A-Za-z0-9_./][A-Za-z0-9_./+=:@-]*(?: (?:[A-Za-z0-9_./+=:@,%-]+|\*))*$/;
+
 /** Permission modes the coordinator (and its workers) may run in. */
 export const COORDINATOR_PERMISSION_MODES = ['auto', 'acceptEdits', 'bypassPermissions'] as const;
 
@@ -258,6 +261,11 @@ export const MinionsConfigSchema = z.object({
     mountDockerSocket: z.boolean(),
     /** Docker runtime: Debian packages added to the image (a derived image, rebuilt by `minions start` / `upgrade`). */
     aptPackages: AptPackagesSchema.optional(),
+    /**
+     * Docker runtime: GPUs in the container. Unset/"auto" = every NVIDIA GPU when the host has the NVIDIA container
+     * toolkit (Linux); "nvidia" always; "none" never. Docker on macOS cannot pass Metal (MPS) through.
+     */
+    gpus: z.enum(['auto', 'nvidia', 'none']).optional(),
   }).strict(),
   execution: z.object({
     maxActiveTasks: z.number().int().min(1),
@@ -367,6 +375,11 @@ export const MinionsConfigSchema = z.object({
      * owner set it, never the coordinator's control overlay.
      */
     sshHosts: z.array(z.string().regex(SSH_TARGET, 'must be host or user@host (letters, digits, . _ -)')).optional(),
+    /**
+     * Host runtime only: Bash permission patterns (`uv run python -m train *`) whose calls run outside the sandbox, without
+     * a prompt (workers too), e.g. GPU training: the sandbox blocks Metal (MPS). Same owner-only rule as sshHosts.
+     */
+    unsandboxedCommands: z.array(z.string().regex(UNSANDBOXED_PATTERN, 'must be a plain command pattern (a program, then words or *; no shell operators)')).optional(),
     /**
      * Claude Code tools removed from the coordinator session (`--disallowedTools`). Unset = the default
      * trim (COORDINATOR_DISALLOWED_TOOLS, src/config/coordinator-tools.ts); a list replaces it; [] keeps

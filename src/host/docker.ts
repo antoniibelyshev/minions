@@ -57,6 +57,8 @@ export function composeYaml(p: ProjectJson, access: SecretsAccess = probeSecrets
     `    mem_limit: ${q(`${c.memoryMiB}m`)}`,
     `    pids_limit: ${c.pidsLimit}`,
     ...(c.network === 'none' ? ['    network_mode: "none"'] : []),
+    ...(c.gpus === 'nvidia' ? ['    deploy:', '      resources:', '        reservations:', '          devices:',
+      '            - driver: "nvidia"', '              count: "all"', '              capabilities: ["gpu"]'] : []),
     // The scratch dir must exist before anything uses TMPDIR; a failed mkdir never stops the container.
     `    command: ["sh", "-c", ${q(`mkdir -p ${CONTAINER.scratch}; exec sleep infinity`)}]`,
     `    working_dir: ${q(CONTAINER.workspace)}`,
@@ -72,6 +74,7 @@ export function composeYaml(p: ProjectJson, access: SecretsAccess = probeSecrets
     '      LANG: "C.UTF-8"',
     '      LC_ALL: "C.UTF-8"',
     '      TERM: "xterm-256color"',
+    ...(c.gpus === 'nvidia' ? ['      NVIDIA_DRIVER_CAPABILITIES: "compute,utility"'] : []),
     '      npm_config_cache: "/home/node/.cache/npm"',
     '      XDG_CACHE_HOME: "/home/node/.cache"',
     // Large temp data (test runs, tool scratch) goes to disk, not RAM; inherited by every exec, so workers and verification commands get it.
@@ -315,6 +318,18 @@ export async function ensureImage(tag: string, opts: { runner?: Runner; root?: s
     : `Rebuilding image ${tag}: the installed package changed since it was built…`);
   await runner('docker', ['build', '-t', tag, '--label', `${BUILD_LABEL}=${fp}`, '-f', join(root, 'docker', 'Dockerfile'), root], { timeoutMs: 1_800_000 });
   return true;
+}
+
+// ---------------------------------------------------------------- container.gpus
+
+/** Files of the NVIDIA container toolkit and driver on a Linux host (checked without running anything). */
+const NVIDIA_FILES = { toolkit: ['/usr/bin/nvidia-container-toolkit', '/usr/bin/nvidia-container-runtime-hook', '/usr/bin/nvidia-container-runtime'], device: '/dev/nvidiactl' };
+export const nvidiaHost = (platform: NodeJS.Platform = process.platform, exists: (p: string) => boolean = existsSync): boolean =>
+  platform === 'linux' && exists(NVIDIA_FILES.device) && NVIDIA_FILES.toolkit.some(exists);
+
+/** container.gpus for project.json: "nvidia" when configured, or on auto when the host has the toolkit; else none. */
+export function resolveGpus(setting: 'auto' | 'nvidia' | 'none' | undefined, nvidia: () => boolean = nvidiaHost): 'nvidia' | undefined {
+  return setting === 'nvidia' || ((setting ?? 'auto') === 'auto' && nvidia()) ? 'nvidia' : undefined;
 }
 
 // ---------------------------------------------------------------- container.aptPackages (docs/design/autonomy.md Decision 14)

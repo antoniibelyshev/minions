@@ -466,15 +466,24 @@ function roleLimits(cfg: MinionsConfig): string {
   return [limited.join(', '), rest].filter(Boolean).join('; ') || 'none';
 }
 
-/** Host runtime with coordinator.sshHosts: how agents reach those hosts (src/runtime/coordinator.ts sshPatterns). */
-export function sshGuidance(cfg: MinionsConfig): string {
+/** Host runtime: the owner's exceptions to the sandbox (coordinator.sshHosts, unsandboxedCommands; src/runtime/coordinator.ts). */
+export function sandboxExceptionGuidance(cfg: MinionsConfig): string {
   const hosts = cfg.coordinator?.sshHosts ?? [];
-  if (!hosts.length || cfg.coordinator?.sandbox === false) return '';
+  const commands = cfg.coordinator?.unsandboxedCommands ?? [];
+  if ((!hosts.length && !commands.length) || cfg.coordinator?.sandbox === false) return '';
+  const single = 'Keep each such call that one command: a pipe, a local redirect, `&&`, `cd` or `$(...)` around it keeps it sandboxed';
+  return [
+    hosts.length ? sshHostsText(hosts) : null,
+    commands.length ? `Commands the owner lets run outside the sandbox, as the owner's user, without a prompt (this is the way to the GPU: the sandbox blocks Metal/MPS): ${commands.map((c) => `\`${c}\``).join(', ')}. ${single}, where it loses that access; write logs from inside the program or with its own flags.` : null,
+  ].filter(Boolean).join(' ');
+}
+
+function sshHostsText(hosts: string[]): string {
   return `SSH hosts the owner opened: ${hosts.map((h) => `\`${h}\``).join(', ')}. \`ssh <host> '<command>'\`, \`scp\`/\`rsync\` to or from \`<host>:<path>\` run outside the sandbox with the owner's SSH keys, without a prompt. Keep each call that one command, written with the host exactly as listed: a pipe, a local redirect, \`&&\`, \`cd\` or \`$(...)\` around it keeps it sandboxed, where SSH fails (put pipes and redirects inside the quoted remote command). Start long jobs detached on the host (\`tmux new -d -s <name> '<command>'\` or \`nohup <command> > <log> 2>&1 &\` remotely) and check on them later.`;
 }
 
 function baseVars(cfg: MinionsConfig, runtime: PluginRuntime = 'docker'): Record<string, string> {
-  const ssh = runtime === 'docker' ? '' : sshGuidance(cfg);
+  const ssh = runtime === 'docker' ? '' : sandboxExceptionGuidance(cfg);
   return {
     toolsGuidance: runtime === 'docker' ? `\n\n${COORDINATOR_TOOLS_GUIDANCE}` : ssh ? `\n\n${ssh}` : '',
     engineerToolsGuidance: runtime === 'docker' ? `\n${ENGINEER_TOOLS_GUIDANCE}` : ssh ? `\n- ${ssh}` : '',

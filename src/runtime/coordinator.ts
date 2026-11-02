@@ -346,7 +346,7 @@ export function coordinatorSettings(cfg: MinionsConfig, opts: { telegram?: boole
     ? ['Bash(minions *)', 'Bash(minions)', ...HOST_GIT_SUBCOMMANDS.flatMap((g) => [`Bash(git ${g})`, `Bash(git ${g} *)`]), 'Bash(backlog *)']
     : ['Bash(minions *)', 'Bash(minions)', 'Bash(git *)', 'Bash(backlog *)'];
   for (const c of cfg.verification.commands) if (!hs || safeVerificationCommand(c)) allow.push(`Bash(${c})`, `Bash(${c} *)`);
-  const ssh = sandboxed ? sshPatterns(cfg.coordinator?.sshHosts ?? []) : [];
+  const ssh = sandboxed ? [...sshPatterns(cfg.coordinator?.sshHosts ?? []), ...(cfg.coordinator?.unsandboxedCommands ?? [])] : [];
   allow.push(...ssh.map((p) => `Bash(${p})`));
   // Replies go only to allowlisted chats (the minions server gates outbound messages too).
   if (opts.telegram) allow.push(...MINIONS_TELEGRAM_TOOLS);

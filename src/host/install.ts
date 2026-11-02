@@ -18,7 +18,7 @@ import {
   backendLabel, loadCredentialRefs, provisionTelegramToken,
   type CredentialsJson, type Fetch, type TelegramProvisionResult,
 } from './credentials.js';
-import { composeYaml, type Runner } from './docker.js';
+import { composeYaml, resolveGpus, type Runner } from './docker.js';
 import { composeHint, daemonHint } from './linux-host.js';
 import { ProjectJsonSchema, loadEffectiveConfig, loadProjectJson, projectConfigPath, resolveEffective, runtimeProjectInfo, sharedConfigView, type ProjectJson } from './project.js';
 import { bindProject, gitCommonDir, loadRegistry, repoRoot, resolveIdentity, saveRegistry, sharedProjectId, type Identity, type Registry } from './registry.js';
@@ -301,6 +301,7 @@ async function prepare(opts: InitOptions, docker?: DockerStatus): Promise<Prepar
       cpus: config.container.cpus, memoryMiB: config.container.memoryMiB, pidsLimit: config.container.pidsLimit,
       ...(config.container.tmpSizeMiB !== undefined ? { tmpSizeMiB: config.container.tmpSizeMiB } : {}),
       publishPorts: config.container.publishPorts, network: config.container.network,
+      ...(resolveGpus(config.container.gpus) ? { gpus: 'nvidia' as const } : {}),
     },
     ...(claudeAuth ? { claudeAuth } : {}),
     ...(runtime === 'host' || prevProject?.runtime || opts.runtime ? { runtime } : {}),
@@ -552,7 +553,7 @@ export async function refreshDerived(project: ProjectJson, effective: MinionsCon
   return warnings;
 }
 
-/** The container resource limits (recreate class) that `minions upgrade` copies from the config into project.json. */
+/** The container resource limits (recreate class) that `minions upgrade` copies from the config into project.json (container.gpus too, resolved). */
 export const CONTAINER_LIMIT_KEYS = ['cpus', 'memoryMiB', 'pidsLimit', 'tmpSizeMiB'] as const;
 
 /**
@@ -562,13 +563,15 @@ export const CONTAINER_LIMIT_KEYS = ['cpus', 'memoryMiB', 'pidsLimit', 'tmpSizeM
  * publishPorts are isolation settings and stay as setup wrote them. An unset tmpSizeMiB drops the override
  * (the default cap applies). Writes project.json only when a value changed; returns the (possibly new) record.
  */
-export async function syncContainerLimits(project: ProjectJson, effective: MinionsConfig): Promise<ProjectJson> {
+export async function syncContainerLimits(project: ProjectJson, effective: MinionsConfig, nvidia?: () => boolean): Promise<ProjectJson> {
   const container = { ...project.container };
   for (const k of CONTAINER_LIMIT_KEYS) {
     const v = effective.container[k];
     if (v === undefined) delete container[k]; else container[k] = v;
   }
-  if (CONTAINER_LIMIT_KEYS.every((k) => container[k] === project.container[k])) return project;
+  const gpus = resolveGpus(effective.container.gpus, nvidia);
+  if (gpus) container.gpus = gpus; else delete container.gpus;
+  if ([...CONTAINER_LIMIT_KEYS, 'gpus' as const].every((k) => container[k] === project.container[k])) return project;
   const next = ProjectJsonSchema.parse({ ...project, container });
   await writeGenerated(project.projectId, projectPaths(project.projectId).projectJson, projectJsonBytes(next));
   return next;
