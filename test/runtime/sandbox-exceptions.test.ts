@@ -6,6 +6,7 @@ import { resolve, validateConfig } from '../../src/config/resolve.js';
 import { coordinatorSettings, sshPatterns } from '../../src/runtime/coordinator.js';
 import { ownerOnlyKey } from '../../src/runtime/control.js';
 import { sandboxExceptionGuidance } from '../../src/plugin/generate.js';
+import { preSshHook, sshFormProblem } from '../../src/runtime/hooks.js';
 import { defaults } from '../helpers.js';
 
 const host = { home: '/Users/u', workspace: '/r/projects/p/host/workspace', state: '/r/projects/p/host/state', secretsDir: '/r/projects/p/secrets', credentialsDir: '/r/credentials', projectDir: '/r/projects/p', hostRoot: '/r' };
@@ -71,5 +72,28 @@ describe('coordinator.allowedDomains', () => {
     for (const bad of ['*', 'localhost', 'crates.io/x', 'a b.com', '*.', 'evil.com:22']) expect(v(bad), bad).toThrow();
     expect(() => resolve({ defaults: defaults(), project: { coordinator: { allowedDomains: ['crates.io'] } } })).toThrow(/cannot open network hosts/);
     expect(ownerOnlyKey('coordinator.allowedDomains')).toBe(true);
+  });
+});
+
+describe('pre-ssh hook: SSH calls that would stay sandboxed', () => {
+  const H = 'me@10.0.0.1';
+  const problem = (c: string) => sshFormProblem(c, [H]);
+  it('allows the exact forms and calls to other hosts', () => {
+    for (const ok of [`ssh ${H} 'hostname; nvidia-smi 2>&1 | head -20'`, `ssh ${H}`, `scp -r out ${H}:~/runs/`, `rsync -av ${H}:/data/x ./x`, 'ssh other@host x | head', 'git log --grep=ssh'])
+      expect(problem(ok), ok).toBeNull();
+  });
+  it('names what to change for the forms agents write', () => {
+    expect(problem(`ssh ${H} 'hostname' 2>&1 | head -30`)).toMatch(/^nothing outside the quotes/);
+    expect(problem(`ssh -o BatchMode=yes ${H} 'hostname'`)).toMatch(/host right after `ssh`/);
+    expect(problem(`timeout 20 ssh ${H} 'hostname'`)).toMatch(/no `timeout`/);
+    expect(problem(`cd /tmp && ssh ${H} 'x'`)).toMatch(/no `cd`/);
+    expect(problem(`scp out ${H}:runs/`)).toMatch(/remote path as/);
+  });
+  it('the hook denies with the reason and an example; allows otherwise', () => {
+    const input = (command: string) => ({ tool_name: 'Bash', tool_input: { command } });
+    const out = preSshHook(input(`ssh ${H} 'x' 2>&1 | head`), [H]);
+    expect(JSON.parse(out.stdout!).hookSpecificOutput).toMatchObject({ permissionDecision: 'deny', permissionDecisionReason: expect.stringMatching(/Operation not permitted.*For example: `ssh me@10\.0\.0\.1 'nvidia-smi 2>&1 \| head -20'`/) });
+    expect(preSshHook(input(`ssh ${H} 'x'`), [H]).stdout).toBeUndefined();
+    expect(preSshHook(input(`ssh ${H} 'x' | head`), []).stdout).toBeUndefined();
   });
 });

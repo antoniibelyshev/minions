@@ -21,6 +21,12 @@
         ]
       },
       {
+        "matcher": "Bash",
+        "hooks": [
+          { "type": "command", "command": "i=$(cat) || exit 0; case \"$i\" in *ssh*|*scp*|*rsync*) printf '%s' \"$i\" | minions hook pre-ssh || exit 0;; esac", "timeout": 30 }
+        ]
+      },
+      {
         "matcher": "Edit|MultiEdit|Write|NotebookEdit",
         "hooks": [
           { "type": "command", "command": "i=$(cat) || exit 2; case \"$i${MINIONS_WORKER_LEASE:+\\\"agent_id\\\"}\" in *'\"agent_id\"'*) printf '%s' \"$i\" | { if command -v timeout >/dev/null 2>&1; then timeout 20 minions hook pre-file; else perl -e '$t=shift;$p=fork;defined $p or exit 127;if(!$p){setpgrp(0,0);exec @ARGV;print STDERR \"$ARGV[0]: $!\\n\";exit 127}setpgrp($p,$p);$SIG{ALRM}=sub{kill \"KILL\",-$p;exit 124};alarm $t;waitpid $p,0;exit($?&127?128+($?&127):$?>>8)' 20 minions hook pre-file; fi; } || exit 2;; esac", "timeout": 30 }

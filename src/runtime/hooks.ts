@@ -451,6 +451,49 @@ export function preBashHook(input: unknown, g?: StateGuard): HookOutput {
   return { reason: 'allow: Bash from a subagent (no coordinator-only minions command, no runtime state path)' };
 }
 
+// ---------------------------------------------------------------- pre-ssh (PreToolUse, Bash)
+
+/**
+ * Plugin PreToolUse(Bash) entry of the pre-ssh hook: node starts only for a call whose text names ssh, scp or rsync. It
+ * corrects a form, it is no boundary (the sandbox is), so every failure of it allows.
+ */
+export const PRE_SSH_HOOK_COMMAND = `i=$(cat) || exit 0; case "$i" in *ssh*|*scp*|*rsync*) printf '%s' "$i" | minions hook pre-ssh || exit 0;; esac`;
+
+/** The pre-ssh hook needs only the owner's coordinator.sshHosts. */
+export type SshLoader = () => Promise<{ sshHosts: string[] }>;
+
+/** The command with its quoted parts removed (what the shell would split on operators). */
+const unquoted = (cmd: string) => cmd.replace(/'[^']*'|"(?:\\.|[^"\\])*"/g, "''");
+
+/**
+ * A call to one of coordinator.sshHosts in a form the sandbox exception does not cover (src/runtime/coordinator.ts
+ * sshPatterns), or null. Claude Code keeps such a call sandboxed and SSH fails with "Operation not permitted", which
+ * agents read as missing access; this says what to change instead.
+ */
+export function sshFormProblem(command: string, hosts: readonly string[]): string | null {
+  const host = hosts.find((h) => command.includes(h));
+  if (!host) return null;
+  const cmd = command.trim();
+  const words = unquoted(cmd).split(/\s+/);
+  const program = words[0] ?? '';
+  if (!['ssh', 'scp', 'rsync'].includes(program)) {
+    return /\b(?:ssh|scp|rsync)\b/.test(cmd) ? `start the call with \`ssh\`, \`scp\` or \`rsync\` itself (no \`${program}\`, \`cd ... &&\` or other wrapper before it)` : null;
+  }
+  if (/[|&;<>`]|\$\(/.test(unquoted(cmd))) return 'nothing outside the quotes: no `2>&1`, `| head`, `> file`, `&&` or `;` after or around the call; put pipes and redirects inside the quoted remote command';
+  if (program === 'ssh' && words[1] !== host) return `write the host right after \`ssh\` (\`ssh ${host} '<command>'\`): no options such as \`-o\`, \`-i\` or \`-p\` before it (the owner's ~/.ssh/config sets them)`;
+  if (program !== 'ssh' && !words.some((w) => w.startsWith(`${host}:/`) || w.startsWith(`${host}:~/`))) return `write the remote path as \`${host}:~/<path>\` or \`${host}:/<absolute path>\``;
+  return null;
+}
+
+export function preSshHook(input: unknown, hosts: readonly string[]): HookOutput {
+  const cmd = isObj(input) && isObj(input.tool_input) && typeof input.tool_input.command === 'string' ? input.tool_input.command : '';
+  const problem = sshFormProblem(cmd, hosts);
+  if (!problem) return { reason: 'allow: no SSH host call, or an allowed form' };
+  const host = hosts.find((h) => cmd.includes(h))!;
+  return deny(`This SSH call would run inside the sandbox, where it fails with "Operation not permitted". The owner allows ${host} outside the sandbox only in exact forms: ${problem}. `
+    + `For example: \`ssh ${host} 'nvidia-smi 2>&1 | head -20'\`. Rewrite the call and run it again.`);
+}
+
 // ---------------------------------------------------------------- pre-file (PreToolUse, file tools)
 
 /** File tools that write, each with the input fields that hold its target path. */
@@ -865,7 +908,7 @@ async function readStdin(timeoutMs = 5000): Promise<string> {
   });
 }
 
-export type HookKind = 'stop' | 'pre-agent' | 'pre-telegram' | 'pre-bash' | 'pre-file' | 'drain';
+export type HookKind = 'stop' | 'pre-agent' | 'pre-telegram' | 'pre-bash' | 'pre-file' | 'pre-ssh' | 'drain';
 
 /** Set by the dispatcher in a headless worker's environment (docs/design/autonomy.md Decision 1). */
 export const WORKER_LEASE_ENV = 'MINIONS_WORKER_LEASE';
@@ -884,10 +927,10 @@ export function asWorkerInput(input: unknown, env: NodeJS.ProcessEnv = process.e
 }
 
 /** Hooks that allow on unreadable input or an internal error (the others fail closed). */
-const failsOpen = (kind: HookKind) => kind === 'stop' || kind === 'drain';
+const failsOpen = (kind: HookKind) => kind === 'stop' || kind === 'drain' || kind === 'pre-ssh';
 
 /** Entry point for `minions hook stop|pre-agent|pre-telegram|drain`: reads stdin, prints the decision, never throws, exits 0. */
-export async function runHook(kind: HookKind, load: HookLoader | DrainLoader, stdinText?: string): Promise<HookOutput> {
+export async function runHook(kind: HookKind, load: HookLoader | DrainLoader | SshLoader, stdinText?: string): Promise<HookOutput> {
   let out: HookOutput;
   try {
     const text = stdinText ?? (await readStdin());
@@ -898,7 +941,8 @@ export async function runHook(kind: HookKind, load: HookLoader | DrainLoader, st
       out = failsOpen(kind) ? { reason: `allow: unreadable hook input (${parseError})` } : deny(`minions could not parse the hook input (${parseError}).`);
     } else {
       if (kind !== 'stop') input = asWorkerInput(input);
-      out = kind === 'drain' ? await drainHook(input, load) : kind === 'pre-telegram' ? preTelegramHook(input) : kind === 'pre-bash' ? preBashHook(input) : kind === 'pre-file' ? preFileHook(input)
+      out = kind === 'drain' ? await drainHook(input, load as DrainLoader) : kind === 'pre-telegram' ? preTelegramHook(input) : kind === 'pre-bash' ? preBashHook(input) : kind === 'pre-file' ? preFileHook(input)
+        : kind === 'pre-ssh' ? preSshHook(input, (await (load as SshLoader)()).sshHosts)
         : kind === 'stop' ? await stopHook(input, load as HookLoader) : preAgentHook(input);
     }
   } catch (e) {

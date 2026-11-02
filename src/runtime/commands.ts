@@ -1032,6 +1032,8 @@ export function register(program: Command): void {
     .action(async () => { await runHook('pre-bash', async () => { throw new Error('pre-bash needs no runtime context'); }); exitHook(); });
   hook.command('pre-file').description('PreToolUse(file tools) hook: subagents cannot write, read or search the runtime state dir (DB, backlog, briefs, results)')
     .action(async () => { await runHook('pre-file', async () => { throw new Error('pre-file needs no runtime context'); }); exitHook(); });
+  hook.command('pre-ssh').description('PreToolUse(Bash) hook: a call to one of coordinator.sshHosts in a form that would stay sandboxed is refused with the form to use')
+    .action(async () => { await runHook('pre-ssh', async () => ({ sshHosts: (await getConfig()).coordinator?.sshHosts ?? [] })); exitHook(); });
   hook.command('pre-telegram').description('PreToolUse(Telegram tools) hook: only the coordinator itself may use them, never a subagent')
     .action(async () => { await runHook('pre-telegram', hookLoader); exitHook(); });
   // DB plus the config when it loads (role contracts for the notice; no backlog): it runs on every worker tool call while a drain is requested.
