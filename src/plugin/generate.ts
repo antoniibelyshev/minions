@@ -479,7 +479,8 @@ export function sandboxExceptionGuidance(cfg: MinionsConfig): string {
 }
 
 function sshHostsText(hosts: string[]): string {
-  return `SSH hosts the owner opened: ${hosts.map((h) => `\`${h}\``).join(', ')}. \`ssh <host> '<command>'\`, \`scp\`/\`rsync\` to or from \`<host>:<path>\` run outside the sandbox with the owner's SSH keys, without a prompt. Keep each call that one command, written with the host exactly as listed: a pipe, a local redirect, \`&&\`, \`cd\` or \`$(...)\` around it keeps it sandboxed, where SSH fails (put pipes and redirects inside the quoted remote command). Start long jobs detached on the host (\`tmux new -d -s <name> '<command>'\` or \`nohup <command> > <log> 2>&1 &\` remotely) and check on them later.`;
+  const h = hosts[0]!;
+  return `SSH hosts the owner opened: ${hosts.map((x) => `\`${x}\``).join(', ')}. Exactly these forms run outside the sandbox with the owner's SSH setup, without a prompt: \`ssh ${h} '<remote command>'\`, \`scp <local> ${h}:~/<path>\` (or \`:/<abs path>\`), \`scp ${h}:~/<path> <local>\`, and the same with \`rsync <flags>\`. Anything else stays sandboxed, where SSH fails with "Operation not permitted": no options before the host (\`-o\`, \`-i\`, \`-p\`; the owner's ~/.ssh/config sets them), no \`timeout\` or other wrapper, and nothing after the closing quote (\`2>&1\`, \`| head\`, \`> file\`, \`&&\`): put pipes and redirects inside the quoted remote command, e.g. \`ssh ${h} 'nvidia-smi 2>&1 | head -20'\`. "Host key verification failed" or "Permission denied (publickey)" is the owner's SSH setup: report it, never work around it. Start long jobs detached on the host (\`tmux new -d -s <name> '<command>'\` or \`nohup <command> > <log> 2>&1 &\` remotely) and check on them later.`;
 }
 
 function baseVars(cfg: MinionsConfig, runtime: PluginRuntime = 'docker'): Record<string, string> {

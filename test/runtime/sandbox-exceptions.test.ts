@@ -15,7 +15,10 @@ type Settings = { permissions: { allow: string[] }; sandbox?: { excludedCommands
 describe('coordinator.sshHosts', () => {
   it('excludes ssh/scp/rsync to each host from the sandbox and allows them', () => {
     const s = coordinatorSettings(withHosts(['me@10.0.0.1']), { auth: 'login', host }) as Settings;
-    const patterns = ['ssh me@10.0.0.1', 'ssh me@10.0.0.1 *', 'scp * me@10.0.0.1:*', 'scp me@10.0.0.1:* *', 'rsync * me@10.0.0.1:*', 'rsync me@10.0.0.1:* *'];
+    const h = 'me@10.0.0.1';
+    const patterns = [`ssh ${h}`, `ssh ${h} *`, ...['scp', 'rsync'].flatMap((p) => [`${p} * ${h}:/*`, `${p} * ${h}:~/*`, `${p} ${h}:/* *`, `${p} ${h}:~/* *`, `${p} * ${h}:/* *`, `${p} * ${h}:~/* *`])];
+    // A trailing `:*` is Claude Code's legacy prefix syntax (the * is not a wildcard there).
+    expect(patterns.some((p) => p.endsWith(':*'))).toBe(false);
     expect(sshPatterns(['me@10.0.0.1'])).toEqual(patterns);
     expect(s.sandbox?.excludedCommands).toEqual(patterns);
     expect(s.permissions.allow).toEqual(expect.arrayContaining(patterns.map((p) => `Bash(${p})`)));
@@ -53,7 +56,7 @@ describe('coordinator.sshHosts', () => {
   });
 
   it('tells the agents how to call the hosts (host runtime, sandbox on)', () => {
-    expect(sandboxExceptionGuidance(withHosts(['me@10.0.0.1']))).toMatch(/^SSH hosts the owner opened: `me@10\.0\.0\.1`\..*a pipe, a local redirect/);
+    expect(sandboxExceptionGuidance(withHosts(['me@10.0.0.1']))).toMatch(/^SSH hosts the owner opened: `me@10\.0\.0\.1`\..*no options before the host.*nothing after the closing quote/);
     expect(sandboxExceptionGuidance(withHosts())).toBe('');
     expect(sandboxExceptionGuidance(withHosts(['h'], false))).toBe('');
   });

@@ -137,7 +137,7 @@ export const HOST_SECRET_DIRS = [
 export const HOST_PROTECTED_FILES = ['.zshrc', '.zprofile', '.zshenv', '.zlogin', '.bashrc', '.bash_profile', '.profile', '.gitconfig', '.claude.json'];
 export const HOST_PROTECTED_DIRS = ['.config/git', 'Library/LaunchAgents', '.claude'];
 /** Toolchain dirs under ~ that sandboxed commands may still read (the home directory itself is denied). */
-export const HOST_TOOLCHAIN_DIRS = ['.nvm', '.volta', '.fnm', '.local/share/fnm', '.asdf', '.local/share/mise', '.rustup', '.cargo/bin', '.pyenv', '.rbenv', '.bun', '.deno', 'go', '.sdkman', '.local/bin', 'Library/pnpm', '.npm-global'];
+export const HOST_TOOLCHAIN_DIRS = ['.nvm', '.volta', '.fnm', '.local/share/fnm', '.asdf', '.local/share/mise', '.rustup', '.cargo/bin', '.pyenv', '.rbenv', '.bun', '.deno', 'go', '.sdkman', '.local/bin', '.local/share/uv', 'Library/pnpm', '.npm-global'];
 /** Hosts sandboxed Bash may reach without a prompt (npm for installs). */
 export const HOST_SANDBOX_DOMAINS = ['registry.npmjs.org'];
 /** Git subcommands the host-runtime coordinator may run without a prompt (no config, remotes or push). */
@@ -273,10 +273,13 @@ export function hostSettings(h: HostHardening): { sandbox: Record<string, unknow
  * Host runtime: `ssh`, `scp` and `rsync` calls to the owner's coordinator.sshHosts, as Bash patterns. The sandbox proxy
  * carries only HTTP(S)/SOCKS-aware tools and ~/.ssh is unreadable inside it, so these run outside it
  * (`sandbox.excludedCommands`, the owner's SSH config and keys) and are allowed without a prompt. Claude Code keeps a
- * call sandboxed unless every command of it matches; a redirect, `cd` or `$(...)` keeps it sandboxed too.
+ * call sandboxed unless every command of it matches; a redirect, `cd` or `$(...)` keeps it sandboxed too. No options before
+ * the host (`-o ProxyCommand=...` would run a local program unsandboxed): they belong in the owner's ~/.ssh/config. Remote
+ * paths are `host:/abs` or `host:~/rel`: Claude Code reads a trailing `:*` as its legacy prefix syntax, never as a wildcard.
  */
 export function sshPatterns(hosts: readonly string[]): string[] {
-  return hosts.flatMap((h) => [`ssh ${h}`, `ssh ${h} *`, `scp * ${h}:*`, `scp ${h}:* *`, `rsync * ${h}:*`, `rsync ${h}:* *`]);
+  return hosts.flatMap((h) => [`ssh ${h}`, `ssh ${h} *`,
+    ...['scp', 'rsync'].flatMap((p) => [`${p} * ${h}:/*`, `${p} * ${h}:~/*`, `${p} ${h}:/* *`, `${p} ${h}:~/* *`, `${p} * ${h}:/* *`, `${p} * ${h}:~/* *`])]);
 }
 
 /** Shell metacharacters and globs a verification command may not contain in the host runtime. */
