@@ -597,6 +597,8 @@ export async function runSupervisor(d: SupervisorDeps): Promise<SupervisorReport
     while (!d.signal?.aborted && !stopping) {
       const cur = db.supervisorLock();
       if (!cur || cur.pid !== lock.pid || cur.at !== lock.at) { exit = 'lock-lost'; stopping = 'shutdown'; log('minions supervisor: the lock was taken over; stopping'); break; }
+      // A state restore swapped the DB file: this connection still reads the old one and would hold its lock forever.
+      if (db.replacedOnDisk()) { exit = 'lock-lost'; stopping = 'shutdown'; log('minions supervisor: the runtime database file was replaced (state restore?); stopping'); break; }
       if (Date.now() - configAt >= t.configMs) {
         configAt = Date.now();
         try { cfg = await d.config(); } catch (e) { log(`minions supervisor: config unreadable, keeping the last one (${(e as Error).message})`); }

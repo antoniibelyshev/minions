@@ -1,4 +1,4 @@
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, statSync } from 'node:fs';
 import { dirname } from 'node:path';
 import type { DatabaseSync, SQLInputValue } from 'node:sqlite';
 import type { IdempotencyStore } from '../backlog/types.js';
@@ -299,10 +299,16 @@ export interface RuntimeDbOptions {
   walRetryBudgetMs?: number;
 }
 
+function fileIdentity(path: string): { dev: number; ino: number } | null {
+  try { const st = statSync(path); return { dev: st.dev, ino: st.ino }; } catch { return null; }
+}
+
 export class RuntimeDb {
   readonly path: string;
   readonly sql: DatabaseSync;
   private depth = 0;
+  /** dev/ino of the file this connection opened (null for :memory: or when unreadable): see replacedOnDisk. */
+  private readonly fileId: { dev: number; ino: number } | null;
 
   constructor(path = runtimePaths().db, opts: RuntimeDbOptions = {}) {
     this.path = path;
@@ -317,6 +323,18 @@ export class RuntimeDb {
     if (path !== ':memory:') this.enableWal(opts.walRetryBudgetMs ?? BUSY_TIMEOUT_MS);
     this.sql.exec('PRAGMA foreign_keys = ON');
     this.migrate();
+    this.fileId = path === ':memory:' ? null : fileIdentity(path);
+  }
+
+  /**
+   * Whether the path now names another file than the one this connection opened (a state restore renamed the DB
+   * aside and swapped a backup in) or none at all. A long-running process keeps the old inode and would otherwise
+   * see itself as lock holder in a DB nobody else reads. False when the identity is unknown.
+   */
+  replacedOnDisk(): boolean {
+    if (!this.fileId) return false;
+    const now = fileIdentity(this.path);
+    return !now || now.dev !== this.fileId.dev || now.ino !== this.fileId.ino;
   }
 
   /**
