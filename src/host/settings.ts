@@ -36,6 +36,7 @@ import { projectPaths } from '../core/paths.js';
 import { editProjectConfig, revisionConflict } from './config-write.js';
 import { loadCredentialRefs, type CredentialsJson } from './credentials.js';
 import { refreshDerived } from './install.js';
+import { mergeOverlay } from './control-overlay.js';
 import { loadEffectiveConfig, projectConfigPath, resolveEffective, type ProjectJson } from './project.js';
 
 export const SETTING_GROUPS = ['Delivery', 'Verification', 'Reporting', 'Models', 'Concurrency', 'Policy', 'Permissions', 'Integrations', 'Pause', 'Agents', 'Container'] as const;
@@ -374,7 +375,7 @@ export function closestSettingKeys(input: string, keys: readonly string[] = SETT
 
 // ---------------------------------------------------------------- reading
 
-export type SourceLabel = 'mode default' | 'shared config' | 'project config' | 'local override' | 'session' | 'credential store' | 'runtime';
+export type SourceLabel = 'mode default' | 'shared config' | 'project config' | 'local override' | 'session' | 'credential store' | 'runtime' | 'coordinator overlay';
 
 export interface SettingView {
   key: string;
@@ -413,6 +414,8 @@ export interface SettingsContext {
   credentials: CredentialsJson;
   /** Runtime pause flags; null when the runtime is not running or did not answer. */
   paused: { intake: boolean; starts: boolean } | null;
+  /** Why the coordinator's control overlay is not part of `config` (unreadable or invalid); absent otherwise. */
+  overlayWarning?: string;
 }
 
 export function getPath(obj: unknown, path: string): Value {
@@ -447,6 +450,7 @@ function sourceOf(def: SettingDef, ctx: SettingsContext): SourceLabel {
   if (prov === 'local') return 'local override';
   if (prov === 'project') return ctx.project.visibility === 'shared' ? 'shared config' : 'project config';
   if (prov === 'session') return 'session';
+  if (prov === 'control') return 'coordinator overlay';
   return 'mode default';
 }
 
@@ -486,13 +490,25 @@ export const listSettings = (ctx: SettingsContext): SettingView[] =>
 export interface SettingsDeps {
   /** Pause flags of the running runtime (null when it is not running or did not answer). */
   pausedState?: (project: ProjectJson) => Promise<SettingsContext['paused']>;
+  /**
+   * The coordinator's control overlay text (src/host/control-overlay.ts; null: none or not reachable). Given only for
+   * the listing: its keys then show the overlay's value with source "coordinator overlay". Changes are planned on the
+   * host layers without it.
+   */
+  controlOverlay?: (project: ProjectJson) => Promise<string | null>;
 }
 
 export async function loadSettingsContext(project: ProjectJson, deps: SettingsDeps = {}): Promise<SettingsContext> {
   const eff = await loadEffectiveConfig(project);
   const credentials = await loadCredentialRefs(project.projectId).catch((): CredentialsJson => ({ version: 1 }));
   const paused = deps.pausedState ? await deps.pausedState(project).catch(() => null) : null;
-  return { project, config: eff.config, provenance: eff.provenance, credentials, paused };
+  if (!deps.controlOverlay) return { project, config: eff.config, provenance: eff.provenance, credentials, paused };
+  let text: string | null = null;
+  let readError: string | undefined;
+  try { text = await deps.controlOverlay(project); } catch (e) { readError = `the coordinator's control overlay could not be read (${(e as Error).message.slice(0, 200)})`; }
+  const m = mergeOverlay(eff, text);
+  const overlayWarning = readError ?? m.warning;
+  return { project, config: m.config, provenance: m.provenance, credentials, paused, ...(overlayWarning ? { overlayWarning } : {}) };
 }
 
 // ---------------------------------------------------------------- parsing

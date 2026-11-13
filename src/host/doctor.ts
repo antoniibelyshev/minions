@@ -20,6 +20,8 @@ import { telegramDoctorCheck } from '../telegram/probe.js';
 import { fastPathHint } from '../backlog/taskfile.js';
 import { resolveChannel, type ChannelResolution } from '../telegram/channel.js';
 import { loadEffectiveConfig, loadProjectJson } from './project.js';
+import { mergeOverlay, projectOverlayText } from './control-overlay.js';
+import type { EffectiveConfig } from '../config/resolve.js';
 import { checkPlugin, pluginMismatch, type PluginCheck } from './install.js';
 import { projectForPath } from './registry.js';
 import { harnessChecks, harnessSkipChecks, parseWorkProbe } from './harness-checks.js';
@@ -426,12 +428,25 @@ export async function runDoctor(opts: {
     await hostAuthChecks(project.projectId, auth, add, runtimeOf(project));
     const baseUrl = containerEnv(auth).ANTHROPIC_BASE_URL;
     let config: MinionsConfig | undefined;
+    let baseEff: EffectiveConfig | null = null;
+    /** The coordinator's control overlay on top of the host config (the runtime applies it): setup and merge.readiness see it. */
+    const useOverlay = (text: string | null, err?: unknown) => {
+      if (!baseEff) return;
+      const m = mergeOverlay(baseEff, text);
+      const warning = err !== undefined ? `the coordinator's control overlay could not be read (${short(String((err as Error)?.message ?? err))}); the host config alone is shown` : m.warning;
+      if (warning) add('config.overlay', 'warn', warning, 'Inspect it in the runtime with `minions control show`.');
+      else if (m.overlayKeys.length) add('config.overlay', 'ok', `the coordinator's control overlay sets ${m.overlayKeys.join(', ')} (applied on top of the host config)`);
+      effective = config = m.config;
+    };
     try {
       const eff = await loadEffectiveConfig(project);
       effective = config = eff.config;
+      baseEff = eff;
       add('config', 'ok', `valid (revision ${eff.config.configRevision}, package ${eff.config.packageVersion})`);
       for (const u of listUnavailable(eff.config)) add(`config.${u.path}`, 'unavailable', u.reason);
       checks.push(pluginDoctorCheck(await checkPlugin(project, eff.config).catch((e: unknown) => e instanceof Error ? e : new Error(String(e))), hostMode));
+      // Host runtime: the overlay is a local file. Docker: read below once the container is known to run.
+      if (hostMode) await projectOverlayText(project).then((t) => useOverlay(t), (e: unknown) => useOverlay(null, e));
     } catch (e) {
       add('config', 'fail', isMinionsError(e) ? e.message : String(e), 'Fix the configuration file, then rerun doctor.');
     }
@@ -493,6 +508,7 @@ export async function runDoctor(opts: {
             r.code === 0 && out.startsWith('HTTP ') ? `${maskValue(baseUrl)} reachable from the container (${out})` : `${maskValue(baseUrl)} not reachable from the container: ${out || short(r.stderr) || `exit ${r.code}`}`,
             r.code === 0 ? undefined : auth.preset === 'jbcentral' ? 'Make sure the Central proxy is running on the host (`minions auth refresh` starts it), then `minions start`.' : 'Check the URL and that the service listens on the host.');
         }
+        if (baseEff) await projectOverlayText(project, { running: async () => true, exec: ex }).then((t) => useOverlay(t), (e: unknown) => useOverlay(null, e));
         checks.push(...tmpUsageChecks(await ex(['df', '-Pk', '/tmp', CONTAINER.scratch]), { capMiB: tmpSizeMiB(project.container), scratch: CONTAINER.scratch }));
         checks.push(backlogCliCheck(await ex(['backlog', '--version'])));
         if (config) checks.push(...integrationDoctorChecks(await ex(['minions', 'status', '--json'])));
