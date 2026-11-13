@@ -248,6 +248,14 @@ const DECLARED: readonly DeclaredSetting[] = [
     loosens: (f, t) => (Array.isArray(t) && t.length > (Array.isArray(f) ? f.length : 1) ? `more digests a day (${t.length}: one coordinator wake each)` : null) },
   { key: 'routine.timezone', group: 'Policy', label: 'Routine time zone', type: 'text', optional: true, apply: 'live',
     description: 'IANA time zone of the digest times and the routine\'s days (default Europe/Berlin)' },
+  { key: 'routine.planWhenIdle', group: 'Policy', label: 'Plan toward goals when idle', type: 'bool', optional: true, apply: 'live',
+    description: 'with the queue empty and an open goal in goals.md (next to the project config), wake the coordinator to plan the next tasks (default: on in independent mode, off in supervised)',
+    loosens: turnsOn('the runtime wakes the coordinator to plan and start new work toward the goals on its own: model spend without you') },
+  { key: 'routine.maxPlanWakesPerDay', group: 'Policy', label: 'Planning wakes per day', type: 'int', min: 0, optional: true, apply: 'live',
+    description: 'planning wakes per day in routine.timezone (default 4; each also counts as a wake)',
+    loosens: (f, t) => ((typeof t === 'number' ? t : 4) > (typeof f === 'number' ? f : 4) ? `more planning wakes per day (${typeof f === 'number' ? f : 4} -> ${String(t)}; higher spend)` : null) },
+  { key: 'routine.minPlanGapMinutes', group: 'Policy', label: 'Minimum minutes between planning wakes', type: 'int', min: 1, optional: true, apply: 'live',
+    description: 'the routine wakes the coordinator to plan at most once per this many minutes (default 120)' },
   { key: 'coordinator.disallowedTools', group: 'Policy', label: 'Coordinator tool trim', type: 'list', optional: true, apply: 'launch',
     description: 'Claude Code tools removed from the coordinator session (default: the built-in trim; none: keep every tool; tools it needs cannot be listed)',
     loosens: (f, t) => {
@@ -463,6 +471,7 @@ export function currentValue(def: SettingDef, ctx: SettingsContext): Value {
   if (def.key === 'coordinator.contextReset.enabled' && v === undefined) return true; // unset = on
   if (def.key === 'coordinator.toolSearch' && v === undefined) return true; // unset = on
   if (def.key === 'routine.enabled' && v === undefined) return false; // unset = off
+  if (def.key === 'routine.planWhenIdle' && v === undefined) return ctx.config.mode === 'independent'; // unset = by the mode
   if (def.key === 'coordinator.bundledSkills' && v === undefined) return false; // unset = off
   return v;
 }

@@ -20,7 +20,7 @@ import { recordOwnerMessageViaStop } from './transcript-shapes.js';
 
 const T0 = new Date('2026-10-27T12:00:00.000Z');
 const ago = (min: number, from = T0) => new Date(from.getTime() - min * 60_000).toISOString();
-const ON: RoutineSettings = { enabled: true, tickMinutes: 15, minWakeGapMinutes: 30, maxWakesPerDay: 8, digestAt: ['08:00'], timezone: 'Europe/Berlin' };
+const ON: RoutineSettings = { enabled: true, tickMinutes: 15, minWakeGapMinutes: 30, maxWakesPerDay: 8, digestAt: ['08:00'], timezone: 'Europe/Berlin', planWhenIdle: true, maxPlanWakesPerDay: 4, minPlanGapMinutes: 120 };
 const running = (over: Partial<CoordinatorView> = {}): CoordinatorView => ({ running: true, lockAcquiredAt: ago(120), staleLock: false, exit: null, lastRestartAt: null, ...over });
 const down = (over: Partial<CoordinatorView> = {}): CoordinatorView => ({ running: false, lockAcquiredAt: null, staleLock: false, exit: null, lastRestartAt: null, ...over });
 const runnable: WakeReason = { kind: 'dispatch-decision', taskId: 'task-1', detail: 'task-1 needs a decision (blocked)' };
@@ -33,9 +33,17 @@ const inputs = (over: Partial<WakeInputs> = {}): WakeInputs => ({
 
 describe('routine settings', () => {
   it('unset = off with the defaults; set fields win', () => {
-    expect(routineSettings({})).toEqual({ enabled: false, tickMinutes: 15, minWakeGapMinutes: 30, maxWakesPerDay: 8, digestAt: ['08:00'], timezone: 'Europe/Berlin' });
-    expect(routineSettings({ routine: { enabled: true, tickMinutes: 5 } })).toEqual({ enabled: true, tickMinutes: 5, minWakeGapMinutes: 30, maxWakesPerDay: 8, digestAt: ['08:00'], timezone: 'Europe/Berlin' });
+    const plan = { planWhenIdle: false, maxPlanWakesPerDay: 4, minPlanGapMinutes: 120 };
+    expect(routineSettings({})).toEqual({ enabled: false, tickMinutes: 15, minWakeGapMinutes: 30, maxWakesPerDay: 8, digestAt: ['08:00'], timezone: 'Europe/Berlin', ...plan });
+    expect(routineSettings({ routine: { enabled: true, tickMinutes: 5 } })).toEqual({ enabled: true, tickMinutes: 5, minWakeGapMinutes: 30, maxWakesPerDay: 8, digestAt: ['08:00'], timezone: 'Europe/Berlin', ...plan });
     expect(routineSettings({ routine: { digestAt: ['18:00', '08:00', '18:00'], timezone: 'America/New_York' } })).toMatchObject({ digestAt: ['08:00', '18:00'], timezone: 'America/New_York' });
+  });
+
+  it('planWhenIdle: on by default in independent mode, off in supervised; an explicit value wins', () => {
+    expect(routineSettings({ mode: 'independent', routine: { enabled: true } }).planWhenIdle).toBe(true);
+    expect(routineSettings({ mode: 'supervised', routine: { enabled: true } }).planWhenIdle).toBe(false);
+    expect(routineSettings({ mode: 'independent', routine: { planWhenIdle: false } }).planWhenIdle).toBe(false);
+    expect(routineSettings({ mode: 'supervised', routine: { planWhenIdle: true, maxPlanWakesPerDay: 1, minPlanGapMinutes: 60 } })).toMatchObject({ planWhenIdle: true, maxPlanWakesPerDay: 1, minPlanGapMinutes: 60 });
   });
 });
 

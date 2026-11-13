@@ -18,8 +18,12 @@ import { lastOwnerMessageAt } from './coordinator-usage.js';
 import { TRANSCRIPT_META } from './context-reset.js';
 import { localDayStart } from './zoned-time.js';
 import { readHolds } from './dispatch-state.js';
+import type { GoalsView } from './goals.js';
 
-export const ROUTINE_DEFAULTS = { tickMinutes: 15, minWakeGapMinutes: 30, maxWakesPerDay: 8, digestAt: ['08:00'] as readonly string[], timezone: 'Europe/Berlin' } as const;
+export const ROUTINE_DEFAULTS = {
+  tickMinutes: 15, minWakeGapMinutes: 30, maxWakesPerDay: 8, digestAt: ['08:00'] as readonly string[], timezone: 'Europe/Berlin',
+  maxPlanWakesPerDay: 4, minPlanGapMinutes: 120,
+} as const;
 /** The main transcript must be idle this long before a wake (the prompt cache has expired by then). */
 export const IDLE_MINUTES = 10;
 /** No wake within this many minutes of an owner message (the task-58 "latest message" window). */
@@ -34,6 +38,10 @@ export const WATCHDOG_TICKS = 2;
 export const ROUTINE_EVENT = 'routine';
 export const WAKE_EVENT = 'routine-wake';
 export const CRASH_START_EVENT = 'routine-crash-start';
+/** A wake for planning (docs/design/autonomy.md Decision 15); also recorded as a WAKE_EVENT, so it counts as a wake. */
+export const PLAN_WAKE_EVENT = 'routine-plan-wake';
+/** The constant planning prompt: the restart's wake reads it from the reasons; a session gets it as its message. */
+export const PLAN_PROMPT = '/minions:orchestrate plan';
 
 export interface RoutineSettings {
   enabled: boolean; tickMinutes: number; minWakeGapMinutes: number; maxWakesPerDay: number;
@@ -41,10 +49,14 @@ export interface RoutineSettings {
   digestAt: string[];
   /** IANA zone of the digest times and of the routine's days (wakes and crash starts per day). */
   timezone: string;
+  /** Plan when the queue is empty and a goal is open (default: on in independent mode, off in supervised). */
+  planWhenIdle: boolean;
+  maxPlanWakesPerDay: number;
+  minPlanGapMinutes: number;
 }
 
-/** Effective routine settings: unset = off, every unset field its default. */
-export function routineSettings(cfg: Pick<MinionsConfig, 'routine'>): RoutineSettings {
+/** Effective routine settings: unset = off, every unset field its default (planWhenIdle: by the mode). */
+export function routineSettings(cfg: Pick<MinionsConfig, 'routine'> & { mode?: MinionsConfig['mode'] }): RoutineSettings {
   const r = cfg.routine ?? {};
   return {
     enabled: r.enabled === true,
@@ -53,6 +65,9 @@ export function routineSettings(cfg: Pick<MinionsConfig, 'routine'>): RoutineSet
     maxWakesPerDay: r.maxWakesPerDay ?? ROUTINE_DEFAULTS.maxWakesPerDay,
     digestAt: [...new Set(r.digestAt?.length ? r.digestAt : ROUTINE_DEFAULTS.digestAt)].sort(),
     timezone: r.timezone ?? ROUTINE_DEFAULTS.timezone,
+    planWhenIdle: r.planWhenIdle ?? cfg.mode === 'independent',
+    maxPlanWakesPerDay: r.maxPlanWakesPerDay ?? ROUTINE_DEFAULTS.maxPlanWakesPerDay,
+    minPlanGapMinutes: r.minPlanGapMinutes ?? ROUTINE_DEFAULTS.minPlanGapMinutes,
   };
 }
 
@@ -64,7 +79,9 @@ export type WakeReason =
   /** The autopilot dispatcher holds a task for a decision (docs/design/autonomy.md Decision 1). */
   | { kind: 'dispatch-decision'; taskId: string; detail: string }
   /** The digest is due (phase 4 composes it): always allowed, also at 100% budget and past maxWakesPerDay. */
-  | { kind: 'digest'; detail: string };
+  | { kind: 'digest'; detail: string }
+  /** The queue is empty and a goal is open: plan the next tasks (Decision 15; planReason). */
+  | { kind: 'plan'; detail: string };
 
 /** How the coordinator stands, as the pass reads it. */
 export interface CoordinatorView {
@@ -95,11 +112,15 @@ export interface WakeInputs {
   wakesToday: number;
   lastWakeAt: string | null;
   crashStartsToday: number;
+  /** Plan wakes today and the last one (a `plan` reason's own cap and gap). */
+  planWakesToday?: number;
+  lastPlanWakeAt?: string | null;
 }
 
 export type WakeDecision =
   | { action: 'none'; why: string }
-  | { action: 'wake'; why: string; digest: boolean }
+  /** plan: the wake is (also) for planning; with sessions on it goes to the general session instead of a restart. */
+  | { action: 'wake'; why: string; digest: boolean; plan: boolean }
   | { action: 'crash-start'; why: string };
 
 const minutesSince = (now: Date, at: string | null) => (at ? (now.getTime() - Date.parse(at)) / 60_000 : Infinity);
@@ -144,6 +165,13 @@ export function decideWake(i: WakeInputs): WakeDecision {
     reasons = reasons.filter((r) => r.kind === 'digest');
     if (!reasons.length) return none('the budget is used up: only the digest wakes the coordinator');
   }
+  // Planning has its own cap and gap on top of the wake's: it never rides along on a digest past them either.
+  const planBlock = reasons.some((r) => r.kind === 'plan') ? planCapBlock(i) : null;
+  if (planBlock) {
+    reasons = reasons.filter((r) => r.kind !== 'plan');
+    if (!reasons.length) return none(planBlock);
+  }
+  const plan = reasons.some((r) => r.kind === 'plan');
   if (i.startsPaused && !digest) return none('starts are paused');
   if (i.activeLeases.length) return none(`${i.activeLeases.length} active worker lease(s) (${i.activeLeases.join(', ')}): the coordinator is busy`);
   if (i.drain) return none(`a drain is in progress (${i.drain.reason})`);
@@ -152,11 +180,48 @@ export function decideWake(i: WakeInputs): WakeDecision {
   const idle = minutesSince(i.now, i.idleSince);
   if (idle < IDLE_MINUTES) return none(`the coordinator was active ${Math.floor(idle)} min ago (needs ${IDLE_MINUTES} min idle)`);
   const what = `${reasons.length} reason(s): ${reasons.slice(0, 3).map((r) => r.detail).join('; ')}${reasons.length > 3 ? '; …' : ''}`;
-  if (digest) return { action: 'wake', why: `digest due; ${what}`, digest: true };
+  if (digest) return { action: 'wake', why: `digest due; ${what}`, digest: true, plan };
   const gap = minutesSince(i.now, i.lastWakeAt);
   if (gap < i.settings.minWakeGapMinutes) return none(`last wake ${Math.floor(gap)} min ago (routine.minWakeGapMinutes ${i.settings.minWakeGapMinutes})`);
   if (i.wakesToday >= i.settings.maxWakesPerDay) return none(`wake limit reached (${i.wakesToday}/${i.settings.maxWakesPerDay} today, routine.maxWakesPerDay)`);
-  return { action: 'wake', why: what, digest: false };
+  return { action: 'wake', why: what, digest: false, plan };
+}
+
+/** Why a plan reason waits for its own limits (routine.maxPlanWakesPerDay, routine.minPlanGapMinutes), else null. */
+function planCapBlock(i: WakeInputs): string | null {
+  const today = i.planWakesToday ?? 0;
+  if (today >= i.settings.maxPlanWakesPerDay) return `plan wake limit reached (${today}/${i.settings.maxPlanWakesPerDay} today, routine.maxPlanWakesPerDay)`;
+  const gap = minutesSince(i.now, i.lastPlanWakeAt ?? null);
+  if (gap < i.settings.minPlanGapMinutes) return `last plan wake ${Math.floor(gap)} min ago (routine.minPlanGapMinutes ${i.settings.minPlanGapMinutes})`;
+  return null;
+}
+
+/** What the pass knows for planning (the CLI reads the goals copy, the goals state and the backlog). */
+export interface PlanFacts {
+  goals: Pick<GoalsView, 'present' | 'counts' | 'exhausted'>;
+  /** Tasks the team is busy with: ready, in a stage, waiting for CI or merging (goals.ts QUEUED_STATUSES). */
+  queued: number;
+  /** `idea` tasks: a planning pass promotes worthwhile ones before inventing new work. */
+  ideas: number;
+  intakePaused: boolean;
+  /** Sessions on: why the general session cannot take a planning message now (pending messages), else null. */
+  sessionBusy?: string | null;
+}
+
+/**
+ * The plan reason (pure): the queue is empty, a goal is open, intake is open, and planning has not recorded that
+ * nothing worthwhile is left for the goals as they are. Returns the reason, or why there is none.
+ */
+export function planReason(f: PlanFacts): { reason: WakeReason | null; why: string } {
+  const no = (why: string) => ({ reason: null, why });
+  if (!f.goals.present) return no('no goals file');
+  if (!f.goals.counts.open) return no(`no open goal (${f.goals.counts.done} done, ${f.goals.counts.paused} paused)`);
+  if (f.queued) return no(`${f.queued} task(s) ready or in flight`);
+  if (f.intakePaused) return no('intake is paused');
+  if (f.goals.exhausted) return no(`planning found nothing worthwhile left at ${f.goals.exhausted.at} (until the goals change)`);
+  if (f.sessionBusy) return no(f.sessionBusy);
+  const ideas = f.ideas ? `; ${f.ideas} idea task(s) to weigh first` : '';
+  return { reason: { kind: 'plan', detail: `the queue is empty and ${f.goals.counts.open} goal(s) are open${ideas}: plan the next tasks` }, why: 'plan due' };
 }
 
 // ---------------------------------------------------------------- reasons
@@ -208,6 +273,10 @@ export interface RoutinePassDeps {
   /** Phase 4: the outbox hold-back (reholdExpired): held items stay for the digest (routine off: released); returns the count. */
   holdBack?: (now: Date) => number;
   mtime?: (path: string) => number | null;
+  /** Planning (Decision 15): the goals and the queue, read only when the routine may plan. Default: never plans. */
+  planFacts?: () => Promise<PlanFacts>;
+  /** Sessions on: hands PLAN_PROMPT to the general session instead of restarting the router. */
+  planSession?: () => Promise<string>;
   /** The fresh wake: `coordinator restart --wake` detached, never with force (scheduleDetachedRestart). */
   wake: () => Promise<string>;
   /** The crash start: `coordinator restart --recover` detached, after its own drain check. */
@@ -229,6 +298,8 @@ export interface RoutineReport {
   /** Held notifications moved on to the next digest by the hold-back step. */
   reheld?: number;
   reasons?: WakeReason[];
+  /** Why the pass did or did not add a plan reason (null: the routine does not plan). */
+  plan?: string | null;
   decision?: WakeDecision;
   /** What the wake or crash start did (scheduled, or the refusal). */
   outcome?: { ok: boolean; detail: string };
@@ -285,6 +356,7 @@ export async function runRoutinePass(deps: RoutinePassDeps, opts: { trigger: Rou
     // Sessions on: holds go to their task sessions; nothing but the digest wakes the coordinator.
     const sessionsOn = deps.config.coordinator?.sessions?.enabled === true;
     const reasons = settings.enabled && c.running && !sessionsOn ? collectWakeReasons(deps.db) : [];
+    report.plan = await planCheck(deps, settings, c, reasons);
     const digest = settings.enabled ? deps.digestDue?.(deps.now()) ?? null : null;
     // Sessions on and the router running: its background `coordinator wait` returns for the digest, so no restart.
     if (digest && !(sessionsOn && c.running)) reasons.push({ kind: 'digest', detail: digest });
@@ -295,14 +367,20 @@ export async function runRoutinePass(deps: RoutinePassDeps, opts: { trigger: Rou
       now: deps.now(), settings, coordinator: c, activeLeases: await deps.activeLeases(), drain: drainOrUpgrade(deps), startsPaused: deps.db.paused().starts,
       budgetExhausted: deps.budgetExhausted(), reasons, idleSince: since, lastOwnerMessageAt: lastOwnerMessageAt(deps.db),
       wakesToday: wakes.length, lastWakeAt: lastWake?.at ?? null, crashStartsToday: deps.db.eventsOfKindSince(CRASH_START_EVENT, day).length,
+      planWakesToday: deps.db.eventsOfKindSince(PLAN_WAKE_EVENT, day).length, lastPlanWakeAt: deps.db.lastEventOfKind(PLAN_WAKE_EVENT)?.at ?? null,
     });
     report.reasons = reasons;
     report.decision = decision;
     if (decision.action === 'wake') {
       try {
-        const detail = await deps.wake();
+        // Sessions on: only planning reaches here while the router runs (holds go to task sessions, it sends the digest).
+        const toSession = decision.plan && sessionsOn && !decision.digest;
+        if (toSession && !deps.planSession) throw new Error('no session to plan in');
+        const detail = toSession ? await deps.planSession!() : await deps.wake();
         report.outcome = { ok: true, detail };
-        deps.db.addEvent(WAKE_EVENT, null, { digest: decision.digest, reasons: reasons.map((r) => r.kind), detail }, deps.now().toISOString());
+        const at = deps.now().toISOString();
+        deps.db.addEvent(WAKE_EVENT, null, { digest: decision.digest, reasons: reasons.map((r) => r.kind), detail }, at);
+        if (decision.plan) deps.db.addEvent(PLAN_WAKE_EVENT, null, { via: toSession ? 'session' : 'restart', detail }, at);
       } catch (e) { report.outcome = { ok: false, detail: msg(e) }; }
     } else if (decision.action === 'crash-start') {
       try {
@@ -316,12 +394,27 @@ export async function runRoutinePass(deps: RoutinePassDeps, opts: { trigger: Rou
     report.nextAt = settings.enabled ? plusMinutes(at, settings.tickMinutes) : null;
     deps.db.addEvent(ROUTINE_EVENT, null, {
       trigger: report.trigger, durationMs: report.durationMs, reheld: report.reheld ?? 0,
-      reasons: reasons.slice(0, 50), decision, outcome: report.outcome ?? null, coordinator: report.coordinator,
+      reasons: reasons.slice(0, 50), plan: report.plan ?? null, decision, outcome: report.outcome ?? null, coordinator: report.coordinator,
     }, at);
     return report;
   } finally {
     try { deps.db.releaseRoutineLock(lock); } catch { /* a dead holder is taken over next time */ }
   }
+}
+
+/**
+ * Adds the plan reason when the routine may plan: on, planWhenIdle, the coordinator running and no held decision
+ * (holds come first). Returns why it did or did not (null when planning is off). Never throws.
+ */
+async function planCheck(deps: Pick<RoutinePassDeps, 'planFacts'>, s: RoutineSettings, c: CoordinatorView, reasons: WakeReason[]): Promise<string | null> {
+  if (!s.enabled || !s.planWhenIdle || !deps.planFacts) return null;
+  if (!c.running) return 'the coordinator is not running';
+  if (reasons.some((r) => r.kind === 'dispatch-decision')) return 'held decisions come first';
+  try {
+    const p = planReason(await deps.planFacts());
+    if (p.reason) reasons.push(p.reason);
+    return p.why;
+  } catch (e) { return `planning facts unreadable: ${msg(e)}`; }
 }
 
 /** The last recorded pass (`minions sync --routine --last`): what the woken coordinator reads its reasons from. */
@@ -332,18 +425,34 @@ export interface RoutineLast {
   nextAt: string | null;
   wakesToday: number;
   lastWakeAt: string | null;
+  /** Planning wakes (Decision 15); null when the routine does not plan (off, or routine.planWhenIdle off). */
+  plan: { wakesToday: number; maxPerDay: number; lastAt: string | null; nextAt: string | null; why: string | null } | null;
 }
 
-export function routineLast(db: RuntimeDb, cfg: Pick<MinionsConfig, 'routine'>, now: Date = new Date()): RoutineLast {
+export function routineLast(db: RuntimeDb, cfg: Pick<MinionsConfig, 'routine'> & { mode?: MinionsConfig['mode'] }, now: Date = new Date()): RoutineLast {
   const s = routineSettings(cfg);
   const e = db.lastEventOfKind(ROUTINE_EVENT);
-  const d = (e?.data ?? {}) as { trigger?: string; decision?: WakeDecision; reasons?: WakeReason[]; outcome?: { ok: boolean; detail: string } };
+  const d = (e?.data ?? {}) as { trigger?: string; decision?: WakeDecision; reasons?: WakeReason[]; plan?: string | null; outcome?: { ok: boolean; detail: string } };
+  const nextAt = s.enabled ? (e ? plusMinutes(e.at, s.tickMinutes) : now.toISOString()) : null;
+  const day = localDayStart(now, s.timezone);
+  const lastWakeAt = db.lastEventOfKind(WAKE_EVENT)?.at ?? null;
+  let plan: RoutineLast['plan'] = null;
+  if (s.enabled && s.planWhenIdle) {
+    const planToday = db.eventsOfKindSince(PLAN_WAKE_EVENT, day).length;
+    const lastAt = db.lastEventOfKind(PLAN_WAKE_EVENT)?.at ?? null;
+    // The earliest pass that may plan: the next pass, the plan gap, the wake gap, and tomorrow once today's cap is used.
+    const after = [nextAt, lastAt && plusMinutes(lastAt, s.minPlanGapMinutes), lastWakeAt && plusMinutes(lastWakeAt, s.minWakeGapMinutes),
+      planToday >= s.maxPlanWakesPerDay ? localDayStart(new Date(Date.parse(day) + 36 * 3_600_000), s.timezone) : null];
+    const next = after.filter((x): x is string => !!x).sort().at(-1) ?? null;
+    plan = { wakesToday: planToday, maxPerDay: s.maxPlanWakesPerDay, lastAt, nextAt: next, why: d.plan ?? null };
+  }
   return {
     enabled: s.enabled, tickMinutes: s.tickMinutes,
     last: e ? { at: e.at, trigger: d.trigger ?? 'unknown', decision: d.decision ?? null, reasons: d.reasons ?? [], outcome: d.outcome ?? null } : null,
-    nextAt: s.enabled ? (e ? plusMinutes(e.at, s.tickMinutes) : now.toISOString()) : null,
-    wakesToday: db.eventsOfKindSince(WAKE_EVENT, localDayStart(now, s.timezone)).length,
-    lastWakeAt: db.lastEventOfKind(WAKE_EVENT)?.at ?? null,
+    nextAt,
+    wakesToday: db.eventsOfKindSince(WAKE_EVENT, day).length,
+    lastWakeAt,
+    plan,
   };
 }
 
@@ -351,7 +460,13 @@ export function routineLast(db: RuntimeDb, cfg: Pick<MinionsConfig, 'routine'>, 
 export function humanRoutine(r: RoutineLast): string {
   if (!r.enabled) return `routine: off (routine.enabled)${r.last ? `; last pass ${r.last.at}` : ''}`;
   const last = r.last ? `last pass ${r.last.at} (${r.last.trigger}: ${r.last.decision?.action === 'none' ? r.last.decision.why : r.last.decision?.action ?? 'no decision'})` : 'no pass yet';
-  return `routine: every ${r.tickMinutes} min; ${last}; next ${r.nextAt ?? '-'}; wakes today ${r.wakesToday}`;
+  return `routine: every ${r.tickMinutes} min; ${last}; next ${r.nextAt ?? '-'}; wakes today ${r.wakesToday}${r.plan ? `\n${humanPlan(r.plan)}` : ''}`;
+}
+
+/** The planning line under the routine: last and next plan wake, and why the last pass did not plan. */
+export function humanPlan(p: NonNullable<RoutineLast['plan']>): string {
+  const why = p.why && p.why !== 'plan due' ? ` (last pass: ${p.why})` : '';
+  return `plan wakes: last ${p.lastAt ?? 'never'}; next when the queue is empty, not before ${p.nextAt ?? '-'}; today ${p.wakesToday}/${p.maxPerDay}${why}`;
 }
 
 export function humanRoutineReport(r: RoutineReport): string {
