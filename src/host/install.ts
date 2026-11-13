@@ -12,6 +12,7 @@ import { atomicWrite, ensureDir, exists, readJsonIfExists, sha256, writeJson } f
 import { TELEGRAM_TOKEN_CONTAINER_PATH, imageTag, projectPaths, registryPath, repoPaths, volumeNames } from '../core/paths.js';
 import { VERSION } from '../core/version.js';
 import { generatePlugin } from '../plugin/generate.js';
+import { GOALS_FILE, GOALS_MAX_BYTES } from '../runtime/goals.js';
 import { discover, dockerProbe, type Discovery, type DockerProbe, type DockerStatus } from './discovery.js';
 import { authOf, ensureSecretsDir, isKeyAuth, loadDefaults, resolveOnPath, summarize, type AuthSummary, type ClaudeAuth } from './auth.js';
 import {
@@ -321,6 +322,8 @@ async function prepare(opts: InitOptions, docker?: DockerStatus): Promise<Prepar
   add(paths.composeYaml, composeYaml(project));
   add(join(paths.runtimeDir, 'config.json'), json(effective));
   add(join(paths.runtimeDir, 'project.json'), json(runtimeProjectInfo(project)));
+  const goals = await readGoalsSource(project);
+  if (goals) add(join(paths.runtimeDir, GOALS_FILE), goals);
 
   const staging = await mkdtemp(join(tmpdir(), 'minions-plugin-'));
   const cleanup = () => rm(staging, { recursive: true, force: true });
@@ -496,6 +499,15 @@ async function apply(prep: Prepared): Promise<ApplyResult> {
 /** Directory role prompt files (`roles.<r>.prompt`) are relative to: next to the project config, read on the host (D1). */
 const roleConfigDir = (project: Pick<ProjectJson, 'visibility' | 'repoPath' | 'projectId'>) => dirname(projectConfigPath(project));
 
+/**
+ * The owner's goals file (docs/design/autonomy.md Decision 15): `goals.md` next to the project config, read on the
+ * host like the role prompt files, so the runtime only ever sees the owner's copy. Null when there is none.
+ */
+export const goalsSourcePath = (project: Pick<ProjectJson, 'visibility' | 'repoPath' | 'projectId'>) => join(roleConfigDir(project), GOALS_FILE);
+async function readGoalsSource(project: Pick<ProjectJson, 'visibility' | 'repoPath' | 'projectId'>): Promise<Buffer | null> {
+  try { return (await readFile(goalsSourcePath(project))).subarray(0, GOALS_MAX_BYTES); } catch { return null; }
+}
+
 /** Renders the plugin from the installed package's templates: [absolute path under pluginDir, content]. */
 async function renderPlugin(pluginDir: string, effective: MinionsConfig, project: ProjectJson): Promise<[string, Buffer][]> {
   const staging = await mkdtemp(join(tmpdir(), 'minions-plugin-'));
@@ -522,13 +534,23 @@ export async function refreshDerived(project: ProjectJson, effective: MinionsCon
   const manifest = (await loadManifest(project.projectId)) ?? { version: 1 as const, packageVersion: VERSION, files: [] };
   const warnings: string[] = [];
   const plugin = await renderPlugin(paths.pluginDir, effective, project);
+  const goals = await readGoalsSource(project);
+  const goalsCopy = join(paths.runtimeDir, GOALS_FILE);
   const files: [string, Buffer][] = [
     [paths.composeYaml, Buffer.from(composeYaml(project))],
     [join(paths.runtimeDir, 'config.json'), json(effective)],
     [join(paths.runtimeDir, 'project.json'), json(runtimeProjectInfo(project))],
+    ...(goals ? [[goalsCopy, goals] as [string, Buffer]] : []),
     ...plugin,
   ];
   let changed = false;
+  // The owner removed the goals file: so does the runtime's copy.
+  if (!goals && await fileHash(goalsCopy) !== undefined) {
+    await rm(goalsCopy, { force: true });
+    const i = manifest.files.findIndex((f) => f.path === goalsCopy);
+    if (i >= 0) manifest.files.splice(i, 1);
+    changed = true;
+  }
   for (const [path, data] of files) {
     const want = sha256(data);
     const cur = await fileHash(path);
