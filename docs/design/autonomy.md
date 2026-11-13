@@ -295,8 +295,9 @@ them.
   pass, which a write to the host-owned project config would not be without a host round trip. The control layer
   refuses `budgets.*` from the coordinator (set, apply, or an undo that would touch them), so the overlay being
   coordinator-writable does not reopen the hole. `budgets.*` stop being prompt text: they refuse claims against the
-  USD estimate, with API-key billing only (a subscription has no USD figure; they are shown, not enforced). The
-  per-task cap counts the task's workers; the daily cap counts everything since the UTC day start. A cap that stops
+  USD estimate, with API-key billing only (a subscription has no USD figure; they are shown, not enforced; Decision 15
+  adds token caps enforced on any billing). The per-task cap counts the task's workers; the daily cap counts everything
+  since the UTC day start (local midnight in routine.timezone since Decision 15). A cap that stops
   work queues one owner notice per cap value (per UTC day for the daily cap), since a silent wait looks like a hang.
   The verify step still runs for stages a cap holds back: it spends no tokens, and the stage is ready when the owner
   raises the cap. A claim-time check cannot stop a stage already running, so one stage can overshoot the cap.
@@ -334,6 +335,34 @@ runtime already uses the owner's machine.
   running container.
 - **No Dockerfile escape hatch for now.** Package names cover what toolchains need without letting config run
   arbitrary build steps as root.
+
+## Decision 15. Token caps, enforced on any billing (owner, 2026-11-13)
+
+On a Claude subscription the USD caps of Decision 13 are shown, not enforced, so an unattended team had no real stop.
+
+- **`budgets.dailyTokens` and `budgets.taskTokens`**, optional whole token counts next to the USD caps, off when
+  unset or null. No mode sets them (`minions mode set` rewrites only the USD caps), so a mode change keeps the owner's.
+  The owner sets them with `minions settings set budgets.<key> <n|off>` or `/budget day|task <n>M|<n>k|<n> tokens`
+  (`/budget ... off` clears both caps of that kind); the coordinator never can (Decision 13's owner-only keys).
+- **Token caps are enforced whatever the billing**: tokens are what minions records for every agent, and the plan
+  quota they stand for is not visible. USD caps stay enforced with API-key billing only. With API-key billing both
+  apply and the first reached stops work.
+- **What counts.** The daily caps count everything recorded (coordinator sessions and workers): the coordinator's own
+  turns spend the same quota. The per-task caps count the task's workers over all its attempts, as before: the
+  coordinator's share is not attributable to one task.
+- **The day starts at local midnight in `routine.timezone`** (the digest's zone, default Europe/Berlin), for the USD
+  daily cap too: one cap day, matching the owner's day. This replaces Decision 13's UTC day.
+- **Same enforcement points as the USD caps**: the claim (and `work run`) refuses a stage, `work next` lists a capped
+  task's stages as `waitingOn: budget` and reports a reached daily cap as `startsBlocked`, and the routine's
+  `budgetExhausted` gate counts a reached daily cap (only the digest wakes the coordinator then). Running workers are
+  never stopped, so one stage can overshoot.
+- **A task at its per-task cap is held for the coordinator** (dispatcher hold `budget-cap`, once per cap value, with
+  the owner notice): it decides whether to block, split or narrow the task, or to ask the owner for a higher cap,
+  rather than the task sitting silently. Resuming the hold does not lift the cap; the hold clears itself once no cap
+  stops the task. Verification still runs for it.
+- **Warnings**: besides the notice at the cap, the dispatcher queues one owner `status` notice at 50% and at 80% of an
+  enforced daily cap (per threshold, cap value and day). No per-task warnings: the hold at the cap is the decision point.
+- `minions status` shows the token caps next to the USD display and says `enforced`.
 
 ## Reversed decisions
 
