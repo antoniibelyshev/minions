@@ -26,7 +26,7 @@ import { formatAccessResult, runAccessCommand, type AccessAction } from '../tele
 import { createInterface } from 'node:readline/promises';
 import type { PollerCheck } from '../telegram/isolation.js';
 import {
-  buildClaudeCommand, buildCoordinatorCommand, hostChannelReport, printChannelServer, telegramPollerStatus, claudePermissionModes, coordinatorWrapper, launchCoordinator, permissionModesNeeded, probeRuntime, readLaunchRecord, readMountedToken, RECOVERY_PROMPT,
+  buildClaudeCommand, buildCoordinatorCommand, hostChannelReport, isGatewayLaunch, printChannelServer, telegramPollerStatus, claudePermissionModes, coordinatorWrapper, launchCoordinator, permissionModesNeeded, probeRuntime, readLaunchRecord, readMountedToken, RECOVERY_PROMPT,
   restartCoordinator, runtimeChannelFacts, scheduleDetachedRestart, syncCoordinator, coordinatorLaunchStatus, type LaunchStatus,
   coordinatorPidAlive, procStartTime, readExitRecord, readPrompt, runtimeAuthMethod, systemProcessControl, scheduleCrashStart, TELEGRAM_TOKEN_ENV, WAKE_PROMPT,
 } from './coordinator.js';
@@ -46,7 +46,7 @@ import { budgetNotice, humanBaseline, humanSpend, parseTokens, recordLeaseUsage,
 import { runtimePaths, type RuntimePaths } from './paths.js';
 import { attachArgs, checkSessionName, listSessionsArgs, newSessionCommand, nextSessionName, parseTmuxSessions, runInteractive } from './interactive.js';
 import { controlApply, controlSet, controlShow, controlUndo, controlUnset, parseValue, readJournal, withControl, type ControlChange } from './control.js';
-import { contextResetCheck, HANDOFF_MAX_BYTES, humanContextReset, readHandoff, TRANSCRIPT_META, withContextReset, writeHandoff, type ContextResetCheck } from './context-reset.js';
+import { contextResetCheck, sessionsResetOverview, HANDOFF_MAX_BYTES, humanContextReset, readHandoff, TRANSCRIPT_META, withContextReset, writeHandoff, type ContextResetCheck } from './context-reset.js';
 import { handoffPathFor, sessionScope } from './session-scope.js';
 export { withContextReset } from './context-reset.js';
 import { capacityOf, Scheduler, type NextReport, type NextStage, type RoleCapacity, type UsageFlag } from './scheduler.js';
@@ -398,7 +398,9 @@ export async function runtimeChannelStatus(cfg: MinionsConfig, paths = runtimePa
 
 export async function collectStatus(deps: { db: RuntimeDb; config: MinionsConfig; state?: string; backlog: () => Promise<BacklogAdapter>; channel?: () => Promise<ChannelStatus>; launch?: () => Promise<LaunchStatus>; poller?: () => Promise<PollerCheck>;
   /** The local integrator's block (the CLI passes collectIntegrationStatus for /workspace/repo); omitted: no block. */
-  integration?: (tasks: Task[] | null) => Promise<IntegrationStatus | null> }): Promise<StatusReport> {
+  integration?: (tasks: Task[] | null) => Promise<IntegrationStatus | null>;
+  /** True in a gateway launch (isGatewayLaunch on the running coordinator's launch record): sessions reset themselves. */
+  gatewayLaunch?: () => Promise<boolean> }): Promise<StatusReport> {
   const { db: d, config: cfg } = deps;
   const leases = d.activeLeases();
   const report: StatusReport = {
@@ -420,7 +422,12 @@ export async function collectStatus(deps: { db: RuntimeDb; config: MinionsConfig
   try { report.spend = spendReport({ db: d, config: cfg }); } catch { /* status never fails on the tally */ }
   try { report.routine = routineLast(d, cfg); } catch { /* status never fails on the routine */ }
   try { if (cfg.routine?.enabled) report.digest = digestStatus(d, cfg); } catch { /* status never fails on the digest */ }
-  try { const { steps: _s, ...c } = contextResetCheck({ db: d, config: cfg, ...(deps.state !== undefined ? { state: deps.state } : {}) }); report.contextReset = c; } catch { /* status never fails on the reset check */ }
+  try {
+    const st = deps.state !== undefined ? { state: deps.state } : {};
+    const gateway = deps.gatewayLaunch ? await deps.gatewayLaunch().catch(() => false) : false;
+    const { steps: _s, ...c } = gateway && sessionScope() === null ? sessionsResetOverview({ db: d, config: cfg, ...st }) : contextResetCheck({ db: d, config: cfg, ...st });
+    report.contextReset = c;
+  } catch { /* status never fails on the reset check */ }
   let tasks: Task[] | null = null;
   try {
     tasks = await (await deps.backlog()).listTasks();
@@ -1466,7 +1473,8 @@ export function register(program: Command): void {
       }
       const cfg = await getConfig();
       const r = await collectStatus({ db: getDb(), config: cfg, state: runtimePaths().state, backlog: getBacklog, channel: () => runtimeChannelStatus(cfg), launch: () => coordinatorLaunchStatus(cfg), poller: () => telegramPollerStatus(),
-        integration: (tasks) => collectIntegrationStatus({ db: getDb(), config: cfg, repo: runtimePaths().repo, tasks }) });
+        integration: (tasks) => collectIntegrationStatus({ db: getDb(), config: cfg, repo: runtimePaths().repo, tasks }),
+        gatewayLaunch: async () => { const rec = await readLaunchRecord(); return !!rec && isGatewayLaunch(cfg, rec.telegram); } });
       emit(r, { json: globalOpts(cmd).json, human: humanStatus });
     }));
   const pauseLike = (name: 'pause' | 'resume') => {

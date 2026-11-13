@@ -5,7 +5,7 @@ import { atomicWrite } from '../core/fsutil.js';
 import { redact } from '../core/output.js';
 import { DISPATCH_HOLDER, type RuntimeDb } from './db.js';
 import { withOpenRuns } from './runner/record.js';
-import { scopedMetaKey, sessionScope, type SessionScope } from './session-scope.js';
+import { parseScope, scopedMetaKey, sessionScope, type SessionScope } from './session-scope.js';
 
 /**
  * Routine coordinator context resets (task-45). The coordinator session's context grows with every turn;
@@ -217,6 +217,12 @@ export interface ContextResetCheck {
   settings: ContextResetSettings;
   /** Present when due: what to run, in order. */
   steps?: string[];
+  /**
+   * Gateway launch (coordinator sessions with the Telegram gateway): there is no main coordinator session, each
+   * session resets itself (sessionsResetOverview). `due`/`session` then describe nothing; `sessions` holds the state.
+   */
+  managedBy?: 'sessions';
+  sessions?: { tracked: number; due: { key: string; reason: string }[] };
 }
 
 export interface ContextResetDeps {
@@ -349,14 +355,20 @@ export function contextResetCheck(deps: ContextResetDeps): ContextResetCheck {
   let handoffs = 0;
   let handoffWritten = false;
   const delivered: string[] = [];
+  // Records and releases of dispatcher leases are not the coordinator's hand-offs (they do not block it either).
+  const holders = new Map<string, string | null>();
+  const dispatched = (leaseId: string | undefined): boolean => {
+    if (!leaseId) return false;
+    if (!holders.has(leaseId)) holders.set(leaseId, db.lease(leaseId)?.holder ?? null);
+    return holders.get(leaseId) === DISPATCH_HOLDER;
+  };
   for (const r of rows) {
     if (r.kind === 'coordinator-handoff') { handoffWritten = true; continue; }
+    let d: { to?: string; leaseId?: string } | null = null;
+    try { d = r.data_json ? JSON.parse(r.data_json) as { to?: string; leaseId?: string } : null; } catch { d = null; }
+    if (dispatched(d?.leaseId)) continue;
     handoffs++;
-    if (r.kind !== 'record' || !r.data_json) continue;
-    try {
-      const d = JSON.parse(r.data_json) as { to?: string; leaseId?: string };
-      if (d.to === 'delivered' || d.to === 'done') delivered.push(r.task_id ?? d.leaseId ?? '?');
-    } catch { /* not a record we can read */ }
+    if (r.kind === 'record' && d && (d.to === 'delivered' || d.to === 'done')) delivered.push(r.task_id ?? d.leaseId ?? '?');
   }
 
   let contextTokens: number | null = null;
@@ -367,6 +379,31 @@ export function contextResetCheck(deps: ContextResetDeps): ContextResetCheck {
     if (rec?.path && since && rec.at && rec.at >= since) contextTokens = contextTokensFromTranscript((deps.readTranscript ?? readTail)(rec.path));
   } catch { contextTokens = null; }
   return resetVerdict({ settings, since, blockers, handoffs, handoffWritten, delivered, contextTokens });
+}
+
+/**
+ * `minions status` in a gateway launch (coordinator sessions + Telegram gateway, isGatewayLaunch): there is no main
+ * coordinator session, so the single-coordinator check would only count everyone's hand-offs against a context that
+ * is never recorded. Each session resets itself (its own contextResetCheck on its records and releases); this reports
+ * how many sessions have a transcript recorded and which of them have a reset due. Never due itself.
+ */
+export function sessionsResetOverview(deps: Omit<ContextResetDeps, 'session'>): ContextResetCheck {
+  const settings = contextResetSettings(deps.config);
+  const rows = deps.db.all<{ key: string }>('SELECT key FROM meta WHERE key LIKE ? ORDER BY key', `${TRANSCRIPT_META}:%`);
+  const due: { key: string; reason: string }[] = [];
+  let tracked = 0;
+  for (const r of rows) {
+    let scope: SessionScope;
+    try { scope = parseScope(r.key.slice(TRANSCRIPT_META.length + 1)); } catch { continue; }
+    tracked++;
+    try { const c = sessionResetCheck(deps, scope); if (c.due) due.push({ key: scope.key, reason: c.reason }); } catch { /* skip an unreadable session */ }
+  }
+  const reason = `coordinator sessions reset themselves (${tracked} tracked${due.length ? `, due: ${due.map((d) => d.key).join(', ')}` : ', none due'})`;
+  return {
+    enabled: settings.enabled, due: false, triggers: [], blockers: [], reason,
+    session: { since: null, handoffs: 0, delivered: [], contextTokens: null, contextSource: 'unavailable', handoffWritten: false },
+    settings, managedBy: 'sessions', sessions: { tracked, due },
+  };
 }
 
 interface VerdictInput {
@@ -407,6 +444,7 @@ export function dueNotice(c: ContextResetCheck): { due: true; reason: string; st
 
 /** One status line when resets are on. */
 export function humanContextReset(c: ContextResetCheck): string {
+  if (c.managedBy === 'sessions') return `context reset: ${c.reason}`;
   const s = c.session;
   const ctx = s.contextTokens === null ? 'context unknown' : `context ${Math.round(s.contextTokens / 1000)}k${c.settings.contextTokens ? `/${Math.round(c.settings.contextTokens / 1000)}k` : ''}`;
   return `context reset: ${c.due ? 'due' : 'not due'} (${s.handoffs}${c.settings.handoffs ? `/${c.settings.handoffs}` : ''} hand-offs, ${ctx}${s.delivered.length ? `, delivered ${s.delivered.join(', ')}` : ''})${c.due ? '' : c.blockers.length ? `; ${c.blockers.join('; ')}` : ''}`;
