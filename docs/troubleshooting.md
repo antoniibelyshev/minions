@@ -56,6 +56,10 @@ coordinator can start). Then run `minions settings restart`: it restarts the coo
 recovery prompt (`/minions:recover`), which re-dispatches the released tasks. The replaced state is
 moved to `<state>/pre-restore/<time>/` inside the runtime; the newest three copies are kept, older ones
 are removed. The archive copies in the runtime import and export dirs are removed after use.
+Open upgrade requests in the backup were made for the runtime that wrote it (for example a container
+recreate for new apt packages): restored into the other runtime (Docker to host, or back) they are
+marked `rejected` as obsolete; from an older backup that does not record its runtime they are marked
+`expired`. Check with `minions settings requests --all`.
 
 ## Docker is not running
 

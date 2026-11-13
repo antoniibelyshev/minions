@@ -6,7 +6,7 @@ import { describe, expect, it } from 'vitest';
 import { openDb, SCHEMA_VERSION, type RuntimeDb } from '../../src/runtime/db.js';
 import { runtimePaths } from '../../src/runtime/paths.js';
 import {
-  createStateBackup, MINIONS_SECRET_FILE_NAMES, stopHelperProcess, parseStateBackup, PRE_RESTORE_KEEP, readTar, releaseRestoredLeases, restoreStateBackup, RESTORE_RELEASE_REASON, writeTar,
+  closeRestoredRequests, createStateBackup, MINIONS_SECRET_FILE_NAMES, stopHelperProcess, parseStateBackup, PRE_RESTORE_KEEP, readTar, releaseRestoredLeases, restoreStateBackup, RESTORE_RELEASE_REASON, writeTar,
   type StateManifest, type TarEntry,
 } from '../../src/runtime/state-backup.js';
 import { projectPaths } from '../../src/core/paths.js';
@@ -248,6 +248,40 @@ describe('state restore guards', () => {
     expect(none).toEqual([]);
     // A holder that ignores SIGTERM: false after the timeout.
     await expect(stopHelperProcess('dispatcher_lock', lock, { alive: () => true, kill: () => undefined, pollMs: 2, timeoutMs: 20 })).resolves.toBe(false);
+  });
+
+  it('open upgrade requests of a backup from another runtime are rejected as obsolete; same runtime: kept', async () => {
+    const src = seed();
+    src.db.addChangeRequest({ id: 'cr_000000a1', kind: 'upgrade', payload: { fromContainer: true }, reason: 'container.aptPackages: recreate' });
+    const file = join(tmp('minions-state-out-'), 'state.tar.gz');
+    await createStateBackup(src.p, file);
+    src.db.close();
+    expect(parseStateBackup(readFileSync(file)).manifest.runtime).toBe('docker'); // tests run outside the host runtime
+    const same = freshTarget();
+    const r1 = await restoreStateBackup(same.p, file, { alive: () => false, runtime: 'docker' });
+    expect(r1.closedRequests).toBeUndefined();
+    const host = freshTarget();
+    const r2 = await restoreStateBackup(host.p, file, { alive: () => false, runtime: 'host' });
+    expect(r2.closedRequests).toEqual([{ id: 'cr_000000a1', status: 'rejected', detail: expect.stringMatching(/obsolete: recorded in the docker runtime; .* restored into the host runtime/) }]);
+    expect(r2.warnings.join('\n')).toMatch(/cr_000000a1 rejected/);
+    const d = openDb(host.p.db);
+    try {
+      expect(d.changeRequest('cr_000000a1')).toMatchObject({ status: 'rejected' });
+      expect(d.changeRequests()).toEqual([]);
+    } finally { d.close(); }
+  });
+
+  it('closeRestoredRequests: a backup without its runtime expires open requests (confirmed too); closed ones stay', () => {
+    const d = openDb(join(tmp('minions-state-cr-'), 'minions.db'));
+    d.addChangeRequest({ id: 'cr_000000b1', kind: 'upgrade', payload: {}, reason: null });
+    d.setChangeRequestStatus('cr_000000b1', 'confirmed');
+    d.addChangeRequest({ id: 'cr_000000b2', kind: 'upgrade', payload: {}, reason: null });
+    d.setChangeRequestStatus('cr_000000b2', 'applied');
+    const closed = closeRestoredRequests(d, { createdAt: '2026-10-01T00:00:00.000Z' }, 'host');
+    expect(closed).toEqual([{ id: 'cr_000000b1', status: 'expired', detail: expect.stringMatching(/does not name its runtime/) }]);
+    expect(d.changeRequest('cr_000000b2')?.status).toBe('applied');
+    expect(closeRestoredRequests(d, { runtime: 'host', createdAt: 'x' }, 'host')).toEqual([]);
+    d.close();
   });
 
   it('restores into a state dir that has no DB yet', async () => {

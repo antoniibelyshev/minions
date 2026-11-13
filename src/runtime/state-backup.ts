@@ -10,6 +10,7 @@ import { lstat, mkdir, mkdtemp, readdir, readFile, rename, rm, rmdir, writeFile 
 import { basename, dirname, join } from 'node:path';
 import { gunzipSync, gzipSync } from 'node:zlib';
 import { matchesAny } from '../config/capabilities.js';
+import { runtimeMode } from '../core/cli-helpers.js';
 import { MinionsError } from '../core/errors.js';
 import { VERSION } from '../core/version.js';
 import { coordinatorPidAlive, type LockAlive } from './coordinator.js';
@@ -56,7 +57,13 @@ export interface StateManifest {
   files: ManifestFile[];
   /** Paths found in the state dir but not archived, with the reason (symlink, hard link, secret-like, ...). */
   skipped: { path: string; reason: string }[];
+  /** The agent runtime that wrote it (absent from older backups). A restore into another runtime rejects its open upgrade requests. */
+  runtime?: BackupRuntime;
 }
+
+export type BackupRuntime = 'docker' | 'host';
+/** The agent runtime this process runs in: the container (docker) or the host runtime. */
+export const currentBackupRuntime = (env: NodeJS.ProcessEnv = process.env): BackupRuntime => (runtimeMode(env) === 'host-runtime' ? 'host' : 'docker');
 
 // ---------------------------------------------------------------------------------------------------
 // Minimal ustar (POSIX.1-1988) writer/reader with PAX `path` records for long names. Only regular
@@ -244,7 +251,7 @@ export async function createStateBackup(paths: Pick<RuntimePaths, 'state' | 'db'
   const files = entries.filter((e) => e.type === 'file').map((e) => ({ path: e.path, size: e.data.length, sha256: sha256(e.data) }));
   const manifest: StateManifest = {
     format: STATE_BACKUP_FORMAT, version: STATE_BACKUP_VERSION, createdAt, minionsVersion: VERSION, schemaVersion,
-    dirs, files, skipped,
+    dirs, files, skipped, runtime: currentBackupRuntime(),
   };
   const mbuf = Buffer.from(JSON.stringify(manifest, null, 2) + '\n');
   const gz = gzipSync(writeTar([{ path: MANIFEST_NAME, type: 'file', data: mbuf, mode: 0o644 }, ...entries], Math.floor(Date.parse(createdAt) / 1000)));
@@ -321,6 +328,30 @@ export interface StateImportResult {
    * before the swap; one still running had its lock row carried into the restored DB (absent from older runtimes).
    */
   helpers?: { helper: RestoreHelper; pid: number; stopped: boolean }[];
+  /** Open upgrade requests of the backup closed by the restore (closeRestoredRequests; absent: none). */
+  closedRequests?: { id: string; status: 'rejected' | 'expired'; detail: string }[];
+}
+
+/**
+ * Open upgrade requests (proposed, confirmed, failed) in a restored DB were recorded for the runtime that wrote the
+ * backup (a container recreate for new apt packages, say). Restored into another runtime they are obsolete:
+ * `rejected`. From a backup without its runtime (older versions) nobody can tell: `expired` (the coordinator asks
+ * again if still needed). Restored into the same runtime they stay open.
+ */
+export function closeRestoredRequests(db: RuntimeDb, manifest: Pick<StateManifest, 'runtime' | 'createdAt'>, into: BackupRuntime): NonNullable<StateImportResult['closedRequests']> {
+  if (manifest.runtime === into) return [];
+  const open = db.changeRequests().filter((r) => r.kind === 'upgrade');
+  if (!open.length) return [];
+  const status = manifest.runtime ? 'rejected' as const : 'expired' as const;
+  const detail = manifest.runtime
+    ? `obsolete: recorded in the ${manifest.runtime} runtime; the state was restored into the ${into} runtime`
+    : `restored from a state backup of ${manifest.createdAt} that does not name its runtime; request again if still needed`;
+  const at = new Date().toISOString();
+  return db.transaction(() => open.map((r) => {
+    db.exec('UPDATE change_requests SET status = ?, detail = ?, updated_at = ? WHERE id = ?', status, detail, at, r.id);
+    db.addEvent('change-request', null, { id: r.id, from: r.status, to: status, via: 'state-restore' });
+    return { id: r.id, status, detail };
+  }));
 }
 
 export type RestoreHelper = 'supervisor' | 'dispatcher';
@@ -376,6 +407,8 @@ export async function restoreStateBackup(paths: Pick<RuntimePaths, 'state' | 'db
   helperAlive?: (key: ProcessLockKey, l: SupervisorLock) => boolean;
   /** Stops a live helper before the swap (default stopHelperProcess); true once it exited. */
   stopHelper?: (key: ProcessLockKey, l: SupervisorLock) => Promise<boolean>;
+  /** The runtime restored into (default: this process's). */
+  runtime?: BackupRuntime;
 } = {}): Promise<StateImportResult> {
   const st = await lstat(archive).catch(() => null);
   if (!st) throw new MinionsError('NOT_FOUND', `State backup not found: ${archive}`);
@@ -420,6 +453,7 @@ export async function restoreStateBackup(paths: Pick<RuntimePaths, 'state' | 'db
   let previous: string | null = null;
   let restoredActiveLeases: string[] = [];
   let helpersRun: NonNullable<StateImportResult['helpers']> = [];
+  let closedRequests: NonNullable<StateImportResult['closedRequests']> = [];
   try {
     let current = '';
     try {
@@ -462,6 +496,7 @@ export async function restoreStateBackup(paths: Pick<RuntimePaths, 'state' | 'db
         if (c) sdb.setMeta(key, JSON.stringify(c.lock)); else sdb.deleteMeta(key);
       }
       restoredActiveLeases = sdb.activeLeases().map((l) => l.id);
+      closedRequests = closeRestoredRequests(sdb, parsed.manifest, opts.runtime ?? currentBackupRuntime());
       sdb.addEvent('state-restore', null, { backupCreatedAt: parsed.manifest.createdAt, forced: !!opts.force, restoredActiveLeases, preservedLockPid: liveLock?.pid ?? null });
       sdb.sql.exec('PRAGMA wal_checkpoint(TRUNCATE)');
     } finally { sdb.close(); }
@@ -493,11 +528,15 @@ export async function restoreStateBackup(paths: Pick<RuntimePaths, 'state' | 'db
   if (restoredActiveLeases.length) {
     warnings.push(`The backup has ${restoredActiveLeases.length} lease(s) marked active (${restoredActiveLeases.join(', ')}); no worker holds them in this runtime, so they are released.`);
   }
+  if (closedRequests.length) {
+    warnings.push(`Open upgrade request(s) from the backup closed: ${closedRequests.map((c) => `${c.id} ${c.status}`).join(', ')} (${closedRequests[0]!.detail}).`);
+  }
   const m = parsed.manifest;
   return {
     restored: { files: parsed.files.size, dirs: parsed.dirs.length, createdAt: m.createdAt, schemaVersion: m.schemaVersion, minionsVersion: m.minionsVersion },
     previous, forced: !!opts.force, warnings, restoredActiveLeases, preservedLockPid: liveLock?.pid ?? null, pruned,
     ...(helpersRun.length ? { helpers: helpersRun } : {}),
+    ...(closedRequests.length ? { closedRequests } : {}),
   };
 }
 

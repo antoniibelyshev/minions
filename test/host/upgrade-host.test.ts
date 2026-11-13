@@ -29,6 +29,8 @@ interface HostWorld {
   cliProblem?: string | null;
   failShim?: boolean;
   events: string[];
+  /** The runtime's upgrade requests (`settings requests` / `settings requests mark`); undefined: the verb fails. */
+  requests?: { id: string; kind: string; status: string }[];
 }
 
 function hostTarget(w: HostWorld): HostUpgradeTarget {
@@ -53,6 +55,13 @@ function hostTarget(w: HostWorld): HostUpgradeTarget {
         if (w.leases.length) { w.events.push('coordinator:refused'); return { code: 1, stdout: JSON.stringify({ ok: false, error: { code: 'PRECONDITION', message: 'Coordinator restart refused: active worker lease(s)' } }) + '\n', stderr: '' }; }
         w.events.push('coordinator');
         return ok({ action: 'restarted', running: true, reason: 'recover' });
+      }
+      if (line === 'settings requests' && w.requests) return ok({ requests: w.requests.filter((q) => ['proposed', 'confirmed', 'failed'].includes(q.status)) });
+      if (args[1] === 'settings' && args[2] === 'requests' && args[3] === 'mark' && w.requests) {
+        const q = w.requests.find((x) => x.id === args[4]);
+        if (!q) return fail('NOT_FOUND');
+        q.status = args[6]!; w.events.push(`mark:${q.id}:${q.status}`);
+        return ok(q);
       }
       if (args[1] === 'work' && args[2] === 'release') { w.events.push(`release:${args[3]}`); w.leases = w.leases.filter((l) => l.id !== args[3]); w.timeline = w.timeline.map((s) => s.filter((l) => l.id !== args[3])); return ok({}); }
       return fail(`unexpected ${args.join(' ')}`);
@@ -82,6 +91,25 @@ describe('runUpgrade on the host runtime', () => {
     expect(w.events).toEqual(['status:1', 'pause', 'status:1', 'status:0', 'files', 'secrets', 'shim', 'workspace', 'resume', 'coordinator']);
     expect(r.coordinator).toMatchObject({ action: 'restarted' });
     expect(r.steps.some((s) => s.id === 'image' || s.id === 'recreate' || s.id === 'import')).toBe(false);
+  });
+
+  it('a successful upgrade marks the open (proposed or failed) upgrade requests applied; a confirmed one is the self-update script\'s', async () => {
+    const w = world({ requests: [
+      { id: 'cr_0000000a', kind: 'upgrade', status: 'proposed' }, { id: 'cr_0000000b', kind: 'upgrade', status: 'failed' },
+      { id: 'cr_0000000c', kind: 'upgrade', status: 'confirmed' }, { id: 'cr_0000000d', kind: 'upgrade', status: 'applied' },
+    ] });
+    const r = await runUpgrade(opts(w));
+    expect(r.ok).toBe(true);
+    expect(r.requestsApplied).toEqual(['cr_0000000a', 'cr_0000000b']);
+    expect(w.events.slice(-2)).toEqual(['mark:cr_0000000a:applied', 'mark:cr_0000000b:applied']);
+    expect(w.requests!.map((q) => q.status)).toEqual(['applied', 'applied', 'confirmed', 'applied']);
+    expect(formatUpgrade(r)).toMatch(/Upgrade request\(s\) marked applied: cr_0000000a, cr_0000000b/);
+    // A dry run or a failed upgrade marks nothing.
+    const w2 = world({ requests: [{ id: 'cr_0000000e', kind: 'upgrade', status: 'proposed' }] });
+    await runUpgrade(opts(w2, { dryRun: true }));
+    const w3 = world({ requests: [{ id: 'cr_0000000f', kind: 'upgrade', status: 'proposed' }], failShim: true });
+    await expect(runUpgrade(opts(w3))).rejects.toThrow();
+    expect([w2.requests![0]!.status, w3.requests![0]!.status]).toEqual(['proposed', 'proposed']);
   });
 
   it('dry run explains each host step and changes nothing', async () => {

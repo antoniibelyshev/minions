@@ -180,9 +180,10 @@ describe('runUpgrade', () => {
     expect(docker.some((a) => a.includes('down') || a.includes('-v') || a.includes('--volumes') || a[0] === 'volume' || a.includes('rm'))).toBe(false);
     const up = docker.filter((a) => a[5] === 'up');
     expect(up).toEqual([['compose', '-p', expect.any(String), '-f', projectPaths(ID).composeYaml, 'up', '-d', '--no-build', '--force-recreate', '--remove-orphans']]);
-    // Only these container commands run: no workspace import/re-clone from here, no backlog writes.
+    // Only these container commands run: no workspace import/re-clone from here, no backlog writes
+    // (`settings requests`: the open upgrade requests a successful upgrade marks applied).
     const execs = docker.filter((a) => a[5] === 'exec').map((a) => a.slice(9).filter((x) => x !== '--json').slice(0, 2).join(' '));
-    expect(new Set(execs)).toEqual(new Set(['status', 'pause --starts', 'workspace setup', 'resume --starts', 'coordinator restart']));
+    expect(new Set(execs)).toEqual(new Set(['status', 'pause --starts', 'workspace setup', 'resume --starts', 'coordinator restart', 'settings requests']));
   });
 
   it('rebuilds the image after the drain and before the recreate when the fingerprint changed', async () => {
