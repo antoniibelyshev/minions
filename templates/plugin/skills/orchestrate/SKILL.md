@@ -1,15 +1,15 @@
 ---
 name: orchestrate
-description: The minions coordinator's loop - check state, handle the decisions the autopilot dispatcher holds (work autopilot status|resume), keep the backlog ready, report. The dispatcher runs every stage; you never spawn workers.
+description: The minions coordinator's loop - check state, handle the decisions the autopilot dispatcher holds (work autopilot status|resume), keep the backlog ready, plan toward the owner's goals (`plan`), run experiments and retrospectives, report. The dispatcher runs every stage; you never spawn workers.
 ---
 
 # Orchestrate minions work
 
-The autopilot dispatcher claims, runs and records every stage. What is left for you: the decisions it holds, the backlog it works from, and the owner. Every durable step uses a `minions ... --json` helper; never edit backlog or state files, and never claim, spawn, record or release a worker.
+The autopilot dispatcher claims, runs and records every stage. What is left for you: the decisions it holds, the backlog it works from, and the owner. Every durable step uses a `minions ... --json` helper; never edit backlog or state files, and never claim, spawn, record or release a worker. Invoked as `/minions:orchestrate plan` (the argument `plan`): go straight to step 4.
 
 ## 0. Woken by the routine (`/minions:orchestrate wake`)
 
-The runtime started this fresh session because its routine pass found work only a model can do (`routine.enabled`). Read why: `minions sync --routine --last --json` (`last.reasons`: `digest`, `dispatch-decision` for a held task). Handle exactly those (step 2 for the holds), then stop. Do not greet the owner or send a status message for the wake itself; report only what the reporting rule asks for. The handoff of the previous session is there when you need it (`minions coordinator handoff --read --json`). Never restart the coordinator from a wake session unless a context reset is due.{{digestRule}}
+The runtime started this fresh session because its routine pass found work only a model can do (`routine.enabled`). Read why: `minions sync --routine --last --json` (`last.reasons`: `digest`, `dispatch-decision` for a held task, `plan` when the queue is empty and a goal is open). Handle exactly those (step 2 for the holds, step 4 for `plan`), then stop. Do not greet the owner or send a status message for the wake itself; report only what the reporting rule asks for. The handoff of the previous session is there when you need it (`minions coordinator handoff --read --json`). Never restart the coordinator from a wake session unless a context reset is due.{{digestRule}}
 
 ## 1. Check state
 
@@ -50,3 +50,32 @@ Then, when context resets are on, check `minions coordinator handoff --check --j
 ## 3. Report
 
 {{reportingRule}} Include the spend so far (see Owner defaults; `spend` in `minions status --json`: total, today, per task, against the budget) with delivery reports. Stage transitions and repairs are recorded in the backlog (notes), not messaged to the user. Approvals for `ask` capabilities and sensitive paths are always requested explicitly, whatever the reporting level.
+
+## 4. Plan (`/minions:orchestrate plan`, or `plan` among the wake reasons)
+
+The queue is empty and the owner's goals ({{goalsFile}}) have open items. One pass, then stop; never loop or wait for the tasks you file.
+
+1. **Read, small.** `minions backlog goals --json` (each goal's `body`, `measure`, `status`; `retro.due`), `minions backlog list --compact --json` (ideas, blocked, recently done), and the recent outcomes that bear on the goals: the notes of the last few done tasks (`minions backlog show <id>`), the latest experiment records, your decision files. Do not read whole histories.
+2. **Goals met.** When the recorded results meet a goal's measure: `minions backlog goals set <id> done --reason "<the measurement>" --json`, and tell the owner (a `feature` item held for the digest) so they update the goals file. A goal you cannot act on (unclear, conflicting, outside the policy): ask the owner (a `question` item) and leave it.
+3. **Retrospective** when `retro.due` is true (below), before planning.
+4. **Pick the next 1-3 highest-value tasks** toward the open goals (paused ones wait). Promote existing `idea` tasks that serve a goal before inventing new ones. Each new task: a brief with acceptance criteria (Owner defaults), the label `goal:<goal id>`, provenance `agent-hypothesis`, idempotency key `plan:<goal id>:<short slug>`; a goal with a `Measure:` is pursued through experiments (below). {{planCreateRule}}
+5. **Nothing worthwhile left** (the goals are met as far as you can measure, every next step needs the owner, or what remains costs more than it brings): `minions backlog goals record idle --reason "<why>" --json`, so the routine does not wake you to plan again until the goals change, and put one line in the digest (a `feature` item, or a `question` with what the owner could add). Never file filler work to keep the team busy.
+6. Stop. New tasks are not a milestone: report per the reporting rule.
+
+## Experiments (label `experiment`)
+
+For a goal with a metric, and for any change whose value is a measured number (speed, strength, accuracy, cost):
+
+- **Records directory**: choose it once per project and keep it: an existing one (for example `docs/efficiency/`, `docs/experiments/`), else `docs/experiments/`. Record the choice as a decision (`/minions:maintain-context`). Records are numbered `NNN-<slug>.md`, the next free number.
+- **The task** (labels `experiment` and `goal:<id>`) states: **Hypothesis**; **Measurement** (the exact command and environment, the baseline on the base branch against the branch, runs or seeds, the noise to expect, a time bound); **Threshold** (accept only if, e.g. "nodes/s +15% median of 5 runs" or "+20 Elo, 95% confidence"); **Record** (`<dir>/NNN-<slug>.md`). The change goes behind a toggle (default off) when it should stay comparable, otherwise on the branch.
+- **The engineer** implements, runs the measurement, and writes the record (hypothesis, setup, raw numbers, verdict against the threshold). Threshold missed: they revert the change on the branch and keep only the record. **The reviewer** checks the numbers against the threshold and that a miss lands only the record.
+- **After it lands**: met → next experiment, or mark the goal done; missed → the negative result is recorded: note it on the task and do not retry the idea without a new hypothesis. A measurement too long for a worker (`dispatch.workerTimeoutMinutes`) is split, or run on the owner's hosts where the policy allows it.
+
+## Retrospective
+
+Due when `minions backlog goals --json` shows `retro.due` (about ten tasks done since the last one, or a goal marked done). Short, from durable data only:
+
+- `minions backlog list --json` and `minions status --json` (`spend.perTask`): tasks with repair cycles or a replan, tasks over the per-task budget, cancelled, blocked or slow tasks, flaky checks (a verify failure that passed unchanged, `verify:periodic` tasks).
+- Each pattern with a project cause becomes one improvement task as `idea` (provenance `agent-hypothesis`, key `retro:<date>:<n>`): a flaky test to fix, a missing fast check, a brief template that left workers guessing. When the cause is minions itself (the dispatcher, a gate, a prompt), do not work around it in the project: write it in the digest for the owner.
+- No QA sweep since the last retrospective and the project has user-facing behaviour: schedule one (Testing in your instructions). No `verification.periodic` while the project has a slow tier (integration tests, a benchmark, a long build): set it (`minions control set verification.periodic '{"commands": ["<cmd>"], "everyHours": 24}' --reason "<why>" --json`) and say so in your report.
+- `minions backlog goals record retro --reason "<one line: what you found and filed>" --json`.
