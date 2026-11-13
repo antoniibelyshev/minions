@@ -36,7 +36,7 @@ import {
   humanRoutine, humanRoutineReport, ROUTINE_TRIGGERS, routineLast, routineSettings, runRoutinePass, startRoutineClock,
   type CoordinatorView, type RoutineLast, type RoutineTrigger,
 } from './routine.js';
-import { currentBudget, usdCaps } from './spend.js';
+import { currentBudget, spendCaps } from './spend.js';
 import { openDb, type DrainNotice, type DrainRequest, type Lease, type PauseChange, type RuntimeDb } from './db.js';
 import { clearDrain, requestDrain } from './drain.js';
 import { claimWithBrief, compactClaim, fetchBrief, recordSubmitted, requireWorkerRole, submissionPath, submitResult, sweepScratchOnStart, type CompactClaim } from './handoff.js';
@@ -203,7 +203,7 @@ async function routineDeps(): Promise<Parameters<typeof runRoutinePass>[0]> {
     lockAlive: (l) => pidAlive(l.pid) && (!l.start || procStartTime(l.pid) === l.start),
     coordinator: () => coordinatorView(d, paths),
     activeLeases: async () => leases(),
-    budgetExhausted: () => { try { return (currentBudget({ db: d, config: cfg })?.exhausted ?? false) || usdCaps({ db: d, config: cfg }).day.exhausted; } catch { return false; } },
+    budgetExhausted: () => { try { return (currentBudget({ db: d, config: cfg })?.exhausted ?? false) || spendCaps({ db: d, config: cfg }).day.exhausted; } catch { return false; } },
     upgradeInProgress: () => upgradeInProgress(d),
     digestDue: (now) => digestStatus(d, cfg, now).due,
     holdBack: (now) => reholdExpired(d, cfg, now),

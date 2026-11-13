@@ -18,7 +18,8 @@
 // - Leases it claims have holder `dispatcher`; the coordinator's restart and wake rules ignore them (they are not its
 //   subagents).
 // - Budget, pause and drain apply (Scheduler.next reports them as startsBlocked). A spend cap that stops work is told to
-//   the owner once per cap value; stages it holds back are still verified (verification spends no tokens).
+//   the owner once per cap value (an enforced daily cap also at 50% and 80%); a task at its per-task cap is also held
+//   for the coordinator. Stages a cap holds back are still verified (verification spends no tokens).
 // - Verify step (Decision 12): a gate stage starts only on a head whose verification passed (Scheduler.verificationDue).
 //   The dispatcher runs it through deps.verify (./verify-step.ts) instead of claiming, one run at a time, and records it
 //   with Scheduler.settleVerification. With the slot free it runs verification.periodic on the base head when due.
@@ -33,6 +34,8 @@ import { DISPATCH_HOLDER, type Lease, type RuntimeDb, type SupervisorLock } from
 import { DEFAULT_TICK_SECONDS, DISPATCH_EVENT, dispatchSettings, readHolds, writeHolds, type DispatchHold } from './dispatch-state.js';
 import { claimWithBrief, compactClaim, recordSubmitted, type CompactClaim, type HandoffPaths } from './handoff.js';
 import { enqueue } from './outbox.js';
+import { dayCapText, dayCapWarning, taskCapText } from './spend.js';
+import { localStamp } from './zoned-time.js';
 import type { NextReport, NextStage, RecordResponse, Scheduler } from './scheduler.js';
 import { hostIdentity, procIdentity } from './runner/record.js';
 import { verifyTimeoutMs } from './integrator.js';
@@ -249,10 +252,10 @@ export class Dispatcher {
     await this.reapAdopted(cfg);
     const sched = await this.d.scheduler(cfg);
     report.cleared = await this.clearResolved(sched);
+    const next = await sched.next();
+    report.cleared.push(...await this.capNotices(cfg, sched, next));
     const holds = readHolds(this.d.db);
     report.held = Object.keys(holds);
-    const next = await sched.next();
-    this.capNotices(next);
     const busy = new Set([...this.active().map((r) => r.taskId), ...this.recording, ...(this.verifying ? [this.verifying] : [])]);
     if (next.startsBlocked) {
       // Verification spends no tokens: a stage held only by the daily cap is still verified (not while paused or draining).
@@ -302,11 +305,11 @@ export class Dispatcher {
     return report;
   }
 
-  /** Verifies the first stage among `stages` (held back by a spend cap) whose head needs it, if the slot is free. */
+  /** Verifies the first stage among `stages` (held back by a spend cap, a cap hold included) whose head needs it, if the slot is free. */
   private async verifyCapped(cfg: MinionsConfig, sched: Scheduler, stages: NextStage[], holds: Record<string, DispatchHold>, busy: Set<string>): Promise<string | null> {
     if (!this.d.verify || this.verifying) return null;
     for (const stage of stages) {
-      if (holds[stage.taskId] || busy.has(stage.taskId)) continue;
+      if ((holds[stage.taskId] && holds[stage.taskId]!.kind !== 'budget-cap') || busy.has(stage.taskId)) continue;
       const due = await sched.verificationDue(stage.taskId, stage.role).catch(() => null);
       if (!due) continue;
       this.startVerify(cfg, stage.taskId, due.head, due.commands);
@@ -315,25 +318,46 @@ export class Dispatcher {
     return null;
   }
 
-  /** Tells the owner once per cap value when a spend cap stops work: the daily cap per UTC day, the per-task cap per task. */
-  private capNotices(next: NextReport): void {
+  /**
+   * Tells the owner once per cap value when a spend cap stops work (the daily caps per local day, the per-task caps per
+   * task), and once per threshold, cap value and day at 50% and 80% of an enforced daily cap. A task at its per-task cap
+   * is also held for the coordinator (once per cap value): it decides whether to block, split or narrow the task, or to
+   * ask the owner for a higher cap; the stage waits until the cap is raised whatever it decides.
+   */
+  private async capNotices(cfg: MinionsConfig, sched: Scheduler, next: NextReport): Promise<string[]> {
     const { caps } = next;
-    if (!caps.enforced) return;
-    const notice = (key: string, taskId: string | null, text: string) => {
-      try {
-        if (enqueue(this.d.db, { key, kind: 'blocker', taskId, text }, () => this.now()).created) this.log(`dispatch: ${text}`);
-      } catch (e) { this.log(`dispatch: could not queue the notice ${key}: ${(e as Error).message}`); }
-    };
-    if (caps.day.exhausted) {
-      notice(`budget-cap:day:${this.now().toISOString().slice(0, 10)}:${caps.day.capUsd}`, null,
-        `Daily spend cap reached: ~$${caps.day.usedUsd.toFixed(2)} of $${caps.day.capUsd} today (UTC, estimated). New stages wait; running workers finish. Raise it with /budget day <usd> (or off).`);
-      return;
+    // A cap hold whose task no cap stops any more (the owner raised or removed it) clears itself.
+    const holds = readHolds(this.d.db);
+    const cleared = Object.values(holds).filter((h) => h.kind === 'budget-cap' && !caps.task.blocked.includes(h.taskId)).map((h) => h.taskId);
+    if (cleared.length) {
+      for (const id of cleared) { delete holds[id]; this.d.db.addEvent('dispatch-resume', id, { why: 'no per-task spend cap stops it any more' }); }
+      writeHolds(this.d.db, holds);
     }
+    const notice = (key: string, taskId: string | null, text: string, kind: 'blocker' | 'status' = 'blocker'): boolean => {
+      try {
+        if (enqueue(this.d.db, { key, kind, taskId, text }, () => this.now()).created) { this.log(`dispatch: ${text}`); return true; }
+      } catch (e) { this.log(`dispatch: could not queue the notice ${key}: ${(e as Error).message}`); }
+      return false;
+    };
+    const day = localStamp(this.now(), caps.timezone).slice(0, 10);
+    if (caps.day.exhausted) {
+      const which = [...(caps.day.tokensReached ? [`tokens:${caps.day.capTokens}`] : []), ...(caps.enforced && caps.day.usdReached ? [String(caps.day.capUsd)] : [])].join(':');
+      notice(`budget-cap:day:${day}:${which}`, null,
+        `Daily spend cap reached: ${dayCapText(caps)}. New stages wait; running workers finish. Raise it with /budget day <amount> (or off).`);
+      return cleared;
+    }
+    const warn = dayCapWarning(caps);
+    if (warn) notice(`budget-cap:day-warn:${day}:${warn.key}`, null, warn.text, 'status');
     const capped = [...new Map(next.waiting.filter((w) => w.waitingOn === 'budget').map((w) => [w.taskId, w])).values()];
     for (const w of capped) {
-      notice(`budget-cap:task:${w.taskId}:${caps.task.capUsd}`, w.taskId,
-        `${w.taskId} reached the per-task spend cap: ~$${(caps.task.atCapUsd[w.taskId] ?? 0).toFixed(2)} of $${caps.task.capUsd} (estimated). Its ${w.role} stage waits (verification still runs). Raise it with /budget task <usd> (or off).`);
+      const text = `${w.taskId} reached the per-task spend cap: ${taskCapText(caps, w.taskId)}. Its ${w.role} stage waits (verification still runs). Raise it with /budget task <amount> (or off).`;
+      const key = `budget-cap:task:${w.taskId}:${[...(caps.task.capTokens !== null ? [`tokens:${caps.task.capTokens}`] : []), ...(caps.task.capUsd !== null ? [String(caps.task.capUsd)] : [])].join(':')}`;
+      if (notice(key, w.taskId, text) && !readHolds(this.d.db)[w.taskId]) {
+        await this.hold(cfg, sched, { taskId: w.taskId, kind: 'budget-cap', leaseId: null,
+          message: `${text} Decide: block, split or narrow the task, or ask the owner for a higher cap. The stage stays held back until the cap is raised; \`minions work autopilot resume ${w.taskId}\` only clears this hold.` });
+      }
     }
+    return cleared;
   }
 
   /** Runs `work` in the verification slot, tracked like an exit (settled() awaits it). */
