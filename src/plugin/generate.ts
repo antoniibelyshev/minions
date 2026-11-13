@@ -264,10 +264,10 @@ function decisionGuidance(): string {
 
 /**
  * Usage-based spend guidance (task-32): the dispatcher records each worker's token total, the runtime keeps the
- * tally (src/runtime/spend.ts) and refuses claims at the owner's budget and at the owner's USD caps (`budgets.*`).
+ * tally (src/runtime/spend.ts) and refuses claims at the owner's budget and at the owner's caps (`budgets.*`).
  */
 function spendGuidance(_cfg: MinionsConfig): string {
-  const configured = ' The owner\'s USD caps (`budgets.dailyUsd`, `budgets.taskUsd`; estimated USD, API-key billing only) also refuse new claims once reached; only the owner changes them (`/budget` in Telegram), never you.';
+  const configured = ' The owner\'s caps also refuse new claims once reached: token caps (`budgets.dailyTokens`, `budgets.taskTokens`; any billing) and USD caps (`budgets.dailyUsd`, `budgets.taskUsd`; estimated, API-key billing only). A task at its per-task cap is held for you (`budget-cap`): block, split or narrow it, or ask the owner for a higher cap. Only the owner changes the caps (`/budget` in Telegram), never you.';
   return [
     '**Spend.** The dispatcher records each worker\'s token total; your own session tokens are measured from the transcript. The tally is durable: `minions status --json` shows `spend` (total, today, per task, budget). Report it with deliveries and when asked: tokens plus a rough USD estimate with API-key billing (the Console usage page is authoritative), tokens only on a subscription (its remaining plan quota is not visible). Never invent figures.',
     `When the owner gives a budget in plain language, set it: \`minions work spend --budget "<their words>" --json\` (tokens or attempts; USD only with API-key billing; \`off\` clears). \`spend.budget\` in the status has the percent used: tell the owner when it passes 50 or 80; at 100 new claims are refused (running workers continue): say why starts stopped and ask before spending more. If workers hit a plan usage or rate limit, pause starts (\`minions pause --starts --json\`) and report it.${configured}`,

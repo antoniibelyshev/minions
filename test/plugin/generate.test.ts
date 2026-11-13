@@ -586,7 +586,8 @@ describe('owner behaviour defaults (task-34)', () => {
   it('budget and permission mode follow the config', async () => {
     const base = defaults();
     const none = ownerSection(await (await gen(base)).read('coordinator.md'));
-    expect(none).toContain('only the owner changes them (`/budget` in Telegram), never you');
+    expect(none).toContain('Only the owner changes the caps (`/budget` in Telegram), never you');
+    expect(none).toContain('token caps (`budgets.dailyTokens`, `budgets.taskTokens`; any billing)');
     expect(none).toContain('The coordinator is launched in `auto` by default (`coordinator.permissionMode`)');
     expect(ownerSection(await (await gen({ ...base, coordinator: { permissionMode: 'bypassPermissions' } })).read('coordinator.md'))).toContain('fully unattended (`bypassPermissions`)');
 
