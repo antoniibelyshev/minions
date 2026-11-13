@@ -99,7 +99,7 @@ export const apiKeyHelperFor = (paths: Pick<RuntimePaths, 'apiKeyFile'>) => `cat
  * sandboxed commands lose read access to the home directory except the working dirs, the parts of
  * ~/.claude Claude Code needs and the global git config). Bash commands (workers included) run under
  * the OS sandbox (Seatbelt on macOS). Read/Edit, hooks and helpers are not sandboxed; they follow the
- * permission rules below. This narrows, but does not equal, the container boundary (README "Running without Docker").
+ * permission rules below. This narrows, but does not equal, the container boundary (docs/guide.md "Running without Docker").
  */
 export interface HostHardening {
   home: string;

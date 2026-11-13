@@ -11,7 +11,7 @@ Related: [bootstrap.md, Host runtime](bootstrap.md#host-runtime) (today's decisi
 [coordinator-self-update.md](coordinator-self-update.md), [telegram-channel.md](telegram-channel.md) (task-67),
 [host-manager.md](host-manager.md), [coordinator-sessions.md](coordinator-sessions.md),
 [cli-surface.md](cli-surface.md), [local-auto-integration.md](local-auto-integration.md) (task-82),
-README [Running without Docker](../../README.md#running-without-docker).
+guide [Running without Docker](../guide.md#running-without-docker).
 
 **Supersedes.** This design supersedes one sentence in
 [coordinator-self-update.md, Relation to the dropped host-runtime "dev mode"](coordinator-self-update.md#relation-to-the-dropped-host-runtime-dev-mode):

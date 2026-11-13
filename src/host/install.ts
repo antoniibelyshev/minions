@@ -686,7 +686,7 @@ export function dockerUnavailable(s: DockerStatus, platform: NodeJS.Platform = p
     ? `${!s.daemon ? daemonHint(platform, s) : composeHint(platform, s)} Then rerun; \`minions doctor\` names the exact fix.`
     : 'Start Docker Desktop (or install Compose v2), then rerun.';
   return new MinionsError('DOCKER_UNAVAILABLE', `${what}. The docker runtime needs Docker; minions never falls back to the host on its own.`,
-    `${fix} Running without Docker is an explicit, less safe choice: \`minions runtime set host\` (see README "Running without Docker").`, s);
+    `${fix} Running without Docker is an explicit, less safe choice: \`minions runtime set host\` (see docs/guide.md "Running without Docker").`, s);
 }
 
 export async function runInit(opts: InitOptions): Promise<InitResult> {
