@@ -1401,8 +1401,8 @@ export function register(program: Command): void {
       emit(r, { json: globalOpts(cmd).json, human: (d: typeof r) => [`Wrote ${d.path} (${d.files} files, ${d.bytes} bytes, schema ${d.schemaVersion})`,
         ...d.skipped.map((s) => `skipped ${s.path}: ${s.reason}`)].join('\n') });
     }));
-  ws.command('state-import <archive>').description('Restore a state backup written by state-export (refused while leases or the coordinator are active unless --force); leases the backup has active are released')
-    .option('--force', 'restore even while worker leases are active or a coordinator holds the project lock')
+  ws.command('state-import <archive>').description('Restore a state backup written by state-export (refused while leases, the coordinator, the session supervisor or the dispatcher are active unless --force); leases the backup has active are released')
+    .option('--force', 'restore even while worker leases are active or a coordinator holds the project lock; a running session supervisor or dispatcher is stopped first')
     .action(action(async (archive: string, o: { force?: boolean }, cmd: Command) => {
       requireMode('runtime');
       // The swap replaces the DB and backlog files: handles opened before it would keep the replaced ones.
