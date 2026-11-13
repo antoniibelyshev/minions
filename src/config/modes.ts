@@ -60,10 +60,11 @@ export function modeDefaults(mode: Mode, ctx: ModeContext): MinionsConfig {
 
 /**
  * Keys a mode decides; `minions mode set` rewrites them in the project layer. Visibility is fixed at install, and
- * everything else (verification, container, models, roles, workflows) belongs to the project.
+ * everything else (verification, container, models, roles, workflows) belongs to the project. Of the budgets only the
+ * USD caps: the token caps are unset in every mode and stay the owner's (docs/design/autonomy.md Decision 15).
  */
 export const MODE_KEYS = [
   'mode', 'backlog.ownership', 'intake.sources', 'intake.startReady', 'execution.maxActiveTasks', 'execution.maxEngineers',
-  'delivery.merge', 'communication.channel', 'budgets', 'capabilities', 'sensitivePaths', 'architecture',
+  'delivery.merge', 'communication.channel', 'budgets.taskUsd', 'budgets.dailyUsd', 'capabilities', 'sensitivePaths', 'architecture',
   'coordinator.sessions', 'routine',
 ] as const;

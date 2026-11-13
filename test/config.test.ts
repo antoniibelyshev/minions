@@ -39,6 +39,17 @@ describe('modes', () => {
     expect(c.sensitivePaths).toEqual(['.claude/**', '.minions/**', 'CLAUDE.md', 'AGENTS.md', '.githooks/**', '.husky/**', '.github/workflows/**']);
   });
 
+  it('budgets: token caps are optional whole positive numbers (or null); the modes leave them unset', () => {
+    const base = defaults();
+    expect(base.budgets).not.toHaveProperty('dailyTokens');
+    expect(modeDefaults('independent', ctx).budgets).toEqual({ dailyUsd: 20, taskUsd: 5 });
+    const ok = validateConfig({ ...base, budgets: { dailyUsd: null, taskUsd: 25, dailyTokens: 20_000_000, taskTokens: null } });
+    expect(ok.budgets).toEqual({ dailyUsd: null, taskUsd: 25, dailyTokens: 20_000_000, taskTokens: null });
+    for (const bad of [{ dailyTokens: 0 }, { dailyTokens: -5 }, { taskTokens: 1.5 }, { taskTokens: '4M' }, { weeklyTokens: 1 }]) {
+      expect(() => validateConfig({ ...base, budgets: { dailyUsd: null, taskUsd: null, ...bad } }), JSON.stringify(bad)).toThrow(MinionsError);
+    }
+  });
+
   it('supervised yields documented explicit defaults', () => {
     const c = modeDefaults('supervised', ctx);
     validateConfig(c);

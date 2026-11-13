@@ -218,6 +218,35 @@ describe('settings set', () => {
     expect(runtimeCfg(project.projectId).models.effort).toBeUndefined();
   });
 
+  it('spend caps (budgets.*): token caps settable in tokens, raising or turning one off is loosening, off overrides a lower layer', async () => {
+    const { project, local } = await install('private');
+    const { runtime, calls } = fakeRuntime();
+    const ctx = await ctxOf(project);
+    expect(S.listSettings(ctx).filter((v) => v.key.startsWith('budgets.')).map((v) => [v.key, v.value, v.class, v.hostOwned])).toEqual([
+      ['budgets.dailyTokens', 'off', 'live', true], ['budgets.taskTokens', 'off', 'live', true],
+      ['budgets.dailyUsd', ctx.config.budgets.dailyUsd ?? 'off', 'live', true], ['budgets.taskUsd', ctx.config.budgets.taskUsd ?? 'off', 'live', true],
+    ]);
+    const r1 = await SC.applySetting(ctx, 'budgets.dailyTokens', '20000000', {}, { runtime, confirm: never });
+    expect(r1).toMatchObject({ from: 'off', to: 20_000_000, written: true, loosens: null, needsRestart: false });
+    await SC.applySetting(await ctxOf(project), 'budgets.taskTokens', '4000000', {}, { runtime, confirm: never });
+    expect(readJson(local)).toEqual({ budgets: { dailyTokens: 20_000_000, taskTokens: 4_000_000 } });
+    expect(runtimeCfg(project.projectId).budgets).toMatchObject({ dailyTokens: 20_000_000, taskTokens: 4_000_000 });
+    const raise = await SC.applySetting(await ctxOf(project), 'budgets.dailyTokens', '30000000', { yes: true }, { runtime, confirm: never });
+    expect(raise.loosens).toBe('the daily token cap is raised (20000000 -> 30000000; higher spend)');
+    const lower = await SC.applySetting(await ctxOf(project), 'budgets.dailyTokens', '10000000', {}, { runtime, confirm: never });
+    expect(lower.loosens).toBeNull();
+    const offed = await SC.applySetting(await ctxOf(project), 'budgets.taskTokens', 'off', { yes: true }, { runtime, confirm: never });
+    expect(offed).toMatchObject({ to: null, loosens: 'the per-task token cap is turned off (was 4000000): no stop at that spend' });
+    expect(readJson(local).budgets).toEqual({ dailyTokens: 10_000_000, taskTokens: null });
+    // USD caps take off too (null overrides the project layer's value).
+    await SC.applySetting(await ctxOf(project), 'budgets.dailyUsd', 'off', { yes: true }, { runtime, confirm: never });
+    expect(runtimeCfg(project.projectId).budgets.dailyUsd).toBeNull();
+    for (const [key, value, msg] of [['budgets.dailyTokens', '0', /at least 1/], ['budgets.dailyTokens', '1.5', /whole number/], ['budgets.taskUsd', '-1', /must be a number/]] as const) {
+      await expect(SC.applySetting(await ctxOf(project), key, value, { yes: true }, { runtime, confirm: never })).rejects.toThrow(msg);
+    }
+    expect(calls).toEqual([]); // live: no restart
+  });
+
   it('pause controls run minions pause/resume in the runtime; refused when it is not running', async () => {
     const { project } = await install('private');
     const f = fakeRuntime();

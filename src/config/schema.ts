@@ -341,9 +341,18 @@ export const MinionsConfigSchema = z.object({
     channel: z.enum(CHANNELS),
     progress: z.enum(['milestones', 'tasks', 'quiet']),
   }).strict(),
+  /**
+   * The owner's spend caps (docs/design/autonomy.md Decisions 13 and 15); only the owner changes them. USD caps count
+   * the estimate and are enforced with API-key billing only; token caps are enforced on any billing. Daily caps count
+   * everything (coordinator and workers) since local midnight in routine.timezone; per-task caps count the task's workers.
+   */
   budgets: z.object({
     taskUsd: z.number().positive().nullable(),
     dailyUsd: z.number().positive().nullable(),
+    /** Tokens of a task's workers (all attempts); at the cap its next stage waits and the task is held for the coordinator. Unset or null = off. */
+    taskTokens: z.number().int().positive().nullable().optional(),
+    /** Tokens of everything since local midnight (routine.timezone); at the cap no new stage starts. Unset or null = off. */
+    dailyTokens: z.number().int().positive().nullable().optional(),
   }).strict(),
   capabilities: CapabilitiesSchema,
   /** Built-in role overrides and project-defined worker roles (docs/design/roles-and-workflows.md D3, D9). */
