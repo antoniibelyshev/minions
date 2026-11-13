@@ -1,4 +1,4 @@
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, statSync } from 'node:fs';
 import { dirname } from 'node:path';
 import type { DatabaseSync, SQLInputValue } from 'node:sqlite';
 import type { IdempotencyStore } from '../backlog/types.js';
@@ -299,10 +299,37 @@ export interface RuntimeDbOptions {
   walRetryBudgetMs?: number;
 }
 
+function fileIdentity(path: string): { dev: number; ino: number } | null {
+  try { const st = statSync(path); return { dev: st.dev, ino: st.ino }; } catch { return null; }
+}
+
+/**
+ * The supervisor and dispatcher lock rows of a runtime DB, read-only (no migration, no write): for host-side checks
+ * (doctor) of a live DB. Null when the DB does not exist or cannot be read.
+ */
+export function readProcessLocks(path: string): Record<ProcessLockKey, SupervisorLock | null> | null {
+  let sql: DatabaseSync | undefined;
+  try {
+    statSync(path);
+    sql = new (loadSqlite().DatabaseSync)(path, { readOnly: true });
+    sql.exec(`PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS}`);
+    const get = (key: ProcessLockKey): SupervisorLock | null => {
+      try {
+        const row = sql!.prepare('SELECT value FROM meta WHERE key = ?').get(key) as { value?: string } | undefined;
+        const l = row?.value ? JSON.parse(row.value) as SupervisorLock : null;
+        return l && typeof l.pid === 'number' ? { pid: l.pid, start: l.start ?? null, bootId: l.bootId ?? null, at: String(l.at) } : null;
+      } catch { return null; }
+    };
+    return { supervisor_lock: get('supervisor_lock'), dispatcher_lock: get('dispatcher_lock') };
+  } catch { return null; } finally { try { sql?.close(); } catch { /* ignore */ } }
+}
+
 export class RuntimeDb {
   readonly path: string;
   readonly sql: DatabaseSync;
   private depth = 0;
+  /** dev/ino of the file this connection opened (null for :memory: or when unreadable): see replacedOnDisk. */
+  private readonly fileId: { dev: number; ino: number } | null;
 
   constructor(path = runtimePaths().db, opts: RuntimeDbOptions = {}) {
     this.path = path;
@@ -317,6 +344,18 @@ export class RuntimeDb {
     if (path !== ':memory:') this.enableWal(opts.walRetryBudgetMs ?? BUSY_TIMEOUT_MS);
     this.sql.exec('PRAGMA foreign_keys = ON');
     this.migrate();
+    this.fileId = path === ':memory:' ? null : fileIdentity(path);
+  }
+
+  /**
+   * Whether the path now names another file than the one this connection opened (a state restore renamed the DB
+   * aside and swapped a backup in) or none at all. A long-running process keeps the old inode and would otherwise
+   * see itself as lock holder in a DB nobody else reads. False when the identity is unknown.
+   */
+  replacedOnDisk(): boolean {
+    if (!this.fileId) return false;
+    const now = fileIdentity(this.path);
+    return !now || now.dev !== this.fileId.dev || now.ino !== this.fileId.ino;
   }
 
   /**

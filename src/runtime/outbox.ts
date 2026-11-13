@@ -380,18 +380,23 @@ export function fail(db: RuntimeDb, key: string, error: string, clock: Clock = s
   });
 }
 
-export interface OutboxCounts { pending: number; due: number; waiting: number; delivered: number; oldestPendingAt: string | null }
+/**
+ * waiting: pending but not due yet (held + retrying, kept for older readers). held: held for the digest (no attempt
+ * yet, isHeld); retrying: failed sends waiting for their backoff (attempts > 0). Only `retrying` are failures.
+ */
+export interface OutboxCounts { pending: number; due: number; waiting: number; held: number; retrying: number; delivered: number; oldestPendingAt: string | null }
 
 export function counts(db: RuntimeDb, clock: Clock = systemClock): OutboxCounts {
   const now = clock().toISOString();
-  const r = db.get<{ pending: number; due: number; delivered: number; oldest: string | null }>(
+  const r = db.get<{ pending: number; due: number; held: number; delivered: number; oldest: string | null }>(
     `SELECT SUM(delivered_at IS NULL) AS pending,
             SUM(delivered_at IS NULL AND (next_attempt_at IS NULL OR next_attempt_at <= ?)) AS due,
+            SUM(delivered_at IS NULL AND attempts = 0 AND next_attempt_at > ?) AS held,
             SUM(delivered_at IS NOT NULL) AS delivered,
             MIN(CASE WHEN delivered_at IS NULL THEN created_at END) AS oldest
-     FROM outbox`, now);
-  const p = Number(r?.pending ?? 0), d = Number(r?.due ?? 0);
-  return { pending: p, due: d, waiting: p - d, delivered: Number(r?.delivered ?? 0), oldestPendingAt: r?.oldest ?? null };
+     FROM outbox`, now, now);
+  const p = Number(r?.pending ?? 0), d = Number(r?.due ?? 0), h = Number(r?.held ?? 0);
+  return { pending: p, due: d, waiting: p - d, held: h, retrying: p - d - h, delivered: Number(r?.delivered ?? 0), oldestPendingAt: r?.oldest ?? null };
 }
 
 export interface FlushReport { sent: string[]; failed: { key: string; error: string }[]; remaining: number }
@@ -427,5 +432,10 @@ export function formatItems(items: OutboxItem[]): string {
   return items.map((i) => `${i.key}  [${i.kind}${i.taskId ? ` ${i.taskId}` : ''}] attempts=${i.attempts}${i.lastError ? ` last error: ${i.lastError}` : ''}\n  ${i.text.split('\n').join('\n  ')}`).join('\n');
 }
 
-export const formatCounts = (c: OutboxCounts): string =>
-  `notifications: ${c.pending} pending${c.waiting ? ` (${c.waiting} waiting to retry)` : ''}${c.oldestPendingAt ? `, oldest ${c.oldestPendingAt}` : ''}`;
+export const formatCounts = (c: OutboxCounts): string => {
+  // An older status JSON (relayed from a container) has only `waiting`: show it as before.
+  const held = c.held ?? 0;
+  const retrying = c.retrying ?? (c.held === undefined ? c.waiting : 0);
+  const parts = [...(held ? [`${held} held for digest`] : []), ...(retrying ? [`${retrying} waiting to retry`] : [])];
+  return `notifications: ${c.pending} pending${parts.length ? ` (${parts.join(', ')})` : ''}${c.oldestPendingAt ? `, oldest ${c.oldestPendingAt}` : ''}`;
+};

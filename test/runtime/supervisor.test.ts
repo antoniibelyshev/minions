@@ -1,7 +1,7 @@
 // Task-57 phase 5 (docs/design/coordinator-sessions.md decisions 6 and 7): the session supervisor. Every session
 // process is a fake resident claude (test/fixtures/fake-claude-session.mjs, run by node); no real claude ever starts.
 import { spawn, type ChildProcess } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { MinionsConfig } from '../../src/config/schema.js';
@@ -127,6 +127,18 @@ describe('supervisor lock: reuse-safe', () => {
     expect(r.exit).toBe('conflict');
     expect(r.holder?.pid).toBe(4242);
     expect(s.launches).toEqual([]);
+  });
+
+  it('exits with lock-lost when the database file is replaced under it (state restore)', async () => {
+    const s = setup();
+    const lines: string[] = [];
+    const done = runSupervisor({ db: s.db, state: s.state, config: async () => s.cfg, launch: s.launch, timing: FAST, lockAlive: () => false, log: (l) => lines.push(l) });
+    await new Promise((r) => setTimeout(r, 60));
+    renameSync(s.db.path, `${s.db.path}.pre-restore`);
+    copyFileSync(`${s.db.path}.pre-restore`, s.db.path);
+    const r = await done;
+    expect(r.exit).toBe('lock-lost');
+    expect(lines.join('\n')).toMatch(/database file was replaced/);
   });
 
   it('subagents may not run `minions coordinator supervise`', () => {

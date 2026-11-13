@@ -44,6 +44,7 @@ import { materializeSecrets, upClearingSecretsOnFailure } from './credentials.js
 import { aptImageTag, buildFingerprint, ensureAptImage, ensureImage, imageBuildLabel, packageRoot, type Compose, type Runner } from './docker.js';
 import { parseEnvelope, type ImportResult } from './transfer.js';
 import type { CliCheck, SourcePhase, SourceStop, SyncResult } from './upgrade-source.js';
+import { isChangeRequestId } from '../runtime/change-requests.js';
 
 export const DEFAULT_UPGRADE_TIMEOUT_SEC = 1800;
 /** --timeout <seconds>: a whole number >= 0 (empty is refused); default DEFAULT_UPGRADE_TIMEOUT_SEC, or 0 with --now. */
@@ -97,6 +98,8 @@ export interface UpgradeResult {
   continued?: boolean;
   /** After the files step: how the plugin the container mounts compares with the installed package (null: not checked). */
   plugin?: { matches: boolean; detail: string } | null;
+  /** Open upgrade requests (proposed or failed) this successful upgrade marked `applied` (absent: none, or not read). */
+  requestsApplied?: string[];
 }
 
 export interface UpgradeOptions {
@@ -568,6 +571,10 @@ export async function runUpgrade(opts: UpgradeOptions): Promise<UpgradeResult> {
       result.coordinator = d;
       return `${d.action ?? 'unknown'} (${d.reason ?? ''})`;
     });
+    if (result.ok) {
+      const applied = await closeOpenRequests(exec, new Date(clock()).toISOString()).catch((e: unknown) => { log(`warning: upgrade requests not marked applied: ${errMsg(e)}`); return []; });
+      if (applied.length) { result.requestsApplied = applied; log(`requests: marked ${applied.join(', ')} applied`); }
+    }
     return result;
   };
 
@@ -575,6 +582,26 @@ export async function runUpgrade(opts: UpgradeOptions): Promise<UpgradeResult> {
   try { return await containerSteps(); } finally { off(); }
 }
 
+
+/**
+ * After a successful upgrade: the runtime's open upgrade requests (proposed or failed; recorded by the coordinator
+ * with `minions upgrade --from-container`) are covered by it, so they are marked `applied`. A `confirmed` request is
+ * being applied by the host self-update script, which reports its own outcome: left alone. Best effort.
+ */
+export async function closeOpenRequests(exec: (args: string[], o: RunOptions) => Promise<RunResult>, at: string): Promise<string[]> {
+  const r = await exec(['minions', 'settings', 'requests', '--json'], { allowFailure: true, timeoutMs: 60_000 });
+  if (r.code !== 0) throw new MinionsError('INTERNAL', `settings requests failed: ${lastLine(r)}`);
+  const d = parseEnvelope<{ requests?: { id?: unknown; kind?: unknown; status?: unknown }[] }>(r.stdout, 'settings requests');
+  const ids = (Array.isArray(d.requests) ? d.requests : [])
+    .filter((q) => q.kind === 'upgrade' && (q.status === 'proposed' || q.status === 'failed') && typeof q.id === 'string' && isChangeRequestId(q.id))
+    .map((q) => q.id as string);
+  const done: string[] = [];
+  for (const id of ids) {
+    const m = await exec(['minions', 'settings', 'requests', 'mark', id, '--status', 'applied', '--detail', `applied by \`minions upgrade\` on the host at ${at}`, '--json'], { allowFailure: true, timeoutMs: 60_000 });
+    if (m.code === 0) done.push(id);
+  }
+  return done;
+}
 
 export function formatUpgrade(r: UpgradeResult): string {
   const mark: Record<UpgradeStepStatus, string> = { done: 'ok  ', skipped: 'skip', failed: 'FAIL', planned: 'plan' };
@@ -584,5 +611,6 @@ export function formatUpgrade(r: UpgradeResult): string {
     ...(r.stopped ? [`Stopped before the container steps (nothing in the container changed): ${r.stopped.reason}.`, 'Run:', `  ${r.stopped.command}`, 'then:', `  ${r.stopped.rerun}`] : []),
     ...(r.continued ? ['The container steps ran on the newly installed CLI.'] : []),
     ...(r.interrupted.length ? [`Interrupted leases (re-dispatched by the coordinator's recovery): ${r.interrupted.map(leaseLabel).join(', ')}`] : []),
+    ...(r.requestsApplied?.length ? [`Upgrade request(s) marked applied: ${r.requestsApplied.join(', ')}`] : []),
   ].join('\n');
 }

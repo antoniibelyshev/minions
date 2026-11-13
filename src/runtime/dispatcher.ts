@@ -532,6 +532,8 @@ export async function runDispatcher(d: RunDispatcherDeps): Promise<{ exit: Dispa
     while (!d.signal?.aborted) {
       const holder = d.db.supervisorLock('dispatcher_lock');
       if (!holder || holder.pid !== lock.pid || holder.at !== lock.at) { exit = 'lock-lost'; break; }
+      // A state restore swapped the DB file: this connection still reads the old one and would hold its lock forever.
+      if (d.db.replacedOnDisk()) { exit = 'lock-lost'; log('minions dispatcher: the runtime database file was replaced (state restore?); stopping'); break; }
       let tick = d.tickMs ?? DEFAULT_TICK_SECONDS * 1000;
       try {
         const cfg = await d.config();

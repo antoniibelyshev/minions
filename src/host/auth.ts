@@ -189,8 +189,13 @@ export async function saveDefaults(d: Defaults): Promise<void> { await writeJson
 
 export const expandHome = (p: string) => (p === '~' || p.startsWith('~/') ? join(homedir(), p.slice(1)) : p);
 
-export function describeSource(a: ClaudeAuth): string {
-  if (a.method === 'login') return 'interactive /login inside the container (state in the project claude volume)';
+/** `runtime`: the project's runtime; `login` means the host's own Claude Code login in the host runtime. */
+export function describeSource(a: ClaudeAuth, runtime: 'docker' | 'host' = 'docker'): string {
+  if (a.method === 'login') {
+    return runtime === 'host'
+      ? 'your Claude Code login on this Mac (host runtime: no key handoff; `claude` and /login once if not logged in)'
+      : 'interactive /login inside the container (state in the project claude volume)';
+  }
   if (a.method === 'helper') return `host command ${JSON.stringify(a.command)} (argv, no shell)`;
   const s = a.source;
   if (s.type === 'file') return `host file ${s.path}`;

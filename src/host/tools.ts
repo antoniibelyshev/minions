@@ -15,7 +15,7 @@ import { ProjectJsonSchema, type ProjectJson } from './project.js';
 
 const OVERLAY = overlayPath(CONTAINER.state);
 /** Prints the overlay, or `{}` when there is none. */
-const READ_OVERLAY = ['sh', '-c', 'if [ -e "$1" ]; then cat "$1"; else echo "{}"; fi', 'sh', OVERLAY];
+export const READ_OVERLAY = ['sh', '-c', 'if [ -e "$1" ]; then cat "$1"; else echo "{}"; fi', 'sh', OVERLAY];
 const MAX_OVERLAY_BYTES = 1_000_000;
 const lastLine = (r: RunResult) => (r.stderr || r.stdout).trim().split('\n').filter(Boolean).at(-1)?.slice(0, 200) ?? 'no output';
 

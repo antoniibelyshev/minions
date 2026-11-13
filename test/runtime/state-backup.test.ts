@@ -6,7 +6,7 @@ import { describe, expect, it } from 'vitest';
 import { openDb, SCHEMA_VERSION, type RuntimeDb } from '../../src/runtime/db.js';
 import { runtimePaths } from '../../src/runtime/paths.js';
 import {
-  createStateBackup, MINIONS_SECRET_FILE_NAMES, parseStateBackup, PRE_RESTORE_KEEP, readTar, releaseRestoredLeases, restoreStateBackup, RESTORE_RELEASE_REASON, writeTar,
+  closeRestoredRequests, createStateBackup, MINIONS_SECRET_FILE_NAMES, stopHelperProcess, parseStateBackup, PRE_RESTORE_KEEP, readTar, releaseRestoredLeases, restoreStateBackup, RESTORE_RELEASE_REASON, writeTar,
   type StateManifest, type TarEntry,
 } from '../../src/runtime/state-backup.js';
 import { projectPaths } from '../../src/core/paths.js';
@@ -187,6 +187,101 @@ describe('state restore guards', () => {
     const d = openDb(dst.p.db); d.setMeta('coordinator_lock', JSON.stringify({ pid: 4242, session: 's', acquiredAt: 'x' })); d.close();
     await expect(restoreStateBackup(dst.p, file, { alive: (pid) => pid === 4242 })).rejects.toMatchObject({ code: 'CONFLICT', details: { coordinatorPid: 4242 } });
     await expect(restoreStateBackup(dst.p, file, { alive: () => false })).resolves.toMatchObject({ forced: false });
+  });
+
+  it('refuses while a live session supervisor or dispatcher holds its lock (they would keep the replaced DB)', async () => {
+    const { src, file } = await backup();
+    // The backup's own helper rows name processes of the source runtime: never carried in.
+    src.db.close();
+    const dst = freshTarget();
+    const d = openDb(dst.p.db);
+    d.setMeta('supervisor_lock', JSON.stringify({ pid: 5001, start: 's1', bootId: null, at: 'a' }));
+    d.setMeta('dispatcher_lock', JSON.stringify({ pid: 5002, start: 's2', bootId: null, at: 'b' }));
+    d.close();
+    await expect(restoreStateBackup(dst.p, file, { alive: () => false, helperAlive: () => true })).rejects.toMatchObject({
+      code: 'CONFLICT', message: expect.stringMatching(/session supervisor \(pid 5001\).*dispatcher \(pid 5002\)/),
+      details: { helpers: [{ helper: 'supervisor', pid: 5001 }, { helper: 'dispatcher', pid: 5002 }] },
+    });
+    // Dead holders do not block, and their rows are dropped.
+    const r = await restoreStateBackup(dst.p, file, { alive: () => false, helperAlive: () => false });
+    expect(r.helpers).toBeUndefined();
+    const after = openDb(dst.p.db);
+    try { expect([after.supervisorLock('supervisor_lock'), after.supervisorLock('dispatcher_lock')]).toEqual([null, null]); } finally { after.close(); }
+  });
+
+  it('with --force stops the live supervisor and dispatcher by identity before the swap; one still running keeps its lock row', async () => {
+    const { src, file } = await backup(); src.db.close();
+    const dst = freshTarget();
+    const sup = { pid: 5001, start: 's1', bootId: null, at: 'a' };
+    const disp = { pid: 5002, start: 's2', bootId: null, at: 'b' };
+    const d = openDb(dst.p.db);
+    d.setMeta('supervisor_lock', JSON.stringify(sup));
+    d.setMeta('dispatcher_lock', JSON.stringify(disp));
+    d.close();
+    const running = new Set([5001, 5002]);
+    const stopped: string[] = [];
+    const r = await restoreStateBackup(dst.p, file, {
+      force: true, alive: () => false, helperAlive: (_k, l) => running.has(l.pid),
+      // The supervisor exits on SIGTERM; the dispatcher does not in time.
+      stopHelper: async (key, l) => { stopped.push(`${key}:${l.pid}`); if (key === 'supervisor_lock') running.delete(l.pid); return !running.has(l.pid); },
+    });
+    expect(stopped).toEqual(['supervisor_lock:5001', 'dispatcher_lock:5002']);
+    expect(r.helpers).toEqual([{ helper: 'supervisor', pid: 5001, stopped: true }, { helper: 'dispatcher', pid: 5002, stopped: false }]);
+    expect(r.warnings.join('\n')).toMatch(/Stopped the session supervisor \(pid 5001\)/);
+    expect(r.warnings.join('\n')).toMatch(/dispatcher \(pid 5002\) is still running; its lock was carried.*kill 5002/);
+    const after = openDb(dst.p.db);
+    try {
+      expect(after.supervisorLock('supervisor_lock')).toBeNull();
+      expect(after.supervisorLock('dispatcher_lock')).toEqual(disp);
+    } finally { after.close(); }
+  });
+
+  it('stopHelperProcess signals only a holder whose identity still matches, and waits for it to exit', async () => {
+    const lock = { pid: 5001, start: 's1', bootId: null, at: 'a' };
+    const kills: [number, string][] = [];
+    let alive = true;
+    await expect(stopHelperProcess('supervisor_lock', lock, { alive: () => alive, kill: (pid, sig) => { kills.push([pid, sig]); setTimeout(() => { alive = false; }, 5); }, pollMs: 2, timeoutMs: 1000 })).resolves.toBe(true);
+    expect(kills).toEqual([[5001, 'SIGTERM']]);
+    // A reused pid (identity no longer matches) is never signalled.
+    const none: number[] = [];
+    await expect(stopHelperProcess('dispatcher_lock', lock, { alive: () => false, kill: (pid) => { none.push(pid); } })).resolves.toBe(true);
+    expect(none).toEqual([]);
+    // A holder that ignores SIGTERM: false after the timeout.
+    await expect(stopHelperProcess('dispatcher_lock', lock, { alive: () => true, kill: () => undefined, pollMs: 2, timeoutMs: 20 })).resolves.toBe(false);
+  });
+
+  it('open upgrade requests of a backup from another runtime are rejected as obsolete; same runtime: kept', async () => {
+    const src = seed();
+    src.db.addChangeRequest({ id: 'cr_000000a1', kind: 'upgrade', payload: { fromContainer: true }, reason: 'container.aptPackages: recreate' });
+    const file = join(tmp('minions-state-out-'), 'state.tar.gz');
+    await createStateBackup(src.p, file);
+    src.db.close();
+    expect(parseStateBackup(readFileSync(file)).manifest.runtime).toBe('docker'); // tests run outside the host runtime
+    const same = freshTarget();
+    const r1 = await restoreStateBackup(same.p, file, { alive: () => false, runtime: 'docker' });
+    expect(r1.closedRequests).toBeUndefined();
+    const host = freshTarget();
+    const r2 = await restoreStateBackup(host.p, file, { alive: () => false, runtime: 'host' });
+    expect(r2.closedRequests).toEqual([{ id: 'cr_000000a1', status: 'rejected', detail: expect.stringMatching(/obsolete: recorded in the docker runtime; .* restored into the host runtime/) }]);
+    expect(r2.warnings.join('\n')).toMatch(/cr_000000a1 rejected/);
+    const d = openDb(host.p.db);
+    try {
+      expect(d.changeRequest('cr_000000a1')).toMatchObject({ status: 'rejected' });
+      expect(d.changeRequests()).toEqual([]);
+    } finally { d.close(); }
+  });
+
+  it('closeRestoredRequests: a backup without its runtime expires open requests (confirmed too); closed ones stay', () => {
+    const d = openDb(join(tmp('minions-state-cr-'), 'minions.db'));
+    d.addChangeRequest({ id: 'cr_000000b1', kind: 'upgrade', payload: {}, reason: null });
+    d.setChangeRequestStatus('cr_000000b1', 'confirmed');
+    d.addChangeRequest({ id: 'cr_000000b2', kind: 'upgrade', payload: {}, reason: null });
+    d.setChangeRequestStatus('cr_000000b2', 'applied');
+    const closed = closeRestoredRequests(d, { createdAt: '2026-10-01T00:00:00.000Z' }, 'host');
+    expect(closed).toEqual([{ id: 'cr_000000b1', status: 'expired', detail: expect.stringMatching(/does not name its runtime/) }]);
+    expect(d.changeRequest('cr_000000b2')?.status).toBe('applied');
+    expect(closeRestoredRequests(d, { runtime: 'host', createdAt: 'x' }, 'host')).toEqual([]);
+    d.close();
   });
 
   it('restores into a state dir that has no DB yet', async () => {

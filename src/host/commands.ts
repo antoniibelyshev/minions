@@ -621,7 +621,7 @@ export function register(program: Command): void {
   program.command('import')
     .description('Import committed history of the base branch into the runtime workspace (git bundle); with --state, restore a state backup instead')
     .option('--state <file>', 'restore runtime state (backlog, notes, briefs, results, runtime DB) from a backup written by `minions export --state`')
-    .option('--force', 'with --state: restore even while worker leases are active or the coordinator holds the project lock')
+    .option('--force', 'with --state: restore even while worker leases are active or the coordinator holds the project lock (a running session supervisor or dispatcher is stopped first)')
     .option('--dry-run', 'show what would be imported')
     .action(action(async (o: { state?: string; force?: boolean }, cmd: Command) => {
       requireMode('host');

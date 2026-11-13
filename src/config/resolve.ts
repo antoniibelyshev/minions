@@ -311,9 +311,9 @@ function checkHostOnlyChoices(project: MinionsConfig, label: string): void {
  * applies it to the config the host resolved; it is trusted like the local layer but without the deny-preservation
  * check (the owner gave the coordinator full control).
  */
-export function applyControl(base: MinionsConfig, control: unknown, label = 'control overlay'): MinionsConfig {
+export function applyControl(base: MinionsConfig, control: unknown, label = 'control overlay', prov: Record<string, Source> = {}): MinionsConfig {
   if (control === undefined) return base;
-  return validateConfig(overlay(base as unknown as Obj, control, 'control', {}, label), label);
+  return validateConfig(overlay(base as unknown as Obj, control, 'control', prov, label), label);
 }
 
 /** defaults < project < local < session (the runtime adds control, applyControl). Returns the validated config with per-leaf provenance. */

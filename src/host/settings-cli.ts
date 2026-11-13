@@ -5,6 +5,7 @@
 // refused while worker leases are active, so running workers are never interrupted).
 // `settings requests [--all]` lists the upgrade requests recorded in the runtime (src/runtime/change-requests.ts).
 import type { Command } from 'commander';
+import { projectOverlayText } from './control-overlay.js';
 import { action, globalOpts, requireMode, runtimeMode } from '../core/cli-helpers.js';
 import type { RunResult } from '../core/exec.js';
 import { displayText } from '../core/control-chars.js';
@@ -287,9 +288,13 @@ async function hostRequests(project: ProjectJson, runtime: SettingsRuntime, all:
 }
 
 async function listAction(project: ProjectJson, json: boolean, runtime: SettingsRuntime): Promise<void> {
-  const ctx = await loadSettingsContext(project, { pausedState: (p) => runtimePaused(p, runtime) });
+  const ctx = await loadSettingsContext(project, {
+    pausedState: (p) => runtimePaused(p, runtime),
+    controlOverlay: (p) => projectOverlayText(p, { running: () => runtime.running(p), exec: (args) => runtime.exec(p, args) }),
+  });
   const views = listSettings(ctx);
-  emit({ projectId: project.projectId, settings: views }, { json, human: () => formatList(views) });
+  emit({ projectId: project.projectId, settings: views, ...(ctx.overlayWarning ? { overlayWarning: ctx.overlayWarning } : {}) },
+    { json, human: () => [formatList(views), ...(ctx.overlayWarning ? [`warning: ${ctx.overlayWarning}`] : [])].join('\n') });
 }
 
 /** `settings set` (also registered as the `config set` alias). */

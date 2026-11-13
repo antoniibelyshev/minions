@@ -546,3 +546,32 @@ describe('edge cases (tester, task-45)', () => {
     expect(calls[0]).toEqual(['coordinator', 'restart', '--recover', '--force']);
   });
 });
+
+describe('gateway launch and dispatcher hand-offs (runtime health)', () => {
+  it('records and releases of dispatcher leases are not the coordinator\'s hand-offs', () => {
+    const db = freshDb();
+    session(db);
+    addLease(db, 'lease-d1', 'task-1', 'completed');
+    db.exec("UPDATE leases SET holder = 'dispatcher' WHERE id = 'lease-d1'");
+    for (let i = 0; i < 12; i++) db.addEvent(i % 2 ? 'record' : 'release', 'task-1', { leaseId: 'lease-d1', status: 'completed', to: 'done' });
+    const c = contextResetCheck({ db, config: defaults(), session: null });
+    expect(c.session.handoffs).toBe(0);
+    expect(c.session.delivered).toEqual([]);
+    expect(c.due).toBe(false);
+    handoffs(db, 2);
+    expect(contextResetCheck({ db, config: defaults(), session: null }).session.handoffs).toBe(2);
+  });
+
+  it('status in a gateway launch reports that sessions reset themselves, not a main-session reset due', async () => {
+    const env: Env = makeDefaultEnv();
+    session(env.db);
+    handoffs(env.db, 51);
+    noteTranscript(env.db, { transcript_path: '/tmp/t-1.jsonl', session_id: 's1' }, new Date(Date.now() - 1000), { key: 'thread:1', kind: 'thread', taskId: null });
+    const single = await collectStatus({ db: env.db, config: env.config, backlog: async () => env.backlog });
+    expect(humanStatus(single)).toMatch(/context reset: due \(51\/10 hand-offs, context unknown\)/);
+    const gw = await collectStatus({ db: env.db, config: env.config, backlog: async () => env.backlog, gatewayLaunch: async () => true });
+    expect(gw.contextReset).toMatchObject({ due: false, managedBy: 'sessions', sessions: { tracked: 1, due: [] } });
+    expect(humanStatus(gw)).toMatch(/context reset: coordinator sessions reset themselves \(1 tracked, none due\)/);
+    expect(humanStatus(gw)).not.toMatch(/hand-offs/);
+  });
+});

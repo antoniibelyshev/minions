@@ -10,11 +10,14 @@ import { lstat, mkdir, mkdtemp, readdir, readFile, rename, rm, rmdir, writeFile 
 import { basename, dirname, join } from 'node:path';
 import { gunzipSync, gzipSync } from 'node:zlib';
 import { matchesAny } from '../config/capabilities.js';
+import { runtimeMode } from '../core/cli-helpers.js';
 import { MinionsError } from '../core/errors.js';
 import { VERSION } from '../core/version.js';
 import { coordinatorPidAlive, type LockAlive } from './coordinator.js';
-import type { CoordinatorLock, RuntimeDb } from './db.js';
+import type { CoordinatorLock, ProcessLockKey, RuntimeDb, SupervisorLock } from './db.js';
 import { openDb, SCHEMA_VERSION } from './db.js';
+import { dispatcherAlive } from './dispatcher.js';
+import { supervisorAlive } from './supervisor.js';
 import type { RuntimePaths } from './paths.js';
 
 export const STATE_BACKUP_FORMAT = 'minions-state-backup';
@@ -54,7 +57,13 @@ export interface StateManifest {
   files: ManifestFile[];
   /** Paths found in the state dir but not archived, with the reason (symlink, hard link, secret-like, ...). */
   skipped: { path: string; reason: string }[];
+  /** The agent runtime that wrote it (absent from older backups). A restore into another runtime rejects its open upgrade requests. */
+  runtime?: BackupRuntime;
 }
+
+export type BackupRuntime = 'docker' | 'host';
+/** The agent runtime this process runs in: the container (docker) or the host runtime. */
+export const currentBackupRuntime = (env: NodeJS.ProcessEnv = process.env): BackupRuntime => (runtimeMode(env) === 'host-runtime' ? 'host' : 'docker');
 
 // ---------------------------------------------------------------------------------------------------
 // Minimal ustar (POSIX.1-1988) writer/reader with PAX `path` records for long names. Only regular
@@ -242,7 +251,7 @@ export async function createStateBackup(paths: Pick<RuntimePaths, 'state' | 'db'
   const files = entries.filter((e) => e.type === 'file').map((e) => ({ path: e.path, size: e.data.length, sha256: sha256(e.data) }));
   const manifest: StateManifest = {
     format: STATE_BACKUP_FORMAT, version: STATE_BACKUP_VERSION, createdAt, minionsVersion: VERSION, schemaVersion,
-    dirs, files, skipped,
+    dirs, files, skipped, runtime: currentBackupRuntime(),
   };
   const mbuf = Buffer.from(JSON.stringify(manifest, null, 2) + '\n');
   const gz = gzipSync(writeTar([{ path: MANIFEST_NAME, type: 'file', data: mbuf, mode: 0o644 }, ...entries], Math.floor(Date.parse(createdAt) / 1000)));
@@ -314,6 +323,57 @@ export interface StateImportResult {
   preservedLockPid: number | null;
   /** Older `pre-restore/<stamp>` dirs removed (the newest PRE_RESTORE_KEEP are kept). */
   pruned: string[];
+  /**
+   * The session supervisor and dispatcher that ran when the restore started (forced restore): stopped by identity
+   * before the swap; one still running had its lock row carried into the restored DB (absent from older runtimes).
+   */
+  helpers?: { helper: RestoreHelper; pid: number; stopped: boolean }[];
+  /** Open upgrade requests of the backup closed by the restore (closeRestoredRequests; absent: none). */
+  closedRequests?: { id: string; status: 'rejected' | 'expired'; detail: string }[];
+}
+
+/**
+ * Open upgrade requests (proposed, confirmed, failed) in a restored DB were recorded for the runtime that wrote the
+ * backup (a container recreate for new apt packages, say). Restored into another runtime they are obsolete:
+ * `rejected`. From a backup without its runtime (older versions) nobody can tell: `expired` (the coordinator asks
+ * again if still needed). Restored into the same runtime they stay open.
+ */
+export function closeRestoredRequests(db: RuntimeDb, manifest: Pick<StateManifest, 'runtime' | 'createdAt'>, into: BackupRuntime): NonNullable<StateImportResult['closedRequests']> {
+  if (manifest.runtime === into) return [];
+  const open = db.changeRequests().filter((r) => r.kind === 'upgrade');
+  if (!open.length) return [];
+  const status = manifest.runtime ? 'rejected' as const : 'expired' as const;
+  const detail = manifest.runtime
+    ? `obsolete: recorded in the ${manifest.runtime} runtime; the state was restored into the ${into} runtime`
+    : `restored from a state backup of ${manifest.createdAt} that does not name its runtime; request again if still needed`;
+  const at = new Date().toISOString();
+  return db.transaction(() => open.map((r) => {
+    db.exec('UPDATE change_requests SET status = ?, detail = ?, updated_at = ? WHERE id = ?', status, detail, at, r.id);
+    db.addEvent('change-request', null, { id: r.id, from: r.status, to: status, via: 'state-restore' });
+    return { id: r.id, status, detail };
+  }));
+}
+
+export type RestoreHelper = 'supervisor' | 'dispatcher';
+const HELPER_LOCKS: [RestoreHelper, ProcessLockKey][] = [['supervisor', 'supervisor_lock'], ['dispatcher', 'dispatcher_lock']];
+const helperName = (h: RestoreHelper) => (h === 'supervisor' ? 'the session supervisor' : 'the autopilot dispatcher');
+/** How long a forced restore waits for a SIGTERM'd supervisor or dispatcher to exit. */
+export const HELPER_STOP_TIMEOUT_MS = 20_000;
+
+/** Identity check of a helper lock holder: pid, start time, boot and command line (supervisorAlive / dispatcherAlive). */
+const defaultHelperAlive = (key: ProcessLockKey, l: SupervisorLock): boolean => (key === 'dispatcher_lock' ? dispatcherAlive(l) : supervisorAlive(l));
+
+/** SIGTERM to the holder (only while its identity still matches), then wait for it to exit; true once it is gone. */
+export async function stopHelperProcess(key: ProcessLockKey, l: SupervisorLock, o: { alive?: (key: ProcessLockKey, l: SupervisorLock) => boolean; kill?: (pid: number, sig: NodeJS.Signals) => void; timeoutMs?: number; pollMs?: number } = {}): Promise<boolean> {
+  const alive = o.alive ?? defaultHelperAlive;
+  if (!alive(key, l)) return true;
+  try { (o.kill ?? ((pid, sig) => { process.kill(pid, sig); }))(l.pid, 'SIGTERM'); } catch { return !alive(key, l); }
+  const deadline = Date.now() + (o.timeoutMs ?? HELPER_STOP_TIMEOUT_MS);
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, o.pollMs ?? 200));
+    if (!alive(key, l)) return true;
+  }
+  return !alive(key, l);
 }
 
 /** Top-level state entries a restore replaces (the DB together with its WAL files). */
@@ -335,16 +395,34 @@ const clashCodes = new Set(['EEXIST', 'ENOTDIR', 'EISDIR']);
  * but the newest PRE_RESTORE_KEEP pre-restore copies. The restored DB's coordinator lock row named a
  * process of the source runtime: it is replaced with the live coordinator's row when one holds the
  * lock (forced restore; so no second coordinator can start before the restart), else cleared.
+ * A live session supervisor or dispatcher (they keep the replaced DB's inode) also refuses the restore unless
+ * `force`; forced, each is stopped by identity right before the swap, and one still running keeps its lock row in
+ * the restored DB (the backup's own rows are cleared).
  * Leases the backup had active are reported in `restoredActiveLeases`; `releaseRestoredLeases`
  * releases them (the command layer does so right after the restore).
  */
-export async function restoreStateBackup(paths: Pick<RuntimePaths, 'state' | 'db'>, archive: string, opts: { force?: boolean; alive?: LockAlive; now?: Date } = {}): Promise<StateImportResult> {
+export async function restoreStateBackup(paths: Pick<RuntimePaths, 'state' | 'db'>, archive: string, opts: {
+  force?: boolean; alive?: LockAlive; now?: Date;
+  /** Supervisor/dispatcher lock holder liveness (default: identity check). */
+  helperAlive?: (key: ProcessLockKey, l: SupervisorLock) => boolean;
+  /** Stops a live helper before the swap (default stopHelperProcess); true once it exited. */
+  stopHelper?: (key: ProcessLockKey, l: SupervisorLock) => Promise<boolean>;
+  /** The runtime restored into (default: this process's). */
+  runtime?: BackupRuntime;
+} = {}): Promise<StateImportResult> {
   const st = await lstat(archive).catch(() => null);
   if (!st) throw new MinionsError('NOT_FOUND', `State backup not found: ${archive}`);
   if (!st.isFile()) throw new MinionsError('PRECONDITION', `${archive} is not a regular file; refusing to read it.`);
   const parsed = parseStateBackup(await readFile(archive));
   const warnings: string[] = [];
   let liveLock: CoordinatorLock | null = null;
+  const helperAlive = opts.helperAlive ?? defaultHelperAlive;
+  /** Live supervisor/dispatcher lock holders of the current DB (they keep its inode across the swap). */
+  const liveHelpers = (db: RuntimeDb): { helper: RestoreHelper; key: ProcessLockKey; lock: SupervisorLock }[] => HELPER_LOCKS.flatMap(([helper, key]) => {
+    const l = db.supervisorLock(key);
+    return l && helperAlive(key, l) ? [{ helper, key, lock: l }] : [];
+  });
+  let helpersAtStart: ReturnType<typeof liveHelpers> = [];
 
   const live = await lstat(paths.db).catch(() => null);
   if (live) {
@@ -354,13 +432,15 @@ export async function restoreStateBackup(paths: Pick<RuntimePaths, 'state' | 'db
       const lock = db.coordinatorLock();
       const lockLive = !!lock && (opts.alive ?? coordinatorPidAlive)(lock.pid, lock);
       if (lockLive) liveLock = lock!;
-      if (leases.length || lockLive) {
+      helpersAtStart = liveHelpers(db);
+      if (leases.length || lockLive || helpersAtStart.length) {
         const what = [...(leases.length ? [`${leases.length} active worker lease(s) (${leases.map((l) => l.id).join(', ')})`] : []),
-          ...(lockLive ? [`a running coordinator (pid ${lock!.pid})`] : [])].join(' and ');
+          ...(lockLive ? [`a running coordinator (pid ${lock!.pid})`] : []),
+          ...helpersAtStart.map((h) => `${helperName(h.helper)} (pid ${h.lock.pid})`)].join(' and ');
         if (!opts.force) {
           throw new MinionsError('CONFLICT', `Refusing to restore runtime state while it is in use: ${what}.`,
-            `Let the workers finish (minions status) or cancel them (minions work cancel --all), then rerun; or run minions pause --starts first (a running coordinator could claim new leases) and pass --force (leases the backup has active are released) and then ${RESTORE_RESTART_HINT}.`,
-            { activeLeases: leases.map((l) => l.id), coordinatorPid: lockLive ? lock!.pid : null });
+            `Let the workers finish (minions status) or cancel them (minions work cancel --all), then rerun; or run minions pause --starts first (a running coordinator could claim new leases) and pass --force (leases the backup has active are released; a running supervisor or dispatcher is stopped) and then ${RESTORE_RESTART_HINT}.`,
+            { activeLeases: leases.map((l) => l.id), coordinatorPid: lockLive ? lock!.pid : null, ...(helpersAtStart.length ? { helpers: helpersAtStart.map((h) => ({ helper: h.helper, pid: h.lock.pid })) } : {}) });
         }
         warnings.push(`Restored over ${what} (--force). Workers still running lose their lease (their submit is refused; worktrees and branches are kept). Now ${RESTORE_RESTART_HINT}.`);
       }
@@ -372,6 +452,8 @@ export async function restoreStateBackup(paths: Pick<RuntimePaths, 'state' | 'db
   const staging = await mkdtemp(join(paths.state, '.restore-staging-'));
   let previous: string | null = null;
   let restoredActiveLeases: string[] = [];
+  let helpersRun: NonNullable<StateImportResult['helpers']> = [];
+  let closedRequests: NonNullable<StateImportResult['closedRequests']> = [];
   try {
     let current = '';
     try {
@@ -387,6 +469,19 @@ export async function restoreStateBackup(paths: Pick<RuntimePaths, 'state' | 'db
       if (clashCodes.has((err as NodeJS.ErrnoException).code ?? '')) throw invalid(`entry ${JSON.stringify(current)} clashes with another entry (a file and a directory share a path)`);
       throw err;
     }
+    // A running supervisor or dispatcher keeps the replaced DB's inode and would loop on as lock holder there
+    // (forced restore only: refused above otherwise). Stop each by identity, as late as possible before the swap;
+    // a holder still running then (did not exit in time, or the wrapper started a new one) keeps its row in the
+    // restored DB, so a later takeover signals the real process (and it exits once it sees the DB file replaced).
+    const helpers: NonNullable<StateImportResult['helpers']> = [];
+    const stop = opts.stopHelper ?? ((key: ProcessLockKey, l: SupervisorLock) => stopHelperProcess(key, l, { alive: helperAlive }));
+    helpersRun = helpers;
+    for (const h of helpersAtStart) helpers.push({ helper: h.helper, pid: h.lock.pid, stopped: await stop(h.key, h.lock).catch(() => false) });
+    let carried: ReturnType<typeof liveHelpers> = [];
+    if (live) { const db = openDb(paths.db); try { carried = liveHelpers(db); } finally { db.close(); } }
+    for (const h of helpers) if (h.stopped) warnings.push(`Stopped ${helperName(h.helper)} (pid ${h.pid}); the coordinator starts it again on the restored state.`);
+    for (const c of carried) warnings.push(`${helperName(c.helper)} (pid ${c.lock.pid}) is still running; its lock was carried into the restored state. It stops by itself once it notices the replaced database; if it does not, \`kill ${c.lock.pid}\`.`);
+
     // The snapshot must open, migrate to this build's schema and pass an integrity check.
     const sdb = (() => {
       try { return openDb(join(staging, DB_NAME)); } catch (err) { throw invalid(`the database snapshot does not open (${(err as Error).message})`); }
@@ -396,7 +491,12 @@ export async function restoreStateBackup(paths: Pick<RuntimePaths, 'state' | 'db
       if (ok?.integrity_check !== 'ok') throw invalid(`the database snapshot fails its integrity check (${ok?.integrity_check ?? 'no result'})`);
       if (liveLock) sdb.setMeta('coordinator_lock', JSON.stringify(liveLock));
       else sdb.deleteMeta('coordinator_lock');
+      for (const [, key] of HELPER_LOCKS) {
+        const c = carried.find((h) => h.key === key);
+        if (c) sdb.setMeta(key, JSON.stringify(c.lock)); else sdb.deleteMeta(key);
+      }
       restoredActiveLeases = sdb.activeLeases().map((l) => l.id);
+      closedRequests = closeRestoredRequests(sdb, parsed.manifest, opts.runtime ?? currentBackupRuntime());
       sdb.addEvent('state-restore', null, { backupCreatedAt: parsed.manifest.createdAt, forced: !!opts.force, restoredActiveLeases, preservedLockPid: liveLock?.pid ?? null });
       sdb.sql.exec('PRAGMA wal_checkpoint(TRUNCATE)');
     } finally { sdb.close(); }
@@ -428,10 +528,15 @@ export async function restoreStateBackup(paths: Pick<RuntimePaths, 'state' | 'db
   if (restoredActiveLeases.length) {
     warnings.push(`The backup has ${restoredActiveLeases.length} lease(s) marked active (${restoredActiveLeases.join(', ')}); no worker holds them in this runtime, so they are released.`);
   }
+  if (closedRequests.length) {
+    warnings.push(`Open upgrade request(s) from the backup closed: ${closedRequests.map((c) => `${c.id} ${c.status}`).join(', ')} (${closedRequests[0]!.detail}).`);
+  }
   const m = parsed.manifest;
   return {
     restored: { files: parsed.files.size, dirs: parsed.dirs.length, createdAt: m.createdAt, schemaVersion: m.schemaVersion, minionsVersion: m.minionsVersion },
     previous, forced: !!opts.force, warnings, restoredActiveLeases, preservedLockPid: liveLock?.pid ?? null, pruned,
+    ...(helpersRun.length ? { helpers: helpersRun } : {}),
+    ...(closedRequests.length ? { closedRequests } : {}),
   };
 }
 

@@ -39,8 +39,13 @@ minions import --state ~/backups/proj.tar.gz
 
 The archive is validated on the host and again in the runtime (manifest, checksums, allowed paths,
 regular files only, DB integrity and schema) before anything changes. The restore is refused
-(`CONFLICT`) while a worker lease is active or a live coordinator holds the project lock: let the
-workers finish or cancel them (`minions work cancel --all`), then rerun; or pass `--force`. Before a forced restore run `minions pause --starts`: a still-running
+(`CONFLICT`) while a worker lease is active, a live coordinator holds the project lock, or the session
+supervisor (`minions coordinator supervise`) or autopilot dispatcher (`minions work dispatch`) runs: let the
+workers finish or cancel them (`minions work cancel --all`), then rerun; or pass `--force`. A forced
+restore stops a running supervisor and dispatcher (SIGTERM, only the process its lock names, checked by pid
+and start time) right before it swaps the database in; the coordinator starts them again on the restored
+state. One that does not exit in time keeps its lock row in the restored DB and exits by itself once it
+notices the database file was replaced. Before a forced restore run `minions pause --starts`: a still-running
 coordinator could otherwise claim new leases before the restart.
 
 Leases the backup has marked active are released by the restore (no worker holds them in this
@@ -51,6 +56,10 @@ coordinator can start). Then run `minions settings restart`: it restarts the coo
 recovery prompt (`/minions:recover`), which re-dispatches the released tasks. The replaced state is
 moved to `<state>/pre-restore/<time>/` inside the runtime; the newest three copies are kept, older ones
 are removed. The archive copies in the runtime import and export dirs are removed after use.
+Open upgrade requests in the backup were made for the runtime that wrote it (for example a container
+recreate for new apt packages): restored into the other runtime (Docker to host, or back) they are
+marked `rejected` as obsolete; from an older backup that does not record its runtime they are marked
+`expired`. Check with `minions settings requests --all`.
 
 ## Docker is not running
 
@@ -105,6 +114,28 @@ anything, and reads its handoff (`minions coordinator handoff --read` inside the
 reason is recorded in `<state>/coordinator-exit.json`; restarts done for context resets log to
 `<state>/logs/context-reset.log`. If `minions start` says another coordinator holds the project lock,
 attach to it with `minions start` instead of launching a second one.
+
+## Orphaned supervisor or dispatcher after a state restore
+
+Symptoms (host runtime): `minions doctor` warns `helpers.orphans: N orphaned helper process(es)`; `ps`
+shows more than one `minions coordinator supervise` or `minions work dispatch` for the project, some of
+them days old; sessions or autopilot workers act on state that no longer matches `minions status`.
+
+A state restore (`minions import --state`) moves the live database to `<state>/pre-restore/<time>/` and
+swaps the backup in. A supervisor or dispatcher that was running keeps the old database file open and
+still sees itself as the lock holder there. Current versions refuse the restore while either runs (or stop
+them with `--force`), and both exit by themselves once they notice the database file was replaced. Older
+versions, or a helper started between the stop and the swap, can leave such a pair running. Doctor lists
+each process whose working directory is this project's state dir but which does not hold its lock in the
+current database, with the command to stop it; it never stops anything itself:
+
+```sh
+minions doctor                               # helpers.orphans: the pids and the exact kill command
+ps -o pid,lstart,command -p <pid>,<pid>      # confirm they are the old `coordinator supervise` / `work dispatch`
+kill <pid> <pid>                             # SIGTERM: they stop their sessions and workers first
+```
+
+The lock holders keep running; the coordinator starts a helper again by itself when its lock is missing or stale.
 
 ## A lease is stuck
 

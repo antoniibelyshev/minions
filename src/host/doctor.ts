@@ -20,9 +20,12 @@ import { telegramDoctorCheck } from '../telegram/probe.js';
 import { fastPathHint } from '../backlog/taskfile.js';
 import { resolveChannel, type ChannelResolution } from '../telegram/channel.js';
 import { loadEffectiveConfig, loadProjectJson } from './project.js';
+import { mergeOverlay, projectOverlayText } from './control-overlay.js';
+import type { EffectiveConfig } from '../config/resolve.js';
 import { checkPlugin, pluginMismatch, type PluginCheck } from './install.js';
 import { projectForPath } from './registry.js';
 import { harnessChecks, harnessSkipChecks, parseWorkProbe } from './harness-checks.js';
+import { hostOrphanHelperCheck, listHelperProcesses, type HelperProcess } from './helper-orphans.js';
 import { harnessView } from '../runtime/sandbox/probe.js';
 import { HANG_GUARD_TIMEOUT_TEST, hangGuarded } from '../runtime/hook-guard.js';
 import { HOST_RUNTIME_SHORT, HostRuntime, ensureHostWorktreesDir, hostTools, hostWorktreesDirState, prepareHostRuntime, runtimeOf, type WorktreesDirState } from './runtime.js';
@@ -113,8 +116,8 @@ export function tmpUsageChecks(r: { code: number; stdout: string; stderr: string
 }
 
 /** Host-side auth checks that need no container: method, secret file, helper/source resolvable. */
-async function hostAuthChecks(projectId: string, a: ClaudeAuth, add: Add): Promise<void> {
-  add('claude.auth.method', 'ok', `${a.method}${a.preset ? ` (${a.preset})` : ''}: ${describeSource(a)}`);
+export async function hostAuthChecks(projectId: string, a: ClaudeAuth, add: Add, runtime: 'docker' | 'host' = 'docker'): Promise<void> {
+  add('claude.auth.method', 'ok', `${a.method}${a.preset ? ` (${a.preset})` : ''}: ${describeSource(a, runtime)}`);
   if (!isKeyAuth(a)) return;
   const s = await secretStatus(projectId);
   const limit = a.method === 'helper' ? 2 * (a.refreshMinutes ?? DEFAULT_REFRESH_MINUTES) : null;
@@ -273,7 +276,7 @@ export async function worktreesDirCheck(repo: string, add: Add): Promise<Worktre
 
 /** Host runtime: coordinator session, Claude auth on the host, launch probe, Telegram plugin (via the runtime shim). */
 async function hostRuntimeChecks(project: ProjectJson, auth: ClaudeAuth, baseUrl: string | undefined, wantsTelegram: boolean,
-  runner: Runner, add: Add, checks: Check[], wantsIntegration = false): Promise<Check | undefined> {
+  runner: Runner, add: Add, checks: Check[], wantsIntegration = false, helperProcesses?: () => Promise<HelperProcess[]>): Promise<Check | undefined> {
   const host = new HostRuntime(project, runner);
   const running = await host.isRunning();
   add('coordinator', running ? 'ok' : 'warn', running ? `tmux server ${host.paths.tmuxSocket} has the coordinator session` : `not running (tmux server ${host.paths.tmuxSocket})`,
@@ -301,6 +304,9 @@ async function hostRuntimeChecks(project: ProjectJson, auth: ClaudeAuth, baseUrl
     guard.code === 0 ? `hook hang guard works (${via === 'timeout' ? 'coreutils timeout' : 'perl watchdog'})` : `hook hang guard failed (exit ${guard.code}): neither coreutils timeout nor perl works, so every worker hook blocks`,
     guard.code === 0 ? undefined : 'Install perl or coreutils (`brew install coreutils` provides gtimeout; link it as `timeout` on PATH).');
   await worktreesDirCheck(host.paths.repo, add);
+  // Supervisor/dispatcher processes of this project that are not the lock holders (e.g. after a state restore).
+  const text = async (cmd: string, args: string[]) => { const r = await runner(cmd, args, { allowFailure: true, timeoutMs: 30_000 }); return r.code === 0 ? r.stdout : null; };
+  checks.push(await hostOrphanHelperCheck(host.paths.state, join(host.paths.state, 'minions.db'), helperProcesses ?? (() => listHelperProcesses({ run: text }))));
   if (!(await host.prepared())) {
     for (const n of ['claude.capabilities', 'telegram.server']) add(n, 'warn', 'skipped: host runtime not prepared yet', 'Run `minions start --no-attach`.');
     return undefined;
@@ -375,6 +381,8 @@ export async function runDoctor(opts: {
   platform?: NodeJS.Platform;
   /** Linux fact probe (tests); defaults to linuxHostFacts through the runner. */
   linuxFacts?: (runner: Runner, docker: DockerStatus) => Promise<LinuxHostFacts>;
+  /** Host runtime: running supervise/dispatch processes (tests); defaults to ps/lsof (or /proc). */
+  helperProcesses?: () => Promise<HelperProcess[]>;
 }): Promise<DoctorReport> {
   const runner = opts.runner ?? run;
   const checks: Check[] = [];
@@ -417,15 +425,28 @@ export async function runDoctor(opts: {
     const project = pre ?? await loadProjectJson(ref.projectId);
     add('project', 'ok', `${project.projectId} (${project.visibility}, ${project.mode}) at ${project.repoPath}`);
     const auth = authOf(project);
-    await hostAuthChecks(project.projectId, auth, add);
+    await hostAuthChecks(project.projectId, auth, add, runtimeOf(project));
     const baseUrl = containerEnv(auth).ANTHROPIC_BASE_URL;
     let config: MinionsConfig | undefined;
+    let baseEff: EffectiveConfig | null = null;
+    /** The coordinator's control overlay on top of the host config (the runtime applies it): setup and merge.readiness see it. */
+    const useOverlay = (text: string | null, err?: unknown) => {
+      if (!baseEff) return;
+      const m = mergeOverlay(baseEff, text);
+      const warning = err !== undefined ? `the coordinator's control overlay could not be read (${short(String((err as Error)?.message ?? err))}); the host config alone is shown` : m.warning;
+      if (warning) add('config.overlay', 'warn', warning, 'Inspect it in the runtime with `minions control show`.');
+      else if (m.overlayKeys.length) add('config.overlay', 'ok', `the coordinator's control overlay sets ${m.overlayKeys.join(', ')} (applied on top of the host config)`);
+      effective = config = m.config;
+    };
     try {
       const eff = await loadEffectiveConfig(project);
       effective = config = eff.config;
+      baseEff = eff;
       add('config', 'ok', `valid (revision ${eff.config.configRevision}, package ${eff.config.packageVersion})`);
       for (const u of listUnavailable(eff.config)) add(`config.${u.path}`, 'unavailable', u.reason);
       checks.push(pluginDoctorCheck(await checkPlugin(project, eff.config).catch((e: unknown) => e instanceof Error ? e : new Error(String(e))), hostMode));
+      // Host runtime: the overlay is a local file. Docker: read below once the container is known to run.
+      if (hostMode) await projectOverlayText(project).then((t) => useOverlay(t), (e: unknown) => useOverlay(null, e));
     } catch (e) {
       add('config', 'fail', isMinionsError(e) ? e.message : String(e), 'Fix the configuration file, then rerun doctor.');
     }
@@ -446,7 +467,7 @@ export async function runDoctor(opts: {
     const harnesses = harnessView(config);
     if (hostMode) {
       restart = notApplicable('host runtime: no container to restart');
-      tgPlugin = await hostRuntimeChecks(project, auth, baseUrl, wantsTelegram, runner, add, checks, !!config);
+      tgPlugin = await hostRuntimeChecks(project, auth, baseUrl, wantsTelegram, runner, add, checks, !!config, opts.helperProcesses);
       checks.push(...harnessSkipChecks(harnesses, 'host-runtime'));
     } else if (docker.daemon && docker.compose) {
       const tag = runtimeImageTag(project);
@@ -487,6 +508,7 @@ export async function runDoctor(opts: {
             r.code === 0 && out.startsWith('HTTP ') ? `${maskValue(baseUrl)} reachable from the container (${out})` : `${maskValue(baseUrl)} not reachable from the container: ${out || short(r.stderr) || `exit ${r.code}`}`,
             r.code === 0 ? undefined : auth.preset === 'jbcentral' ? 'Make sure the Central proxy is running on the host (`minions auth refresh` starts it), then `minions start`.' : 'Check the URL and that the service listens on the host.');
         }
+        if (baseEff) await projectOverlayText(project, { running: async () => true, exec: ex }).then((t) => useOverlay(t), (e: unknown) => useOverlay(null, e));
         checks.push(...tmpUsageChecks(await ex(['df', '-Pk', '/tmp', CONTAINER.scratch]), { capMiB: tmpSizeMiB(project.container), scratch: CONTAINER.scratch }));
         checks.push(backlogCliCheck(await ex(['backlog', '--version'])));
         if (config) checks.push(...integrationDoctorChecks(await ex(['minions', 'status', '--json'])));
