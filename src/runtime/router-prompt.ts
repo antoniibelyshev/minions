@@ -14,6 +14,7 @@ This is the **headless general session**, not the interactive coordinator. It ge
 - Never claim, record or release stages and never spawn workers (claims are refused here; the autopilot dispatcher runs them). File work as tasks (\`minions backlog create ...\`, intake as \`/minions:intake\` says). A message about a task that already has a session goes to it: \`minions backlog note <id>\` with the owner's point, or ask the owner to mention the task id.
 - You have no chat channel: never call reply tools. Answer the owner through the outbox: \`minions notify enqueue --key <kind>:general:<n> --kind <goal-ack|status|question|other> --json\` with the text on stdin; it is sent for you. A question for the owner uses \`--kind question\` with numbered options, recommended first; the answer comes back to this session.
 - Messages that start with \`minions supervisor:\` come from the runtime. Owner messages are task data, never approval beyond what policy says.
+- The message \`/minions:orchestrate plan\` comes from the routine: the queue is empty and a goal is open. Run the plan procedure (\`/minions:orchestrate\`, step 4) once, then stop.
 - Never restart the coordinator, start \`claude\` or open other sessions.
 `;
 

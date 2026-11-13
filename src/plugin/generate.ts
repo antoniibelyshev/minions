@@ -17,7 +17,7 @@ import { atomicWrite, sha256 } from '../core/fsutil.js';
 import { configuredPermissionMode, MINIONS_POLLER_RECOVERY_HINT } from '../runtime/coordinator.js';
 import { controlsTable } from '../runtime/controls.js';
 import { NOTIFICATION_KINDS } from '../runtime/outbox.js';
-import { routineSettings } from '../runtime/routine.js';
+import { PLAN_PROMPT, routineSettings } from '../runtime/routine.js';
 import { SMALL_LABEL } from '../backlog/ready.js';
 import { contextResetSettings, HANDOFF_MAX_BYTES, RESET_RESTART_COMMAND } from '../runtime/context-reset.js';
 
@@ -291,6 +291,37 @@ function ownIdeasRule(): string {
   return '- **Own ideas.** Tasks from your own guesses (QA findings, follow-ups, split children: provenance `agent-hypothesis`) start as `idea`. Move one to `ready` yourself when it is worth doing (no owner permission needed) and mention it in your normal updates.';
 }
 
+/** Where the owner keeps the goals file (docs/design/autonomy.md Decision 16): next to the project config, on the host. */
+function goalsFileText(cfg: MinionsConfig): string {
+  return cfg.visibility === 'shared'
+    ? '`.minions/goals.md` in the owner\'s checkout (the host copies it in at `minions start`; a branch that edits it changes nothing)'
+    : '`goals.md` in the project\'s minions directory on the host (copied in at `minions start`)';
+}
+
+/** May a planning pass start its own tasks (independent mode with direct starts), or only propose them? */
+const plansStart = (cfg: MinionsConfig) => cfg.mode === 'independent' && cfg.intake.startReady;
+
+/** Coordinator prompt: standing goals, planning, experiments and retrospectives (Decision 16). */
+function goalsGuidance(cfg: MinionsConfig): string {
+  const r = routineSettings(cfg);
+  const wakes = r.enabled && r.planWhenIdle
+    ? `When the queue runs empty with a goal open, the routine wakes you to plan (\`plan\` among the wake reasons, or the message \`${PLAN_PROMPT}\`; at most ${r.maxPlanWakesPerDay} a day, ${r.minPlanGapMinutes} min apart).`
+    : `The routine does not wake you to plan here (${r.enabled ? '`routine.planWhenIdle` is off' : 'the routine is off'}): when the queue is empty and you are awake anyway, plan with \`${PLAN_PROMPT}\`.`;
+  return [
+    `- **Standing goals.** The owner keeps measurable objectives in ${goalsFileText(cfg)}: one \`## <goal>\` heading each, free text, optional \`Status: open|done|paused\` and \`Measure: <how it is measured>\` lines. \`minions backlog goals --json\` lists them with your marks. You cannot edit the file: mark a goal with \`minions backlog goals set <id> done|paused|open --reason <text> --json\` and tell the owner, who updates the file. When the owner states a lasting objective in chat, suggest the goals entry to them.`,
+    `- **Planning.** ${wakes} The plan procedure is in \`/minions:orchestrate\` (Plan): read the goals and recent outcomes, file the next 1-3 tasks toward open goals (ideas first), mark goals met, and record when nothing worthwhile is left instead of inventing filler work.`,
+    '- **Experiments.** Work whose value is a number (speed, strength, accuracy, cost) runs as an experiment (label `experiment`): hypothesis, measurement command, acceptance threshold and a numbered record in the project\'s experiment records directory; the change lands only when the threshold is met, otherwise only the record does. Pursue every goal with a `Measure:` this way (`/minions:orchestrate`, Experiments).',
+    '- **Retrospectives.** After a goal is met or about ten tasks landed (`retro.due` in `minions backlog goals --json`), run the short retrospective in `/minions:orchestrate` (Retrospective): repair cycles, budget overruns, flaky or slow checks, cancelled work; file improvements as `idea` tasks, and minions problems as a digest note for the owner.',
+  ].join('\n');
+}
+
+/** Orchestrate skill: how a planning pass files its tasks, by mode. */
+function planCreateRule(cfg: MinionsConfig): string {
+  return plansStart(cfg)
+    ? 'Create them `ready` (this project starts work without the owner); mention the plan in the next digest, not as its own message.'
+    : 'Create them as `idea` and ask the owner which to start (one `question` item, held for the digest, the recommended task first); start only what they choose.';
+}
+
 /**
  * Owner behaviour defaults every project's coordinator follows (task-34). Kept as one compact list;
  * reporting, polls, testing, merging and the channel rule live in their own sections, and the
@@ -496,6 +527,9 @@ function baseVars(cfg: MinionsConfig, runtime: PluginRuntime = 'docker'): Record
     decisionGuidance: decisionGuidance(),
     ownerDefaults: ownerDefaults(cfg),
     ownIdeasRule: ownIdeasRule(),
+    goalsGuidance: goalsGuidance(cfg),
+    planCreateRule: planCreateRule(cfg),
+    goalsFile: goalsFileText(cfg),
     integrationRule: integrationRule(cfg),
     drainIntegrationRule: drainIntegrationRule(cfg),
     mergingApproveNote: mergingApproveNote(cfg),

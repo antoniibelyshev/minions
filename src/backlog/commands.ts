@@ -15,6 +15,7 @@ import { assertIntakeOpen } from './intake.js';
 import type { BacklogAdapter, IdempotencyStore, Provenance, ScopeFilter, Task, TaskStatus } from './types.js';
 import { withControl } from '../runtime/control.js';
 import { runtimePaths } from '../runtime/paths.js';
+import { GOAL_STATUSES, goalsView, readGoalsState, readGoalsText, runtimeGoalsPath, writeGoalsState, type GoalStatus, type GoalsView } from '../runtime/goals.js';
 
 // ---------------------------------------------------------------- hooks set by the runtime
 
@@ -98,6 +99,22 @@ function detail(t: Task): string {
   if (t.acceptanceCriteria.length) out.push('', ...t.acceptanceCriteria.map((a, i) => `[${a.done ? 'x' : ' '}] #${i + 1} ${a.text}`));
   if (t.notes) out.push('', 'notes:', t.notes);
   return out.join('\n');
+}
+
+/** The goals view for `backlog goals`: the runtime's goals copy, the marks, and the backlog for the retrospective check. */
+async function loadGoals(tasks?: Task[] | null): Promise<GoalsView & { path: string }> {
+  const paths = runtimePaths();
+  const path = runtimeGoalsPath(paths.configJson);
+  const text = readGoalsText(path);
+  return { path, ...goalsView(text, readGoalsState(paths.state), tasks ?? (text === null ? null : await (await open()).backlog.listTasks())) };
+}
+
+function humanGoalsList(v: GoalsView): string {
+  if (!v.present) return 'No goals file (the owner writes goals.md next to the project config; `minions start` copies it in).';
+  const out = v.goals.map((g) => `${g.id.padEnd(24)} ${g.status.padEnd(7)}${g.mark ? ' (marked)' : '         '} ${g.title}${g.measure ? `\n${' '.repeat(34)}measure: ${g.measure}` : ''}`);
+  if (v.exhausted) out.push(`planning found nothing worthwhile left at ${v.exhausted.at}: ${v.exhausted.reason}`);
+  if (v.retro) out.push(`retrospective: ${v.retro.due ? 'due' : 'not due'} (${v.retro.doneSince} task(s) done${v.retro.goalsDoneSince ? `, ${v.retro.goalsDoneSince} goal(s) done` : ''} since ${v.retro.last?.at ?? 'the start'})`);
+  return out.join('\n') || '(no goals)';
 }
 
 // ---------------------------------------------------------------- compact listing
@@ -241,6 +258,48 @@ export function register(program: Command): void {
       const { backlog } = await open();
       await backlog.addNote(id, text);
       emit({ id, noted: true }, { json: globalOpts(cmd).json, human: () => `Noted ${id}` });
+    }));
+
+  // Standing goals (docs/design/autonomy.md Decision 16): the owner writes them, the coordinator marks them.
+  const goals = bl.command('goals').description('The owner\'s standing goals (goals.md next to the project config, copied in by the host) with your marks, and whether a retrospective is due')
+    .action(action(async (_opts: unknown, cmd: Command) => {
+      requireMode('runtime');
+      const v = await loadGoals();
+      emit(v, { json: globalOpts(cmd).json, human: humanGoalsList });
+    }));
+  goals.command('set <id> <status>').description(`Mark a goal ${GOAL_STATUSES.join(' | ')} (the owner's own Status line wins once they change it)`)
+    .requiredOption('--reason <text>', 'why (e.g. the measurement that meets the goal)')
+    .action(action(async (id: string, status: string, o: { reason: string }, cmd: Command) => {
+      requireMode('runtime');
+      const st = oneOf<GoalStatus>('status', status, GOAL_STATUSES)!;
+      const v = await loadGoals();
+      const g = v.goals.find((x) => x.id === id);
+      if (!g) throw new MinionsError('NOT_FOUND', `No goal "${id}"${v.present ? '' : ' (no goals file)'}.`, `Goals: ${v.goals.map((x) => x.id).join(', ') || 'none'}.`);
+      const state = readGoalsState(runtimePaths().state);
+      const at = new Date().toISOString();
+      if (st === g.fileStatus) delete state.marks[id]; else state.marks[id] = { status: st, fileStatus: g.fileStatus, at, reason: o.reason.slice(0, 500) };
+      state.log.push({ at, what: `set ${st}`, id, reason: o.reason.slice(0, 500) });
+      await writeGoalsState(runtimePaths().state, state);
+      emit({ id, status: st, fileStatus: g.fileStatus }, { json: globalOpts(cmd).json, human: () => `Goal ${id}: ${st}${st !== g.fileStatus ? ` (the goals file says ${g.fileStatus}; tell the owner)` : ''}` });
+    }));
+  goals.command('record <what>').description('Record `idle` (planning found nothing worthwhile left: no planning wake until the goals change) or `retro` (a retrospective ran)')
+    .requiredOption('--reason <text>', 'idle: why nothing is left; retro: a one-line summary')
+    .action(action(async (what: string, o: { reason: string }, cmd: Command) => {
+      requireMode('runtime');
+      const kind = oneOf('record', what, ['idle', 'retro'] as const)!;
+      const { backlog } = await open();
+      const tasks = kind === 'retro' ? await backlog.listTasks() : null;
+      const v = await loadGoals(tasks);
+      const state = readGoalsState(runtimePaths().state);
+      const at = new Date().toISOString();
+      const reason = o.reason.slice(0, 500);
+      if (kind === 'idle') {
+        if (!v.hash) throw new MinionsError('PRECONDITION', 'There is no goals file: nothing to plan for.', 'The owner adds goals.md next to the project config and runs `minions start`.');
+        state.exhausted = { hash: v.hash, at, reason };
+      } else state.retro = { at, done: tasks!.filter((t) => t.status === 'done').length, summary: reason };
+      state.log.push({ at, what: `record ${kind}`, reason });
+      await writeGoalsState(runtimePaths().state, state);
+      emit({ recorded: kind, at }, { json: globalOpts(cmd).json, human: () => (kind === 'idle' ? 'Recorded: nothing worthwhile left; no planning wake until the goals change.' : 'Recorded the retrospective.') });
     }));
 
   bl.command('export').description('Export all tasks as JSON')

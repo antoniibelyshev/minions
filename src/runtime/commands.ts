@@ -33,9 +33,10 @@ import {
 import { pidAlive } from './db.js';
 import { run as runChild } from '../core/exec.js';
 import {
-  humanRoutine, humanRoutineReport, ROUTINE_TRIGGERS, routineLast, routineSettings, runRoutinePass, startRoutineClock,
-  type CoordinatorView, type RoutineLast, type RoutineTrigger,
+  humanRoutine, humanRoutineReport, PLAN_PROMPT, ROUTINE_TRIGGERS, routineLast, routineSettings, runRoutinePass, startRoutineClock,
+  type CoordinatorView, type PlanFacts, type RoutineLast, type RoutineTrigger,
 } from './routine.js';
+import { goalsView, humanGoals, QUEUED_STATUSES, readGoalsState, readGoalsText, runtimeGoalsPath, type GoalsView } from './goals.js';
 import { currentBudget, spendCaps } from './spend.js';
 import { openDb, type DrainNotice, type DrainRequest, type Lease, type PauseChange, type RuntimeDb } from './db.js';
 import { clearDrain, requestDrain } from './drain.js';
@@ -69,7 +70,7 @@ import { clearHold, DISPATCH_HOLDER, dispatcherLockState, readHolds, runDispatch
 import { launchWorker } from './dispatch-launch.js';
 import { liveRun, liveRunExitCode, type LiveRunReport } from './headless.js';
 import { buildSessionCommand, sessionConfigDir, sessionsSettings, threadSettings } from './sessions.js';
-import { enqueueInbox, openSession } from './session-store.js';
+import { enqueueInbox, openSession, pendingInbox } from './session-store.js';
 import { formatSessionsIndex, handoverSession, runGateway, sessionsIndex, setSessionTopic } from './gateway.js';
 import { heldBySession, recordSent, sendToSession, sessionKeyOf, threadReplyTarget, type ReplyContext } from './router.js';
 import { runSupervisor, startSupervisorWatch, supervisorEnv, supervisorLockState, type SupervisorReport, type SupervisorTaskDeps } from './supervisor.js';
@@ -207,9 +208,34 @@ async function routineDeps(): Promise<Parameters<typeof runRoutinePass>[0]> {
     upgradeInProgress: () => upgradeInProgress(d),
     digestDue: (now) => digestStatus(d, cfg, now).due,
     holdBack: (now) => reholdExpired(d, cfg, now),
+    planFacts: async () => planFacts(d, paths, await getBacklog(), sessionsSettings(cfg).enabled),
+    planSession: async () => {
+      openSession(d, 'general', { configDir: sessionConfigDir(paths, 'general'), model: cfg.models.coordinator ?? null });
+      enqueueInbox(d, 'general', PLAN_INBOX_SOURCE, PLAN_PROMPT);
+      return `${PLAN_PROMPT} queued for the general session`;
+    },
     // Never with force: scheduleDetachedRestart refuses with an active lease or a drain (and the detached restart checks again).
     wake: async () => scheduleDetachedRestart({ activeLeases: () => leases().map((id) => ({ id })), drain: () => d.drain(), log, cwd: paths.state }, { wake: true }).reason,
     crashStart: async () => scheduleCrashStart({ drain: () => d.drain(), upgrade: () => upgradeInProgress(d), log, cwd: paths.state }).reason,
+  };
+}
+
+/** Inbox source of the routine's planning message to the general session. */
+const PLAN_INBOX_SOURCE = 'routine';
+
+/** The goals as the runtime sees them: the host's copy next to the config and the coordinator's marks. */
+export function runtimeGoals(paths = runtimePaths(), tasks?: Task[] | null): GoalsView {
+  return goalsView(readGoalsText(runtimeGoalsPath(paths.configJson)), readGoalsState(paths.state), tasks);
+}
+
+/** What the routine pass needs to decide on planning (Decision 16). */
+async function planFacts(d: RuntimeDb, paths: ReturnType<typeof runtimePaths>, b: BacklogAdapter, sessionsOn: boolean): Promise<PlanFacts> {
+  const goals = runtimeGoals(paths);
+  const tasks = goals.counts.open ? await b.listTasks() : [];
+  const pending = sessionsOn ? pendingInbox(d, 'general').length : 0;
+  return {
+    goals, queued: tasks.filter((t) => QUEUED_STATUSES.has(t.status)).length, ideas: tasks.filter((t) => t.status === 'idea').length,
+    intakePaused: d.paused().intake, sessionBusy: pending ? `the general session has ${pending} message(s) waiting` : null,
   };
 }
 
@@ -364,6 +390,8 @@ export interface StatusReport {
   contextReset?: Omit<ContextResetCheck, 'steps'>;
   /** The unattended routine (task-68.2): settings, the last pass and the next one (src/runtime/routine.ts). */
   routine?: RoutineLast;
+  /** Standing goals (Decision 16): counts and whether planning found nothing worthwhile left. */
+  goals?: Pick<GoalsView, 'present' | 'counts' | 'exhausted'>;
   /** The owner digest (task-68.5): its times, the last one and whether it was sent, held items. */
   digest?: DigestStatus;
   /** Open upgrade requests (proposed, confirmed, failed) waiting for the host (`minions upgrade` there). */
@@ -400,7 +428,9 @@ export async function collectStatus(deps: { db: RuntimeDb; config: MinionsConfig
   /** The local integrator's block (the CLI passes collectIntegrationStatus for /workspace/repo); omitted: no block. */
   integration?: (tasks: Task[] | null) => Promise<IntegrationStatus | null>;
   /** True in a gateway launch (isGatewayLaunch on the running coordinator's launch record): sessions reset themselves. */
-  gatewayLaunch?: () => Promise<boolean> }): Promise<StatusReport> {
+  gatewayLaunch?: () => Promise<boolean>;
+  /** The goals view (the CLI passes runtimeGoals); omitted: no goals line. */
+  goals?: () => Pick<GoalsView, 'present' | 'counts' | 'exhausted'> }): Promise<StatusReport> {
   const { db: d, config: cfg } = deps;
   const leases = d.activeLeases();
   const report: StatusReport = {
@@ -421,6 +451,7 @@ export async function collectStatus(deps: { db: RuntimeDb; config: MinionsConfig
   } catch { /* an older DB without change requests: omit */ }
   try { report.spend = spendReport({ db: d, config: cfg }); } catch { /* status never fails on the tally */ }
   try { report.routine = routineLast(d, cfg); } catch { /* status never fails on the routine */ }
+  try { if (deps.goals) { const { present, counts, exhausted } = deps.goals(); report.goals = { present, counts, exhausted }; } } catch { /* status never fails on the goals */ }
   try { if (cfg.routine?.enabled) report.digest = digestStatus(d, cfg); } catch { /* status never fails on the digest */ }
   try {
     const st = deps.state !== undefined ? { state: deps.state } : {};
@@ -466,6 +497,7 @@ export function humanStatus(s: StatusReport): string {
     ...(s.spend ? humanSpend(s.spend).split('\n') : []),
     ...(s.contextReset?.enabled ? [humanContextReset(s.contextReset)] : []),
     ...(s.routine ? [humanRoutine(s.routine)] : []),
+    ...(s.goals?.present ? [humanGoals(s.goals)] : []),
     ...(s.digest ? [humanDigestStatus(s.digest)] : []),
     ...(s.integration ? humanIntegration(s.integration) : []),
   ];
@@ -1474,7 +1506,8 @@ export function register(program: Command): void {
       const cfg = await getConfig();
       const r = await collectStatus({ db: getDb(), config: cfg, state: runtimePaths().state, backlog: getBacklog, channel: () => runtimeChannelStatus(cfg), launch: () => coordinatorLaunchStatus(cfg), poller: () => telegramPollerStatus(),
         integration: (tasks) => collectIntegrationStatus({ db: getDb(), config: cfg, repo: runtimePaths().repo, tasks }),
-        gatewayLaunch: async () => { const rec = await readLaunchRecord(); return !!rec && isGatewayLaunch(cfg, rec.telegram); } });
+        gatewayLaunch: async () => { const rec = await readLaunchRecord(); return !!rec && isGatewayLaunch(cfg, rec.telegram); },
+        goals: () => runtimeGoals() });
       emit(r, { json: globalOpts(cmd).json, human: humanStatus });
     }));
   const pauseLike = (name: 'pause' | 'resume') => {

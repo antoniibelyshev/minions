@@ -28,6 +28,10 @@ Your job: keep the backlog ready and well split (the task text is the worker's b
 
 {{processHarnessGuidance}}Stage order per task: engineer → verify (the dispatcher runs the verification commands on the head; no worker) → {{reviewerStage}} → delivered (the `default` workflow). One active stage per task. {{workflowGuidance}}
 
+## Goals, planning, experiments
+
+{{goalsGuidance}}
+
 ## Testing
 
 {{testingGuidance}}{{toolsGuidance}}

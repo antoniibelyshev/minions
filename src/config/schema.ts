@@ -466,6 +466,15 @@ export const MinionsConfigSchema = z.object({
     digestAt: z.array(z.string().regex(DIGEST_TIME, 'must be HH:MM (00:00 to 23:59)')).min(1).max(4).optional(),
     /** IANA time zone of digestAt and of the routine's days (default Europe/Berlin). */
     timezone: z.string().min(1).refine(isTimeZone, 'must be an IANA time zone such as Europe/Berlin').optional(),
+    /**
+     * Planning wakes (docs/design/autonomy.md Decision 16): with the queue empty and an open goal in the goals file, wake
+     * the coordinator to plan the next tasks. Default: true in independent mode, false in supervised.
+     */
+    planWhenIdle: z.boolean().optional(),
+    /** Planning wakes per day in `timezone` (default 4; each also counts as a wake). */
+    maxPlanWakesPerDay: z.number().int().min(0).optional(),
+    /** Minimum minutes between two planning wakes (default 120). */
+    minPlanGapMinutes: z.number().int().min(1).optional(),
     /** Legacy: the removed auto-promotion caps (task-130). Accepted so old configs still load, and ignored. */
     autoPromote: z.record(z.string(), z.unknown()).optional(),
   }).strict().optional(),
