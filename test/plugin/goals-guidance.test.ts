@@ -8,6 +8,7 @@ import { generatePlugin } from '../../src/plugin/generate.js';
 import { currentValue, settingDef, type SettingsContext } from '../../src/host/settings.js';
 import { classifyKey } from '../../src/config/setting-classes.js';
 import { validateConfig } from '../../src/config/resolve.js';
+import { GENERAL_SESSION_NOTE } from '../../src/runtime/router-prompt.js';
 import { defaults } from '../helpers.js';
 
 const dirs: string[] = [];
@@ -74,6 +75,10 @@ describe('orchestrate skill: the plan procedure, experiments and the retrospecti
     expect(retro).toMatch(/minions itself .* digest for the owner/);
     expect(retro).toContain('minions control set verification.periodic');
     expect(retro).toContain('`minions backlog goals record retro');
+  });
+
+  it('the general session (sessions on) knows the routine\'s plan message', () => {
+    expect(GENERAL_SESSION_NOTE).toContain('The message `/minions:orchestrate plan` comes from the routine');
   });
 
   it('engineer and reviewer know the experiment label', async () => {
