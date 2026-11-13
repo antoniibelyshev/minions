@@ -80,7 +80,14 @@ describe('gateway: /budget', () => {
     expect(parseBudgetCommand(' /budget@minions_bot ')).toEqual({ kind: 'show' });
     expect(parseBudgetCommand('/budget day 25')).toEqual({ kind: 'set', key: 'dailyUsd', usd: 25 });
     expect(parseBudgetCommand('/budget daily $7.5')).toEqual({ kind: 'set', key: 'dailyUsd', usd: 7.5 });
-    expect(parseBudgetCommand('/budget task off')).toEqual({ kind: 'set', key: 'taskUsd', usd: null });
+    expect(parseBudgetCommand('/budget task off')).toEqual({ kind: 'off', which: 'task' });
+    expect(parseBudgetCommand('/budget day 20M')).toEqual({ kind: 'set-tokens', key: 'dailyTokens', tokens: 20_000_000 });
+    expect(parseBudgetCommand('/budget day 1.5m tokens')).toEqual({ kind: 'set-tokens', key: 'dailyTokens', tokens: 1_500_000 });
+    expect(parseBudgetCommand('/budget task 500k')).toEqual({ kind: 'set-tokens', key: 'taskTokens', tokens: 500_000 });
+    expect(parseBudgetCommand('/budget task 4000000 tokens')).toEqual({ kind: 'set-tokens', key: 'taskTokens', tokens: 4_000_000 });
+    expect(parseBudgetCommand('/budget task 0 tokens')).toMatchObject({ kind: 'usage' });
+    expect(parseBudgetCommand('/budget task 5 dollars')).toMatchObject({ kind: 'usage' });
+    expect(parseBudgetCommand('/budget day 1 2 3')).toMatchObject({ kind: 'usage' });
     expect(parseBudgetCommand('/budget task 0')).toMatchObject({ kind: 'usage' });
     expect(parseBudgetCommand('/budget task -3')).toMatchObject({ kind: 'usage' });
     expect(parseBudgetCommand('/budget week 5')).toMatchObject({ kind: 'usage' });
@@ -102,7 +109,7 @@ describe('gateway: /budget', () => {
     const { d, sent } = budgetGateway('42');
     expect(await routeInbound(d, msg('/budget day 20', { message_id: '700', user_id: '42' }))).toEqual({ command: 'budget' });
     expect(sent[0]).toMatchObject({ kind: 'text', replyTo: 700 });
-    expect(sent[0]!.text).toMatch(/^Daily cap set to \$20 \(control revision 1; applies to the next claim\)\.\nToday \(UTC\): ~\$0\.00 est\. \(0 tok\) of daily cap \$20\.\nPer-task cap: off\./);
+    expect(sent[0]!.text).toMatch(/^Daily cap set to \$20 \(control revision 1; applies to the next claim\)\.\nToday \(Europe\/Berlin\): ~\$0\.00 est\. \(0 tok\) of daily cap \$20\.\nPer-task cap: off\./);
     expect(withControl(cfg(), state).budgets).toEqual({ dailyUsd: 20, taskUsd: null });
     expect(readJournal(state)[0]).toMatchObject({ actor: 'owner (telegram)', keys: ['budgets.dailyUsd'] });
     expect(getSession(db, 'thread:700')).toBeNull();
@@ -110,6 +117,25 @@ describe('gateway: /budget', () => {
     expect(withControl(cfg(), state).budgets.dailyUsd).toBeNull();
     await routeInbound(d, msg('/budget', { message_id: '702', user_id: '42' }));
     expect(sent[2]!.text).toContain('of daily cap off');
+  });
+
+  it('token caps: the owner sets them in tokens on a subscription, the summary says they are enforced, off clears both', async () => {
+    const { d, sent } = budgetGateway('42');
+    d.billing = 'subscription';
+    await routeInbound(d, msg('/budget day 20M', { message_id: '720', user_id: '42' }));
+    expect(sent[0]!.text).toMatch(/^Daily token cap set to 20M tokens \(control revision 1; applies to the next claim\)\.\nToday \(Europe\/Berlin\): ~\$0\.00 est\. \(0 tok\) of daily caps 20M tokens, off\.\nPer-task caps: off, off\.\nToken caps are enforced; USD caps are not/);
+    await routeInbound(d, msg('/budget task 4M', { message_id: '721', user_id: '42' }));
+    await routeInbound(d, msg('/budget task $25', { message_id: '722', user_id: '42' }));
+    expect(withControl(cfg(), state).budgets).toEqual({ dailyUsd: null, taskUsd: 25, dailyTokens: 20_000_000, taskTokens: 4_000_000 });
+    expect(readJournal(state).map((e) => e.keys)).toEqual([['budgets.dailyTokens'], ['budgets.taskTokens'], ['budgets.taskUsd']]);
+    await routeInbound(d, msg('/budget task off', { message_id: '723', user_id: '42' }));
+    expect(sent[3]!.text).toMatch(/^Per-task caps set to off/);
+    expect(withControl(cfg(), state).budgets).toMatchObject({ taskUsd: null, taskTokens: null, dailyTokens: 20_000_000 });
+    // USD only on a subscription: the summary points at token caps.
+    await routeInbound(d, msg('/budget day off', { message_id: '724', user_id: '42' }));
+    await routeInbound(d, msg('/budget day 40', { message_id: '725', user_id: '42' }));
+    expect(sent.at(-1)!.text).toContain('Not enforced: this runtime uses a Claude subscription');
+    expect(sent.at(-1)!.text).toContain('Set token caps instead, e.g. /budget day 20M.');
   });
 
   it('refuses a change from anyone but the paired owner (or without an owner check), and a poll vote is never a command', async () => {

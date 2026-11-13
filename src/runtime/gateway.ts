@@ -11,7 +11,7 @@
 // - The sessions index (<state>/sessions/index.md): every open session and those closed in the last day, with its topic
 //   (`coordinator topic`), last activity and first owner message. Rewritten when it changes; `/sessions` in the chat
 //   shows it.
-// - `/budget` (Decision 13): shows and changes the owner's USD caps, handled here and never routed to a coordinator, so a
+// - `/budget` (Decisions 13 and 15): shows and changes the owner's USD and token caps, handled here and never routed to a coordinator, so a
 //   coordinator cannot raise its own caps. Changes go to the control overlay as the owner's (journaled, live).
 import { mkdir, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -24,8 +24,8 @@ import { parseAccess, SERVER_COMMANDS, type ChannelNotification } from '../teleg
 import { CHANNEL_BOT_ERRORS, ChannelServer, fileLog, LAUNCH_ENV, readChannelToken, type ChannelProc, type ChannelServerOptions } from '../telegram/channel/server.js';
 import type { RuntimeDb, SessionRow } from './db.js';
 import { digestStatus, reholdExpired } from './digest.js';
-import { billingOf, sessionSpend, usdCaps, type Billing } from './spend.js';
-import { controlSet, withControl } from './control.js';
+import { billingOf, parseTokens, sessionSpend, shortTokens, spendCaps, type Billing } from './spend.js';
+import { controlApply, controlSet, withControl } from './control.js';
 import { ack, fail, pending } from './outbox.js';
 import { recordSent, resolveRoute, sendToSession, threadReplyTarget, type RouteRule } from './router.js';
 import { routineSettings } from './routine.js';
@@ -148,57 +148,86 @@ export async function deliverDue(d: GatewayDeps): Promise<{ sent: string[]; fail
 export type BudgetCommand =
   | { kind: 'show' }
   | { kind: 'set'; key: 'dailyUsd' | 'taskUsd'; usd: number | null }
+  | { kind: 'set-tokens'; key: 'dailyTokens' | 'taskTokens'; tokens: number }
+  | { kind: 'off'; which: 'day' | 'task' }
   | { kind: 'usage'; why: string };
 
 /** The gateway's own commands (never routed to a coordinator). */
 export const GATEWAY_COMMANDS: BotMenuCommand[] = [
   { command: 'sessions', description: 'open threads and their spend' },
-  { command: 'budget', description: 'spend vs caps; /budget day|task <usd|off>' },
+  { command: 'budget', description: 'spend vs caps; /budget day|task <usd|tokens|off>' },
 ];
 
-export const BUDGET_USAGE = 'Usage: /budget (show), /budget day <usd|off>, /budget task <usd|off>.';
+export const BUDGET_USAGE = 'Usage: /budget (show), /budget day <usd|tokens|off>, /budget task <usd|tokens|off> (tokens: 20M, 500k or 4000000 tokens; off clears both caps).';
 
-/** `/budget [day|task <usd|off>]`; null when the message is not a /budget command. */
+/**
+ * `/budget [day|task <amount|off>]`; null when the message is not a /budget command. An amount with a k/M/B suffix or
+ * the word "tokens" is a token cap (`budgets.dailyTokens` / `taskTokens`); a plain or $ amount is USD; off clears both.
+ */
 export function parseBudgetCommand(text: string): BudgetCommand | null {
   const m = /^\/budget(?:@\w+)?(?:\s+(.*))?$/is.exec(text.trim());
   if (!m) return null;
   const args = (m[1] ?? '').trim().split(/\s+/).filter(Boolean);
   if (!args.length) return { kind: 'show' };
   const which = args[0]!.toLowerCase();
-  const key = which === 'day' || which === 'daily' ? 'dailyUsd' : which === 'task' ? 'taskUsd' : null;
-  if (!key) return { kind: 'usage', why: `unknown cap "${args[0]!.slice(0, 20)}"` };
-  if (args.length !== 2) return { kind: 'usage', why: `give one amount for the ${which} cap` };
+  const cap = which === 'day' || which === 'daily' ? 'day' : which === 'task' ? 'task' : null;
+  if (!cap) return { kind: 'usage', why: `unknown cap "${args[0]!.slice(0, 20)}"` };
+  const amount = args.slice(1).join(' ').toLowerCase();
+  if (args.length < 2 || args.length > 3) return { kind: 'usage', why: `give one amount for the ${which} cap` };
+  if (args.length === 2 && (amount === 'off' || amount === 'none')) return { kind: 'off', which: cap };
+  if (/\btokens?$|^\d+(?:[.,]\d+)?\s*(k|m|b)$/.test(amount)) {
+    let tokens: number;
+    try { tokens = parseTokens(amount); } catch { tokens = 0; }
+    if (!(tokens > 0)) return { kind: 'usage', why: `"${args.slice(1).join(' ').slice(0, 30)}" is not a positive token amount` };
+    return { kind: 'set-tokens', key: cap === 'day' ? 'dailyTokens' : 'taskTokens', tokens };
+  }
   const v = args[1]!.toLowerCase();
-  if (v === 'off' || v === 'none') return { kind: 'set', key, usd: null };
   const usd = Number(v.replace(/^\$/, ''));
-  if (!/^\$?\d+(\.\d+)?$/.test(v) || !(usd > 0)) return { kind: 'usage', why: `"${args[1]!.slice(0, 20)}" is not a positive USD amount` };
-  return { kind: 'set', key, usd: Math.round(usd * 100) / 100 };
+  if (args.length !== 2 || !/^\$?\d+(\.\d+)?$/.test(v) || !(usd > 0)) return { kind: 'usage', why: `"${args.slice(1).join(' ').slice(0, 30)}" is not a positive USD or token amount` };
+  return { kind: 'set', key: cap === 'day' ? 'dailyUsd' : 'taskUsd', usd: Math.round(usd * 100) / 100 };
 }
 
 const capText = (usd: number | null) => (usd === null ? 'off' : `$${usd}`);
+const tokCapText = (n: number | null) => (n === null ? 'off' : `${shortTokens(n)} tokens`);
 
 /** Runs a /budget command and returns the reply. Changes need the paired owner and the control base. */
 export async function budgetReply(d: GatewayDeps, c: BudgetCommand, userId: string | undefined, now: Date): Promise<string> {
   if (c.kind === 'usage') return `${c.why}. ${BUDGET_USAGE}`;
   if (!d.controlBase) return 'Budget caps are unavailable here (no runtime config).';
   const base = await d.controlBase();
-  if (c.kind === 'set') {
+  if (c.kind === 'set' || c.kind === 'set-tokens' || c.kind === 'off') {
     if (!d.isOwner || !(await d.isOwner(userId))) return 'Only the paired owner changes the budget.';
-    const key = `budgets.${c.key}`;
-    const reason = `owner: /budget ${c.key === 'dailyUsd' ? 'day' : 'task'} ${capText(c.usd)} (Telegram)`;
-    const r = await controlSet({ state: d.state, base, actor: 'owner (telegram)', owner: true, now: () => now }, key, c.usd, reason);
-    d.db.addEvent('budget-cap', null, { key, usd: c.usd, revision: r.revision, via: 'telegram' }, now.toISOString());
-    const head = `${c.key === 'dailyUsd' ? 'Daily' : 'Per-task'} cap ${r.keys.length ? 'set to' : 'already'} ${capText(c.usd)}${r.keys.length ? ` (control revision ${r.revision}; applies to the next claim)` : ''}.`;
+    const which = c.kind === 'off' ? c.which : c.key.startsWith('daily') ? 'day' : 'task';
+    const label = which === 'day' ? 'Daily' : 'Per-task';
+    const deps = { state: d.state, base, actor: 'owner (telegram)', owner: true, now: () => now };
+    let r: Awaited<ReturnType<typeof controlSet>>;
+    let what: string;
+    if (c.kind === 'off') {
+      what = 'off';
+      const keys = which === 'day' ? { dailyUsd: null, dailyTokens: null } : { taskUsd: null, taskTokens: null };
+      r = await controlApply(deps, { budgets: keys }, `owner: /budget ${which} off (Telegram)`);
+      d.db.addEvent('budget-cap', null, { keys: Object.keys(keys).map((k) => `budgets.${k}`), off: true, revision: r.revision, via: 'telegram' }, now.toISOString());
+    } else {
+      const value = c.kind === 'set' ? c.usd : c.tokens;
+      what = c.kind === 'set' ? capText(c.usd) : tokCapText(c.tokens);
+      r = await controlSet(deps, `budgets.${c.key}`, value, `owner: /budget ${which} ${what} (Telegram)`);
+      d.db.addEvent('budget-cap', null, { key: `budgets.${c.key}`, ...(c.kind === 'set' ? { usd: c.usd } : { tokens: c.tokens }), revision: r.revision, via: 'telegram' }, now.toISOString());
+    }
+    const head = `${label} ${c.kind === 'off' ? 'caps' : c.kind === 'set' ? 'cap' : 'token cap'} ${r.keys.length ? 'set to' : 'already'} ${what}${r.keys.length ? ` (control revision ${r.revision}; applies to the next claim)` : ''}.`;
     return `${head}\n${budgetSummary(d, withControl(base, d.state), now)}`;
   }
   return budgetSummary(d, withControl(base, d.state), now);
 }
 
 function budgetSummary(d: GatewayDeps, cfg: MinionsConfig, now: Date): string {
-  const c = usdCaps({ db: d.db, config: cfg, billing: d.billing ?? billingOf(), now });
-  const day = `Today (UTC): ~$${c.day.usedUsd.toFixed(2)} est. (${kTok(c.day.tokens)} tok) of daily cap ${capText(c.day.capUsd)}${c.day.exhausted ? ': reached, new starts refused' : ''}.`;
-  const task = `Per-task cap: ${capText(c.task.capUsd)}${c.task.atCap.length ? ` (reached: ${c.task.atCap.join(', ')})` : ''}.`;
-  const note = c.enforced ? null : 'Not enforced: this runtime uses a Claude subscription (no USD figure); the estimate is the API-rate equivalent.';
+  const c = spendCaps({ db: d.db, config: cfg, billing: d.billing ?? billingOf(), now });
+  const tokenCaps = c.day.capTokens !== null || c.task.capTokens !== null;
+  const dayCaps = tokenCaps ? `daily caps ${tokCapText(c.day.capTokens)}, ${capText(c.day.capUsd)}` : `daily cap ${capText(c.day.capUsd)}`;
+  const day = `Today (${c.timezone}): ~$${c.day.usedUsd.toFixed(2)} est. (${kTok(c.day.tokens)} tok) of ${dayCaps}${c.day.exhausted ? ': reached, new starts refused' : ''}.`;
+  const task = `Per-task ${tokenCaps ? `caps: ${tokCapText(c.task.capTokens)}, ` : 'cap: '}${capText(c.task.capUsd)}${c.task.atCap.length ? ` (reached: ${c.task.atCap.join(', ')})` : ''}.`;
+  const note = c.enforced ? null
+    : tokenCaps ? 'Token caps are enforced; USD caps are not on a Claude subscription (no USD figure; the estimate is the API-rate equivalent).'
+      : 'Not enforced: this runtime uses a Claude subscription (no USD figure; the estimate is the API-rate equivalent). Set token caps instead, e.g. /budget day 20M.';
   return [day, task, ...(note ? [note] : [])].join('\n');
 }
 
