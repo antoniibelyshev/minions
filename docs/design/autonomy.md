@@ -335,6 +335,61 @@ runtime already uses the owner's machine.
 - **No Dockerfile escape hatch for now.** Package names cover what toolchains need without letting config run
   arbitrary build steps as root.
 
+## Decision 15. Standing goals, planning wakes, experiments and retrospectives (owner request, 2026-11-13)
+
+The team was reactive: with the backlog empty the routine found "nothing needs a model" and the project sat idle until
+the owner wrote. The owner wants it to pursue standing, measurable objectives on its own, measure what it changes, and
+learn from how the work went.
+
+- **Goals file.** `goals.md` next to the project config, where role prompt files live: `.minions/goals.md` in a shared
+  install, `<project dir>/goals.md` in a private one. One `## <title>` heading per goal (its id is the title's slug),
+  free text, and optional `Status: open|done|paused` and `Measure: <how it is measured>` (or `Metric:`, `Target:`)
+  lines; text before the first heading is an introduction. Parsing is tolerant: synonyms (`on hold`, `met`, ...) are
+  understood, an unknown status reads as open, nothing is an error; at most 50 goals and 64 KB are read.
+- **The runtime sees only the owner's copy.** The host copies the file into the runtime config dir (`runtime/goals.md`,
+  `/opt/minions/config/goals.md`, read-only) whenever it regenerates the derived files: `minions start`, `upgrade`,
+  `settings set`. A worker branch that edits `.minions/goals.md` changes nothing (the same rule as role prompts); a
+  removed file removes the copy.
+- **The coordinator's marks** live in `<state>/goals.json`, written by `minions backlog goals set <id> <status>` and
+  `minions backlog goals record idle|retro` (folded into `backlog`; workers are refused). A mark applies while the goal's
+  own status line is what it was when the mark was made, so an owner edit of that line wins. The coordinator tells the
+  owner when it marks a goal done, so the file catches up.
+- **The plan reason.** The routine pass adds a `plan` wake reason when the routine is on, `routine.planWhenIdle`
+  holds, the coordinator runs, no decision is held (holds come first), no task is `ready` or in flight (`ready`, a
+  stage status, `awaiting-ci`, `merging`; `idea`, `blocked` and `awaiting-human` do not count), intake is open, a goal
+  is open, and planning has not recorded that nothing worthwhile is left for the goals as they are (the record holds a
+  hash of the file and the effective statuses, so a goal edit or mark lifts it). Every wake gate still applies (budget,
+  paused starts, drain, leases, owner active, idle, wake gap, daily cap, so a plan wake counts as a wake), plus its own
+  `routine.maxPlanWakesPerDay` (default 4) and `routine.minPlanGapMinutes` (default 120). A due digest takes the plan
+  along only within those limits.
+- **How it wakes.** Sessions off: the usual restart with the constant `/minions:orchestrate wake` prompt; the woken
+  session reads `plan` among `sync --routine --last` reasons, so the restart path, its refusals and the wake turn
+  accounting stay as they are. Sessions on (the router runs the gateway, which a restart would not help): the runtime
+  opens the `general` session and queues `/minions:orchestrate plan` (`PLAN_PROMPT`) to it, unless it already has
+  messages waiting. Both are recorded as `routine-wake` and `routine-plan-wake` events.
+- **Defaults by mode.** `planWhenIdle` is derived from the mode when unset (independent on, supervised off), so an
+  installed independent project with the routine on plans after the upgrade with no config change; it is host-owned
+  (model spend without the owner), the caps are not. `minions settings` lists the three keys.
+- **The plan procedure** (orchestrate skill, step 4): read the goals and recent outcomes (done task notes, experiment
+  records, decisions); mark goals whose measure is met; run a due retrospective; file the next 1-3 tasks toward open
+  goals, promoting fitting `idea` tasks before inventing new ones (label `goal:<id>`, key `plan:<goal>:<slug>`,
+  provenance `agent-hypothesis`): `ready` in independent mode with direct starts, otherwise `idea` plus one question for
+  the digest; or record `idle` with the reason and say so in the digest. One pass, never filler work.
+- **Experiments** (prompt level, no new role): a task labelled `experiment` states a hypothesis, the measurement
+  (command, environment, base against branch, runs), the acceptance threshold and a numbered record file in a records
+  directory the coordinator chooses once per project and records as a decision (the chess bot already keeps
+  `docs/efficiency/NNN-*.md`). The engineer implements behind a toggle or on the branch, measures (a baseline on the
+  base is part of such a task), writes the record and, when the threshold is missed, reverts the change so only the
+  record lands; the reviewer checks that the verdict follows from the numbers. Goals with a `Measure:` are pursued this
+  way.
+- **Retrospective.** Due after 10 tasks reached `done` since the last one, or a goal marked done since
+  (`retro.due` in `backlog goals`): a cheap count the coordinator reads in its plan pass. It looks at repair cycles,
+  per-task budget overruns, flaky or slow checks and cancelled work, files project improvements as `idea` tasks, puts
+  minions' own problems in the digest for the owner, schedules a QA sweep when none ran, and sets
+  `verification.periodic` through `control` when a slow tier exists without it.
+- **Left out:** a per-goal progress metric the runtime parses (measures stay text the coordinator reads), the
+  coordinator editing the goals file, a separate planner role or session key, and a time-based retrospective.
+
 ## Reversed decisions
 
 - telegram-decisions.md D2 (tap buttons instead of native polls): native polls are built at the owner's request.
