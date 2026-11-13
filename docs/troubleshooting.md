@@ -111,6 +111,28 @@ reason is recorded in `<state>/coordinator-exit.json`; restarts done for context
 `<state>/logs/context-reset.log`. If `minions start` says another coordinator holds the project lock,
 attach to it with `minions start` instead of launching a second one.
 
+## Orphaned supervisor or dispatcher after a state restore
+
+Symptoms (host runtime): `minions doctor` warns `helpers.orphans: N orphaned helper process(es)`; `ps`
+shows more than one `minions coordinator supervise` or `minions work dispatch` for the project, some of
+them days old; sessions or autopilot workers act on state that no longer matches `minions status`.
+
+A state restore (`minions import --state`) moves the live database to `<state>/pre-restore/<time>/` and
+swaps the backup in. A supervisor or dispatcher that was running keeps the old database file open and
+still sees itself as the lock holder there. Current versions refuse the restore while either runs (or stop
+them with `--force`), and both exit by themselves once they notice the database file was replaced. Older
+versions, or a helper started between the stop and the swap, can leave such a pair running. Doctor lists
+each process whose working directory is this project's state dir but which does not hold its lock in the
+current database, with the command to stop it; it never stops anything itself:
+
+```sh
+minions doctor                               # helpers.orphans: the pids and the exact kill command
+ps -o pid,lstart,command -p <pid>,<pid>      # confirm they are the old `coordinator supervise` / `work dispatch`
+kill <pid> <pid>                             # SIGTERM: they stop their sessions and workers first
+```
+
+The lock holders keep running; the coordinator starts a helper again by itself when its lock is missing or stale.
+
 ## A lease is stuck
 
 Symptoms: `minions status` shows a worker on a task for far longer than its turn limit, the task never

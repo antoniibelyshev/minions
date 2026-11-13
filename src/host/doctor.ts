@@ -23,6 +23,7 @@ import { loadEffectiveConfig, loadProjectJson } from './project.js';
 import { checkPlugin, pluginMismatch, type PluginCheck } from './install.js';
 import { projectForPath } from './registry.js';
 import { harnessChecks, harnessSkipChecks, parseWorkProbe } from './harness-checks.js';
+import { hostOrphanHelperCheck, listHelperProcesses, type HelperProcess } from './helper-orphans.js';
 import { harnessView } from '../runtime/sandbox/probe.js';
 import { HANG_GUARD_TIMEOUT_TEST, hangGuarded } from '../runtime/hook-guard.js';
 import { HOST_RUNTIME_SHORT, HostRuntime, ensureHostWorktreesDir, hostTools, hostWorktreesDirState, prepareHostRuntime, runtimeOf, type WorktreesDirState } from './runtime.js';
@@ -273,7 +274,7 @@ export async function worktreesDirCheck(repo: string, add: Add): Promise<Worktre
 
 /** Host runtime: coordinator session, Claude auth on the host, launch probe, Telegram plugin (via the runtime shim). */
 async function hostRuntimeChecks(project: ProjectJson, auth: ClaudeAuth, baseUrl: string | undefined, wantsTelegram: boolean,
-  runner: Runner, add: Add, checks: Check[], wantsIntegration = false): Promise<Check | undefined> {
+  runner: Runner, add: Add, checks: Check[], wantsIntegration = false, helperProcesses?: () => Promise<HelperProcess[]>): Promise<Check | undefined> {
   const host = new HostRuntime(project, runner);
   const running = await host.isRunning();
   add('coordinator', running ? 'ok' : 'warn', running ? `tmux server ${host.paths.tmuxSocket} has the coordinator session` : `not running (tmux server ${host.paths.tmuxSocket})`,
@@ -301,6 +302,9 @@ async function hostRuntimeChecks(project: ProjectJson, auth: ClaudeAuth, baseUrl
     guard.code === 0 ? `hook hang guard works (${via === 'timeout' ? 'coreutils timeout' : 'perl watchdog'})` : `hook hang guard failed (exit ${guard.code}): neither coreutils timeout nor perl works, so every worker hook blocks`,
     guard.code === 0 ? undefined : 'Install perl or coreutils (`brew install coreutils` provides gtimeout; link it as `timeout` on PATH).');
   await worktreesDirCheck(host.paths.repo, add);
+  // Supervisor/dispatcher processes of this project that are not the lock holders (e.g. after a state restore).
+  const text = async (cmd: string, args: string[]) => { const r = await runner(cmd, args, { allowFailure: true, timeoutMs: 30_000 }); return r.code === 0 ? r.stdout : null; };
+  checks.push(await hostOrphanHelperCheck(host.paths.state, join(host.paths.state, 'minions.db'), helperProcesses ?? (() => listHelperProcesses({ run: text }))));
   if (!(await host.prepared())) {
     for (const n of ['claude.capabilities', 'telegram.server']) add(n, 'warn', 'skipped: host runtime not prepared yet', 'Run `minions start --no-attach`.');
     return undefined;
@@ -375,6 +379,8 @@ export async function runDoctor(opts: {
   platform?: NodeJS.Platform;
   /** Linux fact probe (tests); defaults to linuxHostFacts through the runner. */
   linuxFacts?: (runner: Runner, docker: DockerStatus) => Promise<LinuxHostFacts>;
+  /** Host runtime: running supervise/dispatch processes (tests); defaults to ps/lsof (or /proc). */
+  helperProcesses?: () => Promise<HelperProcess[]>;
 }): Promise<DoctorReport> {
   const runner = opts.runner ?? run;
   const checks: Check[] = [];
@@ -446,7 +452,7 @@ export async function runDoctor(opts: {
     const harnesses = harnessView(config);
     if (hostMode) {
       restart = notApplicable('host runtime: no container to restart');
-      tgPlugin = await hostRuntimeChecks(project, auth, baseUrl, wantsTelegram, runner, add, checks, !!config);
+      tgPlugin = await hostRuntimeChecks(project, auth, baseUrl, wantsTelegram, runner, add, checks, !!config, opts.helperProcesses);
       checks.push(...harnessSkipChecks(harnesses, 'host-runtime'));
     } else if (docker.daemon && docker.compose) {
       const tag = runtimeImageTag(project);

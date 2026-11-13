@@ -303,6 +303,27 @@ function fileIdentity(path: string): { dev: number; ino: number } | null {
   try { const st = statSync(path); return { dev: st.dev, ino: st.ino }; } catch { return null; }
 }
 
+/**
+ * The supervisor and dispatcher lock rows of a runtime DB, read-only (no migration, no write): for host-side checks
+ * (doctor) of a live DB. Null when the DB does not exist or cannot be read.
+ */
+export function readProcessLocks(path: string): Record<ProcessLockKey, SupervisorLock | null> | null {
+  let sql: DatabaseSync | undefined;
+  try {
+    statSync(path);
+    sql = new (loadSqlite().DatabaseSync)(path, { readOnly: true });
+    sql.exec(`PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS}`);
+    const get = (key: ProcessLockKey): SupervisorLock | null => {
+      try {
+        const row = sql!.prepare('SELECT value FROM meta WHERE key = ?').get(key) as { value?: string } | undefined;
+        const l = row?.value ? JSON.parse(row.value) as SupervisorLock : null;
+        return l && typeof l.pid === 'number' ? { pid: l.pid, start: l.start ?? null, bootId: l.bootId ?? null, at: String(l.at) } : null;
+      } catch { return null; }
+    };
+    return { supervisor_lock: get('supervisor_lock'), dispatcher_lock: get('dispatcher_lock') };
+  } catch { return null; } finally { try { sql?.close(); } catch { /* ignore */ } }
+}
+
 export class RuntimeDb {
   readonly path: string;
   readonly sql: DatabaseSync;
