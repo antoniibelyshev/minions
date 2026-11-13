@@ -14,7 +14,8 @@ export const dispatchSettings = (cfg: Pick<MinionsConfig, 'dispatch'>) => ({
   workerTimeoutMs: (cfg.dispatch?.workerTimeoutMinutes ?? DEFAULT_WORKER_TIMEOUT_MINUTES) * 60_000,
 });
 
-export type HoldKind = RecordDecisionKind | 'claim-failed' | 'no-result' | 'launch-failed';
+/** budget-cap: the task reached a per-task spend cap (docs/design/autonomy.md Decision 15). */
+export type HoldKind = RecordDecisionKind | 'claim-failed' | 'no-result' | 'launch-failed' | 'budget-cap';
 export interface DispatchHold {
   taskId: string; kind: HoldKind; message: string; leaseId: string | null; at: string;
   /** The task's status when it was held: a different status later means the coordinator acted. */

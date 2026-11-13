@@ -1,6 +1,8 @@
 import type { MinionsConfig } from '../config/schema.js';
 import { MinionsError } from '../core/errors.js';
 import type { RuntimeDb } from './db.js';
+import { routineSettings } from './routine.js';
+import { localDayStart } from './zoned-time.js';
 import { sessionStates, totalOf, weightedMTok, type CoordinatorRole, type CoordinatorSessionState, type SessionEndTrigger, type UsageComponents } from './coordinator-usage.js';
 
 /**
@@ -286,8 +288,8 @@ export interface SpendReport {
   /** The coordinator sessions' own totals: measured from the transcript by the Stop hook, or set by hand. */
   coordinator: SpendFigures & { baseline: CoordinatorBaseline };
   budget: BudgetStatus | null;
-  /** The owner's USD caps (null when neither is set). */
-  caps: UsdCaps | null;
+  /** The owner's spend caps (null when none is set). */
+  caps: SpendCaps | null;
   /** Shortcut for budget.percent (null without a budget). */
   percent: number | null;
   notes: string[];
@@ -399,7 +401,7 @@ export function coordinatorBaseline(ctx: { db: RuntimeDb; billing: Billing; fall
   };
 }
 
-export interface SpendContext { db: RuntimeDb; billing?: Billing; config?: Pick<MinionsConfig, 'models'> & Partial<Pick<MinionsConfig, 'budgets'>>; now?: Date }
+export interface SpendContext { db: RuntimeDb; billing?: Billing; config?: Pick<MinionsConfig, 'models'> & Partial<Pick<MinionsConfig, 'budgets' | 'routine'>>; now?: Date }
 
 export function readBudget(db: RuntimeDb): Budget | null {
   const v = db.getControl('budget');
@@ -460,7 +462,7 @@ export function spendReport(ctx: SpendContext): SpendReport {
     today: { ...figures(tally(rows, day), attemptsSince(ctx.db, day), billing, fallback), since: day },
     perTask: perTask.filter((t) => t.tokens > 0 || t.attempts > 0),
     coordinator: { ...figures(all.filter((e) => e.scope === 'session'), 0, billing, fallback), baseline: coordinatorBaseline({ db: ctx.db, billing, fallbackModel: ctx.config?.models.coordinator ?? fallback, rows }) },
-    budget, caps: ctx.config?.budgets && (ctx.config.budgets.dailyUsd !== null || ctx.config.budgets.taskUsd !== null) ? usdCaps({ ...ctx, billing, now }) : null,
+    budget, caps: anyCap(ctx.config) ? spendCaps({ ...ctx, billing, now }) : null,
     percent: budget?.percent ?? null, notes,
   };
 }
@@ -497,44 +499,95 @@ export function describeBudget(s: BudgetStatus): string {
 }
 
 /**
- * The owner's USD caps (`budgets.dailyUsd`, `budgets.taskUsd`; docs/design/autonomy.md Decision 13), against the
- * estimated USD: today's (UTC) spend of everything, and a task's worker spend since it began. Enforced only with
- * API-key billing (a subscription has no USD figure).
+ * The owner's spend caps (`budgets.*`; docs/design/autonomy.md Decisions 13 and 15). USD caps count the estimate and are
+ * enforced only with API-key billing (a subscription has no USD figure); token caps count the recorded tokens and are
+ * enforced on any billing. The daily caps count everything (coordinator sessions and workers) since local midnight in
+ * routine.timezone (the digest's day); the per-task caps count the task's workers over all its attempts.
  */
-export interface UsdCaps {
+export interface SpendCaps {
+  /** The USD caps are enforced (API-key billing). Token caps always are. */
   enforced: boolean;
-  day: { capUsd: number | null; usedUsd: number; tokens: number; exhausted: boolean };
-  /** The per-task cap; with a task id, that task's worker spend; `atCap`: tasks whose workers reached it (`atCapUsd`: their spend). */
-  task: { capUsd: number | null; taskId?: string; usedUsd?: number; exhausted: boolean; atCap: string[]; atCapUsd: Record<string, number> };
-}
-
-export function usdCaps(ctx: SpendContext, taskId?: string): UsdCaps {
-  const now = ctx.now ?? new Date();
-  const fallback = ctx.config?.models.default ?? null;
-  const caps = ctx.config?.budgets ?? { dailyUsd: null, taskUsd: null };
-  const enforced = (ctx.billing ?? billingOf()) === 'api-key';
-  const rows = usageRows(ctx.db);
-  const usd = (e: KeyTally[]) => figures(e, 0, 'api-key', fallback).estimatedUsd ?? 0;
-  const today = tally(rows, utcDayStart(now));
-  const dayUsd = usd(today);
-  const all = tally(rows).filter((e) => e.scope === 'lease' && e.taskId);
-  const perTask = new Map<string, KeyTally[]>();
-  for (const e of all) perTask.set(e.taskId!, [...(perTask.get(e.taskId!) ?? []), e]);
-  const taskUsd = (id: string) => usd(perTask.get(id) ?? []);
-  const atCap = caps.taskUsd === null ? [] : [...perTask.keys()].filter((id) => taskUsd(id) >= caps.taskUsd!).sort();
-  const atCapUsd = Object.fromEntries(atCap.map((id) => [id, taskUsd(id)]));
-  const used = taskId === undefined ? undefined : taskUsd(taskId);
-  return {
-    enforced,
-    day: { capUsd: caps.dailyUsd, usedUsd: dayUsd, tokens: today.reduce((a, e) => a + e.tokens, 0), exhausted: enforced && caps.dailyUsd !== null && dayUsd >= caps.dailyUsd },
-    task: { capUsd: caps.taskUsd, ...(taskId !== undefined ? { taskId, usedUsd: used } : {}), exhausted: enforced && caps.taskUsd !== null && used !== undefined && used >= caps.taskUsd, atCap, atCapUsd },
+  /** The cap day: its start (local midnight) and zone. */
+  timezone: string; dayStart: string;
+  day: { capUsd: number | null; usedUsd: number; capTokens: number | null; tokens: number; usdReached: boolean; tokensReached: boolean; exhausted: boolean };
+  /**
+   * The per-task caps; with a task id, that task's worker spend. `atCap`: tasks whose workers reached a cap (USD shown
+   * even when not enforced), with their spend in `atCapUsd` / `atCapTokens`; `blocked`: those an enforced cap stops.
+   */
+  task: {
+    capUsd: number | null; capTokens: number | null; taskId?: string; usedUsd?: number; usedTokens?: number; exhausted: boolean;
+    atCap: string[]; atCapUsd: Record<string, number>; atCapTokens: Record<string, number>; blocked: string[];
   };
 }
 
-const CAP_HINT = 'Record returning workers and tell the owner; the owner changes the caps with /budget in Telegram (the coordinator cannot).';
+/** The configured caps, every unset one null. */
+export const capsOf = (cfg: SpendContext['config']) => {
+  const b = cfg?.budgets;
+  return { dailyUsd: b?.dailyUsd ?? null, taskUsd: b?.taskUsd ?? null, dailyTokens: b?.dailyTokens ?? null, taskTokens: b?.taskTokens ?? null };
+};
+const anyCap = (cfg: SpendContext['config']) => Object.values(capsOf(cfg)).some((v) => v !== null);
+
+export function spendCaps(ctx: SpendContext, taskId?: string): SpendCaps {
+  const now = ctx.now ?? new Date();
+  const fallback = ctx.config?.models.default ?? null;
+  const caps = capsOf(ctx.config);
+  const enforced = (ctx.billing ?? billingOf()) === 'api-key';
+  const { timezone } = routineSettings({ routine: ctx.config?.routine });
+  const dayStart = localDayStart(now, timezone);
+  const rows = usageRows(ctx.db);
+  const usd = (e: KeyTally[]) => figures(e, 0, 'api-key', fallback).estimatedUsd ?? 0;
+  const tokens = (e: KeyTally[]) => e.reduce((a, x) => a + x.tokens, 0);
+  const today = tally(rows, dayStart);
+  const dayUsd = usd(today);
+  const dayTokens = tokens(today);
+  const perTask = new Map<string, KeyTally[]>();
+  for (const e of tally(rows).filter((x) => x.scope === 'lease' && x.taskId)) perTask.set(e.taskId!, [...(perTask.get(e.taskId!) ?? []), e]);
+  const taskUsd = (id: string) => usd(perTask.get(id) ?? []);
+  const taskTokens = (id: string) => tokens(perTask.get(id) ?? []);
+  const usdAt = (id: string) => caps.taskUsd !== null && taskUsd(id) >= caps.taskUsd;
+  const tokensAt = (id: string) => caps.taskTokens !== null && taskTokens(id) >= caps.taskTokens;
+  const atCap = [...perTask.keys()].filter((id) => usdAt(id) || tokensAt(id)).sort();
+  const blocked = atCap.filter((id) => (enforced && usdAt(id)) || tokensAt(id));
+  const usdReached = caps.dailyUsd !== null && dayUsd >= caps.dailyUsd;
+  const tokensReached = caps.dailyTokens !== null && dayTokens >= caps.dailyTokens;
+  return {
+    enforced, timezone, dayStart,
+    day: { capUsd: caps.dailyUsd, usedUsd: dayUsd, capTokens: caps.dailyTokens, tokens: dayTokens, usdReached, tokensReached, exhausted: (enforced && usdReached) || tokensReached },
+    task: {
+      capUsd: caps.taskUsd, capTokens: caps.taskTokens,
+      ...(taskId !== undefined ? { taskId, usedUsd: taskUsd(taskId), usedTokens: taskTokens(taskId) } : {}),
+      exhausted: taskId !== undefined && ((enforced && usdAt(taskId)) || tokensAt(taskId)),
+      atCap, atCapUsd: Object.fromEntries(atCap.map((id) => [id, taskUsd(id)])), atCapTokens: Object.fromEntries(atCap.map((id) => [id, taskTokens(id)])), blocked,
+    },
+  };
+}
+
+/** Compact token count: 950, 135k, 4.2M. */
+export const shortTokens = (n: number) => (n >= 1e6 ? `${Math.round(n / 1e5) / 10}M` : n >= 1e3 ? `${Math.round(n / 1e3)}k` : String(n));
+
+const CAP_HINT = 'Record returning workers and tell the owner; the owner changes the caps with /budget in Telegram or `minions settings set budgets.<key>` (the coordinator cannot).';
+
+/** What reached the daily caps, in words ("~$6.00 of $5 (estimated)", "21M of 20M tokens"). */
+export function dayCapText(c: SpendCaps): string {
+  const parts = [
+    ...(c.day.tokensReached ? [`${shortTokens(c.day.tokens)} of ${shortTokens(c.day.capTokens!)} tokens`] : []),
+    ...(c.enforced && c.day.usdReached ? [`~$${c.day.usedUsd.toFixed(2)} of $${c.day.capUsd} (estimated)`] : []),
+  ];
+  return `${parts.join(', ')} today (since ${c.dayStart}, ${c.timezone} midnight)`;
+}
+
+/** What reached a task's caps, in words. */
+export function taskCapText(c: SpendCaps, taskId: string): string {
+  const tok = c.task.atCapTokens[taskId] ?? c.task.usedTokens ?? 0;
+  const usd = c.task.atCapUsd[taskId] ?? c.task.usedUsd ?? 0;
+  return [
+    ...(c.task.capTokens !== null && tok >= c.task.capTokens ? [`${shortTokens(tok)} of ${shortTokens(c.task.capTokens)} tokens`] : []),
+    ...(c.enforced && c.task.capUsd !== null && usd >= c.task.capUsd ? [`~$${usd.toFixed(2)} of $${c.task.capUsd} (estimated)`] : []),
+  ].join(', ');
+}
 
 /**
- * Refuses a new claim when the budget is used up, or (with a task id) when the owner's daily or per-task USD cap is
+ * Refuses a new claim when the budget is used up, or (with a task id) when the owner's daily or per-task cap is
  * reached. Running leases are never touched.
  */
 export function assertBudgetAllowsStart(ctx: SpendContext, taskId?: string): void {
@@ -544,14 +597,30 @@ export function assertBudgetAllowsStart(ctx: SpendContext, taskId?: string): voi
       'Record returning workers and report to the owner; starts resume when the owner raises the budget (`minions work spend --budget "<amount>"`) or clears it (`--budget off`).',
       { budget: s });
   }
-  if (!ctx.config?.budgets) return;
-  const c = usdCaps(ctx, taskId);
+  if (!anyCap(ctx.config)) return;
+  const c = spendCaps(ctx, taskId);
   if (c.day.exhausted) {
-    throw new MinionsError('POLICY_DENIED', `Daily spend cap reached: ~$${c.day.usedUsd.toFixed(2)} of $${c.day.capUsd} today (UTC, estimated). New starts are refused; running workers continue.`, CAP_HINT, { caps: c });
+    throw new MinionsError('POLICY_DENIED', `Daily spend cap reached: ${dayCapText(c)}. New starts are refused; running workers continue.`, CAP_HINT, { caps: c });
   }
   if (c.task.exhausted) {
-    throw new MinionsError('POLICY_DENIED', `Per-task spend cap reached for ${taskId}: ~$${c.task.usedUsd!.toFixed(2)} of $${c.task.capUsd} (estimated). Its next stage is refused.`, CAP_HINT, { caps: c });
+    throw new MinionsError('POLICY_DENIED', `Per-task spend cap reached for ${taskId}: ${taskCapText(c, taskId!)}. Its next stage is refused.`, CAP_HINT, { caps: c });
   }
+}
+
+/**
+ * The 50% / 80% warnings of the enforced daily caps (highest reached first, null below 50% or at the cap): the
+ * dispatcher queues one owner notice per threshold, cap value and day.
+ */
+export function dayCapWarning(c: SpendCaps): { threshold: 50 | 80; key: string; text: string } | null {
+  if (c.day.exhausted) return null;
+  const shares: { what: string; key: string; share: number }[] = [
+    ...(c.day.capTokens !== null ? [{ what: `${shortTokens(c.day.tokens)} of ${shortTokens(c.day.capTokens)} tokens`, key: `tokens:${c.day.capTokens}`, share: c.day.tokens / c.day.capTokens }] : []),
+    ...(c.enforced && c.day.capUsd !== null ? [{ what: `~$${c.day.usedUsd.toFixed(2)} of $${c.day.capUsd} (estimated)`, key: `usd:${c.day.capUsd}`, share: c.day.usedUsd / c.day.capUsd }] : []),
+  ].sort((a, b) => b.share - a.share);
+  const top = shares[0];
+  if (!top || top.share < 0.5) return null;
+  const threshold = top.share >= 0.8 ? 80 : 50;
+  return { threshold, key: `${top.key}:${threshold}`, text: `Daily spend cap ${threshold}% reached: ${top.what} today (${c.timezone}). At the cap new stages wait; /budget day <amount> changes it.` };
 }
 
 export interface BudgetNotice extends BudgetStatus {
@@ -593,11 +662,29 @@ export function humanSpend(r: SpendReport): string {
 
 const capUsd = (n: number | null) => (n === null ? 'off' : `$${n}`);
 
-function humanCaps(c: UsdCaps): string {
-  const day = `daily ~$${c.day.usedUsd.toFixed(2)} of ${capUsd(c.day.capUsd)}${c.day.exhausted ? ' (reached: new stages wait)' : ''}`;
-  const reached = c.task.atCap.map((id) => `${id} ~$${c.task.atCapUsd[id]!.toFixed(2)}`).join(', ');
-  const task = `per-task ${capUsd(c.task.capUsd)}${reached ? ` (reached: ${reached})` : ''}`;
-  return `spend caps: ${day}; ${task}${c.enforced ? '' : ' (not enforced: subscription billing)'}`;
+function humanCaps(c: SpendCaps): string {
+  const tokenCaps = c.day.capTokens !== null || c.task.capTokens !== null;
+  const usdCaps = c.day.capUsd !== null || c.task.capUsd !== null;
+  if (!tokenCaps) {
+    // USD caps only: the line as before.
+    const day = `daily ~$${c.day.usedUsd.toFixed(2)} of ${capUsd(c.day.capUsd)}${c.day.exhausted ? ' (reached: new stages wait)' : ''}`;
+    const reached = c.task.atCap.map((id) => `${id} ~$${c.task.atCapUsd[id]!.toFixed(2)}`).join(', ');
+    const task = `per-task ${capUsd(c.task.capUsd)}${reached ? ` (reached: ${reached})` : ''}`;
+    return `spend caps: ${day}; ${task}${c.enforced ? '' : ' (not enforced: subscription billing)'}`;
+  }
+  const dayCaps = [
+    ...(c.day.capTokens !== null ? [`${shortTokens(c.day.tokens)} of ${shortTokens(c.day.capTokens)} tokens`] : []),
+    ...(c.day.capUsd !== null ? [`~$${c.day.usedUsd.toFixed(2)} of $${c.day.capUsd}`] : []),
+  ];
+  const day = `daily ${dayCaps.length ? dayCaps.join(', ') : 'off'}${c.day.exhausted ? ' (reached: new stages wait)' : ''}`;
+  const taskCaps = [...(c.task.capTokens !== null ? [`${shortTokens(c.task.capTokens)} tokens`] : []), ...(c.task.capUsd !== null ? [`$${c.task.capUsd}`] : [])];
+  const reached = c.task.atCap.map((id) => [id,
+    ...(c.task.capTokens !== null ? [`${shortTokens(c.task.atCapTokens[id]!)} tokens`] : []),
+    ...(c.task.capUsd !== null ? [`~$${c.task.atCapUsd[id]!.toFixed(2)}`] : []),
+  ].join(' ')).join(', ');
+  const task = `per-task ${taskCaps.length ? taskCaps.join(', ') : 'off'}${reached ? ` (reached: ${reached})` : ''}`;
+  const note = c.enforced || !usdCaps ? 'enforced' : 'token caps enforced; USD not enforced: subscription billing';
+  return `spend caps (day from ${c.timezone} midnight): ${day}; ${task} (${note})`;
 }
 
 const k = (n: number | null) => (n === null ? '-' : n >= 10_000 ? `${Math.round(n / 1000)}k` : n.toLocaleString('en-US'));

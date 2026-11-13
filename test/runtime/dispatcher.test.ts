@@ -245,6 +245,63 @@ describe('dispatcher: the verify step and periodic verification (docs/design/aut
     } finally { vi.unstubAllEnvs(); }
   });
 
+  it('per-task token cap on a subscription: the stage waits, the owner is told and the task is held for the coordinator once', async () => {
+    const v = verifier();
+    const { env, disp, launches, notified } = setup(approve, (c) => { unit(c); c.budgets = { dailyUsd: null, taskUsd: null, taskTokens: 2_000_000 }; }, () => exit({ tokens: 3_000_000 }), { verify: v.verify });
+    env.backlog.add({ id: 'task-1' });
+    await drive(disp);
+    await disp.pass(); await disp.settled();
+    expect(launches.map((l) => l.stage.role)).toEqual(['engineer']);
+    expect(v.runs.map((r) => r.key)).toEqual(['task-1']); // verification spends no tokens: still runs
+    const notices = pending(env.db, { includeWaiting: true }).filter((n) => n.key.startsWith('budget-cap:'));
+    expect(notices.map((n) => [n.key, n.taskId])).toEqual([['budget-cap:task:task-1:tokens:2000000', 'task-1']]);
+    expect(notices[0]!.text).toMatch(/^task-1 reached the per-task spend cap: 3M of 2M tokens\. Its reviewer stage waits/);
+    expect(notified.map((h) => [h.taskId, h.kind])).toEqual([['task-1', 'budget-cap']]);
+    expect(readHolds(env.db)['task-1']).toMatchObject({ kind: 'budget-cap', message: expect.stringContaining('ask the owner for a higher cap') });
+    // The coordinator resumes it without a higher cap: the stage still waits and the task is not held again.
+    clearHold(env.db, 'task-1', 'test');
+    await disp.pass(); await disp.settled();
+    expect(launches).toHaveLength(1);
+    expect(notified).toHaveLength(1);
+    expect(readHolds(env.db)).toEqual({});
+    // The owner raises the cap: the stage runs.
+    env.config.budgets = { dailyUsd: null, taskUsd: null, taskTokens: 10_000_000 };
+    await drive(disp);
+    expect(launches.map((l) => l.stage.role)).toEqual(['engineer', 'reviewer']);
+  });
+
+  it('a cap hold clears itself when the owner raises the cap', async () => {
+    const { env, disp, launches } = setup(approve, (c) => { unit(c); c.budgets = { dailyUsd: null, taskUsd: null, taskTokens: 2_000_000 }; }, () => exit({ tokens: 3_000_000 }));
+    env.backlog.add({ id: 'task-1' });
+    await drive(disp);
+    expect(readHolds(env.db)['task-1']?.kind).toBe('budget-cap');
+    env.config.budgets = { dailyUsd: null, taskUsd: null, taskTokens: null };
+    await drive(disp);
+    expect(readHolds(env.db)).toEqual({});
+    expect(launches.map((l) => l.stage.role)).toEqual(['engineer', 'reviewer']);
+  });
+
+  it('daily token cap on a subscription: a notice at 50% and 80%, then nothing starts at the cap', async () => {
+    const { env, disp, launches } = setup(approve, (c) => { unit(c); c.budgets = { dailyUsd: null, taskUsd: null, dailyTokens: 10_000_000 }; });
+    const coordinator = (tokens: number) => env.db.addEvent('usage', null, { key: 'session:s1', scope: 'session', session: 's1', tokens, model: 'sonnet', source: 'transcript' });
+    const caps = () => pending(env.db, { includeWaiting: true }).filter((n) => n.key.startsWith('budget-cap:')).map((n) => [n.key.replace(/\d{4}-\d{2}-\d{2}/, 'DAY'), n.kind]);
+    coordinator(4_000_000);
+    await disp.pass();
+    expect(caps()).toEqual([]);
+    coordinator(5_500_000);
+    await disp.pass(); await disp.pass();
+    expect(caps()).toEqual([['budget-cap:day-warn:DAY:tokens:10000000:50', 'status']]);
+    coordinator(8_500_000);
+    await disp.pass();
+    expect(caps()).toEqual([['budget-cap:day-warn:DAY:tokens:10000000:50', 'status'], ['budget-cap:day-warn:DAY:tokens:10000000:80', 'status']]);
+    coordinator(10_000_000);
+    env.backlog.add({ id: 'task-1' });
+    const r = await disp.pass(); await disp.settled();
+    expect(launches).toEqual([]);
+    expect(r.blocked).toMatch(/^Daily spend cap reached: 10M of 10M tokens today/);
+    expect(caps().at(-1)).toEqual(['budget-cap:day:DAY:tokens:10000000', 'blocker']);
+  });
+
   it('at the daily cap: nothing starts, a stage waiting for verification is still verified, one notice per day', async () => {
     vi.stubEnv('MINIONS_AUTH_METHOD', 'api-key');
     try {
@@ -257,7 +314,7 @@ describe('dispatcher: the verify step and periodic verification (docs/design/aut
       expect(v.runs.map((r) => r.key)).toEqual(['task-1']);
       const notices = pending(env.db, { includeWaiting: true }).filter((n) => n.key.startsWith('budget-cap:'));
       expect(notices.map((n) => n.key)).toEqual([expect.stringMatching(/^budget-cap:day:\d{4}-\d{2}-\d{2}:5$/)]);
-      expect(notices[0]!.text).toMatch(/^Daily spend cap reached: ~\$9\.00 of \$5 today/);
+      expect(notices[0]!.text).toMatch(/^Daily spend cap reached: ~\$9\.00 of \$5 \(estimated\) today/);
     } finally { vi.unstubAllEnvs(); }
   });
 

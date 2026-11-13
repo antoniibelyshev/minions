@@ -69,6 +69,8 @@ export interface SettingDef {
   min?: number;
   /** May be unset (value `default` removes it from the layer). */
   optional?: boolean;
+  /** `off` sets null (a cap that is off, overriding a lower layer); the value shows as `off` when null or unset. */
+  nullable?: boolean;
   /** List entries are separated by this (default ','); shell commands use ';' since they may contain commas. */
   separator?: ';';
   apply: SettingApply;
@@ -88,6 +90,13 @@ const RESTART_WHY: Record<SettingApply, string> = {
 };
 
 const more = (what: string) => (from: Value, to: Value) => (typeof from === 'number' && typeof to === 'number' && to > from ? `${what} (${from} -> ${to})` : null);
+/** A spend cap raised or turned off (a value of `off` or unset is no cap). */
+const looserCap = (what: string) => (from: Value, to: Value) => {
+  const cap = (v: Value) => (typeof v === 'number' ? v : null);
+  const f = cap(from); const t = cap(to);
+  if (f === null) return null;
+  return t === null ? `${what} is turned off (was ${f}): no stop at that spend` : t > f ? `${what} is raised (${f} -> ${t}; higher spend)` : null;
+};
 const turnsOff = (what: string) => (from: Value, to: Value) => (from === true && to === false ? what : null);
 const turnsOn = (what: string) => (from: Value, to: Value) => (from !== true && to === true ? what : null);
 const price = (m: Value) => (typeof m === 'string' ? usdPerMTok(m) : null);
@@ -249,6 +258,19 @@ const DECLARED: readonly DeclaredSetting[] = [
     loosens: (f, t) => (Array.isArray(t) && t.length > (Array.isArray(f) ? f.length : 1) ? `more digests a day (${t.length}: one coordinator wake each)` : null) },
   { key: 'routine.timezone', group: 'Policy', label: 'Routine time zone', type: 'text', optional: true, apply: 'live',
     description: 'IANA time zone of the digest times and the routine\'s days (default Europe/Berlin)' },
+  // Spend caps (docs/design/autonomy.md Decisions 13 and 15): only the owner changes them (here or /budget in Telegram).
+  { key: 'budgets.dailyTokens', group: 'Policy', label: 'Daily token cap', type: 'int', min: 1, optional: true, nullable: true, apply: 'live',
+    description: 'tokens of the coordinator and workers per day (from midnight in routine.timezone); at the cap no new stage starts. Enforced on any billing; off = no cap',
+    loosens: looserCap('the daily token cap') },
+  { key: 'budgets.taskTokens', group: 'Policy', label: 'Per-task token cap', type: 'int', min: 1, optional: true, nullable: true, apply: 'live',
+    description: "tokens of one task's workers (all attempts); at the cap its next stage waits and the coordinator decides. Enforced on any billing; off = no cap",
+    loosens: looserCap('the per-task token cap') },
+  { key: 'budgets.dailyUsd', group: 'Policy', label: 'Daily USD cap', type: 'number', nullable: true, apply: 'live',
+    description: 'estimated USD of the coordinator and workers per day (from midnight in routine.timezone); enforced with API-key billing only; off = no cap',
+    loosens: looserCap('the daily USD cap') },
+  { key: 'budgets.taskUsd', group: 'Policy', label: 'Per-task USD cap', type: 'number', nullable: true, apply: 'live',
+    description: "estimated USD of one task's workers; enforced with API-key billing only; off = no cap",
+    loosens: looserCap('the per-task USD cap') },
   { key: 'coordinator.disallowedTools', group: 'Policy', label: 'Coordinator tool trim', type: 'list', optional: true, apply: 'launch',
     description: 'Claude Code tools removed from the coordinator session (default: the built-in trim; none: keep every tool; tools it needs cannot be listed)',
     loosens: (f, t) => {
@@ -468,6 +490,7 @@ export function currentValue(def: SettingDef, ctx: SettingsContext): Value {
   if (def.key === 'coordinator.toolSearch' && v === undefined) return true; // unset = on
   if (def.key === 'routine.enabled' && v === undefined) return false; // unset = off
   if (def.key === 'coordinator.bundledSkills' && v === undefined) return false; // unset = off
+  if (def.nullable && (v === null || v === undefined)) return 'off';
   return v;
 }
 
@@ -520,6 +543,7 @@ export function parseSettingValue(def: SettingDef, input: string): Value {
   const s = input.trim();
   const bad = (msg: string) => new MinionsError('INVALID_CONFIG', `${def.key}: ${msg} (got "${s}")`, def.choices ? `Choices: ${def.choices.join(', ')}${def.optional ? ', default' : ''}` : undefined, { path: def.key });
   if (def.optional && (s === 'default' || s === '')) return undefined;
+  if (def.nullable && (s === 'off' || s === 'none')) return null;
   switch (def.type) {
     case 'int': {
       if (!/^\d+$/.test(s)) throw bad('must be a whole number');

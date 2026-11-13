@@ -64,7 +64,7 @@ describe('guard: every schema key has a class and a host-owned flag', () => {
     for (const k of ['execution.maxActiveTasks', 'execution.maxEngineers', 'execution.maxByRole', 'execution.maxRepairCyclesBeforeReplan',
       'coordinator.contextReset.enabled', 'verification.commands', 'verification.periodic',
       'verification.setupCommands', 'delivery.integrationTimeoutMinutes', 'intake.scope.milestone', 'intake.sources']) expect(cls(k), k).toBe('live');
-    for (const k of ['budgets.taskUsd', 'budgets.dailyUsd']) expect([cls(k), owned(k)], k).toEqual(['live', true]);
+    for (const k of ['budgets.taskUsd', 'budgets.dailyUsd', 'budgets.taskTokens', 'budgets.dailyTokens']) expect([cls(k), owned(k)], k).toEqual(['live', true]);
     for (const k of ['execution.attemptMaxTurns', 'communication.progress', 'models.default', 'models.allowed',
       'models.selection', 'models.effortByRole.engineer', 'models.coordinator', 'models.effort', 'models.effortByRole.coordinator',
       'coordinator.toolSearch']) expect([cls(k), owned(k)], k).toEqual(['restart', false]);

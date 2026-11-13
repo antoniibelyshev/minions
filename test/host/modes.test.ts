@@ -51,6 +51,16 @@ describe('minions mode set', () => {
 
     expect((await runModeSet('supervised', {}, { cwd: repo })).changes).toEqual([]);
   });
+
+  it('rewrites the USD caps but keeps the owner\'s token caps in the project layer', async () => {
+    const { repo, projectId } = await initFromTemplate(env.root);
+    const file = projectConfigPath(await loadProjectJson(projectId));
+    const raw = readJson(file);
+    writeFileSync(file, JSON.stringify({ ...raw, budgets: { ...raw.budgets, dailyTokens: 20_000_000, taskTokens: 4_000_000 } }, null, 2));
+    const r = await runModeSet('supervised', {}, { cwd: repo });
+    expect(r.changes.filter((c) => c.key.startsWith('budgets')).map((c) => c.key)).toEqual(['budgets.taskUsd', 'budgets.dailyUsd']);
+    expect(readJson(file).budgets).toEqual({ taskUsd: null, dailyUsd: null, dailyTokens: 20_000_000, taskTokens: 4_000_000 });
+  });
 });
 
 describe('minions defaults', () => {
