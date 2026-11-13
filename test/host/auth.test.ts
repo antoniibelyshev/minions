@@ -94,6 +94,19 @@ describe('schema', () => {
   });
 });
 
+describe('login method wording', () => {
+  it('names the container /login on Docker and the host\'s own Claude Code login on the host runtime', async () => {
+    const login = { method: 'login' } as const;
+    expect(auth.describeSource(login)).toMatch(/inside the container/);
+    expect(auth.describeSource(login, 'host')).toMatch(/your Claude Code login on this Mac/);
+    expect(auth.describeSource(login, 'host')).not.toMatch(/container/);
+    const { hostAuthChecks } = await import('../../src/host/doctor.js');
+    const lines: string[] = [];
+    await hostAuthChecks('p', login, (name, _s, detail) => { lines.push(`${name}: ${detail}`); }, 'host');
+    expect(lines).toEqual([expect.stringMatching(/^claude\.auth\.method: login: your Claude Code login on this Mac/)]);
+  });
+});
+
 describe('env handling', () => {
   it('rewrites loopback hosts to host.docker.internal and leaves others alone', () => {
     expect(auth.rewriteLoopback(CENTRAL_URL)).toBe('http://host.docker.internal:19516/wire/abc123/claude-code/anthropic');

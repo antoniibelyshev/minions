@@ -113,8 +113,8 @@ export function tmpUsageChecks(r: { code: number; stdout: string; stderr: string
 }
 
 /** Host-side auth checks that need no container: method, secret file, helper/source resolvable. */
-async function hostAuthChecks(projectId: string, a: ClaudeAuth, add: Add): Promise<void> {
-  add('claude.auth.method', 'ok', `${a.method}${a.preset ? ` (${a.preset})` : ''}: ${describeSource(a)}`);
+export async function hostAuthChecks(projectId: string, a: ClaudeAuth, add: Add, runtime: 'docker' | 'host' = 'docker'): Promise<void> {
+  add('claude.auth.method', 'ok', `${a.method}${a.preset ? ` (${a.preset})` : ''}: ${describeSource(a, runtime)}`);
   if (!isKeyAuth(a)) return;
   const s = await secretStatus(projectId);
   const limit = a.method === 'helper' ? 2 * (a.refreshMinutes ?? DEFAULT_REFRESH_MINUTES) : null;
@@ -417,7 +417,7 @@ export async function runDoctor(opts: {
     const project = pre ?? await loadProjectJson(ref.projectId);
     add('project', 'ok', `${project.projectId} (${project.visibility}, ${project.mode}) at ${project.repoPath}`);
     const auth = authOf(project);
-    await hostAuthChecks(project.projectId, auth, add);
+    await hostAuthChecks(project.projectId, auth, add, runtimeOf(project));
     const baseUrl = containerEnv(auth).ANTHROPIC_BASE_URL;
     let config: MinionsConfig | undefined;
     try {
