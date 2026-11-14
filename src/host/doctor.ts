@@ -305,7 +305,9 @@ async function hostRuntimeChecks(project: ProjectJson, auth: ClaudeAuth, baseUrl
     guard.code === 0 ? undefined : 'Install perl or coreutils (`brew install coreutils` provides gtimeout; link it as `timeout` on PATH).');
   await worktreesDirCheck(host.paths.repo, add);
   // Supervisor/dispatcher processes of this project that are not the lock holders (e.g. after a state restore).
-  const text = async (cmd: string, args: string[]) => { const r = await runner(cmd, args, { allowFailure: true, timeoutMs: 30_000 }); return r.code === 0 ? r.stdout : null; };
+  // ps in UTC and the C locale, as the locks record start times (process-facts.ts parsePsLine); local time would
+  // make every live holder look like an orphan.
+  const text = async (cmd: string, args: string[]) => { const r = await runner(cmd, args, { allowFailure: true, timeoutMs: 30_000, env: { ...process.env, TZ: 'UTC', LC_ALL: 'C', LANG: 'C' } }); return r.code === 0 ? r.stdout : null; };
   checks.push(await hostOrphanHelperCheck(host.paths.state, join(host.paths.state, 'minions.db'), helperProcesses ?? (() => listHelperProcesses({ run: text }))));
   if (!(await host.prepared())) {
     for (const n of ['claude.capabilities', 'telegram.server']) add(n, 'warn', 'skipped: host runtime not prepared yet', 'Run `minions start --no-attach`.');
